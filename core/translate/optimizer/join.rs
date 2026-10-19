@@ -2762,6 +2762,10 @@ pub(crate) struct HirHashJoins<'a> {
     /// a subquery, does not: a hash table that moved rows to disk cannot be
     /// probed again after its waiting lookups ran.
     pub(crate) allowed: bool,
+    /// Whether a hash table may be built from the joined rows of the loops
+    /// before the probe, legacy's materialized build input
+    /// ([crate::translate::semantic_to_plan::HirHashBuildInput]).
+    pub(crate) materialize: bool,
     /// The sources a correlated subquery of the block reads. Like legacy, a
     /// hash join never reads them.
     pub(crate) subquery_reads: &'a [hir::SourceId],
@@ -2770,6 +2774,7 @@ pub(crate) struct HirHashJoins<'a> {
 impl HirHashJoins<'_> {
     pub(crate) const NONE: HirHashJoins<'static> = HirHashJoins {
         allowed: false,
+        materialize: false,
         subquery_reads: &[],
     };
 }
@@ -3303,11 +3308,31 @@ fn hir_hash_join_candidate(
     {
         return Ok(None);
     }
-    // HIR cannot yet store the build rows that match the join prefix, which
-    // legacy does when the build table has conditions on earlier tables;
-    // such a plan stays a nested loop.
     if should_materialize {
-        return Ok(None);
+        if !hash.materialize {
+            return Ok(None);
+        }
+        // Like legacy: the hash table is built from the rows of the loops
+        // before the probe, stored once, so it holds the rows those loops
+        // keep and the probe scan runs once. Between such plans, legacy
+        // prefers the one whose build is filtered by earlier tables.
+        let tie_breaker = prior_mask.iter().min().unwrap_or(0) as f64 * 1.0e-6;
+        method.cost = estimate_hash_join_cost(
+            estimated_filtered_rows,
+            probe_cardinality,
+            crate::vdbe::hash_table::DEFAULT_MEM_BUDGET,
+            1.0,
+            params,
+        ) + Cost(estimated_filtered_rows * 0.003)
+            + Cost(tie_breaker);
+        let AccessMethodParams::HashJoin {
+            materialize_build_input,
+            ..
+        } = &mut method.params
+        else {
+            unreachable!("a hash join access method");
+        };
+        *materialize_build_input = true;
     }
     add_where_cost(&mut method, ready_where, input_cardinality, params);
     // FULL OUTER requires a hash join for the unmatched-build scan.

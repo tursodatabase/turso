@@ -38,8 +38,8 @@ use crate::{
         result_row::emit_columns_to_destination,
         semantic::hir::{self, HirDocument, QueryId, SourceId, SubqueryExpr},
         semantic_to_plan::{
-            BtreeTableLookup, HirHashLookup, HirPlan, HirPlannedLoop, HirQueryBlockPlan,
-            HirSourceAccess,
+            BtreeTableLookup, HirHashBuildInput, HirHashLookup, HirPlan, HirPlannedLoop,
+            HirQueryBlockPlan, HirSourceAccess,
         },
         window::{
             WindowBufferInput, WindowBufferRuntime, WindowFrameOffsets, WindowFrameTracking,
@@ -1796,20 +1796,18 @@ fn initialize_hir_group_runtime<'a>(
         .map(HirGroupInput::Key)
         .collect::<Vec<_>>();
     let mut sources = Vec::with_capacity(block_plan.loops.len());
-    for planned_loop in &block_plan.loops {
+    for loop_source in block_plan.loops.iter().flat_map(HirPlannedLoop::sources) {
         if sources
             .iter()
-            .any(|source: &HirGroupSource| source.source == planned_loop.source)
+            .any(|source: &HirGroupSource| source.source == loop_source)
         {
             return Err(LimboError::InternalError(format!(
-                "HIR grouped query has more than one loop for source {}",
-                planned_loop.source
+                "HIR grouped query has more than one loop for source {loop_source}"
             )));
         }
-        let source = plan.document.source(planned_loop.source).ok_or_else(|| {
+        let source = plan.document.source(loop_source).ok_or_else(|| {
             LimboError::InternalError(format!(
-                "HIR grouped query references missing source {}",
-                planned_loop.source
+                "HIR grouped query references missing source {loop_source}"
             ))
         })?;
         let row_start = if source.columns.is_empty() {
@@ -3104,7 +3102,10 @@ struct PreparedHirHashLoop<'a> {
     /// columns in `columns` and leaves the others NULL.
     payload: usize,
     columns: Vec<usize>,
-    /// The rowid of the row a lookup found.
+    /// How many registers the payload takes.
+    payload_width: usize,
+    /// The rowid of the row a lookup found. With a build input it is the
+    /// temporary table's rowid, which nothing reads.
     rowid: usize,
     build_keys: usize,
     probe_keys: usize,
@@ -3115,6 +3116,33 @@ struct PreparedHirHashLoop<'a> {
     waiting_pass: usize,
     /// Where the waiting pass looks for the next match.
     waiting_next: BranchOffset,
+    /// Legacy's materialized build input, when the hash table is built from
+    /// the joined rows of earlier loops rather than from the whole table.
+    build_input: Option<PreparedHirHashBuildInput<'a>>,
+}
+
+/// See [HirHashBuildInput]. Its loops run once, before the block's loops,
+/// storing each joined row in a temporary table: the hash keys, then the
+/// payload in its register layout. The hash table keeps that payload, and a
+/// lookup writes it to the registers each supplied source is bound to.
+struct PreparedHirHashBuildInput<'a> {
+    input: &'a HirHashBuildInput,
+    cursor: CursorID,
+    /// Contiguous registers the loops fill with one row: the keys, then
+    /// the payload.
+    record: usize,
+    sources: Vec<PreparedHirPayloadSource>,
+}
+
+/// Where a source a hash lookup supplies lives in the payload.
+struct PreparedHirPayloadSource {
+    source: SourceId,
+    /// The columns the query reads, which the build input stores.
+    columns: Vec<usize>,
+    /// Its first register: one register per column of the source.
+    start: usize,
+    /// The register of its rowid, for a rowid table.
+    rowid: Option<usize>,
 }
 
 impl PreparedHirLoop<'_> {
@@ -4085,32 +4113,30 @@ fn initialize_hir_aggregate_captures(
         dest: first_row,
     });
     let mut captures = Vec::with_capacity(loops.len());
-    for planned_loop in loops {
+    for loop_source in loops.iter().flat_map(HirPlannedLoop::sources) {
         let mut columns = state
             .bare_columns
             .iter()
-            .filter(|reference| reference.source == planned_loop.source)
+            .filter(|reference| reference.source == loop_source)
             .map(|reference| reference.column)
             .collect::<Vec<_>>();
         columns.sort_unstable();
         columns.dedup();
-        let needs_rowid = state.bare_rowids.contains(&planned_loop.source);
+        let needs_rowid = state.bare_rowids.contains(&loop_source);
         if columns.is_empty() && !needs_rowid {
             continue;
         }
         if captures
             .iter()
-            .any(|capture: &HirAggregateCapture| capture.source == planned_loop.source)
+            .any(|capture: &HirAggregateCapture| capture.source == loop_source)
         {
             return Err(LimboError::InternalError(format!(
-                "HIR aggregate query has more than one loop for source {}",
-                planned_loop.source
+                "HIR aggregate query has more than one loop for source {loop_source}"
             )));
         }
-        let source = document.source(planned_loop.source).ok_or_else(|| {
+        let source = document.source(loop_source).ok_or_else(|| {
             LimboError::InternalError(format!(
-                "HIR aggregate capture references missing source {}",
-                planned_loop.source
+                "HIR aggregate capture references missing source {loop_source}"
             ))
         })?;
         let columns_start = if source.columns.is_empty() {
@@ -4305,6 +4331,26 @@ fn emit_join_loops(
             prepare_hir_loop(program, plan, planned_loop, streams)
         })
         .collect::<Result<Vec<_>>>()?;
+    // Like legacy, the build inputs of hash lookups are filled before the
+    // loops. An outer hash join rescans its build table for the rows
+    // nothing matched, which a build input has no table for.
+    for (loop_index, prepared) in prepared_loops.iter().enumerate() {
+        let PreparedHirLoop::Hash(prepared) = prepared else {
+            continue;
+        };
+        let Some(input) = &prepared.build_input else {
+            continue;
+        };
+        if hash_outer
+            .as_ref()
+            .is_some_and(|hash_outer| hash_outer.build_loop == loop_index)
+        {
+            return Err(LimboError::InternalError(
+                "HIR outer hash join cannot build from a materialized build input".into(),
+            ));
+        }
+        emit_hir_hash_build_input(program, plan, from, loops_plan, prepared, input)?;
+    }
     let aggregate_captures = matches!(&body, HirLoopBody::UngroupedAggregate(..))
         .then(|| {
             let HirLoopBody::UngroupedAggregate(state, _) = &body else {
@@ -4920,8 +4966,11 @@ fn prepare_hir_right_outer_join(
             (table, None)
         }
         PreparedHirLoop::Materialized(prepared) => (prepared.table.clone(), Some(prepared.cursor)),
-        PreparedHirLoop::Hash(prepared) => (prepared.table.clone(), None),
-        PreparedHirLoop::Virtual(_)
+        PreparedHirLoop::Hash(prepared) if prepared.build_input.is_none() => {
+            (prepared.table.clone(), None)
+        }
+        PreparedHirLoop::Hash(_)
+        | PreparedHirLoop::Virtual(_)
         | PreparedHirLoop::IndexMethod(_)
         | PreparedHirLoop::OrUnion(_)
         | PreparedHirLoop::Registers(_)
@@ -5244,19 +5293,51 @@ fn emit_hir_block_explain(
         emit_explain!(program, false, EqpDetail::ConstantRow);
         return Ok(());
     };
-    // Like legacy, the tables built into hash tables come after every loop.
+    emit_hir_loops_explain(
+        program,
+        document,
+        from,
+        &block_plan.inner_joins,
+        &block_plan.loops,
+    )
+}
+
+/// The rows of `loops` in loop order. Like legacy, a hash join reads as
+/// `HASH JOIN` with the table it scans, and the tables built into hash
+/// tables come after every loop; the loops that fill a materialized build
+/// input come first, under its `MATERIALIZE` row.
+fn emit_hir_loops_explain(
+    program: &mut ProgramBuilder,
+    document: &HirDocument,
+    from: &hir::From,
+    inner_joins: &[SourceId],
+    loops: &[HirPlannedLoop],
+) -> Result<()> {
+    for planned_loop in loops {
+        let HirSourceAccess::Hash(HirHashLookup {
+            build_input: Some(input),
+            ..
+        }) = &planned_loop.access
+        else {
+            continue;
+        };
+        let table = hir_eqp_table(document, planned_loop.source)?;
+        emit_explain!(program, true, EqpDetail::HashBuild { table });
+        emit_hir_loops_explain(program, document, from, inner_joins, &input.loops)?;
+        program.pop_current_parent_explain();
+    }
     let mut builds = Vec::new();
-    for (position, planned_loop) in block_plan.loops.iter().enumerate() {
-        let mut detail =
-            hir_loop_explain(document, Some(from), &block_plan.inner_joins, planned_loop)?;
-        if matches!(planned_loop.access, HirSourceAccess::Hash(_)) {
-            builds.push((planned_loop.source, detail));
+    for (position, planned_loop) in loops.iter().enumerate() {
+        if let HirSourceAccess::Hash(lookup) = &planned_loop.access {
+            // A build input's loops are listed above.
+            if lookup.build_input.is_none() {
+                let detail = hir_loop_explain(document, Some(from), inner_joins, planned_loop)?;
+                builds.push((planned_loop.source, detail));
+            }
             continue;
         }
-        // Like legacy, a hash join reads as `HASH JOIN` with the table it
-        // scans, then `SCAN` with the table built into the hash table.
-        let probes = block_plan
-            .loops
+        let mut detail = hir_loop_explain(document, Some(from), inner_joins, planned_loop)?;
+        let probes = loops
             .get(position + 1)
             .is_some_and(|next| matches!(next.access, HirSourceAccess::Hash(_)));
         if probes {
@@ -5298,23 +5379,7 @@ pub(super) fn hir_loop_explain(
             planned_loop.source
         ))
     })?;
-    // Legacy names a FROM subquery by its alias.
-    let table = match &source.kind {
-        hir::SourceKind::Derived(_) => EqpTable {
-            name: source.alias.clone().unwrap_or_else(|| source.name.clone()),
-            alias: None,
-        },
-        kind => {
-            let name = match kind {
-                hir::SourceKind::Table(table) | hir::SourceKind::TableFunction { table, .. } => {
-                    table.value().get_name().to_string()
-                }
-                _ => source.name.clone(),
-            };
-            let alias = source.alias.clone().filter(|alias| *alias != name);
-            EqpTable { name, alias }
-        }
-    };
+    let table = hir_eqp_table(document, source.id)?;
     let join = from
         .and_then(|from| hir_loop_explain_join(document, from, source.id))
         .map(|join| {
@@ -5510,6 +5575,30 @@ pub(super) fn hir_loop_explain(
 }
 
 /// How a source joins the sources before it, for EXPLAIN QUERY PLAN.
+/// How EXPLAIN QUERY PLAN names a source, as legacy does: a FROM subquery
+/// by its alias, a table by its name and alias.
+fn hir_eqp_table(document: &HirDocument, source: SourceId) -> Result<EqpTable> {
+    let source = document.source(source).ok_or_else(|| {
+        LimboError::InternalError(format!("HIR loop references missing source {source}"))
+    })?;
+    Ok(match &source.kind {
+        hir::SourceKind::Derived(_) => EqpTable {
+            name: source.alias.clone().unwrap_or_else(|| source.name.clone()),
+            alias: None,
+        },
+        kind => {
+            let name = match kind {
+                hir::SourceKind::Table(table) | hir::SourceKind::TableFunction { table, .. } => {
+                    table.value().get_name().to_string()
+                }
+                _ => source.name.clone(),
+            };
+            let alias = source.alias.clone().filter(|alias| *alias != name);
+            EqpTable { name, alias }
+        }
+    })
+}
+
 fn hir_loop_explain_join(
     document: &HirDocument,
     from: &hir::From,
@@ -5796,16 +5885,64 @@ fn prepare_hir_hash_loop<'a>(
     })?;
     program.begin_read_on_database(database.index(), snapshot.schema_version)?;
 
-    // Keep every column the statement reads, and the columns a virtual
-    // generated column among them is computed from.
     let hir::SourceOwner::QueryBlock(block) = source.owner else {
         return Err(LimboError::InternalError(format!(
             "HIR hash lookup source {source_id} is not owned by a query block"
         )));
     };
-    let mut columns = lookup.columns.clone();
-    for usage in document.source_column_usage(block.query) {
-        if usage.reference.source == source_id && !columns.contains(&usage.reference.column) {
+    let columns = hir_hash_kept_columns(document, block.query, source, lookup.columns.clone());
+    let (payload, payload_width, build_input) = match &lookup.build_input {
+        None => {
+            let payload = program.alloc_registers(source.columns.len().max(1));
+            (payload, source.columns.len().max(1), None)
+        }
+        Some(input) => {
+            let (payload, width, prepared) =
+                prepare_hir_hash_build_input(program, document, block.query, input, lookup)?;
+            (payload, width, Some(prepared))
+        }
+    };
+    let rowid = program.alloc_register();
+    if build_input.is_none() {
+        program.bind_source(
+            source_id,
+            SourceBinding::Registers {
+                start: payload,
+                rowid: Some(rowid),
+            },
+        );
+    }
+    Ok(PreparedHirHashLoop {
+        source,
+        lookup,
+        table: table.clone(),
+        database: database.index(),
+        build_cursor: program.alloc_cursor_id(CursorType::BTreeTable(table.clone())),
+        hash_table: program.alloc_hash_table_id(),
+        payload,
+        columns,
+        payload_width,
+        rowid,
+        build_keys: program.alloc_registers(lookup.keys.len()),
+        probe_keys: program.alloc_registers(lookup.keys.len()),
+        probe_rowid: program.alloc_register(),
+        waiting_pass: program.alloc_register(),
+        waiting_next: program.allocate_label(),
+        build_input,
+    })
+}
+
+/// The columns of `source` a hash row keeps: `columns`, every column the
+/// query reads, and the columns a virtual generated column among them is
+/// computed from.
+fn hir_hash_kept_columns(
+    document: &HirDocument,
+    query: QueryId,
+    source: &hir::Source,
+    mut columns: Vec<usize>,
+) -> Vec<usize> {
+    for usage in document.source_column_usage(query) {
+        if usage.reference.source == source.id && !columns.contains(&usage.reference.column) {
             columns.push(usage.reference.column);
         }
     }
@@ -5817,7 +5954,7 @@ fn prepare_hir_hash_loop<'a>(
         {
             expression.for_each(&mut |expression| {
                 if let hir::Expr::Column(dependency) = expression {
-                    if dependency.source == source_id && !columns.contains(&dependency.column) {
+                    if dependency.source == source.id && !columns.contains(&dependency.column) {
                         columns.push(dependency.column);
                     }
                 }
@@ -5825,32 +5962,184 @@ fn prepare_hir_hash_loop<'a>(
         }
     }
     columns.sort_unstable();
+    columns
+}
 
-    let payload = program.alloc_registers(source.columns.len().max(1));
-    let rowid = program.alloc_register();
-    program.bind_source(
-        source_id,
-        SourceBinding::Registers {
-            start: payload,
-            rowid: Some(rowid),
-        },
-    );
-    Ok(PreparedHirHashLoop {
-        source,
-        lookup,
-        table: table.clone(),
-        database: database.index(),
-        build_cursor: program.alloc_cursor_id(CursorType::BTreeTable(table.clone())),
-        hash_table: program.alloc_hash_table_id(),
-        payload,
+/// Lay out the payload of a hash lookup with a build input: for each source
+/// it supplies, one register per column, then its rowid when it has one.
+/// Bind the sources to those registers, and open the temporary table the
+/// build input fills. Returns the first payload register and its width.
+fn prepare_hir_hash_build_input<'a>(
+    program: &mut ProgramBuilder,
+    document: &HirDocument,
+    query: QueryId,
+    input: &'a HirHashBuildInput,
+    lookup: &HirHashLookup,
+) -> Result<(usize, usize, PreparedHirHashBuildInput<'a>)> {
+    let mut layout = Vec::with_capacity(input.sources.len());
+    let mut width = 0;
+    for &source_id in &input.sources {
+        let source = document.source(source_id).ok_or_else(|| {
+            LimboError::InternalError(format!(
+                "HIR hash build input supplies missing source {source_id}"
+            ))
+        })?;
+        let columns = hir_hash_kept_columns(document, query, source, Vec::new());
+        let has_rowid = matches!(
+            &source.kind,
+            hir::SourceKind::Table(table)
+                if table.value().btree().is_some_and(|table| table.has_rowid)
+        );
+        let column_width = source.columns.len().max(1);
+        layout.push((source_id, columns, column_width, has_rowid));
+        width += column_width + usize::from(has_rowid);
+    }
+    let payload = program.alloc_registers(width);
+    let mut start = payload;
+    let mut sources = Vec::with_capacity(layout.len());
+    for (source_id, columns, column_width, has_rowid) in layout {
+        let rowid = has_rowid.then_some(start + column_width);
+        program.bind_source(source_id, SourceBinding::Registers { start, rowid });
+        sources.push(PreparedHirPayloadSource {
+            source: source_id,
+            columns,
+            start,
+            rowid,
+        });
+        start += column_width + usize::from(has_rowid);
+    }
+    let keys = lookup.keys.len();
+    let columns = (0..keys)
+        .map(|key| format!("key_{key}"))
+        .chain((0..width).map(|slot| format!("payload_{slot}")))
+        .map(|name| Column::new_default_text(Some(name), "BLOB".to_string(), None))
+        .collect();
+    let table = Arc::new(BTreeTable::new(
+        0,
+        "hash_build_input".to_string(),
+        Vec::new(),
         columns,
-        rowid,
-        build_keys: program.alloc_registers(lookup.keys.len()),
-        probe_keys: program.alloc_registers(lookup.keys.len()),
-        probe_rowid: program.alloc_register(),
-        waiting_pass: program.alloc_register(),
-        waiting_next: program.allocate_label(),
-    })
+        BTreeCharacteristics::HAS_ROWID,
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        None,
+    ));
+    Ok((
+        payload,
+        width,
+        PreparedHirHashBuildInput {
+            input,
+            cursor: program.alloc_cursor_id(CursorType::BTreeTable(table)),
+            record: program.alloc_registers(keys + width),
+            sources,
+        },
+    ))
+}
+
+/// Fill a hash lookup's build input once: run its loops, storing each
+/// joined row's hash keys and the kept columns of the sources it supplies
+/// in the temporary table. Its sources then read the hash row again.
+fn emit_hir_hash_build_input(
+    program: &mut ProgramBuilder,
+    plan: &HirPlan,
+    from: Option<&hir::From>,
+    loops_plan: HirLoopsPlan<'_>,
+    prepared: &PreparedHirHashLoop<'_>,
+    input: &PreparedHirHashBuildInput<'_>,
+) -> Result<()> {
+    let document = &plan.document;
+    let keys = &prepared.lookup.keys;
+    let width = keys.len() + prepared.payload_width;
+    let filled = program.allocate_label();
+    program.emit_insn(Insn::Once {
+        target_pc_when_reentered: filled,
+    });
+    program.emit_insn(Insn::OpenEphemeral {
+        cursor_id: input.cursor,
+        is_table: true,
+    });
+    // Columns the query never reads stay NULL.
+    program.emit_insn(Insn::Null {
+        dest: input.record,
+        dest_end: (width > 1).then_some(input.record + width - 1),
+    });
+    let store = |program: &mut ProgramBuilder, _reject: BranchOffset| -> Result<()> {
+        for (position, key) in keys.iter().enumerate() {
+            super::expr::translate_expr_no_constant_opt(
+                program,
+                document,
+                &key.build,
+                input.record + position,
+            )?;
+        }
+        let slot = |register: usize| input.record + keys.len() + (register - prepared.payload);
+        for source in &input.sources {
+            for column in &source.columns {
+                super::expr::translate_expr_no_constant_opt(
+                    program,
+                    document,
+                    &hir::Expr::column(source.source, *column),
+                    slot(source.start + column),
+                )?;
+            }
+            if let Some(rowid) = source.rowid {
+                super::expr::translate_expr_no_constant_opt(
+                    program,
+                    document,
+                    &hir::Expr::rowid(source.source),
+                    slot(rowid),
+                )?;
+            }
+        }
+        let record = program.alloc_register();
+        let rowid = program.alloc_register();
+        program.emit_insn(Insn::MakeRecord {
+            start_reg: to_u32(input.record),
+            count: to_u32(width),
+            dest_reg: to_u32(record),
+            index_name: None,
+            affinity_str: None,
+        });
+        program.emit_insn(Insn::NewRowid {
+            cursor: input.cursor,
+            rowid_reg: rowid,
+            prev_largest_reg: 0,
+        });
+        program.emit_insn(Insn::Insert {
+            cursor: input.cursor,
+            key_reg: rowid,
+            record_reg: record,
+            flag: InsertFlags::new().is_ephemeral_table_insert(),
+            table_name: String::new(),
+        });
+        Ok(())
+    };
+    emit_join_loops(
+        program,
+        plan,
+        from,
+        HirLoopsPlan {
+            groups: &[],
+            loops: &input.input.loops,
+            predicates: &input.input.predicates,
+            where_start: loops_plan.where_start,
+            inner_joins: loops_plan.inner_joins,
+        },
+        HirLoopBody::Dml(&store),
+    )?;
+    program.preassign_label_to_next_insn(filled);
+    // The loops bound the sources to their own cursors.
+    for source in &input.sources {
+        program.bind_source(
+            source.source,
+            SourceBinding::Registers {
+                start: source.start,
+                rowid: source.rowid,
+            },
+        );
+    }
+    Ok(())
 }
 
 /// Build the hash table the first time the loop is reached, then look up
@@ -5870,24 +6159,32 @@ fn start_hir_hash_loop(
         .collect::<String>();
     let key_count = std::num::NonZeroUsize::new(keys.len())
         .ok_or_else(|| LimboError::InternalError("HIR hash lookup has no keys".into()))?;
-    let column_count = prepared.source.columns.len().max(1);
+    let column_count = prepared.payload_width;
 
     let built = program.allocate_label();
     program.emit_insn(Insn::Once {
         target_pc_when_reentered: built,
     });
-    program.emit_insn(Insn::OpenRead {
-        cursor_id: prepared.build_cursor,
-        root_page: prepared.table.root_page,
-        db: prepared.database,
-    });
-    program.bind_source(
-        prepared.source.id,
-        SourceBinding::BTree {
-            scan_cursor: prepared.build_cursor,
-            table_cursor: None,
-        },
-    );
+    // The table the hash table is built from: the build input's temporary
+    // table, whose rows hold the keys then the payload, or the table itself.
+    let build_cursor = match &prepared.build_input {
+        Some(input) => input.cursor,
+        None => {
+            program.emit_insn(Insn::OpenRead {
+                cursor_id: prepared.build_cursor,
+                root_page: prepared.table.root_page,
+                db: prepared.database,
+            });
+            program.bind_source(
+                prepared.source.id,
+                SourceBinding::BTree {
+                    scan_cursor: prepared.build_cursor,
+                    table_cursor: None,
+                },
+            );
+            prepared.build_cursor
+        }
+    };
     program.emit_insn(Insn::Null {
         dest: prepared.payload,
         dest_end: (column_count > 1).then_some(prepared.payload + column_count - 1),
@@ -5895,37 +6192,70 @@ fn start_hir_hash_loop(
     let build_loop = program.allocate_label();
     let build_end = program.allocate_label();
     program.emit_insn(Insn::Rewind {
-        cursor_id: prepared.build_cursor,
+        cursor_id: build_cursor,
         pc_if_empty: build_end,
     });
     program.preassign_label_to_next_insn(build_loop);
-    for (position, key) in keys.iter().enumerate() {
-        super::expr::translate_expr_no_constant_opt(
-            program,
-            document,
-            &key.build,
-            prepared.build_keys + position,
-        )?;
+    match &prepared.build_input {
+        Some(input) => {
+            for position in 0..keys.len() {
+                program.emit_column_or_rowid(
+                    input.cursor,
+                    position,
+                    prepared.build_keys + position,
+                );
+            }
+        }
+        None => {
+            for (position, key) in keys.iter().enumerate() {
+                super::expr::translate_expr_no_constant_opt(
+                    program,
+                    document,
+                    &key.build,
+                    prepared.build_keys + position,
+                )?;
+            }
+        }
     }
     program.emit_insn(Insn::Affinity {
         start_reg: prepared.build_keys,
         count: key_count,
         affinities: affinities.clone(),
     });
-    for column in &prepared.columns {
-        super::expr::translate_expr_no_constant_opt(
-            program,
-            document,
-            &hir::Expr::Column(hir::ColumnRef {
-                source: prepared.source.id,
-                column: *column,
-            }),
-            prepared.payload + column,
-        )?;
+    match &prepared.build_input {
+        Some(input) => {
+            for source in &input.sources {
+                for register in source
+                    .columns
+                    .iter()
+                    .map(|column| source.start + column)
+                    .chain(source.rowid)
+                {
+                    program.emit_column_or_rowid(
+                        input.cursor,
+                        keys.len() + (register - prepared.payload),
+                        register,
+                    );
+                }
+            }
+        }
+        None => {
+            for column in &prepared.columns {
+                super::expr::translate_expr_no_constant_opt(
+                    program,
+                    document,
+                    &hir::Expr::Column(hir::ColumnRef {
+                        source: prepared.source.id,
+                        column: *column,
+                    }),
+                    prepared.payload + column,
+                )?;
+            }
+        }
     }
     program.emit_insn(Insn::HashBuild {
         data: Box::new(crate::vdbe::insn::HashBuildData {
-            cursor_id: prepared.build_cursor,
+            cursor_id: build_cursor,
             key_start_reg: prepared.build_keys,
             num_keys: keys.len(),
             hash_table_id: prepared.hash_table,
@@ -5940,7 +6270,7 @@ fn start_hir_hash_loop(
         }),
     });
     program.emit_insn(Insn::Next {
-        cursor_id: prepared.build_cursor,
+        cursor_id: build_cursor,
         pc_if_next: build_loop,
         fullscan: true,
     });
@@ -5949,13 +6279,26 @@ fn start_hir_hash_loop(
         hash_table_id: prepared.hash_table,
     });
     program.preassign_label_to_next_insn(built);
-    program.bind_source(
-        prepared.source.id,
-        SourceBinding::Registers {
-            start: prepared.payload,
-            rowid: Some(prepared.rowid),
-        },
-    );
+    match &prepared.build_input {
+        Some(input) => {
+            for source in &input.sources {
+                program.bind_source(
+                    source.source,
+                    SourceBinding::Registers {
+                        start: source.start,
+                        rowid: source.rowid,
+                    },
+                );
+            }
+        }
+        None => program.bind_source(
+            prepared.source.id,
+            SourceBinding::Registers {
+                start: prepared.payload,
+                rowid: Some(prepared.rowid),
+            },
+        ),
+    }
 
     for (position, key) in keys.iter().enumerate() {
         super::expr::translate_expr(
@@ -6033,7 +6376,7 @@ fn emit_hir_hash_waiting_lookups(
     left_join: Option<&HirLeftJoin>,
 ) {
     let hash_table = to_u32(prepared.hash_table);
-    let column_count = prepared.source.columns.len().max(1);
+    let column_count = prepared.payload_width;
     let done = program.allocate_label();
     let partition = program.allocate_label();
     let next_lookup = program.allocate_label();
@@ -7557,7 +7900,7 @@ pub(super) fn predicate_loop(
     // Output references follow the aliased expression, and subqueries
     // contribute their outer captures.
     document.visit_expr_sources(expression, &mut |source| {
-        if let Some(position) = loops.iter().position(|hir_loop| hir_loop.source == source) {
+        if let Some(position) = loops.iter().position(|hir_loop| hir_loop.supplies(source)) {
             eval_at = Some(eval_at.map_or(position, |current: usize| current.max(position)));
         } else if program.source_binding(source).is_none() {
             missing = Some(source);

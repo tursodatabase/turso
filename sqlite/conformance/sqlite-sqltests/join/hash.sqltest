@@ -878,3 +878,24 @@ test grace-full-outer-set-aside-probe-rows {
 expect {
     12465|17079801|17820541
 }
+
+# =============================================================================
+# 33. A hash join built from the rows of an earlier hash join
+# =============================================================================
+
+# `c` probes the hash table built from `d`, and `b` probes a hash table
+# built from the `c`/`d` rows that joined (the materialized build input).
+# Both hash tables spill to disk at this size.
+@cross-check-integrity
+test grace-hash-join-chain {
+    CREATE TABLE b(id INTEGER PRIMARY KEY, k INT, pad TEXT);
+    CREATE TABLE c(id INTEGER PRIMARY KEY, k INT, pad TEXT);
+    CREATE TABLE d(id INTEGER PRIMARY KEY, k INT, pad TEXT);
+    INSERT INTO b SELECT value, CASE WHEN value % 13 THEN value % 500 END, printf('%050d', value) FROM generate_series(1, 3000);
+    INSERT INTO c SELECT value, CASE WHEN value % 13 THEN value % 700 END, printf('%050d', value) FROM generate_series(1, 3000);
+    INSERT INTO d SELECT value, CASE WHEN value % 13 THEN value % 300 END, printf('%050d', value) FROM generate_series(1, 2000);
+    SELECT count(*), sum(b.id), sum(c.id), sum(d.id) FROM b JOIN c ON b.k = c.k JOIN d ON d.k = c.k;
+}
+expect {
+    44458|61706490|64355890|44512790
+}

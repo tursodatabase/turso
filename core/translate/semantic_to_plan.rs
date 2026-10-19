@@ -542,6 +542,31 @@ pub(crate) struct HirPlannedLoop {
     pub(crate) access: HirSourceAccess,
 }
 
+impl HirPlannedLoop {
+    /// The sources this loop supplies a row of: its own, and, for a hash
+    /// lookup built from a materialized build input, the sources of the
+    /// loops that filled it, which each hash row carries.
+    pub(crate) fn sources(&self) -> Vec<SourceId> {
+        match &self.access {
+            HirSourceAccess::Hash(HirHashLookup {
+                build_input: Some(input),
+                ..
+            }) => input.sources.clone(),
+            _ => vec![self.source],
+        }
+    }
+
+    pub(crate) fn supplies(&self, source: SourceId) -> bool {
+        match &self.access {
+            HirSourceAccess::Hash(HirHashLookup {
+                build_input: Some(input),
+                ..
+            }) => input.sources.contains(&source),
+            _ => self.source == source,
+        }
+    }
+}
+
 /// Whether an index scan can supply every referenced value itself.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum BtreeTableLookup {
@@ -595,8 +620,31 @@ pub(crate) struct HirHashLookup {
     /// Columns of the table the query reads, kept with each row.
     pub(crate) columns: Vec<usize>,
     /// The access the build table was planned with, which EXPLAIN shows as
-    /// legacy does. The hash table itself is built from every row.
+    /// legacy does. The hash table itself is built from every row, unless
+    /// it has a build input.
     pub(crate) explain: Option<(HirBtreeOperation, BtreeTableLookup)>,
+    /// Legacy's materialized build input: the hash table is built from the
+    /// joined rows of the loops before the probe loop instead of from the
+    /// whole table.
+    pub(crate) build_input: Option<Box<HirHashBuildInput>>,
+}
+
+/// The loops a hash table is built from, legacy's "materialized hash build
+/// input". They run once into a temporary table, each row keeping the hash
+/// keys and the columns the query reads of every source they supply. The
+/// block's loops then no longer include them: a lookup supplies a row of
+/// each of their sources, read from the hash row. Legacy does this when
+/// the build table has a term with an earlier table that the hash keys do
+/// not cover, or was the probe of an earlier hash join, so that building
+/// from the whole table would lose those joins.
+pub(crate) struct HirHashBuildInput {
+    pub(crate) loops: Vec<HirPlannedLoop>,
+    /// The block's predicates as the loops check them: a term that reads a
+    /// source outside these loops is consumed here and checked by the
+    /// block.
+    pub(crate) predicates: Vec<HirWhereTerm>,
+    /// The sources the loops supply, in the order their columns are kept.
+    pub(crate) sources: Vec<SourceId>,
 }
 
 /// One equality between a value of the hashed table's row and a value from
@@ -614,6 +662,63 @@ struct HirQueryEstimate {
     output_cardinality: f64,
     cost: Cost,
     output_order: Vec<crate::translate::optimizer::order::HirOutputOrder>,
+}
+
+/// The probe positions of the hash joins that keep the materialized build
+/// input the join search gave them, like legacy's check after its join
+/// search: only when the build table was the probe of an earlier hash join,
+/// or has a term with an earlier table that the hash keys do not cover.
+/// Otherwise a hash table built from the whole table joins the same rows.
+fn materialized_hash_build_inputs(
+    plan: &crate::translate::optimizer::join::JoinN,
+    access_methods: &[super::optimizer::access_method::AccessMethod],
+    constraints: &[HirTableConstraints],
+) -> Result<Vec<usize>> {
+    use super::optimizer::access_method::AccessMethodParams;
+    let hash_join = |method: usize| match &access_methods[method].params {
+        AccessMethodParams::HashJoin {
+            build_table_idx,
+            probe_table_idx,
+            ..
+        } => Some((*build_table_idx, *probe_table_idx)),
+        _ => None,
+    };
+    let mut probes = Vec::new();
+    for (step, (probe_position, method)) in plan.data.iter().copied().enumerate() {
+        let AccessMethodParams::HashJoin {
+            build_table_idx,
+            join_keys,
+            materialize_build_input: true,
+            ..
+        } = &access_methods[method].params
+        else {
+            continue;
+        };
+        let earlier = &plan.data[..step];
+        let build_was_probe = earlier.iter().any(|(_, method)| {
+            hash_join(*method).is_some_and(|(_, probe)| probe == *build_table_idx)
+        });
+        let mut prior = crate::translate::planner::TableMask::default();
+        for (position, method) in earlier {
+            prior.set(*position)?;
+            if let Some((build, _)) = hash_join(*method) {
+                prior.set(build)?;
+            }
+        }
+        let has_prior_term = constraints[*build_table_idx]
+            .constraints
+            .iter()
+            .any(|constraint| {
+                constraint.lhs_mask.intersects(&prior)
+                    && !join_keys
+                        .iter()
+                        .any(|key| key.where_clause_idx == constraint.where_clause_pos.0)
+            });
+        if build_was_probe || has_prior_term {
+            probes.push(probe_position);
+        }
+    }
+    Ok(probes)
 }
 
 /// Like legacy: turn each LEFT JOIN whose NULL row a WHERE term rejects into
@@ -2103,6 +2208,26 @@ impl<'a> HirPlanContext<'a> {
         }
         let hash = crate::translate::optimizer::join::HirHashJoins {
             allowed: self.hash_joins_allowed(&input),
+            // A materialized build input is filled once per statement, so
+            // the block must not read an outer row (legacy fills it once
+            // for every outer row, which is wrong), and HIR fills it with
+            // plain inner joins only (LEFT JOINs a WHERE term made inner
+            // included); legacy also allows outer joins there. A semi-join
+            // or anti-join comes after every other loop, so it never feeds
+            // a build input.
+            materialize: !self.document.reads_outer_sources(block.id.query)
+                && input.sources.iter().all(|source| {
+                    source.join_info().is_none_or(|join| {
+                        matches!(
+                            join.kind,
+                            hir::JoinKind::Comma
+                                | hir::JoinKind::Inner
+                                | hir::JoinKind::Cross
+                                | hir::JoinKind::Semi
+                                | hir::JoinKind::Anti
+                        )
+                    })
+                }),
             subquery_reads: &subquery_reads,
         };
         let access = self
@@ -2217,6 +2342,7 @@ impl<'a> HirPlanContext<'a> {
             columns,
             keys,
             explain: None,
+            build_input: None,
         })
     }
 
@@ -2590,6 +2716,8 @@ impl<'a> HirPlanContext<'a> {
         let mut prior_sources = crate::translate::planner::TableMask::default();
         let mut loops: Vec<HirPlannedLoop> = Vec::with_capacity(input.sources.len());
         let mut read_out_of_order = false;
+        let materialized_probes =
+            materialized_hash_build_inputs(&result.best_plan, &access_methods, &constraints)?;
         // The build tables of hash joins. Like legacy, each is read in full
         // into its hash table, so its own access method is not applied and
         // its terms stay to be checked after each lookup.
@@ -2606,7 +2734,13 @@ impl<'a> HirPlanContext<'a> {
             })
             .collect::<Vec<_>>();
         for (source_position, access_method_position) in result.best_plan.data.iter().copied() {
-            if hash_builds.contains(&source_position) {
+            // A build table that itself probes an earlier hash table keeps
+            // that lookup: its hash table is then built from a build input.
+            let probes = matches!(
+                access_methods[access_method_position].params,
+                super::optimizer::access_method::AccessMethodParams::HashJoin { .. }
+            );
+            if hash_builds.contains(&source_position) && !probes {
                 // EXPLAIN shows the access the build table was planned with,
                 // as legacy does; it is applied to a copy of the terms, so
                 // they all stay to be checked.
@@ -2650,22 +2784,73 @@ impl<'a> HirPlanContext<'a> {
                 ..
             } = &access_methods[access_method_position].params
             {
-                let build_loop: HirPlannedLoop = loops.pop().ok_or_else(|| {
-                    LimboError::InternalError("HIR hash join has no build loop".to_string())
-                })?;
-                if build_loop.source_position != *build_table_idx {
-                    return Err(LimboError::InternalError(
-                        "HIR hash join build is not the previous loop".to_string(),
-                    ));
-                }
                 let mut lookup = self.hash_join_lookup(&input.predicates, join_keys)?;
-                if let HirSourceAccess::BTree {
-                    operation,
-                    table_lookup,
-                } = &build_loop.access
-                {
-                    lookup.explain = Some((operation.clone(), *table_lookup));
-                }
+                let build_loop = if materialized_probes.contains(&source_position) {
+                    // Like legacy's materialized build input: every loop so
+                    // far runs once into a temporary table the hash table is
+                    // built from, and the lookup supplies their rows.
+                    let prefix = std::mem::take(&mut loops);
+                    if !prefix
+                        .iter()
+                        .any(|planned_loop| planned_loop.source_position == *build_table_idx)
+                    {
+                        return Err(LimboError::InternalError(
+                            "HIR hash join build is not among the loops before its probe"
+                                .to_string(),
+                        ));
+                    }
+                    let sources = prefix
+                        .iter()
+                        .flat_map(HirPlannedLoop::sources)
+                        .collect::<Vec<_>>();
+                    // The prefix checks the terms that read only its
+                    // sources, and the block checks them no more.
+                    let mut predicates = input.predicates.clone();
+                    for (prefix_term, term) in predicates.iter_mut().zip(&mut input.predicates) {
+                        if term.consumed {
+                            continue;
+                        }
+                        let mut outside = false;
+                        self.document.visit_expr_sources(&term.expr, &mut |source| {
+                            outside |= !sources.contains(&source);
+                        });
+                        if outside {
+                            prefix_term.consumed = true;
+                        } else {
+                            term.consumed = true;
+                        }
+                    }
+                    lookup.build_input = Some(Box::new(HirHashBuildInput {
+                        loops: prefix,
+                        predicates,
+                        sources,
+                    }));
+                    HirPlannedLoop {
+                        source: input.sources[*build_table_idx].source(),
+                        source_position: *build_table_idx,
+                        access: HirSourceAccess::Hash(lookup),
+                    }
+                } else {
+                    let build_loop: HirPlannedLoop = loops.pop().ok_or_else(|| {
+                        LimboError::InternalError("HIR hash join has no build loop".to_string())
+                    })?;
+                    if build_loop.source_position != *build_table_idx {
+                        return Err(LimboError::InternalError(
+                            "HIR hash join build is not the previous loop".to_string(),
+                        ));
+                    }
+                    if let HirSourceAccess::BTree {
+                        operation,
+                        table_lookup,
+                    } = &build_loop.access
+                    {
+                        lookup.explain = Some((operation.clone(), *table_lookup));
+                    }
+                    HirPlannedLoop {
+                        access: HirSourceAccess::Hash(lookup),
+                        ..build_loop
+                    }
+                };
                 for key in join_keys {
                     input.predicates[key.where_clause_idx].consumed = true;
                 }
@@ -2680,10 +2865,7 @@ impl<'a> HirPlanContext<'a> {
                         table_lookup: BtreeTableLookup::ScanOnly,
                     },
                 });
-                loops.push(HirPlannedLoop {
-                    access: HirSourceAccess::Hash(lookup),
-                    ..build_loop
-                });
+                loops.push(build_loop);
                 prior_sources.set(source_position)?;
                 continue;
             }

@@ -2746,3 +2746,111 @@ fn hir_hash_joins_run_under_earlier_loops() {
         assert_eq!(limbo_exec_rows(&hir, sql), expected, "{sql}");
     }
 }
+
+/// Like legacy's materialized hash build input: when the build table was
+/// the probe of an earlier hash join, or has a term with an earlier table
+/// that the hash keys do not cover, the loops before the probe run once
+/// into a temporary table that the hash table is built from, and each hash
+/// row carries the columns of every table those loops read. The block's
+/// loops are then the probe scan and the lookup alone, and the query reads
+/// those tables from the hash row: in its outputs, aggregates, GROUP BY and
+/// WHERE terms, and in a later loop's seek.
+#[test]
+fn hir_hash_joins_build_from_the_loops_before_the_probe_like_legacy() {
+    const SCHEMA: &str = "
+        CREATE TABLE b(id INTEGER PRIMARY KEY, k INT, pad TEXT);
+        CREATE TABLE c(id INTEGER PRIMARY KEY, k INT, pad TEXT);
+        CREATE TABLE d(id INTEGER PRIMARY KEY, k INT);
+        CREATE TABLE e(id INTEGER PRIMARY KEY, v INT);
+        WITH RECURSIVE s(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM s WHERE i < 3000)
+            INSERT INTO b SELECT i, CASE WHEN i % 13 THEN i % 500 END, printf('%050d', i) FROM s;
+        WITH RECURSIVE s(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM s WHERE i < 3000)
+            INSERT INTO c SELECT i, CASE WHEN i % 13 THEN i % 700 END, printf('%050d', i) FROM s;
+        WITH RECURSIVE s(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM s WHERE i < 2000)
+            INSERT INTO d SELECT i, i % 300 FROM s;
+        WITH RECURSIVE s(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM s WHERE i < 3000)
+            INSERT INTO e SELECT i, i * 7 FROM s;
+    ";
+    let db = TempDatabase::new_empty();
+    let [legacy, hir] = connections(&db);
+    for statement in SCHEMA.split(';').filter(|sql| !sql.trim().is_empty()) {
+        hir.execute(statement).unwrap();
+    }
+    let sqlite = rusqlite::Connection::open_in_memory().unwrap();
+    sqlite.execute_batch(SCHEMA).unwrap();
+    // (query, whether the chain's middle table gets a build input; the
+    // other queries find a cheaper nested loop, as legacy does)
+    for (sql, materializes) in [
+        (
+            "SELECT count(*), sum(b.id), sum(c.id), sum(d.id) FROM b \
+             JOIN c ON b.k = c.k JOIN d ON d.k = c.k",
+            true,
+        ),
+        (
+            "SELECT b.k, count(*), sum(d.id) FROM b JOIN c ON b.k = c.k JOIN d ON d.k = c.k \
+             GROUP BY b.k ORDER BY b.k",
+            true,
+        ),
+        (
+            "SELECT max(d.id), b.k, c.k FROM b JOIN c ON b.k = c.k JOIN d ON d.k = c.k",
+            true,
+        ),
+        (
+            "SELECT count(*), sum(b.id), sum(c.id), sum(d.id) FROM b \
+             JOIN c ON b.k = c.k JOIN d ON d.k = c.k WHERE d.id > b.id + c.id",
+            true,
+        ),
+        (
+            "SELECT b.id, c.id, d.id FROM b JOIN c ON b.k = c.k JOIN d ON d.k = c.k \
+             WHERE b.id < 20 ORDER BY 1, 2, 3",
+            true,
+        ),
+        (
+            "SELECT count(*) FROM b JOIN c ON b.k = c.k JOIN d ON d.k = c.k \
+             WHERE EXISTS (SELECT 1 FROM e WHERE e.id = d.id AND e.v > b.id)",
+            false,
+        ),
+        (
+            "SELECT count(*), sum(b.id), sum(c.id), sum(d.id) FROM b \
+             JOIN c ON b.k = c.k JOIN d ON d.k = c.k AND d.id > b.id",
+            false,
+        ),
+        (
+            "SELECT count(*), sum(e.v) FROM b JOIN c ON b.k = c.k JOIN d ON d.k = c.k \
+             JOIN e ON e.id = b.id + d.id",
+            false,
+        ),
+    ] {
+        let hir_plan = plan_without_ids(query_plan(&hir, sql));
+        assert_eq!(
+            hir_plan[0].starts_with("MATERIALIZE hash build input for "),
+            materializes,
+            "{sql}: {hir_plan:?}"
+        );
+        // Legacy lists the tables a build input already joined once more
+        // after the loops; without those repeats its plan is the same.
+        let legacy_plan = plan_without_ids(query_plan(&legacy, sql));
+        let mut legacy_once = Vec::new();
+        for row in &legacy_plan {
+            if !legacy_once.contains(row) {
+                legacy_once.push(row.clone());
+            }
+        }
+        assert!(
+            legacy_once == hir_plan && (legacy_plan.len() > hir_plan.len()) == materializes,
+            "{sql}: legacy {legacy_plan:?} hir {hir_plan:?}"
+        );
+        let mut stmt = sqlite.prepare(sql).unwrap();
+        let columns = stmt.column_count();
+        let expected: Vec<Vec<rusqlite::types::Value>> = stmt
+            .query_map([], |row| {
+                (0..columns).map(|column| row.get(column)).collect()
+            })
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        // Legacy fills a bare column next to max() from the first row, not
+        // from the row of the maximum, so only HIR's rows are compared.
+        assert_eq!(limbo_exec_rows(&hir, sql), expected, "{sql}");
+    }
+}

@@ -314,10 +314,25 @@ What stays a subquery still runs fast:
   starts each pass with no build row matched and ends it with its own
   unmatched build rows. A FULL hash join stays the block's first loop: the
   probe rows it adds must come out once, which legacy gets wrong. A block
-  with another RIGHT or FULL join does not hash. The build table is always
-  read in full, never through a materialized list of the rows that match
-  earlier tables, so a join legacy builds that way keeps its nested loops,
-  and the build keys need no Bloom filter.
+  with another RIGHT or FULL join does not hash. The build keys need no
+  Bloom filter.
+- Legacy's materialized build input (`HirHashBuildInput`): when the build
+  table was the probe of an earlier hash join, or has a term with an
+  earlier table that the hash keys do not cover, the loops before the
+  probe run once into a temporary table that the hash table is built from,
+  with legacy's cost and its check after the join search. Each hash row
+  carries the columns the query reads of every table those loops supply,
+  so the block's loops are the probe scan and the lookup, and the query
+  reads those tables from the hash row (`SourceBinding::Registers`),
+  including GROUP BY keys, bare aggregate columns and a later loop's seek.
+  EXPLAIN lists the loops that fill it under `MATERIALIZE hash build input
+  for <table>`; legacy then lists those tables once more after the loops,
+  which HIR does not (they are not read again), and nests a chain's
+  inputs inside each other where legacy lists them one after another.
+  Unlike legacy, HIR does not materialize in a block with an outer join
+  (the unmatched-row pass rescans the build table, which the input has no
+  table for), or in a block that reads an outer row: legacy fills the
+  input once and reuses it for every outer row, which returns wrong rows.
 
 These planning rules are ports of legacy's, sharing its cost formulas and
 order checks where the code allows:
