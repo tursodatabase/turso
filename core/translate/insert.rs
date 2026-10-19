@@ -533,6 +533,7 @@ pub fn translate_insert(
         TriggerTime::Before,
         None,
         &btree_table,
+        connection,
     );
 
     let dml_ctx =
@@ -1039,6 +1040,7 @@ pub fn translate_insert(
         TriggerTime::After,
         None,
         &btree_table,
+        connection,
     );
     let has_after_triggers = !relevant_after_triggers.is_empty();
     if has_after_triggers {
@@ -2218,6 +2220,7 @@ fn init_source_emission<'a>(
         TriggerEvent::Insert,
         None,
         ctx.table.as_ref(),
+        connection,
     );
 
     let (num_values, cursor_id) = match body {
@@ -3837,6 +3840,7 @@ fn emit_replace_delete_conflicting_row(
             ctx.conflict_rowid_reg,
             None,
             ctx.database_id,
+            connection,
         )?;
         if resolver.schema().has_child_fks(ctx.table.name.as_str()) {
             emit_fk_child_decrement_on_delete(
@@ -3847,6 +3851,7 @@ fn emit_replace_delete_conflicting_row(
                 ctx.conflict_rowid_reg,
                 ctx.database_id,
                 resolver,
+                connection,
             )?;
         }
         prepared

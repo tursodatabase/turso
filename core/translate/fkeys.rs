@@ -1497,6 +1497,14 @@ pub fn emit_fk_update_parent_actions(
     database_id: usize,
     resolver: &Resolver,
 ) -> Result<Vec<DeferredNewKeyProbePlan>> {
+    // Only NO ACTION / RESTRICT are checked here, regardless of this
+    // connection's FK-actions setting. A suppressed CASCADE / SET NULL / SET
+    // DEFAULT (see `fire_fk_update_actions`) gets neither its action nor this
+    // check: Turso's checks for those actions are immediate, not deferred, so
+    // checking an FK the replay knows will be fixed up by a separately
+    // replayed child row would fail before that row arrives in the same
+    // transaction. The replay relies on the captured rows being consistent
+    // on their own.
     let mut deferred_new_key_plans = Vec::new();
     let check_fks: Vec<_> = affected_parent_fks
         .iter()
@@ -2107,6 +2115,7 @@ impl ForeignKeyActions<PreparedFkDeleteAction> {
     /// When present, an immediate `ON DELETE NO ACTION` check is skipped if the
     /// row being inserted right after the implicit delete restores the same
     /// parent key, because that delete cannot leave any child orphaned.
+    #[allow(clippy::too_many_arguments)]
     pub fn prepare_fk_delete_actions(
         program: &mut ProgramBuilder,
         resolver: &mut Resolver,
@@ -2115,11 +2124,13 @@ impl ForeignKeyActions<PreparedFkDeleteAction> {
         parent_rowid_reg: usize,
         replace_new_parent_regs: Option<(usize, usize)>,
         database_id: usize,
+        connection: &Arc<Connection>,
     ) -> Result<ForeignKeyActions<PreparedFkDeleteAction>> {
         let parent_bt = resolver
             .with_schema(database_id, |s| s.get_btree_table(parent_table_name))
             .ok_or_else(|| LimboError::InternalError("parent not btree".into()))?;
 
+        let fk_actions_enabled = connection.fk_actions_enabled();
         let mut prepared = Vec::new();
 
         for fk_ref in resolver.with_schema(database_id, |s| {
@@ -2205,6 +2216,11 @@ impl ForeignKeyActions<PreparedFkDeleteAction> {
                         database_id,
                         resolver,
                     )?;
+                }
+                on_delete if fk_action_suppressed(on_delete, fk_actions_enabled) => {
+                    // FK actions are off on this connection: leave this row
+                    // alone, same as RESTRICT/NO ACTION above but without a
+                    // check (see `fk_action_suppressed`).
                 }
                 RefAct::Cascade | RefAct::SetNull | RefAct::SetDefault => {
                     // Decode encoded values so they match the subprogram's decoded column reads
@@ -2306,8 +2322,11 @@ pub fn fire_fk_update_actions(
     };
     let new_image_layout = ColumnLayout::from_btree(&parent_bt)?;
 
+    let fk_actions_enabled = connection.fk_actions_enabled();
     for fk_ref in affected_parent_fks {
-        if matches!(fk_ref.fk.on_update, RefAct::NoAction | RefAct::Restrict) {
+        if matches!(fk_ref.fk.on_update, RefAct::NoAction | RefAct::Restrict)
+            || fk_action_suppressed(fk_ref.fk.on_update, fk_actions_enabled)
+        {
             continue;
         }
 
@@ -2415,16 +2434,19 @@ pub fn emit_fk_drop_table_check(
         return Ok(());
     }
 
+    let fk_actions_enabled = connection.fk_actions_enabled();
     // Separate FK refs by action type:
     // - action_fk_refs: CASCADE, SET NULL, SET DEFAULT - need to fire action subprograms
     // - check_fk_refs: RESTRICT, NO ACTION - need violation counting
+    // A suppressed CASCADE / SET NULL / SET DEFAULT (FK actions off on this
+    // connection) is in neither list: see `fk_action_suppressed`.
     let action_fk_refs: Vec<_> = fk_refs
         .iter()
         .filter(|fk| {
             matches!(
                 fk.fk.on_delete,
                 RefAct::Cascade | RefAct::SetNull | RefAct::SetDefault
-            )
+            ) && !fk_action_suppressed(fk.fk.on_delete, fk_actions_enabled)
         })
         .collect();
     let check_fk_refs: Vec<_> = fk_refs
@@ -2648,6 +2670,22 @@ pub fn emit_fk_drop_table_check(
     }
 
     Ok(())
+}
+
+/// Whether this connection's FK-actions setting suppresses the CASCADE / SET
+/// NULL / SET DEFAULT action for a foreign key whose parent row changed.
+///
+/// Suppressing the action does not fall back to a NO ACTION check: Turso's
+/// parent-side FK checks are immediate, not deferred, so checking an FK the
+/// replay knows a separately captured and separately replayed child row will
+/// fix up would fail before that row arrives in the same transaction. The
+/// row is simply left alone here, same as RESTRICT/NO ACTION already are.
+fn fk_action_suppressed(on_action: RefAct, fk_actions_enabled: bool) -> bool {
+    !fk_actions_enabled
+        && matches!(
+            on_action,
+            RefAct::Cascade | RefAct::SetNull | RefAct::SetDefault
+        )
 }
 
 #[cfg(test)]

@@ -363,7 +363,16 @@ pub fn emit_fk_child_decrement_on_delete(
     child_rowid_reg: usize,
     database_id: usize,
     resolver: &Resolver,
+    connection: &Arc<Connection>,
 ) -> crate::Result<()> {
+    if !connection.fk_actions_enabled() {
+        // While FK actions are off, a CASCADE/SET NULL/SET DEFAULT action on the
+        // parent side is suppressed (fk_action_suppressed), so a parent delete or
+        // update can leave this child row's parent missing without that ever
+        // being counted as a deferred violation. Decrementing here anyway would
+        // cancel a real violation's count instead.
+        return Ok(());
+    }
     for fk_ref in
         resolver.with_schema(database_id, |s| s.resolved_fks_for_child(child_table_name))?
     {
@@ -554,6 +563,7 @@ fn emit_delete_insns<'a>(
             TriggerEvent::Delete,
             None,
             &btree_table,
+            connection,
         )
     } else {
         false
@@ -706,6 +716,7 @@ fn emit_delete_row_common(
                     rowid_reg,
                     None,
                     delete_db_id,
+                    connection,
                 )?
             } else {
                 ForeignKeyActions::default()
@@ -722,6 +733,7 @@ fn emit_delete_row_common(
                     rowid_reg,
                     delete_db_id,
                     &t_ctx.resolver,
+                    connection,
                 )?;
             }
             prepared
@@ -951,6 +963,7 @@ fn emit_delete_insns_when_triggers_present(
             TriggerEvent::Delete,
             None,
             &btree_table,
+            connection,
         )
     } else {
         false
@@ -988,6 +1001,7 @@ fn emit_delete_insns_when_triggers_present(
             TriggerTime::Before,
             None,
             &btree_table,
+            connection,
         );
         if !relevant_triggers.is_empty() {
             let columns_start_reg = columns_start_reg
@@ -1054,6 +1068,7 @@ fn emit_delete_insns_when_triggers_present(
             TriggerTime::After,
             None,
             &btree_table,
+            connection,
         );
         if !relevant_triggers.is_empty() {
             let columns_start_reg = columns_start_reg

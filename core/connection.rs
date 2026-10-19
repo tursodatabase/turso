@@ -9,7 +9,8 @@ use crate::storage::{
 };
 use crate::sync::{
     atomic::{
-        AtomicBool, AtomicI32, AtomicI64, AtomicIsize, AtomicU32, AtomicU64, AtomicU8, Ordering,
+        AtomicBool, AtomicI32, AtomicI64, AtomicIsize, AtomicU32, AtomicU64, AtomicU8, AtomicUsize,
+        Ordering,
     },
     Arc, Mutex, RwLock,
 };
@@ -532,6 +533,29 @@ pub struct Connection {
     /// Whether pragma foreign_keys=ON for this connection
     pub(super) fk_pragma: AtomicBool,
     pub(crate) fk_deferred_violations: AtomicIsize,
+    /// Whether non-TEMP triggers fire for statements prepared on this
+    /// connection. TEMP triggers always fire, matching SQLite's
+    /// `SQLITE_DBCONFIG_ENABLE_TRIGGER`. Not exposed as a PRAGMA: a SQL
+    /// client must not be able to turn off triggers a database relies on
+    /// for its own rules. Only a Rust API caller (the sync engine's row
+    /// replay) can set it.
+    pub(super) triggers_enabled: AtomicBool,
+    /// Whether CASCADE / SET NULL / SET DEFAULT foreign-key actions write
+    /// to the child table for statements prepared on this connection. When
+    /// off, those actions are skipped entirely: no child row is rewritten,
+    /// and (unlike SQLite's `SQLITE_FkNoAction`) the FK is not checked
+    /// either, because Turso's parent-side FK checks are immediate rather
+    /// than deferred (see `fk_action_suppressed` in
+    /// core/translate/fkeys.rs). Not exposed as a PRAGMA, for the same
+    /// reason as `triggers_enabled`.
+    pub(super) fk_actions_enabled: AtomicBool,
+    /// Depth of nested replay sessions open on this connection (see
+    /// `enter_replay_session` / `exit_replay_session`). A replay session saves
+    /// `triggers_enabled`/`fk_actions_enabled` on entry and restores them on
+    /// exit, so sessions on the same connection must close in the reverse of
+    /// the order they opened in (a stack), or an outer session's restore would
+    /// clobber a still-open inner session's settings.
+    pub(super) replay_session_depth: AtomicUsize,
     /// Number of active top-level write statements on this connection.
     ///
     /// This is currently only 0 or 1. We return Busy instead of allowing a
@@ -1957,6 +1981,59 @@ impl Connection {
 
     pub fn foreign_keys_enabled(&self) -> bool {
         self.fk_pragma.load(Ordering::Acquire)
+    }
+
+    /// Turns non-TEMP triggers on or off for statements prepared from now on.
+    /// TEMP triggers keep firing either way (SQLite's
+    /// `SQLITE_DBCONFIG_ENABLE_TRIGGER` rule). Already-prepared statements are
+    /// unaffected until they are reprepared.
+    pub fn set_triggers_enabled(&self, enable: bool) {
+        self.triggers_enabled.store(enable, Ordering::Release);
+        self.bump_prepare_context_generation();
+    }
+
+    pub fn triggers_enabled(&self) -> bool {
+        self.triggers_enabled.load(Ordering::Acquire)
+    }
+
+    /// Turns CASCADE / SET NULL / SET DEFAULT foreign-key actions on or off
+    /// for statements prepared from now on. While off, those actions are
+    /// skipped entirely: no child row is rewritten, and (unlike SQLite's
+    /// `SQLITE_FkNoAction`) they are not downgraded to a checked NO ACTION
+    /// either, because Turso's parent-side FK checks are immediate rather
+    /// than deferred (see `fk_action_suppressed` in core/translate/fkeys.rs).
+    /// RESTRICT and NO ACTION are unaffected. Already-prepared statements are
+    /// unaffected until they are reprepared.
+    pub fn set_fk_actions_enabled(&self, enable: bool) {
+        self.fk_actions_enabled.store(enable, Ordering::Release);
+        self.bump_prepare_context_generation();
+    }
+
+    pub fn fk_actions_enabled(&self) -> bool {
+        self.fk_actions_enabled.load(Ordering::Acquire)
+    }
+
+    /// Records that a new replay session is opening on this connection and
+    /// returns the depth it occupies in the stack of sessions open on this
+    /// connection. Pass the returned depth to `exit_replay_session` when the
+    /// session ends.
+    pub fn enter_replay_session(&self) -> usize {
+        self.replay_session_depth.fetch_add(1, Ordering::AcqRel) + 1
+    }
+
+    /// Records that the replay session at `depth` (the value `enter_replay_session`
+    /// returned for it) is closing. `depth` must be the current top of the stack:
+    /// replay sessions on the same connection must close in the reverse of the
+    /// order they opened in, the same way nested scopes do, or an outer session's
+    /// restore of `triggers_enabled`/`fk_actions_enabled` would clobber a still-open
+    /// inner session's settings.
+    pub fn exit_replay_session(&self, depth: usize) {
+        let current = self.replay_session_depth.load(Ordering::Acquire);
+        debug_assert_eq!(
+            current, depth,
+            "replay sessions on a connection must close in the reverse of the order they opened in"
+        );
+        self.replay_session_depth.fetch_sub(1, Ordering::AcqRel);
     }
 
     pub fn set_check_constraints_ignored(&self, ignore: bool) {
