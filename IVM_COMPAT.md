@@ -158,7 +158,8 @@ value of each class.
 | Direct writes to a materialized view | ❌ No | Materialized views are read-only query results. |
 | `CREATE INDEX` on a materialized view | ❌ No | Rejected. View maintenance does not yet keep secondary indexes up to date; see "Indexes on materialized views" in docs/ivm-vdbe-rewrite-writeup.md. |
 | `TEMP` / `TEMPORARY` materialized views | ❌ No | |
-| Experimental MVCC mode | ❌ No | Materialized views currently require the regular WAL-backed transaction path. |
+| Experimental MVCC mode, plain transaction | ✅ Yes | A plain `BEGIN` (or autocommit) transaction takes MVCC's single exclusive-writer slot, so maintenance always runs against one consistent view of the base tables. |
+| Experimental MVCC mode, `BEGIN CONCURRENT` | ❌ No | Each concurrent transaction would maintain the view against its own snapshot; two transactions that each write one side of a join, or into the same aggregate group, could both commit without ever seeing the other's write. Rejected with a clear error until maintenance runs in commit order. |
 
 Queries *reading* a materialized view use the regular query engine. The
 restrictions above apply to the persistent defining query and its incremental

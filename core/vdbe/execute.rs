@@ -12637,6 +12637,20 @@ fn change_log_route(
     if dependent_views.is_empty() {
         return Ok(None);
     }
+    // View maintenance needs the exclusive writer slot, so a BEGIN CONCURRENT
+    // transaction may only write a viewed table once it holds that slot.
+    if let Some((tx_id, _)) = program.connection.get_mv_tx() {
+        let mv_store = program.connection.mv_store_for_db(MAIN_DB_ID).expect(
+            "a materialized view write under MVCC must have a mv_store for the main database",
+        );
+        if !mv_store.is_exclusive_tx(&tx_id) {
+            let view_name = dependent_views.first().expect("checked non-empty above");
+            return Err(LimboError::TxError(format!(
+                "cannot modify table \"{}\" in a BEGIN CONCURRENT transaction: materialized view \"{view_name}\" depends on it; use BEGIN instead",
+                cursor_table.name
+            )));
+        }
+    }
     // Maintenance write cursors intentionally use a synthetic physical
     // descriptor that includes the trailing weight column. Resolve the bound
     // cursor back to the schema-owned descriptor so change capture always
@@ -12809,12 +12823,10 @@ pub fn op_insert(
                     .as_ref()
                     .is_some_and(|route| !route.dependent_views.is_empty());
                 state.active_op_state.insert().route = route;
-                // If there are no dependent views, we don't need to capture the old record.
-                // We also don't need to do it if the rowid of the UPDATEd row was changed, because
-                // op_delete already captured the deletion for IVM, and this insert only needs to
-                // record the new row (which ApplyViewChange handles without old_record).
+                // No dependent views, or a Delete on this cursor already captured the
+                // old row for IVM: this insert only needs to record the new row.
                 let needs_capture =
-                    has_change_log_subscribers && !flag.has(InsertFlags::UPDATE_ROWID_CHANGE);
+                    has_change_log_subscribers && !flag.has(InsertFlags::OLD_ROW_DELETED);
 
                 if flag.has(InsertFlags::REQUIRE_SEEK) {
                     state.active_op_state.insert().sub_state = OpInsertSubState::Seek;
@@ -12857,7 +12869,7 @@ pub fn op_insert(
                     .as_ref()
                     .is_some_and(|route| !route.dependent_views.is_empty());
                 let needs_capture =
-                    has_change_log_subscribers && !flag.has(InsertFlags::UPDATE_ROWID_CHANGE);
+                    has_change_log_subscribers && !flag.has(InsertFlags::OLD_ROW_DELETED);
                 if needs_capture {
                     state.active_op_state.insert().sub_state = OpInsertSubState::CaptureRecord;
                 } else {
@@ -12931,7 +12943,7 @@ pub fn op_insert(
                 // Delete+Insert update pattern.
                 state.active_op_state.insert().is_noop_update = false;
                 let may_be_noop_update = flag.has(InsertFlags::SKIP_LAST_ROWID)
-                    && !flag.has(InsertFlags::UPDATE_ROWID_CHANGE)
+                    && !flag.has(InsertFlags::OLD_ROW_DELETED)
                     && {
                         let cursor = get_cursor!(state, *cursor_id);
                         let cursor = cursor.as_btree_mut();

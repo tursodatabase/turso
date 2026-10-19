@@ -1,6 +1,5 @@
 @database :memory:
 @requires-file materialized_views ""
-@skip-file-if mvcc "materialized_views not supported with mvcc"
 @verify-materialized-views
 
 # Materialized views are maintained by compiled VDBE programs (filter/project
@@ -2070,7 +2069,7 @@ test matview-vdbe-left-then-inner-source-rowids {
     SELECT 'init', * FROM mixed_rowids ORDER BY 2;
     DELETE FROM rowid_l WHERE rowid = 2;
     SELECT 'removed', * FROM mixed_rowids ORDER BY 2;
-    INSERT INTO rowid_l VALUES (20);
+    INSERT INTO rowid_l(rowid, k) VALUES (2, 20);
     SELECT 'readded', * FROM mixed_rowids ORDER BY 2;
     INSERT INTO rowid_m VALUES (20, 'b');
     SELECT 'after', * FROM mixed_rowids ORDER BY 2;

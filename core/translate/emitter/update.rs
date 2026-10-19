@@ -2368,20 +2368,25 @@ fn emit_update_insns<'a>(
                 });
             }
 
+            // A Delete emitted above already captured and retracted the old
+            // row for any dependent view, so the Insert must not do it again.
+            let insert_flag = {
+                let mut flag = InsertFlags::new().skip_last_rowid();
+                if not_exists_check_required {
+                    // The previous Insn::NotExists and Insn::Delete seek to the old rowid,
+                    // so to insert a new user-provided rowid, we need to seek to the correct place.
+                    flag = flag.require_seek();
+                }
+                if needs_delete {
+                    flag = flag.old_row_deleted();
+                }
+                flag
+            };
             program.emit_insn(Insn::Insert {
                 cursor: target_table_cursor_id,
                 key_reg: effective_rowid_reg,
                 record_reg,
-                flag: if not_exists_check_required {
-                    // The previous Insn::NotExists and Insn::Delete seek to the old rowid,
-                    // so to insert a new user-provided rowid, we need to seek to the correct place.
-                    InsertFlags::new()
-                        .require_seek()
-                        .update_rowid_change()
-                        .skip_last_rowid()
-                } else {
-                    InsertFlags::new().skip_last_rowid()
-                },
+                flag: insert_flag,
                 table_name: target_table.identifier.clone(),
             });
 

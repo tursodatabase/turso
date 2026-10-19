@@ -1,6 +1,5 @@
 @database :memory:
 @requires-file materialized_views ""
-@skip-file-if mvcc "materialized_views not supported with mvcc"
 
 # A hex blob literal selected in a materialized view must come back as the
 # same blob bytes, not as the text of its hex digits.

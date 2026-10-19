@@ -1,6 +1,5 @@
 @database :memory:
 @requires-file materialized_views ""
-@skip-file-if mvcc "materialized_views not supported with mvcc"
 @verify-materialized-views
 
 # Reproducer for #3655: a materialized view built on top of a plain VIEW

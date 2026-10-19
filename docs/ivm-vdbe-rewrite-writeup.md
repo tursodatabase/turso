@@ -306,8 +306,17 @@ These are rejected at CREATE time:
   BY keys;
 - connection-registered custom collations on grouping, DISTINCT, MIN/MAX, or
   set-operation state keys;
-- materialized views on attached databases;
-- materialized views under experimental MVCC mode.
+- materialized views on attached databases.
+
+Materialized views are supported under MVCC for a plain transaction (BEGIN,
+or autocommit), which takes MVCC's single exclusive-writer slot, so
+maintenance always runs against one consistent view of the base tables. A
+BEGIN CONCURRENT transaction maintains a view against its own snapshot, so two
+concurrent transactions that each write one side of a join, or into the same
+aggregate group, can both commit without ever seeing the other's write,
+permanently losing that change from the view. Any write that would need view
+maintenance is therefore rejected while a BEGIN CONCURRENT transaction is
+running, with a clear error, until maintenance runs in commit order instead.
 
 Non-recursive CTEs and FROM subqueries are not gaps.
 Recursive CTEs and writable `WITHOUT ROWID` tables are not counted as IVM gaps

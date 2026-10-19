@@ -178,7 +178,7 @@ impl IdxInsertFlags {
 pub struct InsertFlags(pub u8);
 
 impl InsertFlags {
-    pub const UPDATE_ROWID_CHANGE: u8 = 0x01; // Flag indicating this is part of an UPDATE statement where the row's rowid is changed
+    pub const OLD_ROW_DELETED: u8 = 0x01; // Flag indicating a Delete on this cursor already removed the row this Insert is replacing
     pub const REQUIRE_SEEK: u8 = 0x02; // Flag indicating that a seek is required to insert the row
     pub const EPHEMERAL_TABLE_INSERT: u8 = 0x04; // Flag indicating that this is an insert into an ephemeral table
     pub const SKIP_LAST_ROWID: u8 = 0x08; // Flag indicating that last_insert_rowid() must not be updated
@@ -198,8 +198,8 @@ impl InsertFlags {
         self
     }
 
-    pub fn update_rowid_change(mut self) -> Self {
-        self.0 |= InsertFlags::UPDATE_ROWID_CHANGE;
+    pub fn old_row_deleted(mut self) -> Self {
+        self.0 |= InsertFlags::OLD_ROW_DELETED;
         self
     }
 
