@@ -90,3 +90,49 @@ test view-rejects-explicit-temp-qualified-source {
 expect error {
     cannot reference
 }
+
+# A TEMP view carries no database restriction at all (SQLite's schema fixer
+# skips TEMP objects outright - src/attach.c, sqlite3FixInit sets bTemp for
+# iDb==1 and fixSelectCb only binds a from-item to the view's own schema when
+# bTemp is 0). So unqualified "sqlite_master"/"sqlite_schema" inside a TEMP
+# view's body must keep naming main's schema table, exactly like an ordinary
+# top-level query - never the TEMP view's own schema just because the body
+# is compiled with a database scope set.
+test temp-view-over-sqlite-master-reads-main-schema {
+    CREATE TABLE m(a);
+    CREATE TEMP VIEW tv AS SELECT name FROM sqlite_master;
+    SELECT * FROM tv;
+}
+expect {
+    m
+}
+
+test temp-view-over-sqlite-schema-reads-main-schema {
+    CREATE TABLE m(a);
+    CREATE TEMP VIEW tv AS SELECT name FROM sqlite_schema;
+    SELECT * FROM tv;
+}
+expect {
+    m
+}
+
+test temp-table-as-select-from-temp-view-over-sqlite-master {
+    CREATE TABLE m(a);
+    CREATE TEMP VIEW tv AS SELECT name FROM sqlite_master;
+    CREATE TEMP TABLE out AS SELECT * FROM tv;
+    SELECT * FROM out;
+}
+expect {
+    m
+}
+
+test temp-view-unions-sqlite-schema-with-main-view {
+    CREATE TABLE m(a);
+    CREATE VIEW mv AS SELECT name FROM sqlite_master;
+    CREATE TEMP VIEW tv AS SELECT name FROM sqlite_schema UNION SELECT name FROM mv;
+    SELECT * FROM tv;
+}
+expect {
+    m
+    mv
+}

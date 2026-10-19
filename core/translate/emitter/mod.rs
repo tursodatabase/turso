@@ -853,15 +853,16 @@ impl<'a> Resolver<'a> {
     }
 
     pub(crate) fn resolve_existing_table_database_id(&self, table_name: &str) -> Result<usize> {
+        // A TEMP view or trigger carries a scope (so explicit `aux.table`
+        // references still see its own database below), but the scope does
+        // not restrict unqualified names: SQLite's schema fixer skips TEMP
+        // objects entirely (`bTemp` in sqlite3FixInit, attach.c:547, checked
+        // by fixSelectCb at attach.c:495), so a TEMP view resolves names the
+        // same way a top-level query does, sqlite_schema included.
         if let Some(ctx) = self.database_scope.borrow().as_ref() {
             if ctx.restricts_db_references() {
                 return Ok(ctx.database_id);
             }
-
-            return self.resolve_unqualified_existing_database_id(
-                table_name,
-                Self::schema_has_table_like_object,
-            );
         }
 
         if let Some(database_id) = Self::resolve_schema_table_database_id(table_name) {
