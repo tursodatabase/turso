@@ -3619,6 +3619,21 @@ pub(crate) fn hir_or_union_with_cost(
                 prior_sources,
                 source_position,
             )?);
+            // Like legacy, a branch whose leftover condition runs a subquery
+            // keeps the table scanned.
+            let leftover_runs_subquery = terms.iter().any(|term| {
+                let mut runs = false;
+                if !term.consumed {
+                    term.expr.for_each(&mut |expression| {
+                        runs |= matches!(expression, hir::Expr::Subquery(_));
+                    });
+                }
+                runs
+            });
+            if leftover_runs_subquery {
+                branches.clear();
+                break;
+            }
             covers_term &= terms.iter().all(|term| term.consumed);
         }
         if branches.is_empty() {

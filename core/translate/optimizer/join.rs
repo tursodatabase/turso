@@ -737,6 +737,10 @@ fn join_lhs_and_rhs<'a>(
             );
             if allow_hash_join {
                 let lhs_constraints = build_constraints;
+                let rhs_is_outer = rhs_table_reference
+                    .join_info
+                    .as_ref()
+                    .is_some_and(crate::translate::plan::JoinInfo::is_outer);
                 if let Some(hash_join_method) = try_hash_join_access_method(
                     build_table,
                     rhs_table_reference,
@@ -747,10 +751,18 @@ fn join_lhs_and_rhs<'a>(
                     where_clause,
                     where_terms.iter().enumerate().filter_map(|(index, term)| {
                         let (left, right, owner) = term.equal_tables?;
-                        // An outer join condition belongs to that join only.
-                        owner
-                            .is_none_or(|owner| owner == rhs_table_reference.internal_id)
-                            .then_some((index, left, right))
+                        // An outer join condition belongs to that join only,
+                        // and an outer hash join takes its keys from its own
+                        // ON terms only: a WHERE term used as a key would
+                        // never be checked on the rows the join NULL-fills,
+                        // which it must reject.
+                        let own_on_term = owner == Some(rhs_table_reference.internal_id);
+                        let usable = if rhs_is_outer {
+                            own_on_term
+                        } else {
+                            owner.is_none() || own_on_term
+                        };
+                        usable.then_some((index, left, right))
                     }),
                     build_cardinality,
                     probe_cardinality,
@@ -2613,19 +2625,29 @@ fn hir_join_step(
                         schema,
                         params,
                     )? {
-                        let union_cost = Cost(union_cost.0 * input_cardinality);
-                        if union_cost.0 < method.cost.0 {
-                            method = AccessMethod {
-                                cost: union_cost,
-                                estimated_rows_per_outer_row: union_rows,
-                                consumed_where_terms: Default::default(),
-                                params: AccessMethodParams::BTreeTable {
-                                    iter_dir: crate::translate::plan::IterationDirection::Forwards,
-                                    index: None,
-                                    build_index: false,
-                                    constraint_refs: Vec::new(),
-                                },
-                            };
+                        let union_method = AccessMethod {
+                            cost: Cost(union_cost.0 * input_cardinality),
+                            estimated_rows_per_outer_row: union_rows,
+                            consumed_where_terms: Default::default(),
+                            params: AccessMethodParams::BTreeTable {
+                                iter_dir: crate::translate::plan::IterationDirection::Forwards,
+                                index: None,
+                                build_index: false,
+                                constraint_refs: Vec::new(),
+                            },
+                        };
+                        // Like legacy, both sides count the WHERE terms the
+                        // rows they return still have to pass.
+                        let with_where = |method: &AccessMethod| {
+                            super::access_method::cost_with_where_work(
+                                method,
+                                &ready_where,
+                                input_cardinality,
+                                params,
+                            )
+                        };
+                        if with_where(&union_method) < with_where(&method) {
+                            method = union_method;
                         }
                     }
                 }
@@ -2933,12 +2955,17 @@ fn hir_try_hash_join_access_method(
 
     // Port of `find_hash_join_keys`: `=` terms whose sides each read one of
     // the two tables. An outer join condition belongs to that join only.
+    // Unlike legacy, an outer hash join takes its keys from its own ON terms
+    // only: a WHERE term used as a key would never be checked on the rows
+    // the join NULL-fills, which it must reject (`... FULL JOIN u ON t.x =
+    // u.x WHERE t.x = u.x` returns the matched rows only).
     let mut join_keys: SmallVec<[HashJoinKey; 2]> = SmallVec::new();
     for (index, term) in where_clause.iter().enumerate() {
-        if term
-            .from_outer_join
-            .is_some_and(|owner| owner != probe_source.internal_id)
-        {
+        let own_on_term = term.from_outer_join == Some(probe_source.internal_id);
+        if term.from_outer_join.is_some() && !own_on_term {
+            continue;
+        }
+        if hash_join_type != HashJoinType::Inner && !own_on_term {
             continue;
         }
         let hir::Expr::Binary {

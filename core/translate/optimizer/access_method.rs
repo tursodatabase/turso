@@ -1067,7 +1067,7 @@ pub(super) fn choose_single_btree_access_method<E, I, O>(
 }
 
 /// Add the cost of ready `WHERE` conditions.
-fn cost_with_where_work(
+pub(super) fn cost_with_where_work(
     method: &AccessMethod,
     ready_where: &[(usize, usize)],
     input_cardinality: f64,

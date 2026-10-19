@@ -207,9 +207,10 @@ HIR keeps legacy's FULL JOIN errors for shapes legacy has no hash plan for
 subqueries next to FULL JOIN. HIR matches SQLite where legacy does not:
 `a, b FULL JOIN c ... WHERE ...` (legacy returns extra rows), RIGHT JOIN
 followed by another join (legacy returns columns in the wrong order), and
-`outer_hash_join: full-outer-with-where-equijoin` (legacy ignores a WHERE term
-that repeats the ON term). Both still reject a RIGHT JOIN after another join,
-during analysis.
+Both still reject a RIGHT JOIN after another join, during analysis. An outer
+hash join takes its keys from its own ON terms only, in both engines: a WHERE
+term used as a key was never checked on the rows the join NULL-fills, so
+`t FULL JOIN u ON t.x = u.x WHERE t.x = u.x` returned those rows too.
 
 EXPLAIN QUERY PLAN names each loop of a block before any cursor opens, as
 legacy does, so simple plans print the same rows with the same ids. Plans
@@ -344,6 +345,10 @@ order checks where the code allows:
   directions replace both sorters.
 - `x IS NULL` (and `x ISNULL`) seeks an index on x, with `IS`'s outer-join
   rule.
+- Like legacy's multi-index OR, the join search weighs reading a table as
+  one seek per branch of an OR term against its best other access, with
+  the WHERE work each leaves on both sides, and a branch whose leftover
+  condition runs a subquery keeps the table scanned.
 - A FROM subquery or CTE that earlier loops constrain is stored once and read
   through a temporary index on those columns when that costs less
   (`find_best_access_method_for_subquery`), except when it reads an outer row
