@@ -562,6 +562,51 @@ impl Fuzzer {
         }
     }
 
+    /// Run one statement the IVM mode adds on its own (not drawn from the
+    /// generator) on both engines, then check every materialized view.
+    fn run_ivm_statement(
+        &self,
+        ivm: &IvmState,
+        schema: &sql_gen::Schema,
+        sql: &str,
+        label: &str,
+        stats: &mut SimStats,
+        executed_sql: &mut Vec<String>,
+    ) -> Result<()> {
+        let stmt = GeneratedStatement {
+            sql: sql.to_string(),
+            is_ddl: false,
+            mutates_data: true,
+            has_unordered_limit: false,
+            unordered_limit_reason: None,
+            check_unnesting_invariant: false,
+        };
+        match check_differential(&self.turso_conn, &self.sqlite_conn, schema, &stmt) {
+            OracleResult::Fail(reason) => {
+                stats.oracle_failures += 1;
+                executed_sql.push(format!("-- {label} FAILED: {sql}"));
+                return Err(anyhow::anyhow!("{label} failed: {sql}\n{reason}"));
+            }
+            OracleResult::Skipped(reason) => {
+                executed_sql.push(format!("-- {label} SKIPPED ({reason}): {sql}"));
+                return Ok(());
+            }
+            OracleResult::Pass
+            | OracleResult::PassWithUnnestingInvariant
+            | OracleResult::Warning(_) => {}
+        }
+        executed_sql.push(format!("-- {label}"));
+        executed_sql.push(sql.to_string());
+        if let OracleResult::Fail(reason) = ivm.check_views(&self.turso_conn) {
+            stats.oracle_failures += 1;
+            executed_sql.push(format!("-- IVM FAILED after {label}: {sql}"));
+            return Err(anyhow::anyhow!(
+                "IVM invariant failed after {label}: {sql}\n{reason}"
+            ));
+        }
+        Ok(())
+    }
+
     fn run_inner(
         &self,
         stats: &mut SimStats,
@@ -636,42 +681,15 @@ impl Fuzzer {
                             // exercising identity, arrangement, and
                             // cancellation paths without perturbing the
                             // generator's data distribution.
-                            for probe_sql in leaf_probes {
-                                let probe = GeneratedStatement {
-                                    sql: probe_sql.clone(),
-                                    is_ddl: false,
-                                    mutates_data: true,
-                                    has_unordered_limit: false,
-                                    unordered_limit_reason: None,
-                                    check_unnesting_invariant: false,
-                                };
-                                let result = check_differential(
-                                    &self.turso_conn,
-                                    &self.sqlite_conn,
+                            for probe_sql in &leaf_probes {
+                                self.run_ivm_statement(
+                                    ivm,
                                     &schema,
-                                    &probe,
-                                );
-                                if let OracleResult::Fail(reason) = result {
-                                    stats.oracle_failures += 1;
-                                    executed_sql
-                                        .push(format!("-- IVM LEAF PROBE FAILED: {probe_sql}"));
-                                    return Err(anyhow::anyhow!(
-                                        "IVM leaf mutation probe failed: {probe_sql}\n{reason}"
-                                    ));
-                                }
-                                executed_sql.push("-- IVM leaf mutation probe".to_string());
-                                executed_sql.push(probe_sql.clone());
-                                if let OracleResult::Fail(reason) =
-                                    ivm.check_views(&self.turso_conn)
-                                {
-                                    stats.oracle_failures += 1;
-                                    executed_sql.push(format!(
-                                        "-- IVM FAILED after leaf probe: {probe_sql}"
-                                    ));
-                                    return Err(anyhow::anyhow!(
-                                        "IVM invariant failed after leaf mutation probe: {probe_sql}\n{reason}"
-                                    ));
-                                }
+                                    probe_sql,
+                                    "IVM leaf mutation probe",
+                                    stats,
+                                    executed_sql,
+                                )?;
                             }
                         }
                         Some(IvmCreateOutcome::Rejected {
@@ -689,6 +707,26 @@ impl Fuzzer {
                             }
                         }
                         None => {}
+                    }
+                }
+                // Statements that fail in FAIL mode keep the rows written
+                // before the error; drive them, with a savepoint, through an
+                // explicit transaction. Only from autocommit, so the script
+                // owns the whole transaction.
+                if ivm.wants_fail_mode_transaction(i) && self.turso_conn.get_auto_commit() {
+                    let script = {
+                        let mut rng = self.rng.borrow_mut();
+                        ivm.fail_mode_transaction(&self.turso_conn, &schema, &mut rng)
+                    };
+                    for sql in script.iter().flatten() {
+                        self.run_ivm_statement(
+                            ivm,
+                            &schema,
+                            sql,
+                            "IVM FAIL-mode transaction",
+                            stats,
+                            executed_sql,
+                        )?;
                     }
                 }
             }

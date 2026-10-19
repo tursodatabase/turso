@@ -151,6 +151,134 @@ impl IvmState {
         }
     }
 
+    /// Whether the runner should run a FAIL-mode transaction (see
+    /// `fail_mode_transaction`) at this statement index.
+    pub fn wants_fail_mode_transaction(&self, stmt_index: usize) -> bool {
+        !self.views.is_empty()
+            && stmt_index % CREATE_ATTEMPT_INTERVAL == CREATE_ATTEMPT_INTERVAL / 2
+    }
+
+    /// Build an explicit transaction whose statements end with a FAIL-mode
+    /// error partway through their rows, mixed with a savepoint:
+    ///
+    /// ```sql
+    /// BEGIN;
+    /// INSERT OR FAIL INTO t(rowid, ..) <copy of row r1 under a new rowid>
+    ///                                  UNION ALL <row r2 under its own rowid>;
+    /// SAVEPOINT s;
+    /// UPDATE OR FAIL t SET rowid = .. WHERE rowid IN (r1, r2);
+    /// INSERT INTO t(rowid, ..) <new copy of r1> UNION ALL <r2 again>;
+    /// ROLLBACK TO s;   -- or RELEASE s
+    /// COMMIT;          -- or ROLLBACK
+    /// ```
+    ///
+    /// FAIL keeps the rows written before the conflict, so those rows must
+    /// reach the views even though the statement fails; the plain INSERT
+    /// aborts and must leave nothing behind. `r1 < r2` are the table's two
+    /// smallest rowids, read from Turso (both engines hold the same rows).
+    /// Returns `None` when no main-database table has two rows.
+    pub fn fail_mode_transaction(
+        &self,
+        turso_conn: &Arc<turso_core::Connection>,
+        schema: &Schema,
+        rng: &mut ChaCha8Rng,
+    ) -> Option<Vec<String>> {
+        let tables: Vec<&Table> = schema
+            .tables
+            .iter()
+            .filter(|table| table.database.is_none())
+            .collect();
+        if tables.is_empty() {
+            return None;
+        }
+        let table = tables[rng.random_range(0..tables.len())];
+        let name = quoted(&table.name);
+        let rowids_sql = format!("SELECT rowid FROM {name} ORDER BY rowid LIMIT 2");
+        let QueryResult::Rows(rows) = DifferentialOracle::execute_turso(turso_conn, &rowids_sql)
+        else {
+            return None;
+        };
+        let rowids: Vec<i64> = rows
+            .rows()
+            .iter()
+            .filter_map(|row| match row.0.first() {
+                Some(query_result_oracle::Value::Integer(rowid)) => Some(*rowid),
+                _ => None,
+            })
+            .collect();
+        let [r1, r2] = rowids[..] else {
+            return None;
+        };
+        // New rowids far above the generated ones, so only the deliberate
+        // conflicts below can collide.
+        let offset = 1_000_000_000 + rng.random_range(0..1_000_000i64);
+        let moved_r1 = r1.checked_add(offset)?;
+        let copied_r1 = r1.checked_add(offset.checked_mul(2)?)?;
+        let aborted_r1 = r1.checked_add(offset.checked_mul(3)?)?;
+
+        // The INTEGER PRIMARY KEY column is the rowid, which is set
+        // explicitly. A copy of a UNIQUE column would conflict on the first
+        // row already, so copy NULL instead where the column allows it.
+        let unique_index_columns: Vec<&String> = schema
+            .indexes
+            .iter()
+            .filter(|index| {
+                index.unique && index.database.is_none() && index.table_name == table.name
+            })
+            .flat_map(|index| index.columns.iter())
+            .collect();
+        let columns: Vec<&ColumnDef> = table
+            .columns
+            .iter()
+            .filter(|column| !(column.primary_key && column.data_type == DataType::Integer))
+            .collect();
+        let mut target = String::from("rowid");
+        let mut copied = String::new();
+        for column in &columns {
+            let column_name = quoted(&column.name);
+            target.push_str(", ");
+            target.push_str(&column_name);
+            copied.push_str(", ");
+            let unique = column.unique || unique_index_columns.contains(&&column.name);
+            if unique && column.nullable {
+                copied.push_str("NULL");
+            } else {
+                copied.push_str(&column_name);
+            }
+        }
+        let copy_r1_then_conflict_on_r2 = |new_rowid: i64| {
+            format!(
+                "INSERT {{conflict}}INTO {name} ({target}) \
+                 SELECT {new_rowid}{copied} FROM {name} WHERE rowid = {r1} \
+                 UNION ALL SELECT rowid{copied} FROM {name} WHERE rowid = {r2}"
+            )
+        };
+        let savepoint = "ivm_fail_sp";
+        Some(vec![
+            "BEGIN".to_string(),
+            copy_r1_then_conflict_on_r2(moved_r1).replace("{conflict}", "OR FAIL "),
+            format!("SAVEPOINT {savepoint}"),
+            // Rows are visited in rowid order: r1 moves to a new rowid, then
+            // r2 tries to take the rowid the FAIL insert just used (it
+            // conflicts when that insert kept its first row).
+            format!(
+                "UPDATE OR FAIL {name} SET rowid = CASE rowid WHEN {r1} THEN {copied_r1} \
+                 ELSE {moved_r1} END WHERE rowid IN ({r1}, {r2})"
+            ),
+            copy_r1_then_conflict_on_r2(aborted_r1).replace("{conflict}", ""),
+            if rng.random_bool(0.5) {
+                format!("ROLLBACK TO {savepoint}")
+            } else {
+                format!("RELEASE {savepoint}")
+            },
+            if rng.random_bool(0.8) {
+                "COMMIT".to_string()
+            } else {
+                "ROLLBACK".to_string()
+            },
+        ])
+    }
+
     /// Verify the IVM invariant for every tracked view: the materialized
     /// contents (as a user would read them) must equal a fresh evaluation of
     /// the defining query, as multisets.
