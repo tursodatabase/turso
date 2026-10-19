@@ -1002,6 +1002,35 @@ pub fn translate_insert(
         table_name: btree_table.name.clone(),
     });
 
+    // CDC must capture the row right after the INSERT updated the table, before any AFTER
+    // trigger or FK action this INSERT fires can write further CDC rows of their own.
+    if let Some((cdc_cursor_id, _)) = &ctx.cdc_table {
+        let cdc_has_after = program.capture_data_changes_info().has_after();
+        let after_record_reg = if cdc_has_after {
+            Some(emit_cdc_patch_record(
+                program,
+                &table,
+                insertion.first_col_register(),
+                insertion.record_register(),
+                insertion.key_register(),
+                &ColumnLayout::from_table(&table)?,
+            ))
+        } else {
+            None
+        };
+        emit_cdc_insns(
+            program,
+            resolver,
+            OperationMode::INSERT,
+            *cdc_cursor_id,
+            insertion.key_register(),
+            None,
+            after_record_reg,
+            None,
+            table_name.as_str(),
+        )?;
+    }
+
     // Fire AFTER INSERT triggers
     let relevant_after_triggers = get_triggers_including_temp(
         resolver,
@@ -1119,34 +1148,6 @@ pub fn translate_insert(
                 cursor_id: seq_cursor_id,
             });
         }
-    }
-
-    // Emit update in the CDC table if necessary (after the INSERT updated the table)
-    if let Some((cdc_cursor_id, _)) = &ctx.cdc_table {
-        let cdc_has_after = program.capture_data_changes_info().has_after();
-        let after_record_reg = if cdc_has_after {
-            Some(emit_cdc_patch_record(
-                program,
-                &table,
-                insertion.first_col_register(),
-                insertion.record_register(),
-                insertion.key_register(),
-                &ColumnLayout::from_table(&table)?,
-            ))
-        } else {
-            None
-        };
-        emit_cdc_insns(
-            program,
-            resolver,
-            OperationMode::INSERT,
-            *cdc_cursor_id,
-            insertion.key_register(),
-            None,
-            after_record_reg,
-            None,
-            table_name.as_str(),
-        )?;
     }
 
     if !returning_subqueries.is_empty() {

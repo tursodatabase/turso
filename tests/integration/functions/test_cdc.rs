@@ -2548,16 +2548,16 @@ fn test_cdc_trigger_after_insert_captures_trigger_row(db: TempDatabase) {
             vec![
                 Value::Integer(1),
                 Value::Integer(1),
-                Value::Text("audit".to_string())
+                Value::Text("t".to_string())
             ],
             vec![
                 Value::Integer(2),
                 Value::Integer(1),
-                Value::Text("t".to_string())
+                Value::Text("audit".to_string())
             ],
             vec![Value::Integer(3), Value::Integer(2), Value::Null],
         ],
-        "expected the trigger's audit INSERT, the root's own INSERT, then one COMMIT, each with a distinct increasing change id, got {rows:?}"
+        "expected the root's own INSERT, the trigger's audit INSERT, then one COMMIT, each with a distinct increasing change id, got {rows:?}"
     );
 }
 
@@ -2609,5 +2609,296 @@ fn test_cdc_fk_cascade_delete_captures_child_row(db: TempDatabase) {
             ],
         ],
         "expected the DELETE on parent, the cascade DELETE on child, then one COMMIT, each with a distinct increasing change id, got {rows:?}"
+    );
+}
+
+/// Non-COMMIT rows in `change_id` order, as (change_type, table_name, id). Each CDC row must
+/// appear in the order its write actually happened
+/// (https://github.com/tursodatabase/turso/issues/10149).
+fn cdc_change_order(conn: &std::sync::Arc<turso_core::Connection>) -> Vec<(i64, String, i64)> {
+    limbo_exec_rows(
+        conn,
+        "SELECT change_type, table_name, id FROM turso_cdc WHERE change_type != 2 ORDER BY change_id",
+    )
+    .into_iter()
+    .map(|row| {
+        let Value::Integer(change_type) = row[0] else {
+            panic!("expected integer change_type, got {:?}", row[0]);
+        };
+        let Value::Text(ref table_name) = row[1] else {
+            panic!("expected text table_name, got {:?}", row[1]);
+        };
+        let Value::Integer(id) = row[2] else {
+            panic!("expected integer id, got {:?}", row[2]);
+        };
+        (change_type, table_name.clone(), id)
+    })
+    .collect()
+}
+
+#[turso_macros::test]
+fn test_cdc_order_after_insert_trigger_follows_the_insert(db: TempDatabase) {
+    let conn = db.connect_limbo();
+    conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, x)")
+        .unwrap();
+    conn.execute("CREATE TABLE audit(id INTEGER PRIMARY KEY, msg)")
+        .unwrap();
+    conn.execute(
+        "CREATE TRIGGER t_ai AFTER INSERT ON t BEGIN INSERT INTO audit(msg) VALUES ('inserted ' || new.id); END",
+    )
+    .unwrap();
+    conn.execute("PRAGMA capture_data_changes_conn('full')")
+        .unwrap();
+
+    conn.execute("INSERT INTO t VALUES (1, 'a')").unwrap();
+
+    assert_eq!(
+        cdc_change_order(&conn),
+        vec![(1, "t".to_string(), 1), (1, "audit".to_string(), 1)]
+    );
+}
+
+#[turso_macros::test]
+fn test_cdc_order_after_update_trigger_follows_the_update(db: TempDatabase) {
+    let conn = db.connect_limbo();
+    conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, x)")
+        .unwrap();
+    conn.execute("CREATE TABLE audit(id INTEGER PRIMARY KEY, msg)")
+        .unwrap();
+    conn.execute("INSERT INTO t VALUES (1, 'a')").unwrap();
+    conn.execute(
+        "CREATE TRIGGER t_au AFTER UPDATE ON t BEGIN INSERT INTO audit(msg) VALUES ('updated ' || new.id); END",
+    )
+    .unwrap();
+    conn.execute("PRAGMA capture_data_changes_conn('full')")
+        .unwrap();
+
+    conn.execute("UPDATE t SET x = 'b' WHERE id = 1").unwrap();
+
+    assert_eq!(
+        cdc_change_order(&conn),
+        vec![(0, "t".to_string(), 1), (1, "audit".to_string(), 1)]
+    );
+}
+
+#[turso_macros::test]
+fn test_cdc_order_after_delete_trigger_follows_the_delete(db: TempDatabase) {
+    let conn = db.connect_limbo();
+    conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, x)")
+        .unwrap();
+    conn.execute("CREATE TABLE audit(id INTEGER PRIMARY KEY, msg)")
+        .unwrap();
+    conn.execute("INSERT INTO t VALUES (1, 'a')").unwrap();
+    conn.execute(
+        "CREATE TRIGGER t_ad AFTER DELETE ON t BEGIN INSERT INTO audit(msg) VALUES ('deleted ' || old.id); END",
+    )
+    .unwrap();
+    conn.execute("PRAGMA capture_data_changes_conn('full')")
+        .unwrap();
+
+    conn.execute("DELETE FROM t WHERE id = 1").unwrap();
+
+    assert_eq!(
+        cdc_change_order(&conn),
+        vec![(-1, "t".to_string(), 1), (1, "audit".to_string(), 1)]
+    );
+}
+
+#[turso_macros::test]
+fn test_cdc_order_before_insert_trigger_precedes_the_insert(db: TempDatabase) {
+    let conn = db.connect_limbo();
+    conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, x)")
+        .unwrap();
+    conn.execute("CREATE TABLE log(id INTEGER PRIMARY KEY, msg)")
+        .unwrap();
+    conn.execute(
+        "CREATE TRIGGER t_bi BEFORE INSERT ON t BEGIN INSERT INTO log(msg) VALUES ('before insert'); END",
+    )
+    .unwrap();
+    conn.execute("PRAGMA capture_data_changes_conn('full')")
+        .unwrap();
+
+    conn.execute("INSERT INTO t VALUES (1, 'a')").unwrap();
+
+    assert_eq!(
+        cdc_change_order(&conn),
+        vec![(1, "log".to_string(), 1), (1, "t".to_string(), 1)]
+    );
+}
+
+#[turso_macros::test]
+fn test_cdc_order_before_update_trigger_precedes_the_update(db: TempDatabase) {
+    let conn = db.connect_limbo();
+    conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, x)")
+        .unwrap();
+    conn.execute("CREATE TABLE log(id INTEGER PRIMARY KEY, msg)")
+        .unwrap();
+    conn.execute("INSERT INTO t VALUES (1, 'a')").unwrap();
+    conn.execute(
+        "CREATE TRIGGER t_bu BEFORE UPDATE ON t BEGIN INSERT INTO log(msg) VALUES ('before update'); END",
+    )
+    .unwrap();
+    conn.execute("PRAGMA capture_data_changes_conn('full')")
+        .unwrap();
+
+    conn.execute("UPDATE t SET x = 'b' WHERE id = 1").unwrap();
+
+    assert_eq!(
+        cdc_change_order(&conn),
+        vec![(1, "log".to_string(), 1), (0, "t".to_string(), 1)]
+    );
+}
+
+#[turso_macros::test]
+fn test_cdc_order_before_delete_trigger_precedes_the_delete(db: TempDatabase) {
+    let conn = db.connect_limbo();
+    conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, x)")
+        .unwrap();
+    conn.execute("CREATE TABLE log(id INTEGER PRIMARY KEY, msg)")
+        .unwrap();
+    conn.execute("INSERT INTO t VALUES (1, 'a')").unwrap();
+    conn.execute(
+        "CREATE TRIGGER t_bd BEFORE DELETE ON t BEGIN INSERT INTO log(msg) VALUES ('before delete'); END",
+    )
+    .unwrap();
+    conn.execute("PRAGMA capture_data_changes_conn('full')")
+        .unwrap();
+
+    conn.execute("DELETE FROM t WHERE id = 1").unwrap();
+
+    assert_eq!(
+        cdc_change_order(&conn),
+        vec![(1, "log".to_string(), 1), (-1, "t".to_string(), 1)]
+    );
+}
+
+#[turso_macros::test]
+fn test_cdc_order_fk_cascade_delete_parent_before_child(db: TempDatabase) {
+    let conn = db.connect_limbo();
+    conn.execute("PRAGMA foreign_keys = ON").unwrap();
+    conn.execute("CREATE TABLE parent(id INTEGER PRIMARY KEY)")
+        .unwrap();
+    conn.execute(
+        "CREATE TABLE child(id INTEGER PRIMARY KEY, pid INTEGER REFERENCES parent(id) ON DELETE CASCADE)",
+    )
+    .unwrap();
+    conn.execute("INSERT INTO parent VALUES (1)").unwrap();
+    conn.execute("INSERT INTO child VALUES (10, 1)").unwrap();
+    conn.execute("PRAGMA capture_data_changes_conn('full')")
+        .unwrap();
+
+    conn.execute("DELETE FROM parent WHERE id = 1").unwrap();
+
+    assert_eq!(
+        cdc_change_order(&conn),
+        vec![(-1, "parent".to_string(), 1), (-1, "child".to_string(), 10)]
+    );
+}
+
+#[turso_macros::test]
+fn test_cdc_order_fk_cascade_update_parent_before_child(db: TempDatabase) {
+    let conn = db.connect_limbo();
+    conn.execute("PRAGMA foreign_keys = ON").unwrap();
+    conn.execute("CREATE TABLE parent(id INTEGER PRIMARY KEY, code TEXT UNIQUE)")
+        .unwrap();
+    conn.execute(
+        "CREATE TABLE child(id INTEGER PRIMARY KEY, pcode TEXT REFERENCES parent(code) ON UPDATE CASCADE)",
+    )
+    .unwrap();
+    conn.execute("INSERT INTO parent VALUES (1, 'a')").unwrap();
+    conn.execute("INSERT INTO child VALUES (10, 'a')").unwrap();
+    conn.execute("PRAGMA capture_data_changes_conn('full')")
+        .unwrap();
+
+    conn.execute("UPDATE parent SET code = 'b' WHERE id = 1")
+        .unwrap();
+
+    assert_eq!(
+        cdc_change_order(&conn),
+        vec![(0, "parent".to_string(), 1), (0, "child".to_string(), 10)]
+    );
+}
+
+#[turso_macros::test]
+fn test_cdc_order_upsert_do_update_fk_cascade_parent_before_child(db: TempDatabase) {
+    let conn = db.connect_limbo();
+    conn.execute("PRAGMA foreign_keys = ON").unwrap();
+    conn.execute("CREATE TABLE parent(id INTEGER PRIMARY KEY, code TEXT UNIQUE)")
+        .unwrap();
+    conn.execute(
+        "CREATE TABLE child(id INTEGER PRIMARY KEY, pcode TEXT REFERENCES parent(code) ON UPDATE CASCADE)",
+    )
+    .unwrap();
+    conn.execute("INSERT INTO parent VALUES (1, 'a')").unwrap();
+    conn.execute("INSERT INTO child VALUES (10, 'a')").unwrap();
+    conn.execute("PRAGMA capture_data_changes_conn('full')")
+        .unwrap();
+
+    conn.execute(
+        "INSERT INTO parent(id, code) VALUES (1, 'b') ON CONFLICT(id) DO UPDATE SET code = excluded.code",
+    )
+    .unwrap();
+
+    assert_eq!(
+        cdc_change_order(&conn),
+        vec![(0, "parent".to_string(), 1), (0, "child".to_string(), 10)]
+    );
+}
+
+// TODO: cannot use mvcc, FK CASCADE writes are not captured by CDC under mvcc at all
+#[turso_macros::test()]
+fn test_cdc_order_update_rowid_change_fk_cascade_parent_before_child(db: TempDatabase) {
+    let conn = db.connect_limbo();
+    conn.execute("PRAGMA foreign_keys = ON").unwrap();
+    conn.execute("CREATE TABLE parent(id INTEGER PRIMARY KEY)")
+        .unwrap();
+    conn.execute(
+        "CREATE TABLE child(id INTEGER PRIMARY KEY, pid INTEGER REFERENCES parent(id) ON UPDATE CASCADE)",
+    )
+    .unwrap();
+    conn.execute("INSERT INTO parent VALUES (1)").unwrap();
+    conn.execute("INSERT INTO child VALUES (10, 1)").unwrap();
+    conn.execute("PRAGMA capture_data_changes_conn('full')")
+        .unwrap();
+
+    conn.execute("UPDATE parent SET id = 2 WHERE id = 1")
+        .unwrap();
+
+    assert_eq!(
+        cdc_change_order(&conn),
+        vec![
+            (-1, "parent".to_string(), 1),
+            (1, "parent".to_string(), 2),
+            (0, "child".to_string(), 10),
+        ]
+    );
+}
+
+// TODO: cannot use mvcc, FK CASCADE writes are not captured by CDC under mvcc at all
+#[turso_macros::test()]
+fn test_cdc_order_upsert_do_update_rowid_change_fk_cascade_parent_before_child(db: TempDatabase) {
+    let conn = db.connect_limbo();
+    conn.execute("PRAGMA foreign_keys = ON").unwrap();
+    conn.execute("CREATE TABLE parent(id INTEGER PRIMARY KEY)")
+        .unwrap();
+    conn.execute(
+        "CREATE TABLE child(id INTEGER PRIMARY KEY, pid INTEGER REFERENCES parent(id) ON UPDATE CASCADE)",
+    )
+    .unwrap();
+    conn.execute("INSERT INTO parent VALUES (1)").unwrap();
+    conn.execute("INSERT INTO child VALUES (10, 1)").unwrap();
+    conn.execute("PRAGMA capture_data_changes_conn('full')")
+        .unwrap();
+
+    conn.execute("INSERT INTO parent(id) VALUES (1) ON CONFLICT(id) DO UPDATE SET id = 2")
+        .unwrap();
+
+    assert_eq!(
+        cdc_change_order(&conn),
+        vec![
+            (-1, "parent".to_string(), 1),
+            (1, "parent".to_string(), 2),
+            (0, "child".to_string(), 10),
+        ]
     );
 }
