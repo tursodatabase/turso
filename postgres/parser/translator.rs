@@ -3580,6 +3580,7 @@ impl PostgreSQLTranslator {
         match sub_link.sub_link_type() {
             SubLinkType::ExistsSublink => Ok(ast::Expr::Exists(select)),
             SubLinkType::ExprSublink => Ok(ast::Expr::Subquery(select)),
+            SubLinkType::ArraySublink => Ok(Self::translate_array_subquery(*select)),
             SubLinkType::AnySublink => {
                 // ANY/IN subquery: testexpr IN (SELECT ...)
                 let test_node = sub_link.testexpr.as_ref().ok_or_else(|| {
@@ -3596,6 +3597,82 @@ impl PostgreSQLTranslator {
                 "Unsupported SubLink type: {other:?}",
             ))),
         }
+    }
+
+    fn translate_array_subquery(select: ast::Select) -> ast::Expr {
+        // PostgreSQL: ARRAY(SELECT v FROM items ORDER BY v LIMIT 2)
+        // Becomes this scalar subquery in the Turso AST:
+        // (
+        //     WITH _turso_array_rows(_turso_array_value) AS MATERIALIZED (
+        //         SELECT v FROM items ORDER BY v LIMIT 2
+        //     )
+        //     SELECT coalesce(array_agg(_turso_array_value), array())
+        //     FROM _turso_array_rows
+        // )
+        // array() constructs an empty array when the query returns no rows.
+        let query = select.to_string().to_ascii_lowercase();
+        let mut table_name = "_turso_array_rows".to_owned();
+        while query.contains(&table_name) {
+            table_name.push('_');
+        }
+        let table = ast::Name::from_string(table_name);
+        let column = ast::Name::from_string("_turso_array_value");
+        let call = |name: &str, args: Vec<Box<ast::Expr>>| ast::Expr::FunctionCall {
+            name: ast::Name::from_string(name),
+            distinctness: None,
+            args,
+            order_by: vec![],
+            within_group: vec![],
+            filter_over: ast::FunctionTail {
+                filter_clause: None,
+                over_clause: None,
+            },
+        };
+
+        ast::Expr::Subquery(Box::new(ast::Select {
+            with: Some(ast::With {
+                recursive: false,
+                ctes: vec![ast::CommonTableExpr {
+                    tbl_name: table.clone(),
+                    columns: vec![ast::IndexedColumn {
+                        col_name: column.clone(),
+                        collation_name: None,
+                        order: None,
+                    }],
+                    materialized: ast::Materialized::Yes,
+                    select,
+                }],
+            }),
+            body: ast::SelectBody {
+                select: ast::OneSelect::Select {
+                    distinctness: None,
+                    columns: vec![ast::ResultColumn::Expr(
+                        Box::new(call(
+                            "coalesce",
+                            vec![
+                                Box::new(call("array_agg", vec![Box::new(ast::Expr::Id(column))])),
+                                Box::new(call("array", vec![])),
+                            ],
+                        )),
+                        None,
+                    )],
+                    from: Some(ast::FromClause {
+                        select: Box::new(ast::SelectTable::Table(
+                            ast::QualifiedName::single(table),
+                            None,
+                            None,
+                        )),
+                        joins: vec![],
+                    }),
+                    where_clause: None,
+                    group_by: None,
+                    window_clause: vec![],
+                },
+                compounds: vec![],
+            },
+            order_by: vec![],
+            limit: None,
+        }))
     }
 
     fn translate_with_clause(
