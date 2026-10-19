@@ -26,7 +26,7 @@ use turso_core::Database;
 use crate::generate::{
     GeneratedStatement, GeneratorKind, PropTestBackend, SqlGenBackend, SqlGenerator, WeightProfile,
 };
-use crate::ivm::{IvmCreateOutcome, IvmState};
+use crate::ivm::{IvmCreateOutcome, IvmState, collation_probe_bootstrap_sql};
 use crate::memory::{MemorySimIO, SimIO};
 use crate::oracle::{
     DifferentialOracle, OracleResult, QueryResult, QueryValue, check_differential,
@@ -648,6 +648,35 @@ impl Fuzzer {
         let mut schema = self.introspect_and_verify_schemas()?;
         let mut ivm_state = self.config.ivm.then(IvmState::new);
 
+        // Bootstrap the collation/mixed-type probe table on both engines, up
+        // front, so it is an ordinary tracked table (read and written by the
+        // regular generator too, not just the IVM-specific view generation)
+        // for the rest of the run. See `ivm::collation_probe_bootstrap_sql`.
+        if let Some(ivm) = ivm_state.as_mut() {
+            let (create_sql, insert_sql) = collation_probe_bootstrap_sql();
+            for sql in &create_sql {
+                self.run_ivm_statement(
+                    ivm,
+                    &schema,
+                    sql,
+                    "IVM collation-probe setup",
+                    stats,
+                    executed_sql,
+                )?;
+            }
+            schema = self.introspect_and_verify_schemas()?;
+            for sql in &insert_sql {
+                self.run_ivm_statement(
+                    ivm,
+                    &schema,
+                    sql,
+                    "IVM collation-probe setup",
+                    stats,
+                    executed_sql,
+                )?;
+            }
+        }
+
         for i in 0..self.config.num_statements {
             // In IVM mode, periodically create a materialized view over the
             // current schema. Turso-only: SQLite has no materialized views.
@@ -660,9 +689,16 @@ impl Fuzzer {
                         ivm.try_create_view(&self.turso_conn, &schema, &mut rng)
                     };
                     match outcome {
-                        Some(IvmCreateOutcome::Created { sql, leaf_probes }) => {
+                        Some(IvmCreateOutcome::Created {
+                            sql,
+                            leaf_probes,
+                            extra_setup,
+                        }) => {
                             tracing::info!("IVM: created view: {sql}");
                             executed_sql.push("-- IVM (turso-only)".to_string());
+                            for extra in &extra_setup {
+                                executed_sql.push(extra.clone());
+                            }
                             executed_sql.push(sql.clone());
                             // Check immediately so an initial-population bug is
                             // attributed to the creation, not to the next statement.
@@ -728,6 +764,21 @@ impl Fuzzer {
                             executed_sql,
                         )?;
                     }
+                }
+                // Move the collation/mixed-type probe table's rows between
+                // equal-but-not-identical classes, so the view's displayed
+                // member keeps changing. Only from autocommit for the same
+                // reason as the other IVM-driven statements above.
+                if ivm.wants_collation_mutation(i) && self.turso_conn.get_auto_commit() {
+                    let sql = ivm.next_collation_mutation();
+                    self.run_ivm_statement(
+                        ivm,
+                        &schema,
+                        &sql,
+                        "IVM collation-probe mutation",
+                        stats,
+                        executed_sql,
+                    )?;
                 }
             }
 

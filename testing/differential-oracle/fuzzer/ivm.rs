@@ -30,6 +30,100 @@ use crate::oracle::{DifferentialOracle, OracleResult, QueryResult};
 const MAX_VIEWS: usize = 8;
 /// Attempt to create a new view every this many statements (until MAX_VIEWS).
 const CREATE_ATTEMPT_INTERVAL: usize = 10;
+/// Maximum number of plain (non-materialized) views to keep alive during a
+/// run. They are only ever sources for materialized views, never checked
+/// directly, so a much smaller cap than `MAX_VIEWS` is enough.
+const MAX_PLAIN_VIEWS: usize = 6;
+
+/// Name of the table bootstrapped once per IVM run to exercise collated keys
+/// (`NOCASE`/`RTRIM`) and mixed INTEGER/REAL/NULL numeric data. See
+/// `collation_probe_bootstrap_sql` for its shape and seed rows.
+const COLLATION_PROBE_TABLE: &str = "ivm_collate_probe";
+
+/// Name of a second table, sharing a column name (and type) with
+/// `COLLATION_PROBE_TABLE`, bootstrapped alongside it. The regular schema
+/// generator gives every table unique, randomly generated column names, so
+/// without this companion `NATURAL JOIN` would never find a shared-name pair
+/// to join on.
+const NATURAL_PROBE_TABLE: &str = "ivm_natural_probe";
+
+/// Deterministic sequence of INSERT/UPDATE/DELETE statements that change
+/// which equal-but-not-identical row the collation/mixed-type probe table
+/// shows for a GROUP BY/DISTINCT/MIN/MAX/set-op key: moving a row between
+/// collation classes, and inserting/deleting the sole REAL or INTEGER member
+/// of a `mix_num` group (the "delete the last REAL row" case for
+/// `TOTAL`/`AVG`). Cycled round-robin by `IvmState::next_collation_mutation`.
+const COLLATION_MUTATIONS: &[&str] = &[
+    "UPDATE \"ivm_collate_probe\" SET nocase_key = 'A' WHERE id = 1",
+    "UPDATE \"ivm_collate_probe\" SET nocase_key = 'a' WHERE id = 1",
+    "DELETE FROM \"ivm_collate_probe\" WHERE id = 2",
+    "INSERT INTO \"ivm_collate_probe\" (id, nocase_key, rtrim_key, plain_key, mix_num) \
+     VALUES (2, 'A', 'x  ', 'A', 2.0)",
+    "UPDATE \"ivm_collate_probe\" SET mix_num = 2.0 WHERE id = 1",
+    "UPDATE \"ivm_collate_probe\" SET mix_num = 2 WHERE id = 1",
+    "DELETE FROM \"ivm_collate_probe\" WHERE id = 4",
+    "INSERT INTO \"ivm_collate_probe\" (id, nocase_key, rtrim_key, plain_key, mix_num) \
+     VALUES (4, 'B', 'X  ', 'B', 0.0)",
+    "UPDATE \"ivm_collate_probe\" SET rtrim_key = 'y ' WHERE id = 1",
+    "UPDATE \"ivm_collate_probe\" SET rtrim_key = 'x' WHERE id = 1",
+];
+
+/// The `CREATE TABLE` and seed `INSERT` statements for the collation/mixed-
+/// type probe table and its `NATURAL JOIN` companion, run once at the start
+/// of every IVM run (on both engines, so the regular statement generator can
+/// also read and write them like any other table). Returns
+/// `(create_statements, insert_statements)`; the caller must re-introspect
+/// the schema between the two groups so a post-INSERT snapshot check covers
+/// the new tables.
+///
+/// `mix_num` is declared with no type (BLOB/NONE affinity) so that inserting
+/// the INTEGER `2` and the REAL `2.0` keeps them as distinct storage classes
+/// instead of NUMERIC affinity folding one into the other.
+///
+/// Seed rows group into three collation/type classes compared equal but not
+/// identical: `nocase_key` groups `{a, A}`/`{B, b}`/`{C, c}`; `rtrim_key`
+/// groups `{x, "x  "}`/`{X, "X  "}`/`{y, "y ", "y  "}`; `mix_num` groups
+/// `{2, 2.0}`/`{0, 0.0, -0.0}`.
+pub fn collation_probe_bootstrap_sql() -> (Vec<String>, Vec<String>) {
+    let create = vec![
+        format!(
+            "CREATE TABLE \"{COLLATION_PROBE_TABLE}\" (\
+             id INTEGER PRIMARY KEY, \
+             nocase_key TEXT COLLATE NOCASE, \
+             rtrim_key TEXT COLLATE RTRIM, \
+             plain_key TEXT, \
+             mix_num BLOB)"
+        ),
+        format!(
+            "CREATE TABLE \"{NATURAL_PROBE_TABLE}\" (\
+             id INTEGER PRIMARY KEY, \
+             nocase_key TEXT, \
+             tag TEXT)"
+        ),
+    ];
+    let insert = vec![
+        format!(
+            "INSERT INTO \"{COLLATION_PROBE_TABLE}\" \
+             (id, nocase_key, rtrim_key, plain_key, mix_num) VALUES \
+             (1, 'a', 'x', 'a', 2), \
+             (2, 'A', 'x  ', 'A', 2.0), \
+             (3, 'a  ', 'X', 'a  ', 0), \
+             (4, 'B', 'X  ', 'B', 0.0), \
+             (5, 'b', 'y', 'b', -0.0), \
+             (6, 'C', 'y ', 'C', 5), \
+             (7, NULL, NULL, NULL, NULL), \
+             (8, 'c', 'y  ', 'c', 5.0)"
+        ),
+        format!(
+            "INSERT INTO \"{NATURAL_PROBE_TABLE}\" (id, nocase_key, tag) VALUES \
+             (1, 'a', 'alpha'), \
+             (2, 'B', 'bravo'), \
+             (3, 'zzz', 'zulu'), \
+             (4, NULL, 'none')"
+        ),
+    ];
+    (create, insert)
+}
 
 /// A materialized view created by the fuzzer, with its defining query.
 #[derive(Debug, Clone)]
@@ -47,6 +141,10 @@ pub enum IvmCreateOutcome {
         /// main table guarantees that every leaf of the generated view is
         /// driven at least once; unrelated tables are harmless extra probes.
         leaf_probes: Vec<String>,
+        /// Statements already executed (Turso-only, e.g. a plain `CREATE
+        /// VIEW` the materialized view above reads from) that must be
+        /// logged before `sql` so a replay of test.sql can resolve it.
+        extra_setup: Vec<String>,
     },
     Rejected {
         sql: String,
@@ -69,6 +167,12 @@ struct GeneratedDefinition {
 pub struct IvmState {
     views: Vec<IvmView>,
     next_id: usize,
+    /// Names of plain (non-materialized) views created as relation sources
+    /// for materialized views. Turso-only, never checked directly.
+    plain_views: Vec<String>,
+    next_plain_view_id: usize,
+    /// Round-robin cursor into `COLLATION_MUTATIONS`.
+    collation_mutation_index: usize,
 }
 
 impl IvmState {
@@ -87,6 +191,20 @@ impl IvmState {
         self.views.len() < MAX_VIEWS && stmt_index % CREATE_ATTEMPT_INTERVAL == 0
     }
 
+    /// Whether the runner should run the next collation/mixed-type probe
+    /// mutation (see `COLLATION_MUTATIONS`) at this statement index.
+    pub fn wants_collation_mutation(&self, stmt_index: usize) -> bool {
+        stmt_index > 0 && stmt_index % CREATE_ATTEMPT_INTERVAL == 3
+    }
+
+    /// The next deterministic mutation of the collation/mixed-type probe
+    /// table, cycling through `COLLATION_MUTATIONS`.
+    pub fn next_collation_mutation(&mut self) -> String {
+        let sql = COLLATION_MUTATIONS[self.collation_mutation_index % COLLATION_MUTATIONS.len()];
+        self.collation_mutation_index += 1;
+        sql.to_string()
+    }
+
     /// Generate and execute one CREATE MATERIALIZED VIEW on Turso.
     ///
     /// Returns `None` when the schema has no usable tables. Rejections are
@@ -99,6 +217,10 @@ impl IvmState {
         schema: &Schema,
         rng: &mut ChaCha8Rng,
     ) -> Option<IvmCreateOutcome> {
+        // Statements already executed (Turso-only) that a materialized-view
+        // definition below depends on and that must be logged before it.
+        let mut extra_setup = Vec::new();
+
         // Exercise topologically scheduled view dependencies. A rejection is
         // an oracle failure: accepted upstream views are valid relation
         // inputs and their changes must propagate through the same log.
@@ -112,6 +234,33 @@ impl IvmState {
                     _ => format!("SELECT DISTINCT * FROM {source}"),
                 },
                 must_create: true,
+            }
+        } else if !self.plain_views.is_empty() && rng.random_bool(0.1) {
+            // A materialized view over an already-created plain view: the
+            // plain view's own SELECT was already validated when it was
+            // created, so a rejection here is an oracle failure.
+            let source = quoted(&self.plain_views[rng.random_range(0..self.plain_views.len())]);
+            GeneratedDefinition {
+                sql: match rng.random_range(0..3) {
+                    0 => format!("SELECT * FROM {source}"),
+                    1 => format!("SELECT COUNT(*) FROM {source}"),
+                    _ => format!("SELECT DISTINCT * FROM {source}"),
+                },
+                must_create: true,
+            }
+        } else if rng.random_bool(0.12) {
+            // Create a brand-new plain view (possibly itself over another
+            // plain view) and wrap it in the materialized view, instead of
+            // reading tables directly.
+            match self.try_create_plain_view(turso_conn, schema, rng) {
+                Some((pv_sql, pv_name)) => {
+                    extra_setup.push(pv_sql);
+                    GeneratedDefinition {
+                        sql: format!("SELECT * FROM {}", quoted(&pv_name)),
+                        must_create: true,
+                    }
+                }
+                None => generate_definition(schema, rng)?,
             }
         } else {
             generate_definition(schema, rng)?
@@ -146,7 +295,59 @@ impl IvmState {
                         })
                     })
                     .collect();
-                Some(IvmCreateOutcome::Created { sql, leaf_probes })
+                Some(IvmCreateOutcome::Created {
+                    sql,
+                    leaf_probes,
+                    extra_setup,
+                })
+            }
+        }
+    }
+
+    /// Create a plain (non-materialized) `CREATE VIEW` as a relation source
+    /// for a materialized view, executed on Turso only: nothing ever queries
+    /// it against SQLite, only the materialized view wrapping it is checked.
+    /// Sometimes built over an already-tracked plain view instead of a table
+    /// (view over view). Returns `None` (not a rejection) when there is
+    /// nothing to build it from, or the engine rejects the attempt.
+    fn try_create_plain_view(
+        &mut self,
+        turso_conn: &Arc<turso_core::Connection>,
+        schema: &Schema,
+        rng: &mut ChaCha8Rng,
+    ) -> Option<(String, String)> {
+        let select = if !self.plain_views.is_empty() && rng.random_bool(0.4) {
+            let source = quoted(&self.plain_views[rng.random_range(0..self.plain_views.len())]);
+            match rng.random_range(0..3) {
+                0 => format!("SELECT * FROM {source}"),
+                1 => format!("SELECT DISTINCT * FROM {source}"),
+                _ => format!("SELECT * FROM {source} WHERE 1"),
+            }
+        } else {
+            let tables: Vec<&Table> = schema
+                .tables
+                .iter()
+                .filter(|t| t.database.is_none() && !t.columns.is_empty())
+                .collect();
+            if tables.is_empty() {
+                return None;
+            }
+            let table = tables[rng.random_range(0..tables.len())];
+            let with_filter = rng.random_bool(0.4);
+            projection(table, rng, with_filter)
+        };
+
+        let name = format!("ivm_pv{}", self.next_plain_view_id);
+        self.next_plain_view_id += 1;
+        let sql = format!("CREATE VIEW \"{name}\" AS {select}");
+        match DifferentialOracle::execute_turso(turso_conn, &sql) {
+            QueryResult::Error(_) => None,
+            _ => {
+                self.plain_views.push(name.clone());
+                if self.plain_views.len() > MAX_PLAIN_VIEWS {
+                    self.plain_views.remove(0);
+                }
+                Some((sql, name))
             }
         }
     }
@@ -405,7 +606,7 @@ fn generate_definition(schema: &Schema, rng: &mut ChaCha8Rng) -> Option<Generate
     }
 
     let table = tables[rng.random_range(0..tables.len())];
-    let (sql, must_create) = match rng.random_range(0..30u32) {
+    let (sql, must_create) = match rng.random_range(0..42u32) {
         0..=2 => (Some(projection(table, rng, false)), false),
         3..=4 => (Some(projection(table, rng, true)), false),
         5..=7 => (Some(aggregate(table, rng)), false),
@@ -428,9 +629,132 @@ fn generate_definition(schema: &Schema, rng: &mut ChaCha8Rng) -> Option<Generate
         ),
         // FULL JOIN under an aggregate or DISTINCT consumer.
         28 => (full_outer_composition(&tables, rng, true), true),
+        // GROUP BY/DISTINCT/MIN-MAX/set-op keys under NOCASE/RTRIM collation
+        // (declared on the probe table's columns, or applied explicitly).
+        // Falls back to a plain projection when the probe table isn't part
+        // of this schema (e.g. unit tests, or it was somehow dropped).
+        29..=31 => (
+            collation_view(schema, rng).or_else(|| Some(projection(table, rng, true))),
+            true,
+        ),
+        // TOTAL()/AVG() over mixed INTEGER/REAL/NULL data.
+        32..=33 => (
+            total_avg_view(schema, rng).or_else(|| Some(projection(table, rng, true))),
+            true,
+        ),
+        // NATURAL JOIN and CROSS JOIN: neither is produced by `join()`.
+        34..=36 => (
+            natural_or_cross_join(&tables, rng).or_else(|| Some(projection(table, rng, true))),
+            true,
+        ),
         _ => (full_outer_composition(&tables, rng, false), true),
     };
     sql.map(|sql| GeneratedDefinition { sql, must_create })
+}
+
+/// `GROUP BY`/`DISTINCT`/`MIN`/`MAX`/set-op views over the probe table's
+/// collated text columns, exercising both a column's own declared collation
+/// (`nocase_key`, `rtrim_key`) and an explicit `COLLATE` clause applied to a
+/// column with none declared (`plain_key`). `None` when the probe table has
+/// been dropped (it never is in IVM mode: DROP/ALTER TABLE are disabled, see
+/// `SqlGenBackend::new_with_options`) or wasn't bootstrapped.
+fn collation_view(schema: &Schema, rng: &mut ChaCha8Rng) -> Option<String> {
+    schema.get_table(COLLATION_PROBE_TABLE)?;
+    let collation = if rng.random_bool(0.5) { "NOCASE" } else { "RTRIM" };
+    let key = if rng.random_bool(0.5) {
+        match collation {
+            "NOCASE" => "\"nocase_key\"".to_string(),
+            _ => "\"rtrim_key\"".to_string(),
+        }
+    } else {
+        format!("\"plain_key\" COLLATE {collation}")
+    };
+    let table = quoted(COLLATION_PROBE_TABLE);
+    Some(match rng.random_range(0..5u8) {
+        0 => format!("SELECT {key} AS k, COUNT(*) AS cnt FROM {table} GROUP BY {key}"),
+        1 => format!("SELECT DISTINCT {key} AS k FROM {table}"),
+        2 => format!("SELECT MIN({key}) AS k FROM {table}"),
+        3 => format!("SELECT MAX({key}) AS k FROM {table}"),
+        _ => format!(
+            "SELECT {key} AS k FROM {table} \
+             UNION SELECT {key} FROM {table} WHERE id <> 1"
+        ),
+    })
+}
+
+/// `TOTAL()`/`AVG()` over the probe table's mixed INTEGER/REAL/NULL column.
+/// `aggregate()`/`scalar_aggregate()` never pick this column: it is declared
+/// with no type (BLOB/NONE affinity) precisely so NUMERIC affinity cannot
+/// fold `2` and `2.0` into one storage class, which also makes it a non-
+/// numeric `DataType` to every generic numeric-column filter in this file.
+fn total_avg_view(schema: &Schema, rng: &mut ChaCha8Rng) -> Option<String> {
+    schema.get_table(COLLATION_PROBE_TABLE)?;
+    let table = quoted(COLLATION_PROBE_TABLE);
+    let col = "\"mix_num\"";
+    Some(if rng.random_bool(0.4) {
+        format!(
+            "SELECT TOTAL({col}) AS tot, AVG({col}) AS avg_val, COUNT(*) AS cnt FROM {table}"
+        )
+    } else {
+        format!(
+            "SELECT \"nocase_key\" AS k, TOTAL({col}) AS tot, AVG({col}) AS avg_val \
+             FROM {table} GROUP BY \"nocase_key\""
+        )
+    })
+}
+
+/// `CROSS JOIN` (no predicate at all) and `NATURAL JOIN` (merges every
+/// same-named, same-typed column): neither is produced by `join()`, which
+/// always joins on an explicit `ON`/`USING` predicate. NATURAL JOIN needs a
+/// shared column name between two different tables (most generated tables
+/// share an `id` primary key, and so does the collation probe table).
+fn natural_or_cross_join(tables: &[&Table], rng: &mut ChaCha8Rng) -> Option<String> {
+    if rng.random_bool(0.5) {
+        let left = tables[rng.random_range(0..tables.len())];
+        let right = tables[rng.random_range(0..tables.len())];
+        let mut cols = Vec::new();
+        for c in column_subset(left, rng).iter().take(2) {
+            cols.push(format!("l.{} AS l_{}", quoted(&c.name), c.name));
+        }
+        for c in column_subset(right, rng).iter().take(2) {
+            cols.push(format!("r.{} AS r_{}", quoted(&c.name), c.name));
+        }
+        if cols.is_empty() {
+            return None;
+        }
+        Some(format!(
+            "SELECT {cols} FROM {lt} AS l CROSS JOIN {rt} AS r",
+            cols = cols.join(", "),
+            lt = quoted(&left.name),
+            rt = quoted(&right.name),
+        ))
+    } else {
+        let mut candidates = Vec::new();
+        for left in tables {
+            for right in tables {
+                if left.name.eq_ignore_ascii_case(&right.name) {
+                    continue;
+                }
+                let shares_column = left.columns.iter().any(|lc| {
+                    right.columns.iter().any(|rc| {
+                        lc.name.eq_ignore_ascii_case(&rc.name) && lc.data_type == rc.data_type
+                    })
+                });
+                if shares_column {
+                    candidates.push((*left, *right));
+                }
+            }
+        }
+        if candidates.is_empty() {
+            return None;
+        }
+        let (left, right) = candidates[rng.random_range(0..candidates.len())];
+        Some(format!(
+            "SELECT * FROM {} NATURAL JOIN {}",
+            quoted(&left.name),
+            quoted(&right.name)
+        ))
+    }
 }
 
 fn compatible_pair<'a>(
