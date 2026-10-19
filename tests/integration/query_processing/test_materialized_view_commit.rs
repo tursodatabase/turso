@@ -387,6 +387,64 @@ fn aborted_insert_select_does_not_leak_view_deltas(tmp_db: TempDatabase) -> anyh
     Ok(())
 }
 
+/// A statement prepared while the schema has no materialized views must still
+/// maintain a view created afterward on the same connection, once it steps.
+/// `op_insert`/`op_delete` skip change-log routing entirely for a program
+/// built against a materialized-view-free schema (see
+/// `PreparedProgram::has_materialized_views`); this only stays correct
+/// because `CREATE MATERIALIZED VIEW` bumps the schema cookie, which forces
+/// this already-prepared INSERT to reprepare (picking up the fresh flag)
+/// before it runs.
+#[turso_macros::test(views)]
+fn prepared_insert_sees_view_created_after_prepare_same_connection(
+    tmp_db: TempDatabase,
+) -> anyhow::Result<()> {
+    let conn = tmp_db.connect_limbo();
+    conn.execute("CREATE TABLE t (a INTEGER, b INTEGER)")?;
+
+    // Prepared while the schema has no materialized views at all.
+    let mut stmt = conn.prepare("INSERT INTO t VALUES (1, 10)")?;
+
+    conn.execute("CREATE MATERIALIZED VIEW mv AS SELECT a, b FROM t")?;
+
+    // Must reprepare against the new schema before running, and route the
+    // insert's change through to the view.
+    stmt.run_ignore_rows()?;
+    drop(stmt);
+
+    let view: Vec<(i64, i64)> = conn.exec_rows("SELECT a, b FROM mv ORDER BY a");
+    assert_eq!(view, vec![(1, 10)]);
+    Ok(())
+}
+
+/// Same as above, but the materialized view is created by a second
+/// connection after the first connection already prepared its INSERT. The
+/// first connection must notice the on-disk schema cookie change and
+/// reprepare before stepping, the same as it would for any other concurrent
+/// schema change.
+#[turso_macros::test(views)]
+fn prepared_insert_sees_view_created_after_prepare_other_connection(
+    tmp_db: TempDatabase,
+) -> anyhow::Result<()> {
+    let conn_a = tmp_db.connect_limbo();
+    conn_a.execute("CREATE TABLE t (a INTEGER, b INTEGER)")?;
+
+    // Prepared on connection A while the schema has no materialized views.
+    let mut stmt = conn_a.prepare("INSERT INTO t VALUES (1, 10)")?;
+
+    // Connection B creates the view and commits it to disk.
+    let conn_b = tmp_db.connect_limbo();
+    conn_b.execute("CREATE MATERIALIZED VIEW mv AS SELECT a, b FROM t")?;
+    drop(conn_b);
+
+    stmt.run_ignore_rows()?;
+    drop(stmt);
+
+    let view: Vec<(i64, i64)> = conn_a.exec_rows("SELECT a, b FROM mv ORDER BY a");
+    assert_eq!(view, vec![(1, 10)]);
+    Ok(())
+}
+
 fn count_orders(conn: &std::sync::Arc<turso_core::Connection>) -> i64 {
     match limbo_exec_rows(conn, "SELECT COUNT(*) FROM orders")[0][0] {
         rusqlite::types::Value::Integer(n) => n,

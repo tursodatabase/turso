@@ -2064,6 +2064,14 @@ pub struct PreparedProgram {
     pub trigger: Option<Arc<Trigger>>,
     /// Whether this program is a subprogram (trigger or FK action) that runs within a parent statement.
     pub is_subprogram: bool,
+    /// Whether the schema this program was translated against has any
+    /// materialized views. Lets `op_insert`/`op_delete` skip change-log
+    /// routing entirely for ordinary databases. A schema change always bumps
+    /// the schema cookie, which forces this program to be reprepared (see
+    /// `CheckSchemaCookie` in `core/vdbe/execute.rs`) before it can observe a
+    /// materialized view that didn't exist when it was built, so the flag
+    /// can't go stale while this program is running.
+    pub has_materialized_views: bool,
     pub resolve_type: ResolveType,
     pub prepare_context: PrepareContext,
     /// Set of attached database indices that need write transactions.

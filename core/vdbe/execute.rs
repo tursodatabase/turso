@@ -12868,7 +12868,11 @@ pub fn op_insert(
     loop {
         match state.active_op_state.insert().sub_state {
             OpInsertSubState::MaybeCaptureRecord => {
-                let route = change_log_route(program, state, *cursor_id)?;
+                let route = if program.prepared().has_materialized_views {
+                    change_log_route(program, state, *cursor_id)?
+                } else {
+                    None
+                };
                 let has_change_log_subscribers = route
                     .as_ref()
                     .is_some_and(|route| !route.dependent_views.is_empty());
@@ -13327,7 +13331,11 @@ pub fn op_delete(
     loop {
         match state.active_op_state.delete().sub_state {
             OpDeleteSubState::MaybeCaptureRecord => {
-                let route = change_log_route(program, state, *cursor_id)?;
+                let route = if program.prepared().has_materialized_views {
+                    change_log_route(program, state, *cursor_id)?
+                } else {
+                    None
+                };
                 let Some(route) = route else {
                     state.active_op_state.delete().sub_state = OpDeleteSubState::Delete;
                     continue;
