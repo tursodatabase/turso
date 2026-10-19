@@ -212,6 +212,7 @@ struct sqlite3Inner {
     pub(crate) e_open_state: u8,
     pub(crate) p_err: *mut ffi::c_void,
     pub(crate) filename: CString,
+    pub(crate) attached_filename_cache: Vec<(String, CString)>,
     pub(crate) stmt_list: *mut sqlite3_stmt,
     /// Set when the caller opened "" and we created a private on-disk
     /// database for it; the file is removed when the handle goes away.
@@ -253,6 +254,7 @@ impl sqlite3 {
             e_open_state: SQLITE_STATE_OPEN,
             p_err: std::ptr::null_mut(),
             filename,
+            attached_filename_cache: Vec::new(),
             stmt_list: std::ptr::null_mut(),
             temp_path: None,
         };
@@ -846,15 +848,49 @@ pub unsafe extern "C" fn sqlite3_db_filename(
     if db.is_null() {
         return std::ptr::null();
     }
-    if !db_name.is_null() {
-        let name = CStr::from_ptr(db_name);
-        if name.to_bytes() != b"main" {
-            return std::ptr::null();
-        }
-    }
     let db = &*db;
-    let inner = db.inner.lock().unwrap();
-    inner.filename.as_ptr()
+    let mut inner = db.inner.lock().unwrap();
+    let requested_name = if db_name.is_null() {
+        "main"
+    } else {
+        match CStr::from_ptr(db_name).to_str() {
+            Ok(name) => name,
+            Err(_) => return std::ptr::null(),
+        }
+    };
+    let databases = inner.conn.list_all_databases();
+    inner.attached_filename_cache.retain(|(cached_name, _)| {
+        databases
+            .iter()
+            .any(|(_, database_name, _)| database_name.eq_ignore_ascii_case(cached_name))
+    });
+    let Some((_, database_name, filename)) = databases
+        .into_iter()
+        .find(|(_, name, _)| name.eq_ignore_ascii_case(requested_name))
+    else {
+        return std::ptr::null();
+    };
+    if database_name.eq_ignore_ascii_case("main") {
+        return inner.filename.as_ptr();
+    }
+    let filename = match CString::new(filename) {
+        Ok(filename) => filename,
+        Err(_) => return std::ptr::null(),
+    };
+    if let Some((_, cached)) = inner
+        .attached_filename_cache
+        .iter_mut()
+        .find(|(cached_name, _)| cached_name.eq_ignore_ascii_case(&database_name))
+    {
+        if cached.as_bytes() != filename.as_bytes() {
+            *cached = filename;
+        }
+        return cached.as_ptr();
+    }
+    inner
+        .attached_filename_cache
+        .push((database_name, filename));
+    inner.attached_filename_cache.last().unwrap().1.as_ptr()
 }
 
 #[no_mangle]
