@@ -1978,7 +1978,6 @@ fn parse_table(
     connection: &Arc<crate::Connection>,
 ) -> Result<()> {
     let normalized_qualified_name = normalize_ident(qualified_name.name.as_str());
-    let database_id = resolver.resolve_existing_table_database_id_qualified(qualified_name)?;
     let table_name = &qualified_name.name;
 
     if qualified_name.db_name.is_none() {
@@ -2092,7 +2091,6 @@ fn parse_table(
                 if let Some(alias) = alias {
                     joined_table.identifier = alias;
                 }
-                joined_table.database_id = database_id;
                 table_references.add_joined_table(joined_table);
             } else {
                 // All recursive arms read the same one-row pseudo-cursor.
@@ -2111,7 +2109,7 @@ fn parse_table(
                     col_used_mask: ColumnUsedMask::default(),
                     column_use_counts: Vec::new(),
                     expression_index_usages: Vec::new(),
-                    database_id,
+                    database_id: crate::MAIN_DB_ID,
                     indexed: None,
                     plan_estimate: None,
                 });
@@ -2121,6 +2119,7 @@ fn parse_table(
     }
 
     // Resolve table using connection's with_schema method
+    let database_id = resolver.resolve_existing_table_database_id_qualified(qualified_name)?;
     let table = resolver.with_schema(database_id, |schema| schema.get_table(table_name.as_str()));
 
     if let Some(table) = table {
