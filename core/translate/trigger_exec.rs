@@ -786,25 +786,35 @@ pub fn get_triggers_including_temp(
     time: TriggerTime,
     updated_column_indices: Option<ColumnMask>,
     table: &BTreeTable,
+    connection: &crate::Connection,
 ) -> Vec<Arc<Trigger>> {
-    let mut triggers: Vec<Arc<Trigger>> = resolver.with_schema(database_id, |s| {
-        get_relevant_triggers_type_and_time(
-            s,
-            event.clone(),
-            time,
-            updated_column_indices.clone(),
-            table,
-        )
-        .filter(|trigger| {
-            // In the temp schema, triggers may target a different database.
-            // Only include triggers whose target matches this database.
-            match trigger.target_database_id {
-                Some(target_db) => target_db == database_id,
-                None => true, // unqualified → targets this schema's own table
-            }
-        })
-        .collect()
-    });
+    // Non-TEMP triggers are dropped entirely when triggers are off, same as
+    // SQLite's SQLITE_DBCONFIG_ENABLE_TRIGGER=0 (trigger.c, triggersReallyExist).
+    // Triggers that live in the TEMP schema (database_id == TEMP_DB_ID) always
+    // fire; they are collected below, separately from this table's own schema.
+    let mut triggers: Vec<Arc<Trigger>> =
+        if database_id != crate::TEMP_DB_ID && !connection.triggers_enabled() {
+            Vec::new()
+        } else {
+            resolver.with_schema(database_id, |s| {
+                get_relevant_triggers_type_and_time(
+                    s,
+                    event.clone(),
+                    time,
+                    updated_column_indices.clone(),
+                    table,
+                )
+                .filter(|trigger| {
+                    // In the temp schema, triggers may target a different database.
+                    // Only include triggers whose target matches this database.
+                    match trigger.target_database_id {
+                        Some(target_db) => target_db == database_id,
+                        None => true, // unqualified → targets this schema's own table
+                    }
+                })
+                .collect()
+            })
+        };
     if database_id != crate::TEMP_DB_ID && resolver.has_temp_database() {
         let temp_triggers: Vec<Arc<Trigger>> = resolver.with_schema(crate::TEMP_DB_ID, |s| {
             get_relevant_triggers_type_and_time(s, event, time, updated_column_indices, table)
@@ -836,16 +846,24 @@ pub fn get_triggers_including_temp(
 }
 
 /// Like [`has_relevant_triggers_type_only`], but also checks the temp schema.
+/// Gated on `connection.triggers_enabled()` the same way as
+/// [`get_triggers_including_temp`], so the two agree on whether a table has
+/// triggers that will actually fire.
 pub fn has_triggers_including_temp(
     resolver: &Resolver,
     database_id: usize,
     event: TriggerEvent,
     updated_column_indices: Option<&ColumnMask>,
     table: &BTreeTable,
+    connection: &crate::Connection,
 ) -> bool {
-    let found = resolver.with_schema(database_id, |s| {
-        has_relevant_triggers_type_only(s, event.clone(), updated_column_indices, table)
-    });
+    let found = if database_id != crate::TEMP_DB_ID && !connection.triggers_enabled() {
+        false
+    } else {
+        resolver.with_schema(database_id, |s| {
+            has_relevant_triggers_type_only(s, event.clone(), updated_column_indices, table)
+        })
+    };
     if found {
         return true;
     }

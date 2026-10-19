@@ -696,6 +696,7 @@ fn emit_replace_delete<'a>(
                 conflicting_rowid_reg,
                 new_row_registers,
                 update_database_id,
+                connection,
             )?
         } else {
             ForeignKeyActions::default()
@@ -715,6 +716,7 @@ fn emit_replace_delete<'a>(
                 conflicting_rowid_reg,
                 update_database_id,
                 &t_ctx.resolver,
+                connection,
             )?;
         }
         prepared
@@ -1222,6 +1224,7 @@ fn emit_update_insns<'a>(
             TriggerEvent::Update,
             Some(&updated_column_indices),
             &btree_table,
+            connection,
         )
     } else {
         false
@@ -1349,6 +1352,7 @@ fn emit_update_insns<'a>(
             TriggerTime::Before,
             Some(updated_column_indices.clone()),
             &btree_table,
+            connection,
         ),
         None => Vec::new(),
     };
@@ -1399,6 +1403,7 @@ fn emit_update_insns<'a>(
                 TriggerEvent::Update,
                 Some(&updated_column_indices),
                 &btree_table,
+                connection,
             );
 
             let needs_old_registers =
@@ -2603,6 +2608,7 @@ fn emit_update_insns<'a>(
                     TriggerTime::After,
                     Some(updated_column_indices.clone()),
                     &btree_table,
+                    connection,
                 );
                 if !relevant_triggers.is_empty() {
                     let columns = target_table.table.columns();

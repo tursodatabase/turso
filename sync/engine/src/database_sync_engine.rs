@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeMap, HashMap, HashSet},
+    collections::{BTreeMap, HashSet},
     sync::{
         atomic::{AtomicUsize, Ordering},
         Arc, Mutex,
@@ -12,7 +12,6 @@ use turso_core::{
 };
 
 use crate::{
-    database_replay_generator::DatabaseReplayGenerator,
     database_sync_engine_io::SyncEngineIo,
     database_sync_lazy_storage::LazyDatabaseStorage,
     database_sync_operations::{
@@ -1990,19 +1989,12 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
         conn.execute("BEGIN IMMEDIATE")?;
         let mut logical_table_names_by_stable_id =
             self.meta().logical_table_names_by_stable_id.clone();
-        let mut replay = DatabaseReplaySession {
-            conn: conn.clone(),
-            cached_delete_stmt: HashMap::new(),
-            cached_insert_stmt: HashMap::new(),
-            cached_update_stmt: HashMap::new(),
-            in_txn: true,
-            generator: DatabaseReplayGenerator {
-                conn: conn.clone(),
-                opts: DatabaseReplaySessionOpts {
-                    use_implicit_rowid: true,
-                },
+        let mut replay = DatabaseReplaySession::new(
+            conn.clone(),
+            DatabaseReplaySessionOpts {
+                use_implicit_rowid: true,
             },
-        };
+        );
         let apply_result = async {
             let remote_apply_stats =
                 apply_logical_transactions_file_without_commit_excluding_client_txns_with_table_map_and_stats(
@@ -2065,19 +2057,12 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
             );
 
             if replayed_local_changes {
-                let mut local_replay = DatabaseReplaySession {
-                    conn: conn.clone(),
-                    cached_delete_stmt: HashMap::new(),
-                    cached_insert_stmt: HashMap::new(),
-                    cached_update_stmt: HashMap::new(),
-                    in_txn: true,
-                    generator: DatabaseReplayGenerator {
-                        conn: conn.clone(),
-                        opts: DatabaseReplaySessionOpts {
-                            use_implicit_rowid: false,
-                        },
+                let mut local_replay = DatabaseReplaySession::new(
+                    conn.clone(),
+                    DatabaseReplaySessionOpts {
+                        use_implicit_rowid: false,
                     },
-                };
+                );
 
                 let mut transformed = if self.opts.use_transform {
                     let ctx = &SyncOperationCtx::new(
@@ -2545,19 +2530,12 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
                                         let replay_conn = logical_replay_conn
                                             .as_ref()
                                             .expect("replace-base replay connection should exist");
-                                        let mut replay = DatabaseReplaySession {
-                                            conn: replay_conn.clone(),
-                                            cached_delete_stmt: HashMap::new(),
-                                            cached_insert_stmt: HashMap::new(),
-                                            cached_update_stmt: HashMap::new(),
-                                            in_txn: true,
-                                            generator: DatabaseReplayGenerator {
-                                                conn: replay_conn.clone(),
-                                                opts: DatabaseReplaySessionOpts {
-                                                    use_implicit_rowid: true,
-                                                },
+                                        let mut replay = DatabaseReplaySession::new(
+                                            replay_conn.clone(),
+                                            DatabaseReplaySessionOpts {
+                                                use_implicit_rowid: true,
                                             },
-                                        };
+                                        );
                                         apply_logical_transactions_file_without_commit_excluding_client_txns_with_table_map_and_stats(
                                             coro,
                                             &mut replay,
@@ -2826,19 +2804,12 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
                     cdc_enabled_for_local_replay = true;
                 }
 
-                let mut replay = DatabaseReplaySession {
-                    conn: phase_conn.clone(),
-                    cached_delete_stmt: HashMap::new(),
-                    cached_insert_stmt: HashMap::new(),
-                    cached_update_stmt: HashMap::new(),
-                    in_txn: true,
-                    generator: DatabaseReplayGenerator {
-                        conn: phase_conn.clone(),
-                        opts: DatabaseReplaySessionOpts {
-                            use_implicit_rowid: raw_page_replay_on_sql_conn,
-                        },
+                let mut replay = DatabaseReplaySession::new(
+                    phase_conn.clone(),
+                    DatabaseReplaySessionOpts {
+                        use_implicit_rowid: raw_page_replay_on_sql_conn,
                     },
-                };
+                );
 
                 let should_transform_local_change = |change: &DatabaseTapeRowChange| {
                     is_logically_replayable_table(&change.table_name)

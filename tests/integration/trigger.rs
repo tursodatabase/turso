@@ -1,6 +1,7 @@
 use crate::common::{do_flush, rusqlite_integrity_check, ExecRows, TempDatabase};
 use asserting::expectations::{any, StringContains};
 use asserting::prelude::*;
+use turso_core::LimboError;
 
 #[turso_macros::test(mvcc)]
 fn test_create_trigger(db: TempDatabase) {
@@ -2161,5 +2162,177 @@ fn test_old_values_and_returning_read_real_column_as_real() {
             ("after update real".to_string(),),
             ("after delete real".to_string(),),
         ]
+    );
+}
+
+// `Connection::set_triggers_enabled` / `set_fk_actions_enabled`: the sync
+// engine's row replay turns both off so that a trigger's or FK action's
+// effect, already captured as its own CDC row, is not also applied a second
+// time by the target re-running it (#10147). These tests cover the setting
+// itself, not the replay: see `sync/engine/src/database_tape.rs` for the
+// replay-session tests.
+
+#[turso_macros::test(mvcc)]
+fn test_triggers_enabled_false_skips_non_temp_trigger(db: TempDatabase) {
+    let conn = db.connect_limbo();
+    conn.execute("CREATE TABLE t(x)").unwrap();
+    conn.execute("CREATE TABLE log(msg)").unwrap();
+    conn.execute("CREATE TRIGGER tr AFTER INSERT ON t BEGIN INSERT INTO log VALUES ('fired'); END")
+        .unwrap();
+
+    conn.set_triggers_enabled(false);
+    conn.execute("INSERT INTO t VALUES (1)").unwrap();
+
+    let log: Vec<(String,)> = conn.exec_rows("SELECT msg FROM log");
+    assert_eq!(log, Vec::<(String,)>::new());
+    let rows: Vec<(i64,)> = conn.exec_rows("SELECT x FROM t");
+    assert_eq!(rows, vec![(1,)]);
+}
+
+// A TEMP trigger keeps firing even while non-TEMP triggers are off, matching
+// SQLite's SQLITE_DBCONFIG_ENABLE_TRIGGER=0 rule (trigger.c: triggersReallyExist
+// truncates the trigger list to TEMP triggers only, it does not empty it).
+#[turso_macros::test(mvcc)]
+fn test_triggers_enabled_false_keeps_temp_trigger_firing(db: TempDatabase) {
+    let conn = db.connect_limbo();
+    conn.execute("CREATE TABLE t(x)").unwrap();
+    conn.execute("CREATE TABLE log(msg)").unwrap();
+    conn.execute(
+        "CREATE TEMP TRIGGER tr AFTER INSERT ON t BEGIN INSERT INTO log VALUES ('temp fired'); END",
+    )
+    .unwrap();
+
+    conn.set_triggers_enabled(false);
+    conn.execute("INSERT INTO t VALUES (1)").unwrap();
+
+    let log: Vec<(String,)> = conn.exec_rows("SELECT msg FROM log");
+    assert_eq!(log, vec![("temp fired".to_string(),)]);
+}
+
+#[turso_macros::test(mvcc)]
+fn test_fk_actions_enabled_false_skips_cascade_action(db: TempDatabase) {
+    let conn = db.connect_limbo();
+    conn.execute("PRAGMA foreign_keys = ON").unwrap();
+    conn.execute("CREATE TABLE parent(id INTEGER PRIMARY KEY)")
+        .unwrap();
+    conn.execute(
+        "CREATE TABLE child(id INTEGER PRIMARY KEY, parent_id INTEGER \
+         REFERENCES parent(id) ON DELETE CASCADE)",
+    )
+    .unwrap();
+    conn.execute("INSERT INTO parent VALUES (1), (2)").unwrap();
+    conn.execute("INSERT INTO child VALUES (1, 1), (2, 2)")
+        .unwrap();
+
+    conn.set_fk_actions_enabled(false);
+    conn.execute("DELETE FROM parent WHERE id = 1").unwrap();
+
+    // The parent row is gone, but with FK actions off the CASCADE did not
+    // fire: the child row is untouched, and deleting the parent did not fail
+    // either (CASCADE is not downgraded to a failing check, see
+    // `fk_action_suppressed` in core/translate/fkeys.rs).
+    let parent: Vec<(i64,)> = conn.exec_rows("SELECT id FROM parent ORDER BY id");
+    assert_eq!(parent, vec![(2,)]);
+    let child: Vec<(i64, i64)> = conn.exec_rows("SELECT id, parent_id FROM child ORDER BY id");
+    assert_eq!(child, vec![(1, 1), (2, 2)]);
+
+    conn.set_fk_actions_enabled(true);
+    conn.execute("DELETE FROM parent WHERE id = 2").unwrap();
+
+    let child: Vec<(i64, i64)> = conn.exec_rows("SELECT id, parent_id FROM child ORDER BY id");
+    assert_eq!(child, vec![(1, 1)]);
+}
+
+// Turning `triggers_enabled` back on makes an already-prepared statement fire
+// triggers again: the same `Statement` is reused (reset + stepped) across the
+// setting change, so this exercises `PrepareContext::matches_connection` /
+// `Statement::reprepare`, not just a fresh compile picking up the new setting.
+#[turso_macros::test(mvcc)]
+fn test_triggers_enabled_reprepare_on_setting_change(db: TempDatabase) {
+    let conn = db.connect_limbo();
+    conn.execute("CREATE TABLE t(x)").unwrap();
+    conn.execute("CREATE TABLE log(msg)").unwrap();
+    conn.execute("CREATE TRIGGER tr AFTER INSERT ON t BEGIN INSERT INTO log VALUES ('fired'); END")
+        .unwrap();
+
+    let mut stmt = conn.prepare("INSERT INTO t VALUES (1)").unwrap();
+    stmt.run_ignore_rows().unwrap();
+    stmt.reset().unwrap();
+
+    conn.set_triggers_enabled(false);
+    stmt.run_ignore_rows().unwrap();
+    stmt.reset().unwrap();
+
+    conn.set_triggers_enabled(true);
+    stmt.run_ignore_rows().unwrap();
+    stmt.reset().unwrap();
+
+    let rows: Vec<(i64,)> = conn.exec_rows("SELECT x FROM t");
+    assert_eq!(rows, vec![(1,), (1,), (1,)]);
+    let log: Vec<(String,)> = conn.exec_rows("SELECT msg FROM log");
+    assert_eq!(log, vec![("fired".to_string(),), ("fired".to_string(),)]);
+}
+
+/// `fk_actions_enabled(false)` suppresses a CASCADE action, so a parent DELETE can leave
+/// a deferred child row's parent missing without that ever being counted as a violation
+/// (see `fk_action_suppressed` in core/translate/fkeys.rs). Deleting that now-orphaned
+/// child row must not decrement the deferred-violation counter: nothing incremented it,
+/// and doing so anyway can cancel a real, separately counted violation and let a COMMIT
+/// that should fail succeed instead.
+#[turso_macros::test]
+fn test_fk_actions_enabled_false_delete_does_not_decrement_uncounted_violation(db: TempDatabase) {
+    let conn = db.connect_limbo();
+    conn.execute("PRAGMA foreign_keys = ON").unwrap();
+    conn.execute("CREATE TABLE parent(id INTEGER PRIMARY KEY)")
+        .unwrap();
+    conn.execute(
+        "CREATE TABLE child(id INTEGER PRIMARY KEY, parent_id INTEGER \
+         REFERENCES parent(id) ON DELETE CASCADE DEFERRABLE INITIALLY DEFERRED)",
+    )
+    .unwrap();
+    conn.execute("INSERT INTO parent VALUES (1)").unwrap();
+    conn.execute("INSERT INTO child VALUES (1, 1)").unwrap();
+
+    conn.set_fk_actions_enabled(false);
+    conn.execute("BEGIN").unwrap();
+    // CASCADE is suppressed: parent is gone, child(1,1) is now orphaned, but
+    // nothing counted that: no counter change happens on a parent DELETE.
+    conn.execute("DELETE FROM parent WHERE id = 1").unwrap();
+    // A separate, genuine deferred violation: counter -> 1.
+    conn.execute("INSERT INTO child VALUES (2, 999)").unwrap();
+    // Deletes the orphaned-by-suppressed-cascade row from above. Its parent
+    // is missing, so an ungated decrement here would cancel the real
+    // violation's count: 1 -> 0.
+    conn.execute("DELETE FROM child WHERE id = 1").unwrap();
+    let commit_res = conn.execute("COMMIT");
+    assert!(
+        matches!(commit_res, Err(LimboError::ForeignKeyConstraint(_))),
+        "the genuine deferred violation (child 2 -> missing parent 999) must still \
+         reject the COMMIT, got {commit_res:?}"
+    );
+}
+
+/// `has_triggers_including_temp` (used to decide whether an UPDATE needs the
+/// trigger-driven stable-write-set path) must agree with `get_triggers_including_temp`
+/// (used to actually fire triggers) about whether `triggers_enabled` is off: with it off,
+/// no AFTER UPDATE trigger fires, so the UPDATE must not take that path either.
+#[turso_macros::test]
+fn test_update_skips_stable_write_set_when_triggers_disabled(db: TempDatabase) {
+    let conn = db.connect_limbo();
+    conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, x)")
+        .unwrap();
+    conn.execute("CREATE TABLE log(msg)").unwrap();
+    conn.execute("CREATE TRIGGER tr AFTER UPDATE ON t BEGIN INSERT INTO log VALUES ('fired'); END")
+        .unwrap();
+
+    conn.set_triggers_enabled(false);
+    let rows = crate::common::limbo_exec_rows(&conn, "EXPLAIN UPDATE t SET x = 1");
+    let uses_stable_write_set = rows.iter().any(
+        |row| matches!(&row[1], rusqlite::types::Value::Text(op) if op.as_str() == "OpenEphemeral"),
+    );
+    assert!(
+        !uses_stable_write_set,
+        "with triggers disabled no trigger will fire, so the UPDATE must not \
+         materialize a stable write set for one; EXPLAIN rows: {rows:#?}"
     );
 }
