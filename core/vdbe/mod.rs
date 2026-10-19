@@ -1759,10 +1759,9 @@ impl ProgramState {
         // the materialized views first (see
         // `Program::maintain_views_for_kept_changes`). Everything left in the
         // transaction change log after this point would be applied later,
-        // by some other statement. Debug-only, so statements without
-        // materialized views pay nothing for the check.
+        // by some other statement. The check is one atomic load.
         if ends_write_statement && end_statement == EndStatement::ReleaseSavepoint {
-            turso_debug_assert!(
+            turso_assert!(
                 connection.transaction_changes.is_empty(),
                 "write statement kept changes that never reached its materialized views"
             );

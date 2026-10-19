@@ -5205,7 +5205,7 @@ pub fn op_transaction_inner(
                             previous == 0,
                             "starting a writer while {previous} writer(s) are already active"
                         );
-                        turso_debug_assert!(
+                        turso_assert!(
                             program.connection.transaction_changes.is_empty(),
                             "write statement started with view changes left by an earlier statement"
                         );
@@ -5509,7 +5509,7 @@ pub fn op_savepoint(
     // the materialized views, so a named savepoint needs no position in the
     // transaction change log: ROLLBACK TO undoes the view btrees together
     // with the base tables.
-    turso_debug_assert!(
+    turso_assert!(
         conn.is_nested_stmt() || conn.transaction_changes.is_empty(),
         "savepoint operation with view changes no statement applied"
     );
