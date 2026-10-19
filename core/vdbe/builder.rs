@@ -354,6 +354,7 @@ impl ProgramBuilderFlags {
     const SUPPRESS_CUSTOM_TYPE_DECODE: u16 = 1 << 6;
     const SUPPRESS_COLUMN_DEFAULT: u16 = 1 << 7;
     const SKIP_EXPRESSION_INDEX_VALUES: u16 = 1 << 8;
+    const COMPILED_SUBPROGRAM: u16 = 1 << 9;
 
     const fn new(is_subprogram: bool) -> Self {
         let mut new = Self(0);
@@ -435,6 +436,17 @@ impl ProgramBuilderFlags {
     #[inline]
     pub const fn set_is_subprogram(&mut self, v: bool) {
         self.set(Self::IS_SUBPROGRAM, v)
+    }
+
+    #[inline]
+    /// Whether this program compiled a trigger body or an FK action (CASCADE/SET NULL/SET
+    /// DEFAULT) into itself as a subprogram.
+    pub const fn compiled_subprogram(self) -> bool {
+        self.get(Self::COMPILED_SUBPROGRAM)
+    }
+    #[inline]
+    pub const fn set_compiled_subprogram(&mut self, v: bool) {
+        self.set(Self::COMPILED_SUBPROGRAM, v)
     }
 
     #[inline]

@@ -2179,7 +2179,6 @@ fn test_cdc_upsert_before_image_reflects_before_update_trigger(db: TempDatabase)
                 None,
                 None,
             ),
-            v2_commit(),
             // The upsert's own row: before image is the row as it sat on disk
             // right before the upsert wrote it: y still 'a' (pre-SET), z
             // already 999 (post-trigger).
@@ -2351,5 +2350,125 @@ fn test_cdc_upsert_before_image_rowid_change_mvcc(db: TempDatabase) {
             ),
             v2_commit(),
         ]
+    );
+}
+
+/// A trigger or FK action compiles as its own subprogram; it must never write its own CDC
+/// COMMIT record. Only the root statement writes the single COMMIT record for the whole
+/// statement, and it must be the last row (https://github.com/tursodatabase/turso/issues/10148).
+fn assert_single_trailing_commit(conn: &std::sync::Arc<turso_core::Connection>) {
+    let rows = limbo_exec_rows(conn, "SELECT change_type FROM turso_cdc ORDER BY change_id");
+    let commit_count = rows
+        .iter()
+        .filter(|row| row[0] == Value::Integer(2))
+        .count();
+    assert_eq!(
+        commit_count, 1,
+        "expected exactly one COMMIT record, got {rows:?}"
+    );
+    assert_eq!(
+        rows.last().unwrap()[0],
+        Value::Integer(2),
+        "the COMMIT record must be the last row, got {rows:?}"
+    );
+}
+
+#[turso_macros::test]
+fn test_cdc_trigger_after_insert_autocommit_single_commit(db: TempDatabase) {
+    let conn = db.connect_limbo();
+    conn.execute("CREATE TABLE t(x INTEGER PRIMARY KEY, y)")
+        .unwrap();
+    conn.execute("CREATE TABLE audit(msg)").unwrap();
+    conn.execute(
+        "CREATE TRIGGER trg AFTER INSERT ON t BEGIN INSERT INTO audit VALUES ('fired'); END",
+    )
+    .unwrap();
+    conn.execute("PRAGMA capture_data_changes_conn('full')")
+        .unwrap();
+
+    conn.execute("INSERT INTO t VALUES (1, 'a')").unwrap();
+
+    assert_single_trailing_commit(&conn);
+}
+
+#[turso_macros::test]
+fn test_cdc_fk_cascade_delete_autocommit_single_commit(db: TempDatabase) {
+    let conn = db.connect_limbo();
+    conn.execute("PRAGMA foreign_keys = ON").unwrap();
+    conn.execute("CREATE TABLE parent(id INTEGER PRIMARY KEY)")
+        .unwrap();
+    conn.execute(
+        "CREATE TABLE child(id INTEGER PRIMARY KEY, pid INTEGER REFERENCES parent(id) ON DELETE CASCADE)",
+    )
+    .unwrap();
+    conn.execute("INSERT INTO parent VALUES (1)").unwrap();
+    conn.execute("INSERT INTO child VALUES (10, 1)").unwrap();
+    conn.execute("PRAGMA capture_data_changes_conn('full')")
+        .unwrap();
+
+    conn.execute("DELETE FROM parent WHERE id = 1").unwrap();
+
+    assert_single_trailing_commit(&conn);
+}
+
+/// Guard, not a regression test for the TEMP-root fix below: `t` is itself captured, so
+/// `cdc_cursor_id` is always `Some` here and the TEMP-root fallback path never runs. This
+/// passes with or without that fix; it only checks the single-commit invariant still holds
+/// for an explicit transaction.
+#[turso_macros::test]
+fn test_cdc_trigger_after_insert_explicit_transaction_single_commit_guard(db: TempDatabase) {
+    let conn = db.connect_limbo();
+    conn.execute("CREATE TABLE t(x INTEGER PRIMARY KEY, y)")
+        .unwrap();
+    conn.execute("CREATE TABLE audit(msg)").unwrap();
+    conn.execute(
+        "CREATE TRIGGER trg AFTER INSERT ON t BEGIN INSERT INTO audit VALUES ('fired'); END",
+    )
+    .unwrap();
+    conn.execute("PRAGMA capture_data_changes_conn('full')")
+        .unwrap();
+
+    conn.execute("BEGIN").unwrap();
+    conn.execute("INSERT INTO t VALUES (1, 'a')").unwrap();
+    conn.execute("COMMIT").unwrap();
+
+    assert_single_trailing_commit(&conn);
+}
+
+/// A root statement on a TEMP table is never captured, but a trigger it fires can still
+/// capture a row on a main (captured) table. The root statement must still write the one
+/// COMMIT record for the whole statement.
+// TODO: cannot use mvcc, a multi-row INSERT with an AFTER trigger drops CDC rows for the
+// trigger's own writes under mvcc; reproduces the same way with no TEMP table involved,
+// so it is a pre-existing mvcc/CDC/trigger gap unrelated to this fix.
+#[turso_macros::test()]
+fn test_cdc_trigger_temp_root_with_captured_write_single_commit(db: TempDatabase) {
+    let conn = db.connect_limbo();
+    conn.execute("CREATE TABLE audit(msg)").unwrap();
+    conn.execute("CREATE TEMP TABLE src(x)").unwrap();
+    conn.execute(
+        "CREATE TRIGGER trg AFTER INSERT ON src BEGIN INSERT INTO audit VALUES ('fired'); END",
+    )
+    .unwrap();
+    conn.execute("PRAGMA capture_data_changes_conn('full')")
+        .unwrap();
+
+    // Two rows: the trigger subprogram is invoked (and compiles its end-of-statement
+    // COMMIT check) once per row. A per-invocation COMMIT would show up as 2 records,
+    // one of them before the last row's own write.
+    conn.execute("INSERT INTO src VALUES (1), (2)").unwrap();
+
+    let rows = limbo_exec_rows(
+        &conn,
+        "SELECT change_type, table_name FROM turso_cdc ORDER BY change_id",
+    );
+    assert_eq!(
+        rows,
+        vec![
+            vec![Value::Integer(1), Value::Text("audit".to_string())],
+            vec![Value::Integer(1), Value::Text("audit".to_string())],
+            vec![Value::Integer(2), Value::Null],
+        ],
+        "expected two audit INSERT rows followed by exactly one COMMIT, got {rows:?}"
     );
 }
