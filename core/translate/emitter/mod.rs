@@ -183,11 +183,13 @@ pub struct Resolver<'a> {
     /// Schema dialect of the database being compiled against; used when a
     /// fresh placeholder schema must be constructed during resolution.
     pub(crate) dialect: Arc<dyn crate::dialect::Dialect>,
-    /// When set, we are compiling a trigger subprogram for this database.
-    /// Ordinary triggers are restricted to their own database, but temp-backed
-    /// triggers follow SQLite's looser resolution rules and may access objects
-    /// across schemas.
-    pub(crate) trigger_context: Option<TriggerDatabaseContext>,
+    /// When set, we are compiling the body of a trigger or a (non-materialized)
+    /// view for this database. Ordinary triggers and views are restricted to
+    /// their own database, but temp-backed triggers follow SQLite's looser
+    /// resolution rules and may access objects across schemas. A `RefCell`
+    /// because the view-expansion caller (`parse_table` in planner.rs) only
+    /// holds a shared `&Resolver`; see `with_database_scope`.
+    pub(crate) database_scope: RefCell<Option<DatabaseScopeContext>>,
     /// Cached flag: true when this connection has an active temp database.
     ///
     /// Computed once at Resolver construction to avoid repeated
@@ -259,16 +261,22 @@ impl SelfTableScope {
     }
 }
 
-/// Context for restricting table resolution during trigger subprogram compilation.
+/// Context for restricting table resolution while compiling the body of a
+/// database object (a trigger or a view). Mirrors SQLite's view/trigger
+/// schema fixer (`sqlite3FixSelect`/`DbFixer` in `src/fix.c`): unqualified
+/// table names inside the object's body resolve within the database the
+/// object itself lives in, not through the normal temp-first search.
 #[derive(Debug, Clone)]
-pub(crate) struct TriggerDatabaseContext {
-    /// The database ID the trigger belongs to.
+pub(crate) struct DatabaseScopeContext {
+    /// The database ID the object belongs to.
     database_id: usize,
-    /// The trigger name (for error messages).
-    trigger_name: String,
+    /// "trigger" or "view" (for error messages).
+    kind: &'static str,
+    /// The object's own name (for error messages).
+    object_name: String,
 }
 
-impl TriggerDatabaseContext {
+impl DatabaseScopeContext {
     fn restricts_db_references(&self) -> bool {
         self.database_id != crate::TEMP_DB_ID
     }
@@ -310,7 +318,7 @@ impl<'a> Resolver<'a> {
             #[cfg(feature = "simulator")]
             subquery_unnesting_mode: crate::SubqueryUnnestingMode::Auto,
             dialect,
-            trigger_context: None,
+            database_scope: RefCell::new(None),
             has_temp_schema,
             fk_action_compile_stack: FkActionCompileStack::default(),
             unqualified_database_search_path: unqualified_database_search_path.clone(),
@@ -355,7 +363,7 @@ impl<'a> Resolver<'a> {
             #[cfg(feature = "simulator")]
             subquery_unnesting_mode: self.subquery_unnesting_mode,
             dialect: self.dialect.clone(),
-            trigger_context: self.trigger_context.clone(),
+            database_scope: RefCell::new(self.database_scope.borrow().clone()),
             has_temp_schema: self.has_temp_schema,
             fk_action_compile_stack: self.fk_action_compile_stack.clone(),
             unqualified_database_search_path: self.unqualified_database_search_path.clone(),
@@ -382,7 +390,7 @@ impl<'a> Resolver<'a> {
             #[cfg(feature = "simulator")]
             subquery_unnesting_mode: self.subquery_unnesting_mode,
             dialect: self.dialect.clone(),
-            trigger_context: self.trigger_context.clone(),
+            database_scope: RefCell::new(self.database_scope.borrow().clone()),
             has_temp_schema: self.has_temp_schema,
             fk_action_compile_stack: self.fk_action_compile_stack.clone(),
             unqualified_database_search_path: self.unqualified_database_search_path.clone(),
@@ -513,12 +521,85 @@ impl<'a> Resolver<'a> {
         loaded_schema
     }
 
-    /// Set trigger database context to restrict table resolution to the trigger's database.
-    pub(crate) fn set_trigger_context(&mut self, database_id: usize, trigger_name: String) {
-        self.trigger_context = Some(TriggerDatabaseContext {
-            database_id,
-            trigger_name,
-        });
+    /// Run `f` with table resolution restricted to `database_id`, restoring
+    /// whatever scope was active before once `f` returns (including on an
+    /// early `Err` return). Callers that only hold a shared `&Resolver` use
+    /// this directly (e.g. a view's body is planned as a FROM-clause
+    /// subquery with only `&Resolver` in hand); `f` needs no access to
+    /// `self` because it can simply capture a copy of the shared reference.
+    ///
+    /// For trigger subprogram compilation, which must re-borrow the
+    /// `Resolver` mutably on every statement it compiles, see
+    /// `with_database_scope_mut` instead — a guard holding a live borrow of
+    /// `self` across that loop would conflict with those reborrows.
+    pub(crate) fn with_database_scope<T>(
+        &self,
+        database_id: usize,
+        kind: &'static str,
+        object_name: String,
+        f: impl FnOnce() -> Result<T>,
+    ) -> Result<T> {
+        let previous = self
+            .database_scope
+            .borrow_mut()
+            .replace(DatabaseScopeContext {
+                database_id,
+                kind,
+                object_name,
+            });
+        let result = f();
+        *self.database_scope.borrow_mut() = previous;
+        result
+    }
+
+    /// Like `with_database_scope`, but for callers that hold `&mut Resolver`
+    /// and need to pass it on mutably to `f` (trigger subprogram compilation
+    /// calls `translate_inner`, which takes `&mut Resolver`, once per trigger
+    /// command). `f` receives the same `&mut Resolver` back so it can keep
+    /// reborrowing it, instead of capturing it from the environment, which
+    /// would fight the mutable borrow this method itself takes.
+    pub(crate) fn with_database_scope_mut<T>(
+        &mut self,
+        database_id: usize,
+        kind: &'static str,
+        object_name: String,
+        f: impl FnOnce(&mut Self) -> Result<T>,
+    ) -> Result<T> {
+        let previous = self
+            .database_scope
+            .borrow_mut()
+            .replace(DatabaseScopeContext {
+                database_id,
+                kind,
+                object_name,
+            });
+        let result = f(self);
+        *self.database_scope.borrow_mut() = previous;
+        result
+    }
+
+    /// Restrict table resolution to the trigger's own database while `f` runs.
+    pub(crate) fn with_trigger_scope<T>(
+        &mut self,
+        database_id: usize,
+        trigger_name: String,
+        f: impl FnOnce(&mut Self) -> Result<T>,
+    ) -> Result<T> {
+        self.with_database_scope_mut(database_id, "trigger", trigger_name, f)
+    }
+
+    /// Restrict table resolution to the view's own database while `f` runs,
+    /// the same way `with_trigger_scope` does for triggers: a persistent
+    /// view's unqualified table names resolve within the database the view
+    /// lives in, never through a TEMP table that happens to share a source
+    /// table's name, matching SQLite's view schema fixer.
+    pub(crate) fn with_view_scope<T>(
+        &self,
+        database_id: usize,
+        view_name: String,
+        f: impl FnOnce() -> Result<T>,
+    ) -> Result<T> {
+        self.with_database_scope(database_id, "view", view_name, f)
     }
 
     pub fn resolve_function(
@@ -772,7 +853,7 @@ impl<'a> Resolver<'a> {
     }
 
     pub(crate) fn resolve_existing_table_database_id(&self, table_name: &str) -> Result<usize> {
-        if let Some(ref ctx) = self.trigger_context {
+        if let Some(ctx) = self.database_scope.borrow().as_ref() {
             if ctx.restricts_db_references() {
                 return Ok(ctx.database_id);
             }
@@ -839,10 +920,10 @@ impl<'a> Resolver<'a> {
                 }
             }
         } else {
-            // Unqualified table name — when compiling a trigger subprogram,
-            // resolve to the trigger's database (matching SQLite behavior).
-            // Otherwise default to main.
-            if let Some(ref ctx) = self.trigger_context {
+            // Unqualified table name — when compiling the body of a trigger
+            // or a view, resolve to that object's own database (matching
+            // SQLite behavior). Otherwise default to main.
+            if let Some(ctx) = self.database_scope.borrow().as_ref() {
                 if ctx.restricts_db_references() {
                     Ok(ctx.database_id)
                 } else {
@@ -853,10 +934,11 @@ impl<'a> Resolver<'a> {
             }
         }?;
 
-        // Triggers can only reference tables in their own database.
+        // A trigger or view can only reference tables in its own database.
         // This only fires for explicitly qualified names (e.g. "aux.table")
-        // since unqualified names already resolve to the trigger's database above.
-        if let Some(ref ctx) = self.trigger_context {
+        // since unqualified names already resolve to the object's own
+        // database above.
+        if let Some(ctx) = self.database_scope.borrow().as_ref() {
             if !ctx.restricts_db_references() {
                 return Ok(resolved_id);
             }
@@ -867,8 +949,8 @@ impl<'a> Resolver<'a> {
                     .map(|n| n.as_str())
                     .unwrap_or("main");
                 return Err(LimboError::ParseError(format!(
-                    "trigger {} cannot reference objects in database {}",
-                    ctx.trigger_name, db_name
+                    "{} {} cannot reference objects in database {}",
+                    ctx.kind, ctx.object_name, db_name
                 )));
             }
         }
@@ -1562,7 +1644,6 @@ fn emit_cdc_insns_v1(
     Ok(())
 }
 
-#[allow(clippy::too_many_arguments)]
 #[allow(clippy::too_many_arguments)]
 fn emit_cdc_insns_v2(
     program: &mut ProgramBuilder,

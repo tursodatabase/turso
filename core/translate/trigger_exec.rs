@@ -592,9 +592,11 @@ fn execute_trigger_commands(
     } else {
         database_id
     };
-    let prev_trigger_context = resolver.trigger_context.clone();
-    resolver.set_trigger_context(trigger_database_id, trigger.name.clone());
-    let compile_result = (|| -> Result<()> {
+    // `resolver` is reborrowed as `&mut Resolver` on every trigger command
+    // below (`translate_inner` needs it), so the scope closure takes
+    // `resolver` as a parameter rather than capturing the outer binding -
+    // see `Resolver::with_database_scope_mut`.
+    resolver.with_trigger_scope(trigger_database_id, trigger.name.clone(), |resolver| {
         for command in trigger.commands.iter() {
             let stmt = trigger_cmd_to_stmt_for_subprogram(command, &subprogram_ctx)?;
             subprogram_builder.prologue();
@@ -615,10 +617,7 @@ fn execute_trigger_commands(
             }
         }
         Ok(())
-    })();
-    // Restore previous trigger context (supports nested triggers).
-    resolver.trigger_context = prev_trigger_context;
-    compile_result?;
+    })?;
     subprogram_builder.epilogue(resolver.schema());
     let built_subprogram =
         subprogram_builder.build(connection.clone(), true, "trigger subprogram")?;

@@ -25,10 +25,11 @@ use turso_core::Database;
 
 use crate::generate::{GeneratorKind, PropTestBackend, SqlGenBackend, SqlGenerator, WeightProfile};
 use crate::memory::{MemorySimIO, SimIO};
-use crate::oracle::{DifferentialOracle, OracleResult, QueryResult, check_differential};
+use crate::oracle::{
+    DifferentialOracle, OracleResult, QueryResult, QueryValue, check_differential,
+};
 use crate::schema::SchemaIntrospector;
 pub use sql_gen::TreeMode;
-use sql_gen_prop::SqlValue;
 
 const MAX_GENERATED_SQL_BYTES: usize = 64 * 1024;
 
@@ -724,8 +725,8 @@ impl Fuzzer {
 
         let check_ok = |result: &QueryResult, db_name: &str| -> Result<()> {
             match result {
-                QueryResult::Rows(rows) if rows.len() == 1 && rows[0].0.len() == 1 => {
-                    if let SqlValue::Text(ref text) = rows[0].0[0] {
+                QueryResult::Rows(rows) if rows.len() == 1 && rows.rows()[0].0.len() == 1 => {
+                    if let QueryValue::Text(ref text) = rows.rows()[0].0[0] {
                         if text == "ok" {
                             return Ok(());
                         }
