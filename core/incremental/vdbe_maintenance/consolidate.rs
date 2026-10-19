@@ -1,4 +1,5 @@
 use super::stream::{open_ephemeral_delta, EphemeralDelta};
+use crate::alloc::TursoIteratorExt;
 use crate::schema::PseudoCursorType;
 use crate::turso_assert;
 use crate::vdbe::builder::{CursorType, ProgramBuilder};
@@ -77,8 +78,8 @@ pub(super) fn consolidate_delta(
             columns: key_width,
             order_collations_nulls: (0..key_width)
                 .map(|_| (SortOrder::Asc, None, None))
-                .collect(),
-            comparators: (0..key_width).map(|_| None).collect(),
+                .try_collect()?,
+            comparators: (0..key_width).map(|_| None).try_collect()?,
         }),
     });
     let entry_start = program.alloc_registers(entry_width);

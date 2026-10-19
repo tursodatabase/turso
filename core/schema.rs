@@ -2363,7 +2363,7 @@ impl Schema {
             out.push(name);
         }
         let mut seen = HashSet::default();
-        let mut out = Vec::new();
+        let mut out = vec![];
         for table_name in IncrementalView::referenced_table_names(select) {
             expand(self, &table_name, &mut seen, &mut out);
         }
