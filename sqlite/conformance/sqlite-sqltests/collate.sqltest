@@ -1557,6 +1557,35 @@ expect {
     3
 }
 
+# "x IN (SELECT y ...)" compares like "x = y". binary_side.k is the left
+# operand, so the comparison is BINARY and no row matches.
+@setup mixed_collation_join
+test in-subquery-uses-left-column-collation {
+    SELECT b.k FROM binary_side b WHERE b.k IN (SELECT n.k FROM nocase_side n) ORDER BY b.k;
+}
+expect {
+}
+
+# Flipped: nocase_side.k is the left operand, so the comparison is NOCASE.
+@setup mixed_collation_join
+test in-subquery-uses-left-column-collation-flipped {
+    SELECT n.id FROM nocase_side n WHERE n.k IN (SELECT b.k FROM binary_side b) ORDER BY n.id;
+}
+expect {
+    1
+    2
+}
+
+# NOT IN uses the same BINARY comparison, so both binary_side rows stay.
+@setup mixed_collation_join
+test not-in-subquery-uses-left-column-collation {
+    SELECT b.k FROM binary_side b WHERE b.k NOT IN (SELECT n.k FROM nocase_side n) ORDER BY b.k;
+}
+expect {
+    ABC
+    def
+}
+
 # A NOCASE index cannot serve a BINARY comparison. INDEXED BY only forces the
 # index to be considered; the seek must still be rejected here.
 @setup mixed_collation_join
