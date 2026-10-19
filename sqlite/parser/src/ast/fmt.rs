@@ -1726,6 +1726,9 @@ impl ToTokens for CreateTableBody {
                     }
                 }
                 if let Some(ref strict) = options.strict_text {
+                    if options.contains_without_rowid() {
+                        s.append(TK_COMMA, None)?;
+                    }
                     s.append(TK_ID, Some(strict))?;
                 }
                 Ok(())

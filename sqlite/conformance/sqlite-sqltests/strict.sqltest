@@ -72,3 +72,35 @@ test strict-not-null-still-enforced {
 }
 expect error {
 }
+
+@skip-if mvcc "WITHOUT ROWID writes are not supported in MVCC mode"
+@cross-check-integrity
+test strict-without-rowid-table-options {
+    CREATE TABLE t(a INTEGER PRIMARY KEY, b TEXT) STRICT, WITHOUT ROWID;
+    INSERT INTO t VALUES (1, 'one'), (2, 'two');
+    SELECT a, b FROM t ORDER BY a;
+    PRAGMA table_list(t);
+    PRAGMA integrity_check;
+}
+expect {
+    1|one
+    2|two
+    main|t|table|2|1|1
+    ok
+}
+
+@skip-if mvcc "WITHOUT ROWID writes are not supported in MVCC mode"
+@cross-check-integrity
+test strict-without-rowid-table-options-reversed {
+    CREATE TABLE t(a TEXT, b INTEGER, c ANY, PRIMARY KEY(a, b)) without rowid, strict;
+    INSERT INTO t VALUES ('one', 1, '0001'), ('two', 2, X'0102');
+    SELECT a, b, typeof(c), quote(c) FROM t ORDER BY a;
+    PRAGMA table_list(t);
+    PRAGMA integrity_check;
+}
+expect {
+    one|1|text|'0001'
+    two|2|blob|X'0102'
+    main|t|table|3|1|1
+    ok
+}

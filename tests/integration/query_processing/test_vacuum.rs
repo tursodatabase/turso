@@ -3106,7 +3106,7 @@ fn test_vacuum_into_with_strict_table(tmp_db: TempDatabase) -> anyhow::Result<()
     Ok(())
 }
 
-#[turso_macros::test(mvcc)]
+#[turso_macros::test]
 fn test_vacuum_into_with_strict_without_rowid(tmp_db: TempDatabase) -> anyhow::Result<()> {
     let conn = tmp_db.connect_limbo();
 
@@ -4364,7 +4364,7 @@ fn test_plain_vacuum_with_strict_table(tmp_db: TempDatabase) -> anyhow::Result<(
     Ok(())
 }
 
-#[turso_macros::test(mvcc)]
+#[turso_macros::test]
 fn test_plain_vacuum_with_strict_without_rowid(tmp_db: TempDatabase) -> anyhow::Result<()> {
     let conn = tmp_db.connect_limbo();
 
