@@ -23809,3 +23809,74 @@ unsafe impl crate::alloc::ApiAllocator for OneShotFaultAlloc {
         }
     }
 }
+
+/// A Busy commit of the inner tx that allocates an AUTOINCREMENT id must be
+/// retried on the inner tx. It used to roll back the inner tx and then, on
+/// the retry, commit the outer `BEGIN CONCURRENT` tx in its place, so the
+/// outer tx's writes survived a later ROLLBACK.
+#[test]
+fn test_busy_autoincrement_inner_commit_keeps_outer_tx() {
+    for use_trigger in [false, true] {
+        let db = MvccTestDbNoConn::new_with_random_db();
+        let conn_a = db.connect();
+        let conn_b = db.connect();
+        conn_a
+            .execute("CREATE TABLE s (id INTEGER PRIMARY KEY AUTOINCREMENT, v INTEGER)")
+            .unwrap();
+        conn_a.execute("CREATE TABLE p (v TEXT)").unwrap();
+        conn_a.execute("CREATE TABLE q (v TEXT)").unwrap();
+        conn_a
+            .execute(
+                "CREATE TRIGGER q_ins AFTER INSERT ON q BEGIN INSERT INTO s (v) VALUES (2); END",
+            )
+            .unwrap();
+
+        conn_b.execute("BEGIN IMMEDIATE").unwrap();
+        conn_b.execute("INSERT INTO p VALUES ('b')").unwrap();
+
+        conn_a.execute("BEGIN CONCURRENT").unwrap();
+        conn_a.execute("INSERT INTO p VALUES ('a')").unwrap();
+        let sql = if use_trigger {
+            "INSERT INTO q VALUES (1)"
+        } else {
+            "INSERT INTO s (v) VALUES (1)"
+        };
+        let mut insert = conn_a.prepare(sql).unwrap();
+        step_until_busy_then_release(&mut insert, &conn_b).unwrap();
+        drop(insert);
+
+        assert_eq!(
+            get_rows(&conn_a, "SELECT v FROM s"),
+            vec![vec![Value::from_i64(if use_trigger { 2 } else { 1 })]]
+        );
+        conn_a.execute("ROLLBACK").unwrap();
+
+        let conn_c = db.connect();
+        assert_eq!(
+            get_rows(&conn_c, "SELECT v FROM p"),
+            vec![vec![Value::build_text("b")]]
+        );
+        assert!(get_rows(&conn_c, "SELECT v FROM s").is_empty());
+    }
+}
+
+fn step_until_busy_then_release(
+    stmt: &mut crate::Statement,
+    lock_holder: &Arc<Connection>,
+) -> Result<()> {
+    let mut released = false;
+    loop {
+        match stmt.step()? {
+            StepResult::IO | StepResult::Yield => stmt._io().step()?,
+            StepResult::Busy if !released => {
+                lock_holder.execute("COMMIT")?;
+                released = true;
+            }
+            StepResult::Done => {
+                assert!(released, "statement must hit Busy while the lock is held");
+                return Ok(());
+            }
+            other => panic!("unexpected step result: {other:?}"),
+        }
+    }
+}
