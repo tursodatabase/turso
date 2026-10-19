@@ -151,13 +151,18 @@ subquery emits the same shell when its loop opens.
 `scripts/hir-conformance.sh` runs every `.sqltest` file with the switch on,
 one process per file, and groups failures by cause. The first run on
 2026-10-14 passed 13602 conformance tests and failed 568. On 2026-10-16 a run
-failed 29, with every file running to the end; legacy passes all of them.
-What is left:
-
-| Gap | Failing tests | Example |
-|---|---|---|
-| EXPLAIN QUERY PLAN and bytecode shape where the plans differ (see below) | 28 | `explain-query-plan-json`, `unnest-correlated` |
-| Legacy's expected rows are wrong; HIR matches SQLite | 1 | `full-outer-with-where-equijoin` |
+failed 29, with every file running to the end; legacy passes all of them. On
+2026-10-19 every test passes. The script passes `--normalize-plans` to the
+runner, which compares EXPLAIN QUERY PLAN rows (text and `FORMAT=JSON`, in
+tests whose SQL says `EXPLAIN QUERY PLAN`) with the ids of generated names
+(`ephemeral_t_t3`, `SUBQUERY 2`) replaced, each parent's `SUBQUERY` rows
+moved after its other rows, and the row ids renumbered in that order. Those
+are the parts that differ between the two planners when they choose the
+same plan: legacy numbers rows by instruction address and lists an
+uncorrelated subquery before the loops, HIR after them. A different loop,
+index, or join method still fails. Expectations written as `expect pattern`
+in `unnest-correlated` leave the cursor and register numbers open for the
+same reason.
 
 Fixed since the 2026-10-15 run, each following SQLite:
 
@@ -213,10 +218,17 @@ term used as a key was never checked on the rows the join NULL-fills, so
 `t FULL JOIN u ON t.x = u.x WHERE t.x = u.x` returned those rows too.
 
 EXPLAIN QUERY PLAN names each loop of a block before any cursor opens, as
-legacy does, so simple plans print the same rows with the same ids. Plans
-still differ where the bytecode differs: legacy runs uncorrelated subqueries
-before the loops, turns EXISTS into semi-joins, and uses hash joins in more
-places than HIR.
+legacy does, so simple plans print the same rows with the same ids. HIR
+prints the rows legacy prints for a distinct aggregate (`USE HASH TABLE FOR
+count(DISTINCT)`), a correlated IN probe (`CORRELATED LIST SUBQUERY`, with
+the subquery's loops under it), and a compound query's ORDER BY (next to
+`COMPOUND QUERY`, not under it). A CTE read by several loops, or hinted
+MATERIALIZED, is filled before the block's loops open, as legacy fills it:
+its body rows stand on their own, `FORMAT=JSON` lists them under
+`cte_materializations`, every reader reports `materialized_reuse`, and the
+reader that filled the table reads it through the same cursor while the
+others open a second cursor on it. Row ids still differ where the bytecode
+differs (see `--normalize-plans` above).
 
 Like legacy, a LEFT JOIN outside parentheses whose NULL row a WHERE term
 rejects (a comparison or arithmetic on one of its columns, but not IS,

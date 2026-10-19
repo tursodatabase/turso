@@ -2886,3 +2886,81 @@ fn hir_hash_joins_build_from_the_loops_before_the_probe_like_legacy() {
         assert_eq!(limbo_exec_rows(&hir, sql), expected, "{sql}");
     }
 }
+
+/// Each EXPLAIN QUERY PLAN row legacy prints for a distinct aggregate, a
+/// correlated IN probe, a compound ORDER BY and a shared CTE, HIR prints too,
+/// in the same place. A CTE read twice is filled once before the loops: its
+/// body rows stand on their own, `cte_materializations` points at them, and
+/// both readers report a materialized reuse.
+#[test]
+fn hir_explain_rows_match_legacy_for_distinct_probes_compounds_and_shared_ctes() {
+    let db = setup();
+    let [legacy, hir] = connections(&db);
+    for statement in [
+        "CREATE TABLE users(id INTEGER PRIMARY KEY, name TEXT, city_id INT)",
+        "CREATE TABLE orders(id INTEGER PRIMARY KEY, user_id INT, amount INT)",
+        "CREATE INDEX idx_orders_user ON orders(user_id)",
+    ] {
+        legacy.execute(statement).unwrap();
+    }
+    const SHARED_CTE: &str = "WITH spenders AS (SELECT user_id, sum(amount) AS total \
+         FROM orders GROUP BY user_id) \
+         SELECT u.name, s1.total FROM users u \
+         JOIN spenders s1 ON s1.user_id = u.id JOIN spenders s2 ON s2.user_id = u.city_id";
+    for (sql, row) in [
+        (
+            "SELECT count(DISTINCT tag) FROM tags",
+            "USE HASH TABLE FOR count(DISTINCT)",
+        ),
+        (
+            "SELECT id FROM items WHERE value IN (SELECT item_id FROM tags WHERE item_id = items.id) \
+             LIMIT 1",
+            "CORRELATED LIST SUBQUERY",
+        ),
+        (
+            "SELECT value FROM items UNION SELECT item_id FROM tags ORDER BY 1",
+            "USE SORTER FOR ORDER BY",
+        ),
+        (SHARED_CTE, "SCAN orders USING INDEX idx_orders_user"),
+    ] {
+        let hir_plan = query_plan(&hir, sql);
+        assert!(hir_plan.iter().any(|line| line.starts_with(row)), "{sql}: {hir_plan:?}");
+        assert_eq!(
+            plan_without_ids(hir_plan),
+            plan_without_ids(query_plan(&legacy, sql)),
+            "{sql}"
+        );
+    }
+
+    let json = limbo_exec_rows(
+        &hir,
+        &format!("EXPLAIN QUERY PLAN FORMAT=JSON {SHARED_CTE}"),
+    );
+    let json = match json.as_slice() {
+        [row] => match row.as_slice() {
+            [rusqlite::types::Value::Text(json)] => json.clone(),
+            _ => panic!("one JSON row expected: {json:?}"),
+        },
+        _ => panic!("one JSON row expected: {json:?}"),
+    };
+    assert_eq!(
+        json.matches(r#""execution":"materialized_reuse","cte_id":0"#)
+            .count(),
+        2,
+        "{json}"
+    );
+    let (_, materialization) = json
+        .split_once(r#""cte_materializations":[{"cte_id":0,"name":"spenders","nodes":["#)
+        .unwrap_or_else(|| panic!("{json}"));
+    let body_id: u32 = materialization
+        .split(']')
+        .next()
+        .and_then(|ids| ids.parse().ok())
+        .unwrap_or_else(|| panic!("{json}"));
+    assert!(
+        json.contains(&format!(
+            r#"{{"id":{body_id},"parent":null,"detail":"SCAN orders USING INDEX idx_orders_user""#
+        )),
+        "{json}"
+    );
+}

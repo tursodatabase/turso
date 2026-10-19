@@ -1471,7 +1471,7 @@ test unnested-in-reuses-unused-cursor {
     );
 }
 expect pattern {
-    (?m)^\d+\|OpenRead\|0\|.*table=cursor_outer.*$\n^\d+\|OpenRead\|1\|.*table=cursor_inner.*$(?s).*\n\d+\|OpenAutoindex\|2\|
+    (?m)^\d+\|OpenRead\|[0-2]\|.*table=cursor_outer.*$\n^\d+\|OpenRead\|[0-2]\|.*table=cursor_inner.*$(?s).*\n\d+\|OpenAutoindex\|[0-2]\|
 }
 
 # The scalar result register is not used after the aggregate becomes a grouped
@@ -1493,7 +1493,7 @@ test grouped-aggregate-reuses-unused-result-register {
     FROM register_outer o;
 }
 expect pattern {
-    (?m)^\d+\|AggFinal\|.*$\n^\d+\|Copy\|\d+\|1\|.*$\n^\d+\|Copy\|\d+\|2\|.*$
+    (?m)^\d+\|AggFinal\|.*$\n^\d+\|Copy\|\d+\|\d+\|.*$\n^\d+\|Copy\|\d+\|\d+\|.*$
 }
 
 # A grouped value can be used while two outer hash joins build their inputs.

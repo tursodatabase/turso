@@ -1103,9 +1103,20 @@ pub(crate) fn emit_in_probe_subquery(
         },
         correlated: true,
     };
+    // Legacy lists it as the list subquery it was written as.
+    let explain_id = program.next_subquery_eqp_id();
+    crate::emit_explain!(
+        program,
+        true,
+        EqpDetail::ListSubquery {
+            id: explain_id,
+            correlated: true,
+        }
+    );
     emit_prepared_subquery(program, &prepared, |program, query, destination| {
         emit_planned_query_body(program, plan, query, destination)
     })?;
+    program.pop_current_parent_explain();
     Ok(register)
 }
 
@@ -1270,6 +1281,7 @@ pub(crate) fn emit_planned_query_body(
     }
 
     let block = &query.blocks[0];
+    materialize_hir_shared_ctes(program, plan, &planned_query.blocks[0].loops)?;
     emit_hir_block_explain(program, document, block, &planned_query.blocks[0])?;
     let done = program.allocate_label();
     // EXISTS only checks whether a row comes out, so like legacy and SQLite
@@ -1458,6 +1470,7 @@ fn emit_planned_query_block_with_output(
             block.id, block_plan.block
         )));
     }
+    materialize_hir_shared_ctes(program, plan, &block_plan.loops)?;
     emit_hir_block_explain(program, &plan.document, block, block_plan)?;
     if !block.windows.is_empty() {
         return emit_hir_window_block(program, plan, query, block, block_plan, output);
@@ -2485,6 +2498,9 @@ fn emit_hir_compound_query(
             collection_done,
         )?;
         program.preassign_label_to_next_insn(collection_done);
+        // Like legacy, the sort of the collected rows is not part of the
+        // compound's row.
+        program.pop_current_parent_explain();
         emit_hir_compound_order_by(
             program,
             &plan.document,
@@ -2493,7 +2509,9 @@ fn emit_hir_compound_query(
             destination,
         )
     };
-    program.pop_current_parent_explain();
+    if query.order_by.is_empty() {
+        program.pop_current_parent_explain();
+    }
     result
 }
 
@@ -3650,6 +3668,13 @@ fn initialize_hir_aggregates<'a>(
             program.emit_insn(Insn::HashClear {
                 hash_table_id: hash_table,
             });
+            emit_explain!(
+                program,
+                false,
+                EqpDetail::DistinctAggregate {
+                    function: func.to_string(),
+                }
+            );
             Some(HirAggregateDistinctSet {
                 hash_table,
                 collation: facts[0]
@@ -5327,6 +5352,71 @@ fn prepare_hir_left_joins(
         .collect()
 }
 
+/// Whether a loop reads a CTE that is filled once and shared by its readers:
+/// one read by several loops, or one hinted MATERIALIZED.
+fn hir_loop_shares_cte(planned_loop: &HirPlannedLoop) -> bool {
+    matches!(
+        planned_loop.access,
+        HirSourceAccess::Cte {
+            materialization: HirCteMaterialization::Shared | HirCteMaterialization::Explicit,
+            ..
+        }
+    )
+}
+
+/// Like legacy, fill each shared CTE the loops read into its table before
+/// the block's loops open. EXPLAIN then lists the CTE's body on its own,
+/// under `cte_materializations`, and every reader points at that one fill.
+fn materialize_hir_shared_ctes(
+    program: &mut ProgramBuilder,
+    plan: &HirPlan,
+    loops: &[HirPlannedLoop],
+) -> Result<()> {
+    for planned_loop in loops {
+        match &planned_loop.access {
+            HirSourceAccess::Cte { cte, query, .. } if hir_loop_shares_cte(planned_loop) => {
+                if program.hir_materialized_cte(*cte).is_some() {
+                    continue;
+                }
+                let name = plan
+                    .document
+                    .cte(*cte)
+                    .map(|cte| cte.name.clone())
+                    .ok_or_else(|| {
+                        LimboError::InternalError(format!("HIR references missing CTE {cte}"))
+                    })?;
+                let materialized_query = HirMaterializedQuery::Cte {
+                    cte: *cte,
+                    query: *query,
+                };
+                let prepared =
+                    program.with_cte_materialization_eqp(cte.index(), &name, |program| {
+                        prepare_hir_materialized_loop(
+                            program,
+                            plan,
+                            planned_loop.source,
+                            materialized_query,
+                        )
+                    })?;
+                program.register_hir_materialized_cte(
+                    *cte,
+                    MaterializedCteInfo {
+                        cursor_id: prepared.cursor,
+                        table: prepared.table.clone(),
+                        num_columns: prepared.source.columns.len(),
+                    },
+                );
+            }
+            HirSourceAccess::Hash(HirHashLookup {
+                build_input: Some(input),
+                ..
+            }) => materialize_hir_shared_ctes(program, plan, &input.loops)?,
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
 /// Emit the EXPLAIN QUERY PLAN rows of a block's loops in loop order, as
 /// legacy does before it opens any cursor. A block without FROM reads one
 /// constant row.
@@ -5439,7 +5529,12 @@ pub(super) fn hir_loop_explain(
                 join
             }
         });
-    let exec = if from.is_some_and(|from| hir_loop_streams(document, from, planned_loop)) {
+    // A shared CTE is filled once, before the loops, and every reader reads
+    // that one fill, which legacy reports as a reuse.
+    let shared = hir_loop_shares_cte(planned_loop);
+    let exec = if shared {
+        EqpSubqueryExec::MaterializedReuse
+    } else if from.is_some_and(|from| hir_loop_streams(document, from, planned_loop)) {
         EqpSubqueryExec::Coroutine
     } else {
         EqpSubqueryExec::Materialized
@@ -5481,7 +5576,11 @@ pub(super) fn hir_loop_explain(
             backwards: seek_def.iter_dir == IterationDirection::Backwards,
             join,
             subquery: Some(EqpSubquery {
-                exec: EqpSubqueryExec::Materialized,
+                exec: if shared {
+                    EqpSubqueryExec::MaterializedReuse
+                } else {
+                    EqpSubqueryExec::Materialized
+                },
                 cte_id: cte.map(hir::CteId::index),
                 recursive: false,
             }),
@@ -6951,18 +7050,29 @@ fn prepare_hir_shared_cte_loop<'a>(
     let materialized_query = HirMaterializedQuery::Cte { cte, query };
     let source = validate_hir_materialized_query(plan, source_id, materialized_query)?;
     if let Some(shared) = program.hir_materialized_cte(cte).cloned() {
-        let cursor = program.alloc_cursor_id(CursorType::BTreeTable(shared.table.clone()));
-        program.emit_insn(Insn::OpenDup {
-            new_cursor_id: cursor,
-            original_cursor_id: shared.cursor_id,
-        });
-        program.bind_source(
-            source_id,
-            SourceBinding::BTree {
-                scan_cursor: cursor,
-                table_cursor: None,
-            },
+        // The reader that filled the table reads it through its own cursor;
+        // the others open a second cursor on the same table.
+        let filled_here = matches!(
+            program.source_binding(source_id),
+            Some(SourceBinding::BTree { scan_cursor, .. }) if *scan_cursor == shared.cursor_id
         );
+        let cursor = if filled_here {
+            shared.cursor_id
+        } else {
+            let cursor = program.alloc_cursor_id(CursorType::BTreeTable(shared.table.clone()));
+            program.emit_insn(Insn::OpenDup {
+                new_cursor_id: cursor,
+                original_cursor_id: shared.cursor_id,
+            });
+            program.bind_source(
+                source_id,
+                SourceBinding::BTree {
+                    scan_cursor: cursor,
+                    table_cursor: None,
+                },
+            );
+            cursor
+        };
         return Ok(PreparedHirMaterializedLoop {
             source,
             cursor,
