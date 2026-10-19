@@ -1365,7 +1365,7 @@ pub fn emit_upsert(
             record_reg,
             flag: InsertFlags::new()
                 .require_seek()
-                .update_rowid_change()
+                .old_row_deleted()
                 .skip_last_rowid(),
             table_name: table.get_name().to_string(),
         });

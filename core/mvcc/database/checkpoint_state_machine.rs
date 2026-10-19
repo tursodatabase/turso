@@ -563,13 +563,18 @@ pub fn sqlite_schema_btree_identity(version: &RowVersion) -> Option<SqliteSchema
     }
 
     let row_data = ImmutableRecordRef::from_bin_record(version.row.payload());
-    let Ok((col0, col3)) = row_data.get_two_values(0, 3) else {
+    let Ok((col0, col3, col4)) = row_data.get_three_values(0, 3, 4) else {
         return None;
     };
 
     let kind = match col0 {
         ValueRef::Text(type_str) => match type_str.as_str() {
             "table" => SqliteSchemaBtreeKind::Table,
+            // A materialized view's own storage shares a table's create/drop
+            // B-tree lifecycle; a plain view has no B-tree of its own.
+            "view" if matches!(col4, ValueRef::Text(sql) if crate::util::sql_is_create_materialized_view(sql.as_str())) => {
+                SqliteSchemaBtreeKind::Table
+            }
             "index" => SqliteSchemaBtreeKind::Index,
             _ => return None,
         },
@@ -1128,13 +1133,13 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
                 });
             // - It is a delete, AND some version of the row exists in the database file.
             let is_delete_and_exists_in_db_file = end_ts.is_some() && exists_in_db_file;
-            // - It is a delete of an uncheckpointed sqlite_schema row for a
-            //   table or index. The schema row itself is not in the DB file, but
-            //   checkpoint still needs it so it can remember that the table or
-            //   index was destroyed and skip that object's data/index rows.
-            //   Views and triggers have rootpage=0, so their uncheckpointed
-            //   deletes can be ignored here: there is no B-tree to destroy, and
-            //   deleting a missing sqlite_schema row would be wrong.
+            // - It is a delete of an uncheckpointed sqlite_schema row that owns a
+            //   B-tree (a table, an index, or a materialized view). The schema
+            //   row itself is not in the DB file, but checkpoint still needs it
+            //   so it can remember that the object was destroyed and skip its
+            //   data/index rows. A plain view or a trigger has no B-tree
+            //   (sqlite_schema_btree_identity returns None for it), so its
+            //   uncheckpointed delete is ignored here.
             let is_schema_delete = table_id == SQLITE_SCHEMA_MVCC_TABLE_ID
                 && !exists_in_db_file
                 && sqlite_schema_btree_identity(version).is_some()
@@ -3966,6 +3971,74 @@ mod tests {
             &trigger,
             Some(&rewritten_trigger)
         ));
+    }
+
+    fn sqlite_schema_row_version_with_sql(
+        rowid: i64,
+        entry_type: &'static str,
+        name: &'static str,
+        table_name: &'static str,
+        root_page: i64,
+        sql: &'static str,
+    ) -> RowVersion {
+        let record = ImmutableRecord::from_values(
+            &[
+                Value::build_text(entry_type),
+                Value::build_text(name),
+                Value::build_text(table_name),
+                Value::from_i64(root_page),
+                Value::build_text(sql),
+            ],
+            5,
+        )
+        .unwrap();
+        RowVersion {
+            id: 1,
+            begin: crate::mvcc::database::PackedTs::pack(Some(TxTimestampOrID::Timestamp(1))),
+            end: crate::mvcc::database::PackedTs::pack(None),
+            row: Row::new_table_row(
+                RowID::new(SQLITE_SCHEMA_MVCC_TABLE_ID, RowKey::Int(rowid)),
+                record.as_blob(),
+                5,
+            )
+            .unwrap(),
+            btree_resident: false,
+            materialized_at: crate::mvcc::database::WalPos::ORIGIN,
+        }
+    }
+
+    #[test]
+    fn sqlite_schema_identity_treats_materialized_view_as_btree_owner() {
+        let view = sqlite_schema_row_version_with_sql(
+            4,
+            "view",
+            "mv",
+            "mv",
+            -4,
+            "CREATE MATERIALIZED VIEW mv AS SELECT 1",
+        );
+
+        assert_eq!(
+            sqlite_schema_btree_identity(&view),
+            Some(SqliteSchemaBtreeIdentity {
+                kind: SqliteSchemaBtreeKind::Table,
+                root_page: -4,
+            })
+        );
+    }
+
+    #[test]
+    fn sqlite_schema_identity_ignores_plain_view_with_nonzero_root() {
+        let view = sqlite_schema_row_version_with_sql(
+            5,
+            "view",
+            "v",
+            "v",
+            -5,
+            "CREATE VIEW v AS SELECT 1",
+        );
+
+        assert_eq!(sqlite_schema_btree_identity(&view), None);
     }
 
     #[test]

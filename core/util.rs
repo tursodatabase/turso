@@ -371,6 +371,21 @@ pub fn sql_is_create_virtual_table(sql: &str) -> bool {
     )
 }
 
+/// Returns true if `sql` parses as a `CREATE MATERIALIZED VIEW` statement.
+///
+/// A materialized view's own sqlite_schema row has type `view` but, unlike a
+/// plain view, owns a real B-tree. Classification is done by parsing the
+/// stored SQL, the same way `sql_is_create_virtual_table` tells a virtual
+/// table apart from a regular one sharing the same sqlite_schema type.
+pub fn sql_is_create_materialized_view(sql: &str) -> bool {
+    matches!(
+        Parser::new(sql.as_bytes()).next_cmd(),
+        Ok(Some(ast::Cmd::Stmt(
+            ast::Stmt::CreateMaterializedView { .. }
+        )))
+    )
+}
+
 pub fn module_name_from_sql(sql: &str) -> Result<&str> {
     if let Some(start) = sql.find("USING") {
         let start = start + 6;

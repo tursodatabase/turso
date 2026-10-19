@@ -799,3 +799,240 @@ fn test_incompatible_materialized_view_storage_is_fully_tracked() -> anyhow::Res
 
     Ok(())
 }
+
+/// UPDATE always emits an explicit Delete before the Insert under MVCC, even
+/// when the row's rowid does not change. The view must equal a fresh query
+/// both before and after the update, including across a checkpoint and a
+/// second update.
+#[turso_macros::test(views, mvcc)]
+fn mvcc_matview_update_without_rowid_change_matches_query(
+    tmp_db: TempDatabase,
+) -> anyhow::Result<()> {
+    let conn = tmp_db.connect_limbo();
+    conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, g INTEGER, v INTEGER)")?;
+    conn.execute("CREATE MATERIALIZED VIEW mv AS SELECT g, sum(v) AS s FROM t GROUP BY g")?;
+    conn.execute("INSERT INTO t VALUES (1, 1, 10), (2, 1, 20), (3, 2, 5)")?;
+
+    conn.execute("UPDATE t SET v = 100 WHERE id = 1")?;
+    let view: Vec<(i64, i64)> = conn.exec_rows("SELECT g, s FROM mv ORDER BY g");
+    let query: Vec<(i64, i64)> = conn.exec_rows("SELECT g, sum(v) FROM t GROUP BY g ORDER BY g");
+    assert_eq!(view, query);
+    assert_eq!(view, vec![(1, 120), (2, 5)]);
+
+    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")?;
+    conn.execute("UPDATE t SET v = 7 WHERE id = 2")?;
+    let view: Vec<(i64, i64)> = conn.exec_rows("SELECT g, s FROM mv ORDER BY g");
+    let query: Vec<(i64, i64)> = conn.exec_rows("SELECT g, sum(v) FROM t GROUP BY g ORDER BY g");
+    assert_eq!(view, query);
+    assert_eq!(view, vec![(1, 107), (2, 5)]);
+    assert_eq!(run_integrity_check(&conn), "ok");
+    Ok(())
+}
+
+/// Same UPDATE-without-rowid-change hazard, but through a view that feeds
+/// another materialized view: the upstream write must cascade correctly
+/// through both maintenance programs.
+#[turso_macros::test(views, mvcc)]
+fn mvcc_matview_view_on_view_with_update(tmp_db: TempDatabase) -> anyhow::Result<()> {
+    let conn = tmp_db.connect_limbo();
+    conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, g INTEGER, v INTEGER)")?;
+    conn.execute("CREATE MATERIALIZED VIEW v1 AS SELECT g, sum(v) AS s FROM t GROUP BY g")?;
+    conn.execute("CREATE MATERIALIZED VIEW v2 AS SELECT g, s * 2 AS doubled FROM v1")?;
+    conn.execute("INSERT INTO t VALUES (1, 1, 10), (2, 1, 20), (3, 2, 5)")?;
+
+    conn.execute("UPDATE t SET v = 100 WHERE id = 1")?;
+    let view: Vec<(i64, i64)> = conn.exec_rows("SELECT g, doubled FROM v2 ORDER BY g");
+    assert_eq!(view, vec![(1, 240), (2, 10)]);
+    Ok(())
+}
+
+/// A materialized view maintained inside a plain (non-concurrent) MVCC
+/// transaction must behave exactly like the WAL-mode case: writes inside the
+/// transaction are visible to the view, SAVEPOINT rolls back only its own
+/// writes, and ROLLBACK undoes the whole transaction's writes.
+#[turso_macros::test(views, mvcc)]
+fn mvcc_matview_write_rollback_and_savepoint(tmp_db: TempDatabase) -> anyhow::Result<()> {
+    let conn = tmp_db.connect_limbo();
+    conn.execute("CREATE TABLE t (a INTEGER, b INTEGER)")?;
+    conn.execute("CREATE MATERIALIZED VIEW mv AS SELECT a, sum(b) AS s FROM t GROUP BY a")?;
+    conn.execute("INSERT INTO t VALUES (1, 10), (1, 20), (2, 5)")?;
+
+    conn.execute("BEGIN")?;
+    conn.execute("INSERT INTO t VALUES (1, 100)")?;
+    conn.execute("SAVEPOINT sp")?;
+    conn.execute("INSERT INTO t VALUES (3, 1)")?;
+    conn.execute("ROLLBACK TO sp")?;
+    conn.execute("COMMIT")?;
+
+    let view: Vec<(i64, i64)> = conn.exec_rows("SELECT a, s FROM mv ORDER BY a");
+    assert_eq!(view, vec![(1, 130), (2, 5)]);
+
+    conn.execute("BEGIN")?;
+    conn.execute("INSERT INTO t VALUES (4, 1000)")?;
+    conn.execute("ROLLBACK")?;
+
+    let view: Vec<(i64, i64)> = conn.exec_rows("SELECT a, s FROM mv ORDER BY a");
+    assert_eq!(view, vec![(1, 130), (2, 5)]);
+    Ok(())
+}
+
+/// A materialized view built on top of another materialized view must stay
+/// consistent as the base table changes, and DROP VIEW must refuse to drop a
+/// view that another materialized view still depends on, then clean up every
+/// hidden table once the dependent is gone.
+#[turso_macros::test(views, mvcc)]
+fn mvcc_matview_view_on_view_and_drop(tmp_db: TempDatabase) -> anyhow::Result<()> {
+    let conn = tmp_db.connect_limbo();
+    conn.execute("CREATE TABLE t (a INTEGER, b INTEGER)")?;
+    conn.execute("CREATE MATERIALIZED VIEW v1 AS SELECT a, sum(b) AS s FROM t GROUP BY a")?;
+    conn.execute("CREATE MATERIALIZED VIEW v2 AS SELECT a, s * 2 AS doubled FROM v1")?;
+    conn.execute("INSERT INTO t VALUES (1, 10), (2, 20)")?;
+
+    let view: Vec<(i64, i64)> = conn.exec_rows("SELECT a, doubled FROM v2 ORDER BY a");
+    assert_eq!(view, vec![(1, 20), (2, 40)]);
+
+    let err = conn.execute("DROP VIEW v1").unwrap_err();
+    assert!(
+        err.to_string().contains("dependent materialized view"),
+        "{err}"
+    );
+
+    conn.execute("DROP VIEW v2")?;
+    conn.execute("DROP VIEW v1")?;
+
+    let names: Vec<(String,)> = conn.exec_rows("SELECT name FROM sqlite_schema ORDER BY name");
+    assert_eq!(
+        names
+            .into_iter()
+            .filter(|(name,)| name != "__turso_internal_mvcc_meta")
+            .collect::<Vec<_>>(),
+        vec![("t".to_string(),)],
+        "leftover schema rows"
+    );
+    assert_eq!(run_integrity_check(&conn), "ok");
+    Ok(())
+}
+
+/// A materialized view must keep working across a close and reopen once its
+/// writes have gone through `PRAGMA wal_checkpoint(TRUNCATE)`: the view's own
+/// storage and its hidden state table must both load from the B-tree with
+/// real root pages, and further writes must keep maintaining it correctly.
+#[test]
+fn mvcc_matview_reopen_after_checkpoint() -> anyhow::Result<()> {
+    let tmp_db = TempDatabase::builder()
+        .with_views(true)
+        .with_mvcc(true)
+        .build();
+    let conn = tmp_db.connect_limbo();
+    conn.execute("CREATE TABLE t (a INTEGER, b INTEGER)")?;
+    conn.execute("CREATE MATERIALIZED VIEW mv AS SELECT a, sum(b) AS s FROM t GROUP BY a")?;
+    conn.execute("INSERT INTO t VALUES (1, 10), (2, 20)")?;
+    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")?;
+    let path = tmp_db.path.clone();
+    drop(conn);
+    drop(tmp_db);
+
+    let reopened = TempDatabase::builder()
+        .with_db_path(&path)
+        .with_views(true)
+        .with_mvcc(true)
+        .build();
+    let conn = reopened.connect_limbo();
+    let view: Vec<(i64, i64)> = conn.exec_rows("SELECT a, s FROM mv ORDER BY a");
+    assert_eq!(view, vec![(1, 10), (2, 20)]);
+
+    conn.execute("INSERT INTO t VALUES (1, 5)")?;
+    let view: Vec<(i64, i64)> = conn.exec_rows("SELECT a, s FROM mv ORDER BY a");
+    assert_eq!(view, vec![(1, 15), (2, 20)]);
+    assert_eq!(run_integrity_check(&conn), "ok");
+    Ok(())
+}
+
+/// The same reopen must also work when the database closes with its writes
+/// still only in the MVCC logical log (no checkpoint): reopening replays the
+/// log, which must recognize the view's own schema row (type `view`, a real
+/// root page) the same way it recognizes a table's.
+#[test]
+fn mvcc_matview_reopen_without_checkpoint() -> anyhow::Result<()> {
+    let tmp_db = TempDatabase::builder()
+        .with_views(true)
+        .with_mvcc(true)
+        .build();
+    let conn = tmp_db.connect_limbo();
+    conn.execute("CREATE TABLE t (a INTEGER, b INTEGER)")?;
+    conn.execute("CREATE MATERIALIZED VIEW mv AS SELECT a, sum(b) AS s FROM t GROUP BY a")?;
+    conn.execute("INSERT INTO t VALUES (1, 10), (2, 20)")?;
+    let path = tmp_db.path.clone();
+    drop(conn);
+    drop(tmp_db);
+
+    let reopened = TempDatabase::builder()
+        .with_db_path(&path)
+        .with_views(true)
+        .with_mvcc(true)
+        .build();
+    let conn = reopened.connect_limbo();
+    let view: Vec<(i64, i64)> = conn.exec_rows("SELECT a, s FROM mv ORDER BY a");
+    assert_eq!(view, vec![(1, 10), (2, 20)]);
+
+    conn.execute("INSERT INTO t VALUES (3, 1)")?;
+    let view: Vec<(i64, i64)> = conn.exec_rows("SELECT a, s FROM mv ORDER BY a");
+    assert_eq!(view, vec![(1, 10), (2, 20), (3, 1)]);
+    assert_eq!(run_integrity_check(&conn), "ok");
+    Ok(())
+}
+
+/// A trigger on a table with no materialized view can still write a table a
+/// materialized view depends on. The write must be rejected the same way a
+/// direct one would, and the statement that fired the trigger must leave no
+/// row behind, even though its own target table has no view.
+#[turso_macros::test(views)]
+fn trigger_write_to_viewed_table_is_rejected_under_begin_concurrent(
+    tmp_db: TempDatabase,
+) -> anyhow::Result<()> {
+    let conn = tmp_db.connect_limbo();
+    conn.pragma_update("journal_mode", "'mvcc'")?;
+    conn.execute("CREATE TABLE src (x INTEGER)")?;
+    conn.execute("CREATE TABLE t (a INTEGER, b INTEGER)")?;
+    conn.execute("CREATE MATERIALIZED VIEW mv AS SELECT a, sum(b) AS s FROM t GROUP BY a")?;
+    conn.execute(
+        "CREATE TRIGGER trg AFTER INSERT ON src BEGIN INSERT INTO t VALUES (new.x, new.x); END",
+    )?;
+
+    conn.execute("BEGIN CONCURRENT")?;
+    let err = conn.execute("INSERT INTO src VALUES (1), (2)").unwrap_err();
+    assert!(
+        err.to_string()
+            .contains("cannot modify table \"t\" in a BEGIN CONCURRENT transaction"),
+        "unexpected error: {err}"
+    );
+
+    let src_rows: Vec<(i64,)> = conn.exec_rows("SELECT x FROM src");
+    assert!(
+        src_rows.is_empty(),
+        "the triggering row must not survive: {src_rows:?}"
+    );
+    Ok(())
+}
+
+/// A table a materialized view depends on may still be written inside BEGIN
+/// CONCURRENT once CREATE MATERIALIZED VIEW (a DDL write) has already
+/// upgraded the transaction to the exclusive writer slot: at that point no
+/// other transaction can be concurrently maintaining the same view.
+#[turso_macros::test(views)]
+fn begin_concurrent_allows_write_after_create_materialized_view_upgrades_it(
+    tmp_db: TempDatabase,
+) -> anyhow::Result<()> {
+    let conn = tmp_db.connect_limbo();
+    conn.pragma_update("journal_mode", "'mvcc'")?;
+    conn.execute("CREATE TABLE t (a INTEGER, b INTEGER)")?;
+
+    conn.execute("BEGIN CONCURRENT")?;
+    conn.execute("CREATE MATERIALIZED VIEW mv AS SELECT a, sum(b) AS s FROM t GROUP BY a")?;
+    conn.execute("INSERT INTO t VALUES (1, 10), (2, 20)")?;
+    conn.execute("COMMIT")?;
+
+    let view: Vec<(i64, i64)> = conn.exec_rows("SELECT a, s FROM mv ORDER BY a");
+    assert_eq!(view, vec![(1, 10), (2, 20)]);
+    Ok(())
+}

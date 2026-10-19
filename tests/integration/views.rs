@@ -49,7 +49,7 @@ fn concurrent_view_expansion_is_not_spuriously_circular() {
 }
 
 #[test]
-fn create_materialized_view_is_rejected_in_mvcc_mode() {
+fn create_materialized_view_is_allowed_in_mvcc_mode() {
     let tmp_db = TempDatabase::builder()
         .with_views(true)
         .with_mvcc(true)
@@ -57,17 +57,35 @@ fn create_materialized_view_is_rejected_in_mvcc_mode() {
     let conn = tmp_db.connect_limbo();
     conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v INT)")
         .unwrap();
+    conn.execute("CREATE MATERIALIZED VIEW mv AS SELECT v, count(*) c FROM t GROUP BY v")
+        .unwrap();
 
-    let err = conn
-        .execute("CREATE MATERIALIZED VIEW mv AS SELECT v, count(*) c FROM t GROUP BY v")
-        .unwrap_err();
+    conn.execute("INSERT INTO t VALUES (1, 10), (2, 10), (3, 20)")
+        .unwrap();
+    let rows: Vec<(i64, i64)> = conn.exec_rows("SELECT id, v FROM t ORDER BY id");
+    assert_eq!(rows, vec![(1, 10), (2, 10), (3, 20)]);
+    let view: Vec<(i64, i64)> = conn.exec_rows("SELECT v, c FROM mv ORDER BY v");
+    assert_eq!(view, vec![(10, 2), (20, 1)]);
+}
+
+#[test]
+fn begin_concurrent_rejects_writes_to_a_table_with_a_materialized_view() {
+    let tmp_db = TempDatabase::builder()
+        .with_views(true)
+        .with_mvcc(true)
+        .build();
+    let conn = tmp_db.connect_limbo();
+    conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v INT)")
+        .unwrap();
+    conn.execute("CREATE MATERIALIZED VIEW mv AS SELECT v, count(*) c FROM t GROUP BY v")
+        .unwrap();
+
+    conn.execute("BEGIN CONCURRENT").unwrap();
+    let err = conn.execute("INSERT INTO t VALUES (1, 10)").unwrap_err();
     assert!(
-        err.to_string()
-            .contains("Materialized views are not supported in MVCC mode"),
+        err.to_string().contains(
+            "cannot modify table \"t\" in a BEGIN CONCURRENT transaction: materialized view \"mv\" depends on it; use BEGIN instead"
+        ),
         "unexpected error: {err}"
     );
-
-    conn.execute("INSERT INTO t VALUES (1, 10)").unwrap();
-    let rows: Vec<(i64, i64)> = conn.exec_rows("SELECT id, v FROM t");
-    assert_eq!(rows, vec![(1, 10)]);
 }

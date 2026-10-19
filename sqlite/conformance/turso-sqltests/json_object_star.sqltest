@@ -155,7 +155,6 @@ expect {
 
 # Test json_object(*) in materialized view
 @requires materialized_views "uses MATERIALIZED VIEW"
-@skip-if mvcc "views not supported with MVCC"
 test json_object_star_matview {
     CREATE TABLE js_products (id INTEGER PRIMARY KEY, name TEXT, price REAL);
     INSERT INTO js_products VALUES (1, 'Widget', 9.99);

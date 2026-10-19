@@ -1,6 +1,5 @@
 @database :memory:
 @requires-file materialized_views ""
-@skip-file-if mvcc "materialized_views not supported with mvcc"
 
 # No @verify-materialized-views here: its invariant check re-runs a view's
 # stored SQL as an ordinary top-level query, which (correctly, for a plain

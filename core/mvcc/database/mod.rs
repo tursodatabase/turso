@@ -10024,6 +10024,8 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                                     "table" => {
                                         !sql.is_some_and(crate::util::sql_is_create_virtual_table)
                                     }
+                                    "view" => sql
+                                        .is_some_and(crate::util::sql_is_create_materialized_view),
                                     _ => false,
                                 };
                                 if has_btree {

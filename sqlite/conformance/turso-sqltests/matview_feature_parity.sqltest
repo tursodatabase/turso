@@ -1,6 +1,5 @@
 @database :memory:
 @requires-file materialized_views ""
-@skip-file-if mvcc "materialized_views not supported with mvcc"
 @verify-materialized-views
 
 # UPSERT updates are captured as an ordered retraction and insertion. Moving a
