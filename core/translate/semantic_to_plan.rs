@@ -346,6 +346,10 @@ pub(crate) struct HirPlan {
     /// Table sources that read a materialized view. Their cursor merges the
     /// current transaction's changes into the stored rows.
     pub(crate) materialized_views: Vec<(SourceId, Arc<Mutex<IncrementalView>>)>,
+    /// Parameters of the parts of the statement that turning subqueries
+    /// into joins dropped, such as the SELECT list of an EXISTS. The
+    /// statement still has them, so lowering registers them.
+    pub(crate) dropped_parameters: Vec<hir::Parameter>,
 }
 
 /// Planner facts owned by the semantic root. Variants without a source scan
@@ -407,9 +411,11 @@ impl HirPlan {
         schema: &Schema,
         params: &CostModelParams,
     ) -> Result<Self> {
-        let document =
+        let (document, dropped_parameters) =
             super::semantic_unnest::unnest_correlated_subqueries(document, schema, params)?;
-        Self::build_without_unnesting(document, schema, params)
+        let mut plan = Self::build_without_unnesting(document, schema, params)?;
+        plan.dropped_parameters = dropped_parameters;
+        Ok(plan)
     }
 
     /// Plan `document` as it is, without turning its correlated subqueries
@@ -443,6 +449,7 @@ impl HirPlan {
             root,
             queries,
             materialized_views,
+            dropped_parameters: Vec::new(),
         })
     }
 

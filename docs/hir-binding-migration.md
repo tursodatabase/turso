@@ -249,8 +249,17 @@ With legacy's checks:
 - `EXISTS` and a whole-term `IN` become a semi-join and `NOT EXISTS` an
   anti-join (`JoinKind::Semi`/`Anti`) when the subquery reads one source,
   only filters it, and links to the outer row by `=` terms; their loops come
-  last and stop at the first match, as legacy's do. Not in a block with a
-  RIGHT or FULL join yet.
+  last and stop at the first match, as legacy's do. The subquery may read
+  a table-valued function, whose arguments become its terms. A link to a
+  source a LEFT JOIN (its right side) or RIGHT JOIN (its left side) fills
+  with NULL keeps the subquery; FULL JOIN sides do not, and a block with a
+  FULL join whose correlated subqueries all became joins always keeps that
+  form, as legacy does. The SELECT list of an EXISTS is never run, so an
+  uncorrelated subquery in it is dropped, and its parameters are still
+  counted for binding (`HirPlan::dropped_parameters`). Because HIR keeps a
+  RIGHT JOIN in its written order where legacy turns it into a LEFT JOIN,
+  the costs of the two forms, and so the choice, can differ there.
+- A block with a FULL join gets no aggregate rewrite, as in legacy.
 - A one-value aggregate subquery becomes a FROM subquery grouped by its link
   columns and LEFT JOINed on them (group-first). When computing a key no
   outer row asks for could fail (`sum`, string aggregates, any function), a

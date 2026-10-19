@@ -34,11 +34,13 @@ use rustc_hash::FxHashSet as HashSet;
 /// form costs no more than its original form, and return the document to
 /// plan. Blocks are decided from the innermost query out, so a block is
 /// costed with the forms already chosen for the queries it runs.
+/// Also return the parameters of the parts the kept rewrites dropped, such
+/// as the SELECT list of an EXISTS, which callers still bind.
 pub(crate) fn unnest_correlated_subqueries(
     document: Arc<HirDocument>,
     schema: &Schema,
     params: &CostModelParams,
-) -> Result<Arc<HirDocument>> {
+) -> Result<(Arc<HirDocument>, Vec<hir::Parameter>)> {
     let candidates = queries_innermost_first(&document)
         .into_iter()
         .flat_map(|query| {
@@ -48,13 +50,15 @@ pub(crate) fn unnest_correlated_subqueries(
         .filter(|block| has_candidate(&document, *block))
         .collect::<Vec<_>>();
     if candidates.is_empty() {
-        return Ok(document);
+        return Ok((document, Vec::new()));
     }
     let mut document = document;
+    let mut dropped_parameters = Vec::new();
     let mut original_plan: Option<HirPlan> = None;
     for block in candidates {
         let mut rewritten = (*document).clone();
-        if !rewrite_block(&mut rewritten, block)? {
+        let mut dropped = Vec::new();
+        if !rewrite_block(&mut rewritten, block, &mut dropped)? {
             continue;
         }
         #[cfg(debug_assertions)]
@@ -81,16 +85,36 @@ pub(crate) fn unnest_correlated_subqueries(
         let original_cost = query_cost(original, block.query, params);
         let rewritten_cost = query_cost(&rewritten_plan, block.query, params);
         // Like legacy: equal work is better without one subquery call per
-        // outer row.
-        if matches!(
-            (original_cost, rewritten_cost),
-            (Some(original), Some(rewritten)) if rewritten <= original
-        ) {
+        // outer row, and a block with a FULL join whose correlated
+        // subqueries all became joins always keeps that form.
+        if complete_full_join_rewrite(&rewritten, block)
+            || matches!(
+                (original_cost, rewritten_cost),
+                (Some(original), Some(rewritten)) if rewritten <= original
+            )
+        {
             document = rewritten;
             original_plan = Some(rewritten_plan);
+            dropped_parameters.extend(dropped);
         }
     }
-    Ok(document)
+    Ok((document, dropped_parameters))
+}
+
+/// Whether `block` has a FULL join and no correlated subquery left, legacy's
+/// `full_join_rewrite_is_complete`.
+fn complete_full_join_rewrite(document: &HirDocument, block: QueryBlockId) -> bool {
+    document
+        .query_block(block)
+        .and_then(|block| block.from.as_ref())
+        .is_some_and(|from| {
+            from.joins
+                .iter()
+                .any(|join| join.kind == hir::JoinKind::Full)
+        })
+        && !block_subqueries(document, block)
+            .into_iter()
+            .any(|query| document.reads_outer_sources(query))
 }
 
 /// Every query of the document, each after the queries it runs.
@@ -217,7 +241,11 @@ fn has_candidate(document: &HirDocument, block: QueryBlockId) -> bool {
 /// then `IN` and one-value subqueries in the order legacy lists them: WHERE,
 /// GROUP BY, the result columns, then ORDER BY. Return whether anything
 /// changed.
-fn rewrite_block(document: &mut HirDocument, block: QueryBlockId) -> Result<bool> {
+fn rewrite_block(
+    document: &mut HirDocument,
+    block: QueryBlockId,
+    dropped: &mut Vec<hir::Parameter>,
+) -> Result<bool> {
     let mut changed = false;
     let mut position = 0;
     loop {
@@ -229,7 +257,7 @@ fn rewrite_block(document: &mut HirDocument, block: QueryBlockId) -> Result<bool
             Some(candidate @ Candidate::Exists { query, .. })
                 if document.reads_outer_sources(query) =>
             {
-                try_semi_or_anti_join(document, block, &conjuncts, position, &candidate)
+                try_semi_or_anti_join(document, block, &conjuncts, position, &candidate, dropped)
             }
             _ => false,
         };
@@ -275,7 +303,8 @@ fn rewrite_block(document: &mut HirDocument, block: QueryBlockId) -> Result<bool
         });
         if let Some(position) = in_conjunct {
             let candidate = candidate(&conjuncts[position]).expect("found above");
-            changed |= try_semi_or_anti_join(document, block, &conjuncts, position, &candidate);
+            changed |=
+                try_semi_or_anti_join(document, block, &conjuncts, position, &candidate, dropped);
             continue;
         }
         let written = document.query(query).cloned();
@@ -773,6 +802,7 @@ fn try_semi_or_anti_join(
     conjuncts: &[hir::Expr],
     position: usize,
     candidate: &Candidate<'_>,
+    dropped: &mut Vec<hir::Parameter>,
 ) -> bool {
     let subquery_id = candidate_query(candidate);
     let Some(block) = document.query_block(block_id) else {
@@ -782,15 +812,6 @@ fn try_semi_or_anti_join(
         // A semi-join needs a left table.
         return false;
     };
-    // The loops of a RIGHT or FULL join run the rest of the block again for
-    // their unmatched rows, which this rewrite does not handle.
-    if from
-        .joins
-        .iter()
-        .any(|join| matches!(join.kind, hir::JoinKind::Right | hir::JoinKind::Full))
-    {
-        return false;
-    }
     let Some(subquery) = document.query(subquery_id) else {
         return false;
     };
@@ -829,8 +850,15 @@ fn try_semi_or_anti_join(
     let Some(inner_definition) = document.source(inner_source) else {
         return false;
     };
+    // The argument checks of a table function stay with its source, so they
+    // move with it and must pass the same checks as the WHERE terms.
+    let mut source_terms: &[hir::Expr] = &[];
     match &inner_definition.kind {
         hir::SourceKind::Table(_) => {}
+        hir::SourceKind::TableFunction {
+            argument_predicates,
+            ..
+        } => source_terms = argument_predicates,
         // A FROM subquery that reads the outer row still needs that row,
         // which needs a separate rewrite.
         hir::SourceKind::Derived(query) if !document.reads_outer_sources(*query) => {}
@@ -847,20 +875,34 @@ fn try_semi_or_anti_join(
     }
 
     // Like legacy, every source the subquery reads from outside is a table
-    // of this block's own FROM clause, and none of them gets a NULL row
-    // from an outer join: moving the link into a later join could remove
-    // that row too early.
+    // of this block's own FROM clause, and none of them is NULL-filled by a
+    // LEFT JOIN (its right side) or a RIGHT JOIN (its left side, which legacy
+    // makes the right side of a LEFT JOIN): a LEFT JOIN whose NULL row a
+    // WHERE term rejects becomes an inner join, and the link of a NOT EXISTS
+    // must not count as such a term. Like legacy, FULL JOIN sides are allowed.
     let outer_sources = document.outer_sources(subquery_id);
     if outer_sources.is_empty()
         || outer_sources.iter().any(|source| {
-            from.source_position(*source).is_none() || from.outer_join_may_null_extend(*source)
+            let Some(position) = from.source_position(*source) else {
+                return true;
+            };
+            from.joins
+                .iter()
+                .enumerate()
+                .any(|(index, join)| match join.kind {
+                    hir::JoinKind::Left => join.right == *source,
+                    hir::JoinKind::Right => position <= index,
+                    _ => false,
+                })
         })
     {
         return false;
     }
 
-    // A subquery in the subquery's own clauses stays a subquery of the outer
-    // block: it must not read any row from outside itself.
+    // Like legacy, a subquery in the subquery's own clauses must not read any
+    // row from outside itself. One in the WHERE clause moves with its term
+    // and stays a subquery of the outer block; one in the SELECT list of an
+    // EXISTS is never run, and is dropped with that list.
     let nested = document.expression_subqueries(subquery_id);
     if nested
         .iter()
@@ -868,6 +910,22 @@ fn try_semi_or_anti_join(
     {
         return false;
     }
+    let mut moved_nested = Vec::new();
+    if let Some(filter) = inner_filter {
+        filter.for_each(&mut |expression| {
+            if let hir::Expr::Subquery(subquery) = expression {
+                let query = subquery_query(subquery);
+                if !moved_nested.contains(&query) {
+                    moved_nested.push(query);
+                }
+            }
+        });
+    }
+    let dropped_nested = nested
+        .iter()
+        .copied()
+        .filter(|query| !moved_nested.contains(query))
+        .collect::<Vec<_>>();
 
     let mut terms = inner_filter
         .as_ref()
@@ -876,17 +934,11 @@ fn try_semi_or_anti_join(
     match candidate {
         Candidate::Exists { .. } => {
             // EXISTS ignores its SELECT list, which disappears with the
-            // subquery. Keep the subquery when that list holds something
-            // that must stay: a parameter, which callers still bind, or a
-            // subquery.
-            let mut keeps_something = false;
-            for output in &inner_block.outputs {
-                output.expr.for_each(&mut |expression| {
-                    keeps_something |=
-                        matches!(expression, hir::Expr::Parameter(_) | hir::Expr::Subquery(_));
-                });
-            }
-            if keeps_something {
+            // subquery, together with the subqueries it holds.
+            if !dropped_nested
+                .iter()
+                .all(|query| can_drop_query_tree(document, *query))
+            {
                 return false;
             }
         }
@@ -919,7 +971,7 @@ fn try_semi_or_anti_join(
     }
     let negated = matches!(candidate, Candidate::Exists { negated: true, .. });
 
-    for term in &terms {
+    for term in terms.iter().chain(source_terms) {
         // A function such as random() could run a different number of times.
         if calls_nondeterministic_function(document, term) {
             return false;
@@ -939,10 +991,20 @@ fn try_semi_or_anti_join(
         }
     }
 
-    // Every check passed. Move the source and its terms.
+    // Every check passed. Move the source and its terms. Like legacy's
+    // `phantom_params`, the parameters of the dropped SELECT list are kept
+    // so callers can still bind them.
     let outer_query = block_id.query;
-    for query in nested {
+    for query in moved_nested {
         document.queries[query.index()].parent = Some(outer_query);
+    }
+    if matches!(candidate, Candidate::Exists { .. }) {
+        for output in &document.queries[subquery_id.index()].blocks[0].outputs {
+            collect_parameters(&output.expr, dropped);
+        }
+        for query in dropped_nested {
+            drop_query_tree(document, query, dropped);
+        }
     }
     if let hir::SourceKind::Derived(query) = document.sources[inner_source.index()].kind {
         document.queries[query.index()].parent = Some(outer_query);
@@ -1002,6 +1064,60 @@ fn is_inner_outer_equality(expression: &hir::Expr, inner_source: SourceId) -> bo
         (side(lhs), side(rhs)),
         (Some(true), Some(false)) | (Some(false), Some(true))
     )
+}
+
+fn collect_parameters(expression: &hir::Expr, parameters: &mut Vec<hir::Parameter>) {
+    expression.for_each(&mut |expression| {
+        if let hir::Expr::Parameter(parameter) = expression {
+            parameters.push(parameter.clone());
+        }
+    });
+}
+
+/// `query` and every query it runs through its expressions and FROM
+/// subqueries.
+fn query_tree(document: &HirDocument, query: QueryId) -> Vec<QueryId> {
+    let mut tree = vec![query];
+    let mut position = 0;
+    while let Some(query) = tree.get(position).copied() {
+        position += 1;
+        for dependency in document.direct_query_dependencies(query) {
+            if !tree.contains(&dependency) {
+                tree.push(dependency);
+            }
+        }
+    }
+    tree
+}
+
+/// Whether a query that no expression will run can be dropped with every
+/// query it runs: none of them reads a CTE, whose body other queries may
+/// share.
+fn can_drop_query_tree(document: &HirDocument, query: QueryId) -> bool {
+    query_tree(document, query).into_iter().all(|query| {
+        document.query(query).is_some_and(|definition| {
+            definition.blocks.iter().all(|block| {
+                block.from.as_ref().is_none_or(|from| {
+                    from_sources(document, from).into_iter().all(|source| {
+                        !matches!(
+                            document.source(source).map(|source| &source.kind),
+                            Some(hir::SourceKind::Cte(_) | hir::SourceKind::RecursiveInput(_))
+                        )
+                    })
+                })
+            })
+        })
+    })
+}
+
+/// Detach `query` and every query it runs, keeping their parameters.
+fn drop_query_tree(document: &mut HirDocument, query: QueryId, dropped: &mut Vec<hir::Parameter>) {
+    for query in query_tree(document, query) {
+        document.for_each_query_expression(query, &mut |expression| {
+            collect_parameters(expression, dropped);
+        });
+        detach_query(document, query);
+    }
 }
 
 /// Leave a query that no expression runs anymore empty, so that nothing
@@ -1313,12 +1429,11 @@ fn try_aggregate_rewrite(
     let Some(from) = &block.from else {
         return None;
     };
-    // The correlated form cannot run on every matched and unmatched row of a
-    // RIGHT or FULL join yet.
+    // Like legacy, a block with a FULL join keeps its aggregate subqueries.
     if from
         .joins
         .iter()
-        .any(|join| matches!(join.kind, hir::JoinKind::Right | hir::JoinKind::Full))
+        .any(|join| join.kind == hir::JoinKind::Full)
     {
         return None;
     }

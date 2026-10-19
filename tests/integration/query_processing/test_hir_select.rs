@@ -2444,3 +2444,164 @@ fn hir_hash_joins_build_and_probe_like_legacy() {
         );
     }
 }
+
+/// A correlated EXISTS, NOT EXISTS or IN also becomes a semi-join or
+/// anti-join in a block with a RIGHT or FULL join, where the rest of the
+/// block runs again for the unmatched rows; in an EXISTS whose SELECT list
+/// holds a parameter or an uncorrelated subquery, which are dropped with
+/// that list while the parameter still counts; and when the subquery reads
+/// a table-valued function, whose arguments move with it.
+#[test]
+fn hir_semi_and_anti_joins_cover_outer_joins_parameters_and_table_functions() {
+    let db = setup();
+    let [legacy, hir] = connections(&db);
+    for statement in [
+        "CREATE TABLE o(id INTEGER PRIMARY KEY, k INT, v INT)",
+        "CREATE TABLE p(id INTEGER PRIMARY KEY, k INT)",
+        "CREATE TABLE i(k INT, x INT)",
+        "CREATE TABLE d(x INT)",
+        "INSERT INTO o VALUES (1,1,10),(2,2,20),(3,3,30),(4,NULL,40)",
+        "INSERT INTO p VALUES (1,1),(2,5),(3,3)",
+        "INSERT INTO i VALUES (1,100),(3,300),(5,500),(NULL,0)",
+        "INSERT INTO d VALUES (7),(9)",
+        // Large enough tables that each join costs less than its subquery.
+        "ANALYZE",
+        "DELETE FROM sqlite_stat1",
+        "INSERT INTO sqlite_stat1(tbl, idx, stat) VALUES ('o', NULL, '1000'), \
+         ('p', NULL, '1000'), ('i', NULL, '100000'), ('d', NULL, '10')",
+        "ANALYZE sqlite_schema",
+    ] {
+        legacy.execute(statement).unwrap();
+    }
+    // The loop of a semi-join or anti-join marks where it stops.
+    let semi_join = |sql: &str, table: &str| {
+        let program = limbo_exec_rows(&hir, &format!("EXPLAIN {sql}"));
+        assert!(
+            program.iter().any(|row| matches!(
+                row.last(),
+                Some(rusqlite::types::Value::Text(comment))
+                    if comment.contains("semi-join") || comment.contains("anti-join")
+            )),
+            "{sql}: {program:?}"
+        );
+        let plan = query_plan(&hir, sql);
+        assert!(
+            plan.iter().any(|line| line.contains(table)),
+            "{sql}: {plan:?}"
+        );
+    };
+    for (sql, table) in [
+        (
+            "SELECT o.id, p.id FROM o FULL JOIN p ON p.k = o.k \
+             WHERE EXISTS (SELECT 1 FROM i WHERE i.k = o.k) ORDER BY 1, 2",
+            "i",
+        ),
+        (
+            "SELECT o.id, p.id FROM o FULL JOIN p ON p.k = o.k \
+             WHERE NOT EXISTS (SELECT 1 FROM i WHERE i.k = p.k) ORDER BY 1, 2",
+            "i",
+        ),
+        (
+            "SELECT o.id, p.id FROM o RIGHT JOIN p ON p.k = o.k \
+             WHERE NOT EXISTS (SELECT 1 FROM i WHERE i.k = p.k) ORDER BY 1, 2",
+            "i",
+        ),
+        (
+            "SELECT o.id, p.id FROM o RIGHT JOIN p ON p.k = o.k \
+             WHERE p.k IN (SELECT i.k FROM i WHERE i.k = p.id) ORDER BY 1, 2",
+            "i",
+        ),
+        (
+            "SELECT o.id FROM o WHERE EXISTS \
+             (SELECT (SELECT max(x) FROM d) FROM i WHERE i.k = o.k) ORDER BY 1",
+            "i",
+        ),
+        (
+            "SELECT o.id FROM o WHERE EXISTS \
+             (SELECT 1 FROM generate_series(1, o.k) g WHERE g.value = 2) ORDER BY 1",
+            "generate_series AS g",
+        ),
+        (
+            "SELECT o.id FROM o WHERE o.k IS NOT NULL AND NOT EXISTS \
+             (SELECT 1 FROM generate_series(o.k, 2) g WHERE g.value = o.k) ORDER BY 1",
+            "generate_series AS g",
+        ),
+    ] {
+        semi_join(sql, table);
+        assert_eq!(
+            limbo_exec_rows(&hir, sql),
+            limbo_exec_rows(&legacy, sql),
+            "{sql}"
+        );
+    }
+
+    // Like legacy, the table built into a hash table is listed after the
+    // semi-join's loop. Temporary index names end in different ids.
+    let sql = "SELECT o.id, p.id FROM o FULL JOIN p ON p.k = o.k \
+               WHERE EXISTS (SELECT 1 FROM i WHERE i.k = o.k) ORDER BY 1, 2";
+    let without_index_ids = |plan: Vec<String>| {
+        plan.into_iter()
+            .map(|line| {
+                line.split(' ')
+                    .map(|word| match word.rsplit_once('_') {
+                        Some((name, _)) if word.starts_with("ephemeral_") => name,
+                        _ => word,
+                    })
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            })
+            .collect::<Vec<_>>()
+    };
+    let plan = without_index_ids(query_plan(&hir, sql));
+    assert_eq!(plan, without_index_ids(query_plan(&legacy, sql)), "{sql}");
+    assert_eq!(
+        plan,
+        [
+            "HASH JOIN p",
+            "SEARCH i USING COVERING INDEX ephemeral_i (k=?)",
+            "SCAN o",
+            "USE SORTER FOR ORDER BY",
+        ],
+        "{sql}"
+    );
+
+    // Like legacy, a link to the side a RIGHT JOIN fills with NULL keeps the
+    // subquery.
+    let sql = "SELECT o.id, p.id FROM o RIGHT JOIN p ON p.k = o.k \
+               WHERE NOT EXISTS (SELECT 1 FROM i WHERE i.k = o.k) ORDER BY 1, 2";
+    let program = limbo_exec_rows(&hir, &format!("EXPLAIN {sql}"));
+    assert!(
+        !program.iter().any(|row| matches!(
+            row.last(),
+            Some(rusqlite::types::Value::Text(comment)) if comment.contains("anti-join")
+        )),
+        "{sql}: {program:?}"
+    );
+    assert_eq!(
+        limbo_exec_rows(&hir, sql),
+        limbo_exec_rows(&legacy, sql),
+        "{sql}"
+    );
+
+    // The parameter of the dropped SELECT list still counts and binds.
+    let sql = "SELECT o.id FROM o WHERE EXISTS (SELECT ?1 FROM i WHERE i.k = o.k) \
+               AND o.v > ?2 ORDER BY 1";
+    semi_join(sql, "i");
+    let run = |conn: &std::sync::Arc<turso_core::Connection>| {
+        let mut stmt = conn.prepare(sql).unwrap();
+        assert_eq!(stmt.parameters_count(), 2);
+        stmt.bind_at(1.try_into().unwrap(), turso_core::Value::from_i64(5))
+            .unwrap();
+        stmt.bind_at(2.try_into().unwrap(), turso_core::Value::from_i64(15))
+            .unwrap();
+        let mut rows = Vec::new();
+        stmt.run_with_row_callback(|row| {
+            rows.push(row.get::<i64>(0).unwrap());
+            Ok(())
+        })
+        .unwrap();
+        rows
+    };
+    assert_eq!(run(&hir), run(&legacy));
+    assert_eq!(run(&hir), vec![3]);
+}

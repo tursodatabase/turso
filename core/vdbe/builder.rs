@@ -1075,6 +1075,9 @@ impl ProgramBuilder {
     }
 
     pub(crate) fn set_hir_plan(&mut self, plan: Arc<crate::translate::semantic_to_plan::HirPlan>) {
+        for parameter in &plan.dropped_parameters {
+            self.register_parameter(parameter.index, &parameter.spelling);
+        }
         self.hir_plan = Some(plan);
     }
 

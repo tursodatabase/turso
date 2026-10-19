@@ -5204,9 +5204,15 @@ fn emit_hir_block_explain(
         emit_explain!(program, false, EqpDetail::ConstantRow);
         return Ok(());
     };
+    // Like legacy, the tables built into hash tables come after every loop.
+    let mut builds = Vec::new();
     for (position, planned_loop) in block_plan.loops.iter().enumerate() {
         let mut detail =
             hir_loop_explain(document, Some(from), &block_plan.inner_joins, planned_loop)?;
+        if matches!(planned_loop.access, HirSourceAccess::Hash(_)) {
+            builds.push((planned_loop.source, detail));
+            continue;
+        }
         // Like legacy, a hash join reads as `HASH JOIN` with the table it
         // scans, then `SCAN` with the table built into the hash table.
         let probes = block_plan
@@ -5229,6 +5235,9 @@ fn emit_hir_block_explain(
             }
         }
         program.emit_source_explain(planned_loop.source, detail);
+    }
+    for (source, detail) in builds {
+        program.emit_source_explain(source, detail);
     }
     Ok(())
 }
