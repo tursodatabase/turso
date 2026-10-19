@@ -3127,15 +3127,10 @@ fn hir_hash_join_candidate(
     if !hash.allowed {
         return Ok(None);
     }
-    // Left-deep: the last table joined becomes the build side. HIR scans the
-    // probe table only as the block's first loop: a hash table that moved
-    // rows to disk frees its in-memory part when its waiting lookups run,
-    // so it cannot be probed again for another row of an earlier loop.
-    // Legacy also hashes under earlier loops.
-    let [(build, build_method)] = lhs_steps else {
+    // Left-deep: the last table joined becomes the build side.
+    let Some(&(build, build_method)) = lhs_steps.last() else {
         return Ok(None);
     };
-    let (build, build_method) = (*build, *build_method);
     let rhs_has_selective_seek = matches!(
         &nested_loop.params,
         AccessMethodParams::BTreeTable {
@@ -3259,6 +3254,18 @@ fn hir_hash_join_candidate(
                 .is_some_and(|join| matches!(join.kind, JoinKind::Right | JoinKind::Full))
     });
     if other_outer {
+        return Ok(None);
+    }
+    // Under earlier loops, an outer hash join runs its unmatched build rows
+    // after each pass of the probe loop, with the earlier loops' rows. That
+    // is right for LEFT, whose build rows pair with those rows, but not for
+    // the probe rows FULL adds, which no row of the earlier loops may match
+    // and must come out once (legacy repeats them).
+    if lhs_steps.len() > 1
+        && sources[rhs]
+            .join_info()
+            .is_some_and(|join| join.kind == JoinKind::Full)
+    {
         return Ok(None);
     }
     let needs_materialization = build_has_uncovered_prior_constraints(

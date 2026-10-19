@@ -1112,10 +1112,8 @@ fn hir_equality_joins_without_an_index_use_a_hash_table() {
     let sqlite = rusqlite::Connection::open_in_memory().unwrap();
     sqlite.execute_batch(SCHEMA).unwrap();
     // A LEFT or FULL JOIN row without a match, including one whose lookup
-    // waited for a partition on disk, reads NULL. Unlike legacy, a subquery
-    // may run again, so it seeks an automatic index instead: a hash table
-    // that moved rows to disk cannot be probed again after its waiting
-    // lookups ran.
+    // waited for a partition on disk, reads NULL. Like legacy, a subquery
+    // that runs again probes the same hash table again.
     for (sql, hashes) in [
         (
             "SELECT count(*), sum(a.id), sum(b.id), max(a.pad || b.pad) FROM a JOIN b ON b.k = a.k",
@@ -1164,12 +1162,12 @@ fn hir_equality_joins_without_an_index_use_a_hash_table() {
         (
             "SELECT sum((SELECT count(b.id) FROM a a2 JOIN b ON b.k = a2.k WHERE a2.id = a.id)) \
              FROM a WHERE a.id < 300",
-            false,
+            true,
         ),
         (
             "SELECT count(*), sum(s.n) FROM a, (SELECT a2.id AS i, b.id AS n FROM a a2 \
              JOIN b ON b.k = a2.k WHERE a2.id < 40) s WHERE a.id < 4 AND s.i = a.id + 3",
-            false,
+            true,
         ),
     ] {
         let opcodes = limbo_exec_rows(&hir, &format!("EXPLAIN {sql}"))
@@ -1189,7 +1187,11 @@ fn hir_equality_joins_without_an_index_use_a_hash_table() {
         // The same tables are hashed and scanned as in legacy's plan, where
         // legacy hashes too.
         if hashes {
-            assert_eq!(query_plan(&hir, sql), query_plan(&legacy, sql), "{sql}");
+            assert_eq!(
+                plan_without_ids(query_plan(&hir, sql)),
+                plan_without_ids(query_plan(&legacy, sql)),
+                "{sql}"
+            );
         }
         let mut stmt = sqlite.prepare(sql).unwrap();
         let columns = stmt.column_count();
@@ -1256,6 +1258,27 @@ fn hir_order_by_group_keys_sorts_once() {
 }
 
 /// The detail column of each EXPLAIN QUERY PLAN row.
+/// `plan` without the ids that end the names of temporary indexes and
+/// subqueries, which differ between HIR (`_s3`, `_1`) and legacy (`_t2`).
+fn plan_without_ids(plan: Vec<String>) -> Vec<String> {
+    plan.into_iter()
+        .map(|line| {
+            line.split(' ')
+                .map(|word| match word.rsplit_once('_') {
+                    Some((name, id))
+                        if (word.starts_with("ephemeral_") || word.contains("subquery_"))
+                            && id.trim_start_matches(['s', 't']).parse::<u32>().is_ok() =>
+                    {
+                        name
+                    }
+                    _ => word,
+                })
+                .collect::<Vec<_>>()
+                .join(" ")
+        })
+        .collect()
+}
+
 fn query_plan(conn: &std::sync::Arc<turso_core::Connection>, sql: &str) -> Vec<String> {
     limbo_exec_rows(conn, &format!("EXPLAIN QUERY PLAN {sql}"))
         .into_iter()
@@ -2539,21 +2562,8 @@ fn hir_semi_and_anti_joins_cover_outer_joins_parameters_and_table_functions() {
     // semi-join's loop. Temporary index names end in different ids.
     let sql = "SELECT o.id, p.id FROM o FULL JOIN p ON p.k = o.k \
                WHERE EXISTS (SELECT 1 FROM i WHERE i.k = o.k) ORDER BY 1, 2";
-    let without_index_ids = |plan: Vec<String>| {
-        plan.into_iter()
-            .map(|line| {
-                line.split(' ')
-                    .map(|word| match word.rsplit_once('_') {
-                        Some((name, _)) if word.starts_with("ephemeral_") => name,
-                        _ => word,
-                    })
-                    .collect::<Vec<_>>()
-                    .join(" ")
-            })
-            .collect::<Vec<_>>()
-    };
-    let plan = without_index_ids(query_plan(&hir, sql));
-    assert_eq!(plan, without_index_ids(query_plan(&legacy, sql)), "{sql}");
+    let plan = plan_without_ids(query_plan(&hir, sql));
+    assert_eq!(plan, plan_without_ids(query_plan(&legacy, sql)), "{sql}");
     assert_eq!(
         plan,
         [
@@ -2604,4 +2614,135 @@ fn hir_semi_and_anti_joins_cover_outer_joins_parameters_and_table_functions() {
     };
     assert_eq!(run(&hir), run(&legacy));
     assert_eq!(run(&hir), vec![3]);
+}
+
+/// An outer hash join large enough for its hash table to move rows to disk
+/// records thousands of matched build rows. Each goes into a temporary rowid
+/// table as a one-column record, since an empty record with a small rowid
+/// makes a cell smaller than any B-tree page can hold.
+#[test]
+fn hir_outer_hash_joins_record_many_matched_rows() {
+    let db = setup();
+    let [legacy, hir] = connections(&db);
+    for statement in [
+        "CREATE TABLE b(id INTEGER PRIMARY KEY, k INT, pad TEXT)",
+        "CREATE TABLE c(id INTEGER PRIMARY KEY, k INT, pad TEXT)",
+        "INSERT INTO b SELECT value, CASE WHEN value % 13 THEN value % 500 END, \
+         printf('%050d', value) FROM generate_series(1, 3000)",
+        "INSERT INTO c SELECT value, CASE WHEN value % 13 THEN value % 700 END, \
+         printf('%050d', value) FROM generate_series(1, 3000)",
+    ] {
+        legacy.execute(statement).unwrap();
+    }
+    for (sql, expected) in [
+        (
+            "SELECT count(*), sum(b.id), sum(c.id) FROM b LEFT JOIN c ON b.k = c.k",
+            (11496, 17079801, 16257256),
+        ),
+        (
+            "SELECT count(*), sum(b.id), sum(c.id) FROM b FULL JOIN c ON b.k = c.k",
+            (12465, 17079801, 17820541),
+        ),
+    ] {
+        assert_eq!(query_plan(&hir, sql), ["HASH JOIN c", "SCAN b"], "{sql}");
+        let rows = limbo_exec_rows(&hir, sql);
+        assert_eq!(rows, limbo_exec_rows(&legacy, sql), "{sql}");
+        assert_eq!(
+            rows,
+            [[
+                rusqlite::types::Value::Integer(expected.0),
+                rusqlite::types::Value::Integer(expected.1),
+                rusqlite::types::Value::Integer(expected.2),
+            ]],
+            "{sql}"
+        );
+    }
+}
+
+/// Like legacy, a hash join may scan its probe table under earlier loops:
+/// the hash table is built once, and each pass of the probe loop joins its
+/// own rows, including the rows that waited for a part of the table on
+/// disk. A LEFT hash join starts each pass with no build row matched and
+/// ends it with the build rows nothing matched, next to the earlier loops'
+/// rows. A FULL join under earlier loops keeps its nested loops, since the
+/// probe rows it adds must come out once (legacy repeats them).
+#[test]
+fn hir_hash_joins_run_under_earlier_loops() {
+    const SCHEMA: &str = "
+        CREATE TABLE a(id INTEGER PRIMARY KEY, x INT);
+        CREATE TABLE b(id INTEGER PRIMARY KEY, k INT, pad TEXT);
+        CREATE TABLE c(id INTEGER PRIMARY KEY, k INT, pad TEXT);
+        CREATE TABLE d(id INTEGER PRIMARY KEY, k INT);
+        INSERT INTO a VALUES (1, 1), (2, 2), (3, 3);
+        WITH RECURSIVE s(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM s WHERE i < 3000)
+            INSERT INTO b SELECT i, CASE WHEN i % 13 THEN i % 500 END, printf('%050d', i) FROM s;
+        WITH RECURSIVE s(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM s WHERE i < 3000)
+            INSERT INTO c SELECT i, CASE WHEN i % 13 THEN i % 700 END, printf('%050d', i) FROM s;
+        WITH RECURSIVE s(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM s WHERE i < 2000)
+            INSERT INTO d SELECT i, i % 300 FROM s;
+    ";
+    let db = TempDatabase::new_empty();
+    let [legacy, hir] = connections(&db);
+    for statement in SCHEMA.split(';').filter(|sql| !sql.trim().is_empty()) {
+        hir.execute(statement).unwrap();
+    }
+    let sqlite = rusqlite::Connection::open_in_memory().unwrap();
+    sqlite.execute_batch(SCHEMA).unwrap();
+    for (sql, plan) in [
+        (
+            "SELECT count(*), sum(b.id), sum(c.id) FROM a, b JOIN c ON b.k = c.k",
+            Some(["SCAN a", "HASH JOIN c", "SCAN b"].as_slice()),
+        ),
+        (
+            "SELECT count(*), sum(a.id), sum(b.id), sum(c.id) FROM a, b LEFT JOIN c ON b.k = c.k",
+            Some(&["SCAN a", "HASH JOIN c", "SCAN b"]),
+        ),
+        (
+            "SELECT count(*), sum(a.id), sum(b.id), sum(c.id) FROM a, b \
+             LEFT JOIN c ON b.k = c.k AND c.id % 3 = a.id - 1 WHERE c.id IS NULL OR a.id = 2",
+            Some(&["SCAN a", "HASH JOIN c", "SCAN b"]),
+        ),
+        (
+            "SELECT count(*), sum(a.id), sum(b.id), sum(c.id), sum(d.id) FROM a \
+             LEFT JOIN d ON d.id = a.x * 1000, b LEFT JOIN c ON b.k = c.k",
+            Some(&[
+                "SCAN a",
+                "SEARCH d USING INTEGER PRIMARY KEY (rowid=?) LEFT-JOIN",
+                "HASH JOIN c",
+                "SCAN b",
+            ]),
+        ),
+        (
+            "SELECT a.id, (SELECT count(*) FROM b LEFT JOIN c ON b.k = c.k \
+             AND c.id % 3 = a.id - 1) FROM a ORDER BY a.id",
+            None,
+        ),
+        (
+            "SELECT count(*), sum(a.id), sum(b.id), sum(c.id) FROM a, b FULL JOIN c ON b.k = c.k",
+            None,
+        ),
+    ] {
+        let hir_plan = query_plan(&hir, sql);
+        match plan {
+            Some(plan) => {
+                assert_eq!(hir_plan, plan, "{sql}");
+                assert_eq!(hir_plan, query_plan(&legacy, sql), "{sql}");
+            }
+            None => assert_eq!(
+                hir_plan.iter().any(|line| line.starts_with("HASH JOIN")),
+                !sql.contains("FULL"),
+                "{sql}: {hir_plan:?}"
+            ),
+        }
+        let mut stmt = sqlite.prepare(sql).unwrap();
+        let columns = stmt.column_count();
+        let expected: Vec<Vec<rusqlite::types::Value>> = stmt
+            .query_map([], |row| {
+                (0..columns).map(|column| row.get(column)).collect()
+            })
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(limbo_exec_rows(&hir, sql), expected, "{sql}");
+    }
 }

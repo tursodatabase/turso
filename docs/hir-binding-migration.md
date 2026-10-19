@@ -305,15 +305,19 @@ What stays a subquery still runs fast:
   match, and must hash when it can. A hash table that outgrows its budget
   moves rows to disk; lookups that need them wait, and after the probe loop
   ends they run again by its rowid, so both tables must be rowid tables
-  without custom types. Unlike legacy, a hash table is probed by one run of
-  one loop only, since a hash table that moved rows to disk frees its
-  in-memory part when its waiting lookups run: so only the root query's
-  blocks hash, the probe table is the block's first loop (the build table
-  was the only table before it in the join order), and a block with another
-  RIGHT or FULL join does not hash. The build table is always read in full,
-  never through a materialized list of the rows that match earlier tables,
-  so a join legacy builds that way keeps its nested loops, and the build
-  keys need no Bloom filter.
+  without custom types. The hash table is built once per statement from
+  every row of its table, so, as in legacy, subqueries hash too, and the
+  probe loop may run under earlier loops: each pass joins only its own
+  waiting rows and keeps the in-memory part of the table for the next pass
+  (the VDBE used to free it and keep the waiting rows of earlier passes,
+  which gave legacy wrong rows too). A LEFT hash join under earlier loops
+  starts each pass with no build row matched and ends it with its own
+  unmatched build rows. A FULL hash join stays the block's first loop: the
+  probe rows it adds must come out once, which legacy gets wrong. A block
+  with another RIGHT or FULL join does not hash. The build table is always
+  read in full, never through a materialized list of the rows that match
+  earlier tables, so a join legacy builds that way keeps its nested loops,
+  and the build keys need no Bloom filter.
 
 These planning rules are ports of legacy's, sharing its cost formulas and
 order checks where the code allows:

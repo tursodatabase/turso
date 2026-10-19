@@ -2102,7 +2102,7 @@ impl<'a> HirPlanContext<'a> {
             subquery_reads.extend(self.document.outer_sources(*query));
         }
         let hash = crate::translate::optimizer::join::HirHashJoins {
-            allowed: self.hash_joins_allowed(block, &input),
+            allowed: self.hash_joins_allowed(&input),
             subquery_reads: &subquery_reads,
         };
         let access = self
@@ -2145,17 +2145,13 @@ impl<'a> HirPlanContext<'a> {
     /// Whether a block may use hash joins, which legacy chooses while
     /// ordering its joins (see [crate::translate::optimizer::join::HirHashJoins]).
     ///
-    /// When a hash table grows past its memory budget, it moves rows to
-    /// disk, and a lookup that needs those rows waits: the loop before it
-    /// records its rowid, and after that loop ends, those rows run again by
-    /// rowid. So only the root query's blocks, which run once, use them: a
-    /// subquery may run again, and a hash table that moved rows to disk
-    /// cannot be probed again after its waiting lookups ran. Only a SELECT
-    /// statement uses them, since a statement that writes could change the
-    /// table. A block with a parenthesized FROM group, or with a RIGHT
-    /// join, keeps its nested loops.
-    fn hash_joins_allowed(&self, block: &hir::QueryBlock, input: &HirQueryBlockPlanInput) -> bool {
-        matches!(&self.document.root, hir::HirRoot::Query(root) if root.query == block.id.query)
+    /// The hash table is built once per statement, from every row of its
+    /// table, so a subquery that runs again probes the same table. Only a
+    /// SELECT statement uses them, since a statement that writes could
+    /// change the table. A block with a parenthesized FROM group, or with a
+    /// RIGHT join, keeps its nested loops.
+    fn hash_joins_allowed(&self, input: &HirQueryBlockPlanInput) -> bool {
+        matches!(&self.document.root, hir::HirRoot::Query(_))
             && input.groups.is_empty()
             && !input.sources.iter().any(|source| {
                 source

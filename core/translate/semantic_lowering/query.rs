@@ -3191,6 +3191,11 @@ struct HirRightOuterJoin {
     /// The ephemeral table of a materialized right subquery. Its rowids key
     /// the matched set, and the unmatched pass scans it again.
     materialized: Option<CursorID>,
+    /// The probe loop of an outer hash join that runs under earlier loops.
+    /// Like legacy, each pass of the probe loop starts with an empty
+    /// matched set and ends with its own unmatched pass, which NULL-fills
+    /// only the probe table and keeps the rows of the earlier loops.
+    probe_pass: Option<usize>,
 }
 
 /// An outer hash join: `build` was built into a hash table, and `probe`,
@@ -4367,8 +4372,11 @@ fn emit_join_loops(
         &left_joins,
     )?;
     nest.emit_loops(program, 0, block_done, false)?;
-    if let Some(right_outer) = &right_outer {
-        nest.emit_unmatched_right_rows(program, right_outer)?;
+    if let Some(right_outer) = right_outer
+        .as_ref()
+        .filter(|right_outer| right_outer.probe_pass.is_none())
+    {
+        nest.emit_unmatched_right_rows(program, right_outer, 0)?;
     }
     program.preassign_label_to_next_insn(block_done);
     // A hash table is not closed here: the block may run again, as a FROM
@@ -4466,6 +4474,19 @@ impl HirLoopNest<'_, '_> {
                 return Err(LimboError::InternalError(format!(
                     "HIR loop {loop_index} starts overlapping LEFT JOIN boundaries"
                 )));
+            }
+            if let Some(right_outer) = self
+                .right_outer
+                .filter(|right_outer| right_outer.probe_pass == Some(loop_index))
+            {
+                if unmatched_pass {
+                    return Err(LimboError::InternalError(
+                        "HIR unmatched-row pass re-entered an outer hash join's probe".into(),
+                    ));
+                }
+                program.emit_insn(Insn::ResetSorter {
+                    cursor_id: right_outer.matched,
+                });
             }
             let hir_loop = match &self.prepared_loops[loop_index] {
                 PreparedHirLoop::Hash(prepared) => {
@@ -4673,25 +4694,34 @@ impl HirLoopNest<'_, '_> {
                     left_join,
                 );
             }
+            if let Some(right_outer) = self
+                .right_outer
+                .filter(|right_outer| right_outer.probe_pass == Some(first + position))
+            {
+                self.emit_unmatched_right_rows(program, right_outer, first + position)?;
+            }
         }
         Ok(())
     }
 
     /// After the main loops: scan the right source of a RIGHT or FULL join
     /// and run the rest of the block for every row no left row matched. The
-    /// left sources read NULL, and every WHERE term up to the right source
-    /// runs again, including terms the planner used for index seeks.
+    /// left sources from loop `null_from` on read NULL, and every WHERE term
+    /// up to the right source runs again, including terms the planner used
+    /// for index seeks. An outer hash join under earlier loops runs this
+    /// after each pass of its probe loop, with `null_from` at the probe.
     fn emit_unmatched_right_rows(
         &self,
         program: &mut ProgramBuilder,
         right_outer: &HirRightOuterJoin,
+        null_from: usize,
     ) -> Result<()> {
         let right = right_outer.loop_index;
         // Register-backed left sources, such as a recursive CTE's current
         // row, read NULL registers for this pass only: the pass emits its
         // own copy of the rest of the block.
         let mut register_bindings = Vec::new();
-        for prepared in &self.prepared_loops[..right] {
+        for prepared in &self.prepared_loops[null_from..right] {
             match prepared {
                 PreparedHirLoop::BTree(_)
                 | PreparedHirLoop::OrUnion(_)
@@ -4906,17 +4936,26 @@ fn prepare_hir_right_outer_join(
         cursor_id: matched,
         is_table: true,
     });
+    // One NULL column rather than none: a table cell of an empty record and
+    // a small rowid is 3 bytes, below the 4 bytes a B-tree cell takes.
+    let null = program.alloc_register();
+    program.emit_insn(Insn::Null {
+        dest: null,
+        dest_end: None,
+    });
     let empty_record = program.alloc_register();
     program.emit_insn(Insn::MakeRecord {
-        start_reg: to_u32(empty_record),
-        count: 0,
+        start_reg: to_u32(null),
+        count: 1,
         dest_reg: to_u32(empty_record),
         index_name: None,
         affinity_str: None,
     });
-    let owner = hash_outer
-        .filter(|hash_outer| hash_outer.build == source)
-        .map_or(source, |hash_outer| hash_outer.probe);
+    let hash_outer = hash_outer.filter(|hash_outer| hash_outer.build == source);
+    let owner = hash_outer.map_or(source, |hash_outer| hash_outer.probe);
+    let probe_pass = hash_outer
+        .map(|hash_outer| hash_outer.build_loop - 1)
+        .filter(|probe_loop| *probe_loop > 0);
     Ok(Some(HirRightOuterJoin {
         source,
         owner,
@@ -4924,6 +4963,7 @@ fn prepare_hir_right_outer_join(
         matched,
         empty_record,
         materialized,
+        probe_pass,
     }))
 }
 
