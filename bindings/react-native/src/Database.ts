@@ -266,7 +266,10 @@ export class Database {
         }
 
         // Move to next statement
-        remaining = sql.substring(result.tailIdx).trim();
+        if (result.tailIdx <= 0) {
+          break;
+        }
+        remaining = remaining.substring(result.tailIdx).trim();
       }
     } finally {
       this._execLock.release();
