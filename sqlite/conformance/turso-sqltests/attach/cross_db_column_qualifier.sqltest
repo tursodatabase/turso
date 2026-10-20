@@ -1,0 +1,180 @@
+@database :memory:
+
+# A column qualified with a database name must come from a table of that
+# database that is in the FROM clause. Before, the column index was taken from
+# the named database's table while the row came from the same-named table of
+# another database, which returned the wrong column.
+test cross-db-qualifier-not-in-from {
+    ATTACH ':memory:' AS aux;
+    CREATE TABLE main.t(x, y);
+    INSERT INTO main.t VALUES (1, 2);
+    CREATE TABLE aux.t(y, x);
+    INSERT INTO aux.t VALUES (30, 40);
+    SELECT aux.t.x FROM main.t;
+}
+expect error {
+    no such column: aux.t.x
+}
+
+test cross-db-qualifier-main-not-in-from {
+    ATTACH ':memory:' AS aux;
+    CREATE TABLE main.t(x, y);
+    INSERT INTO main.t VALUES (1, 2);
+    CREATE TABLE aux.t(y, x);
+    INSERT INTO aux.t VALUES (30, 40);
+    SELECT main.t.x FROM aux.t;
+}
+expect error {
+    no such column: main.t.x
+}
+
+test cross-db-qualifier-both-in-from {
+    ATTACH ':memory:' AS aux;
+    CREATE TABLE main.t(x, y);
+    INSERT INTO main.t VALUES (1, 2);
+    CREATE TABLE aux.t(y, x);
+    INSERT INTO aux.t VALUES (30, 40);
+    SELECT main.t.x, aux.t.x FROM main.t, aux.t;
+}
+expect {
+    1|40
+}
+
+test cross-db-qualifier-in-where {
+    ATTACH ':memory:' AS aux;
+    CREATE TABLE main.t(x, y);
+    INSERT INTO main.t VALUES (1, 2);
+    CREATE TABLE aux.t(y, x);
+    INSERT INTO aux.t VALUES (30, 40);
+    SELECT x FROM main.t WHERE aux.t.y > 0;
+}
+expect error {
+    no such column: aux.t.y
+}
+
+test cross-db-qualifier-in-order-by {
+    ATTACH ':memory:' AS aux;
+    CREATE TABLE main.t(x, y);
+    INSERT INTO main.t VALUES (1, 2);
+    CREATE TABLE aux.t(y, x);
+    INSERT INTO aux.t VALUES (30, 40);
+    SELECT x FROM main.t ORDER BY aux.t.y;
+}
+expect error {
+    no such column: aux.t.y
+}
+
+test cross-db-qualifier-in-group-by {
+    ATTACH ':memory:' AS aux;
+    CREATE TABLE main.t(x, y);
+    INSERT INTO main.t VALUES (1, 2);
+    CREATE TABLE aux.t(y, x);
+    INSERT INTO aux.t VALUES (30, 40);
+    SELECT x FROM main.t GROUP BY aux.t.y;
+}
+expect error {
+    no such column: aux.t.y
+}
+
+test cross-db-qualifier-in-update {
+    ATTACH ':memory:' AS aux;
+    CREATE TABLE main.t(x, y);
+    INSERT INTO main.t VALUES (1, 2);
+    CREATE TABLE aux.t(y, x);
+    INSERT INTO aux.t VALUES (30, 40);
+    UPDATE main.t SET y = aux.t.x;
+}
+expect error {
+    no such column: aux.t.x
+}
+
+test cross-db-qualifier-in-delete {
+    ATTACH ':memory:' AS aux;
+    CREATE TABLE main.t(x, y);
+    INSERT INTO main.t VALUES (1, 2);
+    CREATE TABLE aux.t(y, x);
+    INSERT INTO aux.t VALUES (30, 40);
+    DELETE FROM main.t WHERE aux.t.x = 40;
+}
+expect error {
+    no such column: aux.t.x
+}
+
+test cross-db-qualifier-in-subquery {
+    ATTACH ':memory:' AS aux;
+    CREATE TABLE main.t(x, y);
+    INSERT INTO main.t VALUES (1, 2);
+    CREATE TABLE aux.t(y, x);
+    INSERT INTO aux.t VALUES (30, 40);
+    SELECT (SELECT aux.t.x) FROM main.t;
+}
+expect error {
+    no such column: aux.t.x
+}
+
+test cross-db-qualifier-aliased-table {
+    CREATE TABLE t(x, y);
+    INSERT INTO t VALUES (1, 2);
+    SELECT main.t.x FROM main.t AS a;
+}
+expect error {
+    no such column: main.t.x
+}
+
+test cross-db-qualifier-temp-not-in-from {
+    CREATE TABLE t(x, y);
+    INSERT INTO t VALUES (1, 2);
+    CREATE TEMP TABLE t(y, x);
+    INSERT INTO temp.t VALUES (30, 40);
+    SELECT temp.t.x FROM main.t;
+}
+expect error {
+    no such column: temp.t.x
+}
+
+test cross-db-qualifier-correlated-outer-table {
+    ATTACH ':memory:' AS aux;
+    CREATE TABLE main.t(x, y);
+    INSERT INTO main.t VALUES (1, 2);
+    CREATE TABLE aux.u(y, x);
+    INSERT INTO aux.u VALUES (1, 40);
+    SELECT x FROM main.t WHERE EXISTS (SELECT 1 FROM aux.u WHERE aux.u.y = main.t.x);
+}
+expect {
+    1
+}
+
+test cross-db-qualifier-correlated-scalar-subquery {
+    ATTACH ':memory:' AS aux;
+    CREATE TABLE aux.u(y, x);
+    INSERT INTO aux.u VALUES (1, 40);
+    SELECT (SELECT aux.u.x) FROM aux.u;
+}
+expect {
+    40
+}
+
+# A partial index WHERE clause is bound against the altered table, which must
+# be looked up in the database that holds it.
+test alter-drop-column-with-db-qualified-partial-index {
+    ATTACH ':memory:' AS aux;
+    CREATE TABLE aux.u(a, b, c);
+    INSERT INTO aux.u VALUES (7, 8, 9);
+    CREATE INDEX aux.pa ON u(a) WHERE aux.u.a > 0;
+    ALTER TABLE aux.u DROP COLUMN b;
+    SELECT * FROM aux.u;
+}
+expect {
+    7|9
+}
+
+test alter-drop-column-with-temp-qualified-partial-index {
+    CREATE TEMP TABLE tu(a, b, c);
+    INSERT INTO tu VALUES (1, 2, 3);
+    CREATE INDEX temp.pt ON tu(a) WHERE temp.tu.a > 0;
+    ALTER TABLE temp.tu DROP COLUMN b;
+    SELECT * FROM tu;
+}
+expect {
+    1|3
+}
