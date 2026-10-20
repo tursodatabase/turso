@@ -360,7 +360,14 @@ fn emit_plan_nodes(
                     })
                 };
                 let declared_inputs = [declared_input(inputs[0])?, declared_input(inputs[1])?];
-                let contract = JoinContract::from_outputs(declared_inputs, on)?;
+                let contract = JoinContract::from_outputs(
+                    program,
+                    view_name,
+                    *inputs,
+                    declared_inputs,
+                    on,
+                    input,
+                )?;
                 match kind {
                     dag::JoinKind::Inner => emit_inner_join(
                         program,

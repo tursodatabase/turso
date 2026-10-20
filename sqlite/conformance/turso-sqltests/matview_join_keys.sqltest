@@ -1,0 +1,600 @@
+@database :memory:
+@requires-file materialized_views ""
+@skip-file-if mvcc "materialized_views not supported with mvcc"
+@verify-materialized-views
+
+# Joins inside materialized views find matching rows by key: through the
+# rowid, an index, or a temporary index built for one maintenance run.
+# These tests check that the lookup finds exactly the rows `=` matches.
+
+# The parent side is found by its INTEGER PRIMARY KEY. Text, real and NULL
+# keys must match exactly the rows `=` matches.
+test matview-join-key-rowid-alias {
+    CREATE TABLE parent(id INTEGER PRIMARY KEY, name TEXT);
+    CREATE TABLE child(cid INTEGER PRIMARY KEY, pid, v INT);
+    INSERT INTO parent VALUES (1, 'one'), (2, 'two'), (3, 'three');
+    INSERT INTO child VALUES (10, 1, 100), (11, '2', 110), (12, 2.0, 120), (13, 2.5, 130), (14, NULL, 140), (15, 'abc', 150), (16, ' 3', 160);
+    CREATE MATERIALIZED VIEW v AS SELECT c.cid, p.name, c.v FROM child c JOIN parent p ON c.pid = p.id;
+    SELECT * FROM v ORDER BY cid;
+    INSERT INTO child VALUES (17, '3', 170), (18, 3.0, 180);
+    INSERT INTO parent VALUES (4, 'four');
+    INSERT INTO child VALUES (19, 4, 190);
+    UPDATE parent SET name = 'TWO' WHERE id = 2;
+    UPDATE child SET pid = 1 WHERE cid = 13;
+    DELETE FROM parent WHERE id = 3;
+    DELETE FROM child WHERE cid = 10;
+    SELECT * FROM v ORDER BY cid;
+}
+expect {
+    10|one|100
+    11|two|110
+    12|two|120
+    16|three|160
+    11|TWO|110
+    12|TWO|120
+    13|one|130
+    19|four|190
+}
+
+test matview-join-key-explicit-rowid {
+    CREATE TABLE a(x TEXT, y INT);
+    CREATE TABLE b(ref, z INT);
+    INSERT INTO a VALUES ('p', 1), ('q', 2), ('r', 3);
+    INSERT INTO b VALUES (1, 10), ('2', 20), (2.0, 21), (NULL, 30), (9, 90);
+    CREATE MATERIALIZED VIEW v AS SELECT a.x, b.z FROM b JOIN a ON a.rowid = b.ref;
+    SELECT * FROM v ORDER BY x, z;
+    INSERT INTO b VALUES (3, 31);
+    DELETE FROM a WHERE x = 'p';
+    INSERT INTO a VALUES ('s', 4);
+    INSERT INTO b VALUES ('4', 40);
+    SELECT * FROM v ORDER BY x, z;
+}
+expect {
+    p|10
+    q|20
+    q|21
+    q|20
+    q|21
+    r|31
+    s|40
+}
+
+test matview-join-key-indexed-column {
+    CREATE TABLE parent(id INTEGER PRIMARY KEY, name TEXT);
+    CREATE TABLE child(cid INTEGER PRIMARY KEY, pid INT, v INT);
+    CREATE INDEX child_pid ON child(pid);
+    INSERT INTO parent VALUES (1, 'one'), (2, 'two');
+    INSERT INTO child VALUES (10, 1, 100), (11, 2, 110), (12, 2, 120), (13, NULL, 130);
+    CREATE MATERIALIZED VIEW v AS SELECT p.name, c.cid, c.v FROM parent p JOIN child c ON p.id = c.pid;
+    SELECT * FROM v ORDER BY cid;
+    INSERT INTO parent VALUES (3, 'three'), (NULL, 'null');
+    INSERT INTO child VALUES (14, 3, 140), (15, '3', 150), (16, 3.0, 160);
+    UPDATE parent SET id = 5 WHERE id = 1;
+    UPDATE child SET pid = 5 WHERE cid = 11;
+    DELETE FROM child WHERE cid = 12;
+    SELECT * FROM v ORDER BY cid;
+}
+expect {
+    one|10|100
+    two|11|110
+    two|12|120
+    one|11|110
+    three|14|140
+    three|15|150
+    three|16|160
+}
+
+test matview-join-key-no-index {
+    CREATE TABLE a(k, x INT);
+    CREATE TABLE b(k, y INT);
+    INSERT INTO a VALUES (1, 10), (2, 20), (2, 21), ('2', 22), (NULL, 23), (2.0, 24);
+    INSERT INTO b VALUES (2, 200), ('2', 201), (3, 300), (NULL, 301);
+    CREATE MATERIALIZED VIEW v AS SELECT a.x, b.y FROM a JOIN b ON a.k = b.k;
+    SELECT * FROM v ORDER BY x, y;
+    INSERT INTO b VALUES (1, 100), (1, 101);
+    INSERT INTO a VALUES (3, 30);
+    UPDATE a SET k = 3 WHERE x = 10;
+    DELETE FROM b WHERE y = 200;
+    SELECT * FROM v ORDER BY x, y;
+}
+expect {
+    20|200
+    21|200
+    22|201
+    24|200
+    10|300
+    22|201
+    30|300
+}
+
+test matview-join-key-multi-column {
+    CREATE TABLE a(k1 INT, k2 TEXT, x INT);
+    CREATE TABLE b(k1 INT, k2 TEXT, y INT);
+    CREATE TABLE c(k1 INT, k2 TEXT, z INT);
+    CREATE INDEX b_k1_k2 ON b(k1, k2);
+    CREATE INDEX c_k1 ON c(k1);
+    INSERT INTO a VALUES (1, 'a', 10), (1, 'b', 11), (2, 'a', 12), (2, NULL, 13);
+    INSERT INTO b VALUES (1, 'a', 100), (1, 'b', 101), (1, 'b', 102), (2, 'b', 103), (2, NULL, 104);
+    INSERT INTO c VALUES (1, 'a', 1000), (2, 'a', 1001), (2, 'b', 1002);
+    CREATE MATERIALIZED VIEW vb AS SELECT a.x, b.y FROM a JOIN b ON a.k1 = b.k1 AND a.k2 = b.k2;
+    CREATE MATERIALIZED VIEW vc AS SELECT a.x, c.z FROM a JOIN c ON c.k2 = a.k2 AND c.k1 = a.k1;
+    SELECT 'b', * FROM vb ORDER BY x, y;
+    SELECT 'c', * FROM vc ORDER BY x, z;
+    INSERT INTO a VALUES (2, 'b', 14);
+    INSERT INTO b VALUES (2, 'a', 105);
+    INSERT INTO c VALUES (1, 'b', 1003);
+    DELETE FROM a WHERE x = 10;
+    UPDATE b SET k2 = 'a' WHERE y = 101;
+    SELECT 'b', * FROM vb ORDER BY x, y;
+    SELECT 'c', * FROM vc ORDER BY x, z;
+}
+expect {
+    b|10|100
+    b|11|101
+    b|11|102
+    c|10|1000
+    c|12|1001
+    b|11|102
+    b|12|105
+    b|14|103
+    c|11|1003
+    c|12|1001
+    c|14|1002
+}
+
+test matview-join-key-with-range {
+    CREATE TABLE a(k INT, lo INT, x INT);
+    CREATE TABLE b(k INT PRIMARY KEY, v INT);
+    CREATE TABLE c(k INT, v INT);
+    INSERT INTO a VALUES (1, 5, 10), (1, 50, 11), (2, 0, 12);
+    INSERT INTO b VALUES (1, 10), (2, 20);
+    INSERT INTO c VALUES (1, 10), (1, 60), (2, 20);
+    CREATE MATERIALIZED VIEW vb AS SELECT a.x, b.v FROM a JOIN b ON a.k = b.k AND b.v > a.lo;
+    CREATE MATERIALIZED VIEW vc AS SELECT a.x, c.v FROM a JOIN c ON a.k = c.k WHERE c.v BETWEEN a.lo AND a.lo + 30;
+    SELECT 'b', * FROM vb ORDER BY x, v;
+    SELECT 'c', * FROM vc ORDER BY x, v;
+    UPDATE b SET v = 60 WHERE k = 1;
+    INSERT INTO c VALUES (2, 25), (2, 40);
+    UPDATE a SET lo = 15 WHERE x = 12;
+    SELECT 'b', * FROM vb ORDER BY x, v;
+    SELECT 'c', * FROM vc ORDER BY x, v;
+}
+expect {
+    b|10|10
+    b|12|20
+    c|10|10
+    c|11|60
+    c|12|20
+    b|10|60
+    b|11|60
+    b|12|20
+    c|10|10
+    c|11|60
+    c|12|20
+    c|12|25
+    c|12|40
+}
+
+# A TEXT column compared with an INTEGER column compares numerically, so the
+# TEXT column's index cannot be used. A TEXT column compared with an untyped
+# column compares as text.
+test matview-join-key-affinity-mismatch {
+    CREATE TABLE t_text(k TEXT, x INT);
+    CREATE TABLE t_int(k INTEGER, y INT);
+    CREATE TABLE t_any(k, z INT);
+    CREATE INDEX t_text_k ON t_text(k);
+    CREATE INDEX t_any_k ON t_any(k);
+    INSERT INTO t_text VALUES ('1', 1), ('01', 2), ('1.0', 3), ('a', 4), (NULL, 5), ('2', 6);
+    INSERT INTO t_int VALUES (1, 10), (2, 20), (NULL, 30);
+    INSERT INTO t_any VALUES (1, 100), ('1', 101), (1.0, 102), ('01', 103), ('a', 104), (x'61', 105);
+    CREATE MATERIALIZED VIEW v_num AS SELECT t_text.x, t_int.y FROM t_int JOIN t_text ON t_int.k = t_text.k;
+    CREATE MATERIALIZED VIEW v_txt AS SELECT t_text.x, t_any.z FROM t_text JOIN t_any ON t_text.k = t_any.k;
+    CREATE MATERIALIZED VIEW v_any AS SELECT t_int.y, t_any.z FROM t_int JOIN t_any ON t_any.k = t_int.k;
+    SELECT 'num', * FROM v_num ORDER BY x, y;
+    SELECT 'txt', * FROM v_txt ORDER BY x, z;
+    SELECT 'any', * FROM v_any ORDER BY y, z;
+    INSERT INTO t_int VALUES (1, 11);
+    INSERT INTO t_text VALUES ('2.0', 7), (' 2', 8);
+    INSERT INTO t_any VALUES (2, 106), ('2', 107);
+    DELETE FROM t_text WHERE x = 1;
+    SELECT 'num', * FROM v_num ORDER BY x, y;
+    SELECT 'txt', * FROM v_txt ORDER BY x, z;
+    SELECT 'any', * FROM v_any ORDER BY y, z;
+}
+expect {
+    num|1|10
+    num|2|10
+    num|3|10
+    num|6|20
+    txt|1|101
+    txt|2|103
+    txt|4|104
+    any|10|100
+    any|10|101
+    any|10|102
+    any|10|103
+    num|2|10
+    num|2|11
+    num|3|10
+    num|3|11
+    num|6|20
+    num|7|20
+    num|8|20
+    txt|2|103
+    txt|4|104
+    txt|6|107
+    any|10|100
+    any|10|101
+    any|10|102
+    any|10|103
+    any|11|100
+    any|11|101
+    any|11|102
+    any|11|103
+    any|20|106
+    any|20|107
+}
+
+# `=` takes the collation of its left column. The BINARY index on b.k can
+# only be used when the comparison is BINARY.
+test matview-join-key-collation {
+    CREATE TABLE a(k TEXT COLLATE NOCASE, x INT);
+    CREATE TABLE b(k TEXT, y INT);
+    CREATE INDEX b_k ON b(k);
+    INSERT INTO a VALUES ('A', 1), ('b', 2), ('c', 3);
+    INSERT INTO b VALUES ('a', 10), ('A', 11), ('B', 12), ('c ', 13);
+    CREATE MATERIALIZED VIEW v_nocase AS SELECT a.x, b.y FROM a JOIN b ON a.k = b.k;
+    CREATE MATERIALIZED VIEW v_binary AS SELECT a.x, b.y FROM a JOIN b ON b.k = a.k;
+    CREATE MATERIALIZED VIEW v_explicit AS SELECT a.x, b.y FROM b JOIN a ON b.k = a.k COLLATE NOCASE;
+    SELECT 'nocase', * FROM v_nocase ORDER BY x, y;
+    SELECT 'binary', * FROM v_binary ORDER BY x, y;
+    SELECT 'explicit', * FROM v_explicit ORDER BY x, y;
+    INSERT INTO a VALUES ('C', 4);
+    INSERT INTO b VALUES ('b', 14), ('C', 15);
+    DELETE FROM b WHERE y = 10;
+    SELECT 'nocase', * FROM v_nocase ORDER BY x, y;
+    SELECT 'binary', * FROM v_binary ORDER BY x, y;
+    SELECT 'explicit', * FROM v_explicit ORDER BY x, y;
+}
+expect {
+    nocase|1|10
+    nocase|1|11
+    nocase|2|12
+    binary|1|11
+    explicit|1|10
+    explicit|1|11
+    explicit|2|12
+    nocase|1|11
+    nocase|2|12
+    nocase|2|14
+    nocase|3|15
+    nocase|4|15
+    binary|1|11
+    binary|2|14
+    binary|4|15
+    explicit|1|11
+    explicit|2|12
+    explicit|2|14
+    explicit|3|15
+    explicit|4|15
+}
+
+test matview-join-key-three-way {
+    CREATE TABLE customer(c_custkey INTEGER PRIMARY KEY, c_mktsegment TEXT);
+    CREATE TABLE orders(o_orderkey INTEGER PRIMARY KEY, o_custkey INT, o_orderdate TEXT);
+    CREATE TABLE lineitem(l_orderkey INT, l_price INT, l_shipdate TEXT);
+    INSERT INTO customer VALUES (1, 'FURNITURE'), (2, 'BUILDING'), (3, 'FURNITURE');
+    INSERT INTO orders VALUES (10, 1, '1995-03-01'), (11, 2, '1995-03-02'), (12, 3, '1995-04-01'), (13, 1, '1995-03-20');
+    INSERT INTO lineitem VALUES (10, 5, '1995-03-30'), (10, 7, '1995-03-31'), (11, 9, '1995-04-01'), (12, 4, '1995-04-02'), (13, 6, '1995-03-01');
+    CREATE MATERIALIZED VIEW v AS SELECT l_orderkey, sum(l_price) AS revenue, o_orderdate FROM customer JOIN orders ON c_custkey = o_custkey JOIN lineitem ON l_orderkey = o_orderkey WHERE c_mktsegment = 'FURNITURE' AND o_orderdate < '1995-03-29' AND l_shipdate > '1995-03-29' GROUP BY l_orderkey, o_orderdate;
+    SELECT * FROM v ORDER BY l_orderkey;
+    INSERT INTO lineitem VALUES (13, 8, '1995-04-05'), (10, 1, '1995-04-01');
+    UPDATE customer SET c_mktsegment = 'FURNITURE' WHERE c_custkey = 2;
+    DELETE FROM orders WHERE o_orderkey = 10;
+    INSERT INTO orders VALUES (10, 3, '1995-03-05');
+    SELECT * FROM v ORDER BY l_orderkey;
+}
+expect {
+    10|12|1995-03-01
+    10|13|1995-03-05
+    11|9|1995-03-02
+    13|8|1995-03-20
+}
+
+test matview-join-key-self-join {
+    CREATE TABLE emp(id INTEGER PRIMARY KEY, boss INT, name TEXT);
+    INSERT INTO emp VALUES (1, NULL, 'ceo'), (2, 1, 'cto'), (3, 2, 'dev'), (4, 2, 'ops');
+    CREATE MATERIALIZED VIEW v AS SELECT e.name AS worker, b.name AS boss FROM emp e JOIN emp b ON e.boss = b.id;
+    SELECT * FROM v ORDER BY worker;
+    INSERT INTO emp VALUES (5, 3, 'intern');
+    UPDATE emp SET boss = 1 WHERE id = 4;
+    UPDATE emp SET name = 'CTO' WHERE id = 2;
+    DELETE FROM emp WHERE id = 3;
+    SELECT * FROM v ORDER BY worker;
+}
+expect {
+    cto|ceo
+    dev|cto
+    ops|cto
+    CTO|ceo
+    ops|ceo
+}
+
+test matview-join-key-left-join {
+    CREATE TABLE parent(id INTEGER PRIMARY KEY, name TEXT);
+    CREATE TABLE child(pid INT, v INT);
+    INSERT INTO parent VALUES (1, 'one'), (2, 'two'), (3, 'three');
+    INSERT INTO child VALUES (1, 10), (1, 11), (3, 30);
+    CREATE MATERIALIZED VIEW v AS SELECT p.name, c.v FROM parent p LEFT JOIN child c ON c.pid = p.id;
+    SELECT * FROM v ORDER BY name, v;
+    INSERT INTO child VALUES (2, 20);
+    DELETE FROM child WHERE pid = 1;
+    INSERT INTO parent VALUES (4, 'four');
+    UPDATE child SET pid = 4 WHERE v = 30;
+    SELECT * FROM v ORDER BY name, v;
+}
+expect {
+    one|10
+    one|11
+    three|30
+    two|
+    four|30
+    one|
+    three|
+    two|20
+}
+
+# A LEFT JOIN keeps parents without children. The rows with no match are
+# found by looking up each parent in the index on child(pid).
+test matview-join-key-left-join-indexed {
+    CREATE TABLE parent(id INTEGER PRIMARY KEY, name TEXT);
+    CREATE TABLE child(pid INT, v INT);
+    CREATE INDEX child_pid ON child(pid);
+    INSERT INTO parent VALUES (1, 'one'), (2, 'two'), (3, 'three'), (NULL, 'null');
+    INSERT INTO child VALUES (1, 10), (1, 11), (3, 30), (NULL, 40);
+    CREATE MATERIALIZED VIEW v_all AS SELECT p.name, c.v FROM parent p LEFT JOIN child c ON c.pid = p.id;
+    CREATE MATERIALIZED VIEW v_childless AS SELECT p.name FROM parent p LEFT JOIN child c ON p.id = c.pid WHERE c.pid IS NULL;
+    SELECT 'all', * FROM v_all ORDER BY name, v;
+    SELECT 'childless', * FROM v_childless ORDER BY name;
+    DELETE FROM child WHERE v = 10;
+    DELETE FROM child WHERE pid = 3;
+    INSERT INTO child VALUES (2, 20), ('2', 21);
+    INSERT INTO parent VALUES (9, 'nine');
+    SELECT 'all', * FROM v_all ORDER BY name, v;
+    SELECT 'childless', * FROM v_childless ORDER BY name;
+}
+expect {
+    all|null|
+    all|one|10
+    all|one|11
+    all|three|30
+    all|two|
+    childless|null
+    childless|two
+    all|nine|
+    all|null|
+    all|one|11
+    all|three|
+    all|two|20
+    all|two|21
+    childless|nine
+    childless|null
+    childless|three
+}
+
+test matview-join-key-aggregate-input {
+    CREATE TABLE sales(region TEXT, amount INT);
+    CREATE TABLE regions(name TEXT, manager TEXT);
+    INSERT INTO sales VALUES ('east', 10), ('east', 20), ('west', 5);
+    INSERT INTO regions VALUES ('east', 'ann'), ('west', 'bob'), ('north', 'cid');
+    CREATE MATERIALIZED VIEW v AS SELECT r.manager, g.total FROM (SELECT region, sum(amount) AS total FROM sales GROUP BY region) g JOIN regions r ON g.region = r.name;
+    SELECT * FROM v ORDER BY manager;
+    INSERT INTO sales VALUES ('north', 7), ('west', 1);
+    DELETE FROM sales WHERE amount = 10;
+    UPDATE regions SET manager = 'dan' WHERE name = 'west';
+    SELECT * FROM v ORDER BY manager;
+}
+expect {
+    ann|30
+    bob|5
+    ann|20
+    cid|7
+    dan|6
+}
+
+test matview-join-key-filtered-input {
+    CREATE TABLE a(k INT, x INT);
+    CREATE TABLE b(k INT, y INT);
+    INSERT INTO a VALUES (1, 10), (2, 20), (3, 30);
+    INSERT INTO b VALUES (1, 1), (2, 2), (2, 3), (3, 4);
+    CREATE MATERIALIZED VIEW v AS SELECT f.x, b.y FROM (SELECT k, x FROM a WHERE x > 10) f JOIN b ON f.k = b.k;
+    SELECT * FROM v ORDER BY x, y;
+    UPDATE a SET x = 15 WHERE k = 1;
+    INSERT INTO b VALUES (1, 5);
+    DELETE FROM a WHERE k = 2;
+    SELECT * FROM v ORDER BY x, y;
+}
+expect {
+    20|2
+    20|3
+    30|4
+    15|1
+    15|5
+    30|4
+}
+
+test matview-join-key-expression-keys {
+    CREATE TABLE a(k INT, x INT);
+    CREATE TABLE b(k INT, y INT);
+    INSERT INTO a VALUES (1, 10), (2, 20);
+    INSERT INTO b VALUES (2, 1), (3, 2);
+    CREATE MATERIALIZED VIEW v AS SELECT a.x, b.y FROM a JOIN b ON a.k + 1 = b.k;
+    SELECT * FROM v ORDER BY x, y;
+    INSERT INTO a VALUES (2, 21);
+    INSERT INTO b VALUES (2, 3);
+    SELECT * FROM v ORDER BY x, y;
+}
+expect {
+    10|1
+    20|2
+    10|1
+    10|3
+    20|2
+    21|2
+}
+
+test matview-join-key-both-sides-in-one-transaction {
+    CREATE TABLE a(k INT, x INT);
+    CREATE TABLE b(k INT, y INT);
+    CREATE MATERIALIZED VIEW v AS SELECT a.x, b.y FROM a JOIN b ON a.k = b.k;
+    BEGIN;
+    INSERT INTO a VALUES (1, 10), (2, 20), (2, 21);
+    INSERT INTO b VALUES (2, 200), (1, 100), (3, 300);
+    UPDATE a SET k = 3 WHERE x = 10;
+    COMMIT;
+    SELECT * FROM v ORDER BY x, y;
+    BEGIN;
+    DELETE FROM a WHERE k = 2;
+    INSERT INTO b VALUES (2, 201);
+    INSERT INTO a VALUES (2, 22);
+    SELECT * FROM v ORDER BY x, y;
+    ROLLBACK;
+    SELECT * FROM v ORDER BY x, y;
+    BEGIN;
+    INSERT INTO a VALUES (1, 11);
+    SAVEPOINT s;
+    INSERT INTO b VALUES (1, 101);
+    DELETE FROM b WHERE y = 300;
+    ROLLBACK TO s;
+    INSERT INTO b VALUES (1, 102);
+    COMMIT;
+    SELECT * FROM v ORDER BY x, y;
+}
+expect {
+    10|300
+    20|200
+    21|200
+    10|300
+    22|200
+    22|201
+    10|300
+    20|200
+    21|200
+    10|300
+    11|100
+    11|102
+    20|200
+    21|200
+}
+
+test matview-join-key-view-source {
+    CREATE TABLE a(k INT, x INT);
+    CREATE TABLE b(k INT, y INT);
+    INSERT INTO a VALUES (1, 10), (2, 20), (2, 20);
+    INSERT INTO b VALUES (1, 100), (2, 200);
+    CREATE MATERIALIZED VIEW va AS SELECT k, x FROM a;
+    CREATE MATERIALIZED VIEW v AS SELECT va.x, b.y FROM va JOIN b ON va.k = b.k;
+    SELECT * FROM v ORDER BY x, y;
+    INSERT INTO a VALUES (1, 11);
+    DELETE FROM b WHERE k = 2;
+    INSERT INTO b VALUES (2, 201);
+    SELECT * FROM v ORDER BY x, y;
+}
+expect {
+    10|100
+    20|200
+    20|200
+    10|100
+    11|100
+    20|201
+    20|201
+}
+
+# Indexes the lookup may or may not use: a NOCASE index serves only a NOCASE
+# comparison, an index serves a key on its leading column, and a DESC index
+# and a partial index on the inner table. A wrong choice would miss rows.
+test matview-join-key-index-choice {
+    CREATE TABLE a(k TEXT, kn TEXT COLLATE NOCASE, x INT);
+    CREATE TABLE b(k TEXT, other INT, y INT);
+    CREATE INDEX b_k_nocase ON b(k COLLATE NOCASE);
+    CREATE INDEX b_k_other ON b(k, other);
+    CREATE INDEX b_y_desc ON b(y DESC);
+    CREATE INDEX b_k_partial ON b(k) WHERE y > 100;
+    INSERT INTO a VALUES ('a', 'a', 1), ('B', 'B', 2), ('c', 'c', 3);
+    INSERT INTO b VALUES ('a', 1, 10), ('A', 2, 11), ('b', 3, 12), ('B', 4, 112), ('c', 5, 113);
+    CREATE MATERIALIZED VIEW v_binary AS SELECT a.x, b.y FROM a JOIN b ON a.k = b.k;
+    CREATE MATERIALIZED VIEW v_nocase AS SELECT a.x, b.y FROM a JOIN b ON a.kn = b.k;
+    CREATE MATERIALIZED VIEW v_leading AS SELECT a.x, b.other FROM a JOIN b ON b.k = a.k;
+    CREATE MATERIALIZED VIEW v_desc AS SELECT a.x, b.k FROM a JOIN b ON b.y = a.x + 9;
+    SELECT 'binary', * FROM v_binary ORDER BY x, y;
+    SELECT 'nocase', * FROM v_nocase ORDER BY x, y;
+    SELECT 'leading', * FROM v_leading ORDER BY x, other;
+    SELECT 'desc', * FROM v_desc ORDER BY x, k;
+    INSERT INTO a VALUES ('b', 'b', 4);
+    INSERT INTO b VALUES ('C', 6, 13), ('b', 7, 114);
+    UPDATE b SET k = 'a' WHERE y = 12;
+    DELETE FROM b WHERE y = 11;
+    SELECT 'binary', * FROM v_binary ORDER BY x, y;
+    SELECT 'nocase', * FROM v_nocase ORDER BY x, y;
+    SELECT 'leading', * FROM v_leading ORDER BY x, other;
+    SELECT 'desc', * FROM v_desc ORDER BY x, k;
+}
+expect {
+    binary|1|10
+    binary|2|112
+    binary|3|113
+    nocase|1|10
+    nocase|1|11
+    nocase|2|12
+    nocase|2|112
+    nocase|3|113
+    leading|1|1
+    leading|2|4
+    leading|3|5
+    desc|1|a
+    desc|2|A
+    desc|3|b
+    binary|1|10
+    binary|1|12
+    binary|2|112
+    binary|3|113
+    binary|4|114
+    nocase|1|10
+    nocase|1|12
+    nocase|2|112
+    nocase|2|114
+    nocase|3|13
+    nocase|3|113
+    nocase|4|112
+    nocase|4|114
+    leading|1|1
+    leading|1|3
+    leading|2|4
+    leading|3|5
+    leading|4|7
+    desc|1|a
+    desc|3|a
+    desc|4|C
+}
+
+# A REAL key equal to the smallest rowid. Integer affinity does not turn
+# -9.223372036854776e18 into -9223372036854775808, but `=` matches them, so
+# the rowid lookup must find the row too. Otherwise the insert phase adds the
+# join row and the delete phase never finds it again.
+test matview-join-key-real-smallest-rowid {
+    CREATE TABLE a(id INTEGER PRIMARY KEY, v TEXT);
+    CREATE TABLE b(x);
+    CREATE MATERIALIZED VIEW mv AS SELECT b.x, a.v FROM b JOIN a ON b.x = a.id;
+    INSERT INTO b VALUES (-9.223372036854776e18), ('-9223372036854775808.0');
+    INSERT INTO a VALUES (-9223372036854775808, 'min');
+    DELETE FROM b;
+    SELECT 'after delete', count(*) FROM mv;
+    INSERT INTO a VALUES (5, 'five');
+    INSERT INTO b VALUES (-9.223372036854776e18), (5.0);
+    DELETE FROM a;
+    SELECT 'after parent delete', count(*) FROM mv;
+}
+expect {
+    after delete|0
+    after parent delete|0
+}

@@ -81,6 +81,13 @@ even if the regular query engine does.
 | Multi-way and nested joins | ✅ Yes | Covered through five-way joins; there is no fixed shape limit. |
 | Joins over derived, aggregate, distinct, or set-operation results | ✅ Yes | Both join inputs use the same composable stream contract. |
 
+Cost of maintaining a join: when the ON clause compares a column of each
+input with `=`, a changed row finds its matches through the other table's
+INTEGER PRIMARY KEY or an index on the compared column, so a small write
+reads only the matching rows. Without such an index, each write statement
+reads the other input once. A join without any `=` between the inputs reads
+every pair of changed and stored rows.
+
 ### Aggregation
 
 | Feature | Status | Comment |
