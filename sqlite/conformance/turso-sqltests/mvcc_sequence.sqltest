@@ -231,6 +231,140 @@ expect {
     2|b
 }
 
+test mvcc-autoinc-rowid-update-preserves-sequence {
+    PRAGMA journal_mode = 'mvcc';
+    CREATE TABLE t (id INTEGER PRIMARY KEY AUTOINCREMENT, a INT);
+    INSERT INTO t(a) VALUES (1), (2);
+    UPDATE t SET id = id + 100 WHERE id = 2;
+    SELECT name, seq FROM sqlite_sequence;
+    PRAGMA wal_checkpoint(TRUNCATE);
+    SELECT name, seq FROM sqlite_sequence;
+    INSERT INTO t(a) VALUES (3);
+    SELECT id FROM t WHERE a = 3;
+    SELECT seq FROM sqlite_sequence WHERE name = 't';
+}
+expect {
+    mvcc
+    t|2
+    0|0|0
+    t|2
+    103
+    103
+}
+
+test mvcc-autoinc-rowid-update-delete-does-not-advance-sequence {
+    PRAGMA journal_mode = 'mvcc';
+    CREATE TABLE t (id INTEGER PRIMARY KEY AUTOINCREMENT, a INT);
+    INSERT INTO t(a) VALUES (1), (2);
+    UPDATE t SET id = 102 WHERE id = 2;
+    PRAGMA wal_checkpoint(TRUNCATE);
+    DELETE FROM t WHERE id = 102;
+    INSERT INTO t(a) VALUES (3);
+    SELECT id FROM t WHERE a = 3;
+    SELECT seq FROM sqlite_sequence WHERE name = 't';
+}
+expect {
+    mvcc
+    0|0|0
+    3
+    3
+}
+
+test mvcc-autoinc-rowid-update-lower-explicit-insert {
+    PRAGMA journal_mode = 'mvcc';
+    CREATE TABLE t (id INTEGER PRIMARY KEY AUTOINCREMENT, a INT);
+    INSERT INTO t(a) VALUES (1), (2);
+    UPDATE t SET id = 102 WHERE id = 2;
+    INSERT INTO t VALUES (10, 3);
+    SELECT seq FROM sqlite_sequence WHERE name = 't';
+    DELETE FROM t WHERE id = 102;
+    INSERT INTO t(a) VALUES (4);
+    SELECT id FROM t WHERE a = 4;
+}
+expect {
+    mvcc
+    10
+    11
+}
+
+test mvcc-autoinc-rowid-update-in-transaction {
+    PRAGMA journal_mode = 'mvcc';
+    CREATE TABLE t (id INTEGER PRIMARY KEY AUTOINCREMENT, a INT);
+    INSERT INTO t(a) VALUES (1), (2);
+    BEGIN;
+    UPDATE t SET id = 102 WHERE id = 2;
+    SELECT seq FROM sqlite_sequence WHERE name = 't';
+    INSERT INTO t(a) VALUES (3), (4);
+    SELECT id FROM t WHERE a >= 3 ORDER BY id;
+    COMMIT;
+    SELECT seq FROM sqlite_sequence WHERE name = 't';
+}
+expect {
+    mvcc
+    2
+    103
+    104
+    104
+}
+
+test mvcc-autoinc-rowid-update-upsert-preserves-sequence {
+    PRAGMA journal_mode = 'mvcc';
+    CREATE TABLE t (id INTEGER PRIMARY KEY AUTOINCREMENT, a INT UNIQUE);
+    INSERT INTO t(a) VALUES (1);
+    INSERT INTO t(a) VALUES (1) ON CONFLICT(a) DO UPDATE SET id = 100;
+    SELECT seq FROM sqlite_sequence WHERE name = 't';
+    INSERT INTO t(a) VALUES (2);
+    SELECT id FROM t WHERE a = 2;
+}
+expect {
+    mvcc
+    2
+    101
+}
+
+test mvcc-autoinc-rowid-update-upsert-delete {
+    PRAGMA journal_mode = 'mvcc';
+    CREATE TABLE t (id INTEGER PRIMARY KEY AUTOINCREMENT, a INT UNIQUE);
+    INSERT INTO t(a) VALUES (1);
+    INSERT INTO t(a) VALUES (1) ON CONFLICT(a) DO UPDATE SET id = 100;
+    DELETE FROM t WHERE id = 100;
+    INSERT INTO t(a) VALUES (2);
+    SELECT id FROM t;
+    SELECT seq FROM sqlite_sequence WHERE name = 't';
+}
+expect {
+    mvcc
+    3
+    3
+}
+
+test mvcc-autoinc-rowid-update-max-then-delete {
+    PRAGMA journal_mode = 'mvcc';
+    CREATE TABLE t (id INTEGER PRIMARY KEY AUTOINCREMENT, a INT);
+    INSERT INTO t(a) VALUES (1);
+    UPDATE t SET id = 9223372036854775807;
+    SELECT seq FROM sqlite_sequence WHERE name = 't';
+    DELETE FROM t;
+    INSERT INTO t(a) VALUES (2);
+    SELECT id FROM t;
+}
+expect {
+    mvcc
+    1
+    2
+}
+
+test mvcc-autoinc-rowid-update-max-insert-fails {
+    PRAGMA journal_mode = 'mvcc';
+    CREATE TABLE t (id INTEGER PRIMARY KEY AUTOINCREMENT, a INT);
+    INSERT INTO t(a) VALUES (1);
+    UPDATE t SET id = 9223372036854775807;
+    INSERT INTO t(a) VALUES (2);
+}
+expect error {
+    database or disk is full
+}
+
 # MVCC -> WAL mode switch: autoincrement ids continue correctly
 test mvcc-to-wal-autoincrement-continues {
     PRAGMA journal_mode = 'mvcc';

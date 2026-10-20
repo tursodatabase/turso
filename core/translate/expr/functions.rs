@@ -249,6 +249,7 @@ pub(super) fn translate_sequence_function(
             &seq_arc,
             target_register,
             Some(start_reg),
+            None,
         )?;
     } else {
         // setval keeps its own cursor lifecycle: open the backing table,

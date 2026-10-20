@@ -176,6 +176,7 @@ pub fn emit_sequence_backing_table(
 /// The seq descriptor's `start/inc/min/max/cycle` are baked into the
 /// bytecode as `Insn::Integer` literals — they are immutable schema and
 /// reading them back from the row would be wasteful.
+#[allow(clippy::too_many_arguments)]
 pub fn emit_disk_read_nextval(
     program: &mut ProgramBuilder,
     resolver: &Resolver,
@@ -187,6 +188,7 @@ pub fn emit_disk_read_nextval(
     // keyed by (the user's spelling, e.g. `'main.my_seq'`). When `None`
     // the helper allocates one holding `seq_name`.
     seq_name_reg: Option<usize>,
+    minimum_value_reg: Option<usize>,
 ) -> Result<()> {
     let backing_table_name = sequence_backing_table_name(seq_name);
     let backing_table = resolver
@@ -268,6 +270,12 @@ pub fn emit_disk_read_nextval(
         was_empty_reg,
         out_value_reg: target_register,
     });
+    if let Some(minimum_value_reg) = minimum_value_reg {
+        program.emit_insn(Insn::MemMax {
+            dest_reg: target_register,
+            src_reg: minimum_value_reg,
+        });
+    }
 
     program.emit_insn(Insn::Copy {
         src_reg: target_register,

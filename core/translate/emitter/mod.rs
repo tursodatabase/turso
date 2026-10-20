@@ -1491,6 +1491,7 @@ fn emit_cdc_change_id(
         &seq,
         dest_reg,
         None,
+        None,
     )
 }
 

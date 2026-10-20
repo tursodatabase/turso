@@ -247,6 +247,7 @@ fn prepare_update_plan(
     connection: &Arc<crate::Connection>,
     is_internal_schema_change: bool,
 ) -> crate::Result<UpdatePlan> {
+    println!("======> UPDATE =====>");
     let database_id = resolver.resolve_existing_table_database_id_qualified(&body.tbl_name)?;
     let target_name = &body.tbl_name.name;
     let table = match resolver.with_schema(database_id, |s| s.get_table(target_name.as_str())) {
