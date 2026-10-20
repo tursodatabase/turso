@@ -1,3 +1,4 @@
+use std::fmt::Debug;
 use std::num::NonZero;
 use std::sync::{
     atomic::{AtomicUsize, Ordering},
@@ -5,7 +6,8 @@ use std::sync::{
 };
 
 use async_trait::async_trait;
-use futures::stream;
+use bytes::{Buf, Bytes};
+use futures::{stream, Sink, SinkExt};
 use tokio::net::TcpListener;
 use tracing::{error, info};
 use turso_core::Value;
@@ -13,15 +15,24 @@ use turso_pg::{split_statements, Connection, PgConnection};
 
 use pgwire::api::auth::StartupHandler;
 use pgwire::api::portal::{Format, Portal};
-use pgwire::api::query::{ExtendedQueryHandler, SimpleQueryHandler};
+use pgwire::api::query::{
+    send_execution_response, send_query_response, send_ready_for_query, ExtendedQueryHandler,
+    SimpleQueryHandler,
+};
 use pgwire::api::results::{
     DataRowEncoder, DescribePortalResponse, DescribeStatementResponse, FieldFormat, FieldInfo,
     QueryResponse, Response, Tag,
 };
 use pgwire::api::stmt::{NoopQueryParser, StoredStatement};
-use pgwire::api::{ClientInfo, NoopHandler, PgWireServerHandlers, Type};
+use pgwire::api::{
+    ClientInfo, ClientPortalStore, NoopHandler, PgWireConnectionState, PgWireServerHandlers, Type,
+};
 use pgwire::error::{ErrorInfo, PgWireError, PgWireResult};
+use pgwire::messages::copy::{CopyData, CopyDone, CopyOutResponse};
 use pgwire::messages::data::DataRow;
+use pgwire::messages::response::{EmptyQueryResponse, TransactionStatus};
+use pgwire::messages::simplequery::Query;
+use pgwire::messages::PgWireBackendMessage;
 use pgwire::tokio::process_socket;
 use pgwire::types::format::FormatOptions;
 
@@ -174,9 +185,86 @@ impl PgWireServerHandlers for TursoPgFactory {
 
 #[async_trait]
 impl SimpleQueryHandler for TursoPgHandler {
+    async fn on_query<C>(&self, client: &mut C, query: Query) -> PgWireResult<()>
+    where
+        C: ClientInfo + ClientPortalStore + Sink<PgWireBackendMessage> + Unpin + Send + Sync,
+        C::Error: Debug,
+        PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
+    {
+        if !matches!(client.state(), PgWireConnectionState::ReadyForQuery) {
+            return Err(PgWireError::NotReadyForQuery);
+        }
+        client.set_state(PgWireConnectionState::QueryInProgress);
+        let statements = split_statements(&query.query)
+            .map_err(|e| PgWireError::UserError(Box::new(error_info(&e.to_string()))))?;
+        if statements.is_empty() {
+            client
+                .feed(PgWireBackendMessage::EmptyQueryResponse(
+                    EmptyQueryResponse::new(),
+                ))
+                .await?;
+        }
+        for sql in statements {
+            let parsed = turso_pg_parser::parse(&sql)
+                .map_err(|e| PgWireError::UserError(Box::new(error_info(&e.to_string()))))?;
+            match turso_pg_parser::translator::try_extract_copy_to(&parsed)
+                .map_err(|e| PgWireError::UserError(Box::new(error_info(&e))))?
+            {
+                Some(copy) => {
+                    let output = self.copy_to_stdout(&copy)?;
+                    client
+                        .feed(PgWireBackendMessage::CopyOutResponse(CopyOutResponse::new(
+                            0,
+                            output.columns as i16,
+                            vec![0; output.columns],
+                        )))
+                        .await?;
+                    for row in output.rows {
+                        client
+                            .feed(PgWireBackendMessage::CopyData(CopyData::new(Bytes::from(
+                                row,
+                            ))))
+                            .await?;
+                    }
+                    client
+                        .feed(PgWireBackendMessage::CopyDone(CopyDone::new()))
+                        .await?;
+                    send_execution_response(client, Tag::new("COPY").with_rows(output.row_count))
+                        .await?;
+                    client.set_transaction_status(self.transaction_status());
+                }
+                None => {
+                    let responses = SimpleQueryHandler::do_query(self, client, &sql).await?;
+                    client.set_transaction_status(self.transaction_status());
+                    for response in responses {
+                        match response {
+                            Response::Query(mut result) => {
+                                send_query_response(client, &mut result, true).await?
+                            }
+                            Response::Execution(tag) => {
+                                send_execution_response(client, tag).await?;
+                            }
+                            _ => {
+                                return Err(PgWireError::ApiError(
+                                    "unexpected simple query response".into(),
+                                ));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        let transaction_status = self.transaction_status();
+        client.set_state(PgWireConnectionState::ReadyForQuery);
+        client.set_transaction_status(transaction_status);
+        send_ready_for_query(client, transaction_status).await
+    }
+
     async fn do_query<C>(&self, _client: &mut C, query: &str) -> PgWireResult<Vec<Response>>
     where
-        C: ClientInfo + Unpin + Send + Sync,
+        C: ClientInfo + ClientPortalStore + Sink<PgWireBackendMessage> + Unpin + Send + Sync,
+        C::Error: Debug,
+        PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
     {
         let conn = self.conn.lock().unwrap().clone();
 
@@ -202,6 +290,89 @@ impl SimpleQueryHandler for TursoPgHandler {
         }
 
         Ok(responses)
+    }
+}
+
+struct CopyOutput {
+    columns: usize,
+    rows: Vec<Vec<u8>>,
+    row_count: usize,
+}
+
+impl TursoPgHandler {
+    fn transaction_status(&self) -> TransactionStatus {
+        if self.conn.lock().unwrap().inner().get_auto_commit() {
+            TransactionStatus::Idle
+        } else {
+            TransactionStatus::Transaction
+        }
+    }
+
+    fn copy_to_stdout(
+        &self,
+        copy: &turso_pg_parser::translator::PgCopyToStmt,
+    ) -> PgWireResult<CopyOutput> {
+        let quote = |name: &str| format!("\"{}\"", name.replace('"', "\"\""));
+        let columns = copy
+            .columns
+            .as_ref()
+            .map(|columns| {
+                columns
+                    .iter()
+                    .map(|name| quote(name))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            })
+            .unwrap_or_else(|| "*".to_owned());
+        let table = match &copy.schema_name {
+            Some(schema) => format!("{}.{}", quote(schema), quote(&copy.table_name)),
+            None => quote(&copy.table_name),
+        };
+        let conn = self.conn.lock().unwrap().clone();
+        let mut stmt = conn
+            .prepare(&format!("SELECT {columns} FROM {table}"))
+            .map_err(|e| PgWireError::UserError(Box::new(error_info(&e.to_string()))))?;
+        let header = Arc::new(build_field_info(&stmt, &Format::UnifiedText));
+        let column_count = header.len();
+        let mut rows = Vec::new();
+        stmt.run_with_row_callback(|row| {
+            let mut output = Vec::new();
+            for (index, value) in row.get_values().enumerate() {
+                if index > 0 {
+                    output.push(b'\t');
+                }
+                if matches!(value, Value::Null) {
+                    output.extend_from_slice(b"\\N");
+                    continue;
+                }
+                let mut encoder = DataRowEncoder::new(Arc::new(vec![header[index].clone()]));
+                encode_value(&mut encoder, value, header[index].datatype())?;
+                let data_row = encoder
+                    .finish()
+                    .map_err(|e| turso_core::LimboError::InternalError(e.to_string()))?;
+                let mut data = data_row.data.freeze();
+                let length = data.get_i32();
+                assert!(length >= 0);
+                for byte in &data[..length as usize] {
+                    match byte {
+                        b'\\' => output.extend_from_slice(b"\\\\"),
+                        b'\t' => output.extend_from_slice(b"\\t"),
+                        b'\n' => output.extend_from_slice(b"\\n"),
+                        b'\r' => output.extend_from_slice(b"\\r"),
+                        byte => output.push(*byte),
+                    }
+                }
+            }
+            output.push(b'\n');
+            rows.push(output);
+            Ok(())
+        })
+        .map_err(|e| PgWireError::UserError(Box::new(error_info(&e.to_string()))))?;
+        Ok(CopyOutput {
+            columns: column_count,
+            row_count: rows.len(),
+            rows,
+        })
     }
 }
 
@@ -770,6 +941,204 @@ fn error_info(message: &str) -> ErrorInfo {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::mpsc;
+    use turso_pg_client::{BackendEvent, ConnParams, PgConn};
+
+    fn test_handler() -> TursoPgHandler {
+        let (_io, db) = turso_pg::open_database(
+            ":memory:",
+            None,
+            turso_pg::OpenFlags::default(),
+            turso_pg::DatabaseOpts::new(),
+        )
+        .unwrap();
+        let conn = turso_pg::PgConnection::connect(&db).unwrap();
+        TursoPgHandler {
+            conn: Arc::new(Mutex::new(conn)),
+            db_file: ":memory:".to_owned(),
+            query_parser: Arc::new(NoopQueryParser::new()),
+        }
+    }
+
+    fn protocol_client() -> PgConn {
+        let (address_sender, address_receiver) = mpsc::channel();
+        std::thread::spawn(move || {
+            tokio::runtime::Runtime::new()
+                .unwrap()
+                .block_on(async move {
+                    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+                    address_sender.send(listener.local_addr().unwrap()).unwrap();
+                    let (socket, _) = listener.accept().await.unwrap();
+                    let factory = Arc::new(TursoPgFactory {
+                        handler: Arc::new(test_handler()),
+                    });
+                    process_socket(socket, None, factory).await.unwrap();
+                });
+        });
+        let address = address_receiver.recv().unwrap();
+        PgConn::connect(
+            &ConnParams {
+                host: address.ip().to_string(),
+                port: address.port(),
+                user: "postgres".to_owned(),
+                password: None,
+                database: "postgres".to_owned(),
+            },
+            &[],
+        )
+        .unwrap()
+    }
+
+    fn command_complete(body: &[u8]) -> String {
+        String::from_utf8(body[..body.len() - 1].to_vec()).unwrap()
+    }
+
+    #[test]
+    fn test_copy_protocol_orders_statements_and_encodes_rows() {
+        let mut client = protocol_client();
+        client
+            .simple_query(
+                "CREATE TABLE items (value TEXT); INSERT INTO items VALUES ('one\ttwo'), (NULL)",
+            )
+            .unwrap();
+        client
+            .send_query("SELECT 1; COPY items TO STDOUT; SELECT 2")
+            .unwrap();
+
+        let mut messages = Vec::new();
+        loop {
+            let message = client.read_message().unwrap();
+            let done = message.0 == b'Z';
+            messages.push(message);
+            if done {
+                break;
+            }
+        }
+        let tags: Vec<u8> = messages.iter().map(|message| message.0).collect();
+        assert_eq!(
+            tags,
+            [b'T', b'D', b'C', b'H', b'd', b'd', b'c', b'C', b'T', b'D', b'C', b'Z']
+        );
+        assert_eq!(messages[4].1, b"one\\ttwo\n");
+        assert_eq!(messages[5].1, b"\\N\n");
+        assert_eq!(command_complete(&messages[7].1), "COPY 2");
+    }
+
+    #[test]
+    fn test_copy_protocol_empty_table_reports_zero_rows() {
+        let mut client = protocol_client();
+        client
+            .simple_query("CREATE TABLE items (value TEXT)")
+            .unwrap();
+        client.send_query("COPY items TO STDOUT").unwrap();
+
+        let mut messages = Vec::new();
+        loop {
+            let message = client.read_message().unwrap();
+            let done = message.0 == b'Z';
+            messages.push(message);
+            if done {
+                break;
+            }
+        }
+        assert_eq!(
+            messages.iter().map(|message| message.0).collect::<Vec<_>>(),
+            [b'H', b'c', b'C', b'Z']
+        );
+        assert_eq!(command_complete(&messages[2].1), "COPY 0");
+    }
+
+    #[test]
+    fn test_rollback_to_keeps_transaction_status() {
+        let mut client = protocol_client();
+        let events = client
+            .simple_query("BEGIN; SAVEPOINT before_insert; ROLLBACK TO before_insert")
+            .unwrap();
+        assert!(matches!(
+            events.last(),
+            Some(BackendEvent::ReadyForQuery(b'T'))
+        ));
+        assert!(matches!(
+            client.simple_query("ROLLBACK").unwrap().last(),
+            Some(BackendEvent::ReadyForQuery(b'I'))
+        ));
+    }
+
+    #[test]
+    fn test_error_after_begin_reports_failed_transaction_and_stops_batch() {
+        let mut client = protocol_client();
+        client
+            .simple_query("CREATE TABLE items (value TEXT)")
+            .unwrap();
+        let events = client
+            .simple_query("BEGIN; SELECT * FROM missing_table; COPY items TO STDOUT")
+            .unwrap();
+        assert!(
+            matches!(events.first(), Some(BackendEvent::CommandComplete(tag)) if tag == "BEGIN")
+        );
+        assert!(events
+            .iter()
+            .any(|event| matches!(event, BackendEvent::ErrorResponse(_))));
+        assert!(matches!(
+            events.last(),
+            Some(BackendEvent::ReadyForQuery(b'E'))
+        ));
+        assert!(!events.iter().any(
+            |event| matches!(event, BackendEvent::CommandComplete(tag) if tag.starts_with("COPY"))
+        ));
+        assert!(!events
+            .iter()
+            .any(|event| matches!(event, BackendEvent::Other(b'H' | b'd' | b'c'))));
+    }
+
+    #[test]
+    fn test_copy_to_stdout_text_rows() {
+        let handler = test_handler();
+        let conn = handler.conn.lock().unwrap().clone();
+        conn.execute(
+            "CREATE TABLE items (a TEXT, b TEXT, n BIGINT, ok BOOLEAN, f REAL, raw BYTEA)",
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO items VALUES ('', NULL, 9223372036854775807, 1, 1.25, unhex('00ff'))",
+        )
+        .unwrap();
+        conn.execute("INSERT INTO items VALUES ('\\N', 'one\ttwo\nthree\rfour\\five', -2, 0, -0.5, unhex('5c2e'))")
+            .unwrap();
+        let parsed = turso_pg_parser::parse("COPY items (b, a, n, ok, f, raw) TO STDOUT").unwrap();
+        let copy = turso_pg_parser::translator::try_extract_copy_to(&parsed)
+            .unwrap()
+            .unwrap();
+        let output = handler.copy_to_stdout(&copy).unwrap();
+        assert_eq!(output.columns, 6);
+        assert_eq!(output.row_count, 2);
+        assert_eq!(
+            output.rows,
+            vec![
+                b"\\N\t\t9223372036854775807\tt\t1.25\t\\\\x00ff\n".to_vec(),
+                b"one\\ttwo\\nthree\\rfour\\\\five\t\\\\N\t-2\tf\t-0.5\t\\\\x5c2e\n".to_vec(),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_copy_to_stdout_empty_table() {
+        let handler = test_handler();
+        handler
+            .conn
+            .lock()
+            .unwrap()
+            .execute("CREATE TABLE empty_items (value TEXT)")
+            .unwrap();
+        let parsed = turso_pg_parser::parse("COPY empty_items TO STDOUT").unwrap();
+        let copy = turso_pg_parser::translator::try_extract_copy_to(&parsed)
+            .unwrap()
+            .unwrap();
+        let output = handler.copy_to_stdout(&copy).unwrap();
+        assert_eq!(output.columns, 1);
+        assert_eq!(output.row_count, 0);
+        assert!(output.rows.is_empty());
+    }
 
     #[test]
     fn test_pg_is_in_recovery_returns_true_text_on_wire() {

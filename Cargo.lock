@@ -7319,12 +7319,15 @@ version = "0.9.0-pre.1"
 dependencies = [
  "anyhow",
  "async-trait",
+ "bytes",
  "futures",
  "pgwire",
  "tokio",
  "tracing",
  "turso_core",
  "turso_pg",
+ "turso_pg_client",
+ "turso_pg_parser",
 ]
 
 [[package]]
