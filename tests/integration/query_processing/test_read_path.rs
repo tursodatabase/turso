@@ -1365,3 +1365,163 @@ fn test_column_range_reentry_after_io_yield() -> anyhow::Result<()> {
     assert_eq!(rows, expected);
     Ok(())
 }
+
+/// Like SQLite, reading the columns that come before a large value must not
+/// read the overflow pages that hold that value. Each query scans a table
+/// with a cold page cache and counts the pages it reads.
+#[test]
+fn test_columns_before_overflow_value_do_not_read_overflow_pages() -> anyhow::Result<()> {
+    use crate::queued_io::{QueuedIo, QueuedIoOpKind};
+    use std::sync::Arc;
+    use turso_core::{Database, DatabaseOpts, SqliteDialect};
+
+    const ROWS: i64 = 8;
+    // A 100KB value fills about 25 overflow pages of 4096 bytes.
+    const BIG_LEN: i64 = 100_000;
+    const OVERFLOW_PAGES_PER_ROW: usize = BIG_LEN as usize / 4096;
+
+    let io = Arc::new(QueuedIo::new());
+    let path = "columns-before-overflow-value.db";
+    let open = |io: Arc<QueuedIo>| -> anyhow::Result<Arc<Database>> {
+        Ok(Database::open_file_with_flags(
+            io,
+            path,
+            Default::default(),
+            DatabaseOpts::new(),
+            None,
+            Arc::new(SqliteDialect),
+        )?)
+    };
+
+    {
+        let db = open(io.clone())?;
+        let conn = db.connect(ConnectOpts::new())?;
+        conn.execute(
+            "CREATE TABLE revisions(doc_id TEXT, rev INTEGER, saved_at INTEGER, body TEXT, tail TEXT)",
+        )?;
+        for i in 0..ROWS {
+            conn.execute(
+                format!(
+                    "INSERT INTO revisions VALUES ('doc{i}', {i}, {}, printf('%0{BIG_LEN}d', {i}), 'tail{i}')",
+                    i * 100
+                )
+                .as_str(),
+            )?;
+        }
+        conn.close()?;
+    }
+
+    // A fresh Database over the same backing file starts with a cold page
+    // cache, so every page the query needs is read again.
+    let scan = |sql: &str| -> anyhow::Result<(Vec<Vec<Value>>, usize)> {
+        let db = open(io.clone())?;
+        let conn = db.connect(ConnectOpts::new())?;
+        let mut stmt = conn.prepare(sql)?;
+        let mut rows = Vec::new();
+        let mut page_reads = 0;
+        loop {
+            match stmt.step()? {
+                StepResult::Row => {
+                    let row = stmt.row().unwrap();
+                    rows.push(row.get_values().cloned().collect::<Vec<_>>());
+                }
+                StepResult::IO | StepResult::Yield => {
+                    while let Some(event) = io.step_one()? {
+                        if event.kind == QueuedIoOpKind::Pread {
+                            page_reads += 1;
+                        }
+                    }
+                }
+                StepResult::Done => break,
+                r => panic!("unexpected step result: {r:?}"),
+            }
+        }
+        Ok((rows, page_reads))
+    };
+
+    // Three leading columns (a fused column range) and a single column.
+    for (sql, expected) in [
+        (
+            "SELECT doc_id, rev, saved_at FROM revisions",
+            (0..ROWS)
+                .map(|i| {
+                    vec![
+                        Value::build_text(format!("doc{i}")),
+                        Value::from_i64(i),
+                        Value::from_i64(i * 100),
+                    ]
+                })
+                .collect::<Vec<_>>(),
+        ),
+        (
+            "SELECT saved_at FROM revisions",
+            (0..ROWS).map(|i| vec![Value::from_i64(i * 100)]).collect(),
+        ),
+    ] {
+        let (rows, page_reads) = scan(sql)?;
+        assert_eq!(rows, expected, "{sql}");
+        // Reading one overflow page of each row would already take ROWS reads.
+        assert!(
+            page_reads < ROWS as usize,
+            "{sql} read {page_reads} pages, as many as one overflow page per row"
+        );
+    }
+
+    // A column after the large value still needs the overflow pages.
+    let (rows, page_reads) = scan("SELECT rev, tail FROM revisions")?;
+    let expected: Vec<Vec<Value>> = (0..ROWS)
+        .map(|i| vec![Value::from_i64(i), Value::build_text(format!("tail{i}"))])
+        .collect();
+    assert_eq!(rows, expected);
+    assert!(
+        page_reads >= ROWS as usize * OVERFLOW_PAGES_PER_ROW,
+        "reading the column after the large value read only {page_reads} pages"
+    );
+    Ok(())
+}
+
+/// A column read must not use bytes read for an earlier version of the row.
+/// The inner table of the join is scanned once per outer row. After the first
+/// outer row, an UPDATE on the same connection rewrites the large value, and
+/// the next scan reads the row again from the same place on the same page.
+#[turso_macros::test]
+fn test_overflow_value_read_again_after_row_is_rewritten(
+    tmp_db: TempDatabase,
+) -> anyhow::Result<()> {
+    let conn = tmp_db.connect_limbo();
+    conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, b TEXT, tail TEXT)")?;
+    conn.execute(
+        "INSERT INTO t VALUES (1, replace(hex(zeroblob(10000)), '0', 'a') || 'END1', 'tail')",
+    )?;
+    conn.execute("CREATE TABLE a(x INTEGER PRIMARY KEY, want TEXT)")?;
+    conn.execute("INSERT INTO a VALUES (1, 'nomatch'), (2, 'zzzzEND1')")?;
+
+    let mut stmt = conn.prepare(
+        "SELECT a.x, substr(t.b, 19995, 10), t.tail FROM a LEFT JOIN t ON instr(t.b, a.want) > 0",
+    )?;
+    let next_row = |stmt: &mut turso_core::Statement| -> anyhow::Result<Vec<Value>> {
+        loop {
+            match stmt.step()? {
+                StepResult::Row => {
+                    return Ok(stmt.row().unwrap().get_values().cloned().collect());
+                }
+                StepResult::IO => stmt._io().step()?,
+                r => panic!("unexpected step result: {r:?}"),
+            }
+        }
+    };
+    assert_eq!(
+        next_row(&mut stmt)?,
+        vec![Value::from_i64(1), Value::Null, Value::Null]
+    );
+    conn.execute("UPDATE t SET b = replace(b, 'a', 'z'), tail = 'new tail'")?;
+    assert_eq!(
+        next_row(&mut stmt)?,
+        vec![
+            Value::from_i64(2),
+            Value::build_text("zzzzzzEND1"),
+            Value::build_text("new tail"),
+        ]
+    );
+    Ok(())
+}
