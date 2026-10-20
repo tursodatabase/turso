@@ -1486,16 +1486,16 @@ pub fn op_open_read(
 
             // The cursor observes the transaction-wide change-log generation
             // for read-your-own-writes.
-            let mv_cursor = crate::incremental::cursor::MaterializedViewCursor::new(
+            let view_cursor = crate::incremental::cursor::MaterializedViewCursor::new(
                 cursor.into_dyn(),
                 pager,
                 program.connection.clone(),
-            )?;
+            );
 
             cursors
                 .get_mut(*cursor_id)
                 .expect("cursor_id should be valid")
-                .replace(Cursor::new_materialized_view(mv_cursor));
+                .replace(Cursor::new_btree_dyn(Box::new(view_cursor)));
         }
         CursorType::BTreeTable(table) => {
             // Regular table
@@ -1963,12 +1963,8 @@ pub fn op_rewind(
                 return_if_io!(state, btree_cursor.rewind());
                 btree_cursor.is_empty()
             }
-            Cursor::MaterializedView(mv_cursor) => {
-                return_if_io!(state, mv_cursor.rewind());
-                !mv_cursor.is_valid()?
-            }
             Cursor::Delta(delta_cursor) => !return_if_io!(state, delta_cursor.rewind()),
-            _ => panic!("Rewind on non-btree/materialized-view cursor"),
+            _ => panic!("Rewind on non-btree cursor"),
         }
     };
     if is_empty {
@@ -2281,15 +2277,8 @@ fn op_column_fetch_other(
     dest: usize,
     default: &Option<Value>,
 ) -> InsnResult {
-    // First check if this is a MaterializedViewCursor
     {
         let cursor = state.get_cursor(cursor_id);
-        if let Cursor::MaterializedView(mv_cursor) = cursor {
-            // Handle materialized view column access
-            let value = return_if_io!(state, mv_cursor.column(column));
-            state.registers[dest].set_value(value);
-            return Ok(InsnFunctionStepResult::Step);
-        }
         if matches!(cursor, Cursor::NullRow) {
             tracing::trace!("op_column(null_row placeholder)");
             state.registers[dest].set_null();
@@ -3667,10 +3656,9 @@ pub fn op_next(
                 CursorStep::Error(err) => Err(err),
                 CursorStep::IO(io) => Ok(IOResult::IO(io)),
             },
-            Cursor::MaterializedView(mv_cursor) => mv_cursor.next(),
             Cursor::Delta(delta_cursor) => delta_cursor.next().map_err(Into::into),
             Cursor::IndexMethod(_) => cursor.as_index_method_mut().query_next(),
-            _ => panic!("Next on non-btree/materialized-view cursor"),
+            _ => panic!("Next on non-btree cursor"),
         }
     }
 }
@@ -6262,15 +6250,13 @@ fn op_row_id_read(state: &mut ProgramState, cursor_id: usize, dest: usize) -> In
                 let rowid = virtual_cursor.rowid();
                 Ok(IOResult::Done((rowid != 0).then_some(rowid)))
             }
-            Some(Cursor::MaterializedView(mv_cursor)) => mv_cursor.rowid(),
             Some(Cursor::Delta(delta_cursor)) => Ok(IOResult::Done(Some(delta_cursor.rowid()))),
             Some(Cursor::IndexMethod(cursor)) => cursor.query_rowid(),
             Some(Cursor::Pseudo(_)) => Ok(IOResult::Done(None)),
             _ => {
                 mark_unlikely();
                 Err(LimboError::InternalError(
-                    "RowId: cursor is not a table, virtual, or materialized view cursor"
-                        .to_string(),
+                    "RowId: cursor is not a table or virtual table cursor".to_string(),
                 )
                 .into())
             }
@@ -6328,32 +6314,7 @@ pub fn op_seek_rowid(
     let (pc, did_seek) = {
         let cursor = get_cursor!(state, *cursor_id);
 
-        // Handle MaterializedView cursor
         let (pc, did_seek) = match cursor {
-            Cursor::MaterializedView(mv_cursor) => {
-                let rowid = match state.registers[*src_reg].get_value() {
-                    Value::Numeric(Numeric::Integer(rowid)) => Some(*rowid),
-                    Value::Null => None,
-                    _ => None,
-                };
-
-                match rowid {
-                    Some(rowid) => {
-                        let seek_result = return_if_io!(
-                            state,
-                            mv_cursor
-                                .seek(SeekKey::TableRowId(rowid), SeekOp::GE { eq_only: true })
-                        );
-                        let pc = if !matches!(seek_result, SeekResult::Found) {
-                            target_pc.as_offset_int()
-                        } else {
-                            state.pc + 1
-                        };
-                        (pc, true)
-                    }
-                    None => (target_pc.as_offset_int(), false),
-                }
-            }
             Cursor::BTree(..) | Cursor::Dyn(..) => {
                 let btree_cursor = cursor.as_btree_mut();
                 let rowid = match state.registers[*src_reg].get_value() {
@@ -6392,7 +6353,7 @@ pub fn op_seek_rowid(
                     None => (target_pc.as_offset_int(), false),
                 }
             }
-            _ => panic!("SeekRowid on non-btree/materialized-view cursor"),
+            _ => panic!("SeekRowid on non-btree cursor"),
         };
         (pc, did_seek)
     };
@@ -6471,13 +6432,10 @@ fn seek_deferred_row(
     table_cursor_id: usize,
     rowid: i64,
 ) -> IOResultOr<SeekResult> {
-    let key = SeekKey::TableRowId(rowid);
-    let op = SeekOp::GE { eq_only: true };
-    match state.get_cursor(table_cursor_id) {
-        // Materialized views should not use deferred seeks, but seek them correctly if one does.
-        Cursor::MaterializedView(mv_cursor) => mv_cursor.seek(key, op),
-        table_cursor => table_cursor.as_btree_mut().seek(key, op),
-    }
+    state
+        .get_cursor(table_cursor_id)
+        .as_btree_mut()
+        .seek(SeekKey::TableRowId(rowid), SeekOp::GE { eq_only: true })
 }
 
 fn count_deferred_seek(state: &mut ProgramState) {
