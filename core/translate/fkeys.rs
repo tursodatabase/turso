@@ -1743,6 +1743,7 @@ fn emit_fk_action_subprogram(
             QueryMode::Normal,
             program.capture_data_changes_info().clone(),
             FK_SUBPROGRAM_OPTS,
+            program.is_mvcc_enabled(),
         );
         let entry = compile_stack.push(foreign_key, parent_change);
         subprogram_builder.prologue();
@@ -1783,7 +1784,7 @@ fn emit_fk_action_subprogram(
 /// Build a QualifiedName with db_name set for non-main databases.
 fn qualified_table_name(table_name: &str, db_name: Option<&str>) -> QualifiedName {
     QualifiedName {
-        db_name: db_name.map(Name::from_string),
+        namespace: db_name.map(Name::from_string),
         name: Name::from_string(table_name),
         alias: None,
     }

@@ -18,7 +18,7 @@ use crate::schema::{
 };
 use crate::state_machine::StateMachine;
 use crate::storage::btree::{
-    integrity_check, CursorStep, CursorTrait, IntegrityCheckError, IntegrityCheckState,
+    integrity_check, CursorStep, CursorTrait, IntegrityCheckError, IntegrityCheckState, KeptRead,
     PageCategory,
 };
 use crate::storage::database::DatabaseFile;
@@ -55,8 +55,8 @@ use crate::vdbe::vacuum::VacuumInPlaceOpContext;
 use crate::vdbe::value::ComparisonOp;
 use crate::vdbe::ValueIteratorExt;
 use crate::vdbe::{
-    registers_to_ref_values, DeferredSeekState, EndStatement, OpHashBuildState, OpHashProbeState,
-    StepResult, TxnCleanup, VacuumOpState,
+    decode_serial_type_into_register, registers_to_ref_values, DeferredSeekState, EndStatement,
+    OpHashBuildState, OpHashProbeState, StepResult, TxnCleanup, VacuumOpState,
 };
 use crate::vector::{
     vector1bit, vector32, vector32_sparse, vector64, vector8, vector_concat, vector_distance_cos,
@@ -1486,16 +1486,16 @@ pub fn op_open_read(
 
             // The cursor observes the transaction-wide change-log generation
             // for read-your-own-writes.
-            let mv_cursor = crate::incremental::cursor::MaterializedViewCursor::new(
+            let view_cursor = crate::incremental::cursor::MaterializedViewCursor::new(
                 cursor.into_dyn(),
                 pager,
                 program.connection.clone(),
-            )?;
+            );
 
             cursors
                 .get_mut(*cursor_id)
                 .expect("cursor_id should be valid")
-                .replace(Cursor::new_materialized_view(mv_cursor));
+                .replace(Cursor::new_btree_dyn(Box::new(view_cursor)));
         }
         CursorType::BTreeTable(table) => {
             // Regular table
@@ -1963,12 +1963,8 @@ pub fn op_rewind(
                 return_if_io!(state, btree_cursor.rewind());
                 btree_cursor.is_empty()
             }
-            Cursor::MaterializedView(mv_cursor) => {
-                return_if_io!(state, mv_cursor.rewind());
-                !mv_cursor.is_valid()?
-            }
             Cursor::Delta(delta_cursor) => !return_if_io!(state, delta_cursor.rewind()),
-            _ => panic!("Rewind on non-btree/materialized-view cursor"),
+            _ => panic!("Rewind on non-btree cursor"),
         }
     };
     if is_empty {
@@ -2211,12 +2207,21 @@ fn op_column_fetch(
         }
         _ => return op_column_fetch_other(program, state, cursor_id, column, dest, default),
     };
-    let Some(payload) = return_if_io!(state, cursor.record_payload()) else {
+    let Some((payload, payload_size)) = return_if_io!(state, cursor.payload_fetch()) else {
         // A null-row cursor, or one that is not positioned on a valid row
         // (e.g., empty table). Return NULL, not the column's default value.
         state.registers[dest].set_null();
         return Ok(InsnFunctionStepResult::Step);
     };
+    if payload.len() != payload_size {
+        return op_column_fetch_overflowing(
+            state,
+            cursor_id,
+            column,
+            dest,
+            std::slice::from_ref(default),
+        );
+    }
     match ValueIterator::new(payload)?.nth_into_register(column, &mut state.registers[dest]) {
         Some(result) => result?,
         None => {
@@ -2281,15 +2286,8 @@ fn op_column_fetch_other(
     dest: usize,
     default: &Option<Value>,
 ) -> InsnResult {
-    // First check if this is a MaterializedViewCursor
     {
         let cursor = state.get_cursor(cursor_id);
-        if let Cursor::MaterializedView(mv_cursor) = cursor {
-            // Handle materialized view column access
-            let value = return_if_io!(state, mv_cursor.column(column));
-            state.registers[dest].set_value(value);
-            return Ok(InsnFunctionStepResult::Step);
-        }
         if matches!(cursor, Cursor::NullRow) {
             tracing::trace!("op_column(null_row placeholder)");
             state.registers[dest].set_null();
@@ -2433,12 +2431,15 @@ fn op_column_range_fetch(
             defaults,
         );
     };
-    let Some(payload) = return_if_io!(state, cursor.record_payload()) else {
+    let Some((payload, payload_size)) = return_if_io!(state, cursor.payload_fetch()) else {
         for reg in &mut state.registers[dest..dest + count] {
             reg.set_null();
         }
         return Ok(InsnFunctionStepResult::Step);
     };
+    if payload.len() != payload_size {
+        return op_column_fetch_overflowing(state, cursor_id, start_column, dest, defaults);
+    }
     let filled = ValueIterator::new(payload)?
         .decode_into_registers_after(start_column, &mut state.registers[dest..dest + count])?;
     if filled < count {
@@ -2450,6 +2451,71 @@ fn op_column_range_fetch(
         {
             apply_column_default(default, reg)?;
         }
+    }
+    Ok(InsnFunctionStepResult::Step)
+}
+
+/// Column and ColumnRange for a record that spills into overflow pages: reads
+/// columns `start_column..` into the registers from `dest`, one per default,
+/// following SQLite's OP_Column (vdbe.c). Values on the b-tree page are
+/// decoded in place, and a value that reaches into overflow pages is read on
+/// its own, without the rest of the record. Kept out of line, as SQLite keeps
+/// vdbeColumnFromOverflow out of OP_Column, so the common case of a record on
+/// the page stays fast.
+#[cold]
+#[inline(never)]
+fn op_column_fetch_overflowing(
+    state: &mut ProgramState,
+    cursor_id: usize,
+    start_column: usize,
+    dest: usize,
+    defaults: &[Option<Value>],
+) -> InsnResult {
+    let Some(Cursor::BTree(cursor, ..)) = state.cursors[cursor_id].as_mut() else {
+        unreachable!("the caller read the record through a b-tree cursor");
+    };
+    let (mut columns, on_page) = return_if_io!(state, cursor.record_columns());
+    // (register index, offset in the record, serial type) of each value
+    // that does not end on the page.
+    let mut values_in_overflow: SmallVec<[(usize, usize, u64); 4]> = SmallVec::new();
+    let mut values_end = 0;
+    // Step over the columns before the requested ones one at a time, so a
+    // corrupt header there is reported instead of skipped.
+    for _ in 0..start_column {
+        if columns.next().transpose()?.is_none() {
+            break;
+        }
+    }
+    let regs = &mut state.registers[dest..dest + defaults.len()];
+    for (i, (reg, default)) in regs.iter_mut().zip(defaults).enumerate() {
+        match columns.next().transpose()? {
+            // The record has fewer columns, as rows written before an ADD COLUMN do.
+            None => apply_column_default(default, reg)?,
+            Some((offset, len, serial_type)) if offset + len <= on_page.len() => {
+                decode_serial_type_into_register(serial_type, &mut &on_page[offset..], reg)?;
+            }
+            Some((offset, len, serial_type)) => {
+                values_in_overflow.push((i, offset, serial_type));
+                values_end = offset + len;
+            }
+        }
+    }
+    // The columns are consecutive, so the values that do not end on the page
+    // are one run of bytes. Read just that run, as SQLite's
+    // vdbeColumnFromOverflow reads just the bytes of the value.
+    let Some(&(_, values_start, _)) = values_in_overflow.first() else {
+        return Ok(InsnFunctionStepResult::Step);
+    };
+    let bytes = return_if_io!(
+        state,
+        cursor.read_payload(KeptRead::Values, values_start, values_end - values_start)
+    );
+    for (i, offset, serial_type) in values_in_overflow {
+        decode_serial_type_into_register(
+            serial_type,
+            &mut &bytes[offset - values_start..],
+            &mut state.registers[dest + i],
+        )?;
     }
     Ok(InsnFunctionStepResult::Step)
 }
@@ -3667,10 +3733,9 @@ pub fn op_next(
                 CursorStep::Error(err) => Err(err),
                 CursorStep::IO(io) => Ok(IOResult::IO(io)),
             },
-            Cursor::MaterializedView(mv_cursor) => mv_cursor.next(),
             Cursor::Delta(delta_cursor) => delta_cursor.next().map_err(Into::into),
             Cursor::IndexMethod(_) => cursor.as_index_method_mut().query_next(),
-            _ => panic!("Next on non-btree/materialized-view cursor"),
+            _ => panic!("Next on non-btree cursor"),
         }
     }
 }
@@ -6262,15 +6327,13 @@ fn op_row_id_read(state: &mut ProgramState, cursor_id: usize, dest: usize) -> In
                 let rowid = virtual_cursor.rowid();
                 Ok(IOResult::Done((rowid != 0).then_some(rowid)))
             }
-            Some(Cursor::MaterializedView(mv_cursor)) => mv_cursor.rowid(),
             Some(Cursor::Delta(delta_cursor)) => Ok(IOResult::Done(Some(delta_cursor.rowid()))),
             Some(Cursor::IndexMethod(cursor)) => cursor.query_rowid(),
             Some(Cursor::Pseudo(_)) => Ok(IOResult::Done(None)),
             _ => {
                 mark_unlikely();
                 Err(LimboError::InternalError(
-                    "RowId: cursor is not a table, virtual, or materialized view cursor"
-                        .to_string(),
+                    "RowId: cursor is not a table or virtual table cursor".to_string(),
                 )
                 .into())
             }
@@ -6328,32 +6391,7 @@ pub fn op_seek_rowid(
     let (pc, did_seek) = {
         let cursor = get_cursor!(state, *cursor_id);
 
-        // Handle MaterializedView cursor
         let (pc, did_seek) = match cursor {
-            Cursor::MaterializedView(mv_cursor) => {
-                let rowid = match state.registers[*src_reg].get_value() {
-                    Value::Numeric(Numeric::Integer(rowid)) => Some(*rowid),
-                    Value::Null => None,
-                    _ => None,
-                };
-
-                match rowid {
-                    Some(rowid) => {
-                        let seek_result = return_if_io!(
-                            state,
-                            mv_cursor
-                                .seek(SeekKey::TableRowId(rowid), SeekOp::GE { eq_only: true })
-                        );
-                        let pc = if !matches!(seek_result, SeekResult::Found) {
-                            target_pc.as_offset_int()
-                        } else {
-                            state.pc + 1
-                        };
-                        (pc, true)
-                    }
-                    None => (target_pc.as_offset_int(), false),
-                }
-            }
             Cursor::BTree(..) | Cursor::Dyn(..) => {
                 let btree_cursor = cursor.as_btree_mut();
                 let rowid = match state.registers[*src_reg].get_value() {
@@ -6392,7 +6430,7 @@ pub fn op_seek_rowid(
                     None => (target_pc.as_offset_int(), false),
                 }
             }
-            _ => panic!("SeekRowid on non-btree/materialized-view cursor"),
+            _ => panic!("SeekRowid on non-btree cursor"),
         };
         (pc, did_seek)
     };
@@ -6471,13 +6509,10 @@ fn seek_deferred_row(
     table_cursor_id: usize,
     rowid: i64,
 ) -> IOResultOr<SeekResult> {
-    let key = SeekKey::TableRowId(rowid);
-    let op = SeekOp::GE { eq_only: true };
-    match state.get_cursor(table_cursor_id) {
-        // Materialized views should not use deferred seeks, but seek them correctly if one does.
-        Cursor::MaterializedView(mv_cursor) => mv_cursor.seek(key, op),
-        table_cursor => table_cursor.as_btree_mut().seek(key, op),
-    }
+    state
+        .get_cursor(table_cursor_id)
+        .as_btree_mut()
+        .seek(SeekKey::TableRowId(rowid), SeekOp::GE { eq_only: true })
 }
 
 fn count_deferred_seek(state: &mut ProgramState) {
@@ -11957,7 +11992,7 @@ pub fn op_function(
                                     // Rebuild with new table identifier so SQL persists the new name.
                                     let new_stmt = ast::Stmt::CreateTable {
                                         tbl_name: ast::QualifiedName {
-                                            db_name: None,
+                                            namespace: None,
                                             name: ast::Name::exact(original_rename_to.to_string()),
                                             alias: None,
                                         },
@@ -12011,7 +12046,7 @@ pub fn op_function(
                                     let new_stmt =
                                         ast::Stmt::CreateVirtualTable(ast::CreateVirtualTable {
                                             tbl_name: ast::QualifiedName {
-                                                db_name: tbl_name.db_name,
+                                                namespace: tbl_name.namespace,
                                                 name: ast::Name::exact(
                                                     original_rename_to.to_string(),
                                                 ),
@@ -12040,7 +12075,7 @@ pub fn op_function(
                                 // Rewrite ON table name if it matches the renamed table
                                 let new_trigger_tbl_name = if trigger_tbl == rename_from {
                                     ast::QualifiedName {
-                                        db_name: trigger_tbl_name.db_name,
+                                        namespace: trigger_tbl_name.namespace,
                                         name: ast::Name::exact(original_rename_to.to_string()),
                                         alias: None,
                                     }
@@ -12454,7 +12489,7 @@ pub fn op_function(
     Ok(InsnFunctionStepResult::Step)
 }
 
-pub(crate) type OpAttachState = crate::connection::AttachDatabaseState;
+pub(crate) type OpAttachState = crate::dialect::sqlite::attach::AttachDatabaseState;
 
 /// LIKE with an operand that is not TEXT: both are converted to TEXT first.
 #[inline(never)]
@@ -14283,7 +14318,7 @@ pub fn op_open_write(
                 )
                 .into());
             };
-            upgrade_mv_tx_to_exclusive(program, &pager, mv_store, tx_id)?;
+            upgrade_mv_tx_to_exclusive(program, &pager, mv_store, *db, tx_id)?;
         }
     }
 
@@ -15797,10 +15832,8 @@ fn op_parse_schema_step(state: &mut ProgramState, conn: &Arc<Connection>) -> Ins
                 let schema = Schema::try_make_mut(&mut inner.schema_arc)?;
                 let syms = conn.syms.read();
                 let attached_resolver = |alias: &str| -> Option<usize> {
-                    conn.attached_databases()
-                        .read()
-                        .get_database_by_name(&crate::util::normalize_ident(alias))
-                        .map(|(idx, _)| idx)
+                    conn.namespaces()
+                        .database_id(&crate::util::normalize_ident(alias))
                 };
                 schema.handle_schema_row(
                     ty,
@@ -16326,7 +16359,7 @@ pub fn op_set_cookie(
         };
         // Header cookies are global metadata with no row-level conflict keys; they need
         // SQLite-style single-writer semantics (same policy as DDL in MVCC).
-        upgrade_mv_tx_to_exclusive(program, &pager, mv_store, tx_id)?;
+        upgrade_mv_tx_to_exclusive(program, &pager, mv_store, *db, tx_id)?;
     }
 
     match with_header_mut(&pager, mv_store.as_ref(), program, *db, |header| {
@@ -16409,12 +16442,15 @@ fn upgrade_mv_tx_to_exclusive(
     program: &Program,
     pager: &Arc<Pager>,
     mv_store: &MvStore,
+    db: usize,
     tx_id: TxID,
 ) -> Result<()> {
-    if mv_store.is_exclusive_tx(&tx_id) {
-        return Ok(());
+    if !mv_store.is_exclusive_tx(&tx_id) {
+        mv_store.begin_exclusive_tx(pager.clone(), Some(tx_id), &program.connection, None)?;
     }
-    mv_store.begin_exclusive_tx(pager.clone(), Some(tx_id), &program.connection, None)?;
+    program
+        .connection
+        .set_mv_tx_for_db(db, Some((tx_id, TransactionMode::Write)));
     Ok(())
 }
 
@@ -17368,12 +17404,12 @@ fn regenerate_trigger_sql(trigger: &crate::schema::Trigger) -> String {
     use crate::translate::trigger::create_trigger_to_sql;
 
     let trigger_name = QualifiedName {
-        db_name: None,
+        namespace: None,
         name: Name::from_string(&trigger.name),
         alias: None,
     };
     let tbl_name = QualifiedName {
-        db_name: None,
+        namespace: None,
         name: Name::from_string(&trigger.table_name),
         alias: None,
     };

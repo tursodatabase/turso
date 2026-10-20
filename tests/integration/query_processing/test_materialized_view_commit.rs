@@ -726,6 +726,419 @@ fn insert_from_pragma_function_reaches_view_before_savepoint_rollback(
     Ok(())
 }
 
+/// Write statements that fail partway, conflict clauses, savepoints, trigger
+/// RAISE and foreign keys each roll back some writes and keep others. After
+/// every statement, every materialized view must equal a fresh run of its
+/// defining query, in the same session and after reopening the database.
+/// Cases collected from #10176, which fixed these paths in the engine that
+/// #10129 replaced.
+#[test]
+fn failed_writes_keep_materialized_views_equal_to_their_queries() {
+    for case in failed_write_cases() {
+        let db = TempDatabase::builder().with_views(true).build();
+        let conn = db.connect_limbo();
+        for sql in FAILED_WRITE_SETUP {
+            conn.execute(sql)
+                .unwrap_or_else(|e| panic!("{}: setup {sql}: {e}", case.name));
+        }
+        for step in case.steps {
+            let result = conn.execute(step.sql);
+            assert_eq!(
+                result.is_err(),
+                step.fails,
+                "{}: {} returned {result:?}",
+                case.name,
+                step.sql
+            );
+            assert_views_equal_their_queries(&conn, &format!("{}: after {}", case.name, step.sql));
+        }
+        assert_eq!(
+            limbo_exec_rows(&conn, "SELECT id, a, b FROM t ORDER BY id"),
+            expected_t_rows(case.expected_t),
+            "{}: base table",
+            case.name
+        );
+        drop(conn);
+
+        let reopened = TempDatabase::builder()
+            .with_db_path(&db.path)
+            .with_views(true)
+            .build();
+        let conn = reopened.connect_limbo();
+        assert_views_equal_their_queries(&conn, &format!("{}: after reopen", case.name));
+        assert_eq!(run_integrity_check(&conn), "ok", "{}", case.name);
+    }
+}
+
+const FAILED_WRITE_SETUP: &[&str] = &[
+    "CREATE TABLE t(id INTEGER PRIMARY KEY, a TEXT UNIQUE, b INT CHECK(b >= 0))",
+    "CREATE TABLE u(k INTEGER PRIMARY KEY, n INT UNIQUE)",
+    "INSERT INTO t VALUES (1, 'x', 1)",
+    "INSERT INTO u VALUES (1, 10)",
+    "CREATE MATERIALIZED VIEW v AS SELECT id, a, b FROM t",
+    "CREATE MATERIALIZED VIEW v_filter AS SELECT id, a FROM t WHERE b > 1",
+    "CREATE MATERIALIZED VIEW v_group AS SELECT b % 2 AS parity, count(*) AS n, sum(b) AS s FROM t GROUP BY parity",
+    "CREATE MATERIALIZED VIEW v_join AS SELECT t.id, u.n FROM t JOIN u ON t.id = u.k",
+    "CREATE MATERIALIZED VIEW v_on_view AS SELECT id, a FROM v WHERE b > 1",
+];
+
+struct FailedWriteCase {
+    name: &'static str,
+    steps: Vec<Step>,
+    expected_t: &'static [(i64, &'static str, i64)],
+}
+
+struct Step {
+    sql: &'static str,
+    fails: bool,
+}
+
+const fn ok(sql: &'static str) -> Step {
+    Step { sql, fails: false }
+}
+
+const fn fails(sql: &'static str) -> Step {
+    Step { sql, fails: true }
+}
+
+fn failed_write_cases() -> Vec<FailedWriteCase> {
+    vec![
+        FailedWriteCase {
+            name: "multi-row insert fails in autocommit",
+            steps: vec![
+                fails("INSERT INTO t VALUES (2, 'y', 2), (3, 'x', 3)"),
+                ok("INSERT INTO t VALUES (4, 'z', 4)"),
+            ],
+            expected_t: &[(1, "x", 1), (4, "z", 4)],
+        },
+        FailedWriteCase {
+            name: "multi-row update fails in a transaction",
+            steps: vec![
+                ok("BEGIN"),
+                ok("INSERT INTO t VALUES (3, 'w', 3)"),
+                fails("UPDATE t SET a = 'z'"),
+                ok("COMMIT"),
+            ],
+            expected_t: &[(1, "x", 1), (3, "w", 3)],
+        },
+        FailedWriteCase {
+            name: "explicit rollback after a failed statement",
+            steps: vec![
+                ok("BEGIN"),
+                ok("INSERT INTO t VALUES (2, 'y', 2)"),
+                fails("INSERT INTO t VALUES (3, 'z', 3), (4, 'y', 4)"),
+                ok("ROLLBACK"),
+            ],
+            expected_t: &[(1, "x", 1)],
+        },
+        FailedWriteCase {
+            name: "insert or rollback discards the whole transaction",
+            steps: vec![
+                ok("BEGIN"),
+                ok("INSERT INTO t VALUES (2, 'y', 2)"),
+                fails("INSERT OR ROLLBACK INTO t VALUES (3, 'q', 3), (4, 'x', 4)"),
+                ok("INSERT INTO t VALUES (5, 'z', 5)"),
+            ],
+            expected_t: &[(1, "x", 1), (5, "z", 5)],
+        },
+        FailedWriteCase {
+            name: "update or rollback in autocommit",
+            steps: vec![
+                ok("INSERT INTO t VALUES (2, 'y', 2)"),
+                fails("UPDATE OR ROLLBACK t SET a = 'same'"),
+            ],
+            expected_t: &[(1, "x", 1), (2, "y", 2)],
+        },
+        FailedWriteCase {
+            name: "insert or fail keeps earlier rows in autocommit",
+            steps: vec![fails("INSERT OR FAIL INTO t VALUES (2, 'y', 2), (3, 'x', 3)")],
+            expected_t: &[(1, "x", 1), (2, "y", 2)],
+        },
+        FailedWriteCase {
+            name: "insert or fail then rollback",
+            steps: vec![
+                ok("BEGIN"),
+                fails("INSERT OR FAIL INTO t VALUES (2, 'y', 2), (3, 'x', 3)"),
+                ok("ROLLBACK"),
+            ],
+            expected_t: &[(1, "x", 1)],
+        },
+        FailedWriteCase {
+            name: "update or fail keeps earlier rows",
+            steps: vec![
+                ok("INSERT INTO t VALUES (2, 'y', 2), (3, 'z', 3)"),
+                fails("UPDATE OR FAIL t SET a = 'q' WHERE id >= 2"),
+            ],
+            expected_t: &[(1, "x", 1), (2, "q", 2), (3, "z", 3)],
+        },
+        FailedWriteCase {
+            name: "insert or replace undone by a check failure",
+            steps: vec![
+                ok("BEGIN"),
+                fails("INSERT OR REPLACE INTO t VALUES (6, 'x', 6), (7, 'w', -1)"),
+                ok("COMMIT"),
+            ],
+            expected_t: &[(1, "x", 1)],
+        },
+        FailedWriteCase {
+            name: "upsert fails on another unique column",
+            steps: vec![
+                ok("BEGIN"),
+                ok("INSERT INTO t VALUES (2, 'y', 2)"),
+                fails(
+                    "INSERT INTO t VALUES (1, 'k', 9), (8, 'y', 8) \
+                     ON CONFLICT(id) DO UPDATE SET b = excluded.b",
+                ),
+                ok("COMMIT"),
+            ],
+            expected_t: &[(1, "x", 1), (2, "y", 2)],
+        },
+        FailedWriteCase {
+            name: "insert or ignore then a failed insert",
+            steps: vec![
+                ok("BEGIN"),
+                ok("INSERT OR IGNORE INTO t VALUES (2, 'x', 2), (3, 'z', 3)"),
+                fails("INSERT INTO t VALUES (4, 'q', 4), (5, 'z', 5)"),
+                ok("COMMIT"),
+            ],
+            expected_t: &[(1, "x", 1), (3, "z", 3)],
+        },
+        FailedWriteCase {
+            name: "check failure in a multi-row update",
+            steps: vec![
+                ok("INSERT INTO t VALUES (2, 'y', 2)"),
+                fails("UPDATE t SET b = b - 2"),
+            ],
+            expected_t: &[(1, "x", 1), (2, "y", 2)],
+        },
+        FailedWriteCase {
+            name: "rollback to a savepoint inside a transaction",
+            steps: vec![
+                ok("BEGIN"),
+                ok("INSERT INTO t VALUES (2, 'y', 2)"),
+                ok("SAVEPOINT s1"),
+                ok("INSERT INTO t VALUES (3, 'z', 3)"),
+                ok("ROLLBACK TO s1"),
+                ok("COMMIT"),
+            ],
+            expected_t: &[(1, "x", 1), (2, "y", 2)],
+        },
+        FailedWriteCase {
+            name: "rollback to the outermost savepoint",
+            steps: vec![
+                ok("SAVEPOINT s1"),
+                ok("INSERT INTO t VALUES (2, 'y', 2)"),
+                ok("ROLLBACK TO s1"),
+                ok("RELEASE s1"),
+            ],
+            expected_t: &[(1, "x", 1)],
+        },
+        FailedWriteCase {
+            name: "rollback to an outer savepoint after releasing an inner one",
+            steps: vec![
+                ok("BEGIN"),
+                ok("SAVEPOINT a"),
+                ok("INSERT INTO t VALUES (2, 'y', 2)"),
+                ok("SAVEPOINT b"),
+                ok("INSERT INTO t VALUES (3, 'z', 3)"),
+                ok("RELEASE b"),
+                ok("INSERT INTO t VALUES (4, 'w', 4)"),
+                ok("ROLLBACK TO a"),
+                ok("INSERT INTO t VALUES (5, 'v', 5)"),
+                ok("COMMIT"),
+            ],
+            expected_t: &[(1, "x", 1), (5, "v", 5)],
+        },
+        FailedWriteCase {
+            name: "failed statement inside a savepoint",
+            steps: vec![
+                ok("BEGIN"),
+                ok("SAVEPOINT a"),
+                ok("INSERT INTO t VALUES (2, 'y', 2)"),
+                fails("INSERT INTO t VALUES (3, 'q', 3), (4, 'y', 4)"),
+                ok("RELEASE a"),
+                ok("COMMIT"),
+            ],
+            expected_t: &[(1, "x", 1), (2, "y", 2)],
+        },
+        FailedWriteCase {
+            name: "trigger raise abort on the second row",
+            steps: vec![
+                ok("CREATE TRIGGER tr AFTER INSERT ON t WHEN new.b = 99 BEGIN SELECT RAISE(ABORT, 'no'); END"),
+                ok("BEGIN"),
+                fails("INSERT INTO t VALUES (2, 'y', 2), (3, 'z', 99)"),
+                ok("COMMIT"),
+            ],
+            expected_t: &[(1, "x", 1)],
+        },
+        FailedWriteCase {
+            name: "trigger raise rollback ends the transaction",
+            steps: vec![
+                ok("CREATE TRIGGER tr AFTER INSERT ON t WHEN new.b = 99 BEGIN SELECT RAISE(ROLLBACK, 'no'); END"),
+                ok("BEGIN"),
+                ok("INSERT INTO t VALUES (2, 'y', 2)"),
+                fails("INSERT INTO t VALUES (3, 'z', 99)"),
+                ok("INSERT INTO t VALUES (4, 'w', 4)"),
+            ],
+            expected_t: &[(1, "x", 1), (4, "w", 4)],
+        },
+        FailedWriteCase {
+            name: "trigger raise fail keeps earlier rows",
+            steps: vec![
+                ok("CREATE TRIGGER tr AFTER INSERT ON t WHEN new.b = 99 BEGIN SELECT RAISE(FAIL, 'no'); END"),
+                fails("INSERT INTO t VALUES (2, 'y', 2), (3, 'z', 99)"),
+            ],
+            expected_t: &[(1, "x", 1), (2, "y", 2), (3, "z", 99)],
+        },
+        FailedWriteCase {
+            name: "delete fails on its second row",
+            steps: vec![
+                ok("INSERT INTO t VALUES (2, 'y', 2), (3, 'z', 3)"),
+                ok("CREATE TRIGGER tr BEFORE DELETE ON t WHEN old.id = 3 BEGIN SELECT RAISE(ABORT, 'no'); END"),
+                ok("BEGIN"),
+                fails("DELETE FROM t WHERE id IN (2, 3)"),
+                ok("COMMIT"),
+            ],
+            expected_t: &[(1, "x", 1), (2, "y", 2), (3, "z", 3)],
+        },
+        FailedWriteCase {
+            name: "trigger write into another viewed table fails",
+            steps: vec![
+                ok("CREATE TABLE w(k INTEGER PRIMARY KEY, n INT NOT NULL)"),
+                ok("CREATE MATERIALIZED VIEW v_w AS SELECT k, n FROM w"),
+                ok("CREATE TRIGGER tr AFTER INSERT ON t BEGIN INSERT INTO w VALUES (new.id, new.b); END"),
+                ok("BEGIN"),
+                fails("INSERT INTO t VALUES (2, 'y', 2), (3, 'z', NULL)"),
+                ok("COMMIT"),
+                fails("INSERT INTO t VALUES (4, 'w', 4), (5, 'v', NULL)"),
+            ],
+            expected_t: &[(1, "x", 1)],
+        },
+        FailedWriteCase {
+            name: "first change for a view comes from a failing statement",
+            steps: vec![
+                ok("CREATE TABLE w(k INTEGER PRIMARY KEY, n INT UNIQUE)"),
+                ok("CREATE MATERIALIZED VIEW v_w AS SELECT k, n FROM w"),
+                ok("BEGIN"),
+                ok("INSERT INTO t VALUES (2, 'y', 2)"),
+                fails("INSERT INTO w VALUES (1, 1), (2, 1)"),
+                ok("INSERT INTO w VALUES (3, 3)"),
+                ok("COMMIT"),
+            ],
+            expected_t: &[(1, "x", 1), (2, "y", 2)],
+        },
+        FailedWriteCase {
+            name: "failed writes on both sides of a join",
+            steps: vec![
+                ok("BEGIN"),
+                ok("INSERT INTO u VALUES (2, 20)"),
+                fails("INSERT INTO t VALUES (2, 'y', 2), (3, 'x', 3)"),
+                fails("INSERT INTO u VALUES (3, 30), (4, 10)"),
+                ok("INSERT INTO t VALUES (2, 'y', 2)"),
+                ok("COMMIT"),
+            ],
+            expected_t: &[(1, "x", 1), (2, "y", 2)],
+        },
+        FailedWriteCase {
+            name: "insert select fails partway",
+            steps: vec![
+                ok("CREATE TABLE src(id, a, b)"),
+                ok("INSERT INTO src VALUES (2, 'y', 2), (3, 'z', 3), (4, 'x', 4)"),
+                ok("BEGIN"),
+                fails("INSERT INTO t SELECT * FROM src"),
+                ok("INSERT INTO t VALUES (10, 'ten', 10)"),
+                ok("COMMIT"),
+            ],
+            expected_t: &[(1, "x", 1), (10, "ten", 10)],
+        },
+        FailedWriteCase {
+            name: "view read between a write and a failed write",
+            steps: vec![
+                ok("BEGIN"),
+                ok("INSERT INTO t VALUES (2, 'y', 2)"),
+                ok("SELECT * FROM v_group"),
+                fails("INSERT INTO t VALUES (3, 'z', 3), (4, 'y', 4)"),
+                ok("SELECT * FROM v_on_view"),
+                ok("COMMIT"),
+            ],
+            expected_t: &[(1, "x", 1), (2, "y", 2)],
+        },
+        FailedWriteCase {
+            name: "immediate foreign key failure",
+            steps: vec![
+                ok("PRAGMA foreign_keys = ON"),
+                ok("CREATE TABLE c(id INTEGER PRIMARY KEY, pid INT REFERENCES t(id))"),
+                ok("CREATE MATERIALIZED VIEW v_c AS SELECT id, pid FROM c"),
+                ok("BEGIN"),
+                fails("INSERT INTO c VALUES (1, 1), (2, 42)"),
+                ok("INSERT INTO c VALUES (3, 1)"),
+                ok("COMMIT"),
+            ],
+            expected_t: &[(1, "x", 1)],
+        },
+        FailedWriteCase {
+            name: "deferred foreign key failure at commit",
+            steps: vec![
+                ok("PRAGMA foreign_keys = ON"),
+                ok("CREATE TABLE c(id INTEGER PRIMARY KEY, pid INT REFERENCES t(id) DEFERRABLE INITIALLY DEFERRED)"),
+                ok("CREATE MATERIALIZED VIEW v_c AS SELECT id, pid FROM c"),
+                ok("BEGIN"),
+                ok("INSERT INTO c VALUES (1, 42)"),
+                fails("COMMIT"),
+                ok("INSERT INTO t VALUES (42, 'q', 0)"),
+                ok("COMMIT"),
+            ],
+            expected_t: &[(1, "x", 1), (42, "q", 0)],
+        },
+    ]
+}
+
+/// Compare every materialized view in the schema, as a multiset of typed
+/// rows, with a fresh run of the SELECT in its CREATE statement.
+fn assert_views_equal_their_queries(conn: &std::sync::Arc<turso_core::Connection>, context: &str) {
+    let views = limbo_exec_rows(
+        conn,
+        "SELECT name, sql FROM sqlite_schema WHERE type = 'view' AND rootpage <> 0",
+    );
+    assert!(!views.is_empty(), "{context}: no materialized views found");
+    for view in views {
+        let [rusqlite::types::Value::Text(name), rusqlite::types::Value::Text(sql)] =
+            view.as_slice()
+        else {
+            panic!("{context}: unexpected sqlite_schema row {view:?}");
+        };
+        let (_, definition) = sql
+            .split_once(" AS ")
+            .unwrap_or_else(|| panic!("{context}: no AS in {sql}"));
+        assert_eq!(
+            sorted_rows(conn, &format!("SELECT * FROM {name}")),
+            sorted_rows(conn, definition),
+            "{context}: view {name} differs from {definition}"
+        );
+    }
+}
+
+fn sorted_rows(conn: &std::sync::Arc<turso_core::Connection>, sql: &str) -> Vec<String> {
+    let mut rows: Vec<String> = limbo_exec_rows(conn, sql)
+        .iter()
+        .map(|row| format!("{row:?}"))
+        .collect();
+    rows.sort();
+    rows
+}
+
+fn expected_t_rows(rows: &[(i64, &str, i64)]) -> Vec<Vec<rusqlite::types::Value>> {
+    rows.iter()
+        .map(|&(id, a, b)| {
+            vec![
+                rusqlite::types::Value::Integer(id),
+                rusqlite::types::Value::Text(a.to_string()),
+                rusqlite::types::Value::Integer(b),
+            ]
+        })
+        .collect()
+}
+
 /// Run PRAGMA integrity_check and join every result row into one string
 /// ("ok" on a healthy database, or the newline-joined list of problems).
 fn run_integrity_check(conn: &std::sync::Arc<turso_core::Connection>) -> String {
@@ -797,5 +1210,31 @@ fn test_incompatible_materialized_view_storage_is_fully_tracked() -> anyhow::Res
     assert_eq!(agg, vec![(3, 60)]);
     assert_eq!(run_integrity_check(&conn), "ok");
 
+    Ok(())
+}
+
+/// The column list of `CREATE MATERIALIZED VIEW v(x, y)` names the view's
+/// columns after the database is reopened, both for reads and for a view
+/// built on top of it.
+#[turso_macros::test(views)]
+fn materialized_view_column_list_survives_reopen(tmp_db: TempDatabase) -> anyhow::Result<()> {
+    let conn = tmp_db.connect_limbo();
+    conn.execute("CREATE TABLE t(a INTEGER, b INTEGER)")?;
+    conn.execute("INSERT INTO t VALUES (1, 2)")?;
+    conn.execute("CREATE MATERIALIZED VIEW v(x, y) AS SELECT a, b FROM t")?;
+    conn.execute("CREATE MATERIALIZED VIEW w AS SELECT y FROM v WHERE x > 1")?;
+    drop(conn);
+
+    let reopened = TempDatabase::builder()
+        .with_db_path(&tmp_db.path)
+        .with_views(true)
+        .build();
+    let conn = reopened.connect_limbo();
+    conn.execute("INSERT INTO t VALUES (3, 4)")?;
+    let view: Vec<(i64, i64)> = conn.exec_rows("SELECT x, y FROM v ORDER BY x");
+    assert_eq!(view, vec![(1, 2), (3, 4)]);
+    let downstream: Vec<(i64,)> = conn.exec_rows("SELECT y FROM w");
+    assert_eq!(downstream, vec![(4,)]);
+    assert_eq!(run_integrity_check(&conn), "ok");
     Ok(())
 }

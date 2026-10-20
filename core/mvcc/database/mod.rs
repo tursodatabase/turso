@@ -9476,10 +9476,8 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
             };
             let attached_resolver = |alias: &str| -> Option<usize> {
                 connection
-                    .attached_databases()
-                    .read()
-                    .get_database_by_name(&crate::util::normalize_ident(alias))
-                    .map(|(idx, _)| idx)
+                    .namespaces()
+                    .database_id(&crate::util::normalize_ident(alias))
             };
             fresh.handle_schema_row(
                 ty,
@@ -10428,10 +10426,8 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
             };
             let attached_resolver = |alias: &str| -> Option<usize> {
                 connection
-                    .attached_databases()
-                    .read()
-                    .get_database_by_name(&crate::util::normalize_ident(alias))
-                    .map(|(idx, _)| idx)
+                    .namespaces()
+                    .database_id(&crate::util::normalize_ident(alias))
             };
             fresh.handle_schema_row(
                 ty,

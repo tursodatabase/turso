@@ -2426,3 +2426,24 @@ test selectC-2-1 {
 expect error {
     no such column: new.x
 }
+
+# Views only allow INSTEAD OF triggers.
+@skip-if mvcc "views not supported in MVCC mode"
+test create-after-trigger-on-view-rejected {
+    CREATE TABLE t(a);
+    CREATE VIEW v AS SELECT a FROM t;
+    CREATE TRIGGER tr AFTER INSERT ON v BEGIN SELECT 1; END;
+}
+expect error {
+    cannot create AFTER trigger on view: v
+}
+
+@skip-if mvcc "views not supported in MVCC mode"
+test create-before-trigger-on-view-rejected {
+    CREATE TABLE t(a);
+    CREATE VIEW v AS SELECT a FROM t;
+    CREATE TRIGGER tr DELETE ON main.v BEGIN SELECT 1; END;
+}
+expect error {
+    cannot create BEFORE trigger on view: v
+}

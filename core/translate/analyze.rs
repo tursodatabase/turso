@@ -39,7 +39,7 @@ fn resolve_analyze_targets(
             let normalized = normalize_ident(target.name.as_str());
 
             // If db_name is specified, resolve to that database
-            if let Some(db_name) = &target.db_name {
+            if let Some(db_name) = &target.namespace {
                 let database_id = resolver.resolve_database_id(target)?;
                 let db_normalized = normalize_ident(db_name.as_str());
 
@@ -59,7 +59,10 @@ fn resolve_analyze_targets(
             }
 
             // Check if it's an attached database name
-            if let Some((db_id, _)) = resolver.get_attached_database(&normalized) {
+            if let Some(db_id) = resolver
+                .namespace_database_id(&normalized)
+                .filter(|&db_id| db_id != crate::MAIN_DB_ID && db_id != crate::TEMP_DB_ID)
+            {
                 let targets = collect_all_tables_in_db(db_id, resolver);
                 return Ok((db_id, targets));
             }

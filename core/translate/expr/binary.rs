@@ -786,6 +786,9 @@ pub(super) fn emit_binary_insn(
 /// Check if an expression is known to produce an array value.
 pub(crate) fn expr_is_array(expr: &Expr, referenced_tables: Option<&TableReferences>) -> bool {
     match expr {
+        Expr::Cast { type_name, .. } => {
+            type_name.as_ref().is_some_and(|ty| ty.array_dimensions > 0)
+        }
         Expr::Column { table, column, .. } => {
             if let Some(tables) = referenced_tables {
                 tables

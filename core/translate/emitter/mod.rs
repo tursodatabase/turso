@@ -36,6 +36,7 @@ use crate::vdbe::{
     insn::{to_u32, InsertFlags, Insn},
     BranchOffset, CursorID,
 };
+use crate::NamespaceCatalog;
 use crate::{
     error::SQLITE_CONSTRAINT_CHECK,
     function::Func,
@@ -44,8 +45,7 @@ use crate::{
     util::{
         check_expr_references_column, exprs_are_equivalent, normalize_ident, parse_numeric_literal,
     },
-    CaptureDataChangesExt, Connection, Database, DatabaseCatalog, LimboError, Result, RwLock,
-    SymbolTable,
+    CaptureDataChangesExt, Connection, DatabaseCatalog, LimboError, Result, RwLock, SymbolTable,
 };
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 use std::borrow::Cow;
@@ -138,6 +138,7 @@ pub struct Resolver<'a> {
     database_schemas: &'a RwLock<HashMap<usize, Arc<Schema>>>,
     temp_database: &'a RwLock<Option<crate::connection::TempDatabase>>,
     attached_databases: &'a RwLock<DatabaseCatalog>,
+    namespaces: &'a dyn NamespaceCatalog,
     non_main_schema_cache: RefCell<HashMap<usize, Arc<Schema>>>,
     pub symbol_table: &'a SymbolTable,
     pub expr_to_reg_cache_enabled: bool,
@@ -283,15 +284,13 @@ impl DatabaseScopeContext {
 }
 
 impl<'a> Resolver<'a> {
-    const MAIN_DB: &'static str = "main";
-    const TEMP_DB: &'static str = "temp";
-
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         schema: &'a Schema,
         database_schemas: &'a RwLock<HashMap<usize, Arc<Schema>>>,
         temp_database: &'a RwLock<Option<crate::connection::TempDatabase>>,
         attached_databases: &'a RwLock<DatabaseCatalog>,
+        namespaces: &'a dyn NamespaceCatalog,
         symbol_table: &'a SymbolTable,
         enable_custom_types: bool,
         dqs_dml: DoubleQuotedDml,
@@ -304,6 +303,7 @@ impl<'a> Resolver<'a> {
             database_schemas,
             temp_database,
             attached_databases,
+            namespaces,
             non_main_schema_cache: RefCell::new(HashMap::default()),
             symbol_table,
             expr_to_reg_cache_enabled: false,
@@ -349,6 +349,7 @@ impl<'a> Resolver<'a> {
             database_schemas: self.database_schemas,
             temp_database: self.temp_database,
             attached_databases: self.attached_databases,
+            namespaces: self.namespaces,
             non_main_schema_cache: RefCell::new(HashMap::default()),
             symbol_table: self.symbol_table,
             expr_to_reg_cache_enabled: false,
@@ -376,6 +377,7 @@ impl<'a> Resolver<'a> {
             database_schemas: self.database_schemas,
             temp_database: self.temp_database,
             attached_databases: self.attached_databases,
+            namespaces: self.namespaces,
             non_main_schema_cache: RefCell::new(HashMap::default()),
             symbol_table: self.symbol_table,
             expr_to_reg_cache_enabled: self.expr_to_reg_cache_enabled,
@@ -457,6 +459,17 @@ impl<'a> Resolver<'a> {
         match column {
             Some(column) => table.columns().get(column)?.collation_opt(),
             None => table.get_rowid_alias_column()?.1.collation_opt(),
+        }
+    }
+
+    pub(crate) fn self_table_with_custom_type_operators(&self) -> Option<Arc<BTreeTable>> {
+        match &self.self_table_scope.borrow().as_ref()?.context {
+            SelfTableContext::ForDML {
+                table,
+                uses_custom_type_operators: true,
+                ..
+            } => Some(Arc::clone(table)),
+            _ => None,
         }
     }
 
@@ -784,28 +797,25 @@ impl<'a> Resolver<'a> {
             )));
         }
 
-        if self.with_schema(crate::MAIN_DB_ID, |schema| {
-            schema_contains_object(schema, object_name)
-        }) {
-            return Ok(crate::MAIN_DB_ID);
-        }
-
-        for database_id in self.attached_database_ids_in_search_order()? {
-            if self.with_schema(database_id, |schema| {
-                schema_contains_object(schema, object_name)
-            }) {
-                return Ok(database_id);
-            }
-        }
-
-        Ok(crate::MAIN_DB_ID)
+        Ok(self
+            .namespaces
+            .find_in_search_order(&mut |database_id| {
+                self.with_schema(database_id, |schema| {
+                    schema_contains_object(schema, object_name)
+                })
+            })
+            .unwrap_or(crate::MAIN_DB_ID))
     }
 
     fn resolve_search_path_database_id(&self, schema_name: &str) -> Option<usize> {
         if schema_name.eq_ignore_ascii_case("public") {
             return Some(crate::MAIN_DB_ID);
         }
-        self.get_attached_database(schema_name).map(|x| x.0)
+        self.namespaces
+            .database_id(schema_name)
+            .filter(|&database_id| {
+                database_id != crate::MAIN_DB_ID && database_id != crate::TEMP_DB_ID
+            })
     }
 
     fn schema_has_table_like_object(schema: &Schema, table_name: &str) -> bool {
@@ -846,22 +856,23 @@ impl<'a> Resolver<'a> {
         &self,
         qualified_name: &ast::QualifiedName,
     ) -> Result<usize> {
-        if qualified_name.db_name.is_some() {
+        if qualified_name.namespace.is_some() {
             return self.resolve_database_id(qualified_name);
         }
         self.resolve_existing_table_database_id(qualified_name.name.as_str())
     }
 
     pub(crate) fn resolve_existing_table_database_id(&self, table_name: &str) -> Result<usize> {
+        // A TEMP view or trigger carries a scope (so explicit `aux.table`
+        // references still see its own database below), but the scope does
+        // not restrict unqualified names: SQLite's schema fixer skips TEMP
+        // objects entirely (`bTemp` in sqlite3FixInit, attach.c:547, checked
+        // by fixSelectCb at attach.c:495), so a TEMP view resolves names the
+        // same way a top-level query does, sqlite_schema included.
         if let Some(ctx) = self.database_scope.borrow().as_ref() {
             if ctx.restricts_db_references() {
                 return Ok(ctx.database_id);
             }
-
-            return self.resolve_unqualified_existing_database_id(
-                table_name,
-                Self::schema_has_table_like_object,
-            );
         }
 
         if let Some(database_id) = Self::resolve_schema_table_database_id(table_name) {
@@ -878,7 +889,7 @@ impl<'a> Resolver<'a> {
         &self,
         qualified_name: &ast::QualifiedName,
     ) -> Result<usize> {
-        if qualified_name.db_name.is_some() {
+        if qualified_name.namespace.is_some() {
             return self.resolve_database_id(qualified_name);
         }
 
@@ -890,7 +901,7 @@ impl<'a> Resolver<'a> {
         &self,
         qualified_name: &ast::QualifiedName,
     ) -> Result<usize> {
-        if qualified_name.db_name.is_some() {
+        if qualified_name.namespace.is_some() {
             return self.resolve_database_id(qualified_name);
         }
 
@@ -901,24 +912,12 @@ impl<'a> Resolver<'a> {
     /// Resolve database ID from a qualified name
     pub(crate) fn resolve_database_id(&self, qualified_name: &ast::QualifiedName) -> Result<usize> {
         // Check if this is a qualified name (database.table) or unqualified
-        let resolved_id = if let Some(db_name) = &qualified_name.db_name {
+        let resolved_id = if let Some(db_name) = &qualified_name.namespace {
             let db_name_normalized = normalize_ident(db_name.as_str());
-            match db_name_normalized.as_str() {
-                "main" => Ok(crate::MAIN_DB_ID),
-                "temp" => Ok(crate::TEMP_DB_ID),
-                _ => {
-                    // Look up attached database
-                    if let Some((idx, _attached_db)) =
-                        self.get_attached_database(&db_name_normalized)
-                    {
-                        Ok(idx)
-                    } else {
-                        Err(LimboError::InvalidArgument(format!(
-                            "no such database: {db_name_normalized}"
-                        )))
-                    }
-                }
-            }
+            self.namespace_database_id(&db_name_normalized)
+                .ok_or_else(|| {
+                    LimboError::InvalidArgument(format!("no such database: {db_name_normalized}"))
+                })
         } else {
             // Unqualified table name — when compiling the body of a trigger
             // or a view, resolve to that object's own database (matching
@@ -944,7 +943,7 @@ impl<'a> Resolver<'a> {
             }
             if resolved_id != ctx.database_id {
                 let db_name = qualified_name
-                    .db_name
+                    .namespace
                     .as_ref()
                     .map(|n| n.as_str())
                     .unwrap_or("main");
@@ -958,19 +957,27 @@ impl<'a> Resolver<'a> {
         Ok(resolved_id)
     }
 
-    // Get an attached database by alias name
-    pub(crate) fn get_attached_database(&self, alias: &str) -> Option<(usize, Arc<Database>)> {
-        self.attached_databases.read().get_database_by_name(alias)
+    /// Resolve the database that CREATE puts an object named `qualified_name`
+    /// in.
+    pub(crate) fn resolve_database_id_for_create(
+        &self,
+        qualified_name: &ast::QualifiedName,
+    ) -> Result<usize> {
+        if qualified_name.namespace.is_some() {
+            return self.resolve_database_id(qualified_name);
+        }
+        self.namespaces.database_for_create()
+    }
+
+    /// The database that namespace `name` refers to. `name` is normalized.
+    pub(crate) fn namespace_database_id(&self, name: &str) -> Option<usize> {
+        self.namespaces.database_id(name)
     }
 
     /// Get the database name for a given database index.
     /// Returns "main" for index 0, "temp" for index 1, and the alias for attached databases.
     pub(crate) fn get_database_name_by_index(&self, index: usize) -> Option<String> {
-        match index {
-            crate::MAIN_DB_ID => Some(Self::MAIN_DB.to_string()),
-            crate::TEMP_DB_ID => Some(Self::TEMP_DB.to_string()),
-            _ => self.attached_databases.read().get_name_by_index(index),
-        }
+        self.namespaces.name(index)
     }
 }
 
@@ -1851,40 +1858,81 @@ pub fn emit_cdc_commit_insns(
     Ok(())
 }
 
-/// Emit a CDC COMMIT record at end-of-statement when in autocommit mode (v2 only).
-/// This should be called once per statement, after the main loop, not per-row.
+/// Emit the CDC COMMIT record at the end of a statement, once, when in autocommit mode (v2 only).
+/// Only the root statement writes it; a trigger or FK action subprogram never does.
 pub fn emit_cdc_autocommit_commit(
     program: &mut ProgramBuilder,
     resolver: &Resolver,
-    cdc_cursor_id: usize,
+    cdc_cursor_id: Option<usize>,
 ) -> Result<()> {
-    let cdc_info = program.capture_data_changes_info().as_ref();
-    if cdc_info.is_some_and(|info| info.cdc_version().has_commit_record()) {
-        // Check if we're in autocommit mode; if so, emit a COMMIT record.
-        let is_autocommit_fn_ctx = crate::function::FuncCtx {
-            func: Func::Scalar(crate::function::ScalarFunc::IsAutocommit),
-            arg_count: 0,
-        };
-        let autocommit_reg = program.alloc_register();
-        program.emit_insn(Insn::Function {
-            constant_mask: 0,
-            start_reg: 0,
-            dest: autocommit_reg,
-            func: is_autocommit_fn_ctx,
-        });
-
-        // IfNot jumps when reg == 0 (not autocommit). Skip the COMMIT in that case.
-        let skip_label = program.allocate_label();
-        program.emit_insn(Insn::IfNot {
-            reg: autocommit_reg,
-            target_pc: skip_label,
-            jump_if_null: true,
-        });
-
-        emit_cdc_commit_insns(program, resolver, cdc_cursor_id)?;
-
-        program.preassign_label_to_next_insn(skip_label);
+    if program.flags.is_subprogram() {
+        return Ok(());
     }
+    let cdc_info = program.capture_data_changes_info().as_ref();
+    if !cdc_info.is_some_and(|info| info.cdc_version().has_commit_record()) {
+        return Ok(());
+    }
+    if cdc_cursor_id.is_none() && !program.has_emitted_program_call() {
+        // Our own target table was not captured (e.g. a TEMP table), and no trigger or FK
+        // action ran during this statement that could have captured a row elsewhere.
+        return Ok(());
+    }
+
+    // Check if we're in autocommit mode; if so, emit a COMMIT record.
+    let is_autocommit_fn_ctx = crate::function::FuncCtx {
+        func: Func::Scalar(crate::function::ScalarFunc::IsAutocommit),
+        arg_count: 0,
+    };
+    let autocommit_reg = program.alloc_register();
+    program.emit_insn(Insn::Function {
+        constant_mask: 0,
+        start_reg: 0,
+        dest: autocommit_reg,
+        func: is_autocommit_fn_ctx,
+    });
+
+    // IfNot jumps when reg == 0 (not autocommit). Skip the COMMIT in that case.
+    let skip_label = program.allocate_label();
+    program.emit_insn(Insn::IfNot {
+        reg: autocommit_reg,
+        target_pc: skip_label,
+        jump_if_null: true,
+    });
+
+    let cdc_cursor_id = match cdc_cursor_id {
+        Some(cdc_cursor_id) => cdc_cursor_id,
+        None => {
+            // A trigger or FK action fired during this statement may have captured a row
+            // elsewhere. Only write the COMMIT record when something was actually captured.
+            let minus_one_reg = program.alloc_register();
+            program.emit_int(-1, minus_one_reg);
+            let txn_id_reg = program.alloc_register();
+            program.emit_insn(Insn::Function {
+                constant_mask: 0,
+                start_reg: minus_one_reg,
+                dest: txn_id_reg,
+                func: crate::function::FuncCtx {
+                    func: Func::Scalar(crate::function::ScalarFunc::ConnTxnId),
+                    arg_count: 1,
+                },
+            });
+            program.emit_insn(Insn::Eq {
+                lhs: txn_id_reg,
+                rhs: minus_one_reg,
+                target_pc: skip_label,
+                flags: crate::vdbe::insn::CmpInsFlags::default(),
+                collation: None,
+            });
+            let (cursor_id, _) =
+                prepare_cdc_if_necessary(program, resolver.schema(), crate::MAIN_DB_ID, None)?
+                    .expect("CDC is active, so prepare_cdc_if_necessary must return a cursor");
+            cursor_id
+        }
+    };
+
+    emit_cdc_commit_insns(program, resolver, cdc_cursor_id)?;
+
+    program.preassign_label_to_next_insn(skip_label);
 
     Ok(())
 }
@@ -2317,6 +2365,7 @@ fn emit_index_column_value_new_image(
             &mut column_regs,
             table,
             dest_reg,
+            idx_col.pos_in_table == EXPR_INDEX_SENTINEL,
         )?;
     } else {
         let col_in_table = columns
@@ -2413,7 +2462,7 @@ fn emit_check_constraint_bytecode(
         // expression's source text exactly as the user wrote it.
         let constraint_name = match (&check_constraint.name, &check_constraint.source) {
             (Some(name), _) => name.clone(),
-            (None, Some(source)) => crate::util::check_source_for_error(source),
+            (None, Some(source)) => crate::util::dequote(source),
             (None, None) => format!("{}", check_constraint.expr),
         };
 

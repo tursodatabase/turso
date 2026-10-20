@@ -711,10 +711,11 @@ impl IncrementalView {
             Cmd::Stmt(Stmt::CreateMaterializedView {
                 if_not_exists: _,
                 view_name,
-                columns: _,
+                columns,
                 select,
             }) => {
-                let column_schema = extract_view_columns(&select, schema)?;
+                let mut column_schema = extract_view_columns(&select, schema)?;
+                column_schema.rename_columns(&columns);
                 Ok(Self {
                     name: view_name.name.as_str().to_string(),
                     select_stmt: select,

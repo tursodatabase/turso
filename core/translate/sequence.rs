@@ -863,7 +863,7 @@ pub fn translate_create_sequence(
     resolver: &Resolver,
     program: &mut ProgramBuilder,
 ) -> Result<()> {
-    let database_id = resolver.resolve_database_id(seq_name)?;
+    let database_id = resolver.resolve_database_id_for_create(seq_name)?;
     let schema_cookie = resolver.with_schema(database_id, |s| s.schema_version);
     program.begin_write_on_database(database_id, schema_cookie)?;
 

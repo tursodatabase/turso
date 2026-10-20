@@ -26,6 +26,7 @@ use crate::storage::sqlite3_ondisk::{
 use crate::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use crate::sync::Mutex;
 use crate::sync::RwLock;
+use crate::translate::emitter::TransactionMode;
 use crate::types::ImmutableRecordRef;
 use crate::vdbe::execute::TransactionYieldPoint;
 use crate::{
@@ -84,7 +85,7 @@ impl YieldInjector for FixedYieldInjector {
 }
 
 fn drive_attach(conn: &Arc<Connection>, path: &str, alias: &str) {
-    let mut state = crate::connection::AttachDatabaseState::default();
+    let mut state = crate::dialect::sqlite::attach::AttachDatabaseState::default();
     loop {
         match conn.attach_database(path, alias, &mut state).unwrap() {
             crate::IOResult::Done(()) => return,
@@ -3676,10 +3677,106 @@ fn test_mvcc_header_updates_upgrade_concurrent_tx_to_exclusive() {
     assert_eq!(rows[0][0].as_int().unwrap(), 7);
 }
 
+#[test]
+fn test_ddl_upgrade_sets_cached_tx_mode_to_write() {
+    let db = MvccTestDbNoConn::new_with_random_db();
+    let conn = db.connect();
+    let mv_store = db.get_mvcc_store();
+
+    conn.execute("BEGIN CONCURRENT").unwrap();
+    let (tx_id, mode) = conn.get_mv_tx().expect("BEGIN CONCURRENT must open a tx");
+    assert_eq!(mode, TransactionMode::Concurrent);
+    assert!(!mv_store.is_exclusive_tx(&tx_id));
+
+    conn.execute("CREATE TABLE u(y INTEGER)").unwrap();
+    let (tx_id_after, mode_after) = conn
+        .get_mv_tx()
+        .expect("DDL upgrade must keep the same tx open");
+    assert_eq!(tx_id_after, tx_id);
+    assert_eq!(mode_after, TransactionMode::Write);
+    assert!(mv_store.is_exclusive_tx(&tx_id_after));
+
+    conn.execute("ROLLBACK").unwrap();
+}
+
+#[test]
+fn test_analyze_in_concurrent_tx_upgrades_to_exclusive() {
+    let db = MvccTestDbNoConn::new_with_random_db();
+    let conn = db.connect();
+    let other = db.connect();
+    let mv_store = db.get_mvcc_store();
+
+    conn.execute("CREATE TABLE t(x INTEGER)").unwrap();
+    conn.execute("INSERT INTO t VALUES (1)").unwrap();
+
+    conn.execute("BEGIN CONCURRENT").unwrap();
+    other.execute("BEGIN CONCURRENT").unwrap();
+    other.execute("INSERT INTO t VALUES (2)").unwrap();
+
+    conn.execute("ANALYZE").unwrap();
+    let (tx_id, mode) = conn
+        .get_mv_tx()
+        .expect("ANALYZE must keep the outer tx open");
+    assert_eq!(mode, TransactionMode::Write);
+    assert!(mv_store.is_exclusive_tx(&tx_id));
+
+    other
+        .execute("COMMIT")
+        .expect_err("other concurrent commit must fail while ANALYZE holds exclusive");
+
+    conn.execute("COMMIT").unwrap();
+    let rows = get_rows(&conn, "SELECT count(*) FROM sqlite_stat1");
+    assert_eq!(rows.len(), 1);
+    assert!(
+        rows[0][0].as_int().unwrap() > 0,
+        "ANALYZE must write sqlite_stat1"
+    );
+}
+
+#[test]
+fn test_ddl_on_attached_db_in_concurrent_tx_upgrades() {
+    let db = MvccTestDbNoConn::new_with_random_db_with_opts(DatabaseOpts::new().with_attach(true));
+    let aux_dir = tempfile::TempDir::new().unwrap();
+    let aux_path = aux_dir.path().join("aux.db");
+
+    let conn = db.connect();
+    drive_attach(&conn, aux_path.to_str().unwrap(), "aux");
+    conn.execute("CREATE TABLE aux.t (x INTEGER)").unwrap();
+
+    let other = db.connect();
+    drive_attach(&other, aux_path.to_str().unwrap(), "aux");
+
+    conn.execute("BEGIN CONCURRENT").unwrap();
+    other.execute("BEGIN CONCURRENT").unwrap();
+    other.execute("INSERT INTO aux.t VALUES (1)").unwrap();
+
+    conn.execute("CREATE TABLE aux.u (y INTEGER)").unwrap();
+
+    let aux_db_id = conn.get_database_id_by_name("aux").unwrap();
+    let aux_mv_store = conn
+        .mv_store_for_db(aux_db_id)
+        .expect("attached aux database must be MVCC");
+    let (aux_tx_id, aux_mode) = conn
+        .get_mv_tx_for_db(aux_db_id)
+        .expect("attached MVCC tx must be open after DDL");
+    assert_eq!(aux_mode, TransactionMode::Write);
+    assert!(
+        aux_mv_store.is_exclusive_tx(&aux_tx_id),
+        "schema write on attached DB must upgrade that DB to exclusive"
+    );
+
+    other
+        .execute("COMMIT")
+        .expect_err("other concurrent commit on attached DB must fail while exclusive");
+
+    conn.execute("COMMIT").unwrap();
+    let rows = get_rows(&conn, "SELECT count(*) FROM aux.u");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0][0].as_int().unwrap(), 0);
+}
+
 /// What this test checks: Header PRAGMAs in MVCC succeed in autocommit mode, where the VM
 /// opens an implicit single-statement write transaction.
-/// Why this matters: The exclusive-transaction gate must block BEGIN CONCURRENT, but not reject
-/// valid autocommit writes that are internally upgraded to exclusive write mode.
 #[test]
 fn test_mvcc_header_updates_allow_autocommit_statement_tx() {
     let db = MvccTestDbNoConn::new_with_random_db();

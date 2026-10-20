@@ -27,8 +27,8 @@ use crate::{
         trigger::create_trigger_to_sql,
     },
     util::{
-        check_expr_references_column, escape_sql_string_literal, normalize_ident,
-        parse_numeric_literal, rename_identifiers, rewrite_check_expr_table_refs,
+        check_expr_references_column, escape_sql_string_literal, is_builtin_strict_type,
+        normalize_ident, parse_numeric_literal, rename_identifiers, rewrite_check_expr_table_refs,
         rewrite_trigger_cmd_table_refs, rewrite_view_sql_for_column_rename,
     },
     vdbe::{
@@ -833,7 +833,7 @@ fn emit_add_column_check_validation(
         // constraint name, or the expression's source text as written.
         let name = match (constraint_name, check_source) {
             (Some(name), _) => name.clone(),
-            (None, Some(source)) => crate::util::check_source_for_error(source),
+            (None, Some(source)) => crate::util::dequote(source),
             (None, None) => format!("{check_expr}"),
         };
         program.emit_insn(Insn::Halt {
@@ -871,6 +871,7 @@ pub fn translate_alter_table(
     let qualified_schema_table = schema_table_name_for_db(resolver, database_id);
     let schema_version = resolver.with_schema(database_id, |s| s.schema_version);
     validate(&alter_table, table_name)?;
+    reject_alter_of_view(&alter_table, table_name, resolver, database_id)?;
 
     let table_indexes = resolver.with_schema(database_id, |s| {
         s.get_indices(table_name).cloned().collect::<Vec<_>>()
@@ -1297,13 +1298,8 @@ pub fn translate_alter_table(
                         "missing datatype for {table_name}.{new_column_name}"
                     )));
                 }
-                let is_builtin = ty.is_empty()
-                    || ty.eq_ignore_ascii_case("INT")
-                    || ty.eq_ignore_ascii_case("INTEGER")
-                    || ty.eq_ignore_ascii_case("REAL")
-                    || ty.eq_ignore_ascii_case("TEXT")
-                    || ty.eq_ignore_ascii_case("BLOB")
-                    || ty.eq_ignore_ascii_case("ANY");
+                let written_ty = column.written_ty_str.as_deref().unwrap_or(ty);
+                let is_builtin = ty.is_empty() || is_builtin_strict_type(written_ty);
                 // Domain types require STRICT tables because domain constraints
                 // (CHECK, NOT NULL, DEFAULT) are only enforced on STRICT tables.
                 if !is_builtin && !btree.is_strict {
@@ -1611,7 +1607,7 @@ pub fn translate_alter_table(
                                 }),
                             };
                     // Pass the renamed database's NAME so the rewrite
-                    // only touches triggers whose `tbl_name.db_name`
+                    // only touches triggers whose `tbl_name.namespace`
                     // actually points at the db we are renaming in
                     // (or is unqualified). Otherwise a temp trigger
                     // referencing `aux.t` would be wrongly rewritten
@@ -2380,6 +2376,39 @@ pub fn translate_alter_table(
     Ok(())
 }
 
+/// Reject ALTER TABLE on a plain or materialized view with SQLite's messages
+/// (sqlite3AlterRenameTable, sqlite3AlterBeginAddColumn and isRealTable in
+/// alter.c). ALTER COLUMN has no SQLite equivalent and uses the RENAME TO
+/// message.
+fn reject_alter_of_view(
+    alter_table: &ast::AlterTableBody,
+    table_name: &str,
+    resolver: &Resolver,
+    database_id: usize,
+) -> Result<()> {
+    let is_view = resolver.with_schema(database_id, |s| {
+        s.get_view(table_name).is_some() || s.materialized_view_exists(table_name)
+    });
+    if !is_view {
+        return Ok(());
+    }
+    let view_name = normalize_ident(table_name);
+    match alter_table {
+        ast::AlterTableBody::RenameTo(_) | ast::AlterTableBody::AlterColumn { .. } => {
+            crate::bail_parse_error!("view {view_name} may not be altered")
+        }
+        ast::AlterTableBody::AddColumn(_) => {
+            crate::bail_parse_error!("Cannot add a column to a view")
+        }
+        ast::AlterTableBody::RenameColumn { .. } => {
+            crate::bail_parse_error!("cannot rename columns of view \"{view_name}\"")
+        }
+        ast::AlterTableBody::DropColumn(_) => {
+            crate::bail_parse_error!("cannot drop column from view \"{view_name}\"")
+        }
+    }
+}
+
 // Return the indexes whose persisted entries may become stale after ALTER COLUMN,
 // rewritten to match the post-ALTER table metadata. We consider both the old and
 // new generated-column dependency graphs so direct indexes, expression indexes,
@@ -2914,14 +2943,14 @@ fn rewrite_trigger_sql_for_table_rename(
     // implementation did, and the caller already narrowed the
     // candidate set by iterating temp schema triggers for renames in
     // main only.
-    let qualifier_matches = match tbl_name.db_name.as_ref() {
+    let qualifier_matches = match tbl_name.namespace.as_ref() {
         Some(db) => db.as_str().eq_ignore_ascii_case(renamed_db_name),
         None => true,
     };
     let new_tbl_name =
         if qualifier_matches && tbl_name.name.as_str().eq_ignore_ascii_case(old_table_name) {
             ast::QualifiedName {
-                db_name: tbl_name.db_name,
+                namespace: tbl_name.namespace,
                 name: ast::Name::exact(new_table_name.to_string()),
                 alias: None,
             }
@@ -5107,7 +5136,7 @@ fn validate_select_table_refs_after_rename_in_table(
         ast::SelectTable::Table(qualified_name, _, _) => {
             if table_reference_exists_after_rename(
                 qualified_name.name.as_str(),
-                qualified_name.db_name.as_ref().map(|db| db.as_str()),
+                qualified_name.namespace.as_ref().map(|db| db.as_str()),
                 altered_table_norm,
                 resolver,
                 trigger_database_id,
@@ -5934,7 +5963,7 @@ fn collect_qualified_table_visible_columns(
         resolver,
         trigger_database_id,
         altered_database_id,
-        qualified_name.db_name.as_ref().map(|name| name.as_str()),
+        qualified_name.namespace.as_ref().map(|name| name.as_str()),
     )
     .unwrap_or_default();
     let qualifier = alias.map_or_else(
@@ -5944,7 +5973,7 @@ fn collect_qualified_table_visible_columns(
     let mut visible = columns.clone();
     visible.extend(columns.iter().map(|column| format!("{qualifier}.{column}")));
     if alias.is_none() {
-        if let Some(db_name) = &qualified_name.db_name {
+        if let Some(db_name) = &qualified_name.namespace {
             let database = normalize_ident(db_name.as_str());
             let table = normalize_ident(qualified_name.name.as_str());
             visible.extend(

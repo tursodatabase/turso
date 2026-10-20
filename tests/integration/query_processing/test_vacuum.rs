@@ -1,7 +1,8 @@
 use crate::assertions::{AssertQueryPlan, NULL};
 use crate::common::{
     compute_dbhash, compute_dbhash_with_database_opts, compute_dbhash_with_options,
-    compute_dbhash_with_options_and_database_opts, do_flush, ExecRows, TempDatabase,
+    compute_dbhash_with_options_and_database_opts, do_flush, limbo_exec_rows, ExecRows,
+    TempDatabase,
 };
 use crate::queued_io::{QueuedIo, QueuedIoOpKind};
 use asserting::prelude::*;
@@ -3817,8 +3818,8 @@ fn test_vacuum_into_preserves_autoincrement_counter(tmp_db: TempDatabase) -> any
     conn.execute("INSERT INTO t (val) VALUES ('a')")?;
     conn.execute("INSERT INTO t (val) VALUES ('b')")?;
     conn.execute("INSERT INTO t (val) VALUES ('c')")?;
-    // Delete some rows to create a gap - AUTOINCREMENT should never reuse rowids
-    conn.execute("DELETE FROM t WHERE id = 2")?;
+    // Delete the newest rows so the counter is above max(id) - AUTOINCREMENT should never reuse rowids
+    conn.execute("DELETE FROM t WHERE id >= 2")?;
     let source_seq: Vec<(String, i64)> =
         conn.exec_rows("SELECT name, seq FROM sqlite_sequence WHERE name = 't'");
     assert_eq!(source_seq, vec![("t".to_string(), 3)]);
@@ -3836,6 +3837,12 @@ fn test_vacuum_into_preserves_autoincrement_counter(tmp_db: TempDatabase) -> any
     let dest_seq: Vec<(String, i64)> =
         dest_conn.exec_rows("SELECT name, seq FROM sqlite_sequence WHERE name = 't'");
     assert_eq!(dest_seq, source_seq);
+    if tmp_db.enable_mvcc {
+        let dest_counter: Vec<(i64, i64)> = dest_conn.exec_rows(
+            "SELECT value, is_called FROM __turso_internal_seq___turso_internal_autoincrement_t",
+        );
+        assert_eq!(dest_counter, vec![(3, 1)]);
+    }
 
     // Insert a new row on the source - should get id=4 (not 2, because AUTOINCREMENT)
     conn.execute("INSERT INTO t (val) VALUES ('d')")?;
@@ -3854,6 +3861,34 @@ fn test_vacuum_into_preserves_autoincrement_counter(tmp_db: TempDatabase) -> any
         dest_new, source_new,
         "AUTOINCREMENT counter should produce the same next rowid on both databases"
     );
+
+    Ok(())
+}
+
+/// Plain VACUUM must leave the AUTOINCREMENT counter exactly as it was. On an
+/// MVCC database the counter's backing table must keep a single row.
+#[turso_macros::test(mvcc)]
+fn test_vacuum_preserves_autoincrement_counter(tmp_db: TempDatabase) -> anyhow::Result<()> {
+    let conn = tmp_db.connect_limbo();
+
+    conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY AUTOINCREMENT, val TEXT)")?;
+    conn.execute("INSERT INTO t (val) VALUES ('a'), ('b'), ('c')")?;
+    conn.execute("DELETE FROM t WHERE id >= 2")?;
+    checkpoint_if_mvcc(&tmp_db, &conn)?;
+
+    conn.execute("VACUUM")?;
+    assert_eq!(run_integrity_check(&conn), "ok");
+
+    let seq: Vec<(String, i64)> = conn.exec_rows("SELECT name, seq FROM sqlite_sequence");
+    assert_eq!(seq, vec![("t".to_string(), 3)]);
+    if tmp_db.enable_mvcc {
+        let counter: Vec<(i64, i64)> = conn.exec_rows(
+            "SELECT value, is_called FROM __turso_internal_seq___turso_internal_autoincrement_t",
+        );
+        assert_eq!(counter, vec![(3, 1)]);
+    }
+    conn.execute("INSERT INTO t (val) VALUES ('d')")?;
+    assert_eq!(scalar_i64(&conn, "SELECT id FROM t WHERE val = 'd'"), 4);
 
     Ok(())
 }
@@ -4704,6 +4739,112 @@ fn test_plain_vacuum_preserves_views(tmp_db: TempDatabase) -> anyhow::Result<()>
     assert_eq!(rows[0], (3, "three".into()));
 
     Ok(())
+}
+
+/// Each materialized view created by `create_materialized_view_fixture`,
+/// with its defining query.
+const MATERIALIZED_VIEW_FIXTURE: &[(&str, &str)] = &[
+    ("v", "SELECT a, b FROM t WHERE b > 100"),
+    (
+        "vg",
+        "SELECT g, count(*) AS n, sum(b) AS s, min(b) AS lo FROM t GROUP BY g",
+    ),
+    ("vj", "SELECT t.a, u.n FROM t JOIN u ON t.a = u.k"),
+    ("vv", "SELECT g, n FROM vg WHERE n > 1"),
+    ("vd", "SELECT DISTINCT g, b % 3 FROM t"),
+];
+
+/// Plain VACUUM keeps materialized views, their internal state tables, and
+/// their maintenance working. VACUUM used to fail with "table
+/// __turso_internal_dbsp_metadata_v2_v already exists", because it copied a
+/// view's internal tables and then replayed the CREATE MATERIALIZED VIEW
+/// that creates them.
+///
+/// VACUUM now rebuilds the views from the base tables, so the rowids of view
+/// rows and internal state rows may change, as SQLite allows for tables
+/// without an INTEGER PRIMARY KEY. The base tables must stay identical.
+#[turso_macros::test(views)]
+fn test_plain_vacuum_preserves_materialized_views(tmp_db: TempDatabase) -> anyhow::Result<()> {
+    let conn = tmp_db.connect_limbo();
+    create_materialized_view_fixture(&conn)?;
+    let base_tables_before = base_table_hashes(&tmp_db);
+    let schema_before = normalized_schema_snapshot(&conn);
+    conn.execute("VACUUM")?;
+    assert_eq!(run_integrity_check(&conn), "ok");
+    assert_eq!(base_table_hashes(&tmp_db), base_tables_before);
+    assert_eq!(normalized_schema_snapshot(&conn), schema_before);
+    assert_materialized_views_equal_their_queries(&conn);
+
+    conn.execute("INSERT INTO t VALUES (1000, 2, 999)")?;
+    conn.execute("DELETE FROM u WHERE k = 3")?;
+    assert_materialized_views_equal_their_queries(&conn);
+    drop(conn);
+
+    let (_reopened, conn) = connect_existing_with_opts(&tmp_db.path, tmp_db.db_opts);
+    assert_materialized_views_equal_their_queries(&conn);
+    assert_eq!(run_integrity_check(&conn), "ok");
+    Ok(())
+}
+
+/// VACUUM INTO writes a copy whose materialized views equal their queries and
+/// keep being maintained.
+#[turso_macros::test(views)]
+fn test_vacuum_into_preserves_materialized_views(tmp_db: TempDatabase) -> anyhow::Result<()> {
+    let conn = tmp_db.connect_limbo();
+    create_materialized_view_fixture(&conn)?;
+    let dest_dir = TempDir::new()?;
+    let dest_path = dest_dir.path().join("vacuumed.db");
+    conn.execute(format!("VACUUM INTO '{}'", dest_path.to_str().unwrap()))?;
+
+    let (dest_db, dest_conn) = connect_existing_with_opts(&dest_path, tmp_db.db_opts);
+    assert_eq!(run_integrity_check(&dest_conn), "ok");
+    assert_eq!(base_table_hashes(&dest_db), base_table_hashes(&tmp_db));
+    assert_eq!(
+        normalized_schema_snapshot(&dest_conn),
+        normalized_schema_snapshot(&conn)
+    );
+    assert_materialized_views_equal_their_queries(&dest_conn);
+
+    dest_conn.execute("INSERT INTO t VALUES (1000, 2, 999)")?;
+    assert_materialized_views_equal_their_queries(&dest_conn);
+    assert_eq!(run_integrity_check(&dest_conn), "ok");
+    Ok(())
+}
+
+fn create_materialized_view_fixture(conn: &Arc<Connection>) -> anyhow::Result<()> {
+    conn.execute("CREATE TABLE t(a INTEGER PRIMARY KEY, g INTEGER, b INTEGER)")?;
+    conn.execute("CREATE TABLE u(k INTEGER PRIMARY KEY, n INTEGER)")?;
+    conn.execute("INSERT INTO t SELECT value, value % 5, value * 2 FROM generate_series(1, 300)")?;
+    conn.execute("INSERT INTO u SELECT value, value * 10 FROM generate_series(1, 50)")?;
+    for (name, query) in MATERIALIZED_VIEW_FIXTURE {
+        conn.execute(format!("CREATE MATERIALIZED VIEW {name} AS {query}"))?;
+    }
+    conn.execute("DELETE FROM t WHERE a % 7 = 0")?;
+    Ok(())
+}
+
+fn base_table_hashes(db: &TempDatabase) -> Vec<String> {
+    ["t", "u"]
+        .into_iter()
+        .map(|table| {
+            let options = turso_dbhash::DbHashOptions {
+                table_filter: Some(table.to_string()),
+                without_schema: true,
+                ..Default::default()
+            };
+            compute_dbhash_with_options_and_database_opts(db, &options, db.db_opts).hash
+        })
+        .collect()
+}
+
+fn assert_materialized_views_equal_their_queries(conn: &Arc<Connection>) {
+    for (name, query) in MATERIALIZED_VIEW_FIXTURE {
+        let mut view = limbo_exec_rows(conn, &format!("SELECT * FROM {name}"));
+        let mut fresh = limbo_exec_rows(conn, query);
+        view.sort_by_key(|row| format!("{row:?}"));
+        fresh.sort_by_key(|row| format!("{row:?}"));
+        assert_eq!(view, fresh, "materialized view {name} differs from {query}");
+    }
 }
 
 /// Plain VACUUM works on empty databases.

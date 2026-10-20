@@ -178,6 +178,7 @@ fn compile_maintenance_plan(
             approx_num_insns: 128 + 64 * num_view_columns,
             approx_num_labels: 48,
         },
+        connection.mvcc_enabled(),
     );
     program.prologue();
     emit_plan_to_sink(
@@ -244,6 +245,7 @@ fn build_plan_for_connection(
         connection.database_schemas(),
         &connection.temp.database,
         connection.attached_databases(),
+        connection.namespaces(),
         &syms,
         connection.experimental_custom_types_enabled(),
         connection.get_dqs_dml().into(),

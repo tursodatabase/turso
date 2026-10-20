@@ -175,6 +175,7 @@ Combines rows from two or more tables based on a related column.
 | `FULL OUTER JOIN` | Returns all rows from both tables, with NULLs where there is no match on either side |
 | `NATURAL JOIN` | Joins on all columns with the same name in both tables |
 | `JOIN ... USING (column)` | Joins on the specified column that exists in both tables |
+| `LATERAL (subquery)` | Joins a subquery that can read columns of the tables before it in the FROM clause |
 
 ### INNER JOIN
 
@@ -234,6 +235,19 @@ JOIN customers c ON o.customer_id = c.id
 JOIN order_items oi ON o.id = oi.order_id
 JOIN products p ON oi.product_id = p.id
 WHERE o.order_date > '2024-01-01';
+```
+
+### LATERAL Joins
+
+**Turso Extension**: SQLite does not support `LATERAL`.
+
+A subquery in the FROM clause cannot normally read columns of the other tables in the FROM clause. With the `LATERAL` keyword, the subquery can read columns of every table that comes before it.
+
+```sql
+-- One row per quarter for each product (UNPIVOT in some other databases)
+SELECT s.product_name, q.column1 AS quarter, q.column2 AS amount
+FROM quarterly_sales s,
+     LATERAL (VALUES ('Q1', s.q1), ('Q2', s.q2), ('Q3', s.q3), ('Q4', s.q4)) AS q;
 ```
 
 ## GROUP BY and HAVING

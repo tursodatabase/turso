@@ -10,6 +10,7 @@ use crate::translate::plan::{
 use crate::translate::planner::parse_row_id;
 use crate::types::IOResult;
 use crate::types::IOResultOr;
+use crate::vdbe::affinity::Affinity;
 use crate::IO;
 use crate::{
     schema::{Column, Schema, Table, Type},
@@ -145,11 +146,44 @@ pub fn identifier_token_for_error(name: &turso_parser::ast::Name) -> String {
     }
 }
 
-/// Format a CHECK constraint's captured source text for an error message the
-/// way SQLite does. SQLite dequotes the text: when it starts with a quote
-/// character, only the first quoted token survives, so `"x" < +5` is
-/// reported as just `x`.
-pub fn check_source_for_error(source: &str) -> String {
+/// Returns a column's declared type from its type name the way SQLite's
+/// `sqlite3AddColumn` does: a name that starts with a quote and has no other
+/// quote characters before its last character loses its first and last
+/// characters, so `[x] INT` becomes `x] IN`. Other names go through [dequote].
+pub fn column_declared_type(type_name: &str) -> String {
+    match strip_type_name_quotes(type_name) {
+        Some(stripped) => stripped.to_string(),
+        None => dequote(type_name),
+    }
+}
+
+pub fn strip_type_name_quotes(type_name: &str) -> Option<&str> {
+    let is_quote = |b: &u8| matches!(b, b'"' | b'\'' | b'[' | b'`');
+    let bytes = type_name.as_bytes();
+    if bytes.len() >= 3 && is_quote(&bytes[0]) && !bytes[1..bytes.len() - 1].iter().any(is_quote) {
+        let mut chars = type_name.chars();
+        chars.next();
+        chars.next_back();
+        return Some(chars.as_str());
+    }
+    None
+}
+
+/// Returns true when a STRICT table accepts the written type name without a
+/// custom type. Like SQLite, quotes are only removed when they wrap the whole
+/// name, so `"INT"` is built in but `"INT" X` is not.
+pub fn is_builtin_strict_type(written_type_name: &str) -> bool {
+    let name = strip_type_name_quotes(written_type_name).unwrap_or(written_type_name);
+    turso_macros::match_ignore_ascii_case!(match name.as_bytes() {
+        b"INT" | b"INTEGER" | b"REAL" | b"TEXT" | b"BLOB" | b"ANY" => true,
+        _ => false,
+    })
+}
+
+/// Removes the quotes around the start of `source` the way SQLite's
+/// `sqlite3Dequote` does: when it starts with a quote character, only the
+/// first quoted token survives, so `"x" < +5` becomes just `x`.
+pub fn dequote(source: &str) -> String {
     let bytes = source.as_bytes();
     let close = match bytes.first() {
         Some(&c @ (b'"' | b'\'' | b'`')) => c,
@@ -181,7 +215,7 @@ pub fn check_source_for_error(source: &str) -> String {
 /// as the user wrote it with quotes stripped, keeping any database prefix.
 /// `SELECT * FROM main."T1"` reports the missing table as `main.T1`.
 pub fn table_name_for_error(name: &turso_parser::ast::QualifiedName) -> String {
-    match &name.db_name {
+    match &name.namespace {
         Some(db) => format!("{}.{}", db.as_str(), name.name.as_str()),
         None => name.name.as_str().to_owned(),
     }
@@ -1016,6 +1050,16 @@ pub(crate) fn type_from_name(type_name: &str) -> (Type, bool) {
     (Type::Numeric, false)
 }
 
+/// Older Turso versions kept the quotes of `"INTEGER"`, `'INTEGER'` and
+/// `` `INTEGER` `` when deciding whether an INTEGER PRIMARY KEY column is a
+/// rowid alias, and only removed the brackets of `[INTEGER]`. Existing
+/// databases depend on that, because a column that is not a rowid alias is
+/// stored in the record and has an automatic index.
+pub(crate) fn is_rowid_alias_type(written_type_name: &str) -> bool {
+    written_type_name.eq_ignore_ascii_case("INTEGER")
+        || written_type_name.eq_ignore_ascii_case("[INTEGER]")
+}
+
 pub fn columns_from_create_table_body(
     body: &turso_parser::ast::CreateTableBody,
 ) -> crate::Result<Vec<Column>> {
@@ -1598,6 +1642,15 @@ impl ViewColumnSchema {
             .map(|vc| vc.column.clone())
             .collect()
     }
+
+    /// Name the view's columns from the column list of `CREATE VIEW v(x, y)`.
+    pub fn rename_columns(&mut self, names: &[ast::IndexedColumn]) {
+        for (view_column, name) in self.columns.iter_mut().zip(names) {
+            // as_str: Display would render the quoted form, embedding literal
+            // quote characters in the name
+            view_column.column.name = Some(name.col_name.as_str().to_string());
+        }
+    }
 }
 
 /// Walk all expressions in a statement, including subqueries.
@@ -1959,7 +2012,7 @@ fn reject_cross_db_qualified_name(
     qualified_name: &ast::QualifiedName,
     view_db_name: Option<&ast::Name>,
 ) -> Result<()> {
-    if let Some(table_db_name) = &qualified_name.db_name {
+    if let Some(table_db_name) = &qualified_name.namespace {
         let is_cross_db = match view_db_name {
             Some(view_db) => !view_db
                 .as_str()
@@ -2071,7 +2124,7 @@ fn view_source_from_select_table(
                 .clone()
                 .map_or_else(|| vec![table_name.clone()], |alias| vec![alias]);
 
-            if name.db_name.is_none() {
+            if name.namespace.is_none() {
                 if let Some(cte) = ctes.get(&table_name) {
                     return Ok(ViewSource {
                         qualifiers,
@@ -2084,7 +2137,10 @@ fn view_source_from_select_table(
             let table_index = tables.len();
             tables.push(ViewTable {
                 name: table_name.clone(),
-                db_name: name.db_name.as_ref().map(|db| normalize_ident(db.as_str())),
+                db_name: name
+                    .namespace
+                    .as_ref()
+                    .map(|db| normalize_ident(db.as_str())),
                 alias: table_alias,
             });
             let table = schema.get_table(&table_name);
@@ -2155,7 +2211,10 @@ fn view_source_from_select_table(
             let table_index = tables.len();
             tables.push(ViewTable {
                 name: table_name.clone(),
-                db_name: name.db_name.as_ref().map(|db| normalize_ident(db.as_str())),
+                db_name: name
+                    .namespace
+                    .as_ref()
+                    .map(|db| normalize_ident(db.as_str())),
                 alias: table_alias,
             });
             let columns = schema
@@ -2464,38 +2523,13 @@ fn extract_view_columns_inner(
     for result_column in select_columns {
         match result_column {
             ast::ResultColumn::Expr(expr, alias) => {
-                let source_column = match expr.as_ref() {
-                    ast::Expr::Qualified(qualifier, column_name) => sources
-                        .iter()
-                        .find(|source| {
-                            source
-                                .qualifiers
-                                .iter()
-                                .any(|candidate| candidate.eq_ignore_ascii_case(qualifier.as_str()))
-                        })
-                        .and_then(|source| {
-                            source.columns.iter().find(|column| {
-                                view_column_name(column).is_some_and(|candidate| {
-                                    candidate.eq_ignore_ascii_case(column_name.as_str())
-                                })
-                            })
-                        })
-                        .map(view_output_column),
-                    ast::Expr::Id(column_name) => {
-                        resolve_view_column(&sources, column_name.as_str())
-                    }
-                    _ => None,
-                };
                 let name = alias
                     .as_ref()
                     .filter(|alias| !matches!(alias, ast::As::ImplicitColumnName(_)))
                     .map(|alias| alias.name().as_str().to_string())
                     .or_else(|| extract_column_name_from_expr(expr))
                     .unwrap_or_else(|| expr.to_string());
-                let mut column = source_column.unwrap_or_else(|| ViewColumn {
-                    table_index: usize::MAX,
-                    column: Column::new_default_text(None, "TEXT".to_string(), None),
-                });
+                let mut column = view_result_column(expr, &sources);
                 column.column.name = Some(name);
                 deduplicate_view_column_name(&mut column, &mut column_name_counts);
                 columns.push(column);
@@ -2540,6 +2574,78 @@ fn extract_view_columns_inner(
     }
 
     Ok(ViewColumnSchema { tables, columns })
+}
+
+fn view_result_column(expr: &ast::Expr, sources: &[ViewSource]) -> ViewColumn {
+    if let Some(column) = view_referenced_column(expr, sources) {
+        return column;
+    }
+    let ty_str = view_affinity_type_name(view_expression_affinity(expr, sources));
+    let (ty, _) = type_from_name(ty_str);
+    ViewColumn {
+        table_index: usize::MAX,
+        column: Column::new(
+            None,
+            ty_str.to_string(),
+            None,
+            None,
+            ty,
+            None,
+            ColDef::default(),
+        ),
+    }
+}
+
+fn view_referenced_column(expr: &ast::Expr, sources: &[ViewSource]) -> Option<ViewColumn> {
+    match expr {
+        ast::Expr::Parenthesized(exprs) if exprs.len() == 1 => {
+            view_referenced_column(&exprs[0], sources)
+        }
+        ast::Expr::Id(column_name) => resolve_view_column(sources, column_name.as_str()),
+        ast::Expr::Qualified(qualifier, column_name) => sources
+            .iter()
+            .find(|source| {
+                source
+                    .qualifiers
+                    .iter()
+                    .any(|candidate| candidate.eq_ignore_ascii_case(qualifier.as_str()))
+            })
+            .and_then(|source| {
+                source.columns.iter().find(|column| {
+                    view_column_name(column).is_some_and(|candidate| {
+                        candidate.eq_ignore_ascii_case(column_name.as_str())
+                    })
+                })
+            })
+            .map(view_output_column),
+        _ => None,
+    }
+}
+
+fn view_expression_affinity(expr: &ast::Expr, sources: &[ViewSource]) -> Affinity {
+    match expr {
+        ast::Expr::Parenthesized(exprs) if exprs.len() == 1 => {
+            view_expression_affinity(&exprs[0], sources)
+        }
+        ast::Expr::Collate(inner, _) => view_expression_affinity(inner, sources),
+        ast::Expr::Cast { type_name, .. } => {
+            Affinity::affinity(type_name.as_ref().map_or("", |type_name| &type_name.name))
+        }
+        _ => view_referenced_column(expr, sources).map_or(Affinity::None, |column| {
+            Affinity::affinity(&column.column.ty_str)
+        }),
+    }
+}
+
+fn view_affinity_type_name(affinity: Affinity) -> &'static str {
+    match affinity {
+        Affinity::None => "",
+        Affinity::Blob => "BLOB",
+        Affinity::Integer => "INT",
+        Affinity::Real => "REAL",
+        Affinity::Text => "TEXT",
+        Affinity::Numeric => "NUM",
+    }
 }
 
 /// Extract column information from a SELECT statement for view creation.
@@ -3235,7 +3341,7 @@ mod rename_column_view {
             ast::SelectTable::Table(tbl_name, alias, _) => {
                 let table_name_norm = normalize_ident(tbl_name.name.as_str());
                 let table_db_norm = tbl_name
-                    .db_name
+                    .namespace
                     .as_ref()
                     .map(|db| normalize_ident(db.as_str()));
                 let mut qualifiers = Vec::new();
@@ -5559,7 +5665,7 @@ pub mod tests {
         };
 
         assert_eq!(
-            tbl_name.db_name.as_ref().map(ast::Name::as_str),
+            tbl_name.namespace.as_ref().map(ast::Name::as_str),
             Some("temp")
         );
         assert_eq!(tbl_name.name.as_str(), "new");
@@ -5638,7 +5744,7 @@ pub mod tests {
         };
 
         assert_eq!(
-            tbl_name.db_name.as_ref().map(ast::Name::as_str),
+            tbl_name.namespace.as_ref().map(ast::Name::as_str),
             Some("temp")
         );
         assert_eq!(tbl_name.name.as_str(), "new");

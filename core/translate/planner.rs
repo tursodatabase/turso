@@ -264,14 +264,14 @@ impl RecursiveRefCounter<'_> {
     fn count_from_table(&self, table: &ast::SelectTable, scope: &mut RecursiveRefScope) -> usize {
         match table {
             ast::SelectTable::Table(name, _, _) => {
-                if name.db_name.is_none() {
+                if name.namespace.is_none() {
                     self.name_weight(&normalize_ident(name.name.as_str()), scope)
                 } else {
                     0
                 }
             }
             ast::SelectTable::TableCall(name, args, _) => {
-                let mut count = if name.db_name.is_none() {
+                let mut count = if name.namespace.is_none() {
                     self.name_weight(&normalize_ident(name.name.as_str()), scope)
                 } else {
                     0
@@ -346,7 +346,7 @@ impl RecursiveRefCounter<'_> {
         ) -> usize {
             match table {
                 ast::SelectTable::Table(name, _, _) | ast::SelectTable::TableCall(name, _, _) => {
-                    if name.db_name.is_some() {
+                    if name.namespace.is_some() {
                         return 0;
                     }
                     let name = normalize_ident(name.name.as_str());
@@ -390,12 +390,12 @@ impl RecursiveRefCounter<'_> {
 fn collect_from_select_table(table: &ast::SelectTable, out: &mut Vec<String>) {
     match table {
         ast::SelectTable::Table(qualified_name, _, _) => {
-            if qualified_name.db_name.is_none() {
+            if qualified_name.namespace.is_none() {
                 out.push(normalize_ident(qualified_name.name.as_str()));
             }
         }
         ast::SelectTable::TableCall(qualified_name, args, _) => {
-            if qualified_name.db_name.is_none() {
+            if qualified_name.namespace.is_none() {
                 out.push(normalize_ident(qualified_name.name.as_str()));
             }
             for arg in args {
@@ -1980,7 +1980,7 @@ fn parse_table(
     let normalized_qualified_name = normalize_ident(qualified_name.name.as_str());
     let table_name = &qualified_name.name;
 
-    if qualified_name.db_name.is_none() {
+    if qualified_name.namespace.is_none() {
         // Each CTE use gets its own table and cursor IDs unless it shares materialized rows.
         if let Some(cte_definition_index) = cte_definitions
             .iter()
@@ -2277,7 +2277,7 @@ fn parse_table(
     // For other types of tables in the outer query references, we do not add them as joined tables,
     // because the query can simply _reference_ them in e.g. the SELECT columns or the WHERE clause,
     // but it's not part of the join order.
-    if qualified_name.db_name.is_none() {
+    if qualified_name.namespace.is_none() {
         if let Some(outer_ref) =
             table_references.find_cte_outer_query_ref_by_identifier(&normalized_qualified_name)
         {

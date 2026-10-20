@@ -128,8 +128,8 @@ pub use database::{clear_database_registry, SharedWalTestingSnapshot};
 pub(crate) use database::{is_memory_like, DatabaseCatalog, InitState};
 pub use database::{
     ConnectAsyncState, ConnectOpts, Database, DatabaseAllocators, DatabaseOpts, EncryptionOpts,
-    OpenDbAsyncPhase, OpenDbAsyncState, OpenOptions, SharedWalCoordinationOpenTelemetryMode,
-    SharedWalOpenTelemetry,
+    NamespaceCatalog, OpenDbAsyncPhase, OpenDbAsyncState, OpenOptions,
+    SharedWalCoordinationOpenTelemetryMode, SharedWalOpenTelemetry,
 };
 #[cfg(test)]
 pub(crate) use database::{DatabaseKey, RegistryEntry, DATABASE_MANAGER};
@@ -178,6 +178,7 @@ pub use turso_macros::{
 pub use turso_parser::ast::EqpFormat;
 pub use types::{IOResult, Value, ValueBlob, ValueRef};
 pub use util::IOExt;
+pub use vdbe::array::array_values_from_any;
 pub use vdbe::{
     builder::QueryMode, explain::EXPLAIN_COLUMNS, explain::EXPLAIN_QUERY_PLAN_COLUMNS,
     explain::EXPLAIN_QUERY_PLAN_JSON_COLUMNS, FromValueRow, PrepareContext, PreparedProgram,

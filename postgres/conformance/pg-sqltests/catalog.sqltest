@@ -2,6 +2,13 @@
 
 @database :memory:
 
+test pg-collation-pgdump-columns {
+    SELECT tableoid, oid, collname, collnamespace, collowner, collencoding
+    FROM pg_catalog.pg_collation
+    WHERE oid >= 16384;
+}
+expect {}
+
 setup indexed_tables {
     CREATE TABLE items (id int, name text, price int);
     CREATE INDEX items_name_idx ON items (name);
@@ -64,6 +71,40 @@ test catalog-pg-attribute-enum-and-domain-columns {
 expect {
     c|catalog_color
     a|catalog_age
+}
+
+test pg-attribute-default-compression {
+    CREATE TABLE compression_columns (id integer NOT NULL, body text, amount integer DEFAULT 7);
+    SELECT a.attname, quote_literal(a.attcompression::text), a.attnotnull, a.atthasdef,
+           a.attidentity, a.attgenerated, a.attisdropped, a.attislocal, a.attinhcount
+    FROM pg_catalog.pg_attribute a
+    JOIN pg_catalog.pg_class c ON c.oid = a.attrelid
+    WHERE c.relname = 'compression_columns' AND a.attnum > 0
+    ORDER BY a.attnum;
+}
+expect {
+    id|''|t|f|||f|t|0
+    body|''|f|f|||f|t|0
+    amount|''|f|t|||f|t|0
+}
+
+test pg-index-nulls-are-distinct {
+    CREATE TABLE nullable_index_columns (a integer, b text);
+    CREATE INDEX nullable_plain_idx ON nullable_index_columns (a);
+    CREATE UNIQUE INDEX nullable_unique_idx ON nullable_index_columns (a, b);
+    INSERT INTO nullable_index_columns VALUES (NULL, 'same'), (NULL, 'same'), (1, NULL), (1, NULL);
+    SELECT c.relname, i.indisunique, i.indnullsnotdistinct, i.indisprimary,
+           i.indimmediate, i.indisvalid, i.indisready, i.indkey
+    FROM pg_catalog.pg_index i
+    JOIN pg_catalog.pg_class c ON c.oid = i.indexrelid
+    WHERE c.relname IN ('nullable_plain_idx', 'nullable_unique_idx')
+    ORDER BY c.relname;
+    SELECT count(*) FROM nullable_index_columns;
+}
+expect {
+    nullable_plain_idx|f|f|f|t|t|t|1
+    nullable_unique_idx|t|f|f|t|t|t|1 2
+    4
 }
 
 test pg-settings-default-search-path {

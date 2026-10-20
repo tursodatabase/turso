@@ -188,6 +188,10 @@ SELECT 'abc ' = 'abc' COLLATE RTRIM;           -- 1 (trailing space ignored)
 SELECT name FROM users ORDER BY name COLLATE NOCASE;
 ```
 
+For comparisons, an explicit `COLLATE` on either operand takes precedence over a column's collation. If both operands specify an explicit collation, the left operand takes precedence. Otherwise, a column uses its declared collation, or `BINARY` by default, with the left column taking precedence over the right column.
+
+`CAST` and unary `+` preserve a column's collation. Function calls and string concatenation do not inherit a column's collation, but an explicit `COLLATE` inside these expressions still applies to the comparison.
+
 ## Pattern Matching
 
 ### LIKE Operator
@@ -265,6 +269,8 @@ SELECT 'red' NOT IN ('blue', 'green');   -- 1
 SELECT name FROM users
 WHERE id IN (SELECT user_id FROM orders WHERE total > 100);
 ```
+
+`IN (SELECT ...)` follows the same collation precedence as an equality comparison. A plain left-hand column contributes `BINARY` by default, but an explicit `COLLATE` on the selected expression overrides that implicit collation. An explicit collation on the left-hand expression takes precedence over an explicit collation on the selected expression.
 
 ## EXISTS Expression
 

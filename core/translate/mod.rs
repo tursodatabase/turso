@@ -10,7 +10,6 @@
 pub(crate) mod aggregation;
 pub(crate) mod alter;
 pub(crate) mod analyze;
-pub(crate) mod attach;
 pub(crate) mod collate;
 mod compound_select;
 pub(crate) mod delete;
@@ -115,6 +114,7 @@ pub fn translate(
         connection.database_schemas(),
         &connection.temp.database,
         connection.attached_databases(),
+        connection.namespaces(),
         syms,
         connection.experimental_custom_types_enabled(),
         connection.get_dqs_dml().into(),
@@ -233,7 +233,14 @@ pub fn translate_inner(
         }
         ast::Stmt::Analyze { name } => translate_analyze(name, resolver, program)?,
         ast::Stmt::Attach { expr, db_name, key } => {
-            attach::translate_attach(&expr, resolver, &db_name, &key, program, connection.clone())?;
+            crate::dialect::sqlite::attach::translate_attach(
+                &expr,
+                resolver,
+                &db_name,
+                &key,
+                program,
+                connection.clone(),
+            )?;
         }
         ast::Stmt::Begin { typ, name } => translate_tx_begin(typ, name, resolver, program)?,
         ast::Stmt::Commit { name } => {
@@ -311,12 +318,13 @@ pub fn translate_inner(
         ast::Stmt::CreateMaterializedView {
             view_name,
             select,
+            columns,
             if_not_exists,
-            ..
         } => view::translate_create_materialized_view(
             &view_name,
             resolver,
             &select,
+            &columns,
             if_not_exists,
             connection.clone(),
             program,
@@ -347,9 +355,12 @@ pub fn translate_inner(
                 connection,
             )?
         }
-        ast::Stmt::Detach { name } => {
-            attach::translate_detach(&name, resolver, program, connection.clone())?
-        }
+        ast::Stmt::Detach { name } => crate::dialect::sqlite::attach::translate_detach(
+            &name,
+            resolver,
+            program,
+            connection.clone(),
+        )?,
         ast::Stmt::DropIndex {
             if_exists,
             idx_name,

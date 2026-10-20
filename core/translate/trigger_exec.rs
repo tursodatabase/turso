@@ -311,7 +311,7 @@ fn trigger_cmd_to_stmt_for_subprogram(
                 with: None,
                 or_conflict: effective_or_conflict,
                 tbl_name: QualifiedName {
-                    db_name: subprogram_ctx.db_name.clone(),
+                    namespace: subprogram_ctx.db_name.clone(),
                     name: tbl_name.clone(),
                     alias: None,
                 },
@@ -353,7 +353,7 @@ fn trigger_cmd_to_stmt_for_subprogram(
                 with: None,
                 or_conflict: effective_or_conflict,
                 tbl_name: QualifiedName {
-                    db_name: subprogram_ctx.db_name.clone(),
+                    namespace: subprogram_ctx.db_name.clone(),
                     name: tbl_name.clone(),
                     alias: None,
                 },
@@ -376,7 +376,7 @@ fn trigger_cmd_to_stmt_for_subprogram(
 
             Ok(ast::Stmt::Delete {
                 tbl_name: QualifiedName {
-                    db_name: subprogram_ctx.db_name.clone(),
+                    namespace: subprogram_ctx.db_name.clone(),
                     name: tbl_name.clone(),
                     alias: None,
                 },
@@ -579,6 +579,7 @@ fn execute_trigger_commands(
         program.capture_data_changes_info().clone(),
         ProgramBuilderOpts::new(1, 32, 2),
         trigger.clone(),
+        program.is_mvcc_enabled(),
     );
     // If we have an override_conflict (e.g. from UPSERT DO UPDATE context),
     // propagate it to the subprogram so that nested trigger firing will also use it.

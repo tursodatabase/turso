@@ -184,9 +184,9 @@ When the `BEGIN CONCURRENT TRANSACTION` statement executes, the database:
 1. Assigns a unique transaction ID to the transaction
 2. Records a begin timestamp from the logical clock
 3. Creates an empty read set and write set to track accessed rows
-4. Does **not** acquire any locks
+4. Does **not** acquire any locks at start
 
-Unlike deferred transactions which delay locking, concurrent transactions never acquire locks. Instead, they rely on MVCC's snapshot isolation and conflict detection at commit time.
+Unlike deferred transactions which delay locking, concurrent transactions start without locks. They rely on MVCC's snapshot isolation and conflict detection at commit time. Schema changes and header writes upgrade the same transaction to exclusive in place.
 
 #### Read snapshot isolation
 
@@ -203,7 +203,7 @@ All rows read by the transaction are tracked in the transaction's read set, and 
 
 When a concurrent transaction commits, the database performs these steps:
 
-1. **Exclusive transaction check**: If there is an active exclusive transaction (started with `BEGIN IMMEDIATE` or a `BEGIN DEFERRED` that upgraded to a write transaction), the concurrent transaction **cannot commit** and receives a `SQLITE_BUSY` error. Concurrent transactions can read and write concurrently with exclusive transactions, but cannot commit until the exclusive transaction completes.
+1. **Exclusive transaction check**: If there is an active exclusive transaction (started with `BEGIN IMMEDIATE`, a `BEGIN DEFERRED` that upgraded to a write transaction, or a `BEGIN CONCURRENT` that upgraded for schema or header writes), the concurrent transaction **cannot commit** and receives a `SQLITE_BUSY` error. Concurrent transactions can read and write concurrently with exclusive transactions, but cannot commit until the exclusive transaction completes.
 
 2. **Write-write conflict detection**: For each row in the transaction's write set, the database checks if the row was modified by another transaction. A write-write conflict occurs when:
    - The row is currently being modified by another active transaction, or
@@ -219,7 +219,7 @@ Concurrent transactions can coexist with exclusive transactions (deferred and im
 - **Concurrent transactions cannot commit** while an exclusive transaction holds the exclusive lock
 - **Exclusive transactions block concurrent transaction commits**, not their reads or writes
 
-This design allows concurrent transactions to make progress during an exclusive transaction, but ensures that exclusive transactions truly have exclusive write access when needed (for example, schema changes).
+This design allows concurrent transactions to make progress during an exclusive transaction, but ensures that exclusive transactions truly have exclusive write access. Schema changes and header writes upgrade a concurrent transaction to exclusive instead of failing.
 
 **Best practice**: For maximum concurrency in MVCC mode, use `BEGIN CONCURRENT` for all write transactions. Only use `BEGIN IMMEDIATE` or `BEGIN DEFERRED` when you need exclusive write access that prevents any concurrent commits.
 

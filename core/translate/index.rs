@@ -47,7 +47,7 @@ fn canonical_create_index_sql(stmt: &ast::Stmt) -> String {
     // Strip that qualifier before storing SQL in sqlite_schema so the schema text remains valid
     // when the same database is reopened or attached under a different alias.
     // e.g. CREATE INDEX aux.idx1 ON t1 (name) -> CREATE INDEX idx1 ON t1 (name)
-    idx_name.db_name = None;
+    idx_name.namespace = None;
     canonical_stmt.to_string()
 }
 
@@ -105,7 +105,7 @@ pub fn translate_create_index(
 
     let original_idx_name = idx_name;
     let original_tbl_name = tbl_name;
-    let database_id = if original_idx_name.db_name.is_some() {
+    let database_id = if original_idx_name.namespace.is_some() {
         resolver.resolve_database_id(&original_idx_name)?
     } else {
         resolver.resolve_existing_table_database_id(original_tbl_name.as_str())?
@@ -717,7 +717,7 @@ fn resolve_reindex_targets(
     };
 
     let normalized_name = normalize_ident(name.name.as_str());
-    if name.db_name.is_none() {
+    if name.namespace.is_none() {
         let collation = CollationSeq::new(&normalized_name).ok();
         if let Some(collation) = collation {
             let targets = collect_reindex_targets_by_collation(resolver, connection, collation);
@@ -1383,7 +1383,7 @@ pub fn translate_drop_index(
 
     program.preassign_label_to_next_insn(loop_end_label);
     if let Some((cdc_cursor_id, _)) = cdc_table {
-        emit_cdc_autocommit_commit(program, resolver, cdc_cursor_id)?;
+        emit_cdc_autocommit_commit(program, resolver, Some(cdc_cursor_id))?;
     }
 
     let current_schema_version = resolver.with_schema(database_id, |s| s.schema_version);
@@ -1525,7 +1525,7 @@ mod tests {
         };
         assert_eq!(
             idx_name
-                .db_name
+                .namespace
                 .as_ref()
                 .map(ToString::to_string)
                 .as_deref(),

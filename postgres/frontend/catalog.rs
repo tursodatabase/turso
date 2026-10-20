@@ -124,7 +124,7 @@ impl Dialect for PostgresDialect {
         // destination does not have, so re-render the translated AST without
         // the qualifier; the canonical text round-trips through the SQLite
         // fallback in `Dialect::parse`.
-        if tbl_name.db_name.take().is_none() {
+        if tbl_name.namespace.take().is_none() {
             return Ok(raw_sql.to_string());
         }
 
@@ -539,6 +539,7 @@ impl SnapshotRows for PgAttributeTable {
             attbyval BOOLEAN,
             attstorage TEXT,
             attalign TEXT,
+            attcompression TEXT,
             attnotnull BOOLEAN,
             atthasdef BOOLEAN,
             atthasmissing BOOLEAN,
@@ -592,19 +593,20 @@ impl SnapshotRows for PgAttributeTable {
                     Value::from_i64(1),           // attbyval
                     Value::Text("p".into()),      // attstorage (plain)
                     Value::Text("i".into()),      // attalign (int)
-                    Value::from_i64(notnull),     // attnotnull
-                    Value::from_i64(has_def),     // atthasdef
-                    Value::from_i64(0),           // atthasmissing
-                    Value::Text("".into()),       // attidentity
-                    Value::Text("".into()),       // attgenerated
-                    Value::from_i64(0),           // attisdropped
-                    Value::from_i64(1),           // attislocal
-                    Value::from_i64(0),           // attinhcount
-                    Value::from_i64(0),           // attcollation
-                    Value::Null,                  // attacl
-                    Value::Null,                  // attoptions
-                    Value::Null,                  // attfdwoptions
-                    Value::Null,                  // attmissingval
+                    Value::Text("".into()),
+                    Value::from_i64(notnull), // attnotnull
+                    Value::from_i64(has_def), // atthasdef
+                    Value::from_i64(0),       // atthasmissing
+                    Value::Text("".into()),   // attidentity
+                    Value::Text("".into()),   // attgenerated
+                    Value::from_i64(0),       // attisdropped
+                    Value::from_i64(1),       // attislocal
+                    Value::from_i64(0),       // attinhcount
+                    Value::from_i64(0),       // attcollation
+                    Value::Null,              // attacl
+                    Value::Null,              // attoptions
+                    Value::Null,              // attfdwoptions
+                    Value::Null,              // attmissingval
                 ]);
             }
         }
@@ -1487,7 +1489,7 @@ fn make_type_row(t: &PgTypeInfo) -> Vec<Value> {
 // pg_index
 // ──────────────────────────────────────────────────────────────────────
 
-const PG_INDEX_SQL: &str = "CREATE TABLE pg_index (indexrelid INTEGER, indrelid INTEGER, indnatts INTEGER, indnkeyatts INTEGER, indisunique BOOLEAN, indisprimary BOOLEAN, indisexclusion BOOLEAN, indimmediate BOOLEAN, indisclustered BOOLEAN, indisvalid BOOLEAN, indcheckxmin BOOLEAN, indisready BOOLEAN, indislive BOOLEAN, indisreplident BOOLEAN, indkey TEXT, indcollation TEXT, indclass TEXT, indoption TEXT, indexprs TEXT, indpred TEXT, tableoid INTEGER HIDDEN)";
+const PG_INDEX_SQL: &str = "CREATE TABLE pg_index (indexrelid INTEGER, indrelid INTEGER, indnatts INTEGER, indnkeyatts INTEGER, indisunique BOOLEAN, indnullsnotdistinct BOOLEAN, indisprimary BOOLEAN, indisexclusion BOOLEAN, indimmediate BOOLEAN, indisclustered BOOLEAN, indisvalid BOOLEAN, indcheckxmin BOOLEAN, indisready BOOLEAN, indislive BOOLEAN, indisreplident BOOLEAN, indkey TEXT, indcollation TEXT, indclass TEXT, indoption TEXT, indexprs TEXT, indpred TEXT, tableoid INTEGER HIDDEN)";
 
 #[derive(Debug)]
 struct PgIndexTable;
@@ -1553,11 +1555,12 @@ impl SnapshotRows for PgIndexTable {
                 };
 
                 rows.push(vec![
-                    Value::from_i64(index_oid),    // indexrelid
-                    Value::from_i64(table_oid),    // indrelid
-                    Value::from_i64(indnatts),     // indnatts
-                    Value::from_i64(indnatts),     // indnkeyatts
-                    Value::from_i64(indisunique),  // indisunique
+                    Value::from_i64(index_oid),   // indexrelid
+                    Value::from_i64(table_oid),   // indrelid
+                    Value::from_i64(indnatts),    // indnatts
+                    Value::from_i64(indnatts),    // indnkeyatts
+                    Value::from_i64(indisunique), // indisunique
+                    Value::from_i64(0),
                     Value::from_i64(indisprimary), // indisprimary
                     Value::from_i64(0),            // indisexclusion
                     Value::from_i64(1),            // indimmediate
@@ -1996,6 +1999,16 @@ impl SnapshotRows for PgSequencesTable {
 
 pub(crate) fn register_catalog_modules(mut options: OpenOptions) -> OpenOptions {
     options = options.native_module(
+        "unnest",
+        VTabKind::TableValuedFunction,
+        crate::unnest::Unnest,
+    );
+    options = options.native_module(
+        "pg_options_to_table",
+        VTabKind::TableValuedFunction,
+        crate::options::PgOptionsToTable,
+    );
+    options = options.native_module(
         "pg_class",
         VTabKind::TableValuedFunction,
         SnapshotCatalog::<PgClassTable>(PhantomData),
@@ -2145,7 +2158,15 @@ pub(crate) fn register_catalog_modules(mut options: OpenOptions) -> OpenOptions 
     options = options.native_module(
         "pg_collation",
         VTabKind::TableValuedFunction,
-        EmptyPgCatalogTable { create_sql: "CREATE TABLE pg_collation (oid INTEGER, collname TEXT, collnamespace INTEGER, collowner INTEGER, collprovider TEXT, collisdeterministic INTEGER, collencoding INTEGER, collcollate TEXT, collctype TEXT, colliculocale TEXT, collicurules TEXT, collversion TEXT)".to_string() },
+        EmptyPgCatalogTable {
+            create_sql: "CREATE TABLE pg_collation (
+                oid INTEGER, collname TEXT, collnamespace INTEGER, collowner INTEGER,
+                collprovider TEXT, collisdeterministic INTEGER, collencoding INTEGER,
+                collcollate TEXT, collctype TEXT, colliculocale TEXT, collicurules TEXT,
+                collversion TEXT, tableoid INTEGER HIDDEN
+            )"
+            .to_string(),
+        },
     );
     options = options.native_module(
         "pg_description",
@@ -2763,7 +2784,7 @@ impl<'a> IndexRow<'a> {
     const OID_COLUMN: usize = 0;
     const TABLE_OID_COLUMN: usize = 1;
     const IS_UNIQUE_COLUMN: usize = 4;
-    const COLUMN_NUMBERS_COLUMN: usize = 14;
+    const COLUMN_NUMBERS_COLUMN: usize = 15;
 
     fn from_row(row: &'a [Value]) -> Self {
         Self {

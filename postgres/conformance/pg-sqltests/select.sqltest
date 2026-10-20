@@ -5,6 +5,22 @@
 
 @database :memory:
 
+test cast-text-to-integer-array {
+    SELECT '{10,20,30}'::integer[];
+    SELECT array_length('{10,20,30}'::integer[], 1);
+}
+expect {
+    {10,20,30}
+    3
+}
+
+test cast-text-to-text-array {
+    SELECT '{hello,world}'::text[];
+}
+expect {
+    {hello,world}
+}
+
 test select-integer-literal {
     SELECT 42;
 }
@@ -521,4 +537,52 @@ expect {
     1|{30,0}
     2|{7,0}
     {37,0}
+}
+
+setup having_t {
+    CREATE TABLE t (id int PRIMARY KEY, x int, y int);
+    INSERT INTO t VALUES (1, 1, 100), (2, 2, 200);
+}
+
+@setup having_t
+test having-without-group-by-removes-the-row {
+    SELECT max(y) FROM t HAVING max(y) > 1000;
+}
+expect {
+}
+
+@setup having_t
+test having-without-group-by-keeps-the-row {
+    SELECT max(y) FROM t HAVING max(y) > 10;
+}
+expect {
+    200
+}
+
+test having-without-group-by-keeps-one-group-for-an-empty-table {
+    CREATE TABLE e (y int);
+    SELECT count(*), max(y) FROM e HAVING true;
+}
+expect {
+    0|
+}
+
+test having-without-group-by-or-aggregate-errors-instead-of-ignoring-having {
+    SELECT 1 HAVING 1 = 0;
+}
+expect {
+}
+expect @tursopg error {
+    HAVING clause on a non-aggregate query
+}
+
+@setup having_t
+test having-in-subquery-with-only-an-outer-aggregate-errors-instead-of-ignoring-having {
+    SELECT (SELECT max(t1.y) FROM t AS t2 HAVING max(t1.y) > 0 LIMIT 1) FROM t AS t1;
+}
+expect {
+    200
+}
+expect @tursopg error {
+    HAVING clause on a non-aggregate query
 }

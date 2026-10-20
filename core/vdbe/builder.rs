@@ -117,6 +117,10 @@ pub enum SelfTableContext {
     ForDML {
         dml_ctx: DmlColumnContext,
         table: Arc<BTreeTable>,
+        /// False for generated column expressions: they use the standard operators on
+        /// custom-type columns, and indexes on virtual generated columns already store
+        /// keys computed that way.
+        uses_custom_type_operators: bool,
     },
 }
 
@@ -691,13 +695,25 @@ impl ProgramBuilder {
         capture_data_changes_info: Option<CaptureDataChangesInfo>,
         opts: ProgramBuilderOpts,
     ) -> Self {
-        ProgramBuilder::_new(query_mode, capture_data_changes_info, opts, None, false)
+        ProgramBuilder::_new(
+            query_mode,
+            capture_data_changes_info,
+            opts,
+            None,
+            false,
+            false,
+        )
     }
+    /// Create a ProgramBuilder for a trigger subprogram. `mvcc_enabled` must match the
+    /// parent program's `is_mvcc_enabled()`: a trigger runs inside the same transaction
+    /// as its parent statement, so code emitted for it (e.g. CDC change id allocation)
+    /// must take the same MVCC-aware or MVCC-unaware path the parent takes.
     pub fn new_for_trigger(
         query_mode: QueryMode,
         capture_data_changes_info: Option<CaptureDataChangesInfo>,
         opts: ProgramBuilderOpts,
         trigger: Arc<Trigger>,
+        mvcc_enabled: bool,
     ) -> Self {
         ProgramBuilder::_new(
             query_mode,
@@ -705,25 +721,41 @@ impl ProgramBuilder {
             opts,
             Some(trigger),
             true,
+            mvcc_enabled,
         )
     }
     /// Create a ProgramBuilder for a subprogram (FK actions, etc.) that runs within
     /// an existing transaction and doesn't emit Transaction instructions.
+    ///
+    /// `mvcc_enabled` must match the parent program's `is_mvcc_enabled()`: the
+    /// subprogram runs inside the same transaction as its parent statement, so code
+    /// emitted for it (e.g. CDC change id allocation) must take the same MVCC-aware
+    /// or MVCC-unaware path the parent takes.
     pub fn new_for_subprogram(
         query_mode: QueryMode,
         capture_data_changes_info: Option<CaptureDataChangesInfo>,
         opts: ProgramBuilderOpts,
+        mvcc_enabled: bool,
     ) -> Self {
-        ProgramBuilder::_new(query_mode, capture_data_changes_info, opts, None, true)
+        ProgramBuilder::_new(
+            query_mode,
+            capture_data_changes_info,
+            opts,
+            None,
+            true,
+            mvcc_enabled,
+        )
     }
 
     #[turso_macros::trace_stack]
+    #[allow(clippy::too_many_arguments)]
     fn _new(
         query_mode: QueryMode,
         capture_data_changes_info: Option<CaptureDataChangesInfo>,
         opts: ProgramBuilderOpts,
         trigger: Option<Arc<Trigger>>,
         is_subprogram: bool,
+        mvcc_enabled: bool,
     ) -> Self {
         Self {
             table_reference_counter: TableRefIdCounter::new(),
@@ -746,7 +778,7 @@ impl ProgramBuilder {
             init_label: BranchOffset::Placeholder,
             start_offset: BranchOffset::Placeholder,
             capture_data_changes_info,
-            mvcc_enabled: false,
+            mvcc_enabled,
             txn_mode: TransactionMode::None,
             write_databases: BitSet::default(),
             read_databases: BitSet::default(),
@@ -995,6 +1027,16 @@ impl ProgramBuilder {
 
     pub fn set_mvcc_enabled(&mut self, enabled: bool) {
         self.mvcc_enabled = enabled;
+    }
+
+    /// Whether this program has already emitted a call to a trigger or FK action
+    /// subprogram (an `Insn::Program`). Used to tell whether a trigger or FK action fired
+    /// during the statement, which may have captured a CDC row even when this program's own
+    /// target table was not captured (e.g. a TEMP table).
+    pub fn has_emitted_program_call(&self) -> bool {
+        self.insns
+            .iter()
+            .any(|(insn, _)| matches!(insn, Insn::Program { .. }))
     }
 
     pub fn extend(&mut self, opts: &ProgramBuilderOpts) {
