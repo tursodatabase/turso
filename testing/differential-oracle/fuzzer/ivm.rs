@@ -492,6 +492,14 @@ impl IvmState {
 
             let (view_rows, query_rows) = match (view_result, query_result) {
                 (QueryResult::Rows(v), QueryResult::Rows(q)) => (v, q),
+                // A SUM total that does not fit in an integer makes both the
+                // view and its defining SELECT fail; that is agreement.
+                (QueryResult::Error(view_error), QueryResult::Error(query_error))
+                    if view_error.contains("integer overflow")
+                        && query_error.contains("integer overflow") =>
+                {
+                    continue;
+                }
                 (QueryResult::Error(e), _) => {
                     failures.push(format!(
                         "IVM check: reading materialized view {} failed: {e}\n  definition: {}",
@@ -1614,6 +1622,33 @@ mod tests {
         // A deliberately wrong tracked definition must be reported: this
         // exercises the comparison itself.
         state.views[0].definition = "SELECT id, num FROM t WHERE num >= 40".into();
+        assert!(state.check_views(&conn).is_fail());
+    }
+
+    #[test]
+    fn check_views_accepts_integer_overflow_only_when_both_sides_fail() {
+        let conn = open_turso_with_views("ivm-check-overflow-test.db");
+        for sql in [
+            "CREATE TABLE t(id INTEGER PRIMARY KEY, num INTEGER)",
+            "CREATE MATERIALIZED VIEW v AS SELECT sum(num) AS s FROM t",
+            "INSERT INTO t VALUES (1, 9223372036854775807), (2, 1)",
+        ] {
+            assert!(
+                !DifferentialOracle::execute_turso(&conn, sql).is_error(),
+                "setup failed: {sql}"
+            );
+        }
+
+        let mut state = IvmState::new();
+        state.views.push(IvmView {
+            name: "v".into(),
+            definition: "SELECT sum(num) AS s FROM t".into(),
+        });
+        assert!(state.check_views(&conn).is_pass());
+
+        // The view fails to read while a tracked definition that does not
+        // overflow succeeds: still a mismatch.
+        state.views[0].definition = "SELECT sum(num) AS s FROM t WHERE id = 1".into();
         assert!(state.check_views(&conn).is_fail());
     }
 

@@ -414,6 +414,10 @@ pub struct IvmSumFinalizeData {
     pub non_int_count_reg: usize,
     pub non_null_count_reg: usize,
     pub dest_reg: usize,
+    /// Set to 1 when the result would fail with "integer overflow" (`dest_reg`
+    /// then holds NULL), otherwise 0. `None` for a view created before views
+    /// tracked overflow: the instruction then fails with "integer overflow".
+    pub overflowed_reg: Option<usize>,
 }
 
 /// Data for ArrayEncode instruction (boxed to keep Insn small).
@@ -1346,6 +1350,15 @@ pub enum Insn {
     /// `IvmSumFinalizeData`.
     IvmSumFinalize {
         data: Box<IvmSumFinalizeData>,
+    },
+
+    /// Fail with "integer overflow" if `view_name`, or a materialized view it
+    /// reads, has a group whose SUM total does not fit in an integer. Emitted
+    /// before every OpenRead of a materialized view. Pending view maintenance
+    /// is applied first, so a read from inside a write statement sees that
+    /// statement's changes.
+    CheckViewOverflow {
+        view_name: String,
     },
 
     /// Open a sorter.
@@ -2369,6 +2382,7 @@ impl InsnVariants {
             InsnVariants::AggContextStore => execute::op_agg_context_store,
             InsnVariants::IvmSumStep => execute::op_ivm_sum_step,
             InsnVariants::IvmSumFinalize => execute::op_ivm_sum_finalize,
+            InsnVariants::CheckViewOverflow => execute::op_check_view_overflow,
             InsnVariants::SorterOpen => execute::op_sorter_open,
             InsnVariants::SorterInsert => execute::op_sorter_insert,
             InsnVariants::SorterSort => execute::op_sorter_sort,

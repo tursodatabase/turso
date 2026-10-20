@@ -726,6 +726,81 @@ fn insert_from_pragma_function_reaches_view_before_savepoint_rollback(
     Ok(())
 }
 
+/// A write that makes a view's SUM total too large for an integer succeeds,
+/// and reading the view fails. When that write is undone by ROLLBACK, by
+/// ROLLBACK TO, or because its statement fails, the view is readable again.
+/// The view is not read inside the transaction: a failed read there ends
+/// the whole transaction (#6864).
+#[turso_macros::test(views)]
+fn undone_sum_overflow_leaves_view_readable(tmp_db: TempDatabase) -> anyhow::Result<()> {
+    let conn = tmp_db.connect_limbo();
+    conn.execute("CREATE TABLE t(a, b, c UNIQUE)")?;
+    conn.execute("CREATE MATERIALIZED VIEW v AS SELECT a, sum(b) AS s FROM t GROUP BY a")?;
+    conn.execute("INSERT INTO t VALUES (1, 9223372036854775807, 'x')")?;
+
+    conn.execute("BEGIN")?;
+    conn.execute("INSERT INTO t VALUES (1, 1, 'y')")?;
+    conn.execute("ROLLBACK")?;
+    assert_sum_view(&conn, i64::MAX);
+
+    conn.execute("BEGIN")?;
+    conn.execute("SAVEPOINT s")?;
+    conn.execute("INSERT INTO t VALUES (1, 1, 'y')")?;
+    conn.execute("ROLLBACK TO s")?;
+    conn.execute("COMMIT")?;
+    assert_sum_view(&conn, i64::MAX);
+
+    let err = conn
+        .execute("INSERT INTO t VALUES (1, 1, 'y'), (1, 2, 'x')")
+        .expect_err("the second row conflicts on c");
+    assert!(err.to_string().contains("UNIQUE"), "{err}");
+    assert_sum_view(&conn, i64::MAX);
+
+    conn.execute("INSERT INTO t VALUES (1, 1, 'y')")?;
+    let err = conn
+        .execute("SELECT * FROM v")
+        .expect_err("the total no longer fits in an integer");
+    assert!(err.to_string().contains("integer overflow"), "{err}");
+    Ok(())
+}
+
+/// The overflow is part of the view's stored state: it is still reported
+/// after reopening the database, and clears when the total fits again.
+#[turso_macros::test(views)]
+fn sum_overflow_survives_reopen(tmp_db: TempDatabase) -> anyhow::Result<()> {
+    let conn = tmp_db.connect_limbo();
+    conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, a, b)")?;
+    conn.execute("CREATE MATERIALIZED VIEW v AS SELECT a, sum(b) AS s FROM t GROUP BY a")?;
+    conn.execute("INSERT INTO t VALUES (1, 1, 9223372036854775807), (2, 1, 1)")?;
+    drop(conn);
+
+    let reopened = TempDatabase::builder()
+        .with_db_path(&tmp_db.path)
+        .with_views(true)
+        .build();
+    let conn = reopened.connect_limbo();
+    let err = conn
+        .execute("SELECT * FROM v")
+        .expect_err("the total does not fit in an integer");
+    assert!(err.to_string().contains("integer overflow"), "{err}");
+    conn.execute("DELETE FROM t WHERE id = 2")?;
+    drop(conn);
+
+    let reopened = TempDatabase::builder()
+        .with_db_path(&tmp_db.path)
+        .with_views(true)
+        .build();
+    let conn = reopened.connect_limbo();
+    assert_sum_view(&conn, i64::MAX);
+    assert_eq!(run_integrity_check(&conn), "ok");
+    Ok(())
+}
+
+fn assert_sum_view(conn: &std::sync::Arc<turso_core::Connection>, expected_sum: i64) {
+    let view: Vec<(i64, i64)> = conn.exec_rows("SELECT a, s FROM v");
+    assert_eq!(view, vec![(1, expected_sum)]);
+}
+
 /// Write statements that fail partway, conflict clauses, savepoints, trigger
 /// RAISE and foreign keys each roll back some writes and keep others. After
 /// every statement, every materialized view must equal a fresh run of its

@@ -8000,6 +8000,9 @@ pub fn op_ivm_sum_finalize(
     let non_int_count = int_of(data.non_int_count_reg, "non_int_count")?;
     let non_null_count = int_of(data.non_null_count_reg, "non_null_count")?;
 
+    // A total that does not fit must not fail the write that caused it: the
+    // view stores NULL in its place and counts the group as overflowed, and
+    // reading the view fails instead (see `CheckViewOverflow`).
     let result = finalize_ivm_sum(
         data.kind,
         wrapped,
@@ -8008,8 +8011,16 @@ pub fn op_ivm_sum_finalize(
         float_err,
         non_int_count,
         non_null_count,
-    )?;
-    state.registers[data.dest_reg].set_value(result);
+    );
+    let Some(overflowed_reg) = data.overflowed_reg else {
+        let result = result.ok_or(LimboError::IntegerOverflow)?;
+        state.registers[data.dest_reg].set_value(result);
+        state.pc += 1;
+        return Ok(InsnFunctionStepResult::Step);
+    };
+    let overflowed = result.is_none();
+    state.registers[data.dest_reg].set_value(result.unwrap_or(Value::Null));
+    state.registers[overflowed_reg].set_int(i64::from(overflowed));
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
 }
@@ -8026,6 +8037,10 @@ const TWO_POW_64: f64 = 18_446_744_073_709_551_616.0;
 /// "Divergences from DBSP" in docs/ivm-vdbe-rewrite-writeup.md for the one
 /// place this intentionally disagrees with sum()'s own (order-dependent)
 /// overflow reporting.
+///
+/// Returns `None` when sum() would fail with "integer overflow": every
+/// contribution is an exact integer and their exact total does not fit in
+/// i64.
 fn finalize_ivm_sum(
     kind: IvmSumKind,
     wrapped: i64,
@@ -8034,21 +8049,19 @@ fn finalize_ivm_sum(
     float_err: f64,
     non_int_count: i64,
     non_null_count: i64,
-) -> Result<Value> {
+) -> Option<Value> {
     if non_null_count == 0 {
-        return Ok(match kind {
+        return Some(match kind {
             IvmSumKind::Sum | IvmSumKind::Avg => Value::Null,
             IvmSumKind::Total => Value::from_f64(0.0),
         });
     }
-    // A SUM over only exact-integer contributions stays an exact integer, or
-    // errors the same way sum() does if that exact total does not fit in i64.
     if matches!(kind, IvmSumKind::Sum) && non_int_count == 0 {
         if wrap_count != 0 {
             mark_unlikely();
-            return Err(LimboError::IntegerOverflow);
+            return None;
         }
-        return Ok(Value::from_i64(wrapped));
+        return Some(Value::from_i64(wrapped));
     }
     let mut acc = float_sum;
     let mut sum_state = SumAggState {
@@ -8070,13 +8083,132 @@ fn finalize_ivm_sum(
         // A non-integer contribution produced NaN (e.g. +Infinity and
         // -Infinity both appear): "the result is NULL", matching sum()'s
         // documented NaN rule.
-        return Ok(Value::Null);
+        return Some(Value::Null);
     }
     let total = acc.to_float_or_zero() + sum_state.r_err;
-    Ok(match kind {
+    Some(match kind {
         IvmSumKind::Sum | IvmSumKind::Total => Value::from_f64(total),
         IvmSumKind::Avg => Value::from_f64(total / non_null_count as f64),
     })
+}
+
+/// Progress of a `CheckViewOverflow` instruction, kept across I/O yields.
+#[derive(Default)]
+pub enum ViewOverflowCheckState {
+    #[default]
+    NotStarted,
+    /// Applying the transaction's pending view maintenance, so the counts
+    /// read next include this statement's changes.
+    ApplyingChanges(crate::vdbe::ViewDeltaApplyState),
+    /// Reading the overflowed-group count of each view's metadata table.
+    Reading {
+        metadata_root_pages: Vec<i64>,
+        next: usize,
+        cursor: Option<Box<BTreeCursor>>,
+    },
+}
+
+pub fn op_check_view_overflow(
+    program: &Program,
+    state: &mut ProgramState,
+    insn: &Insn,
+    pager: &Arc<Pager>,
+) -> InsnResult {
+    load_insn!(CheckViewOverflow { view_name }, insn);
+    let result = check_view_overflow(program, state, view_name, pager);
+    if !matches!(result, Ok(IOResult::IO(_))) {
+        state.view_overflow_check = ViewOverflowCheckState::NotStarted;
+    }
+    match result? {
+        IOResult::IO(io) => Ok(state.suspend_on_io(io)),
+        IOResult::Done(()) => {
+            state.pc += 1;
+            Ok(InsnFunctionStepResult::Step)
+        }
+    }
+}
+
+fn check_view_overflow(
+    program: &Program,
+    state: &mut ProgramState,
+    view_name: &str,
+    pager: &Arc<Pager>,
+) -> Result<IOResult<()>> {
+    loop {
+        match &mut state.view_overflow_check {
+            ViewOverflowCheckState::NotStarted => {
+                state.view_overflow_check = ViewOverflowCheckState::ApplyingChanges(
+                    crate::vdbe::ViewDeltaApplyState::NotStarted,
+                );
+            }
+            ViewOverflowCheckState::ApplyingChanges(apply_state) => {
+                if let IOResult::IO(io) = crate::vdbe::step_view_delta_batch(
+                    &program.connection,
+                    apply_state,
+                    false,
+                    pager,
+                )? {
+                    return Ok(IOResult::IO(io));
+                }
+                let schema = program.connection.schema.read();
+                let metadata_root_pages = schema
+                    .materialized_view_and_its_sources(view_name)
+                    .iter()
+                    .map(|view| {
+                        let table_name = crate::incremental::view::dbsp_version_marker_table_name(view);
+                        schema
+                            .get_btree_table(&table_name)
+                            .map(|table| table.root_page)
+                            .ok_or_else(|| {
+                                LimboError::InternalError(format!(
+                                    "metadata table {table_name} of materialized view {view} not found"
+                                ))
+                            })
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                state.view_overflow_check = ViewOverflowCheckState::Reading {
+                    metadata_root_pages,
+                    next: 0,
+                    cursor: None,
+                };
+            }
+            ViewOverflowCheckState::Reading {
+                metadata_root_pages,
+                next,
+                cursor: cursor_slot,
+            } => {
+                let Some(&root_page) = metadata_root_pages.get(*next) else {
+                    return Ok(IOResult::Done(()));
+                };
+                let cursor = cursor_slot.get_or_insert_with(|| {
+                    BTreeCursor::new_table(pager.clone(), root_page, 2).into_boxed()
+                });
+                let found = match cursor.seek(
+                    SeekKey::TableRowId(crate::incremental::view::OVERFLOWED_GROUPS_ROWID),
+                    SeekOp::GE { eq_only: true },
+                )? {
+                    IOResult::IO(io) => return Ok(IOResult::IO(io)),
+                    IOResult::Done(seek_result) => seek_result == SeekResult::Found,
+                };
+                if found {
+                    let overflowed_groups = match cursor.record()? {
+                        IOResult::IO(io) => return Ok(IOResult::IO(io)),
+                        IOResult::Done(record) => match record.and_then(|record| {
+                            record.get_value_opt(crate::incremental::view::OVERFLOWED_GROUPS_COLUMN)
+                        }) {
+                            Some(value) => value.to_owned()?.as_int(),
+                            None => None,
+                        },
+                    };
+                    if overflowed_groups.unwrap_or(0) > 0 {
+                        return Err(LimboError::IntegerOverflow);
+                    }
+                }
+                *next += 1;
+                *cursor_slot = None;
+            }
+        }
+    }
 }
 
 /// Number of payload slots for aggregates whose state is a fixed-width value

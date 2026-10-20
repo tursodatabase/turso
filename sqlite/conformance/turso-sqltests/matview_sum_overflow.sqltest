@@ -1,0 +1,240 @@
+@database :memory:
+@requires-file materialized_views ""
+@skip-file-if mvcc "materialized_views not supported with mvcc"
+@verify-materialized-views
+
+# A view's sum() overflow must not make a write to its base table fail
+# (#10188). Like a plain view in SQLite, the write succeeds and reading the
+# view fails with "integer overflow" until its total fits in a 64-bit integer
+# again. The view keeps the exact total, so the result does not depend on
+# the order of earlier writes.
+
+test matview-sum-overflow-insert-succeeds {
+    CREATE TABLE t(a, b);
+    CREATE MATERIALIZED VIEW v AS SELECT a, sum(b) AS s FROM t GROUP BY a;
+    INSERT INTO t VALUES (1, 9223372036854775807);
+    INSERT INTO t VALUES (1, 1);
+    SELECT count(*) FROM t;
+}
+expect {
+    2
+}
+
+test matview-sum-overflow-read-fails {
+    CREATE TABLE t(a, b);
+    CREATE MATERIALIZED VIEW v AS SELECT a, sum(b) AS s FROM t GROUP BY a;
+    INSERT INTO t VALUES (1, 9223372036854775807);
+    INSERT INTO t VALUES (1, 1);
+    SELECT * FROM v;
+}
+expect error {
+    integer overflow
+}
+
+test matview-sum-overflow-delete-makes-view-readable-again {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, a, b);
+    CREATE MATERIALIZED VIEW v AS SELECT a, sum(b) AS s FROM t GROUP BY a;
+    INSERT INTO t VALUES (1, 1, 9223372036854775807);
+    INSERT INTO t VALUES (2, 1, 1);
+    DELETE FROM t WHERE id = 2;
+    SELECT * FROM v;
+    DELETE FROM t WHERE id = 1;
+    INSERT INTO t VALUES (3, 1, 1);
+    SELECT * FROM v;
+}
+expect {
+    1|9223372036854775807
+    1|1
+}
+
+test matview-sum-overflow-later-insert-makes-view-readable-again {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, a, b);
+    CREATE MATERIALIZED VIEW v AS SELECT a, sum(b) AS s FROM t GROUP BY a;
+    INSERT INTO t VALUES (1, 1, 9223372036854775807);
+    INSERT INTO t VALUES (3, 1, 1);
+    INSERT INTO t VALUES (2, 1, -5);
+    SELECT * FROM v;
+}
+expect {
+    1|9223372036854775803
+}
+
+test matview-sum-overflow-update-in-and-out-of-range {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, a, b);
+    CREATE MATERIALIZED VIEW v AS SELECT a, sum(b) AS s FROM t GROUP BY a;
+    INSERT INTO t VALUES (1, 1, 9223372036854775807), (2, 1, 0);
+    UPDATE t SET b = 1 WHERE id = 2;
+    UPDATE t SET b = -1 WHERE id = 2;
+    SELECT * FROM v;
+}
+expect {
+    1|9223372036854775806
+}
+
+test matview-sum-overflow-below-smallest-integer {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, a, b);
+    CREATE MATERIALIZED VIEW v AS SELECT a, sum(b) AS s FROM t GROUP BY a;
+    INSERT INTO t VALUES (1, 1, -9223372036854775808);
+    INSERT INTO t VALUES (3, 1, -1);
+    SELECT * FROM v;
+}
+expect error {
+    integer overflow
+}
+
+test matview-sum-overflow-below-smallest-integer-recovers {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, a, b);
+    CREATE MATERIALIZED VIEW v AS SELECT a, sum(b) AS s FROM t GROUP BY a;
+    INSERT INTO t VALUES (1, 1, -9223372036854775808);
+    INSERT INTO t VALUES (3, 1, -1);
+    INSERT INTO t VALUES (2, 1, 1);
+    SELECT * FROM v;
+}
+expect {
+    1|-9223372036854775808
+}
+
+test matview-sum-overflow-in-one-group-fails-every-read {
+    CREATE TABLE t(a, b);
+    CREATE MATERIALIZED VIEW v AS SELECT a, sum(b) AS s FROM t GROUP BY a;
+    INSERT INTO t VALUES (1, 9223372036854775807), (1, 1), (2, 5);
+    SELECT * FROM v;
+}
+expect error {
+    integer overflow
+}
+
+test matview-sum-overflow-other-group-still-maintained {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, a, b);
+    CREATE MATERIALIZED VIEW v AS SELECT a, sum(b) AS s FROM t GROUP BY a;
+    INSERT INTO t VALUES (1, 1, 9223372036854775807), (2, 1, 1), (3, 2, 5);
+    INSERT INTO t VALUES (4, 2, 6);
+    DELETE FROM t WHERE id = 3;
+    DELETE FROM t WHERE id = 2;
+    SELECT * FROM v ORDER BY a;
+}
+expect {
+    1|9223372036854775807
+    2|6
+}
+
+test matview-sum-overflow-real-value-gives-real-result {
+    CREATE TABLE t(a, b);
+    CREATE MATERIALIZED VIEW v AS SELECT a, sum(b) AS s FROM t GROUP BY a;
+    INSERT INTO t VALUES (1, 9223372036854775807);
+    INSERT INTO t VALUES (1, 1);
+    INSERT INTO t VALUES (1, 0.5);
+    SELECT a, typeof(s) FROM v;
+}
+expect {
+    1|real
+}
+
+test matview-sum-overflow-total-and-avg-never-fail {
+    CREATE TABLE t(a, b);
+    CREATE MATERIALIZED VIEW v AS SELECT a, total(b) AS t, avg(b) AS m FROM t GROUP BY a;
+    INSERT INTO t VALUES (1, 9223372036854775807);
+    INSERT INTO t VALUES (1, 9223372036854775807);
+    SELECT a, typeof(t), typeof(m), CAST(t / 1e18 AS INTEGER), CAST(m / 1e18 AS INTEGER) FROM v;
+}
+expect {
+    1|real|real|18|9
+}
+
+test matview-sum-overflow-scalar-aggregate {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, b);
+    CREATE MATERIALIZED VIEW v AS SELECT sum(b) AS s, count(*) AS n FROM t;
+    INSERT INTO t VALUES (1, 9223372036854775807);
+    INSERT INTO t VALUES (2, 1);
+    DELETE FROM t WHERE id = 1;
+    SELECT * FROM v;
+}
+expect {
+    1|1
+}
+
+test matview-sum-overflow-expression-and-having {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, a, b);
+    CREATE MATERIALIZED VIEW v AS SELECT a, sum(b) - 10 AS s FROM t GROUP BY a HAVING sum(b) > 100;
+    INSERT INTO t VALUES (1, 1, 9223372036854775807), (2, 2, 500);
+    INSERT INTO t VALUES (3, 1, 1);
+    DELETE FROM t WHERE id = 3;
+    SELECT * FROM v ORDER BY a;
+}
+expect {
+    1|9223372036854775797
+    2|490
+}
+
+test matview-sum-overflow-expression-read-fails {
+    CREATE TABLE t(a, b);
+    CREATE MATERIALIZED VIEW v AS SELECT a, sum(b) - 10 AS s FROM t GROUP BY a HAVING sum(b) > 100;
+    INSERT INTO t VALUES (1, 9223372036854775807), (1, 1);
+    SELECT count(*) FROM v;
+}
+expect error {
+    integer overflow
+}
+
+test matview-sum-overflow-view-over-view-read-fails {
+    CREATE TABLE t(a, b);
+    CREATE MATERIALIZED VIEW v AS SELECT a, sum(b) AS s FROM t GROUP BY a;
+    CREATE MATERIALIZED VIEW w AS SELECT a FROM v;
+    INSERT INTO t VALUES (1, 9223372036854775807), (1, 1);
+    SELECT * FROM w;
+}
+expect error {
+    integer overflow
+}
+
+test matview-sum-overflow-view-over-view-recovers {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, a, b);
+    CREATE MATERIALIZED VIEW v AS SELECT a, sum(b) AS s FROM t GROUP BY a;
+    CREATE MATERIALIZED VIEW w AS SELECT a, s FROM v WHERE s > 0;
+    INSERT INTO t VALUES (1, 1, 9223372036854775807), (2, 1, 1), (3, 2, 7);
+    DELETE FROM t WHERE id = 2;
+    SELECT * FROM w ORDER BY a;
+}
+expect {
+    1|9223372036854775807
+    2|7
+}
+
+test matview-sum-overflow-join-over-aggregate-recovers {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, a, b);
+    CREATE TABLE u(a, label);
+    INSERT INTO u VALUES (1, 'one'), (2, 'two');
+    CREATE MATERIALIZED VIEW j AS SELECT g.a, g.s, u.label FROM (SELECT a, sum(b) AS s FROM t GROUP BY a) g JOIN u ON g.a = u.a;
+    INSERT INTO t VALUES (1, 1, 9223372036854775807), (2, 1, 1), (3, 2, 7);
+    INSERT INTO u VALUES (1, 'uno');
+    DELETE FROM t WHERE id = 2;
+    SELECT * FROM j ORDER BY a, label;
+}
+expect {
+    1|9223372036854775807|one
+    1|9223372036854775807|uno
+    2|7|two
+}
+
+test matview-sum-overflow-created-over-overflowing-table {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, a, b);
+    INSERT INTO t VALUES (1, 1, 9223372036854775807), (2, 1, 1);
+    CREATE MATERIALIZED VIEW v AS SELECT a, sum(b) AS s FROM t GROUP BY a;
+    DELETE FROM t WHERE id = 2;
+    SELECT * FROM v;
+}
+expect {
+    1|9223372036854775807
+}
+
+test matview-sum-overflow-trigger-reads-overflowed-view {
+    CREATE TABLE t(a, b);
+    CREATE TABLE lg(x);
+    CREATE MATERIALIZED VIEW v AS SELECT a, sum(b) AS s FROM t GROUP BY a;
+    CREATE TRIGGER tr AFTER INSERT ON t WHEN new.b = 1 BEGIN INSERT INTO lg SELECT s FROM v; END;
+    INSERT INTO t VALUES (1, 9223372036854775807);
+    INSERT INTO t VALUES (1, 1);
+}
+expect error {
+    integer overflow
+}

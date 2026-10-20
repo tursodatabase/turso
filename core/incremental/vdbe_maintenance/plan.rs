@@ -1061,7 +1061,9 @@ fn version_marker_table(view_name: &str) -> HiddenTableDef {
     let table_name = crate::incremental::view::dbsp_version_marker_table_name(view_name);
     let table_ident = crate::util::quote_identifier(&table_name);
     HiddenTableDef {
-        create_sql: format!("CREATE TABLE {table_ident} (version INTEGER)"),
+        create_sql: format!(
+            "CREATE TABLE {table_ident} (version INTEGER, overflowed_groups INTEGER)"
+        ),
         table_name,
         primary_key_index: false,
     }
@@ -1752,6 +1754,12 @@ fn state_table_sql(state_table_name: &str, node: &dag::OpNode) -> Result<String>
                         columns.push(format!("a{i}_{j}"));
                     }
                 }
+            }
+            if aggregates
+                .iter()
+                .any(|agg| matches!(agg.func, crate::function::AggFunc::Sum))
+            {
+                columns.push(super::aggregate::OVERFLOW_FLAG_COLUMN_NAME.to_string());
             }
             let key: Vec<String> = (0..group_exprs.len()).map(|i| format!("g{i}")).collect();
             Ok(format!(

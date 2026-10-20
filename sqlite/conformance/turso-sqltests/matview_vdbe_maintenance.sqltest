@@ -592,13 +592,16 @@ expect {
     real|1
 }
 
-# Deferring finalization must not suppress a genuine final overflow.
+# Deferring finalization must not suppress a genuine final overflow. The
+# INSERT succeeds; reading the view reports the overflow, as a plain view
+# does.
 test matview-vdbe-sum-final-integer-overflow-errors {
     CREATE TABLE sum_final_overflow(x);
     CREATE MATERIALIZED VIEW sum_final_overflow_view AS
       SELECT SUM(x) AS s FROM sum_final_overflow;
     INSERT INTO sum_final_overflow VALUES
       (9223372036854775807), (1);
+    SELECT * FROM sum_final_overflow_view;
 }
 expect error {
     integer overflow

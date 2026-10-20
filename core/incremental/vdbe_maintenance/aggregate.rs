@@ -152,6 +152,21 @@ fn emit_group_aggregate_rows(
             "state table {state_table_name} of materialized view {view_name} not found"
         ))
     })?;
+    // A SUM whose exact total does not fit in an integer cannot be shown, but
+    // the write that caused it must still succeed. Such a group keeps an
+    // overflow flag after its payloads, and the view counts its overflowed
+    // groups so that reading the view fails instead (see `OverflowCount`).
+    // Views created before the flag existed have no flag column; their SUM
+    // still fails the write.
+    let tracks_overflow = state_table.get_column(OVERFLOW_FLAG_COLUMN_NAME).is_some();
+    turso_assert!(
+        !tracks_overflow
+            || aggregates
+                .iter()
+                .any(|agg| matches!(agg.func, AggFunc::Sum)),
+        "only an aggregate with SUM keeps an overflow flag"
+    );
+    let state_width = k + aggregates.len() + total_payload + usize::from(tracks_overflow);
     let state_index = schema
         .get_indices(&state_table_name)
         .next()
@@ -196,6 +211,11 @@ fn emit_group_aggregate_rows(
         root_page: RegisterOrLiteral::Literal(state_index.root_page),
         db: 0,
     });
+    let overflow_count = if tracks_overflow {
+        Some(OverflowCount::open(program, schema, view_name)?)
+    } else {
+        None
+    };
     let mut multisets = Vec::with_capacity(aggregates.len());
     for (aggregate_index, aggregate) in aggregates.iter().enumerate() {
         multisets.push(if uses_multiset(aggregate) {
@@ -247,11 +267,17 @@ fn emit_group_aggregate_rows(
     let cnt_reg = program.alloc_register();
     let prev_rowid_scratch = program.alloc_register();
     let arg_reg = program.alloc_register();
-    // State record image: [g.., finalized aggregate values, payloads..].
-    // Keeping the natural output first makes the state table directly
-    // scannable as the aggregate node's arrangement.
-    let state_rec_start = program.alloc_registers(k + total_payload + aggregates.len());
+    // State record image: [g.., finalized aggregate values, payloads..,
+    // overflow flag if `tracks_overflow`]. Keeping the natural output first
+    // makes the state table directly scannable as the aggregate node's
+    // arrangement.
+    let state_rec_start = program.alloc_registers(state_width);
     let group_start = state_rec_start;
+    let overflow_flag_column = k + aggregates.len() + total_payload;
+    let overflow_flag_reg = state_rec_start + overflow_flag_column;
+    let new_overflow_flag_reg = program.alloc_register();
+    let sum_overflowed_reg = program.alloc_register();
+    let overflow_change_reg = program.alloc_register();
     // The current input row's group values. `group_start` holds the values
     // the group shows, which may be another member of its class.
     let incoming_group_start = program.alloc_registers(k);
@@ -380,6 +406,9 @@ fn emit_group_aggregate_rows(
             emit_payload_zero_init(program, agg, payload_start + offset);
         }
     }
+    if tracks_overflow {
+        program.emit_int(0, overflow_flag_reg);
+    }
     program.emit_insn(Insn::NewRowid {
         cursor: state_cursor_id,
         rowid_reg: state_rowid_reg,
@@ -444,6 +473,14 @@ fn emit_group_aggregate_rows(
             dest: persisted_value_start + i,
             default: None,
         });
+    }
+    if tracks_overflow {
+        emit_overflow_flag_load(
+            program,
+            state_cursor_id,
+            overflow_flag_column,
+            overflow_flag_reg,
+        );
     }
 
     program.preassign_label_to_next_insn(apply_label);
@@ -697,7 +734,7 @@ fn emit_group_aggregate_rows(
     // observe nor publish a transient aggregate result.
     program.emit_insn(Insn::MakeRecord {
         start_reg: to_u32(state_rec_start),
-        count: to_u32(k + total_payload + aggregates.len()),
+        count: to_u32(state_width),
         dest_reg: to_u32(state_record_reg),
         index_name: None,
         affinity_str: None,
@@ -776,6 +813,9 @@ fn emit_group_aggregate_rows(
                 flags: IdxInsertFlags::new(),
             });
             program.preassign_label_to_next_insn(unchanged_label);
+        }
+        if tracks_overflow {
+            program.emit_int(0, new_overflow_flag_reg);
         }
         for (i, agg) in aggregates.iter().enumerate() {
             let value_reg = agg_value_start + i;
@@ -871,8 +911,16 @@ fn emit_group_aggregate_rows(
                         non_int_count_reg: payload_start + offset + 4,
                         non_null_count_reg: payload_start + offset + 5,
                         dest_reg: value_reg,
+                        overflowed_reg: tracks_overflow.then_some(sum_overflowed_reg),
                     }),
                 });
+                if tracks_overflow {
+                    program.emit_insn(Insn::BitOr {
+                        lhs: new_overflow_flag_reg,
+                        rhs: sum_overflowed_reg,
+                        dest: new_overflow_flag_reg,
+                    });
+                }
             } else {
                 turso_assert!(
                     matches!(agg.func, AggFunc::Count | AggFunc::Count0),
@@ -892,9 +940,22 @@ fn emit_group_aggregate_rows(
             dst_reg: persisted_value_start,
             extra_amount: aggregates.len().saturating_sub(1),
         });
+        if let Some(overflow_count) = &overflow_count {
+            program.emit_insn(Insn::Subtract {
+                lhs: new_overflow_flag_reg,
+                rhs: overflow_flag_reg,
+                dest: overflow_change_reg,
+            });
+            overflow_count.emit_add(program, overflow_change_reg);
+            program.emit_insn(Insn::Copy {
+                src_reg: new_overflow_flag_reg,
+                dst_reg: overflow_flag_reg,
+                extra_amount: 0,
+            });
+        }
         program.emit_insn(Insn::MakeRecord {
             start_reg: to_u32(state_rec_start),
-            count: to_u32(k + total_payload + aggregates.len()),
+            count: to_u32(state_width),
             dest_reg: to_u32(state_record_reg),
             index_name: None,
             affinity_str: None,
@@ -979,6 +1040,14 @@ fn emit_group_aggregate_rows(
         payload_start,
         total_payload,
     );
+    if tracks_overflow {
+        emit_overflow_flag_load(
+            program,
+            state_cursor_id,
+            overflow_flag_column,
+            overflow_flag_reg,
+        );
+    }
 
     if !scalar {
         turso_assert!(
@@ -1021,6 +1090,14 @@ fn emit_group_aggregate_rows(
             table_name: state_table_name.clone(),
             is_part_of_update: true,
         });
+        if let Some(overflow_count) = &overflow_count {
+            program.emit_insn(Insn::Subtract {
+                lhs: zero_reg,
+                rhs: overflow_flag_reg,
+                dest: overflow_change_reg,
+            });
+            overflow_count.emit_add(program, overflow_change_reg);
+        }
         program.emit_insn(Insn::Goto {
             target_pc: finalize_next_label,
         });
@@ -1072,6 +1149,9 @@ fn emit_group_aggregate_rows(
                 emit_payload_zero_init(program, agg, payload_start + offset);
             }
         }
+        if tracks_overflow {
+            program.emit_int(0, overflow_flag_reg);
+        }
         program.emit_insn(Insn::Null {
             dest: persisted_value_start,
             dest_end: Some(persisted_value_start + aggregates.len() - 1),
@@ -1106,6 +1186,122 @@ fn emit_group_aggregate_rows(
 
     drop(syms);
     Ok(())
+}
+
+/// Name of the state-table column holding a group's overflow flag.
+pub(super) const OVERFLOW_FLAG_COLUMN_NAME: &str = "overflowed";
+
+/// Load a group's overflow flag.
+fn emit_overflow_flag_load(
+    program: &mut ProgramBuilder,
+    state_cursor_id: usize,
+    overflow_flag_column: usize,
+    overflow_flag_reg: usize,
+) {
+    program.emit_insn(Insn::Column {
+        cursor_id: state_cursor_id,
+        column: overflow_flag_column,
+        dest: overflow_flag_reg,
+        default: None,
+    });
+}
+
+/// The number of a view's groups whose SUM total does not fit in an integer,
+/// kept in one row of the view's metadata table. Reading the view fails
+/// while it is above zero (see `Insn::CheckViewOverflow`).
+struct OverflowCount {
+    table_name: String,
+    metadata_cursor_id: usize,
+    rowid_reg: usize,
+    /// Two consecutive registers: the metadata row's version and count.
+    record_start: usize,
+    record_reg: usize,
+}
+
+impl OverflowCount {
+    fn open(program: &mut ProgramBuilder, schema: &Schema, view_name: &str) -> Result<Self> {
+        let table_name = crate::incremental::view::dbsp_version_marker_table_name(view_name);
+        let table = schema.get_btree_table(&table_name).ok_or_else(|| {
+            LimboError::InternalError(format!(
+                "metadata table {table_name} of materialized view {view_name} not found"
+            ))
+        })?;
+        let metadata_cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(table.clone()));
+        program.emit_insn(Insn::OpenWrite {
+            cursor_id: metadata_cursor_id,
+            root_page: RegisterOrLiteral::Literal(table.root_page),
+            db: 0,
+        });
+        Ok(Self {
+            table_name,
+            metadata_cursor_id,
+            rowid_reg: program.alloc_register(),
+            record_start: program.alloc_registers(2),
+            record_reg: program.alloc_register(),
+        })
+    }
+
+    /// Add `change_reg` (-1, 0 or 1) to the count.
+    fn emit_add(&self, program: &mut ProgramBuilder, change_reg: usize) {
+        let done_label = program.allocate_label();
+        let missing_label = program.allocate_label();
+        let have_label = program.allocate_label();
+        let count_reg = self.record_start + 1;
+        program.emit_insn(Insn::IfNot {
+            reg: change_reg,
+            target_pc: done_label,
+            jump_if_null: false,
+        });
+        program.emit_int(
+            crate::incremental::view::OVERFLOWED_GROUPS_ROWID,
+            self.rowid_reg,
+        );
+        program.emit_insn(Insn::NotExists {
+            cursor: self.metadata_cursor_id,
+            rowid_reg: self.rowid_reg,
+            target_pc: missing_label,
+        });
+        program.emit_insn(Insn::Column {
+            cursor_id: self.metadata_cursor_id,
+            column: crate::incremental::view::OVERFLOWED_GROUPS_COLUMN,
+            dest: count_reg,
+            default: None,
+        });
+        program.emit_insn(Insn::Goto {
+            target_pc: have_label,
+        });
+        program.preassign_label_to_next_insn(missing_label);
+        program.emit_int(0, count_reg);
+        program.preassign_label_to_next_insn(have_label);
+        program.emit_insn(Insn::Add {
+            lhs: count_reg,
+            rhs: change_reg,
+            dest: count_reg,
+        });
+        program.emit_int(
+            i64::from(crate::incremental::view::DBSP_CIRCUIT_VERSION),
+            self.record_start,
+        );
+        program.emit_insn(Insn::MakeRecord {
+            start_reg: to_u32(self.record_start),
+            count: 2,
+            dest_reg: to_u32(self.record_reg),
+            index_name: None,
+            affinity_str: None,
+        });
+        program.emit_insn(Insn::Insert {
+            cursor: self.metadata_cursor_id,
+            key_reg: self.rowid_reg,
+            record_reg: self.record_reg,
+            flag: InsertFlags(
+                InsertFlags::REQUIRE_SEEK
+                    | InsertFlags::SKIP_LAST_ROWID
+                    | InsertFlags::SKIP_STATEMENT_CHANGE_COUNT,
+            ),
+            table_name: self.table_name.clone(),
+        });
+        program.preassign_label_to_next_insn(done_label);
+    }
 }
 
 /// Read the member that the class of the value key at

@@ -250,6 +250,14 @@ and their exact total does not fit in `i64`; a non-integer contribution in
 the same group always yields a REAL result rather than an error, matching
 `total()`'s behavior. See `finalize_ivm_sum` in `core/vdbe/execute.rs`.
 
+Like a plain view, the error is reported when the view is read, not by the
+write that caused it. The group stores NULL in place of the total and a flag
+in its state row, the view's metadata table counts flagged groups, and
+`CheckViewOverflow` (emitted before every read cursor on a materialized view)
+fails while the view or a materialized view it reads has a flagged group.
+Unlike SQLite, which may skip an overflowing group a query filters out, every
+read of the view fails until the total fits again.
+
 Floating-point addition is not associative, so a materialized view's
 incrementally maintained REAL result can differ from a fresh evaluation of
 the same SELECT in the last bit when rows are combined in a different order.

@@ -26,6 +26,12 @@ pub(crate) fn dbsp_version_marker_table_name(view_name: &str) -> String {
     )
 }
 
+/// The metadata table row and column holding how many of the view's groups
+/// have a SUM total that does not fit in an integer. A missing row means
+/// zero.
+pub(crate) const OVERFLOWED_GROUPS_ROWID: i64 = 1;
+pub(crate) const OVERFLOWED_GROUPS_COLUMN: usize = 1;
+
 /// Whether a version-stripped hidden-state key belongs to `view_name`.
 ///
 /// Current keys are `<view>__n<decimal-node-id>` with an optional
@@ -1151,8 +1157,11 @@ mod tests {
         assert!(spill_started);
     }
 
+    /// A maintenance error raised after the aggregate state was updated, here
+    /// abs() of the smallest integer, fails the write and leaves no trace of
+    /// it in the view's state.
     #[test]
-    fn aggregate_finalization_error_rolls_back_intermediate_state() {
+    fn aggregate_maintenance_error_rolls_back_intermediate_state() {
         #[allow(clippy::arc_with_non_send_sync)]
         let io: Arc<dyn crate::IO> = Arc::new(crate::MemoryIO::new());
         let db = Database::open_file_with_flags(
@@ -1167,15 +1176,15 @@ mod tests {
         let conn = db.connect(ConnectOpts::new()).unwrap();
         conn.execute("CREATE TABLE aggregate_base(x)").unwrap();
         conn.execute(
-            "CREATE MATERIALIZED VIEW aggregate_view AS SELECT SUM(x) AS total FROM aggregate_base",
+            "CREATE MATERIALIZED VIEW aggregate_view AS SELECT abs(SUM(x)) AS total FROM aggregate_base",
         )
         .unwrap();
         conn.execute("INSERT INTO aggregate_base VALUES (5)")
             .unwrap();
 
         let error = conn
-            .execute("INSERT INTO aggregate_base VALUES (9223372036854775807), (1)")
-            .expect_err("the completed integer sum must overflow");
+            .execute("INSERT INTO aggregate_base VALUES (-9223372036854775807), (-6)")
+            .expect_err("abs() of the smallest integer must overflow");
         assert!(error.to_string().contains("integer overflow"));
 
         let mut query = conn

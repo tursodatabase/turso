@@ -1110,6 +1110,8 @@ pub struct ProgramState {
     op_vacuum_state: VacuumOpState,
     /// State machine for committing view deltas with I/O handling
     view_delta_state: ViewDeltaApplyState,
+    /// Progress of Insn::CheckViewOverflow, kept across I/O yields.
+    view_overflow_check: execute::ViewOverflowCheckState,
     /// Parked state for Insn::PopulateMaterializedViews: the population
     /// statement currently being stepped, re-entrant across I/O yields.
     pub(crate) populate_matviews_state: Option<PopulateMatViewsState>,
@@ -1250,6 +1252,7 @@ impl ProgramState {
             distinct_key_values: Vec::new(),
             op_vacuum_state: VacuumOpState::None,
             view_delta_state: ViewDeltaApplyState::NotStarted,
+            view_overflow_check: execute::ViewOverflowCheckState::NotStarted,
             populate_matviews_state: None,
             auto_txn_cleanup: TxnCleanup::None,
             fk_deferred_violations_when_stmt_started: AtomicIsize::new(0),
@@ -1412,6 +1415,7 @@ impl ProgramState {
         self.sequence_inner_commit = None;
         self.op_vacuum_state = VacuumOpState::None;
         self.view_delta_state = ViewDeltaApplyState::NotStarted;
+        self.view_overflow_check = execute::ViewOverflowCheckState::NotStarted;
         self.populate_matviews_state = None;
         self.auto_txn_cleanup = TxnCleanup::None;
         *self.fk_immediate_violations_during_stmt.get_mut() = 0;

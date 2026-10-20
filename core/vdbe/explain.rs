@@ -1465,9 +1465,18 @@ pub fn insn_to_row(
                 Value::build_text(""),
                 0,
                 format!(
-                    "{:?} state=r[{}..] dest=r[{}]",
-                    data.kind, data.int_wrapped_reg, data.dest_reg
+                    "{:?} state=r[{}..] dest=r[{}] overflowed={:?}",
+                    data.kind, data.int_wrapped_reg, data.dest_reg, data.overflowed_reg
                 ),
+            ),
+            Insn::CheckViewOverflow { view_name } => (
+                "CheckViewOverflow",
+                0,
+                0,
+                0,
+                Value::build_text(view_name.clone()),
+                0,
+                format!("fail if a SUM in {view_name} does not fit in an integer"),
             ),
             Insn::SorterOpen { data } => {
                 let SorterOpenData {

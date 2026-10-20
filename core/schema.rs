@@ -1397,6 +1397,26 @@ impl Schema {
         Ok(ordered)
     }
 
+    /// `view_name` and every materialized view it reads, directly or through
+    /// other materialized views.
+    pub fn materialized_view_and_its_sources(&self, view_name: &str) -> Vec<String> {
+        let mut views = vec![normalize_ident(view_name)];
+        let mut next = 0;
+        while next < views.len() {
+            let view = views[next].clone();
+            for (source, dependents) in &self.table_to_materialized_views {
+                if dependents.contains(&view)
+                    && self.is_materialized_view(source)
+                    && !views.contains(source)
+                {
+                    views.push(source.clone());
+                }
+            }
+            next += 1;
+        }
+        views
+    }
+
     /// Add a regular (non-materialized) view
     pub fn add_view(&mut self, view: View) -> Result<()> {
         self.check_object_name_conflict(&view.name, SchemaObjectType::View)?;

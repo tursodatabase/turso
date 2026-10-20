@@ -361,18 +361,25 @@ impl RustDatabaseInstance {
         for (name, definition) in definitions {
             let quoted_name = name.replace('"', "\"\"");
             let stored_sql = format!("SELECT * FROM \"{quoted_name}\"");
-            let stored = match self.collect_typed_result(&stored_sql).await {
-                Ok(result) => result,
-                Err(error) => {
+            let (stored, fresh) = match (
+                self.collect_typed_result(&stored_sql).await,
+                self.collect_typed_result(&definition).await,
+            ) {
+                (Ok(stored), Ok(fresh)) => (stored, fresh),
+                // A SUM total that does not fit in an integer makes both the
+                // view and its defining SELECT fail; that is agreement.
+                (Err(stored_error), Err(fresh_error))
+                    if is_integer_overflow(&stored_error) && is_integer_overflow(&fresh_error) =>
+                {
+                    continue;
+                }
+                (Err(error), _) => {
                     failures.push(format!(
                         "reading materialized view {name} failed: {error}\n  definition: {definition}"
                     ));
                     continue;
                 }
-            };
-            let fresh = match self.collect_typed_result(&definition).await {
-                Ok(result) => result,
-                Err(error) => {
+                (_, Err(error)) => {
                     failures.push(format!(
                         "evaluating the defining SELECT for {name} failed: {error}\n  definition: {definition}"
                     ));
@@ -399,6 +406,10 @@ impl RustDatabaseInstance {
             )))
         }
     }
+}
+
+fn is_integer_overflow(error: &turso::Error) -> bool {
+    error.to_string().contains("integer overflow")
 }
 
 fn to_typed_value(value: Value) -> TypedValue {

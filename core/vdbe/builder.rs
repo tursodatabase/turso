@@ -1258,6 +1258,13 @@ impl ProgramBuilder {
             self.emit_column_maybe_fused(cursor_id, column, dest, default);
             return;
         }
+        if let Insn::OpenRead { cursor_id, .. } = insn {
+            if let Some(CursorType::MaterializedView(_, view)) = self.get_cursor_type(cursor_id) {
+                let view_name = view.lock().name().to_string();
+                self.insns
+                    .push((Insn::CheckViewOverflow { view_name }, self.insns.len()));
+            }
+        }
         self.insns.push((insn, self.insns.len()));
     }
 
