@@ -1008,7 +1008,6 @@ fn emit_unmatched_rows_subquery(
             *subquery_plan,
             &subquery.query_type,
             subquery.correlated,
-            false,
         )
     })
 }

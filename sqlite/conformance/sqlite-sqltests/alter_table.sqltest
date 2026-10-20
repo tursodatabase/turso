@@ -857,6 +857,25 @@ expect {
     1|hello
 }
 
+# Differential-fuzzer regression: successful ADD COLUMN statements can expose
+# empty result metadata, so their observable result is the resulting schema.
+@cross-check-integrity
+test strict-alter-add-column-resulting-schema {
+    CREATE TABLE tbl_imaginative_chris (
+        col_captivating_building INTEGER PRIMARY KEY,
+        col_ravishing_yearzero TEXT UNIQUE
+    ) STRICT;
+    ALTER TABLE tbl_imaginative_chris ADD COLUMN col_loyal_sarnoff TEXT;
+    SELECT name, type
+      FROM pragma_table_info('tbl_imaginative_chris')
+     ORDER BY cid;
+}
+expect {
+    col_captivating_building|INTEGER
+    col_ravishing_yearzero|TEXT
+    col_loyal_sarnoff|TEXT
+}
+
 @cross-check-integrity
 test strict-alter-add-column-any {
     CREATE TABLE t(a INTEGER) STRICT;
@@ -1660,6 +1679,43 @@ test alter-table-rename-trigger-exists-subquery {
 }
 expect {
     42
+}
+
+# A FROM subquery cannot see the other tables in the same FROM clause, so the
+# unqualified `a` in `(SELECT a FROM u)` reads u.a and must not be renamed.
+@cross-check-integrity
+test alter-table-rename-column-trigger-keeps-from-subquery-column {
+    CREATE TABLE t(a INT);
+    CREATE TABLE u(a INT);
+    CREATE TABLE src(v INT);
+    CREATE TRIGGER tr AFTER INSERT ON src BEGIN
+        SELECT s.a FROM t, (SELECT a FROM u) AS s;
+    END;
+    ALTER TABLE t RENAME COLUMN a TO b;
+    INSERT INTO src VALUES (1);
+    SELECT count(*) FROM src;
+}
+expect {
+    1
+}
+
+@cross-check-integrity
+test alter-table-rename-column-trigger-from-subquery-reads-other-table {
+    CREATE TABLE t(a INT);
+    CREATE TABLE u(a INT, b INT);
+    CREATE TABLE src(v INT);
+    CREATE TABLE log(x);
+    INSERT INTO t VALUES (100);
+    INSERT INTO u VALUES (1, 2);
+    CREATE TRIGGER tr AFTER INSERT ON src BEGIN
+        INSERT INTO log SELECT s.a FROM t, (SELECT a FROM u) AS s;
+    END;
+    ALTER TABLE t RENAME COLUMN a TO b;
+    INSERT INTO src VALUES (1);
+    SELECT x FROM log;
+}
+expect {
+    1
 }
 
 test alter-table-rename-then-rename-column-trigger {

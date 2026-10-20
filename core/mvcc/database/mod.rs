@@ -1979,7 +1979,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CommitStateMachine<Clock, A> {
         if let Some(tx) = mvcc_store.txs.get(&owner_tx) {
             mvcc_store.unlock_commit_lock_if_held(tx.value());
         }
-        crate::without_allocation_faults!(mvcc_store.remove_tx(owner_tx).expect(ALLOC_ERR_MSG));
+        crate::without_allocation_faults!(mvcc_store.remove_tx(owner_tx));
         Ok(())
     }
 
@@ -3326,7 +3326,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> StateTransition for CommitStat
                         mvcc_store.release_exclusive_tx(&self.tx_id);
                     }
                     mvcc_store.unlock_commit_lock_if_held(tx);
-                    mvcc_store.finish_committed_tx(self.tx_id, &self.connection, self.db_id)?;
+                    mvcc_store.finish_committed_tx(self.tx_id, &self.connection, self.db_id);
                     inject_transition_failure!(self, CommitYieldPoint::AfterRemoveTx);
                     self.finalize(mvcc_store)?;
                     return Ok(TransitionResult::Done(()));
@@ -3400,7 +3400,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> StateTransition for CommitStat
                         mvcc_store.release_exclusive_tx(&self.tx_id);
                         self.commit_coordinator.unlock_pager_commit_lock();
                     }
-                    mvcc_store.finish_committed_tx(self.tx_id, &self.connection, self.db_id)?;
+                    mvcc_store.finish_committed_tx(self.tx_id, &self.connection, self.db_id);
                     inject_transition_failure!(self, CommitYieldPoint::AfterRemoveTx);
                     self.finalize(mvcc_store)?;
                     return Ok(TransitionResult::Done(()));
@@ -3627,8 +3627,12 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> StateTransition for CommitStat
                         != Some(tx_header.schema_cookie.get());
                 self.did_commit_schema_change = schema_did_change;
                 if schema_did_change {
-                    let schema = self.connection.schema.read().clone();
-                    self.connection.db.update_schema_if_newer(schema);
+                    if self.db_id == crate::MAIN_DB_ID {
+                        let schema = self.connection.schema.read().clone();
+                        self.connection.db.update_schema_if_newer(schema);
+                    } else {
+                        self.connection.publish_database_schema(self.db_id);
+                    }
                 }
                 // Guard the global_header write against out-of-order
                 // completion. An exclusive tx can bypass `pager_commit_lock`
@@ -3733,7 +3737,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> StateTransition for CommitStat
                     mvcc_store.release_exclusive_tx(&self.tx_id);
                 }
                 inject_transition_yield!(self, CommitYieldPoint::BeforeFinishCommittedTx);
-                mvcc_store.finish_committed_tx(self.tx_id, &self.connection, self.db_id)?;
+                mvcc_store.finish_committed_tx(self.tx_id, &self.connection, self.db_id);
                 inject_transition_failure!(self, CommitYieldPoint::AfterRemoveTx);
                 if appended_to_log && mvcc_store.storage.should_checkpoint() {
                     let auto_checkpoint_mode = if mvcc_store.uses_passive_checkpoint() {
@@ -6723,6 +6727,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         pager.mvcc_refresh_if_db_changed();
         let read_mark = WalPos::from_pair(pager.wal_pos());
         let mut schema_stale = false;
+        let mut schema_change_unpublished = false;
         let begin_ts = self.clock.get_timestamp(|ts| {
             // Capture header (cookie) + schema_generation INSIDE the clock so they are
             // consistent with the root map at insert time: a passive publish runs under this
@@ -6739,14 +6744,24 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                 .global_header
                 .read()
                 .expect("global_header initialized above");
+            // A schema change that already has its end_ts but has not published its schema
+            // cookie yet would be visible in our row snapshot but not in our header, so the
+            // statement would run its old schema against the new rows.
+            if self.exclusive_tx_has_unpublished_schema_cookie(header.schema_cookie.get()) {
+                schema_change_unpublished = true;
+                return;
+            }
             self.txs.insert(
                 tx_id,
                 Transaction::new(tx_id, ts, header, read_mark, schema_generation),
             );
         });
-        if schema_stale {
+        if schema_stale || schema_change_unpublished {
             if !passive {
                 self.blocking_checkpoint_lock.unlock();
+            }
+            if schema_change_unpublished {
+                return Err(LimboError::Busy);
             }
             return Err(LimboError::SchemaUpdated);
         }
@@ -6769,7 +6784,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         Ok(())
     }
 
-    pub fn remove_tx(&self, tx_id: TxID) -> Result<(), TryReserveError> {
+    pub fn remove_tx(&self, tx_id: TxID) {
         self.remove_sequence_allocations(tx_id);
         if let Some(entry) = self.txs.get(&tx_id) {
             let tx = entry.value();
@@ -6811,10 +6826,9 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
             if held_checkpoint_read {
                 self.blocking_checkpoint_lock.unlock();
             }
-            return Ok(());
+            return;
         }
         self.txs.remove(&tx_id);
-        Ok(())
     }
 
     #[turso_macros::allocation_site(crate::alloc::MvStoreAllocationSite::FinalizedTxStateInsert)]
@@ -6921,14 +6935,9 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
     /// Use this anywhere the commit state machine would otherwise call
     /// `remove_tx` directly. Other call sites that don't have a connection
     /// context (e.g. tests poking internal state) keep using `remove_tx`.
-    pub fn finish_committed_tx(
-        &self,
-        tx_id: TxID,
-        conn: &Connection,
-        db_id: usize,
-    ) -> Result<(), TryReserveError> {
+    pub fn finish_committed_tx(&self, tx_id: TxID, conn: &Connection, db_id: usize) {
         conn.set_mv_tx_for_db(db_id, None);
-        self.remove_tx(tx_id)
+        self.remove_tx(tx_id);
     }
 
     fn get_new_transaction_database_header(&self, pager: &Arc<Pager>) -> DatabaseHeader {
@@ -7193,7 +7202,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         // already completed its register_commit_dependency call (it runs under the
         // read lock), so no future txs.get() for this tx_id can come from a
         // speculative read path.
-        crate::without_allocation_faults!(self.remove_tx(tx_id).expect(ALLOC_ERR_MSG));
+        crate::without_allocation_faults!(self.remove_tx(tx_id));
     }
 
     /// Removes the slots of a table or index created by a transaction that rolled back.
@@ -7279,9 +7288,9 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                 if self.is_exclusive_tx(&tx_id) {
                     self.release_exclusive_tx(&tx_id);
                 }
-                crate::without_allocation_faults!(self
-                    .finish_committed_tx(tx_id, connection, db_id)
-                    .expect(ALLOC_ERR_MSG));
+                crate::without_allocation_faults!(
+                    self.finish_committed_tx(tx_id, connection, db_id)
+                );
             }
             Some(TransactionState::Aborted | TransactionState::Terminated) | None => {
                 if connection.get_mv_tx_id_for_db(db_id) == Some(tx_id) {
@@ -7618,6 +7627,18 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
     #[inline]
     fn has_exclusive_tx(&self) -> bool {
         self.exclusive_tx.load(Ordering::Acquire) != NO_EXCLUSIVE_TX
+    }
+
+    /// Returns true if the exclusive transaction is committing a schema cookie other than
+    /// `global_schema_cookie`, and has already taken its commit timestamp.
+    fn exclusive_tx_has_unpublished_schema_cookie(&self, global_schema_cookie: u32) -> bool {
+        let Some(entry) = self.txs.get(&self.exclusive_tx.load(Ordering::Acquire)) else {
+            return false;
+        };
+        let tx = entry.value();
+        matches!(tx.state.load(), TransactionState::Preparing(_))
+            && tx.header_dirty.load(Ordering::Acquire)
+            && tx.header.read().schema_cookie.get() != global_schema_cookie
     }
 
     fn has_preparing_tx_other_than(&self, tx_id: TxID) -> bool {
@@ -9476,16 +9497,14 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                 connection.dialect().as_ref(),
             )?;
         }
-        fresh.populate_indices(
+        fresh.populate_materialized_views_then_indices(
             &syms,
-            from_sql_indexes,
-            automatic_indices,
-            mv_store.is_some(),
-        )?;
-        fresh.populate_materialized_views(
             materialized_view_info,
             dbsp_state_roots,
             dbsp_state_index_roots,
+            from_sql_indexes,
+            automatic_indices,
+            mv_store.is_some(),
         )?;
 
         Ok(Arc::new(fresh))
@@ -10430,16 +10449,14 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                 connection.dialect().as_ref(),
             )?;
         }
-        fresh.populate_indices(
+        fresh.populate_materialized_views_then_indices(
             &syms,
-            from_sql_indexes,
-            automatic_indices,
-            mv_store.is_some(),
-        )?;
-        fresh.populate_materialized_views(
             materialized_view_info,
             dbsp_state_roots,
             dbsp_state_index_roots,
+            from_sql_indexes,
+            automatic_indices,
+            mv_store.is_some(),
         )?;
 
         Ok(Arc::new(fresh))

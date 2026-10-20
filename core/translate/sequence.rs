@@ -142,7 +142,10 @@ pub fn emit_sequence_backing_table(
         cursor: seq_cursor_id,
         key_reg: base_reg, // base_reg holds the start value
         record_reg,
-        flag: InsertFlags::new().require_seek().skip_all_change_counts(),
+        flag: InsertFlags::new()
+            .require_seek()
+            .skip_last_rowid()
+            .skip_all_change_counts(),
         table_name: seq_name.to_string(),
     });
 
@@ -180,9 +183,9 @@ pub fn emit_disk_read_nextval(
     seq_name: &str,
     seq: &Sequence,
     target_register: usize,
-    // Optional caller-supplied register already holding the seq name as
-    // text (e.g. populated by user-arg evaluation in the SQL translator).
-    // When `None` the helper allocates its own.
+    // Optional caller-supplied register holding the name that currval is
+    // keyed by (the user's spelling, e.g. `'main.my_seq'`). When `None`
+    // the helper allocates one holding `seq_name`.
     seq_name_reg: Option<usize>,
 ) -> Result<()> {
     let backing_table_name = sequence_backing_table_name(seq_name);
@@ -259,7 +262,7 @@ pub fn emit_disk_read_nextval(
 
     program.emit_insn(Insn::SequenceComputeNext {
         db: database_id,
-        seq_name_reg,
+        seq_name: seq_name.to_string(),
         in_value_reg: col_base,
         in_is_called_reg: col_base + 1,
         was_empty_reg,
@@ -289,7 +292,10 @@ pub fn emit_disk_read_nextval(
         cursor: cursor_id,
         key_reg: target_register,
         record_reg,
-        flag: InsertFlags::new().require_seek().skip_all_change_counts(),
+        flag: InsertFlags::new()
+            .require_seek()
+            .skip_last_rowid()
+            .skip_all_change_counts(),
         table_name: seq_name.to_string(),
     });
 
@@ -368,7 +374,7 @@ pub fn emit_disk_read_nextval(
     // `op_sequence_register_allocation`.
     program.emit_insn(Insn::SequenceRegisterAllocation {
         db: database_id,
-        seq_name_reg,
+        seq_name: seq_name.to_string(),
         value_reg: target_register,
         saved_outer_reg,
     });
@@ -398,7 +404,7 @@ pub fn emit_disk_read_nextval(
 
     program.emit_insn(Insn::SequenceTrackAllocation {
         db: database_id,
-        seq_name_reg,
+        seq_name: seq_name.to_string(),
         value_reg: target_register,
     });
 
@@ -557,7 +563,10 @@ pub fn emit_disk_advance_past(
         cursor: cursor_id,
         key_reg: value_reg,
         record_reg,
-        flag: InsertFlags::new().require_seek().skip_all_change_counts(),
+        flag: InsertFlags::new()
+            .require_seek()
+            .skip_last_rowid()
+            .skip_all_change_counts(),
         table_name: seq_name.to_string(),
     });
     let seq_name_reg = program.emit_string8_new_reg(seq_name.to_string());
@@ -778,7 +787,10 @@ pub(crate) fn emit_sqlite_sequence_sync(
         cursor: sseq_cursor,
         key_reg: rowid_reg,
         record_reg,
-        flag: InsertFlags::new().require_seek().skip_all_change_counts(),
+        flag: InsertFlags::new()
+            .require_seek()
+            .skip_last_rowid()
+            .skip_all_change_counts(),
         table_name: SQLITE_SEQUENCE_TABLE_NAME.to_string(),
     });
     program.emit_insn(Insn::Close {

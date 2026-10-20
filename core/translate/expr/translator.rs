@@ -15,7 +15,7 @@ pub enum NoConstantOptReason {
     ///    datetime('now')), so hoisting would produce incorrect results.
     ///
     /// 2. Even if the encode function were deterministic, the encode is
-    ///    applied in-place to the target register inside the update loop.
+    ///    applied in-place to the target register inside the row loop.
     ///    If the original value were hoisted (evaluated once before the
     ///    loop), the second iteration would read the already-encoded value
     ///    from the register and encode it again, causing progressive
@@ -307,28 +307,14 @@ fn copy_cached_expr_reg(
                 if let Some((_, table)) = referenced_tables.find_table_by_internal_id(*table_ref_id)
                 {
                     if let Some(col) = table.get_column_at(*column) {
-                        if let Some(type_def) = resolver
-                            .schema()
-                            .get_type_def(&col.ty_str, table.is_strict())
-                        {
-                            if let Some(decode_expr) = type_def.decode() {
-                                let skip_label = program.allocate_label();
-                                program.emit_insn(Insn::IsNull {
-                                    reg: target_register,
-                                    target_pc: skip_label,
-                                });
-                                emit_type_expr(
-                                    program,
-                                    decode_expr,
-                                    target_register,
-                                    target_register,
-                                    col,
-                                    type_def,
-                                    resolver,
-                                )?;
-                                program.preassign_label_to_next_insn(skip_label);
-                            }
-                        }
+                        emit_user_facing_column_value(
+                            program,
+                            target_register,
+                            target_register,
+                            col,
+                            table.is_strict(),
+                            resolver,
+                        )?;
                     }
                 }
             }
@@ -2636,16 +2622,13 @@ fn translate_column_expr(
                         // default, suppress the Column instruction's default.
                         // We handle short records (ALTER TABLE ADD COLUMN) via
                         // ColumnHasField after the Column instruction.
-                        let col_ref = table.get_column_at(column);
-                        if let Some(col) = col_ref {
-                            if col.default.is_some() {
-                                if let Ok(Some(resolved)) = resolver
-                                    .schema()
-                                    .resolve_type(&col.ty_str, table.is_strict())
-                                {
-                                    if resolved.chain.iter().any(|td| td.encode().is_some()) {
-                                        program.flags.set_suppress_column_default(true);
-                                    }
+                        if table_column.default.is_some() {
+                            if let Ok(Some(resolved)) = resolver
+                                .schema()
+                                .resolve_type(&table_column.ty_str, table.is_strict())
+                            {
+                                if resolved.chain.iter().any(|td| td.encode().is_some()) {
+                                    program.flags.set_suppress_column_default(true);
                                 }
                             }
                         }
@@ -2681,20 +2664,17 @@ fn translate_column_expr(
                     // (ALTER TABLE ADD COLUMN) return NULL.  Use
                     // ColumnHasField to detect short records and compute
                     // ENCODE(DEFAULT) at runtime via bytecode.
-                    if let Some(type_def) = resolver
+                    if let Ok(Some(resolved)) = resolver
                         .schema()
-                        .get_type_def(&column.ty_str, table.is_strict())
+                        .resolve_type(&column.ty_str, table.is_strict())
                     {
-                        if type_def.encode().is_some() {
-                            if let Some(ref default_expr) = column.default {
-                                // Reconstruct the cursor id used for reading
-                                let read_cursor = if read_from_index {
-                                    index_cursor_id.expect("index cursor should be opened")
-                                } else {
-                                    table_cursor_id
-                                        .or(index_cursor_id)
-                                        .expect("cursor should be opened")
-                                };
+                        if resolved.chain.iter().any(|td| td.encode().is_some()) {
+                            if let Some(default_expr) =
+                                column.default.as_ref().filter(|_| !read_from_index)
+                            {
+                                let read_cursor = table_cursor_id
+                                    .or(index_cursor_id)
+                                    .expect("cursor should be opened");
                                 let done_label = program.allocate_label();
                                 // Jump past the default block if the record
                                 // actually has this column (not a short record).
@@ -2712,16 +2692,18 @@ fn translate_column_expr(
                                     resolver,
                                     NoConstantOptReason::RegisterReuse,
                                 )?;
-                                if let Some(encode_expr) = type_def.encode() {
-                                    emit_type_expr(
-                                        program,
-                                        encode_expr,
-                                        target_register,
-                                        target_register,
-                                        column,
-                                        type_def,
-                                        resolver,
-                                    )?;
+                                for td in &resolved.chain {
+                                    if let Some(encode_expr) = td.encode() {
+                                        emit_type_expr(
+                                            program,
+                                            encode_expr,
+                                            target_register,
+                                            target_register,
+                                            column,
+                                            td,
+                                            resolver,
+                                        )?;
+                                    }
                                 }
                                 program.preassign_label_to_next_insn(done_label);
                             }

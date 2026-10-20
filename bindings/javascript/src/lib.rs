@@ -69,6 +69,9 @@ pub struct DatabaseInner {
     /// Weak refs to every shared statement handle created by this database.
     /// `close()` upgrades each live handle and sets it to `None`, which
     /// finalizes the statement and releases its `Arc<Connection>`.
+    /// `prepare()` drops the handles of collected statements whenever the
+    /// vector is full, then keeps room for as many new handles as there are
+    /// live ones, so it scans the vector once per that many prepares.
     stmts: Mutex<Vec<Weak<RefCell<Option<turso_core::Statement>>>>>,
 }
 
@@ -505,7 +508,15 @@ impl Database {
             .collect();
         #[allow(clippy::arc_with_non_send_sync)]
         let stmt: StatementHandle = Arc::new(RefCell::new(Some(stmt)));
-        inner.stmts.lock().unwrap().push(Arc::downgrade(&stmt));
+        {
+            let mut stmts = inner.stmts.lock().unwrap();
+            if stmts.len() == stmts.capacity() {
+                stmts.retain(|handle| handle.strong_count() > 0);
+                let live = stmts.len();
+                stmts.reserve(live);
+            }
+            stmts.push(Arc::downgrade(&stmt));
+        }
         Ok(Statement {
             stmt,
             column_names,
@@ -1032,7 +1043,22 @@ fn to_js_value<'a>(
 
 #[cfg(test)]
 mod tests {
-    use super::apply_experimental_features;
+    use super::{apply_experimental_features, Database};
+
+    #[test]
+    fn prepare_does_not_keep_handles_of_dropped_statements() {
+        let mut db = Database::new(":memory:".to_string(), None).unwrap();
+        db.connect_sync().unwrap();
+
+        let live = db.prepare("SELECT 1".to_string()).unwrap();
+        for _ in 0..10_000 {
+            drop(db.prepare("SELECT 1".to_string()).unwrap());
+        }
+        assert!(db.inner().unwrap().stmts.lock().unwrap().len() < 100);
+
+        db.close().unwrap();
+        assert!(live.stmt.borrow().is_none());
+    }
 
     #[test]
     fn apply_experimental_features_maps_feature_list() {

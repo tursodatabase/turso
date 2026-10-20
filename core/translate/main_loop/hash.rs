@@ -2,7 +2,7 @@ use super::*;
 use crate::alloc::{TryClone, TursoIteratorExt};
 use crate::schema::GeneratedType;
 use crate::translate::emitter::HashLabels;
-use crate::translate::expr::comparison_affinity;
+use crate::translate::expr::{comparison_affinity, maybe_apply_affinity};
 use crate::translate::plan::ColumnUsedMask;
 use crate::vdbe::builder::SelfTableContext;
 
@@ -394,6 +394,23 @@ impl<'a, 'plan> PreparedHashBuild<'a, 'plan> {
                             payload_reg + i,
                             build_table.columns()[col_idx].affinity(),
                         );
+                    }
+                    Some(_) if !config.uses_materialized_keys_and_payload => {
+                        planner.program.emit_column_or_rowid(
+                            payload_source_cursor_id,
+                            col_idx,
+                            payload_reg + i,
+                        );
+                        let column = &build_table.columns()[col_idx];
+                        if planner
+                            .t_ctx
+                            .resolver
+                            .schema()
+                            .get_type_def(&column.ty_str, build_table.table.is_strict())
+                            .is_none()
+                        {
+                            maybe_apply_affinity(column.ty(), payload_reg + i, planner.program);
+                        }
                     }
                     _ => planner.program.emit_column_or_rowid(
                         payload_source_cursor_id,

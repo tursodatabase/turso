@@ -3,7 +3,7 @@ use crate::vdbe::{
     insn::{ClearBtreeCount, IntegrityCkData, RegisterOrLiteral, SorterOpenData},
 };
 use crate::HashSet;
-use turso_parser::ast::{ResolveType, SortOrder};
+use turso_parser::ast::SortOrder;
 
 use super::{Insn, InsnReference, PreparedProgram, Value};
 use crate::function::{Func, ScalarFunc};
@@ -79,6 +79,7 @@ pub fn insn_to_row(
             CursorType::Pseudo(_) => "pseudo",
             CursorType::VirtualTable(virtual_table) => virtual_table.name.as_str(),
             CursorType::MaterializedView(table, _) => table.name.as_str(),
+            CursorType::ViewDelta { view_name, .. } => view_name.as_str(),
             CursorType::Sorter => "sorter",
         };
         if ephemeral_cursors.contains(&cursor_id) {
@@ -644,6 +645,10 @@ pub fn insn_to_row(
                         let name = table.columns().get(*column).and_then(|v| v.name.as_ref());
                         name
                     }
+                    CursorType::ViewDelta { table, .. } => {
+                        // The trailing weight column has no schema entry.
+                        table.columns().get(*column).and_then(|v| v.name.as_ref())
+                    }
                     CursorType::Pseudo(_) => None,
                     CursorType::Sorter => None,
                     CursorType::IndexMethod(..) => None,
@@ -1016,19 +1021,11 @@ pub fn insn_to_row(
                 on_error,
                 description_reg,
             } => {
-                let p2 = match on_error {
-                    Some(ResolveType::Rollback) => 1,
-                    Some(ResolveType::Abort) => 2,
-                    Some(ResolveType::Fail) => 3,
-                    Some(ResolveType::Ignore) => 4,
-                    Some(ResolveType::Replace) => 5,
-                    None => 0,
-                };
                 let p3 = description_reg.unwrap_or(0) as i64;
                 (
                     "Halt",
                     *err_code as i64,
-                    p2,
+                    on_error.map_or(0, |rt| rt.bit_value() as i64),
                     p3,
                     Value::build_text(description.clone()),
                     0,
@@ -1039,10 +1036,11 @@ pub fn insn_to_row(
                 err_code,
                 target_reg,
                 description,
+                on_error,
             } => (
                 "HaltIfNull",
                 *err_code as i64,
-                0,
+                on_error.map_or(0, |rt| rt.bit_value() as i64),
                 *target_reg as i64,
                 Value::build_text(description.clone()),
                 0,
@@ -1424,6 +1422,52 @@ pub fn insn_to_row(
                 Value::build_text(func.as_str()),
                 0,
                 format!("accum=r[{}] dest=r[{}]", *acc_reg, *dest_reg),
+            ),
+            Insn::AggContextLoad {
+                acc_reg,
+                payload_start_reg,
+                func,
+            } => (
+                "AggContextLoad",
+                *acc_reg as i64,
+                *payload_start_reg as i64,
+                0,
+                Value::build_text(func.as_str()),
+                0,
+                format!("accum=r[{}] state=r[{}..]", *acc_reg, *payload_start_reg),
+            ),
+            Insn::AggContextStore { acc_reg, payload_start_reg, func } => (
+                "AggContextStore",
+                *acc_reg as i64,
+                *payload_start_reg as i64,
+                0,
+                Value::build_text(func.as_str()),
+                0,
+                format!("accum=r[{}] state=r[{}..]", *acc_reg, *payload_start_reg),
+            ),
+            Insn::IvmSumStep { data } => (
+                "IvmSumStep",
+                data.arg_reg as i64,
+                data.weight_reg as i64,
+                data.int_wrapped_reg as i64,
+                Value::build_text(""),
+                0,
+                format!(
+                    "state=r[{}..] += r[{}] * r[{}]",
+                    data.int_wrapped_reg, data.arg_reg, data.weight_reg
+                ),
+            ),
+            Insn::IvmSumFinalize { data } => (
+                "IvmSumFinalize",
+                data.kind as i64,
+                data.int_wrapped_reg as i64,
+                data.dest_reg as i64,
+                Value::build_text(""),
+                0,
+                format!(
+                    "{:?} state=r[{}..] dest=r[{}]",
+                    data.kind, data.int_wrapped_reg, data.dest_reg
+                ),
             ),
             Insn::SorterOpen { data } => {
                 let SorterOpenData {
@@ -1912,7 +1956,7 @@ pub fn insn_to_row(
             ),
             Insn::SequenceComputeNext {
                 db,
-                seq_name_reg,
+                seq_name,
                 in_value_reg,
                 in_is_called_reg,
                 was_empty_reg,
@@ -1920,9 +1964,9 @@ pub fn insn_to_row(
             } => (
                 "SequenceComputeNext",
                 *db as i64,
-                *seq_name_reg as i64,
+                0,
                 *out_value_reg as i64,
-                Value::Null,
+                Value::build_text(seq_name.clone()),
                 0,
                 format!(
                     "r[{out_value_reg}] = next(r[{in_value_reg}], is_called=r[{in_is_called_reg}], empty=r[{was_empty_reg}])"
@@ -1942,31 +1986,31 @@ pub fn insn_to_row(
             ),
             Insn::SequenceTrackAllocation {
                 db,
-                seq_name_reg,
+                seq_name,
                 value_reg,
             } => (
                 "SequenceTrackAllocation",
                 *db as i64,
-                *seq_name_reg as i64,
-                *value_reg as i64,
-                Value::Null,
                 0,
-                format!("track sequence allocation r[{seq_name_reg}] = r[{value_reg}]"),
+                *value_reg as i64,
+                Value::build_text(seq_name.clone()),
+                0,
+                format!("track sequence allocation {seq_name} = r[{value_reg}]"),
             ),
             Insn::SequenceRegisterAllocation {
                 db,
-                seq_name_reg,
+                seq_name,
                 value_reg,
                 saved_outer_reg,
             } => (
                 "SequenceRegisterAllocation",
                 *db as i64,
-                *seq_name_reg as i64,
+                0,
                 *value_reg as i64,
-                Value::Null,
+                Value::build_text(seq_name.clone()),
                 0,
                 format!(
-                    "register allocation r[{seq_name_reg}] = r[{value_reg}] \
+                    "register allocation {seq_name} = r[{value_reg}] \
                      against outer mv_tx r[{saved_outer_reg}]"
                 ),
             ),

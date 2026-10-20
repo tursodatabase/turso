@@ -2468,6 +2468,10 @@ impl BTreeCursor {
             let cell_count = contents.cell_count();
             if cell_count == 0 {
                 self.stack.set_cell_index(0);
+                // Deleting the final row can leave this cursor carrying its
+                // old position while the cell bytes remain physically intact.
+                // A seek into the now-empty tree must invalidate that position.
+                self.set_has_record(false);
                 return Ok(IOResult::Done(SeekResult::NotFound));
             }
             self.start_table_leaf_search(cell_count, seek_op);
@@ -2772,6 +2776,8 @@ impl BTreeCursor {
             let contents = page.get_contents();
             let cell_count = contents.cell_count();
             if cell_count == 0 {
+                // Match table seeks: an empty leaf never has a current record.
+                self.set_has_record(false);
                 return Ok(IOResult::Done(SeekResult::NotFound));
             }
 
@@ -6445,10 +6451,20 @@ impl BTreeCursor {
 
     /// Drop any pending saved seek-context; used by callers that re-navigate
     /// from the root and don't want restore_context to clobber them.
+    ///
+    /// Also drops skip_advance. That flag says "the next next() must return
+    /// the cell the cursor already sits on" and only describes the position a
+    /// delete or restore left behind. Once the cursor moves somewhere else,
+    /// the flag is wrong: after seek_to_last() it would stop the next() in
+    /// NewRowid from stepping past the last row, and the following insert
+    /// would land before that row. SQLite keeps this "skip" state in eState,
+    /// and moveToRoot() resets eState (btree.c:5619), so sqlite3BtreeFirst()
+    /// and sqlite3BtreeLast() always discard it.
     #[inline]
     fn clear_saved_seek(&mut self) {
         self.context = None;
         self.valid_state = CursorValidState::Valid;
+        self.skip_advance = false;
     }
 
     #[inline]
@@ -6745,6 +6761,12 @@ impl CursorTrait for BTreeCursor {
             match self.advance_state {
                 AdvanceState::Start => {
                     return_if_io!(self.restore_context());
+                    // skip_advance only tells a forward step to stay put. A
+                    // backward step from the cell after a deleted row is
+                    // already right, and it must consume the flag so a later
+                    // next() advances normally. Matches btreePrevious(),
+                    // which clears CURSOR_SKIPNEXT (btree.c:6439-6442).
+                    self.skip_advance = false;
                     self.advance_state = AdvanceState::Advance;
                 }
                 AdvanceState::Advance => {
@@ -6991,10 +7013,14 @@ impl CursorTrait for BTreeCursor {
                 }
 
                 DeleteState::DeterminePostBalancingSeekKey => {
-                    // FIXME: skip this work if we determine deletion wont result in balancing
-                    // Right now we calculate the key every time for simplicity/debugging
-                    // since it won't affect correctness which is more important
                     let page = self.stack.top_ref();
+                    let cell_idx = self.stack.current_cell_index() as usize;
+                    if !delete_may_need_balancing(page.get_contents(), cell_idx, usable_space)? {
+                        self.state = CursorState::Delete(DeleteState::LoadPage {
+                            post_balancing_seek_key: None,
+                        });
+                        continue;
+                    }
                     let target_key = if page.is_index()? {
                         let record = match return_if_io!(self.record()) {
                             Some(record) => record.clone(),
@@ -7568,7 +7594,6 @@ impl CursorTrait for BTreeCursor {
             return Ok(IOResult::Done(()));
         }
         self.clear_saved_seek();
-        self.skip_advance = false;
         loop {
             match self.rewind_state {
                 RewindState::Start => {
@@ -7940,6 +7965,15 @@ pub enum IntegrityCheckError {
         page_id: i64,
         start: usize,
         end: usize,
+    },
+    #[error(
+        "Page {page_id} freeblock list not in ascending order at pc={pc} size={size} next={next}"
+    )]
+    FreeBlockOutOfOrder {
+        page_id: i64,
+        pc: usize,
+        size: usize,
+        next: usize,
     },
     #[error("Page {page_id} cell overlap detected at position={start} with previous_end={prev_end}. content_area={content_area}, is_free_block={is_free_block}")]
     CellOverlap {
@@ -8571,6 +8605,18 @@ pub fn integrity_check(
                     break;
                 }
                 coverage_checker.add_free_block(pc, pc + size);
+                if next != 0 && next <= pc + size + 3 {
+                    push_integrity_error(
+                        errors,
+                        IntegrityCheckError::FreeBlockOutOfOrder {
+                            page_id: page.get().id() as i64,
+                            pc,
+                            size,
+                            next,
+                        },
+                    )?;
+                    break;
+                }
                 pc = next;
             }
         }
@@ -10548,6 +10594,21 @@ pub fn payload_overflow_threshold_min(_page_type: PageType, usable_space: usize)
     ((usable_space - 12) * 32 / 255) - 23
 }
 
+/// Same rule as `sqlite3BtreeDelete`: an interior delete may always need balancing, and a leaf
+/// delete needs it when the freed cell and its 2-byte cell pointer leave more than 2/3 of the page free.
+fn delete_may_need_balancing(
+    page: &PageContent,
+    cell_idx: usize,
+    usable_space: usize,
+) -> Result<bool> {
+    if !page.is_leaf() || page.cell_count() == 1 || !page.overflow_cells.is_empty() {
+        return Ok(true);
+    }
+    let (_, cell_len) = page.cell_get_raw_region(cell_idx, usable_space)?;
+    let free_space_after_delete = compute_free_space(page, usable_space)? + cell_len + 2;
+    Ok(free_space_after_delete * 3 > usable_space * 2)
+}
+
 /// Drop a cell from a page.
 /// This is done by freeing the range of bytes that the cell occupies.
 #[inline]
@@ -12433,6 +12494,58 @@ mod tests {
     }
 
     #[test]
+    fn leaf_delete_balancing_prediction_matches_underflow_after_drop() {
+        let (db, _temp_dir) = get_database();
+        let conn = db.connect(ConnectOpts::new()).unwrap();
+        let usable_space = 4096;
+        let mut rng = ChaCha8Rng::seed_from_u64(1700);
+        let mut predicted_no_balancing = 0;
+        let mut predicted_balancing = 0;
+
+        for _ in 0..1000 {
+            let page = get_page(2);
+            let page_contents = page.get_contents();
+            let mut rowid = 0;
+            loop {
+                let blob_len = rng.random_range(1..300);
+                if compute_free_space(page_contents, usable_space).unwrap() < blob_len + 20 {
+                    break;
+                }
+                let regs = &[Register::Value(Value::from_blob(
+                    crate::alloc::vec![0xab; blob_len],
+                ))];
+                let record = ImmutableRecord::from_registers(regs, regs.len()).unwrap();
+                add_record(
+                    rowid,
+                    page_contents.cell_count(),
+                    page.clone(),
+                    record,
+                    &conn,
+                );
+                rowid += 1;
+            }
+
+            while page_contents.cell_count() > 1 {
+                let cell_idx = rng.random_range(0..page_contents.cell_count());
+                let predicted =
+                    delete_may_need_balancing(page_contents, cell_idx, usable_space).unwrap();
+                drop_cell(page_contents, cell_idx, usable_space).unwrap();
+                let free_space = compute_free_space(page_contents, usable_space).unwrap();
+                assert_eq!(predicted, free_space * 3 > usable_space * 2);
+                if predicted {
+                    predicted_balancing += 1;
+                } else {
+                    predicted_no_balancing += 1;
+                }
+            }
+            assert!(delete_may_need_balancing(page_contents, 0, usable_space).unwrap());
+        }
+
+        assert!(predicted_no_balancing > 0);
+        assert!(predicted_balancing > 0);
+    }
+
+    #[test]
     pub fn btree_insert_fuzz_run_equal_size() {
         for size in 1..8 {
             tracing::info!("======= size:{} =======", size);
@@ -14123,6 +14236,240 @@ mod tests {
             usable_space - page.get_contents().header_size() - total_size
         );
         dbg!(free);
+    }
+
+    /// Does what NewRowid followed by an Insert without a seek do on one
+    /// cursor: move to the last row, read its rowid, step past it, insert.
+    fn append_with_new_rowid(cursor: &mut BTreeCursor, pager: &Arc<Pager>) -> i64 {
+        run_until_done(|| cursor.seek_to_last(), pager.deref()).unwrap();
+        let max = run_until_done(|| cursor.rowid(), pager.deref()).unwrap();
+        let new_rowid = max.map_or(1, |m| m + 1);
+        run_until_done(|| cursor.next(), pager.deref()).unwrap();
+        let regs = &[Register::Value(Value::from_i64(new_rowid))];
+        let record = ImmutableRecord::from_registers(regs, regs.len()).unwrap();
+        run_until_done(
+            || cursor.insert(&BTreeKey::new_table_rowid(new_rowid, Some(&record))),
+            pager.deref(),
+        )
+        .unwrap();
+        new_rowid
+    }
+
+    fn scan_rowids(pager: &Arc<Pager>, root_page: i64) -> Vec<i64> {
+        let mut cursor = BTreeCursor::new_table(pager.clone(), root_page, 1);
+        run_until_done(|| cursor.rewind(), pager.deref()).unwrap();
+        let mut out = Vec::new();
+        while cursor.has_record() {
+            out.push(
+                run_until_done(|| cursor.rowid(), pager.deref())
+                    .unwrap()
+                    .unwrap(),
+            );
+            run_until_done(|| cursor.next(), pager.deref()).unwrap();
+        }
+        out
+    }
+
+    /// Inserts rows 1..=3 and deletes row 2. The delete underflows the root
+    /// leaf, so the cursor is re-seeked onto row 3 and told that its next
+    /// next() must stay there.
+    fn three_rows_with_middle_deleted() -> (Arc<Pager>, i64, BTreeCursor) {
+        let (pager, root_page, _, _) = empty_btree();
+        let mut cursor = BTreeCursor::new_table(pager.clone(), root_page, 1);
+        for rowid in 1..=3 {
+            insert_record(&mut cursor, &pager, rowid, Value::from_i64(rowid)).unwrap();
+        }
+        run_until_done(
+            || cursor.seek(SeekKey::TableRowId(2), SeekOp::GE { eq_only: true }),
+            pager.deref(),
+        )
+        .unwrap();
+        run_until_done(|| cursor.delete(), pager.deref()).unwrap();
+        assert!(cursor.skip_advance);
+        (pager, root_page, cursor)
+    }
+
+    #[test]
+    fn prev_after_delete_lets_next_advance() {
+        let (pager, _, mut cursor) = three_rows_with_middle_deleted();
+        run_until_done(|| cursor.prev(), pager.deref()).unwrap();
+        let after_prev = run_until_done(|| cursor.rowid(), pager.deref()).unwrap();
+        run_until_done(|| cursor.next(), pager.deref()).unwrap();
+        let after_next = run_until_done(|| cursor.rowid(), pager.deref()).unwrap();
+        assert_eq!((after_prev, after_next), (Some(1), Some(3)));
+    }
+
+    #[test]
+    fn last_after_delete_then_next_reaches_end() {
+        let (pager, _, mut cursor) = three_rows_with_middle_deleted();
+        run_until_done(|| cursor.last(), pager.deref()).unwrap();
+        assert_eq!(
+            run_until_done(|| cursor.rowid(), pager.deref()).unwrap(),
+            Some(3)
+        );
+        run_until_done(|| cursor.next(), pager.deref()).unwrap();
+        assert!(!cursor.has_record());
+    }
+
+    #[test]
+    fn new_rowid_after_delete_appends_after_last_row() {
+        let (pager, root_page, mut cursor) = three_rows_with_middle_deleted();
+        let new_rowid = append_with_new_rowid(&mut cursor, &pager);
+        assert_eq!(new_rowid, 4);
+        assert_eq!(scan_rowids(&pager, root_page), vec![1, 3, 4]);
+        let found = run_until_done(
+            || cursor.seek(SeekKey::TableRowId(4), SeekOp::GE { eq_only: true }),
+            pager.deref(),
+        )
+        .unwrap();
+        assert_eq!(found, SeekResult::Found);
+    }
+
+    /// Same as above over more tree shapes: one leaf or many, deleting the
+    /// first, middle, or last row, or every row one by one.
+    #[test]
+    fn new_rowid_after_delete_appends_after_last_row_in_any_tree_shape() {
+        for n in [1i64, 2, 3, 10, 200] {
+            for large in [false, true] {
+                for target in ["min", "max", "mid", "drain"] {
+                    let (pager, root_page, _, _) = empty_btree();
+                    let mut cursor = BTreeCursor::new_table(pager.clone(), root_page, 1);
+                    for rowid in 1..=n {
+                        let v = if large {
+                            Value::Text(Text::new("x".repeat(300)))
+                        } else {
+                            Value::from_i64(rowid)
+                        };
+                        insert_record(&mut cursor, &pager, rowid, v).unwrap();
+                    }
+                    let mut expected: Vec<i64> = (1..=n).collect();
+                    let victims: Vec<i64> = match target {
+                        "min" => vec![1],
+                        "max" => vec![n],
+                        "mid" => vec![n / 2 + 1],
+                        _ => (1..=n).collect(),
+                    };
+                    for v in victims {
+                        let found = run_until_done(
+                            || cursor.seek(SeekKey::TableRowId(v), SeekOp::GE { eq_only: true }),
+                            pager.deref(),
+                        )
+                        .unwrap();
+                        assert_eq!(found, SeekResult::Found);
+                        run_until_done(|| cursor.delete(), pager.deref()).unwrap();
+                        expected.retain(|r| *r != v);
+                    }
+                    let new_rowid = append_with_new_rowid(&mut cursor, &pager);
+                    expected.push(new_rowid);
+                    expected.sort_unstable();
+                    let ctx = format!("n={n} large={large} target={target} new={new_rowid}");
+                    let found = run_until_done(
+                        || {
+                            cursor
+                                .seek(SeekKey::TableRowId(new_rowid), SeekOp::GE { eq_only: true })
+                        },
+                        pager.deref(),
+                    )
+                    .unwrap();
+                    assert_eq!(found, SeekResult::Found, "{ctx}");
+                    assert_eq!(scan_rowids(&pager, root_page), expected, "{ctx}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn seek_after_delete_to_empty_clears_record_position() {
+        let (pager, root_page, _, _) = empty_btree();
+        let mut cursor = BTreeCursor::new_table(pager.clone(), root_page, 1);
+
+        insert_record(&mut cursor, &pager, 1, Value::from_i64(10)).unwrap();
+        let found = run_until_done(
+            || cursor.seek(SeekKey::TableRowId(1), SeekOp::GE { eq_only: true }),
+            pager.deref(),
+        )
+        .unwrap();
+        assert_eq!(found, SeekResult::Found);
+        run_until_done(|| cursor.delete(), pager.deref()).unwrap();
+
+        let found = run_until_done(
+            || cursor.seek(SeekKey::TableRowId(1), SeekOp::GE { eq_only: true }),
+            pager.deref(),
+        )
+        .unwrap();
+        assert_eq!(found, SeekResult::NotFound);
+        assert!(!cursor.has_record());
+        assert_eq!(
+            run_until_done(|| cursor.rowid(), pager.deref()).unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn index_seek_after_delete_to_empty_clears_record_position() {
+        let (pager, _, _, _) = empty_btree();
+        let root_page = run_until_done(
+            || pager.btree_create(&crate::storage::pager::CreateBTreeFlags::new_index()),
+            pager.deref(),
+        )
+        .unwrap() as i64;
+        let index = Index {
+            name: "seek_empty_index".to_string(),
+            where_clause: None,
+            columns: IndexColumn::new_many(["value".to_string()]),
+            table_name: "seek_empty_table".to_string(),
+            root_page,
+            unique: false,
+            ephemeral: false,
+            has_rowid: false,
+            index_method: None,
+            on_conflict: None,
+        };
+        let mut cursor = BTreeCursor::new_index(pager.clone(), root_page, &index, 1).unwrap();
+        let registers = [Register::Value(Value::from_i64(10))];
+        let record = ImmutableRecord::from_registers(&registers, registers.len()).unwrap();
+
+        let found = run_until_done(
+            || {
+                cursor.seek(
+                    SeekKey::IndexKey(record.as_record_ref()),
+                    SeekOp::GE { eq_only: true },
+                )
+            },
+            pager.deref(),
+        )
+        .unwrap();
+        assert_eq!(found, SeekResult::NotFound);
+        run_until_done(
+            || cursor.insert(&BTreeKey::new_index_key(record.as_record_ref())),
+            pager.deref(),
+        )
+        .unwrap();
+        let found = run_until_done(
+            || {
+                cursor.seek(
+                    SeekKey::IndexKey(record.as_record_ref()),
+                    SeekOp::GE { eq_only: true },
+                )
+            },
+            pager.deref(),
+        )
+        .unwrap();
+        assert_eq!(found, SeekResult::Found);
+        run_until_done(|| cursor.delete(), pager.deref()).unwrap();
+
+        let found = run_until_done(
+            || {
+                cursor.seek(
+                    SeekKey::IndexKey(record.as_record_ref()),
+                    SeekOp::GE { eq_only: true },
+                )
+            },
+            pager.deref(),
+        )
+        .unwrap();
+        assert_eq!(found, SeekResult::NotFound);
+        assert!(!cursor.has_record());
     }
 
     #[test]

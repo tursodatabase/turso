@@ -483,7 +483,7 @@ fn check_select_table_ref(
                 check_expr(arg)?;
             }
         }
-        ast::SelectTable::Select(select, _) => {
+        ast::SelectTable::Select { select, .. } => {
             check_select_table_refs(select, check_qname, check_expr)?;
         }
         ast::SelectTable::Sub(from, _) => {

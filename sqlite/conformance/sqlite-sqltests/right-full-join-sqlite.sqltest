@@ -2670,3 +2670,105 @@ expect {
     1||x|1||x
     0|
 }
+
+@cross-check-integrity
+test right-join-with-13-tables-keeps-later-inner-joins-after-it {
+    CREATE TABLE t1(a, b);
+    CREATE TABLE t2(a, b);
+    CREATE TABLE t3(b, c, a);
+    CREATE TABLE t4(a);
+    CREATE TABLE t5(a);
+    CREATE TABLE t6(a);
+    CREATE TABLE t7(a);
+    CREATE TABLE t8(a);
+    CREATE TABLE t9(a);
+    CREATE TABLE t10(a);
+    CREATE TABLE t11(a);
+    CREATE TABLE t12(a);
+    CREATE TABLE t13(a);
+    INSERT INTO t1 VALUES (1, 10);
+    INSERT INTO t2 VALUES (1, 100), (2, 200);
+    INSERT INTO t3 VALUES (100, 1, 1), (200, 1, 2);
+    INSERT INTO t4 VALUES (1), (2);
+    INSERT INTO t5 VALUES (1), (2);
+    INSERT INTO t6 VALUES (1), (2);
+    INSERT INTO t7 VALUES (1), (2);
+    INSERT INTO t8 VALUES (1), (2);
+    INSERT INTO t9 VALUES (1), (2);
+    INSERT INTO t10 VALUES (1), (2);
+    INSERT INTO t11 VALUES (1), (2);
+    INSERT INTO t12 VALUES (1), (2);
+    INSERT INTO t13 VALUES (1), (2);
+
+    SELECT t1.a, t2.a, t3.b, t4.rowid, t12.rowid
+      FROM t1
+      RIGHT JOIN t2 ON t1.a = t2.a
+      JOIN t3 ON t3.b = t2.b
+      JOIN t4 ON t4.a = t3.a
+      JOIN t5 ON t5.a = t3.a
+      JOIN t6 ON t6.a = t3.a
+      JOIN t7 ON t7.a = t3.a
+      JOIN t8 ON t8.a = t3.a
+      JOIN t9 ON t9.a = t3.a
+      JOIN t10 ON t10.a = t3.a
+      JOIN t11 ON t11.a = t3.a
+      JOIN t12 ON t12.a = t3.a
+      JOIN t13 ON t13.a = t3.a
+     WHERE t3.c = 1
+     ORDER BY t2.a;
+}
+expect {
+    1|1|100|1|1
+    |2|200|2|2
+}
+
+@cross-check-integrity
+test full-join-with-13-tables-keeps-later-inner-joins-after-it {
+    CREATE TABLE t1(a, b);
+    CREATE TABLE t2(a, b);
+    CREATE TABLE t3(b, c, a);
+    CREATE TABLE t4(a);
+    CREATE TABLE t5(a);
+    CREATE TABLE t6(a);
+    CREATE TABLE t7(a);
+    CREATE TABLE t8(a);
+    CREATE TABLE t9(a);
+    CREATE TABLE t10(a);
+    CREATE TABLE t11(a);
+    CREATE TABLE t12(a);
+    CREATE TABLE t13(a);
+    INSERT INTO t1 VALUES (1, 10);
+    INSERT INTO t2 VALUES (1, 100), (2, 200);
+    INSERT INTO t3 VALUES (100, 1, 1), (200, 1, 2);
+    INSERT INTO t4 VALUES (1), (2);
+    INSERT INTO t5 VALUES (1), (2);
+    INSERT INTO t6 VALUES (1), (2);
+    INSERT INTO t7 VALUES (1), (2);
+    INSERT INTO t8 VALUES (1), (2);
+    INSERT INTO t9 VALUES (1), (2);
+    INSERT INTO t10 VALUES (1), (2);
+    INSERT INTO t11 VALUES (1), (2);
+    INSERT INTO t12 VALUES (1), (2);
+    INSERT INTO t13 VALUES (1), (2);
+
+    SELECT t1.a, t2.a, t3.b, t4.rowid, t12.rowid
+      FROM t1
+      FULL JOIN t2 ON t1.a = t2.a
+      JOIN t3 ON t3.b = t2.b
+      JOIN t4 ON t4.a = t3.a
+      JOIN t5 ON t5.a = t3.a
+      JOIN t6 ON t6.a = t3.a
+      JOIN t7 ON t7.a = t3.a
+      JOIN t8 ON t8.a = t3.a
+      JOIN t9 ON t9.a = t3.a
+      JOIN t10 ON t10.a = t3.a
+      JOIN t11 ON t11.a = t3.a
+      JOIN t12 ON t12.a = t3.a
+      JOIN t13 ON t13.a = t3.a
+     WHERE t3.c = 1
+     ORDER BY t2.a;
+}
+expect {
+    1|1|100|1|1
+    |2|200|2|2
+}

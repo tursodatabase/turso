@@ -1910,3 +1910,138 @@ impl IO for CheckpointYieldIo {
         self.inner.wait_for_completion(completion)
     }
 }
+
+/// DDL inside BEGIN CONCURRENT upgrades the transaction to exclusive in
+/// place. The upgraded transaction keeps its earlier concurrent writes and
+/// commits everything together.
+#[turso_macros::test]
+fn test_ddl_in_concurrent_tx_upgrades_to_exclusive(tmp_db: TempDatabase) -> anyhow::Result<()> {
+    let conn = tmp_db.connect_limbo();
+    conn.pragma_update("journal_mode", "'mvcc'")?;
+    conn.execute("CREATE TABLE t(x INTEGER)")?;
+
+    conn.execute("BEGIN CONCURRENT")?;
+    conn.execute("INSERT INTO t VALUES (1)")?;
+    conn.execute("CREATE TABLE u(y INTEGER)")?;
+    conn.execute("INSERT INTO u VALUES (2)")?;
+    conn.execute("COMMIT")?;
+
+    let conn2 = tmp_db.connect_limbo();
+    let rows: Vec<(i64, i64)> = conn2.exec_rows("SELECT (SELECT x FROM t), (SELECT y FROM u)");
+    assert_eq!(rows, vec![(1, 2)]);
+    Ok(())
+}
+
+/// The upgrade to exclusive fails with Busy when another transaction
+/// committed after the concurrent transaction began: the snapshot is stale,
+/// so single-writer DDL semantics cannot be granted.
+#[turso_macros::test]
+fn test_ddl_in_concurrent_tx_busy_after_other_commit(tmp_db: TempDatabase) -> anyhow::Result<()> {
+    let conn = tmp_db.connect_limbo();
+    conn.pragma_update("journal_mode", "'mvcc'")?;
+    conn.execute("CREATE TABLE t(x INTEGER)")?;
+
+    let conn2 = tmp_db.connect_limbo();
+    conn2.execute("BEGIN CONCURRENT")?;
+
+    conn.execute("INSERT INTO t VALUES (1)")?;
+
+    let err = conn2
+        .execute("CREATE TABLE u(y INTEGER)")
+        .expect_err("DDL upgrade must fail after another commit")
+        .to_string();
+    assert!(err.contains("busy"), "expected Busy, got: {err}");
+
+    conn2.execute("ROLLBACK")?;
+    let rows: Vec<(i64,)> = conn.exec_rows("SELECT count(*) FROM sqlite_schema WHERE name = 'u'");
+    assert_eq!(rows, vec![(0,)]);
+    Ok(())
+}
+
+/// While a DDL-upgraded transaction holds the exclusive slot, other
+/// concurrent transactions abort on commit, matching the behavior of a
+/// transaction that was exclusive from the start.
+#[turso_macros::test]
+fn test_ddl_upgraded_tx_aborts_other_concurrent_commit(tmp_db: TempDatabase) -> anyhow::Result<()> {
+    let conn1 = tmp_db.connect_limbo();
+    conn1.pragma_update("journal_mode", "'mvcc'")?;
+    conn1.execute("CREATE TABLE t(x INTEGER)")?;
+
+    let conn2 = tmp_db.connect_limbo();
+    conn1.execute("BEGIN CONCURRENT")?;
+    conn2.execute("BEGIN CONCURRENT")?;
+    conn2.execute("INSERT INTO t VALUES (1)")?;
+
+    conn1.execute("CREATE TABLE u(y INTEGER)")?;
+
+    let result = conn2.execute("COMMIT");
+    assert_that!(result).is_err();
+
+    conn1.execute("COMMIT")?;
+    let rows: Vec<(i64,)> =
+        conn1.exec_rows("SELECT (SELECT count(*) FROM t) + (SELECT count(*) FROM u)");
+    assert_eq!(rows, vec![(0,)], "aborted concurrent insert must not land");
+    Ok(())
+}
+
+/// PRAGMA statements that write header cookies follow the same upgrade rule
+/// as DDL inside BEGIN CONCURRENT.
+#[turso_macros::test]
+fn test_header_write_in_concurrent_tx_upgrades_to_exclusive(
+    tmp_db: TempDatabase,
+) -> anyhow::Result<()> {
+    let conn = tmp_db.connect_limbo();
+    conn.pragma_update("journal_mode", "'mvcc'")?;
+    conn.execute("BEGIN CONCURRENT")?;
+    conn.execute("PRAGMA user_version = 7")?;
+    conn.execute("COMMIT")?;
+
+    let conn2 = tmp_db.connect_limbo();
+    let rows: Vec<(i64,)> = conn2.exec_rows("PRAGMA user_version");
+    assert_eq!(rows, vec![(7,)]);
+    Ok(())
+}
+
+/// ROLLBACK TO a savepoint undoes the DDL but the transaction keeps the
+/// exclusive slot it gained from the upgrade: other concurrent transactions
+/// still abort on commit until the upgraded transaction ends.
+#[turso_macros::test]
+fn test_savepoint_rollback_after_ddl_upgrade_keeps_exclusivity(
+    tmp_db: TempDatabase,
+) -> anyhow::Result<()> {
+    let conn1 = tmp_db.connect_limbo();
+    conn1.pragma_update("journal_mode", "'mvcc'")?;
+    conn1.execute("CREATE TABLE t(x INTEGER)")?;
+
+    let conn2 = tmp_db.connect_limbo();
+    conn1.execute("BEGIN CONCURRENT")?;
+    conn2.execute("BEGIN CONCURRENT")?;
+    conn2.execute("INSERT INTO t VALUES (1)")?;
+
+    conn1.execute("SAVEPOINT sp")?;
+    conn1.execute("CREATE TABLE u(y INTEGER)")?;
+    conn1.execute("ROLLBACK TO sp")?;
+
+    let result = conn2.execute("COMMIT");
+    assert_that!(result).is_err();
+
+    conn1.execute("COMMIT")?;
+    let rows: Vec<(i64, i64)> = conn1.exec_rows(
+        "SELECT (SELECT count(*) FROM t),
+                (SELECT count(*) FROM sqlite_schema WHERE name = 'u')",
+    );
+    assert_eq!(
+        rows,
+        vec![(0, 0)],
+        "rolled-back DDL must not land and the aborted insert must not land"
+    );
+
+    conn2.execute("INSERT INTO t VALUES (2)")?;
+    let rows: Vec<(i64,)> = conn1.exec_rows("SELECT count(*) FROM t");
+    assert_eq!(
+        rows,
+        vec![(1,)],
+        "writes proceed after the upgraded tx ends"
+    );
+    Ok(())
+}

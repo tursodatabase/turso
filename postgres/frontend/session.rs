@@ -298,8 +298,8 @@ fn noop_statement(conn: &Arc<Connection>) -> Result<Statement> {
     conn.prepare("SELECT 0 WHERE 0")
 }
 
-fn execute_sqlite_internal(conn: &Arc<Connection>, sql: impl AsRef<str>) -> Result<()> {
-    let mut stmt = conn.prepare_internal(sql)?;
+fn execute_sqlite(conn: &Arc<Connection>, sql: impl AsRef<str>) -> Result<()> {
+    let mut stmt = conn.prepare_sqlite(sql)?;
     stmt.run_ignore_rows()
 }
 
@@ -404,9 +404,14 @@ fn handle_pg_create_schema(conn: &Arc<Connection>, stmt: &PgCreateSchemaStmt) ->
             "schema \"{name}\" already exists"
         )));
     }
+    if name.starts_with("pg_") {
+        return Err(LimboError::ParseError(format!(
+            "unacceptable schema name \"{name}\": the prefix \"pg_\" is reserved for system schemas"
+        )));
+    }
 
     let path = schema_file_path(conn, &name);
-    execute_sqlite_internal(
+    execute_sqlite(
         conn,
         format!("ATTACH '{}' AS \"{}\"", path.replace('\'', "''"), name),
     )?;
@@ -428,11 +433,7 @@ fn schema_file_path(conn: &Connection, schema_name: &str) -> String {
 
 fn handle_pg_drop_schema(conn: &Arc<Connection>, stmt: &PgDropSchemaStmt) -> Result<()> {
     let name = stmt.name.to_lowercase();
-    if name == "public" {
-        return handle_pg_drop_schema_public(conn, stmt.cascade);
-    }
-
-    if !schema_exists(conn, &name)? {
+    if name != "public" && !schema_exists(conn, &name)? {
         if stmt.if_exists {
             return Ok(());
         }
@@ -441,35 +442,99 @@ fn handle_pg_drop_schema(conn: &Arc<Connection>, stmt: &PgDropSchemaStmt) -> Res
         )));
     }
 
-    if stmt.cascade {
-        drop_all_tables_in_schema(conn, &name)?;
+    let database = if name == "public" { "main" } else { &name };
+    let objects = schema_objects(conn, database)?;
+    if !stmt.cascade && !objects.is_empty() {
+        return Err(LimboError::ParseError(format!(
+            "cannot drop schema \"{name}\" because other objects depend on it"
+        )));
     }
 
-    execute_sqlite_internal(conn, format!("DETACH \"{name}\""))?;
-    Ok(())
+    without_foreign_keys(conn, || {
+        for object in &objects {
+            execute_sqlite(conn, object.drop_sql(database))?;
+        }
+        Ok(())
+    })?;
+    // PostgreSQL drops public like any other schema, but turso keeps it,
+    // because unqualified names of the main database are its objects.
+    if name == "public" {
+        return Ok(());
+    }
+    execute_sqlite(conn, format!("DETACH \"{name}\""))
 }
 
-fn handle_pg_drop_schema_public(conn: &Arc<Connection>, cascade: bool) -> Result<()> {
-    let table_names = list_user_tables(conn, None)?;
-    if !cascade && !table_names.is_empty() {
-        return Err(LimboError::ParseError(
-            "cannot drop schema \"public\" because other objects depend on it".to_string(),
-        ));
-    }
-
-    for table_name in table_names {
-        let mut stmt = conn.prepare(format!("DROP TABLE \"{table_name}\""))?;
-        stmt.run_ignore_rows()?;
-    }
-    Ok(())
+/// Runs `f` with foreign keys not enforced. DROP SCHEMA ... CASCADE drops
+/// the foreign keys of the tables that it drops along with the tables, so
+/// they must not stop the drops or delete rows.
+fn without_foreign_keys(conn: &Arc<Connection>, f: impl FnOnce() -> Result<()>) -> Result<()> {
+    let enabled = conn.foreign_keys_enabled();
+    conn.set_foreign_keys_enabled(false);
+    let result = f();
+    conn.set_foreign_keys_enabled(enabled);
+    result
 }
 
-fn drop_all_tables_in_schema(conn: &Arc<Connection>, schema_name: &str) -> Result<()> {
-    for table_name in list_user_tables(conn, Some(schema_name))? {
-        let mut stmt = conn.prepare(format!("DROP TABLE \"{schema_name}\".\"{table_name}\"",))?;
-        stmt.run_ignore_rows()?;
+/// An object of a schema, which DROP SCHEMA ... CASCADE drops.
+enum SchemaObject {
+    View(String),
+    Table(String),
+    Sequence(String),
+}
+
+impl SchemaObject {
+    fn drop_sql(&self, database: &str) -> String {
+        let kind = match self {
+            SchemaObject::View(_) => "VIEW",
+            SchemaObject::Table(_) => "TABLE",
+            SchemaObject::Sequence(_) => "SEQUENCE",
+        };
+        format!(
+            "DROP {kind} \"{database}\".\"{}\"",
+            self.name().replace('"', "\"\"")
+        )
     }
-    Ok(())
+
+    fn name(&self) -> &str {
+        match self {
+            SchemaObject::View(name) | SchemaObject::Table(name) | SchemaObject::Sequence(name) => {
+                name
+            }
+        }
+    }
+}
+
+/// The table in which core stores sequence `s` is named
+/// `__turso_internal_seq_s`.
+const SEQUENCE_TABLE_PREFIX: &str = "__turso_internal_seq_";
+
+/// The objects of the schema that database `database` holds, in the order
+/// that DROP SCHEMA drops them: views first, because they depend on tables.
+/// Indexes and triggers go with their tables.
+fn schema_objects(conn: &Arc<Connection>, database: &str) -> Result<Vec<SchemaObject>> {
+    let mut stmt = conn.prepare_sqlite(format!(
+        "SELECT type, name FROM \"{database}\".sqlite_schema \
+         WHERE type IN ('view', 'table') ORDER BY name"
+    ))?;
+    let mut views = Vec::new();
+    let mut tables = Vec::new();
+    let mut sequences = Vec::new();
+    for row in stmt.run_collect_rows()? {
+        let (Some(Value::Text(kind)), Some(Value::Text(name))) = (row.first(), row.get(1)) else {
+            continue;
+        };
+        let name = name.as_str().to_string();
+        if kind.as_str() == "view" {
+            views.push(SchemaObject::View(name));
+        } else if let Some(sequence) = name.strip_prefix(SEQUENCE_TABLE_PREFIX) {
+            if !sequence.starts_with("__turso_internal_") {
+                sequences.push(SchemaObject::Sequence(sequence.to_string()));
+            }
+        } else if !name.starts_with("sqlite_") && !name.starts_with("__turso_internal_") {
+            tables.push(SchemaObject::Table(name));
+        }
+    }
+    Ok(views.into_iter().chain(tables).chain(sequences).collect())
 }
 
 fn handle_pg_copy_from(conn: &Arc<Connection>, stmt: &PgCopyFromStmt) -> Result<usize> {
@@ -563,23 +628,6 @@ fn get_table_columns(
     Ok(rows
         .into_iter()
         .filter_map(|row| match row.get(1) {
-            Some(Value::Text(t)) => Some(t.as_str().to_string()),
-            _ => None,
-        })
-        .collect())
-}
-
-fn list_user_tables(conn: &Arc<Connection>, schema_name: Option<&str>) -> Result<Vec<String>> {
-    let filter = "type='table' AND name NOT LIKE 'sqlite_%' AND name NOT LIKE '__turso_internal_%'";
-    let sql = match schema_name {
-        Some(name) => format!("SELECT name FROM \"{name}\".sqlite_schema WHERE {filter}"),
-        None => format!("SELECT name FROM sqlite_schema WHERE {filter}"),
-    };
-    let mut stmt = conn.prepare_internal(&sql)?;
-    let rows = stmt.run_collect_rows()?;
-    Ok(rows
-        .into_iter()
-        .filter_map(|row| match row.first() {
             Some(Value::Text(t)) => Some(t.as_str().to_string()),
             _ => None,
         })

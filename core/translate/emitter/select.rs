@@ -12,6 +12,7 @@ use crate::{
         },
         group_by::{group_by_agg_phase, group_by_emit_row_phase, EmitGroupBy, GroupByRowSource},
         main_loop::{init_distinct, CloseLoop, InitLoop, LoopBodyEmitter, OpenLoop},
+        optimizer::{constraints::partial_index, mark_partial_index_predicate_terms_consumed},
         order_by::EmitOrderBy,
         plan::{
             BitSet, Distinctness, EphemeralRowidMode, EvalAt, IndexMethodQuery, JoinOrderMember,
@@ -85,13 +86,6 @@ pub fn emit_query<'a>(
 ) -> Result<usize> {
     let after_main_loop_label = program.allocate_label();
     t_ctx.label_main_loop_end = Some(after_main_loop_label);
-
-    // Register parameters from EXISTS subquery result columns that were dropped
-    // during semi/anti-join unnesting. No code is emitted for these, but the
-    // parameter slots must exist for bind-time validation to succeed.
-    for variable in &plan.phantom_params {
-        program.register_variable(variable);
-    }
 
     // Evaluate uncorrelated subqueries as early as possible, because even LIMIT can reference a subquery.
     // This must happen before VALUES emission since VALUES expressions may contain scalar subqueries.
@@ -812,6 +806,8 @@ fn build_materialized_build_input_plan(
     // terms for access methods (e.g. ephemeral autoindex seeks) that get
     // overwritten to scans inside the subplan. Reset each term's consumed
     // flag: only terms referencing tables outside the prefix are consumed.
+    // Terms implied by a partial index that the subplan still reads are
+    // consumed again below, after the access methods are checked.
     let mut where_clause = plan.where_clause.clone();
     for term in where_clause.iter_mut() {
         let mask = table_mask_from_expr(
@@ -938,6 +934,19 @@ fn build_materialized_build_input_plan(
             // access paths that are valid within the prefix join order.
             joined_table.op = Operation::default_scan_for(&joined_table.table);
         }
+
+        if let Some(index) = partial_index(joined_table.op.index()) {
+            let is_outer_join = joined_table
+                .join_info
+                .as_ref()
+                .is_some_and(|join_info| join_info.is_outer());
+            mark_partial_index_predicate_terms_consumed(
+                index,
+                joined_table,
+                &mut where_clause,
+                is_outer_join,
+            );
+        }
     }
 
     let build_internal_id = plan.table_references.joined_tables()[build_table_idx].internal_id;
@@ -1031,7 +1040,6 @@ fn build_materialized_build_input_plan(
         estimated_output_rows: None,
         estimated_cost: None,
         simple_aggregate: None,
-        phantom_params: vec![],
     };
 
     prune_join_order_for_materialized_inputs(&mut materialize_plan, materialized_build_inputs)?;

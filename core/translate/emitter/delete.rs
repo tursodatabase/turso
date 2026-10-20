@@ -877,7 +877,6 @@ fn emit_delete_row_common(
                     *subquery_plan,
                     &subquery.query_type,
                     subquery.correlated || rerun_for_target_scan,
-                    true,
                 )?;
             }
             Ok(())

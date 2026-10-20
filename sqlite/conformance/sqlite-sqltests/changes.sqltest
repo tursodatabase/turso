@@ -434,3 +434,53 @@ expect {
     3
     6
 }
+
+# A user INSERT into sqlite_sequence is an ordinary insert: it counts for
+# changes() and total_changes() and sets last_insert_rowid(), whatever the
+# spelling of the table name. Only the AUTOINCREMENT bookkeeping write that
+# the engine itself makes to sqlite_sequence is left out.
+@cross-check-integrity
+test changes-user-insert-into-sqlite-sequence-counts {
+    CREATE TABLE t(id INTEGER PRIMARY KEY AUTOINCREMENT, x);
+    INSERT INTO t(x) VALUES (1);
+    SELECT changes(), total_changes(), last_insert_rowid();
+    INSERT INTO sqlite_sequence VALUES ('ww', 9);
+    SELECT changes(), total_changes(), last_insert_rowid();
+    INSERT INTO SQLITE_SEQUENCE VALUES ('zz', 10);
+    SELECT changes(), total_changes(), last_insert_rowid();
+    INSERT INTO "Sqlite_Sequence" VALUES ('yy', 11);
+    SELECT changes(), total_changes(), last_insert_rowid();
+}
+expect {
+    1|1|1
+    1|2|2
+    1|3|3
+    1|4|4
+}
+
+# The AUTOINCREMENT bookkeeping write to sqlite_sequence never counts, for
+# single-row, multi-row, INSERT ... SELECT and UPSERT inserts, nor for the
+# sqlite_sequence rename done by ALTER TABLE.
+@cross-check-integrity
+test changes-autoincrement-bookkeeping-does-not-count {
+    CREATE TABLE t(id INTEGER PRIMARY KEY AUTOINCREMENT, x UNIQUE);
+    INSERT INTO t(x) VALUES (1);
+    SELECT changes(), total_changes(), last_insert_rowid();
+    INSERT INTO t(x) VALUES (2), (3), (4);
+    SELECT changes(), total_changes(), last_insert_rowid();
+    INSERT INTO t(x) SELECT x + 10 FROM t WHERE x < 3;
+    SELECT changes(), total_changes(), last_insert_rowid();
+    INSERT INTO t(x) VALUES (2), (20) ON CONFLICT(x) DO UPDATE SET x = x + 100;
+    SELECT changes(), total_changes(), last_insert_rowid();
+    ALTER TABLE t RENAME TO t2;
+    SELECT changes(), total_changes(), last_insert_rowid();
+    SELECT name, seq FROM sqlite_sequence;
+}
+expect {
+    1|1|1
+    3|4|4
+    2|6|6
+    2|8|8
+    2|8|8
+    t2|8
+}

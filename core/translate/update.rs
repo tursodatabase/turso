@@ -9,7 +9,7 @@ use crate::translate::plan::{ColumnMask, Operation};
 use crate::translate::planner::ROWID_STRS;
 use crate::{
     bail_parse_error,
-    schema::{Schema, Table},
+    schema::Table,
     util::normalize_ident,
     vdbe::builder::{ProgramBuilder, ProgramBuilderOpts},
     CaptureDataChangesExt, Connection,
@@ -22,7 +22,10 @@ use super::optimizer::optimize_plan;
 use super::plan::{
     ColumnUsedMask, DmlSafety, JoinedTable, Plan, TableReferences, UpdatePlan, UpdateSetClause,
 };
-use super::planner::{append_vtab_predicates_to_where_clause, parse_from, parse_where};
+use super::planner::{
+    append_vtab_predicates_to_where_clause, collect_subquery_table_refs_in_expr, parse_from,
+    parse_where,
+};
 use super::subquery::{
     mark_shared_cte_materialization_requirements, plan_subqueries_from_returning,
     plan_subqueries_from_update_sets, plan_subqueries_from_where_clause,
@@ -201,7 +204,8 @@ fn prepare_and_optimize_update_plan(
 }
 
 fn validate_update(
-    schema: &Schema,
+    resolver: &Resolver,
+    database_id: usize,
     table_name: &str,
     is_internal_schema_change: bool,
     conn: &Arc<Connection>,
@@ -214,15 +218,17 @@ fn validate_update(
     {
         crate::bail_parse_error!("table {} may not be modified", table_name);
     }
-    // Check if this is a materialized view
-    if schema.is_materialized_view(table_name) {
+    // Check if this is a materialized view. Must look up the schema of the
+    // table's own database: a table in an attached database can share a name
+    // with a materialized view in a different database.
+    if resolver.with_schema(database_id, |s| s.is_materialized_view(table_name)) {
         bail_parse_error!("cannot modify materialized view {}", table_name);
     }
 
     // Check if this table has any incompatible dependent views
-    schema.with_incompatible_dependent_views(table_name, |views| {
+    resolver.with_schema(database_id, |schema| schema.with_incompatible_dependent_views(table_name, |views| {
     if !views.is_empty() {
-        use crate::incremental::compiler::DBSP_CIRCUIT_VERSION;
+        use crate::incremental::view::DBSP_CIRCUIT_VERSION;
         crate::bail_parse_error!(
             "Cannot UPDATE table '{table_name}' because it has incompatible dependent materialized view(s): {}. \n\
              These views were created with a different DBSP version than the current version ({DBSP_CIRCUIT_VERSION}). \n\
@@ -231,7 +237,7 @@ fn validate_update(
         );
     }
     Ok(())
-    })
+    }))
 }
 
 fn prepare_update_plan(
@@ -242,7 +248,6 @@ fn prepare_update_plan(
     is_internal_schema_change: bool,
 ) -> crate::Result<UpdatePlan> {
     let database_id = resolver.resolve_existing_table_database_id_qualified(&body.tbl_name)?;
-    let schema = resolver.schema();
     let target_name = &body.tbl_name.name;
     let table = match resolver.with_schema(database_id, |s| s.get_table(target_name.as_str())) {
         Some(table) => table,
@@ -263,7 +268,8 @@ fn prepare_update_plan(
     let schema_cookie = resolver.with_schema(database_id, |s| s.schema_version);
     program.begin_write_on_database(database_id, schema_cookie)?;
     validate_update(
-        schema,
+        resolver,
+        database_id,
         target_name.as_str(),
         is_internal_schema_change,
         connection,
@@ -290,6 +296,18 @@ fn prepare_update_plan(
         indexed,
         plan_estimate: None,
     };
+    let mut table_refs_outside_from = Vec::new();
+    for set in &body.sets {
+        collect_subquery_table_refs_in_expr(&set.expr, &mut table_refs_outside_from);
+    }
+    if let Some(where_clause) = &body.where_clause {
+        collect_subquery_table_refs_in_expr(where_clause, &mut table_refs_outside_from);
+    }
+    for column in &body.returning {
+        if let ast::ResultColumn::Expr(expr, _) = column {
+            collect_subquery_table_refs_in_expr(expr, &mut table_refs_outside_from);
+        }
+    }
     let mut from_tables = TableReferences::new_empty();
     let mut where_clause = vec![];
     let mut vtab_predicates = vec![];
@@ -298,7 +316,7 @@ fn prepare_update_plan(
         resolver,
         program,
         with,
-        true,
+        &table_refs_outside_from,
         &mut where_clause,
         &mut vtab_predicates,
         &mut from_tables,

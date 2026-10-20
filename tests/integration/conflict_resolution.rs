@@ -2156,6 +2156,117 @@ fn test_trigger_or_fail_preserves_prior_changes(tmp_db: TempDatabase) -> anyhow:
     Ok(())
 }
 
+/// A trigger body whose steps use different OR clauses. Each step's own OR
+/// clause decides how its constraint failure is resolved, not the last step's:
+/// an `OR FAIL` step followed by a plain step must keep the rows written for
+/// the earlier source rows, and an `OR ROLLBACK` step must end the transaction.
+#[turso_macros::test]
+fn test_trigger_steps_keep_their_own_conflict_resolution(
+    tmp_db: TempDatabase,
+) -> anyhow::Result<()> {
+    drop(tmp_db);
+    let steps = [
+        (
+            "trigger_or_fail_unique",
+            "INSERT OR FAIL INTO t(x, k) VALUES (new.x, new.x % 3)",
+        ),
+        (
+            "trigger_or_fail_not_null",
+            "INSERT OR FAIL INTO t(x, n) VALUES (new.x, nullif(new.x, 5))",
+        ),
+        (
+            "trigger_or_fail_check",
+            "INSERT OR FAIL INTO t(x, c) VALUES (new.x, new.x)",
+        ),
+        (
+            "trigger_update_or_fail_unique",
+            "UPDATE OR FAIL t SET k = -1 WHERE x = 100 AND new.x = 5",
+        ),
+    ];
+    for (label, step) in steps {
+        let trigger = format!(
+            "CREATE TRIGGER tr AFTER INSERT ON src BEGIN \
+               {step}; \
+               INSERT INTO a(x) VALUES (new.x); \
+             END"
+        );
+        run_mixed_constraint_case(
+            label,
+            "CREATE TABLE src(id INTEGER PRIMARY KEY, x)",
+            &[
+                "CREATE TABLE t(id INTEGER PRIMARY KEY, x, k UNIQUE, n DEFAULT 1 NOT NULL, \
+                 c DEFAULT 0 CHECK (c < 5))",
+                "CREATE TABLE a(id INTEGER PRIMARY KEY AUTOINCREMENT, x)",
+                "INSERT INTO t(x, k) VALUES (100, 100), (101, -1)",
+                &trigger,
+            ],
+            "INSERT INTO src(x) VALUES (2), (3), (4), (5)",
+            "SELECT 'src', x FROM src UNION ALL SELECT 't', x FROM t \
+             UNION ALL SELECT 'a', x FROM a ORDER BY 1, 2",
+        );
+    }
+
+    run_mixed_constraint_case(
+        "trigger_or_rollback_unique",
+        "CREATE TABLE src(id INTEGER PRIMARY KEY, x)",
+        &[
+            "CREATE TABLE t(id INTEGER PRIMARY KEY, x, k UNIQUE)",
+            "CREATE TABLE a(id INTEGER PRIMARY KEY AUTOINCREMENT, x)",
+            "CREATE TRIGGER tr AFTER INSERT ON src BEGIN \
+               INSERT OR ROLLBACK INTO t(x, k) VALUES (new.x, new.x % 3); \
+               INSERT INTO a(x) VALUES (new.x); \
+             END",
+            "INSERT INTO src(x) VALUES (100)",
+            "BEGIN",
+            "INSERT INTO src(x) VALUES (200)",
+        ],
+        "INSERT INTO src(x) VALUES (2), (3), (4), (5)",
+        "SELECT 'src', x FROM src UNION ALL SELECT 't', x FROM t \
+         UNION ALL SELECT 'a', x FROM a ORDER BY 1, 2",
+    );
+    Ok(())
+}
+
+/// An explicit `OR ABORT` on the outer INSERT overrides the trigger step's
+/// `OR FAIL`, exactly like any other explicit outer OR clause, so the whole
+/// INSERT is rolled back. Only an outer INSERT without an OR clause leaves the
+/// trigger steps' own clauses in effect.
+#[turso_macros::test]
+fn test_outer_or_abort_overrides_trigger_or_fail(tmp_db: TempDatabase) -> anyhow::Result<()> {
+    drop(tmp_db);
+    run_mixed_constraint_case(
+        "outer_or_abort_overrides_trigger_or_fail",
+        "CREATE TABLE src(id INTEGER PRIMARY KEY, x)",
+        &[
+            "CREATE TABLE t(id INTEGER PRIMARY KEY, x, k UNIQUE)",
+            "CREATE TABLE a(id INTEGER PRIMARY KEY AUTOINCREMENT, x)",
+            "CREATE TRIGGER tr AFTER INSERT ON src BEGIN \
+               INSERT OR FAIL INTO t(x, k) VALUES (new.x, new.x % 3); \
+               INSERT INTO a(x) VALUES (new.x); \
+             END",
+        ],
+        "INSERT OR ABORT INTO src(x) VALUES (2), (3), (4), (5)",
+        "SELECT 'src', x FROM src UNION ALL SELECT 't', x FROM t \
+         UNION ALL SELECT 'a', x FROM a ORDER BY 1, 2",
+    );
+    Ok(())
+}
+
+/// A column-level `NOT NULL ON CONFLICT FAIL` keeps the rows inserted before
+/// the NULL, like a column-level `UNIQUE ON CONFLICT FAIL` does.
+#[turso_macros::test]
+fn test_not_null_on_conflict_fail_keeps_prior_rows(tmp_db: TempDatabase) -> anyhow::Result<()> {
+    drop(tmp_db);
+    run_mixed_constraint_case(
+        "not_null_on_conflict_fail_keeps_prior_rows",
+        "CREATE TABLE t(x, n NOT NULL ON CONFLICT FAIL)",
+        &[],
+        "INSERT INTO t VALUES (1, 1), (2, NULL), (3, 1)",
+        "SELECT * FROM t ORDER BY x",
+    );
+    Ok(())
+}
+
 /// Test DDL-level REPLACE on two unique indexes where INSERT conflicts with
 /// two DIFFERENT existing rows. Both conflicting rows should be deleted.
 #[turso_macros::test]

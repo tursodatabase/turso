@@ -1281,7 +1281,12 @@ pub fn translate_create_table(
         }
     }
 
-    let cdc_table = prepare_cdc_if_necessary(program, resolver.schema(), Some(SQLITE_TABLEID))?;
+    let cdc_table = prepare_cdc_if_necessary(
+        program,
+        resolver.schema(),
+        database_id,
+        Some(SQLITE_TABLEID),
+    )?;
 
     let create_btree_label = program.allocate_label();
     let database_format_reg = program.alloc_register();
@@ -1417,7 +1422,12 @@ pub fn translate_create_table(
         db: database_id,
     });
 
-    let cdc_table = prepare_cdc_if_necessary(program, resolver.schema(), Some(SQLITE_TABLEID))?;
+    let cdc_table = prepare_cdc_if_necessary(
+        program,
+        resolver.schema(),
+        database_id,
+        Some(SQLITE_TABLEID),
+    )?;
 
     emit_schema_entry(
         program,
@@ -1806,7 +1816,12 @@ pub fn translate_create_virtual_table(
         db: crate::MAIN_DB_ID,
     });
 
-    let cdc_table = prepare_cdc_if_necessary(program, resolver.schema(), Some(SQLITE_TABLEID))?;
+    let cdc_table = prepare_cdc_if_necessary(
+        program,
+        resolver.schema(),
+        crate::MAIN_DB_ID,
+        Some(SQLITE_TABLEID),
+    )?;
     let sql = create_vtable_body_to_str(&vtab, vtab_module.clone());
     emit_schema_entry(
         program,
@@ -1858,6 +1873,15 @@ fn validate_drop_table(
             "Cannot DROP TABLE on materialized view {tbl_name}. Use DROP VIEW instead.",
         );
     }
+    let dependent_views = resolver.with_schema(database_id, |schema| {
+        schema.get_dependent_materialized_views(tbl_name)
+    });
+    if !dependent_views.is_empty() {
+        bail_parse_error!(
+            "cannot drop table \"{tbl_name}\": it has dependent materialized view(s): {}",
+            dependent_views.join(", ")
+        );
+    }
     Ok(())
 }
 
@@ -1893,7 +1917,12 @@ pub fn translate_drop_table(
     {
         emit_fk_drop_table_check(program, resolver, name, connection, database_id)?;
     }
-    let cdc_table = prepare_cdc_if_necessary(program, resolver.schema(), Some(SQLITE_TABLEID))?;
+    let cdc_table = prepare_cdc_if_necessary(
+        program,
+        resolver.schema(),
+        database_id,
+        Some(SQLITE_TABLEID),
+    )?;
 
     let null_reg = program.alloc_register(); //  r1
     program.emit_null(null_reg, None);

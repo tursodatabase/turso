@@ -307,24 +307,25 @@ pub fn parse_schema_rows(
         .take()
         .expect("ParseSchemaRowsState not initialized");
     let has_mv_store = inner.rows.mv_store().is_some();
-    schema.populate_indices(
+    schema.populate_materialized_views_then_indices(
         syms,
-        inner.from_sql_indexes,
-        inner.automatic_indices,
-        has_mv_store,
-    )?;
-    schema.populate_materialized_views(
         inner.materialized_view_info,
         inner.dbsp_state_roots,
         inner.dbsp_state_index_roots,
+        inner.from_sql_indexes,
+        inner.automatic_indices,
+        has_mv_store,
     )?;
 
     Ok(IOResult::Done(()))
 }
 
 fn cmp_numeric_strings(num_str: &str, other: &str) -> bool {
-    fn parse(s: &str) -> Option<Either<i64, f64>> {
-        if let Ok(i) = s.parse::<i64>() {
+    // i128 rather than i64: an integer literal such as 9223372036854775808 does not
+    // fit in i64 but becomes the integer i64::MIN under unary minus, so it must not
+    // compare equal to the float 9.223372036854776e18.
+    fn parse(s: &str) -> Option<Either<i128, f64>> {
+        if let Ok(i) = s.parse::<i128>() {
             Some(Either::Left(i))
         } else if let Ok(f) = s.parse::<f64>() {
             Some(Either::Right(f))
@@ -1599,6 +1600,143 @@ impl ViewColumnSchema {
     }
 }
 
+/// Walk all expressions in a statement, including subqueries.
+pub fn walk_stmt_expressions<F>(stmt: &ast::Stmt, func: &mut F) -> Result<()>
+where
+    F: FnMut(&ast::Expr) -> Result<WalkControl>,
+{
+    match stmt {
+        ast::Stmt::Select(select) => walk_select_expressions_inner(select, func)?,
+        ast::Stmt::Insert {
+            with,
+            body,
+            returning,
+            ..
+        } => {
+            walk_with_expressions(with.as_ref(), func)?;
+            if let ast::InsertBody::Select(select, upsert) = body {
+                walk_select_expressions_inner(select, func)?;
+                let mut upsert = upsert.as_deref();
+                while let Some(clause) = upsert {
+                    if let Some(index) = &clause.index {
+                        for target in &index.targets {
+                            walk_expr_with_subqueries(&target.expr, func)?;
+                        }
+                        if let Some(where_clause) = &index.where_clause {
+                            walk_expr_with_subqueries(where_clause, func)?;
+                        }
+                    }
+                    if let ast::UpsertDo::Set { sets, where_clause } = &clause.do_clause {
+                        for set in sets {
+                            walk_expr_with_subqueries(&set.expr, func)?;
+                        }
+                        if let Some(where_clause) = where_clause {
+                            walk_expr_with_subqueries(where_clause, func)?;
+                        }
+                    }
+                    upsert = clause.next.as_deref();
+                }
+            }
+            walk_result_column_expressions(returning, func)?;
+        }
+        ast::Stmt::Update(update) => {
+            walk_with_expressions(update.with.as_ref(), func)?;
+            for set in &update.sets {
+                walk_expr_with_subqueries(&set.expr, func)?;
+            }
+            if let Some(from_clause) = &update.from {
+                walk_from_clause_expressions(from_clause, func)?;
+            }
+            if let Some(where_clause) = &update.where_clause {
+                walk_expr_with_subqueries(where_clause, func)?;
+            }
+            walk_result_column_expressions(&update.returning, func)?;
+        }
+        ast::Stmt::Delete {
+            with,
+            where_clause,
+            returning,
+            ..
+        } => {
+            walk_with_expressions(with.as_ref(), func)?;
+            if let Some(where_clause) = where_clause {
+                walk_expr_with_subqueries(where_clause, func)?;
+            }
+            walk_result_column_expressions(returning, func)?;
+        }
+        ast::Stmt::Attach { expr, db_name, key } => {
+            walk_expr_with_subqueries(expr, func)?;
+            walk_expr_with_subqueries(db_name, func)?;
+            if let Some(key) = key {
+                walk_expr_with_subqueries(key, func)?;
+            }
+        }
+        ast::Stmt::Detach { name } => walk_expr_with_subqueries(name, func)?,
+        ast::Stmt::Vacuum { into, .. } => {
+            if let Some(into) = into {
+                walk_expr_with_subqueries(into, func)?;
+            }
+        }
+        ast::Stmt::Pragma { body, .. } => {
+            if let Some(ast::PragmaBody::Equals(value) | ast::PragmaBody::Call(value)) = body {
+                walk_expr_with_subqueries(value, func)?;
+            }
+        }
+        ast::Stmt::CreateTable {
+            body: ast::CreateTableBody::AsSelect(select),
+            ..
+        } => walk_select_expressions_inner(select, func)?,
+        ast::Stmt::AlterTable(_)
+        | ast::Stmt::Analyze { .. }
+        | ast::Stmt::Begin { .. }
+        | ast::Stmt::Commit { .. }
+        | ast::Stmt::CreateIndex { .. }
+        | ast::Stmt::CreateTable { .. }
+        | ast::Stmt::CreateTrigger { .. }
+        | ast::Stmt::CreateView { .. }
+        | ast::Stmt::CreateMaterializedView { .. }
+        | ast::Stmt::CreateVirtualTable(_)
+        | ast::Stmt::CreateType { .. }
+        | ast::Stmt::CreateDomain { .. }
+        | ast::Stmt::DropIndex { .. }
+        | ast::Stmt::DropTable { .. }
+        | ast::Stmt::DropTrigger { .. }
+        | ast::Stmt::DropView { .. }
+        | ast::Stmt::DropType { .. }
+        | ast::Stmt::DropDomain { .. }
+        | ast::Stmt::Reindex { .. }
+        | ast::Stmt::Release { .. }
+        | ast::Stmt::Rollback { .. }
+        | ast::Stmt::Savepoint { .. }
+        | ast::Stmt::Optimize { .. }
+        | ast::Stmt::CreateSequence { .. }
+        | ast::Stmt::DropSequence { .. } => {}
+    }
+    Ok(())
+}
+
+fn walk_with_expressions<F>(with: Option<&ast::With>, func: &mut F) -> Result<()>
+where
+    F: FnMut(&ast::Expr) -> Result<WalkControl>,
+{
+    for cte in with.iter().flat_map(|with| &with.ctes) {
+        walk_select_expressions_inner(&cte.select, func)?;
+    }
+    Ok(())
+}
+
+fn walk_result_column_expressions<F>(columns: &[ast::ResultColumn], func: &mut F) -> Result<()>
+where
+    F: FnMut(&ast::Expr) -> Result<WalkControl>,
+{
+    for column in columns {
+        if let ast::ResultColumn::Expr(expr, _) = column {
+            walk_expr_with_subqueries(expr, func)?;
+        }
+    }
+    Ok(())
+}
+
 /// Walk all expressions in a SELECT statement, including subqueries.
 pub fn walk_select_expressions<F>(select: &ast::Select, func: &mut F) -> Result<()>
 where
@@ -1611,11 +1749,7 @@ fn walk_select_expressions_inner<F>(select: &ast::Select, func: &mut F) -> Resul
 where
     F: FnMut(&ast::Expr) -> Result<WalkControl>,
 {
-    if let Some(with_clause) = &select.with {
-        for cte in &with_clause.ctes {
-            walk_select_expressions_inner(&cte.select, func)?;
-        }
-    }
+    walk_with_expressions(select.with.as_ref(), func)?;
 
     walk_one_select_expressions(&select.body.select, func)?;
     for compound in &select.body.compounds {
@@ -1649,11 +1783,7 @@ where
             window_clause,
             ..
         } => {
-            for col in columns {
-                if let ast::ResultColumn::Expr(expr, _) = col {
-                    walk_expr_with_subqueries(expr, func)?;
-                }
-            }
+            walk_result_column_expressions(columns, func)?;
 
             if let Some(from_clause) = from {
                 walk_from_clause_expressions(from_clause, func)?;
@@ -1710,7 +1840,7 @@ where
     F: FnMut(&ast::Expr) -> Result<WalkControl>,
 {
     match select_table {
-        ast::SelectTable::Select(select, _) => walk_select_expressions_inner(select, func),
+        ast::SelectTable::Select { select, .. } => walk_select_expressions_inner(select, func),
         ast::SelectTable::Sub(from_clause, _) => walk_from_clause_expressions(from_clause, func),
         ast::SelectTable::TableCall(_, args, _) => {
             for arg in args {
@@ -1853,7 +1983,7 @@ fn validate_select_table_no_cross_db(
         ast::SelectTable::Table(name, _, _) | ast::SelectTable::TableCall(name, _, _) => {
             reject_cross_db_qualified_name(name, view_db_name)?;
         }
-        ast::SelectTable::Select(select, _) => {
+        ast::SelectTable::Select { select, .. } => {
             validate_no_cross_db_references(select, view_db_name)?;
         }
         ast::SelectTable::Sub(from_clause, _) => {
@@ -1981,7 +2111,7 @@ fn view_source_from_select_table(
                 join_info: None,
             })
         }
-        ast::SelectTable::Select(select, alias) => {
+        ast::SelectTable::Select { select, alias, .. } => {
             let derived = extract_view_columns_inner(select, schema, ctes)?;
             Ok(ViewSource {
                 qualifiers: alias
@@ -1997,7 +2127,10 @@ fn view_source_from_select_table(
             match &mut source_table {
                 ast::SelectTable::Table(_, source_alias, _)
                 | ast::SelectTable::TableCall(_, _, source_alias, ..)
-                | ast::SelectTable::Select(_, source_alias)
+                | ast::SelectTable::Select {
+                    alias: source_alias,
+                    ..
+                }
                 | ast::SelectTable::Sub(_, source_alias) => source_alias.clone_from(alias),
             }
             view_source_from_select_table(&source_table, schema, ctes, tables)
@@ -2148,6 +2281,7 @@ fn view_sources_from_clause(
                     ast::JoinOperator::TypedJoin(Some(join_type))
                         if join_type.contains(ast::JoinType::CROSS)
                 ),
+                lateral: false,
             }),
             ..right
         });
@@ -3184,10 +3318,25 @@ mod rename_column_view {
                     db_name: table_db_norm,
                 })
             }
-            ast::SelectTable::Select(select, alias) => {
+            ast::SelectTable::Select {
+                select,
+                alias,
+                lateral,
+            } => {
                 let before_cols = select_output_columns(select, ctx, false)?;
-                *changed |=
-                    rewrite_view_select_for_column_rename(select, ctx, &[], visiting_views)?;
+                let lateral_scopes: Vec<&[ViewSourceInfo]> = if *lateral {
+                    std::iter::once(visible_sources)
+                        .chain(outer_scopes.iter().copied())
+                        .collect()
+                } else {
+                    Vec::new()
+                };
+                *changed |= rewrite_view_select_for_column_rename(
+                    select,
+                    ctx,
+                    &lateral_scopes,
+                    visiting_views,
+                )?;
                 let after_cols = select_output_columns(select, ctx, true)?;
                 let rename_map = build_rename_map(&before_cols, &after_cols, &ctx.old_column_norm);
                 let qualifiers = alias
@@ -4032,14 +4181,6 @@ fn rewrite_one_select_column_refs_scoped(
             window_clause,
             ..
         } => {
-            // Check if FROM clause references the target table to determine
-            // whether unqualified Expr::Id should be renamed in this scope
-            let local = from_clause_target_qualifiers(from, target_table);
-            let added = extend_qualifiers_scoped(target_qualifiers, &local);
-
-            let rename_unqualified =
-                !target_qualifiers.is_empty() || target_table.eq_ignore_ascii_case(trigger_table);
-
             if let Some(ref mut from) = from {
                 rewrite_from_clause_column_refs_scoped(
                     from,
@@ -4050,6 +4191,14 @@ fn rewrite_one_select_column_refs_scoped(
                     target_qualifiers,
                 );
             }
+
+            // Check if FROM clause references the target table to determine
+            // whether unqualified Expr::Id should be renamed in this scope
+            let local = from_clause_target_qualifiers(from, target_table);
+            let added = extend_qualifiers_scoped(target_qualifiers, &local);
+
+            let rename_unqualified =
+                !target_qualifiers.is_empty() || target_table.eq_ignore_ascii_case(trigger_table);
             if let Some(ref mut wc) = where_clause {
                 rename_identifiers_scoped_inner(
                     wc,
@@ -4228,30 +4377,27 @@ fn rewrite_from_clause_column_refs_scoped(
     new_col: &str,
     target_qualifiers: &mut Vec<String>,
 ) {
-    let local = from_clause_target_qualifiers_inner(from, target_table);
-    let added = extend_qualifiers_scoped(target_qualifiers, &local);
+    let outer_len = target_qualifiers.len();
+    let target_table_norm = normalize_ident(target_table);
 
-    let rename_unqualified =
-        !target_qualifiers.is_empty() || target_table.eq_ignore_ascii_case(trigger_table);
-
-    rewrite_select_table_entry_column_refs_scoped(
-        &mut from.select,
-        target_table,
-        trigger_table,
-        old_col,
-        new_col,
-        target_qualifiers,
-    );
-    for join in &mut from.joins {
+    for (table, constraint) in std::iter::once((&mut *from.select, None)).chain(
+        from.joins
+            .iter_mut()
+            .map(|join| (&mut *join.table, join.constraint.as_mut())),
+    ) {
         rewrite_select_table_entry_column_refs_scoped(
-            &mut join.table,
+            table,
             target_table,
             trigger_table,
             old_col,
             new_col,
-            target_qualifiers,
+            &mut from_entry_visible_qualifiers(table, target_qualifiers, outer_len),
         );
-        if let Some(ast::JoinConstraint::On(ref mut expr)) = join.constraint {
+        push_from_entry_target_qualifiers(table, &target_table_norm, target_qualifiers);
+
+        if let Some(ast::JoinConstraint::On(expr)) = constraint {
+            let rename_unqualified =
+                !target_qualifiers.is_empty() || target_table.eq_ignore_ascii_case(trigger_table);
             rename_identifiers_scoped_inner(
                 expr,
                 target_table,
@@ -4263,7 +4409,37 @@ fn rewrite_from_clause_column_refs_scoped(
             );
         }
     }
-    target_qualifiers.truncate(target_qualifiers.len() - added);
+    target_qualifiers.truncate(outer_len);
+}
+
+/// A plain FROM subquery only sees the outer query; LATERAL subqueries and
+/// table-valued function arguments also see the FROM entries to their left.
+fn from_entry_visible_qualifiers(
+    table: &ast::SelectTable,
+    target_qualifiers: &[String],
+    outer_len: usize,
+) -> Vec<String> {
+    match table {
+        ast::SelectTable::Select { lateral: false, .. } | ast::SelectTable::Sub(..) => {
+            target_qualifiers[..outer_len].to_vec()
+        }
+        _ => target_qualifiers.to_vec(),
+    }
+}
+
+fn push_from_entry_target_qualifiers(
+    table: &ast::SelectTable,
+    target_table_norm: &str,
+    target_qualifiers: &mut Vec<String>,
+) {
+    let mut table_qualifiers = Vec::new();
+    collect_target_qualifiers(
+        table,
+        target_table_norm,
+        &mut table_qualifiers,
+        &mut HashSet::default(),
+    );
+    extend_qualifiers_scoped(target_qualifiers, &table_qualifiers);
 }
 
 fn rewrite_select_table_entry_column_refs_scoped(
@@ -4288,7 +4464,7 @@ fn rewrite_select_table_entry_column_refs_scoped(
                 );
             }
         }
-        ast::SelectTable::Select(ref mut select, _) => {
+        ast::SelectTable::Select { ref mut select, .. } => {
             rewrite_select_column_refs_scoped(
                 select,
                 target_table,
@@ -4401,12 +4577,6 @@ fn one_select_still_references_renamed_column(
             group_by,
             ..
         } => {
-            let local = from_clause_target_qualifiers(from, target_table);
-            let added = extend_qualifiers_scoped(target_qualifiers, &local);
-
-            let rename_unqualified =
-                !target_qualifiers.is_empty() || target_table.eq_ignore_ascii_case(trigger_table);
-
             let mut found = false;
             if let Some(from_clause) = from {
                 if from_clause_still_references_renamed_column(
@@ -4419,6 +4589,12 @@ fn one_select_still_references_renamed_column(
                     found = true;
                 }
             }
+
+            let local = from_clause_target_qualifiers(from, target_table);
+            let added = extend_qualifiers_scoped(target_qualifiers, &local);
+
+            let rename_unqualified =
+                !target_qualifiers.is_empty() || target_table.eq_ignore_ascii_case(trigger_table);
 
             if !found {
                 if let Some(where_expr) = where_clause {
@@ -4636,7 +4812,7 @@ fn select_table_still_references_renamed_column(
                 target_qualifiers,
             )
         }),
-        ast::SelectTable::Select(select, _) => select_still_references_renamed_column(
+        ast::SelectTable::Select { select, .. } => select_still_references_renamed_column(
             select,
             target_table,
             trigger_table,
@@ -4661,52 +4837,43 @@ fn from_clause_still_references_renamed_column(
     old_col: &str,
     target_qualifiers: &mut Vec<String>,
 ) -> bool {
-    let local = from_clause_target_qualifiers_inner(from, target_table);
-    let added = extend_qualifiers_scoped(target_qualifiers, &local);
+    let outer_len = target_qualifiers.len();
+    let target_table_norm = normalize_ident(target_table);
 
-    let rename_unqualified =
-        !target_qualifiers.is_empty() || target_table.eq_ignore_ascii_case(trigger_table);
-
-    let mut found = false;
-    if select_table_still_references_renamed_column(
-        &from.select,
-        target_table,
-        trigger_table,
-        old_col,
-        target_qualifiers,
-    ) {
-        found = true;
-    }
-
-    if !found {
-        for join in &from.joins {
+    let found = std::iter::once((&*from.select, None))
+        .chain(
+            from.joins
+                .iter()
+                .map(|join| (&*join.table, join.constraint.as_ref())),
+        )
+        .any(|(table, constraint)| {
             if select_table_still_references_renamed_column(
-                &join.table,
+                table,
                 target_table,
                 trigger_table,
                 old_col,
-                target_qualifiers,
+                &mut from_entry_visible_qualifiers(table, target_qualifiers, outer_len),
             ) {
-                found = true;
-                break;
+                return true;
             }
-            if let Some(ast::JoinConstraint::On(expr)) = &join.constraint {
-                if expr_still_references_renamed_column(
-                    expr,
-                    target_table,
-                    trigger_table,
-                    old_col,
-                    rename_unqualified,
-                    target_qualifiers,
-                ) {
-                    found = true;
-                    break;
-                }
-            }
-        }
-    }
+            push_from_entry_target_qualifiers(table, &target_table_norm, target_qualifiers);
 
-    target_qualifiers.truncate(target_qualifiers.len() - added);
+            let Some(ast::JoinConstraint::On(expr)) = constraint else {
+                return false;
+            };
+            let rename_unqualified =
+                !target_qualifiers.is_empty() || target_table.eq_ignore_ascii_case(trigger_table);
+            expr_still_references_renamed_column(
+                expr,
+                target_table,
+                trigger_table,
+                old_col,
+                rename_unqualified,
+                target_qualifiers,
+            )
+        });
+
+    target_qualifiers.truncate(outer_len);
     found
 }
 
@@ -5175,7 +5342,7 @@ fn rewrite_select_table_entry_table_refs(st: &mut ast::SelectTable, old_tbl: &st
                 rewrite_check_expr_table_refs(arg, old_tbl, new_tbl);
             }
         }
-        ast::SelectTable::Select(ref mut select, _) => {
+        ast::SelectTable::Select { ref mut select, .. } => {
             rewrite_select_table_refs(select, old_tbl, new_tbl);
         }
         ast::SelectTable::Sub(ref mut from, _) => {

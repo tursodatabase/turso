@@ -1545,6 +1545,54 @@ fn test_integrity_check_freeblock_out_of_range(db: TempDatabase) {
         .is_not_equal_to("ok");
 }
 
+#[cfg(not(feature = "checksum"))]
+#[turso_macros::test]
+fn test_integrity_check_freeblock_loop(db: TempDatabase) {
+    let conn = db.connect_limbo();
+
+    conn.execute("CREATE TABLE t1(id INTEGER PRIMARY KEY, data TEXT);")
+        .unwrap();
+    for i in 0..10 {
+        conn.execute(format!("INSERT INTO t1 VALUES ({i}, 'data{i}');"))
+            .unwrap();
+    }
+
+    checkpoint_database(&conn);
+
+    let result = run_integrity_check(&conn);
+    assert_eq!(result, "ok", "Database should be valid before corruption");
+
+    drop(conn);
+
+    {
+        let mut file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&db.path)
+            .unwrap();
+
+        let mut page2 = [0u8; PAGE_SIZE];
+        file.seek(SeekFrom::Start(PAGE_SIZE as u64)).unwrap();
+        file.read_exact(&mut page2).unwrap();
+
+        let freeblock_offset = 0x800;
+        write_u16_be(&mut page2, 1, freeblock_offset as u16);
+        write_u16_be(&mut page2, freeblock_offset, freeblock_offset as u16);
+        write_u16_be(&mut page2, freeblock_offset + 2, 4);
+
+        file.seek(SeekFrom::Start(PAGE_SIZE as u64)).unwrap();
+        file.write_all(&page2).unwrap();
+        file.sync_all().unwrap();
+    }
+
+    let db = TempDatabase::new_with_existent(&db.path);
+    let conn = db.connect_limbo();
+
+    assert_that!(run_integrity_check_catching_panic(&conn))
+        .ok()
+        .contains("freeblock list not in ascending order");
+}
+
 // =============================================================================
 // ERROR CASE TESTS: RowMissingFromIndex
 // =============================================================================

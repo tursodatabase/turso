@@ -103,6 +103,7 @@ impl AvailableIndexes {
             .joined_tables()
             .iter()
             .filter(|jt| matches!(jt.table, Table::BTree(_) | Table::Virtual(_))) // only b-tree tables can have indexes
+            .filter(|jt| jt.btree().is_none_or(|btree| btree.has_rowid))
             .filter_map(|jt| {
                 let indexes = resolver.with_schema(jt.database_id, |schema| {
                     schema.indexes.get(jt.table.get_name()).cloned()
@@ -1611,6 +1612,7 @@ fn build_update_write_set_plan(
             join_type: JoinType::Inner,
             using: vec![],
             no_reorder: false,
+            lateral: false,
         });
         from_tables.add_joined_table(target_table);
         from_tables
@@ -1686,7 +1688,6 @@ fn build_update_write_set_plan(
             ephemeral_subs
         },
         simple_aggregate: None,
-        phantom_params: vec![],
     };
 
     plan.write_set_plan = Some(WriteSetPlan {
@@ -2338,6 +2339,12 @@ fn enforce_indexed_by_hints(
         match indexed {
             ast::Indexed::IndexedBy(name) => {
                 let idx_name = name.as_str();
+                if table_ref.btree().is_some_and(|btree| !btree.has_rowid) {
+                    crate::bail_parse_error!(
+                        "INDEXED BY is not supported on WITHOUT ROWID tables: {}",
+                        idx_name
+                    );
+                }
                 // Verify the index exists and belongs to this table.
                 let forced_index =
                     available_indexes.btree_index_by_name(table_ref.internal_id, idx_name);
@@ -3793,7 +3800,7 @@ fn mark_seek_constraints_consumed(
     }
 }
 
-fn mark_partial_index_predicate_terms_consumed(
+pub(crate) fn mark_partial_index_predicate_terms_consumed(
     index: &Index,
     table_reference: &JoinedTable,
     where_clause: &mut [WhereTerm],

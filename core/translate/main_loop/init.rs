@@ -62,11 +62,18 @@ impl InitLoop {
             OperationMode::INSERT | OperationMode::UPDATE { .. } | OperationMode::DELETE
         ) {
             turso_assert_eq!(tables.joined_tables().len(), 1);
-            let changed_table = &tables.joined_tables()[0].table;
+            let changed_table = match mode {
+                OperationMode::UPDATE(UpdateRowSource::PrebuiltEphemeralTable {
+                    target_table,
+                    ..
+                }) => target_table.as_ref(),
+                _ => &tables.joined_tables()[0],
+            };
             let prepared = prepare_cdc_if_necessary(
                 program,
                 t_ctx.resolver.schema(),
-                Some(changed_table.get_name()),
+                changed_table.database_id,
+                Some(changed_table.table.get_name()),
             )?;
             if let Some((cdc_cursor_id, _)) = prepared {
                 t_ctx.cdc_cursor_id = Some(cdc_cursor_id);
@@ -181,7 +188,7 @@ impl InitLoop {
                 }
             }
             let (table_cursor_id, index_cursor_id) =
-                table.open_cursors(program, mode.clone(), t_ctx.resolver.schema())?;
+                table.open_cursors(program, mode.clone(), &t_ctx.resolver)?;
             match &table.op {
                 Operation::Scan(Scan::BTreeTable { index, .. }) => match (&mode, &table.table) {
                     (OperationMode::SELECT, Table::BTree(btree)) => {

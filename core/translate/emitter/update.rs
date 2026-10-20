@@ -2,7 +2,6 @@ use super::gencol::compute_virtual_columns;
 use super::TranslateCtx;
 use crate::alloc::{TryClone, TursoIteratorExt};
 use crate::schema::{Column, ColumnLayout, GeneratedType, Table};
-use crate::translate::insert::halt_desc_and_on_error;
 use crate::translate::plan::ColumnMask;
 use crate::translate::stmt_journal::any_effective_replace;
 use crate::vdbe::builder::SelfTableContext;
@@ -601,6 +600,7 @@ fn emit_notnull_constraint_check(
                 target_reg,
                 err_code: SQLITE_CONSTRAINT_NOTNULL,
                 description: description(),
+                on_error: program.constraint_halt_on_error(or_conflict),
             });
         }
         _ => {
@@ -608,6 +608,7 @@ fn emit_notnull_constraint_check(
                 target_reg,
                 err_code: SQLITE_CONSTRAINT_NOTNULL,
                 description: description(),
+                on_error: program.constraint_halt_on_error(or_conflict),
             });
         }
     }
@@ -619,8 +620,8 @@ fn emit_notnull_constraint_check(
 /// read, and propagates a conflict-resolution override when one is in effect:
 /// a `trigger_conflict_override` pushed by an enclosing UPSERT `DO UPDATE`
 /// wins, otherwise the outer UPDATE's explicit `OR <conflict>` overrides the
-/// trigger's own conflict resolution (except for the default `ABORT`, which
-/// is left unset so the trigger's own resolution applies). `after` selects
+/// trigger's own conflict resolution. Without an OR clause the trigger's own
+/// resolution applies. `after` selects
 /// between the BEFORE and AFTER constructors.
 fn update_trigger_context(
     program: &ProgramBuilder,
@@ -630,9 +631,12 @@ fn update_trigger_context(
     or_conflict: ResolveType,
     timing: TriggerTime,
 ) -> TriggerContext {
-    let override_conflict = program
-        .trigger_conflict_override
-        .or_else(|| (!matches!(or_conflict, ResolveType::Abort)).then_some(or_conflict));
+    let override_conflict = program.trigger_conflict_override.or_else(|| {
+        program
+            .flags
+            .has_statement_conflict()
+            .then_some(or_conflict)
+    });
 
     let after = matches!(timing, TriggerTime::After);
     match (after, override_conflict) {
@@ -790,6 +794,9 @@ fn emit_replace_delete<'a>(
 /// This is invoked once for every UPDATE, but will be invoked again if there are
 /// any BEFORE UPDATE triggers that fired, because the triggers may have modified the row,
 /// in which case the previously read values are stale.
+///
+/// Returns whether an unchanged column was read from the table cursor. That read
+/// happens for every row, so it finishes any pending DeferredSeek.
 #[allow(clippy::too_many_arguments)]
 fn emit_update_column_values<'a>(
     program: &mut ProgramBuilder,
@@ -800,8 +807,9 @@ fn emit_update_column_values<'a>(
     skip_set_clauses: bool,
     skip_row_label: BranchOffset,
     skip_notnull_checks: bool,
-) -> crate::Result<()> {
+) -> crate::Result<bool> {
     let or_conflict = program.resolve_type;
+    let mut table_column_was_read = false;
     if let Some(expr) = set_clauses
         .iter()
         .find(|set_clause| set_clause.column_index == ROWID_SENTINEL)
@@ -900,15 +908,13 @@ fn emit_update_column_values<'a>(
                             // Columns with custom type encode must not have their
                             // SET expressions hoisted as constants. See the doc
                             // comment on NoConstantOptReason::CustomTypeEncode.
-                            let has_custom_encode = {
-                                let ty = &table_column.ty_str;
-                                !ty.is_empty()
-                                    && t_ctx
-                                        .resolver
-                                        .schema
-                                        .get_type_def_unchecked(ty)
-                                        .is_some_and(|td| td.encode().is_some())
-                            };
+                            let has_custom_encode = t_ctx
+                                .resolver
+                                .schema
+                                .resolve_type_unchecked(&table_column.ty_str)
+                                .ok()
+                                .flatten()
+                                .is_some_and(|r| r.chain.iter().any(|td| td.encode().is_some()));
                             let translate_result = if has_custom_encode {
                                 translate_expr_no_constant_opt(
                                     program,
@@ -1006,11 +1012,17 @@ fn emit_update_column_values<'a>(
                             .filter(|_| column_idx_in_index.is_some())
                             .map(|(_, id)| *id)
                             .unwrap_or(column_ctx.target_table_cursor_id);
-                        program.emit_column_or_rowid(
+                        table_column_was_read |= cursor_id == column_ctx.target_table_cursor_id;
+                        emit_table_column(
+                            program,
                             cursor_id,
+                            column_ctx.target_table.internal_id,
+                            table_references,
+                            table_column,
                             column_idx_in_index.unwrap_or(idx),
                             target_reg,
-                        );
+                            &t_ctx.resolver,
+                        )?;
                     }
                 }
                 GeneratedType::Virtual { .. } => {
@@ -1030,7 +1042,7 @@ fn emit_update_column_values<'a>(
             }
         }
     }
-    Ok(())
+    Ok(table_column_was_read)
 }
 
 /// Emit NOT NULL constraint checks for SET clause columns after BEFORE triggers have fired.
@@ -1098,7 +1110,6 @@ fn emit_update_insns<'a>(
     returning_buffer: Option<&ReturningBufferCtx>,
     non_from_clause_subqueries: &mut [NonFromClauseSubquery],
 ) -> crate::Result<()> {
-    let update_body_start = program.insns.len();
     let uses_write_set = temp_cursor_id.is_some();
     let iteration_cursor_id = temp_cursor_id.unwrap_or(target_table_cursor_id);
     let or_conflict = program.resolve_type;
@@ -1258,7 +1269,6 @@ fn emit_update_insns<'a>(
             *subquery_plan,
             &subquery.query_type,
             subquery.correlated,
-            false,
         )?;
     }
 
@@ -1278,11 +1288,12 @@ fn emit_update_insns<'a>(
     let layout = ColumnLayout::from_table(&target_table.as_ref().table)?;
     // we allocate 2C registers for "updates" as the structure of this column for CDC table is following:
     // [C boolean values where true set for changed columns] [C values with updates where NULL is set for not-changed columns]
-    let cdc_updates_register = if program.capture_data_changes_info().has_updates() {
-        Some(program.alloc_registers(2 * layout.num_non_virtual_cols()))
-    } else {
-        None
-    };
+    let cdc_updates_register =
+        if t_ctx.cdc_cursor_id.is_some() && program.capture_data_changes_info().has_updates() {
+            Some(program.alloc_registers(2 * layout.num_non_virtual_cols()))
+        } else {
+            None
+        };
     let table_name = target_table.table.get_name();
     let start = if is_virtual_table { beg + 2 } else { beg + 1 };
     let target_btree = target_table.table.btree();
@@ -1344,7 +1355,7 @@ fn emit_update_insns<'a>(
     };
     let has_before_triggers = !relevant_before_update_triggers.is_empty();
 
-    emit_update_column_values(
+    let table_column_was_read = emit_update_column_values(
         program,
         table_references,
         set_clauses,
@@ -1695,15 +1706,10 @@ fn emit_update_insns<'a>(
                 } else {
                     String::from(table_name) + ".rowid"
                 };
-                let (description, on_error) = halt_desc_and_on_error(
-                    &raw_desc,
-                    effective_rowid_alias_conflict,
-                    program.flags.has_statement_conflict(),
-                );
                 program.emit_insn(Insn::Halt {
                     err_code: SQLITE_CONSTRAINT_PRIMARYKEY,
-                    description,
-                    on_error,
+                    description: raw_desc,
+                    on_error: program.constraint_halt_on_error(effective_rowid_alias_conflict),
                     description_reg: None,
                 });
             }
@@ -2062,15 +2068,10 @@ fn emit_update_insns<'a>(
                             accum
                         },
                     );
-                    let (description, on_error) = halt_desc_and_on_error(
-                        &column_names,
-                        idx_conflict,
-                        program.flags.has_statement_conflict(),
-                    );
                     program.emit_insn(Insn::Halt {
                         err_code: SQLITE_CONSTRAINT_UNIQUE,
-                        description,
-                        on_error,
+                        description: column_names,
+                        on_error: program.constraint_halt_on_error(idx_conflict),
                         description_reg: None,
                     });
                 }
@@ -2327,7 +2328,9 @@ fn emit_update_insns<'a>(
             };
 
             // create full CDC record before update if necessary
-            let cdc_before_reg = if program.capture_data_changes_info().has_before() {
+            let cdc_before_reg = if t_ctx.cdc_cursor_id.is_some()
+                && program.capture_data_changes_info().has_before()
+            {
                 Some(emit_cdc_full_record(
                     program,
                     target_table.table.columns(),
@@ -2344,16 +2347,9 @@ fn emit_update_insns<'a>(
             // In MVCC mode, we also need DELETE+INSERT to properly version the row (Hekaton model).
             let needs_delete = not_exists_check_required
                 || connection.mv_store_for_db(update_database_id).is_some();
-            // A table-column read finishes DeferredSeek. SQLite emits FinishSeek
-            // only when no such read appears before the table write.
-            let table_column_was_read =
-                program.insns[update_body_start..].iter().any(|(insn, _)| {
-                    matches!(
-                        insn,
-                        Insn::Column { cursor_id, .. } | Insn::ColumnRange { cursor_id, .. }
-                            if *cursor_id == target_table_cursor_id
-                    )
-                });
+            // Like SQLite, only an unchanged-column read for the new record counts:
+            // other table-column reads, such as the old value for a partial index,
+            // can sit in a branch that some rows skip.
             if target_table.op.index().is_some() && !table_column_was_read {
                 program.emit_insn(Insn::FinishSeek {
                     cursor_id: target_table_cursor_id,
@@ -2490,7 +2486,6 @@ fn emit_update_insns<'a>(
                             *subquery_plan,
                             &subquery.query_type,
                             subquery.correlated || rerun_for_target_scan,
-                            true,
                         )?;
                     }
                     Ok(())
@@ -2516,7 +2511,9 @@ fn emit_update_insns<'a>(
             }
 
             // create full CDC record after update if necessary
-            let cdc_after_reg = if program.capture_data_changes_info().has_after() {
+            let cdc_after_reg = if t_ctx.cdc_cursor_id.is_some()
+                && program.capture_data_changes_info().has_after()
+            {
                 Some(emit_cdc_patch_record(
                     program,
                     &target_table.table,

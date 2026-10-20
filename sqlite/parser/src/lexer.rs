@@ -6,7 +6,10 @@ use turso_macros::match_ignore_ascii_case;
 /// rendered back to SQL text.
 pub fn is_quotable_keyword(input: &[u8]) -> bool {
     let token = keyword_or_id_token(input);
-    token != TokenType::TK_ID && token != TokenType::TK_TYPE
+    !matches!(
+        token,
+        TokenType::TK_ID | TokenType::TK_TYPE | TokenType::TK_LATERAL
+    )
 }
 
 fn keyword_or_id_token(input: &[u8]) -> TokenType {
@@ -93,6 +96,7 @@ fn keyword_or_id_token(input: &[u8]) -> TokenType {
         b"JOIN" => TokenType::TK_JOIN,
         b"KEY" => TokenType::TK_KEY,
         b"LAST" => TokenType::TK_LAST,
+        b"LATERAL" => TokenType::TK_LATERAL,
         b"LEFT" => TokenType::TK_JOIN_KW,
         b"LIKE" => TokenType::TK_LIKE_KW,
         b"LIMIT" => TokenType::TK_LIMIT,
@@ -1318,6 +1322,7 @@ mod tests {
             ("JOIN", TokenType::TK_JOIN),
             ("KEY", TokenType::TK_KEY),
             ("LAST", TokenType::TK_LAST),
+            ("LATERAL", TokenType::TK_LATERAL),
             ("LEFT", TokenType::TK_JOIN_KW),
             ("LIKE", TokenType::TK_LIKE_KW),
             ("LIMIT", TokenType::TK_LIMIT),

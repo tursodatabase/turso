@@ -296,12 +296,25 @@ pub struct TableConstraints {
 pub(super) fn automatic_index_terms(
     table: &JoinedTable,
     constraints: &TableConstraints,
+    schema: &Schema,
 ) -> SmallVec<[ConstraintRef; 4]> {
     let columns = table.columns();
+    let can_use_term = |term: &Constraint| {
+        if !term.can_drive_index_seek(columns) {
+            return false;
+        }
+        let column = &columns[term
+            .table_col_pos
+            .expect("a term that can drive an index seek has a column")];
+        let has_custom_type = schema
+            .get_type_def(&column.ty_str, table.table.is_strict())
+            .is_some();
+        !has_custom_type || term.operator == ast::Operator::Equals.into()
+    };
     let usable_constraints: SmallVec<[&Constraint; 4]> = constraints
         .constraints
         .iter()
-        .filter(|term| term.can_drive_index_seek(columns))
+        .filter(|term| can_use_term(term))
         .collect();
     let index_columns = ordered_ephemeral_key_columns(&usable_constraints);
 
@@ -309,7 +322,7 @@ pub(super) fn automatic_index_terms(
         .constraints
         .iter()
         .enumerate()
-        .filter(|(_, term)| term.can_drive_index_seek(columns))
+        .filter(|(_, term)| can_use_term(term))
         .filter_map(|(term_index, term)| {
             let table_col_pos = term.table_col_pos?;
             Some(ConstraintRef {
@@ -1355,7 +1368,7 @@ pub fn constraints_from_where_clause(
             }
             true
         });
-        cs.temporary_index_terms = automatic_index_terms(table_reference, &cs)
+        cs.temporary_index_terms = automatic_index_terms(table_reference, &cs, schema)
             .into_iter()
             .filter(|term| {
                 let constraint = &cs.constraints[term.constraint_vec_pos];
@@ -1748,7 +1761,7 @@ pub(super) fn partial_index_predicate_terms(
     // `x IS NOT NULL`, `x > 10` implies `x > 5`).
 }
 
-pub(super) fn partial_index(index: Option<&Arc<Index>>) -> Option<&Index> {
+pub(crate) fn partial_index(index: Option<&Arc<Index>>) -> Option<&Index> {
     let index = index?;
     index.where_clause.as_ref()?;
     Some(index.as_ref())
@@ -2184,16 +2197,20 @@ pub(crate) fn summarize_binary_term_for_index(
     subqueries: &[NonFromClauseSubquery],
 ) -> Option<IndexableTermSummary> {
     let BinaryTermIndexInfo {
+        lhs,
+        rhs,
         operator,
         table_col_pos,
         constraining_expr,
         is_rowid,
         ..
     } = analyze_binary_term_index_info(expr, table_id, rowid_alias_column)?;
+    let comparison_collation = resolve_comparison_collseq(lhs, rhs, table_references).ok()?;
 
     let (best_index, constraint_refs) = find_best_index_for_constraint(
         table_col_pos,
         operator,
+        comparison_collation,
         indexes,
         rowid_alias_column,
         is_rowid,
@@ -2251,11 +2268,13 @@ pub(crate) fn analyze_binary_term_for_index(
         side,
         is_rowid,
     } = analyze_binary_term_index_info(expr, table_id, rowid_alias_column)?;
+    let comparison_collation = resolve_comparison_collseq(lhs, rhs, table_references).ok()?;
 
     // Find the best index for this constraint
     let (best_index, constraint_refs) = find_best_index_for_constraint(
         table_col_pos,
         operator,
+        comparison_collation,
         indexes,
         rowid_alias_column,
         is_rowid,
@@ -2339,9 +2358,11 @@ pub(crate) fn analyze_binary_term_for_index(
 }
 
 /// Find the best index for a single constraint.
+#[allow(clippy::too_many_arguments)]
 fn find_best_index_for_constraint(
     table_col_pos: Option<usize>,
     operator: ConstraintOperator,
+    comparison_collation: CollationSeq,
     indexes: Option<&VecDeque<Arc<Index>>>,
     rowid_alias_column: Option<usize>,
     is_rowid: bool,
@@ -2419,7 +2440,9 @@ fn find_best_index_for_constraint(
             if let Some(idx_col_pos) = index.column_table_pos_to_index_pos(col_pos) {
                 // For multi-index OR, we prefer indexes where the constraint column
                 // is the first column (leftmost prefix)
-                if idx_col_pos == 0 {
+                if idx_col_pos == 0
+                    && index.columns[0].collation.unwrap_or_default() == comparison_collation
+                {
                     let constraint_ref = RangeConstraintRef {
                         table_col_pos: Some(col_pos),
                         index_col_pos: 0,

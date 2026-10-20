@@ -3,6 +3,7 @@ use rustc_hash::FxHashSet as HashSet;
 
 use super::*;
 use crate::alloc::{TursoAllocator, TursoIteratorExt, TursoTryWithCapacityExt};
+use crate::database::remove_file_from_database_registry;
 use crate::io::{PlatformIO, IO};
 use crate::mvcc::clock::MvccClock;
 use crate::mvcc::cursor::{CursorYieldPoint, MvccCursorType};
@@ -557,7 +558,7 @@ fn mvcc_active_read_tx_blocks_vacuum_gate() {
         Err(LimboError::Busy)
     ));
 
-    db.mvcc_store.remove_tx(tx_id).unwrap();
+    db.mvcc_store.remove_tx(tx_id);
     db.mvcc_store.try_begin_vacuum_gate().unwrap();
     db.mvcc_store.release_vacuum_gate();
 }
@@ -1786,15 +1787,12 @@ impl MvccTestDbNoConn {
     /// Like `restart`, but returns the error instead of panicking.
     /// Useful for testing wrong-key scenarios.
     pub fn restart_result(&mut self) -> crate::Result<()> {
-        // First let's clear any entries in database manager in order to force restart.
+        // Remove this database from the database manager in order to force restart.
         // If not, we will load the same database instance again.
-        {
-            let mut manager = DATABASE_MANAGER.lock();
-            manager.clear();
-        }
+        let path = self.path.as_ref().unwrap();
+        remove_file_from_database_registry(path);
         // Now open again.
         let io = Arc::new(PlatformIO::new().unwrap());
-        let path = self.path.as_ref().unwrap();
         let db = Database::open_file_with_flags(
             io,
             path,
@@ -1914,8 +1912,7 @@ fn wal_path_for_db(path: &str) -> std::path::PathBuf {
 
 fn force_close_for_artifact_tamper(db: &mut MvccTestDbNoConn) {
     db.db.take();
-    let mut manager = DATABASE_MANAGER.lock();
-    manager.clear();
+    remove_file_from_database_registry(db.path.as_ref().unwrap());
 }
 
 fn read_db_page_size(path: &str) -> usize {
@@ -2823,10 +2820,7 @@ fn test_bootstrap_repairs_torn_short_log_before_metadata_init() {
     let log_path = std::path::Path::new(&db_path_str).with_extension("db-log");
     overwrite_file_with_junk(&log_path, LOG_HDR_SIZE / 2, 0xAB);
 
-    {
-        let mut manager = DATABASE_MANAGER.lock();
-        manager.clear();
-    }
+    remove_file_from_database_registry(&db_path_str);
     {
         let io = Arc::new(PlatformIO::new().unwrap());
         let db = Database::open_file(io, &db_path_str, Arc::new(SqliteDialect)).unwrap();
@@ -2835,10 +2829,7 @@ fn test_bootstrap_repairs_torn_short_log_before_metadata_init() {
         conn.close().unwrap();
     }
 
-    {
-        let mut manager = DATABASE_MANAGER.lock();
-        manager.clear();
-    }
+    remove_file_from_database_registry(&db_path_str);
     let io = Arc::new(PlatformIO::new().unwrap());
     let db = Database::open_file(io, &db_path_str, Arc::new(SqliteDialect)).unwrap();
     let conn = db.connect(ConnectOpts::new()).unwrap();
@@ -3212,10 +3203,7 @@ fn test_bootstrap_recovers_committed_wal_without_log_file() {
         advance_checkpoint_until_wal_has_commit_frame(mvcc_store, &conn);
     }
 
-    {
-        let mut manager = DATABASE_MANAGER.lock();
-        manager.clear();
-    }
+    remove_file_from_database_registry(&db_path);
 
     let log_path = std::path::Path::new(&db_path).with_extension("db-log");
     std::fs::remove_file(&log_path).unwrap();
@@ -3255,10 +3243,7 @@ fn test_full_checkpoint_reopen_recovers_truncate_mode() {
         conn.execute("PRAGMA wal_checkpoint(FULL)").unwrap();
     }
 
-    {
-        let mut manager = DATABASE_MANAGER.lock();
-        manager.clear();
-    }
+    remove_file_from_database_registry(&db_path);
 
     let io = Arc::new(PlatformIO::new().unwrap());
     let db = Database::open_file(io, &db_path, Arc::new(SqliteDialect))
@@ -3358,10 +3343,7 @@ fn test_bootstrap_rejects_torn_log_header_with_committed_wal() {
 
     overwrite_log_header_byte(&db_path, 0, 0x00);
 
-    {
-        let mut manager = DATABASE_MANAGER.lock();
-        manager.clear();
-    }
+    remove_file_from_database_registry(&db_path);
 
     let io = Arc::new(PlatformIO::new().unwrap());
     match Database::open_file(io, &db_path, Arc::new(SqliteDialect)) {
@@ -3399,10 +3381,7 @@ fn test_bootstrap_rejects_corrupt_log_header_without_wal() {
         overwrite_file_with_junk(&wal_path, 0, 0x00);
     }
 
-    {
-        let mut manager = DATABASE_MANAGER.lock();
-        manager.clear();
-    }
+    remove_file_from_database_registry(&db_path);
 
     let io = Arc::new(PlatformIO::new().unwrap());
     match Database::open_file(io, &db_path, Arc::new(SqliteDialect)) {
@@ -3470,10 +3449,7 @@ fn test_bootstrap_ignores_wal_frames_without_commit_marker() {
     }
 
     rewrite_wal_frames_as_non_commit(&wal_path);
-    {
-        let mut manager = DATABASE_MANAGER.lock();
-        manager.clear();
-    }
+    remove_file_from_database_registry(&db_path);
     let io = Arc::new(PlatformIO::new().unwrap());
     let db2 =
         Database::open_file(io, &db_path, Arc::new(SqliteDialect)).expect("open should succeed");
@@ -3670,22 +3646,26 @@ fn test_header_only_mutation_is_replayed_and_checkpointed() {
     }
 }
 
-/// What this test checks: Header PRAGMAs in MVCC require an exclusive transaction and reject
-/// BEGIN CONCURRENT writes.
+/// What this test checks: Header PRAGMAs in MVCC run under an exclusive transaction. A
+/// BEGIN CONCURRENT transaction is upgraded to exclusive in place.
 /// Why this matters: Header updates have no row-level conflict keys, so they must not run under
 /// optimistic concurrent write mode.
 #[test]
-fn test_mvcc_header_updates_require_exclusive_transaction() {
+fn test_mvcc_header_updates_upgrade_concurrent_tx_to_exclusive() {
     let db = MvccTestDbNoConn::new_with_random_db();
     let conn = db.connect();
 
     conn.execute("BEGIN CONCURRENT").unwrap();
-    let err = conn.execute("PRAGMA user_version = 42").unwrap_err();
-    assert!(
-        err.to_string().contains("exclusive transaction"),
-        "expected exclusive-transaction error, got: {err:?}"
-    );
+    conn.execute("PRAGMA user_version = 42").unwrap();
     conn.execute("ROLLBACK").unwrap();
+
+    let rows = get_rows(&conn, "PRAGMA user_version");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(
+        rows[0][0].as_int().unwrap(),
+        0,
+        "rolled-back header update must not stick"
+    );
 
     conn.execute("BEGIN").unwrap();
     conn.execute("PRAGMA user_version = 7").unwrap();
@@ -3737,11 +3717,8 @@ fn test_meta_recovery_case_3_no_wal_log_frames_without_valid_metadata_fails_clos
     let _ = std::fs::remove_file(&wal_path);
     overwrite_file_with_junk(&wal_path, 0, 0);
 
-    {
-        // Ensure cold open after artifact tamper.
-        let mut manager = DATABASE_MANAGER.lock();
-        manager.clear();
-    }
+    // Ensure cold open after artifact tamper.
+    remove_file_from_database_registry(&db_path);
     let io = Arc::new(PlatformIO::new().unwrap());
     match Database::open_file(io, &db_path, Arc::new(SqliteDialect)) {
         Ok(db2) => match db2.connect(ConnectOpts::new()) {
@@ -3823,10 +3800,7 @@ fn test_meta_recovery_case_5_committed_wal_missing_metadata_fails_closed() {
         "expected metadata WAL frame to be mutated into missing-row shape"
     );
 
-    {
-        let mut manager = DATABASE_MANAGER.lock();
-        manager.clear();
-    }
+    remove_file_from_database_registry(&db_path);
     let io = Arc::new(PlatformIO::new().unwrap());
     match Database::open_file(io, &db_path, Arc::new(SqliteDialect)) {
         Ok(db2) => match db2.connect(ConnectOpts::new()) {
@@ -3861,11 +3835,8 @@ fn test_meta_recovery_case_6_committed_wal_corrupt_metadata_fails_closed() {
         "expected at least one metadata WAL frame to be mutated"
     );
 
-    {
-        // Ensure cold open after artifact tamper.
-        let mut manager = DATABASE_MANAGER.lock();
-        manager.clear();
-    }
+    // Ensure cold open after artifact tamper.
+    remove_file_from_database_registry(&db_path);
     let io = Arc::new(PlatformIO::new().unwrap());
     if Database::open_file(io, &db_path, Arc::new(SqliteDialect))
         .is_ok_and(|db2| db2.connect(ConnectOpts::new()).is_ok())
@@ -3894,11 +3865,8 @@ fn test_meta_recovery_case_7_metadata_table_shape_violation_fails_closed() {
     let _ = std::fs::remove_file(&wal_path);
     overwrite_file_with_junk(&wal_path, 0, 0);
 
-    {
-        // Ensure cold open after artifact tamper.
-        let mut manager = DATABASE_MANAGER.lock();
-        manager.clear();
-    }
+    // Ensure cold open after artifact tamper.
+    remove_file_from_database_registry(&db_path);
     let io = Arc::new(PlatformIO::new().unwrap());
     if Database::open_file(io, &db_path, Arc::new(SqliteDialect))
         .is_ok_and(|db2| db2.connect(ConnectOpts::new()).is_ok())
@@ -3932,10 +3900,7 @@ fn test_meta_recovery_case_9_metadata_row_deleted_fails_closed() {
     let _ = std::fs::remove_file(&wal_path);
     overwrite_file_with_junk(&wal_path, 0, 0);
 
-    {
-        let mut manager = DATABASE_MANAGER.lock();
-        manager.clear();
-    }
+    remove_file_from_database_registry(&db_path);
     let io = Arc::new(PlatformIO::new().unwrap());
     match Database::open_file(io, &db_path, Arc::new(SqliteDialect)) {
         Ok(db2) => match db2.connect(ConnectOpts::new()) {
@@ -4668,6 +4633,106 @@ fn attached_reader_does_not_pin_read_mark_until_checkpoint_gate_is_available() {
 
     writer.set_yield_injector(None);
     step_until_done(&mut checkpointing_insert, &checkpoint_io, "attached insert");
+}
+
+#[test]
+fn drop_attached_checkpoint_paused_at_before_pager_commit() {
+    let (db, writer, aux_path_str, _aux_dir) =
+        drop_attached_statement_paused_at_checkpoint_before_pager_commit(
+            "INSERT INTO aux.t VALUES (2, 'checkpointed')",
+        );
+    writer
+        .execute("PRAGMA aux.wal_checkpoint(TRUNCATE)")
+        .unwrap();
+
+    let reader = db.connect();
+    reader
+        .execute(format!("ATTACH '{aux_path_str}' AS aux"))
+        .unwrap();
+    assert_eq!(
+        get_rows(&reader, "SELECT id, v FROM aux.t ORDER BY id"),
+        vec![
+            vec![Value::from_i64(1), Value::build_text("seed")],
+            vec![Value::from_i64(2), Value::build_text("checkpointed")],
+        ]
+    );
+}
+
+#[test]
+fn drop_attached_ddl_checkpoint_paused_at_before_pager_commit_keeps_new_schema() {
+    let (db, writer, aux_path_str, _aux_dir) =
+        drop_attached_statement_paused_at_checkpoint_before_pager_commit("CREATE TABLE aux.t2(x)");
+    assert_eq!(
+        get_rows(&writer, "SELECT id, v FROM aux.t ORDER BY id"),
+        vec![vec![Value::from_i64(1), Value::build_text("seed")]]
+    );
+    assert!(get_rows(&writer, "SELECT x FROM aux.t2").is_empty());
+    writer.execute("INSERT INTO aux.t2 VALUES (7)").unwrap();
+    writer
+        .execute("PRAGMA aux.wal_checkpoint(TRUNCATE)")
+        .unwrap();
+
+    let reader = db.connect();
+    reader
+        .execute(format!("ATTACH '{aux_path_str}' AS aux"))
+        .unwrap();
+    for conn in [&writer, &reader] {
+        assert_eq!(
+            get_rows(conn, "SELECT id, v FROM aux.t ORDER BY id"),
+            vec![vec![Value::from_i64(1), Value::build_text("seed")]]
+        );
+        assert_eq!(
+            get_rows(conn, "SELECT x FROM aux.t2"),
+            vec![vec![Value::from_i64(7)]]
+        );
+    }
+}
+
+fn drop_attached_statement_paused_at_checkpoint_before_pager_commit(
+    sql: &str,
+) -> (MvccTestDbNoConn, Arc<Connection>, String, tempfile::TempDir) {
+    let db = MvccTestDbNoConn::new_with_random_db_with_opts(DatabaseOpts::new().with_attach(true));
+    let aux_dir = tempfile::TempDir::new().unwrap();
+    let aux_path = aux_dir
+        .path()
+        .join(format!("aux_{}.db", rand::random::<u64>()));
+    let aux_path_str = aux_path.to_str().unwrap().to_string();
+
+    let writer = db.connect();
+    writer
+        .execute(format!("ATTACH '{aux_path_str}' AS aux"))
+        .unwrap();
+    writer
+        .execute("PRAGMA aux.journal_mode = 'experimental_mvcc'")
+        .unwrap();
+    let aux_db_id = writer.get_database_id_by_name("aux").unwrap();
+    let aux_mv_store = writer
+        .mv_store_for_db(aux_db_id)
+        .expect("attached aux database must be MVCC");
+    aux_mv_store.set_checkpoint_threshold(-1);
+    writer
+        .execute("CREATE TABLE aux.t(id INTEGER PRIMARY KEY, v TEXT)")
+        .unwrap();
+    writer
+        .execute("INSERT INTO aux.t VALUES (1, 'seed')")
+        .unwrap();
+    aux_mv_store.set_checkpoint_threshold(0);
+
+    let aux_pager = writer.get_pager_from_database_index(&aux_db_id).unwrap();
+    let checkpoint_io = aux_pager.io.clone();
+    let injector = FixedYieldInjector::new([CheckpointYieldPoint::BeforePagerCommit.point()]);
+    writer.set_yield_injector(Some(injector.clone()));
+    let mut stmt = writer.prepare(sql).unwrap();
+    step_until_checkpoint_before_pager_commit_yield(&mut stmt, &injector, &checkpoint_io, sql);
+    assert!(aux_pager.holds_write_lock());
+    drop(stmt);
+    writer.set_yield_injector(None);
+
+    assert!(
+        !aux_pager.holds_write_lock(),
+        "dropped checkpoint must release the aux write lock"
+    );
+    (db, writer, aux_path_str, aux_dir)
 }
 
 #[test]
@@ -6750,9 +6815,9 @@ use crate::mvcc::database::{MvStore, Row, RowID};
 use crate::schema::IndexColumn;
 use crate::types::Text;
 use crate::Value;
+use crate::ValueRef;
 use crate::{Database, StepResult};
 use crate::{MemoryIO, Statement};
-use crate::{ValueRef, DATABASE_MANAGER};
 // Simple atomic clock implementation for testing
 
 fn setup_test_db() -> (MvccTestDb, u64, MVTableId, i64) {
@@ -9139,6 +9204,68 @@ fn test_insert_in_middle_commit_of_create_index_returns_err() {
          schema (missing index `i`), so its INSERT silently skipped writing \
          to that index. Allowing the commit leaves `i` permanently short the \
          row tx_b wrote."
+    );
+}
+
+/// A transaction that begins after a DROP INDEX has taken its commit timestamp, but before
+/// the new schema cookie is published, would see the commit's row changes with the old schema.
+/// Here the old schema still has the index while the snapshot has no rows left in the table.
+#[test]
+fn test_integrity_check_in_middle_commit_of_drop_index_and_delete() {
+    let db = MvccTestDbNoConn::new_with_random_db();
+    let conn_a = db.connect();
+    let conn_b = db.connect();
+    conn_a
+        .execute("CREATE TABLE t (id INTEGER PRIMARY KEY, c INTEGER)")
+        .unwrap();
+    conn_a.execute("CREATE INDEX i ON t(c)").unwrap();
+    conn_a
+        .execute("INSERT INTO t VALUES (1, 10), (2, 20)")
+        .unwrap();
+    conn_a.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+
+    let mut integrity_check = conn_b.prepare("PRAGMA integrity_check").unwrap();
+
+    conn_a.execute("BEGIN").unwrap();
+    conn_a.execute("DROP INDEX i").unwrap();
+    conn_a.execute("DELETE FROM t").unwrap();
+    let store = db.get_mvcc_store();
+    let tx_a = conn_a.get_mv_tx_id().unwrap();
+    let prepared = FixedYieldInjector::new([CommitYieldPoint::LogRecordPrepared.point()]);
+    conn_a.set_yield_injector(Some(prepared.clone()));
+    let mut commit = conn_a.prepare("COMMIT").unwrap();
+    while !prepared.is_empty() {
+        assert!(matches!(
+            commit.step().unwrap(),
+            StepResult::Yield | StepResult::IO
+        ));
+    }
+    conn_a.set_yield_injector(None);
+    assert!(matches!(
+        store.txs.get(&tx_a).unwrap().value().state.load(),
+        TransactionState::Preparing(_)
+    ));
+
+    let first_row = loop {
+        match integrity_check.step().unwrap() {
+            StepResult::IO | StepResult::Yield => {}
+            StepResult::Busy => break None,
+            StepResult::Row => break Some(integrity_check.row().unwrap().get_value(0).clone()),
+            other => panic!("unexpected step result {other:?}"),
+        }
+    };
+    assert_eq!(
+        first_row, None,
+        "integrity_check began during the DROP INDEX commit"
+    );
+
+    commit.run_ignore_rows().unwrap();
+    drop(commit);
+
+    integrity_check.reset().unwrap();
+    assert_eq!(
+        integrity_check.run_collect_rows().unwrap(),
+        vec![vec![Value::build_text("ok")]]
     );
 }
 
@@ -11721,7 +11848,7 @@ fn test_gc_active_reader_pins_lwm() {
     );
 
     // Close the reader transaction.
-    db.mvcc_store.remove_tx(tx2).unwrap();
+    db.mvcc_store.remove_tx(tx2);
 
     // LWM should now be u64::MAX.
     assert_eq!(db.mvcc_store.compute_lwm(), u64::MAX);
@@ -12293,7 +12420,7 @@ fn test_gc_incremental_respects_held_snapshot() {
 
     // Close the snapshot; now incremental GC reclaims the superseded v1
     // without any checkpoint having run.
-    db.mvcc_store.remove_tx(tx2).unwrap();
+    db.mvcc_store.remove_tx(tx2);
     assert_eq!(
         db.mvcc_store
             .gc_incremental(MvStore::<MvccClock>::MAX_CHAINS_PER_GC),
@@ -15990,10 +16117,7 @@ fn test_autoincrement_insert_works_for_preexisting_table() {
     }
 
     // Clear the database manager to force a fresh open
-    {
-        let mut manager = crate::DATABASE_MANAGER.lock();
-        manager.clear();
-    }
+    remove_file_from_database_registry(path_str);
 
     // Phase 2: Reopen in MVCC mode — INSERT should work
     {
@@ -19481,6 +19605,38 @@ fn test_create_index_succeeds_while_concurrent_writer_aborts_at_commit() {
 }
 
 #[test]
+fn test_schema_row_insert_does_not_count_as_statement_change() {
+    let db = MvccTestDbNoConn::new_with_random_db();
+    let conn = db.connect();
+    conn.execute("CREATE TABLE src(id INTEGER PRIMARY KEY)")
+        .unwrap();
+    conn.execute("INSERT INTO src VALUES (1),(2),(3)").unwrap();
+
+    // The sqlite_schema row insert must count neither in the statement change
+    // count nor in last_insert_rowid. Under MVCC the schema cursor reports
+    // the schema table id as its root page, not page 1.
+    let mut stmt = conn
+        .prepare("CREATE TABLE dst AS SELECT * FROM src WHERE id > 1")
+        .unwrap();
+    stmt.run_ignore_rows().unwrap();
+    assert_eq!(
+        stmt.n_change(),
+        2,
+        "CTAS must count only the copied data rows"
+    );
+
+    let last_rowid_before = conn.last_insert_rowid();
+    let mut stmt = conn.prepare("CREATE TABLE empty_t(x)").unwrap();
+    stmt.run_ignore_rows().unwrap();
+    assert_eq!(stmt.n_change(), 0, "plain CREATE TABLE changes no rows");
+    assert_eq!(
+        conn.last_insert_rowid(),
+        last_rowid_before,
+        "the schema row insert must not update last_insert_rowid"
+    );
+}
+
+#[test]
 fn test_exclusive_update_conflicts_with_concurrent_delete_without_replacing_marker() {
     let db = MvccTestDbNoConn::new_with_random_db();
     let setup = db.connect();
@@ -20254,7 +20410,7 @@ fn busy_from_log_tx_does_not_block_subsequent_commit(group_commit: bool) {
         let conn = db.connect(ConnectOpts::new()).unwrap();
         conn.execute("PRAGMA journal_mode = 'mvcc'").unwrap();
         conn.close().unwrap();
-        DATABASE_MANAGER.lock().clear();
+        remove_file_from_database_registry(&path_str);
     }
 
     // Step 3: re-open with the busy-on-log_tx storage wrapper.
@@ -20514,7 +20670,7 @@ fn logical_log_offset_advances_only_after_on_log_write_complete() {
         let conn = db.connect(ConnectOpts::new()).unwrap();
         conn.execute("PRAGMA journal_mode = 'mvcc'").unwrap();
         conn.close().unwrap();
-        DATABASE_MANAGER.lock().clear();
+        remove_file_from_database_registry(&path_str);
     }
 
     let log_path = path.with_extension("db-log");
@@ -21106,10 +21262,7 @@ fn test_autoincrement_in_attached_mvcc_database() {
 
     // Phase 2: restart main, re-attach, insert — id must be 4
     drop(db.db.take());
-    {
-        let mut manager = DATABASE_MANAGER.lock();
-        manager.clear();
-    }
+    remove_file_from_database_registry(&aux_path_str);
     db.restart();
 
     {
@@ -21172,10 +21325,7 @@ fn test_create_sequence_in_attached_mvcc_database() {
 
     // Phase 2: restart, re-attach, nextval must resume from 4
     drop(db.db.take());
-    {
-        let mut manager = DATABASE_MANAGER.lock();
-        manager.clear();
-    }
+    remove_file_from_database_registry(&aux_path_str);
     db.restart();
 
     {
@@ -22752,7 +22902,7 @@ fn on_checkpoint_end_runs_before_blocking_checkpoint_unlock() {
         let conn = db.connect(ConnectOpts::new()).unwrap();
         conn.execute("PRAGMA journal_mode = 'mvcc'").unwrap();
         conn.close().unwrap();
-        DATABASE_MANAGER.lock().clear();
+        remove_file_from_database_registry(&path_str);
     }
 
     let log_path = path.with_extension("db-log");
@@ -23582,7 +23732,7 @@ fn update_survives_restart_when_prune_cannot_mark_its_key_again() {
             .unwrap();
     }
 
-    DATABASE_MANAGER.lock().clear();
+    remove_file_from_database_registry(&path);
     let io: Arc<dyn IO> = Arc::new(PlatformIO::new().unwrap());
     let db = Database::open_file_with_flags(
         io,
@@ -23656,6 +23806,77 @@ unsafe impl crate::alloc::ApiAllocator for OneShotFaultAlloc {
                 ptr,
                 layout,
             )
+        }
+    }
+}
+
+/// A Busy commit of the inner tx that allocates an AUTOINCREMENT id must be
+/// retried on the inner tx. It used to roll back the inner tx and then, on
+/// the retry, commit the outer `BEGIN CONCURRENT` tx in its place, so the
+/// outer tx's writes survived a later ROLLBACK.
+#[test]
+fn test_busy_autoincrement_inner_commit_keeps_outer_tx() {
+    for use_trigger in [false, true] {
+        let db = MvccTestDbNoConn::new_with_random_db();
+        let conn_a = db.connect();
+        let conn_b = db.connect();
+        conn_a
+            .execute("CREATE TABLE s (id INTEGER PRIMARY KEY AUTOINCREMENT, v INTEGER)")
+            .unwrap();
+        conn_a.execute("CREATE TABLE p (v TEXT)").unwrap();
+        conn_a.execute("CREATE TABLE q (v TEXT)").unwrap();
+        conn_a
+            .execute(
+                "CREATE TRIGGER q_ins AFTER INSERT ON q BEGIN INSERT INTO s (v) VALUES (2); END",
+            )
+            .unwrap();
+
+        conn_b.execute("BEGIN IMMEDIATE").unwrap();
+        conn_b.execute("INSERT INTO p VALUES ('b')").unwrap();
+
+        conn_a.execute("BEGIN CONCURRENT").unwrap();
+        conn_a.execute("INSERT INTO p VALUES ('a')").unwrap();
+        let sql = if use_trigger {
+            "INSERT INTO q VALUES (1)"
+        } else {
+            "INSERT INTO s (v) VALUES (1)"
+        };
+        let mut insert = conn_a.prepare(sql).unwrap();
+        step_until_busy_then_release(&mut insert, &conn_b).unwrap();
+        drop(insert);
+
+        assert_eq!(
+            get_rows(&conn_a, "SELECT v FROM s"),
+            vec![vec![Value::from_i64(if use_trigger { 2 } else { 1 })]]
+        );
+        conn_a.execute("ROLLBACK").unwrap();
+
+        let conn_c = db.connect();
+        assert_eq!(
+            get_rows(&conn_c, "SELECT v FROM p"),
+            vec![vec![Value::build_text("b")]]
+        );
+        assert!(get_rows(&conn_c, "SELECT v FROM s").is_empty());
+    }
+}
+
+fn step_until_busy_then_release(
+    stmt: &mut crate::Statement,
+    lock_holder: &Arc<Connection>,
+) -> Result<()> {
+    let mut released = false;
+    loop {
+        match stmt.step()? {
+            StepResult::IO | StepResult::Yield => stmt._io().step()?,
+            StepResult::Busy if !released => {
+                lock_holder.execute("COMMIT")?;
+                released = true;
+            }
+            StepResult::Done => {
+                assert!(released, "statement must hit Busy while the lock is held");
+                return Ok(());
+            }
+            other => panic!("unexpected step result: {other:?}"),
         }
     }
 }

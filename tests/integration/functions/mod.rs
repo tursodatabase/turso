@@ -1,5 +1,6 @@
 mod test_cdc;
 mod test_collation_opacity;
+mod test_datetime;
 mod test_json_malformed_blob;
 mod test_sum;
 mod test_uuid;

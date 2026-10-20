@@ -78,3 +78,18 @@ test txn-set-transaction-lowercase-and-newline {
 expect {
     17
 }
+
+@setup counter
+test txn-access-share-lock-preserves-transaction {
+    CREATE TABLE t2 (a int);
+    BEGIN;
+    UPDATE counter SET n = 29;
+    LOCK TABLE public.counter, ONLY public.t2 IN ACCESS SHARE MODE;
+    SELECT n FROM counter;
+    ROLLBACK;
+    SELECT n FROM counter;
+}
+expect {
+    29
+    0
+}

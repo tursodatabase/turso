@@ -414,6 +414,7 @@ fn rewrite_as_semi_or_anti_join(
                 join_type,
                 using: vec![],
                 no_reorder: false,
+                lateral: false,
             });
         }
         plan.table_references.add_joined_table(table);
@@ -427,26 +428,6 @@ fn rewrite_as_semi_or_anti_join(
 
     for inner_subquery in inner_plan.non_from_clause_subqueries {
         plan.non_from_clause_subqueries.push(inner_subquery);
-    }
-
-    // EXISTS ignores its SELECT list. Keep any parameters from that list so
-    // callers can still bind them.
-    if matches!(
-        plan.non_from_clause_subqueries[subquery_index].query_type,
-        ast::SubqueryType::Exists { .. }
-    ) {
-        for result_column in &inner_plan.result_columns {
-            walk_expr(
-                &result_column.expr,
-                &mut |expr: &Expr| -> Result<WalkControl> {
-                    if let Expr::Variable(variable) = expr {
-                        plan.phantom_params.push(variable.clone());
-                    }
-                    Ok(WalkControl::Continue)
-                },
-            )
-            .expect("walking a result expression cannot fail");
-        }
     }
 
     replace_subquery_term_with_true(&mut plan.where_clause, where_term_index);
@@ -632,6 +613,7 @@ fn try_rewrite_single_value_aggregate(
             join_type: JoinType::LeftOuter,
             using: vec![],
             no_reorder: false,
+            lateral: false,
         }),
         subquery_id,
     )?;
@@ -776,6 +758,7 @@ fn rewrite_aggregate_as_join_then_group(
         join_type: JoinType::LeftOuter,
         using: vec![],
         no_reorder: false,
+        lateral: false,
     });
     plan.table_references.add_joined_table(inner_table);
 

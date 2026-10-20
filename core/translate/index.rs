@@ -137,13 +137,21 @@ pub fn translate_create_index(
         }
         crate::bail_parse_error!("index {} already exists", original_idx_name.name.as_str());
     }
+    // Materialized views store their rows in a real table btree (so plain
+    // reads can use get_table() below like any other table), but writes to
+    // that btree go through the DBSP maintenance path (sink.rs), which emits
+    // raw Insert/Delete and has no notion of secondary indexes. An index
+    // created here would never be kept up to date by later changes to the
+    // view, silently going stale. Reject it the same way a plain view is
+    // rejected, rather than letting the engine look up a corrupt stale
+    // index on later reads.
+    if resolver.with_schema(database_id, |s| {
+        s.get_view(&tbl_name).is_some() || s.is_materialized_view(&tbl_name)
+    }) {
+        crate::bail_parse_error!("views may not be indexed");
+    }
     let table = resolver.with_schema(database_id, |s| s.get_table(&tbl_name));
     let Some(table) = table else {
-        if resolver.with_schema(database_id, |s| {
-            s.get_view(&tbl_name).is_some() || s.is_materialized_view(&tbl_name)
-        }) {
-            crate::bail_parse_error!("views may not be indexed");
-        }
         // The index's target table always lives in the index's own database,
         // so SQLite qualifies the missing table with that database name.
         let db_name = resolver
@@ -265,7 +273,12 @@ pub fn translate_create_index(
         root_page: RegisterOrLiteral::Literal(sqlite_table.root_page),
         db: database_id,
     });
-    let cdc_table = prepare_cdc_if_necessary(program, resolver.schema(), Some(SQLITE_TABLEID))?;
+    let cdc_table = prepare_cdc_if_necessary(
+        program,
+        resolver.schema(),
+        database_id,
+        Some(SQLITE_TABLEID),
+    )?;
     emit_schema_entry(
         program,
         resolver,
@@ -1252,7 +1265,12 @@ pub fn translate_drop_index(
         }
     }
 
-    let cdc_table = prepare_cdc_if_necessary(program, resolver.schema(), Some(SQLITE_TABLEID))?;
+    let cdc_table = prepare_cdc_if_necessary(
+        program,
+        resolver.schema(),
+        database_id,
+        Some(SQLITE_TABLEID),
+    )?;
 
     // According to sqlite should emit Null instruction
     // but why?

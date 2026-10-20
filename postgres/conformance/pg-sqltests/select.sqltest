@@ -244,6 +244,32 @@ expect {
     1|4|3
 }
 
+@setup comma_and_join
+test parenthesized-join-on-the-right-of-join-keeps-the-table-order {
+    SELECT * FROM ca JOIN (cb JOIN cc ON cb.y < cc.z) ON ca.x < cb.y;
+}
+expect {
+    1|2|3
+}
+
+setup outer_join_of_a_parenthesized_join {
+    CREATE TABLE pa (x int, y int);
+    CREATE TABLE pc (k int, v int);
+    INSERT INTO pa VALUES (1, 10), (2, 20);
+    INSERT INTO pc VALUES (1, 1), (3, 4);
+}
+
+@setup outer_join_of_a_parenthesized_join
+test left-join-of-a-parenthesized-join-gives-nulls-for-every-inner-table {
+    SELECT pc.k, pa.x, s.q
+    FROM pc LEFT JOIN (pa JOIN (SELECT 1 AS q) s ON true) ON pc.k = pa.x
+    ORDER BY 1, 2;
+}
+expect {
+    1|1|1
+    3||
+}
+
 setup outer_t1 {
     CREATE TABLE t1 (a int);
     INSERT INTO t1 VALUES (1), (2);
@@ -281,3 +307,218 @@ test qualified-column-errors-when-a-middle-query-table-has-no-such-column {
     SELECT (SELECT (SELECT x.a FROM (SELECT 1 AS c) AS z) FROM (SELECT 5 AS b) AS x) FROM t1 AS x;
 }
 expect error {}
+
+setup array_items {
+    CREATE TABLE array_items (v INTEGER, group_id INTEGER);
+    INSERT INTO array_items VALUES (9, 1), (2, 2), (17, 1), (9, 1), (NULL, 1);
+}
+
+@setup array_items
+test array-subquery-order-limit-offset {
+    SELECT ARRAY(SELECT v FROM array_items ORDER BY v DESC NULLS LAST LIMIT 3 OFFSET 1);
+}
+expect {
+    {9,9,2}
+}
+
+@setup array_items
+test array-subquery-distinct-and-nulls {
+    SELECT ARRAY(SELECT DISTINCT v FROM array_items ORDER BY v NULLS FIRST);
+}
+expect {
+    {NULL,2,9,17}
+}
+
+test array-subquery-union-all-retains-duplicates {
+    SELECT ARRAY(SELECT 17 UNION ALL SELECT 2 UNION ALL SELECT 17);
+}
+expect {
+    {17,2,17}
+}
+
+test array-subquery-ordered-union-with-limit {
+    SELECT ARRAY(SELECT 17 UNION SELECT 2 ORDER BY 1 DESC LIMIT 1);
+}
+expect {
+    {17}
+}
+
+test array-subquery-values {
+    SELECT ARRAY(VALUES (17), (2), (NULL)), ARRAY(VALUES (NULL), ('two words'));
+}
+expect {
+    {17,2,NULL}|{NULL,"two words"}
+}
+
+@setup array_items
+test array-subquery-empty-is-not-null {
+    SELECT ARRAY(SELECT v FROM array_items WHERE group_id = 3),
+           ARRAY(SELECT v FROM array_items LIMIT 0),
+           ARRAY(SELECT v FROM array_items WHERE v IS NULL);
+}
+expect {
+    {}|{}|{NULL}
+}
+
+test array-subquery-text-quoting {
+    SELECT ARRAY(SELECT 'a,b' UNION ALL SELECT 'NULL' UNION ALL SELECT '');
+}
+expect {
+    {"a,b","NULL",""}
+}
+
+test array-subquery-cte-names {
+    WITH _turso_array_rows AS (SELECT 29 AS v)
+    SELECT ARRAY(SELECT v FROM _turso_array_rows);
+}
+expect {
+    {29}
+}
+
+test array-subquery-nested-cte-and-generated-name-conflicts {
+    WITH "_TURSO_ARRAY_ROWS" AS (SELECT 29 AS v),
+         _turso_array_rows_ AS (SELECT 17 AS v)
+    SELECT ARRAY(
+        WITH chosen AS (
+            SELECT v FROM "_TURSO_ARRAY_ROWS"
+            UNION ALL SELECT v FROM _turso_array_rows_
+        )
+        SELECT v FROM chosen ORDER BY v
+    ), ARRAY(SELECT v FROM _turso_array_rows_);
+}
+expect {
+    {17,29}|{17}
+}
+
+@setup array_items
+test array-subquery-correlated-repeated-and-empty-results {
+    SELECT g.group_id,
+           ARRAY(SELECT v FROM array_items i WHERE i.group_id = g.group_id
+                 ORDER BY v DESC NULLS LAST LIMIT 2)
+    FROM (SELECT 1 AS group_id UNION ALL SELECT 2 UNION ALL SELECT 3 UNION ALL SELECT 1) g;
+}
+expect {
+    1|{17,9}
+    2|{2}
+    3|{}
+    1|{17,9}
+}
+
+test array-subquery-projection-alias-keeps-order-by-meaning {
+    SELECT ARRAY(SELECT 9 AS _turso_array_value UNION ALL SELECT 17
+                 ORDER BY _turso_array_value DESC LIMIT 1);
+}
+expect {
+    {17}
+}
+
+@setup array_items
+test array-subquery-grouped-aggregate {
+    SELECT ARRAY(SELECT SUM(v) FROM array_items GROUP BY group_id ORDER BY group_id);
+}
+expect {
+    {35,2}
+}
+
+@setup array_items
+test array-subquery-window-results-in-query-order {
+    SELECT ARRAY(SELECT row_number() OVER (ORDER BY v) FROM array_items
+                 WHERE v IN (2, 17) ORDER BY v DESC);
+}
+expect {
+    {2,1}
+}
+
+@setup array_items
+test array-subquery-single-column-required {
+    SELECT ARRAY(SELECT v, group_id FROM array_items);
+}
+expect error {}
+
+@setup array_items
+test array-subquery-insert-and-update {
+    CREATE TABLE array_results (id INTEGER, vals INTEGER[]);
+    INSERT INTO array_results VALUES (1, ARRAY(SELECT v FROM array_items WHERE group_id = 2));
+    UPDATE array_results SET vals = ARRAY(SELECT v FROM array_items WHERE group_id = 3);
+    SELECT vals FROM array_results;
+}
+expect {
+    {}
+}
+
+@setup array_items
+test array-subquery-view-survives-column-rename {
+    CREATE VIEW array_view AS SELECT ARRAY(SELECT v FROM array_items ORDER BY v NULLS LAST) AS vals;
+    ALTER TABLE array_items RENAME COLUMN v TO number;
+    SELECT vals FROM array_view;
+}
+expect {
+    {2,9,9,17,NULL}
+}
+
+@setup array_items
+test array-subquery-as-a-group-key {
+    SELECT ARRAY(SELECT v FROM array_items i WHERE i.group_id = g.group_id
+                 ORDER BY v NULLS LAST) AS vals, count(*)
+    FROM array_items g GROUP BY vals ORDER BY count(*);
+}
+expect {
+    {2}|1
+    {9,9,17,NULL}|4
+}
+
+test array-subquery-collects-more-than-1024-rows {
+    SELECT array_length(ARRAY(
+        WITH RECURSIVE numbers(v) AS (
+            SELECT 1 UNION ALL SELECT v+1 FROM numbers WHERE v < 2050
+        )
+        SELECT v FROM numbers
+    ), 1);
+}
+expect {
+    2050
+}
+
+test array-subquery-custom-cast {
+    SELECT ARRAY(SELECT CAST('550e8400-e29b-41d4-a716-446655440000' AS uuid));
+}
+expect {
+    {550e8400-e29b-41d4-a716-446655440000}
+}
+
+test array-subquery-copied-right-join {
+    CREATE TABLE l(x INTEGER);
+    CREATE TABLE r(x INTEGER);
+    INSERT INTO r VALUES (1), (2);
+    SELECT r.x FROM l RIGHT JOIN r ON false
+    WHERE r.x = array_length(ARRAY(SELECT 1 UNION ALL SELECT 2), 1);
+}
+expect {
+    2
+}
+
+test array-subquery-copied-full-join {
+    CREATE TABLE l(x INTEGER);
+    CREATE TABLE r(x INTEGER);
+    INSERT INTO l VALUES (3);
+    INSERT INTO r VALUES (1), (2);
+    SELECT r.x FROM l FULL JOIN r ON false
+    WHERE r.x = array_length(ARRAY(SELECT 1 UNION ALL SELECT 2), 1);
+}
+expect {
+    2
+}
+
+@skip "ARRAY subqueries cannot yet read aggregates computed by an outer query"
+test array-subquery-compound-outer-aggregate {
+    CREATE TABLE t(g INTEGER, x INTEGER);
+    INSERT INTO t VALUES (1,10), (1,20), (2,7);
+    SELECT g, ARRAY(SELECT sum(t.x) UNION ALL SELECT 0)
+    FROM t GROUP BY g ORDER BY g;
+    SELECT ARRAY(SELECT sum(t.x) UNION ALL SELECT 0) FROM t;
+}
+expect {
+    1|{30,0}
+    2|{7,0}
+    {37,0}
+}

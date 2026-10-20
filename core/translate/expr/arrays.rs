@@ -61,8 +61,9 @@ pub(super) fn emit_array_element_loop(
         dest: reg_offset,
     });
 
-    let loop_start = program.offset();
+    let loop_start = program.allocate_label();
     let loop_end_label = program.allocate_label();
+    program.preassign_label_to_next_insn(loop_start);
 
     program.emit_insn(Insn::Gt {
         lhs: reg_idx,
