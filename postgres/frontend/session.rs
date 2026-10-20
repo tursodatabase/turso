@@ -179,7 +179,7 @@ fn prepare_statement(pg_conn: &Arc<PgConnectionInner>, sql: &str) -> Result<Stat
     let parse_result =
         turso_pg_parser::parse(sql).map_err(|e| LimboError::ParseError(e.to_string()))?;
     let translator = PostgreSQLTranslator::new();
-    let translated = translator
+    let mut translated = translator
         .translate_with_prereqs(&parse_result)
         .map_err(|e| LimboError::ParseError(e.to_string()))?;
     reject_catalog_dml(translated.cmd.stmt())?;
@@ -203,9 +203,14 @@ fn prepare_statement(pg_conn: &Arc<PgConnectionInner>, sql: &str) -> Result<Stat
         stmt.run_ignore_rows()?;
     }
 
+    let input = if catalog::rewrite_sequence_reads(&pg_conn.conn, &mut translated.cmd, &options)? {
+        translated.cmd.to_string()
+    } else {
+        sql.to_owned()
+    };
     pg_conn
         .conn
-        .prepare_translated_cmd_with_options(translated.cmd, sql, &options)
+        .prepare_translated_cmd_with_options(translated.cmd, &input, &options)
 }
 
 fn reject_catalog_dml(stmt: &ast::Stmt) -> Result<()> {
