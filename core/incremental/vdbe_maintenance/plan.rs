@@ -5,7 +5,7 @@ use super::output::NodeOutputContract;
 use super::stream::{binding_rowid_metadata_width, DeltaIdentity};
 use crate::function::{AggFunc, Func};
 use crate::incremental::dag;
-use crate::schema::BTreeTable;
+use crate::schema::{BTreeTable, SCHEMA_TABLE_NAME};
 use crate::sync::Arc;
 use crate::translate::collate::{get_collseq_from_expr_with_symbols, CollationSeq};
 use crate::translate::emitter::Resolver;
@@ -1096,6 +1096,13 @@ fn validate_planned_node(
         };
     match node {
         dag::OpNode::Scan { table, .. } => {
+            // DDL writes the schema table and DDL runs no view maintenance, so
+            // such a view would populate once and then never change again.
+            if table.name == SCHEMA_TABLE_NAME {
+                return Err(LimboError::ParseError(format!(
+                    "materialized views cannot read the internal table {SCHEMA_TABLE_NAME}"
+                )));
+            }
             if !table.has_rowid {
                 return unsupported("WITHOUT ROWID base tables");
             }
