@@ -1996,6 +1996,11 @@ impl SnapshotRows for PgSequencesTable {
 
 pub(crate) fn register_catalog_modules(mut options: OpenOptions) -> OpenOptions {
     options = options.native_module(
+        "unnest",
+        VTabKind::TableValuedFunction,
+        crate::unnest::Unnest,
+    );
+    options = options.native_module(
         "pg_options_to_table",
         VTabKind::TableValuedFunction,
         crate::options::PgOptionsToTable,

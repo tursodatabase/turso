@@ -2005,6 +2005,59 @@ impl PostgreSQLTranslator {
         } else {
             ast::QualifiedName::single(name)
         };
+        if func_name == "unnest" {
+            if args.len() != 1 || range_func.ordinality || range_func.functions.len() != 1 {
+                return Err(ParseError::ParseError(
+                    "unnest currently requires one array without WITH ORDINALITY or ROWS FROM"
+                        .into(),
+                ));
+            }
+            let column_name = match range_func.alias.as_ref() {
+                Some(alias) if alias.colnames.len() > 1 => {
+                    return Err(ParseError::ParseError(
+                        "unnest has only one output column".into(),
+                    ));
+                }
+                Some(alias) => match alias.colnames.first().and_then(|node| node.node.as_ref()) {
+                    Some(pg_query::protobuf::node::Node::String(name)) => name.sval.clone(),
+                    None => alias.aliasname.clone(),
+                    _ => {
+                        return Err(ParseError::ParseError("invalid unnest column alias".into()));
+                    }
+                },
+                None => "unnest".into(),
+            };
+            return Ok(ast::SelectTable::Select {
+                select: ast::Select {
+                    with: None,
+                    body: ast::SelectBody {
+                        select: ast::OneSelect::Select {
+                            distinctness: None,
+                            columns: vec![ast::ResultColumn::Expr(
+                                Box::new(ast::Expr::Id(ast::Name::from_string("unnest"))),
+                                Some(ast::As::Elided(ast::Name::from_string(column_name))),
+                            )],
+                            from: Some(ast::FromClause {
+                                select: Box::new(ast::SelectTable::TableCall(
+                                    qualified_name,
+                                    args,
+                                    None,
+                                )),
+                                joins: vec![],
+                            }),
+                            where_clause: None,
+                            group_by: None,
+                            window_clause: vec![],
+                        },
+                        compounds: vec![],
+                    },
+                    order_by: vec![],
+                    limit: None,
+                },
+                alias,
+                lateral: true,
+            });
+        }
         Ok(ast::SelectTable::TableCall(qualified_name, args, alias))
     }
 
@@ -2039,6 +2092,9 @@ impl PostgreSQLTranslator {
                 Some(pg_query::protobuf::node::Node::RangeSubselect(range_sub)) => {
                     self.translate_range_subselect(range_sub)?
                 }
+                Some(pg_query::protobuf::node::Node::RangeFunction(range_func)) => {
+                    self.translate_range_function(range_func)?
+                }
                 _ => {
                     return Err(ParseError::ParseError(format!(
                         "Unsupported left side of JOIN: {:?}",
@@ -2063,6 +2119,9 @@ impl PostgreSQLTranslator {
                 }
                 Some(pg_query::protobuf::node::Node::RangeSubselect(range_sub)) => {
                     self.translate_range_subselect(range_sub)?
+                }
+                Some(pg_query::protobuf::node::Node::RangeFunction(range_func)) => {
+                    self.translate_range_function(range_func)?
                 }
                 _ => {
                     return Err(ParseError::ParseError(format!(
@@ -4230,6 +4289,7 @@ pub fn is_catalog_table_name(name: &str) -> bool {
             | "pg_policy"
             | "pg_input_error_info"
             | "pg_options_to_table"
+            | "unnest"
             | "pg_get_tabledef"
             | "pg_settings"
             | "pg_extension"
