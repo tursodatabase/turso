@@ -476,7 +476,7 @@ impl Statement {
         Ok(rows)
     }
 
-    /// Execute this prepared statement. Rows returned by the statement are discarded.
+    /// Execute this prepared statement.
     pub async fn execute(&mut self, params: impl IntoParams) -> Result<u64> {
         let operation_guard = self.conn.acquire_shared_operation()?;
         self.execute_with_operation_guard(params, Some(operation_guard))
