@@ -181,7 +181,7 @@ pub fn check_source_for_error(source: &str) -> String {
 /// as the user wrote it with quotes stripped, keeping any database prefix.
 /// `SELECT * FROM main."T1"` reports the missing table as `main.T1`.
 pub fn table_name_for_error(name: &turso_parser::ast::QualifiedName) -> String {
-    match &name.db_name {
+    match &name.namespace {
         Some(db) => format!("{}.{}", db.as_str(), name.name.as_str()),
         None => name.name.as_str().to_owned(),
     }
@@ -1959,7 +1959,7 @@ fn reject_cross_db_qualified_name(
     qualified_name: &ast::QualifiedName,
     view_db_name: Option<&ast::Name>,
 ) -> Result<()> {
-    if let Some(table_db_name) = &qualified_name.db_name {
+    if let Some(table_db_name) = &qualified_name.namespace {
         let is_cross_db = match view_db_name {
             Some(view_db) => !view_db
                 .as_str()
@@ -2071,7 +2071,7 @@ fn view_source_from_select_table(
                 .clone()
                 .map_or_else(|| vec![table_name.clone()], |alias| vec![alias]);
 
-            if name.db_name.is_none() {
+            if name.namespace.is_none() {
                 if let Some(cte) = ctes.get(&table_name) {
                     return Ok(ViewSource {
                         qualifiers,
@@ -2084,7 +2084,10 @@ fn view_source_from_select_table(
             let table_index = tables.len();
             tables.push(ViewTable {
                 name: table_name.clone(),
-                db_name: name.db_name.as_ref().map(|db| normalize_ident(db.as_str())),
+                db_name: name
+                    .namespace
+                    .as_ref()
+                    .map(|db| normalize_ident(db.as_str())),
                 alias: table_alias,
             });
             let table = schema.get_table(&table_name);
@@ -2155,7 +2158,10 @@ fn view_source_from_select_table(
             let table_index = tables.len();
             tables.push(ViewTable {
                 name: table_name.clone(),
-                db_name: name.db_name.as_ref().map(|db| normalize_ident(db.as_str())),
+                db_name: name
+                    .namespace
+                    .as_ref()
+                    .map(|db| normalize_ident(db.as_str())),
                 alias: table_alias,
             });
             let columns = schema
@@ -3235,7 +3241,7 @@ mod rename_column_view {
             ast::SelectTable::Table(tbl_name, alias, _) => {
                 let table_name_norm = normalize_ident(tbl_name.name.as_str());
                 let table_db_norm = tbl_name
-                    .db_name
+                    .namespace
                     .as_ref()
                     .map(|db| normalize_ident(db.as_str()));
                 let mut qualifiers = Vec::new();
@@ -5559,7 +5565,7 @@ pub mod tests {
         };
 
         assert_eq!(
-            tbl_name.db_name.as_ref().map(ast::Name::as_str),
+            tbl_name.namespace.as_ref().map(ast::Name::as_str),
             Some("temp")
         );
         assert_eq!(tbl_name.name.as_str(), "new");
@@ -5638,7 +5644,7 @@ pub mod tests {
         };
 
         assert_eq!(
-            tbl_name.db_name.as_ref().map(ast::Name::as_str),
+            tbl_name.namespace.as_ref().map(ast::Name::as_str),
             Some("temp")
         );
         assert_eq!(tbl_name.name.as_str(), "new");

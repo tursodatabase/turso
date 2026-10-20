@@ -11957,7 +11957,7 @@ pub fn op_function(
                                     // Rebuild with new table identifier so SQL persists the new name.
                                     let new_stmt = ast::Stmt::CreateTable {
                                         tbl_name: ast::QualifiedName {
-                                            db_name: None,
+                                            namespace: None,
                                             name: ast::Name::exact(original_rename_to.to_string()),
                                             alias: None,
                                         },
@@ -12011,7 +12011,7 @@ pub fn op_function(
                                     let new_stmt =
                                         ast::Stmt::CreateVirtualTable(ast::CreateVirtualTable {
                                             tbl_name: ast::QualifiedName {
-                                                db_name: tbl_name.db_name,
+                                                namespace: tbl_name.namespace,
                                                 name: ast::Name::exact(
                                                     original_rename_to.to_string(),
                                                 ),
@@ -12040,7 +12040,7 @@ pub fn op_function(
                                 // Rewrite ON table name if it matches the renamed table
                                 let new_trigger_tbl_name = if trigger_tbl == rename_from {
                                     ast::QualifiedName {
-                                        db_name: trigger_tbl_name.db_name,
+                                        namespace: trigger_tbl_name.namespace,
                                         name: ast::Name::exact(original_rename_to.to_string()),
                                         alias: None,
                                     }
@@ -17368,12 +17368,12 @@ fn regenerate_trigger_sql(trigger: &crate::schema::Trigger) -> String {
     use crate::translate::trigger::create_trigger_to_sql;
 
     let trigger_name = QualifiedName {
-        db_name: None,
+        namespace: None,
         name: Name::from_string(&trigger.name),
         alias: None,
     };
     let tbl_name = QualifiedName {
-        db_name: None,
+        namespace: None,
         name: Name::from_string(&trigger.table_name),
         alias: None,
     };

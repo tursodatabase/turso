@@ -1642,7 +1642,7 @@ impl ToTokens for QualifiedName {
         s: &mut S,
         context: &C,
     ) -> Result<(), S::Error> {
-        if let Some(ref db_name) = self.db_name {
+        if let Some(ref db_name) = self.namespace {
             db_name.to_tokens(s, context)?;
             s.append(TK_DOT, None)?;
         }

@@ -137,7 +137,7 @@ pub fn table_sql_for_replay(sql: &str) -> crate::Result<String> {
         unreachable!("parse_table_sql_ast returned a non-CREATE TABLE statement");
     };
 
-    if tbl_name.db_name.take().is_none() {
+    if tbl_name.namespace.take().is_none() {
         return Ok(sql.to_string());
     }
 

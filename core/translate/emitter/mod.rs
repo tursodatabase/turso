@@ -846,7 +846,7 @@ impl<'a> Resolver<'a> {
         &self,
         qualified_name: &ast::QualifiedName,
     ) -> Result<usize> {
-        if qualified_name.db_name.is_some() {
+        if qualified_name.namespace.is_some() {
             return self.resolve_database_id(qualified_name);
         }
         self.resolve_existing_table_database_id(qualified_name.name.as_str())
@@ -878,7 +878,7 @@ impl<'a> Resolver<'a> {
         &self,
         qualified_name: &ast::QualifiedName,
     ) -> Result<usize> {
-        if qualified_name.db_name.is_some() {
+        if qualified_name.namespace.is_some() {
             return self.resolve_database_id(qualified_name);
         }
 
@@ -890,7 +890,7 @@ impl<'a> Resolver<'a> {
         &self,
         qualified_name: &ast::QualifiedName,
     ) -> Result<usize> {
-        if qualified_name.db_name.is_some() {
+        if qualified_name.namespace.is_some() {
             return self.resolve_database_id(qualified_name);
         }
 
@@ -901,7 +901,7 @@ impl<'a> Resolver<'a> {
     /// Resolve database ID from a qualified name
     pub(crate) fn resolve_database_id(&self, qualified_name: &ast::QualifiedName) -> Result<usize> {
         // Check if this is a qualified name (database.table) or unqualified
-        let resolved_id = if let Some(db_name) = &qualified_name.db_name {
+        let resolved_id = if let Some(db_name) = &qualified_name.namespace {
             let db_name_normalized = normalize_ident(db_name.as_str());
             match db_name_normalized.as_str() {
                 "main" => Ok(crate::MAIN_DB_ID),
@@ -944,7 +944,7 @@ impl<'a> Resolver<'a> {
             }
             if resolved_id != ctx.database_id {
                 let db_name = qualified_name
-                    .db_name
+                    .namespace
                     .as_ref()
                     .map(|n| n.as_str())
                     .unwrap_or("main");
