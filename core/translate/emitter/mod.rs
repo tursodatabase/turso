@@ -460,6 +460,17 @@ impl<'a> Resolver<'a> {
         }
     }
 
+    pub(crate) fn self_table_with_custom_type_operators(&self) -> Option<Arc<BTreeTable>> {
+        match &self.self_table_scope.borrow().as_ref()?.context {
+            SelfTableContext::ForDML {
+                table,
+                uses_custom_type_operators: true,
+                ..
+            } => Some(Arc::clone(table)),
+            _ => None,
+        }
+    }
+
     pub(crate) fn self_table_column_type_str(&self, column: usize) -> Option<String> {
         self.self_table_scope
             .borrow()
@@ -2317,6 +2328,7 @@ fn emit_index_column_value_new_image(
             &mut column_regs,
             table,
             dest_reg,
+            idx_col.pos_in_table == EXPR_INDEX_SENTINEL,
         )?;
     } else {
         let col_in_table = columns

@@ -5004,6 +5004,32 @@ test gencol-virtual-union-tag-select-resolves-self-table-type {
     2|f
 }
 
+@skip-if sqlite "SQLite doesn't support custom types"
+@requires custom_types "uses custom types"
+test gencol-virtual-index-key-on-custom-type-column-uses-standard-operators {
+    CREATE TABLE prices(id INTEGER PRIMARY KEY, val numeric(10,2), doubled ANY AS (val * 2) VIRTUAL) STRICT;
+    CREATE INDEX prices_doubled ON prices(doubled);
+    INSERT INTO prices(id, val) VALUES (1, 1.50);
+    SELECT typeof(doubled), doubled FROM prices INDEXED BY prices_doubled WHERE doubled = 3.0;
+    PRAGMA integrity_check;
+    UPDATE prices SET val = 2.50;
+    SELECT typeof(doubled), doubled FROM prices INDEXED BY prices_doubled WHERE doubled = 5.0;
+    INSERT INTO prices(id, val) VALUES (1, 4.50) ON CONFLICT(id) DO UPDATE SET val = excluded.val;
+    SELECT typeof(doubled), doubled FROM prices INDEXED BY prices_doubled WHERE doubled = 9.0;
+    PRAGMA integrity_check;
+    DELETE FROM prices WHERE id = 1;
+    SELECT count(*) FROM prices;
+    PRAGMA integrity_check;
+} expect {
+    real|3.0
+    ok
+    real|5.0
+    real|9.0
+    ok
+    0
+    ok
+}
+
 @cross-check-integrity
 test update-covering-index-chained-virtual-gencol {
     CREATE TABLE t (a, c, e AS (a), d AS (e));

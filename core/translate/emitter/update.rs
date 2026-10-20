@@ -886,6 +886,7 @@ fn emit_update_column_values<'a>(
                                 column_ctx.layout.clone(),
                             ),
                             table: column_ctx.target_table.table.require_btree()?,
+                            uses_custom_type_operators: false,
                         }),
                         GeneratedType::NotGenerated => None,
                     };
@@ -1884,6 +1885,7 @@ fn emit_update_insns<'a>(
                 &mut column_regs,
                 &bt,
                 new_satisfied_reg,
+                true,
             )?;
 
             // now we have two registers that tell us whether or not the old and new values satisfy

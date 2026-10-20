@@ -1377,6 +1377,7 @@ fn emit_partial_index_check(
         &mut column_regs,
         table,
         reg,
+        true,
     )?;
     let skip_label = program.allocate_label();
     program.emit_insn(Insn::IfNot {
@@ -3574,6 +3575,7 @@ fn emit_index_column_value_for_insert(
             &mut column_regs,
             table,
             dest_reg,
+            idx_col.pos_in_table == EXPR_INDEX_SENTINEL,
         )?;
         // For virtual generated column references, apply the column's
         // declared affinity to the computed expression result.
