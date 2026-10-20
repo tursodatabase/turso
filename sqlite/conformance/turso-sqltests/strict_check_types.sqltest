@@ -369,6 +369,76 @@ expect {
 }
 
 # ============================================================================
+# Custom types that store values unchanged — compared as their base type
+# ============================================================================
+
+@requires strict "uses STRICT tables"
+test smallint-vs-integer-literal-valid {
+    CREATE TABLE t(n smallint DEFAULT 0 CHECK(n >= 0 AND n <= 2)) STRICT;
+    INSERT INTO t VALUES(1) RETURNING n;
+}
+expect {
+    1
+}
+
+@requires strict "uses STRICT tables"
+test smallint-vs-integer-literal-violation {
+    CREATE TABLE t(n smallint CHECK(n >= 0 AND n <= 2)) STRICT;
+    INSERT INTO t VALUES(3);
+}
+expect error {
+    CHECK constraint failed
+}
+
+@requires strict "uses STRICT tables"
+test integer-types-of-different-sizes-valid {
+    CREATE TABLE t(a int2, b INTEGER, c int8, d bigint, CHECK(a < b AND b < c AND a < d AND d BETWEEN a AND c AND a IN (1, 2))) STRICT;
+    INSERT INTO t VALUES(1, 2, 3, 2);
+    SELECT a, b, c, d FROM t;
+}
+expect {
+    1|2|3|2
+}
+
+@requires strict "uses STRICT tables"
+test integer-types-of-different-sizes-violation {
+    CREATE TABLE t(a smallint, c bigint, CHECK(a < c)) STRICT;
+    INSERT INTO t VALUES(5, 4);
+}
+expect error {
+    CHECK constraint failed
+}
+
+@requires strict "uses STRICT tables"
+test smallint-vs-text-error {
+    CREATE TABLE t(n smallint CHECK(n < 'hello')) STRICT;
+}
+expect error {
+    type mismatch
+}
+
+@requires strict "uses STRICT tables"
+test varchar-vs-text-literal-valid {
+    CREATE TABLE t(name varchar(10) CHECK(name <> '')) STRICT;
+    INSERT INTO t VALUES('alice');
+    SELECT name FROM t;
+}
+expect {
+    alice
+}
+
+@requires strict "uses STRICT tables"
+test custom-type-without-decode-vs-base-literal-valid {
+    CREATE TYPE score BASE integer;
+    CREATE TABLE t(s score CHECK(s > 0)) STRICT;
+    INSERT INTO t VALUES(7);
+    SELECT s FROM t;
+}
+expect {
+    7
+}
+
+# ============================================================================
 # Built-in function calls in CHECK on STRICT tables
 # ============================================================================
 

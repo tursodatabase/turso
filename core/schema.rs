@@ -259,6 +259,12 @@ impl ResolvedType {
         self.chain[0].is_domain
     }
 
+    pub fn reads_stored_values_unchanged(&self) -> bool {
+        self.chain.iter().all(|td| {
+            matches!(td.kind, TypeDefKind::Custom { .. }) && td.decode_returns_value_unchanged()
+        })
+    }
+
     /// Find the first DEFAULT expression in the type chain (child first, then ancestors).
     /// Matches PostgreSQL: a child domain inherits the parent's DEFAULT when it
     /// doesn't declare its own.

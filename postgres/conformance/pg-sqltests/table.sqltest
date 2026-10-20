@@ -198,6 +198,29 @@ expect {
     2024-01-15|10:30:00
 }
 
+test table-check-on-smallint-column {
+    CREATE TABLE t (n smallint DEFAULT 0 CHECK (n >= 0 AND n <= 2));
+    INSERT INTO t VALUES (1) RETURNING n;
+}
+expect {
+    1
+}
+
+test table-check-on-smallint-column-rejects-value-out-of-range {
+    CREATE TABLE t (n smallint DEFAULT 0 CHECK (n >= 0 AND n <= 2));
+    INSERT INTO t VALUES (3);
+}
+expect error {}
+
+test table-check-compares-integer-types-of-different-sizes {
+    CREATE TABLE t (a smallint, b integer, c bigint, CHECK (a < b AND b < c AND c > 0));
+    INSERT INTO t VALUES (1, 2, 3);
+    SELECT a, b, c FROM t;
+}
+expect {
+    1|2|3
+}
+
 test table-delete-row-with-numeric-expression-index {
     CREATE TABLE prices (id int PRIMARY KEY, val numeric(10,2));
     CREATE INDEX prices_doubled ON prices ((val * 2));
