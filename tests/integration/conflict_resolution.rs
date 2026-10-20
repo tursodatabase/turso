@@ -2267,6 +2267,58 @@ fn test_not_null_on_conflict_fail_keeps_prior_rows(tmp_db: TempDatabase) -> anyh
     Ok(())
 }
 
+#[turso_macros::test]
+fn test_insert_or_fail_does_not_advance_autoincrement(tmp_db: TempDatabase) -> anyhow::Result<()> {
+    drop(tmp_db);
+    let ddl = "CREATE TABLE t(id INTEGER PRIMARY KEY AUTOINCREMENT, x UNIQUE)";
+    let verify_sql = "SELECT 'seq', name, seq FROM sqlite_sequence \
+                      UNION ALL SELECT 't', id, x FROM t ORDER BY 1, 2";
+    let cases: [(&str, &[&str], &str); 6] = [
+        (
+            "autoinc_fail_single_row",
+            &["INSERT INTO t(x) VALUES (1)"],
+            "INSERT OR FAIL INTO t(x) VALUES (1)",
+        ),
+        (
+            "autoinc_fail_multi_row",
+            &["INSERT INTO t(x) VALUES (1)"],
+            "INSERT OR FAIL INTO t(x) VALUES (2), (3), (1), (4)",
+        ),
+        (
+            "autoinc_fail_explicit_rowid",
+            &["INSERT INTO t(x) VALUES (1)"],
+            "INSERT OR FAIL INTO t VALUES (10, 2), (20, 1)",
+        ),
+        (
+            "autoinc_fail_without_sequence_row",
+            &[],
+            "INSERT OR FAIL INTO t(x) VALUES (1), (1)",
+        ),
+        (
+            "autoinc_fail_with_after_trigger",
+            &[
+                "CREATE TABLE log(v)",
+                "CREATE TRIGGER tr AFTER INSERT ON t BEGIN INSERT INTO log VALUES (new.x); END",
+                "INSERT INTO t(x) VALUES (1)",
+            ],
+            "INSERT OR FAIL INTO t(x) VALUES (2), (3), (1), (4)",
+        ),
+        (
+            "autoinc_fail_with_before_trigger",
+            &[
+                "CREATE TABLE log(v)",
+                "CREATE TRIGGER tr BEFORE INSERT ON t BEGIN INSERT INTO log VALUES (new.x); END",
+                "INSERT INTO t(x) VALUES (1)",
+            ],
+            "INSERT OR FAIL INTO t(x) VALUES (2), (3), (1), (4)",
+        ),
+    ];
+    for (label, seed_rows, conflict_sql) in cases {
+        run_mixed_constraint_case(label, ddl, seed_rows, conflict_sql, verify_sql);
+    }
+    Ok(())
+}
+
 /// Test DDL-level REPLACE on two unique indexes where INSERT conflicts with
 /// two DIFFERENT existing rows. Both conflicting rows should be deleted.
 #[turso_macros::test]
