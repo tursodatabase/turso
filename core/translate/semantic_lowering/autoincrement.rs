@@ -43,8 +43,10 @@ impl Sequence {
             })?;
             return Ok(Self::Mvcc(operation));
         }
+        let sqlite_sequence = autoincrement.sqlite_sequence.value().require_btree()?;
+        check_sqlite_sequence(&sqlite_sequence)?;
         Ok(Self::Table(TableSequence {
-            table: autoincrement.sqlite_sequence.value().require_btree()?,
+            table: sqlite_sequence,
             database,
             name: table.name.clone(),
         }))
@@ -171,6 +173,32 @@ fn emit_advance_past(
         operation.sequence.value(),
         value,
     )
+}
+
+/// Like legacy, a `sqlite_sequence` table that does not have the shape
+/// SQLite creates, (name, seq) with a rowid, is corruption, not a table to
+/// read through.
+fn check_sqlite_sequence(table: &BTreeTable) -> Result<()> {
+    if !table.has_rowid {
+        crate::bail_corrupt_error!("malformed sqlite_sequence: table must have rowid");
+    }
+    let columns = table.columns();
+    if columns.len() != 2 {
+        crate::bail_corrupt_error!(
+            "malformed sqlite_sequence: expected 2 columns, got {}",
+            columns.len()
+        );
+    }
+    let named = |column: &crate::schema::Column, name: &str| {
+        column
+            .name
+            .as_deref()
+            .is_some_and(|column| column.eq_ignore_ascii_case(name))
+    };
+    if !named(&columns[0], "name") || !named(&columns[1], "seq") {
+        crate::bail_corrupt_error!("malformed sqlite_sequence: expected columns (name, seq)");
+    }
+    Ok(())
 }
 
 /// The `sqlite_sequence` table of the target's database and the name of the

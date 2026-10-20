@@ -397,6 +397,8 @@ pub(super) struct HirLoopsPlan<'a> {
     predicates: &'a [crate::translate::plan::HirWhereTerm],
     /// Index of the first WHERE term; earlier terms come from the FROM clause.
     where_start: usize,
+    /// See [HirQueryBlockPlan::later_on_terms].
+    later_on_terms: &'a [(SourceId, usize)],
     /// LEFT JOINs the plan runs as inner joins.
     inner_joins: &'a [SourceId],
     /// These loops fill a hash lookup's build input: they are the loops
@@ -412,6 +414,7 @@ impl<'a> HirLoopsPlan<'a> {
             loops: &plan.loops,
             predicates: &plan.predicates,
             where_start: plan.where_start,
+            later_on_terms: &plan.later_on_terms,
             inner_joins: &plan.inner_joins,
             build_input: false,
         }
@@ -423,6 +426,7 @@ impl<'a> HirLoopsPlan<'a> {
             loops: &plan.loops,
             predicates: &plan.predicates,
             where_start: plan.where_start,
+            later_on_terms: &plan.later_on_terms,
             inner_joins: &[],
             build_input: false,
         }
@@ -4967,10 +4971,23 @@ impl HirLoopNest<'_, '_> {
         if let Some(prepared) = hash_input {
             emit_hir_hash_input_payload(program, prepared);
         }
-        // Like SQLite, the unmatched pass checks WHERE terms only. ON terms,
-        // including those of inner joins left of the RIGHT JOIN, would reject
-        // every row whose left side is NULL.
-        for predicate in &self.loops_plan.predicates[self.loops_plan.where_start..] {
+        // Like SQLite, the unmatched pass checks WHERE terms, and the ON
+        // terms of the inner joins written after this outer join, which
+        // apply to its NULL-extended rows the same way. The ON terms of this
+        // join and of the joins before it are not checked again: those of
+        // inner joins left of a RIGHT JOIN would reject every row whose left
+        // side is NULL.
+        let later_on_terms = self
+            .loops_plan
+            .later_on_terms
+            .iter()
+            .find(|(source, _)| *source == right_outer.owner)
+            .map(|(_, start)| &self.loops_plan.predicates[*start..self.loops_plan.where_start])
+            .unwrap_or(&[])
+            .iter()
+            .filter(|predicate| predicate.from_outer_join.is_none());
+        let where_terms = self.loops_plan.predicates[self.loops_plan.where_start..].iter();
+        for predicate in later_on_terms.chain(where_terms) {
             let ready_at = predicate_loop(
                 program,
                 self.document,
@@ -6323,6 +6340,7 @@ fn emit_hir_hash_build_input(
             loops: &input.input.loops,
             predicates: &input.input.predicates,
             where_start: loops_plan.where_start,
+            later_on_terms: loops_plan.later_on_terms,
             inner_joins: loops_plan.inner_joins,
             build_input: true,
         },

@@ -16,7 +16,6 @@ info:
   database: ':memory:'
 ---
 QUERY PLAN
-`--SCAN window_subquery_0
-   |--SCAN unordered
-   |  `--SCAN t1
-   `--USE SORTER FOR ORDER BY
+|--SCAN unordered
+|  `--SCAN t1
+`--USE SORTER FOR ORDER BY

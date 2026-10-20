@@ -65,17 +65,17 @@ jobs:
       - name: Run tests (MVCC)
         run: make -C sqlite/conformance run-rust MVCC=1
 
-  # The same corpora prepared through semantic HIR. Snapshot tests are
-  # skipped: their bytecode is legacy's. EXPLAIN QUERY PLAN rows are
-  # compared without row ids, generated-name ids and subquery row order,
-  # which differ between the planners; a different loop, index or join
-  # method still fails.
-  sqltest-run-hir:
-    name: Run SQL tests (HIR planner)
+  # The same corpora prepared through the legacy planner, which statements
+  # HIR does not lower yet still use. Snapshot tests are skipped: their
+  # bytecode is HIR's. EXPLAIN QUERY PLAN rows are compared without row
+  # ids, generated-name ids and subquery row order, which differ between
+  # the planners; a different loop, index or join method still fails.
+  sqltest-run-legacy:
+    name: Run SQL tests (legacy planner)
     runs-on: blacksmith-4vcpu-ubuntu-2404
     timeout-minutes: 45
     env:
-      TURSO_EXPERIMENTAL_HIR: "1"
+      TURSO_LEGACY_PLANNER: "1"
     steps:
       - uses: actions/checkout@v4
       - uses: useblacksmith/rust-cache@v3

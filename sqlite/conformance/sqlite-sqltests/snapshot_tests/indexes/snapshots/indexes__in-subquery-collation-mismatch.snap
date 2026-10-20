@@ -11,6 +11,6 @@ info:
   database: ':memory:'
 ---
 QUERY PLAN
-|--LIST SUBQUERY 1
-|  `--SCAN rhs_values
-`--SCAN collated_values_subquery
+|--SCAN collated_values_subquery
+`--LIST SUBQUERY 1
+   `--SCAN rhs_values

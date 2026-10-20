@@ -97,9 +97,11 @@ Audited on 2026-10-20 from `translate_statement`:
   prepare through legacy (`translate_inner`), only when their outer
   statement is a legacy one.
 
-CI runs the conformance corpora with the switch on (`sqltest-run-hir` in
-`.github/workflows/sqltest.yml`): the Rust and CLI backends, without
-snapshot tests and with normalized plans.
+CI runs the conformance corpora through both planners
+(`.github/workflows/sqltest.yml`): the regular jobs through HIR, the
+default, with the snapshot tests regenerated from HIR's bytecode, and
+`sqltest-run-legacy` through the legacy planner on the Rust and CLI
+backends, without snapshot tests and with normalized plans.
 
 ### Cutover deletion map
 
@@ -136,18 +138,21 @@ Internal or already-normalized parser nodes are not new SQL coverage:
 - `Func::AlterTable` is created by ALTER TABLE translation, not by a SELECT
   function call.
 
-### Opt-in production entry point
+### Production entry point
 
-Setting `TURSO_EXPERIMENTAL_HIR` (any value) when a connection opens, or
-calling `Connection::set_experimental_hir(true)`, prepares top-level SELECT
+Since the cutover on 2026-10-20, every connection prepares top-level SELECT
 statements through HIR: the owned semantic catalog, `analyze_root`,
 `HirPlan::build`, and HIR lowering. Statements the engine prepares inside
 another one, such as the copy statements of VACUUM, take the same path; like
-legacy, they may write internal tables. There is no fallback: a SELECT that HIR cannot lower fails to
-prepare, so running the test suites with the variable set lists the remaining
-gaps. Top-level DELETE, UPDATE and INSERT also go through HIR, except the
-cases listed under "DML through HIR", which still go to legacy. The variable and the legacy path
-are removed at cutover.
+legacy, they may write internal tables. There is no fallback: a SELECT that
+HIR cannot lower fails to prepare. Top-level DELETE, UPDATE and INSERT also
+go through HIR, except the cases listed under "DML through HIR", which still
+go to legacy. Setting `TURSO_LEGACY_PLANNER` (any value) when a connection
+opens, or calling `Connection::set_experimental_hir(false)`, keeps the
+legacy planner for every statement; CI runs the conformance corpora that
+way too (`sqltest-run-legacy`), without snapshot tests, whose bytecode is
+now HIR's. The variable and the legacy path go when the deletion map below
+is worked through.
 
 Result-column names, table names, and declared types come from the HIR outputs
 and the same alias, `full_column_names`, and `short_column_names` rules as
@@ -172,7 +177,7 @@ right before reading its result. Uncorrelated subqueries run once through
 through the source bindings in effect at that point. An IN seek driven by a
 subquery emits the same shell when its loop opens.
 
-`scripts/hir-conformance.sh` runs every `.sqltest` file with the switch on,
+`scripts/hir-conformance.sh` runs every `.sqltest` file through HIR,
 one process per file, and groups failures by cause. The first run on
 2026-10-14 passed 13602 conformance tests and failed 568. On 2026-10-16 a run
 failed 29, with every file running to the end; legacy passes all of them. On
@@ -230,7 +235,11 @@ join. The right loop records each matched rowid in an ephemeral table, and
 after the main loops a second pass scans the right table, or the ephemeral
 table of a materialized subquery, for rows not in it,
 with the left tables reading NULL. As in SQLite, WHERE terms run only after the
-match is recorded, and the second pass checks WHERE terms but not ON terms.
+match is recorded, and the second pass checks WHERE terms and the ON terms of
+the inner joins written after the outer join, which apply to its NULL-extended
+rows the same way (`LEFT JOIN t3 ON ... JOIN t4 ON t3.d IS t4.d` keeps the
+rows whose t3 side is NULL only where t4.d is NULL too), but not the ON terms
+of the outer join itself or of the joins before it.
 HIR keeps legacy's FULL JOIN errors for shapes legacy has no hash plan for
 (chaining, a recursive CTE reference, USING or NATURAL). It accepts correlated
 subqueries next to FULL JOIN. HIR matches SQLite where legacy does not:

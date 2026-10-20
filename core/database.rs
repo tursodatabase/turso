@@ -2374,7 +2374,9 @@ impl Database {
             vdbe_trace: AtomicBool::new(false),
             dml_require_where: AtomicBool::new(false),
             count_changes: AtomicBool::new(false),
-            experimental_hir: AtomicBool::new(std::env::var_os("TURSO_EXPERIMENTAL_HIR").is_some()),
+            // Statements are prepared through semantic HIR. TURSO_LEGACY_PLANNER
+            // keeps the legacy planner until it is deleted.
+            experimental_hir: AtomicBool::new(std::env::var_os("TURSO_LEGACY_PLANNER").is_none()),
             dqs_dml: AtomicBool::new(true),
             sequence_inner_retries: AtomicU64::new(0),
             mv_tx: RwLock::new(None),

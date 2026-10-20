@@ -476,6 +476,10 @@ pub(crate) struct HirQueryBlockPlanInput {
     /// come from the FROM clause: join constraints and table-function
     /// arguments.
     pub(crate) where_start: usize,
+    /// For the right source of each outer join, the index in `predicates`
+    /// where the ON terms of the joins after it start. Like WHERE terms,
+    /// those apply to the rows the outer join NULL-extends.
+    pub(crate) later_on_terms: Vec<(SourceId, usize)>,
     /// The block's correlated expression subqueries, whose number of runs
     /// planning counts from the chosen join order. Empty outside SELECT.
     pub(crate) subqueries: Vec<QueryId>,
@@ -491,6 +495,10 @@ pub(crate) struct HirQueryBlockPlan {
     /// come from the FROM clause. Planning only marks predicates consumed; it
     /// never reorders them.
     pub(crate) where_start: usize,
+    /// For the right source of each outer join, the index in `predicates`
+    /// where the ON terms of the joins after it start. Like WHERE terms,
+    /// those apply to the rows the outer join NULL-extends.
+    pub(crate) later_on_terms: Vec<(SourceId, usize)>,
     pub(crate) group_sort_elided: bool,
     /// The loops return rows in ORDER BY order, so the query needs no sorter.
     pub(crate) order_sort_elided: bool,
@@ -523,6 +531,10 @@ pub(crate) struct HirAccessPlan {
     /// Index of the first predicate from the WHERE clause. Earlier predicates
     /// come from the FROM clause.
     pub(crate) where_start: usize,
+    /// For the right source of each outer join, the index in `predicates`
+    /// where the ON terms of the joins after it start. Like WHERE terms,
+    /// those apply to the rows the outer join NULL-extends.
+    pub(crate) later_on_terms: Vec<(SourceId, usize)>,
     pub(crate) group_sort_elided: bool,
     /// The loops return rows in ORDER BY order.
     pub(crate) order_sort_elided: bool,
@@ -891,6 +903,7 @@ impl<'a> HirPlanContext<'a> {
             groups: Vec::new(),
             predicates: Vec::new(),
             where_start: 0,
+            later_on_terms: Vec::new(),
             subqueries: Vec::new(),
         };
         // The target joins the result of the FROM clause, so a RIGHT or FULL
@@ -1037,6 +1050,7 @@ impl<'a> HirPlanContext<'a> {
             }],
             predicates: std::mem::take(&mut input.predicates),
             where_start: input.where_start,
+            later_on_terms: std::mem::take(&mut input.later_on_terms),
             group_sort_elided: false,
             order_sort_elided: false,
             min_max_first_value: false,
@@ -1061,6 +1075,7 @@ impl<'a> HirPlanContext<'a> {
             groups: Vec::new(),
             predicates: Vec::new(),
             where_start: 0,
+            later_on_terms: Vec::new(),
             subqueries: Vec::new(),
         };
         if let Some(predicate) = &delete.predicate {
@@ -1989,6 +2004,11 @@ impl<'a> HirPlanContext<'a> {
                 usage,
             )?;
             self.append_join_predicates(&mut input.predicates, join, predicate_owner);
+            if local_outer_join.is_some() {
+                input
+                    .later_on_terms
+                    .push((join.right, input.predicates.len()));
+            }
         }
         Ok(())
     }
@@ -2069,6 +2089,7 @@ impl<'a> HirPlanContext<'a> {
             groups: Vec::new(),
             predicates: Vec::new(),
             where_start: 0,
+            later_on_terms: Vec::new(),
             subqueries: Vec::new(),
         };
 
@@ -2240,6 +2261,7 @@ impl<'a> HirPlanContext<'a> {
                 loops: Vec::new(),
                 predicates: input.predicates,
                 where_start: input.where_start,
+                later_on_terms: input.later_on_terms,
                 group_sort_elided: false,
                 order_sort_elided: false,
                 window_sort_elided: false,
@@ -2344,6 +2366,7 @@ impl<'a> HirPlanContext<'a> {
             loops: access.loops,
             predicates: access.predicates,
             where_start,
+            later_on_terms: access.later_on_terms,
             group_sort_elided: access.group_sort_elided,
             order_sort_elided: access.order_sort_elided && window_target.is_none(),
             window_sort_elided: access.order_sort_elided && window_target.is_some(),
@@ -2504,6 +2527,7 @@ impl<'a> HirPlanContext<'a> {
             }],
             predicates,
             where_start: input.where_start,
+            later_on_terms: std::mem::take(&mut input.later_on_terms),
             group_sort_elided: false,
             order_sort_elided: matched.applies_order_by,
             window_sort_elided: false,
@@ -2583,6 +2607,7 @@ impl<'a> HirPlanContext<'a> {
             groups: Vec::new(),
             predicates: std::mem::take(&mut input.predicates),
             where_start: input.where_start,
+            later_on_terms: std::mem::take(&mut input.later_on_terms),
             subqueries: Vec::new(),
         };
         let access = self
@@ -2618,6 +2643,7 @@ impl<'a> HirPlanContext<'a> {
             loops,
             predicates: access.predicates,
             where_start: input.where_start,
+            later_on_terms: access.later_on_terms,
             group_sort_elided: false,
             order_sort_elided: false,
             window_sort_elided: false,
@@ -3113,6 +3139,7 @@ impl<'a> HirPlanContext<'a> {
             loops,
             where_start: input.where_start,
             predicates: input.predicates,
+            later_on_terms: input.later_on_terms,
             group_sort_elided: group_sort_elided && !read_out_of_order,
             order_sort_elided: order_sort_elided && !read_out_of_order,
             min_max_first_value: min_max_first_value && !read_out_of_order,

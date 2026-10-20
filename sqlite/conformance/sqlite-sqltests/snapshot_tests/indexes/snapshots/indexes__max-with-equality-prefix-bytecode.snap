@@ -14,19 +14,22 @@ QUERY PLAN
 
 BYTECODE
 addr  opcode       p1  p2  p3  p4           p5  comment
-   0  Init          0  14   0                0  Start at 14
-   1  Null          0   2   0                0  r[2]=NULL
+   0  Init          0  17   0                0  Start at 17
+   1  Null          0   1   0                0  r[1]=NULL
    2  OpenRead      0   3   0  k(3,B,B)      0  index=idx_measurements_category_value, root=3, iDb=0
-   3  String8       0   3   0  a             0  r[3]='a'
-   4  SeekLE        0  10   3                0  key=[3..3]
-   5    IdxLT       0  10   3                0  key=[3..3]
-   6    Column      0   1   4                0  r[4]=idx_measurements_category_value.value
-   7    AggStep     0   4   2  max(Binary)   0  accum=r[2] step(r[4])
-   8    Goto        0  10   0                0
-   9  Prev          0   5   0                0
-  10  AggFinal      0   2   0  max           0  accum=r[2]
-  11  Copy          2   1   0                0  r[1]=r[2]
-  12  ResultRow     1   1   0                0  output=r[1]
-  13  Halt          0   0   0                0
-  14  Transaction   0   1   2                0  iDb=0 tx_mode=Read
-  15  Goto          0   1   0                0
+   3  Integer       0   2   0                0  r[2]=0
+   4  String8       0   3   0  a             0  r[3]='a'
+   5  SeekLE        0  13   3                0  key=[3..3]
+   6    IdxLT       0  13   3                0  key=[3..3]
+   7    Column      0   1   4                0  r[4]=idx_measurements_category_value.value
+   8    IsNull      4  12   0                0  if (r[4]==NULL) goto 12
+   9    Column      0   1   5                0  r[5]=idx_measurements_category_value.value
+  10    AggStep     0   5   1  max(Binary)   0  accum=r[1] step(r[5])
+  11    Goto        0  13   0                0
+  12  Prev          0   6   0                0
+  13  AggFinal      0   1   0  max           0  accum=r[1]
+  14  Copy          1   6   0                0  r[6]=r[1]
+  15  ResultRow     6   1   0                0  output=r[6]
+  16  Halt          0   0   0                0
+  17  Transaction   0   1   2                0  iDb=0 tx_mode=Read
+  18  Goto          0   1   0                0
