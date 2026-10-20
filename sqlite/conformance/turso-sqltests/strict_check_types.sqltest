@@ -427,6 +427,16 @@ expect {
     alice
 }
 
+setup integer-types-of-different-sizes {
+    CREATE TABLE t(a smallint, b bigint, CHECK(a >= 0 AND a < b)) STRICT;
+}
+
+@skip-if mvcc "mvcc has different root pages"
+@setup integer-types-of-different-sizes
+snapshot check-on-integer-types-of-different-sizes-has-no-cast {
+    INSERT INTO t VALUES(1, 2);
+}
+
 @requires strict "uses STRICT tables"
 test custom-type-without-decode-vs-base-literal-valid {
     CREATE TYPE score BASE integer;
