@@ -856,12 +856,32 @@ impl Statement {
 
         // When the step returns Busy (no more busy-handler retries) and we
         // freshly opened an MVCC transaction for a Pending explicit tx,
-        // roll it back so the next statement gets a fresh snapshot.  Without
+        // roll it back so the next step gets a fresh snapshot.  Without
         // this, the snapshot would be pinned to the moment of the failed
         // attempt rather than to the first statement that actually succeeds,
         // which diverges from what the caller observes.
+        //
+        // Also reset pc and cursors so Insn::Transaction re-opens the MVCC
+        // tx on retry.  Without the reset, pc stays past Insn::Transaction
+        // and later instructions (e.g. OpenWrite for DDL) find no MVCC tx.
         if matches!(res, Ok(StepResult::Busy)) {
+            let had_pending_tx = self.state.pending_fresh_tx.is_some() && !self.has_returned_row;
             self.rollback_pending_fresh_tx_if_needed();
+            if had_pending_tx {
+                // reset(None, None) will set is_active_write = false, but the
+                // connection-level n_active_writes counter needs to be
+                // decremented first or the retry will see a spurious "writer
+                // already active" error at Insn::Transaction.
+                if self.state.is_active_write {
+                    let prev = self
+                        .program
+                        .connection
+                        .n_active_writes
+                        .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+                    debug_assert_eq!(prev, 1, "writer count mismatch before statement restart");
+                }
+                self.state.reset(None, None);
+            }
         }
 
         if matches!(res, Ok(StepResult::Done)) {
