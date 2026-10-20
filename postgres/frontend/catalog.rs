@@ -1489,7 +1489,7 @@ fn make_type_row(t: &PgTypeInfo) -> Vec<Value> {
 // pg_index
 // ──────────────────────────────────────────────────────────────────────
 
-const PG_INDEX_SQL: &str = "CREATE TABLE pg_index (indexrelid INTEGER, indrelid INTEGER, indnatts INTEGER, indnkeyatts INTEGER, indisunique BOOLEAN, indisprimary BOOLEAN, indisexclusion BOOLEAN, indimmediate BOOLEAN, indisclustered BOOLEAN, indisvalid BOOLEAN, indcheckxmin BOOLEAN, indisready BOOLEAN, indislive BOOLEAN, indisreplident BOOLEAN, indkey TEXT, indcollation TEXT, indclass TEXT, indoption TEXT, indexprs TEXT, indpred TEXT, tableoid INTEGER HIDDEN)";
+const PG_INDEX_SQL: &str = "CREATE TABLE pg_index (indexrelid INTEGER, indrelid INTEGER, indnatts INTEGER, indnkeyatts INTEGER, indisunique BOOLEAN, indnullsnotdistinct BOOLEAN, indisprimary BOOLEAN, indisexclusion BOOLEAN, indimmediate BOOLEAN, indisclustered BOOLEAN, indisvalid BOOLEAN, indcheckxmin BOOLEAN, indisready BOOLEAN, indislive BOOLEAN, indisreplident BOOLEAN, indkey TEXT, indcollation TEXT, indclass TEXT, indoption TEXT, indexprs TEXT, indpred TEXT, tableoid INTEGER HIDDEN)";
 
 #[derive(Debug)]
 struct PgIndexTable;
@@ -1555,11 +1555,12 @@ impl SnapshotRows for PgIndexTable {
                 };
 
                 rows.push(vec![
-                    Value::from_i64(index_oid),    // indexrelid
-                    Value::from_i64(table_oid),    // indrelid
-                    Value::from_i64(indnatts),     // indnatts
-                    Value::from_i64(indnatts),     // indnkeyatts
-                    Value::from_i64(indisunique),  // indisunique
+                    Value::from_i64(index_oid),   // indexrelid
+                    Value::from_i64(table_oid),   // indrelid
+                    Value::from_i64(indnatts),    // indnatts
+                    Value::from_i64(indnatts),    // indnkeyatts
+                    Value::from_i64(indisunique), // indisunique
+                    Value::from_i64(0),
                     Value::from_i64(indisprimary), // indisprimary
                     Value::from_i64(0),            // indisexclusion
                     Value::from_i64(1),            // indimmediate
@@ -2783,7 +2784,7 @@ impl<'a> IndexRow<'a> {
     const OID_COLUMN: usize = 0;
     const TABLE_OID_COLUMN: usize = 1;
     const IS_UNIQUE_COLUMN: usize = 4;
-    const COLUMN_NUMBERS_COLUMN: usize = 14;
+    const COLUMN_NUMBERS_COLUMN: usize = 15;
 
     fn from_row(row: &'a [Value]) -> Self {
         Self {
