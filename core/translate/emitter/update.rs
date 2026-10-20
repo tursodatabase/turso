@@ -1215,12 +1215,13 @@ fn emit_update_insns<'a>(
         .iter()
         .map(|set_clause| set_clause.column_index)
         .try_collect()?;
+    let set_column_names = UpdateSetClause::all_target_names(set_clauses);
     let has_any_update_triggers = if let Some(btree_table) = target_table.table.btree() {
         has_triggers_including_temp(
             &t_ctx.resolver,
             update_database_id,
             TriggerEvent::Update,
-            Some(&updated_column_indices),
+            Some(&set_column_names),
             &btree_table,
         )
     } else {
@@ -1347,7 +1348,7 @@ fn emit_update_insns<'a>(
             update_database_id,
             TriggerEvent::Update,
             TriggerTime::Before,
-            Some(updated_column_indices.clone()),
+            Some(&set_column_names),
             &btree_table,
         ),
         None => Vec::new(),
@@ -1397,7 +1398,7 @@ fn emit_update_insns<'a>(
                 &t_ctx.resolver,
                 update_database_id,
                 TriggerEvent::Update,
-                Some(&updated_column_indices),
+                Some(&set_column_names),
                 &btree_table,
             );
 
@@ -2601,7 +2602,7 @@ fn emit_update_insns<'a>(
                     update_database_id,
                     TriggerEvent::Update,
                     TriggerTime::After,
-                    Some(updated_column_indices.clone()),
+                    Some(&set_column_names),
                     &btree_table,
                 );
                 if !relevant_triggers.is_empty() {

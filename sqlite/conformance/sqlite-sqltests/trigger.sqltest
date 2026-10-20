@@ -2447,3 +2447,111 @@ test create-before-trigger-on-view-rejected {
 expect error {
     cannot create BEFORE trigger on view: v
 }
+
+# UPDATE OF fires only when the SET clause uses the same name (SQLite's checkColumnOverlap): rowid, oid, _rowid_ and an INTEGER PRIMARY KEY's name set the same value but are different names.
+test trigger-update-of-matches-set-names-as-written {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, x);
+    CREATE TABLE log(v);
+    CREATE TRIGGER tr_id AFTER UPDATE OF id ON t BEGIN INSERT INTO log VALUES ('of id: ' || NEW.id); END;
+    CREATE TRIGGER tr_rowid AFTER UPDATE OF rowid ON t BEGIN INSERT INTO log VALUES ('of rowid: ' || NEW.id); END;
+    CREATE TRIGGER tr_oid AFTER UPDATE OF oid ON t BEGIN INSERT INTO log VALUES ('of oid: ' || NEW.id); END;
+    INSERT INTO t VALUES (1, 'a');
+    UPDATE t SET id = 2;
+    UPDATE t SET rowid = 3;
+    UPDATE t SET oid = 4;
+    UPDATE t SET _rowid_ = 5;
+    UPDATE t SET x = 'b';
+    SELECT v FROM log ORDER BY rowid;
+}
+expect {
+    of id: 2
+    of rowid: 3
+    of oid: 4
+}
+
+# On a table without an INTEGER PRIMARY KEY, UPDATE OF rowid fires for SET rowid, and UPDATE OF oid only for SET oid.
+test trigger-update-of-rowid-without-ipk {
+    CREATE TABLE t(x);
+    CREATE TABLE log(v);
+    CREATE TRIGGER tr_rowid AFTER UPDATE OF rowid ON t BEGIN INSERT INTO log VALUES ('of rowid: ' || NEW.rowid); END;
+    CREATE TRIGGER tr_oid AFTER UPDATE OF oid ON t BEGIN INSERT INTO log VALUES ('of oid: ' || NEW.rowid); END;
+    INSERT INTO t VALUES ('a');
+    UPDATE t SET rowid = 7;
+    UPDATE t SET oid = 8;
+    UPDATE t SET x = 'b';
+    SELECT v FROM log ORDER BY rowid;
+}
+expect {
+    of rowid: 7
+    of oid: 8
+}
+
+# Trigger and SET names match without regard to case or quotes.
+test trigger-update-of-name-case-and-quotes {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, x);
+    CREATE TABLE log(v);
+    CREATE TRIGGER tr_id AFTER UPDATE OF "ID" ON t BEGIN INSERT INTO log VALUES ('of ID: ' || NEW.id); END;
+    CREATE TRIGGER tr_rowid AFTER UPDATE OF ROWID ON t BEGIN INSERT INTO log VALUES ('of ROWID: ' || NEW.id); END;
+    INSERT INTO t VALUES (1, 'a');
+    UPDATE t SET Id = 2;
+    UPDATE t SET RowId = 3;
+    UPDATE t SET "id" = 4;
+    SELECT v FROM log ORDER BY rowid;
+}
+expect {
+    of ID: 2
+    of ROWID: 3
+    of ID: 4
+}
+
+# SET rowid = ..., id = ... in one statement fires both the OF rowid and the OF id trigger.
+test trigger-update-of-two-names-for-one-column {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, x);
+    CREATE TABLE log(v);
+    CREATE TRIGGER tr_id AFTER UPDATE OF id ON t BEGIN INSERT INTO log VALUES ('of id: ' || NEW.id); END;
+    CREATE TRIGGER tr_rowid AFTER UPDATE OF rowid ON t BEGIN INSERT INTO log VALUES ('of rowid: ' || NEW.id); END;
+    INSERT INTO t VALUES (1, 'a');
+    UPDATE t SET rowid = 5, id = 6;
+    SELECT v FROM log ORDER BY rowid;
+    SELECT id, x FROM t;
+}
+expect {
+    of rowid: 6
+    of id: 6
+    6|a
+}
+
+# UPSERT DO UPDATE fires UPDATE OF triggers by the names its SET clause uses.
+test trigger-update-of-upsert-do-update {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, x UNIQUE, y);
+    CREATE TABLE log(v);
+    CREATE TRIGGER tr_id AFTER UPDATE OF id ON t BEGIN INSERT INTO log VALUES ('of id: ' || NEW.id); END;
+    CREATE TRIGGER tr_rowid AFTER UPDATE OF rowid ON t BEGIN INSERT INTO log VALUES ('of rowid: ' || NEW.id); END;
+    INSERT INTO t VALUES (1, 'a', 0);
+    INSERT INTO t VALUES (2, 'a', 0) ON CONFLICT(x) DO UPDATE SET id = 5;
+    INSERT INTO t VALUES (3, 'a', 0) ON CONFLICT(x) DO UPDATE SET y = 1;
+    SELECT v FROM log ORDER BY rowid;
+    SELECT id, x, y FROM t;
+}
+expect {
+    of id: 5
+    5|a|1
+}
+
+# A BEFORE UPDATE OF <INTEGER PRIMARY KEY> trigger does not fire for SET rowid, so its inserts cannot make UPDATE OR FAIL stop partway (differential fuzzer seed 109).
+test trigger-update-of-ipk-not-fired-by-set-rowid {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, x);
+    CREATE TABLE log(k INTEGER PRIMARY KEY, v);
+    CREATE TRIGGER tr BEFORE UPDATE OF id ON t BEGIN INSERT INTO log VALUES (10, 'x'), (11, 'y'); END;
+    INSERT INTO t VALUES (1, 'a'), (2, 'b');
+    BEGIN;
+    UPDATE OR FAIL t SET rowid = CASE rowid WHEN 1 THEN 100 ELSE 200 END WHERE rowid IN (1, 2);
+    COMMIT;
+    SELECT 't', id, x FROM t ORDER BY id;
+    SELECT 'log', count(*) FROM log;
+}
+expect {
+    t|100|a
+    t|200|b
+    log|0
+}

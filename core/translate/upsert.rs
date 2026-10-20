@@ -813,6 +813,13 @@ pub fn emit_upsert(
         .iter()
         .map(|(col_idx, _)| *col_idx)
         .try_collect()?;
+    // Every SET target here is a table column resolved by its name, so the
+    // names UPDATE OF triggers match against are the columns' own names.
+    let set_column_names: Vec<String> = set_pairs
+        .iter()
+        .filter_map(|(col_idx, _)| table.columns()[*col_idx].name.as_deref())
+        .map(normalize_ident)
+        .collect();
     let table_btree = table.btree();
     let affected_parent_fks = match (connection.foreign_keys_enabled(), table_btree.as_deref()) {
         (true, Some(table)) => {
@@ -838,7 +845,7 @@ pub fn emit_upsert(
             upsert_database_id,
             TriggerEvent::Update,
             TriggerTime::Before,
-            Some(updated_positions.clone()),
+            Some(&set_column_names),
             &btree_table,
         );
         // OLD row values are in current_start registers
@@ -935,7 +942,7 @@ pub fn emit_upsert(
                 resolver,
                 upsert_database_id,
                 TriggerEvent::Update,
-                Some(&updated_positions),
+                Some(&set_column_names),
                 &btree_table,
             );
             if has_relevant_after_triggers {
@@ -962,7 +969,7 @@ pub fn emit_upsert(
                 resolver,
                 upsert_database_id,
                 TriggerEvent::Update,
-                Some(&updated_positions),
+                Some(&set_column_names),
                 &btree_table,
             );
             if has_relevant_after_triggers {
@@ -1504,16 +1511,12 @@ pub fn emit_upsert(
 
     // Fire AFTER UPDATE triggers
     if let (Some(btree_table), Some(old_regs)) = (table.btree(), preserved_old_registers) {
-        let updated_column_indices: ColumnMask = set_pairs
-            .iter()
-            .map(|(col_idx, _)| *col_idx)
-            .try_collect()?;
         let relevant_triggers = get_triggers_including_temp(
             resolver,
             upsert_database_id,
             TriggerEvent::Update,
             TriggerTime::After,
-            Some(updated_column_indices),
+            Some(&set_column_names),
             &btree_table,
         );
         if !relevant_triggers.is_empty() {

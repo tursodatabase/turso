@@ -1431,7 +1431,7 @@ fn update_write_set_reason(
             resolver,
             database_id,
             TriggerEvent::Update,
-            Some(&updated_cols),
+            Some(&UpdateSetClause::all_target_names(&plan.set_clauses)),
             btree_table,
         ) {
             break 'requires Some(DmlSafetyReason::Trigger);
