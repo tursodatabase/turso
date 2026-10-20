@@ -1907,30 +1907,11 @@ pub fn emit_cdc_autocommit_commit(
         jump_if_null: true,
     });
 
+    emit_skip_if_no_captured_change(program, skip_label);
+
     let cdc_cursor_id = match cdc_cursor_id {
         Some(cdc_cursor_id) => cdc_cursor_id,
         None => {
-            // A trigger or FK action fired during this statement may have captured a row
-            // elsewhere. Only write the COMMIT record when something was actually captured.
-            let minus_one_reg = program.alloc_register();
-            program.emit_int(-1, minus_one_reg);
-            let txn_id_reg = program.alloc_register();
-            program.emit_insn(Insn::Function {
-                constant_mask: 0,
-                start_reg: minus_one_reg,
-                dest: txn_id_reg,
-                func: crate::function::FuncCtx {
-                    func: Func::Scalar(crate::function::ScalarFunc::ConnTxnId),
-                    arg_count: 1,
-                },
-            });
-            program.emit_insn(Insn::Eq {
-                lhs: txn_id_reg,
-                rhs: minus_one_reg,
-                target_pc: skip_label,
-                flags: crate::vdbe::insn::CmpInsFlags::default(),
-                collation: None,
-            });
             let (cursor_id, _) =
                 prepare_cdc_if_necessary(program, resolver.schema(), crate::MAIN_DB_ID, None)?
                     .expect("CDC is active, so prepare_cdc_if_necessary must return a cursor");
@@ -1966,30 +1947,8 @@ pub fn emit_cdc_explicit_commit_insns(
     schema: &Schema,
     resolver: &Resolver,
 ) -> Result<()> {
-    let minus_one_reg = program.alloc_register();
-    program.emit_int(-1, minus_one_reg);
-    let txn_id_reg = program.alloc_register();
-    program.emit_insn(Insn::Function {
-        constant_mask: 0,
-        start_reg: minus_one_reg,
-        dest: txn_id_reg,
-        func: crate::function::FuncCtx {
-            func: Func::Scalar(crate::function::ScalarFunc::ConnTxnId),
-            arg_count: 1,
-        },
-    });
-
-    // Skip the whole record (including the CDC OpenWrite) when no change was captured.
-    // `emit_cdc_commit_insns` recomputes `conn_txn_id(-1)` for the record itself; because the
-    // opcode is an idempotent get-or-set, the second call returns the same value we gated on.
     let skip_label = program.allocate_label();
-    program.emit_insn(Insn::Eq {
-        lhs: txn_id_reg,
-        rhs: minus_one_reg,
-        target_pc: skip_label,
-        flags: crate::vdbe::insn::CmpInsFlags::default(),
-        collation: None,
-    });
+    emit_skip_if_no_captured_change(program, skip_label);
 
     // The CDC record write needs a transaction; joins the open one (keeping its mode) if any.
     program.emit_insn(Insn::Transaction {
@@ -2008,6 +1967,29 @@ pub fn emit_cdc_explicit_commit_insns(
     program.preassign_label_to_next_insn(skip_label);
     Ok(())
 }
+
+fn emit_skip_if_no_captured_change(program: &mut ProgramBuilder, skip_label: BranchOffset) {
+    let minus_one_reg = program.alloc_register();
+    program.emit_int(-1, minus_one_reg);
+    let txn_id_reg = program.alloc_register();
+    program.emit_insn(Insn::Function {
+        constant_mask: 0,
+        start_reg: minus_one_reg,
+        dest: txn_id_reg,
+        func: crate::function::FuncCtx {
+            func: Func::Scalar(crate::function::ScalarFunc::ConnTxnId),
+            arg_count: 1,
+        },
+    });
+    program.emit_insn(Insn::Eq {
+        lhs: txn_id_reg,
+        rhs: minus_one_reg,
+        target_pc: skip_label,
+        flags: crate::vdbe::insn::CmpInsFlags::default(),
+        collation: None,
+    });
+}
+
 /// Initialize the limit/offset counters and registers.
 /// In case of compound SELECTs, the limit counter is initialized only once,
 /// hence [LimitCtx::initialize_counter] being false in those cases.
