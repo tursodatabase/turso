@@ -1689,3 +1689,164 @@ expect {
     3
     1
 }
+
+# --- Collation of compound SELECT results ---
+# SQLite takes each result column's collation from the leftmost branch whose
+# expression has one (multiSelectCollSeq, select.c). A plain column always
+# has one, BINARY when it declares none; literals and other expressions have
+# none. Deduplication and ORDER BY both use the collation of the whole
+# compound, trailing UNION ALL branches included.
+
+test collate-compound-binary-column-first {
+    CREATE TABLE p(c TEXT);
+    CREATE TABLE q(nk TEXT COLLATE NOCASE);
+    INSERT INTO p VALUES ('K6');
+    INSERT INTO q VALUES ('a'), ('A'), ('B'), ('b');
+    SELECT c FROM p UNION SELECT nk FROM q ORDER BY 1;
+}
+expect {
+    A
+    B
+    K6
+    a
+    b
+}
+
+test collate-compound-nocase-column-first {
+    CREATE TABLE p(c TEXT);
+    CREATE TABLE q(nk TEXT COLLATE NOCASE);
+    INSERT INTO p VALUES ('K6');
+    INSERT INTO q VALUES ('a'), ('A'), ('B'), ('b');
+    SELECT count(*) FROM (SELECT nk FROM q UNION SELECT c FROM p);
+}
+expect {
+    3
+}
+
+test collate-compound-literal-first-has-no-collation {
+    CREATE TABLE q(nk TEXT COLLATE NOCASE);
+    INSERT INTO q VALUES ('a'), ('A'), ('B'), ('b');
+    SELECT count(*) FROM (SELECT 'b' UNION SELECT nk FROM q);
+}
+expect {
+    2
+}
+
+test collate-compound-expression-first-has-no-collation {
+    CREATE TABLE p(c TEXT);
+    CREATE TABLE q(nk TEXT COLLATE NOCASE);
+    INSERT INTO p VALUES ('K6');
+    INSERT INTO q VALUES ('a'), ('A'), ('B'), ('b');
+    SELECT count(*) FROM (SELECT c || '' FROM p UNION SELECT nk FROM q);
+}
+expect {
+    3
+}
+
+# SQLite 3.50 takes the collation from the whole compound, so the NOCASE
+# column of the trailing UNION ALL branch makes the UNION merge 'b' and 'B'.
+test collate-compound-trailing-union-all-sets-collation {
+    CREATE TABLE q(nk TEXT COLLATE NOCASE);
+    INSERT INTO q VALUES ('a'), ('A'), ('B'), ('b');
+    SELECT count(*) FROM (SELECT 'b' UNION SELECT 'B' UNION ALL SELECT nk FROM q);
+}
+expect {
+    5
+}
+
+test collate-compound-except-binary-column-first {
+    CREATE TABLE p(c TEXT);
+    CREATE TABLE q(nk TEXT COLLATE NOCASE);
+    INSERT INTO p VALUES ('K6');
+    INSERT INTO q VALUES ('a'), ('A'), ('B'), ('b');
+    SELECT count(*) FROM (SELECT c FROM p UNION ALL SELECT 'k6' EXCEPT SELECT nk FROM q);
+}
+expect {
+    2
+}
+
+test collate-compound-intersect-binary-column-first {
+    CREATE TABLE p(c TEXT);
+    CREATE TABLE q(nk TEXT COLLATE NOCASE);
+    INSERT INTO p VALUES ('K6');
+    INSERT INTO q VALUES ('a'), ('A'), ('B'), ('b');
+    SELECT count(*) FROM (SELECT c FROM p UNION ALL SELECT 'a' INTERSECT SELECT nk FROM q);
+}
+expect {
+    1
+}
+
+test collate-compound-order-by-binary-column-first {
+    CREATE TABLE p(c TEXT);
+    CREATE TABLE q(nk TEXT COLLATE NOCASE);
+    INSERT INTO p VALUES ('K6');
+    INSERT INTO q VALUES ('a'), ('A'), ('B'), ('b');
+    SELECT c FROM p UNION ALL SELECT nk FROM q ORDER BY 1;
+}
+expect {
+    A
+    B
+    K6
+    a
+    b
+}
+
+test collate-compound-middle-union-all-in-dedup {
+    CREATE TABLE p(c TEXT);
+    CREATE TABLE q(nk TEXT COLLATE NOCASE);
+    INSERT INTO p VALUES ('K6');
+    INSERT INTO q VALUES ('a'), ('A'), ('B'), ('b');
+    SELECT count(*) FROM (SELECT 'x' UNION ALL SELECT nk FROM q UNION SELECT c FROM p);
+}
+expect {
+    4
+}
+
+# Issue #8272: a plain column on the left branch keeps its BINARY collation;
+# the right branch's NOCASE must not decide.
+test collate-compound-issue-8272 {
+    CREATE TABLE q(x, y TEXT);
+    INSERT INTO q VALUES (1, 'a'), (2, 'B'), (NULL, 'c'), ('3', 'z');
+    CREATE TABLE p(x, y TEXT COLLATE NOCASE);
+    INSERT INTO p VALUES (1, 'A'), (2, 'b'), (NULL, 'C'), (3, NULL), (2, 'B'), (1.0, 'a');
+    SELECT 'intersect', group_concat(coalesce(y, 'NULL'), ',') FROM (SELECT y FROM q INTERSECT SELECT y FROM p ORDER BY 1);
+    SELECT 'except', group_concat(coalesce(y, 'NULL'), ',') FROM (SELECT y FROM q EXCEPT SELECT y FROM p ORDER BY 1);
+    SELECT 'union', group_concat(coalesce(y, 'NULL'), ',') FROM (SELECT y FROM q UNION SELECT y FROM p ORDER BY 1);
+    SELECT 'union-all', group_concat(coalesce(y, 'NULL'), ',') FROM (SELECT y FROM q UNION ALL SELECT y FROM p ORDER BY 1);
+}
+expect {
+    intersect|B,a
+    except|c,z
+    union|NULL,A,B,C,a,b,c,z
+    union-all|NULL,A,B,B,C,a,a,b,c,z
+}
+
+# Issue #6407: with three or more branches, an explicit COLLATE on the first
+# branch still decides.
+test collate-compound-issue-6407 {
+    SELECT 'Hello' COLLATE NOCASE UNION SELECT 'hello' UNION SELECT 'HELLO';
+}
+expect {
+    HELLO
+}
+
+# Issue #8374: an expression that wraps a column (||, substr, trim, coalesce,
+# replace) has no collation of its own, so the next branch decides.
+test collate-compound-issue-8374 {
+    CREATE TABLE p(y TEXT COLLATE NOCASE);
+    CREATE TABLE q(y TEXT);
+    INSERT INTO p VALUES ('a'), ('B');
+    INSERT INTO q VALUES ('A'), ('b');
+    SELECT 'concat-union', group_concat(y, ',') FROM (SELECT y || '' AS y FROM p UNION SELECT y FROM q ORDER BY 1);
+    SELECT 'substr-intersect', count(*) FROM (SELECT substr(y, 1) FROM p INTERSECT SELECT y FROM q);
+    SELECT 'trim-except', group_concat(y, ',') FROM (SELECT trim(y) AS y FROM p EXCEPT SELECT y FROM q ORDER BY 1);
+    SELECT 'coalesce-union', group_concat(y, ',') FROM (SELECT coalesce(y, '') AS y FROM p UNION SELECT y FROM q ORDER BY 1);
+    SELECT 'replace-intersect', count(*) FROM (SELECT replace(y, 'z', 'z') FROM p INTERSECT SELECT y FROM q);
+}
+expect {
+    concat-union|A,B,a,b
+    substr-intersect|0
+    trim-except|B,a
+    coalesce-union|A,B,a,b
+    replace-intersect|0
+}

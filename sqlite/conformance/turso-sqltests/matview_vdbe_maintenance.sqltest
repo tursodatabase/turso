@@ -2485,6 +2485,36 @@ expect {
     a
 }
 
+# A plain column has a collation (BINARY when it declares none), so when it
+# is the left-most branch, UNION deduplicates under BINARY even though a
+# later branch is NOCASE: 'a' and 'A' are separate rows. The differential
+# fuzzer found this through nested UNION/EXCEPT subqueries (seed 104).
+test matview-vdbe-union-binary-column-before-nocase {
+    CREATE TABLE union_binary_first_p(c TEXT);
+    CREATE TABLE union_binary_first_q(nk TEXT COLLATE NOCASE);
+    INSERT INTO union_binary_first_p VALUES ('K6');
+    INSERT INTO union_binary_first_q VALUES ('a'), ('A'), ('B');
+    CREATE MATERIALIZED VIEW union_binary_first_view AS
+        SELECT value FROM (SELECT c AS value FROM union_binary_first_p) AS s0
+        UNION
+        SELECT value FROM (SELECT nk AS value FROM union_binary_first_q) AS s1;
+    SELECT * FROM union_binary_first_view ORDER BY value;
+    INSERT INTO union_binary_first_q VALUES ('b'), ('k6');
+    DELETE FROM union_binary_first_q WHERE nk = 'A';
+    -- nk is NOCASE, so this deletes both 'a' and 'A'.
+    SELECT * FROM union_binary_first_view ORDER BY value;
+}
+expect {
+    A
+    B
+    K6
+    a
+    B
+    K6
+    b
+    k6
+}
+
 # INTERSECT shows a member of its left input; the right branch only decides
 # whether the class is shown.
 test matview-vdbe-collated-intersect-representative {

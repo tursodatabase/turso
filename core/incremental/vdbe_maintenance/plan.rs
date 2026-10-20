@@ -7,7 +7,9 @@ use crate::function::{AggFunc, Func};
 use crate::incremental::dag;
 use crate::schema::BTreeTable;
 use crate::sync::Arc;
-use crate::translate::collate::{get_collseq_from_expr_with_symbols, CollationSeq};
+use crate::translate::collate::{
+    compound_column_collation, get_collseq_from_expr_with_symbols, CollationSeq,
+};
 use crate::translate::emitter::Resolver;
 use crate::translate::expr::{expr_contains_nondeterministic_scalar_function, WalkControl};
 use crate::translate::optimizer::optimize_plan;
@@ -187,10 +189,9 @@ fn build_plan_dag_node(
                     .iter()
                     .map(|(branch, _)| branch)
                     .chain(std::iter::once(right_most.as_ref()))
-                    .take(prefix_len)
                     .collect::<Vec<_>>();
                 (0..arity)
-                    .map(|index| set_op_key_column(&branches, index, resolver))
+                    .map(|index| set_op_key_column(&branches, prefix_len, index, resolver))
                     .collect::<Result<Vec<_>>>()?
             };
             builder.push(dag::OpNode::SetOp {
@@ -625,7 +626,16 @@ fn plan_expr_collation(
     tables: &TableReferences,
     resolver: &Resolver,
 ) -> Result<Option<CollationSeq>> {
-    let collation = get_collseq_from_expr_with_symbols(expr, tables, Some(resolver.symbol_table))?;
+    supported_key_collation(get_collseq_from_expr_with_symbols(
+        expr,
+        tables,
+        Some(resolver.symbol_table),
+    )?)
+}
+
+/// Reject custom collations, which maintenance cannot compare with, and read
+/// an unset collation as BINARY.
+fn supported_key_collation(collation: Option<CollationSeq>) -> Result<Option<CollationSeq>> {
     if collation.is_some_and(|collation| collation.is_custom()) {
         return unsupported("custom collations on grouping or dedup keys");
     }
@@ -648,25 +658,23 @@ fn key_column(
     })
 }
 
-/// The key column of compound result column `index` over the deduplicated
-/// `branches`. The collation is the first explicit one, as in SQLite. Under
-/// BINARY a class holds one exact value only when no branch can produce an
-/// integer that another branch produces as an equal real.
+/// The key column of compound result column `index`, deduplicated over the
+/// first `dedup_len` of `branches`. The collation is the one the regular
+/// compound SELECT compares with (see `compound_column_collation`). Under
+/// BINARY a class holds one exact value only when no deduplicated branch can
+/// produce an integer that another one produces as an equal real.
 fn set_op_key_column(
     branches: &[&SelectPlan],
+    dedup_len: usize,
     index: usize,
     resolver: &Resolver,
 ) -> Result<dag::KeyColumn> {
-    let mut collation = None;
-    let mut affinities = Vec::with_capacity(branches.len());
-    for branch in branches {
-        let expr = &branch.result_columns[index].expr;
-        if collation.is_none() {
-            collation = plan_expr_collation(expr, &branch.table_references, resolver)?;
-        }
-        affinities.push(stored_affinity(expr, &branch.table_references));
-    }
-    let collation = collation.unwrap_or(CollationSeq::Binary);
+    let collation = supported_key_collation(compound_column_collation(branches, index, resolver)?)?
+        .unwrap_or(CollationSeq::Binary);
+    let affinities: Vec<_> = branches[..dedup_len]
+        .iter()
+        .map(|branch| stored_affinity(&branch.result_columns[index].expr, &branch.table_references))
+        .collect();
     let mixes_integers_and_reals =
         affinities.contains(&Some(Affinity::Integer)) && affinities.contains(&Some(Affinity::Real));
     Ok(dag::KeyColumn {
