@@ -2,6 +2,13 @@
 
 @database :memory:
 
+test pg-collation-pgdump-columns {
+    SELECT tableoid, oid, collname, collnamespace, collowner, collencoding
+    FROM pg_catalog.pg_collation
+    WHERE oid >= 16384;
+}
+expect {}
+
 setup indexed_tables {
     CREATE TABLE items (id int, name text, price int);
     CREATE INDEX items_name_idx ON items (name);
