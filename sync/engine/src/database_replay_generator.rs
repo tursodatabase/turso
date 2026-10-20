@@ -1007,7 +1007,7 @@ fn generated_column_changed_between_local_and_remote(
     local_column: &turso_parser::ast::ColumnDefinition,
     remote_columns: &[turso_parser::ast::ColumnDefinition],
 ) -> bool {
-    if !is_generated(local_column) {
+    if !is_generated_column(local_column) {
         return false;
     }
     let local_name = local_column.col_name.as_str();
@@ -1020,16 +1020,16 @@ fn generated_column_changed_between_local_and_remote(
         // remote has removed the gencol
         return true;
     };
-    return is_generated(remote_column) && remote_column.to_string() != local_column.to_string();
+    is_generated_column(remote_column) && remote_column.to_string() != local_column.to_string()
+}
 
-    fn is_generated(column: &turso_parser::ast::ColumnDefinition) -> bool {
-        column.constraints.iter().any(|constraint| {
-            matches!(
-                constraint.constraint,
-                turso_parser::ast::ColumnConstraint::Generated { .. }
-            )
-        })
-    }
+pub(crate) fn is_generated_column(column: &turso_parser::ast::ColumnDefinition) -> bool {
+    column.constraints.iter().any(|constraint| {
+        matches!(
+            constraint.constraint,
+            turso_parser::ast::ColumnConstraint::Generated { .. }
+        )
+    })
 }
 
 fn has_column(columns: &[turso_parser::ast::ColumnDefinition], name: &str) -> bool {

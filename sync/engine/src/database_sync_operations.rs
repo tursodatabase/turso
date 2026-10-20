@@ -1,5 +1,5 @@
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, HashMap},
     ops::Deref,
     sync::{Arc, Mutex},
 };
@@ -18,7 +18,7 @@ use crate::{
     client_proto::{
         LogicalOp, LogicalOpType, LogicalSchemaAction, LogicalSchemaKind, LogicalTxnData,
     },
-    database_replay_generator::DatabaseReplayGenerator,
+    database_replay_generator::{is_generated_column, DatabaseReplayGenerator},
     database_sync_engine::{DataStats, DatabaseSyncEngineOpts},
     database_sync_engine_io::{DataCompletion, DataPollResult, SyncEngineIo},
     database_tape::{
@@ -659,6 +659,7 @@ async fn replay_logical_transactions_from_file<Ctx>(
     txns_file: &Arc<dyn turso_core::File>,
     excluded_client_id: Option<&str>,
     table_names_by_stable_id: &mut BTreeMap<u64, String>,
+    local_drops: &UnpushedLocalDrops,
 ) -> Result<LogicalReplayApplyStats> {
     let size = txns_file.size()?;
     let mut file_offset = 0u64;
@@ -678,6 +679,19 @@ async fn replay_logical_transactions_from_file<Ctx>(
             }
             table_map = decoded_table_map;
             for operation in operations {
+                let operation = match operation {
+                    DatabaseTapeOperation::RowChange(change) => {
+                        match local_drops.trim_remote_change(change) {
+                            Some(change) => DatabaseTapeOperation::RowChange(change),
+                            None => continue,
+                        }
+                    }
+                    DatabaseTapeOperation::SchemaReplay(change) => {
+                        local_drops.check_remote_schema_change(&change)?;
+                        DatabaseTapeOperation::SchemaReplay(change)
+                    }
+                    operation => operation,
+                };
                 for row in logical_operations_touched_rows(std::slice::from_ref(&operation)) {
                     stats.touched_rows.insert(row);
                 }
@@ -706,6 +720,7 @@ pub async fn apply_logical_transactions_file_without_commit_excluding_client_txn
     txns_file: &Arc<dyn turso_core::File>,
     excluded_client_id: &str,
     table_names_by_stable_id: &mut BTreeMap<u64, String>,
+    local_drops: &UnpushedLocalDrops,
 ) -> Result<LogicalReplayApplyStats> {
     replay_logical_transactions_from_file(
         coro,
@@ -713,8 +728,235 @@ pub async fn apply_logical_transactions_file_without_commit_excluding_client_txn
         txns_file,
         Some(excluded_client_id),
         table_names_by_stable_id,
+        local_drops,
     )
     .await
+}
+
+/// Tables and columns that the replica dropped locally and has not pushed yet.
+/// The local drop wins over remote row changes to the dropped table or column:
+/// once the drop is pushed, the remote rows go away too.
+///
+/// Row records store columns by position, so a dropped column's value is found
+/// by the position the column had before the drop. A pull fails if it brings a
+/// remote schema change to such a table, so every remote row pulled while the
+/// drop is unpushed has that layout.
+#[derive(Default)]
+pub struct UnpushedLocalDrops {
+    table_drop_change_ids: HashMap<String, i64>,
+    column_drops: HashMap<String, Vec<ColumnDrop>>,
+}
+
+struct ColumnDrop {
+    change_id: i64,
+    record_index: usize,
+}
+
+impl UnpushedLocalDrops {
+    pub fn from_local_changes(changes: &[DatabaseTapeRowChange]) -> Result<Self> {
+        let mut drops = Self::default();
+        for change in changes {
+            if change.table_name != SQLITE_SCHEMA_TABLE {
+                continue;
+            }
+            match &change.change {
+                DatabaseTapeRowChangeType::Delete { before, .. } => {
+                    let [Value::Text(kind), Value::Text(name), ..] = before.as_slice() else {
+                        continue;
+                    };
+                    if kind.as_str() == "table" {
+                        let table_name = name.as_str().to_ascii_lowercase();
+                        drops.column_drops.remove(&table_name);
+                        drops
+                            .table_drop_change_ids
+                            .insert(table_name, change.change_id);
+                    }
+                }
+                DatabaseTapeRowChangeType::Update {
+                    before,
+                    updates: Some(updates),
+                    ..
+                } => {
+                    let (Some(Value::Text(old_sql)), Some(Value::Text(new_sql))) =
+                        (before.get(4), updates.get(9))
+                    else {
+                        continue;
+                    };
+                    let Some((table_name, record_index)) =
+                        dropped_column_record_index(old_sql.as_str(), new_sql.as_str())?
+                    else {
+                        continue;
+                    };
+                    drops
+                        .column_drops
+                        .entry(table_name)
+                        .or_default()
+                        .push(ColumnDrop {
+                            change_id: change.change_id,
+                            record_index,
+                        });
+                }
+                _ => {}
+            }
+        }
+        Ok(drops)
+    }
+
+    pub fn check_remote_schema_change(&self, change: &DatabaseSchemaReplay) -> Result<()> {
+        let table_name = match change {
+            DatabaseSchemaReplay::Create { sql } | DatabaseSchemaReplay::Alter { sql } => {
+                let mut parser = turso_parser::parser::Parser::new(sql.as_bytes());
+                match parser.next() {
+                    Some(Ok(turso_parser::ast::Cmd::Stmt(
+                        turso_parser::ast::Stmt::CreateTable { tbl_name: name, .. }
+                        | turso_parser::ast::Stmt::AlterTable(turso_parser::ast::AlterTable {
+                            name,
+                            ..
+                        }),
+                    ))) => name.name.as_str().to_ascii_lowercase(),
+                    _ => return Ok(()),
+                }
+            }
+            DatabaseSchemaReplay::Refresh {
+                kind: DatabaseSchemaKind::Table,
+                name,
+                ..
+            }
+            | DatabaseSchemaReplay::Drop {
+                kind: DatabaseSchemaKind::Table,
+                name,
+            } => name.to_ascii_lowercase(),
+            DatabaseSchemaReplay::Refresh { .. } | DatabaseSchemaReplay::Drop { .. } => {
+                return Ok(())
+            }
+        };
+        if self.column_drops.contains_key(&table_name) {
+            return Err(Error::DatabaseSyncEngineError(format!(
+                "cannot pull a schema change to table '{table_name}': a column of it was dropped locally and is not pushed yet; push the local changes before pulling"
+            )));
+        }
+        Ok(())
+    }
+
+    pub fn trim_remote_change(
+        &self,
+        change: DatabaseTapeRowChange,
+    ) -> Option<DatabaseTapeRowChange> {
+        self.trim_change_made_before_drops_after(change, i64::MIN)
+    }
+
+    pub fn trim_local_change(
+        &self,
+        change: DatabaseTapeRowChange,
+    ) -> Option<DatabaseTapeRowChange> {
+        let change_id = change.change_id;
+        self.trim_change_made_before_drops_after(change, change_id)
+    }
+
+    fn trim_change_made_before_drops_after(
+        &self,
+        mut change: DatabaseTapeRowChange,
+        change_id: i64,
+    ) -> Option<DatabaseTapeRowChange> {
+        let table_name = change.table_name.to_ascii_lowercase();
+        if self
+            .table_drop_change_ids
+            .get(&table_name)
+            .is_some_and(|drop_change_id| *drop_change_id > change_id)
+        {
+            return None;
+        }
+        let Some(column_drops) = self.column_drops.get(&table_name) else {
+            return Some(change);
+        };
+        let mut removed_any_column = false;
+        for column_drop in column_drops
+            .iter()
+            .filter(|column_drop| column_drop.change_id > change_id)
+        {
+            removed_any_column = true;
+            let index = column_drop.record_index;
+            match &mut change.change {
+                DatabaseTapeRowChangeType::Delete { before, .. } => {
+                    remove_record_value(before, index);
+                }
+                DatabaseTapeRowChangeType::Insert { after } => {
+                    remove_record_value(after, index);
+                }
+                DatabaseTapeRowChangeType::Update {
+                    before,
+                    after,
+                    updates,
+                } => {
+                    remove_record_value(before, index);
+                    remove_record_value(after, index);
+                    if let Some(updates) = updates {
+                        let columns = updates.len() / 2;
+                        if index < columns {
+                            updates.remove(columns + index);
+                            updates.remove(index);
+                        }
+                    }
+                }
+            }
+        }
+        if let DatabaseTapeRowChangeType::Update {
+            updates: Some(updates),
+            ..
+        } = &change.change
+        {
+            let columns = updates.len() / 2;
+            let updates_kept_column = updates[..columns]
+                .iter()
+                .any(|changed| !matches!(changed, Value::Numeric(turso_core::Numeric::Integer(0))));
+            if removed_any_column && !updates_kept_column {
+                return None;
+            }
+        }
+        Some(change)
+    }
+}
+
+fn remove_record_value(record: &mut crate::alloc::Vec<Value>, index: usize) {
+    if index < record.len() {
+        record.remove(index);
+    }
+}
+
+/// For an `ALTER TABLE ... DROP COLUMN` change, returns the table name and the
+/// position the dropped column had in the table's row records. Records don't
+/// store generated columns, so dropping one returns None.
+fn dropped_column_record_index(old_sql: &str, new_sql: &str) -> Result<Option<(String, usize)>> {
+    let mut parser = turso_parser::parser::Parser::new(new_sql.as_bytes());
+    let Some(Ok(turso_parser::ast::Cmd::Stmt(turso_parser::ast::Stmt::AlterTable(
+        turso_parser::ast::AlterTable {
+            name,
+            body: turso_parser::ast::AlterTableBody::DropColumn(column_name),
+        },
+    )))) = parser.next()
+    else {
+        return Ok(None);
+    };
+    let mut parser = turso_parser::parser::Parser::new(old_sql.as_bytes());
+    let Some(Ok(turso_parser::ast::Cmd::Stmt(turso_parser::ast::Stmt::CreateTable {
+        body: turso_parser::ast::CreateTableBody::ColumnsAndConstraints { columns, .. },
+        ..
+    }))) = parser.next()
+    else {
+        return Err(Error::DatabaseSyncEngineError(format!(
+            "unexpected table definition before `{new_sql}`: {old_sql}"
+        )));
+    };
+    let record_index = columns
+        .iter()
+        .filter(|column| !is_generated_column(column))
+        .position(|column| {
+            column
+                .col_name
+                .as_str()
+                .eq_ignore_ascii_case(column_name.as_str())
+        });
+    Ok(record_index.map(|index| (name.name.as_str().to_ascii_lowercase(), index)))
 }
 
 pub struct MutexSlot<T: Clone> {
@@ -4027,6 +4269,7 @@ mod tests {
             logically_replayable_table_filter, pull_pages_v1, pull_updates_v1, should_push_change,
             should_replay_local_change, update_last_change_id, wait_proto_message,
             wal_pull_to_file_v1, PullUpdatesV1Result, SyncEngineIoStats, SyncOperationCtx,
+            UnpushedLocalDrops,
         },
         database_tape::{
             run_stmt_expect_one_row, run_stmt_once, DatabaseReplaySessionOpts, DatabaseTape,
@@ -5476,6 +5719,7 @@ mod tests {
                         &txns_file,
                         "client-a",
                         &mut table_names_by_stable_id,
+                        &UnpushedLocalDrops::default(),
                     )
                     .await
                     .unwrap();

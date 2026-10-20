@@ -23,7 +23,8 @@ use crate::{
         push_logical_changes, read_last_change_id, read_logical_replay_table_map, read_wal_salt,
         reset_wal_file, should_replay_local_change, sync_file, update_last_change_id,
         wait_all_results, wal_apply_from_file, wal_pull_to_file, PullUpdatesV1Result,
-        SyncEngineIoStats, SyncOperationCtx, PAGE_SIZE, WAL_FRAME_HEADER, WAL_FRAME_SIZE,
+        SyncEngineIoStats, SyncOperationCtx, UnpushedLocalDrops, PAGE_SIZE, WAL_FRAME_HEADER,
+        WAL_FRAME_SIZE,
     },
     database_tape::{
         run_stmt_ignore_rows, try_wal_watermark_read_page, DatabaseChangesIteratorMode,
@@ -2004,21 +2005,6 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
             },
         };
         let apply_result = async {
-            let remote_apply_stats =
-                apply_logical_transactions_file_without_commit_excluding_client_txns_with_table_map_and_stats(
-                    coro,
-                    &mut replay,
-                    changes_file,
-                    &self.client_unique_id,
-                    &mut logical_table_names_by_stable_id,
-                )
-                .await?;
-	            tracing::info!(
-	                "apply_logical_mvcc_changes(path={}): applied remote logical transactions; touched_rows={}",
-	                self.main_db_path,
-	                remote_apply_stats.touched_rows.len()
-	            );
-
             let (last_pushed_pull_gen_hint, last_pushed_change_id_hint) = {
                 let meta = self.meta();
                 (
@@ -2056,6 +2042,28 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
                     Err(error) => Some(Err(error)),
                 })
                 .collect::<Result<Vec<_>>>()?;
+            let local_drops = UnpushedLocalDrops::from_local_changes(&local_changes)?;
+
+            let remote_apply_stats =
+                apply_logical_transactions_file_without_commit_excluding_client_txns_with_table_map_and_stats(
+                    coro,
+                    &mut replay,
+                    changes_file,
+                    &self.client_unique_id,
+                    &mut logical_table_names_by_stable_id,
+                    &local_drops,
+                )
+                .await?;
+	            tracing::info!(
+	                "apply_logical_mvcc_changes(path={}): applied remote logical transactions; touched_rows={}",
+	                self.main_db_path,
+	                remote_apply_stats.touched_rows.len()
+	            );
+
+            let local_changes = local_changes
+                .into_iter()
+                .filter_map(|change| local_drops.trim_local_change(change))
+                .collect::<Vec<_>>();
             let replayed_local_changes = !local_changes.is_empty();
             tracing::info!(
                 "apply_logical_mvcc_changes(path={}): logical local replay floor={replay_floor}; local_changes={} skipped_internal_local_changes={}",
@@ -2564,6 +2572,7 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
                                             changes_file,
                                             &self.client_unique_id,
                                             &mut logical_table_names_by_stable_id,
+                                            &UnpushedLocalDrops::default(),
                                         )
                                         .await
                                         .map_err(|error| {
