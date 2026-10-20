@@ -4937,6 +4937,7 @@ impl Pager {
     fn reset_checkpoint_state(&self) {
         self.clear_checkpoint_state();
         self.commit_info.write().state = CommitState::PrepareWal;
+        *self.header_ref_state.write() = HeaderRefState::Start;
     }
 
     /// Reset checkpoint state machine to initial state.
@@ -6554,6 +6555,20 @@ mod tests {
         default_page1, CacheFlushState, CollectingState, Page, PageRef, Pager, SharedPagerState,
     };
     use crate::{Buffer, Completion, CompletionError, LimboError};
+
+    #[test]
+    fn checkpoint_reset_does_not_reuse_failed_header_read() {
+        let pager = pager_with_cache_capacity(10, 2);
+        let completion =
+            Completion::new_read(Arc::new(Buffer::new_temporary(4096)), Box::new(|_| None));
+        completion.abort();
+        *pager.header_ref_state.write() = super::HeaderRefState::CreateHeader {
+            page: default_page1(None),
+            completion: Some(completion),
+        };
+        pager.reset_checkpoint_state();
+        pager.io.block(|| pager.with_header(|_| ())).unwrap();
+    }
 
     #[test]
     fn page_id_changes_keep_header_access_at_the_correct_offset() {
