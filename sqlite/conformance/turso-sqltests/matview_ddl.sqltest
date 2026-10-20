@@ -135,3 +135,34 @@ test matview-alter-column-rejected {
 expect error {
     view v may not be altered
 }
+
+# BEFORE and AFTER triggers on a view are rejected like in SQLite. A trigger
+# on a materialized view used to be created, but it never fired, because the
+# view's rows are written by view maintenance and not by INSERT, UPDATE or
+# DELETE on the view.
+test matview-after-trigger-rejected {
+    CREATE TABLE t(a);
+    CREATE MATERIALIZED VIEW v AS SELECT a FROM t;
+    CREATE TRIGGER tr AFTER INSERT ON v BEGIN SELECT 1; END;
+}
+expect error {
+    cannot create AFTER trigger on view: v
+}
+
+test matview-before-trigger-rejected {
+    CREATE TABLE t(a);
+    CREATE MATERIALIZED VIEW v AS SELECT a FROM t;
+    CREATE TRIGGER tr BEFORE UPDATE ON v BEGIN SELECT 1; END;
+}
+expect error {
+    cannot create BEFORE trigger on view: v
+}
+
+test matview-default-time-trigger-rejected {
+    CREATE TABLE t(a);
+    CREATE MATERIALIZED VIEW v AS SELECT a FROM t;
+    CREATE TRIGGER tr DELETE ON v BEGIN SELECT 1; END;
+}
+expect error {
+    cannot create BEFORE trigger on view: v
+}
