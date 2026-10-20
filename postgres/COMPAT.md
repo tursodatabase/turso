@@ -292,6 +292,7 @@ INTEGER. Unknown type names pass through as custom types.
 | JSONB-modifying operators and functions | ❌ Not supported | |
 | JSONB subscripting | ❌ Not supported | |
 | JSON data type | 🟡 Partial | Same as jsonb (see above) |
+| json_to_record / json_to_recordset (and jsonb_ variants) | 🟡 Partial | Work with a column definition list; WITH ORDINALITY and ROWS FROM are not supported; error messages for malformed input differ from PostgreSQL; a repeated key reads its first value, like `->>` |
 | SQL/JSON constructors | ❌ Not supported | |
 | SQL/JSON: datetime() | ❌ Not supported | |
 | SQL/JSON IS JSON | ❌ Not supported | |

@@ -2058,7 +2058,205 @@ impl PostgreSQLTranslator {
                 lateral: true,
             });
         }
+        if matches!(
+            func_name,
+            "json_to_record" | "json_to_recordset" | "jsonb_to_record" | "jsonb_to_recordset"
+        ) {
+            return self.translate_json_to_record(func_name, range_func, &args, alias);
+        }
         Ok(ast::SelectTable::TableCall(qualified_name, args, alias))
+    }
+
+    fn translate_json_to_record(
+        &self,
+        func_name: &str,
+        range_func: &pg_query::protobuf::RangeFunction,
+        args: &[Box<ast::Expr>],
+        alias: Option<ast::As>,
+    ) -> Result<ast::SelectTable, ParseError> {
+        if range_func.ordinality || range_func.functions.len() != 1 {
+            return Err(ParseError::ParseError(format!(
+                "{func_name} does not support WITH ORDINALITY or ROWS FROM"
+            )));
+        }
+        let [arg] = args else {
+            return Err(ParseError::ParseError(format!(
+                "{func_name} requires exactly one argument"
+            )));
+        };
+        if range_func.coldeflist.is_empty() {
+            return Err(ParseError::ParseError(
+                "a column definition list is required for functions returning \"record\"".into(),
+            ));
+        }
+        let is_recordset = func_name.ends_with("recordset");
+        let (arg_type, arg_type_error) = if is_recordset {
+            ("array", format!("cannot call {func_name} on a non-array"))
+        } else {
+            ("object", format!("cannot call {func_name} on a non-object"))
+        };
+        let json_type = |args: Vec<Box<ast::Expr>>| ast::Expr::FunctionCall {
+            name: ast::Name::from_string("json_type"),
+            distinctness: None,
+            args,
+            order_by: vec![],
+            within_group: vec![],
+            filter_over: ast::FunctionTail {
+                filter_clause: None,
+                over_clause: None,
+            },
+        };
+        let checked_arg = json_type_or_raise(
+            json_type(vec![arg.clone()]),
+            (**arg).clone(),
+            arg_type,
+            &arg_type_error,
+        );
+        let arg_subquery = ast::SelectTable::Select {
+            select: ast::Select {
+                with: None,
+                body: ast::SelectBody {
+                    select: ast::OneSelect::Select {
+                        distinctness: None,
+                        columns: vec![ast::ResultColumn::Expr(
+                            Box::new(checked_arg),
+                            Some(ast::As::Elided(ast::Name::from_string("json"))),
+                        )],
+                        from: None,
+                        where_clause: None,
+                        group_by: None,
+                        window_clause: vec![],
+                    },
+                    compounds: vec![],
+                },
+                order_by: vec![],
+                limit: None,
+            },
+            alias: Some(ast::As::Elided(ast::Name::from_string("arg"))),
+            lateral: false,
+        };
+        let arg_json = ast::Expr::Qualified(
+            ast::Name::from_string("arg"),
+            ast::Name::from_string("json"),
+        );
+        let (source, joins) = if is_recordset {
+            let json_each = ast::SelectTable::TableCall(
+                ast::QualifiedName::single(ast::Name::from_string("json_each")),
+                vec![Box::new(arg_json)],
+                Some(ast::As::Elided(ast::Name::from_string("element"))),
+            );
+            let element = |column: &str| {
+                ast::Expr::Qualified(
+                    ast::Name::from_string("element"),
+                    ast::Name::from_string(column),
+                )
+            };
+            (
+                json_type_or_raise(
+                    element("type"),
+                    element("value"),
+                    "object",
+                    &format!("argument of {func_name} must be an array of objects"),
+                ),
+                vec![ast::JoinedSelectTable {
+                    operator: ast::JoinOperator::Comma,
+                    table: Box::new(json_each),
+                    constraint: None,
+                }],
+            )
+        } else {
+            (arg_json, vec![])
+        };
+        let columns = range_func
+            .coldeflist
+            .iter()
+            .map(|node| {
+                let Some(pg_query::protobuf::node::Node::ColumnDef(col_def)) = &node.node else {
+                    return Err(ParseError::ParseError(
+                        "invalid column definition list".into(),
+                    ));
+                };
+                let type_name = col_def.type_name.as_ref().ok_or_else(|| {
+                    ParseError::ParseError(format!("column {} missing type", col_def.colname))
+                })?;
+                let is_json = matches!(
+                    extract_type_name_from_typename(type_name)?
+                        .to_lowercase()
+                        .as_str(),
+                    "json" | "jsonb"
+                );
+                let cast_type = pg_type_name_to_ast_type(type_name);
+                let path = Box::new(ast::Expr::Literal(ast::Literal::String(format!(
+                    "'$.\"{}\"'",
+                    col_def
+                        .colname
+                        .replace('\\', "\\\\")
+                        .replace('"', "\\\"")
+                        .replace('\'', "''")
+                ))));
+                let extract =
+                    |operator| ast::Expr::Binary(Box::new(source.clone()), operator, path.clone());
+                let reads_json_text =
+                    is_json || cast_type.as_ref().is_some_and(|t| t.name == "TEXT");
+                let value = if reads_json_text {
+                    let mut when_then_pairs = vec![(
+                        Box::new(ast::Expr::Literal(ast::Literal::String("'null'".into()))),
+                        Box::new(ast::Expr::Literal(ast::Literal::Null)),
+                    )];
+                    if !is_json {
+                        when_then_pairs.push((
+                            Box::new(ast::Expr::Literal(ast::Literal::String("'text'".into()))),
+                            Box::new(extract(ast::Operator::ArrowRightShift)),
+                        ));
+                    }
+                    ast::Expr::Case {
+                        base: Some(Box::new(json_type(vec![
+                            Box::new(source.clone()),
+                            path.clone(),
+                        ]))),
+                        when_then_pairs,
+                        else_expr: Some(Box::new(extract(ast::Operator::ArrowRight))),
+                    }
+                } else {
+                    extract(ast::Operator::ArrowRightShift)
+                };
+                let cast = ast::Expr::Cast {
+                    expr: Box::new(value),
+                    type_name: cast_type,
+                };
+                Ok(ast::ResultColumn::Expr(
+                    Box::new(cast),
+                    Some(ast::As::Elided(ast::Name::from_string(
+                        col_def.colname.clone(),
+                    ))),
+                ))
+            })
+            .collect::<Result<Vec<_>, ParseError>>()?;
+        Ok(ast::SelectTable::Select {
+            select: ast::Select {
+                with: None,
+                body: ast::SelectBody {
+                    select: ast::OneSelect::Select {
+                        distinctness: None,
+                        columns,
+                        from: Some(ast::FromClause {
+                            select: Box::new(arg_subquery),
+                            joins,
+                        }),
+                        where_clause: None,
+                        group_by: None,
+                        window_clause: vec![],
+                    },
+                    compounds: vec![],
+                },
+                order_by: vec![],
+                limit: None,
+            },
+            alias: Some(
+                alias.unwrap_or_else(|| ast::As::Elided(ast::Name::from_string(func_name))),
+            ),
+            lateral: true,
+        })
     }
 
     fn translate_join_expr(
@@ -4644,6 +4842,35 @@ fn translate_create_enum(
             default: None,
         },
     })
+}
+
+fn json_type_or_raise(
+    json_type: ast::Expr,
+    value: ast::Expr,
+    expected_type: &str,
+    error: &str,
+) -> ast::Expr {
+    let expected_type = ast::Expr::Literal(ast::Literal::String(format!("'{expected_type}'")));
+    ast::Expr::Case {
+        base: Some(Box::new(ast::Expr::FunctionCall {
+            name: ast::Name::from_string("coalesce"),
+            distinctness: None,
+            args: vec![Box::new(json_type), Box::new(expected_type.clone())],
+            order_by: vec![],
+            within_group: vec![],
+            filter_over: ast::FunctionTail {
+                filter_clause: None,
+                over_clause: None,
+            },
+        })),
+        when_then_pairs: vec![(Box::new(expected_type), Box::new(value))],
+        else_expr: Some(Box::new(ast::Expr::Raise(
+            ast::ResolveType::Abort,
+            Some(Box::new(ast::Expr::Literal(ast::Literal::String(format!(
+                "'{error}'"
+            ))))),
+        ))),
+    }
 }
 
 /// Convert a pg_query TypeName to a Turso AST Type for use in CAST expressions.
