@@ -1612,3 +1612,71 @@ expect {
     3
     1
 }
+
+# Multi-argument min() and max() compare text with the collation of the
+# leftmost argument that has one (#9503).
+
+setup scalar_min_max_collation {
+    CREATE TABLE users(name TEXT COLLATE NOCASE, plain TEXT, padded TEXT COLLATE RTRIM);
+    INSERT INTO users VALUES ('alice', 'alice', 'x');
+}
+
+@setup scalar_min_max_collation
+test scalar-min-max-use-column-collation {
+    SELECT max(name, 'BOB'), min(name, 'BOB'), max('BOB', name), min('BOB', name) FROM users;
+}
+expect {
+    BOB|alice|BOB|alice
+}
+
+test scalar-min-max-use-explicit-collation {
+    SELECT max('a' COLLATE NOCASE, 'B'), min('B', 'a' COLLATE NOCASE), max('a', 'B');
+}
+expect {
+    B|a|a
+}
+
+# Equal values under NOCASE: max() keeps the first, min() takes the last.
+test scalar-min-max-nocase-ties {
+    SELECT max('a' COLLATE NOCASE, 'A'), min('a' COLLATE NOCASE, 'A');
+}
+expect {
+    a|A
+}
+
+@setup scalar_min_max_collation
+test scalar-min-max-use-rtrim-collation {
+    SELECT quote(min('x ' COLLATE RTRIM, 'x')), quote(max('x', 'x ' COLLATE RTRIM)), quote(max(padded, 'x ')) FROM users;
+}
+expect {
+    'x'|'x'|'x'
+}
+
+# A column with no declared collation is BINARY, and the leftmost argument
+# with a collation wins even over a later COLLATE operator.
+@setup scalar_min_max_collation
+test scalar-min-max-leftmost-collation-wins {
+    SELECT max(plain, 'BOB'), max(plain, name), max(plain, 'BOB' COLLATE NOCASE), max(name COLLATE BINARY, 'BOB') FROM users;
+}
+expect {
+    alice|alice|alice|alice
+}
+
+# CAST and unary + keep the column's collation; other expressions do not.
+@setup scalar_min_max_collation
+test scalar-min-max-column-expressions {
+    SELECT max(+name, 'BOB'), max(CAST(name AS TEXT), 'BOB'), max(name || '', 'BOB') FROM users;
+}
+expect {
+    BOB|BOB|alice
+}
+
+# A COLLATE operator in an argument applies to comparisons with the result,
+# a column's collation does not.
+@setup scalar_min_max_collation
+test scalar-min-max-result-collation {
+    SELECT max('a' COLLATE NOCASE, 'B') = 'b', max('BOB', name) = 'bob' FROM users;
+}
+expect {
+    1|0
+}

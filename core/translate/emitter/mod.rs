@@ -1557,6 +1557,7 @@ fn emit_cdc_insns_v1(
     let unixepoch_fn_ctx = crate::function::FuncCtx {
         func: Func::Scalar(crate::function::ScalarFunc::UnixEpoch),
         arg_count: 0,
+        collation: None,
     };
 
     program.emit_insn(Insn::Function {
@@ -1668,6 +1669,7 @@ fn emit_cdc_insns_v2(
     let unixepoch_fn_ctx = crate::function::FuncCtx {
         func: Func::Scalar(crate::function::ScalarFunc::UnixEpoch),
         arg_count: 0,
+        collation: None,
     };
     program.emit_insn(Insn::Function {
         constant_mask: 0,
@@ -1685,6 +1687,7 @@ fn emit_cdc_insns_v2(
     let conn_txn_id_fn_ctx = crate::function::FuncCtx {
         func: Func::Scalar(crate::function::ScalarFunc::ConnTxnId),
         arg_count: 1,
+        collation: None,
     };
     program.emit_insn(Insn::Function {
         constant_mask: 0,
@@ -1790,6 +1793,7 @@ pub fn emit_cdc_commit_insns(
     let unixepoch_fn_ctx = crate::function::FuncCtx {
         func: Func::Scalar(crate::function::ScalarFunc::UnixEpoch),
         arg_count: 0,
+        collation: None,
     };
     program.emit_insn(Insn::Function {
         constant_mask: 0,
@@ -1805,6 +1809,7 @@ pub fn emit_cdc_commit_insns(
     let conn_txn_id_fn_ctx = crate::function::FuncCtx {
         func: Func::Scalar(crate::function::ScalarFunc::ConnTxnId),
         arg_count: 1,
+        collation: None,
     };
     program.emit_insn(Insn::Function {
         constant_mask: 0,
@@ -1864,6 +1869,7 @@ pub fn emit_cdc_autocommit_commit(
         let is_autocommit_fn_ctx = crate::function::FuncCtx {
             func: Func::Scalar(crate::function::ScalarFunc::IsAutocommit),
             arg_count: 0,
+            collation: None,
         };
         let autocommit_reg = program.alloc_register();
         program.emit_insn(Insn::Function {
@@ -1920,6 +1926,7 @@ pub fn emit_cdc_explicit_commit_insns(
         func: crate::function::FuncCtx {
             func: Func::Scalar(crate::function::ScalarFunc::ConnTxnId),
             arg_count: 1,
+            collation: None,
         },
     });
 

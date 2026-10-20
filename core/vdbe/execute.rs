@@ -10716,14 +10716,20 @@ pub fn op_function(
                 state.registers[*dest].set_value(result);
             }
             ScalarFunc::Min => {
+                let collation = func.collation.unwrap_or(CollationSeq::Binary);
                 let reg_values = &state.registers[*start_reg..*start_reg + arg_count];
-                state.registers[*dest]
-                    .set_value(Value::exec_min(reg_values.iter().map(|v| v.get_value())));
+                let result = Value::exec_min(reg_values.iter().map(|v| v.get_value()), |a, b| {
+                    compare_with_program_collation(program, a, b, collation)
+                })?;
+                state.registers[*dest].set_value(result);
             }
             ScalarFunc::Max => {
+                let collation = func.collation.unwrap_or(CollationSeq::Binary);
                 let reg_values = &state.registers[*start_reg..*start_reg + arg_count];
-                state.registers[*dest]
-                    .set_value(Value::exec_max(reg_values.iter().map(|v| v.get_value())));
+                let result = Value::exec_max(reg_values.iter().map(|v| v.get_value()), |a, b| {
+                    compare_with_program_collation(program, a, b, collation)
+                })?;
+                state.registers[*dest].set_value(result);
             }
             ScalarFunc::Nullif => {
                 let first_value = &state.registers[*start_reg];
