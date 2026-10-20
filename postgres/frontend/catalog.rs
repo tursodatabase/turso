@@ -2150,7 +2150,15 @@ pub(crate) fn register_catalog_modules(mut options: OpenOptions) -> OpenOptions 
     options = options.native_module(
         "pg_collation",
         VTabKind::TableValuedFunction,
-        EmptyPgCatalogTable { create_sql: "CREATE TABLE pg_collation (oid INTEGER, collname TEXT, collnamespace INTEGER, collowner INTEGER, collprovider TEXT, collisdeterministic INTEGER, collencoding INTEGER, collcollate TEXT, collctype TEXT, colliculocale TEXT, collicurules TEXT, collversion TEXT)".to_string() },
+        EmptyPgCatalogTable {
+            create_sql: "CREATE TABLE pg_collation (
+                oid INTEGER, collname TEXT, collnamespace INTEGER, collowner INTEGER,
+                collprovider TEXT, collisdeterministic INTEGER, collencoding INTEGER,
+                collcollate TEXT, collctype TEXT, colliculocale TEXT, collicurules TEXT,
+                collversion TEXT, tableoid INTEGER HIDDEN
+            )"
+            .to_string(),
+        },
     );
     options = options.native_module(
         "pg_description",
