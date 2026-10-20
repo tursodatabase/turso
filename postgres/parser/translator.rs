@@ -1999,11 +1999,13 @@ impl PostgreSQLTranslator {
             });
         }
 
-        Ok(ast::SelectTable::TableCall(
-            ast::QualifiedName::single(ast::Name::from_string(func_name)),
-            args,
-            alias,
-        ))
+        let name = ast::Name::from_string(func_name);
+        let qualified_name = if is_catalog_table_name(func_name) {
+            ast::QualifiedName::fullname(ast::Name::from_string("main"), name)
+        } else {
+            ast::QualifiedName::single(name)
+        };
+        Ok(ast::SelectTable::TableCall(qualified_name, args, alias))
     }
 
     fn translate_join_expr(
@@ -4227,6 +4229,7 @@ pub fn is_catalog_table_name(name: &str) -> bool {
             | "pg_trigger"
             | "pg_policy"
             | "pg_input_error_info"
+            | "pg_options_to_table"
             | "pg_get_tabledef"
             | "pg_settings"
             | "pg_extension"

@@ -377,3 +377,74 @@ expect {
     '   hi'
     'hello'
 }
+
+test pg-options-to-table-values {
+    SELECT option_name, COALESCE(option_value, 'NULL')
+    FROM pg_catalog.pg_options_to_table(ARRAY['a=b=c', 'flag', '', '=x', 'x=', 'é=olá', 'a=again']);
+}
+expect {
+    a|b=c
+    flag|NULL
+    |NULL
+    |x
+    x|
+    é|olá
+    a|again
+}
+
+test pg-options-to-table-empty {
+    SELECT count(*) FROM pg_options_to_table(NULL);
+    SELECT count(*) FROM pg_options_to_table('{}'::text[]);
+}
+expect {
+    0
+    0
+}
+
+test pg-options-to-table-text-array {
+    SELECT option_name, COALESCE(option_value, 'NULL') FROM pg_options_to_table('{"name=hello, world","flag","empty="}'::text[]);
+}
+expect {
+    name|hello, world
+    flag|NULL
+    empty|
+}
+
+test pg-options-to-table-nested {
+    SELECT * FROM pg_options_to_table(ARRAY[['a=b', 'c=d'], ['e=f', 'g=h']]);
+}
+expect {
+    a|b
+    c|d
+    e|f
+    g|h
+}
+
+test pg-options-to-table-null-element {
+    SELECT * FROM pg_options_to_table(ARRAY['a=b', NULL]);
+}
+expect error {
+    null array element not allowed in this context
+}
+
+test pg-options-to-table-correlated {
+    CREATE TABLE option_arrays (id int, options text[]);
+    INSERT INTO option_arrays VALUES (1, ARRAY['b=two', 'a=one']), (2, ARRAY['c=three']), (3, NULL);
+    SELECT id, ARRAY(SELECT option_name || '=' || option_value FROM pg_options_to_table(options) ORDER BY option_name)
+    FROM option_arrays ORDER BY id;
+}
+expect {
+    1|{a=one,b=two}
+    2|{c=three}
+    3|{}
+}
+
+test pg-options-to-table-empty-search-path {
+    SET search_path = '';
+    SELECT option_name, option_value FROM pg_options_to_table(ARRAY['a=b']);
+    SELECT option_name, option_value FROM pg_catalog.pg_options_to_table(ARRAY['c=d']);
+}
+expect {
+    a|b
+    c|d
+}

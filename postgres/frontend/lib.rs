@@ -1,6 +1,7 @@
 mod catalog;
 mod copy;
 mod functions;
+mod options;
 mod session;
 
 pub use session::PgConnection as Connection;
