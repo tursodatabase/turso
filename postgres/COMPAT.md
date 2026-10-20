@@ -63,7 +63,7 @@ Basics not enumerated by the official feature matrix.
 | Dollar-quoted strings, escape strings (`E'...'`), bit/hex string literals | ✅ Supported | |
 | generate_series | ✅ Supported | In FROM and with joins; column aliases on the function (`AS g(x)`) do not resolve |
 | pg_catalog emulation | 🟡 Partial | See Backend section |
-| SET / SHOW | 🟡 Partial | Passed through as PRAGMAs; no PostgreSQL GUCs (e.g. `SHOW search_path` returns nothing) |
+| SET / SHOW | 🟡 Partial | `search_path` is the only PostgreSQL GUC (see Configuration Management); other parameters are passed through as PRAGMAs; `SHOW search_path` returns nothing |
 
 ## Backend
 
@@ -86,6 +86,8 @@ forms), `pg_backend_pid()`, `quote_ident()`, `quote_literal()`;
 `obj_description()`/`col_description()` always return NULL because COMMENT ON
 is not persisted. DML against pg_catalog is rejected. `pg_typeof` is not
 implemented.
+Configuration settings functions: `set_config()` and `current_setting()`
+(including the `missing_ok` form), for `search_path` only.
 
 | Feature | Status | Notes |
 |---------|--------|-------|
@@ -353,7 +355,7 @@ Upgrade is not supported.
 
 | Feature | Status | Notes |
 |---------|--------|-------|
-| SET / SHOW configuration parameters | 🟡 Partial | Passed through as PRAGMAs; PostgreSQL GUCs (search_path, work_mem, ...) are not recognized |
+| SET / SHOW configuration parameters | 🟡 Partial | `search_path` is the only PostgreSQL GUC: `SET search_path` and `set_config()` change it for the connection, and `current_setting()` and `pg_settings` report it; `SHOW search_path` returns nothing; other parameters are passed through as PRAGMAs, and `set_config()` and `current_setting()` reject them |
 | ALTER SYSTEM | ❌ Not supported | |
 | Fractional input for "integer" values | ❌ Not supported | |
 | Include directives for pg_hba.conf and pg_ident.conf | ❌ Not supported | |
