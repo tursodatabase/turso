@@ -3539,7 +3539,7 @@ impl PostgreSQLTranslator {
         group_clause: &[pg_query::protobuf::Node],
         having_clause: &Option<Box<pg_query::protobuf::Node>>,
     ) -> Result<Option<GroupBy>, ParseError> {
-        if group_clause.is_empty() {
+        if group_clause.is_empty() && having_clause.is_none() {
             return Ok(None);
         }
 
