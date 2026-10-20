@@ -3307,3 +3307,63 @@ test alter-table-drop-view-column-rejected {
 expect error {
     cannot drop column from view "v"
 }
+
+# RENAME TO must rewrite the table name inside a partial index WHERE clause.
+# Leaving the old name there stores schema SQL that no longer parses, so the
+# next ALTER on the table fails and the column is not dropped.
+@cross-check-integrity
+test alter-table-rename-table-rewrites-partial-index-where {
+    CREATE TABLE u (a, b, c);
+    INSERT INTO u VALUES (7, 8, 9);
+    CREATE INDEX pa ON u (a) WHERE u.a > 0;
+    ALTER TABLE u RENAME TO uu;
+    ALTER TABLE uu DROP COLUMN b;
+    SELECT * FROM uu;
+    SELECT count(*) FROM uu WHERE uu.a > 0;
+}
+expect {
+    7|9
+    1
+}
+
+test alter-table-rename-table-rewrites-partial-index-where-attached-db {
+    ATTACH ':memory:' AS aux;
+    CREATE TABLE aux.u (a, b, c);
+    INSERT INTO aux.u VALUES (7, 8, 9);
+    CREATE INDEX aux.pa ON u (a) WHERE aux.u.a > 0;
+    ALTER TABLE aux.u RENAME TO uu;
+    ALTER TABLE aux.uu DROP COLUMN b;
+    SELECT * FROM aux.uu;
+    SELECT count(*) FROM aux.uu WHERE aux.uu.a > 0;
+}
+expect {
+    7|9
+    1
+}
+
+test alter-table-rename-table-rewrites-partial-index-where-temp {
+    CREATE TEMP TABLE u (a, b, c);
+    INSERT INTO temp.u VALUES (7, 8, 9);
+    CREATE INDEX temp.pa ON u (a) WHERE temp.u.a > 0;
+    ALTER TABLE temp.u RENAME TO uu;
+    ALTER TABLE temp.uu DROP COLUMN b;
+    SELECT * FROM temp.uu;
+    SELECT count(*) FROM temp.uu WHERE temp.uu.a > 0;
+}
+expect {
+    7|9
+    1
+}
+
+# An index on an unrelated table keeps its stored SQL untouched.
+@cross-check-integrity
+test alter-table-rename-table-keeps-other-tables-index-where {
+    CREATE TABLE u (a, b);
+    CREATE TABLE w (a, b);
+    CREATE INDEX pw ON w (a) WHERE w.a > 0;
+    ALTER TABLE u RENAME TO uu;
+    SELECT sql FROM sqlite_schema WHERE name = 'pw';
+}
+expect {
+    CREATE INDEX pw ON w (a) WHERE w.a > 0
+}
