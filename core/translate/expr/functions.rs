@@ -195,16 +195,11 @@ pub(super) fn translate_sequence_function(
     let (database_id, normalized_name) = if let Some((schema, name)) = seq_name_raw.split_once('.')
     {
         let schema_norm = normalize_ident(schema);
-        let db_id = match schema_norm.as_str() {
-            "main" => crate::MAIN_DB_ID,
-            "temp" => crate::TEMP_DB_ID,
-            _ => resolver
-                .get_attached_database(&schema_norm)
-                .map(|(idx, _)| idx)
-                .ok_or_else(|| {
-                    LimboError::InvalidArgument(format!("no such database: {schema_norm}"))
-                })?,
-        };
+        let db_id = resolver
+            .namespace_database_id(&schema_norm)
+            .ok_or_else(|| {
+                LimboError::InvalidArgument(format!("no such database: {schema_norm}"))
+            })?;
         (db_id, normalize_ident(name))
     } else {
         (crate::MAIN_DB_ID, normalize_ident(&seq_name_raw))

@@ -19,6 +19,7 @@ use crate::types::{WalFrameInfo, WalState};
 #[cfg(feature = "fs")]
 use crate::util::{OpenMode, OpenOptions};
 use crate::vdbe::MvccCommitStateMachine;
+use crate::NamespaceCatalog;
 #[cfg(all(feature = "fs", feature = "conn_raw_api"))]
 use crate::Page;
 use crate::{
@@ -442,6 +443,8 @@ pub struct Connection {
     pub(crate) temp: TempDbContext,
     /// Attached databases
     pub(super) attached_databases: RwLock<DatabaseCatalog>,
+    /// The names of the databases in SQL
+    pub(super) namespaces: Arc<dyn NamespaceCatalog>,
     /// Set before the first temp or attached database is installed and
     /// never cleared, so the statement paths that visit the non-main pagers
     /// can skip the catalog locks while no such pager can exist.
@@ -1523,10 +1526,8 @@ impl Connection {
                     // Resolver so attached-db qualifiers in temp triggers can be
                     // mapped to their actual index on this connection.
                     let attached_resolver = |name: &str| -> Option<usize> {
-                        self.attached_databases
-                            .read()
-                            .get_database_by_name(&crate::util::normalize_ident(name))
-                            .map(|(idx, _)| idx)
+                        self.namespaces
+                            .database_id(&crate::util::normalize_ident(name))
                     };
                     crate::return_if_io!(crate::util::parse_schema_rows(
                         parse,
@@ -2896,10 +2897,8 @@ impl Connection {
             let mut materialized_view_info = HashMap::default();
 
             let attached_resolver = |name: &str| -> Option<usize> {
-                self.attached_databases
-                    .read()
-                    .get_database_by_name(&crate::util::normalize_ident(name))
-                    .map(|(idx, _)| idx)
+                self.namespaces
+                    .database_id(&crate::util::normalize_ident(name))
             };
             for (ty, name, table_name, root_page, sql) in &rows_data {
                 match schema.handle_schema_row(
@@ -2999,11 +2998,10 @@ impl Connection {
     }
 
     pub fn attached_database_names(&self) -> Vec<String> {
-        self.attached_databases
-            .read()
-            .name_to_index
-            .keys()
-            .cloned()
+        self.namespaces
+            .others()
+            .into_iter()
+            .map(|(_, name)| name)
             .collect()
     }
 
@@ -3245,26 +3243,14 @@ impl Connection {
     /// Get the database name for a given database index.
     /// Returns "main" for index 0, "temp" for index 1, and the alias for attached databases.
     pub(crate) fn get_database_name_by_index(&self, index: usize) -> Option<String> {
-        match index {
-            MAIN_DB_ID => Some("main".to_string()),
-            TEMP_DB_ID => Some("temp".to_string()),
-            _ => self.attached_databases.read().get_name_by_index(index),
-        }
+        self.namespaces.name(index)
     }
 
     /// Get the database id for a schema name ("main", "temp", or an attached db alias).
     pub(crate) fn get_database_id_by_name(&self, name: &str) -> Result<usize> {
-        let normalized: String = crate::util::normalize_ident(name);
-        match normalized.as_str() {
-            "main" => Ok(MAIN_DB_ID),
-            "temp" => Ok(TEMP_DB_ID),
-            _ => self
-                .attached_databases
-                .read()
-                .get_database_by_name(&normalized)
-                .map(|(idx, _)| idx)
-                .ok_or_else(|| LimboError::InvalidArgument(format!("no such database: {name}"))),
-        }
+        self.namespaces
+            .database_id(&crate::util::normalize_ident(name))
+            .ok_or_else(|| LimboError::InvalidArgument(format!("no such database: {name}")))
     }
 
     /// Get the Database object for a given database id.
@@ -3287,10 +3273,10 @@ impl Connection {
     }
 
     pub(crate) fn is_attached(&self, alias: &str) -> bool {
-        self.attached_databases
-            .read()
-            .name_to_index
-            .contains_key(alias)
+        self.namespaces
+            .others()
+            .iter()
+            .any(|(_, name)| name == alias)
     }
 
     /// Returns the reserved-space value inherited from the main connection's pager.
@@ -3658,11 +3644,11 @@ impl Connection {
                 }
                 AttachDatabaseState::Publish { alias, db, pager } => {
                     self.has_non_main_pagers.store(true, Ordering::Release);
-                    self.attached_databases.write().insert(
-                        alias.as_str(),
-                        db.clone(),
-                        pager.clone(),
-                    );
+                    let database_id = self
+                        .attached_databases
+                        .write()
+                        .insert(db.clone(), pager.clone());
+                    self.namespaces.add(alias, database_id);
                     self.bump_prepare_context_generation();
                     *state = AttachDatabaseState::Done;
                     return Ok(IOResult::Done(()));
@@ -3693,16 +3679,10 @@ impl Connection {
         // *before* removing the database from the catalog.  mv_store_for_db
         // and get_pager_from_database_index read `attached_databases`, so we
         // must not hold the write lock during the rollback.
-        let database_id = {
-            let attached_dbs = self.attached_databases.read();
-            match attached_dbs.name_to_index.get(alias).copied() {
-                Some(id) => id,
-                None => {
-                    return Err(LimboError::InvalidArgument(format!(
-                        "no such database: {alias}"
-                    )));
-                }
-            }
+        let Some(database_id) = self.namespaces.database_id(alias) else {
+            return Err(LimboError::InvalidArgument(format!(
+                "no such database: {alias}"
+            )));
         };
 
         // Rollback any active transaction on this database before detaching.
@@ -3732,10 +3712,8 @@ impl Connection {
         // Remove from catalog. The write lock must be released before
         // acquiring database_schemas.write() to maintain consistent lock
         // ordering (attached_databases before database_schemas).
-        {
-            let mut attached_dbs = self.attached_databases.write();
-            attached_dbs.remove(alias);
-        }
+        self.namespaces.remove(alias);
+        self.attached_databases.write().remove(database_id);
 
         // Invalidate the cached schema for this database index so that a future
         // ATTACH reusing the same index won't see stale schema entries.
@@ -3747,12 +3725,7 @@ impl Connection {
 
     /// List all attached database aliases
     pub fn list_attached_databases(&self) -> Vec<String> {
-        self.attached_databases
-            .read()
-            .name_to_index
-            .keys()
-            .cloned()
-            .collect()
+        self.attached_database_names()
     }
 
     /// Invoke `f` with a slice of all non-main database (index, pager) pairs
@@ -3845,6 +3818,10 @@ impl Connection {
         &self.attached_databases
     }
 
+    pub(crate) fn namespaces(&self) -> &dyn NamespaceCatalog {
+        self.namespaces.as_ref()
+    }
+
     /// Access schema for a database using a closure pattern to avoid cloning
     pub(crate) fn with_schema<T>(&self, database_id: usize, f: impl FnOnce(&Schema) -> T) -> T {
         match database_id {
@@ -3907,13 +3884,13 @@ impl Connection {
 
         // Add attached databases
         let attached_dbs = self.attached_databases.read();
-        for (alias, &seq_number) in attached_dbs.name_to_index.iter() {
+        for (seq_number, alias) in self.namespaces.others() {
             let file_path = if let Some(entry) = attached_dbs.index_to_data.get(&seq_number) {
                 Self::get_canonical_path_for_database(&entry.db)
             } else {
                 String::new()
             };
-            databases.push((seq_number, alias.clone(), file_path));
+            databases.push((seq_number, alias, file_path));
         }
 
         // Sort by sequence number to ensure consistent ordering
@@ -5602,8 +5579,8 @@ mod tests {
 
     // given a attached 'alias', return the Database and Pager for that attached database
     fn attached_entry(conn: &Connection, alias: &str) -> (Arc<Database>, Arc<Pager>) {
+        let index = conn.namespaces.database_id(alias).unwrap();
         let catalog = conn.attached_databases.read();
-        let index = *catalog.name_to_index.get(alias).unwrap();
         let entry = catalog.index_to_data.get(&index).unwrap();
         (entry.db.clone(), entry.pager.clone())
     }

@@ -1170,7 +1170,7 @@ pub fn translate_create_table(
     let database_id = if temporary {
         crate::TEMP_DB_ID
     } else {
-        resolver.resolve_database_id(&tbl_name)?
+        resolver.resolve_database_id_for_create(&tbl_name)?
     };
     let schema_cookie = resolver.with_schema(database_id, |s| s.schema_version);
     program.begin_write_on_database(database_id, schema_cookie)?;

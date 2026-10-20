@@ -64,7 +64,7 @@ pub fn translate_create_materialized_view(
     if connection.mvcc_enabled() {
         bail_parse_error!("Materialized views are not supported in MVCC mode");
     }
-    let database_id = resolver.resolve_database_id(view_name)?;
+    let database_id = resolver.resolve_database_id_for_create(view_name)?;
     let schema_cookie = resolver.with_schema(database_id, |s| s.schema_version);
     program.begin_write_on_database(database_id, schema_cookie)?;
     let normalized_view_name = normalize_ident(view_name.name.as_str());
@@ -337,7 +337,7 @@ pub fn translate_create_view(
     let database_id = if temporary {
         crate::TEMP_DB_ID
     } else {
-        resolver.resolve_database_id(view_name)?
+        resolver.resolve_database_id_for_create(view_name)?
     };
     let schema_cookie = resolver.with_schema(database_id, |s| s.schema_version);
     program.begin_write_on_database(database_id, schema_cookie)?;

@@ -15797,10 +15797,8 @@ fn op_parse_schema_step(state: &mut ProgramState, conn: &Arc<Connection>) -> Ins
                 let schema = Schema::try_make_mut(&mut inner.schema_arc)?;
                 let syms = conn.syms.read();
                 let attached_resolver = |alias: &str| -> Option<usize> {
-                    conn.attached_databases()
-                        .read()
-                        .get_database_by_name(&crate::util::normalize_ident(alias))
-                        .map(|(idx, _)| idx)
+                    conn.namespaces()
+                        .database_id(&crate::util::normalize_ident(alias))
                 };
                 schema.handle_schema_row(
                     ty,
