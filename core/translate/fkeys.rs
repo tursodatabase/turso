@@ -224,7 +224,7 @@ fn emit_parent_key_change_probes(
             let deferred_fks: Vec<_> = incoming
                 .iter()
                 .copied()
-                .filter(|fk_ref| fk_ref.fk.deferred)
+                .filter(|fk_ref| program.is_fk_deferred(&fk_ref.fk))
                 .cloned()
                 .collect();
             if deferred_fks.is_empty() {
@@ -582,7 +582,7 @@ pub fn build_index_affinity_string(idx: &Index, table: &BTreeTable) -> String {
 pub fn emit_fk_violation(program: &mut ProgramBuilder, fk: &ForeignKey) -> Result<()> {
     program.emit_insn(Insn::FkCounter {
         increment_value: 1,
-        deferred: fk.deferred,
+        deferred: program.is_fk_deferred(fk),
     });
     Ok(())
 }
@@ -907,8 +907,8 @@ fn emit_fk_parent_key_probe(
 ) -> Result<()> {
     let child_tbl = &fk_ref.child_table;
     let child_cols = &fk_ref.fk.child_columns;
-    let is_deferred = fk_ref.fk.deferred;
-    let is_restrict = matches!(fk_ref.fk.on_update, RefAct::Restrict);
+    let is_deferred = program.is_fk_deferred(&fk_ref.fk);
+    let is_restrict = matches!(fk_ref.fk.on_update, RefAct::Restrict) && !is_deferred;
     let skip_probe = program.allocate_label();
     emit_skip_if_any_null(program, parent_key_start, n_cols, skip_probe);
 
@@ -931,7 +931,7 @@ fn emit_fk_parent_key_probe(
             // counter does not know which key originally incremented it.
             (true, ParentProbePass::New) => {
                 let skip = p.allocate_label();
-                emit_guarded_fk_decrement(p, skip, fk_ref.fk.deferred);
+                emit_guarded_fk_decrement(p, skip, p.is_fk_deferred(&fk_ref.fk));
                 p.preassign_label_to_next_insn(skip);
             }
             // Immediate FK on NEW pass: nothing to cancel; do nothing.
@@ -1117,7 +1117,7 @@ pub fn emit_fk_child_update_counters(
         let ncols = fk_ref.fk.child_columns.len();
 
         // Pass 1: OLD tuple handling only for deferred FKs
-        if fk_ref.fk.deferred {
+        if program.is_fk_deferred(&fk_ref.fk) {
             if let Some((dml_ctx, fk_col_positions, null_skip)) =
                 load_old_fk_values(program, &fk_ref.fk.child_columns)?
             {
@@ -1156,7 +1156,7 @@ pub fn emit_fk_child_update_counters(
                     program.preassign_label_to_next_insn(miss);
                     program.emit_insn(Insn::Close { cursor_id: pcur });
                     let skip = program.allocate_label();
-                    emit_guarded_fk_decrement(program, skip, fk_ref.fk.deferred);
+                    emit_guarded_fk_decrement(program, skip, program.is_fk_deferred(&fk_ref.fk));
                     program.preassign_label_to_next_insn(skip);
 
                     program.preassign_label_to_next_insn(join);
@@ -1187,7 +1187,7 @@ pub fn emit_fk_child_update_counters(
                         |_p| Ok(()),
                         |p| {
                             let skip = p.allocate_label();
-                            emit_guarded_fk_decrement(p, skip, fk_ref.fk.deferred);
+                            emit_guarded_fk_decrement(p, skip, p.is_fk_deferred(&fk_ref.fk));
                             p.preassign_label_to_next_insn(skip);
                             Ok(())
                         },
@@ -1389,7 +1389,8 @@ fn emit_fk_delete_parent_existence_check_single(
         .name
         .eq_ignore_ascii_case(parent_table_name);
 
-    let is_restrict = matches!(fk_ref.fk.on_delete, RefAct::Restrict);
+    let is_restrict =
+        matches!(fk_ref.fk.on_delete, RefAct::Restrict) && !program.is_fk_deferred(&fk_ref.fk);
 
     // Build parent key in FK's parent-column order
     let parent_cols: &[String] = &fk_ref.parent_cols;
@@ -1744,6 +1745,7 @@ fn emit_fk_action_subprogram(
             program.capture_data_changes_info().clone(),
             FK_SUBPROGRAM_OPTS,
         );
+        subprogram_builder.set_defer_foreign_keys(connection.defer_foreign_keys());
         let entry = compile_stack.push(foreign_key, parent_change);
         subprogram_builder.prologue();
         translate_inner(
@@ -2143,7 +2145,7 @@ impl ForeignKeyActions<PreparedFkDeleteAction> {
                     // For REPLACE-style updates with immediate NO ACTION: skip the
                     // check when the replacement row restores the same parent key,
                     // since the implicit delete cannot orphan any children.
-                    if !fk_ref.fk.deferred {
+                    if !program.is_fk_deferred(&fk_ref.fk) {
                         if let Some((replace_values_start, replace_rowid_reg)) =
                             replace_new_parent_regs
                         {
@@ -2602,7 +2604,7 @@ pub fn emit_fk_drop_table_check(
         // If we reach here, all FK columns match: increment violation counter
         program.emit_insn(Insn::FkCounter {
             increment_value: 1,
-            deferred: false,
+            deferred: program.is_fk_deferred(&fk_ref.fk),
         });
 
         program.preassign_label_to_next_insn(child_next);
@@ -2633,7 +2635,7 @@ pub fn emit_fk_drop_table_check(
     });
 
     // Only check for violations if there are RESTRICT/NO ACTION FKs
-    if !check_fk_refs.is_empty() {
+    if !check_fk_refs.is_empty() && !program.defer_foreign_keys_enabled() {
         // FkIfZero: if counter == 0, skip the halt
         let no_violations = program.allocate_label();
         program.emit_insn(Insn::FkIfZero {

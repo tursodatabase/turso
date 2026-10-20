@@ -200,6 +200,10 @@ pub fn pragma_for(pragma: &PragmaName) -> Pragma {
             PragmaFlags::NoColumns1 | PragmaFlags::Result0,
             &["foreign_keys"],
         ),
+        DeferForeignKeys => Pragma::new(
+            PragmaFlags::NoColumns1 | PragmaFlags::Result0,
+            &["defer_foreign_keys"],
+        ),
         ForeignKeyList => Pragma::new(
             PragmaFlags::NeedSchema | PragmaFlags::Result1 | PragmaFlags::SchemaOpt,
             &[

@@ -531,6 +531,8 @@ pub struct Connection {
     pub(super) is_mvcc_bootstrap_connection: AtomicBool,
     /// Whether pragma foreign_keys=ON for this connection
     pub(super) fk_pragma: AtomicBool,
+    /// Whether immediate FK checks should be delayed until transaction end.
+    pub(super) defer_foreign_keys_pragma: AtomicBool,
     pub(crate) fk_deferred_violations: AtomicIsize,
     /// Number of active top-level write statements on this connection.
     ///
@@ -1957,6 +1959,19 @@ impl Connection {
 
     pub fn foreign_keys_enabled(&self) -> bool {
         self.fk_pragma.load(Ordering::Acquire)
+    }
+
+    pub fn set_defer_foreign_keys(&self, enable: bool) {
+        self.defer_foreign_keys_pragma
+            .store(enable, Ordering::Release);
+        if !enable {
+            self.clear_deferred_foreign_key_violations();
+        }
+        self.bump_prepare_context_generation();
+    }
+
+    pub fn defer_foreign_keys(&self) -> bool {
+        self.defer_foreign_keys_pragma.load(Ordering::Acquire)
     }
 
     pub fn set_check_constraints_ignored(&self, ignore: bool) {
