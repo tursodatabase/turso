@@ -813,6 +813,7 @@ impl Limbo {
             }
             Ok(cmd) => match cmd.command {
                 Command::Exit(args) => {
+                    let _ = self.close_conn();
                     self.save_history();
                     std::process::exit(args.code);
                 }
