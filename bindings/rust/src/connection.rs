@@ -127,7 +127,7 @@ impl Connection {
         stmt.query(params).await
     }
 
-    /// Execute SQL statement on the database.
+    /// Execute SQL statement on the database. Rows returned by the statement are discarded.
     pub async fn execute(&self, sql: impl AsRef<str>, params: impl IntoParams) -> Result<u64> {
         self.maybe_handle_dangling_tx().await?;
         let mut stmt = self.prepare(sql).await?;
