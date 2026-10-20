@@ -215,15 +215,6 @@ CREATE TABLE products (
 ) STRICT;
 ```
 
-A type that reads stored values back unchanged (no DECODE, or `DECODE value`) is compared as its base type, and a CAST is not necessary. For example, `smallint` and `bigint` compare directly with integer literals and `INTEGER` columns:
-
-```sql
-CREATE TABLE counters (
-    n smallint CHECK(n >= 0 AND n <= 2),
-    total bigint CHECK(total >= n)
-) STRICT;
-```
-
 ## Inspecting Types
 
 ### PRAGMA list_types

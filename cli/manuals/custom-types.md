@@ -337,13 +337,6 @@ CREATE TABLE t1(amount cents CHECK(amount < 50)) STRICT;
 CREATE TABLE t1(amount cents CHECK(amount < CAST(50 AS cents))) STRICT;
 ```
 
-A type that reads stored values back unchanged (no DECODE, or `DECODE value`) is compared as its base type, so CAST is not necessary:
-
-```sql
--- OK: smallint and bigint compare as INTEGER
-CREATE TABLE t1(a smallint, b bigint, CHECK(a >= 0 AND a < b)) STRICT;
-```
-
 This rule applies to all comparisons in STRICT tables, not just custom types:
 
 ```sql
