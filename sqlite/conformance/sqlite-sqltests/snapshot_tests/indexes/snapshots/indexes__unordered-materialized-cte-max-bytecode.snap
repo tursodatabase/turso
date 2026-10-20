@@ -31,7 +31,7 @@ addr  opcode          p1  p2  p3  p4           p5  comment
    8    Insert         0   3   4                4  intkey=r[4] data=r[3]
    9  Next             1   4   0                1
   10  Null             0   6   0                0  r[6]=NULL
-  11  Rewind           0  16   0                0  Rewind  ephemeral()
+  11  Rewind           0  16   0                0  Rewind table ephemeral()
   12    Column         0   0   1                0  r[1]=ephemeral().price
   13    Copy           1   7   0                0  r[7]=r[1]
   14    AggStep        0   7   6  max(Binary)   0  accum=r[6] step(r[7])

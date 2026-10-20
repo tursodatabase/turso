@@ -27,7 +27,7 @@ addr  opcode       p1  p2  p3  p4                                               
   12  ParseSchema   0   0   0  tbl_name = 'sqlite_stat1' AND type != 'trigger'   0  tbl_name = 'sqlite_stat1' AND type != 'trigger'
   13  SetCookie     0   1  10                                                    0
   14  OpenWrite     1   2   0                                                    0  root=2; iDb=0
-  15  Rewind        1  24   0                                                    0  Rewind  sqlite_stat1
+  15  Rewind        1  24   0                                                    0  Rewind table sqlite_stat1
   16      Column    1   0  10                                                    0  r[10]=sqlite_stat1.tbl
   17      Ne       10  11  23                                                    0  if r[10]!=r[11] goto 23
   18      Column    1   1  12                                                    0  r[12]=sqlite_stat1.idx
@@ -36,11 +36,11 @@ addr  opcode       p1  p2  p3  p4                                               
   21      Delete    1   0   0  sqlite_stat1                                      0
   22    Next        1  16   0                                                    0
   23  Next          1  16   0                                                    0
-  24  OpenRead      2   2   0  k(6,B,B,B,B,B,B)                                  0  =products, root=2, iDb=0
-  25  OpenRead      3   3   0  k(2,B)                                            0  =idx_products_sku, root=3, iDb=0
+  24  OpenRead      2   2   0  k(6,B,B,B,B,B,B)                                  0  table=products, root=2, iDb=0
+  25  OpenRead      3   3   0  k(2,B)                                            0  index=idx_products_sku, root=3, iDb=0
   26  Integer       1  17   0                                                    0  r[17]=1
   27  Function      0  17  16  stat_init                                         0  r[16]=func(r[17])
-  28  Rewind        3  45   0                                                    0  Rewind  idx_products_sku
+  28  Rewind        3  45   0                                                    0  Rewind index idx_products_sku
   29  Integer       0  17   0                                                    0  r[17]=0
   30  Goto          0  36   0                                                    0
   31    Integer     0  17   0                                                    0  r[17]=0

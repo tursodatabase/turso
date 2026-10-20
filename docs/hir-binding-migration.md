@@ -121,8 +121,9 @@ Internal or already-normalized parser nodes are not new SQL coverage:
 Setting `TURSO_EXPERIMENTAL_HIR` (any value) when a connection opens, or
 calling `Connection::set_experimental_hir(true)`, prepares top-level SELECT
 statements through HIR: the owned semantic catalog, `analyze_root`,
-`HirPlan::build`, and HIR lowering. Nested engine statements still use the
-legacy path. There is no fallback: a SELECT that HIR cannot lower fails to
+`HirPlan::build`, and HIR lowering. Statements the engine prepares inside
+another one, such as the copy statements of VACUUM, take the same path; like
+legacy, they may write internal tables. There is no fallback: a SELECT that HIR cannot lower fails to
 prepare, so running the test suites with the variable set lists the remaining
 gaps. Top-level DELETE, UPDATE and INSERT also go through HIR, except the
 cases listed under "DML through HIR", which still go to legacy. The variable and the legacy path
@@ -150,13 +151,18 @@ subquery emits the same shell when its loop opens.
 `scripts/hir-conformance.sh` runs every `.sqltest` file with the switch on,
 one process per file, and groups failures by cause. The first run on
 2026-10-14 passed 13602 conformance tests and failed 568. On 2026-10-16 a run
-failed 29, with every file running to the end; legacy passes all of them.
-What is left:
-
-| Gap | Failing tests | Example |
-|---|---|---|
-| EXPLAIN QUERY PLAN and bytecode shape where the plans differ (see below) | 28 | `explain-query-plan-json`, `unnest-correlated` |
-| Legacy's expected rows are wrong; HIR matches SQLite | 1 | `full-outer-with-where-equijoin` |
+failed 29, with every file running to the end; legacy passes all of them. On
+2026-10-19 every test passes. The script passes `--normalize-plans` to the
+runner, which compares EXPLAIN QUERY PLAN rows (text and `FORMAT=JSON`, in
+tests whose SQL says `EXPLAIN QUERY PLAN`) with the ids of generated names
+(`ephemeral_t_t3`, `SUBQUERY 2`) replaced, each parent's `SUBQUERY` rows
+moved after its other rows, and the row ids renumbered in that order. Those
+are the parts that differ between the two planners when they choose the
+same plan: legacy numbers rows by instruction address and lists an
+uncorrelated subquery before the loops, HIR after them. A different loop,
+index, or join method still fails. Expectations written as `expect pattern`
+in `unnest-correlated` leave the cursor and register numbers open for the
+same reason.
 
 Fixed since the 2026-10-15 run, each following SQLite:
 
@@ -206,15 +212,23 @@ HIR keeps legacy's FULL JOIN errors for shapes legacy has no hash plan for
 subqueries next to FULL JOIN. HIR matches SQLite where legacy does not:
 `a, b FULL JOIN c ... WHERE ...` (legacy returns extra rows), RIGHT JOIN
 followed by another join (legacy returns columns in the wrong order), and
-`outer_hash_join: full-outer-with-where-equijoin` (legacy ignores a WHERE term
-that repeats the ON term). Both still reject a RIGHT JOIN after another join,
-during analysis.
+Both still reject a RIGHT JOIN after another join, during analysis. An outer
+hash join takes its keys from its own ON terms only, in both engines: a WHERE
+term used as a key was never checked on the rows the join NULL-fills, so
+`t FULL JOIN u ON t.x = u.x WHERE t.x = u.x` returned those rows too.
 
 EXPLAIN QUERY PLAN names each loop of a block before any cursor opens, as
-legacy does, so simple plans print the same rows with the same ids. Plans
-still differ where the bytecode differs: legacy runs uncorrelated subqueries
-before the loops, turns EXISTS into semi-joins, and uses coroutines and hash
-joins, which HIR does not.
+legacy does, so simple plans print the same rows with the same ids. HIR
+prints the rows legacy prints for a distinct aggregate (`USE HASH TABLE FOR
+count(DISTINCT)`), a correlated IN probe (`CORRELATED LIST SUBQUERY`, with
+the subquery's loops under it), and a compound query's ORDER BY (next to
+`COMPOUND QUERY`, not under it). A CTE read by several loops, or hinted
+MATERIALIZED, is filled before the block's loops open, as legacy fills it:
+its body rows stand on their own, `FORMAT=JSON` lists them under
+`cte_materializations`, every reader reports `materialized_reuse`, and the
+reader that filled the table reads it through the same cursor while the
+others open a second cursor on it. Row ids still differ where the bytecode
+differs (see `--normalize-plans` above).
 
 Like legacy, a LEFT JOIN outside parentheses whose NULL row a WHERE term
 rejects (a comparison or arithmetic on one of its columns, but not IS,
@@ -228,9 +242,155 @@ instead read through one seek per branch of a WHERE OR term (`v = 5 OR w =
 rowid and together they cost less than the scan. The branches add the rowids
 they find to a row set, and the loop reads each of those rows once. Unlike
 legacy, this is decided after the join order, not while choosing it, so it
-may pick a different table of a join than legacy does; the OR term stays in
-WHERE and is checked again on each row. It is used only in SELECT, not yet
-in DELETE or UPDATE loops, and never on the right side of an outer join.
+may pick a different table of a join than legacy does. When every condition
+of every branch is applied by that branch's seek, the OR term is dropped from
+WHERE, as legacy drops it, so a subquery in it fills its list once; otherwise
+it stays in WHERE and is checked again on each row (HIR has no per-branch
+filters like legacy's). It is never used on the right side of an outer
+join. A DELETE or UPDATE whose loop reads rows this way first collects their
+rowids, as legacy does, since the row set gives them in rowid order through
+a cursor the statement is about to write through.
+
+Like legacy's `optimizer/unnest.rs`, `semantic_unnest.rs` turns correlated
+subqueries into joins before planning. It rewrites HIR into HIR: the
+subquery's source keeps its identity and moves into the outer block's FROM
+clause, so no reference changes, and the empty subquery is left detached
+(`Query::is_detached`). For each block, innermost queries first, it plans the
+document with and without the rewrite and keeps the rewrite when the block's
+query costs no more, counting each remaining subquery's cost for the times it
+runs plus `cpu_cost_per_seek` per call, as legacy's `estimated_cost` does.
+With legacy's checks:
+
+- `EXISTS` and a whole-term `IN` become a semi-join and `NOT EXISTS` an
+  anti-join (`JoinKind::Semi`/`Anti`) when the subquery reads one source,
+  only filters it, and links to the outer row by `=` terms; their loops come
+  last and stop at the first match, as legacy's do. The subquery may read
+  a table-valued function, whose arguments become its terms. A link to a
+  source a LEFT JOIN (its right side) or RIGHT JOIN (its left side) fills
+  with NULL keeps the subquery; FULL JOIN sides do not, and a block with a
+  FULL join whose correlated subqueries all became joins always keeps that
+  form, as legacy does. The SELECT list of an EXISTS is never run, so an
+  uncorrelated subquery in it is dropped, and its parameters are still
+  counted for binding (`HirPlan::dropped_parameters`). Because HIR keeps a
+  RIGHT JOIN in its written order where legacy turns it into a LEFT JOIN,
+  the costs of the two forms, and so the choice, can differ there.
+- A block with a FULL join gets no aggregate rewrite, as in legacy.
+- A one-value aggregate subquery becomes a FROM subquery grouped by its link
+  columns and LEFT JOINed on them (group-first). When computing a key no
+  outer row asks for could fail (`sum`, string aggregates, any function), a
+  direct WHERE comparison instead LEFT JOINs the inner table and groups by
+  the outer rowid (join-first). A copy of a rewritten subquery in the same
+  clause reads the same grouped table, as legacy's `same_query` does.
+
+What stays a subquery still runs fast:
+
+- A correlated subquery that only asks whether rows match (IN, EXISTS, or an
+  order-insensitive aggregate) in a SELECT statement is planned for one run
+  per outer row, so it builds an automatic index once and seeks it each run.
+- A correlated `x IN (SELECT y ...)` that is a whole WHERE term runs like
+  `EXISTS (SELECT ... AND x = y)`: the planner adds `x = y` to the
+  subquery's WHERE terms, so it stops at the first match and can seek `y`.
+  It is not used when an expression of the subquery or `x` can fail, since
+  the probe stops early.
+- A correlated ungrouped aggregate in a SELECT statement caches its result
+  in an ephemeral index keyed by the outer values it reads (each with its
+  `typeof()`), so each key is computed once. Legacy has no such cache. It
+  is not used when the subquery reads an outer aggregate, calls a function
+  that is not deterministic, or reads a virtual table.
+- When every ORDER BY term is a GROUP BY key with the same collation, the
+  group sorter orders its keys that way, and no second sorter runs for
+  ORDER BY.
+- Grouped rows keep only the columns read after grouping: the keys, the
+  aggregate arguments, and columns that outputs, HAVING, ORDER BY or windows
+  read outside a key.
+- A correlated subquery opens its cursors once, under `Once`, instead of on
+  every run.
+- Like legacy (`join_lhs_and_rhs`, `try_hash_join_access_method`), the join
+  search may hash-join a table with the one joined before it: that table is
+  built into a hash table, keyed by the `=` terms between the two, and the
+  new table is scanned and probes it, when that costs less than its best
+  nested-loop access, with legacy's eligibility rules (no index on a join
+  column, no index hint, no USING, no table a correlated subquery reads, no
+  probe-to-build chaining). In loop order the probe comes first and the
+  build table's loop looks rows up; EXPLAIN shows `HASH JOIN <probe>` then
+  the build table, as legacy does. A LEFT or FULL join builds from its left
+  table, records the build rows its ON terms match, and after the loops
+  runs the other build rows with the right side NULL, like HIR's RIGHT
+  JOIN; a FULL join also NULL-fills the build row for a probe row without a
+  match, and must hash when it can. A hash table that outgrows its budget
+  moves rows to disk; lookups that need them wait, and after the probe loop
+  ends they run again by its rowid, so both tables must be rowid tables
+  without custom types. The hash table is built once per statement from
+  every row of its table, so, as in legacy, subqueries hash too, and the
+  probe loop may run under earlier loops: each pass joins only its own
+  waiting rows and keeps the in-memory part of the table for the next pass
+  (the VDBE used to free it and keep the waiting rows of earlier passes,
+  which gave legacy wrong rows too). A LEFT hash join under earlier loops
+  starts each pass with no build row matched and ends it with its own
+  unmatched build rows. A FULL hash join stays the block's first loop: the
+  probe rows it adds must come out once, which legacy gets wrong. A block
+  with another RIGHT or FULL join does not hash. The build keys need no
+  Bloom filter.
+- Legacy's materialized build input (`HirHashBuildInput`): when the build
+  table was the probe of an earlier hash join, or has a term with an
+  earlier table that the hash keys do not cover, the loops before the
+  probe run once into a temporary table that the hash table is built from,
+  with legacy's cost and its check after the join search. Each hash row
+  carries the columns the query reads of every table those loops supply,
+  so the block's loops are the probe scan and the lookup, and the query
+  reads those tables from the hash row (`SourceBinding::Registers`),
+  including GROUP BY keys, bare aggregate columns and a later loop's seek.
+  EXPLAIN lists the loops that fill it under `MATERIALIZE hash build input
+  for <table>`; legacy then lists those tables once more after the loops,
+  which HIR does not (they are not read again), and nests a chain's
+  inputs inside each other where legacy lists them one after another.
+  The loops that fill it run their own LEFT JOINs, and a LEFT JOIN probe
+  over such a hash table gets its unmatched build rows from the temporary
+  table, keyed by its rowids. Unlike legacy, HIR does not materialize in a
+  block that reads an outer row: legacy fills the input once and reuses
+  it for every outer row, which returns wrong rows.
+
+These planning rules are ports of legacy's, sharing its cost formulas and
+order checks where the code allows:
+
+- A grouped block aims for its GROUP BY order even with an ORDER BY
+  (`compute_order_target`), so an index on the keys replaces the GROUP BY
+  sorter; when every ORDER BY term is a key, the keys in ORDER BY order and
+  directions replace both sorters.
+- `x IS NULL` (and `x ISNULL`) seeks an index on x, with `IS`'s outer-join
+  rule.
+- Like legacy's multi-index OR, the join search weighs reading a table as
+  one seek per branch of an OR term against its best other access, with
+  the WHERE work each leaves on both sides, and a branch whose leftover
+  condition runs a subquery keeps the table scanned.
+- A FROM subquery or CTE that earlier loops constrain is stored once and read
+  through a temporary index on those columns when that costs less
+  (`find_best_access_method_for_subquery`), except when it reads an outer row
+  or is the right side of a RIGHT or FULL JOIN. HIR builds the index from the
+  stored table, so setup costs two passes. A correlated subquery counts the
+  rows of an outer FROM subquery or CTE as its number of runs.
+- A scanned FROM subquery or CTE returns its rows in the order of its ORDER
+  BY, its GROUP BY keys, or the one subquery it passes through
+  (`subquery_intrinsic_order_consumed`), so an outer ORDER BY in that order
+  needs no sort; a CTE stored once is read backwards for the opposite order.
+  Not ported: the order of a plain table scan inside the subquery, and using
+  a temporary index's order.
+- A block with windows aims for the innermost window's PARTITION BY and
+  ORDER BY order, like legacy's window source subquery, so an index or an
+  ordered CTE replaces that window's sorter. EXPLAIN shows `USE SORTER FOR
+  ORDER BY` for each window that sorts its input, innermost first, as
+  legacy shows each source subquery's sort; legacy's `SCAN
+  window_subquery_N` rows, which name those subqueries, have no HIR
+  counterpart.
+- A LEFT JOIN keeps the order of the loops before it for ORDER BY terms that
+  do not read its own columns (`plan_satisfies_order_target`).
+- When join orders cost the same, the FROM-order plan wins, and other plans
+  replace it only when strictly cheaper, in legacy's map order.
+
+Three queries where legacy returns wrong rows return SQLite's rows in HIR
+(see `hir_correlated_in_probe_and_cached_aggregates_match_sqlite`): an IN
+whose subquery joins two tables, and grouped tables for a subquery that reads
+an outer aggregate or joins two tables.
 
 Like legacy, a FROM subquery, a single-reference CTE and a recursive CTE run
 as coroutines, so the outer loop pulls rows on demand and an outer LIMIT can
@@ -257,8 +417,17 @@ OFFSET). In an inner join without parentheses or GROUP BY, a table whose
 WHERE term matches a pattern without ORDER BY or LIMIT is read first,
 through the index; the other tables are planned after it, treating its
 columns as known values, so join terms can seek them. Legacy weighs this
-against other join orders; HIR always takes it. Not done yet: index methods
-for DELETE and UPDATE scans.
+against other join orders; HIR always takes it. A DELETE or UPDATE whose
+WHERE term matches a pattern without ORDER BY or LIMIT reads its target
+through the index too, and like legacy collects the rowids first, since the
+index may stream its rows lazily. Legacy writes rows while scanning an index
+method whose results are stored before the scan starts (the toy vector
+index); HIR collects their rowids first as well. Like legacy, `x MATCH
+'pattern'` in a WHERE or ON term stands for `fts_match`, so `x` must be a
+column, or the first of a row of columns, of a table with an FTS index;
+any other MATCH term fails with legacy's "unable to use function MATCH in
+the requested context". A MATCH outside those terms, such as in a result
+column, runs as the function in both engines.
 
 ### DML through HIR
 
@@ -295,8 +464,8 @@ statement in autocommit mode then writes one COMMIT row. Where legacy is
 wrong, HIR is not: legacy also writes a COMMIT row from each trigger and
 foreign-key action it runs, files a moved row's new image under `before`,
 and gives UPSERT DO UPDATE the new row as its before image. The `ALTER
-TABLE` rewrite of `sqlite_schema`, which records its own statement, still
-goes to legacy.
+TABLE` rewrite of `sqlite_schema` records the ALTER statement as the new
+`sql` value, as legacy does.
 
 Writes to a virtual table record no change data. Legacy records none
 either, but writes a COMMIT row after each UPDATE and DELETE of one.
@@ -564,6 +733,24 @@ small bytecode helpers it shares with legacy (foreign-key probes, UNIQUE
 error text, statement journal flags) are copied into
 `semantic_lowering/emit.rs`. It still shares plain types with HIR SELECT
 lowering, such as `ConditionMetadata` and `QueryDestination`.
+
+### Schema statements through HIR
+
+Schema statements still go through legacy's translators, but the parts that
+read or write table rows use HIR:
+
+- The UPDATE of `sqlite_schema` that ALTER TABLE generates is lowered from
+  HIR, writing the new CREATE statement into the `sql` column.
+- The SELECT of `CREATE TABLE ... AS SELECT` is planned through HIR
+  (`PlannedSelect`) and runs as a coroutine. Column names follow the alias
+  rules (a plain column read keeps its own name), and types come from each
+  output's affinity.
+- CREATE INDEX and REINDEX fill the index from `SELECT <index columns>,
+  rowid FROM <table> NOT INDEXED [WHERE <partial condition>]`, planned
+  through HIR. NOT INDEXED keeps REINDEX reading the table, not an index it
+  rebuilds. Legacy still fills the index when the table has a custom type or
+  array column (the SELECT would decode the stored value), or when real
+  columns take all of `rowid`, `_rowid_` and `oid`.
 
 ### Non-lowering phase complete
 
@@ -1281,7 +1468,16 @@ collations, custom comparators, and final calls use semantic HIR facts. HIR and
 legacy paths share one aggregate-step opcode switch, so this adds no second
 copy of function behavior. Bare columns and rowid reads capture only values
 needed after the scan, preserving SQLite first-row and empty-input behavior
-without forcing unused columns into covering-index plans. Ordered-set
+without forcing unused columns into covering-index plans. As in SQLite, and
+unlike legacy, a query with exactly one min() or max() aggregate, grouped or
+not, takes its bare columns from a row holding the aggregate's value: the
+first row, then each row whose value changes the aggregate. Also unlike
+legacy, which rejects it, an aggregate's arguments may have an ORDER BY, as
+in SQLite: `group_concat(a ORDER BY b)` keeps each row's ORDER BY values, a
+sequence number and its arguments in an ephemeral index, and steps through
+it in order when it is finalized, per group in a grouped query. Tied rows
+keep their order, and DISTINCT keeps the first of equal arguments in that
+order. A window call still rejects it, with legacy's error. Ordered-set
 percentile aggregates evaluate their direct fraction once before opening the
 input scan, reject local-row and subquery dependencies with the legacy error,
 and reuse the same range-check and aggregate-step opcode helpers as legacy

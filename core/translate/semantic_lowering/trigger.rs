@@ -249,6 +249,7 @@ fn compile_trigger(
                     subprograms,
                     mvcc,
                     !connection.check_constraints_ignored(),
+                    None,
                 )?;
                 builder.emit_insn(Insn::ResetCount);
             }

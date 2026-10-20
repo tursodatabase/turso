@@ -30,10 +30,9 @@ const SETUP: &[&str] = &[
 
 type Rows = Vec<Vec<rusqlite::types::Value>>;
 
-/// Run `statements` on a fresh database with HIR on or off, then return
-/// what each one returned or its error, every row left in the tables, and
-/// the integrity check.
-fn run(hir: bool, statements: &[&str]) -> Vec<Result<Rows, String>> {
+/// A fresh database with the test tables, and a connection to it that
+/// prepares statements through HIR or legacy.
+fn connect(hir: bool) -> (TempDatabase, std::sync::Arc<turso_core::Connection>) {
     let db = TempDatabase::builder()
         .with_opts(turso_core::DatabaseOpts::new().with_generated_columns(true))
         .build();
@@ -42,6 +41,26 @@ fn run(hir: bool, statements: &[&str]) -> Vec<Result<Rows, String>> {
         conn.execute(statement).unwrap();
     }
     conn.set_experimental_hir(hir);
+    (db, conn)
+}
+
+/// The EXPLAIN QUERY PLAN rows of `sql`, without their ids.
+fn query_plan(hir: bool, sql: &str) -> Vec<String> {
+    let (_db, conn) = connect(hir);
+    limbo_exec_rows(&conn, &format!("EXPLAIN QUERY PLAN {sql}"))
+        .into_iter()
+        .map(|row| match row.last() {
+            Some(rusqlite::types::Value::Text(detail)) => detail.clone(),
+            other => panic!("EXPLAIN QUERY PLAN detail is not text: {other:?}"),
+        })
+        .collect()
+}
+
+/// Run `statements` on a fresh database with HIR on or off, then return
+/// what each one returned or its error, every row left in the tables, and
+/// the integrity check.
+fn run(hir: bool, statements: &[&str]) -> Vec<Result<Rows, String>> {
+    let (db, conn) = connect(hir);
     let mut results = Vec::new();
     for statement in statements {
         results.push(limbo_exec_rows_fallible(&db, &conn, statement).map_err(|e| e.to_string()));
@@ -2101,4 +2120,384 @@ fn hir_inserts_into_without_rowid_tables() {
             "[Integer(1), Text(\"y\")]",
         ]
     );
+}
+
+/// ALTER TABLE rewrites its schema row with a generated UPDATE of
+/// sqlite_schema. With HIR on, HIR lowers that UPDATE, and change data
+/// capture still records the ALTER statement as the new `sql` value, so the
+/// schema, the rows and the captured changes match legacy.
+#[test]
+fn hir_alter_table_schema_updates_match_legacy() {
+    let statements = [
+        "PRAGMA capture_data_changes_conn('full')",
+        "CREATE TABLE w(a INTEGER PRIMARY KEY, b TEXT, c INT)",
+        "INSERT INTO w VALUES (1, 'x', 10), (2, 'y', 20)",
+        "CREATE INDEX w_b ON w(b)",
+        "ALTER TABLE w ADD COLUMN d TEXT DEFAULT 'z'",
+        "ALTER TABLE w RENAME COLUMN b TO bb",
+        "ALTER TABLE w DROP COLUMN c",
+        "ALTER TABLE w RENAME TO w2",
+        "SELECT * FROM w2 ORDER BY a",
+        "SELECT type, name, tbl_name, sql FROM sqlite_schema ORDER BY name",
+        "SELECT change_type, table_name, id, \
+         bin_record_json_object(table_columns_json_array('sqlite_schema'), updates) \
+         FROM turso_cdc WHERE table_name = 'sqlite_schema' ORDER BY change_id",
+    ];
+    assert_eq!(run(true, &statements), run(false, &statements));
+
+    let program = |hir: bool| {
+        let db = TempDatabase::new_empty();
+        let conn = db.connect_limbo();
+        conn.execute("PRAGMA capture_data_changes_conn('full')")
+            .unwrap();
+        conn.execute("CREATE TABLE w(a, b, c)").unwrap();
+        conn.set_experimental_hir(hir);
+        limbo_exec_rows(&conn, "EXPLAIN ALTER TABLE w DROP COLUMN b")
+    };
+    assert_ne!(
+        program(true),
+        program(false),
+        "HIR lowers the schema-row UPDATE itself"
+    );
+}
+
+/// CREATE TABLE ... AS SELECT plans its SELECT through HIR when HIR is on:
+/// the new table's column names and types come from HIR's outputs, and its
+/// rows from HIR's SELECT, matching legacy.
+#[test]
+fn hir_create_table_as_select_matches_legacy() {
+    let statements = [
+        "CREATE TABLE s(a INTEGER PRIMARY KEY, b TEXT, c REAL, d, e NUMERIC, f BLOB)",
+        "INSERT INTO s VALUES (1, 'x', 1.5, NULL, 10, x'01'), (2, 'y', 2.5, 'q', 20, NULL), \
+         (3, NULL, NULL, 3, 30, x'02')",
+        "CREATE TABLE c1 AS SELECT * FROM s",
+        "CREATE TABLE c2 AS SELECT a, b AS bee, c * 2, 1, 'lit', a + 1, a || b, \
+         count(*) OVER () FROM s",
+        "CREATE TABLE c3 AS SELECT b, count(*), sum(c), max(a) FROM s GROUP BY b ORDER BY b",
+        "CREATE TABLE c4 AS SELECT a, a, b AS a FROM s",
+        "CREATE TABLE c5 AS SELECT x.a, y.b FROM s x JOIN s y ON y.a = x.a + 1",
+        "CREATE TABLE c6 AS SELECT a FROM s UNION SELECT c FROM s ORDER BY 1",
+        "CREATE TABLE c7 AS WITH w AS (SELECT a, e FROM s WHERE a > 1) SELECT * FROM w",
+        "CREATE TABLE c8 AS SELECT CAST(a AS TEXT) AS t, (SELECT max(c) FROM s) AS m, e FROM s",
+        "CREATE TABLE c9 AS SELECT * FROM s WHERE 0",
+        "CREATE TABLE c10 AS VALUES (1, 'a'), (2, 'b')",
+        "SELECT name, sql FROM sqlite_schema WHERE name LIKE 'c%' ORDER BY name",
+        "SELECT * FROM c2 ORDER BY a",
+        "SELECT * FROM c3 ORDER BY b",
+        "SELECT * FROM c4 ORDER BY 1",
+        "SELECT * FROM c5 ORDER BY 1",
+        "SELECT * FROM c6 ORDER BY 1",
+        "SELECT * FROM c8 ORDER BY 1",
+        "SELECT * FROM c10 ORDER BY 1",
+        "SELECT typeof(a), typeof(b), typeof(e) FROM c1 ORDER BY a",
+    ];
+    assert_eq!(run(true, &statements), run(false, &statements));
+
+    let program = |hir: bool| {
+        let db = TempDatabase::new_empty();
+        let conn = db.connect_limbo();
+        conn.execute("CREATE TABLE s(a, b)").unwrap();
+        conn.set_experimental_hir(hir);
+        limbo_exec_rows(
+            &conn,
+            "EXPLAIN CREATE TABLE c AS SELECT a, count(*) FROM s GROUP BY a",
+        )
+    };
+    assert_ne!(program(true), program(false), "HIR plans the SELECT itself");
+}
+
+/// CREATE INDEX and REINDEX fill the index from a SELECT planned through
+/// HIR: plain, expression, partial and generated-column indexes, collations,
+/// a table whose `rowid` name is taken, and a UNIQUE index that fails.
+#[test]
+fn hir_create_index_and_reindex_fill_the_index_like_legacy() {
+    let statements = [
+        "CREATE TABLE x(id INTEGER PRIMARY KEY, a TEXT, b INT, c REAL, v INT AS (a || '') VIRTUAL)",
+        "INSERT INTO x(id, a, b, c) VALUES (1, 'B', 3, 1.5), (2, 'a', 1, NULL), (3, NULL, 2, 2.5), \
+         (4, '12', NULL, 0), (5, 'A', 5, 9)",
+        "CREATE INDEX x1 ON x(a COLLATE NOCASE)",
+        "CREATE INDEX x2 ON x(b * 10 + 1) WHERE c > 1",
+        "CREATE INDEX x3 ON x(v, id)",
+        "CREATE INDEX x4 ON x(id, b DESC)",
+        "CREATE INDEX x5 ON x(lower(a)) WHERE a IS NOT NULL AND x.b < 4",
+        "CREATE TABLE r(rowid TEXT, z)",
+        "INSERT INTO r VALUES ('r1', 10), ('r2', 20)",
+        "CREATE INDEX r1 ON r(z, rowid)",
+        "REINDEX",
+        "REINDEX NOCASE",
+        "REINDEX x2",
+        "CREATE UNIQUE INDEX bad ON x(b % 2)",
+        "SELECT a FROM x INDEXED BY x1 WHERE a > 'a' ORDER BY a COLLATE NOCASE",
+        "SELECT id FROM x INDEXED BY x2 WHERE b * 10 + 1 > 0 AND c > 1",
+        "SELECT v, typeof(v), id FROM x INDEXED BY x3 WHERE v IS NOT NULL",
+        "SELECT id, b FROM x INDEXED BY x4 WHERE id > 0",
+        "SELECT lower(a) FROM x INDEXED BY x5 WHERE lower(a) > '' AND a IS NOT NULL AND x.b < 4",
+        "SELECT z, rowid FROM r INDEXED BY r1 WHERE z > 0",
+        "SELECT name FROM sqlite_schema WHERE type = 'index' ORDER BY name",
+        "PRAGMA integrity_check",
+    ];
+    assert_eq!(run(true, &statements), run(false, &statements));
+
+    let program = |hir: bool| {
+        let db = TempDatabase::new_empty();
+        let conn = db.connect_limbo();
+        conn.execute("CREATE TABLE s(a, b)").unwrap();
+        conn.set_experimental_hir(hir);
+        limbo_exec_rows(&conn, "EXPLAIN CREATE INDEX s2 ON s(a + 1) WHERE b > 0")
+    };
+    assert_ne!(
+        program(true),
+        program(false),
+        "HIR plans the SELECT that fills the index"
+    );
+}
+
+/// ALTER TABLE ADD COLUMN checks the new column's CHECK constraints against
+/// every existing row, through a SELECT planned by HIR: the new column reads
+/// its default, and other columns read the row, as in SQLite. Legacy reads
+/// another column's name as text, so `c > b` compares 3 with 'b'.
+#[test]
+fn hir_alter_add_column_checks_each_row_like_sqlite() {
+    let db = TempDatabase::new_empty();
+    let conn = db.connect_limbo();
+    conn.set_experimental_hir(true);
+    let sqlite = rusqlite::Connection::open_in_memory().unwrap();
+    for sql in [
+        "CREATE TABLE t(a, b)",
+        "INSERT INTO t VALUES (1, 1), (2, 2)",
+        "ALTER TABLE t ADD COLUMN c INT DEFAULT 3 CHECK (c > b)",
+        "ALTER TABLE t ADD COLUMN d INT DEFAULT 3 CHECK (d < 10) CHECK (t.d + b > 4)",
+        "ALTER TABLE t ADD COLUMN e INT DEFAULT 3 CHECK (e + b < 5)",
+        "INSERT INTO t(a, b) VALUES (3, 9)",
+        "ALTER TABLE t ADD COLUMN f INT DEFAULT 3 CHECK (f > b)",
+        "CREATE TABLE empty(a)",
+        "ALTER TABLE empty ADD COLUMN c INT DEFAULT 3 CHECK (c > 4)",
+        "SELECT * FROM t ORDER BY a",
+        "SELECT * FROM empty",
+    ] {
+        assert_matches_sqlite(&db, &conn, &sqlite, sql);
+    }
+}
+
+/// ATTACH and DETACH evaluate their arguments through HIR, so an argument
+/// may be any expression, a subquery too (legacy rejects one).
+#[test]
+fn hir_attach_evaluates_its_arguments() {
+    let db = TempDatabase::builder()
+        .with_opts(turso_core::DatabaseOpts::new().with_attach(true))
+        .build();
+    let conn = db.connect_limbo();
+    conn.set_experimental_hir(true);
+    let dir = db
+        .path
+        .parent()
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .replace('\'', "''");
+    for sql in [
+        format!("ATTACH '{dir}/' || 'aux1.db' AS 'a' || '1'"),
+        format!("ATTACH (SELECT '{dir}/aux2.db') AS a2"),
+        "CREATE TABLE a1.x(v)".to_string(),
+        "INSERT INTO a1.x VALUES (1)".to_string(),
+        "DETACH 'a' || '2'".to_string(),
+    ] {
+        conn.execute(&sql).unwrap();
+    }
+    assert_eq!(
+        limbo_exec_rows(&conn, "SELECT name FROM pragma_database_list ORDER BY seq"),
+        vec![
+            vec![rusqlite::types::Value::Text("main".into())],
+            vec![rusqlite::types::Value::Text("a1".into())],
+        ]
+    );
+    assert_eq!(
+        limbo_exec_rows(&conn, "SELECT v FROM a1.x"),
+        vec![vec![rusqlite::types::Value::Integer(1)]]
+    );
+}
+
+/// PRAGMA integrity_check and quick_check read each table's rows through a
+/// SELECT planned by HIR, and find the same broken NOT NULL and CHECK
+/// constraints and missing or repeated index entries as legacy.
+#[test]
+fn hir_integrity_check_finds_what_legacy_finds() {
+    let fixtures =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../sqlite/conformance/database");
+    let check = |hir: bool, fixture: &str| {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(fixture);
+        std::fs::copy(fixtures.join(fixture), &path).unwrap();
+        let db = TempDatabase::new_with_existent_with_opts(
+            &path,
+            turso_core::DatabaseOpts::new().with_generated_columns(true),
+        );
+        let conn = db.connect_limbo();
+        conn.set_experimental_hir(hir);
+        [
+            "PRAGMA integrity_check",
+            "PRAGMA quick_check",
+            "EXPLAIN PRAGMA integrity_check",
+        ]
+        .map(|sql| limbo_exec_rows(&conn, sql))
+    };
+    for fixture in [
+        "integrity_check_constraint_violation.db",
+        "integrity_gencol_not_null_violation.db",
+        "integrity_missing_expression_index_entry.db",
+        "integrity_missing_index_entry.db",
+        "integrity_missing_partial_index_entry.db",
+        "integrity_missing_unique_index_entry.db",
+        "integrity_non_unique_index_entry.db",
+        "integrity_not_null_violation.db",
+    ] {
+        let [hir_check, hir_quick, hir_program] = check(true, fixture);
+        let [check, quick, program] = check(false, fixture);
+        assert_eq!(hir_check, check, "{fixture}");
+        assert_eq!(hir_quick, quick, "{fixture}");
+        assert_ne!(
+            hir_check,
+            vec![vec![rusqlite::types::Value::Text("ok".into())]],
+            "{fixture} is broken"
+        );
+        assert_ne!(hir_program, program, "{fixture}: HIR reads the rows");
+    }
+}
+
+/// Like legacy, a DELETE or UPDATE whose WHERE is an OR of terms that
+/// indexes can each seek reads the table through one seek per branch. The
+/// branches give rowids in rowid order through a row set, so the statement
+/// collects them first, then writes each row once.
+#[test]
+fn hir_dml_with_or_terms_seeks_each_branch_like_legacy() {
+    for (sql, plan) in [
+        (
+            "DELETE FROM u WHERE b = 2 OR c = 'z'",
+            "MULTI-INDEX OR u (u_b, u_c)",
+        ),
+        (
+            "UPDATE u SET d = 9 WHERE b = 1 OR c = 'q'",
+            "MULTI-INDEX OR u (u_b, u_c)",
+        ),
+        // A branch reads the index the UPDATE changes.
+        (
+            "UPDATE u SET b = b + 10 WHERE b = 3 OR c = 'p'",
+            "MULTI-INDEX OR u (u_b, u_c)",
+        ),
+        (
+            "DELETE FROM u WHERE (b = 1 OR c = 'yy') AND d < 2",
+            "MULTI-INDEX OR u (u_b, u_c)",
+        ),
+        (
+            "UPDATE u SET d = 0 WHERE b = 2 OR c = 'x' RETURNING a, d",
+            "MULTI-INDEX OR u (u_b, u_c)",
+        ),
+        (
+            "DELETE FROM t WHERE (b = 2 AND d > 0) OR (d = 3 AND c = 'z')",
+            "MULTI-INDEX OR t (t_b, t_unique)",
+        ),
+        (
+            "DELETE FROM t WHERE b = 2 OR g = 10",
+            "MULTI-INDEX OR t (t_b, t_g)",
+        ),
+        (
+            "DELETE FROM t WHERE b = 5 OR b + length(c) = 3",
+            "MULTI-INDEX OR t (t_b, t_expr)",
+        ),
+    ] {
+        assert_eq!(query_plan(true, sql), vec![plan.to_string()], "{sql}");
+        assert_eq!(query_plan(false, sql), vec![plan.to_string()], "{sql}");
+        assert_eq!(run(true, &[sql]), run(false, &[sql]), "{sql}");
+    }
+    for statements in [
+        &[
+            "CREATE TRIGGER ad AFTER DELETE ON u BEGIN INSERT INTO log VALUES (old.a); END",
+            "DELETE FROM u WHERE b = 2 OR c = 'z'",
+        ][..],
+        &[
+            "CREATE TRIGGER au AFTER UPDATE ON u BEGIN INSERT INTO log VALUES (new.d); END",
+            "UPDATE OR REPLACE u SET b = 1 WHERE b = 3 OR c = 'q'",
+        ],
+    ] {
+        assert_eq!(
+            run(true, statements),
+            run(false, statements),
+            "{statements:?}"
+        );
+    }
+}
+
+/// Like legacy, a DELETE or UPDATE whose WHERE term matches an index
+/// method's query pattern, such as `fts_match`, reads its rows through the
+/// index. The index may stream rows lazily, so the statement collects their
+/// rowids first, then writes each row.
+#[test]
+fn hir_dml_through_an_index_method_matches_legacy() {
+    const FTS_SETUP: &[&str] = &[
+        "CREATE TABLE docs(id INTEGER PRIMARY KEY, body TEXT, n INT)",
+        "CREATE INDEX docs_fts ON docs USING fts (body)",
+        "CREATE INDEX docs_n ON docs(n)",
+        "INSERT INTO docs VALUES (1, 'red apple', 1), (2, 'green apple', 2), \
+         (3, 'red pear', 3), (4, 'apple apple', 4), (5, 'plum', 5)",
+    ];
+    let run = |hir: bool, statements: &[&str]| -> (Vec<String>, Vec<Result<Rows, String>>) {
+        let db = TempDatabase::builder()
+            .with_opts(turso_core::DatabaseOpts::new().with_index_method(true))
+            .build();
+        let conn = db.connect_limbo();
+        for statement in FTS_SETUP {
+            conn.execute(statement).unwrap();
+        }
+        conn.set_experimental_hir(hir);
+        let mut plans = Vec::new();
+        let mut results = Vec::new();
+        for statement in statements {
+            if statement.starts_with("DELETE") || statement.starts_with("UPDATE") {
+                for row in limbo_exec_rows(&conn, &format!("EXPLAIN QUERY PLAN {statement}")) {
+                    let Some(rusqlite::types::Value::Text(detail)) = row.last() else {
+                        panic!("EXPLAIN QUERY PLAN detail is not text: {row:?}");
+                    };
+                    plans.push(detail.clone());
+                }
+            }
+            results
+                .push(limbo_exec_rows_fallible(&db, &conn, statement).map_err(|e| e.to_string()));
+            results.push(Ok(limbo_exec_rows(&conn, "SELECT changes()")));
+        }
+        for sql in [
+            "SELECT id, body, n FROM docs ORDER BY id",
+            "SELECT id FROM docs WHERE fts_match(body, 'apple') ORDER BY id",
+            "SELECT id FROM docs WHERE fts_match(body, 'pear') ORDER BY id",
+            "PRAGMA integrity_check",
+        ] {
+            results.push(Ok(limbo_exec_rows(&conn, sql)));
+        }
+        (plans, results)
+    };
+    for statements in [
+        &["DELETE FROM docs WHERE fts_match(body, 'apple')"][..],
+        &["DELETE FROM docs WHERE fts_match(body, 'apple') AND n > 1"],
+        &["UPDATE docs SET body = 'pear', n = n + 10 WHERE fts_match(body, 'apple')"],
+        &["UPDATE docs SET n = 0 WHERE fts_match(body, 'red') RETURNING id, n"],
+        &["DELETE FROM docs WHERE fts_match(body, 'apple') RETURNING id"],
+        &[
+            "CREATE TRIGGER ad AFTER DELETE ON docs BEGIN \
+             UPDATE docs SET n = n + 100 WHERE id = old.id + 1; END",
+            "DELETE FROM docs WHERE fts_match(body, 'red')",
+        ],
+        &[
+            "DELETE FROM docs WHERE fts_match(body, 'apple')",
+            "UPDATE docs SET body = 'apple' WHERE fts_match(body, 'plum')",
+            "DELETE FROM docs WHERE fts_match(body, 'apple')",
+        ],
+    ] {
+        let (hir_plans, hir_results) = run(true, statements);
+        let (legacy_plans, legacy_results) = run(false, statements);
+        assert!(
+            hir_plans.iter().all(|row| row == "QUERY INDEX METHOD fts"),
+            "{statements:?}: {hir_plans:?}"
+        );
+        assert_eq!(hir_plans, legacy_plans, "{statements:?}");
+        assert_eq!(hir_results, legacy_results, "{statements:?}");
+    }
 }

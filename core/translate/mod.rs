@@ -40,6 +40,7 @@ pub(crate) mod select;
 pub(crate) mod semantic;
 pub(crate) mod semantic_lowering;
 pub(crate) mod semantic_to_plan;
+pub(crate) mod semantic_unnest;
 pub(crate) mod sequence;
 pub(crate) mod stmt_journal;
 pub(crate) mod subquery;
@@ -142,6 +143,9 @@ pub fn translate(
     match stmt {
         // There can be no nesting with pragma, so lift it up here
         ast::Stmt::Pragma { name, body } => {
+            let hir = connection
+                .experimental_hir_enabled()
+                .then_some((schema, &hir_settings));
             pragma::translate_pragma(
                 &resolver,
                 &name,
@@ -149,11 +153,10 @@ pub fn translate(
                 pager,
                 connection.clone(),
                 &mut program,
+                hir,
             )?;
         }
-        stmt @ ast::Stmt::Select(_)
-            if connection.experimental_hir_enabled() && !connection.is_nested_stmt() =>
-        {
+        stmt @ ast::Stmt::Select(_) if connection.experimental_hir_enabled() => {
             semantic_lowering::translate_select(
                 &stmt,
                 schema,
@@ -165,7 +168,8 @@ pub fn translate(
         stmt => {
             // DML that HIR lowers today goes through it; everything else,
             // and DML it does not lower yet, stays on legacy.
-            let hir = (connection.experimental_hir_enabled() && !connection.is_nested_stmt())
+            let hir = connection
+                .experimental_hir_enabled()
                 .then_some((schema, &hir_settings));
             translate_statement(stmt, &mut resolver, &mut program, &connection, input, hir)?
         }
@@ -283,18 +287,26 @@ fn translate_statement(
     match stmt {
         _ if lowered_by_hir => {}
         ast::Stmt::AlterTable(alter) => {
-            translate_alter_table(alter, resolver, program, connection, input)?;
+            translate_alter_table(alter, resolver, program, connection, input, hir)?;
         }
         ast::Stmt::Analyze { name } => translate_analyze(name, resolver, program)?,
         ast::Stmt::Attach { expr, db_name, key } => {
-            attach::translate_attach(&expr, resolver, &db_name, &key, program, connection.clone())?;
+            attach::translate_attach(
+                &expr,
+                resolver,
+                &db_name,
+                &key,
+                program,
+                connection.clone(),
+                hir,
+            )?;
         }
         ast::Stmt::Begin { typ, name } => translate_tx_begin(typ, name, resolver, program)?,
         ast::Stmt::Commit { name } => {
             translate_tx_commit(name, resolver.schema(), resolver, program)?
         }
         ast::Stmt::CreateIndex { .. } => {
-            translate_create_index(program, connection, resolver, stmt)?;
+            translate_create_index(program, connection, resolver, stmt, hir)?;
         }
         ast::Stmt::CreateTable {
             temporary,
@@ -310,6 +322,7 @@ fn translate_statement(
             program,
             connection,
             input,
+            hir,
         )?,
         ast::Stmt::CreateTrigger {
             temporary,
@@ -402,7 +415,7 @@ fn translate_statement(
             )?
         }
         ast::Stmt::Detach { name } => {
-            attach::translate_detach(&name, resolver, program, connection.clone())?
+            attach::translate_detach(&name, resolver, program, connection.clone(), hir)?
         }
         ast::Stmt::DropIndex {
             if_exists,
@@ -473,7 +486,7 @@ fn translate_statement(
         ast::Stmt::Pragma { .. } => {
             bail_parse_error!("PRAGMA statement cannot be evaluated in a nested context")
         }
-        ast::Stmt::Reindex { name } => translate_reindex(name, resolver, program, connection)?,
+        ast::Stmt::Reindex { name } => translate_reindex(name, resolver, program, connection, hir)?,
         ast::Stmt::Optimize { idx_name } => {
             translate_optimize(idx_name, resolver, program, connection)?
         }

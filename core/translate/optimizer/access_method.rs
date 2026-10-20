@@ -115,7 +115,8 @@ pub(super) trait BtreeCandidateSource<I, O>: AccessSource {
 
 pub(super) trait BtreeAccessSource<I, O>: BtreeCandidateSource<I, O> {
     fn allows_alternative_access(&self) -> bool;
-    fn is_full_outer_join(&self) -> bool;
+    /// Whether the table may not be read through a temporary index.
+    fn forbids_automatic_index(&self) -> bool;
     fn used_column_count(&self) -> usize;
 }
 
@@ -146,7 +147,8 @@ impl BtreeAccessSource<TableInternalId, *const ast::Expr> for JoinedTable {
         self.indexed.is_none()
     }
 
-    fn is_full_outer_join(&self) -> bool {
+    /// Legacy runs a FULL JOIN only as a hash join.
+    fn forbids_automatic_index(&self) -> bool {
         self.join_info
             .as_ref()
             .is_some_and(|join_info| join_info.is_full_outer())
@@ -189,11 +191,12 @@ impl<'a> BtreeAccessSource<hir::SourceId, &'a hir::Expr> for HirAccessSource<'a>
         matches!(self.planned.indexed, hir::IndexHint::None)
     }
 
-    fn is_full_outer_join(&self) -> bool {
-        self.planned
-            .join_info
-            .as_ref()
-            .is_some_and(|join_info| join_info.kind == hir::JoinKind::Full)
+    /// HIR runs a FULL JOIN like SQLite, as nested loops plus a pass over
+    /// the right table for its unmatched rows, so like a RIGHT JOIN its
+    /// right side may seek a temporary index instead of being scanned again
+    /// for every left row.
+    fn forbids_automatic_index(&self) -> bool {
+        false
     }
 
     fn used_column_count(&self) -> usize {
@@ -964,13 +967,13 @@ pub(super) fn choose_single_btree_access_method<E, I, O>(
             ..
         } if constraint_refs.is_empty()
     );
-    // A temporary index pays off when its seeks run many times: after other
-    // tables in a join, or in a correlated subquery that runs once per outer
-    // row. It is built once either way.
+    // Like legacy, a temporary index is only built for a table joined after
+    // another one. A correlated subquery's first table is scanned on each
+    // run; legacy speeds those up by turning the subquery into a join.
     if source.allows_alternative_access()
         && uses_full_table_scan
-        && (!lhs_mask.is_empty() || input_cardinality > 1.0)
-        && !source.is_full_outer_join()
+        && !lhs_mask.is_empty()
+        && !source.forbids_automatic_index()
     {
         let constraint_refs = usable_constraints_for_lhs_mask(
             &constraints.constraints,
@@ -1064,7 +1067,7 @@ pub(super) fn choose_single_btree_access_method<E, I, O>(
 }
 
 /// Add the cost of ready `WHERE` conditions.
-fn cost_with_where_work(
+pub(super) fn cost_with_where_work(
     method: &AccessMethod,
     ready_where: &[(usize, usize)],
     input_cardinality: f64,
@@ -2084,6 +2087,323 @@ fn find_best_access_method_for_subquery(
     } else {
         Ok(Some(index_method))
     }
+}
+
+/// Legacy's `find_best_access_method_for_subquery` for a HIR FROM subquery
+/// or CTE: scan its rows, or store them once in a temporary index keyed by
+/// the columns earlier loops constrain and seek that index for each outer
+/// row, whichever costs less. The rows are stored in a table first and the
+/// index is built from it, so setup always costs two passes, except for a
+/// CTE that is already stored as a table. A subquery that reads an outer
+/// row runs again for each one, so it is only scanned, and so is the right
+/// side of a RIGHT or FULL JOIN (`may_seek` false), whose unmatched rows a
+/// second pass finds by scanning the stored table.
+///
+/// Without seek constraints, like legacy's `intrinsic_subquery_scan_direction`,
+/// the scan reads a stored CTE backwards when that gives `order_target`.
+///
+/// Not ported yet: legacy also uses the order of the temporary index to
+/// skip an outer sort.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn find_best_hir_access_method_for_subquery(
+    document: &hir::HirDocument,
+    source: hir::SourceId,
+    query: hir::QueryId,
+    table_materialization_required: bool,
+    may_seek: bool,
+    order_target: Option<&super::order::HirOrderTarget<'_>>,
+    output_order: &[super::order::HirOutputOrder],
+    constraints: &TableConstraints<hir::Expr, hir::SourceId>,
+    lhs_mask: &TableMask,
+    source_position: usize,
+    ready_where: &[(usize, usize)],
+    subquery_cost: Cost,
+    input_cardinality: f64,
+    base_row_count: RowCountEstimate,
+    params: &CostModelParams,
+) -> Result<AccessMethod> {
+    use super::constraints::ConstraintRef;
+    let scan = |cost| AccessMethod {
+        cost,
+        estimated_rows_per_outer_row: *base_row_count,
+        consumed_where_terms: Default::default(),
+        params: AccessMethodParams::Subquery {
+            iter_dir: IterationDirection::Forwards,
+        },
+    };
+    let coroutine_scan_cost = estimate_cost_for_scan_or_seek::<hir::Expr>(
+        None,
+        &[],
+        &[],
+        input_cardinality,
+        base_row_count,
+        false,
+        params,
+        None,
+    );
+    let coroutine_reexecution_overhead =
+        Cost((input_cardinality - 1.0).max(0.0) * *base_row_count * params.cpu_cost_per_seek);
+    let coroutine_cost = coroutine_scan_cost
+        + coroutine_reexecution_overhead
+        + Cost(input_cardinality * subquery_cost.0);
+    if document.reads_outer_sources(query) {
+        return Ok(scan(coroutine_cost));
+    }
+    if !may_seek {
+        return Ok(scan(if table_materialization_required {
+            coroutine_scan_cost + subquery_cost
+        } else {
+            coroutine_cost
+        }));
+    }
+    let scan_cost = if table_materialization_required {
+        coroutine_scan_cost + subquery_cost
+    } else {
+        coroutine_cost
+    };
+    let definition = document.source(source).ok_or_else(|| {
+        crate::LimboError::InternalError(format!("HIR subquery source {source} is missing"))
+    })?;
+    let usable: Vec<(usize, &Constraint<hir::Expr>)> = constraints
+        .constraints
+        .iter()
+        .enumerate()
+        .filter(|(_, constraint)| {
+            matches!(
+                constraint.operator.as_ast_operator(),
+                Some(
+                    ast::Operator::Equals
+                        | ast::Operator::Greater
+                        | ast::Operator::GreaterEquals
+                        | ast::Operator::Less
+                        | ast::Operator::LessEquals
+                )
+            ) && constraint.usable
+                && constraint.table_col_pos.is_some_and(|position| {
+                    definition
+                        .columns
+                        .get(position)
+                        .is_some_and(|column| constraint.satisfies_index_affinity(column.affinity))
+                })
+        })
+        .collect();
+    // Like legacy: a MIN or MAX whose seek constraints are all on its own
+    // column can walk the subquery's own order from one end.
+    let extremum_constraints_compatible = order_target.is_some_and(|target| {
+        target.is_extremum()
+            && matches!(
+                target.columns.first(),
+                Some(column) if column.source == source
+                    && matches!(column.target, super::order::ColumnTarget::Column(position)
+                        if usable.iter().all(|(_, constraint)| constraint.table_col_pos == Some(position)))
+            )
+    });
+    if extremum_constraints_compatible || usable.is_empty() {
+        // Legacy's `intrinsic_subquery_scan_direction`: reading forwards
+        // gives the subquery's own order; only a stored CTE can be read
+        // backwards for the opposite one.
+        let direction = order_target.and_then(|target| {
+            let consumed = |direction| {
+                super::order::hir_subquery_intrinsic_order_consumed(
+                    source,
+                    output_order,
+                    direction,
+                    &target.columns,
+                )
+            };
+            if consumed(IterationDirection::Forwards) == target.columns.len() {
+                Some(IterationDirection::Forwards)
+            } else if table_materialization_required
+                && consumed(IterationDirection::Backwards) == target.columns.len()
+            {
+                Some(IterationDirection::Backwards)
+            } else {
+                None
+            }
+        });
+        if let Some(iter_dir) = direction {
+            let mut method = scan(scan_cost);
+            method.params = AccessMethodParams::Subquery { iter_dir };
+            return Ok(method);
+        }
+    }
+    if usable.is_empty() {
+        return Ok(scan(scan_cost));
+    }
+    let usable_constraints: Vec<&Constraint<hir::Expr>> =
+        usable.iter().map(|(_, constraint)| *constraint).collect();
+    let key_col_positions = super::constraints::ordered_ephemeral_key_columns(&usable_constraints);
+    if key_col_positions.is_empty() {
+        return Ok(scan(scan_cost));
+    }
+    let mut constraint_refs: Vec<ConstraintRef> = usable
+        .iter()
+        .map(|(constraint_vec_pos, constraint)| {
+            let table_col_pos = constraint
+                .table_col_pos
+                .expect("usable subquery constraints name a column");
+            let index_col_pos = key_col_positions
+                .iter()
+                .position(|position| *position == table_col_pos)
+                .expect("every usable column is a key column");
+            ConstraintRef {
+                constraint_vec_pos: *constraint_vec_pos,
+                index_col_pos,
+                sort_order: SortOrder::Asc,
+                nulls_order: ast::NullsOrder::First,
+            }
+        })
+        .collect();
+    constraint_refs.sort_by_key(|constraint| constraint.index_col_pos);
+    let constraint_refs = usable_constraints_for_lhs_mask(
+        &constraints.constraints,
+        &constraint_refs,
+        lhs_mask,
+        source_position,
+    )
+    .into_vec();
+    if constraint_refs.is_empty() {
+        return Ok(scan(scan_cost));
+    }
+    let index = hir_materialized_subquery_ephemeral_index(definition, &key_col_positions)?;
+    let estimated_rows_per_outer_row =
+        if hir_grouped_subquery_lookup_is_unique(document, query, &constraint_refs) {
+            1.0
+        } else {
+            estimate_rows_per_seek(
+                IndexInfo {
+                    unique: false,
+                    column_count: key_col_positions.len(),
+                    covering: true,
+                    rows_per_leaf_page: params.rows_per_table_page,
+                },
+                &constraints.constraints,
+                &constraint_refs,
+                base_row_count,
+                None,
+            )
+        };
+    let one_pass_scan_cost = estimate_cost_for_scan_or_seek::<hir::Expr>(
+        None,
+        &[],
+        &[],
+        1.0,
+        base_row_count,
+        false,
+        params,
+        None,
+    );
+    let append_build_cost = estimate_ephemeral_index_build_cost(*base_row_count, params);
+    let seek_setup_cost = if table_materialization_required {
+        one_pass_scan_cost + append_build_cost
+    } else {
+        one_pass_scan_cost + one_pass_scan_cost + append_build_cost
+    };
+    let seek_cost = Cost(
+        input_cardinality * params.cpu_cost_per_seek
+            + input_cardinality * estimated_rows_per_outer_row * params.cpu_cost_per_row,
+    );
+    let scan_method = scan(scan_cost);
+    let index_method = AccessMethod {
+        cost: subquery_cost + seek_setup_cost + seek_cost,
+        estimated_rows_per_outer_row,
+        consumed_where_terms: consumed_where_terms_from_constraint_refs(
+            &constraints.constraints,
+            &constraint_refs,
+        )?,
+        params: AccessMethodParams::MaterializedSubquery {
+            index,
+            constraint_refs,
+            iter_dir: IterationDirection::Forwards,
+        },
+    };
+    let scan_cost = cost_with_where_work(&scan_method, ready_where, input_cardinality, params);
+    let index_cost = cost_with_where_work(&index_method, ready_where, input_cardinality, params);
+    Ok(if index_cost >= scan_cost {
+        scan_method
+    } else {
+        index_method
+    })
+}
+
+/// Legacy's `materialized_subquery_ephemeral_index` for a HIR source: the
+/// key columns first, then every other column, so the index holds the whole
+/// row and the loop never reads the stored table.
+fn hir_materialized_subquery_ephemeral_index(
+    source: &hir::Source,
+    key_col_positions: &[usize],
+) -> Result<Arc<Index>> {
+    let index_column = |position: usize| {
+        let column = &source.columns[position];
+        IndexColumn {
+            name: column.name.clone(),
+            order: SortOrder::Asc,
+            nulls_order: None,
+            pos_in_table: position,
+            collation: column
+                .collation
+                .as_ref()
+                .map(|collation| *collation.value()),
+            default: None,
+            expr: None,
+        }
+    };
+    let columns = key_col_positions
+        .iter()
+        .copied()
+        .chain((0..source.columns.len()).filter(|position| !key_col_positions.contains(position)))
+        .map(index_column)
+        .collect();
+    Ok(Arc::new(Index {
+        name: format!("ephemeral_subquery_{}", source.id),
+        columns,
+        unique: false,
+        ephemeral: true,
+        table_name: source.name.clone(),
+        root_page: 0,
+        where_clause: None,
+        has_rowid: true,
+        index_method: None,
+        on_conflict: None,
+    }))
+}
+
+/// Legacy's `grouped_subquery_lookup_is_unique`: a grouped query has at most
+/// one row for one full group key.
+fn hir_grouped_subquery_lookup_is_unique(
+    document: &hir::HirDocument,
+    query: hir::QueryId,
+    constraint_refs: &[RangeConstraintRef],
+) -> bool {
+    let Some(query) = document.query(query) else {
+        return false;
+    };
+    let [block] = query.blocks.as_slice() else {
+        return false;
+    };
+    let hir::QueryBlockBody::Select {
+        grouping: Some(grouping),
+        ..
+    } = &block.body
+    else {
+        return false;
+    };
+    !grouping.keys.is_empty()
+        && grouping.keys.iter().all(|key| {
+            query
+                .output
+                .iter()
+                .position(|output| {
+                    document
+                        .output(*output)
+                        .is_some_and(|output| output.expr.equivalent(key))
+                })
+                .is_some_and(|position| {
+                    constraint_refs.iter().any(|constraint| {
+                        constraint.table_col_pos == Some(position) && constraint.eq.is_some()
+                    })
+                })
+        })
 }
 
 /// A grouped query has at most one row for one full group key.

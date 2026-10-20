@@ -58,6 +58,237 @@ pub(crate) fn translate_select(
     Ok(())
 }
 
+/// A SELECT that a schema statement runs to read rows, planned through HIR:
+/// the SELECT of `CREATE TABLE ... AS SELECT`, or the scan that fills a new
+/// or rebuilt index.
+pub(crate) struct PlannedSelect {
+    plan: Arc<HirPlan>,
+    query: hir::QueryId,
+}
+
+impl PlannedSelect {
+    pub(crate) fn new(
+        select: ast::Select,
+        schema: &Arc<Schema>,
+        settings: &HirSettings<'_>,
+        connection: &Arc<Connection>,
+    ) -> Result<Self> {
+        let plan = analyze_and_plan(&ast::Stmt::Select(select), schema, settings, connection)?;
+        let HirRoot::Query(root) = &plan.document.root else {
+            return Err(LimboError::InternalError(
+                "HIR CTAS analysis did not produce a query root".into(),
+            ));
+        };
+        let query = root.query;
+        Ok(Self { plan, query })
+    }
+
+    /// `SELECT <values>`, without FROM: how a schema statement evaluates
+    /// expressions that read no table, such as the arguments of ATTACH.
+    pub(crate) fn values(
+        values: Vec<ast::Expr>,
+        schema: &Arc<Schema>,
+        settings: &HirSettings<'_>,
+        connection: &Arc<Connection>,
+    ) -> Result<Self> {
+        let select = Self::select(values, None, None);
+        Self::new(select, schema, settings, connection)
+    }
+
+    /// `SELECT <values> FROM <database>.<table> NOT INDEXED [WHERE <filter>]`:
+    /// how a schema statement reads every row of a table. NOT INDEXED keeps
+    /// it reading the table itself, never one of its indexes.
+    pub(crate) fn scan(
+        values: Vec<ast::Expr>,
+        database: String,
+        table: String,
+        filter: Option<Box<ast::Expr>>,
+        schema: &Arc<Schema>,
+        settings: &HirSettings<'_>,
+        connection: &Arc<Connection>,
+    ) -> Result<Self> {
+        let from = ast::FromClause {
+            select: Box::new(ast::SelectTable::Table(
+                ast::QualifiedName {
+                    db_name: Some(ast::Name::exact(database)),
+                    name: ast::Name::exact(table),
+                    alias: None,
+                },
+                None,
+                Some(ast::Indexed::NotIndexed),
+            )),
+            joins: vec![],
+        };
+        let select = Self::select(values, Some(from), filter);
+        Self::new(select, schema, settings, connection)
+    }
+
+    fn select(
+        values: Vec<ast::Expr>,
+        from: Option<ast::FromClause>,
+        where_clause: Option<Box<ast::Expr>>,
+    ) -> ast::Select {
+        ast::Select {
+            with: None,
+            body: ast::SelectBody {
+                select: ast::OneSelect::Select {
+                    distinctness: None,
+                    columns: values
+                        .into_iter()
+                        .map(|value| ast::ResultColumn::Expr(Box::new(value), None))
+                        .collect(),
+                    from,
+                    where_clause,
+                    group_by: None,
+                    window_clause: vec![],
+                },
+                compounds: vec![],
+            },
+            order_by: vec![],
+            limit: None,
+        }
+    }
+
+    /// Emit a loop over the SELECT's rows, which runs as a coroutine. For
+    /// each row, `body` gets the first of the registers holding its columns.
+    pub(crate) fn emit_each_row(
+        &self,
+        program: &mut ProgramBuilder,
+        body: impl FnOnce(&mut ProgramBuilder, usize) -> Result<()>,
+    ) -> Result<()> {
+        use crate::vdbe::insn::Insn;
+        let yield_reg = program.alloc_register();
+        let after_definition = program.allocate_label();
+        let start = program.allocate_label();
+        program.emit_insn(Insn::InitCoroutine {
+            yield_reg,
+            jump_on_definition: after_definition,
+            start_offset: start,
+        });
+        program.preassign_label_to_next_insn(start);
+        let values = self.emit_rows(program, yield_reg, start)?;
+        program.emit_insn(Insn::EndCoroutine { yield_reg });
+        program.preassign_label_to_next_insn(after_definition);
+
+        let loop_start = program.allocate_label();
+        let loop_end = program.allocate_label();
+        program.preassign_label_to_next_insn(loop_start);
+        program.emit_insn(Insn::Yield {
+            yield_reg,
+            end_offset: loop_end,
+            subtype_clear_start_reg: 0,
+            subtype_clear_count: 0,
+        });
+        body(program, values)?;
+        program.emit_insn(Insn::Goto {
+            target_pc: loop_start,
+        });
+        program.preassign_label_to_next_insn(loop_end);
+        Ok(())
+    }
+
+    /// Run the SELECT once and write its first row into the returned
+    /// registers, one per column; they are NULL when it returns no row.
+    pub(crate) fn emit_values(&self, program: &mut ProgramBuilder) -> Result<usize> {
+        let width = self
+            .plan
+            .document
+            .query(self.query)
+            .map_or(0, |query| query.output.len());
+        let values = program.alloc_registers(width.max(1));
+        program.emit_insn(crate::vdbe::insn::Insn::Null {
+            dest: values,
+            dest_end: (width > 1).then(|| values + width - 1),
+        });
+        program.set_hir_plan(self.plan.clone());
+        program.nested(|program| {
+            query::emit_planned_query_body(
+                program,
+                &self.plan,
+                self.query,
+                &QueryDestination::RowValueSubqueryResult {
+                    result_reg_start: values,
+                    num_regs: width,
+                },
+            )
+        })?;
+        Ok(values)
+    }
+
+    /// Whether the SELECT reads a column whose stored value it would decode:
+    /// a custom type or an array. An index stores the encoded value, so its
+    /// refill cannot read such a column through a SELECT.
+    pub(crate) fn decodes_stored_values(&self) -> bool {
+        self.plan.document.sources.iter().any(|source| {
+            source.column_type_programs.iter().any(Option::is_some)
+                || source
+                    .columns
+                    .iter()
+                    .any(|column| column.type_fact.is_array())
+        })
+    }
+
+    /// Each column of the new table: the SELECT's output name, and the type
+    /// SQLite derives from the output's affinity, as legacy does.
+    pub(crate) fn columns(&self) -> Result<Vec<(String, &'static str)>> {
+        let document = &self.plan.document;
+        let query = document
+            .query(self.query)
+            .ok_or_else(|| LimboError::InternalError("HIR CTAS query is missing".into()))?;
+        let names = resolved_result_columns(document, self.query)?;
+        query
+            .output
+            .iter()
+            .zip(names)
+            .map(|(output, column)| {
+                let output = document.output(*output).ok_or_else(|| {
+                    LimboError::InternalError("HIR CTAS output is missing".into())
+                })?;
+                // Like legacy, a column read keeps its own name, without the
+                // table that qualifies it, unless it has an alias.
+                let name = match column.value {
+                    ResolvedResultValue::Column(source) if !column.name_is_alias => {
+                        source.column_name
+                    }
+                    ResolvedResultValue::RowId(name) if !column.name_is_alias => name,
+                    _ => column.name,
+                };
+                Ok((name, output.schema_affinity.short_type_name()))
+            })
+            .collect()
+    }
+
+    /// Run the SELECT as a coroutine that yields each row into the returned
+    /// registers, one per column.
+    pub(crate) fn emit_rows(
+        &self,
+        program: &mut ProgramBuilder,
+        yield_reg: usize,
+        start: crate::vdbe::BranchOffset,
+    ) -> Result<usize> {
+        let width = self
+            .plan
+            .document
+            .query(self.query)
+            .map_or(0, |query| query.output.len());
+        let values = program.alloc_registers(width.max(1));
+        program.bind_coroutine_row(yield_reg, values);
+        program.set_hir_plan(self.plan.clone());
+        program.nested(|program| {
+            query::emit_planned_query_body(
+                program,
+                &self.plan,
+                self.query,
+                &QueryDestination::CoroutineYield {
+                    yield_reg,
+                    coroutine_implementation_start: start,
+                },
+            )
+        })?;
+        Ok(values)
+    }
+}
+
 /// Prepare a top-level DELETE through semantic HIR. Returns `false`, with
 /// nothing emitted, when the statement uses something only legacy lowers
 /// today; the caller then hands it to legacy.
@@ -109,12 +340,38 @@ pub(crate) fn translate_update(
     program: &mut ProgramBuilder,
     connection: &Arc<Connection>,
 ) -> Result<bool> {
+    translate_update_with(statement, schema, settings, program, connection, None)
+}
+
+/// Prepare the UPDATE of the schema table that ALTER TABLE generates. Like
+/// legacy, it may write the schema table, and change data capture records
+/// `ddl`, the ALTER statement, as the new `sql` value. Returns `false`, with
+/// nothing emitted, when the update needs legacy.
+pub(crate) fn translate_schema_update(
+    statement: &ast::Stmt,
+    schema: &Arc<Schema>,
+    settings: &HirSettings<'_>,
+    program: &mut ProgramBuilder,
+    connection: &Arc<Connection>,
+    ddl: &str,
+) -> Result<bool> {
+    translate_update_with(statement, schema, settings, program, connection, Some(ddl))
+}
+
+fn translate_update_with(
+    statement: &ast::Stmt,
+    schema: &Arc<Schema>,
+    settings: &HirSettings<'_>,
+    program: &mut ProgramBuilder,
+    connection: &Arc<Connection>,
+    schema_change: Option<&str>,
+) -> Result<bool> {
     let ast::Stmt::Update(syntax) = statement else {
         return Err(LimboError::InternalError(
             "HIR UPDATE got another statement".into(),
         ));
     };
-    if target_needs_legacy(schema, connection, &syntax.tbl_name)? {
+    if schema_change.is_none() && target_needs_legacy(schema, connection, &syntax.tbl_name)? {
         return Ok(false);
     }
     let session = HirSession::new(schema, settings, connection)?;
@@ -136,6 +393,7 @@ pub(crate) fn translate_update(
         &subprograms,
         mvcc,
         !connection.check_constraints_ignored(),
+        schema_change,
     )?;
     if let Some(returning) = &update.returning {
         program.resolved_result_columns =
@@ -209,7 +467,12 @@ fn target_needs_legacy(
     name: &ast::QualifiedName,
 ) -> Result<bool> {
     let table_name = crate::util::normalize_ident(name.name.as_str());
-    if !connection.is_mvcc_bootstrap_connection() && !crate::schema::allow_user_dml(&table_name) {
+    // Like legacy, the statements the engine runs itself, such as VACUUM's,
+    // may write its internal tables.
+    if !connection.is_nested_stmt()
+        && !connection.is_mvcc_bootstrap_connection()
+        && !crate::schema::allow_user_dml(&table_name)
+    {
         crate::bail_parse_error!("table {table_name} may not be modified");
     }
     if schema.is_materialized_view(&table_name) {

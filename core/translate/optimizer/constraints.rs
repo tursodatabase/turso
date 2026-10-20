@@ -496,6 +496,22 @@ fn hir_binary_constraints_for_term(
 ) -> Result<SmallVec<[HirConstraint; 2]>> {
     let source = source_definition.id;
     let mut constraints = SmallVec::new();
+    if let hir::Expr::IsNull(constrained_expr) = &term.expr {
+        if let Some(constraint) = hir_is_null_constraint_for_term(
+            document,
+            from,
+            term_position,
+            term,
+            constrained_expr,
+            source_definition,
+            constraint_source,
+            schema,
+            params,
+        )? {
+            constraints.push(constraint);
+        }
+        return Ok(constraints);
+    }
     let hir::Expr::Binary { operator, rhs, .. } = &term.expr else {
         return Ok(constraints);
     };
@@ -574,6 +590,89 @@ fn hir_binary_constraints_for_term(
         });
     }
     Ok(constraints)
+}
+
+/// `x IS NULL` as a seek on `x`, like legacy's `x IS NULL` constraint. HIR
+/// analysis turns both `x IS NULL` and `x ISNULL` into [`hir::Expr::IsNull`],
+/// which has no NULL operand of its own, so the constraint carries the NULL
+/// it seeks. `IS NULL` is true on a row an outer join adds, so like `IS` it
+/// cannot seek a table an outer join may NULL-extend, except in that join's
+/// own ON clause. A rowid is never NULL, so `rowid IS NULL` is left to the
+/// filter.
+#[allow(clippy::too_many_arguments)]
+fn hir_is_null_constraint_for_term(
+    document: &hir::HirDocument,
+    from: &impl HirFromScope,
+    term_position: usize,
+    term: &HirWhereTerm,
+    constrained_expr: &hir::Expr,
+    source_definition: &hir::Source,
+    constraint_source: HirConstraintSource<'_>,
+    schema: &Schema,
+    params: &CostModelParams,
+) -> Result<Option<HirConstraint>> {
+    let source = source_definition.id;
+    if term
+        .from_outer_join
+        .is_some_and(|outer_source| outer_source != source)
+    {
+        return Ok(None);
+    }
+    let table_col_pos = match constrained_expr {
+        hir::Expr::Column(column) if column.source == source => Some(column.column),
+        hir::Expr::Literal(_)
+        | hir::Expr::Parameter(_)
+        | hir::Expr::Column(_)
+        | hir::Expr::RowId(_)
+        | hir::Expr::Output(_)
+        | hir::Expr::Subquery(_)
+        | hir::Expr::Raise { .. } => return Ok(None),
+        _ => {
+            let target_mask = table_mask_from_hir_scope(document, from, constrained_expr)?;
+            let target_position = from.source_position(source).ok_or_else(|| {
+                crate::LimboError::InternalError(format!(
+                    "HIR constraint source {source} is absent from FROM"
+                ))
+            })?;
+            if !target_mask.get(target_position) || target_mask.count() != 1 {
+                return Ok(None);
+            }
+            None
+        }
+    };
+    let operator = ConstraintOperator::from(ast::Operator::Is);
+    let selectivity = match constraint_source {
+        HirConstraintSource::BTree(table) => {
+            let column = table_col_pos.map(|position| &table.table.columns()[position]);
+            let index = table_col_pos.and_then(|position| {
+                hir_selectivity_index_for_column(schema, table, source_definition, position)
+            });
+            hir_estimate_constraint_selectivity(
+                schema, table, column, operator, true, index, params, false,
+            )
+        }
+        HirConstraintSource::Derived { .. } | HirConstraintSource::Cte { .. } => {
+            hir_estimate_scan_constraint_selectivity(operator, true, params)
+        }
+    };
+    Ok(Some(HirConstraint {
+        where_clause_pos: (term_position, BinaryExprSide::Rhs),
+        operator,
+        table_col_pos,
+        expr: None,
+        constraining_expr: Some((
+            ast::Operator::Is,
+            hir::Expr::Literal(ast::Literal::Null),
+            Affinity::Blob,
+        )),
+        lhs_mask: TableMask::default(),
+        selectivity,
+        usable: term.from_outer_join == Some(source) || !from.outer_join_may_null_extend(source),
+        is_rowid: false,
+        comparison_affinity: None,
+        comparison_collation: None,
+        null_matching: true,
+    }))
 }
 
 fn hir_estimate_constraint_selectivity(
@@ -807,10 +906,15 @@ fn hir_constrained_expr<'a>(
             "HIR constraint WHERE position {term_position} is out of bounds"
         ))
     })?;
-    let hir::Expr::Binary { lhs, rhs, .. } = &term.expr else {
-        return Err(crate::LimboError::InternalError(format!(
-            "HIR constraint WHERE position {term_position} is not binary"
-        )));
+    let (lhs, rhs) = match &term.expr {
+        hir::Expr::Binary { lhs, rhs, .. } => (lhs, rhs),
+        // `x IS NULL` constrains x; see `hir_is_null_constraint_for_term`.
+        hir::Expr::IsNull(constrained) => return Ok(constrained),
+        _ => {
+            return Err(crate::LimboError::InternalError(format!(
+                "HIR constraint WHERE position {term_position} is not binary"
+            )))
+        }
     };
     Ok(match constraining_side {
         BinaryExprSide::Lhs => rhs,
@@ -1029,7 +1133,10 @@ fn hir_in_query_constraint_for_term(
             "HIR IN constraint references missing query {query}"
         ))
     })?;
-    if !query_definition.captures.is_empty() {
+    // A subquery that reads the outer row cannot supply seek keys for it,
+    // even when only a query it runs reads that row, such as a FROM
+    // subquery: `id IN (SELECT a FROM (SELECT a FROM i WHERE i.k = o.k))`.
+    if document.reads_outer_sources(query_definition.id) {
         return Ok(None);
     }
     let Some((comparison_affinity, comparison_collation)) = hir_scalar_comparison(comparison)

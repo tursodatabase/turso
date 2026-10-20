@@ -33,7 +33,7 @@ addr  opcode                    p1  p2  p3  p4            p5  comment
    8          Rewind             4  33   0                 0  Rewind table purchases
    9            Once            19   0   0                 0  goto 19
   10            OpenAutoindex    3   0   0                 0  cursor=3
-  11            Rewind           2  12   0                 0  Rewind table customers
+  11            Rewind           2  19   0                 0  Rewind table customers
   12              RowId          2  17   0                 0  r[17]=customers.rowid
   13              Column         2   1  18                 0  r[18]=customers.name
   14              RowId          2  19   0                 0  r[19]=customers.rowid

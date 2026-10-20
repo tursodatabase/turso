@@ -1617,7 +1617,11 @@ fn join_kind_may_null_extend(
         hir::JoinKind::Left => right.contains(&source_position),
         hir::JoinKind::Right => (left_start..right.start).contains(&source_position),
         hir::JoinKind::Full => (left_start..right.end).contains(&source_position),
-        hir::JoinKind::Comma | hir::JoinKind::Inner | hir::JoinKind::Cross => false,
+        hir::JoinKind::Comma
+        | hir::JoinKind::Inner
+        | hir::JoinKind::Cross
+        | hir::JoinKind::Semi
+        | hir::JoinKind::Anti => false,
     }
 }
 
@@ -1649,6 +1653,8 @@ pub(crate) enum HirPlanSource {
         source: crate::translate::semantic::hir::SourceId,
         query: crate::translate::semantic::hir::QueryId,
         join_info: Option<HirJoinInfo>,
+        /// The order the subquery's plan returns its rows in.
+        output_order: Vec<crate::translate::optimizer::order::HirOutputOrder>,
     },
     Cte {
         source: crate::translate::semantic::hir::SourceId,
@@ -1656,6 +1662,8 @@ pub(crate) enum HirPlanSource {
         query: crate::translate::semantic::hir::QueryId,
         materialization: HirCteMaterialization,
         join_info: Option<HirJoinInfo>,
+        /// The order the CTE body's plan returns its rows in.
+        output_order: Vec<crate::translate::optimizer::order::HirOutputOrder>,
     },
     RecursiveCte {
         source: crate::translate::semantic::hir::SourceId,

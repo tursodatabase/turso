@@ -142,8 +142,25 @@ pub fn translate_update_for_schema_change(
     program: &mut ProgramBuilder,
     connection: &Arc<crate::Connection>,
     ddl_query: &str,
+    hir: Option<(&Arc<Schema>, &super::semantic_lowering::HirSettings<'_>)>,
     after: impl FnOnce(&mut ProgramBuilder),
 ) -> crate::Result<()> {
+    let body = match hir {
+        Some((schema, settings)) => {
+            let statement = ast::Stmt::Update(body);
+            if super::semantic_lowering::translate_schema_update(
+                &statement, schema, settings, program, connection, ddl_query,
+            )? {
+                after(program);
+                return Ok(());
+            }
+            let ast::Stmt::Update(body) = statement else {
+                unreachable!("the statement was built as an UPDATE")
+            };
+            body
+        }
+        None => body,
+    };
     let plan = prepare_and_optimize_update_plan(
         program,
         resolver,

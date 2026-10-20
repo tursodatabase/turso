@@ -88,6 +88,12 @@ enum Commands {
         /// :memory: databases are automatically upgraded to temp files for annotated tests.
         #[arg(long)]
         cross_check_binary: Option<PathBuf>,
+
+        /// Compare EXPLAIN QUERY PLAN output without instruction ids,
+        /// generated name ids and the order of subquery rows, so the plans
+        /// of two planners can be compared.
+        #[arg(long)]
+        normalize_plans: bool,
     },
 
     /// Validate test file syntax and check for pending snapshots
@@ -157,6 +163,7 @@ async fn main() -> ExitCode {
             snapshot_mode,
             snapshot_filter,
             cross_check_binary,
+            normalize_plans,
         } => {
             run_tests(
                 paths,
@@ -172,6 +179,7 @@ async fn main() -> ExitCode {
                 snapshot_mode,
                 snapshot_filter,
                 cross_check_binary,
+                normalize_plans,
             )
             .await
         }
@@ -228,6 +236,7 @@ async fn run_tests(
     snapshot_mode: SnapshotUpdateMode,
     snapshot_filter: Option<String>,
     cross_check_binary: Option<PathBuf>,
+    normalize_plans: bool,
 ) -> ExitCode {
     // Resolve paths, trying to add .sqltest extension if missing
     let mut resolved_paths = Vec::new();
@@ -331,6 +340,7 @@ async fn run_tests(
     if let Some(binary) = cross_check_binary {
         config = config.with_cross_check_binary(binary);
     }
+    config = config.with_normalize_plans(normalize_plans);
 
     // Create output formatter
     let mut output: Box<dyn OutputFormat> = create_output(format);

@@ -3443,11 +3443,19 @@ where
 #[derive(Clone, Debug)]
 pub(crate) struct HirOrUnion {
     pub(crate) branches: Vec<HirBtreeOperation>,
+    /// Position of the OR term in the block's predicates.
+    pub(crate) term: usize,
+    /// Every condition of every branch is applied by that branch's seek, so
+    /// the rows the seeks find are exactly the rows the OR term accepts.
+    /// Then, like legacy, the term is not checked again on each row, and a
+    /// subquery in it is not run a second time.
+    pub(crate) covers_term: bool,
 }
 
 /// Like legacy's OR-by-union: plan `source` as one seek per branch of one of
 /// its OR terms, when every branch can seek an index or the rowid and the
-/// seeks together cost less than scanning the table. The OR term itself is
+/// seeks together cost less than scanning the table. Unless the seeks apply
+/// every condition of the term ([`HirOrUnion::covers_term`]), the term is
 /// left in WHERE and checked again on each row read.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn plan_hir_or_union(
@@ -3531,9 +3539,10 @@ pub(crate) fn hir_or_union_with_cost(
             _ => parts.push(expr),
         }
     }
-    for term in predicates
+    for (term_position, term) in predicates
         .iter()
-        .filter(|term| !term.consumed && term.from_outer_join.is_none())
+        .enumerate()
+        .filter(|(_, term)| !term.consumed && term.from_outer_join.is_none())
     {
         if !matches!(
             &term.expr,
@@ -3551,6 +3560,7 @@ pub(crate) fn hir_or_union_with_cost(
         let mut disjuncts = Vec::new();
         split(&term.expr, ast::Operator::Or, &mut disjuncts);
         let mut branches = Vec::with_capacity(disjuncts.len());
+        let mut covers_term = true;
         let mut union_cost = Cost(0.0);
         let mut union_rows = 0.0;
         for disjunct in disjuncts {
@@ -3609,6 +3619,22 @@ pub(crate) fn hir_or_union_with_cost(
                 prior_sources,
                 source_position,
             )?);
+            // Like legacy, a branch whose leftover condition runs a subquery
+            // keeps the table scanned.
+            let leftover_runs_subquery = terms.iter().any(|term| {
+                let mut runs = false;
+                if !term.consumed {
+                    term.expr.for_each(&mut |expression| {
+                        runs |= matches!(expression, hir::Expr::Subquery(_));
+                    });
+                }
+                runs
+            });
+            if leftover_runs_subquery {
+                branches.clear();
+                break;
+            }
+            covers_term &= terms.iter().all(|term| term.consumed);
         }
         if branches.is_empty() {
             continue;
@@ -3617,7 +3643,12 @@ pub(crate) fn hir_or_union_with_cost(
         // in the table.
         let union_cost = union_cost + Cost(union_rows * 2.0 * params.cpu_cost_per_seek);
         if union_cost.0 < scan_cost.0 {
-            return Ok(Some((HirOrUnion { branches }, union_cost, union_rows)));
+            let union = HirOrUnion {
+                branches,
+                term: term_position,
+                covers_term,
+            };
+            return Ok(Some((union, union_cost, union_rows)));
         }
     }
     Ok(None)
@@ -3653,6 +3684,48 @@ pub(crate) fn apply_hir_selected_btree_access(
     .ok_or_else(|| {
         LimboError::InternalError("HIR B-tree plan selected a non-B-tree access method".into())
     })
+}
+
+/// The seek of a FROM subquery or CTE that
+/// [`access_method::find_best_hir_access_method_for_subquery`] chose to read
+/// through a temporary index over its stored rows, as legacy applies its
+/// `MaterializedSubquery` access: the seek's constraints are consumed and
+/// its key is built like any index seek. `None` when the subquery is
+/// scanned.
+pub(crate) fn apply_hir_materialized_subquery_access(
+    constraints: &constraints::HirTableConstraints,
+    predicates: &mut [HirWhereTerm],
+    access_method: &AccessMethod,
+    outer_join_source: Option<hir::SourceId>,
+) -> Result<Option<HirBtreeOperation>> {
+    match &access_method.params {
+        AccessMethodParams::Subquery { .. } => Ok(None),
+        AccessMethodParams::MaterializedSubquery {
+            index,
+            constraint_refs,
+            iter_dir,
+        } => {
+            mark_seek_constraints_consumed(
+                &constraints.constraints,
+                constraint_refs,
+                predicates,
+                outer_join_source,
+                false,
+            );
+            Ok(Some(SelectedBtreeOperation::Seek {
+                index: Some(index.clone()),
+                seek_def: HirBtreeOperationBuilder.seek_def(
+                    &constraints.constraints,
+                    constraint_refs,
+                    *iter_dir,
+                    predicates,
+                )?,
+            }))
+        }
+        _ => Err(LimboError::InternalError(
+            "HIR subquery source selected a table access method".into(),
+        )),
+    }
 }
 
 pub(crate) fn apply_hir_selected_virtual_access(

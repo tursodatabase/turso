@@ -30,13 +30,12 @@ use crate::{
 
 use super::autoincrement::Sequence;
 use super::dml::{
-    emit_access_predicates, emit_index_key, has_subquery, operation_index, touches_at_most_one_row,
-    DmlTarget, ReturningBuffer, Subprograms,
+    collect_target_rowids, emit_access_predicates, emit_index_key, has_subquery, operation_index,
+    touches_at_most_one_row, DmlTarget, ReturningBuffer, Subprograms,
 };
 use super::fkey_action::CompiledAction;
 use super::query::{
-    close_hir_btree_loop, hir_loop_explain, prepare_hir_btree_loop, start_hir_btree_loop,
-    PreparedHirBtreeLoop,
+    close_hir_btree_loop, hir_loop_explain, start_hir_btree_loop, PreparedHirBtreeLoop,
 };
 use super::trigger::{CompiledTrigger, TriggerRow};
 use crate::translate::emitter::OperationMode;
@@ -50,10 +49,7 @@ pub(super) fn needs_legacy(
     access: &HirAccessPlan,
 ) -> Result<bool> {
     let document = &plan.document;
-    if !update.order_by.is_empty()
-        || update.limit.is_some()
-        || update.cdc_updates_override.is_some()
-    {
+    if !update.order_by.is_empty() || update.limit.is_some() {
         return Ok(true);
     }
     // Like legacy, writes to a virtual table record no change data.
@@ -128,15 +124,19 @@ pub(super) fn needs_legacy(
             access.loops.len()
         )));
     };
-    let HirSourceAccess::BTree { operation, .. } = &planned_loop.access else {
-        return Ok(true);
-    };
-    // A loop over an index built for this statement is not lowered yet.
-    Ok(operation_index(operation).is_some_and(|index| index.ephemeral))
+    match &planned_loop.access {
+        // A loop over an index built for this statement is not lowered yet.
+        HirSourceAccess::BTree { operation, .. } => {
+            Ok(operation_index(operation).is_some_and(|index| index.ephemeral))
+        }
+        HirSourceAccess::OrUnion(_) | HirSourceAccess::IndexMethod(_) => Ok(false),
+        _ => Ok(true),
+    }
 }
 
 /// Emit an UPDATE that [`needs_legacy`] accepted. `update` is the plan's
 /// root or one command of a trigger in it.
+#[allow(clippy::too_many_arguments)]
 pub(super) fn emit_update(
     program: &mut ProgramBuilder,
     plan: &HirPlan,
@@ -145,6 +145,7 @@ pub(super) fn emit_update(
     subprograms: &Subprograms<'_>,
     mvcc: bool,
     enforce_checks: bool,
+    schema_change: Option<&str>,
 ) -> Result<()> {
     let triggers = &subprograms.triggers[..];
     let actions = &subprograms.actions[..];
@@ -170,10 +171,17 @@ pub(super) fn emit_update(
                     planned_loop.source, update.target
                 )));
             }
-            let HirSourceAccess::BTree { operation, .. } = &planned_loop.access else {
-                return Err(LimboError::InternalError(
-                    "HIR UPDATE target does not use a B-tree loop".into(),
-                ));
+            // One seek per branch of an OR term reads rows in rowid order
+            // through a row set, and an index method may stream its rows
+            // lazily; like legacy, the UPDATE then collects its rowids first.
+            let operation = match &planned_loop.access {
+                HirSourceAccess::BTree { operation, .. } => Some(operation),
+                HirSourceAccess::OrUnion(_) | HirSourceAccess::IndexMethod(_) => None,
+                _ => {
+                    return Err(LimboError::InternalError(
+                        "HIR UPDATE target does not use a B-tree loop".into(),
+                    ))
+                }
             };
             Some((planned_loop, operation))
         }
@@ -263,7 +271,7 @@ pub(super) fn emit_update(
     if triggers.is_empty()
         && !has_foreign_keys
         && !replaces
-        && single_loop.is_some_and(|(_, operation)| touches_at_most_one_row(operation))
+        && single_loop.is_some_and(|(_, operation)| operation.is_some_and(touches_at_most_one_row))
     {
         program.set_multi_write(false);
     }
@@ -295,13 +303,13 @@ pub(super) fn emit_update(
     match single_loop {
         Some((planned_loop, _)) => program.emit_source_explain(
             target.source.id,
-            hir_loop_explain(document, None, planned_loop)?,
+            hir_loop_explain(document, None, &[], planned_loop)?,
         ),
         None => {
             for planned_loop in &access.loops {
                 program.emit_source_explain(
                     planned_loop.source,
-                    hir_loop_explain(document, update.from.as_ref(), planned_loop)?,
+                    hir_loop_explain(document, update.from.as_ref(), &[], planned_loop)?,
                 );
             }
         }
@@ -409,6 +417,17 @@ pub(super) fn emit_update(
         actions,
         replace_actions,
         sequence: sequence.as_ref(),
+        // ALTER TABLE rewrites a schema row with a generated UPDATE; like
+        // legacy, change data capture records the user's DDL as the new
+        // `sql` value instead.
+        schema_change: schema_change.and_then(|ddl| {
+            table
+                .columns()
+                .iter()
+                .position(|column| column.name.as_deref() == Some("sql"))
+                .filter(|position| assigned.contains(position))
+                .map(|position| (position, ddl))
+        }),
     };
     let done = program.allocate_label();
     // Like legacy, an UPDATE with triggers, OR REPLACE or a subquery in its
@@ -421,7 +440,7 @@ pub(super) fn emit_update(
     // its rows first, so the loop never reaches a changed row again.
     let moves_rows = rowid_value.is_some()
         || single_loop
-            .and_then(|(_, operation)| operation_index(operation))
+            .and_then(|(_, operation)| operation_index(operation?))
             .is_some_and(|index| {
                 replaces
                     || changed_indexes
@@ -439,7 +458,7 @@ pub(super) fn emit_update(
             row,
             done,
         )?,
-        Some((_, operation))
+        Some((_, Some(operation)))
             if triggers.is_empty()
                 && actions.is_empty()
                 && !statement_replace
@@ -657,6 +676,9 @@ struct UpdateRowLayout<'a> {
     mvcc: bool,
     /// The ON UPDATE actions to run once the row is written.
     actions: &'a [CompiledAction<'a>],
+    /// For ALTER TABLE's schema-row UPDATE: the `sql` column, and the DDL
+    /// change data capture records as its new value.
+    schema_change: Option<(usize, &'a str)>,
     /// The ON DELETE actions of a row REPLACE deletes.
     replace_actions: &'a [CompiledAction<'a>],
     /// AUTOINCREMENT, when the UPDATE sets the rowid: the target's sequence.
@@ -757,39 +779,13 @@ fn emit_rowset_update(
     settings: UpdateRowSettings,
     done: BranchOffset,
 ) -> Result<()> {
-    let document = target.document;
     let [planned_loop] = access.loops.as_slice() else {
         return Err(LimboError::InternalError(format!(
             "HIR UPDATE plan has {} loops for one target",
             access.loops.len()
         )));
     };
-    let rowset = program.alloc_register();
-    program.emit_insn(Insn::Null {
-        dest: rowset,
-        dest_end: None,
-    });
-    let collected = program.allocate_label();
-    let prepared = prepare_hir_btree_loop(program, plan, planned_loop)?;
-    emit_access_predicates(program, document, access, None, collected)?;
-    let hir_loop = start_hir_btree_loop(program, document, &prepared, None)?;
-    emit_access_predicates(program, document, access, Some(0), hir_loop.next)?;
-    let rowid = program.alloc_register();
-    super::expr::translate_expr(
-        program,
-        document,
-        &hir::Expr::RowId(target.source.id),
-        rowid,
-    )?;
-    program.emit_insn(Insn::RowSetAdd {
-        rowset_reg: rowset,
-        value_reg: rowid,
-    });
-    close_hir_btree_loop(program, &hir_loop, &[]);
-    program.preassign_label_to_next_insn(collected);
-    for cursor in std::iter::once(prepared.cursor).chain(prepared.table_cursor) {
-        program.emit_insn(Insn::Close { cursor_id: cursor });
-    }
+    let rowset = collect_target_rowids(program, plan, target, access, planned_loop)?;
 
     let table_cursor = target.open_table_for_write(program);
     let index_cursors = open_changed_indexes(program, target, layout)?;
@@ -1350,6 +1346,12 @@ impl UpdateRow<'_, '_> {
         // Like legacy, a BEFORE trigger runs before NOT NULL is checked.
         self.emit_new_values(program, layout, !has_before, updates)?;
         self.emit_virtual_columns(program, layout, !has_before)?;
+        if let (Some(updates), Some((position, ddl))) = (updates, layout.schema_change) {
+            program.emit_insn(Insn::String8 {
+                value: ddl.to_string(),
+                dest: updates + columns + position,
+            });
+        }
         if let Some(updates) = updates {
             // Like legacy, a changed virtual column records its value.
             for &position in layout.assigned {
@@ -2237,6 +2239,7 @@ mod tests {
             &Subprograms::default(),
             false,
             true,
+            None,
         )
         .unwrap();
         program

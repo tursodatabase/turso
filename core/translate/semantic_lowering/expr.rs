@@ -255,6 +255,10 @@ enum NullTest {
 struct LoweringContext {
     target: usize,
     registers: ExprRegisters,
+    /// How this expression avoids being computed again on every row.
+    hoisted: Option<Hoisted>,
+    /// Whether an enclosing operand is computed once already.
+    in_hoisted: bool,
 }
 
 impl LoweringContext {
@@ -262,8 +266,21 @@ impl LoweringContext {
         Self {
             target,
             registers: ExprRegisters::None,
+            hoisted: None,
+            in_hoisted: false,
         }
     }
+}
+
+/// A constant operand computed once, as legacy computes it.
+#[derive(Clone, Copy)]
+enum Hoisted {
+    /// An operand without a function call, moved before the loops by this
+    /// constant span.
+    Span(usize),
+    /// Anything else, which might fail, computed the first time it is
+    /// reached and kept in its own register: `Once` jumps here after that.
+    Once(BranchOffset),
 }
 
 fn binary_registers(registers: ExprRegisters) -> BinaryOperands {
@@ -1717,10 +1734,79 @@ impl<'expr> hir::ExprVisitor<'expr> for ExprLowerer<'_, 'expr, '_> {
             hir::Expr::Row(_) => context.target + child_index,
             _ => return Ok(ControlFlow::Break(())),
         };
-        Ok(ControlFlow::Continue(LoweringContext::new(target)))
+        let mut child_context = LoweringContext::new(target);
+        child_context.in_hoisted = context.in_hoisted || context.hoisted.is_some();
+        // The operands of an ordinary operator or function each have their
+        // own register, which nothing else writes.
+        let own_register = match parent {
+            hir::Expr::Binary { custom: None, .. } => true,
+            hir::Expr::Function(call) => {
+                matches!(call.evaluation, hir::FunctionEvaluation::Scalar)
+                    && matches!(call.operation, hir::FunctionOperation::Ordinary)
+                    && plain_function_lowering(call.function.value()).is_some()
+            }
+            _ => false,
+        };
+        if own_register && !child_context.in_hoisted {
+            child_context.hoisted = self.begin_hoisted_constant(child);
+        }
+        Ok(ControlFlow::Continue(child_context))
     }
 
     fn post_order(
+        &mut self,
+        expression: &hir::Expr,
+        mut context: LoweringContext,
+        children: &[usize],
+    ) -> Result<usize> {
+        let hoisted = context.hoisted.take();
+        let value = self.post_order_value(expression, context, children)?;
+        match hoisted {
+            Some(Hoisted::Span(span)) => self.program.constant_span_end(span),
+            Some(Hoisted::Once(done)) => self.program.preassign_label_to_next_insn(done),
+            None => {}
+        }
+        Ok(value)
+    }
+}
+
+impl<'expr> ExprLowerer<'_, 'expr, '_> {
+    /// Like legacy, an operand with the same value on every row, such as
+    /// the `1` of `a + 1` or the `upper('x')` of `upper('x') || b`, is not
+    /// computed again for each row. Without a function call or a CAST to a
+    /// custom type it cannot fail, so it moves before the loops. A function
+    /// might fail, as `abs(-9223372036854775808)` does, so an operand that
+    /// calls one still runs only where it is first reached, as SQLite's does.
+    fn begin_hoisted_constant(&mut self, operand: &hir::Expr) -> Option<Hoisted> {
+        if self.program.constant_span_is_open()
+            || matches!(operand, hir::Expr::Parameter(_))
+            || !hir_expr_is_constant(self.program, operand)
+        {
+            return None;
+        }
+        // A CAST to a custom type runs its encoder and domain checks, which
+        // may fail like a function.
+        let mut may_fail = false;
+        operand.for_each(&mut |expression| {
+            may_fail |= match expression {
+                hir::Expr::Function(_) => true,
+                hir::Expr::Cast { target, .. } => {
+                    !target.programs.encode.is_empty() || target.programs.domain.is_some()
+                }
+                _ => false,
+            };
+        });
+        if !may_fail {
+            return Some(Hoisted::Span(self.program.constant_span_start()));
+        }
+        let done = self.program.allocate_label();
+        self.program.emit_insn(Insn::Once {
+            target_pc_when_reentered: done,
+        });
+        Some(Hoisted::Once(done))
+    }
+
+    fn post_order_value(
         &mut self,
         expression: &hir::Expr,
         context: LoweringContext,

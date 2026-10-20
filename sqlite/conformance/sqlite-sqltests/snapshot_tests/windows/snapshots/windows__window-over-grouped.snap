@@ -84,8 +84,8 @@ addr  opcode                      p1  p2  p3  p4                     p5  comment
   58        MakeRecord             2   3  34                          0  r[34]=mkrec(r[2..4])
   59        NewRowid               5  30   0                          0  r[30]=rowid
   60        Insert                 5  34  30  buffer_table_window_0   2  intkey=r[30] data=r[34]
-  61        Rewind                 4  63   0                          0  Rewind  ephemeral(buffer_table_window_0)
-  62        Rewind                 6  63   0                          0  Rewind  ephemeral(buffer_table_window_0)
+  61        Rewind                 4  63   0                          0  Rewind table ephemeral(buffer_table_window_0)
+  62        Rewind                 6  63   0                          0  Rewind table ephemeral(buffer_table_window_0)
   63        Goto                   0  75   0                          0
   64        MakeRecord             2   3  35                          0  r[35]=mkrec(r[2..4])
   65        NewRowid               5  30   0                          0  r[30]=rowid
@@ -100,7 +100,7 @@ addr  opcode                      p1  p2  p3  p4                     p5  comment
   74        Next                   4  75   0                          0
   75      Goto                     0  54   0                          0
   76      Null                     0  31   0                          0  r[31]=NULL; return remaining buffered rows
-  77      Rewind                   5  88   0                          0  Rewind  ephemeral(buffer_table_window_0)
+  77      Rewind                   5  88   0                          0  Rewind table ephemeral(buffer_table_window_0)
   78      AggStep                  0   0  25  row_number              0  accum=r[25] step(r[0])
   79      Next                     6  80   0                          0
   80      AggValue                 0  25  26  row_number              0  accum=r[25] dest=r[26]

@@ -1075,6 +1075,9 @@ impl ProgramBuilder {
     }
 
     pub(crate) fn set_hir_plan(&mut self, plan: Arc<crate::translate::semantic_to_plan::HirPlan>) {
+        for parameter in &plan.dropped_parameters {
+            self.register_parameter(parameter.index, &parameter.spelling);
+        }
         self.hir_plan = Some(plan);
     }
 
@@ -1091,6 +1094,16 @@ impl ProgramBuilder {
     ) {
         self.expression_registers
             .push((std::ptr::from_ref(expression) as usize, register));
+    }
+
+    /// How many expression registers are bound, to drop the ones bound
+    /// after this point with [Self::truncate_expression_registers].
+    pub(crate) fn expression_register_count(&self) -> usize {
+        self.expression_registers.len()
+    }
+
+    pub(crate) fn truncate_expression_registers(&mut self, count: usize) {
+        self.expression_registers.truncate(count);
     }
 
     pub(crate) fn expression_register(

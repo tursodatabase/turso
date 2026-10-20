@@ -191,6 +191,7 @@ fn compile_action<'a>(
                 &subprograms,
                 super::uses_mvcc(connection, &plan.document, update.target),
                 !connection.check_constraints_ignored(),
+                None,
             )?;
         }
         _ => {

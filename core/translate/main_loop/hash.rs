@@ -763,6 +763,16 @@ impl<'a, 'plan> HashProbeSetupEmitter<'a, 'plan> {
         };
 
         let match_reg = self.program.alloc_register();
+        if self.hash_join_op.join_type == HashJoinType::FullOuter {
+            // A probe row set aside for grace processing jumps to the miss
+            // label with NULL here; a real miss leaves this 0. Only a real
+            // miss emits the probe row with a NULL build side now: grace
+            // emits the set-aside row once it knows its matches.
+            self.program.emit_insn(Insn::Integer {
+                value: 0,
+                dest: match_reg,
+            });
+        }
         self.program.emit_insn(Insn::HashProbe {
             hash_table_id: to_u32(hash_table_id),
             key_start_reg: to_u32(probe_key_start_reg),
@@ -1063,6 +1073,11 @@ impl<'a, 'plan> HashProbeCloseEmitter<'a, 'plan> {
                 reg: reg_match_flag,
                 target_pc: label_next_probe_row,
                 decrement_by: 0,
+            });
+            // The probe row waits for grace processing, which emits it.
+            self.program.emit_insn(Insn::IsNull {
+                reg: self.hash_ctx.match_reg,
+                target_pc: label_next_probe_row,
             });
 
             if let Some(cursor_id) = self.hash_ctx.build_cursor_id {

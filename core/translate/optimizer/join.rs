@@ -276,6 +276,83 @@ pub(super) fn count_subquery_calls_for_plan(
     Ok(calls)
 }
 
+/// Legacy's [count_subquery_calls_for_plan] for a HIR block: how many times
+/// each correlated subquery runs, counted from the rows that reach the join
+/// step where the last block source it reads is joined. Each subquery comes
+/// with the block sources it reads, as positions, and the position of the
+/// first predicate it appears in: that predicate and the ones after it run
+/// after the subquery, so they cannot reduce its calls.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn hir_subquery_calls_for_plan(
+    plan: &JoinN,
+    access_methods: &[AccessMethod],
+    constraints: &[HirTableConstraints],
+    sources: &[HirPlanSource],
+    subqueries: &[(hir::QueryId, TableMask, Option<usize>)],
+    predicate_count: usize,
+    initial_input_cardinality: f64,
+    params: &CostModelParams,
+) -> Result<Vec<(hir::QueryId, f64)>> {
+    let mut calls = Vec::new();
+    if subqueries.is_empty() {
+        return Ok(calls);
+    }
+    let mut prior_sources = TableMask::default();
+    let mut input_cardinality = initial_input_cardinality;
+    for (source_position, access_method_index) in &plan.data {
+        let method = &access_methods[*access_method_index];
+        let mut source_mask = TableMask::default();
+        source_mask.set(*source_position)?;
+        let mut current_sources = prior_sources.clone();
+        current_sources.set(*source_position)?;
+        let rows_before_filters = input_cardinality * method.estimated_rows_per_outer_row;
+        for (query, required, first_predicate) in subqueries {
+            if required.is_empty()
+                || !current_sources.contains_all_set_bits_of(required)
+                || prior_sources.contains_all_set_bits_of(required)
+            {
+                continue;
+            }
+            let skipped: BitSet<usize> = match first_predicate {
+                Some(first) => (*first..predicate_count).try_collect()?,
+                None => Default::default(),
+            };
+            let multiplier = constraint_output_multipliers(
+                &constraints[*source_position],
+                &prior_sources,
+                source_mask.clone(),
+                &method.consumed_where_terms,
+                &skipped,
+                params,
+            );
+            calls.push((*query, (rows_before_filters * multiplier).max(1.0)));
+        }
+        input_cardinality = rows_after_join(
+            input_cardinality,
+            method,
+            &constraints[*source_position],
+            &prior_sources,
+            source_mask,
+            hir_is_semi_or_anti(sources, *source_position),
+            params,
+        );
+        prior_sources.set(*source_position)?;
+    }
+    Ok(calls)
+}
+
+/// Whether the source at `position` is the right side of a semi-join or
+/// anti-join, which passes on each row before it at most once.
+fn hir_is_semi_or_anti(sources: &[HirPlanSource], position: usize) -> bool {
+    sources[position].join_info().is_some_and(|join| {
+        matches!(
+            join.kind,
+            crate::translate::semantic::hir::JoinKind::Semi
+                | crate::translate::semantic::hir::JoinKind::Anti
+        )
+    })
+}
+
 /// Represents an n-ary join, anywhere from 1 table to N tables.
 #[derive(Debug, Clone)]
 pub struct JoinN {
@@ -660,6 +737,10 @@ fn join_lhs_and_rhs<'a>(
             );
             if allow_hash_join {
                 let lhs_constraints = build_constraints;
+                let rhs_is_outer = rhs_table_reference
+                    .join_info
+                    .as_ref()
+                    .is_some_and(crate::translate::plan::JoinInfo::is_outer);
                 if let Some(hash_join_method) = try_hash_join_access_method(
                     build_table,
                     rhs_table_reference,
@@ -670,10 +751,18 @@ fn join_lhs_and_rhs<'a>(
                     where_clause,
                     where_terms.iter().enumerate().filter_map(|(index, term)| {
                         let (left, right, owner) = term.equal_tables?;
-                        // An outer join condition belongs to that join only.
-                        owner
-                            .is_none_or(|owner| owner == rhs_table_reference.internal_id)
-                            .then_some((index, left, right))
+                        // An outer join condition belongs to that join only,
+                        // and an outer hash join takes its keys from its own
+                        // ON terms only: a WHERE term used as a key would
+                        // never be checked on the rows the join NULL-fills,
+                        // which it must reject.
+                        let own_on_term = owner == Some(rhs_table_reference.internal_id);
+                        let usable = if rhs_is_outer {
+                            own_on_term
+                        } else {
+                            owner.is_none() || own_on_term
+                        };
+                        usable.then_some((index, left, right))
                     }),
                     build_cardinality,
                     probe_cardinality,
@@ -950,8 +1039,8 @@ fn join_lhs_and_rhs<'a>(
 
 /// Returns true when build-side constraints reference prior tables in ways that
 /// are not already consumed by hash-join keys.
-fn build_has_uncovered_prior_constraints(
-    build_constraints: &TableConstraints,
+fn build_has_uncovered_prior_constraints<E, S>(
+    build_constraints: &TableConstraints<E, S>,
     join_keys: &[HashJoinKey],
     prior_mask: &TableMask,
     prior_hash_build_mask: &TableMask,
@@ -984,8 +1073,8 @@ fn build_has_uncovered_prior_constraints(
 }
 
 /// Estimates selectivity from prior equality constraints on the build side.
-fn build_prior_constraint_selectivity(
-    build_constraints: &TableConstraints,
+fn build_prior_constraint_selectivity<E, S>(
+    build_constraints: &TableConstraints<E, S>,
     prior_mask: &TableMask,
 ) -> f64 {
     let mut selectivity = 1.0;
@@ -1036,8 +1125,8 @@ fn build_self_constraint_selectivity<E, S>(
 }
 
 /// Returns true if any prior constraints can be turned into an index lookup.
-fn build_has_indexable_prior_constraints(
-    build_constraints: &TableConstraints,
+fn build_has_indexable_prior_constraints<E, S>(
+    build_constraints: &TableConstraints<E, S>,
     prior_mask: &TableMask,
 ) -> bool {
     build_constraints.candidates.iter().any(|candidate| {
@@ -1185,6 +1274,8 @@ pub(crate) fn hir_join_ordering_restrictions(
                         | crate::translate::semantic::hir::JoinKind::Left
                         | crate::translate::semantic::hir::JoinKind::Right
                         | crate::translate::semantic::hir::JoinKind::Full
+                        | crate::translate::semantic::hir::JoinKind::Semi
+                        | crate::translate::semantic::hir::JoinKind::Anti
                 )
             ),
             full_outer: kind == Some(crate::translate::semantic::hir::JoinKind::Full),
@@ -1940,6 +2031,7 @@ pub(crate) fn compute_hir_join_order(
     analyze_stats: &AnalyzeStats,
     params: &CostModelParams,
     or_union: bool,
+    hash: &HirHashJoins<'_>,
 ) -> Result<Option<BestJoinOrderResult>> {
     if sources.len() <= 1 || sources.len() > HIR_EXHAUSTIVE_JOIN_LIMIT {
         return compute_hir_greedy_join_order(
@@ -1957,6 +2049,7 @@ pub(crate) fn compute_hir_join_order(
             analyze_stats,
             params,
             or_union,
+            hash,
         );
     }
     let ordering_restrictions = hir_join_ordering_restrictions(sources)?;
@@ -1966,7 +2059,14 @@ pub(crate) fn compute_hir_join_order(
     };
     let layout = HirFromLayout::new(sources, groups);
     let predicate_work = build_hir_predicate_work(document, &layout, where_clause)?;
-    let step = |position: usize, lhs_mask: &TableMask, input_cardinality: f64| {
+    let step = |position: usize,
+                lhs_mask: &TableMask,
+                lhs_steps: &[(usize, AccessMethod)],
+                input_cardinality: f64| {
+        let lhs_steps = lhs_steps
+            .iter()
+            .map(|(position, method)| (*position, method))
+            .collect::<Vec<_>>();
         hir_join_step(
             document,
             sources,
@@ -1979,11 +2079,13 @@ pub(crate) fn compute_hir_join_order(
             order_target,
             position,
             lhs_mask,
+            &lhs_steps,
             input_cardinality,
             schema,
             analyze_stats,
             params,
             or_union,
+            hash,
         )
     };
     let allowed = |position: usize, lhs_mask: &TableMask| {
@@ -1999,7 +2101,7 @@ pub(crate) fn compute_hir_join_order(
         if !allowed(position, &empty) {
             continue;
         }
-        let Some(first) = step(position, &empty, initial_input_cardinality)? else {
+        let Some(first) = step(position, &empty, &[], initial_input_cardinality)? else {
             continue;
         };
         let mut mask = TableMask::default();
@@ -2024,7 +2126,82 @@ pub(crate) fn compute_hir_join_order(
         );
     }
 
+    // Add `rhs` after the tables of `lhs`.
+    let extend = |lhs: &HirPartialJoin,
+                  lhs_mask: &TableMask,
+                  rhs: usize|
+     -> Result<Option<HirPartialJoin>> {
+        let Some(next) = step(rhs, lhs_mask, &lhs.steps, lhs.output_cardinality)? else {
+            return Ok(None);
+        };
+        let mut method = next.access_method;
+        // Like legacy, a table nothing joins to the tables before it pays for
+        // the cross product.
+        let connected = predicate_work
+            .iter()
+            .any(|work| work.table_mask.get(rhs) && work.table_mask.intersects(lhs_mask));
+        if !connected {
+            let base_rows = base_table_rows
+                .get(rhs)
+                .copied()
+                .unwrap_or_else(|| RowCountEstimate::hardcoded_fallback(params));
+            let self_selectivity = build_self_constraint_selectivity(&constraints[rhs], rhs);
+            method.cost =
+                method.cost + Cost(lhs.output_cardinality * *base_rows * self_selectivity);
+        }
+        let mut rhs_mask = TableMask::default();
+        rhs_mask.set(rhs)?;
+        let output_cardinality = rows_after_join(
+            lhs.output_cardinality,
+            &method,
+            &constraints[rhs],
+            lhs_mask,
+            rhs_mask,
+            hir_is_semi_or_anti(sources, rhs),
+            params,
+        );
+        let mut steps = lhs
+            .steps
+            .iter()
+            .map(|(position, method)| (*position, method.clone()))
+            .collect::<Vec<_>>();
+        steps.push((rhs, method.clone()));
+        Ok(Some(HirPartialJoin {
+            steps,
+            output_cardinality,
+            cost: lhs.cost + method.cost,
+        }))
+    };
+
+    // Like legacy, the plan that joins the tables in FROM order goes first and
+    // only a strictly cheaper plan replaces it.
+    let mut from_order: Option<HirPartialJoin> = memo
+        .get(&{
+            let mut mask = TableMask::default();
+            mask.set(0)?;
+            mask
+        })
+        .and_then(|plans| plans.get(&0))
+        .map(|first| HirPartialJoin {
+            steps: first.steps.clone(),
+            output_cardinality: first.output_cardinality,
+            cost: first.cost,
+        });
+    let mut from_order_mask = TableMask::default();
+    from_order_mask.set(0)?;
+    for rhs in 1..sources.len() {
+        let Some(lhs) = from_order.take() else {
+            break;
+        };
+        if !allowed(rhs, &from_order_mask) {
+            break;
+        }
+        from_order = extend(&lhs, &from_order_mask, rhs)?;
+        from_order_mask.set(rhs)?;
+    }
+
     let mut complete: Vec<HirPartialJoin> = Vec::new();
+    complete.extend(from_order);
     for subset_size in 2..=sources.len() {
         for mask in generate_join_bitmasks(sources.len(), subset_size) {
             let mask = mask?;
@@ -2041,71 +2218,25 @@ pub(crate) fn compute_hir_join_order(
                 let Some(lhs_plans) = memo.get(&lhs_mask) else {
                     continue;
                 };
-                let connected = predicate_work
-                    .iter()
-                    .any(|work| work.table_mask.get(rhs) && work.table_mask.intersects(&lhs_mask));
                 let mut last_positions = lhs_plans.keys().copied().collect::<Vec<_>>();
                 last_positions.sort_unstable();
                 for last in last_positions {
-                    let lhs = &lhs_plans[&last];
-                    let Some(next) = step(rhs, &lhs_mask, lhs.output_cardinality)? else {
+                    let Some(plan) = extend(&lhs_plans[&last], &lhs_mask, rhs)? else {
                         continue;
                     };
-                    let mut method = next.access_method;
-                    // Like legacy, a table nothing joins to the tables before
-                    // it pays for the cross product.
-                    if !connected {
-                        let base_rows = base_table_rows
-                            .get(rhs)
-                            .copied()
-                            .unwrap_or_else(|| RowCountEstimate::hardcoded_fallback(params));
-                        let self_selectivity =
-                            build_self_constraint_selectivity(&constraints[rhs], rhs);
-                        method.cost = method.cost
-                            + Cost(lhs.output_cardinality * *base_rows * self_selectivity);
-                    }
-                    let mut rhs_mask = TableMask::default();
-                    rhs_mask.set(rhs)?;
-                    let output_cardinality = rows_after_join(
-                        lhs.output_cardinality,
-                        &method,
-                        &constraints[rhs],
-                        &lhs_mask,
-                        rhs_mask,
-                        false,
-                        params,
-                    );
-                    let cost = lhs.cost + method.cost;
                     if best_by_last
                         .get(&rhs)
-                        .is_some_and(|existing| existing.cost.0 <= cost.0)
+                        .is_some_and(|existing| existing.cost.0 <= plan.cost.0)
                     {
                         continue;
                     }
-                    let mut steps = lhs
-                        .steps
-                        .iter()
-                        .map(|(position, method)| (*position, method.clone()))
-                        .collect::<Vec<_>>();
-                    steps.push((rhs, method));
-                    best_by_last.insert(
-                        rhs,
-                        HirPartialJoin {
-                            steps,
-                            output_cardinality,
-                            cost,
-                        },
-                    );
+                    best_by_last.insert(rhs, plan);
                 }
             }
             if subset_size == sources.len() {
-                let mut lasts = best_by_last.keys().copied().collect::<Vec<_>>();
-                lasts.sort_unstable();
-                for last in lasts {
-                    if let Some(plan) = best_by_last.remove(&last) {
-                        complete.push(plan);
-                    }
-                }
+                // Visit the finished plans in the same map order as legacy so
+                // that equally cheap plans resolve the same way.
+                complete.extend(best_by_last.into_values());
             } else if !best_by_last.is_empty() {
                 memo.insert(mask, best_by_last);
             }
@@ -2124,20 +2255,12 @@ pub(crate) fn compute_hir_join_order(
         output_cardinality: plan.output_cardinality,
         cost: plan.cost,
     };
-    // Like legacy, a tie keeps the FROM clause's order, so rows of equally
-    // cheap plans come out in the same order as before.
-    let order_key = |plan: &HirPartialJoin| {
-        plan.steps
-            .iter()
-            .map(|(position, _)| *position)
-            .collect::<Vec<_>>()
-    };
-    let Some(best_position) = (0..complete.len()).min_by(|left, right| {
-        complete[*left]
-            .cost
-            .0
-            .total_cmp(&complete[*right].cost.0)
-            .then_with(|| order_key(&complete[*left]).cmp(&order_key(&complete[*right])))
+    let Some(best_position) = (0..complete.len()).reduce(|best, position| {
+        if complete[position].cost.0 < complete[best].cost.0 {
+            position
+        } else {
+            best
+        }
     }) else {
         return Err(LimboError::PlanningError(
             "No valid HIR join order found".to_string(),
@@ -2216,6 +2339,7 @@ pub(crate) fn compute_hir_greedy_join_order(
     analyze_stats: &AnalyzeStats,
     params: &CostModelParams,
     or_union: bool,
+    hash: &HirHashJoins<'_>,
 ) -> Result<Option<BestJoinOrderResult>> {
     if sources.is_empty() {
         return Ok(None);
@@ -2258,11 +2382,13 @@ pub(crate) fn compute_hir_greedy_join_order(
             order_target,
             position,
             &joined_mask,
+            &[],
             initial_input_cardinality,
             schema,
             analyze_stats,
             params,
             or_union,
+            hash,
         )?;
         if first.is_some() {
             break;
@@ -2332,6 +2458,10 @@ pub(crate) fn compute_hir_greedy_join_order(
                 continue;
             }
 
+            let lhs_steps = data
+                .iter()
+                .map(|(position, method)| (*position, &access_methods_arena[*method]))
+                .collect::<Vec<_>>();
             let Some(step) = hir_join_step(
                 document,
                 sources,
@@ -2344,11 +2474,13 @@ pub(crate) fn compute_hir_greedy_join_order(
                 order_target,
                 position,
                 &joined_mask,
+                &lhs_steps,
                 output_cardinality,
                 schema,
                 analyze_stats,
                 params,
                 or_union,
+                hash,
             )?
             else {
                 continue;
@@ -2375,7 +2507,7 @@ pub(crate) fn compute_hir_greedy_join_order(
                 &constraints[position],
                 &joined_mask,
                 rhs_mask,
-                false,
+                hir_is_semi_or_anti(sources, position),
                 params,
             );
             if best
@@ -2408,6 +2540,11 @@ pub(crate) fn compute_hir_greedy_join_order(
 }
 
 #[allow(clippy::too_many_arguments)]
+/// Whether a source is the right side of a RIGHT or FULL JOIN.
+fn hir_right_or_full_join(join_info: Option<&crate::translate::plan::HirJoinInfo>) -> bool {
+    join_info.is_some_and(|join| matches!(join.kind, hir::JoinKind::Right | hir::JoinKind::Full))
+}
+
 fn hir_join_step(
     document: &HirDocument,
     sources: &[HirPlanSource],
@@ -2420,11 +2557,13 @@ fn hir_join_step(
     order_target: Option<&HirOrderTarget<'_>>,
     source_position: usize,
     lhs_mask: &TableMask,
+    lhs_steps: &[(usize, &AccessMethod)],
     input_cardinality: f64,
     schema: &Schema,
     analyze_stats: &AnalyzeStats,
     params: &CostModelParams,
     or_union: bool,
+    hash: &HirHashJoins<'_>,
 ) -> Result<Option<HirJoinStep>> {
     let source = &sources[source_position];
     let mut joined_mask = lhs_mask.try_clone()?;
@@ -2486,19 +2625,29 @@ fn hir_join_step(
                         schema,
                         params,
                     )? {
-                        let union_cost = Cost(union_cost.0 * input_cardinality);
-                        if union_cost.0 < method.cost.0 {
-                            method = AccessMethod {
-                                cost: union_cost,
-                                estimated_rows_per_outer_row: union_rows,
-                                consumed_where_terms: Default::default(),
-                                params: AccessMethodParams::BTreeTable {
-                                    iter_dir: crate::translate::plan::IterationDirection::Forwards,
-                                    index: None,
-                                    build_index: false,
-                                    constraint_refs: Vec::new(),
-                                },
-                            };
+                        let union_method = AccessMethod {
+                            cost: Cost(union_cost.0 * input_cardinality),
+                            estimated_rows_per_outer_row: union_rows,
+                            consumed_where_terms: Default::default(),
+                            params: AccessMethodParams::BTreeTable {
+                                iter_dir: crate::translate::plan::IterationDirection::Forwards,
+                                index: None,
+                                build_index: false,
+                                constraint_refs: Vec::new(),
+                            },
+                        };
+                        // Like legacy, both sides count the WHERE terms the
+                        // rows they return still have to pass.
+                        let with_where = |method: &AccessMethod| {
+                            super::access_method::cost_with_where_work(
+                                method,
+                                &ready_where,
+                                input_cardinality,
+                                params,
+                            )
+                        };
+                        if with_where(&union_method) < with_where(&method) {
+                            method = union_method;
                         }
                     }
                 }
@@ -2528,10 +2677,56 @@ fn hir_join_step(
                 )))
             }
         },
-        HirPlanSource::Derived { .. }
-        | HirPlanSource::Cte { .. }
-        | HirPlanSource::RecursiveCte { .. }
-        | HirPlanSource::RecursiveInput { .. } => {
+        HirPlanSource::Derived {
+            source,
+            query,
+            join_info,
+            output_order,
+        } => super::access_method::find_best_hir_access_method_for_subquery(
+            document,
+            *source,
+            *query,
+            false,
+            !hir_right_or_full_join(join_info.as_ref()),
+            order_target,
+            output_order,
+            &constraints[source_position],
+            lhs_mask,
+            source_position,
+            &ready_where,
+            source_costs[source_position],
+            input_cardinality,
+            base_row_count,
+            params,
+        )?,
+        HirPlanSource::Cte {
+            source,
+            query,
+            materialization,
+            join_info,
+            output_order,
+            ..
+        } => super::access_method::find_best_hir_access_method_for_subquery(
+            document,
+            *source,
+            *query,
+            !matches!(
+                materialization,
+                crate::translate::plan::HirCteMaterialization::PerReference
+            ),
+            !hir_right_or_full_join(join_info.as_ref()),
+            order_target,
+            output_order,
+            &constraints[source_position],
+            lhs_mask,
+            source_position,
+            &ready_where,
+            source_costs[source_position],
+            input_cardinality,
+            base_row_count,
+            params,
+        )?,
+        HirPlanSource::RecursiveCte { .. } | HirPlanSource::RecursiveInput { .. } => {
             let rows = *base_row_count;
             let scan_cost = estimate_cost_for_scan_or_seek::<hir::Expr>(
                 None,
@@ -2558,11 +2753,631 @@ fn hir_join_step(
         }
     };
     add_where_cost(&mut access_method, &ready_where, input_cardinality, params);
+    if let Some(hash_join) = hir_hash_join_candidate(
+        document,
+        sources,
+        constraints,
+        where_clause,
+        base_table_rows,
+        source_position,
+        lhs_mask,
+        lhs_steps,
+        &access_method,
+        &ready_where,
+        input_cardinality,
+        hash,
+        schema,
+        params,
+    )? {
+        access_method = hash_join;
+    }
 
     Ok(Some(HirJoinStep {
         source_position,
         access_method,
     }))
+}
+
+/// Whether and how a HIR block may use legacy's hash joins.
+pub(crate) struct HirHashJoins<'a> {
+    /// Whether the block may hash at all. A block that may run again, such as
+    /// a subquery, does not: a hash table that moved rows to disk cannot be
+    /// probed again after its waiting lookups ran.
+    pub(crate) allowed: bool,
+    /// Whether a hash table may be built from the joined rows of the loops
+    /// before the probe, legacy's materialized build input
+    /// ([crate::translate::semantic_to_plan::HirHashBuildInput]).
+    pub(crate) materialize: bool,
+    /// The sources a correlated subquery of the block reads. Like legacy, a
+    /// hash join never reads them.
+    pub(crate) subquery_reads: &'a [hir::SourceId],
+}
+
+impl HirHashJoins<'_> {
+    pub(crate) const NONE: HirHashJoins<'static> = HirHashJoins {
+        allowed: false,
+        materialize: false,
+        subquery_reads: &[],
+    };
+}
+
+/// The one source an expression's columns and rowids read, if exactly one.
+fn hir_one_source(expression: &hir::Expr) -> Option<hir::SourceId> {
+    let mut found = None;
+    let mut more = false;
+    expression.for_each(&mut |expression| {
+        let source = match expression {
+            hir::Expr::Column(column) => column.source,
+            hir::Expr::RowId(source) => *source,
+            _ => return,
+        };
+        match found {
+            Some(known) if known != source => more = true,
+            _ => found = Some(source),
+        }
+    });
+    (!more).then_some(found).flatten()
+}
+
+fn hir_runs_subquery(expression: &hir::Expr) -> bool {
+    let mut runs = false;
+    expression.for_each(&mut |expression| {
+        runs |= matches!(expression, hir::Expr::Subquery(_));
+    });
+    runs
+}
+
+/// Whether a source is the right side of a USING or NATURAL join.
+fn hir_joined_with_using(document: &HirDocument, source: hir::SourceId) -> bool {
+    let Some(hir::SourceOwner::QueryBlock(block)) = document.source(source).map(|s| s.owner) else {
+        return false;
+    };
+    let Some(from) = document
+        .query_block(block)
+        .and_then(|block| block.from.as_ref())
+    else {
+        return false;
+    };
+    let mut pending = vec![from];
+    while let Some(from) = pending.pop() {
+        for join in &from.joins {
+            if join.right == source {
+                return matches!(
+                    join.constraint,
+                    hir::JoinConstraint::Using(_) | hir::JoinConstraint::Natural(_)
+                );
+            }
+            if let Some(hir::SourceKind::FromGroup(group)) =
+                document.source(join.right).map(|source| &source.kind)
+            {
+                pending.push(&group.from);
+            }
+        }
+    }
+    false
+}
+
+/// Whether a HIR source is a rowid B-tree table that the hash lookup code
+/// can build from and probe with: no custom types or arrays, not a
+/// materialized view.
+fn hir_plain_rowid_table(document: &HirDocument, source: &HirPlanSource, schema: &Schema) -> bool {
+    let Some(planned) = source.btree() else {
+        return false;
+    };
+    let Some(definition) = document.source(planned.internal_id) else {
+        return false;
+    };
+    matches!(&planned.table, Table::BTree(table)
+        if table.has_rowid && !schema.is_materialized_view(&table.name))
+        && definition.column_type_programs.iter().all(Option::is_none)
+        && definition
+            .columns
+            .iter()
+            .all(|column| !column.type_fact.is_array())
+}
+
+/// Port of legacy's `try_hash_join_access_method` for HIR sources: a hash
+/// join that builds a hash table from `build` and scans `probe`.
+#[allow(clippy::too_many_arguments)]
+fn hir_try_hash_join_access_method(
+    document: &HirDocument,
+    sources: &[HirPlanSource],
+    constraints: &[HirTableConstraints],
+    where_clause: &[HirWhereTerm],
+    build: usize,
+    probe: usize,
+    build_cardinality: f64,
+    probe_cardinality: f64,
+    probe_multiplier: f64,
+    hash: &HirHashJoins<'_>,
+    schema: &Schema,
+    params: &CostModelParams,
+) -> Option<AccessMethod> {
+    use crate::translate::semantic::hir::JoinKind;
+    let (Some(build_source), Some(probe_source)) = (sources[build].btree(), sources[probe].btree())
+    else {
+        return None;
+    };
+    // The hash lookup code reads rowid tables only.
+    if !hir_plain_rowid_table(document, &sources[build], schema)
+        || !hir_plain_rowid_table(document, &sources[probe], schema)
+    {
+        return None;
+    }
+    let probe_kind = probe_source.join_info.as_ref().map(|join| join.kind);
+    let build_kind = build_source.join_info.as_ref().map(|join| join.kind);
+    // A RIGHT join has no hash form, and semi/anti-joins prefer a nested
+    // loop with an index seek.
+    let hash_join_type = match probe_kind {
+        Some(JoinKind::Right | JoinKind::Semi | JoinKind::Anti) => return None,
+        Some(JoinKind::Full) => HashJoinType::FullOuter,
+        Some(JoinKind::Left) => HashJoinType::LeftOuter,
+        _ => HashJoinType::Inner,
+    };
+    // Can't build from a table an outer join may fill with NULL, and no
+    // hash join for semi/anti-joins.
+    if matches!(
+        build_kind,
+        Some(JoinKind::Left | JoinKind::Right | JoinKind::Full | JoinKind::Semi | JoinKind::Anti)
+    ) {
+        return None;
+    }
+    // Avoid hash join on self-joins over the same table: a nested loop with
+    // an index seek is usually better.
+    let (Table::BTree(build_table), Table::BTree(probe_table)) =
+        (&build_source.table, &probe_source.table)
+    else {
+        return None;
+    };
+    // FULL OUTER has no nested-loop form in legacy, so it hashes even then.
+    if build_table.root_page == probe_table.root_page && hash_join_type != HashJoinType::FullOuter {
+        return None;
+    }
+    // INDEXED BY and NOT INDEXED must be honored.
+    if !matches!(build_source.indexed, hir::IndexHint::None)
+        || !matches!(probe_source.indexed, hir::IndexHint::None)
+    {
+        return None;
+    }
+    if hir_joined_with_using(document, build_source.internal_id)
+        || hir_joined_with_using(document, probe_source.internal_id)
+    {
+        return None;
+    }
+    // Avoid hash joins when a correlated subquery reads the joined tables.
+    if hash
+        .subquery_reads
+        .iter()
+        .any(|source| *source == build_source.internal_id || *source == probe_source.internal_id)
+    {
+        return None;
+    }
+
+    // Port of `find_hash_join_keys`: `=` terms whose sides each read one of
+    // the two tables. An outer join condition belongs to that join only.
+    // Unlike legacy, an outer hash join takes its keys from its own ON terms
+    // only: a WHERE term used as a key would never be checked on the rows
+    // the join NULL-fills, which it must reject (`... FULL JOIN u ON t.x =
+    // u.x WHERE t.x = u.x` returns the matched rows only).
+    let mut join_keys: SmallVec<[HashJoinKey; 2]> = SmallVec::new();
+    for (index, term) in where_clause.iter().enumerate() {
+        let own_on_term = term.from_outer_join == Some(probe_source.internal_id);
+        if term.from_outer_join.is_some() && !own_on_term {
+            continue;
+        }
+        if hash_join_type != HashJoinType::Inner && !own_on_term {
+            continue;
+        }
+        let hir::Expr::Binary {
+            lhs,
+            operator: Operator::Equals,
+            rhs,
+            ..
+        } = &term.expr
+        else {
+            continue;
+        };
+        let (Some(left), Some(right)) = (hir_one_source(lhs), hir_one_source(rhs)) else {
+            continue;
+        };
+        let build_side = if left == build_source.internal_id && right == probe_source.internal_id {
+            super::constraints::BinaryExprSide::Lhs
+        } else if right == build_source.internal_id && left == probe_source.internal_id {
+            super::constraints::BinaryExprSide::Rhs
+        } else {
+            continue;
+        };
+        join_keys.push(HashJoinKey {
+            where_clause_idx: index,
+            build_side,
+        });
+    }
+    // HIR's hash table needs at least one key; legacy hashes a FULL JOIN
+    // without one into a single bucket, which HIR runs as a nested loop.
+    if join_keys.is_empty() {
+        return None;
+    }
+    let sides = |key: &HashJoinKey| {
+        let hir::Expr::Binary {
+            lhs,
+            rhs,
+            comparison,
+            custom,
+            ..
+        } = &where_clause[key.where_clause_idx].expr
+        else {
+            unreachable!("a hash join key is a binary `=`");
+        };
+        let (build_expr, probe_expr) = match key.build_side {
+            super::constraints::BinaryExprSide::Lhs => (lhs.as_ref(), rhs.as_ref()),
+            super::constraints::BinaryExprSide::Rhs => (rhs.as_ref(), lhs.as_ref()),
+        };
+        (build_expr, probe_expr, comparison, custom)
+    };
+    for key in &join_keys {
+        let (build_expr, _, comparison, custom) = sides(key);
+        // A key is one value, does not run a subquery, and compares with a
+        // built-in collation.
+        if custom.is_some()
+            || hir_runs_subquery(build_expr)
+            || matches!(build_expr, hir::Expr::Row(_))
+            || comparison
+                .as_ref()
+                .is_some_and(|comparison| comparison.components.len() != 1)
+        {
+            return None;
+        }
+        let custom_collation = comparison.as_ref().is_some_and(|comparison| {
+            comparison.components.iter().any(|component| {
+                matches!(
+                    component
+                        .collation
+                        .as_ref()
+                        .map(|collation| *collation.value()),
+                    Some(crate::translate::collate::CollationSeq::Custom(_))
+                )
+            })
+        });
+        if custom_collation {
+            return None;
+        }
+    }
+
+    // Prefer a nested loop with an index lookup when an index exists on a
+    // join column of either table.
+    let indexed_join_column =
+        |position: usize, expr: &hir::Expr, source: &crate::translate::plan::HirPlannedSource| {
+            if hir_one_source(expr) != Some(source.internal_id)
+                || !matches!(expr, hir::Expr::Column(_) | hir::Expr::RowId(_))
+            {
+                return false;
+            }
+            let table_constraints = &constraints[position];
+            join_keys.iter().any(|key| {
+                let Some(constraint) = table_constraints
+                    .constraints
+                    .iter()
+                    .find(|constraint| constraint.where_clause_pos.0 == key.where_clause_idx)
+                else {
+                    return false;
+                };
+                let Some(column) = constraint.table_col_pos else {
+                    return false;
+                };
+                source
+                    .table
+                    .columns()
+                    .get(column)
+                    .is_some_and(|column| column.is_rowid_alias())
+                    || table_constraints.candidates.iter().any(|candidate| {
+                        candidate.index.as_ref().is_some_and(|index| {
+                            index.column_table_pos_to_index_pos(column).is_some()
+                        })
+                    })
+            })
+        };
+    // FULL OUTER must hash.
+    if hash_join_type != HashJoinType::FullOuter {
+        for key in &join_keys {
+            let (build_expr, probe_expr, ..) = sides(key);
+            if indexed_join_column(probe, probe_expr, probe_source)
+                || indexed_join_column(build, build_expr, build_source)
+            {
+                return None;
+            }
+        }
+    }
+
+    let join_selectivity = join_keys
+        .iter()
+        .map(|key| {
+            constraints[probe]
+                .constraints
+                .iter()
+                .find(|constraint| constraint.where_clause_pos.0 == key.where_clause_idx)
+                .map_or(params.sel_eq_unindexed, |constraint| constraint.selectivity)
+        })
+        .product::<f64>();
+    let cost = estimate_hash_join_cost(
+        build_cardinality,
+        probe_cardinality,
+        crate::vdbe::hash_table::DEFAULT_MEM_BUDGET,
+        probe_multiplier,
+        params,
+    );
+    let rows_per_build_row = probe_cardinality * join_selectivity;
+    let estimated_rows_per_outer_row = match hash_join_type {
+        HashJoinType::Inner => rows_per_build_row,
+        HashJoinType::LeftOuter => rows_per_build_row.max(1.0),
+        HashJoinType::FullOuter => rows_per_build_row
+            .max(1.0)
+            .max(probe_cardinality / build_cardinality.max(1.0)),
+    };
+    Some(AccessMethod {
+        cost,
+        estimated_rows_per_outer_row,
+        consumed_where_terms: join_keys
+            .iter()
+            .map(|key| key.where_clause_idx)
+            .try_collect()
+            .ok()?,
+        params: AccessMethodParams::HashJoin {
+            build_table_idx: build,
+            probe_table_idx: probe,
+            join_keys: join_keys.into_vec(),
+            mem_budget: crate::vdbe::hash_table::DEFAULT_MEM_BUDGET,
+            materialize_build_input: false,
+            use_bloom_filter: false,
+            join_type: hash_join_type,
+        },
+    })
+}
+
+/// Port of the hash-join part of legacy's `join_lhs_and_rhs`: when the
+/// sources before `rhs` end with a table read by a plain scan, a hash join
+/// may build a hash table from that table and scan `rhs`, probing it. It is
+/// chosen when it costs less than `nested_loop`, the best way to read `rhs`
+/// in a nested loop.
+#[allow(clippy::too_many_arguments)]
+fn hir_hash_join_candidate(
+    document: &HirDocument,
+    sources: &[HirPlanSource],
+    constraints: &[HirTableConstraints],
+    where_clause: &[HirWhereTerm],
+    base_table_rows: &[RowCountEstimate],
+    rhs: usize,
+    lhs_mask: &TableMask,
+    lhs_steps: &[(usize, &AccessMethod)],
+    nested_loop: &AccessMethod,
+    ready_where: &[(usize, usize)],
+    input_cardinality: f64,
+    hash: &HirHashJoins<'_>,
+    schema: &Schema,
+    params: &CostModelParams,
+) -> Result<Option<AccessMethod>> {
+    use crate::translate::semantic::hir::JoinKind;
+    if !hash.allowed {
+        return Ok(None);
+    }
+    // Left-deep: the last table joined becomes the build side.
+    let Some(&(build, build_method)) = lhs_steps.last() else {
+        return Ok(None);
+    };
+    let rhs_has_selective_seek = matches!(
+        &nested_loop.params,
+        AccessMethodParams::BTreeTable {
+            index,
+            build_index,
+            constraint_refs,
+            ..
+        } if !constraint_refs.is_empty()
+            && !build_index
+            && index.as_ref().is_none_or(|index| !index.ephemeral)
+    );
+    // The probe table must not be the build table of an earlier hash join.
+    let probe_is_prior_build = lhs_steps.iter().any(|(_, method)| {
+        matches!(&method.params, AccessMethodParams::HashJoin { build_table_idx, .. }
+            if *build_table_idx == rhs)
+    });
+    let Some(build_source) = sources[build].btree() else {
+        return Ok(None);
+    };
+    let build_has_rowid = build_source
+        .table
+        .btree()
+        .is_some_and(|table| table.has_rowid);
+    let build_access_method_uses_constraints = matches!(
+        &build_method.params,
+        AccessMethodParams::BTreeTable { build_index, constraint_refs, .. }
+            if *build_index || !constraint_refs.is_empty()
+    );
+    let build_constraints = &constraints[build];
+    let base_rows = |position: usize| {
+        base_table_rows
+            .get(position)
+            .copied()
+            .unwrap_or_else(|| RowCountEstimate::hardcoded_fallback(params))
+    };
+    let build_base_rows = base_rows(build);
+    let build_self_selectivity = build_self_constraint_selectivity(build_constraints, build);
+    let build_cardinality = *build_base_rows * build_self_selectivity;
+    let probe_cardinality = *base_rows(rhs);
+    let mut prior_mask = lhs_mask.try_clone()?;
+    prior_mask.clear(build);
+    let prior_constraint_selectivity =
+        build_prior_constraint_selectivity(build_constraints, &prior_mask);
+    let probe_multiplier = if lhs_steps.len() == 1 && lhs_steps[0].0 == build {
+        1.0
+    } else {
+        let join_selectivity = prior_constraint_selectivity.clamp(0.0, 1.0);
+        let denom = (build_cardinality * join_selectivity).max(1.0);
+        (input_cardinality / denom).max(1.0)
+    };
+    // The build tables of earlier hash joins whose probe was this build
+    // table: their join keys already constrain it.
+    let prior_hash_build_mask: TableMask = lhs_steps
+        .iter()
+        .filter_map(|(_, method)| match &method.params {
+            AccessMethodParams::HashJoin {
+                build_table_idx,
+                probe_table_idx,
+                ..
+            } if *probe_table_idx == build => Some(*build_table_idx),
+            _ => None,
+        })
+        .try_collect()?;
+    let build_has_prior_constraints = build_constraints.constraints.iter().any(|constraint| {
+        constraint.lhs_mask.intersects(&prior_mask)
+            && (0..64).any(|position| {
+                constraint.lhs_mask.get(position)
+                    && prior_mask.get(position)
+                    && !prior_hash_build_mask.get(position)
+            })
+    });
+    let build_table_is_prior_probe = lhs_steps.iter().any(|(_, method)| {
+        matches!(&method.params, AccessMethodParams::HashJoin { probe_table_idx, .. }
+            if *probe_table_idx == build)
+    });
+    let prefix_has_outer = lhs_steps.iter().any(|(position, _)| {
+        sources[*position]
+            .join_info()
+            .is_some_and(|join| matches!(join.kind, JoinKind::Left | JoinKind::Full))
+    });
+    let chaining_across_outer = build_table_is_prior_probe && prefix_has_outer;
+    let build_am_is_plain_table_scan = matches!(
+        &build_method.params,
+        AccessMethodParams::BTreeTable { build_index, constraint_refs, .. }
+            if !build_index && constraint_refs.is_empty()
+    );
+    let allow_hash_join = !rhs_has_selective_seek
+        && !probe_is_prior_build
+        && (!build_has_prior_constraints || build_has_rowid)
+        && !chaining_across_outer;
+    if !allow_hash_join {
+        return Ok(None);
+    }
+    let Some(mut method) = hir_try_hash_join_access_method(
+        document,
+        sources,
+        constraints,
+        where_clause,
+        build,
+        rhs,
+        build_cardinality,
+        probe_cardinality,
+        probe_multiplier,
+        hash,
+        schema,
+        params,
+    ) else {
+        return Ok(None);
+    };
+    let AccessMethodParams::HashJoin { join_keys, .. } = &method.params else {
+        unreachable!("a hash join access method");
+    };
+    // HIR runs the unmatched rows of one RIGHT, FULL or outer hash join per
+    // block after its loops: it NULL-fills every loop before the join's
+    // right side and runs the loops after it again. So, in a block with a
+    // RIGHT or FULL join that is not this one, only an inner hash join of
+    // tables on that join's left side hashes.
+    let AccessMethodParams::HashJoin { join_type, .. } = &method.params else {
+        unreachable!("a hash join access method");
+    };
+    let other_outer = sources.iter().enumerate().any(|(position, source)| {
+        position != rhs
+            && source
+                .join_info()
+                .is_some_and(|join| matches!(join.kind, JoinKind::Right | JoinKind::Full))
+            && (*join_type != HashJoinType::Inner || position < rhs || position < build)
+    });
+    if other_outer {
+        return Ok(None);
+    }
+    let needs_materialization = build_has_uncovered_prior_constraints(
+        build_constraints,
+        join_keys,
+        &prior_mask,
+        &prior_hash_build_mask,
+    ) || build_table_is_prior_probe;
+    let selectivity_threshold = if probe_multiplier > 1.0 {
+        params.hash_nested_probe_selectivity_threshold
+    } else {
+        params.hash_materialize_selectivity_threshold
+    };
+    let estimated_filtered_rows =
+        *build_base_rows * build_self_selectivity * prior_constraint_selectivity;
+    let wants_materialization = needs_materialization
+        || (build_access_method_uses_constraints
+            && prior_constraint_selectivity < selectivity_threshold);
+    let optional_materialization_too_large = !needs_materialization
+        && wants_materialization
+        && estimated_filtered_rows > MAX_MATERIALIZED_BUILD_ROWS;
+    let should_materialize = needs_materialization
+        || (wants_materialization
+            && build_has_rowid
+            && build_has_indexable_prior_constraints(build_constraints, &prior_mask)
+            && !optional_materialization_too_large);
+    let build_is_eligible = build_am_is_plain_table_scan
+        || needs_materialization
+        || build_access_method_uses_constraints;
+    let materialization_too_large =
+        needs_materialization && estimated_filtered_rows > MAX_MATERIALIZED_BUILD_ROWS;
+    if !build_is_eligible
+        || (needs_materialization && !build_has_rowid)
+        || materialization_too_large
+    {
+        return Ok(None);
+    }
+    // Under earlier loops, an outer hash join runs its unmatched build rows
+    // after each pass of the probe loop, with the earlier loops' rows. That
+    // is right for LEFT, whose build rows pair with those rows, but not for
+    // the probe rows FULL adds, which no row of the earlier loops may match
+    // and must come out once (legacy repeats them). A build input folds the
+    // earlier loops into the hash table, so the probe loop runs once.
+    if lhs_steps.len() > 1
+        && !should_materialize
+        && sources[rhs]
+            .join_info()
+            .is_some_and(|join| join.kind == JoinKind::Full)
+    {
+        return Ok(None);
+    }
+    if should_materialize {
+        if !hash.materialize {
+            return Ok(None);
+        }
+        // Like legacy: the hash table is built from the rows of the loops
+        // before the probe, stored once, so it holds the rows those loops
+        // keep and the probe scan runs once. Between such plans, legacy
+        // prefers the one whose build is filtered by earlier tables.
+        let tie_breaker = prior_mask.iter().min().unwrap_or(0) as f64 * 1.0e-6;
+        method.cost = estimate_hash_join_cost(
+            estimated_filtered_rows,
+            probe_cardinality,
+            crate::vdbe::hash_table::DEFAULT_MEM_BUDGET,
+            1.0,
+            params,
+        ) + Cost(estimated_filtered_rows * 0.003)
+            + Cost(tie_breaker);
+        let AccessMethodParams::HashJoin {
+            materialize_build_input,
+            ..
+        } = &mut method.params
+        else {
+            unreachable!("a hash join access method");
+        };
+        *materialize_build_input = true;
+    }
+    add_where_cost(&mut method, ready_where, input_cardinality, params);
+    // FULL OUTER requires a hash join for the unmatched-build scan.
+    let is_full_outer = matches!(
+        &method.params,
+        AccessMethodParams::HashJoin {
+            join_type: HashJoinType::FullOuter,
+            ..
+        }
+    );
+    Ok((is_full_outer || method.cost < nested_loop.cost).then_some(method))
 }
 
 /// Select the best starting table for greedy join ordering by evaluating indexed-seek benefits.
@@ -3585,11 +4400,13 @@ mod tests {
             None,
             1,
             &lhs_mask,
+            &[],
             1_000.0,
             &Schema::new(),
             &AnalyzeStats::default(),
             &DEFAULT_PARAMS,
             false,
+            &HirHashJoins::NONE,
         )?
         .expect("a B-tree source always has a join step");
 
@@ -3692,6 +4509,7 @@ mod tests {
             &AnalyzeStats::default(),
             &DEFAULT_PARAMS,
             false,
+            &HirHashJoins::NONE,
         )?
         .expect("three HIR sources produce a join plan");
 

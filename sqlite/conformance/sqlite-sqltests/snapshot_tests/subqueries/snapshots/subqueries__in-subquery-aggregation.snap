@@ -69,7 +69,7 @@ addr  opcode                    p1  p2  p3  p4            p5  comment
   41  Return                    11   0   0                 0
   42  OpenRead                   3   6   0  k(4,B,B,B,B)   0  table=customers, root=6, iDb=0
   43  NullRow                    0   0   0                 0  Set cursor 0 to a (pseudo) NULL row
-  44  Rewind                     0  52   0                 0  Rewind  ephemeral(ephemeral_index_where_sub_t2)
+  44  Rewind                     0  52   0                 0  Rewind index ephemeral(ephemeral_index_where_sub_t2)
   45    Column                   0   0  18                 0  r[18]=ephemeral(ephemeral_index_where_sub_t2).customer_id
   46    IsNull                  18  51   0                 0  if (r[18]==NULL) goto 51
   47    SeekRowid                3  18  51                 0  if (r[18]!=cursor 3 for table customers.rowid) goto 51

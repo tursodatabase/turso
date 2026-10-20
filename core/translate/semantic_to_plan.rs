@@ -26,6 +26,93 @@ use crate::{
 };
 use rustc_hash::FxHashSet as HashSet;
 
+/// The source an outer join may NULL-extend, when `source` is the right
+/// side of one: its seek terms must stay checked on the added row.
+fn hir_outer_join_source(
+    source: SourceId,
+    join_info: Option<&crate::translate::plan::HirJoinInfo>,
+) -> Option<SourceId> {
+    join_info.and_then(|join| {
+        matches!(
+            join.kind,
+            hir::JoinKind::Left | hir::JoinKind::Right | hir::JoinKind::Full
+        )
+        .then_some(source)
+    })
+}
+
+fn hir_block_grouping(block: &hir::QueryBlock) -> Option<&hir::Grouping> {
+    match &block.body {
+        hir::QueryBlockBody::Select {
+            grouping: Some(grouping),
+            ..
+        } => Some(grouping),
+        _ => None,
+    }
+}
+
+/// One GROUP BY key, in the order the GROUP BY sorter compares keys in.
+pub(crate) struct GroupKeyOrder {
+    pub(crate) key: usize,
+    pub(crate) order: turso_parser::ast::SortOrder,
+    pub(crate) nulls: Option<turso_parser::ast::NullsOrder>,
+}
+
+/// The order the GROUP BY sorter compares its keys in, when every ORDER BY
+/// term is a GROUP BY key with that key's collation: the keys the ORDER BY
+/// names, in its order and with its directions, then the others ascending.
+/// Groups then leave in ORDER BY order, so no second sort is needed. Like
+/// legacy's `compute_order_target`, which reorders its GROUP BY keys the
+/// same way. Which rows form a group does not depend on this order.
+pub(crate) fn group_key_order(
+    document: &HirDocument,
+    order_by: &[hir::OrderTerm],
+    grouping: &hir::Grouping,
+) -> Option<Vec<GroupKeyOrder>> {
+    use crate::translate::collate::CollationSeq;
+    if order_by.is_empty() {
+        return None;
+    }
+    let collation = |collation: Option<&hir::ResolvedCollation>| match collation
+        .map(|collation| *collation.value())
+    {
+        None | Some(CollationSeq::Unset) => CollationSeq::Binary,
+        Some(collation) => collation,
+    };
+    let mut order: Vec<GroupKeyOrder> = Vec::with_capacity(grouping.keys.len());
+    for term in order_by {
+        let mut expression = &term.expr;
+        while let hir::Expr::Output(output) = expression {
+            expression = &document.output(*output)?.expr;
+        }
+        let key = grouping
+            .keys
+            .iter()
+            .zip(&grouping.key_collations)
+            .position(|(key, key_collation)| {
+                expression.equivalent(key)
+                    && collation(term.collation.as_ref()) == collation(key_collation.as_ref())
+            })?;
+        if !order.iter().any(|known| known.key == key) {
+            order.push(GroupKeyOrder {
+                key,
+                order: term.order,
+                nulls: term.nulls,
+            });
+        }
+    }
+    for key in 0..grouping.keys.len() {
+        if !order.iter().any(|known| known.key == key) {
+            order.push(GroupKeyOrder {
+                key,
+                order: turso_parser::ast::SortOrder::Asc,
+                nulls: None,
+            });
+        }
+    }
+    Some(order)
+}
+
 /// Whether a query's result is the same whatever order its rows are read
 /// in: one ungrouped aggregate block whose aggregates are all count, sum,
 /// total, avg, min or max.
@@ -69,23 +156,12 @@ fn query_ignores_row_order(query: &hir::Query) -> bool {
     ignores_order
 }
 
-/// Whether an expression reads a column or rowid of some table. A hash
-/// table only pays off for keys from another table; an index on a constant
-/// key is built and searched once anyway.
-fn reads_a_row(expression: &hir::Expr) -> bool {
-    let mut reads = false;
-    expression.for_each(&mut |expression| {
-        reads |= matches!(expression, hir::Expr::Column(_) | hir::Expr::RowId(_));
-    });
-    reads
-}
-
 /// Whether evaluating `expression` could return an error for some input,
 /// as legacy's `expression_can_fail_on_input` decides. Function calls,
 /// LIKE, RAISE, JSON and array operators, custom types, casts and nested
 /// subqueries all count; plain columns, literals, parameters, arithmetic and
 /// comparisons do not.
-fn hir_expr_can_fail(document: &HirDocument, expression: &hir::Expr) -> bool {
+pub(crate) fn hir_expr_can_fail(document: &HirDocument, expression: &hir::Expr) -> bool {
     let mut can_fail = false;
     expression.for_each(&mut |expression| {
         can_fail |= match expression {
@@ -154,7 +230,8 @@ fn hir_from_can_fail(document: &HirDocument, from: &hir::From) -> bool {
 }
 
 /// For a block that is `SELECT min(x) FROM t` or `SELECT max(x) FROM t`
-/// with nothing else, the order that puts the answer first: x ascending for
+/// with nothing else, where t may also be a FROM subquery or CTE, the order
+/// that puts the answer first: x ascending for
 /// MIN and descending for MAX. Like legacy and SQLite, a scan in that order
 /// stops at the first non-NULL x.
 fn simple_min_max_term(
@@ -188,7 +265,12 @@ fn simple_min_max_term(
     let ([argument], [fact]) = (values.as_slice(), facts.as_slice()) else {
         return None;
     };
-    let single_btree = matches!(input.sources.as_slice(), [HirPlanSource::BTree(_)]);
+    // Like legacy's `detect_simple_aggregate`: one table, or one FROM
+    // subquery or CTE whose own order may put the answer first.
+    let single_btree = matches!(
+        input.sources.as_slice(),
+        [HirPlanSource::BTree(_) | HirPlanSource::Derived { .. } | HirPlanSource::Cte { .. }]
+    );
     (matches!(
         call.evaluation,
         hir::FunctionEvaluation::Aggregate { filter: None, .. }
@@ -264,6 +346,10 @@ pub(crate) struct HirPlan {
     /// Table sources that read a materialized view. Their cursor merges the
     /// current transaction's changes into the stored rows.
     pub(crate) materialized_views: Vec<(SourceId, Arc<Mutex<IncrementalView>>)>,
+    /// Parameters of the parts of the statement that turning subqueries
+    /// into joins dropped, such as the SELECT list of an EXISTS. The
+    /// statement still has them, so lowering registers them.
+    pub(crate) dropped_parameters: Vec<hir::Parameter>,
 }
 
 /// Planner facts owned by the semantic root. Variants without a source scan
@@ -296,6 +382,12 @@ pub(crate) enum HirTriggerCommandPlan {
 /// Access plans and estimates for one query in the owned HIR document.
 pub(crate) struct HirPlannedQuery {
     pub(crate) query: QueryId,
+    /// How many times the plan expects the query to run: more than one for
+    /// a correlated subquery, as legacy counts its calls.
+    pub(crate) runs: f64,
+    /// The order the query returns its rows in, as legacy's
+    /// `subquery_intrinsic_order_consumed` reads it from a subquery's plan.
+    pub(crate) output_order: Vec<crate::translate::optimizer::order::HirOutputOrder>,
     pub(crate) blocks: Vec<HirQueryBlockPlan>,
     /// The query is the subquery of a correlated `x IN (SELECT y ...)` that
     /// runs like `EXISTS (SELECT ... AND x = y)`: its block plan holds the
@@ -319,6 +411,20 @@ impl HirPlan {
         schema: &Schema,
         params: &CostModelParams,
     ) -> Result<Self> {
+        let (document, dropped_parameters) =
+            super::semantic_unnest::unnest_correlated_subqueries(document, schema, params)?;
+        let mut plan = Self::build_without_unnesting(document, schema, params)?;
+        plan.dropped_parameters = dropped_parameters;
+        Ok(plan)
+    }
+
+    /// Plan `document` as it is, without turning its correlated subqueries
+    /// into joins.
+    pub(crate) fn build_without_unnesting(
+        document: Arc<HirDocument>,
+        schema: &Schema,
+        params: &CostModelParams,
+    ) -> Result<Self> {
         let mut queries = Vec::new();
         let mut active = HashSet::default();
         let context = HirPlanContext::new(&document);
@@ -333,6 +439,7 @@ impl HirPlan {
                 .map(|plan| HirQueryEstimate {
                     output_cardinality: plan.output_cardinality,
                     cost: plan.cost,
+                    output_order: plan.output_order.clone(),
                 })
         };
         let root = context.plan_root(schema, params, &query_estimate)?;
@@ -342,6 +449,7 @@ impl HirPlan {
             root,
             queries,
             materialized_views,
+            dropped_parameters: Vec::new(),
         })
     }
 
@@ -368,6 +476,9 @@ pub(crate) struct HirQueryBlockPlanInput {
     /// come from the FROM clause: join constraints and table-function
     /// arguments.
     pub(crate) where_start: usize,
+    /// The block's correlated expression subqueries, whose number of runs
+    /// planning counts from the chosen join order. Empty outside SELECT.
+    pub(crate) subqueries: Vec<QueryId>,
 }
 
 /// Access choices for one resolved HIR query block.
@@ -383,6 +494,12 @@ pub(crate) struct HirQueryBlockPlan {
     pub(crate) group_sort_elided: bool,
     /// The loops return rows in ORDER BY order, so the query needs no sorter.
     pub(crate) order_sort_elided: bool,
+    /// The loops return rows in the order the innermost window layer sorts
+    /// them in, so that layer needs no sorter.
+    pub(crate) window_sort_elided: bool,
+    /// How many times each correlated expression subquery of the block runs
+    /// for one run of the block, as legacy counts them.
+    pub(crate) subquery_calls: Vec<(QueryId, f64)>,
     /// An index method applies LIMIT and OFFSET while it scans.
     pub(crate) limit_applied: bool,
     /// The block is `SELECT min(x)` or `SELECT max(x)` and the loop reads x
@@ -411,6 +528,8 @@ pub(crate) struct HirAccessPlan {
     pub(crate) order_sort_elided: bool,
     /// The loops return rows in the order of a MIN or MAX target.
     pub(crate) min_max_first_value: bool,
+    /// See [`HirQueryBlockPlan::subquery_calls`].
+    pub(crate) subquery_calls: Vec<(QueryId, f64)>,
     pub(crate) output_cardinality: f64,
     pub(crate) cost: Cost,
 }
@@ -421,6 +540,31 @@ pub(crate) struct HirPlannedLoop {
     pub(crate) source: SourceId,
     pub(crate) source_position: usize,
     pub(crate) access: HirSourceAccess,
+}
+
+impl HirPlannedLoop {
+    /// The sources this loop supplies a row of: its own, and, for a hash
+    /// lookup built from a materialized build input, the sources of the
+    /// loops that filled it, which each hash row carries.
+    pub(crate) fn sources(&self) -> Vec<SourceId> {
+        match &self.access {
+            HirSourceAccess::Hash(HirHashLookup {
+                build_input: Some(input),
+                ..
+            }) => input.sources.clone(),
+            _ => vec![self.source],
+        }
+    }
+
+    pub(crate) fn supplies(&self, source: SourceId) -> bool {
+        match &self.access {
+            HirSourceAccess::Hash(HirHashLookup {
+                build_input: Some(input),
+                ..
+            }) => input.sources.contains(&source),
+            _ => self.source == source,
+        }
+    }
 }
 
 /// Whether an index scan can supply every referenced value itself.
@@ -445,13 +589,22 @@ pub(crate) enum HirSourceAccess {
     /// keyed by the columns that equal values from earlier loops. It replaces
     /// an automatic index, as legacy's hash join does.
     Hash(HirHashLookup),
+    /// A FROM subquery. With `seek`, its rows are stored once and read
+    /// through a temporary index over them, keyed by columns that earlier
+    /// loops constrain, as legacy's materialized-subquery seek.
     Derived {
         query: QueryId,
+        seek: Option<crate::translate::optimizer::HirBtreeOperation>,
     },
+    /// A CTE reference; `seek` as for [`HirSourceAccess::Derived`]. A CTE
+    /// stored once (`Shared` or `Explicit`) may be read `Backwards`, from
+    /// its last row, to give an outer ORDER BY the opposite of its order.
     Cte {
         cte: hir::CteId,
         query: QueryId,
         materialization: HirCteMaterialization,
+        seek: Option<crate::translate::optimizer::HirBtreeOperation>,
+        direction: crate::translate::plan::IterationDirection,
     },
     RecursiveCte {
         cte: hir::CteId,
@@ -466,21 +619,106 @@ pub(crate) struct HirHashLookup {
     pub(crate) keys: Vec<HirHashKey>,
     /// Columns of the table the query reads, kept with each row.
     pub(crate) columns: Vec<usize>,
+    /// The access the build table was planned with, which EXPLAIN shows as
+    /// legacy does. The hash table itself is built from every row, unless
+    /// it has a build input.
+    pub(crate) explain: Option<(HirBtreeOperation, BtreeTableLookup)>,
+    /// Legacy's materialized build input: the hash table is built from the
+    /// joined rows of the loops before the probe loop instead of from the
+    /// whole table.
+    pub(crate) build_input: Option<Box<HirHashBuildInput>>,
 }
 
-/// One equality between a column of the hashed table and a value from an
-/// earlier loop.
+/// The loops a hash table is built from, legacy's "materialized hash build
+/// input". They run once into a temporary table, each row keeping the hash
+/// keys and the columns the query reads of every source they supply. The
+/// block's loops then no longer include them: a lookup supplies a row of
+/// each of their sources, read from the hash row. Legacy does this when
+/// the build table has a term with an earlier table that the hash keys do
+/// not cover, or was the probe of an earlier hash join, so that building
+/// from the whole table would lose those joins.
+pub(crate) struct HirHashBuildInput {
+    pub(crate) loops: Vec<HirPlannedLoop>,
+    /// The block's predicates as the loops check them: a term that reads a
+    /// source outside these loops is consumed here and checked by the
+    /// block.
+    pub(crate) predicates: Vec<HirWhereTerm>,
+    /// The sources the loops supply, in the order their columns are kept.
+    pub(crate) sources: Vec<SourceId>,
+}
+
+/// One equality between a value of the hashed table's row and a value from
+/// an earlier loop.
 pub(crate) struct HirHashKey {
-    pub(crate) column: usize,
+    /// An expression that reads only the hashed table.
+    pub(crate) build: hir::Expr,
     pub(crate) value: hir::Expr,
     pub(crate) affinity: crate::vdbe::affinity::Affinity,
     pub(crate) collation: Option<crate::translate::collate::CollationSeq>,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 struct HirQueryEstimate {
     output_cardinality: f64,
     cost: Cost,
+    output_order: Vec<crate::translate::optimizer::order::HirOutputOrder>,
+}
+
+/// The probe positions of the hash joins that keep the materialized build
+/// input the join search gave them, like legacy's check after its join
+/// search: only when the build table was the probe of an earlier hash join,
+/// or has a term with an earlier table that the hash keys do not cover.
+/// Otherwise a hash table built from the whole table joins the same rows.
+fn materialized_hash_build_inputs(
+    plan: &crate::translate::optimizer::join::JoinN,
+    access_methods: &[super::optimizer::access_method::AccessMethod],
+    constraints: &[HirTableConstraints],
+) -> Result<Vec<usize>> {
+    use super::optimizer::access_method::AccessMethodParams;
+    let hash_join = |method: usize| match &access_methods[method].params {
+        AccessMethodParams::HashJoin {
+            build_table_idx,
+            probe_table_idx,
+            ..
+        } => Some((*build_table_idx, *probe_table_idx)),
+        _ => None,
+    };
+    let mut probes = Vec::new();
+    for (step, (probe_position, method)) in plan.data.iter().copied().enumerate() {
+        let AccessMethodParams::HashJoin {
+            build_table_idx,
+            join_keys,
+            materialize_build_input: true,
+            ..
+        } = &access_methods[method].params
+        else {
+            continue;
+        };
+        let earlier = &plan.data[..step];
+        let build_was_probe = earlier.iter().any(|(_, method)| {
+            hash_join(*method).is_some_and(|(_, probe)| probe == *build_table_idx)
+        });
+        let mut prior = crate::translate::planner::TableMask::default();
+        for (position, method) in earlier {
+            prior.set(*position)?;
+            if let Some((build, _)) = hash_join(*method) {
+                prior.set(build)?;
+            }
+        }
+        let has_prior_term = constraints[*build_table_idx]
+            .constraints
+            .iter()
+            .any(|constraint| {
+                constraint.lhs_mask.intersects(&prior)
+                    && !join_keys
+                        .iter()
+                        .any(|key| key.where_clause_idx == constraint.where_clause_pos.0)
+            });
+        if build_was_probe || has_prior_term {
+            probes.push(probe_position);
+        }
+    }
+    Ok(probes)
 }
 
 /// Like legacy: turn each LEFT JOIN whose NULL row a WHERE term rejects into
@@ -653,6 +891,7 @@ impl<'a> HirPlanContext<'a> {
             groups: Vec::new(),
             predicates: Vec::new(),
             where_start: 0,
+            subqueries: Vec::new(),
         };
         // The target joins the result of the FROM clause, so a RIGHT or FULL
         // join inside FROM must never NULL-extend it: then it comes after
@@ -688,11 +927,16 @@ impl<'a> HirPlanContext<'a> {
         if let Some(predicate) = &update.predicate {
             append_predicates(&mut input.predicates, predicate, None);
         }
+        self.check_match_terms(&input.predicates)?;
 
+        if let Some(plan) = self.plan_dml_index_method(&mut input)? {
+            return Ok(plan);
+        }
         self.plan_source_access(
             input,
             None,
-            false,
+            true,
+            &crate::translate::optimizer::join::HirHashJoins::NONE,
             false,
             1.0,
             schema,
@@ -702,6 +946,104 @@ impl<'a> HirPlanContext<'a> {
         .ok_or_else(|| {
             LimboError::InternalError("UPDATE target produced no access plan".to_string())
         })
+    }
+
+    /// Like legacy, `x MATCH 'pattern'` in a WHERE or ON term stands for
+    /// `fts_match`, so `x` must be a column, or the first of a row of
+    /// columns, of a table with an FTS index. Any other MATCH term fails
+    /// with legacy's error.
+    fn check_match_terms(&self, predicates: &[HirWhereTerm]) -> Result<()> {
+        let column_source = |expression: &hir::Expr| match expression {
+            hir::Expr::Column(column) => Some(column.source),
+            hir::Expr::Row(items) => match items.first() {
+                Some(hir::Expr::Column(column)) => Some(column.source),
+                _ => None,
+            },
+            _ => None,
+        };
+        // Without the fts feature, analysis rejects MATCH before planning.
+        #[cfg(all(feature = "fts", not(target_family = "wasm")))]
+        const FTS: &str = crate::index_method::fts::FTS_INDEX_METHOD_NAME;
+        #[cfg(not(all(feature = "fts", not(target_family = "wasm"))))]
+        const FTS: &str = "fts";
+        let has_fts_index = |source: SourceId| {
+            self.document.source(source).is_some_and(|source| {
+                source.index_expressions.iter().any(|expressions| {
+                    expressions
+                        .index
+                        .value()
+                        .index_method
+                        .as_ref()
+                        .is_some_and(|method| method.definition().method_name == FTS)
+                })
+            })
+        };
+        for term in predicates {
+            let mut unusable = false;
+            term.expr.for_each(&mut |expression| {
+                if let hir::Expr::Like {
+                    lhs,
+                    operator: turso_parser::ast::LikeOperator::Match,
+                    ..
+                } = expression
+                {
+                    unusable |= !column_source(lhs).is_some_and(has_fts_index);
+                }
+            });
+            if unusable {
+                return Err(LimboError::ParseError(
+                    "unable to use function MATCH in the requested context".to_string(),
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// Like legacy, a DELETE or UPDATE whose only loop is its target reads
+    /// it through an index method's query pattern when a WHERE term matches
+    /// one, such as `fts_match(x, ?)`. The pattern may not sort or limit
+    /// the rows, since the statement has no ORDER BY or LIMIT.
+    fn plan_dml_index_method(
+        &self,
+        input: &mut HirQueryBlockPlanInput,
+    ) -> Result<Option<HirAccessPlan>> {
+        let [HirPlanSource::BTree(planned)] = input.sources.as_slice() else {
+            return Ok(None);
+        };
+        let source = self.definition(planned.internal_id);
+        let Some(matched) = crate::translate::hir_index_method::match_index_methods(
+            &crate::translate::hir_index_method::IndexMethodQuery {
+                document: self.document,
+                source,
+                outputs: &[],
+                predicates: &input.predicates,
+                where_start: input.where_start,
+                order_by: &[],
+                limit: None,
+                rows_are_output: false,
+            },
+        ) else {
+            return Ok(None);
+        };
+        if let Some(position) = matched.predicate {
+            input.predicates[position].consumed = true;
+        }
+        Ok(Some(HirAccessPlan {
+            groups: std::mem::take(&mut input.groups),
+            loops: vec![HirPlannedLoop {
+                source: source.id,
+                source_position: 0,
+                access: HirSourceAccess::IndexMethod(matched.access),
+            }],
+            predicates: std::mem::take(&mut input.predicates),
+            where_start: input.where_start,
+            group_sort_elided: false,
+            order_sort_elided: false,
+            min_max_first_value: false,
+            subquery_calls: Vec::new(),
+            output_cardinality: 1.0,
+            cost: Cost(1.0),
+        }))
     }
 
     fn plan_delete(
@@ -719,10 +1061,12 @@ impl<'a> HirPlanContext<'a> {
             groups: Vec::new(),
             predicates: Vec::new(),
             where_start: 0,
+            subqueries: Vec::new(),
         };
         if let Some(predicate) = &delete.predicate {
             append_predicates(&mut input.predicates, predicate, None);
         }
+        self.check_match_terms(&input.predicates)?;
         for term in &delete.order_by {
             self.register_expression_index_usage(&mut input.sources, &term.expr)?;
         }
@@ -732,6 +1076,9 @@ impl<'a> HirPlanContext<'a> {
             }
         }
 
+        if let Some(plan) = self.plan_dml_index_method(&mut input)? {
+            return Ok(plan);
+        }
         let order_target = self.order_target(
             &delete.order_by,
             OrderTargetPurpose::EliminatesSort(EliminatesSortBy::Order),
@@ -739,7 +1086,8 @@ impl<'a> HirPlanContext<'a> {
         self.plan_source_access(
             input,
             order_target.as_ref(),
-            false,
+            true,
+            &crate::translate::optimizer::join::HirHashJoins::NONE,
             false,
             1.0,
             schema,
@@ -752,7 +1100,9 @@ impl<'a> HirPlanContext<'a> {
     }
 
     /// Plan query-backed dependencies before their owning query so source
-    /// scans can use the child's output and work estimates.
+    /// scans can use the child's output and work estimates. Then, like
+    /// legacy's `plan_correlated_subqueries`, plan each correlated
+    /// subquery again for the number of times the chosen plan runs it.
     fn plan_query_tree(
         &self,
         query_id: QueryId,
@@ -765,6 +1115,7 @@ impl<'a> HirPlanContext<'a> {
             return Ok(HirQueryEstimate {
                 output_cardinality: plan.output_cardinality,
                 cost: plan.cost,
+                output_order: plan.output_order.clone(),
             });
         }
         if !active.insert(query_id) {
@@ -772,15 +1123,78 @@ impl<'a> HirPlanContext<'a> {
                 "HIR query dependency cycle at {query_id}"
             )));
         }
+        for dependency in self.document.direct_query_dependencies(query_id) {
+            self.plan_query_tree(dependency, schema, params, planned, active)?;
+        }
+        let estimate = self.plan_query(query_id, 1.0, schema, params, planned)?;
+        self.plan_correlated_subqueries(query_id, 1.0, schema, params, planned)?;
+        active.remove(&query_id);
+        Ok(estimate)
+    }
 
+    /// Plan the correlated expression subqueries of `query_id` again for the
+    /// number of times its plan runs them, as legacy does: a subquery that
+    /// reads sources of a block runs once per row reaching the step that
+    /// joins them, and any other once per run of the query. Like legacy, a
+    /// statement that writes plans its subqueries for one run, and a
+    /// subquery already planned for at least that many runs is kept.
+    fn plan_correlated_subqueries(
+        &self,
+        query_id: QueryId,
+        query_runs: f64,
+        schema: &Schema,
+        params: &CostModelParams,
+        planned: &mut Vec<HirPlannedQuery>,
+    ) -> Result<()> {
+        if !matches!(self.document.root, hir::HirRoot::Query(_)) {
+            return Ok(());
+        }
+        let Some(plan) = planned.iter().find(|plan| plan.query == query_id) else {
+            return Err(LimboError::InternalError(format!(
+                "HIR query {query_id} is not planned"
+            )));
+        };
+        let counted = plan
+            .blocks
+            .iter()
+            .flat_map(|block| block.subquery_calls.iter().copied())
+            .collect::<Vec<_>>();
+        for subquery in self.document.expression_subqueries(query_id) {
+            if !self.document.reads_outer_sources(subquery) {
+                continue;
+            }
+            let calls = counted
+                .iter()
+                .find_map(|(query, calls)| (*query == subquery).then_some(*calls))
+                .unwrap_or(query_runs)
+                .max(1.0);
+            let planned_runs = planned
+                .iter()
+                .find(|plan| plan.query == subquery)
+                .map_or(0.0, |plan| plan.runs);
+            if planned_runs >= calls {
+                continue;
+            }
+            self.plan_query(subquery, calls, schema, params, planned)?;
+            self.plan_correlated_subqueries(subquery, calls, schema, params, planned)?;
+        }
+        Ok(())
+    }
+
+    /// Plan the blocks of one query whose dependencies are planned, for
+    /// `runs` runs, and store the plan. Its estimates are for one run.
+    fn plan_query(
+        &self,
+        query_id: QueryId,
+        runs: f64,
+        schema: &Schema,
+        params: &CostModelParams,
+        planned: &mut Vec<HirPlannedQuery>,
+    ) -> Result<HirQueryEstimate> {
         let query = self
             .document
             .query(query_id)
             .expect("validated HIR query exists");
-        for dependency in self.document.direct_query_dependencies(query_id) {
-            self.plan_query_tree(dependency, schema, params, planned, active)?;
-        }
-
         let block_order_by = query
             .compounds
             .is_empty()
@@ -798,14 +1212,11 @@ impl<'a> HirPlanContext<'a> {
                 .map(|plan| HirQueryEstimate {
                     output_cardinality: plan.output_cardinality,
                     cost: plan.cost,
+                    output_order: plan.output_order.clone(),
                 })
         };
-        // A correlated subquery runs once per row of the outer tables it
-        // reads, so like SQLite it may build an automatic index once and
-        // seek it on every run. Its estimates stay per run.
-        let runs = self.correlated_runs(query, schema, params);
         let in_probe = self.in_probe_equality(query);
-        let blocks = query
+        let mut blocks = query
             .blocks
             .iter()
             .map(|block| {
@@ -824,17 +1235,387 @@ impl<'a> HirPlanContext<'a> {
                 Ok(plan)
             })
             .collect::<Result<Vec<_>>>()?;
-        let estimate = query_estimate_from_blocks(query, &blocks, params);
-        planned.push(HirPlannedQuery {
+        // Like legacy's `estimated_output_rows`: the rows a block returns
+        // after grouping or aggregates, and a literal LIMIT, not the rows its
+        // loops read.
+        let block_rows = query
+            .blocks
+            .iter()
+            .zip(&blocks)
+            .map(|(block, plan)| {
+                self.hir_select_output_rows(
+                    block,
+                    plan.output_cardinality,
+                    schema,
+                    params,
+                    &query_estimate,
+                )
+            })
+            .collect::<Vec<_>>();
+        let mut estimate = query_estimate_from_blocks(query, &blocks, &block_rows, params);
+        if let Some(limit) = block_limit.and_then(|limit| hir_literal_limit(&limit.limit)) {
+            let rows_before_limit = estimate.output_cardinality;
+            estimate.output_cardinality = rows_before_limit.min(limit);
+            // Like legacy: the calls cover the full result, and LIMIT only
+            // needs the same share of them.
+            if rows_before_limit > 0.0 {
+                let share = (estimate.output_cardinality / rows_before_limit).min(1.0);
+                for block in &mut blocks {
+                    for (_, calls) in &mut block.subquery_calls {
+                        *calls *= share;
+                    }
+                }
+            }
+        }
+        let output_order = self.query_output_order(query, &blocks, planned);
+        let plan = HirPlannedQuery {
             query: query_id,
+            runs,
+            output_order: output_order.clone(),
             blocks,
             in_probe: in_probe.is_some(),
             result_cache_keys: self.result_cache_keys(query),
             output_cardinality: estimate.output_cardinality,
             cost: estimate.cost,
-        });
-        active.remove(&query_id);
+        };
+        match planned.iter_mut().find(|planned| planned.query == query_id) {
+            Some(existing) => *existing = plan,
+            None => planned.push(plan),
+        }
+        estimate.output_order = output_order;
         Ok(estimate)
+    }
+
+    /// The order a planned query returns its rows in, in terms of its output
+    /// columns, as legacy's `subquery_intrinsic_order_consumed` reads it from
+    /// a subquery's plan: its ORDER BY; else its GROUP BY keys, which leave
+    /// the GROUP BY sorter ascending; else, for a block that only filters one
+    /// source, the order its loop reads that source in: an index or rowid
+    /// scan of a table, or the order of a FROM subquery or CTE it scans.
+    fn query_output_order(
+        &self,
+        query: &hir::Query,
+        blocks: &[HirQueryBlockPlan],
+        planned: &[HirPlannedQuery],
+    ) -> Vec<crate::translate::optimizer::order::HirOutputOrder> {
+        use crate::translate::optimizer::order::HirOutputOrder;
+        use turso_parser::ast::{NullsOrder, SortOrder};
+        let (true, [block], [block_plan]) =
+            (query.compounds.is_empty(), query.blocks.as_slice(), blocks)
+        else {
+            return Vec::new();
+        };
+        let collation = |collation: Option<&hir::ResolvedCollation>| {
+            collation
+                .map(|collation| *collation.value())
+                .unwrap_or_default()
+        };
+        let nulls = |order: SortOrder, nulls: Option<NullsOrder>| {
+            nulls.unwrap_or_else(|| NullsOrder::default_for(order))
+        };
+        let output_position = |expression: &hir::Expr| match expression {
+            hir::Expr::Output(output) => query.output.iter().position(|id| id == output),
+            expression => query.output.iter().position(|id| {
+                self.document
+                    .output(*id)
+                    .is_some_and(|output| output.expr.equivalent(expression))
+            }),
+        };
+        let mut columns = Vec::new();
+        if !query.order_by.is_empty() {
+            for term in &query.order_by {
+                let Some(column) = output_position(&term.expr) else {
+                    break;
+                };
+                columns.push(HirOutputOrder {
+                    column,
+                    order: term.order,
+                    collation: collation(term.collation.as_ref()),
+                    nulls: nulls(term.order, term.nulls),
+                });
+            }
+            return columns;
+        }
+        // Windows sort rows again after grouping and after the loops.
+        if !block.windows.is_empty() {
+            return columns;
+        }
+        let hir::QueryBlockBody::Select {
+            distinctness,
+            grouping,
+            ..
+        } = &block.body
+        else {
+            return columns;
+        };
+        if let Some(grouping) = grouping {
+            for (key, key_collation) in grouping.keys.iter().zip(&grouping.key_collations) {
+                let Some(column) = output_position(key) else {
+                    break;
+                };
+                columns.push(HirOutputOrder {
+                    column,
+                    order: SortOrder::Asc,
+                    collation: collation(key_collation.as_ref()),
+                    nulls: NullsOrder::default_for(SortOrder::Asc),
+                });
+            }
+            return columns;
+        }
+        // Like legacy's `finalized_scan_subquery_order_consumed`: only a plain
+        // scan of one source keeps the order rows are read in.
+        let [planned_loop] = block_plan.loops.as_slice() else {
+            return columns;
+        };
+        if block.aggregate_count != 0 || distinctness.is_some() || query.limit.is_some() {
+            return columns;
+        }
+        let source = planned_loop.source;
+        let source_column_position = |column: usize| {
+            query.output.iter().position(|id| {
+                self.document.output(*id).is_some_and(|output| {
+                    matches!(&output.expr, hir::Expr::Column(reference)
+                        if reference.source == source && reference.column == column)
+                })
+            })
+        };
+        let reverse = |order: SortOrder| match order {
+            SortOrder::Asc => SortOrder::Desc,
+            SortOrder::Desc => SortOrder::Asc,
+        };
+        match &planned_loop.access {
+            HirSourceAccess::BTree {
+                operation: HirBtreeOperation::Scan { iter_dir, index },
+                ..
+            } => {
+                let backwards = *iter_dir == crate::translate::plan::IterationDirection::Backwards;
+                let hir::SourceKind::Table(table) = &self.definition(source).kind else {
+                    return columns;
+                };
+                let table_columns = table.value().columns();
+                let keys: Vec<(
+                    usize,
+                    SortOrder,
+                    Option<crate::translate::collate::CollationSeq>,
+                    Option<NullsOrder>,
+                )> = match index {
+                    Some(index) => {
+                        let mut keys = Vec::new();
+                        for column in &index.columns {
+                            if column.expr.is_some() {
+                                break;
+                            }
+                            keys.push((
+                                column.pos_in_table,
+                                column.order,
+                                column.collation,
+                                column.nulls_order,
+                            ));
+                        }
+                        keys
+                    }
+                    None => match table_columns
+                        .iter()
+                        .position(|column| column.is_rowid_alias())
+                    {
+                        Some(rowid) => vec![(rowid, SortOrder::Asc, None, None)],
+                        None => Vec::new(),
+                    },
+                };
+                for (table_column, order, key_collation, key_nulls) in keys {
+                    let Some(column) = source_column_position(table_column) else {
+                        break;
+                    };
+                    let forward_nulls = nulls(order, key_nulls);
+                    columns.push(HirOutputOrder {
+                        column,
+                        order: if backwards { reverse(order) } else { order },
+                        collation: key_collation
+                            .or_else(|| table_columns[table_column].collation_opt())
+                            .unwrap_or_default(),
+                        nulls: if backwards {
+                            forward_nulls.reverse()
+                        } else {
+                            forward_nulls
+                        },
+                    });
+                }
+            }
+            HirSourceAccess::Derived {
+                query: inner,
+                seek: None,
+            }
+            | HirSourceAccess::Cte {
+                query: inner,
+                seek: None,
+                ..
+            } => {
+                let backwards = matches!(
+                    &planned_loop.access,
+                    HirSourceAccess::Cte { direction, .. }
+                        if *direction == crate::translate::plan::IterationDirection::Backwards
+                );
+                let Some(inner_order) = planned
+                    .iter()
+                    .find(|plan| plan.query == *inner)
+                    .map(|plan| &plan.output_order)
+                else {
+                    return columns;
+                };
+                for inner_column in inner_order {
+                    let Some(column) = source_column_position(inner_column.column) else {
+                        break;
+                    };
+                    columns.push(HirOutputOrder {
+                        column,
+                        order: if backwards {
+                            reverse(inner_column.order)
+                        } else {
+                            inner_column.order
+                        },
+                        collation: inner_column.collation,
+                        nulls: if backwards {
+                            inner_column.nulls.reverse()
+                        } else {
+                            inner_column.nulls
+                        },
+                    });
+                }
+            }
+            _ => {}
+        }
+        columns
+    }
+
+    /// Legacy's `estimate_select_output_rows` for one run of a HIR block:
+    /// an aggregate without GROUP BY returns one row; GROUP BY returns at most
+    /// one row per group, counted from ANALYZE statistics of an index on the
+    /// keys, or else bounded by the rows of the block's sources the keys
+    /// read.
+    fn hir_select_output_rows(
+        &self,
+        block: &hir::QueryBlock,
+        input_rows: f64,
+        schema: &Schema,
+        params: &CostModelParams,
+        query_estimate: &dyn Fn(QueryId) -> Option<HirQueryEstimate>,
+    ) -> f64 {
+        let hir::QueryBlockBody::Select { grouping, .. } = &block.body else {
+            return input_rows;
+        };
+        let Some(grouping) = grouping else {
+            return if block.aggregate_count == 0 {
+                input_rows
+            } else {
+                1.0
+            };
+        };
+        if grouping.keys.is_empty() {
+            return 1.0;
+        }
+        if let Some(groups) = self.hir_group_count_from_analyze(block, grouping, schema) {
+            return input_rows.min(groups.max(1.0));
+        }
+        let mut sources: Vec<SourceId> = Vec::new();
+        for key in &grouping.keys {
+            key.for_each(&mut |expression| {
+                if let hir::Expr::Column(hir::ColumnRef { source, .. }) | hir::Expr::RowId(source) =
+                    expression
+                {
+                    if !sources.contains(source) {
+                        sources.push(*source);
+                    }
+                }
+            });
+        }
+        if sources.is_empty() {
+            return 1.0;
+        }
+        let rows_per_call = sources.iter().try_fold(1.0, |rows, source| {
+            let definition = self.document.source(*source)?;
+            if definition.owner != hir::SourceOwner::QueryBlock(block.id) {
+                return None;
+            }
+            let source_rows = match &definition.kind {
+                hir::SourceKind::Table(table) => *base_row_estimate(schema, table.value(), params),
+                hir::SourceKind::Derived(query) => query_estimate(*query)
+                    .map_or(*RowCountEstimate::hardcoded_fallback(params), |estimate| {
+                        estimate.output_cardinality.max(1.0)
+                    }),
+                hir::SourceKind::Cte(cte) => match self.document.cte(*cte).map(|cte| &cte.body) {
+                    Some(hir::CteBody::Query(query)) => query_estimate(*query)
+                        .map_or(*RowCountEstimate::hardcoded_fallback(params), |estimate| {
+                            estimate.output_cardinality.max(1.0)
+                        }),
+                    _ => *RowCountEstimate::hardcoded_fallback(params),
+                },
+                _ => return None,
+            };
+            Some(rows * source_rows)
+        });
+        rows_per_call.map_or(input_rows, |rows| input_rows.min(rows))
+    }
+
+    /// Legacy's `group_count_from_analyze`: when every GROUP BY key is a
+    /// column of one table and an index starts with exactly those columns,
+    /// ANALYZE says how many distinct keys it holds.
+    fn hir_group_count_from_analyze(
+        &self,
+        block: &hir::QueryBlock,
+        grouping: &hir::Grouping,
+        schema: &Schema,
+    ) -> Option<f64> {
+        let mut source = None;
+        let mut columns: Vec<usize> = Vec::new();
+        for key in &grouping.keys {
+            let hir::Expr::Column(column) = key else {
+                return None;
+            };
+            if source.is_some_and(|source| source != column.source) {
+                return None;
+            }
+            source = Some(column.source);
+            columns.push(column.column);
+        }
+        let definition = self.document.source(source?)?;
+        if definition.owner != hir::SourceOwner::QueryBlock(block.id) {
+            return None;
+        }
+        let hir::SourceKind::Table(table) = &definition.kind else {
+            return None;
+        };
+        let btree = table.value().btree()?;
+        let table_stats = schema.analyze_stats.table_stats(&btree.name)?;
+        table_stats
+            .index_stats
+            .iter()
+            .filter_map(|(index_name, index_stats)| {
+                let index = schema.get_index(&btree.name, index_name)?;
+                if index.where_clause.is_some() || index.columns.len() < columns.len() {
+                    return None;
+                }
+                let columns_match =
+                    index
+                        .columns
+                        .iter()
+                        .zip(&columns)
+                        .all(|(index_column, group_column)| {
+                            index_column.expr.is_none()
+                                && index_column.pos_in_table == *group_column
+                        });
+                if !columns_match {
+                    return None;
+                }
+                let total_rows = index_stats.total_rows? as f64;
+                let rows_per_group = *index_stats
+                    .avg_rows_per_distinct_prefix
+                    .get(columns.len().checked_sub(1)?)?
+                    as f64;
+                (rows_per_group > 0.0).then_some(total_rows / rows_per_group)
+            })
+            .fold(None, |best: Option<f64>, groups| {
+                Some(best.map_or(groups, |best| best.max(groups)))
+            })
     }
 
     /// The outer values to cache a correlated subquery's result under, or
@@ -952,38 +1733,6 @@ impl<'a> HirPlanContext<'a> {
             custom: None,
             comparison: Some(comparison.clone()),
         })
-    }
-
-    /// How many times a query runs: once, or for a correlated subquery,
-    /// about once per row of the largest outer table it reads.
-    ///
-    /// Planning for many runs lets the subquery build an automatic index
-    /// once. It is only used where that index cannot change the answer: a
-    /// statement that writes tables could change them between runs, and an
-    /// index returns rows sharing a key in a different order than the table,
-    /// which matters to `group_concat` or to a scalar subquery's first row.
-    fn correlated_runs(
-        &self,
-        query: &hir::Query,
-        schema: &Schema,
-        params: &CostModelParams,
-    ) -> f64 {
-        if !matches!(self.document.root, hir::HirRoot::Query(_))
-            || !(self.document.subquery_uses_ignore_row_order(query.id)
-                || query_ignores_row_order(query))
-        {
-            return 1.0;
-        }
-        query
-            .captures
-            .iter()
-            .filter_map(|source| match &self.definition(*source).kind {
-                hir::SourceKind::Table(table) => {
-                    Some(*base_row_estimate(schema, table.value(), params))
-                }
-                _ => None,
-            })
-            .fold(1.0, f64::max)
     }
 
     /// Build planner source metadata without resolving names, allocating a
@@ -1140,6 +1889,7 @@ impl<'a> HirPlanContext<'a> {
                 source,
                 query: *query,
                 join_info,
+                output_order: Vec::new(),
             }),
             hir::SourceKind::Cte(cte) => {
                 let definition = self
@@ -1176,6 +1926,7 @@ impl<'a> HirPlanContext<'a> {
                             query: *query,
                             materialization,
                             join_info,
+                            output_order: Vec::new(),
                         })
                     }
                     hir::CteBody::Recursive(_) => Ok(HirPlanSource::RecursiveCte {
@@ -1220,7 +1971,11 @@ impl<'a> HirPlanContext<'a> {
                 hir::JoinKind::Left | hir::JoinKind::Right | hir::JoinKind::Full => {
                     Some(join.right)
                 }
-                hir::JoinKind::Comma | hir::JoinKind::Inner | hir::JoinKind::Cross => None,
+                hir::JoinKind::Comma
+                | hir::JoinKind::Inner
+                | hir::JoinKind::Cross
+                | hir::JoinKind::Semi
+                | hir::JoinKind::Anti => None,
             };
             let predicate_owner = local_outer_join.or(context.outer_join);
             self.append_from_item(
@@ -1314,6 +2069,7 @@ impl<'a> HirPlanContext<'a> {
             groups: Vec::new(),
             predicates: Vec::new(),
             where_start: 0,
+            subqueries: Vec::new(),
         };
 
         if let Some(from) = &block.from {
@@ -1486,6 +2242,8 @@ impl<'a> HirPlanContext<'a> {
                 where_start: input.where_start,
                 group_sort_elided: false,
                 order_sort_elided: false,
+                window_sort_elided: false,
+                subquery_calls: Vec::new(),
                 limit_applied: false,
                 min_max_first_value: false,
                 simple_count: false,
@@ -1496,9 +2254,11 @@ impl<'a> HirPlanContext<'a> {
         }
 
         let mut input = self.query_block_input(block, order_by, &usage)?;
+        input.subqueries = self.document.expression_subqueries(block.id.query);
         if let Some(predicate) = extra_predicate {
             append_predicates(&mut input.predicates, predicate, None);
         }
+        self.check_match_terms(&input.predicates)?;
         // Join planning tracks tables in a 64-bit mask.
         if input.sources.len() > crate::translate::plan::TableReferences::MAX_JOINED_TABLES {
             crate::bail_parse_error!(
@@ -1524,10 +2284,22 @@ impl<'a> HirPlanContext<'a> {
         let min_max_terms = simple_min_max_term(block, &input)
             .into_iter()
             .collect::<Vec<_>>();
+        // Like legacy's `compute_order_target`: a grouped block aims for its
+        // GROUP BY order even when it has an ORDER BY, so an index can still
+        // replace the GROUP BY sorter.
+        // Like the ORDER BY of legacy's window source subquery: the rows of a
+        // block with windows are wanted in the innermost window's key order.
+        let window_target = (min_max_terms.is_empty()
+            && hir_block_grouping(block).is_none()
+            && block.aggregate_count == 0)
+            .then(|| self.window_target(block))
+            .flatten();
         let order_target = if !min_max_terms.is_empty() {
             self.order_target(&min_max_terms, OrderTargetPurpose::Extremum)
-        } else if order_by.is_empty() {
-            self.grouping_target(block)
+        } else if window_target.is_some() {
+            window_target.clone()
+        } else if order_by.is_empty() || hir_block_grouping(block).is_some() {
+            self.grouping_target(block, order_by)
         } else {
             self.order_target(
                 order_by,
@@ -1535,11 +2307,26 @@ impl<'a> HirPlanContext<'a> {
             )
         };
         let simple_count = is_simple_count(block, &input, limit);
+        // Like legacy, a hash join never reads a source that a correlated
+        // subquery of the block reads.
+        let mut subquery_reads = Vec::new();
+        for query in &input.subqueries {
+            subquery_reads.extend(self.document.outer_sources(*query));
+        }
+        let hash = crate::translate::optimizer::join::HirHashJoins {
+            allowed: self.hash_joins_allowed(&input),
+            // A materialized build input is filled once per statement, so
+            // the block must not read an outer row (legacy fills it once
+            // for every outer row, which is wrong).
+            materialize: !self.document.reads_outer_sources(block.id.query),
+            subquery_reads: &subquery_reads,
+        };
         let access = self
             .plan_source_access(
                 input,
                 order_target.as_ref(),
                 true,
+                &hash,
                 simple_count,
                 initial_cardinality,
                 schema,
@@ -1551,14 +2338,16 @@ impl<'a> HirPlanContext<'a> {
                     "query block with FROM produced no B-tree access plan".to_string(),
                 )
             })?;
-        let mut plan = HirQueryBlockPlan {
+        let plan = HirQueryBlockPlan {
             block: block.id,
             groups: access.groups,
             loops: access.loops,
             predicates: access.predicates,
             where_start,
             group_sort_elided: access.group_sort_elided,
-            order_sort_elided: access.order_sort_elided,
+            order_sort_elided: access.order_sort_elided && window_target.is_none(),
+            window_sort_elided: access.order_sort_elided && window_target.is_some(),
+            subquery_calls: access.subquery_calls,
             limit_applied: false,
             min_max_first_value: access.min_max_first_value,
             simple_count,
@@ -1566,158 +2355,85 @@ impl<'a> HirPlanContext<'a> {
             output_cardinality: access.output_cardinality,
             cost: access.cost,
         };
-        self.use_hash_lookups(block, &mut plan, schema);
         Ok(plan)
     }
 
-    /// Replace automatic indexes with hash tables where that cannot change
-    /// the result, as legacy's hash joins do. A hash table is built faster
-    /// than an index and finds a row without searching a tree.
+    /// Whether a block may use hash joins, which legacy chooses while
+    /// ordering its joins (see [crate::translate::optimizer::join::HirHashJoins]).
     ///
-    /// When a hash table grows past its memory budget, it moves rows to
-    /// disk, and a lookup that needs those rows waits: the loop before it
-    /// records its rowid, and after that loop ends, those rows run again by
-    /// rowid. So:
-    ///
-    /// - the loop before the lookup must read a rowid table directly, so it
-    ///   can go back to a row by its rowid;
-    /// - the plan must not rely on the order the loops return rows in, to
-    ///   skip a sort or to stop at the first MIN or MAX value; and
-    /// - neither table may be in an outer join, whose NULL row would come
-    ///   out before the waiting rows are tried.
-    ///
-    /// Only a SELECT statement uses them, since the table is read once and a
-    /// statement that writes could change it.
-    fn use_hash_lookups(
-        &self,
-        block: &hir::QueryBlock,
-        plan: &mut HirQueryBlockPlan,
-        schema: &Schema,
-    ) {
-        let Some(from) = &block.from else {
-            return;
-        };
-        if !matches!(self.document.root, hir::HirRoot::Query(_))
-            || plan.order_sort_elided
-            || plan.group_sort_elided
-            || plan.min_max_first_value
-            || plan.simple_count
-            || plan.limit_applied
-            || !plan.groups.is_empty()
-            || plan
-                .predicates
-                .iter()
-                .any(|predicate| predicate.from_outer_join.is_some())
-            || from.joins.iter().any(|join| match join.kind {
-                hir::JoinKind::Comma | hir::JoinKind::Inner | hir::JoinKind::Cross => false,
-                hir::JoinKind::Left => !plan.inner_joins.contains(&join.right),
-                hir::JoinKind::Right | hir::JoinKind::Full => true,
+    /// The hash table is built once per statement, from every row of its
+    /// table, so a subquery that runs again probes the same table. Only a
+    /// SELECT statement uses them, since a statement that writes could
+    /// change the table. A block with a parenthesized FROM group, or with a
+    /// RIGHT join, keeps its nested loops.
+    fn hash_joins_allowed(&self, input: &HirQueryBlockPlanInput) -> bool {
+        matches!(&self.document.root, hir::HirRoot::Query(_))
+            && input.groups.is_empty()
+            && !input.sources.iter().any(|source| {
+                source
+                    .join_info()
+                    .is_some_and(|join| join.kind == hir::JoinKind::Right)
             })
-        {
-            return;
-        }
-        for position in 1..plan.loops.len() {
-            if !self.reads_rowid_table_directly(&plan.loops[position - 1], schema) {
-                continue;
-            }
-            if let Some(lookup) = self.hash_lookup(&plan.loops[position], schema) {
-                plan.loops[position].access = HirSourceAccess::Hash(lookup);
-            }
-        }
     }
 
-    /// Whether a loop reads a rowid B-tree table through its own cursor, so
-    /// a rowid puts it back on a row.
-    fn reads_rowid_table_directly(&self, planned_loop: &HirPlannedLoop, schema: &Schema) -> bool {
-        let HirSourceAccess::BTree {
-            operation,
-            table_lookup: BtreeTableLookup::ScanOnly,
-        } = &planned_loop.access
-        else {
-            return false;
-        };
-        matches!(
-            operation,
-            HirBtreeOperation::Scan { index: None, .. }
-                | HirBtreeOperation::Seek { index: None, .. }
-                | HirBtreeOperation::RowidEq { .. }
-        ) && self.plain_rowid_table(planned_loop.source, schema)
-    }
-
-    /// A rowid B-tree table without custom types that is not a materialized
-    /// view, whose cursor also reads the transaction's changes.
-    fn plain_rowid_table(&self, source: SourceId, schema: &Schema) -> bool {
-        let definition = self.definition(source);
-        let hir::SourceKind::Table(table) = &definition.kind else {
-            return false;
-        };
-        table
-            .value()
-            .btree()
-            .is_some_and(|table| table.has_rowid && !schema.is_materialized_view(&table.name))
-            && definition.column_type_programs.iter().all(Option::is_none)
-            && definition
-                .columns
-                .iter()
-                .all(|column| !column.type_fact.is_array())
-    }
-
-    /// The hash lookup that can replace a loop's automatic index: every key
-    /// of its seek is an `=` with a collation the hash table supports.
-    fn hash_lookup(&self, planned_loop: &HirPlannedLoop, schema: &Schema) -> Option<HirHashLookup> {
-        use crate::translate::collate::CollationSeq;
-        use crate::translate::plan::SeekKeyComponent;
-        let HirSourceAccess::BTree {
-            operation:
-                HirBtreeOperation::Seek {
-                    index: Some(index),
-                    seek_def,
-                },
-            table_lookup: BtreeTableLookup::ScanOnly,
-        } = &planned_loop.access
-        else {
-            return None;
-        };
-        if !index.ephemeral
-            || !self.plain_rowid_table(planned_loop.source, schema)
-            || seek_def.prefix.is_empty()
-            || !matches!(seek_def.start.last_component, SeekKeyComponent::None)
-            || !matches!(seek_def.end.last_component, SeekKeyComponent::None)
-        {
-            return None;
-        }
-        let keys = seek_def
-            .prefix
+    /// The hash lookup of a hash join's build table: one key per join term,
+    /// the build table's column against the probe table's value, compared
+    /// with the term's affinity and collation.
+    fn hash_join_lookup(
+        &self,
+        predicates: &[HirWhereTerm],
+        join_keys: &[crate::translate::plan::HashJoinKey],
+    ) -> Result<HirHashLookup> {
+        use crate::translate::optimizer::constraints::BinaryExprSide;
+        let keys = join_keys
             .iter()
-            .zip(&index.columns)
-            .map(|(component, column)| {
-                let (turso_parser::ast::Operator::Equals, value, affinity) =
-                    component.eq.as_ref()?
+            .map(|key| {
+                let hir::Expr::Binary {
+                    lhs,
+                    rhs,
+                    comparison,
+                    ..
+                } = &predicates[key.where_clause_idx].expr
                 else {
-                    return None;
+                    return Err(LimboError::InternalError(
+                        "HIR hash join key is not a binary term".to_string(),
+                    ));
                 };
-                if component.lower_bound.is_some()
-                    || component.upper_bound.is_some()
-                    || matches!(column.collation, Some(CollationSeq::Custom(_)))
-                    || !reads_a_row(value)
-                {
-                    return None;
-                }
-                Some(HirHashKey {
-                    column: column.pos_in_table,
-                    value: value.clone(),
-                    affinity: *affinity,
-                    collation: column.collation,
+                let (build, probe) = match key.build_side {
+                    BinaryExprSide::Lhs => (lhs, rhs),
+                    BinaryExprSide::Rhs => (rhs, lhs),
+                };
+                let component = comparison
+                    .as_ref()
+                    .and_then(|comparison| comparison.components.first());
+                Ok(HirHashKey {
+                    build: build.as_ref().clone(),
+                    value: probe.as_ref().clone(),
+                    affinity: component
+                        .map_or(crate::vdbe::affinity::Affinity::Blob, |component| {
+                            component.affinity
+                        }),
+                    collation: component
+                        .and_then(|component| component.collation.as_ref())
+                        .map(|collation| *collation.value()),
                 })
             })
-            .collect::<Option<Vec<_>>>()?;
-        Some(HirHashLookup {
+            .collect::<Result<Vec<_>>>()?;
+        let mut columns = Vec::new();
+        for key in &keys {
+            key.build.for_each(&mut |expression| {
+                if let hir::Expr::Column(column) = expression {
+                    if !columns.contains(&column.column) {
+                        columns.push(column.column);
+                    }
+                }
+            });
+        }
+        Ok(HirHashLookup {
+            columns,
             keys,
-            columns: index
-                .columns
-                .iter()
-                .map(|column| column.pos_in_table)
-                .collect(),
+            explain: None,
+            build_input: None,
         })
     }
 
@@ -1790,6 +2506,8 @@ impl<'a> HirPlanContext<'a> {
             where_start: input.where_start,
             group_sort_elided: false,
             order_sort_elided: matched.applies_order_by,
+            window_sort_elided: false,
+            subquery_calls: Vec::new(),
             limit_applied: matched.applies_limit,
             min_max_first_value: false,
             simple_count: false,
@@ -1865,12 +2583,14 @@ impl<'a> HirPlanContext<'a> {
             groups: Vec::new(),
             predicates: std::mem::take(&mut input.predicates),
             where_start: input.where_start,
+            subqueries: Vec::new(),
         };
         let access = self
             .plan_source_access(
                 rest,
                 None,
                 true,
+                &crate::translate::optimizer::join::HirHashJoins::NONE,
                 false,
                 initial_cardinality,
                 schema,
@@ -1900,6 +2620,8 @@ impl<'a> HirPlanContext<'a> {
             where_start: input.where_start,
             group_sort_elided: false,
             order_sort_elided: false,
+            window_sort_elided: false,
+            subquery_calls: Vec::new(),
             limit_applied: false,
             min_max_first_value: false,
             simple_count: false,
@@ -1918,8 +2640,10 @@ impl<'a> HirPlanContext<'a> {
         mut input: HirQueryBlockPlanInput,
         order_target: Option<&HirOrderTarget<'_>>,
         // Whether a table may be read through one seek per branch of an OR
-        // term, which DELETE and UPDATE loops do not do yet.
+        // term.
         or_union: bool,
+        // Whether and how the block may use hash joins.
+        hash: &crate::translate::optimizer::join::HirHashJoins<'_>,
         // Whether the block is a plain `SELECT count(*) FROM t`.
         simple_count: bool,
         initial_cardinality: f64,
@@ -1930,13 +2654,18 @@ impl<'a> HirPlanContext<'a> {
         let query_rows = |query| query_estimate(query).map(|estimate| estimate.output_cardinality);
         let mut base_rows = Vec::with_capacity(input.sources.len());
         let mut source_costs = Vec::with_capacity(input.sources.len());
-        for source in &input.sources {
+        for source in &mut input.sources {
             match source {
                 HirPlanSource::BTree(source) => {
                     base_rows.push(base_row_estimate(schema, &source.table, params));
                     source_costs.push(Cost(0.0));
                 }
-                HirPlanSource::Derived { source, query, .. } => {
+                HirPlanSource::Derived {
+                    source,
+                    query,
+                    output_order,
+                    ..
+                } => {
                     let child = query_estimate(*query).ok_or_else(|| {
                         LimboError::InternalError(format!(
                             "derived HIR source {source} references unplanned query {query}"
@@ -1946,9 +2675,14 @@ impl<'a> HirPlanContext<'a> {
                         child.output_cardinality.max(1.0),
                     ));
                     source_costs.push(child.cost);
+                    *output_order = child.output_order;
                 }
                 HirPlanSource::Cte {
-                    source, cte, query, ..
+                    source,
+                    cte,
+                    query,
+                    output_order,
+                    ..
                 } => {
                     let child = query_estimate(*query).ok_or_else(|| {
                         LimboError::InternalError(format!(
@@ -1959,6 +2693,7 @@ impl<'a> HirPlanContext<'a> {
                         child.output_cardinality.max(1.0),
                     ));
                     source_costs.push(child.cost);
+                    *output_order = child.output_order;
                 }
                 HirPlanSource::RecursiveCte { .. } => {
                     base_rows.push(RowCountEstimate::hardcoded_fallback(params));
@@ -2012,6 +2747,7 @@ impl<'a> HirPlanContext<'a> {
             &schema.analyze_stats,
             params,
             or_union,
+            hash,
         )?;
 
         let Some(mut result) = result else {
@@ -2027,6 +2763,14 @@ impl<'a> HirPlanContext<'a> {
                 result.best_plan = ordered;
             }
         }
+        let subquery_calls = self.subquery_calls(
+            &input,
+            &result.best_plan,
+            &access_methods,
+            &constraints,
+            initial_cardinality,
+            params,
+        )?;
         // Whether the chosen loops already return rows in the order the
         // GROUP BY or ORDER BY target asks for, so its sort can be skipped.
         let sort_elided = |by: EliminatesSortBy| -> Result<bool> {
@@ -2044,8 +2788,11 @@ impl<'a> HirPlanContext<'a> {
                 _ => Ok(false),
             }
         };
-        let group_sort_elided = sort_elided(EliminatesSortBy::Group)?;
-        let order_sort_elided = sort_elided(EliminatesSortBy::Order)?;
+        let group_and_order_sort_elided = sort_elided(EliminatesSortBy::GroupByAndOrder)?;
+        let group_sort_elided =
+            group_and_order_sort_elided || sort_elided(EliminatesSortBy::Group)?;
+        let order_sort_elided =
+            group_and_order_sort_elided || sort_elided(EliminatesSortBy::Order)?;
         let min_max_first_value = match order_target {
             Some(target) if target.is_extremum() => hir_plan_satisfies_order_target(
                 &result.best_plan,
@@ -2058,9 +2805,164 @@ impl<'a> HirPlanContext<'a> {
             _ => false,
         };
         let mut prior_sources = crate::translate::planner::TableMask::default();
-        let mut loops = Vec::with_capacity(input.sources.len());
+        let mut loops: Vec<HirPlannedLoop> = Vec::with_capacity(input.sources.len());
         let mut read_out_of_order = false;
+        let materialized_probes =
+            materialized_hash_build_inputs(&result.best_plan, &access_methods, &constraints)?;
+        // The build tables of hash joins. Like legacy, each is read in full
+        // into its hash table, so its own access method is not applied and
+        // its terms stay to be checked after each lookup.
+        let hash_builds = result
+            .best_plan
+            .data
+            .iter()
+            .filter_map(|(_, method)| match &access_methods[*method].params {
+                super::optimizer::access_method::AccessMethodParams::HashJoin {
+                    build_table_idx,
+                    ..
+                } => Some(*build_table_idx),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
         for (source_position, access_method_position) in result.best_plan.data.iter().copied() {
+            // A build table that itself probes an earlier hash table keeps
+            // that lookup: its hash table is then built from a build input.
+            let probes = matches!(
+                access_methods[access_method_position].params,
+                super::optimizer::access_method::AccessMethodParams::HashJoin { .. }
+            );
+            if hash_builds.contains(&source_position) && !probes {
+                // EXPLAIN shows the access the build table was planned with,
+                // as legacy does; it is applied to a copy of the terms, so
+                // they all stay to be checked.
+                let HirPlanSource::BTree(source) = &input.sources[source_position] else {
+                    return Err(LimboError::InternalError(
+                        "HIR hash join builds from a non-table source".to_string(),
+                    ));
+                };
+                let mut scratch = input.predicates.clone();
+                let operation = apply_hir_selected_btree_access(
+                    source,
+                    &constraints[source_position],
+                    &mut scratch,
+                    &mut access_methods[access_method_position].clone(),
+                    &prior_sources,
+                    source_position,
+                )?;
+                let definition = self.definition(source.internal_id);
+                let table_lookup = selected_btree_index(&operation)
+                    .filter(|index| !source.index_is_covering(definition, index))
+                    .map_or(BtreeTableLookup::ScanOnly, |_| {
+                        BtreeTableLookup::TableRequired
+                    });
+                loops.push(HirPlannedLoop {
+                    source: source.internal_id,
+                    source_position,
+                    access: HirSourceAccess::BTree {
+                        operation,
+                        table_lookup,
+                    },
+                });
+                prior_sources.set(source_position)?;
+                continue;
+            }
+            // Like legacy's hash join, the previous loop's table is built into a
+            // hash table and this table is scanned, probing it: this loop
+            // comes first, and the build table's loop looks up its rows.
+            if let super::optimizer::access_method::AccessMethodParams::HashJoin {
+                build_table_idx,
+                join_keys,
+                ..
+            } = &access_methods[access_method_position].params
+            {
+                let mut lookup = self.hash_join_lookup(&input.predicates, join_keys)?;
+                let build_loop = if materialized_probes.contains(&source_position) {
+                    // Like legacy's materialized build input: every loop so
+                    // far runs once into a temporary table the hash table is
+                    // built from, and the lookup supplies their rows.
+                    let prefix = std::mem::take(&mut loops);
+                    if !prefix
+                        .iter()
+                        .any(|planned_loop| planned_loop.source_position == *build_table_idx)
+                    {
+                        return Err(LimboError::InternalError(
+                            "HIR hash join build is not among the loops before its probe"
+                                .to_string(),
+                        ));
+                    }
+                    let sources = prefix
+                        .iter()
+                        .flat_map(HirPlannedLoop::sources)
+                        .collect::<Vec<_>>();
+                    // The prefix checks the terms that read only its
+                    // sources, and the block checks them no more. An outer
+                    // join's ON term goes with that join.
+                    let mut predicates = input.predicates.clone();
+                    for (prefix_term, term) in predicates.iter_mut().zip(&mut input.predicates) {
+                        if term.consumed {
+                            continue;
+                        }
+                        let mut outside = term
+                            .from_outer_join
+                            .is_some_and(|owner| !sources.contains(&owner));
+                        self.document.visit_expr_sources(&term.expr, &mut |source| {
+                            outside |= !sources.contains(&source);
+                        });
+                        if outside {
+                            prefix_term.consumed = true;
+                        } else {
+                            term.consumed = true;
+                        }
+                    }
+                    lookup.build_input = Some(Box::new(HirHashBuildInput {
+                        loops: prefix,
+                        predicates,
+                        sources,
+                    }));
+                    HirPlannedLoop {
+                        source: input.sources[*build_table_idx].source(),
+                        source_position: *build_table_idx,
+                        access: HirSourceAccess::Hash(lookup),
+                    }
+                } else {
+                    let build_loop: HirPlannedLoop = loops.pop().ok_or_else(|| {
+                        LimboError::InternalError("HIR hash join has no build loop".to_string())
+                    })?;
+                    if build_loop.source_position != *build_table_idx {
+                        return Err(LimboError::InternalError(
+                            "HIR hash join build is not the previous loop".to_string(),
+                        ));
+                    }
+                    if let HirSourceAccess::BTree {
+                        operation,
+                        table_lookup,
+                    } = &build_loop.access
+                    {
+                        lookup.explain = Some((operation.clone(), *table_lookup));
+                    }
+                    HirPlannedLoop {
+                        access: HirSourceAccess::Hash(lookup),
+                        ..build_loop
+                    }
+                };
+                for key in join_keys {
+                    input.predicates[key.where_clause_idx].consumed = true;
+                }
+                loops.push(HirPlannedLoop {
+                    source: input.sources[source_position].source(),
+                    source_position,
+                    access: HirSourceAccess::BTree {
+                        operation: HirBtreeOperation::Scan {
+                            iter_dir: crate::translate::plan::IterationDirection::Forwards,
+                            index: None,
+                        },
+                        table_lookup: BtreeTableLookup::ScanOnly,
+                    },
+                });
+                loops.push(build_loop);
+                prior_sources.set(source_position)?;
+                continue;
+            }
             let access = match &input.sources[source_position] {
                 HirPlanSource::BTree(source) => match &source.table {
                     Table::BTree(_) => {
@@ -2092,6 +2994,9 @@ impl<'a> HirPlanContext<'a> {
                         };
                         match union {
                             Some(union) => {
+                                if union.covers_term {
+                                    input.predicates[union.term].consumed = true;
+                                }
                                 // The union reads rows in rowid order, not
                                 // the scan's, so an order the plan proved
                                 // from this table's loop no longer holds.
@@ -2131,37 +3036,46 @@ impl<'a> HirPlanContext<'a> {
                         )))
                     }
                 },
-                HirPlanSource::Derived { query, .. } => {
-                    if !matches!(
-                        access_methods[access_method_position].params,
-                        super::optimizer::access_method::AccessMethodParams::Subquery { .. }
-                    ) {
-                        return Err(LimboError::InternalError(
-                            "derived HIR source selected a non-subquery access method".to_string(),
-                        ));
-                    }
-                    HirSourceAccess::Derived { query: *query }
-                }
+                HirPlanSource::Derived {
+                    query, join_info, ..
+                } => HirSourceAccess::Derived {
+                    query: *query,
+                    seek: crate::translate::optimizer::apply_hir_materialized_subquery_access(
+                        &constraints[source_position],
+                        &mut input.predicates,
+                        &access_methods[access_method_position],
+                        hir_outer_join_source(
+                            input.sources[source_position].source(),
+                            join_info.as_ref(),
+                        ),
+                    )?,
+                },
                 HirPlanSource::Cte {
                     cte,
                     query,
                     materialization,
+                    join_info,
                     ..
-                } => {
-                    if !matches!(
-                        access_methods[access_method_position].params,
-                        super::optimizer::access_method::AccessMethodParams::Subquery { .. }
-                    ) {
-                        return Err(LimboError::InternalError(
-                            "CTE HIR source selected a non-subquery access method".to_string(),
-                        ));
-                    }
-                    HirSourceAccess::Cte {
-                        cte: *cte,
-                        query: *query,
-                        materialization: *materialization,
-                    }
-                }
+                } => HirSourceAccess::Cte {
+                    cte: *cte,
+                    query: *query,
+                    materialization: *materialization,
+                    direction: match access_methods[access_method_position].params {
+                        super::optimizer::access_method::AccessMethodParams::Subquery {
+                            iter_dir,
+                        } => iter_dir,
+                        _ => crate::translate::plan::IterationDirection::Forwards,
+                    },
+                    seek: crate::translate::optimizer::apply_hir_materialized_subquery_access(
+                        &constraints[source_position],
+                        &mut input.predicates,
+                        &access_methods[access_method_position],
+                        hir_outer_join_source(
+                            input.sources[source_position].source(),
+                            join_info.as_ref(),
+                        ),
+                    )?,
+                },
                 HirPlanSource::RecursiveCte { cte, .. } => {
                     if !matches!(
                         access_methods[access_method_position].params,
@@ -2202,9 +3116,59 @@ impl<'a> HirPlanContext<'a> {
             group_sort_elided: group_sort_elided && !read_out_of_order,
             order_sort_elided: order_sort_elided && !read_out_of_order,
             min_max_first_value: min_max_first_value && !read_out_of_order,
+            subquery_calls,
             output_cardinality: result.best_plan.output_cardinality,
             cost: result.best_plan.cost,
         }))
+    }
+
+    /// How many times each correlated expression subquery of the block runs,
+    /// as legacy counts it for its chosen plan: for a subquery that reads
+    /// sources of this block, the rows that reach the step where the last of
+    /// them is joined. A subquery that reads none of them runs as often as
+    /// the block, and is left out here.
+    fn subquery_calls(
+        &self,
+        input: &HirQueryBlockPlanInput,
+        plan: &crate::translate::optimizer::join::JoinN,
+        access_methods: &[super::optimizer::access_method::AccessMethod],
+        constraints: &[HirTableConstraints],
+        initial_cardinality: f64,
+        params: &CostModelParams,
+    ) -> Result<Vec<(QueryId, f64)>> {
+        let mut subqueries = Vec::with_capacity(input.subqueries.len());
+        for query in &input.subqueries {
+            let mut required = crate::translate::planner::TableMask::default();
+            for source in self.document.outer_sources(*query) {
+                if let Some(position) = input
+                    .sources
+                    .iter()
+                    .position(|planned| planned.source() == source)
+                {
+                    required.set(position)?;
+                }
+            }
+            let first_predicate = input.predicates.iter().position(|term| {
+                let mut found = false;
+                term.expr.for_each(&mut |expression| {
+                    if let hir::Expr::Subquery(subquery) = expression {
+                        found |= hir_subquery_query(subquery) == *query;
+                    }
+                });
+                found
+            });
+            subqueries.push((*query, required, first_predicate));
+        }
+        crate::translate::optimizer::join::hir_subquery_calls_for_plan(
+            plan,
+            access_methods,
+            constraints,
+            &input.sources,
+            &subqueries,
+            input.predicates.len(),
+            initial_cardinality,
+            params,
+        )
     }
 
     /// Build an ordering requirement from resolved HIR terms without reopening
@@ -2224,17 +3188,46 @@ impl<'a> HirPlanContext<'a> {
         (!columns.is_empty()).then_some(OrderTarget { columns, purpose })
     }
 
-    fn grouping_target<'term>(&self, block: &'term hir::QueryBlock) -> Option<HirOrderTarget<'term>>
+    /// The order a grouped block wants its rows in, as legacy's
+    /// `compute_order_target` picks it. When every ORDER BY term is a GROUP BY
+    /// key, the keys in ORDER BY order and directions: rows in that order need
+    /// neither the GROUP BY nor the ORDER BY sorter. Otherwise the keys in
+    /// their own order, which only saves the GROUP BY sorter. Windows sort
+    /// the grouped rows again, so then only the GROUP BY order helps.
+    fn grouping_target<'term>(
+        &self,
+        block: &'term hir::QueryBlock,
+        order_by: &'term [hir::OrderTerm],
+    ) -> Option<HirOrderTarget<'term>>
     where
         'a: 'term,
     {
-        let hir::QueryBlockBody::Select {
-            grouping: Some(grouping),
-            ..
-        } = &block.body
-        else {
-            return None;
-        };
+        let grouping = hir_block_grouping(block)?;
+        let key_order = block
+            .windows
+            .is_empty()
+            .then(|| group_key_order(self.document, order_by, grouping))
+            .flatten();
+        if let Some(key_order) = key_order {
+            let columns = key_order
+                .iter()
+                .map(|key| {
+                    self.ordering_column(
+                        &grouping.keys[key.key],
+                        key.order,
+                        grouping.key_collations[key.key]
+                            .as_ref()
+                            .map(|collation| *collation.value())
+                            .unwrap_or_default(),
+                        key.nulls,
+                    )
+                })
+                .collect::<Option<Vec<_>>>()?;
+            return Some(OrderTarget {
+                columns,
+                purpose: OrderTargetPurpose::EliminatesSort(EliminatesSortBy::GroupByAndOrder),
+            });
+        }
         let columns = grouping
             .keys
             .iter()
@@ -2254,6 +3247,62 @@ impl<'a> HirPlanContext<'a> {
         (!columns.is_empty()).then_some(OrderTarget {
             columns,
             purpose: OrderTargetPurpose::EliminatesSort(EliminatesSortBy::Group),
+        })
+    }
+
+    /// The order the innermost window layer, which reads the block's rows,
+    /// sorts them in: PARTITION BY terms ascending, then ORDER BY terms, each
+    /// key once, like the ORDER BY of legacy's window source subquery. Rows
+    /// already in that order need no window sort. A key that a custom type
+    /// sorts by its stored value is left to the sorter.
+    fn window_target<'term>(&self, block: &'term hir::QueryBlock) -> Option<HirOrderTarget<'term>>
+    where
+        'a: 'term,
+    {
+        let window = block.windows.last()?;
+        let collation = |collation: Option<&hir::ResolvedCollation>| {
+            collation
+                .map(|collation| *collation.value())
+                .unwrap_or_default()
+        };
+        let partition = window.partition_by.iter().map(|term| {
+            (
+                &term.expr,
+                &term.type_fact,
+                turso_parser::ast::SortOrder::Asc,
+                collation(term.collation.as_ref()),
+                None,
+            )
+        });
+        let order = window.order_by.iter().map(|term| {
+            (
+                &term.expr,
+                &term.type_fact,
+                term.order,
+                collation(term.collation.as_ref()),
+                term.nulls,
+            )
+        });
+        let mut keys: Vec<&'term hir::Expr> = Vec::new();
+        let mut columns = Vec::new();
+        for (expression, type_fact, order, collation, nulls) in partition.chain(order) {
+            if keys.iter().any(|key| key.equivalent(expression)) {
+                continue;
+            }
+            let encoded = type_fact
+                .declared
+                .as_ref()
+                .and_then(|declared| declared.custom())
+                .is_some_and(|custom| custom.value().decode().is_some());
+            if encoded {
+                return None;
+            }
+            keys.push(expression);
+            columns.push(self.ordering_column(expression, order, collation, nulls)?);
+        }
+        (!columns.is_empty()).then_some(OrderTarget {
+            columns,
+            purpose: OrderTargetPurpose::EliminatesSort(EliminatesSortBy::Order),
         })
     }
 
@@ -2381,17 +3430,47 @@ fn materialized_view_sources(
     Ok(views)
 }
 
+fn hir_subquery_query(subquery: &hir::SubqueryExpr) -> QueryId {
+    match subquery {
+        hir::SubqueryExpr::Scalar { query, .. }
+        | hir::SubqueryExpr::Row { query }
+        | hir::SubqueryExpr::In { query, .. }
+        | hir::SubqueryExpr::Exists(query) => *query,
+    }
+}
+
+/// A non-negative literal LIMIT, as legacy reads one to cap its row
+/// estimate. A negative LIMIT means no limit.
+fn hir_literal_limit(limit: &hir::Expr) -> Option<f64> {
+    let hir::Expr::Literal(turso_parser::ast::Literal::Numeric(text)) = limit else {
+        return None;
+    };
+    match crate::util::parse_numeric_literal(text).ok()? {
+        crate::types::Value::Numeric(crate::numeric::Numeric::Integer(value)) if value >= 0 => {
+            Some(value as f64)
+        }
+        crate::types::Value::Numeric(crate::numeric::Numeric::Float(value)) => {
+            let value: f64 = value.into();
+            (value >= 0.0).then_some(value)
+        }
+        _ => None,
+    }
+}
+
+/// `block_rows` holds the rows each block of `blocks` returns.
 fn query_estimate_from_blocks(
     query: &hir::Query,
     blocks: &[HirQueryBlockPlan],
+    block_rows: &[f64],
     params: &CostModelParams,
 ) -> HirQueryEstimate {
     let fallback = *RowCountEstimate::hardcoded_fallback(params);
     let block_rows = |block| {
         blocks
             .iter()
-            .find(|plan| plan.block == block)
-            .map_or(fallback, |plan| plan.output_cardinality)
+            .zip(block_rows)
+            .find(|(plan, _)| plan.block == block)
+            .map_or(fallback, |(_, rows)| *rows)
     };
     let mut output_cardinality = block_rows(query.first);
     for arm in &query.compounds {
@@ -2406,6 +3485,7 @@ fn query_estimate_from_blocks(
 
     HirQueryEstimate {
         output_cardinality,
+        output_order: Vec::new(),
         cost: blocks
             .iter()
             .fold(Cost(0.0), |cost, block| cost + block.cost),
@@ -3516,35 +4596,21 @@ mod tests {
         assert_eq!(left_loop.source_position, 0);
         assert_eq!(right_loop.source, right);
         assert_eq!(right_loop.source_position, 1);
-        let HirSourceAccess::BTree {
-            operation:
-                HirBtreeOperation::Seek {
-                    index: Some(index),
-                    seek_def,
-                },
-            ..
-        } = &right_loop.access
-        else {
-            panic!("right source uses its selected automatic-index seek");
-        };
-        assert!(index.ephemeral);
-        assert_eq!(
-            index
-                .columns
-                .iter()
-                .map(|column| column.pos_in_table)
-                .collect::<Vec<_>>(),
-            [0]
+        // Like legacy, a USING join never hashes: the right source seeks an
+        // automatic index on the join equality.
+        assert!(
+            matches!(
+                &right_loop.access,
+                HirSourceAccess::BTree {
+                    operation: crate::translate::optimizer::HirBtreeOperation::Seek {
+                        index: Some(index),
+                        ..
+                    },
+                    ..
+                } if index.ephemeral
+            ),
+            "right source seeks an automatic index"
         );
-        let Some((operator, expression, affinity)) = &seek_def.prefix[0].eq else {
-            panic!("join equality becomes the seek prefix");
-        };
-        assert_eq!(*operator, Operator::Equals);
-        assert_eq!(*affinity, Affinity::Integer);
-        assert!(matches!(
-            expression,
-            hir::Expr::Column(column) if *column == hir::ColumnRef { source: left, column: 0 }
-        ));
         assert!(plan.predicates[0].consumed);
     }
 
@@ -3787,7 +4853,7 @@ mod tests {
         assert_eq!(source_loop.source_position, 0);
         assert!(matches!(
             source_loop.access,
-            HirSourceAccess::Derived { query } if query == child_query
+            HirSourceAccess::Derived { query, .. } if query == child_query
         ));
         assert!(root.cost.0 > child.cost.0);
 
@@ -3863,6 +4929,7 @@ mod tests {
                 cte,
                 query,
                 materialization: HirCteMaterialization::Explicit,
+                ..
             } if cte == cte_id && query == child_query
         ));
 
@@ -4080,7 +5147,7 @@ mod tests {
             source_loop.source == source_id
                 && matches!(
                     source_loop.access,
-                    HirSourceAccess::Derived { query } if query == child_query
+                    HirSourceAccess::Derived { query, .. } if query == child_query
                 )
         }));
     }

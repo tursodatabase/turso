@@ -421,27 +421,102 @@ pub(crate) fn hir_plan_satisfies_order_target(
     order_target: &HirOrderTarget<'_>,
     schema: &Schema,
 ) -> Result<bool> {
-    // An outer join adds NULL-extended rows outside any loop's order.
-    let outer = |source: &HirPlanSource| {
-        source.join_info().is_some_and(|join| {
-            matches!(
-                join.kind,
-                hir::JoinKind::Left | hir::JoinKind::Right | hir::JoinKind::Full
-            )
-        })
+    // A hash join scans its probe table first and looks the build table up,
+    // so its loops do not run in the plan's join order; legacy never keeps a
+    // hash join's order either.
+    if plan.data.iter().any(|(_, method)| {
+        matches!(
+            access_methods.get(*method).map(|method| &method.params),
+            Some(AccessMethodParams::HashJoin { .. })
+        )
+    }) {
+        return Ok(false);
+    }
+    // A RIGHT or FULL join adds its unmatched rows after every loop ends.
+    let join_kind = |source_position: usize| {
+        sources
+            .get(source_position)
+            .and_then(|source| source.join_info())
+            .map(|join| join.kind)
     };
-    if plan
-        .data
-        .iter()
-        .any(|(source_position, _)| sources.get(*source_position).is_some_and(outer))
-    {
+    if plan.data.iter().any(|(source_position, _)| {
+        matches!(
+            join_kind(*source_position),
+            Some(hir::JoinKind::Right | hir::JoinKind::Full)
+        )
+    }) {
         return Ok(false);
     }
     let columns = order_target.columns.len();
     let mut consumed_columns = 0;
     for (loop_position, (source_position, access_method_position)) in plan.data.iter().enumerate() {
-        let Some(HirPlanSource::BTree(source)) = sources.get(*source_position) else {
+        // Like legacy: a LEFT JOIN adds a NULL row after its scan or seek, so
+        // its order cannot give the terms that read its own columns. The
+        // terms before them keep the order of the loops before it.
+        if join_kind(*source_position) == Some(hir::JoinKind::Left)
+            && order_target.columns[consumed_columns..]
+                .iter()
+                .any(|column| {
+                    sources
+                        .get(*source_position)
+                        .is_some_and(|source| source.source() == column.source)
+                })
+        {
             return Ok(false);
+        }
+        let source = match sources.get(*source_position) {
+            Some(HirPlanSource::BTree(source)) => source,
+            // Like legacy, a FROM subquery or CTE that is scanned returns its
+            // rows in its own order.
+            Some(
+                HirPlanSource::Derived {
+                    source: subquery_source,
+                    output_order,
+                    ..
+                }
+                | HirPlanSource::Cte {
+                    source: subquery_source,
+                    output_order,
+                    ..
+                },
+            ) => {
+                let Some(AccessMethod {
+                    params: AccessMethodParams::Subquery { iter_dir },
+                    ..
+                }) = access_methods.get(*access_method_position)
+                else {
+                    return Ok(false);
+                };
+                let consumed = hir_subquery_intrinsic_order_consumed(
+                    *subquery_source,
+                    output_order,
+                    *iter_dir,
+                    &order_target.columns[consumed_columns..],
+                );
+                if consumed == 0 {
+                    return Ok(false);
+                }
+                consumed_columns += consumed;
+                if consumed_columns == columns {
+                    return Ok(true);
+                }
+                // The scan may repeat the values ordered so far.
+                let next_comes_from_later_loop = order_target
+                    .columns
+                    .get(consumed_columns)
+                    .is_some_and(|column| {
+                        plan.data[loop_position + 1..].iter().any(|(later, _)| {
+                            sources
+                                .get(*later)
+                                .is_some_and(|later| later.source() == column.source)
+                        })
+                    });
+                if next_comes_from_later_loop {
+                    return Ok(false);
+                }
+                continue;
+            }
+            _ => return Ok(false),
         };
         let Some(definition) = document.source(source.internal_id) else {
             return Err(LimboError::InternalError(format!(
@@ -611,6 +686,46 @@ pub fn subquery_intrinsic_order_consumed(
     finalized_scan_subquery_order_consumed(table_id, select_plan, iter_dir, target, schema)
 }
 
+/// One output column of a planned HIR query, in the order the query returns
+/// its rows: rows are ordered by the first entry, then the second, and so on.
+/// `nulls` is the effective NULLS placement, so a later reversal flips it.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct HirOutputOrder {
+    pub(crate) column: usize,
+    pub(crate) order: SortOrder,
+    pub(crate) collation: CollationSeq,
+    pub(crate) nulls: ast::NullsOrder,
+}
+
+/// How many leading `target` columns a HIR FROM subquery or CTE returns its
+/// rows in when read in `iter_dir`, as legacy's
+/// [subquery_intrinsic_order_consumed] finds it. `output_order` is the order
+/// the subquery's plan returns its rows in; see `HirPlannedQuery`.
+pub(crate) fn hir_subquery_intrinsic_order_consumed(
+    source: hir::SourceId,
+    output_order: &[HirOutputOrder],
+    iter_dir: IterationDirection,
+    target: &[ColumnOrder<hir::SourceId, &hir::Expr>],
+) -> usize {
+    let intrinsic = output_order
+        .iter()
+        .map(|column| ColumnOrder {
+            source,
+            target: ColumnTarget::<()>::Column(column.column),
+            order: column.order,
+            collation: column.collation,
+            nulls_order: Some(column.nulls),
+        })
+        .collect::<Vec<_>>();
+    match_intrinsic_order_by(&intrinsic, iter_dir, target, |intrinsic, target| {
+        intrinsic.source == target.source
+            && matches!(
+                (&intrinsic.target, &target.target),
+                (ColumnTarget::Column(a), ColumnTarget::Column(b)) if a == b
+            )
+    })
+}
+
 /// Build a `ColumnOrder` list from expressions and sort directions by mapping
 /// each expression to a result column position.
 fn build_intrinsic_order(
@@ -662,10 +777,23 @@ fn match_intrinsic_order(
     iter_dir: IterationDirection,
     target: &[ColumnOrder],
 ) -> usize {
+    match_intrinsic_order_by(intrinsic, iter_dir, target, |intrinsic_col, target_col| {
+        intrinsic_col.source == target_col.source && intrinsic_col.target == target_col.target
+    })
+}
+
+/// [match_intrinsic_order] for any column representation: `same_column`
+/// decides whether an intrinsic column is the target column; direction,
+/// collation and NULLS order are compared the same way for every caller.
+fn match_intrinsic_order_by<I, E, J, F>(
+    intrinsic: &[ColumnOrder<J, F>],
+    iter_dir: IterationDirection,
+    target: &[ColumnOrder<I, E>],
+    same_column: impl Fn(&ColumnOrder<J, F>, &ColumnOrder<I, E>) -> bool,
+) -> usize {
     let target_len = target.len().min(intrinsic.len());
     for (intrinsic_col, target_col) in intrinsic.iter().zip(target.iter()).take(target_len) {
-        if intrinsic_col.source != target_col.source
-            || intrinsic_col.target != target_col.target
+        if !same_column(intrinsic_col, target_col)
             || intrinsic_col.collation != target_col.collation
         {
             return 0;

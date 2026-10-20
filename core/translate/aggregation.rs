@@ -669,12 +669,11 @@ pub(crate) fn translate_hir_aggregation_step(
     distinct: Option<&HirAggregateDistinct>,
     fraction_reg: Option<usize>,
 ) -> Result<usize> {
+    // Like legacy.
     if !call.arguments.order_terms().is_empty()
         && !matches!(call.arguments, hir::FunctionArguments::OrderedSet { .. })
     {
-        return Err(LimboError::InternalError(
-            "HIR aggregate argument ORDER BY is not lowered yet".to_string(),
-        ));
+        crate::bail_parse_error!("ORDER BY clause is not supported yet in aggregate functions");
     }
     let func = hir_aggregate_function(call)?;
     emit_aggregation_step(
@@ -687,6 +686,29 @@ pub(crate) fn translate_hir_aggregation_step(
         },
         target_register,
         fraction_reg,
+    )
+}
+
+/// Step an aggregate whose argument ORDER BY its caller applied: the caller
+/// feeds it the rows in that order, with the arguments in bound registers.
+pub(crate) fn translate_hir_sorted_aggregation_step(
+    program: &mut ProgramBuilder,
+    document: &HirDocument,
+    call: &hir::FunctionCall,
+    target_register: usize,
+    distinct: Option<&HirAggregateDistinct>,
+) -> Result<usize> {
+    let func = hir_aggregate_function(call)?;
+    emit_aggregation_step(
+        program,
+        AggregationArguments::Hir {
+            document,
+            call,
+            func,
+            distinct,
+        },
+        target_register,
+        None,
     )
 }
 
