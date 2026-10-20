@@ -4852,7 +4852,7 @@ fn build_seek_def(
 #[cfg(test)]
 mod tests {
     use super::{where_term_rejects_null_row, Optimizable};
-    use crate::attach::AttachedNamespaces;
+    use crate::dialect::sqlite::attach::AttachedNamespaces;
     use crate::translate::emitter::{DoubleQuotedDml, Resolver};
     use crate::{schema::Schema, DatabaseCatalog, RwLock, SymbolTable};
     use rustc_hash::FxHashMap as HashMap;

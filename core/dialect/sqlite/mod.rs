@@ -5,8 +5,10 @@
 //! tables here (`pragma_*` table-valued functions, `json_each`/`json_tree`,
 //! `sqlite_dbpage`, `btree_dump`, and `sqlite_turso_types`) are registered
 //! into every fresh schema by [`crate::schema::Schema::with_options`]
-//! through [`register_builtin_catalog`].
+//! through [`register_builtin_catalog`]. ATTACH and DETACH, which give
+//! SQLite one namespace per database, are in [`attach`].
 
+pub(crate) mod attach;
 use crate::pragma::PragmaVirtualTable;
 use crate::schema::{BTreeTable, Schema, Table};
 use crate::sync::Arc;

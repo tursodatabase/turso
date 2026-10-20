@@ -12454,7 +12454,7 @@ pub fn op_function(
     Ok(InsnFunctionStepResult::Step)
 }
 
-pub(crate) type OpAttachState = crate::connection::AttachDatabaseState;
+pub(crate) type OpAttachState = crate::dialect::sqlite::attach::AttachDatabaseState;
 
 /// LIKE with an operand that is not TEXT: both are converted to TEXT first.
 #[inline(never)]

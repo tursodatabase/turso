@@ -2603,7 +2603,7 @@ impl Database {
             closed: AtomicBool::new(false),
             temp: crate::connection::TempDbContext::new(),
             attached_databases: RwLock::new(DatabaseCatalog::new()),
-            namespaces: Arc::new(crate::attach::AttachedNamespaces::default()),
+            namespaces: Arc::new(crate::dialect::sqlite::attach::AttachedNamespaces::default()),
             has_non_main_pagers: AtomicBool::new(false),
             query_only: AtomicBool::new(false),
             vdbe_trace: AtomicBool::new(false),
@@ -3515,7 +3515,8 @@ pub(crate) struct AttachedDatabase {
 /// looks up a name without a namespace.
 ///
 /// SQLite has one namespace per database: `main`, `temp` and one for each
-/// attached database. [`crate::attach::AttachedNamespaces`] implements that.
+/// attached database.
+/// [`crate::dialect::sqlite::attach::AttachedNamespaces`] implements that.
 pub trait NamespaceCatalog: Send + Sync {
     /// The database that namespace `name` refers to. `name` is normalized.
     fn database_id(&self, name: &str) -> Option<usize>;
