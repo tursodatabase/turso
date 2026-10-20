@@ -927,7 +927,11 @@ impl<'a> HirPlanContext<'a> {
         if let Some(predicate) = &update.predicate {
             append_predicates(&mut input.predicates, predicate, None);
         }
+        self.check_match_terms(&input.predicates)?;
 
+        if let Some(plan) = self.plan_dml_index_method(&mut input)? {
+            return Ok(plan);
+        }
         self.plan_source_access(
             input,
             None,
@@ -942,6 +946,104 @@ impl<'a> HirPlanContext<'a> {
         .ok_or_else(|| {
             LimboError::InternalError("UPDATE target produced no access plan".to_string())
         })
+    }
+
+    /// Like legacy, `x MATCH 'pattern'` in a WHERE or ON term stands for
+    /// `fts_match`, so `x` must be a column, or the first of a row of
+    /// columns, of a table with an FTS index. Any other MATCH term fails
+    /// with legacy's error.
+    fn check_match_terms(&self, predicates: &[HirWhereTerm]) -> Result<()> {
+        let column_source = |expression: &hir::Expr| match expression {
+            hir::Expr::Column(column) => Some(column.source),
+            hir::Expr::Row(items) => match items.first() {
+                Some(hir::Expr::Column(column)) => Some(column.source),
+                _ => None,
+            },
+            _ => None,
+        };
+        // Without the fts feature, analysis rejects MATCH before planning.
+        #[cfg(all(feature = "fts", not(target_family = "wasm")))]
+        const FTS: &str = crate::index_method::fts::FTS_INDEX_METHOD_NAME;
+        #[cfg(not(all(feature = "fts", not(target_family = "wasm"))))]
+        const FTS: &str = "fts";
+        let has_fts_index = |source: SourceId| {
+            self.document.source(source).is_some_and(|source| {
+                source.index_expressions.iter().any(|expressions| {
+                    expressions
+                        .index
+                        .value()
+                        .index_method
+                        .as_ref()
+                        .is_some_and(|method| method.definition().method_name == FTS)
+                })
+            })
+        };
+        for term in predicates {
+            let mut unusable = false;
+            term.expr.for_each(&mut |expression| {
+                if let hir::Expr::Like {
+                    lhs,
+                    operator: turso_parser::ast::LikeOperator::Match,
+                    ..
+                } = expression
+                {
+                    unusable |= !column_source(lhs).is_some_and(has_fts_index);
+                }
+            });
+            if unusable {
+                return Err(LimboError::ParseError(
+                    "unable to use function MATCH in the requested context".to_string(),
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// Like legacy, a DELETE or UPDATE whose only loop is its target reads
+    /// it through an index method's query pattern when a WHERE term matches
+    /// one, such as `fts_match(x, ?)`. The pattern may not sort or limit
+    /// the rows, since the statement has no ORDER BY or LIMIT.
+    fn plan_dml_index_method(
+        &self,
+        input: &mut HirQueryBlockPlanInput,
+    ) -> Result<Option<HirAccessPlan>> {
+        let [HirPlanSource::BTree(planned)] = input.sources.as_slice() else {
+            return Ok(None);
+        };
+        let source = self.definition(planned.internal_id);
+        let Some(matched) = crate::translate::hir_index_method::match_index_methods(
+            &crate::translate::hir_index_method::IndexMethodQuery {
+                document: self.document,
+                source,
+                outputs: &[],
+                predicates: &input.predicates,
+                where_start: input.where_start,
+                order_by: &[],
+                limit: None,
+                rows_are_output: false,
+            },
+        ) else {
+            return Ok(None);
+        };
+        if let Some(position) = matched.predicate {
+            input.predicates[position].consumed = true;
+        }
+        Ok(Some(HirAccessPlan {
+            groups: std::mem::take(&mut input.groups),
+            loops: vec![HirPlannedLoop {
+                source: source.id,
+                source_position: 0,
+                access: HirSourceAccess::IndexMethod(matched.access),
+            }],
+            predicates: std::mem::take(&mut input.predicates),
+            where_start: input.where_start,
+            group_sort_elided: false,
+            order_sort_elided: false,
+            min_max_first_value: false,
+            subquery_calls: Vec::new(),
+            output_cardinality: 1.0,
+            cost: Cost(1.0),
+        }))
     }
 
     fn plan_delete(
@@ -964,6 +1066,7 @@ impl<'a> HirPlanContext<'a> {
         if let Some(predicate) = &delete.predicate {
             append_predicates(&mut input.predicates, predicate, None);
         }
+        self.check_match_terms(&input.predicates)?;
         for term in &delete.order_by {
             self.register_expression_index_usage(&mut input.sources, &term.expr)?;
         }
@@ -973,6 +1076,9 @@ impl<'a> HirPlanContext<'a> {
             }
         }
 
+        if let Some(plan) = self.plan_dml_index_method(&mut input)? {
+            return Ok(plan);
+        }
         let order_target = self.order_target(
             &delete.order_by,
             OrderTargetPurpose::EliminatesSort(EliminatesSortBy::Order),
@@ -2152,6 +2258,7 @@ impl<'a> HirPlanContext<'a> {
         if let Some(predicate) = extra_predicate {
             append_predicates(&mut input.predicates, predicate, None);
         }
+        self.check_match_terms(&input.predicates)?;
         // Join planning tracks tables in a 64-bit mask.
         if input.sources.len() > crate::translate::plan::TableReferences::MAX_JOINED_TABLES {
             crate::bail_parse_error!(

@@ -413,8 +413,17 @@ OFFSET). In an inner join without parentheses or GROUP BY, a table whose
 WHERE term matches a pattern without ORDER BY or LIMIT is read first,
 through the index; the other tables are planned after it, treating its
 columns as known values, so join terms can seek them. Legacy weighs this
-against other join orders; HIR always takes it. Not done yet: index methods
-for DELETE and UPDATE scans.
+against other join orders; HIR always takes it. A DELETE or UPDATE whose
+WHERE term matches a pattern without ORDER BY or LIMIT reads its target
+through the index too, and like legacy collects the rowids first, since the
+index may stream its rows lazily. Legacy writes rows while scanning an index
+method whose results are stored before the scan starts (the toy vector
+index); HIR collects their rowids first as well. Like legacy, `x MATCH
+'pattern'` in a WHERE or ON term stands for `fts_match`, so `x` must be a
+column, or the first of a row of columns, of a table with an FTS index;
+any other MATCH term fails with legacy's "unable to use function MATCH in
+the requested context". A MATCH outside those terms, such as in a result
+column, runs as the function in both engines.
 
 ### DML through HIR
 

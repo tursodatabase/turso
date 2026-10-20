@@ -556,6 +556,14 @@ fn hir_errors_match_legacy() {
         "SELECT * FROM main.nosuch",
         "SELECT * FROM nosuch",
         "SELECT nosuch FROM items",
+        // MATCH stands for fts_match, so it needs a table with an FTS index.
+        "SELECT * FROM items WHERE extra MATCH 'a'",
+        "SELECT * FROM items WHERE (extra, id) MATCH 'a'",
+        "SELECT * FROM items WHERE NOT (lower(extra) MATCH 'a')",
+        "SELECT * FROM items i JOIN tags t ON i.id = t.item_id AND t.tag MATCH 'x'",
+        "SELECT (SELECT 1 FROM tags WHERE tag MATCH 'x') FROM items",
+        "DELETE FROM items WHERE extra MATCH 'a'",
+        "UPDATE items SET value = 1 WHERE extra MATCH 'a' OR value = 2",
     ] {
         let legacy_error = legacy
             .prepare(sql)

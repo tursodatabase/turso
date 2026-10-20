@@ -2426,3 +2426,78 @@ fn hir_dml_with_or_terms_seeks_each_branch_like_legacy() {
         );
     }
 }
+
+/// Like legacy, a DELETE or UPDATE whose WHERE term matches an index
+/// method's query pattern, such as `fts_match`, reads its rows through the
+/// index. The index may stream rows lazily, so the statement collects their
+/// rowids first, then writes each row.
+#[test]
+fn hir_dml_through_an_index_method_matches_legacy() {
+    const FTS_SETUP: &[&str] = &[
+        "CREATE TABLE docs(id INTEGER PRIMARY KEY, body TEXT, n INT)",
+        "CREATE INDEX docs_fts ON docs USING fts (body)",
+        "CREATE INDEX docs_n ON docs(n)",
+        "INSERT INTO docs VALUES (1, 'red apple', 1), (2, 'green apple', 2), \
+         (3, 'red pear', 3), (4, 'apple apple', 4), (5, 'plum', 5)",
+    ];
+    let run = |hir: bool, statements: &[&str]| -> (Vec<String>, Vec<Result<Rows, String>>) {
+        let db = TempDatabase::builder()
+            .with_opts(turso_core::DatabaseOpts::new().with_index_method(true))
+            .build();
+        let conn = db.connect_limbo();
+        for statement in FTS_SETUP {
+            conn.execute(statement).unwrap();
+        }
+        conn.set_experimental_hir(hir);
+        let mut plans = Vec::new();
+        let mut results = Vec::new();
+        for statement in statements {
+            if statement.starts_with("DELETE") || statement.starts_with("UPDATE") {
+                for row in limbo_exec_rows(&conn, &format!("EXPLAIN QUERY PLAN {statement}")) {
+                    let Some(rusqlite::types::Value::Text(detail)) = row.last() else {
+                        panic!("EXPLAIN QUERY PLAN detail is not text: {row:?}");
+                    };
+                    plans.push(detail.clone());
+                }
+            }
+            results
+                .push(limbo_exec_rows_fallible(&db, &conn, statement).map_err(|e| e.to_string()));
+            results.push(Ok(limbo_exec_rows(&conn, "SELECT changes()")));
+        }
+        for sql in [
+            "SELECT id, body, n FROM docs ORDER BY id",
+            "SELECT id FROM docs WHERE fts_match(body, 'apple') ORDER BY id",
+            "SELECT id FROM docs WHERE fts_match(body, 'pear') ORDER BY id",
+            "PRAGMA integrity_check",
+        ] {
+            results.push(Ok(limbo_exec_rows(&conn, sql)));
+        }
+        (plans, results)
+    };
+    for statements in [
+        &["DELETE FROM docs WHERE fts_match(body, 'apple')"][..],
+        &["DELETE FROM docs WHERE fts_match(body, 'apple') AND n > 1"],
+        &["UPDATE docs SET body = 'pear', n = n + 10 WHERE fts_match(body, 'apple')"],
+        &["UPDATE docs SET n = 0 WHERE fts_match(body, 'red') RETURNING id, n"],
+        &["DELETE FROM docs WHERE fts_match(body, 'apple') RETURNING id"],
+        &[
+            "CREATE TRIGGER ad AFTER DELETE ON docs BEGIN \
+             UPDATE docs SET n = n + 100 WHERE id = old.id + 1; END",
+            "DELETE FROM docs WHERE fts_match(body, 'red')",
+        ],
+        &[
+            "DELETE FROM docs WHERE fts_match(body, 'apple')",
+            "UPDATE docs SET body = 'apple' WHERE fts_match(body, 'plum')",
+            "DELETE FROM docs WHERE fts_match(body, 'apple')",
+        ],
+    ] {
+        let (hir_plans, hir_results) = run(true, statements);
+        let (legacy_plans, legacy_results) = run(false, statements);
+        assert!(
+            hir_plans.iter().all(|row| row == "QUERY INDEX METHOD fts"),
+            "{statements:?}: {hir_plans:?}"
+        );
+        assert_eq!(hir_plans, legacy_plans, "{statements:?}");
+        assert_eq!(hir_results, legacy_results, "{statements:?}");
+    }
+}

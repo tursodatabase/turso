@@ -129,7 +129,7 @@ pub(super) fn needs_legacy(
         HirSourceAccess::BTree { operation, .. } => {
             Ok(operation_index(operation).is_some_and(|index| index.ephemeral))
         }
-        HirSourceAccess::OrUnion(_) => Ok(false),
+        HirSourceAccess::OrUnion(_) | HirSourceAccess::IndexMethod(_) => Ok(false),
         _ => Ok(true),
     }
 }
@@ -172,11 +172,11 @@ pub(super) fn emit_update(
                 )));
             }
             // One seek per branch of an OR term reads rows in rowid order
-            // through a row set; like legacy, the UPDATE then collects its
-            // rowids first.
+            // through a row set, and an index method may stream its rows
+            // lazily; like legacy, the UPDATE then collects its rowids first.
             let operation = match &planned_loop.access {
                 HirSourceAccess::BTree { operation, .. } => Some(operation),
-                HirSourceAccess::OrUnion(_) => None,
+                HirSourceAccess::OrUnion(_) | HirSourceAccess::IndexMethod(_) => None,
                 _ => {
                     return Err(LimboError::InternalError(
                         "HIR UPDATE target does not use a B-tree loop".into(),

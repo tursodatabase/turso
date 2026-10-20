@@ -3129,6 +3129,7 @@ impl PreparedHirLoop<'_> {
                         .filter(|cursor| *cursor != prepared.table_cursor),
                 )
                 .collect()),
+            Self::IndexMethod(prepared) => Ok(vec![prepared.table_cursor, prepared.index_cursor]),
             _ => Err(LimboError::InternalError(
                 "HIR DML target loop is not a table loop".into(),
             )),
