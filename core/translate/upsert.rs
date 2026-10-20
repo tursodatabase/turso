@@ -1325,15 +1325,29 @@ pub fn emit_upsert(
     let record_reg = program.alloc_register();
     emit_make_record(program, table.columns().iter(), new_start, record_reg);
 
+    let cdc_wants_before =
+        ctx.cdc_table.is_some() && program.capture_data_changes_info().has_before();
+
     // If rowid changed, delete+insert (uniqueness of the new rowid was
     // already verified before index maintenance above)
-    if let Some(rnew) = new_rowid_reg {
+    let cdc_before_rec = if let Some(rnew) = new_rowid_reg {
         // important: the cursor was repositioned in the earlier rowid uniqueness
         // probe via NotExists, so we need to re-seek to the row under update.
         program.emit_insn(Insn::SeekRowid {
             cursor_id: ctx.cursor_id,
             src_reg: ctx.conflict_rowid_reg,
             target_pc: ctx.loop_labels.row_done,
+        });
+
+        // Read the before image before the delete below removes it; reading
+        // it after the write would return the new row instead of the old one.
+        let cdc_before_rec = cdc_wants_before.then(|| {
+            emit_cdc_full_record(
+                program,
+                table.columns(),
+                ctx.cursor_id,
+                ctx.conflict_rowid_reg,
+            )
         });
 
         // Now replace the row
@@ -1383,7 +1397,18 @@ pub fn emit_upsert(
                 rnew,
             )?;
         }
+
+        cdc_before_rec
     } else {
+        // Read the before image before the insert below overwrites it in place.
+        let cdc_before_rec = cdc_wants_before.then(|| {
+            emit_cdc_full_record(
+                program,
+                table.columns(),
+                ctx.cursor_id,
+                ctx.conflict_rowid_reg,
+            )
+        });
         program.emit_insn(Insn::Insert {
             cursor: ctx.cursor_id,
             key_reg: ctx.conflict_rowid_reg,
@@ -1391,7 +1416,8 @@ pub fn emit_upsert(
             flag: InsertFlags::new().skip_last_rowid(),
             table_name: table.get_name().to_string(),
         });
-    }
+        cdc_before_rec
+    };
 
     // Fire FK actions (CASCADE, SET NULL, SET DEFAULT) for parent-side updates.
     // This must be done after the update is complete but before AFTER triggers.
@@ -1417,23 +1443,13 @@ pub fn emit_upsert(
         let new_rowid = new_rowid_reg.unwrap_or(ctx.conflict_rowid_reg);
         if new_rowid_reg.is_some() {
             // DELETE (before)
-            let before_rec = if program.capture_data_changes_info().has_before() {
-                Some(emit_cdc_full_record(
-                    program,
-                    table.columns(),
-                    ctx.cursor_id,
-                    ctx.conflict_rowid_reg,
-                ))
-            } else {
-                None
-            };
             emit_cdc_insns(
                 program,
                 resolver,
                 OperationMode::DELETE,
                 cdc_id,
                 ctx.conflict_rowid_reg,
-                before_rec,
+                cdc_before_rec,
                 None,
                 None,
                 table.get_name(),
@@ -1471,23 +1487,13 @@ pub fn emit_upsert(
             } else {
                 None
             };
-            let before_rec = if program.capture_data_changes_info().has_before() {
-                Some(emit_cdc_full_record(
-                    program,
-                    table.columns(),
-                    ctx.cursor_id,
-                    ctx.conflict_rowid_reg,
-                ))
-            } else {
-                None
-            };
             emit_cdc_insns(
                 program,
                 resolver,
                 OperationMode::UPDATE(UpdateRowSource::Normal),
                 cdc_id,
                 ctx.conflict_rowid_reg,
-                before_rec,
+                cdc_before_rec,
                 after_rec,
                 None,
                 table.get_name(),
