@@ -745,9 +745,11 @@ fn translate_cast_expr(
     };
     translate_expr(program, referenced_tables, expr, target_register, resolver)?;
 
+    let cast_type_name = type_name.as_ref().map(|tn| crate::util::dequote(&tn.name));
+
     // Check if casting to a custom type
-    if let Some(ref tn) = type_name {
-        if let Some(resolved) = resolver.schema().resolve_type_unchecked(&tn.name)? {
+    if let (Some(tn), Some(cast_type_name)) = (type_name, &cast_type_name) {
+        if let Some(resolved) = resolver.schema().resolve_type_unchecked(cast_type_name)? {
             // Build ty_params from AST TypeSize so parametric types
             // (e.g. numeric(10,2)) get their parameters passed through.
             let ty_params: Vec<Box<ast::Expr>> = match &tn.size {
@@ -764,7 +766,7 @@ fn translate_cast_expr(
                 // Apply encode from parent custom types (domain itself has encode: None)
                 let cast_col = Column::new(
                     None,
-                    tn.name.clone(),
+                    cast_type_name.clone(),
                     None,
                     None,
                     Type::Null,
@@ -798,7 +800,7 @@ fn translate_cast_expr(
             if user_param_count == 0 || ty_params.len() == user_param_count {
                 let mut cast_col = Column::new(
                     None,
-                    tn.name.clone(),
+                    cast_type_name.clone(),
                     None,
                     None,
                     Type::Null,
@@ -827,9 +829,8 @@ fn translate_cast_expr(
     }
 
     // SQLite allows CAST(x AS) without a type name, treating it as NUMERIC affinity
-    let type_affinity = type_name
-        .as_ref()
-        .map(|t| Affinity::affinity(&t.name))
+    let type_affinity = cast_type_name
+        .map(|name| Affinity::of_written_type(&name))
         .unwrap_or(Affinity::Numeric);
     program.emit_insn(Insn::Cast {
         reg: target_register,

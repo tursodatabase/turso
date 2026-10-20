@@ -145,11 +145,44 @@ pub fn identifier_token_for_error(name: &turso_parser::ast::Name) -> String {
     }
 }
 
-/// Format a CHECK constraint's captured source text for an error message the
-/// way SQLite does. SQLite dequotes the text: when it starts with a quote
-/// character, only the first quoted token survives, so `"x" < +5` is
-/// reported as just `x`.
-pub fn check_source_for_error(source: &str) -> String {
+/// Returns a column's declared type from its type name the way SQLite's
+/// `sqlite3AddColumn` does: a name that starts with a quote and has no other
+/// quote characters before its last character loses its first and last
+/// characters, so `[x] INT` becomes `x] IN`. Other names go through [dequote].
+pub fn column_declared_type(type_name: &str) -> String {
+    match strip_type_name_quotes(type_name) {
+        Some(stripped) => stripped.to_string(),
+        None => dequote(type_name),
+    }
+}
+
+pub fn strip_type_name_quotes(type_name: &str) -> Option<&str> {
+    let is_quote = |b: &u8| matches!(b, b'"' | b'\'' | b'[' | b'`');
+    let bytes = type_name.as_bytes();
+    if bytes.len() >= 3 && is_quote(&bytes[0]) && !bytes[1..bytes.len() - 1].iter().any(is_quote) {
+        let mut chars = type_name.chars();
+        chars.next();
+        chars.next_back();
+        return Some(chars.as_str());
+    }
+    None
+}
+
+/// Returns true when a STRICT table accepts the written type name without a
+/// custom type. Like SQLite, quotes are only removed when they wrap the whole
+/// name, so `"INT"` is built in but `"INT" X` is not.
+pub fn is_builtin_strict_type(written_type_name: &str) -> bool {
+    let name = strip_type_name_quotes(written_type_name).unwrap_or(written_type_name);
+    turso_macros::match_ignore_ascii_case!(match name.as_bytes() {
+        b"INT" | b"INTEGER" | b"REAL" | b"TEXT" | b"BLOB" | b"ANY" => true,
+        _ => false,
+    })
+}
+
+/// Removes the quotes around the start of `source` the way SQLite's
+/// `sqlite3Dequote` does: when it starts with a quote character, only the
+/// first quoted token survives, so `"x" < +5` becomes just `x`.
+pub fn dequote(source: &str) -> String {
     let bytes = source.as_bytes();
     let close = match bytes.first() {
         Some(&c @ (b'"' | b'\'' | b'`')) => c,
@@ -1014,6 +1047,16 @@ pub(crate) fn type_from_name(type_name: &str) -> (Type, bool) {
     }
 
     (Type::Numeric, false)
+}
+
+/// Older Turso versions kept the quotes of `"INTEGER"`, `'INTEGER'` and
+/// `` `INTEGER` `` when deciding whether an INTEGER PRIMARY KEY column is a
+/// rowid alias, and only removed the brackets of `[INTEGER]`. Existing
+/// databases depend on that, because a column that is not a rowid alias is
+/// stored in the record and has an automatic index.
+pub(crate) fn is_rowid_alias_type(written_type_name: &str) -> bool {
+    written_type_name.eq_ignore_ascii_case("INTEGER")
+        || written_type_name.eq_ignore_ascii_case("[INTEGER]")
 }
 
 pub fn columns_from_create_table_body(

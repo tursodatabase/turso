@@ -5,9 +5,9 @@ use crate::LimboError;
 use crate::ext::VTabImpl;
 use crate::function::{Deterministic, Func, MathFunc, ScalarFunc};
 use crate::schema::{
-    create_table, translate_ident_to_string_literal, BTreeCharacteristics, BTreeTable, ColDef,
-    Column, SchemaObjectType, Table, Type, RESERVED_TABLE_PREFIXES, SQLITE_SEQUENCE_TABLE_NAME,
-    TURSO_TYPES_TABLE_NAME,
+    create_table, translate_ident_to_string_literal, type_registry_key, BTreeCharacteristics,
+    BTreeTable, ColDef, Column, SchemaObjectType, Table, Type, RESERVED_TABLE_PREFIXES,
+    SQLITE_SEQUENCE_TABLE_NAME, TURSO_TYPES_TABLE_NAME,
 };
 use crate::stats::STATS_TABLE;
 use crate::storage::pager::CreateBTreeFlags;
@@ -23,8 +23,8 @@ use crate::translate::planner::ROWID_STRS;
 use crate::translate::select::{emit_select_plan, prepare_select_plan};
 use crate::translate::{ProgramBuilder, ProgramBuilderOpts};
 use crate::util::{
-    escape_sql_string_literal, normalize_ident, quote_identifier,
-    PRIMARY_KEY_AUTOMATIC_INDEX_NAME_PREFIX,
+    column_declared_type, dequote, escape_sql_string_literal, is_builtin_strict_type,
+    normalize_ident, quote_identifier, PRIMARY_KEY_AUTOMATIC_INDEX_NAME_PREFIX,
 };
 use crate::vdbe::builder::CursorType;
 use crate::vdbe::insn::{
@@ -269,7 +269,7 @@ fn resolve_check_expr_type(
         }
         ast::Expr::Cast { type_name, .. } => {
             if let Some(ref tn) = type_name {
-                resolve_type_name(&tn.name, resolver)
+                resolve_type_name(&dequote(&tn.name), resolver)
             } else {
                 bail_parse_error!(
                     "cannot determine type of CAST in CHECK constraint; use CAST with explicit type"
@@ -591,7 +591,7 @@ fn resolve_json_func_return_type(func: &crate::function::JsonFunc) -> Result<Che
 /// Resolve a column's type from its definition.
 fn resolve_column_type(col: &ast::ColumnDefinition, resolver: &Resolver) -> Result<CheckExprType> {
     if let Some(ref col_type) = col.col_type {
-        resolve_type_name(&col_type.name, resolver)
+        resolve_type_name(&column_declared_type(&col_type.name), resolver)
     } else {
         // No type specified — in STRICT tables this would be caught elsewhere,
         // but treat as ANY for CHECK validation purposes.
@@ -800,12 +800,8 @@ fn validate(
 
         for c in columns {
             if let Some(ref col_type) = c.col_type {
-                let type_name = &col_type.name;
-                let name_bytes = type_name.as_bytes();
-                let is_builtin = turso_macros::match_ignore_ascii_case!(match name_bytes {
-                    b"INT" | b"INTEGER" | b"REAL" | b"TEXT" | b"BLOB" | b"ANY" => true,
-                    _ => false,
-                });
+                let type_name = &column_declared_type(&col_type.name);
+                let is_builtin = is_builtin_strict_type(&col_type.name);
 
                 // Array columns require STRICT tables because the encode/decode
                 // pipeline is only emitted for STRICT tables.
@@ -2993,6 +2989,7 @@ pub fn translate_drop_type(
     }
 
     // Check if any table in any database uses this type
+    let registry_key = type_registry_key(type_name);
     let mut database_ids = resolver.attached_database_ids_in_search_order()?;
     database_ids.set(MAIN_DB_ID)?;
     if resolver.has_temp_database() {
@@ -3004,7 +3001,7 @@ pub fn translate_drop_type(
                 table
                     .columns()
                     .iter()
-                    .find(|col| normalize_ident(&col.ty_str) == normalized_name)
+                    .find(|col| type_registry_key(&col.ty_str) == registry_key)
                     .map(|col| {
                         (
                             col.name.as_deref().unwrap_or("?").to_string(),
@@ -3022,7 +3019,7 @@ pub fn translate_drop_type(
 
     // Check if any other type/domain depends on this type
     for (name, td) in resolver.schema().type_registry.iter() {
-        if normalize_ident(td.base()) == normalized_name {
+        if type_registry_key(td.base()) == registry_key {
             bail_parse_error!(
                 "cannot drop type {}: type {} depends on it",
                 normalized_name,

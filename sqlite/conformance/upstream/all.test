@@ -317,7 +317,7 @@ set test_files {
   intarray             fail
   interrupt            fail
   interrupt2           fail
-  intpkey              fail
+  intpkey              pass
   intreal              fail
   io                   fail
   istrue               fail

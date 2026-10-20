@@ -108,7 +108,8 @@ use crate::sync::Mutex;
 use crate::translate::collate::CollationSeq;
 use crate::translate::plan::{BitSet, ColumnMask, Plan, TableReferences};
 use crate::util::{
-    module_args_from_sql, module_name_from_sql, type_from_name, UnparsedFromSqlIndex,
+    column_declared_type, is_rowid_alias_type, module_args_from_sql, module_name_from_sql,
+    type_from_name, UnparsedFromSqlIndex,
 };
 use crate::Result;
 use crate::{bail_parse_error, LimboError, MvCursor, Pager, SymbolTable, ValueRef, VirtualTable};
@@ -423,10 +424,13 @@ impl TypeDef {
             ast::CreateTypeBody::Struct(fields) => {
                 let struct_fields: Vec<StructFieldDef> = fields
                     .iter()
-                    .map(|f| StructFieldDef {
-                        name: f.name.to_string(),
-                        base_affinity: Affinity::affinity(&f.field_type.name),
-                        type_name: f.field_type.name.clone(),
+                    .map(|f| {
+                        let type_name = column_declared_type(&f.field_type.name);
+                        StructFieldDef {
+                            name: f.name.to_string(),
+                            base_affinity: Affinity::affinity(&type_name),
+                            type_name,
+                        }
                     })
                     .try_collect()?;
                 Self {
@@ -451,11 +455,14 @@ impl TypeDef {
                 let variants: Vec<UnionVariantDef> = fields
                     .iter()
                     .enumerate()
-                    .map(|(i, f)| UnionVariantDef {
-                        tag_name: f.name.to_string(),
-                        tag_index: i as u8,
-                        base_affinity: Affinity::affinity(&f.field_type.name),
-                        type_name: f.field_type.name.clone(),
+                    .map(|(i, f)| {
+                        let type_name = column_declared_type(&f.field_type.name);
+                        UnionVariantDef {
+                            tag_name: f.name.to_string(),
+                            tag_index: i as u8,
+                            base_affinity: Affinity::affinity(&type_name),
+                            type_name,
+                        }
                     })
                     .try_collect()?;
                 Self {
@@ -962,14 +969,14 @@ impl Schema {
         if !is_strict {
             return None;
         }
-        self.type_registry.get(&type_name.to_lowercase())
+        self.type_registry.get(&type_registry_key(type_name))
     }
 
     /// Look up a custom type definition by name without a strictness check.
     /// Only use this for operations that aren't column-scoped (e.g. DROP TYPE,
     /// CREATE TABLE validation, CAST).
     pub fn get_type_def_unchecked(&self, type_name: &str) -> Option<&Arc<TypeDef>> {
-        self.type_registry.get(&type_name.to_lowercase())
+        self.type_registry.get(&type_registry_key(type_name))
     }
 
     /// Resolve a custom type fully: look it up (with strictness gate) and chase
@@ -989,7 +996,7 @@ impl Schema {
     /// Resolve a custom type fully without a strictness check.
     /// Returns `Ok(None)` if the type is not in the registry.
     pub fn resolve_type_unchecked(&self, type_name: &str) -> crate::Result<Option<ResolvedType>> {
-        let key = type_name.to_lowercase();
+        let key = type_registry_key(type_name);
         if !self.type_registry.contains_key(&key) {
             return Ok(None);
         }
@@ -1032,7 +1039,7 @@ impl Schema {
     }
 
     pub fn remove_type(&mut self, type_name: &str) {
-        self.type_registry.remove(&type_name.to_lowercase());
+        self.type_registry.remove(&type_registry_key(type_name));
     }
 
     /// Chase the base type chain: domain_a → domain_b → integer
@@ -1045,7 +1052,7 @@ impl Schema {
     ) -> crate::Result<(String, Vec<Arc<TypeDef>>)> {
         let mut chain = vec![];
         let mut visited = std::collections::HashSet::new();
-        let mut current = type_name.to_lowercase();
+        let mut current = type_registry_key(type_name);
 
         loop {
             if !visited.insert(current.clone()) {
@@ -1056,7 +1063,7 @@ impl Schema {
             match self.type_registry.get(&current) {
                 Some(td) => {
                     chain.try_push(Arc::clone(td))?;
-                    current = td.base().to_lowercase();
+                    current = type_registry_key(td.base());
                 }
                 None => {
                     // current is not in the registry — it's a primitive
@@ -1080,7 +1087,7 @@ impl Schema {
                 let type_def =
                     TypeDef::from_create_type(&type_name, &body, false, sql.to_string())?;
                 self.type_registry
-                    .insert(type_name.to_lowercase(), Arc::new(type_def));
+                    .insert(type_registry_key(&type_name), Arc::new(type_def));
             }
             Ok(Some(Cmd::Stmt(Stmt::CreateDomain {
                 domain_name,
@@ -1099,7 +1106,7 @@ impl Schema {
                     sql.to_string(),
                 );
                 self.type_registry
-                    .insert(domain_name.to_lowercase(), Arc::new(type_def));
+                    .insert(type_registry_key(&domain_name), Arc::new(type_def));
             }
             _ => {
                 return Err(crate::LimboError::ParseError(format!(
@@ -3037,6 +3044,12 @@ impl Schema {
     }
 }
 
+/// Type and domain names are stored as written, so `"my domain"` keeps its
+/// quotes, while a column's declared type is dequoted like SQLite does.
+pub(crate) fn type_registry_key(type_name: &str) -> String {
+    crate::util::dequote(type_name).to_lowercase()
+}
+
 impl TryClone for UniqueSet {
     type Error = TryReserveError;
 
@@ -3987,9 +4000,10 @@ impl BTreeTable {
             let column_name = column.name.as_ref().expect("column name is None");
             sql.push_str(&quote_ident(column_name));
 
-            if !column.ty_str.is_empty() {
+            let written_ty_str = column.written_ty_str.as_deref().unwrap_or(&column.ty_str);
+            if !written_ty_str.is_empty() {
                 sql.push(' ');
-                sql.push_str(&column.ty_str);
+                sql.push_str(written_ty_str);
                 if !column.ty_params.is_empty() {
                     sql.push('(');
                     for (i, param) in column.ty_params.iter().enumerate() {
@@ -5190,8 +5204,7 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
                 // https://www.sqlite.org/lang_createtable.html#rowids_and_the_integer_primary_key
                 let ty_str = col_type
                     .as_ref()
-                    .cloned()
-                    .map(|ast::Type { name, .. }| name)
+                    .map(|t| column_declared_type(&t.name))
                     .unwrap_or_default();
 
                 let ty_params: std::vec::Vec<Box<Expr>> = match col_type {
@@ -5208,10 +5221,9 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
 
                 let mut typename_exactly_integer = false;
                 let ty = match col_type {
-                    Some(data_type) => {
-                        let (ty, ei) = type_from_name(&data_type.name);
-                        typename_exactly_integer = ei;
-                        ty
+                    Some(written_type) => {
+                        typename_exactly_integer = is_rowid_alias_type(&written_type.name);
+                        type_from_name(&ty_str).0
                     }
                     None => Type::Null,
                 };
@@ -5447,9 +5459,7 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
                 });
                 col.ty_params = ty_params;
                 if let Some(t) = col_type.as_ref() {
-                    if t.is_array() {
-                        col.set_array_dimensions(t.array_dimensions);
-                    }
+                    col.apply_written_type(t);
                 }
                 cols.try_push(col)?;
             }
@@ -5769,6 +5779,10 @@ impl ResolvedFkRef {
 pub struct Column {
     pub name: Option<String>,
     pub ty_str: String,
+    /// The type name as written in the CREATE TABLE statement, when it is not
+    /// the same as `ty_str`, which has its quotes removed and may not be
+    /// valid SQL, e.g. `[x] INT` has the declared type `x] IN`.
+    pub written_ty_str: Option<String>,
     pub ty_params: std::vec::Vec<Box<Expr>>,
     pub default: Option<Box<Expr>>,
     generated_type: GeneratedType,
@@ -5924,6 +5938,7 @@ impl Column {
         Self {
             name,
             ty_str,
+            written_ty_str: None,
             ty_params: std::vec::Vec::new(),
             default,
             generated_type,
@@ -5985,16 +6000,19 @@ impl Column {
             };
         }
 
-        let (ty, typename_exactly_integer) = match value.col_type {
-            Some(ref data_type) => type_from_name(&data_type.name),
-            None => (Type::Null, false),
-        };
-
         let ty_str = value
             .col_type
             .as_ref()
-            .map(|t| t.name.to_string())
+            .map(|t| column_declared_type(&t.name))
             .unwrap_or_default();
+
+        let (ty, typename_exactly_integer) = match value.col_type {
+            Some(ref written_type) => (
+                type_from_name(&ty_str).0,
+                is_rowid_alias_type(&written_type.name),
+            ),
+            None => (Type::Null, false),
+        };
 
         let ty_params: std::vec::Vec<Box<turso_parser::ast::Expr>> = match &value.col_type {
             Some(ast::Type {
@@ -6038,11 +6056,21 @@ impl Column {
         });
         col.ty_params = ty_params;
         if let Some(t) = value.col_type.as_ref() {
-            if t.is_array() {
-                col.set_array_dimensions(t.array_dimensions);
-            }
+            col.apply_written_type(t);
         }
         Ok(col)
+    }
+
+    fn apply_written_type(&mut self, written: &ast::Type) {
+        if written.name != self.ty_str {
+            self.written_ty_str = Some(written.name.clone());
+        }
+        if self.ty_str.is_empty() {
+            self.override_affinity(Affinity::Numeric);
+        }
+        if written.is_array() {
+            self.set_array_dimensions(written.array_dimensions);
+        }
     }
 
     #[inline]

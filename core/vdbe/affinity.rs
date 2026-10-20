@@ -210,6 +210,14 @@ impl Affinity {
         Affinity::Numeric
     }
 
+    pub fn of_written_type(datatype: &str) -> Self {
+        if datatype.is_empty() {
+            Affinity::Numeric
+        } else {
+            Affinity::affinity(datatype)
+        }
+    }
+
     pub fn convert<'a>(&self, val: &'a impl AsValueRef) -> Option<Either<ValueRef<'a>, Value>> {
         let val = val.as_value_ref();
         let is_text = matches!(val, ValueRef::Text(_));
