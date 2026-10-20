@@ -861,6 +861,15 @@ impl MaintenancePlan {
         std::iter::once(&self.version_marker).chain(self.operator_states.hidden_tables())
     }
 
+    /// The base tables the view reads, under the one name the main planner
+    /// resolved each of them to.
+    pub(crate) fn source_table_names(&self) -> impl Iterator<Item = &str> {
+        self.dag.nodes.iter().filter_map(|node| match node {
+            dag::OpNode::Scan { table, .. } => Some(table.name.as_str()),
+            _ => None,
+        })
+    }
+
     /// For each view column: the collation under which the value it shows
     /// was chosen among several values that compare equal, or `None` when
     /// the value is exact. These are the values SQL leaves open, such as

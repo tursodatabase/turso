@@ -1,4 +1,6 @@
-use crate::schema::{BTreeCharacteristics, BTreeTable, SchemaObjectType, RESERVED_TABLE_PREFIXES};
+use crate::schema::{
+    BTreeCharacteristics, BTreeTable, SchemaObjectType, RESERVED_TABLE_PREFIXES, SCHEMA_TABLE_NAME,
+};
 use crate::storage::pager::CreateBTreeFlags;
 use crate::sync::Arc;
 use crate::translate::{
@@ -130,6 +132,18 @@ pub fn translate_create_materialized_view(
             maintenance_plan.output_arity(),
         )));
     }
+    // Writes to the schema table produce no view changes, so such a view would
+    // populate once and then never change again. Only a new view is refused:
+    // replaying one that a database already holds, as VACUUM does, must keep
+    // working.
+    if !connection.is_nested_stmt()
+        && maintenance_plan
+            .source_table_names()
+            .any(|name| name == SCHEMA_TABLE_NAME)
+    {
+        bail_parse_error!("materialized views cannot read the internal table {SCHEMA_TABLE_NAME}");
+    }
+
     let hidden_tables = maintenance_plan
         .hidden_tables()
         .cloned()
