@@ -287,29 +287,7 @@ pub fn convert_ref_dbtype_to_jsonb(val: ValueRef<'_>, strict: Conv) -> crate::Re
                 };
                 Jsonb::from_str(json_str).map_err(malformed_json_error)
             } else {
-                let mut buff = ryu::Buffer::new();
-                let s_ryu = buff.format(float);
-                let mut s = Cow::Borrowed(s_ryu);
-
-                if let Some(e_idx) = s_ryu.find('e') {
-                    // Scientific notation case
-                    s = Cow::Owned(String::with_capacity(s_ryu.len() + 4));
-                    let inner = s.to_mut();
-                    let mantissa = &s_ryu[..e_idx];
-                    let exponent = &s_ryu[e_idx + 1..];
-
-                    inner.push_str(mantissa);
-                    if !mantissa.contains('.') {
-                        inner.push_str(".0");
-                    }
-                    inner.push('e');
-                    if !exponent.starts_with('-') && !exponent.starts_with('+') {
-                        inner.push('+');
-                    }
-                    inner.push_str(exponent);
-                }
-
-                Jsonb::from_str(&s).map_err(malformed_json_error)
+                Jsonb::from_str(&crate::numeric::format_float(float)).map_err(malformed_json_error)
             }
         }
         ValueRef::Numeric(Numeric::Integer(int)) => {
