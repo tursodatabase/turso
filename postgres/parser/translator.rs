@@ -9,6 +9,8 @@ use pg_query::{NodeRef, ParseResult};
 use turso_parser::ast;
 use turso_parser::ast::GroupBy;
 
+mod json_record;
+
 /// Result of translating a PostgreSQL command, which may include
 /// prerequisite statements (e.g., implicit CREATE SEQUENCE for serial columns).
 #[derive(Debug)]
@@ -1936,6 +1938,10 @@ impl PostgreSQLTranslator {
             .iter()
             .map(|arg| Ok(Box::new(self.translate_expr(arg)?)))
             .collect::<Result<Vec<_>, ParseError>>()?;
+
+        if let Some(function) = json_record::JsonToRecordFunction::from_name(func_name) {
+            return json_record::translate_json_to_record(function, range_func, &args);
+        }
 
         let alias = range_func
             .alias

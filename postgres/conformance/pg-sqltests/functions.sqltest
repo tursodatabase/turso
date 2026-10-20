@@ -505,3 +505,310 @@ expect {
     1|3
     2|-1
 }
+
+test json-to-record-columns {
+    SELECT * FROM json_to_record('{"a":1,"b":"foo","c":"bar"}') AS x(a int, b text, d text);
+    SELECT x.b, x.a FROM json_to_record('{"a":2,"b":"baz"}') AS x(a int, b text);
+    SELECT json_to_record.a FROM json_to_record('{"a":3}') AS (a int);
+    SELECT a FROM pg_catalog.json_to_record('{"a":4}') AS x(a int);
+    SELECT a, b FROM jsonb_to_record('{"a":5,"b":"qux"}') AS x(a int, b text);
+}
+expect {
+    1|foo|
+    baz|2
+    3
+    4
+    5|qux
+}
+
+test json-to-record-null-and-missing-values {
+    SELECT coalesce(a::text, '<null>'), coalesce(b, '<null>'), coalesce(c::text, '<null>'), coalesce(d::text, '<null>')
+    FROM json_to_record('{"a":null,"b":null,"c":null}') AS x(a int, b text, c json, d int);
+    SELECT count(*), count(a) FROM json_to_record(NULL) AS x(a int);
+    SELECT count(*), count(a), count(b) FROM json_to_record('{}') AS x(a int, b text);
+}
+expect {
+    <null>|<null>|<null>|<null>
+    1|0
+    1|0|0
+}
+
+test json-to-record-text-columns-get-the-json-text {
+    SELECT * FROM json_to_record('{"a":true,"b":false,"c":1.50,"d":1e2,"e":{"k":[1,2]},"f":"s\"q"}')
+    AS x(a text, b text, c text, d text, e text, f text);
+}
+expect {
+    true|false|1.50|1e2|{"k":[1,2]}|s"q
+}
+
+test json-to-record-json-columns-keep-the-json-value {
+    SELECT * FROM json_to_record('{"a":{"k":1},"b":[1,"x"],"c":"s","d":2}') AS x(a json, b json, c json, d jsonb);
+}
+expect {
+    {"k":1}|[1,"x"]|"s"|2
+}
+
+test json-to-record-boolean-columns {
+    SELECT CASE WHEN a THEN 'yes' ELSE 'no' END, CASE WHEN b THEN 'yes' ELSE 'no' END,
+        CASE WHEN c THEN 'yes' ELSE 'no' END, CASE WHEN d THEN 'yes' ELSE 'no' END
+    FROM json_to_record('{"a":true,"b":false,"c":"on","d":"f"}') AS x(a boolean, b boolean, c boolean, d bool);
+}
+expect {
+    yes|no|yes|no
+}
+
+test json-to-record-boolean-column-rejects-other-text {
+    SELECT * FROM json_to_record('{"a":"maybe"}') AS x(a boolean);
+}
+expect error {
+    invalid input (syntax )?for type boolean
+}
+
+test json-to-record-number-and-date-columns {
+    SELECT * FROM json_to_record('{"a":"12","b":9007199254740993,"c":1.5,"d":"2024-01-02","e":"2024-01-02 03:04:05"}')
+    AS x(a int, b bigint, c float8, d date, e timestamp);
+}
+expect {
+    12|9007199254740993|1.5|2024-01-02|2024-01-02 03:04:05
+}
+
+test json-to-record-keys-match-column-names-exactly {
+    SELECT * FROM json_to_record('{"a.b":1,"a":{"b":2},"q\"r":3,"A":4,"$":5,"it''s":6}')
+    AS x("a.b" int, "q""r" int, "A" int, "$" int, "it's" int);
+    SELECT coalesce(a::text, '<null>') FROM json_to_record('{"A":1}') AS x(A int);
+}
+expect {
+    1|3|4|5|6
+    <null>
+}
+
+test json-to-record-lateral-reference {
+    CREATE TABLE json_record_docs (id int, doc json);
+    INSERT INTO json_record_docs VALUES (1, '{"a":10,"b":"x"}'), (2, '{"a":20}'), (3, NULL);
+    SELECT t.id, x.a, x.b FROM json_record_docs AS t, json_to_record(t.doc) AS x(a int, b text) ORDER BY t.id;
+    SELECT t.id, x.a FROM json_record_docs AS t, LATERAL json_to_record(t.doc) AS x(a int) WHERE x.a > 10;
+    SELECT t.id, coalesce(x.a, -1) FROM json_record_docs AS t
+    LEFT JOIN json_to_record(t.doc) AS x(a int) ON x.a = 10 ORDER BY t.id;
+}
+expect {
+    1|10|x
+    2|20|
+    3||
+    2|20
+    1|10
+    2|-1
+    3|-1
+}
+
+test json-to-record-names-of-the-rewrite-do-not-hide-user-names {
+    CREATE TABLE json_record_names (value json, type json);
+    INSERT INTO json_record_names VALUES ('[{"a":1}]', '{"a":2}');
+    SELECT x.a FROM json_record_names, json_to_recordset(value) AS x(a int);
+    SELECT x.a FROM json_record_names, json_to_record(type) AS x(a int);
+    SELECT x.a FROM json_record_names AS json_input, json_to_record(json_input.type) AS x(a int);
+    SELECT x.a FROM json_record_names AS json_element, json_to_recordset(json_element.value) AS x(a int);
+    SELECT json_input.a FROM json_to_record('{"a":3}') AS json_input(a int);
+    SELECT json_element.a FROM json_to_recordset('[{"a":4}]') AS json_element(a int);
+}
+expect {
+    1
+    2
+    2
+    1
+    3
+    4
+}
+
+test json-to-recordset-rows {
+    SELECT * FROM json_to_recordset('[{"a":1,"b":"foo","d":false},{"a":2,"b":"bar","c":true}]')
+    AS x(a int, b text, c text) ORDER BY a;
+    SELECT sum(a) FROM jsonb_to_recordset('[{"a":1},{"a":2},{"a":3}]') AS x(a int) WHERE a > 1;
+    SELECT count(*) FROM json_to_recordset('[]') AS x(a int);
+    SELECT count(*) FROM json_to_recordset(NULL) AS x(a int);
+}
+expect {
+    1|foo|
+    2|bar|true
+    5
+    0
+    0
+}
+
+test json-to-recordset-lateral-reference {
+    CREATE TABLE json_recordset_docs (id int, doc json);
+    INSERT INTO json_recordset_docs VALUES (1, '[{"a":1},{"a":2}]'), (2, '[]'), (3, NULL);
+    SELECT t.id, x.a FROM json_recordset_docs AS t, json_to_recordset(t.doc) AS x(a int) ORDER BY t.id, x.a;
+    SELECT t.id, coalesce(x.a, -1) FROM json_recordset_docs AS t
+    LEFT JOIN json_to_recordset(t.doc) AS x(a int) ON true ORDER BY t.id, x.a;
+}
+expect {
+    1|1
+    1|2
+    1|1
+    1|2
+    2|-1
+    3|-1
+}
+
+test json-to-recordset-join-and-insert {
+    CREATE TABLE json_recordset_items (id int, name text);
+    INSERT INTO json_recordset_items VALUES (1, 'one'), (2, 'two'), (3, 'three');
+    SELECT i.name, x.qty FROM json_to_recordset('[{"id":3,"qty":30},{"id":1,"qty":10}]') AS x(id int, qty int)
+    JOIN json_recordset_items AS i ON i.id = x.id ORDER BY i.id;
+    CREATE TABLE json_recordset_target (a int, b text);
+    INSERT INTO json_recordset_target SELECT * FROM json_to_recordset('[{"a":1,"b":"x"},{"a":2}]') AS x(a int, b text);
+    SELECT a, coalesce(b, '<null>') FROM json_recordset_target ORDER BY a;
+}
+expect {
+    one|10
+    three|30
+    1|x
+    2|<null>
+}
+
+test json-to-record-requires-column-definition-list {
+    SELECT * FROM json_to_record('{"a":1}') AS x(a);
+}
+expect error {
+    a column definition list is required for functions returning "record"
+}
+
+test json-to-record-without-alias-requires-column-definition-list {
+    SELECT * FROM json_to_recordset('[{"a":1}]');
+}
+expect error {
+    a column definition list is required for functions returning "record"
+}
+
+test json-to-record-rejects-array {
+    SELECT * FROM json_to_record('[1]') AS x(a int);
+}
+expect error {
+    cannot call populate_composite on an array
+}
+
+test json-to-record-rejects-scalar {
+    SELECT * FROM json_to_record('5') AS x(a int);
+}
+expect error {
+    cannot call populate_composite on a scalar
+}
+
+test json-to-record-rejects-json-null {
+    SELECT * FROM json_to_record('null') AS x(a int);
+}
+expect error {
+    cannot call populate_composite on a scalar
+}
+
+test json-to-record-rejects-array-without-reading-columns {
+    SELECT count(*) FROM json_to_record('[1]') AS x(a int);
+}
+expect error {
+    cannot call populate_composite on an array
+}
+
+test jsonb-to-record-rejects-array {
+    SELECT * FROM jsonb_to_record('[1]') AS x(a int);
+}
+expect error {
+    cannot call populate_composite on an array
+}
+
+test json-to-record-rejects-invalid-json {
+    SELECT * FROM json_to_record('nope') AS x(a int);
+}
+expect error {}
+
+test json-to-recordset-rejects-object {
+    SELECT * FROM json_to_recordset('{"a":1}') AS x(a int);
+}
+expect error {
+    cannot call json_to_recordset on an object
+}
+
+test json-to-recordset-rejects-empty-object {
+    SELECT * FROM json_to_recordset('{}') AS x(a int);
+}
+expect error {
+    cannot call json_to_recordset on an object
+}
+
+test json-to-recordset-rejects-scalar {
+    SELECT * FROM json_to_recordset('5') AS x(a int);
+}
+expect error {
+    cannot call json_to_recordset on a scalar
+}
+
+test json-to-recordset-rejects-element-that-is-not-an-object {
+    SELECT * FROM json_to_recordset('[{"a":1},2]') AS x(a int);
+}
+expect error {
+    argument of json_to_recordset must be an array of objects
+}
+
+test json-to-recordset-rejects-null-element {
+    SELECT * FROM json_to_recordset('[{"a":1},null]') AS x(a int);
+}
+expect error {
+    argument of json_to_recordset must be an array of objects
+}
+
+test jsonb-to-recordset-rejects-object {
+    SELECT * FROM jsonb_to_recordset('{"a":1}') AS x(a int);
+}
+expect error {
+    cannot call jsonb_to_recordset on a non-array
+}
+
+test jsonb-to-recordset-rejects-element-that-is-not-an-object {
+    SELECT * FROM jsonb_to_recordset('[[{"a":1}]]') AS x(a int);
+}
+expect error {
+    argument of jsonb_to_recordset must be an array of objects
+}
+
+test json-to-record-rejects-duplicate-column-name {
+    SELECT * FROM json_to_record('{"a":1}') AS x(a int, a text);
+}
+expect error {
+    column name "a" specified more than once
+}
+
+test json-to-recordset-rejects-with-ordinality {
+    SELECT * FROM json_to_recordset('[{"a":5}]') WITH ORDINALITY AS x(a int);
+}
+expect error {
+    WITH ORDINALITY cannot be used with a column definition list
+}
+
+test json-to-record-rejects-two-arguments {
+    SELECT * FROM json_to_record('{"a":1}', 1) AS x(a int);
+}
+expect error {}
+
+@skip-if postgres "PostgreSQL converts JSON arrays to array columns"
+test json-to-record-rejects-array-column-type {
+    SELECT * FROM json_to_record('{"a":[1,2]}') AS x(a int[]);
+}
+expect error {
+    json_to_record does not support the column type int4\[\]
+}
+
+@skip-if postgres "PostgreSQL converts JSON objects to composite columns"
+test json-to-record-rejects-unknown-column-type {
+    CREATE TABLE json_record_row (a int);
+    SELECT * FROM json_to_record('{"r":{"a":1}}') AS x(r json_record_row);
+}
+expect error {
+    json_to_record does not support the column type json_record_row
+}
+
+@skip-if postgres "PostgreSQL supports ROWS FROM"
+test json-to-record-rejects-rows-from {
+    SELECT * FROM ROWS FROM (json_to_record('{"a":1}') AS (a int)) AS x;
+}
+expect error {
+    ROWS FROM is not supported with json_to_record
+}

@@ -292,6 +292,7 @@ INTEGER. Unknown type names pass through as custom types.
 | JSONB-modifying operators and functions | ❌ Not supported | |
 | JSONB subscripting | ❌ Not supported | |
 | JSON data type | 🟡 Partial | Same as jsonb (see above) |
+| json_to_record, json_to_recordset, jsonb_to_record, jsonb_to_recordset | 🟡 Partial | In FROM with a column definition list (`AS x(a int, b text)`), also with LATERAL references, joins, and DML. An input of the wrong JSON type gives the PostgreSQL error. Values convert with the casts of this frontend, so type modifiers are ignored and boolean columns return 1 and 0. Text columns get the JSON text of numbers, booleans, and nested values, as in PostgreSQL. With duplicate keys, Turso uses the first value and PostgreSQL uses the last. json and jsonb columns return compact JSON text. Array, composite, enum, domain, and bytea column types, WITH ORDINALITY, and ROWS FROM are rejected |
 | SQL/JSON constructors | ❌ Not supported | |
 | SQL/JSON: datetime() | ❌ Not supported | |
 | SQL/JSON IS JSON | ❌ Not supported | |
