@@ -2747,3 +2747,111 @@ test matview-count-star-and-constant-count-all-rows {
 expect {
     3|3|1
 }
+
+# Rows reach sqlite_schema through DDL, and DDL does not run view maintenance,
+# so a materialized view over it would populate once and then never change
+# again. Refuse it at CREATE time instead. The planner resolves every spelling
+# of the table to one name, so one check covers them all.
+test matview-over-sqlite-schema-refused {
+    CREATE TABLE person(id INTEGER PRIMARY KEY);
+    CREATE MATERIALIZED VIEW person_schema AS
+    SELECT name FROM sqlite_schema WHERE tbl_name = 'person';
+}
+expect error {
+    materialized views cannot read the internal table sqlite_schema
+}
+
+test matview-over-sqlite-master-refused {
+    CREATE TABLE person(id INTEGER PRIMARY KEY);
+    CREATE MATERIALIZED VIEW person_schema AS
+    SELECT name FROM sqlite_master WHERE tbl_name = 'person';
+}
+expect error {
+    materialized views cannot read the internal table sqlite_schema
+}
+
+test matview-over-mixed-case-sqlite-master-refused {
+    CREATE TABLE person(id INTEGER PRIMARY KEY);
+    CREATE MATERIALIZED VIEW person_schema AS
+    SELECT name FROM SQLite_Master WHERE tbl_name = 'person';
+}
+expect error {
+    materialized views cannot read the internal table sqlite_schema
+}
+
+test matview-over-quoted-sqlite-master-refused {
+    CREATE TABLE person(id INTEGER PRIMARY KEY);
+    CREATE MATERIALIZED VIEW person_schema AS SELECT name FROM "sqlite_master";
+}
+expect error {
+    materialized views cannot read the internal table sqlite_schema
+}
+
+test matview-over-sqlite-temp-master-refused {
+    CREATE TABLE person(id INTEGER PRIMARY KEY);
+    CREATE MATERIALIZED VIEW person_schema AS SELECT name FROM sqlite_temp_master;
+}
+expect error {
+    materialized views cannot read the internal table sqlite_schema
+}
+
+test matview-over-sqlite-temp-schema-refused {
+    CREATE TABLE person(id INTEGER PRIMARY KEY);
+    CREATE MATERIALIZED VIEW person_schema AS SELECT name FROM sqlite_temp_schema;
+}
+expect error {
+    materialized views cannot read the internal table sqlite_schema
+}
+
+# The schema table is refused wherever it appears, not only as the first table.
+test matview-joining-sqlite-master-refused {
+    CREATE TABLE person(id INTEGER PRIMARY KEY, name TEXT);
+    CREATE MATERIALIZED VIEW person_schema AS
+    SELECT person.id FROM person JOIN sqlite_master ON person.name = sqlite_master.name;
+}
+expect error {
+    materialized views cannot read the internal table sqlite_schema
+}
+
+test matview-over-subquery-on-sqlite-master-refused {
+    CREATE TABLE person(id INTEGER PRIMARY KEY);
+    CREATE MATERIALIZED VIEW person_schema AS
+    SELECT n FROM (SELECT name AS n FROM sqlite_master);
+}
+expect error {
+    materialized views cannot read the internal table sqlite_schema
+}
+
+# A plain view reads the schema table every time it is queried, so it is
+# unaffected by the refusal above.
+test plain-view-over-sqlite-master-allowed {
+    CREATE TABLE person(id INTEGER PRIMARY KEY);
+    CREATE VIEW person_schema AS SELECT name FROM sqlite_master WHERE tbl_name = 'person';
+    SELECT name FROM person_schema ORDER BY name;
+}
+expect {
+    person
+}
+
+# sqlite_sequence, in contrast, is written by ordinary row writes that view
+# maintenance does see, so a materialized view over it stays current — through
+# AUTOINCREMENT inserts and through the DROP TABLE that removes its row.
+test matview-over-sqlite-sequence-is-maintained {
+    CREATE TABLE t(id INTEGER PRIMARY KEY AUTOINCREMENT, v TEXT);
+    CREATE TABLE u(id INTEGER PRIMARY KEY AUTOINCREMENT, v TEXT);
+    INSERT INTO t(v) VALUES ('a');
+    INSERT INTO u(v) VALUES ('a');
+    CREATE MATERIALIZED VIEW seqm AS SELECT name, seq FROM sqlite_sequence;
+    SELECT name, seq FROM seqm ORDER BY name;
+    INSERT INTO t(v) VALUES ('b'), ('c');
+    SELECT name, seq FROM seqm ORDER BY name;
+    DROP TABLE u;
+    SELECT name, seq FROM seqm ORDER BY name;
+}
+expect {
+    t|1
+    u|1
+    t|3
+    u|1
+    t|3
+}
