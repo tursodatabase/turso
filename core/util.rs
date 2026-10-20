@@ -1842,7 +1842,7 @@ where
     match select_table {
         ast::SelectTable::Select { select, .. } => walk_select_expressions_inner(select, func),
         ast::SelectTable::Sub(from_clause, _) => walk_from_clause_expressions(from_clause, func),
-        ast::SelectTable::TableCall(_, args, _) => {
+        ast::SelectTable::TableCall(_, args, ..) => {
             for arg in args {
                 walk_expr_with_subqueries(arg, func)?;
             }
@@ -1980,7 +1980,7 @@ fn validate_select_table_no_cross_db(
     view_db_name: Option<&ast::Name>,
 ) -> Result<()> {
     match select_table {
-        ast::SelectTable::Table(name, _, _) | ast::SelectTable::TableCall(name, _, _) => {
+        ast::SelectTable::Table(name, _, _) | ast::SelectTable::TableCall(name, ..) => {
             reject_cross_db_qualified_name(name, view_db_name)?;
         }
         ast::SelectTable::Select { select, .. } => {
@@ -2146,7 +2146,7 @@ fn view_source_from_select_table(
                 join_info: None,
             })
         }
-        ast::SelectTable::TableCall(name, _, alias) => {
+        ast::SelectTable::TableCall(name, _, alias, _) => {
             let table_name = normalize_ident(name.name.as_str());
             let table_alias = alias.as_ref().map(|a| normalize_ident(a.name().as_str()));
             let qualifiers = table_alias
@@ -3381,7 +3381,7 @@ mod rename_column_view {
                     db_name: None,
                 })
             }
-            ast::SelectTable::TableCall(_, args, alias) => {
+            ast::SelectTable::TableCall(_, args, alias, _) => {
                 for arg in args {
                     rewrite_expr_in_scope(
                         arg,
@@ -4451,7 +4451,7 @@ fn rewrite_select_table_entry_column_refs_scoped(
     target_qualifiers: &mut Vec<String>,
 ) {
     match st {
-        ast::SelectTable::TableCall(_, ref mut args, _) => {
+        ast::SelectTable::TableCall(_, ref mut args, ..) => {
             for arg in args {
                 rename_identifiers_scoped_inner(
                     arg,
@@ -4802,7 +4802,7 @@ fn select_table_still_references_renamed_column(
     target_qualifiers: &mut Vec<String>,
 ) -> bool {
     match st {
-        ast::SelectTable::TableCall(_, args, _) => args.iter().any(|arg| {
+        ast::SelectTable::TableCall(_, args, ..) => args.iter().any(|arg| {
             expr_still_references_renamed_column(
                 arg,
                 target_table,
@@ -5334,7 +5334,7 @@ fn rewrite_select_table_entry_table_refs(st: &mut ast::SelectTable, old_tbl: &st
                 name.name = ast::Name::exact(new_tbl.to_owned());
             }
         }
-        ast::SelectTable::TableCall(ref mut name, ref mut args, _) => {
+        ast::SelectTable::TableCall(ref mut name, ref mut args, ..) => {
             if name.name.as_str().eq_ignore_ascii_case(old_tbl) {
                 name.name = ast::Name::exact(new_tbl.to_owned());
             }

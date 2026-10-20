@@ -3975,7 +3975,7 @@ fn apply_select_table_for_column_rename(
                 resolver,
             )?;
         }
-        ast::SelectTable::TableCall(_, args, _) => {
+        ast::SelectTable::TableCall(_, args, ..) => {
             for arg in args {
                 apply_expr_for_column_rename(
                     mode,
@@ -5118,7 +5118,7 @@ fn validate_select_table_refs_after_rename_in_table(
                 Ok(Some(qualified_name.name.as_str().to_string()))
             }
         }
-        ast::SelectTable::TableCall(_, args, _) => {
+        ast::SelectTable::TableCall(_, args, ..) => {
             for arg in args {
                 if let Some(missing_table) = validate_expr_table_refs_after_rename(
                     arg,
@@ -5827,7 +5827,7 @@ fn validate_select_table_column_refs_after_drop(
             trigger_database_id,
             altered_database_id,
         ),
-        ast::SelectTable::TableCall(_, args, _) => {
+        ast::SelectTable::TableCall(_, args, ..) => {
             for arg in args {
                 if let Some(bad) = validate_expr_column_refs_after_drop(
                     arg,
@@ -5901,7 +5901,7 @@ fn collect_select_table_visible_columns(
                 altered_database_id,
             )
         }
-        ast::SelectTable::TableCall(qualified_name, _, alias) => {
+        ast::SelectTable::TableCall(qualified_name, _, alias, _) => {
             collect_qualified_table_visible_columns(
                 qualified_name,
                 alias.as_ref(),

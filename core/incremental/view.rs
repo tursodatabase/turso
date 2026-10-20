@@ -767,7 +767,7 @@ impl IncrementalView {
                         collect_source(&join.table, cte_names, tables);
                     }
                 }
-                ast::SelectTable::TableCall(_, _, _) => {}
+                ast::SelectTable::TableCall(..) => {}
             }
         }
 
