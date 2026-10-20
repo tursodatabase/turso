@@ -2080,6 +2080,7 @@ pub(crate) fn init_limit(
     t_ctx: &mut TranslateCtx,
     limit: &Option<Box<Expr>>,
     offset: &Option<Box<Expr>>,
+    end_label: BranchOffset,
 ) -> Result<()> {
     if t_ctx.limit_ctx.is_none() && limit.is_some() {
         t_ctx.limit_ctx = Some(LimitCtx::new(program));
@@ -2185,12 +2186,9 @@ pub(crate) fn init_limit(
     }
 
     // exit early if LIMIT 0
-    let main_loop_end = t_ctx
-        .label_main_loop_end
-        .expect("label_main_loop_end must be set before init_limit");
     program.emit_insn(Insn::IfNot {
         reg: limit_ctx.reg_limit,
-        target_pc: main_loop_end,
+        target_pc: end_label,
         jump_if_null: false,
     });
 

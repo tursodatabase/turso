@@ -79,3 +79,17 @@ test order-by-agg-with-select-agg-ok {
 expect {
     2
 }
+
+test scalar-aggregate-order-error-names-function {
+    SELECT abs(-1 ORDER BY 1);
+}
+expect error {
+    ORDER BY may not be used with non-aggregate abs()
+}
+
+test ordered-window-error-names-function {
+    SELECT group_concat(1 ORDER BY 1) OVER ();
+}
+expect error {
+    ORDER BY may not be used with non-aggregate group_concat()
+}

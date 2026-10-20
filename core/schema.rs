@@ -2721,8 +2721,6 @@ impl Schema {
                             select,
                             ..
                         } => {
-                            crate::util::validate_select_for_unsupported_features(&select)?;
-
                             let mut view_column_schema =
                                 crate::util::extract_view_columns(&select, self)?;
                             view_column_schema.rename_columns(&column_names);

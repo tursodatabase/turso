@@ -236,7 +236,7 @@ addr  opcode               p1   p2   p3  p4                                     
  180  Integer               0   81    0                                               0  r[81]=0
  181  Null                  0   89    0                                               0  r[89]=NULL
  182  Integer               1   90    0                                               0  r[90]=1; LIMIT counter
- 183  IfNot                90  222    0                                               0  if !r[90] goto 222
+ 183  IfNot                90  227    0                                               0  if !r[90] goto 227
  184  OpenRead             13    6    0  k(6,B,B,B,B,B)                               0  table=partsupp, root=6, iDb=0
  185  OpenRead             11    2    0  k(4,B,B,B,B)                                 0  table=nation, root=2, iDb=0
  186  Once                195    0    0                                               0  goto 195

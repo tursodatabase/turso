@@ -275,14 +275,15 @@ expect {
     300
 }
 
-@skip-if sqlite "sqlite supports ORDER BY in aggregate functions"
 @cross-check-integrity
-test view-rejects-aggregate-order-by {
+test view-aggregate-order-by {
     CREATE TABLE t(val INT);
-    CREATE VIEW v AS SELECT SUM(val ORDER BY val) FROM t;
+    INSERT INTO t VALUES (3),(1),(2);
+    CREATE VIEW v AS SELECT group_concat(val ORDER BY val) AS ordered FROM t;
+    SELECT * FROM v;
 }
-expect error {
-    ORDER BY clause is not supported yet in aggregate functions
+expect {
+    1,2,3
 }
 
 test view-self-circle-detection {
@@ -443,4 +444,64 @@ test view-star-does-not-inherit-source-primary-key {
 expect {
     id|0
     value|0
+}
+
+test view-rejects-ordered-window-direct {
+    CREATE TABLE t(val INT);
+    CREATE VIEW invalid_view AS SELECT group_concat(val ORDER BY val) OVER () FROM t;
+}
+expect error {
+    ORDER BY may not be used with non-aggregate group_concat()
+}
+
+test view-rejects-ordered-window-scalar-subquery {
+    CREATE TABLE t(val INT);
+    CREATE VIEW invalid_view AS SELECT (SELECT group_concat(val ORDER BY val) OVER () FROM t);
+}
+expect error {
+    ORDER BY may not be used with non-aggregate group_concat()
+}
+
+test view-rejects-ordered-window-from-subquery {
+    CREATE TABLE t(val INT);
+    CREATE VIEW invalid_view AS SELECT * FROM (SELECT group_concat(val ORDER BY val) OVER () FROM t);
+}
+expect error {
+    ORDER BY may not be used with non-aggregate group_concat()
+}
+
+test view-rejects-ordered-window-cte {
+    CREATE TABLE t(val INT);
+    CREATE VIEW invalid_view AS WITH c AS (SELECT group_concat(val ORDER BY val) OVER () FROM t) SELECT * FROM c;
+}
+expect error {
+    ORDER BY may not be used with non-aggregate group_concat()
+}
+
+test view-rejects-ordered-window-compound {
+    CREATE TABLE t(val INT);
+    CREATE VIEW invalid_view AS SELECT val FROM t UNION ALL SELECT group_concat(val ORDER BY val) OVER () FROM t;
+}
+expect error {
+    ORDER BY may not be used with non-aggregate group_concat()
+}
+
+test view-rejects-ordered-window-named-window {
+    CREATE TABLE t(val INT);
+    CREATE VIEW invalid_view AS SELECT group_concat(val ORDER BY val) OVER w FROM t WINDOW w AS ();
+}
+expect error {
+    ORDER BY may not be used with non-aggregate group_concat()
+}
+
+@cross-check-integrity
+test view-window-without-aggregate-order-by {
+    CREATE TABLE t(val INT);
+    INSERT INTO t VALUES (2),(1);
+    CREATE VIEW valid_window AS SELECT val, sum(val) OVER (ORDER BY val) AS total FROM t;
+    SELECT * FROM valid_window ORDER BY val;
+}
+expect {
+    1|1
+    2|3
 }

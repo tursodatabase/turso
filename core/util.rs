@@ -2046,29 +2046,25 @@ fn validate_select_table_no_cross_db(
     Ok(())
 }
 
-pub fn validate_select_for_unsupported_features(select_stmt: &ast::Select) -> Result<()> {
-    walk_select_expressions(select_stmt, &mut |expr| {
-        if let ast::Expr::FunctionCall { order_by, .. } = expr {
-            if !order_by.is_empty() {
-                crate::bail_parse_error!(
-                    "ORDER BY clause is not supported yet in aggregate functions"
-                );
-            }
-        }
-        Ok(WalkControl::Continue)
-    })
-}
-
 pub fn validate_select_for_views(
     select_stmt: &ast::Select,
     view_db_name: Option<&ast::Name>,
 ) -> Result<()> {
-    validate_select_for_unsupported_features(select_stmt)?;
-
     validate_no_cross_db_references(select_stmt, view_db_name)?;
 
     walk_select_expressions(select_stmt, &mut |expr| {
         match expr {
+            ast::Expr::FunctionCall {
+                name,
+                order_by,
+                filter_over,
+                ..
+            } if !order_by.is_empty() && filter_over.over_clause.is_some() => {
+                crate::bail_parse_error!(
+                    "ORDER BY may not be used with non-aggregate {}()",
+                    name.as_str()
+                );
+            }
             ast::Expr::Subquery(subquery_select) | ast::Expr::Exists(subquery_select) => {
                 validate_no_cross_db_references(subquery_select, view_db_name)?;
             }

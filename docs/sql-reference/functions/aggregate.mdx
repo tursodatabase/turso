@@ -328,6 +328,28 @@ SELECT group_concat(DISTINCT product) FROM sales;
 -- 'Widget,Gadget'
 ```
 
+## Ordering Aggregate Inputs
+
+Place `ORDER BY` inside an aggregate call, after its arguments, to control the order in which it processes rows. This affects functions such as `group_concat` and `json_group_array`. An outer `ORDER BY` sorts the result rows and does not set the aggregate input order.
+
+```sql
+SELECT region,
+       group_concat(product, ', ' ORDER BY amount DESC NULLS LAST, id)
+           FILTER (WHERE quantity IS NOT NULL) AS products
+FROM sales
+GROUP BY region;
+```
+
+Each aggregate can have its own ordering, with multiple expressions, `ASC` or `DESC`, collations, and `NULLS FIRST` or `NULLS LAST`. Add a tie-breaker when equal ordering keys could produce different results. `FILTER` excludes rows before evaluating the aggregate's arguments and ordering expressions.
+
+Single-argument aggregates can combine `DISTINCT` with ordering:
+
+```sql
+SELECT group_concat(DISTINCT product ORDER BY product) FROM sales;
+```
+
+`min` and `max` ignore aggregate-local ordering. Aggregate-local ordering is not supported in calls with `OVER` or in materialized views. `CREATE VIEW` rejects calls combining aggregate-local ordering with `OVER`, including inside subqueries and CTEs. Invalid calls identify the function in the error, for example `ORDER BY may not be used with non-aggregate abs()`.
+
 ## Aggregates as Window Functions
 
 All standard aggregate functions can be used as window functions. When used with an `OVER` clause, the function computes a running or partitioned result without collapsing rows.
