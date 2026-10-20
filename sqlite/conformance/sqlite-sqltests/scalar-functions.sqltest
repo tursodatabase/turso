@@ -1596,10 +1596,9 @@ expect {
 
 # Regression: infinite REAL must quote as a reloadable numeric literal, not Inf.
 # SQLite emits 9.0e+999 so both engines can parse the dump back.
+# Keep these SELECT-only: the sqltest harness opens the DB read-only.
 test quote-positive-infinity {
-    CREATE TABLE t(x REAL);
-    INSERT INTO t VALUES(1e400);
-    SELECT quote(x) FROM t;
+    SELECT quote(1e400);
 }
 expect {
     9.0e+999
@@ -1613,12 +1612,8 @@ expect {
 }
 
 test quote-infinity-reload {
-    CREATE TABLE inf_src(x REAL);
-    INSERT INTO inf_src VALUES(1e400);
-    INSERT INTO inf_src VALUES(-1e400);
-    CREATE TABLE inf_dst(x REAL);
-    INSERT INTO inf_dst SELECT quote(x) FROM inf_src;
-    SELECT quote(x) FROM inf_dst ORDER BY rowid;
+    SELECT quote(CAST(quote(1e400) AS REAL));
+    SELECT quote(CAST(quote(-1e400) AS REAL));
 }
 expect {
     9.0e+999
