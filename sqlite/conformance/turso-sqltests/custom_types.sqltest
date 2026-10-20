@@ -393,6 +393,15 @@ expect error {
     invalid UUID value
 }
 
+test strict-uuid-omitted-column-gets-random-uuid {
+    CREATE TABLE t1(a INTEGER PRIMARY KEY, b uuid) STRICT;
+    INSERT INTO t1(a) VALUES (1), (2);
+    SELECT count(DISTINCT b), min(length(b)), max(length(b)) FROM t1;
+}
+expect {
+    2|36|36
+}
+
 setup nullable-uuid {
     CREATE TABLE t1(a INTEGER PRIMARY KEY, b uuid) STRICT;
 }

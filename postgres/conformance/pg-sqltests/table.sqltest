@@ -208,3 +208,77 @@ test table-delete-row-with-numeric-expression-index {
 expect {
     0
 }
+
+test table-uuid-column-omitted-from-insert-is-null {
+    CREATE TABLE t (id int PRIMARY KEY, u uuid);
+    INSERT INTO t (id) VALUES (1);
+    SELECT count(*), count(u) FROM t;
+}
+expect {
+    1|0
+}
+
+test table-uuid-column-omitted-from-multi-row-insert-is-null {
+    CREATE TABLE t (id int, u uuid);
+    INSERT INTO t (id) VALUES (1), (2), (3);
+    SELECT count(*), count(u) FROM t;
+}
+expect {
+    3|0
+}
+
+test table-uuid-column-omitted-from-insert-select-is-null {
+    CREATE TABLE src (id int);
+    INSERT INTO src VALUES (1), (2), (3);
+    CREATE TABLE t (id int, u uuid);
+    INSERT INTO t (id) SELECT id FROM src;
+    SELECT count(*), count(u) FROM t;
+}
+expect {
+    3|0
+}
+
+test table-uuid-column-added-by-alter-table-is-null-for-existing-rows {
+    CREATE TABLE t (id int);
+    INSERT INTO t VALUES (1), (2);
+    ALTER TABLE t ADD COLUMN u uuid;
+    SELECT count(*), count(u) FROM t;
+}
+expect {
+    2|0
+}
+
+test table-domain-over-uuid-column-omitted-from-insert-is-null {
+    CREATE DOMAIN d_uuid AS uuid;
+    CREATE TABLE t (id int, u d_uuid);
+    INSERT INTO t (id) VALUES (1);
+    SELECT count(*), count(u) FROM t;
+}
+expect {
+    1|0
+}
+
+test table-uuid-not-null-column-omitted-from-insert-fails {
+    CREATE TABLE t (id int, u uuid NOT NULL);
+    INSERT INTO t (id) VALUES (1);
+}
+expect error {}
+
+test table-uuid-column-only-gets-a-value-from-an-explicit-default {
+    CREATE TABLE t (id int, with_default uuid DEFAULT gen_random_uuid(), without_default uuid);
+    INSERT INTO t (id) VALUES (1), (2);
+    SELECT count(DISTINCT with_default), count(without_default) FROM t;
+}
+expect {
+    2|0
+}
+
+test table-uuid-column-keeps-explicit-values {
+    CREATE TABLE t (id int, u uuid);
+    INSERT INTO t VALUES (1, '550e8400-e29b-41d4-a716-446655440000'), (2, NULL);
+    SELECT id, u FROM t ORDER BY id;
+}
+expect {
+    1|550e8400-e29b-41d4-a716-446655440000
+    2|
+}

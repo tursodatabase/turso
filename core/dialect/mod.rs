@@ -172,6 +172,13 @@ pub trait Dialect: Send + Sync + 'static {
         false
     }
 
+    /// Whether built-in types with a DEFAULT, like `uuid`, fill a column that
+    /// leaves out its value and has no DEFAULT of its own. PostgreSQL types
+    /// have no DEFAULT, so such a column is NULL there.
+    fn builtin_types_have_defaults(&self) -> bool {
+        true
+    }
+
     /// Whether `t.c` reads only the nearest query that has a table named `t`.
     ///
     /// SQLite keeps searching outer queries when that table has no column

@@ -166,6 +166,10 @@ impl Dialect for PostgresDialect {
         true
     }
 
+    fn builtin_types_have_defaults(&self) -> bool {
+        false
+    }
+
     fn qualified_column_uses_nearest_table_only(&self) -> bool {
         true
     }
