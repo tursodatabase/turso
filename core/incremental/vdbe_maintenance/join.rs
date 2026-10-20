@@ -54,9 +54,9 @@ impl JoinInputContract {
     }
 }
 
-/// The complete physical contract of one binary join node.
+/// The complete physical contract of one join node.
 pub(super) struct JoinContract {
-    inputs: [JoinInputContract; JOIN_ARITY],
+    inputs: Vec<JoinInputContract>,
     on: Vec<ast::Expr>,
 }
 
@@ -64,34 +64,43 @@ impl JoinContract {
     pub(super) fn from_outputs(
         program: &mut ProgramBuilder,
         view_name: &str,
-        input_nodes: [dag::NodeId; JOIN_ARITY],
-        outputs: [&NodeOutput; JOIN_ARITY],
+        input_nodes: &[dag::NodeId],
+        outputs: &[&NodeOutput],
         on: &[ast::Expr],
         input: MaintenanceInput,
     ) -> Result<Self> {
-        let mut join_input = |position: usize| -> Result<JoinInputContract> {
-            let output = outputs[position];
-            let arrangement = output.arrangement().cloned().ok_or_else(|| {
-                LimboError::InternalError("join input has no materialized arrangement".to_string())
-            })?;
-            let delta = match input {
-                MaintenanceInput::TransactionDelta => Some(materialize_node_output(
-                    program,
-                    view_name,
-                    input_nodes[position],
-                    output,
-                    input,
-                )?),
-                MaintenanceInput::BaseTable => None,
-            };
-            Ok(JoinInputContract {
-                delta,
-                schema: output.contract().schema.clone(),
-                arrangement,
+        turso_assert!(
+            input_nodes.len() == outputs.len(),
+            "a join needs one output per input node"
+        );
+        let inputs = input_nodes
+            .iter()
+            .zip(outputs)
+            .map(|(input_node, output)| {
+                let arrangement = output.arrangement().cloned().ok_or_else(|| {
+                    LimboError::InternalError(
+                        "join input has no materialized arrangement".to_string(),
+                    )
+                })?;
+                let delta = match input {
+                    MaintenanceInput::TransactionDelta => Some(materialize_node_output(
+                        program,
+                        view_name,
+                        *input_node,
+                        output,
+                        input,
+                    )?),
+                    MaintenanceInput::BaseTable => None,
+                };
+                Ok(JoinInputContract {
+                    delta,
+                    schema: output.contract().schema.clone(),
+                    arrangement,
+                })
             })
-        };
+            .collect::<Result<Vec<_>>>()?;
         Ok(Self {
-            inputs: [join_input(0)?, join_input(1)?],
+            inputs,
             on: on.to_vec(),
         })
     }
@@ -1926,8 +1935,14 @@ mod tests {
         program
             .insns
             .iter()
-            .filter(|(insn, _)| {
-                matches!(insn, Insn::SeekRowid { cursor_id, .. } if reads_table(program, *cursor_id, table_name))
+            .filter(|(insn, _)| match insn {
+                Insn::SeekRowid { cursor_id, .. }
+                | Insn::SeekGE {
+                    cursor_id,
+                    is_index: false,
+                    ..
+                } => reads_table(program, *cursor_id, table_name),
+                _ => false,
             })
             .count()
     }

@@ -151,21 +151,23 @@ pub enum OpNode {
         logical_id: TableInternalId,
     },
 
-    /// Binary join (⋈) with arbitrary ON predicates. Pure: no projection, no
-    /// WHERE (those are `Project`/`Filter` above). Output schema: the
-    /// concatenation of the left and right schemas for an inner join, the
-    /// left schema for a semi or anti join. Keeping this node binary makes SQL's
-    /// mixed outer-join tree explicit and bounds every delta decomposition
-    /// to the bilinear two-input rule.
+    /// Join (⋈) with arbitrary ON predicates. Pure: no projection (that is a
+    /// `Project` above). Output schema: the concatenation of the input
+    /// schemas for an inner join, the first input's schema for a semi or
+    /// anti join.
+    ///
+    /// An inner join takes every input of one run of inner joins, so the
+    /// run keeps no intermediate join results. Semi and anti joins have
+    /// exactly two inputs, which keeps SQL's mixed outer-join tree explicit.
     ///
     /// Inputs expose both a delta stream and, where available, an arrangement.
     /// Scans use base-table btrees for free; aggregates expose their persisted
     /// finalized rows. Other interior operators require an explicit output
     /// arrangement before a downstream join can consume them.
     Join {
-        inputs: [NodeId; 2],
-        /// ON predicates, desugared from USING/NATURAL; bind against the
-        /// concatenated input schema.
+        inputs: Vec<NodeId>,
+        /// ON and WHERE predicates of the join, desugared from
+        /// USING/NATURAL; bind against the concatenated input schema.
         on: Vec<ast::Expr>,
         kind: JoinKind,
     },
@@ -232,8 +234,7 @@ impl OpNode {
             | OpNode::Alias { input, .. }
             | OpNode::Pad { input, .. }
             | OpNode::Aggregate { input, .. } => std::slice::from_ref(input),
-            OpNode::Join { inputs, .. } => inputs,
-            OpNode::SetOp { inputs, .. } => inputs,
+            OpNode::Join { inputs, .. } | OpNode::SetOp { inputs, .. } => inputs,
         }
     }
 }
@@ -315,6 +316,18 @@ impl DagBuilder {
     }
 
     fn derive_output_schema(&self, node: &OpNode) -> Result<StreamSchema> {
+        if let OpNode::Join { inputs, kind, .. } = node {
+            let arity_is_valid = match kind {
+                JoinKind::Inner => inputs.len() >= 2,
+                JoinKind::Semi | JoinKind::Anti => inputs.len() == 2,
+            };
+            if !arity_is_valid {
+                return Err(LimboError::InternalError(format!(
+                    "{kind:?} join DAG node has {} inputs",
+                    inputs.len()
+                )));
+            }
+        }
         let (columns, bindings) = match node {
             OpNode::Scan {
                 table,

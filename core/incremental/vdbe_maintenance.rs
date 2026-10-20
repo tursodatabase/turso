@@ -359,12 +359,15 @@ fn emit_plan_nodes(
                         ))
                     })
                 };
-                let declared_inputs = [declared_input(inputs[0])?, declared_input(inputs[1])?];
+                let declared_inputs = inputs
+                    .iter()
+                    .map(|input_id| declared_input(*input_id))
+                    .collect::<Result<Vec<_>>>()?;
                 let contract = JoinContract::from_outputs(
                     program,
                     view_name,
-                    *inputs,
-                    declared_inputs,
+                    inputs,
+                    &declared_inputs,
                     on,
                     input,
                 )?;

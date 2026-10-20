@@ -377,7 +377,7 @@ fn build_select_plan_dag(
     let mut node = inputs[0];
     for step in 0..inputs.len() {
         if step > 0 {
-            let pair = [node, inputs[step]];
+            let pair = vec![node, inputs[step]];
             let on = std::mem::take(&mut on_by_step[step]);
             node = match join_types[step] {
                 JoinType::Inner => builder.push(dag::OpNode::Join {
@@ -523,7 +523,7 @@ fn build_select_plan_dag(
 /// ```
 fn push_outer_join(
     builder: &mut dag::DagBuilder,
-    inputs: [dag::NodeId; 2],
+    inputs: Vec<dag::NodeId>,
     on: Vec<ast::Expr>,
     keep_left_rows: bool,
     keep_right_rows: bool,
@@ -533,7 +533,7 @@ fn push_outer_join(
         bindings: Vec::new(),
     });
     let mut branches = vec![builder.push(dag::OpNode::Join {
-        inputs,
+        inputs: inputs.clone(),
         on: on.clone(),
         kind: dag::JoinKind::Inner,
     })?];
@@ -543,7 +543,7 @@ fn push_outer_join(
         }
         let other = inputs[1 - side];
         let unmatched = builder.push(dag::OpNode::Join {
-            inputs: [inputs[side], other],
+            inputs: vec![inputs[side], other],
             on: on.clone(),
             kind: dag::JoinKind::Anti,
         })?;
@@ -902,10 +902,9 @@ impl MaintenancePlan {
                     inputs,
                     kind: dag::JoinKind::Inner,
                     ..
-                } => [&chosen[inputs[0]], &chosen[inputs[1]]]
-                    .into_iter()
-                    .flatten()
-                    .copied()
+                } => inputs
+                    .iter()
+                    .flat_map(|input| chosen[*input].iter().copied())
                     .collect(),
                 dag::OpNode::Join { inputs, .. } => chosen[inputs[0]].clone(),
                 dag::OpNode::Pad {
@@ -1129,10 +1128,10 @@ fn validate_planned_node(
                     )));
                 }
             }
-            let input_contracts = [
-                &operator_states.for_node(inputs[0])?.output,
-                &operator_states.for_node(inputs[1])?.output,
-            ];
+            let input_contracts = inputs
+                .iter()
+                .map(|input| Ok(&operator_states.for_node(*input)?.output))
+                .collect::<Result<Vec<_>>>()?;
             if *kind != dag::JoinKind::Inner
                 && !matches!(
                     input_contracts[0].published_identity,
@@ -1316,7 +1315,10 @@ fn plan_node_output(
             kind: dag::JoinKind::Inner,
             ..
         } => {
-            let inputs = [prior_output(inputs[0])?, prior_output(inputs[1])?];
+            let inputs = inputs
+                .iter()
+                .map(|input| prior_output(*input))
+                .collect::<Result<Vec<_>>>()?;
             let identity = if inputs
                 .iter()
                 .all(|input| matches!(input.published_identity, DeltaIdentity::BindingRowids(_)))
@@ -1328,8 +1330,8 @@ fn plan_node_output(
                         .sum(),
                 )
             } else {
-                // Opaque pair for non-binding inputs.
-                DeltaIdentity::OperatorKey(2)
+                // One opaque slot per input, holding that input's identity.
+                DeltaIdentity::OperatorKey(inputs.len())
             };
             let mut provenance = Vec::new();
             for input in &inputs {
