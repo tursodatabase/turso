@@ -246,8 +246,10 @@ may pick a different table of a join than legacy does. When every condition
 of every branch is applied by that branch's seek, the OR term is dropped from
 WHERE, as legacy drops it, so a subquery in it fills its list once; otherwise
 it stays in WHERE and is checked again on each row (HIR has no per-branch
-filters like legacy's). It is used only in SELECT, not yet in DELETE or
-UPDATE loops, and never on the right side of an outer join.
+filters like legacy's). It is never used on the right side of an outer
+join. A DELETE or UPDATE whose loop reads rows this way first collects their
+rowids, as legacy does, since the row set gives them in rowid order through
+a cursor the statement is about to write through.
 
 Like legacy's `optimizer/unnest.rs`, `semantic_unnest.rs` turns correlated
 subqueries into joins before planning. It rewrites HIR into HIR: the

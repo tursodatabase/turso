@@ -21,9 +21,13 @@ use crate::{
 };
 
 use super::fkey_action::CompiledAction;
-use super::query::{emit_array_results, predicate_loop};
+use super::query::{
+    close_hir_btree_loop, emit_array_results, predicate_loop, prepare_hir_loop_unexplained,
+    start_hir_loop,
+};
 use super::trigger::CompiledTrigger;
 use super::{HirPlan, HirSession};
+use crate::translate::semantic_to_plan::HirPlannedLoop;
 
 /// The subprograms a DML statement fires. They are compiled before anything
 /// is emitted, so one that needs legacy leaves the whole statement to it.
@@ -502,6 +506,47 @@ pub(super) fn operation_index(operation: &HirBtreeOperation) -> Option<&Arc<crat
 
 /// Legacy's single-row test for a DML access path: a rowid lookup, or a
 /// seek where every column of a unique index (or the rowid) is fixed by `=`.
+/// Run the statement's loop with read cursors and collect the rowid of each
+/// row it finds into a row set, then close those cursors. The loop reads the
+/// table, an index, or one seek per branch of an OR term. Returns the row
+/// set's register.
+pub(super) fn collect_target_rowids(
+    program: &mut ProgramBuilder,
+    plan: &HirPlan,
+    target: &DmlTarget<'_>,
+    access: &HirAccessPlan,
+    planned_loop: &HirPlannedLoop,
+) -> Result<usize> {
+    let document = target.document;
+    let rowset = program.alloc_register();
+    program.emit_insn(Insn::Null {
+        dest: rowset,
+        dest_end: None,
+    });
+    let collected = program.allocate_label();
+    let prepared = prepare_hir_loop_unexplained(program, plan, planned_loop)?;
+    emit_access_predicates(program, document, access, None, collected)?;
+    let hir_loop = start_hir_loop(program, document, &prepared, None)?;
+    emit_access_predicates(program, document, access, Some(0), hir_loop.next)?;
+    let rowid = program.alloc_register();
+    super::expr::translate_expr(
+        program,
+        document,
+        &hir::Expr::RowId(target.source.id),
+        rowid,
+    )?;
+    program.emit_insn(Insn::RowSetAdd {
+        rowset_reg: rowset,
+        value_reg: rowid,
+    });
+    close_hir_btree_loop(program, &hir_loop, &[]);
+    program.preassign_label_to_next_insn(collected);
+    for cursor in prepared.read_cursors()? {
+        program.emit_insn(Insn::Close { cursor_id: cursor });
+    }
+    Ok(rowset)
+}
+
 pub(super) fn touches_at_most_one_row(operation: &HirBtreeOperation) -> bool {
     use crate::translate::plan::SeekKeyComponent;
     match operation {

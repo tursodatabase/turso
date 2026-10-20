@@ -30,13 +30,12 @@ use crate::{
 
 use super::autoincrement::Sequence;
 use super::dml::{
-    emit_access_predicates, emit_index_key, has_subquery, operation_index, touches_at_most_one_row,
-    DmlTarget, ReturningBuffer, Subprograms,
+    collect_target_rowids, emit_access_predicates, emit_index_key, has_subquery, operation_index,
+    touches_at_most_one_row, DmlTarget, ReturningBuffer, Subprograms,
 };
 use super::fkey_action::CompiledAction;
 use super::query::{
-    close_hir_btree_loop, hir_loop_explain, prepare_hir_btree_loop, start_hir_btree_loop,
-    PreparedHirBtreeLoop,
+    close_hir_btree_loop, hir_loop_explain, start_hir_btree_loop, PreparedHirBtreeLoop,
 };
 use super::trigger::{CompiledTrigger, TriggerRow};
 use crate::translate::emitter::OperationMode;
@@ -125,11 +124,14 @@ pub(super) fn needs_legacy(
             access.loops.len()
         )));
     };
-    let HirSourceAccess::BTree { operation, .. } = &planned_loop.access else {
-        return Ok(true);
-    };
-    // A loop over an index built for this statement is not lowered yet.
-    Ok(operation_index(operation).is_some_and(|index| index.ephemeral))
+    match &planned_loop.access {
+        // A loop over an index built for this statement is not lowered yet.
+        HirSourceAccess::BTree { operation, .. } => {
+            Ok(operation_index(operation).is_some_and(|index| index.ephemeral))
+        }
+        HirSourceAccess::OrUnion(_) => Ok(false),
+        _ => Ok(true),
+    }
 }
 
 /// Emit an UPDATE that [`needs_legacy`] accepted. `update` is the plan's
@@ -169,10 +171,17 @@ pub(super) fn emit_update(
                     planned_loop.source, update.target
                 )));
             }
-            let HirSourceAccess::BTree { operation, .. } = &planned_loop.access else {
-                return Err(LimboError::InternalError(
-                    "HIR UPDATE target does not use a B-tree loop".into(),
-                ));
+            // One seek per branch of an OR term reads rows in rowid order
+            // through a row set; like legacy, the UPDATE then collects its
+            // rowids first.
+            let operation = match &planned_loop.access {
+                HirSourceAccess::BTree { operation, .. } => Some(operation),
+                HirSourceAccess::OrUnion(_) => None,
+                _ => {
+                    return Err(LimboError::InternalError(
+                        "HIR UPDATE target does not use a B-tree loop".into(),
+                    ))
+                }
             };
             Some((planned_loop, operation))
         }
@@ -262,7 +271,7 @@ pub(super) fn emit_update(
     if triggers.is_empty()
         && !has_foreign_keys
         && !replaces
-        && single_loop.is_some_and(|(_, operation)| touches_at_most_one_row(operation))
+        && single_loop.is_some_and(|(_, operation)| operation.is_some_and(touches_at_most_one_row))
     {
         program.set_multi_write(false);
     }
@@ -431,7 +440,7 @@ pub(super) fn emit_update(
     // its rows first, so the loop never reaches a changed row again.
     let moves_rows = rowid_value.is_some()
         || single_loop
-            .and_then(|(_, operation)| operation_index(operation))
+            .and_then(|(_, operation)| operation_index(operation?))
             .is_some_and(|index| {
                 replaces
                     || changed_indexes
@@ -449,7 +458,7 @@ pub(super) fn emit_update(
             row,
             done,
         )?,
-        Some((_, operation))
+        Some((_, Some(operation)))
             if triggers.is_empty()
                 && actions.is_empty()
                 && !statement_replace
@@ -770,39 +779,13 @@ fn emit_rowset_update(
     settings: UpdateRowSettings,
     done: BranchOffset,
 ) -> Result<()> {
-    let document = target.document;
     let [planned_loop] = access.loops.as_slice() else {
         return Err(LimboError::InternalError(format!(
             "HIR UPDATE plan has {} loops for one target",
             access.loops.len()
         )));
     };
-    let rowset = program.alloc_register();
-    program.emit_insn(Insn::Null {
-        dest: rowset,
-        dest_end: None,
-    });
-    let collected = program.allocate_label();
-    let prepared = prepare_hir_btree_loop(program, plan, planned_loop)?;
-    emit_access_predicates(program, document, access, None, collected)?;
-    let hir_loop = start_hir_btree_loop(program, document, &prepared, None)?;
-    emit_access_predicates(program, document, access, Some(0), hir_loop.next)?;
-    let rowid = program.alloc_register();
-    super::expr::translate_expr(
-        program,
-        document,
-        &hir::Expr::RowId(target.source.id),
-        rowid,
-    )?;
-    program.emit_insn(Insn::RowSetAdd {
-        rowset_reg: rowset,
-        value_reg: rowid,
-    });
-    close_hir_btree_loop(program, &hir_loop, &[]);
-    program.preassign_label_to_next_insn(collected);
-    for cursor in std::iter::once(prepared.cursor).chain(prepared.table_cursor) {
-        program.emit_insn(Insn::Close { cursor_id: cursor });
-    }
+    let rowset = collect_target_rowids(program, plan, target, access, planned_loop)?;
 
     let table_cursor = target.open_table_for_write(program);
     let index_cursors = open_changed_indexes(program, target, layout)?;

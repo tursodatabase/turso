@@ -3039,7 +3039,7 @@ pub(super) struct PreparedHirBtreeLoop<'a> {
     pub(super) index_keys: Vec<(&'a hir::Expr, usize)>,
 }
 
-struct PreparedHirMaterializedLoop<'a> {
+pub(super) struct PreparedHirMaterializedLoop<'a> {
     source: &'a hir::Source,
     cursor: CursorID,
     table: Arc<BTreeTable>,
@@ -3048,7 +3048,7 @@ struct PreparedHirMaterializedLoop<'a> {
     direction: IterationDirection,
 }
 
-struct PreparedHirVirtualLoop<'a> {
+pub(super) struct PreparedHirVirtualLoop<'a> {
     source: &'a hir::Source,
     operation: &'a HirVirtualTableOperation,
     cursor: CursorID,
@@ -3056,14 +3056,14 @@ struct PreparedHirVirtualLoop<'a> {
 
 /// One seek per branch of an OR term: each branch adds the rowids it finds
 /// to a row set, and the loop then reads each of those rows once.
-struct PreparedHirOrUnionLoop<'a> {
+pub(super) struct PreparedHirOrUnionLoop<'a> {
     table_cursor: CursorID,
     branches: Vec<PreparedHirBtreeLoop<'a>>,
 }
 
 /// A scan through a query pattern of an index method, such as FTS: the
 /// index returns rowids, and the values of the pattern's result columns.
-struct PreparedHirIndexMethodLoop<'a> {
+pub(super) struct PreparedHirIndexMethodLoop<'a> {
     source: &'a hir::Source,
     access: &'a crate::translate::hir_index_method::HirIndexMethodAccess,
     index_cursor: CursorID,
@@ -3074,14 +3074,14 @@ struct PreparedHirIndexMethodLoop<'a> {
     covered: Vec<(&'a hir::Expr, usize)>,
 }
 
-struct PreparedHirRegistersLoop<'a> {
+pub(super) struct PreparedHirRegistersLoop<'a> {
     source: &'a hir::Source,
 }
 
 /// A FROM subquery or CTE that runs as a coroutine: the loop resumes it for
 /// each row instead of reading a materialized table, so an outer LIMIT can
 /// stop it early, as in legacy.
-struct PreparedHirCoroutineLoop<'a> {
+pub(super) struct PreparedHirCoroutineLoop<'a> {
     source: &'a hir::Source,
     yield_reg: usize,
     start: BranchOffset,
@@ -3101,7 +3101,7 @@ impl HirMaterializedQuery {
     }
 }
 
-enum PreparedHirLoop<'a> {
+pub(super) enum PreparedHirLoop<'a> {
     BTree(PreparedHirBtreeLoop<'a>),
     Virtual(PreparedHirVirtualLoop<'a>),
     IndexMethod(PreparedHirIndexMethodLoop<'a>),
@@ -3112,9 +3112,33 @@ enum PreparedHirLoop<'a> {
     Hash(PreparedHirHashLoop<'a>),
 }
 
+impl PreparedHirLoop<'_> {
+    /// The cursors a DML statement closes once it has collected the rowids
+    /// its loop finds: the table's, and those of the indexes the loop reads.
+    pub(super) fn read_cursors(&self) -> Result<Vec<CursorID>> {
+        match self {
+            Self::BTree(prepared) => Ok(std::iter::once(prepared.cursor)
+                .chain(prepared.table_cursor)
+                .collect()),
+            Self::OrUnion(prepared) => Ok(std::iter::once(prepared.table_cursor)
+                .chain(
+                    prepared
+                        .branches
+                        .iter()
+                        .map(|branch| branch.cursor)
+                        .filter(|cursor| *cursor != prepared.table_cursor),
+                )
+                .collect()),
+            _ => Err(LimboError::InternalError(
+                "HIR DML target loop is not a table loop".into(),
+            )),
+        }
+    }
+}
+
 /// A hash lookup's cursor, registers and labels, chosen before any loop
 /// starts. See [HirSourceAccess::Hash].
-struct PreparedHirHashLoop<'a> {
+pub(super) struct PreparedHirHashLoop<'a> {
     source: &'a hir::Source,
     lookup: &'a HirHashLookup,
     table: Arc<BTreeTable>,
@@ -5911,7 +5935,7 @@ fn prepare_hir_coroutine_loop<'a>(
     }))
 }
 
-fn prepare_hir_loop_unexplained<'a>(
+pub(super) fn prepare_hir_loop_unexplained<'a>(
     program: &mut ProgramBuilder,
     plan: &'a HirPlan,
     planned_loop: &'a HirPlannedLoop,
@@ -7722,7 +7746,7 @@ fn build_hir_autoindex(
     Ok(result?.use_bloom_filter)
 }
 
-fn start_hir_loop(
+pub(super) fn start_hir_loop(
     program: &mut ProgramBuilder,
     document: &HirDocument,
     prepared: &PreparedHirLoop<'_>,

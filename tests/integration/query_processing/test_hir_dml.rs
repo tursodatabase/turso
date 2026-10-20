@@ -30,10 +30,9 @@ const SETUP: &[&str] = &[
 
 type Rows = Vec<Vec<rusqlite::types::Value>>;
 
-/// Run `statements` on a fresh database with HIR on or off, then return
-/// what each one returned or its error, every row left in the tables, and
-/// the integrity check.
-fn run(hir: bool, statements: &[&str]) -> Vec<Result<Rows, String>> {
+/// A fresh database with the test tables, and a connection to it that
+/// prepares statements through HIR or legacy.
+fn connect(hir: bool) -> (TempDatabase, std::sync::Arc<turso_core::Connection>) {
     let db = TempDatabase::builder()
         .with_opts(turso_core::DatabaseOpts::new().with_generated_columns(true))
         .build();
@@ -42,6 +41,26 @@ fn run(hir: bool, statements: &[&str]) -> Vec<Result<Rows, String>> {
         conn.execute(statement).unwrap();
     }
     conn.set_experimental_hir(hir);
+    (db, conn)
+}
+
+/// The EXPLAIN QUERY PLAN rows of `sql`, without their ids.
+fn query_plan(hir: bool, sql: &str) -> Vec<String> {
+    let (_db, conn) = connect(hir);
+    limbo_exec_rows(&conn, &format!("EXPLAIN QUERY PLAN {sql}"))
+        .into_iter()
+        .map(|row| match row.last() {
+            Some(rusqlite::types::Value::Text(detail)) => detail.clone(),
+            other => panic!("EXPLAIN QUERY PLAN detail is not text: {other:?}"),
+        })
+        .collect()
+}
+
+/// Run `statements` on a fresh database with HIR on or off, then return
+/// what each one returned or its error, every row left in the tables, and
+/// the integrity check.
+fn run(hir: bool, statements: &[&str]) -> Vec<Result<Rows, String>> {
+    let (db, conn) = connect(hir);
     let mut results = Vec::new();
     for statement in statements {
         results.push(limbo_exec_rows_fallible(&db, &conn, statement).map_err(|e| e.to_string()));
@@ -2342,5 +2361,68 @@ fn hir_integrity_check_finds_what_legacy_finds() {
             "{fixture} is broken"
         );
         assert_ne!(hir_program, program, "{fixture}: HIR reads the rows");
+    }
+}
+
+/// Like legacy, a DELETE or UPDATE whose WHERE is an OR of terms that
+/// indexes can each seek reads the table through one seek per branch. The
+/// branches give rowids in rowid order through a row set, so the statement
+/// collects them first, then writes each row once.
+#[test]
+fn hir_dml_with_or_terms_seeks_each_branch_like_legacy() {
+    for (sql, plan) in [
+        (
+            "DELETE FROM u WHERE b = 2 OR c = 'z'",
+            "MULTI-INDEX OR u (u_b, u_c)",
+        ),
+        (
+            "UPDATE u SET d = 9 WHERE b = 1 OR c = 'q'",
+            "MULTI-INDEX OR u (u_b, u_c)",
+        ),
+        // A branch reads the index the UPDATE changes.
+        (
+            "UPDATE u SET b = b + 10 WHERE b = 3 OR c = 'p'",
+            "MULTI-INDEX OR u (u_b, u_c)",
+        ),
+        (
+            "DELETE FROM u WHERE (b = 1 OR c = 'yy') AND d < 2",
+            "MULTI-INDEX OR u (u_b, u_c)",
+        ),
+        (
+            "UPDATE u SET d = 0 WHERE b = 2 OR c = 'x' RETURNING a, d",
+            "MULTI-INDEX OR u (u_b, u_c)",
+        ),
+        (
+            "DELETE FROM t WHERE (b = 2 AND d > 0) OR (d = 3 AND c = 'z')",
+            "MULTI-INDEX OR t (t_b, t_unique)",
+        ),
+        (
+            "DELETE FROM t WHERE b = 2 OR g = 10",
+            "MULTI-INDEX OR t (t_b, t_g)",
+        ),
+        (
+            "DELETE FROM t WHERE b = 5 OR b + length(c) = 3",
+            "MULTI-INDEX OR t (t_b, t_expr)",
+        ),
+    ] {
+        assert_eq!(query_plan(true, sql), vec![plan.to_string()], "{sql}");
+        assert_eq!(query_plan(false, sql), vec![plan.to_string()], "{sql}");
+        assert_eq!(run(true, &[sql]), run(false, &[sql]), "{sql}");
+    }
+    for statements in [
+        &[
+            "CREATE TRIGGER ad AFTER DELETE ON u BEGIN INSERT INTO log VALUES (old.a); END",
+            "DELETE FROM u WHERE b = 2 OR c = 'z'",
+        ][..],
+        &[
+            "CREATE TRIGGER au AFTER UPDATE ON u BEGIN INSERT INTO log VALUES (new.d); END",
+            "UPDATE OR REPLACE u SET b = 1 WHERE b = 3 OR c = 'q'",
+        ],
+    ] {
+        assert_eq!(
+            run(true, statements),
+            run(false, statements),
+            "{statements:?}"
+        );
     }
 }

@@ -931,7 +931,7 @@ impl<'a> HirPlanContext<'a> {
         self.plan_source_access(
             input,
             None,
-            false,
+            true,
             &crate::translate::optimizer::join::HirHashJoins::NONE,
             false,
             1.0,
@@ -980,7 +980,7 @@ impl<'a> HirPlanContext<'a> {
         self.plan_source_access(
             input,
             order_target.as_ref(),
-            false,
+            true,
             &crate::translate::optimizer::join::HirHashJoins::NONE,
             false,
             1.0,
@@ -2533,7 +2533,7 @@ impl<'a> HirPlanContext<'a> {
         mut input: HirQueryBlockPlanInput,
         order_target: Option<&HirOrderTarget<'_>>,
         // Whether a table may be read through one seek per branch of an OR
-        // term, which DELETE and UPDATE loops do not do yet.
+        // term.
         or_union: bool,
         // Whether and how the block may use hash joins.
         hash: &crate::translate::optimizer::join::HirHashJoins<'_>,

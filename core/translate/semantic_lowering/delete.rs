@@ -25,13 +25,12 @@ use crate::{
 };
 
 use super::dml::{
-    emit_access_predicates, emit_index_key, has_subquery, operation_index, touches_at_most_one_row,
-    DmlTarget, ReturningBuffer, Subprograms,
+    collect_target_rowids, emit_access_predicates, emit_index_key, has_subquery, operation_index,
+    touches_at_most_one_row, DmlTarget, ReturningBuffer, Subprograms,
 };
 use super::fkey_action::CompiledAction;
 use super::query::{
-    close_hir_btree_loop, hir_loop_explain, prepare_hir_btree_loop, start_hir_btree_loop,
-    PreparedHirBtreeLoop,
+    close_hir_btree_loop, hir_loop_explain, start_hir_btree_loop, PreparedHirBtreeLoop,
 };
 use super::trigger::{CompiledTrigger, TriggerRow};
 use crate::translate::emitter::OperationMode;
@@ -61,6 +60,7 @@ pub(super) fn needs_legacy(
         HirSourceAccess::BTree { operation, .. } => {
             Ok(operation_index(operation).is_some_and(|index| index.ephemeral))
         }
+        HirSourceAccess::OrUnion(_) => Ok(false),
         _ => Ok(true),
     }
 }
@@ -102,10 +102,16 @@ pub(super) fn emit_delete(
             planned_loop.source, delete.target
         )));
     }
-    let HirSourceAccess::BTree { operation, .. } = &planned_loop.access else {
-        return Err(LimboError::InternalError(
-            "HIR DELETE target does not use a B-tree loop".into(),
-        ));
+    // One seek per branch of an OR term reads rows in rowid order through
+    // a row set; like legacy, the DELETE then collects its rowids first.
+    let operation = match &planned_loop.access {
+        HirSourceAccess::BTree { operation, .. } => Some(operation),
+        HirSourceAccess::OrUnion(_) => None,
+        _ => {
+            return Err(LimboError::InternalError(
+                "HIR DELETE target does not use a B-tree loop".into(),
+            ))
+        }
     };
     let hir::DeleteTargetKind::BTree {
         foreign_keys,
@@ -121,12 +127,13 @@ pub(super) fn emit_delete(
         .with_capture(program, capture_changes.as_ref())?;
     // Like legacy, a DELETE that fires triggers or foreign-key actions
     // first collects its rowids, since they can change the table.
-    let uses_rowset = uses_rowset(delete) || !triggers.is_empty() || !actions.is_empty();
+    let uses_rowset =
+        uses_rowset(delete) || !triggers.is_empty() || !actions.is_empty() || operation.is_none();
     // Same statement-journal facts as legacy: without triggers or foreign
     // keys a DELETE cannot abort, and a point lookup writes at most one row.
     // After collecting rowids, legacy treats the delete as a scan.
     let has_foreign_keys = !foreign_keys.incoming.is_empty() || !foreign_keys.outgoing.is_empty();
-    if !uses_rowset && !has_foreign_keys && touches_at_most_one_row(operation) {
+    if !uses_rowset && !has_foreign_keys && operation.is_some_and(touches_at_most_one_row) {
         program.set_multi_write(false);
     }
     program.set_may_abort(!triggers.is_empty() || has_foreign_keys);
@@ -150,6 +157,7 @@ pub(super) fn emit_delete(
             done,
         )?;
     } else {
+        let operation = operation.expect("a DELETE without a B-tree loop collects its rowids");
         emit_scan_delete(
             program,
             &target,
@@ -271,32 +279,7 @@ fn emit_rowset_delete(
             access.loops.len()
         )));
     };
-    let rowset = program.alloc_register();
-    program.emit_insn(Insn::Null {
-        dest: rowset,
-        dest_end: None,
-    });
-    let collected = program.allocate_label();
-    let prepared = prepare_hir_btree_loop(program, plan, planned_loop)?;
-    emit_access_predicates(program, document, access, None, collected)?;
-    let hir_loop = start_hir_btree_loop(program, document, &prepared, None)?;
-    emit_access_predicates(program, document, access, Some(0), hir_loop.next)?;
-    let rowid = program.alloc_register();
-    super::expr::translate_expr(
-        program,
-        document,
-        &hir::Expr::RowId(target.source.id),
-        rowid,
-    )?;
-    program.emit_insn(Insn::RowSetAdd {
-        rowset_reg: rowset,
-        value_reg: rowid,
-    });
-    close_hir_btree_loop(program, &hir_loop, &[]);
-    program.preassign_label_to_next_insn(collected);
-    for cursor in std::iter::once(prepared.cursor).chain(prepared.table_cursor) {
-        program.emit_insn(Insn::Close { cursor_id: cursor });
-    }
+    let rowset = collect_target_rowids(program, plan, target, access, planned_loop)?;
 
     let table_cursor = target.open_table_for_write(program);
     let indexes = target.open_indexes_for_write(program, None)?;
