@@ -4811,6 +4811,85 @@ fn test_vacuum_into_preserves_materialized_views(tmp_db: TempDatabase) -> anyhow
     Ok(())
 }
 
+/// A database written before materialized views over the schema table were
+/// refused must keep working. Only a new CREATE is refused: the stored view is
+/// replayed on every VACUUM, and refusing the replay would leave such a
+/// database impossible to vacuum.
+#[turso_macros::test(views)]
+fn test_vacuum_keeps_a_stored_materialized_view_over_sqlite_schema(
+    tmp_db: TempDatabase,
+) -> anyhow::Result<()> {
+    let conn = tmp_db.connect_limbo();
+    conn.execute("CREATE TABLE t(a INTEGER PRIMARY KEY, b INTEGER)")?;
+    conn.execute("CREATE TABLE u(k INTEGER PRIMARY KEY)")?;
+    conn.execute("INSERT INTO t VALUES (1, 10), (2, 20)")?;
+    // Both tables exist before the view, so the rows are the same whether the
+    // view holds what CREATE populated or what a VACUUM replay rebuilt.
+    replay_schema_statement(
+        &conn,
+        "CREATE MATERIALIZED VIEW sm AS \
+         SELECT name FROM sqlite_schema WHERE name = 't' OR name = 'u'",
+    )?;
+    conn.execute("CREATE MATERIALIZED VIEW other AS SELECT b FROM t")?;
+
+    let new_view = conn.execute("CREATE MATERIALIZED VIEW sm2 AS SELECT name FROM sqlite_schema");
+    assert!(
+        new_view.is_err(),
+        "a new materialized view over the schema table must still be refused"
+    );
+
+    let stored_view_rows = vec![
+        vec![rusqlite::types::Value::Text("t".to_string())],
+        vec![rusqlite::types::Value::Text("u".to_string())],
+    ];
+    let read_stored_view =
+        |conn: &Arc<Connection>| limbo_exec_rows(conn, "SELECT name FROM sm ORDER BY name");
+    assert_eq!(read_stored_view(&conn), stored_view_rows);
+
+    conn.execute("VACUUM")?;
+    assert_eq!(run_integrity_check(&conn), "ok");
+    assert_eq!(read_stored_view(&conn), stored_view_rows);
+
+    let dest_dir = TempDir::new()?;
+    let dest_path = dest_dir.path().join("vacuumed.db");
+    conn.execute(format!("VACUUM INTO '{}'", dest_path.to_str().unwrap()))?;
+    let (_dest_db, dest_conn) = connect_existing_with_opts(&dest_path, tmp_db.db_opts);
+    assert_eq!(run_integrity_check(&dest_conn), "ok");
+    assert_eq!(read_stored_view(&dest_conn), stored_view_rows);
+
+    conn.execute("INSERT INTO t VALUES (3, 30)")?;
+    conn.execute("DELETE FROM t WHERE a = 1")?;
+    assert_eq!(read_stored_view(&conn), stored_view_rows);
+    assert_eq!(
+        limbo_exec_rows(&conn, "SELECT b FROM other ORDER BY b"),
+        vec![
+            vec![rusqlite::types::Value::Integer(20)],
+            vec![rusqlite::types::Value::Integer(30)]
+        ]
+    );
+    assert_eq!(run_integrity_check(&conn), "ok");
+    Ok(())
+}
+
+/// Run a statement the way VACUUM replays a schema entry the database already
+/// holds: engine-internal at prepare time, an ordinary statement at step time.
+/// This is the only way to reach a view that a new CREATE refuses.
+fn replay_schema_statement(conn: &Arc<Connection>, sql: &str) -> anyhow::Result<()> {
+    conn.start_nested();
+    let stmt = conn.prepare(sql);
+    conn.end_nested();
+    let mut stmt = stmt?;
+    loop {
+        match stmt.step()? {
+            StepResult::Done => return Ok(()),
+            StepResult::IO => {
+                stmt.get_pager().io.step()?;
+            }
+            other => anyhow::bail!("replaying {sql} returned {other:?}"),
+        }
+    }
+}
+
 fn create_materialized_view_fixture(conn: &Arc<Connection>) -> anyhow::Result<()> {
     conn.execute("CREATE TABLE t(a INTEGER PRIMARY KEY, g INTEGER, b INTEGER)")?;
     conn.execute("CREATE TABLE u(k INTEGER PRIMARY KEY, n INTEGER)")?;
