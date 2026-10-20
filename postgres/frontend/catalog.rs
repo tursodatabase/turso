@@ -62,23 +62,14 @@ impl Dialect for PostgresDialect {
     fn parse_table_sql(&self, sql: &str, root_page: i64) -> Result<BTreeTable> {
         // Schema rows written by internal SQLite paths (e.g. sqlite_sequence)
         // carry no frontend marker and are plain SQLite SQL.
-        let Some(raw_sql) = decode_stored_pg_schema_sql(sql) else {
+        if decode_stored_pg_schema_sql(sql).is_none() {
             return BTreeTable::from_sql(sql, root_page);
-        };
-
-        let parse_result =
-            turso_pg_parser::parse(raw_sql).map_err(|e| LimboError::ParseError(e.to_string()))?;
-        let translator = turso_pg_parser::translator::PostgreSQLTranslator::new();
-        let stmt = translator
-            .translate(&parse_result)
-            .map_err(|e| LimboError::ParseError(e.to_string()))?;
-        match stmt {
+        }
+        match self.parse_table_sql_ast(sql)? {
             turso_parser::ast::Stmt::CreateTable { tbl_name, body, .. } => {
                 BTreeTable::from_create_table_ast(&tbl_name, &body, root_page)
             }
-            _ => Err(LimboError::ParseError(
-                "expected CREATE TABLE statement".to_string(),
-            )),
+            _ => unreachable!("parse_table_sql_ast returned a non-CREATE TABLE statement"),
         }
     }
 
@@ -96,7 +87,22 @@ impl Dialect for PostgresDialect {
             .translate(&parse_result)
             .map_err(|e| LimboError::ParseError(e.to_string()))?;
         match stmt {
-            stmt @ turso_parser::ast::Stmt::CreateTable { .. } => Ok(stmt),
+            turso_parser::ast::Stmt::CreateTable {
+                tbl_name,
+                temporary,
+                if_not_exists,
+                mut body,
+            } => {
+                if !stored_real_columns_are_float4(sql) {
+                    store_float4_columns_as_double(&mut body);
+                }
+                Ok(turso_parser::ast::Stmt::CreateTable {
+                    tbl_name,
+                    temporary,
+                    if_not_exists,
+                    body,
+                })
+            }
             _ => Err(LimboError::ParseError(
                 "expected CREATE TABLE statement".to_string(),
             )),
@@ -125,7 +131,11 @@ impl Dialect for PostgresDialect {
         // the qualifier; the canonical text round-trips through the SQLite
         // fallback in `Dialect::parse`.
         if tbl_name.db_name.take().is_none() {
-            return Ok(raw_sql.to_string());
+            if stored_real_columns_are_float4(sql) {
+                return Ok(raw_sql.to_string());
+            }
+            return turso_pg_parser::declare_real_columns_as_double_precision(raw_sql)
+                .map_err(|e| LimboError::ParseError(e.to_string()));
         }
 
         Ok(turso_parser::ast::Stmt::CreateTable {
@@ -171,12 +181,37 @@ impl Dialect for PostgresDialect {
     }
 }
 
+const REAL_IS_FLOAT4_MARKER: &str = "/* real:float4 */ ";
+
 pub fn encode_pg_schema_sql(sql: &str) -> String {
-    format!("{POSTGRES_TABLE_SQL_PREFIX}{sql}")
+    format!("{POSTGRES_TABLE_SQL_PREFIX}{REAL_IS_FLOAT4_MARKER}{sql}")
 }
 
 pub fn decode_stored_pg_schema_sql(sql: &str) -> Option<&str> {
+    let raw_sql = sql.strip_prefix(POSTGRES_TABLE_SQL_PREFIX)?;
+    Some(
+        raw_sql
+            .strip_prefix(REAL_IS_FLOAT4_MARKER)
+            .unwrap_or(raw_sql),
+    )
+}
+
+fn stored_real_columns_are_float4(sql: &str) -> bool {
     sql.strip_prefix(POSTGRES_TABLE_SQL_PREFIX)
+        .is_some_and(|raw_sql| raw_sql.starts_with(REAL_IS_FLOAT4_MARKER))
+}
+
+fn store_float4_columns_as_double(body: &mut turso_parser::ast::CreateTableBody) {
+    let turso_parser::ast::CreateTableBody::ColumnsAndConstraints { columns, .. } = body else {
+        return;
+    };
+    for column in columns {
+        if let Some(col_type) = column.col_type.as_mut() {
+            if col_type.name.eq_ignore_ascii_case("float4") {
+                col_type.name = "REAL".to_string();
+            }
+        }
+    }
 }
 
 /// Returns an iterator of (table_name, table_ref) for user tables in deterministic order.

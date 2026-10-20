@@ -308,6 +308,7 @@ expect {
     bytea(value blob)|blob||||'<'
     cidr(value text)|text|value|value||
     date(value text)|text|CASE WHEN value IS NULL THEN NULL WHEN date (value) IS NULL THEN RAISE (ABORT, 'invalid date value') ELSE date (value) END|value||'+' date_plus, '-' date_minus, '<'
+    float4(value real)|real|float4_encode (value)|value||'<'
     inet(value text)|text|validate_ipaddr (value)|value||
     json(value text)|text|json (value)|value||
     jsonb(value text)|blob|jsonb (value)|json (value)||
@@ -342,6 +343,7 @@ expect {
     bytea(value blob)|blob||||'<'
     cidr(value text)|text|value|value||
     date(value text)|text|CASE WHEN value IS NULL THEN NULL WHEN date (value) IS NULL THEN RAISE (ABORT, 'invalid date value') ELSE date (value) END|value||'+' date_plus, '-' date_minus, '<'
+    float4(value real)|real|float4_encode (value)|value||'<'
     inet(value text)|text|validate_ipaddr (value)|value||
     json(value text)|text|json (value)|value||
     jsonb(value text)|blob|jsonb (value)|json (value)||
@@ -1899,4 +1901,30 @@ test filter-numeric-group-concat {
 }
 expect {
     Alice,Carol
+}
+
+test float4-cast-rejects-nan-text {
+    SELECT CAST('nan' AS float4);
+}
+expect error {
+}
+
+test float4-cast-rejects-text-with-trailing-characters {
+    SELECT CAST('1.5abc' AS float4);
+}
+expect error {
+}
+
+test float4-cast-keeps-value-when-shortest-text-converts-to-another-float {
+    SELECT CAST(CAST(7.038530691851209e-26 AS float4) AS float4) = CAST(7.038530691851209e-26 AS float4);
+}
+expect {
+    1
+}
+
+test float4-cast-stores-shortest-decimal-in-every-context {
+    SELECT CAST(0.1 AS float4) = 0.1, CAST(1.0/3 AS float4), CAST(CAST(0.1 AS float4) AS REAL), CAST(CAST(0.1 AS float4) AS TEXT);
+}
+expect {
+    1|0.33333334|0.1|0.1
 }

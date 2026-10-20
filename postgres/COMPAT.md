@@ -113,8 +113,8 @@ implemented.
 
 Type mapping: serial/smallserial/bigserial (and serial2/4/8) become
 `INTEGER NOT NULL DEFAULT nextval(...)` with an implicit sequence. boolean,
-smallint, bigint, uuid, date, time, timestamp[tz], bytea, json, jsonb, inet,
-cidr, macaddr, macaddr8 map to Turso custom types. varchar(n)/char(n) and
+smallint, bigint, real/float4, uuid, date, time, timestamp[tz], bytea, json,
+jsonb, inet, cidr, macaddr, macaddr8 map to Turso custom types. varchar(n)/char(n) and
 numeric(p,s) keep their type modifiers. interval, xml, tsvector/tsquery,
 bit/varbit, geometric types degrade to TEXT; money to REAL; OID/reg* types to
 INTEGER. Unknown type names pass through as custom types.
@@ -130,6 +130,7 @@ INTEGER. Unknown type names pass through as custom types.
 | NULLs in Array | ✅ Supported | `ARRAY[1, NULL, 3]` round-trips |
 | Phrase search | ❌ Not supported | tsvector/tsquery degrade to TEXT; no full-text search |
 | Range types | ❌ Not supported | |
+| real/float4 data type | 🟡 Partial | Values are rounded to single precision when written or cast and stored as the double with the same shortest decimal text, so 1.0/3 is stored as 0.33333334 and every context sees that decimal: columns, arrays, `::text`, `\|\|`, concat(), format(), `::numeric` and `::float8` all give 0.33333334. Differences from PostgreSQL: PostgreSQL widens a real to float8 with its exact binary value, so `0.1::real::float8` is 0.10000000149011612 there and 0.1 here; for the same reason arithmetic and comparisons with float8 differ in the low digits (`a*3` of 1.0/3 is 1.0000000199999999 here and 1.0000000298023224 in PostgreSQL, and `a = 0.1` matches a real column holding 0.1 here but not in PostgreSQL); `a::numeric` keeps the shortest decimal (0.33333334) where PostgreSQL rounds to 6 digits (0.333333). real columns in tables created by earlier tursopg versions keep storing doubles. The text inputs 'Infinity', '-Infinity' and 'NaN' are rejected with an error (double precision turns them into 0) |
 | smallserial type | ✅ Supported | serial2/serial4/serial8 aliases too; serial implies NOT NULL + implicit sequence, not PRIMARY KEY |
 | Type modifier support | ✅ Supported | varchar(n) length enforced ("value too long for varchar"); numeric(p,s) scale applied |
 | UUIDv7 | ❌ Not supported | |

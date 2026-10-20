@@ -197,3 +197,187 @@ test table-cast-timestamp-column-to-date-and-time {
 expect {
     2024-01-15|10:30:00
 }
+
+test table-real-column-rounds-to-single-precision {
+    CREATE TABLE t (a real, b float4, c double precision);
+    INSERT INTO t VALUES (1.0/3, 0.1, 1.0/3);
+    SELECT a, b, c FROM t;
+}
+expect {
+    0.33333334|0.1|0.3333333333333333
+}
+
+test table-real-cast-rounds-to-single-precision {
+    SELECT (1.0/3)::real, CAST(1.0/3 AS float4), float4(1.0/3), 0.1::real;
+}
+expect {
+    0.33333334|0.33333334|0.33333334|0.1
+}
+
+test table-real-cast-out-of-range {
+    SELECT 1e300::real;
+}
+expect error {}
+
+test table-real-cast-rejects-text-that-is-not-a-number {
+    SELECT '1.5abc'::real;
+}
+expect error {}
+
+test table-real-expressions-print-as-single-precision {
+    CREATE TABLE t (a real);
+    INSERT INTO t VALUES (0.1), (1.0/3);
+    SELECT max(a), min(a), coalesce(min(a), 0) FROM t;
+}
+expect {
+    0.33333334|0.1|0.1
+}
+
+test table-real-subquery-column-prints-as-single-precision {
+    CREATE TABLE t (a real);
+    INSERT INTO t VALUES (1.0/3);
+    WITH c AS (SELECT a FROM t) SELECT s.a, c.a FROM (SELECT a FROM t) s, c;
+}
+expect {
+    0.33333334|0.33333334
+}
+
+test table-coalesce-of-real-and-double-prints-as-double {
+    CREATE TABLE t (a real, f double precision);
+    INSERT INTO t VALUES (NULL, 1.0/3);
+    SELECT coalesce(a, f), coalesce(f, a) FROM t;
+}
+expect {
+    0.3333333333333333|0.3333333333333333
+}
+
+test table-custom-type-array-column-with-where-filter {
+    CREATE TABLE t (a int, b real[], c smallint[]);
+    INSERT INTO t VALUES (1, ARRAY[0.5], ARRAY[2]);
+    SELECT b, c FROM t WHERE a < 5;
+}
+expect {
+    {0.5}|{2}
+}
+
+test table-real-to-numeric-keeps-single-precision-text {
+    CREATE TABLE t (a real);
+    INSERT INTO t VALUES (0.1);
+    SELECT a::numeric FROM t;
+}
+expect {
+    0.1
+}
+
+test table-real-converts-to-double-the-same-way-everywhere {
+    CREATE TABLE t (a real);
+    INSERT INTO t VALUES (0.1);
+    SELECT count(*) FROM t
+     WHERE a::float8 = (SELECT a FROM t)::float8
+       AND a * 3 = a::float8 * 3
+       AND (-a)::float8 = -(a::float8);
+}
+expect {
+    1
+}
+
+test table-real-expressions-print-like-postgres {
+    CREATE TABLE t (a real);
+    INSERT INTO t VALUES (0.1);
+    SELECT a * 2, a + 0, CASE WHEN true THEN a END, greatest(a, a), (SELECT a FROM t) FROM t;
+}
+expect {
+    0.2|0.1|0.1|0.1|0.1
+}
+
+test table-real-to-text-prints-as-single-precision {
+    CREATE TABLE t (a real);
+    INSERT INTO t VALUES (0.1), (1.0/3);
+    SELECT a::text, a || '', concat(a, ''), format('%s', a) FROM t;
+}
+expect {
+    0.1|0.1|0.1|0.1
+    0.33333334|0.33333334|0.33333334|0.33333334
+}
+
+test table-real-array-prints-as-single-precision {
+    CREATE TABLE t (a real[]);
+    INSERT INTO t VALUES (ARRAY[0.1, 1.0/3]);
+    SELECT a, a[1] FROM t;
+}
+expect {
+    {0.1,0.33333334}|0.1
+}
+
+test table-create-table-as-of-real-column-prints-as-single-precision {
+    CREATE TABLE t (a real);
+    INSERT INTO t VALUES (0.1), (1.0/3);
+    CREATE TABLE u AS SELECT a FROM t;
+    SELECT a FROM u;
+}
+expect {
+    0.1
+    0.33333334
+}
+
+test table-real-union-double-prints-as-double {
+    CREATE TABLE t (a real, f double precision);
+    INSERT INTO t VALUES (0.5, 1.0/3);
+    SELECT a FROM t UNION ALL SELECT f FROM t;
+}
+expect {
+    0.5
+    0.3333333333333333
+}
+
+test table-real-union-double-expression-prints-as-double {
+    CREATE TABLE t (a real, f double precision);
+    INSERT INTO t VALUES (0.5, 1.0/3);
+    SELECT a FROM t UNION ALL SELECT abs(f) FROM t;
+}
+expect {
+    0.5
+    0.3333333333333333
+}
+
+test table-real-union-real-prints-as-real {
+    CREATE TABLE t (a real, b real);
+    INSERT INTO t VALUES (1.0/3, 0.1);
+    SELECT a FROM t UNION ALL SELECT b FROM t;
+}
+expect {
+    0.33333334
+    0.1
+}
+
+test table-boolean-union-literals-prints-as-boolean {
+    CREATE TABLE t (b boolean);
+    INSERT INTO t VALUES (true);
+    SELECT b FROM t UNION ALL SELECT NULL UNION ALL SELECT false;
+}
+expect {
+    t
+
+    f
+}
+
+test table-real-union-literal-out-of-range {
+    CREATE TABLE t (a real);
+    INSERT INTO t VALUES (0.5);
+    SELECT a FROM t UNION ALL SELECT 1e300;
+}
+expect error {}
+
+test table-real-coalesce-literal-out-of-range {
+    CREATE TABLE t (a real);
+    INSERT INTO t VALUES (NULL);
+    SELECT coalesce(a, 1e300) FROM t;
+}
+expect error {}
+
+test table-real-union-literal-underflow {
+    CREATE TABLE t (a real);
+    INSERT INTO t VALUES (0.5);
+    SELECT a FROM t UNION ALL SELECT 1e-50;
+}
+expect error {}

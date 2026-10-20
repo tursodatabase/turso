@@ -178,7 +178,7 @@ impl TempDatabaseBuilder {
             connection
                 .pragma_update(None, "journal_mode", "wal")
                 .unwrap();
-            connection.execute(init_sql, ()).unwrap();
+            connection.execute_batch(init_sql).unwrap();
         }
 
         let io = Arc::new(TestIo {

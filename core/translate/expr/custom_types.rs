@@ -1,4 +1,5 @@
 use super::*;
+use crate::translate::plan::{Plan, SelectPlan};
 
 /// Map an AST operator to the string representation used in custom type operator definitions.
 pub(super) fn operator_to_str(op: &ast::Operator) -> Option<&'static str> {
@@ -150,6 +151,80 @@ pub(super) fn expr_custom_type_info(
         });
     }
     None
+}
+
+pub(crate) fn expr_source_column<'a>(
+    expr: &'a ast::Expr,
+    referenced_tables: &'a TableReferences,
+) -> Option<(&'a Column, &'a Table)> {
+    match expr {
+        ast::Expr::Column { table, column, .. } => {
+            let (_, table) = referenced_tables.find_table_by_internal_id(*table)?;
+            if let Table::FromClauseSubquery(subquery) = table {
+                if let Some(source) = plan_output_source_column(&subquery.plan, *column) {
+                    return Some(source);
+                }
+            }
+            Some((table.get_column_at(*column)?, table))
+        }
+        ast::Expr::FunctionCall { name, args, .. } => match name.as_str().to_lowercase().as_str() {
+            "min" | "max" if args.len() == 1 => expr_source_column(&args[0], referenced_tables),
+            "nullif" => expr_source_column(args.first()?, referenced_tables),
+            "coalesce" | "ifnull" => same_source_column(
+                args.iter()
+                    .filter(|arg| !is_null_or_number_literal(arg))
+                    .map(|arg| expr_source_column(arg, referenced_tables)),
+            ),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+fn plan_output_source_column(plan: &Plan, column: usize) -> Option<(&Column, &Table)> {
+    match plan {
+        Plan::Select(select) => select_output_source_column(select, column),
+        Plan::CompoundSelect {
+            left, right_most, ..
+        } => same_source_column(
+            left.iter()
+                .map(|(select, _)| select)
+                .chain(std::iter::once(right_most.as_ref()))
+                .map(|select| select_output_source_column(select, column)),
+        ),
+        Plan::RecursiveCte(_) | Plan::Delete(_) | Plan::Update(_) => None,
+    }
+}
+
+fn select_output_source_column(select: &SelectPlan, column: usize) -> Option<(&Column, &Table)> {
+    expr_source_column(
+        &select.result_columns.get(column)?.expr,
+        &select.table_references,
+    )
+}
+
+fn is_null_or_number_literal(expr: &ast::Expr) -> bool {
+    matches!(
+        expr,
+        ast::Expr::Literal(ast::Literal::Null | ast::Literal::Numeric(_))
+    )
+}
+
+fn same_source_column<'a>(
+    sources: impl Iterator<Item = Option<(&'a Column, &'a Table)>>,
+) -> Option<(&'a Column, &'a Table)> {
+    let mut first: Option<(&Column, &Table)> = None;
+    for source in sources {
+        let (column, table) = source?;
+        match first {
+            None => first = Some((column, table)),
+            Some((first_column, first_table))
+                if first_column.ty_str.eq_ignore_ascii_case(&column.ty_str)
+                    && first_table.is_strict() == table.is_strict() => {}
+            Some(_) => return None,
+        }
+    }
+    first
 }
 
 /// Get the effective type name of a literal expression.

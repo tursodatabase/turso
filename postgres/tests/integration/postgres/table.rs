@@ -316,3 +316,73 @@ fn test_postgres_select_into_compound_rejected(db: TempDatabase) {
         "expected nested INTO rejection, got: {err}"
     );
 }
+
+#[test]
+fn test_real_column_created_before_float4_stores_doubles() {
+    let db = TempDatabase::builder()
+        .with_init_sql(
+            "CREATE TABLE t(a REAL) STRICT;
+             INSERT INTO t VALUES (1.0 / 3);
+             PRAGMA writable_schema = ON;
+             UPDATE sqlite_schema
+                SET sql = '/* turso_frontend:postgres */ CREATE TABLE t (a real)'
+              WHERE name = 't';",
+        )
+        .build();
+    let conn = db.connect_postgres();
+    let double = 1.0 / 3.0;
+    let single = 0.33333334;
+
+    conn.execute("INSERT INTO t VALUES (1.0/3)").unwrap();
+    conn.execute("CREATE TABLE n (a real)").unwrap();
+    conn.execute("INSERT INTO n VALUES (1.0/3)").unwrap();
+    assert_eq!(query_floats(&conn, "SELECT a FROM t"), vec![double, double]);
+    assert_eq!(query_floats(&conn, "SELECT a FROM n"), vec![single]);
+}
+
+#[test]
+fn test_vacuum_into_keeps_real_column_created_before_float4_as_double() {
+    let db = TempDatabase::builder()
+        .with_init_sql(
+            "CREATE TABLE t(a REAL) STRICT;
+             PRAGMA writable_schema = ON;
+             UPDATE sqlite_schema
+                SET sql = '/* turso_frontend:postgres */ CREATE TABLE t (a real)'
+              WHERE name = 't';",
+        )
+        .build();
+    db.connect_postgres()
+        .execute("CREATE TABLE n (a real)")
+        .unwrap();
+    let copy_path = db.path.with_file_name("vacuum-copy.db");
+    db.connect_limbo()
+        .execute(format!("VACUUM INTO '{}'", copy_path.display()))
+        .unwrap();
+
+    let copy = turso_pg::open_database_with_io(
+        db.io.clone(),
+        copy_path.to_str().unwrap(),
+        turso_core::OpenFlags::default(),
+        turso_core::DatabaseOpts::new()
+            .with_encryption(true)
+            .with_custom_types(true),
+    )
+    .unwrap();
+    let conn = turso_pg::Connection::connect(&copy).unwrap();
+    conn.execute("INSERT INTO t VALUES (1.0/3)").unwrap();
+    conn.execute("INSERT INTO n VALUES (1.0/3)").unwrap();
+    assert_eq!(query_floats(&conn, "SELECT a FROM t"), vec![1.0 / 3.0]);
+    assert_eq!(query_floats(&conn, "SELECT a FROM n"), vec![0.33333334]);
+}
+
+fn query_floats(conn: &turso_pg::PgConnection, sql: &str) -> Vec<f64> {
+    let mut rows = conn.query(sql).unwrap().unwrap();
+    let mut values = Vec::new();
+    while let StepResult::Row = rows.step().unwrap() {
+        match rows.row().unwrap().get_value(0) {
+            Value::Numeric(Numeric::Float(f)) => values.push(f64::from(*f)),
+            other => panic!("expected float, got {other:?} for: {sql}"),
+        }
+    }
+    values
+}

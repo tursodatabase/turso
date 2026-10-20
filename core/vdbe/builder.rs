@@ -246,6 +246,7 @@ pub struct ProgramBuilder {
     explain: ExplainInfo,
     pub parameters: Parameters,
     pub result_columns: Vec<ResultSetColumn>,
+    pub compound_arm_result_columns: Vec<Vec<ResultSetColumn>>,
     /// Instruction, the function to execute it with, and its original index in the vector.
     pub insns: Vec<(Insn, usize)>,
     /// Registry of materialized CTEs, keyed by cte_id.
@@ -739,6 +740,7 @@ impl ProgramBuilder {
             explain: ExplainInfo::default(),
             parameters: Parameters::new(),
             result_columns: Vec::new(),
+            compound_arm_result_columns: Vec::new(),
             table_references: TableReferences::new(vec![], vec![]),
             collation: None,
             nested_level: 0,
@@ -2433,6 +2435,7 @@ impl ProgramBuilder {
             change_cnt_on,
             readonly: self.flags.readonly(),
             result_columns: self.result_columns,
+            compound_arm_result_columns: self.compound_arm_result_columns,
             table_references: self.table_references,
             sql: sql.to_string(),
             refreshes_analyze_stats: sql

@@ -94,12 +94,18 @@ impl StatementOrigin {
 /// (`"INTEGER"`, `"TEXT"`, `"REAL"`). For a typed expression — CAST, rowid,
 /// or anything else SQLite's affinity rules can pin down — it's the
 /// inferred primitive. In both cases `array_dimensions` is `0`, `base_type`
-/// is `None`, and `kind` is [`ColumnTypeKind::Builtin`]. When neither path
+/// is `None`, and `kind` is [`ColumnTypeKind::Builtin`]. A CAST to a
+/// non-parametric `CREATE TYPE` / `CREATE DOMAIN` is reported like a column of
+/// that type. When neither path
 /// produces a usable primitive (binary arithmetic that SQLite refuses to
 /// propagate through, BLOB literals, NULL literals, function calls without
 /// declared return affinity), `get_column_type_info` returns `Ok(None)`
 /// rather than fabricating a name — callers can fall through to their own
 /// default.
+///
+/// For a compound SELECT, a custom type is reported only when every SELECT
+/// that is not a literal gives the same type.
+/// Otherwise the column is reported as the custom type's primitive.
 ///
 /// New fields may be added over time; the struct is marked
 /// `#[non_exhaustive]` so consumers must use struct-update or accessor
@@ -1343,26 +1349,47 @@ impl Statement {
         let Some(column) = self.program.result_columns.get(idx) else {
             return Ok(None);
         };
-        // Direct table-column reference: pull declared name, array depth, and
-        // any registered CREATE TYPE / CREATE DOMAIN resolution out of the
+        match self.result_column_type_info(column) {
+            Some(info) if info.kind != ColumnTypeKind::Builtin => {
+                let all_arms_have_same_type = self
+                    .program
+                    .compound_arm_result_columns
+                    .iter()
+                    .filter_map(|arm_columns| arm_columns.get(idx))
+                    .filter(|arm_column| {
+                        !matches!(arm_column.expr, turso_parser::ast::Expr::Literal(_))
+                    })
+                    .all(|arm_column| {
+                        self.result_column_type_info(arm_column)
+                            .is_some_and(|other| same_column_type(&info, &other))
+                    });
+                if all_arms_have_same_type {
+                    Ok(Some(info))
+                } else {
+                    Ok(info.base_type.map(|base_type| ColumnTypeInfo {
+                        declared_name: base_type,
+                        array_dimensions: info.array_dimensions,
+                        base_type: None,
+                        kind: ColumnTypeKind::Builtin,
+                    }))
+                }
+            }
+            info => Ok(info),
+        }
+    }
+
+    fn result_column_type_info(
+        &self,
+        column: &crate::translate::plan::ResultSetColumn,
+    ) -> Option<ColumnTypeInfo> {
+        // A table column, or an expression that returns a table column's
+        // value unchanged: pull declared name, array depth, and any
+        // registered CREATE TYPE / CREATE DOMAIN resolution out of the
         // schema. Anything else falls through to the expression-affinity
         // inference path below.
-        if let turso_parser::ast::Expr::Column {
-            table,
-            column: column_idx,
-            ..
-        } = &column.expr
+        if let Some((table_column, table_ref)) =
+            crate::translate::expr::expr_source_column(&column.expr, &self.program.table_references)
         {
-            let Some((_, table_ref)) = self
-                .program
-                .table_references
-                .find_table_by_internal_id(*table)
-            else {
-                return Ok(None);
-            };
-            let Some(table_column) = table_ref.get_column_at(*column_idx) else {
-                return Ok(None);
-            };
             let declared_name = table_column.ty_str.clone();
             let array_dimensions = table_column.array_dimensions();
             let schema = self.program.connection.schema.read();
@@ -1370,49 +1397,53 @@ impl Statement {
                 .resolve_type(&declared_name, table_ref.is_strict())
                 .ok()
                 .flatten();
-            // `kind` is computed from the leaf TypeDef in the resolution chain:
-            // STRUCT and UNION are tagged on `TypeDefKind`, DOMAIN is tagged
-            // separately on `TypeDef.is_domain`, and anything else registered
-            // through CREATE TYPE is a Custom. A column whose declared name
-            // does not appear in the type registry is a Builtin.
+            // A column whose declared name does not appear in the type
+            // registry is a Builtin.
             let (base_type, kind) = match resolved {
-                Some(resolved) => {
-                    let leaf = resolved.leaf();
-                    let kind = if leaf.is_struct() {
-                        ColumnTypeKind::Struct
-                    } else if leaf.is_union() {
-                        ColumnTypeKind::Union
-                    } else if leaf.is_domain {
-                        ColumnTypeKind::Domain
-                    } else {
-                        ColumnTypeKind::Custom
-                    };
-                    (Some(resolved.primitive.to_uppercase()), kind)
-                }
+                Some(resolved) => (
+                    Some(resolved.primitive.to_uppercase()),
+                    custom_type_kind(&resolved),
+                ),
                 None => (None, ColumnTypeKind::Builtin),
             };
             drop(schema);
-            return Ok(Some(ColumnTypeInfo {
+            return Some(ColumnTypeInfo {
                 declared_name,
                 array_dimensions,
                 base_type,
                 kind,
-            }));
+            });
+        }
+        if let turso_parser::ast::Expr::Cast {
+            type_name: Some(type_name),
+            ..
+        } = &column.expr
+        {
+            let schema = self.program.connection.schema.read();
+            if let Some(resolved) = schema
+                .resolve_type_unchecked(&type_name.name)
+                .ok()
+                .flatten()
+                .filter(|resolved| resolved.leaf().user_params().next().is_none())
+            {
+                return Some(ColumnTypeInfo {
+                    declared_name: type_name.name.clone(),
+                    array_dimensions: type_name.array_dimensions,
+                    base_type: Some(resolved.primitive.to_uppercase()),
+                    kind: custom_type_kind(&resolved),
+                });
+            }
         }
         // Not a table column: infer the result primitive from the
         // expression's shape (literal value type, operand types of a binary
         // op, the CAST target, etc.).
-        let Some(name) =
-            infer_expression_primitive(&column.expr, Some(&self.program.table_references))
-        else {
-            return Ok(None);
-        };
-        Ok(Some(ColumnTypeInfo {
+        let name = infer_expression_primitive(&column.expr, Some(&self.program.table_references))?;
+        Some(ColumnTypeInfo {
             declared_name: name.to_string(),
             array_dimensions: 0,
             base_type: None,
             kind: ColumnTypeKind::Builtin,
-        }))
+        })
     }
 
     /// Returns the type affinity name of a result column (e.g., "INTEGER", "TEXT", "REAL", "BLOB", "NUMERIC").
@@ -1802,6 +1833,24 @@ impl Statement {
     /// Prefer to use helper methods instead such as [Self::run_with_row_callback]
     pub fn _io(&self) -> &dyn crate::IO {
         self.pager.io.as_ref()
+    }
+}
+
+fn same_column_type(a: &ColumnTypeInfo, b: &ColumnTypeInfo) -> bool {
+    a.declared_name.eq_ignore_ascii_case(&b.declared_name)
+        && a.array_dimensions == b.array_dimensions
+}
+
+fn custom_type_kind(resolved: &crate::schema::ResolvedType) -> ColumnTypeKind {
+    let leaf = resolved.leaf();
+    if leaf.is_struct() {
+        ColumnTypeKind::Struct
+    } else if leaf.is_union() {
+        ColumnTypeKind::Union
+    } else if leaf.is_domain {
+        ColumnTypeKind::Domain
+    } else {
+        ColumnTypeKind::Custom
     }
 }
 

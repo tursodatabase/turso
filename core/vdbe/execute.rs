@@ -11,7 +11,7 @@ use crate::mvcc::database::{
     BootstrapState, CheckpointReadLockState, CheckpointStateMachine, TxID,
 };
 use crate::mvcc::MvccClock;
-use crate::numeric::Numeric;
+use crate::numeric::{str_to_f64, Numeric, StrToF64};
 use crate::schema::{
     render_gencol_expr_sql_with_new_names, FromDefinitionFlags, Schema, Table, EXPR_INDEX_SENTINEL,
     SCHEMA_TABLE_NAME,
@@ -11388,6 +11388,52 @@ pub fn op_function(
                 };
                 state.registers[*dest].set_value(result);
             }
+            ScalarFunc::Float4Encode => {
+                check_arg_count!(arg_count, 1);
+                let double = match state.registers[*start_reg].get_value() {
+                    Value::Null => None,
+                    Value::Numeric(Numeric::Integer(i)) => Some(*i as f64),
+                    Value::Numeric(Numeric::Float(f)) => Some(f64::from(*f)),
+                    Value::Text(t) => match str_to_f64(&t.value) {
+                        Some(parsed @ (StrToF64::Fractional(_) | StrToF64::Decimal(_))) => {
+                            Some(f64::from(parsed))
+                        }
+                        _ => {
+                            return Err(LimboError::Constraint(format!(
+                                "invalid input syntax for type real: \"{}\"",
+                                t.value
+                            ))
+                            .into());
+                        }
+                    },
+                    other => {
+                        return Err(LimboError::Constraint(format!(
+                            "invalid input syntax for type real: \"{other}\""
+                        ))
+                        .into());
+                    }
+                };
+                let result = match double {
+                    None => Value::Null,
+                    Some(double) => {
+                        let single = double as f32;
+                        if single.is_infinite() && double.is_finite() {
+                            return Err(LimboError::Constraint(
+                                "value out of range: overflow".to_string(),
+                            )
+                            .into());
+                        }
+                        if single == 0.0 && double != 0.0 {
+                            return Err(LimboError::Constraint(
+                                "value out of range: underflow".to_string(),
+                            )
+                            .into());
+                        }
+                        Value::from_f64(float4_as_shortest_double(single))
+                    }
+                };
+                state.registers[*dest].set_value(result);
+            }
             ScalarFunc::NumericEncode => {
                 check_arg_count!(arg_count, 3);
                 let val = &state.registers[*start_reg];
@@ -12452,6 +12498,21 @@ pub fn op_function(
     }
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
+}
+
+fn float4_as_shortest_double(single: f32) -> f64 {
+    if !single.is_finite() {
+        return f64::from(single);
+    }
+    let shortest: f64 = single
+        .to_string()
+        .parse()
+        .expect("the decimal text of a finite f32 is a valid f64");
+    if shortest as f32 == single {
+        shortest
+    } else {
+        f64::from(single)
+    }
 }
 
 pub(crate) type OpAttachState = crate::connection::AttachDatabaseState;

@@ -9,7 +9,9 @@ use crate::translate::emitter::{
 use crate::translate::eqp::{EqpCompoundOp, EqpDetail, EqpSortMethod};
 use crate::translate::expr::translate_expr;
 use crate::translate::order_by::{custom_type_comparator, sorter_insert};
-use crate::translate::plan::{CompoundOrderByKey, Plan, QueryDestination, SelectPlan};
+use crate::translate::plan::{
+    CompoundOrderByKey, Plan, QueryDestination, ResultSetColumn, SelectPlan,
+};
 use crate::translate::result_row::emit_columns_to_destination;
 use crate::vdbe::builder::{CursorType, ProgramBuilder};
 use crate::vdbe::insn::{Insn, SorterOpenData};
@@ -175,6 +177,14 @@ pub fn emit_program_for_compound_select(
     // `emit_compound_select` finishes — emission of nested subqueries (e.g. IN-subqueries)
     // calls `emit_program_for_select`, which clobbers `program.result_columns`.
     let leftmost_result_columns = left[0].0.result_columns.clone();
+    let other_arm_result_columns: Option<Vec<Vec<ResultSetColumn>>> =
+        matches!(real_query_destination, QueryDestination::ResultRows).then(|| {
+            left[1..]
+                .iter()
+                .map(|(select, _)| select.result_columns.clone())
+                .chain(std::iter::once(right_most.result_columns.clone()))
+                .collect()
+        });
 
     // These must also be set because we make the decision to start a transaction based on whether
     // any tables are actually touched by the query. Previously this only used the rightmost subselect's
@@ -223,6 +233,9 @@ pub fn emit_program_for_compound_select(
     // so `column_count`/column metadata reflect the compound query, and so that the
     // ORDER BY emitter below sees the correct columns.
     program.result_columns = leftmost_result_columns;
+    if let Some(other_arm_result_columns) = other_arm_result_columns {
+        program.compound_arm_result_columns = other_arm_result_columns;
+    }
 
     // When ORDER BY is present, sort the collected results and emit to the real destination.
     if let (Some(order_by), Some(collection_cursor_id), Some(collection_idx)) =

@@ -560,6 +560,9 @@ fn encode_value(
                     .map_err(|e| turso_core::LimboError::InternalError(e.to_string()))
             }
         }
+        Value::Numeric(turso_core::Numeric::Float(f)) if *pg_type == Type::FLOAT4 => encoder
+            .encode_field(&double_to_float4(f64::from(*f))?)
+            .map_err(|e| turso_core::LimboError::InternalError(e.to_string())),
         Value::Numeric(turso_core::Numeric::Float(f)) => encoder
             .encode_field(&f64::from(*f))
             .map_err(|e| turso_core::LimboError::InternalError(e.to_string())),
@@ -602,13 +605,25 @@ fn encode_value(
     }
 }
 
+fn double_to_float4(double: f64) -> turso_core::Result<f32> {
+    let single = double as f32;
+    if (single.is_infinite() && double.is_finite()) || (single == 0.0 && double != 0.0) {
+        return Err(turso_core::LimboError::Constraint(format!(
+            "\"{double}\" is out of range for type real"
+        )));
+    }
+    Ok(single)
+}
+
 fn sqlite_type_to_pg_type(type_str: &str) -> Type {
     let upper = type_str.to_uppercase();
     match upper.as_str() {
         "INTEGER" | "INT" | "INT4" | "SMALLINT" | "INT2" | "SERIAL" | "SMALLSERIAL" => Type::INT4,
         "BIGINT" | "INT8" | "BIGSERIAL" => Type::INT8,
-        "REAL" | "FLOAT" | "FLOAT4" | "FLOAT8" | "DOUBLE" | "DOUBLE PRECISION" | "NUMERIC"
-        | "DECIMAL" => Type::FLOAT8,
+        "FLOAT4" => Type::FLOAT4,
+        "REAL" | "FLOAT" | "FLOAT8" | "DOUBLE" | "DOUBLE PRECISION" | "NUMERIC" | "DECIMAL" => {
+            Type::FLOAT8
+        }
         "TEXT" | "VARCHAR" | "CHAR" | "CHARACTER VARYING" | "CHARACTER" | "NAME" => Type::TEXT,
         "BLOB" | "BYTEA" => Type::BYTEA,
         "BOOLEAN" | "BOOL" => Type::BOOL,
@@ -979,6 +994,7 @@ mod tests {
         assert_eq!(sqlite_type_to_pg_type("BIGINT"), Type::INT8);
         assert_eq!(sqlite_type_to_pg_type("INT8"), Type::INT8);
         assert_eq!(sqlite_type_to_pg_type("REAL"), Type::FLOAT8);
+        assert_eq!(sqlite_type_to_pg_type("float4"), Type::FLOAT4);
         assert_eq!(sqlite_type_to_pg_type("TEXT"), Type::TEXT);
         assert_eq!(sqlite_type_to_pg_type("BLOB"), Type::BYTEA);
         assert_eq!(sqlite_type_to_pg_type("BOOLEAN"), Type::BOOL);
