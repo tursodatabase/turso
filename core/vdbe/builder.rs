@@ -517,11 +517,11 @@ pub struct MaterializedCteInfo {
     /// calls it before `OpenDup`, because the first reference can be on a path
     /// that never runs. A CTE that reads an outer row is never shared, so each of
     /// its references fills its own table.
-    pub fill_subroutine: CteFillSubroutine,
+    pub fill_subroutine: Subroutine,
 }
 
 #[derive(Debug, Clone, Copy)]
-pub struct CteFillSubroutine {
+pub struct Subroutine {
     pub label: BranchOffset,
     pub return_reg: usize,
 }

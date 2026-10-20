@@ -19,8 +19,8 @@ use super::{
         ConditionMetadata, NoConstantOptReason,
     },
     plan::{
-        Aggregate, Distinctness, NonFromClauseSubquery, SelectPlan, SubqueryEvalPhase,
-        TableReferences,
+        Aggregate, Distinctness, EvalAt, NonFromClauseSubquery, SelectPlan, SubqueryEvalPhase,
+        SubqueryOrigin, SubqueryState, TableReferences,
     },
     result_row::emit_select_result,
     subquery::emit_non_from_clause_subqueries_for_phase,
@@ -149,6 +149,24 @@ pub fn emit_ungrouped_aggregation<'a>(
                             },
                         });
                     }
+                }
+            }
+        }
+        // A result column subquery that runs inside the loop last ran for a
+        // row that never reached the aggregate. Run it again so that it reads
+        // the NULL row too.
+        for subquery in output_subqueries.iter() {
+            if let SubqueryState::Evaluated {
+                evaluated_at: EvalAt::Loop(_),
+                subroutine: Some(subroutine),
+                ..
+            } = &subquery.state
+            {
+                if subquery.origin == SubqueryOrigin::SelectList {
+                    program.emit_insn(Insn::Gosub {
+                        target_pc: subroutine.label,
+                        return_reg: subroutine.return_reg,
+                    });
                 }
             }
         }

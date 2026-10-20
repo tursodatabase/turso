@@ -21,7 +21,7 @@ use crate::{
     util::exprs_are_equivalent,
     vdbe::{
         affinity::{self, Affinity},
-        builder::{CursorKey, CursorType, ProgramBuilder},
+        builder::{CursorKey, CursorType, ProgramBuilder, Subroutine},
         insn::{HashDistinctData, Insn},
         BranchOffset, CursorID,
     },
@@ -4209,6 +4209,10 @@ pub enum SubqueryState {
         /// We keep these so later analysis can still understand dependencies
         /// even after the plan is consumed.
         outer_ref_ids: Vec<TableInternalId>,
+        /// Set when the subquery was emitted as a subroutine that a `Gosub`
+        /// can run again, for example against the NULL row of an aggregate
+        /// query that read no rows.
+        subroutine: Option<Subroutine>,
     },
 }
 
@@ -4324,6 +4328,7 @@ impl NonFromClauseSubquery {
                 self.state = SubqueryState::Evaluated {
                     evaluated_at,
                     outer_ref_ids,
+                    subroutine: None,
                 };
                 plan
             }
@@ -4331,6 +4336,13 @@ impl NonFromClauseSubquery {
                 panic!("subquery has already been evaluated");
             }
         }
+    }
+
+    pub fn set_subroutine(&mut self, new_subroutine: Option<Subroutine>) {
+        let SubqueryState::Evaluated { subroutine, .. } = &mut self.state else {
+            panic!("subquery must be emitted before its subroutine is recorded");
+        };
+        *subroutine = new_subroutine;
     }
 }
 
