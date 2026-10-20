@@ -377,7 +377,11 @@ order checks where the code allows:
   a temporary index's order.
 - A block with windows aims for the innermost window's PARTITION BY and
   ORDER BY order, like legacy's window source subquery, so an index or an
-  ordered CTE replaces that window's sorter.
+  ordered CTE replaces that window's sorter. EXPLAIN shows `USE SORTER FOR
+  ORDER BY` for each window that sorts its input, innermost first, as
+  legacy shows each source subquery's sort; legacy's `SCAN
+  window_subquery_N` rows, which name those subqueries, have no HIR
+  counterpart.
 - A LEFT JOIN keeps the order of the loops before it for ORDER BY terms that
   do not read its own columns (`plan_satisfies_order_target`).
 - When join orders cost the same, the FROM-order plan wins, and other plans

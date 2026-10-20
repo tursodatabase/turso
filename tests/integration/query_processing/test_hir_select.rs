@@ -2972,3 +2972,49 @@ fn hir_explain_rows_match_legacy_for_distinct_probes_compounds_and_shared_ctes()
         "{json}"
     );
 }
+
+/// Legacy runs each window through a source subquery whose ORDER BY sorts
+/// the rows, and EXPLAIN shows that sort. HIR has no such subquery but
+/// prints the same sorter row for each window that sorts its input, the
+/// innermost window first, and none for a window whose order the loops or
+/// an inner window already give.
+#[test]
+fn hir_window_sorts_show_in_explain_like_legacy() {
+    let db = setup();
+    let [legacy, hir] = connections(&db);
+    for statement in [
+        "CREATE TABLE sales(id INTEGER PRIMARY KEY, region TEXT, day INT, amount INT)",
+        "CREATE INDEX sales_region ON sales(region)",
+        "INSERT INTO sales VALUES (1, 'n', 3, 10), (2, 's', 1, 20), (3, 'n', 2, 30)",
+    ] {
+        legacy.execute(statement).unwrap();
+    }
+    for sql in [
+        "SELECT sum(amount) OVER (ORDER BY day) FROM sales",
+        "SELECT sum(amount) OVER (ORDER BY day), max(amount) OVER (PARTITION BY region) FROM sales",
+        "SELECT row_number() OVER (PARTITION BY region ORDER BY day), \
+         sum(amount) OVER (PARTITION BY region), rank() OVER (ORDER BY amount DESC) FROM sales",
+        // The index gives the partition order, so that window needs no sort.
+        "SELECT count(*) OVER (PARTITION BY region) FROM sales",
+        "SELECT region, sum(amount), row_number() OVER (ORDER BY sum(amount) DESC) \
+         FROM sales GROUP BY region",
+        "SELECT sum(amount) OVER (ORDER BY day) FROM sales ORDER BY day",
+        "SELECT * FROM (SELECT amount, avg(amount) OVER (PARTITION BY region) AS a FROM sales) \
+         WHERE a > 10 ORDER BY amount",
+    ] {
+        let legacy_plan = query_plan(&legacy, sql)
+            .into_iter()
+            .filter(|row| !row.starts_with("SCAN window_subquery_"))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            plan_without_ids(query_plan(&hir, sql)),
+            plan_without_ids(legacy_plan),
+            "{sql}"
+        );
+        assert_eq!(
+            limbo_exec_rows(&hir, sql),
+            limbo_exec_rows(&legacy, sql),
+            "{sql}"
+        );
+    }
+}

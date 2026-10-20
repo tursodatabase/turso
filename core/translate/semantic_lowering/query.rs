@@ -9279,6 +9279,19 @@ fn emit_hir_window_block(
     let innermost = layers.last().ok_or_else(|| {
         LimboError::InternalError(format!("HIR query block {:?} has no windows", block.id))
     })?;
+    // Like legacy's window source subqueries, each window that sorts its
+    // input shows the sort, innermost window first.
+    for layer in layers.iter().rev() {
+        if layer.sorter.is_some() {
+            emit_explain!(
+                program,
+                false,
+                EqpDetail::OrderBy {
+                    method: EqpSortMethod::Sorter,
+                }
+            );
+        }
+    }
     let rows_done = program.allocate_label();
     emit_planned_block_rows(
         program,
