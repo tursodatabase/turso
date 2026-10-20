@@ -680,7 +680,6 @@ fn execute_trigger_commands(
         program: Subprogram::PreparedProgram(built_subprogram.prepared().clone()),
         ignore_jump_target,
     });
-    program.flags.set_compiled_subprogram(true);
 
     Ok(true)
 }

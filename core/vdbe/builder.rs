@@ -354,7 +354,6 @@ impl ProgramBuilderFlags {
     const SUPPRESS_CUSTOM_TYPE_DECODE: u16 = 1 << 6;
     const SUPPRESS_COLUMN_DEFAULT: u16 = 1 << 7;
     const SKIP_EXPRESSION_INDEX_VALUES: u16 = 1 << 8;
-    const COMPILED_SUBPROGRAM: u16 = 1 << 9;
 
     const fn new(is_subprogram: bool) -> Self {
         let mut new = Self(0);
@@ -436,17 +435,6 @@ impl ProgramBuilderFlags {
     #[inline]
     pub const fn set_is_subprogram(&mut self, v: bool) {
         self.set(Self::IS_SUBPROGRAM, v)
-    }
-
-    #[inline]
-    /// Whether this program compiled a trigger body or an FK action (CASCADE/SET NULL/SET
-    /// DEFAULT) into itself as a subprogram.
-    pub const fn compiled_subprogram(self) -> bool {
-        self.get(Self::COMPILED_SUBPROGRAM)
-    }
-    #[inline]
-    pub const fn set_compiled_subprogram(&mut self, v: bool) {
-        self.set(Self::COMPILED_SUBPROGRAM, v)
     }
 
     #[inline]
@@ -1035,6 +1023,16 @@ impl ProgramBuilder {
 
     pub fn set_mvcc_enabled(&mut self, enabled: bool) {
         self.mvcc_enabled = enabled;
+    }
+
+    /// Whether this program has already emitted a call to a trigger or FK action
+    /// subprogram (an `Insn::Program`). Used to tell whether a trigger or FK action fired
+    /// during the statement, which may have captured a CDC row even when this program's own
+    /// target table was not captured (e.g. a TEMP table).
+    pub fn has_emitted_program_call(&self) -> bool {
+        self.insns
+            .iter()
+            .any(|(insn, _)| matches!(insn, Insn::Program { .. }))
     }
 
     pub fn extend(&mut self, opts: &ProgramBuilderOpts) {

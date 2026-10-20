@@ -1776,7 +1776,6 @@ fn emit_fk_action_subprogram(
         program: subprogram,
         ignore_jump_target,
     });
-    program.flags.set_compiled_subprogram(true);
     program.preassign_label_to_next_insn(ignore_jump_target);
 
     Ok(())

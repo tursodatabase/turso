@@ -1865,7 +1865,7 @@ pub fn emit_cdc_autocommit_commit(
     if !cdc_info.is_some_and(|info| info.cdc_version().has_commit_record()) {
         return Ok(());
     }
-    if cdc_cursor_id.is_none() && !program.flags.compiled_subprogram() {
+    if cdc_cursor_id.is_none() && !program.has_emitted_program_call() {
         // Our own target table was not captured (e.g. a TEMP table), and no trigger or FK
         // action ran during this statement that could have captured a row elsewhere.
         return Ok(());
