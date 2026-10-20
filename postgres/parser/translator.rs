@@ -4629,7 +4629,7 @@ fn pg_type_name_to_ast_type(type_name: &pg_query::protobuf::TypeName) -> Option<
     Some(ast::Type {
         name: name.to_string(),
         size: None,
-        array_dimensions: 0,
+        array_dimensions: type_name.array_bounds.len() as u32,
     })
 }
 

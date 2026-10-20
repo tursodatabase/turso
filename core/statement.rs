@@ -1409,7 +1409,13 @@ impl Statement {
         };
         Ok(Some(ColumnTypeInfo {
             declared_name: name.to_string(),
-            array_dimensions: 0,
+            array_dimensions: match &column.expr {
+                turso_parser::ast::Expr::Cast {
+                    type_name: Some(ty),
+                    ..
+                } => ty.array_dimensions,
+                _ => 0,
+            },
             base_type: None,
             kind: ColumnTypeKind::Builtin,
         }))

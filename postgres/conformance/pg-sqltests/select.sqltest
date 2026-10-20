@@ -5,6 +5,22 @@
 
 @database :memory:
 
+test cast-text-to-integer-array {
+    SELECT '{10,20,30}'::integer[];
+    SELECT array_length('{10,20,30}'::integer[], 1);
+}
+expect {
+    {10,20,30}
+    3
+}
+
+test cast-text-to-text-array {
+    SELECT '{hello,world}'::text[];
+}
+expect {
+    {hello,world}
+}
+
 test select-integer-literal {
     SELECT 42;
 }
