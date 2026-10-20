@@ -2540,11 +2540,19 @@ fn translate_column_expr(
                     // if we're reading from an index that contains this virtual column,
                     // the index already has the computed value, so read it from the index
                     GeneratedType::Virtual { .. } if !read_from_index => {
+                        let row_cursor_id = if is_btree_index {
+                            index_cursor_id
+                        } else {
+                            table_cursor_id.or(index_cursor_id)
+                        }
+                        .expect("cursor should be opened");
+                        let cursor_may_be_on_null_row = program.flags.cursors_may_be_on_null_row()
+                            || referenced_tables
+                                .unwrap()
+                                .outer_join_may_null_extend(*table_ref_id);
                         do_emit_table_column(
                             program,
-                            table_cursor_id
-                                .or(index_cursor_id)
-                                .expect("cursor should be opened"),
+                            row_cursor_id,
                             &SelfTableContext::ForSelect {
                                 table_ref_id: *table_ref_id,
                                 referenced_tables: referenced_tables.unwrap().clone(),
@@ -2554,6 +2562,7 @@ fn translate_column_expr(
                             *column,
                             target_register,
                             resolver,
+                            cursor_may_be_on_null_row.then_some(row_cursor_id),
                         )?;
                         // The virtual column's declared collation must override
                         // whatever collation the inner expression resolved to.

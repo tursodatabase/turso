@@ -348,6 +348,7 @@ impl ProgramBuilderFlags {
     const SUPPRESS_CUSTOM_TYPE_DECODE: u16 = 1 << 6;
     const SUPPRESS_COLUMN_DEFAULT: u16 = 1 << 7;
     const SKIP_EXPRESSION_INDEX_VALUES: u16 = 1 << 8;
+    const CURSORS_MAY_BE_ON_NULL_ROW: u16 = 1 << 9;
 
     const fn new(is_subprogram: bool) -> Self {
         let mut new = Self(0);
@@ -475,6 +476,14 @@ impl ProgramBuilderFlags {
     /// as SQLite clears `pIdxEpr`, so the same index match does not recur.
     pub const fn set_skip_expression_index_values(&mut self, value: bool) {
         self.set(Self::SKIP_EXPRESSION_INDEX_VALUES, value)
+    }
+
+    pub const fn cursors_may_be_on_null_row(self) -> bool {
+        self.get(Self::CURSORS_MAY_BE_ON_NULL_ROW)
+    }
+
+    pub const fn set_cursors_may_be_on_null_row(&mut self, value: bool) {
+        self.set(Self::CURSORS_MAY_BE_ON_NULL_ROW, value)
     }
 }
 

@@ -27,6 +27,7 @@ pub fn emit_table_column(
         column_index,
         target_register,
         resolver,
+        None,
     )
 }
 
@@ -54,6 +55,7 @@ pub fn emit_table_column_for_dml(
         column_index,
         target_register,
         resolver,
+        None,
     )
 }
 
@@ -68,31 +70,34 @@ pub(super) fn do_emit_table_column(
     column_index: usize,
     target_register: usize,
     resolver: &Resolver,
+    null_row_cursor: Option<CursorID>,
 ) -> Result<()> {
     match column.generated_type() {
         GeneratedType::Virtual { expr, .. } => {
-            let end_column_emission = match self_table_context {
-                SelfTableContext::ForSelect { .. } => {
-                    let end = program.allocate_label();
-                    program.emit_insn(Insn::IfNullRow {
-                        cursor_id,
-                        target_pc: end,
-                        dest: target_register,
-                    });
-                    Some(end)
-                }
-                SelfTableContext::ForDML { .. } => None,
-            };
+            let end_column_emission = null_row_cursor.map(|null_row_cursor| {
+                let end = program.allocate_label();
+                program.emit_insn(Insn::IfNullRow {
+                    cursor_id: null_row_cursor,
+                    target_pc: end,
+                    dest: target_register,
+                });
+                end
+            });
             resolver.with_self_table_context(program, Some(self_table_context), |program, _| {
-                if end_column_emission.is_some() {
-                    translate_expr_no_constant_opt(
+                if expr.is_constant(resolver) {
+                    let constant_register = program.alloc_register();
+                    translate_expr(
                         program,
                         referenced_tables,
                         expr,
-                        target_register,
+                        constant_register,
                         resolver,
-                        NoConstantOptReason::RegisterReuse,
                     )?;
+                    program.emit_insn(Insn::Copy {
+                        src_reg: constant_register,
+                        dst_reg: target_register,
+                        extra_amount: 0,
+                    });
                 } else {
                     translate_expr(program, referenced_tables, expr, target_register, resolver)?;
                 }

@@ -156,6 +156,8 @@ pub fn emit_ungrouped_aggregation<'a>(
         // Must use no_constant_opt to prevent constant hoisting which would place the label
         // after the hoisted constants, causing infinite loops in compound selects.
         let col_start = t_ctx.reg_result_cols_start.unwrap();
+        let cursors_were_on_null_row = program.flags.cursors_may_be_on_null_row();
+        program.flags.set_cursors_may_be_on_null_row(true);
         for (i, rc) in plan.result_columns.iter().enumerate() {
             if !rc.contains_aggregates {
                 translate_expr_no_constant_opt(
@@ -168,6 +170,9 @@ pub fn emit_ungrouped_aggregation<'a>(
                 )?;
             }
         }
+        program
+            .flags
+            .set_cursors_may_be_on_null_row(cursors_were_on_null_row);
         program.preassign_label_to_next_insn(skip_nonagg_eval);
     }
 

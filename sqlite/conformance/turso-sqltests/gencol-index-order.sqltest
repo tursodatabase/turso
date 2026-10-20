@@ -65,7 +65,7 @@ test eqp-order-by-virtual-column-and-unindexed-column-still-sorts {
 }
 expect {
     1|0|0|SCAN t
-    16|0|0|USE SORTER FOR ORDER BY
+    14|0|0|USE SORTER FOR ORDER BY
 }
 
 test order-by-virtual-column-index-scan-nulls-first-limit {
