@@ -119,7 +119,12 @@ pub(super) fn translate_in_list(
                         rhs: rhs_reg,
                         target_pc: label_ok,
                         flags: cmp_flags,
-                        collation: program.curr_collation(),
+                        collation: comparison_collation(
+                            lhs,
+                            expr,
+                            referenced_tables,
+                            Some(resolver),
+                        )?,
                     });
                 } else {
                     program.emit_insn(Insn::NotNull {
@@ -133,7 +138,7 @@ pub(super) fn translate_in_list(
                     rhs: rhs_reg,
                     target_pc: condition_metadata.jump_target_when_false,
                     flags: cmp_flags.jump_if_null(),
-                    collation: program.curr_collation(),
+                    collation: comparison_collation(lhs, expr, referenced_tables, Some(resolver))?,
                 });
             } else {
                 program.emit_insn(Insn::IsNull {
