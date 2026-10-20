@@ -1641,15 +1641,6 @@ impl LevelEmitter<'_> {
             self.level.keys.iter().map(|key| self.keys[*key].affinity),
             probe_start,
         );
-        emit_read_image(
-            program,
-            input,
-            side,
-            cursor,
-            self.next_layout.image(self.level.input),
-            self.row,
-        )?;
-        let source_weight = emit_read_weight(program, input, side, cursor)?;
         program.emit_insn(Insn::SeekGE {
             is_index: true,
             cursor_id: index_cursor,
@@ -1659,6 +1650,17 @@ impl LevelEmitter<'_> {
             eq_only: true,
             null_matching_mask: Default::default(),
         });
+        // Most rows of a scanned table match no partial row: read the whole
+        // row only for those that do.
+        emit_read_image(
+            program,
+            input,
+            side,
+            cursor,
+            self.next_layout.image(self.level.input),
+            self.row,
+        )?;
+        let source_weight = emit_read_weight(program, input, side, cursor)?;
         let candidate_loop = program.allocate_label();
         let next_candidate = program.allocate_label();
         program.preassign_label_to_next_insn(candidate_loop);
@@ -2570,6 +2572,41 @@ mod tests {
         assert!(rowid_lookups_of(&population, "parent") > 0);
     }
 
+    /// A chain of six tables whose join keys are rowids or indexed: no phase
+    /// of maintenance reads a whole table, and population reads only the
+    /// table it starts from.
+    #[test]
+    fn keyed_six_way_join_never_reads_a_whole_table() {
+        let conn = open_views_db("six-way-join-key-lookup.db");
+        for table in 1..=6 {
+            conn.execute(format!(
+                "CREATE TABLE t{table}(id INTEGER PRIMARY KEY, p INT, v INT)"
+            ))
+            .unwrap();
+            conn.execute(format!("CREATE INDEX t{table}_p ON t{table}(p)"))
+                .unwrap();
+        }
+        conn.execute(
+            "CREATE MATERIALIZED VIEW v AS SELECT t1.v, t6.v FROM t1 \
+             JOIN t2 ON t2.p = t1.id JOIN t3 ON t3.p = t2.id JOIN t4 ON t4.p = t3.id \
+             JOIN t5 ON t5.p = t4.id JOIN t6 ON t6.p = t5.id",
+        )
+        .unwrap();
+
+        let maintenance = compile_view_program(&conn, "v", MaintenanceInput::TransactionDelta);
+        assert_eq!(stored_table_full_reads(&maintenance), Vec::<String>::new());
+        for table in 1..=6 {
+            let name = format!("t{table}");
+            assert!(rowid_lookups_of(&maintenance, &name) > 0, "{name}");
+        }
+
+        let population = compile_view_program(&conn, "v", MaintenanceInput::BaseTable);
+        let read_whole = (1..=6)
+            .filter(|table| full_reads_of(&population, &format!("t{table}")) > 0)
+            .count();
+        assert_eq!(read_whole, 1);
+    }
+
     fn open_views_db(name: &str) -> Arc<Connection> {
         #[allow(clippy::arc_with_non_send_sync)]
         let io: Arc<dyn crate::IO> = Arc::new(crate::MemoryIO::new());
@@ -2620,6 +2657,24 @@ mod tests {
                 matches!(insn, Insn::Rewind { cursor_id, .. } if reads_table(program, *cursor_id, table_name))
             })
             .count()
+    }
+
+    /// The stored tables (base tables and hidden view state, not ephemeral
+    /// tables) that a program reads from start to end.
+    fn stored_table_full_reads(program: &Program) -> Vec<String> {
+        program
+            .insns
+            .iter()
+            .filter_map(|(insn, _)| match insn {
+                Insn::Rewind { cursor_id, .. } => match &program.cursor_ref[*cursor_id].1 {
+                    CursorType::BTreeTable(table) if table.root_page != 0 => {
+                        Some(table.name.clone())
+                    }
+                    _ => None,
+                },
+                _ => None,
+            })
+            .collect()
     }
 
     fn rowid_lookups_of(program: &Program, table_name: &str) -> usize {

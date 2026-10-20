@@ -1,0 +1,424 @@
+@database :memory:
+@requires-file materialized_views ""
+@skip-file-if mvcc "materialized_views not supported with mvcc"
+@verify-materialized-views
+
+# Runs of inner joins over three or more tables are maintained as one
+# delta join. Expected output: SQLite 3.50.4 running the same statements
+# with each materialized view as a plain view.
+
+# A chain of four tables without indexes on the join keys. Every table is
+# written, so every phase of the delta join runs, and every level reads its
+# table once.
+test matview-multiway-chain4-unindexed {
+    CREATE TABLE c1(id INTEGER PRIMARY KEY, v TEXT);
+    CREATE TABLE c2(id INTEGER PRIMARY KEY, c1_id INT, v TEXT);
+    CREATE TABLE c3(id INTEGER PRIMARY KEY, c2_id INT, v TEXT);
+    CREATE TABLE c4(id INTEGER PRIMARY KEY, c3_id INT, v TEXT);
+    INSERT INTO c1 VALUES (1, 'a'), (2, 'b'), (3, 'c');
+    INSERT INTO c2 VALUES (1, 1, 'a1'), (2, 1, 'a2'), (3, 2, 'b1'), (4, NULL, 'x');
+    INSERT INTO c3 VALUES (1, 1, 'a1i'), (2, 2, 'a2i'), (3, 3, 'b1i'), (4, 3, 'b1j');
+    INSERT INTO c4 VALUES (1, 1, 'p'), (2, 3, 'q'), (3, 4, 'r'), (4, 4, 's'), (5, 9, 'z');
+    CREATE MATERIALIZED VIEW v AS SELECT c1.v AS a, c2.v AS b, c3.v AS c, c4.v AS d FROM c1 JOIN c2 ON c2.c1_id = c1.id JOIN c3 ON c3.c2_id = c2.id JOIN c4 ON c4.c3_id = c3.id;
+    SELECT * FROM v ORDER BY a, b, c, d;
+    INSERT INTO c1 VALUES (4, 'd');
+    INSERT INTO c2 VALUES (5, 4, 'd1');
+    INSERT INTO c3 VALUES (5, 5, 'd1i');
+    INSERT INTO c4 VALUES (6, 5, 't');
+    UPDATE c2 SET c1_id = 3 WHERE id = 3;
+    UPDATE c3 SET c2_id = 1 WHERE id = 2;
+    DELETE FROM c4 WHERE id = 3;
+    DELETE FROM c1 WHERE id = 1;
+    SELECT * FROM v ORDER BY a, b, c, d;
+}
+expect {
+    a|a1|a1i|p
+    b|b1|b1i|q
+    b|b1|b1j|r
+    b|b1|b1j|s
+    c|b1|b1i|q
+    c|b1|b1j|s
+    d|d1|d1i|t
+}
+
+# A chain of six tables with an index on every join key: each level looks
+# its table up by key. Rows are written to every table, alone and together.
+test matview-multiway-chain6-indexed {
+    CREATE TABLE t1(id INTEGER PRIMARY KEY, p INT, v INT);
+    CREATE TABLE t2(id INTEGER PRIMARY KEY, p INT, v INT);
+    CREATE TABLE t3(id INTEGER PRIMARY KEY, p INT, v INT);
+    CREATE TABLE t4(id INTEGER PRIMARY KEY, p INT, v INT);
+    CREATE TABLE t5(id INTEGER PRIMARY KEY, p INT, v INT);
+    CREATE TABLE t6(id INTEGER PRIMARY KEY, p INT, v INT);
+    CREATE INDEX t2_p ON t2(p);
+    CREATE INDEX t3_p ON t3(p);
+    CREATE INDEX t4_p ON t4(p);
+    CREATE INDEX t5_p ON t5(p);
+    CREATE INDEX t6_p ON t6(p);
+    INSERT INTO t1 SELECT value, NULL, value FROM generate_series(1, 20);
+    INSERT INTO t2 SELECT value, value % 20 + 1, value FROM generate_series(1, 30);
+    INSERT INTO t3 SELECT value, value % 30 + 1, value FROM generate_series(1, 40);
+    INSERT INTO t4 SELECT value, value % 40 + 1, value FROM generate_series(1, 50);
+    INSERT INTO t5 SELECT value, value % 50 + 1, value FROM generate_series(1, 60);
+    INSERT INTO t6 SELECT value, value % 60 + 1, value FROM generate_series(1, 70);
+    CREATE MATERIALIZED VIEW v AS SELECT t1.v AS a, t3.v AS c, t6.v AS f FROM t1 JOIN t2 ON t2.p = t1.id JOIN t3 ON t3.p = t2.id JOIN t4 ON t4.p = t3.id JOIN t5 ON t5.p = t4.id JOIN t6 ON t6.p = t5.id;
+    SELECT count(*), sum(a), sum(c), sum(f) FROM v;
+    INSERT INTO t1 VALUES (21, NULL, 21);
+    INSERT INTO t2 VALUES (31, 21, 31);
+    INSERT INTO t3 VALUES (41, 31, 41);
+    INSERT INTO t4 VALUES (51, 41, 51);
+    INSERT INTO t5 VALUES (61, 51, 61);
+    INSERT INTO t6 VALUES (71, 61, 71), (72, 61, 72);
+    SELECT count(*), sum(a), sum(c), sum(f) FROM v;
+    BEGIN;
+    UPDATE t3 SET p = 31 WHERE id < 5;
+    DELETE FROM t5 WHERE id % 4 = 0;
+    INSERT INTO t2 VALUES (32, 3, 32);
+    UPDATE t6 SET p = p + 1 WHERE id > 60;
+    COMMIT;
+    SELECT count(*), sum(a), sum(c), sum(f) FROM v;
+    DELETE FROM t1 WHERE id % 3 = 0;
+    SELECT count(*), sum(a), sum(c), sum(f) FROM v;
+}
+expect {
+    70|635|1045|2485
+    72|677|1127|2628
+    52|582|785|1822
+    31|297|505|1067
+}
+
+# Eight tables: some join keys are rowids, some indexed, some neither.
+test matview-multiway-chain8-mixed {
+    CREATE TABLE e1(id INTEGER PRIMARY KEY, v INT);
+    CREATE TABLE e2(id INTEGER PRIMARY KEY, e1 INT, v INT);
+    CREATE TABLE e3(id INTEGER PRIMARY KEY, e2 INT, v INT);
+    CREATE TABLE e4(id INTEGER PRIMARY KEY, e3 INT, v INT);
+    CREATE TABLE e5(id INTEGER PRIMARY KEY, e4 INT, v INT);
+    CREATE TABLE e6(id INTEGER PRIMARY KEY, e5 INT, v INT);
+    CREATE TABLE e7(id INTEGER PRIMARY KEY, e6 INT, v INT);
+    CREATE TABLE e8(id INTEGER PRIMARY KEY, e7 INT, v INT);
+    CREATE INDEX e3_e2 ON e3(e2);
+    CREATE INDEX e6_e5 ON e6(e5);
+    INSERT INTO e1 SELECT value, value FROM generate_series(1, 6);
+    INSERT INTO e2 SELECT value, value % 6 + 1, value FROM generate_series(1, 8);
+    INSERT INTO e3 SELECT value, value % 8 + 1, value FROM generate_series(1, 9);
+    INSERT INTO e4 SELECT value, value % 9 + 1, value FROM generate_series(1, 10);
+    INSERT INTO e5 SELECT value, value % 10 + 1, value FROM generate_series(1, 11);
+    INSERT INTO e6 SELECT value, value % 11 + 1, value FROM generate_series(1, 12);
+    INSERT INTO e7 SELECT value, value % 12 + 1, value FROM generate_series(1, 13);
+    INSERT INTO e8 SELECT value, value % 13 + 1, value FROM generate_series(1, 14);
+    CREATE MATERIALIZED VIEW v AS SELECT e1.v AS a, e4.v AS d, e8.v AS h FROM e1 JOIN e2 ON e2.e1 = e1.id JOIN e3 ON e3.e2 = e2.id JOIN e4 ON e4.e3 = e3.id JOIN e5 ON e5.e4 = e4.id JOIN e6 ON e6.e5 = e5.id JOIN e7 ON e7.e6 = e6.id JOIN e8 ON e8.e7 = e7.id;
+    SELECT count(*), sum(a), sum(d), sum(h) FROM v;
+    INSERT INTO e1 VALUES (7, 7);
+    INSERT INTO e4 VALUES (11, 2, 11);
+    INSERT INTO e8 VALUES (15, 3, 15);
+    UPDATE e5 SET e4 = 11 WHERE id = 1;
+    DELETE FROM e2 WHERE id = 1;
+    UPDATE e7 SET e6 = 1;
+    SELECT count(*), sum(a), sum(d), sum(h) FROM v;
+}
+expect {
+    14|47|69|105
+    15|90|45|120
+}
+
+# A star schema: a fact table joined to three dimensions by their INTEGER
+# PRIMARY KEY, with filters on two dimensions.
+test matview-multiway-star {
+    CREATE TABLE sales(id INTEGER PRIMARY KEY, product INT, store INT, day INT, amount INT);
+    CREATE TABLE product(id INTEGER PRIMARY KEY, category TEXT);
+    CREATE TABLE store(id INTEGER PRIMARY KEY, region TEXT);
+    CREATE TABLE day(id INTEGER PRIMARY KEY, month INT);
+    INSERT INTO product VALUES (1, 'food'), (2, 'toys'), (3, 'food');
+    INSERT INTO store VALUES (1, 'north'), (2, 'south');
+    INSERT INTO day VALUES (1, 1), (2, 1), (3, 2);
+    INSERT INTO sales VALUES (1, 1, 1, 1, 10), (2, 2, 1, 2, 20), (3, 3, 2, 3, 30), (4, 1, 2, 3, 40), (5, 9, 1, 1, 50);
+    CREATE MATERIALIZED VIEW v AS SELECT product.category, store.region, day.month, sum(sales.amount) AS total, count(*) AS n FROM sales JOIN product ON product.id = sales.product JOIN store ON store.id = sales.store JOIN day ON day.id = sales.day WHERE store.region <> 'west' AND day.month < 3 GROUP BY product.category, store.region, day.month;
+    SELECT * FROM v ORDER BY 1, 2, 3;
+    INSERT INTO sales VALUES (6, 2, 2, 1, 60);
+    UPDATE product SET category = 'toys' WHERE id = 3;
+    UPDATE store SET region = 'west' WHERE id = 1;
+    INSERT INTO product VALUES (9, 'books');
+    UPDATE day SET month = 3 WHERE id = 2;
+    DELETE FROM sales WHERE id = 4;
+    SELECT * FROM v ORDER BY 1, 2, 3;
+}
+expect {
+    food|north|1|10|1
+    food|south|2|70|2
+    toys|north|1|20|1
+    toys|south|1|60|1
+    toys|south|2|30|1
+}
+
+# Redundant equalities: a = b, b = c and a = c. The third key is checked
+# as a term once both of its tables are bound.
+test matview-multiway-cyclic-keys {
+    CREATE TABLE a(id INTEGER PRIMARY KEY, k INT);
+    CREATE TABLE b(id INTEGER PRIMARY KEY, k INT);
+    CREATE TABLE c(id INTEGER PRIMARY KEY, k INT);
+    INSERT INTO a VALUES (1, 1), (2, 2), (3, NULL);
+    INSERT INTO b VALUES (1, 1), (2, 2), (3, 2), (4, NULL);
+    INSERT INTO c VALUES (1, 2), (2, 2), (3, 3);
+    CREATE MATERIALIZED VIEW v AS SELECT a.id AS x, b.id AS y, c.id AS z FROM a JOIN b ON a.k = b.k JOIN c ON b.k = c.k AND a.k = c.k;
+    SELECT * FROM v ORDER BY 1, 2, 3;
+    INSERT INTO c VALUES (4, 1);
+    UPDATE b SET k = 3 WHERE id = 3;
+    INSERT INTO a VALUES (4, 3);
+    DELETE FROM b WHERE id = 2;
+    SELECT * FROM v ORDER BY 1, 2, 3;
+}
+expect {
+    2|2|1
+    2|2|2
+    2|3|1
+    2|3|2
+    1|1|4
+    4|3|3
+}
+
+# A table twice in one run (employee, manager, manager's department).
+test matview-multiway-self-join-in-chain {
+    CREATE TABLE emp(id INTEGER PRIMARY KEY, manager INT, dept INT, name TEXT);
+    CREATE TABLE dept(id INTEGER PRIMARY KEY, name TEXT);
+    INSERT INTO dept VALUES (1, 'eng'), (2, 'ops');
+    INSERT INTO emp VALUES (1, NULL, 1, 'ann'), (2, 1, 1, 'bob'), (3, 1, 2, 'cy'), (4, 2, 2, 'di');
+    CREATE MATERIALIZED VIEW v AS SELECT e.name AS worker, m.name AS boss, d.name AS boss_dept FROM emp e JOIN emp m ON e.manager = m.id JOIN dept d ON d.id = m.dept;
+    SELECT * FROM v ORDER BY 1;
+    INSERT INTO emp VALUES (5, 4, 1, 'ed');
+    UPDATE emp SET dept = 2 WHERE id = 1;
+    UPDATE emp SET manager = 3 WHERE id = 2;
+    BEGIN;
+    INSERT INTO emp VALUES (6, 6, 1, 'fay');
+    UPDATE emp SET name = 'fae' WHERE id = 6;
+    COMMIT;
+    DELETE FROM dept WHERE id = 1;
+    SELECT * FROM v ORDER BY 1;
+}
+expect {
+    bob|ann|eng
+    cy|ann|eng
+    di|bob|eng
+    bob|cy|ops
+    cy|ann|ops
+    ed|di|ops
+}
+
+# An inner run followed by a LEFT JOIN: the run's result is stored for the
+# outer join, which pads its unmatched rows.
+test matview-multiway-run-then-left-join {
+    CREATE TABLE o(id INTEGER PRIMARY KEY, c INT);
+    CREATE TABLE c(id INTEGER PRIMARY KEY, name TEXT);
+    CREATE TABLE l(id INTEGER PRIMARY KEY, o INT, qty INT);
+    CREATE TABLE note(o INT, text TEXT);
+    INSERT INTO c VALUES (1, 'x'), (2, 'y');
+    INSERT INTO o VALUES (1, 1), (2, 2), (3, 1);
+    INSERT INTO l VALUES (1, 1, 5), (2, 1, 6), (3, 2, 7);
+    INSERT INTO note VALUES (1, 'rush');
+    CREATE MATERIALIZED VIEW v AS SELECT c.name, l.qty, note.text FROM o JOIN c ON c.id = o.c JOIN l ON l.o = o.id LEFT JOIN note ON note.o = o.id;
+    SELECT * FROM v ORDER BY 1, 2, 3;
+    INSERT INTO note VALUES (2, 'gift'), (2, 'wrap');
+    INSERT INTO l VALUES (4, 3, 8);
+    DELETE FROM note WHERE o = 1;
+    UPDATE o SET c = 2 WHERE id = 1;
+    SELECT * FROM v ORDER BY 1, 2, 3;
+}
+expect {
+    x|5|rush
+    x|6|rush
+    y|7|
+    x|8|
+    y|5|
+    y|6|
+    y|7|gift
+    y|7|wrap
+}
+
+# WHERE terms on single tables of the run, on the first table and later
+# ones, including a term with no table and one that reads two tables.
+test matview-multiway-filters-on-run-inputs {
+    CREATE TABLE a(id INTEGER PRIMARY KEY, x INT);
+    CREATE TABLE b(id INTEGER PRIMARY KEY, a_id INT, y INT);
+    CREATE TABLE c(id INTEGER PRIMARY KEY, b_id INT, z INT);
+    INSERT INTO a SELECT value, value % 4 FROM generate_series(1, 12);
+    INSERT INTO b SELECT value, value % 12 + 1, value % 5 FROM generate_series(1, 20);
+    INSERT INTO c SELECT value, value % 20 + 1, value % 3 FROM generate_series(1, 30);
+    CREATE MATERIALIZED VIEW v AS SELECT a.id AS ai, b.id AS bi, c.id AS ci FROM a JOIN b ON b.a_id = a.id JOIN c ON c.b_id = b.id WHERE a.x <> 0 AND c.z = 1 AND 1 = 1 AND a.x + b.y > 2;
+    SELECT count(*), sum(ai), sum(bi), sum(ci) FROM v;
+    UPDATE a SET x = 0 WHERE id < 4;
+    UPDATE c SET z = 1 WHERE id % 2 = 0;
+    UPDATE b SET y = 4 WHERE id < 6;
+    INSERT INTO c VALUES (31, 2, 1);
+    SELECT count(*), sum(ai), sum(bi), sum(ci) FROM v;
+}
+expect {
+    6|38|56|90
+    7|54|59|112
+}
+
+# An aggregate over a four-way join, with writes that move rows between
+# groups and empty a group.
+test matview-multiway-aggregate-over-4way {
+    CREATE TABLE r(id INTEGER PRIMARY KEY, g TEXT);
+    CREATE TABLE s(id INTEGER PRIMARY KEY, r INT);
+    CREATE TABLE t(id INTEGER PRIMARY KEY, s INT, w INT);
+    CREATE TABLE u(id INTEGER PRIMARY KEY, t INT, x INT);
+    CREATE INDEX u_t ON u(t);
+    INSERT INTO r VALUES (1, 'a'), (2, 'b'), (3, 'c');
+    INSERT INTO s SELECT value, value % 3 + 1 FROM generate_series(1, 9);
+    INSERT INTO t SELECT value, value % 9 + 1, value FROM generate_series(1, 18);
+    INSERT INTO u SELECT value, value % 18 + 1, value * 10 FROM generate_series(1, 36);
+    CREATE MATERIALIZED VIEW v AS SELECT r.g, count(*) AS n, sum(t.w * u.x) AS total, min(u.x) AS lo FROM r JOIN s ON s.r = r.id JOIN t ON t.s = s.id JOIN u ON u.t = t.id GROUP BY r.g;
+    SELECT * FROM v ORDER BY 1;
+    UPDATE s SET r = 1 WHERE r = 3;
+    DELETE FROM u WHERE x < 100;
+    INSERT INTO r VALUES (4, 'd');
+    INSERT INTO s VALUES (10, 4);
+    INSERT INTO t VALUES (19, 10, 5);
+    INSERT INTO u VALUES (37, 19, 1);
+    SELECT * FROM v ORDER BY 1;
+}
+expect {
+    a|12|23100|10
+    b|12|26460|20
+    c|12|20340|30
+    a|18|41220|100
+    b|9|25380|110
+    d|1|5|1
+}
+
+# Several tables changed in one transaction: a row inserted and then
+# updated, keys changed on both sides, and bulk INSERT ... SELECT into two
+# tables, so several phases see changes of the same transaction.
+test matview-multiway-many-inputs-in-one-txn {
+    CREATE TABLE a(id INTEGER PRIMARY KEY, k INT);
+    CREATE TABLE b(id INTEGER PRIMARY KEY, k INT, m INT);
+    CREATE TABLE c(id INTEGER PRIMARY KEY, m INT);
+    INSERT INTO a VALUES (1, 1), (2, 2);
+    INSERT INTO b VALUES (1, 1, 10), (2, 2, 20);
+    INSERT INTO c VALUES (1, 10), (2, 20);
+    CREATE MATERIALIZED VIEW v AS SELECT a.id AS ai, b.id AS bi, c.id AS ci FROM a JOIN b ON b.k = a.k JOIN c ON c.m = b.m;
+    BEGIN;
+    INSERT INTO a VALUES (3, 1);
+    UPDATE a SET k = 2 WHERE id = 3;
+    UPDATE b SET m = 20 WHERE id = 1;
+    INSERT INTO c VALUES (3, 20);
+    DELETE FROM c WHERE id = 2;
+    SELECT * FROM v ORDER BY 1, 2, 3;
+    COMMIT;
+    SELECT * FROM v ORDER BY 1, 2, 3;
+    BEGIN;
+    INSERT INTO a SELECT value + 10, value % 3 FROM generate_series(1, 30);
+    INSERT INTO b SELECT value + 10, value % 3, value % 2 * 10 + 10 FROM generate_series(1, 30);
+    INSERT INTO c SELECT value + 10, value % 2 * 10 + 10 FROM generate_series(1, 5);
+    COMMIT;
+    SELECT count(*), sum(ai), sum(bi), sum(ci) FROM v;
+}
+expect {
+    1|1|3
+    2|2|3
+    3|2|3
+    1|1|3
+    2|2|3
+    3|2|3
+    1247|29009|29490|12351
+}
+
+# Join keys with NULLs, mixed affinities (INTEGER, TEXT, none) and a
+# NOCASE column, across three tables.
+test matview-multiway-keys-with-null-affinity-collation {
+    CREATE TABLE a(id INTEGER PRIMARY KEY, n INTEGER, t TEXT COLLATE NOCASE);
+    CREATE TABLE b(id INTEGER PRIMARY KEY, n TEXT, t TEXT);
+    CREATE TABLE c(id INTEGER PRIMARY KEY, n, t TEXT);
+    CREATE INDEX b_n ON b(n);
+    INSERT INTO a VALUES (1, 1, 'X'), (2, 2, 'y'), (3, NULL, 'z'), (4, 10, NULL);
+    INSERT INTO b VALUES (1, '1', 'x'), (2, '01', 'Y'), (3, '2', 'y'), (4, NULL, 'z'), (5, '10', 'q');
+    INSERT INTO c VALUES (1, 1, 'x'), (2, '1', 'X'), (3, 2.0, 'y'), (4, NULL, 'z'), (5, '10', 'Q');
+    CREATE MATERIALIZED VIEW v AS SELECT a.id AS ai, b.id AS bi, c.id AS ci FROM a JOIN b ON a.n = b.n JOIN c ON c.n = a.n AND a.t = c.t;
+    SELECT * FROM v ORDER BY 1, 2, 3;
+    INSERT INTO c VALUES (6, '2', 'Y');
+    UPDATE b SET n = '1.0' WHERE id = 2;
+    UPDATE a SET t = 'q' WHERE id = 4;
+    INSERT INTO b VALUES (6, '10.0', 'w');
+    SELECT * FROM v ORDER BY 1, 2, 3;
+}
+expect {
+    1|1|1
+    1|1|2
+    1|2|1
+    1|2|2
+    2|3|3
+    1|1|1
+    1|1|2
+    1|2|1
+    1|2|2
+    2|3|3
+    2|3|6
+    4|5|5
+    4|6|5
+}
+
+# ROLLBACK and ROLLBACK TO undo the view's changes from a multi-way join.
+test matview-multiway-rollback {
+    CREATE TABLE a(id INTEGER PRIMARY KEY, k INT);
+    CREATE TABLE b(id INTEGER PRIMARY KEY, a INT);
+    CREATE TABLE c(id INTEGER PRIMARY KEY, b INT);
+    INSERT INTO a VALUES (1, 1), (2, 2);
+    INSERT INTO b VALUES (1, 1), (2, 2), (3, 2);
+    INSERT INTO c VALUES (1, 1), (2, 3);
+    CREATE MATERIALIZED VIEW v AS SELECT a.id AS ai, b.id AS bi, c.id AS ci FROM a JOIN b ON b.a = a.id JOIN c ON c.b = b.id;
+    BEGIN;
+    INSERT INTO c VALUES (3, 2);
+    DELETE FROM a WHERE id = 2;
+    SELECT * FROM v ORDER BY 1, 2, 3;
+    ROLLBACK;
+    SELECT * FROM v ORDER BY 1, 2, 3;
+    BEGIN;
+    INSERT INTO c VALUES (4, 2);
+    SAVEPOINT s;
+    UPDATE b SET a = 1;
+    DELETE FROM c WHERE id = 1;
+    SELECT * FROM v ORDER BY 1, 2, 3;
+    ROLLBACK TO s;
+    INSERT INTO a VALUES (3, 3);
+    COMMIT;
+    SELECT * FROM v ORDER BY 1, 2, 3;
+}
+expect {
+    1|1|1
+    1|1|1
+    2|3|2
+    1|2|4
+    1|3|2
+    1|1|1
+    2|2|4
+    2|3|2
+}
+
+# A table with no join key to the others (paired with every row), and a
+# grouped subquery as one input of the run.
+test matview-multiway-cross-and-derived-inputs {
+    CREATE TABLE a(id INTEGER PRIMARY KEY, k INT);
+    CREATE TABLE b(id INTEGER PRIMARY KEY, k INT, w INT);
+    CREATE TABLE flag(f INT);
+    INSERT INTO a VALUES (1, 1), (2, 2);
+    INSERT INTO b VALUES (1, 1, 5), (2, 1, 6), (3, 2, 7);
+    INSERT INTO flag VALUES (1), (2);
+    CREATE MATERIALIZED VIEW v AS SELECT a.id, s.total, flag.f FROM a JOIN (SELECT k, sum(w) AS total FROM b GROUP BY k) s ON s.k = a.k JOIN flag WHERE flag.f > 0;
+    SELECT * FROM v ORDER BY 1, 2, 3;
+    INSERT INTO flag VALUES (3), (0);
+    INSERT INTO b VALUES (4, 2, 10);
+    DELETE FROM flag WHERE f = 1;
+    UPDATE a SET k = 1 WHERE id = 2;
+    SELECT * FROM v ORDER BY 1, 2, 3;
+}
+expect {
+    1|11|1
+    1|11|2
+    2|7|1
+    2|7|2
+    1|11|2
+    1|11|3
+    2|11|2
+    2|11|3
+}

@@ -606,7 +606,7 @@ fn generate_definition(schema: &Schema, rng: &mut ChaCha8Rng) -> Option<Generate
     }
 
     let table = tables[rng.random_range(0..tables.len())];
-    let (sql, must_create) = match rng.random_range(0..42u32) {
+    let (sql, must_create) = match rng.random_range(0..48u32) {
         0..=2 => (Some(projection(table, rng, false)), false),
         3..=4 => (Some(projection(table, rng, true)), false),
         5..=7 => (Some(aggregate(table, rng)), false),
@@ -645,6 +645,11 @@ fn generate_definition(schema: &Schema, rng: &mut ChaCha8Rng) -> Option<Generate
         // NATURAL JOIN and CROSS JOIN: neither is produced by `join()`.
         34..=36 => (
             natural_or_cross_join(&tables, rng).or_else(|| Some(projection(table, rng, true))),
+            true,
+        ),
+        // Runs of three to five inner joins, maintained as one delta join.
+        42..=47 => (
+            inner_join_chain(&tables, rng).or_else(|| Some(projection(table, rng, true))),
             true,
         ),
         _ => (full_outer_composition(&tables, rng, false), true),
@@ -702,6 +707,85 @@ fn total_avg_view(schema: &Schema, rng: &mut ChaCha8Rng) -> Option<String> {
             "SELECT \"nocase_key\" AS k, TOTAL({col}) AS tot, AVG({col}) AS avg_val \
              FROM {table} GROUP BY \"nocase_key\""
         )
+    })
+}
+
+/// An inner join of three to five tables (a table may appear more than
+/// once), each joined to an earlier one on columns of the same type,
+/// sometimes on two columns, with a filter, or under GROUP BY. A run of inner
+/// joins is maintained as one delta join, so these views exercise every
+/// phase and every way a level finds its rows.
+fn inner_join_chain(tables: &[&Table], rng: &mut ChaCha8Rng) -> Option<String> {
+    let keyable = |column: &ColumnDef| {
+        matches!(
+            column.data_type,
+            DataType::Integer | DataType::Real | DataType::Text
+        )
+    };
+    let count = rng.random_range(3..=5usize);
+    let chosen = (0..count)
+        .map(|_| tables[rng.random_range(0..tables.len())])
+        .collect::<Vec<_>>();
+    let mut from = format!("{} AS j0", quoted(&chosen[0].name));
+    for position in 1..count {
+        let mut pairs = Vec::new();
+        for earlier in 0..position {
+            for earlier_column in &chosen[earlier].columns {
+                for column in &chosen[position].columns {
+                    if keyable(column) && earlier_column.data_type == column.data_type {
+                        pairs.push((earlier, earlier_column, column));
+                    }
+                }
+            }
+        }
+        if pairs.is_empty() {
+            return None;
+        }
+        let mut on = Vec::new();
+        for _ in 0..if rng.random_bool(0.2) { 2 } else { 1 } {
+            let (earlier, earlier_column, column) = pairs[rng.random_range(0..pairs.len())];
+            on.push(format!(
+                "j{earlier}.{} = j{position}.{}",
+                quoted(&earlier_column.name),
+                quoted(&column.name)
+            ));
+        }
+        let _ = write!(
+            from,
+            " JOIN {} AS j{position} ON {}",
+            quoted(&chosen[position].name),
+            on.join(" AND ")
+        );
+    }
+    let filter = if rng.random_bool(0.3) {
+        let position = rng.random_range(0..count);
+        let column = &chosen[position].columns[rng.random_range(0..chosen[position].columns.len())];
+        format!(" WHERE j{position}.{} IS NOT NULL", quoted(&column.name))
+    } else {
+        String::new()
+    };
+    let first_column = |position: usize| quoted(&chosen[position].columns[0].name);
+    let random_column = |rng: &mut ChaCha8Rng| {
+        let position = rng.random_range(0..count);
+        let columns = &chosen[position].columns;
+        format!(
+            "j{position}.{}",
+            quoted(&columns[rng.random_range(0..columns.len())].name)
+        )
+    };
+    Some(if rng.random_bool(0.25) {
+        let group = random_column(rng);
+        let aggregated = random_column(rng);
+        format!(
+            "SELECT {group} AS g, COUNT(*) AS n, MAX({aggregated}) AS m \
+             FROM {from}{filter} GROUP BY {group}"
+        )
+    } else {
+        let columns = (0..count)
+            .map(|position| format!("j{position}.{} AS c{position}", first_column(position)))
+            .collect::<Vec<_>>()
+            .join(", ");
+        format!("SELECT {columns} FROM {from}{filter}")
     })
 }
 
