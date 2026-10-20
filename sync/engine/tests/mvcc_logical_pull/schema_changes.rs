@@ -153,3 +153,37 @@ fn drop_newest_table_and_create_another_table_in_one_transaction() -> Result<()>
     assert_eq!(replica.snapshot()?, remote.snapshot()?);
     Ok(())
 }
+
+#[test]
+fn pull_keeps_unpushed_local_drops() -> Result<()> {
+    let remote = Remote::new(&[
+        "CREATE TABLE r (x)",
+        "CREATE INDEX \"r x\" ON r (x)",
+        "CREATE TABLE t (x, \"select\", z)",
+        "CREATE TABLE \"order\" (x)",
+        "CREATE VIEW \"v-1\" AS SELECT x FROM r",
+        "CREATE TRIGGER \"from\" AFTER INSERT ON r BEGIN SELECT new.x; END",
+    ])?;
+    let replica = remote.bootstrap_replica()?;
+
+    replica.execute("DROP INDEX \"r x\"")?;
+    replica.execute("DROP VIEW \"v-1\"")?;
+    replica.execute("ALTER TABLE t DROP COLUMN z")?;
+    replica.execute("ALTER TABLE t DROP COLUMN \"select\"")?;
+    replica.execute("DROP TABLE \"order\"")?;
+    replica.execute("DROP TRIGGER \"from\"")?;
+    remote.execute_transaction(&["INSERT INTO r VALUES (1)"])?;
+    replica.pull()?;
+    remote.execute_transaction(&["INSERT INTO r VALUES (2)"])?;
+    replica.pull()?;
+    replica.pull()?;
+
+    let expected = Remote::new(&[
+        "CREATE TABLE r (x)",
+        "CREATE TABLE t (x)",
+        "INSERT INTO r VALUES (1)",
+        "INSERT INTO r VALUES (2)",
+    ])?;
+    assert_eq!(replica.snapshot()?, expected.snapshot()?);
+    Ok(())
+}

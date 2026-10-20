@@ -694,18 +694,10 @@ impl DatabaseReplaySession {
 
                 if table == SQLITE_SCHEMA_TABLE {
                     let replay_info = self.generator.replay_info(coro, &change).await?;
-                    if replay_info.is_ddl_replay
-                        && matches!(
-                            replay_info.change_type,
-                            DatabaseChangeType::Insert | DatabaseChangeType::Update
-                        )
-                    {
-                        self.generator
-                            .execute_ddl_idempotent(coro, &replay_info.query)
-                            .await?;
-                    } else {
-                        self.conn.execute(replay_info.query.as_str())?;
-                    }
+                    assert!(replay_info.is_ddl_replay);
+                    self.generator
+                        .execute_ddl_idempotent(coro, &replay_info.query)
+                        .await?;
                 } else {
                     match change.change {
                         DatabaseTapeRowChangeType::Delete {
