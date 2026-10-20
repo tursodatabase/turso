@@ -1,4 +1,6 @@
-use crate::schema::{BTreeCharacteristics, BTreeTable, SchemaObjectType, RESERVED_TABLE_PREFIXES};
+use crate::schema::{
+    BTreeCharacteristics, BTreeTable, Index, SchemaObjectType, RESERVED_TABLE_PREFIXES,
+};
 use crate::storage::pager::CreateBTreeFlags;
 use crate::sync::Arc;
 use crate::translate::{
@@ -12,7 +14,8 @@ use crate::util::{
 use crate::vdbe::builder::{CursorType, ProgramBuilder};
 use crate::vdbe::insn::{CmpInsFlags, Cookie, Insn, RegisterOrLiteral};
 use crate::{bail_parse_error, Connection, Result, MAIN_DB_ID};
-use turso_parser::ast;
+use turso_parser::ast::{self, Cmd};
+use turso_parser::parser::Parser;
 
 fn validate_materialized(
     connection: &Arc<crate::Connection>,
@@ -276,6 +279,72 @@ pub fn translate_create_materialized_view(
             )?;
             parse_schema_names.push(escape_sql_string_literal(&index_name));
         }
+    }
+
+    // Indexes the view's joins need on its base tables, built from the
+    // tables' current rows the way CREATE INDEX builds them. Loading their
+    // schema rows below makes the table's write path keep them up to date.
+    for owned in maintenance_plan.owned_indexes() {
+        let Ok(Some(Cmd::Stmt(ast::Stmt::CreateIndex {
+            columns,
+            where_clause,
+            ..
+        }))) = Parser::new(owned.create_sql.as_bytes()).next().transpose()
+        else {
+            return Err(crate::LimboError::InternalError(format!(
+                "materialized view index does not parse: {}",
+                owned.create_sql
+            )));
+        };
+        let table = resolver
+            .with_schema(database_id, |s| s.get_btree_table(&owned.table_name))
+            .ok_or_else(|| {
+                crate::LimboError::InternalError(format!(
+                    "materialized view index on missing table {}",
+                    owned.table_name
+                ))
+            })?;
+        let index = Arc::new(Index {
+            name: owned.index_name.clone(),
+            table_name: table.name.clone(),
+            root_page: 0,
+            columns: crate::translate::index::resolve_sorted_columns(&table, &columns)?,
+            unique: false,
+            ephemeral: false,
+            has_rowid: table.has_rowid,
+            where_clause,
+            index_method: None,
+            on_conflict: None,
+        });
+        let index_root_reg = program.alloc_register();
+        program.emit_insn(Insn::CreateBtree {
+            db: database_id,
+            root: index_root_reg,
+            flags: CreateBTreeFlags::new_index(),
+        });
+        emit_schema_entry(
+            program,
+            resolver,
+            sqlite_schema_cursor_id,
+            None,
+            SchemaEntryType::Index,
+            &owned.index_name,
+            &table.name,
+            index_root_reg,
+            Some(owned.create_sql.clone()),
+        )?;
+        let index_cursor_id = program.alloc_cursor_index(None, &index)?;
+        crate::translate::index::emit_refill_index(
+            program,
+            resolver,
+            database_id,
+            &table,
+            &index,
+            index_cursor_id,
+            RegisterOrLiteral::Register(index_root_reg),
+            None,
+        )?;
+        parse_schema_names.push(escape_sql_string_literal(&owned.index_name));
     }
 
     // Parse schema to load the new view (and its state table, if any)
@@ -564,6 +633,33 @@ pub fn translate_drop_view(
         Vec::new()
     };
 
+    // The indexes the view owns on its base tables.
+    let owned_indexes: Vec<Arc<Index>> = if is_materialized_view {
+        resolver.with_schema(database_id, |s| {
+            s.indexes
+                .values()
+                .flatten()
+                .filter(|index| {
+                    crate::incremental::view::owned_index_belongs_to_view(
+                        &index.name,
+                        &normalized_view_name,
+                    )
+                })
+                .cloned()
+                .collect()
+        })
+    } else {
+        Vec::new()
+    };
+    for index in &owned_indexes {
+        program.emit_insn(Insn::Destroy {
+            db: database_id,
+            root: index.root_page,
+            former_root_reg: 0,
+            is_temp: 0,
+        });
+    }
+
     // Destroy the internal tables' btrees and indexes (those that exist).
     for internal_table_name in &internal_table_names {
         let internal_indexes: Vec<_> = resolver.with_schema(database_id, |s| {
@@ -637,6 +733,31 @@ pub fn translate_drop_view(
 
     // Check if this row matches the view, DBSP table, or DBSP index
     let skip_delete_label = program.allocate_label();
+    let delete_label = program.allocate_label();
+
+    // An index the view owns on a base table (type='index', its name).
+    if !owned_indexes.is_empty() {
+        let index_type_reg = program.emit_string8_new_reg("index".to_string());
+        let not_owned_index = program.allocate_label();
+        program.emit_insn(Insn::Ne {
+            lhs: col0_reg,
+            rhs: index_type_reg,
+            target_pc: not_owned_index,
+            flags: CmpInsFlags::default(),
+            collation: program.curr_collation(),
+        });
+        for index in &owned_indexes {
+            let index_name_reg = program.emit_string8_new_reg(index.name.clone());
+            program.emit_insn(Insn::Eq {
+                lhs: col1_reg,
+                rhs: index_name_reg,
+                target_pc: delete_label,
+                flags: CmpInsFlags::default(),
+                collation: program.curr_collation(),
+            });
+        }
+        program.preassign_label_to_next_insn(not_owned_index);
+    }
 
     // Check if this is the view entry (type='view' and name=view_name)
     program.emit_insn(Insn::Ne {
@@ -653,7 +774,8 @@ pub fn translate_drop_view(
         flags: CmpInsFlags::default(),
         collation: program.curr_collation(),
     });
-    // Matches view - delete it
+    // Matches view or an owned index - delete it
+    program.preassign_label_to_next_insn(delete_label);
     program.emit_insn(Insn::RowId {
         cursor_id: sqlite_schema_cursor_id,
         dest: rowid_reg,

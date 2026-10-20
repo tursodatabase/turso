@@ -59,11 +59,20 @@ pub(crate) fn state_key_belongs_to_view(key: &str, view_name: &str) -> bool {
     if remainder.is_empty() {
         return true;
     }
+    let is_number = |suffix: &str| !suffix.is_empty() && suffix.bytes().all(|b| b.is_ascii_digit());
     remainder == "__g"
         || remainder == "__r"
-        || remainder.strip_prefix("__a").is_some_and(|aggregate_id| {
-            !aggregate_id.is_empty() && aggregate_id.bytes().all(|byte| byte.is_ascii_digit())
-        })
+        || remainder.strip_prefix("__a").is_some_and(is_number)
+        || remainder.strip_prefix("__i").is_some_and(is_number)
+}
+
+/// Whether an index is one a view owns on one of its base tables,
+/// independent of the storage version embedded in its name.
+pub(crate) fn owned_index_belongs_to_view(index_name: &str, view_name: &str) -> bool {
+    index_name
+        .strip_prefix(crate::schema::DBSP_INDEX_PREFIX)
+        .and_then(|suffix| suffix.split_once('_'))
+        .is_some_and(|(_, key)| state_key_belongs_to_view(key, view_name))
 }
 
 /// Whether a complete hidden metadata or operator table belongs to a view,

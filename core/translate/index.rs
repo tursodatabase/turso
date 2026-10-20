@@ -1222,6 +1222,7 @@ pub fn translate_drop_index(
     resolver: &Resolver,
     if_exists: bool,
     program: &mut ProgramBuilder,
+    connection: &Arc<crate::Connection>,
 ) -> crate::Result<()> {
     let database_id = resolver.resolve_existing_index_database_id(qualified_name)?;
     let idx_name = normalize_ident(qualified_name.name.as_str());
@@ -1256,6 +1257,12 @@ pub fn translate_drop_index(
                 &idx_name
             )));
         }
+    }
+    // Internal indexes, such as those a materialized view owns on its base
+    // tables, go away only with their owner, like CREATE INDEX refuses to
+    // make them.
+    if idx_name.starts_with(crate::schema::TURSO_INTERNAL_PREFIX) && !connection.is_nested_stmt() {
+        crate::bail_parse_error!("Object name reserved for internal use: {}", idx_name);
     }
     // Return an error if the index is an auto-generated constraint-backing index.
     // User-created UNIQUE indexes (via CREATE UNIQUE INDEX) are allowed to be dropped.

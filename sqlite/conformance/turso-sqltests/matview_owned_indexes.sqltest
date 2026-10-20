@@ -1,0 +1,94 @@
+@database :memory:
+@requires-file materialized_views ""
+@skip-file-if mvcc "materialized_views not supported with mvcc"
+@verify-materialized-views
+
+# A join inside a materialized view finds the rows that match a changed row
+# by key. When a base table has no index on its join key, the view creates
+# one. The view owns that index: DROP VIEW removes it and DROP INDEX refuses
+# it. When the WHERE clause filters the join's first table, the index only
+# holds the rows that pass the filter.
+
+test matview-owned-index-partial {
+    CREATE TABLE t1(id INTEGER PRIMARY KEY, p INT, v INT);
+    CREATE TABLE t2(id INTEGER PRIMARY KEY, w TEXT);
+    INSERT INTO t1 VALUES (1, 10, 5), (2, 10, -1), (3, 20, 7), (4, NULL, 9);
+    INSERT INTO t2 VALUES (10, 'a'), (20, 'b'), (30, 'c');
+    CREATE MATERIALIZED VIEW v AS SELECT t1.id, t2.w FROM t1 JOIN t2 ON t1.p = t2.id WHERE t1.v > 0;
+    SELECT name, tbl_name, sql FROM sqlite_schema WHERE name LIKE '__turso_internal_dbsp_index%';
+    SELECT * FROM v ORDER BY id;
+    UPDATE t2 SET w = 'A' WHERE id = 10;
+    UPDATE t1 SET v = 3 WHERE id = 2;
+    UPDATE t1 SET v = 0 WHERE id = 3;
+    INSERT INTO t1 VALUES (5, 30, 1);
+    UPDATE t2 SET w = 'C' WHERE id = 30;
+    DELETE FROM t2 WHERE id = 20;
+    INSERT INTO t2 VALUES (20, 'B');
+    UPDATE t1 SET v = 2 WHERE id = 3;
+    SELECT * FROM v ORDER BY id;
+    PRAGMA integrity_check;
+}
+expect {
+    __turso_internal_dbsp_index_v3_v__n2__i0|t1|CREATE INDEX __turso_internal_dbsp_index_v3_v__n2__i0 ON t1(p COLLATE Binary) WHERE (v > 0)
+    1|a
+    3|b
+    1|A
+    2|A
+    3|B
+    5|C
+    ok
+}
+
+# A user index on the join key is used instead of creating one.
+test matview-owned-index-reuses-user-index {
+    CREATE TABLE t1(id INTEGER PRIMARY KEY, p INT, v INT);
+    CREATE TABLE t2(id INTEGER PRIMARY KEY, w TEXT);
+    CREATE INDEX t1_p ON t1(p);
+    INSERT INTO t1 VALUES (1, 10, 5), (2, 20, 6);
+    INSERT INTO t2 VALUES (10, 'a'), (20, 'b');
+    CREATE MATERIALIZED VIEW v AS SELECT t1.id, t2.w FROM t1 JOIN t2 ON t1.p = t2.id;
+    SELECT count(*) FROM sqlite_schema WHERE name LIKE '__turso_internal_dbsp_index%';
+    UPDATE t2 SET w = 'B' WHERE id = 20;
+    SELECT * FROM v ORDER BY id;
+}
+expect {
+    0
+    1|a
+    2|B
+}
+
+test matview-owned-index-drop-index-refused {
+    CREATE TABLE t1(id INTEGER PRIMARY KEY, p INT);
+    CREATE TABLE t2(id INTEGER PRIMARY KEY, w TEXT);
+    CREATE MATERIALIZED VIEW v AS SELECT t1.id, t2.w FROM t1 JOIN t2 ON t1.p = t2.id;
+    DROP INDEX __turso_internal_dbsp_index_v3_v__n2__i0;
+}
+expect error {
+    reserved for internal use
+}
+
+# DROP VIEW removes the view's indexes, and creating the view again creates
+# them again over the current rows.
+test matview-owned-index-dropped-with-view {
+    CREATE TABLE t1(id INTEGER PRIMARY KEY, p INT);
+    CREATE TABLE t2(id INTEGER PRIMARY KEY, w TEXT);
+    INSERT INTO t1 VALUES (1, 10), (2, 20);
+    INSERT INTO t2 VALUES (10, 'a'), (20, 'b');
+    CREATE MATERIALIZED VIEW v AS SELECT t1.id, t2.w FROM t1 JOIN t2 ON t1.p = t2.id;
+    DROP VIEW v;
+    SELECT count(*) FROM sqlite_schema WHERE name LIKE '__turso_internal_dbsp_index%';
+    INSERT INTO t1 VALUES (3, 10);
+    CREATE MATERIALIZED VIEW v AS SELECT t1.id, t2.w FROM t1 JOIN t2 ON t1.p = t2.id;
+    SELECT count(*) FROM sqlite_schema WHERE name LIKE '__turso_internal_dbsp_index%';
+    UPDATE t2 SET w = 'A' WHERE id = 10;
+    SELECT * FROM v ORDER BY id;
+    PRAGMA integrity_check;
+}
+expect {
+    0
+    1
+    1|A
+    2|b
+    3|A
+    ok
+}

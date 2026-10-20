@@ -1,23 +1,24 @@
 use super::binding::{
-    cache_stream_expr_reg, remap_bound_expr, stream_table_references, BindingRemap,
+    cache_stream_expr_reg, make_joined_table, remap_bound_expr, stream_table_references,
+    BindingRemap,
 };
 use super::output::{EmittedNodeOutput, NodeOutput, NodeOutputContract};
 use super::plan::OperatorStateDef;
 use super::source::materialize_node_output;
 use super::stream::{
-    emit_ephemeral_delta_row, open_ephemeral_delta, scratch_table, ArrangementHandle,
-    ArrangementIdentityColumn, DeltaIdentity, EphemeralDelta,
+    base_arrangement, emit_ephemeral_delta_row, open_ephemeral_delta, scratch_table,
+    ArrangementHandle, ArrangementIdentityColumn, DeltaIdentity, EphemeralDelta,
 };
 use super::MaintenanceInput;
 use crate::alloc::TursoIteratorExt;
 use crate::incremental::dag;
-use crate::schema::{Index, IndexColumn, Schema};
+use crate::schema::{BTreeTable, Index, IndexColumn, Schema};
 use crate::sync::Arc;
 use crate::translate::collate::{get_expr_collation_ctx_with_symbols, CollationSeq};
 use crate::translate::emitter::Resolver;
 use crate::translate::expr::{
-    comparison_affinity, expr_is_array, translate_condition_expr, walk_expr, ConditionMetadata,
-    WalkControl,
+    comparison_affinity, expr_is_array, translate_condition_expr, walk_expr, walk_expr_mut,
+    ConditionMetadata, WalkControl,
 };
 use crate::translate::plan::TableReferences;
 use crate::turso_assert;
@@ -42,7 +43,17 @@ struct JoinInputContract {
     /// `None` while a new view is populated, which reads only arrangements.
     delta: Option<EphemeralDelta>,
     schema: Arc<dag::StreamSchema>,
+    /// Whether each binding of the input carries its SQL rowid.
+    binding_rowids: Arc<[bool]>,
     arrangement: ArrangementHandle,
+}
+
+/// What finding a join's keys, and the inputs each term reads, needs from
+/// one input: its values, and which of its bindings carry their SQL rowid.
+/// Planning a view knows these before any arrangement exists.
+pub(super) struct KeyInput<'a> {
+    pub(super) schema: &'a dag::StreamSchema,
+    pub(super) binding_rowids: &'a [bool],
 }
 
 impl JoinInputContract {
@@ -96,6 +107,7 @@ impl JoinContract {
                 Ok(JoinInputContract {
                     delta,
                     schema: output.contract().schema.clone(),
+                    binding_rowids: output.contract().binding_rowids.clone(),
                     arrangement,
                 })
             })
@@ -104,6 +116,16 @@ impl JoinContract {
             inputs,
             on: on.to_vec(),
         })
+    }
+
+    fn key_inputs(&self) -> Vec<KeyInput<'_>> {
+        self.inputs
+            .iter()
+            .map(|input| KeyInput {
+                schema: &input.schema,
+                binding_rowids: &input.binding_rowids,
+            })
+            .collect()
     }
 }
 
@@ -913,13 +935,23 @@ fn emit_join_phases(
     sink: &mut JoinRowSink<'_>,
 ) -> Result<()> {
     let input_count = contract.inputs.len();
+    let key_inputs = contract.key_inputs();
     let (binding_remap, table_references) = join_table_references(program, contract);
-    let keys = find_join_keys(contract, &binding_remap, &table_references, resolver)?;
+    let keys = find_join_keys(
+        &key_inputs,
+        &contract.on,
+        &binding_remap,
+        &table_references,
+        resolver,
+    )?;
     let term_inputs = contract
         .on
         .iter()
-        .map(|term| term_input_positions(contract, term))
+        .map(|term| term_input_positions(&key_inputs, term))
         .collect::<Result<Vec<_>>>()?;
+    let input_wheres = (0..input_count)
+        .map(|input| input_where_sql(&key_inputs, &contract.on, &term_inputs, input))
+        .collect::<Vec<_>>();
     let terms = JoinTerms {
         exprs: &contract.on,
         binding_remap: &binding_remap,
@@ -948,9 +980,9 @@ fn emit_join_phases(
     for states in phases {
         let driver = match states.iter().position(|state| *state == InputState::Delta) {
             Some(driver) => driver,
-            None => population_driver(schema, contract, &keys, &term_inputs),
+            None => population_driver(schema, contract, &keys, &term_inputs, &input_wheres),
         };
-        let plan = plan_phase(schema, contract, &keys, &term_inputs, driver);
+        let plan = plan_phase(schema, contract, &keys, &term_inputs, &input_wheres, driver);
         emit_join_phase(
             program,
             resolver,
@@ -1033,6 +1065,7 @@ fn plan_phase(
     contract: &JoinContract,
     keys: &[JoinKey],
     term_inputs: &[Vec<usize>],
+    input_wheres: &[Option<String>],
     driver: usize,
 ) -> PhasePlan {
     let input_count = contract.inputs.len();
@@ -1067,9 +1100,15 @@ fn plan_phase(
             if level_keys.is_empty() {
                 continue;
             }
-            let access =
-                persistent_key_access(schema, &contract.inputs[input], input, keys, &level_keys)
-                    .unwrap_or(LevelAccess::ScanAndProbe);
+            let access = persistent_key_access(
+                schema,
+                &contract.inputs[input].arrangement,
+                input,
+                keys,
+                &level_keys,
+                input_wheres[input].as_deref(),
+            )
+            .unwrap_or(LevelAccess::ScanAndProbe);
             let rank = match access {
                 LevelAccess::Rowid { .. } => 0,
                 LevelAccess::Index { .. } => 1,
@@ -1120,10 +1159,11 @@ fn population_driver(
     contract: &JoinContract,
     keys: &[JoinKey],
     term_inputs: &[Vec<usize>],
+    input_wheres: &[Option<String>],
 ) -> usize {
     (0..contract.inputs.len())
         .min_by_key(|driver| {
-            let plan = plan_phase(schema, contract, keys, term_inputs, *driver);
+            let plan = plan_phase(schema, contract, keys, term_inputs, input_wheres, *driver);
             let reads_whole_inputs = plan
                 .levels
                 .iter()
@@ -2150,13 +2190,224 @@ fn join_table_references(
     (binding_remap, table_references)
 }
 
+/// An index one inner join needs on a base table, so that a level reading
+/// that table can look its rows up by key instead of reading it whole.
+pub(super) struct JoinKeyIndex {
+    pub(super) table: Arc<BTreeTable>,
+    /// Table columns with the collation `=` compares them with, in key order.
+    pub(super) columns: Vec<(usize, CollationSeq)>,
+    /// The terms of the join that read only this table, as an index WHERE.
+    pub(super) where_sql: Option<String>,
+}
+
+/// The indexes an inner join needs so that every level of every phase finds
+/// its rows by key, the way Materialize arranges every join input by its
+/// join key. For each base-table input and each other input it shares `=`
+/// terms with, an index on this input's compared columns is needed unless a
+/// rowid or an existing index already serves those keys. A key whose column
+/// affinity would make the index sort values differently from how `=`
+/// compares them is left out (`Affinity::index_affinity_ok`); a level whose
+/// keys are all left out keeps reading its table whole.
+///
+/// `tables[i]` is the base table of input `i` when the view may index it:
+/// a plain scan of a table, not a derived input or a materialized view.
+pub(super) fn needed_join_key_indexes(
+    inputs: &[KeyInput],
+    tables: &[Option<Arc<BTreeTable>>],
+    on: &[ast::Expr],
+    schema: &Schema,
+    resolver: &Resolver,
+) -> Result<Vec<JoinKeyIndex>> {
+    let table_references = TableReferences::new(
+        inputs
+            .iter()
+            .flat_map(|input| input.schema.bindings.iter())
+            .map(|binding| {
+                make_joined_table(&binding.table, &binding.identifier, binding.logical_id)
+            })
+            .collect(),
+        vec![],
+    );
+    let binding_remap = inputs
+        .iter()
+        .flat_map(|input| input.schema.bindings.iter())
+        .map(|binding| (binding.logical_id, binding.logical_id))
+        .collect::<BindingRemap>();
+    let keys = find_join_keys(inputs, on, &binding_remap, &table_references, resolver)?;
+    let term_inputs = on
+        .iter()
+        .map(|term| term_input_positions(inputs, term))
+        .collect::<Result<Vec<_>>>()?;
+    let mut needed: Vec<JoinKeyIndex> = Vec::new();
+    for (input, table) in tables.iter().enumerate() {
+        let Some(table) = table else {
+            continue;
+        };
+        let where_sql = input_where_sql(inputs, on, &term_inputs, input);
+        let arrangement = base_arrangement(table.clone(), None);
+        for other in (0..inputs.len()).filter(|other| *other != input) {
+            let shared_keys = (0..keys.len())
+                .filter(|key| {
+                    keys[*key]
+                        .other_input(input)
+                        .is_some_and(|(side, _)| side == other)
+                })
+                .collect::<Vec<_>>();
+            if shared_keys.is_empty()
+                || persistent_key_access(
+                    schema,
+                    &arrangement,
+                    input,
+                    &keys,
+                    &shared_keys,
+                    where_sql.as_deref(),
+                )
+                .is_some()
+            {
+                continue;
+            }
+            let mut columns = Vec::new();
+            for key in &shared_keys {
+                let Some(JoinKeyColumn::Value(column)) = keys[*key].column_of(input) else {
+                    continue;
+                };
+                let usable = table.columns()[column]
+                    .affinity()
+                    .index_affinity_ok(keys[*key].affinity);
+                if usable && !columns.iter().any(|(indexed, _)| *indexed == column) {
+                    columns.push((column, keys[*key].collation));
+                }
+            }
+            let index = JoinKeyIndex {
+                table: table.clone(),
+                columns,
+                where_sql: where_sql.clone(),
+            };
+            let already_needed = needed.iter().any(|needed| {
+                needed.table.name == index.table.name
+                    && needed.columns == index.columns
+                    && needed.where_sql == index.where_sql
+            });
+            if !index.columns.is_empty() && !already_needed {
+                needed.push(index);
+            }
+        }
+    }
+    Ok(needed)
+}
+
+/// The WHERE of a partial index on `input` that holds exactly the rows the
+/// join can use: the terms that read only `input`, written over its table's
+/// own column names, normalized by [`normalized_where_sql`]. `None` when the
+/// input is not one base table, has no such term, or a term uses an
+/// expression that is not plainly written back as SQL; a full index then
+/// takes its place.
+fn input_where_sql(
+    inputs: &[KeyInput],
+    on: &[ast::Expr],
+    term_inputs: &[Vec<usize>],
+    input: usize,
+) -> Option<String> {
+    let [binding] = inputs[input].schema.bindings.as_slice() else {
+        return None;
+    };
+    let columns = binding.table.columns();
+    let has_rowid_column = columns
+        .iter()
+        .any(|column| column.name.as_deref() == Some("rowid"));
+    let mut combined: Option<ast::Expr> = None;
+    for (term, reads) in on.iter().zip(term_inputs) {
+        if reads.as_slice() != [input] {
+            continue;
+        }
+        let mut written = term.clone();
+        let mut writable = true;
+        walk_expr_mut(&mut written, &mut |node| {
+            match node {
+                ast::Expr::Column { table, column, .. } if *table == binding.logical_id => {
+                    match columns.get(*column).and_then(|column| column.name.clone()) {
+                        Some(name) => *node = ast::Expr::Id(ast::Name::exact(name)),
+                        None => writable = false,
+                    }
+                }
+                ast::Expr::RowId { table, .. }
+                    if *table == binding.logical_id && !has_rowid_column =>
+                {
+                    *node = ast::Expr::Id(ast::Name::exact("rowid".to_string()));
+                }
+                ast::Expr::Id(_)
+                | ast::Expr::Literal(_)
+                | ast::Expr::Binary(..)
+                | ast::Expr::Unary(..)
+                | ast::Expr::Parenthesized(_)
+                | ast::Expr::Between { .. }
+                | ast::Expr::IsNull(_)
+                | ast::Expr::NotNull(_)
+                | ast::Expr::Cast { .. }
+                | ast::Expr::Collate(..)
+                | ast::Expr::Case { .. } => {}
+                ast::Expr::InList { rhs, .. } => {
+                    writable &= rhs
+                        .iter()
+                        .all(|value| !matches!(**value, ast::Expr::Subquery(_)));
+                }
+                ast::Expr::Like { escape: None, .. } => {}
+                ast::Expr::FunctionCall {
+                    distinctness: None,
+                    order_by,
+                    within_group,
+                    filter_over,
+                    ..
+                } if order_by.is_empty()
+                    && within_group.is_empty()
+                    && filter_over.filter_clause.is_none()
+                    && filter_over.over_clause.is_none() => {}
+                _ => writable = false,
+            }
+            Ok(WalkControl::Continue)
+        })
+        .ok()?;
+        if !writable {
+            return None;
+        }
+        let written = ast::Expr::Parenthesized(vec![Box::new(written)]);
+        combined = Some(match combined {
+            None => written,
+            Some(earlier) => {
+                ast::Expr::Binary(Box::new(earlier), ast::Operator::And, Box::new(written))
+            }
+        });
+    }
+    normalized_where_sql(&combined?)
+}
+
+/// The SQL text of an index WHERE, as the parser reads it back: a WHERE
+/// written by [`input_where_sql`] and one loaded from `sqlite_schema` give
+/// the same text exactly when they are the same expression. `None` when the
+/// text does not read back as one expression.
+fn normalized_where_sql(expr: &ast::Expr) -> Option<String> {
+    let sql = format!("SELECT {expr}");
+    let mut parser = turso_parser::parser::Parser::new(sql.as_bytes());
+    let Some(Ok(ast::Cmd::Stmt(ast::Stmt::Select(select)))) = parser.next() else {
+        return None;
+    };
+    let ast::OneSelect::Select { columns, .. } = &select.body.select else {
+        return None;
+    };
+    match columns.as_slice() {
+        [ast::ResultColumn::Expr(expr, _)] if select.body.compounds.is_empty() => {
+            Some(expr.to_string())
+        }
+        _ => None,
+    }
+}
+
 /// The positions of the join inputs a term reads.
-fn term_input_positions(contract: &JoinContract, term: &ast::Expr) -> Result<Vec<usize>> {
+fn term_input_positions(inputs: &[KeyInput], term: &ast::Expr) -> Result<Vec<usize>> {
     let mut positions = Vec::new();
     walk_expr(term, &mut |node| {
         if let ast::Expr::Column { table, .. } | ast::Expr::RowId { table, .. } = node {
-            let position = contract
-                .inputs
+            let position = inputs
                 .iter()
                 .position(|input| {
                     input
@@ -2350,20 +2601,20 @@ impl JoinKey {
 }
 
 fn find_join_keys(
-    contract: &JoinContract,
+    inputs: &[KeyInput],
+    on: &[ast::Expr],
     binding_remap: &BindingRemap,
     table_references: &TableReferences,
     resolver: &Resolver,
 ) -> Result<Vec<JoinKey>> {
     let mut keys = Vec::new();
-    for condition in &contract.on {
+    for condition in on {
         let ast::Expr::Binary(lhs, ast::Operator::Equals, rhs) = condition else {
             continue;
         };
-        let (Some(lhs_side), Some(rhs_side)) = (
-            join_key_column(contract, lhs),
-            join_key_column(contract, rhs),
-        ) else {
+        let (Some(lhs_side), Some(rhs_side)) =
+            (join_key_column(inputs, lhs), join_key_column(inputs, rhs))
+        else {
             continue;
         };
         if lhs_side.0 == rhs_side.0 {
@@ -2409,9 +2660,8 @@ fn join_key_collation(
 }
 
 /// Which input an operand of `=` is a plain column of, if any.
-fn join_key_column(contract: &JoinContract, expr: &ast::Expr) -> Option<(usize, JoinKeyColumn)> {
-    contract
-        .inputs
+fn join_key_column(inputs: &[KeyInput], expr: &ast::Expr) -> Option<(usize, JoinKeyColumn)> {
+    inputs
         .iter()
         .enumerate()
         .find_map(|(position, input)| match expr {
@@ -2426,7 +2676,7 @@ fn join_key_column(contract: &JoinContract, expr: &ast::Expr) -> Option<(usize, 
                 .bindings
                 .iter()
                 .position(|binding| binding.logical_id == *table)
-                .filter(|binding| input.arrangement.binding_rowid_columns()[*binding].is_some())
+                .filter(|binding| input.binding_rowids[*binding])
                 .map(|binding| (position, JoinKeyColumn::BindingRowid(binding))),
             _ => None,
         })
@@ -2439,12 +2689,12 @@ fn join_key_column(contract: &JoinContract, expr: &ast::Expr) -> Option<(usize, 
 /// (SQLite's `sqlite3IndexAffinityOk`).
 fn persistent_key_access(
     schema: &Schema,
-    input: &JoinInputContract,
+    arrangement: &ArrangementHandle,
     position: usize,
     keys: &[JoinKey],
     level_keys: &[usize],
+    input_where: Option<&str>,
 ) -> Option<LevelAccess> {
-    let arrangement = &input.arrangement;
     let table = arrangement.table();
     if !table.has_rowid {
         return None;
@@ -2475,7 +2725,16 @@ fn persistent_key_access(
 
     let mut best: Option<(Arc<Index>, Vec<usize>)> = None;
     for index in schema.get_indices(&table.name) {
-        if index.where_clause.is_some() || index.index_method.is_some() || !index.has_rowid {
+        // A partial index holds only the rows its WHERE accepts. It serves
+        // the level when that WHERE is exactly the terms the level checks on
+        // this input anyway, so the rows it leaves out could never match.
+        let where_serves_level = match &index.where_clause {
+            None => true,
+            Some(index_where) => input_where.is_some_and(|input_where| {
+                normalized_where_sql(index_where).as_deref() == Some(input_where)
+            }),
+        };
+        if !where_serves_level || index.index_method.is_some() || !index.has_rowid {
             continue;
         }
         let mut used = Vec::new();
@@ -2537,6 +2796,7 @@ fn emit_key_affinity(
 #[cfg(test)]
 mod tests {
     use super::super::{compile_maintenance_program, MaintenanceInput};
+    use crate::incremental::view::owned_index_belongs_to_view;
     use crate::sync::Arc;
     use crate::vdbe::builder::CursorType;
     use crate::vdbe::insn::Insn;
@@ -2607,6 +2867,54 @@ mod tests {
         assert_eq!(read_whole, 1);
     }
 
+    /// A chain of six tables with no index on any join key: the view
+    /// creates its own indexes, a partial one where the first table's WHERE
+    /// terms apply, reuses an index the user already has, and maintenance
+    /// reads no stored table or index in full.
+    #[test]
+    fn unindexed_six_way_join_creates_its_own_key_indexes() {
+        let conn = open_views_db("six-way-join-owned-indexes.db");
+        for table in 1..=6 {
+            conn.execute(format!(
+                "CREATE TABLE t{table}(id INTEGER PRIMARY KEY, p INT, v INT)"
+            ))
+            .unwrap();
+        }
+        conn.execute("CREATE INDEX t3_p ON t3(p)").unwrap();
+        conn.execute(
+            "CREATE MATERIALIZED VIEW v AS SELECT t1.v, t6.v FROM t1 \
+             JOIN t2 ON t1.p = t2.id JOIN t3 ON t2.p = t3.id JOIN t4 ON t3.p = t4.id \
+             JOIN t5 ON t4.p = t5.id JOIN t6 ON t5.p = t6.id WHERE t1.v > 0",
+        )
+        .unwrap();
+
+        let schema = conn.schema.read().clone();
+        let mut owned: Vec<(String, Option<String>)> = ["t1", "t2", "t3", "t4", "t5", "t6"]
+            .into_iter()
+            .flat_map(|table| schema.get_indices(table).cloned().collect::<Vec<_>>())
+            .filter(|index| owned_index_belongs_to_view(&index.name, "v"))
+            .map(|index| {
+                (
+                    index.table_name.clone(),
+                    index.where_clause.as_ref().map(|expr| expr.to_string()),
+                )
+            })
+            .collect();
+        owned.sort();
+        assert_eq!(
+            owned,
+            vec![
+                ("t1".to_string(), Some("(v > 0)".to_string())),
+                ("t2".to_string(), None),
+                ("t4".to_string(), None),
+                ("t5".to_string(), None),
+            ]
+        );
+
+        let maintenance = compile_view_program(&conn, "v", MaintenanceInput::TransactionDelta);
+        assert_eq!(stored_table_full_reads(&maintenance), Vec::<String>::new());
+    }
+
     fn open_views_db(name: &str) -> Arc<Connection> {
         #[allow(clippy::arc_with_non_send_sync)]
         let io: Arc<dyn crate::IO> = Arc::new(crate::MemoryIO::new());
@@ -2659,8 +2967,9 @@ mod tests {
             .count()
     }
 
-    /// The stored tables (base tables and hidden view state, not ephemeral
-    /// tables) that a program reads from start to end.
+    /// The stored tables and indexes (base tables, their indexes and hidden
+    /// view state, not ephemeral tables) that a program reads from start to
+    /// end.
     fn stored_table_full_reads(program: &Program) -> Vec<String> {
         program
             .insns
@@ -2670,6 +2979,7 @@ mod tests {
                     CursorType::BTreeTable(table) if table.root_page != 0 => {
                         Some(table.name.clone())
                     }
+                    CursorType::BTreeIndex(index) if !index.ephemeral => Some(index.name.clone()),
                     _ => None,
                 },
                 _ => None,

@@ -86,9 +86,19 @@ Cost of maintaining a join: a run of inner joins is maintained as one join
 that stores no intermediate join results. A changed row of one table is
 joined with the other tables one at a time, following the `=` terms between
 them. A table whose compared column is its INTEGER PRIMARY KEY or has an index
-is looked up by key, so a small write reads only the matching rows. A table
-without such an index is read once per write statement. A table with no `=`
-term to the tables joined before it is paired with every row.
+is looked up by key, so a small write reads only the matching rows. When the
+compared column has no index, the view creates one, named
+`__turso_internal_dbsp_index_v3_<view>__...`. When the WHERE clause filters the
+first table of the join, that table's index only holds the rows that pass the
+filter. These indexes cost space and make writes to those tables slower, like
+any index. They are kept up to date by every write to the table, `DROP VIEW`
+removes them, `DROP INDEX` refuses them, and `VACUUM` creates them again. A user
+index on the same columns is used instead of creating one; if it is dropped
+later, the view does not create a replacement, and the table is read once per
+write statement. The same happens when an index cannot find every matching row,
+for example when the two compared columns convert values to different types
+before comparing. A table with no `=` term to the tables joined before it is
+paired with every row.
 
 ### Aggregation
 

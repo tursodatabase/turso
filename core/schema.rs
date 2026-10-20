@@ -145,6 +145,9 @@ pub const DBSP_ARRANGEMENT_TABLE_PREFIX: &str = "__turso_internal_dbsp_arrangeme
 /// Hidden storage-version marker owned by every materialized view, including
 /// views whose maintenance circuit has no stateful operators.
 pub const DBSP_METADATA_TABLE_PREFIX: &str = "__turso_internal_dbsp_metadata_v";
+/// Index a materialized view owns on one of its base tables, so that its
+/// joins can look that table up by key.
+pub const DBSP_INDEX_PREFIX: &str = "__turso_internal_dbsp_index_v";
 pub const TURSO_INTERNAL_PREFIX: &str = "__turso_internal_";
 pub const SEQ_BACKING_TABLE_PREFIX: &str = "__turso_internal_seq_";
 // Prefix for the hidden sequence *name* owned by an AUTOINCREMENT table.
@@ -1295,6 +1298,18 @@ impl Schema {
             for table in hidden_tables {
                 self.remove_table(&table);
                 self.remove_indices_for_table(&table);
+            }
+            let owned_indexes: Vec<Arc<Index>> = self
+                .indexes
+                .values()
+                .flatten()
+                .filter(|index| {
+                    crate::incremental::view::owned_index_belongs_to_view(&index.name, &name)
+                })
+                .cloned()
+                .try_collect()?;
+            for index in &owned_indexes {
+                self.remove_index(index);
             }
 
             // Remove from materialized view tracking
