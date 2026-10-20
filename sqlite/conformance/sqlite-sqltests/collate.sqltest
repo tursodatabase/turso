@@ -1751,6 +1751,43 @@ expect {
     0|0|1
 }
 
+test collation-min-max-results-are-opaque {
+    CREATE TABLE t1(a TEXT COLLATE NOCASE);
+    INSERT INTO t1 VALUES ('A'), ('C');
+    SELECT min(a) = 'a', max(a) = 'c',
+           min(a COLLATE NOCASE) = 'a', max(a COLLATE NOCASE) = 'c' FROM t1;
+    SELECT min(a) = 'a', max(a) = 'c',
+           min(a COLLATE NOCASE) = 'a', max(a COLLATE NOCASE) = 'c'
+    FROM t1 GROUP BY a IS NOT NULL;
+    SELECT lo = 'a', hi = 'c', explicit_lo = 'a', explicit_hi = 'c'
+    FROM (SELECT min(a) AS lo, max(a) AS hi,
+                 min(a COLLATE NOCASE) AS explicit_lo,
+                 max(a COLLATE NOCASE) AS explicit_hi FROM t1);
+}
+expect {
+    0|0|1|1
+    0|0|1|1
+    0|0|1|1
+}
+
+test collation-aggregate-having-keeps-explicit-collation {
+    CREATE TABLE t1(a TEXT COLLATE NOCASE);
+    INSERT INTO t1 VALUES ('A'), ('C');
+    SELECT 'explicit', min(a) FROM t1 HAVING min(a COLLATE NOCASE) = 'a';
+    SELECT 'implicit', min(a) FROM t1 HAVING min(a) = 'a';
+    SELECT 'explicit-group', min(a) FROM t1
+    GROUP BY a IS NOT NULL HAVING min(a COLLATE NOCASE) = 'a';
+    SELECT 'implicit-group', min(a) FROM t1
+    GROUP BY a IS NOT NULL HAVING min(a) = 'a';
+    SELECT CAST(count(a) AS TEXT) = '2 ',
+           CAST(count(a COLLATE RTRIM) AS TEXT) = '2 ' FROM t1;
+}
+expect {
+    explicit|A
+    explicit-group|A
+    0|1
+}
+
 @cross-check-integrity
 test group_concat_column_uses_binary_collation {
     CREATE TABLE t(value TEXT COLLATE NOCASE);

@@ -461,7 +461,7 @@ test matview-parity-collated-min-to-join {
         FROM familiar_names
         GROUP BY school
       ) AS grouped
-      JOIN exact_familiars AS exact ON grouped.chosen = exact.name;
+      JOIN exact_familiars AS exact ON grouped.chosen COLLATE NOCASE = exact.name;
     SELECT 'init', * FROM chosen_familiars;
     DELETE FROM familiar_names WHERE name = 'A' COLLATE BINARY;
     SELECT 'after-delete', * FROM chosen_familiars;
@@ -472,6 +472,22 @@ expect {
     init|north|A
     after-delete|north|a
     after-restore|north|A
+}
+
+test matview-collation-explicit-aggregate-arguments {
+    CREATE TABLE t1(a TEXT COLLATE NOCASE);
+    INSERT INTO t1 VALUES ('A'), ('C');
+    CREATE MATERIALIZED VIEW v1 AS
+      SELECT min(a) = 'a' AS a, max(a) = 'c' AS b,
+             min(a COLLATE NOCASE) = 'a' AS c,
+             max(a COLLATE NOCASE) = 'c' AS d FROM t1;
+    SELECT * FROM v1;
+    DELETE FROM t1 WHERE a = 'A';
+    SELECT * FROM v1;
+}
+expect {
+    0|0|1|1
+    0|0|0|1
 }
 
 # Explicit COLLATE on a derived expression has precedence over the binary
