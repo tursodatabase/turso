@@ -1,4 +1,6 @@
-use super::binding::{cache_stream_expr_reg, make_joined_table, remap_bound_expr, BindingRemap};
+use super::binding::{
+    cache_stream_expr_reg, remap_bound_expr, stream_table_references, BindingRemap,
+};
 use super::output::{EmittedNodeOutput, NodeOutput, NodeOutputContract};
 use super::plan::OperatorStateDef;
 use super::source::materialize_node_output;
@@ -14,7 +16,8 @@ use crate::sync::Arc;
 use crate::translate::collate::{get_expr_collation_ctx_with_symbols, CollationSeq};
 use crate::translate::emitter::Resolver;
 use crate::translate::expr::{
-    comparison_affinity, expr_is_array, translate_condition_expr, translate_expr, ConditionMetadata,
+    comparison_affinity, expr_is_array, translate_condition_expr, walk_expr, ConditionMetadata,
+    WalkControl,
 };
 use crate::translate::plan::TableReferences;
 use crate::turso_assert;
@@ -28,9 +31,7 @@ use crate::{Connection, LimboError, Result};
 use std::num::NonZeroUsize;
 use turso_parser::ast::{self, SortOrder};
 
-const JOIN_ARITY: usize = 2;
-
-/// One physical input edge of a binary join.
+/// One physical input edge of a join.
 ///
 /// Keeping the delta, logical schema, and maintained arrangement together
 /// prevents emitters from accidentally combining parallel slices belonging
@@ -106,956 +107,6 @@ impl JoinContract {
     }
 }
 
-/// Which relation a join phase reads for one side of the join.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum JoinSide {
-    /// The transaction's captured delta for the table.
-    Delta,
-    /// The table's btree, which at maintenance time holds the post-change
-    /// state.
-    Btree,
-}
-
-/// The bilinear delta decomposition for one binary join:
-/// `d(L ⋈ R) = dL ⋈ R_new + L_new ⋈ dR − dL ⋈ dR`.
-///
-/// Population is one all-arrangement phase with weight +1. Unlike the deleted
-/// n-ary subset expansion, this has constant code size per join node.
-fn binary_join_phases(input: MaintenanceInput) -> &'static [([JoinSide; JOIN_ARITY], bool)] {
-    const POPULATION: &[([JoinSide; JOIN_ARITY], bool)] =
-        &[([JoinSide::Btree, JoinSide::Btree], false)];
-    const MAINTENANCE: &[([JoinSide; JOIN_ARITY], bool)] = &[
-        ([JoinSide::Delta, JoinSide::Btree], false),
-        ([JoinSide::Btree, JoinSide::Delta], false),
-        ([JoinSide::Delta, JoinSide::Delta], true),
-    ];
-    match input {
-        MaintenanceInput::BaseTable => POPULATION,
-        MaintenanceInput::TransactionDelta => MAINTENANCE,
-    }
-}
-
-/// Per-match emission hook for [`emit_join_phase`]: receives the program,
-/// and the per-input physical cursor ids.
-type JoinPhaseSink<'a> = dyn FnMut(&mut ProgramBuilder, &[usize; JOIN_ARITY]) -> Result<()> + 'a;
-
-fn emit_arrangement_column_value(
-    program: &mut ProgramBuilder,
-    column: ArrangementIdentityColumn,
-    cursor_id: usize,
-    dest: usize,
-) {
-    match column {
-        ArrangementIdentityColumn::RowId => {
-            program.emit_insn(Insn::RowId { cursor_id, dest });
-        }
-        ArrangementIdentityColumn::Column(column) => {
-            program.emit_insn(Insn::Column {
-                cursor_id,
-                column,
-                dest,
-                default: None,
-            });
-        }
-    }
-}
-
-fn emit_arrangement_identity_value(
-    program: &mut ProgramBuilder,
-    arrangement: &ArrangementHandle,
-    cursor_id: usize,
-    identity_column: usize,
-    dest: usize,
-) {
-    emit_arrangement_column_value(
-        program,
-        arrangement.identity_columns()[identity_column],
-        cursor_id,
-        dest,
-    );
-}
-
-/// Read the SQL rowid of one binding of a join input. Returns false when the
-/// input does not carry that rowid.
-fn emit_join_input_binding_rowid(
-    program: &mut ProgramBuilder,
-    side: JoinSide,
-    input: &JoinInputContract,
-    cursor_id: usize,
-    binding: usize,
-    dest: usize,
-) -> Result<bool> {
-    let column = match side {
-        JoinSide::Delta => input
-            .delta()?
-            .binding_rowid_columns
-            .get(binding)
-            .copied()
-            .flatten()
-            .map(ArrangementIdentityColumn::Column),
-        JoinSide::Btree => input
-            .arrangement
-            .binding_rowid_columns()
-            .get(binding)
-            .copied()
-            .flatten(),
-    };
-    let Some(column) = column else {
-        return Ok(false);
-    };
-    emit_arrangement_column_value(program, column, cursor_id, dest);
-    Ok(true)
-}
-
-fn emit_join_input_identity(
-    program: &mut ProgramBuilder,
-    side: JoinSide,
-    input: &JoinInputContract,
-    cursor_id: usize,
-    dest: usize,
-) -> Result<usize> {
-    match side {
-        JoinSide::Delta => {
-            let width = input.delta()?.identity.width();
-            for column in 0..width {
-                program.emit_insn(Insn::Column {
-                    cursor_id,
-                    column,
-                    dest: dest + column,
-                    default: None,
-                });
-            }
-            Ok(width)
-        }
-        JoinSide::Btree => {
-            let width = input.arrangement.identity().width();
-            for column in 0..width {
-                emit_arrangement_identity_value(
-                    program,
-                    &input.arrangement,
-                    cursor_id,
-                    column,
-                    dest + column,
-                );
-            }
-            Ok(width)
-        }
-    }
-}
-
-fn join_input_identity(side: JoinSide, input: &JoinInputContract) -> Result<DeltaIdentity> {
-    Ok(match side {
-        JoinSide::Delta => input.delta()?.identity,
-        JoinSide::Btree => input.arrangement.identity(),
-    })
-}
-
-/// Read one logical column of a join input.
-fn emit_join_input_value(
-    program: &mut ProgramBuilder,
-    side: JoinSide,
-    input: &JoinInputContract,
-    cursor_id: usize,
-    logical_column: usize,
-    dest: usize,
-) -> Result<()> {
-    match side {
-        JoinSide::Delta => {
-            program.emit_insn(Insn::Column {
-                cursor_id,
-                column: input.delta()?.value_start + logical_column,
-                dest,
-                default: None,
-            });
-        }
-        JoinSide::Btree => program.emit_column_or_rowid(
-            cursor_id,
-            input.arrangement.value_columns()[logical_column],
-            dest,
-        ),
-    }
-    Ok(())
-}
-
-/// Emit one join delta phase: a loop over the outer input and, for each of
-/// its rows, a loop over the rows of the inner input that can match it. At
-/// the innermost level the ON predicates and WHERE are evaluated, the signed
-/// weight product lands in `w_reg`, and `sink` emits the per-match work with
-/// both cursors positioned (its slice maps input positions to cursor ids).
-///
-/// When the ON clause compares a column of each input with `=`, the inner
-/// rows are found by key instead of by reading the whole inner input: see
-/// [`choose_join_order`]. The full ON clause is still evaluated for every
-/// row found this way, so a lookup may return extra rows but never misses
-/// one.
-#[allow(clippy::too_many_arguments)]
-fn emit_join_phase(
-    program: &mut ProgramBuilder,
-    resolver: &mut Resolver,
-    view_name: &str,
-    schema: &Schema,
-    contract: &JoinContract,
-    sides: &[JoinSide; JOIN_ARITY],
-    negate: bool,
-    w_reg: usize,
-    sink: &mut JoinPhaseSink<'_>,
-) -> Result<()> {
-    // A physical input may carry several SQL bindings after a previous binary
-    // join. Bound expressions are retargeted to fresh phase ids and every
-    // column is seeded from the one physical cursor declared by that edge.
-    let mut binding_remap = BindingRemap::default();
-    let mut phase_bindings = Vec::new();
-    for input in &contract.inputs {
-        for binding in &input.schema.bindings {
-            let phase_id = program.table_reference_counter.next();
-            let previous = binding_remap.insert(binding.logical_id, phase_id);
-            turso_assert!(
-                previous.is_none(),
-                "a join phase must expose each logical binding exactly once"
-            );
-            phase_bindings.push((binding, phase_id));
-        }
-    }
-    let table_references = TableReferences::new(
-        phase_bindings
-            .iter()
-            .map(|(binding, phase_id)| {
-                make_joined_table(&binding.table, &binding.identifier, *phase_id)
-            })
-            .collect(),
-        vec![],
-    );
-
-    let cursor_ids = [
-        open_join_input(program, contract, sides, 0)?,
-        open_join_input(program, contract, sides, 1)?,
-    ];
-    let keys = find_join_keys(contract, &binding_remap, &table_references, resolver)?;
-    let order = choose_join_order(schema, contract, sides, &keys);
-    let (outer, inner) = (order.outer, order.inner);
-
-    // An empty delta makes the whole phase empty; skip it before reading or
-    // indexing an arrangement.
-    let phase_done_label = program.allocate_label();
-    for position in 0..JOIN_ARITY {
-        if sides[position] == JoinSide::Delta {
-            program.emit_insn(Insn::Rewind {
-                cursor_id: cursor_ids[position],
-                pc_if_empty: phase_done_label,
-            });
-        }
-    }
-    let lookup_cursor = match &order.access {
-        InnerAccess::Scan | InnerAccess::Rowid { .. } => None,
-        InnerAccess::Index { index, .. } => {
-            let cursor_id = program.alloc_cursor_id(CursorType::BTreeIndex(index.clone()));
-            program.emit_insn(Insn::OpenRead {
-                cursor_id,
-                root_page: index.root_page,
-                db: 0,
-            });
-            Some(cursor_id)
-        }
-        InnerAccess::TemporaryIndex => Some(emit_temporary_key_index(
-            program,
-            &contract.inputs[inner],
-            sides[inner],
-            inner,
-            cursor_ids[inner],
-            &keys,
-        )?),
-    };
-    let missing_row_label = lookup_cursor.map(|_| program.allocate_label());
-
-    // Bind every logical column to the physical arrangement/delta slot used
-    // in this phase. This keeps expression translation independent of record
-    // layout (aggregate arrangements can project away accumulator payloads,
-    // while ephemeral deltas carry identity before their values).
-    resolver.enable_expr_to_reg_cache();
-    let mut weight_regs = Vec::new();
-    let outer_loop = program.allocate_label();
-    let outer_next = program.allocate_label();
-    let inner_next = program.allocate_label();
-    program.emit_insn(Insn::Rewind {
-        cursor_id: cursor_ids[outer],
-        pc_if_empty: phase_done_label,
-    });
-    program.preassign_label_to_next_insn(outer_loop);
-    emit_join_input_row(
-        program,
-        resolver,
-        &contract.inputs[outer],
-        sides[outer],
-        cursor_ids[outer],
-        &binding_remap,
-        &table_references,
-        &mut weight_regs,
-    )?;
-    let inner_loop = emit_inner_lookup(
-        program,
-        resolver,
-        &table_references,
-        &order,
-        &keys,
-        cursor_ids[inner],
-        lookup_cursor,
-        outer_next,
-        missing_row_label,
-    )?;
-    emit_join_input_row(
-        program,
-        resolver,
-        &contract.inputs[inner],
-        sides[inner],
-        cursor_ids[inner],
-        &binding_remap,
-        &table_references,
-        &mut weight_regs,
-    )?;
-
-    // ON predicates and WHERE: a FALSE or NULL result means this combination
-    // is not a join output.
-    for condition in &contract.on {
-        let bound = remap_bound_expr(condition, &binding_remap)?;
-        let pred_true = program.allocate_label();
-        translate_condition_expr(
-            program,
-            &table_references,
-            &bound,
-            ConditionMetadata {
-                jump_if_condition_is_true: false,
-                jump_target_when_true: pred_true,
-                jump_target_when_false: inner_next,
-                jump_target_when_null: inner_next,
-            },
-            resolver,
-        )?;
-        program.preassign_label_to_next_insn(pred_true);
-    }
-
-    // Signed weight: the product of the delta weights and arrangement
-    // multiplicities times the phase sign.
-    program.emit_int(if negate { -1 } else { 1 }, w_reg);
-    for weight in &weight_regs {
-        program.emit_insn(Insn::Multiply {
-            lhs: w_reg,
-            rhs: *weight,
-            dest: w_reg,
-        });
-    }
-
-    sink(program, &cursor_ids)?;
-
-    program.preassign_label_to_next_insn(inner_next);
-    match (inner_loop, lookup_cursor) {
-        (Some(loop_label), Some(lookup_cursor)) => program.emit_insn(Insn::Next {
-            cursor_id: lookup_cursor,
-            pc_if_next: loop_label,
-            fullscan: false,
-            is_index: true,
-        }),
-        (Some(loop_label), None) => program.emit_insn(Insn::Next {
-            cursor_id: cursor_ids[inner],
-            pc_if_next: loop_label,
-            fullscan: false,
-            is_index: false,
-        }),
-        (None, _) => {}
-    }
-    program.preassign_label_to_next_insn(outer_next);
-    program.emit_insn(Insn::Next {
-        cursor_id: cursor_ids[outer],
-        pc_if_next: outer_loop,
-        fullscan: false,
-        is_index: false,
-    });
-    if let Some(missing_row_label) = missing_row_label {
-        program.emit_insn(Insn::Goto {
-            target_pc: phase_done_label,
-        });
-        program.preassign_label_to_next_insn(missing_row_label);
-        program.emit_insn(Insn::Halt {
-            err_code: crate::error::SQLITE_ERROR,
-            description: format!(
-                "materialized view {view_name}: a join key lookup found a row that does not exist"
-            ),
-            on_error: None,
-            description_reg: None,
-        });
-    }
-    program.preassign_label_to_next_insn(phase_done_label);
-    Ok(())
-}
-
-fn open_join_input(
-    program: &mut ProgramBuilder,
-    contract: &JoinContract,
-    sides: &[JoinSide; JOIN_ARITY],
-    position: usize,
-) -> Result<usize> {
-    let input = &contract.inputs[position];
-    match sides[position] {
-        JoinSide::Delta => Ok(input.delta()?.cursor_id),
-        JoinSide::Btree => {
-            let storage = input.arrangement.table();
-            let cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(storage.clone()));
-            program.emit_insn(Insn::OpenRead {
-                cursor_id,
-                root_page: storage.root_page,
-                db: 0,
-            });
-            Ok(cursor_id)
-        }
-    }
-}
-
-/// One column of a join input that a join key compares.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum JoinKeyColumn {
-    /// A logical column of the input.
-    Value(usize),
-    /// The SQL rowid of one of the input's bindings.
-    BindingRowid(usize),
-}
-
-/// An `a = b` conjunct of the ON clause where `a` is a column of one input
-/// and `b` a column of the other.
-struct JoinKey {
-    /// The compared column of each input, in input order.
-    columns: [JoinKeyColumn; JOIN_ARITY],
-    /// The compared expression of each input, bound to this phase.
-    operands: [ast::Expr; JOIN_ARITY],
-    /// The affinity `=` applies to its operands before comparing them.
-    affinity: Affinity,
-    /// The collation `=` compares text with.
-    collation: CollationSeq,
-}
-
-fn find_join_keys(
-    contract: &JoinContract,
-    binding_remap: &BindingRemap,
-    table_references: &TableReferences,
-    resolver: &Resolver,
-) -> Result<Vec<JoinKey>> {
-    let mut keys = Vec::new();
-    for condition in &contract.on {
-        let ast::Expr::Binary(lhs, ast::Operator::Equals, rhs) = condition else {
-            continue;
-        };
-        let (Some((lhs_input, lhs_column)), Some((rhs_input, rhs_column))) = (
-            join_key_column(contract, lhs),
-            join_key_column(contract, rhs),
-        ) else {
-            continue;
-        };
-        if lhs_input == rhs_input {
-            continue;
-        }
-        let lhs = remap_bound_expr(lhs, binding_remap)?;
-        let rhs = remap_bound_expr(rhs, binding_remap)?;
-        if expr_is_array(&lhs, Some(table_references))
-            || expr_is_array(&rhs, Some(table_references))
-        {
-            continue;
-        }
-        // The same rules the ON condition itself is compiled with.
-        let affinity = comparison_affinity(&lhs, &rhs, Some(table_references), Some(resolver));
-        let collation = join_key_collation(&lhs, &rhs, table_references, resolver)?;
-        let (columns, operands) = if lhs_input == 0 {
-            ([lhs_column, rhs_column], [lhs, rhs])
-        } else {
-            ([rhs_column, lhs_column], [rhs, lhs])
-        };
-        keys.push(JoinKey {
-            columns,
-            operands,
-            affinity,
-            collation,
-        });
-    }
-    Ok(keys)
-}
-
-/// The collation `lhs = rhs` compares text with in the compiled ON condition.
-/// The operands are read from the expression cache, where a column carries
-/// its declared collation (BINARY by default) and a rowid carries none; the
-/// left operand's collation wins.
-fn join_key_collation(
-    lhs: &ast::Expr,
-    rhs: &ast::Expr,
-    table_references: &TableReferences,
-    resolver: &Resolver,
-) -> Result<CollationSeq> {
-    let operand_collation = |expr: &ast::Expr| match expr {
-        ast::Expr::RowId { .. } => Ok(None),
-        _ => {
-            get_expr_collation_ctx_with_symbols(expr, table_references, Some(resolver.symbol_table))
-        }
-    };
-    Ok(match (operand_collation(lhs)?, operand_collation(rhs)?) {
-        (Some((collation, _)), _) | (None, Some((collation, _))) => collation,
-        (None, None) => CollationSeq::Binary,
-    })
-}
-
-/// Which input an operand of `=` is a plain column of, if any.
-fn join_key_column(contract: &JoinContract, expr: &ast::Expr) -> Option<(usize, JoinKeyColumn)> {
-    contract
-        .inputs
-        .iter()
-        .enumerate()
-        .find_map(|(position, input)| match expr {
-            ast::Expr::Column { .. } => input
-                .schema
-                .columns
-                .iter()
-                .position(|column| column.as_ref() == Some(expr))
-                .map(|column| (position, JoinKeyColumn::Value(column))),
-            ast::Expr::RowId { table, .. } => input
-                .schema
-                .bindings
-                .iter()
-                .position(|binding| binding.logical_id == *table)
-                .filter(|binding| input.arrangement.binding_rowid_columns()[*binding].is_some())
-                .map(|binding| (position, JoinKeyColumn::BindingRowid(binding))),
-            _ => None,
-        })
-}
-
-/// How a phase finds the rows of its inner input for one outer row.
-enum InnerAccess {
-    /// Read every row.
-    Scan,
-    /// Seek the inner arrangement's rowid with `keys[key]`.
-    Rowid { key: usize },
-    /// Seek a persistent index of the inner arrangement with `keys`, in the
-    /// index's column order.
-    Index { index: Arc<Index>, keys: Vec<usize> },
-    /// Seek an index over all keys, built from the inner input at the start
-    /// of the phase.
-    TemporaryIndex,
-}
-
-struct JoinOrder {
-    outer: usize,
-    inner: usize,
-    access: InnerAccess,
-}
-
-/// Choose which input to loop over and how to find the matching rows of the
-/// other one.
-///
-/// - An arrangement with a usable rowid or index is looked up directly, as
-///   SQLite's planner would.
-/// - Otherwise a delta is looked up through a temporary index built over it.
-///   The delta is usually small, so the phase reads the arrangement once
-///   instead of once per changed row.
-/// - Population joins two arrangements; the second one gets the temporary
-///   index.
-///
-/// A join with no `=` between the inputs reads every pair of rows.
-fn choose_join_order(
-    schema: &Schema,
-    contract: &JoinContract,
-    sides: &[JoinSide; JOIN_ARITY],
-    keys: &[JoinKey],
-) -> JoinOrder {
-    let scan_with_deltas_outside = || {
-        let outer = if sides[1] == JoinSide::Delta && sides[0] == JoinSide::Btree {
-            1
-        } else {
-            0
-        };
-        JoinOrder {
-            outer,
-            inner: 1 - outer,
-            access: InnerAccess::Scan,
-        }
-    };
-    if keys.is_empty() {
-        return scan_with_deltas_outside();
-    }
-    for inner in [1, 0] {
-        if sides[inner] != JoinSide::Btree {
-            continue;
-        }
-        if let Some(access) = persistent_key_access(schema, &contract.inputs[inner], inner, keys) {
-            return JoinOrder {
-                outer: 1 - inner,
-                inner,
-                access,
-            };
-        }
-    }
-    let inner = [1, 0]
-        .into_iter()
-        .find(|&position| sides[position] == JoinSide::Delta)
-        .unwrap_or(1);
-    if sides[inner] == JoinSide::Btree && !contract.inputs[inner].arrangement.table().has_rowid {
-        return scan_with_deltas_outside();
-    }
-    JoinOrder {
-        outer: 1 - inner,
-        inner,
-        access: InnerAccess::TemporaryIndex,
-    }
-}
-
-/// A rowid or index of the inner arrangement that finds every row the keys
-/// match. An index column is usable only when it sorts values the way `=`
-/// compares them: the same collation, and an affinity under which the
-/// comparison does not convert the stored values (SQLite's
-/// `sqlite3IndexAffinityOk`).
-fn persistent_key_access(
-    schema: &Schema,
-    input: &JoinInputContract,
-    inner: usize,
-    keys: &[JoinKey],
-) -> Option<InnerAccess> {
-    let arrangement = &input.arrangement;
-    let table = arrangement.table();
-    if !table.has_rowid {
-        return None;
-    }
-    let physical_column = |key: &JoinKey| match key.columns[inner] {
-        JoinKeyColumn::Value(column) => Some(arrangement.value_columns()[column]),
-        JoinKeyColumn::BindingRowid(_) => None,
-    };
-    for (position, key) in keys.iter().enumerate() {
-        let is_rowid = match key.columns[inner] {
-            JoinKeyColumn::BindingRowid(binding) => matches!(
-                arrangement.binding_rowid_columns()[binding],
-                Some(ArrangementIdentityColumn::RowId)
-            ),
-            JoinKeyColumn::Value(_) => {
-                physical_column(key).is_some_and(|column| table.columns()[column].is_rowid_alias())
-            }
-        };
-        if is_rowid {
-            return Some(InnerAccess::Rowid { key: position });
-        }
-    }
-
-    let mut best: Option<(Arc<Index>, Vec<usize>)> = None;
-    for index in schema.get_indices(&table.name) {
-        if index.where_clause.is_some() || index.index_method.is_some() || !index.has_rowid {
-            continue;
-        }
-        let mut used = Vec::new();
-        for index_column in &index.columns {
-            if index_column.expr.is_some() || index_column.order != SortOrder::Asc {
-                break;
-            }
-            let table_column = &table.columns()[index_column.pos_in_table];
-            let index_collation = index_column
-                .collation
-                .unwrap_or_else(|| table_column.collation());
-            let Some(position) = keys.iter().enumerate().position(|(position, key)| {
-                !used.contains(&position)
-                    && physical_column(key) == Some(index_column.pos_in_table)
-                    && table_column.affinity().index_affinity_ok(key.affinity)
-                    && same_collation(index_collation, key.collation)
-            }) else {
-                break;
-            };
-            used.push(position);
-        }
-        if !used.is_empty()
-            && best
-                .as_ref()
-                .is_none_or(|(_, keys)| used.len() > keys.len())
-        {
-            best = Some((index.clone(), used));
-        }
-    }
-    best.map(|(index, keys)| InnerAccess::Index { index, keys })
-}
-
-fn same_collation(a: CollationSeq, b: CollationSeq) -> bool {
-    let normalize = |collation| match collation {
-        CollationSeq::Unset => CollationSeq::Binary,
-        other => other,
-    };
-    normalize(a) == normalize(b)
-}
-
-/// Build an index over all join keys of the inner input, holding each row's
-/// key values and its rowid in the inner cursor. Keys are stored with the
-/// affinity and collation `=` uses, and probes get the same affinity, so a
-/// probe finds every row `=` would match.
-fn emit_temporary_key_index(
-    program: &mut ProgramBuilder,
-    input: &JoinInputContract,
-    side: JoinSide,
-    inner: usize,
-    inner_cursor: usize,
-    keys: &[JoinKey],
-) -> Result<usize> {
-    let columns = keys
-        .iter()
-        .enumerate()
-        .map(|(position, key)| IndexColumn {
-            name: format!("k{position}"),
-            order: SortOrder::Asc,
-            nulls_order: None,
-            pos_in_table: position,
-            collation: Some(key.collation),
-            default: None,
-            expr: None,
-        })
-        .try_collect::<crate::alloc::Vec<_>>()?;
-    let index = Arc::new(Index {
-        name: format!("join_keys_{inner_cursor}"),
-        table_name: input.arrangement.table().name.clone(),
-        root_page: 0,
-        columns,
-        unique: false,
-        ephemeral: true,
-        has_rowid: true,
-        where_clause: None,
-        index_method: None,
-        on_conflict: None,
-    });
-    let index_cursor = program.alloc_cursor_id(CursorType::BTreeIndex(index.clone()));
-    program.emit_insn(Insn::OpenAutoindex {
-        cursor_id: index_cursor,
-    });
-
-    let record_start = program.alloc_registers(keys.len() + 1);
-    let record_reg = program.alloc_register();
-    let build_loop = program.allocate_label();
-    let build_done = program.allocate_label();
-    program.emit_insn(Insn::Rewind {
-        cursor_id: inner_cursor,
-        pc_if_empty: build_done,
-    });
-    program.preassign_label_to_next_insn(build_loop);
-    for (position, key) in keys.iter().enumerate() {
-        let dest = record_start + position;
-        match key.columns[inner] {
-            JoinKeyColumn::Value(column) => {
-                emit_join_input_value(program, side, input, inner_cursor, column, dest)?
-            }
-            JoinKeyColumn::BindingRowid(binding) => turso_assert!(
-                emit_join_input_binding_rowid(program, side, input, inner_cursor, binding, dest)?,
-                "a join key reads a rowid its input does not carry"
-            ),
-        }
-    }
-    emit_key_affinity(program, keys.iter().map(|key| key.affinity), record_start);
-    program.emit_insn(Insn::RowId {
-        cursor_id: inner_cursor,
-        dest: record_start + keys.len(),
-    });
-    program.emit_insn(Insn::MakeRecord {
-        start_reg: to_u32(record_start),
-        count: to_u32(keys.len() + 1),
-        dest_reg: to_u32(record_reg),
-        index_name: Some(index.name.clone()),
-        affinity_str: None,
-    });
-    program.emit_insn(Insn::IdxInsert {
-        cursor_id: index_cursor,
-        record_reg,
-        unpacked_start: Some(record_start),
-        unpacked_count: Some(to_u32(keys.len() + 1)),
-        flags: IdxInsertFlags::new().use_seek(false),
-    });
-    program.emit_insn(Insn::Next {
-        cursor_id: inner_cursor,
-        pc_if_next: build_loop,
-        fullscan: false,
-        is_index: false,
-    });
-    program.preassign_label_to_next_insn(build_done);
-    Ok(index_cursor)
-}
-
-/// Read the weight and multiplicity of the current row of one input, and
-/// make its columns and rowids available to expressions.
-#[allow(clippy::too_many_arguments)]
-fn emit_join_input_row(
-    program: &mut ProgramBuilder,
-    resolver: &mut Resolver,
-    input: &JoinInputContract,
-    side: JoinSide,
-    cursor_id: usize,
-    binding_remap: &BindingRemap,
-    table_references: &TableReferences,
-    weight_regs: &mut Vec<usize>,
-) -> Result<()> {
-    let weight_column = match side {
-        JoinSide::Delta => Some(input.delta()?.weight_column),
-        JoinSide::Btree => input.arrangement.count_column(),
-    };
-    if let Some(column) = weight_column {
-        let weight_reg = program.alloc_register();
-        program.emit_insn(Insn::Column {
-            cursor_id,
-            column,
-            dest: weight_reg,
-            default: None,
-        });
-        weight_regs.push(weight_reg);
-    }
-    for (logical_column, column) in input.schema.columns.iter().enumerate() {
-        let Some(expr) = column else {
-            continue;
-        };
-        let value_reg = program.alloc_register();
-        emit_join_input_value(program, side, input, cursor_id, logical_column, value_reg)?;
-        let bound = remap_bound_expr(expr, binding_remap)?;
-        cache_stream_expr_reg(&mut *resolver, bound, value_reg, table_references)?;
-    }
-    for (binding_index, binding) in input.schema.bindings.iter().enumerate() {
-        let rowid_reg = program.alloc_register();
-        if !emit_join_input_binding_rowid(
-            program,
-            side,
-            input,
-            cursor_id,
-            binding_index,
-            rowid_reg,
-        )? {
-            continue;
-        }
-        let phase_id = *binding_remap.get(&binding.logical_id).ok_or_else(|| {
-            LimboError::InternalError("join binding rowid has no phase-local binding".to_string())
-        })?;
-        resolver.cache_expr_reg(
-            std::borrow::Cow::Owned(ast::Expr::RowId {
-                database: None,
-                table: phase_id,
-            }),
-            rowid_reg,
-            false,
-            None,
-        );
-    }
-    Ok(())
-}
-
-/// Position the inner cursor on the first row that can match the current
-/// outer row. Returns the label to loop back to for the next candidate, or
-/// `None` when at most one row can match. Jumps to `outer_next` when no row
-/// matches.
-#[allow(clippy::too_many_arguments)]
-fn emit_inner_lookup(
-    program: &mut ProgramBuilder,
-    resolver: &Resolver,
-    table_references: &TableReferences,
-    order: &JoinOrder,
-    keys: &[JoinKey],
-    inner_cursor: usize,
-    lookup_cursor: Option<usize>,
-    outer_next: BranchOffset,
-    missing_row_label: Option<BranchOffset>,
-) -> Result<Option<BranchOffset>> {
-    let probe_keys: Vec<usize> = match &order.access {
-        InnerAccess::Scan => {
-            program.emit_insn(Insn::Rewind {
-                cursor_id: inner_cursor,
-                pc_if_empty: outer_next,
-            });
-            let inner_loop = program.allocate_label();
-            program.preassign_label_to_next_insn(inner_loop);
-            return Ok(Some(inner_loop));
-        }
-        InnerAccess::Rowid { key } => {
-            let probe_reg = program.alloc_register();
-            translate_expr(
-                program,
-                Some(table_references),
-                &keys[*key].operands[order.outer],
-                probe_reg,
-                resolver,
-            )?;
-            // A table seek compares the key with the rowid the way `=`
-            // does, so a REAL key such as -9.223372036854776e18 finds rowid
-            // -9223372036854775808. SeekRowid would not: it only converts
-            // REALs that integer affinity converts, which excludes the
-            // smallest and largest integers. Every phase must find the same
-            // rows, or a delete would miss a row an insert added.
-            program.emit_insn(Insn::SeekGE {
-                is_index: false,
-                cursor_id: inner_cursor,
-                start_reg: probe_reg,
-                num_regs: 1,
-                target_pc: outer_next,
-                eq_only: true,
-                null_matching_mask: Default::default(),
-            });
-            return Ok(None);
-        }
-        InnerAccess::Index { keys, .. } => keys.clone(),
-        InnerAccess::TemporaryIndex => (0..keys.len()).collect(),
-    };
-    let (Some(lookup_cursor), Some(missing_row_label)) = (lookup_cursor, missing_row_label) else {
-        return Err(LimboError::InternalError(
-            "a join key lookup has no index cursor".to_string(),
-        ));
-    };
-    let probe_start = program.alloc_registers(probe_keys.len());
-    for (position, key) in probe_keys.iter().enumerate() {
-        translate_expr(
-            program,
-            Some(table_references),
-            &keys[*key].operands[order.outer],
-            probe_start + position,
-            resolver,
-        )?;
-    }
-    emit_key_affinity(
-        program,
-        probe_keys.iter().map(|key| keys[*key].affinity),
-        probe_start,
-    );
-    program.emit_insn(Insn::SeekGE {
-        is_index: true,
-        cursor_id: lookup_cursor,
-        start_reg: probe_start,
-        num_regs: probe_keys.len(),
-        target_pc: outer_next,
-        eq_only: true,
-        null_matching_mask: Default::default(),
-    });
-    let inner_loop = program.allocate_label();
-    program.preassign_label_to_next_insn(inner_loop);
-    program.emit_insn(Insn::IdxGT {
-        cursor_id: lookup_cursor,
-        start_reg: probe_start,
-        num_regs: probe_keys.len(),
-        target_pc: outer_next,
-    });
-    let rowid_reg = program.alloc_register();
-    program.emit_insn(Insn::IdxRowId {
-        cursor_id: lookup_cursor,
-        dest: rowid_reg,
-    });
-    program.emit_insn(Insn::SeekRowid {
-        cursor_id: inner_cursor,
-        src_reg: rowid_reg,
-        target_pc: missing_row_label,
-    });
-    Ok(Some(inner_loop))
-}
-
-/// Apply the comparison affinity of each key to consecutive registers.
-fn emit_key_affinity(
-    program: &mut ProgramBuilder,
-    affinities: impl ExactSizeIterator<Item = Affinity>,
-    start_reg: usize,
-) {
-    let Some(count) = NonZeroUsize::new(affinities.len()) else {
-        return;
-    };
-    program.emit_insn(Insn::Affinity {
-        start_reg,
-        count,
-        affinities: affinities.map(|affinity| affinity.aff_mask()).collect(),
-    });
-}
-
 /// Emit a join's natural delta row into a typed ephemeral stream. The join
 /// knows only its declared inputs and predicates; downstream group keys,
 /// aggregate arguments, filters, and projections are evaluated by their own
@@ -1092,12 +143,18 @@ pub(super) fn emit_inner_join(
         output_contract.emitted_identity,
         output_contract.binding_rowids.clone(),
     )?;
-    let eph_cursor_id = channel.cursor_id;
+    match channel.identity {
+        DeltaIdentity::BindingRowids(_) => {}
+        DeltaIdentity::OperatorKey(width) if width == contract.inputs.len() => {}
+        DeltaIdentity::OperatorRowid | DeltaIdentity::OperatorKey(_) => {
+            return Err(LimboError::InternalError(
+                "inner join has an invalid planned identity".to_string(),
+            ));
+        }
+    }
 
     // [transport identity..., binding rowids..., natural join row..., weight].
     let eph_rec_start = program.alloc_registers(channel.record_width());
-    let eph_value_start = eph_rec_start + channel.value_start;
-    let eph_weight_reg = eph_rec_start + channel.weight_column;
     let eph_rowid_reg = program.alloc_register();
     let eph_record_reg = program.alloc_register();
 
@@ -1115,151 +172,109 @@ pub(super) fn emit_inner_join(
         &None,
     );
 
-    let emit_eph_insert = |program: &mut ProgramBuilder| {
-        program.emit_insn(Insn::MakeRecord {
-            start_reg: to_u32(eph_rec_start),
-            count: to_u32(channel.record_width()),
-            dest_reg: to_u32(eph_record_reg),
-            index_name: None,
-            affinity_str: None,
-        });
-        program.emit_insn(Insn::NewRowid {
-            cursor: eph_cursor_id,
-            rowid_reg: eph_rowid_reg,
-            prev_largest_reg: 0,
-        });
-        program.emit_insn(Insn::Insert {
-            cursor: eph_cursor_id,
-            key_reg: eph_rowid_reg,
-            record_reg: eph_record_reg,
-            flag: InsertFlags::new().is_ephemeral_table_insert(),
-            table_name: String::new(),
-        });
-    };
-
-    for &(sides, negate) in binary_join_phases(input) {
-        emit_join_phase(
-            program,
-            &mut resolver,
-            view_name,
-            schema,
-            contract,
-            &sides,
-            negate,
-            eph_weight_reg,
-            &mut |program, cursors| {
-                match channel.identity {
-                    DeltaIdentity::BindingRowids(expected_width) => {
-                        let mut destination = eph_rec_start;
-                        for (position, input) in contract.inputs.iter().enumerate() {
-                            turso_assert!(
-                                matches!(
-                                    join_input_identity(sides[position], input)?,
-                                    DeltaIdentity::BindingRowids(_)
-                                ),
-                                "binding-rowid join output requires binding-rowid inputs"
-                            );
-                            destination += emit_join_input_identity(
-                                program,
-                                sides[position],
-                                input,
-                                cursors[position],
-                                destination,
-                            )?;
-                        }
-                        turso_assert!(
-                            destination == eph_rec_start + expected_width,
-                            "join binding-rowid output width must equal its input identities"
-                        );
-                    }
-                    DeltaIdentity::OperatorKey(2) => {
-                        for (position, input) in contract.inputs.iter().enumerate() {
-                            let source_identity = join_input_identity(sides[position], input)?;
-                            let source_start = program.alloc_registers(source_identity.width());
-                            let width = emit_join_input_identity(
-                                program,
-                                sides[position],
-                                input,
-                                cursors[position],
-                                source_start,
-                            )?;
-                            program.emit_insn(Insn::MakeRecord {
-                                start_reg: to_u32(source_start),
-                                count: to_u32(width),
-                                dest_reg: to_u32(eph_rec_start + position),
-                                index_name: None,
-                                affinity_str: None,
-                            });
-                        }
-                    }
-                    DeltaIdentity::OperatorRowid | DeltaIdentity::OperatorKey(_) => {
-                        return Err(LimboError::InternalError(
-                            "binary inner join has an invalid planned identity".to_string(),
-                        ));
-                    }
-                }
-                let mut output_binding = 0;
-                for (position, input) in contract.inputs.iter().enumerate() {
-                    for input_binding in 0..input.schema.bindings.len() {
-                        if let Some(output_column) = channel.binding_rowid_columns[output_binding] {
-                            if output_column < channel.identity_width() {
-                                turso_assert!(
-                                    channel.identity
-                                        == DeltaIdentity::BindingRowids(
-                                            channel.schema.bindings.len()
-                                        )
-                                        && output_column == output_binding,
-                                    "binding-rowid transport slots must follow binding order"
-                                );
-                            } else {
-                                turso_assert!(
-                                    emit_join_input_binding_rowid(
-                                        program,
-                                        sides[position],
-                                        input,
-                                        cursors[position],
-                                        input_binding,
-                                        eph_rec_start + output_column,
-                                    )?,
-                                    "planned join rowid provenance is unavailable from its input"
-                                );
-                            }
-                        }
-                        output_binding += 1;
-                    }
-                }
-                turso_assert!(
-                    output_binding == channel.schema.bindings.len(),
-                    "join input bindings must match its output provenance contract"
-                );
-                let mut destination = eph_value_start;
-                for (position, (input, cursor_id)) in
-                    contract.inputs.iter().zip(cursors).enumerate()
-                {
-                    for column in 0..input.schema.len() {
-                        emit_join_input_value(
-                            program,
-                            sides[position],
-                            input,
-                            *cursor_id,
-                            column,
-                            destination,
-                        )?;
-                        destination += 1;
-                    }
-                }
-                turso_assert!(
-                    destination == eph_value_start + width,
-                    "join stream row does not match its declared schema"
-                );
-                emit_eph_insert(program);
-                Ok(())
-            },
-        )?;
-    }
+    emit_join_phases(
+        program,
+        &mut resolver,
+        view_name,
+        schema,
+        contract,
+        input,
+        &mut |program, row| {
+            emit_inner_join_output_row(program, contract, &channel, eph_rec_start, row);
+            program.emit_insn(Insn::MakeRecord {
+                start_reg: to_u32(eph_rec_start),
+                count: to_u32(channel.record_width()),
+                dest_reg: to_u32(eph_record_reg),
+                index_name: None,
+                affinity_str: None,
+            });
+            program.emit_insn(Insn::NewRowid {
+                cursor: channel.cursor_id,
+                rowid_reg: eph_rowid_reg,
+                prev_largest_reg: 0,
+            });
+            program.emit_insn(Insn::Insert {
+                cursor: channel.cursor_id,
+                key_reg: eph_rowid_reg,
+                record_reg: eph_record_reg,
+                flag: InsertFlags::new().is_ephemeral_table_insert(),
+                table_name: String::new(),
+            });
+            Ok(())
+        },
+    )?;
 
     drop(syms);
     EmittedNodeOutput::from_ephemeral(node_id, channel, output_contract)
+}
+
+/// Copy one joined row into the output record registers: the inputs'
+/// identities (concatenated, or one packed record per input for an opaque
+/// key), the binding rowids the identity does not already carry, the
+/// inputs' values in input order, and the weight.
+fn emit_inner_join_output_row(
+    program: &mut ProgramBuilder,
+    contract: &JoinContract,
+    channel: &EphemeralDelta,
+    record_start: usize,
+    row: &JoinRow,
+) {
+    let mut identity_column = 0;
+    let mut output_binding = 0;
+    let mut value_column = channel.value_start;
+    for (position, input) in contract.inputs.iter().enumerate() {
+        let image = row.layout.image(position);
+        match channel.identity {
+            DeltaIdentity::BindingRowids(_) => {
+                program.emit_insn(Insn::Copy {
+                    src_reg: row.start + image.identity_start,
+                    dst_reg: record_start + identity_column,
+                    extra_amount: image.identity_width - 1,
+                });
+                identity_column += image.identity_width;
+            }
+            _ => program.emit_insn(Insn::MakeRecord {
+                start_reg: to_u32(row.start + image.identity_start),
+                count: to_u32(image.identity_width),
+                dest_reg: to_u32(record_start + position),
+                index_name: None,
+                affinity_str: None,
+            }),
+        }
+        for slot in &image.binding_rowids {
+            if let Some(output_column) = channel.binding_rowid_columns[output_binding] {
+                if output_column >= channel.identity_width() {
+                    let slot = slot.expect("planned join rowid provenance is unavailable");
+                    program.emit_insn(Insn::Copy {
+                        src_reg: row.start + slot,
+                        dst_reg: record_start + output_column,
+                        extra_amount: 0,
+                    });
+                }
+            }
+            output_binding += 1;
+        }
+        if !input.schema.columns.is_empty() {
+            program.emit_insn(Insn::Copy {
+                src_reg: row.start + image.value_start,
+                dst_reg: record_start + value_column,
+                extra_amount: input.schema.len() - 1,
+            });
+        }
+        value_column += input.schema.len();
+    }
+    turso_assert!(
+        output_binding == channel.schema.bindings.len()
+            && value_column == channel.weight_column
+            && (!matches!(channel.identity, DeltaIdentity::BindingRowids(_))
+                || identity_column == channel.identity_width()),
+        "join row does not match its declared output stream"
+    );
+    program.emit_insn(Insn::Copy {
+        src_reg: row.weight_reg,
+        dst_reg: record_start + channel.weight_column,
+        extra_amount: 0,
+    });
 }
 
 /// Emit a semi or anti join: the rows of the first input that some (semi) or
@@ -1270,8 +285,8 @@ pub(super) fn emit_inner_join(
 ///
 /// - `present`: the row's multiplicity, the integral of the first input's
 ///   delta;
-/// - `matches`: its number of ON matches, the integral of the bilinear join
-///   delta `dA ⋈ B + A ⋈ dB − dA ⋈ dB`;
+/// - `matches`: its number of ON matches, the integral of the join's change
+///   `dA ⋈ B_old + A_new ⋈ dB` (see [`emit_join_phases`]);
 /// - `published`: the weight the row has in the output, which is `present`
 ///   when the match test passes (`matches > 0` for semi, `matches == 0` for
 ///   anti) and zero otherwise, and the image published with it.
@@ -1450,33 +465,33 @@ pub(super) fn emit_semi_or_anti_join(
     program.preassign_label_to_next_insn(presence_done);
 
     // Each changed ON match changes `matches` of its first-input row.
-    let match_weight_reg = program.alloc_register();
-    for &(sides, negate) in binary_join_phases(input) {
-        emit_join_phase(
-            program,
-            &mut resolver,
-            view_name,
-            schema,
-            contract,
-            &sides,
-            negate,
-            match_weight_reg,
-            &mut |program, cursors| {
-                emit_join_input_identity(program, sides[0], rows, cursors[0], row_reg)?;
-                program.emit_int(0, present_change_reg);
-                program.emit_insn(Insn::Copy {
-                    src_reg: match_weight_reg,
-                    dst_reg: matches_change_reg,
-                    extra_amount: 0,
-                });
-                program.emit_insn(Insn::Gosub {
-                    target_pc: add_change_label,
-                    return_reg,
-                });
-                Ok(())
-            },
-        )?;
-    }
+    emit_join_phases(
+        program,
+        &mut resolver,
+        view_name,
+        schema,
+        contract,
+        input,
+        &mut |program, row| {
+            let image = row.layout.image(0);
+            program.emit_insn(Insn::Copy {
+                src_reg: row.start + image.identity_start,
+                dst_reg: row_reg,
+                extra_amount: 0,
+            });
+            program.emit_int(0, present_change_reg);
+            program.emit_insn(Insn::Copy {
+                src_reg: row.weight_reg,
+                dst_reg: matches_change_reg,
+                extra_amount: 0,
+            });
+            program.emit_insn(Insn::Gosub {
+                target_pc: add_change_label,
+                return_reg,
+            });
+            Ok(())
+        },
+    )?;
 
     // Visit each changed row once.
     // State record: [present, matches, published, output image...], where the
@@ -1838,6 +853,1682 @@ fn emit_add_change_subroutine(
     program.emit_insn(Insn::Return {
         return_reg,
         can_fallthrough: false,
+    });
+}
+
+/// Which rows of an input one phase of a delta join reads.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InputState {
+    /// The rows after this transaction's changes: the input's arrangement.
+    New,
+    /// Only this transaction's changes.
+    Delta,
+    /// The rows before the changes: the arrangement, plus the changes with
+    /// their weights negated.
+    Old,
+}
+
+/// Where a join phase reads one input's rows from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum JoinSide {
+    /// The transaction's captured delta for the input.
+    Delta,
+    /// The input's arrangement, which at maintenance time holds the
+    /// post-change state.
+    Btree,
+}
+
+/// One joined row handed to a join's output step: every input's image at
+/// `start` (laid out by `layout`), and the row's signed weight.
+struct JoinRow<'a> {
+    layout: &'a RowLayout,
+    start: usize,
+    weight_reg: usize,
+}
+
+type JoinRowSink<'a> = dyn FnMut(&mut ProgramBuilder, &JoinRow) -> Result<()> + 'a;
+
+/// Emit every row of a join's change, or of its whole result while a view is
+/// populated, into `sink`.
+///
+/// A change to the inputs is the sum of one phase per input (the delta
+/// join): `A'B'C' − ABC = dA·B·C + A'·dB·C + A'·B'·dC`, where `X'` is the
+/// input after the change and `X` before it. Phase `i` reads the inputs
+/// before `i` in their new state, input `i`'s changes, and the inputs after
+/// `i` in their old state, which is the new state plus the changes with their
+/// weights negated. No phase reads a stored intermediate join result.
+///
+/// A phase starts from its driving input and adds one input per level. Level
+/// `k` reads the partial rows of the inputs bound so far from an ephemeral
+/// table and writes the rows extended by one input to the next table, so
+/// each level's code is emitted once. The last level hands its rows to
+/// `sink`. Population is one phase that reads every input in its new state.
+fn emit_join_phases(
+    program: &mut ProgramBuilder,
+    resolver: &mut Resolver,
+    view_name: &str,
+    schema: &Schema,
+    contract: &JoinContract,
+    input: MaintenanceInput,
+    sink: &mut JoinRowSink<'_>,
+) -> Result<()> {
+    let input_count = contract.inputs.len();
+    let (binding_remap, table_references) = join_table_references(program, contract);
+    let keys = find_join_keys(contract, &binding_remap, &table_references, resolver)?;
+    let term_inputs = contract
+        .on
+        .iter()
+        .map(|term| term_input_positions(contract, term))
+        .collect::<Result<Vec<_>>>()?;
+    let terms = JoinTerms {
+        exprs: &contract.on,
+        binding_remap: &binding_remap,
+        table_references: &table_references,
+    };
+    resolver.enable_expr_to_reg_cache();
+
+    let phases: Vec<Vec<InputState>> = match input {
+        MaintenanceInput::BaseTable => vec![vec![InputState::New; input_count]],
+        MaintenanceInput::TransactionDelta => (0..input_count)
+            .map(|driver| {
+                (0..input_count)
+                    .map(|position| match position.cmp(&driver) {
+                        std::cmp::Ordering::Less => InputState::New,
+                        std::cmp::Ordering::Equal => InputState::Delta,
+                        std::cmp::Ordering::Greater => InputState::Old,
+                    })
+                    .collect()
+            })
+            .collect(),
+    };
+    let corrupt_label = program.allocate_label();
+    let done_label = program.allocate_label();
+    let minus_one_reg = program.alloc_register();
+    program.emit_int(-1, minus_one_reg);
+    for states in phases {
+        let driver = match states.iter().position(|state| *state == InputState::Delta) {
+            Some(driver) => driver,
+            None => population_driver(schema, contract, &keys, &term_inputs),
+        };
+        let plan = plan_phase(schema, contract, &keys, &term_inputs, driver);
+        emit_join_phase(
+            program,
+            resolver,
+            view_name,
+            contract,
+            &keys,
+            &terms,
+            &plan,
+            &states,
+            corrupt_label,
+            minus_one_reg,
+            sink,
+        )?;
+    }
+    program.emit_insn(Insn::Goto {
+        target_pc: done_label,
+    });
+    program.preassign_label_to_next_insn(corrupt_label);
+    program.emit_insn(Insn::Halt {
+        err_code: crate::error::SQLITE_ERROR,
+        description: format!(
+            "materialized view {view_name}: a join key lookup found a row that does not exist"
+        ),
+        on_error: None,
+        description_reg: None,
+    });
+    program.preassign_label_to_next_insn(done_label);
+    Ok(())
+}
+
+/// The ON and WHERE terms of a join, and the bindings they are translated with.
+struct JoinTerms<'a> {
+    exprs: &'a [ast::Expr],
+    binding_remap: &'a BindingRemap,
+    table_references: &'a TableReferences,
+}
+
+/// One phase of a delta join: the input it starts from, and the inputs it
+/// adds level by level.
+struct PhasePlan {
+    driver: usize,
+    /// Terms that read only the driver (or nothing): checked before its rows
+    /// enter the first partial table.
+    driver_terms: Vec<usize>,
+    levels: Vec<LevelPlan>,
+}
+
+/// One level of a phase: the input it adds and how it finds that input's
+/// rows for the partial rows bound so far.
+struct LevelPlan {
+    input: usize,
+    /// The join keys between `input` and an input bound earlier.
+    keys: Vec<usize>,
+    access: LevelAccess,
+    /// Terms whose inputs are all bound once `input` is: checked here.
+    terms: Vec<usize>,
+}
+
+/// How a level finds the rows of its input that match a partial row.
+enum LevelAccess {
+    /// Seek the input's rowid with `keys[key]`, once per partial row.
+    Rowid { key: usize },
+    /// Seek an index of the input with `keys` (indexes into the join's keys,
+    /// in the index's column order), once per partial row.
+    Index { index: Arc<Index>, keys: Vec<usize> },
+    /// No usable rowid or index: index the partial rows by their key values,
+    /// read the input once, and look each of its rows up in that index.
+    ScanAndProbe,
+    /// No join key between the input and the bound inputs: every pair.
+    Cross,
+}
+
+/// Choose the order in which a phase adds inputs: from the bound inputs,
+/// follow a join key to an input that can be looked up by rowid, then one
+/// with a usable index, then any keyed input; an input with no key to the
+/// bound ones comes last. Every term is checked at the first level where all
+/// the inputs it reads are bound.
+fn plan_phase(
+    schema: &Schema,
+    contract: &JoinContract,
+    keys: &[JoinKey],
+    term_inputs: &[Vec<usize>],
+    driver: usize,
+) -> PhasePlan {
+    let input_count = contract.inputs.len();
+    let mut bound = vec![driver];
+    let mut placed = vec![false; term_inputs.len()];
+    let mut take_ready_terms = |bound: &[usize]| {
+        (0..term_inputs.len())
+            .filter(|term| {
+                let ready =
+                    !placed[*term] && term_inputs[*term].iter().all(|input| bound.contains(input));
+                if ready {
+                    placed[*term] = true;
+                }
+                ready
+            })
+            .collect::<Vec<_>>()
+    };
+    let driver_terms = take_ready_terms(&bound);
+    let mut levels = Vec::with_capacity(input_count - 1);
+    while bound.len() < input_count {
+        let mut best: Option<(usize, LevelPlan)> = None;
+        for input in (0..input_count).filter(|input| !bound.contains(input)) {
+            let level_keys = keys
+                .iter()
+                .enumerate()
+                .filter(|(_, key)| {
+                    key.other_input(input)
+                        .is_some_and(|(other, _)| bound.contains(&other))
+                })
+                .map(|(position, _)| position)
+                .collect::<Vec<_>>();
+            if level_keys.is_empty() {
+                continue;
+            }
+            let access =
+                persistent_key_access(schema, &contract.inputs[input], input, keys, &level_keys)
+                    .unwrap_or(LevelAccess::ScanAndProbe);
+            let rank = match access {
+                LevelAccess::Rowid { .. } => 0,
+                LevelAccess::Index { .. } => 1,
+                LevelAccess::ScanAndProbe | LevelAccess::Cross => 2,
+            };
+            if best.as_ref().is_none_or(|(best_rank, _)| rank < *best_rank) {
+                best = Some((
+                    rank,
+                    LevelPlan {
+                        input,
+                        keys: level_keys,
+                        access,
+                        terms: Vec::new(),
+                    },
+                ));
+            }
+        }
+        let mut level = match best {
+            Some((_, level)) => level,
+            None => LevelPlan {
+                input: (0..input_count)
+                    .find(|input| !bound.contains(input))
+                    .expect("an unbound input remains"),
+                keys: Vec::new(),
+                access: LevelAccess::Cross,
+                terms: Vec::new(),
+            },
+        };
+        bound.push(level.input);
+        level.terms = take_ready_terms(&bound);
+        levels.push(level);
+    }
+    turso_assert!(
+        placed.iter().all(|placed| *placed),
+        "every join term must be checked at some level"
+    );
+    PhasePlan {
+        driver,
+        driver_terms,
+        levels,
+    }
+}
+
+/// The input that population starts from: the one whose phase looks the
+/// most inputs up by rowid or index instead of reading them whole.
+fn population_driver(
+    schema: &Schema,
+    contract: &JoinContract,
+    keys: &[JoinKey],
+    term_inputs: &[Vec<usize>],
+) -> usize {
+    (0..contract.inputs.len())
+        .min_by_key(|driver| {
+            let plan = plan_phase(schema, contract, keys, term_inputs, *driver);
+            let reads_whole_inputs = plan
+                .levels
+                .iter()
+                .filter(|level| {
+                    matches!(level.access, LevelAccess::ScanAndProbe | LevelAccess::Cross)
+                })
+                .count();
+            (reads_whole_inputs, *driver)
+        })
+        .expect("a join has inputs")
+}
+
+/// Emit one phase: copy the driver's rows that pass its terms into the first
+/// partial table, then add the other inputs level by level.
+#[allow(clippy::too_many_arguments)]
+fn emit_join_phase(
+    program: &mut ProgramBuilder,
+    resolver: &mut Resolver,
+    view_name: &str,
+    contract: &JoinContract,
+    keys: &[JoinKey],
+    terms: &JoinTerms,
+    plan: &PhasePlan,
+    states: &[InputState],
+    corrupt_label: BranchOffset,
+    minus_one_reg: usize,
+    sink: &mut JoinRowSink<'_>,
+) -> Result<()> {
+    let phase_done = program.allocate_label();
+    let driver = &contract.inputs[plan.driver];
+    let (driver_side, driver_cursor) = match states[plan.driver] {
+        InputState::Delta => {
+            // A phase without changes to its driving input adds nothing.
+            let cursor_id = driver.delta()?.cursor_id;
+            program.emit_insn(Insn::Rewind {
+                cursor_id,
+                pc_if_empty: phase_done,
+            });
+            (JoinSide::Delta, cursor_id)
+        }
+        InputState::New => (JoinSide::Btree, open_arrangement(program, driver)),
+        InputState::Old => {
+            return Err(LimboError::InternalError(
+                "a delta join phase cannot start from an input's old state".to_string(),
+            ))
+        }
+    };
+
+    let mut layout = RowLayout::default().with_input(contract, plan.driver);
+    let mut partial = open_partial_table(program, view_name, &layout)?;
+    {
+        let row = program.alloc_registers(layout.width + 1);
+        let weight_reg = row + layout.width;
+        let cache_mark = resolver.expr_to_reg_cache.len();
+        emit_bind_row(resolver, contract, terms, &layout, row)?;
+        let loop_label = program.allocate_label();
+        let next_label = program.allocate_label();
+        let filled = program.allocate_label();
+        program.emit_insn(Insn::Rewind {
+            cursor_id: driver_cursor,
+            pc_if_empty: filled,
+        });
+        program.preassign_label_to_next_insn(loop_label);
+        emit_read_image(
+            program,
+            driver,
+            driver_side,
+            driver_cursor,
+            layout.image(plan.driver),
+            row,
+        )?;
+        match emit_read_weight(program, driver, driver_side, driver_cursor)? {
+            Some(weight) => program.emit_insn(Insn::Copy {
+                src_reg: weight,
+                dst_reg: weight_reg,
+                extra_amount: 0,
+            }),
+            None => program.emit_int(1, weight_reg),
+        }
+        emit_terms(program, resolver, terms, &plan.driver_terms, next_label)?;
+        emit_partial_insert(program, partial, row, layout.width);
+        program.preassign_label_to_next_insn(next_label);
+        program.emit_insn(Insn::Next {
+            cursor_id: driver_cursor,
+            pc_if_next: loop_label,
+            fullscan: false,
+            is_index: false,
+        });
+        program.preassign_label_to_next_insn(filled);
+        resolver.expr_to_reg_cache.truncate(cache_mark);
+    }
+
+    for (position, level) in plan.levels.iter().enumerate() {
+        // No partial rows: nothing joins any more.
+        program.emit_insn(Insn::Rewind {
+            cursor_id: partial,
+            pc_if_empty: phase_done,
+        });
+        let next_layout = layout.with_input(contract, level.input);
+        let output = if position + 1 == plan.levels.len() {
+            LevelOutput::Sink
+        } else {
+            LevelOutput::Partial(open_partial_table(program, view_name, &next_layout)?)
+        };
+        emit_join_level(
+            program,
+            resolver,
+            contract,
+            keys,
+            terms,
+            level,
+            states[level.input],
+            partial,
+            &layout,
+            &next_layout,
+            &output,
+            corrupt_label,
+            minus_one_reg,
+            sink,
+        )?;
+        if let LevelOutput::Partial(next) = output {
+            partial = next;
+        }
+        layout = next_layout;
+    }
+    program.preassign_label_to_next_insn(phase_done);
+    Ok(())
+}
+
+/// Where a level writes the rows it extends: the next partial table, or the
+/// join's output step after the last level.
+enum LevelOutput {
+    Partial(usize),
+    Sink,
+}
+
+/// Emit one level: extend every partial row with the matching rows of
+/// `level.input`. An input read in its old state is read twice at this
+/// level: its arrangement, then its changes with the weights negated.
+#[allow(clippy::too_many_arguments)]
+fn emit_join_level(
+    program: &mut ProgramBuilder,
+    resolver: &mut Resolver,
+    contract: &JoinContract,
+    keys: &[JoinKey],
+    terms: &JoinTerms,
+    level: &LevelPlan,
+    state: InputState,
+    partial: usize,
+    layout: &RowLayout,
+    next_layout: &RowLayout,
+    output: &LevelOutput,
+    corrupt_label: BranchOffset,
+    minus_one_reg: usize,
+    sink: &mut JoinRowSink<'_>,
+) -> Result<()> {
+    let input = &contract.inputs[level.input];
+    let row = program.alloc_registers(next_layout.width + 1);
+    let weight_reg = row + next_layout.width;
+    let cache_mark = resolver.expr_to_reg_cache.len();
+    emit_bind_row(resolver, contract, terms, next_layout, row)?;
+    let mut level_ctx = LevelEmitter {
+        contract,
+        keys,
+        terms,
+        level,
+        partial,
+        layout,
+        next_layout,
+        output,
+        row,
+        weight_reg,
+        partial_weight_reg: program.alloc_register(),
+        corrupt_label,
+        minus_one_reg,
+        partial_index: None,
+    };
+
+    let arrangement_cursor = open_arrangement(program, input);
+    match &level.access {
+        LevelAccess::Rowid { .. } | LevelAccess::Index { .. } => {
+            level_ctx.emit_lookups(program, resolver, arrangement_cursor, sink)?;
+        }
+        LevelAccess::ScanAndProbe => {
+            level_ctx.build_partial_index(program)?;
+            level_ctx.emit_scan_and_probe(
+                program,
+                resolver,
+                JoinSide::Btree,
+                arrangement_cursor,
+                false,
+                sink,
+            )?;
+        }
+        LevelAccess::Cross => level_ctx.emit_cross(
+            program,
+            resolver,
+            JoinSide::Btree,
+            arrangement_cursor,
+            false,
+            sink,
+        )?,
+    }
+    if state == InputState::Old {
+        let delta_cursor = input.delta()?.cursor_id;
+        let delta_done = program.allocate_label();
+        program.emit_insn(Insn::Rewind {
+            cursor_id: delta_cursor,
+            pc_if_empty: delta_done,
+        });
+        match level.access {
+            LevelAccess::Cross => level_ctx.emit_cross(
+                program,
+                resolver,
+                JoinSide::Delta,
+                delta_cursor,
+                true,
+                sink,
+            )?,
+            _ => {
+                if level_ctx.partial_index.is_none() {
+                    level_ctx.build_partial_index(program)?;
+                }
+                level_ctx.emit_scan_and_probe(
+                    program,
+                    resolver,
+                    JoinSide::Delta,
+                    delta_cursor,
+                    true,
+                    sink,
+                )?;
+            }
+        }
+        program.preassign_label_to_next_insn(delta_done);
+    }
+    resolver.expr_to_reg_cache.truncate(cache_mark);
+    Ok(())
+}
+
+/// The state shared by the loops of one level.
+struct LevelEmitter<'a> {
+    contract: &'a JoinContract,
+    keys: &'a [JoinKey],
+    terms: &'a JoinTerms<'a>,
+    level: &'a LevelPlan,
+    /// The partial table this level reads.
+    partial: usize,
+    layout: &'a RowLayout,
+    next_layout: &'a RowLayout,
+    output: &'a LevelOutput,
+    /// The extended row: `layout`'s images, the level input's image, weight.
+    row: usize,
+    weight_reg: usize,
+    partial_weight_reg: usize,
+    corrupt_label: BranchOffset,
+    minus_one_reg: usize,
+    /// An index over the partial rows' key values, once built.
+    partial_index: Option<usize>,
+}
+
+impl LevelEmitter<'_> {
+    /// For each partial row, find the level input's matching rows through
+    /// its rowid or index.
+    fn emit_lookups(
+        &mut self,
+        program: &mut ProgramBuilder,
+        resolver: &mut Resolver,
+        arrangement_cursor: usize,
+        sink: &mut JoinRowSink<'_>,
+    ) -> Result<()> {
+        let input = &self.contract.inputs[self.level.input];
+        let loop_label = program.allocate_label();
+        let next_partial = program.allocate_label();
+        let done = program.allocate_label();
+        program.emit_insn(Insn::Rewind {
+            cursor_id: self.partial,
+            pc_if_empty: done,
+        });
+        program.preassign_label_to_next_insn(loop_label);
+        self.emit_read_partial(program, self.partial);
+        let candidate_loop = match &self.level.access {
+            LevelAccess::Rowid { key } => {
+                // A table seek compares the key with the rowid the way `=`
+                // does, so a REAL key such as -9.223372036854776e18 finds
+                // rowid -9223372036854775808. SeekRowid would not: it only
+                // converts REALs that integer affinity converts.
+                let probe_reg = self.bound_key_reg(*key);
+                program.emit_insn(Insn::SeekGE {
+                    is_index: false,
+                    cursor_id: arrangement_cursor,
+                    start_reg: probe_reg,
+                    num_regs: 1,
+                    target_pc: next_partial,
+                    eq_only: true,
+                    null_matching_mask: Default::default(),
+                });
+                None
+            }
+            LevelAccess::Index { index, keys } => {
+                let index_cursor = program.alloc_cursor_id(CursorType::BTreeIndex(index.clone()));
+                program.emit_insn(Insn::OpenRead {
+                    cursor_id: index_cursor,
+                    root_page: index.root_page,
+                    db: 0,
+                });
+                let probe_start = program.alloc_registers(keys.len());
+                for (position, key) in keys.iter().enumerate() {
+                    program.emit_insn(Insn::Copy {
+                        src_reg: self.bound_key_reg(*key),
+                        dst_reg: probe_start + position,
+                        extra_amount: 0,
+                    });
+                }
+                emit_key_affinity(
+                    program,
+                    keys.iter().map(|key| self.keys[*key].affinity),
+                    probe_start,
+                );
+                program.emit_insn(Insn::SeekGE {
+                    is_index: true,
+                    cursor_id: index_cursor,
+                    start_reg: probe_start,
+                    num_regs: keys.len(),
+                    target_pc: next_partial,
+                    eq_only: true,
+                    null_matching_mask: Default::default(),
+                });
+                let candidate_loop = program.allocate_label();
+                program.preassign_label_to_next_insn(candidate_loop);
+                program.emit_insn(Insn::IdxGT {
+                    cursor_id: index_cursor,
+                    start_reg: probe_start,
+                    num_regs: keys.len(),
+                    target_pc: next_partial,
+                });
+                let rowid_reg = program.alloc_register();
+                program.emit_insn(Insn::IdxRowId {
+                    cursor_id: index_cursor,
+                    dest: rowid_reg,
+                });
+                program.emit_insn(Insn::SeekRowid {
+                    cursor_id: arrangement_cursor,
+                    src_reg: rowid_reg,
+                    target_pc: self.corrupt_label,
+                });
+                Some((candidate_loop, index_cursor))
+            }
+            LevelAccess::ScanAndProbe | LevelAccess::Cross => {
+                return Err(LimboError::InternalError(
+                    "a join level without a rowid or index cannot look rows up".to_string(),
+                ))
+            }
+        };
+        let next_candidate = program.allocate_label();
+        emit_read_image(
+            program,
+            input,
+            JoinSide::Btree,
+            arrangement_cursor,
+            self.next_layout.image(self.level.input),
+            self.row,
+        )?;
+        let source_weight = emit_read_weight(program, input, JoinSide::Btree, arrangement_cursor)?;
+        self.emit_extended_row(
+            program,
+            resolver,
+            source_weight,
+            false,
+            next_candidate,
+            sink,
+        )?;
+        program.preassign_label_to_next_insn(next_candidate);
+        if let Some((candidate_loop, index_cursor)) = candidate_loop {
+            program.emit_insn(Insn::Next {
+                cursor_id: index_cursor,
+                pc_if_next: candidate_loop,
+                fullscan: false,
+                is_index: true,
+            });
+        }
+        program.preassign_label_to_next_insn(next_partial);
+        program.emit_insn(Insn::Next {
+            cursor_id: self.partial,
+            pc_if_next: loop_label,
+            fullscan: false,
+            is_index: false,
+        });
+        program.preassign_label_to_next_insn(done);
+        Ok(())
+    }
+
+    /// Index the partial rows by their values of the level's join keys, with
+    /// the affinity and collation `=` uses, so that a probe with the level
+    /// input's values finds every partial row `=` matches.
+    fn build_partial_index(&mut self, program: &mut ProgramBuilder) -> Result<()> {
+        let key_count = self.level.keys.len();
+        let columns = self
+            .level
+            .keys
+            .iter()
+            .enumerate()
+            .map(|(position, key)| IndexColumn {
+                name: format!("k{position}"),
+                order: SortOrder::Asc,
+                nulls_order: None,
+                pos_in_table: position,
+                collation: Some(self.keys[*key].collation),
+                default: None,
+                expr: None,
+            })
+            .try_collect::<crate::alloc::Vec<_>>()?;
+        let index = Arc::new(Index {
+            name: format!("join_keys_{}", self.partial),
+            table_name: format!("join_partial_{}", self.partial),
+            root_page: 0,
+            columns,
+            unique: false,
+            ephemeral: true,
+            has_rowid: true,
+            where_clause: None,
+            index_method: None,
+            on_conflict: None,
+        });
+        let index_cursor = program.alloc_cursor_id(CursorType::BTreeIndex(index.clone()));
+        program.emit_insn(Insn::OpenAutoindex {
+            cursor_id: index_cursor,
+        });
+        let record_start = program.alloc_registers(key_count + 1);
+        let record_reg = program.alloc_register();
+        let build_loop = program.allocate_label();
+        let built = program.allocate_label();
+        program.emit_insn(Insn::Rewind {
+            cursor_id: self.partial,
+            pc_if_empty: built,
+        });
+        program.preassign_label_to_next_insn(build_loop);
+        for (position, key) in self.level.keys.iter().enumerate() {
+            let (other, column) = self.keys[*key]
+                .other_input(self.level.input)
+                .expect("a level key reaches a bound input");
+            program.emit_insn(Insn::Column {
+                cursor_id: self.partial,
+                column: self.layout.key_offset(other, column),
+                dest: record_start + position,
+                default: None,
+            });
+        }
+        emit_key_affinity(
+            program,
+            self.level.keys.iter().map(|key| self.keys[*key].affinity),
+            record_start,
+        );
+        program.emit_insn(Insn::RowId {
+            cursor_id: self.partial,
+            dest: record_start + key_count,
+        });
+        program.emit_insn(Insn::MakeRecord {
+            start_reg: to_u32(record_start),
+            count: to_u32(key_count + 1),
+            dest_reg: to_u32(record_reg),
+            index_name: Some(index.name.clone()),
+            affinity_str: None,
+        });
+        program.emit_insn(Insn::IdxInsert {
+            cursor_id: index_cursor,
+            record_reg,
+            unpacked_start: Some(record_start),
+            unpacked_count: Some(to_u32(key_count + 1)),
+            flags: IdxInsertFlags::new().use_seek(false),
+        });
+        program.emit_insn(Insn::Next {
+            cursor_id: self.partial,
+            pc_if_next: build_loop,
+            fullscan: false,
+            is_index: false,
+        });
+        program.preassign_label_to_next_insn(built);
+        self.partial_index = Some(index_cursor);
+        Ok(())
+    }
+
+    /// Read every row of the level input from `cursor` once, and look up the
+    /// partial rows it matches in the partial-row index.
+    fn emit_scan_and_probe(
+        &mut self,
+        program: &mut ProgramBuilder,
+        resolver: &mut Resolver,
+        side: JoinSide,
+        cursor: usize,
+        negate: bool,
+        sink: &mut JoinRowSink<'_>,
+    ) -> Result<()> {
+        let input = &self.contract.inputs[self.level.input];
+        let index_cursor = self
+            .partial_index
+            .expect("the partial-row index is built before it is probed");
+        let key_count = self.level.keys.len();
+        let probe_start = program.alloc_registers(key_count);
+        let loop_label = program.allocate_label();
+        let next_input_row = program.allocate_label();
+        let done = program.allocate_label();
+        program.emit_insn(Insn::Rewind {
+            cursor_id: cursor,
+            pc_if_empty: done,
+        });
+        program.preassign_label_to_next_insn(loop_label);
+        for (position, key) in self.level.keys.iter().enumerate() {
+            let column = self.keys[*key]
+                .column_of(self.level.input)
+                .expect("a level key reads the level input");
+            emit_read_key_column(program, input, side, cursor, column, probe_start + position)?;
+        }
+        emit_key_affinity(
+            program,
+            self.level.keys.iter().map(|key| self.keys[*key].affinity),
+            probe_start,
+        );
+        emit_read_image(
+            program,
+            input,
+            side,
+            cursor,
+            self.next_layout.image(self.level.input),
+            self.row,
+        )?;
+        let source_weight = emit_read_weight(program, input, side, cursor)?;
+        program.emit_insn(Insn::SeekGE {
+            is_index: true,
+            cursor_id: index_cursor,
+            start_reg: probe_start,
+            num_regs: key_count,
+            target_pc: next_input_row,
+            eq_only: true,
+            null_matching_mask: Default::default(),
+        });
+        let candidate_loop = program.allocate_label();
+        let next_candidate = program.allocate_label();
+        program.preassign_label_to_next_insn(candidate_loop);
+        program.emit_insn(Insn::IdxGT {
+            cursor_id: index_cursor,
+            start_reg: probe_start,
+            num_regs: key_count,
+            target_pc: next_input_row,
+        });
+        let partial_rowid_reg = program.alloc_register();
+        program.emit_insn(Insn::IdxRowId {
+            cursor_id: index_cursor,
+            dest: partial_rowid_reg,
+        });
+        program.emit_insn(Insn::SeekRowid {
+            cursor_id: self.partial,
+            src_reg: partial_rowid_reg,
+            target_pc: self.corrupt_label,
+        });
+        self.emit_read_partial(program, self.partial);
+        self.emit_extended_row(
+            program,
+            resolver,
+            source_weight,
+            negate,
+            next_candidate,
+            sink,
+        )?;
+        program.preassign_label_to_next_insn(next_candidate);
+        program.emit_insn(Insn::Next {
+            cursor_id: index_cursor,
+            pc_if_next: candidate_loop,
+            fullscan: false,
+            is_index: true,
+        });
+        program.preassign_label_to_next_insn(next_input_row);
+        program.emit_insn(Insn::Next {
+            cursor_id: cursor,
+            pc_if_next: loop_label,
+            fullscan: false,
+            is_index: false,
+        });
+        program.preassign_label_to_next_insn(done);
+        Ok(())
+    }
+
+    /// Pair every partial row with every row of the level input.
+    fn emit_cross(
+        &mut self,
+        program: &mut ProgramBuilder,
+        resolver: &mut Resolver,
+        side: JoinSide,
+        cursor: usize,
+        negate: bool,
+        sink: &mut JoinRowSink<'_>,
+    ) -> Result<()> {
+        let input = &self.contract.inputs[self.level.input];
+        let partial_loop = program.allocate_label();
+        let next_partial = program.allocate_label();
+        let input_loop = program.allocate_label();
+        let next_input_row = program.allocate_label();
+        let done = program.allocate_label();
+        program.emit_insn(Insn::Rewind {
+            cursor_id: self.partial,
+            pc_if_empty: done,
+        });
+        program.preassign_label_to_next_insn(partial_loop);
+        self.emit_read_partial(program, self.partial);
+        program.emit_insn(Insn::Rewind {
+            cursor_id: cursor,
+            pc_if_empty: next_partial,
+        });
+        program.preassign_label_to_next_insn(input_loop);
+        emit_read_image(
+            program,
+            input,
+            side,
+            cursor,
+            self.next_layout.image(self.level.input),
+            self.row,
+        )?;
+        let source_weight = emit_read_weight(program, input, side, cursor)?;
+        self.emit_extended_row(
+            program,
+            resolver,
+            source_weight,
+            negate,
+            next_input_row,
+            sink,
+        )?;
+        program.preassign_label_to_next_insn(next_input_row);
+        program.emit_insn(Insn::Next {
+            cursor_id: cursor,
+            pc_if_next: input_loop,
+            fullscan: false,
+            is_index: false,
+        });
+        program.preassign_label_to_next_insn(next_partial);
+        program.emit_insn(Insn::Next {
+            cursor_id: self.partial,
+            pc_if_next: partial_loop,
+            fullscan: false,
+            is_index: false,
+        });
+        program.preassign_label_to_next_insn(done);
+        Ok(())
+    }
+
+    /// Copy the current partial row's images into the start of the extended
+    /// row, and its weight aside.
+    fn emit_read_partial(&self, program: &mut ProgramBuilder, partial: usize) {
+        for column in 0..self.layout.width {
+            program.emit_insn(Insn::Column {
+                cursor_id: partial,
+                column,
+                dest: self.row + column,
+                default: None,
+            });
+        }
+        program.emit_insn(Insn::Column {
+            cursor_id: partial,
+            column: self.layout.width,
+            dest: self.partial_weight_reg,
+            default: None,
+        });
+    }
+
+    /// With the extended row in registers: compute its weight, check the
+    /// level's terms, and write it to the next partial table or the output.
+    fn emit_extended_row(
+        &self,
+        program: &mut ProgramBuilder,
+        resolver: &mut Resolver,
+        source_weight: Option<usize>,
+        negate: bool,
+        skip_label: BranchOffset,
+        sink: &mut JoinRowSink<'_>,
+    ) -> Result<()> {
+        emit_terms(program, resolver, self.terms, &self.level.terms, skip_label)?;
+        program.emit_insn(Insn::Copy {
+            src_reg: self.partial_weight_reg,
+            dst_reg: self.weight_reg,
+            extra_amount: 0,
+        });
+        for factor in source_weight
+            .into_iter()
+            .chain(negate.then_some(self.minus_one_reg))
+        {
+            program.emit_insn(Insn::Multiply {
+                lhs: self.weight_reg,
+                rhs: factor,
+                dest: self.weight_reg,
+            });
+        }
+        match self.output {
+            LevelOutput::Partial(next) => {
+                emit_partial_insert(program, *next, self.row, self.next_layout.width);
+            }
+            LevelOutput::Sink => sink(
+                program,
+                &JoinRow {
+                    layout: self.next_layout,
+                    start: self.row,
+                    weight_reg: self.weight_reg,
+                },
+            )?,
+        }
+        Ok(())
+    }
+
+    /// The register holding the bound side's value of `key` in the current
+    /// partial row.
+    fn bound_key_reg(&self, key: usize) -> usize {
+        let (other, column) = self.keys[key]
+            .other_input(self.level.input)
+            .expect("a level key reaches a bound input");
+        self.row + self.layout.key_offset(other, column)
+    }
+}
+
+/// Where one input's values sit in a row of bound inputs, relative to the
+/// row's start: its identity, the SQL rowids of its bindings that it
+/// carries, and its logical values.
+#[derive(Debug, Clone)]
+struct InputImage {
+    input: usize,
+    identity_start: usize,
+    identity_width: usize,
+    binding_rowids: Vec<Option<usize>>,
+    value_start: usize,
+}
+
+/// The layout of a row of bound inputs: their images in the order they were
+/// bound. A partial table stores this row followed by its weight.
+#[derive(Debug, Clone, Default)]
+struct RowLayout {
+    images: Vec<InputImage>,
+    width: usize,
+}
+
+impl RowLayout {
+    fn with_input(&self, contract: &JoinContract, input: usize) -> RowLayout {
+        let contract_input = &contract.inputs[input];
+        let identity_start = self.width;
+        let identity_width = contract_input.arrangement.identity().width();
+        let mut next = identity_start + identity_width;
+        let binding_rowids = contract_input
+            .arrangement
+            .binding_rowid_columns()
+            .iter()
+            .map(|column| {
+                column.map(|_| {
+                    next += 1;
+                    next - 1
+                })
+            })
+            .collect();
+        let value_start = next;
+        let mut images = self.images.clone();
+        images.push(InputImage {
+            input,
+            identity_start,
+            identity_width,
+            binding_rowids,
+            value_start,
+        });
+        RowLayout {
+            images,
+            width: value_start + contract_input.schema.len(),
+        }
+    }
+
+    fn image(&self, input: usize) -> &InputImage {
+        self.images
+            .iter()
+            .find(|image| image.input == input)
+            .expect("the input is bound in this row")
+    }
+
+    /// The offset of one key column of a bound input.
+    fn key_offset(&self, input: usize, column: JoinKeyColumn) -> usize {
+        let image = self.image(input);
+        match column {
+            JoinKeyColumn::Value(column) => image.value_start + column,
+            JoinKeyColumn::BindingRowid(binding) => image.binding_rowids[binding]
+                .expect("a rowid join key reads a rowid its input carries"),
+        }
+    }
+}
+
+fn open_partial_table(
+    program: &mut ProgramBuilder,
+    view_name: &str,
+    layout: &RowLayout,
+) -> Result<usize> {
+    let table = scratch_table(
+        &format!("{view_name}_join_partial_{}", layout.images.len()),
+        layout.width + 1,
+    )?;
+    let cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(Arc::new(table)));
+    program.emit_insn(Insn::OpenEphemeral {
+        cursor_id,
+        is_table: true,
+    });
+    Ok(cursor_id)
+}
+
+/// Append the row at `row` (its `width` images followed by the weight) to a
+/// partial table.
+fn emit_partial_insert(program: &mut ProgramBuilder, partial: usize, row: usize, width: usize) {
+    let record_reg = program.alloc_register();
+    program.emit_insn(Insn::MakeRecord {
+        start_reg: to_u32(row),
+        count: to_u32(width + 1),
+        dest_reg: to_u32(record_reg),
+        index_name: None,
+        affinity_str: None,
+    });
+    let rowid_reg = program.alloc_register();
+    program.emit_insn(Insn::NewRowid {
+        cursor: partial,
+        rowid_reg,
+        prev_largest_reg: 0,
+    });
+    program.emit_insn(Insn::Insert {
+        cursor: partial,
+        key_reg: rowid_reg,
+        record_reg,
+        flag: InsertFlags::new().is_ephemeral_table_insert(),
+        table_name: String::new(),
+    });
+}
+
+fn open_arrangement(program: &mut ProgramBuilder, input: &JoinInputContract) -> usize {
+    let storage = input.arrangement.table();
+    let cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(storage.clone()));
+    program.emit_insn(Insn::OpenRead {
+        cursor_id,
+        root_page: storage.root_page,
+        db: 0,
+    });
+    cursor_id
+}
+
+/// Read the current row of one input into its image in a row of bound
+/// inputs.
+fn emit_read_image(
+    program: &mut ProgramBuilder,
+    input: &JoinInputContract,
+    side: JoinSide,
+    cursor_id: usize,
+    image: &InputImage,
+    row: usize,
+) -> Result<()> {
+    let identity_width =
+        emit_join_input_identity(program, side, input, cursor_id, row + image.identity_start)?;
+    turso_assert!(
+        identity_width == image.identity_width,
+        "a join input's delta and arrangement must have the same identity"
+    );
+    for (binding, slot) in image.binding_rowids.iter().enumerate() {
+        if let Some(slot) = slot {
+            turso_assert!(
+                emit_join_input_binding_rowid(
+                    program,
+                    side,
+                    input,
+                    cursor_id,
+                    binding,
+                    row + slot
+                )?,
+                "a join input's delta must carry the rowids its arrangement carries"
+            );
+        }
+    }
+    for column in 0..input.schema.len() {
+        emit_join_input_value(
+            program,
+            side,
+            input,
+            cursor_id,
+            column,
+            row + image.value_start + column,
+        )?;
+    }
+    Ok(())
+}
+
+/// Read the weight of the current row of one input: a change's signed
+/// weight, or an arrangement row's multiplicity. `None` means one.
+fn emit_read_weight(
+    program: &mut ProgramBuilder,
+    input: &JoinInputContract,
+    side: JoinSide,
+    cursor_id: usize,
+) -> Result<Option<usize>> {
+    let column = match side {
+        JoinSide::Delta => Some(input.delta()?.weight_column),
+        JoinSide::Btree => input.arrangement.count_column(),
+    };
+    Ok(column.map(|column| {
+        let weight_reg = program.alloc_register();
+        program.emit_insn(Insn::Column {
+            cursor_id,
+            column,
+            dest: weight_reg,
+            default: None,
+        });
+        weight_reg
+    }))
+}
+
+fn emit_read_key_column(
+    program: &mut ProgramBuilder,
+    input: &JoinInputContract,
+    side: JoinSide,
+    cursor_id: usize,
+    column: JoinKeyColumn,
+    dest: usize,
+) -> Result<()> {
+    match column {
+        JoinKeyColumn::Value(column) => {
+            emit_join_input_value(program, side, input, cursor_id, column, dest)
+        }
+        JoinKeyColumn::BindingRowid(binding) => {
+            turso_assert!(
+                emit_join_input_binding_rowid(program, side, input, cursor_id, binding, dest)?,
+                "a join key reads a rowid its input does not carry"
+            );
+            Ok(())
+        }
+    }
+}
+
+/// Make the values and rowids of every input bound in `layout` available to
+/// expressions, read from the registers at `row`.
+fn emit_bind_row(
+    resolver: &mut Resolver,
+    contract: &JoinContract,
+    terms: &JoinTerms,
+    layout: &RowLayout,
+    row: usize,
+) -> Result<()> {
+    for image in &layout.images {
+        let input = &contract.inputs[image.input];
+        for (column, expr) in input.schema.columns.iter().enumerate() {
+            let Some(expr) = expr else {
+                continue;
+            };
+            let bound = remap_bound_expr(expr, terms.binding_remap)?;
+            cache_stream_expr_reg(
+                resolver,
+                bound,
+                row + image.value_start + column,
+                terms.table_references,
+            )?;
+        }
+        for (binding, slot) in input.schema.bindings.iter().zip(&image.binding_rowids) {
+            let Some(slot) = slot else {
+                continue;
+            };
+            let phase_id = *terms
+                .binding_remap
+                .get(&binding.logical_id)
+                .ok_or_else(|| {
+                    LimboError::InternalError(
+                        "join binding rowid has no phase-local binding".to_string(),
+                    )
+                })?;
+            resolver.cache_expr_reg(
+                std::borrow::Cow::Owned(ast::Expr::RowId {
+                    database: None,
+                    table: phase_id,
+                }),
+                row + slot,
+                false,
+                None,
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Check `selected` terms: a FALSE or NULL result jumps to `skip_label`.
+fn emit_terms(
+    program: &mut ProgramBuilder,
+    resolver: &mut Resolver,
+    terms: &JoinTerms,
+    selected: &[usize],
+    skip_label: BranchOffset,
+) -> Result<()> {
+    for term in selected {
+        let bound = remap_bound_expr(&terms.exprs[*term], terms.binding_remap)?;
+        let term_true = program.allocate_label();
+        translate_condition_expr(
+            program,
+            terms.table_references,
+            &bound,
+            ConditionMetadata {
+                jump_if_condition_is_true: false,
+                jump_target_when_true: term_true,
+                jump_target_when_false: skip_label,
+                jump_target_when_null: skip_label,
+            },
+            resolver,
+        )?;
+        program.preassign_label_to_next_insn(term_true);
+    }
+    Ok(())
+}
+
+/// Phase-local bindings for every input of a join, so that its terms can be
+/// translated against registers.
+fn join_table_references(
+    program: &mut ProgramBuilder,
+    contract: &JoinContract,
+) -> (BindingRemap, TableReferences) {
+    let schema = dag::StreamSchema {
+        columns: Vec::new(),
+        bindings: contract
+            .inputs
+            .iter()
+            .flat_map(|input| input.schema.bindings.iter().cloned())
+            .collect(),
+    };
+    let (table_references, binding_remap) = stream_table_references(program, &schema);
+    (binding_remap, table_references)
+}
+
+/// The positions of the join inputs a term reads.
+fn term_input_positions(contract: &JoinContract, term: &ast::Expr) -> Result<Vec<usize>> {
+    let mut positions = Vec::new();
+    walk_expr(term, &mut |node| {
+        if let ast::Expr::Column { table, .. } | ast::Expr::RowId { table, .. } = node {
+            let position = contract
+                .inputs
+                .iter()
+                .position(|input| {
+                    input
+                        .schema
+                        .bindings
+                        .iter()
+                        .any(|binding| binding.logical_id == *table)
+                })
+                .ok_or_else(|| {
+                    LimboError::InternalError(
+                        "a join term reads a binding outside its inputs".to_string(),
+                    )
+                })?;
+            if !positions.contains(&position) {
+                positions.push(position);
+            }
+        }
+        Ok(WalkControl::Continue)
+    })?;
+    Ok(positions)
+}
+
+fn emit_arrangement_column_value(
+    program: &mut ProgramBuilder,
+    column: ArrangementIdentityColumn,
+    cursor_id: usize,
+    dest: usize,
+) {
+    match column {
+        ArrangementIdentityColumn::RowId => {
+            program.emit_insn(Insn::RowId { cursor_id, dest });
+        }
+        ArrangementIdentityColumn::Column(column) => {
+            program.emit_insn(Insn::Column {
+                cursor_id,
+                column,
+                dest,
+                default: None,
+            });
+        }
+    }
+}
+
+fn emit_arrangement_identity_value(
+    program: &mut ProgramBuilder,
+    arrangement: &ArrangementHandle,
+    cursor_id: usize,
+    identity_column: usize,
+    dest: usize,
+) {
+    emit_arrangement_column_value(
+        program,
+        arrangement.identity_columns()[identity_column],
+        cursor_id,
+        dest,
+    );
+}
+
+/// Read the SQL rowid of one binding of a join input. Returns false when the
+/// input does not carry that rowid.
+fn emit_join_input_binding_rowid(
+    program: &mut ProgramBuilder,
+    side: JoinSide,
+    input: &JoinInputContract,
+    cursor_id: usize,
+    binding: usize,
+    dest: usize,
+) -> Result<bool> {
+    let column = match side {
+        JoinSide::Delta => input
+            .delta()?
+            .binding_rowid_columns
+            .get(binding)
+            .copied()
+            .flatten()
+            .map(ArrangementIdentityColumn::Column),
+        JoinSide::Btree => input
+            .arrangement
+            .binding_rowid_columns()
+            .get(binding)
+            .copied()
+            .flatten(),
+    };
+    let Some(column) = column else {
+        return Ok(false);
+    };
+    emit_arrangement_column_value(program, column, cursor_id, dest);
+    Ok(true)
+}
+
+fn emit_join_input_identity(
+    program: &mut ProgramBuilder,
+    side: JoinSide,
+    input: &JoinInputContract,
+    cursor_id: usize,
+    dest: usize,
+) -> Result<usize> {
+    match side {
+        JoinSide::Delta => {
+            let width = input.delta()?.identity.width();
+            for column in 0..width {
+                program.emit_insn(Insn::Column {
+                    cursor_id,
+                    column,
+                    dest: dest + column,
+                    default: None,
+                });
+            }
+            Ok(width)
+        }
+        JoinSide::Btree => {
+            let width = input.arrangement.identity().width();
+            for column in 0..width {
+                emit_arrangement_identity_value(
+                    program,
+                    &input.arrangement,
+                    cursor_id,
+                    column,
+                    dest + column,
+                );
+            }
+            Ok(width)
+        }
+    }
+}
+
+/// Read one logical column of a join input.
+fn emit_join_input_value(
+    program: &mut ProgramBuilder,
+    side: JoinSide,
+    input: &JoinInputContract,
+    cursor_id: usize,
+    logical_column: usize,
+    dest: usize,
+) -> Result<()> {
+    match side {
+        JoinSide::Delta => {
+            program.emit_insn(Insn::Column {
+                cursor_id,
+                column: input.delta()?.value_start + logical_column,
+                dest,
+                default: None,
+            });
+        }
+        JoinSide::Btree => program.emit_column_or_rowid(
+            cursor_id,
+            input.arrangement.value_columns()[logical_column],
+            dest,
+        ),
+    }
+    Ok(())
+}
+
+/// One column of a join input that a join key compares.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum JoinKeyColumn {
+    /// A logical column of the input.
+    Value(usize),
+    /// The SQL rowid of one of the input's bindings.
+    BindingRowid(usize),
+}
+
+/// An `a = b` term of a join where `a` is a column of one input and `b` a
+/// column of another.
+struct JoinKey {
+    /// The two compared inputs, each with its compared column.
+    sides: [(usize, JoinKeyColumn); 2],
+    /// The affinity `=` applies to its operands before comparing them.
+    affinity: Affinity,
+    /// The collation `=` compares text with.
+    collation: CollationSeq,
+}
+
+impl JoinKey {
+    /// The compared column of `input`, if the key reads it.
+    fn column_of(&self, input: usize) -> Option<JoinKeyColumn> {
+        self.sides
+            .iter()
+            .find(|(side, _)| *side == input)
+            .map(|(_, column)| *column)
+    }
+
+    /// The other side of the key, if one side is `input`.
+    fn other_input(&self, input: usize) -> Option<(usize, JoinKeyColumn)> {
+        match self.sides {
+            [(first, _), other] if first == input => Some(other),
+            [other, (second, _)] if second == input => Some(other),
+            _ => None,
+        }
+    }
+}
+
+fn find_join_keys(
+    contract: &JoinContract,
+    binding_remap: &BindingRemap,
+    table_references: &TableReferences,
+    resolver: &Resolver,
+) -> Result<Vec<JoinKey>> {
+    let mut keys = Vec::new();
+    for condition in &contract.on {
+        let ast::Expr::Binary(lhs, ast::Operator::Equals, rhs) = condition else {
+            continue;
+        };
+        let (Some(lhs_side), Some(rhs_side)) = (
+            join_key_column(contract, lhs),
+            join_key_column(contract, rhs),
+        ) else {
+            continue;
+        };
+        if lhs_side.0 == rhs_side.0 {
+            continue;
+        }
+        let lhs = remap_bound_expr(lhs, binding_remap)?;
+        let rhs = remap_bound_expr(rhs, binding_remap)?;
+        if expr_is_array(&lhs, Some(table_references))
+            || expr_is_array(&rhs, Some(table_references))
+        {
+            continue;
+        }
+        // The same rules the term itself is compiled with.
+        keys.push(JoinKey {
+            sides: [lhs_side, rhs_side],
+            affinity: comparison_affinity(&lhs, &rhs, Some(table_references), Some(resolver)),
+            collation: join_key_collation(&lhs, &rhs, table_references, resolver)?,
+        });
+    }
+    Ok(keys)
+}
+
+/// The collation `lhs = rhs` compares text with in the compiled term. The
+/// operands are read from the expression cache, where a column carries its
+/// declared collation (BINARY by default) and a rowid carries none; the left
+/// operand's collation wins.
+fn join_key_collation(
+    lhs: &ast::Expr,
+    rhs: &ast::Expr,
+    table_references: &TableReferences,
+    resolver: &Resolver,
+) -> Result<CollationSeq> {
+    let operand_collation = |expr: &ast::Expr| match expr {
+        ast::Expr::RowId { .. } => Ok(None),
+        _ => {
+            get_expr_collation_ctx_with_symbols(expr, table_references, Some(resolver.symbol_table))
+        }
+    };
+    Ok(match (operand_collation(lhs)?, operand_collation(rhs)?) {
+        (Some((collation, _)), _) | (None, Some((collation, _))) => collation,
+        (None, None) => CollationSeq::Binary,
+    })
+}
+
+/// Which input an operand of `=` is a plain column of, if any.
+fn join_key_column(contract: &JoinContract, expr: &ast::Expr) -> Option<(usize, JoinKeyColumn)> {
+    contract
+        .inputs
+        .iter()
+        .enumerate()
+        .find_map(|(position, input)| match expr {
+            ast::Expr::Column { .. } => input
+                .schema
+                .columns
+                .iter()
+                .position(|column| column.as_ref() == Some(expr))
+                .map(|column| (position, JoinKeyColumn::Value(column))),
+            ast::Expr::RowId { table, .. } => input
+                .schema
+                .bindings
+                .iter()
+                .position(|binding| binding.logical_id == *table)
+                .filter(|binding| input.arrangement.binding_rowid_columns()[*binding].is_some())
+                .map(|binding| (position, JoinKeyColumn::BindingRowid(binding))),
+            _ => None,
+        })
+}
+
+/// A rowid or index of `input`'s arrangement that finds every row the
+/// `level_keys` (indexes into `keys`) match. An index column is usable only
+/// when it sorts values the way `=` compares them: the same collation, and
+/// an affinity under which the comparison does not convert the stored values
+/// (SQLite's `sqlite3IndexAffinityOk`).
+fn persistent_key_access(
+    schema: &Schema,
+    input: &JoinInputContract,
+    position: usize,
+    keys: &[JoinKey],
+    level_keys: &[usize],
+) -> Option<LevelAccess> {
+    let arrangement = &input.arrangement;
+    let table = arrangement.table();
+    if !table.has_rowid {
+        return None;
+    }
+    let column_of = |key: usize| {
+        keys[key]
+            .column_of(position)
+            .expect("a level key reads the level input")
+    };
+    let physical_column = |key: usize| match column_of(key) {
+        JoinKeyColumn::Value(column) => Some(arrangement.value_columns()[column]),
+        JoinKeyColumn::BindingRowid(_) => None,
+    };
+    for &key in level_keys {
+        let is_rowid = match column_of(key) {
+            JoinKeyColumn::BindingRowid(binding) => matches!(
+                arrangement.binding_rowid_columns()[binding],
+                Some(ArrangementIdentityColumn::RowId)
+            ),
+            JoinKeyColumn::Value(_) => {
+                physical_column(key).is_some_and(|column| table.columns()[column].is_rowid_alias())
+            }
+        };
+        if is_rowid {
+            return Some(LevelAccess::Rowid { key });
+        }
+    }
+
+    let mut best: Option<(Arc<Index>, Vec<usize>)> = None;
+    for index in schema.get_indices(&table.name) {
+        if index.where_clause.is_some() || index.index_method.is_some() || !index.has_rowid {
+            continue;
+        }
+        let mut used = Vec::new();
+        for index_column in &index.columns {
+            if index_column.expr.is_some() || index_column.order != SortOrder::Asc {
+                break;
+            }
+            let table_column = &table.columns()[index_column.pos_in_table];
+            let index_collation = index_column
+                .collation
+                .unwrap_or_else(|| table_column.collation());
+            let Some(key) = level_keys.iter().copied().find(|key| {
+                !used.contains(key)
+                    && physical_column(*key) == Some(index_column.pos_in_table)
+                    && table_column
+                        .affinity()
+                        .index_affinity_ok(keys[*key].affinity)
+                    && same_collation(index_collation, keys[*key].collation)
+            }) else {
+                break;
+            };
+            used.push(key);
+        }
+        if !used.is_empty()
+            && best
+                .as_ref()
+                .is_none_or(|(_, keys)| used.len() > keys.len())
+        {
+            best = Some((index.clone(), used));
+        }
+    }
+    best.map(|(index, keys)| LevelAccess::Index { index, keys })
+}
+
+fn same_collation(a: CollationSeq, b: CollationSeq) -> bool {
+    let normalize = |collation| match collation {
+        CollationSeq::Unset => CollationSeq::Binary,
+        other => other,
+    };
+    normalize(a) == normalize(b)
+}
+
+/// Apply the comparison affinity of each key to consecutive registers.
+fn emit_key_affinity(
+    program: &mut ProgramBuilder,
+    affinities: impl ExactSizeIterator<Item = Affinity>,
+    start_reg: usize,
+) {
+    let Some(count) = NonZeroUsize::new(affinities.len()) else {
+        return;
+    };
+    program.emit_insn(Insn::Affinity {
+        start_reg,
+        count,
+        affinities: affinities.map(|affinity| affinity.aff_mask()).collect(),
     });
 }
 

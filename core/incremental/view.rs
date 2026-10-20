@@ -14,10 +14,12 @@ use turso_parser::{
 };
 
 /// Version of the materialized-view storage format embedded in every hidden
-/// table name. Version 1 is the interpreter layout released on `main`;
-/// version 2 is the VDBE-maintained operator-DAG layout developed on this
-/// branch. Bump this only after a layout has shipped or been shared.
-pub const DBSP_CIRCUIT_VERSION: u32 = 2;
+/// table name. Version 1 is the interpreter layout; version 2 compiled
+/// maintenance to bytecode but stored the result of every join in a chain;
+/// version 3 joins a run of inner joins in one node and stores no
+/// intermediate join results. Bump this whenever the hidden tables of a view
+/// change after a layout has shipped or been shared.
+pub const DBSP_CIRCUIT_VERSION: u32 = 3;
 
 pub(crate) fn dbsp_version_marker_table_name(view_name: &str) -> String {
     format!(

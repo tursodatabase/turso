@@ -17,6 +17,7 @@ use crate::translate::plan::{
 };
 use crate::translate::planner::resolve_window_and_aggregate_functions;
 use crate::translate::select::prepare_select_plan;
+use crate::turso_assert;
 use crate::util::walk_expr_with_subqueries;
 use crate::vdbe::affinity::Affinity;
 use crate::vdbe::builder::{ProgramBuilder, ProgramBuilderOpts};
@@ -374,39 +375,48 @@ fn build_select_plan_dag(
         }
     }
 
+    // A run of inner joins becomes one join node over all its inputs, so it
+    // keeps no intermediate join results. Outer, semi and anti joins end the
+    // run: they take the run's result as their first input.
     let mut node = inputs[0];
+    let mut run = Vec::new();
+    let mut run_terms = Vec::new();
     for step in 0..inputs.len() {
         if step > 0 {
-            let pair = vec![node, inputs[step]];
             let on = std::mem::take(&mut on_by_step[step]);
-            node = match join_types[step] {
-                JoinType::Inner => builder.push(dag::OpNode::Join {
-                    inputs: pair,
-                    on,
-                    kind: dag::JoinKind::Inner,
-                })?,
-                JoinType::LeftOuter => push_outer_join(builder, pair, on, true, false)?,
-                JoinType::RightOuter => push_outer_join(builder, pair, on, false, true)?,
-                JoinType::FullOuter => push_outer_join(builder, pair, on, true, true)?,
-                JoinType::Semi => builder.push(dag::OpNode::Join {
-                    inputs: pair,
-                    on,
-                    kind: dag::JoinKind::Semi,
-                })?,
-                JoinType::Anti => builder.push(dag::OpNode::Join {
-                    inputs: pair,
-                    on,
-                    kind: dag::JoinKind::Anti,
-                })?,
-            };
+            if join_types[step] == JoinType::Inner {
+                run.push(inputs[step]);
+                run_terms.extend(on);
+            } else {
+                node = push_inner_run(builder, node, &mut run, &mut run_terms)?;
+                let pair = vec![node, inputs[step]];
+                node = match join_types[step] {
+                    JoinType::LeftOuter => push_outer_join(builder, pair, on, true, false)?,
+                    JoinType::RightOuter => push_outer_join(builder, pair, on, false, true)?,
+                    JoinType::FullOuter => push_outer_join(builder, pair, on, true, true)?,
+                    JoinType::Semi => builder.push(dag::OpNode::Join {
+                        inputs: pair,
+                        on,
+                        kind: dag::JoinKind::Semi,
+                    })?,
+                    JoinType::Anti => builder.push(dag::OpNode::Join {
+                        inputs: pair,
+                        on,
+                        kind: dag::JoinKind::Anti,
+                    })?,
+                    JoinType::Inner => unreachable!("inner joins extend the run"),
+                };
+            }
         }
         if let Some(predicate) = combine_predicates(std::mem::take(&mut filters_by_step[step])) {
+            node = push_inner_run(builder, node, &mut run, &mut run_terms)?;
             node = builder.push(dag::OpNode::Filter {
                 input: node,
                 predicate,
             })?;
         }
     }
+    node = push_inner_run(builder, node, &mut run, &mut run_terms)?;
 
     if plan.group_by.is_some() || !plan.aggregates.is_empty() {
         let (group_exprs, group_keys, scalar) = if plan
@@ -511,6 +521,26 @@ fn build_select_plan_dag(
     }
 
     Ok(node)
+}
+
+/// Join `first` with the inputs collected in `run` by one inner join node,
+/// and empty the run. Returns `first` when the run is empty.
+fn push_inner_run(
+    builder: &mut dag::DagBuilder,
+    first: dag::NodeId,
+    run: &mut Vec<dag::NodeId>,
+    terms: &mut Vec<ast::Expr>,
+) -> Result<dag::NodeId> {
+    if run.is_empty() {
+        turso_assert!(terms.is_empty(), "join terms need a join");
+        return Ok(first);
+    }
+    let inputs = std::iter::once(first).chain(run.drain(..)).collect();
+    builder.push(dag::OpNode::Join {
+        inputs,
+        on: std::mem::take(terms),
+        kind: dag::JoinKind::Inner,
+    })
 }
 
 /// Build an outer join from simpler operators: the inner join, plus the

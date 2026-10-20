@@ -36,7 +36,8 @@ one:
   MATERIALIZED VIEW` statement to fill it again from the current source data.
 
 Every view created before materialized views were compiled to VDBE bytecode
-(storage version 1) is in this state.
+(storage version 1), and every view created before a run of inner joins was
+maintained as one join (storage version 2), is in this state.
 
 In the tables below, ✅ means the feature is implemented and part of the
 intended supported surface. 🚧 identifies an implemented feature with an
@@ -81,12 +82,13 @@ even if the regular query engine does.
 | Multi-way and nested joins | ✅ Yes | Covered through five-way joins; there is no fixed shape limit. |
 | Joins over derived, aggregate, distinct, or set-operation results | ✅ Yes | Both join inputs use the same composable stream contract. |
 
-Cost of maintaining a join: when the ON clause compares a column of each
-input with `=`, a changed row finds its matches through the other table's
-INTEGER PRIMARY KEY or an index on the compared column, so a small write
-reads only the matching rows. Without such an index, each write statement
-reads the other input once. A join without any `=` between the inputs reads
-every pair of changed and stored rows.
+Cost of maintaining a join: a run of inner joins is maintained as one join
+that stores no intermediate join results. A changed row of one table is
+joined with the other tables one at a time, following the `=` terms between
+them. A table whose compared column is its INTEGER PRIMARY KEY or has an index
+is looked up by key, so a small write reads only the matching rows. A table
+without such an index is read once per write statement. A table with no `=`
+term to the tables joined before it is paired with every row.
 
 ### Aggregation
 
