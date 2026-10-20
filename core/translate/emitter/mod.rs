@@ -1907,30 +1907,11 @@ pub fn emit_cdc_autocommit_commit(
         jump_if_null: true,
     });
 
+    emit_skip_if_no_captured_change(program, skip_label);
+
     let cdc_cursor_id = match cdc_cursor_id {
         Some(cdc_cursor_id) => cdc_cursor_id,
         None => {
-            // A trigger or FK action fired during this statement may have captured a row
-            // elsewhere. Only write the COMMIT record when something was actually captured.
-            let minus_one_reg = program.alloc_register();
-            program.emit_int(-1, minus_one_reg);
-            let txn_id_reg = program.alloc_register();
-            program.emit_insn(Insn::Function {
-                constant_mask: 0,
-                start_reg: minus_one_reg,
-                dest: txn_id_reg,
-                func: crate::function::FuncCtx {
-                    func: Func::Scalar(crate::function::ScalarFunc::ConnTxnId),
-                    arg_count: 1,
-                },
-            });
-            program.emit_insn(Insn::Eq {
-                lhs: txn_id_reg,
-                rhs: minus_one_reg,
-                target_pc: skip_label,
-                flags: crate::vdbe::insn::CmpInsFlags::default(),
-                collation: None,
-            });
             let (cursor_id, _) =
                 prepare_cdc_if_necessary(program, resolver.schema(), crate::MAIN_DB_ID, None)?
                     .expect("CDC is active, so prepare_cdc_if_necessary must return a cursor");
@@ -1943,6 +1924,33 @@ pub fn emit_cdc_autocommit_commit(
     program.preassign_label_to_next_insn(skip_label);
 
     Ok(())
+}
+
+/// Jump to `skip_label` when the transaction captured no change.
+///
+/// `conn_txn_id(-1)` returns the active CDC transaction id, or -1 when nothing was captured.
+/// The opcode is an idempotent get-or-set, so `emit_cdc_commit_insns` recomputing it for the
+/// record itself sees the same value this gate tested.
+fn emit_skip_if_no_captured_change(program: &mut ProgramBuilder, skip_label: BranchOffset) {
+    let minus_one_reg = program.alloc_register();
+    program.emit_int(-1, minus_one_reg);
+    let txn_id_reg = program.alloc_register();
+    program.emit_insn(Insn::Function {
+        constant_mask: 0,
+        start_reg: minus_one_reg,
+        dest: txn_id_reg,
+        func: crate::function::FuncCtx {
+            func: Func::Scalar(crate::function::ScalarFunc::ConnTxnId),
+            arg_count: 1,
+        },
+    });
+    program.emit_insn(Insn::Eq {
+        lhs: txn_id_reg,
+        rhs: minus_one_reg,
+        target_pc: skip_label,
+        flags: crate::vdbe::insn::CmpInsFlags::default(),
+        collation: None,
+    });
 }
 
 /// Emit the CDC COMMIT record for an explicit `COMMIT` statement, gated on the transaction
