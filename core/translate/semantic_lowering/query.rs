@@ -9537,6 +9537,7 @@ pub(super) mod tests {
                 dqs_dml: DoubleQuotedDml::Enabled,
                 foreign_keys_enabled: true,
                 capture_changes_table: None,
+                long_column_names: false,
             },
             SemanticRootInput::Statement(&statement),
         )

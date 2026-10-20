@@ -65,6 +65,8 @@ pub(crate) struct ResolvedScopeExpr {
 #[derive(Clone, Debug)]
 pub(crate) struct ExpandedColumn {
     pub(crate) name: String,
+    /// The source's alias, or its table name or `(subquery-N)` without one.
+    pub(crate) qualifier: String,
     pub(crate) resolved: ResolvedScopeExpr,
 }
 
@@ -490,15 +492,28 @@ impl Scope {
             }
         }
 
-        Ok(self
-            .visible_columns
+        self.visible_columns
             .iter()
             .filter(|column| !column.hidden)
-            .map(|column| ExpandedColumn {
-                name: column.display_name.clone(),
-                resolved: column.resolved(),
+            .map(|column| {
+                let qualifier = self
+                    .sources
+                    .iter()
+                    .find(|source| source.id == column.source)
+                    .map(|source| source.qualifier.clone())
+                    .ok_or_else(|| {
+                        crate::LimboError::InternalError(format!(
+                            "visible column {} has no source in scope",
+                            column.display_name
+                        ))
+                    })?;
+                Ok(ExpandedColumn {
+                    name: column.display_name.clone(),
+                    qualifier,
+                    resolved: column.resolved(),
+                })
             })
-            .collect())
+            .collect()
     }
 
     pub(crate) fn expand_table_star(&self, qualifier: &str) -> Result<Vec<ExpandedColumn>> {
@@ -520,6 +535,7 @@ impl Scope {
             .filter(|column| !column.hidden)
             .map(|column| ExpandedColumn {
                 name: column.display_name.clone(),
+                qualifier: matching[0].qualifier.clone(),
                 resolved: column.resolved(),
             })
             .collect())

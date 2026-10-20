@@ -581,6 +581,8 @@ impl<'a> HirSession<'a> {
                     .get_capture_data_changes_info()
                     .as_ref()
                     .map(|info| info.table.clone()),
+                long_column_names: self.connection.get_full_column_names()
+                    && !self.connection.get_short_column_names(),
             },
             input,
         )?;

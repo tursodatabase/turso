@@ -81,6 +81,26 @@ Deferred migration surfaces:
 |---|---|
 | Production entry point and whole-query lowering | Statement and whole-trigger-program inputs produce validated HIR from an owned multi-database semantic catalog. Standalone HIR expression lowering is now being ported in narrow checkpoints, but preparation still enters the legacy plan and emitter path. |
 
+### What still reaches legacy with the switch on
+
+Audited on 2026-10-20 from `translate_statement`:
+
+- SELECT always goes through HIR; there is no guard and no fallback.
+- DELETE, UPDATE and INSERT go through HIR unless `needs_legacy` says
+  otherwise (see "DML through HIR"), a trigger or foreign-key action of
+  theirs cannot be compiled through HIR, or a materialized view built by
+  another DBSP version reads the target.
+- Every other statement is translated by legacy code that is handed the HIR
+  settings and prepares the SELECTs inside it through HIR where it can
+  (CREATE TABLE AS, CREATE VIEW, CREATE MATERIALIZED VIEW, ATTACH). The
+  nested statements legacy triggers and foreign-key actions compile still
+  prepare through legacy (`translate_inner`), only when their outer
+  statement is a legacy one.
+
+CI runs the conformance corpora with the switch on (`sqltest-run-hir` in
+`.github/workflows/sqltest.yml`): the Rust and CLI backends, without
+snapshot tests and with normalized plans.
+
 ### Cutover deletion map
 
 SELECT has no remaining HIR planning guard. Its planner handoff does not use a
@@ -131,7 +151,11 @@ are removed at cutover.
 
 Result-column names, table names, and declared types come from the HIR outputs
 and the same alias, `full_column_names`, and `short_column_names` rules as
-legacy. Two known differences are legacy artifacts: legacy reports its internal
+legacy. With `full_column_names` on and `short_column_names` off, `SELECT *`
+and `t.*` name each column after its source during analysis, as legacy and
+SQLite do: the alias, or the table name or `(subquery-N)` without one, so a
+FROM subquery passes those names up (`(subquery-0).a.id`). RETURNING `*`
+keeps plain names, as in legacy. Two known differences are legacy artifacts: legacy reports its internal
 window subquery as the table of every output of a window query, and BLOB as
 the declared type of expressions such as `count(*)` there. HIR reports the real
 table and no declared type, like SQLite. `get_column_type_info` infers

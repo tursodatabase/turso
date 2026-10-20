@@ -3018,3 +3018,47 @@ fn hir_window_sorts_show_in_explain_like_legacy() {
         );
     }
 }
+
+/// Like legacy and SQLite, with full_column_names on and short_column_names
+/// off, `SELECT *` names each column after its source: the alias, the table
+/// name, or `(subquery-N)` for a FROM subquery without an alias. Explicit
+/// column references keep legacy's `table.column` rule, and other settings
+/// keep the plain column name.
+#[test]
+fn hir_names_star_columns_after_their_source_under_long_names() {
+    let db = setup();
+    let [legacy, hir] = connections(&db);
+    for (full, short) in [(true, false), (true, true), (false, true), (false, false)] {
+        for conn in [&legacy, &hir] {
+            conn.set_full_column_names(full);
+            conn.set_short_column_names(short);
+        }
+        for sql in [
+            "SELECT * FROM items a, tags b LIMIT 1",
+            "SELECT * FROM items, tags LIMIT 1",
+            "SELECT a.*, b.tag FROM items a JOIN tags b ON b.item_id = a.id LIMIT 1",
+            "SELECT * FROM items a, (SELECT 5, 6) LIMIT 1",
+            "SELECT * FROM items a, (SELECT 5 AS n) AS s LIMIT 1",
+            "SELECT a.id, value AS v, extra || 'x' FROM items a LIMIT 1",
+            "SELECT * FROM (SELECT * FROM items a) LIMIT 1",
+            "CREATE TABLE ctas AS SELECT * FROM items a LIMIT 1",
+            "SELECT * FROM ctas",
+            "DROP TABLE ctas",
+        ] {
+            assert_eq!(
+                column_names(&hir, sql),
+                column_names(&legacy, sql),
+                "{sql} full={full} short={short}"
+            );
+            if sql.starts_with("SELECT") {
+                assert_eq!(
+                    limbo_exec_rows(&hir, sql),
+                    limbo_exec_rows(&legacy, sql),
+                    "{sql}"
+                );
+            } else {
+                legacy.execute(sql).unwrap();
+            }
+        }
+    }
+}

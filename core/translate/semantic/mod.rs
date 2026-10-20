@@ -22,6 +22,9 @@ pub(crate) struct SemanticOptions {
     pub(crate) foreign_keys_enabled: bool,
     /// The table change data capture writes to, when it is on.
     pub(crate) capture_changes_table: Option<String>,
+    /// `full_column_names` on and `short_column_names` off: like legacy
+    /// and SQLite, `SELECT *` then names each column `source.column`.
+    pub(crate) long_column_names: bool,
 }
 
 pub(crate) enum SemanticRootInput<'ast> {
@@ -57,7 +60,8 @@ pub(crate) fn analyze_root(
         options.dqs_dml,
         options.foreign_keys_enabled,
     )?
-    .with_capture_changes(options.capture_changes_table);
+    .with_capture_changes(options.capture_changes_table)
+    .with_long_column_names(options.long_column_names);
     let input = match input {
         SemanticRootInput::Statement(statement) => AnalyzeInput::Statement(statement),
         SemanticRootInput::TriggerProgram {
@@ -215,6 +219,7 @@ mod tests {
             dqs_dml: DoubleQuotedDml::Disabled,
             foreign_keys_enabled: true,
             capture_changes_table: None,
+            long_column_names: false,
         };
         let document = analyze_root(
             &catalog,

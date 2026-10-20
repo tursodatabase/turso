@@ -1532,11 +1532,19 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
         expanded: Vec<ExpandedColumn>,
         scope: &Scope,
     ) -> Result<()> {
+        // Like legacy and SQLite, with full_column_names on and
+        // short_column_names off the column is named after its source.
+        let long_names = self.context().long_column_names();
         for column in expanded {
             let resolved = self.resolve_atomic_expr(column.resolved.expr, scope)?;
+            let name = if long_names {
+                format!("{}.{}", column.qualifier, column.name)
+            } else {
+                column.name
+            };
             outputs.push(output_from_resolved(
                 OutputId::query(block, outputs.len()),
-                column.name,
+                name,
                 OutputNameKind::StarExpansion,
                 resolved,
             ));

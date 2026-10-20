@@ -59,6 +59,8 @@ pub(crate) struct SemanticContext<'catalog> {
     foreign_keys_enabled: bool,
     /// The table change data capture writes to, when it is on.
     capture_changes_table: Option<String>,
+    /// See [super::SemanticOptions::long_column_names].
+    long_column_names: bool,
     snapshot: CatalogSnapshot,
 }
 
@@ -159,6 +161,7 @@ impl<'catalog> SemanticContext<'catalog> {
             dqs_dml: DoubleQuotedDml::Enabled,
             foreign_keys_enabled: true,
             capture_changes_table: None,
+            long_column_names: false,
             snapshot: CatalogSnapshot::from_id(snapshot),
         })
     }
@@ -180,6 +183,15 @@ impl<'catalog> SemanticContext<'catalog> {
     pub(crate) fn with_foreign_keys(mut self, enabled: bool) -> Self {
         self.foreign_keys_enabled = enabled;
         self
+    }
+
+    pub(crate) fn with_long_column_names(mut self, enabled: bool) -> Self {
+        self.long_column_names = enabled;
+        self
+    }
+
+    pub(crate) const fn long_column_names(&self) -> bool {
+        self.long_column_names
     }
 
     pub(crate) const fn main_schema(&self) -> &Schema {
