@@ -622,6 +622,19 @@ pub fn is_system_table(table_name: &str) -> bool {
         .any(|prefix| table_name.to_lowercase().starts_with(prefix))
 }
 
+/// Check if a table is one of the internal tables that store a materialized
+/// view's state, of any storage version.
+pub fn is_materialized_view_state_table(table_name: &str) -> bool {
+    [
+        DBSP_METADATA_TABLE_PREFIX,
+        DBSP_TABLE_PREFIX,
+        DBSP_MULTISET_TABLE_PREFIX,
+        DBSP_ARRANGEMENT_TABLE_PREFIX,
+    ]
+    .iter()
+    .any(|prefix| table_name.starts_with(prefix))
+}
+
 pub fn allow_user_dml(table_name: &str) -> bool {
     const NAMES: [&str; 2] = [SCHEMA_TABLE_NAME, SCHEMA_TABLE_NAME_ALT];
     !(NAMES.iter().any(|n| n.eq_ignore_ascii_case(table_name))

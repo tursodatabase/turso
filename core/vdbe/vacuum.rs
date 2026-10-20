@@ -104,6 +104,14 @@ impl SchemaEntry {
         };
         seq_name.starts_with(crate::schema::AUTOINCREMENT_SEQ_PREFIX)
     }
+
+    /// True for the internal tables that store a materialized view's state.
+    /// VACUUM neither creates nor copies them: replaying the view's
+    /// `CREATE MATERIALIZED VIEW` creates them again and fills them, and
+    /// the view itself, from the base tables that were already copied.
+    pub fn is_materialized_view_state_table(&self) -> bool {
+        crate::schema::is_materialized_view_state_table(&self.name)
+    }
 }
 
 /// Split rowid-ordered schema entries into the replay phases used by VACUUM.
@@ -119,6 +127,7 @@ pub(crate) fn classify_schema_entries(
 
     for (idx, entry) in entries.iter().enumerate() {
         match entry.entry_type {
+            SchemaEntryType::Table if entry.is_materialized_view_state_table() => {}
             SchemaEntryType::Table if entry.is_storage_backed() => {
                 // Skip sqlite_sequence and AUTOINCREMENT implicit sequence
                 // backing tables in the schema creation phase: both are
