@@ -28,7 +28,7 @@ use turso_parser::ast::{Expr, Literal};
 /// SQLite's namespaces: `main`, `temp` and the name of each attached
 /// database.
 #[derive(Default)]
-pub(crate) struct AttachedNamespaces {
+pub struct AttachedNamespaces {
     name_to_index: RwLock<HashMap<String, usize>>,
 }
 

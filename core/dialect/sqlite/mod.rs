@@ -8,7 +8,7 @@
 //! through [`register_builtin_catalog`]. ATTACH and DETACH, which give
 //! SQLite one namespace per database, are in [`attach`].
 
-pub(crate) mod attach;
+pub mod attach;
 use crate::pragma::PragmaVirtualTable;
 use crate::schema::{BTreeTable, Schema, Table};
 use crate::sync::Arc;

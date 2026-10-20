@@ -2603,7 +2603,7 @@ impl Database {
             closed: AtomicBool::new(false),
             temp: crate::connection::TempDbContext::new(),
             attached_databases: RwLock::new(DatabaseCatalog::new()),
-            namespaces: Arc::new(crate::dialect::sqlite::attach::AttachedNamespaces::default()),
+            namespaces: self.dialect.new_namespaces(),
             has_non_main_pagers: AtomicBool::new(false),
             query_only: AtomicBool::new(false),
             vdbe_trace: AtomicBool::new(false),
