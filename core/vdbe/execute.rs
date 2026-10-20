@@ -5457,7 +5457,12 @@ pub fn op_auto_commit(
                 // DEFERRED and BEGIN CONCURRENT no Transaction instruction precedes
                 // AutoCommit, so state is None here unless a SELECT is still active
                 // (state = Read) from a prior autocommit query on the same connection.
-                if conn.get_tx_state() == TransactionState::None {
+                //
+                // Only move to Pending in MVCC mode. In WAL-only mode a deferred
+                // BEGIN has no snapshot to defer; keeping the state at None
+                // preserves the pre-existing behavior and lets schema-reload
+                // checks that gate on None continue to work.
+                if conn.get_tx_state() == TransactionState::None && mv_store.is_some() {
                     conn.set_tx_state(TransactionState::Pending {
                         concurrent: *concurrent,
                     });
