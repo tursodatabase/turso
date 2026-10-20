@@ -5354,7 +5354,10 @@ impl Pager {
                             "mode should be truncate in CheckpointPhase::TruncateWalFile"
                         );
                         let result = state.result.as_ref().expect("result should be set");
-                        !result.wal_truncate_sent || !result.wal_sync_sent
+                        !result.wal_truncate_sent
+                            || !result.wal_sync_sent
+                            || !result.wal_header_sent
+                            || !result.wal_header_sync_sent
                     };
 
                     if !need_wal_truncate {
