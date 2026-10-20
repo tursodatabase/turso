@@ -30,6 +30,7 @@ use crate::schema::{
 };
 use crate::translate::fkeys::FkActionCompileStack;
 use crate::translate::plan::{Aggregate, ColumnMask};
+use crate::translate::trigger_exec::TriggerProgramCache;
 use crate::vdbe::{
     affinity::Affinity,
     builder::{CursorKey, CursorType, DmlColumnContext, ProgramBuilder, SelfTableContext},
@@ -210,6 +211,9 @@ pub struct Resolver<'a> {
     /// shared state, a self-referential `ON DELETE CASCADE` could fail to see
     /// that its own action program is already being built.
     pub(super) fk_action_compile_stack: FkActionCompileStack,
+    /// Trigger programs already compiled for this statement, shared with
+    /// forked resolvers for the same reason as `fk_action_compile_stack`.
+    pub(super) trigger_program_cache: TriggerProgramCache,
     unqualified_database_search_path: Option<Vec<String>>,
 }
 
@@ -321,6 +325,7 @@ impl<'a> Resolver<'a> {
             database_scope: RefCell::new(None),
             has_temp_schema,
             fk_action_compile_stack: FkActionCompileStack::default(),
+            trigger_program_cache: TriggerProgramCache::default(),
             unqualified_database_search_path: unqualified_database_search_path.clone(),
         }
     }
@@ -367,6 +372,7 @@ impl<'a> Resolver<'a> {
             database_scope: RefCell::new(self.database_scope.borrow().clone()),
             has_temp_schema: self.has_temp_schema,
             fk_action_compile_stack: self.fk_action_compile_stack.clone(),
+            trigger_program_cache: self.trigger_program_cache.clone(),
             unqualified_database_search_path: self.unqualified_database_search_path.clone(),
         }
     }
@@ -395,6 +401,7 @@ impl<'a> Resolver<'a> {
             database_scope: RefCell::new(self.database_scope.borrow().clone()),
             has_temp_schema: self.has_temp_schema,
             fk_action_compile_stack: self.fk_action_compile_stack.clone(),
+            trigger_program_cache: self.trigger_program_cache.clone(),
             unqualified_database_search_path: self.unqualified_database_search_path.clone(),
         }
     }
