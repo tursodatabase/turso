@@ -1323,9 +1323,13 @@ fn emit_epilogue(
         });
     }
     program.preassign_label_to_next_insn(ctx.loop_labels.stmt_epilogue);
-    if let Some((cdc_cursor_id, _)) = &ctx.cdc_table {
-        emit_cdc_autocommit_commit(program, resolver, *cdc_cursor_id)?;
-    }
+    emit_cdc_autocommit_commit(
+        program,
+        resolver,
+        ctx.cdc_table
+            .as_ref()
+            .map(|(cdc_cursor_id, _)| *cdc_cursor_id),
+    )?;
     // Emit scan-back loop for buffered RETURNING results.
     // All DML is complete at this point; now yield the buffered rows to the caller.
     // FkCheck must come before the scan-back so that FK violations prevent

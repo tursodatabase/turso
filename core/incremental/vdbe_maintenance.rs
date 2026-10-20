@@ -178,6 +178,7 @@ fn compile_maintenance_plan(
             approx_num_insns: 128 + 64 * num_view_columns,
             approx_num_labels: 48,
         },
+        connection.mvcc_enabled(),
     );
     program.prologue();
     emit_plan_to_sink(

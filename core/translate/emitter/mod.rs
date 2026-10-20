@@ -1863,40 +1863,81 @@ pub fn emit_cdc_commit_insns(
     Ok(())
 }
 
-/// Emit a CDC COMMIT record at end-of-statement when in autocommit mode (v2 only).
-/// This should be called once per statement, after the main loop, not per-row.
+/// Emit the CDC COMMIT record at the end of a statement, once, when in autocommit mode (v2 only).
+/// Only the root statement writes it; a trigger or FK action subprogram never does.
 pub fn emit_cdc_autocommit_commit(
     program: &mut ProgramBuilder,
     resolver: &Resolver,
-    cdc_cursor_id: usize,
+    cdc_cursor_id: Option<usize>,
 ) -> Result<()> {
-    let cdc_info = program.capture_data_changes_info().as_ref();
-    if cdc_info.is_some_and(|info| info.cdc_version().has_commit_record()) {
-        // Check if we're in autocommit mode; if so, emit a COMMIT record.
-        let is_autocommit_fn_ctx = crate::function::FuncCtx {
-            func: Func::Scalar(crate::function::ScalarFunc::IsAutocommit),
-            arg_count: 0,
-        };
-        let autocommit_reg = program.alloc_register();
-        program.emit_insn(Insn::Function {
-            constant_mask: 0,
-            start_reg: 0,
-            dest: autocommit_reg,
-            func: is_autocommit_fn_ctx,
-        });
-
-        // IfNot jumps when reg == 0 (not autocommit). Skip the COMMIT in that case.
-        let skip_label = program.allocate_label();
-        program.emit_insn(Insn::IfNot {
-            reg: autocommit_reg,
-            target_pc: skip_label,
-            jump_if_null: true,
-        });
-
-        emit_cdc_commit_insns(program, resolver, cdc_cursor_id)?;
-
-        program.preassign_label_to_next_insn(skip_label);
+    if program.flags.is_subprogram() {
+        return Ok(());
     }
+    let cdc_info = program.capture_data_changes_info().as_ref();
+    if !cdc_info.is_some_and(|info| info.cdc_version().has_commit_record()) {
+        return Ok(());
+    }
+    if cdc_cursor_id.is_none() && !program.has_emitted_program_call() {
+        // Our own target table was not captured (e.g. a TEMP table), and no trigger or FK
+        // action ran during this statement that could have captured a row elsewhere.
+        return Ok(());
+    }
+
+    // Check if we're in autocommit mode; if so, emit a COMMIT record.
+    let is_autocommit_fn_ctx = crate::function::FuncCtx {
+        func: Func::Scalar(crate::function::ScalarFunc::IsAutocommit),
+        arg_count: 0,
+    };
+    let autocommit_reg = program.alloc_register();
+    program.emit_insn(Insn::Function {
+        constant_mask: 0,
+        start_reg: 0,
+        dest: autocommit_reg,
+        func: is_autocommit_fn_ctx,
+    });
+
+    // IfNot jumps when reg == 0 (not autocommit). Skip the COMMIT in that case.
+    let skip_label = program.allocate_label();
+    program.emit_insn(Insn::IfNot {
+        reg: autocommit_reg,
+        target_pc: skip_label,
+        jump_if_null: true,
+    });
+
+    let cdc_cursor_id = match cdc_cursor_id {
+        Some(cdc_cursor_id) => cdc_cursor_id,
+        None => {
+            // A trigger or FK action fired during this statement may have captured a row
+            // elsewhere. Only write the COMMIT record when something was actually captured.
+            let minus_one_reg = program.alloc_register();
+            program.emit_int(-1, minus_one_reg);
+            let txn_id_reg = program.alloc_register();
+            program.emit_insn(Insn::Function {
+                constant_mask: 0,
+                start_reg: minus_one_reg,
+                dest: txn_id_reg,
+                func: crate::function::FuncCtx {
+                    func: Func::Scalar(crate::function::ScalarFunc::ConnTxnId),
+                    arg_count: 1,
+                },
+            });
+            program.emit_insn(Insn::Eq {
+                lhs: txn_id_reg,
+                rhs: minus_one_reg,
+                target_pc: skip_label,
+                flags: crate::vdbe::insn::CmpInsFlags::default(),
+                collation: None,
+            });
+            let (cursor_id, _) =
+                prepare_cdc_if_necessary(program, resolver.schema(), crate::MAIN_DB_ID, None)?
+                    .expect("CDC is active, so prepare_cdc_if_necessary must return a cursor");
+            cursor_id
+        }
+    };
+
+    emit_cdc_commit_insns(program, resolver, cdc_cursor_id)?;
+
+    program.preassign_label_to_next_insn(skip_label);
 
     Ok(())
 }
