@@ -1743,6 +1743,7 @@ fn emit_fk_action_subprogram(
             QueryMode::Normal,
             program.capture_data_changes_info().clone(),
             FK_SUBPROGRAM_OPTS,
+            program.is_mvcc_enabled(),
         );
         let entry = compile_stack.push(foreign_key, parent_change);
         subprogram_builder.prologue();

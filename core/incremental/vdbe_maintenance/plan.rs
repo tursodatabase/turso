@@ -986,6 +986,7 @@ pub(crate) fn plan_view(
         QueryMode::Normal,
         None,
         ProgramBuilderOpts::new(8, 32, 8),
+        connection.mvcc_enabled(),
     );
     let mut relational_plan = prepare_select_plan(
         select.clone(),

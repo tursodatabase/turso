@@ -2143,7 +2143,12 @@ fn test_cdc_upsert_before_image_in_place_before_mode(db: TempDatabase) {
 /// sat on disk right before the upsert's own write: `y` still holds its
 /// pre-SET value ('a'), while `z` already holds the trigger's write (999), not
 /// the original value ('orig') that was there before the statement started.
-#[turso_macros::test]
+///
+/// Also a regression test for https://github.com/tursodatabase/turso/issues/10152: under
+/// MVCC, the trigger's nested UPDATE and the upsert's own UPDATE used to collide on the same
+/// CDC change id (see `test_cdc_trigger_after_insert_captures_trigger_row` for the cause), so
+/// only one of the two rows below survived.
+#[turso_macros::test(mvcc)]
 fn test_cdc_upsert_before_image_reflects_before_update_trigger(db: TempDatabase) {
     let conn = db.connect_limbo();
     conn.execute("CREATE TABLE t (x INTEGER PRIMARY KEY, y, z)")
@@ -2438,10 +2443,14 @@ fn test_cdc_trigger_after_insert_explicit_transaction_single_commit_guard(db: Te
 /// A root statement on a TEMP table is never captured, but a trigger it fires can still
 /// capture a row on a main (captured) table. The root statement must still write the one
 /// COMMIT record for the whole statement.
-// TODO: cannot use mvcc, a multi-row INSERT with an AFTER trigger drops CDC rows for the
-// trigger's own writes under mvcc; reproduces the same way with no TEMP table involved,
-// so it is a pre-existing mvcc/CDC/trigger gap unrelated to this fix.
-#[turso_macros::test()]
+///
+/// Also a regression test for https://github.com/tursodatabase/turso/issues/10154: under
+/// MVCC, each row's trigger-fired audit INSERT used to collide with (and get overwritten by)
+/// a later CDC row, because the trigger subprogram allocated its change id with the plain
+/// `NewRowid` path instead of the CDC table's AUTOINCREMENT sequence the root statement uses.
+/// See `test_cdc_trigger_after_insert_captures_trigger_row` for the single-row case and the
+/// underlying cause.
+#[turso_macros::test(mvcc)]
 fn test_cdc_trigger_temp_root_with_captured_write_single_commit(db: TempDatabase) {
     let conn = db.connect_limbo();
     conn.execute("CREATE TABLE audit(msg)").unwrap();
@@ -2470,5 +2479,135 @@ fn test_cdc_trigger_temp_root_with_captured_write_single_commit(db: TempDatabase
             vec![Value::Integer(2), Value::Null],
         ],
         "expected two audit INSERT rows followed by exactly one COMMIT, got {rows:?}"
+    );
+}
+
+/// Single-row variant of the above: a TEMP root statement whose trigger captures exactly one
+/// row on a main table. Regression test for
+/// https://github.com/tursodatabase/turso/issues/10154.
+#[turso_macros::test(mvcc)]
+fn test_cdc_trigger_temp_root_with_captured_write_single_row(db: TempDatabase) {
+    let conn = db.connect_limbo();
+    conn.execute("CREATE TABLE audit(msg)").unwrap();
+    conn.execute("CREATE TEMP TABLE src(x)").unwrap();
+    conn.execute(
+        "CREATE TRIGGER trg AFTER INSERT ON src BEGIN INSERT INTO audit VALUES ('fired'); END",
+    )
+    .unwrap();
+    conn.execute("PRAGMA capture_data_changes_conn('full')")
+        .unwrap();
+
+    conn.execute("INSERT INTO src VALUES (1)").unwrap();
+
+    let rows = limbo_exec_rows(
+        &conn,
+        "SELECT change_id, change_type, table_name FROM turso_cdc ORDER BY change_id",
+    );
+    assert_eq!(
+        rows,
+        vec![
+            vec![
+                Value::Integer(1),
+                Value::Integer(1),
+                Value::Text("audit".to_string())
+            ],
+            vec![Value::Integer(2), Value::Integer(2), Value::Null],
+        ],
+        "expected one audit INSERT row with change_id 1, then one COMMIT with change_id 2, got {rows:?}"
+    );
+}
+
+/// Regression test for https://github.com/tursodatabase/turso/issues/10154: under MVCC, a
+/// trigger subprogram allocated its CDC change id with the plain `NewRowid` path (the one used
+/// when CDC is not running under MVCC at all) instead of the CDC table's AUTOINCREMENT
+/// sequence, because `ProgramBuilder::new_for_trigger` did not inherit the parent program's
+/// MVCC flag and defaulted it to `false`. The trigger's audit row then landed on the same
+/// change id the root statement's own end-of-statement COMMIT record computed from the
+/// sequence, and the COMMIT's INSERT silently overwrote the audit row.
+#[turso_macros::test(mvcc)]
+fn test_cdc_trigger_after_insert_captures_trigger_row(db: TempDatabase) {
+    let conn = db.connect_limbo();
+    conn.execute("CREATE TABLE audit(msg)").unwrap();
+    conn.execute("CREATE TABLE t(x)").unwrap();
+    conn.execute(
+        "CREATE TRIGGER trg AFTER INSERT ON t BEGIN INSERT INTO audit VALUES ('fired'); END",
+    )
+    .unwrap();
+    conn.execute("PRAGMA capture_data_changes_conn('full')")
+        .unwrap();
+
+    conn.execute("INSERT INTO t VALUES (1)").unwrap();
+
+    let rows = limbo_exec_rows(
+        &conn,
+        "SELECT change_id, change_type, table_name FROM turso_cdc ORDER BY change_id",
+    );
+    assert_eq!(
+        rows,
+        vec![
+            vec![
+                Value::Integer(1),
+                Value::Integer(1),
+                Value::Text("audit".to_string())
+            ],
+            vec![
+                Value::Integer(2),
+                Value::Integer(1),
+                Value::Text("t".to_string())
+            ],
+            vec![Value::Integer(3), Value::Integer(2), Value::Null],
+        ],
+        "expected the trigger's audit INSERT, the root's own INSERT, then one COMMIT, each with a distinct increasing change id, got {rows:?}"
+    );
+}
+
+/// Same root cause as `test_cdc_trigger_after_insert_captures_trigger_row`, but for an FK
+/// ON DELETE CASCADE action subprogram instead of a trigger: `emit_fk_action_subprogram` built
+/// the cascade's `ProgramBuilder` the same way, without inheriting the parent's MVCC flag.
+/// Regression test for https://github.com/tursodatabase/turso/issues/10154.
+#[turso_macros::test(mvcc)]
+fn test_cdc_fk_cascade_delete_captures_child_row(db: TempDatabase) {
+    let conn = db.connect_limbo();
+    conn.execute("PRAGMA foreign_keys = ON").unwrap();
+    conn.execute("CREATE TABLE parent(id INTEGER PRIMARY KEY)")
+        .unwrap();
+    conn.execute(
+        "CREATE TABLE child(id INTEGER PRIMARY KEY, pid INTEGER REFERENCES parent(id) ON DELETE CASCADE)",
+    )
+    .unwrap();
+    conn.execute("INSERT INTO parent VALUES (1)").unwrap();
+    conn.execute("INSERT INTO child VALUES (10, 1)").unwrap();
+    conn.execute("PRAGMA capture_data_changes_conn('full')")
+        .unwrap();
+
+    conn.execute("DELETE FROM parent WHERE id = 1").unwrap();
+
+    let rows = limbo_exec_rows(
+        &conn,
+        "SELECT change_id, change_type, table_name, id FROM turso_cdc ORDER BY change_id",
+    );
+    assert_eq!(
+        rows,
+        vec![
+            vec![
+                Value::Integer(1),
+                Value::Integer(-1),
+                Value::Text("parent".to_string()),
+                Value::Integer(1)
+            ],
+            vec![
+                Value::Integer(2),
+                Value::Integer(-1),
+                Value::Text("child".to_string()),
+                Value::Integer(10)
+            ],
+            vec![
+                Value::Integer(3),
+                Value::Integer(2),
+                Value::Null,
+                Value::Null
+            ],
+        ],
+        "expected the DELETE on parent, the cascade DELETE on child, then one COMMIT, each with a distinct increasing change id, got {rows:?}"
     );
 }
