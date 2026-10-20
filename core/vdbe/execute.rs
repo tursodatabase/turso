@@ -12041,8 +12041,8 @@ pub fn op_function(
                                 unique,
                                 if_not_exists,
                                 idx_name,
-                                columns,
-                                where_clause,
+                                mut columns,
+                                mut where_clause,
                                 using,
                                 with_clause,
                             } => {
@@ -12050,6 +12050,17 @@ pub fn op_function(
 
                                 if rename_from != table_name {
                                     break 'sql None;
+                                }
+
+                                for col in &mut columns {
+                                    rewrite_check_expr_table_refs(
+                                        &mut col.expr,
+                                        &rename_from,
+                                        &rename_to,
+                                    );
+                                }
+                                if let Some(ref mut wc) = where_clause {
+                                    rewrite_check_expr_table_refs(wc, &rename_from, &rename_to);
                                 }
 
                                 Some(
@@ -17768,6 +17779,14 @@ pub fn op_rename_table(
             indexes.iter_mut().for_each(|index| {
                 let index = Arc::make_mut(index);
                 normalized_to.clone_into(&mut index.table_name);
+                if let Some(ref mut wc) = index.where_clause {
+                    rewrite_check_expr_table_refs(wc, &normalized_from, &normalized_to);
+                }
+                for col in &mut index.columns {
+                    if let Some(ref mut expr) = col.expr {
+                        rewrite_check_expr_table_refs(expr, &normalized_from, &normalized_to);
+                    }
+                }
                 // Rename autoindexes to match the new table name
                 if let Some(suffix) = index.name.strip_prefix(&autoindex_prefix) {
                     index.name = format!("sqlite_autoindex_{normalized_to}_{suffix}");
