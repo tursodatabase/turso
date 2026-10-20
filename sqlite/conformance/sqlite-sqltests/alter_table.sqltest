@@ -3267,3 +3267,43 @@ test alter-table-add-column-preserve-schema-collate-locale {
 expect {
     CREATE TABLE tbl (c TEXT COLLATE "fr-FR", d)
 }
+
+@skip-if mvcc "views not supported in MVCC mode"
+test alter-table-rename-view-rejected {
+    CREATE TABLE t(a);
+    CREATE VIEW v AS SELECT a FROM t;
+    ALTER TABLE v RENAME TO w;
+}
+expect error {
+    view v may not be altered
+}
+
+@skip-if mvcc "views not supported in MVCC mode"
+test alter-table-add-column-to-view-rejected {
+    CREATE TABLE t(a);
+    CREATE VIEW v AS SELECT a FROM t;
+    ALTER TABLE v ADD COLUMN z;
+}
+expect error {
+    Cannot add a column to a view
+}
+
+@skip-if mvcc "views not supported in MVCC mode"
+test alter-table-rename-view-column-rejected {
+    CREATE TABLE t(a);
+    CREATE VIEW v AS SELECT a FROM t;
+    ALTER TABLE v RENAME COLUMN a TO q;
+}
+expect error {
+    cannot rename columns of view "v"
+}
+
+@skip-if mvcc "views not supported in MVCC mode"
+test alter-table-drop-view-column-rejected {
+    CREATE TABLE t(a, b);
+    CREATE VIEW v AS SELECT a, b FROM t;
+    ALTER TABLE v DROP COLUMN a;
+}
+expect error {
+    cannot drop column from view "v"
+}

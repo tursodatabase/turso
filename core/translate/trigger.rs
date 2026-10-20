@@ -174,6 +174,23 @@ pub fn translate_create_trigger(
         bail_parse_error!("INSTEAD OF triggers are not supported yet");
     }
 
+    // SQLite allows only INSTEAD OF triggers on views (sqlite3BeginTrigger in
+    // trigger.c). A materialized view's storage is registered as a table, so
+    // check for views before the table lookup.
+    if resolver.with_schema(target_table_database_id, |s| {
+        s.get_view(&normalized_table_name).is_some()
+            || s.materialized_view_exists(&normalized_table_name)
+    }) {
+        let time = match time.as_ref() {
+            Some(ast::TriggerTime::After) => "AFTER",
+            _ => "BEFORE",
+        };
+        bail_parse_error!(
+            "cannot create {time} trigger on view: {}",
+            tbl_name.name.as_str()
+        );
+    }
+
     // Verify the table exists (use the table's database, not the trigger's).
     let table = resolver.with_schema(target_table_database_id, |s| {
         s.get_table(&normalized_table_name)

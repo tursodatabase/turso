@@ -1212,3 +1212,29 @@ fn test_incompatible_materialized_view_storage_is_fully_tracked() -> anyhow::Res
 
     Ok(())
 }
+
+/// The column list of `CREATE MATERIALIZED VIEW v(x, y)` names the view's
+/// columns after the database is reopened, both for reads and for a view
+/// built on top of it.
+#[turso_macros::test(views)]
+fn materialized_view_column_list_survives_reopen(tmp_db: TempDatabase) -> anyhow::Result<()> {
+    let conn = tmp_db.connect_limbo();
+    conn.execute("CREATE TABLE t(a INTEGER, b INTEGER)")?;
+    conn.execute("INSERT INTO t VALUES (1, 2)")?;
+    conn.execute("CREATE MATERIALIZED VIEW v(x, y) AS SELECT a, b FROM t")?;
+    conn.execute("CREATE MATERIALIZED VIEW w AS SELECT y FROM v WHERE x > 1")?;
+    drop(conn);
+
+    let reopened = TempDatabase::builder()
+        .with_db_path(&tmp_db.path)
+        .with_views(true)
+        .build();
+    let conn = reopened.connect_limbo();
+    conn.execute("INSERT INTO t VALUES (3, 4)")?;
+    let view: Vec<(i64, i64)> = conn.exec_rows("SELECT x, y FROM v ORDER BY x");
+    assert_eq!(view, vec![(1, 2), (3, 4)]);
+    let downstream: Vec<(i64,)> = conn.exec_rows("SELECT y FROM w");
+    assert_eq!(downstream, vec![(4,)]);
+    assert_eq!(run_integrity_check(&conn), "ok");
+    Ok(())
+}

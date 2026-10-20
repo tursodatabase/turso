@@ -1641,6 +1641,15 @@ impl ViewColumnSchema {
             .map(|vc| vc.column.clone())
             .collect()
     }
+
+    /// Name the view's columns from the column list of `CREATE VIEW v(x, y)`.
+    pub fn rename_columns(&mut self, names: &[ast::IndexedColumn]) {
+        for (view_column, name) in self.columns.iter_mut().zip(names) {
+            // as_str: Display would render the quoted form, embedding literal
+            // quote characters in the name
+            view_column.column.name = Some(name.col_name.as_str().to_string());
+        }
+    }
 }
 
 /// Walk all expressions in a statement, including subqueries.
