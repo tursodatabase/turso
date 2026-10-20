@@ -57,6 +57,7 @@ pub fn translate_create_materialized_view(
     view_name: &ast::QualifiedName,
     resolver: &Resolver,
     select_stmt: &ast::Select,
+    columns: &[ast::IndexedColumn],
     if_not_exists: bool,
     connection: Arc<Connection>,
     program: &mut ProgramBuilder,
@@ -87,8 +88,19 @@ pub fn translate_create_materialized_view(
     // Check for cross-database table references first
     crate::util::validate_select_for_views(select_stmt, view_name.db_name.as_ref())?;
 
-    let view_column_schema =
+    let mut view_column_schema =
         resolver.with_schema(database_id, |s| extract_view_columns(select_stmt, s))?;
+    // The parser checks the column count when it can count the SELECT's
+    // columns; a `*` is only expanded here.
+    if !columns.is_empty() && columns.len() != view_column_schema.columns.len() {
+        bail_parse_error!(
+            "expected {} columns for {} but got {}",
+            columns.len(),
+            view_name,
+            view_column_schema.columns.len()
+        );
+    }
+    view_column_schema.rename_columns(columns);
     let view_columns = view_column_schema.flat_columns()?;
 
     // One plan owns validation, the executable operator DAG, and the hidden
@@ -124,7 +136,12 @@ pub fn translate_create_materialized_view(
         .collect::<Vec<_>>();
 
     // Reconstruct the SQL string for storage
-    let sql = create_materialized_view_to_str(&view_name.name.as_ident(), select_stmt);
+    let sql = create_view_to_str(
+        "MATERIALIZED VIEW",
+        &view_name.name.as_ident(),
+        columns,
+        select_stmt,
+    );
 
     // Create a btree for storing the materialized view state
     // This btree will hold the materialized rows (row_id -> values)
@@ -291,10 +308,6 @@ pub fn translate_create_materialized_view(
     Ok(())
 }
 
-fn create_materialized_view_to_str(view_name: &str, select_stmt: &ast::Select) -> String {
-    format!("CREATE MATERIALIZED VIEW {view_name} AS {select_stmt}")
-}
-
 fn validate_create_view(
     resolver: &Resolver,
     database_id: usize,
@@ -390,7 +403,7 @@ pub fn translate_create_view(
     crate::util::validate_select_for_views(select_stmt, view_name.db_name.as_ref())?;
 
     // Reconstruct the SQL string
-    let sql = create_view_to_str(&view_name.name.as_ident(), columns, select_stmt);
+    let sql = create_view_to_str("VIEW", &view_name.name.as_ident(), columns, select_stmt);
 
     // Open cursor to sqlite_schema table
     let table = resolver.schema().get_btree_table(SQLITE_TABLEID).unwrap();
@@ -434,6 +447,7 @@ pub fn translate_create_view(
 }
 
 fn create_view_to_str(
+    view_kind: &str,
     view_name: &str,
     columns: &[ast::IndexedColumn],
     select_stmt: &ast::Select,
@@ -444,9 +458,9 @@ fn create_view_to_str(
         .collect::<Vec<String>>()
         .join(", ");
     if !columns_str.is_empty() {
-        return format!("CREATE VIEW {view_name} ({columns_str}) AS {select_stmt}");
+        return format!("CREATE {view_kind} {view_name} ({columns_str}) AS {select_stmt}");
     }
-    format!("CREATE VIEW {view_name} AS {select_stmt}")
+    format!("CREATE {view_kind} {view_name} AS {select_stmt}")
 }
 
 pub fn translate_drop_view(

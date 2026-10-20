@@ -956,20 +956,7 @@ impl<'a> Parser<'a> {
                 }
             }
         }
-        let columns = self.parse_eid_list(true)?;
-        eat_expect!(self, TK_AS);
-        let select = self.parse_select()?;
-        if let (ColumnCount::Fixed(n), false) = (select.column_count(), columns.is_empty()) {
-            if n != columns.len() {
-                return Err(Error::Custom(format!(
-                    "expected {} columns for {} but got {}",
-                    columns.len(),
-                    view_name,
-                    n
-                )));
-            }
-        }
-
+        let (columns, select) = self.parse_view_columns_and_select(&view_name)?;
         Ok(Stmt::CreateView {
             temporary,
             if_not_exists,
@@ -984,15 +971,33 @@ impl<'a> Parser<'a> {
         eat_expect!(self, TK_VIEW);
         let if_not_exists = self.parse_if_not_exists()?;
         let view_name = self.parse_fullname(false)?;
-        let columns = self.parse_eid_list(false)?;
-        eat_expect!(self, TK_AS);
-        let select = self.parse_select()?;
+        let (columns, select) = self.parse_view_columns_and_select(&view_name)?;
         Ok(Stmt::CreateMaterializedView {
             if_not_exists,
             view_name,
             columns,
             select,
         })
+    }
+
+    fn parse_view_columns_and_select(
+        &mut self,
+        view_name: &QualifiedName,
+    ) -> Result<(Vec<IndexedColumn>, Select)> {
+        let columns = self.parse_eid_list(true)?;
+        eat_expect!(self, TK_AS);
+        let select = self.parse_select()?;
+        if let (ColumnCount::Fixed(n), false) = (select.column_count(), columns.is_empty()) {
+            if n != columns.len() {
+                return Err(Error::Custom(format!(
+                    "expected {} columns for {} but got {}",
+                    columns.len(),
+                    view_name,
+                    n
+                )));
+            }
+        }
+        Ok((columns, select))
     }
 
     fn parse_vtab_arg(&mut self) -> Result<String> {

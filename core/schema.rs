@@ -2697,24 +2697,15 @@ impl Schema {
                         } => {
                             crate::util::validate_select_for_unsupported_features(&select)?;
 
-                            // Extract actual columns from the SELECT statement
-                            let view_column_schema =
+                            let mut view_column_schema =
                                 crate::util::extract_view_columns(&select, self)?;
-
-                            // If column names were provided in CREATE VIEW (col1, col2, ...),
-                            // use them to rename the columns
-                            let mut final_columns = view_column_schema.flat_columns()?;
-                            for (i, indexed_col) in column_names.iter().enumerate() {
-                                if let Some(col) = final_columns.get_mut(i) {
-                                    // as_str: Display would render the quoted form,
-                                    // embedding literal quote characters in the name
-                                    col.name = Some(indexed_col.col_name.as_str().to_string());
-                                }
-                            }
-
-                            // Create regular view
-                            let view =
-                                View::new(name.to_string(), sql.to_string(), select, final_columns);
+                            view_column_schema.rename_columns(&column_names);
+                            let view = View::new(
+                                name.to_string(),
+                                sql.to_string(),
+                                select,
+                                view_column_schema.flat_columns()?,
+                            );
                             self.add_view(view)?;
                         }
                         _ => {}

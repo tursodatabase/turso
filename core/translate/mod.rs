@@ -311,12 +311,13 @@ pub fn translate_inner(
         ast::Stmt::CreateMaterializedView {
             view_name,
             select,
+            columns,
             if_not_exists,
-            ..
         } => view::translate_create_materialized_view(
             &view_name,
             resolver,
             &select,
+            &columns,
             if_not_exists,
             connection.clone(),
             program,

@@ -1,0 +1,89 @@
+@database :memory:
+@requires-file materialized_views ""
+@skip-file-if mvcc "materialized_views not supported with mvcc"
+@verify-materialized-views
+
+# A column list names the view's columns, like it does for a plain view.
+test matview-column-list-names-columns {
+    CREATE TABLE t(a, b);
+    INSERT INTO t VALUES (1, 2);
+    CREATE MATERIALIZED VIEW v(x, y) AS SELECT a, b FROM t;
+    SELECT x, y FROM v;
+    SELECT name FROM pragma_table_info('v');
+    INSERT INTO t VALUES (3, 4);
+    SELECT x, y FROM v ORDER BY x;
+}
+expect {
+    1|2
+    x
+    y
+    1|2
+    3|4
+}
+
+test matview-column-list-kept-in-schema-sql {
+    CREATE TABLE t(a, b);
+    CREATE MATERIALIZED VIEW v(x, "y z") AS SELECT a, b FROM t;
+    SELECT sql FROM sqlite_schema WHERE name = 'v';
+}
+expect {
+    CREATE MATERIALIZED VIEW v (x, "y z") AS SELECT a, b FROM t
+}
+
+test matview-column-list-with-star {
+    CREATE TABLE t(a, b);
+    INSERT INTO t VALUES (1, 2);
+    CREATE MATERIALIZED VIEW v(p, q) AS SELECT * FROM t;
+    SELECT p, q FROM v;
+}
+expect {
+    1|2
+}
+
+test matview-column-list-on-aggregate {
+    CREATE TABLE t(g, b);
+    INSERT INTO t VALUES (1, 2), (1, 3), (2, 5);
+    CREATE MATERIALIZED VIEW v(grp, "total sum") AS SELECT g, sum(b) FROM t GROUP BY g;
+    SELECT grp, "total sum" FROM v ORDER BY grp;
+}
+expect {
+    1|5
+    2|5
+}
+
+test matview-over-view-with-column-list {
+    CREATE TABLE t(a, b);
+    INSERT INTO t VALUES (1, 2), (3, 4);
+    CREATE MATERIALIZED VIEW v(x, y) AS SELECT a, b FROM t;
+    CREATE MATERIALIZED VIEW w AS SELECT y FROM v WHERE x > 1;
+    INSERT INTO t VALUES (5, 6);
+    SELECT y FROM w ORDER BY y;
+}
+expect {
+    4
+    6
+}
+
+test matview-column-list-too-few-names {
+    CREATE TABLE t(a, b);
+    CREATE MATERIALIZED VIEW v(x) AS SELECT a, b FROM t;
+}
+expect error {
+    expected 1 columns for v but got 2
+}
+
+test matview-column-list-too-few-names-with-star {
+    CREATE TABLE t(a, b);
+    CREATE MATERIALIZED VIEW v(x) AS SELECT * FROM t;
+}
+expect error {
+    expected 1 columns for v but got 2
+}
+
+test matview-column-list-duplicate-name {
+    CREATE TABLE t(a, b);
+    CREATE MATERIALIZED VIEW v(x, x) AS SELECT a, b FROM t;
+}
+expect error {
+    duplicate column name: x
+}
