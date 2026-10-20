@@ -747,8 +747,21 @@ fn translate_cast_expr(
 
     let cast_type_name = type_name.as_ref().map(|tn| crate::util::dequote(&tn.name));
 
-    // Check if casting to a custom type
     if let (Some(tn), Some(cast_type_name)) = (type_name, &cast_type_name) {
+        if tn.array_dimensions > 0 {
+            let mut column = Column::new(
+                None,
+                cast_type_name.clone(),
+                None,
+                None,
+                Type::Null,
+                None,
+                ColDef::default(),
+            );
+            column.set_array_dimensions(tn.array_dimensions);
+            super::arrays::emit_array_encode(program, target_register, &column, resolver, "")?;
+            return Ok(target_register);
+        }
         if let Some(resolved) = resolver.schema().resolve_type_unchecked(cast_type_name)? {
             // Build ty_params from AST TypeSize so parametric types
             // (e.g. numeric(10,2)) get their parameters passed through.
