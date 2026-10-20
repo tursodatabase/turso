@@ -2747,3 +2747,51 @@ test matview-count-star-and-constant-count-all-rows {
 expect {
     3|3|1
 }
+
+# The expected types are what SQLite reports for the same view.
+test view-column-declared-type-matches-source-expression {
+    CREATE TABLE u(id INTEGER PRIMARY KEY, k INTEGER);
+    CREATE VIEW v AS SELECT k, (k) AS paren, CAST(k AS INTEGER) AS cint,
+        CAST(k AS REAL) AS creal, CAST(k AS VARCHAR(10)) AS ctext,
+        CAST(k AS DECIMAL(4,2)) AS cnum, k + 1 AS kexpr FROM u;
+    SELECT name, '[' || type || ']' FROM pragma_table_info('v');
+}
+expect {
+    k|[INTEGER]
+    paren|[INTEGER]
+    cint|[INT]
+    creal|[REAL]
+    ctext|[TEXT]
+    cnum|[NUM]
+    kexpr|[]
+}
+
+test matview-column-declared-type-matches-source-expression {
+    CREATE TABLE u(id INTEGER PRIMARY KEY, k INTEGER);
+    CREATE MATERIALIZED VIEW v AS SELECT k, (k) AS paren,
+        CAST(k AS INTEGER) AS cint, CAST(k AS REAL) AS creal,
+        CAST(k AS VARCHAR(10)) AS ctext, CAST(k AS DECIMAL(4,2)) AS cnum,
+        k + 1 AS kexpr FROM u;
+    SELECT name, '[' || type || ']' FROM pragma_table_info('v');
+}
+expect {
+    k|[INTEGER]
+    paren|[INTEGER]
+    cint|[INT]
+    creal|[REAL]
+    ctext|[TEXT]
+    cnum|[NUM]
+    kexpr|[]
+}
+
+# count(*) has no declared type, so the comparison applies no affinity.
+test matview-untyped-column-compares-without-affinity {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, st TEXT);
+    INSERT INTO t VALUES (1, 'X'), (2, 'X'), (3, 'Y');
+    CREATE MATERIALIZED VIEW magg AS SELECT st, count(*) AS n FROM t GROUP BY st;
+    SELECT st, n FROM magg WHERE n = '1';
+    SELECT st, n FROM magg WHERE n = 1;
+}
+expect {
+    Y|1
+}
