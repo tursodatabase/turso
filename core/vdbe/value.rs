@@ -1,4 +1,3 @@
-#[cfg(feature = "json")]
 use crate::types::TextSubtype;
 use crate::{
     function::MathFunc,
@@ -647,9 +646,8 @@ impl Value {
 
     pub fn exec_subtype(&self) -> Value {
         match self {
-            #[cfg(feature = "json")]
-            Value::Text(t) if t.subtype == TextSubtype::Json => Value::from_i64(74),
-            _ => Value::from_i64(0),
+            Value::Text(t) => Value::from_i64(i64::from(t.subtype)),
+            _ => Value::from_i64(i64::from(TextSubtype::Text)),
         }
     }
 
