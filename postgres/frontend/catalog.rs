@@ -124,7 +124,7 @@ impl Dialect for PostgresDialect {
         // destination does not have, so re-render the translated AST without
         // the qualifier; the canonical text round-trips through the SQLite
         // fallback in `Dialect::parse`.
-        if tbl_name.db_name.take().is_none() {
+        if tbl_name.namespace.take().is_none() {
             return Ok(raw_sql.to_string());
         }
 

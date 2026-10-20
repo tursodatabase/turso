@@ -2762,7 +2762,7 @@ impl Schema {
                 //     behaviour) would treat an unresolved attached name
                 //     the same as an unqualified reference, causing the
                 //     trigger to fire on every table with a matching name.
-                let target_database_id = tbl_name.db_name.as_ref().map(|db_name| {
+                let target_database_id = tbl_name.namespace.as_ref().map(|db_name| {
                     let db = db_name.as_str();
                     if db.eq_ignore_ascii_case("main") {
                         crate::MAIN_DB_ID

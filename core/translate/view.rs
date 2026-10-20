@@ -64,7 +64,7 @@ pub fn translate_create_materialized_view(
     if connection.mvcc_enabled() {
         bail_parse_error!("Materialized views are not supported in MVCC mode");
     }
-    let database_id = resolver.resolve_database_id(view_name)?;
+    let database_id = resolver.resolve_database_id_for_create(view_name)?;
     let schema_cookie = resolver.with_schema(database_id, |s| s.schema_version);
     program.begin_write_on_database(database_id, schema_cookie)?;
     let normalized_view_name = normalize_ident(view_name.name.as_str());
@@ -85,7 +85,7 @@ pub fn translate_create_materialized_view(
     validate_materialized(&connection, database_id, resolver, &normalized_view_name)?;
 
     // Check for cross-database table references first
-    crate::util::validate_select_for_views(select_stmt, view_name.db_name.as_ref())?;
+    crate::util::validate_select_for_views(select_stmt, view_name.namespace.as_ref())?;
 
     let view_column_schema =
         resolver.with_schema(database_id, |s| extract_view_columns(select_stmt, s))?;
@@ -337,7 +337,7 @@ pub fn translate_create_view(
     let database_id = if temporary {
         crate::TEMP_DB_ID
     } else {
-        resolver.resolve_database_id(view_name)?
+        resolver.resolve_database_id_for_create(view_name)?
     };
     let schema_cookie = resolver.with_schema(database_id, |s| s.schema_version);
     program.begin_write_on_database(database_id, schema_cookie)?;
@@ -387,7 +387,7 @@ pub fn translate_create_view(
         }));
     }
 
-    crate::util::validate_select_for_views(select_stmt, view_name.db_name.as_ref())?;
+    crate::util::validate_select_for_views(select_stmt, view_name.namespace.as_ref())?;
 
     // Reconstruct the SQL string
     let sql = create_view_to_str(&view_name.name.as_ident(), columns, select_stmt);

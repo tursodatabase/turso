@@ -1606,7 +1606,7 @@ pub fn translate_alter_table(
                                 }),
                             };
                     // Pass the renamed database's NAME so the rewrite
-                    // only touches triggers whose `tbl_name.db_name`
+                    // only touches triggers whose `tbl_name.namespace`
                     // actually points at the db we are renaming in
                     // (or is unqualified). Otherwise a temp trigger
                     // referencing `aux.t` would be wrongly rewritten
@@ -2909,14 +2909,14 @@ fn rewrite_trigger_sql_for_table_rename(
     // implementation did, and the caller already narrowed the
     // candidate set by iterating temp schema triggers for renames in
     // main only.
-    let qualifier_matches = match tbl_name.db_name.as_ref() {
+    let qualifier_matches = match tbl_name.namespace.as_ref() {
         Some(db) => db.as_str().eq_ignore_ascii_case(renamed_db_name),
         None => true,
     };
     let new_tbl_name =
         if qualifier_matches && tbl_name.name.as_str().eq_ignore_ascii_case(old_table_name) {
             ast::QualifiedName {
-                db_name: tbl_name.db_name,
+                namespace: tbl_name.namespace,
                 name: ast::Name::exact(new_table_name.to_string()),
                 alias: None,
             }
@@ -5102,7 +5102,7 @@ fn validate_select_table_refs_after_rename_in_table(
         ast::SelectTable::Table(qualified_name, _, _) => {
             if table_reference_exists_after_rename(
                 qualified_name.name.as_str(),
-                qualified_name.db_name.as_ref().map(|db| db.as_str()),
+                qualified_name.namespace.as_ref().map(|db| db.as_str()),
                 altered_table_norm,
                 resolver,
                 trigger_database_id,
@@ -5929,7 +5929,7 @@ fn collect_qualified_table_visible_columns(
         resolver,
         trigger_database_id,
         altered_database_id,
-        qualified_name.db_name.as_ref().map(|name| name.as_str()),
+        qualified_name.namespace.as_ref().map(|name| name.as_str()),
     )
     .unwrap_or_default();
     let qualifier = alias.map_or_else(
@@ -5939,7 +5939,7 @@ fn collect_qualified_table_visible_columns(
     let mut visible = columns.clone();
     visible.extend(columns.iter().map(|column| format!("{qualifier}.{column}")));
     if alias.is_none() {
-        if let Some(db_name) = &qualified_name.db_name {
+        if let Some(db_name) = &qualified_name.namespace {
             let database = normalize_ident(db_name.as_str());
             let table = normalize_ident(qualified_name.name.as_str());
             visible.extend(

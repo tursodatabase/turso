@@ -311,7 +311,7 @@ fn trigger_cmd_to_stmt_for_subprogram(
                 with: None,
                 or_conflict: effective_or_conflict,
                 tbl_name: QualifiedName {
-                    db_name: subprogram_ctx.db_name.clone(),
+                    namespace: subprogram_ctx.db_name.clone(),
                     name: tbl_name.clone(),
                     alias: None,
                 },
@@ -353,7 +353,7 @@ fn trigger_cmd_to_stmt_for_subprogram(
                 with: None,
                 or_conflict: effective_or_conflict,
                 tbl_name: QualifiedName {
-                    db_name: subprogram_ctx.db_name.clone(),
+                    namespace: subprogram_ctx.db_name.clone(),
                     name: tbl_name.clone(),
                     alias: None,
                 },
@@ -376,7 +376,7 @@ fn trigger_cmd_to_stmt_for_subprogram(
 
             Ok(ast::Stmt::Delete {
                 tbl_name: QualifiedName {
-                    db_name: subprogram_ctx.db_name.clone(),
+                    namespace: subprogram_ctx.db_name.clone(),
                     name: tbl_name.clone(),
                     alias: None,
                 },

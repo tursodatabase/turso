@@ -85,7 +85,7 @@ impl YieldInjector for FixedYieldInjector {
 }
 
 fn drive_attach(conn: &Arc<Connection>, path: &str, alias: &str) {
-    let mut state = crate::connection::AttachDatabaseState::default();
+    let mut state = crate::dialect::sqlite::attach::AttachDatabaseState::default();
     loop {
         match conn.attach_database(path, alias, &mut state).unwrap() {
             crate::IOResult::Done(()) => return,

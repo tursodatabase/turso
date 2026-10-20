@@ -168,6 +168,7 @@ fn emit_group_aggregate_rows(
         connection.database_schemas(),
         &connection.temp.database,
         connection.attached_databases(),
+        connection.namespaces(),
         &syms,
         connection.experimental_custom_types_enabled(),
         connection.get_dqs_dml().into(),
