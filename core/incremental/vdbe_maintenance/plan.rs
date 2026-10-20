@@ -377,7 +377,9 @@ fn build_select_plan_dag(
 
     // A run of inner joins becomes one join node over all its inputs, so it
     // keeps no intermediate join results. Outer, semi and anti joins end the
-    // run: they take the run's result as their first input.
+    // run: they take the run's result as their first input. A filter on the
+    // run's first input joins the run's terms, so that input stays a base
+    // table the join can look up by key instead of a filtered copy.
     let mut node = inputs[0];
     let mut run = Vec::new();
     let mut run_terms = Vec::new();
@@ -408,13 +410,13 @@ fn build_select_plan_dag(
                 };
             }
         }
-        if let Some(predicate) = combine_predicates(std::mem::take(&mut filters_by_step[step])) {
-            node = push_inner_run(builder, node, &mut run, &mut run_terms)?;
-            node = builder.push(dag::OpNode::Filter {
-                input: node,
-                predicate,
-            })?;
-        }
+        // Only the first table and outer joins have filters: the WHERE terms of
+        // an inner join are terms of the run.
+        turso_assert!(
+            run.is_empty() || filters_by_step[step].is_empty(),
+            "a filter inside a run of inner joins must be a join term"
+        );
+        run_terms.append(&mut filters_by_step[step]);
     }
     node = push_inner_run(builder, node, &mut run, &mut run_terms)?;
 
@@ -523,8 +525,9 @@ fn build_select_plan_dag(
     Ok(node)
 }
 
-/// Join `first` with the inputs collected in `run` by one inner join node,
-/// and empty the run. Returns `first` when the run is empty.
+/// Join `first` with the inputs collected in `run` by one inner join node
+/// checking `terms`, and empty both. Without a run, `terms` are filters on
+/// `first`.
 fn push_inner_run(
     builder: &mut dag::DagBuilder,
     first: dag::NodeId,
@@ -532,8 +535,13 @@ fn push_inner_run(
     terms: &mut Vec<ast::Expr>,
 ) -> Result<dag::NodeId> {
     if run.is_empty() {
-        turso_assert!(terms.is_empty(), "join terms need a join");
-        return Ok(first);
+        return match combine_predicates(std::mem::take(terms)) {
+            Some(predicate) => builder.push(dag::OpNode::Filter {
+                input: first,
+                predicate,
+            }),
+            None => Ok(first),
+        };
     }
     let inputs = std::iter::once(first).chain(run.drain(..)).collect();
     builder.push(dag::OpNode::Join {
