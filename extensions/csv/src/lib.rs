@@ -37,12 +37,21 @@ register_extension! {
 struct CsvVTabModule;
 
 impl CsvVTabModule {
-    fn parse_arg(arg: &Value) -> Result<(&str, Option<&str>), ResultCode> {
-        let text = arg.to_text().ok_or(ResultCode::InvalidArgs)?;
-        match text.split_once('=') {
-            Some((name, value)) => Ok((name.trim(), Some(value.trim()))),
-            None => Ok((text.trim(), None)),
+    fn parse_arg(arg: &Value) -> Result<(&str, &str), ResultCode> {
+        if let Some(text) = arg.to_text() {
+            let mut split = text.splitn(2, '=');
+            if let Some(name) = split.next() {
+                if let Some(value) = split.next() {
+                    let name = name.trim();
+                    let value = value.trim();
+                    return Ok((name, value));
+                }
+                if name.trim() == "header" {
+                    return Ok(("header", "yes"));
+                }
+            }
         }
+        Err(ResultCode::InvalidArgs)
     }
 
     fn parse_string(s: &str) -> Result<String, ResultCode> {
@@ -118,38 +127,26 @@ impl VTabModule for CsvVTabModule {
 
         for arg in args {
             let (name, value) = Self::parse_arg(arg)?;
-            match (name, value) {
-                ("header", value) => {
-                    if header.is_some() {
-                        return Err(ResultCode::InvalidArgs);
-                    }
-                    header = Some(match value {
-                        Some(value) => Self::parse_boolean(value).ok_or(ResultCode::InvalidArgs)?,
-                        None => true,
-                    });
-                }
-                (_, None) => {
-                    return Err(ResultCode::InvalidArgs);
-                }
-                ("filename", Some(value)) => {
+            match name {
+                "filename" => {
                     if filename.is_some() {
                         return Err(ResultCode::InvalidArgs);
                     }
                     filename = Some(Self::parse_string(value)?);
                 }
-                ("data", Some(value)) => {
+                "data" => {
                     if data.is_some() {
                         return Err(ResultCode::InvalidArgs);
                     }
                     data = Some(Self::parse_string(value)?);
                 }
-                ("schema", Some(value)) => {
+                "schema" => {
                     if schema.is_some() {
                         return Err(ResultCode::InvalidArgs);
                     }
                     schema = Some(Self::parse_string(value)?);
                 }
-                ("columns", Some(value)) => {
+                "columns" => {
                     if column_count.is_some() {
                         return Err(ResultCode::InvalidArgs);
                     }
@@ -158,6 +155,12 @@ impl VTabModule for CsvVTabModule {
                         return Err(ResultCode::InvalidArgs);
                     }
                     column_count = Some(n);
+                }
+                "header" => {
+                    if header.is_some() {
+                        return Err(ResultCode::InvalidArgs);
+                    }
+                    header = Some(Self::parse_boolean(value).ok_or(ResultCode::InvalidArgs)?);
                 }
                 _ => {
                     return Err(ResultCode::InvalidArgs);
