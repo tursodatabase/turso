@@ -1037,7 +1037,7 @@ fn get_subquery_parser<'a>(
                             pos_in_table: i,
                             collation: lhs_collation
                                 .filter(|(_, explicit)| *explicit)
-                                .or(rhs_collation.filter(|(_, explicit)| *explicit))
+                                .or_else(|| rhs_collation.filter(|(_, explicit)| *explicit))
                                 .or(lhs_collation)
                                 .or(rhs_collation)
                                 .map(|(collation, _)| collation),
