@@ -10,6 +10,7 @@ use crate::translate::plan::{
 use crate::translate::planner::parse_row_id;
 use crate::types::IOResult;
 use crate::types::IOResultOr;
+use crate::vdbe::affinity::Affinity;
 use crate::IO;
 use crate::{
     schema::{Column, Schema, Table, Type},
@@ -2507,38 +2508,13 @@ fn extract_view_columns_inner(
     for result_column in select_columns {
         match result_column {
             ast::ResultColumn::Expr(expr, alias) => {
-                let source_column = match expr.as_ref() {
-                    ast::Expr::Qualified(qualifier, column_name) => sources
-                        .iter()
-                        .find(|source| {
-                            source
-                                .qualifiers
-                                .iter()
-                                .any(|candidate| candidate.eq_ignore_ascii_case(qualifier.as_str()))
-                        })
-                        .and_then(|source| {
-                            source.columns.iter().find(|column| {
-                                view_column_name(column).is_some_and(|candidate| {
-                                    candidate.eq_ignore_ascii_case(column_name.as_str())
-                                })
-                            })
-                        })
-                        .map(view_output_column),
-                    ast::Expr::Id(column_name) => {
-                        resolve_view_column(&sources, column_name.as_str())
-                    }
-                    _ => None,
-                };
                 let name = alias
                     .as_ref()
                     .filter(|alias| !matches!(alias, ast::As::ImplicitColumnName(_)))
                     .map(|alias| alias.name().as_str().to_string())
                     .or_else(|| extract_column_name_from_expr(expr))
                     .unwrap_or_else(|| expr.to_string());
-                let mut column = source_column.unwrap_or_else(|| ViewColumn {
-                    table_index: usize::MAX,
-                    column: Column::new_default_text(None, "TEXT".to_string(), None),
-                });
+                let mut column = view_result_column(expr, &sources);
                 column.column.name = Some(name);
                 deduplicate_view_column_name(&mut column, &mut column_name_counts);
                 columns.push(column);
@@ -2583,6 +2559,78 @@ fn extract_view_columns_inner(
     }
 
     Ok(ViewColumnSchema { tables, columns })
+}
+
+fn view_result_column(expr: &ast::Expr, sources: &[ViewSource]) -> ViewColumn {
+    if let Some(column) = view_referenced_column(expr, sources) {
+        return column;
+    }
+    let ty_str = view_affinity_type_name(view_expression_affinity(expr, sources));
+    let (ty, _) = type_from_name(ty_str);
+    ViewColumn {
+        table_index: usize::MAX,
+        column: Column::new(
+            None,
+            ty_str.to_string(),
+            None,
+            None,
+            ty,
+            None,
+            ColDef::default(),
+        ),
+    }
+}
+
+fn view_referenced_column(expr: &ast::Expr, sources: &[ViewSource]) -> Option<ViewColumn> {
+    match expr {
+        ast::Expr::Parenthesized(exprs) if exprs.len() == 1 => {
+            view_referenced_column(&exprs[0], sources)
+        }
+        ast::Expr::Id(column_name) => resolve_view_column(sources, column_name.as_str()),
+        ast::Expr::Qualified(qualifier, column_name) => sources
+            .iter()
+            .find(|source| {
+                source
+                    .qualifiers
+                    .iter()
+                    .any(|candidate| candidate.eq_ignore_ascii_case(qualifier.as_str()))
+            })
+            .and_then(|source| {
+                source.columns.iter().find(|column| {
+                    view_column_name(column).is_some_and(|candidate| {
+                        candidate.eq_ignore_ascii_case(column_name.as_str())
+                    })
+                })
+            })
+            .map(view_output_column),
+        _ => None,
+    }
+}
+
+fn view_expression_affinity(expr: &ast::Expr, sources: &[ViewSource]) -> Affinity {
+    match expr {
+        ast::Expr::Parenthesized(exprs) if exprs.len() == 1 => {
+            view_expression_affinity(&exprs[0], sources)
+        }
+        ast::Expr::Collate(inner, _) => view_expression_affinity(inner, sources),
+        ast::Expr::Cast { type_name, .. } => {
+            Affinity::affinity(type_name.as_ref().map_or("", |type_name| &type_name.name))
+        }
+        _ => view_referenced_column(expr, sources).map_or(Affinity::None, |column| {
+            Affinity::affinity(&column.column.ty_str)
+        }),
+    }
+}
+
+fn view_affinity_type_name(affinity: Affinity) -> &'static str {
+    match affinity {
+        Affinity::None => "",
+        Affinity::Blob => "BLOB",
+        Affinity::Integer => "INT",
+        Affinity::Real => "REAL",
+        Affinity::Text => "TEXT",
+        Affinity::Numeric => "NUM",
+    }
 }
 
 /// Extract column information from a SELECT statement for view creation.
