@@ -1689,3 +1689,18 @@ expect {
     3
     1
 }
+
+test compound-chain-leftmost-collation {
+    CREATE TABLE compound_collate_left(n TEXT COLLATE NOCASE, p TEXT);
+    CREATE TABLE compound_collate_right(n TEXT);
+    INSERT INTO compound_collate_left VALUES ('a', 'z'), ('A', 'A');
+    INSERT INTO compound_collate_right VALUES ('a');
+    SELECT count(*) FROM (
+        SELECT n FROM compound_collate_left
+        EXCEPT SELECT p FROM compound_collate_left
+        INTERSECT SELECT n FROM compound_collate_right
+    );
+}
+expect {
+    0
+}
