@@ -1297,7 +1297,7 @@ pub(crate) fn compute_best_join_order_with_context<'a>(
     // The DP algorithm has O(2^n) complexity which becomes prohibitively slow
     // beyond ~12 tables. The greedy algorithm is O(n²) and produces good
     // (though not always optimal) plans.
-    let where_terms = build_where_term_info(where_clause, table_references, subqueries)?;
+    let where_terms = build_where_term_info(where_clause, table_references, subqueries, schema)?;
     if num_tables > GREEDY_JOIN_THRESHOLD {
         return compute_greedy_join_order(
             joined_tables,
@@ -2277,6 +2277,7 @@ fn build_where_term_info(
     where_clause: &[WhereTerm],
     table_references: &TableReferences,
     subqueries: &[NonFromClauseSubquery],
+    schema: &Schema,
 ) -> Result<Vec<WhereTermInfo>> {
     where_clause
         .iter()
@@ -2287,7 +2288,7 @@ fn build_where_term_info(
                 // and condition work separate costs so this does not need to subtract one.
                 extra_steps: where_expr_steps(&term.expr).saturating_sub(1),
                 equal_tables: (!term.consumed)
-                    .then(|| tables_in_equal_test(&term.expr))
+                    .then(|| tables_in_equal_test(&term.expr, table_references, schema))
                     .flatten()
                     .map(|(left, right)| {
                         (
@@ -2576,7 +2577,8 @@ mod tests {
             Operator::Or,
             Box::new(check(second_id)),
         ))];
-        let where_terms = build_where_term_info(&two_table_where, &table_references, &[])?;
+        let where_terms =
+            build_where_term_info(&two_table_where, &table_references, &[], &empty_schema())?;
 
         let mut joined_mask = TableMask::default();
         joined_mask.set(0)?;
@@ -2594,7 +2596,8 @@ mod tests {
         ));
         term.origin = WhereTermOrigin::Join(JoinOrigin::Outer(second_id));
         let outer_join_where = vec![term];
-        let where_terms = build_where_term_info(&outer_join_where, &table_references, &[])?;
+        let where_terms =
+            build_where_term_info(&outer_join_where, &table_references, &[], &empty_schema())?;
 
         let mut joined_mask = TableMask::default();
         joined_mask.set(0)?;

@@ -1,6 +1,8 @@
 use super::{cost_params::CostModelParams, AvailableIndexes};
 use crate::alloc::TursoIteratorExt;
-use crate::translate::expr::comparison_affinity;
+use crate::translate::expr::{
+    comparison_affinity, custom_type_eq_func_for_column_pair, custom_type_with_different_params,
+};
 use crate::{
     schema::{Column, Index, Schema},
     translate::{
@@ -812,6 +814,31 @@ pub fn constraints_from_where_clause(
                 {
                     continue;
                 }
+                // An index search encodes the search value with the parameters
+                // of the indexed column, which can change a value of the same
+                // custom type with other parameters (see
+                // [custom_type_with_different_params]), and it compares bytes,
+                // so it cannot call the `=` function of the type (see
+                // [custom_type_eq_func_for_column_pair]).
+                if custom_type_with_different_params(
+                    lhs,
+                    table_references,
+                    rhs,
+                    table_references,
+                    schema,
+                )
+                .is_some()
+                    || custom_type_eq_func_for_column_pair(
+                        lhs,
+                        table_references,
+                        rhs,
+                        table_references,
+                        schema,
+                    )
+                    .is_some()
+                {
+                    continue;
+                }
                 // Resolve the comparison affinity once per term per SQLite's
                 // `comparisonAffinity` (see `Constraint::comparison_affinity`)
                 // and propagate it to every constraint derived from this term.
@@ -1114,7 +1141,12 @@ pub fn constraints_from_where_clause(
                 subquery_id,
                 lhs: Some(lhs_expr),
                 not_in,
-                query_type: ast::SubqueryType::In { affinity_str, .. },
+                query_type:
+                    ast::SubqueryType::In {
+                        affinity_str,
+                        custom_type_eq_funcs,
+                        ..
+                    },
             } = &term.expr
             {
                 // Find the subquery to check if it's correlated
@@ -1122,8 +1154,10 @@ pub fn constraints_from_where_clause(
                     .iter()
                     .find(|s| s.internal_id == *subquery_id)
                     .expect("subquery not found");
-                // Only use as constraint if NOT correlated
-                if !subquery.correlated {
+                // Only use as constraint if NOT correlated, and not when a
+                // column needs the `=` function of its custom type, which an
+                // index search cannot call.
+                if !subquery.correlated && custom_type_eq_funcs.iter().all(Option::is_none) {
                     let table_stats = schema
                         .analyze_stats
                         .table_stats(table_reference.table.get_name());

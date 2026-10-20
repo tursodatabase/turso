@@ -128,7 +128,8 @@ pub(super) struct ExprCustomTypeInfo {
 pub(super) fn expr_custom_type_info(
     expr: &ast::Expr,
     referenced_tables: Option<&TableReferences>,
-    resolver: &Resolver,
+    schema: &Schema,
+    self_table: Option<&BTreeTable>,
 ) -> Option<ExprCustomTypeInfo> {
     if let ast::Expr::Column {
         table: table_ref_id,
@@ -141,12 +142,12 @@ pub(super) fn expr_custom_type_info(
         {
             Some((_, table)) => (table.get_column_at(*column)?.clone(), table.is_strict()),
             None if table_ref_id.is_self_table() => {
-                let table = resolver.self_table_with_custom_type_operators()?;
+                let table = self_table?;
                 (table.columns().get(*column)?.clone(), table.is_strict)
             }
             None => return None,
         };
-        let type_def = resolver.schema().get_type_def(&col.ty_str, is_strict)?;
+        let type_def = schema.get_type_def(&col.ty_str, is_strict)?;
         return Some(ExprCustomTypeInfo {
             type_name: col.ty_str.to_lowercase(),
             type_def: Arc::clone(type_def),
@@ -235,8 +236,19 @@ pub(super) fn find_custom_type_operator(
     resolver: &Resolver,
 ) -> Option<ResolvedOperator> {
     let op_str = operator_to_str(op)?;
-    let lhs_info = expr_custom_type_info(e1, referenced_tables, resolver);
-    let rhs_info = expr_custom_type_info(e2, referenced_tables, resolver);
+    let self_table = resolver.self_table_with_custom_type_operators();
+    let lhs_info = expr_custom_type_info(
+        e1,
+        referenced_tables,
+        resolver.schema(),
+        self_table.as_deref(),
+    );
+    let rhs_info = expr_custom_type_info(
+        e2,
+        referenced_tables,
+        resolver.schema(),
+        self_table.as_deref(),
+    );
 
     // Try to find a direct or derived operator match on a type definition.
     let find_in_type_def = |type_def: &TypeDef| -> Option<(String, bool, bool)> {
@@ -250,13 +262,7 @@ pub(super) fn find_custom_type_operator(
         }
 
         // Derive missing operators from < and =
-        let find_op = |sym: &str| -> Option<String> {
-            type_def
-                .operators()
-                .iter()
-                .find(|o| o.op == sym)
-                .and_then(|o| o.func_name.clone())
-        };
+        let find_op = |sym: &str| type_def.operator_func(sym).cloned();
 
         match *op {
             // a > b  →  lt(b, a)
@@ -315,6 +321,52 @@ pub(super) fn find_custom_type_operator(
         (None, Some(rhs)) => resolve_one_custom_operand(rhs, e1, EncodeArg::First),
         _ => None,
     }
+}
+
+/// Return the type when `lhs` and `rhs` are columns of the same custom type
+/// declared with different parameters, such as `numeric(10,2)` and
+/// `numeric(10,3)`. Their values are encoded and decoded with different
+/// parameters, so equal values can have different bytes (`1.00` and `1.000`),
+/// and encoding one column's value with the other column's parameters can
+/// change it (`1.25` becomes `1.2`).
+pub(crate) fn custom_type_with_different_params(
+    lhs: &ast::Expr,
+    lhs_tables: &TableReferences,
+    rhs: &ast::Expr,
+    rhs_tables: &TableReferences,
+    schema: &Schema,
+) -> Option<Arc<TypeDef>> {
+    let lhs_info = expr_custom_type_info(lhs, Some(lhs_tables), schema, None)?;
+    let rhs_info = expr_custom_type_info(rhs, Some(rhs_tables), schema, None)?;
+    (lhs_info.type_name == rhs_info.type_name
+        && lhs_info.column.ty_params != rhs_info.column.ty_params)
+        .then_some(lhs_info.type_def)
+}
+
+/// Return the `=` function of the type when `lhs` and `rhs` are columns of the
+/// same custom type whose equal values can have different bytes, so a byte
+/// comparison misses matches that the `=` function finds. This is the case
+/// for a user-defined `=` function, such as one that finds `'1'` equal to
+/// `'01'`, and for columns declared with different parameters (see
+/// [custom_type_with_different_params]). The `=` function of a built-in type
+/// finds two values equal only when they have the same bytes under the same
+/// parameters, and a type without an `=` function compares bytes anyway.
+pub(crate) fn custom_type_eq_func_for_column_pair(
+    lhs: &ast::Expr,
+    lhs_tables: &TableReferences,
+    rhs: &ast::Expr,
+    rhs_tables: &TableReferences,
+    schema: &Schema,
+) -> Option<String> {
+    let lhs_info = expr_custom_type_info(lhs, Some(lhs_tables), schema, None)?;
+    let rhs_info = expr_custom_type_info(rhs, Some(rhs_tables), schema, None)?;
+    if lhs_info.type_name != rhs_info.type_name {
+        return None;
+    }
+    let eq_func = lhs_info.type_def.operator_func("=")?;
+    let equal_values_have_equal_bytes =
+        lhs_info.type_def.is_builtin && lhs_info.column.ty_params == rhs_info.column.ty_params;
+    (!equal_values_have_equal_bytes).then(|| eq_func.clone())
 }
 
 /// Evaluate an expression-index expression in a DML context (INSERT/UPDATE/UPSERT).

@@ -15,7 +15,7 @@ use crate::function::JsonFunc;
 use crate::function::{AggFunc, Func, FuncCtx, MathFuncArity, ScalarFunc, VectorFunc};
 use crate::schema::{
     BTreeTable, ColDef, Column, ColumnLayout, GeneratedType, ParenthesizedJoinColumn,
-    ParenthesizedJoinColumnVisibility, Table, Type, TypeDef,
+    ParenthesizedJoinColumnVisibility, Schema, Table, Type, TypeDef,
 };
 use crate::sync::Arc;
 use crate::translate::expression_index::selected_expression_index;
@@ -89,6 +89,7 @@ pub(super) use binding::{find_unqualified_column, lookup_unqualified_column};
 pub use columns::{emit_table_column, emit_table_column_for_dml};
 pub use condition::translate_condition_expr;
 pub(crate) use custom_types::{
+    custom_type_eq_func_for_column_pair, custom_type_with_different_params,
     emit_dml_expr_index_value, emit_trigger_decode_registers, emit_type_expr,
     emit_user_facing_column_value,
 };
