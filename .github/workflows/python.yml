@@ -21,28 +21,21 @@ env:
   # Blacksmith Windows images ship VS Build Tools without LLVM, so the aegis
   # crate's clang-cl preference fails; force the MSVC compiler instead.
   CC_x86_64_pc_windows_msvc: cl.exe
+  # Wheels are only published from tags. Pull requests only check that the
+  # wheels build, so they use lib-release (no LTO) instead of the slow
+  # release-official profile.
+  WHEEL_PROFILE: ${{ github.event_name == 'pull_request' && 'lib-release' || 'release-official' }}
 
 jobs:
-  configure-strategy:
-    runs-on: blacksmith-4vcpu-ubuntu-2404
-    timeout-minutes: 30
-    outputs:
-      python-versions: ${{ steps.gen-matrix.outputs.python-versions }}
-    steps:
-      - id: gen-matrix
-        run: |
-          echo "python-versions=[\"3.10\",\"3.14\"]" >> $GITHUB_OUTPUT
-
   test:
-    needs: configure-strategy
     timeout-minutes: 30
     strategy:
       matrix:
         os:
           - blacksmith-4vcpu-ubuntu-2404
           - blacksmith-6vcpu-macos-latest
-          - blacksmith-4vcpu-windows-2025
-        python-version: ${{ fromJson(needs.configure-strategy.outputs.python-versions) }}
+          - blacksmith-8vcpu-windows-2025
+        python-version: ["3.10", "3.14"]
     runs-on: ${{ matrix.os }}
 
     steps:
@@ -51,6 +44,10 @@ jobs:
 
       - name: Setup Rust toolchain
         uses: dtolnay/rust-toolchain@stable
+
+      - name: Setup MSVC
+        if: runner.os == 'Windows'
+        uses: "./.github/shared/setup-msvc"
 
       - name: Setup mold linker
         if: runner.os == 'Linux'
@@ -61,10 +58,11 @@ jobs:
         with:
           prefix-key: "v1-rust"
           cache-on-failure: true
+          save-if: ${{ github.ref == 'refs/heads/main' }}
 
 
       - name: Build Rust (debug)
-        run: cargo build --verbose --locked
+        run: cargo build -p turso_cli --bin tursodb --locked
 
       - name: Set up Python ${{ matrix.python-version }}
         uses: useblacksmith/setup-python@v6
@@ -75,6 +73,16 @@ jobs:
         uses: useblacksmith/setup-uv@v4
         with:
           enable-cache: true
+
+      # `uv sync` builds the extension with maturin, which defaults to an
+      # optimized release build with LTO. On pull requests, build it in debug
+      # mode instead: much faster, and it reuses what "Build Rust (debug)"
+      # built. main keeps testing the release build, which has code paths
+      # debug builds don't (e.g. panic=abort, release-only branches).
+      - name: Build the extension in debug mode on pull requests
+        if: github.event_name == 'pull_request'
+        shell: bash
+        run: echo "MATURIN_PEP517_ARGS=--profile dev" >> "$GITHUB_ENV"
 
       - name: Install the project
         working-directory: ${{ env.working-directory }}
@@ -93,28 +101,36 @@ jobs:
         if: runner.os != 'Windows'
         env:
           LOCAL_SYNC_SERVER: "../../target/debug/tursodb"
-        run: uv run pytest tests/test_database_sync.py
+        run: uv run pytest tests/test_database_sync.py --durations=10
 
       - name: Run Pytest (sync, async driver)
         working-directory: ${{ env.working-directory }}
         if: runner.os != 'Windows'
         env:
           LOCAL_SYNC_SERVER: "../../target/debug/tursodb"
-        run: uv run pytest tests/test_database_sync_aio.py
+        run: uv run pytest tests/test_database_sync_aio.py --durations=10
 
-      - name: Run Pytest (windows, sync)
+      - name: Run Pytest (windows, sync drivers)
         working-directory: ${{ env.working-directory }}
         if: runner.os == 'Windows'
+        shell: bash
         env:
           LOCAL_SYNC_SERVER: "..\\..\\target\\debug\\tursodb.exe"
-        run: uv run pytest tests/test_database_sync.py
-
-      - name: Run Pytest (windows, sync, async driver)
-        working-directory: ${{ env.working-directory }}
-        if: runner.os == 'Windows'
-        env:
-          LOCAL_SYNC_SERVER: "..\\..\\target\\debug\\tursodb.exe"
-        run: uv run pytest tests/test_database_sync_aio.py
+        run: |
+          set -euo pipefail
+          uv run --no-sync pytest tests/test_database_sync.py --durations=10 >sync.log 2>&1 &
+          sync_pid=$!
+          uv run --no-sync pytest tests/test_database_sync_aio.py --durations=10 >async.log 2>&1 &
+          async_pid=$!
+          sync_status=0
+          wait "$sync_pid" || sync_status=$?
+          async_status=0
+          wait "$async_pid" || async_status=$?
+          cat sync.log
+          cat async.log
+          if [ "$sync_status" -ne 0 ] || [ "$async_status" -ne 0 ]; then
+            exit 1
+          fi
 
   lint:
     runs-on: blacksmith-4vcpu-ubuntu-2404
@@ -132,9 +148,6 @@ jobs:
         with:
           enable-cache: true
 
-      - name: Install the project
-        run: uv sync --all-extras --dev --all-packages
-
       - name: Ruff lint
         run: uvx ruff@0.5.4 check
 
@@ -149,7 +162,7 @@ jobs:
           - target: x86_64
             runner: blacksmith-4vcpu-ubuntu-2404
           - target: aarch64
-            runner: blacksmith-2vcpu-ubuntu-2404-arm
+            runner: blacksmith-4vcpu-ubuntu-2404-arm
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v4
@@ -161,8 +174,7 @@ jobs:
         with:
           working-directory: ${{ env.working-directory }}
           target: ${{ matrix.target }}
-          args: --profile release-official --out dist
-          sccache: 'true'
+          args: --profile ${{ env.WHEEL_PROFILE }} --out dist
           manylinux: auto
       - name: Upload wheels
         uses: actions/upload-artifact@v4
@@ -178,7 +190,11 @@ jobs:
         working-directory: ${{ env.working-directory }}
     strategy:
       matrix:
-        target: [x86_64, aarch64]
+        # On pull requests, skip the aarch64 wheel: the macOS test job
+        # already builds the same extension for aarch64 (uv sync builds a
+        # wheel through maturin) and runs the tests against it. x86_64 is
+        # the only PR build for that target, so it stays.
+        target: ${{ github.event_name == 'pull_request' && fromJSON('["x86_64"]') || fromJSON('["x86_64", "aarch64"]') }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -192,8 +208,7 @@ jobs:
         with:
           working-directory: ${{ env.working-directory }}
           target: ${{ matrix.target }}
-          args: --profile release-official --out dist
-          sccache: 'true'
+          args: --profile ${{ env.WHEEL_PROFILE }} --out dist
       - name: Upload wheels
         uses: actions/upload-artifact@v4
         with:

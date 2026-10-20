@@ -3,7 +3,7 @@ name: Dotnet Publish
 on:
   push:
     branches:
-      - "**"
+      - main
     paths:
       - ".github/workflows/dotnet-publish.yml"
       - "bindings/dotnet/**"
@@ -13,6 +13,12 @@ on:
       - "sdk-kit/**"
       - "sync/engine/**"
       - "sync/sdk-kit/**"
+  # Core changes in PRs are covered by dotnet-test.yml. The full
+  # cross-platform build runs on PRs only when the .NET binding changes.
+  pull_request:
+    paths:
+      - ".github/workflows/dotnet-publish.yml"
+      - "bindings/dotnet/**"
   # Manual trigger with dry-run / publish controls
   workflow_dispatch:
     inputs:
@@ -112,7 +118,7 @@ jobs:
           artifact-name: native-win-arm64
 
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 30
+    timeout-minutes: 60
     permissions:
       contents: read
       id-token: write  # required for Azure OIDC login (code signing on Windows)
@@ -132,11 +138,16 @@ jobs:
       - name: Add target
         run: rustup target add ${{ matrix.target }}
 
+      - name: Setup MSVC
+        if: matrix.target == 'x86_64-pc-windows-msvc'
+        uses: "./.github/shared/setup-msvc"
+
       - name: Rust cache
         uses: Swatinem/rust-cache@v2
         with:
           prefix-key: "v1-rust-dotnet-publish"
           cache-on-failure: true
+          save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: Set up Android SDK
         if: contains(matrix.target, 'linux-android')
@@ -782,8 +793,11 @@ jobs:
         with:
           dotnet-version: 10.0.x
 
+      # Workload set 10.0.401.1 moved the iOS SDK to 27.0, which requires
+      # Xcode 27. The macos-26 runner image only ships Xcode 26.x, so stay on
+      # the last workload set whose iOS SDK (26.5) builds with Xcode 26.
       - name: Install iOS workload
-        run: dotnet workload install ios
+        run: dotnet workload install ios --version 10.0.401
 
       - name: Download NuGet packages
         uses: actions/download-artifact@v7

@@ -36,22 +36,29 @@ impl PostgreSQLTranslator {
         &self,
         range_var: &pg_query::protobuf::RangeVar,
     ) -> ast::QualifiedName {
-        let mapped_name = self.map_table_name(&range_var.relname);
+        let is_schemata = range_var
+            .schemaname
+            .eq_ignore_ascii_case("information_schema")
+            && range_var.relname.eq_ignore_ascii_case("schemata");
+        let mapped_name = if is_schemata {
+            "pg_information_schema_schemata".to_string()
+        } else {
+            self.map_table_name(&range_var.relname)
+        };
         let name = ast::Name::from_string(mapped_name);
         let alias = range_var
             .alias
             .as_ref()
             .filter(|a| !a.aliasname.is_empty())
             .map(|a| ast::Name::from_string(&a.aliasname));
-        let mut qn = if range_var.schemaname.is_empty()
-            || matches!(
-                range_var.schemaname.to_lowercase().as_str(),
-                "pg_catalog" | "public" | "information_schema"
-            ) {
-            ast::QualifiedName::single(name)
+        let schema = if range_var.schemaname.is_empty() {
+            is_catalog_table_name(name.as_str()).then_some("main")
         } else {
-            let schema = ast::Name::from_string(range_var.schemaname.clone());
-            ast::QualifiedName::fullname(schema, name)
+            Some(map_schema_name(&range_var.schemaname))
+        };
+        let mut qn = match schema {
+            Some(schema) => ast::QualifiedName::fullname(ast::Name::from_string(schema), name),
+            None => ast::QualifiedName::single(name),
         };
         qn.alias = alias;
         qn
@@ -88,7 +95,10 @@ impl PostgreSQLTranslator {
             | "pg_publication_namespace"
             | "pg_publication_rel"
             | "pg_get_tabledef"
-            | "pg_tables" => table_name.to_string(),
+            | "pg_settings"
+            | "pg_extension"
+            | "pg_tables"
+            | "pg_indexes" => table_name.to_string(),
             "information_schema.tables" => "sqlite_master".to_string(),
             "information_schema.columns" => "pragma_table_info".to_string(),
             // Default: keep original name
@@ -157,6 +167,7 @@ impl PostgreSQLTranslator {
             NodeRef::UpdateStmt(update) => self.translate_update(update)?,
             NodeRef::DeleteStmt(delete) => self.translate_delete(delete)?,
             NodeRef::TransactionStmt(txn) => self.translate_transaction(txn)?,
+            NodeRef::LockStmt(lock) => self.translate_lock_stub(lock)?,
             NodeRef::DropStmt(drop) => self.translate_drop(drop)?,
             NodeRef::AlterTableStmt(alter) => self.translate_alter_table(alter)?,
             NodeRef::RenameStmt(rename) => self.translate_rename_stmt(rename)?,
@@ -199,6 +210,49 @@ impl PostgreSQLTranslator {
             stmt: self.translate_node(query.to_ref())?,
             format: ast::EqpFormat::Text,
         })
+    }
+
+    fn translate_lock_stub(
+        &self,
+        lock: &pg_query::protobuf::LockStmt,
+    ) -> Result<ast::Stmt, ParseError> {
+        if lock.mode != 1 || lock.nowait {
+            return Err(ParseError::ParseError(
+                "only LOCK IN ACCESS SHARE MODE without NOWAIT is supported".to_string(),
+            ));
+        }
+        Ok(ast::Stmt::Select(ast::Select {
+            with: None,
+            body: ast::SelectBody {
+                select: ast::OneSelect::Select {
+                    distinctness: None,
+                    columns: vec![ast::ResultColumn::Expr(
+                        Box::new(ast::Expr::Literal(ast::Literal::Numeric("0".into()))),
+                        None,
+                    )],
+                    from: None,
+                    where_clause: None,
+                    group_by: None,
+                    window_clause: vec![],
+                },
+                compounds: vec![],
+            },
+            order_by: vec![],
+            limit: Some(ast::Limit {
+                expr: Box::new(ast::Expr::FunctionCall {
+                    name: ast::Name::from_string("pg_lock_access_share"),
+                    distinctness: None,
+                    args: vec![],
+                    order_by: vec![],
+                    within_group: vec![],
+                    filter_over: ast::FunctionTail {
+                        filter_clause: None,
+                        over_clause: None,
+                    },
+                }),
+                offset: None,
+            }),
+        }))
     }
 
     /// Translate a PostgreSQL CREATE TABLE statement into Turso AST.
@@ -1712,8 +1766,19 @@ impl PostgreSQLTranslator {
                 Some(pg_query::protobuf::node::Node::JoinExpr(join_expr)) => {
                     // A JoinExpr as a comma-separated item — flatten its joins
                     let nested = self.translate_join_expr(join_expr)?;
+                    if nested.joins.iter().any(join_keeps_unmatched_right_rows) {
+                        return Err(ParseError::ParseError(
+                            "RIGHT and FULL joins after a comma in FROM are not supported"
+                                .to_string(),
+                        ));
+                    }
+                    from_clause.joins.push(ast::JoinedSelectTable {
+                        operator: ast::JoinOperator::Comma,
+                        table: nested.select,
+                        constraint: None,
+                    });
                     from_clause.joins.extend(nested.joins);
-                    *nested.select
+                    continue;
                 }
                 Some(pg_query::protobuf::node::Node::RangeFunction(range_func)) => {
                     self.translate_range_function(range_func)?
@@ -1778,10 +1843,14 @@ impl PostgreSQLTranslator {
         range_var: &pg_query::protobuf::RangeVar,
     ) -> Result<ast::SelectTable, ParseError> {
         let qualified_name = self.qualified_name_from_range_var(range_var);
-        let alias = range_var
-            .alias
-            .as_ref()
-            .map(|a| ast::As::Elided(ast::Name::from_string(a.aliasname.clone())));
+        let alias = match &range_var.alias {
+            Some(a) => Some(a.aliasname.clone()),
+            None if qualified_name.name.as_str() != range_var.relname => {
+                Some(range_var.relname.clone())
+            }
+            None => None,
+        }
+        .map(|name| ast::As::Elided(ast::Name::from_string(name)));
 
         Ok(ast::SelectTable::Table(qualified_name, alias, None))
     }
@@ -1807,7 +1876,11 @@ impl PostgreSQLTranslator {
             .alias
             .as_ref()
             .map(|a| ast::As::Elided(ast::Name::from_string(a.aliasname.clone())));
-        Ok(ast::SelectTable::Select(select, alias))
+        Ok(ast::SelectTable::Select {
+            select,
+            alias,
+            lateral: range_sub.lateral,
+        })
     }
 
     fn translate_range_function(
@@ -1919,7 +1992,11 @@ impl PostgreSQLTranslator {
                 order_by: vec![],
                 limit: None,
             };
-            return Ok(ast::SelectTable::Select(select, alias));
+            return Ok(ast::SelectTable::Select {
+                select,
+                alias,
+                lateral: false,
+            });
         }
 
         Ok(ast::SelectTable::TableCall(
@@ -1980,13 +2057,7 @@ impl PostgreSQLTranslator {
                     self.translate_range_var(range_var)?
                 }
                 Some(pg_query::protobuf::node::Node::JoinExpr(nested_join)) => {
-                    // Nested join on the right side: wrap as a subquery-like structure
-                    // For now, flatten it too (handles chained joins)
-                    let mut right_joins = Vec::new();
-                    let right_primary = self.flatten_join_tree(nested_join, &mut right_joins)?;
-                    // Add the right-side joins first, then the right primary becomes a joined table
-                    joins.extend(right_joins);
-                    right_primary
+                    ast::SelectTable::Sub(self.translate_join_expr(nested_join)?, None)
                 }
                 Some(pg_query::protobuf::node::Node::RangeSubselect(range_sub)) => {
                     self.translate_range_subselect(range_sub)?
@@ -2096,8 +2167,12 @@ impl PostgreSQLTranslator {
                         } else {
                             let expr = self.translate_expr(val)?;
                             let alias: Option<ast::As> = if res_target.name.is_empty() {
-                                derived_column_name(val)
-                                    .map(|name| ast::As::Elided(ast::Name::from_string(name)))
+                                Some(match derived_column_name(val) {
+                                    Some(name) => ast::As::Elided(ast::Name::from_string(name)),
+                                    None => ast::As::ImplicitColumnName(ast::Name::from_string(
+                                        "?column?",
+                                    )),
+                                })
                             } else {
                                 Some(ast::As::Elided(ast::Name::from_string(&res_target.name)))
                             };
@@ -2138,9 +2213,10 @@ impl PostgreSQLTranslator {
                                 }
                                 match parts.len() {
                                     3 => {
-                                        // schema.table.column
+                                        // schema.table.column. The table name is not mapped:
+                                        // FROM aliases a renamed table with its original name.
                                         Ok(ast::Expr::DoublyQualified(
-                                            ast::Name::from_string(parts[0].clone()),
+                                            ast::Name::from_string(map_schema_name(&parts[0])),
                                             ast::Name::from_string(parts[1].clone()),
                                             ast::Name::from_string(parts[2].clone()),
                                         ))
@@ -2214,7 +2290,7 @@ impl PostgreSQLTranslator {
                     .arg
                     .as_ref()
                     .ok_or_else(|| ParseError::ParseError("NullTest missing arg".to_string()))?;
-                let expr = self.translate_expr(arg)?;
+                let expr = self.translate_operand(arg)?;
                 match null_test.nulltesttype() {
                     NullTestType::IsNotNull => Ok(ast::Expr::NotNull(Box::new(expr))),
                     _ => Ok(ast::Expr::IsNull(Box::new(expr))),
@@ -2233,7 +2309,7 @@ impl PostgreSQLTranslator {
                     .arg
                     .as_ref()
                     .ok_or_else(|| ParseError::ParseError("BooleanTest missing arg".into()))?;
-                let expr = self.translate_expr(arg)?;
+                let expr = self.translate_operand(arg)?;
                 // Map IS TRUE / IS FALSE / IS NOT TRUE / IS NOT FALSE / IS UNKNOWN / IS NOT UNKNOWN
                 match BoolTestType::try_from(bt.booltesttype) {
                     Ok(BoolTestType::IsTrue) => Ok(ast::Expr::Binary(
@@ -2554,9 +2630,9 @@ impl PostgreSQLTranslator {
                     .as_ref()
                     .ok_or_else(|| ParseError::ParseError("DISTINCT FROM: missing rhs".into()))?;
                 Ok(ast::Expr::Binary(
-                    Box::new(self.translate_expr(lhs)?),
+                    Box::new(self.translate_operand(lhs)?),
                     ast::Operator::IsNot,
-                    Box::new(self.translate_expr(rhs)?),
+                    Box::new(self.translate_operand(rhs)?),
                 ))
             }
             AExprKind::AexprNotDistinct => {
@@ -2568,9 +2644,9 @@ impl PostgreSQLTranslator {
                     ParseError::ParseError("NOT DISTINCT FROM: missing rhs".into())
                 })?;
                 Ok(ast::Expr::Binary(
-                    Box::new(self.translate_expr(lhs)?),
+                    Box::new(self.translate_operand(lhs)?),
                     ast::Operator::Is,
-                    Box::new(self.translate_expr(rhs)?),
+                    Box::new(self.translate_operand(rhs)?),
                 ))
             }
             AExprKind::AexprNullif => {
@@ -2627,7 +2703,7 @@ impl PostgreSQLTranslator {
                     _ => rhs_node,
                 };
 
-                let rhs_expr = self.translate_expr(pattern_node)?;
+                let rhs_expr = self.translate_operand(pattern_node)?;
                 let regex_rhs = match rhs_expr {
                     ast::Expr::Literal(ast::Literal::String(ref pat)) => {
                         // String literals in our AST include surrounding quotes
@@ -2643,7 +2719,7 @@ impl PostgreSQLTranslator {
                 };
 
                 Ok(ast::Expr::Like {
-                    lhs: Box::new(self.translate_expr(lhs)?),
+                    lhs: Box::new(self.translate_operand(lhs)?),
                     not,
                     op: ast::LikeOperator::Regexp,
                     rhs: Box::new(regex_rhs),
@@ -2679,7 +2755,7 @@ impl PostgreSQLTranslator {
                 .rexpr
                 .as_ref()
                 .ok_or_else(|| ParseError::ParseError("Missing right expression".into()))?;
-            let operand = self.translate_expr(rhs)?;
+            let operand = self.translate_operand(rhs)?;
             return match op_name {
                 "+" => Ok(ast::Expr::Unary(
                     ast::UnaryOperator::Positive,
@@ -2700,10 +2776,10 @@ impl PostgreSQLTranslator {
         }
 
         // Translate left and right expressions
-        let left = Box::new(self.translate_expr(a_expr.lexpr.as_ref().unwrap())?);
+        let left = Box::new(self.translate_operand(a_expr.lexpr.as_ref().unwrap())?);
 
         let right = if let Some(rexpr) = &a_expr.rexpr {
-            Box::new(self.translate_expr(rexpr)?)
+            Box::new(self.translate_operand(rexpr)?)
         } else {
             return Err(ParseError::ParseError(
                 "Missing right expression".to_string(),
@@ -2811,7 +2887,7 @@ impl PostgreSQLTranslator {
     ) -> Result<ast::Expr, ParseError> {
         // Get the left expression (the column/expression being tested)
         let lhs = if let Some(lexpr) = &a_expr.lexpr {
-            Box::new(self.translate_expr(lexpr)?)
+            Box::new(self.translate_operand(lexpr)?)
         } else {
             return Err(ParseError::ParseError(
                 "Missing left expression for IN operator".to_string(),
@@ -2891,7 +2967,7 @@ impl PostgreSQLTranslator {
             .rexpr
             .as_ref()
             .ok_or_else(|| ParseError::ParseError(format!("{kw}: missing rhs")))?;
-        let lhs = self.translate_expr(lhs_node)?;
+        let lhs = self.translate_operand(lhs_node)?;
 
         if let Some(pg_query::protobuf::node::Node::AArrayExpr(arr)) = &rhs_node.node {
             let rhs = arr
@@ -2958,7 +3034,7 @@ impl PostgreSQLTranslator {
 
         // Get left and right expressions
         let lhs = if let Some(lexpr) = &a_expr.lexpr {
-            Box::new(self.translate_expr(lexpr)?)
+            Box::new(self.translate_operand(lexpr)?)
         } else {
             return Err(ParseError::ParseError(
                 "Missing left expression for LIKE operator".to_string(),
@@ -2966,7 +3042,7 @@ impl PostgreSQLTranslator {
         };
 
         let rhs = if let Some(rexpr) = &a_expr.rexpr {
-            Box::new(self.translate_expr(rexpr)?)
+            Box::new(self.translate_operand(rexpr)?)
         } else {
             return Err(ParseError::ParseError(
                 "Missing right expression for LIKE operator".to_string(),
@@ -3066,7 +3142,7 @@ impl PostgreSQLTranslator {
             .lexpr
             .as_ref()
             .ok_or_else(|| ParseError::ParseError("BETWEEN: missing test expression".into()))?;
-        let lhs = self.translate_expr(lhs)?;
+        let lhs = self.translate_operand(lhs)?;
 
         let rexpr = a_expr
             .rexpr
@@ -3085,8 +3161,8 @@ impl PostgreSQLTranslator {
                 "BETWEEN: expected exactly 2 range bounds".into(),
             ));
         }
-        let start = self.translate_expr(&items[0])?;
-        let end = self.translate_expr(&items[1])?;
+        let start = self.translate_operand(&items[0])?;
+        let end = self.translate_operand(&items[1])?;
 
         Ok(ast::Expr::Between {
             lhs: Box::new(lhs),
@@ -3123,7 +3199,7 @@ impl PostgreSQLTranslator {
 
         // Translate OVER clause (window function)
         let over_clause = if let Some(ref window_def) = func_call.over {
-            Some(self.translate_window_def(window_def)?)
+            Some(Box::new(self.translate_window_def(window_def)?))
         } else {
             None
         };
@@ -3499,17 +3575,18 @@ impl PostgreSQLTranslator {
                 ));
             }
         };
-        let select = self.translate_select(select_stmt)?;
+        let select = Box::new(self.translate_select(select_stmt)?);
 
         match sub_link.sub_link_type() {
             SubLinkType::ExistsSublink => Ok(ast::Expr::Exists(select)),
             SubLinkType::ExprSublink => Ok(ast::Expr::Subquery(select)),
+            SubLinkType::ArraySublink => Ok(Self::translate_array_subquery(*select)),
             SubLinkType::AnySublink => {
                 // ANY/IN subquery: testexpr IN (SELECT ...)
                 let test_node = sub_link.testexpr.as_ref().ok_or_else(|| {
                     ParseError::ParseError("ANY SubLink missing testexpr".to_string())
                 })?;
-                let lhs = self.translate_expr(test_node)?;
+                let lhs = self.translate_operand(test_node)?;
                 Ok(ast::Expr::InSelect {
                     lhs: Box::new(lhs),
                     not: false,
@@ -3520,6 +3597,82 @@ impl PostgreSQLTranslator {
                 "Unsupported SubLink type: {other:?}",
             ))),
         }
+    }
+
+    fn translate_array_subquery(select: ast::Select) -> ast::Expr {
+        // PostgreSQL: ARRAY(SELECT v FROM items ORDER BY v LIMIT 2)
+        // Becomes this scalar subquery in the Turso AST:
+        // (
+        //     WITH _turso_array_rows(_turso_array_value) AS MATERIALIZED (
+        //         SELECT v FROM items ORDER BY v LIMIT 2
+        //     )
+        //     SELECT coalesce(array_agg(_turso_array_value), array())
+        //     FROM _turso_array_rows
+        // )
+        // array() constructs an empty array when the query returns no rows.
+        let query = select.to_string().to_ascii_lowercase();
+        let mut table_name = "_turso_array_rows".to_owned();
+        while query.contains(&table_name) {
+            table_name.push('_');
+        }
+        let table = ast::Name::from_string(table_name);
+        let column = ast::Name::from_string("_turso_array_value");
+        let call = |name: &str, args: Vec<Box<ast::Expr>>| ast::Expr::FunctionCall {
+            name: ast::Name::from_string(name),
+            distinctness: None,
+            args,
+            order_by: vec![],
+            within_group: vec![],
+            filter_over: ast::FunctionTail {
+                filter_clause: None,
+                over_clause: None,
+            },
+        };
+
+        ast::Expr::Subquery(Box::new(ast::Select {
+            with: Some(ast::With {
+                recursive: false,
+                ctes: vec![ast::CommonTableExpr {
+                    tbl_name: table.clone(),
+                    columns: vec![ast::IndexedColumn {
+                        col_name: column.clone(),
+                        collation_name: None,
+                        order: None,
+                    }],
+                    materialized: ast::Materialized::Yes,
+                    select,
+                }],
+            }),
+            body: ast::SelectBody {
+                select: ast::OneSelect::Select {
+                    distinctness: None,
+                    columns: vec![ast::ResultColumn::Expr(
+                        Box::new(call(
+                            "coalesce",
+                            vec![
+                                Box::new(call("array_agg", vec![Box::new(ast::Expr::Id(column))])),
+                                Box::new(call("array", vec![])),
+                            ],
+                        )),
+                        None,
+                    )],
+                    from: Some(ast::FromClause {
+                        select: Box::new(ast::SelectTable::Table(
+                            ast::QualifiedName::single(table),
+                            None,
+                            None,
+                        )),
+                        joins: vec![],
+                    }),
+                    where_clause: None,
+                    group_by: None,
+                    window_clause: vec![],
+                },
+                compounds: vec![],
+            },
+            order_by: vec![],
+            limit: None,
+        }))
     }
 
     fn translate_with_clause(
@@ -3821,7 +3974,7 @@ impl PostgreSQLTranslator {
                         "NOT expression must have exactly 1 argument".to_string(),
                     ));
                 }
-                let operand = Box::new(self.translate_expr(&bool_expr.args[0])?);
+                let operand = Box::new(self.translate_operand(&bool_expr.args[0])?);
                 Ok(ast::Expr::Unary(ast::UnaryOperator::Not, operand))
             }
             BoolExprType::AndExpr => {
@@ -3831,9 +3984,9 @@ impl PostgreSQLTranslator {
                     ));
                 }
                 // Combine all arguments into a binary tree with AND
-                let mut result = self.translate_expr(&bool_expr.args[0])?;
+                let mut result = self.translate_operand(&bool_expr.args[0])?;
                 for arg in &bool_expr.args[1..] {
-                    let right = self.translate_expr(arg)?;
+                    let right = self.translate_operand(arg)?;
                     result =
                         ast::Expr::Binary(Box::new(result), ast::Operator::And, Box::new(right));
                 }
@@ -3846,9 +3999,9 @@ impl PostgreSQLTranslator {
                     ));
                 }
                 // Combine all arguments into a binary tree with OR
-                let mut result = self.translate_expr(&bool_expr.args[0])?;
+                let mut result = self.translate_operand(&bool_expr.args[0])?;
                 for arg in &bool_expr.args[1..] {
-                    let right = self.translate_expr(arg)?;
+                    let right = self.translate_operand(arg)?;
                     result =
                         ast::Expr::Binary(Box::new(result), ast::Operator::Or, Box::new(right));
                 }
@@ -3859,6 +4012,26 @@ impl PostgreSQLTranslator {
                 bool_expr.boolop()
             ))),
         }
+    }
+
+    /// PostgreSQL's parse tree has no nodes for parentheses, so an operand that
+    /// is itself an operator expression gets wrapped here. Without this the
+    /// grouping is lost when the expression is written back as SQL, for example
+    /// `(1+2)*3` in a DEFAULT stored in the table SQL would become `1 + 2 * 3`.
+    fn translate_operand(&self, node: &pg_query::protobuf::Node) -> Result<ast::Expr, ParseError> {
+        let expr = self.translate_expr(node)?;
+        Ok(match expr {
+            ast::Expr::Binary(..)
+            | ast::Expr::Unary(..)
+            | ast::Expr::Between { .. }
+            | ast::Expr::Like { .. }
+            | ast::Expr::IsNull(_)
+            | ast::Expr::NotNull(_)
+            | ast::Expr::InList { .. }
+            | ast::Expr::InSelect { .. }
+            | ast::Expr::InTable { .. } => ast::Expr::Parenthesized(vec![Box::new(expr)]),
+            _ => expr,
+        })
     }
 
     fn translate_create_sequence(
@@ -4012,24 +4185,114 @@ impl PostgreSQLTranslator {
     }
 }
 
+fn join_keeps_unmatched_right_rows(join: &ast::JoinedSelectTable) -> bool {
+    matches!(
+        join.operator,
+        ast::JoinOperator::TypedJoin(Some(join_type)) if join_type.contains(ast::JoinType::RIGHT)
+    )
+}
+
+/// Maps a PostgreSQL schema name to the Turso schema that holds its tables.
+fn map_schema_name(schema: &str) -> &str {
+    match schema.to_ascii_lowercase().as_str() {
+        "pg_catalog" | "public" | "information_schema" => "main",
+        _ => schema,
+    }
+}
+
+pub fn is_catalog_table_name(name: &str) -> bool {
+    matches!(
+        name.to_ascii_lowercase().as_str(),
+        "pg_class"
+            | "pg_namespace"
+            | "pg_attribute"
+            | "pg_roles"
+            | "pg_proc"
+            | "pg_database"
+            | "pg_am"
+            | "pg_type"
+            | "pg_collation"
+            | "pg_attrdef"
+            | "pg_description"
+            | "pg_publication"
+            | "pg_publication_namespace"
+            | "pg_publication_rel"
+            | "pg_sequences"
+            | "pg_constraint"
+            | "pg_index"
+            | "pg_inherits"
+            | "pg_rewrite"
+            | "pg_foreign_table"
+            | "pg_partitioned_table"
+            | "pg_trigger"
+            | "pg_policy"
+            | "pg_input_error_info"
+            | "pg_get_tabledef"
+            | "pg_settings"
+            | "pg_extension"
+            | "pg_depend"
+            | "pg_tablespace"
+            | "pg_init_privs"
+            | "pg_cast"
+            | "pg_transform"
+            | "pg_language"
+            | "pg_operator"
+            | "pg_opclass"
+            | "pg_opfamily"
+            | "pg_ts_parser"
+            | "pg_ts_template"
+            | "pg_ts_dict"
+            | "pg_ts_config"
+            | "pg_foreign_data_wrapper"
+            | "pg_foreign_server"
+            | "pg_default_acl"
+            | "pg_conversion"
+            | "pg_range"
+            | "pg_event_trigger"
+            | "pg_subscription"
+            | "pg_largeobject_metadata"
+            | "pg_amop"
+            | "pg_amproc"
+            | "pg_tables"
+            | "pg_indexes"
+    )
+}
+
 /// PostgreSQL derives a name for result columns without an explicit alias
 /// (FigureColname in the server): function calls are named after the function
 /// and SQL value functions after their keyword. Clients read columns by these
 /// names, e.g. knex reads rows[0].version from `select version()`.
+/// Casts and CASE pass through the name of the expression they wrap, and only
+/// when that expression has no name are they named after the outermost target
+/// type or `case`, so `1::int::text` is named `text`.
 fn derived_column_name(node: &pg_query::protobuf::Node) -> Option<String> {
+    expression_name(node).or_else(|| cast_or_case_name(node))
+}
+
+fn expression_name(node: &pg_query::protobuf::Node) -> Option<String> {
     use pg_query::protobuf::node::Node;
-    match &node.node {
-        Some(Node::FuncCall(func_call)) => func_call
-            .funcname
-            .iter()
-            .filter_map(|n| match &n.node {
-                Some(Node::String(s)) => Some(s.sval.clone()),
-                _ => None,
-            })
-            .next_back(),
+    let name = match &node.node {
+        Some(Node::FuncCall(func_call)) => return last_string(&func_call.funcname),
+        Some(Node::ColumnRef(col_ref)) => return last_string(&col_ref.fields),
+        Some(Node::TypeCast(type_cast)) => return expression_name(type_cast.arg.as_deref()?),
+        Some(Node::CaseExpr(case_expr)) => return expression_name(case_expr.defresult.as_deref()?),
+        Some(Node::CoalesceExpr(_)) => "coalesce",
+        Some(Node::MinMaxExpr(min_max)) => {
+            use pg_query::protobuf::MinMaxOp;
+            match MinMaxOp::try_from(min_max.op) {
+                Ok(MinMaxOp::IsGreatest) => "greatest",
+                Ok(MinMaxOp::IsLeast) => "least",
+                _ => return None,
+            }
+        }
+        Some(Node::AExpr(a_expr))
+            if a_expr.kind == pg_query::protobuf::AExprKind::AexprNullif as i32 =>
+        {
+            "nullif"
+        }
         Some(Node::SqlvalueFunction(svf)) => {
             use pg_query::protobuf::SqlValueFunctionOp as Op;
-            let name = match Op::try_from(svf.op) {
+            match Op::try_from(svf.op) {
                 Ok(Op::SvfopCurrentDate) => "current_date",
                 Ok(Op::SvfopCurrentTime | Op::SvfopCurrentTimeN) => "current_time",
                 Ok(Op::SvfopCurrentTimestamp | Op::SvfopCurrentTimestampN) => "current_timestamp",
@@ -4042,11 +4305,30 @@ fn derived_column_name(node: &pg_query::protobuf::Node) -> Option<String> {
                 Ok(Op::SvfopCurrentCatalog) => "current_catalog",
                 Ok(Op::SvfopCurrentSchema) => "current_schema",
                 _ => return None,
-            };
-            Some(name.to_string())
+            }
         }
+        _ => return None,
+    };
+    Some(name.to_string())
+}
+
+fn cast_or_case_name(node: &pg_query::protobuf::Node) -> Option<String> {
+    use pg_query::protobuf::node::Node;
+    match &node.node {
+        Some(Node::TypeCast(type_cast)) => last_string(&type_cast.type_name.as_ref()?.names),
+        Some(Node::CaseExpr(_)) => Some("case".to_string()),
         _ => None,
     }
+}
+
+fn last_string(names: &[pg_query::protobuf::Node]) -> Option<String> {
+    names
+        .iter()
+        .filter_map(|n| match &n.node {
+            Some(pg_query::protobuf::node::Node::String(s)) => Some(s.sval.clone()),
+            _ => None,
+        })
+        .next_back()
 }
 
 /// Extract a string value from a DefElem's arg.
@@ -4302,7 +4584,8 @@ fn translate_create_enum(
 }
 
 /// Convert a pg_query TypeName to a Turso AST Type for use in CAST expressions.
-/// Maps PG types to their base SQLite storage types.
+/// Maps PG types to their base SQLite storage types. Other names are kept as
+/// written so that enums and domains resolve to their custom type.
 fn pg_type_name_to_ast_type(type_name: &pg_query::protobuf::TypeName) -> Option<ast::Type> {
     use pg_query::protobuf::node::Node;
 
@@ -4328,11 +4611,16 @@ fn pg_type_name_to_ast_type(type_name: &pg_query::protobuf::TypeName) -> Option<
         // For CAST expressions, map all text-like PG types to TEXT and
         // boolean to INTEGER for SQLite VDBE compatibility
         "BOOLEAN" | "BOOL" => "INTEGER",
-        "TEXT" | "VARCHAR" | "CHAR" | "BPCHAR" | "NAME" | "UUID" | "DATE" | "TIME" | "TIMETZ"
-        | "TIMESTAMP" | "TIMESTAMPTZ" | "INTERVAL" | "INET" | "JSON" | "JSONB" | "XML" | "CIDR"
-        | "MACADDR" | "BIT" | "VARBIT" | "TSVECTOR" | "TSQUERY" => "TEXT",
+        "DATE" => "date",
+        "TIME" | "TIMETZ" => "time",
+        "TIMESTAMP" => "timestamp",
+        "TIMESTAMPTZ" => "timestamptz",
+        "TEXT" | "VARCHAR" | "CHAR" | "BPCHAR" | "NAME" | "UUID" | "INTERVAL" | "INET" | "JSON"
+        | "JSONB" | "XML" | "CIDR" | "MACADDR" | "BIT" | "VARBIT" | "TSVECTOR" | "TSQUERY" => {
+            "TEXT"
+        }
         "BYTEA" | "BLOB" => "BLOB",
-        _ => return None,
+        _ => &pg_type,
     };
 
     Some(ast::Type {
@@ -4497,6 +4785,7 @@ fn pg_fk_action_to_string(action: &str) -> Option<String> {
 pub struct PgSetStmt {
     pub name: String,
     pub values: Vec<PgSetValue>,
+    pub is_local: bool,
 }
 
 #[derive(Clone)]
@@ -4595,7 +4884,19 @@ pub fn try_extract_set(parse_result: &ParseResult) -> Option<PgSetStmt> {
     Some(PgSetStmt {
         name: set_stmt.name.clone(),
         values,
+        is_local: set_stmt.is_local,
     })
+}
+
+pub fn is_set_transaction(parse_result: &ParseResult) -> bool {
+    use pg_query::{protobuf::VariableSetKind, NodeRef};
+
+    matches!(
+        parse_result.protobuf.nodes().first().map(|node| &node.0),
+        Some(NodeRef::VariableSetStmt(stmt))
+            if stmt.kind == VariableSetKind::VarSetMulti as i32
+                && stmt.name.eq_ignore_ascii_case("transaction")
+    )
 }
 
 /// Try to extract a SHOW statement from a PG parse result.
@@ -5684,18 +5985,23 @@ mod tests {
                     if let ast::Expr::Binary(left, op, right) = &**where_expr {
                         assert!(matches!(op, ast::Operator::And), "Top level should be AND");
 
+                        let (ast::Expr::Parenthesized(left), ast::Expr::Parenthesized(right)) =
+                            (&**left, &**right)
+                        else {
+                            panic!("Both sides of AND should be parenthesized");
+                        };
+
                         // Left side should be IN expression
                         assert!(
-                            matches!(**left, ast::Expr::InList { .. }),
+                            matches!(&left[..], [inner] if matches!(**inner, ast::Expr::InList { .. })),
                             "Left side should be IN list"
                         );
 
                         // Right side should be NOT LIKE expression
-                        if let ast::Expr::Like { not, .. } = &**right {
-                            assert!(*not, "Right side should be NOT LIKE");
-                        } else {
-                            panic!("Right side should be LIKE expression");
-                        }
+                        assert!(
+                            matches!(&right[..], [inner] if matches!(**inner, ast::Expr::Like { not: true, .. })),
+                            "Right side should be NOT LIKE"
+                        );
                     } else {
                         panic!("WHERE clause should be Binary expression");
                     }
@@ -6147,6 +6453,70 @@ mod tests {
     }
 
     #[test]
+    fn test_join_after_a_comma_keeps_its_order() {
+        let translator = PostgreSQLTranslator::new();
+        for (sql, expected) in [
+            (
+                "SELECT * FROM a, b JOIN c ON b.y < c.z",
+                "SELECT * FROM a, b INNER JOIN c ON b.y < c.z",
+            ),
+            (
+                "SELECT * FROM a, b CROSS JOIN c",
+                "SELECT * FROM a, b INNER JOIN c",
+            ),
+            (
+                "SELECT * FROM a, b CROSS JOIN LATERAL (SELECT a.x, b.y) s",
+                "SELECT * FROM a, b INNER JOIN LATERAL (SELECT a.x, b.y) s",
+            ),
+        ] {
+            let parsed = crate::parse(sql).unwrap();
+            let translated = translator.translate(&parsed).unwrap();
+            assert_eq!(translated.to_string(), expected);
+        }
+    }
+
+    #[test]
+    fn test_lateral_subquery() {
+        let translator = PostgreSQLTranslator::new();
+        for (sql, expected) in [
+            (
+                "SELECT * FROM t1, LATERAL (SELECT t1.a) s",
+                "SELECT * FROM t1, LATERAL (SELECT t1.a) s",
+            ),
+            (
+                "SELECT * FROM t1 LEFT JOIN LATERAL (SELECT t1.a) s ON true",
+                "SELECT * FROM t1 LEFT OUTER JOIN LATERAL (SELECT t1.a) s ON 1",
+            ),
+            (
+                "SELECT * FROM t1, (SELECT 1) s",
+                "SELECT * FROM t1, (SELECT 1) s",
+            ),
+        ] {
+            let parsed = crate::parse(sql).unwrap();
+            let translated = translator.translate(&parsed).unwrap();
+            assert_eq!(translated.to_string(), expected);
+        }
+    }
+
+    #[test]
+    fn test_right_or_full_join_after_a_comma_is_rejected() {
+        let translator = PostgreSQLTranslator::new();
+        for sql in [
+            "SELECT * FROM a, b RIGHT JOIN c ON true",
+            "SELECT * FROM a, b FULL JOIN c ON true",
+            "SELECT * FROM a, b JOIN c ON true RIGHT JOIN d ON true",
+        ] {
+            let parsed = crate::parse(sql).unwrap();
+            let err = translator.translate(&parsed).unwrap_err();
+            assert_eq!(
+                err.to_string(),
+                "RIGHT and FULL joins after a comma in FROM are not supported",
+                "{sql}"
+            );
+        }
+    }
+
+    #[test]
     fn test_join_subquery() {
         let translator = PostgreSQLTranslator::new();
         let sql = r#"SELECT c.name, sq.cnt FROM cities c LEFT JOIN (SELECT city_id, count(*) as cnt FROM users GROUP BY city_id) sq ON c.id = sq.city_id"#;
@@ -6160,7 +6530,10 @@ mod tests {
                 assert_eq!(from_clause.joins.len(), 1, "Should have one join");
                 let join = &from_clause.joins[0];
                 assert!(
-                    matches!(join.table.as_ref(), ast::SelectTable::Select(_, Some(_))),
+                    matches!(
+                        join.table.as_ref(),
+                        ast::SelectTable::Select { alias: Some(_), .. }
+                    ),
                     "Join RHS should be a subquery with alias"
                 );
             } else {
@@ -7166,7 +7539,7 @@ mod tests {
                 if let ast::ResultColumn::Expr(expr, _) = &columns[0] {
                     if let ast::Expr::FunctionCall { filter_over, .. } = &**expr {
                         assert!(
-                            matches!(&filter_over.over_clause, Some(ast::Over::Name(n)) if n.as_str() == "w"),
+                            matches!(filter_over.over_clause.as_deref(), Some(ast::Over::Name(n)) if n.as_str() == "w"),
                             "Expected Over::Name(\"w\"), got: {:?}",
                             filter_over.over_clause
                         );
@@ -7270,7 +7643,7 @@ mod tests {
         let ast::Expr::FunctionCall { filter_over, .. } = expr.as_ref() else {
             panic!("expected function call expression, got {expr:?}");
         };
-        let Some(ast::Over::Window(window)) = &filter_over.over_clause else {
+        let Some(ast::Over::Window(window)) = filter_over.over_clause.as_deref() else {
             panic!(
                 "expected inline OVER window, got {:?}",
                 filter_over.over_clause

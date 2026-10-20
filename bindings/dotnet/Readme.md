@@ -259,7 +259,7 @@ Supported common connection string keywords include:
 | `Foreign Keys` | Parsed and preserved for compatibility. |
 | `Recursive Triggers` | Parsed and preserved for compatibility. |
 | `Default Timeout` | Used as the default command timeout. Aliases include `Command Timeout`. |
-| `Pooling` | Parsed and preserved for compatibility. |
+| `Pooling` | Defaults to `True`. Local files stay open after the last connection closes so the next `Open()` skips reloading the schema and WAL; each connection still gets fresh connection state. Call `SqliteConnection.ClearPool` or `ClearAllPools` before deleting or replacing a pooled file. `:memory:` and shared in-memory databases are never pooled. |
 | `Vfs` | Parsed and preserved for compatibility. |
 | `Encryption Cipher` | Turso local encryption cipher. |
 | `Encryption Key` | Hex-encoded encryption key used with `Encryption Cipher`. |

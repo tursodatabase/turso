@@ -1,0 +1,13 @@
+[package]
+name = "query-result-oracle"
+version.workspace = true
+authors.workspace = true
+edition = "2024"
+license.workspace = true
+repository.workspace = true
+
+[lib]
+path = "lib.rs"
+
+[lints]
+workspace = true

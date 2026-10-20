@@ -56,7 +56,8 @@ impl TursoPgServer {
         let listener = TcpListener::bind(&self.address).await?;
         println!(
             "PostgreSQL server listening on {} (database: {})",
-            self.address, self.db_file
+            listener.local_addr()?,
+            self.db_file
         );
 
         let factory = Arc::new(TursoPgFactory {
@@ -286,6 +287,9 @@ impl ExtendedQueryHandler for TursoPgHandler {
 
 /// Build FieldInfo metadata from a prepared statement's column information.
 fn build_field_info(stmt: &turso_core::Statement, format: &Format) -> Vec<FieldInfo> {
+    if is_pg_non_query(stmt.get_sql()) {
+        return vec![];
+    }
     (0..stmt.num_columns())
         .map(|i| {
             let name = stmt.get_column_name(i).into_owned();
@@ -637,6 +641,8 @@ fn sqlite_type_to_pg_type(type_str: &str) -> Type {
 fn is_pg_non_query(sql: &str) -> bool {
     let upper = sql.trim().to_uppercase();
     upper.starts_with("COPY")
+        || upper.starts_with("SET")
+        || upper.starts_with("LOCK")
         || upper.starts_with("CREATE SCHEMA")
         || upper.starts_with("DROP SCHEMA")
         || upper.starts_with("REFRESH MATERIALIZED VIEW")
@@ -690,6 +696,8 @@ fn command_tag(query: &str, affected_rows: usize) -> Tag {
         Tag::new("RELEASE")
     } else if upper.starts_with("SET") {
         Tag::new("SET")
+    } else if upper.starts_with("LOCK") {
+        Tag::new("LOCK TABLE")
     } else if upper.starts_with("COPY") {
         Tag::new("COPY").with_rows(affected_rows)
     } else if upper.starts_with("COMMENT") {
@@ -762,6 +770,114 @@ fn error_info(message: &str) -> ErrorInfo {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_pg_is_in_recovery_returns_true_text_on_wire() {
+        let (_io, db) = turso_pg::open_database(
+            ":memory:",
+            None,
+            turso_pg::OpenFlags::default(),
+            turso_pg::DatabaseOpts::new(),
+        )
+        .unwrap();
+        let conn = Connection::connect(&db).unwrap();
+        for sql in [
+            "SELECT pg_catalog.pg_is_in_recovery()",
+            "SELECT pg_is_in_recovery() AS recovery",
+            "SELECT (PG_IS_IN_RECOVERY())",
+        ] {
+            for format in [Format::UnifiedText, Format::UnifiedBinary] {
+                let mut stmt = conn.prepare(sql).unwrap();
+                let fields = Arc::new(build_field_info(&stmt, &format));
+                assert_eq!(*fields[0].datatype(), Type::TEXT, "{sql}");
+                let rows = stmt.run_collect_rows().unwrap();
+                assert_eq!(rows.len(), 1);
+                let mut encoder = DataRowEncoder::new(fields.clone());
+                encode_value(&mut encoder, &rows[0][0], fields[0].datatype()).unwrap();
+                let row = encoder.finish().unwrap();
+                assert_eq!(row.field_count, 1);
+                assert_eq!(&row.data[..], b"\0\0\0\x01t");
+            }
+        }
+        let stmt = conn.prepare("SELECT 7 AS pg_is_in_recovery").unwrap();
+        let fields = build_field_info(&stmt, &Format::UnifiedText);
+        assert_eq!(*fields[0].datatype(), Type::INT4);
+    }
+
+    #[test]
+    fn test_integer_case_and_function_results_are_int4_on_wire() {
+        let (_io, db) = turso_pg::open_database(
+            ":memory:",
+            None,
+            turso_pg::OpenFlags::default(),
+            turso_pg::DatabaseOpts::new(),
+        )
+        .unwrap();
+        let conn = Connection::connect(&db).unwrap();
+        conn.execute("CREATE TABLE t(id int PRIMARY KEY, x int)")
+            .unwrap();
+        conn.execute("INSERT INTO t VALUES (1, 1)").unwrap();
+        for sql in [
+            "SELECT x * 2 FROM t",
+            "SELECT coalesce(x, 2) * coalesce(x, 3) FROM t",
+            "SELECT abs(x) * 2 FROM t",
+            "SELECT CASE WHEN x = 1 THEN x ELSE 0 END - 1 FROM t",
+            "SELECT coalesce(x, 2) FROM t",
+        ] {
+            let stmt = conn.prepare(sql).unwrap();
+            let fields = build_field_info(&stmt, &Format::UnifiedText);
+            assert_eq!(*fields[0].datatype(), Type::INT4, "{sql}");
+        }
+    }
+
+    #[test]
+    fn test_set_transaction_is_non_query() {
+        assert!(is_pg_non_query(
+            "SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY"
+        ));
+        assert!(is_pg_non_query("  set\ntransaction read only"));
+        assert!(!is_pg_non_query(
+            "SELECT set_config('search_path', '', false)"
+        ));
+    }
+
+    #[test]
+    fn test_access_share_lock_is_non_query() {
+        assert!(is_pg_non_query(
+            "LOCK TABLE public.items IN ACCESS SHARE MODE"
+        ));
+        assert!(is_pg_non_query("  lock\ntable items in access share mode"));
+        assert!(!is_pg_non_query("SELECT 'LOCK TABLE items'"));
+    }
+
+    #[test]
+    fn test_access_share_lock_command_tag() {
+        assert_eq!(
+            command_tag("LOCK TABLE items IN ACCESS SHARE MODE", 0),
+            Tag::new("LOCK TABLE")
+        );
+    }
+
+    #[test]
+    fn test_access_share_lock_has_no_result_fields() {
+        let (_io, db) = turso_pg::open_database(
+            ":memory:",
+            None,
+            turso_pg::OpenFlags::default(),
+            turso_pg::DatabaseOpts::new(),
+        )
+        .unwrap();
+        let conn = turso_pg::PgConnection::connect(&db).unwrap();
+        conn.execute("CREATE TABLE items (v INTEGER)").unwrap();
+        let stmt = conn
+            .prepare("LOCK TABLE items IN ACCESS SHARE MODE")
+            .unwrap();
+        for format in [Format::UnifiedText, Format::UnifiedBinary] {
+            assert!(build_field_info(&stmt, &format).is_empty());
+        }
+        let query = conn.prepare("SELECT 'LOCK TABLE items'").unwrap();
+        assert_eq!(build_field_info(&query, &Format::UnifiedText).len(), 1);
+    }
 
     #[test]
     fn test_pg_bytes_to_value_integer() {

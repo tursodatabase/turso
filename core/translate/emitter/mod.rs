@@ -8,11 +8,11 @@ use super::{
         update::emit_program_for_update,
     },
     expr::{
-        bind_and_rewrite_expr, emit_table_column, translate_expr, translate_expr_no_constant_opt,
-        walk_expr, BindingBehavior, NoConstantOptReason, WalkControl,
+        bind_and_rewrite_expr, emit_table_column, translate_expr_no_constant_opt, walk_expr,
+        BindingBehavior, NoConstantOptReason, WalkControl,
     },
     group_by::GroupByMetadata,
-    main_loop::{LeftJoinMetadata, LoopLabels, SemiAntiJoinMetadata},
+    main_loop::{LeftJoinMetadata, LoopLabels, RightJoinMetadata, SemiAntiJoinMetadata},
     order_by::SortMetadata,
     plan::{
         BitSet, HashJoinType, JoinedTable, NonFromClauseSubquery, Plan, ResultSetColumn,
@@ -25,14 +25,14 @@ use super::{
 use crate::alloc::{TryClone, TursoIteratorExt};
 use crate::instrument;
 use crate::schema::{
-    BTreeTable, CheckConstraint, Column, ColumnLayout, GeneratedType, IndexColumn, Schema, Table,
-    EXPR_INDEX_SENTINEL,
+    BTreeTable, CheckConstraint, Column, ColumnLayout, GeneratedType, Index, IndexColumn, Schema,
+    Table, EXPR_INDEX_SENTINEL,
 };
 use crate::translate::fkeys::FkActionCompileStack;
 use crate::translate::plan::{Aggregate, ColumnMask};
 use crate::vdbe::{
     affinity::Affinity,
-    builder::{CursorType, DmlColumnContext, ProgramBuilder, SelfTableContext},
+    builder::{CursorKey, CursorType, DmlColumnContext, ProgramBuilder, SelfTableContext},
     insn::{to_u32, InsertFlags, Insn},
     BranchOffset, CursorID,
 };
@@ -183,11 +183,13 @@ pub struct Resolver<'a> {
     /// Schema dialect of the database being compiled against; used when a
     /// fresh placeholder schema must be constructed during resolution.
     pub(crate) dialect: Arc<dyn crate::dialect::Dialect>,
-    /// When set, we are compiling a trigger subprogram for this database.
-    /// Ordinary triggers are restricted to their own database, but temp-backed
-    /// triggers follow SQLite's looser resolution rules and may access objects
-    /// across schemas.
-    pub(crate) trigger_context: Option<TriggerDatabaseContext>,
+    /// When set, we are compiling the body of a trigger or a (non-materialized)
+    /// view for this database. Ordinary triggers and views are restricted to
+    /// their own database, but temp-backed triggers follow SQLite's looser
+    /// resolution rules and may access objects across schemas. A `RefCell`
+    /// because the view-expansion caller (`parse_table` in planner.rs) only
+    /// holds a shared `&Resolver`; see `with_database_scope`.
+    pub(crate) database_scope: RefCell<Option<DatabaseScopeContext>>,
     /// Cached flag: true when this connection has an active temp database.
     ///
     /// Computed once at Resolver construction to avoid repeated
@@ -219,26 +221,16 @@ struct SelfTableScope {
 impl SelfTableScope {
     fn new(context: SelfTableContext) -> Self {
         let affinities = match &context {
-            SelfTableContext::ForDML { table, .. } => Some(
-                table
-                    .columns()
-                    .iter()
-                    .map(|c| c.affinity_with_strict(table.is_strict))
-                    .collect(),
-            ),
+            SelfTableContext::ForDML { table, .. } => {
+                Some(table.columns().iter().map(|c| c.affinity()).collect())
+            }
             SelfTableContext::ForSelect {
                 table_ref_id,
                 referenced_tables,
             } => referenced_tables
                 .find_table_by_internal_id(*table_ref_id)
                 .and_then(|(_, table_ref)| table_ref.btree())
-                .map(|btree| {
-                    btree
-                        .columns()
-                        .iter()
-                        .map(|c| c.affinity_with_strict(btree.is_strict))
-                        .collect()
-                }),
+                .map(|btree| btree.columns().iter().map(|c| c.affinity()).collect()),
         };
 
         Self {
@@ -269,16 +261,22 @@ impl SelfTableScope {
     }
 }
 
-/// Context for restricting table resolution during trigger subprogram compilation.
+/// Context for restricting table resolution while compiling the body of a
+/// database object (a trigger or a view). Mirrors SQLite's view/trigger
+/// schema fixer (`sqlite3FixSelect`/`DbFixer` in `src/fix.c`): unqualified
+/// table names inside the object's body resolve within the database the
+/// object itself lives in, not through the normal temp-first search.
 #[derive(Debug, Clone)]
-pub(crate) struct TriggerDatabaseContext {
-    /// The database ID the trigger belongs to.
+pub(crate) struct DatabaseScopeContext {
+    /// The database ID the object belongs to.
     database_id: usize,
-    /// The trigger name (for error messages).
-    trigger_name: String,
+    /// "trigger" or "view" (for error messages).
+    kind: &'static str,
+    /// The object's own name (for error messages).
+    object_name: String,
 }
 
-impl TriggerDatabaseContext {
+impl DatabaseScopeContext {
     fn restricts_db_references(&self) -> bool {
         self.database_id != crate::TEMP_DB_ID
     }
@@ -320,7 +318,7 @@ impl<'a> Resolver<'a> {
             #[cfg(feature = "simulator")]
             subquery_unnesting_mode: crate::SubqueryUnnestingMode::Auto,
             dialect,
-            trigger_context: None,
+            database_scope: RefCell::new(None),
             has_temp_schema,
             fk_action_compile_stack: FkActionCompileStack::default(),
             unqualified_database_search_path: unqualified_database_search_path.clone(),
@@ -365,7 +363,7 @@ impl<'a> Resolver<'a> {
             #[cfg(feature = "simulator")]
             subquery_unnesting_mode: self.subquery_unnesting_mode,
             dialect: self.dialect.clone(),
-            trigger_context: self.trigger_context.clone(),
+            database_scope: RefCell::new(self.database_scope.borrow().clone()),
             has_temp_schema: self.has_temp_schema,
             fk_action_compile_stack: self.fk_action_compile_stack.clone(),
             unqualified_database_search_path: self.unqualified_database_search_path.clone(),
@@ -392,7 +390,7 @@ impl<'a> Resolver<'a> {
             #[cfg(feature = "simulator")]
             subquery_unnesting_mode: self.subquery_unnesting_mode,
             dialect: self.dialect.clone(),
-            trigger_context: self.trigger_context.clone(),
+            database_scope: RefCell::new(self.database_scope.borrow().clone()),
             has_temp_schema: self.has_temp_schema,
             fk_action_compile_stack: self.fk_action_compile_stack.clone(),
             unqualified_database_search_path: self.unqualified_database_search_path.clone(),
@@ -443,6 +441,25 @@ impl<'a> Resolver<'a> {
             .and_then(|scope| scope.affinity(column))
     }
 
+    pub(crate) fn self_table_collation(&self, column: Option<usize>) -> Option<CollationSeq> {
+        let scope = self.self_table_scope.borrow();
+        let context = &scope.as_ref()?.context;
+        let table = match context {
+            SelfTableContext::ForDML { table, .. } => Arc::clone(table),
+            SelfTableContext::ForSelect {
+                table_ref_id,
+                referenced_tables,
+            } => referenced_tables
+                .find_table_by_internal_id(*table_ref_id)?
+                .1
+                .btree()?,
+        };
+        match column {
+            Some(column) => table.columns().get(column)?.collation_opt(),
+            None => table.get_rowid_alias_column()?.1.collation_opt(),
+        }
+    }
+
     pub(crate) fn self_table_column_type_str(&self, column: usize) -> Option<String> {
         self.self_table_scope
             .borrow()
@@ -481,10 +498,11 @@ impl<'a> Resolver<'a> {
                 .map(|temp_db| temp_db.db.schema.lock().clone())
                 .unwrap_or_else(|| {
                     // with_options only fails if built-in type SQL is malformed (programmer bug).
-                    Arc::new(
+                    let mut schema =
                         Schema::with_options(self.enable_custom_types, self.dialect.as_ref())
-                            .expect("built-in type definitions are malformed"),
-                    )
+                            .expect("built-in type definitions are malformed");
+                    schema.copy_table_valued_functions(self.schema);
+                    Arc::new(schema)
                 }),
             _ => {
                 let attached_dbs = self.attached_databases.read();
@@ -503,12 +521,85 @@ impl<'a> Resolver<'a> {
         loaded_schema
     }
 
-    /// Set trigger database context to restrict table resolution to the trigger's database.
-    pub(crate) fn set_trigger_context(&mut self, database_id: usize, trigger_name: String) {
-        self.trigger_context = Some(TriggerDatabaseContext {
-            database_id,
-            trigger_name,
-        });
+    /// Run `f` with table resolution restricted to `database_id`, restoring
+    /// whatever scope was active before once `f` returns (including on an
+    /// early `Err` return). Callers that only hold a shared `&Resolver` use
+    /// this directly (e.g. a view's body is planned as a FROM-clause
+    /// subquery with only `&Resolver` in hand); `f` needs no access to
+    /// `self` because it can simply capture a copy of the shared reference.
+    ///
+    /// For trigger subprogram compilation, which must re-borrow the
+    /// `Resolver` mutably on every statement it compiles, see
+    /// `with_database_scope_mut` instead — a guard holding a live borrow of
+    /// `self` across that loop would conflict with those reborrows.
+    pub(crate) fn with_database_scope<T>(
+        &self,
+        database_id: usize,
+        kind: &'static str,
+        object_name: String,
+        f: impl FnOnce() -> Result<T>,
+    ) -> Result<T> {
+        let previous = self
+            .database_scope
+            .borrow_mut()
+            .replace(DatabaseScopeContext {
+                database_id,
+                kind,
+                object_name,
+            });
+        let result = f();
+        *self.database_scope.borrow_mut() = previous;
+        result
+    }
+
+    /// Like `with_database_scope`, but for callers that hold `&mut Resolver`
+    /// and need to pass it on mutably to `f` (trigger subprogram compilation
+    /// calls `translate_inner`, which takes `&mut Resolver`, once per trigger
+    /// command). `f` receives the same `&mut Resolver` back so it can keep
+    /// reborrowing it, instead of capturing it from the environment, which
+    /// would fight the mutable borrow this method itself takes.
+    pub(crate) fn with_database_scope_mut<T>(
+        &mut self,
+        database_id: usize,
+        kind: &'static str,
+        object_name: String,
+        f: impl FnOnce(&mut Self) -> Result<T>,
+    ) -> Result<T> {
+        let previous = self
+            .database_scope
+            .borrow_mut()
+            .replace(DatabaseScopeContext {
+                database_id,
+                kind,
+                object_name,
+            });
+        let result = f(self);
+        *self.database_scope.borrow_mut() = previous;
+        result
+    }
+
+    /// Restrict table resolution to the trigger's own database while `f` runs.
+    pub(crate) fn with_trigger_scope<T>(
+        &mut self,
+        database_id: usize,
+        trigger_name: String,
+        f: impl FnOnce(&mut Self) -> Result<T>,
+    ) -> Result<T> {
+        self.with_database_scope_mut(database_id, "trigger", trigger_name, f)
+    }
+
+    /// Restrict table resolution to the view's own database while `f` runs,
+    /// the same way `with_trigger_scope` does for triggers: a persistent
+    /// view's unqualified table names resolve within the database the view
+    /// lives in, never through a TEMP table that happens to share a source
+    /// table's name, matching SQLite's view schema fixer.
+    pub(crate) fn with_view_scope<T>(
+        &self,
+        database_id: usize,
+        view_name: String,
+        f: impl FnOnce() -> Result<T>,
+    ) -> Result<T> {
+        self.with_database_scope(database_id, "view", view_name, f)
     }
 
     pub fn resolve_function(
@@ -547,6 +638,24 @@ impl<'a> Resolver<'a> {
             .borrow_mut()
             .pop()
             .unwrap_or_default()
+    }
+
+    /// Number of aggregates moved up so far to the innermost collecting query.
+    pub(crate) fn count_aggregates_moved_from_subqueries(&self) -> usize {
+        self.enclosing_query_aggregates
+            .borrow()
+            .last()
+            .map_or(0, Vec::len)
+    }
+
+    /// The function name of the aggregate at `index` among those moved up to
+    /// the innermost collecting query, if there is one.
+    pub(crate) fn aggregate_moved_from_subqueries(&self, index: usize) -> Option<String> {
+        self.enclosing_query_aggregates
+            .borrow()
+            .last()
+            .and_then(|collected| collected.get(index))
+            .map(|agg| agg.func.to_string())
     }
 
     /// Move an aggregate up to the innermost enclosing query that is
@@ -744,7 +853,7 @@ impl<'a> Resolver<'a> {
     }
 
     pub(crate) fn resolve_existing_table_database_id(&self, table_name: &str) -> Result<usize> {
-        if let Some(ref ctx) = self.trigger_context {
+        if let Some(ctx) = self.database_scope.borrow().as_ref() {
             if ctx.restricts_db_references() {
                 return Ok(ctx.database_id);
             }
@@ -811,10 +920,10 @@ impl<'a> Resolver<'a> {
                 }
             }
         } else {
-            // Unqualified table name — when compiling a trigger subprogram,
-            // resolve to the trigger's database (matching SQLite behavior).
-            // Otherwise default to main.
-            if let Some(ref ctx) = self.trigger_context {
+            // Unqualified table name — when compiling the body of a trigger
+            // or a view, resolve to that object's own database (matching
+            // SQLite behavior). Otherwise default to main.
+            if let Some(ctx) = self.database_scope.borrow().as_ref() {
                 if ctx.restricts_db_references() {
                     Ok(ctx.database_id)
                 } else {
@@ -825,10 +934,11 @@ impl<'a> Resolver<'a> {
             }
         }?;
 
-        // Triggers can only reference tables in their own database.
+        // A trigger or view can only reference tables in its own database.
         // This only fires for explicitly qualified names (e.g. "aux.table")
-        // since unqualified names already resolve to the trigger's database above.
-        if let Some(ref ctx) = self.trigger_context {
+        // since unqualified names already resolve to the object's own
+        // database above.
+        if let Some(ctx) = self.database_scope.borrow().as_ref() {
             if !ctx.restricts_db_references() {
                 return Ok(resolved_id);
             }
@@ -839,8 +949,8 @@ impl<'a> Resolver<'a> {
                     .map(|n| n.as_str())
                     .unwrap_or("main");
                 return Err(LimboError::ParseError(format!(
-                    "trigger {} cannot reference objects in database {}",
-                    ctx.trigger_name, db_name
+                    "{} {} cannot reference objects in database {}",
+                    ctx.kind, ctx.object_name, db_name
                 )));
             }
         }
@@ -926,6 +1036,12 @@ pub struct MaterializedBuildInput {
     pub prefix_tables: TableMask,
 }
 
+impl MaterializedBuildInput {
+    pub(crate) fn requires_build_table(&self) -> bool {
+        matches!(self.mode, MaterializedBuildInputMode::RowidOnly)
+    }
+}
+
 impl LimitCtx {
     pub fn new(program: &mut ProgramBuilder) -> Self {
         Self {
@@ -955,6 +1071,8 @@ pub(crate) struct HashLabels {
     pub check_outer: Option<BranchOffset>,
     /// Entry label for the inner-loop subroutine.
     pub inner_loop_gosub: Option<BranchOffset>,
+    /// Return label for the inner-loop subroutine.
+    pub inner_loop_return: Option<BranchOffset>,
     /// Label that skips past the subroutine body (resolved after Return).
     pub inner_loop_skip: Option<BranchOffset>,
     /// Label for the grace loop's own HashNext (resolved during grace loop emission).
@@ -968,6 +1086,7 @@ impl HashLabels {
             next,
             check_outer: None,
             inner_loop_gosub: None,
+            inner_loop_return: None,
             inner_loop_skip: None,
             grace_hash_next: None,
         }
@@ -987,8 +1106,7 @@ pub struct HashCtx {
     /// These references may point at multiple tables when a build input was
     /// materialized from a join prefix.
     pub payload_columns: Vec<MaterializedColumnRef>,
-    /// Build table cursor (for NullRow in outer joins).
-    pub build_cursor_id: Option<CursorID>,
+    pub build_table_cursor_id: Option<CursorID>,
     pub join_type: HashJoinType,
     /// Gosub register for the inner-loop subroutine wrapping subsequent tables.
     /// Outer hash joins wrap inner loops so unmatched-row paths can re-enter via Gosub.
@@ -1030,9 +1148,13 @@ pub struct TranslateCtx<'a> {
     pub meta_group_by: Option<GroupByMetadata>,
     // metadata for the order by operator
     pub meta_sort: Option<SortMetadata>,
-    /// mapping between table loop index and associated metadata (for left joins only)
-    /// this metadata exists for the right table in a given left join
+    /// Match state for each JOIN that keeps unmatched left rows.
+    ///
+    /// Left-row and right-row match state are separate because a FULL JOIN needs both.
+    /// This matches SQLite's `WhereLevel.iLeftJoin` and `WhereLevel.pRJ` fields.
     pub meta_left_joins: Vec<Option<LeftJoinMetadata>>,
+    /// Match state for each JOIN that keeps unmatched right rows.
+    pub meta_right_joins: Vec<Option<RightJoinMetadata>>,
     /// mapping between table loop index and associated metadata (for semi/anti joins)
     pub meta_semi_anti_joins: Vec<Option<SemiAntiJoinMetadata>>,
     pub resolver: Resolver<'a>,
@@ -1057,6 +1179,7 @@ pub struct TranslateCtx<'a> {
     /// Only populated when GROUP BY uses a sorter, enabling deferred expression
     /// evaluation: the sorter stores raw columns instead of pre-computed expressions,
     /// and full expressions are re-evaluated from the pseudo cursor during aggregation.
+    /// An expression that the selected index stores is kept whole.
     pub agg_leaf_columns: Vec<Expr>,
     /// Cursor id for cdc table (if capture_data_changes PRAGMA is set and query can modify the data)
     pub cdc_cursor_id: Option<usize>,
@@ -1092,6 +1215,7 @@ impl<'a> TranslateCtx<'a> {
             reg_result_cols_start: None,
             meta_group_by: None,
             meta_left_joins: (0..table_count).map(|_| None).collect(),
+            meta_right_joins: (0..table_count).map(|_| None).collect(),
             meta_semi_anti_joins: (0..table_count).map(|_| None).collect(),
             meta_sort: None,
             hash_table_contexts: HashMap::default(),
@@ -1176,6 +1300,7 @@ fn build_rowid_column() -> Column {
 pub fn prepare_cdc_if_necessary(
     program: &mut ProgramBuilder,
     schema: &Schema,
+    database_id: usize,
     changed_table_name: Option<&str>,
 ) -> Result<Option<(usize, Arc<BTreeTable>)>> {
     let mode = program.capture_data_changes_info();
@@ -1183,6 +1308,9 @@ pub fn prepare_cdc_if_necessary(
     let Some(cdc_table) = cdc_table else {
         return Ok(None);
     };
+    if database_id == crate::TEMP_DB_ID {
+        return Ok(None);
+    }
     // Self-exclusion: never capture changes to CDC's own bookkeeping tables. `None` means the
     // caller has no associated table (e.g. a transaction-boundary COMMIT record) and always
     // gets the cursor.
@@ -1226,11 +1354,10 @@ pub fn emit_cdc_patch_record(
             extra_amount: 0,
         });
         let storable_count = columns.iter().filter(|c| !c.is_virtual_generated()).count();
-        let is_strict = table.btree().is_some_and(|btree| btree.is_strict);
         let affinity_str = columns
             .iter()
             .filter(|col| !col.is_virtual_generated())
-            .map(|col| col.affinity_with_strict(is_strict).aff_mask())
+            .map(|col| col.affinity().aff_mask())
             .collect::<String>();
 
         program.emit_insn(Insn::MakeRecord {
@@ -1251,7 +1378,6 @@ pub(super) fn emit_make_record<'a>(
     cols: impl IntoIterator<Item = &'a Column>,
     start_reg: usize,
     dest_reg: usize,
-    is_strict: bool,
 ) {
     let storable_cols: Vec<&Column> = cols
         .into_iter()
@@ -1261,7 +1387,7 @@ pub(super) fn emit_make_record<'a>(
 
     let affinity_str: String = storable_cols
         .iter()
-        .map(|c| c.affinity_with_strict(is_strict).aff_mask())
+        .map(|c| c.affinity().aff_mask())
         .collect();
 
     program.emit_insn(Insn::MakeRecord {
@@ -1278,7 +1404,6 @@ pub fn emit_cdc_full_record(
     columns: &[Column],
     table_cursor_id: usize,
     rowid_reg: usize,
-    is_strict: bool,
 ) -> usize {
     let storable_count = columns.iter().filter(|c| !c.is_virtual_generated()).count();
     let columns_reg = program.alloc_registers(storable_count + 1);
@@ -1301,7 +1426,7 @@ pub fn emit_cdc_full_record(
     let affinity_str = columns
         .iter()
         .filter(|col| !col.is_virtual_generated())
-        .map(|col| col.affinity_with_strict(is_strict).aff_mask())
+        .map(|col| col.affinity().aff_mask())
         .collect::<String>();
 
     program.emit_insn(Insn::MakeRecord {
@@ -1519,7 +1644,6 @@ fn emit_cdc_insns_v1(
     Ok(())
 }
 
-#[allow(clippy::too_many_arguments)]
 #[allow(clippy::too_many_arguments)]
 fn emit_cdc_insns_v2(
     program: &mut ProgramBuilder,
@@ -1819,7 +1943,9 @@ pub fn emit_cdc_explicit_commit_insns(
     });
 
     // A COMMIT record has no associated table, so pass `None` (no self-exclusion check).
-    if let Some((cdc_cursor_id, _)) = prepare_cdc_if_necessary(program, schema, None)? {
+    if let Some((cdc_cursor_id, _)) =
+        prepare_cdc_if_necessary(program, schema, crate::MAIN_DB_ID, None)?
+    {
         emit_cdc_commit_insns(program, resolver, cdc_cursor_id)?;
     }
 
@@ -1869,7 +1995,14 @@ pub(crate) fn init_limit(
                 _ => {
                     let r = limit_ctx.reg_limit;
 
-                    _ = translate_expr(program, None, expr, r, &t_ctx.resolver)?;
+                    _ = translate_expr_no_constant_opt(
+                        program,
+                        None,
+                        expr,
+                        r,
+                        &t_ctx.resolver,
+                        NoConstantOptReason::RegisterReuse,
+                    )?;
                     program.emit_insn(Insn::MustBeInt {
                         reg: r,
                         target_pc: None,
@@ -1904,7 +2037,14 @@ pub(crate) fn init_limit(
                     _ => unreachable!("parse_numeric_literal only returns Integer or Float"),
                 },
                 _ => {
-                    _ = translate_expr(program, None, expr, offset_reg, &t_ctx.resolver)?;
+                    _ = translate_expr_no_constant_opt(
+                        program,
+                        None,
+                        expr,
+                        offset_reg,
+                        &t_ctx.resolver,
+                        NoConstantOptReason::RegisterReuse,
+                    )?;
                 }
             }
             program.add_comment(program.offset(), "OFFSET counter");
@@ -2093,6 +2233,36 @@ pub(crate) fn emit_index_column_value_old_image(
     Ok(())
 }
 
+/// Emit code that evaluates a partial index's WHERE for the row under the table
+/// cursor, and return the register that holds the result. Return None for an
+/// index without a WHERE. The columns are read from the table cursor because it
+/// can be on a different row than a scan cursor, e.g. the row that REPLACE deletes.
+pub(crate) fn emit_partial_index_where_old_image(
+    program: &mut ProgramBuilder,
+    resolver: &Resolver,
+    table_references: &mut TableReferences,
+    table_cursor_id: usize,
+    table_internal_id: TableInternalId,
+    index: &Index,
+) -> Result<Option<usize>> {
+    let Some(where_clause) = index.bind_where_expr(Some(table_references), resolver)? else {
+        return Ok(None);
+    };
+    let result_reg = program.alloc_register();
+    let table_cursor = [(CursorKey::table(table_internal_id), table_cursor_id)];
+    program.with_cursor_overrides(&table_cursor, |program| {
+        translate_expr_no_constant_opt(
+            program,
+            Some(table_references),
+            &where_clause,
+            result_reg,
+            resolver,
+            NoConstantOptReason::RegisterReuse,
+        )
+    })?;
+    Ok(Some(result_reg))
+}
+
 fn generated_column(
     program: &mut ProgramBuilder,
     table_cursor_id: usize,
@@ -2262,7 +2432,7 @@ fn emit_check_constraint_bytecode(
                 program.emit_insn(Insn::Halt {
                     err_code: SQLITE_CONSTRAINT_CHECK,
                     description: constraint_name.to_string(),
-                    on_error: None,
+                    on_error: program.constraint_halt_on_error(or_conflict),
                     description_reg: None,
                 });
             }

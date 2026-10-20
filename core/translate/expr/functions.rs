@@ -57,36 +57,7 @@ pub(super) fn translate_like_base(
         }
         #[cfg(all(feature = "fts", not(target_family = "wasm")))]
         ast::LikeOperator::Match => {
-            // Transform MATCH to fts_match():
-            // - `col MATCH 'query'` -> `fts_match(col, 'query')`
-            // - `(col1, col2) MATCH 'query'` -> `fts_match(col1, col2, 'query')`
-            let columns: Vec<&ast::Expr> = match lhs.as_ref() {
-                ast::Expr::Parenthesized(cols) => cols.iter().map(|c| c.as_ref()).collect(),
-                other => vec![other],
-            };
-            let arg_count = columns.len() + 1; // columns + query
-            let start_reg = program.alloc_registers(arg_count);
-
-            for (i, col) in columns.iter().enumerate() {
-                translate_expr(program, referenced_tables, col, start_reg + i, resolver)?;
-            }
-            translate_expr(
-                program,
-                referenced_tables,
-                rhs,
-                start_reg + columns.len(),
-                resolver,
-            )?;
-
-            program.emit_insn(Insn::Function {
-                constant_mask: 0,
-                start_reg,
-                dest: target_register,
-                func: FuncCtx {
-                    func: Func::Fts(FtsFunc::Match),
-                    arg_count,
-                },
-            });
+            crate::bail_parse_error!("MATCH requires an FTS index query")
         }
         #[cfg(any(not(feature = "fts"), target_family = "wasm"))]
         ast::LikeOperator::Match => {
@@ -266,11 +237,10 @@ pub(super) fn translate_sequence_function(
 
     if is_nextval {
         // Reuse `start_reg` (the user's raw arg, possibly schema-qualified
-        // such as `'aux.my_seq'`) as the seq-name register so per-session
+        // such as `'aux.my_seq'`) as the currval register so per-session
         // `currval` stays keyed by the user's original spelling. The
-        // runtime handler strips the schema prefix when looking up the
-        // sequence object; the opcode's `db` field already encodes the
-        // correct database id resolved here.
+        // sequence opcodes get the bare `normalized_name` and the database
+        // id resolved here, so they never parse the user's string.
         crate::translate::sequence::emit_disk_read_nextval(
             program,
             resolver,
@@ -357,7 +327,10 @@ pub(super) fn translate_sequence_function(
             cursor: cursor_id,
             key_reg: start_reg + 1,
             record_reg,
-            flag: InsertFlags::new().require_seek().skip_all_change_counts(),
+            flag: InsertFlags::new()
+                .require_seek()
+                .skip_last_rowid()
+                .skip_all_change_counts(),
             table_name: normalized_name.clone(),
         });
         program.emit_insn(Insn::SetSequenceCurrval {

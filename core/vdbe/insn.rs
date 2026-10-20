@@ -274,7 +274,7 @@ pub struct HashBuildData {
 /// them. Most seeks have no such columns, so the empty mask is a null pointer
 /// and only IS-seeks allocate (boxed to keep Insn small).
 ///
-/// Build it from a [`BitSet`] via `From`; that keeps the invariant that the
+/// Build it from a `BitSet` via `From`; that keeps the invariant that the
 /// inner option is `None` exactly when the mask is empty.
 #[derive(Debug, Clone, Default)]
 pub struct NullMatchingMask(Option<Box<BitSet>>);
@@ -359,6 +359,63 @@ pub struct AggStepData {
     pub collation: Option<CollationSeq>,
 }
 
+/// Which of SUM, TOTAL, or AVG an `IvmSumFinalize` instruction computes. The
+/// three share one linear state (see `IvmSumData`); only the finalize step
+/// tells them apart.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IvmSumKind {
+    Sum,
+    Total,
+    Avg,
+}
+
+/// Incremental-view state for SUM/TOTAL/AVG (boxed to keep Insn small).
+///
+/// A materialized view must equal a fresh evaluation of its defining SELECT
+/// over the table's current rows, so this state combines by plain addition,
+/// with no sticky flag that survives a retraction it should not. A row is
+/// added `weight` times: its z-set weight, negative for a retraction. See
+/// "Divergences from DBSP" in docs/ivm-vdbe-rewrite-writeup.md.
+///
+/// Fields:
+/// - `int_wrapped`/`int_wrap_count`: the exact sum of every live INTEGER (or
+///   integer-valued TEXT) contribution, stored as `int_wrapped + int_wrap_count
+///   * 2^64` so an i64 overflow is still exactly undone by a later retraction.
+/// - `float_sum`/`float_err`: the Kahan-Babuska-Neumaier running sum of every
+///   live non-integer contribution (REAL, or TEXT/BLOB that sum() treats as
+///   approximate).
+/// - `non_int_count`: count of live non-integer contributions; decides
+///   whether SUM's result is INTEGER or REAL.
+/// - `non_null_count`: count of live non-NULL contributions; decides the
+///   empty-group result and AVG's divisor.
+#[derive(Debug, Clone)]
+pub struct IvmSumData {
+    pub arg_reg: usize,
+    /// The row's z-set weight: an integer, negative for a retraction.
+    pub weight_reg: usize,
+    pub int_wrapped_reg: usize,
+    pub int_wrap_count_reg: usize,
+    pub float_sum_reg: usize,
+    pub float_err_reg: usize,
+    pub non_int_count_reg: usize,
+    pub non_null_count_reg: usize,
+}
+
+/// Data for the `IvmSumFinalize` instruction (boxed to keep Insn small): the
+/// same state fields as `IvmSumData`, minus the row's argument and weight,
+/// plus which function to compute and where to write the result.
+#[derive(Debug, Clone)]
+pub struct IvmSumFinalizeData {
+    pub kind: IvmSumKind,
+    pub int_wrapped_reg: usize,
+    pub int_wrap_count_reg: usize,
+    pub float_sum_reg: usize,
+    pub float_err_reg: usize,
+    pub non_int_count_reg: usize,
+    pub non_null_count_reg: usize,
+    pub dest_reg: usize,
+}
+
 /// Data for ArrayEncode instruction (boxed to keep Insn small).
 #[derive(Debug, Clone)]
 pub struct ArrayEncodeData {
@@ -377,6 +434,13 @@ pub struct HashDistinctData {
     pub num_keys: usize,
     pub collations: Vec<CollationSeq>,
     pub target_pc: BranchOffset,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ClearBtreeCount {
+    Nothing,
+    RowsWritten,
+    ChangesAndRowsWritten,
 }
 
 // The opcodes the dispatch loop matches directly come first.
@@ -552,6 +616,13 @@ pub enum Insn {
     NullRow {
         cursor_id: CursorID,
     },
+    /// If the cursor is on a null row, write NULL to `dest` and jump.
+    /// This instruction does nothing for an unopened cursor.
+    IfNullRow {
+        cursor_id: CursorID,
+        target_pc: BranchOffset,
+        dest: usize,
+    },
     /// Add two registers and store the result in a third register.
     Add {
         lhs: usize,
@@ -645,7 +716,7 @@ pub enum Insn {
         reg: usize,
         target_pc: BranchOffset,
     },
-    /// Compute a hash on num_keys registers starting with r[key_reg]. Check to see if that hash
+    /// Compute a hash on num_keys registers starting with `r[key_reg]`. Check to see if that hash
     /// is found in the bloom filter associated with the cursor/hash_table. If it is not present
     /// then jump to target_pc. Otherwise fall through.
     /// False negatives are harmless. It is always safe to fall through, even if the value is
@@ -661,7 +732,7 @@ pub enum Insn {
         /// Number of key registers to hash together
         num_keys: usize,
     },
-    /// Compute a hash on num_keys registers starting with r[key_reg] and add that hash to
+    /// Compute a hash on num_keys registers starting with `r[key_reg]` and add that hash to
     /// the bloom filter associated with the cursor/hash_table.
     FilterAdd {
         cursor_id: CursorID,
@@ -799,11 +870,17 @@ pub enum Insn {
         target_pc: BranchOffset,
     },
 
+    /// Jump if the register is NULL or has type `value_type`.
+    IsType {
+        reg: usize,
+        target_pc: BranchOffset,
+        value_type: crate::types::ValueType,
+    },
+
     TypeCheck {
         start_reg: usize, // P1
         count: usize,     // P2
-        /// GENERATED ALWAYS AS ... STORED columns are only checked if P3 is zero.
-        /// When P3 is non-zero, no type checking occurs for stored generated columns.
+        /// Check generated columns after their values have been computed.
         check_generated: bool, // P3
         table_reference: Arc<BTreeTable>, // P4
     },
@@ -811,7 +888,7 @@ pub enum Insn {
     /// Parse a JSON text array into a native record-format BLOB, validating
     /// and coercing each element against the declared type using STRICT
     /// type-checking logic (apply_affinity_char + value_type check).
-    /// Input: reg = JSON text like '[1,2,3]'. Output: reg = record-format BLOB.
+    /// Input: reg = JSON text like `'[1,2,3]'`. Output: reg = record-format BLOB.
     /// Raises SQLITE_CONSTRAINT on type mismatch.
     ArrayEncode {
         data: Box<ArrayEncodeData>,
@@ -889,8 +966,10 @@ pub enum Insn {
     },
 
     /// Copy a register value to a dynamically-computed destination.
+    /// ```text
     /// dest = registers[base + registers[offset_reg]]
     /// registers[base + registers[offset_reg]] = registers[src]
+    /// ```
     RegCopyOffset {
         src: usize,
         base: usize,
@@ -975,7 +1054,7 @@ pub enum Insn {
     Halt {
         err_code: usize,
         description: String,
-        /// Override the program's resolve_type for error handling (used by RAISE).
+        /// Override the program's resolve_type for error handling.
         on_error: Option<ResolveType>,
         /// If set, read the error description from this register instead of
         /// the static `description` field (used by RAISE with expression messages).
@@ -987,6 +1066,8 @@ pub enum Insn {
         target_reg: usize,   // P3
         description: String, // p4
         err_code: usize,     // p1
+        /// Override the program's resolve_type for error handling.
+        on_error: Option<ResolveType>, // p2
     },
 
     /// Start a transaction.
@@ -1010,7 +1091,7 @@ pub enum Insn {
 
     /// Invoke a trigger or foreign-key action subprogram.
     ///
-    /// According to SQLite documentation (https://sqlite.org/opcode.html):
+    /// According to SQLite documentation (<https://sqlite.org/opcode.html>):
     /// "The Program opcode invokes the trigger subprogram. The Program instruction
     /// allocates and initializes a fresh register set for each invocation of the
     /// subprogram, so subprograms can be reentrant and recursive. The Param opcode
@@ -1088,6 +1169,11 @@ pub enum Insn {
     DeferredSeek {
         index_cursor_id: CursorID,
         table_cursor_id: CursorID,
+    },
+
+    /// Complete a pending DeferredSeek before a write that can use only index values.
+    FinishSeek {
+        cursor_id: CursorID,
     },
 
     /// If cursor_id refers to an SQL table (B-Tree that uses integer keys), use the value in start_reg as the key.
@@ -1226,6 +1312,40 @@ pub enum Insn {
         acc_reg: usize,
         dest_reg: usize,
         func: AccumulatorFunc,
+    },
+
+    /// Materialize an aggregate accumulator register from its persisted state
+    /// payload, read from `agg_payload_width(func)` registers starting at
+    /// `payload_start_reg`. The counterpart of AggContextStore; used by
+    /// materialized view maintenance to resume a group's aggregate state from
+    /// the view's state table.
+    AggContextLoad {
+        acc_reg: usize,
+        payload_start_reg: usize,
+        func: AccumulatorFunc,
+    },
+
+    /// Persist an aggregate accumulator's state payload into
+    /// `agg_payload_width(func)` registers starting at `payload_start_reg`,
+    /// for storage in a materialized view's state table.
+    AggContextStore {
+        acc_reg: usize,
+        payload_start_reg: usize,
+        func: AccumulatorFunc,
+    },
+
+    /// Add `arg_reg`'s row, `weight_reg` times, to a materialized view's
+    /// SUM/TOTAL/AVG state. A negative weight retracts the row. See
+    /// `IvmSumData`.
+    IvmSumStep {
+        data: Box<IvmSumData>,
+    },
+
+    /// Compute SUM, TOTAL, or AVG's current result from the state registers
+    /// `IvmSumStep` maintains, into `dest_reg`. See
+    /// `IvmSumFinalizeData`.
+    IvmSumFinalize {
+        data: Box<IvmSumFinalizeData>,
     },
 
     /// Open a sorter.
@@ -1461,6 +1581,9 @@ pub enum Insn {
     ClearBtree {
         db: usize,
         root: i64,
+        /// What the removed entries count toward. Whole-table DELETE counts every B-tree's
+        /// entries as written rows and the table's rows as changes. REINDEX counts nothing.
+        count: ClearBtreeCount,
     },
 
     /// Deletes an entire database table or index whose root page in the database file is given by P1.
@@ -1600,7 +1723,7 @@ pub enum Insn {
     /// `LimboError::SequenceExhausted` on overflow when `cycle` is false.
     SequenceComputeNext {
         db: usize,
-        seq_name_reg: usize,
+        seq_name: String,
         in_value_reg: usize,
         in_is_called_reg: usize,
         was_empty_reg: usize,
@@ -1618,7 +1741,7 @@ pub enum Insn {
     /// successful sequence RMW commit.
     SequenceTrackAllocation {
         db: usize,
-        seq_name_reg: usize,
+        seq_name: String,
         value_reg: usize,
     },
     /// Register an in-flight sequence allocation against the *outer*
@@ -1630,7 +1753,7 @@ pub enum Insn {
     /// closes.
     SequenceRegisterAllocation {
         db: usize,
-        seq_name_reg: usize,
+        seq_name: String,
         value_reg: usize,
         /// Register holding the encoded saved outer mv_tx (the blob written
         /// by `SequenceBeginInnerTx`). Empty blob means "no outer tx".
@@ -1972,7 +2095,10 @@ pub enum Insn {
         key_start_reg: u32,
         num_keys: u32,
         dest_reg: u32,
+        /// Jump here when the probe has no matching build row.
         target_pc: BranchOffset,
+        /// Jump here when the probe row is stored for grace processing.
+        deferred_target_pc: BranchOffset,
         /// Starting register to write payload columns from hash entry.
         payload_dest_reg: Option<u32>,
         /// Number of payload columns expected
@@ -2143,6 +2269,7 @@ impl InsnVariants {
             InsnVariants::Null => execute::op_null,
             InsnVariants::BeginSubrtn => execute::op_null,
             InsnVariants::NullRow => execute::op_null_row,
+            InsnVariants::IfNullRow => execute::op_if_null_row,
             InsnVariants::Add => execute::op_add,
             InsnVariants::Subtract => execute::op_subtract,
             InsnVariants::Multiply => execute::op_multiply,
@@ -2180,6 +2307,7 @@ impl InsnVariants {
             InsnVariants::Column => execute::op_column,
             InsnVariants::ColumnRange => execute::op_column_range,
             InsnVariants::ColumnHasField => execute::op_column_has_field,
+            InsnVariants::IsType => execute::op_is_type,
             InsnVariants::TypeCheck => execute::op_type_check,
             InsnVariants::ArrayEncode => execute::op_array_encode,
             InsnVariants::ArrayDecode => execute::op_array_decode,
@@ -2223,6 +2351,7 @@ impl InsnVariants {
             InsnVariants::IdxRowId => execute::op_idx_row_id,
             InsnVariants::SeekRowid => execute::op_seek_rowid,
             InsnVariants::DeferredSeek => execute::op_deferred_seek,
+            InsnVariants::FinishSeek => execute::op_finish_seek,
             InsnVariants::SeekGE
             | InsnVariants::SeekGT
             | InsnVariants::SeekLE
@@ -2236,6 +2365,10 @@ impl InsnVariants {
             InsnVariants::AggStep => execute::op_agg_step,
             InsnVariants::AggInverse => execute::op_agg_inverse,
             InsnVariants::AggFinal | InsnVariants::AggValue => execute::op_agg_final,
+            InsnVariants::AggContextLoad => execute::op_agg_context_load,
+            InsnVariants::AggContextStore => execute::op_agg_context_store,
+            InsnVariants::IvmSumStep => execute::op_ivm_sum_step,
+            InsnVariants::IvmSumFinalize => execute::op_ivm_sum_finalize,
             InsnVariants::SorterOpen => execute::op_sorter_open,
             InsnVariants::SorterInsert => execute::op_sorter_insert,
             InsnVariants::SorterSort => execute::op_sorter_sort,
@@ -2427,6 +2560,8 @@ impl Insn {
 // TODO: Add remaining cookies.
 #[derive(Description, Debug, Clone, Copy)]
 pub enum Cookie {
+    /// The number of free pages.
+    FreePageCount = 0,
     /// The schema cookie.
     SchemaVersion = 1,
     /// The schema format number. Supported schema formats are 1, 2, 3, and 4.
@@ -2443,6 +2578,8 @@ pub enum Cookie {
     IncrementalVacuum = 7,
     /// The application ID as set by the application_id pragma.
     ApplicationId = 8,
+    /// The page size, as read by the page_size pragma.
+    PageSize = 9,
 }
 
 #[cfg(test)]

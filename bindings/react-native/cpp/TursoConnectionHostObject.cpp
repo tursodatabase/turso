@@ -20,12 +20,13 @@ void TursoConnectionHostObject::throwError(jsi::Runtime &rt, const char *error) 
 
 jsi::Value TursoConnectionHostObject::get(jsi::Runtime &rt, const jsi::PropNameID &name) {
     auto propName = name.utf8(rt);
+    auto self = shared_from_this();
 
     if (propName == "prepareSingle") {
         return jsi::Function::createFromHostFunction(
             rt, name, 1,
-            [this](jsi::Runtime &rt, const jsi::Value &, const jsi::Value *args, size_t count) -> jsi::Value {
-                return this->prepareSingle(rt, args, count);
+            [self](jsi::Runtime &rt, const jsi::Value &, const jsi::Value *args, size_t count) -> jsi::Value {
+                return self->prepareSingle(rt, args, count);
             }
         );
     }
@@ -33,8 +34,8 @@ jsi::Value TursoConnectionHostObject::get(jsi::Runtime &rt, const jsi::PropNameI
     if (propName == "prepareFirst") {
         return jsi::Function::createFromHostFunction(
             rt, name, 1,
-            [this](jsi::Runtime &rt, const jsi::Value &, const jsi::Value *args, size_t count) -> jsi::Value {
-                return this->prepareFirst(rt, args, count);
+            [self](jsi::Runtime &rt, const jsi::Value &, const jsi::Value *args, size_t count) -> jsi::Value {
+                return self->prepareFirst(rt, args, count);
             }
         );
     }
@@ -42,8 +43,8 @@ jsi::Value TursoConnectionHostObject::get(jsi::Runtime &rt, const jsi::PropNameI
     if (propName == "lastInsertRowid") {
         return jsi::Function::createFromHostFunction(
             rt, name, 0,
-            [this](jsi::Runtime &rt, const jsi::Value &, const jsi::Value *, size_t) -> jsi::Value {
-                return this->lastInsertRowid(rt);
+            [self](jsi::Runtime &rt, const jsi::Value &, const jsi::Value *, size_t) -> jsi::Value {
+                return self->lastInsertRowid(rt);
             }
         );
     }
@@ -51,8 +52,8 @@ jsi::Value TursoConnectionHostObject::get(jsi::Runtime &rt, const jsi::PropNameI
     if (propName == "getAutocommit") {
         return jsi::Function::createFromHostFunction(
             rt, name, 0,
-            [this](jsi::Runtime &rt, const jsi::Value &, const jsi::Value *, size_t) -> jsi::Value {
-                return this->getAutocommit(rt);
+            [self](jsi::Runtime &rt, const jsi::Value &, const jsi::Value *, size_t) -> jsi::Value {
+                return self->getAutocommit(rt);
             }
         );
     }
@@ -60,8 +61,8 @@ jsi::Value TursoConnectionHostObject::get(jsi::Runtime &rt, const jsi::PropNameI
     if (propName == "setBusyTimeout") {
         return jsi::Function::createFromHostFunction(
             rt, name, 1,
-            [this](jsi::Runtime &rt, const jsi::Value &, const jsi::Value *args, size_t count) -> jsi::Value {
-                return this->setBusyTimeout(rt, args, count);
+            [self](jsi::Runtime &rt, const jsi::Value &, const jsi::Value *args, size_t count) -> jsi::Value {
+                return self->setBusyTimeout(rt, args, count);
             }
         );
     }
@@ -69,8 +70,8 @@ jsi::Value TursoConnectionHostObject::get(jsi::Runtime &rt, const jsi::PropNameI
     if (propName == "close") {
         return jsi::Function::createFromHostFunction(
             rt, name, 0,
-            [this](jsi::Runtime &rt, const jsi::Value &, const jsi::Value *, size_t) -> jsi::Value {
-                return this->close(rt);
+            [self](jsi::Runtime &rt, const jsi::Value &, const jsi::Value *, size_t) -> jsi::Value {
+                return self->close(rt);
             }
         );
     }

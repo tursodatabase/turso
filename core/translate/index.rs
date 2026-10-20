@@ -19,7 +19,7 @@ use crate::translate::{
     plan::{ColumnUsedMask, IterationDirection, JoinedTable, Operation, Scan, TableReferences},
 };
 use crate::vdbe::builder::{CursorKey, ProgramBuilderOpts, SelfTableContext};
-use crate::vdbe::insn::{to_u32, CmpInsFlags, Cookie};
+use crate::vdbe::insn::{to_u32, ClearBtreeCount, CmpInsFlags, Cookie};
 use crate::{bail_parse_error, CaptureDataChangesExt, LimboError, MAIN_DB_ID, TEMP_DB_ID};
 use crate::{
     schema::{
@@ -137,13 +137,21 @@ pub fn translate_create_index(
         }
         crate::bail_parse_error!("index {} already exists", original_idx_name.name.as_str());
     }
+    // Materialized views store their rows in a real table btree (so plain
+    // reads can use get_table() below like any other table), but writes to
+    // that btree go through the DBSP maintenance path (sink.rs), which emits
+    // raw Insert/Delete and has no notion of secondary indexes. An index
+    // created here would never be kept up to date by later changes to the
+    // view, silently going stale. Reject it the same way a plain view is
+    // rejected, rather than letting the engine look up a corrupt stale
+    // index on later reads.
+    if resolver.with_schema(database_id, |s| {
+        s.get_view(&tbl_name).is_some() || s.is_materialized_view(&tbl_name)
+    }) {
+        crate::bail_parse_error!("views may not be indexed");
+    }
     let table = resolver.with_schema(database_id, |s| s.get_table(&tbl_name));
     let Some(table) = table else {
-        if resolver.with_schema(database_id, |s| {
-            s.get_view(&tbl_name).is_some() || s.is_materialized_view(&tbl_name)
-        }) {
-            crate::bail_parse_error!("views may not be indexed");
-        }
         // The index's target table always lives in the index's own database,
         // so SQLite qualifies the missing table with that database name.
         let db_name = resolver
@@ -265,7 +273,12 @@ pub fn translate_create_index(
         root_page: RegisterOrLiteral::Literal(sqlite_table.root_page),
         db: database_id,
     });
-    let cdc_table = prepare_cdc_if_necessary(program, resolver.schema(), Some(SQLITE_TABLEID))?;
+    let cdc_table = prepare_cdc_if_necessary(
+        program,
+        resolver.schema(),
+        database_id,
+        Some(SQLITE_TABLEID),
+    )?;
     emit_schema_entry(
         program,
         resolver,
@@ -347,6 +360,7 @@ pub(crate) fn emit_refill_index(
                 iter_dir: IterationDirection::Forwards,
                 index: None,
             }),
+            unmatched_right_rows_plan: None,
             table: Table::BTree(tbl.clone()),
             identifier: tbl_name.clone(),
             internal_id: table_ref,
@@ -553,6 +567,7 @@ pub(crate) fn emit_refill_index(
             program.emit_insn(Insn::ClearBtree {
                 db: database_id,
                 root,
+                count: ClearBtreeCount::Nothing,
             });
         }
         program.emit_insn(Insn::OpenWrite {
@@ -703,16 +718,21 @@ fn resolve_reindex_targets(
 
     let normalized_name = normalize_ident(name.name.as_str());
     if name.db_name.is_none() {
-        if let Ok(collation) = CollationSeq::new(&normalized_name) {
-            return Ok(collect_reindex_targets_by_collation(
-                resolver, connection, collation,
-            ));
+        let collation = CollationSeq::new(&normalized_name).ok();
+        if let Some(collation) = collation {
+            let targets = collect_reindex_targets_by_collation(resolver, connection, collation);
+            if !targets.is_empty() || !matches!(collation, CollationSeq::Locale(_)) {
+                return Ok(targets);
+            }
         }
         if let Some(targets) = find_reindex_table(&normalized_name, resolver, connection) {
             return Ok(targets);
         }
         if let Some(target) = find_reindex_index(&normalized_name, resolver, connection) {
             return Ok(vec![target]);
+        }
+        if collation.is_some() {
+            return Ok(Vec::new());
         }
         bail_parse_error!("unable to identify the object to be reindexed");
     }
@@ -1179,18 +1199,9 @@ pub fn resolve_index_method_parameters(
                 },
                 ast::Literal::Null => crate::Value::Null,
                 ast::Literal::String(s) => crate::Value::Text(s.into()),
-                ast::Literal::Blob(b) => crate::Value::Blob(
-                    ast::blob_literal_hex(&b)
-                        .as_bytes()
-                        .chunks_exact(2)
-                        .map(|pair| {
-                            // We assume that sqlite3-parser has already validated that
-                            // the input is valid hex string, thus unwrap is safe.
-                            let hex_byte = std::str::from_utf8(pair).unwrap();
-                            u8::from_str_radix(hex_byte, 16).unwrap()
-                        })
-                        .try_collect()?,
-                ),
+                ast::Literal::Blob(b) => {
+                    crate::Value::Blob(ast::blob_literal_bytes(&b).try_collect()?)
+                }
                 _ => bail_parse_error!("parameters must be constant literals"),
             },
             _ => bail_parse_error!("parameters must be constant literals"),
@@ -1254,7 +1265,12 @@ pub fn translate_drop_index(
         }
     }
 
-    let cdc_table = prepare_cdc_if_necessary(program, resolver.schema(), Some(SQLITE_TABLEID))?;
+    let cdc_table = prepare_cdc_if_necessary(
+        program,
+        resolver.schema(),
+        database_id,
+        Some(SQLITE_TABLEID),
+    )?;
 
     // According to sqlite should emit Null instruction
     // but why?
@@ -1301,7 +1317,7 @@ pub fn translate_drop_index(
         rhs: dest_reg,
         target_pc: next_label,
         flags: CmpInsFlags::default(),
-        collation: program.curr_collation(),
+        collation: Some(CollationSeq::NoCase),
     });
 
     // read type of table
@@ -1334,7 +1350,6 @@ pub fn translate_drop_index(
                 sqlite_table.columns(),
                 sqlite_schema_cursor_id,
                 row_id_reg,
-                sqlite_table.is_strict,
             ))
         } else {
             None

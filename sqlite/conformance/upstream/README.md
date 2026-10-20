@@ -60,6 +60,10 @@ A file that runs longer than `file_timeout_seconds` (180 by default) is
 killed and shows as `XHANG`; a file whose process dies on a signal shows
 as `XCRASH`. Neither takes down the rest of the run.
 
+Each file runs in its own empty directory, `scratch/NAME`, which is
+cleared before the file starts and kept afterwards, so the databases a
+file creates can be inspected after the run.
+
 The full output of each file is written to `logs/NAME.log`; the console
 shows only each file's summary, failed-test list, and any abort, crash
 or hang line, because the complete output of a run is tens of megabytes.
@@ -72,9 +76,12 @@ and `wal_common.tcl` are the upstream helper files. The one change is in
 tests are plain `tclsh`, so it makes them source `tester.tcl` (with
 `TURSO_CHILD_PROCESS` set so they leave the parent's database alone). The
 testfixture-only commands that upstream provides from C (`sqlite3_test_control`,
-`testvfs`, `load_static_extension`, ...) are defined as no-ops in
+`testvfs`, ...) are defined as no-ops in
 `tester.tcl` so files that call them keep running; tests that depend on
-their effect fail on their own assertions.
+their effect fail on their own assertions. `load_static_extension` comes from
+the TCL binding, which registers `randomjson` and ignores other names. The `csv`
+module is built into `libturso_sqlite3` by the `csv` feature that
+`make -C bindings/tcl` turns on.
 
 ## Blessed and Known-Bad Files
 

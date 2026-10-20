@@ -30,3 +30,61 @@ test auto-vacuum-none-by-number {
 expect {
     0
 }
+
+# SQLite reads any other value as NONE. Upstream tests start with
+# `PRAGMA auto_vacuum=off`, so it has to be accepted too.
+test auto-vacuum-off-keyword {
+    PRAGMA auto_vacuum=off;
+    PRAGMA auto_vacuum;
+}
+expect {
+    0
+}
+
+test auto-vacuum-on-keyword {
+    PRAGMA auto_vacuum=ON;
+    PRAGMA auto_vacuum;
+}
+expect {
+    0
+}
+
+test auto-vacuum-unknown-name {
+    PRAGMA auto_vacuum=bogus;
+    PRAGMA auto_vacuum;
+}
+expect {
+    0
+}
+
+test auto-vacuum-quoted-string {
+    PRAGMA auto_vacuum='off';
+    PRAGMA auto_vacuum;
+}
+expect {
+    0
+}
+
+test auto-vacuum-default-keyword {
+    PRAGMA auto_vacuum=DEFAULT;
+    PRAGMA auto_vacuum;
+}
+expect {
+    0
+}
+
+test auto-vacuum-number-above-range {
+    PRAGMA auto_vacuum=7;
+    PRAGMA auto_vacuum;
+}
+expect {
+    0
+}
+
+test auto-vacuum-negative-number {
+    PRAGMA auto_vacuum=-1;
+    PRAGMA auto_vacuum;
+}
+expect {
+    0
+}

@@ -11,6 +11,7 @@ use crate::schema::{
 };
 use crate::stats::STATS_TABLE;
 use crate::storage::pager::CreateBTreeFlags;
+use crate::translate::collate::CollationSeq;
 use crate::translate::emitter::{
     emit_cdc_autocommit_commit, emit_cdc_full_record, emit_cdc_insns, prepare_cdc_if_necessary,
     OperationMode, Resolver,
@@ -30,7 +31,7 @@ use crate::vdbe::insn::{
     to_u32, {CmpInsFlags, Cookie, InsertFlags, Insn, RegisterOrLiteral},
 };
 use crate::{bail_parse_error, turso_assert, turso_assert_eq, CaptureDataChangesExt, Result};
-use crate::{Connection, MAIN_DB_ID};
+use crate::{Connection, Value, MAIN_DB_ID};
 
 use turso_ext::VTabKind;
 use turso_parser::ast;
@@ -139,6 +140,15 @@ fn validate_default_expr(expr: &ast::Expr, col: &ColumnDefinition) -> Result<()>
             | ast::Expr::Subquery(_)
             | ast::Expr::SubqueryResult { .. }
             | ast::Expr::Id(_) => {
+                bail_parse_error!(
+                    "default value of column [{}] is not constant",
+                    col.col_name.as_str()
+                );
+            }
+            ast::Expr::FunctionCall { filter_over, .. }
+            | ast::Expr::FunctionCallStar { filter_over, .. }
+                if filter_over.filter_clause.is_some() || filter_over.over_clause.is_some() =>
+            {
                 bail_parse_error!(
                     "default value of column [{}] is not constant",
                     col.col_name.as_str()
@@ -1271,7 +1281,12 @@ pub fn translate_create_table(
         }
     }
 
-    let cdc_table = prepare_cdc_if_necessary(program, resolver.schema(), Some(SQLITE_TABLEID))?;
+    let cdc_table = prepare_cdc_if_necessary(
+        program,
+        resolver.schema(),
+        database_id,
+        Some(SQLITE_TABLEID),
+    )?;
 
     let create_btree_label = program.allocate_label();
     let database_format_reg = program.alloc_register();
@@ -1407,7 +1422,12 @@ pub fn translate_create_table(
         db: database_id,
     });
 
-    let cdc_table = prepare_cdc_if_necessary(program, resolver.schema(), Some(SQLITE_TABLEID))?;
+    let cdc_table = prepare_cdc_if_necessary(
+        program,
+        resolver.schema(),
+        database_id,
+        Some(SQLITE_TABLEID),
+    )?;
 
     emit_schema_entry(
         program,
@@ -1692,14 +1712,14 @@ fn create_vtable_body_to_str(vtab: &ast::CreateVirtualTable, module: Arc<VTabImp
     } else {
         ""
     };
-    let ext_args = vtab
+    let module_args = vtab
         .args
         .iter()
-        .map(|a| turso_ext::Value::from_text(a.to_string()))
+        .map(|a| Value::from_text(a.to_string()))
         .collect::<Vec<_>>();
     let schema = module
         .implementation
-        .create_schema(ext_args)
+        .create_schema(module_args)
         .unwrap_or_default();
     let vtab_args = if let Some(first_paren) = schema.find('(') {
         let closing_paren = schema.rfind(')').unwrap_or_default();
@@ -1796,7 +1816,12 @@ pub fn translate_create_virtual_table(
         db: crate::MAIN_DB_ID,
     });
 
-    let cdc_table = prepare_cdc_if_necessary(program, resolver.schema(), Some(SQLITE_TABLEID))?;
+    let cdc_table = prepare_cdc_if_necessary(
+        program,
+        resolver.schema(),
+        crate::MAIN_DB_ID,
+        Some(SQLITE_TABLEID),
+    )?;
     let sql = create_vtable_body_to_str(&vtab, vtab_module.clone());
     emit_schema_entry(
         program,
@@ -1848,6 +1873,15 @@ fn validate_drop_table(
             "Cannot DROP TABLE on materialized view {tbl_name}. Use DROP VIEW instead.",
         );
     }
+    let dependent_views = resolver.with_schema(database_id, |schema| {
+        schema.get_dependent_materialized_views(tbl_name)
+    });
+    if !dependent_views.is_empty() {
+        bail_parse_error!(
+            "cannot drop table \"{tbl_name}\": it has dependent materialized view(s): {}",
+            dependent_views.join(", ")
+        );
+    }
     Ok(())
 }
 
@@ -1883,7 +1917,12 @@ pub fn translate_drop_table(
     {
         emit_fk_drop_table_check(program, resolver, name, connection, database_id)?;
     }
-    let cdc_table = prepare_cdc_if_necessary(program, resolver.schema(), Some(SQLITE_TABLEID))?;
+    let cdc_table = prepare_cdc_if_necessary(
+        program,
+        resolver.schema(),
+        database_id,
+        Some(SQLITE_TABLEID),
+    )?;
 
     let null_reg = program.alloc_register(); //  r1
     program.emit_null(null_reg, None);
@@ -1927,7 +1966,7 @@ pub fn translate_drop_table(
         rhs: table_reg,
         target_pc: next_label,
         flags: CmpInsFlags::default(),
-        collation: program.curr_collation(),
+        collation: Some(CollationSeq::NoCase),
     });
     program.emit_insn(Insn::RowId {
         cursor_id: sqlite_schema_cursor_id_0,
@@ -1954,7 +1993,6 @@ pub fn translate_drop_table(
                 schema_table.columns(),
                 sqlite_schema_cursor_id_0,
                 row_id_reg,
-                schema_table.is_strict,
             ))
         } else {
             None
@@ -2103,7 +2141,10 @@ pub fn translate_drop_table(
 
     //  2. Destroy the indices within a loop
     let indices: Vec<_> = resolver.with_schema(database_id, |s| {
-        s.get_indices(tbl_name.name.as_str()).cloned().collect()
+        s.get_indices(tbl_name.name.as_str())
+            .chain(s.get_unowned_backing_btrees(tbl_name.name.as_str()))
+            .cloned()
+            .collect()
     });
     for index in &indices {
         if index.index_method.is_some() && !index.is_backing_btree_index() {
@@ -2366,7 +2407,7 @@ pub fn translate_drop_table(
             rhs: dropped_table_name_reg,
             target_pc: continue_loop_label,
             flags: CmpInsFlags::default(),
-            collation: None,
+            collation: Some(CollationSeq::NoCase),
         });
 
         program.emit_insn(Insn::Delete {
@@ -2951,16 +2992,31 @@ pub fn translate_drop_type(
         bail_parse_error!("cannot drop built-in type: {normalized_name}");
     }
 
-    // Check if any table uses this type
-    for (_, table) in resolver.schema().tables.iter() {
-        for col in table.columns() {
-            if normalize_ident(&col.ty_str) == normalized_name {
-                bail_parse_error!(
-                    "cannot drop type {normalized_name}: used by column {} in table {}",
-                    col.name.as_deref().unwrap_or("?"),
-                    table.get_name()
-                );
-            }
+    // Check if any table in any database uses this type
+    let mut database_ids = resolver.attached_database_ids_in_search_order()?;
+    database_ids.set(MAIN_DB_ID)?;
+    if resolver.has_temp_database() {
+        database_ids.set(crate::TEMP_DB_ID)?;
+    }
+    for database_id in database_ids {
+        let column_using_type = resolver.with_schema(database_id, |schema| {
+            schema.tables.values().find_map(|table| {
+                table
+                    .columns()
+                    .iter()
+                    .find(|col| normalize_ident(&col.ty_str) == normalized_name)
+                    .map(|col| {
+                        (
+                            col.name.as_deref().unwrap_or("?").to_string(),
+                            table.get_name().to_string(),
+                        )
+                    })
+            })
+        });
+        if let Some((column_name, table_name)) = column_using_type {
+            bail_parse_error!(
+                "cannot drop type {normalized_name}: used by column {column_name} in table {table_name}"
+            );
         }
     }
 

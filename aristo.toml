@@ -27,6 +27,7 @@ commit_artifacts = true
 position = "before"
 
 [index]
+exclude = ["perf/tatp/upstream/**"]
 
 [canon]
 enabled = true

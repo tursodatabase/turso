@@ -355,6 +355,13 @@ assert_eq "random_json matches upstream for seed 1" {404 1} \
 assert_eq "load_static_extension accepts an extension that does not exist here" {} \
     [load_static_extension db no_such_extension]
 
+load_static_extension db csv
+assert_eq "load_static_extension csv registers the csv module" {1 2 3} \
+    [db eval {
+      CREATE VIRTUAL TABLE temp.csv_probe USING csv(data='1,2,3', columns=3);
+      SELECT * FROM csv_probe;
+    }]
+
 # ---------------------------------------------------------------------------
 # Summary
 # ---------------------------------------------------------------------------

@@ -31,8 +31,6 @@
 use criterion::{
     criterion_group, criterion_main, BenchmarkId, Criterion, SamplingMode, Throughput,
 };
-#[cfg(not(feature = "codspeed"))]
-use pprof::criterion::{Output, PProfProfiler};
 use turso_core::SqliteDialect;
 
 #[cfg(feature = "codspeed")]
@@ -42,7 +40,7 @@ use codspeed_criterion_compat::{
 
 use std::sync::Arc;
 use tempfile::TempDir;
-use turso_core::{Database, PlatformIO, StepResult};
+use turso_core::{ConnectOpts, Database, PlatformIO, StepResult};
 
 #[cfg(not(target_family = "wasm"))]
 #[global_allocator]
@@ -115,7 +113,7 @@ fn open_turso(temp_dir: &TempDir) -> (Arc<Database>, Arc<turso_core::Connection>
     #[allow(clippy::arc_with_non_send_sync)]
     let io = Arc::new(PlatformIO::new().unwrap());
     let db = Database::open_file(io, db_path.to_str().unwrap(), Arc::new(SqliteDialect)).unwrap();
-    let conn = db.connect().unwrap();
+    let conn = db.connect(ConnectOpts::new()).unwrap();
     exec_turso(&conn, &db, "PRAGMA journal_mode = 'mvcc'");
     exec_turso(&conn, &db, "PRAGMA mvcc_checkpoint_threshold = -1");
     exec_turso(&conn, &db, "PRAGMA synchronous = FULL");
@@ -423,8 +421,7 @@ fn bench_create_index_commit(criterion: &mut Criterion) {
 #[cfg(not(feature = "codspeed"))]
 criterion_group! {
     name = create_index_benches;
-    config = Criterion::default()
-        .with_profiler(PProfProfiler::new(100, Output::Flamegraph(None)));
+    config = Criterion::default();
     targets = bench_create_index
 }
 

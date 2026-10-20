@@ -1,0 +1,65 @@
+@database :memory:
+@requires-file materialized_views ""
+@skip-file-if mvcc "materialized_views not supported with mvcc"
+
+# No @verify-materialized-views here: its invariant check re-runs a view's
+# stored SQL as an ordinary top-level query, which (correctly, for a plain
+# query) resolves an unqualified name through TEMP first. That is exactly the
+# resolution this test is checking a materialized view must NOT use for its
+# own source table, so the verifier's own comparison would flag the fix
+# itself as a mismatch.
+#
+# Reproducer for #9456: a materialized view's unqualified source-table name
+# must resolve within its own database (main), the same way SQLite pins a
+# plain view's unqualified names to the database it was created in. Without
+# this, an unqualified "FROM t" resolved like an ordinary top-level query
+# (temp first), so once a same-named TEMP table existed, the view's backing
+# BTreeTable came from the temp schema while the engine still opened it
+# against the main database file: whatever page that table's root page
+# number happened to land on in main, which returned the wrong rows (often
+# none at all - hence "returns zero rows from creation").
+test matview-over-table-shadowed-by-temp-returns-main-rows-at-creation {
+    CREATE TABLE padding1(x INTEGER);
+    CREATE TABLE padding2(x INTEGER);
+    CREATE TABLE t(id INTEGER, val TEXT);
+    INSERT INTO t VALUES (1, 'main-row');
+    CREATE TEMP TABLE t(id INTEGER, val TEXT);
+    INSERT INTO t VALUES (2, 'temp-row');
+    CREATE MATERIALIZED VIEW mv AS SELECT * FROM t;
+    SELECT * FROM mv;
+}
+expect {
+    1|main-row
+}
+
+# Maintenance (not just the initial backfill) must keep resolving "t" to
+# main.t even though an unqualified, direct "t" now means the temp table.
+test matview-over-table-shadowed-by-temp-maintains-against-main-rows {
+    CREATE TABLE padding1(x INTEGER);
+    CREATE TABLE padding2(x INTEGER);
+    CREATE TABLE t(id INTEGER, val TEXT);
+    CREATE TEMP TABLE t(id INTEGER, val TEXT);
+    INSERT INTO t VALUES (2, 'temp-row');
+    CREATE MATERIALIZED VIEW mv AS SELECT * FROM t;
+    INSERT INTO main.t VALUES (1, 'main-row');
+    UPDATE main.t SET val = 'main-row-updated' WHERE id = 1;
+    SELECT * FROM mv ORDER BY id;
+    SELECT 'direct unqualified t still resolves to temp:';
+    SELECT * FROM t;
+}
+expect {
+    1|main-row-updated
+    direct unqualified t still resolves to temp:
+    2|temp-row
+}
+
+# A materialized view explicitly qualifying a source table in another
+# database is rejected outright, matching SQLite's rule that a persistent
+# view cannot reference objects in a different database.
+test matview-rejects-explicit-temp-qualified-source {
+    CREATE TEMP TABLE t(id INTEGER);
+    CREATE MATERIALIZED VIEW mv AS SELECT * FROM temp.t;
+}
+expect error {
+    view cannot reference table in attached database
+}

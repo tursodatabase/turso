@@ -2,7 +2,7 @@ use super::{get_rows, FixedYieldInjector, MvccTestDbNoConn};
 use crate::mvcc::database::{CommitCoordinator, CommitYieldPoint, GroupWork, LogRecord};
 use crate::mvcc::yield_hooks::YieldPointMarker;
 use crate::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use crate::{Connection, Database, LimboError, StepResult, Value};
+use crate::{ConnectOpts, Connection, Database, LimboError, StepResult, SyncMode, Value};
 use std::sync::{Arc, Barrier};
 use std::time::{Duration, Instant};
 
@@ -60,7 +60,7 @@ fn group_commit_pragma_is_store_wide() {
 fn group_commit_pragma_needs_mvcc() {
     let io = Arc::new(crate::io::MemoryIO::new());
     let db = Database::open_file(io, ":memory:", Arc::new(crate::SqliteDialect)).unwrap();
-    let conn = db.connect().unwrap();
+    let conn = db.connect(ConnectOpts::new()).unwrap();
 
     let err = conn
         .execute("PRAGMA mvcc_group_commit = yes")
@@ -225,7 +225,7 @@ fn batched_records_survive_a_restart() {
                 let shared = shared.clone();
                 let barrier = barrier.clone();
                 std::thread::spawn(move || {
-                    let conn = shared.connect().unwrap();
+                    let conn = shared.connect(ConnectOpts::new()).unwrap();
                     for round in 0..rounds {
                         let pk = (round * WRITERS + writer) as i64;
                         conn.execute("BEGIN CONCURRENT").unwrap();
@@ -257,8 +257,8 @@ fn empty_record(end_ts: u64) -> LogRecord {
 #[test]
 fn requeued_records_go_back_in_ticket_order() {
     let coordinator = CommitCoordinator::new();
-    let first = coordinator.enqueue(1, empty_record(10));
-    let second = coordinator.enqueue(2, empty_record(20));
+    let first = coordinator.enqueue(1, empty_record(10), SyncMode::Full);
+    let second = coordinator.enqueue(2, empty_record(20), SyncMode::Full);
 
     let batch = coordinator.take_pending();
     assert_eq!(
@@ -266,7 +266,7 @@ fn requeued_records_go_back_in_ticket_order() {
         vec![first, second]
     );
 
-    let latecomer = coordinator.enqueue(3, empty_record(30));
+    let latecomer = coordinator.enqueue(3, empty_record(30), SyncMode::Full);
     coordinator.requeue(batch.into_iter());
     assert_eq!(
         coordinator
@@ -282,10 +282,10 @@ fn requeued_records_go_back_in_ticket_order() {
 fn drop_pending_only_removes_queued_records() {
     let coordinator = CommitCoordinator::new();
 
-    let queued = coordinator.enqueue(1, empty_record(10));
+    let queued = coordinator.enqueue(1, empty_record(10), SyncMode::Full);
     assert!(coordinator.drop_pending(queued));
 
-    let claimed = coordinator.enqueue(2, empty_record(20));
+    let claimed = coordinator.enqueue(2, empty_record(20), SyncMode::Full);
     let _batch = coordinator.take_pending();
     assert!(
         !coordinator.drop_pending(claimed),
@@ -305,8 +305,8 @@ fn durability_watermark_only_moves_forward() {
 #[test]
 fn failed_leader_does_not_publish_unsynced_prefix() {
     let coordinator = CommitCoordinator::new();
-    let first = coordinator.enqueue(1, empty_record(10));
-    let second = coordinator.enqueue(2, empty_record(20));
+    let first = coordinator.enqueue(1, empty_record(10), SyncMode::Full);
+    let second = coordinator.enqueue(2, empty_record(20), SyncMode::Full);
     let mut batch = coordinator.take_pending();
     let writing = batch.pop_front().unwrap();
     assert_eq!(writing.ticket, first);
@@ -331,9 +331,9 @@ fn failed_leader_does_not_publish_unsynced_prefix() {
 #[test]
 fn failed_mid_batch_leader_does_not_cover_retry_hole() {
     let coordinator = CommitCoordinator::new();
-    let t2 = coordinator.enqueue(2, empty_record(20));
-    let t3 = coordinator.enqueue(3, empty_record(30));
-    let t4 = coordinator.enqueue(4, empty_record(40));
+    let t2 = coordinator.enqueue(2, empty_record(20), SyncMode::Full);
+    let t3 = coordinator.enqueue(3, empty_record(30), SyncMode::Full);
+    let t4 = coordinator.enqueue(4, empty_record(40), SyncMode::Full);
     assert_eq!((t2, t3, t4), (1, 2, 3));
 
     let mut batch = coordinator.take_pending();
@@ -375,16 +375,16 @@ fn step_until_yield_or_done(stmt: &mut crate::Statement) -> StepResult {
 }
 
 #[test]
-fn dropped_commit_after_log_record_is_owned_still_commits() {
-    dropped_after_own_still_commits(true);
+fn dropped_commit_after_log_record_is_written_still_commits() {
+    dropped_after_log_record_written_still_commits(true);
 }
 
 #[test]
-fn dropped_commit_after_log_record_is_owned_still_commits_without_group() {
-    dropped_after_own_still_commits(false);
+fn dropped_commit_after_log_record_is_written_still_commits_without_group() {
+    dropped_after_log_record_written_still_commits(false);
 }
 
-fn dropped_after_own_still_commits(group_commit: bool) {
+fn dropped_after_log_record_written_still_commits(group_commit: bool) {
     let db = MvccTestDbNoConn::new_with_random_db();
     let conn = db.connect();
     conn.execute("CREATE TABLE t (pk INTEGER PRIMARY KEY, v INTEGER)")
@@ -396,7 +396,7 @@ fn dropped_after_own_still_commits(group_commit: bool) {
     conn.execute("BEGIN CONCURRENT").unwrap();
     conn.execute("INSERT INTO t VALUES (1, 1)").unwrap();
     conn.set_yield_injector(Some(FixedYieldInjector::new([
-        CommitYieldPoint::LogicalLogOwned.point(),
+        CommitYieldPoint::LogRecordMarkedWritten.point(),
     ])));
 
     {
@@ -414,6 +414,102 @@ fn dropped_after_own_still_commits(group_commit: bool) {
 
     let rows = get_rows(&conn, "SELECT pk FROM t");
     assert_eq!(rows, vec![vec![Value::from_i64(1)]]);
+}
+
+fn step_until_done(stmt: &mut crate::Statement) {
+    for _ in 0..10_000 {
+        match stmt.step().unwrap() {
+            StepResult::Done => return,
+            StepResult::IO | StepResult::Yield => continue,
+            other => panic!("COMMIT ended with {other:?}"),
+        }
+    }
+    panic!("statement never finished")
+}
+
+#[test]
+fn commit_parks_once_while_another_transaction_holds_the_commit_lock() {
+    let db = MvccTestDbNoConn::new_with_random_db();
+    let conn = db.connect();
+    conn.execute("CREATE TABLE t (pk INTEGER PRIMARY KEY, v INTEGER)")
+        .unwrap();
+    conn.execute("PRAGMA mvcc_group_commit = yes").unwrap();
+    conn.execute("BEGIN CONCURRENT").unwrap();
+    conn.execute("INSERT INTO t VALUES (1, 1)").unwrap();
+
+    let store = db.get_mvcc_store();
+    let coordinator = &store.commit_coordinator;
+    assert!(coordinator.pager_commit_lock.write());
+
+    let mut commit = conn.prepare("COMMIT").unwrap();
+    assert!(matches!(commit.step().unwrap(), StepResult::IO));
+    assert_eq!(coordinator.parked_tickets().len(), 1);
+    assert_eq!(coordinator.park_calls(), 1);
+    for _ in 0..100 {
+        assert!(matches!(commit.step().unwrap(), StepResult::IO));
+    }
+    assert_eq!(
+        coordinator.park_calls(),
+        1,
+        "a parked commit must not re-run its wait step until it is woken"
+    );
+
+    coordinator.unlock_pager_commit_lock();
+    assert!(
+        coordinator.parked_tickets().is_empty(),
+        "releasing the commit lock wakes every parked commit"
+    );
+    step_until_done(&mut commit);
+    assert_eq!(
+        get_rows(&conn, "SELECT pk FROM t"),
+        vec![vec![Value::from_i64(1)]]
+    );
+}
+
+#[test]
+fn parked_waiter_wakes_when_the_leader_makes_it_durable() {
+    let db = MvccTestDbNoConn::new_with_random_db();
+    let setup = db.connect();
+    setup
+        .execute("CREATE TABLE t (pk INTEGER PRIMARY KEY, v INTEGER)")
+        .unwrap();
+    setup.execute("PRAGMA mvcc_group_commit = yes").unwrap();
+    setup.close().unwrap();
+
+    let conn_a = db.connect();
+    let conn_b = db.connect();
+    conn_a.execute("BEGIN CONCURRENT").unwrap();
+    conn_b.execute("BEGIN CONCURRENT").unwrap();
+    conn_a.execute("INSERT INTO t VALUES (1, 1)").unwrap();
+    conn_b.execute("INSERT INTO t VALUES (2, 1)").unwrap();
+
+    let store = db.get_mvcc_store();
+    let coordinator = &store.commit_coordinator;
+    assert!(coordinator.pager_commit_lock.write());
+
+    let mut commit_a = conn_a.prepare("COMMIT").unwrap();
+    let mut commit_b = conn_b.prepare("COMMIT").unwrap();
+    assert!(matches!(commit_a.step().unwrap(), StepResult::IO));
+    assert!(matches!(commit_b.step().unwrap(), StepResult::IO));
+    assert_eq!(coordinator.parked_tickets().len(), 2);
+
+    coordinator.unlock_pager_commit_lock();
+    step_until_done(&mut commit_a);
+    assert!(
+        store.last_group_commit_size() >= 2,
+        "the leader must write the waiter's record in its batch"
+    );
+    assert!(
+        coordinator.parked_tickets().is_empty(),
+        "the leader making the batch durable wakes the waiter"
+    );
+    step_until_done(&mut commit_b);
+
+    let reader = db.connect();
+    assert_eq!(
+        get_rows(&reader, "SELECT pk FROM t ORDER BY pk"),
+        vec![vec![Value::from_i64(1)], vec![Value::from_i64(2)]]
+    );
 }
 
 #[test]
@@ -459,8 +555,11 @@ fn dropped_waiter_after_log_tx_still_commits() {
     ])));
 
     let store = db.get_mvcc_store();
-    let lock = &store.commit_coordinator.pager_commit_lock;
-    assert!(lock.write(), "hold the commit lock so both enqueue");
+    let coordinator = &store.commit_coordinator;
+    assert!(
+        coordinator.pager_commit_lock.write(),
+        "hold the commit lock so both enqueue"
+    );
 
     let mut commit_a = conn_a.prepare("COMMIT").unwrap();
     let mut commit_b = conn_b.prepare("COMMIT").unwrap();
@@ -472,16 +571,15 @@ fn dropped_waiter_after_log_tx_still_commits() {
         step_until_yield_or_done(&mut commit_b),
         StepResult::Yield
     ));
-    assert!(matches!(
-        step_until_yield_or_done(&mut commit_a),
-        StepResult::Yield
-    ));
-    assert!(matches!(
-        step_until_yield_or_done(&mut commit_b),
-        StepResult::Yield
-    ));
+    assert!(matches!(commit_a.step().unwrap(), StepResult::IO));
+    assert!(matches!(commit_b.step().unwrap(), StepResult::IO));
+    assert_eq!(
+        coordinator.parked_tickets().len(),
+        2,
+        "both commits park on the held lock"
+    );
 
-    lock.unlock();
+    coordinator.unlock_pager_commit_lock();
 
     assert!(
         matches!(step_until_yield_or_done(&mut commit_a), StepResult::Yield),

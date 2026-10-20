@@ -38,7 +38,7 @@ use crate::{
         DatabaseRowTransformResult, DatabaseSchemaKind, DatabaseSchemaReplay,
         DatabaseStatementReplay, DatabaseSyncEngineProtocolVersion, DatabaseTapeOperation,
         DatabaseTapeRowChange, DatabaseTapeRowChangeType, DbSyncInfo, DbSyncStatus,
-        PartialBootstrapStrategy, PartialSyncOpts, RemotePullProtocol, SyncEngineIoResult,
+        PartialBootstrapStrategy, PartialSyncOpts, RemotePullProtocol, Secret, SyncEngineIoResult,
     },
     wal_session::WalSession,
     Result,
@@ -806,7 +806,7 @@ pub struct SyncOperationCtx<'a, IO: SyncEngineIo, Ctx> {
     // optional remote url set in the saved configuration section of metadata file
     pub remote_url: Option<String>,
     // optional remote encryption key for the encrypted Turso Cloud databases, base64 encoded
-    pub remote_encryption_key: Option<String>,
+    pub remote_encryption_key: Option<Secret>,
 }
 
 impl<'a, IO: SyncEngineIo, Ctx> SyncOperationCtx<'a, IO, Ctx> {
@@ -816,13 +816,13 @@ impl<'a, IO: SyncEngineIo, Ctx> SyncOperationCtx<'a, IO, Ctx> {
         coro: &'a Coro<Ctx>,
         io: &'a SyncEngineIoStats<IO>,
         remote_url: Option<String>,
-        remote_encryption_key: Option<&str>,
+        remote_encryption_key: Option<&Secret>,
     ) -> Self {
         Self {
             coro,
             io,
             remote_url: remote_url.map(|x| x.to_string()),
-            remote_encryption_key: remote_encryption_key.map(|k| k.to_string()),
+            remote_encryption_key: remote_encryption_key.cloned(),
         }
     }
     pub fn http(
@@ -835,7 +835,7 @@ impl<'a, IO: SyncEngineIo, Ctx> SyncOperationCtx<'a, IO, Ctx> {
         let encryption_header = self
             .remote_encryption_key
             .as_ref()
-            .map(|key| (ENCRYPTION_KEY_HEADER, key.as_str()));
+            .map(|key| (ENCRYPTION_KEY_HEADER, key.expose()));
 
         let all_headers: Vec<_> = headers.iter().copied().chain(encryption_header).collect();
 
@@ -1252,27 +1252,47 @@ fn append_schema_ops(
     deltas: BTreeMap<i64, SchemaRowDelta>,
     ops: &mut Vec<LogicalOp>,
 ) -> Result<()> {
+    let mut drops = Vec::new();
+    let mut table_refreshes_and_creates = Vec::new();
+    let mut non_table_creates = Vec::new();
     for delta in deltas.into_values() {
-        match (delta.old, delta.new) {
-            (Some(old), Some(new)) => {
-                if is_logically_replayable_table(&old.name) {
-                    ops.push(schema_logical_op(&new, LogicalSchemaAction::Refresh)?);
-                }
-            }
-            (None, Some(new)) => {
-                if is_logically_replayable_table(&new.name) {
-                    ops.push(schema_logical_op(&new, LogicalSchemaAction::Create)?);
-                }
-            }
-            (Some(old), None) => {
-                if is_logically_replayable_table(&old.name) {
-                    ops.push(schema_logical_op(&old, LogicalSchemaAction::Drop)?);
-                }
-            }
+        let old = delta
+            .old
+            .filter(|row| is_logically_replayable_table(&row.name));
+        let new = delta
+            .new
+            .filter(|row| is_logically_replayable_table(&row.name));
+        match (old, new) {
             (None, None) => {}
+            (None, Some(new)) if is_table(&new) => table_refreshes_and_creates
+                .push(schema_logical_op(&new, LogicalSchemaAction::Create)?),
+            (None, Some(new)) => {
+                non_table_creates.push(schema_logical_op(&new, LogicalSchemaAction::Create)?)
+            }
+            (Some(old), None) => drops.push(schema_logical_op(&old, LogicalSchemaAction::Drop)?),
+            (Some(old), Some(new)) if !old.row_type.eq_ignore_ascii_case(&new.row_type) => {
+                return Err(Error::DatabaseSyncEngineError(format!(
+                    "schema row {} changed type from '{}' to '{}'",
+                    new.name, old.row_type, new.row_type
+                )));
+            }
+            (Some(_), Some(new)) if is_table(&new) => table_refreshes_and_creates
+                .push(schema_logical_op(&new, LogicalSchemaAction::Refresh)?),
+            (Some(old), Some(new)) => {
+                drops.push(schema_logical_op(&old, LogicalSchemaAction::Drop)?);
+                non_table_creates.push(schema_logical_op(&new, LogicalSchemaAction::Create)?);
+            }
         }
     }
+    ops.extend(drops);
+    ops.extend(table_refreshes_and_creates);
+    // these may depend on new or altered tables, so we emit them after all tables have been updated
+    ops.extend(non_table_creates);
     Ok(())
+}
+
+fn is_table(row: &DecodedSchemaRow) -> bool {
+    row.row_type.eq_ignore_ascii_case("table")
 }
 
 fn decode_update_header_op(payload: &[u8]) -> Result<LogicalOp> {
@@ -1439,21 +1459,40 @@ fn decode_recovery_ops_to_logical_txn(
 
     let mut ops = header_ops;
     append_schema_ops(schema_deltas, &mut ops)?;
-    // Every row delete in a transaction is applied before every row upsert.
+    // Sort row_ops so that deletes appear before upserts.
     //
-    // MVCC coalesces a transaction to one final version per rowid, and a row
-    // whose primary key changed arrives as a delete of its old key followed by
-    // an upsert of its new image. Applying those pairs row by row breaks as soon
-    // as two rows exchange keys inside one transaction: the second row's delete
-    // targets the key the first row's upsert just took, so it removes the row
-    // that was just written and the replica silently ends up one row short.
+    // We do this because we replay upserts using the PK as the conflict target, but the logical log
+    // emits upserts using rowid as the conflict target. Replaying ops in order could therefore
+    // diverge from the source DB. Consider the following schema and tx:
     //
-    // Draining the deletes first applies the transaction as a set difference,
-    // which is also what lets both upserts land without tripping the unique
-    // index on an intermediate state — the remote needed a temporary key to make
-    // the same swap statement by statement. A rowid appears at most once per
-    // coalesced transaction, so no upsert can depend on a delete of its own row
-    // running later.
+    // CREATE TABLE t(a PRIMARY KEY, b);
+    // -- table: [(1, 1), (2, 2)]
+    //
+    // BEGIN;
+    // UPDATE t SET a = 3 WHERE a = 2;
+    // UPDATE t SET a = 2 WHERE a = 1;
+    // COMMIT;
+    // -- table: [(2, 1), (3, 2)]
+    //
+    // The logical log for this transaction contains:
+    //   1. delete rowid 1, key a = 1
+    //   2. upsert rowid 1, (2, 1)
+    //   3. delete rowid 2, key a = 2
+    //   4. upsert rowid 2, (3, 2)
+    //
+    // Replaying these by primary key, in this order, would then give:
+    //   1. delete a = 1    -- [(2, 2)]
+    //   2. upsert (2, 1)   -- [(2, 1)]  the database upserted using the rowid, but we upsert using
+    //                                   the PK, so we would end up overwriting the wrong row!
+    //   3. delete a = 2    -- []        deletes the row from step 2!
+    //   4. upsert (3, 2)   -- [(3, 2)]
+    //
+    // The state of the table at step 4 would now be inconsistent with the original transaction. But
+    // if we issue all deletes first, we're consistent with the source:
+    //   1. delete a = 1    -- [(2, 2)]
+    //   2. delete a = 2    -- []
+    //   3. upsert (2, 1)   -- [(2, 1)]
+    //   4. upsert (3, 2)   -- [(2, 1), (3, 2)]
     let (row_deletes, row_upserts): (Vec<_>, Vec<_>) = row_ops
         .into_iter()
         .partition(|op| op.op_type == LogicalOpType::DeleteRow as i32);
@@ -4000,7 +4039,7 @@ mod tests {
         types::{
             parse_bin_record, Coro, DatabasePullRevision, DatabaseRowMutation,
             DatabaseRowTransformResult, DatabaseSchemaReplay, DatabaseTapeOperation,
-            DatabaseTapeRowChange, DatabaseTapeRowChangeType,
+            DatabaseTapeRowChange, DatabaseTapeRowChangeType, Secret,
         },
         Result,
     };
@@ -5167,7 +5206,7 @@ mod tests {
                     &coro,
                     &stats,
                     Some("https://example.com".to_string()),
-                    Some("dGVzdC1lbmNyeXB0aW9uLWtleQ=="),
+                    Some(&Secret::new("dGVzdC1lbmNyeXB0aW9uLWtleQ==")),
                 );
                 let err = pull_updates_v1(&ctx, &file, "g1:o40", None, true)
                     .await

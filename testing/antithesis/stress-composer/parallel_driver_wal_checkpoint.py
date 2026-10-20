@@ -27,10 +27,26 @@ try:
     # checkpointed is frames successfully checkpointed
     if row is not None:
         busy, log, checkpointed = row
-        always(busy in (0, 1), f"wal_checkpoint returned unexpected busy value: {busy}", {})
-        always(log >= 0, f"wal_checkpoint returned negative log value: {log}", {})
-        always(checkpointed >= 0, f"wal_checkpoint returned negative checkpointed value: {checkpointed}", {})
-        always(checkpointed <= log, f"checkpointed ({checkpointed}) > log ({log})", {})
+        always(
+            busy in (0, 1),
+            "wal_checkpoint returned unexpected busy value",
+            {"busy": busy},
+        )
+        always(
+            log >= 0,
+            "wal_checkpoint returned negative log value",
+            {"log": log},
+        )
+        always(
+            checkpointed >= 0,
+            "wal_checkpoint returned negative checkpointed value",
+            {"checkpointed": checkpointed},
+        )
+        always(
+            checkpointed <= log,
+            "wal_checkpoint returned checkpointed value greater than log value",
+            {"checkpointed": checkpointed, "log": log},
+        )
         print(f"wal_checkpoint result: busy={busy}, log={log}, checkpointed={checkpointed}")
     else:
         print("wal_checkpoint returned no result (database may not be in WAL mode)")

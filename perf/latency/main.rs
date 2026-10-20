@@ -183,6 +183,13 @@ struct Args {
     checkpointer: u64,
 
     #[arg(
+        long = "no-group-commit",
+        help = "Turn off Turso MVCC group commit, so every transaction writes and syncs the \
+                logical log on its own. SQLite ignores this"
+    )]
+    no_group_commit: bool,
+
+    #[arg(
         long = "run",
         default_value = "1",
         help = "Number of this run among repeats of the same configuration; it names the \
@@ -247,6 +254,7 @@ pub struct Config {
     /// Interval of the separate checkpointer connection, or `None` to let
     /// the writer auto-checkpoint on its commit path.
     pub checkpointer: Option<Duration>,
+    pub group_commit: bool,
     pub rate: f64,
     pub arrivals: Arrivals,
     pub seed: u64,
@@ -428,6 +436,7 @@ fn main() {
         checkpoint_mode: args.checkpoint_mode,
         mvcc_checkpoint_threshold: args.mvcc_checkpoint_threshold,
         checkpointer: (args.checkpointer > 0).then(|| Duration::from_millis(args.checkpointer)),
+        group_commit: !args.no_group_commit,
         rate: args.rate,
         arrivals: args.arrivals,
         seed: args.seed,

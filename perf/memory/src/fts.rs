@@ -6,6 +6,7 @@ use std::fmt::Write;
 use std::sync::Arc;
 use tempfile::TempDir;
 use turso::{Connection, Database};
+use turso_core::ConnectOpts;
 use turso_core::IO;
 
 use crate::workload::JournalMode;
@@ -163,6 +164,10 @@ impl FtsWorkload {
             workload.batch(1).await?;
         }
         Ok(workload)
+    }
+
+    pub fn sessions(&self) -> &[QuerySession] {
+        &self.sessions
     }
 
     pub async fn run(&self, observer: &mut dyn FtsObserver) -> Result<RunResult> {
@@ -351,20 +356,12 @@ impl FtsFixture {
                 .prepare("INSERT INTO docs VALUES (?1, ?2, ?3)")
                 .await?;
             for id in start..documents.min(start + 500) {
-                let rare = if id % 100 == 0 { "rare" } else { "plain" };
-                let alpha = if id % 2 == 0 { "alpha" } else { "gamma" };
-                let beta = if id % 3 == 0 { "beta" } else { "delta" };
-                let prefix = if id % 200 == 100 {
-                    "rare common".to_string()
-                } else {
-                    format!("common {rare}")
-                };
-                let mut body = format!("{prefix} {alpha} {beta} search document storage text");
+                let (title, mut body) = document(id);
                 for _ in 0..corpus.extra_tokens {
                     write!(body, " x{:016x}", rng.next_u64())?;
                 }
                 insert
-                    .execute(turso::params![id as i64, format!("document {id:08}"), body])
+                    .execute(turso::params![id as i64, title, body])
                     .await?;
             }
             session.conn.execute("COMMIT", ()).await?;
@@ -387,7 +384,7 @@ impl FtsFixture {
             turso_core::OpenOptions::new(Arc::new(turso_core::SqliteDialect))
                 .db_opts(turso_core::DatabaseOpts::new().with_index_method(true)),
         )?;
-        let conn = db.connect()?;
+        let conn = db.connect(ConnectOpts::new())?;
         conn.execute("BEGIN")?;
         conn.execute("SELECT count(*) FROM docs")?;
         let mut dumper = turso_core::index_method::fts::FtsBackingRowDumper::new(
@@ -520,6 +517,21 @@ impl QueryCase {
             }
         }
     }
+}
+
+pub fn document(id: usize) -> (String, String) {
+    let rare = if id % 100 == 0 { "rare" } else { "plain" };
+    let alpha = if id % 2 == 0 { "alpha" } else { "gamma" };
+    let beta = if id % 3 == 0 { "beta" } else { "delta" };
+    let prefix = if id % 200 == 100 {
+        "rare common".to_string()
+    } else {
+        format!("common {rare}")
+    };
+    (
+        format!("document {id:08}"),
+        format!("{prefix} {alpha} {beta} search document storage text"),
+    )
 }
 
 #[cfg(test)]

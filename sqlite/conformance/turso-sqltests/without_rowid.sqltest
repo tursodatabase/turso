@@ -19,6 +19,17 @@ expect error {
     UNIQUE constraint failed
 }
 
+test without-rowid-join-does-not-use-a-hash-join {
+    CREATE TABLE left_table(k1 INTEGER, k2 INTEGER, PRIMARY KEY(k2, k1)) WITHOUT ROWID;
+    CREATE TABLE right_table(k1 INTEGER, k2 INTEGER, PRIMARY KEY(k2, k1)) WITHOUT ROWID;
+    INSERT INTO left_table SELECT value, value % 23 FROM generate_series(1, 200);
+    INSERT INTO right_table SELECT value, value % 23 FROM generate_series(1, 220);
+    SELECT count(*) FROM left_table JOIN right_table ON left_table.k1 = right_table.k1;
+}
+expect {
+    200
+}
+
 test without-rowid-missing-primary-key-rejected {
     CREATE TABLE t(a INTEGER, b TEXT) WITHOUT ROWID;
 }

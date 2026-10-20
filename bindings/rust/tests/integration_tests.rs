@@ -1103,6 +1103,144 @@ async fn test_prepare_cached_reprepare_on_query_only_change() {
 }
 
 #[tokio::test]
+async fn test_drop_column_after_schema_change_in_txn_with_live_index_statement() {
+    let db = Builder::new_local(":memory:").build().await.unwrap();
+    let conn = db.connect().unwrap();
+    conn.execute("CREATE TABLE t (a TEXT, other TEXT, b TEXT)", ())
+        .await
+        .unwrap();
+    conn.execute("CREATE INDEX t_b ON t(b)", ()).await.unwrap();
+    conn.execute("INSERT INTO t VALUES ('a0', 'discard', 'b0')", ())
+        .await
+        .unwrap();
+
+    conn.execute("BEGIN", ()).await.unwrap();
+    conn.execute("ALTER TABLE t ADD COLUMN extra TEXT", ())
+        .await
+        .unwrap();
+    let mut select = conn.prepare("SELECT a FROM t WHERE b = ?1").await.unwrap();
+    let mut rows = select.query(["b0"]).await.unwrap();
+    while rows.next().await.unwrap().is_some() {}
+    drop(rows);
+
+    conn.execute("ALTER TABLE t DROP COLUMN other", ())
+        .await
+        .unwrap();
+
+    let mut rows = select.query(["b0"]).await.unwrap();
+    let row = rows.next().await.unwrap().unwrap();
+    assert_eq!(row.get::<String>(0).unwrap(), "a0");
+    drop(rows);
+    drop(select);
+    conn.execute("COMMIT", ()).await.unwrap();
+
+    assert_eq!(
+        collect_values(&conn, "SELECT * FROM t").await,
+        vec![vec![
+            Value::Text("a0".into()),
+            Value::Text("b0".into()),
+            Value::Null
+        ]]
+    );
+    assert_eq!(
+        collect_values(&conn, "SELECT a FROM t WHERE b = 'b0'").await,
+        vec![vec![Value::Text("a0".into())]]
+    );
+    assert_eq!(
+        collect_values(&conn, "PRAGMA integrity_check").await,
+        vec![vec![Value::Text("ok".into())]]
+    );
+}
+
+#[tokio::test]
+async fn test_drop_column_after_schema_change_in_txn_with_cached_index_statement() {
+    let db = Builder::new_local(":memory:").build().await.unwrap();
+    let conn = db.connect().unwrap();
+    conn.execute("CREATE TABLE t (a TEXT, other TEXT, b TEXT)", ())
+        .await
+        .unwrap();
+    conn.execute("CREATE INDEX t_b ON t(b)", ()).await.unwrap();
+    conn.execute("INSERT INTO t VALUES ('a0', 'discard', 'b0')", ())
+        .await
+        .unwrap();
+
+    conn.execute("BEGIN", ()).await.unwrap();
+    conn.execute("CREATE TABLE unrelated (x TEXT)", ())
+        .await
+        .unwrap();
+    {
+        let mut select = conn
+            .prepare_cached("SELECT a FROM t WHERE b = ?1")
+            .await
+            .unwrap();
+        let mut rows = select.query(["b0"]).await.unwrap();
+        while rows.next().await.unwrap().is_some() {}
+    }
+
+    conn.execute("ALTER TABLE t DROP COLUMN other", ())
+        .await
+        .unwrap();
+    conn.execute("COMMIT", ()).await.unwrap();
+
+    assert_eq!(
+        collect_values(&conn, "SELECT * FROM t").await,
+        vec![vec![Value::Text("a0".into()), Value::Text("b0".into())]]
+    );
+    assert_eq!(
+        collect_values(&conn, "SELECT a FROM t WHERE b = 'b0'").await,
+        vec![vec![Value::Text("a0".into())]]
+    );
+    assert_eq!(
+        collect_values(&conn, "PRAGMA integrity_check").await,
+        vec![vec![Value::Text("ok".into())]]
+    );
+}
+
+#[tokio::test]
+async fn test_drop_column_after_schema_change_in_txn_with_live_upsert_statement() {
+    let db = Builder::new_local(":memory:").build().await.unwrap();
+    let conn = db.connect().unwrap();
+    conn.execute(
+        "CREATE TABLE t (id TEXT PRIMARY KEY, other TEXT, v TEXT)",
+        (),
+    )
+    .await
+    .unwrap();
+
+    conn.execute("BEGIN", ()).await.unwrap();
+    conn.execute("ALTER TABLE t ADD COLUMN extra TEXT", ())
+        .await
+        .unwrap();
+    let mut upsert = conn
+        .prepare(
+            "INSERT INTO t (id, v) VALUES (?1, ?2) ON CONFLICT(id) DO UPDATE SET v = excluded.v",
+        )
+        .await
+        .unwrap();
+    upsert.execute(["k", "v0"]).await.unwrap();
+
+    conn.execute("ALTER TABLE t DROP COLUMN other", ())
+        .await
+        .unwrap();
+    upsert.execute(["k", "v1"]).await.unwrap();
+    drop(upsert);
+    conn.execute("COMMIT", ()).await.unwrap();
+
+    assert_eq!(
+        collect_values(&conn, "SELECT * FROM t").await,
+        vec![vec![
+            Value::Text("k".into()),
+            Value::Text("v1".into()),
+            Value::Null
+        ]]
+    );
+    assert_eq!(
+        collect_values(&conn, "PRAGMA integrity_check").await,
+        vec![vec![Value::Text("ok".into())]]
+    );
+}
+
+#[tokio::test]
 async fn test_prepare_cached_batch_insert_delete_pattern() {
     #[derive(Clone)]
     struct Host {
@@ -1804,6 +1942,149 @@ async fn query_i64(conn: &turso::Connection, sql: &str) -> i64 {
     let mut rows = conn.query(sql, ()).await.unwrap();
     let row = rows.next().await.unwrap().unwrap();
     row.get::<i64>(0).unwrap()
+}
+
+#[tokio::test]
+async fn test_mvcc_reopen_rollback_does_not_reuse_restored_rowid() {
+    let dir = tempdir().unwrap();
+    let db_path = dir.path().join("mvcc-rowid-rollback.db");
+    let db_path = db_path.to_str().unwrap();
+
+    {
+        let db = Builder::new_local(db_path).build().await.unwrap();
+        let conn = db.connect().unwrap();
+        drain_query(&conn, "PRAGMA journal_mode = 'mvcc'").await;
+        conn.execute("CREATE TABLE t (value TEXT UNIQUE)", ())
+            .await
+            .unwrap();
+        conn.execute("INSERT INTO t VALUES ('one'), ('two'), ('three')", ())
+            .await
+            .unwrap();
+        drain_query(&conn, "PRAGMA wal_checkpoint(TRUNCATE)").await;
+    }
+
+    {
+        let db = Builder::new_local(db_path).build().await.unwrap();
+        let conn = db.connect().unwrap();
+        conn.execute("PRAGMA data_sync_retry = 1", ())
+            .await
+            .unwrap();
+        conn.execute("BEGIN CONCURRENT", ()).await.unwrap();
+        conn.execute("DELETE FROM t WHERE rowid IN (2, 3)", ())
+            .await
+            .unwrap();
+        assert!(matches!(
+            conn.execute("INSERT INTO t VALUES ('one')", ()).await,
+            Err(Error::Constraint(_))
+        ));
+        conn.execute("ROLLBACK", ()).await.unwrap();
+        conn.execute("INSERT INTO t VALUES ('four')", ())
+            .await
+            .unwrap();
+
+        assert_eq!(
+            collect_values(
+                &conn,
+                "SELECT rowid, value FROM t NOT INDEXED ORDER BY rowid",
+            )
+            .await,
+            vec![
+                vec![Value::Integer(1), Value::Text("one".to_string())],
+                vec![Value::Integer(2), Value::Text("two".to_string())],
+                vec![Value::Integer(3), Value::Text("three".to_string())],
+                vec![Value::Integer(4), Value::Text("four".to_string())],
+            ]
+        );
+    }
+}
+
+#[tokio::test]
+async fn test_mvcc_savepoint_rollback_does_not_reuse_restored_rowid() {
+    let dir = tempdir().unwrap();
+    let db_path = dir.path().join("mvcc-savepoint-rowid-rollback.db");
+    let db_path = db_path.to_str().unwrap();
+
+    {
+        let db = Builder::new_local(db_path).build().await.unwrap();
+        let conn = db.connect().unwrap();
+        drain_query(&conn, "PRAGMA journal_mode = 'mvcc'").await;
+        conn.execute("CREATE TABLE t (value TEXT UNIQUE)", ())
+            .await
+            .unwrap();
+        conn.execute("INSERT INTO t VALUES ('one')", ())
+            .await
+            .unwrap();
+        conn.execute("INSERT INTO t VALUES ('two')", ())
+            .await
+            .unwrap();
+        conn.execute("INSERT INTO t VALUES ('three')", ())
+            .await
+            .unwrap();
+        drain_query(&conn, "PRAGMA wal_checkpoint(TRUNCATE)").await;
+    }
+
+    {
+        let db = Builder::new_local(db_path).build().await.unwrap();
+        let conn = db.connect().unwrap();
+        conn.execute("PRAGMA data_sync_retry = 1", ())
+            .await
+            .unwrap();
+        conn.execute("BEGIN CONCURRENT", ()).await.unwrap();
+        conn.execute("SAVEPOINT sp", ()).await.unwrap();
+        conn.execute("DELETE FROM t WHERE rowid = 3", ())
+            .await
+            .unwrap();
+        conn.execute("DELETE FROM t WHERE rowid = 2", ())
+            .await
+            .unwrap();
+        assert!(matches!(
+            conn.execute("INSERT INTO t VALUES ('one')", ()).await,
+            Err(Error::Constraint(_))
+        ));
+        conn.execute("ROLLBACK TO sp", ()).await.unwrap();
+        conn.execute("RELEASE sp", ()).await.unwrap();
+        conn.execute("INSERT INTO t VALUES ('four')", ())
+            .await
+            .unwrap();
+        conn.execute("COMMIT", ()).await.unwrap();
+        drain_query(&conn, "PRAGMA wal_checkpoint(TRUNCATE)").await;
+
+        assert_eq!(
+            collect_values(
+                &conn,
+                "SELECT rowid, value FROM t NOT INDEXED ORDER BY rowid"
+            )
+            .await,
+            vec![
+                vec![Value::Integer(1), Value::Text("one".to_string())],
+                vec![Value::Integer(2), Value::Text("two".to_string())],
+                vec![Value::Integer(3), Value::Text("three".to_string())],
+                vec![Value::Integer(4), Value::Text("four".to_string())],
+            ]
+        );
+        assert_eq!(
+            collect_values(&conn, "PRAGMA integrity_check").await,
+            vec![vec![Value::Text("ok".to_string())]]
+        );
+    }
+}
+
+async fn drain_query(conn: &turso::Connection, sql: &str) {
+    let mut rows = conn.query(sql, ()).await.unwrap();
+    while rows.next().await.unwrap().is_some() {}
+}
+
+async fn collect_values(conn: &turso::Connection, sql: &str) -> Vec<Vec<Value>> {
+    let mut rows = conn.query(sql, ()).await.unwrap();
+    let mut output = Vec::new();
+    while let Some(row) = rows.next().await.unwrap() {
+        let mut values = Vec::with_capacity(row.column_count());
+        for idx in 0..row.column_count() {
+            values.push(row.get_value(idx).unwrap());
+        }
+        output.push(values);
+    }
+    output
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]

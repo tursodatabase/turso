@@ -1,12 +1,13 @@
+use crate::assertions::NULL;
 use crate::common::{limbo_exec_rows, try_limbo_exec_rows, TempDatabase};
-use rusqlite::types::Value as RusqliteValue;
+use asserting::prelude::*;
 
 /// Test that uuid7_timestamp_ms returns NULL for empty blob input
 #[turso_macros::test]
 fn uuid7_timestamp_ms_empty_blob(tmp_db: TempDatabase) {
     let conn = tmp_db.connect_limbo();
     let result = limbo_exec_rows(&conn, "SELECT uuid7_timestamp_ms(X'')");
-    assert_eq!(result, vec![vec![RusqliteValue::Null]]);
+    assert_that!(result).is_equal_to(vec![row![NULL]]);
 }
 
 /// Test that uuid7_timestamp_ms returns NULL for non 16-byte blob
@@ -14,7 +15,7 @@ fn uuid7_timestamp_ms_empty_blob(tmp_db: TempDatabase) {
 fn uuid7_timestamp_ms_10_byte_blob(tmp_db: TempDatabase) {
     let conn = tmp_db.connect_limbo();
     let result = limbo_exec_rows(&conn, "SELECT uuid7_timestamp_ms(zeroblob(10))");
-    assert_eq!(result, vec![vec![RusqliteValue::Null]]);
+    assert_that!(result).is_equal_to(vec![row![NULL]]);
 }
 
 /// Test that uuid7_timestamp_ms returns NULL for invalid UUID string
@@ -22,7 +23,7 @@ fn uuid7_timestamp_ms_10_byte_blob(tmp_db: TempDatabase) {
 fn uuid7_timestamp_ms_invalid_string(tmp_db: TempDatabase) {
     let conn = tmp_db.connect_limbo();
     let result = limbo_exec_rows(&conn, "SELECT uuid7_timestamp_ms('not-a-uuid')");
-    assert_eq!(result, vec![vec![RusqliteValue::Null]]);
+    assert_that!(result).is_equal_to(vec![row![NULL]]);
 }
 
 /// Test that uuid7_timestamp_ms works with valid 16-byte blob from uuid7()
@@ -30,10 +31,7 @@ fn uuid7_timestamp_ms_invalid_string(tmp_db: TempDatabase) {
 fn uuid7_timestamp_ms_valid_blob(tmp_db: TempDatabase) {
     let conn = tmp_db.connect_limbo();
     let result = limbo_exec_rows(&conn, "SELECT typeof(uuid7_timestamp_ms(uuid7()))");
-    assert_eq!(
-        result,
-        vec![vec![RusqliteValue::Text("integer".to_string())]]
-    );
+    assert_that!(result).is_equal_to(vec![row!["integer"]]);
 }
 
 /// Test that uuid7_timestamp_ms correctly parses a known UUID7 string
@@ -45,7 +43,7 @@ fn uuid7_timestamp_ms_valid_string(tmp_db: TempDatabase) {
         &conn,
         "SELECT uuid7_timestamp_ms('01945ca0-3189-76c0-9a8f-caf310fc8b8e') / 1000",
     );
-    assert_eq!(result, vec![vec![RusqliteValue::Integer(1736720789)]]);
+    assert_that!(result).is_equal_to(vec![row![1736720789]]);
 }
 
 /// uuid7_str() rejects timestamps it cannot represent instead of overflowing.
@@ -66,10 +64,7 @@ fn uuid7_str_rejects_out_of_range_timestamps(tmp_db: TempDatabase) {
     ] {
         let query = format!("SELECT uuid7_str({arg})");
         let result = try_limbo_exec_rows(&tmp_db, &conn, &query);
-        assert!(
-            result.is_err(),
-            "uuid7_str({arg}) should be rejected, got {result:?}"
-        );
+        assert_that!(result).is_err();
     }
 }
 
@@ -86,11 +81,7 @@ fn uuid7_rejects_out_of_range_timestamps(tmp_db: TempDatabase) {
         "281474976710656",
     ] {
         let result = limbo_exec_rows(&conn, &format!("SELECT uuid7({arg})"));
-        assert_eq!(
-            result,
-            vec![vec![RusqliteValue::Null]],
-            "uuid7({arg}) should be NULL"
-        );
+        assert_that!(result).is_equal_to(vec![row![NULL]]);
     }
 }
 
@@ -101,19 +92,11 @@ fn uuid7_accepts_in_range_timestamps(tmp_db: TempDatabase) {
     let conn = tmp_db.connect_limbo();
     for unix in [1i64, 1736720789, 281474976710] {
         let result = limbo_exec_rows(&conn, &format!("SELECT uuid7_timestamp_ms(uuid7({unix}))"));
-        assert_eq!(
-            result,
-            vec![vec![RusqliteValue::Integer(unix * 1000)]],
-            "uuid7({unix}) should round-trip"
-        );
+        assert_that!(result).is_equal_to(vec![row![unix * 1000]]);
         let result = limbo_exec_rows(
             &conn,
             &format!("SELECT uuid7_timestamp_ms(uuid7_str({unix}))"),
         );
-        assert_eq!(
-            result,
-            vec![vec![RusqliteValue::Integer(unix * 1000)]],
-            "uuid7_str({unix}) should round-trip"
-        );
+        assert_that!(result).is_equal_to(vec![row![unix * 1000]]);
     }
 }

@@ -1,8 +1,9 @@
+use crate::assertions::{AssertColumn, Cell};
 use crate::common::{limbo_exec_rows, sqlite_exec_rows, ExecRows, TempDatabase};
 use asserting::prelude::*;
 use rusqlite::Connection as SqliteConnection;
 use tempfile::TempDir;
-use turso_core::{LimboError, StepResult, Value};
+use turso_core::{ConnectOpts, LimboError, StepResult, Value};
 
 #[turso_macros::test(mvcc, init_sql = "create table test (i integer);")]
 fn test_statement_reset_bind(tmp_db: TempDatabase) -> anyhow::Result<()> {
@@ -76,10 +77,9 @@ fn recursive_cte_explain_query_plan_shows_setup_and_recursive_step(
         })
         .collect::<Vec<_>>()
         .join("\n");
-    assert!(
-        plan.contains("SETUP") && plan.contains("RECURSIVE STEP"),
-        "expected recursive CTE structure in query plan, got:\n{plan}"
-    );
+    assert_that!(plan)
+        .contains("SETUP")
+        .contains("RECURSIVE STEP");
     Ok(())
 }
 
@@ -147,11 +147,62 @@ fn test_open_existing_without_rowid_database(_tmp_db: TempDatabase) -> anyhow::R
     assert_eq!(limbo_exec_rows(&conn, query), sqlite_rows);
     assert_eq!(limbo_exec_rows(&conn, schema_query), sqlite_schema);
 
-    let err = conn.prepare("SELECT rowid FROM config").unwrap_err();
-    assert!(
-        err.to_string().contains("no such column: rowid"),
-        "expected rowid access to be rejected for WITHOUT ROWID table, got {err}"
-    );
+    assert_that!(conn.prepare("SELECT rowid FROM config"))
+        .err()
+        .display_string()
+        .contains("no such column: rowid");
+
+    Ok(())
+}
+
+#[turso_macros::test]
+fn test_without_rowid_table_with_secondary_index(_tmp_db: TempDatabase) -> anyhow::Result<()> {
+    let temp_dir = TempDir::new()?;
+    let db_path = temp_dir.path().join("without_rowid_index.db");
+    let queries = [
+        "SELECT count(*) FROM t0 FULL JOIN t1 ON NULL",
+        "SELECT count(*) FROM t0 RIGHT JOIN t1 ON NULL",
+        "SELECT NULL FROM t0 FULL JOIN t1 ON NULL",
+        "SELECT count(*) FROM t2 FULL JOIN t3 ON NULL",
+        "SELECT count(*) FROM t2 RIGHT JOIN t3 ON NULL",
+        "SELECT NULL FROM t2 FULL JOIN t3 ON NULL",
+        "SELECT count(*) FROM t2 RIGHT JOIN t3 ON t2.c0 = t3.c0",
+        "SELECT count(*) FROM t2 RIGHT JOIN t3 ON t3.c1 = t2.c0 + 1",
+        "SELECT c0, c1 FROM t3 ORDER BY c1",
+        "SELECT c0 FROM t3 WHERE c1 = 4",
+        "SELECT t2.c0, t3.c0 FROM t2 JOIN t3 ON t3.c1 = t2.c0 + 1 ORDER BY t2.c0",
+    ];
+
+    let sqlite_rows = {
+        let sqlite = SqliteConnection::open(&db_path)?;
+        sqlite.pragma_update(None, "journal_mode", "wal")?;
+        sqlite.execute_batch(
+            "CREATE TABLE t0(c0);
+            CREATE TABLE t1(c0 PRIMARY KEY, c1) WITHOUT ROWID;
+            CREATE INDEX t1_i0 ON t1(c1);
+            CREATE TABLE t2(c0);
+            CREATE TABLE t3(c0 PRIMARY KEY, c1) WITHOUT ROWID;
+            CREATE INDEX t3_i0 ON t3(c1);
+            INSERT INTO t2 VALUES (1), (3), (7);
+            INSERT INTO t3 VALUES (1, 2), (3, 4), (5, 6);
+            PRAGMA wal_checkpoint(TRUNCATE);",
+        )?;
+        queries
+            .iter()
+            .map(|query| sqlite_exec_rows(&sqlite, query))
+            .collect::<Vec<_>>()
+    };
+
+    let db = TempDatabase::new_with_existent(&db_path);
+    let conn = db.connect_limbo();
+    for (query, sqlite_rows) in queries.iter().zip(sqlite_rows) {
+        assert_eq!(limbo_exec_rows(&conn, query), sqlite_rows, "{query}");
+    }
+
+    assert_that!(conn.prepare("SELECT c0 FROM t3 INDEXED BY t3_i0 WHERE c1 = 4"))
+        .err()
+        .display_string()
+        .contains("INDEXED BY is not supported on WITHOUT ROWID tables");
 
     Ok(())
 }
@@ -629,9 +680,9 @@ fn test_cte_with_union(tmp_db: TempDatabase) -> anyhow::Result<()> {
         Ok(())
     })?;
 
-    assert_eq!(rows.len(), 2);
-    assert_eq!(rows[0][0], Value::from_i64(1));
-    assert_eq!(rows[1][0], Value::from_i64(99));
+    assert_that!(rows)
+        .column(0)
+        .is_equal_to(vec![Cell::from(1), Cell::from(99)]);
 
     // Test 2: CTE with UNION (not UNION ALL)
     let mut stmt = conn.prepare("WITH t AS (SELECT 1 as x) SELECT * FROM t UNION SELECT 2 as x")?;
@@ -654,9 +705,9 @@ fn test_cte_with_union(tmp_db: TempDatabase) -> anyhow::Result<()> {
         Ok(())
     })?;
 
-    assert_eq!(rows.len(), 2);
-    assert_eq!(rows[0][0], Value::from_i64(1));
-    assert_eq!(rows[1][0], Value::from_i64(2));
+    assert_that!(rows)
+        .column(0)
+        .is_equal_to(vec![Cell::from(1), Cell::from(2)]);
 
     Ok(())
 }
@@ -719,6 +770,108 @@ fn test_offset_limit_bind(tmp_db: TempDatabase) -> anyhow::Result<()> {
 
         assert_eq!(rows, expected);
     }
+
+    Ok(())
+}
+
+#[turso_macros::test(mvcc)]
+fn test_scalar_subquery_limit_bind(tmp_db: TempDatabase) -> anyhow::Result<()> {
+    let conn = tmp_db.connect_limbo();
+
+    for (limit, expected) in [
+        (Value::from_i64(0), Value::Null),
+        (Value::build_text("0"), Value::Null),
+        (Value::from_i64(1), Value::from_i64(5)),
+        (Value::from_i64(2), Value::from_i64(5)),
+        (Value::from_i64(-1), Value::from_i64(5)),
+    ] {
+        let mut stmt = conn.prepare("SELECT (SELECT 5 LIMIT ?)")?;
+        assert_eq!(stmt.parameters().count(), 1);
+        stmt.bind_at(1.try_into()?, limit)?;
+
+        let mut rows = Vec::new();
+        stmt.run_with_row_callback(|row| {
+            rows.push(row.get_values().cloned().collect::<Vec<_>>());
+            Ok(())
+        })?;
+
+        assert_eq!(rows, vec![vec![expected]]);
+    }
+
+    Ok(())
+}
+
+#[turso_macros::test(mvcc, init_sql = "CREATE TABLE t (a INTEGER);")]
+fn test_correlated_scalar_subquery_limit_offset_bind(tmp_db: TempDatabase) -> anyhow::Result<()> {
+    let conn = tmp_db.connect_limbo();
+    conn.execute("INSERT INTO t VALUES (1), (2), (3)")?;
+
+    let mut stmt = conn.prepare(
+        "SELECT o.a, (SELECT i.a FROM t i WHERE i.a >= o.a ORDER BY i.a LIMIT ? OFFSET ?) FROM t o ORDER BY o.a",
+    )?;
+    stmt.bind_at(1.try_into()?, Value::from_i64(1))?;
+    stmt.bind_at(2.try_into()?, Value::from_i64(1))?;
+
+    let mut rows = Vec::new();
+    stmt.run_with_row_callback(|row| {
+        rows.push(row.get_values().cloned().collect::<Vec<_>>());
+        Ok(())
+    })?;
+
+    assert_eq!(
+        rows,
+        vec![
+            vec![Value::from_i64(1), Value::from_i64(2)],
+            vec![Value::from_i64(2), Value::from_i64(3)],
+            vec![Value::from_i64(3), Value::Null],
+        ]
+    );
+
+    Ok(())
+}
+
+#[turso_macros::test(
+    mvcc,
+    init_sql = "CREATE TABLE pf_job_queue (id INTEGER PRIMARY KEY, queue TEXT, available_at INTEGER, locked_until INTEGER, claim_receipt TEXT, job_attempts INTEGER, job_retry_limit INTEGER, _deleted INTEGER);"
+)]
+fn test_update_where_scalar_subquery_limit_bind(tmp_db: TempDatabase) -> anyhow::Result<()> {
+    let conn = tmp_db.connect_limbo();
+    conn.execute(
+        "INSERT INTO pf_job_queue VALUES (1, 'q', 10, NULL, NULL, 0, 3, 0), (2, 'q', 5, NULL, NULL, 0, 3, 0)",
+    )?;
+
+    let mut stmt = conn.prepare(
+        "UPDATE \"pf_job_queue\"
+         SET \"job_attempts\" = \"job_attempts\" + 1,
+             \"locked_until\" = ?,
+             \"claim_receipt\" = ?
+         WHERE \"id\" = (
+           SELECT \"id\"
+           FROM \"pf_job_queue\"
+           WHERE \"queue\" = ?
+             AND \"available_at\" <= ?
+             AND (\"locked_until\" IS NULL OR \"locked_until\" <= ?)
+             AND \"job_attempts\" < \"job_retry_limit\"
+             AND \"_deleted\" = 0
+           ORDER BY \"job_attempts\", \"available_at\", \"id\"
+           LIMIT ?
+         )
+         RETURNING \"id\"",
+    )?;
+    assert_eq!(stmt.parameters().count(), 6);
+    stmt.bind_at(1.try_into()?, Value::from_i64(100))?;
+    stmt.bind_at(2.try_into()?, Value::build_text("receipt"))?;
+    stmt.bind_at(3.try_into()?, Value::build_text("q"))?;
+    stmt.bind_at(4.try_into()?, Value::from_i64(20))?;
+    stmt.bind_at(5.try_into()?, Value::from_i64(20))?;
+    stmt.bind_at(6.try_into()?, Value::from_i64(1))?;
+
+    let mut rows = Vec::new();
+    stmt.run_with_row_callback(|row| {
+        rows.push(row.get_values().cloned().collect::<Vec<_>>());
+        Ok(())
+    })?;
+    assert_eq!(rows, vec![vec![Value::from_i64(2)]]);
 
     Ok(())
 }
@@ -832,18 +985,10 @@ fn test_prepare_rejects_empty_statements(tmp_db: TempDatabase) {
     ];
 
     for sql in empty_inputs {
-        let Err(err) = conn.prepare(sql) else {
-            panic!("Expected invalid argument error for input: {sql}");
+        let Err(LimboError::InvalidArgument(msg)) = conn.prepare(sql) else {
+            panic!("Expected an invalid argument error for input: {sql}");
         };
-        match err {
-            LimboError::InvalidArgument(msg) => {
-                assert!(
-                    msg.contains("contains no statements"),
-                    "Unexpected error message for input {sql}: {msg}"
-                );
-            }
-            other => panic!("Unexpected error for input {sql}: {other}"),
-        }
+        assert_that!(msg).contains("contains no statements");
     }
 
     let invalid_syntax_inputs = ["/* outer /* inner */ still outer */"];
@@ -878,7 +1023,7 @@ fn test_max_joined_tables_limit(tmp_db: TempDatabase) {
     let Err(LimboError::ParseError(result)) = conn.prepare(&sql) else {
         panic!("Expected an error but got no error");
     };
-    assert!(result.contains("Only up to 63 tables can be joined"));
+    assert_that!(result).contains("Only up to 63 tables can be joined");
 }
 
 #[turso_macros::test]
@@ -1031,8 +1176,9 @@ fn test_bind_in_exists_subquery(tmp_db: TempDatabase) -> anyhow::Result<()> {
         turso_rows.push(row.get::<&Value>(2).unwrap().clone());
         Ok(())
     })?;
-    assert_eq!(turso_rows.len(), 1);
-    assert_eq!(turso_rows[0], Value::from_i64(42));
+    assert_that!(turso_rows)
+        .single_element()
+        .is_equal_to(Cell::from(42));
     Ok(())
 }
 
@@ -1074,6 +1220,59 @@ fn test_parameter_column_names(tmp_db: TempDatabase) {
     }
 }
 
+/// Parameters in expressions that produce no bytecode must still be counted,
+/// as SQLite counts every parameter in the SQL text.
+#[turso_macros::test(mvcc, init_sql = "CREATE TABLE t (x INTEGER);")]
+fn test_parameters_count_includes_parameters_without_bytecode(tmp_db: TempDatabase) {
+    let cases = [
+        "SELECT x FROM t WHERE x = ?",
+        "SELECT x FROM t WHERE 0 AND x = ?",
+        "SELECT x FROM t WHERE 1 OR x = ?",
+        "SELECT x FROM t WHERE x = ? AND 0 AND x = ?",
+        "SELECT x FROM t WHERE 0 AND x = :a AND x = ?",
+        "DELETE FROM t WHERE 0 AND x = ?",
+        "DELETE FROM t WHERE 1 OR x = ?",
+        "UPDATE t SET x = 1 WHERE 0 AND x = ?",
+        "UPDATE t SET x = ? WHERE 1 OR x = ?",
+        "UPDATE t SET x = t2.x FROM t AS t2 WHERE 0 AND t2.x = ?",
+        "SELECT x FROM t WHERE x IN (SELECT x FROM t WHERE 0 AND x = ?)",
+        "SELECT x FROM t WHERE 0 AND x IN (SELECT ?)",
+        "SELECT x FROM t WHERE 0 AND EXISTS (SELECT 1 FROM t WHERE x = ?)",
+        "SELECT x FROM t UNION SELECT x FROM t WHERE 0 AND x = ?",
+        "WITH c AS (SELECT ?) SELECT 1",
+        "WITH c AS (SELECT ?) SELECT x FROM t WHERE x = ?",
+        "SELECT EXISTS (SELECT x FROM u ORDER BY ?)",
+        "SELECT x FROM t WHERE EXISTS (SELECT ? FROM t)",
+        "INSERT INTO u VALUES (1, 2) ON CONFLICT(x) WHERE 0 AND ? DO NOTHING",
+        "INSERT INTO u VALUES (1, 2) ON CONFLICT(x) DO UPDATE SET y = ? WHERE 0 AND ?",
+        "CREATE TABLE z AS SELECT 1 WHERE 0 AND ?",
+    ];
+
+    let sqlite_conn = rusqlite::Connection::open_in_memory().unwrap();
+    sqlite_conn
+        .execute_batch(
+            "CREATE TABLE t (x INTEGER); CREATE TABLE u (x INTEGER PRIMARY KEY, y UNIQUE);",
+        )
+        .unwrap();
+    let conn = tmp_db.connect_limbo();
+    conn.execute("CREATE TABLE u (x INTEGER PRIMARY KEY, y UNIQUE)")
+        .unwrap();
+    for sql in cases {
+        let sqlite_stmt = sqlite_conn.prepare(sql).unwrap();
+        let stmt = conn.prepare(sql).unwrap();
+        assert_eq!(
+            stmt.parameters_count(),
+            sqlite_stmt.parameter_count(),
+            "{sql}"
+        );
+        assert_eq!(
+            stmt.parameter_index(":a").map(|index| index.get()),
+            sqlite_stmt.parameter_index(":a").unwrap(),
+            "{sql}"
+        );
+    }
+}
+
 /// A fused column-range read (Insn::ColumnRange) must stay correct when
 /// `cursor.record()` yields IO mid-instruction. Records spanning many
 /// overflow pages are scanned through a reopened database whose IO only
@@ -1105,7 +1304,7 @@ fn test_column_range_reentry_after_io_yield() -> anyhow::Result<()> {
 
     {
         let db = open(io.clone())?;
-        let conn = db.connect()?;
+        let conn = db.connect(ConnectOpts::new())?;
         conn.execute("CREATE TABLE t(a INTEGER, b TEXT, c TEXT, d INTEGER, e TEXT)")?;
         for i in 0..ROWS {
             conn.execute(
@@ -1122,7 +1321,7 @@ fn test_column_range_reentry_after_io_yield() -> anyhow::Result<()> {
     // A fresh Database over the same backing file starts with a cold page
     // cache, so every record (and its overflow chain) must be read back.
     let db = open(io.clone())?;
-    let conn = db.connect()?;
+    let conn = db.connect(ConnectOpts::new())?;
     let mut stmt = conn.prepare("SELECT a, b, c, d, e FROM t")?;
     let mut io_yields = 0usize;
     let mut rows: Vec<(i64, usize, String, i64, String)> = Vec::new();

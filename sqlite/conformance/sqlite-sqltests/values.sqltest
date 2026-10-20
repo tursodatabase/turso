@@ -140,3 +140,13 @@ expect {
     2|jill
 }
 
+
+test values-correlated-multi-row-in-from-subquery {
+    CREATE TABLE t1(a);
+    INSERT INTO t1 VALUES (1), (2);
+    SELECT a, (SELECT max(column1) FROM (VALUES (a + 0), (a * 10))) FROM t1;
+}
+expect {
+    1|10
+    2|20
+}

@@ -77,6 +77,7 @@ ongoing work to pass the full SQLite TCL test suite.
 * ✅ SQLite file format is fully supported
 * 🚧 SQLite query language [[status](#sqlite-query-language)] is partially supported
 * 🚧 SQLite C API [[status](#sqlite-c-api)] is partially supported
+* 🚧 Materialized views are experimental [[IVM status](IVM_COMPAT.md)]
 
 ### Limitations
 
@@ -287,7 +288,7 @@ avoid this window.
 | PRAGMA vdbe_debug                | ❌ No         |                                              |
 | PRAGMA vdbe_listing              | ❌ No         |                                              |
 | PRAGMA vdbe_trace                | ✅ Yes        |                                              |
-| PRAGMA wal_autocheckpoint        | ❌ No         |                                              |
+| PRAGMA wal_autocheckpoint        | ✅ Yes        |                                              |
 | PRAGMA wal_checkpoint            | 🚧 Partial    | Not Needed calling with param (pragma-value) |
 | PRAGMA writable_schema           | ❌ No         |                                              |
 
@@ -940,6 +941,7 @@ Modifiers:
 | Integer        | ✅ Yes    |         |
 | IntegrityCk    | ✅ Yes    |         |
 | IsNull         | ✅ Yes    |         |
+| IsType         | ✅ Yes    |         |
 | IsUnique       | ❌ No     |         |
 | JournalMode    | ✅ Yes    |         |
 | Jump           | ✅ Yes    |         |

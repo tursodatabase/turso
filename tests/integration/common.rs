@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use tempfile::TempDir;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
-use turso_core::{Clock, Connection, Database, FromValueRow, Row, SqliteDialect, IO};
+use turso_core::{Clock, ConnectOpts, Connection, Database, FromValueRow, Row, SqliteDialect, IO};
 
 /// Temp directories holding test databases, deleted when the test process exits.
 ///
@@ -245,7 +245,7 @@ impl TempDatabaseBuilder {
 
         // Enable MVCC via turso connection if requested
         if self.enable_mvcc {
-            let conn = db.connect().unwrap();
+            let conn = db.connect(ConnectOpts::new()).unwrap();
             conn.pragma_update("journal_mode", "'mvcc'")
                 .expect("enable mvcc");
         }
@@ -310,7 +310,7 @@ impl TempDatabase {
     pub fn connect_limbo(&self) -> Arc<turso_core::Connection> {
         log::debug!("conneting to limbo");
 
-        let conn = self.db.connect().unwrap();
+        let conn = self.db.connect(ConnectOpts::new()).unwrap();
         log::debug!("connected to limbo");
         conn
     }
@@ -698,7 +698,7 @@ mod tests {
     use std::{sync::Arc, vec};
     use tempfile::TempDir;
     use turso_core::SqliteDialect;
-    use turso_core::{Database, StepResult, IO};
+    use turso_core::{ConnectOpts, Database, StepResult, IO};
 
     use crate::common::{do_flush, ExecRows};
 
@@ -979,11 +979,11 @@ mod tests {
         let mut connections = Vec::new();
 
         // Create a new connection to verify persistence
-        let verification_conn = db.connect()?;
+        let verification_conn = db.connect(ConnectOpts::new())?;
         // Create multiple connections and create a table from each
 
         for i in 0..NUM_CONNECTIONS {
-            let conn = db.connect()?;
+            let conn = db.connect(ConnectOpts::new())?;
             connections.push(conn);
 
             // Create a unique table name for this connection

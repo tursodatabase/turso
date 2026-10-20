@@ -15,7 +15,7 @@
 //!
 //! You can find a full list of SQLite opcodes at:
 //!
-//! https://www.sqlite.org/opcode.html
+//! <https://www.sqlite.org/opcode.html>
 
 use crate::alloc::{TryReserveError, TursoFromIterator};
 use crate::translate::plan::BitSet;
@@ -34,6 +34,8 @@ pub mod explain;
 pub mod hash_table;
 pub mod insn;
 pub mod metrics;
+#[cfg(test)]
+mod native_extension_tests;
 pub mod rowset;
 pub mod sorter;
 #[cfg(test)]
@@ -58,7 +60,7 @@ use crate::{
             OpAttachState, OpClearBtreeState, OpColumnState, OpDeleteState, OpDeleteSubState,
             OpDestroyState, OpIdxInsertState, OpInitCdcVersionState, OpInsertState,
             OpInsertSubState, OpJournalModeState, OpNewRowidState, OpNoConflictState,
-            OpParseSchemaState, OpProgramState, OpRowIdState, OpSeekState, OpTransactionState,
+            OpParseSchemaState, OpProgramState, OpSeekState, OpTransactionState,
             VacuumIntoOpContext,
         },
         hash_table::HashTable,
@@ -90,7 +92,7 @@ use execute::{
 use turso_parser::ast::{EqpFormat, ResolveType};
 
 use crate::io::TempFile;
-use crate::storage::sqlite3_ondisk::read_varint;
+use crate::storage::sqlite3_ondisk::split_varint;
 use crate::vdbe::bloom_filter::BloomFilter;
 use crate::vdbe::rowset::RowSet;
 use explain::{
@@ -111,17 +113,166 @@ use tracing::{instrument, Level};
 
 const MAX_CHECK_INTERVAL: u64 = 256;
 
-type MvccCommitStateMachine = CommitStateMachine<MvccClock, DynAllocator>;
+pub(crate) type MvccCommitStateMachine = CommitStateMachine<MvccClock, DynAllocator>;
 
-/// State machine for committing view deltas with I/O handling
-#[derive(Debug, Clone)]
-pub enum ViewDeltaCommitState {
+/// State machine for applying pending view deltas with I/O handling.
+///
+/// Each touched materialized view is maintained by stepping a compiled VDBE
+/// maintenance program to completion; the parked statement makes the state
+/// machine re-entrant across I/O yields.
+#[derive(Debug)]
+pub enum ViewDeltaApplyState {
     NotStarted,
     Processing {
-        views: Vec<String>, // view names (all materialized views have storage)
+        views: crate::alloc::Vec<String>, // view names (all materialized views have storage)
         current_index: usize,
+        /// The maintenance statement currently being stepped for
+        /// `views[current_index]`, parked across I/O yields.
+        stmt: Option<Box<crate::statement::Statement>>,
     },
     Done,
+}
+
+/// Advance one transaction change-log batch through every subscribed
+/// materialized view in dependency order.
+///
+/// This runner is independent of a parent [`ProgramState`] so both statement
+/// completion and a materialized-view cursor can use exactly the same
+/// maintenance programs. The latter matters when a write statement reads a
+/// view before reaching `Halt`: there must not be a second query evaluator for
+/// that read-your-writes path.
+#[instrument(skip_all, level = Level::DEBUG)]
+pub(crate) fn step_view_delta_batch(
+    connection: &Arc<Connection>,
+    state: &mut ViewDeltaApplyState,
+    rollback: bool,
+    pager: &Arc<Pager>,
+) -> Result<IOResult<()>> {
+    loop {
+        match state {
+            ViewDeltaApplyState::NotStarted => {
+                if connection.transaction_changes.is_empty() {
+                    return Ok(IOResult::Done(()));
+                }
+
+                if rollback {
+                    connection.transaction_changes.clear();
+                    return Ok(IOResult::Done(()));
+                }
+
+                let schema = connection.schema.read();
+                let views = schema.materialized_view_maintenance_order(
+                    connection.transaction_changes.get_view_names()?,
+                )?;
+                for view_name in &views {
+                    if let Some(view_mutex) = schema.get_materialized_view(view_name) {
+                        let view = view_mutex.lock();
+                        turso_assert_ne!(
+                            view.get_root_page(),
+                            0,
+                            "Materialized view should have a root page",
+                            { "view_name": view_name }
+                        );
+                    }
+                }
+
+                *state = ViewDeltaApplyState::Processing {
+                    views,
+                    current_index: 0,
+                    stmt: None,
+                };
+            }
+
+            ViewDeltaApplyState::Processing {
+                views,
+                current_index,
+                stmt,
+            } => {
+                if *current_index >= views.len() {
+                    connection.transaction_changes.clear();
+                    *state = ViewDeltaApplyState::Done;
+                    return Ok(IOResult::Done(()));
+                }
+
+                let view_name = &views[*current_index];
+                if stmt.is_none() {
+                    // Downstream views acquire their subscription while an
+                    // upstream maintenance program changes its input btree.
+                    let has_delta = connection
+                        .transaction_changes
+                        .get(view_name)
+                        .is_some_and(|tx_state| !tx_state.is_empty());
+                    if !has_delta {
+                        *current_index += 1;
+                        continue;
+                    }
+
+                    let schema = connection.schema.read();
+                    let Some(view_mutex) = schema.get_materialized_view(view_name) else {
+                        *current_index += 1;
+                        continue;
+                    };
+                    let (select, root_page, num_view_columns) = {
+                        let view = view_mutex.lock();
+                        (
+                            view.select_stmt.clone(),
+                            view.get_root_page(),
+                            view.column_schema.flat_columns()?.len(),
+                        )
+                    };
+                    let program =
+                        crate::incremental::vdbe_maintenance::compile_maintenance_program(
+                            view_name,
+                            &select,
+                            root_page,
+                            num_view_columns,
+                            crate::incremental::vdbe_maintenance::MaintenanceInput::TransactionDelta,
+                            &schema,
+                            connection,
+                        )?;
+                    *stmt = Some(Box::new(crate::statement::Statement::new_with_origin(
+                        program,
+                        pager.clone(),
+                        crate::QueryMode::Normal,
+                        0,
+                        crate::statement::StatementOrigin::Subprogram,
+                        false,
+                    )));
+                }
+
+                let statement = stmt.as_mut().expect("maintenance statement was just built");
+                match statement.step_subprogram()? {
+                    StepResult::Done => {
+                        *stmt = None;
+                        *current_index += 1;
+                    }
+                    StepResult::IO | StepResult::Yield | StepResult::Sleep { .. } => {
+                        let io = statement
+                            .take_io_completions()
+                            .unwrap_or_else(|| IOCompletions(crate::Completion::new_yield()));
+                        return Ok(IOResult::IO(io));
+                    }
+                    StepResult::Row => {
+                        return Err(LimboError::InternalError(
+                            "materialized view maintenance program produced a row".to_string(),
+                        ));
+                    }
+                    StepResult::Busy => return Err(LimboError::Busy),
+                    StepResult::Interrupt => return Err(LimboError::Interrupt),
+                }
+            }
+
+            ViewDeltaApplyState::Done => return Ok(IOResult::Done(())),
+        }
+    }
+}
+
+/// Parked state for materialized-view initial population
+/// (Insn::PopulateMaterializedViews).
+#[derive(Debug)]
+pub struct PopulateMatViewsState {
+    pub view_idx: usize,
+    pub stmt: Option<Box<crate::statement::Statement>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -271,7 +422,7 @@ impl CommitState {
     }
 
     fn cleanup_abandoned_mvcc_commit(&mut self, connection: &Connection) {
-        match self {
+        let db_id = match self {
             CommitState::CommittingAttachedMvcc {
                 state_machine,
                 db_id: attached_db_id,
@@ -285,8 +436,11 @@ impl CommitState {
                 {
                     connection.bump_prepare_context_generation();
                 }
+                *attached_db_id
             }
-            CommitState::CommittingMvcc { state_machine } if !state_machine.is_finalized() => {}
+            CommitState::CommittingMvcc { state_machine } if !state_machine.is_finalized() => {
+                crate::MAIN_DB_ID
+            }
             _ => return, // no-op for already-finalized state machines and non-MVCC commit states
         };
 
@@ -299,6 +453,7 @@ impl CommitState {
         // The locks/exclusive slot the SM acquired are released by the same
         // cleanup path on drop.
         *self = CommitState::Ready;
+        connection.end_abandoned_mvcc_commit(db_id);
 
         connection.rollback_attached_mvcc_txs(true);
         connection.rollback_attached_wal_txns();
@@ -307,7 +462,7 @@ impl CommitState {
     }
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, PartialEq)]
 pub enum Register {
     Value(Value),
     Aggregate(AggContext),
@@ -320,7 +475,7 @@ impl TryClone for Register {
     fn try_clone(&self) -> Result<Self, Self::Error> {
         match self {
             Register::Value(value) => Ok(Register::Value(value.try_clone()?)),
-            Register::Aggregate(context) => Ok(Register::Aggregate(context.try_clone()?)),
+            Register::Aggregate(_) => unreachable!("aggregate accumulators cannot be copied"),
             Register::Record(record) => Ok(Register::Record(ImmutableRecord::copy_payload(
                 record.get_payload(),
                 RecordBuf::alloc(),
@@ -351,7 +506,7 @@ impl TryClone for Register {
                     RecordBuf::alloc(),
                 )?);
             }
-            (dst, Register::Aggregate(src)) => *dst = Register::Aggregate(src.try_clone()?),
+            (_, Register::Aggregate(_)) => unreachable!("aggregate accumulators cannot be copied"),
         }
         Ok(())
     }
@@ -455,6 +610,14 @@ impl Register {
             _ => {
                 *self = Register::Value(Value::Numeric(Numeric::Float(val)));
             }
+        }
+    }
+
+    #[inline(always)]
+    pub fn set_numeric(&mut self, val: Numeric) {
+        match val {
+            Numeric::Integer(i) => self.set_int(i),
+            Numeric::Float(f) => self.set_float(f),
         }
     }
 
@@ -601,7 +764,7 @@ pub struct OpHashProbeState {
 }
 
 // repr(u8): with the tag in its own byte, the idle test that every Column
-// and RowId runs is one byte compare instead of a niche computation on a
+// runs is one byte compare instead of a niche computation on a
 // nested payload.
 #[repr(u8)]
 enum ActiveOpState {
@@ -618,7 +781,6 @@ enum ActiveOpState {
     Insert(OpInsertState),
     NoConflict(OpNoConflictState),
     Column(OpColumnState),
-    RowId(OpRowIdState),
     Transaction(OpTransactionState),
     Attach(OpAttachState),
     JournalMode(OpJournalModeState),
@@ -644,7 +806,6 @@ impl std::fmt::Debug for ActiveOpState {
             ActiveOpState::Insert(_) => "Insert",
             ActiveOpState::NoConflict(_) => "NoConflict",
             ActiveOpState::Column(_) => "Column",
-            ActiveOpState::RowId(_) => "RowId",
             ActiveOpState::Transaction(_) => "Transaction",
             ActiveOpState::Attach(_) => "Attach",
             ActiveOpState::JournalMode(_) => "JournalMode",
@@ -717,6 +878,7 @@ impl ActiveOpStateSlot {
         OpDeleteState,
         OpDeleteState {
             sub_state: OpDeleteSubState::MaybeCaptureRecord,
+            route: None,
             deleted_record: None,
         }
     );
@@ -764,7 +926,7 @@ impl ActiveOpStateSlot {
         OpInsertState,
         OpInsertState {
             sub_state: OpInsertSubState::MaybeCaptureRecord,
-            has_dependent_views: false,
+            route: None,
             old_record: None,
             is_noop_update: false,
         }
@@ -776,7 +938,6 @@ impl ActiveOpStateSlot {
         OpNoConflictState::Start
     );
     active_state_accessor!(column, Column, OpColumnState, OpColumnState::Start);
-    active_state_accessor!(row_id, RowId, OpRowIdState, OpRowIdState::Start);
     active_state_accessor!(
         transaction,
         Transaction,
@@ -832,6 +993,8 @@ impl ActiveOpStateSlot {
 pub(crate) struct DeferredSeekState {
     pub index_cursor_id: CursorID,
     pub table_cursor_id: CursorID,
+    /// The rowid that DeferredSeek saves before the index can move.
+    pub rowid: i64,
 }
 
 pub(crate) enum VacuumOpState {
@@ -870,8 +1033,12 @@ pub struct ProgramState {
     /// the progress handler's interval each time the check runs.
     check_interval: u64,
     pub io_completions: Option<IOCompletions>,
+    pub(crate) extension_state: crate::native_ext::ExtensionState,
     pub pc: InsnReference,
     pub(crate) cursors: Vec<Option<Cursor>>,
+    /// Database id associated with each opened cursor. Ephemeral and pseudo
+    /// cursors have no database id.
+    cursor_databases: Vec<Option<usize>>,
     /// Immutable execution/storage context captured when each index-method
     /// cursor is first opened for this statement.
     pub(crate) index_method_contexts:
@@ -892,7 +1059,7 @@ pub struct ProgramState {
     cursor_seqs: Vec<i64>,
     registers: Box<[Register]>,
     /// Trace state: register snapshot for diffing.
-    pre_op_registers: Option<Box<[Register]>>,
+    pre_op_registers: Option<Box<[String]>>,
     pub(crate) result_row: Option<Row>,
     last_compare: Option<std::cmp::Ordering>,
     deferred_seeks: Vec<Option<DeferredSeekState>>,
@@ -942,7 +1109,10 @@ pub struct ProgramState {
     pub metrics: StatementMetrics,
     op_vacuum_state: VacuumOpState,
     /// State machine for committing view deltas with I/O handling
-    view_delta_state: ViewDeltaCommitState,
+    view_delta_state: ViewDeltaApplyState,
+    /// Parked state for Insn::PopulateMaterializedViews: the population
+    /// statement currently being stepped, re-entrant across I/O yields.
+    pub(crate) populate_matviews_state: Option<PopulateMatViewsState>,
     /// Marker which tells about auto transaction cleanup necessary for that connection in case of reset
     /// This is used when statement in auto-commit mode reseted after previous uncomplete execution - in which case we may need to rollback transaction started on previous attempt
     pub(crate) auto_txn_cleanup: TxnCleanup,
@@ -959,9 +1129,10 @@ pub struct ProgramState {
     /// When a constraint error occurs with FAIL resolve type in autocommit mode,
     /// we need to commit partial changes before returning the error.
     pub(crate) pending_fail_error: Option<LimboError>,
-    /// FAIL can escape a trigger before the parent reaches its Halt opcode.
-    /// Keep the error here while index-method writes from earlier rows finish
-    /// through the normal resumable I/O path.
+    /// A FAIL-mode error ends the statement without reaching the normal
+    /// Halt completion, but keeps the rows written before it. Keep the error
+    /// here while those rows reach the materialized views and their
+    /// index-method writes finish, through the normal resumable I/O path.
     pending_fail_prepare_error: Option<LimboError>,
     /// True once the Halt opcode has started finishing the statement. The
     /// statement's outcome is decided at that point, so an interrupt request
@@ -974,7 +1145,7 @@ pub struct ProgramState {
     /// Set by InitCdcVersion opcode, applied at Halt/Done so that if the
     /// transaction rolls back, the connection's CDC state remains unchanged.
     ///
-    /// capture_data_changes has type Option<CaptureDataChangesInfo> (off mode is None)
+    /// capture_data_changes has type `Option<CaptureDataChangesInfo>` (off mode is None)
     /// so, for pending_cdc_info we wrap it in one more Option<...> layer to represent if mode changed during program execution
     pub(crate) pending_cdc_info: Option<Option<CaptureDataChangesInfo>>,
     /// Cached subprogram Statements keyed by the PC of the Program instruction.
@@ -1035,14 +1206,20 @@ crate::assert::assert_send_sync!(ProgramState);
 impl ProgramState {
     pub fn new(max_registers: usize, max_cursors: usize) -> Self {
         let cursors: Vec<Option<Cursor>> = (0..max_cursors).map(|_| None).collect();
+        let cursor_databases = vec![None; max_cursors];
         let cursor_seqs = vec![0i64; max_cursors];
-        let registers = vec![Register::Value(Value::Null); max_registers].into_boxed_slice();
+        let registers = (0..max_registers)
+            .map(|_| Register::Value(Value::Null))
+            .collect::<Vec<_>>()
+            .into_boxed_slice();
         Self {
             check_countdown: 1,
             check_interval: MAX_CHECK_INTERVAL,
             io_completions: None,
+            extension_state: crate::native_ext::ExtensionState::None,
             pc: 0,
             cursors,
+            cursor_databases,
             index_method_contexts: vec![None; max_cursors],
             closed_index_method_cursors: Vec::new(),
             index_method_finalize_cursor: 0,
@@ -1072,7 +1249,8 @@ impl ProgramState {
             metrics: StatementMetrics::new(),
             distinct_key_values: Vec::new(),
             op_vacuum_state: VacuumOpState::None,
-            view_delta_state: ViewDeltaCommitState::NotStarted,
+            view_delta_state: ViewDeltaApplyState::NotStarted,
+            populate_matviews_state: None,
             auto_txn_cleanup: TxnCleanup::None,
             fk_deferred_violations_when_stmt_started: AtomicIsize::new(0),
             fk_immediate_violations_during_stmt: AtomicIsize::new(0),
@@ -1153,10 +1331,12 @@ impl ProgramState {
 
     pub fn reset(&mut self, max_registers: Option<usize>, max_cursors: Option<usize>) {
         self.io_completions = None;
+        self.extension_state = crate::native_ext::ExtensionState::None;
         self.pc = 0;
 
         if let Some(max_cursors) = max_cursors {
             self.cursors.resize_with(max_cursors, || None);
+            self.cursor_databases.resize(max_cursors, None);
             self.index_method_contexts.resize_with(max_cursors, || None);
             self.cursor_seqs.resize(max_cursors, 0);
             self.deferred_seeks.resize(max_cursors, None);
@@ -1170,6 +1350,7 @@ impl ProgramState {
             self.registers = registers.into_boxed_slice();
         }
         // reset cursors as they can have cached information which will be no longer relevant on next program execution
+        self.cursor_databases.fill(None);
         for (cursor, context) in self
             .cursors
             .iter_mut()
@@ -1181,8 +1362,10 @@ impl ProgramState {
                 cursor.close(context);
             }
             match cursor.take() {
-                Some(Cursor::BTree(cursor)) => crate::storage::btree::CursorTrait::recycle(cursor),
-                Some(Cursor::Dyn(cursor)) => cursor.recycle(),
+                Some(Cursor::BTree(cursor, ..)) => {
+                    crate::storage::btree::CursorTrait::recycle(cursor)
+                }
+                Some(Cursor::Dyn(cursor, ..)) => cursor.recycle(),
                 _ => {}
             }
             *context = None;
@@ -1228,7 +1411,8 @@ impl ProgramState {
         // here only releases its references.
         self.sequence_inner_commit = None;
         self.op_vacuum_state = VacuumOpState::None;
-        self.view_delta_state = ViewDeltaCommitState::NotStarted;
+        self.view_delta_state = ViewDeltaApplyState::NotStarted;
+        self.populate_matviews_state = None;
         self.auto_txn_cleanup = TxnCleanup::None;
         *self.fk_immediate_violations_during_stmt.get_mut() = 0;
         *self.fk_deferred_violations_when_stmt_started.get_mut() = 0;
@@ -1261,12 +1445,17 @@ impl ProgramState {
     }
 
     pub(crate) fn record_statement_change(&self) {
-        self.n_change.fetch_add(1, Ordering::SeqCst);
-        self.n_total_change.fetch_add(1, Ordering::SeqCst);
+        bump_change_count(&self.n_change);
+        bump_change_count(&self.n_total_change);
+    }
+
+    pub(crate) fn record_statement_changes(&self, count: i64) {
+        add_to_change_count(&self.n_change, count);
+        add_to_change_count(&self.n_total_change, count);
     }
 
     pub(crate) fn record_total_change(&self) {
-        self.n_total_change.fetch_add(1, Ordering::SeqCst);
+        bump_change_count(&self.n_total_change);
     }
 
     /// Whether this statement may finish the implicit autocommit transaction
@@ -1557,6 +1746,7 @@ impl ProgramState {
         pager: &Arc<Pager>,
         end_statement: EndStatement,
     ) -> Result<()> {
+        let ends_write_statement = self.is_active_write;
         if self.is_active_write {
             let previous = connection.n_active_writes.fetch_sub(1, Ordering::SeqCst);
             turso_assert!(
@@ -1565,11 +1755,33 @@ impl ProgramState {
             );
             self.is_active_write = false;
         }
+        // A write statement that keeps its changes must have applied them to
+        // the materialized views first (see
+        // `Program::maintain_views_for_kept_changes`). Everything left in the
+        // transaction change log after this point would be applied later,
+        // by some other statement. The check is one atomic load.
+        if ends_write_statement && end_statement == EndStatement::ReleaseSavepoint {
+            turso_assert!(
+                connection.transaction_changes.is_empty(),
+                "write statement kept changes that never reached its materialized views"
+            );
+        }
         // If begin_statement was never called, no savepoint/FK cleanup needed.
         if !self.has_stmt_transaction {
             return Ok(());
         }
         self.has_stmt_transaction = false;
+
+        // The change log was empty when this write statement started (see
+        // `Program::maintain_views_for_kept_changes`), so everything in it now
+        // was captured by this statement. Rolling the statement back therefore
+        // discards the whole log, together with the btree writes it mirrors.
+        if ends_write_statement
+            && end_statement == EndStatement::RollbackSavepoint
+            && !connection.transaction_changes.is_empty()
+        {
+            connection.transaction_changes.clear();
+        }
 
         // Drain attached pagers upfront so we can clean them up regardless of path.
         let attached_pagers: Vec<Arc<Pager>> = self.attached_savepoint_pagers.drain(..).collect();
@@ -1584,6 +1796,9 @@ impl ProgramState {
                             attached_mv.release_savepoint(tx_id);
                         }
                     });
+                    for p in &attached_pagers {
+                        p.release_savepoint()?;
+                    }
                     Ok(())
                 } else if self.uses_subjournal || !attached_pagers.is_empty() {
                     if self.uses_subjournal {
@@ -1615,6 +1830,13 @@ impl ProgramState {
                             }
                         }
                     });
+                    for p in &attached_pagers {
+                        if let Err(e) = p.rollback_to_newest_savepoint() {
+                            if err.is_none() {
+                                err = Some(e);
+                            }
+                        }
+                    }
                     err
                 } else if self.uses_subjournal {
                     match pager.rollback_to_newest_savepoint() {
@@ -1825,7 +2047,7 @@ pub struct PreparedProgram {
     pub parameters: crate::parameters::Parameters,
     pub change_cnt_on: bool,
     /// Flag that detect if the sqlite statement will directly manipulate the database file.\
-    /// mirrors: https://sqlite.org/c3ref/stmt_readonly.html.
+    /// mirrors: <https://sqlite.org/c3ref/stmt_readonly.html>.
     pub readonly: bool,
     pub result_columns: Vec<ResultSetColumn>,
     pub table_references: TableReferences,
@@ -1836,12 +2058,20 @@ pub struct PreparedProgram {
     pub refreshes_analyze_stats: bool,
     /// Whether the statement needs to be wrapped in a statement subtransaction
     /// when run as part of an interactive (non-autocommit) transaction.
-    /// See [crate::vdbe::builder::ProgramBuilder::is_multi_write] and [crate::vdbe::builder::ProgramBuilder::may_abort] for more details.
+    /// See `crate::vdbe::builder::ProgramBuilder::is_multi_write` and [crate::vdbe::builder::ProgramBuilder::may_abort] for more details.
     pub needs_stmt_subtransactions: Arc<AtomicBool>,
     /// If this Program is a trigger subprogram, a ref to the trigger is stored here.
     pub trigger: Option<Arc<Trigger>>,
     /// Whether this program is a subprogram (trigger or FK action) that runs within a parent statement.
     pub is_subprogram: bool,
+    /// Whether the schema this program was translated against has any
+    /// materialized views. Lets `op_insert`/`op_delete` skip change-log
+    /// routing entirely for ordinary databases. A schema change always bumps
+    /// the schema cookie, which forces this program to be reprepared (see
+    /// `CheckSchemaCookie` in `core/vdbe/execute.rs`) before it can observe a
+    /// materialized view that didn't exist when it was built, so the flag
+    /// can't go stale while this program is running.
+    pub has_materialized_views: bool,
     pub resolve_type: ResolveType,
     pub prepare_context: PrepareContext,
     /// Set of attached database indices that need write transactions.
@@ -2203,20 +2433,24 @@ impl Program {
         if !vdbe_trace {
             return;
         }
+        let snapshots: Box<[_]> = state
+            .registers
+            .iter()
+            .map(|register| format!("{register:?}"))
+            .collect();
         // Diff registers from PREVIOUS opcode
         // The last opcode (Halt) won't have its diff printed, but Halt
         // doesn't write to any registers
-        if let Some(ref old) = state.pre_op_registers {
-            for (i, (old_reg, new_reg)) in old.iter().zip(state.registers.iter()).enumerate() {
+        if let Some(old) = state.pre_op_registers.take() {
+            for (i, (old_reg, new_reg)) in old.iter().zip(snapshots.iter()).enumerate() {
                 if old_reg != new_reg {
-                    match new_reg {
+                    match &state.registers[i] {
                         Register::Value(v) => eprintln!("R[{i}] = {v}"),
                         Register::Aggregate(_) => eprintln!("R[{i}] = <aggregate>"),
                         Register::Record(_) => eprintln!("R[{i}] = <record>"),
                     }
                 }
             }
-            state.pre_op_registers = None;
         }
 
         // Print CURRENT opcode
@@ -2234,7 +2468,7 @@ impl Program {
             )
         );
         // Snapshot for next iteration
-        state.pre_op_registers = Some(state.registers.clone());
+        state.pre_op_registers = Some(snapshots);
     }
 
     /// Step in [QueryMode::Normal]
@@ -2256,6 +2490,7 @@ impl Program {
         match &result {
             ProgramStep::Row => {}
             ProgramStep::Done => {
+                crate::native_ext::close_cursors(&mut state.cursors);
                 state.execution_state = ProgramExecutionState::Done;
             }
             ProgramStep::Interrupt => {
@@ -2464,11 +2699,12 @@ impl Program {
         None
     }
 
-    /// A trigger returned FAIL before the parent program reached Halt. FAIL
-    /// keeps changes made by earlier rows, so their index-method writes must
-    /// finish before abort() releases the statement savepoint and commits
-    /// those partial changes. None means the staging finished its IO inline
-    /// and the loop starts over.
+    /// A FAIL-mode error (ON CONFLICT FAIL, or RAISE(FAIL) in a trigger)
+    /// ended the statement before the normal Halt completion. FAIL keeps
+    /// changes made by earlier rows, so they must reach the materialized
+    /// views and their index-method writes must finish before abort()
+    /// releases the statement savepoint and commits those partial changes.
+    /// None means this work finished its IO inline and the loop starts over.
     #[cold]
     #[inline(never)]
     fn prepare_pending_fail(
@@ -2481,7 +2717,12 @@ impl Program {
             .pending_fail_prepare_error
             .take()
             .expect("the caller checked the pending error");
-        match execute::index_method_stage_statement_all(state) {
+        let prepared = match self.maintain_views_for_kept_changes(state, pager) {
+            Ok(IOResult::Done(())) => execute::index_method_stage_statement_all(state),
+            Ok(IOResult::IO(io)) => Ok(IOResult::IO(io)),
+            Err(err) => Err(Box::new(err)),
+        };
+        match prepared {
             Ok(IOResult::Done(())) => {
                 if let Err(abort_err) = self.abort(pager, Some(&fail_error), state, true) {
                     tracing::error!("Abort failed after preparing FAIL index methods: {abort_err}");
@@ -2503,11 +2744,13 @@ impl Program {
             }
             Err(prepare_error) => {
                 // FAIL may keep earlier base-table rows only when every
+                // dependent materialized view was maintained and every
                 // matching index-method write was staged successfully.
-                // Once preparation fails, committing those rows would
-                // leave the table and index out of sync, so roll back the
-                // whole transaction while returning the real preparation
-                // error to the caller.
+                // Once either fails, committing those rows would leave the
+                // table out of sync with its views or indexes. A FAIL
+                // statement usually has no statement journal to undo just
+                // its own rows, so roll back the whole transaction while
+                // returning the real preparation error to the caller.
                 let rollback_error =
                     LimboError::Raise(ResolveType::Rollback, prepare_error.to_string());
                 if let Err(abort_err) = self.abort(pager, Some(&rollback_error), state, true) {
@@ -2663,108 +2906,55 @@ impl Program {
         }
     }
 
-    #[instrument(skip_all, level = Level::DEBUG)]
-    fn apply_view_deltas(
+    /// Apply and consume the transaction change log, resetting the resumable
+    /// state once the batch is complete.
+    ///
+    /// Write statements that keep their changes call this (through
+    /// `maintain_views_for_kept_changes`) before releasing their statement
+    /// savepoint. Consequently the view btree and every hidden
+    /// operator integral advance in the same transaction as the base-table
+    /// write. Commit calls it as well to consume any batch left by an unusual
+    /// execution path.
+    pub(crate) fn apply_pending_view_deltas(
         &self,
         state: &mut ProgramState,
         rollback: bool,
         pager: &Arc<Pager>,
-    ) -> IOResultOr<()> {
-        use crate::types::IOResult;
-
-        loop {
-            match &state.view_delta_state {
-                ViewDeltaCommitState::NotStarted => {
-                    if self.connection.view_transaction_states.is_empty() {
-                        return Ok(IOResult::Done(()));
-                    }
-
-                    if rollback {
-                        // On rollback, just clear and done
-                        self.connection.view_transaction_states.clear();
-                        return Ok(IOResult::Done(()));
-                    }
-
-                    // Not a rollback - proceed with processing
-                    let schema = self.connection.schema.read();
-
-                    // Collect materialized views - they should all have storage
-                    let mut views = Vec::new();
-                    for view_name in self.connection.view_transaction_states.get_view_names() {
-                        if let Some(view_mutex) = schema.get_materialized_view(&view_name) {
-                            let view = view_mutex.lock();
-                            let root_page = view.get_root_page();
-
-                            // Materialized views should always have storage (root_page != 0)
-                            turso_assert_ne!(
-                                root_page, 0,
-                                "Materialized view should have a root page",
-                                { "view_name": view_name }
-                            );
-
-                            views.push(view_name);
-                        }
-                    }
-
-                    state.view_delta_state = ViewDeltaCommitState::Processing {
-                        views,
-                        current_index: 0,
-                    };
-                }
-
-                ViewDeltaCommitState::Processing {
-                    views,
-                    current_index,
-                } => {
-                    // At this point we know it's not a rollback
-                    if *current_index >= views.len() {
-                        // All done, clear the transaction states
-                        self.connection.view_transaction_states.clear();
-                        state.view_delta_state = ViewDeltaCommitState::Done;
-                        return Ok(IOResult::Done(()));
-                    }
-
-                    let view_name = &views[*current_index];
-
-                    let table_deltas = self
-                        .connection
-                        .view_transaction_states
-                        .get(view_name)
-                        .expect("view should have transaction state")
-                        .get_table_deltas();
-
-                    let schema = self.connection.schema.read();
-                    if let Some(view_mutex) = schema.get_materialized_view(view_name) {
-                        let mut view = view_mutex.lock();
-
-                        // Create a DeltaSet from the per-table deltas
-                        let mut delta_set = crate::incremental::compiler::DeltaSet::new();
-                        for (table_name, delta) in table_deltas {
-                            delta_set.insert(table_name, delta);
-                        }
-
-                        // Handle I/O from merge_delta - pass pager, circuit will create its own cursor
-                        match view.merge_delta(delta_set, pager.clone())? {
-                            IOResult::Done(_) => {
-                                // Move to next view
-                                state.view_delta_state = ViewDeltaCommitState::Processing {
-                                    views: views.clone(),
-                                    current_index: current_index + 1,
-                                };
-                            }
-                            IOResult::IO(io) => {
-                                // Return I/O, will resume at same index
-                                return Ok(IOResult::IO(io));
-                            }
-                        }
-                    }
-                }
-
-                ViewDeltaCommitState::Done => {
-                    return Ok(IOResult::Done(()));
-                }
+    ) -> Result<IOResult<()>> {
+        match step_view_delta_batch(
+            &self.connection,
+            &mut state.view_delta_state,
+            rollback,
+            pager,
+        )? {
+            IOResult::IO(io) => Ok(IOResult::IO(io)),
+            IOResult::Done(()) => {
+                state.view_delta_state = ViewDeltaApplyState::NotStarted;
+                Ok(IOResult::Done(()))
             }
         }
+    }
+
+    /// Apply the changes a finishing write statement keeps to the
+    /// materialized views, before its statement savepoint is released.
+    ///
+    /// Every path on which a write statement ends and keeps its changes runs
+    /// this first: the normal Halt, and a FAIL-mode error (ON CONFLICT FAIL
+    /// or RAISE(FAIL)), which keeps the rows written before the error. So the
+    /// transaction change log is empty whenever no write statement is
+    /// running. That lets a statement rollback discard the whole log, and
+    /// lets a named savepoint ignore it. Statements that captured nothing
+    /// (no materialized view reads what they wrote) stop at the emptiness
+    /// check.
+    pub(crate) fn maintain_views_for_kept_changes(
+        &self,
+        state: &mut ProgramState,
+        pager: &Arc<Pager>,
+    ) -> Result<IOResult<()>> {
+        if !state.is_active_write || self.connection.transaction_changes.is_empty() {
+            return Ok(IOResult::Done(()));
+        }
+        self.apply_pending_view_deltas(state, false, pager)
     }
 
     pub fn commit_txn(
@@ -2784,14 +2974,11 @@ impl Program {
             );
         }
 
-        // Apply view deltas with I/O handling
-        match self.apply_view_deltas(program_state, rollback, &pager)? {
+        // Apply any view deltas not already consumed at statement completion.
+        match self.apply_pending_view_deltas(program_state, rollback, &pager)? {
             IOResult::IO(io) => return Ok(IOResult::IO(io)),
             IOResult::Done(_) => {}
         }
-
-        // Reset state for next use
-        program_state.view_delta_state = ViewDeltaCommitState::NotStarted;
         // Drop virtual table cursors before the `is_nested_stmt()` check
         // below: a pragma virtual table cursor owns a nested helper statement
         // whose guard would otherwise make this top-level statement classify
@@ -2980,9 +3167,7 @@ impl Program {
             match self.step_end_mvcc_txn(state_machine, mv_store)? {
                 IOResult::Done(_) => {
                     assert!(state_machine.is_finalized());
-                    conn.set_mv_tx(None);
-                    conn.set_tx_state(TransactionState::None);
-                    pager.end_read_tx();
+                    conn.end_committed_main_mvcc_tx(&pager);
                     program_state.commit_state = CommitState::Ready;
                     // Fall through to attached phase
                 }
@@ -3171,6 +3356,7 @@ impl Program {
                     // the checkpoint logic can leave read locks held.
                     match attached_pager.commit_wal(
                         WalAutoActions::empty(),
+                        connection.get_wal_autocheckpoint(),
                         connection.get_sync_mode_for_database(db_id)?,
                         connection.get_data_sync_retry(),
                     ) {
@@ -3235,7 +3421,7 @@ impl Program {
     /// Statement teardown passes its actual counted state: a statement that
     /// already finished was released on Done or on its step error, so the
     /// counted statements are all siblings (see
-    /// [`ProgramState::can_autocommit_now`]).
+    /// `ProgramState::can_autocommit_now`).
     pub fn abort(
         &self,
         pager: &Arc<Pager>,
@@ -3255,6 +3441,11 @@ impl Program {
         }
 
         let mut abort_error: Option<LimboError> = None;
+        if let Err(err) = execute::abort_active_subprogram(self, state, err) {
+            capture_abort_error(&mut abort_error, err, "Failed to abort active subprogram");
+        }
+        state.extension_state = crate::native_ext::ExtensionState::None;
+        crate::native_ext::abort_aggregates(&mut state.registers);
         state.explicit_checkpoint_guard = None;
         // PRAGMA journal_mode owns its MVCC checkpoint in active_op_state rather
         // than commit_state. Clean it before transaction abort logic inspects
@@ -3393,6 +3584,13 @@ impl Program {
                 // statement, we cannot pretend COMMIT is still safe: there is
                 // no statement savepoint to undo only the partial UPDATE.
                 self.connection.mark_tx_poisoned();
+                // The transaction can no longer commit. Drop the unfinished
+                // writer's view changes too, so the change log stays empty
+                // while no write statement runs (see
+                // `maintain_views_for_kept_changes`).
+                if !self.connection.transaction_changes.is_empty() {
+                    self.connection.transaction_changes.clear();
+                }
             }
 
             let can_autocommit_now = state.can_autocommit_now(&self.connection, self_counted);
@@ -3623,6 +3821,18 @@ impl Program {
                     }
                 },
             }
+            if (must_rollback_tx_if_needed || inside_explicit_transaction)
+                && !keeps_prior_changes
+                && self.connection.get_auto_commit()
+            {
+                if let Err(err) = execute::vtab_rollback_all(&self.connection) {
+                    capture_abort_error(
+                        &mut abort_error,
+                        err,
+                        "Failed to rollback virtual tables during abort",
+                    );
+                }
+            }
         }
         if state.uses_subjournal {
             pager.stop_use_subjournal();
@@ -3689,6 +3899,19 @@ impl Deref for Program {
     fn deref(&self) -> &PreparedProgram {
         &self.prepared
     }
+}
+
+#[inline(always)]
+fn bump_change_count(count: &AtomicI64) {
+    add_to_change_count(count, 1);
+}
+
+#[inline(always)]
+fn add_to_change_count(count: &AtomicI64, amount: i64) {
+    count.store(
+        count.load(Ordering::Relaxed).wrapping_add(amount),
+        Ordering::Relaxed,
+    );
 }
 
 /// Split a register slice into an immutable ref and a mutable ref at two distinct indices.
@@ -3912,9 +4135,35 @@ fn skip_serial_types(header: &mut &[u8], data: &mut &[u8], n: usize) -> Result<(
 /// Reads the serial type at the front of `header` and moves past it.
 #[inline(always)]
 fn read_serial_type(header: &mut &[u8]) -> Result<u64> {
-    let (serial_type, bytes_read) = read_varint(header)?;
-    *header = &header[bytes_read..];
+    let bytes = *header;
+    if let Some((first, rest)) = bytes.split_first() {
+        if *first < 0x80 {
+            *header = rest;
+            return Ok(u64::from(*first));
+        }
+    }
+    let (serial_type, rest) = split_varint(bytes)?;
+    *header = rest;
     Ok(serial_type)
+}
+
+/// Puts a TEXT value in a register that does not hold text yet.
+#[cold]
+#[inline(never)]
+fn start_text_register(dest: &mut Register, text_data: &[u8]) -> Result<()> {
+    use crate::types::Text;
+    let text_str = crate::storage::sqlite3_ondisk::read_text(text_data)?;
+    dest.set_text(Text::new(text_str.to_string()))
+}
+
+/// Puts a BLOB value in a register that does not hold a blob yet.
+#[cold]
+#[inline(never)]
+fn start_blob_register(dest: &mut Register, blob_data: &[u8]) -> Result<()> {
+    crate::with_value_blob_allocation_site!(RecordDecode, {
+        let blob = crate::types::value_blob_from_slice(blob_data)?;
+        dest.set_blob(blob)
+    })
 }
 
 /// Decodes the value of `serial_type` at the front of `data` into `dest`
@@ -3925,7 +4174,7 @@ fn decode_serial_type_into_register(
     data: &mut &[u8],
     dest: &mut Register,
 ) -> Result<()> {
-    use crate::types::{Extendable, Text};
+    use crate::types::Extendable;
     match serial_type {
         // NULL
         0 => {
@@ -4033,10 +4282,7 @@ fn decode_serial_type_into_register(
                 Register::Value(Value::Blob(existing_blob)) => {
                     existing_blob.do_extend(&blob_data)?;
                 }
-                _ => {
-                    let blob = crate::types::value_blob_from_slice(blob_data)?;
-                    dest.set_blob(blob)?;
-                }
+                _ => start_blob_register(dest, blob_data)?,
             }
             *data = &data[content_size..];
         }),
@@ -4047,19 +4293,11 @@ fn decode_serial_type_into_register(
                 return Err(LimboError::Corrupt("Invalid Text value".into()));
             }
             let text_data = &data[..content_size];
-            let Some(text_str) = crate::types::validate_utf8(text_data) else {
-                mark_unlikely();
-                return Err(LimboError::Corrupt(
-                    "TEXT value contains invalid UTF-8".into(),
-                ));
-            };
             match dest {
                 Register::Value(Value::Text(existing_text)) => {
-                    existing_text.do_extend(&text_str)?;
+                    existing_text.replace_with_bytes(text_data)?;
                 }
-                _ => {
-                    dest.set_text(Text::new(text_str.to_string()))?;
-                }
+                _ => start_text_register(dest, text_data)?,
             }
             *data = &data[content_size..];
         }
@@ -4076,7 +4314,20 @@ fn decode_serial_type_into_register(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ConnectOpts;
     use std::panic::{catch_unwind, AssertUnwindSafe};
+
+    #[test]
+    fn change_count_increment_matches_atomic_wraparound() {
+        let expected = AtomicI64::new(i64::MAX);
+        expected.fetch_add(1, Ordering::Relaxed);
+        let expected = expected.load(Ordering::Relaxed);
+
+        let actual = AtomicI64::new(i64::MAX);
+        bump_change_count(&actual);
+
+        assert_eq!(actual.load(Ordering::Relaxed), expected);
+    }
 
     #[test]
     fn program_step_conversion_preserves_error_allocation() {
@@ -4094,7 +4345,7 @@ mod tests {
             let io = Arc::new(crate::MemoryIO::new());
             let db =
                 crate::Database::open_file(io, ":memory:", Arc::new(crate::SqliteDialect)).unwrap();
-            let conn = db.connect().unwrap();
+            let conn = db.connect(ConnectOpts::new()).unwrap();
             conn.set_vdbe_trace(trace);
             let mut stmt = conn.prepare("SELECT 1 UNION ALL SELECT 2").unwrap();
             assert_eq!(stmt.execution_state(), ProgramExecutionState::Init);
@@ -4126,6 +4377,106 @@ mod tests {
         ));
         state.active_op_state.clear();
         assert!(state.active_op_state.parse_schema().is_none());
+    }
+
+    /// Builds a record payload holding one TEXT value of `value`.
+    fn one_text_record(value: &[u8]) -> Vec<u8> {
+        use crate::storage::sqlite3_ondisk::write_varint_to_vec;
+        let mut header_body = Vec::new();
+        write_varint_to_vec(13 + 2 * value.len() as u64, &mut header_body);
+        let mut payload = Vec::new();
+        write_varint_to_vec(header_body.len() as u64 + 1, &mut payload);
+        payload.extend_from_slice(&header_body);
+        payload.extend_from_slice(value);
+        payload
+    }
+
+    fn decode_one_text(payload: &[u8], destination: &mut Register) -> Result<()> {
+        let mut iterator = crate::types::ValueIterator::new(payload)?;
+        iterator
+            .nth_into_register(0, destination)
+            .expect("record contains one value")
+    }
+
+    fn register_text(destination: &Register) -> &str {
+        match destination {
+            Register::Value(Value::Text(text)) => text.as_str(),
+            other => panic!("expected text, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn text_decode_into_a_reused_register_keeps_every_length() {
+        let mut destination = Register::Value(Value::Null);
+        // Grow the buffer first so later values take the reuse path.
+        let long: Vec<u8> = (0..80usize).map(|i| b'a' + (i % 26) as u8).collect();
+        decode_one_text(&one_text_record(&long), &mut destination).unwrap();
+        assert_eq!(register_text(&destination).len(), 80);
+
+        for len in 0..=80usize {
+            let value: Vec<u8> = (0..len).map(|i| b'A' + (i % 26) as u8).collect();
+            decode_one_text(&one_text_record(&value), &mut destination).unwrap();
+            assert_eq!(
+                register_text(&destination).as_bytes(),
+                value.as_slice(),
+                "length {len}"
+            );
+        }
+    }
+
+    #[test]
+    fn text_decode_into_a_reused_register_keeps_multibyte_utf8() {
+        let mut destination = Register::Value(Value::Null);
+        let long: Vec<u8> = (0..80usize).map(|i| b'a' + (i % 26) as u8).collect();
+        decode_one_text(&one_text_record(&long), &mut destination).unwrap();
+
+        for value in [
+            "é",
+            "héllo",
+            "日本語",
+            "\u{1F600}",
+            "aé",
+            "ααααααααα",
+            "ααααααααααααααααααααααααααααααααααα",
+        ] {
+            decode_one_text(&one_text_record(value.as_bytes()), &mut destination).unwrap();
+            assert_eq!(register_text(&destination), value);
+        }
+    }
+
+    #[test]
+    fn text_decode_reads_a_serial_type_that_needs_two_varint_bytes() {
+        let mut destination = Register::Value(Value::Null);
+        let value: Vec<u8> = (0..200usize).map(|i| b'a' + (i % 26) as u8).collect();
+        decode_one_text(&one_text_record(&value), &mut destination).unwrap();
+        assert_eq!(register_text(&destination).as_bytes(), value.as_slice());
+
+        decode_one_text(&one_text_record(b"short"), &mut destination).unwrap();
+        assert_eq!(register_text(&destination), "short");
+    }
+
+    #[test]
+    fn text_decode_rejects_invalid_utf8_and_leaves_the_register_usable() {
+        let mut destination = Register::Value(Value::Null);
+        let long: Vec<u8> = (0..80usize).map(|i| b'a' + (i % 26) as u8).collect();
+        decode_one_text(&one_text_record(&long), &mut destination).unwrap();
+
+        let short_invalid = [0xff, 0xfe];
+        let long_invalid = [0xff; 20];
+        for invalid in [&short_invalid[..], &long_invalid[..]] {
+            let result = decode_one_text(&one_text_record(invalid), &mut destination);
+            assert!(
+                matches!(
+                    result,
+                    Err(LimboError::Corrupt(ref message))
+                        if message == "TEXT value contains invalid UTF-8"
+                ),
+                "unexpected result: {result:?}"
+            );
+            let _ = register_text(&destination);
+        }
+        decode_one_text(&one_text_record(b"ok"), &mut destination).unwrap();
+        assert_eq!(register_text(&destination), "ok");
     }
 
     #[test]
@@ -4165,7 +4516,7 @@ mod tests {
 
         *state.active_op_state.insert() = OpInsertState {
             sub_state: OpInsertSubState::Seek,
-            has_dependent_views: false,
+            route: None,
             old_record: None,
             is_noop_update: false,
         };
@@ -4179,12 +4530,10 @@ mod tests {
     }
 
     #[test]
-    fn register_try_clone_copies_each_variant() {
+    fn register_try_clone_copies_values_and_records() {
         let record_values = [Value::from_i64(1), Value::build_text("record payload")];
-        let aggregate_values = crate::alloc::vec![Value::build_text("aggregate payload")];
         let registers = [
             Register::Value(Value::build_text("value")),
-            Register::Aggregate(AggContext::Builtin(aggregate_values)),
             Register::Record(
                 ImmutableRecord::from_values(&record_values, record_values.len()).unwrap(),
             ),
@@ -4233,14 +4582,6 @@ mod tests {
             Register::Record(record) => assert_eq!(record.get_payload().as_ptr(), ptr),
             _ => unreachable!(),
         }
-
-        let src = Register::Aggregate(AggContext::Builtin(crate::alloc::vec![
-            Value::build_text("agg state"),
-            Value::from_i64(2),
-        ]));
-        let mut dst = Register::Value(Value::Null);
-        dst.try_clone_from(&src).unwrap();
-        assert_eq!(dst, src);
     }
 
     #[test]

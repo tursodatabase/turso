@@ -1,0 +1,57 @@
+@database :temp:
+@skip-file-if sqlite "MVCC is not supported in SQLite"
+
+test mvcc-integrity-check-skips-index-dropped-before-update {
+    PRAGMA journal_mode='MVCC';
+    CREATE TABLE t1(id INTEGER PRIMARY KEY, b TEXT);
+    CREATE INDEX i2 ON t1(b);
+    INSERT INTO t1 VALUES (480, 'y');
+    PRAGMA wal_checkpoint(TRUNCATE);
+    BEGIN;
+    DROP INDEX i2;
+    UPDATE t1 SET b = 'q1' WHERE b = 'y';
+    PRAGMA integrity_check;
+    ROLLBACK;
+}
+expect {
+    mvcc
+    0|0|0
+    ok
+}
+
+test mvcc-integrity-check-skips-index-dropped-before-delete {
+    PRAGMA journal_mode='MVCC';
+    CREATE TABLE t1(id INTEGER PRIMARY KEY, b TEXT);
+    CREATE INDEX i2 ON t1(b);
+    INSERT INTO t1 VALUES (480, 'y');
+    PRAGMA wal_checkpoint(TRUNCATE);
+    BEGIN;
+    DROP INDEX i2;
+    DELETE FROM t1;
+    PRAGMA integrity_check;
+    ROLLBACK;
+}
+expect {
+    mvcc
+    0|0|0
+    ok
+}
+
+test mvcc-integrity-check-skips-index-dropped-and-recreated-with-same-name {
+    PRAGMA journal_mode='MVCC';
+    CREATE TABLE t1(id INTEGER PRIMARY KEY, b TEXT);
+    CREATE INDEX i2 ON t1(b);
+    INSERT INTO t1 VALUES (480, 'y');
+    PRAGMA wal_checkpoint(TRUNCATE);
+    BEGIN;
+    DROP INDEX i2;
+    CREATE INDEX i2 ON t1(id);
+    UPDATE t1 SET b = 'q1';
+    PRAGMA integrity_check;
+    ROLLBACK;
+}
+expect {
+    mvcc
+    0|0|0
+    ok
+}

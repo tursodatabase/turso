@@ -26,10 +26,11 @@ This document is a quick helper to get you going.
   - [Fault injection with unreliable libc](#fault-injection-with-unreliable-libc)
   - [Antithesis](#antithesis)
   - [Adding Third Party Dependencies](#adding-third-party-dependencies)
-  - [Making Releases](#making-releases)
-    - [Pre-releases](#pre-releases)
-    - [Releases](#releases)
-    - [Cleaning up PyPI Storage](#cleaning-up-pypi-storage)
+  - [Release process](#release-process)
+    - [Release lifecycle](#release-lifecycle)
+    - [Building a release](#building-a-release)
+  - [Backporting commits](#backporting-commits)
+  - [Cleaning up PyPI Storage](#cleaning-up-pypi-storage)
 <!--toc:end-->
 
 ## Getting Started
@@ -296,6 +297,15 @@ $env:VCPKG_ROOT = "C:\path\to\vcpkg"
 vcpkg install sqlite3:x64-windows-static-md
 ```
 
+3. uv is needed because `make test` uses it to install and run the Python test packages (`uv sync` and `uv run`). You can install it using `brew` on macOS/Linux:
+```console
+brew install uv
+```
+Or using `pipx`:
+```console
+pipx install uv
+```
+
 ### Running the tests
 To run the test suite with Turso, simply run:
 
@@ -443,6 +453,15 @@ testing (DST) tool for the following:
 - Discovering bugs that the DST did not catch (and improve the DST)
 - Discovering bugs that the DST does not cover (for example, non-simulated I/O)
 
+The test templates live in `testing/antithesis/`. You can run one locally, without an Antithesis account, with
+[`thesis`](tools/thesis):
+
+```bash
+uv run --group antithesis thesis run testing/antithesis/stress-composer --seed 42
+```
+
+See [`testing/antithesis/README.md`](testing/antithesis/README.md#running-a-template-locally) for details.
+
 If you have an Antithesis account, you first need to configure some
 environment variables:
 
@@ -536,32 +555,83 @@ When you want to add third party dependencies, please follow these steps:
 By following these steps, you ensure that all third-party dependencies are properly documented and their licenses are
 included in the project.
 
-## Making Releases
+## Release process
 
-Releases are made using the `scripts/update-version.py` script, which updates version numbers across all `Cargo.toml`, `package.json`, `package-lock.json`, `gradle.properties`, and `Directory.Build.props` files in the workspace, creates a git commit, and adds a version tag.
+### Release lifecycle
 
-The process is:
+Development happens on `main`. A release goes through three stages:
 
-1. Run the version update script with the desired version number.
-2. Push the commit and tag to the remote.
+1. **Pre-releases** (`0.9.0-pre.1`, `0.9.0-pre.2`, ...) are tagged on `main`
+   while the next minor version is being developed. They let users try new
+   features before the release.
+2. **Releases** (`0.9.0`) are tagged on `main`. A release branch named after
+   the minor version, such as `v0.9`, is created at the release tag.
+3. **Stable releases** (`0.9.1`, `0.9.2`, ...) are tagged on the release
+   branch. They contain only bug fixes backported from `main` (see
+   [Backporting commits](#backporting-commits)). A stable release is
+   preceded by a pre-release on the release branch, such as `0.9.1-pre.1`.
 
-### Pre-releases
+Only the release branch of the newest minor version receives backports. When
+`0.10.0` is released, `v0.9` stops receiving fixes.
 
-Pre-releases use a version suffix such as `-pre.N`:
+### Building a release
+
+Releases are built with the `scripts/update-version.py` script. The script
+updates the version number in every `Cargo.toml`, `package.json`,
+`package-lock.json`, `gradle.properties`, and `Directory.Build.props` file in
+the workspace, creates a commit, and tags it with the version prefixed by `v`.
+Pushing the tag starts the release workflow in CI. Push the branch and the tag
+with `--atomic` so that either both are pushed or neither is: a tag that points
+to a commit the branch does not have would start a release from the wrong
+commit.
+
+For a pre-release or a release, run the script on `main`:
 
 ```console
-./scripts/update-version.py 0.6.0-pre.9
-git push origin main v0.6.0-pre.9
+./scripts/update-version.py 0.9.0-pre.1
+git push --atomic origin main v0.9.0-pre.1
 ```
-
-### Releases
-
-Releases use a plain version number:
 
 ```console
-./scripts/update-version.py 0.6.0
-git push origin main v0.6.0
+./scripts/update-version.py 0.9.0
+git push --atomic origin main v0.9.0
+git branch v0.9 v0.9.0
+git push origin v0.9
 ```
+
+For a stable release, run the script on the release branch:
+
+```console
+git checkout v0.9
+./scripts/update-version.py 0.9.1
+git push --atomic origin v0.9 v0.9.1
+```
+
+## Backporting commits
+
+A commit is backported to a release branch only if:
+
+* It is already merged on `main`.
+* It fixes a bug users hit: a panic, a hang, corruption, wrong query results,
+  a security issue, a build failure, or a regression. No new features,
+  refactors, or cleanups.
+* It is small enough that a reviewer can verify it by reading it.
+* It includes its regression test.
+* It has passed an Antithesis run on `main`.
+* It does not change on-disk formats or public APIs.
+
+To backport a pull request, cherry-pick its merge commit from `main` onto the
+release branch. The `-x` flag records the original commit in the message and
+`-m 1` picks the changes the merge brought in:
+
+```console
+git checkout v0.9
+git cherry-pick -x -m 1 <merge commit on main>
+git push origin v0.9
+```
+
+If the cherry-pick does not apply cleanly, resolve the conflicts and explain
+what was changed in the commit message.
 
 ## Cleaning up PyPI Storage
 

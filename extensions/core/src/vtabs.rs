@@ -573,6 +573,7 @@ impl Statement {
     /// while stmt.step() == StepResult::Row {
     ///    let row = stmt.get_row();
     ///    println!("row: {:?}", row);
+    /// }
     ///```
     pub fn get_row(&mut self) -> &[Value] {
         unsafe { (*self.0).get_row() }

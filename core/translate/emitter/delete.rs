@@ -6,14 +6,15 @@ use crate::{
     translate::{
         emitter::{
             emit_cdc_autocommit_commit, emit_cdc_full_record, emit_cdc_insns,
-            emit_index_column_value_old_image, emit_program_for_select,
-            get_triggers_including_temp, has_triggers_including_temp, OperationMode, TriggerTime,
+            emit_index_column_value_old_image, emit_partial_index_where_old_image,
+            emit_program_for_select, get_triggers_including_temp, has_triggers_including_temp,
+            OperationMode, TriggerTime,
         },
         eqp::eqp_detail_for_table_op,
         expr::{
             emit_returning_results, emit_returning_scan_back, emit_table_column,
             restore_returning_row_image_in_cache, seed_returning_row_image_in_cache,
-            translate_expr_no_constant_opt, NoConstantOptReason, ReturningBufferCtx,
+            ReturningBufferCtx,
         },
         fkeys::{
             build_index_affinity_string, emit_guarded_fk_decrement, open_read_index,
@@ -29,7 +30,7 @@ use crate::{
     },
     vdbe::{
         builder::{CursorKey, CursorType, ProgramBuilder},
-        insn::{Insn, RegisterOrLiteral},
+        insn::{ClearBtreeCount, Insn, RegisterOrLiteral},
     },
     CaptureDataChangesExt, Connection,
 };
@@ -42,6 +43,21 @@ pub fn emit_program_for_delete(
     resolver: &Resolver,
     program: &mut ProgramBuilder,
     mut plan: DeletePlan,
+) -> Result<()> {
+    if !emit_clear_btree_delete(connection, resolver, program, &plan)? {
+        emit_row_loop_delete(connection, resolver, program, &mut plan)?;
+    }
+
+    program.result_columns = plan.result_columns;
+    program.table_references.extend(plan.table_references);
+    Ok(())
+}
+
+fn emit_row_loop_delete(
+    connection: &Arc<Connection>,
+    resolver: &Resolver,
+    program: &mut ProgramBuilder,
+    plan: &mut DeletePlan,
 ) -> Result<()> {
     let mut t_ctx = Box::new(TranslateCtx::new(
         program,
@@ -273,10 +289,71 @@ pub fn emit_program_for_delete(
         program.emit_insn(Insn::FkCheck { deferred: false });
         emit_returning_scan_back(program, buf);
     }
-    // Finalize program
-    program.result_columns = plan.result_columns;
-    program.table_references.extend(plan.table_references);
     Ok(())
+}
+
+fn emit_clear_btree_delete(
+    connection: &Arc<Connection>,
+    resolver: &Resolver,
+    program: &mut ProgramBuilder,
+    plan: &DeletePlan,
+) -> Result<bool> {
+    if !plan.where_clause.is_empty()
+        || !plan.result_columns.is_empty()
+        || plan.rowset_plan.is_some()
+        || plan.safety.requires_stable_write_set()
+        || program.capture_data_changes_info().is_some()
+        || plan
+            .indexes
+            .iter()
+            .any(|index| index.index_method.is_some())
+    {
+        return Ok(false);
+    }
+
+    let table_ref = plan
+        .table_references
+        .joined_tables()
+        .first()
+        .expect("DELETE always has one joined table");
+    let Some(table) = table_ref.btree() else {
+        return Ok(false);
+    };
+    if connection.mv_store_for_db(table_ref.database_id).is_some() {
+        return Ok(false);
+    }
+
+    let table_name = table_ref.table.get_name();
+    let has_dependent_views = resolver.with_schema(table_ref.database_id, |schema| {
+        !schema
+            .get_dependent_materialized_views(table_name)
+            .is_empty()
+    });
+    if has_dependent_views {
+        return Ok(false);
+    }
+    if connection.foreign_keys_enabled() {
+        let has_foreign_keys = resolver.with_schema(table_ref.database_id, |schema| {
+            schema.any_resolved_fks_referencing(table_name) || schema.has_child_fks(table_name)
+        });
+        if has_foreign_keys {
+            return Ok(false);
+        }
+    }
+
+    for index in &plan.indexes {
+        program.emit_insn(Insn::ClearBtree {
+            db: table_ref.database_id,
+            root: index.root_page,
+            count: ClearBtreeCount::RowsWritten,
+        });
+    }
+    program.emit_insn(Insn::ClearBtree {
+        db: table_ref.database_id,
+        root: table.root_page,
+        count: ClearBtreeCount::ChangesAndRowsWritten,
+    });
+    Ok(true)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -470,6 +547,7 @@ fn emit_delete_insns<'a>(
     let btree_table = unsafe { &*table_reference }.btree();
     let database_id = unsafe { (*table_reference).database_id };
     let main_table_cursor_id = program.resolve_cursor_id(&CursorKey::table(internal_id));
+    let iteration_index = unsafe { &*table_reference }.op.index();
     let has_returning = !result_columns.is_empty();
     let has_delete_triggers = if let Some(btree_table) = btree_table {
         has_triggers_including_temp(
@@ -485,6 +563,13 @@ fn emit_delete_insns<'a>(
 
     let cols_len = unsafe { &*table_reference }.columns().len();
     let (columns_start_reg, rowid_reg): (Option<usize>, usize) = {
+        // An index can supply all values without moving the table cursor.
+        // SQLite finishes the deferred move before it reads the row for deletion.
+        if iteration_index.is_some() {
+            program.emit_insn(Insn::FinishSeek {
+                cursor_id: main_table_cursor_id,
+            });
+        }
         // Get rowid for RETURNING
         let rowid_reg = program.alloc_register();
         program.emit_insn(Insn::RowId {
@@ -524,9 +609,6 @@ fn emit_delete_insns<'a>(
         }
     };
 
-    // Get the index that is being used to iterate the deletion loop, if there is one.
-    let iteration_index = unsafe { &*table_reference }.op.index();
-
     // Capture iteration index key values BEFORE deleting the main table row,
     // since the main table cursor will be invalidated after deletion.
     let iteration_idx_delete_ctx = if let Some(index) = iteration_index {
@@ -549,7 +631,7 @@ fn emit_delete_insns<'a>(
             cursor_id: main_table_cursor_id,
             dest: start_reg + num_regs - 1,
         });
-        Some((iteration_index_cursor, start_reg, num_regs, index))
+        Some((iteration_index_cursor, start_reg, num_regs))
     } else {
         None
     };
@@ -567,18 +649,17 @@ fn emit_delete_insns<'a>(
         main_table_cursor_id,
         iteration_index,
         Some(cursor_id), // Use the cursor_id from the operation for virtual tables
-        resolver,
         returning_buffer,
     )?;
 
     // Delete from the iteration index after deleting from the main table,
     // using the key values captured above.
-    if let Some((iteration_index_cursor, start_reg, num_regs, index)) = iteration_idx_delete_ctx {
+    if let Some((iteration_index_cursor, start_reg, num_regs)) = iteration_idx_delete_ctx {
         program.emit_insn(Insn::IdxDelete {
             start_reg,
             num_regs,
             cursor_id: iteration_index_cursor,
-            raise_error_if_no_matching_entry: index.where_clause.is_none(),
+            raise_error_if_no_matching_entry: true,
         });
     }
     Ok(())
@@ -605,7 +686,6 @@ fn emit_delete_row_common(
     main_table_cursor_id: usize,
     skip_iteration_index: Option<&Arc<crate::schema::Index>>,
     virtual_table_cursor_id: Option<usize>,
-    resolver: &Resolver,
     returning_buffer: Option<&ReturningBufferCtx>,
 ) -> Result<()> {
     let internal_id = unsafe { (*table_reference).internal_id };
@@ -688,29 +768,23 @@ fn emit_delete_row_common(
             .collect::<Vec<_>>();
 
         for (index, index_cursor_id) in indexes_to_delete {
-            let skip_delete_label = if index.where_clause.is_some() {
-                let where_copy = index
-                    .bind_where_expr(Some(table_references), resolver)?
-                    .expect("index.where_clause was checked to be Some above");
+            let skip_delete_label = emit_partial_index_where_old_image(
+                program,
+                &t_ctx.resolver,
+                table_references,
+                main_table_cursor_id,
+                internal_id,
+                &index,
+            )?
+            .map(|where_reg| {
                 let skip_label = program.allocate_label();
-                let reg = program.alloc_register();
-                translate_expr_no_constant_opt(
-                    program,
-                    Some(table_references),
-                    &where_copy,
-                    reg,
-                    &t_ctx.resolver,
-                    NoConstantOptReason::RegisterReuse,
-                )?;
                 program.emit_insn(Insn::IfNot {
-                    reg,
+                    reg: where_reg,
                     jump_if_null: true,
                     target_pc: skip_label,
                 });
-                Some(skip_label)
-            } else {
-                None
-            };
+                skip_label
+            });
             let num_regs = index.columns.len() + 1;
             let start_reg = program.alloc_registers(num_regs);
             for (reg_offset, column_index) in index.columns.iter().enumerate() {
@@ -732,7 +806,7 @@ fn emit_delete_row_common(
                 start_reg,
                 num_regs,
                 cursor_id: index_cursor_id,
-                raise_error_if_no_matching_entry: index.where_clause.is_none(),
+                raise_error_if_no_matching_entry: true,
             });
             if let Some(label) = skip_delete_label {
                 program.preassign_label_to_next_insn(label);
@@ -749,10 +823,6 @@ fn emit_delete_row_common(
                     table_reference.table.columns(),
                     main_table_cursor_id,
                     rowid_reg,
-                    table_reference
-                        .table
-                        .btree()
-                        .is_some_and(|btree| btree.is_strict),
                 ))
             } else {
                 None
@@ -807,7 +877,6 @@ fn emit_delete_row_common(
                     *subquery_plan,
                     &subquery.query_type,
                     subquery.correlated || rerun_for_target_scan,
-                    true,
                 )?;
             }
             Ok(())
@@ -975,7 +1044,6 @@ fn emit_delete_insns_when_triggers_present(
         main_table_cursor_id,
         None, // Don't skip any indexes when deleting from RowSet
         None, // Use main_table_cursor_id for virtual tables
-        resolver,
         returning_buffer,
     )?;
 

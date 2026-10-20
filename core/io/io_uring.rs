@@ -191,7 +191,7 @@ impl IovecPool {
 
 impl UringIO {
     pub fn new() -> Result<Self> {
-        let ring = io_uring::IoUring::new(ENTRIES).map_err(|e| io_error(e, "io_uring_setup"))?;
+        let ring = io_uring::IoUring::new(ENTRIES).map_err(explain_setup_failure)?;
         // RL_MEMLOCK cap is typically 8MB, the current design is to have one large arena
         // registered at startup and therefore we can simply use the zero index, falling back
         // to similar logic as the existing buffer pool for cases where it is over capacity.
@@ -224,6 +224,31 @@ impl UringIO {
             wait_lock: Arc::new(Mutex::new(())),
             caps: Arc::new(caps),
         })
+    }
+}
+
+fn explain_setup_failure(e: std::io::Error) -> LimboError {
+    match e.kind() {
+        ErrorKind::Unsupported => LimboError::IoBackendUnavailable(format!(
+            "io_uring_setup: not supported (host kernel version {})",
+            read_kernel_setting("osrelease").unwrap_or_else(|| "unknown".to_string())
+        )),
+        ErrorKind::PermissionDenied => LimboError::IoBackendUnavailable(
+            permission_denied_message(read_kernel_setting("io_uring_disabled").as_deref()),
+        ),
+        _ => io_error(e, "io_uring_setup"),
+    }
+}
+
+fn read_kernel_setting(name: &str) -> Option<String> {
+    let setting = std::fs::read_to_string(format!("/proc/sys/kernel/{name}")).ok()?;
+    Some(setting.trim().to_string())
+}
+
+fn permission_denied_message(disabled: Option<&str>) -> String {
+    match disabled {
+        Some(setting) => format!("io_uring_setup: permission denied (io_uring_disabled={setting})"),
+        None => "io_uring_setup: permission denied".to_string(),
     }
 }
 
@@ -890,5 +915,17 @@ mod tests {
     #[test]
     fn test_multiple_processes_cannot_open_file() {
         common::tests::test_multiple_processes_cannot_open_file(UringIO::new);
+    }
+
+    #[test]
+    fn permission_denied_names_the_kernel_setting() {
+        assert_eq!(
+            permission_denied_message(Some("2")),
+            "io_uring_setup: permission denied (io_uring_disabled=2)"
+        );
+        assert_eq!(
+            permission_denied_message(None),
+            "io_uring_setup: permission denied"
+        );
     }
 }

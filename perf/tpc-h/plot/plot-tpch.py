@@ -11,11 +11,13 @@ Usage: ./results2csv.sh ../results_<timestamp>-r1.txt > results-r1.csv
 Every CSV is one run over all the queries, with one row per query and one
 column per engine, as `results2csv.sh` writes it: `Query,Limbo,SQLite`.
 Every query gets a group of bars, one per engine, with runtime in seconds
-up a log axis so a query that takes a fifth of a second and one that
-takes a minute both read. A bar is the median over the runs, and its
+up a linear axis that starts at zero. A bar is the median over the runs, and its
 whiskers reach the fastest and the slowest run; with a single CSV there
 are no whiskers. Under the bars sits a table with the median of every
 bar, one row per engine and one column per query, lined up with the bars.
+In every column the fastest median is in bold, as TPC-H result tables
+usually mark the winner; when the fastest medians round to the same
+number no cell is bold.
 A query an engine did not run (`NA` in the CSV) has no bar and `n/a` in
 its cell, so a gap is never mistaken for a fast run.
 
@@ -136,15 +138,13 @@ class Figure:
         self.queries = [row["Query"] for row in runs[0].rows]
         self.series = [Series(c, i, self.queries, runs, names.get(c.lower())) for i, c in enumerate(columns)]
         self.whiskers = len(runs) > 1
-        lows = [t for s in self.series for t in s.lows if t is not None]
         highs = [t for s in self.series for t in s.highs if t is not None]
-        if not lows:
+        if not highs:
             raise SystemExit("no query finished on any engine")
-        # A decade of headroom under the fastest run and over the slowest,
-        # so the shortest bar still has height and the legend fits over the tallest.
-        self.ymin = 10 ** np.floor(np.log10(min(lows)))
-        self.ymax = 10 ** (np.ceil(np.log10(max(highs))) + 0.5)
+        # Headroom over the slowest run so the legend fits over the tallest bar.
+        self.ymax = max(highs) * 1.15
         self.bar_width = GROUP_WIDTH / len(self.series)
+        self.fastest = fastest_cells(self.series, len(self.queries))
 
     def offset(self, index):
         """How far the bars of the engine at `index` sit from the query's centre."""
@@ -156,12 +156,11 @@ class Figure:
         matplotlib.use("Agg")
         import matplotlib.pyplot as plt
         import scienceplots  # noqa: F401  (registers the styles)
-        from matplotlib.ticker import FuncFormatter, NullLocator
+        from matplotlib.ticker import NullLocator
 
         plt.style.use(["science", "no-latex"])
 
         fig, ax = plt.subplots(figsize=(7.2, 2.8), dpi=300)
-        ax.set_yscale("log")
         ax.grid(True, axis="y", which="major", linewidth=0.5, linestyle=(0, (2, 2)), color="0.7")
         ax.set_axisbelow(True)
         x = np.arange(len(self.queries))
@@ -177,8 +176,7 @@ class Figure:
         ax.set_xticks([])
         ax.xaxis.set_minor_locator(NullLocator())
         ax.set_xlim(-0.5, len(self.queries) - 0.5)
-        ax.set_ylim(self.ymin, self.ymax)
-        ax.yaxis.set_major_formatter(FuncFormatter(lambda v, _: f"{v:g}"))
+        ax.set_ylim(0, self.ymax)
         ax.yaxis.set_minor_locator(NullLocator())
         ax.set_ylabel("Runtime (s)")
         table = ax.table(cellText=[[cell_text(t) for t in s.times] for s in self.series],
@@ -191,6 +189,10 @@ class Figure:
         for cell in table.get_celld().values():
             cell.set_linewidth(0.4)
             cell.set_edgecolor("black")
+        for row, s in enumerate(self.series, start=1):
+            for column, fastest in enumerate(self.fastest[row - 1]):
+                if fastest:
+                    table[row, column].get_text().set_fontweight("bold")
         ax.legend(loc="upper left", ncol=len(self.series), frameon=False,
                   handlelength=1.0, handletextpad=0.4, columnspacing=1.8)
         fig.savefig(output, bbox_inches="tight")
@@ -209,8 +211,7 @@ class Figure:
         out.append(rf"""\begin{{axis}}[
   scale only axis, width=0.92\linewidth, height=0.36\linewidth, clip=false,
   ybar, bar width={self.bar_width:.4g}, bar shift=0pt,
-  ymode=log, log origin=infty, ymin={self.ymin:g}, ymax={self.ymax:.4g},
-  log ticks with fixed point, yminorticks=false,
+  ymin=0, ymax={self.ymax:.4g}, yminorticks=false,
   xmin=-0.5, xmax={n - 0.5:g}, xtick=\empty, xminorticks=false,
   ylabel={{Runtime (s)}},
   ymajorgrids, grid style={{line width=0.3pt, dashed, draw=black!30}},
@@ -244,7 +245,9 @@ class Figure:
         `axis description cs`, whose x runs 0 to 1 across the axis, shifted
         down from the axis bottom by whole rows of `TABLE_ROW_HEIGHT`."""
         n = len(self.queries)
-        rows = [self.queries] + [[cell_text(t) for t in s.times] for s in self.series]
+        rows = [self.queries] + [[rf"\textbf{{{cell_text(t)}}}" if fastest else cell_text(t)
+                                  for t, fastest in zip(s.times, self.fastest[i])]
+                                 for i, s in enumerate(self.series)]
         labels = [""] + [s.label for s in self.series]
         out = [
             r"\begin{scope}[every node/.style={font=\tiny, scale=0.85, transform shape, inner sep=0pt},"
@@ -266,6 +269,22 @@ class Figure:
                            rf"axis description cs:0,0) {{{label}}};")
         out.append(r"\end{scope}")
         return out
+
+
+def fastest_cells(series, query_count):
+    """For every engine and query, whether the engine's median is the one
+    fastest median for the query as the table prints it. Comparing the
+    printed numbers means two medians that show up the same are a tie."""
+    fastest = [[False] * query_count for _ in series]
+    for q in range(query_count):
+        shown = [(float(cell_text(s.times[q])), i) for i, s in enumerate(series) if s.times[q] is not None]
+        if len(shown) < 2:
+            continue
+        best = min(t for t, _ in shown)
+        winners = [i for t, i in shown if t == best]
+        if len(winners) == 1:
+            fastest[winners[0]][q] = True
+    return fastest
 
 
 def cell_text(time):

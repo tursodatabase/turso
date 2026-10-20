@@ -450,7 +450,7 @@ export class Session {
     // Add column name properties to the array as non-enumerable
     // Only add valid identifier names to avoid conflicts
     columns.forEach((column, index) => {
-      if (column && isValidIdentifier(column)) {
+      if (column && isValidIdentifier(column) && !Object.prototype.hasOwnProperty.call(row, column)) {
         Object.defineProperty(row, column, {
           value: values[index],
           enumerable: false,

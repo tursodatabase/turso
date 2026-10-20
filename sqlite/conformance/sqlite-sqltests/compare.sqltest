@@ -728,3 +728,13 @@ expect {
 expect @js {
     -1870756973399217200|0|0|1
 }
+
+test compare-text-operands-affinity-and-collation {
+    CREATE TABLE t(d DATE, b, n NUMERIC, c TEXT COLLATE NOCASE);
+    INSERT INTO t VALUES ('1997-06-01', '9', '10x', 'abc'), ('1997-09-01', '10', '9x', 'ABD');
+    SELECT d, d >= '1997-06-01', d < '1997-09-01', b < n, b > n, b = '9', c = 'ABC', c < 'abd', b < '10' FROM t;
+}
+expect {
+    1997-06-01|1|1|1|0|1|1|1|0
+    1997-09-01|1|0|1|0|0|0|0|0
+}

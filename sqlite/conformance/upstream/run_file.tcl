@@ -9,18 +9,27 @@
 # summary line and count the file as running zero tests. This wrapper
 # catches that error, reports it as one extra failure named
 # FILE-ABORTED, and then prints the summary for the tests that did run.
+#
+# The file runs in its own empty directory, scratch/FILE, so the databases
+# and other files it creates do not end up in the directory tclsh was
+# started from, and are not left over for the next file.
 
 # The variables here have a __run_file prefix so a test file's own globals
 # (several use "file" and "name") cannot clobber them.
-set __run_file_path [lindex $argv 0]
+set __run_file_path [file normalize [lindex $argv 0]]
+set __run_file_name [file rootname [file tail $__run_file_path]]
 set argv0 $__run_file_path
 set argv [lrange $argv 1 end]
 set testdir [file dirname $__run_file_path]
 
+set __run_file_scratch [file join $testdir scratch $__run_file_name]
+file delete -force $__run_file_scratch
+file mkdir $__run_file_scratch
+cd $__run_file_scratch
+
 set __run_file_rc [catch {uplevel #0 [list source $__run_file_path]} \
     __run_file_err __run_file_opts]
 if {$__run_file_rc != 0 && $__run_file_rc != 2} {
-  set __run_file_name [file rootname [file tail $__run_file_path]]
   set __run_file_where ""
   regexp {\(file "[^"]*" line (\d+)\)} \
       [dict get $__run_file_opts -errorinfo] -> __run_file_where

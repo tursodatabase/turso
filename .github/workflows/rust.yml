@@ -19,6 +19,9 @@ env:
   # Blacksmith Windows images ship VS Build Tools without LLVM, so the aegis
   # crate's clang-cl preference fails; force the MSVC compiler instead.
   CC_x86_64_pc_windows_msvc: cl.exe
+  # Keeps file and line numbers in backtraces but drops the rest of the
+  # debug info, which makes the Rust cache entries smaller.
+  CARGO_PROFILE_DEV_DEBUG: line-tables-only
 
 jobs:
   license-check:
@@ -69,6 +72,12 @@ jobs:
             blacksmith-6vcpu-macos-latest,
             blacksmith-8vcpu-windows-2025,
           ]
+        # The main nextest run and the smaller suites (sync-dir, leak check,
+        # doctests) run on separate machines at the same time instead of one
+        # after another. On pull requests the nextest run is also split in two
+        # with nextest's --partition (every test runs in exactly one part); on
+        # main it stays one job so coverage covers the whole suite.
+        suite: ${{ github.event_name == 'pull_request' && fromJSON('["nextest 1/2", "nextest 2/2", "extra"]') || fromJSON('["nextest", "extra"]') }}
 
     runs-on: ${{ matrix.os }}
 
@@ -77,38 +86,61 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: llvm-tools-preview
+      - name: Setup MSVC
+        if: runner.os == 'Windows'
+        uses: "./.github/shared/setup-msvc"
       - name: Setup mold linker
         if: runner.os == 'Linux'
         uses: "./.github/shared/setup-mold"
+      # Both suites get the same cache key. The nextest suite builds a superset
+      # of what the extra suite needs, so only it saves.
       - uses: Swatinem/rust-cache@v2
         with:
           prefix-key: "v1-rust"
           cache-on-failure: true
+          save-if: ${{ github.ref == 'refs/heads/main' && matrix.suite == 'nextest' }}
       - name: Install cargo-nextest
         uses: taiki-e/install-action@nextest
       - name: Install cargo-llvm-cov
-        if: runner.os == 'Linux'
+        if: runner.os == 'Linux' && github.event_name != 'pull_request' && matrix.suite == 'nextest'
         uses: taiki-e/install-action@cargo-llvm-cov
       # Blacksmith Windows images ship no LLVM; the all-features build pulls in
-      # pg_query, whose bindgen needs libclang.dll.
+      # pg_query, whose bindgen needs libclang.dll and clang's own headers.
+      # Unpack just those from the LLVM installer instead of running it: the
+      # installer writes ~3 GB and took ~42 s. libclang finds the headers in
+      # ../lib/clang next to itself, so the layout is kept.
       - name: Install LLVM (libclang for bindgen)
         if: runner.os == 'Windows'
         run: |
-          choco install llvm -y --no-progress
-          echo "LIBCLANG_PATH=C:\Program Files\LLVM\bin" >> $env:GITHUB_ENV
+          $version = "22.1.8"
+          $url = "https://github.com/llvm/llvm-project/releases/download/llvmorg-$version/LLVM-$version-win64.exe"
+          $installer = "$env:RUNNER_TEMP\llvm-installer.exe"
+          $dest = "$env:RUNNER_TEMP\llvm"
+          for ($attempt = 1; $attempt -le 5; $attempt++) {
+            curl.exe -fsSL -o $installer $url
+            if ($LASTEXITCODE -eq 0) { break }
+            if ($attempt -eq 5) { throw "LLVM download failed after $attempt attempts" }
+            Start-Sleep -Seconds (30 * $attempt)
+          }
+          7z x $installer "-o$dest" "bin\libclang.dll" "lib\clang" -y | Out-Null
+          if ($LASTEXITCODE -ne 0 -or -not (Test-Path "$dest\bin\libclang.dll")) {
+            throw "Extracting libclang from the LLVM installer failed"
+          }
+          echo "LIBCLANG_PATH=$dest\bin" >> $env:GITHUB_ENV
       - name: Set up Python 3.10
         uses: useblacksmith/setup-python@v6
         with:
           python-version: "3.10"
       - name: Install SQLite (Windows)
         if: runner.os == 'Windows'
+        shell: pwsh
         run: |
           echo "VCPKG_ROOT=$env:VCPKG_INSTALLATION_ROOT" >> $env:GITHUB_ENV
-          vcpkg install sqlite3:x64-windows-static-md
+          & "$env:VCPKG_INSTALLATION_ROOT\vcpkg.exe" install sqlite3:x64-windows-static-md
       - name: Build
         run: cargo build --verbose --locked --all-features
       - name: Test (nextest with coverage)
-        if: runner.os == 'Linux'
+        if: runner.os == 'Linux' && github.event_name != 'pull_request' && matrix.suite == 'nextest'
         env:
           RUST_LOG: ${{ runner.debug && 'turso_core::storage=trace' || '' }}
           LOCAL_SYNC_SERVER: "../../target/debug/tursodb"
@@ -120,27 +152,42 @@ jobs:
           echo "::endgroup::"
         timeout-minutes: 20
       - name: Test (nextest)
-        if: runner.os != 'Linux'
+        if: (runner.os != 'Linux' || github.event_name == 'pull_request') && startsWith(matrix.suite, 'nextest')
+        shell: bash
         env:
           RUST_LOG: ${{ runner.debug && 'turso_core::storage=trace' || '' }}
           LOCAL_SYNC_SERVER: "../../target/debug/tursodb"
-        run: cargo nextest run --workspace --all-features --locked --no-fail-fast --exclude memory-benchmark -E 'not binary(fuzz_tests) and not binary(pending_byte_tests)' --failure-output=final
+          SUITE: ${{ matrix.suite }}
+        run: |
+          # "nextest 1/2" runs part 1 of 2; plain "nextest" runs everything.
+          part="${SUITE#nextest}"
+          part="${part# }"
+          partition=()
+          if [ -n "$part" ]; then
+            partition=(--partition "slice:$part")
+          fi
+          cargo nextest run --workspace --all-features --locked --no-fail-fast --exclude memory-benchmark -E 'not binary(fuzz_tests) and not binary(pending_byte_tests)' "${partition[@]}" --failure-output=final
         timeout-minutes: 30
       # Same suite against a --sync-dir server, so directory mode's per-database
       # routing gets the coverage the single-database run above provides.
       - name: Test sync suite against --sync-dir
-        if: runner.os == 'Linux'
+        if: runner.os == 'Linux' && matrix.suite == 'extra'
         env:
           LOCAL_SYNC_SERVER: "../../target/debug/tursodb"
           LOCAL_SYNC_SERVER_DIR: "1"
         run: cargo nextest run -p turso --all-features --locked --no-fail-fast -E 'test(/^sync::/)' --no-tests=fail --failure-output=final
         timeout-minutes: 20
+      - name: Memory leak check (repeated database open/workload/drop)
+        if: matrix.suite == 'extra'
+        run: cargo nextest run -p core_tester --locked --no-fail-fast -E 'binary(leak_tests)' --failure-output=final
+        timeout-minutes: 10
       - name: Test doctests
+        if: matrix.suite == 'extra'
         env:
           LOCAL_SYNC_SERVER: "../../target/debug/tursodb"
         run: cargo test --workspace --all-features --doc --locked --exclude memory-benchmark
       - name: Upload coverage report
-        if: runner.os == 'Linux'
+        if: runner.os == 'Linux' && github.event_name != 'pull_request' && matrix.suite == 'nextest'
         uses: actions/upload-artifact@v4
         with:
           name: coverage-report
@@ -164,6 +211,7 @@ jobs:
         with:
           prefix-key: "v1-rust"
           cache-on-failure: true
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Install cargo-nextest
         uses: taiki-e/install-action@nextest
       - name: Test integrity_check corruption and short reads (no checksum feature because it interferes with the test)
@@ -184,6 +232,7 @@ jobs:
         with:
           prefix-key: "v1-rust-windows-arm64-cli"
           cache-on-failure: true
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Build Windows ARM64 CLI
         shell: pwsh
         run: |
@@ -210,12 +259,21 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - name: Add wasm32 Rust target
         run: rustup target add wasm32-unknown-unknown
-      - uses: Swatinem/rust-cache@v2
-        with:
-          prefix-key: "v1-rust"
-          cache-on-failure: true
+      # No Rust cache: the job takes ~1 min uncached, and the cache space is
+      # worth more to the jobs with long builds.
       - name: Check turso builds for wasm32-unknown-unknown
         run: cargo check -p turso --target wasm32-unknown-unknown --locked
+
+  check-core-no-default-features:
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      # No Rust cache: the job takes ~1 min uncached, and the cache space is
+      # worth more to the jobs with long builds.
+      - name: Check turso_core builds without default features
+        run: cargo check -p turso_core --no-default-features --features fs --locked
 
   shuttle-tests:
     runs-on: blacksmith-4vcpu-ubuntu-2404
@@ -229,6 +287,7 @@ jobs:
         with:
           prefix-key: "v1-rust-shuttle"
           cache-on-failure: true
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Install cargo-nextest
         uses: taiki-e/install-action@nextest
       - name: Run shuttle tests
@@ -247,6 +306,7 @@ jobs:
         with:
           prefix-key: "v1-rust-conn-raw-api"
           cache-on-failure: true
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Install cargo-nextest
         uses: taiki-e/install-action@nextest
       - name: Run conn_raw_api-gated core tests
@@ -282,6 +342,7 @@ jobs:
         with:
           prefix-key: "v1-rust"
           cache-on-failure: true
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Clippy
         run: |
           cargo clippy --workspace --all-features --all-targets --locked --exclude memory-benchmark -- --deny=warnings
@@ -322,13 +383,26 @@ jobs:
         with:
           prefix-key: "v1-rust"
           cache-on-failure: true
-      # Run these with for loops (instead of --loop flag in sim) so that each iteration gets a separate seed -- this produces much easier-to-debug traces when there's a failure since we don't have to potentially
-      # run 10 iterations of the same seed to get to the failure
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: Build simulator
+        run: cargo build -p limbo_sim --bin limbo_sim --locked
       - name: Simulator ${{ matrix.profile.name }}
+        env:
+          SIM_ARGS: ${{ matrix.profile.args }}
         run: |
-          for i in $(seq 1 ${{ matrix.profile.iterations }}); do
-            ./scripts/run-sim ${{ matrix.profile.args }} || exit 1
-          done
+          set -euo pipefail
+          seq 1 ${{ matrix.profile.iterations }} | xargs -P 4 -n 1 bash -c '
+            i="$1"
+            log="sim-run-$i.log"
+            read -r -a args <<< "$SIM_ARGS"
+            if ./target/debug/limbo_sim "${args[@]}" >"$log" 2>&1; then
+              echo "iteration $i ok: $(grep -m1 "^seed: " "$log")"
+            else
+              echo "iteration $i FAILED:"
+              cat "$log"
+              exit 255
+            fi
+          ' _
 
         # TODO: find out why this blows the stack so quickly every time..
         # e.g. https://github.com/tursodatabase/turso/actions/runs/22370904813/job/64749257476?pr=5588
@@ -391,7 +465,7 @@ jobs:
       matrix:
         # Each profile focuses a different workload so CI covers more than the
         # default statement distribution.
-        profile: [balanced, ddl, triggers, writes, correlated-subqueries]
+        profile: [balanced, ddl, triggers, writes, correlated-subqueries, joins]
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -401,6 +475,7 @@ jobs:
         with:
           prefix-key: "v1-rust"
           cache-on-failure: true
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Build differential_fuzzer
         run: cargo build -p differential-fuzzer --bin differential_fuzzer
       - name: Run differential_fuzzer on a fixed set of seeds
@@ -423,6 +498,56 @@ jobs:
             fi
           done
 
+  # Same fixed-seed idea as differential-fuzzer above, but with materialized
+  # views turned on (--ivm): the fuzzer creates views over the generated
+  # tables and checks that they stay in sync with a plain re-query. Seeds are
+  # hand-picked, not just 1..6 like the non-IVM job: a few known pre-existing
+  # main bugs unrelated to views (collation precedence in `x IN (subquery)`
+  # #6088, a 3+-arm compound dropping the first arm's collation #6407, and
+  # some INSERT/UPDATE OR FAIL differences vs SQLite) can make a seed fail
+  # here for reasons that have nothing to do with the view code. Widen this
+  # list with more seeds once those bugs are fixed.
+  differential-fuzzer-ivm:
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    timeout-minutes: 30
+    env:
+      DIFFERENTIAL_FUZZER_TIMEOUT_SECONDS: 180
+    strategy:
+      fail-fast: false
+      matrix:
+        profile: [balanced, ddl, triggers, writes, correlated-subqueries, joins]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Setup mold linker
+        uses: "./.github/shared/setup-mold"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: "v1-rust"
+          cache-on-failure: true
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: Build differential_fuzzer
+        run: cargo build -p differential-fuzzer --bin differential_fuzzer
+      - name: Run differential_fuzzer in IVM mode on a fixed set of seeds
+        run: |
+          # Reproduce a failure locally with:
+          #   cargo run -p differential-fuzzer --bin differential_fuzzer -- \
+          #     --seed <seed> --profile ${{ matrix.profile }} -n 1000 --ivm
+          for seed in 1 2 3; do
+            exit_code=0
+            # One slow statement must not consume the complete CI job.
+            timeout --kill-after=10s "${DIFFERENTIAL_FUZZER_TIMEOUT_SECONDS}s" \
+              target/debug/differential_fuzzer \
+                --seed "$seed" --profile ${{ matrix.profile }} -n 1000 --ivm \
+              || exit_code=$?
+            if [ "$exit_code" -eq 124 ] || [ "$exit_code" -eq 137 ]; then
+              echo "::error::Differential fuzzer (IVM) timed out after ${DIFFERENTIAL_FUZZER_TIMEOUT_SECONDS} seconds. Seed: $seed. Profile: ${{ matrix.profile }}."
+            fi
+            if [ "$exit_code" -ne 0 ]; then
+              exit "$exit_code"
+            fi
+          done
+
   # Random seeds keep discovering new divergences. Run them only on pushes to
   # main, so a newly generated failing statement flags a real bug to look at
   # without blocking an unrelated pull request.
@@ -435,7 +560,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        profile: [balanced, ddl, triggers, writes, correlated-subqueries]
+        profile: [balanced, ddl, triggers, writes, correlated-subqueries, joins]
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -445,6 +570,7 @@ jobs:
         with:
           prefix-key: "v1-rust"
           cache-on-failure: true
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Build differential_fuzzer
         run: cargo build -p differential-fuzzer --bin differential_fuzzer
       - name: Run differential_fuzzer with random seeds
@@ -482,6 +608,7 @@ jobs:
         with:
           prefix-key: "v1-rust"
           cache-on-failure: true
+          save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: Install uv
         uses: useblacksmith/setup-uv@v4
@@ -493,12 +620,14 @@ jobs:
 
       - uses: "./.github/shared/install_sqlite"
       - name: Test
-        run: make test
+        run: make test-without-sqltest
 
-  concurrent-simulator:
-    name: "Concurrent simulator (${{ matrix.toolchain.label }}, ${{ matrix.profile.name }})"
+  # Builds turso_whopper once per toolchain. The concurrent-simulator jobs
+  # below download the binary instead of each compiling it again.
+  concurrent-simulator-build:
+    name: "Concurrent simulator build (${{ matrix.toolchain.label }})"
     runs-on: blacksmith-4vcpu-ubuntu-2404
-    timeout-minutes: 40
+    timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
@@ -509,6 +638,73 @@ jobs:
           - label: nightly
             version: "nightly-2025-12-17"
             rustflags: "--cfg nightly"
+    steps:
+      - uses: actions/checkout@v4
+      - name: Setup Rust toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ matrix.toolchain.version }}
+      - name: Setup mold linker
+        uses: "./.github/shared/setup-mold"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: "v1-rust-whopper-${{ matrix.toolchain.label }}"
+          cache-on-failure: true
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: Build turso_whopper
+        env:
+          RUSTFLAGS: ${{ matrix.toolchain.rustflags }}
+        run: cargo +${{ matrix.toolchain.version }} build -p turso_whopper --release
+      - name: Upload turso_whopper
+        uses: actions/upload-artifact@v4
+        with:
+          name: turso_whopper-${{ matrix.toolchain.label }}
+          path: target/release/turso_whopper
+          if-no-files-found: error
+          retention-days: 1
+
+  concurrent-simulator-regression-tests:
+    name: "Concurrent simulator regression tests (${{ matrix.toolchain.label }})"
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        toolchain:
+          - label: stable
+            version: "1.88.0"
+            rustflags: ""
+          - label: nightly
+            version: "nightly-2025-12-17"
+            rustflags: "--cfg nightly"
+    steps:
+      - uses: actions/checkout@v4
+      - name: Setup Rust toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ matrix.toolchain.version }}
+      - name: Setup mold linker
+        uses: "./.github/shared/setup-mold"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: "v1-rust-whopper-${{ matrix.toolchain.label }}"
+          cache-on-failure: true
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: Run turso_whopper regression tests
+        env:
+          RUSTFLAGS: ${{ matrix.toolchain.rustflags }}
+        run: cargo +${{ matrix.toolchain.version }} test -p turso_whopper --test regression_tests
+        timeout-minutes: 15
+
+  concurrent-simulator:
+    name: "Concurrent simulator (${{ matrix.toolchain }}, ${{ matrix.profile.name }})"
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    timeout-minutes: 40
+    needs: concurrent-simulator-build
+    strategy:
+      fail-fast: false
+      matrix:
+        toolchain: [stable, nightly]
         profile:
           - name: in-process
             iterations: 100
@@ -522,36 +718,64 @@ jobs:
           - name: btree-rebalance
             iterations: 5
             args: "--mode btree-rebalance --allocation-fault-probability 0"
-          - name: multiprocess
+          - name: fts-merge-wal
             iterations: 10
+            args: "--mode fts-merge --max-steps 100000 --allocation-fault-probability 0.001"
+          - name: fts-merge-mvcc
+            iterations: 10
+            args: "--mode fts-merge --enable-mvcc --max-steps 100000 --allocation-fault-probability 0.001"
+          - name: fts-snapshots-wal
+            iterations: 10
+            args: "--mode fts-snapshots --max-steps 100000 --allocation-fault-probability 0.001"
+          - name: fts-snapshots-mvcc
+            iterations: 10
+            args: "--mode fts-snapshots --enable-mvcc --max-steps 100000 --allocation-fault-probability 0.001"
+          - name: fts-recovery-wal
+            iterations: 10
+            args: "--mode fts-recovery --max-steps 100000 --allocation-fault-probability 0.001"
+          - name: fts-recovery-mvcc
+            iterations: 10
+            args: "--mode fts-recovery --enable-mvcc --max-steps 100000 --allocation-fault-probability 0.001"
+          # The multiprocess profiles are the slowest, so their 10 iterations
+          # are split across four jobs each (3+3+2+2). The step below runs up
+          # to 4 iterations at once, so each job finishes in one round.
+          - name: multiprocess (1/4)
+            iterations: 3
             args: "--mode fast --multiprocess --connections-per-process 4 --processes 4"
-          - name: multiprocess-kill
-            iterations: 10
+          - name: multiprocess (2/4)
+            iterations: 3
+            args: "--mode fast --multiprocess --connections-per-process 4 --processes 4"
+          - name: multiprocess (3/4)
+            iterations: 2
+            args: "--mode fast --multiprocess --connections-per-process 4 --processes 4"
+          - name: multiprocess (4/4)
+            iterations: 2
+            args: "--mode fast --multiprocess --connections-per-process 4 --processes 4"
+          - name: multiprocess-kill (1/4)
+            iterations: 3
+            args: "--mode fast --multiprocess --connections-per-process 4 --processes 4 --kill-probability 0.01"
+          - name: multiprocess-kill (2/4)
+            iterations: 3
+            args: "--mode fast --multiprocess --connections-per-process 4 --processes 4 --kill-probability 0.01"
+          - name: multiprocess-kill (3/4)
+            iterations: 2
+            args: "--mode fast --multiprocess --connections-per-process 4 --processes 4 --kill-probability 0.01"
+          - name: multiprocess-kill (4/4)
+            iterations: 2
             args: "--mode fast --multiprocess --connections-per-process 4 --processes 4 --kill-probability 0.01"
     steps:
       - uses: actions/checkout@v4
-      - name: Setup Rust toolchain
-        uses: dtolnay/rust-toolchain@master
+      - name: Download turso_whopper
+        uses: actions/download-artifact@v4
         with:
-          toolchain: ${{ matrix.toolchain.version }}
-      - name: Setup mold linker
-        uses: "./.github/shared/setup-mold"
-      - uses: Swatinem/rust-cache@v2
-        with:
-          prefix-key: "v1-rust-whopper-${{ matrix.toolchain.label }}"
-          cache-on-failure: true
-      - name: Run turso_whopper regression tests
-        if: matrix.profile.name == 'in-process'
+          name: turso_whopper-${{ matrix.toolchain }}
+          path: target/release
+      - name: Restore binary permissions
+        run: chmod +x target/release/turso_whopper
+      - name: Run turso_whopper (${{ matrix.toolchain }}, ${{ matrix.profile.name }})
         env:
-          RUSTFLAGS: ${{ matrix.toolchain.rustflags }}
-        run: cargo +${{ matrix.toolchain.version }} test -p turso_whopper --test regression_tests
-        timeout-minutes: 15
-      - name: Run turso_whopper (${{ matrix.toolchain.label }}, ${{ matrix.profile.name }})
-        env:
-          RUSTFLAGS: ${{ matrix.toolchain.rustflags }}
           WHOPPER_ARGS: ${{ matrix.profile.args }}
         run: |
-          cargo +${{ matrix.toolchain.version }} build -p turso_whopper --release
           # A single whopper run drives its connections serially (one blocking
           # step at a time), so it only keeps about one core busy. Run
           # iterations concurrently to use the whole runner; per-iteration log
@@ -574,10 +798,13 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+      - name: Setup MSVC
+        uses: "./.github/shared/setup-msvc"
       - uses: Swatinem/rust-cache@v2
         with:
           prefix-key: "v1-rust"
           cache-on-failure: true
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Run Windows concurrent simulator multiprocess regressions
         run: cargo test -q -p turso_whopper --test regression_tests
       - name: Reclaim Windows runner disk space

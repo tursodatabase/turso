@@ -1,4 +1,5 @@
 use crate::sync::{Arc, RwLock};
+use std::borrow::Cow;
 use std::iter::successors;
 use std::result::Result;
 
@@ -6,12 +7,13 @@ use turso_ext::{ConstraintOp, ConstraintUsage, ResultCode};
 
 use crate::{
     json::{
-        convert_dbtype_to_jsonb, json_path_from_db_value,
+        convert_dbtype_to_jsonb, json_path_from_db_value, json_path_text,
         jsonb::{IteratorState, Jsonb, SearchOperation},
         path::{json_path, JsonPath, PathElement},
         vtab::columns::{Columns, Key},
         Conv,
     },
+    types::AsValueRef,
     vtab::{InternalVirtualTable, InternalVirtualTableCursor},
     Connection, LimboError, Value,
 };
@@ -256,45 +258,33 @@ impl InternalVirtualTableCursor for JsonEachCursor {
         if args.is_empty() || args[0] == Value::Null {
             return Ok(false);
         }
-        if args.len() == 2 && matches!(self.traversal_mode, JsonTraversalMode::Tree) {
-            if let Value::Text(ref text) = args[1] {
-                if !text.value.is_empty()
-                    && text
-                        .value
-                        .as_bytes()
-                        .windows(3)
-                        .any(|chars| chars == b"[#-")
-                {
-                    return Err(LimboError::InvalidArgument(
-                        "Json paths with negative indices in json_tree are not supported yet"
-                            .to_owned(),
-                    ));
-                }
-            }
+        let root_path = match args.get(1) {
+            None => Cow::Borrowed("$"),
+            Some(path) => json_path_text(path.as_value_ref()).ok_or_else(|| {
+                LimboError::InvalidArgument("root path should be text".to_owned())
+            })?,
+        };
+        if matches!(self.traversal_mode, JsonTraversalMode::Tree)
+            && root_path.as_bytes().windows(3).any(|chars| chars == b"[#-")
+        {
+            return Err(LimboError::InvalidArgument(
+                "Json paths with negative indices in json_tree are not supported yet".to_owned(),
+            ));
         }
 
         let mut jsonb = convert_dbtype_to_jsonb(&args[0], Conv::Strict)?;
 
-        let (path, root_json) = if args.len() == 1 {
-            let path = "$";
-            (path, jsonb)
+        let root_json = if args.len() == 1 {
+            jsonb
+        } else if let Some(json) = navigate_to_path(&mut jsonb, &args[1])? {
+            json
         } else {
-            let Value::Text(path) = &args[1] else {
-                return Err(LimboError::InvalidArgument(
-                    "root path should be text".to_owned(),
-                ));
-            };
-            let root_json = if let Some(json) = navigate_to_path(&mut jsonb, &args[1])? {
-                json
-            } else {
-                return Ok(false);
-            };
-            (path.as_str(), root_json)
+            return Ok(false);
         };
 
         self.json = root_json;
         self.path_to_current_value =
-            InPlaceJsonPath::from_json_path(path.to_owned(), json_path(path)?);
+            InPlaceJsonPath::from_json_path(root_path.to_string(), json_path(&root_path)?);
         let iterator_state = json_iterator_from(&self.json)?;
         let innermost_container_path = if matches!(self.traversal_mode, JsonTraversalMode::Tree)
             && matches!(iterator_state, IteratorState::Primitive(_))
@@ -597,7 +587,9 @@ mod columns {
                 jsonb::ElementType::NULL => Ok(Value::Null),
                 jsonb::ElementType::TRUE => Ok(Value::from_i64(1)),
                 jsonb::ElementType::FALSE => Ok(Value::from_i64(0)),
-                jsonb::ElementType::INT | jsonb::ElementType::INT5 => Self::jsonb_to_integer(value),
+                jsonb::ElementType::INT | jsonb::ElementType::INT5 => {
+                    json_string_to_db_type(value.clone(), element_type, OutputVariant::ElementType)
+                }
                 jsonb::ElementType::FLOAT | jsonb::ElementType::FLOAT5 => {
                     Self::jsonb_to_float(value)
                 }
@@ -617,13 +609,6 @@ mod columns {
             };
 
             string
-        }
-
-        fn jsonb_to_integer(value: &Jsonb) -> Result<Value, LimboError> {
-            let string = value.to_string()?;
-            let int = string.parse::<i64>()?;
-
-            Ok(Value::from_i64(int))
         }
 
         fn jsonb_to_float(value: &Jsonb) -> Result<Value, LimboError> {

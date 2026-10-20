@@ -337,41 +337,6 @@ impl BackingStore {
         )?))
     }
 
-    /// Under MVCC, take the maintenance lease of this store for the
-    /// transaction of the handle. The owner can take it again. If another
-    /// transaction holds it, the result is `Busy`. If the snapshot is older
-    /// than the last publication, the result is `WriteWriteConflict`. In
-    /// WAL mode this does nothing, because the pager write lock already
-    /// serializes writers.
-    pub fn acquire_maintenance_lease(&self) -> Result<()> {
-        let Some(binding) = &self.mvcc else {
-            return Ok(());
-        };
-        binding
-            .mv_store
-            .acquire_index_method_write_lease(binding.tx_id, binding.table_id)
-    }
-
-    pub(crate) fn register_deleter(&self) -> Result<()> {
-        let Some(binding) = &self.mvcc else {
-            return Ok(());
-        };
-        binding
-            .mv_store
-            .register_index_method_deleter(binding.tx_id, binding.table_id)
-    }
-
-    pub(crate) fn check_merge_admissible(&self) -> Result<()> {
-        let Some(binding) = &self.mvcc else {
-            return Ok(());
-        };
-        binding
-            .mv_store
-            .check_index_method_merge_admissible(binding.tx_id, binding.table_id)
-    }
-
-    /// The schema root of the B-tree of the store. The value is negative
-    /// for an MVCC table that was not checkpointed yet.
     pub fn root_page(&self) -> i64 {
         self.root_page
     }

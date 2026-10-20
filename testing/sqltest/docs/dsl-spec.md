@@ -167,6 +167,7 @@ These directives apply to all tests and snapshots in the file.
 @skip-file "reason"
 @skip-file-if <condition> "reason"
 @requires-file <capability> "reason"
+@verify-materialized-views
 ```
 
 ### Directives
@@ -176,6 +177,14 @@ These directives apply to all tests and snapshots in the file.
 | `@skip-file "reason"` | Skip all tests in the file unconditionally |
 | `@skip-file-if <condition> "reason"` | Skip all tests conditionally (e.g., `mvcc`) |
 | `@requires-file <capability> "reason"` | Require capability for all tests (e.g., `trigger`) |
+| `@verify-materialized-views` | On the native Rust backend, compare every live materialized view with a fresh evaluation of its stored defining SELECT after each successful test statement. |
+
+`@verify-materialized-views` compares typed result multisets, so row order is
+ignored while duplicate counts, NULL, integer/real distinctions, blobs, and
+the column count of an empty result remain significant. Materialized views are
+discovered from `sqlite_schema`; definitions are not repeated in the test.
+Backends that expose only rendered text continue to run the ordinary expected
+output but cannot perform this additional typed check.
 
 ### Example
 
@@ -183,6 +192,7 @@ These directives apply to all tests and snapshots in the file.
 @database :memory:
 @skip-file-if mvcc "MVCC not supported for this file"
 @requires-file trigger "all tests need trigger support"
+@verify-materialized-views
 
 test example {
     SELECT 1;
@@ -214,7 +224,7 @@ Decorators appear before the `test` keyword:
 | `@setup <name>` | Apply a named setup before the test (can be repeated) |
 | `@skip "reason"` | Skip this test unconditionally with the given reason |
 | `@skip-if <condition> "reason"` | Skip this test conditionally based on runtime configuration |
-| `@backend <name>` | Only run this test on the specified backend (`rust`, `cli`, `js`) |
+| `@backend <name>` | Only run this test on the specified backend (`rust`, `cli`, `js`, `tursopg`, `postgres`) |
 | `@requires <capability> "reason"` | Only run if the backend supports the capability |
 
 #### Skip Conditions
@@ -225,6 +235,7 @@ The `@skip-if` decorator supports the following conditions:
 |-----------|-------------|
 | `mvcc` | Skip when MVCC mode is enabled (`--mvcc` flag) |
 | `sqlite` | Skip when running with the sqlite CLI backend |
+| `postgres` | Skip when running against a real PostgreSQL server (`--backend postgres`). |
 
 #### Capabilities
 
@@ -400,6 +411,12 @@ Snapshots support all the same decorators as tests:
 | `@skip-if <condition> "reason"` | Skip this snapshot conditionally |
 | `@backend <name>` | Only run this snapshot on the specified backend (snapshots only run on `rust`) |
 | `@requires <capability> "reason"` | Only run if the backend supports the capability |
+| `@sqlite-reference` | Add SQLite's plan, bytecode, and an opcode diff to this snapshot |
+
+`@sqlite-reference` runs the setup and query against the bundled SQLite library.
+Use it only with `@database :memory:`. The runner rejects other database locations.
+The snapshot then shows both engines' EXPLAIN output and the difference in opcode order.
+Review this difference when the snapshot changes. The decorator also works with `snapshot-eqp`, but that form shows only the two query plans.
 
 ### Snapshot File Location
 
@@ -535,6 +552,7 @@ decorator       = "@setup" IDENTIFIER NEWLINE
 
 skip_condition  = "mvcc"
                 | "sqlite"
+                | "postgres"
 
 capability      = "trigger" | "strict" | "materialized_views"
 

@@ -41,6 +41,8 @@ members = [
     "testing/concurrent-simulator",
     "perf/throughput",
     "perf/latency",
+    "perf/tatp",
+    "perf/fts",
     "perf/join-benchmark",
     "perf/encryption",
     "perf/memory",
@@ -52,6 +54,7 @@ members = [
     "testing/differential-oracle/sql_gen_prop",
     "testing/differential-oracle/sql_gen",
     "testing/differential-oracle/fuzzer",
+    "testing/query-result-oracle",
     "testing/sqltest"
 ]
 
@@ -94,32 +97,35 @@ default-members = [
     "testing/differential-oracle/sql_gen_prop",
     "testing/differential-oracle/sql_gen",
     "testing/differential-oracle/fuzzer",
+    "testing/query-result-oracle",
     "testing/sqltest"
 ]
 
 [workspace.package]
-version = "0.8.0-pre.11"
+version = "0.9.0-pre.1"
 authors = ["the Turso authors"]
 edition = "2021"
 license = "MIT"
 repository = "https://github.com/tursodatabase/turso"
 
 [workspace.dependencies]
-turso = { path = "bindings/rust", version = "0.8.0-pre.11" }
-turso_node = { path = "bindings/javascript", version = "0.8.0-pre.11" }
-turso_sdk_kit = { path = "sdk-kit", version = "0.8.0-pre.11" }
-turso_sdk_kit_macros = { path = "sdk-kit-macros", version = "0.8.0-pre.11" }
-turso_sync_sdk_kit = { path = "sync/sdk-kit", version = "0.8.0-pre.11" }
-limbo_completion = { path = "extensions/completion", version = "0.8.0-pre.11" }
-turso_core = { path = "core", version = "0.8.0-pre.11" }
-turso_sync_engine = { path = "sync/engine", version = "0.8.0-pre.11" }
-turso_ext = { path = "extensions/core", version = "0.8.0-pre.11" }
-turso_macros = { path = "macros", version = "0.8.0-pre.11" }
-turso_parser = { path = "sqlite/parser", version = "0.8.0-pre.11" }
-turso_pg = { path = "postgres/frontend", version = "0.8.0-pre.11" }
-turso_pg_client = { path = "postgres/client", version = "0.8.0-pre.11" }
-turso_pg_parser = { path = "postgres/parser", version = "0.8.0-pre.11" }
-turso_pg_server = { path = "postgres/server", version = "0.8.0-pre.11" }
+chumsky = { version = "0.13", default-features = false, features = ["std"] }
+turso = { path = "bindings/rust", version = "0.9.0-pre.1" }
+turso_node = { path = "bindings/javascript", version = "0.9.0-pre.1" }
+turso_sdk_kit = { path = "sdk-kit", version = "0.9.0-pre.1" }
+turso_sdk_kit_macros = { path = "sdk-kit-macros", version = "0.9.0-pre.1" }
+turso_sync_sdk_kit = { path = "sync/sdk-kit", version = "0.9.0-pre.1" }
+limbo_completion = { path = "extensions/completion", version = "0.9.0-pre.1" }
+limbo_csv = { path = "extensions/csv", version = "0.9.0-pre.1" }
+turso_core = { path = "core", version = "0.9.0-pre.1" }
+turso_sync_engine = { path = "sync/engine", version = "0.9.0-pre.1" }
+turso_ext = { path = "extensions/core", version = "0.9.0-pre.1" }
+turso_macros = { path = "macros", version = "0.9.0-pre.1" }
+turso_parser = { path = "sqlite/parser", version = "0.9.0-pre.1" }
+turso_pg = { path = "postgres/frontend", version = "0.9.0-pre.1" }
+turso_pg_client = { path = "postgres/client", version = "0.9.0-pre.1" }
+turso_pg_parser = { path = "postgres/parser", version = "0.9.0-pre.1" }
+turso_pg_server = { path = "postgres/server", version = "0.9.0-pre.1" }
 sql_generation = { path = "sql_generation" }
 turso-dbhash = { path = "tools/dbhash" }
 strum = { version = "0.26", features = ["derive"] }
@@ -152,6 +158,7 @@ getrandom = "0.4.2"
 
 criterion = "0.5.0"
 codspeed-criterion-compat = "4.2.1"
+pprof = "0.15.0"
 divan = { package = "codspeed-divan-compat", version = "4.2.1" }
 
 chrono = { version = "0.4.42", default-features = false }
@@ -209,7 +216,7 @@ inherits = "release"
 debug = true
 codegen-units = 1
 panic = "abort"
-lto = true
+lto = false
 
 [profile.bench-profile]
 inherits = "release"

@@ -45,6 +45,8 @@ pub struct RunOptions {
     pub snapshot_update_mode: SnapshotUpdateMode,
     /// Path to binary used for cross-checking integrity (None = disabled)
     pub cross_check_binary: Option<PathBuf>,
+    /// Check every live materialized view after each successful statement.
+    pub verify_materialized_views: bool,
 }
 
 /// Trait for runnable test items (tests and snapshots)
@@ -198,7 +200,7 @@ impl Runnable for SnapshotCase {
             };
         }
 
-        let actual_output = if self.eqp_only {
+        let mut actual_output = if self.eqp_only {
             format_eqp_snapshot_content(&eqp_result.rows)
         } else {
             let explain_result = results.get(1).expect("should have EXPLAIN result");
@@ -209,6 +211,14 @@ impl Runnable for SnapshotCase {
             }
             format_snapshot_content(&eqp_result.rows, &explain_result.rows)
         };
+
+        if self.sqlite_reference {
+            let reference = match format_sqlite_snapshot_reference(self, &results, options) {
+                Ok(reference) => reference,
+                Err(message) => return TestOutcome::Error { message },
+            };
+            actual_output.push_str(&reference);
+        }
 
         // Build snapshot info with metadata
         let db_location_str = options.db_config.location.to_string();
@@ -382,6 +392,62 @@ fn format_snapshot_content(eqp_rows: &[Vec<String>], explain_rows: &[Vec<String>
     output
 }
 
+fn format_sqlite_snapshot_reference(
+    snapshot: &SnapshotCase,
+    results: &[QueryResult],
+    options: &RunOptions,
+) -> Result<String, String> {
+    if options.db_config.location != DatabaseLocation::Memory {
+        return Err("@sqlite-reference requires @database :memory:".to_string());
+    }
+    let setups: Vec<String> = snapshot
+        .modifiers
+        .setups
+        .iter()
+        .map(|setup| options.setups[&setup.name].clone())
+        .collect();
+    let sqlite_rows = |sql: String| match run_oracle(&setups, &sql)? {
+        OracleOutcome::Rows(rows) => Ok(rows),
+        OracleOutcome::Error(error) => Err(format!("SQLite EXPLAIN failed: {error}")),
+    };
+    let sqlite_eqp = sqlite_rows(format!("EXPLAIN QUERY PLAN {}", snapshot.sql))?;
+    let mut reference = String::from("\n\nSQLITE REFERENCE\n");
+    if snapshot.eqp_only {
+        reference.push_str(&format_eqp_snapshot_content(&sqlite_eqp));
+        return Ok(reference);
+    }
+
+    let sqlite_explain = sqlite_rows(format!("EXPLAIN {}", snapshot.sql))?;
+    reference.push_str(&format_snapshot_content(&sqlite_eqp, &sqlite_explain));
+    let turso_explain = &results.get(1).expect("EXPLAIN already succeeded").rows;
+    let sqlite_opcodes = snapshot_opcode_names(&sqlite_explain)?;
+    let turso_opcodes = snapshot_opcode_names(turso_explain)?;
+    let diff = similar::TextDiff::from_lines(&sqlite_opcodes, &turso_opcodes)
+        .unified_diff()
+        .context_radius(1)
+        .header("sqlite opcodes", "turso opcodes")
+        .to_string();
+    reference.push_str("\n\nOPCODE DIFF\n");
+    if diff.is_empty() {
+        reference.push_str("same opcode order");
+    } else {
+        reference.push_str(diff.trim_end());
+    }
+    Ok(reference)
+}
+
+fn snapshot_opcode_names(rows: &[Vec<String>]) -> Result<String, String> {
+    let mut names = String::new();
+    for row in rows {
+        let opcode = row
+            .get(1)
+            .ok_or_else(|| "EXPLAIN returned a row without an opcode".to_string())?;
+        names.push_str(opcode);
+        names.push('\n');
+    }
+    Ok(names)
+}
+
 // ============================================================================
 // Generic test runner
 // ============================================================================
@@ -406,6 +472,7 @@ async fn run_single<B: SqlBackend, R: Runnable>(
                 None => true, // Unconditional skip
                 Some(SkipCondition::Mvcc) => options.mvcc,
                 Some(SkipCondition::Sqlite) => options.backend_is_sqlite,
+                Some(SkipCondition::Postgres) => options.backend_type == Backend::Postgres,
             };
             if should_skip {
                 return TestResult {
@@ -480,7 +547,12 @@ async fn run_single<B: SqlBackend, R: Runnable>(
         let queries = test.queries_to_execute();
         let mut results = Vec::with_capacity(queries.len());
         for sql in queries {
-            match db.execute(&sql).await {
+            let execution = if options.verify_materialized_views {
+                db.execute_with_materialized_view_verification(&sql).await
+            } else {
+                db.execute(&sql).await
+            };
+            match execution {
                 Ok(r) => results.push(r),
                 Err(e) => {
                     let _ = db.close().await;
@@ -951,6 +1023,8 @@ impl<B: SqlBackend + 'static> TestRunner<B> {
                     // Tests don't use snapshots, but we still need the field
                     snapshot_update_mode: SnapshotUpdateMode::No,
                     cross_check_binary: self.config.cross_check_binary.clone(),
+                    verify_materialized_views: test_file.verify_materialized_views
+                        && self.backend.supports_materialized_view_verification(),
                 };
 
                 futures.push(tokio::spawn(async move {
@@ -1021,6 +1095,7 @@ impl<B: SqlBackend + 'static> TestRunner<B> {
                     backend_is_sqlite: self.backend.is_sqlite(),
                     snapshot_update_mode: self.config.snapshot_update_mode,
                     cross_check_binary: self.config.cross_check_binary.clone(),
+                    verify_materialized_views: false,
                 };
 
                 futures.push(tokio::spawn(async move {
@@ -1078,6 +1153,7 @@ impl<B: SqlBackend + 'static> TestRunner<B> {
                         backend_is_sqlite: self.backend.is_sqlite(),
                         snapshot_update_mode: self.config.snapshot_update_mode,
                         cross_check_binary: self.config.cross_check_binary.clone(),
+                        verify_materialized_views: false,
                     };
 
                     futures.push(tokio::spawn(async move {
@@ -1406,5 +1482,99 @@ mod tests {
         assert_eq!(summary.failed, 1);
         assert_eq!(summary.skipped, 1);
         assert!(!summary.is_success());
+    }
+
+    #[tokio::test]
+    async fn skip_if_postgres_skips_only_on_the_postgres_backend() {
+        let file = crate::parser::parse(
+            r#"
+@database :memory:
+
+@skip-if postgres "EXPLAIN shows the Turso query plan"
+test select-1 {
+    SELECT 1;
+}
+expect {
+    1
+}
+"#,
+        )
+        .unwrap();
+
+        for backend_type in Backend::ALL.iter().copied() {
+            let options = RunOptions {
+                file_path: PathBuf::from("skip.sqltest"),
+                db_config: file.databases[0].clone(),
+                setups: file.setups.clone(),
+                mvcc: false,
+                global_skip: file.global_skip.clone(),
+                global_requires: file.global_requires.clone(),
+                backend_capabilities: HashSet::new(),
+                backend_type,
+                backend_is_sqlite: false,
+                snapshot_update_mode: SnapshotUpdateMode::No,
+                cross_check_binary: None,
+                verify_materialized_views: false,
+            };
+            let backend = Arc::new(OneRowBackend { backend_type });
+            let result = run_single(backend, file.tests[0].clone(), options).await;
+            match backend_type {
+                Backend::Postgres => assert!(
+                    matches!(
+                        &result.outcome,
+                        TestOutcome::Skipped { reason } if reason == "EXPLAIN shows the Turso query plan"
+                    ),
+                    "{:?}",
+                    result.outcome
+                ),
+                _ => assert!(
+                    matches!(result.outcome, TestOutcome::Passed),
+                    "{backend_type}: {:?}",
+                    result.outcome
+                ),
+            }
+        }
+    }
+
+    /// A backend whose every query returns the single row `1`.
+    struct OneRowBackend {
+        backend_type: Backend,
+    }
+
+    #[async_trait]
+    impl SqlBackend for OneRowBackend {
+        fn name(&self) -> &str {
+            "one-row"
+        }
+
+        fn backend_type(&self) -> Backend {
+            self.backend_type
+        }
+
+        fn capabilities(&self) -> HashSet<Capability> {
+            HashSet::new()
+        }
+
+        async fn create_database(
+            &self,
+            _config: &DatabaseConfig,
+        ) -> Result<Box<dyn crate::backends::DatabaseInstance>, BackendError> {
+            Ok(Box::new(OneRowDatabase))
+        }
+    }
+
+    struct OneRowDatabase;
+
+    #[async_trait]
+    impl crate::backends::DatabaseInstance for OneRowDatabase {
+        async fn execute(&mut self, _sql: &str) -> Result<QueryResult, BackendError> {
+            Ok(QueryResult::success(vec![vec!["1".to_string()]]))
+        }
+
+        async fn close(
+            self: Box<Self>,
+        ) -> Result<crate::backends::DatabaseFileHandle, BackendError> {
+            Ok(crate::backends::DatabaseFileHandle::none())
+        }
     }
 }

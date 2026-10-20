@@ -1,6 +1,7 @@
 @database :memory:
 @requires-file materialized_views ""
 @skip-file-if mvcc "materialized_views not supported with mvcc"
+@verify-materialized-views
 
 # Test that INSERT with reused primary keys maintains correct aggregate counts
 # When a row is deleted and a new row is inserted with the same primary key
@@ -65,9 +66,9 @@ test matview-aggregation-population {
     SELECT * FROM daily_totals ORDER BY day;
 }
 expect {
-    1|7.0|2
-    2|2.0|2
-    3|4.0|2
+    1|7|2
+    2|2|2
+    3|4|2
 }
 
 test matview-filter-with-groupby {
@@ -81,9 +82,9 @@ test matview-filter-with-groupby {
     SELECT * FROM v ORDER BY yourb;
 }
 expect {
-    3|3.0|1
-    6|6.0|1
-    7|7.0|1
+    3|3|1
+    6|6|1
+    7|7|1
 }
 
 test matview-insert-maintenance {
@@ -101,12 +102,12 @@ test matview-insert-maintenance {
     SELECT * FROM v ORDER BY b;
 }
 expect {
-    3|3.0|1
-    6|6.0|1
-    3|7.0|2
-    6|11.0|2
-    3|7.0|2
-    6|11.0|2
+    3|3|1
+    6|6|1
+    3|7|2
+    6|11|2
+    3|7|2
+    6|11|2
 }
 
 test matview-delete-maintenance {
@@ -128,11 +129,11 @@ test matview-delete-maintenance {
     SELECT * FROM category_sums ORDER BY category;
 }
 expect {
-    A|90.0|3
-    B|60.0|2
-    A|60.0|2
-    B|60.0|2
-    A|60.0|2
+    A|90|3
+    B|60|2
+    A|60|2
+    B|60|2
+    A|60|2
 }
 
 test matview-update-maintenance {
@@ -153,12 +154,12 @@ test matview-update-maintenance {
     SELECT * FROM status_totals ORDER BY status;
 }
 expect {
-    1|400.0|2
-    2|600.0|2
-    1|450.0|2
-    2|600.0|2
-    1|150.0|1
-    2|900.0|3
+    1|400|2
+    2|600|2
+    1|450|2
+    2|600|2
+    1|150|1
+    2|900|3
 }
 
 test matview-integer-primary-key-basic {
@@ -239,12 +240,12 @@ test matview-integer-primary-key-with-aggregation {
     SELECT * FROM v ORDER BY b;
 }
 expect {
-    10|500.0|1
-    20|700.0|2
-    10|600.0|2
-    20|700.0|2
-    10|600.0|2
-    20|400.0|1
+    10|500|1
+    20|700|2
+    10|600|2
+    20|700|2
+    10|600|2
+    20|400|1
 }
 
 test matview-complex-filter-aggregation {
@@ -275,17 +276,17 @@ test matview-complex-filter-aggregation {
     SELECT * FROM account_deposits ORDER BY account;
 }
 expect {
-    100|70.0|2
-    200|100.0|1
-    300|60.0|1
-    100|95.0|3
-    200|100.0|1
-    300|60.0|1
-    100|125.0|3
-    200|100.0|1
-    300|60.0|1
-    100|125.0|3
-    300|60.0|1
+    100|70|2
+    200|100|1
+    300|60|1
+    100|95|3
+    200|100|1
+    300|60|1
+    100|125|3
+    200|100|1
+    300|60|1
+    100|125|3
+    300|60|1
 }
 
 test matview-sum-count-only {
@@ -309,12 +310,12 @@ test matview-sum-count-only {
     SELECT * FROM category_stats ORDER BY category;
 }
 expect {
-    1|80.0|3
-    2|70.0|2
-    1|85.0|4
-    2|70.0|2
-    1|85.0|4
-    2|75.0|2
+    1|80|3
+    2|70|2
+    1|85|4
+    2|70|2
+    1|85|4
+    2|75|2
 }
 
 test matview-empty-table-population {
@@ -330,8 +331,8 @@ test matview-empty-table-population {
 }
 expect {
     0
-    7|2.0|1
-    9|3.0|1
+    7|2|1
+    9|3|1
 }
 
 test matview-all-rows-filtered {
@@ -374,17 +375,17 @@ test matview-mixed-operations-sequence {
     SELECT * FROM customer_totals ORDER BY customer_id;
 }
 expect {
-    100|50.0|1
-    200|75.0|1
-    100|75.0|2
-    200|75.0|1
-    100|75.0|2
-    200|100.0|1
-    100|25.0|1
-    200|100.0|1
-    100|25.0|1
-    200|100.0|1
-    300|150.0|1
+    100|50|1
+    200|75|1
+    100|75|2
+    200|75|1
+    100|75|2
+    200|100|1
+    100|25|1
+    200|100|1
+    100|25|1
+    200|100|1
+    300|150|1
 }
 
 test matview-projections {
@@ -486,13 +487,13 @@ test matview-rollback-aggregation {
     SELECT * FROM product_totals ORDER BY product_id;
 }
 expect {
-    1|300.0|2
-    2|400.0|2
-    1|350.0|3
-    2|400.0|2
-    3|300.0|1
-    1|300.0|2
-    2|400.0|2
+    1|300|2
+    2|400|2
+    1|350|3
+    2|400|2
+    3|300|1
+    1|300|2
+    2|400|2
 }
 
 test matview-rollback-mixed-operations {
@@ -512,12 +513,12 @@ test matview-rollback-mixed-operations {
     SELECT * FROM customer_totals ORDER BY customer;
 }
 expect {
-    100|75.0|2
-    200|75.0|1
-    100|150.0|2
-    200|150.0|1
-    100|75.0|2
-    200|75.0|1
+    100|75|2
+    200|75|1
+    100|150|2
+    200|150|1
+    100|75|2
+    200|75|1
 }
 
 test matview-rollback-filtered-aggregation {
@@ -542,11 +543,11 @@ test matview-rollback-filtered-aggregation {
     SELECT * FROM deposits ORDER BY account;
 }
 expect {
-    100|50.0|1
-    200|100.0|1
-    100|135.0|2
-    100|50.0|1
-    200|100.0|1
+    100|50|1
+    200|100|1
+    100|135|2
+    100|50|1
+    200|100|1
 }
 
 test matview-rollback-empty-view {
@@ -599,8 +600,8 @@ test matview-join-with-aggregation {
     SELECT * FROM user_totals ORDER BY name;
 }
 expect {
-    Alice|250.0
-    Bob|250.0
+    Alice|250
+    Bob|250
 }
 
 test matview-three-way-join {
@@ -641,9 +642,9 @@ test matview-three-way-join-with-aggregation {
     SELECT * FROM sales_totals ORDER BY customer_name, product_name;
 }
 expect {
-    Alice|Gadget|3.0|60.0
-    Alice|Widget|9.0|90.0
-    Bob|Widget|2.0|20.0
+    Alice|Gadget|3|60
+    Alice|Widget|9|90
+    Bob|Widget|2|20
 }
 
 test matview-join-incremental-insert {
@@ -832,9 +833,9 @@ test matview-aggregation-before-join {
     SELECT * FROM customer_order_summary ORDER BY total_quantity DESC;
 }
 expect {
-    Bob|Silver|2|7.0
-    Alice|Gold|3|6.0
-    Charlie|Bronze|1|1.0
+    Bob|Silver|2|7
+    Alice|Gold|3|6
+    Charlie|Bronze|1|1
 }
 
 # Test 4: Join with aggregation AFTER the join
@@ -861,8 +862,8 @@ test matview-aggregation-after-join {
     SELECT * FROM regional_sales ORDER BY total_revenue DESC;
 }
 expect {
-    North|38.0|3150.0
-    South|18.0|1500.0
+    North|38|3150
+    South|18|1500
 }
 
 # Test 5: Modifying both tables in same transaction
@@ -1172,8 +1173,8 @@ test matview-union-with-aggregation {
     SELECT * FROM half_year_summary ORDER BY quarter;
 }
 expect {
-    Q1|68.0|16450.0
-    Q2|105.0|21750.0
+    Q1|68|16450
+    Q2|105|21750
 }
 
 test matview-union-with-join {
@@ -1601,8 +1602,8 @@ test matview-groupby-scalar-function {
     SELECT * FROM yearly_totals ORDER BY 1;
 }
 expect {
-    2020|250.0
-    2021|200.0
+    2020|250
+    2021|200
 }
 
 test matview-groupby-alias {
@@ -1617,8 +1618,8 @@ test matview-groupby-alias {
     SELECT * FROM yearly_totals ORDER BY year;
 }
 expect {
-    2020|250.0
-    2021|200.0
+    2020|250
+    2021|200
 }
 
 test matview-groupby-position {
@@ -1633,8 +1634,8 @@ test matview-groupby-position {
     SELECT * FROM national_yearly ORDER BY nation, year;
 }
 expect {
-    UK|2021|200.0
-    USA|2020|250.0
+    UK|2021|200
+    USA|2020|250
 }
 
 test matview-groupby-scalar-incremental {
@@ -1651,10 +1652,10 @@ test matview-groupby-scalar-incremental {
     SELECT * FROM yearly_totals ORDER BY year;
 }
 expect {
-    2020|100.0
-    2020|250.0
-    2020|250.0
-    2021|200.0
+    2020|100
+    2020|250
+    2020|250
+    2021|200
 }
 
 test matview-groupby-join-position {
@@ -2125,6 +2126,27 @@ expect {
     3|1
 }
 
+test matview-delete-all-rows-without-a-where-clause {
+    CREATE TABLE readings(id INTEGER PRIMARY KEY, device TEXT, value INTEGER);
+    CREATE INDEX readings_device ON readings(device);
+    CREATE MATERIALIZED VIEW device_totals AS
+    SELECT device, COUNT(*) AS n FROM readings GROUP BY device;
+    INSERT INTO readings VALUES (1, 'D1', 10), (2, 'D1', 5), (3, 'D2', 7);
+    SELECT device, n FROM device_totals ORDER BY device;
+    DELETE FROM readings;
+    SELECT changes(), (SELECT count(*) FROM readings), (SELECT count(*) FROM device_totals);
+    INSERT INTO readings VALUES (4, 'D3', 3);
+    SELECT device, n FROM device_totals;
+    SELECT id FROM readings INDEXED BY readings_device WHERE device = 'D3';
+}
+expect {
+    D1|2
+    D2|1
+    3|0|0
+    D3|1
+    4
+}
+
 test matview-count-distinct-group-by-empty-start {
     CREATE TABLE measurements(device TEXT, reading INTEGER);
     CREATE MATERIALIZED VIEW device_summary AS
@@ -2254,12 +2276,12 @@ test matview-sum-distinct {
     SELECT * FROM sales_summary ORDER BY region;
 }
 expect {
-    North|300.0
-    South|700.0
-    North|300.0
-    South|700.0
-    North|300.0
-    South|1200.0
+    North|300
+    South|700
+    North|300
+    South|700
+    North|300
+    South|1200
 }
 
 test matview-avg-distinct {
@@ -2383,10 +2405,10 @@ test matview-multiple-distinct-aggregates-with-groupby {
     SELECT * FROM multi_distinct ORDER BY grp;
 }
 expect {
-    A|3|100.0|250.0
-    B|3|180.0|600.0
-    A|3|100.0|250.0
-    B|4|260.0|650.0
+    A|3|100|250.0
+    B|3|180|600.0
+    A|3|100|250.0
+    B|4|260|650.0
 }
 
 test matview-multiple-distinct-aggregates-no-groupby {
@@ -2415,8 +2437,8 @@ test matview-multiple-distinct-aggregates-no-groupby {
     SELECT * FROM multi_distinct_global;
 }
 expect {
-    6|280.0|400.0
-    7|360.0|450.0
+    6|280|400.0
+    7|360|450.0
 }
 
 test matview-count-distinct-global-aggregate {
@@ -2442,7 +2464,7 @@ expect {
     4
 }
 
-# Test that dropping a materialized view cleans up the DBSP state table
+# Test that dropping a materialized view cleans up its node-owned state table.
 test matview-drop-cleans-up-dbsp-table {
     CREATE TABLE t(id INTEGER PRIMARY KEY, val INTEGER);
     INSERT INTO t VALUES (1, 10), (2, 20), (3, 30);
@@ -2452,18 +2474,16 @@ test matview-drop-cleans-up-dbsp-table {
     GROUP BY val;
     -- Verify the view exists
     SELECT COUNT(*) FROM sqlite_schema WHERE type='view' AND name='v';
-    -- Verify the DBSP state table exists (name pattern: __turso_internal_dbsp_state_v*_v)
-    SELECT COUNT(*) FROM sqlite_schema WHERE type='table' AND name LIKE '__turso_internal_dbsp_state_v%_v';
-    -- Verify the DBSP state index exists
-    SELECT COUNT(*) FROM sqlite_schema WHERE type='index' AND name LIKE 'sqlite_autoindex___turso_internal_dbsp_state_v%_v_1';
+    -- Verify the aggregate node's state table and index exist.
+    SELECT COUNT(*) FROM sqlite_schema WHERE type='table' AND name LIKE '__turso_internal_dbsp_state_v%_v__n%';
+    SELECT COUNT(*) FROM sqlite_schema WHERE type='index' AND name LIKE 'sqlite_autoindex___turso_internal_dbsp_state_v%_v__n%_1';
     -- Drop the materialized view
     DROP VIEW v;
     -- Verify the view is gone
     SELECT COUNT(*) FROM sqlite_schema WHERE type='view' AND name='v';
-    -- Verify the DBSP state table is gone
-    SELECT COUNT(*) FROM sqlite_schema WHERE type='table' AND name LIKE '__turso_internal_dbsp_state_v%_v';
-    -- Verify the DBSP state index is gone
-    SELECT COUNT(*) FROM sqlite_schema WHERE type='index' AND name LIKE 'sqlite_autoindex___turso_internal_dbsp_state_v%_v_1';
+    -- Verify the node-owned state is gone.
+    SELECT COUNT(*) FROM sqlite_schema WHERE type='table' AND name LIKE '__turso_internal_dbsp_state_v%_v__n%';
+    SELECT COUNT(*) FROM sqlite_schema WHERE type='index' AND name LIKE 'sqlite_autoindex___turso_internal_dbsp_state_v%_v__n%_1';
 }
 expect {
     1
@@ -2493,9 +2513,9 @@ test matview-recreate-after-drop {
     SELECT * FROM mv ORDER BY modified_x;
 }
 expect {
-    1|10.0
-    2|20.0
-    3|30.0
+    1|10
+    2|20
+    3|30
     3|40
     4|60
 }
@@ -2507,4 +2527,223 @@ test matview-reserved-prefix-sqlite {
 }
 expect error {
     object name reserved for internal use: sqlite_matview
+}
+
+# sum() over integer input must return an INTEGER (and REAL as soon as one
+# input is not, flipping back to INTEGER when that row is removed), and
+# sum()/avg() over no non-NULL value must be NULL.
+test matview-sum-of-integers-is-integer {
+    CREATE TABLE t(a INTEGER);
+    INSERT INTO t VALUES (3), (4), (5);
+    CREATE MATERIALIZED VIEW v AS SELECT sum(a) AS s FROM t;
+    SELECT s, typeof(s) FROM v;
+}
+expect {
+    12|integer
+}
+
+test matview-sum-of-reals-is-real {
+    CREATE TABLE t(b REAL);
+    INSERT INTO t VALUES (1.5), (2.5), (3.0);
+    CREATE MATERIALIZED VIEW v AS SELECT sum(b) AS s FROM t;
+    SELECT s, typeof(s) FROM v;
+}
+expect {
+    7.0|real
+}
+
+# One REAL input makes the whole sum REAL, and removing that row makes it
+# INTEGER again.
+test matview-sum-mixed-types-follows-current-rows {
+    CREATE TABLE t(x);
+    INSERT INTO t VALUES (1), (2), (3.5);
+    CREATE MATERIALIZED VIEW v AS SELECT sum(x) AS s FROM t;
+    SELECT s, typeof(s) FROM v;
+    DELETE FROM t WHERE x = 3.5;
+    SELECT s, typeof(s) FROM v;
+    INSERT INTO t VALUES (0.5);
+    SELECT s, typeof(s) FROM v;
+}
+expect {
+    6.5|real
+    3|integer
+    3.5|real
+}
+
+test matview-sum-per-group-is-integer {
+    CREATE TABLE g(k TEXT, v INTEGER);
+    INSERT INTO g VALUES ('a', 1), ('a', 2), ('b', 10);
+    CREATE MATERIALIZED VIEW v AS SELECT k, sum(v) AS s FROM g GROUP BY k;
+    SELECT k, s, typeof(s) FROM v ORDER BY k;
+}
+expect {
+    a|3|integer
+    b|10|integer
+}
+
+# The integer type must survive being written to and read back from the
+# persisted aggregate state, which is what a later statement reads.
+test matview-sum-integer-type-survives-more-writes {
+    CREATE TABLE t(a INTEGER);
+    INSERT INTO t VALUES (7);
+    CREATE MATERIALIZED VIEW v AS SELECT sum(a) AS s FROM t;
+    SELECT s, typeof(s) FROM v;
+    INSERT INTO t VALUES (5);
+    SELECT s, typeof(s) FROM v;
+    UPDATE t SET a = 6 WHERE a = 5;
+    SELECT s, typeof(s) FROM v;
+}
+expect {
+    7|integer
+    12|integer
+    13|integer
+}
+
+# The REAL/INTEGER split in matview-sum-mixed-types-follows-current-rows
+# above must hold per group: removing the only REAL row of one group flips
+# that group back to INTEGER without disturbing an untouched group.
+test matview-sum-mixed-types-follows-current-rows-per-group {
+    CREATE TABLE g(id INTEGER PRIMARY KEY, k TEXT, v);
+    INSERT INTO g VALUES (1, 'a', 1), (2, 'a', 2), (3, 'a', 3.5), (4, 'b', 10), (5, 'b', 20);
+    CREATE MATERIALIZED VIEW v AS SELECT k, sum(v) AS s, typeof(sum(v)) AS t FROM g GROUP BY k;
+    SELECT k, s, t FROM v ORDER BY k;
+    DELETE FROM g WHERE id = 3;
+    SELECT k, s, t FROM v ORDER BY k;
+}
+expect {
+    a|6.5|real
+    b|30|integer
+    a|3|integer
+    b|30|integer
+}
+
+# sum() over TEXT follows the same rules as over numeric columns: a string
+# that is wholly a valid integer sums on the exact-integer path, but a string
+# that is merely numeric-looking ("5abc") forces a REAL result (contributing
+# 0), and removing it brings the sum back to INTEGER.
+test matview-sum-text-numeric-input {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, x);
+    INSERT INTO t VALUES (1, '3'), (2, '4');
+    CREATE MATERIALIZED VIEW v AS SELECT sum(x) AS s, typeof(sum(x)) AS t FROM t;
+    SELECT s, t FROM v;
+    INSERT INTO t VALUES (3, '5abc');
+    SELECT s, t FROM v;
+    DELETE FROM t WHERE id = 3;
+    SELECT s, t FROM v;
+}
+expect {
+    7|integer
+    12.0|real
+    7|integer
+}
+
+# An all-integer SUM that overflows i64 is reported as an error (see the
+# aggregate_finalization_error_rolls_back_intermediate_state Rust test), but
+# a non-integer row in the same group forces a REAL result instead, and the
+# overflow is not a sticky flag: removing both the non-integer row and the
+# extra integer brings the group back to an exact, un-errored INTEGER.
+test matview-sum-overflow-then-retract {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, x);
+    INSERT INTO t VALUES (1, 9223372036854775807), (2, 9223372036854775807), (3, 1.5);
+    CREATE MATERIALIZED VIEW v AS SELECT sum(x) AS s, typeof(sum(x)) AS t FROM t;
+    SELECT t FROM v;
+    DELETE FROM t WHERE id = 1;
+    SELECT t FROM v;
+    DELETE FROM t WHERE id = 3;
+    SELECT s, t FROM v;
+}
+expect {
+    real
+    real
+    9223372036854775807|integer
+}
+
+# avg() and total() stay REAL regardless of input types, but their values
+# must still equal a fresh evaluation after a mixed-type row is retracted.
+test matview-avg-total-follow-current-rows {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, x);
+    INSERT INTO t VALUES (1, 1), (2, 2), (3, 3.5);
+    CREATE MATERIALIZED VIEW v AS
+        SELECT avg(x) AS a, total(x) AS s, typeof(total(x)) AS t FROM t;
+    SELECT a, s, t FROM v;
+    DELETE FROM t WHERE id = 3;
+    SELECT a, s, t FROM v;
+}
+expect {
+    2.16666666666667|6.5|real
+    1.5|3.0|real
+}
+
+# count(x) must count only the rows where x is not NULL, while count(*) and
+# count(<constant>) count every row. sum()/avg() over no non-NULL value must
+# be NULL, and total() must be 0.0.
+test matview-count-column-skips-nulls {
+    CREATE TABLE t(id INTEGER, x INTEGER);
+    INSERT INTO t VALUES (1, NULL), (2, NULL);
+    CREATE MATERIALIZED VIEW v AS
+        SELECT count(x) AS cx, sum(x) AS sx, avg(x) AS ax, total(x) AS tx,
+               typeof(total(x)) AS tt, count(*) AS n
+        FROM t;
+    SELECT cx, sx, typeof(sx), ax, typeof(ax), tx, tt, n FROM v;
+}
+expect {
+    0||null||null|0.0|real|2
+}
+
+test matview-count-column-tracks-inserts-and-deletes {
+    CREATE TABLE t(id INTEGER, x INTEGER);
+    INSERT INTO t VALUES (1, NULL), (2, NULL);
+    CREATE MATERIALIZED VIEW v AS
+        SELECT count(x) AS cx, sum(x) AS sx, avg(x) AS ax, count(*) AS n FROM t;
+    INSERT INTO t VALUES (3, 10);
+    SELECT cx, sx, typeof(sx), ax, n FROM v;
+    DELETE FROM t WHERE id = 3;
+    SELECT cx, sx, typeof(sx), ax, n FROM v;
+}
+expect {
+    1|10|integer|10.0|3
+    0||null||2
+}
+
+# A row that changes from NULL to a value and back must move count(x) with it.
+test matview-count-column-tracks-updates {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, x INTEGER);
+    INSERT INTO t VALUES (1, NULL), (2, 4);
+    CREATE MATERIALIZED VIEW v AS
+        SELECT count(x) AS cx, sum(x) AS sx, avg(x) AS ax FROM t;
+    SELECT cx, sx, typeof(sx), ax FROM v;
+    UPDATE t SET x = NULL WHERE id = 2;
+    SELECT cx, sx, typeof(sx), ax FROM v;
+    UPDATE t SET x = 6 WHERE id = 1;
+    SELECT cx, sx, typeof(sx), ax FROM v;
+}
+expect {
+    1|4|integer|4.0
+    0||null|
+    1|6|integer|6.0
+}
+
+test matview-count-column-ignores-nulls-per-group {
+    CREATE TABLE g(k TEXT, x INTEGER);
+    INSERT INTO g VALUES ('a', NULL), ('a', 5), ('b', NULL);
+    CREATE MATERIALIZED VIEW v AS
+        SELECT k, count(x) AS cx, sum(x) AS sx, avg(x) AS ax, count(*) AS n
+        FROM g GROUP BY k;
+    SELECT k, cx, sx, typeof(sx), ax, n FROM v ORDER BY k;
+}
+expect {
+    a|1|5|integer|5.0|2
+    b|0||null||1
+}
+
+# count(*) and count(<constant>) count every row, NULLs included.
+test matview-count-star-and-constant-count-all-rows {
+    CREATE TABLE t(id INTEGER, x INTEGER);
+    INSERT INTO t VALUES (1, NULL), (2, 7), (3, NULL);
+    CREATE MATERIALIZED VIEW v AS
+        SELECT count(*) AS n, count(1) AS c1, count(x) AS cx FROM t;
+    SELECT n, c1, cx FROM v;
+}
+expect {
+    3|3|1
 }

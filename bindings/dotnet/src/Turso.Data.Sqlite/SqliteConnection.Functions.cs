@@ -8,10 +8,9 @@ namespace Turso.Data.Sqlite;
 public partial class SqliteConnection
 {
     private static readonly TursoScalarFunctionCallback ScalarFunctionCallback = InvokeScalarFunction;
-    private static readonly TursoContextDestructorCallback ContextDestructorCallback = NoopContextDestructor;
+    private static readonly TursoContextDestructorCallback ContextDestructorCallback = FreeCallbackContext;
     private static readonly TursoValueDestructorCallback ValueDestructorCallback = DestroyFunctionValue;
     private readonly Dictionary<string, ScalarFunctionRegistration> _scalarFunctions = new(StringComparer.OrdinalIgnoreCase);
-    private readonly List<GCHandle> _nativeFunctionContexts = [];
 
     private void RegisterScalarFunction(string name, int argc, bool isDeterministic, Func<object?[], object?>? function)
     {
@@ -33,27 +32,14 @@ public partial class SqliteConnection
         if (HasNativeCallbackHandle)
         {
             using var syncOperation = _managedConnection?.EnterSyncOperation();
-            _nativeFunctionContexts.Add(registration.Register(DatabaseHandle));
+            registration.Register(DatabaseHandle);
         }
     }
 
     private void RegisterScalarFunctions()
     {
         foreach (var registration in _scalarFunctions.Values)
-            _nativeFunctionContexts.Add(registration.Register(DatabaseHandle));
-    }
-
-    private void FreeNativeFunctionContexts()
-    {
-        foreach (var handle in _nativeFunctionContexts)
-        {
-            if (handle.Target is AggregateFunctionRegistration aggregate)
-                aggregate.FreeInvocations();
-            if (handle.IsAllocated)
-                handle.Free();
-        }
-
-        _nativeFunctionContexts.Clear();
+            registration.Register(DatabaseHandle);
     }
 
     private static object? InvokeTypedFunction<T1, TResult>(string name, Func<T1, TResult> function, object?[] args)
@@ -98,8 +84,7 @@ public partial class SqliteConnection
     {
         try
         {
-            var registration = (ScalarFunctionRegistration?)GCHandle.FromIntPtr(context).Target
-                ?? throw new ObjectDisposedException(nameof(ScalarFunctionRegistration));
+            var registration = ResolveCallbackContext<ScalarFunctionRegistration>(context);
             var args = ReadArguments(argc, argv);
             return CreateResult(registration.Invoke(args));
         }
@@ -113,8 +98,24 @@ public partial class SqliteConnection
         }
     }
 
-    private static void NoopContextDestructor(IntPtr context)
+    private static T ResolveCallbackContext<T>(IntPtr context) where T : class
     {
+        var target = GCHandle.FromIntPtr(context).Target
+            ?? throw new ObjectDisposedException(typeof(T).Name);
+        return target as T
+            ?? throw new InvalidOperationException(
+                $"Native callback expected a {typeof(T).Name} context but received a {target.GetType().Name}.");
+    }
+
+    private static void FreeCallbackContext(IntPtr context)
+    {
+        if (context == IntPtr.Zero)
+            return;
+
+        var handle = GCHandle.FromIntPtr(context);
+        if (handle.Target is AggregateFunctionRegistration aggregate)
+            aggregate.FreeInvocations();
+        handle.Free();
     }
 
     private static void DestroyFunctionValue(IntPtr result)
@@ -295,7 +296,7 @@ public partial class SqliteConnection
     {
         public object? Invoke(object?[] args) => invoke(args);
 
-        public GCHandle Register(Turso.Raw.Public.Handles.TursoDatabaseHandle database)
+        public void Register(Turso.Raw.Public.Handles.TursoDatabaseHandle database)
         {
             var handle = GCHandle.Alloc(this);
             try
@@ -309,7 +310,6 @@ public partial class SqliteConnection
                     ScalarFunctionCallback,
                     ContextDestructorCallback,
                     ValueDestructorCallback);
-                return handle;
             }
             catch
             {

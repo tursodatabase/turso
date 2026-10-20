@@ -13,13 +13,21 @@ pub enum Backend {
     Cli,
     /// JavaScript bindings backend
     Js,
-    /// PostgreSQL wire-protocol backend (tursopg server)
-    Pg,
+    /// tursopg server, driven over the PostgreSQL wire protocol
+    Tursopg,
+    /// A real PostgreSQL server, driven over the PostgreSQL wire protocol
+    Postgres,
 }
 
 impl Backend {
     /// All known backend variants
-    pub const ALL: &'static [Backend] = &[Backend::Rust, Backend::Cli, Backend::Js, Backend::Pg];
+    pub const ALL: &'static [Backend] = &[
+        Backend::Rust,
+        Backend::Cli,
+        Backend::Js,
+        Backend::Tursopg,
+        Backend::Postgres,
+    ];
 }
 
 impl Display for Backend {
@@ -28,7 +36,8 @@ impl Display for Backend {
             Backend::Rust => write!(f, "rust"),
             Backend::Cli => write!(f, "cli"),
             Backend::Js => write!(f, "js"),
-            Backend::Pg => write!(f, "pg"),
+            Backend::Tursopg => write!(f, "tursopg"),
+            Backend::Postgres => write!(f, "postgres"),
         }
     }
 }
@@ -41,9 +50,10 @@ impl FromStr for Backend {
             "rust" => Ok(Backend::Rust),
             "cli" => Ok(Backend::Cli),
             "js" => Ok(Backend::Js),
-            "pg" => Ok(Backend::Pg),
+            "tursopg" => Ok(Backend::Tursopg),
+            "postgres" => Ok(Backend::Postgres),
             _ => Err(format!(
-                "unknown backend '{s}', valid backends are: rust, cli, js, pg"
+                "unknown backend '{s}', valid backends are: rust, cli, js, tursopg, postgres"
             )),
         }
     }
@@ -118,6 +128,9 @@ pub struct Requirement {
 pub struct TestFile {
     /// Database configurations to run tests against
     pub databases: Vec<DatabaseConfig>,
+    /// Verify every materialized view against its defining SELECT after each
+    /// successful test statement on backends that preserve typed results.
+    pub verify_materialized_views: bool,
     /// Named setup blocks that can be composed
     pub setups: HashMap<String, String>,
     /// Test cases
@@ -169,6 +182,8 @@ pub struct SnapshotCase {
     /// If true, only run EXPLAIN QUERY PLAN (no bytecode).
     /// Set by the `snapshot-eqp` directive.
     pub eqp_only: bool,
+    /// Include bundled SQLite's EXPLAIN output and an opcode diff.
+    pub sqlite_reference: bool,
     /// Common modifiers (setups, skip, backend, requires)
     pub modifiers: CaseModifiers,
 }
@@ -310,6 +325,8 @@ pub enum SkipCondition {
     Mvcc,
     /// Skip when running against the sqlite CLI backend
     Sqlite,
+    /// Skip when running against a real PostgreSQL server
+    Postgres,
 }
 
 /// What we expect from executing the SQL

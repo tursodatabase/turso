@@ -142,7 +142,10 @@ pub fn emit_sequence_backing_table(
         cursor: seq_cursor_id,
         key_reg: base_reg, // base_reg holds the start value
         record_reg,
-        flag: InsertFlags::new().require_seek().skip_all_change_counts(),
+        flag: InsertFlags::new()
+            .require_seek()
+            .skip_last_rowid()
+            .skip_all_change_counts(),
         table_name: seq_name.to_string(),
     });
 
@@ -180,9 +183,9 @@ pub fn emit_disk_read_nextval(
     seq_name: &str,
     seq: &Sequence,
     target_register: usize,
-    // Optional caller-supplied register already holding the seq name as
-    // text (e.g. populated by user-arg evaluation in the SQL translator).
-    // When `None` the helper allocates its own.
+    // Optional caller-supplied register holding the name that currval is
+    // keyed by (the user's spelling, e.g. `'main.my_seq'`). When `None`
+    // the helper allocates one holding `seq_name`.
     seq_name_reg: Option<usize>,
 ) -> Result<()> {
     let backing_table_name = sequence_backing_table_name(seq_name);
@@ -259,7 +262,7 @@ pub fn emit_disk_read_nextval(
 
     program.emit_insn(Insn::SequenceComputeNext {
         db: database_id,
-        seq_name_reg,
+        seq_name: seq_name.to_string(),
         in_value_reg: col_base,
         in_is_called_reg: col_base + 1,
         was_empty_reg,
@@ -289,7 +292,10 @@ pub fn emit_disk_read_nextval(
         cursor: cursor_id,
         key_reg: target_register,
         record_reg,
-        flag: InsertFlags::new().require_seek().skip_all_change_counts(),
+        flag: InsertFlags::new()
+            .require_seek()
+            .skip_last_rowid()
+            .skip_all_change_counts(),
         table_name: seq_name.to_string(),
     });
 
@@ -368,7 +374,7 @@ pub fn emit_disk_read_nextval(
     // `op_sequence_register_allocation`.
     program.emit_insn(Insn::SequenceRegisterAllocation {
         db: database_id,
-        seq_name_reg,
+        seq_name: seq_name.to_string(),
         value_reg: target_register,
         saved_outer_reg,
     });
@@ -398,7 +404,7 @@ pub fn emit_disk_read_nextval(
 
     program.emit_insn(Insn::SequenceTrackAllocation {
         db: database_id,
-        seq_name_reg,
+        seq_name: seq_name.to_string(),
         value_reg: target_register,
     });
 
@@ -410,11 +416,15 @@ pub fn emit_disk_read_nextval(
     Ok(())
 }
 
-/// Emit bytecode that ensures the sequence's disk watermark is at least
-/// `value_reg`. If the current MAX is below the value, INSERTs a new
-/// watermark row at the value; otherwise no-op. Used for AUTOINCREMENT
-/// when the user supplies an explicit rowid that exceeds the running
-/// watermark — mirrors `Sequence::advance_past` but on disk.
+/// Emit bytecode that makes the sequence's next id come after `value_reg`.
+/// Used for AUTOINCREMENT when an INSERT supplies an explicit rowid, so that
+/// later generated ids never reuse it. Mirrors `Sequence::advance_past`, but
+/// on the backing table.
+///
+/// The backing table's last row is `(value, is_called)`. The next id is
+/// `value` when is_called is 0 (not handed out yet) and the id after `value`
+/// when is_called is 1. If the explicit rowid is the next id or later, this
+/// writes a row `(rowid, is_called = 1)`; otherwise it does nothing.
 pub fn emit_disk_advance_past(
     program: &mut ProgramBuilder,
     resolver: &Resolver,
@@ -475,26 +485,57 @@ pub fn emit_disk_advance_past(
         });
     }
     program.emit_column_or_rowid(cursor_id, 0, col_value_reg);
+    let col_is_called_reg = program.alloc_register();
+    program.emit_column_or_rowid(cursor_id, 1, col_is_called_reg);
 
-    // For ascending sequences advance only if value > current; for
-    // descending advance only if value < current.
+    // Advance when the explicit rowid is the next id or later. For an
+    // ascending sequence:
+    //
+    //   rowid < value                    -> the rowid is behind; do nothing
+    //   rowid > value                    -> advance
+    //   rowid = value, is_called = 1     -> value is already used; do nothing
+    //   rowid = value, is_called = 0     -> value is the next id; advance
+    //
+    // The last case is a new table: its row is (1, is_called = 0). Without
+    // it, an explicit rowid 1 left the next id at 1, and the next generated
+    // id replaced that row. A descending sequence uses the same rule with
+    // the comparisons reversed.
     if seq.increment_by >= 0 {
-        program.emit_insn(Insn::Le {
+        program.emit_insn(Insn::Lt {
             lhs: value_reg,
             rhs: col_value_reg,
             target_pc: done_seek_label,
+            flags: CmpInsFlags::default(),
+            collation: program.curr_collation(),
+        });
+        program.emit_insn(Insn::Gt {
+            lhs: value_reg,
+            rhs: col_value_reg,
+            target_pc: do_advance_label,
             flags: CmpInsFlags::default(),
             collation: program.curr_collation(),
         });
     } else {
-        program.emit_insn(Insn::Ge {
+        program.emit_insn(Insn::Gt {
             lhs: value_reg,
             rhs: col_value_reg,
             target_pc: done_seek_label,
             flags: CmpInsFlags::default(),
             collation: program.curr_collation(),
         });
+        program.emit_insn(Insn::Lt {
+            lhs: value_reg,
+            rhs: col_value_reg,
+            target_pc: do_advance_label,
+            flags: CmpInsFlags::default(),
+            collation: program.curr_collation(),
+        });
     }
+    program.emit_insn(Insn::If {
+        reg: col_is_called_reg,
+        target_pc: done_seek_label,
+        jump_if_null: false,
+    });
 
     program.preassign_label_to_next_insn(do_advance_label);
 
@@ -522,7 +563,10 @@ pub fn emit_disk_advance_past(
         cursor: cursor_id,
         key_reg: value_reg,
         record_reg,
-        flag: InsertFlags::new().require_seek().skip_all_change_counts(),
+        flag: InsertFlags::new()
+            .require_seek()
+            .skip_last_rowid()
+            .skip_all_change_counts(),
         table_name: seq_name.to_string(),
     });
     let seq_name_reg = program.emit_string8_new_reg(seq_name.to_string());
@@ -554,8 +598,8 @@ pub fn emit_disk_advance_past(
     }
 
     // Mirror the watermark into `sqlite_sequence` ONLY when the
-    // advance branch actually fired. If `value_reg` is at-or-below the
-    // current watermark we fall through to `done_seek_label` without
+    // advance branch actually fired. If `value_reg` does not advance the
+    // watermark we fall through to `done_seek_label` without
     // updating the backing table — emitting the sync after the label
     // would clobber `sqlite_sequence.seq` with a *lower* value than the
     // engine's actual watermark, regressing the SQLite-compatibility
@@ -743,7 +787,10 @@ pub(crate) fn emit_sqlite_sequence_sync(
         cursor: sseq_cursor,
         key_reg: rowid_reg,
         record_reg,
-        flag: InsertFlags::new().require_seek().skip_all_change_counts(),
+        flag: InsertFlags::new()
+            .require_seek()
+            .skip_last_rowid()
+            .skip_all_change_counts(),
         table_name: SQLITE_SEQUENCE_TABLE_NAME.to_string(),
     });
     program.emit_insn(Insn::Close {

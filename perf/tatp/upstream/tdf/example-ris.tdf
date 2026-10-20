@@ -1,0 +1,110 @@
+//tatp_tdf
+// TATP
+// This a TDF file for Read Intensity Scalability (RIS) runs.
+// Five different transaction mixes are defined.
+// Eight different user loads (1 to 128) are defined, to choose from
+
+[Session parameters]
+session_name = "RIS runs"
+author = "Anon" 
+throughput_resolution = 1  // seconds
+comments = "RIS runs"
+
+[Population parameters]
+subscribers = 10000
+commit_block_rows = 2000
+post_population_delay = 1 // delay after population in minutes
+check_targetdb = "no"
+
+[Test parameters]
+warm_up_duration = 1  // minutes
+run_duration = 3  // minutes
+
+[Transaction mixes]
+tatp_mix_R100 = {
+   GET_SUBSCRIBER_DATA 44
+   GET_NEW_DESTINATION 12
+   GET_ACCESS_DATA 44
+   UPDATE_SUBSCRIBER_DATA 0
+   UPDATE_LOCATION 0
+   INSERT_CALL_FORWARDING 0
+   DELETE_CALL_FORWARDING 0
+}  
+tatp_mix_8020 = {
+   GET_SUBSCRIBER_DATA 35
+   GET_NEW_DESTINATION 10
+   GET_ACCESS_DATA 35
+   UPDATE_SUBSCRIBER_DATA 2
+   UPDATE_LOCATION 14
+   INSERT_CALL_FORWARDING 2
+   DELETE_CALL_FORWARDING 2
+}
+tatp_mix_5050 = {
+   GET_SUBSCRIBER_DATA 22
+   GET_NEW_DESTINATION 6
+   GET_ACCESS_DATA 22
+   UPDATE_SUBSCRIBER_DATA 4
+   UPDATE_LOCATION 38
+   INSERT_CALL_FORWARDING 4
+   DELETE_CALL_FORWARDING 4
+}
+tatp_mix_2080 = {
+   GET_SUBSCRIBER_DATA 8
+   GET_NEW_DESTINATION 4
+   GET_ACCESS_DATA 8
+   UPDATE_SUBSCRIBER_DATA 8
+   UPDATE_LOCATION 56
+   INSERT_CALL_FORWARDING 8
+   DELETE_CALL_FORWARDING 8
+}
+
+tatp_mix_W100 = {
+   GET_SUBSCRIBER_DATA 0
+   GET_NEW_DESTINATION 0
+   GET_ACCESS_DATA 0
+   UPDATE_SUBSCRIBER_DATA 8
+   UPDATE_LOCATION 76
+   INSERT_CALL_FORWARDING 8
+   DELETE_CALL_FORWARDING 8
+}
+[Database client distributions]
+
+local_only_dcd_1 = {
+   localhost 1 // number of database client threads
+}
+local_only_dcd_2 = {
+   localhost 2 // number of database client threads
+}
+local_only_dcd_4 = {
+   localhost 4 // number of database client threads
+}
+local_only_dcd_8 = {
+   localhost 8 // number of database client threads
+}
+local_only_dcd_16 = {
+   localhost 16 // number of database client threads
+}
+local_only_dcd_32 = {
+   localhost 32 // number of database client threads
+}
+local_only_dcd_64 = {
+   localhost 64 // number of database client threads
+}
+local_only_dcd_128 = {
+   localhost 128 // number of database client threads
+}
+
+[Test sequence]
+populate post_population_delay = 0 conditional
+
+// run tests with varying R/W ratio, from R100 to W100
+
+run database_client_distribution="local_only_dcd_16" transaction_mix="tatp_mix_R100" name="1M 16 cli R100"
+
+run database_client_distribution="local_only_dcd_16" transaction_mix="tatp_mix_8020" name="1M 16 cli R80/W20"
+
+run database_client_distribution="local_only_dcd_16" transaction_mix="tatp_mix_5050" name="1M 16 cli R50/W50"
+
+run database_client_distribution="local_only_dcd_16" transaction_mix="tatp_mix_2080" name="1M 16 cli R20/W80"
+
+run database_client_distribution="local_only_dcd_16" transaction_mix="tatp_mix_W100" name="1M 16 cli W100"
