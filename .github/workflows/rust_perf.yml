@@ -116,6 +116,22 @@ jobs:
           RUST_LOG: "off"
         run: ./perf/tpc-h/benchmark.sh
 
+  tpc-h-matview:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: "v1-rust"
+          cache-on-failure: true
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: Materialized views on TPC-H
+        env:
+          RUST_LOG: "off"
+        run: ./perf/tpc-h/matview.sh
+
   vfs-bench-compile:
     runs-on: ubuntu-latest
     timeout-minutes: 30
