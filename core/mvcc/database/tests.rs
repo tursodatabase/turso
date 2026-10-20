@@ -24118,10 +24118,7 @@ fn notexists_descends_the_btree_for_non_positive_rowids() {
     conn1.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
     conn1.execute("INSERT INTO t VALUES (-1, 'b')").unwrap();
 
-    {
-        let mut manager = DATABASE_MANAGER.lock();
-        manager.clear();
-    }
+    remove_file_from_database_registry(&db_path);
 
     // Recovery replays uncheckpointed -1 into a fresh allocator (max 0 drops it).
     let io = Arc::new(PlatformIO::new().unwrap());
