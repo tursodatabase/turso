@@ -1419,26 +1419,8 @@ pub fn emit_upsert(
         cdc_before_rec
     };
 
-    // Fire FK actions (CASCADE, SET NULL, SET DEFAULT) for parent-side updates.
-    // This must be done after the update is complete but before AFTER triggers.
-    if let Some(bt) = table.btree() {
-        if has_parent_fk_actions {
-            fire_fk_update_actions(
-                program,
-                resolver,
-                bt.name.as_str(),
-                ctx.conflict_rowid_reg, // old_rowid_reg
-                current_start,          // old_values_start
-                new_start,              // new_values_start
-                new_rowid_reg.unwrap_or(ctx.conflict_rowid_reg), // new_rowid_reg
-                connection,
-                upsert_database_id,
-                &affected_parent_fks,
-            )?;
-        }
-    }
-
-    // emit CDC instructions
+    // CDC must capture the row right after the write above, before any FK action or AFTER
+    // trigger this UPSERT fires can write further CDC rows of their own.
     if let Some((cdc_id, _)) = ctx.cdc_table {
         let new_rowid = new_rowid_reg.unwrap_or(ctx.conflict_rowid_reg);
         if new_rowid_reg.is_some() {
@@ -1497,6 +1479,25 @@ pub fn emit_upsert(
                 after_rec,
                 None,
                 table.get_name(),
+            )?;
+        }
+    }
+
+    // Fire FK actions (CASCADE, SET NULL, SET DEFAULT) for parent-side updates.
+    // This must be done after the update is complete but before AFTER triggers.
+    if let Some(bt) = table.btree() {
+        if has_parent_fk_actions {
+            fire_fk_update_actions(
+                program,
+                resolver,
+                bt.name.as_str(),
+                ctx.conflict_rowid_reg, // old_rowid_reg
+                current_start,          // old_values_start
+                new_start,              // new_values_start
+                new_rowid_reg.unwrap_or(ctx.conflict_rowid_reg), // new_rowid_reg
+                connection,
+                upsert_database_id,
+                &affected_parent_fks,
             )?;
         }
     }
