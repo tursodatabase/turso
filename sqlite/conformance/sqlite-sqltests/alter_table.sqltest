@@ -1662,6 +1662,57 @@ expect {
     1|55
 }
 
+test alter-table-rename-column-trigger-subquery-reads-other-table {
+    DROP TABLE IF EXISTS t;
+    DROP TABLE IF EXISTS u;
+    DROP TABLE IF EXISTS src;
+    DROP TABLE IF EXISTS log;
+    CREATE TABLE t (a INT);
+    CREATE TABLE u (a INT);
+    CREATE TABLE src (v INT);
+    CREATE TABLE log (x);
+    CREATE TRIGGER tr AFTER INSERT ON src BEGIN
+        INSERT INTO log SELECT (SELECT a FROM u) FROM t;
+        INSERT INTO log SELECT (SELECT a FROM (SELECT 8 AS a)) FROM t;
+    END;
+    CREATE TRIGGER tr_t AFTER INSERT ON t BEGIN
+        INSERT INTO log SELECT (SELECT a FROM u) + 10;
+    END;
+    INSERT INTO u VALUES (7);
+    ALTER TABLE t RENAME COLUMN a TO b;
+    INSERT INTO t VALUES (100);
+    INSERT INTO src VALUES (1);
+    SELECT x FROM log;
+    SELECT sql FROM sqlite_schema WHERE name = 'tr';
+}
+expect pattern {
+    17\s+7\s+8\s+CREATE TRIGGER tr AFTER INSERT ON src\s+BEGIN\s+INSERT INTO log SELECT \(SELECT a FROM u\) FROM t;\s+INSERT INTO log SELECT \(SELECT a FROM \(SELECT 8 AS a\)\) FROM t;?\s+END
+}
+
+test alter-table-rename-column-trigger-subquery-reads-view-or-table-valued-function {
+    DROP TABLE IF EXISTS t;
+    DROP VIEW IF EXISTS vw;
+    DROP TABLE IF EXISTS src;
+    DROP TABLE IF EXISTS log;
+    CREATE TABLE t (a INT, value INT);
+    CREATE VIEW vw AS SELECT 5 AS a;
+    CREATE TABLE src (v INT);
+    CREATE TABLE log (x);
+    CREATE TRIGGER tr AFTER INSERT ON src BEGIN
+        INSERT INTO log SELECT (SELECT a FROM vw) FROM t;
+        INSERT INTO log SELECT (SELECT value FROM json_each('[3]')) FROM t;
+    END;
+    INSERT INTO t VALUES (100, 200);
+    ALTER TABLE t RENAME COLUMN a TO b;
+    ALTER TABLE t RENAME COLUMN value TO c;
+    INSERT INTO src VALUES (1);
+    SELECT x FROM log;
+    SELECT sql FROM sqlite_schema WHERE name = 'tr';
+}
+expect pattern {
+    5\s+3\s+CREATE TRIGGER tr AFTER INSERT ON src\s+BEGIN\s+INSERT INTO log SELECT \(SELECT a FROM vw\) FROM t;\s+INSERT INTO log SELECT \(SELECT value FROM json_each\s?\('\[3\]'\)\) FROM t;?\s+END
+}
+
 test alter-table-rename-trigger-exists-subquery {
     DROP TABLE IF EXISTS t1;
     DROP TABLE IF EXISTS t2;

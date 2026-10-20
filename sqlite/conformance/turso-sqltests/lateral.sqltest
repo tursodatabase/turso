@@ -483,3 +483,21 @@ test rename-column-rewrites-a-lateral-subquery-in-a-trigger {
 expect {
     CREATE TRIGGER tr1 AFTER INSERT ON t2 BEGIN INSERT INTO t2 SELECT s.c FROM t1 AS x, LATERAL (SELECT x.d * 10 AS c) AS s WHERE NEW.b = 0; END
 }
+
+test rename-column-keeps-a-lateral-subquery-column-of-another-table-in-a-trigger {
+    CREATE TABLE t(a INT);
+    CREATE TABLE u(a INT);
+    CREATE TABLE src(v INT);
+    CREATE TABLE log(x);
+    CREATE TRIGGER tr AFTER INSERT ON src BEGIN INSERT INTO log SELECT s.a FROM t, LATERAL (SELECT a FROM u) AS s; END;
+    INSERT INTO t VALUES (100);
+    INSERT INTO u VALUES (7);
+    ALTER TABLE t RENAME COLUMN a TO b;
+    INSERT INTO src VALUES (1);
+    SELECT x FROM log;
+    SELECT sql FROM sqlite_schema WHERE name = 'tr';
+}
+expect {
+    7
+    CREATE TRIGGER tr AFTER INSERT ON src BEGIN INSERT INTO log SELECT s.a FROM t, LATERAL (SELECT a FROM u) AS s; END
+}
