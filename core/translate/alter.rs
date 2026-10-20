@@ -871,6 +871,7 @@ pub fn translate_alter_table(
     let qualified_schema_table = schema_table_name_for_db(resolver, database_id);
     let schema_version = resolver.with_schema(database_id, |s| s.schema_version);
     validate(&alter_table, table_name)?;
+    reject_alter_of_view(&alter_table, table_name, resolver, database_id)?;
 
     let table_indexes = resolver.with_schema(database_id, |s| {
         s.get_indices(table_name).cloned().collect::<Vec<_>>()
@@ -2378,6 +2379,39 @@ pub fn translate_alter_table(
     };
 
     Ok(())
+}
+
+/// Reject ALTER TABLE on a plain or materialized view with SQLite's messages
+/// (sqlite3AlterRenameTable, sqlite3AlterBeginAddColumn and isRealTable in
+/// alter.c). ALTER COLUMN has no SQLite equivalent and uses the RENAME TO
+/// message.
+fn reject_alter_of_view(
+    alter_table: &ast::AlterTableBody,
+    table_name: &str,
+    resolver: &Resolver,
+    database_id: usize,
+) -> Result<()> {
+    let is_view = resolver.with_schema(database_id, |s| {
+        s.get_view(table_name).is_some() || s.materialized_view_exists(table_name)
+    });
+    if !is_view {
+        return Ok(());
+    }
+    let view_name = normalize_ident(table_name);
+    match alter_table {
+        ast::AlterTableBody::RenameTo(_) | ast::AlterTableBody::AlterColumn { .. } => {
+            crate::bail_parse_error!("view {view_name} may not be altered")
+        }
+        ast::AlterTableBody::AddColumn(_) => {
+            crate::bail_parse_error!("Cannot add a column to a view")
+        }
+        ast::AlterTableBody::RenameColumn { .. } => {
+            crate::bail_parse_error!("cannot rename columns of view \"{view_name}\"")
+        }
+        ast::AlterTableBody::DropColumn(_) => {
+            crate::bail_parse_error!("cannot drop column from view \"{view_name}\"")
+        }
+    }
 }
 
 // Return the indexes whose persisted entries may become stale after ALTER COLUMN,

@@ -87,3 +87,51 @@ test matview-column-list-duplicate-name {
 expect error {
     duplicate column name: x
 }
+
+# ALTER TABLE on a view is rejected with SQLite's messages. Renaming a
+# materialized view used to succeed while its internal tables kept the old
+# name, so the view could not be read after a reopen.
+test matview-alter-rename-rejected {
+    CREATE TABLE t(a);
+    CREATE MATERIALIZED VIEW v AS SELECT a FROM t;
+    ALTER TABLE v RENAME TO w;
+}
+expect error {
+    view v may not be altered
+}
+
+test matview-alter-add-column-rejected {
+    CREATE TABLE t(a);
+    CREATE MATERIALIZED VIEW v AS SELECT a FROM t;
+    ALTER TABLE v ADD COLUMN z;
+}
+expect error {
+    Cannot add a column to a view
+}
+
+test matview-alter-rename-column-rejected {
+    CREATE TABLE t(a);
+    CREATE MATERIALIZED VIEW v AS SELECT a FROM t;
+    ALTER TABLE v RENAME COLUMN a TO q;
+}
+expect error {
+    cannot rename columns of view "v"
+}
+
+test matview-alter-drop-column-rejected {
+    CREATE TABLE t(a, b);
+    CREATE MATERIALIZED VIEW v AS SELECT a, b FROM t;
+    ALTER TABLE v DROP COLUMN a;
+}
+expect error {
+    cannot drop column from view "v"
+}
+
+test matview-alter-column-rejected {
+    CREATE TABLE t(a);
+    CREATE MATERIALIZED VIEW v AS SELECT a FROM t;
+    ALTER TABLE v ALTER COLUMN a TO a INTEGER;
+}
+expect error {
+    view v may not be altered
+}
