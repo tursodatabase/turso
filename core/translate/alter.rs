@@ -22,7 +22,7 @@ use crate::{
     },
     translate::{
         emitter::{emit_check_constraints, gencol::compute_virtual_columns, Resolver},
-        expr::{translate_expr, walk_expr, walk_expr_mut, WalkControl},
+        expr::{emit_stored_column, translate_expr, walk_expr, walk_expr_mut, WalkControl},
         plan::{ColumnMask, ColumnUsedMask, OuterQueryReference, TableReferences},
         trigger::create_trigger_to_sql,
     },
@@ -2639,11 +2639,13 @@ fn emit_rewrite_table_rows(
                 continue;
             };
 
-            program.emit_column_or_rowid(
+            emit_stored_column(
+                program,
                 cursor_id,
                 *source_column_idx,
                 layout.to_register(base_dest_reg, schema_idx),
-            );
+                resolver,
+            )?;
         }
 
         if let Some(column_index) = converted_column {

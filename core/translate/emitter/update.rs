@@ -2333,10 +2333,11 @@ fn emit_update_insns<'a>(
             {
                 Some(emit_cdc_full_record(
                     program,
+                    &t_ctx.resolver,
                     target_table.table.columns(),
                     target_table_cursor_id,
                     cdc_rowid_before_reg.expect("cdc_rowid_before_reg must be set"),
-                ))
+                )?)
             } else {
                 None
             };

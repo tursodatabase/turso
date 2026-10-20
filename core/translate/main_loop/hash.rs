@@ -396,11 +396,13 @@ impl<'a, 'plan> PreparedHashBuild<'a, 'plan> {
                         );
                     }
                     Some(_) if !config.uses_materialized_keys_and_payload => {
-                        planner.program.emit_column_or_rowid(
+                        emit_stored_column(
+                            planner.program,
                             payload_source_cursor_id,
                             col_idx,
                             payload_reg + i,
-                        );
+                            &planner.t_ctx.resolver,
+                        )?;
                         let column = &build_table.columns()[col_idx];
                         if planner
                             .t_ctx
