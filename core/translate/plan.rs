@@ -3903,6 +3903,23 @@ impl Aggregate {
         }
     }
 
+    pub fn order_by(&self) -> &[ast::SortedColumn] {
+        if matches!(self.func, AggFunc::Min | AggFunc::Max) {
+            return &[];
+        }
+        match &self.original_expr {
+            ast::Expr::FunctionCall { order_by, .. } => order_by,
+            _ => &[],
+        }
+    }
+
+    pub fn input_exprs(&self) -> impl Iterator<Item = &ast::Expr> {
+        self.args
+            .iter()
+            .chain(self.filter_expr.iter())
+            .chain(self.order_by().iter().map(|term| term.expr.as_ref()))
+    }
+
     pub fn is_distinct(&self) -> bool {
         self.distinctness.is_distinct()
     }

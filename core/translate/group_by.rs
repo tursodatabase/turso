@@ -406,11 +406,8 @@ fn collect_agg_leaf_columns(aggregates: &[Aggregate], plan: &SelectPlan) -> Resu
         }
     };
     for agg in aggregates {
-        for arg in &agg.args {
-            walk_expr(arg, &mut collect)?;
-        }
-        if let Some(filter_expr) = &agg.filter_expr {
-            walk_expr(filter_expr, &mut collect)?;
+        for expr in agg.input_exprs() {
+            walk_expr(expr, &mut collect)?;
         }
     }
     Ok(leaf_columns)
