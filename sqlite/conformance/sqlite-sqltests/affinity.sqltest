@@ -809,3 +809,90 @@ test affinity-sum-of-text-i64-min {
 expect {
     integer|-9223372036854775808
 }
+
+@cross-check-integrity
+test affinity-real-text-large-exponent-matches-cast {
+    CREATE TABLE r(x REAL);
+    INSERT INTO r VALUES ('2e218'), (2e218);
+    SELECT x = 2e218, x = CAST('2e218' AS REAL) FROM r;
+    SELECT count(DISTINCT x) FROM r;
+}
+expect {
+    1|1
+    1|1
+    1
+}
+
+@cross-check-integrity
+test affinity-real-numeric-text-matches-cast {
+    CREATE TABLE s(v TEXT, x REAL, n NUMERIC);
+    INSERT INTO s VALUES ('43833.5411857880e249', '43833.5411857880e249', '43833.5411857880e249');
+    INSERT INTO s VALUES ('3.158929622800560e-100', '3.158929622800560e-100', '3.158929622800560e-100');
+    SELECT x = CAST(v AS REAL), n = CAST(v AS REAL) FROM s ORDER BY rowid;
+}
+expect {
+    1|1
+    1|1
+}
+
+@cross-check-integrity
+test affinity-sum-total-avg-of-text-matches-cast {
+    SELECT sum('2e218') = 2e218, total('2e218') = 2e218, avg('2e218') = 2e218;
+    SELECT sum('1.0e-300') = CAST('1.0e-300' AS REAL);
+    SELECT sum(v) = CAST(v AS REAL) FROM (SELECT '43833.5411857880e249' AS v);
+    SELECT sum(v) = CAST(v AS REAL) FROM (SELECT '3.158929622800560e-100' AS v);
+}
+expect {
+    1|1|1
+    1
+    1
+    1
+}
+
+@cross-check-integrity
+test affinity-cast-text-as-numeric-matches-numeric-column {
+    CREATE TABLE n(v TEXT, x NUMERIC);
+    INSERT INTO n VALUES ('2e218', '2e218');
+    INSERT INTO n VALUES ('43833.5411857880e249', '43833.5411857880e249');
+    INSERT INTO n VALUES ('3.158929622800560e-100', '3.158929622800560e-100');
+    INSERT INTO n VALUES ('12345678901234567890123', '12345678901234567890123');
+    SELECT x = CAST(v AS NUMERIC), CAST(v AS NUMERIC) = CAST(v AS REAL) FROM n ORDER BY rowid;
+    SELECT CAST('2e218' AS NUMERIC) = 2e218;
+    SELECT CAST('12345678901234567890123' AS NUMERIC) = 12345678901234567890123;
+}
+expect {
+    1|1
+    1|1
+    1|1
+    1|1
+    1
+    1
+}
+
+@cross-check-integrity
+test affinity-text-to-real-stops-at-sqlite-significand-limit {
+    CREATE TABLE r(v TEXT, x REAL);
+    INSERT INTO r VALUES ('1844674407370955160.3e-141', '1844674407370955160.3e-141');
+    INSERT INTO r VALUES ('18446744073709551613e-232', '18446744073709551613e-232');
+    INSERT INTO r VALUES ('18446744073709551609', '18446744073709551609');
+    SELECT printf('%!.20e', x), printf('%!.20e', CAST(v AS REAL)), printf('%!.20e', CAST(v AS NUMERIC)), x = CAST(v AS REAL), sum(v) = CAST(v AS REAL) FROM r GROUP BY rowid ORDER BY rowid;
+}
+expect {
+    1.844674407370954903e-123|1.844674407370954903e-123|1.844674407370954903e-123|1|1
+    1.844674407370955208e-213|1.844674407370955208e-213|1.844674407370955208e-213|1|1
+    1.844674407370955162e+19|1.844674407370955162e+19|1.844674407370955162e+19|1|1
+}
+
+@cross-check-integrity
+test affinity-text-to-real-exponent-above-1000-offset-by-digits {
+    CREATE TABLE r(v TEXT, x REAL, n NUMERIC);
+    INSERT INTO r SELECT s, s, s FROM (SELECT '0.' || replace(printf('%1000s', ''), ' ', '0') || '1e1001' AS s);
+    INSERT INTO r SELECT s, s, s FROM (SELECT '1' || replace(printf('%1500s', ''), ' ', '0') || 'e-1700' AS s);
+    INSERT INTO r SELECT s, s, s FROM (SELECT '0.' || replace(printf('%9999s', ''), ' ', '0') || '7e10002' AS s);
+    SELECT CAST(v AS NUMERIC), CAST(v AS REAL), v + 0, sum(v), x, n, x = CAST(v AS REAL) FROM r GROUP BY rowid ORDER BY rowid;
+}
+expect {
+    1|1.0|1.0|1.0|1.0|1|1
+    1.0e-200|1.0e-200|1.0e-200|1.0e-200|1.0e-200|1.0e-200|1
+    700|700.0|700.0|700.0|700.0|700|1
+}

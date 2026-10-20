@@ -607,13 +607,10 @@ pub fn str_to_f64(input: impl AsRef<str>) -> Option<StrToF64> {
     while let Some(digit) = input.peek().and_then(|ch| ch.to_digit(10)) {
         had_digits = true;
 
-        match significant
-            .checked_mul(10)
-            .and_then(|v| v.checked_add(digit as u64))
-        {
-            Some(new) => significant = new,
-            None => break,
+        if significant >= (u64::MAX - 9) / 10 {
+            break;
         }
+        significant = significant * 10 + digit as u64;
 
         input.next();
     }
@@ -657,7 +654,11 @@ pub fn str_to_f64(input: impl AsRef<str>) -> Option<StrToF64> {
             let mut e = 0;
 
             while let Some(ch) = input.next_if(char::is_ascii_digit) {
-                e = (e * 10 + ch.to_digit(10).unwrap() as i32).min(1000);
+                e = if e < 10000 {
+                    e * 10 + ch.to_digit(10).unwrap() as i32
+                } else {
+                    10000
+                };
             }
 
             exponent += sign * e;
@@ -670,17 +671,36 @@ pub fn str_to_f64(input: impl AsRef<str>) -> Option<StrToF64> {
         return None;
     }
 
-    while exponent.is_positive() && significant < MAX_EXACT / 10 {
-        significant *= 10;
+    let result = NonNan::new(decimal_to_f64(significant, exponent) * sign)
+        .unwrap_or_else(|| NonNan::new(sign * f64::INFINITY).unwrap());
+
+    if !valid_exponent || input.count() > 0 {
+        if is_fractional {
+            return Some(StrToF64::FractionalPrefix(result));
+        } else {
+            return Some(StrToF64::DecimalPrefix(result));
+        }
+    }
+
+    Some(if is_fractional {
+        StrToF64::Fractional(result)
+    } else {
+        StrToF64::Decimal(result)
+    })
+}
+
+pub fn decimal_to_f64(mut significand: u64, mut exponent: i32) -> f64 {
+    while exponent.is_positive() && significand < MAX_EXACT / 10 {
+        significand *= 10;
         exponent -= 1;
     }
 
-    while exponent.is_negative() && significant % 10 == 0 {
-        significant /= 10;
+    while exponent.is_negative() && significand % 10 == 0 {
+        significand /= 10;
         exponent += 1;
     }
 
-    let mut result = DoubleDouble::from(significant);
+    let mut result = DoubleDouble::from(significand);
 
     if exponent > 0 {
         while exponent >= 100 {
@@ -710,22 +730,7 @@ pub fn str_to_f64(input: impl AsRef<str>) -> Option<StrToF64> {
         }
     }
 
-    let result = NonNan::new(f64::from(result) * sign)
-        .unwrap_or_else(|| NonNan::new(sign * f64::INFINITY).unwrap());
-
-    if !valid_exponent || input.count() > 0 {
-        if is_fractional {
-            return Some(StrToF64::FractionalPrefix(result));
-        } else {
-            return Some(StrToF64::DecimalPrefix(result));
-        }
-    }
-
-    Some(if is_fractional {
-        StrToF64::Fractional(result)
-    } else {
-        StrToF64::Decimal(result)
-    })
+    f64::from(result)
 }
 
 pub fn round_half_away_from_zero_tie(f: f64, precision: usize) -> Option<f64> {
