@@ -2611,11 +2611,11 @@ pub fn op_column_has_field(
             let cursor_ref =
                 must_be_btree_cursor!(*cursor_id, program.cursor_ref, state, "ColumnHasField");
             if matches!(cursor_ref, Cursor::NullRow) {
-                false
+                true
             } else {
                 let cursor = cursor_ref.as_btree_mut();
                 if cursor.get_null_flag() {
-                    false
+                    true
                 } else {
                     match return_if_io!(state, cursor.record()) {
                         Some(record) => record.column_count() > *column,

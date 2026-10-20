@@ -263,9 +263,12 @@ test alter-add-default-old-row-domain-over-encoded-type {
     INSERT INTO t VALUES (1, 10);
     ALTER TABLE t ADD COLUMN c d DEFAULT 5;
     SELECT id, x, c FROM t;
+    UPDATE t SET x = 11;
+    SELECT id, x, c FROM t;
 }
 expect {
     1|10|5
+    1|11|5
 }
 
 @requires strict "uses STRICT tables"
@@ -311,4 +314,22 @@ test alter-add-default-old-row-integrity-check-uses-encoded-default {
 expect {
     1|10|a
     ok
+}
+
+@requires strict "uses STRICT tables"
+test alter-add-default-left-join-unmatched-row-is-null {
+    CREATE TYPE cents BASE integer ENCODE value * 100 DECODE value / 100 OPERATOR '<';
+    CREATE TABLE t(id INTEGER PRIMARY KEY, x INT) STRICT;
+    INSERT INTO t VALUES (1, 10);
+    ALTER TABLE t ADD COLUMN c cents DEFAULT 5;
+    CREATE TABLE u(id INTEGER PRIMARY KEY) STRICT;
+    INSERT INTO u VALUES (1), (2);
+    SELECT u.id, t.c, t.c IS NULL FROM u LEFT JOIN t ON t.id = u.id ORDER BY u.id;
+    SELECT u.id, t.c FROM u LEFT JOIN t ON t.id = u.id ORDER BY t.c;
+}
+expect {
+    1|5|0
+    2||1
+    2|
+    1|5
 }
