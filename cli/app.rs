@@ -2467,7 +2467,7 @@ mod tests {
     fn test_dump_and_reload_infinite_real() -> anyhow::Result<()> {
         let io: Arc<dyn turso_core::IO> = Arc::new(turso_core::MemoryIO::new());
         let db = Database::open_file(io, ":memory:", Arc::new(SqliteDialect))?;
-        let conn = db.connect()?;
+        let conn = db.connect(ConnectOpts::new())?;
         conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, x REAL);")?;
         conn.execute("INSERT INTO t VALUES(1, 1e400), (2, -1e400), (3, 1.5), (4, NULL);")?;
 
@@ -2490,7 +2490,7 @@ mod tests {
 
         let io2: Arc<dyn turso_core::IO> = Arc::new(turso_core::MemoryIO::new());
         let db2 = Database::open_file(io2, ":memory:", Arc::new(SqliteDialect))?;
-        let conn2 = db2.connect()?;
+        let conn2 = db2.connect(ConnectOpts::new())?;
         for stmt in dump_sql.split(';') {
             let stmt = stmt.trim();
             if stmt.is_empty() {
