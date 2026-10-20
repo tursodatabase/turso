@@ -282,7 +282,7 @@ test view-rejects-aggregate-order-by {
     CREATE VIEW v AS SELECT SUM(val ORDER BY val) FROM t;
 }
 expect error {
-    ORDER BY clause is not supported yet in aggregate functions
+    ORDER BY is only supported in array_agg
 }
 
 test view-self-circle-detection {
