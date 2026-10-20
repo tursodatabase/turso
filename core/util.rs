@@ -2490,16 +2490,7 @@ fn extract_view_columns_inner(
     schema: &Schema,
     outer_ctes: &HashMap<String, ViewColumnSchema>,
 ) -> Result<ViewColumnSchema> {
-    let mut ctes = outer_ctes.clone();
-    if let Some(with) = &select_stmt.with {
-        for cte in &with.ctes {
-            let mut derived = extract_view_columns_inner(&cte.select, schema, &ctes)?;
-            for (column, explicit_name) in derived.columns.iter_mut().zip(&cte.columns) {
-                column.column.name = Some(explicit_name.col_name.as_str().to_string());
-            }
-            ctes.insert(normalize_ident(cte.tbl_name.as_str()), derived);
-        }
-    }
+    let ctes = extract_cte_columns(&select_stmt.with, schema, outer_ctes)?;
 
     let mut tables = Vec::new();
     let mut columns = Vec::new();
@@ -2574,6 +2565,36 @@ fn extract_view_columns_inner(
     }
 
     Ok(ViewColumnSchema { tables, columns })
+}
+
+pub(crate) fn extract_cte_columns(
+    with: &Option<ast::With>,
+    schema: &Schema,
+    outer_ctes: &HashMap<String, ViewColumnSchema>,
+) -> Result<HashMap<String, ViewColumnSchema>> {
+    let mut ctes = outer_ctes.clone();
+    for cte in with.iter().flat_map(|with| &with.ctes) {
+        let mut derived = extract_view_columns_inner(&cte.select, schema, &ctes)?;
+        for (column, explicit_name) in derived.columns.iter_mut().zip(&cte.columns) {
+            column.column.name = Some(explicit_name.col_name.as_str().to_string());
+        }
+        ctes.insert(normalize_ident(cte.tbl_name.as_str()), derived);
+    }
+    Ok(ctes)
+}
+
+pub(crate) fn select_table_column_names(
+    select_table: &ast::SelectTable,
+    schema: &Schema,
+    ctes: &HashMap<String, ViewColumnSchema>,
+) -> Result<Vec<String>> {
+    let source = view_source_from_select_table(select_table, schema, ctes, &mut Vec::new())?;
+    Ok(source
+        .columns
+        .iter()
+        .filter_map(view_column_name)
+        .map(normalize_ident)
+        .collect())
 }
 
 fn view_result_column(expr: &ast::Expr, sources: &[ViewSource]) -> ViewColumn {
