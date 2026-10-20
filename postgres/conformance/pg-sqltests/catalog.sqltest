@@ -73,6 +73,21 @@ expect {
     a|catalog_age
 }
 
+test pg-attribute-default-compression {
+    CREATE TABLE compression_columns (id integer NOT NULL, body text, amount integer DEFAULT 7);
+    SELECT a.attname, quote_literal(a.attcompression::text), a.attnotnull, a.atthasdef,
+           a.attidentity, a.attgenerated, a.attisdropped, a.attislocal, a.attinhcount
+    FROM pg_catalog.pg_attribute a
+    JOIN pg_catalog.pg_class c ON c.oid = a.attrelid
+    WHERE c.relname = 'compression_columns' AND a.attnum > 0
+    ORDER BY a.attnum;
+}
+expect {
+    id|''|t|f|||f|t|0
+    body|''|f|f|||f|t|0
+    amount|''|f|t|||f|t|0
+}
+
 test pg-settings-default-search-path {
     SELECT setting, source, boot_val, reset_val, context, vartype,
            unit, min_val, max_val, enumvals, sourcefile, sourceline, pending_restart

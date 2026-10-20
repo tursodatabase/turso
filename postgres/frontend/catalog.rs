@@ -539,6 +539,7 @@ impl SnapshotRows for PgAttributeTable {
             attbyval BOOLEAN,
             attstorage TEXT,
             attalign TEXT,
+            attcompression TEXT,
             attnotnull BOOLEAN,
             atthasdef BOOLEAN,
             atthasmissing BOOLEAN,
@@ -592,19 +593,20 @@ impl SnapshotRows for PgAttributeTable {
                     Value::from_i64(1),           // attbyval
                     Value::Text("p".into()),      // attstorage (plain)
                     Value::Text("i".into()),      // attalign (int)
-                    Value::from_i64(notnull),     // attnotnull
-                    Value::from_i64(has_def),     // atthasdef
-                    Value::from_i64(0),           // atthasmissing
-                    Value::Text("".into()),       // attidentity
-                    Value::Text("".into()),       // attgenerated
-                    Value::from_i64(0),           // attisdropped
-                    Value::from_i64(1),           // attislocal
-                    Value::from_i64(0),           // attinhcount
-                    Value::from_i64(0),           // attcollation
-                    Value::Null,                  // attacl
-                    Value::Null,                  // attoptions
-                    Value::Null,                  // attfdwoptions
-                    Value::Null,                  // attmissingval
+                    Value::Text("".into()),
+                    Value::from_i64(notnull), // attnotnull
+                    Value::from_i64(has_def), // atthasdef
+                    Value::from_i64(0),       // atthasmissing
+                    Value::Text("".into()),   // attidentity
+                    Value::Text("".into()),   // attgenerated
+                    Value::from_i64(0),       // attisdropped
+                    Value::from_i64(1),       // attislocal
+                    Value::from_i64(0),       // attinhcount
+                    Value::from_i64(0),       // attcollation
+                    Value::Null,              // attacl
+                    Value::Null,              // attoptions
+                    Value::Null,              // attfdwoptions
+                    Value::Null,              // attmissingval
                 ]);
             }
         }
