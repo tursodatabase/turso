@@ -17,7 +17,8 @@
 //! - `filename` — path to the CSV file (mutually exclusive with `data=`)
 //! - `data` — inline CSV content as a string
 //! - `header` — whether the first row contains column names;
-//!   accepts `yes`/`no`, `on`/`off`, `true`/`false`, or `1`/`0`
+//!   accepts `yes`/`no`, `on`/`off`, `true`/`false`, or `1`/`0`;
+//!   a bare `header` means `header=yes`
 //! - `columns` — number of columns
 //! - `schema` — optional custom SQL `CREATE TABLE` schema
 use std::fs::File;
@@ -36,18 +37,12 @@ register_extension! {
 struct CsvVTabModule;
 
 impl CsvVTabModule {
-    fn parse_arg(arg: &Value) -> Result<(&str, &str), ResultCode> {
-        if let Some(text) = arg.to_text() {
-            let mut split = text.splitn(2, '=');
-            if let Some(name) = split.next() {
-                if let Some(value) = split.next() {
-                    let name = name.trim();
-                    let value = value.trim();
-                    return Ok((name, value));
-                }
-            }
+    fn parse_arg(arg: &Value) -> Result<(&str, Option<&str>), ResultCode> {
+        let text = arg.to_text().ok_or(ResultCode::InvalidArgs)?;
+        match text.split_once('=') {
+            Some((name, value)) => Ok((name.trim(), Some(value.trim()))),
+            None => Ok((text.trim(), None)),
         }
-        Err(ResultCode::InvalidArgs)
     }
 
     fn parse_string(s: &str) -> Result<String, ResultCode> {
@@ -123,26 +118,38 @@ impl VTabModule for CsvVTabModule {
 
         for arg in args {
             let (name, value) = Self::parse_arg(arg)?;
-            match name {
-                "filename" => {
+            match (name, value) {
+                ("header", value) => {
+                    if header.is_some() {
+                        return Err(ResultCode::InvalidArgs);
+                    }
+                    header = Some(match value {
+                        Some(value) => Self::parse_boolean(value).ok_or(ResultCode::InvalidArgs)?,
+                        None => true,
+                    });
+                }
+                (_, None) => {
+                    return Err(ResultCode::InvalidArgs);
+                }
+                ("filename", Some(value)) => {
                     if filename.is_some() {
                         return Err(ResultCode::InvalidArgs);
                     }
                     filename = Some(Self::parse_string(value)?);
                 }
-                "data" => {
+                ("data", Some(value)) => {
                     if data.is_some() {
                         return Err(ResultCode::InvalidArgs);
                     }
                     data = Some(Self::parse_string(value)?);
                 }
-                "schema" => {
+                ("schema", Some(value)) => {
                     if schema.is_some() {
                         return Err(ResultCode::InvalidArgs);
                     }
                     schema = Some(Self::parse_string(value)?);
                 }
-                "columns" => {
+                ("columns", Some(value)) => {
                     if column_count.is_some() {
                         return Err(ResultCode::InvalidArgs);
                     }
@@ -151,12 +158,6 @@ impl VTabModule for CsvVTabModule {
                         return Err(ResultCode::InvalidArgs);
                     }
                     column_count = Some(n);
-                }
-                "header" => {
-                    if header.is_some() {
-                        return Err(ResultCode::InvalidArgs);
-                    }
-                    header = Some(Self::parse_boolean(value).ok_or(ResultCode::InvalidArgs)?);
                 }
                 _ => {
                     return Err(ResultCode::InvalidArgs);
@@ -457,6 +458,34 @@ mod tests {
     }
 
     #[test]
+    fn test_bare_header_argument() {
+        let file = write_csv("id,name\n1,Alice\n2,Bob\n");
+        let filename = format!("filename={}", file.path().to_string_lossy());
+        for args in [
+            vec![filename.as_str(), "header"],
+            vec!["data=id,name\n1,Alice\n2,Bob\n", " header "],
+        ] {
+            let (schema, table) = try_new_table(args).unwrap();
+            assert_eq!(schema, "CREATE TABLE x (\"id\" TEXT, \"name\" TEXT)");
+            let cursor = table.open(None).unwrap();
+            let rows = read_rows(cursor, 2);
+            assert_eq!(
+                rows,
+                vec![
+                    vec![cell!("1"), cell!("Alice")],
+                    vec![cell!("2"), cell!("Bob")]
+                ]
+            );
+        }
+    }
+
+    #[test]
+    fn test_more_than_one_bare_header_argument() {
+        let result = try_new_table(vec!["data=id,name\n1,Alice\n", "header", "header=false"]);
+        assert!(matches!(result, Err(ResultCode::InvalidArgs)));
+    }
+
+    #[test]
     fn test_file_without_header() {
         let file = write_csv("1,Alice\n2,Bob\n");
         let table = new_table(vec![
@@ -708,7 +737,8 @@ mod tests {
     #[test]
     fn test_unparsable_argument() {
         let unparsable_arguments = [
-            "header",
+            "data",
+            "header=",
             "schema='CREATE TABLE x (id INT, name TEXT)",
             "schema=\"CREATE TABLE x (id INT, name TEXT)",
             "schema=\"CREATE TABLE x (id INT, name TEXT)'",
