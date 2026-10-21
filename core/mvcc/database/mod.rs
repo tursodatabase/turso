@@ -10636,7 +10636,10 @@ impl RowidAllocator {
     }
 
     pub(crate) fn record_btree_last(&self, last: BtreeLast) {
-        *self.btree_last.lock() = Some(last);
+        let mut stored = self.btree_last.lock();
+        if stored.is_none_or(|stored| stored.read_mark <= last.read_mark) {
+            *stored = Some(last);
+        }
     }
 
     pub fn is_uninitialized(&self) -> bool {

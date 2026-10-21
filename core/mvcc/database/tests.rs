@@ -7116,6 +7116,45 @@ fn exists_reads_the_btree_last_cached_at_the_pager_wal_position() {
 }
 
 #[test]
+fn record_btree_last_keeps_the_newest_wal_position() {
+    let db = MvccTestDb::new();
+    db.conn
+        .execute("CREATE TABLE t(x INTEGER PRIMARY KEY, v TEXT)")
+        .unwrap();
+    let root_page = get_rows(
+        &db.conn,
+        "SELECT rootpage FROM sqlite_schema WHERE name = 't'",
+    )[0][0]
+        .as_int()
+        .unwrap();
+    let table_id = db.mvcc_store.get_table_id_from_root_page(root_page);
+    let allocator = db.mvcc_store.get_rowid_allocator(&table_id);
+    let older = WalPos {
+        checkpoint_seq: 1,
+        frame: 5,
+    };
+    let newer = WalPos {
+        checkpoint_seq: 2,
+        frame: 0,
+    };
+
+    allocator.record_btree_last(BtreeLast {
+        read_mark: newer,
+        rowid: Some(10),
+    });
+    allocator.record_btree_last(BtreeLast {
+        read_mark: older,
+        rowid: Some(5),
+    });
+
+    assert_eq!(
+        allocator.btree_last(newer).map(|last| last.rowid),
+        Some(Some(10))
+    );
+    assert!(allocator.btree_last(older).is_none());
+}
+
+#[test]
 fn notexists_does_not_raise_the_next_automatic_rowid_past_a_deleted_tail() {
     let mut db = MvccTestDbNoConn::new_with_random_db();
     {
