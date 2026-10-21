@@ -9,10 +9,10 @@ use crate::functions::ConfigParameter;
 use turso_core::{Connection, LimboError, PrepareOptions, Result, Statement, Value};
 use turso_parser::ast::{self};
 use turso_pg_parser::translator::{
-    is_comment_on, is_refresh_matview, is_set_transaction, try_extract_copy_from,
-    try_extract_create_schema, try_extract_drop_schema, try_extract_set, try_extract_show,
-    unqualified_created_name_location, PgCopyFromStmt, PgCreateSchemaStmt, PgDropSchemaStmt,
-    PgSetStmt, PgShowStmt, PostgreSQLTranslator,
+    drop_if_exists_object_schemas, is_comment_on, is_refresh_matview, is_set_transaction,
+    try_extract_copy_from, try_extract_create_schema, try_extract_drop_schema, try_extract_set,
+    try_extract_show, unqualified_created_name_location, PgCopyFromStmt, PgCreateSchemaStmt,
+    PgDropSchemaStmt, PgSetStmt, PgShowStmt, PostgreSQLTranslator,
 };
 
 use crate::copy::parse_copy_text_format;
@@ -395,6 +395,23 @@ fn try_prepare_special(pg_conn: &Arc<PgConnectionInner>, sql: &str) -> Result<Op
         return Ok(Some(noop_statement(&pg_conn.conn)?));
     }
 
+    if let Some(schemas) = drop_if_exists_object_schemas(&parse_result) {
+        let mut every_schema_is_missing = !schemas.is_empty();
+        for schema in &schemas {
+            let exists = match schema {
+                Some(schema) => pg_schema_exists(&pg_conn.conn, schema)?,
+                None => true,
+            };
+            if exists {
+                every_schema_is_missing = false;
+                break;
+            }
+        }
+        if every_schema_is_missing {
+            return Ok(Some(noop_statement(&pg_conn.conn)?));
+        }
+    }
+
     if is_refresh_matview(&parse_result) {
         return Ok(Some(noop_statement(&pg_conn.conn)?));
     }
@@ -415,6 +432,17 @@ fn try_prepare_special(pg_conn: &Arc<PgConnectionInner>, sql: &str) -> Result<Op
 
 fn noop_statement(conn: &Arc<Connection>) -> Result<Statement> {
     conn.prepare("SELECT 0 WHERE 0")
+}
+
+fn pg_schema_exists(conn: &Arc<Connection>, schema: &str) -> Result<bool> {
+    let schema = schema.to_lowercase();
+    if matches!(
+        schema.as_str(),
+        "public" | "pg_catalog" | "information_schema"
+    ) {
+        return Ok(true);
+    }
+    schema_exists(conn, &schema)
 }
 
 fn execute_sqlite(conn: &Arc<Connection>, sql: impl AsRef<str>) -> Result<()> {

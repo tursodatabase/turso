@@ -9,7 +9,7 @@ use crate::translate::{
     collate::CollationSeq,
     emitter::{
         emit_cdc_autocommit_commit, emit_cdc_full_record, emit_cdc_insns, prepare_cdc_if_necessary,
-        OperationMode, Resolver,
+        OperationMode, RelationKind, Resolver,
     },
     expr::{
         bind_and_rewrite_expr, emit_stored_column, translate_condition_expr, translate_expr,
@@ -1227,7 +1227,12 @@ pub fn translate_drop_index(
     let opts = ProgramBuilderOpts::new(5, 40, 5);
     program.extend(&opts);
 
-    let Some(database_id) = resolver.find_existing_index_database_id(qualified_name)? else {
+    let found = if resolver.uses_search_path() {
+        resolver.find_existing_relation_of_kind(qualified_name, RelationKind::Index)?
+    } else {
+        resolver.find_existing_index_database_id(qualified_name)?
+    };
+    let Some(database_id) = found else {
         if if_exists {
             return Ok(());
         }

@@ -990,15 +990,8 @@ impl PostgreSQLTranslator {
             .ok_or_else(|| ParseError::ParseError("DROP missing object name".into()))?;
 
         let qualified_name = match &obj_node.node {
-            Some(Node::List(list)) => {
-                let names: Vec<String> = list
-                    .items
-                    .iter()
-                    .filter_map(|item| match &item.node {
-                        Some(Node::String(s)) => Some(s.sval.clone()),
-                        _ => None,
-                    })
-                    .collect();
+            Some(Node::List(_)) => {
+                let names = drop_object_name_parts(obj_node);
                 match names.len() {
                     0 => return Err(ParseError::ParseError("DROP: empty name list".into())),
                     1 => ast::QualifiedName::single(ast::Name::from_string(names[0].clone())),
@@ -5282,6 +5275,53 @@ pub fn unqualified_created_name_location(parse_result: &ParseResult) -> Option<u
         return None;
     }
     Some(relation.location as usize)
+}
+
+/// The schema in the name of each object of a DROP TABLE, VIEW, INDEX or
+/// SEQUENCE ... IF EXISTS statement, None for an object named without one.
+/// None for other statements.
+pub fn drop_if_exists_object_schemas(parse_result: &ParseResult) -> Option<Vec<Option<String>>> {
+    use pg_query::protobuf::ObjectType;
+    use pg_query::NodeRef;
+
+    let nodes = parse_result.protobuf.nodes();
+    let NodeRef::DropStmt(drop) = &nodes.first()?.0 else {
+        return None;
+    };
+    if !drop.missing_ok
+        || !matches!(
+            ObjectType::try_from(drop.remove_type).ok()?,
+            ObjectType::ObjectTable
+                | ObjectType::ObjectView
+                | ObjectType::ObjectMatview
+                | ObjectType::ObjectIndex
+                | ObjectType::ObjectSequence
+        )
+    {
+        return None;
+    }
+    Some(
+        drop.objects
+            .iter()
+            .map(|object| drop_object_name_parts(object).into_iter().rev().nth(1))
+            .collect(),
+    )
+}
+
+/// The parts of an object name in a DROP statement, schema first.
+fn drop_object_name_parts(object: &pg_query::protobuf::Node) -> Vec<String> {
+    use pg_query::protobuf::node::Node;
+
+    let Some(Node::List(list)) = &object.node else {
+        return Vec::new();
+    };
+    list.items
+        .iter()
+        .filter_map(|item| match &item.node {
+            Some(Node::String(s)) => Some(s.sval.clone()),
+            _ => None,
+        })
+        .collect()
 }
 
 /// Try to extract a SHOW statement from a PG parse result.

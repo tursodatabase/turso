@@ -284,6 +284,26 @@ impl DatabaseScopeContext {
     }
 }
 
+/// The kinds of relation that share one namespace per schema in PostgreSQL.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RelationKind {
+    Table,
+    View,
+    Index,
+    Sequence,
+}
+
+impl RelationKind {
+    fn with_article(self) -> &'static str {
+        match self {
+            Self::Table => "a table",
+            Self::View => "a view",
+            Self::Index => "an index",
+            Self::Sequence => "a sequence",
+        }
+    }
+}
+
 impl<'a> Resolver<'a> {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
@@ -931,6 +951,42 @@ impl<'a> Resolver<'a> {
         Ok(self.find_unqualified_existing_database_id(&index_name, Self::schema_has_index))
     }
 
+    /// Under a search path, the database of the relation named
+    /// `qualified_name` when it is of `kind`: the database in the name, or
+    /// the first schema of the search path that has a relation of the name,
+    /// since PostgreSQL keeps tables, views, indexes and sequences in one
+    /// namespace per schema. None when no relation of the name exists, and
+    /// an error when the relation found is of another kind.
+    pub(crate) fn find_existing_relation_of_kind(
+        &self,
+        qualified_name: &ast::QualifiedName,
+        kind: RelationKind,
+    ) -> Result<Option<usize>> {
+        let name = normalize_ident(qualified_name.name.as_str());
+        let database_id = if qualified_name.namespace.is_some() {
+            self.resolve_database_id(qualified_name)?
+        } else {
+            let Some(database_id) = self
+                .find_unqualified_existing_database_id(&name, |schema, name| {
+                    Self::schema_relation_kind(schema, name).is_some()
+                })
+            else {
+                return Ok(None);
+            };
+            database_id
+        };
+        match self.with_schema(database_id, |schema| {
+            Self::schema_relation_kind(schema, &name)
+        }) {
+            None => Ok(None),
+            Some(found) if found == kind => Ok(Some(database_id)),
+            Some(_) => Err(LimboError::ParseError(format!(
+                "\"{name}\" is not {}",
+                kind.with_article()
+            ))),
+        }
+    }
+
     pub(crate) fn resolve_existing_trigger_database_id(
         &self,
         qualified_name: &ast::QualifiedName,
@@ -948,14 +1004,48 @@ impl<'a> Resolver<'a> {
     /// is set or no schema of it has the sequence. Serial columns create
     /// their sequences in main, so main stays reachable from every search
     /// path.
-    pub(crate) fn resolve_existing_sequence_database_id(&self, seq_name: &str) -> usize {
-        if self.unqualified_database_search_path.is_none() {
-            return crate::MAIN_DB_ID;
+    pub(crate) fn resolve_existing_sequence_database_id(&self, seq_name: &str) -> Result<usize> {
+        if !self.uses_search_path() {
+            return Ok(crate::MAIN_DB_ID);
         }
-        self.resolve_unqualified_existing_database_id(seq_name, |schema, seq_name| {
-            schema.get_sequence(seq_name).is_some()
-        })
-        .unwrap_or(crate::MAIN_DB_ID)
+        let Some(database_id) = self
+            .find_unqualified_existing_database_id(seq_name, |schema, name| {
+                Self::schema_relation_kind(schema, name).is_some()
+            })
+        else {
+            return Ok(crate::MAIN_DB_ID);
+        };
+        match self.with_schema(database_id, |schema| {
+            Self::schema_relation_kind(schema, seq_name)
+        }) {
+            Some(RelationKind::Sequence) => Ok(database_id),
+            _ => Err(LimboError::ParseError(format!(
+                "\"{seq_name}\" is not a sequence"
+            ))),
+        }
+    }
+
+    fn schema_relation_kind(schema: &Schema, name: &str) -> Option<RelationKind> {
+        if schema.get_view(name).is_some()
+            || schema.get_materialized_view(name).is_some()
+            || schema.broken_views.contains(name)
+        {
+            return Some(RelationKind::View);
+        }
+        if schema.get_table(name).is_some() {
+            return Some(RelationKind::Table);
+        }
+        if schema.get_sequence(name).is_some() {
+            return Some(RelationKind::Sequence);
+        }
+        if Self::schema_has_index(schema, name) {
+            return Some(RelationKind::Index);
+        }
+        None
+    }
+
+    pub(crate) fn uses_search_path(&self) -> bool {
+        self.unqualified_database_search_path.is_some()
     }
 
     /// `seq_name` qualified with the database it resolved to, for the
