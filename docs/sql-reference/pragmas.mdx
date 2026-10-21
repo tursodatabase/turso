@@ -324,6 +324,29 @@ PRAGMA foreign_keys = OFF;
 
 Foreign key enforcement is off by default for SQLite compatibility.
 
+### foreign_key_list
+
+Lists the foreign keys defined on a table. This pragma is read-only; there is no setter form.
+
+```sql
+PRAGMA foreign_key_list(table_name);
+```
+
+One row is returned for each column of each foreign key. The columns are:
+
+| Column | Meaning |
+|--------|---------|
+| `id` | Zero-based number of the foreign key. Foreign keys declared in table-level `FOREIGN KEY` clauses are listed before the ones declared inline on a column, and within each group the last declared one comes first, so `id` 0 belongs to the last table-level foreign key. |
+| `seq` | Zero-based position of this column within the foreign key. |
+| `table` | The parent table. |
+| `from` | The child (local) column. |
+| `to` | The parent column, or an empty string when the foreign key does not list parent columns explicitly. |
+| `on_update` | The ON UPDATE action: `SET NULL`, `SET DEFAULT`, `CASCADE`, `RESTRICT`, or `NO ACTION`. Defaults to `NO ACTION`. |
+| `on_delete` | The ON DELETE action, with the same values and default. |
+| `match` | Always `NONE`; Turso does not store MATCH clauses. |
+
+If the table does not exist, or is a view or a virtual table, the pragma returns no rows.
+
 ### legacy_file_format
 
 Returns the legacy file format flag.
