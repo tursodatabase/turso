@@ -1089,9 +1089,14 @@ pub enum Insn {
     },
 
     /// Set database auto-commit mode and potentially rollback.
+    /// On BEGIN (`auto_commit: false`), `concurrent` records that the
+    /// transaction was started with BEGIN CONCURRENT: like BEGIN DEFERRED
+    /// it opens nothing by itself, and the first statement materializes
+    /// the MVCC transaction in concurrent mode.
     AutoCommit {
         auto_commit: bool,
         rollback: bool,
+        concurrent: bool,
     },
 
     /// Execute a named savepoint operation.
