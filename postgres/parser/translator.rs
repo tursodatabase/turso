@@ -2090,10 +2090,22 @@ impl PostgreSQLTranslator {
             ));
         }
         let is_recordset = func_name.ends_with("recordset");
-        let (arg_type, arg_type_error) = if is_recordset {
-            ("array", format!("cannot call {func_name} on a non-array"))
-        } else {
-            ("object", format!("cannot call {func_name} on a non-object"))
+        let (arg_type, other_type_errors, scalar_error) = match func_name {
+            "json_to_recordset" => (
+                "array",
+                vec![("object", format!("cannot call {func_name} on an object"))],
+                format!("cannot call {func_name} on a scalar"),
+            ),
+            "jsonb_to_recordset" => (
+                "array",
+                vec![],
+                format!("cannot call {func_name} on a non-array"),
+            ),
+            _ => (
+                "object",
+                vec![("array", "cannot call populate_composite on an array".into())],
+                "cannot call populate_composite on a scalar".into(),
+            ),
         };
         let json_type = |args: Vec<Box<ast::Expr>>| ast::Expr::FunctionCall {
             name: ast::Name::from_string("json_type"),
@@ -2110,7 +2122,8 @@ impl PostgreSQLTranslator {
             json_type(vec![arg.clone()]),
             (**arg).clone(),
             arg_type,
-            &arg_type_error,
+            &other_type_errors,
+            &scalar_error,
         );
         let arg_subquery = ast::SelectTable::Select {
             select: ast::Select {
@@ -2156,6 +2169,7 @@ impl PostgreSQLTranslator {
                     element("type"),
                     element("value"),
                     "object",
+                    &[],
                     &format!("argument of {func_name} must be an array of objects"),
                 ),
                 vec![ast::JoinedSelectTable {
@@ -4848,14 +4862,26 @@ fn json_type_or_raise(
     json_type: ast::Expr,
     value: ast::Expr,
     expected_type: &str,
+    other_type_errors: &[(&str, String)],
     error: &str,
 ) -> ast::Expr {
-    let expected_type = ast::Expr::Literal(ast::Literal::String(format!("'{expected_type}'")));
+    let string = |text: &str| {
+        Box::new(ast::Expr::Literal(ast::Literal::String(format!(
+            "'{text}'"
+        ))))
+    };
+    let raise = |message: &str| {
+        Box::new(ast::Expr::Raise(
+            ast::ResolveType::Abort,
+            Some(string(message)),
+        ))
+    };
+    let expected_type = string(expected_type);
     ast::Expr::Case {
         base: Some(Box::new(ast::Expr::FunctionCall {
             name: ast::Name::from_string("coalesce"),
             distinctness: None,
-            args: vec![Box::new(json_type), Box::new(expected_type.clone())],
+            args: vec![Box::new(json_type), expected_type.clone()],
             order_by: vec![],
             within_group: vec![],
             filter_over: ast::FunctionTail {
@@ -4863,13 +4889,14 @@ fn json_type_or_raise(
                 over_clause: None,
             },
         })),
-        when_then_pairs: vec![(Box::new(expected_type), Box::new(value))],
-        else_expr: Some(Box::new(ast::Expr::Raise(
-            ast::ResolveType::Abort,
-            Some(Box::new(ast::Expr::Literal(ast::Literal::String(format!(
-                "'{error}'"
-            ))))),
-        ))),
+        when_then_pairs: std::iter::once((expected_type, Box::new(value)))
+            .chain(
+                other_type_errors
+                    .iter()
+                    .map(|(json_type, message)| (string(json_type), raise(message))),
+            )
+            .collect(),
+        else_expr: Some(raise(error)),
     }
 }
 

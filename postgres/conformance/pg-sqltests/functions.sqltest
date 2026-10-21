@@ -558,6 +558,7 @@ test json-to-record-requires-column-list {
     SELECT * FROM json_to_record('{"id":1}') AS _;
 }
 expect error {
+    a column definition list is required for functions returning "record"
 }
 
 test json-to-record-argument-named-like-json-each-column {
@@ -586,36 +587,49 @@ test json-to-recordset-object-errors {
     SELECT * FROM json_to_recordset('{"a":1}') AS _(a int);
 }
 expect error {
+    cannot call json_to_recordset on an object
 }
 
 test json-to-recordset-scalar-errors {
     SELECT * FROM jsonb_to_recordset('5'::jsonb) AS _(a int);
 }
 expect error {
+    cannot call jsonb_to_recordset on a non-array
+}
+
+test json-to-recordset-json-scalar-errors {
+    SELECT * FROM json_to_recordset('5') AS _(a int);
+}
+expect error {
+    cannot call json_to_recordset on a scalar
 }
 
 test json-to-recordset-non-object-element-errors {
     SELECT * FROM json_to_recordset('[{"a":1},5]') AS _(a int);
 }
 expect error {
+    argument of json_to_recordset must be an array of objects
 }
 
 test json-to-recordset-null-element-errors {
     SELECT * FROM jsonb_to_recordset('[null]'::jsonb) AS _(a int);
 }
 expect error {
+    argument of jsonb_to_recordset must be an array of objects
 }
 
 test json-to-record-array-errors {
     SELECT * FROM json_to_record('[{"a":1}]') AS _(a int);
 }
 expect error {
+    cannot call populate_composite on an array
 }
 
 test json-to-record-scalar-errors {
     SELECT * FROM jsonb_to_record('null'::jsonb) AS _(a int);
 }
 expect error {
+    cannot call populate_composite on a scalar
 }
 
 test json-to-record-text-column-keeps-json-text {
