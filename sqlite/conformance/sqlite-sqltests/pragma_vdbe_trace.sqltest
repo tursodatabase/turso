@@ -12,3 +12,18 @@ test pragma-vdbe-trace {
 }
 expect {
 }
+
+test pragma-vdbe-trace-odd-values {
+    PRAGMA vdbe_trace = 0.0;
+    PRAGMA vdbe_trace = 1.5;
+    PRAGMA vdbe_trace = 256;
+    PRAGMA vdbe_trace = 0x10;
+    PRAGMA vdbe_trace = +1;
+    PRAGMA vdbe_trace = -1;
+    PRAGMA vdbe_trace = bogus;
+    PRAGMA vdbe_trace = 'true';
+    PRAGMA vdbe_trace = OFF;
+    PRAGMA vdbe_trace;
+}
+expect {
+}

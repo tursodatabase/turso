@@ -1,0 +1,213 @@
+@database :memory:
+
+test pragma-boolean-require-where {
+    PRAGMA require_where = on;
+    PRAGMA require_where;
+    PRAGMA require_where = off;
+    PRAGMA require_where;
+    PRAGMA require_where = 0.0;
+    PRAGMA require_where;
+    PRAGMA require_where = 00;
+    PRAGMA require_where;
+    PRAGMA require_where = 0.5;
+    PRAGMA require_where;
+    PRAGMA require_where = 1.5;
+    PRAGMA require_where;
+    PRAGMA require_where = 256;
+    PRAGMA require_where;
+    PRAGMA require_where = 1024;
+    PRAGMA require_where;
+    PRAGMA require_where = 0x10;
+    PRAGMA require_where;
+    PRAGMA require_where = 0x100;
+    PRAGMA require_where;
+    PRAGMA require_where = 2147483648;
+    PRAGMA require_where;
+    PRAGMA require_where = 99999999999;
+    PRAGMA require_where;
+    PRAGMA require_where = +1;
+    PRAGMA require_where;
+    PRAGMA require_where = -1;
+    PRAGMA require_where;
+    PRAGMA require_where = bogus;
+    PRAGMA require_where;
+    PRAGMA require_where = 'true';
+    PRAGMA require_where;
+}
+expect {
+    1
+    0
+    0
+    0
+    0
+    1
+    0
+    0
+    1
+    0
+    0
+    0
+    1
+    0
+    0
+    1
+}
+
+test pragma-boolean-i-am-a-dummy {
+    PRAGMA i_am_a_dummy = on;
+    PRAGMA i_am_a_dummy;
+    PRAGMA i_am_a_dummy = off;
+    PRAGMA i_am_a_dummy;
+    PRAGMA i_am_a_dummy = 0.0;
+    PRAGMA i_am_a_dummy;
+    PRAGMA i_am_a_dummy = 00;
+    PRAGMA i_am_a_dummy;
+    PRAGMA i_am_a_dummy = 0.5;
+    PRAGMA i_am_a_dummy;
+    PRAGMA i_am_a_dummy = 1.5;
+    PRAGMA i_am_a_dummy;
+    PRAGMA i_am_a_dummy = 256;
+    PRAGMA i_am_a_dummy;
+    PRAGMA i_am_a_dummy = 1024;
+    PRAGMA i_am_a_dummy;
+    PRAGMA i_am_a_dummy = 0x10;
+    PRAGMA i_am_a_dummy;
+    PRAGMA i_am_a_dummy = 0x100;
+    PRAGMA i_am_a_dummy;
+    PRAGMA i_am_a_dummy = 2147483648;
+    PRAGMA i_am_a_dummy;
+    PRAGMA i_am_a_dummy = 99999999999;
+    PRAGMA i_am_a_dummy;
+    PRAGMA i_am_a_dummy = +1;
+    PRAGMA i_am_a_dummy;
+    PRAGMA i_am_a_dummy = -1;
+    PRAGMA i_am_a_dummy;
+    PRAGMA i_am_a_dummy = bogus;
+    PRAGMA i_am_a_dummy;
+    PRAGMA i_am_a_dummy = 'true';
+    PRAGMA i_am_a_dummy;
+}
+expect {
+    1
+    0
+    0
+    0
+    0
+    1
+    0
+    0
+    1
+    0
+    0
+    0
+    1
+    0
+    0
+    1
+}
+
+test pragma-boolean-data-sync-retry {
+    PRAGMA data_sync_retry = on;
+    PRAGMA data_sync_retry;
+    PRAGMA data_sync_retry = off;
+    PRAGMA data_sync_retry;
+    PRAGMA data_sync_retry = 0.0;
+    PRAGMA data_sync_retry;
+    PRAGMA data_sync_retry = 00;
+    PRAGMA data_sync_retry;
+    PRAGMA data_sync_retry = 0.5;
+    PRAGMA data_sync_retry;
+    PRAGMA data_sync_retry = 1.5;
+    PRAGMA data_sync_retry;
+    PRAGMA data_sync_retry = 256;
+    PRAGMA data_sync_retry;
+    PRAGMA data_sync_retry = 1024;
+    PRAGMA data_sync_retry;
+    PRAGMA data_sync_retry = 0x10;
+    PRAGMA data_sync_retry;
+    PRAGMA data_sync_retry = 0x100;
+    PRAGMA data_sync_retry;
+    PRAGMA data_sync_retry = 2147483648;
+    PRAGMA data_sync_retry;
+    PRAGMA data_sync_retry = 99999999999;
+    PRAGMA data_sync_retry;
+    PRAGMA data_sync_retry = +1;
+    PRAGMA data_sync_retry;
+    PRAGMA data_sync_retry = -1;
+    PRAGMA data_sync_retry;
+    PRAGMA data_sync_retry = bogus;
+    PRAGMA data_sync_retry;
+    PRAGMA data_sync_retry = 'true';
+    PRAGMA data_sync_retry;
+}
+expect {
+    1
+    0
+    0
+    0
+    0
+    1
+    0
+    0
+    1
+    0
+    0
+    0
+    1
+    0
+    0
+    1
+}
+
+test pragma-boolean-cache-spill {
+    PRAGMA cache_spill = on;
+    PRAGMA cache_spill;
+    PRAGMA cache_spill = off;
+    PRAGMA cache_spill;
+    PRAGMA cache_spill = 0.0;
+    PRAGMA cache_spill;
+    PRAGMA cache_spill = 00;
+    PRAGMA cache_spill;
+    PRAGMA cache_spill = 0.5;
+    PRAGMA cache_spill;
+    PRAGMA cache_spill = 1.5;
+    PRAGMA cache_spill;
+    PRAGMA cache_spill = 256;
+    PRAGMA cache_spill;
+    PRAGMA cache_spill = 1024;
+    PRAGMA cache_spill;
+    PRAGMA cache_spill = 0x10;
+    PRAGMA cache_spill;
+    PRAGMA cache_spill = 0x100;
+    PRAGMA cache_spill;
+    PRAGMA cache_spill = 2147483648;
+    PRAGMA cache_spill;
+    PRAGMA cache_spill = 99999999999;
+    PRAGMA cache_spill;
+    PRAGMA cache_spill = +1;
+    PRAGMA cache_spill;
+    PRAGMA cache_spill = -1;
+    PRAGMA cache_spill;
+    PRAGMA cache_spill = bogus;
+    PRAGMA cache_spill;
+    PRAGMA cache_spill = 'true';
+    PRAGMA cache_spill;
+}
+expect {
+    1
+    0
+    0
+    0
+    0
+    1
+    0
+    0
+    1
+    0
+    0
+    0
+    1
+    0
+    0
+    1
+}
