@@ -275,7 +275,7 @@ avoid this window.
 | PRAGMA shrink_memory             | ❌ No         |                                              |
 | PRAGMA soft_heap_limit           | ❌ No         |                                              |
 | PRAGMA stats                     | ❌ No         | Used for testing in SQLite                   |
-| PRAGMA synchronous               | 🚧 Partial    | `OFF` and `FULL` supported                   |
+| PRAGMA synchronous               | 🚧 Partial    | `OFF`, `NORMAL`, `FULL` accepted; `NORMAL` syncs like `FULL` |
 | PRAGMA table_info                | ✅ Yes        |                                              |
 | PRAGMA table_list                | ✅ Yes        |                                              |
 | PRAGMA table_xinfo               | ✅ Yes        |                                              |
