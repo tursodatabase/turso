@@ -2097,39 +2097,37 @@ async fn test_old_mvcc_snapshot_finds_fk_parent_after_passive_checkpoint() {
     );
 }
 
+#[tokio::test]
+async fn test_old_mvcc_snapshot_rejects_duplicate_rowid_after_other_old_snapshot_checkpoints() {
+    let (_dir, _db, older) = old_snapshot_after_other_old_snapshot_checkpoints().await;
+
+    let error = older
+        .execute("INSERT INTO parent VALUES (100, 'duplicate')", ())
+        .await
+        .expect_err("a rowid visible to the old snapshot must be unique");
+    assert!(
+        matches!(error, Error::Constraint(ref message) if message.contains("UNIQUE constraint failed: parent.id")),
+        "{error}"
+    );
+}
+
+#[tokio::test]
+async fn test_old_mvcc_snapshot_finds_fk_parent_after_other_old_snapshot_checkpoints() {
+    let (_dir, _db, older) = old_snapshot_after_other_old_snapshot_checkpoints().await;
+
+    older
+        .execute("INSERT INTO child(pid) VALUES (100)", ())
+        .await
+        .expect("the old snapshot can still read parent rowid 100");
+    assert_eq!(
+        collect_values(&older, "SELECT pid FROM child").await,
+        vec![vec![Value::Integer(100)]]
+    );
+}
+
 async fn old_snapshot_after_newer_passive_checkpoint(
 ) -> (tempfile::TempDir, turso::Database, turso::Connection) {
-    let dir = tempdir().expect("temporary directory must be created");
-    let path = dir.path().join("snapshot.db");
-    let path = path.to_str().expect("database path must be valid UTF-8");
-
-    {
-        let db = Builder::new_local(path)
-            .build()
-            .await
-            .expect("database must open for setup");
-        let conn = db.connect().expect("setup connection must open");
-        drain_query(&conn, "PRAGMA journal_mode = mvcc").await;
-        conn.execute("PRAGMA mvcc_checkpoint_threshold = -1", ())
-            .await
-            .expect("automatic checkpoints must be disabled");
-        conn.execute("CREATE TABLE parent(id INTEGER PRIMARY KEY, v TEXT)", ())
-            .await
-            .expect("parent table must be created");
-        conn.execute("CREATE TABLE child(pid INTEGER REFERENCES parent(id))", ())
-            .await
-            .expect("child table must be created");
-        conn.execute("INSERT INTO parent VALUES (1, 'a'), (100, 'z')", ())
-            .await
-            .expect("parent rows must be inserted");
-        drain_query(&conn, "PRAGMA wal_checkpoint(TRUNCATE)").await;
-    }
-
-    let db = Builder::new_local(path)
-        .experimental_mvcc_passive_checkpoint(true)
-        .build()
-        .await
-        .expect("database must reopen with passive checkpointing");
+    let (dir, db) = open_parent_child_db_with_passive_checkpoint().await;
     let writer = db.connect().expect("writer connection must open");
     let older = db.connect().expect("older connection must open");
     let newer = db.connect().expect("newer connection must open");
@@ -2174,6 +2172,94 @@ async fn old_snapshot_after_newer_passive_checkpoint(
     );
 
     (dir, db, older)
+}
+
+async fn old_snapshot_after_other_old_snapshot_checkpoints(
+) -> (tempfile::TempDir, turso::Database, turso::Connection) {
+    let (dir, db) = open_parent_child_db_with_passive_checkpoint().await;
+    let writer = db.connect().expect("writer connection must open");
+    let older = db.connect().expect("older connection must open");
+    let other = db.connect().expect("other old connection must open");
+
+    writer
+        .execute("PRAGMA mvcc_checkpoint_threshold = -1", ())
+        .await
+        .expect("automatic checkpoints must be disabled");
+    older
+        .execute("PRAGMA foreign_keys = ON", ())
+        .await
+        .expect("foreign key checks must be enabled");
+    for conn in [&older, &other] {
+        conn.execute("BEGIN CONCURRENT", ())
+            .await
+            .expect("old snapshot must begin");
+        assert_eq!(
+            query_i64(conn, "SELECT id FROM parent WHERE id = 100").await,
+            100
+        );
+    }
+
+    writer
+        .execute("DELETE FROM parent WHERE id = 100", ())
+        .await
+        .expect("newer snapshot must delete rowid 100");
+    writer
+        .execute("PRAGMA mvcc_checkpoint_threshold = 0", ())
+        .await
+        .expect("automatic checkpoints must be enabled");
+    assert_eq!(query_i64(&other, "SELECT nextval('s')").await, 1);
+    writer
+        .execute("PRAGMA mvcc_checkpoint_threshold = -1", ())
+        .await
+        .expect("automatic checkpoints must be disabled");
+    other
+        .execute("INSERT INTO parent VALUES (7, 'seven')", ())
+        .await
+        .expect("other old snapshot must insert a new rowid");
+    assert_eq!(
+        query_i64(&older, "SELECT id FROM parent WHERE id = 100").await,
+        100
+    );
+
+    (dir, db, older)
+}
+
+async fn open_parent_child_db_with_passive_checkpoint() -> (tempfile::TempDir, turso::Database) {
+    let dir = tempdir().expect("temporary directory must be created");
+    let path = dir.path().join("snapshot.db");
+    let path = path.to_str().expect("database path must be valid UTF-8");
+
+    {
+        let db = Builder::new_local(path)
+            .build()
+            .await
+            .expect("database must open for setup");
+        let conn = db.connect().expect("setup connection must open");
+        drain_query(&conn, "PRAGMA journal_mode = mvcc").await;
+        conn.execute("PRAGMA mvcc_checkpoint_threshold = -1", ())
+            .await
+            .expect("automatic checkpoints must be disabled");
+        conn.execute("CREATE TABLE parent(id INTEGER PRIMARY KEY, v TEXT)", ())
+            .await
+            .expect("parent table must be created");
+        conn.execute("CREATE TABLE child(pid INTEGER REFERENCES parent(id))", ())
+            .await
+            .expect("child table must be created");
+        conn.execute("CREATE SEQUENCE s START 1 INCREMENT 1", ())
+            .await
+            .expect("sequence must be created");
+        conn.execute("INSERT INTO parent VALUES (1, 'a'), (100, 'z')", ())
+            .await
+            .expect("parent rows must be inserted");
+        drain_query(&conn, "PRAGMA wal_checkpoint(TRUNCATE)").await;
+    }
+
+    let db = Builder::new_local(path)
+        .experimental_mvcc_passive_checkpoint(true)
+        .build()
+        .await
+        .expect("database must reopen with passive checkpointing");
+    (dir, db)
 }
 
 async fn drain_query(conn: &turso::Connection, sql: &str) {
