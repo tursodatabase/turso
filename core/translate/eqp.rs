@@ -677,19 +677,7 @@ pub fn program_plan_json(program: &Program) -> String {
     top.num("version", 1);
     top.str("sql", &program.sql);
 
-    // A program prepared through HIR names its columns in
-    // `resolved_result_columns` instead.
-    let column_names: Vec<String> = if program.resolved_result_columns.is_empty() {
-        program
-            .result_columns
-            .iter()
-            .enumerate()
-            .map(|(i, col)| match col.name(&program.table_references) {
-                Some(name) => name.to_string(),
-                None => format!("column{}", i + 1),
-            })
-            .collect()
-    } else {
+    let column_names: Vec<String> = {
         program
             .resolved_result_columns
             .iter()

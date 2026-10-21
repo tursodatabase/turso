@@ -999,7 +999,7 @@ fn emit_ctas_insert(
     });
     program.preassign_label_to_next_insn(start_offset_label);
 
-    let result_start_reg = plan.emit_rows(program, yield_reg, start_offset_label)?;
+    let result_start_reg = plan.emit_rows(program, yield_reg)?;
 
     program.emit_insn(Insn::EndCoroutine { yield_reg });
     program.preassign_label_to_next_insn(jump_on_definition_label);
@@ -1056,7 +1056,7 @@ fn emit_ctas_insert(
     program.preassign_label_to_next_insn(loop_end);
     program.preassign_label_to_next_insn(halt_label);
 
-    program.result_columns.clear();
+    program.resolved_result_columns.clear();
 
     Ok(())
 }
@@ -2093,7 +2093,6 @@ pub fn translate_drop_table(
                 db: database_id,
             });
         }
-        Table::FromClauseSubquery(..) => panic!("FromClauseSubquery can't be dropped"),
         Table::RecursiveCteInput(..) => panic!("recursive CTE inputs cannot be dropped"),
     };
 

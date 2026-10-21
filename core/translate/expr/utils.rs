@@ -1,6 +1,4 @@
-use super::expr_vector_size;
 use crate::schema::Type;
-use crate::translate::optimizer::constraints::ConstraintOperator;
 use crate::vdbe::{builder::ProgramBuilder, insn::Insn};
 use crate::Result;
 use turso_parser::ast;
@@ -26,41 +24,6 @@ pub fn sanitize_string(input: &str) -> String {
     inner.replace("''", "'")
 }
 
-/// Returns the components of a binary expression
-/// e.g. t.x = 5 -> Some((t.x, =, 5))
-pub fn as_binary_components(
-    expr: &ast::Expr,
-) -> Result<Option<(&ast::Expr, ConstraintOperator, &ast::Expr)>> {
-    match unwrap_parens(expr)? {
-        ast::Expr::Binary(lhs, operator, rhs)
-            if matches!(
-                operator,
-                ast::Operator::Equals
-                    | ast::Operator::NotEquals
-                    | ast::Operator::Greater
-                    | ast::Operator::Less
-                    | ast::Operator::GreaterEquals
-                    | ast::Operator::LessEquals
-                    | ast::Operator::Is
-                    | ast::Operator::IsNot
-            ) =>
-        {
-            // Row-valued binary comparisons are translated directly in expression codegen.
-            // They are not safe to expose as scalar binary constraints in optimizer paths.
-            if expr_vector_size(lhs)? > 1 || expr_vector_size(rhs)? > 1 {
-                return Ok(None);
-            }
-            Ok(Some((lhs.as_ref(), (*operator).into(), rhs.as_ref())))
-        }
-        ast::Expr::Like { lhs, not, rhs, .. } => Ok(Some((
-            lhs.as_ref(),
-            ConstraintOperator::Like { not: *not },
-            rhs.as_ref(),
-        ))),
-        _ => Ok(None),
-    }
-}
-
 /// Recursively unwrap parentheses from an expression
 /// e.g. (((t.x > 5))) -> t.x > 5
 pub fn unwrap_parens(expr: &ast::Expr) -> Result<&ast::Expr> {
@@ -71,26 +34,5 @@ pub fn unwrap_parens(expr: &ast::Expr) -> Result<&ast::Expr> {
             _ => Ok(expr), // If the expression is e.g. (x, y), as used in e.g. (x, y) IN (SELECT ...), return as is.
         },
         _ => Ok(expr),
-    }
-}
-
-/// If the right-hand side of `IS` / `IS NOT` is the TRUE or FALSE keyword —
-/// possibly inside parentheses or under COLLATE — return its boolean value.
-/// `x IS TRUE` and friends then test the truth of x instead of comparing
-/// values. SQLite behaves the same way: it resolves the keyword after
-/// skipping COLLATE, and its grammar collapses parentheses (resolve.c,
-/// `sqlite3ExprSkipCollateAndLikely`). A unary `+` blocks the keyword there
-/// too, so `x IS +TRUE` stays an ordinary comparison with 1.
-///
-/// Every place that decides "is this a truth test?" — the expression
-/// evaluator, the condition emitter, and the index-seek guard in the
-/// optimizer — must call this one function, so they cannot drift apart.
-pub fn truth_test_rhs(expr: &ast::Expr) -> Option<bool> {
-    match expr {
-        ast::Expr::Literal(ast::Literal::True) => Some(true),
-        ast::Expr::Literal(ast::Literal::False) => Some(false),
-        ast::Expr::Parenthesized(exprs) if exprs.len() == 1 => truth_test_rhs(&exprs[0]),
-        ast::Expr::Collate(inner, _) => truth_test_rhs(inner),
-        _ => None,
     }
 }

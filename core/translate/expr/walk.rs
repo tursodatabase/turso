@@ -185,18 +185,6 @@ where
     Ok(WalkControl::Continue)
 }
 
-pub fn expr_references_any_subquery(expr: &ast::Expr) -> bool {
-    let mut found = false;
-    let _ = walk_expr(expr, &mut |e: &ast::Expr| -> Result<WalkControl> {
-        if matches!(e, ast::Expr::SubqueryResult { .. }) {
-            found = true;
-            return Ok(WalkControl::SkipChildren);
-        }
-        Ok(WalkControl::Continue)
-    });
-    found
-}
-
 /// Walks a mutable expression, applying a function to each sub-expression.
 pub fn walk_expr_mut<'a, F>(expr: &'a mut ast::Expr, func: &mut F) -> Result<WalkControl>
 where

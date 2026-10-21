@@ -50,7 +50,6 @@ use crate::{
     return_if_io,
     schema::Trigger,
     state_machine::StateMachine,
-    translate::plan::TableReferences,
     types::{IOCompletions, IOResult},
     vdbe::{
         execute::{
@@ -73,7 +72,6 @@ use crate::json::JsonCacheCell;
 use crate::sync::RwLock;
 use crate::{
     storage::pager::Pager,
-    translate::plan::ResultSetColumn,
     types::{AggContext, Cursor, ImmutableRecord, RecordBuf, Value},
     vdbe::{builder::CursorType, insn::Insn},
 };
@@ -1606,8 +1604,6 @@ pub struct PreparedProgram {
     /// Flag that detect if the sqlite statement will directly manipulate the database file.\
     /// mirrors: https://sqlite.org/c3ref/stmt_readonly.html.
     pub readonly: bool,
-    pub result_columns: Vec<ResultSetColumn>,
-    pub table_references: TableReferences,
     /// Result columns of a statement prepared from semantic HIR; see
     /// [crate::vdbe::builder::ProgramBuilder::resolved_result_columns].
     pub(crate) resolved_result_columns:

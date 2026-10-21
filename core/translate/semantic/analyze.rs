@@ -10001,21 +10001,18 @@ mod tests {
             panic!("SELECT produces query root");
         };
         let outputs = &document.query(root.query).expect("query exists").blocks[0].outputs;
-        for (index, expected_kind, expected_user_name) in [
+        for (index, expected_kind) in [
             (
                 0,
                 crate::translate::semantic::hir::SequenceOperationKind::NextValue,
-                "orders",
             ),
             (
                 1,
                 crate::translate::semantic::hir::SequenceOperationKind::SetValue,
-                "main.orders",
             ),
             (
                 2,
                 crate::translate::semantic::hir::SequenceOperationKind::SetValue,
-                "orders",
             ),
         ] {
             let Expr::Function(call) = &outputs[index].expr else {
@@ -10025,7 +10022,6 @@ mod tests {
                 panic!("sequence write keeps its resolved operation");
             };
             assert_eq!(operation.kind, expected_kind);
-            assert_eq!(operation.user_name, expected_user_name);
             assert_eq!(operation.normalized_name, "orders");
             assert_eq!(operation.sequence.value().name, "orders");
             assert_eq!(

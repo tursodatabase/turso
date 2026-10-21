@@ -325,7 +325,6 @@ impl<'ast> Analyzer<'_, '_, 'ast> {
                 );
                 Some(hir::SequenceOperation {
                     kind: hir::SequenceOperationKind::NextValue,
-                    user_name: sequence_name.clone(),
                     normalized_name: sequence_name,
                     sequence,
                     backing_table,

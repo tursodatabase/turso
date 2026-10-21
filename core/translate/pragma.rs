@@ -1934,7 +1934,6 @@ fn is_database_empty(schema: &Schema, pager: &Arc<Pager>) -> crate::Result<bool>
         let table_name = match table_arc.as_ref() {
             Table::BTree(tbl) => &tbl.name,
             Table::Virtual(tbl) => &tbl.name,
-            Table::FromClauseSubquery(tbl) => &tbl.name,
             Table::RecursiveCteInput(_) => {
                 unreachable!("recursive CTE inputs are not stored in the schema")
             }

@@ -12,11 +12,9 @@ pub(crate) mod alter;
 pub(crate) mod analyze;
 pub(crate) mod attach;
 pub(crate) mod collate;
-pub(crate) mod display;
 pub(crate) mod emitter;
 pub mod eqp;
 pub(crate) mod expr;
-pub(crate) mod expression_index;
 pub(crate) mod hir_index_method;
 pub(crate) mod index;
 pub(crate) mod integrity_check;
@@ -197,7 +195,6 @@ fn translate_statement(
         bail_parse_error!("Cannot execute write statement in query_only mode")
     }
 
-    let is_select = matches!(stmt, ast::Stmt::Select { .. });
     let is_dml = matches!(
         stmt,
         ast::Stmt::Delete { .. } | ast::Stmt::Insert { .. } | ast::Stmt::Update { .. }
@@ -472,15 +469,10 @@ fn translate_statement(
         }
     }
 
-    // Indicate read operations so that in the epilogue we can emit the correct type of transaction
-    if is_select && !program.table_references.is_empty() {
-        program.begin_read_operation()?;
-    }
-
     // A statement with RETURNING already produces rows, so it never also returns
     // a count row (same as SQLite).
     if let Some(column_name) = count_changes_column {
-        if program.result_columns.is_empty() && program.resolved_result_columns.is_empty() {
+        if program.resolved_result_columns.is_empty() {
             let reg = program.alloc_register();
             program.emit_insn(crate::vdbe::insn::Insn::ChangeCount { dest: reg });
             program.emit_result_row(reg, 1);

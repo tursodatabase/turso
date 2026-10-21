@@ -574,7 +574,6 @@ fn emit_select_rows(
         query,
         &QueryDestination::CoroutineYield {
             yield_reg,
-            coroutine_implementation_start: start,
             stored_outputs: Vec::new(),
         },
     )?;

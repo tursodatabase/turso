@@ -146,12 +146,25 @@ deleted the same day, once their last callers moved to HIR:
 - The planner's unused WHERE, LIMIT and rowid parsers are gone.
 
 What is left of `expr/` is the helpers both HIR and the planner share: AST
-walking, affinity rules, literal emission, conditional jumps, and array and
-row-value shape checks. What remains of the legacy data types:
+walking, the storage-class mask, literal emission and conditional jumps.
+
+The parser-expression optimizer went the same day: `compute_best_join_order`
+and its access-method, multi-index, constraint and ordering code over
+`JoinedTable`, `WhereTerm` and `TableReferences`; the `Plan`/`SelectPlan`
+types and the plan display; `Table::FromClauseSubquery`; the statement's
+legacy result-column metadata (PRAGMA and change-count columns are now
+resolved result columns like every other); and the program builder's
+cursor overrides, CTE name stack, hash-build signatures and subquery result
+registers. HIR planning had its own generic versions of all of them
+(`HirPlannedSource`, `HirWhereTerm`, `HirTableConstraints`,
+`compute_hir_join_order`), which `plan.rs` and `optimizer/` now hold alone,
+with the shared `PlannedSource`, `PredicateTerm`, `SeekDef`, `BitSet` and
+`QueryDestination` types.
+
+What remains of the legacy data types:
 
 | Legacy work | HIR replacement | Why still live |
 |---|---|---|
-| `TableReferences` physical facts | HIR planned sources and loops | The optimizer's cost and constraint code still reads its cursor and ordering metadata while planning HIR sources; `plan.rs` still derives subquery output columns from it. |
 | `Resolver` | Semantic catalog and `HirSettings` | Schema statements, pragmas and transaction statements still look databases, functions and collations up through it. |
 
 Preserved binding restrictions, not HIR gaps:

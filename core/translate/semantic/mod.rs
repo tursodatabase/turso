@@ -7,7 +7,6 @@ mod cte;
 mod delete;
 mod dml;
 mod expr;
-pub(crate) use expr::supports_row_value_binary_comparison;
 pub(crate) mod hir;
 mod insert;
 mod query;

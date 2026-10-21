@@ -1,9 +1,6 @@
 // This module contains code for emitting bytecode instructions for SQL query execution.
 // It handles translating high-level SQL operations into low-level bytecode that can be executed by the virtual machine.
-use super::{
-    collate::CollationSeq,
-    plan::{BitSet, JoinedTable},
-};
+use super::{collate::CollationSeq, plan::BitSet};
 use crate::alloc::TursoIteratorExt;
 use crate::schema::{BTreeTable, Column, Schema};
 use crate::vdbe::{
@@ -16,7 +13,7 @@ use crate::{
 };
 use rustc_hash::FxHashMap as HashMap;
 use std::cell::RefCell;
-use turso_parser::ast::{self, TableInternalId};
+use turso_parser::ast::{self};
 
 // Would make more sense to not have RwLock for the attached databases and get all the schemas on prepare,
 // because there could be some data race where at 1 point you check the attached db, it has a table,
@@ -418,24 +415,6 @@ impl<'a> Resolver<'a> {
     }
 }
 
-/// Identifies a value stored in a materialized hash-build input.
-///
-/// These references are used to map payload registers back to the original
-/// table expressions during hash-probe evaluation. They are deliberately
-/// table-qualified so payloads can span multiple tables when the build input
-/// is derived from a join prefix.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub enum MaterializedColumnRef {
-    /// A concrete column from a specific table, including rowid alias metadata.
-    Column {
-        table_id: TableInternalId,
-        column_idx: usize,
-        is_rowid_alias: bool,
-    },
-    /// The implicit rowid (or integer primary key) of a specific table.
-    RowId { table_id: TableInternalId },
-}
-
 #[derive(Debug, Clone)]
 /// Update row source for UPDATE statements
 /// `Normal` is the default mode, it will iterate either the table itself or an index on the table.
@@ -444,13 +423,6 @@ pub enum MaterializedColumnRef {
 pub enum UpdateRowSource {
     /// Iterate over the table itself or an index on the table
     Normal,
-    /// Iterate over an ephemeral table containing the target rowids to update
-    PrebuiltEphemeralTable {
-        /// The cursor id of the ephemeral table that is being used to iterate the target rowids to update.
-        ephemeral_table_cursor_id: usize,
-        /// The table that is being updated.
-        target_table: Arc<JoinedTable>,
-    },
 }
 
 /// Used to distinguish database operations

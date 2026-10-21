@@ -147,10 +147,6 @@ impl CatalogSnapshot {
     pub(crate) const fn from_id(id: u64) -> Self {
         Self(id)
     }
-
-    pub const fn id(self) -> u64 {
-        self.0
-    }
 }
 
 /// Stable identity of one object within a catalog snapshot.
@@ -161,10 +157,6 @@ pub struct CatalogObjectId(u64);
 impl CatalogObjectId {
     pub(crate) const fn new(id: u64) -> Self {
         Self(id)
-    }
-
-    pub const fn id(self) -> u64 {
-        self.0
     }
 }
 

@@ -222,7 +222,7 @@ impl PlannedSelect {
             start_offset: start,
         });
         program.preassign_label_to_next_insn(start);
-        let values = self.emit_rows(program, yield_reg, start)?;
+        let values = self.emit_rows(program, yield_reg)?;
         program.emit_insn(Insn::EndCoroutine { yield_reg });
         program.preassign_label_to_next_insn(after_definition);
 
@@ -307,7 +307,6 @@ impl PlannedSelect {
         &self,
         program: &mut ProgramBuilder,
         yield_reg: usize,
-        start: crate::vdbe::BranchOffset,
     ) -> Result<usize> {
         let width = self
             .plan
@@ -324,7 +323,6 @@ impl PlannedSelect {
                 self.query,
                 &QueryDestination::CoroutineYield {
                     yield_reg,
-                    coroutine_implementation_start: start,
                     stored_outputs: self.stored_outputs.clone(),
                 },
             )

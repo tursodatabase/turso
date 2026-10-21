@@ -5469,7 +5469,6 @@ fn materialize_hir_shared_ctes(
                     MaterializedCteInfo {
                         cursor_id: prepared.cursor,
                         table: prepared.table.clone(),
-                        num_columns: prepared.source.columns.len(),
                     },
                 );
             }
@@ -5934,7 +5933,6 @@ fn prepare_hir_coroutine_loop<'a>(
     program.preassign_label_to_next_insn(start);
     let destination = QueryDestination::CoroutineYield {
         yield_reg,
-        coroutine_implementation_start: start,
         stored_outputs: Vec::new(),
     };
     let row = match &planned_loop.access {
@@ -7170,7 +7168,6 @@ fn prepare_hir_shared_cte_loop<'a>(
         MaterializedCteInfo {
             cursor_id: prepared.cursor,
             table: prepared.table.clone(),
-            num_columns: prepared.source.columns.len(),
         },
     );
     Ok(prepared)
@@ -7272,7 +7269,6 @@ fn prepare_hir_recursive_cte_loop<'a>(
             MaterializedCteInfo {
                 cursor_id: cursor,
                 table: table.clone(),
-                num_columns: source.columns.len(),
             },
         );
     }

@@ -185,9 +185,6 @@ pub enum SequenceOperationKind {
 #[derive(Clone, Debug)]
 pub struct SequenceOperation {
     pub kind: SequenceOperationKind,
-    /// The string supplied by SQL, without its outer quotes. Runtime currval
-    /// tracking uses this spelling, including an optional schema prefix.
-    pub user_name: String,
     pub normalized_name: String,
     pub sequence: ResolvedSequence,
     pub backing_table: ResolvedTable,
@@ -548,12 +545,13 @@ impl Expr {
         Self::Column(ColumnRef { source, column })
     }
 
-    pub fn rowid(source: SourceId) -> Self {
-        Self::RowId(source)
-    }
-
+    #[cfg(test)]
     pub fn output(output: OutputId) -> Self {
         Self::Output(output)
+    }
+
+    pub fn rowid(source: SourceId) -> Self {
+        Self::RowId(source)
     }
 
     pub(crate) fn child(&self, mut index: usize) -> Option<&Self> {

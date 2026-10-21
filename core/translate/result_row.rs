@@ -130,36 +130,6 @@ pub fn emit_columns_to_destination(
             program.constant_span_end_all();
             let record_reg = program.alloc_register();
             match rowid_mode {
-                super::plan::EphemeralRowidMode::FromResultColumns => {
-                    // For single-column case (RowidOnly materialization), we still need to
-                    // create a record containing the rowid so it can be read back later.
-                    if num_columns == 1 {
-                        program.emit_insn(Insn::MakeRecord {
-                            start_reg: to_u32(start_reg),
-                            count: to_u32(1),
-                            dest_reg: to_u32(record_reg),
-                            index_name: Some(table.name.clone()),
-                            affinity_str: None,
-                        });
-                    } else if num_columns > 1 {
-                        program.emit_insn(Insn::MakeRecord {
-                            start_reg: to_u32(start_reg),
-                            count: to_u32(num_columns - 1),
-                            dest_reg: to_u32(record_reg),
-                            index_name: Some(table.name.clone()),
-                            affinity_str: None,
-                        });
-                    }
-                    program.emit_insn(Insn::Insert {
-                        cursor: *table_cursor_id,
-                        key_reg: start_reg + (num_columns - 1),
-                        record_reg,
-                        flag: InsertFlags::new()
-                            .require_seek()
-                            .is_ephemeral_table_insert(),
-                        table_name: table.name.clone(),
-                    });
-                }
                 super::plan::EphemeralRowidMode::Auto => {
                     if num_columns > 0 {
                         program.emit_insn(Insn::MakeRecord {
@@ -313,18 +283,6 @@ pub fn emit_columns_to_destination(
                 extra_amount: num_regs - 1,
             });
         }
-        QueryDestination::RowSet { rowset_reg } => {
-            turso_assert_eq!(
-                num_columns,
-                1,
-                "RowSet should only have one result column (rowid)"
-            );
-            program.emit_insn(Insn::RowSetAdd {
-                rowset_reg: *rowset_reg,
-                value_reg: start_reg,
-            });
-        }
-        QueryDestination::Unset => unreachable!("Unset query destination should not be reached"),
     }
     Ok(())
 }

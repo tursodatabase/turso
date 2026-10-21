@@ -2776,7 +2776,6 @@ mod tests {
 
         let invalid_backing = SequenceOperation {
             kind: SequenceOperationKind::NextValue,
-            user_name: "seq".to_string(),
             normalized_name: "seq".to_string(),
             sequence: sequence.clone(),
             backing_table: non_btree(2, "__turso_internal_seq_seq"),
@@ -2801,7 +2800,6 @@ mod tests {
         );
         let invalid_sqlite_sequence = SequenceOperation {
             kind: SequenceOperationKind::NextValue,
-            user_name: "seq".to_string(),
             normalized_name: "seq".to_string(),
             sequence,
             backing_table: valid_backing,

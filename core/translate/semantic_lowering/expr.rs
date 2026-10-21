@@ -6396,7 +6396,6 @@ mod tests {
             result_type: TypeFact::known(crate::schema::Type::Integer),
             operation: hir::FunctionOperation::Sequence(hir::SequenceOperation {
                 kind,
-                user_name: "aux.seq".to_string(),
                 normalized_name,
                 sequence: hir::CatalogObject::new(
                     hir::CatalogObjectId::new(2),

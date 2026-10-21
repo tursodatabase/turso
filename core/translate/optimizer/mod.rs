@@ -1,20 +1,11 @@
-#[cfg(test)]
-use super::plan::JoinedTable;
-use super::{
-    emitter::Resolver,
-    plan::{
-        HirPlannedSource, HirSeekDef, HirWhereTerm, IterationDirection, Plan, SeekDef, SeekKey,
-        SelectPlan, TableReferences, WhereTerm,
-    },
+use super::plan::{
+    HirPlannedSource, HirSeekDef, HirWhereTerm, IterationDirection, SeekDef, SeekKey,
 };
 use crate::alloc::TursoIteratorExt;
 use crate::schema::GeneratedType;
 use crate::translate::planner::TableMask;
 use crate::translate::semantic::hir;
 use crate::{
-    function::Deterministic,
-    index_method::IndexMethodCostEstimate,
-    numeric::Numeric,
     schema::{Index, IndexColumn, Schema, Table},
     translate::{
         optimizer::{
@@ -33,10 +24,9 @@ use crate::{
 use crate::{turso_assert, turso_assert_eq, turso_debug_assert};
 use constraints::Constraint;
 use cost::Cost;
-use rustc_hash::FxHashMap as HashMap;
 use smallvec::SmallVec;
-use std::{cmp::Ordering, collections::VecDeque, fmt::Display, sync::Arc};
-use turso_parser::ast::{self, Expr, SortOrder, TableInternalId};
+use std::{cmp::Ordering, fmt::Display, sync::Arc};
+use turso_parser::ast::{self, SortOrder};
 
 pub(crate) mod access_method;
 pub(crate) mod constraints;
@@ -44,83 +34,7 @@ pub(crate) mod cost;
 mod cost_params;
 pub(crate) use cost_params::CostModelParams;
 pub(crate) mod join;
-pub(crate) mod multi_index;
 pub(crate) mod order;
-
-#[derive(Debug, Default)]
-pub(crate) struct AvailableIndexes {
-    indexes_by_table_id: HashMap<TableInternalId, VecDeque<Arc<Index>>>,
-}
-
-impl AvailableIndexes {
-    pub(crate) fn indexes_for_table(
-        &self,
-        table_id: TableInternalId,
-    ) -> Option<&VecDeque<Arc<Index>>> {
-        self.indexes_by_table_id.get(&table_id)
-    }
-
-    pub(crate) fn btree_indexes_for_column(
-        &self,
-        table_id: TableInternalId,
-        column_pos: usize,
-    ) -> impl Iterator<Item = &Index> {
-        self.indexes_for_table(table_id)
-            .into_iter()
-            .flat_map(|indexes| indexes.iter())
-            .filter(move |index| {
-                index.index_method.is_none()
-                    && index.column_table_pos_to_index_pos(column_pos) == Some(0)
-            })
-            .map(Arc::as_ref)
-    }
-
-    #[cfg(test)]
-    pub(crate) fn insert_for_table_name(
-        &mut self,
-        joined_tables: &[JoinedTable],
-        table_name: &str,
-        indexes: VecDeque<Arc<Index>>,
-    ) {
-        let table_ref = joined_tables
-            .iter()
-            .find(|table_ref| table_ref.table.get_name() == table_name)
-            .expect("test table should exist");
-        self.indexes_by_table_id
-            .insert(table_ref.internal_id, indexes);
-    }
-
-    #[cfg(test)]
-    pub(crate) fn push_front_for_table_name(
-        &mut self,
-        joined_tables: &[JoinedTable],
-        table_name: &str,
-        index: Arc<Index>,
-    ) {
-        let table_ref = joined_tables
-            .iter()
-            .find(|table_ref| table_ref.table.get_name() == table_name)
-            .expect("test table should exist");
-        self.indexes_by_table_id
-            .entry(table_ref.internal_id)
-            .or_default()
-            .push_front(index);
-    }
-}
-
-/// A candidate index method that could be used for table access in a join query.
-/// This struct captures all information needed to construct an IndexMethodQuery
-/// operation, allowing the DP join ordering algorithm to consider custom index
-/// methods alongside BTree indexes.
-#[derive(Debug, Clone)]
-pub struct IndexMethodCandidate {
-    /// Index of the table in the joined_tables list
-    pub table_idx: usize,
-    /// Index in WHERE clause that was covered by this pattern (if any)
-    pub where_covered: Option<usize>,
-    /// Cost estimate from the index method
-    pub cost_estimate: Option<IndexMethodCostEstimate>,
-}
 
 /// Cost model used by the planner: the loaded parameters when the
 /// `optimizer_params` feature is on, the built-in defaults otherwise.
@@ -151,45 +65,6 @@ pub(crate) fn base_row_estimate(
             }
             RowCountEstimate::hardcoded_fallback(params)
         }
-        Table::FromClauseSubquery(subquery) => match subquery.plan.as_ref() {
-            Plan::Select(plan) => {
-                if let Some(rows) = plan.estimated_output_rows {
-                    return RowCountEstimate::AnalyzeStats(rows.max(1.0));
-                }
-                RowCountEstimate::hardcoded_fallback(params)
-            }
-            Plan::CompoundSelect {
-                left, right_most, ..
-            } => {
-                // Combine estimates from all branches according to set operation semantics.
-                // left = [(A, op1), (B, op2)], right_most = C
-                // represents: (A op1 B) op2 C
-                // We fold left-to-right: seed with A, then apply op_i with plan_{i+1}.
-                let fallback = *RowCountEstimate::hardcoded_fallback(params);
-                let est = |p: &SelectPlan| p.estimated_output_rows.unwrap_or(fallback);
-                let mut combined = left.first().map_or(
-                    right_most.estimated_output_rows.unwrap_or(fallback),
-                    |(p, _)| est(p),
-                );
-                // The estimates to the right of each operator: left[1..].est, then right_most.est
-                let rhs_estimates = left
-                    .iter()
-                    .skip(1)
-                    .map(|(p, _)| est(p))
-                    .chain(std::iter::once(est(right_most)));
-                for ((_, op), rhs) in left.iter().zip(rhs_estimates) {
-                    combined = match op {
-                        ast::CompoundOperator::UnionAll | ast::CompoundOperator::Union => {
-                            combined + rhs
-                        }
-                        ast::CompoundOperator::Intersect => combined.min(rhs),
-                        ast::CompoundOperator::Except => combined,
-                    };
-                }
-                RowCountEstimate::AnalyzeStats(combined.max(1.0))
-            }
-            _ => RowCountEstimate::hardcoded_fallback(params),
-        },
         _ => RowCountEstimate::hardcoded_fallback(params),
     }
 }
@@ -198,20 +73,6 @@ trait AccessPredicate<S: Copy> {
     fn outer_join_source(&self) -> Option<S>;
     fn is_consumed(&self) -> bool;
     fn consume(&mut self);
-}
-
-impl AccessPredicate<TableInternalId> for WhereTerm {
-    fn outer_join_source(&self) -> Option<TableInternalId> {
-        self.from_outer_join
-    }
-
-    fn is_consumed(&self) -> bool {
-        self.consumed
-    }
-
-    fn consume(&mut self) {
-        self.consumed = true;
-    }
 }
 
 impl AccessPredicate<hir::SourceId> for HirWhereTerm {
@@ -325,8 +186,8 @@ impl BtreeOperationBuilder<hir::Expr, HirWhereTerm> for HirBtreeOperationBuilder
     }
 }
 
-fn selected_partial_index_terms<E, I>(
-    constraints: &TableConstraints<E, I>,
+fn selected_partial_index_terms<E>(
+    constraints: &TableConstraints<E>,
     index: Option<&Arc<Index>>,
 ) -> SmallVec<[usize; 4]> {
     let Some(index) = index.filter(|index| index.where_clause.is_some()) else {
@@ -407,9 +268,9 @@ fn mark_seek_constraints_consumed<E, S: Copy>(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn apply_selected_btree_access<I, H, E, J, O, N, P, B>(
-    source: &PlannedSource<I, H, E, J, O, N>,
-    constraints: &TableConstraints<E, I>,
+fn apply_selected_btree_access<I, H, E, J, P, B>(
+    source: &PlannedSource<I, H, E, J>,
+    constraints: &TableConstraints<E>,
     predicates: &mut [P],
     access_method: &mut AccessMethod,
     prior_sources: &TableMask,
@@ -889,319 +750,8 @@ pub(crate) fn apply_hir_selected_virtual_access(
     })
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum AlwaysTrueOrFalse {
-    AlwaysTrue,
-    AlwaysFalse,
-}
-
-/**
-  Helper trait for expressions that can be optimized
-  Implemented for ast::Expr
-*/
-pub trait Optimizable {
-    // if the expression is a constant expression that, when evaluated as a condition, is always true or false
-    // return a [ConstantPredicate].
-    fn check_always_true_or_false(&self) -> Result<Option<AlwaysTrueOrFalse>>;
-    fn is_constant(&self, resolver: &Resolver<'_>) -> bool;
-    fn is_nonnull(&self, tables: &TableReferences) -> bool;
-}
-
-impl Optimizable for ast::Expr {
-    /// Returns true if the expressions is (verifiably) non-NULL.
-    /// It might still be non-NULL even if we return false; we just
-    /// weren't able to prove it.
-    /// This function is currently very conservative, and will return false
-    /// for any expression where we aren't sure and didn't bother to find out
-    /// by writing more complex code.
-    fn is_nonnull(&self, tables: &TableReferences) -> bool {
-        match self {
-            Expr::SubqueryResult { .. } => false,
-            Expr::Between {
-                lhs, start, end, ..
-            } => lhs.is_nonnull(tables) && start.is_nonnull(tables) && end.is_nonnull(tables),
-            Expr::Binary(_, ast::Operator::Modulus | ast::Operator::Divide, _) => false, // 1 % 0, 1 / 0
-            Expr::Binary(expr, _, expr1) => expr.is_nonnull(tables) && expr1.is_nonnull(tables),
-            Expr::Case {
-                when_then_pairs,
-                else_expr,
-                ..
-            } => {
-                // With no ELSE, the CASE yields NULL when no WHEN matches.
-                // Otherwise its result is one of the THEN values or the ELSE
-                // value, so it is non-null only when all of those are. The base
-                // is only compared in the WHEN tests and never becomes the
-                // result, so its nullability does not matter.
-                when_then_pairs
-                    .iter()
-                    .all(|(_, then)| then.is_nonnull(tables))
-                    && else_expr
-                        .as_ref()
-                        .is_some_and(|else_expr| else_expr.is_nonnull(tables))
-            }
-            Expr::Cast { expr, .. } => expr.is_nonnull(tables),
-            Expr::Collate(expr, _) => expr.is_nonnull(tables),
-            Expr::DoublyQualified(..) => {
-                panic!("Do not call is_nonnull before DoublyQualified has been rewritten as Column")
-            }
-            Expr::Exists(..) => false,
-            Expr::FunctionCall { .. } => false,
-            Expr::FunctionCallStar { .. } => false,
-            Expr::Id(..) => panic!("Do not call is_nonnull before Id has been rewritten as Column"),
-            Expr::Column {
-                table,
-                column,
-                is_rowid_alias,
-                ..
-            } => {
-                if *is_rowid_alias {
-                    return true;
-                }
-
-                let (_, table_ref) = tables
-                    .find_table_by_internal_id(*table)
-                    .expect("table not found");
-                let columns = table_ref.columns();
-                let column = &columns[*column];
-                // Only INTEGER PRIMARY KEY (rowid alias) is implicitly NOT NULL.
-                // Other PRIMARY KEY types (e.g., TEXT PRIMARY KEY) can contain NULL.
-                column.is_rowid_alias() || column.notnull()
-            }
-            Expr::RowId { .. } => true,
-            Expr::InList { lhs, rhs, .. } => {
-                lhs.is_nonnull(tables)
-                    && (rhs.is_empty() || rhs.iter().all(|v| v.is_nonnull(tables)))
-            }
-            Expr::InSelect { .. } => false,
-            Expr::InTable { .. } => false,
-            Expr::IsNull(..) => true,
-            Expr::Like { lhs, rhs, .. } => lhs.is_nonnull(tables) && rhs.is_nonnull(tables),
-            Expr::Literal(literal) => match literal {
-                ast::Literal::Numeric(_) => true,
-                ast::Literal::String(_) => true,
-                ast::Literal::Blob(_) => true,
-                ast::Literal::Keyword(_) => true,
-                ast::Literal::Null => false,
-                ast::Literal::True => true,
-                ast::Literal::False => true,
-                ast::Literal::CurrentDate => true,
-                ast::Literal::CurrentTime => true,
-                ast::Literal::CurrentTimestamp => true,
-            },
-            Expr::Name(..) => false,
-            Expr::NotNull(..) => true,
-            Expr::Parenthesized(exprs) => exprs.iter().all(|expr| expr.is_nonnull(tables)),
-            Expr::Qualified(..) => {
-                panic!("Do not call is_nonnull before Qualified has been rewritten as Column")
-            }
-            Expr::FieldAccess { .. } => false, // struct/union field extraction can return NULL
-            Expr::Raise(..) => false,
-            Expr::Subquery(..) => false,
-            Expr::Unary(_, expr) => expr.is_nonnull(tables),
-            Expr::Variable(..) => false,
-            Expr::Register(..) => false, // Register values can be null
-            Expr::Default => false,
-            Expr::Array { .. } | Expr::Subscript { .. } => {
-                unreachable!("Array and Subscript are desugared into function calls by the parser")
-            }
-        }
-    }
-    /// Returns true if the expression is a constant i.e. does not depend on columns and can be evaluated only once during the execution
-    fn is_constant(&self, resolver: &Resolver<'_>) -> bool {
-        match self {
-            Expr::SubqueryResult { .. } => false,
-            Expr::Between {
-                lhs, start, end, ..
-            } => {
-                lhs.is_constant(resolver)
-                    && start.is_constant(resolver)
-                    && end.is_constant(resolver)
-            }
-            Expr::Binary(expr, _, expr1) => {
-                expr.is_constant(resolver) && expr1.is_constant(resolver)
-            }
-            Expr::Case {
-                base,
-                when_then_pairs,
-                else_expr,
-            } => {
-                base.as_ref().is_none_or(|base| base.is_constant(resolver))
-                    && when_then_pairs.iter().all(|(when, then)| {
-                        when.is_constant(resolver) && then.is_constant(resolver)
-                    })
-                    && else_expr
-                        .as_ref()
-                        .is_none_or(|else_expr| else_expr.is_constant(resolver))
-            }
-            Expr::Cast { expr, .. } => expr.is_constant(resolver),
-            Expr::Collate(expr, _) => expr.is_constant(resolver),
-            // Not constant. Normally rewritten to Expr::Column by the optimizer,
-            // but CHECK constraints bypass the rewrite pass and legitimately
-            // contain DoublyQualified nodes.
-            Expr::DoublyQualified(_, _, _) => false,
-            Expr::Exists(_) => false,
-            Expr::FunctionCall {
-                args,
-                name,
-                filter_over,
-                ..
-            } => {
-                if filter_over.over_clause.is_some() {
-                    return false;
-                }
-                let Some(func) = resolver
-                    .resolve_function(name.as_str(), args.len())
-                    .ok()
-                    .flatten()
-                else {
-                    return false;
-                };
-                func.is_deterministic() && args.iter().all(|arg| arg.is_constant(resolver))
-            }
-            Expr::FunctionCallStar { .. } => false,
-            Expr::Id(_) => true,
-            Expr::Column { .. } => false,
-            Expr::RowId { .. } => false,
-            Expr::InList { lhs, rhs, .. } => {
-                lhs.is_constant(resolver)
-                    && (rhs.is_empty() || rhs.iter().all(|v| v.is_constant(resolver)))
-            }
-            Expr::InSelect { .. } => {
-                false // might be constant, too annoying to check subqueries etc. implement later
-            }
-            Expr::InTable { .. } => false,
-            Expr::IsNull(expr) => expr.is_constant(resolver),
-            Expr::Like {
-                lhs, rhs, escape, ..
-            } => {
-                lhs.is_constant(resolver)
-                    && rhs.is_constant(resolver)
-                    && escape
-                        .as_ref()
-                        .is_none_or(|escape| escape.is_constant(resolver))
-            }
-            Expr::Literal(_) => true,
-            Expr::Name(_) => false,
-            Expr::NotNull(expr) => expr.is_constant(resolver),
-            Expr::Parenthesized(exprs) => exprs.iter().all(|expr| expr.is_constant(resolver)),
-            // Not constant. Normally rewritten to Expr::Column by the optimizer,
-            // but CHECK constraints bypass the rewrite pass and legitimately
-            // contain Qualified nodes.
-            Expr::Qualified(_, _) | Expr::FieldAccess { .. } => false,
-            Expr::Raise(_, expr) => expr.as_ref().is_none_or(|expr| expr.is_constant(resolver)),
-            Expr::Subquery(_) => false,
-            Expr::Unary(_, expr) => expr.is_constant(resolver),
-            Expr::Variable(_) => true,
-            Expr::Register(_) => false,
-            Expr::Default => true,
-            Expr::Array { .. } | Expr::Subscript { .. } => {
-                unreachable!("Array and Subscript are desugared into function calls by the parser")
-            }
-        }
-    }
-    /// Returns true if the expression is a constant expression that, when evaluated as a condition, is always true or false
-    fn check_always_true_or_false(&self) -> Result<Option<AlwaysTrueOrFalse>> {
-        match self {
-            Self::Literal(lit) => match lit {
-                ast::Literal::Numeric(b) => {
-                    if let Ok(int_value) = b.parse::<i64>() {
-                        return Ok(Some(if int_value == 0 {
-                            AlwaysTrueOrFalse::AlwaysFalse
-                        } else {
-                            AlwaysTrueOrFalse::AlwaysTrue
-                        }));
-                    }
-                    if let Ok(float_value) = b.parse::<f64>() {
-                        return Ok(Some(if float_value == 0.0 {
-                            AlwaysTrueOrFalse::AlwaysFalse
-                        } else {
-                            AlwaysTrueOrFalse::AlwaysTrue
-                        }));
-                    }
-
-                    Ok(None)
-                }
-                ast::Literal::String(s) => {
-                    // Use Numeric::from to match SQLite's string-to-numeric conversion,
-                    // which extracts leading numeric prefixes (e.g., '9S' -> 9, 'abc' -> 0)
-                    let without_quotes = s.trim_matches('\'');
-                    let numeric = Numeric::from(without_quotes);
-                    match numeric.to_bool() {
-                        true => Ok(Some(AlwaysTrueOrFalse::AlwaysTrue)),
-                        false => Ok(Some(AlwaysTrueOrFalse::AlwaysFalse)),
-                    }
-                }
-                _ => Ok(None),
-            },
-            Self::Unary(op, expr) => {
-                if *op == ast::UnaryOperator::Not {
-                    let trivial = expr.check_always_true_or_false()?;
-                    return Ok(trivial.map(|t| match t {
-                        AlwaysTrueOrFalse::AlwaysTrue => AlwaysTrueOrFalse::AlwaysFalse,
-                        AlwaysTrueOrFalse::AlwaysFalse => AlwaysTrueOrFalse::AlwaysTrue,
-                    }));
-                }
-
-                if *op == ast::UnaryOperator::Negative {
-                    let trivial = expr.check_always_true_or_false()?;
-                    return Ok(trivial);
-                }
-
-                Ok(None)
-            }
-            Self::InList { lhs: _, not, rhs } => {
-                if rhs.is_empty() {
-                    return Ok(Some(if *not {
-                        AlwaysTrueOrFalse::AlwaysTrue
-                    } else {
-                        AlwaysTrueOrFalse::AlwaysFalse
-                    }));
-                }
-
-                Ok(None)
-            }
-            Self::Binary(lhs, op, rhs) => {
-                let lhs_trivial = lhs.check_always_true_or_false()?;
-                let rhs_trivial = rhs.check_always_true_or_false()?;
-                match op {
-                    ast::Operator::And => {
-                        if lhs_trivial == Some(AlwaysTrueOrFalse::AlwaysFalse)
-                            || rhs_trivial == Some(AlwaysTrueOrFalse::AlwaysFalse)
-                        {
-                            return Ok(Some(AlwaysTrueOrFalse::AlwaysFalse));
-                        }
-                        if lhs_trivial == Some(AlwaysTrueOrFalse::AlwaysTrue)
-                            && rhs_trivial == Some(AlwaysTrueOrFalse::AlwaysTrue)
-                        {
-                            return Ok(Some(AlwaysTrueOrFalse::AlwaysTrue));
-                        }
-
-                        Ok(None)
-                    }
-                    ast::Operator::Or => {
-                        if lhs_trivial == Some(AlwaysTrueOrFalse::AlwaysTrue)
-                            || rhs_trivial == Some(AlwaysTrueOrFalse::AlwaysTrue)
-                        {
-                            return Ok(Some(AlwaysTrueOrFalse::AlwaysTrue));
-                        }
-                        if lhs_trivial == Some(AlwaysTrueOrFalse::AlwaysFalse)
-                            && rhs_trivial == Some(AlwaysTrueOrFalse::AlwaysFalse)
-                        {
-                            return Ok(Some(AlwaysTrueOrFalse::AlwaysFalse));
-                        }
-
-                        Ok(None)
-                    }
-                    _ => Ok(None),
-                }
-            }
-            _ => Ok(None),
-        }
-    }
-}
-
-pub(crate) fn ephemeral_index_build<I, H, E, J, O, N>(
-    source: &PlannedSource<I, H, E, J, O, N>,
+pub(crate) fn ephemeral_index_build<I, H, E, J>(
+    source: &PlannedSource<I, H, E, J>,
     constraint_refs: &[RangeConstraintRef],
 ) -> Result<Index>
 where
@@ -1681,115 +1231,4 @@ fn build_seek_def<E>(
             }
         }
     })
-}
-
-#[cfg(test)]
-mod tests {
-    use super::Optimizable;
-    use crate::translate::emitter::{DoubleQuotedDml, Resolver};
-    use crate::{schema::Schema, DatabaseCatalog, RwLock, SymbolTable};
-    use rustc_hash::FxHashMap as HashMap;
-    use turso_parser::ast::{self, Expr, FunctionTail, Name, TableInternalId};
-
-    fn empty_resolver<'a>(
-        schema: &'a Schema,
-        database_schemas: &'a RwLock<HashMap<usize, crate::sync::Arc<Schema>>>,
-        temp_database: &'a RwLock<Option<crate::connection::TempDatabase>>,
-        attached_databases: &'a RwLock<DatabaseCatalog>,
-        syms: &'a SymbolTable,
-    ) -> Resolver<'a> {
-        Resolver::new(
-            schema,
-            database_schemas,
-            temp_database,
-            attached_databases,
-            syms,
-            true,
-            DoubleQuotedDml::Enabled,
-            crate::sync::Arc::new(crate::dialect::SqliteDialect),
-            &None,
-        )
-    }
-
-    fn no_tail() -> FunctionTail {
-        FunctionTail {
-            filter_clause: None,
-            over_clause: None,
-        }
-    }
-
-    fn fn_call(name: &str, args: Vec<Expr>) -> Expr {
-        Expr::FunctionCall {
-            name: Name::exact(name.to_string()),
-            distinctness: None,
-            args: args.into_iter().map(Box::new).collect(),
-            order_by: vec![],
-            within_group: vec![],
-            filter_over: no_tail(),
-        }
-    }
-
-    #[test]
-    fn constant_classifier_for_coalesce_with_in_list() {
-        let schema = Schema::new();
-        let syms = SymbolTable::new();
-        let database_schemas = RwLock::new(HashMap::default());
-        let attached_databases = RwLock::new(DatabaseCatalog::new());
-        let temp_database = RwLock::new(None);
-        let resolver = empty_resolver(
-            &schema,
-            &database_schemas,
-            &temp_database,
-            &attached_databases,
-            &syms,
-        );
-
-        let expr = fn_call(
-            "coalesce",
-            vec![
-                fn_call(
-                    "length",
-                    vec![Expr::Literal(ast::Literal::String("a".into()))],
-                ),
-                Expr::InList {
-                    lhs: Box::new(fn_call(
-                        "hex",
-                        vec![Expr::Literal(ast::Literal::Blob("X'01'".into()))],
-                    )),
-                    not: false,
-                    rhs: vec![Box::new(Expr::Literal(ast::Literal::Blob("X'02'".into())))],
-                },
-            ],
-        );
-
-        assert!(expr.is_constant(&resolver));
-    }
-
-    #[test]
-    fn constant_classifier_for_quote_of_column() {
-        let schema = Schema::new();
-        let syms = SymbolTable::new();
-        let database_schemas = RwLock::new(HashMap::default());
-        let attached_databases = RwLock::new(DatabaseCatalog::new());
-        let temp_database = RwLock::new(None);
-        let resolver = empty_resolver(
-            &schema,
-            &database_schemas,
-            &temp_database,
-            &attached_databases,
-            &syms,
-        );
-
-        let expr = fn_call(
-            "quote",
-            vec![Expr::Column {
-                database: None,
-                table: TableInternalId::default(),
-                column: 0,
-                is_rowid_alias: false,
-            }],
-        );
-
-        assert!(!expr.is_constant(&resolver));
-    }
 }

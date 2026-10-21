@@ -3574,7 +3574,6 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
         Ok(Some((
             hir::FunctionOperation::Sequence(hir::SequenceOperation {
                 kind,
-                user_name,
                 normalized_name,
                 sequence,
                 backing_table,

@@ -2259,10 +2259,10 @@ impl<'a> HirPlanContext<'a> {
         }
         self.check_match_terms(&input.predicates)?;
         // Join planning tracks tables in a 64-bit mask.
-        if input.sources.len() > crate::translate::plan::TableReferences::MAX_JOINED_TABLES {
+        if input.sources.len() > crate::translate::plan::MAX_JOINED_TABLES {
             crate::bail_parse_error!(
                 "Only up to {} tables can be joined",
-                crate::translate::plan::TableReferences::MAX_JOINED_TABLES
+                crate::translate::plan::MAX_JOINED_TABLES
             );
         }
         let where_start = input.where_start;
@@ -3537,21 +3537,15 @@ fn planned_source_from_definition(
             )))
         }
     };
-    let database = source.database.ok_or_else(|| {
-        LimboError::InternalError(format!("table source {} has no database", source.id))
-    })?;
     let (col_used_mask, column_use_counts) = column_usage(source.id, usage)?;
 
     Ok(HirPlannedSource {
-        op: (),
         table: table.value().clone(),
-        identifier: (),
         internal_id: source.id,
         join_info,
         col_used_mask,
         column_use_counts,
         expression_index_usages: Vec::new(),
-        database_id: database.index(),
         indexed: source.index_hint.clone(),
     })
 }
@@ -3874,7 +3868,6 @@ mod tests {
             joined.join_info.as_ref().unwrap().kind,
             hir::JoinKind::Inner
         );
-        assert_eq!(joined.database_id, 0);
         let (Table::BTree(expected), Table::BTree(actual)) = (resolved.value(), &joined.table)
         else {
             panic!("resolved and planned tables are btree tables");
