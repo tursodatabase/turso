@@ -985,15 +985,28 @@ pub struct UpdateSetClause {
     /// the collection phase. That column in the scratch table contains the evaluated result
     /// of s.x + 1.
     pub update_from_result: Option<Box<ast::Expr>>,
+    /// The normalized names the SET clause used for this column, as written.
+    /// `rowid`, `oid` and an INTEGER PRIMARY KEY's name set the same column
+    /// but stay distinct here, because UPDATE OF triggers match by name.
+    pub target_names: Vec<String>,
 }
 
 impl UpdateSetClause {
-    pub fn new(column_index: usize, expr: Box<ast::Expr>) -> Self {
+    pub fn new(column_index: usize, expr: Box<ast::Expr>, target_name: String) -> Self {
         Self {
             column_index,
             expr,
             update_from_result: None,
+            target_names: vec![target_name],
         }
+    }
+
+    /// Every name the SET clauses used, for matching UPDATE OF triggers.
+    pub fn all_target_names(set_clauses: &[UpdateSetClause]) -> Vec<String> {
+        set_clauses
+            .iter()
+            .flat_map(|set| set.target_names.iter().cloned())
+            .collect()
     }
 
     /// If UPDATE ... FROM, the this is the materialized result of a SET clause expression derived from the FROM clause;

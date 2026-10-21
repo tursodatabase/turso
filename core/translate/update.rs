@@ -506,8 +506,13 @@ fn collect_update_set_clauses(
                 .iter_mut()
                 .find(|set| set.column_index == col_index)
             {
-                Some(existing) => compose_update_set_clause(existing, expr),
-                None => set_clauses.push(UpdateSetClause::new(col_index, expr)),
+                Some(existing) => {
+                    compose_update_set_clause(existing, expr);
+                    if !existing.target_names.contains(&ident) {
+                        existing.target_names.push(ident);
+                    }
+                }
+                None => set_clauses.push(UpdateSetClause::new(col_index, expr, ident)),
             }
         }
     }

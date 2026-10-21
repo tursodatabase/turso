@@ -1,7 +1,6 @@
 use crate::schema::{BTreeTable, Trigger};
 use crate::sync::Arc;
 use crate::translate::expr::WalkControl;
-use crate::translate::plan::ColumnMask;
 use crate::translate::subquery::{
     emit_non_from_clause_subquery, plan_subqueries_from_trigger_when_clause,
 };
@@ -689,40 +688,12 @@ fn execute_trigger_commands(
 pub fn has_relevant_triggers_type_only(
     schema: &crate::schema::Schema,
     event: TriggerEvent,
-    updated_column_indices: Option<&ColumnMask>,
+    set_column_names: Option<&[String]>,
     table: &BTreeTable,
 ) -> bool {
-    let mut triggers = schema.get_triggers_for_table(table.name.as_str());
-
-    // Filter triggers by event
-    triggers.any(|trigger| {
-        // Check event matches
-        let event_matches = match (&trigger.event, &event) {
-            (TriggerEvent::Delete, TriggerEvent::Delete) => true,
-            (TriggerEvent::Insert, TriggerEvent::Insert) => true,
-            (TriggerEvent::Update, TriggerEvent::Update) => true,
-            (TriggerEvent::UpdateOf(trigger_cols), TriggerEvent::Update) => {
-                // For UPDATE OF, we need to check if any of the specified columns
-                // are in the UPDATE SET clause
-                let updated_cols =
-                    updated_column_indices.expect("UPDATE should contain some updated columns");
-                // Check if any of the trigger's specified columns are being updated
-                trigger_cols.iter().any(|col_name| {
-                    let normalized_col = normalize_ident(col_name.as_str());
-                    if let Some((col_idx, _)) = table.get_column(&normalized_col) {
-                        updated_cols.get(col_idx)
-                    } else {
-                        // Column doesn't exist - according to SQLite docs, unrecognized
-                        // column names in UPDATE OF are silently ignored
-                        false
-                    }
-                })
-            }
-            _ => false,
-        };
-
-        event_matches
-    })
+    schema
+        .get_triggers_for_table(table.name.as_str())
+        .any(|trigger| trigger_event_matches(&trigger.event, &event, set_column_names))
 }
 
 /// Check if there are any triggers for a given event (regardless of time).
@@ -731,48 +702,41 @@ pub fn get_relevant_triggers_type_and_time<'a>(
     schema: &'a crate::schema::Schema,
     event: TriggerEvent,
     time: TriggerTime,
-    updated_column_indices: Option<ColumnMask>,
+    set_column_names: Option<&'a [String]>,
     table: &'a BTreeTable,
 ) -> impl Iterator<Item = Arc<Trigger>> + 'a + Clone {
-    let triggers = schema.get_triggers_for_table(table.name.as_str());
-
-    // Filter triggers by event
-    triggers
-        .filter(move |trigger| -> bool {
-            // Check event matches
-            let event_matches = match (&trigger.event, &event) {
-                (TriggerEvent::Delete, TriggerEvent::Delete) => true,
-                (TriggerEvent::Insert, TriggerEvent::Insert) => true,
-                (TriggerEvent::Update, TriggerEvent::Update) => true,
-                (TriggerEvent::UpdateOf(trigger_cols), TriggerEvent::Update) => {
-                    // For UPDATE OF, we need to check if any of the specified columns
-                    // are in the UPDATE SET clause
-                    if let Some(ref updated_cols) = updated_column_indices {
-                        // Check if any of the trigger's specified columns are being updated
-                        trigger_cols.iter().any(|col_name| {
-                            let normalized_col = normalize_ident(col_name.as_str());
-                            if let Some((col_idx, _)) = table.get_column(&normalized_col) {
-                                updated_cols.get(col_idx)
-                            } else {
-                                // Column doesn't exist - according to SQLite docs, unrecognized
-                                // column names in UPDATE OF are silently ignored
-                                false
-                            }
-                        })
-                    } else {
-                        false
-                    }
-                }
-                _ => false,
-            };
-
-            if !event_matches {
-                return false;
-            }
-
-            trigger.time == time
+    schema
+        .get_triggers_for_table(table.name.as_str())
+        .filter(move |trigger| {
+            trigger.time == time && trigger_event_matches(&trigger.event, &event, set_column_names)
         })
         .cloned()
+}
+
+/// Whether a trigger defined for `trigger_event` fires for a statement of
+/// `event`. An UPDATE OF trigger fires when the UPDATE's SET clause names one
+/// of its columns. Like SQLite's checkColumnOverlap, this compares names as
+/// written: `rowid`, `oid`, `_rowid_` and an INTEGER PRIMARY KEY's own name
+/// all set the same value, but each only matches itself.
+fn trigger_event_matches(
+    trigger_event: &TriggerEvent,
+    event: &TriggerEvent,
+    set_column_names: Option<&[String]>,
+) -> bool {
+    match (trigger_event, event) {
+        (TriggerEvent::Delete, TriggerEvent::Delete)
+        | (TriggerEvent::Insert, TriggerEvent::Insert)
+        | (TriggerEvent::Update, TriggerEvent::Update) => true,
+        (TriggerEvent::UpdateOf(trigger_cols), TriggerEvent::Update) => {
+            let set_column_names =
+                set_column_names.expect("an UPDATE always passes the names its SET clause used");
+            trigger_cols.iter().any(|col_name| {
+                let col_name = normalize_ident(col_name.as_str());
+                set_column_names.contains(&col_name)
+            })
+        }
+        _ => false,
+    }
 }
 
 /// Like [`get_relevant_triggers_type_and_time`], but also searches the temp
@@ -784,30 +748,24 @@ pub fn get_triggers_including_temp(
     database_id: usize,
     event: TriggerEvent,
     time: TriggerTime,
-    updated_column_indices: Option<ColumnMask>,
+    set_column_names: Option<&[String]>,
     table: &BTreeTable,
 ) -> Vec<Arc<Trigger>> {
     let mut triggers: Vec<Arc<Trigger>> = resolver.with_schema(database_id, |s| {
-        get_relevant_triggers_type_and_time(
-            s,
-            event.clone(),
-            time,
-            updated_column_indices.clone(),
-            table,
-        )
-        .filter(|trigger| {
-            // In the temp schema, triggers may target a different database.
-            // Only include triggers whose target matches this database.
-            match trigger.target_database_id {
-                Some(target_db) => target_db == database_id,
-                None => true, // unqualified → targets this schema's own table
-            }
-        })
-        .collect()
+        get_relevant_triggers_type_and_time(s, event.clone(), time, set_column_names, table)
+            .filter(|trigger| {
+                // In the temp schema, triggers may target a different database.
+                // Only include triggers whose target matches this database.
+                match trigger.target_database_id {
+                    Some(target_db) => target_db == database_id,
+                    None => true, // unqualified → targets this schema's own table
+                }
+            })
+            .collect()
     });
     if database_id != crate::TEMP_DB_ID && resolver.has_temp_database() {
         let temp_triggers: Vec<Arc<Trigger>> = resolver.with_schema(crate::TEMP_DB_ID, |s| {
-            get_relevant_triggers_type_and_time(s, event, time, updated_column_indices, table)
+            get_relevant_triggers_type_and_time(s, event, time, set_column_names, table)
                 .filter(|trigger| match trigger.target_database_id {
                     // Explicit qualifier: include if it matches this database.
                     Some(target_db) => target_db == database_id,
@@ -840,11 +798,11 @@ pub fn has_triggers_including_temp(
     resolver: &Resolver,
     database_id: usize,
     event: TriggerEvent,
-    updated_column_indices: Option<&ColumnMask>,
+    set_column_names: Option<&[String]>,
     table: &BTreeTable,
 ) -> bool {
     let found = resolver.with_schema(database_id, |s| {
-        has_relevant_triggers_type_only(s, event.clone(), updated_column_indices, table)
+        has_relevant_triggers_type_only(s, event.clone(), set_column_names, table)
     });
     if found {
         return true;
