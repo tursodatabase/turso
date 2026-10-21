@@ -479,6 +479,7 @@ ORDER BY department, salary;
 function_name() OVER (
   [PARTITION BY expression [, ...]]
   [ORDER BY expression [ASC | DESC] [, ...]]
+  [{ ROWS | RANGE | GROUPS } frame specification]
 )
 ```
 
@@ -486,11 +487,12 @@ function_name() OVER (
 |-----------|-------------|
 | `PARTITION BY` | Divides rows into groups (partitions). The function resets for each partition |
 | `ORDER BY` | Defines the order of rows within each partition |
+| Frame specification | `ROWS`, `RANGE`, or `GROUPS` with explicit bounds, overriding the default frame |
 
 Standard aggregate functions (`SUM`, `AVG`, `COUNT`, `MIN`, `MAX`, `TOTAL`, `GROUP_CONCAT`) can all be used as window functions.
 
 <Info>
-Window functions in Turso use the default frame definition (RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW). Custom frame specifications (ROWS, RANGE, GROUPS with explicit bounds) are not supported. The `row_number()` ranking function and the `FILTER (WHERE ...)` clause are supported; other ranking and navigation functions (`rank`, `dense_rank`, `lag`, `lead`, and so on) are not yet available.
+Turso implements the SQLite window function feature set: the default frame (RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) plus custom `ROWS`, `RANGE`, and `GROUPS` frames with the `EXCLUDE` clause; the ranking functions `row_number()`, `rank()`, `dense_rank()`, `percent_rank()`, `cume_dist()`, and `ntile()`; the value functions `first_value()`, `last_value()`, and `nth_value()`; the navigational functions `lag()` and `lead()`; and the `FILTER (WHERE ...)` clause. See [Window Functions](/docs/sql-reference/functions/window) for details.
 </Info>
 
 ## Set Operations
