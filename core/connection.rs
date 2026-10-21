@@ -376,6 +376,12 @@ pub struct Connection {
     pub(super) database_schemas: RwLock<HashMap<usize, Arc<Schema>>>,
     /// Whether to automatically commit transaction
     pub(crate) auto_commit: AtomicBool,
+    /// When the current root statement started, in microseconds since the
+    /// Unix epoch.
+    pub(super) statement_start_micros: AtomicI64,
+    /// When the current transaction started, in microseconds since the Unix
+    /// epoch: the start of BEGIN, or of the statement in autocommit mode.
+    pub(super) transaction_start_micros: AtomicI64,
     pub(super) transaction_state: AtomicTransactionState,
     /// True when an unfinished write statement inside an explicit transaction
     /// was reset or dropped and there was no statement savepoint to undo only
@@ -2863,6 +2869,28 @@ impl Connection {
         self.auto_commit.load(Ordering::SeqCst)
     }
 
+    /// Remember when a root statement started. In autocommit mode the
+    /// statement also starts a transaction.
+    pub(crate) fn record_statement_start(&self, now: crate::io::clock::WallClockInstant) {
+        let micros = now.secs * 1_000_000 + i64::from(now.micros);
+        self.statement_start_micros.store(micros, Ordering::SeqCst);
+        if self.get_auto_commit() {
+            self.transaction_start_micros
+                .store(micros, Ordering::SeqCst);
+        }
+    }
+
+    /// When the current root statement started.
+    pub fn statement_start_time(&self) -> std::time::SystemTime {
+        time_from_micros(self.statement_start_micros.load(Ordering::SeqCst))
+    }
+
+    /// When the current transaction started: the start of BEGIN, or of the
+    /// statement in autocommit mode.
+    pub fn transaction_start_time(&self) -> std::time::SystemTime {
+        time_from_micros(self.transaction_start_micros.load(Ordering::SeqCst))
+    }
+
     /// Mark the active explicit transaction poisoned so COMMIT rolls it back.
     ///
     /// This is used when a write statement under BEGIN is abandoned before it
@@ -5121,6 +5149,14 @@ fn function_from_row(row: &crate::Row) -> Result<crate::schema::FunctionDef> {
     })
 }
 
+fn time_from_micros(micros: i64) -> std::time::SystemTime {
+    crate::io::clock::WallClockInstant {
+        secs: micros.div_euclid(1_000_000),
+        micros: micros.rem_euclid(1_000_000) as u32,
+    }
+    .to_system_time()
+}
+
 #[cfg(all(test, feature = "fs"))]
 mod tests {
     use super::*;
@@ -5194,6 +5230,26 @@ mod tests {
         let catalog = conn.attached_databases.read();
         let entry = catalog.index_to_data.get(&index).unwrap();
         (entry.db.clone(), entry.pager.clone())
+    }
+
+    #[test]
+    fn transaction_start_time_is_the_start_of_begin() {
+        let dir = TempDir::new().unwrap();
+        let conn = open_connection(&dir.path().join("start-times.db"));
+        conn.execute("CREATE TABLE t (x)").unwrap();
+        conn.execute("BEGIN").unwrap();
+        let begin = conn.transaction_start_time();
+        std::thread::sleep(std::time::Duration::from_millis(2));
+
+        conn.execute("INSERT INTO t VALUES (1)").unwrap();
+        assert_eq!(conn.transaction_start_time(), begin);
+        assert!(conn.statement_start_time() > begin);
+
+        conn.execute("COMMIT").unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        conn.execute("INSERT INTO t VALUES (2)").unwrap();
+        assert!(conn.transaction_start_time() > begin);
+        assert_eq!(conn.transaction_start_time(), conn.statement_start_time());
     }
 
     #[test]
