@@ -1,5 +1,6 @@
 use chumsky::{error::EmptyErr, prelude::*};
 use std::borrow::Cow;
+use std::collections::HashMap;
 use std::num::NonZero;
 use std::str;
 use std::sync::{Arc, Mutex};
@@ -30,6 +31,8 @@ struct PgConnectionInner {
 struct SessionState {
     search_path: Option<Vec<String>>,
     search_path_setting: Option<String>,
+    /// The values of the variables of the compiled PL/pgSQL triggers, by key.
+    trigger_variables: HashMap<String, Value>,
 }
 
 type PgSessionState = Mutex<SessionState>;
@@ -491,6 +494,31 @@ pub(crate) fn set_search_path(conn: &Connection, value: Option<&str>) -> Result<
     Ok(Value::build_text(
         value.unwrap_or(DEFAULT_SEARCH_PATH).to_owned(),
     ))
+}
+
+pub(crate) fn set_trigger_variable(conn: &Connection, key: &str, value: Value) -> Result<()> {
+    session_state(conn)?
+        .lock()
+        .unwrap()
+        .trigger_variables
+        .insert(key.to_string(), value);
+    Ok(())
+}
+
+pub(crate) fn trigger_variable(conn: &Connection, key: &str) -> Result<Value> {
+    Ok(session_state(conn)?
+        .lock()
+        .unwrap()
+        .trigger_variables
+        .get(key)
+        .cloned()
+        .unwrap_or(Value::Null))
+}
+
+fn session_state(conn: &Connection) -> Result<&PgSessionState> {
+    conn.context::<PgSessionState>().ok_or_else(|| {
+        LimboError::InvalidArgument("PostgreSQL session state is not initialized".to_string())
+    })
 }
 
 pub(crate) fn search_path_setting(conn: &Connection) -> Option<String> {

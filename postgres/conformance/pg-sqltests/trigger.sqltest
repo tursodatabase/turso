@@ -804,3 +804,15 @@ test set-updated-at-trigger-fires-for-the-update-of-an-upsert {
 expect {
     b|updated
 }
+
+@skip-if postgres "the variables of compiled triggers exist only in tursopg"
+test trigger-variables-keep-typed-values-in-the-session {
+    SELECT __pl_set('a key', 42);
+    SELECT __pl_get('a key') + 1;
+    SELECT coalesce(__pl_get('a missing key'), 'missing');
+}
+expect {
+    42
+    43
+    missing
+}

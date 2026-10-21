@@ -1,11 +1,18 @@
 use crate::ast_walk::{walk_stmt_exprs_mut, walk_tree_mut};
+use crate::session::{set_trigger_variable, trigger_variable};
 use crate::trigger::{parse_trigger_definition, postgres_schema_name, trigger_definition};
 use crate::user_function::{Language, UserFunction};
 use pg_query::protobuf::node::Node;
 use serde_json::Value as Json;
+use std::sync::Arc;
 use turso_core::dialect::{ChangedColumn, FunctionCatalog, TriggerBody};
+use turso_core::native_ext::{FunctionArity, ScalarCall, ScalarFunction};
 use turso_core::schema::{BTreeTable, Trigger};
-use turso_core::{walk_expr, LimboError, Result, WalkControl};
+use turso_core::types::IOResultOr;
+use turso_core::{
+    walk_expr, Connection, ExternalFunc, IOResult, LimboError, OpenOptions, Register, Result,
+    Value, WalkControl,
+};
 use turso_parser::ast;
 use turso_pg_parser::translator::{call_name, PostgreSQLTranslator};
 
@@ -86,6 +93,29 @@ pub(crate) fn compile_trigger(
         changed_columns: compiler.changed_columns,
     }))
 }
+
+/// Register `__pl_set(key, value)` and `__pl_get(key)`, which keep the values
+/// of the variables of the compiled triggers in the session.
+pub(crate) fn register_trigger_variable_functions(mut options: OpenOptions) -> OpenOptions {
+    for (name, arg_count, function) in [
+        (SET_VARIABLE, 2, TriggerVariableFunction::Set),
+        (GET_VARIABLE, 1, TriggerVariableFunction::Get),
+    ] {
+        options = options.extension_function(
+            ExternalFunc::new_native_scalar(
+                name.to_string(),
+                FunctionArity::Exact(arg_count),
+                false,
+                function,
+            )
+            .expect("the trigger variable functions have valid argument counts"),
+        );
+    }
+    options
+}
+
+const SET_VARIABLE: &str = "__pl_set";
+const GET_VARIABLE: &str = "__pl_get";
 
 struct TriggerConstants {
     op: &'static str,
@@ -500,6 +530,42 @@ enum Record {
     New,
     Old,
     Null,
+}
+
+/// `__pl_set(key, value)` stores a value and returns it. `__pl_get(key)`
+/// returns the stored value, or NULL.
+#[derive(Debug, Clone, Copy)]
+enum TriggerVariableFunction {
+    Set,
+    Get,
+}
+
+impl ScalarFunction for TriggerVariableFunction {
+    type Call = Self;
+
+    fn create_call(&self) -> Result<Self::Call> {
+        Ok(*self)
+    }
+}
+
+impl ScalarCall for TriggerVariableFunction {
+    fn step(&mut self, connection: &Arc<Connection>, args: &[Register]) -> IOResultOr<Value> {
+        let Value::Text(key) = args[0].get_value() else {
+            return Err(LimboError::InvalidArgument(
+                "the key of a trigger variable must be text".to_string(),
+            )
+            .into());
+        };
+        let value = match self {
+            Self::Set => {
+                let value = args[1].get_value().clone();
+                set_trigger_variable(connection, key.as_str(), value.clone())?;
+                value
+            }
+            Self::Get => trigger_variable(connection, key.as_str())?,
+        };
+        Ok(IOResult::Done(value))
+    }
 }
 
 fn statement_description(kind: &str) -> &str {
