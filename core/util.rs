@@ -10,6 +10,7 @@ use crate::translate::plan::{
 use crate::translate::planner::parse_row_id;
 use crate::types::IOResult;
 use crate::types::IOResultOr;
+use crate::vdbe::affinity::Affinity;
 use crate::IO;
 use crate::{
     schema::{Column, Schema, Table, Type},
@@ -145,11 +146,44 @@ pub fn identifier_token_for_error(name: &turso_parser::ast::Name) -> String {
     }
 }
 
-/// Format a CHECK constraint's captured source text for an error message the
-/// way SQLite does. SQLite dequotes the text: when it starts with a quote
-/// character, only the first quoted token survives, so `"x" < +5` is
-/// reported as just `x`.
-pub fn check_source_for_error(source: &str) -> String {
+/// Returns a column's declared type from its type name the way SQLite's
+/// `sqlite3AddColumn` does: a name that starts with a quote and has no other
+/// quote characters before its last character loses its first and last
+/// characters, so `[x] INT` becomes `x] IN`. Other names go through [dequote].
+pub fn column_declared_type(type_name: &str) -> String {
+    match strip_type_name_quotes(type_name) {
+        Some(stripped) => stripped.to_string(),
+        None => dequote(type_name),
+    }
+}
+
+pub fn strip_type_name_quotes(type_name: &str) -> Option<&str> {
+    let is_quote = |b: &u8| matches!(b, b'"' | b'\'' | b'[' | b'`');
+    let bytes = type_name.as_bytes();
+    if bytes.len() >= 3 && is_quote(&bytes[0]) && !bytes[1..bytes.len() - 1].iter().any(is_quote) {
+        let mut chars = type_name.chars();
+        chars.next();
+        chars.next_back();
+        return Some(chars.as_str());
+    }
+    None
+}
+
+/// Returns true when a STRICT table accepts the written type name without a
+/// custom type. Like SQLite, quotes are only removed when they wrap the whole
+/// name, so `"INT"` is built in but `"INT" X` is not.
+pub fn is_builtin_strict_type(written_type_name: &str) -> bool {
+    let name = strip_type_name_quotes(written_type_name).unwrap_or(written_type_name);
+    turso_macros::match_ignore_ascii_case!(match name.as_bytes() {
+        b"INT" | b"INTEGER" | b"REAL" | b"TEXT" | b"BLOB" | b"ANY" => true,
+        _ => false,
+    })
+}
+
+/// Removes the quotes around the start of `source` the way SQLite's
+/// `sqlite3Dequote` does: when it starts with a quote character, only the
+/// first quoted token survives, so `"x" < +5` becomes just `x`.
+pub fn dequote(source: &str) -> String {
     let bytes = source.as_bytes();
     let close = match bytes.first() {
         Some(&c @ (b'"' | b'\'' | b'`')) => c,
@@ -181,7 +215,7 @@ pub fn check_source_for_error(source: &str) -> String {
 /// as the user wrote it with quotes stripped, keeping any database prefix.
 /// `SELECT * FROM main."T1"` reports the missing table as `main.T1`.
 pub fn table_name_for_error(name: &turso_parser::ast::QualifiedName) -> String {
-    match &name.db_name {
+    match &name.namespace {
         Some(db) => format!("{}.{}", db.as_str(), name.name.as_str()),
         None => name.name.as_str().to_owned(),
     }
@@ -307,24 +341,25 @@ pub fn parse_schema_rows(
         .take()
         .expect("ParseSchemaRowsState not initialized");
     let has_mv_store = inner.rows.mv_store().is_some();
-    schema.populate_indices(
+    schema.populate_materialized_views_then_indices(
         syms,
-        inner.from_sql_indexes,
-        inner.automatic_indices,
-        has_mv_store,
-    )?;
-    schema.populate_materialized_views(
         inner.materialized_view_info,
         inner.dbsp_state_roots,
         inner.dbsp_state_index_roots,
+        inner.from_sql_indexes,
+        inner.automatic_indices,
+        has_mv_store,
     )?;
 
     Ok(IOResult::Done(()))
 }
 
 fn cmp_numeric_strings(num_str: &str, other: &str) -> bool {
-    fn parse(s: &str) -> Option<Either<i64, f64>> {
-        if let Ok(i) = s.parse::<i64>() {
+    // i128 rather than i64: an integer literal such as 9223372036854775808 does not
+    // fit in i64 but becomes the integer i64::MIN under unary minus, so it must not
+    // compare equal to the float 9.223372036854776e18.
+    fn parse(s: &str) -> Option<Either<i128, f64>> {
+        if let Ok(i) = s.parse::<i128>() {
             Some(Either::Left(i))
         } else if let Ok(f) = s.parse::<f64>() {
             Some(Either::Right(f))
@@ -1015,6 +1050,16 @@ pub(crate) fn type_from_name(type_name: &str) -> (Type, bool) {
     (Type::Numeric, false)
 }
 
+/// Older Turso versions kept the quotes of `"INTEGER"`, `'INTEGER'` and
+/// `` `INTEGER` `` when deciding whether an INTEGER PRIMARY KEY column is a
+/// rowid alias, and only removed the brackets of `[INTEGER]`. Existing
+/// databases depend on that, because a column that is not a rowid alias is
+/// stored in the record and has an automatic index.
+pub(crate) fn is_rowid_alias_type(written_type_name: &str) -> bool {
+    written_type_name.eq_ignore_ascii_case("INTEGER")
+        || written_type_name.eq_ignore_ascii_case("[INTEGER]")
+}
+
 pub fn columns_from_create_table_body(
     body: &turso_parser::ast::CreateTableBody,
 ) -> crate::Result<Vec<Column>> {
@@ -1597,6 +1642,152 @@ impl ViewColumnSchema {
             .map(|vc| vc.column.clone())
             .collect()
     }
+
+    /// Name the view's columns from the column list of `CREATE VIEW v(x, y)`.
+    pub fn rename_columns(&mut self, names: &[ast::IndexedColumn]) {
+        for (view_column, name) in self.columns.iter_mut().zip(names) {
+            // as_str: Display would render the quoted form, embedding literal
+            // quote characters in the name
+            view_column.column.name = Some(name.col_name.as_str().to_string());
+        }
+    }
+}
+
+/// Walk all expressions in a statement, including subqueries.
+pub fn walk_stmt_expressions<F>(stmt: &ast::Stmt, func: &mut F) -> Result<()>
+where
+    F: FnMut(&ast::Expr) -> Result<WalkControl>,
+{
+    match stmt {
+        ast::Stmt::Select(select) => walk_select_expressions_inner(select, func)?,
+        ast::Stmt::Insert {
+            with,
+            body,
+            returning,
+            ..
+        } => {
+            walk_with_expressions(with.as_ref(), func)?;
+            if let ast::InsertBody::Select(select, upsert) = body {
+                walk_select_expressions_inner(select, func)?;
+                let mut upsert = upsert.as_deref();
+                while let Some(clause) = upsert {
+                    if let Some(index) = &clause.index {
+                        for target in &index.targets {
+                            walk_expr_with_subqueries(&target.expr, func)?;
+                        }
+                        if let Some(where_clause) = &index.where_clause {
+                            walk_expr_with_subqueries(where_clause, func)?;
+                        }
+                    }
+                    if let ast::UpsertDo::Set { sets, where_clause } = &clause.do_clause {
+                        for set in sets {
+                            walk_expr_with_subqueries(&set.expr, func)?;
+                        }
+                        if let Some(where_clause) = where_clause {
+                            walk_expr_with_subqueries(where_clause, func)?;
+                        }
+                    }
+                    upsert = clause.next.as_deref();
+                }
+            }
+            walk_result_column_expressions(returning, func)?;
+        }
+        ast::Stmt::Update(update) => {
+            walk_with_expressions(update.with.as_ref(), func)?;
+            for set in &update.sets {
+                walk_expr_with_subqueries(&set.expr, func)?;
+            }
+            if let Some(from_clause) = &update.from {
+                walk_from_clause_expressions(from_clause, func)?;
+            }
+            if let Some(where_clause) = &update.where_clause {
+                walk_expr_with_subqueries(where_clause, func)?;
+            }
+            walk_result_column_expressions(&update.returning, func)?;
+        }
+        ast::Stmt::Delete {
+            with,
+            where_clause,
+            returning,
+            ..
+        } => {
+            walk_with_expressions(with.as_ref(), func)?;
+            if let Some(where_clause) = where_clause {
+                walk_expr_with_subqueries(where_clause, func)?;
+            }
+            walk_result_column_expressions(returning, func)?;
+        }
+        ast::Stmt::Attach { expr, db_name, key } => {
+            walk_expr_with_subqueries(expr, func)?;
+            walk_expr_with_subqueries(db_name, func)?;
+            if let Some(key) = key {
+                walk_expr_with_subqueries(key, func)?;
+            }
+        }
+        ast::Stmt::Detach { name } => walk_expr_with_subqueries(name, func)?,
+        ast::Stmt::Vacuum { into, .. } => {
+            if let Some(into) = into {
+                walk_expr_with_subqueries(into, func)?;
+            }
+        }
+        ast::Stmt::Pragma { body, .. } => {
+            if let Some(ast::PragmaBody::Equals(value) | ast::PragmaBody::Call(value)) = body {
+                walk_expr_with_subqueries(value, func)?;
+            }
+        }
+        ast::Stmt::CreateTable {
+            body: ast::CreateTableBody::AsSelect(select),
+            ..
+        } => walk_select_expressions_inner(select, func)?,
+        ast::Stmt::AlterTable(_)
+        | ast::Stmt::Analyze { .. }
+        | ast::Stmt::Begin { .. }
+        | ast::Stmt::Commit { .. }
+        | ast::Stmt::CreateIndex { .. }
+        | ast::Stmt::CreateTable { .. }
+        | ast::Stmt::CreateTrigger { .. }
+        | ast::Stmt::CreateView { .. }
+        | ast::Stmt::CreateMaterializedView { .. }
+        | ast::Stmt::CreateVirtualTable(_)
+        | ast::Stmt::CreateType { .. }
+        | ast::Stmt::CreateDomain { .. }
+        | ast::Stmt::DropIndex { .. }
+        | ast::Stmt::DropTable { .. }
+        | ast::Stmt::DropTrigger { .. }
+        | ast::Stmt::DropView { .. }
+        | ast::Stmt::DropType { .. }
+        | ast::Stmt::DropDomain { .. }
+        | ast::Stmt::Reindex { .. }
+        | ast::Stmt::Release { .. }
+        | ast::Stmt::Rollback { .. }
+        | ast::Stmt::Savepoint { .. }
+        | ast::Stmt::Optimize { .. }
+        | ast::Stmt::CreateSequence { .. }
+        | ast::Stmt::DropSequence { .. } => {}
+    }
+    Ok(())
+}
+
+fn walk_with_expressions<F>(with: Option<&ast::With>, func: &mut F) -> Result<()>
+where
+    F: FnMut(&ast::Expr) -> Result<WalkControl>,
+{
+    for cte in with.iter().flat_map(|with| &with.ctes) {
+        walk_select_expressions_inner(&cte.select, func)?;
+    }
+    Ok(())
+}
+
+fn walk_result_column_expressions<F>(columns: &[ast::ResultColumn], func: &mut F) -> Result<()>
+where
+    F: FnMut(&ast::Expr) -> Result<WalkControl>,
+{
+    for column in columns {
+        if let ast::ResultColumn::Expr(expr, _) = column {
+            walk_expr_with_subqueries(expr, func)?;
+        }
+    }
+    Ok(())
 }
 
 /// Walk all expressions in a SELECT statement, including subqueries.
@@ -1611,11 +1802,7 @@ fn walk_select_expressions_inner<F>(select: &ast::Select, func: &mut F) -> Resul
 where
     F: FnMut(&ast::Expr) -> Result<WalkControl>,
 {
-    if let Some(with_clause) = &select.with {
-        for cte in &with_clause.ctes {
-            walk_select_expressions_inner(&cte.select, func)?;
-        }
-    }
+    walk_with_expressions(select.with.as_ref(), func)?;
 
     walk_one_select_expressions(&select.body.select, func)?;
     for compound in &select.body.compounds {
@@ -1649,11 +1836,7 @@ where
             window_clause,
             ..
         } => {
-            for col in columns {
-                if let ast::ResultColumn::Expr(expr, _) = col {
-                    walk_expr_with_subqueries(expr, func)?;
-                }
-            }
+            walk_result_column_expressions(columns, func)?;
 
             if let Some(from_clause) = from {
                 walk_from_clause_expressions(from_clause, func)?;
@@ -1710,7 +1893,7 @@ where
     F: FnMut(&ast::Expr) -> Result<WalkControl>,
 {
     match select_table {
-        ast::SelectTable::Select(select, _) => walk_select_expressions_inner(select, func),
+        ast::SelectTable::Select { select, .. } => walk_select_expressions_inner(select, func),
         ast::SelectTable::Sub(from_clause, _) => walk_from_clause_expressions(from_clause, func),
         ast::SelectTable::TableCall(_, args, _) => {
             for arg in args {
@@ -1829,7 +2012,7 @@ fn reject_cross_db_qualified_name(
     qualified_name: &ast::QualifiedName,
     view_db_name: Option<&ast::Name>,
 ) -> Result<()> {
-    if let Some(table_db_name) = &qualified_name.db_name {
+    if let Some(table_db_name) = &qualified_name.namespace {
         let is_cross_db = match view_db_name {
             Some(view_db) => !view_db
                 .as_str()
@@ -1853,7 +2036,7 @@ fn validate_select_table_no_cross_db(
         ast::SelectTable::Table(name, _, _) | ast::SelectTable::TableCall(name, _, _) => {
             reject_cross_db_qualified_name(name, view_db_name)?;
         }
-        ast::SelectTable::Select(select, _) => {
+        ast::SelectTable::Select { select, .. } => {
             validate_no_cross_db_references(select, view_db_name)?;
         }
         ast::SelectTable::Sub(from_clause, _) => {
@@ -1941,7 +2124,7 @@ fn view_source_from_select_table(
                 .clone()
                 .map_or_else(|| vec![table_name.clone()], |alias| vec![alias]);
 
-            if name.db_name.is_none() {
+            if name.namespace.is_none() {
                 if let Some(cte) = ctes.get(&table_name) {
                     return Ok(ViewSource {
                         qualifiers,
@@ -1954,7 +2137,10 @@ fn view_source_from_select_table(
             let table_index = tables.len();
             tables.push(ViewTable {
                 name: table_name.clone(),
-                db_name: name.db_name.as_ref().map(|db| normalize_ident(db.as_str())),
+                db_name: name
+                    .namespace
+                    .as_ref()
+                    .map(|db| normalize_ident(db.as_str())),
                 alias: table_alias,
             });
             let table = schema.get_table(&table_name);
@@ -1981,7 +2167,7 @@ fn view_source_from_select_table(
                 join_info: None,
             })
         }
-        ast::SelectTable::Select(select, alias) => {
+        ast::SelectTable::Select { select, alias, .. } => {
             let derived = extract_view_columns_inner(select, schema, ctes)?;
             Ok(ViewSource {
                 qualifiers: alias
@@ -1997,7 +2183,10 @@ fn view_source_from_select_table(
             match &mut source_table {
                 ast::SelectTable::Table(_, source_alias, _)
                 | ast::SelectTable::TableCall(_, _, source_alias, ..)
-                | ast::SelectTable::Select(_, source_alias)
+                | ast::SelectTable::Select {
+                    alias: source_alias,
+                    ..
+                }
                 | ast::SelectTable::Sub(_, source_alias) => source_alias.clone_from(alias),
             }
             view_source_from_select_table(&source_table, schema, ctes, tables)
@@ -2022,7 +2211,10 @@ fn view_source_from_select_table(
             let table_index = tables.len();
             tables.push(ViewTable {
                 name: table_name.clone(),
-                db_name: name.db_name.as_ref().map(|db| normalize_ident(db.as_str())),
+                db_name: name
+                    .namespace
+                    .as_ref()
+                    .map(|db| normalize_ident(db.as_str())),
                 alias: table_alias,
             });
             let columns = schema
@@ -2148,6 +2340,7 @@ fn view_sources_from_clause(
                     ast::JoinOperator::TypedJoin(Some(join_type))
                         if join_type.contains(ast::JoinType::CROSS)
                 ),
+                lateral: false,
             }),
             ..right
         });
@@ -2297,16 +2490,7 @@ fn extract_view_columns_inner(
     schema: &Schema,
     outer_ctes: &HashMap<String, ViewColumnSchema>,
 ) -> Result<ViewColumnSchema> {
-    let mut ctes = outer_ctes.clone();
-    if let Some(with) = &select_stmt.with {
-        for cte in &with.ctes {
-            let mut derived = extract_view_columns_inner(&cte.select, schema, &ctes)?;
-            for (column, explicit_name) in derived.columns.iter_mut().zip(&cte.columns) {
-                column.column.name = Some(explicit_name.col_name.as_str().to_string());
-            }
-            ctes.insert(normalize_ident(cte.tbl_name.as_str()), derived);
-        }
-    }
+    let ctes = extract_cte_columns(&select_stmt.with, schema, outer_ctes)?;
 
     let mut tables = Vec::new();
     let mut columns = Vec::new();
@@ -2330,38 +2514,13 @@ fn extract_view_columns_inner(
     for result_column in select_columns {
         match result_column {
             ast::ResultColumn::Expr(expr, alias) => {
-                let source_column = match expr.as_ref() {
-                    ast::Expr::Qualified(qualifier, column_name) => sources
-                        .iter()
-                        .find(|source| {
-                            source
-                                .qualifiers
-                                .iter()
-                                .any(|candidate| candidate.eq_ignore_ascii_case(qualifier.as_str()))
-                        })
-                        .and_then(|source| {
-                            source.columns.iter().find(|column| {
-                                view_column_name(column).is_some_and(|candidate| {
-                                    candidate.eq_ignore_ascii_case(column_name.as_str())
-                                })
-                            })
-                        })
-                        .map(view_output_column),
-                    ast::Expr::Id(column_name) => {
-                        resolve_view_column(&sources, column_name.as_str())
-                    }
-                    _ => None,
-                };
                 let name = alias
                     .as_ref()
                     .filter(|alias| !matches!(alias, ast::As::ImplicitColumnName(_)))
                     .map(|alias| alias.name().as_str().to_string())
                     .or_else(|| extract_column_name_from_expr(expr))
                     .unwrap_or_else(|| expr.to_string());
-                let mut column = source_column.unwrap_or_else(|| ViewColumn {
-                    table_index: usize::MAX,
-                    column: Column::new_default_text(None, "TEXT".to_string(), None),
-                });
+                let mut column = view_result_column(expr, &sources);
                 column.column.name = Some(name);
                 deduplicate_view_column_name(&mut column, &mut column_name_counts);
                 columns.push(column);
@@ -2406,6 +2565,108 @@ fn extract_view_columns_inner(
     }
 
     Ok(ViewColumnSchema { tables, columns })
+}
+
+pub(crate) fn extract_cte_columns(
+    with: &Option<ast::With>,
+    schema: &Schema,
+    outer_ctes: &HashMap<String, ViewColumnSchema>,
+) -> Result<HashMap<String, ViewColumnSchema>> {
+    let mut ctes = outer_ctes.clone();
+    for cte in with.iter().flat_map(|with| &with.ctes) {
+        let mut derived = extract_view_columns_inner(&cte.select, schema, &ctes)?;
+        for (column, explicit_name) in derived.columns.iter_mut().zip(&cte.columns) {
+            column.column.name = Some(explicit_name.col_name.as_str().to_string());
+        }
+        ctes.insert(normalize_ident(cte.tbl_name.as_str()), derived);
+    }
+    Ok(ctes)
+}
+
+pub(crate) fn select_table_column_names(
+    select_table: &ast::SelectTable,
+    schema: &Schema,
+    ctes: &HashMap<String, ViewColumnSchema>,
+) -> Result<Vec<String>> {
+    let source = view_source_from_select_table(select_table, schema, ctes, &mut Vec::new())?;
+    Ok(source
+        .columns
+        .iter()
+        .filter_map(view_column_name)
+        .map(normalize_ident)
+        .collect())
+}
+
+fn view_result_column(expr: &ast::Expr, sources: &[ViewSource]) -> ViewColumn {
+    if let Some(column) = view_referenced_column(expr, sources) {
+        return column;
+    }
+    let ty_str = view_affinity_type_name(view_expression_affinity(expr, sources));
+    let (ty, _) = type_from_name(ty_str);
+    ViewColumn {
+        table_index: usize::MAX,
+        column: Column::new(
+            None,
+            ty_str.to_string(),
+            None,
+            None,
+            ty,
+            None,
+            ColDef::default(),
+        ),
+    }
+}
+
+fn view_referenced_column(expr: &ast::Expr, sources: &[ViewSource]) -> Option<ViewColumn> {
+    match expr {
+        ast::Expr::Parenthesized(exprs) if exprs.len() == 1 => {
+            view_referenced_column(&exprs[0], sources)
+        }
+        ast::Expr::Id(column_name) => resolve_view_column(sources, column_name.as_str()),
+        ast::Expr::Qualified(qualifier, column_name) => sources
+            .iter()
+            .find(|source| {
+                source
+                    .qualifiers
+                    .iter()
+                    .any(|candidate| candidate.eq_ignore_ascii_case(qualifier.as_str()))
+            })
+            .and_then(|source| {
+                source.columns.iter().find(|column| {
+                    view_column_name(column).is_some_and(|candidate| {
+                        candidate.eq_ignore_ascii_case(column_name.as_str())
+                    })
+                })
+            })
+            .map(view_output_column),
+        _ => None,
+    }
+}
+
+fn view_expression_affinity(expr: &ast::Expr, sources: &[ViewSource]) -> Affinity {
+    match expr {
+        ast::Expr::Parenthesized(exprs) if exprs.len() == 1 => {
+            view_expression_affinity(&exprs[0], sources)
+        }
+        ast::Expr::Collate(inner, _) => view_expression_affinity(inner, sources),
+        ast::Expr::Cast { type_name, .. } => {
+            Affinity::affinity(type_name.as_ref().map_or("", |type_name| &type_name.name))
+        }
+        _ => view_referenced_column(expr, sources).map_or(Affinity::None, |column| {
+            Affinity::affinity(&column.column.ty_str)
+        }),
+    }
+}
+
+fn view_affinity_type_name(affinity: Affinity) -> &'static str {
+    match affinity {
+        Affinity::None => "",
+        Affinity::Blob => "BLOB",
+        Affinity::Integer => "INT",
+        Affinity::Real => "REAL",
+        Affinity::Text => "TEXT",
+        Affinity::Numeric => "NUM",
+    }
 }
 
 /// Extract column information from a SELECT statement for view creation.
@@ -2485,101 +2746,6 @@ pub fn rename_identifiers(expr: &mut ast::Expr, from: &str, to: &str) {
                 {
                     let tbl = tbl.clone();
                     *e = ast::Expr::Qualified(tbl, ast::Name::exact(to.to_owned()));
-                }
-                _ => {}
-            }
-            Ok(WalkControl::Continue)
-        },
-    );
-}
-
-/// Like `rename_identifiers` but scope-aware: only renames qualified refs
-/// (e.g. `t1.b`) when the qualifier matches the target table or is NEW/OLD
-/// (which always refer to the trigger's owning table). Unqualified refs
-/// are renamed unconditionally (caller must ensure they're in the right scope).
-/// Also enters Subquery/Exists/InSelect expressions that walk_expr_mut skips.
-pub fn rename_identifiers_scoped(
-    expr: &mut ast::Expr,
-    target_table: &str,
-    trigger_table: &str,
-    from: &str,
-    to: &str,
-) {
-    rename_identifiers_scoped_inner(expr, target_table, trigger_table, from, to, true, None);
-}
-
-/// Rename column references in a trigger WHEN clause.
-/// Only renames qualified NEW.col / OLD.col references — bare column names
-/// are invalid in WHEN clauses per SQLite semantics and must not be renamed.
-pub fn rename_identifiers_scoped_when_clause(
-    expr: &mut ast::Expr,
-    target_table: &str,
-    trigger_table: &str,
-    from: &str,
-    to: &str,
-) {
-    rename_identifiers_scoped_inner(expr, target_table, trigger_table, from, to, false, None);
-}
-
-/// Inner implementation with `rename_unqualified` flag controlling whether bare `Expr::Id`
-/// references should be renamed. When `false`, only qualified refs (table.col, NEW.col, OLD.col)
-/// are renamed — used when the enclosing SELECT's FROM clause does NOT reference the target table.
-fn rename_identifiers_scoped_inner(
-    expr: &mut ast::Expr,
-    target_table: &str,
-    trigger_table: &str,
-    from: &str,
-    to: &str,
-    rename_unqualified: bool,
-    target_qualifiers: Option<&[String]>,
-) {
-    let is_renaming_trigger_table = target_table.eq_ignore_ascii_case(trigger_table);
-    let _ = walk_expr_mut(
-        expr,
-        &mut |e: &mut ast::Expr| -> crate::Result<WalkControl> {
-            match e {
-                ast::Expr::Subquery(select) | ast::Expr::Exists(select) => {
-                    let mut quals = target_qualifiers.unwrap_or(&[]).to_vec();
-                    rewrite_select_column_refs_scoped(
-                        select,
-                        target_table,
-                        trigger_table,
-                        from,
-                        to,
-                        &mut quals,
-                    );
-                }
-                ast::Expr::InSelect { rhs, .. } => {
-                    let mut quals = target_qualifiers.unwrap_or(&[]).to_vec();
-                    rewrite_select_column_refs_scoped(
-                        rhs,
-                        target_table,
-                        trigger_table,
-                        from,
-                        to,
-                        &mut quals,
-                    );
-                    // lhs will be walked by walk_expr_mut
-                }
-                ast::Expr::Id(ref name) | ast::Expr::Name(ref name)
-                    if rename_unqualified && name.as_str().eq_ignore_ascii_case(from) =>
-                {
-                    *e = ast::Expr::Id(ast::Name::exact(to.to_owned()));
-                }
-                ast::Expr::Qualified(ref tbl, ref col_name)
-                    if col_name.as_str().eq_ignore_ascii_case(from) =>
-                {
-                    let tbl_norm = normalize_ident(tbl.as_str());
-                    let should_rename = if tbl_norm == "new" || tbl_norm == "old" {
-                        is_renaming_trigger_table
-                    } else {
-                        target_qualifiers.is_some_and(|qualifiers| qualifiers.contains(&tbl_norm))
-                            || tbl_norm.eq_ignore_ascii_case(target_table)
-                    };
-                    if should_rename {
-                        let tbl = tbl.clone();
-                        *e = ast::Expr::Qualified(tbl, ast::Name::exact(to.to_owned()));
-                    }
                 }
                 _ => {}
             }
@@ -3101,7 +3267,7 @@ mod rename_column_view {
             ast::SelectTable::Table(tbl_name, alias, _) => {
                 let table_name_norm = normalize_ident(tbl_name.name.as_str());
                 let table_db_norm = tbl_name
-                    .db_name
+                    .namespace
                     .as_ref()
                     .map(|db| normalize_ident(db.as_str()));
                 let mut qualifiers = Vec::new();
@@ -3184,10 +3350,25 @@ mod rename_column_view {
                     db_name: table_db_norm,
                 })
             }
-            ast::SelectTable::Select(select, alias) => {
+            ast::SelectTable::Select {
+                select,
+                alias,
+                lateral,
+            } => {
                 let before_cols = select_output_columns(select, ctx, false)?;
-                *changed |=
-                    rewrite_view_select_for_column_rename(select, ctx, &[], visiting_views)?;
+                let lateral_scopes: Vec<&[ViewSourceInfo]> = if *lateral {
+                    std::iter::once(visible_sources)
+                        .chain(outer_scopes.iter().copied())
+                        .collect()
+                } else {
+                    Vec::new()
+                };
+                *changed |= rewrite_view_select_for_column_rename(
+                    select,
+                    ctx,
+                    &lateral_scopes,
+                    visiting_views,
+                )?;
                 let after_cols = select_output_columns(select, ctx, true)?;
                 let rename_map = build_rename_map(&before_cols, &after_cols, &ctx.old_column_norm);
                 let qualifiers = alias
@@ -3868,1226 +4049,6 @@ fn one_select_has_explicit_alias(one_select: &ast::OneSelect, name: &str) -> boo
     })
 }
 
-/// Scope-aware version of `rewrite_select_column_refs` that checks table qualifiers.
-fn rewrite_select_column_refs_scoped(
-    select: &mut ast::Select,
-    target_table: &str,
-    trigger_table: &str,
-    old_col: &str,
-    new_col: &str,
-    target_qualifiers: &mut Vec<String>,
-) {
-    if let Some(with_clause) = &mut select.with {
-        for cte in &mut with_clause.ctes {
-            rewrite_select_column_refs_scoped(
-                &mut cte.select,
-                target_table,
-                trigger_table,
-                old_col,
-                new_col,
-                target_qualifiers,
-            );
-        }
-    }
-
-    rewrite_one_select_column_refs_scoped(
-        &mut select.body.select,
-        target_table,
-        trigger_table,
-        old_col,
-        new_col,
-        target_qualifiers,
-    );
-    for compound in &mut select.body.compounds {
-        rewrite_one_select_column_refs_scoped(
-            &mut compound.select,
-            target_table,
-            trigger_table,
-            old_col,
-            new_col,
-            target_qualifiers,
-        );
-    }
-    // ORDER BY is in the same scope as the body's FROM
-    let added = match &select.body.select {
-        ast::OneSelect::Select { from, .. } => {
-            let local = from_clause_target_qualifiers(from, target_table);
-            extend_qualifiers_scoped(target_qualifiers, &local)
-        }
-        _ => 0,
-    };
-    let rename_unqualified =
-        !target_qualifiers.is_empty() || target_table.eq_ignore_ascii_case(trigger_table);
-    // Per SQLite's ORDER BY resolution rules, a bare identifier matching an
-    // output column alias is treated as that alias, not as a FROM-clause
-    // column reference. Such a reference must not be rewritten — the alias
-    // label is independent of the renamed table column.
-    let body = &select.body;
-    for col in &mut select.order_by {
-        if is_order_by_alias_ref(body, &col.expr, old_col) {
-            continue;
-        }
-        rename_identifiers_scoped_inner(
-            &mut col.expr,
-            target_table,
-            trigger_table,
-            old_col,
-            new_col,
-            rename_unqualified,
-            Some(target_qualifiers),
-        );
-    }
-    if let Some(limit) = &mut select.limit {
-        rename_identifiers_scoped_inner(
-            &mut limit.expr,
-            target_table,
-            trigger_table,
-            old_col,
-            new_col,
-            rename_unqualified,
-            Some(target_qualifiers),
-        );
-        if let Some(offset) = &mut limit.offset {
-            rename_identifiers_scoped_inner(
-                offset,
-                target_table,
-                trigger_table,
-                old_col,
-                new_col,
-                rename_unqualified,
-                Some(target_qualifiers),
-            );
-        }
-    }
-    target_qualifiers.truncate(target_qualifiers.len() - added);
-}
-
-fn from_clause_target_qualifiers(
-    from: &Option<ast::FromClause>,
-    target_table: &str,
-) -> Vec<String> {
-    match from {
-        Some(from_clause) => from_clause_target_qualifiers_inner(from_clause, target_table),
-        None => Vec::new(),
-    }
-}
-
-fn from_clause_target_qualifiers_inner(
-    from_clause: &ast::FromClause,
-    target_table: &str,
-) -> Vec<String> {
-    let target_table = normalize_ident(target_table);
-    let mut qualifiers = Vec::new();
-    let mut seen = HashSet::default();
-    collect_target_qualifiers(
-        &from_clause.select,
-        &target_table,
-        &mut qualifiers,
-        &mut seen,
-    );
-    for join in &from_clause.joins {
-        collect_target_qualifiers(&join.table, &target_table, &mut qualifiers, &mut seen);
-    }
-    qualifiers
-}
-
-fn collect_target_qualifiers(
-    st: &ast::SelectTable,
-    target_table: &str,
-    qualifiers: &mut Vec<String>,
-    seen: &mut HashSet<String>,
-) {
-    let ast::SelectTable::Table(name, alias, _) = st else {
-        return;
-    };
-    if !name.name.as_str().eq_ignore_ascii_case(target_table) {
-        return;
-    }
-
-    if seen.insert(target_table.to_string()) {
-        qualifiers.push(target_table.to_string());
-    }
-    if let Some(alias) = alias {
-        let alias_norm = normalize_ident(alias.name().as_str());
-        if seen.insert(alias_norm.clone()) {
-            qualifiers.push(alias_norm);
-        }
-    }
-}
-
-fn rewrite_one_select_column_refs_scoped(
-    one: &mut ast::OneSelect,
-    target_table: &str,
-    trigger_table: &str,
-    old_col: &str,
-    new_col: &str,
-    target_qualifiers: &mut Vec<String>,
-) {
-    match one {
-        ast::OneSelect::Select {
-            from,
-            where_clause,
-            columns,
-            group_by,
-            window_clause,
-            ..
-        } => {
-            // Check if FROM clause references the target table to determine
-            // whether unqualified Expr::Id should be renamed in this scope
-            let local = from_clause_target_qualifiers(from, target_table);
-            let added = extend_qualifiers_scoped(target_qualifiers, &local);
-
-            let rename_unqualified =
-                !target_qualifiers.is_empty() || target_table.eq_ignore_ascii_case(trigger_table);
-
-            if let Some(ref mut from) = from {
-                rewrite_from_clause_column_refs_scoped(
-                    from,
-                    target_table,
-                    trigger_table,
-                    old_col,
-                    new_col,
-                    target_qualifiers,
-                );
-            }
-            if let Some(ref mut wc) = where_clause {
-                rename_identifiers_scoped_inner(
-                    wc,
-                    target_table,
-                    trigger_table,
-                    old_col,
-                    new_col,
-                    rename_unqualified,
-                    Some(target_qualifiers),
-                );
-            }
-            for col in columns {
-                if let ast::ResultColumn::Expr(ref mut expr, _) = col {
-                    rename_result_identifiers_scoped(
-                        expr,
-                        target_table,
-                        trigger_table,
-                        old_col,
-                        new_col,
-                        rename_unqualified,
-                        Some(target_qualifiers),
-                    );
-                }
-            }
-            if let Some(ref mut gb) = group_by {
-                for expr in &mut gb.exprs {
-                    rename_identifiers_scoped_inner(
-                        expr,
-                        target_table,
-                        trigger_table,
-                        old_col,
-                        new_col,
-                        rename_unqualified,
-                        Some(target_qualifiers),
-                    );
-                }
-                if let Some(ref mut having) = gb.having {
-                    rename_identifiers_scoped_inner(
-                        having,
-                        target_table,
-                        trigger_table,
-                        old_col,
-                        new_col,
-                        rename_unqualified,
-                        Some(target_qualifiers),
-                    );
-                }
-            }
-            for window_def in window_clause {
-                rewrite_window_column_refs_scoped(
-                    &mut window_def.window,
-                    target_table,
-                    trigger_table,
-                    old_col,
-                    new_col,
-                    target_qualifiers,
-                );
-            }
-            target_qualifiers.truncate(target_qualifiers.len() - added);
-        }
-        ast::OneSelect::Values(rows) => {
-            for row in rows {
-                for expr in row {
-                    rename_identifiers_scoped(expr, target_table, trigger_table, old_col, new_col);
-                }
-            }
-        }
-    }
-}
-
-fn rename_result_identifiers_scoped(
-    expr: &mut ast::Expr,
-    target_table: &str,
-    trigger_table: &str,
-    from: &str,
-    to: &str,
-    rename_unqualified: bool,
-    target_qualifiers: Option<&[String]>,
-) {
-    let is_renaming_trigger_table = target_table.eq_ignore_ascii_case(trigger_table);
-
-    let _ = walk_expr_mut(
-        expr,
-        &mut |e: &mut ast::Expr| -> crate::Result<WalkControl> {
-            match e {
-                ast::Expr::Exists(_) => return Ok(WalkControl::SkipChildren),
-                ast::Expr::Subquery(select) => {
-                    let mut quals = target_qualifiers.unwrap_or(&[]).to_vec();
-                    rewrite_select_column_refs_scoped(
-                        select,
-                        target_table,
-                        trigger_table,
-                        from,
-                        to,
-                        &mut quals,
-                    );
-                }
-                ast::Expr::InSelect { rhs, .. } => {
-                    let mut quals = target_qualifiers.unwrap_or(&[]).to_vec();
-                    rewrite_select_column_refs_scoped(
-                        rhs,
-                        target_table,
-                        trigger_table,
-                        from,
-                        to,
-                        &mut quals,
-                    );
-                }
-                ast::Expr::Id(ref name) | ast::Expr::Name(ref name)
-                    if rename_unqualified && name.as_str().eq_ignore_ascii_case(from) =>
-                {
-                    *e = ast::Expr::Id(ast::Name::exact(to.to_owned()));
-                }
-                ast::Expr::Qualified(ref tbl, ref col_name)
-                    if col_name.as_str().eq_ignore_ascii_case(from) =>
-                {
-                    let tbl_norm = normalize_ident(tbl.as_str());
-                    let should_rename = if tbl_norm == "new" || tbl_norm == "old" {
-                        is_renaming_trigger_table
-                    } else {
-                        target_qualifiers.is_some_and(|qualifiers| qualifiers.contains(&tbl_norm))
-                            || tbl_norm.eq_ignore_ascii_case(target_table)
-                    };
-                    if should_rename {
-                        let tbl = tbl.clone();
-                        *e = ast::Expr::Qualified(tbl, ast::Name::exact(to.to_owned()));
-                    }
-                }
-                _ => {}
-            }
-            Ok(WalkControl::Continue)
-        },
-    );
-}
-
-fn rewrite_window_column_refs_scoped(
-    window: &mut ast::Window,
-    target_table: &str,
-    trigger_table: &str,
-    old_col: &str,
-    new_col: &str,
-    visible_target_qualifiers: &[String],
-) {
-    let rename_unqualified =
-        !visible_target_qualifiers.is_empty() || target_table.eq_ignore_ascii_case(trigger_table);
-
-    for expr in &mut window.partition_by {
-        rename_identifiers_scoped_inner(
-            expr,
-            target_table,
-            trigger_table,
-            old_col,
-            new_col,
-            rename_unqualified,
-            Some(visible_target_qualifiers),
-        );
-    }
-    for sorted_col in &mut window.order_by {
-        rename_identifiers_scoped_inner(
-            &mut sorted_col.expr,
-            target_table,
-            trigger_table,
-            old_col,
-            new_col,
-            rename_unqualified,
-            Some(visible_target_qualifiers),
-        );
-    }
-}
-
-fn rewrite_from_clause_column_refs_scoped(
-    from: &mut ast::FromClause,
-    target_table: &str,
-    trigger_table: &str,
-    old_col: &str,
-    new_col: &str,
-    target_qualifiers: &mut Vec<String>,
-) {
-    let local = from_clause_target_qualifiers_inner(from, target_table);
-    let added = extend_qualifiers_scoped(target_qualifiers, &local);
-
-    let rename_unqualified =
-        !target_qualifiers.is_empty() || target_table.eq_ignore_ascii_case(trigger_table);
-
-    rewrite_select_table_entry_column_refs_scoped(
-        &mut from.select,
-        target_table,
-        trigger_table,
-        old_col,
-        new_col,
-        target_qualifiers,
-    );
-    for join in &mut from.joins {
-        rewrite_select_table_entry_column_refs_scoped(
-            &mut join.table,
-            target_table,
-            trigger_table,
-            old_col,
-            new_col,
-            target_qualifiers,
-        );
-        if let Some(ast::JoinConstraint::On(ref mut expr)) = join.constraint {
-            rename_identifiers_scoped_inner(
-                expr,
-                target_table,
-                trigger_table,
-                old_col,
-                new_col,
-                rename_unqualified,
-                Some(target_qualifiers),
-            );
-        }
-    }
-    target_qualifiers.truncate(target_qualifiers.len() - added);
-}
-
-fn rewrite_select_table_entry_column_refs_scoped(
-    st: &mut ast::SelectTable,
-    target_table: &str,
-    trigger_table: &str,
-    old_col: &str,
-    new_col: &str,
-    target_qualifiers: &mut Vec<String>,
-) {
-    match st {
-        ast::SelectTable::TableCall(_, ref mut args, _) => {
-            for arg in args {
-                rename_identifiers_scoped_inner(
-                    arg,
-                    target_table,
-                    trigger_table,
-                    old_col,
-                    new_col,
-                    true,
-                    Some(target_qualifiers),
-                );
-            }
-        }
-        ast::SelectTable::Select(ref mut select, _) => {
-            rewrite_select_column_refs_scoped(
-                select,
-                target_table,
-                trigger_table,
-                old_col,
-                new_col,
-                target_qualifiers,
-            );
-        }
-        ast::SelectTable::Sub(ref mut from, _) => {
-            rewrite_from_clause_column_refs_scoped(
-                from,
-                target_table,
-                trigger_table,
-                old_col,
-                new_col,
-                target_qualifiers,
-            );
-        }
-        ast::SelectTable::Table(..) => {}
-    }
-}
-
-/// Push `local` qualifiers that are not already present in `qualifiers`.
-/// Returns the number of elements added so the caller can truncate afterwards (backtracking).
-fn extend_qualifiers_scoped(qualifiers: &mut Vec<String>, local: &[String]) -> usize {
-    let before = qualifiers.len();
-    for qualifier in local {
-        if !qualifiers.iter().any(|q| q == qualifier) {
-            qualifiers.push(qualifier.clone());
-        }
-    }
-    qualifiers.len() - before
-}
-
-fn expr_still_references_renamed_column(
-    expr: &ast::Expr,
-    target_table: &str,
-    trigger_table: &str,
-    old_col: &str,
-    rename_unqualified: bool,
-    visible_target_qualifiers: &[String],
-) -> bool {
-    let mut found = false;
-
-    let _ = walk_expr(expr, &mut |e: &ast::Expr| -> crate::Result<WalkControl> {
-        if found {
-            return Ok(WalkControl::Continue);
-        }
-
-        match e {
-            ast::Expr::Subquery(select) | ast::Expr::Exists(select) => {
-                let mut quals = visible_target_qualifiers.to_vec();
-                found = select_still_references_renamed_column(
-                    select,
-                    target_table,
-                    trigger_table,
-                    old_col,
-                    &mut quals,
-                );
-            }
-            ast::Expr::InSelect { rhs, .. } => {
-                let mut quals = visible_target_qualifiers.to_vec();
-                found = select_still_references_renamed_column(
-                    rhs,
-                    target_table,
-                    trigger_table,
-                    old_col,
-                    &mut quals,
-                );
-            }
-            ast::Expr::Qualified(ns, col) | ast::Expr::DoublyQualified(_, ns, col) => {
-                if col.as_str().eq_ignore_ascii_case(old_col) {
-                    let ns_norm = normalize_ident(ns.as_str());
-                    if ((ns_norm == "new" || ns_norm == "old")
-                        && target_table.eq_ignore_ascii_case(trigger_table))
-                        || visible_target_qualifiers.contains(&ns_norm)
-                        || (target_table.eq_ignore_ascii_case(trigger_table)
-                            && ns_norm.eq_ignore_ascii_case(trigger_table))
-                    {
-                        found = true;
-                    }
-                }
-            }
-            ast::Expr::Id(name) | ast::Expr::Name(name) => {
-                if rename_unqualified && name.as_str().eq_ignore_ascii_case(old_col) {
-                    found = true;
-                }
-            }
-            _ => {}
-        }
-        Ok(WalkControl::Continue)
-    });
-
-    found
-}
-
-fn one_select_still_references_renamed_column(
-    one: &ast::OneSelect,
-    target_table: &str,
-    trigger_table: &str,
-    old_col: &str,
-    target_qualifiers: &mut Vec<String>,
-) -> bool {
-    match one {
-        ast::OneSelect::Select {
-            from,
-            where_clause,
-            columns,
-            group_by,
-            ..
-        } => {
-            let local = from_clause_target_qualifiers(from, target_table);
-            let added = extend_qualifiers_scoped(target_qualifiers, &local);
-
-            let rename_unqualified =
-                !target_qualifiers.is_empty() || target_table.eq_ignore_ascii_case(trigger_table);
-
-            let mut found = false;
-            if let Some(from_clause) = from {
-                if from_clause_still_references_renamed_column(
-                    from_clause,
-                    target_table,
-                    trigger_table,
-                    old_col,
-                    target_qualifiers,
-                ) {
-                    found = true;
-                }
-            }
-
-            if !found {
-                if let Some(where_expr) = where_clause {
-                    if expr_still_references_renamed_column(
-                        where_expr,
-                        target_table,
-                        trigger_table,
-                        old_col,
-                        rename_unqualified,
-                        target_qualifiers,
-                    ) {
-                        found = true;
-                    }
-                }
-            }
-
-            if !found {
-                for col in columns {
-                    if let ast::ResultColumn::Expr(expr, _) = col {
-                        if expr_still_references_renamed_column(
-                            expr,
-                            target_table,
-                            trigger_table,
-                            old_col,
-                            rename_unqualified,
-                            target_qualifiers,
-                        ) {
-                            found = true;
-                            break;
-                        }
-                    }
-                }
-            }
-
-            if !found {
-                if let Some(group_by) = group_by {
-                    for expr in &group_by.exprs {
-                        if expr_still_references_renamed_column(
-                            expr,
-                            target_table,
-                            trigger_table,
-                            old_col,
-                            rename_unqualified,
-                            target_qualifiers,
-                        ) {
-                            found = true;
-                            break;
-                        }
-                    }
-                    if !found {
-                        if let Some(having) = &group_by.having {
-                            if expr_still_references_renamed_column(
-                                having,
-                                target_table,
-                                trigger_table,
-                                old_col,
-                                rename_unqualified,
-                                target_qualifiers,
-                            ) {
-                                found = true;
-                            }
-                        }
-                    }
-                }
-            }
-
-            target_qualifiers.truncate(target_qualifiers.len() - added);
-            found
-        }
-        ast::OneSelect::Values(rows) => {
-            for row in rows {
-                for expr in row {
-                    if expr_still_references_renamed_column(
-                        expr,
-                        target_table,
-                        trigger_table,
-                        old_col,
-                        true,
-                        target_qualifiers,
-                    ) {
-                        return true;
-                    }
-                }
-            }
-            false
-        }
-    }
-}
-
-fn select_still_references_renamed_column(
-    select: &ast::Select,
-    target_table: &str,
-    trigger_table: &str,
-    old_col: &str,
-    target_qualifiers: &mut Vec<String>,
-) -> bool {
-    if let Some(with_clause) = &select.with {
-        for cte in &with_clause.ctes {
-            if select_still_references_renamed_column(
-                &cte.select,
-                target_table,
-                trigger_table,
-                old_col,
-                target_qualifiers,
-            ) {
-                return true;
-            }
-        }
-    }
-
-    if one_select_still_references_renamed_column(
-        &select.body.select,
-        target_table,
-        trigger_table,
-        old_col,
-        target_qualifiers,
-    ) {
-        return true;
-    }
-
-    for compound in &select.body.compounds {
-        if one_select_still_references_renamed_column(
-            &compound.select,
-            target_table,
-            trigger_table,
-            old_col,
-            target_qualifiers,
-        ) {
-            return true;
-        }
-    }
-
-    // ORDER BY is in the same scope as the body's FROM
-    let added = match &select.body.select {
-        ast::OneSelect::Select { from, .. } => {
-            let local = from_clause_target_qualifiers(from, target_table);
-            extend_qualifiers_scoped(target_qualifiers, &local)
-        }
-        _ => 0,
-    };
-    let rename_unqualified =
-        !target_qualifiers.is_empty() || target_table.eq_ignore_ascii_case(trigger_table);
-
-    // Bare identifiers in ORDER BY that match an output column alias are
-    // alias references, not FROM-clause column references, so they don't
-    // count as a stale reference to the renamed column.
-    let body = &select.body;
-
-    let mut found = false;
-    for sorted_col in &select.order_by {
-        if is_order_by_alias_ref(body, &sorted_col.expr, old_col) {
-            continue;
-        }
-        if expr_still_references_renamed_column(
-            &sorted_col.expr,
-            target_table,
-            trigger_table,
-            old_col,
-            rename_unqualified,
-            target_qualifiers,
-        ) {
-            found = true;
-            break;
-        }
-    }
-
-    if !found {
-        if let Some(limit) = &select.limit {
-            if expr_still_references_renamed_column(
-                &limit.expr,
-                target_table,
-                trigger_table,
-                old_col,
-                rename_unqualified,
-                target_qualifiers,
-            ) {
-                found = true;
-            }
-            if !found {
-                if let Some(offset) = &limit.offset {
-                    if expr_still_references_renamed_column(
-                        offset,
-                        target_table,
-                        trigger_table,
-                        old_col,
-                        rename_unqualified,
-                        target_qualifiers,
-                    ) {
-                        found = true;
-                    }
-                }
-            }
-        }
-    }
-
-    target_qualifiers.truncate(target_qualifiers.len() - added);
-    found
-}
-
-fn select_table_still_references_renamed_column(
-    st: &ast::SelectTable,
-    target_table: &str,
-    trigger_table: &str,
-    old_col: &str,
-    target_qualifiers: &mut Vec<String>,
-) -> bool {
-    match st {
-        ast::SelectTable::TableCall(_, args, _) => args.iter().any(|arg| {
-            expr_still_references_renamed_column(
-                arg,
-                target_table,
-                trigger_table,
-                old_col,
-                true,
-                target_qualifiers,
-            )
-        }),
-        ast::SelectTable::Select(select, _) => select_still_references_renamed_column(
-            select,
-            target_table,
-            trigger_table,
-            old_col,
-            target_qualifiers,
-        ),
-        ast::SelectTable::Sub(from, _) => from_clause_still_references_renamed_column(
-            from,
-            target_table,
-            trigger_table,
-            old_col,
-            target_qualifiers,
-        ),
-        ast::SelectTable::Table(..) => false,
-    }
-}
-
-fn from_clause_still_references_renamed_column(
-    from: &ast::FromClause,
-    target_table: &str,
-    trigger_table: &str,
-    old_col: &str,
-    target_qualifiers: &mut Vec<String>,
-) -> bool {
-    let local = from_clause_target_qualifiers_inner(from, target_table);
-    let added = extend_qualifiers_scoped(target_qualifiers, &local);
-
-    let rename_unqualified =
-        !target_qualifiers.is_empty() || target_table.eq_ignore_ascii_case(trigger_table);
-
-    let mut found = false;
-    if select_table_still_references_renamed_column(
-        &from.select,
-        target_table,
-        trigger_table,
-        old_col,
-        target_qualifiers,
-    ) {
-        found = true;
-    }
-
-    if !found {
-        for join in &from.joins {
-            if select_table_still_references_renamed_column(
-                &join.table,
-                target_table,
-                trigger_table,
-                old_col,
-                target_qualifiers,
-            ) {
-                found = true;
-                break;
-            }
-            if let Some(ast::JoinConstraint::On(expr)) = &join.constraint {
-                if expr_still_references_renamed_column(
-                    expr,
-                    target_table,
-                    trigger_table,
-                    old_col,
-                    rename_unqualified,
-                    target_qualifiers,
-                ) {
-                    found = true;
-                    break;
-                }
-            }
-        }
-    }
-
-    target_qualifiers.truncate(target_qualifiers.len() - added);
-    found
-}
-
-pub fn trigger_still_references_renamed_column(
-    trigger: &crate::schema::Trigger,
-    target_table: &str,
-    old_col: &str,
-) -> bool {
-    if trigger.table_name.eq_ignore_ascii_case(target_table) {
-        if let ast::TriggerEvent::UpdateOf(cols) = &trigger.event {
-            if cols
-                .iter()
-                .any(|col| col.as_str().eq_ignore_ascii_case(old_col))
-            {
-                return true;
-            }
-        }
-    }
-
-    if let Some(when_clause) = &trigger.when_clause {
-        if expr_still_references_renamed_column(
-            when_clause,
-            target_table,
-            &trigger.table_name,
-            old_col,
-            false,
-            &[],
-        ) {
-            return true;
-        }
-    }
-
-    for cmd in &trigger.commands {
-        match cmd {
-            ast::TriggerCmd::Update {
-                tbl_name,
-                sets,
-                from,
-                where_clause,
-                ..
-            } => {
-                let targets_renamed_table = tbl_name.as_str().eq_ignore_ascii_case(target_table);
-                let visible_target_qualifiers = from_clause_target_qualifiers(from, target_table);
-
-                if targets_renamed_table
-                    && sets.iter().any(|set| {
-                        set.col_names
-                            .iter()
-                            .any(|col_name| col_name.as_str().eq_ignore_ascii_case(old_col))
-                    })
-                {
-                    return true;
-                }
-
-                for set in sets {
-                    if expr_still_references_renamed_column(
-                        &set.expr,
-                        target_table,
-                        &trigger.table_name,
-                        old_col,
-                        targets_renamed_table,
-                        &visible_target_qualifiers,
-                    ) {
-                        return true;
-                    }
-                }
-
-                if let Some(where_clause) = where_clause {
-                    if expr_still_references_renamed_column(
-                        where_clause,
-                        target_table,
-                        &trigger.table_name,
-                        old_col,
-                        targets_renamed_table,
-                        &visible_target_qualifiers,
-                    ) {
-                        return true;
-                    }
-                }
-
-                if let Some(from_clause) = from {
-                    if from_clause_still_references_renamed_column(
-                        from_clause,
-                        target_table,
-                        &trigger.table_name,
-                        old_col,
-                        &mut Vec::new(),
-                    ) {
-                        return true;
-                    }
-                }
-            }
-            ast::TriggerCmd::Insert {
-                tbl_name,
-                col_names,
-                select,
-                upsert,
-                ..
-            } => {
-                if tbl_name.as_str().eq_ignore_ascii_case(target_table)
-                    && col_names
-                        .iter()
-                        .any(|col_name| col_name.as_str().eq_ignore_ascii_case(old_col))
-                {
-                    return true;
-                }
-
-                if select_still_references_renamed_column(
-                    select,
-                    target_table,
-                    &trigger.table_name,
-                    old_col,
-                    &mut Vec::new(),
-                ) {
-                    return true;
-                }
-
-                if let Some(upsert) = upsert {
-                    if let Some(index) = &upsert.index {
-                        for target in &index.targets {
-                            if expr_still_references_renamed_column(
-                                &target.expr,
-                                target_table,
-                                &trigger.table_name,
-                                old_col,
-                                tbl_name.as_str().eq_ignore_ascii_case(target_table),
-                                &[],
-                            ) {
-                                return true;
-                            }
-                        }
-                        if let Some(where_clause) = &index.where_clause {
-                            if expr_still_references_renamed_column(
-                                where_clause,
-                                target_table,
-                                &trigger.table_name,
-                                old_col,
-                                tbl_name.as_str().eq_ignore_ascii_case(target_table),
-                                &[],
-                            ) {
-                                return true;
-                            }
-                        }
-                    }
-                }
-            }
-            ast::TriggerCmd::Delete {
-                tbl_name,
-                where_clause,
-            } => {
-                if let Some(where_clause) = where_clause {
-                    if expr_still_references_renamed_column(
-                        where_clause,
-                        target_table,
-                        &trigger.table_name,
-                        old_col,
-                        tbl_name.as_str().eq_ignore_ascii_case(target_table),
-                        &[],
-                    ) {
-                        return true;
-                    }
-                }
-            }
-            ast::TriggerCmd::Select(select) => {
-                if select_still_references_renamed_column(
-                    select,
-                    target_table,
-                    &trigger.table_name,
-                    old_col,
-                    &mut Vec::new(),
-                ) {
-                    return true;
-                }
-            }
-        }
-    }
-
-    false
-}
-
-fn rename_excluded_column_refs(expr: &mut ast::Expr, old_col: &str, new_col: &str) {
-    let _ = walk_expr_mut(
-        expr,
-        &mut |e: &mut ast::Expr| -> crate::Result<WalkControl> {
-            if let ast::Expr::Qualified(ns, col) | ast::Expr::DoublyQualified(_, ns, col) = e {
-                if ns.as_str().eq_ignore_ascii_case("excluded")
-                    && col.as_str().eq_ignore_ascii_case(old_col)
-                {
-                    *col = ast::Name::exact(new_col.to_owned());
-                }
-            }
-            Ok(WalkControl::Continue)
-        },
-    );
-}
-
-fn rewrite_upsert_column_refs_scoped(
-    upsert: &mut ast::Upsert,
-    table: &str,
-    trigger_table: &str,
-    insert_table: &str,
-    old_col: &str,
-    new_col: &str,
-) {
-    let insert_targets_renamed_table = insert_table.eq_ignore_ascii_case(table);
-    let rewrite_expr = |expr: &mut ast::Expr| {
-        if insert_targets_renamed_table {
-            rename_identifiers_scoped(expr, table, trigger_table, old_col, new_col);
-            rename_excluded_column_refs(expr, old_col, new_col);
-        } else {
-            rename_identifiers_scoped_when_clause(expr, table, trigger_table, old_col, new_col);
-        }
-    };
-
-    if let Some(ref mut index) = upsert.index {
-        for target in &mut index.targets {
-            rewrite_expr(&mut target.expr);
-        }
-        if let Some(ref mut wc) = index.where_clause {
-            rewrite_expr(wc);
-        }
-    }
-    if let ast::UpsertDo::Set {
-        ref mut sets,
-        ref mut where_clause,
-    } = upsert.do_clause
-    {
-        for set in sets {
-            if insert_targets_renamed_table {
-                for col_name in &mut set.col_names {
-                    if col_name.as_str().eq_ignore_ascii_case(old_col) {
-                        *col_name = ast::Name::exact(new_col.to_owned());
-                    }
-                }
-            }
-            rewrite_expr(&mut set.expr);
-        }
-        if let Some(ref mut wc) = where_clause {
-            rewrite_expr(wc);
-        }
-    }
-    if let Some(ref mut next) = upsert.next {
-        rewrite_upsert_column_refs_scoped(
-            next,
-            table,
-            trigger_table,
-            insert_table,
-            old_col,
-            new_col,
-        );
-    }
-}
-
-/// Rewrite column references inside a trigger's body commands for ALTER TABLE RENAME COLUMN.
-/// Uses scope-aware renaming: only renames qualified refs when the qualifier matches
-/// the target table (or NEW/OLD for the trigger's owning table).
-pub fn rewrite_trigger_cmd_column_refs(
-    cmd: &mut ast::TriggerCmd,
-    table: &str,
-    trigger_table: &str,
-    old_col: &str,
-    new_col: &str,
-) {
-    match cmd {
-        ast::TriggerCmd::Update {
-            tbl_name,
-            sets,
-            from,
-            where_clause,
-            ..
-        } => {
-            let targets_renamed_table = tbl_name.as_str().eq_ignore_ascii_case(table);
-            if targets_renamed_table {
-                for set in sets {
-                    for col_name in &mut set.col_names {
-                        if col_name.as_str().eq_ignore_ascii_case(old_col) {
-                            *col_name = ast::Name::exact(new_col.to_owned());
-                        }
-                    }
-                    rename_identifiers_scoped(
-                        &mut set.expr,
-                        table,
-                        trigger_table,
-                        old_col,
-                        new_col,
-                    );
-                }
-                if let Some(ref mut wc) = where_clause {
-                    rename_identifiers_scoped(wc, table, trigger_table, old_col, new_col);
-                }
-            } else {
-                for set in sets {
-                    rename_identifiers_scoped_when_clause(
-                        &mut set.expr,
-                        table,
-                        trigger_table,
-                        old_col,
-                        new_col,
-                    );
-                }
-                if let Some(ref mut wc) = where_clause {
-                    rename_identifiers_scoped_when_clause(
-                        wc,
-                        table,
-                        trigger_table,
-                        old_col,
-                        new_col,
-                    );
-                }
-            }
-            if let Some(ref mut from) = from {
-                rewrite_from_clause_column_refs_scoped(
-                    from,
-                    table,
-                    trigger_table,
-                    old_col,
-                    new_col,
-                    &mut Vec::new(),
-                );
-            }
-        }
-        ast::TriggerCmd::Insert {
-            tbl_name,
-            col_names,
-            select,
-            upsert,
-            ..
-        } => {
-            let targets_renamed_table = tbl_name.as_str().eq_ignore_ascii_case(table);
-            if targets_renamed_table {
-                for col_name in col_names {
-                    if col_name.as_str().eq_ignore_ascii_case(old_col) {
-                        *col_name = ast::Name::exact(new_col.to_owned());
-                    }
-                }
-            }
-            rewrite_select_column_refs_scoped(
-                select,
-                table,
-                trigger_table,
-                old_col,
-                new_col,
-                &mut Vec::new(),
-            );
-            if let Some(ref mut upsert) = upsert {
-                rewrite_upsert_column_refs_scoped(
-                    upsert,
-                    table,
-                    trigger_table,
-                    tbl_name.as_str(),
-                    old_col,
-                    new_col,
-                );
-            }
-        }
-        ast::TriggerCmd::Delete {
-            tbl_name,
-            where_clause,
-        } => {
-            let targets_renamed_table = tbl_name.as_str().eq_ignore_ascii_case(table);
-            if targets_renamed_table {
-                if let Some(ref mut wc) = where_clause {
-                    rename_identifiers_scoped(wc, table, trigger_table, old_col, new_col);
-                }
-            } else if let Some(ref mut wc) = where_clause {
-                rename_identifiers_scoped_when_clause(wc, table, trigger_table, old_col, new_col);
-            }
-        }
-        ast::TriggerCmd::Select(select) => {
-            rewrite_select_column_refs_scoped(
-                select,
-                table,
-                trigger_table,
-                old_col,
-                new_col,
-                &mut Vec::new(),
-            );
-        }
-    }
-}
-
 fn rewrite_select_table_refs(select: &mut ast::Select, old_tbl: &str, new_tbl: &str) {
     if let Some(with_clause) = &mut select.with {
         for cte in &mut with_clause.ctes {
@@ -5175,7 +4136,7 @@ fn rewrite_select_table_entry_table_refs(st: &mut ast::SelectTable, old_tbl: &st
                 rewrite_check_expr_table_refs(arg, old_tbl, new_tbl);
             }
         }
-        ast::SelectTable::Select(ref mut select, _) => {
+        ast::SelectTable::Select { ref mut select, .. } => {
             rewrite_select_table_refs(select, old_tbl, new_tbl);
         }
         ast::SelectTable::Sub(ref mut from, _) => {
@@ -5239,21 +4200,6 @@ pub mod tests {
 
     fn schema_with_table(create_table_sql: &str) -> Schema {
         schema_with_tables(&[create_table_sql])
-    }
-
-    fn parse_select_from(sql: &str) -> Option<ast::FromClause> {
-        let mut parser = Parser::new(sql.as_bytes());
-        let cmd = parser
-            .next_cmd()
-            .expect("test SQL should parse")
-            .expect("test SQL should contain a statement");
-        let ast::Cmd::Stmt(ast::Stmt::Select(select)) = cmd else {
-            panic!("expected SELECT statement");
-        };
-        match select.body.select {
-            ast::OneSelect::Select { from, .. } => from,
-            _ => panic!("expected simple SELECT"),
-        }
     }
 
     #[test]
@@ -5392,45 +4338,10 @@ pub mod tests {
         };
 
         assert_eq!(
-            tbl_name.db_name.as_ref().map(ast::Name::as_str),
+            tbl_name.namespace.as_ref().map(ast::Name::as_str),
             Some("temp")
         );
         assert_eq!(tbl_name.name.as_str(), "new");
-    }
-
-    #[test]
-    fn test_from_clause_target_qualifiers_dedups_case_insensitively() {
-        let from = parse_select_from("SELECT 1 FROM Target AS tgt, target AS TARGET");
-        assert_eq!(
-            from_clause_target_qualifiers(&from, "target"),
-            vec!["target".to_string(), "tgt".to_string()]
-        );
-    }
-
-    #[test]
-    fn test_extend_qualifiers_scoped_preserves_first_seen_order() {
-        let mut qualifiers = vec!["target".to_string(), "outer_alias".to_string()];
-        let local = vec![
-            "outer_alias".to_string(),
-            "local_alias".to_string(),
-            "target".to_string(),
-        ];
-
-        let added = extend_qualifiers_scoped(&mut qualifiers, &local);
-        assert_eq!(
-            qualifiers,
-            vec![
-                "target".to_string(),
-                "outer_alias".to_string(),
-                "local_alias".to_string(),
-            ]
-        );
-        assert_eq!(added, 1);
-        qualifiers.truncate(qualifiers.len() - added);
-        assert_eq!(
-            qualifiers,
-            vec!["target".to_string(), "outer_alias".to_string(),]
-        );
     }
 
     #[test]
@@ -5471,7 +4382,7 @@ pub mod tests {
         };
 
         assert_eq!(
-            tbl_name.db_name.as_ref().map(ast::Name::as_str),
+            tbl_name.namespace.as_ref().map(ast::Name::as_str),
             Some("temp")
         );
         assert_eq!(tbl_name.name.as_str(), "new");

@@ -2,7 +2,6 @@ use super::gencol::compute_virtual_columns;
 use super::TranslateCtx;
 use crate::alloc::{TryClone, TursoIteratorExt};
 use crate::schema::{Column, ColumnLayout, GeneratedType, Table};
-use crate::translate::insert::halt_desc_and_on_error;
 use crate::translate::plan::ColumnMask;
 use crate::translate::stmt_journal::any_effective_replace;
 use crate::vdbe::builder::SelfTableContext;
@@ -470,9 +469,7 @@ pub fn emit_program_for_update(
     )?;
 
     program.preassign_label_to_next_insn(after_main_loop_label);
-    if let Some(cdc_cursor_id) = t_ctx.cdc_cursor_id {
-        emit_cdc_autocommit_commit(program, resolver, cdc_cursor_id)?;
-    }
+    emit_cdc_autocommit_commit(program, resolver, t_ctx.cdc_cursor_id)?;
     // Emit scan-back loop for buffered RETURNING results.
     // All DML is complete at this point; now yield the buffered rows to the caller.
     // FkCheck must come before the scan-back so that FK violations prevent
@@ -601,6 +598,7 @@ fn emit_notnull_constraint_check(
                 target_reg,
                 err_code: SQLITE_CONSTRAINT_NOTNULL,
                 description: description(),
+                on_error: program.constraint_halt_on_error(or_conflict),
             });
         }
         _ => {
@@ -608,6 +606,7 @@ fn emit_notnull_constraint_check(
                 target_reg,
                 err_code: SQLITE_CONSTRAINT_NOTNULL,
                 description: description(),
+                on_error: program.constraint_halt_on_error(or_conflict),
             });
         }
     }
@@ -619,8 +618,8 @@ fn emit_notnull_constraint_check(
 /// read, and propagates a conflict-resolution override when one is in effect:
 /// a `trigger_conflict_override` pushed by an enclosing UPSERT `DO UPDATE`
 /// wins, otherwise the outer UPDATE's explicit `OR <conflict>` overrides the
-/// trigger's own conflict resolution (except for the default `ABORT`, which
-/// is left unset so the trigger's own resolution applies). `after` selects
+/// trigger's own conflict resolution. Without an OR clause the trigger's own
+/// resolution applies. `after` selects
 /// between the BEFORE and AFTER constructors.
 fn update_trigger_context(
     program: &ProgramBuilder,
@@ -630,9 +629,12 @@ fn update_trigger_context(
     or_conflict: ResolveType,
     timing: TriggerTime,
 ) -> TriggerContext {
-    let override_conflict = program
-        .trigger_conflict_override
-        .or_else(|| (!matches!(or_conflict, ResolveType::Abort)).then_some(or_conflict));
+    let override_conflict = program.trigger_conflict_override.or_else(|| {
+        program
+            .flags
+            .has_statement_conflict()
+            .then_some(or_conflict)
+    });
 
     let after = matches!(timing, TriggerTime::After);
     match (after, override_conflict) {
@@ -790,6 +792,9 @@ fn emit_replace_delete<'a>(
 /// This is invoked once for every UPDATE, but will be invoked again if there are
 /// any BEFORE UPDATE triggers that fired, because the triggers may have modified the row,
 /// in which case the previously read values are stale.
+///
+/// Returns whether an unchanged column was read from the table cursor. That read
+/// happens for every row, so it finishes any pending DeferredSeek.
 #[allow(clippy::too_many_arguments)]
 fn emit_update_column_values<'a>(
     program: &mut ProgramBuilder,
@@ -800,8 +805,9 @@ fn emit_update_column_values<'a>(
     skip_set_clauses: bool,
     skip_row_label: BranchOffset,
     skip_notnull_checks: bool,
-) -> crate::Result<()> {
+) -> crate::Result<bool> {
     let or_conflict = program.resolve_type;
+    let mut table_column_was_read = false;
     if let Some(expr) = set_clauses
         .iter()
         .find(|set_clause| set_clause.column_index == ROWID_SENTINEL)
@@ -878,6 +884,7 @@ fn emit_update_column_values<'a>(
                                 column_ctx.layout.clone(),
                             ),
                             table: column_ctx.target_table.table.require_btree()?,
+                            uses_custom_type_operators: false,
                         }),
                         GeneratedType::NotGenerated => None,
                     };
@@ -900,15 +907,13 @@ fn emit_update_column_values<'a>(
                             // Columns with custom type encode must not have their
                             // SET expressions hoisted as constants. See the doc
                             // comment on NoConstantOptReason::CustomTypeEncode.
-                            let has_custom_encode = {
-                                let ty = &table_column.ty_str;
-                                !ty.is_empty()
-                                    && t_ctx
-                                        .resolver
-                                        .schema
-                                        .get_type_def_unchecked(ty)
-                                        .is_some_and(|td| td.encode().is_some())
-                            };
+                            let has_custom_encode = t_ctx
+                                .resolver
+                                .schema
+                                .resolve_type_unchecked(&table_column.ty_str)
+                                .ok()
+                                .flatten()
+                                .is_some_and(|r| r.chain.iter().any(|td| td.encode().is_some()));
                             let translate_result = if has_custom_encode {
                                 translate_expr_no_constant_opt(
                                     program,
@@ -1006,11 +1011,17 @@ fn emit_update_column_values<'a>(
                             .filter(|_| column_idx_in_index.is_some())
                             .map(|(_, id)| *id)
                             .unwrap_or(column_ctx.target_table_cursor_id);
-                        program.emit_column_or_rowid(
+                        table_column_was_read |= cursor_id == column_ctx.target_table_cursor_id;
+                        emit_table_column(
+                            program,
                             cursor_id,
+                            column_ctx.target_table.internal_id,
+                            table_references,
+                            table_column,
                             column_idx_in_index.unwrap_or(idx),
                             target_reg,
-                        );
+                            &t_ctx.resolver,
+                        )?;
                     }
                 }
                 GeneratedType::Virtual { .. } => {
@@ -1030,7 +1041,7 @@ fn emit_update_column_values<'a>(
             }
         }
     }
-    Ok(())
+    Ok(table_column_was_read)
 }
 
 /// Emit NOT NULL constraint checks for SET clause columns after BEFORE triggers have fired.
@@ -1098,7 +1109,6 @@ fn emit_update_insns<'a>(
     returning_buffer: Option<&ReturningBufferCtx>,
     non_from_clause_subqueries: &mut [NonFromClauseSubquery],
 ) -> crate::Result<()> {
-    let update_body_start = program.insns.len();
     let uses_write_set = temp_cursor_id.is_some();
     let iteration_cursor_id = temp_cursor_id.unwrap_or(target_table_cursor_id);
     let or_conflict = program.resolve_type;
@@ -1205,12 +1215,16 @@ fn emit_update_insns<'a>(
         .iter()
         .map(|set_clause| set_clause.column_index)
         .try_collect()?;
+    let updated_column_names: Vec<_> = set_clauses
+        .iter()
+        .flat_map(|set_clause| set_clause.column_names.iter().cloned())
+        .try_collect()?;
     let has_any_update_triggers = if let Some(btree_table) = target_table.table.btree() {
         has_triggers_including_temp(
             &t_ctx.resolver,
             update_database_id,
             TriggerEvent::Update,
-            Some(&updated_column_indices),
+            Some(&updated_column_names),
             &btree_table,
         )
     } else {
@@ -1258,7 +1272,6 @@ fn emit_update_insns<'a>(
             *subquery_plan,
             &subquery.query_type,
             subquery.correlated,
-            false,
         )?;
     }
 
@@ -1278,11 +1291,12 @@ fn emit_update_insns<'a>(
     let layout = ColumnLayout::from_table(&target_table.as_ref().table)?;
     // we allocate 2C registers for "updates" as the structure of this column for CDC table is following:
     // [C boolean values where true set for changed columns] [C values with updates where NULL is set for not-changed columns]
-    let cdc_updates_register = if program.capture_data_changes_info().has_updates() {
-        Some(program.alloc_registers(2 * layout.num_non_virtual_cols()))
-    } else {
-        None
-    };
+    let cdc_updates_register =
+        if t_ctx.cdc_cursor_id.is_some() && program.capture_data_changes_info().has_updates() {
+            Some(program.alloc_registers(2 * layout.num_non_virtual_cols()))
+        } else {
+            None
+        };
     let table_name = target_table.table.get_name();
     let start = if is_virtual_table { beg + 2 } else { beg + 1 };
     let target_btree = target_table.table.btree();
@@ -1337,14 +1351,14 @@ fn emit_update_insns<'a>(
             update_database_id,
             TriggerEvent::Update,
             TriggerTime::Before,
-            Some(updated_column_indices.clone()),
+            Some(&updated_column_names),
             &btree_table,
         ),
         None => Vec::new(),
     };
     let has_before_triggers = !relevant_before_update_triggers.is_empty();
 
-    emit_update_column_values(
+    let table_column_was_read = emit_update_column_values(
         program,
         table_references,
         set_clauses,
@@ -1387,7 +1401,7 @@ fn emit_update_insns<'a>(
                 &t_ctx.resolver,
                 update_database_id,
                 TriggerEvent::Update,
-                Some(&updated_column_indices),
+                Some(&updated_column_names),
                 &btree_table,
             );
 
@@ -1695,15 +1709,10 @@ fn emit_update_insns<'a>(
                 } else {
                     String::from(table_name) + ".rowid"
                 };
-                let (description, on_error) = halt_desc_and_on_error(
-                    &raw_desc,
-                    effective_rowid_alias_conflict,
-                    program.flags.has_statement_conflict(),
-                );
                 program.emit_insn(Insn::Halt {
                     err_code: SQLITE_CONSTRAINT_PRIMARYKEY,
-                    description,
-                    on_error,
+                    description: raw_desc,
+                    on_error: program.constraint_halt_on_error(effective_rowid_alias_conflict),
                     description_reg: None,
                 });
             }
@@ -1878,6 +1887,7 @@ fn emit_update_insns<'a>(
                 &mut column_regs,
                 &bt,
                 new_satisfied_reg,
+                true,
             )?;
 
             // now we have two registers that tell us whether or not the old and new values satisfy
@@ -2062,15 +2072,10 @@ fn emit_update_insns<'a>(
                             accum
                         },
                     );
-                    let (description, on_error) = halt_desc_and_on_error(
-                        &column_names,
-                        idx_conflict,
-                        program.flags.has_statement_conflict(),
-                    );
                     program.emit_insn(Insn::Halt {
                         err_code: SQLITE_CONSTRAINT_UNIQUE,
-                        description,
-                        on_error,
+                        description: column_names,
+                        on_error: program.constraint_halt_on_error(idx_conflict),
                         description_reg: None,
                     });
                 }
@@ -2327,13 +2332,16 @@ fn emit_update_insns<'a>(
             };
 
             // create full CDC record before update if necessary
-            let cdc_before_reg = if program.capture_data_changes_info().has_before() {
+            let cdc_before_reg = if t_ctx.cdc_cursor_id.is_some()
+                && program.capture_data_changes_info().has_before()
+            {
                 Some(emit_cdc_full_record(
                     program,
+                    &t_ctx.resolver,
                     target_table.table.columns(),
                     target_table_cursor_id,
                     cdc_rowid_before_reg.expect("cdc_rowid_before_reg must be set"),
-                ))
+                )?)
             } else {
                 None
             };
@@ -2344,16 +2352,9 @@ fn emit_update_insns<'a>(
             // In MVCC mode, we also need DELETE+INSERT to properly version the row (Hekaton model).
             let needs_delete = not_exists_check_required
                 || connection.mv_store_for_db(update_database_id).is_some();
-            // A table-column read finishes DeferredSeek. SQLite emits FinishSeek
-            // only when no such read appears before the table write.
-            let table_column_was_read =
-                program.insns[update_body_start..].iter().any(|(insn, _)| {
-                    matches!(
-                        insn,
-                        Insn::Column { cursor_id, .. } | Insn::ColumnRange { cursor_id, .. }
-                            if *cursor_id == target_table_cursor_id
-                    )
-                });
+            // Like SQLite, only an unchanged-column read for the new record counts:
+            // other table-column reads, such as the old value for a partial index,
+            // can sit in a branch that some rows skip.
             if target_table.op.index().is_some() && !table_column_was_read {
                 program.emit_insn(Insn::FinishSeek {
                     cursor_id: target_table_cursor_id,
@@ -2384,139 +2385,13 @@ fn emit_update_insns<'a>(
                 table_name: target_table.identifier.clone(),
             });
 
-            // MVCC AUTOINCREMENT: an UPDATE that moves the rowid forward
-            // must advance the implicit sequence past the new rowid, just
-            // like an explicit-rowid INSERT does — otherwise the next
-            // `INSERT … DEFAULT VALUES` would emit a value smaller than
-            // the manually-set rowid and either collide with it or
-            // produce a non-monotonic id.
-            //
-            // emit_disk_advance_past emits a direction-aware seek + a
-            // value comparison + a conditional INSERT into the backing
-            // table. The INSERT key is the value itself (rowid alias),
-            // so two concurrent writers either pick distinct values
-            // (safe) or collide on the watermark key (resolved by the
-            // standard MVCC conflict path).
-            //
-            // WAL mode follows the SQLite contract: UPDATE does not
-            // bump `sqlite_sequence`. The next AUTOINCREMENT INSERT
-            // takes the max of `sqlite_sequence.seq` and `MAX(rowid)`
-            // (see the AUTOINCREMENT allocator in insert.rs) and so
-            // automatically skips past any manually-advanced rowid.
-            if updates_rowid
-                && table.has_autoincrement
-                && connection.mv_store_for_db(update_database_id).is_some()
+            // CDC must capture the row exactly as written by this UPDATE, before any FK
+            // action or AFTER trigger this UPDATE fires can write further CDC rows of
+            // their own (an FK CASCADE/SET NULL/SET DEFAULT action on a child table, or
+            // the AFTER trigger below), so build the full post-update CDC record now.
+            let cdc_after_reg = if t_ctx.cdc_cursor_id.is_some()
+                && program.capture_data_changes_info().has_after()
             {
-                let seq_name = crate::schema::autoincrement_sequence_name(&target_table.identifier);
-                let seq = t_ctx
-                    .resolver
-                    .with_schema(update_database_id, |s| s.get_sequence(&seq_name).cloned())
-                    .ok_or_else(|| {
-                        crate::LimboError::InternalError(format!(
-                            "missing implicit sequence for AUTOINCREMENT table \"{}\"",
-                            target_table.identifier
-                        ))
-                    })?;
-                crate::translate::sequence::emit_disk_advance_past(
-                    program,
-                    &t_ctx.resolver,
-                    update_database_id,
-                    &seq_name,
-                    &seq,
-                    effective_rowid_reg,
-                )?;
-            }
-
-            if connection.foreign_keys_enabled() {
-                emit_fk_parent_deferred_new_key_probes(
-                    program,
-                    &deferred_new_key_plans,
-                    update_database_id,
-                    &t_ctx.resolver,
-                )?;
-            }
-
-            // Fire FK CASCADE/SET NULL actions AFTER the parent row is updated
-            // This ensures the new parent key exists when cascade actions update child rows
-            if has_parent_fk_actions {
-                // OLD column values are stored in preserved_old_registers (contiguous registers)
-                let old_values_start = preserved_old_registers
-                    .as_ref()
-                    .expect("FK check requires OLD values")[0];
-                fire_fk_update_actions(
-                    program,
-                    &mut t_ctx.resolver,
-                    table_name,
-                    beg, // old_rowid_reg
-                    old_values_start,
-                    start, // new_values_start
-                    effective_rowid_reg,
-                    connection,
-                    update_database_id,
-                    &affected_parent_fks,
-                )?;
-            }
-
-            // RETURNING and CDC must capture the row as written by this UPDATE,
-            // before any AFTER trigger runs. SQLite fires its RETURNING pseudo-
-            // trigger ahead of user AFTER triggers, so an AFTER trigger that
-            // rewrites or deletes the row does not change what RETURNING reports.
-            // The AFTER trigger is therefore fired at the end of this block.
-            let has_post_write_returning_subqueries = non_from_clause_subqueries
-                .iter()
-                .any(|s| !s.has_been_evaluated() && s.is_post_write_returning());
-            if has_post_write_returning_subqueries {
-                let cache_state = seed_returning_row_image_in_cache(
-                    program,
-                    table_references,
-                    start,
-                    effective_rowid_reg,
-                    &mut t_ctx.resolver,
-                    &layout,
-                )?;
-                let result: Result<()> = (|| {
-                    // Emit RETURNING subqueries after Insert so correlated references
-                    // resolve against the post-write row image, not the old cursor state.
-                    for subquery in non_from_clause_subqueries
-                        .iter_mut()
-                        .filter(|s| !s.has_been_evaluated() && s.is_post_write_returning())
-                    {
-                        let rerun_for_target_scan = subquery
-                            .reads_table(target_table.database_id, target_table.table.get_name());
-                        let subquery_plan = subquery.consume_plan(EvalAt::Loop(0));
-                        emit_non_from_clause_subquery(
-                            program,
-                            &t_ctx.resolver,
-                            *subquery_plan,
-                            &subquery.query_type,
-                            subquery.correlated || rerun_for_target_scan,
-                            true,
-                        )?;
-                    }
-                    Ok(())
-                })();
-                restore_returning_row_image_in_cache(&mut t_ctx.resolver, cache_state);
-                result?;
-            }
-
-            // Emit RETURNING results if specified
-            if let Some(returning_columns) = &returning {
-                if !returning_columns.is_empty() {
-                    emit_returning_results(
-                        program,
-                        table_references,
-                        returning_columns,
-                        start,
-                        effective_rowid_reg,
-                        &mut t_ctx.resolver,
-                        returning_buffer,
-                        &layout,
-                    )?;
-                }
-            }
-
-            // create full CDC record after update if necessary
-            let cdc_after_reg = if program.capture_data_changes_info().has_after() {
                 Some(emit_cdc_patch_record(
                     program,
                     &target_table.table,
@@ -2592,17 +2467,146 @@ fn emit_update_insns<'a>(
                 }
             }
 
-            // Fire AFTER UPDATE triggers last, after RETURNING and CDC have
-            // captured the row this UPDATE wrote. An AFTER trigger that rewrites
-            // or deletes the row then cannot change what RETURNING reports,
-            // matching SQLite.
+            // MVCC AUTOINCREMENT: an UPDATE that moves the rowid forward
+            // must advance the implicit sequence past the new rowid, just
+            // like an explicit-rowid INSERT does — otherwise the next
+            // `INSERT … DEFAULT VALUES` would emit a value smaller than
+            // the manually-set rowid and either collide with it or
+            // produce a non-monotonic id.
+            //
+            // emit_disk_advance_past emits a direction-aware seek + a
+            // value comparison + a conditional INSERT into the backing
+            // table. The INSERT key is the value itself (rowid alias),
+            // so two concurrent writers either pick distinct values
+            // (safe) or collide on the watermark key (resolved by the
+            // standard MVCC conflict path).
+            //
+            // WAL mode follows the SQLite contract: UPDATE does not
+            // bump `sqlite_sequence`. The next AUTOINCREMENT INSERT
+            // takes the max of `sqlite_sequence.seq` and `MAX(rowid)`
+            // (see the AUTOINCREMENT allocator in insert.rs) and so
+            // automatically skips past any manually-advanced rowid.
+            if updates_rowid
+                && table.has_autoincrement
+                && connection.mv_store_for_db(update_database_id).is_some()
+            {
+                let seq_name = crate::schema::autoincrement_sequence_name(&target_table.identifier);
+                let seq = t_ctx
+                    .resolver
+                    .with_schema(update_database_id, |s| s.get_sequence(&seq_name).cloned())
+                    .ok_or_else(|| {
+                        crate::LimboError::InternalError(format!(
+                            "missing implicit sequence for AUTOINCREMENT table \"{}\"",
+                            target_table.identifier
+                        ))
+                    })?;
+                crate::translate::sequence::emit_disk_advance_past(
+                    program,
+                    &t_ctx.resolver,
+                    update_database_id,
+                    &seq_name,
+                    &seq,
+                    effective_rowid_reg,
+                )?;
+            }
+
+            if connection.foreign_keys_enabled() {
+                emit_fk_parent_deferred_new_key_probes(
+                    program,
+                    &deferred_new_key_plans,
+                    update_database_id,
+                    &t_ctx.resolver,
+                )?;
+            }
+
+            // Fire FK CASCADE/SET NULL actions AFTER the parent row is updated
+            // This ensures the new parent key exists when cascade actions update child rows
+            if has_parent_fk_actions {
+                // OLD column values are stored in preserved_old_registers (contiguous registers)
+                let old_values_start = preserved_old_registers
+                    .as_ref()
+                    .expect("FK check requires OLD values")[0];
+                fire_fk_update_actions(
+                    program,
+                    &mut t_ctx.resolver,
+                    table_name,
+                    beg, // old_rowid_reg
+                    old_values_start,
+                    start, // new_values_start
+                    effective_rowid_reg,
+                    connection,
+                    update_database_id,
+                    &affected_parent_fks,
+                )?;
+            }
+
+            // RETURNING must capture the row as written by this UPDATE, before any AFTER
+            // trigger runs. SQLite fires its RETURNING pseudo-trigger ahead of user AFTER
+            // triggers, so an AFTER trigger that rewrites or deletes the row does not change
+            // what RETURNING reports. The AFTER trigger is therefore fired at the end of this
+            // block. CDC already captured the row right after the write, above.
+            let has_post_write_returning_subqueries = non_from_clause_subqueries
+                .iter()
+                .any(|s| !s.has_been_evaluated() && s.is_post_write_returning());
+            if has_post_write_returning_subqueries {
+                let cache_state = seed_returning_row_image_in_cache(
+                    program,
+                    table_references,
+                    start,
+                    effective_rowid_reg,
+                    &mut t_ctx.resolver,
+                    &layout,
+                )?;
+                let result: Result<()> = (|| {
+                    // Emit RETURNING subqueries after Insert so correlated references
+                    // resolve against the post-write row image, not the old cursor state.
+                    for subquery in non_from_clause_subqueries
+                        .iter_mut()
+                        .filter(|s| !s.has_been_evaluated() && s.is_post_write_returning())
+                    {
+                        let rerun_for_target_scan = subquery
+                            .reads_table(target_table.database_id, target_table.table.get_name());
+                        let subquery_plan = subquery.consume_plan(EvalAt::Loop(0));
+                        emit_non_from_clause_subquery(
+                            program,
+                            &t_ctx.resolver,
+                            *subquery_plan,
+                            &subquery.query_type,
+                            subquery.correlated || rerun_for_target_scan,
+                        )?;
+                    }
+                    Ok(())
+                })();
+                restore_returning_row_image_in_cache(&mut t_ctx.resolver, cache_state);
+                result?;
+            }
+
+            // Emit RETURNING results if specified
+            if let Some(returning_columns) = &returning {
+                if !returning_columns.is_empty() {
+                    emit_returning_results(
+                        program,
+                        table_references,
+                        returning_columns,
+                        start,
+                        effective_rowid_reg,
+                        &mut t_ctx.resolver,
+                        returning_buffer,
+                        &layout,
+                    )?;
+                }
+            }
+
+            // Fire AFTER UPDATE triggers last, after RETURNING has captured the row this
+            // UPDATE wrote. An AFTER trigger that rewrites or deletes the row then cannot
+            // change what RETURNING reports, matching SQLite.
             if let Some(btree_table) = target_table.table.btree() {
                 let relevant_triggers = get_triggers_including_temp(
                     &t_ctx.resolver,
                     update_database_id,
                     TriggerEvent::Update,
                     TriggerTime::After,
-                    Some(updated_column_indices.clone()),
+                    Some(&updated_column_names),
                     &btree_table,
                 );
                 if !relevant_triggers.is_empty() {

@@ -3,7 +3,7 @@ use crate::{
     function::{AccumulatorFunc, AggFunc},
     schema::{
         BTreeTable, ColDef, Column, FromClauseSubquery, Index, ParenthesizedJoinColumnSource,
-        ParenthesizedJoinColumnVisibility, PseudoCursorType, RecursiveCteInput, Schema, Table,
+        ParenthesizedJoinColumnVisibility, PseudoCursorType, RecursiveCteInput, Table,
         ROWID_SENTINEL,
     },
     translate::{
@@ -21,7 +21,7 @@ use crate::{
     util::exprs_are_equivalent,
     vdbe::{
         affinity::{self, Affinity},
-        builder::{CursorKey, CursorType, ProgramBuilder},
+        builder::{CursorKey, CursorType, ProgramBuilder, Subroutine},
         insn::{HashDistinctData, Insn},
         BranchOffset, CursorID,
     },
@@ -861,11 +861,6 @@ pub struct SelectPlan {
     /// When set, this query is a simple aggregate (COUNT(*), MIN, or MAX)
     /// that can be satisfied without a full table scan.
     pub simple_aggregate: Option<SimpleAggregate>,
-    /// Parameters from EXISTS subquery result columns that were dropped during
-    /// semi/anti-join unnesting. These need to be registered in the program's
-    /// parameter list even though no code is emitted for them, so that bind-time
-    /// validation (`has_slot`) succeeds.
-    pub phantom_params: Vec<ast::Variable>,
 }
 
 impl SelectPlan {
@@ -979,6 +974,10 @@ pub struct DeletePlan {
 #[derive(Debug, Clone)]
 pub struct UpdateSetClause {
     pub column_index: usize,
+    /// Names the SET list used for this column, as written. UPDATE OF triggers
+    /// match against these, so `SET rowid` and `SET id` differ even when `id` is
+    /// the INTEGER PRIMARY KEY.
+    pub column_names: Vec<ast::Name>,
     /// Original user-visible SET expression.
     pub expr: Box<ast::Expr>,
     /// In UPDATE FROM, SET clause expressions are rewritten to read from the
@@ -993,9 +992,10 @@ pub struct UpdateSetClause {
 }
 
 impl UpdateSetClause {
-    pub fn new(column_index: usize, expr: Box<ast::Expr>) -> Self {
+    pub fn new(column_index: usize, column_name: ast::Name, expr: Box<ast::Expr>) -> Self {
         Self {
             column_index,
+            column_names: vec![column_name],
             expr,
             update_from_result: None,
         }
@@ -1418,6 +1418,7 @@ pub struct JoinInfo {
     /// When true, the optimizer must not reorder this table relative to its
     /// neighbors. Set for CROSS JOIN to match SQLite semantics.
     pub no_reorder: bool,
+    pub lateral: bool,
 }
 
 impl JoinInfo {
@@ -1467,7 +1468,7 @@ impl JoinInfo {
 
     /// Whether the optimizer must preserve this table's position in the join order.
     pub fn is_ordering_constrained(&self) -> bool {
-        self.is_outer() || self.is_semi_or_anti() || self.no_reorder
+        self.is_outer() || self.is_semi_or_anti() || self.no_reorder || self.lateral
     }
 }
 
@@ -3389,7 +3390,7 @@ impl JoinedTable {
         &self,
         program: &mut ProgramBuilder,
         mode: OperationMode,
-        schema: &Schema,
+        resolver: &Resolver,
     ) -> Result<(Option<CursorID>, Option<CursorID>)> {
         let index = self.op.index();
         match &self.table {
@@ -3420,13 +3421,16 @@ impl JoinedTable {
                         },
                     ))
                 } else {
-                    // Check if this is a materialized view
-                    let cursor_type =
-                        if let Some(view_mutex) = schema.get_materialized_view(&btree.name) {
-                            CursorType::MaterializedView(btree.clone(), view_mutex)
-                        } else {
-                            CursorType::BTreeTable(btree.clone())
-                        };
+                    // Check if this is a materialized view. Must look up the
+                    // schema of the table's own database: a table in an
+                    // attached database can share a name with a materialized
+                    // view in a different database.
+                    let cursor_type = match resolver
+                        .with_schema(self.database_id, |s| s.get_materialized_view(&btree.name))
+                    {
+                        Some(view_mutex) => CursorType::MaterializedView(btree.clone(), view_mutex),
+                        None => CursorType::BTreeTable(btree.clone()),
+                    };
                     Some(program.alloc_cursor_id_keyed_if_not_exists(
                         CursorKey::table(self.internal_id),
                         cursor_type,
@@ -3444,7 +3448,7 @@ impl JoinedTable {
                 Ok((table_cursor_id, index_cursor_id))
             }
             Table::Virtual(virtual_table) => {
-                let table_cursor_id = Some(program.alloc_cursor_id_keyed(
+                let table_cursor_id = Some(program.alloc_cursor_id_keyed_if_not_exists(
                     CursorKey::table(self.internal_id),
                     CursorType::VirtualTable(virtual_table.clone()),
                 ));
@@ -4036,23 +4040,20 @@ pub fn validate_frame_clause(
         exclude,
     } = clause;
 
-    let start_bound = translate_frame_bound(start, /* is_start = */ true)?;
-    let end_bound = match end {
-        Some(b) => translate_frame_bound(b, /* is_start = */ false)?,
-        // No END clause means CURRENT ROW per SQL standard.
-        None => FrameBoundary::CurrentRow,
-    };
+    let start_bound = start.clone();
+    // No END clause means CURRENT ROW per SQL standard.
+    let end_bound = end.clone().unwrap_or(FrameBound::CurrentRow);
 
     // Combinations that can never describe a real frame (start past
     // the end, etc.). SQLite rejects the same set at
     // `window.c:1217-1221`.
     let illegal = matches!(
         (&start_bound, &end_bound),
-        (FrameBoundary::UnboundedFollowing, _)
-            | (_, FrameBoundary::UnboundedPreceding)
-            | (FrameBoundary::CurrentRow, FrameBoundary::Preceding(_))
-            | (FrameBoundary::Following(_), FrameBoundary::Preceding(_))
-            | (FrameBoundary::Following(_), FrameBoundary::CurrentRow)
+        (FrameBound::UnboundedFollowing, _)
+            | (_, FrameBound::UnboundedPreceding)
+            | (FrameBound::CurrentRow, FrameBound::Preceding(_))
+            | (FrameBound::Following(_), FrameBound::Preceding(_))
+            | (FrameBound::Following(_), FrameBound::CurrentRow)
     );
     if illegal {
         crate::bail_parse_error!("unsupported frame specification");
@@ -4064,10 +4065,10 @@ pub fn validate_frame_clause(
     if *mode == FrameMode::Range
         && (matches!(
             &start_bound,
-            FrameBoundary::Preceding(_) | FrameBoundary::Following(_)
+            FrameBound::Preceding(_) | FrameBound::Following(_)
         ) || matches!(
             &end_bound,
-            FrameBoundary::Preceding(_) | FrameBoundary::Following(_)
+            FrameBound::Preceding(_) | FrameBound::Following(_)
         ))
         && order_by_len != 1
     {
@@ -4082,35 +4083,6 @@ pub fn validate_frame_clause(
         end: end_bound,
         exclude: exclude.clone(),
     }))
-}
-
-/// Convert a parser-level `FrameBound` to the planner's `FrameBoundary`,
-/// cloning any offset expression out of the AST for the emit code to
-/// evaluate.
-fn translate_frame_bound(bound: &FrameBound, is_start: bool) -> Result<FrameBoundary> {
-    // The parser enforces start/end orientation: TK_PRECEDING is only
-    // emitted as a start bound, TK_FOLLOWING only as an end bound
-    // (parser.rs: `frame_start_bound` / `frame_end_bound`). Mirrors
-    // SQLite's parser-level guarantee at window.c:1213-1215.
-    match bound {
-        FrameBound::CurrentRow => Ok(FrameBoundary::CurrentRow),
-        FrameBound::UnboundedPreceding => {
-            debug_assert!(
-                is_start,
-                "parser only emits UNBOUNDED PRECEDING as a start bound"
-            );
-            Ok(FrameBoundary::UnboundedPreceding)
-        }
-        FrameBound::UnboundedFollowing => {
-            debug_assert!(
-                !is_start,
-                "parser only emits UNBOUNDED FOLLOWING as an end bound"
-            );
-            Ok(FrameBoundary::UnboundedFollowing)
-        }
-        FrameBound::Preceding(expr) => Ok(FrameBoundary::Preceding(expr.clone())),
-        FrameBound::Following(expr) => Ok(FrameBoundary::Following(expr.clone())),
-    }
 }
 
 /// A named WINDOW clause definition, captured before any function references
@@ -4144,16 +4116,6 @@ pub struct NamedWindowBound {
     pub order_by: Vec<(Expr, SortOrder, Option<ast::NullsOrder>)>,
 }
 
-/// One bound of a window function's effective frame.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum FrameBoundary {
-    UnboundedPreceding,
-    Preceding(Box<Expr>),
-    CurrentRow,
-    Following(Box<Expr>),
-    UnboundedFollowing,
-}
-
 /// A window function's effective frame. The bounds are interpreted per `mode`:
 /// `Rows` counts physical rows, `Range` and `Groups` work over peer groups of
 /// the window's ORDER BY values.
@@ -4162,8 +4124,8 @@ pub enum FrameBoundary {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Frame {
     pub mode: ast::FrameMode,
-    pub start: FrameBoundary,
-    pub end: FrameBoundary,
+    pub start: FrameBound,
+    pub end: FrameBound,
     /// The EXCLUDE clause the user wrote, or `None` if they wrote none.
     ///
     /// `Some(NoOthers)` (an explicit `EXCLUDE NO OTHERS`) excludes
@@ -4179,8 +4141,8 @@ impl Default for Frame {
     fn default() -> Self {
         Self {
             mode: ast::FrameMode::Range,
-            start: FrameBoundary::UnboundedPreceding,
-            end: FrameBoundary::CurrentRow,
+            start: FrameBound::UnboundedPreceding,
+            end: FrameBound::CurrentRow,
             exclude: None,
         }
     }
@@ -4252,6 +4214,10 @@ pub enum SubqueryState {
         /// We keep these so later analysis can still understand dependencies
         /// even after the plan is consumed.
         outer_ref_ids: Vec<TableInternalId>,
+        /// Set when the subquery was emitted as a subroutine that a `Gosub`
+        /// can run again, for example against the NULL row of an aggregate
+        /// query that read no rows.
+        subroutine: Option<Subroutine>,
     },
 }
 
@@ -4367,6 +4333,7 @@ impl NonFromClauseSubquery {
                 self.state = SubqueryState::Evaluated {
                     evaluated_at,
                     outer_ref_ids,
+                    subroutine: None,
                 };
                 plan
             }
@@ -4374,6 +4341,13 @@ impl NonFromClauseSubquery {
                 panic!("subquery has already been evaluated");
             }
         }
+    }
+
+    pub fn set_subroutine(&mut self, new_subroutine: Option<Subroutine>) {
+        let SubqueryState::Evaluated { subroutine, .. } = &mut self.state else {
+            panic!("subquery must be emitted before its subroutine is recorded");
+        };
+        *subroutine = new_subroutine;
     }
 }
 
@@ -4553,8 +4527,22 @@ fn eval_at_for_select_plan(
         }
     }
     for subquery in plan.non_from_clause_subqueries.iter() {
-        let eval_at_inner = subquery.get_eval_at(join_order, table_references)?;
-        eval_at = eval_at.max(eval_at_inner);
+        match &subquery.state {
+            SubqueryState::Unevaluated { .. } => {
+                eval_at = eval_at.max(subquery.get_eval_at(join_order, table_references)?);
+            }
+            // A nested subquery is already emitted when it is inside a pre-materialized CTE.
+            // Its `evaluated_at` is a loop of the nested plan, not of `join_order`.
+            SubqueryState::Evaluated { outer_ref_ids, .. } => {
+                for outer_ref_id in outer_ref_ids {
+                    if let Some(loop_idx) =
+                        resolve_outer_ref_loop(*outer_ref_id, join_order, table_references)
+                    {
+                        eval_at = eval_at.max(EvalAt::Loop(loop_idx));
+                    }
+                }
+            }
+        }
     }
     for joined_table in plan.table_references.joined_tables().iter() {
         if let Table::FromClauseSubquery(from_clause_subquery) = &joined_table.table {

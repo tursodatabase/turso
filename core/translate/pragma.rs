@@ -119,7 +119,7 @@ fn resolve_index_pragma_database_id(
     }
 
     let qualified_name = ast::QualifiedName {
-        db_name: None,
+        namespace: None,
         name: ast::Name::exact(index_name.to_string()),
         alias: None,
     };
@@ -246,7 +246,7 @@ pub fn translate_pragma(
         return Ok(());
     };
 
-    let schema_was_explicit = name.db_name.is_some();
+    let schema_was_explicit = name.namespace.is_some();
     let query_only = connection.get_query_only();
 
     let mode = match body {

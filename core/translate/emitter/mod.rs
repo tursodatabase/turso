@@ -8,8 +8,9 @@ use super::{
         update::emit_program_for_update,
     },
     expr::{
-        bind_and_rewrite_expr, emit_table_column, translate_expr, translate_expr_no_constant_opt,
-        walk_expr, BindingBehavior, NoConstantOptReason, WalkControl,
+        bind_and_rewrite_expr, emit_stored_column, emit_table_column,
+        translate_expr_no_constant_opt, walk_expr, BindingBehavior, NoConstantOptReason,
+        WalkControl,
     },
     group_by::GroupByMetadata,
     main_loop::{LeftJoinMetadata, LoopLabels, RightJoinMetadata, SemiAntiJoinMetadata},
@@ -36,6 +37,7 @@ use crate::vdbe::{
     insn::{to_u32, InsertFlags, Insn},
     BranchOffset, CursorID,
 };
+use crate::NamespaceCatalog;
 use crate::{
     error::SQLITE_CONSTRAINT_CHECK,
     function::Func,
@@ -44,8 +46,7 @@ use crate::{
     util::{
         check_expr_references_column, exprs_are_equivalent, normalize_ident, parse_numeric_literal,
     },
-    CaptureDataChangesExt, Connection, Database, DatabaseCatalog, LimboError, Result, RwLock,
-    SymbolTable,
+    CaptureDataChangesExt, Connection, DatabaseCatalog, LimboError, Result, RwLock, SymbolTable,
 };
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 use std::borrow::Cow;
@@ -138,6 +139,7 @@ pub struct Resolver<'a> {
     database_schemas: &'a RwLock<HashMap<usize, Arc<Schema>>>,
     temp_database: &'a RwLock<Option<crate::connection::TempDatabase>>,
     attached_databases: &'a RwLock<DatabaseCatalog>,
+    namespaces: &'a dyn NamespaceCatalog,
     non_main_schema_cache: RefCell<HashMap<usize, Arc<Schema>>>,
     pub symbol_table: &'a SymbolTable,
     pub expr_to_reg_cache_enabled: bool,
@@ -183,11 +185,13 @@ pub struct Resolver<'a> {
     /// Schema dialect of the database being compiled against; used when a
     /// fresh placeholder schema must be constructed during resolution.
     pub(crate) dialect: Arc<dyn crate::dialect::Dialect>,
-    /// When set, we are compiling a trigger subprogram for this database.
-    /// Ordinary triggers are restricted to their own database, but temp-backed
-    /// triggers follow SQLite's looser resolution rules and may access objects
-    /// across schemas.
-    pub(crate) trigger_context: Option<TriggerDatabaseContext>,
+    /// When set, we are compiling the body of a trigger or a (non-materialized)
+    /// view for this database. Ordinary triggers and views are restricted to
+    /// their own database, but temp-backed triggers follow SQLite's looser
+    /// resolution rules and may access objects across schemas. A `RefCell`
+    /// because the view-expansion caller (`parse_table` in planner.rs) only
+    /// holds a shared `&Resolver`; see `with_database_scope`.
+    pub(crate) database_scope: RefCell<Option<DatabaseScopeContext>>,
     /// Cached flag: true when this connection has an active temp database.
     ///
     /// Computed once at Resolver construction to avoid repeated
@@ -259,31 +263,35 @@ impl SelfTableScope {
     }
 }
 
-/// Context for restricting table resolution during trigger subprogram compilation.
+/// Context for restricting table resolution while compiling the body of a
+/// database object (a trigger or a view). Mirrors SQLite's view/trigger
+/// schema fixer (`sqlite3FixSelect`/`DbFixer` in `src/fix.c`): unqualified
+/// table names inside the object's body resolve within the database the
+/// object itself lives in, not through the normal temp-first search.
 #[derive(Debug, Clone)]
-pub(crate) struct TriggerDatabaseContext {
-    /// The database ID the trigger belongs to.
+pub(crate) struct DatabaseScopeContext {
+    /// The database ID the object belongs to.
     database_id: usize,
-    /// The trigger name (for error messages).
-    trigger_name: String,
+    /// "trigger" or "view" (for error messages).
+    kind: &'static str,
+    /// The object's own name (for error messages).
+    object_name: String,
 }
 
-impl TriggerDatabaseContext {
+impl DatabaseScopeContext {
     fn restricts_db_references(&self) -> bool {
         self.database_id != crate::TEMP_DB_ID
     }
 }
 
 impl<'a> Resolver<'a> {
-    const MAIN_DB: &'static str = "main";
-    const TEMP_DB: &'static str = "temp";
-
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         schema: &'a Schema,
         database_schemas: &'a RwLock<HashMap<usize, Arc<Schema>>>,
         temp_database: &'a RwLock<Option<crate::connection::TempDatabase>>,
         attached_databases: &'a RwLock<DatabaseCatalog>,
+        namespaces: &'a dyn NamespaceCatalog,
         symbol_table: &'a SymbolTable,
         enable_custom_types: bool,
         dqs_dml: DoubleQuotedDml,
@@ -296,6 +304,7 @@ impl<'a> Resolver<'a> {
             database_schemas,
             temp_database,
             attached_databases,
+            namespaces,
             non_main_schema_cache: RefCell::new(HashMap::default()),
             symbol_table,
             expr_to_reg_cache_enabled: false,
@@ -310,7 +319,7 @@ impl<'a> Resolver<'a> {
             #[cfg(feature = "simulator")]
             subquery_unnesting_mode: crate::SubqueryUnnestingMode::Auto,
             dialect,
-            trigger_context: None,
+            database_scope: RefCell::new(None),
             has_temp_schema,
             fk_action_compile_stack: FkActionCompileStack::default(),
             unqualified_database_search_path: unqualified_database_search_path.clone(),
@@ -341,6 +350,7 @@ impl<'a> Resolver<'a> {
             database_schemas: self.database_schemas,
             temp_database: self.temp_database,
             attached_databases: self.attached_databases,
+            namespaces: self.namespaces,
             non_main_schema_cache: RefCell::new(HashMap::default()),
             symbol_table: self.symbol_table,
             expr_to_reg_cache_enabled: false,
@@ -355,7 +365,7 @@ impl<'a> Resolver<'a> {
             #[cfg(feature = "simulator")]
             subquery_unnesting_mode: self.subquery_unnesting_mode,
             dialect: self.dialect.clone(),
-            trigger_context: self.trigger_context.clone(),
+            database_scope: RefCell::new(self.database_scope.borrow().clone()),
             has_temp_schema: self.has_temp_schema,
             fk_action_compile_stack: self.fk_action_compile_stack.clone(),
             unqualified_database_search_path: self.unqualified_database_search_path.clone(),
@@ -368,6 +378,7 @@ impl<'a> Resolver<'a> {
             database_schemas: self.database_schemas,
             temp_database: self.temp_database,
             attached_databases: self.attached_databases,
+            namespaces: self.namespaces,
             non_main_schema_cache: RefCell::new(HashMap::default()),
             symbol_table: self.symbol_table,
             expr_to_reg_cache_enabled: self.expr_to_reg_cache_enabled,
@@ -382,7 +393,7 @@ impl<'a> Resolver<'a> {
             #[cfg(feature = "simulator")]
             subquery_unnesting_mode: self.subquery_unnesting_mode,
             dialect: self.dialect.clone(),
-            trigger_context: self.trigger_context.clone(),
+            database_scope: RefCell::new(self.database_scope.borrow().clone()),
             has_temp_schema: self.has_temp_schema,
             fk_action_compile_stack: self.fk_action_compile_stack.clone(),
             unqualified_database_search_path: self.unqualified_database_search_path.clone(),
@@ -452,6 +463,17 @@ impl<'a> Resolver<'a> {
         }
     }
 
+    pub(crate) fn self_table_with_custom_type_operators(&self) -> Option<Arc<BTreeTable>> {
+        match &self.self_table_scope.borrow().as_ref()?.context {
+            SelfTableContext::ForDML {
+                table,
+                uses_custom_type_operators: true,
+                ..
+            } => Some(Arc::clone(table)),
+            _ => None,
+        }
+    }
+
     pub(crate) fn self_table_column_type_str(&self, column: usize) -> Option<String> {
         self.self_table_scope
             .borrow()
@@ -513,12 +535,85 @@ impl<'a> Resolver<'a> {
         loaded_schema
     }
 
-    /// Set trigger database context to restrict table resolution to the trigger's database.
-    pub(crate) fn set_trigger_context(&mut self, database_id: usize, trigger_name: String) {
-        self.trigger_context = Some(TriggerDatabaseContext {
-            database_id,
-            trigger_name,
-        });
+    /// Run `f` with table resolution restricted to `database_id`, restoring
+    /// whatever scope was active before once `f` returns (including on an
+    /// early `Err` return). Callers that only hold a shared `&Resolver` use
+    /// this directly (e.g. a view's body is planned as a FROM-clause
+    /// subquery with only `&Resolver` in hand); `f` needs no access to
+    /// `self` because it can simply capture a copy of the shared reference.
+    ///
+    /// For trigger subprogram compilation, which must re-borrow the
+    /// `Resolver` mutably on every statement it compiles, see
+    /// `with_database_scope_mut` instead — a guard holding a live borrow of
+    /// `self` across that loop would conflict with those reborrows.
+    pub(crate) fn with_database_scope<T>(
+        &self,
+        database_id: usize,
+        kind: &'static str,
+        object_name: String,
+        f: impl FnOnce() -> Result<T>,
+    ) -> Result<T> {
+        let previous = self
+            .database_scope
+            .borrow_mut()
+            .replace(DatabaseScopeContext {
+                database_id,
+                kind,
+                object_name,
+            });
+        let result = f();
+        *self.database_scope.borrow_mut() = previous;
+        result
+    }
+
+    /// Like `with_database_scope`, but for callers that hold `&mut Resolver`
+    /// and need to pass it on mutably to `f` (trigger subprogram compilation
+    /// calls `translate_inner`, which takes `&mut Resolver`, once per trigger
+    /// command). `f` receives the same `&mut Resolver` back so it can keep
+    /// reborrowing it, instead of capturing it from the environment, which
+    /// would fight the mutable borrow this method itself takes.
+    pub(crate) fn with_database_scope_mut<T>(
+        &mut self,
+        database_id: usize,
+        kind: &'static str,
+        object_name: String,
+        f: impl FnOnce(&mut Self) -> Result<T>,
+    ) -> Result<T> {
+        let previous = self
+            .database_scope
+            .borrow_mut()
+            .replace(DatabaseScopeContext {
+                database_id,
+                kind,
+                object_name,
+            });
+        let result = f(self);
+        *self.database_scope.borrow_mut() = previous;
+        result
+    }
+
+    /// Restrict table resolution to the trigger's own database while `f` runs.
+    pub(crate) fn with_trigger_scope<T>(
+        &mut self,
+        database_id: usize,
+        trigger_name: String,
+        f: impl FnOnce(&mut Self) -> Result<T>,
+    ) -> Result<T> {
+        self.with_database_scope_mut(database_id, "trigger", trigger_name, f)
+    }
+
+    /// Restrict table resolution to the view's own database while `f` runs,
+    /// the same way `with_trigger_scope` does for triggers: a persistent
+    /// view's unqualified table names resolve within the database the view
+    /// lives in, never through a TEMP table that happens to share a source
+    /// table's name, matching SQLite's view schema fixer.
+    pub(crate) fn with_view_scope<T>(
+        &self,
+        database_id: usize,
+        view_name: String,
+        f: impl FnOnce() -> Result<T>,
+    ) -> Result<T> {
+        self.with_database_scope(database_id, "view", view_name, f)
     }
 
     pub fn resolve_function(
@@ -676,6 +771,18 @@ impl<'a> Resolver<'a> {
     where
         F: Fn(&Schema, &str) -> bool,
     {
+        self.find_unqualified_existing_database_id(object_name, schema_contains_object)
+            .ok_or_else(|| LimboError::ParseError(format!("no such object: {object_name}")))
+    }
+
+    fn find_unqualified_existing_database_id<F>(
+        &self,
+        object_name: &str,
+        schema_contains_object: F,
+    ) -> Option<usize>
+    where
+        F: Fn(&Schema, &str) -> bool,
+    {
         // Only check the temp schema when a temp database actually exists.
         // This avoids expensive schema construction/lookup on every table
         // resolution when no temp objects have been created.
@@ -684,47 +791,40 @@ impl<'a> Resolver<'a> {
                 schema_contains_object(schema, object_name)
             })
         {
-            return Ok(crate::TEMP_DB_ID);
+            return Some(crate::TEMP_DB_ID);
         }
 
         if let Some(search_path) = &self.unqualified_database_search_path {
-            for schema_name in search_path {
-                let Some(database_id) = self.resolve_search_path_database_id(schema_name) else {
-                    continue;
-                };
-                if self.with_schema(database_id, |schema| {
-                    schema_contains_object(schema, object_name)
-                }) {
-                    return Ok(database_id);
-                }
-            }
-            return Err(LimboError::ParseError(format!(
-                "no such object: {object_name}"
-            )));
+            return search_path
+                .iter()
+                .filter_map(|schema_name| self.resolve_search_path_database_id(schema_name))
+                .find(|&database_id| {
+                    self.with_schema(database_id, |schema| {
+                        schema_contains_object(schema, object_name)
+                    })
+                });
         }
 
-        if self.with_schema(crate::MAIN_DB_ID, |schema| {
-            schema_contains_object(schema, object_name)
-        }) {
-            return Ok(crate::MAIN_DB_ID);
-        }
-
-        for database_id in self.attached_database_ids_in_search_order()? {
-            if self.with_schema(database_id, |schema| {
-                schema_contains_object(schema, object_name)
-            }) {
-                return Ok(database_id);
-            }
-        }
-
-        Ok(crate::MAIN_DB_ID)
+        Some(
+            self.namespaces
+                .find_in_search_order(&mut |database_id| {
+                    self.with_schema(database_id, |schema| {
+                        schema_contains_object(schema, object_name)
+                    })
+                })
+                .unwrap_or(crate::MAIN_DB_ID),
+        )
     }
 
     fn resolve_search_path_database_id(&self, schema_name: &str) -> Option<usize> {
         if schema_name.eq_ignore_ascii_case("public") {
             return Some(crate::MAIN_DB_ID);
         }
-        self.get_attached_database(schema_name).map(|x| x.0)
+        self.namespaces
+            .database_id(schema_name)
+            .filter(|&database_id| {
+                database_id != crate::MAIN_DB_ID && database_id != crate::TEMP_DB_ID
+            })
     }
 
     fn schema_has_table_like_object(schema: &Schema, table_name: &str) -> bool {
@@ -765,51 +865,77 @@ impl<'a> Resolver<'a> {
         &self,
         qualified_name: &ast::QualifiedName,
     ) -> Result<usize> {
-        if qualified_name.db_name.is_some() {
-            return self.resolve_database_id(qualified_name);
-        }
-        self.resolve_existing_table_database_id(qualified_name.name.as_str())
+        self.find_existing_table_database_id_qualified(qualified_name)?
+            .ok_or_else(|| {
+                LimboError::ParseError(format!("no such object: {}", qualified_name.name.as_str()))
+            })
     }
 
     pub(crate) fn resolve_existing_table_database_id(&self, table_name: &str) -> Result<usize> {
-        if let Some(ref ctx) = self.trigger_context {
-            if ctx.restricts_db_references() {
-                return Ok(ctx.database_id);
-            }
+        self.find_existing_table_database_id(table_name)
+            .ok_or_else(|| LimboError::ParseError(format!("no such object: {table_name}")))
+    }
 
-            return self.resolve_unqualified_existing_database_id(
-                table_name,
-                Self::schema_has_table_like_object,
-            );
+    pub(crate) fn find_existing_table_database_id_qualified(
+        &self,
+        qualified_name: &ast::QualifiedName,
+    ) -> Result<Option<usize>> {
+        if qualified_name.namespace.is_some() {
+            return self.resolve_database_id(qualified_name).map(Some);
+        }
+        Ok(self.find_existing_table_database_id(qualified_name.name.as_str()))
+    }
+
+    fn find_existing_table_database_id(&self, table_name: &str) -> Option<usize> {
+        // A TEMP view or trigger carries a scope (so explicit `aux.table`
+        // references still see its own database below), but the scope does
+        // not restrict unqualified names: SQLite's schema fixer skips TEMP
+        // objects entirely (`bTemp` in sqlite3FixInit, attach.c:547, checked
+        // by fixSelectCb at attach.c:495), so a TEMP view resolves names the
+        // same way a top-level query does, sqlite_schema included.
+        if let Some(ctx) = self.database_scope.borrow().as_ref() {
+            if ctx.restricts_db_references() {
+                return Some(ctx.database_id);
+            }
         }
 
         if let Some(database_id) = Self::resolve_schema_table_database_id(table_name) {
-            return Ok(database_id);
+            return Some(database_id);
         }
 
-        self.resolve_unqualified_existing_database_id(
-            table_name,
-            Self::schema_has_table_like_object,
-        )
+        self.find_unqualified_existing_database_id(table_name, Self::schema_has_table_like_object)
     }
 
     pub(crate) fn resolve_existing_index_database_id(
         &self,
         qualified_name: &ast::QualifiedName,
     ) -> Result<usize> {
-        if qualified_name.db_name.is_some() {
-            return self.resolve_database_id(qualified_name);
+        self.find_existing_index_database_id(qualified_name)?
+            .ok_or_else(|| {
+                LimboError::ParseError(format!(
+                    "no such object: {}",
+                    normalize_ident(qualified_name.name.as_str())
+                ))
+            })
+    }
+
+    pub(crate) fn find_existing_index_database_id(
+        &self,
+        qualified_name: &ast::QualifiedName,
+    ) -> Result<Option<usize>> {
+        if qualified_name.namespace.is_some() {
+            return self.resolve_database_id(qualified_name).map(Some);
         }
 
         let index_name = normalize_ident(qualified_name.name.as_str());
-        self.resolve_unqualified_existing_database_id(&index_name, Self::schema_has_index)
+        Ok(self.find_unqualified_existing_database_id(&index_name, Self::schema_has_index))
     }
 
     pub(crate) fn resolve_existing_trigger_database_id(
         &self,
         qualified_name: &ast::QualifiedName,
     ) -> Result<usize> {
-        if qualified_name.db_name.is_some() {
+        if qualified_name.namespace.is_some() {
             return self.resolve_database_id(qualified_name);
         }
 
@@ -817,32 +943,51 @@ impl<'a> Resolver<'a> {
         self.resolve_unqualified_existing_database_id(trigger_name, Self::schema_has_trigger)
     }
 
+    /// The database of a sequence named without a namespace: the first
+    /// schema of the search path that has it, or main when no search path
+    /// is set or no schema of it has the sequence. Serial columns create
+    /// their sequences in main, so main stays reachable from every search
+    /// path.
+    pub(crate) fn resolve_existing_sequence_database_id(&self, seq_name: &str) -> usize {
+        if self.unqualified_database_search_path.is_none() {
+            return crate::MAIN_DB_ID;
+        }
+        self.resolve_unqualified_existing_database_id(seq_name, |schema, seq_name| {
+            schema.get_sequence(seq_name).is_some()
+        })
+        .unwrap_or(crate::MAIN_DB_ID)
+    }
+
+    /// `seq_name` qualified with the database it resolved to, for the
+    /// opcodes that look a sequence up again by its name when the statement
+    /// runs. None when no search path is set: a bare name then refers to
+    /// main when the statement runs too.
+    pub(crate) fn runtime_sequence_name(
+        &self,
+        database_id: usize,
+        seq_name: &str,
+    ) -> Option<String> {
+        self.unqualified_database_search_path.as_ref()?;
+        let database_name = self
+            .get_database_name_by_index(database_id)
+            .expect("the database of a sequence has a name");
+        Some(format!("{database_name}.{seq_name}"))
+    }
+
     /// Resolve database ID from a qualified name
     pub(crate) fn resolve_database_id(&self, qualified_name: &ast::QualifiedName) -> Result<usize> {
         // Check if this is a qualified name (database.table) or unqualified
-        let resolved_id = if let Some(db_name) = &qualified_name.db_name {
+        let resolved_id = if let Some(db_name) = &qualified_name.namespace {
             let db_name_normalized = normalize_ident(db_name.as_str());
-            match db_name_normalized.as_str() {
-                "main" => Ok(crate::MAIN_DB_ID),
-                "temp" => Ok(crate::TEMP_DB_ID),
-                _ => {
-                    // Look up attached database
-                    if let Some((idx, _attached_db)) =
-                        self.get_attached_database(&db_name_normalized)
-                    {
-                        Ok(idx)
-                    } else {
-                        Err(LimboError::InvalidArgument(format!(
-                            "no such database: {db_name_normalized}"
-                        )))
-                    }
-                }
-            }
+            self.namespace_database_id(&db_name_normalized)
+                .ok_or_else(|| {
+                    LimboError::InvalidArgument(format!("no such database: {db_name_normalized}"))
+                })
         } else {
-            // Unqualified table name — when compiling a trigger subprogram,
-            // resolve to the trigger's database (matching SQLite behavior).
-            // Otherwise default to main.
-            if let Some(ref ctx) = self.trigger_context {
+            // Unqualified table name — when compiling the body of a trigger
+            // or a view, resolve to that object's own database (matching
+            // SQLite behavior). Otherwise default to main.
+            if let Some(ctx) = self.database_scope.borrow().as_ref() {
                 if ctx.restricts_db_references() {
                     Ok(ctx.database_id)
                 } else {
@@ -853,22 +998,23 @@ impl<'a> Resolver<'a> {
             }
         }?;
 
-        // Triggers can only reference tables in their own database.
+        // A trigger or view can only reference tables in its own database.
         // This only fires for explicitly qualified names (e.g. "aux.table")
-        // since unqualified names already resolve to the trigger's database above.
-        if let Some(ref ctx) = self.trigger_context {
+        // since unqualified names already resolve to the object's own
+        // database above.
+        if let Some(ctx) = self.database_scope.borrow().as_ref() {
             if !ctx.restricts_db_references() {
                 return Ok(resolved_id);
             }
             if resolved_id != ctx.database_id {
                 let db_name = qualified_name
-                    .db_name
+                    .namespace
                     .as_ref()
                     .map(|n| n.as_str())
                     .unwrap_or("main");
                 return Err(LimboError::ParseError(format!(
-                    "trigger {} cannot reference objects in database {}",
-                    ctx.trigger_name, db_name
+                    "{} {} cannot reference objects in database {}",
+                    ctx.kind, ctx.object_name, db_name
                 )));
             }
         }
@@ -876,19 +1022,27 @@ impl<'a> Resolver<'a> {
         Ok(resolved_id)
     }
 
-    // Get an attached database by alias name
-    pub(crate) fn get_attached_database(&self, alias: &str) -> Option<(usize, Arc<Database>)> {
-        self.attached_databases.read().get_database_by_name(alias)
+    /// Resolve the database that CREATE puts an object named `qualified_name`
+    /// in.
+    pub(crate) fn resolve_database_id_for_create(
+        &self,
+        qualified_name: &ast::QualifiedName,
+    ) -> Result<usize> {
+        if qualified_name.namespace.is_some() {
+            return self.resolve_database_id(qualified_name);
+        }
+        self.namespaces.database_for_create()
+    }
+
+    /// The database that namespace `name` refers to. `name` is normalized.
+    pub(crate) fn namespace_database_id(&self, name: &str) -> Option<usize> {
+        self.namespaces.database_id(name)
     }
 
     /// Get the database name for a given database index.
     /// Returns "main" for index 0, "temp" for index 1, and the alias for attached databases.
     pub(crate) fn get_database_name_by_index(&self, index: usize) -> Option<String> {
-        match index {
-            crate::MAIN_DB_ID => Some(Self::MAIN_DB.to_string()),
-            crate::TEMP_DB_ID => Some(Self::TEMP_DB.to_string()),
-            _ => self.attached_databases.read().get_name_by_index(index),
-        }
+        self.namespaces.name(index)
     }
 }
 
@@ -1218,6 +1372,7 @@ fn build_rowid_column() -> Column {
 pub fn prepare_cdc_if_necessary(
     program: &mut ProgramBuilder,
     schema: &Schema,
+    database_id: usize,
     changed_table_name: Option<&str>,
 ) -> Result<Option<(usize, Arc<BTreeTable>)>> {
     let mode = program.capture_data_changes_info();
@@ -1225,6 +1380,9 @@ pub fn prepare_cdc_if_necessary(
     let Some(cdc_table) = cdc_table else {
         return Ok(None);
     };
+    if database_id == crate::TEMP_DB_ID {
+        return Ok(None);
+    }
     // Self-exclusion: never capture changes to CDC's own bookkeeping tables. `None` means the
     // caller has no associated table (e.g. a transaction-boundary COMMIT record) and always
     // gets the cursor.
@@ -1315,10 +1473,11 @@ pub(super) fn emit_make_record<'a>(
 
 pub fn emit_cdc_full_record(
     program: &mut ProgramBuilder,
+    resolver: &Resolver,
     columns: &[Column],
     table_cursor_id: usize,
     rowid_reg: usize,
-) -> usize {
+) -> Result<usize> {
     let storable_count = columns.iter().filter(|c| !c.is_virtual_generated()).count();
     let columns_reg = program.alloc_registers(storable_count + 1);
     let mut slot = 0;
@@ -1333,7 +1492,13 @@ pub fn emit_cdc_full_record(
                 extra_amount: 0,
             });
         } else {
-            program.emit_column_or_rowid(table_cursor_id, i, columns_reg + 1 + slot);
+            emit_stored_column(
+                program,
+                table_cursor_id,
+                i,
+                columns_reg + 1 + slot,
+                resolver,
+            )?;
         }
         slot += 1;
     }
@@ -1350,7 +1515,7 @@ pub fn emit_cdc_full_record(
         index_name: None,
         affinity_str: Some(affinity_str),
     });
-    columns_reg
+    Ok(columns_reg)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1559,7 +1724,6 @@ fn emit_cdc_insns_v1(
 }
 
 #[allow(clippy::too_many_arguments)]
-#[allow(clippy::too_many_arguments)]
 fn emit_cdc_insns_v2(
     program: &mut ProgramBuilder,
     resolver: &Resolver,
@@ -1766,40 +1930,81 @@ pub fn emit_cdc_commit_insns(
     Ok(())
 }
 
-/// Emit a CDC COMMIT record at end-of-statement when in autocommit mode (v2 only).
-/// This should be called once per statement, after the main loop, not per-row.
+/// Emit the CDC COMMIT record at the end of a statement, once, when in autocommit mode (v2 only).
+/// Only the root statement writes it; a trigger or FK action subprogram never does.
 pub fn emit_cdc_autocommit_commit(
     program: &mut ProgramBuilder,
     resolver: &Resolver,
-    cdc_cursor_id: usize,
+    cdc_cursor_id: Option<usize>,
 ) -> Result<()> {
-    let cdc_info = program.capture_data_changes_info().as_ref();
-    if cdc_info.is_some_and(|info| info.cdc_version().has_commit_record()) {
-        // Check if we're in autocommit mode; if so, emit a COMMIT record.
-        let is_autocommit_fn_ctx = crate::function::FuncCtx {
-            func: Func::Scalar(crate::function::ScalarFunc::IsAutocommit),
-            arg_count: 0,
-        };
-        let autocommit_reg = program.alloc_register();
-        program.emit_insn(Insn::Function {
-            constant_mask: 0,
-            start_reg: 0,
-            dest: autocommit_reg,
-            func: is_autocommit_fn_ctx,
-        });
-
-        // IfNot jumps when reg == 0 (not autocommit). Skip the COMMIT in that case.
-        let skip_label = program.allocate_label();
-        program.emit_insn(Insn::IfNot {
-            reg: autocommit_reg,
-            target_pc: skip_label,
-            jump_if_null: true,
-        });
-
-        emit_cdc_commit_insns(program, resolver, cdc_cursor_id)?;
-
-        program.preassign_label_to_next_insn(skip_label);
+    if program.flags.is_subprogram() {
+        return Ok(());
     }
+    let cdc_info = program.capture_data_changes_info().as_ref();
+    if !cdc_info.is_some_and(|info| info.cdc_version().has_commit_record()) {
+        return Ok(());
+    }
+    if cdc_cursor_id.is_none() && !program.has_emitted_program_call() {
+        // Our own target table was not captured (e.g. a TEMP table), and no trigger or FK
+        // action ran during this statement that could have captured a row elsewhere.
+        return Ok(());
+    }
+
+    // Check if we're in autocommit mode; if so, emit a COMMIT record.
+    let is_autocommit_fn_ctx = crate::function::FuncCtx {
+        func: Func::Scalar(crate::function::ScalarFunc::IsAutocommit),
+        arg_count: 0,
+    };
+    let autocommit_reg = program.alloc_register();
+    program.emit_insn(Insn::Function {
+        constant_mask: 0,
+        start_reg: 0,
+        dest: autocommit_reg,
+        func: is_autocommit_fn_ctx,
+    });
+
+    // IfNot jumps when reg == 0 (not autocommit). Skip the COMMIT in that case.
+    let skip_label = program.allocate_label();
+    program.emit_insn(Insn::IfNot {
+        reg: autocommit_reg,
+        target_pc: skip_label,
+        jump_if_null: true,
+    });
+
+    let cdc_cursor_id = match cdc_cursor_id {
+        Some(cdc_cursor_id) => cdc_cursor_id,
+        None => {
+            // A trigger or FK action fired during this statement may have captured a row
+            // elsewhere. Only write the COMMIT record when something was actually captured.
+            let minus_one_reg = program.alloc_register();
+            program.emit_int(-1, minus_one_reg);
+            let txn_id_reg = program.alloc_register();
+            program.emit_insn(Insn::Function {
+                constant_mask: 0,
+                start_reg: minus_one_reg,
+                dest: txn_id_reg,
+                func: crate::function::FuncCtx {
+                    func: Func::Scalar(crate::function::ScalarFunc::ConnTxnId),
+                    arg_count: 1,
+                },
+            });
+            program.emit_insn(Insn::Eq {
+                lhs: txn_id_reg,
+                rhs: minus_one_reg,
+                target_pc: skip_label,
+                flags: crate::vdbe::insn::CmpInsFlags::default(),
+                collation: None,
+            });
+            let (cursor_id, _) =
+                prepare_cdc_if_necessary(program, resolver.schema(), crate::MAIN_DB_ID, None)?
+                    .expect("CDC is active, so prepare_cdc_if_necessary must return a cursor");
+            cursor_id
+        }
+    };
+
+    emit_cdc_commit_insns(program, resolver, cdc_cursor_id)?;
+
+    program.preassign_label_to_next_insn(skip_label);
 
     Ok(())
 }
@@ -1858,7 +2063,9 @@ pub fn emit_cdc_explicit_commit_insns(
     });
 
     // A COMMIT record has no associated table, so pass `None` (no self-exclusion check).
-    if let Some((cdc_cursor_id, _)) = prepare_cdc_if_necessary(program, schema, None)? {
+    if let Some((cdc_cursor_id, _)) =
+        prepare_cdc_if_necessary(program, schema, crate::MAIN_DB_ID, None)?
+    {
         emit_cdc_commit_insns(program, resolver, cdc_cursor_id)?;
     }
 
@@ -1908,7 +2115,14 @@ pub(crate) fn init_limit(
                 _ => {
                     let r = limit_ctx.reg_limit;
 
-                    _ = translate_expr(program, None, expr, r, &t_ctx.resolver)?;
+                    _ = translate_expr_no_constant_opt(
+                        program,
+                        None,
+                        expr,
+                        r,
+                        &t_ctx.resolver,
+                        NoConstantOptReason::RegisterReuse,
+                    )?;
                     program.emit_insn(Insn::MustBeInt {
                         reg: r,
                         target_pc: None,
@@ -1943,7 +2157,14 @@ pub(crate) fn init_limit(
                     _ => unreachable!("parse_numeric_literal only returns Integer or Float"),
                 },
                 _ => {
-                    _ = translate_expr(program, None, expr, offset_reg, &t_ctx.resolver)?;
+                    _ = translate_expr_no_constant_opt(
+                        program,
+                        None,
+                        expr,
+                        offset_reg,
+                        &t_ctx.resolver,
+                        NoConstantOptReason::RegisterReuse,
+                    )?;
                 }
             }
             program.add_comment(program.offset(), "OFFSET counter");
@@ -2028,26 +2249,27 @@ pub(crate) fn emit_columns_and_dependencies(
     };
 
     let mut extra_idx = 0;
-    let pairs = table.columns().iter().enumerate().map(|(idx, col)| {
+    let mut pairs = Vec::with_capacity(table.columns().len());
+    for (idx, col) in table.columns().iter().enumerate() {
         let reg = if let Some(pos) = non_rowid_target_positions[idx] {
             let reg = target_base + pos;
             if !col.is_virtual_generated() {
-                program.emit_column_or_rowid(cursor_id, idx, reg);
+                emit_stored_column(program, cursor_id, idx, reg, resolver)?;
             }
             reg
         } else if col.is_rowid_alias() {
             rowid_reg
         } else if dependencies.get(idx) {
             let reg = extra_base + extra_idx;
-            program.emit_column_or_rowid(cursor_id, idx, reg);
+            emit_stored_column(program, cursor_id, idx, reg, resolver)?;
             extra_idx += 1;
             reg
         } else {
             0
         };
-        (col, reg)
-    });
-    let dml_ctx = DmlColumnContext::from_column_reg_mapping(pairs);
+        pairs.push((col, reg));
+    }
+    let dml_ctx = DmlColumnContext::from_column_reg_mapping(pairs.into_iter());
     if targets
         .iter()
         .all(|&idx| !table.columns()[idx].is_rowid_alias())
@@ -2127,7 +2349,13 @@ pub(crate) fn emit_index_column_value_old_image(
             resolver,
         )?;
     } else {
-        program.emit_column_or_rowid(table_cursor_id, idx_col.pos_in_table, dest_reg);
+        emit_stored_column(
+            program,
+            table_cursor_id,
+            idx_col.pos_in_table,
+            dest_reg,
+            resolver,
+        )?;
     }
     Ok(())
 }
@@ -2216,6 +2444,7 @@ fn emit_index_column_value_new_image(
             &mut column_regs,
             table,
             dest_reg,
+            idx_col.pos_in_table == EXPR_INDEX_SENTINEL,
         )?;
     } else {
         let col_in_table = columns
@@ -2312,7 +2541,7 @@ fn emit_check_constraint_bytecode(
         // expression's source text exactly as the user wrote it.
         let constraint_name = match (&check_constraint.name, &check_constraint.source) {
             (Some(name), _) => name.clone(),
-            (None, Some(source)) => crate::util::check_source_for_error(source),
+            (None, Some(source)) => crate::util::dequote(source),
             (None, None) => format!("{}", check_constraint.expr),
         };
 
@@ -2331,7 +2560,7 @@ fn emit_check_constraint_bytecode(
                 program.emit_insn(Insn::Halt {
                     err_code: SQLITE_CONSTRAINT_CHECK,
                     description: constraint_name.to_string(),
-                    on_error: None,
+                    on_error: program.constraint_halt_on_error(or_conflict),
                     description_reg: None,
                 });
             }

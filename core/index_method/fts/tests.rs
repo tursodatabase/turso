@@ -1,5 +1,6 @@
 use super::*;
 use crate::{
+    alloc::TursoVecInExt,
     index_method::{
         IndexMethodAttachment, IndexMethodConfiguration, IndexMethodCostContext,
         IndexMethodCostEstimate,
@@ -228,11 +229,13 @@ fn snapshot_directory_reads_shared_file_bytes_without_copying() {
     use tantivy::directory::Directory;
 
     let path = std::path::Path::new("segment.term");
-    let mut bytes = DynVec::new_in(DynAllocator::default());
+    let mut bytes =
+        <DynVec<u8> as TursoVecInExt<u8, DynAllocator>>::new_in(DynAllocator::default());
     bytes.try_extend([3, 5, 7, 11, 13]).unwrap();
     let data = Arc::new(bytes);
     let files = HashMap::from_iter([(path.to_path_buf(), Arc::clone(&data))]);
-    let mut meta_json = DynVec::new_in(DynAllocator::default());
+    let mut meta_json =
+        <DynVec<u8> as TursoVecInExt<u8, DynAllocator>>::new_in(DynAllocator::default());
     meta_json.try_extend(b"metadata".iter().copied()).unwrap();
     let directory = SnapshotDirectory::new(files, meta_json);
     assert!(directory.exists(path).unwrap());
@@ -382,7 +385,9 @@ fn merged_segment_files_can_be_rekeyed_to_a_minted_id() {
     let mut stray = files;
     stray.insert(
         PathBuf::from("meta.json"),
-        Arc::new(DynVec::new_in(DynAllocator::default())),
+        Arc::new(<DynVec<u8> as TursoVecInExt<u8, DynAllocator>>::new_in(
+            DynAllocator::default(),
+        )),
     );
     assert!(matches!(
         rename_segment_files(stray, &segment.id(), &minted),

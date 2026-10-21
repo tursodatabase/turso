@@ -20,6 +20,7 @@ use crate::translate::planner::ROWID_STRS;
 use crate::translate::trigger_exec::{
     fire_trigger, get_triggers_including_temp, has_triggers_including_temp, TriggerContext,
 };
+use crate::translate::update::rowid_name_column_index;
 use crate::vdbe::insn::{to_u32, CmpInsFlags};
 use crate::{
     bail_parse_error,
@@ -170,7 +171,9 @@ fn collect_changed_cols(
     let mut cols_changed = ColumnMask::default();
     let mut rowid_changed = false;
     for (col_idx, _) in set_pairs {
-        if let Some(c) = table.columns().get(*col_idx) {
+        if *col_idx == ROWID_SENTINEL {
+            rowid_changed = true;
+        } else if let Some(c) = table.columns().get(*col_idx) {
             if c.is_rowid_alias() {
                 rowid_changed = true;
             } else {
@@ -480,6 +483,7 @@ pub fn emit_upsert(
     ctx: &InsertEmitCtx,
     insertion: &Insertion,
     set_pairs: &mut [(usize, Box<ast::Expr>)],
+    set_column_names: &[ast::Name],
     where_clause: &mut Option<Box<ast::Expr>>,
     resolver: &mut Resolver,
     returning: &mut [ResultSetColumn],
@@ -670,6 +674,23 @@ pub fn emit_upsert(
             excluded_decoded_start,
             &layout,
         )?;
+        if *col_idx == ROWID_SENTINEL {
+            let r = program.alloc_register();
+            translate_expr_no_constant_opt(
+                program,
+                None,
+                expr,
+                r,
+                resolver,
+                NoConstantOptReason::RegisterReuse,
+            )?;
+            program.emit_insn(Insn::MustBeInt {
+                reg: r,
+                target_pc: None,
+            });
+            new_rowid_reg = Some(r);
+            continue;
+        }
         // Save/restore target_union_type so union_value() resolves tags
         // against this column's union type. See ProgramBuilder::target_union_type.
         let col = &table.columns()[*col_idx];
@@ -695,6 +716,7 @@ pub fn emit_upsert(
                 target_reg: layout.to_register(new_start, *col_idx),
                 err_code: SQLITE_CONSTRAINT_NOTNULL,
                 description: String::from(table.get_name()) + "." + col.name.as_ref().unwrap(),
+                on_error: None,
             });
         }
         if col.is_rowid_alias() {
@@ -837,7 +859,7 @@ pub fn emit_upsert(
             upsert_database_id,
             TriggerEvent::Update,
             TriggerTime::Before,
-            Some(updated_positions.clone()),
+            Some(set_column_names),
             &btree_table,
         );
         // OLD row values are in current_start registers
@@ -934,7 +956,7 @@ pub fn emit_upsert(
                 resolver,
                 upsert_database_id,
                 TriggerEvent::Update,
-                Some(&updated_positions),
+                Some(set_column_names),
                 &btree_table,
             );
             if has_relevant_after_triggers {
@@ -961,7 +983,7 @@ pub fn emit_upsert(
                 resolver,
                 upsert_database_id,
                 TriggerEvent::Update,
-                Some(&updated_positions),
+                Some(set_column_names),
                 &btree_table,
             );
             if has_relevant_after_triggers {
@@ -1324,9 +1346,12 @@ pub fn emit_upsert(
     let record_reg = program.alloc_register();
     emit_make_record(program, table.columns().iter(), new_start, record_reg);
 
+    let cdc_wants_before =
+        ctx.cdc_table.is_some() && program.capture_data_changes_info().has_before();
+
     // If rowid changed, delete+insert (uniqueness of the new rowid was
     // already verified before index maintenance above)
-    if let Some(rnew) = new_rowid_reg {
+    let cdc_before_rec = if let Some(rnew) = new_rowid_reg {
         // important: the cursor was repositioned in the earlier rowid uniqueness
         // probe via NotExists, so we need to re-seek to the row under update.
         program.emit_insn(Insn::SeekRowid {
@@ -1334,6 +1359,20 @@ pub fn emit_upsert(
             src_reg: ctx.conflict_rowid_reg,
             target_pc: ctx.loop_labels.row_done,
         });
+
+        // Read the before image before the delete below removes it; reading
+        // it after the write would return the new row instead of the old one.
+        let cdc_before_rec = cdc_wants_before
+            .then(|| {
+                emit_cdc_full_record(
+                    program,
+                    resolver,
+                    table.columns(),
+                    ctx.cursor_id,
+                    ctx.conflict_rowid_reg,
+                )
+            })
+            .transpose()?;
 
         // Now replace the row
         program.emit_insn(Insn::Delete {
@@ -1382,7 +1421,21 @@ pub fn emit_upsert(
                 rnew,
             )?;
         }
+
+        cdc_before_rec
     } else {
+        // Read the before image before the insert below overwrites it in place.
+        let cdc_before_rec = cdc_wants_before
+            .then(|| {
+                emit_cdc_full_record(
+                    program,
+                    resolver,
+                    table.columns(),
+                    ctx.cursor_id,
+                    ctx.conflict_rowid_reg,
+                )
+            })
+            .transpose()?;
         program.emit_insn(Insn::Insert {
             cursor: ctx.cursor_id,
             key_reg: ctx.conflict_rowid_reg,
@@ -1390,49 +1443,22 @@ pub fn emit_upsert(
             flag: InsertFlags::new().skip_last_rowid(),
             table_name: table.get_name().to_string(),
         });
-    }
+        cdc_before_rec
+    };
 
-    // Fire FK actions (CASCADE, SET NULL, SET DEFAULT) for parent-side updates.
-    // This must be done after the update is complete but before AFTER triggers.
-    if let Some(bt) = table.btree() {
-        if has_parent_fk_actions {
-            fire_fk_update_actions(
-                program,
-                resolver,
-                bt.name.as_str(),
-                ctx.conflict_rowid_reg, // old_rowid_reg
-                current_start,          // old_values_start
-                new_start,              // new_values_start
-                new_rowid_reg.unwrap_or(ctx.conflict_rowid_reg), // new_rowid_reg
-                connection,
-                upsert_database_id,
-                &affected_parent_fks,
-            )?;
-        }
-    }
-
-    // emit CDC instructions
+    // CDC must capture the row right after the write above, before any FK action or AFTER
+    // trigger this UPSERT fires can write further CDC rows of their own.
     if let Some((cdc_id, _)) = ctx.cdc_table {
         let new_rowid = new_rowid_reg.unwrap_or(ctx.conflict_rowid_reg);
         if new_rowid_reg.is_some() {
             // DELETE (before)
-            let before_rec = if program.capture_data_changes_info().has_before() {
-                Some(emit_cdc_full_record(
-                    program,
-                    table.columns(),
-                    ctx.cursor_id,
-                    ctx.conflict_rowid_reg,
-                ))
-            } else {
-                None
-            };
             emit_cdc_insns(
                 program,
                 resolver,
                 OperationMode::DELETE,
                 cdc_id,
                 ctx.conflict_rowid_reg,
-                before_rec,
+                cdc_before_rec,
                 None,
                 None,
                 table.get_name(),
@@ -1470,23 +1496,13 @@ pub fn emit_upsert(
             } else {
                 None
             };
-            let before_rec = if program.capture_data_changes_info().has_before() {
-                Some(emit_cdc_full_record(
-                    program,
-                    table.columns(),
-                    ctx.cursor_id,
-                    ctx.conflict_rowid_reg,
-                ))
-            } else {
-                None
-            };
             emit_cdc_insns(
                 program,
                 resolver,
                 OperationMode::UPDATE(UpdateRowSource::Normal),
                 cdc_id,
                 ctx.conflict_rowid_reg,
-                before_rec,
+                cdc_before_rec,
                 after_rec,
                 None,
                 table.get_name(),
@@ -1494,18 +1510,33 @@ pub fn emit_upsert(
         }
     }
 
+    // Fire FK actions (CASCADE, SET NULL, SET DEFAULT) for parent-side updates.
+    // This must be done after the update is complete but before AFTER triggers.
+    if let Some(bt) = table.btree() {
+        if has_parent_fk_actions {
+            fire_fk_update_actions(
+                program,
+                resolver,
+                bt.name.as_str(),
+                ctx.conflict_rowid_reg, // old_rowid_reg
+                current_start,          // old_values_start
+                new_start,              // new_values_start
+                new_rowid_reg.unwrap_or(ctx.conflict_rowid_reg), // new_rowid_reg
+                connection,
+                upsert_database_id,
+                &affected_parent_fks,
+            )?;
+        }
+    }
+
     // Fire AFTER UPDATE triggers
     if let (Some(btree_table), Some(old_regs)) = (table.btree(), preserved_old_registers) {
-        let updated_column_indices: ColumnMask = set_pairs
-            .iter()
-            .map(|(col_idx, _)| *col_idx)
-            .try_collect()?;
         let relevant_triggers = get_triggers_including_temp(
             resolver,
             upsert_database_id,
             TriggerEvent::Update,
             TriggerTime::After,
-            Some(updated_column_indices),
+            Some(set_column_names),
             &btree_table,
         );
         if !relevant_triggers.is_empty() {
@@ -1628,15 +1659,22 @@ pub fn collect_set_clauses_for_upsert(
             );
         }
         for (cn, e) in set.col_names.iter().zip(values.into_iter()) {
-            let Some(idx) = lookup.get(&normalize_ident(cn.as_str())) else {
-                bail_parse_error!("no such column: {}", cn);
+            let ident = normalize_ident(cn.as_str());
+            let idx = match lookup.get(&ident) {
+                Some(idx) => {
+                    // cannot upsert generated column
+                    table.columns()[*idx].ensure_not_generated("UPDATE", cn.as_str())?;
+                    *idx
+                }
+                None => match rowid_name_column_index(table, &ident) {
+                    Some(idx) => idx,
+                    None => bail_parse_error!("no such column: {}", cn),
+                },
             };
-            // cannot upsert generated column
-            table.columns()[*idx].ensure_not_generated("UPDATE", cn.as_str())?;
-            if let Some(existing) = out.iter_mut().find(|(i, _)| *i == *idx) {
+            if let Some(existing) = out.iter_mut().find(|(i, _)| *i == idx) {
                 existing.1 = e;
             } else {
-                out.push((*idx, e));
+                out.push((idx, e));
             }
         }
     }
@@ -1680,6 +1718,7 @@ fn eval_partial_pred_for_row_image(
         &mut column_regs,
         &bt,
         r,
+        true,
     )
     .ok()?;
     Some(r)
@@ -1720,6 +1759,7 @@ fn emit_upsert_expr_index_value(
         &mut column_regs,
         &bt,
         dest_reg,
+        idx_col.pos_in_table == EXPR_INDEX_SENTINEL,
     )?;
     Ok(())
 }

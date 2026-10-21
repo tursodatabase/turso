@@ -60,6 +60,10 @@ A file that runs longer than `file_timeout_seconds` (180 by default) is
 killed and shows as `XHANG`; a file whose process dies on a signal shows
 as `XCRASH`. Neither takes down the rest of the run.
 
+Each file runs in its own empty directory, `scratch/NAME`, which is
+cleared before the file starts and kept afterwards, so the databases a
+file creates can be inspected after the run.
+
 The full output of each file is written to `logs/NAME.log`; the console
 shows only each file's summary, failed-test list, and any abort, crash
 or hang line, because the complete output of a run is tens of megabytes.

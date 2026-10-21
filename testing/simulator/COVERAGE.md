@@ -72,6 +72,7 @@ simulator covers and tests.
 | SELECT ... OUTER JOIN     | No      |                                                                                   |
 | SELECT ... JOIN USING     | No      |                                                                                   |
 | SELECT ... NATURAL JOIN   | No      |                                                                                   |
+| SELECT ... LATERAL        | Yes     |                                                                                   |
 | UPDATE                    | Partial |                                                                                   |
 | VACUUM                    | No      |                                                                                   |
 | WITH clause               | No      |                                                                                   |
@@ -219,7 +220,7 @@ Feature support of [sqlite expr syntax](https://www.sqlite.org/lang_expr.html).
 | nullif(X,Y)                  | No     |         |
 | octet_length(X)              | No     |         |
 | printf(FORMAT,...)           | No     |         |
-| quote(X)                     | No     |         |
+| quote(X)                     | Partial|         |
 | random()                     | No     |         |
 | randomblob(N)                | No     |         |
 | replace(X,Y,Z)               | No     |         |
@@ -343,7 +344,7 @@ Modifiers:
 | ---------------------------------- | ------ | ------- |
 | json(json)                         | No     |         |
 | jsonb(json)                        | No     |         |
-| json_array(value1,value2,...)      | No     |         |
+| json_array(value1,value2,...)      | Partial|         |
 | jsonb_array(value1,value2,...)     | No     |         |
 | json_array_length(json)            | No     |         |
 | json_array_length(json,path)       | No     |         |
@@ -351,7 +352,7 @@ Modifiers:
 | json_extract(json,path,...)        | No     |         |
 | jsonb_extract(json,path,...)       | No     |         |
 | json -> path                       | No     |         |
-| json ->> path                      | No     |         |
+| json ->> path                      | Partial|         |
 | json_insert(json,path,value,...)   | No     |         |
 | jsonb_insert(json,path,value,...)  | No     |         |
 | json_object(label1,value1,...)     | No     |         |
@@ -370,11 +371,11 @@ Modifiers:
 | json_valid(json)                   | No     |         |
 | json_valid(json,flags)             | No     |         |
 | json_quote(value)                  | No     |         |
-| json_group_array(value)            | No     |         |
+| json_group_array(value)            | Partial|         |
 | jsonb_group_array(value)           | No     |         |
 | json_group_object(label,value)     | No     |         |
 | jsonb_group_object(name,value)     | No     |         |
-| json_each(json)                    | No     |         |
+| json_each(json)                    | Partial|         |
 | json_each(json,path)               | No     |         |
 | json_tree(json)                    | No     |         |
 | json_tree(json,path)               | No     |         |

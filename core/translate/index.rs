@@ -12,8 +12,8 @@ use crate::translate::{
         OperationMode, Resolver,
     },
     expr::{
-        bind_and_rewrite_expr, translate_condition_expr, translate_expr, unwrap_parens, walk_expr,
-        BindingBehavior, ConditionMetadata, WalkControl,
+        bind_and_rewrite_expr, emit_stored_column, translate_condition_expr, translate_expr,
+        unwrap_parens, walk_expr, BindingBehavior, ConditionMetadata, WalkControl,
     },
     insert::format_unique_violation_desc,
     plan::{ColumnUsedMask, IterationDirection, JoinedTable, Operation, Scan, TableReferences},
@@ -47,7 +47,7 @@ fn canonical_create_index_sql(stmt: &ast::Stmt) -> String {
     // Strip that qualifier before storing SQL in sqlite_schema so the schema text remains valid
     // when the same database is reopened or attached under a different alias.
     // e.g. CREATE INDEX aux.idx1 ON t1 (name) -> CREATE INDEX idx1 ON t1 (name)
-    idx_name.db_name = None;
+    idx_name.namespace = None;
     canonical_stmt.to_string()
 }
 
@@ -105,7 +105,7 @@ pub fn translate_create_index(
 
     let original_idx_name = idx_name;
     let original_tbl_name = tbl_name;
-    let database_id = if original_idx_name.db_name.is_some() {
+    let database_id = if original_idx_name.namespace.is_some() {
         resolver.resolve_database_id(&original_idx_name)?
     } else {
         resolver.resolve_existing_table_database_id(original_tbl_name.as_str())?
@@ -137,13 +137,21 @@ pub fn translate_create_index(
         }
         crate::bail_parse_error!("index {} already exists", original_idx_name.name.as_str());
     }
+    // Materialized views store their rows in a real table btree (so plain
+    // reads can use get_table() below like any other table), but writes to
+    // that btree go through the DBSP maintenance path (sink.rs), which emits
+    // raw Insert/Delete and has no notion of secondary indexes. An index
+    // created here would never be kept up to date by later changes to the
+    // view, silently going stale. Reject it the same way a plain view is
+    // rejected, rather than letting the engine look up a corrupt stale
+    // index on later reads.
+    if resolver.with_schema(database_id, |s| {
+        s.get_view(&tbl_name).is_some() || s.is_materialized_view(&tbl_name)
+    }) {
+        crate::bail_parse_error!("views may not be indexed");
+    }
     let table = resolver.with_schema(database_id, |s| s.get_table(&tbl_name));
     let Some(table) = table else {
-        if resolver.with_schema(database_id, |s| {
-            s.get_view(&tbl_name).is_some() || s.is_materialized_view(&tbl_name)
-        }) {
-            crate::bail_parse_error!("views may not be indexed");
-        }
         // The index's target table always lives in the index's own database,
         // so SQLite qualifies the missing table with that database name.
         let db_name = resolver
@@ -265,7 +273,12 @@ pub fn translate_create_index(
         root_page: RegisterOrLiteral::Literal(sqlite_table.root_page),
         db: database_id,
     });
-    let cdc_table = prepare_cdc_if_necessary(program, resolver.schema(), Some(SQLITE_TABLEID))?;
+    let cdc_table = prepare_cdc_if_necessary(
+        program,
+        resolver.schema(),
+        database_id,
+        Some(SQLITE_TABLEID),
+    )?;
     emit_schema_entry(
         program,
         resolver,
@@ -704,7 +717,7 @@ fn resolve_reindex_targets(
     };
 
     let normalized_name = normalize_ident(name.name.as_str());
-    if name.db_name.is_none() {
+    if name.namespace.is_none() {
         let collation = CollationSeq::new(&normalized_name).ok();
         if let Some(collation) = collation {
             let targets = collect_reindex_targets_by_collation(resolver, connection, collation);
@@ -1168,7 +1181,13 @@ fn emit_index_column_value_from_cursor(
             }
         }
     } else {
-        program.emit_column_or_rowid(table_cursor_id, idx_col.pos_in_table, dest_reg);
+        emit_stored_column(
+            program,
+            table_cursor_id,
+            idx_col.pos_in_table,
+            dest_reg,
+            resolver,
+        )?;
     }
     Ok(())
 }
@@ -1204,11 +1223,19 @@ pub fn translate_drop_index(
     if_exists: bool,
     program: &mut ProgramBuilder,
 ) -> crate::Result<()> {
-    let database_id = resolver.resolve_existing_index_database_id(qualified_name)?;
     let idx_name = normalize_ident(qualified_name.name.as_str());
     let opts = ProgramBuilderOpts::new(5, 40, 5);
     program.extend(&opts);
 
+    let Some(database_id) = resolver.find_existing_index_database_id(qualified_name)? else {
+        if if_exists {
+            return Ok(());
+        }
+        return Err(crate::error::LimboError::InvalidArgument(format!(
+            "No such index: {}",
+            &idx_name
+        )));
+    };
     let schema_cookie = resolver.with_schema(database_id, |s| s.schema_version);
     program.begin_write_on_database(database_id, schema_cookie)?;
 
@@ -1252,7 +1279,12 @@ pub fn translate_drop_index(
         }
     }
 
-    let cdc_table = prepare_cdc_if_necessary(program, resolver.schema(), Some(SQLITE_TABLEID))?;
+    let cdc_table = prepare_cdc_if_necessary(
+        program,
+        resolver.schema(),
+        database_id,
+        Some(SQLITE_TABLEID),
+    )?;
 
     // According to sqlite should emit Null instruction
     // but why?
@@ -1329,10 +1361,11 @@ pub fn translate_drop_index(
         let before_record_reg = if program.capture_data_changes_info().has_before() {
             Some(emit_cdc_full_record(
                 program,
+                resolver,
                 sqlite_table.columns(),
                 sqlite_schema_cursor_id,
                 row_id_reg,
-            ))
+            )?)
         } else {
             None
         };
@@ -1365,7 +1398,7 @@ pub fn translate_drop_index(
 
     program.preassign_label_to_next_insn(loop_end_label);
     if let Some((cdc_cursor_id, _)) = cdc_table {
-        emit_cdc_autocommit_commit(program, resolver, cdc_cursor_id)?;
+        emit_cdc_autocommit_commit(program, resolver, Some(cdc_cursor_id))?;
     }
 
     let current_schema_version = resolver.with_schema(database_id, |s| s.schema_version);
@@ -1507,7 +1540,7 @@ mod tests {
         };
         assert_eq!(
             idx_name
-                .db_name
+                .namespace
                 .as_ref()
                 .map(ToString::to_string)
                 .as_deref(),

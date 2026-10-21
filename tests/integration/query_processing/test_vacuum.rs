@@ -1,7 +1,8 @@
 use crate::assertions::{AssertQueryPlan, NULL};
 use crate::common::{
     compute_dbhash, compute_dbhash_with_database_opts, compute_dbhash_with_options,
-    compute_dbhash_with_options_and_database_opts, do_flush, ExecRows, TempDatabase,
+    compute_dbhash_with_options_and_database_opts, do_flush, limbo_exec_rows, ExecRows,
+    TempDatabase,
 };
 use crate::queued_io::{QueuedIo, QueuedIoOpKind};
 use asserting::prelude::*;
@@ -591,7 +592,6 @@ fn populate_until_page_count(
     }
 }
 
-#[cfg_attr(feature = "checksum", ignore)]
 #[turso_macros::test(mvcc, init_sql = "CREATE TABLE t (a INTEGER, b TEXT, c BLOB);")]
 fn test_vacuum_into_basic(tmp_db: TempDatabase) -> anyhow::Result<()> {
     let _ = env_logger::try_init();
@@ -955,7 +955,6 @@ fn test_vacuum_into_multiple_tables(tmp_db: TempDatabase) -> anyhow::Result<()> 
     Ok(())
 }
 
-#[cfg_attr(feature = "checksum", ignore)]
 #[turso_macros::test(mvcc, init_sql = "CREATE TABLE t (a INTEGER);")]
 fn test_vacuum_into_with_index(tmp_db: TempDatabase) -> anyhow::Result<()> {
     let _ = env_logger::try_init();
@@ -1184,7 +1183,6 @@ fn test_vacuum_into_with_triggers(tmp_db: TempDatabase) {
 
 /// Test VACUUM INTO preserves and bumps meta values like SQLite.
 /// Note: Some pragmas don't work correctly with MVCC yet
-#[cfg_attr(feature = "checksum", ignore)]
 #[turso_macros::test(init_sql = "CREATE TABLE t (a INTEGER);")]
 fn test_vacuum_into_preserves_meta_values(tmp_db: TempDatabase) -> anyhow::Result<()> {
     let _ = env_logger::try_init();
@@ -3423,8 +3421,6 @@ fn test_vacuum_into_column_name_with_comma(tmp_db: TempDatabase) -> anyhow::Resu
     Ok(())
 }
 
-// checksum feature changes reserved_space which breaks VACUUM INTO hash comparison
-#[cfg_attr(feature = "checksum", ignore)]
 #[turso_macros::test(init_sql = "CREATE TABLE main_t(x INTEGER);")]
 fn test_vacuum_main_into(tmp_db: TempDatabase) -> anyhow::Result<()> {
     let conn = tmp_db.connect_limbo();
@@ -3822,8 +3818,8 @@ fn test_vacuum_into_preserves_autoincrement_counter(tmp_db: TempDatabase) -> any
     conn.execute("INSERT INTO t (val) VALUES ('a')")?;
     conn.execute("INSERT INTO t (val) VALUES ('b')")?;
     conn.execute("INSERT INTO t (val) VALUES ('c')")?;
-    // Delete some rows to create a gap - AUTOINCREMENT should never reuse rowids
-    conn.execute("DELETE FROM t WHERE id = 2")?;
+    // Delete the newest rows so the counter is above max(id) - AUTOINCREMENT should never reuse rowids
+    conn.execute("DELETE FROM t WHERE id >= 2")?;
     let source_seq: Vec<(String, i64)> =
         conn.exec_rows("SELECT name, seq FROM sqlite_sequence WHERE name = 't'");
     assert_eq!(source_seq, vec![("t".to_string(), 3)]);
@@ -3841,6 +3837,12 @@ fn test_vacuum_into_preserves_autoincrement_counter(tmp_db: TempDatabase) -> any
     let dest_seq: Vec<(String, i64)> =
         dest_conn.exec_rows("SELECT name, seq FROM sqlite_sequence WHERE name = 't'");
     assert_eq!(dest_seq, source_seq);
+    if tmp_db.enable_mvcc {
+        let dest_counter: Vec<(i64, i64)> = dest_conn.exec_rows(
+            "SELECT value, is_called FROM __turso_internal_seq___turso_internal_autoincrement_t",
+        );
+        assert_eq!(dest_counter, vec![(3, 1)]);
+    }
 
     // Insert a new row on the source - should get id=4 (not 2, because AUTOINCREMENT)
     conn.execute("INSERT INTO t (val) VALUES ('d')")?;
@@ -3859,6 +3861,34 @@ fn test_vacuum_into_preserves_autoincrement_counter(tmp_db: TempDatabase) -> any
         dest_new, source_new,
         "AUTOINCREMENT counter should produce the same next rowid on both databases"
     );
+
+    Ok(())
+}
+
+/// Plain VACUUM must leave the AUTOINCREMENT counter exactly as it was. On an
+/// MVCC database the counter's backing table must keep a single row.
+#[turso_macros::test(mvcc)]
+fn test_vacuum_preserves_autoincrement_counter(tmp_db: TempDatabase) -> anyhow::Result<()> {
+    let conn = tmp_db.connect_limbo();
+
+    conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY AUTOINCREMENT, val TEXT)")?;
+    conn.execute("INSERT INTO t (val) VALUES ('a'), ('b'), ('c')")?;
+    conn.execute("DELETE FROM t WHERE id >= 2")?;
+    checkpoint_if_mvcc(&tmp_db, &conn)?;
+
+    conn.execute("VACUUM")?;
+    assert_eq!(run_integrity_check(&conn), "ok");
+
+    let seq: Vec<(String, i64)> = conn.exec_rows("SELECT name, seq FROM sqlite_sequence");
+    assert_eq!(seq, vec![("t".to_string(), 3)]);
+    if tmp_db.enable_mvcc {
+        let counter: Vec<(i64, i64)> = conn.exec_rows(
+            "SELECT value, is_called FROM __turso_internal_seq___turso_internal_autoincrement_t",
+        );
+        assert_eq!(counter, vec![(3, 1)]);
+    }
+    conn.execute("INSERT INTO t (val) VALUES ('d')")?;
+    assert_eq!(scalar_i64(&conn, "SELECT id FROM t WHERE val = 'd'"), 4);
 
     Ok(())
 }
@@ -4495,7 +4525,6 @@ fn test_plain_vacuum_with_multiple_strict_tables(tmp_db: TempDatabase) -> anyhow
 }
 
 /// Plain VACUUM preserves indexes (queries using them still work).
-#[cfg_attr(feature = "checksum", ignore)]
 #[turso_macros::test(init_sql = "CREATE TABLE t1(a INTEGER PRIMARY KEY, b TEXT);")]
 fn test_plain_vacuum_preserves_indexes(tmp_db: TempDatabase) -> anyhow::Result<()> {
     let conn = tmp_db.connect_limbo();
@@ -4691,7 +4720,6 @@ fn test_plain_vacuum_preserves_vector_blobs(tmp_db: TempDatabase) -> anyhow::Res
 }
 
 /// Plain VACUUM preserves views.
-#[cfg_attr(feature = "checksum", ignore)]
 #[turso_macros::test(views, init_sql = "CREATE TABLE t1(a INTEGER PRIMARY KEY, b TEXT);")]
 fn test_plain_vacuum_preserves_views(tmp_db: TempDatabase) -> anyhow::Result<()> {
     let conn = tmp_db.connect_limbo();
@@ -4713,8 +4741,113 @@ fn test_plain_vacuum_preserves_views(tmp_db: TempDatabase) -> anyhow::Result<()>
     Ok(())
 }
 
+/// Each materialized view created by `create_materialized_view_fixture`,
+/// with its defining query.
+const MATERIALIZED_VIEW_FIXTURE: &[(&str, &str)] = &[
+    ("v", "SELECT a, b FROM t WHERE b > 100"),
+    (
+        "vg",
+        "SELECT g, count(*) AS n, sum(b) AS s, min(b) AS lo FROM t GROUP BY g",
+    ),
+    ("vj", "SELECT t.a, u.n FROM t JOIN u ON t.a = u.k"),
+    ("vv", "SELECT g, n FROM vg WHERE n > 1"),
+    ("vd", "SELECT DISTINCT g, b % 3 FROM t"),
+];
+
+/// Plain VACUUM keeps materialized views, their internal state tables, and
+/// their maintenance working. VACUUM used to fail with "table
+/// __turso_internal_dbsp_metadata_v2_v already exists", because it copied a
+/// view's internal tables and then replayed the CREATE MATERIALIZED VIEW
+/// that creates them.
+///
+/// VACUUM now rebuilds the views from the base tables, so the rowids of view
+/// rows and internal state rows may change, as SQLite allows for tables
+/// without an INTEGER PRIMARY KEY. The base tables must stay identical.
+#[turso_macros::test(views)]
+fn test_plain_vacuum_preserves_materialized_views(tmp_db: TempDatabase) -> anyhow::Result<()> {
+    let conn = tmp_db.connect_limbo();
+    create_materialized_view_fixture(&conn)?;
+    let base_tables_before = base_table_hashes(&tmp_db);
+    let schema_before = normalized_schema_snapshot(&conn);
+    conn.execute("VACUUM")?;
+    assert_eq!(run_integrity_check(&conn), "ok");
+    assert_eq!(base_table_hashes(&tmp_db), base_tables_before);
+    assert_eq!(normalized_schema_snapshot(&conn), schema_before);
+    assert_materialized_views_equal_their_queries(&conn);
+
+    conn.execute("INSERT INTO t VALUES (1000, 2, 999)")?;
+    conn.execute("DELETE FROM u WHERE k = 3")?;
+    assert_materialized_views_equal_their_queries(&conn);
+    drop(conn);
+
+    let (_reopened, conn) = connect_existing_with_opts(&tmp_db.path, tmp_db.db_opts);
+    assert_materialized_views_equal_their_queries(&conn);
+    assert_eq!(run_integrity_check(&conn), "ok");
+    Ok(())
+}
+
+/// VACUUM INTO writes a copy whose materialized views equal their queries and
+/// keep being maintained.
+#[turso_macros::test(views)]
+fn test_vacuum_into_preserves_materialized_views(tmp_db: TempDatabase) -> anyhow::Result<()> {
+    let conn = tmp_db.connect_limbo();
+    create_materialized_view_fixture(&conn)?;
+    let dest_dir = TempDir::new()?;
+    let dest_path = dest_dir.path().join("vacuumed.db");
+    conn.execute(format!("VACUUM INTO '{}'", dest_path.to_str().unwrap()))?;
+
+    let (dest_db, dest_conn) = connect_existing_with_opts(&dest_path, tmp_db.db_opts);
+    assert_eq!(run_integrity_check(&dest_conn), "ok");
+    assert_eq!(base_table_hashes(&dest_db), base_table_hashes(&tmp_db));
+    assert_eq!(
+        normalized_schema_snapshot(&dest_conn),
+        normalized_schema_snapshot(&conn)
+    );
+    assert_materialized_views_equal_their_queries(&dest_conn);
+
+    dest_conn.execute("INSERT INTO t VALUES (1000, 2, 999)")?;
+    assert_materialized_views_equal_their_queries(&dest_conn);
+    assert_eq!(run_integrity_check(&dest_conn), "ok");
+    Ok(())
+}
+
+fn create_materialized_view_fixture(conn: &Arc<Connection>) -> anyhow::Result<()> {
+    conn.execute("CREATE TABLE t(a INTEGER PRIMARY KEY, g INTEGER, b INTEGER)")?;
+    conn.execute("CREATE TABLE u(k INTEGER PRIMARY KEY, n INTEGER)")?;
+    conn.execute("INSERT INTO t SELECT value, value % 5, value * 2 FROM generate_series(1, 300)")?;
+    conn.execute("INSERT INTO u SELECT value, value * 10 FROM generate_series(1, 50)")?;
+    for (name, query) in MATERIALIZED_VIEW_FIXTURE {
+        conn.execute(format!("CREATE MATERIALIZED VIEW {name} AS {query}"))?;
+    }
+    conn.execute("DELETE FROM t WHERE a % 7 = 0")?;
+    Ok(())
+}
+
+fn base_table_hashes(db: &TempDatabase) -> Vec<String> {
+    ["t", "u"]
+        .into_iter()
+        .map(|table| {
+            let options = turso_dbhash::DbHashOptions {
+                table_filter: Some(table.to_string()),
+                without_schema: true,
+                ..Default::default()
+            };
+            compute_dbhash_with_options_and_database_opts(db, &options, db.db_opts).hash
+        })
+        .collect()
+}
+
+fn assert_materialized_views_equal_their_queries(conn: &Arc<Connection>) {
+    for (name, query) in MATERIALIZED_VIEW_FIXTURE {
+        let mut view = limbo_exec_rows(conn, &format!("SELECT * FROM {name}"));
+        let mut fresh = limbo_exec_rows(conn, query);
+        view.sort_by_key(|row| format!("{row:?}"));
+        fresh.sort_by_key(|row| format!("{row:?}"));
+        assert_eq!(view, fresh, "materialized view {name} differs from {query}");
+    }
+}
+
 /// Plain VACUUM works on empty databases.
-#[cfg_attr(feature = "checksum", ignore)]
 #[turso_macros::test(init_sql = "CREATE TABLE t(a INTEGER);")]
 fn test_plain_vacuum_empty_table(tmp_db: TempDatabase) -> anyhow::Result<()> {
     let conn = tmp_db.connect_limbo();
@@ -4749,7 +4882,6 @@ fn test_plain_vacuum_empty_table(tmp_db: TempDatabase) -> anyhow::Result<()> {
 }
 
 /// Plain VACUUM preserves an empty table after heavy insert/update/delete churn.
-#[cfg_attr(feature = "checksum", ignore)]
 #[turso_macros::test(init_sql = "CREATE TABLE t(id INTEGER PRIMARY KEY, payload TEXT);")]
 fn test_plain_vacuum_empty_table_after_updates(tmp_db: TempDatabase) -> anyhow::Result<()> {
     let conn = tmp_db.connect_limbo();
@@ -4803,7 +4935,6 @@ fn test_plain_vacuum_empty_table_after_updates(tmp_db: TempDatabase) -> anyhow::
 }
 
 /// Multiple VACUUMs in a row work correctly.
-#[cfg_attr(feature = "checksum", ignore)]
 #[turso_macros::test(init_sql = "CREATE TABLE t(a INTEGER PRIMARY KEY, b TEXT);")]
 fn test_plain_vacuum_repeated(tmp_db: TempDatabase) -> anyhow::Result<()> {
     let conn = tmp_db.connect_limbo();
@@ -4824,7 +4955,6 @@ fn test_plain_vacuum_repeated(tmp_db: TempDatabase) -> anyhow::Result<()> {
 }
 
 /// Writes after VACUUM work correctly.
-#[cfg_attr(feature = "checksum", ignore)]
 #[turso_macros::test(init_sql = "CREATE TABLE t(a INTEGER PRIMARY KEY, b TEXT);")]
 fn test_plain_vacuum_then_write(tmp_db: TempDatabase) -> anyhow::Result<()> {
     let conn = tmp_db.connect_limbo();
@@ -4870,7 +5000,6 @@ fn test_plain_vacuum_rejects_active_statement(tmp_db: TempDatabase) -> anyhow::R
 
 /// Plain VACUUM reduces page_count when rows are deleted, and a subsequent
 /// checkpoint truncates the .db file to the compacted size.
-#[cfg_attr(feature = "checksum", ignore)]
 #[turso_macros::test(init_sql = "CREATE TABLE t(a INTEGER PRIMARY KEY, b TEXT);")]
 fn test_plain_vacuum_reduces_page_count(tmp_db: TempDatabase) -> anyhow::Result<()> {
     let conn = tmp_db.connect_limbo();
@@ -5863,6 +5992,53 @@ fn test_mvcc_plain_vacuum_discards_reused_index_rootpage_state() -> anyhow::Resu
 }
 
 #[test]
+fn test_mvcc_plain_vacuum_after_checkpoint_of_rows_never_written() -> anyhow::Result<()> {
+    let scenarios = [
+        (
+            "drop table with rows never written",
+            "CREATE TABLE u(x); CREATE INDEX u_x ON u(x); INSERT INTO u VALUES (1); DROP TABLE u;",
+            vec![(1, 1)],
+        ),
+        (
+            "drop index with rows never written",
+            "CREATE INDEX t_a ON t(a); INSERT INTO t VALUES (3, 3); DROP INDEX t_a;",
+            vec![(1, 1), (3, 3)],
+        ),
+        (
+            "delete rows never written",
+            "CREATE INDEX t_a ON t(a); INSERT INTO t VALUES (2, 2); DELETE FROM t WHERE id = 2;",
+            vec![(1, 1)],
+        ),
+    ];
+    for passive_checkpoint in [false, true] {
+        for (scenario, sql, expected_rows) in &scenarios {
+            let opts =
+                DatabaseOpts::new().with_experimental_mvcc_passive_checkpoint(passive_checkpoint);
+            let tmp_db = TempDatabase::builder()
+                .with_opts(opts)
+                .with_mvcc(true)
+                .build();
+            let conn = tmp_db.connect_limbo();
+            conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, a INT)")?;
+            conn.execute("INSERT INTO t VALUES (1, 1)")?;
+            conn.execute(sql)?;
+            conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")?;
+
+            conn.execute("VACUUM")?;
+
+            let rows: Vec<(i64, i64)> = conn.exec_rows("SELECT id, a FROM t ORDER BY id");
+            assert_eq!(
+                &rows, expected_rows,
+                "{scenario}, passive_checkpoint={passive_checkpoint}"
+            );
+            assert_eq!(run_integrity_check(&conn), "ok");
+        }
+    }
+
+    Ok(())
+}
+
+#[test]
 fn test_mvcc_plain_vacuum_requires_checkpointed_image() -> anyhow::Result<()> {
     let tmp_db =
         TempDatabase::new_with_mvcc("test_mvcc_plain_vacuum_requires_checkpointed_image.db");
@@ -6021,7 +6197,6 @@ fn populate_queued_multibatch(conn: &Arc<Connection>) -> anyhow::Result<()> {
     Ok(())
 }
 
-#[cfg_attr(feature = "checksum", ignore)]
 #[test]
 fn test_plain_vacuum_reset_during_checkpoint_io_cleans_up_checkpoint_and_vacuum_locks(
 ) -> anyhow::Result<()> {

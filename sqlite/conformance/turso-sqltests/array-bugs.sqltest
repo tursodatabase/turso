@@ -174,3 +174,13 @@ test array-nested-case-display {
 expect {
     {1,2}
 }
+
+test array-custom-type-decode-next-to-literal {
+    CREATE TYPE cents_lit BASE integer ENCODE value*100 DECODE value/100;
+    CREATE TABLE lit1 (id INTEGER PRIMARY KEY, xs cents_lit[]) STRICT;
+    INSERT INTO lit1 VALUES (1, '{1,2,3}');
+    SELECT 'l', xs FROM lit1;
+}
+expect {
+    l|{1,2,3}
+}

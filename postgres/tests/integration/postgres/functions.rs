@@ -2,6 +2,24 @@ use crate::common::TempDatabase;
 use turso_core::{Numeric, StepResult, Value};
 use turso_pg::PgConnection;
 
+#[turso_macros::test(mvcc)]
+fn test_pg_array_subquery_rebind_and_reset(db: TempDatabase) {
+    let conn = db.connect_postgres();
+    let mut stmt = conn
+        .prepare("SELECT ARRAY(SELECT 17 AS v UNION ALL SELECT 2 ORDER BY v LIMIT $1)")
+        .unwrap();
+
+    for (limit, expected) in [(1, "{2}"), (0, "{}"), (2, "{2,17}"), (1, "{2}")] {
+        stmt.bind_at(std::num::NonZero::new(1).unwrap(), Value::from_i64(limit))
+            .unwrap();
+        assert_eq!(
+            stmt.run_collect_rows().unwrap(),
+            vec![vec![Value::build_text(expected)]]
+        );
+        stmt.reset().unwrap();
+    }
+}
+
 fn query_text(conn: &PgConnection, sql: &str) -> Vec<String> {
     let mut rows = conn.query(sql).unwrap().unwrap();
     let mut result = Vec::new();
@@ -207,6 +225,41 @@ fn test_pg_set_config_validates_arguments(db: TempDatabase) {
 }
 
 #[turso_macros::test(mvcc)]
+fn test_pg_current_setting_reads_connection_settings_when_executed(db: TempDatabase) {
+    let conn = db.connect_postgres();
+    let other = db.connect_postgres();
+    let mut reader = conn
+        .prepare("SELECT current_setting('search_path')")
+        .unwrap();
+    assert_eq!(
+        reader.run_collect_rows().unwrap(),
+        vec![vec![Value::build_text("\"$user\", public")]]
+    );
+    conn.execute("SET search_path TO public").unwrap();
+    reader.reset().unwrap();
+    assert_eq!(
+        reader.run_collect_rows().unwrap(),
+        vec![vec![Value::build_text("public")]]
+    );
+    assert_eq!(
+        query_text(&other, "SELECT current_setting('search_path')"),
+        ["\"$user\", public"]
+    );
+}
+
+#[turso_macros::test(mvcc)]
+fn test_pg_current_setting_reports_default_without_session_state(db: TempDatabase) {
+    let conn = db.connect_limbo();
+    assert_eq!(
+        conn.prepare("SELECT current_setting('search_path')")
+            .unwrap()
+            .run_collect_rows()
+            .unwrap(),
+        vec![vec![Value::build_text("\"$user\", public")]]
+    );
+}
+
+#[turso_macros::test(mvcc)]
 fn test_pg_is_in_recovery_returns_temporary_true_text(db: TempDatabase) {
     let conn = db.connect_postgres();
     assert_eq!(
@@ -304,8 +357,9 @@ fn test_pg_derived_result_column_names(db: TempDatabase) {
     conn.execute("CREATE TABLE t (a integer)").unwrap();
 
     // PostgreSQL names unaliased function-call and keyword columns after the
-    // function, casts after the cast expression or else the target type, and
-    // other unaliased expressions `?column?`
+    // function, casts after the cast expression or else the target type,
+    // coalesce/greatest/least/nullif after the keyword, CASE after its ELSE
+    // expression or else `case`, and other unaliased expressions `?column?`
     for (sql, expected) in [
         ("SELECT version()", "version"),
         ("SELECT pg_catalog.version()", "version"),
@@ -333,6 +387,22 @@ fn test_pg_derived_result_column_names(db: TempDatabase) {
         ("SELECT 1::int::text", "text"),
         ("SELECT (1 + 1)::int", "int4"),
         ("SELECT * FROM (SELECT 1::bigint) AS s", "int8"),
+        ("SELECT coalesce(1, 2)", "coalesce"),
+        ("SELECT greatest(1, 2)", "greatest"),
+        ("SELECT least(1, 2)", "least"),
+        ("SELECT nullif(1, 2)", "nullif"),
+        ("SELECT coalesce(1, 2)::text", "coalesce"),
+        ("SELECT CASE WHEN true THEN 1 END", "case"),
+        ("SELECT CASE WHEN true THEN 1 ELSE abs(1) END", "abs"),
+        ("SELECT CASE WHEN true THEN 1 ELSE abs(1)::int END", "abs"),
+        ("SELECT CASE WHEN true THEN 1 ELSE 1::int END", "case"),
+        ("SELECT CASE WHEN true THEN 1 END::text", "text"),
+        ("SELECT CASE WHEN true THEN 1 ELSE 1::int END::text", "text"),
+        ("SELECT CASE WHEN true THEN 1 ELSE now() END::text", "now"),
+        (
+            "SELECT CASE WHEN true THEN 1 ELSE CASE WHEN true THEN 1 ELSE abs(1) END END",
+            "abs",
+        ),
     ] {
         let stmt = conn.prepare(sql).unwrap();
         assert_eq!(stmt.get_column_name(0), expected, "{sql}");

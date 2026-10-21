@@ -397,7 +397,28 @@ pub fn resolve_comparison_collseq_with_resolver(
         symbol_table,
         resolver,
     )?;
+    let lhs_column = lhs_column.or(comparison_operand_column_collseq(
+        lhs_expr,
+        referenced_tables,
+    )?);
+    let rhs_column = rhs_column.or(comparison_operand_column_collseq(
+        rhs_expr,
+        referenced_tables,
+    )?);
     Ok(lhs_explicit.or(rhs_explicit).or(lhs_column).or(rhs_column))
+}
+
+/// Collation of `x` or of `y` in `x IN (SELECT y ...)`: its explicit `COLLATE` if any,
+/// otherwise its column's collation (BINARY when the column declares none). `x` belongs
+/// to the outer query and `y` to the subquery, so each side is looked up in its own tables.
+pub fn in_subquery_side_collation(
+    expr: &Expr,
+    referenced_tables: &TableReferences,
+) -> Result<Option<CollationSeq>> {
+    let (explicit, _) =
+        get_collseq_parts_from_expr_with_symbols(expr, referenced_tables, None, None)?;
+    let column = comparison_operand_column_collseq(expr, referenced_tables)?;
+    Ok(explicit.or(column))
 }
 
 /// Return the collation context that standalone expression translation would

@@ -1196,6 +1196,17 @@ impl TursoConnection {
     pub fn last_insert_rowid(&self) -> i64 {
         self.connection.last_insert_rowid()
     }
+    /// See `turso_core::Connection::materialized_view_chosen_value_collations`.
+    /// For test oracles only.
+    #[cfg(feature = "test_helper")]
+    pub fn materialized_view_chosen_value_collations(
+        &self,
+        view_name: &str,
+    ) -> Result<Vec<Option<String>>, TursoError> {
+        Ok(self
+            .connection
+            .materialized_view_chosen_value_collations(view_name)?)
+    }
 
     #[allow(clippy::too_many_arguments)]
     pub fn register_external_scalar_function(

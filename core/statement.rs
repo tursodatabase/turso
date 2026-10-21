@@ -182,6 +182,7 @@ fn infer_expression_primitive(
     expr: &turso_parser::ast::Expr,
     referenced_tables: Option<&translate::plan::TableReferences>,
 ) -> Option<&'static str> {
+    use crate::function::ScalarFunc;
     use turso_parser::ast::{Expr, Operator, UnaryOperator};
 
     match expr {
@@ -250,6 +251,34 @@ fn infer_expression_primitive(
             ),
         },
         Expr::RowId { .. } => Some("INTEGER"),
+        Expr::Case {
+            when_then_pairs,
+            else_expr,
+            ..
+        } => common_primitive(
+            when_then_pairs
+                .iter()
+                .map(|(_, then)| then.as_ref())
+                .chain(else_expr.as_deref()),
+            referenced_tables,
+        ),
+        Expr::FunctionCall { name, args, .. } => {
+            match crate::function::Func::resolve_function(name.as_str(), args.len()) {
+                Ok(Some(crate::function::Func::Scalar(
+                    ScalarFunc::Coalesce | ScalarFunc::IfNull | ScalarFunc::Max | ScalarFunc::Min,
+                ))) => common_primitive(args.iter().map(|arg| arg.as_ref()), referenced_tables),
+                Ok(Some(crate::function::Func::Scalar(ScalarFunc::Nullif))) => {
+                    infer_expression_primitive(&args[0], referenced_tables)
+                }
+                Ok(Some(crate::function::Func::Scalar(ScalarFunc::Abs))) => {
+                    Some(combine_arithmetic_primitive(
+                        Some("INTEGER"),
+                        infer_expression_primitive(&args[0], referenced_tables),
+                    ))
+                }
+                _ => None,
+            }
+        }
         // CAST, column references, and anything else: defer to the affinity
         // machinery, which handles these shapes correctly.
         _ => affinity_to_primitive(translate::expr::get_expr_affinity(
@@ -258,6 +287,31 @@ fn infer_expression_primitive(
             None,
         )),
     }
+}
+
+/// The type that every non-NULL expression can be converted to, following
+/// PostgreSQL's rule for CASE branches and COALESCE arguments: mixed numeric
+/// types widen the way arithmetic does, any other mix has no common type.
+fn common_primitive<'a>(
+    exprs: impl Iterator<Item = &'a turso_parser::ast::Expr>,
+    referenced_tables: Option<&translate::plan::TableReferences>,
+) -> Option<&'static str> {
+    use turso_parser::ast::{Expr, Literal};
+
+    let is_numeric = |primitive| matches!(primitive, "INTEGER" | "REAL" | "NUMERIC");
+    let mut common = None;
+    for expr in exprs.filter(|expr| !matches!(expr, Expr::Literal(Literal::Null))) {
+        let primitive = infer_expression_primitive(expr, referenced_tables)?;
+        common = match common {
+            None => Some(primitive),
+            Some(common) if common == primitive => Some(common),
+            Some(common) if is_numeric(common) && is_numeric(primitive) => {
+                Some(combine_arithmetic_primitive(Some(common), Some(primitive)))
+            }
+            Some(_) => return None,
+        };
+    }
+    common
 }
 
 /// Map [`crate::vdbe::affinity::Affinity`] to the uppercase primitive name
@@ -325,6 +379,9 @@ pub struct Statement {
     /// True if this statement called `Connection::start_nested()` during
     /// construction and therefore must call `end_nested()` on drop.
     nested_guard_active: bool,
+    /// The options the statement was prepared with, reused when a schema
+    /// change makes it compile again from its SQL text.
+    prepare_options: PrepareOptions,
 }
 
 crate::assert::assert_send_sync!(Statement);
@@ -368,6 +425,7 @@ impl Statement {
             tail_offset,
             StatementOrigin::Root,
             false,
+            PrepareOptions::default(),
         )
     }
 
@@ -379,6 +437,7 @@ impl Statement {
         tail_offset: usize,
         origin: StatementOrigin,
         nested_guard_active: bool,
+        prepare_options: PrepareOptions,
     ) -> Self {
         let (max_registers, cursor_count) = match query_mode {
             QueryMode::Normal => (program.max_registers, program.cursor_ref.len()),
@@ -405,6 +464,7 @@ impl Statement {
             counted_as_active_root: false,
             is_blob_handle: false,
             nested_guard_active,
+            prepare_options,
             analyze_refresh: None,
         }
     }
@@ -711,7 +771,10 @@ impl Statement {
                 break;
             }
             tracing::debug!("reprepare: attempt={}", attempt);
-            if let Err(err) = self.reprepare() {
+            if let Err(err) = self
+                .rollback_autocommit_txn()
+                .and_then(|()| self.reprepare())
+            {
                 self.release_active_root_if_counted();
                 return Err(err);
             }
@@ -818,6 +881,12 @@ impl Statement {
         self.program
             .step(&mut self.state, &self.pager, self.query_mode, None)
             .map_err(|err| *err)
+    }
+
+    /// Makes a trigger or foreign key action see the same current time as
+    /// the statement that runs it, as SQLite does.
+    pub(crate) fn set_current_time(&mut self, now: crate::WallClockInstant) {
+        self.state.current_time = Some(now);
     }
 
     pub(crate) fn abort_subprogram(&mut self, err: Option<&LimboError>) -> Result<()> {
@@ -963,9 +1032,7 @@ impl Statement {
         Ok(result)
     }
 
-    #[instrument(skip_all, level = Level::DEBUG)]
-    fn reprepare(&mut self) -> Result<()> {
-        tracing::trace!("repreparing statement");
+    fn rollback_autocommit_txn(&mut self) -> Result<()> {
         let conn = self.program.connection.clone();
         let main_pager = conn.pager.load().clone();
 
@@ -987,9 +1054,6 @@ impl Statement {
         if conn.get_auto_commit() && has_implicit_txn_state {
             conn.rollback_current_txn_state(&main_pager, true);
             self.state.auto_txn_cleanup = vdbe::TxnCleanup::None;
-        }
-        if conn.get_auto_commit() && !conn.schema_reparse_in_progress() {
-            conn.maybe_reparse_schema()?;
         }
 
         // End transactions on attached database pagers so they get a fresh view
@@ -1020,6 +1084,16 @@ impl Statement {
                 pager.rollback_attached();
             }
         }
+        Ok(())
+    }
+
+    #[instrument(skip_all, level = Level::DEBUG)]
+    fn reprepare(&mut self) -> Result<()> {
+        tracing::trace!("repreparing statement");
+        let conn = self.program.connection.clone();
+        if conn.get_auto_commit() && !conn.schema_reparse_in_progress() {
+            conn.maybe_reparse_schema()?;
+        }
 
         // Refresh from shared schema only when shared is newer; this preserves a
         // connection-local schema that is ahead of shared. An MVCC checkpoint can
@@ -1036,7 +1110,6 @@ impl Statement {
             crate::turso_assert_eq!(QueryMode::new(&cmd), mode);
             let (Cmd::Stmt(stmt) | Cmd::Explain(stmt) | Cmd::ExplainQueryPlan { stmt, .. }) = cmd;
             let schema = conn.schema.read().clone();
-            let prepare_options = PrepareOptions::default();
             translate::translate(
                 &schema,
                 stmt,
@@ -1046,7 +1119,7 @@ impl Statement {
                 mode,
                 &self.program.sql,
                 self.origin,
-                &prepare_options,
+                &self.prepare_options,
             )?
         };
 
@@ -1347,7 +1420,13 @@ impl Statement {
         };
         Ok(Some(ColumnTypeInfo {
             declared_name: name.to_string(),
-            array_dimensions: 0,
+            array_dimensions: match &column.expr {
+                turso_parser::ast::Expr::Cast {
+                    type_name: Some(ty),
+                    ..
+                } => ty.array_dimensions,
+                _ => 0,
+            },
             base_type: None,
             kind: ColumnTypeKind::Builtin,
         }))

@@ -3472,10 +3472,11 @@ pub enum Cursor {
     Pseudo(Box<PseudoCursor>),
     Sorter(Box<Sorter>),
     Virtual(VirtualTableCursor),
-    MaterializedView(Box<crate::incremental::cursor::MaterializedViewCursor>),
     /// Permanently-null placeholder installed by `NullRow` on a
     /// never-opened cursor slot; all reads yield NULL.
     NullRow,
+    /// In-memory cursor over a transaction's captured materialized-view delta.
+    Delta(Box<crate::incremental::vdbe_maintenance::DeltaCursor>),
 }
 
 impl Debug for Cursor {
@@ -3487,8 +3488,8 @@ impl Debug for Cursor {
             Self::Pseudo(..) => f.debug_tuple("Pseudo").finish(),
             Self::Sorter(..) => f.debug_tuple("Sorter").finish(),
             Self::Virtual(..) => f.debug_tuple("Virtual").finish(),
-            Self::MaterializedView(..) => f.debug_tuple("MaterializedView").finish(),
             Self::NullRow => f.debug_tuple("NullRow").finish(),
+            Self::Delta(..) => f.debug_tuple("Delta").finish(),
         }
     }
 }
@@ -3515,10 +3516,18 @@ impl Cursor {
         Self::Sorter(Box::new(cursor))
     }
 
-    pub fn new_materialized_view(
-        cursor: crate::incremental::cursor::MaterializedViewCursor,
-    ) -> Self {
-        Self::MaterializedView(Box::new(cursor))
+    pub fn new_delta(cursor: crate::incremental::vdbe_maintenance::DeltaCursor) -> Self {
+        Self::Delta(Box::new(cursor))
+    }
+
+    pub fn as_delta_mut(&mut self) -> &mut crate::incremental::vdbe_maintenance::DeltaCursor {
+        match self {
+            Self::Delta(cursor) => cursor,
+            _ => {
+                mark_unlikely();
+                panic!("Cursor is not a delta cursor");
+            }
+        }
     }
 
     pub fn as_btree_mut(&mut self) -> &mut dyn CursorTrait {
@@ -3585,18 +3594,6 @@ impl Cursor {
         }
     }
 
-    pub fn as_materialized_view_mut(
-        &mut self,
-    ) -> &mut crate::incremental::cursor::MaterializedViewCursor {
-        match self {
-            Self::MaterializedView(cursor) => cursor,
-            _ => {
-                mark_unlikely();
-                panic!("Cursor is not a materialized view cursor");
-            }
-        }
-    }
-
     pub fn as_index_method_mut(&mut self) -> &mut dyn IndexMethodCursor {
         match self {
             Self::IndexMethod(cursor) => cursor.as_mut(),
@@ -3639,10 +3636,7 @@ impl Cursor {
             Self::Dyn(cursor, ..) => cursor.get_null_flag(),
             Self::Virtual(cursor) => cursor.get_null_flag(),
             Self::NullRow => true,
-            Self::IndexMethod(_)
-            | Self::Pseudo(_)
-            | Self::Sorter(_)
-            | Self::MaterializedView(_) => false,
+            Self::IndexMethod(_) | Self::Pseudo(_) | Self::Sorter(_) | Self::Delta(_) => false,
         }
     }
 }

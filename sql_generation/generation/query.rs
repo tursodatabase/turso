@@ -431,7 +431,10 @@ fn gen_insert_values<R: Rng + ?Sized, C: GenerationContext>(
                 .iter()
                 .enumerate()
                 .map(|(col_idx, c)| {
-                    if integer_pk_idx == Some(col_idx) && rng.random_bool(INTEGER_PK_NULL_PROB) {
+                    if integer_pk_idx == Some(col_idx)
+                        && insert_opts.allow_implicit_rowids
+                        && rng.random_bool(INTEGER_PK_NULL_PROB)
+                    {
                         return SimValue::NULL;
                     }
                     if c.has_unique_or_pk() {
@@ -473,7 +476,6 @@ fn gen_insert_upsert_values<R: Rng + ?Sized, C: GenerationContext>(
     const UNIQUE_COL_STRIDE: i64 = 10_000_000;
     const FRESH_ID_JITTER: i64 = 5;
     const PAYLOAD_OFFSET_BUMP: i64 = 42;
-    const UPSERT_INTEGER_PK_NULL_PROB: f64 = 0.25;
 
     if !rng.random_bool(insert_opts.upsert_prob) {
         return None;
@@ -604,7 +606,7 @@ fn gen_insert_upsert_values<R: Rng + ?Sized, C: GenerationContext>(
         );
     }
     row[pk_idx] = SimValue::unique_for_type(&pk_col.column_type, new_id);
-    if rng.random_bool(UPSERT_INTEGER_PK_NULL_PROB) {
+    if insert_opts.allow_implicit_rowids && rng.random_bool(0.25) {
         row[pk_idx] = SimValue::NULL;
     }
 
@@ -1052,6 +1054,70 @@ impl Arbitrary for DropIndex {
         Self {
             index_name: index.index_name.clone(),
             table_name: table.name.clone(),
+        }
+    }
+}
+
+#[cfg(test)]
+mod insert_tests {
+    use super::*;
+    use crate::generation::tests::TestContext;
+    use rand::SeedableRng;
+
+    #[test]
+    fn insert_generation_can_require_explicit_rowids() {
+        let mut context = TestContext::default();
+        context.opts.query.insert.upsert_prob = 1.0;
+        context.opts.query.insert.allow_implicit_rowids = false;
+        context.tables.push(Table {
+            name: "t".into(),
+            columns: vec![
+                Column {
+                    name: "id".into(),
+                    column_type: ColumnType::Integer,
+                    constraints: vec![ColumnConstraint::PrimaryKey {
+                        order: None,
+                        conflict_clause: None,
+                        auto_increment: false,
+                    }],
+                },
+                Column {
+                    name: "name".into(),
+                    column_type: ColumnType::Text,
+                    constraints: vec![ColumnConstraint::Unique(None)],
+                },
+            ],
+            rows: vec![
+                vec![
+                    SimValue(turso_core::Value::from_i64(1)),
+                    SimValue(turso_core::Value::build_text("a")),
+                ],
+                vec![
+                    SimValue(turso_core::Value::from_i64(2)),
+                    SimValue(turso_core::Value::build_text("b")),
+                ],
+            ],
+            indexes: vec![],
+        });
+        let mut rng = rand_chacha::ChaCha8Rng::seed_from_u64(1);
+        for _ in 0..100 {
+            let insert =
+                gen_insert_upsert_values(&mut rng, &context, &context.opts.query.insert).unwrap();
+            let Insert::Values {
+                values,
+                on_conflict,
+                ..
+            } = insert
+            else {
+                panic!("expected UPSERT");
+            };
+            assert!(on_conflict.is_some());
+            assert!(values[0][0].0.as_int().is_some());
+            let insert = gen_insert_values(&mut rng, &context, &context.opts.query.insert).unwrap();
+            let Insert::Values { values, .. } = insert else {
+                panic!("expected INSERT VALUES");
+            };
+            assert!(values.iter().all(|row| row[0].0.as_int().is_some()));
         }
     }
 }

@@ -12,6 +12,7 @@ default = ["encryption", "pure-rust-crypto"]
 encryption = ["turso_core/encryption"]
 pure-rust-crypto = ["turso_core/pure-rust-crypto"]
 fts = ["turso_core/fts"]
+test_helper = ["turso_core/test_helper"]
 
 [lib]
 doc = false
@@ -40,3 +41,4 @@ tempfile = { workspace = true }
 
 [build-dependencies]
 bindgen = "0.69.5"
+find-msvc-tools = "0.1.9"

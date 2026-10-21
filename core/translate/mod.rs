@@ -10,7 +10,6 @@
 pub(crate) mod aggregation;
 pub(crate) mod alter;
 pub(crate) mod analyze;
-pub(crate) mod attach;
 pub(crate) mod collate;
 mod compound_select;
 pub(crate) mod delete;
@@ -24,7 +23,6 @@ pub(crate) mod group_by;
 pub(crate) mod index;
 pub(crate) mod insert;
 pub(crate) mod integrity_check;
-pub(crate) mod logical;
 pub(crate) mod main_loop;
 pub(crate) mod optimizer;
 pub(crate) mod order_by;
@@ -55,6 +53,8 @@ use crate::storage::pager::Pager;
 use crate::sync::Arc;
 use crate::translate::delete::translate_delete;
 use crate::translate::emitter::Resolver;
+use crate::translate::expr::WalkControl;
+use crate::util::walk_stmt_expressions;
 use crate::vdbe::builder::{ProgramBuilder, ProgramBuilderOpts, QueryMode};
 use crate::vdbe::Program;
 use crate::{bail_parse_error, Connection, Result, SymbolTable};
@@ -114,6 +114,7 @@ pub fn translate(
         connection.database_schemas(),
         &connection.temp.database,
         connection.attached_databases(),
+        connection.namespaces(),
         syms,
         connection.experimental_custom_types_enabled(),
         connection.get_dqs_dml().into(),
@@ -129,6 +130,13 @@ pub fn translate(
     );
     #[cfg(feature = "simulator")]
     resolver.set_subquery_unnesting_mode(connection.subquery_unnesting_mode());
+
+    walk_stmt_expressions(&stmt, &mut |expr| {
+        if let ast::Expr::Variable(variable) = expr {
+            program.register_variable(variable);
+        }
+        Ok(WalkControl::Continue)
+    })?;
 
     match stmt {
         // There can be no nesting with pragma, so lift it up here
@@ -225,7 +233,14 @@ pub fn translate_inner(
         }
         ast::Stmt::Analyze { name } => translate_analyze(name, resolver, program)?,
         ast::Stmt::Attach { expr, db_name, key } => {
-            attach::translate_attach(&expr, resolver, &db_name, &key, program, connection.clone())?;
+            crate::dialect::sqlite::attach::translate_attach(
+                &expr,
+                resolver,
+                &db_name,
+                &key,
+                program,
+                connection.clone(),
+            )?;
         }
         ast::Stmt::Begin { typ, name } => translate_tx_begin(typ, name, resolver, program)?,
         ast::Stmt::Commit { name } => {
@@ -303,12 +318,13 @@ pub fn translate_inner(
         ast::Stmt::CreateMaterializedView {
             view_name,
             select,
+            columns,
             if_not_exists,
-            ..
         } => view::translate_create_materialized_view(
             &view_name,
             resolver,
             &select,
+            &columns,
             if_not_exists,
             connection.clone(),
             program,
@@ -339,9 +355,12 @@ pub fn translate_inner(
                 connection,
             )?
         }
-        ast::Stmt::Detach { name } => {
-            attach::translate_detach(&name, resolver, program, connection.clone())?
-        }
+        ast::Stmt::Detach { name } => crate::dialect::sqlite::attach::translate_detach(
+            &name,
+            resolver,
+            program,
+            connection.clone(),
+        )?,
         ast::Stmt::DropIndex {
             if_exists,
             idx_name,

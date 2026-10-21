@@ -186,6 +186,29 @@ Similar to `index_info` but includes additional columns.
 PRAGMA index_xinfo(index-name);
 ```
 
+### foreign_key_list
+
+Returns one row per parent key column of each foreign key constraint on a table. `id`
+numbers the constraints, `seq` is the position of the column within that constraint, and
+`from` and `to` are the child and parent columns. `on_update` and `on_delete` are
+`NO ACTION` unless the constraint declares an action, and `match` is always `NONE`.
+Constraints are reported newest declaration first, so a table-level `FOREIGN KEY` clause
+written last has `id` 0.
+
+```sql
+PRAGMA foreign_key_list(child);
+-- id | seq | table  | from     | to   | on_update | on_delete | match
+```
+
+An optional schema qualifier selects the database, and the same rows are available as the
+`pragma_foreign_key_list()` table-valued function. A name that is not a table with
+foreign keys, and a missing table argument, return no rows rather than an error.
+
+```sql
+PRAGMA main.foreign_key_list(child);
+SELECT * FROM pragma_foreign_key_list('child');
+```
+
 ### function_list
 
 Returns one row for each SQL function available.
@@ -327,6 +350,25 @@ PRAGMA data_sync_retry = 1;   -- retry on sync failure
 PRAGMA data_sync_retry = 0;   -- do not retry (default)
 ```
 
+### fullfsync
+
+<Warning>
+**Apple platforms only.** `F_FULLFSYNC` is a macOS and iOS system call. On other platforms
+Turso does not know the pragma name and ignores the statement, like any other unknown
+pragma, so it silently does nothing there.
+</Warning>
+
+On Apple platforms, enabling this makes Turso use `F_FULLFSYNC` instead of `fsync` when it
+syncs the database file, which also asks the storage device to flush its own cache to
+media. Off by default. It changes which sync call is used, not when the sync happens:
+`synchronous` still decides that.
+
+```sql
+PRAGMA fullfsync;        -- 0
+PRAGMA fullfsync = 1;    -- use F_FULLFSYNC
+PRAGMA fullfsync = off;  -- use fsync again
+```
+
 ### require_where
 
 <Info>
@@ -365,6 +407,25 @@ Performs a faster but less thorough integrity check than `integrity_check`.
 ```sql
 PRAGMA quick_check;
 ```
+
+## Debugging
+
+### vdbe_trace
+
+Turns tracing of the bytecode program on for this connection. Off by default. A program
+stepped while it is on writes to standard error: one line for each register the previous
+opcode changed, written as `R[i] = value`, then the opcode that is about to run, printed the
+way `EXPLAIN` prints it. The listing of a program starts with a `VDBE Trace:` line. A
+register that holds an aggregate state or a record prints as `<aggregate>` or `<record>`
+instead of a value.
+
+```sql
+PRAGMA vdbe_trace = 1;    -- trace programs on this connection
+PRAGMA vdbe_trace = off;  -- stop tracing
+```
+
+Reading the pragma does nothing: `PRAGMA vdbe_trace;` returns no rows and does not report
+the current setting.
 
 ## WAL Operations
 

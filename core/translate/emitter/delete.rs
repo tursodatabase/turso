@@ -278,9 +278,7 @@ fn emit_row_loop_delete(
         )?;
     }
     program.preassign_label_to_next_insn(after_main_loop_label);
-    if let Some(cdc_cursor_id) = t_ctx.cdc_cursor_id {
-        emit_cdc_autocommit_commit(program, resolver, cdc_cursor_id)?;
-    }
+    emit_cdc_autocommit_commit(program, resolver, t_ctx.cdc_cursor_id)?;
     // Emit scan-back loop for buffered RETURNING results.
     // All DML is complete at this point; now yield the buffered rows to the caller.
     // FkCheck must come before the scan-back so that FK violations prevent
@@ -820,10 +818,11 @@ fn emit_delete_row_common(
                 let table_reference = unsafe { &*table_reference };
                 Some(emit_cdc_full_record(
                     program,
+                    &t_ctx.resolver,
                     table_reference.table.columns(),
                     main_table_cursor_id,
                     rowid_reg,
-                ))
+                )?)
             } else {
                 None
             };
@@ -877,7 +876,6 @@ fn emit_delete_row_common(
                     *subquery_plan,
                     &subquery.query_type,
                     subquery.correlated || rerun_for_target_scan,
-                    true,
                 )?;
             }
             Ok(())

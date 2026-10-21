@@ -23,7 +23,7 @@ use crate::translate::{
 use crate::{
     emit_explain,
     schema::PseudoCursorType,
-    translate::collate::{get_collseq_from_expr_with_symbols, CollationSeq},
+    translate::collate::{resolve_comparison_collseq_with_symbols, CollationSeq},
     util::exprs_are_equivalent,
     vdbe::{
         builder::{CursorType, ProgramBuilder},
@@ -171,11 +171,12 @@ impl EmitGroupBy {
                 .zip(sort_order.iter())
                 .zip(group_by.nulls_order.iter())
                 .map(|((expr, ord), nulls)| {
-                    let collation = get_collseq_from_expr_with_symbols(
+                    let collation = Some(resolve_comparison_collseq_with_symbols(
+                        expr,
                         expr,
                         &plan.table_references,
                         Some(t_ctx.resolver.symbol_table),
-                    )?;
+                    )?);
                     Ok::<_, crate::LimboError>((*ord, collation, *nulls))
                 })
                 .try_collect::<Result<crate::alloc::Vec<_>>>()??;
@@ -440,9 +441,10 @@ fn collect_non_aggregate_expressions<'a>(
         let expr_appears_in_result_columns = result_columns
             .iter()
             .any(|expr| exprs_are_equivalent(expr, group_expr))
-            || root_result_columns
-                .iter()
-                .any(|rc| exprs_are_equivalent(&rc.expr, group_expr));
+            || (!can_return_json_subtype(group_expr)
+                && root_result_columns
+                    .iter()
+                    .any(|rc| exprs_are_equivalent(&rc.expr, group_expr)));
         non_aggregate_expressions.push((group_expr, expr_appears_in_result_columns));
     }
     for expr in result_columns {
@@ -521,10 +523,13 @@ fn collect_result_columns<'a>(
                 // may need its value afterward. We add it to result_columns so that
                 // value is read back even when the expression isn't selected, and skip
                 // its children because we reuse the expression's computed value.
-                if plan
-                    .group_by
-                    .as_ref()
-                    .is_some_and(|gb| gb.exprs.iter().any(|ge| exprs_are_equivalent(ge, expr)))
+                // A value read back from the GROUP BY sorter has lost its JSON subtype,
+                // so like SQLite we compute such an expression again from its columns.
+                if !can_return_json_subtype(expr)
+                    && plan
+                        .group_by
+                        .as_ref()
+                        .is_some_and(|gb| gb.exprs.iter().any(|ge| exprs_are_equivalent(ge, expr)))
                 {
                     result_columns.push(expr);
                     return Ok(WalkControl::SkipChildren);
@@ -534,6 +539,28 @@ fn collect_result_columns<'a>(
         Ok(WalkControl::Continue)
     })?;
     Ok(())
+}
+
+fn can_return_json_subtype(expr: &ast::Expr) -> bool {
+    let mut can_return_subtype = false;
+    walk_expr(expr, &mut |expr: &ast::Expr| -> Result<WalkControl> {
+        can_return_subtype |= match expr {
+            #[cfg(feature = "json")]
+            ast::Expr::FunctionCall { name, args, .. } => matches!(
+                crate::function::Func::resolve_function(name.as_str(), args.len()),
+                Ok(Some(crate::function::Func::Json(_)))
+            ),
+            ast::Expr::Binary(_, ast::Operator::ArrowRight, _) => true,
+            _ => false,
+        };
+        Ok(if can_return_subtype {
+            WalkControl::SkipChildren
+        } else {
+            WalkControl::Continue
+        })
+    })
+    .expect("walking an expression cannot fail");
+    can_return_subtype
 }
 
 /// In case sorting is needed for GROUP BY, creates a pseudo table that matches
@@ -692,12 +719,13 @@ pub fn group_by_process_single_group(
         .enumerate()
         .take(group_by.exprs.len())
     {
-        let maybe_collation = get_collseq_from_expr_with_symbols(
+        let collation = resolve_comparison_collseq_with_symbols(
+            &group_by.exprs[i],
             &group_by.exprs[i],
             &plan.table_references,
             Some(t_ctx.resolver.symbol_table),
         )?;
-        c.collation = maybe_collation.unwrap_or_default();
+        c.collation = collation;
     }
 
     // Compare the group by columns to the previous group by columns to see if we are at a new group or not

@@ -147,6 +147,152 @@ expect {
     public
 }
 
+test current-setting-default-search-path {
+    SELECT current_setting('search_path');
+    SELECT pg_catalog.current_setting('SEARCH_PATH');
+    SELECT current_setting('Search_Path', false);
+    SELECT current_setting('search_path', true);
+}
+expect {
+    "$user", public
+    "$user", public
+    "$user", public
+    "$user", public
+}
+
+test current-setting-reads-set-config {
+    SELECT quote_literal(set_config('search_path', ' "My,Schema", PUBLIC ', false));
+    SELECT quote_literal(current_setting('search_path'));
+    SELECT quote_literal(set_config('search_path', '', false));
+    SELECT quote_literal(current_setting('search_path'));
+    SELECT set_config('search_path', NULL, false);
+    SELECT current_setting('search_path');
+}
+expect {
+    ' "My,Schema", PUBLIC '
+    ' "My,Schema", PUBLIC '
+    ''
+    ''
+    "$user", public
+    "$user", public
+}
+
+test current-setting-reads-set {
+    SET search_path TO "My,Schema", PUBLIC;
+    SELECT current_setting('search_path');
+    SET search_path TO '';
+    SELECT current_setting('search_path');
+}
+expect {
+    "My,Schema", public
+    ""
+}
+
+test current-setting-sees-set-config-of-the-same-row {
+    CREATE TABLE setting_rows (x int);
+    INSERT INTO setting_rows VALUES (1), (2), (3);
+    SELECT set_config('search_path', 'v' || x, false), current_setting('search_path')
+    FROM setting_rows;
+    SELECT current_setting('search_path'), set_config('search_path', 'last', false);
+    SELECT current_setting('search_path');
+}
+expect {
+    v1|v1
+    v2|v2
+    v3|v3
+    v3|last
+    last
+}
+
+test current-setting-matches-pg-settings {
+    SET search_path TO public;
+    SELECT s.name, current_setting(s.name), s.setting
+    FROM pg_catalog.pg_settings s WHERE s.name = 'search_path';
+}
+expect {
+    search_path|public|public
+}
+
+test current-setting-takes-arguments-from-rows {
+    CREATE TABLE setting_names (id int, name text, missing_ok boolean);
+    INSERT INTO setting_names VALUES
+        (1, 'search_path', false), (2, 'no_such_setting', true),
+        (3, NULL, false), (4, 'search_path', NULL);
+    SELECT id, coalesce(current_setting(name, missing_ok), '<null>')
+    FROM setting_names ORDER BY id;
+}
+expect {
+    1|"$user", public
+    2|<null>
+    3|<null>
+    4|<null>
+}
+
+test current-setting-null-arguments-return-null {
+    SELECT coalesce(current_setting(NULL), '<null>');
+    SELECT coalesce(current_setting(NULL, true), '<null>');
+    SELECT coalesce(current_setting('search_path', NULL), '<null>');
+    SELECT coalesce(current_setting('no_such_setting', NULL), '<null>');
+}
+expect {
+    <null>
+    <null>
+    <null>
+    <null>
+}
+
+test current-setting-missing-ok-returns-null-for-unknown-parameters {
+    SELECT coalesce(current_setting('no_such_setting', true), '<null>');
+    SELECT coalesce(current_setting('nosuch.setting', true), '<null>');
+    SELECT coalesce(current_setting('', true), '<null>');
+}
+expect {
+    <null>
+    <null>
+    <null>
+}
+
+test current-setting-unknown-parameter-errors {
+    SELECT current_setting('no_such_setting');
+}
+expect error {
+    unrecognized configuration parameter "no_such_setting"
+}
+
+test current-setting-unknown-parameter-without-missing-ok-errors {
+    SELECT current_setting('no_such_setting', false);
+}
+expect error {
+    unrecognized configuration parameter "no_such_setting"
+}
+
+test current-setting-does-not-trim-the-parameter-name {
+    SELECT current_setting('search_path ');
+}
+expect error {
+    unrecognized configuration parameter "search_path "
+}
+
+test current-setting-integer-parameter-name-errors {
+    SELECT current_setting(5);
+}
+expect error {}
+
+test current-setting-text-missing-ok-errors {
+    SELECT current_setting('search_path', 'x');
+}
+expect error {}
+
+test current-setting-without-arguments-errors {
+    SELECT current_setting();
+}
+expect error {}
+
+test current-setting-with-three-arguments-errors {
+    SELECT current_setting('search_path', true, true);
+}
+expect error {}
+
 test obj-description-unknown-oid-is-null {
     SELECT obj_description(0, 'pg_class');
 }
@@ -203,6 +349,7 @@ test pg-get-expr-null-oid-does-not-hide-invalid-expression {
 }
 expect error {}
 
+@skip-if postgres "PostgreSQL prints (val > 0), and also lists the CHECK constraints of the information_schema domains"
 test pg-get-expr-check-constraint {
     CREATE TABLE checked (val int CHECK (val > 0));
     SELECT pg_get_expr(conbin, conrelid) FROM pg_constraint WHERE contype = 'c';
@@ -229,6 +376,20 @@ expect {
     1
 }
 
+test within-group-skips-nulls-with-any-null-order {
+    CREATE TABLE demo (value int);
+    INSERT INTO demo VALUES (1), (NULL), (2), (2);
+    SELECT percentile_cont(0.25) WITHIN GROUP (ORDER BY value) FROM demo;
+    SELECT percentile_disc(0) WITHIN GROUP (ORDER BY value NULLS FIRST) FROM demo;
+    SELECT mode() WITHIN GROUP (ORDER BY value NULLS LAST) FROM demo;
+}
+expect {
+    1.5
+    1
+    2
+}
+
+@skip-if postgres "Turso has the ACLs of PostgreSQL 16, without the MAINTAIN privilege (m) of PostgreSQL 17"
 test acldefault-object-kinds {
     SELECT pg_catalog.acldefault('c', 4294967294);
     SELECT acldefault('r', 4294967294);
@@ -271,6 +432,7 @@ expect {
     2615|2200|public|{owner=UC/owner}
 }
 
+@skip-if postgres "Turso has the ACLs of PostgreSQL 16, without the MAINTAIN privilege (m) of PostgreSQL 17"
 test acldefault-first-byte-selects-object-kind {
     SELECT acldefault('rr', 4294967294);
     SELECT acldefault('r ', 4294967294);
@@ -315,3 +477,335 @@ test acldefault-non-ascii-object-kind-errors {
     SELECT acldefault('é', 4294967294);
 }
 expect error {}
+
+test format-type-expanded {
+    SELECT format_type(16, -1);
+    SELECT format_type(23, -1);
+    SELECT format_type(25, -1);
+    SELECT format_type(114, -1);
+    SELECT format_type(3802, -1);
+    SELECT format_type(2950, -1);
+    SELECT format_type(1082, -1);
+    SELECT format_type(1114, -1);
+    SELECT format_type(1184, -1);
+    SELECT format_type(1186, -1);
+    SELECT format_type(2278, -1);
+    SELECT format_type(2205, -1);
+    SELECT format_type(2206, -1);
+    SELECT format_type(1000, -1);
+    SELECT format_type(1007, -1);
+    SELECT format_type(1009, -1);
+    SELECT format_type(1043, 54);
+}
+expect {
+    boolean
+    integer
+    text
+    json
+    jsonb
+    uuid
+    date
+    timestamp without time zone
+    timestamp with time zone
+    interval
+    void
+    regclass
+    regtype
+    boolean[]
+    integer[]
+    text[]
+    character varying(50)
+}
+
+test pg-type-is-visible {
+    SELECT CASE WHEN pg_type_is_visible(23) THEN 1 ELSE 0 END;
+}
+expect {
+    1
+}
+
+test lpad-rpad {
+    SELECT quote_literal(lpad('hi', 5, '*'));
+    SELECT quote_literal(rpad('hi', 5, '-'));
+    SELECT quote_literal(lpad('hi', 5));
+    SELECT quote_literal(lpad('hello world', 5));
+}
+expect {
+    '***hi'
+    'hi---'
+    '   hi'
+    'hello'
+}
+
+test pg-options-to-table-values {
+    SELECT option_name, COALESCE(option_value, 'NULL')
+    FROM pg_catalog.pg_options_to_table(ARRAY['a=b=c', 'flag', '', '=x', 'x=', 'é=olá', 'a=again']);
+}
+expect {
+    a|b=c
+    flag|NULL
+    |NULL
+    |x
+    x|
+    é|olá
+    a|again
+}
+
+test pg-options-to-table-empty {
+    SELECT count(*) FROM pg_options_to_table(NULL);
+    SELECT count(*) FROM pg_options_to_table('{}'::text[]);
+}
+expect {
+    0
+    0
+}
+
+test pg-options-to-table-text-array {
+    SELECT option_name, COALESCE(option_value, 'NULL') FROM pg_options_to_table('{"name=hello, world","flag","empty="}'::text[]);
+}
+expect {
+    name|hello, world
+    flag|NULL
+    empty|
+}
+
+test pg-options-to-table-nested {
+    SELECT * FROM pg_options_to_table(ARRAY[['a=b', 'c=d'], ['e=f', 'g=h']]);
+}
+expect {
+    a|b
+    c|d
+    e|f
+    g|h
+}
+
+test pg-options-to-table-null-element {
+    SELECT * FROM pg_options_to_table(ARRAY['a=b', NULL]);
+}
+expect error {
+    null array element not allowed in this context
+}
+
+test pg-options-to-table-correlated {
+    CREATE TABLE option_arrays (id int, options text[]);
+    INSERT INTO option_arrays VALUES (1, ARRAY['b=two', 'a=one']), (2, ARRAY['c=three']), (3, NULL);
+    SELECT id, ARRAY(SELECT option_name || '=' || option_value FROM pg_options_to_table(options) ORDER BY option_name)
+    FROM option_arrays ORDER BY id;
+}
+expect {
+    1|{a=one,b=two}
+    2|{c=three}
+    3|{}
+}
+
+test pg-options-to-table-empty-search-path {
+    SET search_path = '';
+    SELECT option_name, option_value FROM pg_options_to_table(ARRAY['a=b']);
+    SELECT option_name, option_value FROM pg_catalog.pg_options_to_table(ARRAY['c=d']);
+}
+expect {
+    a|b
+    c|d
+}
+
+test unnest-array-elements {
+    SELECT unnest FROM unnest(ARRAY[3, 1, 3]);
+    SELECT COALESCE(x, '<null>') FROM pg_catalog.unnest(ARRAY['a,b', NULL, 'NULL', '']) AS t(x);
+    SELECT * FROM unnest(ARRAY[[1, 2], [3, 4]]);
+    SELECT count(*) FROM unnest(NULL::int[]);
+    SELECT count(*) FROM unnest('{}'::text[]);
+}
+expect {
+    3
+    1
+    3
+    a,b
+    <null>
+    NULL
+
+    1
+    2
+    3
+    4
+    0
+    0
+}
+
+test unnest-pgdump-correlated {
+    CREATE TABLE unnest_tags (id int, tags text[]);
+    INSERT INTO unnest_tags VALUES (1, ARRAY['a', 'b']), (2, ARRAY['c']), (3, NULL);
+    SELECT id, array_to_string(ARRAY(SELECT quote_literal(x) FROM unnest(tags) AS t(x)), ', ')
+    FROM unnest_tags ORDER BY id;
+}
+expect {
+    1|'a', 'b'
+    2|'c'
+    3|
+}
+
+test unnest-join-left {
+    CREATE TABLE unnest_ids (id int);
+    INSERT INTO unnest_ids VALUES (1), (2);
+    SELECT src.id FROM unnest('{2,3}'::oid[]) AS src(id)
+    JOIN unnest_ids AS t ON src.id = t.id;
+}
+expect {
+    2
+}
+
+test unnest-join-right {
+    CREATE TABLE unnest_inputs (id int, vals int[]);
+    INSERT INTO unnest_inputs VALUES (1, ARRAY[2,3]), (2, NULL);
+    SELECT t.id, COALESCE(src.val, -1) FROM unnest_inputs AS t
+    LEFT JOIN unnest(t.vals) AS src(val) ON true ORDER BY t.id, src.val;
+}
+expect {
+    1|2
+    1|3
+    2|-1
+}
+
+test json-to-recordset-column-list {
+    SELECT (id + 10) || ':' || v FROM json_to_recordset('[{"id":1,"v":"a"},{"id":2,"v":"b"}]') AS _("id" integer, "v" text) ORDER BY id;
+    SELECT (id + 10) || ':' || v FROM jsonb_to_recordset('[{"id":3,"v":"c"},{"id":4,"v":"d"}]'::jsonb) AS _("id" integer, "v" text) ORDER BY id;
+    SELECT count(*) FROM json_to_recordset('[]') AS _(id integer);
+    SELECT count(*) FROM json_to_recordset(NULL) AS _(id integer);
+}
+expect {
+    11:a
+    12:b
+    13:c
+    14:d
+    0
+    0
+}
+
+test json-to-record-column-list {
+    SELECT (id + 10) || ':' || v FROM json_to_record('{"id":1,"v":"a"}') AS _("id" integer, "v" text);
+    SELECT (id + 10) || ':' || v FROM jsonb_to_record('{"id":5,"v":"e"}'::jsonb) AS _("id" integer, "v" text);
+    SELECT coalesce(m, 'none') FROM json_to_record('{"id":1}') AS _(id integer, m text);
+    SELECT coalesce(id, -1) FROM json_to_record(NULL) AS _(id integer);
+}
+expect {
+    11:a
+    15:e
+    none
+    -1
+}
+
+test json-to-record-value-conversion {
+    SELECT id + 1, n, j, s FROM json_to_record('{"id":"5","n":{"z":[1]},"j":"q","s":"x"}') AS _(id integer, n text, j json, s text);
+    SELECT * FROM json_to_record('{"a b":1,"c.d":2,"$x":3,"q\"r":4}') AS _("a b" integer, "c.d" integer, "$x" integer, "q""r" integer);
+}
+expect {
+    6|{"z":[1]}|"q"|x
+    1|2|3|4
+}
+
+test json-to-recordset-correlated {
+    CREATE TABLE json_bodies (id int, body text);
+    INSERT INTO json_bodies VALUES (1, '[{"v":"a"},{"v":"b"}]'), (2, '[{"v":"c"}]');
+    SELECT b.id, r.v FROM json_bodies AS b, json_to_recordset(b.body::json) AS r(v text) ORDER BY b.id, r.v;
+}
+expect {
+    1|a
+    1|b
+    2|c
+}
+
+test json-to-record-requires-column-list {
+    SELECT * FROM json_to_record('{"id":1}') AS _;
+}
+expect error {
+    a column definition list is required for functions returning "record"
+}
+
+test json-to-record-argument-named-like-json-each-column {
+    CREATE TABLE json_each_names (value text, key text, type text);
+    INSERT INTO json_each_names VALUES ('[{"v":"a"},{"v":"b"}]', '{"v":"k"}', '[{"v":"t"}]');
+    SELECT r.v, s.v FROM json_each_names, json_to_recordset(value::json) AS r(v text), json_to_record(key::json) AS s(v text) ORDER BY r.v;
+    SELECT r.v FROM json_each_names, jsonb_to_recordset(type::jsonb) AS r(v text);
+}
+expect {
+    a|k
+    b|k
+    t
+}
+
+test json-to-record-without-alias-uses-function-name {
+    SELECT json_to_recordset.id FROM json_to_recordset('[{"id":1},{"id":2}]') AS (id int) ORDER BY json_to_recordset.id;
+    SELECT jsonb_to_record.id FROM jsonb_to_record('{"id":3}'::jsonb) AS (id int);
+}
+expect {
+    1
+    2
+    3
+}
+
+test json-to-recordset-object-errors {
+    SELECT * FROM json_to_recordset('{"a":1}') AS _(a int);
+}
+expect error {
+    cannot call json_to_recordset on an object
+}
+
+test json-to-recordset-scalar-errors {
+    SELECT * FROM jsonb_to_recordset('5'::jsonb) AS _(a int);
+}
+expect error {
+    cannot call jsonb_to_recordset on a non-array
+}
+
+test json-to-recordset-json-scalar-errors {
+    SELECT * FROM json_to_recordset('5') AS _(a int);
+}
+expect error {
+    cannot call json_to_recordset on a scalar
+}
+
+test json-to-recordset-non-object-element-errors {
+    SELECT * FROM json_to_recordset('[{"a":1},5]') AS _(a int);
+}
+expect error {
+    argument of json_to_recordset must be an array of objects
+}
+
+test json-to-recordset-null-element-errors {
+    SELECT * FROM jsonb_to_recordset('[null]'::jsonb) AS _(a int);
+}
+expect error {
+    argument of jsonb_to_recordset must be an array of objects
+}
+
+test json-to-record-array-errors {
+    SELECT * FROM json_to_record('[{"a":1}]') AS _(a int);
+}
+expect error {
+    cannot call populate_composite on an array
+}
+
+test json-to-record-scalar-errors {
+    SELECT * FROM jsonb_to_record('null'::jsonb) AS _(a int);
+}
+expect error {
+    cannot call populate_composite on a scalar
+}
+
+test json-to-record-text-column-keeps-json-text {
+    SELECT a, b, c, d, e, f, g FROM json_to_record('{"a":true,"b":1e2,"c":12345678901234567890,"d":-0,"e":false,"f":1.50,"g":"s"}') AS _(a text, b text, c text, d varchar, e text, f text, g text);
+    SELECT a, b FROM jsonb_to_recordset('[{"a":12345678901234567890,"b":true}]'::jsonb) AS _(a text, b varchar);
+}
+expect {
+    true|1e2|12345678901234567890|-0|false|1.50|s
+    12345678901234567890|true
+}
+
+test json-to-record-json-null-is-sql-null {
+    SELECT coalesce(a::text, '<null>'), coalesce(b::text, '<null>'), coalesce(c, '<null>'), coalesce(d, -1) FROM jsonb_to_record('{"a":null,"b":null,"c":null,"d":null}'::jsonb) AS _(a jsonb, b json, c text, d int);
+    SELECT coalesce(a::text, '<null>'), b FROM json_to_recordset('[{"a":null,"b":"x"},{"a":{"y":2},"b":"z"}]') AS _(a json, b json);
+}
+expect {
+    <null>|<null>|<null>|-1
+    <null>|"x"
+    {"y":2}|"z"
+}

@@ -77,6 +77,7 @@ ongoing work to pass the full SQLite TCL test suite.
 * ✅ SQLite file format is fully supported
 * 🚧 SQLite query language [[status](#sqlite-query-language)] is partially supported
 * 🚧 SQLite C API [[status](#sqlite-c-api)] is partially supported
+* 🚧 Materialized views are experimental [[IVM status](IVM_COMPAT.md)]
 
 ### Limitations
 
@@ -241,7 +242,7 @@ avoid this window.
 | PRAGMA foreign_keys              | ✅ Yes         |                                              |
 | PRAGMA freelist_count            | ✅ Yes        |                                              |
 | PRAGMA full_column_names         | Not Needed | deprecated in SQLite                         |
-| PRAGMA fullfsync                 | ✅ Yes        |                                              |
+| PRAGMA fullfsync                 | 🚧 Partial    | Apple platforms only; ignored elsewhere      |
 | PRAGMA function_list             | ✅ Yes        |                                              |
 | PRAGMA hard_heap_limit           | ❌ No         |                                              |
 | PRAGMA ignore_check_constraints  | ✅ Yes        |                                              |

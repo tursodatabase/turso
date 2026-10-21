@@ -117,6 +117,10 @@ pub enum SelfTableContext {
     ForDML {
         dml_ctx: DmlColumnContext,
         table: Arc<BTreeTable>,
+        /// False for generated column expressions: they use the standard operators on
+        /// custom-type columns, and indexes on virtual generated columns already store
+        /// keys computed that way.
+        uses_custom_type_operators: bool,
     },
 }
 
@@ -332,6 +336,12 @@ pub struct ProgramBuilder {
     /// `UnionValueFunc` handler in expr.rs saves/restores this to the inner union
     /// type before translating the value argument.
     pub(crate) target_union_type: Option<Arc<crate::schema::TypeDef>>,
+    /// Whether the schema this program was translated against has any
+    /// materialized views at all, set once by `epilogue()`. A schema change
+    /// bumps the schema cookie, which forces a reprepare (see
+    /// `PreparedProgram::has_materialized_views`), so this can't go stale
+    /// while the built program runs.
+    has_materialized_views: bool,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -503,6 +513,17 @@ pub struct MaterializedCteInfo {
     pub table: Arc<BTreeTable>,
     /// Number of result columns.
     pub num_columns: usize,
+    /// Subroutine that fills the table the first time it runs. A later reference
+    /// calls it before `OpenDup`, because the first reference can be on a path
+    /// that never runs. A CTE that reads an outer row is never shared, so each of
+    /// its references fills its own table.
+    pub fill_subroutine: Subroutine,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct Subroutine {
+    pub label: BranchOffset,
+    pub return_reg: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -517,6 +538,13 @@ pub enum CursorType {
         Arc<BTreeTable>,
         Arc<crate::sync::Mutex<crate::incremental::view::IncrementalView>>,
     ),
+    /// Read-only cursor over the transaction's captured delta for one base
+    /// table of a materialized view. Rows are the base columns plus a
+    /// trailing weight column; opened by maintenance programs at commit time.
+    ViewDelta {
+        view_name: String,
+        table: Arc<BTreeTable>,
+    },
 }
 
 impl CursorType {
@@ -667,13 +695,25 @@ impl ProgramBuilder {
         capture_data_changes_info: Option<CaptureDataChangesInfo>,
         opts: ProgramBuilderOpts,
     ) -> Self {
-        ProgramBuilder::_new(query_mode, capture_data_changes_info, opts, None, false)
+        ProgramBuilder::_new(
+            query_mode,
+            capture_data_changes_info,
+            opts,
+            None,
+            false,
+            false,
+        )
     }
+    /// Create a ProgramBuilder for a trigger subprogram. `mvcc_enabled` must match the
+    /// parent program's `is_mvcc_enabled()`: a trigger runs inside the same transaction
+    /// as its parent statement, so code emitted for it (e.g. CDC change id allocation)
+    /// must take the same MVCC-aware or MVCC-unaware path the parent takes.
     pub fn new_for_trigger(
         query_mode: QueryMode,
         capture_data_changes_info: Option<CaptureDataChangesInfo>,
         opts: ProgramBuilderOpts,
         trigger: Arc<Trigger>,
+        mvcc_enabled: bool,
     ) -> Self {
         ProgramBuilder::_new(
             query_mode,
@@ -681,25 +721,41 @@ impl ProgramBuilder {
             opts,
             Some(trigger),
             true,
+            mvcc_enabled,
         )
     }
     /// Create a ProgramBuilder for a subprogram (FK actions, etc.) that runs within
     /// an existing transaction and doesn't emit Transaction instructions.
+    ///
+    /// `mvcc_enabled` must match the parent program's `is_mvcc_enabled()`: the
+    /// subprogram runs inside the same transaction as its parent statement, so code
+    /// emitted for it (e.g. CDC change id allocation) must take the same MVCC-aware
+    /// or MVCC-unaware path the parent takes.
     pub fn new_for_subprogram(
         query_mode: QueryMode,
         capture_data_changes_info: Option<CaptureDataChangesInfo>,
         opts: ProgramBuilderOpts,
+        mvcc_enabled: bool,
     ) -> Self {
-        ProgramBuilder::_new(query_mode, capture_data_changes_info, opts, None, true)
+        ProgramBuilder::_new(
+            query_mode,
+            capture_data_changes_info,
+            opts,
+            None,
+            true,
+            mvcc_enabled,
+        )
     }
 
     #[turso_macros::trace_stack]
+    #[allow(clippy::too_many_arguments)]
     fn _new(
         query_mode: QueryMode,
         capture_data_changes_info: Option<CaptureDataChangesInfo>,
         opts: ProgramBuilderOpts,
         trigger: Option<Arc<Trigger>>,
         is_subprogram: bool,
+        mvcc_enabled: bool,
     ) -> Self {
         Self {
             table_reference_counter: TableRefIdCounter::new(),
@@ -722,7 +778,7 @@ impl ProgramBuilder {
             init_label: BranchOffset::Placeholder,
             start_offset: BranchOffset::Placeholder,
             capture_data_changes_info,
-            mvcc_enabled: false,
+            mvcc_enabled,
             txn_mode: TransactionMode::None,
             write_databases: BitSet::default(),
             read_databases: BitSet::default(),
@@ -746,6 +802,7 @@ impl ProgramBuilder {
             views_being_expanded: Vec::new(),
             next_subquery_eqp_id: 1,
             target_union_type: None,
+            has_materialized_views: false,
         }
     }
 
@@ -860,6 +917,21 @@ impl ProgramBuilder {
         self.resolve_type = resolve_type;
     }
 
+    /// The resolve type a constraint Halt must carry for a constraint whose
+    /// effective conflict resolution is `effective`. A statement's own OR
+    /// clause is applied through the program's resolve_type, except in a
+    /// trigger: its program holds every trigger step, each with its own OR
+    /// clause, so each Halt carries its step's resolve type, as in SQLite.
+    pub fn constraint_halt_on_error(&self, effective: ResolveType) -> Option<ResolveType> {
+        if self.flags.has_statement_conflict() && self.trigger.is_none() {
+            return None;
+        }
+        match effective {
+            ResolveType::Fail | ResolveType::Rollback => Some(effective),
+            _ => None,
+        }
+    }
+
     /// Set the trigger conflict override. When set, all triggers fired from this program
     /// should use this conflict resolution instead of their own OR clauses.
     pub const fn set_trigger_conflict_override(&mut self, resolve_type: ResolveType) {
@@ -955,6 +1027,16 @@ impl ProgramBuilder {
 
     pub fn set_mvcc_enabled(&mut self, enabled: bool) {
         self.mvcc_enabled = enabled;
+    }
+
+    /// Whether this program has already emitted a call to a trigger or FK action
+    /// subprogram (an `Insn::Program`). Used to tell whether a trigger or FK action fired
+    /// during the statement, which may have captured a CDC row even when this program's own
+    /// target table was not captured (e.g. a TEMP table).
+    pub fn has_emitted_program_call(&self) -> bool {
+        self.insns
+            .iter()
+            .any(|(insn, _)| matches!(insn, Insn::Program { .. }))
     }
 
     pub fn extend(&mut self, opts: &ProgramBuilderOpts) {
@@ -2082,6 +2164,7 @@ impl ProgramBuilder {
     /// Note that although these are the final instructions, typically an SQLite
     /// query will jump to the Transaction instruction via init_label.
     pub fn epilogue(&mut self, schema: &Schema) {
+        self.has_materialized_views = !schema.table_to_materialized_views.is_empty();
         if self.flags.is_subprogram() {
             // Subprograms (triggers, FK actions) just emit Halt without Transaction
             let description = if self.trigger.is_some() {
@@ -2232,7 +2315,9 @@ impl ProgramBuilder {
 
     /// Emit a ColumnHasField instruction that jumps to `target_pc` if the
     /// cursor's record has a field at the given logical column index.
-    /// Falls through if the record is short (ALTER TABLE ADD COLUMN).
+    /// Also jumps on a NULL row (the unmatched side of a LEFT JOIN), so the
+    /// column stays NULL. Falls through if the record is short (ALTER TABLE
+    /// ADD COLUMN).
     pub fn emit_column_has_field(
         &mut self,
         cursor_id: CursorID,
@@ -2253,6 +2338,9 @@ impl ProgramBuilder {
 
     /// Emit an Affinity instruction for a single register with the given column affinity.
     pub fn emit_column_affinity(&mut self, register: usize, affinity: Affinity) {
+        if matches!(affinity, Affinity::Blob | Affinity::None) {
+            return;
+        }
         self.emit_insn(Insn::Affinity {
             start_reg: register,
             count: NonZeroUsize::MIN,
@@ -2401,6 +2489,7 @@ impl ProgramBuilder {
             )),
             trigger: self.trigger.take(),
             is_subprogram: self.flags.is_subprogram(),
+            has_materialized_views: self.has_materialized_views,
             resolve_type: self.resolve_type,
             prepare_context,
             write_databases: self.write_databases,

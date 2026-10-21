@@ -1,6 +1,6 @@
 use crate::alloc::Arc;
 use crate::schema::Column;
-use crate::translate::expr::emit_table_column;
+use crate::translate::expr::{emit_stored_column, emit_table_column};
 use crate::vdbe::affinity::Affinity;
 use crate::vdbe::builder::SelfTableContext;
 use crate::{
@@ -692,6 +692,20 @@ fn resolved_root_pages(schema: &Schema, mv_store: Option<&crate::MvStore>) -> Ve
             }
         }
     }
+
+    // A materialized view created by an incompatible (older) storage version
+    // has no `Table::BTree` entry above: it is deliberately kept out of
+    // `schema.tables` so reads and writes still fail with the "DROP and
+    // recreate" error instead of touching storage this build cannot
+    // interpret. Its btree still owns a real page, though, so it must be
+    // counted here or the structural pass below reports it as orphaned.
+    for &root_page in schema.incompatible_materialized_view_roots.values() {
+        let view_root = resolve_root(root_page);
+        if view_root > 0 {
+            root_pages.push(view_root);
+        }
+    }
+
     root_pages
 }
 
@@ -783,7 +797,7 @@ fn emit_column(
     let col_value_reg = program.alloc_register();
     match col_ref {
         BoundIndexColumn::Column(idx) => {
-            program.emit_column_or_rowid(table_cursor_id, *idx, col_value_reg);
+            emit_stored_column(program, table_cursor_id, *idx, col_value_reg, resolver)?;
         }
         BoundIndexColumn::Expr(expr, affinity) => {
             let self_table_context =

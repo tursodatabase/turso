@@ -1,4 +1,4 @@
-use pg_query::ParseResult;
+pub use pg_query::ParseResult;
 use thiserror::Error;
 
 pub mod translator;
@@ -61,6 +61,14 @@ pub fn quote_identifier(ident: &str) -> String {
         return ident.to_string();
     }
     format!("\"{}\"", ident.replace('"', "\"\""))
+}
+
+/// `sql` with `schema` in front of the table name that starts at byte
+/// offset `location`.
+pub fn qualify_create_table_name(sql: &str, location: usize, schema: &str) -> String {
+    let mut sql = sql.to_string();
+    sql.insert_str(location, &format!("{}.", quote_identifier(schema)));
+    sql
 }
 
 /// pg_query's scanner is the same lexer the PostgreSQL server uses, so its

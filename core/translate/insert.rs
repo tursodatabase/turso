@@ -31,7 +31,7 @@ use crate::{
             ColumnUsedMask, EvalAt, JoinedTable, Operation, QueryDestination, ResultSetColumn,
             TableReferences,
         },
-        planner::{plan_ctes_as_outer_refs, ROWID_STRS},
+        planner::{collect_subquery_table_refs_in_expr, plan_ctes_as_outer_refs, ROWID_STRS},
         select::translate_select,
         stmt_journal::{any_index_or_ipk_has_replace, set_insert_stmt_journal_flags},
         subquery::{
@@ -68,7 +68,7 @@ fn validate(
     table_name: &str,
     resolver: &Resolver,
     _table: &Table,
-    _database_id: usize,
+    database_id: usize,
     conn: &Arc<Connection>,
 ) -> Result<()> {
     // Check if this is a system table that should be protected from direct writes
@@ -79,22 +79,24 @@ fn validate(
         crate::bail_parse_error!("table {} may not be modified", table_name);
     }
     // Check if this table has any incompatible dependent views
-    // Check if this is a materialized view
-    if resolver.schema().is_materialized_view(table_name) {
+    // Check if this is a materialized view. Must look up the schema of the
+    // table's own database: a table in an attached database can share a name
+    // with a materialized view in a different database.
+    if resolver.with_schema(database_id, |s| s.is_materialized_view(table_name)) {
         crate::bail_parse_error!("cannot modify materialized view {}", table_name);
     }
-    resolver.schema().with_incompatible_dependent_views(table_name, |views| {
+    resolver.with_schema(database_id, |s| s.with_incompatible_dependent_views(table_name, |views| {
     if !views.is_empty() {
-        use crate::incremental::compiler::DBSP_CIRCUIT_VERSION;
+        use crate::incremental::view::DBSP_CIRCUIT_VERSION;
         crate::bail_parse_error!(
-            "Cannot DELETE from table '{table_name}' because it has incompatible dependent materialized view(s): {}. \n\
+            "Cannot INSERT into table '{table_name}' because it has incompatible dependent materialized view(s): {}. \n\
              These views were created with a different DBSP version than the current version ({DBSP_CIRCUIT_VERSION}). \n\
              Please DROP and recreate the view(s) before modifying this table.",
-            views.iter().fold(String::new(), |_, s| s.to_string() + ", "),
+            views.iter().map(|view| view.as_str()).collect::<Vec<_>>().join(", "),
         );
     }
     Ok(())
-    })
+    }))
 }
 
 pub struct TempTableCtx {
@@ -324,11 +326,12 @@ pub fn translate_insert(
 
     let is_mvcc = connection.mv_store_for_db(database_id).is_some();
 
-    if inserting_multiple_rows && btree_table.has_autoincrement && !is_mvcc {
-        ensure_sequence_initialized(program, resolver, &btree_table, database_id)?;
-    }
-
-    let cdc_table = prepare_cdc_if_necessary(program, resolver.schema(), Some(table.get_name()))?;
+    let cdc_table = prepare_cdc_if_necessary(
+        program,
+        resolver.schema(),
+        database_id,
+        Some(table.get_name()),
+    )?;
 
     let schema_cookie = resolver.with_schema(database_id, |s| s.schema_version);
     program.begin_write_on_database(database_id, schema_cookie)?;
@@ -356,8 +359,15 @@ pub fn translate_insert(
     );
 
     // Plan CTEs and add them as outer query references for RETURNING subquery resolution
+    let mut returning_table_refs = Vec::new();
+    for column in &returning {
+        if let ResultColumn::Expr(expr, _) = column {
+            collect_subquery_table_refs_in_expr(expr, &mut returning_table_refs);
+        }
+    }
     plan_ctes_as_outer_refs(
         with_for_returning,
+        &returning_table_refs,
         resolver,
         program,
         &mut table_references,
@@ -398,7 +408,7 @@ pub fn translate_insert(
         }
         if !resolver
             .schema()
-            .get_dependent_materialized_views(table_name.as_str())
+            .get_dependent_materialized_views(&btree_table.name)
             .is_empty()
         {
             crate::bail_parse_error!(
@@ -438,6 +448,10 @@ pub fn translate_insert(
             cursor_id: ret_cursor_id,
             num_columns: result_columns.len(),
         });
+    }
+
+    if ctx.table.has_autoincrement && !is_mvcc {
+        init_autoincrement(program, &mut ctx, resolver)?;
     }
 
     init_source_emission(
@@ -481,10 +495,6 @@ pub fn translate_insert(
     )?;
 
     let has_user_provided_rowid = ctx.table.has_rowid && insertion.key.is_provided_by_user();
-
-    if ctx.table.has_autoincrement && !is_mvcc {
-        init_autoincrement(program, &mut ctx, resolver)?;
-    }
 
     // For non-STRICT tables, apply column affinity to the values early.
     // This must happen before BEFORE triggers (matching SQLite's order) so that
@@ -588,9 +598,9 @@ pub fn translate_insert(
             .collect();
         // Determine the conflict resolution to propagate to triggers:
         // 1. If there's already an override from UPSERT DO UPDATE context, use it (forces ABORT)
-        // 2. If the INSERT uses an explicit ON CONFLICT clause (not default ABORT),
-        //    propagate it to trigger statements (per SQLite semantics, the outer
-        //    statement's conflict resolution overrides the trigger body's)
+        // 2. If the INSERT uses an explicit ON CONFLICT clause, propagate it to
+        //    trigger statements (per SQLite semantics, the outer statement's
+        //    conflict resolution overrides the trigger body's)
         // 3. Otherwise, don't override (use statement's own conflict resolution)
         let trigger_ctx = if let Some(override_conflict) = program.trigger_conflict_override {
             TriggerContext::new_with_override_conflict(
@@ -599,12 +609,12 @@ pub fn translate_insert(
                 None, // No OLD for INSERT
                 override_conflict,
             )
-        } else if !matches!(ctx.on_conflict, ResolveType::Abort) {
+        } else if let Some(statement_on_conflict) = ctx.statement_on_conflict {
             TriggerContext::new_with_override_conflict(
                 btree_table.clone(),
                 Some(new_registers),
                 None, // No OLD for INSERT
-                ctx.on_conflict,
+                statement_on_conflict,
             )
         } else {
             TriggerContext::new(
@@ -681,9 +691,9 @@ pub fn translate_insert(
     }
     // Non-STRICT tables: Affinity was already emitted earlier (before BEFORE triggers).
 
-    // For AUTOINCREMENT tables with an explicit rowid, update sqlite_sequence
-    // before CHECK constraints. SQLite updates sqlite_sequence even when
-    // INSERT OR IGNORE skips the row due to a CHECK failure.
+    // For AUTOINCREMENT tables with an explicit rowid, record it before CHECK
+    // constraints. SQLite advances sqlite_sequence even when INSERT OR IGNORE
+    // skips the row due to a CHECK failure.
     if has_user_provided_rowid {
         if is_mvcc && ctx.table.has_autoincrement {
             // MVCC mode: advance the implicit sequence's disk watermark past
@@ -707,83 +717,20 @@ pub fn translate_insert(
                 &seq,
                 insertion.key_register(),
             )?;
-        } else if let Some(AutoincMeta {
-            seq_cursor_id,
-            r_seq,
-            r_seq_rowid,
-            table_name_reg,
-        }) = ctx.autoincrement_meta
-        {
-            turso_assert!(ctx.table.has_autoincrement);
-            reload_autoincrement_state(
-                program,
-                AutoincMeta {
-                    seq_cursor_id,
-                    r_seq,
-                    r_seq_rowid,
-                    table_name_reg,
-                },
-            );
-            // Existing sqlite_sequence row: update only when explicit key advances seq.
-            let missing_row_label = program.allocate_label();
-            let explicit_done_label = program.allocate_label();
-            program.emit_insn(Insn::IsNull {
-                reg: r_seq_rowid,
-                target_pc: missing_row_label,
-            });
-
-            let skip_seq_update_label = program.allocate_label();
-            program.emit_insn(Insn::Le {
-                lhs: insertion.key_register(),
-                rhs: r_seq,
-                target_pc: skip_seq_update_label,
-                flags: Default::default(),
-                collation: None,
-            });
-
-            emit_update_sqlite_sequence(
-                program,
-                resolver,
-                ctx.database_id,
-                seq_cursor_id,
-                r_seq_rowid,
-                table_name_reg,
-                insertion.key_register(),
-            )?;
-            program.emit_insn(Insn::Goto {
-                target_pc: explicit_done_label,
-            });
-
-            // SQLite leaves sqlite_sequence unchanged when the explicit key
-            // does not advance seq.
-            program.preassign_label_to_next_insn(skip_seq_update_label);
-            program.emit_insn(Insn::Goto {
-                target_pc: explicit_done_label,
-            });
-
-            // If sqlite_sequence has no row yet, write max(0, explicit_key).
-            program.preassign_label_to_next_insn(missing_row_label);
-            let seq_to_write_reg = program.alloc_register();
-            program.emit_insn(Insn::Copy {
-                src_reg: r_seq,
-                dst_reg: seq_to_write_reg,
-                extra_amount: 0,
-            });
+        } else if let Some(AutoincMeta { r_max_rowid, .. }) = ctx.autoincrement_meta {
             program.emit_insn(Insn::MemMax {
-                dest_reg: seq_to_write_reg,
+                dest_reg: r_max_rowid,
                 src_reg: insertion.key_register(),
             });
-            emit_update_sqlite_sequence(
-                program,
-                resolver,
-                ctx.database_id,
-                seq_cursor_id,
-                r_seq_rowid,
-                table_name_reg,
-                seq_to_write_reg,
-            )?;
-            program.preassign_label_to_next_insn(explicit_done_label);
         }
+    }
+    // An INSERT run by a trigger reads sqlite_sequence from disk, so it cannot
+    // see the rowids this statement has used unless they are written first.
+    if let Some(meta) = ctx
+        .autoincrement_meta
+        .filter(|_| any_trigger_inserts_into(resolver, database_id, &ctx.table.name))
+    {
+        emit_write_sqlite_sequence(program, resolver, ctx.database_id, meta)?;
     }
 
     // We need to emit NOT NULL constraints (and their actions) a first time for stored columns,
@@ -983,8 +930,39 @@ pub fn translate_insert(
         key_reg: insertion.key_register(),
         record_reg: insertion.record_register(),
         flag: insert_flags,
-        table_name: table_name.to_string(),
+        // Runtime change attribution must use the resolved table identity,
+        // not the SQL token spelling (`"t"`, `[t]`, aliases, case, ...).
+        table_name: btree_table.name.clone(),
     });
+
+    // CDC must capture the row right after the INSERT updated the table, before any AFTER
+    // trigger or FK action this INSERT fires can write further CDC rows of their own.
+    if let Some((cdc_cursor_id, _)) = &ctx.cdc_table {
+        let cdc_has_after = program.capture_data_changes_info().has_after();
+        let after_record_reg = if cdc_has_after {
+            Some(emit_cdc_patch_record(
+                program,
+                &table,
+                insertion.first_col_register(),
+                insertion.record_register(),
+                insertion.key_register(),
+                &ColumnLayout::from_table(&table)?,
+            ))
+        } else {
+            None
+        };
+        emit_cdc_insns(
+            program,
+            resolver,
+            OperationMode::INSERT,
+            *cdc_cursor_id,
+            insertion.key_register(),
+            None,
+            after_record_reg,
+            None,
+            table_name.as_str(),
+        )?;
+    }
 
     // Fire AFTER INSERT triggers
     let relevant_after_triggers = get_triggers_including_temp(
@@ -1020,12 +998,12 @@ pub fn translate_insert(
                 None,
                 override_conflict,
             )
-        } else if !matches!(ctx.on_conflict, ResolveType::Abort) {
+        } else if let Some(statement_on_conflict) = ctx.statement_on_conflict {
             TriggerContext::new_after_with_override_conflict(
                 btree_table.clone(),
                 Some(new_registers_after),
                 None,
-                ctx.on_conflict,
+                statement_on_conflict,
             )
         } else {
             TriggerContext::new_after(btree_table.clone(), Some(new_registers_after), None)
@@ -1062,77 +1040,6 @@ pub fn translate_insert(
         )?;
     }
 
-    if !is_mvcc {
-        if let Some(AutoincMeta {
-            seq_cursor_id,
-            r_seq,
-            r_seq_rowid,
-            table_name_reg,
-        }) = ctx.autoincrement_meta
-        {
-            reload_autoincrement_state(
-                program,
-                AutoincMeta {
-                    seq_cursor_id,
-                    r_seq,
-                    r_seq_rowid,
-                    table_name_reg,
-                },
-            );
-            let no_update_needed_label = program.allocate_label();
-            program.emit_insn(Insn::Le {
-                lhs: insertion.key_register(),
-                rhs: r_seq,
-                target_pc: no_update_needed_label,
-                flags: Default::default(),
-                collation: None,
-            });
-
-            emit_update_sqlite_sequence(
-                program,
-                resolver,
-                ctx.database_id,
-                seq_cursor_id,
-                r_seq_rowid,
-                table_name_reg,
-                insertion.key_register(),
-            )?;
-
-            program.preassign_label_to_next_insn(no_update_needed_label);
-            program.emit_insn(Insn::Close {
-                cursor_id: seq_cursor_id,
-            });
-        }
-    }
-
-    // Emit update in the CDC table if necessary (after the INSERT updated the table)
-    if let Some((cdc_cursor_id, _)) = &ctx.cdc_table {
-        let cdc_has_after = program.capture_data_changes_info().has_after();
-        let after_record_reg = if cdc_has_after {
-            Some(emit_cdc_patch_record(
-                program,
-                &table,
-                insertion.first_col_register(),
-                insertion.record_register(),
-                insertion.key_register(),
-                &ColumnLayout::from_table(&table)?,
-            ))
-        } else {
-            None
-        };
-        emit_cdc_insns(
-            program,
-            resolver,
-            OperationMode::INSERT,
-            *cdc_cursor_id,
-            insertion.key_register(),
-            None,
-            after_record_reg,
-            None,
-            table_name.as_str(),
-        )?;
-    }
-
     if !returning_subqueries.is_empty() {
         let target_table = table_references
             .joined_tables()
@@ -1160,7 +1067,6 @@ pub fn translate_insert(
                     *subquery_plan,
                     &subquery.query_type,
                     subquery.correlated || rerun_for_target_scan,
-                    true,
                 )?;
             }
             Ok(())
@@ -1308,9 +1214,19 @@ fn emit_epilogue(
         });
     }
     program.preassign_label_to_next_insn(ctx.loop_labels.stmt_epilogue);
-    if let Some((cdc_cursor_id, _)) = &ctx.cdc_table {
-        emit_cdc_autocommit_commit(program, resolver, *cdc_cursor_id)?;
+    if let Some(meta) = ctx.autoincrement_meta {
+        emit_write_sqlite_sequence(program, resolver, ctx.database_id, meta)?;
+        program.emit_insn(Insn::Close {
+            cursor_id: meta.seq_cursor_id,
+        });
     }
+    emit_cdc_autocommit_commit(
+        program,
+        resolver,
+        ctx.cdc_table
+            .as_ref()
+            .map(|(cdc_cursor_id, _)| *cdc_cursor_id),
+    )?;
     // Emit scan-back loop for buffered RETURNING results.
     // All DML is complete at this point; now yield the buffered rows to the caller.
     // FkCheck must come before the scan-back so that FK violations prevent
@@ -1320,6 +1236,58 @@ fn emit_epilogue(
         emit_returning_scan_back(program, buf);
     }
     program.preassign_label_to_next_insn(ctx.halt_label);
+    Ok(())
+}
+
+fn any_trigger_inserts_into(resolver: &Resolver, database_id: usize, table_name: &str) -> bool {
+    let inserts_into_table = |schema: &schema::Schema| {
+        schema
+            .triggers
+            .values()
+            .flatten()
+            .flat_map(|trigger| trigger.commands.iter())
+            .any(|command| {
+                matches!(command, ast::TriggerCmd::Insert { tbl_name, .. }
+                    if normalize_ident(tbl_name.as_str()).eq_ignore_ascii_case(table_name))
+            })
+    };
+    resolver.with_schema(database_id, inserts_into_table)
+        || (database_id != crate::TEMP_DB_ID
+            && resolver.has_temp_database()
+            && resolver.with_schema(crate::TEMP_DB_ID, inserts_into_table))
+}
+
+fn emit_write_sqlite_sequence(
+    program: &mut ProgramBuilder,
+    resolver: &Resolver,
+    database_id: usize,
+    meta: AutoincMeta,
+) -> Result<()> {
+    reload_autoincrement_state(program, meta);
+    let write_label = program.allocate_label();
+    let done_label = program.allocate_label();
+    program.emit_insn(Insn::IsNull {
+        reg: meta.r_seq_rowid,
+        target_pc: write_label,
+    });
+    program.emit_insn(Insn::Le {
+        lhs: meta.r_max_rowid,
+        rhs: meta.r_seq,
+        target_pc: done_label,
+        flags: Default::default(),
+        collation: None,
+    });
+    program.preassign_label_to_next_insn(write_label);
+    emit_update_sqlite_sequence(
+        program,
+        resolver,
+        database_id,
+        meta.seq_cursor_id,
+        meta.r_seq_rowid,
+        meta.table_name_reg,
+        meta.r_max_rowid,
+    )?;
+    program.preassign_label_to_next_insn(done_label);
     Ok(())
 }
 
@@ -1362,6 +1330,7 @@ fn emit_partial_index_check(
         &mut column_regs,
         table,
         reg,
+        true,
     )?;
     let skip_label = program.allocate_label();
     program.emit_insn(Insn::IfNot {
@@ -1516,23 +1485,8 @@ fn emit_rowid_generation(
             insertion.key_register(),
             None,
         )?;
-    } else if let Some(AutoincMeta {
-        r_seq,
-        seq_cursor_id,
-        r_seq_rowid,
-        table_name_reg,
-        ..
-    }) = ctx.autoincrement_meta
-    {
-        reload_autoincrement_state(
-            program,
-            AutoincMeta {
-                seq_cursor_id,
-                r_seq,
-                r_seq_rowid,
-                table_name_reg,
-            },
-        );
+    } else if let Some(meta) = ctx.autoincrement_meta {
+        reload_autoincrement_state(program, meta);
         let r_max = program.alloc_register();
 
         let dummy_reg = program.alloc_register();
@@ -1544,9 +1498,13 @@ fn emit_rowid_generation(
         });
 
         program.emit_insn(Insn::Copy {
-            src_reg: r_seq,
+            src_reg: meta.r_seq,
             dst_reg: insertion.key_register(),
             extra_amount: 0,
+        });
+        program.emit_insn(Insn::MemMax {
+            dest_reg: insertion.key_register(),
+            src_reg: meta.r_max_rowid,
         });
         program.emit_insn(Insn::MemMax {
             dest_reg: insertion.key_register(),
@@ -1580,16 +1538,11 @@ fn emit_rowid_generation(
             register: insertion.key_register(),
             value: 1,
         });
-
-        emit_update_sqlite_sequence(
-            program,
-            resolver,
-            ctx.database_id,
-            seq_cursor_id,
-            r_seq_rowid,
-            table_name_reg,
-            insertion.key_register(),
-        )?;
+        program.emit_insn(Insn::Copy {
+            src_reg: insertion.key_register(),
+            dst_reg: meta.r_max_rowid,
+            extra_amount: 0,
+        });
     } else {
         program.emit_insn(Insn::NewRowid {
             cursor: ctx.cursor_id,
@@ -1623,6 +1576,10 @@ fn resolve_upserts(
         {
             // Normalize SET pairs once
             let mut rewritten_sets = collect_set_clauses_for_upsert(table, sets)?;
+            let set_column_names: Vec<_> = sets
+                .iter()
+                .flat_map(|set| set.col_names.iter().cloned())
+                .collect();
 
             emit_upsert(
                 program,
@@ -1630,6 +1587,7 @@ fn resolve_upserts(
                 ctx,
                 insertion,
                 &mut rewritten_sets,
+                &set_column_names,
                 where_clause,
                 resolver,
                 result_columns,
@@ -1685,11 +1643,15 @@ fn init_autoincrement(
     resolver: &Resolver,
 ) -> Result<()> {
     open_autoincrement_state(program, ctx, resolver)?;
-    reload_autoincrement_state(
-        program,
-        ctx.autoincrement_meta
-            .expect("AUTOINCREMENT metadata should be initialized"),
-    );
+    let meta = ctx
+        .autoincrement_meta
+        .expect("AUTOINCREMENT metadata should be initialized");
+    reload_autoincrement_state(program, meta);
+    program.emit_insn(Insn::Copy {
+        src_reg: meta.r_seq,
+        dst_reg: meta.r_max_rowid,
+        extra_amount: 0,
+    });
     Ok(())
 }
 
@@ -1715,6 +1677,7 @@ fn open_autoincrement_state(
         r_seq,
         r_seq_rowid,
         table_name_reg,
+        r_max_rowid: program.alloc_register(),
     });
 
     program.emit_insn(Insn::Integer {
@@ -1734,6 +1697,7 @@ fn reload_autoincrement_state(program: &mut ProgramBuilder, meta: AutoincMeta) {
         r_seq,
         r_seq_rowid,
         table_name_reg,
+        ..
     } = meta;
 
     program.emit_insn(Insn::Integer {
@@ -1868,24 +1832,23 @@ fn emit_notnulls(
         // a DECODE expression, decode the encoded value into a temp register
         // and check the *decoded* value. This prevents "ghost NULLs" where
         // ENCODE produces a non-NULL value but DECODE returns NULL.
-        let check_reg = if let Some(type_def) = resolver
+        let has_decode = resolver
             .schema()
-            .get_type_def(&column_mapping.column.ty_str, ctx.table.is_strict)
-        {
-            if type_def.decode().is_some() {
-                let decoded_reg = program.alloc_register();
-                crate::translate::expr::emit_user_facing_column_value(
-                    program,
-                    column_mapping.register,
-                    decoded_reg,
-                    column_mapping.column,
-                    ctx.table.is_strict,
-                    resolver,
-                )?;
-                decoded_reg
-            } else {
-                column_mapping.register
-            }
+            .resolve_type(&column_mapping.column.ty_str, ctx.table.is_strict)
+            .ok()
+            .flatten()
+            .is_some_and(|resolved| resolved.chain.iter().any(|td| td.decode().is_some()));
+        let check_reg = if has_decode {
+            let decoded_reg = program.alloc_register();
+            crate::translate::expr::emit_user_facing_column_value(
+                program,
+                column_mapping.register,
+                decoded_reg,
+                column_mapping.column,
+                ctx.table.is_strict,
+                resolver,
+            )?;
+            decoded_reg
         } else {
             column_mapping.register
         };
@@ -1922,6 +1885,7 @@ fn emit_notnulls(
                     );
                     description
                 },
+                on_error: program.constraint_halt_on_error(effective),
             });
         }
     }
@@ -2415,6 +2379,7 @@ pub struct AutoincMeta {
     r_seq: usize,
     r_seq_rowid: usize,
     table_name_reg: usize,
+    r_max_rowid: usize,
 }
 
 pub static ROWID_COLUMN: std::sync::LazyLock<Column> = std::sync::LazyLock::new(|| {
@@ -2835,22 +2800,38 @@ fn translate_column(
             dest: column_register,
             dest_end: None,
         });
-    } else if let Some(default_expr) = column.default.as_ref() {
-        translate_expr(program, None, default_expr, column_register, resolver)?;
-    } else if let Ok(Some(resolved)) = resolver.schema().resolve_type(&column.ty_str, is_strict) {
-        if let Some(default_expr) = resolved.default_expr() {
-            translate_expr(program, None, default_expr, column_register, resolver)?;
-        } else {
+    } else {
+        let resolved = resolver
+            .schema()
+            .resolve_type(&column.ty_str, is_strict)
+            .ok()
+            .flatten();
+        let default_expr = column
+            .default
+            .as_deref()
+            .or_else(|| resolved.as_ref().and_then(|r| r.default_expr()));
+        let Some(default_expr) = default_expr else {
             program.emit_insn(Insn::Null {
                 dest: column_register,
                 dest_end: None,
             });
+            return Ok(());
+        };
+        let has_custom_encode = resolved
+            .as_ref()
+            .is_some_and(|r| r.chain.iter().any(|td| td.encode().is_some()));
+        if has_custom_encode {
+            translate_expr_no_constant_opt(
+                program,
+                None,
+                default_expr,
+                column_register,
+                resolver,
+                NoConstantOptReason::CustomTypeEncode,
+            )?;
+        } else {
+            translate_expr(program, None, default_expr, column_register, resolver)?;
         }
-    } else {
-        program.emit_insn(Insn::Null {
-            dest: column_register,
-            dest_end: None,
-        });
     }
     Ok(())
 }
@@ -2919,15 +2900,10 @@ fn emit_pk_uniqueness_check(
                 .map(|(name, _)| format!("{}.{}", ctx.table.name, name))
                 .collect::<Vec<_>>()
                 .join(", ");
-            let (description, on_error) = halt_desc_and_on_error(
-                &raw_desc,
-                preflight.effective_on_conflict,
-                program.flags.has_statement_conflict(),
-            );
             program.emit_insn(Insn::Halt {
                 err_code: SQLITE_CONSTRAINT_PRIMARYKEY,
-                description,
-                on_error,
+                description: raw_desc,
+                on_error: program.constraint_halt_on_error(preflight.effective_on_conflict),
                 description_reg: None,
             });
         }
@@ -2986,15 +2962,10 @@ fn emit_pk_uniqueness_check(
             break 'emit_halt;
         }
         let raw_desc = format!("{}.{}", ctx.table.name, rowid_column_name);
-        let (description, on_error) = halt_desc_and_on_error(
-            &raw_desc,
-            preflight.effective_on_conflict,
-            program.flags.has_statement_conflict(),
-        );
         program.emit_insn(Insn::Halt {
             err_code: SQLITE_CONSTRAINT_PRIMARYKEY,
-            description,
-            on_error,
+            description: raw_desc,
+            on_error: program.constraint_halt_on_error(preflight.effective_on_conflict),
             description_reg: None,
         });
     }
@@ -3155,15 +3126,10 @@ fn emit_unique_index_check(
         // No matching UPSERT handler so we emit constraint error
         // (if conflict clause matched - VM will jump to later instructions and skip halt)
         let raw_desc = format_unique_violation_desc(ctx.table.name.as_str(), index);
-        let (description, on_error) = halt_desc_and_on_error(
-            &raw_desc,
-            preflight.effective_on_conflict,
-            program.flags.has_statement_conflict(),
-        );
         program.emit_insn(Insn::Halt {
             err_code: SQLITE_CONSTRAINT_UNIQUE,
-            description,
-            on_error,
+            description: raw_desc,
+            on_error: program.constraint_halt_on_error(preflight.effective_on_conflict),
             description_reg: None,
         });
 
@@ -3200,15 +3166,10 @@ fn emit_unique_index_check(
         } else {
             // ABORT/FAIL/ROLLBACK: halt on conflict.
             let raw_desc = format_unique_violation_desc(ctx.table.name.as_str(), index);
-            let (description, on_error) = halt_desc_and_on_error(
-                &raw_desc,
-                preflight.effective_on_conflict,
-                program.flags.has_statement_conflict(),
-            );
             program.emit_insn(Insn::Halt {
                 err_code: SQLITE_CONSTRAINT_UNIQUE,
-                description,
-                on_error,
+                description: raw_desc,
+                on_error: program.constraint_halt_on_error(preflight.effective_on_conflict),
                 description_reg: None,
             });
         }
@@ -3395,138 +3356,9 @@ fn translate_virtual_table_insert(
     Ok(())
 }
 
-///  makes sure that an AUTOINCREMENT table has a sequence row in `sqlite_sequence`, inserting one with 0 if missing.
-fn ensure_sequence_initialized(
-    program: &mut ProgramBuilder,
-    resolver: &Resolver,
-    table: &schema::BTreeTable,
-    database_id: usize,
-) -> Result<()> {
-    let seq_table = get_valid_sqlite_sequence_table(resolver, database_id)?;
-
-    let seq_cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(seq_table.clone()));
-
-    program.emit_insn(Insn::OpenWrite {
-        cursor_id: seq_cursor_id,
-        root_page: seq_table.root_page.into(),
-        db: database_id,
-    });
-
-    let table_name_reg = program.emit_string8_new_reg(table.name.clone());
-
-    let loop_start_label = program.allocate_label();
-    let entry_exists_label = program.allocate_label();
-    let insert_new_label = program.allocate_label();
-
-    program.emit_insn(Insn::Rewind {
-        cursor_id: seq_cursor_id,
-        pc_if_empty: insert_new_label,
-    });
-
-    program.preassign_label_to_next_insn(loop_start_label);
-
-    let name_col_reg = program.alloc_register();
-
-    program.emit_column_or_rowid(seq_cursor_id, 0, name_col_reg);
-
-    program.emit_insn(Insn::Eq {
-        lhs: table_name_reg,
-        rhs: name_col_reg,
-        target_pc: entry_exists_label,
-        flags: Default::default(),
-        collation: Some(super::collate::CollationSeq::NoCase),
-    });
-
-    program.emit_insn(Insn::Next {
-        cursor_id: seq_cursor_id,
-        pc_if_next: loop_start_label,
-        fullscan: false,
-        is_index: false,
-    });
-
-    program.preassign_label_to_next_insn(insert_new_label);
-
-    let record_reg = program.alloc_register();
-    let record_start_reg = program.alloc_registers(2);
-    let zero_reg = program.alloc_register();
-
-    program.emit_insn(Insn::Integer {
-        dest: zero_reg,
-        value: 0,
-    });
-
-    program.emit_insn(Insn::Copy {
-        src_reg: table_name_reg,
-        dst_reg: record_start_reg,
-        extra_amount: 0,
-    });
-
-    program.emit_insn(Insn::Copy {
-        src_reg: zero_reg,
-        dst_reg: record_start_reg + 1,
-        extra_amount: 0,
-    });
-
-    let affinity_str = seq_table
-        .columns()
-        .iter()
-        .map(|c| c.affinity().aff_mask())
-        .collect();
-
-    program.emit_insn(Insn::MakeRecord {
-        start_reg: to_u32(record_start_reg),
-        count: to_u32(2),
-        dest_reg: to_u32(record_reg),
-        index_name: None,
-        affinity_str: Some(affinity_str),
-    });
-
-    let new_rowid_reg = program.alloc_register();
-    program.emit_insn(Insn::NewRowid {
-        cursor: seq_cursor_id,
-        rowid_reg: new_rowid_reg,
-        prev_largest_reg: 0,
-    });
-    program.emit_insn(Insn::Insert {
-        cursor: seq_cursor_id,
-        key_reg: new_rowid_reg,
-        record_reg,
-        flag: InsertFlags::new(),
-        table_name: SQLITE_SEQUENCE_TABLE_NAME.to_string(),
-    });
-
-    program.preassign_label_to_next_insn(entry_exists_label);
-    program.emit_insn(Insn::Close {
-        cursor_id: seq_cursor_id,
-    });
-
-    Ok(())
-}
-#[inline]
 /// Build the UNIQUE constraint error description to match sqlite
 /// single column: `t.c1`
 /// multi-column:  `t.(k, c1)`
-/// For constraint-level FAIL/ROLLBACK ON CONFLICT, pre-format the description
-/// and set on_error so the VM's halt() produces Raise(rt, msg) with correct semantics.
-/// `has_statement_conflict` should be true when the statement has its own OR clause
-/// (e.g. INSERT OR FAIL), in which case program.resolve_type already handles it.
-pub(crate) fn halt_desc_and_on_error(
-    raw_desc: &str,
-    effective: ResolveType,
-    has_statement_conflict: bool,
-) -> (String, Option<ResolveType>) {
-    if has_statement_conflict {
-        return (raw_desc.to_string(), None);
-    }
-    match effective {
-        ResolveType::Fail | ResolveType::Rollback => (
-            format!("UNIQUE constraint failed: {raw_desc}"),
-            Some(effective),
-        ),
-        _ => (raw_desc.to_string(), None),
-    }
-}
-
 pub fn format_unique_violation_desc(table_name: &str, index: &Index) -> String {
     if index.columns.len() == 1 {
         let mut s = String::with_capacity(table_name.len() + 1 + index.columns[0].name.len());
@@ -3585,6 +3417,7 @@ fn emit_index_column_value_for_insert(
             &mut column_regs,
             table,
             dest_reg,
+            idx_col.pos_in_table == EXPR_INDEX_SENTINEL,
         )?;
         // For virtual generated column references, apply the column's
         // declared affinity to the computed expression result.
@@ -3787,7 +3620,7 @@ fn emit_update_sqlite_sequence(
         cursor: seq_cursor_id,
         key_reg: r_seq_rowid,
         record_reg,
-        flag: InsertFlags::new(),
+        flag: autoincrement_bookkeeping_insert_flags(),
         table_name: SQLITE_SEQUENCE_TABLE_NAME.to_string(),
     });
     program.emit_insn(Insn::Goto {
@@ -3799,13 +3632,24 @@ fn emit_update_sqlite_sequence(
         cursor: seq_cursor_id,
         key_reg: r_seq_rowid,
         record_reg,
-        flag: InsertFlags(turso_parser::ast::ResolveType::Replace.bit_value() as u8),
+        flag: autoincrement_bookkeeping_insert_flags(),
         table_name: SQLITE_SEQUENCE_TABLE_NAME.to_string(),
     });
 
     program.preassign_label_to_next_insn(end_update_label);
 
     Ok(())
+}
+
+/// Flags for the engine's own AUTOINCREMENT write to sqlite_sequence. Like
+/// SQLite's autoIncrementEnd (insert.c, OP_Insert with only OPFLAG_APPEND,
+/// so neither OPFLAG_NCHANGE nor OPFLAG_LASTROWID), it changes neither
+/// changes(), total_changes() nor last_insert_rowid(). A user's INSERT into
+/// sqlite_sequence has none of these flags and counts as usual.
+pub(crate) fn autoincrement_bookkeeping_insert_flags() -> InsertFlags {
+    InsertFlags::new()
+        .skip_last_rowid()
+        .skip_all_change_counts()
 }
 
 fn emit_replace_delete_conflicting_row(
@@ -3913,10 +3757,11 @@ fn emit_replace_delete_conflicting_row(
         let before_record_reg = if cdc_has_before {
             Some(emit_cdc_full_record(
                 program,
+                resolver,
                 table.columns(),
                 main_cursor_id,
                 ctx.conflict_rowid_reg,
-            ))
+            )?)
         } else {
             None
         };

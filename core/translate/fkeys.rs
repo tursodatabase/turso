@@ -2,7 +2,7 @@ use turso_parser::ast::{self, Expr, Literal, Name, QualifiedName, RefAct};
 
 use super::{translate_inner, ProgramBuilder, ProgramBuilderOpts};
 use crate::translate::emitter::emit_columns_and_dependencies;
-use crate::translate::expr::emit_table_column_for_dml;
+use crate::translate::expr::{emit_stored_column, emit_table_column_for_dml};
 use crate::translate::plan::ColumnMask;
 use crate::{
     error::SQLITE_CONSTRAINT_FOREIGNKEY,
@@ -727,7 +727,13 @@ pub fn emit_parent_index_key_change_checks(
                 &Arc::new(table_btree.clone()),
             )?;
         } else {
-            program.emit_column_or_rowid(cursor_id, index_col.pos_in_table, old_key + i);
+            emit_stored_column(
+                program,
+                cursor_id,
+                index_col.pos_in_table,
+                old_key + i,
+                resolver,
+            )?;
         }
     }
     let new_key = program.alloc_registers(idx_len);
@@ -1044,7 +1050,7 @@ fn build_parent_key(
                 &Arc::new(parent_bt.clone()),
             )?;
         } else {
-            program.emit_column_or_rowid(parent_cursor_id, pos, dest_start + i);
+            emit_stored_column(program, parent_cursor_id, pos, dest_start + i, resolver)?;
         }
     }
     Ok(())
@@ -1743,6 +1749,7 @@ fn emit_fk_action_subprogram(
             QueryMode::Normal,
             program.capture_data_changes_info().clone(),
             FK_SUBPROGRAM_OPTS,
+            program.is_mvcc_enabled(),
         );
         let entry = compile_stack.push(foreign_key, parent_change);
         subprogram_builder.prologue();
@@ -1783,7 +1790,7 @@ fn emit_fk_action_subprogram(
 /// Build a QualifiedName with db_name set for non-main databases.
 fn qualified_table_name(table_name: &str, db_name: Option<&str>) -> QualifiedName {
     QualifiedName {
-        db_name: db_name.map(Name::from_string),
+        namespace: db_name.map(Name::from_string),
         name: Name::from_string(table_name),
         alias: None,
     }

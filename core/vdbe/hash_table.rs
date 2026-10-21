@@ -118,7 +118,7 @@ fn hash_join_key(key_values: &[ValueRef], collations: &[CollationSeq]) -> u64 {
 
 /// Normalize signed zero so 0.0 and -0.0 hash the same.
 #[inline]
-const fn normalized_f64_bits(f: f64) -> u64 {
+pub(crate) const fn normalized_f64_bits(f: f64) -> u64 {
     if f == 0.0 {
         0.0f64.to_bits()
     } else {
@@ -723,6 +723,22 @@ impl SpilledPartition {
             self.state,
             PartitionState::Loaded | PartitionState::InMemory
         )
+    }
+
+    /// Drop the loaded buckets so that the next load reads every chunk from disk.
+    /// Returns the resident memory that was freed.
+    fn unload(&mut self) -> usize {
+        let freed = self.resident_mem;
+        self.buckets.clear();
+        self.state = PartitionState::OnDisk;
+        self.resident_mem = 0;
+        self.current_chunk_idx = 0;
+        self.buffer_len.store(0, atomic::Ordering::Release);
+        self.read_buffer.write().clear();
+        self.partial_entry.clear();
+        self.parsed_entries = 0;
+        self.io_state.set(SpillIOState::None);
+        freed
     }
 
     /// Check if there are more chunks to load
@@ -1497,6 +1513,10 @@ impl HashTable {
 
         // Find existing partition or create new one
         let io_state = if let Some(existing) = spill_state.find_partition_mut(partition_idx) {
+            if existing.state == PartitionState::Loaded {
+                self.loaded_partitions_mem =
+                    self.loaded_partitions_mem.saturating_sub(existing.unload());
+            }
             existing.add_chunk(file_offset, data_size, num_entries)?;
             if let Some(metrics) = metrics.as_deref_mut() {
                 metrics.spill_bytes_written =
@@ -1649,6 +1669,10 @@ impl HashTable {
 
             // Find existing partition or create new one
             let io_state = if let Some(existing) = spill_state.find_partition_mut(meta.idx) {
+                if existing.state == PartitionState::Loaded {
+                    self.loaded_partitions_mem =
+                        self.loaded_partitions_mem.saturating_sub(existing.unload());
+                }
                 existing.add_chunk(file_offset, meta.data_size, meta.num_entries)?;
                 if let Some(metrics) = metrics.as_deref_mut() {
                     metrics.spill_bytes_written = metrics
@@ -2643,16 +2667,7 @@ impl HashTable {
             if let Some(spill_state) = self.spill_state.as_mut() {
                 if let Some(victim) = spill_state.find_partition_mut(victim_idx) {
                     if matches!(victim.state, PartitionState::Loaded) {
-                        freed = victim.resident_mem;
-                        victim.buckets.clear();
-                        victim.state = PartitionState::OnDisk;
-                        victim.resident_mem = 0;
-                        victim.current_chunk_idx = 0;
-                        victim.buffer_len.store(0, atomic::Ordering::Release);
-                        victim.read_buffer.write().clear();
-                        victim.partial_entry.clear();
-                        victim.parsed_entries = 0;
-                        victim.io_state.set(SpillIOState::None);
+                        freed = victim.unload();
                     }
                 }
             }
@@ -3065,15 +3080,7 @@ impl HashTable {
             for partition in &mut spill_state.partitions {
                 if matches!(partition.state, PartitionState::Loaded) && !partition.chunks.is_empty()
                 {
-                    partition.buckets.clear();
-                    partition.state = PartitionState::OnDisk;
-                    partition.resident_mem = 0;
-                    partition.current_chunk_idx = 0;
-                    partition.buffer_len.store(0, atomic::Ordering::Release);
-                    partition.read_buffer.write().clear();
-                    partition.partial_entry.clear();
-                    partition.parsed_entries = 0;
-                    partition.io_state.set(SpillIOState::None);
+                    partition.unload();
                 }
             }
         }
@@ -4017,6 +4024,45 @@ mod hashtests {
         let entry = ht.probe_partition(partition_idx, &probe_key, None).unwrap();
         assert!(entry.is_some()); // here
         assert_eq!(entry.unwrap().rowid, 10);
+    }
+
+    #[test]
+    fn test_insert_distinct_finds_keys_spilled_after_partition_load() {
+        let io = Arc::new(MemoryIO::new());
+        let config = HashTableConfig {
+            initial_buckets: 4,
+            mem_budget: 4 * 1024,
+            num_keys: 1,
+            collations: vec![CollationSeq::Binary],
+            temp_store: crate::TempStore::Default,
+            track_matched: false,
+            partition_count: Some(4),
+        };
+        let mut ht = HashTable::new(config, io).unwrap();
+
+        for key in 0..1024 {
+            assert!(insert_distinct_i64(&mut ht, key));
+            if key > 0 {
+                assert!(
+                    !insert_distinct_i64(&mut ht, key - 1),
+                    "key {} inserted twice",
+                    key - 1
+                );
+            }
+        }
+        assert!(ht.has_spilled());
+    }
+
+    fn insert_distinct_i64(ht: &mut HashTable, key: i64) -> bool {
+        let key_values = [Value::from_i64(key)];
+        let key_refs = [key_values[0].as_ref()];
+        loop {
+            if let IOResult::Done(inserted) =
+                ht.insert_distinct(&key_values, &key_refs, None).unwrap()
+            {
+                return inserted;
+            }
+        }
     }
 
     #[test]

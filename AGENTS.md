@@ -29,6 +29,7 @@ scripts/diff.sh "SQL" [label]  # compare sqlite3 vs tursodb output
 - `make test-single TEST=foo.test` - single legacy TCL test
 - `make -C sqlite/conformance run-rust ARGS='--snapshot-filter __never__'` - preferred `.sqltest` runner for new coverage
 - `CI=1 make -C sqlite/conformance run-rust` - only when snapshot tests are required
+- `make -C postgres/conformance run-postgres` - run the PostgreSQL `.sqltest` corpus against a real PostgreSQL server (needs Docker, or a server at `PG_DSN`)
 
 ### Test Organization
 
@@ -37,11 +38,18 @@ Default: add coverage to the narrowest existing test harness that can express th
 - `sqlite/conformance/sqlite-sqltests/` - preferred for SQL conformance coverage. These tests run the same scenario against both Turso and SQLite, so use them first for parser, planner, executor, and SQL semantics work that fits the `.sqltest` DSL.
 - `tests/integration/` - primary fallback when the behavior cannot be expressed cleanly in `.sqltest`. Put API-level regressions, multi-connection orchestration, storage assertions, injected failures, timeout behavior, and other Rust-driven scenarios here.
 - `sqlite/conformance/upstream/` - imported upstream SQLite golden tests. Do not modify these for Turso behavior changes; use them as fixed compatibility coverage, and only touch them for intentional upstream sync or harness maintenance.
-- `postgres/conformance/pg-sqltests/` - `.sqltest` coverage for the PostgreSQL frontend, run via `make -C postgres/conformance run` (spawns a tursopg server per test and drives it over the wire protocol). Only assert behavior real PostgreSQL also exhibits, so the corpus stays valid for differential runs.
+- `postgres/conformance/pg-sqltests/` - `.sqltest` coverage for the PostgreSQL frontend.
 - `testing/cli_tests/` - CLI-focused Python coverage for shell behavior and end-to-end command workflows.
 - `tests/fuzz/` - minimized fuzz regressions and targeted edge cases that are easier to keep as Rust tests.
 - `testing/simulator/` and `testing/concurrent-simulator/` - deterministic concurrency, scheduling, and failure-injection coverage for state-machine and I/O correctness.
 - `testing/differential-oracle/` and `testing/stress/` - differential and long-running stress tooling. Use these for deeper investigation or specialized validation, not as the first stop for a focused regression test.
+
+### Differential-Fuzzer Regression Rule
+
+Every differential-fuzzer failure that is successfully minimized must become a
+permanent `*.sqltest` regression case before its fix is considered complete.
+The seed and minimized fuzzer artifact are debugging aids, not substitutes for
+the focused SQL regression.
 
 ## Structure
 
@@ -74,6 +82,7 @@ limbo/
 | New SQL tests | `sqlite/conformance/sqlite-sqltests/` | `.sqltest` format preferred |
 | Quick sqlite3 diff | `scripts/diff.sh` | Compare sqlite3 vs tursodb output for a query |
 | MVCC testing REPL | `cli/mvcc_repl.rs` | Multi-conn concurrent txn testing REPL        |
+| User docs | `docs/sql-reference/` | statements/, functions/, pragmas.mdx, cli/ — update with any user-visible change |
 
 ## Guides
 
@@ -125,8 +134,9 @@ Before opening a PR, read the "PR Workflow" document linked above.
 5. **Own your regressions.** If tests fail after your change, they are your regressions. Debug them directly. Never stash/revert to "check if they fail on main" — that wastes time and is categorically banned.
 6. **Validate your hypotheses.** If you suspect a given cause for a bug, validate it and provide incontrovertible evidence. NEVER make unearned assumptions.
 7. **Fix root causes, not symptoms** When designing a fix, ask yourself: is this a symptom of a deeper root cause? would my fix hide a problem that's created upstream?
-7. **Driver API parity** Embedded (`bindings/rust`) and serverless (`serverless/rust`) drivers expose the same public API; add features to both in the same change. Spec: `serverless/conformance/differential/README.md`.
-8. **Backward compatibility** No breaking changes. New versions of Turso must work with databases and sidecar files that were created from previous versions.  
+8. **Driver API parity** Embedded (`bindings/rust`) and serverless (`serverless/rust`) drivers expose the same public API; add features to both in the same change. Spec: `serverless/conformance/differential/README.md`.
+9. **Backward compatibility** No breaking changes. New versions of Turso must work with databases and sidecar files that were created from previous versions.  
+10. **Keep user docs current.** If a change adds, removes, or changes user-visible SQL behavior (syntax, functions, pragmas, data types, CLI commands, errors), update the matching page in `docs/sql-reference/` in the same change. For example, a new `JOIN` type goes in `docs/sql-reference/statements/select.mdx`.
 
 ## Always use plain language instead of complex jargon
 

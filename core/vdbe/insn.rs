@@ -307,6 +307,17 @@ pub struct AddColumnData {
     pub foreign_keys: Vec<Arc<ForeignKey>>,
 }
 
+/// Data for AlterColumn instruction (boxed to keep Insn small).
+#[derive(Debug, Clone)]
+pub struct AlterColumnData {
+    pub db: usize,
+    pub table: String,
+    pub column_index: usize,
+    pub definition: turso_parser::ast::ColumnDefinition,
+    pub rename: bool,
+    pub rewritten_triggers: Vec<(usize, String, String)>,
+}
+
 /// Data for IntegrityCk instruction (boxed to keep Insn small).
 #[derive(Debug, Clone)]
 pub struct IntegrityCkData {
@@ -357,6 +368,63 @@ pub struct AggStepData {
     /// Collation for comparison-based aggregates (MIN/MAX), resolved at
     /// translation time from the argument expression.
     pub collation: Option<CollationSeq>,
+}
+
+/// Which of SUM, TOTAL, or AVG an `IvmSumFinalize` instruction computes. The
+/// three share one linear state (see `IvmSumData`); only the finalize step
+/// tells them apart.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IvmSumKind {
+    Sum,
+    Total,
+    Avg,
+}
+
+/// Incremental-view state for SUM/TOTAL/AVG (boxed to keep Insn small).
+///
+/// A materialized view must equal a fresh evaluation of its defining SELECT
+/// over the table's current rows, so this state combines by plain addition,
+/// with no sticky flag that survives a retraction it should not. A row is
+/// added `weight` times: its z-set weight, negative for a retraction. See
+/// "Divergences from DBSP" in docs/ivm-vdbe-rewrite-writeup.md.
+///
+/// Fields:
+/// - `int_wrapped`/`int_wrap_count`: the exact sum of every live INTEGER (or
+///   integer-valued TEXT) contribution, stored as `int_wrapped + int_wrap_count
+///   * 2^64` so an i64 overflow is still exactly undone by a later retraction.
+/// - `float_sum`/`float_err`: the Kahan-Babuska-Neumaier running sum of every
+///   live non-integer contribution (REAL, or TEXT/BLOB that sum() treats as
+///   approximate).
+/// - `non_int_count`: count of live non-integer contributions; decides
+///   whether SUM's result is INTEGER or REAL.
+/// - `non_null_count`: count of live non-NULL contributions; decides the
+///   empty-group result and AVG's divisor.
+#[derive(Debug, Clone)]
+pub struct IvmSumData {
+    pub arg_reg: usize,
+    /// The row's z-set weight: an integer, negative for a retraction.
+    pub weight_reg: usize,
+    pub int_wrapped_reg: usize,
+    pub int_wrap_count_reg: usize,
+    pub float_sum_reg: usize,
+    pub float_err_reg: usize,
+    pub non_int_count_reg: usize,
+    pub non_null_count_reg: usize,
+}
+
+/// Data for the `IvmSumFinalize` instruction (boxed to keep Insn small): the
+/// same state fields as `IvmSumData`, minus the row's argument and weight,
+/// plus which function to compute and where to write the result.
+#[derive(Debug, Clone)]
+pub struct IvmSumFinalizeData {
+    pub kind: IvmSumKind,
+    pub int_wrapped_reg: usize,
+    pub int_wrap_count_reg: usize,
+    pub float_sum_reg: usize,
+    pub float_err_reg: usize,
+    pub non_int_count_reg: usize,
+    pub non_null_count_reg: usize,
+    pub dest_reg: usize,
 }
 
 /// Data for ArrayEncode instruction (boxed to keep Insn small).
@@ -997,7 +1065,7 @@ pub enum Insn {
     Halt {
         err_code: usize,
         description: String,
-        /// Override the program's resolve_type for error handling (used by RAISE).
+        /// Override the program's resolve_type for error handling.
         on_error: Option<ResolveType>,
         /// If set, read the error description from this register instead of
         /// the static `description` field (used by RAISE with expression messages).
@@ -1009,6 +1077,8 @@ pub enum Insn {
         target_reg: usize,   // P3
         description: String, // p4
         err_code: usize,     // p1
+        /// Override the program's resolve_type for error handling.
+        on_error: Option<ResolveType>, // p2
     },
 
     /// Start a transaction.
@@ -1253,6 +1323,40 @@ pub enum Insn {
         acc_reg: usize,
         dest_reg: usize,
         func: AccumulatorFunc,
+    },
+
+    /// Materialize an aggregate accumulator register from its persisted state
+    /// payload, read from `agg_payload_width(func)` registers starting at
+    /// `payload_start_reg`. The counterpart of AggContextStore; used by
+    /// materialized view maintenance to resume a group's aggregate state from
+    /// the view's state table.
+    AggContextLoad {
+        acc_reg: usize,
+        payload_start_reg: usize,
+        func: AccumulatorFunc,
+    },
+
+    /// Persist an aggregate accumulator's state payload into
+    /// `agg_payload_width(func)` registers starting at `payload_start_reg`,
+    /// for storage in a materialized view's state table.
+    AggContextStore {
+        acc_reg: usize,
+        payload_start_reg: usize,
+        func: AccumulatorFunc,
+    },
+
+    /// Add `arg_reg`'s row, `weight_reg` times, to a materialized view's
+    /// SUM/TOTAL/AVG state. A negative weight retracts the row. See
+    /// `IvmSumData`.
+    IvmSumStep {
+        data: Box<IvmSumData>,
+    },
+
+    /// Compute SUM, TOTAL, or AVG's current result from the state registers
+    /// `IvmSumStep` maintains, into `dest_reg`. See
+    /// `IvmSumFinalizeData`.
+    IvmSumFinalize {
+        data: Box<IvmSumFinalizeData>,
     },
 
     /// Open a sorter.
@@ -1630,7 +1734,7 @@ pub enum Insn {
     /// `LimboError::SequenceExhausted` on overflow when `cycle` is false.
     SequenceComputeNext {
         db: usize,
-        seq_name_reg: usize,
+        seq_name: String,
         in_value_reg: usize,
         in_is_called_reg: usize,
         was_empty_reg: usize,
@@ -1648,7 +1752,7 @@ pub enum Insn {
     /// successful sequence RMW commit.
     SequenceTrackAllocation {
         db: usize,
-        seq_name_reg: usize,
+        seq_name: String,
         value_reg: usize,
     },
     /// Register an in-flight sequence allocation against the *outer*
@@ -1660,7 +1764,7 @@ pub enum Insn {
     /// closes.
     SequenceRegisterAllocation {
         db: usize,
-        seq_name_reg: usize,
+        seq_name: String,
         value_reg: usize,
         /// Register holding the encoded saved outer mv_tx (the blob written
         /// by `SequenceBeginInnerTx`). Empty blob means "no outer tx".
@@ -1904,11 +2008,7 @@ pub enum Insn {
         data: Box<AddColumnData>,
     },
     AlterColumn {
-        db: usize,
-        table: String,
-        column_index: usize,
-        definition: Box<turso_parser::ast::ColumnDefinition>,
-        rename: bool,
+        data: Box<AlterColumnData>,
     },
     /// Try to set the maximum page count for database P1 to the value in P3.
     /// Do not let the maximum page count fall below the current page count and
@@ -2272,6 +2372,10 @@ impl InsnVariants {
             InsnVariants::AggStep => execute::op_agg_step,
             InsnVariants::AggInverse => execute::op_agg_inverse,
             InsnVariants::AggFinal | InsnVariants::AggValue => execute::op_agg_final,
+            InsnVariants::AggContextLoad => execute::op_agg_context_load,
+            InsnVariants::AggContextStore => execute::op_agg_context_store,
+            InsnVariants::IvmSumStep => execute::op_ivm_sum_step,
+            InsnVariants::IvmSumFinalize => execute::op_ivm_sum_finalize,
             InsnVariants::SorterOpen => execute::op_sorter_open,
             InsnVariants::SorterInsert => execute::op_sorter_insert,
             InsnVariants::SorterSort => execute::op_sorter_sort,

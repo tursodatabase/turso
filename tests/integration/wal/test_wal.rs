@@ -348,3 +348,58 @@ fn test_wal_write_lock_released_on_conn_drop() {
         .execute("CREATE TABLE t (id integer primary key)")
         .unwrap();
 }
+
+/// A WAL whose header checksum is wrong must be ignored, the way SQLite's
+/// `walIndexRecover()` ignores it. Its page size must not be used either: a
+/// header claiming 512-byte pages next to a 4096-byte-page database used to
+/// make the next write fail and truncate the main file on close.
+#[test]
+fn test_wal_with_bad_header_checksum_is_ignored() -> anyhow::Result<()> {
+    let temp_dir = tempfile::TempDir::new()?;
+    let source_path = temp_dir.path().join("source.db");
+    let db_path = temp_dir.path().join("bad_wal_header.db");
+    let wal_path = db_path.with_extension("db-wal");
+
+    // Copy the pair aside while the WAL still holds uncheckpointed rows,
+    // because SQLite checkpoints and removes the WAL when it closes.
+    let sqlite = rusqlite::Connection::open(&source_path)?;
+    sqlite.pragma_update(None, "journal_mode", "WAL")?;
+    sqlite.execute_batch(
+        "CREATE TABLE t(x TEXT);
+         WITH RECURSIVE c(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM c WHERE i<50)
+         INSERT INTO t SELECT printf('%0100d', i) FROM c;
+         PRAGMA wal_checkpoint(TRUNCATE);
+         WITH RECURSIVE c(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM c WHERE i<20)
+         INSERT INTO t SELECT printf('%0100d', i) FROM c;",
+    )?;
+    std::fs::copy(&source_path, &db_path)?;
+    std::fs::copy(source_path.with_extension("db-wal"), &wal_path)?;
+    drop(sqlite);
+
+    let mut wal = std::fs::read(&wal_path)?;
+    wal[8..12].copy_from_slice(&512u32.to_be_bytes());
+    wal[24..32].fill(0xab);
+    std::fs::write(&wal_path, wal)?;
+
+    {
+        let tmp_db = TempDatabase::new_with_existent(&db_path);
+        let conn = tmp_db.connect_limbo();
+        assert_eq!(
+            execute_and_get_ints(&conn, "SELECT count(*) FROM t")?,
+            vec![50]
+        );
+        conn.execute("INSERT INTO t VALUES ('after')")?;
+        assert_eq!(
+            execute_and_get_ints(&conn, "SELECT count(*) FROM t")?,
+            vec![51]
+        );
+        conn.close()?;
+    }
+
+    let sqlite = rusqlite::Connection::open(&db_path)?;
+    let quick_check: String = sqlite.query_row("PRAGMA quick_check", (), |row| row.get(0))?;
+    assert_eq!(quick_check, "ok");
+    let count: i64 = sqlite.query_row("SELECT count(*) FROM t", (), |row| row.get(0))?;
+    assert_eq!(count, 51);
+    Ok(())
+}

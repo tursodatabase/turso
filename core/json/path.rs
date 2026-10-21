@@ -37,6 +37,24 @@ pub struct JsonPath<'a> {
     pub elements: Vec<PathElement<'a>>,
 }
 
+impl JsonPath<'_> {
+    pub fn into_owned(self) -> JsonPath<'static> {
+        let elements = self
+            .elements
+            .into_iter()
+            .map(|element| match element {
+                PathElement::Root() => PathElement::Root(),
+                PathElement::Key(key, raw) => PathElement::Key(Cow::Owned(key.into_owned()), raw),
+                PathElement::ArrayLocator(index) => PathElement::ArrayLocator(index),
+                PathElement::BracketQuotedKey(key) => {
+                    PathElement::BracketQuotedKey(Cow::Owned(key.into_owned()))
+                }
+            })
+            .collect();
+        JsonPath { elements }
+    }
+}
+
 type RawString = bool;
 
 /// PathElement describes a single element of a JSON path.

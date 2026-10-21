@@ -72,3 +72,30 @@ test strict-not-null-still-enforced {
 }
 expect error {
 }
+
+test strict-primary-key-columns-are-not-null {
+    CREATE TABLE pk1 (code TEXT PRIMARY KEY, n INT) STRICT;
+    CREATE TABLE pk2 (a TEXT, b INT, c INT, PRIMARY KEY (a, b)) STRICT;
+    CREATE TABLE pk3 (id INTEGER PRIMARY KEY, x TEXT) STRICT;
+    SELECT name, "notnull", pk FROM pragma_table_info('pk1');
+    SELECT name, "notnull", pk FROM pragma_table_info('pk2');
+    SELECT name, "notnull", pk FROM pragma_table_info('pk3');
+}
+expect {
+    code|1|1
+    n|0|0
+    a|1|1
+    b|1|2
+    c|0|0
+    id|0|1
+    x|0|0
+}
+
+test strict-primary-key-schema-sql-after-add-column {
+    CREATE TABLE pk1 (code TEXT PRIMARY KEY, n INT) STRICT;
+    ALTER TABLE pk1 ADD COLUMN z INT;
+    SELECT sql FROM sqlite_schema WHERE name = 'pk1';
+}
+expect {
+    CREATE TABLE pk1 (code TEXT PRIMARY KEY, n INT, z INT) STRICT
+}

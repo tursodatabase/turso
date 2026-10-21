@@ -1666,6 +1666,9 @@ pub struct Pager {
     pub(crate) io_ctx: RwLock<IOContext>,
     /// encryption is an opt-in feature. we will enable it only if the flag is passed
     enable_encryption: AtomicBool,
+    /// Whether this pager holds an ephemeral table or index, whose file no
+    /// other pager reads.
+    ephemeral: AtomicBool,
     shared: Arc<SharedPagerState>,
     /// Sync type for durability. FullFsync uses F_FULLFSYNC on macOS (PRAGMA fullfsync).
     /// Only stored on Apple platforms; on others, always returns Fsync.
@@ -1972,6 +1975,7 @@ impl Pager {
             }),
             io_ctx: RwLock::new(IOContext::default()),
             enable_encryption: AtomicBool::new(false),
+            ephemeral: AtomicBool::new(false),
             shared,
             #[cfg(target_vendor = "apple")]
             sync_type: AtomicFileSyncType::new(FileSyncType::Fsync),
@@ -3094,6 +3098,10 @@ impl Pager {
 
     pub fn db_initialized(&self) -> bool {
         self.shared.initialized()
+    }
+
+    pub(crate) fn mark_ephemeral(&self) {
+        self.ephemeral.store(true, Ordering::Relaxed);
     }
 
     /// Set the page size of an empty database for all of its pagers. Does nothing once page 1 exists.
@@ -5720,6 +5728,12 @@ impl Pager {
                     (default_header.page_size.get() - default_header.reserved_space as u32)
                         as usize,
                 );
+                // The page cache never evicts or spills page 1, so an
+                // ephemeral pager never reads it back from its file.
+                if self.ephemeral.load(Ordering::Relaxed) {
+                    page1.pin();
+                    return self.finish_allocate_page1(page1);
+                }
                 let c = begin_write_btree_page(self, &page1, None)?;
 
                 // Pin page1 to prevent eviction while stored in state machine
@@ -6111,6 +6125,10 @@ impl Pager {
         self.set_schema_cookie(None);
         if schema_did_change {
             *connection.schema.write() = connection.db.clone_schema();
+            // Programs prepared against the rolled-back schema may use btrees
+            // that no longer exist, and later DDL can bring the schema version
+            // back to the number they were prepared with.
+            connection.bump_prepare_context_generation();
         }
         if is_write {
             if let Some(wal) = self.wal.as_ref() {

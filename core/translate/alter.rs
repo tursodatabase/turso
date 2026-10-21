@@ -22,13 +22,16 @@ use crate::{
     },
     translate::{
         emitter::{emit_check_constraints, gencol::compute_virtual_columns, Resolver},
-        expr::{emit_type_expr, translate_expr, walk_expr, walk_expr_mut, WalkControl},
+        expr::{
+            emit_stored_column, emit_type_expr, translate_expr, walk_expr, walk_expr_mut,
+            WalkControl,
+        },
         plan::{ColumnMask, ColumnUsedMask, OuterQueryReference, TableReferences},
         trigger::create_trigger_to_sql,
     },
     util::{
-        check_expr_references_column, escape_sql_string_literal, normalize_ident,
-        parse_numeric_literal, rename_identifiers, rewrite_check_expr_table_refs,
+        check_expr_references_column, escape_sql_string_literal, is_builtin_strict_type,
+        normalize_ident, parse_numeric_literal, rename_identifiers, rewrite_check_expr_table_refs,
         rewrite_trigger_cmd_table_refs, rewrite_view_sql_for_column_rename,
     },
     vdbe::{
@@ -363,7 +366,7 @@ fn emit_rename_sqlite_sequence_entry(
             cursor: seq_cursor_id,
             key_reg: rowid,
             record_reg,
-            flag: crate::vdbe::insn::InsertFlags(0),
+            flag: crate::translate::insert::autoincrement_bookkeeping_insert_flags(),
             table_name: crate::schema::SQLITE_SEQUENCE_TABLE_NAME.to_string(),
         });
 
@@ -559,10 +562,10 @@ fn emit_add_column_default_type_validation(
     Ok(())
 }
 
-/// Validate NOT NULL and CHECK constraints for a new virtual generated column
-/// by scanning each row and computing the expression.
+/// Validate NOT NULL and CHECK constraints for a new or altered column by
+/// scanning each existing row, computing virtual generated columns as needed.
 #[allow(clippy::too_many_arguments)]
-fn emit_add_virtual_column_validation(
+fn emit_column_constraints_validation(
     program: &mut ProgramBuilder,
     table: &BTreeTable,
     column: &Column,
@@ -890,7 +893,7 @@ fn emit_add_column_check_validation(
         // constraint name, or the expression's source text as written.
         let name = match (constraint_name, check_source) {
             (Some(name), _) => name.clone(),
-            (None, Some(source)) => crate::util::check_source_for_error(source),
+            (None, Some(source)) => crate::util::dequote(source),
             (None, None) => format!("{check_expr}"),
         };
         program.emit_insn(Insn::Halt {
@@ -928,6 +931,7 @@ pub fn translate_alter_table(
     let qualified_schema_table = schema_table_name_for_db(resolver, database_id);
     let schema_version = resolver.with_schema(database_id, |s| s.schema_version);
     validate(&alter_table, table_name)?;
+    reject_alter_of_view(&alter_table, table_name, resolver, database_id)?;
 
     let table_indexes = resolver.with_schema(database_id, |s| {
         s.get_indices(table_name).cloned().collect::<Vec<_>>()
@@ -1354,13 +1358,8 @@ pub fn translate_alter_table(
                         "missing datatype for {table_name}.{new_column_name}"
                     )));
                 }
-                let is_builtin = ty.is_empty()
-                    || ty.eq_ignore_ascii_case("INT")
-                    || ty.eq_ignore_ascii_case("INTEGER")
-                    || ty.eq_ignore_ascii_case("REAL")
-                    || ty.eq_ignore_ascii_case("TEXT")
-                    || ty.eq_ignore_ascii_case("BLOB")
-                    || ty.eq_ignore_ascii_case("ANY");
+                let written_ty = column.written_ty_str.as_deref().unwrap_or(ty);
+                let is_builtin = ty.is_empty() || is_builtin_strict_type(written_ty);
                 // Domain types require STRICT tables because domain constraints
                 // (CHECK, NOT NULL, DEFAULT) are only enforced on STRICT tables.
                 if !is_builtin && !btree.is_strict {
@@ -1522,7 +1521,7 @@ pub fn translate_alter_table(
             };
 
             if is_generated {
-                emit_add_virtual_column_validation(
+                emit_column_constraints_validation(
                     program,
                     &btree,
                     &column,
@@ -1678,7 +1677,7 @@ pub fn translate_alter_table(
                                 }),
                             };
                     // Pass the renamed database's NAME so the rewrite
-                    // only touches triggers whose `tbl_name.db_name`
+                    // only touches triggers whose `tbl_name.namespace`
                     // actually points at the db we are renaming in
                     // (or is unqualified). Otherwise a temp trigger
                     // referencing `aux.t` would be wrongly rewritten
@@ -2040,6 +2039,16 @@ pub fn translate_alter_table(
                 table.columns_mut()[column_index] = replacement_column.clone();
                 table.resolve_custom_type_affinities(resolver.schema());
                 table.prepare_generated_columns()?;
+                let column_names: Vec<&str> = table
+                    .columns()
+                    .iter()
+                    .filter_map(|c| c.name.as_deref())
+                    .collect();
+                for constraint in &definition.constraints {
+                    if let ast::ColumnConstraint::Check { expr, .. } = &constraint.constraint {
+                        validate_check_expr(expr, &table.name, &column_names, resolver)?;
+                    }
+                }
                 Some(table)
             } else {
                 None
@@ -2272,7 +2281,7 @@ pub fn translate_alter_table(
             });
 
             // Update trigger SQL for renamed columns
-            for (trigger_database_id, trigger_name, new_sql) in triggers_to_rewrite {
+            for (trigger_database_id, trigger_name, new_sql) in triggers_to_rewrite.clone() {
                 let escaped_sql = escape_sql_string_literal(&new_sql);
                 let escaped_trigger_name = escape_sql_string_literal(&trigger_name);
                 let qualified_schema_table =
@@ -2352,17 +2361,16 @@ pub fn translate_alter_table(
 
             if let Some(altered_table) = altered_table {
                 let altered_table = Arc::new(altered_table);
+                emit_column_constraints_validation(
+                    program,
+                    &altered_table,
+                    &altered_table.columns()[column_index],
+                    &definition.constraints,
+                    resolver,
+                    connection,
+                    database_id,
+                )?;
                 if rewrites_physical_layout {
-                    emit_add_virtual_column_validation(
-                        program,
-                        &altered_table,
-                        &altered_table.columns()[column_index],
-                        &definition.constraints,
-                        resolver,
-                        connection,
-                        database_id,
-                    )?;
-
                     let original_columns = original_btree.columns();
                     let source_column_by_schema_idx: Vec<Option<usize>> = altered_table
                         .columns()
@@ -2426,16 +2434,52 @@ pub fn translate_alter_table(
                 p5: 0,
             });
             program.emit_insn(Insn::AlterColumn {
-                db: database_id,
-                table: table_name.to_owned(),
-                column_index,
-                definition: Box::new(definition),
-                rename,
+                data: Box::new(crate::vdbe::insn::AlterColumnData {
+                    db: database_id,
+                    table: table_name.to_owned(),
+                    column_index,
+                    definition,
+                    rename,
+                    rewritten_triggers: triggers_to_rewrite,
+                }),
             });
         }
     };
 
     Ok(())
+}
+
+/// Reject ALTER TABLE on a plain or materialized view with SQLite's messages
+/// (sqlite3AlterRenameTable, sqlite3AlterBeginAddColumn and isRealTable in
+/// alter.c). ALTER COLUMN has no SQLite equivalent and uses the RENAME TO
+/// message.
+fn reject_alter_of_view(
+    alter_table: &ast::AlterTableBody,
+    table_name: &str,
+    resolver: &Resolver,
+    database_id: usize,
+) -> Result<()> {
+    let is_view = resolver.with_schema(database_id, |s| {
+        s.get_view(table_name).is_some() || s.materialized_view_exists(table_name)
+    });
+    if !is_view {
+        return Ok(());
+    }
+    let view_name = normalize_ident(table_name);
+    match alter_table {
+        ast::AlterTableBody::RenameTo(_) | ast::AlterTableBody::AlterColumn { .. } => {
+            crate::bail_parse_error!("view {view_name} may not be altered")
+        }
+        ast::AlterTableBody::AddColumn(_) => {
+            crate::bail_parse_error!("Cannot add a column to a view")
+        }
+        ast::AlterTableBody::RenameColumn { .. } => {
+            crate::bail_parse_error!("cannot rename columns of view \"{view_name}\"")
+        }
+        ast::AlterTableBody::DropColumn(_) => {
+            crate::bail_parse_error!("cannot drop column from view \"{view_name}\"")
+        }
+    }
 }
 
 // Return the indexes whose persisted entries may become stale after ALTER COLUMN,
@@ -2697,11 +2741,13 @@ fn emit_rewrite_table_rows(
                 continue;
             };
 
-            program.emit_column_or_rowid(
+            emit_stored_column(
+                program,
                 cursor_id,
                 *source_column_idx,
                 layout.to_register(base_dest_reg, schema_idx),
-            );
+                resolver,
+            )?;
         }
 
         if let Some(column_index) = converted_column {
@@ -2972,14 +3018,14 @@ fn rewrite_trigger_sql_for_table_rename(
     // implementation did, and the caller already narrowed the
     // candidate set by iterating temp schema triggers for renames in
     // main only.
-    let qualifier_matches = match tbl_name.db_name.as_ref() {
+    let qualifier_matches = match tbl_name.namespace.as_ref() {
         Some(db) => db.as_str().eq_ignore_ascii_case(renamed_db_name),
         None => true,
     };
     let new_tbl_name =
         if qualifier_matches && tbl_name.name.as_str().eq_ignore_ascii_case(old_table_name) {
             ast::QualifiedName {
-                db_name: tbl_name.db_name,
+                namespace: tbl_name.namespace,
                 name: ast::Name::exact(new_table_name.to_string()),
                 alias: None,
             }
@@ -3252,6 +3298,101 @@ impl<'a> ColumnRenameMode<'a> {
     }
 }
 
+#[derive(Clone, Default)]
+struct TargetQualifiers {
+    names: Vec<String>,
+    unqualified_column_is_from_other_table: bool,
+    ctes: rustc_hash::FxHashMap<String, crate::util::ViewColumnSchema>,
+}
+
+impl TargetQualifiers {
+    fn with_from_tables<'a>(
+        &self,
+        from_tables: impl IntoIterator<Item = &'a ast::SelectTable>,
+        target_table_name: &str,
+        old_col_norm: &str,
+        database_id: usize,
+        resolver: &Resolver,
+    ) -> Result<Self> {
+        let mut names = self.names.clone();
+        let mut from_has_target_table = false;
+        let mut other_table_has_column = false;
+        for select_table in from_tables {
+            let is_cte = matches!(
+                select_table,
+                ast::SelectTable::Table(name, _, _)
+                    if name.namespace.is_none()
+                        && self.ctes.contains_key(&normalize_ident(name.name.as_str()))
+            );
+            match select_table {
+                ast::SelectTable::Table(name, alias, _)
+                    if !is_cte && name.name.as_str().eq_ignore_ascii_case(target_table_name) =>
+                {
+                    from_has_target_table = true;
+                    let alias = alias
+                        .as_ref()
+                        .map(|alias| normalize_ident(alias.name().as_str()));
+                    for qualifier in std::iter::once(target_table_name.to_string()).chain(alias) {
+                        if !names.contains(&qualifier) {
+                            names.push(qualifier);
+                        }
+                    }
+                }
+                ast::SelectTable::Table(name, _, _) | ast::SelectTable::TableCall(name, _, _)
+                    if !is_cte =>
+                {
+                    other_table_has_column |=
+                        trigger_from_table_has_column(resolver, database_id, name, old_col_norm);
+                }
+                _ => {
+                    other_table_has_column |= resolver
+                        .with_schema(database_id, |schema| {
+                            crate::util::select_table_column_names(select_table, schema, &self.ctes)
+                        })?
+                        .iter()
+                        .any(|column| column == old_col_norm);
+                }
+            }
+        }
+        Ok(Self {
+            names,
+            unqualified_column_is_from_other_table: !from_has_target_table
+                && (other_table_has_column || self.unqualified_column_is_from_other_table),
+            ctes: self.ctes.clone(),
+        })
+    }
+}
+
+fn trigger_from_table_has_column(
+    resolver: &Resolver,
+    trigger_database_id: usize,
+    table_name: &ast::QualifiedName,
+    col_norm: &str,
+) -> bool {
+    let table_name_norm = normalize_ident(table_name.name.as_str());
+    let Some(database_id) = trigger_table_database_id(
+        resolver,
+        trigger_database_id,
+        &table_name_norm,
+        table_name.namespace.as_ref().map(|db| db.as_str()),
+    ) else {
+        return false;
+    };
+    resolver.with_schema(database_id, |schema| {
+        if let Some(table) = schema.get_table(&table_name_norm) {
+            return table.get_column_by_name(col_norm).is_some();
+        }
+        schema.get_view(&table_name_norm).is_some_and(|view| {
+            view.columns.iter().any(|column| {
+                column
+                    .name
+                    .as_deref()
+                    .is_some_and(|name| name.eq_ignore_ascii_case(col_norm))
+            })
+        })
+    })
+}
+
 #[derive(Clone, Copy)]
 enum ColumnRenameExprTraversal {
     Normal,
@@ -3271,7 +3412,7 @@ fn apply_expr_column_ref_with_context(
     old_col_norm: &str,
     is_renaming_trigger_table: bool,
     context_table: Option<(&BTreeTable, &str, bool)>,
-    from_target_qualifiers: &[String],
+    from_target_qualifiers: &TargetQualifiers,
 ) -> Result<()> {
     match e {
         ast::Expr::Qualified(..) | ast::Expr::DoublyQualified(..) => {
@@ -3342,7 +3483,7 @@ fn apply_expr_column_ref_with_context(
                 } else {
                     return Err(no_such_column_error(&error_column_ref));
                 }
-            } else if from_target_qualifiers.contains(&ns_norm) {
+            } else if from_target_qualifiers.names.contains(&ns_norm) {
                 if let Some(new_col_norm) = mode.rewritten_name() {
                     *col = ast::Name::from_string(new_col_norm);
                 } else {
@@ -3379,8 +3520,9 @@ fn apply_expr_column_ref_with_context(
             // best proxy we have — which mis-rewrites a USING-joined
             // reference when both sides happen to use the same
             // pre-rename column name.
-            if (is_renaming_trigger_table && trigger_table.get_column(&col_norm).is_some())
-                || !from_target_qualifiers.is_empty()
+            if !from_target_qualifiers.unqualified_column_is_from_other_table
+                && ((is_renaming_trigger_table && trigger_table.get_column(&col_norm).is_some())
+                    || !from_target_qualifiers.names.is_empty())
             {
                 if let Some(new_col_norm) = mode.rewritten_name() {
                     *e = ast::Expr::Id(ast::Name::from_string(new_col_norm));
@@ -3405,7 +3547,7 @@ fn apply_expr_for_column_rename(
     target_table_name: &str,
     old_col_norm: &str,
     context_table_name: Option<&str>,
-    from_target_qualifiers: &[String],
+    from_target_qualifiers: &TargetQualifiers,
     database_id: usize,
     resolver: &Resolver,
 ) -> Result<()> {
@@ -3500,7 +3642,7 @@ fn apply_result_expr_for_column_rename(
     trigger_table_name: &str,
     target_table_name: &str,
     old_col_norm: &str,
-    visible_target_qualifiers: &[String],
+    visible_target_qualifiers: &TargetQualifiers,
     database_id: usize,
     resolver: &Resolver,
 ) -> Result<()> {
@@ -3549,7 +3691,7 @@ fn apply_upsert_for_column_rename(
                 target_table_name,
                 old_col_norm,
                 Some(&insert_table_name_norm),
-                &[],
+                &TargetQualifiers::default(),
                 database_id,
                 resolver,
             )?;
@@ -3569,7 +3711,7 @@ fn apply_upsert_for_column_rename(
                 target_table_name,
                 old_col_norm,
                 Some(&insert_table_name_norm),
-                &[],
+                &TargetQualifiers::default(),
                 database_id,
                 resolver,
             )?;
@@ -3603,7 +3745,7 @@ fn apply_upsert_for_column_rename(
                 target_table_name,
                 old_col_norm,
                 Some(&insert_table_name_norm),
-                &[],
+                &TargetQualifiers::default(),
                 database_id,
                 resolver,
             )?;
@@ -3623,7 +3765,7 @@ fn apply_upsert_for_column_rename(
                 target_table_name,
                 old_col_norm,
                 Some(&insert_table_name_norm),
-                &[],
+                &TargetQualifiers::default(),
                 database_id,
                 resolver,
             )?;
@@ -3660,10 +3802,16 @@ fn apply_select_for_column_rename(
     trigger_table_name: &str,
     target_table_name: &str,
     old_col_norm: &str,
-    outer_target_qualifiers: &[String],
+    outer_target_qualifiers: &TargetQualifiers,
     database_id: usize,
     resolver: &Resolver,
 ) -> Result<()> {
+    let outer_target_qualifiers = &TargetQualifiers {
+        ctes: resolver.with_schema(database_id, |schema| {
+            crate::util::extract_cte_columns(&select.with, schema, &outer_target_qualifiers.ctes)
+        })?,
+        ..outer_target_qualifiers.clone()
+    };
     if let Some(ref mut with_clause) = select.with {
         for cte in &mut with_clause.ctes {
             apply_select_for_column_rename(
@@ -3707,11 +3855,14 @@ fn apply_select_for_column_rename(
     }
 
     let body_target_qualifiers = match &select.body.select {
-        ast::OneSelect::Select { from, .. } => merge_target_qualifiers(
-            outer_target_qualifiers,
-            &from_clause_target_qualifiers(from, target_table_name),
-        ),
-        _ => outer_target_qualifiers.to_vec(),
+        ast::OneSelect::Select { from, .. } => outer_target_qualifiers.with_from_tables(
+            from_clause_tables(from),
+            target_table_name,
+            old_col_norm,
+            database_id,
+            resolver,
+        )?,
+        ast::OneSelect::Values(_) => outer_target_qualifiers.clone(),
     };
 
     // Per SQLite's ORDER BY resolution rules, a bare identifier that matches
@@ -3780,7 +3931,7 @@ fn apply_one_select_for_column_rename(
     trigger_table_name: &str,
     target_table_name: &str,
     old_col_norm: &str,
-    outer_target_qualifiers: &[String],
+    outer_target_qualifiers: &TargetQualifiers,
     database_id: usize,
     resolver: &Resolver,
 ) -> Result<()> {
@@ -3793,10 +3944,13 @@ fn apply_one_select_for_column_rename(
             window_clause,
             ..
         } => {
-            let visible_target_qualifiers = merge_target_qualifiers(
-                outer_target_qualifiers,
-                &from_clause_target_qualifiers(from, target_table_name),
-            );
+            let visible_target_qualifiers = outer_target_qualifiers.with_from_tables(
+                from_clause_tables(from),
+                target_table_name,
+                old_col_norm,
+                database_id,
+                resolver,
+            )?;
 
             for col in columns {
                 if let ast::ResultColumn::Expr(expr, _) = col {
@@ -3922,7 +4076,7 @@ fn apply_from_clause_for_column_rename(
     trigger_table_name: &str,
     target_table_name: &str,
     old_col_norm: &str,
-    visible_target_qualifiers: &[String],
+    visible_target_qualifiers: &TargetQualifiers,
     database_id: usize,
     resolver: &Resolver,
 ) -> Result<()> {
@@ -3937,8 +4091,41 @@ fn apply_from_clause_for_column_rename(
         database_id,
         resolver,
     )?;
-
-    for join in &mut from_clause.joins {
+    for join_index in 0..from_clause.joins.len() {
+        let lateral_target_qualifiers;
+        let table_target_qualifiers = if matches!(
+            from_clause.joins[join_index].table.as_ref(),
+            ast::SelectTable::Select { lateral: true, .. } | ast::SelectTable::TableCall(..)
+        ) {
+            let left_tables = std::iter::once(from_clause.select.as_ref()).chain(
+                from_clause.joins[..join_index]
+                    .iter()
+                    .map(|join| join.table.as_ref()),
+            );
+            lateral_target_qualifiers = visible_target_qualifiers.with_from_tables(
+                left_tables,
+                target_table_name,
+                old_col_norm,
+                database_id,
+                resolver,
+            )?;
+            &lateral_target_qualifiers
+        } else {
+            visible_target_qualifiers
+        };
+        let on_tables = std::iter::once(from_clause.select.as_ref()).chain(
+            from_clause.joins[..=join_index]
+                .iter()
+                .map(|join| join.table.as_ref()),
+        );
+        let on_target_qualifiers = visible_target_qualifiers.with_from_tables(
+            on_tables,
+            target_table_name,
+            old_col_norm,
+            database_id,
+            resolver,
+        )?;
+        let join = &mut from_clause.joins[join_index];
         apply_select_table_for_column_rename(
             mode,
             &mut join.table,
@@ -3946,7 +4133,7 @@ fn apply_from_clause_for_column_rename(
             trigger_table_name,
             target_table_name,
             old_col_norm,
-            visible_target_qualifiers,
+            table_target_qualifiers,
             database_id,
             resolver,
         )?;
@@ -3960,7 +4147,7 @@ fn apply_from_clause_for_column_rename(
                 target_table_name,
                 old_col_norm,
                 None,
-                visible_target_qualifiers,
+                &on_target_qualifiers,
                 database_id,
                 resolver,
             )?;
@@ -3977,12 +4164,12 @@ fn apply_select_table_for_column_rename(
     trigger_table_name: &str,
     target_table_name: &str,
     old_col_norm: &str,
-    outer_target_qualifiers: &[String],
+    outer_target_qualifiers: &TargetQualifiers,
     database_id: usize,
     resolver: &Resolver,
 ) -> Result<()> {
     match select_table {
-        ast::SelectTable::Select(select, _) => {
+        ast::SelectTable::Select { select, .. } => {
             apply_select_for_column_rename(
                 mode,
                 select,
@@ -4039,7 +4226,7 @@ fn apply_window_for_column_rename(
     trigger_table_name: &str,
     target_table_name: &str,
     old_col_norm: &str,
-    visible_target_qualifiers: &[String],
+    visible_target_qualifiers: &TargetQualifiers,
     database_id: usize,
     resolver: &Resolver,
 ) -> Result<()> {
@@ -4099,7 +4286,13 @@ fn apply_trigger_cmd_for_column_rename(
         } => {
             let update_table_name_norm = normalize_ident(tbl_name.as_str());
             let is_renaming_update_table = update_table_name_norm == *target_table_name;
-            let from_target_qualifiers = from_clause_target_qualifiers(from, target_table_name);
+            let from_target_qualifiers = TargetQualifiers::default().with_from_tables(
+                from_clause_tables(from),
+                target_table_name,
+                old_col_norm,
+                database_id,
+                resolver,
+            )?;
 
             if is_renaming_update_table {
                 for set in sets.iter_mut() {
@@ -4155,7 +4348,7 @@ fn apply_trigger_cmd_for_column_rename(
                     trigger_table_name,
                     target_table_name,
                     old_col_norm,
-                    &[],
+                    &TargetQualifiers::default(),
                     database_id,
                     resolver,
                 )?;
@@ -4187,7 +4380,7 @@ fn apply_trigger_cmd_for_column_rename(
                 trigger_table_name,
                 target_table_name,
                 old_col_norm,
-                &[],
+                &TargetQualifiers::default(),
                 database_id,
                 resolver,
             )?;
@@ -4221,7 +4414,7 @@ fn apply_trigger_cmd_for_column_rename(
                     target_table_name,
                     old_col_norm,
                     Some(&delete_table_name_norm),
-                    &[],
+                    &TargetQualifiers::default(),
                     database_id,
                     resolver,
                 )?;
@@ -4235,7 +4428,7 @@ fn apply_trigger_cmd_for_column_rename(
                 trigger_table_name,
                 target_table_name,
                 old_col_norm,
-                &[],
+                &TargetQualifiers::default(),
                 database_id,
                 resolver,
             )?;
@@ -4279,7 +4472,7 @@ fn validate_trigger_after_column_rename(
             target_table_name,
             old_col_norm,
             None,
-            &[],
+            &TargetQualifiers::default(),
             database_id,
             resolver,
         )?;
@@ -4301,6 +4494,13 @@ fn validate_trigger_after_column_rename(
     Ok(())
 }
 
+fn from_clause_tables(from: &Option<ast::FromClause>) -> impl Iterator<Item = &ast::SelectTable> {
+    from.iter().flat_map(|from| {
+        std::iter::once(from.select.as_ref())
+            .chain(from.joins.iter().map(|join| join.table.as_ref()))
+    })
+}
+
 fn rename_excluded_column_refs(
     expr: &mut ast::Expr,
     old_col_norm: &str,
@@ -4317,73 +4517,6 @@ fn rename_excluded_column_refs(
         Ok(WalkControl::Continue)
     })?;
     Ok(())
-}
-
-fn from_clause_target_qualifiers(
-    from: &Option<ast::FromClause>,
-    target_table_name: &str,
-) -> Vec<String> {
-    let Some(from_clause) = from else {
-        return Vec::new();
-    };
-
-    let mut qualifiers = Vec::new();
-    let mut seen = HashSet::default();
-    collect_select_table_target_qualifiers(
-        &from_clause.select,
-        target_table_name,
-        &mut qualifiers,
-        &mut seen,
-    );
-    for join in &from_clause.joins {
-        collect_select_table_target_qualifiers(
-            &join.table,
-            target_table_name,
-            &mut qualifiers,
-            &mut seen,
-        );
-    }
-    qualifiers
-}
-
-fn collect_select_table_target_qualifiers(
-    select_table: &ast::SelectTable,
-    target_table_name: &str,
-    qualifiers: &mut Vec<String>,
-    seen: &mut HashSet<String>,
-) {
-    let ast::SelectTable::Table(name, alias, _) = select_table else {
-        return;
-    };
-    if !name.name.as_str().eq_ignore_ascii_case(target_table_name) {
-        return;
-    }
-
-    if seen.insert(target_table_name.to_string()) {
-        qualifiers.push(target_table_name.to_string());
-    }
-    if let Some(alias) = alias {
-        let alias_norm = normalize_ident(alias.name().as_str());
-        if seen.insert(alias_norm.clone()) {
-            qualifiers.push(alias_norm);
-        }
-    }
-}
-
-fn merge_target_qualifiers(outer: &[String], local: &[String]) -> Vec<String> {
-    let mut seen = HashSet::default();
-    let mut merged = Vec::with_capacity(outer.len() + local.len());
-    for qualifier in outer {
-        if seen.insert(qualifier.as_str()) {
-            merged.push(qualifier.clone());
-        }
-    }
-    for qualifier in local {
-        if seen.insert(qualifier.as_str()) {
-            merged.push(qualifier.clone());
-        }
-    }
-    merged
 }
 
 /// Rewrite a trigger command to replace column references.
@@ -5140,7 +5273,7 @@ fn validate_select_table_refs_after_rename_in_table(
         ast::SelectTable::Table(qualified_name, _, _) => {
             if table_reference_exists_after_rename(
                 qualified_name.name.as_str(),
-                qualified_name.db_name.as_ref().map(|db| db.as_str()),
+                qualified_name.namespace.as_ref().map(|db| db.as_str()),
                 altered_table_norm,
                 resolver,
                 trigger_database_id,
@@ -5165,7 +5298,7 @@ fn validate_select_table_refs_after_rename_in_table(
             }
             Ok(None)
         }
-        ast::SelectTable::Select(select, _) => validate_select_table_refs_after_rename(
+        ast::SelectTable::Select { select, .. } => validate_select_table_refs_after_rename(
             select,
             altered_table_norm,
             resolver,
@@ -5838,7 +5971,7 @@ fn validate_select_table_column_refs_after_drop(
     altered_database_id: usize,
 ) -> Result<Option<String>> {
     match select_table {
-        ast::SelectTable::Select(select, _) => validate_select_column_refs_after_drop(
+        ast::SelectTable::Select { select, .. } => validate_select_column_refs_after_drop(
             select,
             &[],
             owning_table_columns,
@@ -5945,7 +6078,7 @@ fn collect_select_table_visible_columns(
                 altered_database_id,
             )
         }
-        ast::SelectTable::Select(select, _) => collect_select_output_columns(select),
+        ast::SelectTable::Select { select, .. } => collect_select_output_columns(select),
         ast::SelectTable::Sub(from_clause, _) => collect_from_clause_output_columns(from_clause),
     }
 }
@@ -5967,7 +6100,7 @@ fn collect_qualified_table_visible_columns(
         resolver,
         trigger_database_id,
         altered_database_id,
-        qualified_name.db_name.as_ref().map(|name| name.as_str()),
+        qualified_name.namespace.as_ref().map(|name| name.as_str()),
     )
     .unwrap_or_default();
     let qualifier = alias.map_or_else(
@@ -5977,7 +6110,7 @@ fn collect_qualified_table_visible_columns(
     let mut visible = columns.clone();
     visible.extend(columns.iter().map(|column| format!("{qualifier}.{column}")));
     if alias.is_none() {
-        if let Some(db_name) = &qualified_name.db_name {
+        if let Some(db_name) = &qualified_name.namespace {
             let database = normalize_ident(db_name.as_str());
             let table = normalize_ident(qualified_name.name.as_str());
             visible.extend(
@@ -6003,7 +6136,7 @@ fn collect_select_table_visible_columns_from_output(
 ) -> Vec<String> {
     match select_table {
         ast::SelectTable::Table(..) | ast::SelectTable::TableCall(..) => Vec::new(),
-        ast::SelectTable::Select(select, _) => collect_select_output_columns(select),
+        ast::SelectTable::Select { select, .. } => collect_select_output_columns(select),
         ast::SelectTable::Sub(from_clause, _) => collect_from_clause_output_columns(from_clause),
     }
 }
@@ -6122,24 +6255,12 @@ fn get_table_columns(
     altered_database_id: usize,
     explicit_db_name: Option<&str>,
 ) -> Option<Vec<String>> {
-    let lookup_database_id = if let Some(db_name) = explicit_db_name {
-        resolver
-            .resolve_database_id(&ast::QualifiedName::fullname(
-                ast::Name::exact(db_name.to_string()),
-                ast::Name::exact(table_name_norm.to_string()),
-            ))
-            .ok()?
-    } else if trigger_database_id == crate::TEMP_DB_ID {
-        if resolver.with_schema(crate::TEMP_DB_ID, |s| {
-            s.get_table(table_name_norm).is_some()
-        }) {
-            crate::TEMP_DB_ID
-        } else {
-            crate::MAIN_DB_ID
-        }
-    } else {
-        trigger_database_id
-    };
+    let lookup_database_id = trigger_table_database_id(
+        resolver,
+        trigger_database_id,
+        table_name_norm,
+        explicit_db_name,
+    )?;
 
     if lookup_database_id == altered_database_id && table_name_norm == altered_table_norm {
         Some(referenceable_column_names(post_drop_table))
@@ -6148,6 +6269,32 @@ fn get_table_columns(
             s.get_table(table_name_norm)
                 .and_then(|t| t.btree().map(|bt| referenceable_column_names(&bt)))
         })
+    }
+}
+
+fn trigger_table_database_id(
+    resolver: &Resolver,
+    trigger_database_id: usize,
+    table_name_norm: &str,
+    explicit_db_name: Option<&str>,
+) -> Option<usize> {
+    if let Some(db_name) = explicit_db_name {
+        resolver
+            .resolve_database_id(&ast::QualifiedName::fullname(
+                ast::Name::exact(db_name.to_string()),
+                ast::Name::exact(table_name_norm.to_string()),
+            ))
+            .ok()
+    } else if trigger_database_id == crate::TEMP_DB_ID {
+        if resolver.with_schema(crate::TEMP_DB_ID, |s| {
+            s.get_table(table_name_norm).is_some()
+        }) {
+            Some(crate::TEMP_DB_ID)
+        } else {
+            Some(crate::MAIN_DB_ID)
+        }
+    } else {
+        Some(trigger_database_id)
     }
 }
 

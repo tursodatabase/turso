@@ -72,11 +72,13 @@ scalar_functions! {
     Boolne(FunctionArity::Exact(2), true),
     ColDescription(FunctionArity::Exact(2), true),
     SetConfig(FunctionArity::Exact(3), false),
+    CurrentSetting(FunctionArity::OneOf(&[1, 2]), false),
     Version(FunctionArity::Exact(0), true),
     CurrentDatabase(FunctionArity::Exact(0), false),
     CurrentSchema(FunctionArity::Exact(0), true),
     PgBackendPid(FunctionArity::Exact(0), true),
     PgIsInRecovery(FunctionArity::Exact(0), false),
+    PgLockAccessShare(FunctionArity::Exact(0), false),
     Now | ClockTimestamp | TransactionTimestamp | StatementTimestamp(FunctionArity::Variadic, false),
 }
 
@@ -117,15 +119,28 @@ impl ScalarCall for PgScalarFunction {
             Self::Booleq => Value::from_i64((args[0].get_value() == args[1].get_value()) as i64),
             Self::Boolne => Value::from_i64((args[0].get_value() != args[1].get_value()) as i64),
             Self::SetConfig => exec_set_config(connection, args)?,
+            Self::CurrentSetting => exec_current_setting(connection, args)?,
             Self::Version => exec_version(),
             Self::CurrentDatabase => {
                 Value::build_text(crate::catalog::db_name_from_path(connection.db_file_path()))
             }
-            Self::CurrentSchema => Value::build_text("public"),
+            Self::CurrentSchema => match crate::session::current_schema(connection) {
+                Some(schema) => Value::build_text(schema),
+                None => Value::Null,
+            },
             Self::PgBackendPid => Value::from_i64(std::process::id() as i64),
             Self::PgIsInRecovery => {
                 // Temporary pg_dump compatibility: "t" means true, not actual recovery state.
                 Value::build_text("t")
+            }
+            Self::PgLockAccessShare => {
+                if connection.get_auto_commit() {
+                    return Err(LimboError::InvalidArgument(
+                        "LOCK TABLE can only be used in transaction blocks".to_string(),
+                    )
+                    .into());
+                }
+                Value::from_i64(0)
             }
             Self::Now
             | Self::ClockTimestamp
@@ -313,7 +328,7 @@ fn text_arg(args: &[Register], i: usize) -> String {
 
 #[derive(strum::EnumString)]
 #[strum(ascii_case_insensitive, serialize_all = "snake_case")]
-enum ConfigParameter {
+pub(crate) enum ConfigParameter {
     SearchPath,
 }
 
@@ -362,6 +377,43 @@ fn exec_set_config(conn: &Connection, args: &[Register]) -> Result<Value> {
     }
     match parameter {
         ConfigParameter::SearchPath => crate::session::set_search_path(conn, value),
+    }
+}
+
+fn exec_current_setting(conn: &Connection, args: &[Register]) -> Result<Value> {
+    if args
+        .iter()
+        .any(|arg| matches!(arg.get_value(), Value::Null))
+    {
+        return Ok(Value::Null);
+    }
+    let Value::Text(name) = args[0].get_value() else {
+        return Err(LimboError::InvalidArgument(
+            "current_setting requires a text parameter name".to_string(),
+        ));
+    };
+    let name = name.as_str();
+    let missing_ok = match args.get(1).map(Register::get_value) {
+        None => false,
+        Some(value) => match value.as_int() {
+            Some(0) => false,
+            Some(1) => true,
+            _ => {
+                return Err(LimboError::InvalidArgument(
+                    "current_setting requires a boolean".to_string(),
+                ));
+            }
+        },
+    };
+    match name.parse::<ConfigParameter>() {
+        Ok(ConfigParameter::SearchPath) => Ok(Value::build_text(
+            crate::session::search_path_setting(conn)
+                .unwrap_or_else(|| crate::session::DEFAULT_SEARCH_PATH.to_owned()),
+        )),
+        Err(_) if missing_ok => Ok(Value::Null),
+        Err(_) => Err(LimboError::InvalidArgument(format!(
+            "unrecognized configuration parameter \"{name}\""
+        ))),
     }
 }
 

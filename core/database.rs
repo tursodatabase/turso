@@ -20,7 +20,7 @@ use crate::{
     alloc, bail_corrupt_error,
     busy::BusyHandler,
     ext,
-    incremental::view::AllViewsTxState,
+    incremental::view::TransactionChanges,
     io, io_error, io_yield_one, mvcc,
     progress::ProgressHandler,
     return_if_io,
@@ -639,6 +639,12 @@ pub(crate) static DATABASE_MANAGER: LazyLock<
 #[cfg(feature = "simulator")]
 pub fn clear_database_registry() {
     DATABASE_MANAGER.lock().clear();
+}
+
+#[cfg(test)]
+pub(crate) fn remove_file_from_database_registry(path: &str) {
+    let file_id = io::get_file_id(path).unwrap();
+    DATABASE_MANAGER.lock().remove(&DatabaseKey::File(file_id));
 }
 
 /// The `Database` object contains per database file state that is shared
@@ -1697,21 +1703,13 @@ impl Database {
                         // Sync the connection's schema from the database so it
                         // can query __turso_internal_types.
                         conn.maybe_update_schema();
-                        let load_result: Result<()> = (|| {
-                            let type_sqls = conn.query_stored_type_definitions()?;
-                            if !type_sqls.is_empty() {
-                                let db = state
-                                    .db
-                                    .as_ref()
-                                    .expect("db must be initialized in Init phase");
-                                db.with_schema_mut(|schema| {
-                                    schema.load_type_definitions(&type_sqls)
-                                })?;
-                            }
-                            Ok(())
-                        })();
-                        if let Err(e) = load_result {
-                            tracing::warn!("Failed to load custom types during open: {}", e);
+                        let type_sqls = conn.query_stored_type_definitions()?;
+                        if !type_sqls.is_empty() {
+                            let db = state
+                                .db
+                                .as_ref()
+                                .expect("db must be initialized in Init phase");
+                            db.with_schema_mut(|schema| schema.load_type_definitions(&type_sqls))?;
                         }
                     }
 
@@ -2605,6 +2603,7 @@ impl Database {
             closed: AtomicBool::new(false),
             temp: crate::connection::TempDbContext::new(),
             attached_databases: RwLock::new(DatabaseCatalog::new()),
+            namespaces: self.dialect.new_namespaces(),
             has_non_main_pagers: AtomicBool::new(false),
             query_only: AtomicBool::new(false),
             vdbe_trace: AtomicBool::new(false),
@@ -2621,7 +2620,9 @@ impl Database {
             failure_injector: RwLock::new(None),
             #[cfg(any(test, injected_yields))]
             yield_instance_id_counter: AtomicU64::new(1),
-            view_transaction_states: AllViewsTxState::new(),
+            transaction_changes: TransactionChanges::with_io(self.io.clone()),
+            maintenance_program_cache:
+                crate::incremental::vdbe_maintenance::MaintenanceProgramCache::new(),
             metrics: RwLock::new(ConnectionMetrics::new()),
             nestedness: AtomicI32::new(0),
             compiling_triggers: RwLock::new(Vec::new()),
@@ -3504,9 +3505,49 @@ pub(crate) struct AttachedDatabase {
     pub(crate) sync_mode: SyncMode,
 }
 
+/// The namespaces of a connection: the names that qualify object names in
+/// SQL.
+///
+/// A namespace is what the qualifier of an object name selects, like `aux`
+/// in `aux.t`. Every namespace refers to a database, the storage that holds
+/// its objects. Core asks [`NamespaceCatalog`] whenever it turns a namespace
+/// name into a database or a database into a namespace name, and when it
+/// looks up a name without a namespace.
+///
+/// SQLite has one namespace per database: `main`, `temp` and one for each
+/// attached database.
+/// [`crate::dialect::sqlite::attach::AttachedNamespaces`] implements that.
+pub trait NamespaceCatalog: Send + Sync {
+    /// The database that namespace `name` refers to. `name` is normalized.
+    fn database_id(&self, name: &str) -> Option<usize>;
+
+    /// The name of the namespace that refers to database `database_id`.
+    fn name(&self, database_id: usize) -> Option<String>;
+
+    /// The namespaces other than `main` and `temp`, with the databases they
+    /// refer to, ordered by database.
+    fn others(&self) -> Vec<(usize, String)>;
+
+    /// Adds namespace `name`, which refers to database `database_id`.
+    fn add(&self, name: &str, database_id: usize);
+
+    /// Removes namespace `name` and returns the database it referred to.
+    fn remove(&self, name: &str) -> Option<usize>;
+
+    /// The first database that `contains` accepts, in the order that a name
+    /// without a namespace is looked up in. The temporary database comes
+    /// before all of them when it has objects.
+    fn find_in_search_order(&self, contains: &mut dyn FnMut(usize) -> bool) -> Option<usize>;
+
+    /// The database that CREATE puts an object in when its name has no
+    /// namespace.
+    fn database_for_create(&self) -> Result<usize>;
+}
+
+/// The databases of a connection other than main and temp, by database id.
+/// Their names are in the connection's [`NamespaceCatalog`].
 // Optimized for fast get() operations and supports unlimited attached databases.
 pub(crate) struct DatabaseCatalog {
-    pub(crate) name_to_index: HashMap<String, usize>,
     allocated: Vec<u64>,
     pub(crate) index_to_data: HashMap<usize, AttachedDatabase>,
 }
@@ -3515,7 +3556,6 @@ pub(crate) struct DatabaseCatalog {
 impl DatabaseCatalog {
     pub(crate) fn new() -> Self {
         Self {
-            name_to_index: HashMap::default(),
             index_to_data: HashMap::default(),
             allocated: vec![3], // 0 | 1, as those are reserved for main and temp
         }
@@ -3525,41 +3565,12 @@ impl DatabaseCatalog {
         self.index_to_data.get(&index).map(|entry| entry.db.clone())
     }
 
-    pub(crate) fn get_name_by_index(&self, index: usize) -> Option<String> {
-        self.name_to_index
-            .iter()
-            .find(|(_, &idx)| idx == index)
-            .map(|(name, _)| name.clone())
-    }
-
-    pub(crate) fn get_database_by_name(&self, s: &str) -> Option<(usize, Arc<Database>)> {
-        match self.name_to_index.get(s) {
-            None => None,
-            Some(idx) => self
-                .index_to_data
-                .get(idx)
-                .map(|entry| (*idx, entry.db.clone())),
-        }
-    }
-
     pub(crate) fn get_pager_by_index(&self, idx: &usize) -> Option<Arc<Pager>> {
         self.index_to_data.get(idx).map(|entry| entry.pager.clone())
     }
 
-    fn add(&mut self, s: &str) -> usize {
-        turso_assert!(
-            !self.name_to_index.contains_key(s),
-            "lib: database name already exists in catalog",
-            { "name": s }
-        );
-
-        let index = self.allocate_index();
-        self.name_to_index.insert(s.to_string(), index);
-        index
-    }
-
-    pub(crate) fn insert(&mut self, s: &str, db: Arc<Database>, pager: Arc<Pager>) -> usize {
-        let idx = self.add(s);
+    pub(crate) fn insert(&mut self, db: Arc<Database>, pager: Arc<Pager>) -> usize {
+        let idx = self.allocate_index();
         self.index_to_data.insert(
             idx,
             AttachedDatabase {
@@ -3571,16 +3582,11 @@ impl DatabaseCatalog {
         idx
     }
 
-    pub(crate) fn remove(&mut self, s: &str) -> Option<usize> {
-        if let Some(index) = self.name_to_index.remove(s) {
-            // Should be impossible to remove main or temp.
-            turso_assert_greater_than_or_equal!(index, 2);
-            self.deallocate_index(index);
-            self.index_to_data.remove(&index);
-            Some(index)
-        } else {
-            None
-        }
+    pub(crate) fn remove(&mut self, index: usize) {
+        // Should be impossible to remove main or temp.
+        turso_assert_greater_than_or_equal!(index, 2);
+        self.deallocate_index(index);
+        self.index_to_data.remove(&index);
     }
 
     #[inline(always)]

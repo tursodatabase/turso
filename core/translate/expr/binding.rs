@@ -359,7 +359,7 @@ pub fn bind_and_rewrite_expr<'a>(
                     //
                     // Same principle as Qualified: schema-level references always win.
                     let qualified_name = ast::QualifiedName {
-                        db_name: Some(db_name_clone),
+                        namespace: Some(db_name_clone),
                         name: tbl_name_clone,
                         alias: None,
                     };
