@@ -581,6 +581,7 @@ test handle-times-trigger-sets-the-times-of-insert-and-update {
         FOR EACH ROW
     EXECUTE PROCEDURE handle_times();
     INSERT INTO todos (text, created_at, updated_at) VALUES ('a', '2000-01-01 00:00:00', '2000-01-01 00:00:00');
+    SELECT CASE WHEN created_at = updated_at THEN 'same time' ELSE 'different times' END FROM todos;
     UPDATE todos SET created_at = '2001-01-01 00:00:00', updated_at = '2001-01-01 00:00:00';
     SELECT text,
         CASE WHEN created_at > '2020-01-01' THEN 'insert time' ELSE 'old' END,
@@ -588,6 +589,7 @@ test handle-times-trigger-sets-the-times-of-insert-and-update {
     FROM todos;
 }
 expect {
+    same time
     a|insert time|update time
 }
 

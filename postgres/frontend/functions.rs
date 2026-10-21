@@ -1,5 +1,5 @@
-use chrono::Utc;
-use std::{fmt, sync::Arc};
+use chrono::{DateTime, Utc};
+use std::{fmt, sync::Arc, time::SystemTime};
 use turso_core::native_ext::{FunctionArity, ScalarCall, ScalarFunction};
 use turso_core::types::IOResultOr;
 use turso_core::{
@@ -146,15 +146,22 @@ impl ScalarCall for PgScalarFunction {
                 }
                 Value::from_i64(0)
             }
-            Self::Now
-            | Self::ClockTimestamp
-            | Self::TransactionTimestamp
-            | Self::StatementTimestamp => {
-                Value::build_text(Utc::now().format("%Y-%m-%d %H:%M:%S%.3f").to_string())
+            Self::Now | Self::TransactionTimestamp => {
+                timestamp_text(connection.transaction_start_time())
             }
+            Self::StatementTimestamp => timestamp_text(connection.statement_start_time()),
+            Self::ClockTimestamp => timestamp_text(SystemTime::now()),
         };
         Ok(IOResult::Done(value))
     }
+}
+
+fn timestamp_text(time: SystemTime) -> Value {
+    Value::build_text(
+        DateTime::<Utc>::from(time)
+            .format("%Y-%m-%d %H:%M:%S%.3f")
+            .to_string(),
+    )
 }
 
 fn exec_acl_default(args: &[Register]) -> Result<Value> {
