@@ -29,6 +29,9 @@ struct ScopeTable {
     name: String,
     /// `None` when the columns are not known, as for a table function.
     columns: Option<Vec<String>>,
+    /// The columns that a `USING` or `NATURAL` join merged with a column of
+    /// an earlier table. `*` gives a merged column one time.
+    merged: Vec<String>,
 }
 
 /// The tables that a part of a query can read columns from.
@@ -79,6 +82,7 @@ impl<'a> NameResolver<'a> {
                         ScopeTable {
                             name: "excluded".to_string(),
                             columns: target.columns.clone(),
+                            merged: Vec::new(),
                         },
                     ];
                     let scope = Scope {
@@ -147,6 +151,12 @@ impl<'a> NameResolver<'a> {
             }
             _ => Ok(()),
         }
+    }
+
+    /// Resolve a query, and give the number of its columns. `None` when
+    /// the number is not known, as for `*` on a table function.
+    pub(crate) fn query(&mut self, select: &mut ast::Select) -> Result<Option<usize>> {
+        Ok(self.select(select, None)?.map(|names| names.len()))
     }
 
     /// Resolve a query, and give the names of its columns. `None` when the
@@ -248,7 +258,12 @@ impl<'a> NameResolver<'a> {
     ) -> Result<()> {
         self.select_table(&mut from.select, parent, tables)?;
         for join in &mut from.joins {
+            let earlier = tables.len();
             self.select_table(&mut join.table, parent, tables)?;
+            let merged = merged_columns(join, &tables[..earlier], &tables[earlier..]);
+            for table in &mut tables[earlier..] {
+                table.merged.clone_from(&merged);
+            }
             if let Some(ast::JoinConstraint::On(expr)) = &mut join.constraint {
                 self.expr(expr, Scope::new(tables, parent))?;
             }
@@ -271,6 +286,7 @@ impl<'a> NameResolver<'a> {
                         .as_str()
                         .to_string(),
                     columns: self.table_columns(name),
+                    merged: Vec::new(),
                 });
             }
             ast::SelectTable::TableCall(name, args, alias) => {
@@ -284,6 +300,7 @@ impl<'a> NameResolver<'a> {
                         .as_str()
                         .to_string(),
                     columns: None,
+                    merged: Vec::new(),
                 });
             }
             ast::SelectTable::Select {
@@ -303,6 +320,7 @@ impl<'a> NameResolver<'a> {
                         .map_or("", |alias| alias.name().as_str())
                         .to_string(),
                     columns,
+                    merged: Vec::new(),
                 });
             }
             ast::SelectTable::Sub(from, _) => self.from(from, parent, tables)?,
@@ -336,6 +354,7 @@ impl<'a> NameResolver<'a> {
                 self.ctes.push(ScopeTable {
                     name: cte.tbl_name.as_str().to_string(),
                     columns,
+                    merged: Vec::new(),
                 });
             }
             let names = self.select(&mut cte.select, parent)?;
@@ -345,6 +364,7 @@ impl<'a> NameResolver<'a> {
             self.ctes.push(ScopeTable {
                 name: cte.tbl_name.as_str().to_string(),
                 columns: listed.or(names),
+                merged: Vec::new(),
             });
         }
         Ok(start)
@@ -359,6 +379,7 @@ impl<'a> NameResolver<'a> {
                 .as_str()
                 .to_string(),
             columns: self.table_columns(name),
+            merged: Vec::new(),
         }
     }
 
@@ -507,6 +528,37 @@ impl<'s> Scope<'s> {
     }
 }
 
+/// The columns that `join` merges: its `USING` columns, or for a `NATURAL`
+/// join, the columns of the joined tables that an earlier table also has.
+fn merged_columns(
+    join: &ast::JoinedSelectTable,
+    earlier: &[ScopeTable],
+    joined: &[ScopeTable],
+) -> Vec<String> {
+    if let Some(ast::JoinConstraint::Using(names)) = &join.constraint {
+        return names.iter().map(|name| name.as_str().to_string()).collect();
+    }
+    let natural = matches!(
+        join.operator,
+        ast::JoinOperator::TypedJoin(Some(join_type)) if join_type.contains(ast::JoinType::NATURAL)
+    );
+    if !natural {
+        return Vec::new();
+    }
+    let earlier_columns: Vec<&String> = earlier
+        .iter()
+        .filter_map(|table| table.columns.as_ref())
+        .flatten()
+        .collect();
+    joined
+        .iter()
+        .filter_map(|table| table.columns.as_ref())
+        .flatten()
+        .filter(|column| earlier_columns.contains(column))
+        .cloned()
+        .collect()
+}
+
 /// Whether `expr` in ORDER BY or GROUP BY is a name of an output column of
 /// the query, which the clause reads before the input columns.
 fn is_output_column(expr: &ast::Expr, names: Option<&[String]>) -> bool {
@@ -527,7 +579,13 @@ fn output_names(columns: &[ast::ResultColumn], tables: &[ScopeTable]) -> Option<
             }),
             ast::ResultColumn::Star => {
                 for table in tables {
-                    names.extend(table.columns.clone()?);
+                    let columns = table.columns.as_ref()?;
+                    names.extend(
+                        columns
+                            .iter()
+                            .filter(|column| !table.merged.contains(column))
+                            .cloned(),
+                    );
                 }
             }
             ast::ResultColumn::TableStar(name) => {

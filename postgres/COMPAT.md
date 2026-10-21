@@ -465,7 +465,7 @@ Upgrade is not supported.
 | Per function statistics | ❌ Not supported | |
 | RETURN QUERY EXECUTE | ❌ Not supported | |
 | RETURNS TABLE | ❌ Not supported | |
-| Row level triggers | 🟡 Partial | `BEFORE` and `AFTER` triggers whose PL/pgSQL function has SQL statements, `PERFORM`, variables, assignments to variables and to fields of `NEW`, `IF`, `CASE`, `RAISE` and `RETURN`. A `BEFORE` trigger writes the row that it returns, or skips the row when it returns `NULL`. It cannot change an `INTEGER PRIMARY KEY` column. An assigned value is converted as in `INSERT`, so `NEW.n := 3.7` for an `int` column gives an error, where PostgreSQL stores 4. `SECURITY DEFINER` and `SET` options of the function are accepted and ignored |
+| Row level triggers | 🟡 Partial | `BEFORE` and `AFTER` triggers whose PL/pgSQL function has SQL statements, `PERFORM`, `SELECT INTO`, variables, `FOUND`, assignments to variables and to fields of `NEW`, `IF`, `CASE`, `RAISE` and `RETURN`. A `BEFORE` trigger writes the row that it returns, or skips the row when it returns `NULL`. It cannot change an `INTEGER PRIMARY KEY` column. An assigned value is converted as in `INSERT`, so `NEW.n := 3.7` for an `int` column gives an error, where PostgreSQL stores 4. `SECURITY DEFINER` and `SET` options of the function are accepted and ignored |
 | Statement level triggers | ❌ Not supported | CREATE TRIGGER ... FOR EACH STATEMENT gives an error |
 | Statement level TRUNCATE triggers | ❌ Not supported | |
 | Triggers on views | ❌ Not supported | |
@@ -476,7 +476,7 @@ Upgrade is not supported.
 
 | Feature | Status | Notes |
 |---------|--------|-------|
-| Procedural languages (PL/pgSQL, PL/Python, ...) | 🟡 Partial | PL/pgSQL functions run only as trigger functions, compiled to SQL statements for each trigger and event; loops, cursors, `EXCEPTION`, `EXECUTE` and `RETURN QUERY` give an error when the trigger fires. A value that a variable gets is converted with the casts of tursopg, so `v int := 3.7` stores 3 and `'abc'` stores 0, where PostgreSQL stores 4 and gives an error. A name that is both a variable and a column gives the error `column reference is ambiguous` when the statement runs, as in PostgreSQL. Record variables, `%TYPE`, `%ROWTYPE` and `FOUND` are not supported yet. `RAISE EXCEPTION` gives its message without SQLSTATE, `DETAIL` or `HINT`, and `RAISE NOTICE` and the other levels send no message. Other languages and DO are rejected with an error |
+| Procedural languages (PL/pgSQL, PL/Python, ...) | 🟡 Partial | PL/pgSQL functions run only as trigger functions, compiled to SQL statements for each trigger and event; loops, cursors, `EXCEPTION`, `EXECUTE` and `RETURN QUERY` give an error when the trigger fires. A value that a variable gets is converted with the casts of tursopg, so `v int := 3.7` stores 3 and `'abc'` stores 0, where PostgreSQL stores 4 and gives an error. A name that is both a variable and a column gives the error `column reference is ambiguous` when the statement runs, as in PostgreSQL. `SELECT INTO STRICT`, `RETURNING INTO`, record variables, `%TYPE` and `%ROWTYPE` are not supported yet. `RAISE EXCEPTION` gives its message without SQLSTATE, `DETAIL` or `HINT`, and `RAISE NOTICE` and the other levels send no message. Other languages and DO are rejected with an error |
 | CASE in pl/pgsql | 🟡 Partial | In trigger functions |
 | CONTINUE statement for PL/pgSQL | ❌ Not supported | |
 | CREATE TRANSFORM | ❌ Not supported | |

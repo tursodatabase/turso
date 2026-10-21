@@ -52,6 +52,11 @@ pub(crate) fn compile_trigger(
     let action = plpgsql_function.get("action").ok_or_else(malformed)?;
     let datums = Datums::new(plpgsql_function);
     let block_variables = block_variables(action, &datums)?;
+    let found = datums.found();
+    let uses_found = found.is_some()
+        && user_function
+            .body_text()
+            .is_some_and(|body| mentions_found(&body));
     let args = statement
         .args
         .iter()
@@ -90,7 +95,11 @@ pub(crate) fn compile_trigger(
         tables,
         datums,
         block_variables,
-        scopes: Vec::new(),
+        scopes: vec![BlockScope {
+            label: Some(function.name.clone()),
+            variables: found.into_iter().collect(),
+        }],
+        uses_found,
         variable_count: 0,
         statements: Vec::new(),
         new_values: Vec::new(),
@@ -99,6 +108,12 @@ pub(crate) fn compile_trigger(
         conditional_returns: Vec::new(),
         changed_columns: Vec::new(),
     };
+    if let Some(found) = compiler.found_key() {
+        compiler.statements.push(select_statement(set_variable(
+            &found,
+            ast::Expr::Literal(ast::Literal::False),
+        )));
+    }
     let flow = compiler.compile_statement(action)?;
     compiler.finish(flow)?;
     Ok(Some(TriggerBody {
@@ -150,8 +165,11 @@ struct Compiler<'a> {
     /// The variables that each block declares, by the address of the block.
     block_variables: HashMap<usize, Vec<usize>>,
     /// The blocks that enclose the statement that compiles now, the
-    /// innermost last.
+    /// innermost last. The first scope has FOUND.
     scopes: Vec<BlockScope>,
+    /// Whether the function reads FOUND, so that the statements that change
+    /// FOUND must set it.
+    uses_found: bool,
     variable_count: usize,
     statements: Vec<ast::Stmt>,
     /// The fields of NEW that the function assigned, in the order of the
@@ -229,7 +247,7 @@ enum NoBranch<'j> {
     CaseNotFound,
 }
 
-impl Compiler<'_> {
+impl<'a> Compiler<'a> {
     fn compile_statement(&mut self, statement: &Json) -> Result<Flow> {
         let (kind, body) = statement
             .as_object()
@@ -338,21 +356,151 @@ impl Compiler<'_> {
     }
 
     fn compile_sql_statement(&mut self, body: &Json) -> Result<Flow> {
-        if body.get("into").and_then(Json::as_bool) == Some(true) {
-            return Err(LimboError::ParseError("INTO is not supported yet".into()));
-        }
         let query = expression_query(body.get("sqlstmt"))?;
-        let mut stmt = self.translate_statement(query)?;
-        if matches!(stmt, ast::Stmt::Select(_)) {
+        let stmt = self.translate_statement(query)?;
+        let into = body.get("into").and_then(Json::as_bool) == Some(true);
+        if into && body.get("strict").and_then(Json::as_bool) == Some(true) {
             return Err(LimboError::ParseError(
-                "query has no destination for result data".into(),
+                "INTO STRICT is not supported yet".into(),
             ));
         }
+        match (stmt, into) {
+            (ast::Stmt::Select(_), false) => Err(LimboError::ParseError(
+                "query has no destination for result data".into(),
+            )),
+            (ast::Stmt::Select(select), true) => {
+                let targets = self.targets_of_into(body.get("target"))?;
+                self.compile_select_into(select, targets)
+            }
+            (_, true) => Err(LimboError::ParseError(
+                "RETURNING INTO is not supported yet".into(),
+            )),
+            (stmt, false) => self.compile_write(stmt),
+        }
+    }
+
+    /// Compile INSERT, UPDATE or DELETE.
+    fn compile_write(&mut self, mut stmt: ast::Stmt) -> Result<Flow> {
         if let Some(name) = self.resolve_statement(&mut stmt)? {
             return Ok(self.raise_ambiguous(&name));
         }
         let stmt = with_condition(stmt, self.statement_condition())?;
         self.statements.push(stmt);
+        self.set_found_from_changes();
+        Ok(Flow::Continues)
+    }
+
+    /// The variables and fields of NEW that INTO assigns, in order.
+    fn targets_of_into(&self, target: Option<&Json>) -> Result<Vec<Target<'a>>> {
+        let malformed = || LimboError::Corrupt("malformed PL/pgSQL INTO target".into());
+        let target = target.ok_or_else(malformed)?;
+        if let Some(row) = target.get("PLpgSQL_row") {
+            return json_array(row, "fields")
+                .map(|field| {
+                    let varno = field
+                        .get("varno")
+                        .and_then(Json::as_u64)
+                        .ok_or_else(malformed)?;
+                    Ok(self.datums.assignment_target(varno))
+                })
+                .collect();
+        }
+        let record = target.get("PLpgSQL_rec").ok_or_else(malformed)?;
+        if record.get("dno").and_then(Json::as_u64) != self.datums.new_varno {
+            let name = record.get("refname").and_then(Json::as_str).unwrap_or("");
+            return Err(LimboError::ParseError(format!(
+                "INTO the record variable \"{name}\" is not supported yet"
+            )));
+        }
+        Ok(self
+            .table
+            .columns()
+            .iter()
+            .filter(|column| !column.hidden())
+            .filter_map(|column| column.name.as_deref())
+            .map(Target::NewField)
+            .collect())
+    }
+
+    /// Compile `SELECT ... INTO targets` as one statement that assigns all
+    /// targets from the first row of the query, or NULL to each target when
+    /// the query gives no row:
+    ///
+    /// ```sql
+    /// WITH __into(__c1, ..., __found) AS
+    ///     (SELECT *, 1 FROM (<query>) WHERE <condition> LIMIT 1)
+    /// SELECT __pl_set('<target>', __into.__c1), ..., __pl_set('<found>', __into.__found IS NOT NULL)
+    /// FROM (SELECT 1) LEFT JOIN __into ON 1 WHERE <condition>
+    /// ```
+    fn compile_select_into(
+        &mut self,
+        mut select: ast::Select,
+        targets: Vec<Target>,
+    ) -> Result<Flow> {
+        let (ambiguous, count) = self.resolve_query(&mut select)?;
+        if let Some(name) = ambiguous {
+            return Ok(self.raise_ambiguous(&name));
+        }
+        let count = count.ok_or_else(|| {
+            LimboError::ParseError(
+                "SELECT INTO from a query whose columns are not known is not supported yet".into(),
+            )
+        })?;
+        let condition = self.statement_condition();
+        let mut assignments = Vec::new();
+        let mut not_null = Vec::new();
+        for (position, target) in targets.into_iter().enumerate() {
+            let value = if position < count {
+                record_field(INTO_TABLE, &format!("__c{}", position + 1))
+            } else {
+                null()
+            };
+            match target {
+                Target::Variable(dno) => {
+                    let declaration = self.datums.declaration(dno)?;
+                    let key = self.variable_key(dno);
+                    assignments.push(set_variable(&key, cast(value, declaration.cast)));
+                    if declaration.not_null {
+                        not_null.push((key, declaration.name));
+                    }
+                }
+                Target::NewField(field) => {
+                    if self.new_field_exists(field, condition.clone()) {
+                        let key = self.new_field_variable(field)?;
+                        assignments.push(set_variable(&key, value));
+                    }
+                }
+                Target::OldField => {
+                    return Err(LimboError::ParseError(
+                        "assignment to OLD is not supported".into(),
+                    ))
+                }
+                Target::Other => {
+                    return Err(LimboError::ParseError(
+                        "INTO this variable is not supported yet".into(),
+                    ))
+                }
+            }
+        }
+        if let Some(found) = self.found_key() {
+            let found_row = record_field(INTO_TABLE, "__found");
+            assignments.push(set_variable(
+                &found,
+                ast::Expr::NotNull(Box::new(found_row)),
+            ));
+        }
+        if assignments.is_empty() {
+            assignments.push(ast::Expr::Literal(ast::Literal::Numeric("1".into())));
+        }
+        self.statements.push(select_into_statement(
+            select,
+            count,
+            assignments,
+            condition.clone(),
+        ));
+        for (key, name) in not_null {
+            self.check_not_null(&key, name, condition.clone());
+        }
         Ok(Flow::Continues)
     }
 
@@ -362,9 +510,19 @@ impl Compiler<'_> {
         if let Some(name) = self.resolve_statement(&mut stmt)? {
             return Ok(self.raise_ambiguous(&name));
         }
-        let ast::Stmt::Select(select) = stmt else {
+        let ast::Stmt::Select(mut select) = stmt else {
             return Err(LimboError::Corrupt("PERFORM without a query".into()));
         };
+        if let Some(found) = self.found_key() {
+            self.statements.push(select_where(
+                set_variable(&found, ast::Expr::Literal(ast::Literal::False)),
+                self.statement_condition(),
+            ));
+            add_result_column(
+                &mut select,
+                set_variable(&found, ast::Expr::Literal(ast::Literal::True)),
+            );
+        }
         let select = select_with_condition(select, self.statement_condition())?;
         self.statements.push(ast::Stmt::Select(select));
         Ok(Flow::Continues)
@@ -422,28 +580,13 @@ impl Compiler<'_> {
 
     fn assign_new_field(&mut self, field: &str, value: ast::Expr) -> Result<()> {
         let condition = self.statement_condition();
-        match self.table.get_column(field) {
-            None => {
-                self.statements.push(select_where(
-                    raise_abort_expr(text_literal(&format!(
-                        "record \"new\" has no field \"{field}\""
-                    ))),
-                    condition,
-                ));
-                return Ok(());
-            }
-            Some((_, column)) if column.is_generated() => return Ok(()),
-            Some(_) => {}
+        if !self.new_field_exists(field, condition.clone()) {
+            return Ok(());
         }
-        let position = self
-            .new_values
-            .iter()
-            .position(|(name, _)| name.eq_ignore_ascii_case(field));
-        let current_variable = position.and_then(|position| match &self.new_values[position].1 {
-            NewValue::Variable(key) => Some(key.clone()),
-            NewValue::Expression(_) => None,
-        });
-        if condition.is_none() && current_variable.is_none() && can_be_calculated_again(&value) {
+        let position = self.new_value_position(field);
+        let has_variable = position
+            .is_some_and(|position| matches!(self.new_values[position].1, NewValue::Variable(_)));
+        if condition.is_none() && !has_variable && can_be_calculated_again(&value) {
             match position {
                 Some(position) => self.new_values[position].1 = NewValue::Expression(value),
                 None => self
@@ -452,32 +595,62 @@ impl Compiler<'_> {
             }
             return Ok(());
         }
-        let key = match current_variable {
-            Some(key) => key,
-            None => {
-                let key = self.new_variable(&format!("new.{field}"));
-                let current = match position {
-                    Some(position) => self.read_new_value(position),
-                    None => {
-                        let mut current = record_field("new", field);
-                        self.replace_trigger_value(&mut current)?;
-                        current
-                    }
-                };
-                self.statements
-                    .push(select_statement(set_variable(&key, current)));
-                match position {
-                    Some(position) => self.new_values[position].1 = NewValue::Variable(key.clone()),
-                    None => self
-                        .new_values
-                        .push((field.to_string(), NewValue::Variable(key.clone()))),
-                }
-                key
-            }
-        };
+        let key = self.new_field_variable(field)?;
         self.statements
             .push(select_where(set_variable(&key, value), condition));
         Ok(())
+    }
+
+    /// Whether an assignment to `NEW.<field>` changes the row. A field that
+    /// is not a column gives the error of PostgreSQL when the assignment
+    /// runs, and a generated column ignores the assignment.
+    fn new_field_exists(&mut self, field: &str, condition: Option<ast::Expr>) -> bool {
+        match self.table.get_column(field) {
+            None => {
+                self.statements.push(select_where(
+                    raise_abort_expr(text_literal(&format!(
+                        "record \"new\" has no field \"{field}\""
+                    ))),
+                    condition,
+                ));
+                false
+            }
+            Some((_, column)) => !column.is_generated(),
+        }
+    }
+
+    /// The variable that has the value of `NEW.<field>` from here on. A new
+    /// variable starts with the current value of the field.
+    fn new_field_variable(&mut self, field: &str) -> Result<String> {
+        let position = self.new_value_position(field);
+        if let Some(NewValue::Variable(key)) = position.map(|position| &self.new_values[position].1)
+        {
+            return Ok(key.clone());
+        }
+        let key = self.new_variable(&format!("new.{field}"));
+        let current = match position {
+            Some(position) => self.read_new_value(position),
+            None => {
+                let mut current = record_field("new", field);
+                self.replace_trigger_value(&mut current)?;
+                current
+            }
+        };
+        self.statements
+            .push(select_statement(set_variable(&key, current)));
+        match position {
+            Some(position) => self.new_values[position].1 = NewValue::Variable(key.clone()),
+            None => self
+                .new_values
+                .push((field.to_string(), NewValue::Variable(key.clone()))),
+        }
+        Ok(key)
+    }
+
+    fn new_value_position(&self, field: &str) -> Option<usize> {
+        self.new_values
+            .iter()
+            .position(|(name, _)| name.eq_ignore_ascii_case(field))
     }
 
     fn compile_if(&mut self, body: &Json) -> Result<Flow> {
@@ -1018,6 +1191,37 @@ impl Compiler<'_> {
         Ok(resolver.ambiguous)
     }
 
+    /// Replace the names of variables in a query, and give the first name
+    /// that is both a column and a variable, and the number of columns.
+    fn resolve_query(&self, select: &mut ast::Select) -> Result<(Option<String>, Option<usize>)> {
+        let mut resolver = NameResolver::new(self, self.tables);
+        let count = resolver.query(select)?;
+        Ok((resolver.ambiguous, count))
+    }
+
+    /// Set FOUND after a statement that changes rows: FOUND is true when the
+    /// statement changed a row.
+    fn set_found_from_changes(&mut self) {
+        let Some(found) = self.found_key() else {
+            return;
+        };
+        let changed = ast::Expr::Binary(
+            Box::new(function_call("changes", vec![])),
+            ast::Operator::Greater,
+            Box::new(ast::Expr::Literal(ast::Literal::Numeric("0".into()))),
+        );
+        self.statements.push(select_where(
+            set_variable(&found, changed),
+            self.statement_condition(),
+        ));
+    }
+
+    /// The key of FOUND, or `None` when the function does not read FOUND.
+    fn found_key(&self) -> Option<String> {
+        let found = self.datums.found().filter(|_| self.uses_found)?;
+        Some(self.variable_key(found))
+    }
+
     /// Add the statement that gives the error of PostgreSQL for a name that
     /// is both a column and a variable. As in PostgreSQL, the error comes
     /// only when the statement runs.
@@ -1082,11 +1286,8 @@ impl Variables for Compiler<'_> {
                 return Ok(Some(get_variable(&self.variable_key(dno))));
             }
         }
-        if qualifier.is_some() {
+        if qualifier.is_some_and(|label| label != self.function_name) {
             return Ok(None);
-        }
-        if name == "found" {
-            return Err(LimboError::ParseError("FOUND is not supported yet".into()));
         }
         self.trigger_constant(name)
     }
@@ -1237,6 +1438,16 @@ impl<'a> Datums<'a> {
         }
     }
 
+    /// The datum of FOUND, which the function declares and no block does.
+    fn found(&self) -> Option<usize> {
+        self.datums.iter().position(|datum| {
+            datum.get("PLpgSQL_var").is_some_and(|variable| {
+                variable.get("refname").and_then(Json::as_str) == Some("found")
+                    && variable.get("lineno").is_none()
+            })
+        })
+    }
+
     /// The name of a variable or a record that a block declares.
     fn name(&self, dno: usize) -> Option<&'a str> {
         let datum = self.datums.get(dno)?;
@@ -1262,9 +1473,6 @@ impl<'a> Datums<'a> {
             .get("refname")
             .and_then(Json::as_str)
             .ok_or_else(|| LimboError::Corrupt("malformed PL/pgSQL variable".into()))?;
-        if name == "found" && variable.get("lineno").is_none() {
-            return Err(LimboError::ParseError("FOUND is not supported yet".into()));
-        }
         if variable.get("cursor_explicit_expr").is_some() {
             return Err(LimboError::ParseError("cursors are not supported".into()));
         }
@@ -1659,6 +1867,13 @@ fn from_subquery(select: ast::Select, alias: &str) -> ast::FromClause {
     }
 }
 
+/// Whether the body of a function names FOUND. A word in a comment or a
+/// string also counts, which only adds statements that set FOUND.
+fn mentions_found(body: &str) -> bool {
+    body.split(|c: char| !(c.is_alphanumeric() || c == '_'))
+        .any(|word| word.eq_ignore_ascii_case("found"))
+}
+
 /// Functions that give the same value each time in one statement.
 const FUNCTIONS_WITH_ONE_VALUE: &[&str] = &[
     "now",
@@ -1891,6 +2106,116 @@ fn inserted_rows_with_condition(select: ast::Select, condition: ast::Expr) -> as
         }),
         Some(condition),
     )
+}
+
+/// The name of the CTE that has the row of `SELECT INTO`.
+const INTO_TABLE: &str = "__into";
+
+fn select_into_statement(
+    query: ast::Select,
+    count: usize,
+    assignments: Vec<ast::Expr>,
+    condition: Option<ast::Expr>,
+) -> ast::Stmt {
+    let mut first_row = one_select(
+        vec![
+            ast::ResultColumn::Star,
+            ast::ResultColumn::Expr(
+                Box::new(ast::Expr::Literal(ast::Literal::Numeric("1".into()))),
+                None,
+            ),
+        ],
+        Some(ast::FromClause {
+            select: Box::new(ast::SelectTable::Select {
+                select: query,
+                alias: Some(ast::As::As(ast::Name::exact("__query".to_string()))),
+                lateral: false,
+            }),
+            joins: vec![],
+        }),
+        condition.clone(),
+    );
+    first_row.limit = Some(ast::Limit {
+        expr: Box::new(ast::Expr::Literal(ast::Literal::Numeric("1".into()))),
+        offset: None,
+    });
+    let columns = (1..=count)
+        .map(|position| format!("__c{position}"))
+        .chain(std::iter::once("__found".to_string()))
+        .map(|name| ast::IndexedColumn {
+            col_name: ast::Name::exact(name),
+            collation_name: None,
+            order: None,
+        })
+        .collect();
+    let one_row = one_select(
+        vec![ast::ResultColumn::Expr(
+            Box::new(ast::Expr::Literal(ast::Literal::Numeric("1".into()))),
+            None,
+        )],
+        None,
+        None,
+    );
+    let mut select = one_select(
+        assignments
+            .into_iter()
+            .map(|assignment| ast::ResultColumn::Expr(Box::new(assignment), None))
+            .collect(),
+        Some(ast::FromClause {
+            select: Box::new(ast::SelectTable::Select {
+                select: one_row,
+                alias: Some(ast::As::As(ast::Name::exact("__one".to_string()))),
+                lateral: false,
+            }),
+            joins: vec![ast::JoinedSelectTable {
+                operator: ast::JoinOperator::TypedJoin(Some(
+                    ast::JoinType::LEFT | ast::JoinType::OUTER,
+                )),
+                table: Box::new(ast::SelectTable::Table(
+                    ast::QualifiedName::single(ast::Name::exact(INTO_TABLE.to_string())),
+                    None,
+                    None,
+                )),
+                constraint: Some(ast::JoinConstraint::On(Box::new(ast::Expr::Literal(
+                    ast::Literal::Numeric("1".into()),
+                )))),
+            }],
+        }),
+        condition,
+    );
+    select.with = Some(ast::With {
+        recursive: false,
+        ctes: vec![ast::CommonTableExpr {
+            tbl_name: ast::Name::exact(INTO_TABLE.to_string()),
+            columns,
+            materialized: ast::Materialized::Any,
+            select: first_row,
+        }],
+    });
+    ast::Stmt::Select(select)
+}
+
+/// Add a column to each query of a compound query.
+fn add_result_column(select: &mut ast::Select, column: ast::Expr) {
+    let queries = std::iter::once(&mut select.body.select).chain(
+        select
+            .body
+            .compounds
+            .iter_mut()
+            .map(|compound| &mut compound.select),
+    );
+    for query in queries {
+        match query {
+            ast::OneSelect::Select { columns, .. } => {
+                columns.push(ast::ResultColumn::Expr(Box::new(column.clone()), None))
+            }
+            ast::OneSelect::Values(rows) => {
+                for row in rows {
+                    row.push(Box::new(column.clone()));
+                }
+            }
+        }
+    }
 }
 
 /// A query of PERFORM that runs only when `condition` is true.
