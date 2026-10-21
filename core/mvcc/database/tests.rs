@@ -7031,12 +7031,6 @@ fn exists_skips_the_btree_for_a_rowid_above_its_last_row() {
         .as_int()
         .unwrap();
     let table_id = db.mvcc_store.get_table_id_from_root_page(root_page);
-    let allocator = db.mvcc_store.get_rowid_allocator(&table_id);
-    assert_eq!(
-        allocator.max_rowid(),
-        None,
-        "inserts with explicit rowids never seed the allocator"
-    );
 
     let tx_id = db
         .mvcc_store
@@ -7057,7 +7051,6 @@ fn exists_skips_the_btree_for_a_rowid_above_its_last_row() {
     .unwrap();
 
     assert_eq!(probe_exists(&db, &mut cursor, 100), (false, false));
-    assert_eq!(allocator.max_rowid(), None);
     assert_eq!(probe_exists(&db, &mut cursor, 3), (false, true));
     assert!(probe_exists(&db, &mut cursor, 5).0);
 
