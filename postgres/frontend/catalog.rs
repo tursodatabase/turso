@@ -172,6 +172,14 @@ impl Dialect for PostgresDialect {
         crate::plpgsql::compile_trigger(trigger, table, functions)
     }
 
+    /// PostgreSQL fires the triggers of one event in the order of their names.
+    fn order_triggers(&self, triggers: &mut [Arc<turso_core::schema::Trigger>]) {
+        triggers.sort_by(|left, right| {
+            crate::trigger::postgres_trigger_name(left)
+                .cmp(crate::trigger::postgres_trigger_name(right))
+        });
+    }
+
     fn compile_function_call(
         &self,
         function: &FunctionDef,

@@ -567,6 +567,14 @@ fn core_trigger_name(trigger_name: &str, table: &str, event: &ast::TriggerEvent)
     format!("{trigger_name} ON {table} {event}")
 }
 
+/// The PostgreSQL name in the name that [`core_trigger_name`] made.
+pub(crate) fn postgres_trigger_name(trigger: &Trigger) -> &str {
+    trigger
+        .name
+        .rsplit_once(" ON ")
+        .map_or(trigger.name.as_str(), |(name, _)| name)
+}
+
 fn definition_call(definition: &str) -> ast::Select {
     ast::Select {
         with: None,
