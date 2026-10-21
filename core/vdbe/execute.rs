@@ -6017,6 +6017,7 @@ pub fn op_program(
                             0,
                             crate::statement::StatementOrigin::Subprogram,
                             false,
+                            crate::connection::PrepareOptions::default(),
                         ))
                     };
 
@@ -16252,6 +16253,7 @@ pub fn op_populate_materialized_views(
                 0,
                 crate::statement::StatementOrigin::Subprogram,
                 false,
+                crate::connection::PrepareOptions::default(),
             )));
         }
 
