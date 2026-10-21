@@ -7031,6 +7031,7 @@ fn exists_skips_the_btree_for_a_rowid_above_its_last_row() {
         .as_int()
         .unwrap();
     let table_id = db.mvcc_store.get_table_id_from_root_page(root_page);
+    let allocator = db.mvcc_store.get_rowid_allocator(&table_id);
 
     let tx_id = db
         .mvcc_store
@@ -7051,6 +7052,11 @@ fn exists_skips_the_btree_for_a_rowid_above_its_last_row() {
     .unwrap();
 
     assert_eq!(probe_exists(&db.conn, &mut cursor, 100), (false, false));
+    let wal_pos = WalPos::from_pair(db.conn.pager.load().wal_pos());
+    assert_eq!(
+        allocator.btree_last(wal_pos).map(|last| last.rowid),
+        Some(Some(5))
+    );
     assert_eq!(probe_exists(&db.conn, &mut cursor, 3), (false, true));
     assert!(probe_exists(&db.conn, &mut cursor, 5).0);
 
@@ -7061,6 +7067,12 @@ fn exists_skips_the_btree_for_a_rowid_above_its_last_row() {
     db.mvcc_store.insert(tx_id, row).unwrap();
     assert_eq!(probe_exists(&db.conn, &mut cursor, 100), (true, false));
     assert_eq!(probe_exists(&db.conn, &mut cursor, 101), (false, false));
+
+    allocator.record_btree_last(BtreeLast {
+        read_mark: wal_pos,
+        rowid: Some(2),
+    });
+    assert_eq!(probe_exists(&db.conn, &mut cursor, 3), (false, false));
 
     db.mvcc_store
         .rollback_tx(tx_id, db.conn.pager.load().clone(), db.conn.as_ref(), 0);
@@ -7155,55 +7167,84 @@ fn record_btree_last_keeps_the_newest_wal_position() {
 }
 
 #[test]
-fn notexists_does_not_raise_the_next_automatic_rowid_past_a_deleted_tail() {
-    let mut db = MvccTestDbNoConn::new_with_random_db();
-    {
-        let conn = db.connect();
-        conn.execute("CREATE TABLE t(x INTEGER PRIMARY KEY, v TEXT)")
-            .unwrap();
-        conn.execute("INSERT INTO t VALUES (1, 'a'), (2, 'b'), (100, 'c')")
-            .unwrap();
-        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
-        conn.close().unwrap();
-    }
-    db.restart();
-    let conn = db.connect();
-    conn.execute("DELETE FROM t WHERE x = 100").unwrap();
+fn insert_rejects_a_duplicate_rowid_below_a_deleted_btree_last_row() {
+    let db = MvccTestDb::new();
+    db.conn
+        .execute("CREATE TABLE t(x INTEGER PRIMARY KEY, v TEXT)")
+        .unwrap();
+    db.conn
+        .execute("INSERT INTO t VALUES (1, 'a'), (2, 'b'), (100, 'c')")
+        .unwrap();
+    db.conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+    db.conn.execute("DELETE FROM t WHERE x = 100").unwrap();
 
-    let dup = conn.execute("INSERT INTO t VALUES (2, 'dup')");
+    let dup = db.conn.execute("INSERT INTO t VALUES (2, 'dup')");
     assert!(dup.is_err(), "rowid 2 must still be taken");
-
-    conn.execute("INSERT INTO t(v) VALUES ('auto')").unwrap();
-    let rows = get_rows(&conn, "SELECT x, v FROM t ORDER BY x");
-    assert_eq!(
-        rows,
-        vec![
-            vec![Value::from_i64(1), Value::from_text("a")],
-            vec![Value::from_i64(2), Value::from_text("b")],
-            vec![Value::from_i64(3), Value::from_text("auto")],
-        ]
-    );
 }
 
 #[test]
-fn new_rowid_reuses_the_gap_after_a_deleted_uncheckpointed_tail() {
+fn insert_rejects_a_duplicate_rowid_that_a_checkpoint_added_above_the_btree_last_row() {
+    let db = MvccTestDb::new();
+    db.conn
+        .execute("CREATE TABLE t(x INTEGER PRIMARY KEY, v TEXT)")
+        .unwrap();
+    db.conn
+        .execute("INSERT INTO t VALUES (1, 'a'), (100, 'b')")
+        .unwrap();
+    db.conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+    db.conn.execute("INSERT INTO t VALUES (200, 'c')").unwrap();
+    db.conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+
+    let dup = db.conn.execute("INSERT INTO t VALUES (200, 'dup')");
+    assert!(dup.is_err(), "rowid 200 must still be taken");
+}
+
+#[test]
+fn insert_rejects_a_duplicate_rowid_that_a_checkpoint_added_to_an_empty_btree() {
+    let db = MvccTestDb::new();
+    db.conn
+        .execute("CREATE TABLE t(x INTEGER PRIMARY KEY, v TEXT)")
+        .unwrap();
+    db.conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+    db.conn.execute("INSERT INTO t VALUES (5, 'a')").unwrap();
+    db.conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+
+    let dup = db.conn.execute("INSERT INTO t VALUES (5, 'dup')");
+    assert!(dup.is_err(), "rowid 5 must still be taken");
+}
+
+#[test]
+fn insert_rejects_a_duplicate_negative_rowid_after_recovery_and_checkpoint() {
     let mut db = MvccTestDbNoConn::new_with_random_db();
-    {
-        let conn = db.connect();
-        conn.execute("CREATE TABLE t(x INTEGER PRIMARY KEY, v TEXT)")
-            .unwrap();
-        conn.execute("INSERT INTO t VALUES (1, 'a'), (2, 'b'), (100, 'c')")
-            .unwrap();
-        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
-        conn.close().unwrap();
-    }
+    let conn_before_restart = db.connect();
+    conn_before_restart
+        .execute("CREATE TABLE t(x INTEGER PRIMARY KEY, v TEXT)")
+        .unwrap();
+    conn_before_restart
+        .execute("INSERT INTO t VALUES (-5, 'a')")
+        .unwrap();
+    conn_before_restart
+        .execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        .unwrap();
+    conn_before_restart
+        .execute("INSERT INTO t VALUES (-1, 'b')")
+        .unwrap();
+
     db.restart();
     let conn = db.connect();
-    conn.execute("DELETE FROM t WHERE x = 100").unwrap();
-    conn.execute("INSERT INTO t(v) VALUES ('auto')").unwrap();
-    let rows = get_rows(&conn, "SELECT x FROM t ORDER BY x");
-    let ids: Vec<i64> = rows.iter().map(|r| r[0].as_int().unwrap()).collect();
-    assert_eq!(ids, vec![1, 2, 3], "got {ids:?}");
+    conn.execute("INSERT INTO t VALUES (-3, 'c')").unwrap();
+    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+
+    let dup = conn.execute("INSERT INTO t VALUES (-1, 'dup')");
+    assert!(dup.is_err(), "rowid -1 must still be taken");
+    assert_eq!(
+        get_rows(&conn, "SELECT x FROM t ORDER BY x"),
+        vec![
+            vec![Value::from_i64(-5)],
+            vec![Value::from_i64(-3)],
+            vec![Value::from_i64(-1)],
+        ]
+    );
 }
 
 #[test]
@@ -24185,42 +24226,4 @@ fn step_until_busy_then_release(
             other => panic!("unexpected step result: {other:?}"),
         }
     }
-}
-
-#[test]
-fn notexists_descends_the_btree_for_non_positive_rowids() {
-    let db = MvccTestDbNoConn::new_with_random_db();
-    let db_path = db.path.as_ref().unwrap().clone();
-    let conn1 = db.connect();
-    conn1
-        .execute("CREATE TABLE t(x INTEGER PRIMARY KEY, v TEXT)")
-        .unwrap();
-    conn1.execute("INSERT INTO t VALUES (-5, 'a')").unwrap();
-    conn1.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
-    conn1.execute("INSERT INTO t VALUES (-1, 'b')").unwrap();
-
-    remove_file_from_database_registry(&db_path);
-
-    let io = Arc::new(PlatformIO::new().unwrap());
-    let db2 = Database::open_file_with_flags(
-        io,
-        &db_path,
-        OpenFlags::default(),
-        DatabaseOpts::new(),
-        None,
-        Arc::new(SqliteDialect),
-    )
-    .unwrap();
-    let conn = db2.connect(ConnectOpts::new()).unwrap();
-
-    conn.execute("INSERT INTO t VALUES (-3, 'c')").unwrap();
-    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
-
-    let res = conn.execute("INSERT INTO t VALUES (-1, 'dup')");
-    let rows = get_rows(&conn, "SELECT x, v FROM t ORDER BY x");
-    assert!(
-        res.is_err(),
-        "duplicate rowid -1 was accepted; table now reads {rows:?}"
-    );
-    assert_eq!(rows.len(), 3);
 }
