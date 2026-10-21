@@ -35,13 +35,11 @@ use crate::types::{
     IOCompletions, IOResult, ImmutableRecord, IndexInfo, SeekResult, Text, ValueIterator,
 };
 use crate::util::{
-    escape_sql_string_literal, normalize_ident, rename_identifiers,
-    rename_identifiers_scoped_when_clause, rewrite_check_expr_table_refs,
+    escape_sql_string_literal, normalize_ident, rename_identifiers, rewrite_check_expr_table_refs,
     rewrite_column_level_fk_parent_columns_if_needed, rewrite_column_references_if_needed,
     rewrite_fk_parent_cols_if_self_ref, rewrite_fk_parent_table_if_needed,
-    rewrite_inline_col_fk_target_if_needed, rewrite_trigger_cmd_column_refs,
-    rewrite_trigger_cmd_table_refs, rewrite_view_sql_for_column_rename,
-    trigger_still_references_renamed_column, trim_ascii_whitespace, RewrittenView,
+    rewrite_inline_col_fk_target_if_needed, rewrite_trigger_cmd_table_refs,
+    rewrite_view_sql_for_column_rename, trim_ascii_whitespace, RewrittenView,
 };
 use crate::vdbe::affinity::{
     apply_numeric_affinity, real_to_i64, try_for_float, Affinity, NumericParseResult, ParsedNumber,
@@ -49,7 +47,7 @@ use crate::vdbe::affinity::{
 use crate::vdbe::hash_table::{
     HashEntry, HashInsertResult, HashTable, HashTableConfig, PendingHashInsert, DEFAULT_MEM_BUDGET,
 };
-use crate::vdbe::insn::InsertFlags;
+use crate::vdbe::insn::{AlterColumnData, InsertFlags};
 use crate::vdbe::metrics::HashJoinMetrics;
 use crate::vdbe::vacuum::VacuumInPlaceOpContext;
 use crate::vdbe::value::ComparisonOp;
@@ -17437,18 +17435,6 @@ fn sql_might_reference_identifier(sql: &str, ident: &str) -> bool {
         .any(|window| window.eq_ignore_ascii_case(ident))
 }
 
-fn with_relevant_trigger_schemas_mut(
-    conn: &Connection,
-    table_db_id: usize,
-    mut f: impl FnMut(&mut Schema) -> crate::Result<()>,
-) -> crate::Result<()> {
-    conn.with_database_schema_mut(table_db_id, |schema| f(schema))??;
-    if table_db_id != crate::TEMP_DB_ID && conn.temp.database.read().is_some() {
-        conn.with_database_schema_mut(crate::TEMP_DB_ID, |schema| f(schema))??;
-    }
-    Ok(())
-}
-
 fn rewrite_trigger_for_table_rename(
     trigger: &mut crate::schema::Trigger,
     normalized_from: &str,
@@ -17465,45 +17451,6 @@ fn rewrite_trigger_for_table_rename(
     if new_sql != old_sql {
         trigger.sql = new_sql;
     }
-}
-
-fn rewrite_trigger_for_column_rename(
-    trigger: &mut crate::schema::Trigger,
-    table_name: &str,
-    old_col: &str,
-    new_col: &str,
-) -> crate::Result<()> {
-    let trigger_tbl = normalize_ident(&trigger.table_name);
-    let old_sql = trigger.sql.clone();
-    if let Some(ref mut when) = trigger.when_clause {
-        rename_identifiers_scoped_when_clause(when, table_name, &trigger_tbl, old_col, new_col);
-    }
-    if trigger_tbl == table_name {
-        if let ast::TriggerEvent::UpdateOf(ref mut cols) = trigger.event {
-            for col in cols {
-                if normalize_ident(col.as_str()) == normalize_ident(old_col) {
-                    *col = ast::Name::exact(new_col.to_owned());
-                }
-            }
-        }
-    }
-    for cmd in &mut trigger.commands {
-        rewrite_trigger_cmd_column_refs(cmd, table_name, &trigger_tbl, old_col, new_col);
-    }
-    if trigger_still_references_renamed_column(trigger, table_name, old_col) {
-        return Err(LimboError::ParseError(format!(
-            "error in trigger {} after rename: no such column: {}",
-            trigger.name, old_col
-        )));
-    }
-    // Keep trigger.sql in sync with the rewritten in-memory AST so a subsequent
-    // RENAME COLUMN sees the current column name (the translate step uses the
-    // in-memory trigger.sql as the source of the next rewrite).
-    let new_sql = regenerate_trigger_sql(trigger);
-    if new_sql != old_sql {
-        trigger.sql = new_sql;
-    }
-    Ok(())
 }
 
 pub fn op_rename_table(
@@ -17879,16 +17826,15 @@ pub fn op_alter_column(
     insn: &Insn,
     _pager: &Arc<Pager>,
 ) -> InsnResult {
-    load_insn!(
-        AlterColumn {
-            db,
-            table: table_name,
-            column_index,
-            definition,
-            rename,
-        },
-        insn
-    );
+    load_insn!(AlterColumn { data }, insn);
+    let AlterColumnData {
+        db,
+        table: table_name,
+        column_index,
+        definition,
+        rename,
+        rewritten_triggers,
+    } = data.as_ref();
 
     let conn = program.connection.clone();
 
@@ -17908,7 +17854,7 @@ pub fn op_alter_column(
         (old_column_name, table.is_strict())
     });
     let new_column = crate::schema::Column::from_definition(
-        definition.as_ref(),
+        definition,
         FromDefinitionFlags::empty().with(FromDefinitionFlags::InStrictTable, is_strict),
     )?;
     let new_name = definition.col_name.as_str().to_owned();
@@ -18143,22 +18089,11 @@ pub fn op_alter_column(
     })??;
 
     if *rename {
-        // Update in-memory trigger objects for the renamed column in both the
-        // altered schema and temp, since temp triggers may reference main/attached tables.
-        with_relevant_trigger_schemas_mut(&conn, *db, |schema| {
-            for triggers in schema.triggers.values_mut() {
-                for trigger_arc in triggers.iter_mut() {
-                    let trigger = Arc::make_mut(trigger_arc);
-                    rewrite_trigger_for_column_rename(
-                        trigger,
-                        &normalized_table_name,
-                        &old_column_name,
-                        &new_name,
-                    )?;
-                }
-            }
-            Ok(())
-        })?;
+        for (trigger_db, trigger_name, sql) in rewritten_triggers {
+            conn.with_database_schema_mut(*trigger_db, |schema| {
+                replace_trigger_sql(schema, trigger_name, sql)
+            })??;
+        }
 
         for (view_db, view_name, rewritten) in view_rewrites {
             conn.with_database_schema_mut(view_db, move |schema| -> crate::Result<()> {
@@ -18197,6 +18132,33 @@ pub fn op_alter_column(
 
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
+}
+
+fn replace_trigger_sql(schema: &mut Schema, trigger_name: &str, sql: &str) -> Result<()> {
+    let mut parser = Parser::new(sql.as_bytes());
+    let Some(ast::Cmd::Stmt(ast::Stmt::CreateTrigger {
+        event,
+        when_clause,
+        commands,
+        ..
+    })) = parser.next_cmd()?
+    else {
+        return Err(LimboError::ParseError(format!(
+            "invalid trigger sql: {sql}"
+        )));
+    };
+    let trigger = schema
+        .triggers
+        .values_mut()
+        .flatten()
+        .find(|trigger| trigger.name == trigger_name)
+        .expect("rewritten trigger should be in schema");
+    let trigger = Arc::make_mut(trigger);
+    trigger.sql = sql.to_string();
+    trigger.event = event;
+    trigger.when_clause = when_clause.map(|expr| *expr);
+    trigger.commands = commands;
+    Ok(())
 }
 
 pub fn op_if_neg(
