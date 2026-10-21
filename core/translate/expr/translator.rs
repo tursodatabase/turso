@@ -2061,14 +2061,17 @@ fn translate_function_call_expr(
                     target_register,
                     func_ctx,
                 ),
-                ScalarFunc::CurrVal => translate_function(
-                    program,
-                    args,
-                    referenced_tables,
-                    resolver,
-                    target_register,
-                    func_ctx,
-                ),
+                ScalarFunc::CurrVal => {
+                    let runtime_args = qualify_sequence_argument(args, resolver);
+                    translate_function(
+                        program,
+                        runtime_args.as_deref().unwrap_or(args),
+                        referenced_tables,
+                        resolver,
+                        target_register,
+                        func_ctx,
+                    )
+                }
             }
         }
         Func::Math(math_func) => match math_func.arity() {

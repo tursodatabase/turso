@@ -910,6 +910,37 @@ impl<'a> Resolver<'a> {
         self.resolve_unqualified_existing_database_id(trigger_name, Self::schema_has_trigger)
     }
 
+    /// The database of a sequence named without a namespace: the first
+    /// schema of the search path that has it, or main when no search path
+    /// is set or no schema of it has the sequence. Serial columns create
+    /// their sequences in main, so main stays reachable from every search
+    /// path.
+    pub(crate) fn resolve_existing_sequence_database_id(&self, seq_name: &str) -> usize {
+        if self.unqualified_database_search_path.is_none() {
+            return crate::MAIN_DB_ID;
+        }
+        self.resolve_unqualified_existing_database_id(seq_name, |schema, seq_name| {
+            schema.get_sequence(seq_name).is_some()
+        })
+        .unwrap_or(crate::MAIN_DB_ID)
+    }
+
+    /// `seq_name` qualified with the database it resolved to, for the
+    /// opcodes that look a sequence up again by its name when the statement
+    /// runs. None when no search path is set: a bare name then refers to
+    /// main when the statement runs too.
+    pub(crate) fn runtime_sequence_name(
+        &self,
+        database_id: usize,
+        seq_name: &str,
+    ) -> Option<String> {
+        self.unqualified_database_search_path.as_ref()?;
+        let database_name = self
+            .get_database_name_by_index(database_id)
+            .expect("the database of a sequence has a name");
+        Some(format!("{database_name}.{seq_name}"))
+    }
+
     /// Resolve database ID from a qualified name
     pub(crate) fn resolve_database_id(&self, qualified_name: &ast::QualifiedName) -> Result<usize> {
         // Check if this is a qualified name (database.table) or unqualified

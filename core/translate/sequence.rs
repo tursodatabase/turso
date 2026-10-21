@@ -1064,11 +1064,15 @@ pub fn translate_drop_sequence(
     resolver: &Resolver,
     program: &mut ProgramBuilder,
 ) -> Result<()> {
-    let database_id = resolver.resolve_database_id(seq_name)?;
+    let normalized_name = normalize_ident(seq_name.name.as_str());
+    let database_id = if seq_name.namespace.is_some() {
+        resolver.resolve_database_id(seq_name)?
+    } else {
+        resolver.resolve_existing_sequence_database_id(&normalized_name)
+    };
     let schema_cookie = resolver.with_schema(database_id, |s| s.schema_version);
     program.begin_write_on_database(database_id, schema_cookie)?;
 
-    let normalized_name = normalize_ident(seq_name.name.as_str());
     let dropped = emit_drop_sequence_cleanup(program, resolver, database_id, &normalized_name)?;
     if !dropped {
         if if_exists {
