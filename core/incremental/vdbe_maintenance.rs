@@ -250,7 +250,7 @@ fn build_plan_for_connection(
         connection.experimental_custom_types_enabled(),
         connection.get_dqs_dml().into(),
         Arc::new(crate::dialect::SqliteDialect),
-        &None,
+        None,
     );
     // Re-planning for maintenance must resolve the view's unqualified table
     // names the same way CREATE did: within the view's own database, never

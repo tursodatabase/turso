@@ -47,7 +47,6 @@ mod values;
 pub(crate) mod view;
 mod window;
 
-use crate::connection::PrepareOptions;
 use crate::schema::Schema;
 use crate::storage::pager::Pager;
 use crate::sync::Arc;
@@ -83,7 +82,6 @@ pub fn translate(
     query_mode: QueryMode,
     input: &str,
     origin: crate::statement::StatementOrigin,
-    prepare_options: &PrepareOptions,
 ) -> Result<Program> {
     tracing::trace!("querying {}", input);
     let change_cnt_on = matches!(
@@ -109,6 +107,17 @@ pub fn translate(
     program.set_mvcc_enabled(connection.mvcc_enabled());
 
     program.prologue();
+    // Engine-generated helper statements are always SQLite text and
+    // must resolve functions with SQLite semantics regardless of the
+    // database's dialect — the same invariant as unmarked schema rows.
+    // They look names up in every database, like SQLite does, whatever
+    // the connection's search path says.
+    let is_internal_helper = matches!(origin, crate::statement::StatementOrigin::InternalHelper);
+    let search_path = if is_internal_helper {
+        None
+    } else {
+        connection.search_path()
+    };
     let mut resolver = Resolver::new(
         schema,
         connection.database_schemas(),
@@ -118,15 +127,12 @@ pub fn translate(
         syms,
         connection.experimental_custom_types_enabled(),
         connection.get_dqs_dml().into(),
-        // Engine-generated helper statements are always SQLite text and
-        // must resolve functions with SQLite semantics regardless of the
-        // database's dialect — the same invariant as unmarked schema rows.
-        if matches!(origin, crate::statement::StatementOrigin::InternalHelper) {
+        if is_internal_helper {
             Arc::new(crate::dialect::SqliteDialect) as Arc<dyn crate::dialect::Dialect>
         } else {
             connection.dialect()
         },
-        &prepare_options.unqualified_database_search_path,
+        search_path.as_deref(),
     );
     #[cfg(feature = "simulator")]
     resolver.set_subquery_unnesting_mode(connection.subquery_unnesting_mode());
@@ -656,7 +662,6 @@ mod tests {
             QueryMode::Normal,
             "",
             crate::statement::StatementOrigin::Root,
-            &crate::connection::PrepareOptions::default(),
         );
         let err = result.unwrap_err().to_string();
         assert!(
@@ -877,7 +882,6 @@ mod tests {
             QueryMode::Normal,
             "",
             crate::statement::StatementOrigin::Root,
-            &crate::connection::PrepareOptions::default(),
         )
         .expect_err("translation should fail with malformed sqlite_sequence");
         match err {
@@ -921,7 +925,6 @@ mod tests {
             QueryMode::Normal,
             "",
             crate::statement::StatementOrigin::Root,
-            &crate::connection::PrepareOptions::default(),
         )
         .expect_err("translation should fail with missing sqlite_sequence");
         match err {

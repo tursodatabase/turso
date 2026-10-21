@@ -282,9 +282,6 @@ impl PostgreSQLTranslator {
         // Collect implicit sequence names for serial columns
         let mut serial_sequences: Vec<String> = Vec::new();
 
-        // Extract table name for serial sequence naming
-        let tbl_name_str = tbl_name.name.as_str().to_string();
-
         // Check for table-level PK (to suppress column-level PK emission)
         let mut has_table_pk = false;
         for elt in &create.table_elts {
@@ -306,7 +303,7 @@ impl PostgreSQLTranslator {
                     let col = self.translate_create_table_column(
                         col_def,
                         has_table_pk,
-                        &tbl_name_str,
+                        &tbl_name,
                         &mut serial_sequences,
                     )?;
                     columns.push(col);
@@ -397,18 +394,27 @@ impl PostgreSQLTranslator {
     }
 
     /// Translate CREATE TABLE, generating prerequisite CREATE SEQUENCE statements
-    /// for any serial columns.
+    /// for any serial columns. The sequences go to the namespace of the table,
+    /// which the column defaults name too, so they stay bound to the table
+    /// whatever `search_path` is later.
     fn translate_create_table_with_prereqs(
         &self,
         create: &pg_query::protobuf::CreateStmt,
     ) -> Result<TranslateResult, ParseError> {
         let (stmt, serial_sequences) = self.translate_create_table(create)?;
+        let ast::Stmt::CreateTable { tbl_name, .. } = &stmt else {
+            unreachable!("translate_create_table returns a CREATE TABLE statement");
+        };
+        let namespace = serial_sequence_namespace(tbl_name);
 
         let prereqs = serial_sequences
             .into_iter()
             .map(|seq_name| ast::Stmt::CreateSequence {
                 if_not_exists: true,
-                seq_name: ast::QualifiedName::single(ast::Name::from_string(seq_name)),
+                seq_name: ast::QualifiedName::fullname(
+                    ast::Name::from_string(&namespace),
+                    ast::Name::from_string(seq_name),
+                ),
                 start: None,
                 increment: None,
                 min_value: None,
@@ -429,7 +435,7 @@ impl PostgreSQLTranslator {
         &self,
         col_def: &pg_query::protobuf::ColumnDef,
         has_table_pk: bool,
-        table_name: &str,
+        tbl_name: &ast::QualifiedName,
         serial_sequences: &mut Vec<String>,
     ) -> Result<ast::ColumnDefinition, ParseError> {
         use pg_query::protobuf::node::Node;
@@ -513,15 +519,20 @@ impl PostgreSQLTranslator {
         // Build constraints list
         let mut constraints = Vec::new();
 
-        // For serial columns, add DEFAULT nextval('tablename_colname_seq')
+        // For serial columns, add DEFAULT nextval('namespace.tablename_colname_seq')
         if is_serial && default_expr.is_none() {
-            let seq_name = format!("{}_{}_seq", table_name.to_lowercase(), name.to_lowercase());
+            let seq_name = format!(
+                "{}_{}_seq",
+                tbl_name.name.as_str().to_lowercase(),
+                name.to_lowercase()
+            );
             serial_sequences.push(seq_name.clone());
+            let namespace = serial_sequence_namespace(tbl_name);
             default_expr = Some(ast::Expr::FunctionCall {
                 name: ast::Name::from_string("nextval"),
                 distinctness: None,
                 args: vec![Box::new(ast::Expr::Literal(ast::Literal::String(format!(
-                    "'{seq_name}'"
+                    "'{namespace}.{seq_name}'"
                 ))))],
                 order_by: vec![],
                 within_group: vec![],
@@ -910,7 +921,16 @@ impl PostgreSQLTranslator {
             .ok_or_else(|| ParseError::ParseError("CREATE INDEX missing table name".into()))?;
         let tbl_name = ast::Name::from_string(self.map_table_name(&relation.relname));
 
-        let idx_name = ast::QualifiedName::single(ast::Name::from_string(&idx.idxname));
+        // SQLite names the database on the index, not on the table, and
+        // looks the table up there.
+        let idx_name = if relation.schemaname.is_empty() {
+            ast::QualifiedName::single(ast::Name::from_string(&idx.idxname))
+        } else {
+            ast::QualifiedName::fullname(
+                ast::Name::from_string(map_schema_name(&relation.schemaname)),
+                ast::Name::from_string(&idx.idxname),
+            )
+        };
 
         self.translating_index.set(true);
         let index_parts = self.translate_index_parts(idx);
@@ -4454,6 +4474,16 @@ fn join_keeps_unmatched_right_rows(join: &ast::JoinedSelectTable) -> bool {
         join.operator,
         ast::JoinOperator::TypedJoin(Some(join_type)) if join_type.contains(ast::JoinType::RIGHT)
     )
+}
+
+/// The namespace of the sequences of the serial columns of table `tbl_name`:
+/// the namespace of the table, or main when the table has none.
+fn serial_sequence_namespace(tbl_name: &ast::QualifiedName) -> String {
+    tbl_name
+        .namespace
+        .as_ref()
+        .map(|namespace| namespace.as_str().to_string())
+        .unwrap_or_else(|| "main".to_string())
 }
 
 /// Maps a PostgreSQL schema name to the Turso schema that holds its tables.

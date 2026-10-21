@@ -169,6 +169,10 @@ impl Dialect for PostgresDialect {
     fn qualified_column_uses_nearest_table_only(&self) -> bool {
         true
     }
+
+    fn binds_names_at_create(&self) -> bool {
+        true
+    }
 }
 
 pub fn encode_pg_schema_sql(sql: &str) -> String {
@@ -1976,7 +1980,7 @@ impl SnapshotRows for PgSequencesTable {
                 // currval is per-connection; expose this connection's last
                 // value via the connection currval map, falling back to start.
                 let last_val = conn
-                    .get_sequence_currval(&seq_name)
+                    .get_sequence_currval(turso_core::MAIN_DB_ID, &seq_name)
                     .unwrap_or(seq.start_value);
                 rows.push(vec![
                     Value::build_text("public"),           // schemaname

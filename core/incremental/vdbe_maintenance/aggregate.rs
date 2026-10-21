@@ -173,7 +173,7 @@ fn emit_group_aggregate_rows(
         connection.experimental_custom_types_enabled(),
         connection.get_dqs_dml().into(),
         Arc::new(crate::dialect::SqliteDialect),
-        &None,
+        None,
     );
 
     turso_assert!(
