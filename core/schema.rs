@@ -8,7 +8,6 @@ use crate::index_method::{IndexMethodAttachment, IndexMethodConfiguration};
 use crate::return_if_io;
 use crate::stats::AnalyzeStats;
 use crate::sync::RwLock;
-use crate::translate::emitter::Resolver;
 use crate::translate::expr::{walk_expr, walk_expr_mut, WalkControl};
 use crate::translate::index::{resolve_index_method_parameters, resolve_sorted_columns};
 use crate::translate::planner::ROWID_STRS;
@@ -1660,7 +1659,7 @@ impl Schema {
                     // any connection exists, so there is no attached catalog
                     // to consult. Any `CREATE TEMP TRIGGER ... ON aux.x` row
                     // maps to `Some(INVALID_DB_ID)` until a connection-scoped
-                    // reparse runs with a real resolver.
+                    // reparse runs with a real catalog.
                     self.handle_schema_row(
                         &ty,
                         &name,
@@ -5844,7 +5843,7 @@ impl Index {
 
     /// Walk the where_clause Expr of a partial index and validate that it doesn't reference any other
     /// tables or use any disallowed constructs.
-    pub fn validate_where_expr(&self, table: &Table, _resolver: &Resolver) -> bool {
+    pub fn validate_where_expr(&self, table: &Table) -> bool {
         let Some(where_clause) = &self.where_clause else {
             return true;
         };

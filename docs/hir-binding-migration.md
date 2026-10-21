@@ -161,11 +161,13 @@ registers. HIR planning had its own generic versions of all of them
 with the shared `PlannedSource`, `PredicateTerm`, `SeekDef`, `BitSet` and
 `QueryDestination` types.
 
-What remains of the legacy data types:
+`Resolver`, the last legacy data type, was deleted on 2026-10-21. Schema
+statements, pragmas and transaction statements now look databases, tables,
+indexes, triggers, functions and collations up through the same
+`SemanticContext` that semantic analysis builds from the captured catalog,
+so no statement resolves a name outside the binding step's catalog.
 
-| Legacy work | HIR replacement | Why still live |
-|---|---|---|
-| `Resolver` | Semantic catalog and `HirSettings` | Schema statements, pragmas and transaction statements still look databases, functions and collations up through it. |
+Nothing of the legacy data types remains.
 
 Preserved binding restrictions, not HIR gaps:
 
@@ -805,7 +807,7 @@ clause has a RIGHT or FULL JOIN, which must not NULL-extend the target. Like
 legacy, a FROM clause that names a table twice, or whose NATURAL/USING column
 is also exposed by two other tables, is rejected up front.
 
-HIR DML does not use legacy's `Resolver`, `TableReferences` or AST
+HIR DML does not use the deleted `Resolver`, `TableReferences` or AST
 rewriting. Its settings (functions, dialect, custom types, double-quoted
 strings, search path) come from the connection through `HirSettings`, the
 checks that a target may be written run in `semantic_lowering`, and the

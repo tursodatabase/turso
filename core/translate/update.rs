@@ -1,7 +1,7 @@
 //! The UPDATE of the schema table that ALTER TABLE generates.
 
 use crate::sync::Arc;
-use crate::translate::emitter::Resolver;
+use crate::translate::semantic::context::SemanticContext;
 use crate::vdbe::builder::ProgramBuilder;
 use turso_parser::ast;
 
@@ -11,7 +11,7 @@ use turso_parser::ast;
 /// new `sql` value.
 pub fn translate_update_for_schema_change(
     body: ast::Update,
-    _resolver: &Resolver,
+    _resolver: &SemanticContext<'_>,
     program: &mut ProgramBuilder,
     connection: &Arc<crate::Connection>,
     ddl_query: &str,

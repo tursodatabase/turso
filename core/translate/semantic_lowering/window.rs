@@ -1712,6 +1712,8 @@ mod tests {
                 schema: Arc::new(schema),
             }],
             unqualified_database_search_path: vec![DatabaseId::new(MAIN_DB_ID)],
+            has_temp_database: false,
+            search_path_configured: false,
         };
         let command = Parser::new(sql.as_bytes())
             .next_cmd()

@@ -1479,7 +1479,7 @@ impl Connection {
             };
             match &mut inner.phase {
                 ReparsePhase::ParseSchema { parse } => {
-                    // Resolver so attached-db qualifiers in temp triggers can be
+                    // Name lookup so attached-db qualifiers in temp triggers can be
                     // mapped to their actual index on this connection.
                     let attached_resolver = |name: &str| -> Option<usize> {
                         self.attached_databases

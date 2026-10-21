@@ -18,6 +18,11 @@ pub(crate) struct SemanticCatalogDatabase {
 pub(crate) struct SemanticCatalog {
     pub(crate) databases: Vec<SemanticCatalogDatabase>,
     pub(crate) unqualified_database_search_path: Vec<DatabaseId>,
+    /// Whether the connection has a TEMP database with objects of its own.
+    pub(crate) has_temp_database: bool,
+    /// Whether the prepare call set the search path, in which case an
+    /// unqualified name that is in none of its databases is an error.
+    pub(crate) search_path_configured: bool,
 }
 
 impl SemanticCatalog {
@@ -113,6 +118,8 @@ impl SemanticCatalog {
         Ok(Self {
             databases,
             unqualified_database_search_path,
+            has_temp_database: has_temp_schema,
+            search_path_configured: configured_search_path.is_some(),
         })
     }
 }

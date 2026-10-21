@@ -45,7 +45,7 @@ use crate::connection::PrepareOptions;
 use crate::schema::Schema;
 use crate::storage::pager::Pager;
 use crate::sync::Arc;
-use crate::translate::emitter::Resolver;
+use crate::translate::semantic::context::SemanticContext;
 use crate::vdbe::builder::{ProgramBuilder, ProgramBuilderOpts, QueryMode};
 use crate::vdbe::Program;
 use crate::{bail_parse_error, Connection, Result, SymbolTable};
@@ -115,24 +115,34 @@ pub fn translate(
         dialect.clone(),
         prepare_options.unqualified_database_search_path.as_deref(),
     );
-    let mut resolver = Resolver::new(
-        schema,
+    let captured = semantic::catalog::SemanticCatalog::capture(
+        schema.clone(),
         connection.database_schemas(),
         &connection.temp.database,
         connection.attached_databases(),
+        connection.experimental_custom_types_enabled(),
+        dialect.as_ref(),
+        prepare_options.unqualified_database_search_path.as_deref(),
+    )?;
+    let catalog = SemanticContext::for_catalog(
+        &captured,
         syms,
         connection.experimental_custom_types_enabled(),
-        connection.get_dqs_dml().into(),
         dialect,
-        &prepare_options.unqualified_database_search_path,
-    );
+        if connection.get_dqs_dml() {
+            semantic::context::DoubleQuotedDml::Enabled
+        } else {
+            semantic::context::DoubleQuotedDml::Disabled
+        },
+        connection.foreign_keys_enabled(),
+    )?;
 
     let hir = (schema, &hir_settings);
     match stmt {
         // There can be no nesting with pragma, so lift it up here
         ast::Stmt::Pragma { name, body } => {
             pragma::translate_pragma(
-                &resolver,
+                &catalog,
                 &name,
                 body,
                 pager,
@@ -141,7 +151,7 @@ pub fn translate(
                 hir,
             )?;
         }
-        stmt => translate_statement(stmt, &mut resolver, &mut program, &connection, input, hir)?,
+        stmt => translate_statement(stmt, &catalog, &mut program, &connection, input, hir)?,
     };
 
     program.epilogue(schema);
@@ -155,7 +165,7 @@ pub fn translate(
 #[turso_macros::trace_stack(detail = stmt_kind(&stmt))]
 fn translate_statement(
     stmt: ast::Stmt,
-    resolver: &mut Resolver,
+    catalog: &SemanticContext<'_>,
     program: &mut ProgramBuilder,
     connection: &Arc<Connection>,
     input: &str,
@@ -247,18 +257,18 @@ fn translate_statement(
             semantic_lowering::translate_insert(&stmt, schema, settings, program, connection)?
         }
         ast::Stmt::AlterTable(alter) => {
-            translate_alter_table(alter, resolver, program, connection, input, hir)?;
+            translate_alter_table(alter, catalog, program, connection, input, hir)?;
         }
-        ast::Stmt::Analyze { name } => translate_analyze(name, resolver, program)?,
+        ast::Stmt::Analyze { name } => translate_analyze(name, catalog, program)?,
         ast::Stmt::Attach { expr, db_name, key } => {
             attach::translate_attach(&expr, &db_name, &key, program, connection.clone(), hir)?;
         }
-        ast::Stmt::Begin { typ, name } => translate_tx_begin(typ, name, resolver, program)?,
+        ast::Stmt::Begin { typ, name } => translate_tx_begin(typ, name, catalog, program)?,
         ast::Stmt::Commit { name } => {
-            translate_tx_commit(name, resolver.schema(), resolver, program)?
+            translate_tx_commit(name, catalog.main_schema(), catalog, program)?
         }
         ast::Stmt::CreateIndex { .. } => {
-            translate_create_index(program, connection, resolver, stmt, hir)?;
+            translate_create_index(program, connection, catalog, stmt, hir)?;
         }
         ast::Stmt::CreateTable {
             temporary,
@@ -267,7 +277,7 @@ fn translate_statement(
             body,
         } => translate_create_table(
             tbl_name,
-            resolver,
+            catalog,
             temporary,
             if_not_exists,
             body,
@@ -301,7 +311,7 @@ fn translate_statement(
             );
             trigger::translate_create_trigger(
                 trigger_name,
-                resolver,
+                catalog,
                 temporary,
                 if_not_exists,
                 time,
@@ -320,7 +330,7 @@ fn translate_statement(
             temporary,
         } => view::translate_create_view(
             &view_name,
-            resolver,
+            catalog,
             &select,
             &columns,
             temporary,
@@ -334,14 +344,14 @@ fn translate_statement(
             ..
         } => view::translate_create_materialized_view(
             &view_name,
-            resolver,
+            catalog,
             &select,
             if_not_exists,
             connection.clone(),
             program,
         )?,
         ast::Stmt::CreateVirtualTable(vtab) => {
-            translate_create_virtual_table(vtab, resolver, program, connection)?
+            translate_create_virtual_table(vtab, catalog, program, connection)?
         }
         ast::Stmt::Detach { name } => {
             attach::translate_detach(&name, program, connection.clone(), hir)?
@@ -349,19 +359,19 @@ fn translate_statement(
         ast::Stmt::DropIndex {
             if_exists,
             idx_name,
-        } => translate_drop_index(&idx_name, resolver, if_exists, program)?,
+        } => translate_drop_index(&idx_name, catalog, if_exists, program)?,
         ast::Stmt::DropTable {
             if_exists,
             tbl_name,
-        } => translate_drop_table(tbl_name, resolver, if_exists, program, connection, hir)?,
+        } => translate_drop_table(tbl_name, catalog, if_exists, program, connection, hir)?,
         ast::Stmt::DropTrigger {
             if_exists,
             trigger_name,
-        } => trigger::translate_drop_trigger(resolver, &trigger_name, if_exists, program)?,
+        } => trigger::translate_drop_trigger(catalog, &trigger_name, if_exists, program)?,
         ast::Stmt::DropView {
             if_exists,
             view_name,
-        } => view::translate_drop_view(resolver, &view_name, if_exists, program)?,
+        } => view::translate_drop_view(catalog, &view_name, if_exists, program)?,
         ast::Stmt::CreateType {
             if_not_exists,
             type_name,
@@ -370,7 +380,7 @@ fn translate_statement(
             if !connection.experimental_custom_types_enabled() {
                 bail_parse_error!("Custom types require --experimental-custom-types flag");
             }
-            schema::translate_create_type(&type_name, &body, if_not_exists, resolver, program)?
+            schema::translate_create_type(&type_name, &body, if_not_exists, catalog, program)?
         }
         ast::Stmt::CreateDomain {
             if_not_exists,
@@ -390,7 +400,7 @@ fn translate_statement(
                 &constraints,
                 default,
                 if_not_exists,
-                resolver,
+                catalog,
                 program,
             )?
         }
@@ -401,7 +411,7 @@ fn translate_statement(
             if !connection.experimental_custom_types_enabled() {
                 bail_parse_error!("Custom types require --experimental-custom-types flag");
             }
-            schema::translate_drop_type(&type_name, if_exists, false, resolver, program)?
+            schema::translate_drop_type(&type_name, if_exists, false, catalog, program)?
         }
         ast::Stmt::DropDomain {
             if_exists,
@@ -410,14 +420,14 @@ fn translate_statement(
             if !connection.experimental_custom_types_enabled() {
                 bail_parse_error!("Custom types require --experimental-custom-types flag");
             }
-            schema::translate_drop_type(&domain_name, if_exists, true, resolver, program)?
+            schema::translate_drop_type(&domain_name, if_exists, true, catalog, program)?
         }
         ast::Stmt::Pragma { .. } => {
             bail_parse_error!("PRAGMA statement cannot be evaluated in a nested context")
         }
-        ast::Stmt::Reindex { name } => translate_reindex(name, resolver, program, connection, hir)?,
+        ast::Stmt::Reindex { name } => translate_reindex(name, catalog, program, connection, hir)?,
         ast::Stmt::Optimize { idx_name } => {
-            translate_optimize(idx_name, resolver, program, connection)?
+            translate_optimize(idx_name, catalog, program, connection)?
         }
         ast::Stmt::Release { name } => translate_release(program, name)?,
         ast::Stmt::Rollback {
@@ -445,7 +455,7 @@ fn translate_statement(
                 &min_value,
                 &max_value,
                 cycle,
-                resolver,
+                catalog,
                 program,
             )?;
         }
@@ -453,7 +463,7 @@ fn translate_statement(
             if_exists,
             seq_name,
         } => {
-            sequence::translate_drop_sequence(&seq_name, if_exists, resolver, program)?;
+            sequence::translate_drop_sequence(&seq_name, if_exists, catalog, program)?;
         }
     };
 
