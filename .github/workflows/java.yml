@@ -28,16 +28,16 @@ jobs:
 
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
       - name: Install Rust(stable)
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
 
       - name: Setup mold linker
-        uses: rui314/setup-mold@v1
+        uses: rui314/setup-mold@339e96b4ff1f3bd865856ba4cbbe8818a7acb038 # v1
 
       - name: Rust cache
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           prefix-key: "v1-rust"
           cache-on-failure: true
@@ -45,7 +45,7 @@ jobs:
 
 
       - name: Set up JDK
-        uses: useblacksmith/setup-java@v5
+        uses: useblacksmith/setup-java@4ef812391eff6e9737ba13bf0356d0f702877a64 # v5.0.1
         with:
           distribution: 'temurin'
           java-version: '8'

@@ -18,10 +18,10 @@ jobs:
         working-directory: ${{ env.working-directory }}
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
       - name: Setup uv
-        uses: useblacksmith/setup-uv@v4
+        uses: useblacksmith/setup-uv@f4588471335f14dcb60198856207b916701a9e9f # v4
 
       - name: Build
         run: uv build

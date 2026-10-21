@@ -37,9 +37,9 @@ jobs:
           - bench: graph_queries_benchmark
             features: "--features bench"
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           prefix-key: "v1-rust"
           cache-on-failure: true
@@ -57,14 +57,14 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           prefix-key: "v1-rust"
           cache-on-failure: true
           save-if: ${{ github.ref == 'refs/heads/main' }}
-      - uses: useblacksmith/setup-node@v5
+      - uses: useblacksmith/setup-node@65c6ca86fdeb0ab3d85e78f57e4f6a7e4780b391 # v5.0.4
         with:
           node-version: 24
 
@@ -77,9 +77,9 @@ jobs:
     env:
       DB_FILE: "perf/tpc-h/TPC-H.db"
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           prefix-key: "v1-rust"
           cache-on-failure: true
@@ -87,7 +87,7 @@ jobs:
 
       - name: Cache TPC-H
         id: cache-primes
-        uses: useblacksmith/cache@v5
+        uses: useblacksmith/cache@71c7c918062ba3861252d84b07fe5ab2a6b467a6 # v5
         with:
           path: ${{ env.DB_FILE }}
           key: tpc-h
@@ -104,9 +104,9 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           prefix-key: "v1-rust"
           cache-on-failure: true
@@ -120,9 +120,9 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           prefix-key: "v1-rust"
           cache-on-failure: true
@@ -132,7 +132,7 @@ jobs:
         run: cargo build --release --verbose --locked
 
       - name: Install uv
-        uses: useblacksmith/setup-uv@v4
+        uses: useblacksmith/setup-uv@f4588471335f14dcb60198856207b916701a9e9f # v4
         with:
           enable-cache: true
 

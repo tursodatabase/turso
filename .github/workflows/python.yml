@@ -40,10 +40,10 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
       - name: Setup Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
 
       - name: Setup MSVC
         if: runner.os == 'Windows'
@@ -51,10 +51,10 @@ jobs:
 
       - name: Setup mold linker
         if: runner.os == 'Linux'
-        uses: rui314/setup-mold@v1
+        uses: rui314/setup-mold@339e96b4ff1f3bd865856ba4cbbe8818a7acb038 # v1
 
       - name: Rust cache
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           prefix-key: "v1-rust"
           cache-on-failure: true
@@ -65,12 +65,12 @@ jobs:
         run: cargo build -p turso_cli --bin tursodb --locked
 
       - name: Set up Python ${{ matrix.python-version }}
-        uses: useblacksmith/setup-python@v6
+        uses: useblacksmith/setup-python@943b05a7c4ca70c2360391137527a37bee33fb1d # v6
         with:
           python-version: ${{ matrix.python-version }}
 
       - name: Install uv
-        uses: useblacksmith/setup-uv@v4
+        uses: useblacksmith/setup-uv@f4588471335f14dcb60198856207b916701a9e9f # v4
         with:
           enable-cache: true
 
@@ -138,13 +138,13 @@ jobs:
 
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
       - name: Set up Python
-        uses: useblacksmith/setup-python@v6
+        uses: useblacksmith/setup-python@943b05a7c4ca70c2360391137527a37bee33fb1d # v6
 
       - name: Install uv
-        uses: useblacksmith/setup-uv@v4
+        uses: useblacksmith/setup-uv@f4588471335f14dcb60198856207b916701a9e9f # v4
         with:
           enable-cache: true
 
@@ -165,19 +165,19 @@ jobs:
             runner: blacksmith-4vcpu-ubuntu-2404-arm
     runs-on: ${{ matrix.runner }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: useblacksmith/setup-python@v6
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: useblacksmith/setup-python@943b05a7c4ca70c2360391137527a37bee33fb1d # v6
         with:
           python-version: '3.10'
       - name: Build wheels
-        uses: PyO3/maturin-action@v1
+        uses: PyO3/maturin-action@e83996d129638aa358a18fbd1dfb82f0b0fb5d3b # v1.51.0
         with:
           working-directory: ${{ env.working-directory }}
           target: ${{ matrix.target }}
           args: --profile ${{ env.WHEEL_PROFILE }} --out dist
           manylinux: auto
       - name: Upload wheels
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: wheels-linux-${{ matrix.target }}
           path: bindings/python/dist
@@ -196,21 +196,21 @@ jobs:
         # the only PR build for that target, so it stays.
         target: ${{ github.event_name == 'pull_request' && fromJSON('["x86_64"]') || fromJSON('["x86_64", "aarch64"]') }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
         env:
           CXX: clang++
           CC: clang
         with:
           python-version: '3.10'
       - name: Build wheels
-        uses: PyO3/maturin-action@v1
+        uses: PyO3/maturin-action@e83996d129638aa358a18fbd1dfb82f0b0fb5d3b # v1.51.0
         with:
           working-directory: ${{ env.working-directory }}
           target: ${{ matrix.target }}
           args: --profile ${{ env.WHEEL_PROFILE }} --out dist
       - name: Upload wheels
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: wheels-macos-${{ matrix.target }}
           path: bindings/python/dist
@@ -222,15 +222,15 @@ jobs:
       run:
         working-directory: ${{ env.working-directory }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - name: Build sdist
-        uses: PyO3/maturin-action@v1
+        uses: PyO3/maturin-action@e83996d129638aa358a18fbd1dfb82f0b0fb5d3b # v1.51.0
         with:
           working-directory: ${{ env.working-directory }}
           command: sdist
           args: --out dist
       - name: Upload sdist
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: wheels-sdist
           path: bindings/python/dist
@@ -242,13 +242,13 @@ jobs:
     if: "startsWith(github.ref, 'refs/tags/')"
     needs: [linux, macos, sdist]
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           path: bindings/python/dist
           pattern: wheels-*
           merge-multiple: true
       - name: Publish to PyPI
-        uses: PyO3/maturin-action@v1
+        uses: PyO3/maturin-action@e83996d129638aa358a18fbd1dfb82f0b0fb5d3b # v1.51.0
         env:
           MATURIN_PYPI_TOKEN: ${{ secrets.PYPI_API_TOKEN }}
         with:

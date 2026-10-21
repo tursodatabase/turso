@@ -39,22 +39,22 @@ jobs:
         mode: [default, mvcc, mvcc-passive]
         elle_model: [list-append, rw-register]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
-      - uses: useblacksmith/rust-cache@v3
+      - uses: useblacksmith/rust-cache@f53e7f127245d2a269b3d90879ccf259876842d5 # v3.0.1
         with:
           prefix-key: "v1-rust"
           save-if: ${{ github.ref == 'refs/heads/main' }}
 
 
       - name: Setup Java
-        uses: actions/setup-java@v4
+        uses: actions/setup-java@cf277c60eb25467037889841efdb72551f06f6c3 # v4.9.1
         with:
           distribution: "temurin"
           java-version: "21"
 
       - name: Cache Leiningen
-        uses: actions/cache@v4
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
           path: |
             /tmp/lein
@@ -62,7 +62,7 @@ jobs:
           key: lein-${{ runner.os }}
 
       - name: Cache elle-cli
-        uses: actions/cache@v4
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
           path: /tmp/elle-cli
           key: elle-cli-${{ runner.os }}-${{ env.ELLE_CLI_REV }}
@@ -136,7 +136,7 @@ jobs:
           java -jar "$ELLE_JAR" --model ${{ matrix.elle_model }} $CONSISTENCY_FLAG --verbose --directory elle-results elle-history.edn
 
       - name: Upload Elle results
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         if: always()
         with:
           name: elle-results-${{ matrix.elle_model }}-${{ matrix.mode }}

@@ -25,8 +25,8 @@ jobs:
     runs-on: blacksmith-4vcpu-ubuntu-2404
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v4
-      - uses: useblacksmith/rust-cache@v3
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: useblacksmith/rust-cache@f53e7f127245d2a269b3d90879ccf259876842d5 # v3.0.1
         with:
           prefix-key: "v1-rust"
           save-if: ${{ github.ref == 'refs/heads/main' }}
@@ -42,8 +42,8 @@ jobs:
     runs-on: blacksmith-4vcpu-ubuntu-2404
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
-      - uses: useblacksmith/rust-cache@v3
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: useblacksmith/rust-cache@f53e7f127245d2a269b3d90879ccf259876842d5 # v3.0.1
         with:
           prefix-key: "v1-rust"
           save-if: ${{ github.ref == 'refs/heads/main' }}
@@ -62,8 +62,8 @@ jobs:
     runs-on: blacksmith-4vcpu-ubuntu-2404
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
-      - uses: useblacksmith/rust-cache@v3
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: useblacksmith/rust-cache@f53e7f127245d2a269b3d90879ccf259876842d5 # v3.0.1
         with:
           prefix-key: "v1-rust"
           save-if: ${{ github.ref == 'refs/heads/main' }}
@@ -93,14 +93,14 @@ jobs:
       run:
         working-directory: bindings/javascript
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       # Both modes build the same things and share this key; one saves.
-      - uses: useblacksmith/rust-cache@v3
+      - uses: useblacksmith/rust-cache@f53e7f127245d2a269b3d90879ccf259876842d5 # v3.0.1
         with:
           prefix-key: "v1-rust"
           save-if: ${{ github.ref == 'refs/heads/main' && matrix.mode == 'default' }}
       - name: Setup node
-        uses: useblacksmith/setup-node@v5
+        uses: useblacksmith/setup-node@65c6ca86fdeb0ab3d85e78f57e4f6a7e4780b391 # v5.0.4
         with:
           node-version: 24
       - name: Install JS dependencies
@@ -128,8 +128,8 @@ jobs:
     runs-on: blacksmith-4vcpu-ubuntu-2404
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
-      - uses: useblacksmith/rust-cache@v3
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: useblacksmith/rust-cache@f53e7f127245d2a269b3d90879ccf259876842d5 # v3.0.1
         with:
           prefix-key: "v1-rust"
           save-if: ${{ github.ref == 'refs/heads/main' }}
@@ -145,8 +145,8 @@ jobs:
     runs-on: blacksmith-4vcpu-ubuntu-2404
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
-      - uses: useblacksmith/rust-cache@v3
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: useblacksmith/rust-cache@f53e7f127245d2a269b3d90879ccf259876842d5 # v3.0.1
         with:
           prefix-key: "v1-rust"
           save-if: ${{ github.ref == 'refs/heads/main' }}
@@ -160,8 +160,8 @@ jobs:
     runs-on: blacksmith-4vcpu-ubuntu-2404
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
-      - uses: useblacksmith/rust-cache@v3
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: useblacksmith/rust-cache@f53e7f127245d2a269b3d90879ccf259876842d5 # v3.0.1
         with:
           prefix-key: "v1-rust"
           save-if: ${{ github.ref == 'refs/heads/main' }}
