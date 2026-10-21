@@ -230,6 +230,10 @@ pub trait Dialect: Send + Sync + 'static {
         Ok(None)
     }
 
+    /// Put the triggers that fire for one event at one time in the order in
+    /// which they fire. The default keeps the order of SQLite.
+    fn order_triggers(&self, _triggers: &mut [crate::sync::Arc<crate::schema::Trigger>]) {}
+
     /// Whether INSERT gives a new row its rowid before the BEFORE INSERT
     /// triggers, so that NEW has the rowid. SQLite gives the rowid after the
     /// triggers, and NEW has -1. PostgreSQL calculates the default of a key,
@@ -398,7 +402,7 @@ mod tests {
                 let Expr::Literal(Literal::String(text)) = arg else {
                     panic!("test trigger bodies are text");
                 };
-                text.trim_matches('\'').replace("''", "'")
+                text[1..text.len() - 1].replace("''", "'")
             };
             let [body, changes @ ..] = args.as_slice() else {
                 panic!("test trigger bodies have a statement");
@@ -462,6 +466,10 @@ mod tests {
                 panic!("the test condition is one column");
             };
             Ok(Some(*condition))
+        }
+
+        fn order_triggers(&self, triggers: &mut [Arc<crate::schema::Trigger>]) {
+            triggers.sort_by(|left, right| left.name.cmp(&right.name));
         }
 
         fn compile_function_call(
@@ -1085,6 +1093,29 @@ mod tests {
             rows(&conn, "SELECT a, b, c FROM t"),
             vec![vec![int(1), int(2), int(4)]]
         );
+    }
+
+    #[test]
+    fn triggers_fire_in_the_order_of_the_dialect() {
+        let conn = open_trigger_db("trigger-order.db");
+        conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, c TEXT)")
+            .unwrap();
+        conn.execute(
+            "CREATE TRIGGER a_first BEFORE INSERT ON t BEGIN \
+             SELECT test_trigger_body('', 'c', '''a'''); \
+             END",
+        )
+        .unwrap();
+        conn.execute(
+            "CREATE TRIGGER b_second BEFORE INSERT ON t BEGIN \
+             SELECT test_trigger_body('', 'c', 'new.c || ''b'''); \
+             END",
+        )
+        .unwrap();
+
+        conn.execute("INSERT INTO t (id) VALUES (1)").unwrap();
+
+        assert_eq!(rows(&conn, "SELECT c FROM t"), vec![vec![text("ab")]]);
     }
 
     #[test]

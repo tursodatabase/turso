@@ -995,6 +995,7 @@ pub fn get_triggers_including_temp(
         }
         triggers = list.into();
     }
+    resolver.dialect.order_triggers(&mut triggers);
     triggers
 }
 

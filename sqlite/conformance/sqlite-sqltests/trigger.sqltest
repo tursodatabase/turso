@@ -2832,3 +2832,103 @@ expect {
     after insert|new
     1|new
 }
+
+test trigger-multiple-before-update-fire-in-reverse-creation-order {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, a);
+    CREATE TABLE log(seq INTEGER PRIMARY KEY, ev);
+    CREATE TRIGGER b_first BEFORE UPDATE ON t BEGIN
+        INSERT INTO log(ev) VALUES ('b_first');
+    END;
+    CREATE TRIGGER a_second BEFORE UPDATE ON t BEGIN
+        INSERT INTO log(ev) VALUES ('a_second');
+    END;
+    CREATE TRIGGER c_third BEFORE UPDATE ON t BEGIN
+        INSERT INTO log(ev) VALUES ('c_third');
+    END;
+    INSERT INTO t VALUES (1, 1);
+    UPDATE t SET a = 2;
+    SELECT ev FROM log ORDER BY seq;
+}
+expect {
+    c_third
+    a_second
+    b_first
+}
+
+test trigger-multiple-after-insert-fire-in-reverse-creation-order {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, a);
+    CREATE TABLE log(seq INTEGER PRIMARY KEY, ev);
+    CREATE TRIGGER b_first AFTER INSERT ON t BEGIN
+        INSERT INTO log(ev) VALUES ('b_first');
+    END;
+    CREATE TRIGGER a_second AFTER INSERT ON t BEGIN
+        INSERT INTO log(ev) VALUES ('a_second');
+    END;
+    INSERT INTO t VALUES (1, 1);
+    SELECT ev FROM log ORDER BY seq;
+}
+expect {
+    a_second
+    b_first
+}
+
+test trigger-multiple-after-delete-fire-in-reverse-creation-order {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, a);
+    CREATE TABLE log(seq INTEGER PRIMARY KEY, ev);
+    CREATE TRIGGER b_first AFTER DELETE ON t BEGIN
+        INSERT INTO log(ev) VALUES ('b_first');
+    END;
+    CREATE TRIGGER a_second AFTER DELETE ON t BEGIN
+        INSERT INTO log(ev) VALUES ('a_second');
+    END;
+    INSERT INTO t VALUES (1, 1);
+    DELETE FROM t;
+    SELECT ev FROM log ORDER BY seq;
+}
+expect {
+    a_second
+    b_first
+}
+
+test trigger-update-and-update-of-triggers-fire-in-reverse-creation-order {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, a, b);
+    CREATE TABLE log(seq INTEGER PRIMARY KEY, ev);
+    CREATE TRIGGER z_any BEFORE UPDATE ON t BEGIN
+        INSERT INTO log(ev) VALUES ('z_any');
+    END;
+    CREATE TRIGGER y_of_a BEFORE UPDATE OF a ON t BEGIN
+        INSERT INTO log(ev) VALUES ('y_of_a');
+    END;
+    CREATE TRIGGER x_of_b BEFORE UPDATE OF b ON t BEGIN
+        INSERT INTO log(ev) VALUES ('x_of_b');
+    END;
+    INSERT INTO t VALUES (1, 1, 1);
+    UPDATE t SET a = 2, b = 2;
+    SELECT ev FROM log ORDER BY seq;
+}
+expect {
+    x_of_b
+    y_of_a
+    z_any
+}
+
+test trigger-created-again-fires-first {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, a);
+    CREATE TABLE log(seq INTEGER PRIMARY KEY, ev);
+    CREATE TRIGGER one AFTER INSERT ON t BEGIN
+        INSERT INTO log(ev) VALUES ('one');
+    END;
+    CREATE TRIGGER two AFTER INSERT ON t BEGIN
+        INSERT INTO log(ev) VALUES ('two');
+    END;
+    DROP TRIGGER one;
+    CREATE TRIGGER one AFTER INSERT ON t BEGIN
+        INSERT INTO log(ev) VALUES ('one');
+    END;
+    INSERT INTO t VALUES (1, 1);
+    SELECT ev FROM log ORDER BY seq;
+}
+expect {
+    one
+    two
+}
