@@ -921,7 +921,7 @@ fn join_key_indexes_no_other_view_needs(
     dropped_view: &str,
     connection: &Arc<Connection>,
 ) -> Result<Vec<Arc<Index>>> {
-    let (join_key_indexes, other_views) = resolver.with_schema(database_id, |s| {
+    let (join_key_indexes, views) = resolver.with_schema(database_id, |s| {
         let join_key_indexes = s
             .indexes
             .values()
@@ -929,11 +929,11 @@ fn join_key_indexes_no_other_view_needs(
             .filter(|index| crate::schema::is_materialized_view_join_key_index(&index.name))
             .cloned()
             .collect::<Vec<_>>();
-        let other_views = s
+        let views = s
             .materialized_view_names
             .iter()
             .filter(|name| {
-                name.as_str() != dropped_view && s.has_compatible_materialized_view_storage(name)
+                name.as_str() == dropped_view || s.has_compatible_materialized_view_storage(name)
             })
             .map(|name| {
                 let view = s
@@ -943,24 +943,138 @@ fn join_key_indexes_no_other_view_needs(
                 (name.clone(), select)
             })
             .collect::<Vec<_>>();
-        (join_key_indexes, other_views)
+        (join_key_indexes, views)
     });
     if join_key_indexes.is_empty() {
         return Ok(Vec::new());
     }
-    let mut needed = Vec::new();
-    for (view_name, select) in &other_views {
+    let (dropped, others): (Vec<_>, Vec<_>) =
+        views.iter().partition(|(name, _)| name == dropped_view);
+    let existing = join_key_indexes
+        .iter()
+        .map(|index| index.name.clone())
+        .collect::<Vec<_>>();
+    let unneeded = unneeded_join_key_indexes(&existing, dropped.first(), &others, |view| {
+        let (view_name, select) = view;
         let plan = resolver.with_view_scope(database_id, view_name.clone(), || {
             crate::incremental::vdbe_maintenance::plan_view(view_name, select, resolver, connection)
         })?;
-        needed.extend(
-            plan.join_key_indexes()
-                .iter()
-                .map(|index| index.index.name.clone()),
-        );
-    }
+        Ok(plan
+            .join_key_indexes()
+            .iter()
+            .map(|index| index.index.name.clone())
+            .collect())
+    });
     Ok(join_key_indexes
         .into_iter()
-        .filter(|index| !needed.contains(&index.name))
+        .filter(|index| unneeded.contains(&index.name))
         .collect())
+}
+
+/// Of the `existing` join-key indexes, the ones to drop with `dropped`: those
+/// it needs that no view in `others` needs, as `needs` lists them. When the
+/// dropped view cannot be planned, every index no other view needs is
+/// dropped. When another view cannot be planned, nothing is dropped, so
+/// DROP VIEW never fails because of an unrelated view; an index kept this
+/// way only costs space and write time.
+fn unneeded_join_key_indexes<V>(
+    existing: &[String],
+    dropped: Option<&V>,
+    others: &[V],
+    needs: impl Fn(&V) -> Result<Vec<String>>,
+) -> Vec<String> {
+    let candidates = match dropped.map(&needs) {
+        Some(Ok(needed)) => existing
+            .iter()
+            .filter(|index| needed.contains(index))
+            .cloned()
+            .collect::<Vec<_>>(),
+        Some(Err(_)) | None => existing.to_vec(),
+    };
+    if candidates.is_empty() {
+        return candidates;
+    }
+    let mut needed_by_others = Vec::new();
+    for view in others {
+        match needs(view) {
+            Ok(needed) => needed_by_others.extend(needed),
+            Err(_) => return Vec::new(),
+        }
+    }
+    candidates
+        .into_iter()
+        .filter(|index| !needed_by_others.contains(index))
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::unneeded_join_key_indexes;
+    use crate::LimboError;
+
+    fn names(names: &[&str]) -> Vec<String> {
+        names.iter().map(|name| name.to_string()).collect()
+    }
+
+    /// Each view is (name, the indexes it needs); a view needing "error"
+    /// cannot be planned.
+    fn needs(view: &(&str, &[&str])) -> crate::Result<Vec<String>> {
+        match view.1 {
+            ["error"] => Err(LimboError::InternalError(format!(
+                "{} does not plan",
+                view.0
+            ))),
+            needed => Ok(names(needed)),
+        }
+    }
+
+    #[test]
+    fn drop_view_drops_only_indexes_no_other_view_needs() {
+        let existing = names(&["i1", "i2", "i3"]);
+        let dropped = ("v1", &["i1", "i2"][..]);
+        let others = [("v2", &["i2"][..]), ("v3", &["i3"][..])];
+        assert_eq!(
+            unneeded_join_key_indexes(&existing, Some(&dropped), &others, needs),
+            names(&["i1"])
+        );
+    }
+
+    #[test]
+    fn drop_view_keeps_every_index_when_another_view_does_not_plan() {
+        let existing = names(&["i1", "i2"]);
+        let dropped = ("v1", &["i1"][..]);
+        let others = [("v2", &["error"][..]), ("v3", &["i2"][..])];
+        assert_eq!(
+            unneeded_join_key_indexes(&existing, Some(&dropped), &others, needs),
+            Vec::<String>::new()
+        );
+    }
+
+    #[test]
+    fn drop_view_without_indexes_does_not_plan_other_views() {
+        let existing = names(&["i1"]);
+        let dropped = ("v1", &[][..]);
+        let others = [("v2", &["error"][..])];
+        let planned = std::cell::Cell::new(0);
+        let counting_needs = |view: &(&str, &[&str])| {
+            planned.set(planned.get() + 1);
+            needs(view)
+        };
+        assert_eq!(
+            unneeded_join_key_indexes(&existing, Some(&dropped), &others, counting_needs),
+            Vec::<String>::new()
+        );
+        assert_eq!(planned.get(), 1);
+    }
+
+    #[test]
+    fn drop_view_that_does_not_plan_drops_indexes_no_other_view_needs() {
+        let existing = names(&["i1", "i2"]);
+        let dropped = ("v1", &["error"][..]);
+        let others = [("v2", &["i2"][..])];
+        assert_eq!(
+            unneeded_join_key_indexes(&existing, Some(&dropped), &others, needs),
+            names(&["i1"])
+        );
+    }
 }

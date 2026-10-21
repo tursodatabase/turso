@@ -1353,9 +1353,20 @@ fn emit_join_level(
 
     let arrangement_cursor = open_arrangement(program, input);
     match &level.access {
-        LevelAccess::Rowid { .. } | LevelAccess::Index { .. } => {
-            level_ctx.emit_lookups(program, resolver, arrangement_cursor, sink)?;
-        }
+        LevelAccess::Rowid { key } => level_ctx.emit_lookups(
+            program,
+            resolver,
+            KeyLookup::Rowid { key: *key },
+            arrangement_cursor,
+            sink,
+        )?,
+        LevelAccess::Index { index, keys } => level_ctx.emit_lookups(
+            program,
+            resolver,
+            KeyLookup::Index { index, keys },
+            arrangement_cursor,
+            sink,
+        )?,
         LevelAccess::ScanAndProbe => {
             level_ctx.build_partial_index(program)?;
             level_ctx.emit_scan_and_probe(
@@ -1412,6 +1423,18 @@ fn emit_join_level(
     Ok(())
 }
 
+/// How a level that looks its rows up by key finds them: a [`LevelAccess`]
+/// with a rowid or index.
+enum KeyLookup<'a> {
+    Rowid {
+        key: usize,
+    },
+    Index {
+        index: &'a Arc<Index>,
+        keys: &'a [usize],
+    },
+}
+
 /// The state shared by the loops of one level.
 struct LevelEmitter<'a> {
     contract: &'a JoinContract,
@@ -1440,6 +1463,7 @@ impl LevelEmitter<'_> {
         &mut self,
         program: &mut ProgramBuilder,
         resolver: &mut Resolver,
+        lookup: KeyLookup,
         arrangement_cursor: usize,
         sink: &mut JoinRowSink<'_>,
     ) -> Result<()> {
@@ -1452,14 +1476,16 @@ impl LevelEmitter<'_> {
             pc_if_empty: done,
         });
         program.preassign_label_to_next_insn(loop_label);
-        self.emit_read_partial(program, self.partial);
-        let candidate_loop = match &self.level.access {
-            LevelAccess::Rowid { key } => {
-                // A table seek compares the key with the rowid the way `=`
-                // does, so a REAL key such as -9.223372036854776e18 finds
-                // rowid -9223372036854775808. SeekRowid would not: it only
-                // converts REALs that integer affinity converts.
-                let probe_reg = self.bound_key_reg(*key);
+        self.emit_read_partial(program);
+        let candidate_loop = match lookup {
+            KeyLookup::Rowid { key } => {
+                // Position on the first rowid >= the key, the way `=`
+                // compares them, so a REAL key such as -9.223372036854776e18
+                // finds rowid -9223372036854775808; SeekRowid only converts
+                // REALs that integer affinity converts. A key that is not an
+                // integer lands on the next rowid, and the key term checked
+                // at this level rejects that row.
+                let probe_reg = self.bound_key_reg(key);
                 program.emit_insn(Insn::SeekGE {
                     is_index: false,
                     cursor_id: arrangement_cursor,
@@ -1471,7 +1497,7 @@ impl LevelEmitter<'_> {
                 });
                 None
             }
-            LevelAccess::Index { index, keys } => {
+            KeyLookup::Index { index, keys } => {
                 let index_cursor = program.alloc_cursor_id(CursorType::BTreeIndex(index.clone()));
                 program.emit_insn(Insn::OpenRead {
                     cursor_id: index_cursor,
@@ -1519,11 +1545,6 @@ impl LevelEmitter<'_> {
                     target_pc: self.corrupt_label,
                 });
                 Some((candidate_loop, index_cursor))
-            }
-            LevelAccess::ScanAndProbe | LevelAccess::Cross => {
-                return Err(LimboError::InternalError(
-                    "a join level without a rowid or index cannot look rows up".to_string(),
-                ))
             }
         };
         let next_candidate = program.allocate_label();
@@ -1729,7 +1750,7 @@ impl LevelEmitter<'_> {
             src_reg: partial_rowid_reg,
             target_pc: self.corrupt_label,
         });
-        self.emit_read_partial(program, self.partial);
+        self.emit_read_partial(program);
         self.emit_extended_row(
             program,
             resolver,
@@ -1777,7 +1798,7 @@ impl LevelEmitter<'_> {
             pc_if_empty: done,
         });
         program.preassign_label_to_next_insn(partial_loop);
-        self.emit_read_partial(program, self.partial);
+        self.emit_read_partial(program);
         program.emit_insn(Insn::Rewind {
             cursor_id: cursor,
             pc_if_empty: next_partial,
@@ -1820,17 +1841,17 @@ impl LevelEmitter<'_> {
 
     /// Copy the current partial row's images into the start of the extended
     /// row, and its weight aside.
-    fn emit_read_partial(&self, program: &mut ProgramBuilder, partial: usize) {
+    fn emit_read_partial(&self, program: &mut ProgramBuilder) {
         for column in 0..self.layout.width {
             program.emit_insn(Insn::Column {
-                cursor_id: partial,
+                cursor_id: self.partial,
                 column,
                 dest: self.row + column,
                 default: None,
             });
         }
         program.emit_insn(Insn::Column {
-            cursor_id: partial,
+            cursor_id: self.partial,
             column: self.layout.width,
             dest: self.partial_weight_reg,
             default: None,
@@ -2136,7 +2157,7 @@ fn emit_bind_row(
                 .get(&binding.logical_id)
                 .ok_or_else(|| {
                     LimboError::InternalError(
-                        "join binding rowid has no phase-local binding".to_string(),
+                        "a join input table has no table reference in the join program".to_string(),
                     )
                 })?;
             resolver.cache_expr_reg(
