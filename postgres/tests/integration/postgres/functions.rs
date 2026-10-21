@@ -598,3 +598,37 @@ fn test_pg_description_stubs_return_null(db: TempDatabase) {
         assert_eq!(query_text(&conn, sql), ["NULL"], "{sql}");
     }
 }
+
+#[turso_macros::test(mvcc)]
+fn test_pg_stored_types_are_loaded_after_a_checkpoint_when_the_database_opens_again(
+    db: TempDatabase,
+) {
+    let conn = db.connect_postgres();
+    conn.execute("CREATE TYPE mood AS ENUM ('sad', 'ok')")
+        .unwrap();
+    conn.execute("CREATE TABLE feelings (m mood)").unwrap();
+    conn.execute("INSERT INTO feelings VALUES ('ok')").unwrap();
+    conn.inner()
+        .checkpoint(turso_core::CheckpointMode::Truncate {
+            upper_bound_inclusive: None,
+        })
+        .unwrap();
+    let conn = reopen(db, conn);
+    assert_eq!(query_text(&conn, "SELECT m FROM feelings"), vec!["ok"]);
+}
+
+/// Close the database of `db` and open it again from its file.
+fn reopen(db: TempDatabase, conn: PgConnection) -> PgConnection {
+    let path = db.path.clone();
+    let io = db.io.clone();
+    drop(conn);
+    drop(db);
+    let reopened = turso_pg::open_database_with_io(
+        io,
+        path.to_str().unwrap(),
+        turso_core::OpenFlags::default(),
+        turso_core::DatabaseOpts::new().with_custom_types(true),
+    )
+    .unwrap();
+    turso_pg::Connection::connect(&reopened).unwrap()
+}

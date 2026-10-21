@@ -1689,28 +1689,12 @@ impl Database {
                         Err(e) => return Err(e),
                     }
 
-                    // Load custom types from __turso_internal_types if the table
-                    // exists and custom types are enabled. The schema loaded by
-                    // make_from_btree includes the table definition but not its
-                    // contents. We need to read the stored type definitions so
-                    // that DECODE/ENCODE and affinity metadata are available to
-                    // all subsequent connections.
-                    let conn = state
-                        .conn
+                    let db = state
+                        .db
                         .as_ref()
-                        .expect("conn must be initialized in Init phase");
-                    if conn.experimental_custom_types_enabled() {
-                        // Sync the connection's schema from the database so it
-                        // can query __turso_internal_types.
-                        conn.maybe_update_schema();
-                        let type_sqls = conn.query_stored_type_definitions()?;
-                        if !type_sqls.is_empty() {
-                            let db = state
-                                .db
-                                .as_ref()
-                                .expect("db must be initialized in Init phase");
-                            db.with_schema_mut(|schema| schema.load_type_definitions(&type_sqls))?;
-                        }
+                        .expect("db must be initialized in Init phase");
+                    if db.get_mv_store().is_none() {
+                        Self::load_stored_types(state)?;
                     }
 
                     state.phase = OpenDbAsyncPhase::BootstrapMvStore;
@@ -1746,6 +1730,7 @@ impl Database {
                         );
                         // Done — drop the bootstrap connection.
                         state.mvcc_bootstrap_conn = None;
+                        Self::load_stored_types(state)?;
                     }
 
                     state.phase = OpenDbAsyncPhase::Done;
@@ -1762,6 +1747,31 @@ impl Database {
                 }
             }
         }
+    }
+
+    /// Read the stored custom types into the schema. The schema that
+    /// make_from_btree loaded has the table that stores them, but not its
+    /// rows. The types give DECODE, ENCODE and affinity metadata to all later
+    /// connections.
+    fn load_stored_types(state: &OpenDbAsyncState) -> Result<()> {
+        let conn = state
+            .conn
+            .as_ref()
+            .expect("conn must be initialized in Init phase");
+        let db = state
+            .db
+            .as_ref()
+            .expect("db must be initialized in Init phase");
+        if conn.experimental_custom_types_enabled() {
+            // Sync the connection's schema from the database so it can query
+            // __turso_internal_types.
+            conn.maybe_update_schema();
+            let type_sqls = conn.query_stored_type_definitions()?;
+            if !type_sqls.is_empty() {
+                db.with_schema_mut(|schema| schema.load_type_definitions(&type_sqls))?;
+            }
+        }
+        Ok(())
     }
 
     /// Necessary Pager initialization, so that we are prepared to read from Page 1.
