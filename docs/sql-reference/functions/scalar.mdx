@@ -484,6 +484,34 @@ SELECT soundex('Smith');     -- 'S530'
 SELECT soundex('Smythe');    -- 'S530'
 ```
 
+### numeric_encode(VALUE, PRECISION, SCALE) and numeric_decode(BLOB)
+
+The encode and decode functions behind Turso's built-in `numeric` custom type, which stores exact decimal values as blobs. They can also be called directly.
+
+`numeric_encode` parses `VALUE` (an integer, a real, or decimal text) as an exact decimal, rounds it to `SCALE` decimal places, checks it fits in `PRECISION` total digits, and returns the blob representation. `NULL` gives `NULL`. `PRECISION` must be a positive integer and `SCALE` a non-negative integer not exceeding `PRECISION`; otherwise these raise `numeric_encode: precision must be an integer`, `numeric_encode: scale must be an integer`, `numeric precision must be positive, got N`, `numeric scale must be non-negative, got N`, or `numeric scale (S) must not exceed precision (P)`. A value that does not fit the declared digits raises `numeric value out of range: precision P, scale S`. Unparsable input raises `invalid input for type numeric: "..."`.
+
+`numeric_decode` converts the blob back to a plain decimal string. `NULL` gives `NULL`; a non-blob argument raises `numeric_decode: expected blob, got "..."`.
+
+```sql
+SELECT typeof(numeric_encode('123.45', 5, 2));              -- 'blob'
+SELECT numeric_decode(numeric_encode('123.45', 5, 2));      -- '123.45'
+```
+
+### numeric_add, numeric_sub, numeric_mul, numeric_div, numeric_lt, numeric_eq
+
+Exact decimal arithmetic and comparison, the operator functions of the built-in `numeric` type. Each takes two arguments, accepted as integers, reals, decimal text, or numeric blobs; if either argument is `NULL` the result is `NULL`.
+
+`numeric_add`, `numeric_sub`, `numeric_mul`, and `numeric_div` return the result as a decimal string; `numeric_div` raises `division by zero` when the divisor is zero. `numeric_lt` and `numeric_eq` return `1` or `0`; comparison is numeric, so `2.50` equals `2.5`. Arithmetic is exact decimal, not floating point: `0.1 + 0.2` is `0.3`.
+
+```sql
+SELECT numeric_add('0.1', '0.2');    -- '0.3'
+SELECT numeric_sub('1.5', '0.25');   -- '1.25'
+SELECT numeric_mul('1.5', '1.5');    -- '2.25'
+SELECT numeric_div(10, 4);           -- '2.5'
+SELECT numeric_lt('1.99', '2.0');    -- 1
+SELECT numeric_eq('2.50', '2.5');    -- 1
+```
+
 ### zeroblob(N)
 
 Returns a blob consisting of N zero bytes (0x00). Useful for pre-allocating blob storage.
