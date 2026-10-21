@@ -492,6 +492,30 @@ expect {
     1|integer|7
 }
 
+@cross-check-integrity
+test alter-table-add-column-check-existing-columns {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, x INT, c INT);
+    INSERT INTO t VALUES(1, 10, 5);
+    INSERT INTO t VALUES(2, 10, 6);
+    ALTER TABLE t ADD COLUMN d INT DEFAULT 0 CHECK(x = 10 AND d = 0 AND rowid > 0);
+    SELECT id, x, c, d FROM t ORDER BY id;
+}
+expect {
+    1|10|5|0
+    2|10|6|0
+}
+
+@cross-check-integrity
+test alter-table-add-column-check-validates-all-existing-rows {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, x INT);
+    INSERT INTO t VALUES(1, 10);
+    INSERT INTO t VALUES(2, 20);
+    ALTER TABLE t ADD COLUMN d INT DEFAULT 0 CHECK(x = 10);
+}
+expect error {
+    CHECK constraint failed: x = 10
+}
+
 # https://github.com/tursodatabase/turso/issues/4987
 @cross-check-integrity
 test alter-table-add-column-trailing-named-constraint {
