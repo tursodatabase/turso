@@ -68,6 +68,8 @@ scalar_functions! {
     PgGetExpr(FunctionArity::OneOf(&[2, 3]), true),
     ToChar(FunctionArity::Exact(2), true),
     PgInputIsValid(FunctionArity::Exact(2), true),
+    Textlike(FunctionArity::Exact(2), true),
+    LikeEscape(FunctionArity::Exact(2), true),
     Booleq(FunctionArity::Exact(2), true),
     Boolne(FunctionArity::Exact(2), true),
     ColDescription(FunctionArity::Exact(2), true),
@@ -116,6 +118,8 @@ impl ScalarCall for PgScalarFunction {
             Self::PgGetExpr => exec_pg_get_expr(args)?,
             Self::ToChar => exec_to_char(args[0].get_value(), &text_arg(args, 1)),
             Self::PgInputIsValid => exec_pg_input_is_valid(args[0].get_value(), &text_arg(args, 1)),
+            Self::Textlike => exec_textlike(args)?,
+            Self::LikeEscape => exec_like_escape(args)?,
             Self::Booleq => Value::from_i64((args[0].get_value() == args[1].get_value()) as i64),
             Self::Boolne => Value::from_i64((args[0].get_value() != args[1].get_value()) as i64),
             Self::SetConfig => exec_set_config(connection, args)?,
@@ -457,6 +461,100 @@ fn exec_quote_literal(value: &Value) -> Value {
         format!("'{}'", text.replace('\'', "''"))
     };
     Value::build_text(quoted)
+}
+
+fn exec_textlike(args: &[Register]) -> Result<Value> {
+    if args
+        .iter()
+        .any(|arg| matches!(arg.get_value(), Value::Null))
+    {
+        return Ok(Value::Null);
+    }
+    let text: Vec<char> = args[0].get_value().to_string().chars().collect();
+    let pattern: Vec<char> = args[1].get_value().to_string().chars().collect();
+    Ok(Value::from_i64(like_matches(&text, &pattern)? as i64))
+}
+
+/// PostgreSQL's LIKE: case-sensitive, `%` and `_` wildcards, and `\` makes the
+/// next pattern character literal. On a mismatch, the last `%` absorbs one more
+/// text character and matching resumes after it.
+fn like_matches(text: &[char], pattern: &[char]) -> Result<bool> {
+    let (mut p, mut t) = (0, 0);
+    let mut backtrack: Option<(usize, usize)> = None;
+    while t < text.len() {
+        let step = match pattern.get(p) {
+            Some('%') => {
+                backtrack = Some((p, t));
+                p += 1;
+                continue;
+            }
+            Some('_') => Some(1),
+            Some('\\') => match pattern.get(p + 1) {
+                Some(&c) => (c == text[t]).then_some(2),
+                None => {
+                    return Err(LimboError::InvalidArgument(
+                        "LIKE pattern must not end with escape character".to_string(),
+                    ));
+                }
+            },
+            Some(&c) => (c == text[t]).then_some(1),
+            None => None,
+        };
+        match (step, backtrack) {
+            (Some(step), _) => {
+                p += step;
+                t += 1;
+            }
+            (None, Some((percent_p, percent_t))) => {
+                p = percent_p + 1;
+                t = percent_t + 1;
+                backtrack = Some((percent_p, t));
+            }
+            (None, None) => return Ok(false),
+        }
+    }
+    Ok(pattern[p..].iter().all(|&c| c == '%'))
+}
+
+/// Rewrites a `LIKE ... ESCAPE` pattern to use `\` as the escape character,
+/// as PostgreSQL's like_escape() does.
+fn exec_like_escape(args: &[Register]) -> Result<Value> {
+    if args
+        .iter()
+        .any(|arg| matches!(arg.get_value(), Value::Null))
+    {
+        return Ok(Value::Null);
+    }
+    let pattern = args[0].get_value().to_string();
+    let escape = args[1].get_value().to_string();
+    let mut escape_chars = escape.chars();
+    let result = match (escape_chars.next(), escape_chars.next()) {
+        (None, _) => pattern.replace('\\', "\\\\"),
+        (Some('\\'), None) => pattern,
+        (Some(escape), None) => {
+            let mut result = String::with_capacity(pattern.len());
+            let mut after_escape = false;
+            for c in pattern.chars() {
+                if c == escape && !after_escape {
+                    result.push('\\');
+                    after_escape = true;
+                    continue;
+                }
+                if c == '\\' && !after_escape {
+                    result.push('\\');
+                }
+                result.push(c);
+                after_escape = false;
+            }
+            result
+        }
+        _ => {
+            return Err(LimboError::InvalidArgument(
+                "invalid escape string: Escape string must be empty or one character.".to_string(),
+            ));
+        }
+    };
+    Ok(Value::build_text(result))
 }
 
 fn exec_pg_encoding_to_char(encoding: i64) -> Value {
