@@ -207,3 +207,63 @@ expect {
     none
     public
 }
+
+test sequence-functions-follow-search-path {
+    CREATE SCHEMA IF NOT EXISTS sp_sq;
+    DROP SEQUENCE IF EXISTS sp_sq.s;
+    CREATE SEQUENCE sp_sq.s START 10;
+    SET search_path TO sp_sq, public;
+    SELECT nextval('s');
+    SELECT currval('s');
+    SELECT setval('s', 20);
+    SELECT nextval('s');
+    DROP SEQUENCE s;
+    CREATE SEQUENCE sp_sq.s START 30;
+    SELECT nextval('s');
+}
+expect {
+    10
+    10
+    20
+    21
+    30
+}
+
+test sequence-first-schema-in-search-path-wins {
+    CREATE SCHEMA IF NOT EXISTS sp_sq2;
+    DROP SEQUENCE IF EXISTS sp_sq2.s;
+    CREATE SEQUENCE sp_sq2.s START 100;
+    CREATE SEQUENCE s START 1;
+    SET search_path TO sp_sq2, public;
+    SELECT nextval('s');
+    SET search_path TO public, sp_sq2;
+    SELECT nextval('s');
+    SET search_path TO sp_missing_sq, public;
+    SELECT nextval('s');
+}
+expect {
+    100
+    1
+    2
+}
+
+test drop-sequence-if-exists-under-search-path {
+    SET search_path TO sp_missing_sq;
+    DROP SEQUENCE IF EXISTS nope;
+    SELECT 1;
+}
+expect {
+    1
+}
+
+test serial-sequence-reachable-under-search-path {
+    CREATE SCHEMA IF NOT EXISTS sp_sq3;
+    DROP TABLE IF EXISTS sp_sq3.t;
+    SET search_path TO sp_sq3;
+    CREATE TABLE t (id serial, x int);
+    INSERT INTO t (x) VALUES (1);
+    SELECT currval('t_id_seq');
+}
+expect {
+    1
+}
