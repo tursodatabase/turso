@@ -23,7 +23,7 @@ pub struct TranslateResult {
 /// Translates a PostgreSQL query into Turso's AST
 #[derive(Default)]
 pub struct PostgreSQLTranslator {
-    // TODO: Add schema information, type mappings, etc.
+    translating_index: std::cell::Cell<bool>,
 }
 
 impl PostgreSQLTranslator {
@@ -904,8 +904,6 @@ impl PostgreSQLTranslator {
         &self,
         idx: &pg_query::protobuf::IndexStmt,
     ) -> Result<ast::Stmt, ParseError> {
-        use pg_query::protobuf::node::Node;
-
         let relation = idx
             .relation
             .as_ref()
@@ -913,6 +911,29 @@ impl PostgreSQLTranslator {
         let tbl_name = ast::Name::from_string(self.map_table_name(&relation.relname));
 
         let idx_name = ast::QualifiedName::single(ast::Name::from_string(&idx.idxname));
+
+        self.translating_index.set(true);
+        let index_parts = self.translate_index_parts(idx);
+        self.translating_index.set(false);
+        let (columns, where_clause) = index_parts?;
+
+        Ok(ast::Stmt::CreateIndex {
+            unique: idx.unique,
+            if_not_exists: idx.if_not_exists,
+            idx_name,
+            tbl_name,
+            using: None,
+            columns,
+            with_clause: vec![],
+            where_clause,
+        })
+    }
+
+    fn translate_index_parts(
+        &self,
+        idx: &pg_query::protobuf::IndexStmt,
+    ) -> Result<(Vec<ast::SortedColumn>, Option<Box<ast::Expr>>), ParseError> {
+        use pg_query::protobuf::node::Node;
 
         let mut columns = Vec::new();
         for param_node in &idx.index_params {
@@ -952,16 +973,7 @@ impl PostgreSQLTranslator {
             None
         };
 
-        Ok(ast::Stmt::CreateIndex {
-            unique: idx.unique,
-            if_not_exists: idx.if_not_exists,
-            idx_name,
-            tbl_name,
-            using: None,
-            columns,
-            with_clause: vec![],
-            where_clause,
-        })
+        Ok((columns, where_clause))
     }
 
     fn translate_drop(&self, drop: &pg_query::protobuf::DropStmt) -> Result<ast::Stmt, ParseError> {
@@ -2876,14 +2888,7 @@ impl PostgreSQLTranslator {
                 // IN operator
                 self.translate_in_expr(a_expr)
             }
-            AExprKind::AexprLike => {
-                // LIKE/NOT LIKE operator
-                self.translate_like_expr(a_expr)
-            }
-            AExprKind::AexprIlike => {
-                // ILIKE/NOT ILIKE → LOWER(lhs) LIKE LOWER(rhs)
-                self.translate_ilike_expr(a_expr)
-            }
+            AExprKind::AexprLike | AExprKind::AexprIlike => self.translate_like_expr(a_expr),
             AExprKind::AexprOpAny => self.translate_any_all_expr(a_expr, false),
             AExprKind::AexprOpAll => self.translate_any_all_expr(a_expr, true),
             AExprKind::AexprBetween | AExprKind::AexprBetweenSym => {
@@ -3059,6 +3064,18 @@ impl PostgreSQLTranslator {
             ));
         };
 
+        let right = if matches!(op_name, "~*" | "!~*") {
+            Box::new(ast::Expr::Binary(
+                Box::new(ast::Expr::Literal(ast::Literal::String(
+                    "'(?i)'".to_string(),
+                ))),
+                ast::Operator::Concat,
+                right,
+            ))
+        } else {
+            right
+        };
+
         // Handle regex operators (~, !~) which map to REGEXP expressions
         match op_name {
             "~" => {
@@ -3079,8 +3096,6 @@ impl PostgreSQLTranslator {
                     escape: None,
                 });
             }
-            // Case-insensitive regex (~*, !~*) — treat same as case-sensitive
-            // since SQLite REGEXP is case-insensitive by default
             "~*" => {
                 return Ok(ast::Expr::Like {
                     lhs: left,
@@ -3278,64 +3293,6 @@ impl PostgreSQLTranslator {
         &self,
         a_expr: &pg_query::protobuf::AExpr,
     ) -> Result<ast::Expr, ParseError> {
-        // Get the operator name to determine if it's LIKE or NOT LIKE
-        let op_name = if let Some(name) = a_expr.name.first() {
-            match &name.node {
-                Some(pg_query::protobuf::node::Node::String(s)) => &s.sval,
-                _ => {
-                    return Err(ParseError::ParseError(
-                        "Invalid LIKE operator name".to_string(),
-                    ));
-                }
-            }
-        } else {
-            return Err(ParseError::ParseError(
-                "Missing LIKE operator name".to_string(),
-            ));
-        };
-
-        // Determine if it's NOT LIKE
-        let not = match op_name.as_str() {
-            "~~" => false, // LIKE
-            "!~~" => true, // NOT LIKE
-            _ => {
-                return Err(ParseError::ParseError(format!(
-                    "Unsupported LIKE operator: {op_name}"
-                )));
-            }
-        };
-
-        // Get left and right expressions
-        let lhs = if let Some(lexpr) = &a_expr.lexpr {
-            Box::new(self.translate_operand(lexpr)?)
-        } else {
-            return Err(ParseError::ParseError(
-                "Missing left expression for LIKE operator".to_string(),
-            ));
-        };
-
-        let rhs = if let Some(rexpr) = &a_expr.rexpr {
-            Box::new(self.translate_operand(rexpr)?)
-        } else {
-            return Err(ParseError::ParseError(
-                "Missing right expression for LIKE operator".to_string(),
-            ));
-        };
-
-        Ok(ast::Expr::Like {
-            lhs,
-            not,
-            op: ast::LikeOperator::Like,
-            rhs,
-            escape: None,
-        })
-    }
-
-    fn translate_ilike_expr(
-        &self,
-        a_expr: &pg_query::protobuf::AExpr,
-    ) -> Result<ast::Expr, ParseError> {
-        // Get operator name: ~~* = ILIKE, !~~* = NOT ILIKE
         let op_name = a_expr
             .name
             .first()
@@ -3343,65 +3300,75 @@ impl PostgreSQLTranslator {
                 Some(pg_query::protobuf::node::Node::String(s)) => Some(s.sval.as_str()),
                 _ => None,
             })
-            .ok_or_else(|| ParseError::ParseError("Missing ILIKE operator name".to_string()))?;
+            .ok_or_else(|| ParseError::ParseError("Missing LIKE operator name".to_string()))?;
 
-        let not = match op_name {
-            "~~*" => false, // ILIKE
-            "!~~*" => true, // NOT ILIKE
+        let (not, ignore_case) = match op_name {
+            "~~" => (false, false),
+            "!~~" => (true, false),
+            "~~*" => (false, true),
+            "!~~*" => (true, true),
             _ => {
                 return Err(ParseError::ParseError(format!(
-                    "Unsupported ILIKE operator: {op_name}"
+                    "Unsupported LIKE operator: {op_name}"
                 )));
             }
         };
 
-        let lhs = if let Some(lexpr) = &a_expr.lexpr {
-            self.translate_expr(lexpr)?
-        } else {
+        let Some(lexpr) = &a_expr.lexpr else {
             return Err(ParseError::ParseError(
-                "Missing left expression for ILIKE".to_string(),
+                "Missing left expression for LIKE operator".to_string(),
             ));
         };
-
-        let rhs = if let Some(rexpr) = &a_expr.rexpr {
-            self.translate_expr(rexpr)?
-        } else {
+        let Some(rexpr) = &a_expr.rexpr else {
             return Err(ParseError::ParseError(
-                "Missing right expression for ILIKE".to_string(),
+                "Missing right expression for LIKE operator".to_string(),
             ));
         };
-
-        // Wrap both sides in LOWER() to make case-insensitive
-        let lower_lhs = ast::Expr::FunctionCall {
-            name: ast::Name::from_string("lower"),
-            distinctness: None,
-            args: vec![Box::new(lhs)],
-            order_by: vec![],
-            within_group: vec![],
-            filter_over: ast::FunctionTail {
-                filter_clause: None,
-                over_clause: None,
-            },
+        let fold_case = |expr: ast::Expr| {
+            if ignore_case {
+                function_call("lower", vec![expr])
+            } else {
+                expr
+            }
         };
+        let lhs = fold_case(self.translate_operand(lexpr)?);
 
-        let lower_rhs = ast::Expr::FunctionCall {
-            name: ast::Name::from_string("lower"),
-            distinctness: None,
-            args: vec![Box::new(rhs)],
-            order_by: vec![],
-            within_group: vec![],
-            filter_over: ast::FunctionTail {
-                filter_clause: None,
-                over_clause: None,
-            },
-        };
+        // A literal pattern becomes GLOB, a core operator that also works in
+        // index expressions, where frontend functions such as textlike() cannot.
+        if let Some(pg_query::protobuf::node::Node::AConst(pg_query::protobuf::AConst {
+            val: Some(pg_query::protobuf::a_const::Val::Sval(pattern)),
+            ..
+        })) = &rexpr.node
+        {
+            if let Some(glob) = like_pattern_to_glob(&pattern.sval) {
+                return Ok(ast::Expr::Like {
+                    lhs: Box::new(lhs),
+                    not,
+                    op: ast::LikeOperator::Glob,
+                    rhs: Box::new(fold_case(ast::Expr::Literal(ast::Literal::String(
+                        format!("'{}'", glob.replace('\'', "''")),
+                    )))),
+                    escape: None,
+                });
+            }
+        }
 
-        Ok(ast::Expr::Like {
-            lhs: Box::new(lower_lhs),
-            not,
-            op: ast::LikeOperator::Like,
-            rhs: Box::new(lower_rhs),
-            escape: None,
+        if self.translating_index.get() {
+            return Err(ParseError::ParseError(
+                "CREATE INDEX supports LIKE and ILIKE only with a string-literal pattern that does not use ESCAPE or end with the escape character".to_string(),
+            ));
+        }
+
+        // SQLite's LIKE ignores case and has no default escape character, so
+        // other PostgreSQL LIKE patterns run through the frontend's textlike() function.
+        let call = function_call(
+            "textlike",
+            vec![lhs, fold_case(self.translate_operand(rexpr)?)],
+        );
+        Ok(if not {
+            ast::Expr::Unary(ast::UnaryOperator::Not, Box::new(call))
+        } else {
+            call
         })
     }
 
@@ -5599,6 +5566,57 @@ fn deparse_default_expr(node: &pg_query::protobuf::Node) -> Option<String> {
     }
 }
 
+fn function_call(name: &str, args: Vec<ast::Expr>) -> ast::Expr {
+    ast::Expr::FunctionCall {
+        name: ast::Name::from_string(name),
+        distinctness: None,
+        args: args.into_iter().map(Box::new).collect(),
+        order_by: vec![],
+        within_group: vec![],
+        filter_over: ast::FunctionTail {
+            filter_clause: None,
+            over_clause: None,
+        },
+    }
+}
+
+/// SQLite's default SQLITE_MAX_LIKE_PATTERN_LENGTH, which core enforces on
+/// GLOB patterns.
+const SQLITE_MAX_LIKE_PATTERN_LENGTH: usize = 50000;
+
+/// PostgreSQL's LIKE is case-sensitive like GLOB. `%` and `_` become `*` and
+/// `?`, and a character escaped with `\` or special to GLOB is matched literally.
+/// Returns None when GLOB cannot express the pattern: it ends with the escape
+/// character, which is an error only once matching reaches it, or it grows past
+/// SQLite's pattern length limit because each literal `*`, `?` and `[` takes
+/// three bytes in GLOB.
+fn like_pattern_to_glob(pattern: &str) -> Option<String> {
+    let mut glob = String::with_capacity(pattern.len());
+    let mut chars = pattern.chars();
+    while let Some(c) = chars.next() {
+        let literal = match c {
+            '%' => {
+                glob.push('*');
+                continue;
+            }
+            '_' => {
+                glob.push('?');
+                continue;
+            }
+            '\\' => chars.next()?,
+            c => c,
+        };
+        if matches!(literal, '*' | '?' | '[') {
+            glob.push('[');
+            glob.push(literal);
+            glob.push(']');
+        } else {
+            glob.push(literal);
+        }
+    }
+    (glob.len() <= SQLITE_MAX_LIKE_PATTERN_LENGTH).then_some(glob)
+}
+
 /// Convert a SQL SIMILAR TO pattern to a POSIX regex anchored with ^...$
 /// `%` → `.*`, `_` → `.`, other regex metacharacters are kept as-is since
 /// SIMILAR TO patterns are already regex-like in SQL standard.
@@ -6251,92 +6269,59 @@ mod tests {
 
     #[test]
     fn test_like_translation() {
-        let translator = PostgreSQLTranslator::new();
-        let sql = "SELECT * FROM users WHERE name LIKE 'John%'";
-        let parse_result = crate::parse(sql).unwrap();
-        let translated = translator.translate(&parse_result);
-        assert!(translated.is_ok());
-
-        if let Ok(ast::Stmt::Select(select)) = translated {
-            if let ast::OneSelect::Select { where_clause, .. } = &select.body.select {
-                assert!(where_clause.is_some());
-                if let Some(where_expr) = where_clause {
-                    // Should be a Like expression
-                    if let ast::Expr::Like {
-                        lhs,
-                        not,
-                        op,
-                        rhs,
-                        escape,
-                    } = &**where_expr
-                    {
-                        assert!(!not, "Should not be NOT LIKE");
-                        assert!(
-                            matches!(op, ast::LikeOperator::Like),
-                            "Should be LIKE operator"
-                        );
-                        assert!(escape.is_none(), "No ESCAPE clause expected");
-
-                        // Check left and right expressions
-                        assert!(
-                            matches!(**lhs, ast::Expr::Id(_)),
-                            "Left side should be column name"
-                        );
-                        assert!(
-                            matches!(**rhs, ast::Expr::Literal(_)),
-                            "Right side should be literal"
-                        );
-                    } else {
-                        panic!("Expected Like expression but got: {where_expr:?}");
-                    }
-                }
-            }
-        }
+        let where_expr = where_clause_of("SELECT * FROM users WHERE name LIKE 'John%'");
+        let ast::Expr::Like {
+            lhs,
+            not: false,
+            op: ast::LikeOperator::Glob,
+            rhs,
+            escape: None,
+        } = &where_expr
+        else {
+            panic!("Expected GLOB expression but got: {where_expr:?}");
+        };
+        assert!(matches!(**lhs, ast::Expr::Id(_)));
+        assert!(matches!(&**rhs, ast::Expr::Literal(ast::Literal::String(p)) if p == "'John*'"));
     }
 
     #[test]
     fn test_not_like_translation() {
-        let translator = PostgreSQLTranslator::new();
-        let sql = "SELECT * FROM users WHERE name NOT LIKE 'sqlite_%'";
-        let parse_result = crate::parse(sql).unwrap();
-        let translated = translator.translate(&parse_result);
-        assert!(translated.is_ok());
+        let where_expr = where_clause_of("SELECT * FROM users WHERE name NOT LIKE 'sqlite\\_%'");
+        let ast::Expr::Like {
+            not: true,
+            op: ast::LikeOperator::Glob,
+            rhs,
+            ..
+        } = &where_expr
+        else {
+            panic!("Expected NOT GLOB expression but got: {where_expr:?}");
+        };
+        assert!(matches!(&**rhs, ast::Expr::Literal(ast::Literal::String(p)) if p == "'sqlite_*'"));
+    }
 
-        if let Ok(ast::Stmt::Select(select)) = translated {
-            if let ast::OneSelect::Select { where_clause, .. } = &select.body.select {
-                assert!(where_clause.is_some());
-                if let Some(where_expr) = where_clause {
-                    // Should be a Like expression with NOT
-                    if let ast::Expr::Like {
-                        lhs,
-                        not,
-                        op,
-                        rhs,
-                        escape,
-                    } = &**where_expr
-                    {
-                        assert!(*not, "Should be NOT LIKE");
-                        assert!(
-                            matches!(op, ast::LikeOperator::Like),
-                            "Should be LIKE operator"
-                        );
-                        assert!(escape.is_none(), "No ESCAPE clause expected");
+    #[test]
+    fn test_like_with_column_pattern_translation() {
+        let where_expr = where_clause_of("SELECT * FROM users WHERE name NOT LIKE pattern");
+        let ast::Expr::Unary(ast::UnaryOperator::Not, inner) = &where_expr else {
+            panic!("Expected NOT textlike() but got: {where_expr:?}");
+        };
+        assert!(
+            matches!(&**inner, ast::Expr::FunctionCall { name, .. } if name.as_str() == "textlike"),
+            "Expected textlike() call but got: {inner:?}"
+        );
+    }
 
-                        // Check expressions
-                        assert!(
-                            matches!(**lhs, ast::Expr::Id(_)),
-                            "Left side should be column name"
-                        );
-                        assert!(
-                            matches!(**rhs, ast::Expr::Literal(_)),
-                            "Right side should be literal"
-                        );
-                    } else {
-                        panic!("Expected Like expression but got: {where_expr:?}");
-                    }
-                }
-            }
-        }
+    #[test]
+    fn test_like_pattern_too_long_for_glob_uses_textlike() {
+        let sql = format!(
+            "SELECT * FROM users WHERE name LIKE '{}'",
+            "*".repeat(16667)
+        );
+        let where_expr = where_clause_of(&sql);
+        assert!(
+            matches!(&where_expr, ast::Expr::FunctionCall { name, .. } if name.as_str() == "textlike"),
+            "Expected textlike() call but got: {where_expr:?}"
+        );
     }
 
     #[test]
