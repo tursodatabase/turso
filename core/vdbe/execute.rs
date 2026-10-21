@@ -14144,6 +14144,45 @@ pub fn op_must_be_int(
     Ok(InsnFunctionStepResult::Step)
 }
 
+pub fn op_get_subtype(
+    _program: &Program,
+    state: &mut ProgramState,
+    insn: &Insn,
+    _pager: &Arc<Pager>,
+) -> InsnResult {
+    load_insn!(GetSubtype { src_reg, dest_reg }, insn);
+    let subtype = state.registers[*src_reg].get_value().exec_subtype();
+    state.registers[*dest_reg] = Register::Value(subtype);
+    state.pc += 1;
+    Ok(InsnFunctionStepResult::Step)
+}
+
+pub fn op_set_subtype(
+    _program: &Program,
+    state: &mut ProgramState,
+    insn: &Insn,
+    _pager: &Arc<Pager>,
+) -> InsnResult {
+    load_insn!(
+        SetSubtype {
+            subtype_reg,
+            dest_reg
+        },
+        insn
+    );
+    let subtype = state.registers[*subtype_reg]
+        .get_value()
+        .as_int()
+        .ok_or_else(|| LimboError::InternalError("stored subtype must be an integer".into()))?;
+    let subtype = crate::types::TextSubtype::try_from(subtype)
+        .map_err(|value| LimboError::InternalError(format!("unknown stored subtype: {value}")))?;
+    if let Register::Value(Value::Text(text)) = &mut state.registers[*dest_reg] {
+        text.subtype = subtype;
+    }
+    state.pc += 1;
+    Ok(InsnFunctionStepResult::Step)
+}
+
 pub fn op_soft_null(
     _program: &Program,
     state: &mut ProgramState,

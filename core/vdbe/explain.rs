@@ -1737,6 +1737,14 @@ pub fn insn_to_row(
                 0,
                 "".to_string(),
             ),
+            Insn::GetSubtype { src_reg, dest_reg } => (
+                "GetSubtype", *src_reg as i64, *dest_reg as i64, 0,
+                Value::build_text(""), 0, "".to_string(),
+            ),
+            Insn::SetSubtype { subtype_reg, dest_reg } => (
+                "SetSubtype", *subtype_reg as i64, *dest_reg as i64, 0,
+                Value::build_text(""), 0, "".to_string(),
+            ),
             Insn::SoftNull { reg } => (
                 "SoftNull",
                 *reg as i64,
