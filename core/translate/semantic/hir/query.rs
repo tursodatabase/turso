@@ -85,6 +85,7 @@ impl QueryBlock {
 }
 
 #[derive(Clone, Debug)]
+#[allow(clippy::large_enum_variant)]
 pub enum QueryBlockBody {
     Select {
         distinctness: Option<Distinctness>,
@@ -225,6 +226,7 @@ pub enum JoinKind {
 }
 
 #[derive(Clone, Debug)]
+#[allow(clippy::large_enum_variant)]
 pub enum JoinConstraint {
     None,
     On(Expr),
@@ -258,7 +260,6 @@ pub enum MergedColumnValue {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SourceOwner {
     QueryBlock(QueryBlockId),
-    Cte(CteId),
     Root,
 }
 
@@ -280,6 +281,7 @@ pub struct CheckConstraint {
 /// statement does not need. Every required expression must be `Planned`
 /// before the HIR document is finished.
 #[derive(Clone, Debug)]
+#[allow(clippy::large_enum_variant)]
 pub enum ColumnReadExpression {
     Absent,
     NotRequired,
@@ -419,6 +421,7 @@ pub struct CteColumn {
 }
 
 #[derive(Clone, Debug)]
+#[allow(clippy::large_enum_variant)]
 pub enum CteBody {
     Query(QueryId),
     Recursive(RecursiveCte),

@@ -206,6 +206,7 @@ pub fn emit_sequence_backing_table(
 /// The seq descriptor's `start/inc/min/max/cycle` are baked into the
 /// bytecode as `Insn::Integer` literals — they are immutable schema and
 /// reading them back from the row would be wasteful.
+#[allow(clippy::too_many_arguments)]
 pub fn emit_disk_read_nextval(
     program: &mut ProgramBuilder,
     database_id: usize,

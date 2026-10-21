@@ -675,6 +675,7 @@ fn hir_is_null_constraint_for_term(
     }))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn hir_estimate_constraint_selectivity(
     schema: &Schema,
     table: &HirPlannedSource,
@@ -975,8 +976,7 @@ pub(crate) fn hir_binary_constraints_for_source(
     let source_id = constraint_source.source();
     let source = document.source(source_id).ok_or_else(|| {
         crate::LimboError::InternalError(format!(
-            "missing HIR source {} for constraint planning",
-            source_id
+            "missing HIR source {source_id} for constraint planning"
         ))
     })?;
     let mut constraints = Vec::new();
@@ -2398,19 +2398,6 @@ impl RangeConstraintRef {
             self.lower_bound.map(&mut get),
             self.upper_bound.map(get),
         )
-    }
-
-    /// Convert the [RangeConstraintRef] to a [SeekRangeConstraint] usable in a [crate::translate::plan::SeekDef::key].
-    pub fn as_seek_range_constraint(
-        &self,
-        constraints: &[Constraint],
-        where_clause: &[WhereTerm],
-        referenced_tables: Option<&TableReferences>,
-        resolver: Option<&Resolver>,
-    ) -> SeekRangeConstraint {
-        self.map_seek_range(|position| {
-            constraints[position].get_constraining_expr(where_clause, referenced_tables, resolver)
-        })
     }
 
     pub(crate) fn as_hir_seek_range_constraint(

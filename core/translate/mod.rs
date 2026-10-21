@@ -12,18 +12,13 @@ pub(crate) mod alter;
 pub(crate) mod analyze;
 pub(crate) mod attach;
 pub(crate) mod collate;
-mod compound_select;
-pub(crate) mod delete;
 pub(crate) mod display;
 pub(crate) mod emitter;
 pub mod eqp;
 pub(crate) mod expr;
 pub(crate) mod expression_index;
-pub(crate) mod fkeys;
-pub(crate) mod group_by;
 pub(crate) mod hir_index_method;
 pub(crate) mod index;
-pub(crate) mod insert;
 pub(crate) mod integrity_check;
 pub(crate) mod logical;
 pub(crate) mod main_loop;
@@ -36,21 +31,15 @@ pub(crate) mod recursive_cte;
 pub(crate) mod result_row;
 pub(crate) mod rollback;
 pub(crate) mod schema;
-pub(crate) mod select;
 pub(crate) mod semantic;
 pub(crate) mod semantic_lowering;
 pub(crate) mod semantic_to_plan;
 pub(crate) mod semantic_unnest;
 pub(crate) mod sequence;
-pub(crate) mod stmt_journal;
-pub(crate) mod subquery;
 pub(crate) mod transaction;
 pub(crate) mod trigger;
-pub(crate) mod trigger_exec;
 pub(crate) mod update;
-pub(crate) mod upsert;
 pub(crate) mod vacuum;
-mod values;
 pub(crate) mod view;
 mod window;
 
@@ -58,7 +47,6 @@ use crate::connection::PrepareOptions;
 use crate::schema::Schema;
 use crate::storage::pager::Pager;
 use crate::sync::Arc;
-use crate::translate::delete::translate_delete;
 use crate::translate::emitter::Resolver;
 use crate::vdbe::builder::{ProgramBuilder, ProgramBuilderOpts, QueryMode};
 use crate::vdbe::Program;
@@ -66,14 +54,15 @@ use crate::{bail_parse_error, Connection, Result, SymbolTable};
 use alter::translate_alter_table;
 use analyze::translate_analyze;
 use index::{translate_create_index, translate_drop_index, translate_optimize, translate_reindex};
-use insert::translate_insert;
 use rollback::{translate_release, translate_rollback, translate_savepoint};
 use schema::{translate_create_table, translate_create_virtual_table, translate_drop_table};
-use select::translate_select;
 use tracing::{instrument, Level};
 use transaction::{translate_tx_begin, translate_tx_commit};
 use turso_parser::ast;
-use update::translate_update;
+
+/// What a statement is analyzed and lowered with: the schema it was
+/// prepared against and the HIR settings of its connection.
+pub(crate) type HirContext<'a> = (&'a Arc<Schema>, &'a semantic_lowering::HirSettings<'a>);
 
 #[instrument(skip_all, level = Level::DEBUG)]
 #[allow(clippy::too_many_arguments)]
@@ -140,12 +129,10 @@ pub fn translate(
         &prepare_options.unqualified_database_search_path,
     );
 
+    let hir = (schema, &hir_settings);
     match stmt {
         // There can be no nesting with pragma, so lift it up here
         ast::Stmt::Pragma { name, body } => {
-            let hir = connection
-                .experimental_hir_enabled()
-                .then_some((schema, &hir_settings));
             pragma::translate_pragma(
                 &resolver,
                 &name,
@@ -156,23 +143,7 @@ pub fn translate(
                 hir,
             )?;
         }
-        stmt @ ast::Stmt::Select(_) if connection.experimental_hir_enabled() => {
-            semantic_lowering::translate_select(
-                &stmt,
-                schema,
-                &hir_settings,
-                &mut program,
-                &connection,
-            )?
-        }
-        stmt => {
-            // DML that HIR lowers today goes through it; everything else,
-            // and DML it does not lower yet, stays on legacy.
-            let hir = connection
-                .experimental_hir_enabled()
-                .then_some((schema, &hir_settings));
-            translate_statement(stmt, &mut resolver, &mut program, &connection, input, hir)?
-        }
+        stmt => translate_statement(stmt, &mut resolver, &mut program, &connection, input, hir)?,
     };
 
     program.epilogue(schema);
@@ -180,21 +151,9 @@ pub fn translate(
     program.build(connection, change_cnt_on, input)
 }
 
-// TODO: for now leaving the return value as a Program. But ideally to support nested parsing of arbitraty
-// statements, we would have to return a program builder instead
-/// Translate SQL statement into bytecode program.
-pub fn translate_inner(
-    stmt: ast::Stmt,
-    resolver: &mut Resolver,
-    program: &mut ProgramBuilder,
-    connection: &Arc<Connection>,
-    input: &str,
-) -> Result<()> {
-    translate_statement(stmt, resolver, program, connection, input, None)
-}
-
-/// Translate one statement. With `hir`, a statement that HIR can lower goes
-/// through semantic HIR instead of legacy.
+/// Translate one statement. SELECT, DELETE, UPDATE and INSERT go through
+/// semantic HIR; the other statements have their own translation, with the
+/// queries inside them planned through HIR.
 #[turso_macros::trace_stack(detail = stmt_kind(&stmt))]
 fn translate_statement(
     stmt: ast::Stmt,
@@ -202,7 +161,7 @@ fn translate_statement(
     program: &mut ProgramBuilder,
     connection: &Arc<Connection>,
     input: &str,
-    hir: Option<(&Arc<Schema>, &semantic_lowering::HirSettings<'_>)>,
+    hir: HirContext<'_>,
 ) -> Result<()> {
     let is_write = matches!(
         stmt,
@@ -261,34 +220,35 @@ fn translate_statement(
         None
     };
 
-    let lowered_by_hir = match (hir, &stmt) {
-        (Some((schema, settings)), ast::Stmt::Delete { where_clause, .. }) => {
-            if where_clause.is_none() && connection.get_dml_require_where() {
-                bail_parse_error!(
-                    "DELETE without a WHERE clause is not allowed when require_where (or i_am_a_dummy) is enabled"
-                );
-            }
-            semantic_lowering::translate_delete(&stmt, schema, settings, program, connection)?;
-            true
+    let (schema, settings) = hir;
+    match stmt {
+        ast::Stmt::Select(_) => {
+            semantic_lowering::translate_select(&stmt, schema, settings, program, connection)?
         }
-        (Some((schema, settings)), ast::Stmt::Update(update)) => {
+        ast::Stmt::Delete { .. } => {
+            if let ast::Stmt::Delete {
+                where_clause: None, ..
+            } = &stmt
+            {
+                if connection.get_dml_require_where() {
+                    bail_parse_error!(
+                        "DELETE without a WHERE clause is not allowed when require_where (or i_am_a_dummy) is enabled"
+                    );
+                }
+            }
+            semantic_lowering::translate_delete(&stmt, schema, settings, program, connection)?
+        }
+        ast::Stmt::Update(ref update) => {
             if update.where_clause.is_none() && connection.get_dml_require_where() {
                 bail_parse_error!(
                     "UPDATE without a WHERE clause is not allowed when require_where (or i_am_a_dummy) is enabled"
                 );
             }
-            semantic_lowering::translate_update(&stmt, schema, settings, program, connection)?;
-            true
+            semantic_lowering::translate_update(&stmt, schema, settings, program, connection)?
         }
-        (Some((schema, settings)), ast::Stmt::Insert { .. }) => {
-            semantic_lowering::translate_insert(&stmt, schema, settings, program, connection)?;
-            true
+        ast::Stmt::Insert { .. } => {
+            semantic_lowering::translate_insert(&stmt, schema, settings, program, connection)?
         }
-        _ => false,
-    };
-
-    match stmt {
-        _ if lowered_by_hir => {}
         ast::Stmt::AlterTable(alter) => {
             translate_alter_table(alter, resolver, program, connection, input, hir)?;
         }
@@ -394,29 +354,6 @@ fn translate_statement(
         ast::Stmt::CreateVirtualTable(vtab) => {
             translate_create_virtual_table(vtab, resolver, program, connection)?
         }
-        ast::Stmt::Delete {
-            tbl_name,
-            where_clause,
-            returning,
-            indexed,
-            with,
-        } => {
-            if where_clause.is_none() && connection.get_dml_require_where() {
-                bail_parse_error!(
-                    "DELETE without a WHERE clause is not allowed when require_where (or i_am_a_dummy) is enabled"
-                );
-            }
-            translate_delete(
-                &tbl_name,
-                resolver,
-                where_clause,
-                returning,
-                indexed,
-                with,
-                program,
-                connection,
-            )?
-        }
         ast::Stmt::Detach { name } => {
             attach::translate_detach(&name, resolver, program, connection.clone(), hir)?
         }
@@ -427,7 +364,7 @@ fn translate_statement(
         ast::Stmt::DropTable {
             if_exists,
             tbl_name,
-        } => translate_drop_table(tbl_name, resolver, if_exists, program, connection)?,
+        } => translate_drop_table(tbl_name, resolver, if_exists, program, connection, hir)?,
         ast::Stmt::DropTrigger {
             if_exists,
             trigger_name,
@@ -499,44 +436,9 @@ fn translate_statement(
             savepoint_name,
         } => translate_rollback(program, tx_name, savepoint_name)?,
         ast::Stmt::Savepoint { name } => translate_savepoint(program, name)?,
-        ast::Stmt::Select(select) => {
-            translate_select(
-                select,
-                resolver,
-                program,
-                plan::QueryDestination::ResultRows,
-                connection,
-            )?;
-        }
-        ast::Stmt::Update(update) => {
-            if update.where_clause.is_none() && connection.get_dml_require_where() {
-                bail_parse_error!(
-                    "UPDATE without a WHERE clause is not allowed when require_where (or i_am_a_dummy) is enabled"
-                );
-            }
-            translate_update(update, resolver, program, connection)?
-        }
         ast::Stmt::Vacuum { name, into } => {
             vacuum::translate_vacuum(program, name.as_ref(), into.as_deref(), connection.clone())?
         }
-        ast::Stmt::Insert {
-            with,
-            or_conflict,
-            tbl_name,
-            columns,
-            body,
-            returning,
-        } => translate_insert(
-            resolver,
-            or_conflict,
-            tbl_name,
-            columns,
-            body,
-            returning,
-            with,
-            program,
-            connection,
-        )?,
         ast::Stmt::CreateSequence {
             if_not_exists,
             seq_name,

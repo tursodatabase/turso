@@ -338,12 +338,10 @@ fn hash_join_unmatched_rows_apply_payload_backed_predicates() {
     conn.execute("COMMIT").unwrap();
     sqlite_conn.execute("COMMIT", []).unwrap();
 
-    // Legacy scans the unmatched rows of its hash join through
-    // HashScanUnmatched; HIR null-extends them another way. Both must
-    // filter them by the predicate.
-    for hir in [false, true] {
+    // The unmatched rows a hash join NULL-extends must still be filtered
+    // by the predicate.
+    {
         let conn = tmp_db.connect_limbo();
-        conn.set_experimental_hir(hir);
         for predicate in [
             "t3.d IS t4.d",
             "t3.d IS NOT t4.d",
@@ -354,17 +352,6 @@ fn hash_join_unmatched_rows_apply_payload_backed_predicates() {
 JOIN t2 ON t1.d = t2.d \
 LEFT JOIN t3 ON t2.c = t3.c \
 JOIN t4 ON {predicate}"
-            );
-
-            let explain_rows = limbo_exec_rows(&conn, &format!("EXPLAIN {query}"));
-            let has_unmatched_scan = explain_rows.iter().any(|row| {
-                row.get(1)
-                    .and_then(value_as_text)
-                    .is_some_and(|op| op == "HashScanUnmatched")
-            });
-            assert!(
-                hir || has_unmatched_scan,
-                "expected a hash join unmatched-row scan for `{predicate}`"
             );
 
             let sqlite_rows = sqlite_exec_rows(&sqlite_conn, &query);

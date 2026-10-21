@@ -113,49 +113,6 @@ pub(crate) fn group_key_order(
     Some(order)
 }
 
-/// Whether a query's result is the same whatever order its rows are read
-/// in: one ungrouped aggregate block whose aggregates are all count, sum,
-/// total, avg, min or max.
-fn query_ignores_row_order(query: &hir::Query) -> bool {
-    use crate::function::{AggFunc, Func};
-    let [block] = query.blocks.as_slice() else {
-        return false;
-    };
-    if block.aggregate_count == 0
-        || block.window_function_count != 0
-        || !matches!(
-            &block.body,
-            hir::QueryBlockBody::Select { grouping: None, .. }
-        )
-    {
-        return false;
-    }
-    let mut ignores_order = true;
-    for output in &block.outputs {
-        output.expr.for_each(&mut |expression| {
-            let hir::Expr::Function(call) = expression else {
-                return;
-            };
-            if !matches!(call.evaluation, hir::FunctionEvaluation::Aggregate { .. }) {
-                return;
-            }
-            ignores_order &= matches!(
-                call.function.value(),
-                Func::Agg(
-                    AggFunc::Count
-                        | AggFunc::Count0
-                        | AggFunc::Sum
-                        | AggFunc::Total
-                        | AggFunc::Avg
-                        | AggFunc::Min
-                        | AggFunc::Max
-                )
-            );
-        });
-    }
-    ignores_order
-}
-
 /// Whether evaluating `expression` could return an error for some input,
 /// as legacy's `expression_can_fail_on_input` decides. Function calls,
 /// LIKE, RAISE, JSON and array operators, custom types, casts and nested
@@ -360,14 +317,17 @@ pub(crate) enum HirRootPlan {
     Update(HirAccessPlan),
     Delete(HirAccessPlan),
     Trigger(HirTriggerPlan),
+    #[cfg(test)]
     SchemaExpressions,
 }
 
 /// Planner facts for one trigger body. Expressions remain owned by HIR; this
 /// records only command access plans and their source order.
 pub(crate) enum HirTriggerPlan {
+    #[cfg(test)]
     Predicate,
-    Command(HirTriggerCommandPlan),
+    #[cfg(test)]
+    Command,
     Program(Vec<HirTriggerCommandPlan>),
 }
 
@@ -846,6 +806,7 @@ impl<'a> HirPlanContext<'a> {
             hir::HirRoot::Trigger(trigger) => self
                 .plan_trigger(trigger, schema, params, query_estimate)
                 .map(HirRootPlan::Trigger),
+            #[cfg(test)]
             hir::HirRoot::SchemaExpressions(_) => Ok(HirRootPlan::SchemaExpressions),
         }
     }
@@ -858,10 +819,12 @@ impl<'a> HirPlanContext<'a> {
         query_estimate: &dyn Fn(QueryId) -> Option<HirQueryEstimate>,
     ) -> Result<HirTriggerPlan> {
         match &trigger.body {
+            #[cfg(test)]
             hir::TriggerBody::Predicate(_) => Ok(HirTriggerPlan::Predicate),
+            #[cfg(test)]
             hir::TriggerBody::Command(command) => self
                 .plan_trigger_command(command, schema, params, query_estimate)
-                .map(HirTriggerPlan::Command),
+                .map(|_| HirTriggerPlan::Command),
             hir::TriggerBody::Program(program) => program
                 .commands
                 .iter()
@@ -1210,11 +1173,11 @@ impl<'a> HirPlanContext<'a> {
             .document
             .query(query_id)
             .expect("validated HIR query exists");
-        let block_order_by = query
-            .compounds
-            .is_empty()
-            .then_some(query.order_by.as_slice())
-            .unwrap_or_default();
+        let block_order_by = if query.compounds.is_empty() {
+            query.order_by.as_slice()
+        } else {
+            &[]
+        };
         let block_limit = query
             .compounds
             .is_empty()
@@ -1553,15 +1516,15 @@ impl<'a> HirPlanContext<'a> {
             }
             let source_rows = match &definition.kind {
                 hir::SourceKind::Table(table) => *base_row_estimate(schema, table.value(), params),
-                hir::SourceKind::Derived(query) => query_estimate(*query)
-                    .map_or(*RowCountEstimate::hardcoded_fallback(params), |estimate| {
-                        estimate.output_cardinality.max(1.0)
-                    }),
+                hir::SourceKind::Derived(query) => query_estimate(*query).map_or_else(
+                    || *RowCountEstimate::hardcoded_fallback(params),
+                    |estimate| estimate.output_cardinality.max(1.0),
+                ),
                 hir::SourceKind::Cte(cte) => match self.document.cte(*cte).map(|cte| &cte.body) {
-                    Some(hir::CteBody::Query(query)) => query_estimate(*query)
-                        .map_or(*RowCountEstimate::hardcoded_fallback(params), |estimate| {
-                            estimate.output_cardinality.max(1.0)
-                        }),
+                    Some(hir::CteBody::Query(query)) => query_estimate(*query).map_or_else(
+                        || *RowCountEstimate::hardcoded_fallback(params),
+                        |estimate| estimate.output_cardinality.max(1.0),
+                    ),
                     _ => *RowCountEstimate::hardcoded_fallback(params),
                 },
                 _ => return None,
@@ -1852,7 +1815,6 @@ impl<'a> HirPlanContext<'a> {
                     let source = self.definition(*source);
                     match source.owner {
                         hir::SourceOwner::QueryBlock(block) => !queries.contains(&block.query),
-                        hir::SourceOwner::Cte(cte) => !self.cte_belongs_to_queries(cte, &queries),
                         hir::SourceOwner::Root => true,
                     }
                 })
@@ -1891,23 +1853,6 @@ impl<'a> HirPlanContext<'a> {
                 recursive.seed == query || recursive.arms.iter().any(|arm| arm.query == query)
             }
         })
-    }
-
-    fn cte_belongs_to_queries(&self, cte: hir::CteId, queries: &HashSet<QueryId>) -> bool {
-        let definition = self
-            .document
-            .cte(cte)
-            .expect("validated HIR contains captured CTE source");
-        match &definition.body {
-            hir::CteBody::Query(query) => queries.contains(query),
-            hir::CteBody::Recursive(recursive) => {
-                queries.contains(&recursive.seed)
-                    || recursive
-                        .arms
-                        .iter()
-                        .any(|arm| queries.contains(&arm.query))
-            }
-        }
     }
 
     fn plan_source(
@@ -1968,11 +1913,6 @@ impl<'a> HirPlanContext<'a> {
                                     HirCteMaterialization::PerReference
                                 }
                             }
-                            owner => {
-                                return Err(LimboError::InternalError(format!(
-                                    "CTE HIR source {source} has non-query owner {owner:?}"
-                                )));
-                            }
                         };
                         Ok(HirPlanSource::Cte {
                             source,
@@ -2001,7 +1941,7 @@ impl<'a> HirPlanContext<'a> {
         }
     }
 
-    fn from_item(&self, source: SourceId) -> HirFromItem<'_> {
+    fn item_of(&self, source: SourceId) -> HirFromItem<'_> {
         match &self.definition(source).kind {
             hir::SourceKind::FromGroup(group) => HirFromItem::Group {
                 source,
@@ -2060,7 +2000,7 @@ impl<'a> HirPlanContext<'a> {
         input: &mut HirQueryBlockPlanInput,
         usage: &[ColumnUsage],
     ) -> Result<()> {
-        match self.from_item(source) {
+        match self.item_of(source) {
             HirFromItem::Source(source) => {
                 input
                     .sources
@@ -4784,12 +4724,8 @@ mod tests {
         });
         let document = Arc::new(document);
 
-        let plan = HirPlan::build(
-            document.clone(),
-            &Schema::default(),
-            &CostModelParams::default(),
-        )
-        .expect("compound query arms plan from HIR");
+        let plan = HirPlan::build(document, &Schema::default(), &CostModelParams::default())
+            .expect("compound query arms plan from HIR");
 
         let planned_query = plan.planned_query(query_id).expect("root query is planned");
         assert_eq!(
@@ -5216,5 +5152,116 @@ mod tests {
                     HirSourceAccess::Derived { query, .. } if query == child_query
                 )
         }));
+    }
+
+    fn number(text: &str) -> hir::Expr {
+        hir::Expr::Literal(turso_parser::ast::Literal::Numeric(text.into()))
+    }
+
+    fn integer_comparison() -> ComparisonSemantics {
+        ComparisonSemantics {
+            components: vec![ComparisonComponent {
+                affinity: Affinity::Integer,
+                collation: None,
+                array: false,
+            }],
+        }
+    }
+
+    #[test]
+    fn null_rejection_needs_a_column_of_the_target_source() {
+        let target = SourceId::new(7);
+        let other = SourceId::new(8);
+        // A term that never mentions the target can be TRUE on the join's
+        // null-extended rows, so it proves nothing about them.
+        let expr = binary(hir::Expr::column(other, 0), Operator::Greater, number("1"));
+        assert!(!rejects_null_row(&expr, target));
+        let expr = binary(hir::Expr::column(target, 0), Operator::Greater, number("1"));
+        assert!(rejects_null_row(&expr, target));
+    }
+
+    #[test]
+    fn null_rejection_treats_is_and_null_tests_as_non_rejecting() {
+        let target = SourceId::new(42);
+        let column = || hir::Expr::column(target, 0);
+        assert!(!rejects_null_row(
+            &binary(column(), Operator::Is, number("5")),
+            target
+        ));
+        assert!(!rejects_null_row(
+            &binary(column(), Operator::IsNot, number("5")),
+            target
+        ));
+        assert!(!rejects_null_row(
+            &hir::Expr::IsNull(Box::new(column())),
+            target
+        ));
+        // A null test nested inside a comparison still does not reject.
+        let nested = binary(
+            hir::Expr::IsNull(Box::new(column())),
+            Operator::Equals,
+            number("1"),
+        );
+        assert!(!rejects_null_row(&nested, target));
+    }
+
+    #[test]
+    fn null_rejection_treats_empty_not_in_as_non_rejecting() {
+        let target = SourceId::new(42);
+        let in_list = |values: Vec<hir::Expr>| hir::Expr::InList {
+            lhs: Box::new(hir::Expr::column(target, 0)),
+            negated: true,
+            comparisons: values.iter().map(|_| integer_comparison()).collect(),
+            values,
+        };
+        // `x NOT IN ()` is TRUE for NULL x.
+        assert!(!rejects_null_row(&in_list(vec![]), target));
+        assert!(rejects_null_row(&in_list(vec![number("1")]), target));
+    }
+
+    #[test]
+    fn null_rejection_or_needs_both_arms() {
+        let target = SourceId::new(1);
+        let other = SourceId::new(2);
+        let rejecting = binary(hir::Expr::column(target, 0), Operator::Greater, number("1"));
+        let unrelated = binary(hir::Expr::column(other, 0), Operator::Greater, number("1"));
+        assert!(!rejects_null_row(
+            &binary(rejecting.clone(), Operator::Or, unrelated.clone()),
+            target
+        ));
+        assert!(rejects_null_row(
+            &binary(rejecting.clone(), Operator::Or, rejecting.clone()),
+            target
+        ));
+        // An AND sits under a NOT or in parentheses here, so its polarity
+        // is unknown and both arms must reject too.
+        assert!(!rejects_null_row(
+            &binary(rejecting, Operator::And, unrelated),
+            target
+        ));
+    }
+
+    #[test]
+    fn null_rejection_sees_through_null_propagating_wrappers() {
+        let target = SourceId::new(3);
+        let column = hir::Expr::column(target, 1);
+        let expr = binary(
+            hir::Expr::Unary {
+                operator: turso_parser::ast::UnaryOperator::Negative,
+                expr: Box::new(column.clone()),
+            },
+            Operator::Less,
+            number("0"),
+        );
+        assert!(rejects_null_row(&expr, target));
+        let between = hir::Expr::Between {
+            expr: Box::new(number("1")),
+            negated: true,
+            start: Box::new(column.clone()),
+            end: Box::new(column),
+            start_comparison: integer_comparison(),
+            end_comparison: integer_comparison(),
+        };
+        assert!(rejects_null_row(&between, target));
     }
 }

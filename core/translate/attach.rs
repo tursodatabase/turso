@@ -2,17 +2,17 @@ use crate::function::{Func, ScalarFunc};
 use crate::translate::{
     emitter::Resolver,
     expr::{sanitize_string, translate_expr},
-    semantic_lowering::{HirSettings, PlannedSelect},
+    semantic_lowering::PlannedSelect,
     ProgramBuilder, ProgramBuilderOpts,
 };
 use crate::util::normalize_ident;
 use crate::vdbe::insn::Insn;
-use crate::{schema::Schema, sync::Arc, Connection, Result};
+use crate::{sync::Arc, Connection, Result};
 use turso_parser::ast::{Expr, Literal};
 
 /// The HIR settings ATTACH and DETACH evaluate their arguments with, when
 /// HIR is on.
-type HirContext<'a> = Option<(&'a Arc<Schema>, &'a HirSettings<'a>)>;
+use crate::translate::HirContext;
 
 /// How an ATTACH or DETACH argument gets its value.
 enum Argument<'a> {
@@ -53,12 +53,12 @@ fn emit_arguments(
             _ => None,
         })
         .collect();
-    let mut hir_values = match hir {
-        Some((schema, settings)) if !values.is_empty() => {
-            let select = PlannedSelect::values(values, schema, settings, connection)?;
-            Some(select.emit_values(program)?)
-        }
-        _ => None,
+    let mut hir_values = if values.is_empty() {
+        None
+    } else {
+        let (schema, settings) = hir;
+        let select = PlannedSelect::values(values, schema, settings, connection)?;
+        Some(select.emit_values(program)?)
     };
     for (i, argument) in arguments.iter().enumerate() {
         let dest = start + i;

@@ -259,7 +259,6 @@ mod tests {
     fn type_info_for_expressions_through_hir() {
         let db = fresh_db_with_custom_types("type_info_hir.db");
         let conn = db.connect_limbo();
-        conn.set_experimental_hir(true);
         conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, name TEXT) STRICT")
             .unwrap();
         let stmt = conn

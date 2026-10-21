@@ -347,6 +347,7 @@ pub enum SubqueryExpr {
 
 /// An expression whose names and type-dependent operations are fully resolved.
 #[derive(Clone, Debug)]
+#[allow(clippy::large_enum_variant)]
 pub enum Expr {
     Literal(Literal),
     Parameter(Parameter),
@@ -667,7 +668,7 @@ impl Expr {
                 _ => None,
             },
             Self::FieldAccess(access) => (index == 0).then_some(access.base.as_ref()),
-            Self::Raise { message, .. } => (index == 0).then(|| message.as_deref()).flatten(),
+            Self::Raise { message, .. } => (index == 0).then_some(message.as_deref()).flatten(),
         }
     }
 

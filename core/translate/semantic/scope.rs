@@ -146,7 +146,6 @@ struct ScopeOutput {
     id: OutputId,
     name: String,
     name_kind: hir::OutputNameKind,
-    expr: hir::Expr,
     type_fact: TypeFact,
     affinity: Affinity,
     has_affinity: bool,
@@ -266,7 +265,6 @@ impl Scope {
                 id: output.id,
                 name: crate::util::normalize_ident(&output.name),
                 name_kind: output.name_kind,
-                expr: output.expr.clone(),
                 type_fact: output.type_fact.clone(),
                 affinity: output.affinity,
                 has_affinity: output.has_affinity,
@@ -316,12 +314,6 @@ impl Scope {
         self.output(id)
             .map(ScopeOutput::collation)
             .or_else(|| self.outer.as_deref()?.output_collation(id))
-    }
-
-    pub(crate) fn output_expr(&self, id: OutputId) -> Option<&hir::Expr> {
-        self.output(id)
-            .map(|output| &output.expr)
-            .or_else(|| self.outer.as_deref()?.output_expr(id))
     }
 
     pub(crate) fn resolve_unqualified(
@@ -1616,10 +1608,6 @@ mod tests {
         );
         assert_eq!(scope.output_affinity(output_id), Some(Affinity::Real));
         assert_eq!(scope.output_has_affinity(output_id), Some(false));
-        assert!(matches!(
-            scope.output_expr(output_id),
-            Some(Expr::Literal(Literal::Numeric(value))) if value == "7"
-        ));
         assert!(matches!(
             scope.output_collation(output_id),
             Some(ExprCollation::Absent)

@@ -7,29 +7,6 @@ pub enum NoConstantOptReason {
     /// so hoisting those register assignments is not safe.
     /// e.g. SELECT COALESCE(1, t.x, NULL) would overwrite 1 with NULL, which is invalid.
     RegisterReuse,
-    /// The column has a custom type encode function that will be applied
-    /// in-place after this expression is evaluated. We must not hoist the
-    /// expression because:
-    ///
-    /// 1. The encode function may be non-deterministic (e.g. it could use
-    ///    datetime('now')), so hoisting would produce incorrect results.
-    ///
-    /// 2. Even if the encode function were deterministic, the encode is
-    ///    applied in-place to the target register inside the update loop.
-    ///    If the original value were hoisted (evaluated once before the
-    ///    loop), the second iteration would read the already-encoded value
-    ///    from the register and encode it again, causing progressive
-    ///    double-encoding (e.g. 99 → 9900 → 990000 → ...).
-    ///
-    /// The correct fix for deterministic encode functions would be to hoist
-    /// the *encoded* result (i.e. `encode_fn(99)` not `99`), but that
-    /// requires tracking the encode through the hoisting machinery. For now
-    /// we simply disable hoisting for these columns.
-    CustomTypeEncode,
-    /// IN-list values are inserted into an ephemeral table in a loop.
-    /// Each value reuses the same register, so hoisting would collapse
-    /// all values into the last one.
-    InListEphemeral,
 }
 
 /// Controls how binary expressions are emitted.
@@ -63,30 +40,6 @@ pub fn translate_expr_no_constant_opt(
     let translated = translate_expr(program, referenced_tables, expr, target_register, resolver)?;
     program.constant_spans_invalidate_after(next_span_idx);
     Ok(translated)
-}
-
-/// Resolve an expression to a register, reusing an existing register when possible.
-///
-/// Unlike `translate_expr`, this does not require a pre-allocated target register.
-/// If the expression is found in the `expr_to_reg_cache`, the cached register is
-/// returned directly without emitting a Copy instruction. Otherwise, a new register
-/// is allocated and the expression is translated into it.
-///
-/// Callers MUST use the returned register — they cannot assume a specific destination.
-#[must_use = "the returned register must be used, because that is where the expression value is stored"]
-pub fn resolve_expr(
-    program: &mut ProgramBuilder,
-    referenced_tables: Option<&TableReferences>,
-    expr: &ast::Expr,
-    resolver: &Resolver,
-) -> Result<usize> {
-    if let Some((reg, needs_decode, _collation)) = resolver.resolve_cached_expr_reg(expr) {
-        if !needs_decode {
-            return Ok(reg);
-        }
-    }
-    let dest_reg = program.alloc_register();
-    translate_expr(program, referenced_tables, expr, dest_reg, resolver)
 }
 
 /// Translate an expression into bytecode.

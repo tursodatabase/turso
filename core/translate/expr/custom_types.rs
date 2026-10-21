@@ -319,56 +319,6 @@ pub(super) fn find_custom_type_operator(
     None
 }
 
-/// Evaluate an expression-index expression in a DML context (INSERT/UPDATE/UPSERT).
-///
-/// Shared logic: decode custom-type column registers into temps (so the
-/// expression sees user-facing values), build a `SelfTableContext::ForDML`,
-/// and translate the expression.
-///
-/// The caller must:
-/// 1. Clone the expression from `idx_col.expr`
-/// 2. Build the initial `column_regs` mapping (before decode)
-///
-/// The expression is resolved via `resolve_gencol_expr_columns` and custom-type
-/// columns are decoded in-place in `column_regs`.
-pub(crate) fn emit_dml_expr_index_value(
-    program: &mut ProgramBuilder,
-    resolver: &Resolver,
-    mut expr: ast::Expr,
-    columns: &[Column],
-    column_regs: &mut [usize],
-    table: &Arc<BTreeTable>,
-    dest_reg: usize,
-) -> Result<()> {
-    crate::schema::resolve_gencol_expr_columns(&mut expr, columns)?;
-
-    let is_strict = table.is_strict;
-    for (i, col) in columns.iter().enumerate() {
-        if col.is_rowid_alias() {
-            continue;
-        }
-        if let Some(type_def) = resolver.schema().get_type_def(&col.ty_str, is_strict) {
-            if type_def.decode().is_some() {
-                let src_reg = column_regs[i];
-                let tmp = program.alloc_register();
-                emit_user_facing_column_value(program, src_reg, tmp, col, is_strict, resolver)?;
-                column_regs[i] = tmp;
-            }
-        }
-    }
-
-    let pairs = columns.iter().zip(column_regs.iter().copied());
-    let ctx = SelfTableContext::ForDML {
-        dml_ctx: DmlColumnContext::from_column_reg_mapping(pairs),
-        table: Arc::clone(table),
-    };
-    resolver.with_self_table_context(program, Some(&ctx), |program, _| {
-        translate_expr(program, None, &expr, dest_reg, resolver)?;
-        Ok(())
-    })?;
-    Ok(())
-}
-
 /// Emit bytecode that transforms a stored column value into its user-facing
 /// representation.
 ///
@@ -551,55 +501,4 @@ pub(crate) fn emit_type_expr(
     program.id_register_overrides.clear();
 
     result
-}
-
-/// Decode custom type columns for AFTER trigger NEW registers.
-///
-/// For each column with a custom type decode expression, copies the encoded register
-/// to a new register and emits the decode expression. NULL values are skipped.
-/// Returns a Vec of registers: one per column (decoded or original) plus the rowid at the end.
-pub(crate) fn emit_trigger_decode_registers(
-    program: &mut ProgramBuilder,
-    resolver: &Resolver,
-    columns: &[Column],
-    source_regs: &dyn Fn(usize) -> usize,
-    rowid_reg: usize,
-    is_strict: bool,
-) -> Result<Vec<usize>> {
-    columns
-        .iter()
-        .enumerate()
-        .map(|(i, col)| -> Result<usize> {
-            let type_def = resolver.schema().get_type_def(&col.ty_str, is_strict);
-            if let Some(type_def) = type_def {
-                if let Some(decode_expr) = type_def.decode() {
-                    let src = source_regs(i);
-                    let decoded_reg = program.alloc_register();
-                    program.emit_insn(Insn::Copy {
-                        src_reg: src,
-                        dst_reg: decoded_reg,
-                        extra_amount: 0,
-                    });
-                    let skip_label = program.allocate_label();
-                    program.emit_insn(Insn::IsNull {
-                        reg: decoded_reg,
-                        target_pc: skip_label,
-                    });
-                    emit_type_expr(
-                        program,
-                        decode_expr,
-                        decoded_reg,
-                        decoded_reg,
-                        col,
-                        type_def,
-                        resolver,
-                    )?;
-                    program.preassign_label_to_next_insn(skip_label);
-                    return Ok(decoded_reg);
-                }
-            }
-            Ok(source_regs(i))
-        })
-        .chain(std::iter::once(Ok(rowid_reg)))
-        .collect::<Result<Vec<usize>>>()
 }

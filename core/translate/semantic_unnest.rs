@@ -1034,6 +1034,18 @@ fn try_semi_or_anti_join(
     true
 }
 
+/// Add the LEFT JOIN a rewritten subquery becomes. A semi-join or anti-join
+/// from a WHERE EXISTS or IN rewritten earlier must stay the last join: it
+/// only filters the rows before it, and the loops are built in this order.
+fn push_join_before_semi_anti(from: &mut hir::From, join: hir::Join) {
+    let first_semi_anti = from
+        .joins
+        .iter()
+        .position(|join| matches!(join.kind, hir::JoinKind::Semi | hir::JoinKind::Anti))
+        .unwrap_or(from.joins.len());
+    from.joins.insert(first_semi_anti, join);
+}
+
 /// Like legacy's `is_inner_outer_equal_check`: one side of an `=` reads only
 /// the inner source and the other only outer sources.
 fn is_inner_outer_equality(expression: &hir::Expr, inner_source: SourceId) -> bool {
@@ -1686,16 +1698,14 @@ fn try_aggregate_rewrite(
         .reduce(and)
         .expect("a grouped table has a link");
     let block = &mut document.queries[block_id.query.index()].blocks[block_id.index];
-    block
-        .from
-        .as_mut()
-        .expect("checked above")
-        .joins
-        .push(hir::Join {
+    push_join_before_semi_anti(
+        block.from.as_mut().expect("checked above"),
+        hir::Join {
             right: grouped,
             kind: hir::JoinKind::Left,
             constraint: hir::JoinConstraint::On(link),
-        });
+        },
+    );
 
     let result = hir::Expr::Column(hir::ColumnRef {
         source: grouped,
@@ -1928,19 +1938,17 @@ fn try_join_first(document: &mut HirDocument, block_id: QueryBlockId, query_id: 
     let mut remaining = conjuncts;
     remaining.remove(position);
     let block = &mut document.queries[block_id.query.index()].blocks[block_id.index];
-    block
-        .from
-        .as_mut()
-        .expect("checked above")
-        .joins
-        .push(hir::Join {
+    push_join_before_semi_anti(
+        block.from.as_mut().expect("checked above"),
+        hir::Join {
             right: inner,
             kind: hir::JoinKind::Left,
             constraint: match inner_filter {
                 Some(filter) => hir::JoinConstraint::On(filter),
                 None => hir::JoinConstraint::None,
             },
-        });
+        },
+    );
     block.aggregate_count += inner_aggregates;
     let hir::QueryBlockBody::Select {
         filter, grouping, ..

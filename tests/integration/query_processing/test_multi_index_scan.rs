@@ -148,7 +148,6 @@ JOIN t4 ON t3.b = t4.b OR t3.c = t4.c";
 fn hir_uses_one_seek_per_or_branch() {
     let tmp_db = TempDatabase::new_empty();
     let conn = tmp_db.connect_limbo();
-    conn.set_experimental_hir(true);
     let sqlite_conn = rusqlite::Connection::open_in_memory().unwrap();
     for sql in [
         "CREATE TABLE h(id INTEGER PRIMARY KEY, v INTEGER, w INTEGER)",
@@ -200,7 +199,6 @@ fn hir_uses_one_seek_per_or_branch() {
 fn hir_turns_a_null_rejected_left_join_into_an_inner_join() {
     let tmp_db = TempDatabase::new_empty();
     let conn = tmp_db.connect_limbo();
-    conn.set_experimental_hir(true);
     let sqlite_conn = rusqlite::Connection::open_in_memory().unwrap();
     for sql in [
         "CREATE TABLE g(id INTEGER PRIMARY KEY)",

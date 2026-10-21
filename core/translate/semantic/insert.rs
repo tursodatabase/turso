@@ -111,6 +111,7 @@ impl<'ast> Analyzer<'_, '_, 'ast> {
         })
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn analyze_insert_body(
         &mut self,
         conflict: Option<ast::ResolveType>,
@@ -718,7 +719,6 @@ impl<'ast> Analyzer<'_, '_, 'ast> {
                                     ExprCollation::Absent | ExprCollation::Inherited(_) => None,
                                 },
                                 expr: resolved.expr,
-                                order: term.order.unwrap_or(ast::SortOrder::Asc),
                             })
                         })
                         .collect::<Result<Vec<_>>>()?;

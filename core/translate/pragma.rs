@@ -216,10 +216,7 @@ pub fn translate_pragma(
     pager: Arc<Pager>,
     connection: Arc<crate::Connection>,
     program: &mut ProgramBuilder,
-    hir: Option<(
-        &Arc<crate::schema::Schema>,
-        &crate::translate::semantic_lowering::HirSettings<'_>,
-    )>,
+    hir: crate::translate::HirContext<'_>,
 ) -> crate::Result<()> {
     let opts = ProgramBuilderOpts::new(0, 20, 0);
     program.extend(&opts);
@@ -280,6 +277,7 @@ pub fn translate_pragma(
                 database_id,
                 schema_was_explicit,
                 program,
+                hir,
             )?,
         },
     };
@@ -313,6 +311,7 @@ fn update_pragma(
     database_id: usize,
     schema_was_explicit: bool,
     program: &mut ProgramBuilder,
+    hir: crate::translate::HirContext<'_>,
 ) -> crate::Result<TransactionMode> {
     let parse_pragma_enabled = |expr: &ast::Expr| -> bool {
         if let Expr::Literal(Literal::Numeric(n)) = expr {
@@ -415,7 +414,7 @@ fn update_pragma(
                 database_id,
                 schema_was_explicit,
                 program,
-                None,
+                hir,
             )
         }
         PragmaName::FullColumnNames => {
@@ -440,7 +439,7 @@ fn update_pragma(
             database_id,
             schema_was_explicit,
             program,
-            None,
+            hir,
         ),
         PragmaName::ModuleList => Ok(TransactionMode::None),
         PragmaName::PageCount => query_pragma(
@@ -452,7 +451,7 @@ fn update_pragma(
             database_id,
             schema_was_explicit,
             program,
-            None,
+            hir,
         ),
         PragmaName::MaxPageCount => {
             let data = parse_signed_number(&value)?;
@@ -630,7 +629,7 @@ fn update_pragma(
             database_id,
             schema_was_explicit,
             program,
-            None,
+            hir,
         ),
         PragmaName::FreelistCount => query_pragma(
             PragmaName::FreelistCount,
@@ -641,7 +640,7 @@ fn update_pragma(
             database_id,
             schema_was_explicit,
             program,
-            None,
+            hir,
         ),
         PragmaName::EncryptionKey => {
             let value = parse_string(&value)?;
@@ -797,7 +796,7 @@ fn update_pragma(
             database_id,
             schema_was_explicit,
             program,
-            None,
+            hir,
         ),
     }
 }
@@ -812,10 +811,7 @@ fn query_pragma(
     database_id: usize,
     schema_was_explicit: bool,
     program: &mut ProgramBuilder,
-    hir: Option<(
-        &Arc<crate::schema::Schema>,
-        &crate::translate::semantic_lowering::HirSettings<'_>,
-    )>,
+    hir: crate::translate::HirContext<'_>,
 ) -> crate::Result<TransactionMode> {
     let schema = resolver.schema();
     let register = program.alloc_register();
@@ -1495,7 +1491,7 @@ fn query_pragma(
             let schema = main_schema.as_deref().unwrap_or(schema);
             // HIR plans against this connection's schema, so it reads rows
             // only when the check uses that schema.
-            let hir = hir.filter(|_| main_schema.is_none());
+            let hir = (main_schema.as_ref().unwrap_or(hir.0), hir.1);
             translate_integrity_check(
                 schema,
                 program,
@@ -1512,7 +1508,7 @@ fn query_pragma(
             let main_schema = (database_id == 0 && connection.mvcc_enabled())
                 .then(|| connection.db.schema.lock().clone());
             let schema = main_schema.as_deref().unwrap_or(schema);
-            let hir = hir.filter(|_| main_schema.is_none());
+            let hir = (main_schema.as_ref().unwrap_or(hir.0), hir.1);
             translate_quick_check(
                 schema,
                 program,

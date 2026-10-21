@@ -141,13 +141,6 @@ impl HirDocument {
         )
     }
 
-    /// Whether `query`, or any query it runs, reads a CTE.
-    pub(crate) fn query_reads_cte(&self, query: QueryId) -> bool {
-        self.query_reads_source(query, |kind| {
-            matches!(kind, SourceKind::Cte(_) | SourceKind::RecursiveInput(_))
-        })
-    }
-
     /// Whether `query`, or any query it runs, has a FROM source of a kind
     /// `matches` accepts.
     fn query_reads_source(&self, query: QueryId, matches: impl Fn(&SourceKind) -> bool) -> bool {
@@ -245,46 +238,6 @@ impl HirDocument {
         let mut dependencies = dependencies.into_iter().collect::<Vec<_>>();
         dependencies.sort_unstable();
         dependencies
-    }
-
-    /// Whether every use of `child` in its parent query only asks whether
-    /// rows exist or match, as EXISTS and IN do, so the order its rows come
-    /// in cannot change the answer.
-    pub(crate) fn subquery_uses_ignore_row_order(&self, child: QueryId) -> bool {
-        let Some(parent) = self
-            .query(child)
-            .and_then(|query| query.parent)
-            .and_then(|parent| self.query(parent))
-        else {
-            return false;
-        };
-        let mut found = false;
-        let mut ignores_order = true;
-        visit_query_parts(self, parent, &mut |part| {
-            let QueryPart::Expression(expression) = part else {
-                return;
-            };
-            expression.for_each(&mut |expression| {
-                let Expr::Subquery(subquery) = expression else {
-                    return;
-                };
-                match subquery {
-                    SubqueryExpr::In { query, .. } | SubqueryExpr::Exists(query)
-                        if *query == child =>
-                    {
-                        found = true;
-                    }
-                    SubqueryExpr::Scalar { query, .. } | SubqueryExpr::Row { query }
-                        if *query == child =>
-                    {
-                        found = true;
-                        ignores_order = false;
-                    }
-                    _ => {}
-                }
-            });
-        });
-        found && ignores_order
     }
 
     /// The outer values that `query`, or any query it runs, reads: one
@@ -823,11 +776,10 @@ fn collect_source_argument_column_reads<'source>(
 }
 
 fn collect_expr_column_reads(expression: &Expr, reads: &mut ColumnUsageCollector) {
-    expression.for_each(&mut |expression| match expression {
-        Expr::Column(reference) => {
+    expression.for_each(&mut |expression| {
+        if let Expr::Column(reference) = expression {
             reads.record(*reference);
         }
-        _ => {}
     });
 }
 

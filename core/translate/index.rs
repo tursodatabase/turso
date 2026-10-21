@@ -15,8 +15,8 @@ use crate::translate::{
         bind_and_rewrite_expr, translate_condition_expr, translate_expr, unwrap_parens, walk_expr,
         BindingBehavior, ConditionMetadata, WalkControl,
     },
-    insert::format_unique_violation_desc,
     plan::{ColumnUsedMask, IterationDirection, JoinedTable, Operation, Scan, TableReferences},
+    semantic_lowering::format_unique_violation_desc,
 };
 use crate::vdbe::builder::{CursorKey, ProgramBuilderOpts, SelfTableContext};
 use crate::vdbe::insn::{to_u32, CmpInsFlags, Cookie};
@@ -316,10 +316,7 @@ pub fn translate_create_index(
 }
 
 /// The HIR settings a schema statement plans its SELECTs with, when HIR is on.
-type HirContext<'a> = Option<(
-    &'a Arc<crate::schema::Schema>,
-    &'a crate::translate::semantic_lowering::HirSettings<'a>,
-)>;
+use crate::translate::HirContext;
 
 /// How a refill reads the rows of the indexed table.
 enum RefillRows {
@@ -345,9 +342,7 @@ fn hir_refill_select(
     tbl: &BTreeTable,
     idx: &Index,
 ) -> crate::Result<Option<crate::translate::semantic_lowering::PlannedSelect>> {
-    let Some((schema, settings)) = hir else {
-        return Ok(None);
-    };
+    let (schema, settings) = hir;
     let Some(rowid_name) = ["rowid", "_rowid_", "oid"].into_iter().find(|name| {
         !tbl.columns().iter().any(|column| {
             column
@@ -990,15 +985,6 @@ pub fn resolve_sorted_columns(
     cols: &[SortedColumn],
 ) -> crate::Result<crate::alloc::Vec<IndexColumn>> {
     resolve_sorted_columns_with_resolver(table, cols, None)
-}
-
-pub fn reject_explicit_nulls(cols: &[SortedColumn]) -> crate::Result<()> {
-    for sc in cols {
-        if let Some(nulls) = sc.nulls {
-            crate::bail_parse_error!("unsupported use of {}", nulls);
-        }
-    }
-    Ok(())
 }
 
 fn resolve_sorted_columns_with_resolver(

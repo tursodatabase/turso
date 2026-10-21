@@ -314,7 +314,7 @@ pub(super) fn emit_guarded_fk_decrement(
 
 /// The UNIQUE error text for `index`, as SQLite writes it: `t.c` for one
 /// column, `t.(a, b)` for several.
-pub(super) fn format_unique_violation_desc(table_name: &str, index: &Index) -> String {
+pub(crate) fn format_unique_violation_desc(table_name: &str, index: &Index) -> String {
     match index.columns.as_slice() {
         [column] => format!("{table_name}.{}", column.name),
         columns => {

@@ -677,29 +677,36 @@ impl HirDocument {
                     .get(id.index)
                     .filter(|output| output.id == id),
                 HirRoot::Trigger(root) => match &root.body {
+                    #[cfg(test)]
                     TriggerBody::Command(TriggerCommand::Insert(insert)) => insert
                         .returning
                         .as_ref()?
                         .outputs
                         .get(id.index)
                         .filter(|output| output.id == id),
+                    #[cfg(test)]
                     TriggerBody::Command(TriggerCommand::Update(update)) => update
                         .returning
                         .as_ref()?
                         .outputs
                         .get(id.index)
                         .filter(|output| output.id == id),
+                    #[cfg(test)]
                     TriggerBody::Command(TriggerCommand::Delete(delete)) => delete
                         .returning
                         .as_ref()?
                         .outputs
                         .get(id.index)
                         .filter(|output| output.id == id),
-                    TriggerBody::Predicate(_)
-                    | TriggerBody::Command(TriggerCommand::Select(_))
-                    | TriggerBody::Program(_) => None,
+                    #[cfg(test)]
+                    TriggerBody::Predicate(_) | TriggerBody::Command(TriggerCommand::Select(_)) => {
+                        None
+                    }
+                    TriggerBody::Program(_) => None,
                 },
-                HirRoot::Query(_) | HirRoot::SchemaExpressions(_) => None,
+                HirRoot::Query(_) => None,
+                #[cfg(test)]
+                HirRoot::SchemaExpressions(_) => None,
             },
         }
     }

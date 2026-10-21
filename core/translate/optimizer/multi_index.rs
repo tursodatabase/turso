@@ -37,14 +37,18 @@ use turso_parser::ast::{self, TableInternalId};
 
 #[derive(Debug, Clone)]
 /// Parameters for a single branch of a multi-index scan.
+/// The planner tests read the fields the HIR planner does not: it reads
+/// the branches of its own `HirOrUnion` instead.
 pub struct MultiIndexBranchParams {
     /// The index to use for this branch, or None for rowid access.
+    #[allow(dead_code)]
     pub index: Option<Arc<Index>>,
     /// How this branch probes the table/index.
     pub access: MultiIndexBranchAccessParams,
     /// Estimated number of rows from this branch.
     pub estimated_rows: f64,
     /// Residual filters for union (OR) branches. `None` for intersection branches.
+    #[allow(dead_code)]
     pub residuals: Option<UnionBranchPrePostFilters>,
 }
 
@@ -52,9 +56,11 @@ pub struct MultiIndexBranchParams {
 pub enum MultiIndexBranchAccessParams {
     Seek {
         constraints: Vec<Constraint>,
+        #[allow(dead_code)]
         constraint_refs: Vec<RangeConstraintRef>,
     },
     InSeek {
+        #[allow(dead_code)]
         source: InSeekSource,
     },
 }

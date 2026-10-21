@@ -74,16 +74,6 @@ pub(super) fn check(
     }
 }
 
-/// Whether a RETURNING value of the DELETE has a subquery.
-fn returning_has_subquery(delete: &hir::Delete) -> bool {
-    delete.returning.as_ref().is_some_and(|returning| {
-        returning
-            .outputs
-            .iter()
-            .any(|output| has_subquery(&output.expr))
-    })
-}
-
 /// Emit a DELETE that [`check`] accepted. `delete` is the plan's
 /// root or one command of a trigger in it.
 pub(super) fn emit_delete(

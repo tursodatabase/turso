@@ -37,21 +37,20 @@ pub(super) enum FromContext<'scope> {
         outer_scope: Option<&'scope Scope>,
         policies: ExprPolicies,
     },
-    Root,
 }
 
 impl<'scope> FromContext<'scope> {
     fn source_owner(self) -> SourceOwner {
         match self {
             Self::QueryBlock { block, .. } => SourceOwner::QueryBlock(block),
-            Self::Dml { .. } | Self::Root => SourceOwner::Root,
+            Self::Dml { .. } => SourceOwner::Root,
         }
     }
 
     fn query_parent(self) -> Option<hir::QueryId> {
         match self {
             Self::QueryBlock { block, .. } => Some(block.query),
-            Self::Dml { .. } | Self::Root => None,
+            Self::Dml { .. } => None,
         }
     }
 
@@ -59,11 +58,10 @@ impl<'scope> FromContext<'scope> {
         match self {
             Self::QueryBlock { outer_scope, .. } => outer_scope,
             Self::Dml { outer_scope, .. } => outer_scope,
-            Self::Root => None,
         }
     }
 
-    fn cte_context(self, dqs_dml: super::context::DoubleQuotedDml) -> CteBindingContext<'scope> {
+    fn cte_context(self) -> CteBindingContext<'scope> {
         match self {
             Self::QueryBlock {
                 block,
@@ -71,15 +69,13 @@ impl<'scope> FromContext<'scope> {
                 policies,
             } => CteBindingContext::new(block.query, outer_scope, policies),
             Self::Dml { policies, .. } => CteBindingContext::root(policies),
-            Self::Root => CteBindingContext::root(ExprPolicies::statement(dqs_dml)),
         }
     }
 
-    fn expr_policies(self, dqs_dml: super::context::DoubleQuotedDml) -> ExprPolicies {
+    fn expr_policies(self) -> ExprPolicies {
         match self {
             Self::QueryBlock { policies, .. } => policies,
             Self::Dml { policies, .. } => policies,
-            Self::Root => ExprPolicies::statement(dqs_dml),
         }
     }
 }
@@ -263,11 +259,11 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
                 arguments,
                 &scope,
                 context.query_parent(),
-                context.expr_policies(self.context().dqs_dml()),
+                context.expr_policies(),
             )?;
         }
 
-        let policy = context.expr_policies(self.context().dqs_dml()).select();
+        let policy = context.expr_policies().select();
         for (syntax_join, join) in syntax.joins.iter().zip(&mut joins) {
             if let Some(ast::JoinConstraint::On(expression)) = &syntax_join.constraint {
                 join.constraint = hir::JoinConstraint::On(self.analyze_source_scalar_expr(
@@ -295,7 +291,7 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
         position: usize,
     ) -> Result<AnalyzedTableSource<'ast>> {
         let owner = context.source_owner();
-        let cte_context = context.cte_context(self.context().dqs_dml());
+        let cte_context = context.cte_context();
         match syntax {
             ast::SelectTable::Table(name, alias, indexed) => {
                 if name.db_name.is_none() {
@@ -664,18 +660,13 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
         let parent = match owner {
             SourceOwner::QueryBlock(block) => Some(block.query),
             SourceOwner::Root => None,
-            SourceOwner::Cte(cte) => {
-                return Err(crate::LimboError::InternalError(format!(
-                    "derived source cannot be owned directly by CTE {cte}"
-                )));
-            }
         };
         let query = self.analyze_select_with_scope(
             select,
             parent,
             context.outer_scope(),
             None,
-            context.expr_policies(self.context().dqs_dml()),
+            context.expr_policies(),
         )?;
         let columns = self.query_source_columns(query)?;
         let width = columns.len();
@@ -729,7 +720,7 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
             context.query_parent(),
             None,
             None,
-            context.expr_policies(self.context().dqs_dml()),
+            context.expr_policies(),
         );
         assert!(
             self.cte_scopes.is_empty(),
@@ -924,10 +915,11 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
         }
     }
 
-    /// Like legacy and SQLite, a subquery column without an alias is named
-    /// after the column it reads: `(SELECT b.k FROM l AS b)` has a column
-    /// `k`, not `b.k`. A rowid read takes the name of the rowid alias column,
-    /// or `rowid`. Other expressions keep their SQL text.
+    /// Like SQLite, a subquery column without an alias is named after the
+    /// column it reads: `(SELECT b.k FROM l AS b)` has a column `k`, not
+    /// `b.k`. A rowid read keeps the identifier as written (`rowid`, `oid`,
+    /// `_rowid_`), not the rowid alias column, since SQLite names the column
+    /// before it resolves the read. Other expressions keep their SQL text.
     fn subquery_column_name(&self, output: &hir::Output) -> String {
         if output.name_kind != hir::OutputNameKind::Inferred {
             return output.name.clone();
@@ -937,13 +929,11 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
                 .source(reference.source)
                 .and_then(|source| source.columns.get(reference.column))
                 .map(|column| column.name.clone()),
-            hir::Expr::RowId(source) => self.source(*source).map(|source| {
-                source
-                    .columns
-                    .iter()
-                    .find(|column| column.rowid_alias)
-                    .map_or_else(|| "rowid".to_string(), |column| column.name.clone())
-            }),
+            hir::Expr::RowId(_) => output
+                .name
+                .rsplit('.')
+                .next()
+                .map(|written| written.trim_matches(['"', '`', '[', ']']).to_string()),
             _ => None,
         };
         column_name.unwrap_or_else(|| output.name.clone())

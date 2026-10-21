@@ -428,9 +428,6 @@ pub struct Connection {
     /// PRAGMA count_changes: when ON, each INSERT, UPDATE and DELETE returns
     /// one row with the number of rows it changed.
     pub(super) count_changes: AtomicBool,
-    /// Migration switch: prepare top-level SELECT statements through semantic
-    /// HIR instead of the legacy planner. Starts from `TURSO_EXPERIMENTAL_HIR`.
-    pub(super) experimental_hir: AtomicBool,
     /// SQLite DQS misfeature: when ON (default), unresolved double-quoted identifiers
     /// in DML statements fall back to string literals instead of raising an error.
     pub(super) dqs_dml: AtomicBool,
@@ -3905,17 +3902,6 @@ impl Connection {
 
     pub fn set_count_changes(&self, value: bool) {
         self.count_changes.store(value, Ordering::SeqCst);
-    }
-
-    /// Whether top-level SELECT statements are prepared through semantic HIR.
-    pub fn experimental_hir_enabled(&self) -> bool {
-        self.experimental_hir.load(Ordering::SeqCst)
-    }
-
-    /// Prepare later top-level SELECT statements through semantic HIR. There is
-    /// no fallback: a SELECT HIR cannot lower yet fails to prepare.
-    pub fn set_experimental_hir(&self, value: bool) {
-        self.experimental_hir.store(value, Ordering::SeqCst);
     }
 
     pub fn get_dqs_dml(&self) -> bool {

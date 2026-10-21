@@ -418,7 +418,7 @@ fn recursive_comparison_collations(
         for block in &query.blocks {
             for (collation, output) in collations.iter_mut().zip(&block.outputs) {
                 if collation.is_none() {
-                    *collation = output.collation.clone();
+                    collation.clone_from(&output.collation);
                 }
             }
         }

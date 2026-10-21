@@ -3454,7 +3454,7 @@ impl ExprLowerer<'_, '_, '_> {
             column
                 .collation
                 .as_ref()
-                .map(|collation| (collation.value().clone(), false)),
+                .map(|collation| (*collation.value(), false)),
         );
     }
 

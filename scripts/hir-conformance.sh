@@ -5,10 +5,9 @@
 #   scripts/hir-conformance.sh [output-dir]
 #
 # Runs every .sqltest file in its own process, so a crash or hang in one
-# file does not hide the results of the others. HIR is the default planner;
-# set TURSO_LEGACY_PLANNER to run the corpora through the legacy planner.
-# EXPLAIN QUERY PLAN rows are compared without instruction ids, generated
-# name ids and the order of subquery rows, which differ between the planners.
+# file does not hide the results of the others. EXPLAIN QUERY PLAN rows are
+# compared without instruction ids, generated name ids and the order of
+# subquery rows.
 # Each file gets <name>.json (sqltest JSON output), <name>.err, and <name>.exit
 # in the output directory. Files are killed after 10 minutes. The summary at
 # the end groups failures by error message.

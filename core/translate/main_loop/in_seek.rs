@@ -73,41 +73,6 @@ pub(crate) fn open_in_seek_values_cursor<E>(
     Ok(source_cursor)
 }
 
-/// Open or reuse the ephemeral cursor that supplies RHS values for an IN-seek.
-///
-/// Literal lists are materialized once into a unique ephemeral index so both
-/// ordinary `Search::InSeek` and multi-index OR branches can drive repeated
-/// equality seeks from the same bytecode pattern. IN-subqueries already have an
-/// ephemeral cursor from subquery translation, so they are reused directly.
-pub(super) fn open_in_seek_source_cursor(
-    program: &mut ProgramBuilder,
-    table_references: &TableReferences,
-    resolver: &Resolver<'_>,
-    index: Option<&Arc<Index>>,
-    source: &InSeekSource,
-) -> Result<CursorID> {
-    match source {
-        InSeekSource::LiteralList { values, affinity } => open_in_seek_values_cursor(
-            program,
-            index,
-            values,
-            *affinity,
-            |program, value, target| {
-                translate_expr_no_constant_opt(
-                    program,
-                    Some(table_references),
-                    value,
-                    target,
-                    resolver,
-                    NoConstantOptReason::InListEphemeral,
-                )?;
-                Ok(())
-            },
-        ),
-        InSeekSource::Subquery { cursor_id } => Ok(*cursor_id),
-    }
-}
-
 /// Emit the outer IN-value loop and position the table or index cursor for its
 /// first matching row.
 pub(crate) fn emit_in_seek_start(

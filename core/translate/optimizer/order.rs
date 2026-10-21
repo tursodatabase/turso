@@ -1,5 +1,4 @@
 use crate::schema::Table;
-use crate::turso_assert_greater_than_or_equal;
 use crate::{
     schema::{FromClauseSubquery, Index, Schema},
     translate::{
@@ -10,8 +9,8 @@ use crate::{
             usable_constraints_for_lhs_mask, RangeConstraintRef, TableConstraints,
         },
         plan::{
-            GroupBy, HashJoinType, HirPlanSource, HirPlannedSource, IterationDirection,
-            JoinedTable, Operation, Plan, Scan, SimpleAggregate, TableReferences,
+            HashJoinType, HirPlanSource, HirPlannedSource, IterationDirection, JoinedTable,
+            Operation, Plan, Scan, TableReferences,
         },
         planner::{table_mask_from_expr, TableMask},
         semantic::hir,
@@ -90,10 +89,6 @@ pub struct OrderTarget<I = TableInternalId, E = *const ast::Expr> {
     pub purpose: OrderTargetPurpose,
 }
 
-/// Legacy AST expressions live at least as long as their statement/program.
-/// Keep pointers here to avoid cloning another parser expression during the
-/// transition; HIR targets borrow their resolved expressions instead.
-pub type LegacyOrderTarget = OrderTarget<TableInternalId, *const ast::Expr>;
 pub type HirOrderTarget<'a> = OrderTarget<
     crate::translate::semantic::hir::SourceId,
     &'a crate::translate::semantic::hir::Expr,
@@ -110,155 +105,9 @@ pub enum EqualityPrefixScope {
     ConstantEquality,
 }
 
-impl LegacyOrderTarget {
-    /// Build an `OrderTarget` from a list of expressions if they can all be
-    /// satisfied by a single-table ordering (needed for index satisfaction).
-    fn maybe_from_iterator<'a>(
-        list: impl Iterator<Item = (&'a ast::Expr, SortOrder, Option<ast::NullsOrder>)> + Clone,
-        tables: &crate::translate::plan::TableReferences,
-        purpose: OrderTargetPurpose,
-    ) -> Option<Self> {
-        if list.clone().count() == 0 {
-            return None;
-        }
-        let mut cols = Vec::new();
-        for (expr, order, nulls) in list {
-            let col = expr_to_column_order(expr, order, nulls, tables)?;
-            cols.push(col);
-        }
-        Some(OrderTarget {
-            columns: cols,
-            purpose,
-        })
-    }
-}
-
 impl<I, E> OrderTarget<I, E> {
     pub fn is_extremum(&self) -> bool {
         matches!(self.purpose, OrderTargetPurpose::Extremum)
-    }
-}
-
-/// Build the synthetic ordering requirement used by simple MIN/MAX aggregation.
-pub fn simple_aggregate_order_target(
-    simple_aggregate: &SimpleAggregate,
-    tables: &TableReferences,
-) -> Option<OrderTarget> {
-    let SimpleAggregate::MinMax(min_max) = simple_aggregate else {
-        return None;
-    };
-
-    let mut target = OrderTarget::maybe_from_iterator(
-        std::iter::once((&min_max.argument, min_max.order, None)),
-        tables,
-        OrderTargetPurpose::Extremum,
-    )?;
-    if let Some(coll) = min_max.collation {
-        target.columns[0].collation = coll;
-    }
-    Some(target)
-}
-
-/// Compute an [OrderTarget] for the join optimizer to use.
-/// Ideally, a join order is both efficient in joining the tables
-/// but also returns the results in an order that minimizes the amount of
-/// sorting that needs to be done later (either in GROUP BY, ORDER BY, or both).
-///
-/// TODO: this does not currently handle the case where we definitely cannot eliminate
-/// the ORDER BY sorter, but we could still eliminate the GROUP BY sorter.
-pub fn compute_order_target(
-    order_by: &mut Vec<(Box<ast::Expr>, SortOrder, Option<ast::NullsOrder>)>,
-    group_by_opt: Option<&mut GroupBy>,
-    tables: &TableReferences,
-) -> Option<OrderTarget> {
-    match (order_by.is_empty(), group_by_opt) {
-        // No ordering demands - we don't care what order the joined result rows are in
-        (true, None) => None,
-        // Only ORDER BY - we would like the joined result rows to be in the order specified by the ORDER BY
-        (false, None) => OrderTarget::maybe_from_iterator(
-            order_by
-                .iter()
-                .map(|(expr, order, nulls)| (expr.as_ref(), *order, *nulls)),
-            tables,
-            OrderTargetPurpose::EliminatesSort(EliminatesSortBy::Order),
-        ),
-        // Only GROUP BY - we would like the joined result rows to be in the order specified by the GROUP BY
-        (true, Some(group_by)) => OrderTarget::maybe_from_iterator(
-            group_by
-                .exprs
-                .iter()
-                .map(|expr| (expr, SortOrder::Asc, None)),
-            tables,
-            OrderTargetPurpose::EliminatesSort(EliminatesSortBy::Group),
-        ),
-        // Both ORDER BY and GROUP BY:
-        // If the GROUP BY does not contain all the expressions in the ORDER BY,
-        // then we must separately sort the result rows for ORDER BY anyway.
-        // However, in that case we can use the GROUP BY expressions as the target order for the join,
-        // so that we don't have to sort twice.
-        //
-        // If the GROUP BY contains all the expressions in the ORDER BY,
-        // then we again can use the GROUP BY expressions as the target order for the join;
-        // however in this case we must take the ASC/DESC from ORDER BY into account.
-        (false, Some(group_by)) => {
-            // Does the group by contain all expressions in the order by?
-            let group_by_contains_all = order_by.iter().all(|(expr, _, _)| {
-                group_by
-                    .exprs
-                    .iter()
-                    .any(|group_by_expr| exprs_are_equivalent(expr, group_by_expr))
-            });
-            // If not, let's try to target an ordering that matches the group by -- we don't care about ASC/DESC
-            if !group_by_contains_all {
-                return OrderTarget::maybe_from_iterator(
-                    group_by
-                        .exprs
-                        .iter()
-                        .map(|expr| (expr, SortOrder::Asc, None)),
-                    tables,
-                    OrderTargetPurpose::EliminatesSort(EliminatesSortBy::Group),
-                );
-            }
-            // If yes, let's try to target an ordering that matches the GROUP BY columns,
-            // but the ORDER BY orderings. First, we need to reorder the GROUP BY columns to match the ORDER BY columns.
-            group_by.exprs.sort_by_key(|expr| {
-                order_by
-                    .iter()
-                    .position(|(order_by_expr, _, _)| exprs_are_equivalent(expr, order_by_expr))
-                    .map_or(usize::MAX, |i| i)
-            });
-
-            // Now, regardless of whether we can eventually eliminate the sorting entirely in the optimizer,
-            // we know that we don't need ORDER BY sorting anyway, because the GROUP BY will sort the result since
-            // it contains all the necessary columns required for the ORDER BY, and the GROUP BY columns are now in the correct order.
-            // First, however, we need to make sure the GROUP BY sorter's column sort directions and NULLS
-            // ordering match the ORDER BY requirements.
-            turso_assert_greater_than_or_equal!(group_by.exprs.len(), order_by.len());
-            for (i, (_, order_by_dir, order_by_nulls)) in order_by.iter().enumerate() {
-                group_by.sort_order[i] = *order_by_dir;
-                group_by.nulls_order[i] = *order_by_nulls;
-            }
-            // The sort_by_key above reordered group_by.exprs but not sort_order,
-            // so remaining positions may have stale values. GROUP BY columns not
-            // in ORDER BY should default to ASC (matching SQLite's tie-breaking).
-            for i in order_by.len()..group_by.sort_order.len() {
-                group_by.sort_order[i] = SortOrder::Asc;
-                group_by.nulls_order[i] = None;
-            }
-            // Now we can remove the ORDER BY from the query.
-            order_by.clear();
-
-            OrderTarget::maybe_from_iterator(
-                group_by
-                    .exprs
-                    .iter()
-                    .zip(group_by.sort_order.iter())
-                    .zip(group_by.nulls_order.iter())
-                    .map(|((expr, dir), nulls)| (expr, *dir, *nulls)),
-                tables,
-                OrderTargetPurpose::EliminatesSort(EliminatesSortBy::GroupByAndOrder),
-            )
-        }
     }
 }
 
@@ -612,7 +461,7 @@ fn access_method_emits_unique_order_prefix(
         | AccessMethodParams::RecursiveCteInput
         | AccessMethodParams::HashJoin { .. }
         | AccessMethodParams::VirtualTable { .. }
-        | AccessMethodParams::IndexMethod { .. }
+        | AccessMethodParams::IndexMethod
         | AccessMethodParams::MultiIndexScan { .. }
         | AccessMethodParams::InSeek { .. } => false,
     }
@@ -1604,7 +1453,7 @@ mod tests {
             database_id: 0,
             indexed: IndexHint::None,
         };
-        let target_expression = indexed_expression.clone();
+        let target_expression = indexed_expression;
         let target = OrderTarget {
             columns: vec![ColumnOrder {
                 source: source_id,

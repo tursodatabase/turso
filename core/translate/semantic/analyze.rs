@@ -69,19 +69,24 @@ pub(crate) fn analyze<'context, 'catalog, 'ast>(
                     .to_string(),
             ));
         }
+        #[cfg(test)]
         AnalyzeInput::TriggerPredicate {
             context,
             expression,
         } => analyzer.analyze_trigger_predicate(context, expression)?,
+        #[cfg(test)]
         AnalyzeInput::TriggerSelect { context, select } => {
             analyzer.analyze_trigger_select(context, select)?
         }
+        #[cfg(test)]
         AnalyzeInput::TriggerInsert { context, insert } => {
             analyzer.analyze_trigger_insert(context, insert)?
         }
+        #[cfg(test)]
         AnalyzeInput::TriggerUpdate { context, update } => {
             analyzer.analyze_trigger_update(context, update)?
         }
+        #[cfg(test)]
         AnalyzeInput::TriggerDelete { context, delete } => {
             analyzer.analyze_trigger_delete(context, delete)?
         }
@@ -106,7 +111,9 @@ fn collect_root_dml<'a>(
         HirRoot::Update(update) => updates.push(update),
         HirRoot::Delete(delete) => deletes.push(delete),
         HirRoot::Trigger(root) => match &root.body {
+            #[cfg(test)]
             TriggerBody::Predicate(_) => {}
+            #[cfg(test)]
             TriggerBody::Command(command) => {
                 collect_trigger_command_dml(command, inserts, updates, deletes);
             }
@@ -116,7 +123,9 @@ fn collect_root_dml<'a>(
                 }
             }
         },
-        HirRoot::Query(_) | HirRoot::SchemaExpressions(_) => {}
+        HirRoot::Query(_) => {}
+        #[cfg(test)]
+        HirRoot::SchemaExpressions(_) => {}
     }
 }
 
@@ -590,9 +599,10 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
                 .transpose()?;
 
             for expression in generated.iter().chain(default.iter()) {
-                expression.for_each(&mut |expression| match expression {
-                    Expr::Column(dependency) => pending.push(*dependency),
-                    _ => {}
+                expression.for_each(&mut |expression| {
+                    if let Expr::Column(dependency) = expression {
+                        pending.push(*dependency);
+                    }
                 });
             }
 
@@ -618,34 +628,6 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
         self.analyze_select_with_scope(
             select,
             None,
-            None,
-            None,
-            ExprPolicies::statement(self.context.dqs_dml()),
-        )
-    }
-
-    pub(super) fn analyze_select_with_expected_outputs(
-        &mut self,
-        select: &'ast ast::Select,
-        expected_outputs: &[Option<Arc<TypeDef>>],
-    ) -> Result<QueryId> {
-        self.analyze_select_with_scope(
-            select,
-            None,
-            None,
-            Some(expected_outputs),
-            ExprPolicies::statement(self.context.dqs_dml()),
-        )
-    }
-
-    pub(super) fn analyze_select_with_parent(
-        &mut self,
-        select: &'ast ast::Select,
-        parent: Option<QueryId>,
-    ) -> Result<QueryId> {
-        self.analyze_select_with_scope(
-            select,
-            parent,
             None,
             None,
             ExprPolicies::statement(self.context.dqs_dml()),
@@ -859,6 +841,7 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn analyze_select_block(
         &mut self,
         select: &'ast ast::OneSelect,
@@ -1041,6 +1024,7 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
         ))
     }
 
+    #[allow(clippy::vec_box)]
     fn analyze_values_block(
         &mut self,
         rows: &'ast [Vec<Box<ast::Expr>>],
@@ -1552,6 +1536,7 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn analyze_output(
         &mut self,
         block: QueryBlockId,
@@ -7835,7 +7820,6 @@ mod tests {
             primary.terms.as_slice(),
             [hir::ConflictTerm {
                 expr: Expr::Column(column),
-                order: ast::SortOrder::Desc,
                 ..
             }] if column.source == insert.target && column.column == 0
         ));
@@ -7849,7 +7833,6 @@ mod tests {
             .as_ref()
             .expect("ordinary UNIQUE index is frozen");
         assert_eq!(ordinary_index.value().name, "guarded_value");
-        assert_eq!(ordinary.terms[0].order, ast::SortOrder::Desc);
         assert!(ordinary.terms[0].collation.as_ref().is_some_and(
             |collation| collation.value() == &crate::translate::collate::CollationSeq::Binary
         ));
@@ -8315,8 +8298,7 @@ mod tests {
             &schema,
             "INSERT INTO writable(id) VALUES (4) RETURNING writable.*",
         )
-        .err()
-        .expect("qualified RETURNING star is rejected");
+        .expect_err("qualified RETURNING star is rejected");
         assert_eq!(
             qualified.to_string(),
             "Parse error: RETURNING may not use \"TABLE.*\" wildcards"

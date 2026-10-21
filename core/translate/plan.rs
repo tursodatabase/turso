@@ -30,11 +30,8 @@ use crate::{
     Result, VirtualTable, MAIN_DB_ID,
 };
 use rustc_hash::FxHashMap as HashMap;
-use smallvec::SmallVec;
 use std::{cmp::Ordering, marker::PhantomData, ops::Range, sync::Arc};
-use turso_parser::ast::{
-    self, Expr, FrameBound, FrameClause, FrameMode, ResolveType, SortOrder, SubqueryType,
-};
+use turso_parser::ast::{self, Expr, SortOrder, SubqueryType};
 
 use turso_parser::ast::TableInternalId;
 
@@ -659,8 +656,6 @@ pub enum Plan {
     },
     /// Runs the initial query once, then runs the recursive query for each queued row.
     RecursiveCte(Box<RecursiveCtePlan>),
-    Delete(Box<DeletePlan>),
-    Update(Box<UpdatePlan>),
 }
 
 #[derive(Debug, Clone)]
@@ -689,7 +684,7 @@ impl Plan {
                 .map(|(plan, _)| plan.estimated_cost)
                 .chain(core::iter::once(right_most.estimated_cost))
                 .try_fold(0.0, |total, cost| cost.map(|cost| total + cost)),
-            Plan::RecursiveCte(_) | Plan::Delete(_) | Plan::Update(_) => None,
+            Plan::RecursiveCte(_) => None,
         }
     }
 
@@ -711,7 +706,6 @@ impl Plan {
                 plan.initial_query.select_contains_table(table)
                     || plan.recursive_query.select_contains_table(table)
             }
-            Plan::Delete(_) | Plan::Update(_) => false,
         }
     }
 
@@ -722,7 +716,6 @@ impl Plan {
             Plan::Select(select_plan) => Some(&select_plan.query_destination),
             Plan::CompoundSelect { right_most, .. } => Some(&right_most.query_destination),
             Plan::RecursiveCte(plan) => Some(&plan.query_destination),
-            Plan::Delete(_) | Plan::Update(_) => None,
         }
     }
 
@@ -733,7 +726,6 @@ impl Plan {
             Plan::Select(select_plan) => Some(&mut select_plan.query_destination),
             Plan::CompoundSelect { right_most, .. } => Some(&mut right_most.query_destination),
             Plan::RecursiveCte(plan) => Some(&mut plan.query_destination),
-            Plan::Delete(_) | Plan::Update(_) => None,
         }
     }
 
@@ -750,9 +742,6 @@ impl Plan {
             Plan::Select(select_plan) => &select_plan.result_columns,
             Plan::CompoundSelect { right_most, .. } => &right_most.result_columns,
             Plan::RecursiveCte(plan) => plan.initial_query.select_result_columns(),
-            Plan::Delete(_) | Plan::Update(_) => {
-                panic!("select_result_columns called on a non-SELECT plan")
-            }
         }
     }
 
@@ -768,9 +757,6 @@ impl Plan {
             Plan::Select(select_plan) => &select_plan.table_references,
             Plan::CompoundSelect { right_most, .. } => &right_most.table_references,
             Plan::RecursiveCte(plan) => plan.initial_query.select_table_references(),
-            Plan::Delete(_) | Plan::Update(_) => {
-                panic!("select_table_references called on a non-SELECT plan")
-            }
         }
     }
 
@@ -801,7 +787,6 @@ impl Plan {
                 ids.extend(plan.initial_query.used_outer_query_ref_ids());
                 ids.extend(plan.recursive_query.used_outer_query_ref_ids());
             }
-            Plan::Delete(_) | Plan::Update(_) => {}
         }
         ids
     }
@@ -822,7 +807,6 @@ impl Plan {
                 plan.initial_query.reads_table(database_id, table_name)
                     || plan.recursive_query.reads_table(database_id, table_name)
             }
-            Plan::Delete(_) | Plan::Update(_) => false,
         }
     }
 }
@@ -1110,265 +1094,10 @@ impl SelectPlan {
     }
 }
 
-/// Why an UPDATE/DELETE must gather target rowids first, then apply writes.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum DmlSafetyReason {
-    /// UPDATE ... FROM computes writes from the materialized result of the FROM clause.
-    UpdateFrom,
-    /// Triggers exist, so we lock in target rows before writing.
-    Trigger,
-    /// WHERE has a subquery, so we lock in target rows before writing.
-    SubqueryInWhere,
-    /// The plan reads rowids from multiple index branches (multi-index scan).
-    MultiIndexScan,
-    /// REPLACE may delete conflicting rows while we are scanning.
-    ReplaceMode,
-    /// The statement updates key columns used by the scan itself.
-    KeyMutation,
-    /// The index method cursor does not materialize results up front,
-    /// so writes could invalidate the live iterator.
-    IndexMethodNotMaterialized,
-    /// The UPDATE changes a column referenced by an FK with a cascading
-    /// action (CASCADE / SET NULL / SET DEFAULT). The cascade can fire
-    /// triggers on referencing tables that write back to the target,
-    /// which would invalidate the live scan iterator.
-    FkCascade,
-}
-
-/// Safety decisions made while planning UPDATE/DELETE.
-#[derive(Debug, Clone, Default)]
-pub struct DmlSafety {
-    /// Why the safer "collect first, write later" mode was enabled.
-    pub reasons: SmallVec<[DmlSafetyReason; 2]>,
-}
-
-impl DmlSafety {
-    pub fn requires_stable_write_set(&self) -> bool {
-        !self.reasons.is_empty()
-    }
-
-    pub fn require(&mut self, reason: DmlSafetyReason) {
-        if !self.reasons.contains(&reason) {
-            self.reasons.push(reason);
-        }
-    }
-}
-
-#[allow(dead_code)]
-#[derive(Debug, Clone)]
-pub struct DeletePlan {
-    pub table_references: TableReferences,
-    /// the columns inside SELECT ... FROM
-    pub result_columns: Vec<ResultSetColumn>,
-    /// where clause split into a vec at 'AND' boundaries.
-    pub where_clause: Vec<WhereTerm>,
-    /// query contains a constant condition that is always false
-    pub contains_constant_false_condition: bool,
-    /// Indexes that must be updated by the delete operation.
-    pub indexes: Vec<Arc<Index>>,
-    /// When DELETE cannot safely write while scanning, we first collect rowids into a RowSet.
-    pub rowset_plan: Option<SelectPlan>,
-    /// Register ID for the RowSet (if rowset_plan is Some)
-    pub rowset_reg: Option<usize>,
-    /// Subqueries that appear in the WHERE clause (for non-rowset path)
-    pub non_from_clause_subqueries: Vec<NonFromClauseSubquery>,
-    /// Whether this DELETE plan uses the safer pre-materialization path, and why.
-    pub safety: DmlSafety,
-}
-
-#[derive(Debug, Clone)]
-pub struct UpdateSetClause {
-    pub column_index: usize,
-    /// Original user-visible SET expression.
-    pub expr: Box<ast::Expr>,
-    /// In UPDATE FROM, SET clause expressions are rewritten to read from the
-    /// scratch table populated before the write loop.
-    ///
-    /// For example, `UPDATE t SET a = s.x + 1 FROM s WHERE t.id = s.id` rewrites
-    /// the SET expression `s.x + 1` (a column reference into the FROM table + a literal 1) into a
-    /// `Column` read from the ephemeral scratch table that was populated during
-    /// the collection phase. That column in the scratch table contains the evaluated result
-    /// of s.x + 1.
-    pub update_from_result: Option<Box<ast::Expr>>,
-}
-
-impl UpdateSetClause {
-    pub fn new(column_index: usize, expr: Box<ast::Expr>) -> Self {
-        Self {
-            column_index,
-            expr,
-            update_from_result: None,
-        }
-    }
-
-    /// If UPDATE ... FROM, the this is the materialized result of a SET clause expression derived from the FROM clause;
-    /// otherwise, it is the original expression.
-    pub fn emitted_expr(&self) -> &ast::Expr {
-        self.update_from_result.as_deref().unwrap_or(&self.expr)
-    }
-}
-
-/// The SELECT plan that is used for either a) UPDATE...FROM or b) a normal UPDATE where the write set must be prematerialized;
-/// see [crate::translate::plan::DmlSafety].
-#[derive(Debug, Clone)]
-pub struct WriteSetPlan {
-    pub select: SelectPlan,
-    pub scratch_table_id: TableInternalId,
-}
-
-#[derive(Debug, Clone)]
-pub struct UpdatePlan {
-    /// The table whose rows this UPDATE mutates.
-    pub target_table: JoinedTable,
-    /// The read-side FROM graph for `UPDATE ... FROM`.
-    ///
-    /// Plain UPDATE statements keep this empty except for any outer-query
-    /// references (for example preplanned CTE definitions) that are still needed
-    /// when binding subqueries later in the pipeline.
-    pub from_tables: TableReferences,
-    /// Conflict resolution strategy (e.g., OR IGNORE, OR REPLACE)
-    pub or_conflict: Option<ResolveType>,
-    /// SET clause assignments
-    pub set_clauses: Vec<UpdateSetClause>,
-    pub where_clause: Vec<WhereTerm>,
-    /// Optional RETURNING clause.
-    pub returning: Option<Vec<ResultSetColumn>>,
-    /// Whether the WHERE clause is always false.
-    pub contains_constant_false_condition: bool,
-    pub indexes_to_update: Vec<Arc<Index>>,
-    /// Prebuilt write-set SELECT for Halloween protection / UPDATE FROM.
-    pub write_set_plan: Option<WriteSetPlan>,
-    /// For ALTER TABLE turso-db emits appropriate DDL statement in the "updates"
-    /// cell of CDC table. This field is present only for update plans created for
-    /// ALTER TABLE when CDC mode has "updates" values.
-    pub cdc_update_alter_statement: Option<String>,
-    /// Subqueries that appear in the WHERE clause (for non-ephemeral path)
-    pub non_from_clause_subqueries: Vec<NonFromClauseSubquery>,
-    /// Whether this UPDATE plan uses the safer pre-materialization path, and why.
-    pub safety: DmlSafety,
-}
-
-impl UpdatePlan {
-    /// Combine the UPDATE target (always first) and the `FROM`-clause tables
-    /// into one `TableReferences` — the read-side scope used for planning
-    /// outer-`WHERE` subqueries, `EXPLAIN QUERY PLAN`, and rendering the plan
-    /// back to SQL text via `ToTokens`.
-    /// The plan stores the two separately because the write-side emitter
-    /// treats the target table specially; this helper rejoins them for readers.
-    pub fn build_read_scope_tables(&self) -> TableReferences {
-        let mut read_scope_tables = TableReferences::new(vec![self.target_table.clone()], vec![]);
-        if self.from_tables.right_join_swapped() {
-            read_scope_tables.set_right_join_swapped();
-        }
-        read_scope_tables.extend(self.from_tables.clone());
-        read_scope_tables
-    }
-}
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum IterationDirection {
     Forwards,
     Backwards,
-}
-
-pub fn select_star(
-    tables: &[JoinedTable],
-    out_columns: &mut Vec<ResultSetColumn>,
-    right_join_swapped: bool,
-    long_names: bool,
-) -> crate::Result<()> {
-    // RIGHT JOIN swapped tables; iterate in reverse to restore original column order.
-    let table_iter: Vec<&JoinedTable> = if right_join_swapped {
-        tables.iter().rev().collect()
-    } else {
-        tables.iter().collect()
-    };
-    for table in table_iter {
-        // Semi/anti-join tables are internal (from EXISTS/NOT EXISTS unnesting)
-        // and should not contribute columns to SELECT *.
-        if table
-            .join_info
-            .as_ref()
-            .is_some_and(|ji| ji.is_semi_or_anti())
-        {
-            continue;
-        }
-        // If this table's identifier appears more than once in the FROM clause,
-        // expanding * would produce ambiguous column references (matches SQLite).
-        // However, columns deduplicated by USING/NATURAL are not ambiguous.
-        let has_duplicate_identifier = tables
-            .iter()
-            .filter(|t| t.identifier == table.identifier)
-            .count()
-            > 1;
-        if has_duplicate_identifier {
-            // Collect all USING columns from duplicate tables (both this table's
-            // own join_info and the join_info of other tables with the same identifier).
-            let using_cols: Vec<&str> = tables
-                .iter()
-                .filter(|t| t.identifier == table.identifier)
-                .filter_map(|t| t.join_info.as_ref())
-                .flat_map(|ji| ji.using.iter().map(|u| u.as_str()))
-                .collect();
-            for col in table.columns().iter().filter(|c| !c.hidden()) {
-                if let Some(col_name) = &col.name {
-                    let in_using = using_cols.iter().any(|u| u.eq_ignore_ascii_case(col_name));
-                    if !in_using {
-                        crate::bail_parse_error!(
-                            "ambiguous column name: {}.{}",
-                            table.identifier,
-                            col_name
-                        );
-                    }
-                }
-            }
-        }
-        out_columns.extend(
-            table
-                .columns()
-                .iter()
-                .enumerate()
-                .filter(|(_, col)| !col.hidden())
-                .filter(|(_, col)| {
-                    // If we are joining with USING, we need to deduplicate the columns from the right table
-                    // that are also present in the USING clause.
-                    if let Some(join_info) = &table.join_info {
-                        !join_info.using.iter().any(|using_col| {
-                            col.name
-                                .as_ref()
-                                .is_some_and(|name| name.eq_ignore_ascii_case(using_col.as_str()))
-                        })
-                    } else {
-                        true
-                    }
-                })
-                .map(|(i, col)| {
-                    // Like SQLite, SELECT * sets column names as aliases (ENAME_NAME),
-                    // bypassing full/short column name logic in get_column_name().
-                    // When long_names (full=ON, short=OFF), use "TABLE.COLUMN".
-                    // Otherwise, use just "COLUMN".
-                    let alias = col.name.as_ref().map(|col_name| {
-                        if long_names {
-                            format!("{}.{}", table.identifier, col_name)
-                        } else {
-                            col_name.clone()
-                        }
-                    });
-                    ResultSetColumn {
-                        alias,
-                        implicit_column_name: None,
-                        expr: ast::Expr::Column {
-                            database: None,
-                            table: table.internal_id,
-                            column: i,
-                            is_rowid_alias: col.is_rowid_alias(),
-                        },
-                        contains_aggregates: false,
-                    }
-                }),
-        );
-    }
-    Ok(())
 }
 
 /// The type of join between two tables.
@@ -2165,12 +1894,6 @@ impl TableReferences {
     /// Returns an immutable reference to the [OuterQueryReference]s in the query plan.
     pub fn outer_query_refs(&self) -> &[OuterQueryReference] {
         &self.outer_query_refs
-    }
-
-    /// Remove outer references after an optimizer rewrite has removed every
-    /// expression that uses them.
-    pub(crate) fn clear_outer_query_refs(&mut self) {
-        self.outer_query_refs.clear();
     }
 
     /// Returns an immutable reference to the [OuterQueryReference] with the given internal ID.
@@ -3124,9 +2847,6 @@ fn query_output_columns(
             recursive_cte.initial_query.select_result_columns(),
             recursive_cte.initial_query.select_table_references(),
         ),
-        Plan::Delete(_) | Plan::Update(_) => {
-            unreachable!("DELETE/UPDATE plans cannot define query output columns")
-        }
     };
 
     let compound_arms = match plan {
@@ -3947,127 +3667,6 @@ impl Window {
     }
 }
 
-/// Convert a parsed `FRAME` clause into the planner's `Frame`.
-/// Returns `Ok(None)` when the user wrote no FRAME clause, `Ok(Some(frame))`
-/// for an accepted clause, `Err` for shapes SQLite rejects.
-/// Validation rules ported from `sqlite3WindowCreate` (`window.c:1179-1250`)
-/// and the parser-level guard at `window.c:680-684`.
-pub fn validate_frame_clause(
-    clause: &Option<FrameClause>,
-    order_by_len: usize,
-) -> Result<Option<Frame>> {
-    let Some(clause) = clause else {
-        return Ok(None);
-    };
-    let FrameClause {
-        mode,
-        start,
-        end,
-        exclude,
-    } = clause;
-
-    let start_bound = translate_frame_bound(start, /* is_start = */ true)?;
-    let end_bound = match end {
-        Some(b) => translate_frame_bound(b, /* is_start = */ false)?,
-        // No END clause means CURRENT ROW per SQL standard.
-        None => FrameBoundary::CurrentRow,
-    };
-
-    // Combinations that can never describe a real frame (start past
-    // the end, etc.). SQLite rejects the same set at
-    // `window.c:1217-1221`.
-    let illegal = matches!(
-        (&start_bound, &end_bound),
-        (FrameBoundary::UnboundedFollowing, _)
-            | (_, FrameBoundary::UnboundedPreceding)
-            | (FrameBoundary::CurrentRow, FrameBoundary::Preceding(_))
-            | (FrameBoundary::Following(_), FrameBoundary::Preceding(_))
-            | (FrameBoundary::Following(_), FrameBoundary::CurrentRow)
-    );
-    if illegal {
-        crate::bail_parse_error!("unsupported frame specification");
-    }
-
-    // RANGE with an N PRECEDING/FOLLOWING bound does arithmetic on the
-    // ORDER BY value, so it needs exactly one ORDER BY column. SQLite
-    // enforces the same rule at `window.c:680-684`.
-    if *mode == FrameMode::Range
-        && (matches!(
-            &start_bound,
-            FrameBoundary::Preceding(_) | FrameBoundary::Following(_)
-        ) || matches!(
-            &end_bound,
-            FrameBoundary::Preceding(_) | FrameBoundary::Following(_)
-        ))
-        && order_by_len != 1
-    {
-        crate::bail_parse_error!(
-            "RANGE with offset PRECEDING/FOLLOWING requires one ORDER BY expression"
-        );
-    }
-
-    Ok(Some(Frame {
-        mode: *mode,
-        start: start_bound,
-        end: end_bound,
-        exclude: exclude.clone(),
-    }))
-}
-
-/// Convert a parser-level `FrameBound` to the planner's `FrameBoundary`,
-/// cloning any offset expression out of the AST for the emit code to
-/// evaluate.
-fn translate_frame_bound(bound: &FrameBound, is_start: bool) -> Result<FrameBoundary> {
-    // The parser enforces start/end orientation: TK_PRECEDING is only
-    // emitted as a start bound, TK_FOLLOWING only as an end bound
-    // (parser.rs: `frame_start_bound` / `frame_end_bound`). Mirrors
-    // SQLite's parser-level guarantee at window.c:1213-1215.
-    match bound {
-        FrameBound::CurrentRow => Ok(FrameBoundary::CurrentRow),
-        FrameBound::UnboundedPreceding => {
-            debug_assert!(
-                is_start,
-                "parser only emits UNBOUNDED PRECEDING as a start bound"
-            );
-            Ok(FrameBoundary::UnboundedPreceding)
-        }
-        FrameBound::UnboundedFollowing => {
-            debug_assert!(
-                !is_start,
-                "parser only emits UNBOUNDED FOLLOWING as an end bound"
-            );
-            Ok(FrameBoundary::UnboundedFollowing)
-        }
-        FrameBound::Preceding(expr) => Ok(FrameBoundary::Preceding(expr.clone())),
-        FrameBound::Following(expr) => Ok(FrameBoundary::Following(expr.clone())),
-    }
-}
-
-/// A named WINDOW clause definition, captured before any function references
-/// it. The effective frame belongs to the resolved `Window` instance the
-/// planner spawns when a function attaches. Whether the user wrote a frame is
-/// retained because SQLite forbids chaining from a framed base window.
-///
-/// `bound` holds the already-bound `partition_by` / `order_by`. The
-/// first `resolve_window` that needs them *takes* them by moving;
-/// subsequent attachments under a different coerced frame deep-clone
-/// from a sister resolved `Window`. This keeps the common case
-/// (1 function per name, or N functions all sharing one frame) at
-/// zero extra clones vs. the old "mutated stub" model.
-#[derive(Debug, Clone)]
-pub struct NamedWindowDef {
-    pub name: String,
-    /// User-written FRAME clause preserved so a function attaching by
-    /// `Over::Name` can compute its effective frame from it.
-    pub user_frame_clause: Option<FrameClause>,
-    /// The bound PARTITION BY / ORDER BY expressions. The first function
-    /// to attach takes them (leaving `None`); any later function under a
-    /// different coerced frame copies them back from a resolved `Window`.
-    /// They live here, rather than inside the frame, so taking them
-    /// doesn't disturb `user_frame_clause`.
-    pub bound: Option<NamedWindowBound>,
-}
-
 #[derive(Debug, Clone)]
 pub struct NamedWindowBound {
     pub partition_by: Vec<Expr>,
@@ -4185,40 +3784,6 @@ pub enum SubqueryState {
     },
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SubqueryPosition {
-    ResultColumn,
-    Where,
-    GroupBy,
-    Having,
-    OrderBy,
-    LimitOffset,
-}
-
-impl SubqueryPosition {
-    /// Returns true if a subquery in this position of the SELECT can be correlated, i.e. if it can reference columns from the outer query.
-    pub fn allow_correlated(&self) -> bool {
-        matches!(
-            self,
-            SubqueryPosition::ResultColumn
-                | SubqueryPosition::Where
-                | SubqueryPosition::GroupBy
-                | SubqueryPosition::OrderBy
-        )
-    }
-
-    pub fn name(&self) -> &'static str {
-        match self {
-            SubqueryPosition::ResultColumn => "SELECT list",
-            SubqueryPosition::Where => "WHERE",
-            SubqueryPosition::GroupBy => "GROUP BY",
-            SubqueryPosition::Having => "HAVING",
-            SubqueryPosition::OrderBy => "ORDER BY",
-            SubqueryPosition::LimitOffset => "LIMIT/OFFSET",
-        }
-    }
-}
-
 #[derive(Debug, Clone)]
 /// A subquery that is not part of the `FROM` clause.
 /// This is used for subqueries in the WHERE clause, HAVING clause, ORDER BY clause, LIMIT clause, OFFSET clause, etc.
@@ -4333,7 +3898,6 @@ fn eval_at_for_plan(
                 eval_at_for_plan(&recursive_cte.recursive_query, join_order, table_references)?;
             Ok(initial_query.max(recursive_query))
         }
-        Plan::Delete(_) | Plan::Update(_) => Ok(EvalAt::BeforeLoop),
     }
 }
 
@@ -4348,7 +3912,6 @@ pub fn plan_is_correlated(plan: &Plan) -> bool {
             plan_is_correlated(&recursive_cte.initial_query)
                 || plan_is_correlated(&recursive_cte.recursive_query)
         }
-        Plan::Delete(_) | Plan::Update(_) => false,
     }
 }
 
@@ -4434,7 +3997,6 @@ fn plan_has_outer_scope_dependency_with_tables(
                 accessible_table_ids,
             )
         }
-        Plan::Delete(_) | Plan::Update(_) => false,
     }
 }
 
@@ -4447,10 +4009,6 @@ fn plan_has_outer_scope_dependency_with_tables(
 /// query row. Those plans are still safe to materialize once and reuse.
 pub fn plan_has_outer_scope_dependency(plan: &Plan) -> bool {
     plan_has_outer_scope_dependency_with_tables(plan, &mut Vec::new())
-}
-
-pub fn select_plan_has_outer_scope_dependency(plan: &SelectPlan) -> bool {
-    select_plan_has_outer_scope_dependency_with_tables(plan, &mut Vec::new())
 }
 
 /// Determine when a SELECT plan can be evaluated, including nested non-FROM and FROM-clause subqueries.

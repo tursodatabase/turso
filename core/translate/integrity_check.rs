@@ -45,12 +45,7 @@ struct BoundIntegrityIndex {
     columns: Vec<BoundIndexColumn>,
 }
 
-/// The HIR settings the integrity check plans its row reads with, when HIR
-/// is on.
-type HirContext<'a> = Option<(
-    &'a crate::sync::Arc<Schema>,
-    &'a crate::translate::semantic_lowering::HirSettings<'a>,
-)>;
+use crate::translate::HirContext;
 
 /// Translate PRAGMA integrity_check.
 pub fn translate_integrity_check(
@@ -347,9 +342,12 @@ fn translate_integrity_check_impl(
                         reporter.not_null(program, values + i, &btree_table.name, col_name);
                     }
                     let checks = values + layout.not_null.len();
-                    for i in 0..btree_table.check_constraints.len() {
-                        reporter.check(program, checks + i, &btree_table.name);
-                    }
+                    reporter.checks(
+                        program,
+                        checks,
+                        btree_table.check_constraints.len(),
+                        &btree_table.name,
+                    );
                     for (index, offsets) in indexes.iter().zip(&layout.indexes) {
                         let skip_current_index = program.allocate_label();
                         if let Some(predicate) = offsets.predicate {
@@ -493,21 +491,34 @@ impl Reporter {
         program.preassign_label_to_next_insn(not_null_ok);
     }
 
-    /// Report a CHECK constraint whose value is in `check_reg`. It passes
-    /// when the value is TRUE or NULL; only FALSE is a violation.
-    fn check(&self, program: &mut ProgramBuilder, check_reg: usize, table: &str) {
-        let check_ok = program.allocate_label();
-        program.emit_insn(Insn::If {
-            reg: check_reg,
-            target_pc: check_ok,
-            jump_if_null: true,
-        });
+    /// Report the row's CHECK constraints, whose values are in `count`
+    /// registers from `first_reg`. A constraint passes when its value is
+    /// TRUE or NULL; only FALSE is a violation. Like SQLite, a row is
+    /// reported once however many of its constraints fail.
+    fn checks(&self, program: &mut ProgramBuilder, first_reg: usize, count: usize, table: &str) {
+        if count == 0 {
+            return;
+        }
+        let failed = program.allocate_label();
+        let all_ok = program.allocate_label();
+        for i in 0..count {
+            let check_ok = program.allocate_label();
+            program.emit_insn(Insn::If {
+                reg: first_reg + i,
+                target_pc: check_ok,
+                jump_if_null: true,
+            });
+            program.emit_insn(Insn::Goto { target_pc: failed });
+            program.preassign_label_to_next_insn(check_ok);
+        }
+        program.emit_insn(Insn::Goto { target_pc: all_ok });
+        program.preassign_label_to_next_insn(failed);
         program.emit_string8(
             format!("CHECK constraint failed in {table}"),
             self.message_reg,
         );
         self.report(program);
-        program.preassign_label_to_next_insn(check_ok);
+        program.preassign_label_to_next_insn(all_ok);
     }
 
     /// Check that the index has an entry for the row whose key columns and
@@ -629,9 +640,7 @@ fn hir_table_rows(
     table: &BTreeTable,
     indexes: &[crate::sync::Arc<Index>],
 ) -> crate::Result<TableRows> {
-    let Some((schema, settings)) = hir else {
-        return Ok(TableRows::Legacy);
-    };
+    let (schema, settings) = hir;
     let Some(rowid_name) = ["rowid", "_rowid_", "oid"].into_iter().find(|name| {
         !table.columns().iter().any(|column| {
             column
@@ -869,19 +878,20 @@ fn emit_legacy_table_rows(
         reporter.not_null(program, col_value_reg, &btree_table.name, col_name);
     }
 
-    for check_expr in &bound_checks {
-        // Evaluate the CHECK expression into a register, then branch.
-        let check_reg = program.alloc_register();
+    // Evaluate every CHECK expression into a register, then report the row
+    // once if any failed.
+    let check_regs = program.alloc_registers(bound_checks.len());
+    for (i, check_expr) in bound_checks.iter().enumerate() {
         translate_expr_no_constant_opt(
             program,
             Some(&table_references),
             check_expr,
-            check_reg,
+            check_regs + i,
             resolver,
             NoConstantOptReason::RegisterReuse,
         )?;
-        reporter.check(program, check_reg, &btree_table.name);
     }
+    reporter.checks(program, check_regs, bound_checks.len(), &btree_table.name);
 
     for (index, bound_index) in indexes.iter().zip(&bound_indexes) {
         let skip_current_index = program.allocate_label();

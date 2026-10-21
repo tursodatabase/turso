@@ -309,6 +309,7 @@ impl ExprPolicies {
 type ExprChildren = SmallVec<[ResolvedScopeExpr; 3]>;
 type FrameChildren = SmallVec<[FrameValue; 3]>;
 
+#[allow(clippy::large_enum_variant)]
 enum FrameValue {
     Scalar(ResolvedScopeExpr),
     RowSubquery {
@@ -539,11 +540,13 @@ struct FunctionWindowFrame {
 #[derive(Clone)]
 struct NamedFunctionWindow {
     name: String,
+    #[allow(clippy::vec_box)]
     partition_by: Vec<Box<ast::Expr>>,
     order_by: Vec<ast::SortedColumn>,
     frame: Option<ast::FrameClause>,
 }
 
+#[allow(clippy::large_enum_variant)]
 enum FunctionOver {
     Named(String),
     Inline {
@@ -656,6 +659,7 @@ impl FunctionOrderTerm {
     }
 }
 
+#[allow(clippy::large_enum_variant)]
 enum FunctionInput {
     Star,
     Expressions {
@@ -1169,9 +1173,9 @@ impl<'a> ExprFrame<'a> {
                     )
                 }
             }
-            ast::Expr::Raise(_, message) => {
-                (self.next_child == 0).then(|| message.as_deref()).flatten()
-            }
+            ast::Expr::Raise(_, message) => (self.next_child == 0)
+                .then_some(message.as_deref())
+                .flatten(),
             _ => None,
         };
         if child.is_some() {
@@ -1280,7 +1284,7 @@ fn take_expression_operands<'a>(
     }
 
     let mut children = children.into_iter();
-    Ok(syntaxes
+    syntaxes
         .into_iter()
         .map(|syntax| {
             let values = children
@@ -1306,7 +1310,7 @@ fn take_expression_operands<'a>(
             );
             Ok(ExprOperand { expr, components })
         })
-        .collect::<Result<_>>()?)
+        .collect::<Result<_>>()
 }
 
 fn take_scalar_operand(mut operand: ExprOperand) -> Result<ResolvedScopeExpr> {
@@ -1372,12 +1376,14 @@ fn frame_bound_expr(bound: &ast::FrameBound) -> Option<&ast::Expr> {
 }
 
 fn window_function_ignores_frame(name: &ast::Name, argument_count: usize) -> bool {
-    match (normalize_ident(name.as_str()).as_str(), argument_count) {
-        ("row_number" | "rank" | "dense_rank" | "percent_rank" | "cume_dist", 0)
-        | ("ntile", 1)
-        | ("lag" | "lead", 1..=3) => true,
-        _ => false,
-    }
+    matches!(
+        (normalize_ident(name.as_str()).as_str(), argument_count),
+        (
+            "row_number" | "rank" | "dense_rank" | "percent_rank" | "cume_dist",
+            0
+        ) | ("ntile", 1)
+            | ("lag" | "lead", 1..=3)
+    )
 }
 
 fn function_ignores_user_frame(function: &Func) -> bool {
@@ -2953,6 +2959,7 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
         ))
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn build_function_call(
         &mut self,
         name: &ast::Name,

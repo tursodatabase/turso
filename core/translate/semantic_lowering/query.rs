@@ -2048,14 +2048,16 @@ fn hir_group_rowids(query: &hir::Query, block: &hir::QueryBlock) -> Vec<SourceId
     for output in &block.outputs {
         collect(&output.expr);
     }
-    if let hir::QueryBlockBody::Select { grouping, .. } = &block.body {
-        if let Some(grouping) = grouping {
-            for key in &grouping.keys {
-                collect(key);
-            }
-            if let Some(having) = &grouping.having {
-                collect(having);
-            }
+    if let hir::QueryBlockBody::Select {
+        grouping: Some(grouping),
+        ..
+    } = &block.body
+    {
+        for key in &grouping.keys {
+            collect(key);
+        }
+        if let Some(having) = &grouping.having {
+            collect(having);
         }
     }
     for term in &query.order_by {
@@ -2495,7 +2497,7 @@ fn emit_hir_compound_query(
         )?;
         let collection_destination = QueryDestination::EphemeralIndex {
             cursor_id: collection_cursor,
-            index: collection_index.clone(),
+            index: collection_index,
             affinity_str: None,
             is_delete: false,
         };
@@ -3076,7 +3078,6 @@ pub(super) struct PreparedHirOrUnionLoop<'a> {
 /// A scan through a query pattern of an index method, such as FTS: the
 /// index returns rowids, and the values of the pattern's result columns.
 pub(super) struct PreparedHirIndexMethodLoop<'a> {
-    source: &'a hir::Source,
     access: &'a crate::translate::hir_index_method::HirIndexMethodAccess,
     index_cursor: CursorID,
     table_cursor: CursorID,
@@ -3093,8 +3094,7 @@ pub(super) struct PreparedHirRegistersLoop<'a> {
 /// A FROM subquery or CTE that runs as a coroutine: the loop resumes it for
 /// each row instead of reading a materialized table, so an outer LIMIT can
 /// stop it early, as in legacy.
-pub(super) struct PreparedHirCoroutineLoop<'a> {
-    source: &'a hir::Source,
+pub(super) struct PreparedHirCoroutineLoop {
     yield_reg: usize,
     start: BranchOffset,
 }
@@ -3120,7 +3120,7 @@ pub(super) enum PreparedHirLoop<'a> {
     OrUnion(PreparedHirOrUnionLoop<'a>),
     Materialized(PreparedHirMaterializedLoop<'a>),
     Registers(PreparedHirRegistersLoop<'a>),
-    Coroutine(PreparedHirCoroutineLoop<'a>),
+    Coroutine(PreparedHirCoroutineLoop),
     Hash(PreparedHirHashLoop<'a>),
 }
 
@@ -3177,6 +3177,10 @@ pub(super) struct PreparedHirHashLoop<'a> {
     waiting_pass: usize,
     /// Where the waiting pass looks for the next match.
     waiting_next: BranchOffset,
+    /// 1 once the hash table is built. The unmatched-row pass of an outer
+    /// join before this loop emits the loops after it again, and that copy
+    /// must not build the table a second time.
+    built: usize,
     /// Legacy's materialized build input, when the hash table is built from
     /// the joined rows of earlier loops rather than from the whole table.
     build_input: Option<PreparedHirHashBuildInput<'a>>,
@@ -3248,6 +3252,12 @@ pub(super) struct HirLeftJoin {
     owner: SourceId,
     first_loop: usize,
     last_loop: usize,
+    /// The first loop whose WHERE terms wait until `last_loop` records the
+    /// match, like SQLite checks WHERE terms on a LEFT JOIN's right table
+    /// after setting its match flag. For an outer hash join this is the
+    /// probe loop: a term that drops a probe row must not keep it from
+    /// matching a build row.
+    where_from: usize,
     null_extends: bool,
     metadata: LeftJoinMetadata,
     null_cursors: Vec<CursorID>,
@@ -4558,6 +4568,7 @@ impl HirLoopNest<'_, '_> {
                     owner: left_join.owner,
                     first_loop: left_join.first_loop,
                     last_loop: left_join.last_loop,
+                    where_from: left_join.where_from,
                     null_extends: left_join.null_extends,
                     metadata: LeftJoinMetadata::new(program),
                     null_cursors: left_join.null_cursors.clone(),
@@ -4716,7 +4727,16 @@ impl HirLoopNest<'_, '_> {
             program.preassign_label_to_next_insn(labels.body);
         }
 
-        let innermost_next = loops.last().map_or(outer_next, |hir_loop| hir_loop.next);
+        // A row the body skips, for OFFSET or a NULL MIN/MAX value, is done
+        // with its outer row when the last loop is a semi-join or anti-join:
+        // going on with that loop's rows would emit the outer row again.
+        let innermost_next = match loops.len().checked_sub(1) {
+            None => outer_next,
+            Some(last) if self.semi_anti[first + last].is_some() => {
+                semi_anti_next_outer(&loops, last)
+            }
+            Some(last) => loops[last].next,
+        };
         match self.body {
             HirLoopBody::Rows(output, outputs) => {
                 let start = query_output_registers(program, outputs, output.needs_values())?;
@@ -5393,6 +5413,7 @@ fn prepare_hir_left_joins(
                 owner: *owner,
                 first_loop,
                 last_loop,
+                where_from: hash_loop.map_or(first_loop, |hash_loop| hash_loop - 1),
                 null_extends: *null_extends,
                 metadata: LeftJoinMetadata::new(program),
                 null_cursors,
@@ -5955,7 +5976,6 @@ fn prepare_hir_coroutine_loop<'a>(
         },
     );
     Ok(PreparedHirLoop::Coroutine(PreparedHirCoroutineLoop {
-        source,
         yield_reg,
         start,
     }))
@@ -6127,6 +6147,14 @@ fn prepare_hir_hash_loop<'a>(
         probe_rowid: program.alloc_register(),
         waiting_pass: program.alloc_register(),
         waiting_next: program.allocate_label(),
+        built: {
+            let built = program.alloc_register();
+            program.emit_insn(Insn::Integer {
+                value: 0,
+                dest: built,
+            });
+            built
+        },
         build_input,
     })
 }
@@ -6388,6 +6416,11 @@ fn start_hir_hash_loop(
     let column_count = prepared.payload_width;
 
     let built = program.allocate_label();
+    program.emit_insn(Insn::IfPos {
+        reg: prepared.built,
+        target_pc: built,
+        decrement_by: 0,
+    });
     program.emit_insn(Insn::Once {
         target_pc_when_reentered: built,
     });
@@ -6488,6 +6521,10 @@ fn start_hir_hash_loop(
     program.preassign_label_to_next_insn(build_end);
     program.emit_insn(Insn::HashBuildFinalize {
         hash_table_id: prepared.hash_table,
+    });
+    program.emit_insn(Insn::Integer {
+        value: 1,
+        dest: prepared.built,
     });
     program.preassign_label_to_next_insn(built);
     match &prepared.build_input {
@@ -6973,7 +7010,6 @@ fn prepare_hir_index_method_loop<'a>(
             .map(|(_, column)| *column)
     })?;
     Ok(PreparedHirIndexMethodLoop {
-        source,
         access,
         index_cursor,
         table_cursor,
@@ -7357,11 +7393,11 @@ fn emit_hir_recursive_cte(
     )
 }
 
-fn validate_hir_materialized_query<'a>(
-    plan: &'a HirPlan,
+fn validate_hir_materialized_query(
+    plan: &HirPlan,
     source_id: SourceId,
     materialized_query: HirMaterializedQuery,
-) -> Result<&'a hir::Source> {
+) -> Result<&hir::Source> {
     let document = &plan.document;
     let query_id = materialized_query.query();
     let source = document.source(source_id).ok_or_else(|| {
@@ -8058,7 +8094,7 @@ fn emit_ready_predicates(
             continue;
         }
         let references_ready_at =
-            predicate_loop(program, document, &predicate.expr, &block_plan.loops)?;
+            predicate_loop(program, document, &predicate.expr, block_plan.loops)?;
         let evaluate_at = match kind {
             HirPredicateKind::Join(source) => {
                 let owner = left_joins
@@ -8083,7 +8119,7 @@ fn emit_ready_predicates(
                     _ => ready,
                 };
                 left_joins.iter().fold(ready, |ready, left_join| {
-                    if left_join.first_loop <= ready && ready <= left_join.last_loop {
+                    if left_join.where_from <= ready && ready <= left_join.last_loop {
                         left_join.last_loop
                     } else {
                         ready
@@ -8925,6 +8961,7 @@ struct HirWindowLayer<'a> {
 }
 
 impl<'a> HirWindowLayer<'a> {
+    #[allow(clippy::too_many_arguments)]
     fn prepare(
         program: &mut ProgramBuilder,
         document: &'a HirDocument,
@@ -9567,9 +9604,8 @@ pub(super) mod tests {
             },
             SemanticRootInput::Statement(&statement),
         )
-        .map(|document| {
+        .inspect(|document| {
             document.validate().expect("HIR validates");
-            document
         })
         .expect("SQL analyzes");
         (document, schema)

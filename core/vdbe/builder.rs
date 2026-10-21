@@ -185,22 +185,14 @@ pub enum SelfTableContext {
     },
 }
 
-#[derive(Clone)]
-enum DmlColumnRegisters {
-    // Used to compute column registers lazily
-    Layout {
-        base_reg: usize,
-        rowid_reg: usize,
-        layout: ColumnLayout,
-    },
-    Indexed {
-        column_regs: Vec<usize>,
-    },
-}
-
+/// Where a DML statement keeps the values of the row it writes: the
+/// columns in `layout` from `base_reg`, and the rowid alias, if any, in
+/// `rowid_reg`.
 #[derive(Clone)]
 pub struct DmlColumnContext {
-    registers: DmlColumnRegisters,
+    base_reg: usize,
+    rowid_reg: usize,
+    layout: ColumnLayout,
     rowid_alias_col: Option<usize>,
 }
 
@@ -214,44 +206,18 @@ impl DmlColumnContext {
         let rowid_alias_col = columns.iter().position(|c| c.is_rowid_alias());
 
         Self {
-            registers: DmlColumnRegisters::Layout {
-                base_reg,
-                rowid_reg,
-                layout,
-            },
-            rowid_alias_col,
-        }
-    }
-
-    pub fn from_column_reg_mapping<'a>(pairs: impl Iterator<Item = (&'a Column, usize)>) -> Self {
-        let mut rowid_alias_col = None;
-        let mut column_regs = Vec::new();
-        for (idx, (col, reg)) in pairs.enumerate() {
-            column_regs.push(reg);
-            if col.is_rowid_alias() {
-                rowid_alias_col = Some(idx);
-            }
-        }
-        Self {
-            registers: DmlColumnRegisters::Indexed { column_regs },
+            base_reg,
+            rowid_reg,
+            layout,
             rowid_alias_col,
         }
     }
 
     pub fn to_column_reg(&self, col_idx: usize) -> usize {
-        match &self.registers {
-            DmlColumnRegisters::Layout {
-                base_reg,
-                rowid_reg,
-                layout,
-            } => {
-                if self.rowid_alias_col == Some(col_idx) {
-                    *rowid_reg
-                } else {
-                    layout.to_register(*base_reg, col_idx)
-                }
-            }
-            DmlColumnRegisters::Indexed { column_regs } => column_regs[col_idx],
+        if self.rowid_alias_col == Some(col_idx) {
+            self.rowid_reg
+        } else {
+            self.layout.to_register(self.base_reg, col_idx)
         }
     }
 }
@@ -1267,43 +1233,6 @@ impl ProgramBuilder {
         reg
     }
 
-    /// Allow later code to use registers that a removed plan had reserved.
-    pub(crate) fn release_registers(&mut self, start: usize, amount: usize) {
-        if amount == 0 {
-            return;
-        }
-        let end = start.checked_add(amount).expect("register range overflow");
-        turso_assert!(start > 0 && end <= self.next_free_register);
-        self.free_register_ranges.push(start..end);
-        self.free_register_ranges
-            .sort_unstable_by_key(|range| range.start);
-
-        let mut merged: Vec<Range<usize>> = Vec::with_capacity(self.free_register_ranges.len());
-        for range in self.free_register_ranges.drain(..) {
-            if let Some(last) = merged.last_mut() {
-                turso_assert!(last.end <= range.start, "register range released twice");
-                if last.end == range.start {
-                    last.end = range.end;
-                    continue;
-                }
-            }
-            merged.push(range);
-        }
-        self.free_register_ranges = merged;
-
-        while self
-            .free_register_ranges
-            .last()
-            .is_some_and(|range| range.end == self.next_free_register)
-        {
-            let range = self
-                .free_register_ranges
-                .pop()
-                .expect("last register range was present");
-            self.next_free_register = range.start;
-        }
-    }
-
     /// Returns the next register that will be allocated by alloc_register/alloc_registers.
     pub const fn peek_next_register(&self) -> usize {
         self.next_free_register
@@ -1387,31 +1316,6 @@ impl ProgramBuilder {
         self.cursor_ref.push((key, cursor_type));
         turso_assert_eq!(self.cursor_ref.len(), self.next_free_cursor_id);
         cursor
-    }
-
-    /// Allow later code to use a cursor that a removed plan had reserved.
-    pub(crate) fn release_cursor_id(&mut self, cursor_id: usize) {
-        turso_assert!(cursor_id < self.next_free_cursor_id);
-        turso_assert!(!self.free_cursor_ids.contains(&cursor_id));
-
-        if cursor_id + 1 == self.next_free_cursor_id {
-            self.cursor_ref.pop();
-            self.next_free_cursor_id -= 1;
-            while let Some(index) = self
-                .free_cursor_ids
-                .iter()
-                .position(|id| *id + 1 == self.next_free_cursor_id)
-            {
-                self.free_cursor_ids.remove(index);
-                self.cursor_ref.pop();
-                self.next_free_cursor_id -= 1;
-            }
-            return;
-        }
-
-        self.free_cursor_ids.push(cursor_id);
-        self.free_cursor_ids
-            .sort_unstable_by(|left, right| right.cmp(left));
     }
 
     pub fn add_pragma_result_column(&mut self, col_name: String) {

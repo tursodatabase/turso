@@ -1733,9 +1733,8 @@ mod tests {
             },
             SemanticRootInput::Statement(&statement),
         )
-        .map(|document| {
+        .inspect(|document| {
             document.validate().expect("HIR validates");
-            document
         })
         .expect("SQL analyzes")
     }

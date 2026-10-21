@@ -100,22 +100,28 @@ pub(crate) fn analyze_root(
 
 pub(crate) enum AnalyzeInput<'ast> {
     Statement(&'ast turso_parser::ast::Stmt),
+    /// One trigger body part on its own, which the analyzer tests analyze.
+    #[cfg(test)]
     TriggerPredicate {
         context: TriggerAnalysis,
         expression: &'ast turso_parser::ast::Expr,
     },
+    #[cfg(test)]
     TriggerSelect {
         context: TriggerAnalysis,
         select: &'ast turso_parser::ast::Select,
     },
+    #[cfg(test)]
     TriggerInsert {
         context: TriggerAnalysis,
         insert: TriggerInsert<'ast>,
     },
+    #[cfg(test)]
     TriggerUpdate {
         context: TriggerAnalysis,
         update: TriggerUpdate<'ast>,
     },
+    #[cfg(test)]
     TriggerDelete {
         context: TriggerAnalysis,
         delete: TriggerDelete<'ast>,

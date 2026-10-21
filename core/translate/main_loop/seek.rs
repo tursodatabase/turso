@@ -22,64 +22,6 @@ fn index_seek_affinities<E>(
         .collect()
 }
 
-fn encode_seek_keys_for_custom_types(
-    program: &mut ProgramBuilder,
-    tables: &TableReferences,
-    seek_index: &Arc<Index>,
-    start_reg: usize,
-    num_keys: usize,
-    idx_col_offset: usize,
-    resolver: &Resolver<'_>,
-) -> crate::Result<()> {
-    let table = tables
-        .find_table_by_identifier(&seek_index.table_name)
-        .or_else(|| tables.find_table_by_table_name(&seek_index.table_name));
-    let table = match table {
-        Some(t) => t,
-        None => return Ok(()),
-    };
-    let columns = table.columns();
-    for i in 0..num_keys {
-        let idx_col_pos = idx_col_offset + i;
-        if idx_col_pos >= seek_index.columns.len() {
-            break;
-        }
-        let idx_col = &seek_index.columns[idx_col_pos];
-        let table_col = match columns.get(idx_col.pos_in_table) {
-            Some(c) => c,
-            None => continue,
-        };
-        let type_def = match resolver
-            .schema()
-            .get_type_def(&table_col.ty_str, table.is_strict())
-        {
-            Some(td) => td,
-            None => continue,
-        };
-        let encode_expr = match type_def.encode() {
-            Some(e) => e,
-            None => continue,
-        };
-        let reg = start_reg + i;
-        let skip_label = program.allocate_label();
-        program.emit_insn(Insn::IsNull {
-            reg,
-            target_pc: skip_label,
-        });
-        crate::translate::expr::emit_type_expr(
-            program,
-            encode_expr,
-            reg,
-            reg,
-            table_col,
-            type_def,
-            resolver,
-        )?;
-        program.preassign_label_to_next_insn(skip_label);
-    }
-    Ok(())
-}
-
 pub(crate) trait SeekExpressionLowering<E> {
     fn emit_expression(
         &mut self,
@@ -106,80 +48,6 @@ pub(crate) trait SeekExpressionLowering<E> {
     fn rowid_affinity(&self) -> Affinity;
 }
 
-pub(super) struct LegacySeekExpressionLowering<'a, 'plan> {
-    tables: &'a TableReferences,
-    t_ctx: &'a mut TranslateCtx<'plan>,
-}
-
-impl SeekExpressionLowering<Expr> for LegacySeekExpressionLowering<'_, '_> {
-    fn emit_expression(
-        &mut self,
-        program: &mut ProgramBuilder,
-        expression: &Expr,
-        target: usize,
-    ) -> Result<()> {
-        translate_expr_no_constant_opt(
-            program,
-            Some(self.tables),
-            expression,
-            target,
-            &self.t_ctx.resolver,
-            NoConstantOptReason::RegisterReuse,
-        )?;
-        Ok(())
-    }
-
-    fn is_nonnull(&self, expression: &Expr) -> bool {
-        expression.is_nonnull(self.tables)
-    }
-
-    fn is_null_matching(&self, operator: turso_parser::ast::Operator, expression: &Expr) -> bool {
-        operator == turso_parser::ast::Operator::Is
-            && !crate::translate::plan::is_non_null_literal(expression)
-    }
-
-    fn affinity(&self, affinity: Affinity, expression: &Expr) -> Affinity {
-        if affinity.expr_needs_no_affinity_change(expression) {
-            Affinity::Blob
-        } else {
-            affinity
-        }
-    }
-
-    fn encode_index_keys(
-        &mut self,
-        program: &mut ProgramBuilder,
-        index: &Arc<Index>,
-        start_reg: usize,
-        num_keys: usize,
-        index_column_offset: usize,
-    ) -> Result<()> {
-        encode_seek_keys_for_custom_types(
-            program,
-            self.tables,
-            index,
-            start_reg,
-            num_keys,
-            index_column_offset,
-            &self.t_ctx.resolver,
-        )
-    }
-
-    fn rowid_affinity(&self) -> Affinity {
-        self.tables
-            .joined_tables()
-            .iter()
-            .find_map(|table| {
-                table
-                    .columns()
-                    .iter()
-                    .find(|column| column.is_rowid_alias())
-                    .map(|column| column.affinity())
-            })
-            .unwrap_or(Affinity::Numeric)
-    }
-}
-
 /// Seek-based loop setup.
 ///
 /// A seek loop has a real two-phase contract:
@@ -194,31 +62,6 @@ pub(crate) struct SeekEmitter<'a, E, L> {
     loop_end: BranchOffset,
     seek_index: Option<&'a Arc<Index>>,
     is_index: bool,
-}
-
-impl<'a, 'plan> SeekEmitter<'a, Expr, LegacySeekExpressionLowering<'a, 'plan>> {
-    #[allow(clippy::too_many_arguments)]
-    pub(super) fn new(
-        program: &'a mut ProgramBuilder,
-        tables: &'a TableReferences,
-        seek_def: &'a SeekDef,
-        t_ctx: &'a mut TranslateCtx<'plan>,
-        seek_cursor_id: usize,
-        start_reg: usize,
-        loop_end: BranchOffset,
-        seek_index: Option<&'a Arc<Index>>,
-    ) -> Self {
-        Self {
-            program,
-            seek_def,
-            lowering: LegacySeekExpressionLowering { tables, t_ctx },
-            seek_cursor_id,
-            start_reg,
-            loop_end,
-            seek_index,
-            is_index: seek_index.is_some(),
-        }
-    }
 }
 
 impl<'a, E, L: SeekExpressionLowering<E>> SeekEmitter<'a, E, L> {

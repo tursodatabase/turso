@@ -5,6 +5,7 @@ mod cdc;
 mod delete;
 mod dml;
 mod emit;
+pub(crate) use emit::format_unique_violation_desc;
 pub(super) mod expr;
 mod fkey;
 mod fkey_action;
@@ -250,7 +251,7 @@ impl PlannedSelect {
                     ResolvedResultValue::Column(source) if !column.name_is_alias => {
                         source.column_name
                     }
-                    ResolvedResultValue::RowId(name) if !column.name_is_alias => name,
+                    ResolvedResultValue::RowId { name, .. } if !column.name_is_alias => name,
                     _ => column.name,
                 };
                 Ok((name, output.schema_affinity.short_type_name()))
@@ -287,6 +288,47 @@ impl PlannedSelect {
         })?;
         Ok(values)
     }
+}
+
+/// The DELETE that DROP TABLE runs first when foreign keys are on and other
+/// tables reference the table, as SQLite does: it fires the ON DELETE
+/// actions of those foreign keys and counts the RESTRICT and NO ACTION
+/// violations, with the table's own triggers off. The caller checks the
+/// count.
+pub(crate) fn translate_drop_table_delete(
+    database: &str,
+    table: &str,
+    schema: &Arc<Schema>,
+    settings: &HirSettings<'_>,
+    program: &mut ProgramBuilder,
+    connection: &Arc<Connection>,
+) -> Result<()> {
+    let statement = ast::Stmt::Delete {
+        with: None,
+        tbl_name: ast::QualifiedName {
+            db_name: Some(ast::Name::exact(database.to_string())),
+            name: ast::Name::exact(table.to_string()),
+            alias: None,
+        },
+        indexed: None,
+        where_clause: None,
+        returning: Vec::new(),
+    };
+    let session = HirSession::new(schema, settings, connection)?;
+    let plan = session.plan(SemanticRootInput::Statement(&statement))?;
+    let (HirRoot::Delete(delete), HirRootPlan::Delete(access)) = (&plan.document.root, &plan.root)
+    else {
+        return Err(LimboError::InternalError(
+            "HIR DELETE analysis did not produce a DELETE root".into(),
+        ));
+    };
+    delete::check(&plan.document, delete, access)?;
+    let subprograms = Subprograms {
+        actions: fkey_action::delete_actions(&session, program, delete)?,
+        ..Subprograms::default()
+    };
+    program.set_hir_plan(plan.clone());
+    delete::emit_delete(program, &plan, delete, access, &subprograms)
 }
 
 /// Prepare a top-level DELETE through semantic HIR.
@@ -619,8 +661,13 @@ pub(crate) enum ResolvedResultValue {
     Expression,
     /// The output reads one source column directly.
     Column(ResolvedResultSourceColumn),
-    /// The output reads a source rowid; this is the name legacy reports.
-    RowId(String),
+    /// The output reads a source rowid, named after its INTEGER PRIMARY KEY
+    /// alias when the table has one, else `rowid`.
+    RowId {
+        name: String,
+        /// The alias column's declared type, like SQLite reports.
+        declared_type: Option<String>,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -840,11 +887,18 @@ fn resolved_result_value(
                 .and_then(|table| {
                     table
                         .get_rowid_alias_column()
-                        .and_then(|(_, column)| column.name.clone())
+                        .map(|(_, column)| (column.name.clone(), column.ty_str.clone()))
                 });
-            Ok(ResolvedResultValue::RowId(
-                alias.unwrap_or_else(|| "rowid".to_string()),
-            ))
+            Ok(match alias {
+                Some((name, declared_type)) => ResolvedResultValue::RowId {
+                    name: name.unwrap_or_else(|| "rowid".to_string()),
+                    declared_type: (!declared_type.is_empty()).then_some(declared_type),
+                },
+                None => ResolvedResultValue::RowId {
+                    name: "rowid".to_string(),
+                    declared_type: None,
+                },
+            })
         }
         _ => Ok(ResolvedResultValue::Expression),
     }

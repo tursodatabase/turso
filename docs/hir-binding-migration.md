@@ -79,11 +79,12 @@ Deferred migration surfaces:
 
 | Surface | Why deferred |
 |---|---|
-| Production entry point and whole-query lowering | Statement and whole-trigger-program inputs produce validated HIR from an owned multi-database semantic catalog. Standalone HIR expression lowering is now being ported in narrow checkpoints, but preparation still enters the legacy plan and emitter path. |
+| None | Statement and whole-trigger-program inputs produce validated HIR from an owned multi-database semantic catalog, and every statement is prepared from it. The legacy planner was deleted on 2026-10-21. |
 
-### What still reaches legacy with the switch on
+### What goes through HIR
 
-Audited on 2026-10-21 from `translate_statement`:
+Audited on 2026-10-21 from `translate_statement`, after the legacy planner
+was deleted:
 
 - SELECT always goes through HIR; there is no guard and no fallback.
 - DELETE, UPDATE and INSERT always go through HIR as well, with their
@@ -110,18 +111,15 @@ Audited on 2026-10-21 from `translate_statement`:
 - The elements of an array of a custom type are encoded one by one when
   written, as legacy encodes them, so STRICT tables with such columns go
   through HIR.
-- Every other statement is translated by legacy code that is handed the HIR
-  settings and prepares the SELECTs inside it through HIR where it can
-  (CREATE TABLE AS, CREATE VIEW, CREATE MATERIALIZED VIEW, ATTACH). The
-  nested statements legacy triggers and foreign-key actions compile still
-  prepare through legacy (`translate_inner`), only when their outer
-  statement is a legacy one.
+- Schema statements (CREATE TABLE AS, CREATE VIEW, CREATE MATERIALIZED
+  VIEW, ATTACH, ALTER TABLE, DROP TABLE, pragmas) prepare the SELECTs and
+  DML inside them through HIR: DROP TABLE checks foreign keys by lowering a
+  DELETE of the whole table without its triggers, and ALTER TABLE rewrites
+  rows through an HIR UPDATE. There is no `translate_inner` and no legacy
+  plan left to reach.
 
-CI runs the conformance corpora through both planners
-(`.github/workflows/sqltest.yml`): the regular jobs through HIR, the
-default, with the snapshot tests regenerated from HIR's bytecode, and
-`sqltest-run-legacy` through the legacy planner on the Rust and CLI
-backends, without snapshot tests and with normalized plans.
+CI runs the conformance corpora through HIR (`.github/workflows/sqltest.yml`),
+with the snapshot tests regenerated from HIR's bytecode.
 
 ### Cutover deletion map
 
@@ -166,13 +164,11 @@ statements through HIR: the owned semantic catalog, `analyze_root`,
 another one, such as the copy statements of VACUUM, take the same path; like
 legacy, they may write internal tables. There is no fallback: a SELECT that
 HIR cannot lower fails to prepare. Top-level DELETE, UPDATE and INSERT also
-go through HIR, except the cases listed under "DML through HIR", which still
-go to legacy. Setting `TURSO_LEGACY_PLANNER` (any value) when a connection
-opens, or calling `Connection::set_experimental_hir(false)`, keeps the
-legacy planner for every statement; CI runs the conformance corpora that
-way too (`sqltest-run-legacy`), without snapshot tests, whose bytecode is
-now HIR's. The variable and the legacy path go when the deletion map below
-is worked through.
+go through HIR. The legacy planner, `TURSO_LEGACY_PLANNER` and
+`Connection::set_experimental_hir` were deleted on 2026-10-21: the SELECT
+and DML planners, binders, emitters and optimizer passes that only legacy
+used are gone, and the remaining `plan.rs` types, optimizer and emitter
+helpers are the ones HIR lowering builds on.
 
 Result-column names, table names, and declared types come from the HIR outputs
 and the same alias, `full_column_names`, and `short_column_names` rules as

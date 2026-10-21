@@ -440,19 +440,10 @@ pub fn resolve_comparison_collseq(
     rhs_expr: &Expr,
     referenced_tables: &TableReferences,
 ) -> Result<CollationSeq> {
-    resolve_comparison_collseq_with_symbols(lhs_expr, rhs_expr, referenced_tables, None)
-}
-
-pub fn resolve_comparison_collseq_with_symbols(
-    lhs_expr: &Expr,
-    rhs_expr: &Expr,
-    referenced_tables: &TableReferences,
-    symbol_table: Option<&SymbolTable>,
-) -> Result<CollationSeq> {
     let (lhs_explicit, lhs_column) =
-        get_collseq_parts_from_expr_with_symbols(lhs_expr, referenced_tables, symbol_table)?;
+        get_collseq_parts_from_expr_with_symbols(lhs_expr, referenced_tables, None)?;
     let (rhs_explicit, rhs_column) =
-        get_collseq_parts_from_expr_with_symbols(rhs_expr, referenced_tables, symbol_table)?;
+        get_collseq_parts_from_expr_with_symbols(rhs_expr, referenced_tables, None)?;
     Ok(lhs_explicit
         .or(rhs_explicit)
         .or(lhs_column)

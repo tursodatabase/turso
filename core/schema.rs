@@ -3232,6 +3232,7 @@ bitflags! {
 #[derive(Debug)]
 pub(crate) struct GeneratedColGraph {
     /// `dependencies[j]` = columns `j` transitively reads from (excludes `j`).
+    #[cfg(test)]
     dependencies: Vec<ColumnMask>,
     /// `dependents[i]` = columns that transitively read from `i` (excludes `i`).
     dependents: Vec<ColumnMask>,
@@ -3314,6 +3315,7 @@ impl GeneratedColGraph {
         }
 
         Ok(Self {
+            #[cfg(test)]
             dependencies,
             dependents,
             topological_sort,
@@ -3980,6 +3982,7 @@ impl BTreeTable {
         Ok(affected)
     }
 
+    #[cfg(test)]
     pub(crate) fn dependencies_of_columns(
         &self,
         targets: impl IntoIterator<Item = usize>,

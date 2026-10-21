@@ -21,7 +21,6 @@ use crate::{
     schema::{Schema, Table},
     stats::AnalyzeStats,
     translate::{
-        expr::expr_references_subquery_id,
         optimizer::{
             access_method::{
                 estimate_hash_join_cost, tables_in_equal_test, try_hash_join_access_method,
@@ -37,7 +36,7 @@ use crate::{
         plan::{
             HashJoinKey, HashJoinType, HirFromGroupBoundary, HirFromLayout, HirPlanSource,
             HirWhereTerm, JoinOrderMember, JoinedTable, NonFromClauseSubquery, PredicateTerm,
-            SubqueryState, TableReferences, WhereTerm,
+            TableReferences, WhereTerm,
         },
         planner::{table_mask_from_expr, table_mask_from_hir_scope, HirFromScope, TableMask},
         semantic::hir::{self, HirDocument},
@@ -154,128 +153,6 @@ fn rows_after_join<E, S>(
     input_cardinality * method.estimated_rows_per_outer_row * remaining_filter_selectivity
 }
 
-/// Count calls to each subquery when all of its outer tables have been read.
-#[allow(clippy::too_many_arguments)]
-fn count_subquery_calls_after_join(
-    subqueries: &[NonFromClauseSubquery],
-    joined_tables: &[JoinedTable],
-    prior_tables: &TableMask,
-    new_table_number: usize,
-    outer_rows: f64,
-    method: &AccessMethod,
-    new_table_constraints: &TableConstraints,
-    new_table_mask: TableMask,
-    where_clause: &[WhereTerm],
-    params: &CostModelParams,
-) -> Result<SmallVec<[(TableInternalId, f64); 2]>> {
-    let mut current_tables = prior_tables.clone();
-    current_tables.set(new_table_number)?;
-
-    let rows_before_filters = outer_rows * method.estimated_rows_per_outer_row;
-    let mut subquery_calls = SmallVec::new();
-
-    for subquery in subqueries.iter().filter(|subquery| subquery.correlated) {
-        let SubqueryState::Unevaluated {
-            plan: Some(inner_plan),
-        } = &subquery.state
-        else {
-            continue;
-        };
-        let mut required_tables = TableMask::default();
-        for table_id in inner_plan.used_outer_query_ref_ids() {
-            let Some(table_number) = joined_tables
-                .iter()
-                .position(|table| table.internal_id == table_id)
-            else {
-                continue;
-            };
-            required_tables.set(table_number)?;
-        }
-        if required_tables.is_empty()
-            || !current_tables.contains_all_set_bits_of(&required_tables)
-            || prior_tables.contains_all_set_bits_of(&required_tables)
-        {
-            continue;
-        }
-
-        let first_subquery_term = where_clause.iter().enumerate().find_map(|(index, term)| {
-            expr_references_subquery_id(&term.expr, subquery.internal_id).then_some(index)
-        });
-        // A WHERE term cannot cut the call count for a subquery in that term
-        // or in an earlier term. Terms before it may cut the count.
-        let skipped_where_terms: BitSet<usize> = if let Some(first) = first_subquery_term {
-            (first..where_clause.len()).try_collect()?
-        } else {
-            Default::default()
-        };
-        let multiplier = constraint_output_multipliers(
-            new_table_constraints,
-            prior_tables,
-            new_table_mask.clone(),
-            &method.consumed_where_terms,
-            &skipped_where_terms,
-            params,
-        );
-        let rows = rows_before_filters * multiplier;
-        subquery_calls.push((subquery.internal_id, rows.max(1.0)));
-    }
-
-    Ok(subquery_calls)
-}
-
-/// Count subquery calls for the chosen join plan.
-#[allow(clippy::too_many_arguments)]
-pub(super) fn count_subquery_calls_for_plan(
-    plan: &JoinN,
-    access_methods: &[AccessMethod],
-    constraints: &[TableConstraints],
-    joined_tables: &[JoinedTable],
-    where_clause: &[WhereTerm],
-    subqueries: &[NonFromClauseSubquery],
-    initial_input_cardinality: f64,
-    params: &CostModelParams,
-) -> Result<SmallVec<[(TableInternalId, f64); 2]>> {
-    if !subqueries.iter().any(|subquery| subquery.correlated) {
-        return Ok(SmallVec::new());
-    }
-
-    let mut calls = SmallVec::new();
-    let mut prior_tables = TableMask::default();
-    let mut input_cardinality = initial_input_cardinality;
-
-    for (table_number, access_method_index) in &plan.data {
-        let method = &access_methods[*access_method_index];
-        let mut table_mask = TableMask::default();
-        table_mask.set(*table_number)?;
-        calls.extend(count_subquery_calls_after_join(
-            subqueries,
-            joined_tables,
-            &prior_tables,
-            *table_number,
-            input_cardinality,
-            method,
-            &constraints[*table_number],
-            table_mask.clone(),
-            where_clause,
-            params,
-        )?);
-        input_cardinality = rows_after_join(
-            input_cardinality,
-            method,
-            &constraints[*table_number],
-            &prior_tables,
-            table_mask,
-            joined_tables[*table_number]
-                .join_info
-                .as_ref()
-                .is_some_and(|join_info| join_info.is_semi_or_anti()),
-            params,
-        );
-        prior_tables.set(*table_number)?;
-    }
-    Ok(calls)
-}
-
 /// Legacy's [count_subquery_calls_for_plan] for a HIR block: how many times
 /// each correlated subquery runs, counted from the rows that reach the join
 /// step where the last block source it reads is joined. Each subquery comes
@@ -379,6 +256,7 @@ impl JoinN {
         self.data.iter().map(|(table_number, _)| *table_number)
     }
 
+    #[cfg(test)]
     pub fn best_access_methods(&self) -> impl Iterator<Item = usize> + use<'_> {
         self.data
             .iter()
@@ -958,10 +836,7 @@ fn join_lhs_and_rhs<'a>(
                 cost: fts_cost,
                 estimated_rows_per_outer_row: cost_estimate.estimated_rows as f64,
                 consumed_where_terms: candidate.where_covered.into_iter().try_collect()?,
-                params: AccessMethodParams::IndexMethod {
-                    query: candidate.to_query(),
-                    where_covered: candidate.where_covered,
-                },
+                params: AccessMethodParams::IndexMethod,
             };
             add_where_cost(&mut index_method, &ready_where, input_cardinality, params);
             if index_method.cost < best_access_method.cost {
@@ -2097,7 +1972,7 @@ pub(crate) fn compute_hir_join_order(
 
     let mut memo: HashMap<TableMask, HashMap<usize, HirPartialJoin>> = HashMap::default();
     let empty = TableMask::default();
-    for position in 0..sources.len() {
+    for (position, source_constraints) in constraints.iter().enumerate().take(sources.len()) {
         if !allowed(position, &empty) {
             continue;
         }
@@ -2109,7 +1984,7 @@ pub(crate) fn compute_hir_join_order(
         let output_cardinality = rows_after_join(
             initial_input_cardinality,
             &first.access_method,
-            &constraints[position],
+            source_constraints,
             &empty,
             mask.try_clone()?,
             false,
@@ -2545,6 +2420,7 @@ fn hir_right_or_full_join(join_info: Option<&crate::translate::plan::HirJoinInfo
     join_info.is_some_and(|join| matches!(join.kind, hir::JoinKind::Right | hir::JoinKind::Full))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn hir_join_step(
     document: &HirDocument,
     sources: &[HirPlanSource],
@@ -3433,6 +3309,7 @@ where
 
 /// The tables that may start the join, best first, scored like
 /// [find_best_starting_source].
+#[allow(clippy::too_many_arguments)]
 fn hir_starting_sources_by_score(
     document: &HirDocument,
     sources: &[HirPlanSource],

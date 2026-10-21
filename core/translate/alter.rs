@@ -728,10 +728,7 @@ fn emit_add_column_check_validation(
     constraints: &[ast::NamedColumnConstraint],
     resolver: &Resolver,
     connection: &Arc<crate::Connection>,
-    hir: Option<(
-        &Arc<crate::schema::Schema>,
-        &crate::translate::semantic_lowering::HirSettings<'_>,
-    )>,
+    hir: crate::translate::HirContext<'_>,
     database_id: usize,
 ) -> Result<()> {
     // Determine the effective default value. If no DEFAULT, existing rows get NULL,
@@ -848,7 +845,8 @@ fn emit_add_column_check_validation(
 
     // With HIR, every existing row is checked, with its other columns read
     // from the row, as SQLite's check of the altered table does.
-    if let Some((schema, settings)) = hir {
+    {
+        let (schema, settings) = hir;
         let database = connection
             .get_database_name_by_index(database_id)
             .ok_or_else(|| {
@@ -904,10 +902,7 @@ pub fn translate_alter_table(
     program: &mut ProgramBuilder,
     connection: &Arc<crate::Connection>,
     input: &str,
-    hir: Option<(
-        &Arc<crate::schema::Schema>,
-        &crate::translate::semantic_lowering::HirSettings<'_>,
-    )>,
+    hir: crate::translate::HirContext<'_>,
 ) -> Result<()> {
     let ast::AlterTable {
         name: qualified_name,

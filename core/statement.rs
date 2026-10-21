@@ -1127,7 +1127,7 @@ impl Statement {
         if let Some(column) = self.resolved_result_column(idx) {
             return match &column.value {
                 ResolvedResultValue::Column(source) => Some(Cow::Borrowed(&source.table_name)),
-                ResolvedResultValue::Expression | ResolvedResultValue::RowId(_) => None,
+                ResolvedResultValue::Expression | ResolvedResultValue::RowId { .. } => None,
             };
         }
         let column = &self.program.result_columns.get(idx).expect("No column");
@@ -1171,6 +1171,7 @@ impl Statement {
                 ResolvedResultValue::Column(source) if !source.declared_type.is_empty() => {
                     Some(source.declared_type.clone())
                 }
+                ResolvedResultValue::RowId { declared_type, .. } => declared_type.clone(),
                 _ => None,
             };
         }
@@ -1337,7 +1338,7 @@ impl Statement {
         if let Some(column) = self.resolved_result_column(idx) {
             return match &column.value {
                 ResolvedResultValue::Column(source) => type_name(source.ty).map(str::to_string),
-                ResolvedResultValue::Expression | ResolvedResultValue::RowId(_) => None,
+                ResolvedResultValue::Expression | ResolvedResultValue::RowId { .. } => None,
             };
         }
         let column = &self.program.result_columns.get(idx).expect("No column");
@@ -1417,7 +1418,7 @@ impl Statement {
                     Cow::Borrowed(&column.name)
                 }
             }
-            ResolvedResultValue::RowId(name) => Cow::Borrowed(name),
+            ResolvedResultValue::RowId { name, .. } => Cow::Borrowed(name),
             ResolvedResultValue::Expression => Cow::Borrowed(&column.name),
         }
     }

@@ -897,7 +897,6 @@ fn test_max_joined_tables_limit(tmp_db: TempDatabase) {
 /// does.
 fn hir_checks_join_and_column_limits(tmp_db: TempDatabase) {
     let conn = tmp_db.connect_limbo();
-    conn.set_experimental_hir(true);
     for i in 0..64 {
         conn.execute(format!("CREATE TABLE t{i} (id INTEGER)"))
             .unwrap();

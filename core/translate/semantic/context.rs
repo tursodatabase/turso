@@ -89,6 +89,7 @@ impl<'catalog> SemanticContext<'catalog> {
         })
     }
 
+    #[cfg(test)]
     pub(crate) fn for_main_schema_object(
         main_schema: &'catalog Schema,
         symbols: &'catalog SymbolTable,
@@ -204,10 +205,6 @@ impl<'catalog> SemanticContext<'catalog> {
 
     pub(crate) const fn custom_types_enabled(&self) -> bool {
         self.custom_types_enabled
-    }
-
-    pub(crate) fn dialect(&self) -> &Arc<dyn Dialect> {
-        &self.dialect
     }
 
     pub(crate) fn resolve_function(&self, name: &str, arg_count: usize) -> Result<Option<Func>> {

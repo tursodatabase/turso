@@ -71,6 +71,7 @@ impl<'ast> Analyzer<'_, '_, 'ast> {
         }))
     }
 
+    #[cfg(test)]
     pub(super) fn analyze_trigger_predicate(
         &mut self,
         context: TriggerAnalysis,
@@ -85,6 +86,7 @@ impl<'ast> Analyzer<'_, '_, 'ast> {
         }))
     }
 
+    #[cfg(test)]
     pub(super) fn analyze_trigger_select(
         &mut self,
         context: TriggerAnalysis,
@@ -98,6 +100,7 @@ impl<'ast> Analyzer<'_, '_, 'ast> {
         }))
     }
 
+    #[cfg(test)]
     pub(super) fn analyze_trigger_insert(
         &mut self,
         context: TriggerAnalysis,
@@ -112,6 +115,7 @@ impl<'ast> Analyzer<'_, '_, 'ast> {
         }))
     }
 
+    #[cfg(test)]
     pub(super) fn analyze_trigger_update(
         &mut self,
         context: TriggerAnalysis,
@@ -126,6 +130,7 @@ impl<'ast> Analyzer<'_, '_, 'ast> {
         }))
     }
 
+    #[cfg(test)]
     pub(super) fn analyze_trigger_delete(
         &mut self,
         context: TriggerAnalysis,

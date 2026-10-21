@@ -1,53 +1,20 @@
-use turso_parser::ast::{Expr, SortOrder, TableInternalId};
+use turso_parser::ast::SortOrder;
 
-use super::{
-    aggregation::{translate_aggregation_step, AggArgumentSource},
-    emitter::{
-        MaterializedBuildInputMode, MaterializedColumnRef, OperationMode, Resolver, TranslateCtx,
-        UpdateRowSource,
-    },
-    expr::{
-        expr_references_subquery_id, translate_condition_expr, translate_expr,
-        translate_expr_no_constant_opt, walk_expr, ConditionMetadata, NoConstantOptReason,
-        WalkControl,
-    },
-    group_by::{group_by_agg_phase, GroupByMetadata, GroupByRowSource},
-    optimizer::{constraints::BinaryExprSide, Optimizable},
-    order_by::sorter_insert,
-    plan::{
-        Aggregate, DistinctCtx, Distinctness, EvalAt, HashJoinOp, HashJoinType, InSeekSource,
-        IterationDirection, JoinOrderMember, JoinedTable, MultiIndexScanOp, NonFromClauseSubquery,
-        Operation, QueryDestination, Scan, Search, SeekDef, SeekKey, SeekKeyComponent, SelectPlan,
-        SetOperation, TableReferences, WhereTerm,
-    },
-};
+use super::plan::{IterationDirection, SeekDef, SeekKey, SeekKeyComponent};
 use crate::{
-    emit_explain,
-    schema::{Index, IndexColumn, Table},
-    translate::{
-        collate::{
-            get_collseq_from_expr_with_symbols, resolve_comparison_collseq_with_symbols,
-            CollationSeq,
-        },
-        emitter::{prepare_cdc_if_necessary, HashCtx},
-        planner::{table_mask_from_expr, TableMask},
-        result_row::emit_select_result,
-    },
-    turso_assert, turso_assert_eq,
+    schema::{Index, IndexColumn},
+    translate::collate::CollationSeq,
+    turso_assert,
     types::SeekOp,
     vdbe::{
         affinity::{self, Affinity},
-        builder::{
-            CursorKey, CursorType, HashBuildSignature, MaterializedBuildInputModeTag,
-            ProgramBuilder,
-        },
-        insn::{to_u32, CmpInsFlags, HashBuildData, IdxInsertFlags, Insn},
+        builder::{CursorType, ProgramBuilder},
+        insn::{to_u32, CmpInsFlags, IdxInsertFlags, Insn},
         BranchOffset, CursorID,
     },
     Result,
 };
-use std::{borrow::Cow, collections::HashSet, ops::Range, sync::Arc};
-use turso_macros::turso_assert_some;
+use std::sync::Arc;
 
 mod body;
 mod close;
@@ -59,17 +26,10 @@ mod multi_index;
 mod open;
 mod seek;
 
-use body::emit_unmatched_row_conditions_and_loop;
-pub(crate) use body::LoopBodyEmitter;
-pub(crate) use close::CloseLoop;
-pub(crate) use close::{emit_autoindex, AutoIndexBuild, AutoIndexResult};
-use in_seek::open_in_seek_source_cursor;
+pub(crate) use close::{emit_autoindex, AutoIndexBuild};
 pub(crate) use in_seek::{
     emit_in_seek_advance, emit_in_seek_start, open_in_seek_values_cursor, InSeekLoop,
 };
-pub(crate) use init::{init_distinct, InitLoop};
-use multi_index::emit_multi_index_scan_loop;
-pub(crate) use open::OpenLoop;
 pub(crate) use seek::{SeekEmitter, SeekExpressionLowering};
 
 #[derive(Clone, Copy, Debug)]
@@ -124,49 +84,4 @@ impl LeftJoinMetadata {
         });
         program.preassign_label_to_next_insn(finished);
     }
-}
-
-#[derive(Debug)]
-pub struct SemiAntiJoinMetadata {
-    pub label_body: BranchOffset,
-    pub label_next_outer: BranchOffset,
-    pub outer_table_idx: usize,
-}
-
-#[derive(Debug, Clone, Copy)]
-pub struct LoopLabels {
-    pub loop_start: BranchOffset,
-    pub next: BranchOffset,
-    pub loop_end: BranchOffset,
-}
-
-impl LoopLabels {
-    pub fn new(program: &mut ProgramBuilder) -> Self {
-        Self {
-            loop_start: program.allocate_label(),
-            next: program.allocate_label(),
-            loop_end: program.allocate_label(),
-        }
-    }
-}
-
-fn find_non_semi_anti_ancestor(
-    join_order: &[JoinOrderMember],
-    tables: &[JoinedTable],
-    join_idx: usize,
-) -> usize {
-    assert!(join_idx > 0, "semi/anti-join cannot be the first table");
-    let mut idx = join_idx - 1;
-    while idx > 0 {
-        let prev = &tables[join_order[idx].original_idx];
-        if !prev
-            .join_info
-            .as_ref()
-            .is_some_and(|ji| ji.is_semi_or_anti())
-        {
-            break;
-        }
-        idx -= 1;
-    }
-    join_order[idx].original_idx
 }

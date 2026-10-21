@@ -179,18 +179,6 @@ impl<'ast> Analyzer<'_, '_, 'ast> {
         })
     }
 
-    pub(super) fn analyze_dml_returning(
-        &mut self,
-        columns: &'ast [ast::ResultColumn],
-        row_source: hir::SourceId,
-    ) -> Result<Option<hir::Returning>> {
-        self.analyze_dml_returning_with_policies(
-            columns,
-            row_source,
-            ExprPolicies::statement(self.context().dqs_dml()),
-        )
-    }
-
     pub(super) fn analyze_dml_returning_with_policies(
         &mut self,
         columns: &'ast [ast::ResultColumn],

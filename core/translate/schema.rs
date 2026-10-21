@@ -15,10 +15,7 @@ use crate::translate::emitter::{
     OperationMode, Resolver,
 };
 use crate::translate::expr::{walk_expr, WalkControl};
-use crate::translate::fkeys::emit_fk_drop_table_check;
-use crate::translate::plan::{Plan, QueryDestination};
 use crate::translate::planner::ROWID_STRS;
-use crate::translate::select::{emit_select_plan, prepare_select_plan};
 use crate::translate::{ProgramBuilder, ProgramBuilderOpts};
 use crate::util::{
     escape_sql_string_literal, normalize_ident, quote_identifier,
@@ -891,10 +888,8 @@ fn validate(
 }
 
 /// How a CTAS SELECT runs: planned by legacy, or through HIR.
-enum CtasPlan {
-    Legacy(Plan),
-    Hir(crate::translate::semantic_lowering::PlannedSelect),
-}
+/// The SELECT of a CTAS table, planned through HIR.
+type CtasPlan = crate::translate::semantic_lowering::PlannedSelect;
 
 /// Schema information derived from a CTAS SELECT.
 struct CtasInfo {
@@ -907,45 +902,15 @@ struct CtasInfo {
 fn derive_ctas_schema(
     select: ast::Select,
     table_name: &str,
-    resolver: &Resolver,
-    program: &mut ProgramBuilder,
     connection: &Arc<Connection>,
-    hir: Option<(
-        &Arc<crate::schema::Schema>,
-        &crate::translate::semantic_lowering::HirSettings<'_>,
-    )>,
+    hir: crate::translate::HirContext<'_>,
 ) -> Result<(CtasInfo, Vec<ColumnDefinition>)> {
-    if let Some((schema, settings)) = hir {
-        let select = crate::translate::semantic_lowering::PlannedSelect::new(
-            select, schema, settings, connection,
-        )?;
-        let columns = select.columns()?;
-        return Ok(ctas_schema(CtasPlan::Hir(select), table_name, columns));
-    }
-    let plan = prepare_select_plan(
-        select,
-        resolver,
-        program,
-        &[],
-        QueryDestination::ResultRows,
-        connection,
+    let (schema, settings) = hir;
+    let select = crate::translate::semantic_lowering::PlannedSelect::new(
+        select, schema, settings, connection,
     )?;
-
-    // For compound selects, use the leftmost select's columns for naming (matching SQLite).
-    // The planner guarantees `left` is always non-empty in a CompoundSelect.
-    let (result_columns, table_refs) = match &plan {
-        Plan::Select(sp) => (&sp.result_columns, &sp.table_references),
-        Plan::CompoundSelect { left, .. } => {
-            (&left[0].0.result_columns, &left[0].0.table_references)
-        }
-        _ => bail_parse_error!("unexpected plan type for CTAS"),
-    };
-
-    let columns = result_columns
-        .iter()
-        .map(|col| (col.name_or_expr(table_refs), col.declared_type(table_refs)))
-        .collect();
-    Ok(ctas_schema(CtasPlan::Legacy(plan), table_name, columns))
+    let columns = select.columns()?;
+    Ok(ctas_schema(select, table_name, columns))
 }
 
 /// The CREATE TABLE text and column definitions of a CTAS table, from each
@@ -1005,17 +970,14 @@ fn ctas_schema(
 /// Emit bytecode to populate a newly-created CTAS table from the SELECT.
 /// Uses a coroutine to run the SELECT and insert each result row.
 /// Takes an already-prepared plan (from `derive_ctas_schema`) to avoid double planning.
-#[allow(clippy::too_many_arguments)]
 fn emit_ctas_insert(
     program: &mut ProgramBuilder,
-    resolver: &Resolver,
     plan: CtasPlan,
     body: &ast::CreateTableBody,
     table_root_reg: usize,
     col_count: usize,
     database_id: usize,
     table_name: &str,
-    connection: &Arc<Connection>,
 ) -> Result<()> {
     let opts = ProgramBuilderOpts {
         num_cursors: 2,
@@ -1037,33 +999,7 @@ fn emit_ctas_insert(
     });
     program.preassign_label_to_next_insn(start_offset_label);
 
-    let hir_rows = match plan {
-        CtasPlan::Legacy(mut plan) => {
-            // Switch the plan's destination to coroutine yield mode.
-            let dest = plan.select_query_destination_mut().ok_or_else(|| {
-                crate::LimboError::InternalError(
-                    "CTAS plan must be a SELECT or CompoundSelect".into(),
-                )
-            })?;
-            *dest = QueryDestination::CoroutineYield {
-                yield_reg,
-                coroutine_implementation_start: halt_label,
-            };
-
-            let num_result_cols =
-                program.nested(|program| emit_select_plan(plan, resolver, program, connection))?;
-
-            if num_result_cols != col_count {
-                bail_parse_error!(
-                    "CTAS internal error: expected {} columns from SELECT but got {}",
-                    col_count,
-                    num_result_cols
-                );
-            }
-            None
-        }
-        CtasPlan::Hir(select) => Some(select.emit_rows(program, yield_reg, start_offset_label)?),
-    };
+    let result_start_reg = plan.emit_rows(program, yield_reg, start_offset_label)?;
 
     program.emit_insn(Insn::EndCoroutine { yield_reg });
     program.preassign_label_to_next_insn(jump_on_definition_label);
@@ -1089,14 +1025,6 @@ fn emit_ctas_insert(
         subtype_clear_count: 0,
     });
 
-    let result_start_reg = match hir_rows {
-        Some(values) => values,
-        None => program.reg_result_cols_start.ok_or_else(|| {
-            crate::LimboError::InternalError(
-                "CTAS internal error: result column start register not set".into(),
-            )
-        })?,
-    };
     let record_reg = program.alloc_register();
     program.emit_insn(Insn::MakeRecord {
         start_reg: to_u32(result_start_reg),
@@ -1143,23 +1071,14 @@ pub fn translate_create_table(
     program: &mut ProgramBuilder,
     connection: &Arc<Connection>,
     input: &str,
-    hir: Option<(
-        &Arc<crate::schema::Schema>,
-        &crate::translate::semantic_lowering::HirSettings<'_>,
-    )>,
+    hir: crate::translate::HirContext<'_>,
 ) -> Result<()> {
     // For CTAS, extract the SELECT, determine column info, and convert to a
     // regular ColumnsAndConstraints body + separate SELECT for data insertion.
     let (body, ctas_info) = match body {
         ast::CreateTableBody::AsSelect(select) => {
-            let (info, col_defs) = derive_ctas_schema(
-                select,
-                &tbl_name.name.as_ident(),
-                resolver,
-                program,
-                connection,
-                hir,
-            )?;
+            let (info, col_defs) =
+                derive_ctas_schema(select, &tbl_name.name.as_ident(), connection, hir)?;
             let body = ast::CreateTableBody::ColumnsAndConstraints {
                 columns: col_defs,
                 constraints: vec![],
@@ -1514,14 +1433,12 @@ pub fn translate_create_table(
         };
         emit_ctas_insert(
             program,
-            resolver,
             info.plan,
             &body,
             table_root_reg,
             col_count,
             database_id,
             &normalized_tbl_name,
-            connection,
         )?;
     }
 
@@ -1861,6 +1778,7 @@ pub fn translate_drop_table(
     if_exists: bool,
     program: &mut ProgramBuilder,
     connection: &Arc<Connection>,
+    hir: crate::translate::HirContext<'_>,
 ) -> Result<()> {
     let database_id = resolver.resolve_existing_table_database_id_qualified(&tbl_name)?;
     let name = tbl_name.name.as_str();
@@ -1880,12 +1798,34 @@ pub fn translate_drop_table(
         );
     };
     validate_drop_table(resolver, database_id, name, connection)?;
-    // Check if foreign keys are enabled and if this table is referenced by foreign keys
-    // Fire FK actions (CASCADE, SET NULL, SET DEFAULT) or check for violations (RESTRICT, NO ACTION)
+    // Like SQLite, a table other tables reference through foreign keys is
+    // emptied first by a DELETE, which fires the ON DELETE actions and
+    // counts the RESTRICT and NO ACTION violations; any violation fails the
+    // statement here.
     if connection.foreign_keys_enabled()
         && resolver.with_schema(database_id, |s| s.any_resolved_fks_referencing(name))
     {
-        emit_fk_drop_table_check(program, resolver, name, connection, database_id)?;
+        let database = connection
+            .get_database_name_by_index(database_id)
+            .ok_or_else(|| {
+                crate::LimboError::InternalError(format!("no database with id {database_id}"))
+            })?;
+        let (schema, settings) = hir;
+        crate::translate::semantic_lowering::translate_drop_table_delete(
+            &database, name, schema, settings, program, connection,
+        )?;
+        let no_violations = program.allocate_label();
+        program.emit_insn(Insn::FkIfZero {
+            deferred: false,
+            target_pc: no_violations,
+        });
+        program.emit_insn(Insn::Halt {
+            err_code: crate::error::SQLITE_CONSTRAINT_FOREIGNKEY,
+            description: "FOREIGN KEY constraint failed".to_string(),
+            on_error: None,
+            description_reg: None,
+        });
+        program.preassign_label_to_next_insn(no_violations);
     }
     let cdc_table = prepare_cdc_if_necessary(program, resolver.schema(), Some(SQLITE_TABLEID))?;
 

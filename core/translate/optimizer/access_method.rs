@@ -27,7 +27,7 @@ use crate::vdbe::affinity::Affinity;
 use crate::vdbe::hash_table::DEFAULT_MEM_BUDGET;
 use crate::{
     schema::{FromClauseSubquery, Index, IndexColumn, Table},
-    translate::plan::{IndexMethodQuery, IterationDirection, JoinOrderMember, JoinedTable},
+    translate::plan::{IterationDirection, JoinOrderMember, JoinedTable},
     vtab::VirtualTable,
     LimboError, Result,
 };
@@ -289,21 +289,21 @@ pub enum AccessMethodParams {
     /// Custom index method access (e.g., FTS).
     /// This variant is used when the optimizer determines that a custom index method
     /// should be used for table access in a join query.
-    IndexMethod {
-        /// The fully constructed IndexMethodQuery operation to apply to this table.
-        query: IndexMethodQuery,
-        /// Index in WHERE clause that was covered by this index method (if any).
-        where_covered: Option<usize>,
-    },
+    IndexMethod,
     /// Multi-index scan for OR-by-union or AND-by-intersection optimization.
     /// Used when a WHERE clause has OR/AND terms that can each use a different index.
     /// Example: WHERE a = 1 AND|OR b = 2 with separate indexes on a and b.
     MultiIndexScan {
-        /// Each branch represents one term with its own index access.
+        /// Each branch represents one term with its own index access. The
+        /// HIR planner reads the branches of its own `HirOrUnion` instead;
+        /// the planner tests read these.
+        #[allow(dead_code)]
         branches: Vec<MultiIndexBranchParams>,
         /// Index of the primary WHERE term.
+        #[allow(dead_code)]
         where_term_idx: usize,
         /// The set operation (Union for OR, Intersection for AND).
+        #[allow(dead_code)]
         set_op: SetOperation,
     },
     /// IN-list driven index seek.

@@ -135,7 +135,6 @@ fn insert_autoincrement_notnull(tmp_db: TempDatabase) -> anyhow::Result<()> {
 )]
 fn insert_autoincrement_through_hir(tmp_db: TempDatabase) -> anyhow::Result<()> {
     let conn = tmp_db.connect_limbo();
-    conn.set_experimental_hir(true);
     assert!(needs_stmt_journal(&conn, "INSERT INTO t (v) VALUES (1)"));
     conn.execute("CREATE TABLE u (id INTEGER PRIMARY KEY AUTOINCREMENT, v)")?;
     assert!(!needs_stmt_journal(&conn, "INSERT INTO u (v) VALUES (1)"));

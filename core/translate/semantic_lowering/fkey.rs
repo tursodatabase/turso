@@ -97,15 +97,7 @@ pub(super) fn emit_delete_checks(
         }
     }
     for foreign_key in &foreign_keys.outgoing {
-        if foreign_key.declaration.deferred {
-            emit_deleted_child_releases_violation(
-                program,
-                document,
-                foreign_key,
-                target,
-                database,
-            )?;
-        }
+        emit_deleted_child_releases_violation(program, document, foreign_key, target, database)?;
     }
     Ok(())
 }
@@ -158,8 +150,11 @@ fn emit_children_still_point_here(
     Ok(())
 }
 
-/// A deleted child row whose parent was missing added one to the deferred
-/// counter when it was written; take that back.
+/// A deleted child row whose parent is missing counted one violation, when
+/// it was written or when its parent went earlier in this statement; take
+/// that back. Like SQLite, this holds for immediate constraints too: a
+/// statement that deletes a parent and its children, such as `DELETE FROM
+/// t` on a self-referencing table, is checked when it ends, not row by row.
 fn emit_deleted_child_releases_violation(
     program: &mut ProgramBuilder,
     document: &HirDocument,
@@ -168,6 +163,7 @@ fn emit_deleted_child_releases_violation(
     database: usize,
 ) -> Result<()> {
     let width = foreign_key.child_positions.len();
+    let deferred = foreign_key.declaration.deferred;
     let key = emit_child_key(program, document, foreign_key, target)?;
     let skip = program.allocate_label();
     emit_skip_if_any_null(program, key, width, skip);
@@ -194,7 +190,7 @@ fn emit_deleted_child_releases_violation(
         program.emit_insn(Insn::Goto { target_pc: skip });
         program.preassign_label_to_next_insn(missing);
         program.emit_insn(Insn::Close { cursor_id: cursor });
-        emit_guarded_fk_decrement(program, skip, true);
+        emit_guarded_fk_decrement(program, skip, deferred);
     } else {
         let index = parent_index(foreign_key)?;
         let cursor = open_read_index(program, &index.handle(), database);
@@ -207,7 +203,7 @@ fn emit_deleted_child_releases_violation(
             num_regs: width,
         });
         program.emit_insn(Insn::Close { cursor_id: cursor });
-        emit_guarded_fk_decrement(program, found, true);
+        emit_guarded_fk_decrement(program, found, deferred);
         program.preassign_label_to_next_insn(found);
         program.emit_insn(Insn::Close { cursor_id: cursor });
     }
@@ -235,14 +231,13 @@ pub(super) fn emit_insert_child_checks(
         emit_skip_if_any_null(program, key, width, ok);
         let parent_table = btree(&foreign_key.parent_table)?;
         let self_reference = is_self_reference(foreign_key);
-        let deferred = foreign_key.declaration.deferred;
         let declaration = foreign_key.declaration.clone();
+        // A missing parent counts a violation; an immediate one fails the
+        // statement when it ends. Like SQLite, this lets one statement write
+        // a child before its parent, as `INSERT INTO t VALUES (7, 8), (8, 7)`
+        // does on a self-referencing table.
         let violation = move |program: &mut ProgramBuilder| -> Result<()> {
-            if deferred {
-                emit_fk_violation(program, &declaration)
-            } else {
-                emit_fk_restrict_halt(program)
-            }
+            emit_fk_violation(program, &declaration)
         };
         if foreign_key.parent_uses_rowid {
             let cursor = open_read_table(program, &parent_table, database);
