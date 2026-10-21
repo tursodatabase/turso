@@ -224,6 +224,25 @@ SELECT unhex('48-45-4C', '-'); -- x'48454C' (ignoring dashes)
 SELECT unhex('ZZZZ');          -- NULL (invalid hex)
 ```
 
+### get_byte(VALUE, OFFSET) and set_byte(VALUE, OFFSET, NEWBYTE)
+
+PostgreSQL-compatible byte access functions. Offsets are 0-based. Blobs are used
+as-is, text is treated as its UTF-8 bytes, and numbers use their textual form
+(the same coercion `hex()` applies). `NULL` input or offset yields `NULL`.
+
+`get_byte` returns the byte at `OFFSET` as an integer in `0..=255`. An offset
+outside `0..length-1` raises `index N out of valid range, 0..M`.
+
+`set_byte` returns a new blob with the byte at `OFFSET` replaced by the low 8
+bits of `NEWBYTE` (so `6555` stores `155` and `-1` stores `255`).
+
+```sql
+SELECT get_byte(x'48454C4C4F', 0);        -- 72 (the byte 'H')
+SELECT get_byte('HELLO', 4);              -- 79 (the byte 'O')
+SELECT get_byte('HELLO', 9);              -- error: index 9 out of valid range, 0..4
+SELECT set_byte(x'48454C4C4F', 0, 104);   -- x'68454C4C4F' ('h' replaces 'H')
+```
+
 ### iif(X, Y, Z) and if(X, Y, Z)
 
 Returns Y if X is true (non-zero and non-NULL), otherwise returns Z. `if` is an alias for `iif`.
