@@ -130,3 +130,35 @@ expect {
     "$user", public
     "$user", public
 }
+
+test create-table-follows-search-path {
+    CREATE SCHEMA IF NOT EXISTS sp_ct;
+    DROP TABLE IF EXISTS sp_ct.t;
+    SET search_path TO sp_ct, public;
+    CREATE TABLE t (id serial, x int);
+    INSERT INTO t (x) VALUES (1);
+    SELECT id, x FROM sp_ct.t;
+    SELECT count(*) FROM pg_tables WHERE schemaname = 'public' AND tablename = 't';
+}
+expect {
+    1|1
+    0
+}
+
+test create-table-skips-missing-schema-in-search-path {
+    SET search_path TO sp_missing_ct, public;
+    CREATE TABLE t (x int);
+    INSERT INTO t VALUES (2);
+    SELECT x FROM public.t;
+}
+expect {
+    2
+}
+
+test create-table-with-no-existing-schema-in-search-path-errors {
+    SET search_path TO sp_missing_ct;
+    CREATE TABLE t (x int);
+}
+expect error {
+    no schema has been selected to create in
+}
