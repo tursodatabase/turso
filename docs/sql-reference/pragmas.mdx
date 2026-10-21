@@ -218,6 +218,22 @@ PRAGMA function_list;
 -- name | builtin | type | enc | narg | flags
 ```
 
+### module_list
+
+Returns one row for each virtual table module registered on the connection, in arbitrary
+order.
+
+```sql
+PRAGMA module_list;
+-- generate_series
+```
+
+A freshly opened database reports only the built-in `generate_series` module, which is
+compiled in through the default `series` feature. Extensions that register their own
+modules through the C API `sqlite3_create_module()` show up here as well. The pragma
+takes no arguments: a write form such as `PRAGMA module_list = 1;` is accepted and does
+nothing.
+
 ### pragma_list
 
 Returns the list of all supported PRAGMA commands.
