@@ -445,80 +445,104 @@ fn prepared_insert_sees_view_created_after_prepare_other_connection(
     Ok(())
 }
 
-fn count_orders(conn: &std::sync::Arc<turso_core::Connection>) -> i64 {
-    match limbo_exec_rows(conn, "SELECT COUNT(*) FROM orders")[0][0] {
-        rusqlite::types::Value::Integer(n) => n,
-        ref other => panic!("unexpected count value: {other:?}"),
-    }
-}
+#[test]
+fn failed_commit_with_materialized_view_leaves_no_rows_behind() -> anyhow::Result<()> {
+    use crate::queued_io::{QueuedIo, QueuedIoOpKind};
+    use std::sync::Arc;
+    use turso_core::{ConnectOpts, Database, DatabaseOpts, OpenFlags, SqliteDialect};
 
-/// A COMMIT that fails partway through must leave no partial effects behind,
-/// even when a materialized view is maintained on the table being written.
-/// The repro drives enough INSERT OR REPLACE batches that some COMMIT in the
-/// run hits an induced failure; once that happens, the row count on the same
-/// connection and on a fresh connection must agree with the number of batches
-/// that actually reported success.
-#[turso_macros::test(views)]
-fn failed_commit_with_materialized_view_leaves_no_rows_behind(
-    tmp_db: TempDatabase,
-) -> anyhow::Result<()> {
-    let conn = tmp_db.connect_limbo();
-    conn.execute(
-        "CREATE TABLE orders (collection TEXT NOT NULL, key TEXT NOT NULL, \
-         value TEXT NOT NULL, PRIMARY KEY (collection, key))",
-    )
-    .unwrap();
-    conn.execute(
-        "CREATE MATERIALIZED VIEW mv AS SELECT json_extract(value,'$.customer') AS grp, \
-         SUM(json_extract(value,'$.amount')) AS agg FROM orders \
-         WHERE collection='o' GROUP BY grp",
-    )
-    .unwrap();
+    for fault in [QueuedIoOpKind::Pwritev, QueuedIoOpKind::Sync] {
+        let io = Arc::new(QueuedIo::new());
+        let path = format!("materialized-view-commit-{fault:?}.db");
+        let open = || {
+            Database::open_file_with_flags(
+                io.clone(),
+                &path,
+                OpenFlags::default(),
+                DatabaseOpts::new().with_views(true),
+                None,
+                Arc::new(SqliteDialect),
+            )
+        };
+        let db = open()?;
+        let conn = db.connect(ConnectOpts::new())?;
+        conn.execute(
+            "CREATE TABLE orders (collection TEXT NOT NULL, key TEXT NOT NULL, \
+             value TEXT NOT NULL, PRIMARY KEY (collection, key))",
+        )?;
+        conn.execute(
+            "CREATE MATERIALIZED VIEW mv AS SELECT json_extract(value,'$.customer') AS grp, \
+             SUM(json_extract(value,'$.amount')) AS agg FROM orders \
+             WHERE collection='o' GROUP BY grp",
+        )?;
+        conn.execute(
+            r#"INSERT INTO orders VALUES
+               ('o', 'first', '{"customer":"alice","amount":10.5}'),
+               ('o', 'second', '{"customer":"bob","amount":20.5}')"#,
+        )?;
 
-    let mut committed = 0i64;
-    let mut commit_error = None;
-    for start in (0..10_000).step_by(1000) {
-        conn.execute("BEGIN").unwrap();
-        for i in start..start + 1000 {
-            let key = format!("order-{i:05}");
-            let value = format!(
-                r#"{{"customer":"c{}","amount":{}}}"#,
-                i % 316,
-                (i % 97) as f64 + 0.5
+        conn.execute("BEGIN")?;
+        conn.execute(
+            r#"INSERT OR REPLACE INTO orders VALUES
+               ('o', 'first', '{"customer":"bob","amount":99.5}'),
+               ('o', 'third', '{"customer":"carol","amount":30.5}')"#,
+        )?;
+        conn.execute("DELETE FROM orders WHERE key = 'second'")?;
+        let pending: Vec<(String, f64)> = conn.exec_rows("SELECT grp, agg FROM mv ORDER BY grp");
+        assert_eq!(
+            pending,
+            vec![("bob".to_string(), 99.5), ("carol".to_string(), 30.5)]
+        );
+
+        io.fault_after(format!("{path}-wal"), fault, 0);
+        let err = conn.execute("COMMIT").expect_err("COMMIT must fail");
+        io.clear_fault();
+        assert!(err.to_string().contains("queued_io"), "{fault:?}: {err}");
+
+        let fresh = db.connect(ConnectOpts::new())?;
+        for connection in [&conn, &fresh] {
+            let orders: Vec<(String, String, f64)> = connection.exec_rows(
+                "SELECT key, json_extract(value,'$.customer'), json_extract(value,'$.amount') \
+                 FROM orders ORDER BY key",
             );
-            let mut stmt = conn
-                .prepare(
-                    "INSERT OR REPLACE INTO orders (collection, key, value) VALUES ('o', ?, ?)",
-                )
-                .unwrap();
-            stmt.bind_at(1.try_into().unwrap(), turso_core::Value::build_text(key))
-                .unwrap();
-            stmt.bind_at(2.try_into().unwrap(), turso_core::Value::build_text(value))
-                .unwrap();
-            stmt.run_ignore_rows().unwrap();
+            assert_eq!(
+                orders,
+                vec![
+                    ("first".to_string(), "alice".to_string(), 10.5),
+                    ("second".to_string(), "bob".to_string(), 20.5),
+                ],
+                "{fault:?}"
+            );
+            let view: Vec<(String, f64)> =
+                connection.exec_rows("SELECT grp, agg FROM mv ORDER BY grp");
+            assert_eq!(
+                view,
+                vec![("alice".to_string(), 10.5), ("bob".to_string(), 20.5)],
+                "{fault:?}"
+            );
+            assert_eq!(run_integrity_check(connection), "ok", "{fault:?}");
         }
-        match conn.execute("COMMIT") {
-            Ok(()) => committed += 1000,
-            Err(e) => {
-                commit_error = Some(e.to_string());
-                break;
-            }
-        }
+        drop(fresh);
+
+        conn.execute("BEGIN")?;
+        conn.execute(
+            r#"INSERT INTO orders VALUES ('o', 'third', '{"customer":"alice","amount":5.0}')"#,
+        )?;
+        conn.execute("COMMIT")?;
+        drop(conn);
+        drop(db);
+
+        let reopened = open()?;
+        let conn = reopened.connect(ConnectOpts::new())?;
+        let view: Vec<(String, f64)> = conn.exec_rows("SELECT grp, agg FROM mv ORDER BY grp");
+        assert_eq!(
+            view,
+            vec![("alice".to_string(), 15.5), ("bob".to_string(), 20.5)],
+            "{fault:?}"
+        );
+        assert_views_equal_their_queries(&conn, &format!("{fault:?} after reopen"));
+        assert_eq!(run_integrity_check(&conn), "ok", "{fault:?}");
     }
-
-    let Some(commit_error) = commit_error else {
-        return Ok(());
-    };
-
-    let same_conn_rows = count_orders(&conn);
-    let fresh = tmp_db.connect_limbo();
-    let fresh_rows = count_orders(&fresh);
-    assert_eq!(
-        (same_conn_rows, fresh_rows),
-        (committed, committed),
-        "rows from the transaction whose COMMIT failed ({commit_error}) are still visible \
-         (same connection, fresh connection)"
-    );
 
     Ok(())
 }
