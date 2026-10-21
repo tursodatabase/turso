@@ -106,7 +106,7 @@ fn resolve_table_pragma_name(
     if table_name.eq_ignore_ascii_case(crate::schema::TEMP_SCHEMA_TABLE_NAME)
         || table_name.eq_ignore_ascii_case(crate::schema::TEMP_SCHEMA_TABLE_NAME_ALT)
     {
-        return Ok(ResolvedName::in_database(crate::TEMP_DB_ID, table_name));
+        return Ok(resolver.resolved_in_database(crate::TEMP_DB_ID, table_name));
     }
     resolver.resolve_existing_table_named(table_name)
 }

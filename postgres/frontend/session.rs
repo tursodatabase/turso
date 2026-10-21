@@ -78,10 +78,10 @@ impl PgConnection {
     pub fn connect(db: &Arc<turso_core::Database>) -> Result<Self> {
         let context = Arc::new(PgSessionState::default());
         let conn = db.connect_with_context(context)?;
-        conn.add_namespace(
+        conn.add_namespace(turso_core::Namespace::database(
             "public",
-            turso_core::Namespace::database(turso_core::MAIN_DB_ID),
-        );
+            turso_core::MAIN_DB_ID,
+        ));
         set_search_path(&conn, None)?;
         Ok(Self {
             inner: Arc::new(PgConnectionInner { conn }),
@@ -307,11 +307,10 @@ fn relation_name_is_taken(
 /// The default search_path, "$user", public, gives public, since there is no
 /// schema named after a user.
 pub(crate) fn current_schema(conn: &Connection) -> Option<String> {
-    let database_id = *conn.search_order().first()?;
-    if database_id == turso_core::MAIN_DB_ID {
-        return Some("public".to_owned());
-    }
-    conn.namespace_name(database_id)
+    conn.search_order()
+        .into_iter()
+        .next()
+        .map(|namespace| namespace.name)
 }
 
 fn reject_catalog_dml(stmt: &ast::Stmt) -> Result<()> {

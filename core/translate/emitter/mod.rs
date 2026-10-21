@@ -134,11 +134,13 @@ impl From<bool> for DoubleQuotedDml {
     }
 }
 
-/// Where an object named in SQL is: the namespace that holds it and the
-/// name it is stored under in the schema of the namespace's database.
+/// Where an object named in SQL is: the namespace that holds it, its name
+/// in that namespace and the name it is stored under in the schema of the
+/// namespace's database.
 #[derive(Clone, Debug)]
 pub(crate) struct ResolvedName {
     pub namespace: Namespace,
+    pub name: String,
     pub stored_name: String,
 }
 
@@ -146,12 +148,9 @@ impl ResolvedName {
     pub(crate) fn in_namespace(namespace: Namespace, name: &str) -> Self {
         Self {
             stored_name: namespace.stored_name(name),
+            name: name.to_string(),
             namespace,
         }
-    }
-
-    pub(crate) fn in_database(database_id: usize, name: &str) -> Self {
-        Self::in_namespace(Namespace::database(database_id), name)
     }
 
     pub fn database_id(&self) -> usize {
@@ -236,11 +235,11 @@ pub struct Resolver<'a> {
     /// shared state, a self-referential `ON DELETE CASCADE` could fail to see
     /// that its own action program is already being built.
     pub(super) fk_action_compile_stack: FkActionCompileStack,
-    /// The databases that a name without a namespace is looked up in, in
+    /// The namespaces that a name without a namespace is looked up in, in
     /// order, from the connection's search path. Temp comes before them.
     /// The first one is where CREATE puts an object whose name has no
     /// namespace.
-    search_order: Vec<usize>,
+    search_order: Vec<Namespace>,
 }
 
 #[derive(Clone)]
@@ -826,17 +825,16 @@ impl<'a> Resolver<'a> {
         // Only check the temp schema when a temp database actually exists.
         // This avoids expensive schema construction/lookup on every table
         // resolution when no temp objects have been created.
-        let temp = Namespace::database(crate::TEMP_DB_ID);
+        let temp = self.namespace_of_database(crate::TEMP_DB_ID);
         if self.has_temp_schema && has_object(&temp) {
             return Some(ResolvedName::in_namespace(temp, &object_name));
         }
 
-        let mut candidates = self.search_order.iter().map(|&id| Namespace::database(id));
-        candidates
-            .clone()
-            .find(has_object)
-            .or_else(|| candidates.next())
-            .map(|namespace| ResolvedName::in_namespace(namespace, &object_name))
+        self.search_order
+            .iter()
+            .find(|namespace| has_object(namespace))
+            .or_else(|| self.search_order.first())
+            .map(|namespace| ResolvedName::in_namespace(namespace.clone(), &object_name))
     }
 
     fn schema_has_table_like_object(schema: &Schema, table_name: &str) -> bool {
@@ -912,12 +910,12 @@ impl<'a> Resolver<'a> {
         // same way a top-level query does, sqlite_schema included.
         if let Some(ctx) = self.database_scope.borrow().as_ref() {
             if ctx.restricts_db_references() {
-                return Some(ResolvedName::in_database(ctx.database_id, &table_name));
+                return Some(self.resolved_in_database(ctx.database_id, &table_name));
             }
         }
 
         if let Some(database_id) = Self::resolve_schema_table_database_id(&table_name) {
-            return Some(ResolvedName::in_database(database_id, &table_name));
+            return Some(self.resolved_in_database(database_id, &table_name));
         }
 
         self.find_unqualified_existing(&table_name, Self::schema_has_table_like_object)
@@ -981,13 +979,10 @@ impl<'a> Resolver<'a> {
         Ok(self.find_unqualified_existing(qualified_name.name.as_str(), Self::schema_has_sequence))
     }
 
-    /// The name of `sequence` qualified with its database, for the opcodes
+    /// The name of `sequence` qualified with its namespace, for the opcodes
     /// that look a sequence up again by its name when the statement runs.
     pub(crate) fn runtime_sequence_name(&self, sequence: &ResolvedName) -> String {
-        let database_name = self
-            .namespace_name(sequence.database_id())
-            .expect("the database of a sequence has a name");
-        format!("{database_name}.{}", sequence.stored_name)
+        format!("{}.{}", sequence.namespace.name, sequence.name)
     }
 
     /// The object that `qualified_name` names in the namespace it names, or
@@ -1018,12 +1013,12 @@ impl<'a> Resolver<'a> {
             // SQLite behavior). Otherwise default to main.
             if let Some(ctx) = self.database_scope.borrow().as_ref() {
                 if ctx.restricts_db_references() {
-                    Ok(Namespace::database(ctx.database_id))
+                    Ok(self.namespace_of_database(ctx.database_id))
                 } else {
-                    Ok(Namespace::database(crate::MAIN_DB_ID))
+                    Ok(self.namespace_of_database(crate::MAIN_DB_ID))
                 }
             } else {
-                Ok(Namespace::database(crate::MAIN_DB_ID))
+                Ok(self.namespace_of_database(crate::MAIN_DB_ID))
             }
         }?;
 
@@ -1067,7 +1062,7 @@ impl<'a> Resolver<'a> {
         temporary: bool,
     ) -> Result<ResolvedName> {
         if temporary {
-            return Ok(ResolvedName::in_database(
+            return Ok(self.resolved_in_database(
                 crate::TEMP_DB_ID,
                 &normalize_ident(qualified_name.name.as_str()),
             ));
@@ -1075,13 +1070,25 @@ impl<'a> Resolver<'a> {
         if qualified_name.namespace.is_some() {
             return self.resolve_object(qualified_name);
         }
-        let database_id = self.search_order.first().copied().ok_or_else(|| {
+        let namespace = self.search_order.first().cloned().ok_or_else(|| {
             LimboError::ParseError("no schema has been selected to create in".to_string())
         })?;
-        Ok(ResolvedName::in_database(
-            database_id,
+        Ok(ResolvedName::in_namespace(
+            namespace,
             &normalize_ident(qualified_name.name.as_str()),
         ))
+    }
+
+    /// The object called `name` in the namespace that is the whole of
+    /// database `database_id`.
+    pub(crate) fn resolved_in_database(&self, database_id: usize, name: &str) -> ResolvedName {
+        ResolvedName::in_namespace(self.namespace_of_database(database_id), name)
+    }
+
+    fn namespace_of_database(&self, database_id: usize) -> Namespace {
+        self.namespaces
+            .of_database(database_id)
+            .expect("a database has a namespace")
     }
 
     /// The database that namespace `name` refers to. `name` is normalized.
@@ -1092,7 +1099,9 @@ impl<'a> Resolver<'a> {
     /// Get the database name for a given database index.
     /// Returns "main" for index 0, "temp" for index 1, and the alias for attached databases.
     pub(crate) fn namespace_name(&self, index: usize) -> Option<String> {
-        self.namespaces.name(index)
+        self.namespaces
+            .of_database(index)
+            .map(|namespace| namespace.name)
     }
 }
 
