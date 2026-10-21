@@ -187,3 +187,23 @@ test create-index-skips-missing-schema-in-search-path {
 expect {
     public|t
 }
+
+test current-schema-follows-search-path {
+    CREATE SCHEMA IF NOT EXISTS sp_cs;
+    SELECT current_schema();
+    SET search_path TO sp_missing_cs, sp_cs, public;
+    SELECT current_schema();
+    SET search_path TO public, sp_cs;
+    SELECT current_schema();
+    SET search_path TO sp_missing_cs;
+    SELECT coalesce(current_schema(), 'none');
+    SET search_path TO "$user", public;
+    SELECT current_schema();
+}
+expect {
+    public
+    sp_cs
+    public
+    none
+    public
+}
