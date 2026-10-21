@@ -119,7 +119,6 @@ pub fn translate_delete(
     // Plan subqueries in the WHERE clause
     if let Plan::Delete(ref mut delete_plan_inner) = delete_plan {
         if let Some(ref mut rowset_plan) = delete_plan_inner.rowset_plan {
-            // When using rowset (triggers or subqueries present), subqueries are in the rowset_plan's WHERE
             plan_subqueries_from_select_plan(program, rowset_plan, resolver, connection)?;
         } else {
             // Normal path: subqueries are in the DELETE plan's WHERE
@@ -281,11 +280,11 @@ pub fn prepare_delete_plan(
         .unwrap_or(false);
 
     let has_fk_actions = match btree_table_for_triggers.as_ref() {
-        Some(bt) => resolver
+        Some(bt) if connection.foreign_keys_enabled() => resolver
             .with_schema(database_id, |s| s.resolved_fks_referencing(&bt.name))?
             .iter()
             .any(|fk_ref| !matches!(fk_ref.fk.on_delete, RefAct::NoAction | RefAct::Restrict)),
-        None => false,
+        _ => false,
     };
 
     let mut safety = DmlSafety::default();
