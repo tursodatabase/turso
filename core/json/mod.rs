@@ -1595,6 +1595,25 @@ mod tests {
     }
 
     #[test]
+    fn test_json_error_position_keyword_boundary() {
+        for (input, expected) in [
+            ("true0", 1),
+            ("[true0]", 2),
+            ("false1", 1),
+            ("[nullx]", 2),
+            ("true", 0),
+            ("[true, false, null]", 0),
+            ("true/* JSON5 comment */", 0),
+        ] {
+            assert_eq!(
+                json_error_position(&Value::build_text(input)).unwrap(),
+                Value::from_i64(expected),
+                "{input}"
+            );
+        }
+    }
+
+    #[test]
     fn test_json_error_position_null() {
         let input = Value::Null;
         let result = json_error_position(&input).unwrap();
