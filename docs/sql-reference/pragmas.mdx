@@ -251,6 +251,27 @@ PRAGMA journal_mode = mvcc;
 When MVCC mode is active, you can use `BEGIN CONCURRENT` for optimistic concurrent write transactions. See [Transactions](/docs/sql-reference/statements/transactions#begin-concurrent) for details.
 </Info>
 
+### auto_vacuum
+
+Returns or sets the auto-vacuum mode. The bare form returns the current mode as an integer.
+
+```sql
+PRAGMA auto_vacuum;              -- 0 (none), 1 (full), or 2 (incremental)
+PRAGMA auto_vacuum = none;       -- same as = 0
+PRAGMA auto_vacuum = full;       -- same as = 1
+PRAGMA auto_vacuum = incremental; -- same as = 2
+```
+
+Auto-vacuum is experimental: setting a mode other than `none` fails with
+`Autovacuum is not enabled. Use --experimental-autovacuum flag to enable it.`
+unless the database was opened with the `--experimental-autovacuum` flag. Writing
+`none` is always allowed, and unrecognized names or numbers are treated as `none`.
+
+Like SQLite, the mode is fixed once page 1 of the database file exists: setting the
+pragma after the database has been initialized is silently ignored. Opening a database
+that already has auto-vacuum enabled without the flag logs a warning and opens the
+connection read-only.
+
 ### cache_size
 
 Returns or sets the suggested maximum number of database pages held in memory.
