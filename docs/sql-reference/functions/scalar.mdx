@@ -464,6 +464,20 @@ SELECT typeof(x'CAFE');    -- 'blob'
 SELECT typeof(1 + 1.0);   -- 'real'
 ```
 
+### validate_ipaddr(X)
+
+Checks that a string is a valid IPv4 or IPv6 address and returns it unchanged.
+This is the built-in validation function behind the `INET` custom type
+(`CREATE TYPE ... AS INET`). `NULL` gives `NULL`. Anything that is not a valid
+address text — including non-text values — raises
+`invalid input for type inet: "..."`.
+
+```sql
+SELECT validate_ipaddr('192.168.0.1');  -- '192.168.0.1'
+SELECT validate_ipaddr('::1');          -- '::1'
+SELECT validate_ipaddr('999.1.1.1');    -- error: invalid input for type inet: "999.1.1.1"
+```
+
 ### unicode(X)
 
 Returns the Unicode code point of the first character of string X. Returns NULL if X is NULL or an empty string.
