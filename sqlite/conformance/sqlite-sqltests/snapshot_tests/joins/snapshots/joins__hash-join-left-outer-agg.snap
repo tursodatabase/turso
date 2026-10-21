@@ -23,93 +23,96 @@ QUERY PLAN
 
 BYTECODE
 addr  opcode                             p1  p2  p3  p4                                                p5  comment
-   0        Init                          0  88   0                                                     0  Start at 88
+   0        Init                          0  91   0                                                     0  Start at 91
    1        Null                          0   1   0                                                     0  r[1]=NULL
    2        SorterOpen                    0   2   0  k(1,B)                                             0  cursor=0
    3        Integer                       0  21   0                                                     0  r[21]=0
    4        Null                          0  22   0                                                     0  r[22]=NULL
-   5        Gosub                        20  84   0                                                     0
+   5        Gosub                        20  87   0                                                     0
    6        OpenRead                      2   3   0  k(4,B,B,B,B)                                       0  table=h_items, root=3, iDb=0
-   7        OpenEphemeral                 4   1   0                                                     0  cursor=4 is_table=true
-   8        Null                          0  33   0                                                     0  r[33]=NULL
-   9        MakeRecord                   33   1  34                                                     0  r[34]=mkrec(r[33..33])
-  10        Rewind                        2  36   0                                                     0  Rewind table h_items
-  11          Once                       21   0   0                                                     0  goto 21
-  12          OpenRead                    3   2   0  k(3,B,B,B)                                         0  table=h_orders, root=2, iDb=0
-  13          Null                        0  24  26                                                     0  r[24..26]=NULL
-  14          Rewind                      3  20   0                                                     0  Rewind table h_orders
-  15            Column                    3   1  28                                                     0  r[28]=h_orders.customer_name
-  16            Affinity                 28   1   0                                                     0  r[28..29] = A
-  17            Column                    3   1  25                                                     0  r[25]=h_orders.customer_name
-  18            HashBuild                 3  28   1  r=[1073741824] budget=32768 payload=r[24]..r[26]   0
-  19          Next                        3  15   0                                                     1
-  20          HashBuildFinalize  1073741824   0   0                                                     0
-  21          Column                      2   1  29                                                     0  r[29]=h_items.order_name
-  22          Affinity                   29   1   0                                                     0  r[29..30] = A
-  23          RowId                       2  30   0                                                     0  r[30]=h_items.rowid
-  24          Integer                     0  31   0                                                     0  r[31]=0
-  25          HashProbe          1073741824  29   1  r[27]=35 payload=r[24]..r[26]                      0
-  26          Copy                       27  35   0                                                     0  r[35]=r[27]
-  27          Insert                      4  34  35                                                     6  intkey=r[35] data=r[34]
-  28          Copy                       25  17   0                                                     0  r[17]=r[25]
-  29          RowId                       2  18   0                                                     0  r[18]=h_items.rowid
-  30          MakeRecord                 17   2  16                                                     0  r[16]=mkrec(r[17..18])
-  31          SorterInsert                0  16   0  0                                                  0  key=r[16]
-  32          IfPos                      31  43   0                                                     0  r[31]>0 -> r[31]-=0, goto 43
-  33          HashNext           1073741824  27  35   payload=r[24]..r[26]                              0
-  34          Goto                        0  26   0                                                     0
-  35        Next                          2  11   0                                                     1
-  36        HashGraceInit        1073741824   0  48                                                     0  hash_table_id=1073741824
-  37        Integer                       1  31   0                                                     0  r[31]=1
-  38        HashGraceLoadPart    1073741824   0  47                                                     0  hash_table_id=1073741824
-  39        HashGraceNextProbe   1073741824  29  45                                                     0  hash_table_id=1073741824 keys=r[29]..r[29] probe_rowid_dest=r[30]
-  40        SeekRowid                     2  30  39                                                     0  if (r[30]!=cursor 2.rowid) goto 39
-  41        HashProbe            1073741824  29   1  r[27]=39 payload=r[24]..r[26]                      0
-  42        Goto                          0  26   0                                                     0
-  43        HashNext             1073741824  27  39   payload=r[24]..r[26]                              0
-  44        Goto                          0  26   0                                                     0
-  45        HashGraceAdvPart     1073741824   0  47                                                     0  hash_table_id=1073741824
-  46        Goto                          0  38   0                                                     0
-  47        Integer                       0  31   0                                                     0  r[31]=0
-  48        NullRow                       2   0   0                                                     0  Set cursor 2 to a (pseudo) NULL row
-  49        OpenRead                      5   2   0  k(3,B,B,B)                                         0  table=h_orders, root=2, iDb=0
-  50        Rewind                        5  59   0                                                     0  Rewind table h_orders
-  51          RowId                       5  36   0                                                     0  r[36]=h_orders.rowid
-  52          NotExists                   4  54  36                                                     0
-  53          Goto                        0  58   0                                                     0
-  54          Column                      5   1  17                                                     0  r[17]=h_orders.customer_name
-  55          RowId                       2  18   0                                                     0  r[18]=h_items.rowid
-  56          MakeRecord                 17   2  16                                                     0  r[16]=mkrec(r[17..18])
-  57          SorterInsert                0  16   0  0                                                  0  key=r[16]
-  58        Next                          5  51   0                                                     1
-  59        OpenPseudo                    1  16   2                                                     0  2 columns in r[16]
-  60        SorterSort                    0  75   0                                                     0
-  61          SorterData                  0  16   1                                                     0  r[16]=data
-  62          Column                      1   0  23                                                     0  r[23]=pseudo.column 0
-  63          Column                      1   1   2                                                     0  r[2]=pseudo.column 1
-  64          Compare                    22  23   1  k(1, Binary)                                       0  r[22..22]==r[23..23]
-  65          Jump                       66  69  66                                                     0
-  66          Gosub                      19  77   0                                                     0
-  67          Move                       23  22   1                                                     0  r[22..22]=r[23..23]
-  68          Gosub                      20  84   0                                                     0
-  69          Copy                        2  38   0                                                     0  r[38]=r[2]
-  70          AggStep                     0  38   1  count                                              0  accum=r[1] step(r[38])
-  71          If                         21  73   0                                                     0  if r[21] goto 73
-  72          Copy                        2   6   0                                                     0  r[6]=r[2]
-  73          Integer                     1  21   0                                                     0  r[21]=1
-  74        SorterNext                    0  61   0                                                     0
-  75        Gosub                        19  77   0                                                     0
-  76        Goto                          0  87   0                                                     0
-  77        IfPos                        21  79   0                                                     0  r[21]>0 -> r[21]-=0, goto 79
-  78      Return                         19   0   0                                                     0
-  79      AggFinal                        0   1   0  count                                              0  accum=r[1]
-  80      Copy                           22  39   0                                                     0  r[39]=r[22]
-  81      Copy                            1  40   0                                                     0  r[40]=r[1]
-  82      ResultRow                      39   2   0                                                     0  output=r[39..40]
-  83    Return                           19   0   0                                                     0
-  84    Null                              0   1   0                                                     0  r[1]=NULL
-  85    Integer                           0  21   0                                                     0  r[21]=0
-  86  Return                             20   0   0                                                     0
-  87  Halt                                0   0   0                                                     0
-  88  Transaction                         0   1   3                                                     0  iDb=0 tx_mode=Read
-  89  Goto                                0   1   0                                                     0
+   7        Integer                       0  32   0                                                     0  r[32]=0
+   8        OpenEphemeral                 4   1   0                                                     0  cursor=4 is_table=true
+   9        Null                          0  34   0                                                     0  r[34]=NULL
+  10        MakeRecord                   34   1  35                                                     0  r[35]=mkrec(r[34..34])
+  11        Rewind                        2  39   0                                                     0  Rewind table h_items
+  12          IfPos                      32  24   0                                                     0  r[32]>0 -> r[32]-=0, goto 24
+  13          Once                       24   0   0                                                     0  goto 24
+  14          OpenRead                    3   2   0  k(3,B,B,B)                                         0  table=h_orders, root=2, iDb=0
+  15          Null                        0  24  26                                                     0  r[24..26]=NULL
+  16          Rewind                      3  22   0                                                     0  Rewind table h_orders
+  17            Column                    3   1  28                                                     0  r[28]=h_orders.customer_name
+  18            Affinity                 28   1   0                                                     0  r[28..29] = A
+  19            Column                    3   1  25                                                     0  r[25]=h_orders.customer_name
+  20            HashBuild                 3  28   1  r=[1073741824] budget=32768 payload=r[24]..r[26]   0
+  21          Next                        3  17   0                                                     1
+  22          HashBuildFinalize  1073741824   0   0                                                     0
+  23          Integer                     1  32   0                                                     0  r[32]=1
+  24          Column                      2   1  29                                                     0  r[29]=h_items.order_name
+  25          Affinity                   29   1   0                                                     0  r[29..30] = A
+  26          RowId                       2  30   0                                                     0  r[30]=h_items.rowid
+  27          Integer                     0  31   0                                                     0  r[31]=0
+  28          HashProbe          1073741824  29   1  r[27]=38 payload=r[24]..r[26]                      0
+  29          Copy                       27  36   0                                                     0  r[36]=r[27]
+  30          Insert                      4  35  36                                                     6  intkey=r[36] data=r[35]
+  31          Copy                       25  17   0                                                     0  r[17]=r[25]
+  32          RowId                       2  18   0                                                     0  r[18]=h_items.rowid
+  33          MakeRecord                 17   2  16                                                     0  r[16]=mkrec(r[17..18])
+  34          SorterInsert                0  16   0  0                                                  0  key=r[16]
+  35          IfPos                      31  46   0                                                     0  r[31]>0 -> r[31]-=0, goto 46
+  36          HashNext           1073741824  27  38   payload=r[24]..r[26]                              0
+  37          Goto                        0  29   0                                                     0
+  38        Next                          2  12   0                                                     1
+  39        HashGraceInit        1073741824   0  51                                                     0  hash_table_id=1073741824
+  40        Integer                       1  31   0                                                     0  r[31]=1
+  41        HashGraceLoadPart    1073741824   0  50                                                     0  hash_table_id=1073741824
+  42        HashGraceNextProbe   1073741824  29  48                                                     0  hash_table_id=1073741824 keys=r[29]..r[29] probe_rowid_dest=r[30]
+  43        SeekRowid                     2  30  42                                                     0  if (r[30]!=cursor 2.rowid) goto 42
+  44        HashProbe            1073741824  29   1  r[27]=42 payload=r[24]..r[26]                      0
+  45        Goto                          0  29   0                                                     0
+  46        HashNext             1073741824  27  42   payload=r[24]..r[26]                              0
+  47        Goto                          0  29   0                                                     0
+  48        HashGraceAdvPart     1073741824   0  50                                                     0  hash_table_id=1073741824
+  49        Goto                          0  41   0                                                     0
+  50        Integer                       0  31   0                                                     0  r[31]=0
+  51        NullRow                       2   0   0                                                     0  Set cursor 2 to a (pseudo) NULL row
+  52        OpenRead                      5   2   0  k(3,B,B,B)                                         0  table=h_orders, root=2, iDb=0
+  53        Rewind                        5  62   0                                                     0  Rewind table h_orders
+  54          RowId                       5  37   0                                                     0  r[37]=h_orders.rowid
+  55          NotExists                   4  57  37                                                     0
+  56          Goto                        0  61   0                                                     0
+  57          Column                      5   1  17                                                     0  r[17]=h_orders.customer_name
+  58          RowId                       2  18   0                                                     0  r[18]=h_items.rowid
+  59          MakeRecord                 17   2  16                                                     0  r[16]=mkrec(r[17..18])
+  60          SorterInsert                0  16   0  0                                                  0  key=r[16]
+  61        Next                          5  54   0                                                     1
+  62        OpenPseudo                    1  16   2                                                     0  2 columns in r[16]
+  63        SorterSort                    0  78   0                                                     0
+  64          SorterData                  0  16   1                                                     0  r[16]=data
+  65          Column                      1   0  23                                                     0  r[23]=pseudo.column 0
+  66          Column                      1   1   2                                                     0  r[2]=pseudo.column 1
+  67          Compare                    22  23   1  k(1, Binary)                                       0  r[22..22]==r[23..23]
+  68          Jump                       69  72  69                                                     0
+  69          Gosub                      19  80   0                                                     0
+  70          Move                       23  22   1                                                     0  r[22..22]=r[23..23]
+  71          Gosub                      20  87   0                                                     0
+  72          Copy                        2  39   0                                                     0  r[39]=r[2]
+  73          AggStep                     0  39   1  count                                              0  accum=r[1] step(r[39])
+  74          If                         21  76   0                                                     0  if r[21] goto 76
+  75          Copy                        2   6   0                                                     0  r[6]=r[2]
+  76          Integer                     1  21   0                                                     0  r[21]=1
+  77        SorterNext                    0  64   0                                                     0
+  78        Gosub                        19  80   0                                                     0
+  79        Goto                          0  90   0                                                     0
+  80        IfPos                        21  82   0                                                     0  r[21]>0 -> r[21]-=0, goto 82
+  81      Return                         19   0   0                                                     0
+  82      AggFinal                        0   1   0  count                                              0  accum=r[1]
+  83      Copy                           22  40   0                                                     0  r[40]=r[22]
+  84      Copy                            1  41   0                                                     0  r[41]=r[1]
+  85      ResultRow                      40   2   0                                                     0  output=r[40..41]
+  86    Return                           19   0   0                                                     0
+  87    Null                              0   1   0                                                     0  r[1]=NULL
+  88    Integer                           0  21   0                                                     0  r[21]=0
+  89  Return                             20   0   0                                                     0
+  90  Halt                                0   0   0                                                     0
+  91  Transaction                         0   1   3                                                     0  iDb=0 tx_mode=Read
+  92  Goto                                0   1   0                                                     0
