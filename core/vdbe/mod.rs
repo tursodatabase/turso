@@ -2092,6 +2092,8 @@ pub struct PreparedProgram {
     pub write_databases: BitSet,
     /// Set of attached database indices that need read transactions.
     pub read_databases: BitSet,
+    /// Set of database indices whose tables the program reads.
+    pub read_table_databases: BitSet,
 }
 
 #[derive(Clone)]

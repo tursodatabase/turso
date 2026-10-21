@@ -927,3 +927,51 @@ fn test_attached_write_txn_rolled_back_after_io_error() -> anyhow::Result<()> {
     );
     Ok(())
 }
+
+#[turso_macros::test(init_sql = "CREATE TABLE t (x INTEGER);")]
+fn test_statement_reports_the_databases_of_the_tables_it_reads(
+    tmp_db: TempDatabase,
+) -> anyhow::Result<()> {
+    let aux_path = tmp_db
+        .path
+        .parent()
+        .unwrap()
+        .join("read_table_databases.db")
+        .to_string_lossy()
+        .to_string();
+    let conn = tmp_db.connect_limbo();
+    conn.execute(format!("ATTACH '{aux_path}' AS aux"))?;
+    conn.execute("CREATE TABLE aux.u (y INTEGER)")?;
+    let aux = conn
+        .list_all_databases()
+        .into_iter()
+        .find(|(_, name, _)| name == "aux")
+        .map(|(id, _, _)| id)
+        .unwrap();
+    let main = turso_core::MAIN_DB_ID;
+
+    let databases = |sql: &str| -> anyhow::Result<Vec<usize>> {
+        let stmt = conn.prepare(sql)?;
+        let mut ids: Vec<usize> = stmt.read_table_database_ids().collect();
+        ids.sort();
+        Ok(ids)
+    };
+
+    assert_eq!(databases("SELECT 1")?, Vec::<usize>::new());
+    assert_eq!(databases("SELECT x FROM t")?, vec![main]);
+    assert_eq!(databases("SELECT y FROM aux.u")?, vec![aux]);
+    assert_eq!(databases("SELECT x, y FROM t, aux.u")?, vec![main, aux]);
+    assert_eq!(
+        databases("SELECT y FROM (SELECT y FROM aux.u) s")?,
+        vec![aux]
+    );
+    assert_eq!(
+        databases("WITH c AS (SELECT y FROM aux.u) SELECT y FROM c")?,
+        vec![aux]
+    );
+    assert_eq!(
+        databases("SELECT (SELECT y FROM aux.u LIMIT 1) AS y")?,
+        vec![aux]
+    );
+    Ok(())
+}

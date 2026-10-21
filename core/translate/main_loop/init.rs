@@ -147,10 +147,12 @@ impl InitLoop {
                 continue;
             }
             // Ensure non-main databases have a Transaction instruction for read access.
-            let schema_cookie = t_ctx
-                .resolver
-                .with_schema(table.database_id, |s| s.schema_version);
-            program.begin_read_on_database(table.database_id, schema_cookie)?;
+            if matches!(table.table, Table::BTree(_) | Table::Virtual(_)) {
+                let schema_cookie = t_ctx
+                    .resolver
+                    .with_schema(table.database_id, |s| s.schema_version);
+                program.begin_read_on_database(table.database_id, schema_cookie)?;
+            }
             // Initialize bookkeeping for OUTER JOIN
             if let Some(join_info) = table.join_info.as_ref() {
                 if join_info.keeps_left_rows() {

@@ -277,6 +277,8 @@ pub struct ProgramBuilder {
     write_databases: BitSet,
     /// Set of attached database IDs that need read transactions.
     read_databases: BitSet,
+    /// Set of database IDs whose tables the program reads.
+    read_table_databases: BitSet,
     /// Schema cookies for attached databases at prepare time.
     write_database_cookies: HashMap<usize, u32>,
     /// Schema cookies for attached databases opened for reading.
@@ -782,6 +784,7 @@ impl ProgramBuilder {
             txn_mode: TransactionMode::None,
             write_databases: BitSet::default(),
             read_databases: BitSet::default(),
+            read_table_databases: BitSet::default(),
             write_database_cookies: HashMap::default(),
             read_database_cookies: HashMap::default(),
             mode: BuilderQueryMode::new(query_mode),
@@ -2146,6 +2149,7 @@ impl ProgramBuilder {
             self.txn_mode = TransactionMode::Read;
         }
         self.read_databases.set(database_id)?;
+        self.read_table_databases.set(database_id)?;
         self.read_database_cookies
             .insert(database_id, schema_cookie);
         Ok(())
@@ -2494,6 +2498,7 @@ impl ProgramBuilder {
             prepare_context,
             write_databases: self.write_databases,
             read_databases: self.read_databases,
+            read_table_databases: self.read_table_databases,
         };
         Ok(prepared)
     }

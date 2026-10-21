@@ -1185,6 +1185,10 @@ impl Statement {
         Ok(())
     }
 
+    pub fn read_table_database_ids(&self) -> impl Iterator<Item = usize> + '_ {
+        self.program.prepared.read_table_databases.iter()
+    }
+
     pub fn num_columns(&self) -> usize {
         match self.query_mode {
             QueryMode::Normal => self.program.result_columns.len(),
