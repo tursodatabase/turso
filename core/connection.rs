@@ -171,7 +171,7 @@ impl Drop for SchemaReparseGuard {
     }
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct PrepareOptions {
     pub unqualified_database_search_path: Option<Vec<String>>,
 }
@@ -1091,6 +1091,7 @@ impl Connection {
                 byte_offset_end,
                 origin,
                 needs_nested_guard,
+                prepare_options,
             ))
         })();
         if result.is_err() && needs_nested_guard {
@@ -1166,6 +1167,7 @@ impl Connection {
                 0,
                 origin,
                 needs_nested_guard,
+                prepare_options.clone(),
             ))
         })();
         if result.is_err() && needs_nested_guard {

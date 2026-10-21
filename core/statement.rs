@@ -379,6 +379,9 @@ pub struct Statement {
     /// True if this statement called `Connection::start_nested()` during
     /// construction and therefore must call `end_nested()` on drop.
     nested_guard_active: bool,
+    /// The options the statement was prepared with, reused when a schema
+    /// change makes it compile again from its SQL text.
+    prepare_options: PrepareOptions,
 }
 
 crate::assert::assert_send_sync!(Statement);
@@ -422,6 +425,7 @@ impl Statement {
             tail_offset,
             StatementOrigin::Root,
             false,
+            PrepareOptions::default(),
         )
     }
 
@@ -433,6 +437,7 @@ impl Statement {
         tail_offset: usize,
         origin: StatementOrigin,
         nested_guard_active: bool,
+        prepare_options: PrepareOptions,
     ) -> Self {
         let (max_registers, cursor_count) = match query_mode {
             QueryMode::Normal => (program.max_registers, program.cursor_ref.len()),
@@ -459,6 +464,7 @@ impl Statement {
             counted_as_active_root: false,
             is_blob_handle: false,
             nested_guard_active,
+            prepare_options,
             analyze_refresh: None,
         }
     }
@@ -1098,7 +1104,6 @@ impl Statement {
             crate::turso_assert_eq!(QueryMode::new(&cmd), mode);
             let (Cmd::Stmt(stmt) | Cmd::Explain(stmt) | Cmd::ExplainQueryPlan { stmt, .. }) = cmd;
             let schema = conn.schema.read().clone();
-            let prepare_options = PrepareOptions::default();
             translate::translate(
                 &schema,
                 stmt,
@@ -1108,7 +1113,7 @@ impl Statement {
                 mode,
                 &self.program.sql,
                 self.origin,
-                &prepare_options,
+                &self.prepare_options,
             )?
         };
 
