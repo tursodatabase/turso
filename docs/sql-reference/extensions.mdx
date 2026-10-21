@@ -285,8 +285,8 @@ Statistical aggregate functions for computing percentiles.
 |----------|-----------|-------------|-------------|
 | `median(X)` | column | REAL | Median value (50th percentile) |
 | `percentile(Y, P)` | column, REAL | REAL | P-th percentile of Y (P between 0 and 100) |
-| `percentile_cont(Y, P)` | column, REAL | REAL | Continuous percentile (interpolated) |
-| `percentile_disc(Y, P)` | column, REAL | REAL | Discrete percentile (nearest value) |
+| `percentile_cont(Y, P)` | column, REAL | REAL | Continuous percentile (interpolated). P is a fraction between 0.0 and 1.0 inclusive, like PostgreSQL; values outside that range raise an error |
+| `percentile_disc(Y, P)` | column, REAL | REAL | Discrete percentile: the value at the largest rank not exceeding P. P is a fraction between 0.0 and 1.0 inclusive, like `percentile_cont` |
 
 ### Examples
 
