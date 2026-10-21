@@ -20159,8 +20159,6 @@ fn op_vacuum_into_inner(program: &Program, state: &mut ProgramState, insn: &Insn
                     .into());
                 }
 
-                // Like SQLite, only the exact names ':memory:' and '' are
-                // in-memory targets; any other name is a file to create.
                 let output_in_memory =
                     dest_path.is_empty() || dest_path == crate::util::MEMORY_PATH;
                 if !output_in_memory && std::path::Path::new(dest_path).exists() {
