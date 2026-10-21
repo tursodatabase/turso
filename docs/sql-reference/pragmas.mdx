@@ -303,30 +303,6 @@ PRAGMA busy_timeout;
 PRAGMA busy_timeout = 5000;   -- 5 seconds
 ```
 
-### locking_mode
-
-Returns the database locking mode.
-
-```sql
-PRAGMA locking_mode;
--- exclusive
-```
-
-Turso always opens databases in `EXCLUSIVE` locking mode, so the read form always
-returns `exclusive`.
-
-<Warning>
-**Only `EXCLUSIVE` is supported.** Assigning `EXCLUSIVE` is accepted but changes
-nothing, and any other value (such as `NORMAL`) is rejected with
-`locking_mode must be EXCLUSIVE`. `COMPAT.md` tracks this as
-[🚧 Partial](https://github.com/tursodatabase/turso/blob/main/COMPAT.md).
-</Warning>
-
-```sql
-PRAGMA locking_mode = exclusive;  -- no-op
-PRAGMA locking_mode = NORMAL;     -- rejected
-```
-
 ### query_only
 
 When enabled, prevents any changes to the database.
