@@ -154,6 +154,7 @@ struct Compiler<'a> {
 }
 
 /// The value of a field of NEW after an assignment.
+#[derive(Clone)]
 enum NewValue {
     /// An expression that reads NEW as the trigger got it. The compiler puts
     /// it in each place that reads the field, so it must give the same value
@@ -189,10 +190,16 @@ impl ReturnAction {
     }
 }
 
-/// A branch of IF: the condition and the statements.
+/// A branch of IF or CASE: the condition and the statements.
 struct Branch<'j> {
     condition: ast::Expr,
     statements: Vec<&'j Json>,
+}
+
+/// What happens when no branch of IF or CASE runs.
+enum NoBranch<'j> {
+    Else(Vec<&'j Json>),
+    CaseNotFound,
 }
 
 impl Compiler<'_> {
@@ -202,11 +209,16 @@ impl Compiler<'_> {
             .and_then(|object| object.iter().next())
             .ok_or_else(|| LimboError::Corrupt("malformed PL/pgSQL statement".into()))?;
         let line = body.get("lineno").and_then(Json::as_u64).unwrap_or(0);
+        let statements_before = self.statements.len();
+        let new_values_before = self.new_values.clone();
         let result = match kind.as_str() {
             "PLpgSQL_stmt_block" => self.compile_block(body),
             "PLpgSQL_stmt_execsql" => self.compile_sql_statement(body).map(|()| Flow::Continues),
             "PLpgSQL_stmt_assign" => self.compile_assignment(body).map(|()| Flow::Continues),
             "PLpgSQL_stmt_if" => self.compile_if(body),
+            "PLpgSQL_stmt_case" => self.compile_case(body),
+            "PLpgSQL_stmt_raise" => self.compile_raise(body),
+            "PLpgSQL_stmt_perform" => self.compile_perform(body).map(|()| Flow::Continues),
             "PLpgSQL_stmt_return" if body.get("lineno").is_none() => Ok(Flow::Continues),
             "PLpgSQL_stmt_return" => self.compile_return(body),
             kind => Err(LimboError::ParseError(format!(
@@ -214,7 +226,18 @@ impl Compiler<'_> {
                 statement_description(kind)
             ))),
         };
-        result.map_err(|error| self.with_context(error, line, kind))
+        match result.map_err(|error| self.with_context(error, line, kind)) {
+            Err(LimboError::ParseError(message)) if !has_nested_statements(kind) => {
+                self.statements.truncate(statements_before);
+                self.new_values = new_values_before;
+                self.statements.push(select_where(
+                    raise_abort_expr(text_literal(&message)),
+                    self.statement_condition(),
+                ));
+                Ok(self.flow_after_error())
+            }
+            result => result,
+        }
     }
 
     fn compile_block(&mut self, block: &Json) -> Result<Flow> {
@@ -252,6 +275,18 @@ impl Compiler<'_> {
         walk_stmt_exprs_mut(&mut stmt, &mut |expr| self.replace_trigger_values(expr))?;
         let stmt = with_condition(stmt, self.statement_condition())?;
         self.statements.push(stmt);
+        Ok(())
+    }
+
+    fn compile_perform(&mut self, body: &Json) -> Result<()> {
+        let query = expression_query(body.get("expr"))?;
+        let mut stmt = self.translate_statement(query)?;
+        walk_stmt_exprs_mut(&mut stmt, &mut |expr| self.replace_trigger_values(expr))?;
+        let ast::Stmt::Select(select) = stmt else {
+            return Err(LimboError::Corrupt("PERFORM without a query".into()));
+        };
+        let select = select_with_condition(select, self.statement_condition())?;
+        self.statements.push(ast::Stmt::Select(select));
         Ok(())
     }
 
@@ -337,34 +372,74 @@ impl Compiler<'_> {
 
     fn compile_if(&mut self, body: &Json) -> Result<Flow> {
         let mut branches = vec![Branch {
-            condition: self.condition_expression(body.get("cond"))?,
+            condition: self.condition_expression(body.get("cond"), None)?,
             statements: json_array(body, "then_body").collect(),
         }];
         for elsif in
             json_array(body, "elsif_list").filter_map(|elsif| elsif.get("PLpgSQL_if_elsif"))
         {
             branches.push(Branch {
-                condition: self.condition_expression(elsif.get("cond"))?,
+                condition: self.condition_expression(elsif.get("cond"), None)?,
                 statements: json_array(elsif, "stmts").collect(),
             });
         }
-        self.compile_branches(branches, json_array(body, "else_body").collect())
+        let no_branch = NoBranch::Else(json_array(body, "else_body").collect());
+        self.compile_branches(branches, no_branch)
     }
 
-    /// Compile the branches of IF. Each condition is calculated one time into
-    /// a variable, because a statement in a branch can change what the
-    /// condition reads. A condition that is constant, such as one on
+    fn compile_case(&mut self, body: &Json) -> Result<Flow> {
+        let case_value = match body.get("t_expr") {
+            Some(value) => {
+                let varno = body.get("t_varno").and_then(Json::as_u64).unwrap_or(0);
+                let mut value = translate_expression(expression_query(Some(value))?)?;
+                walk_tree_mut(&mut value, &mut |expr| self.replace_trigger_values(expr))?;
+                let value = if constant_value(&value).is_some() {
+                    value
+                } else {
+                    let key = self.new_variable("case");
+                    let value = match self.statement_condition() {
+                        Some(condition) => case_when(condition, value, null()),
+                        None => value,
+                    };
+                    self.statements
+                        .push(select_statement(set_variable(&key, value)));
+                    get_variable(&key)
+                };
+                Some((format!("__Case__Variable_{varno}__"), value))
+            }
+            None => None,
+        };
+        let mut branches = Vec::new();
+        for when in
+            json_array(body, "case_when_list").filter_map(|when| when.get("PLpgSQL_case_when"))
+        {
+            branches.push(Branch {
+                condition: self.condition_expression(when.get("expr"), case_value.as_ref())?,
+                statements: json_array(when, "stmts").collect(),
+            });
+        }
+        let no_branch = if body.get("have_else").and_then(Json::as_bool) == Some(true) {
+            NoBranch::Else(json_array(body, "else_stmts").collect())
+        } else {
+            NoBranch::CaseNotFound
+        };
+        self.compile_branches(branches, no_branch)
+    }
+
+    /// Compile the branches of IF or CASE. Each condition is calculated one
+    /// time into a variable, because a statement in a branch can change what
+    /// the condition reads. A condition that is constant, such as one on
     /// `TG_OP`, selects its branch at compile time.
     fn compile_branches(
         &mut self,
         branches: Vec<Branch<'_>>,
-        else_statements: Vec<&Json>,
+        no_branch: NoBranch<'_>,
     ) -> Result<Flow> {
         let outer_branch = self.branch_condition.clone();
         let outer = self.statement_condition();
         let mut earlier = Vec::new();
         let mut every_branch_returns = true;
-        let mut can_reach_else = true;
+        let mut can_reach_no_branch = true;
         for branch in branches {
             let condition = branch.condition;
             match constant_value(&condition).as_ref().map(Constant::is_true) {
@@ -373,7 +448,7 @@ impl Compiler<'_> {
                     let branch_condition = and_all(outer_branch.clone(), earlier.iter().map(not));
                     let flow = self.compile_branch(branch_condition, branch.statements)?;
                     every_branch_returns &= flow == Flow::Returns;
-                    can_reach_else = false;
+                    can_reach_no_branch = false;
                     break;
                 }
                 None => {
@@ -394,9 +469,25 @@ impl Compiler<'_> {
                 }
             }
         }
-        if can_reach_else {
+        if can_reach_no_branch {
             let branch_condition = and_all(outer_branch, earlier.iter().map(not));
-            let flow = self.compile_branch(branch_condition, else_statements)?;
+            let flow = match no_branch {
+                NoBranch::Else(statements) => self.compile_branch(branch_condition, statements)?,
+                NoBranch::CaseNotFound => {
+                    let saved = std::mem::replace(&mut self.branch_condition, branch_condition);
+                    let condition = self.statement_condition();
+                    self.branch_condition = saved;
+                    self.statements.push(select_where(
+                        raise_abort_expr(text_literal("case not found")),
+                        condition.clone(),
+                    ));
+                    if condition.is_none() {
+                        Flow::Returns
+                    } else {
+                        Flow::Continues
+                    }
+                }
+            };
             every_branch_returns &= flow == Flow::Returns;
         }
         Ok(if every_branch_returns {
@@ -417,12 +508,130 @@ impl Compiler<'_> {
         flow
     }
 
-    fn condition_expression(&self, condition: Option<&Json>) -> Result<ast::Expr> {
+    fn condition_expression(
+        &self,
+        condition: Option<&Json>,
+        case_value: Option<&(String, ast::Expr)>,
+    ) -> Result<ast::Expr> {
         let mut condition = translate_expression(expression_query(condition)?)?;
         walk_tree_mut(&mut condition, &mut |expr| {
+            if let (Some((name, value)), ast::Expr::Id(id)) = (case_value, &*expr) {
+                if id.as_str() == name {
+                    *expr = value.clone();
+                    return Ok(WalkControl::SkipChildren);
+                }
+            }
             self.replace_trigger_values(expr)
         })?;
         Ok(condition)
+    }
+
+    fn compile_raise(&mut self, body: &Json) -> Result<Flow> {
+        const ERROR_LEVEL: u64 = 21;
+        if body
+            .get("elog_level")
+            .and_then(Json::as_u64)
+            .unwrap_or(ERROR_LEVEL)
+            < ERROR_LEVEL
+        {
+            return Ok(Flow::Continues);
+        }
+        let mut message = match body.get("message").and_then(Json::as_str) {
+            Some(format) => Some(self.raise_message(format, json_array(body, "params"))?),
+            None => None,
+        };
+        let mut error_code = None;
+        for option in
+            json_array(body, "options").filter_map(|option| option.get("PLpgSQL_raise_option"))
+        {
+            const ERRCODE_OPTION: u64 = 0;
+            const MESSAGE_OPTION: u64 = 1;
+            let option_type = option.get("opt_type").and_then(Json::as_u64);
+            if option_type != Some(MESSAGE_OPTION) && option_type != Some(ERRCODE_OPTION) {
+                continue;
+            }
+            if option_type == Some(MESSAGE_OPTION) && message.is_some() {
+                return Err(LimboError::ParseError(
+                    "RAISE option already specified: MESSAGE".into(),
+                ));
+            }
+            let mut value = translate_expression(expression_query(option.get("expr"))?)?;
+            walk_tree_mut(&mut value, &mut |expr| self.replace_trigger_values(expr))?;
+            if option_type == Some(MESSAGE_OPTION) {
+                message = Some(cast_to_text(value));
+            } else {
+                error_code = Some(cast_to_text(value));
+            }
+        }
+        let message = match (message, body.get("condname").and_then(Json::as_str)) {
+            (Some(message), _) => message,
+            (None, Some(condition_name)) => text_literal(condition_name),
+            (None, None) => match error_code {
+                Some(error_code) => error_code,
+                None => {
+                    return Err(LimboError::ParseError(
+                        "RAISE without parameters is not supported".into(),
+                    ))
+                }
+            },
+        };
+        let condition = self.statement_condition();
+        let flow = if condition.is_none() {
+            Flow::Returns
+        } else {
+            Flow::Continues
+        };
+        self.statements
+            .push(select_where(raise_abort_expr(message), condition));
+        Ok(flow)
+    }
+
+    /// The message of `RAISE '<format>', params`: each `%` takes the next
+    /// parameter, and `%%` is one `%`.
+    fn raise_message<'j>(
+        &self,
+        format: &str,
+        params: impl Iterator<Item = &'j Json>,
+    ) -> Result<ast::Expr> {
+        let mut params = params.peekable();
+        let mut parts = Vec::new();
+        let mut text = String::new();
+        let mut chars = format.chars().peekable();
+        while let Some(c) = chars.next() {
+            if c != '%' {
+                text.push(c);
+                continue;
+            }
+            if chars.peek() == Some(&'%') {
+                chars.next();
+                text.push('%');
+                continue;
+            }
+            let Some(param) = params.next() else {
+                return Err(LimboError::ParseError(
+                    "too few parameters specified for RAISE".into(),
+                ));
+            };
+            let mut value = translate_expression(expression_query(Some(param))?)?;
+            walk_tree_mut(&mut value, &mut |expr| self.replace_trigger_values(expr))?;
+            parts.push(text_literal(&std::mem::take(&mut text)));
+            parts.push(function_call(
+                "coalesce",
+                vec![cast_to_text(value), text_literal("<NULL>")],
+            ));
+        }
+        if params.peek().is_some() {
+            return Err(LimboError::ParseError(
+                "too many parameters specified for RAISE".into(),
+            ));
+        }
+        parts.push(text_literal(&text));
+        Ok(parts
+            .into_iter()
+            .reduce(|left, right| {
+                ast::Expr::Binary(Box::new(left), ast::Operator::Concat, Box::new(right))
+            })
+            .expect("the message has at least one part"))
     }
 
     fn compile_return(&mut self, body: &Json) -> Result<Flow> {
@@ -620,6 +829,14 @@ impl Compiler<'_> {
         match (self.branch_condition.clone(), no_return_yet) {
             (Some(branch), Some(no_return_yet)) => Some(and(Some(branch), no_return_yet)),
             (branch, no_return_yet) => branch.or(no_return_yet),
+        }
+    }
+
+    /// The flow after a statement that always gives an error when it runs.
+    fn flow_after_error(&self) -> Flow {
+        match self.statement_condition() {
+            None => Flow::Returns,
+            Some(_) => Flow::Continues,
         }
     }
 
@@ -878,6 +1095,17 @@ fn json_array<'a>(value: &'a Json, key: &str) -> impl Iterator<Item = &'a Json> 
         .and_then(Json::as_array)
         .into_iter()
         .flatten()
+}
+
+/// Whether a statement of this kind has statements inside it that the
+/// compiler compiles. An error of another statement becomes an error when the
+/// statement runs, as in PostgreSQL, so that it does not stop a trigger
+/// whose branch with that statement does not run.
+fn has_nested_statements(kind: &str) -> bool {
+    matches!(
+        kind,
+        "PLpgSQL_stmt_block" | "PLpgSQL_stmt_if" | "PLpgSQL_stmt_case"
+    )
 }
 
 fn expression_query(expression: Option<&Json>) -> Result<&str> {
@@ -1194,6 +1422,29 @@ fn inserted_rows_with_condition(select: ast::Select, condition: ast::Expr) -> as
     )
 }
 
+/// A query of PERFORM that runs only when `condition` is true.
+fn select_with_condition(select: ast::Select, condition: Option<ast::Expr>) -> Result<ast::Select> {
+    let Some(condition) = condition else {
+        return Ok(select);
+    };
+    let mut select = select;
+    if !select.body.compounds.is_empty() {
+        return Err(LimboError::ParseError(
+            "PERFORM of a compound query in a branch is not supported yet".into(),
+        ));
+    }
+    match &mut select.body.select {
+        ast::OneSelect::Select { where_clause, .. } => {
+            *where_clause = Some(Box::new(and(
+                where_clause.take().map(|expr| *expr),
+                condition,
+            )));
+            Ok(select)
+        }
+        ast::OneSelect::Values(_) => Ok(inserted_rows_with_condition(select, condition)),
+    }
+}
+
 fn one_select(
     columns: Vec<ast::ResultColumn>,
     from: Option<ast::FromClause>,
@@ -1271,6 +1522,17 @@ fn case_when(condition: ast::Expr, then: ast::Expr, otherwise: ast::Expr) -> ast
         base: None,
         when_then_pairs: vec![(Box::new(condition), Box::new(then))],
         else_expr: Some(Box::new(otherwise)),
+    }
+}
+
+fn cast_to_text(value: ast::Expr) -> ast::Expr {
+    ast::Expr::Cast {
+        expr: Box::new(value),
+        type_name: Some(ast::Type {
+            name: "TEXT".to_string(),
+            size: None,
+            array_dimensions: 0,
+        }),
     }
 }
 

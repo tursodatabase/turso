@@ -991,3 +991,198 @@ expect {
     1|done|done after open
     2|waiting|
 }
+
+test if-elsif-else-checks-and-changes-the-row {
+    CREATE TABLE items (id int PRIMARY KEY, n int, note text);
+    CREATE TABLE seen (msg text);
+    CREATE FUNCTION check_n() RETURNS trigger LANGUAGE plpgsql AS $$
+    BEGIN
+        IF NEW.n < 0 THEN
+            RAISE EXCEPTION 'n must not be negative: %', NEW.n;
+        ELSIF NEW.n = 0 THEN
+            RETURN NULL;
+        ELSIF NEW.n > 100 THEN
+            NEW.n := 100;
+            NEW.note := 'capped';
+        ELSE
+            INSERT INTO seen VALUES ('ok ' || NEW.n);
+        END IF;
+        RAISE NOTICE 'checked %', NEW.n;
+        RETURN NEW;
+    END
+    $$;
+    CREATE TRIGGER items_check BEFORE INSERT OR UPDATE ON items FOR EACH ROW EXECUTE FUNCTION check_n();
+    INSERT INTO items (id, n) VALUES (1, 5), (2, 0), (3, 500);
+    UPDATE items SET n = 1000 WHERE id = 1;
+    SELECT id, n, note FROM items ORDER BY id;
+    SELECT msg FROM seen;
+}
+expect {
+    1|100|capped
+    3|100|capped
+    ok 5
+}
+
+test case-statement-chooses-a-branch {
+    CREATE TABLE items (id int PRIMARY KEY, kind text, size text);
+    CREATE FUNCTION set_size() RETURNS trigger LANGUAGE plpgsql AS $$
+    BEGIN
+        CASE NEW.kind
+            WHEN 'a', 'b' THEN
+                NEW.size := 'small';
+            WHEN 'c' THEN
+                NEW.size := 'large';
+            ELSE
+                NEW.size := 'unknown';
+        END CASE;
+        CASE
+            WHEN NEW.id > 100 THEN
+                NEW.size := NEW.size || '+';
+            ELSE
+                NULL;
+        END CASE;
+        RETURN NEW;
+    END
+    $$;
+    CREATE TRIGGER items_size BEFORE INSERT ON items FOR EACH ROW EXECUTE FUNCTION set_size();
+    INSERT INTO items (id, kind) VALUES (1, 'a'), (2, 'c'), (3, 'z'), (101, 'b');
+    SELECT id, size FROM items ORDER BY id;
+}
+expect {
+    1|small
+    2|large
+    3|unknown
+    101|small+
+}
+
+test case-statement-without-a-match-and-without-else-errors {
+    CREATE TABLE items (id int PRIMARY KEY, kind text);
+    CREATE FUNCTION check_kind() RETURNS trigger LANGUAGE plpgsql AS $$
+    BEGIN
+        CASE NEW.kind
+            WHEN 'a' THEN
+                NULL;
+        END CASE;
+        RETURN NEW;
+    END
+    $$;
+    CREATE TRIGGER items_kind BEFORE INSERT ON items FOR EACH ROW EXECUTE FUNCTION check_kind();
+    INSERT INTO items VALUES (1, 'a');
+    INSERT INTO items VALUES (2, 'b');
+}
+expect error {
+    case not found
+}
+
+test raise-exception-in-a-branch-aborts-the-statement {
+    CREATE TABLE items (id int PRIMARY KEY, n int);
+    CREATE FUNCTION check_n() RETURNS trigger LANGUAGE plpgsql AS $$
+    BEGIN
+        IF NEW.n < 0 THEN
+            RAISE EXCEPTION 'n must not be negative: % (%%)', NEW.n;
+        END IF;
+        RETURN NEW;
+    END
+    $$;
+    CREATE TRIGGER items_check BEFORE INSERT ON items FOR EACH ROW EXECUTE FUNCTION check_n();
+    INSERT INTO items VALUES (1, 1), (2, -7);
+}
+expect error {
+    n must not be negative: -7 \(%\)
+}
+
+test raise-shows-null-parameters-and-the-message-option {
+    CREATE TABLE items (id int PRIMARY KEY, n int);
+    CREATE FUNCTION check_n() RETURNS trigger LANGUAGE plpgsql AS $$
+    BEGIN
+        IF NEW.n IS NULL THEN
+            RAISE 'n is %', NEW.n;
+        END IF;
+        RAISE EXCEPTION USING MESSAGE = 'n is ' || NEW.n;
+    END
+    $$;
+    CREATE TRIGGER items_check BEFORE INSERT ON items FOR EACH ROW EXECUTE FUNCTION check_n();
+    INSERT INTO items VALUES (1, NULL);
+}
+expect error {
+    n is <NULL>
+}
+
+test statements-that-fail-only-when-they-run-do-not-stop-a-branch-that-does-not-run {
+    CREATE TABLE items (id int PRIMARY KEY);
+    CREATE TABLE log (msg text);
+    CREATE FUNCTION check_id() RETURNS trigger LANGUAGE plpgsql AS $$
+    BEGIN
+        IF NEW.id < 0 THEN
+            SELECT 1;
+            RAISE EXCEPTION 'x' USING MESSAGE = 'y';
+            FOR i IN 1..3 LOOP
+                INSERT INTO log VALUES ('loop');
+            END LOOP;
+        END IF;
+        INSERT INTO log VALUES ('ok ' || NEW.id);
+        RETURN NEW;
+    END
+    $$;
+    CREATE TRIGGER items_check BEFORE INSERT ON items FOR EACH ROW EXECUTE FUNCTION check_id();
+    INSERT INTO items VALUES (1);
+    SELECT msg FROM log;
+}
+expect {
+    ok 1
+}
+
+test query-without-a-destination-errors-when-it-runs {
+    CREATE TABLE items (id int PRIMARY KEY);
+    CREATE FUNCTION check_id() RETURNS trigger LANGUAGE plpgsql AS $$
+    BEGIN
+        IF NEW.id > 0 THEN
+            SELECT 1;
+        END IF;
+        RETURN NEW;
+    END
+    $$;
+    CREATE TRIGGER items_check BEFORE INSERT ON items FOR EACH ROW EXECUTE FUNCTION check_id();
+    INSERT INTO items VALUES (1);
+}
+expect error {
+    query has no destination for result data
+}
+
+test raise-with-only-an-error-code-gives-the-code-as-the-message {
+    CREATE TABLE items (id int PRIMARY KEY);
+    CREATE FUNCTION check_id() RETURNS trigger LANGUAGE plpgsql AS $$
+    BEGIN
+        IF NEW.id < 0 THEN
+            RAISE EXCEPTION USING ERRCODE = 'check_violation';
+        END IF;
+        RETURN NEW;
+    END
+    $$;
+    CREATE TRIGGER items_check BEFORE INSERT ON items FOR EACH ROW EXECUTE FUNCTION check_id();
+    INSERT INTO items VALUES (1);
+    INSERT INTO items VALUES (-1);
+}
+expect error {
+    check_violation
+}
+
+test perform-runs-the-query-of-its-branch {
+    CREATE SEQUENCE calls;
+    CREATE TABLE t (id int PRIMARY KEY, a text);
+    CREATE FUNCTION count_calls() RETURNS trigger LANGUAGE plpgsql AS $$
+    BEGIN
+        IF NEW.id > 1 THEN
+            PERFORM nextval('calls');
+        END IF;
+        PERFORM nextval('calls') WHERE NEW.a = 'two';
+        RETURN NULL;
+    END
+    $$;
+    CREATE TRIGGER t_count AFTER INSERT ON t FOR EACH ROW EXECUTE FUNCTION count_calls();
+    INSERT INTO t VALUES (1, 'one'), (2, 'two'), (3, 'three');
+    SELECT nextval('calls');
+}
+expect {
+    4
+}

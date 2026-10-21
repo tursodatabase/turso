@@ -465,7 +465,7 @@ Upgrade is not supported.
 | Per function statistics | ❌ Not supported | |
 | RETURN QUERY EXECUTE | ❌ Not supported | |
 | RETURNS TABLE | ❌ Not supported | |
-| Row level triggers | 🟡 Partial | `BEFORE` and `AFTER` triggers whose PL/pgSQL function has SQL statements, assignments to fields of `NEW`, `IF` and `RETURN`. A `BEFORE` trigger writes the row that it returns, or skips the row when it returns `NULL`. It cannot change an `INTEGER PRIMARY KEY` column. An assigned value is converted as in `INSERT`, so `NEW.n := 3.7` for an `int` column gives an error, where PostgreSQL stores 4. `SECURITY DEFINER` and `SET` options of the function are accepted and ignored |
+| Row level triggers | 🟡 Partial | `BEFORE` and `AFTER` triggers whose PL/pgSQL function has SQL statements, `PERFORM`, assignments to fields of `NEW`, `IF`, `CASE`, `RAISE` and `RETURN`. A `BEFORE` trigger writes the row that it returns, or skips the row when it returns `NULL`. It cannot change an `INTEGER PRIMARY KEY` column. An assigned value is converted as in `INSERT`, so `NEW.n := 3.7` for an `int` column gives an error, where PostgreSQL stores 4. `SECURITY DEFINER` and `SET` options of the function are accepted and ignored |
 | Statement level triggers | ❌ Not supported | CREATE TRIGGER ... FOR EACH STATEMENT gives an error |
 | Statement level TRUNCATE triggers | ❌ Not supported | |
 | Triggers on views | ❌ Not supported | |
@@ -476,8 +476,8 @@ Upgrade is not supported.
 
 | Feature | Status | Notes |
 |---------|--------|-------|
-| Procedural languages (PL/pgSQL, PL/Python, ...) | 🟡 Partial | PL/pgSQL functions run only as trigger functions, compiled to SQL statements for each trigger and event; loops, cursors, `EXCEPTION`, `EXECUTE` and `RETURN QUERY` give an error when the trigger fires. Other languages and DO are rejected with an error |
-| CASE in pl/pgsql | ❌ Not supported | |
+| Procedural languages (PL/pgSQL, PL/Python, ...) | 🟡 Partial | PL/pgSQL functions run only as trigger functions, compiled to SQL statements for each trigger and event; loops, cursors, `EXCEPTION`, `EXECUTE` and `RETURN QUERY` give an error when the trigger fires. `RAISE EXCEPTION` gives its message without SQLSTATE, `DETAIL` or `HINT`, and `RAISE NOTICE` and the other levels send no message. Other languages and DO are rejected with an error |
+| CASE in pl/pgsql | 🟡 Partial | In trigger functions |
 | CONTINUE statement for PL/pgSQL | ❌ Not supported | |
 | CREATE TRANSFORM | ❌ Not supported | |
 | DO statement for pl/perl | ❌ Not supported | |
