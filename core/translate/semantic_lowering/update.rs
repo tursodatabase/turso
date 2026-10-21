@@ -50,11 +50,20 @@ pub(super) fn needs_legacy(
 ) -> Result<bool> {
     let document = &plan.document;
     if !update.order_by.is_empty() || update.limit.is_some() {
+        super::note_fallback("UPDATE with ORDER BY or LIMIT")?;
         return Ok(true);
     }
     // Like legacy, writes to a virtual table record no change data.
     if let Some(table) = super::dml::virtual_target(document, update.target)? {
-        return Ok(update.from.is_some() || super::dml::virtual_needs_legacy(&table));
+        if update.from.is_some() {
+            super::note_fallback("UPDATE ... FROM of a virtual table")?;
+            return Ok(true);
+        }
+        if super::dml::virtual_needs_legacy(&table) {
+            super::note_fallback("UPDATE of sqlite_dbpage")?;
+            return Ok(true);
+        }
+        return Ok(false);
     }
     let Some(source) = document.source(update.target) else {
         return Err(LimboError::InternalError(format!(
@@ -63,17 +72,21 @@ pub(super) fn needs_legacy(
         )));
     };
     let hir::SourceKind::Table(table) = &source.kind else {
+        super::note_fallback("UPDATE of a target that is not a table")?;
         return Ok(true);
     };
     let Some(table) = table.value().btree() else {
+        super::note_fallback("UPDATE of a table without a B-tree")?;
         return Ok(true);
     };
     if super::dml::strict_needs_legacy(&table, source) {
+        super::note_fallback("UPDATE of a STRICT table with custom types")?;
         return Ok(true);
     }
     // Custom types are lowered unless a virtual column has one.
     if super::dml::has_custom_types(source) {
         if !matches!(update.target_kind, hir::UpdateTargetKind::BTree { .. }) {
+            super::note_fallback("UPDATE with custom types of a target that is not a B-tree")?;
             return Ok(true);
         }
         let custom_virtual = table
@@ -82,6 +95,7 @@ pub(super) fn needs_legacy(
             .zip(&source.column_type_programs)
             .any(|(column, programs)| column.is_virtual_generated() && programs.is_some());
         if custom_virtual {
+            super::note_fallback("UPDATE of a table with a custom-typed virtual column")?;
             return Ok(true);
         }
     }
@@ -100,6 +114,7 @@ pub(super) fn needs_legacy(
                 reads_cte
             })
         }) {
+            super::note_fallback("UPDATE ... FROM with RETURNING reading a CTE")?;
             return Ok(true);
         }
         // UPDATE ... FROM fills a scratch table during the join, so no loop
@@ -116,6 +131,9 @@ pub(super) fn needs_legacy(
                 other
             })
         });
+        if reads_from {
+            super::note_fallback("UPDATE ... FROM with RETURNING reading a FROM table")?;
+        }
         return Ok(reads_from);
     }
     let [planned_loop] = access.loops.as_slice() else {
@@ -127,10 +145,17 @@ pub(super) fn needs_legacy(
     match &planned_loop.access {
         // A loop over an index built for this statement is not lowered yet.
         HirSourceAccess::BTree { operation, .. } => {
-            Ok(operation_index(operation).is_some_and(|index| index.ephemeral))
+            if operation_index(operation).is_some_and(|index| index.ephemeral) {
+                super::note_fallback("UPDATE through an automatic index")?;
+                return Ok(true);
+            }
+            Ok(false)
         }
         HirSourceAccess::OrUnion(_) | HirSourceAccess::IndexMethod(_) => Ok(false),
-        _ => Ok(true),
+        _ => {
+            super::note_fallback("UPDATE target without a table loop")?;
+            Ok(true)
+        }
     }
 }
 

@@ -461,6 +461,17 @@ pub(super) fn uses_mvcc(
         .is_some_and(|database| connection.mv_store_for_db(database.index()).is_some())
 }
 
+/// Record that a statement goes to the legacy planner for `reason`. With
+/// TURSO_HIR_NO_FALLBACK set the statement fails instead, naming the reason,
+/// so running the test suites with it lists what still needs legacy.
+pub(super) fn note_fallback(reason: &str) -> Result<()> {
+    static NO_FALLBACK: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if *NO_FALLBACK.get_or_init(|| std::env::var_os("TURSO_HIR_NO_FALLBACK").is_some()) {
+        return Err(LimboError::InternalError(format!("HIR fallback: {reason}")));
+    }
+    Ok(())
+}
+
 fn target_needs_legacy(
     schema: &Schema,
     connection: &Connection,
@@ -489,7 +500,11 @@ fn target_needs_legacy(
     }
     // The VM keeps dependent materialized views up to date as rows are
     // written; legacy reports views built by another DBSP version.
-    Ok(schema.with_incompatible_dependent_views(&table_name, |views| !views.is_empty()))
+    if schema.with_incompatible_dependent_views(&table_name, |views| !views.is_empty()) {
+        note_fallback("target has materialized views built by another DBSP version")?;
+        return Ok(true);
+    }
+    Ok(false)
 }
 
 /// What every HIR document of one statement is analyzed and planned with:

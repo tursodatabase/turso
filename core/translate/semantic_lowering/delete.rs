@@ -44,11 +44,16 @@ pub(super) fn needs_legacy(
     access: &HirAccessPlan,
 ) -> Result<bool> {
     if !delete.order_by.is_empty() || delete.limit.is_some() {
+        super::note_fallback("DELETE with ORDER BY or LIMIT")?;
         return Ok(true);
     }
     // Like legacy, writes to a virtual table record no change data.
     if let Some(table) = super::dml::virtual_target(document, delete.target)? {
-        return Ok(super::dml::virtual_needs_legacy(&table));
+        if super::dml::virtual_needs_legacy(&table) {
+            super::note_fallback("DELETE from sqlite_dbpage")?;
+            return Ok(true);
+        }
+        return Ok(false);
     }
     let [planned_loop] = access.loops.as_slice() else {
         return Err(LimboError::InternalError(format!(
@@ -58,10 +63,17 @@ pub(super) fn needs_legacy(
     };
     match &planned_loop.access {
         HirSourceAccess::BTree { operation, .. } => {
-            Ok(operation_index(operation).is_some_and(|index| index.ephemeral))
+            if operation_index(operation).is_some_and(|index| index.ephemeral) {
+                super::note_fallback("DELETE through an automatic index")?;
+                return Ok(true);
+            }
+            Ok(false)
         }
         HirSourceAccess::OrUnion(_) | HirSourceAccess::IndexMethod(_) => Ok(false),
-        _ => Ok(true),
+        _ => {
+            super::note_fallback("DELETE target without a table loop")?;
+            Ok(true)
+        }
     }
 }
 

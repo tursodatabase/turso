@@ -49,7 +49,11 @@ pub(super) fn needs_legacy(
     let document = &plan.document;
     // Like legacy, writes to a virtual table record no change data.
     if let Some(table) = super::dml::virtual_target(document, insert.target)? {
-        return Ok(super::dml::virtual_needs_legacy(&table));
+        if super::dml::virtual_needs_legacy(&table) {
+            super::note_fallback("INSERT into sqlite_dbpage")?;
+            return Ok(true);
+        }
+        return Ok(false);
     }
     let Some(source) = document.source(insert.target) else {
         return Err(LimboError::InternalError(format!(
@@ -58,15 +62,18 @@ pub(super) fn needs_legacy(
         )));
     };
     let hir::SourceKind::Table(table) = &source.kind else {
+        super::note_fallback("INSERT into a target that is not a table")?;
         return Ok(true);
     };
     let Some(table) = table.value().btree() else {
+        super::note_fallback("INSERT into a table without a B-tree")?;
         return Ok(true);
     };
     if !table.has_rowid {
         without_rowid_errors(program, insert, source)?;
     }
     if super::dml::strict_needs_legacy(&table, source) {
+        super::note_fallback("INSERT into a STRICT table with custom types")?;
         return Ok(true);
     }
     // Custom types are lowered unless a virtual column has one.
@@ -76,6 +83,9 @@ pub(super) fn needs_legacy(
             .iter()
             .zip(&source.column_type_programs)
             .any(|(column, programs)| column.is_virtual_generated() && programs.is_some());
+        if custom_virtual {
+            super::note_fallback("INSERT into a table with a custom-typed virtual column")?;
+        }
         return Ok(custom_virtual);
     }
     Ok(false)
