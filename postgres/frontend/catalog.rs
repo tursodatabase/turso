@@ -193,6 +193,10 @@ impl Dialect for PostgresDialect {
         true
     }
 
+    fn rowid_before_insert_triggers(&self) -> bool {
+        true
+    }
+
     fn trigger_when_clause(
         &self,
         trigger: &turso_core::schema::Trigger,

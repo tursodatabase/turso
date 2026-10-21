@@ -180,6 +180,25 @@ expect error {
     a whole row in WHEN is supported only in a comparison of OLD and NEW
 }
 
+test before-insert-trigger-reads-the-generated-key {
+    CREATE TABLE items (id serial PRIMARY KEY, name text, slug text);
+    CREATE FUNCTION make_slug() RETURNS trigger LANGUAGE plpgsql AS $$
+    BEGIN
+        NEW.slug := NEW.name || '-' || NEW.id;
+        RETURN NEW;
+    END
+    $$;
+    CREATE TRIGGER items_slug BEFORE INSERT ON items FOR EACH ROW EXECUTE FUNCTION make_slug();
+    INSERT INTO items (name) VALUES ('a'), ('b');
+    INSERT INTO items (name) VALUES ('c');
+    SELECT id, name, slug FROM items ORDER BY id;
+}
+expect {
+    1|a|a-1
+    2|b|b-2
+    3|c|c-3
+}
+
 @setup log_table
 test statements-after-return-do-not-run {
     CREATE FUNCTION log_row() RETURNS trigger LANGUAGE plpgsql AS $$
@@ -356,6 +375,34 @@ expect {
     schema 2
 }
 
+test drop-function-that-a-trigger-calls-errors {
+    CREATE TABLE items (id int PRIMARY KEY, n int);
+    CREATE FUNCTION set_n() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN NEW.n := 5; RETURN NEW; END $$;
+    CREATE TRIGGER items_n BEFORE INSERT ON items FOR EACH ROW EXECUTE FUNCTION set_n();
+    DROP FUNCTION set_n();
+}
+expect error {
+    cannot drop function set_n\(\) because other objects depend on it
+}
+
+test drop-function-cascade-drops-the-triggers-that-call-it {
+    CREATE TABLE items (id int PRIMARY KEY, n int);
+    CREATE FUNCTION set_n() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN NEW.n := 5; RETURN NEW; END $$;
+    CREATE TRIGGER items_n BEFORE INSERT ON items FOR EACH ROW EXECUTE FUNCTION set_n();
+    INSERT INTO items (id) VALUES (1);
+    DROP FUNCTION IF EXISTS set_n() CASCADE;
+    INSERT INTO items (id) VALUES (2);
+    CREATE FUNCTION set_n() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN NEW.n := 7; RETURN NEW; END $$;
+    CREATE TRIGGER items_n BEFORE INSERT ON items FOR EACH ROW EXECUTE FUNCTION set_n();
+    INSERT INTO items (id) VALUES (3);
+    SELECT id, n FROM items ORDER BY id;
+}
+expect {
+    1|5
+    2|
+    3|7
+}
+
 @setup log_table
 test create-trigger-twice-errors {
     CREATE FUNCTION log_row() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RETURN NULL; END $$;
@@ -453,4 +500,246 @@ test dropped-trigger-can-be-created-again {
 }
 expect {
     1
+}
+
+@setup log_table
+test before-insert-trigger-changes-the-new-row {
+    CREATE FUNCTION upper_a() RETURNS trigger LANGUAGE plpgsql AS $$
+    BEGIN
+        NEW.a := upper(NEW.a);
+        RETURN NEW;
+    END
+    $$;
+    CREATE TRIGGER t_upper BEFORE INSERT ON t FOR EACH ROW EXECUTE FUNCTION upper_a();
+    INSERT INTO t VALUES (1, 'one'), (2, 'two');
+    SELECT id, a FROM t ORDER BY id;
+}
+expect {
+    1|ONE
+    2|TWO
+}
+
+test before-update-trigger-changes-a-column-that-update-does-not-set {
+    CREATE TABLE items (id int PRIMARY KEY, name text, changed timestamp);
+    CREATE INDEX items_changed ON items (changed);
+    CREATE FUNCTION set_changed() RETURNS trigger LANGUAGE plpgsql AS $$
+    BEGIN
+        NEW.changed := '2024-05-06 07:08:09';
+        RETURN NEW;
+    END
+    $$;
+    CREATE TRIGGER items_changed BEFORE UPDATE ON items FOR EACH ROW EXECUTE FUNCTION set_changed();
+    INSERT INTO items VALUES (1, 'a', '2000-01-01 00:00:00'), (2, 'b', '2000-01-01 00:00:00');
+    UPDATE items SET name = 'c' WHERE id = 1;
+    SELECT id, name, changed FROM items ORDER BY id;
+    SELECT id FROM items WHERE changed = '2024-05-06 07:08:09';
+}
+expect {
+    1|c|2024-05-06 07:08:09
+    2|b|2000-01-01 00:00:00
+    1
+}
+
+test set-updated-at-trigger-sets-the-time-of-the-update {
+    CREATE TABLE items (id int PRIMARY KEY, name text, updated_at timestamptz NOT NULL DEFAULT now());
+    create or replace function public.set_updated_at()
+    returns trigger
+    language plpgsql
+    as $$
+    begin
+        new.updated_at = now();
+        return new;
+    end;
+    $$;
+    create trigger set_items_updated_at before update on items for each row execute function public.set_updated_at();
+    INSERT INTO items (id, name, updated_at) VALUES (1, 'a', '2000-01-01 00:00:00');
+    UPDATE items SET name = 'b';
+    SELECT name, CASE WHEN updated_at > '2020-01-01' THEN 'updated' ELSE 'old' END FROM items;
+}
+expect {
+    b|updated
+}
+
+test handle-times-trigger-sets-the-times-of-insert-and-update {
+    CREATE TABLE todos (id serial PRIMARY KEY, text text, created_at timestamptz, updated_at timestamptz);
+    CREATE OR REPLACE FUNCTION handle_times()
+        RETURNS trigger AS
+        $$
+        BEGIN
+        IF (TG_OP = 'INSERT') THEN
+            NEW.created_at := now();
+            NEW.updated_at := now();
+        ELSEIF (TG_OP = 'UPDATE') THEN
+            NEW.created_at = OLD.created_at;
+            NEW.updated_at = now();
+        END IF;
+        RETURN NEW;
+        END;
+        $$ language plpgsql;
+    CREATE TRIGGER handle_times
+        BEFORE INSERT OR UPDATE ON todos
+        FOR EACH ROW
+    EXECUTE PROCEDURE handle_times();
+    INSERT INTO todos (text, created_at, updated_at) VALUES ('a', '2000-01-01 00:00:00', '2000-01-01 00:00:00');
+    UPDATE todos SET created_at = '2001-01-01 00:00:00', updated_at = '2001-01-01 00:00:00';
+    SELECT text,
+        CASE WHEN created_at > '2020-01-01' THEN 'insert time' ELSE 'old' END,
+        CASE WHEN updated_at >= created_at THEN 'update time' ELSE 'old' END
+    FROM todos;
+}
+expect {
+    a|insert time|update time
+}
+
+@setup log_table
+test assignments-read-the-earlier-assignments {
+    CREATE FUNCTION append() RETURNS trigger LANGUAGE plpgsql AS $$
+    BEGIN
+        NEW.a := NEW.a || '1';
+        NEW.a := NEW.a || '2';
+        INSERT INTO log VALUES (TG_OP, NEW.id, NEW.a);
+        RETURN NEW;
+    END
+    $$;
+    CREATE TRIGGER t_append BEFORE INSERT ON t FOR EACH ROW EXECUTE FUNCTION append();
+    INSERT INTO t VALUES (1, 'x');
+    SELECT id, a FROM t;
+    SELECT op, id, a FROM log;
+}
+expect {
+    1|x12
+    INSERT|1|x12
+}
+
+@setup log_table
+test return-null-in-a-before-trigger-skips-the-row {
+    CREATE FUNCTION skip_row() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RETURN NULL; END $$;
+    INSERT INTO t VALUES (1, 'one');
+    CREATE TRIGGER t_skip BEFORE INSERT OR UPDATE OR DELETE ON t FOR EACH ROW EXECUTE FUNCTION skip_row();
+    INSERT INTO t VALUES (2, 'two');
+    UPDATE t SET a = 'changed';
+    DELETE FROM t;
+    SELECT id, a FROM t;
+}
+expect {
+    1|one
+}
+
+@setup log_table
+test return-new-in-a-before-delete-trigger-skips-the-delete {
+    CREATE FUNCTION keep_row() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RETURN NEW; END $$;
+    INSERT INTO t VALUES (1, 'one');
+    CREATE TRIGGER t_keep BEFORE DELETE ON t FOR EACH ROW EXECUTE FUNCTION keep_row();
+    DELETE FROM t;
+    SELECT id, a FROM t;
+}
+expect {
+    1|one
+}
+
+@setup log_table
+test return-old-in-a-before-update-trigger-keeps-the-old-row {
+    CREATE FUNCTION keep_old() RETURNS trigger LANGUAGE plpgsql AS $$
+    BEGIN
+        NEW.a := 'ignored';
+        RETURN OLD;
+    END
+    $$;
+    INSERT INTO t VALUES (1, 'one');
+    CREATE TRIGGER t_old BEFORE INSERT OR UPDATE ON t FOR EACH ROW EXECUTE FUNCTION keep_old();
+    UPDATE t SET a = 'two';
+    INSERT INTO t VALUES (2, 'two');
+    SELECT id, a FROM t;
+}
+expect {
+    1|one
+}
+
+@setup log_table
+test return-coalesce-of-new-and-old-returns-the-row-of-the-event {
+    CREATE FUNCTION mark() RETURNS trigger LANGUAGE plpgsql AS $$
+    BEGIN
+        NEW.a := 'marked';
+        RETURN COALESCE(NEW, OLD);
+    END
+    $$;
+    CREATE TRIGGER t_mark BEFORE INSERT OR UPDATE OR DELETE ON t FOR EACH ROW EXECUTE FUNCTION mark();
+    INSERT INTO t VALUES (1, 'one'), (2, 'two');
+    UPDATE t SET a = 'changed' WHERE id = 2;
+    DELETE FROM t WHERE id = 1;
+    SELECT id, a FROM t;
+}
+expect {
+    2|marked
+}
+
+@setup log_table
+test update-of-trigger-does-not-fire-for-a-column-that-a-before-trigger-changes {
+    CREATE FUNCTION set_a() RETURNS trigger LANGUAGE plpgsql AS $$
+    BEGIN
+        NEW.a := 'set by trigger';
+        RETURN NEW;
+    END
+    $$;
+    CREATE FUNCTION log_row() RETURNS trigger LANGUAGE plpgsql AS $$
+    BEGIN
+        INSERT INTO log VALUES (TG_OP, NEW.id, NEW.a);
+        RETURN NULL;
+    END
+    $$;
+    INSERT INTO t VALUES (1, 'one');
+    CREATE TRIGGER t_set_a BEFORE UPDATE ON t FOR EACH ROW EXECUTE FUNCTION set_a();
+    CREATE TRIGGER t_log_a AFTER UPDATE OF a ON t FOR EACH ROW EXECUTE FUNCTION log_row();
+    UPDATE t SET id = 2;
+    SELECT id, a FROM t;
+    SELECT count(*) FROM log;
+}
+expect {
+    2|set by trigger
+    0
+}
+
+@setup log_table
+test assignment-to-a-missing-field-errors-when-the-trigger-fires {
+    CREATE FUNCTION bad_field() RETURNS trigger LANGUAGE plpgsql AS $$
+    BEGIN
+        NEW.nope := 1;
+        RETURN NEW;
+    END
+    $$;
+    CREATE TRIGGER t_bad BEFORE INSERT ON t FOR EACH ROW EXECUTE FUNCTION bad_field();
+    INSERT INTO t VALUES (1, 'one');
+}
+expect error {
+    record "new" has no field "nope"
+}
+
+@setup log_table
+test trigger-function-without-return-errors-when-it-ends {
+    CREATE FUNCTION no_return() RETURNS trigger LANGUAGE plpgsql AS $$
+    BEGIN
+        INSERT INTO log VALUES (TG_OP, NEW.id, NEW.a);
+    END
+    $$;
+    CREATE TRIGGER t_no_return AFTER INSERT ON t FOR EACH ROW EXECUTE FUNCTION no_return();
+    INSERT INTO t VALUES (1, 'one');
+}
+expect error {
+    control reached end of trigger procedure without RETURN
+}
+
+@skip-if postgres "PostgreSQL lets a BEFORE trigger change the primary key"
+test before-trigger-that-changes-an-integer-primary-key-errors {
+    CREATE TABLE keyed (id int PRIMARY KEY, a text);
+    CREATE FUNCTION move_row() RETURNS trigger LANGUAGE plpgsql AS $$
+    BEGIN
+        NEW.id := NEW.id + 100;
+        RETURN NEW;
+    END
+    $$;
+    CREATE TRIGGER keyed_move BEFORE INSERT ON keyed FOR EACH ROW EXECUTE FUNCTION move_row();
+    INSERT INTO keyed VALUES (1, 'one');
+}
+expect error {
+    a BEFORE trigger cannot change the INTEGER PRIMARY KEY column "id" yet \(PL/pgSQL function move_row\(\) line 4 at RETURN\)
 }

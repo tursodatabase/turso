@@ -165,7 +165,7 @@ pub use storage::{
     pager::{Page, PageRef, Pager},
     wal::{CheckpointMode, CheckpointResult, Wal, WalAutoActions, WalFile, WalFileShared},
 };
-pub use translate::expr::{walk_expr_mut, WalkControl};
+pub use translate::expr::{walk_expr, walk_expr_mut, WalkControl};
 pub use turso_ext::ContextDestructor;
 pub use turso_macros::{
     turso_assert, turso_assert_all, turso_assert_eq, turso_assert_greater_than,
