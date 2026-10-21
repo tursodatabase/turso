@@ -1298,7 +1298,8 @@ impl PostgreSQLTranslator {
 
         let (body, columns) = if !select_stmt.values_lists.is_empty() {
             // VALUES clause — compute which columns are DEFAULT in ALL rows.
-            let (rows, default_mask) = self.translate_values(&select_stmt.values_lists)?;
+            let (rows, default_mask) =
+                self.translate_values(&select_stmt.values_lists, has_explicit_columns)?;
             // Strip columns that use DEFAULT in every row
             let filtered_columns: Vec<ast::Name> = columns
                 .into_iter()
@@ -1343,15 +1344,16 @@ impl PostgreSQLTranslator {
     }
 
     /// Translate VALUES lists, returning both the translated rows and a bitmask of
-    /// which column positions contain DEFAULT in every row. These positions should
-    /// be stripped from the INSERT column list since SQLite doesn't support DEFAULT
-    /// in VALUES — omitting the column achieves the same effect.
-    /// Columns with DEFAULT in only SOME rows keep the DEFAULT as NULL.
+    /// which column positions contain DEFAULT in every row. When the INSERT has an
+    /// explicit column list, those positions can be omitted from both the list and
+    /// each VALUES row. Positional VALUES must preserve every position so the core
+    /// can resolve `Expr::Default` against the table schema.
     // The Box<Expr> is required by ast::OneSelect::Values(Vec<Vec<Box<Expr>>>)
     #[allow(clippy::vec_box, clippy::type_complexity)]
     fn translate_values(
         &self,
         values_lists: &[pg_query::protobuf::Node],
+        omit_all_default_columns: bool,
     ) -> Result<(Vec<Vec<Box<ast::Expr>>>, Vec<bool>), ParseError> {
         use pg_query::protobuf::node::Node;
 
@@ -1378,8 +1380,8 @@ impl PostgreSQLTranslator {
             }
         }
 
-        // Second pass: translate values, filtering out all-default columns.
-        // Columns with DEFAULT in only some rows emit NULL (via translate_expr).
+        // Second pass: translate values, omitting all-default columns only when
+        // the INSERT has an explicit column list.
         let mut rows = Vec::new();
         for row_node in values_lists.iter() {
             match &row_node.node {
@@ -1388,7 +1390,10 @@ impl PostgreSQLTranslator {
                         .items
                         .iter()
                         .enumerate()
-                        .filter(|(i, _)| !default_mask.get(*i).copied().unwrap_or(false))
+                        .filter(|(i, _)| {
+                            !omit_all_default_columns
+                                || !default_mask.get(*i).copied().unwrap_or(false)
+                        })
                         .map(|(_, item)| Ok(Box::new(self.translate_expr(item)?)))
                         .collect::<Result<Vec<_>, ParseError>>()?;
                     rows.push(row);

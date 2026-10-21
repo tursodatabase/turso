@@ -2650,6 +2650,21 @@ fn test_postgres_insert_default(db: TempDatabase) {
     );
 }
 
+#[turso_macros::test]
+fn test_postgres_insert_default_without_column_list(db: TempDatabase) {
+    let conn = db.connect_postgres();
+    conn.execute("CREATE TABLE t (x INTEGER DEFAULT 2)")
+        .unwrap();
+    conn.execute("INSERT INTO t VALUES (DEFAULT)").unwrap();
+    assert_eq!(
+        conn.prepare("SELECT x FROM t")
+            .unwrap()
+            .run_collect_rows()
+            .unwrap(),
+        vec![vec![Value::from_i64(2)]]
+    );
+}
+
 /// Tests DEFAULT with multiple data types and verifies DEFAULT is distinct from NULL.
 #[turso_macros::test]
 fn test_postgres_insert_default_vs_null(db: TempDatabase) {
