@@ -58,7 +58,7 @@ Basics not enumerated by the official feature matrix.
 | BEGIN / COMMIT / ROLLBACK | ✅ Supported | Isolation-level and READ ONLY/WRITE options accepted but ignored |
 | LOCK TABLE | 🟡 Partial | ACCESS SHARE without NOWAIT is accepted as a no-op inside a transaction for pg_dump compatibility; table names are not checked, no locks are acquired, and no read snapshot is started; other modes are rejected |
 | Casts (`expr::type`, CAST) | ✅ Supported | Also `int4(x)`-style cast functions |
-| Parameters (`$1`, `$2`, ...) | 🟡 Partial | Work through the extended wire protocol; text-format values only |
+| Parameters (`$1`, `$2`, ...) | 🟡 Partial | Work through the extended wire protocol; text-format values only. tursopg runs `CREATE SCHEMA`, `CREATE TRIGGER`, `DROP TRIGGER` and all but the last function of a `DROP FUNCTION` list when it prepares them, and the server prepares an extended-protocol statement at Describe and again at Execute. Thus these statements run two times through that protocol, and the second run can give an error such as `trigger ... already exists` |
 | Operators: `\|\|`, `%`, bitwise, LIKE/ILIKE [ESCAPE], SIMILAR TO, `~`/`~*`/`!~`/`!~*`, IS [NOT] DISTINCT FROM, BETWEEN | ✅ Supported | Regex operators lower to REGEXP; `~*`/`!~*` add the `(?i)` flag. LIKE is case-sensitive with `\` as the default escape; ILIKE applies LOWER() to both sides, then matches like LIKE. In CREATE INDEX, LIKE and ILIKE need a string-literal pattern without ESCAPE |
 | Dollar-quoted strings, escape strings (`E'...'`), bit/hex string literals | ✅ Supported | |
 | generate_series | ✅ Supported | In FROM and with joins; column aliases on the function (`AS g(x)`) do not resolve |
@@ -132,6 +132,7 @@ INTEGER. Unknown type names pass through as custom types.
 | macaddr8 data type | ✅ Supported | Along with inet, cidr, macaddr (round-trip tested) |
 | Multiranges | ❌ Not supported | |
 | NULLs in Array | ✅ Supported | `ARRAY[1, NULL, 3]` round-trips |
+| NUMERIC data type | 🟡 Partial | The operators of `numeric` apply only to a column of a table. A comparison of another numeric value with a number, such as a column of a subquery, `amount + 0`, or a field of `NEW` in a trigger, gives a wrong result |
 | Phrase search | ❌ Not supported | tsvector/tsquery degrade to TEXT; no full-text search |
 | Range types | ❌ Not supported | |
 | smallserial type | ✅ Supported | serial2/serial4/serial8 aliases too; serial implies NOT NULL + implicit sequence, not PRIMARY KEY |
@@ -455,7 +456,7 @@ Upgrade is not supported.
 | ALTER TABLE / ENABLE REPLICA TRIGGER/RULE | ❌ Not supported | |
 | BEGIN ATOMIC function bodies | ❌ Not supported | |
 | CALL syntax for executing procedures | ❌ Not supported | |
-| CREATE FUNCTION | 🟡 Partial | `LANGUAGE sql` and `LANGUAGE plpgsql` are stored and listed in `pg_proc`. CREATE FUNCTION without a schema creates the function in the first schema of `search_path` that exists. A call of a SQL function whose body is one expression without FROM is inlined, with the null check of STRICT and a cast to the return type; other calls give an error. Functions are found by name and argument count only, so default argument values do not make a function match fewer arguments |
+| CREATE FUNCTION | 🟡 Partial | `LANGUAGE sql` and `LANGUAGE plpgsql` are stored and listed in `pg_proc`. CREATE FUNCTION without a schema creates the function in the first schema of `search_path` that exists. A call of a SQL function whose body is one expression without FROM is inlined, with the null check of STRICT and a cast to the return type; other calls give an error. Functions are found by name and argument count only, so default argument values do not make a function match fewer arguments. Each argument gets the cast to the type of its parameter. DROP FUNCTION gives an error for a function that a trigger calls, and with CASCADE it drops those triggers; it does not know other objects that use a function, such as views. A function with the name of a built-in function of Turso that PostgreSQL does not have, such as `hex`, `total` or `instr`, is not called. CHECK constraints and expression indexes cannot call stored functions |
 | Column level triggers | ✅ Supported | `UPDATE OF` columns |
 | CREATE PROCEDURE syntax for SQL stored procedures | 🟡 Partial | Stored like functions; CALL is not supported |
 | Event triggers | ❌ Not supported | |
@@ -465,18 +466,18 @@ Upgrade is not supported.
 | Per function statistics | ❌ Not supported | |
 | RETURN QUERY EXECUTE | ❌ Not supported | |
 | RETURNS TABLE | ❌ Not supported | |
-| Row level triggers | 🟡 Partial | `BEFORE` and `AFTER` triggers whose PL/pgSQL function has SQL statements, `PERFORM`, `SELECT INTO`, `RETURNING INTO`, variables, `FOUND`, assignments to variables and to fields of `NEW`, `IF`, `CASE`, `RAISE` and `RETURN`. A `BEFORE` trigger writes the row that it returns, or skips the row when it returns `NULL`. It cannot change an `INTEGER PRIMARY KEY` column. An assigned value is converted as in `INSERT`, so `NEW.n := 3.7` for an `int` column gives an error, where PostgreSQL stores 4. `SECURITY DEFINER` and `SET` options of the function are accepted and ignored |
+| Row level triggers | 🟡 Partial | `BEFORE` and `AFTER` triggers whose PL/pgSQL function has SQL statements, `PERFORM`, `SELECT INTO`, `RETURNING INTO`, variables, `FOUND`, assignments to variables and to fields of `NEW`, `IF`, `CASE`, `RAISE` and `RETURN`. A `BEFORE` trigger writes the row that it returns, or skips the row when it returns `NULL`. It cannot change an `INTEGER PRIMARY KEY` column, and `RETURN OLD` gives an error when the statement changes that column. An assigned value is converted as in `INSERT`, so `NEW.n := 3.7` for an `int` column gives an error, where PostgreSQL stores 4. In a `BEFORE` trigger, a field of `NEW` has the value that the statement gives, before the conversion to the type of the column: after `INSERT ... VALUES ('true')` into a `boolean` column, `NEW.flag` is the text `'true'`, and `numeric(10,2)` 10.5 is 10.5, not 10.50. An `AFTER` trigger fires after each row, not at the end of the statement. An unknown table or column in a statement of the function stops each firing, also when the branch of the statement does not run. `SECURITY DEFINER` and `SET` options of the function are accepted and ignored |
 | Statement level triggers | ❌ Not supported | CREATE TRIGGER ... FOR EACH STATEMENT gives an error |
 | Statement level TRUNCATE triggers | ❌ Not supported | |
 | Triggers on views | ❌ Not supported | |
 | Variadic functions | ❌ Not supported | |
-| WHEN clause for CREATE TRIGGER | ✅ Supported | |
+| WHEN clause for CREATE TRIGGER | 🟡 Partial | A whole row, as in `OLD.* IS DISTINCT FROM NEW.*`, only in a comparison of `OLD` and `NEW` with `IS [NOT] DISTINCT FROM`, `=` or `<>` |
 
 ## Procedural Languages
 
 | Feature | Status | Notes |
 |---------|--------|-------|
-| Procedural languages (PL/pgSQL, PL/Python, ...) | 🟡 Partial | PL/pgSQL functions run only as trigger functions, compiled to SQL statements for each trigger and event; loops, cursors, `EXCEPTION`, `EXECUTE` and `RETURN QUERY` give an error when the trigger fires. A value that a variable gets is converted with the casts of tursopg, so `v int := 3.7` stores 3 and `'abc'` stores 0, where PostgreSQL stores 4 and gives an error. A name that is both a variable and a column gives the error `column reference is ambiguous` when the statement runs, as in PostgreSQL, unless `#variable_conflict` chooses the variable or the column. `SELECT INTO STRICT`, record variables, `%TYPE` and `%ROWTYPE` are not supported yet. `RAISE EXCEPTION` gives its message without SQLSTATE, `DETAIL` or `HINT`, and `RAISE NOTICE` and the other levels send no message. Other languages and DO are rejected with an error |
+| Procedural languages (PL/pgSQL, PL/Python, ...) | 🟡 Partial | PL/pgSQL functions run only as trigger functions, compiled to SQL statements for each trigger and event; loops, cursors, `EXECUTE` and `RETURN QUERY` give an error when the statement runs, and a block with `EXCEPTION` gives an error when the trigger fires. A value that a variable gets is converted with the casts of tursopg, so `v int := 3.7` stores 3 and `'abc'` stores 0, where PostgreSQL stores 4 and gives an error. A name that is both a variable and a column gives the error `column reference is ambiguous` when the statement runs, as in PostgreSQL, unless `#variable_conflict` chooses the variable or the column. `SELECT INTO STRICT`, record variables, `%TYPE`, `%ROWTYPE`, `GET DIAGNOSTICS` and a whole row of `NEW` or `OLD` in an expression, such as `to_jsonb(NEW)`, are not supported yet. A variable in a query that reads a table function, such as `generate_series`, gives an error. `PERFORM` of an aggregate in a branch that does not run still sets `FOUND` and calls the functions of its select list. `RAISE EXCEPTION` gives its message without SQLSTATE, `DETAIL` or `HINT`, and `RAISE NOTICE` and the other levels send no message. Other languages and DO are rejected with an error |
 | CASE in pl/pgsql | 🟡 Partial | In trigger functions |
 | CONTINUE statement for PL/pgSQL | ❌ Not supported | |
 | CREATE TRANSFORM | ❌ Not supported | |
