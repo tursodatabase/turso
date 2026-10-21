@@ -787,3 +787,20 @@ expect {
     a_first
     b_second
 }
+
+test set-updated-at-trigger-fires-for-the-update-of-an-upsert {
+    CREATE TABLE items (id int PRIMARY KEY, name text, updated_at timestamptz NOT NULL DEFAULT now());
+    CREATE FUNCTION set_updated_at() RETURNS trigger LANGUAGE plpgsql AS $$
+    BEGIN
+        NEW.updated_at := now();
+        RETURN NEW;
+    END
+    $$;
+    CREATE TRIGGER items_updated_at BEFORE UPDATE ON items FOR EACH ROW EXECUTE FUNCTION set_updated_at();
+    INSERT INTO items (id, name, updated_at) VALUES (1, 'a', '2000-01-01 00:00:00');
+    INSERT INTO items (id, name) VALUES (1, 'b') ON CONFLICT (id) DO UPDATE SET name = excluded.name;
+    SELECT name, CASE WHEN updated_at > '2020-01-01' THEN 'updated' ELSE 'old' END FROM items;
+}
+expect {
+    b|updated
+}

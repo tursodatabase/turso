@@ -1096,6 +1096,63 @@ mod tests {
     }
 
     #[test]
+    fn before_update_trigger_changes_the_row_of_an_upsert() {
+        let conn = open_trigger_db("trigger-changes-upsert.db");
+        conn.execute(
+            "CREATE TYPE cents BASE integer ENCODE value * 100 DECODE value / 100 OPERATOR '<'",
+        )
+        .unwrap();
+        conn.execute(
+            "CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER, b INTEGER NOT NULL, price cents) STRICT",
+        )
+        .unwrap();
+        conn.execute("CREATE TABLE log (x TEXT)").unwrap();
+        conn.execute("CREATE INDEX t_b ON t (b)").unwrap();
+        conn.execute("CREATE INDEX t_price ON t (price)").unwrap();
+        conn.execute("INSERT INTO t VALUES (1, 1, 10, 5)").unwrap();
+        conn.execute(
+            "CREATE TRIGGER tr BEFORE UPDATE ON t BEGIN \
+             SELECT test_trigger_body('', 'b', 'nullif(new.a * 10 + old.b, 1020)', 'price', 'new.price + 1'); \
+             END",
+        )
+        .unwrap();
+        conn.execute(
+            "CREATE TRIGGER of_b AFTER UPDATE OF b ON t BEGIN INSERT INTO log VALUES ('b'); END",
+        )
+        .unwrap();
+
+        conn.execute(
+            "INSERT INTO t VALUES (1, 2, 0, 0) ON CONFLICT (id) DO UPDATE SET a = excluded.a",
+        )
+        .unwrap();
+
+        assert_eq!(
+            rows(&conn, "SELECT id, a, b, price FROM t"),
+            vec![vec![int(1), int(2), int(30), int(6)]]
+        );
+        assert_eq!(
+            rows(&conn, "SELECT id FROM t INDEXED BY t_b WHERE b = 30"),
+            vec![vec![int(1)]]
+        );
+        assert_eq!(
+            rows(&conn, "SELECT id FROM t INDEXED BY t_price WHERE price = 6"),
+            vec![vec![int(1)]]
+        );
+        assert_eq!(rows(&conn, "SELECT count(*) FROM log"), vec![vec![int(0)]]);
+        assert_eq!(
+            rows(&conn, "PRAGMA integrity_check"),
+            vec![vec![text("ok")]]
+        );
+
+        let error = conn
+            .execute("INSERT INTO t VALUES (1, 99, 0, 0) ON CONFLICT (id) DO UPDATE SET a = 99")
+            .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("NOT NULL constraint failed: t.b"));
+    }
+
+    #[test]
     fn triggers_fire_in_the_order_of_the_dialect() {
         let conn = open_trigger_db("trigger-order.db");
         conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, c TEXT)")

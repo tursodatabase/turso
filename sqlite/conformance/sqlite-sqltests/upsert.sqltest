@@ -1008,6 +1008,50 @@ expect {
 }
 
 @cross-check-integrity
+test upsert-before-update-trigger-sees-new-values-after-affinity {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, a INTEGER, b TEXT);
+    CREATE TABLE log(x, ty);
+    CREATE TRIGGER tg BEFORE UPDATE ON t BEGIN
+        INSERT INTO log VALUES (NEW.a, typeof(NEW.a));
+        INSERT INTO log VALUES (NEW.b, typeof(NEW.b));
+    END;
+    INSERT INTO t VALUES (1, 1, 'x');
+    INSERT INTO t VALUES (1, 2, 'y') ON CONFLICT(id) DO UPDATE SET a = '5', b = 7;
+    SELECT * FROM log;
+}
+expect {
+    5|integer
+    7|text
+}
+
+test upsert-before-update-trigger-when-clause-sees-new-values-after-affinity {
+    CREATE TABLE u(id INTEGER PRIMARY KEY, q INTEGER);
+    CREATE TABLE ulog(x);
+    CREATE TRIGGER utr BEFORE UPDATE ON u WHEN NEW.q IS NOT OLD.q BEGIN
+        INSERT INTO ulog VALUES (1);
+    END;
+    INSERT INTO u VALUES (1, 5);
+    INSERT INTO u VALUES (1, 0) ON CONFLICT(id) DO UPDATE SET q = '5';
+    SELECT count(*) FROM ulog;
+}
+expect {
+    0
+}
+
+test upsert-before-update-trigger-sees-new-values-of-a-strict-table-after-the-type-check {
+    CREATE TABLE s(id INTEGER PRIMARY KEY, a INTEGER) STRICT;
+    CREATE TABLE slog(x, ty);
+    CREATE TRIGGER str BEFORE UPDATE ON s BEGIN
+        INSERT INTO slog VALUES (NEW.a, typeof(NEW.a));
+    END;
+    INSERT INTO s VALUES (1, 0);
+    INSERT INTO s VALUES (1, 0) ON CONFLICT(id) DO UPDATE SET a = '9';
+    SELECT * FROM slog;
+}
+expect {
+    9|integer
+}
+
 test upsert-before-update-trigger-changes-non-set-column {
     -- The trigger changes c, which is not in the SET list. The final row
     -- must keep the trigger's c value; only b gets the SET value.
@@ -1026,4 +1070,282 @@ expect {
     1|6|11
     11
     ok
+}
+
+test upsert-before-update-trigger-fires-before-the-not-null-check {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, a NOT NULL);
+    CREATE TRIGGER tr BEFORE UPDATE ON t BEGIN
+        SELECT RAISE(ABORT, 'before update trigger');
+    END;
+    INSERT INTO t VALUES (1, 1);
+    INSERT INTO t VALUES (1, 2) ON CONFLICT(id) DO UPDATE SET a = NULL;
+}
+expect error {
+    before update trigger
+}
+
+test upsert-before-update-trigger-fires-before-the-check-constraint {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, a CHECK (a > 0));
+    CREATE TRIGGER tr BEFORE UPDATE ON t BEGIN
+        SELECT RAISE(ABORT, 'before update trigger');
+    END;
+    INSERT INTO t VALUES (1, 1);
+    INSERT INTO t VALUES (1, 2) ON CONFLICT(id) DO UPDATE SET a = -1;
+}
+expect error {
+    before update trigger
+}
+
+test upsert-before-update-trigger-fires-before-the-unique-check-of-another-index {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, a UNIQUE);
+    CREATE TRIGGER tr BEFORE UPDATE ON t BEGIN
+        SELECT RAISE(ABORT, 'before update trigger');
+    END;
+    INSERT INTO t VALUES (1, 1), (2, 2);
+    INSERT INTO t VALUES (1, 9) ON CONFLICT(id) DO UPDATE SET a = 2;
+}
+expect error {
+    before update trigger
+}
+
+test upsert-strict-type-check-comes-before-the-before-update-trigger {
+    CREATE TABLE s(id INTEGER PRIMARY KEY, a INTEGER) STRICT;
+    CREATE TRIGGER tr BEFORE UPDATE ON s BEGIN
+        SELECT RAISE(ABORT, 'before update trigger');
+    END;
+    INSERT INTO s VALUES (1, 1);
+    INSERT INTO s VALUES (1, 2) ON CONFLICT(id) DO UPDATE SET a = 'abc';
+}
+expect error {
+    cannot store TEXT value in INTEGER column
+}
+
+test upsert-not-null-check-fails-after-a-before-update-trigger-that-passes {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, a NOT NULL);
+    CREATE TABLE log(x);
+    CREATE TRIGGER tr BEFORE UPDATE ON t BEGIN
+        INSERT INTO log VALUES (OLD.a);
+    END;
+    INSERT INTO t VALUES (1, 1);
+    INSERT INTO t VALUES (1, 2) ON CONFLICT(id) DO UPDATE SET a = NULL;
+}
+expect error {
+    NOT NULL constraint failed
+}
+
+test upsert-fires-the-insert-and-update-triggers-in-order {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, a);
+    CREATE TABLE log(seq INTEGER PRIMARY KEY, ev, a);
+    CREATE TRIGGER bi BEFORE INSERT ON t BEGIN
+        INSERT INTO log(ev, a) VALUES ('before insert', NEW.a);
+    END;
+    CREATE TRIGGER ai AFTER INSERT ON t BEGIN
+        INSERT INTO log(ev, a) VALUES ('after insert', NEW.a);
+    END;
+    CREATE TRIGGER bu BEFORE UPDATE ON t BEGIN
+        INSERT INTO log(ev, a) VALUES ('before update', NEW.a);
+    END;
+    CREATE TRIGGER au AFTER UPDATE ON t BEGIN
+        INSERT INTO log(ev, a) VALUES ('after update', NEW.a);
+    END;
+    INSERT INTO t VALUES (1, 1);
+    DELETE FROM log;
+    INSERT INTO t VALUES (1, 2), (3, 3) ON CONFLICT(id) DO UPDATE SET a = excluded.a * 10;
+    SELECT ev, a FROM log ORDER BY seq;
+    SELECT * FROM t;
+}
+expect {
+    before insert|2
+    before update|20
+    after update|20
+    before insert|3
+    after insert|3
+    1|20
+    3|3
+}
+
+test upsert-do-update-where-false-fires-no-update-trigger {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, a);
+    CREATE TABLE log(ev);
+    CREATE TRIGGER bu BEFORE UPDATE ON t BEGIN
+        INSERT INTO log VALUES ('before update');
+    END;
+    CREATE TRIGGER au AFTER UPDATE ON t BEGIN
+        INSERT INTO log VALUES ('after update');
+    END;
+    INSERT INTO t VALUES (1, 1);
+    INSERT INTO t VALUES (1, 2) ON CONFLICT(id) DO UPDATE SET a = excluded.a WHERE excluded.a > 5;
+    SELECT count(*) FROM log;
+    SELECT * FROM t;
+}
+expect {
+    0
+    1|1
+}
+
+test upsert-before-update-trigger-sees-the-old-row-and-the-new-row {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, a, b);
+    CREATE TABLE log(oa, ob, na, nb);
+    CREATE TRIGGER bu BEFORE UPDATE ON t BEGIN
+        INSERT INTO log VALUES (OLD.a, OLD.b, NEW.a, NEW.b);
+    END;
+    INSERT INTO t VALUES (1, 'a1', 'b1');
+    INSERT INTO t VALUES (1, 'a2', 'b2') ON CONFLICT(id) DO UPDATE SET a = excluded.a;
+    SELECT * FROM log;
+    SELECT * FROM t;
+}
+expect {
+    a1|b1|a2|b1
+    1|a2|b1
+}
+
+test upsert-after-update-trigger-sees-the-written-row {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, n INTEGER);
+    CREATE TABLE log(o, nw);
+    CREATE TRIGGER au AFTER UPDATE ON t BEGIN
+        INSERT INTO log VALUES (OLD.n, NEW.n);
+    END;
+    INSERT INTO t VALUES (1, 5);
+    INSERT INTO t VALUES (1, 1) ON CONFLICT(id) DO UPDATE SET n = n + excluded.n;
+    INSERT INTO t VALUES (1, 1) ON CONFLICT(id) DO UPDATE SET n = n + excluded.n;
+    SELECT * FROM log;
+}
+expect {
+    5|6
+    6|7
+}
+
+test upsert-update-of-trigger-fires-only-for-the-columns-of-set {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, a, b);
+    CREATE TABLE log(ev);
+    CREATE TRIGGER ta BEFORE UPDATE OF a ON t BEGIN
+        INSERT INTO log VALUES ('a');
+    END;
+    CREATE TRIGGER tb BEFORE UPDATE OF b ON t BEGIN
+        INSERT INTO log VALUES ('b');
+    END;
+    INSERT INTO t VALUES (1, 1, 1);
+    INSERT INTO t VALUES (1, 2, 2) ON CONFLICT(id) DO UPDATE SET b = excluded.b;
+    SELECT ev FROM log;
+    SELECT * FROM t;
+}
+expect {
+    b
+    1|1|2
+}
+
+test upsert-returning-with-a-before-update-trigger {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, a);
+    CREATE TABLE log(x);
+    CREATE TRIGGER bu BEFORE UPDATE ON t BEGIN
+        INSERT INTO log VALUES (NEW.a);
+    END;
+    INSERT INTO t VALUES (1, 1);
+    INSERT INTO t VALUES (1, 2) ON CONFLICT(id) DO UPDATE SET a = excluded.a + 1 RETURNING id, a;
+    SELECT x FROM log;
+}
+expect {
+    1|3
+    3
+}
+
+@cross-check-integrity
+
+test upsert-with-a-before-update-trigger-keeps-the-index-correct {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, a, b);
+    CREATE INDEX t_a ON t(a);
+    CREATE TABLE log(x);
+    CREATE TRIGGER bu BEFORE UPDATE ON t BEGIN
+        INSERT INTO log VALUES (NEW.a);
+    END;
+    INSERT INTO t VALUES (1, 'x', 1), (2, 'y', 2);
+    INSERT INTO t VALUES (1, 'z', 0) ON CONFLICT(id) DO UPDATE SET a = excluded.a;
+    SELECT id FROM t WHERE a = 'z';
+    SELECT count(*) FROM t WHERE a = 'x';
+    SELECT x FROM log;
+}
+expect {
+    1
+    0
+    z
+}
+
+test upsert-before-update-trigger-for-each-conflict-of-one-statement {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, n);
+    CREATE TABLE log(id, o, nw);
+    CREATE TRIGGER bu BEFORE UPDATE ON t BEGIN
+        INSERT INTO log VALUES (NEW.id, OLD.n, NEW.n);
+    END;
+    INSERT INTO t VALUES (1, 1), (1, 2), (1, 3) ON CONFLICT(id) DO UPDATE SET n = n + excluded.n;
+    SELECT * FROM log;
+    SELECT * FROM t;
+}
+expect {
+    1|1|3
+    1|3|6
+    1|6
+}
+
+test upsert-before-update-trigger-with-a-unique-conflict-target {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, k UNIQUE, v);
+    CREATE TABLE log(o, nw);
+    CREATE TRIGGER bu BEFORE UPDATE ON t BEGIN
+        INSERT INTO log VALUES (OLD.v, NEW.v);
+    END;
+    INSERT INTO t(k, v) VALUES ('a', 1);
+    INSERT INTO t(k, v) VALUES ('a', 2) ON CONFLICT(k) DO UPDATE SET v = excluded.v;
+    SELECT * FROM log;
+    SELECT id, k, v FROM t;
+}
+expect {
+    1|2
+    1|a|2
+}
+
+test upsert-before-update-trigger-sees-generated-columns {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, a, g AS (a * 2));
+    CREATE TABLE log(o, nw);
+    CREATE TRIGGER bu BEFORE UPDATE ON t BEGIN
+        INSERT INTO log VALUES (OLD.g, NEW.g);
+    END;
+    INSERT INTO t(id, a) VALUES (1, 1);
+    INSERT INTO t(id, a) VALUES (1, 5) ON CONFLICT(id) DO UPDATE SET a = excluded.a;
+    SELECT * FROM log;
+    SELECT * FROM t;
+}
+expect {
+    2|10
+    1|5|10
+}
+
+test upsert-before-update-trigger-with-when-on-old-and-new {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, a);
+    CREATE TABLE log(o, nw);
+    CREATE TRIGGER bu BEFORE UPDATE ON t WHEN NEW.a > OLD.a BEGIN
+        INSERT INTO log VALUES (OLD.a, NEW.a);
+    END;
+    INSERT INTO t VALUES (1, 5), (2, 5);
+    INSERT INTO t VALUES (1, 9), (2, 1) ON CONFLICT(id) DO UPDATE SET a = excluded.a;
+    SELECT * FROM log;
+    SELECT * FROM t;
+}
+expect {
+    5|9
+    1|9
+    2|1
+}
+
+test upsert-raise-ignore-skips-only-the-row-of-the-trigger {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, a);
+    CREATE TRIGGER bu BEFORE UPDATE ON t WHEN NEW.a = 99 BEGIN
+        SELECT RAISE(IGNORE);
+    END;
+    INSERT INTO t VALUES (1, 1), (2, 2);
+    INSERT INTO t VALUES (1, 99), (2, 5), (3, 99) ON CONFLICT(id) DO UPDATE SET a = excluded.a;
+    SELECT * FROM t;
+}
+expect {
+    1|1
+    2|5
+    3|99
 }
