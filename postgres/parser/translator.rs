@@ -5255,6 +5255,23 @@ pub fn is_set_transaction(parse_result: &ParseResult) -> bool {
     )
 }
 
+/// The byte offset of the table name in a CREATE TABLE statement that names
+/// its table without a schema. None for temporary tables and for other
+/// statements.
+pub fn unqualified_create_table_name_location(parse_result: &ParseResult) -> Option<usize> {
+    use pg_query::NodeRef;
+
+    let nodes = parse_result.protobuf.nodes();
+    let NodeRef::CreateStmt(create) = &nodes.first()?.0 else {
+        return None;
+    };
+    let relation = create.relation.as_ref()?;
+    if !relation.schemaname.is_empty() || relation.relpersistence == "t" {
+        return None;
+    }
+    Some(relation.location as usize)
+}
+
 /// Try to extract a SHOW statement from a PG parse result.
 /// Returns None if the statement is not a SHOW.
 pub fn try_extract_show(parse_result: &ParseResult) -> Option<PgShowStmt> {
