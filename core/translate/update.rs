@@ -506,8 +506,11 @@ fn collect_update_set_clauses(
                 .iter_mut()
                 .find(|set| set.column_index == col_index)
             {
-                Some(existing) => compose_update_set_clause(existing, expr),
-                None => set_clauses.push(UpdateSetClause::new(col_index, expr)),
+                Some(existing) => {
+                    existing.column_names.push(col_name.clone());
+                    compose_update_set_clause(existing, expr)
+                }
+                None => set_clauses.push(UpdateSetClause::new(col_index, col_name.clone(), expr)),
             }
         }
     }

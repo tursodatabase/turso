@@ -1576,6 +1576,10 @@ fn resolve_upserts(
         {
             // Normalize SET pairs once
             let mut rewritten_sets = collect_set_clauses_for_upsert(table, sets)?;
+            let set_column_names: Vec<_> = sets
+                .iter()
+                .flat_map(|set| set.col_names.iter().cloned())
+                .collect();
 
             emit_upsert(
                 program,
@@ -1583,6 +1587,7 @@ fn resolve_upserts(
                 ctx,
                 insertion,
                 &mut rewritten_sets,
+                &set_column_names,
                 where_clause,
                 resolver,
                 result_columns,

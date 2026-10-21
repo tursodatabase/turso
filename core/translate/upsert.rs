@@ -170,7 +170,9 @@ fn collect_changed_cols(
     let mut cols_changed = ColumnMask::default();
     let mut rowid_changed = false;
     for (col_idx, _) in set_pairs {
-        if let Some(c) = table.columns().get(*col_idx) {
+        if *col_idx == ROWID_SENTINEL {
+            rowid_changed = true;
+        } else if let Some(c) = table.columns().get(*col_idx) {
             if c.is_rowid_alias() {
                 rowid_changed = true;
             } else {
@@ -480,6 +482,7 @@ pub fn emit_upsert(
     ctx: &InsertEmitCtx,
     insertion: &Insertion,
     set_pairs: &mut [(usize, Box<ast::Expr>)],
+    set_column_names: &[ast::Name],
     where_clause: &mut Option<Box<ast::Expr>>,
     resolver: &mut Resolver,
     returning: &mut [ResultSetColumn],
@@ -670,6 +673,23 @@ pub fn emit_upsert(
             excluded_decoded_start,
             &layout,
         )?;
+        if *col_idx == ROWID_SENTINEL {
+            let r = program.alloc_register();
+            translate_expr_no_constant_opt(
+                program,
+                None,
+                expr,
+                r,
+                resolver,
+                NoConstantOptReason::RegisterReuse,
+            )?;
+            program.emit_insn(Insn::MustBeInt {
+                reg: r,
+                target_pc: None,
+            });
+            new_rowid_reg = Some(r);
+            continue;
+        }
         // Save/restore target_union_type so union_value() resolves tags
         // against this column's union type. See ProgramBuilder::target_union_type.
         let col = &table.columns()[*col_idx];
@@ -838,7 +858,7 @@ pub fn emit_upsert(
             upsert_database_id,
             TriggerEvent::Update,
             TriggerTime::Before,
-            Some(updated_positions.clone()),
+            Some(set_column_names),
             &btree_table,
         );
         // OLD row values are in current_start registers
@@ -935,7 +955,7 @@ pub fn emit_upsert(
                 resolver,
                 upsert_database_id,
                 TriggerEvent::Update,
-                Some(&updated_positions),
+                Some(set_column_names),
                 &btree_table,
             );
             if has_relevant_after_triggers {
@@ -962,7 +982,7 @@ pub fn emit_upsert(
                 resolver,
                 upsert_database_id,
                 TriggerEvent::Update,
-                Some(&updated_positions),
+                Some(set_column_names),
                 &btree_table,
             );
             if has_relevant_after_triggers {
@@ -1510,16 +1530,12 @@ pub fn emit_upsert(
 
     // Fire AFTER UPDATE triggers
     if let (Some(btree_table), Some(old_regs)) = (table.btree(), preserved_old_registers) {
-        let updated_column_indices: ColumnMask = set_pairs
-            .iter()
-            .map(|(col_idx, _)| *col_idx)
-            .try_collect()?;
         let relevant_triggers = get_triggers_including_temp(
             resolver,
             upsert_database_id,
             TriggerEvent::Update,
             TriggerTime::After,
-            Some(updated_column_indices),
+            Some(set_column_names),
             &btree_table,
         );
         if !relevant_triggers.is_empty() {
@@ -1642,15 +1658,24 @@ pub fn collect_set_clauses_for_upsert(
             );
         }
         for (cn, e) in set.col_names.iter().zip(values.into_iter()) {
-            let Some(idx) = lookup.get(&normalize_ident(cn.as_str())) else {
-                bail_parse_error!("no such column: {}", cn);
+            let ident = normalize_ident(cn.as_str());
+            let idx = match lookup.get(&ident) {
+                Some(idx) => {
+                    // cannot upsert generated column
+                    table.columns()[*idx].ensure_not_generated("UPDATE", cn.as_str())?;
+                    *idx
+                }
+                None if ROWID_STRS.iter().any(|s| s.eq_ignore_ascii_case(&ident)) => table
+                    .columns()
+                    .iter()
+                    .position(|c| c.is_rowid_alias())
+                    .unwrap_or(ROWID_SENTINEL),
+                None => bail_parse_error!("no such column: {}", cn),
             };
-            // cannot upsert generated column
-            table.columns()[*idx].ensure_not_generated("UPDATE", cn.as_str())?;
-            if let Some(existing) = out.iter_mut().find(|(i, _)| *i == *idx) {
+            if let Some(existing) = out.iter_mut().find(|(i, _)| *i == idx) {
                 existing.1 = e;
             } else {
-                out.push((*idx, e));
+                out.push((idx, e));
             }
         }
     }

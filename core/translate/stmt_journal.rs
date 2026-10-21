@@ -22,7 +22,7 @@
 //! into this module to set them to `false` when safe.
 
 use crate::translate::emitter::Resolver;
-use crate::translate::plan::{DeletePlan, DmlSafetyReason, UpdatePlan};
+use crate::translate::plan::{ColumnMask, DeletePlan, DmlSafetyReason, UpdatePlan};
 use crate::translate::trigger_exec::has_triggers_including_temp;
 use crate::vdbe::builder::ProgramBuilder;
 use crate::{sync::Arc, Connection, Result};
@@ -205,16 +205,21 @@ pub(crate) fn set_update_stmt_journal_flags(
     };
     let database_id = target_table.database_id;
 
-    let updated_cols = plan
+    let updated_cols: ColumnMask = plan
         .set_clauses
         .iter()
         .map(|set_clause| set_clause.column_index)
+        .try_collect()?;
+    let updated_col_names: Vec<_> = plan
+        .set_clauses
+        .iter()
+        .flat_map(|set_clause| set_clause.column_names.iter().cloned())
         .try_collect()?;
     let has_triggers = has_triggers_including_temp(
         resolver,
         database_id,
         TriggerEvent::Update,
-        Some(&updated_cols),
+        Some(&updated_col_names),
         &btree_table,
     );
     let has_fks = table_has_fks(connection, resolver, database_id, btree_table.name.as_str());
