@@ -825,6 +825,20 @@ expect {
 }
 
 @cross-check-integrity
+test affinity-type-size-with-comment {
+    CREATE TABLE t (a VARCHAR /*INT*/ (10), b VARCHAR(10), c DECIMAL(10, 2));
+    INSERT INTO t VALUES ('12', '12', '12');
+    SELECT type FROM pragma_table_info('t') ORDER BY cid;
+    SELECT typeof(a), typeof(b), typeof(c) FROM t;
+}
+expect {
+    VARCHAR /*INT*/ (10)
+    VARCHAR(10)
+    DECIMAL(10, 2)
+    integer|text|integer
+}
+
+@cross-check-integrity
 test affinity-type-name-with-quotes {
     CREATE TABLE t (a "BLOB" INTEGER, b "INT", c 'TEXT' INT, d "a""b" INT, e [x] INT);
     INSERT INTO t VALUES ('123', '123', '123', '123', '123');

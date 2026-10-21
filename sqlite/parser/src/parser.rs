@@ -1277,8 +1277,9 @@ impl<'a> Parser<'a> {
         }
     }
 
-    /// Like SQLite, the type name keeps the source text from its first word to
-    /// its last one, comments and quotes included: both affect the affinity.
+    /// Like SQLite, preserve type-name source text, including comments and
+    /// quotes, because those bytes can affect affinity. Block comments before
+    /// the optional size are part of the declared type too.
     fn parse_type(&mut self) -> Result<Option<Type>> {
         let Some(token_type) = self.peek()?.map(|tok| tok.token_type) else {
             return Ok(None);
@@ -1326,7 +1327,19 @@ impl<'a> Parser<'a> {
             }
             end = self.offset();
         }
-        let type_name = from_bytes(&self.lexer.input[start..end]);
+        let type_name_end = match self.peek()? {
+            Some(tok) if tok.token_type == TK_LP => {
+                let size_start = self.offset();
+                let trivia = &self.lexer.input[end..size_start];
+                if trivia.windows(2).any(|window| window == b"/*") {
+                    size_start
+                } else {
+                    end
+                }
+            }
+            _ => end,
+        };
+        let type_name = from_bytes(&self.lexer.input[start..type_name_end]);
 
         let size = if let Some(tok) = self.peek()? {
             if tok.token_type == TK_LP {
