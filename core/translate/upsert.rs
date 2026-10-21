@@ -20,6 +20,7 @@ use crate::translate::planner::ROWID_STRS;
 use crate::translate::trigger_exec::{
     fire_trigger, get_triggers_including_temp, has_triggers_including_temp, TriggerContext,
 };
+use crate::translate::update::rowid_name_column_index;
 use crate::vdbe::insn::{to_u32, CmpInsFlags};
 use crate::{
     bail_parse_error,
@@ -1665,12 +1666,10 @@ pub fn collect_set_clauses_for_upsert(
                     table.columns()[*idx].ensure_not_generated("UPDATE", cn.as_str())?;
                     *idx
                 }
-                None if ROWID_STRS.iter().any(|s| s.eq_ignore_ascii_case(&ident)) => table
-                    .columns()
-                    .iter()
-                    .position(|c| c.is_rowid_alias())
-                    .unwrap_or(ROWID_SENTINEL),
-                None => bail_parse_error!("no such column: {}", cn),
+                None => match rowid_name_column_index(table, &ident) {
+                    Some(idx) => idx,
+                    None => bail_parse_error!("no such column: {}", cn),
+                },
             };
             if let Some(existing) = out.iter_mut().find(|(i, _)| *i == idx) {
                 existing.1 = e;
