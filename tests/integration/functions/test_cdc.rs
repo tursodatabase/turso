@@ -2902,3 +2902,35 @@ fn test_cdc_order_upsert_do_update_rowid_change_fk_cascade_parent_before_child(d
         ]
     );
 }
+
+#[turso_macros::test]
+fn test_cdc_updates_record_is_the_same_with_a_before_update_trigger(db: TempDatabase) {
+    let conn = db.connect_limbo();
+    for table in ["plain", "with_trigger"] {
+        conn.execute(format!(
+            "CREATE TABLE {table} (id INTEGER PRIMARY KEY, a INTEGER, b TEXT)"
+        ))
+        .unwrap();
+        conn.execute(format!("INSERT INTO {table} VALUES (1, 1, 'x')"))
+            .unwrap();
+    }
+    conn.execute("CREATE TABLE log (x)").unwrap();
+    conn.execute(
+        "CREATE TRIGGER tr BEFORE UPDATE ON with_trigger BEGIN INSERT INTO log VALUES (1); END",
+    )
+    .unwrap();
+    conn.execute("PRAGMA capture_data_changes_conn('full')")
+        .unwrap();
+    for table in ["plain", "with_trigger"] {
+        conn.execute(format!("UPDATE {table} SET a = '5', b = 7"))
+            .unwrap();
+    }
+
+    let rows = limbo_exec_rows(
+        &conn,
+        r#"SELECT bin_record_json_object('["id?","a?","b?","id","a","b"]', updates)
+           FROM turso_cdc WHERE table_name IN ('plain', 'with_trigger') ORDER BY table_name"#,
+    );
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0], rows[1]);
+}

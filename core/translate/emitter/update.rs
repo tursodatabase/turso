@@ -44,7 +44,8 @@ use crate::{
         planner::ROWID_STRS,
         subquery::{emit_non_from_clause_subqueries_for_eval_at, emit_non_from_clause_subquery},
         trigger_exec::{
-            fire_trigger, get_triggers_including_temp, has_triggers_including_temp, TriggerContext,
+            columns_changed_by_triggers, fire_trigger, get_triggers_including_temp,
+            has_triggers_including_temp, TriggerContext,
         },
         ProgramBuilder,
     },
@@ -1357,6 +1358,14 @@ fn emit_update_insns<'a>(
         None => Vec::new(),
     };
     let has_before_triggers = !relevant_before_update_triggers.is_empty();
+    let trigger_changed_columns = match target_table.table.btree() {
+        Some(btree_table) => columns_changed_by_triggers(
+            &t_ctx.resolver,
+            &relevant_before_update_triggers,
+            &btree_table,
+        )?,
+        None => ColumnMask::default(),
+    };
 
     let table_column_was_read = emit_update_column_values(
         program,
@@ -1475,7 +1484,8 @@ fn emit_update_insns<'a>(
                     Some(old_registers.clone()),
                     or_conflict,
                     TriggerTime::Before,
-                );
+                )
+                .with_changeable_new_columns(updated_column_indices.clone());
 
                 for trigger in relevant_before_update_triggers {
                     fire_trigger(
@@ -1564,6 +1574,8 @@ fn emit_update_insns<'a>(
             skip_row_label,
             t_ctx,
         )?;
+
+        copy_set_values_to_cdc_updates(program, &column_ctx, &trigger_changed_columns);
     }
 
     // Build a complete NEW row image for FK code now, while the old cursor is
@@ -2705,4 +2717,32 @@ fn emit_update_insns<'a>(
     t_ctx.resolver.register_affinities.clear();
     t_ctx.resolver.register_collations.clear();
     Ok(())
+}
+
+/// Copy the values of the columns that the BEFORE triggers of a dialect can
+/// change into the CDC `updates` record again, after those triggers.
+fn copy_set_values_to_cdc_updates(
+    program: &mut ProgramBuilder,
+    column_ctx: &UpdateColumnCtx<'_>,
+    trigger_changed_columns: &ColumnMask,
+) {
+    if column_ctx.cdc_update_alter_statement.is_some() {
+        return;
+    }
+    let columns = column_ctx.target_table.table.columns();
+    for index in trigger_changed_columns.iter() {
+        if index == ROWID_SENTINEL {
+            continue;
+        }
+        let Some(CdcUpdateRegisters { new_value, .. }) =
+            column_ctx.cdc_update_registers(index, &columns[index])
+        else {
+            continue;
+        };
+        program.emit_insn(Insn::Copy {
+            src_reg: column_ctx.layout.to_register(column_ctx.start, index),
+            dst_reg: new_value,
+            extra_amount: 0,
+        });
+    }
 }

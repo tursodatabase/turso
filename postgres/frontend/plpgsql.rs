@@ -84,6 +84,7 @@ pub(crate) fn compile_trigger(
     compiler.compile_statement(action)?;
     Ok(Some(TriggerBody {
         statements: compiler.statements,
+        changed_columns: Vec::new(),
     }))
 }
 

@@ -32,6 +32,18 @@ pub trait FunctionCatalog {
 /// databases, and unqualified names resolve as in other statements.
 pub struct TriggerBody {
     pub statements: Vec<turso_parser::ast::Stmt>,
+    /// The columns that a `BEFORE INSERT` or `BEFORE UPDATE` trigger changes
+    /// in the row that the statement writes. After the statements, core
+    /// calculates each value and writes it into `NEW`. The next trigger and
+    /// the statement see the changed row.
+    pub changed_columns: Vec<ChangedColumn>,
+}
+
+/// A column that a trigger changes, and the new value. The value can read
+/// `NEW` and `OLD`, as the statements of the trigger can.
+pub struct ChangedColumn {
+    pub name: String,
+    pub value: turso_parser::ast::Expr,
 }
 
 /// SQL dialect layered on top of the engine.
@@ -218,6 +230,14 @@ pub trait Dialect: Send + Sync + 'static {
         Ok(None)
     }
 
+    /// Whether INSERT gives a new row its rowid before the BEFORE INSERT
+    /// triggers, so that NEW has the rowid. SQLite gives the rowid after the
+    /// triggers, and NEW has -1. PostgreSQL calculates the default of a key,
+    /// such as the next value of a serial column, before the triggers.
+    fn rowid_before_insert_triggers(&self) -> bool {
+        false
+    }
+
     /// Whether this dialect needs the custom-type machinery (DECODE/ENCODE,
     /// affinity metadata) regardless of the experimental database flag.
     /// A dialect whose type system leans on custom types (e.g. PostgreSQL)
@@ -356,7 +376,9 @@ mod tests {
             _table: &BTreeTable,
             _functions: &dyn FunctionCatalog,
         ) -> crate::Result<Option<TriggerBody>> {
-            use turso_parser::ast::{Cmd, Expr, Literal, OneSelect, ResultColumn, TriggerCmd};
+            use turso_parser::ast::{
+                Cmd, Expr, Literal, OneSelect, ResultColumn, Stmt, TriggerCmd,
+            };
             let [TriggerCmd::Select(select)] = trigger.commands.as_slice() else {
                 return Ok(None);
             };
@@ -369,21 +391,53 @@ mod tests {
             let Expr::FunctionCall { name, args, .. } = call.as_ref() else {
                 return Ok(None);
             };
-            let [body] = args.as_slice() else {
-                return Ok(None);
-            };
-            let Expr::Literal(Literal::String(body)) = body.as_ref() else {
-                return Ok(None);
-            };
             if name.as_str() != "test_trigger_body" {
                 return Ok(None);
             }
-            let body = body.trim_matches('\'').replace("''", "'");
-            let (Some(Cmd::Stmt(stmt)), _) = sqlite::parse(&body)? else {
-                panic!("test trigger bodies are statements");
+            let text = |arg: &Expr| {
+                let Expr::Literal(Literal::String(text)) = arg else {
+                    panic!("test trigger bodies are text");
+                };
+                text.trim_matches('\'').replace("''", "'")
             };
+            let [body, changes @ ..] = args.as_slice() else {
+                panic!("test trigger bodies have a statement");
+            };
+            let body = text(body);
+            let statements = if body.is_empty() {
+                Vec::new()
+            } else {
+                let (Some(Cmd::Stmt(stmt)), _) = sqlite::parse(&body)? else {
+                    panic!("test trigger bodies are statements");
+                };
+                vec![stmt]
+            };
+            let changed_columns = changes
+                .chunks(2)
+                .map(|change| {
+                    let [column, value] = change else {
+                        panic!("each changed column has a value");
+                    };
+                    let (Some(Cmd::Stmt(Stmt::Select(select))), _) =
+                        sqlite::parse(&format!("SELECT {}", text(value)))?
+                    else {
+                        panic!("changed values are expressions");
+                    };
+                    let OneSelect::Select { mut columns, .. } = select.body.select else {
+                        panic!("changed values are expressions");
+                    };
+                    let ResultColumn::Expr(value, _) = columns.remove(0) else {
+                        panic!("changed values are expressions");
+                    };
+                    Ok(ChangedColumn {
+                        name: text(column),
+                        value: *value,
+                    })
+                })
+                .collect::<crate::Result<_>>()?;
             Ok(Some(TriggerBody {
-                statements: vec![stmt],
+                statements,
+                changed_columns,
             }))
         }
 
@@ -883,6 +937,300 @@ mod tests {
             ]
         );
         conn.close().unwrap();
+    }
+
+    #[test]
+    fn before_insert_trigger_changes_the_new_row() {
+        let conn = open_trigger_db("trigger-changes-inserted-row.db");
+        conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER, b INTEGER)")
+            .unwrap();
+        conn.execute("CREATE INDEX t_b ON t (b)").unwrap();
+        conn.execute(
+            "CREATE TRIGGER tr BEFORE INSERT ON t BEGIN \
+             SELECT test_trigger_body('', 'b', 'CAST(new.a * 10 AS TEXT)'); \
+             END",
+        )
+        .unwrap();
+
+        conn.execute("INSERT INTO t (id, a) VALUES (1, 2), (2, 3)")
+            .unwrap();
+
+        assert_eq!(
+            rows(&conn, "SELECT id, a, b, typeof(b) FROM t ORDER BY id"),
+            vec![
+                vec![int(1), int(2), int(20), text("integer")],
+                vec![int(2), int(3), int(30), text("integer")],
+            ]
+        );
+        assert_eq!(
+            rows(&conn, "SELECT id FROM t INDEXED BY t_b WHERE b = 30"),
+            vec![vec![int(2)]]
+        );
+        assert_eq!(
+            rows(&conn, "PRAGMA integrity_check"),
+            vec![vec![text("ok")]]
+        );
+    }
+
+    #[test]
+    fn before_update_trigger_changes_a_column_that_set_does_not_name() {
+        let conn = open_trigger_db("trigger-changes-updated-row.db");
+        conn.execute(
+            "CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER, b INTEGER, g INTEGER AS (b + 1))",
+        )
+        .unwrap();
+        conn.execute("CREATE INDEX t_b ON t (b)").unwrap();
+        conn.execute("CREATE INDEX t_g ON t (g)").unwrap();
+        conn.execute("INSERT INTO t (id, a, b) VALUES (1, 1, 10)")
+            .unwrap();
+        conn.execute(
+            "CREATE TRIGGER tr BEFORE UPDATE ON t BEGIN \
+             SELECT test_trigger_body('', 'b', 'new.a * 10 + old.b'); \
+             END",
+        )
+        .unwrap();
+
+        conn.execute("UPDATE t SET a = 2").unwrap();
+
+        assert_eq!(
+            rows(&conn, "SELECT id, a, b, g FROM t"),
+            vec![vec![int(1), int(2), int(30), int(31)]]
+        );
+        assert_eq!(
+            rows(&conn, "SELECT id FROM t INDEXED BY t_b WHERE b = 30"),
+            vec![vec![int(1)]]
+        );
+        assert_eq!(
+            rows(&conn, "SELECT id FROM t INDEXED BY t_g WHERE g = 31"),
+            vec![vec![int(1)]]
+        );
+        assert_eq!(
+            rows(&conn, "PRAGMA integrity_check"),
+            vec![vec![text("ok")]]
+        );
+    }
+
+    #[test]
+    fn before_update_trigger_changes_a_column_that_set_names() {
+        let conn = open_trigger_db("trigger-changes-set-column.db");
+        conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, b INTEGER NOT NULL)")
+            .unwrap();
+        conn.execute("INSERT INTO t VALUES (1, 10)").unwrap();
+        conn.execute(
+            "CREATE TRIGGER tr BEFORE UPDATE ON t BEGIN \
+             SELECT test_trigger_body('', 'b', 'nullif(new.b + 1, 100)'); \
+             END",
+        )
+        .unwrap();
+
+        conn.execute("UPDATE t SET b = 5").unwrap();
+        assert_eq!(rows(&conn, "SELECT b FROM t"), vec![vec![int(6)]]);
+
+        let error = conn.execute("UPDATE t SET b = 99").unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("NOT NULL constraint failed: t.b"));
+        assert_eq!(rows(&conn, "SELECT b FROM t"), vec![vec![int(6)]]);
+    }
+
+    #[test]
+    fn update_of_trigger_does_not_fire_for_a_column_that_a_trigger_changes() {
+        let conn = open_trigger_db("trigger-changes-update-of.db");
+        conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER, b INTEGER)")
+            .unwrap();
+        conn.execute("CREATE TABLE log (x TEXT)").unwrap();
+        conn.execute("INSERT INTO t VALUES (1, 1, 10)").unwrap();
+        conn.execute(
+            "CREATE TRIGGER tr BEFORE UPDATE ON t BEGIN \
+             SELECT test_trigger_body('', 'b', 'new.b + 1'); \
+             END",
+        )
+        .unwrap();
+        for column in ["a", "b"] {
+            conn.execute(format!(
+                "CREATE TRIGGER of_{column} AFTER UPDATE OF {column} ON t BEGIN \
+                 INSERT INTO log VALUES ('{column}'); \
+                 END"
+            ))
+            .unwrap();
+        }
+
+        conn.execute("UPDATE t SET a = 2").unwrap();
+
+        assert_eq!(rows(&conn, "SELECT b FROM t"), vec![vec![int(11)]]);
+        assert_eq!(rows(&conn, "SELECT x FROM log"), vec![vec![text("a")]]);
+    }
+
+    #[test]
+    fn next_before_trigger_sees_the_changed_row() {
+        let conn = open_trigger_db("trigger-changes-next-trigger.db");
+        conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER, b INTEGER, c INTEGER)")
+            .unwrap();
+        conn.execute(
+            "CREATE TRIGGER fires_second BEFORE INSERT ON t BEGIN \
+             SELECT test_trigger_body('', 'c', 'new.b * 2'); \
+             END",
+        )
+        .unwrap();
+        conn.execute(
+            "CREATE TRIGGER fires_first BEFORE INSERT ON t BEGIN \
+             SELECT test_trigger_body('', 'b', 'new.a + 1'); \
+             END",
+        )
+        .unwrap();
+
+        conn.execute("INSERT INTO t (id, a) VALUES (1, 1)").unwrap();
+
+        assert_eq!(
+            rows(&conn, "SELECT a, b, c FROM t"),
+            vec![vec![int(1), int(2), int(4)]]
+        );
+    }
+
+    #[test]
+    fn trigger_changes_a_custom_type_column() {
+        let conn = open_trigger_db("trigger-changes-custom-type.db");
+        conn.execute(
+            "CREATE TYPE cents BASE integer ENCODE value * 100 DECODE value / 100 OPERATOR '<'",
+        )
+        .unwrap();
+        conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER, price cents) STRICT")
+            .unwrap();
+        conn.execute("CREATE INDEX t_price ON t (price)").unwrap();
+        for event in ["INSERT", "UPDATE"] {
+            conn.execute(format!(
+                "CREATE TRIGGER on_{event} BEFORE {event} ON t BEGIN \
+                 SELECT test_trigger_body('', 'price', 'new.a'); \
+                 END"
+            ))
+            .unwrap();
+        }
+
+        conn.execute("INSERT INTO t (id, a) VALUES (1, 7)").unwrap();
+        assert_eq!(rows(&conn, "SELECT price FROM t"), vec![vec![int(7)]]);
+        conn.execute("UPDATE t SET a = 8").unwrap();
+
+        assert_eq!(rows(&conn, "SELECT price FROM t"), vec![vec![int(8)]]);
+        assert_eq!(
+            rows(&conn, "SELECT id FROM t INDEXED BY t_price WHERE price = 8"),
+            vec![vec![int(1)]]
+        );
+        assert_eq!(
+            rows(&conn, "PRAGMA integrity_check"),
+            vec![vec![text("ok")]]
+        );
+    }
+
+    #[test]
+    fn cdc_records_the_values_that_a_trigger_writes() {
+        let conn = open_trigger_db("trigger-changes-cdc.db");
+        conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER, b INTEGER)")
+            .unwrap();
+        conn.execute("INSERT INTO t VALUES (1, 1, 10)").unwrap();
+        conn.execute(
+            "CREATE TRIGGER tr BEFORE UPDATE ON t BEGIN \
+             SELECT test_trigger_body('', 'a', 'new.a + 1', 'b', 'new.a * 10'); \
+             END",
+        )
+        .unwrap();
+        conn.execute("PRAGMA capture_data_changes_conn('full')")
+            .unwrap();
+
+        conn.execute("UPDATE t SET a = 2").unwrap();
+
+        assert_eq!(
+            rows(
+                &conn,
+                "SELECT bin_record_json_object('[\"id?\",\"a?\",\"b?\",\"id\",\"a\",\"b\"]', updates) \
+                 FROM turso_cdc WHERE table_name = 't'"
+            ),
+            vec![vec![text(r#"{"id?":0,"a?":1,"b?":1,"id":null,"a":3,"b":20}"#)]]
+        );
+    }
+
+    #[test]
+    fn trigger_cannot_change_the_rowid() {
+        let conn = open_trigger_db("trigger-changes-rowid.db");
+        conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER)")
+            .unwrap();
+        conn.execute(
+            "CREATE TRIGGER tr BEFORE INSERT ON t BEGIN \
+             SELECT test_trigger_body('', 'id', '5'); \
+             END",
+        )
+        .unwrap();
+
+        let error = conn.execute("INSERT INTO t VALUES (1, 1)").unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("trigger tr cannot change column id"));
+    }
+
+    #[test]
+    fn after_trigger_cannot_change_the_row() {
+        let conn = open_trigger_db("trigger-changes-after.db");
+        conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER)")
+            .unwrap();
+        conn.execute(
+            "CREATE TRIGGER tr AFTER INSERT ON t BEGIN \
+             SELECT test_trigger_body('', 'a', '5'); \
+             END",
+        )
+        .unwrap();
+
+        let error = conn.execute("INSERT INTO t VALUES (1, 1)").unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("trigger tr cannot change the row in this statement"));
+    }
+
+    #[test]
+    fn trigger_when_clause_of_the_dialect_replaces_the_stored_condition() {
+        let conn = open_trigger_db("trigger-dialect-when.db");
+        conn.execute("CREATE TABLE t (a INTEGER)").unwrap();
+        conn.execute("CREATE TABLE log (a INTEGER)").unwrap();
+        conn.execute(
+            "CREATE TRIGGER t_dialect_when AFTER INSERT ON t WHEN 0 BEGIN \
+             INSERT INTO log VALUES (new.a); \
+             END",
+        )
+        .unwrap();
+
+        conn.execute("INSERT INTO t VALUES (1), (2)").unwrap();
+
+        assert_eq!(rows(&conn, "SELECT a FROM log"), vec![vec![int(1)]]);
+    }
+
+    fn open_trigger_db(path: &str) -> Arc<crate::Connection> {
+        let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+        let file = io.open_file(path, OpenFlags::Create, true).unwrap();
+        let db = Database::open(
+            io.clone(),
+            path,
+            crate::OpenOptions::new(Arc::new(TestDialect::default()))
+                .storage(Arc::new(DatabaseFile::new(file)))
+                .db_opts(
+                    DatabaseOpts::new()
+                        .with_custom_types(true)
+                        .with_generated_columns(true),
+                ),
+        )
+        .unwrap();
+        db.connect(ConnectOpts::new()).unwrap()
+    }
+
+    fn rows(conn: &Arc<crate::Connection>, sql: &str) -> Vec<Vec<crate::Value>> {
+        conn.prepare(sql).unwrap().run_collect_rows().unwrap()
+    }
+
+    fn int(value: i64) -> crate::Value {
+        crate::Value::from_i64(value)
+    }
+
+    fn text(value: &str) -> crate::Value {
+        crate::Value::build_text(value.to_string())
     }
 
     #[test]

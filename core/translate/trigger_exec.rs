@@ -1,6 +1,8 @@
+use crate::dialect::ChangedColumn;
 use crate::schema::{BTreeTable, Trigger};
 use crate::sync::Arc;
 use crate::translate::expr::WalkControl;
+use crate::translate::plan::ColumnMask;
 use crate::translate::subquery::{
     emit_non_from_clause_subquery, plan_subqueries_from_trigger_when_clause,
 };
@@ -17,6 +19,7 @@ use crate::vdbe::BranchOffset;
 use crate::{bail_parse_error, QueryMode, Result};
 use std::cell::RefCell;
 use std::num::NonZero;
+use turso_macros::turso_assert;
 use turso_parser::ast::{self, Expr, TriggerEvent, TriggerTime};
 
 /// Context for trigger execution
@@ -38,6 +41,10 @@ pub struct TriggerContext {
     /// True for AFTER triggers (values have been encoded for storage).
     /// False for BEFORE triggers (values are still user-facing).
     pub new_encoded: bool,
+    /// The columns of NEW that a BEFORE trigger can change. The statement
+    /// writes the values that the trigger puts into these NEW registers.
+    /// `None` when the statement does not let a trigger change NEW.
+    pub changeable_new_columns: Option<ColumnMask>,
 }
 
 impl TriggerContext {
@@ -52,6 +59,7 @@ impl TriggerContext {
             old_registers,
             override_conflict: None,
             new_encoded: false,
+            changeable_new_columns: None,
         }
     }
 
@@ -67,6 +75,7 @@ impl TriggerContext {
             old_registers,
             override_conflict: None,
             new_encoded: true,
+            changeable_new_columns: None,
         }
     }
 
@@ -85,6 +94,7 @@ impl TriggerContext {
             old_registers,
             override_conflict: Some(override_conflict),
             new_encoded: false,
+            changeable_new_columns: None,
         }
     }
 
@@ -101,7 +111,14 @@ impl TriggerContext {
             old_registers,
             override_conflict: Some(override_conflict),
             new_encoded: true,
+            changeable_new_columns: None,
         }
+    }
+
+    /// Let BEFORE triggers change these columns of NEW.
+    pub fn with_changeable_new_columns(mut self, columns: ColumnMask) -> Self {
+        self.changeable_new_columns = Some(columns);
+        self
     }
 }
 
@@ -669,7 +686,9 @@ fn execute_trigger_commands(
     };
     let dialect = resolver.dialect.clone();
     let dialect_body = dialect.trigger_body(trigger, &ctx.table, &*resolver)?;
+    let mut changed_columns = Vec::new();
     if let Some(body) = dialect_body {
+        changed_columns = body.changed_columns;
         for mut stmt in body.statements {
             rewrite_stmt_for_subprogram(&mut stmt, &subprogram_ctx)?;
             let writes = matches!(
@@ -777,8 +796,72 @@ fn execute_trigger_commands(
         program: Subprogram::PreparedProgram(built_subprogram.prepared().clone()),
         ignore_jump_target,
     });
+    if !changed_columns.is_empty() {
+        emit_changed_columns(program, resolver, trigger, ctx, changed_columns, connection)?;
+    }
 
     Ok(true)
+}
+
+/// Write the values of the columns that a BEFORE trigger changes into NEW.
+/// Core calculates all values before it writes one, because each value reads
+/// NEW as the trigger saw it.
+fn emit_changed_columns(
+    program: &mut ProgramBuilder,
+    resolver: &mut Resolver,
+    trigger: &Trigger,
+    ctx: &TriggerContext,
+    changed_columns: Vec<ChangedColumn>,
+    connection: &Arc<crate::Connection>,
+) -> Result<()> {
+    let (Some(new_registers), Some(changeable_columns)) =
+        (&ctx.new_registers, &ctx.changeable_new_columns)
+    else {
+        bail_parse_error!(
+            "trigger {} cannot change the row in this statement",
+            trigger.name
+        );
+    };
+    let mut values = Vec::with_capacity(changed_columns.len());
+    for ChangedColumn { name, mut value } in changed_columns {
+        let Some((index, column)) = ctx.table.get_column(&normalize_ident(&name)) else {
+            bail_parse_error!("no such column: {}", name);
+        };
+        if column.is_rowid_alias() || column.is_generated() {
+            bail_parse_error!("trigger {} cannot change column {}", trigger.name, name);
+        }
+        turso_assert!(
+            changeable_columns.get(index),
+            "the statement must let the trigger change each column that it changes"
+        );
+        rewrite_trigger_expr_for_when_clause(&mut value, &ctx.table, ctx)?;
+        let mut subqueries = Vec::new();
+        plan_subqueries_from_trigger_when_clause(
+            program,
+            &mut subqueries,
+            &mut value,
+            resolver,
+            connection,
+        )?;
+        for subquery in &mut subqueries {
+            let plan = subquery.consume_plan(crate::translate::plan::EvalAt::BeforeLoop);
+            emit_non_from_clause_subquery(program, resolver, *plan, &subquery.query_type, true)?;
+        }
+        let value_register = program.alloc_register();
+        translate_expr(program, None, &value, value_register, resolver)?;
+        values.push((new_registers[index], value_register, column.affinity()));
+    }
+    for (new_register, value_register, affinity) in values {
+        program.emit_insn(Insn::Copy {
+            src_reg: value_register,
+            dst_reg: new_register,
+            extra_amount: 0,
+        });
+        if !ctx.table.is_strict {
+            program.emit_column_affinity(new_register, affinity);
+        }
+    }
+    Ok(())
 }
 
 /// Check if there are any triggers for a given event (regardless of time).
@@ -913,6 +996,30 @@ pub fn get_triggers_including_temp(
         triggers = list.into();
     }
     triggers
+}
+
+/// The columns of `table` that these BEFORE triggers of a dialect change. An
+/// UPDATE writes them as if the statement set them. A trigger cannot change
+/// the rowid alias or a generated column; compiling the trigger reports that.
+pub fn columns_changed_by_triggers(
+    resolver: &Resolver,
+    triggers: &[Arc<Trigger>],
+    table: &BTreeTable,
+) -> Result<ColumnMask> {
+    let mut columns = ColumnMask::default();
+    for trigger in triggers {
+        let Some(body) = resolver.dialect.trigger_body(trigger, table, resolver)? else {
+            continue;
+        };
+        for changed in body.changed_columns {
+            if let Some((index, column)) = table.get_column(&normalize_ident(&changed.name)) {
+                if !column.is_rowid_alias() && !column.is_generated() {
+                    columns.set(index)?;
+                }
+            }
+        }
+    }
+    Ok(columns)
 }
 
 /// Like [`has_relevant_triggers_type_only`], but also checks the temp schema.
@@ -1087,6 +1194,10 @@ fn decode_trigger_registers(
     resolver: &Resolver,
     ctx: &TriggerContext,
 ) -> Result<TriggerContext> {
+    turso_assert!(
+        !ctx.new_encoded || ctx.changeable_new_columns.is_none(),
+        "a trigger cannot change NEW registers that have encoded values"
+    );
     if !ctx.table.is_strict {
         // Non-STRICT tables never have custom type encoding
         return Ok(TriggerContext {
@@ -1095,6 +1206,7 @@ fn decode_trigger_registers(
             old_registers: ctx.old_registers.clone(),
             override_conflict: ctx.override_conflict,
             new_encoded: false,
+            changeable_new_columns: ctx.changeable_new_columns.clone(),
         });
     }
 
@@ -1140,6 +1252,7 @@ fn decode_trigger_registers(
         old_registers: decoded_old,
         override_conflict: ctx.override_conflict,
         new_encoded: false, // decoded now
+        changeable_new_columns: ctx.changeable_new_columns.clone(),
     })
 }
 
