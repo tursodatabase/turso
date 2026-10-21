@@ -6,7 +6,7 @@ use std::sync::Arc;
 use turso_core::{
     dialect::POSTGRES_TABLE_SQL_PREFIX,
     native_ext::{VirtualTable, VirtualTableCursor, VirtualTableModule},
-    schema::{BTreeTable, Index, Schema, Table},
+    schema::{BTreeTable, FunctionDef, Index, Schema, Table},
     Connection, Dialect, Func, IOResult, LimboError, OpenOptions, Result, Statement, Value,
 };
 use turso_ext::{ConstraintInfo, IndexInfo, OrderByInfo, ResultCode, VTabKind};
@@ -160,6 +160,14 @@ impl Dialect for PostgresDialect {
 
     fn resolve_function(&self, name: &str, arg_count: usize) -> Result<Option<Func>> {
         turso_core::dialect::sqlite::resolve_builtin_function(name, arg_count)
+    }
+
+    fn compile_function_call(
+        &self,
+        function: &FunctionDef,
+        args: &[Box<turso_parser::ast::Expr>],
+    ) -> Result<turso_parser::ast::Expr> {
+        crate::user_function::compile_function_call(function, args)
     }
 
     fn requires_custom_types(&self) -> bool {

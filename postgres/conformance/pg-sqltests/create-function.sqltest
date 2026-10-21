@@ -1,0 +1,87 @@
+# CREATE FUNCTION and DROP FUNCTION through the PostgreSQL frontend.
+
+@database :memory:
+
+test create-function-twice-errors {
+    CREATE FUNCTION add_tax(p numeric) RETURNS numeric LANGUAGE sql AS 'SELECT p * 1.2';
+    CREATE FUNCTION add_tax(p numeric) RETURNS numeric LANGUAGE sql AS 'SELECT p';
+}
+expect error {
+    function "add_tax" already exists with same argument types
+}
+
+test create-function-with-unknown-language-errors {
+    CREATE FUNCTION js() RETURNS int LANGUAGE plv8 AS 'return 1';
+}
+expect error {
+    language "plv8" does not exist
+}
+
+test drop-missing-function-errors {
+    DROP FUNCTION add_tax(numeric);
+}
+expect error {
+    does not exist
+}
+
+test drop-function-if-exists-ignores-a-missing-function {
+    DROP FUNCTION IF EXISTS add_tax(numeric);
+    SELECT 1;
+}
+expect {
+    1
+}
+
+test drop-function-if-exists-ignores-a-missing-schema {
+    DROP FUNCTION IF EXISTS no_such_schema.add_tax(numeric);
+    SELECT 1;
+}
+expect {
+    1
+}
+
+test drop-function-without-arguments-errors-when-missing {
+    DROP FUNCTION add_tax;
+}
+expect error {
+    could not find a function named "add_tax"
+}
+
+test drop-function-without-arguments-errors-when-not-unique {
+    CREATE FUNCTION pick(a int) RETURNS int LANGUAGE sql AS 'SELECT a';
+    CREATE FUNCTION pick(a int, b int) RETURNS int LANGUAGE sql AS 'SELECT a';
+    DROP FUNCTION pick;
+}
+expect error {
+    function name "pick" is not unique
+}
+
+# Schema databases are file-backed, so the function is dropped before each
+# create to keep repeated test runs independent of old sidecar files.
+test create-and-drop-function-in-a-schema {
+    CREATE SCHEMA IF NOT EXISTS fn_schema;
+    DROP FUNCTION IF EXISTS fn_schema.pick(int);
+    CREATE FUNCTION fn_schema.pick(a int) RETURNS int LANGUAGE sql AS 'SELECT a';
+    DROP FUNCTION fn_schema.pick(int);
+    DROP FUNCTION fn_schema.pick(int);
+}
+expect error {
+    does not exist
+}
+
+test create-function-without-a-schema-errors-when-no-schema-of-search-path-exists {
+    SET search_path TO fn_path_missing;
+    CREATE FUNCTION path_function() RETURNS int LANGUAGE sql AS 'SELECT 42';
+}
+expect error {
+    no schema has been selected to create in
+}
+
+@skip-if postgres "PostgreSQL executes SQL functions that Turso cannot inline yet"
+test call-of-a-function-that-turso-cannot-execute-errors {
+    CREATE FUNCTION add_tax(p numeric) RETURNS numeric LANGUAGE sql AS 'SELECT p * 1.2';
+    SELECT add_tax(10);
+}
+expect error {
+    cannot execute function add_tax()
+}

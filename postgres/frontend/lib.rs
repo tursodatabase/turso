@@ -4,6 +4,7 @@ mod functions;
 mod options;
 mod session;
 mod unnest;
+mod user_function;
 
 pub use session::PgConnection as Connection;
 pub use session::{

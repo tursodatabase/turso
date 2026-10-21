@@ -140,6 +140,23 @@ impl PostgreSQLTranslator {
             });
         }
 
+        if let NodeRef::DropStmt(drop) = &node.0 {
+            use pg_query::protobuf::ObjectType;
+            if matches!(
+                drop.remove_type(),
+                ObjectType::ObjectFunction | ObjectType::ObjectProcedure
+            ) {
+                let mut prereqs = crate::function::translate_drop_functions(drop)?;
+                let last = prereqs
+                    .pop()
+                    .ok_or_else(|| ParseError::ParseError("DROP missing object name".into()))?;
+                return Ok(TranslateResult {
+                    prereqs,
+                    cmd: ast::Cmd::Stmt(last),
+                });
+            }
+        }
+
         let cmd = match node.0 {
             NodeRef::ExplainStmt(explain) => self.translate_explain(explain)?,
             node => ast::Cmd::Stmt(self.translate_node(node)?),
@@ -177,6 +194,9 @@ impl PostgreSQLTranslator {
             NodeRef::CreateTableAsStmt(ctas) => self.translate_create_table_as(ctas)?,
             NodeRef::CreateEnumStmt(enum_stmt) => translate_create_enum(enum_stmt)?,
             NodeRef::CreateDomainStmt(domain) => self.translate_create_domain(domain)?,
+            NodeRef::CreateFunctionStmt(function) => {
+                crate::function::translate_create_function(function)?
+            }
             NodeRef::CopyStmt(_) => {
                 return Err(ParseError::ParseError(
                     "COPY is handled at the postgres frontend layer".to_string(),
@@ -4457,7 +4477,7 @@ fn join_keeps_unmatched_right_rows(join: &ast::JoinedSelectTable) -> bool {
 }
 
 /// Maps a PostgreSQL schema name to the Turso schema that holds its tables.
-fn map_schema_name(schema: &str) -> &str {
+pub(crate) fn map_schema_name(schema: &str) -> &str {
     match schema.to_ascii_lowercase().as_str() {
         "pg_catalog" | "public" | "information_schema" => "main",
         _ => schema,

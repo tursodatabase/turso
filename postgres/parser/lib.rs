@@ -1,7 +1,13 @@
 pub use pg_query::ParseResult;
 use thiserror::Error;
 
+mod function;
 pub mod translator;
+
+pub use function::{
+    function_language, input_parameter_count, qualify_create_function_name,
+    unqualified_create_function,
+};
 
 #[derive(Debug, Error)]
 pub enum ParseError {

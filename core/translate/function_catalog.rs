@@ -82,10 +82,13 @@ pub fn translate_drop_function(
     program: &mut ProgramBuilder,
 ) -> Result<()> {
     let name = normalize_ident(func_name.name.as_str());
-    let database_id = if func_name.namespace.is_some() {
-        Some(resolver.resolve_database_id(func_name)?)
-    } else {
-        resolver.resolve_function_database_id(&name, arg_count)
+    let database_id = match &func_name.namespace {
+        Some(_) => match resolver.resolve_database_id(func_name) {
+            Ok(database_id) => Some(database_id),
+            Err(_) if if_exists => None,
+            Err(error) => return Err(error),
+        },
+        None => resolver.resolve_function_database_id(&name, arg_count),
     };
     let overloads = database_id
         .map(|database_id| {

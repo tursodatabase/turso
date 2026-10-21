@@ -453,9 +453,9 @@ Upgrade is not supported.
 | ALTER TABLE / ENABLE REPLICA TRIGGER/RULE | ❌ Not supported | |
 | BEGIN ATOMIC function bodies | ❌ Not supported | |
 | CALL syntax for executing procedures | ❌ Not supported | |
-| CREATE FUNCTION | ❌ Not supported | Rejected with an error |
+| CREATE FUNCTION | 🟡 Partial | `LANGUAGE sql` and `LANGUAGE plpgsql` are stored; a call gives an error. CREATE FUNCTION without a schema creates the function in the first schema of `search_path` that exists. Functions are found by name and argument count only, so default argument values do not make a function match fewer arguments |
 | Column level triggers | ❌ Not supported | |
-| CREATE PROCEDURE syntax for SQL stored procedures | ❌ Not supported | |
+| CREATE PROCEDURE syntax for SQL stored procedures | 🟡 Partial | Stored like functions; CALL is not supported |
 | Event triggers | ❌ Not supported | |
 | FILTER clause for aggregate functions | ✅ Supported | |
 | ORDER BY support within aggregates | ❌ Not supported | Silently dropped |
@@ -473,7 +473,7 @@ Upgrade is not supported.
 
 | Feature | Status | Notes |
 |---------|--------|-------|
-| Procedural languages (PL/pgSQL, PL/Python, ...) | ❌ Not supported | CREATE FUNCTION and DO are rejected with an error |
+| Procedural languages (PL/pgSQL, PL/Python, ...) | 🟡 Partial | CREATE FUNCTION ... LANGUAGE plpgsql is stored; other languages and DO are rejected with an error |
 | CASE in pl/pgsql | ❌ Not supported | |
 | CONTINUE statement for PL/pgSQL | ❌ Not supported | |
 | CREATE TRANSFORM | ❌ Not supported | |
