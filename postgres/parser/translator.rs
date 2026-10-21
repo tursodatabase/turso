@@ -5232,16 +5232,22 @@ pub fn is_set_transaction(parse_result: &ParseResult) -> bool {
     )
 }
 
-/// The byte offset of the name in a CREATE TABLE or CREATE VIEW statement
-/// that names the table or view without a schema. None for temporary
-/// tables and views and for other statements.
+/// The byte offset of the name in a CREATE TABLE, CREATE TABLE AS, SELECT
+/// INTO, CREATE VIEW or CREATE SEQUENCE statement that names the object
+/// without a schema. None for temporary objects, for materialized views
+/// and for other statements.
 pub fn unqualified_created_name_location(parse_result: &ParseResult) -> Option<usize> {
-    use pg_query::NodeRef;
+    use pg_query::{protobuf::ObjectType, NodeRef};
 
     let nodes = parse_result.protobuf.nodes();
     let relation = match &nodes.first()?.0 {
         NodeRef::CreateStmt(create) => create.relation.as_ref()?,
+        NodeRef::CreateTableAsStmt(create) if create.objtype == ObjectType::ObjectTable as i32 => {
+            create.into.as_ref()?.rel.as_ref()?
+        }
+        NodeRef::SelectStmt(select) => select.into_clause.as_ref()?.rel.as_ref()?,
         NodeRef::ViewStmt(view) => view.view.as_ref()?,
+        NodeRef::CreateSeqStmt(create) => create.sequence.as_ref()?,
         _ => return None,
     };
     if !relation.schemaname.is_empty() || relation.relpersistence == "t" {
