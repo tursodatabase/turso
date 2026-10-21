@@ -226,3 +226,69 @@ test table-uuid-column-with-explicit-default-generates-uuid {
 expect {
     1
 }
+
+@setup users
+test table-insert-returning-table-star {
+    INSERT INTO users VALUES (4, 'dave', 40, false) RETURNING users.*;
+}
+expect {
+    4|dave|40|f
+}
+
+@setup users
+test table-update-returning-table-star {
+    UPDATE users SET age = age + 1 WHERE name = 'bob' RETURNING users.*;
+}
+expect {
+    2|bob|26|f
+}
+
+@setup users
+test table-delete-returning-table-star {
+    DELETE FROM users WHERE name = 'carol' RETURNING users.*;
+}
+expect {
+    3|carol|35|t
+}
+
+@setup users
+test table-returning-alias-star {
+    INSERT INTO users AS u VALUES (5, 'eve', 20, true) RETURNING u.*;
+    UPDATE users AS u SET age = 50 WHERE id = 1 RETURNING u.*;
+    DELETE FROM users u WHERE id = 5 RETURNING id, u.*;
+}
+expect {
+    5|eve|20|t
+    1|alice|50|t
+    5|5|eve|20|t
+}
+
+@setup users
+test table-returning-schema-qualified-star {
+    INSERT INTO public.users VALUES (4, 'dave', 40, false) RETURNING public.users.*;
+    UPDATE public.users SET age = 50 WHERE id = 1 RETURNING public.users.*, users.*;
+    DELETE FROM public.users WHERE id = 4 RETURNING public.users.*;
+}
+expect {
+    4|dave|40|f
+    1|alice|50|t|1|alice|50|t
+    4|dave|40|f
+}
+
+@setup users
+test table-returning-star-with-unknown-middle-name-rejected {
+    INSERT INTO users VALUES (4, 'dave', 40, false) RETURNING users.zz.*;
+}
+expect error {}
+
+@setup users
+test table-returning-star-with-other-schema-rejected {
+    INSERT INTO public.users VALUES (4, 'dave', 40, false) RETURNING pg_catalog.users.*;
+}
+expect error {}
+
+@setup users
+test table-returning-table-name-star-after-alias-rejected {
+    INSERT INTO users AS u VALUES (4, 'dave', 40, false) RETURNING users.*;
+}
+expect error {}

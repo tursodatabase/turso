@@ -1329,7 +1329,7 @@ impl PostgreSQLTranslator {
             (ast::InsertBody::Select(select, upsert), columns)
         };
 
-        let returning = self.translate_returning(&insert.returning_list)?;
+        let returning = self.translate_returning(&insert.returning_list, relation)?;
         let with = self.translate_with_clause(&insert.with_clause)?;
 
         Ok(ast::Stmt::Insert {
@@ -1457,7 +1457,7 @@ impl PostgreSQLTranslator {
             None
         };
 
-        let returning = self.translate_returning(&update.returning_list)?;
+        let returning = self.translate_returning(&update.returning_list, relation)?;
         let with = self.translate_with_clause(&update.with_clause)?;
 
         Ok(ast::Stmt::Update(ast::Update {
@@ -1490,7 +1490,7 @@ impl PostgreSQLTranslator {
             None
         };
 
-        let returning = self.translate_returning(&delete.returning_list)?;
+        let returning = self.translate_returning(&delete.returning_list, relation)?;
         let with = self.translate_with_clause(&delete.with_clause)?;
 
         Ok(ast::Stmt::Delete {
@@ -3858,11 +3858,25 @@ impl PostgreSQLTranslator {
     fn translate_returning(
         &self,
         returning_list: &[pg_query::protobuf::Node],
+        target: &pg_query::protobuf::RangeVar,
     ) -> Result<Vec<ast::ResultColumn>, ParseError> {
         if returning_list.is_empty() {
             return Ok(vec![]);
         }
-        self.translate_target_list(returning_list)
+        let target_qualifiers: &[&str] = match target.alias.as_ref() {
+            Some(alias) if !alias.aliasname.is_empty() => &[&alias.aliasname],
+            _ if target.schemaname.is_empty() => &[&target.relname],
+            _ => &[&target.relname, &target.schemaname],
+        };
+        let mut columns = Vec::with_capacity(returning_list.len());
+        for node in returning_list {
+            if is_star_qualified_by(node, target_qualifiers) {
+                columns.push(ast::ResultColumn::Star);
+            } else {
+                columns.extend(self.translate_target_list(std::slice::from_ref(node))?);
+            }
+        }
+        Ok(columns)
     }
 
     fn translate_on_conflict(
@@ -4382,6 +4396,31 @@ fn cast_or_case_name(node: &pg_query::protobuf::Node) -> Option<String> {
         Some(Node::CaseExpr(_)) => Some("case".to_string()),
         _ => None,
     }
+}
+
+/// Whether `node` is a `qualifier.*` RETURNING target whose qualifier, read
+/// from the table name outwards, is a non-empty prefix of `target_qualifiers`.
+fn is_star_qualified_by(node: &pg_query::protobuf::Node, target_qualifiers: &[&str]) -> bool {
+    use pg_query::protobuf::node::Node;
+    let Some(Node::ResTarget(res_target)) = &node.node else {
+        return false;
+    };
+    let Some(Node::ColumnRef(col_ref)) = res_target.val.as_ref().and_then(|v| v.node.as_ref())
+    else {
+        return false;
+    };
+    let Some((last, qualifier)) = col_ref.fields.split_last() else {
+        return false;
+    };
+    if !matches!(last.node, Some(Node::AStar(_)))
+        || qualifier.is_empty()
+        || qualifier.len() > target_qualifiers.len()
+    {
+        return false;
+    }
+    qualifier.iter().rev().zip(target_qualifiers).all(
+        |(field, expected)| matches!(&field.node, Some(Node::String(s)) if s.sval == *expected),
+    )
 }
 
 fn last_string(names: &[pg_query::protobuf::Node]) -> Option<String> {
