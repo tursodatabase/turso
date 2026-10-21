@@ -1789,6 +1789,13 @@ test sign-null {
 expect {
 }
 
+test random-calls-in-comparison-are-independent {
+    SELECT random() = random();
+}
+expect {
+    0
+}
+
 test randomblob-int-2 {
     SELECT length(randomblob(2));
 }
