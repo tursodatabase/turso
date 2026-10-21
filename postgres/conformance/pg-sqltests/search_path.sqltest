@@ -294,3 +294,34 @@ test drop-if-exists-finds-object-through-search-path {
 expect {
     0
 }
+
+
+test public-prefix-on-drop-statements {
+    CREATE TABLE pp_t (x int);
+    CREATE VIEW pp_v AS SELECT x FROM pp_t;
+    CREATE INDEX pp_i ON pp_t (x);
+    CREATE SEQUENCE pp_s;
+    DROP INDEX public.pp_i;
+    DROP VIEW public.pp_v;
+    DROP SEQUENCE public.pp_s;
+    DROP TABLE public.pp_t;
+    DROP TABLE IF EXISTS public.pp_t;
+    SELECT count(*) FROM pg_tables WHERE tablename = 'pp_t';
+}
+expect {
+    0
+}
+
+test public-prefix-on-sequence-functions {
+    CREATE SEQUENCE pp_s2 START 7;
+    SELECT nextval('public.pp_s2');
+    SELECT currval('public.pp_s2');
+    SELECT setval('public.pp_s2', 9);
+    SELECT nextval('pp_s2');
+}
+expect {
+    7
+    7
+    9
+    10
+}
