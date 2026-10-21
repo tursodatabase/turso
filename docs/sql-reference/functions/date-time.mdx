@@ -264,6 +264,55 @@ SELECT timediff('2024-01-01', '2025-06-15');
 -- '-0001-05-14 00:00:00.000'
 ```
 
+### date_plus() and date_minus()
+
+<Info>
+**Turso Extension**: these functions have no SQLite equivalent.
+</Info>
+
+`date_plus(date, days)` returns the date `days` days after `date`, as TEXT in
+`YYYY-MM-DD` format. The arguments may be given in either order. If either
+argument is NULL the result is NULL. Only whole integer day counts are accepted;
+any other combination of argument types raises
+`a date can only be added to an integer number of days`.
+
+```sql
+date_plus(date, days)
+```
+
+```sql
+SELECT date_plus('2025-06-15', 10);
+-- '2025-06-25'
+
+SELECT date_plus(10, '2025-06-15');
+-- '2025-06-25'
+
+SELECT date_plus('2025-06-15', NULL);
+-- NULL
+```
+
+`date_minus` works the same way in the other direction. Subtracting an integer
+number of days returns a date, and subtracting one date from another returns the
+whole number of days between them as an INTEGER. Unlike `date_plus`, the date
+must come first: `date_minus(days, date)` is rejected with
+`only an integer number of days or a date can be subtracted from a date`.
+
+```sql
+date_minus(date, days)
+date_minus(date1, date2)
+```
+
+```sql
+SELECT date_minus('2025-06-15', 10);
+-- '2025-06-05'
+
+SELECT date_minus('2025-06-15', '2025-06-05');
+-- 10
+```
+
+Date strings that do not parse raise `invalid date value: ...`, and a shifted
+date that falls outside the supported range raises `date out of range`.
+
 ## Time Value Formats
 
 All date and time functions accept time values in the following formats.
