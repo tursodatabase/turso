@@ -204,6 +204,12 @@ pub trait Dialect: Send + Sync + 'static {
     fn qualified_column_uses_nearest_table_only(&self) -> bool {
         false
     }
+
+    /// Whether the function name `s.f` names the function `f` of the schema
+    /// `s`. A SQLite function name has no schema, so `"s.f"` is one name.
+    fn qualified_function_names(&self) -> bool {
+        false
+    }
 }
 
 #[cfg(test)]

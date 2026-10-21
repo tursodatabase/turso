@@ -179,6 +179,10 @@ impl Dialect for PostgresDialect {
     fn qualified_column_uses_nearest_table_only(&self) -> bool {
         true
     }
+
+    fn qualified_function_names(&self) -> bool {
+        true
+    }
 }
 
 pub fn encode_pg_schema_sql(sql: &str) -> String {

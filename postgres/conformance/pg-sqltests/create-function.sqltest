@@ -164,3 +164,11 @@ test call-of-a-function-that-turso-cannot-execute-errors {
 expect error {
     cannot execute function add_tax()
 }
+
+@skip-if postgres "PostgreSQL finds a function only in the schema of the call"
+test qualified-call-of-a-builtin-function-calls-the-builtin-function {
+    SELECT extensions.lower('ABC');
+}
+expect {
+    abc
+}

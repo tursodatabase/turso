@@ -3436,19 +3436,7 @@ impl PostgreSQLTranslator {
         &self,
         func_call: &pg_query::protobuf::FuncCall,
     ) -> Result<ast::Expr, ParseError> {
-        // Extract function name
-        let func_name = func_call
-            .funcname
-            .iter()
-            .filter_map(|node| {
-                if let Some(pg_query::protobuf::node::Node::String(s)) = &node.node {
-                    Some(s.sval.clone())
-                } else {
-                    None
-                }
-            })
-            .next_back()
-            .ok_or_else(|| ParseError::ParseError("Missing function name".to_string()))?;
+        let func_name = call_name(&func_call.funcname)?;
 
         // Translate FILTER clause
         let filter_clause = if let Some(ref filter) = func_call.agg_filter {
@@ -3489,12 +3477,6 @@ impl PostgreSQLTranslator {
         } else {
             None
         };
-
-        // Strip pg_catalog. schema prefix from function names
-        let func_name = func_name
-            .strip_prefix("pg_catalog.")
-            .unwrap_or(&func_name)
-            .to_string();
 
         // Rewrite PG-specific function-name spellings to their core-native
         // equivalents so the core resolver doesn't need to carry aliases
@@ -4477,6 +4459,25 @@ fn join_keeps_unmatched_right_rows(join: &ast::JoinedSelectTable) -> bool {
 }
 
 /// Maps a PostgreSQL schema name to the Turso schema that holds its tables.
+fn call_name(funcname: &[pg_query::protobuf::Node]) -> Result<String, ParseError> {
+    let names: Vec<&str> = funcname
+        .iter()
+        .filter_map(|node| match &node.node {
+            Some(pg_query::protobuf::node::Node::String(s)) => Some(s.sval.as_str()),
+            _ => None,
+        })
+        .collect();
+    match names.as_slice() {
+        [name] | ["pg_catalog", name] => Ok(name.to_string()),
+        [schema, name] => Ok(format!("{}.{name}", map_schema_name(schema))),
+        [] => Err(ParseError::ParseError("Missing function name".to_string())),
+        _ => Err(ParseError::ParseError(format!(
+            "improper qualified name (too many dotted names): {}",
+            names.join(".")
+        ))),
+    }
+}
+
 pub(crate) fn map_schema_name(schema: &str) -> &str {
     match schema.to_ascii_lowercase().as_str() {
         "pg_catalog" | "public" | "information_schema" => "main",

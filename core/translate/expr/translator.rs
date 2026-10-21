@@ -2188,6 +2188,27 @@ fn translate_catalog_function_call(
     };
     let Some((database_id, function)) = resolver.find_catalog_function(name.as_str(), args.len())
     else {
+        let qualified_name = resolver
+            .dialect
+            .qualified_function_names()
+            .then(|| name.as_str().split_once('.'))
+            .flatten();
+        if let Some((_, bare_name)) = qualified_name {
+            if resolver.resolve_function(bare_name, args.len())?.is_some() {
+                let mut bare_call = expr.clone();
+                let ast::Expr::FunctionCall { name, .. } = &mut bare_call else {
+                    unreachable!("bare_call is a copy of a function call");
+                };
+                *name = ast::Name::exact(bare_name.to_string());
+                return translate_function_call_expr(
+                    program,
+                    referenced_tables,
+                    &bare_call,
+                    target_register,
+                    resolver,
+                );
+            }
+        }
         crate::bail_parse_error!("no such function: {}", name.as_str());
     };
     if database_id == crate::MAIN_DB_ID {
