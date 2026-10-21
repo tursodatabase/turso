@@ -318,7 +318,7 @@ expect {
     time(value text)|text|CASE WHEN value IS NULL THEN NULL WHEN time (value) IS NULL THEN RAISE (ABORT, 'invalid time value') ELSE rtrim (rtrim (strftime ('%H:%M:%f', value), '0'), '.') END|value||'<'
     timestamp(value text)|text|CASE WHEN value IS NULL THEN NULL WHEN datetime (value) IS NULL THEN RAISE (ABORT, 'invalid timestamp value') ELSE rtrim (rtrim (strftime ('%Y-%m-%d %H:%M:%f', value), '0'), '.') END|value||'<'
     timestamptz(value text)|text|CASE WHEN value IS NULL THEN NULL WHEN datetime (value) IS NULL THEN RAISE (ABORT, 'invalid timestamp value') ELSE rtrim (rtrim (strftime ('%Y-%m-%d %H:%M:%f', value), '0'), '.') END|value||'<'
-    uuid(value any)|blob|CASE WHEN value IS NULL THEN NULL WHEN typeof (value) = 'blob' AND length (value) = 16 THEN value ELSE coalesce (uuid_blob (value), RAISE (ABORT, 'invalid UUID value')) END|uuid_str (value)|uuid4_str ()|'<'
+    uuid(value any)|blob|CASE WHEN value IS NULL THEN NULL WHEN typeof (value) = 'blob' AND length (value) = 16 THEN value ELSE coalesce (uuid_blob (value), RAISE (ABORT, 'invalid UUID value')) END|uuid_str (value)||'<'
     varchar(value text, maxlen integer)|text|CASE WHEN length (value) <= maxlen THEN value ELSE RAISE (ABORT, 'value too long for varchar') END|value||'<'
 }
 
@@ -353,7 +353,7 @@ expect {
     time(value text)|text|CASE WHEN value IS NULL THEN NULL WHEN time (value) IS NULL THEN RAISE (ABORT, 'invalid time value') ELSE rtrim (rtrim (strftime ('%H:%M:%f', value), '0'), '.') END|value||'<'
     timestamp(value text)|text|CASE WHEN value IS NULL THEN NULL WHEN datetime (value) IS NULL THEN RAISE (ABORT, 'invalid timestamp value') ELSE rtrim (rtrim (strftime ('%Y-%m-%d %H:%M:%f', value), '0'), '.') END|value||'<'
     timestamptz(value text)|text|CASE WHEN value IS NULL THEN NULL WHEN datetime (value) IS NULL THEN RAISE (ABORT, 'invalid timestamp value') ELSE rtrim (rtrim (strftime ('%Y-%m-%d %H:%M:%f', value), '0'), '.') END|value||'<'
-    uuid(value any)|blob|CASE WHEN value IS NULL THEN NULL WHEN typeof (value) = 'blob' AND length (value) = 16 THEN value ELSE coalesce (uuid_blob (value), RAISE (ABORT, 'invalid UUID value')) END|uuid_str (value)|uuid4_str ()|'<'
+    uuid(value any)|blob|CASE WHEN value IS NULL THEN NULL WHEN typeof (value) = 'blob' AND length (value) = 16 THEN value ELSE coalesce (uuid_blob (value), RAISE (ABORT, 'invalid UUID value')) END|uuid_str (value)||'<'
     varchar(value text, maxlen integer)|text|CASE WHEN length (value) <= maxlen THEN value ELSE RAISE (ABORT, 'value too long for varchar') END|value||'<'
 }
 
@@ -393,8 +393,25 @@ expect error {
     invalid UUID value
 }
 
-test strict-uuid-omitted-column-gets-random-uuid {
+test strict-uuid-omitted-column-is-null {
     CREATE TABLE t1(a INTEGER PRIMARY KEY, b uuid) STRICT;
+    INSERT INTO t1(a) VALUES (1), (2);
+    SELECT count(*), count(b) FROM t1;
+}
+expect {
+    2|0
+}
+
+test strict-uuid-omitted-not-null-column-is-rejected {
+    CREATE TABLE t1(a INTEGER PRIMARY KEY, b uuid NOT NULL) STRICT;
+    INSERT INTO t1(a) VALUES (1);
+}
+expect error {
+    NOT NULL constraint failed
+}
+
+test strict-uuid-explicit-default-generates-values {
+    CREATE TABLE t1(a INTEGER PRIMARY KEY, b uuid DEFAULT (uuid4_str())) STRICT;
     INSERT INTO t1(a) VALUES (1), (2);
     SELECT count(DISTINCT b), min(length(b)), max(length(b)) FROM t1;
 }

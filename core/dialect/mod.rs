@@ -172,10 +172,6 @@ pub trait Dialect: Send + Sync + 'static {
         false
     }
 
-    fn builtin_types_have_defaults(&self) -> bool {
-        true
-    }
-
     /// Whether `t.c` reads only the nearest query that has a table named `t`.
     ///
     /// SQLite keeps searching outer queries when that table has no column

@@ -813,26 +813,13 @@ impl Default for Schema {
     }
 }
 
-fn bootstrap_builtin_types(
-    registry: &mut HashMap<String, Arc<TypeDef>>,
-    #[cfg_attr(not(feature = "uuid"), allow(unused_variables))]
-    dialect: &dyn crate::dialect::Dialect,
-) -> crate::Result<()> {
+fn bootstrap_builtin_types(registry: &mut HashMap<String, Arc<TypeDef>>) -> crate::Result<()> {
     use turso_parser::ast::{Cmd, Stmt};
     use turso_parser::parser::Parser;
 
-    #[cfg(feature = "uuid")]
-    let uuid_type_sql = format!(
-        "CREATE TYPE uuid(value any) BASE blob ENCODE CASE WHEN value IS NULL THEN NULL WHEN typeof(value) = 'blob' AND length(value) = 16 THEN value ELSE coalesce(uuid_blob(value), RAISE(ABORT, 'invalid UUID value')) END DECODE uuid_str(value){} OPERATOR '<'",
-        if dialect.builtin_types_have_defaults() {
-            " DEFAULT uuid4_str()"
-        } else {
-            ""
-        }
-    );
     let type_sqls: &[&str] = &[
         #[cfg(feature = "uuid")]
-        &uuid_type_sql,
+        "CREATE TYPE uuid(value any) BASE blob ENCODE CASE WHEN value IS NULL THEN NULL WHEN typeof(value) = 'blob' AND length(value) = 16 THEN value ELSE coalesce(uuid_blob(value), RAISE(ABORT, 'invalid UUID value')) END DECODE uuid_str(value) OPERATOR '<'",
         "CREATE TYPE boolean(value any) BASE integer ENCODE boolean_to_int(value) DECODE CASE WHEN value THEN 1 ELSE 0 END OPERATOR '<'",
         #[cfg(feature = "json")]
         "CREATE TYPE json(value text) BASE text ENCODE json(value) DECODE value",
@@ -939,7 +926,7 @@ impl Schema {
         let incompatible_materialized_view_roots = HashMap::default();
         let mut type_registry = HashMap::default();
         if enable_custom_types {
-            bootstrap_builtin_types(&mut type_registry, dialect)?;
+            bootstrap_builtin_types(&mut type_registry)?;
         }
         let mut schema = Self {
             tables,

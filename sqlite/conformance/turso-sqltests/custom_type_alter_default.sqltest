@@ -55,6 +55,17 @@ expect error {
 }
 
 @requires strict "uses STRICT tables"
+test alter-add-uuid-column-leaves-existing-rows-null {
+    CREATE TABLE t(id INTEGER PRIMARY KEY) STRICT;
+    INSERT INTO t VALUES (1), (2);
+    ALTER TABLE t ADD COLUMN u uuid;
+    SELECT count(*), count(u) FROM t;
+}
+expect {
+    2|0
+}
+
+@requires strict "uses STRICT tables"
 test alter-add-notnull-type-default-empty-table {
     -- Empty table: should always succeed regardless of defaults.
     CREATE TYPE cents BASE integer ENCODE value * 100 DECODE value / 100 DEFAULT 50;
