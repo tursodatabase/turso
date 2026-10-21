@@ -324,6 +324,55 @@ fn test_wal_frame_far_away_write(db: TempDatabase) {
     assert!(conn2.wal_insert_frame(5, &frame).is_err());
 }
 
+#[test]
+fn wal_get_frame_returns_uncommitted_frame() {
+    let db = TempDatabase::new_empty();
+    let writer = db.connect_limbo();
+    let reader = db.connect_limbo();
+    writer.execute("CREATE TABLE t(x)").unwrap();
+    writer.execute("PRAGMA cache_size = 100").unwrap();
+    writer.execute("BEGIN").unwrap();
+    writer
+        .execute("INSERT INTO t SELECT randomblob(3000) FROM generate_series(1, 1000)")
+        .unwrap();
+    let _: Vec<(i64,)> = reader.exec_rows("SELECT count(*) FROM t");
+    let max_frame = reader.wal_state().unwrap().max_frame;
+    let mut frame = [0u8; 24 + 4096];
+    let read = reader.wal_get_frame(max_frame + 1, &mut frame);
+    assert!(
+        read.is_err(),
+        "max_frame={max_frame}, uncommitted frame {}: {read:?}",
+        max_frame + 1
+    );
+    assert!(reader.wal_get_frame(0, &mut frame).is_err());
+    reader.wal_get_frame(max_frame, &mut frame).unwrap();
+}
+
+#[test]
+fn wal_get_frame_after_wal_restart_does_not_return_uncommitted_frame() {
+    let db = TempDatabase::new_empty();
+    let writer = db.connect_limbo();
+    let reader = db.connect_limbo();
+    writer.execute("CREATE TABLE t(x)").unwrap();
+    writer
+        .execute("INSERT INTO t SELECT randomblob(3000) FROM generate_series(1, 20)")
+        .unwrap();
+    let _: Vec<(i64,)> = reader.exec_rows("SELECT count(*) FROM t");
+    let max_frame = reader.wal_state().unwrap().max_frame;
+    assert!(max_frame > 0);
+    writer.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+    writer.execute("PRAGMA cache_size = 100").unwrap();
+    writer.execute("BEGIN").unwrap();
+    writer
+        .execute("INSERT INTO t SELECT randomblob(3000) FROM generate_series(1, 1000)")
+        .unwrap();
+    let mut frame = [0u8; 24 + 4096];
+    for frame_no in 1..=max_frame {
+        let read = reader.wal_get_frame(frame_no, &mut frame);
+        assert!(read.is_err(), "uncommitted frame {frame_no}: {read:?}");
+    }
+}
+
 // TODO: mvcc
 #[turso_macros::test()]
 fn test_wal_frame_api_no_schema_changes_fuzz(db: TempDatabase) {
