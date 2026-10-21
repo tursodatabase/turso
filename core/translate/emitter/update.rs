@@ -25,7 +25,7 @@ use crate::{
         eqp::eqp_detail_for_table_op,
         expr::{
             emit_dml_expr_index_value, emit_returning_results, emit_returning_scan_back,
-            emit_table_column, restore_returning_row_image_in_cache,
+            emit_table_column, emit_trigger_decode_registers, restore_returning_row_image_in_cache,
             seed_returning_row_image_in_cache, translate_expr, translate_expr_no_constant_opt,
             NoConstantOptReason, ReturningBufferCtx,
         },
@@ -1454,10 +1454,15 @@ fn emit_update_insns<'a>(
                     )?;
                 }
 
-                let new_registers = (0..col_len)
-                    .map(|i| layout.to_register(start, i))
-                    .chain(std::iter::once(new_rowid_reg))
-                    .collect();
+                let new_registers = emit_trigger_decode_registers(
+                    program,
+                    &t_ctx.resolver,
+                    columns,
+                    &|i| layout.to_register(start, i),
+                    &|i| !updated_column_indices.get(i) && !columns[i].is_virtual_generated(),
+                    new_rowid_reg,
+                    btree_table.is_strict,
+                )?;
 
                 // Propagate conflict resolution to trigger context:
                 // 1. UPSERT DO UPDATE override takes precedence

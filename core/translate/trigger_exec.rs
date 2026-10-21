@@ -1108,6 +1108,7 @@ fn decode_trigger_registers(
                 resolver,
                 columns,
                 &|i| new_regs[i],
+                &|_| true,
                 rowid_reg,
                 true, // is_strict
             )?)
@@ -1125,6 +1126,7 @@ fn decode_trigger_registers(
             resolver,
             columns,
             &|i| old_regs[i],
+            &|_| true,
             rowid_reg,
             true, // is_strict
         )?)

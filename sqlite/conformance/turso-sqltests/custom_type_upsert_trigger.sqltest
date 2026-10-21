@@ -63,3 +63,138 @@ test before-update-trigger-direct-update-still-works {
 expect {
     old=10 new=20
 }
+
+@requires strict "uses STRICT tables"
+@requires trigger "uses triggers"
+test before-update-trigger-sees-decoded-new-of-column-not-in-set {
+    CREATE TYPE cents BASE integer ENCODE value * 100 DECODE value / 100;
+    CREATE TABLE t1(id INTEGER PRIMARY KEY, amount cents, note TEXT) STRICT;
+    CREATE TABLE log(msg TEXT);
+    CREATE TRIGGER tr_before BEFORE UPDATE ON t1
+    BEGIN INSERT INTO log VALUES ('old=' || OLD.amount || ' new=' || NEW.amount); END;
+    INSERT INTO t1 VALUES (1, 10, 'a');
+    UPDATE t1 SET note = 'b' WHERE id = 1;
+    SELECT * FROM log;
+    SELECT id, amount, note FROM t1;
+}
+expect {
+    old=10 new=10
+    1|10|b
+}
+
+@requires strict "uses STRICT tables"
+
+@requires trigger "uses triggers"
+
+test before-update-trigger-when-clause-sees-decoded-new-of-column-not-in-set {
+    CREATE TYPE cents BASE integer ENCODE value * 100 DECODE value / 100;
+    CREATE TABLE t1(id INTEGER PRIMARY KEY, amount cents, note TEXT) STRICT;
+    CREATE TABLE log(msg TEXT);
+    CREATE TRIGGER tr_before BEFORE UPDATE ON t1 WHEN NEW.amount = 10
+    BEGIN INSERT INTO log VALUES ('fired'); END;
+    INSERT INTO t1 VALUES (1, 10, 'a');
+    UPDATE t1 SET note = 'b' WHERE id = 1;
+    SELECT * FROM log;
+}
+expect {
+    fired
+}
+
+@requires strict "uses STRICT tables"
+
+@requires trigger "uses triggers"
+
+test before-update-trigger-sees-decoded-new-of-column-in-set {
+    CREATE TYPE cents BASE integer ENCODE value * 100 DECODE value / 100;
+    CREATE TABLE t1(id INTEGER PRIMARY KEY, amount cents, note TEXT) STRICT;
+    CREATE TABLE log(msg TEXT);
+    CREATE TRIGGER tr_before BEFORE UPDATE ON t1
+    BEGIN INSERT INTO log VALUES ('old=' || OLD.amount || ' new=' || NEW.amount); END;
+    INSERT INTO t1 VALUES (1, 10, 'a');
+    UPDATE t1 SET amount = 30 WHERE id = 1;
+    SELECT * FROM log;
+    SELECT id, amount, note FROM t1;
+}
+expect {
+    old=10 new=30
+    1|30|a
+}
+
+@requires strict "uses STRICT tables"
+
+@requires trigger "uses triggers"
+
+test after-update-trigger-sees-decoded-old-and-new {
+    CREATE TYPE cents BASE integer ENCODE value * 100 DECODE value / 100;
+    CREATE TABLE t1(id INTEGER PRIMARY KEY, amount cents, note TEXT) STRICT;
+    CREATE TABLE log(msg TEXT);
+    CREATE TRIGGER tr_after AFTER UPDATE ON t1
+    BEGIN INSERT INTO log VALUES ('old=' || OLD.amount || ' new=' || NEW.amount); END;
+    INSERT INTO t1 VALUES (1, 10, 'a');
+    UPDATE t1 SET note = 'b' WHERE id = 1;
+    UPDATE t1 SET amount = 20 WHERE id = 1;
+    SELECT * FROM log;
+}
+expect {
+    old=10 new=10
+    old=10 new=20
+}
+
+@requires strict "uses STRICT tables"
+
+@requires trigger "uses triggers"
+
+test upsert-before-update-trigger-sees-decoded-new-of-column-not-in-set {
+    CREATE TYPE cents BASE integer ENCODE value * 100 DECODE value / 100;
+    CREATE TABLE t1(id INTEGER PRIMARY KEY, amount cents, note TEXT) STRICT;
+    CREATE TABLE log(msg TEXT);
+    CREATE TRIGGER tr_before BEFORE UPDATE ON t1
+    BEGIN INSERT INTO log VALUES ('old=' || OLD.amount || ' new=' || NEW.amount); END;
+    INSERT INTO t1 VALUES (1, 10, 'a');
+    INSERT INTO t1 VALUES (1, 99, 'b') ON CONFLICT(id) DO UPDATE SET note = excluded.note;
+    SELECT * FROM log;
+    SELECT id, amount, note FROM t1;
+}
+expect {
+    old=10 new=10
+    1|10|b
+}
+
+@requires strict "uses STRICT tables"
+
+@requires trigger "uses triggers"
+
+test upsert-before-update-trigger-sees-decoded-new-of-column-in-set {
+    CREATE TYPE cents BASE integer ENCODE value * 100 DECODE value / 100;
+    CREATE TABLE t1(id INTEGER PRIMARY KEY, amount cents, note TEXT) STRICT;
+    CREATE TABLE log(msg TEXT);
+    CREATE TRIGGER tr_before BEFORE UPDATE ON t1
+    BEGIN INSERT INTO log VALUES ('old=' || OLD.amount || ' new=' || NEW.amount); END;
+    INSERT INTO t1 VALUES (1, 10, 'a');
+    INSERT INTO t1 VALUES (1, 40, 'b') ON CONFLICT(id) DO UPDATE SET amount = excluded.amount;
+    SELECT * FROM log;
+    SELECT id, amount, note FROM t1;
+}
+expect {
+    old=10 new=40
+    1|40|a
+}
+
+@requires strict "uses STRICT tables"
+
+@requires trigger "uses triggers"
+
+test before-insert-trigger-sees-the-value-of-the-statement {
+    CREATE TYPE cents BASE integer ENCODE value * 100 DECODE value / 100;
+    CREATE TABLE t1(id INTEGER PRIMARY KEY, amount cents, note TEXT) STRICT;
+    CREATE TABLE log(msg TEXT);
+    CREATE TRIGGER tr_before BEFORE INSERT ON t1
+    BEGIN INSERT INTO log VALUES ('new=' || NEW.amount); END;
+    INSERT INTO t1 VALUES (1, 10, 'a');
+    SELECT * FROM log;
+    SELECT id, amount FROM t1;
+}
+expect {
+    new=10
+    1|10
+}
