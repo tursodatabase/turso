@@ -1,6 +1,6 @@
 use chumsky::{error::EmptyErr, prelude::*};
 use std::borrow::Cow;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::num::NonZero;
 use std::str;
 use std::sync::{Arc, Mutex};
@@ -33,6 +33,9 @@ struct SessionState {
     search_path_setting: Option<String>,
     /// The values of the variables of the compiled PL/pgSQL triggers, by key.
     trigger_variables: HashMap<String, Value>,
+    /// The trigger variables that `set_trigger_variable_once` set after the
+    /// last `set_trigger_variable` of the same key.
+    trigger_variables_set_once: HashSet<String>,
 }
 
 type PgSessionState = Mutex<SessionState>;
@@ -497,11 +500,23 @@ pub(crate) fn set_search_path(conn: &Connection, value: Option<&str>) -> Result<
 }
 
 pub(crate) fn set_trigger_variable(conn: &Connection, key: &str, value: Value) -> Result<()> {
-    session_state(conn)?
-        .lock()
-        .unwrap()
-        .trigger_variables
-        .insert(key.to_string(), value);
+    let mut state = session_state(conn)?.lock().unwrap();
+    state.trigger_variables_set_once.remove(key);
+    state.trigger_variables.insert(key.to_string(), value);
+    Ok(())
+}
+
+/// Set a trigger variable that one statement can set only one time, as
+/// `RETURNING ... INTO` does. A second set before the next
+/// `set_trigger_variable` of the key gives the error of PostgreSQL.
+pub(crate) fn set_trigger_variable_once(conn: &Connection, key: &str, value: Value) -> Result<()> {
+    let mut state = session_state(conn)?.lock().unwrap();
+    if !state.trigger_variables_set_once.insert(key.to_string()) {
+        return Err(LimboError::SqlError(
+            "query returned more than one row".to_string(),
+        ));
+    }
+    state.trigger_variables.insert(key.to_string(), value);
     Ok(())
 }
 

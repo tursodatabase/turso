@@ -1,5 +1,5 @@
 use crate::plpgsql_names::{NameResolver, Variables};
-use crate::session::{set_trigger_variable, trigger_variable};
+use crate::session::{set_trigger_variable, set_trigger_variable_once, trigger_variable};
 use crate::trigger::{parse_trigger_definition, postgres_schema_name, trigger_definition};
 use crate::user_function::{Language, UserFunction};
 use pg_query::protobuf::node::Node;
@@ -122,11 +122,13 @@ pub(crate) fn compile_trigger(
     }))
 }
 
-/// Register `__pl_set(key, value)` and `__pl_get(key)`, which keep the values
-/// of the variables of the compiled triggers in the session.
+/// Register `__pl_set(key, value)`, `__pl_set_one(key, value)` and
+/// `__pl_get(key)`, which keep the values of the variables of the compiled
+/// triggers in the session.
 pub(crate) fn register_trigger_variable_functions(mut options: OpenOptions) -> OpenOptions {
     for (name, arg_count, function) in [
         (SET_VARIABLE, 2, TriggerVariableFunction::Set),
+        (SET_VARIABLE_ONCE, 2, TriggerVariableFunction::SetOnce),
         (GET_VARIABLE, 1, TriggerVariableFunction::Get),
     ] {
         options = options.extension_function(
@@ -143,6 +145,7 @@ pub(crate) fn register_trigger_variable_functions(mut options: OpenOptions) -> O
 }
 
 const SET_VARIABLE: &str = "__pl_set";
+const SET_VARIABLE_ONCE: &str = "__pl_set_one";
 const GET_VARIABLE: &str = "__pl_get";
 
 struct TriggerConstants {
@@ -372,11 +375,133 @@ impl<'a> Compiler<'a> {
                 let targets = self.targets_of_into(body.get("target"))?;
                 self.compile_select_into(select, targets)
             }
-            (_, true) => Err(LimboError::ParseError(
-                "RETURNING INTO is not supported yet".into(),
-            )),
+            (stmt, true) => {
+                let targets = self.targets_of_into(body.get("target"))?;
+                self.compile_returning_into(stmt, targets)
+            }
             (stmt, false) => self.compile_write(stmt),
         }
+    }
+
+    /// Compile `INSERT, UPDATE or DELETE ... RETURNING ... INTO targets`.
+    /// A statement first sets each target to NULL, for a write that returns
+    /// no row. Then each returned value goes to its target with
+    /// `__pl_set_one`, which gives an error for a second row, as PostgreSQL
+    /// does.
+    fn compile_returning_into(
+        &mut self,
+        mut stmt: ast::Stmt,
+        targets: Vec<Target>,
+    ) -> Result<Flow> {
+        if let Some(name) = self.resolve_statement(&mut stmt)? {
+            return Ok(self.raise_ambiguous(&name));
+        }
+        let (table, returning) = returning_clause(&mut stmt)
+            .ok_or_else(|| LimboError::Corrupt("INTO without RETURNING".into()))?;
+        let values = self.returned_values(&table, returning)?;
+        let condition = self.statement_condition();
+        let returned_key = self.new_variable("returned");
+        let mut resets = Vec::new();
+        let mut assignments = vec![ast::ResultColumn::Expr(
+            Box::new(function_call(
+                SET_VARIABLE_ONCE,
+                vec![
+                    text_literal(&returned_key),
+                    ast::Expr::Literal(ast::Literal::Numeric("1".to_string())),
+                ],
+            )),
+            None,
+        )];
+        let mut not_null = Vec::new();
+        for (position, target) in targets.into_iter().enumerate() {
+            let value = values.get(position).cloned().unwrap_or_else(null);
+            let (key, value) = match target {
+                Target::Variable(dno) => {
+                    let declaration = self.datums.declaration(dno)?;
+                    let key = self.variable_key(dno);
+                    if declaration.not_null {
+                        not_null.push((key.clone(), declaration.name));
+                    }
+                    (key, cast(value, declaration.cast))
+                }
+                Target::NewField(field) => {
+                    if !self.new_field_exists(field, condition.clone()) {
+                        continue;
+                    }
+                    (self.new_field_variable(field)?, value)
+                }
+                Target::OldField => {
+                    return Err(LimboError::ParseError(
+                        "assignment to OLD is not supported".into(),
+                    ))
+                }
+                Target::Other => {
+                    return Err(LimboError::ParseError(
+                        "INTO this variable is not supported yet".into(),
+                    ))
+                }
+            };
+            resets.push(ast::ResultColumn::Expr(
+                Box::new(set_variable(&key, null())),
+                None,
+            ));
+            assignments.push(ast::ResultColumn::Expr(
+                Box::new(set_variable(&key, value)),
+                None,
+            ));
+        }
+        *returning = assignments;
+        self.statements.push(select_where(
+            set_variable(&returned_key, null()),
+            condition.clone(),
+        ));
+        self.push_write(stmt)?;
+        if !resets.is_empty() {
+            let no_row = ast::Expr::IsNull(Box::new(get_variable(&returned_key)));
+            self.statements.push(ast::Stmt::Select(one_select(
+                resets,
+                None,
+                Some(and(condition.clone(), no_row)),
+            )));
+        }
+        for (key, name) in not_null {
+            self.check_not_null(&key, name, condition.clone());
+        }
+        Ok(Flow::Continues)
+    }
+
+    /// The values of a RETURNING list, with `*` as the columns of `table`.
+    fn returned_values(
+        &self,
+        table: &ast::QualifiedName,
+        columns: &[ast::ResultColumn],
+    ) -> Result<Vec<ast::Expr>> {
+        let table_columns = || {
+            self.tables.column_names(table).ok_or_else(|| {
+                LimboError::ParseError(format!("no such table: {}", table.name.as_str()))
+            })
+        };
+        let table_name = table.alias.as_ref().unwrap_or(&table.name);
+        let mut values = Vec::new();
+        for column in columns {
+            match column {
+                ast::ResultColumn::Expr(expr, _) => values.push(expr.as_ref().clone()),
+                ast::ResultColumn::TableStar(name)
+                    if !name.as_str().eq_ignore_ascii_case(table_name.as_str()) =>
+                {
+                    return Err(LimboError::ParseError(format!(
+                        "RETURNING {}.* INTO is not supported yet",
+                        name.as_str()
+                    )))
+                }
+                ast::ResultColumn::Star | ast::ResultColumn::TableStar(_) => values.extend(
+                    table_columns()?
+                        .into_iter()
+                        .map(|name| ast::Expr::Id(ast::Name::exact(name))),
+                ),
+            }
+        }
+        Ok(values)
     }
 
     /// Compile INSERT, UPDATE or DELETE.
@@ -384,10 +509,17 @@ impl<'a> Compiler<'a> {
         if let Some(name) = self.resolve_statement(&mut stmt)? {
             return Ok(self.raise_ambiguous(&name));
         }
+        self.push_write(stmt)?;
+        Ok(Flow::Continues)
+    }
+
+    /// Add an INSERT, UPDATE or DELETE whose names are resolved, and set
+    /// FOUND after it.
+    fn push_write(&mut self, stmt: ast::Stmt) -> Result<()> {
         let stmt = with_condition(stmt, self.statement_condition())?;
         self.statements.push(stmt);
         self.set_found_from_changes();
-        Ok(Flow::Continues)
+        Ok(())
     }
 
     /// The variables and fields of NEW that INTO assigns, in order.
@@ -1598,11 +1730,14 @@ enum Record {
     Null,
 }
 
-/// `__pl_set(key, value)` stores a value and returns it. `__pl_get(key)`
-/// returns the stored value, or NULL.
+/// `__pl_set(key, value)` stores a value and returns it. `__pl_set_one` does
+/// the same, but gives an error when it set the key before and no
+/// `__pl_set` of the key came after. `__pl_get(key)` returns the stored
+/// value, or NULL.
 #[derive(Debug, Clone, Copy)]
 enum TriggerVariableFunction {
     Set,
+    SetOnce,
     Get,
 }
 
@@ -1626,6 +1761,11 @@ impl ScalarCall for TriggerVariableFunction {
             Self::Set => {
                 let value = args[1].get_value().clone();
                 set_trigger_variable(connection, key.as_str(), value.clone())?;
+                value
+            }
+            Self::SetOnce => {
+                let value = args[1].get_value().clone();
+                set_trigger_variable_once(connection, key.as_str(), value.clone())?;
                 value
             }
             Self::Get => trigger_variable(connection, key.as_str())?,
@@ -2008,6 +2148,26 @@ fn constant_value(expr: &ast::Expr) -> Option<Constant> {
             }
             Some(Constant::Integer(i64::from(found != *not)))
         }
+        _ => None,
+    }
+}
+
+/// The table that a write changes, and its RETURNING list.
+fn returning_clause(
+    stmt: &mut ast::Stmt,
+) -> Option<(ast::QualifiedName, &mut Vec<ast::ResultColumn>)> {
+    match stmt {
+        ast::Stmt::Insert {
+            tbl_name,
+            returning,
+            ..
+        }
+        | ast::Stmt::Delete {
+            tbl_name,
+            returning,
+            ..
+        } => Some((tbl_name.clone(), returning)),
+        ast::Stmt::Update(update) => Some((update.tbl_name.clone(), &mut update.returning)),
         _ => None,
     }
 }

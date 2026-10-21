@@ -1855,3 +1855,132 @@ test select-into-strict-is-not-supported {
 expect error {
     INTO STRICT is not supported yet
 }
+
+test returning-into-assigns-the-returned-row {
+    CREATE TABLE items (id serial PRIMARY KEY, x int);
+    CREATE TABLE trig (id int);
+    CREATE TABLE log (msg text);
+    INSERT INTO items (x) VALUES (10), (20);
+    CREATE FUNCTION track() RETURNS trigger LANGUAGE plpgsql AS $$
+    DECLARE
+        v int := 7;
+        w int;
+    BEGIN
+        UPDATE items SET x = x + 1 WHERE id = 100 RETURNING x INTO v;
+        INSERT INTO log VALUES ('1 ' || coalesce(v::text, 'null') || ' ' || CASE WHEN FOUND THEN 'found' ELSE 'not found' END);
+        INSERT INTO items (x) VALUES (NEW.id * 100) RETURNING id, x INTO v, w;
+        INSERT INTO log VALUES ('2 ' || v || ' ' || w || ' ' || CASE WHEN FOUND THEN 'found' ELSE 'not found' END);
+        DELETE FROM items WHERE id = 1 RETURNING * INTO v, w;
+        INSERT INTO log VALUES ('3 ' || v || ' ' || w);
+        RETURN NEW;
+    END
+    $$;
+    CREATE TRIGGER trig_track AFTER INSERT ON trig FOR EACH ROW EXECUTE FUNCTION track();
+    INSERT INTO trig VALUES (6);
+    SELECT msg FROM log ORDER BY msg;
+    SELECT id, x FROM items ORDER BY id;
+}
+expect {
+    1 null not found
+    2 3 600 found
+    3 1 10
+    2|20
+    3|600
+}
+
+test returning-into-reads-the-old-value-of-its-target-in-the-same-statement {
+    CREATE TABLE accounts (id int PRIMARY KEY, balance int);
+    CREATE TABLE payments (id int PRIMARY KEY, account_id int, amount int);
+    CREATE TABLE nodes (id serial PRIMARY KEY, parent_id int);
+    INSERT INTO accounts VALUES (1, 100);
+    CREATE FUNCTION pay() RETURNS trigger LANGUAGE plpgsql AS $$
+    DECLARE
+        account int := NEW.account_id;
+        node int := 7;
+    BEGIN
+        UPDATE accounts SET balance = balance - NEW.amount WHERE id = account RETURNING id INTO account;
+        IF account IS NULL THEN
+            RAISE EXCEPTION 'account % not found', NEW.account_id;
+        END IF;
+        INSERT INTO nodes (parent_id) VALUES (node) RETURNING id INTO node;
+        INSERT INTO nodes (parent_id) VALUES (node);
+        RETURN NEW;
+    END
+    $$;
+    CREATE TRIGGER payments_pay BEFORE INSERT ON payments FOR EACH ROW EXECUTE FUNCTION pay();
+    INSERT INTO payments VALUES (1, 1, 30);
+    SELECT balance FROM accounts;
+    SELECT id, parent_id FROM nodes ORDER BY id;
+}
+expect {
+    70
+    1|7
+    2|1
+}
+
+test returning-into-gives-an-error-for-more-than-one-row {
+    CREATE TABLE items (id int PRIMARY KEY, x int);
+    CREATE TABLE trig (id int);
+    INSERT INTO items VALUES (1, 10), (2, 20);
+    CREATE FUNCTION track() RETURNS trigger LANGUAGE plpgsql AS $$
+    DECLARE
+        v int;
+    BEGIN
+        UPDATE items SET x = x + 1 RETURNING x INTO v;
+        RETURN NEW;
+    END
+    $$;
+    CREATE TRIGGER trig_track AFTER INSERT ON trig FOR EACH ROW EXECUTE FUNCTION track();
+    INSERT INTO trig VALUES (1);
+}
+expect error {
+    query returned more than one row
+}
+
+test returning-star-into-new-writes-the-returned-row {
+    CREATE TABLE projects (name text, org_id int, created text);
+    CREATE TABLE private_projects (name text, org_id int, created text);
+    CREATE FUNCTION projects_on_insert() RETURNS trigger LANGUAGE plpgsql AS $$
+    BEGIN
+        INSERT INTO private_projects (name, org_id, created)
+        VALUES (upper(NEW.name), NEW.org_id, coalesce(NEW.created, 'today'))
+        RETURNING * INTO NEW;
+        RETURN NEW;
+    END
+    $$;
+    CREATE TRIGGER projects_insert BEFORE INSERT ON projects FOR EACH ROW EXECUTE FUNCTION projects_on_insert();
+    INSERT INTO projects VALUES ('a', 1, NULL), ('b', 2, 'monday');
+    SELECT name, org_id, created FROM projects ORDER BY name;
+    SELECT name, org_id, created FROM private_projects ORDER BY name;
+}
+expect {
+    A|1|today
+    B|2|monday
+    A|1|today
+    B|2|monday
+}
+
+test returning-into-in-a-branch-that-does-not-run-changes-nothing {
+    CREATE TABLE items (id int PRIMARY KEY, x int);
+    CREATE TABLE trig (id int);
+    CREATE TABLE log (msg text);
+    INSERT INTO items VALUES (1, 10);
+    CREATE FUNCTION track() RETURNS trigger LANGUAGE plpgsql AS $$
+    DECLARE
+        v int := 5;
+    BEGIN
+        IF NEW.id > 1 THEN
+            UPDATE items SET x = x + 1 WHERE id = 1 RETURNING x INTO v;
+        END IF;
+        INSERT INTO log VALUES (NEW.id || ' ' || v);
+        RETURN NEW;
+    END
+    $$;
+    CREATE TRIGGER trig_track AFTER INSERT ON trig FOR EACH ROW EXECUTE FUNCTION track();
+    INSERT INTO trig VALUES (1), (2);
+    SELECT msg FROM log ORDER BY msg;
+}
+expect {
+    1 5
+    2 11
+}
