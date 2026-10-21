@@ -603,15 +603,22 @@ fn test_delete_collects_rowids_first_only_when_foreign_keys_are_on(
     conn.execute(
         "CREATE TABLE child(id INTEGER PRIMARY KEY, pid INTEGER REFERENCES parent(id) ON DELETE CASCADE)",
     )?;
-    let delete_uses_rowset = |conn: &Arc<Connection>| {
-        limbo_exec_rows(conn, "EXPLAIN DELETE FROM parent WHERE id > 5")
+    conn.execute("CREATE TABLE plain_parent(id INTEGER PRIMARY KEY)")?;
+    conn.execute(
+        "CREATE TABLE plain_child(id INTEGER PRIMARY KEY, \
+         a INTEGER REFERENCES plain_parent(id) ON DELETE NO ACTION, \
+         b INTEGER REFERENCES plain_parent(id) ON DELETE RESTRICT)",
+    )?;
+    let delete_uses_rowset = |conn: &Arc<Connection>, table: &str| {
+        limbo_exec_rows(conn, &format!("EXPLAIN DELETE FROM {table} WHERE id > 5"))
             .iter()
             .any(|row| row[1] == RValue::Text("RowSetAdd".to_string()))
     };
 
-    assert!(!delete_uses_rowset(&conn));
+    assert!(!delete_uses_rowset(&conn, "parent"));
     conn.execute("PRAGMA foreign_keys = ON")?;
-    assert!(delete_uses_rowset(&conn));
+    assert!(delete_uses_rowset(&conn, "parent"));
+    assert!(!delete_uses_rowset(&conn, "plain_parent"));
     Ok(())
 }
 
