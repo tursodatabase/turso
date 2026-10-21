@@ -2277,6 +2277,17 @@ impl Connection {
                         Ok(IOResult::Done(()))
                     })
                     .err()
+            } else if self.get_sync_mode() == SyncMode::Full && wal.is_dirty() {
+                let synced = wal
+                    .sync(pager.get_sync_type())
+                    .and_then(|c| pager.io.wait_for_completion(c));
+                if let Err(err) = &synced {
+                    assert!(
+                        self.get_data_sync_retry(),
+                        "fsync error (data_sync_retry=off): {err:?}"
+                    );
+                }
+                synced.err()
             } else {
                 None
             };
