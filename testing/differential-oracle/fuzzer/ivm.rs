@@ -486,6 +486,17 @@ impl IvmState {
     pub fn check_views(&self, turso_conn: &Arc<turso_core::Connection>) -> OracleResult {
         let mut failures = Vec::new();
         for view in &self.views {
+            match turso_conn.materialized_view_rows_depend_on_chosen_values(&view.name) {
+                Ok(false) => {}
+                Ok(true) => continue,
+                Err(error) => {
+                    failures.push(format!(
+                        "IVM check: planning {} failed: {error}\n  definition: {}",
+                        view.name, view.definition
+                    ));
+                    continue;
+                }
+            }
             let view_sql = format!("SELECT * FROM \"{}\"", view.name);
             let view_result = DifferentialOracle::execute_turso(turso_conn, &view_sql);
             let query_result = DifferentialOracle::execute_turso(turso_conn, &view.definition);

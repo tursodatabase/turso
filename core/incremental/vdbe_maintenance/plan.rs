@@ -928,7 +928,33 @@ impl MaintenancePlan {
     /// value is not reported.
     #[cfg(feature = "test_helper")]
     pub(crate) fn chosen_value_collations(&self) -> Vec<Option<CollationSeq>> {
+        self.chosen_values().columns
+    }
+
+    /// Whether which rows the view holds, not only which values they show,
+    /// depends on a value SQL leaves open. That happens when a value chosen
+    /// under one collation is a key under another non-binary collation: a
+    /// DISTINCT under RTRIM may show 'X' or 'X  ', and a UNION under NOCASE
+    /// above it then keeps one row beside 'x' or two.
+    #[cfg(feature = "test_helper")]
+    pub(crate) fn rows_depend_on_chosen_values(&self) -> bool {
+        self.chosen_values().rows_depend_on_choice
+    }
+
+    #[cfg(feature = "test_helper")]
+    fn chosen_values(&self) -> ChosenValues {
         let dag = &self.dag;
+        let mut rows_depend_on_choice = false;
+        // A key compared under `key` can put values that `chosen` keeps apart
+        // into one class.
+        let mut note_key_over_chosen = |key: dag::KeyColumn, chosen: Option<CollationSeq>| {
+            if chosen.is_some_and(|chosen| {
+                chosen != key.collation
+                    && !matches!(key.collation, CollationSeq::Binary | CollationSeq::Unset)
+            }) {
+                rows_depend_on_choice = true;
+            }
+        };
         let mut chosen: Vec<Vec<Option<CollationSeq>>> = Vec::with_capacity(dag.nodes.len());
         // The collation of input column `expr` when it passes on a chosen
         // value unchanged.
@@ -989,6 +1015,13 @@ impl MaintenancePlan {
                             passed_on(&chosen, *input, expr)
                         }
                     };
+                    for (expr, key) in group_exprs.iter().zip(group_keys) {
+                        let compared = match expr {
+                            ast::Expr::Collate(inner, _) => inner,
+                            expr => expr,
+                        };
+                        note_key_over_chosen(*key, passed_on(&chosen, *input, compared));
+                    }
                     group_exprs
                         .iter()
                         .zip(group_keys)
@@ -1014,20 +1047,36 @@ impl MaintenancePlan {
                     inputs,
                     key_columns,
                     ..
-                } => (0..width)
-                    .map(|index| {
-                        key_columns
-                            .get(index)
-                            .filter(|key| key.ambiguous)
-                            .map(|key| key.collation)
-                            .or_else(|| inputs.iter().find_map(|input| chosen[*input][index]))
-                    })
-                    .collect(),
+                } => {
+                    for (index, key) in key_columns.iter().enumerate() {
+                        for input in inputs {
+                            note_key_over_chosen(*key, chosen[*input][index]);
+                        }
+                    }
+                    (0..width)
+                        .map(|index| {
+                            key_columns
+                                .get(index)
+                                .filter(|key| key.ambiguous)
+                                .map(|key| key.collation)
+                                .or_else(|| inputs.iter().find_map(|input| chosen[*input][index]))
+                        })
+                        .collect()
+                }
             };
             chosen.push(columns);
         }
-        chosen.swap_remove(dag.root)
+        ChosenValues {
+            columns: chosen.swap_remove(dag.root),
+            rows_depend_on_choice,
+        }
     }
+}
+
+#[cfg(feature = "test_helper")]
+struct ChosenValues {
+    columns: Vec<Option<CollationSeq>>,
+    rows_depend_on_choice: bool,
 }
 
 /// Validate a view and build its executable maintenance plan.
