@@ -20228,6 +20228,11 @@ fn op_vacuum_into_inner(program: &Program, state: &mut ProgramState, insn: &Insn
                 } else {
                     Arc::new(crate::io::PlatformIO::new()?)
                 };
+                let dest_path = if output_in_memory {
+                    crate::util::MEMORY_PATH
+                } else {
+                    dest_path
+                };
                 let page_codec = source_pager.page_codec_external();
                 let output_db = match &page_codec {
                     Some(codec) => crate::Database::open(

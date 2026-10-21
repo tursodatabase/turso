@@ -2680,6 +2680,7 @@ fn test_plain_vacuum_preserves_mvcc_after_reopen(tmp_db: TempDatabase) -> anyhow
     Ok(())
 }
 
+#[cfg(not(windows))]
 #[turso_macros::test]
 fn test_vacuum_into_names_that_are_not_exactly_memory_create_files(
     tmp_db: TempDatabase,

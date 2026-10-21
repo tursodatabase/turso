@@ -87,11 +87,7 @@ pub fn open_mv_store(
             storage
         } else {
             let db_path = db_path.as_ref();
-            let log_path = if db_path.as_os_str().is_empty() {
-                std::path::PathBuf::from(".db-log")
-            } else {
-                db_path.with_extension("db-log")
-            };
+            let log_path = db_path.with_extension("db-log");
             let string_path = log_path
                 .as_os_str()
                 .to_str()
