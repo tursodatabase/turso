@@ -749,12 +749,13 @@ pub(crate) struct HiddenTableDef {
     pub(crate) primary_key_index: bool,
 }
 
-/// An index a view creates on one of its base tables so that its joins can
-/// look that table up by key. The view owns it: DROP VIEW drops it, and its
-/// reserved name keeps users from dropping it. The table's ordinary write
-/// path keeps it up to date.
+/// An index materialized views create on a base table so that their joins
+/// can look that table up by key. Views that need the same index share it:
+/// DROP VIEW drops it once no remaining view needs it, and its reserved name
+/// keeps users from dropping it. The table's ordinary write path keeps it
+/// up to date.
 #[derive(Debug, Clone)]
-pub(crate) struct OwnedIndexDef {
+pub(crate) struct JoinKeyIndexDef {
     pub(crate) index_name: String,
     pub(crate) table_name: String,
     pub(crate) create_sql: String,
@@ -891,7 +892,7 @@ pub(crate) struct MaintenancePlan {
     operator_states: OperatorStateCatalog,
     output_arity: usize,
     version_marker: HiddenTableDef,
-    owned_indexes: Vec<OwnedIndexDef>,
+    join_key_indexes: Vec<JoinKeyIndexDef>,
 }
 
 impl MaintenancePlan {
@@ -911,8 +912,8 @@ impl MaintenancePlan {
         std::iter::once(&self.version_marker).chain(self.operator_states.hidden_tables())
     }
 
-    pub(crate) fn owned_indexes(&self) -> &[OwnedIndexDef] {
-        &self.owned_indexes
+    pub(crate) fn join_key_indexes(&self) -> &[JoinKeyIndexDef] {
+        &self.join_key_indexes
     }
 
     /// For each view column: the collation under which the value it shows
@@ -1058,31 +1059,30 @@ pub(crate) fn plan_view(
     let operator_states = plan_operator_states(view_name, &dag, resolver)?;
     let output_arity = dag.root_schema().len();
     let version_marker = version_marker_table(view_name);
-    let owned_indexes = plan_owned_indexes(view_name, &dag, &operator_states, resolver)?;
+    let join_key_indexes = plan_join_key_indexes(&dag, &operator_states, resolver)?;
     Ok(MaintenancePlan {
         dag,
         operator_states,
         output_arity,
         version_marker,
-        owned_indexes,
+        join_key_indexes,
     })
 }
 
-/// The indexes the view's inner joins need on base tables that have no
-/// usable index for their join keys (see `needed_join_key_indexes`). Two
-/// joins that need the same index share it.
-fn plan_owned_indexes(
-    view_name: &str,
+/// The indexes the view's inner joins need on base tables that have no user
+/// index for their join keys (see `needed_join_key_indexes`). An index is
+/// named after its table and a hash of its definition, so every view that
+/// needs the same index names the same one and they all share it.
+fn plan_join_key_indexes(
     dag: &dag::MaintenanceDag,
     operator_states: &OperatorStateCatalog,
     resolver: &Resolver,
-) -> Result<Vec<OwnedIndexDef>> {
+) -> Result<Vec<JoinKeyIndexDef>> {
     use crate::incremental::view::DBSP_CIRCUIT_VERSION;
 
     let schema = resolver.schema();
-    let mut owned: Vec<OwnedIndexDef> = Vec::new();
-    let mut planned = Vec::new();
-    for (node_id, node) in dag.nodes.iter().enumerate() {
+    let mut indexes: Vec<JoinKeyIndexDef> = Vec::new();
+    for node in &dag.nodes {
         let dag::OpNode::Join {
             inputs,
             on,
@@ -1116,15 +1116,6 @@ fn plan_owned_indexes(
         for needed in
             super::join::needed_join_key_indexes(&key_inputs, &tables, on, schema, resolver)?
         {
-            let key = (
-                needed.table.name.clone(),
-                needed.columns.clone(),
-                needed.where_sql.clone(),
-            );
-            if planned.contains(&key) {
-                continue;
-            }
-            planned.push(key);
             let columns = needed
                 .columns
                 .iter()
@@ -1142,24 +1133,31 @@ fn plan_owned_indexes(
                 .as_ref()
                 .map(|where_sql| format!(" WHERE {where_sql}"))
                 .unwrap_or_default();
-            let index_name = format!(
-                "{}{DBSP_CIRCUIT_VERSION}_{view_name}__n{node_id}__i{}",
-                crate::schema::DBSP_INDEX_PREFIX,
-                owned.len()
-            );
-            let create_sql = format!(
-                "CREATE INDEX {} ON {}({columns}){where_clause}",
-                ast::Name::exact(index_name.clone()).as_ident(),
+            let definition = format!(
+                "{}({columns}){where_clause}",
                 ast::Name::exact(needed.table.name.clone()).as_ident(),
             );
-            owned.push(OwnedIndexDef {
+            let index_name = format!(
+                "{}{DBSP_CIRCUIT_VERSION}_{}__{:016x}",
+                crate::schema::DBSP_INDEX_PREFIX,
+                needed.table.name,
+                twox_hash::XxHash3_64::oneshot(definition.as_bytes()),
+            );
+            if indexes.iter().any(|index| index.index_name == index_name) {
+                continue;
+            }
+            let create_sql = format!(
+                "CREATE INDEX {} ON {definition}",
+                ast::Name::exact(index_name.clone()).as_ident(),
+            );
+            indexes.push(JoinKeyIndexDef {
                 index_name,
                 table_name: needed.table.name.clone(),
                 create_sql,
             });
         }
     }
-    Ok(owned)
+    Ok(indexes)
 }
 
 /// Turn every correlated subquery the regular planner can rewrite into a join

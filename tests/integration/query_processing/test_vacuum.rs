@@ -4756,6 +4756,10 @@ const MATERIALIZED_VIEW_FIXTURE: &[(&str, &str)] = &[
         "vk",
         "SELECT t.a, u.n FROM t JOIN u ON t.g = u.k WHERE t.b > 50",
     ),
+    (
+        "vk2",
+        "SELECT t.b, u.k FROM t JOIN u ON u.k = t.g WHERE t.b > 50",
+    ),
 ];
 
 /// Plain VACUUM keeps materialized views, their internal state tables, and

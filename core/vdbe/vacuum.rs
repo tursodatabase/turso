@@ -113,10 +113,9 @@ impl SchemaEntry {
         crate::schema::is_materialized_view_state_table(&self.name)
     }
 
-    /// True for the indexes a materialized view creates on its base tables'
-    /// join keys. Replaying the view's `CREATE MATERIALIZED VIEW` creates
-    /// them again.
-    pub fn is_materialized_view_owned_index(&self) -> bool {
+    /// True for the indexes materialized views create on their base tables'
+    /// join keys. Replaying the first view that needs one creates it again.
+    pub fn is_materialized_view_join_key_index(&self) -> bool {
         self.name.starts_with(crate::schema::DBSP_INDEX_PREFIX)
     }
 }
@@ -136,7 +135,7 @@ pub(crate) fn classify_schema_entries(
     for (idx, entry) in entries.iter().enumerate() {
         match entry.entry_type {
             SchemaEntryType::Table if entry.is_materialized_view_state_table() => {}
-            SchemaEntryType::Index if entry.is_materialized_view_owned_index() => {}
+            SchemaEntryType::Index if entry.is_materialized_view_join_key_index() => {}
             SchemaEntryType::Table if entry.is_storage_backed() => {
                 // Skip sqlite_sequence and AUTOINCREMENT implicit sequence
                 // backing tables in the schema creation phase: both are

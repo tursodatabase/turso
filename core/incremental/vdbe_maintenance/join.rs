@@ -12,7 +12,7 @@ use super::stream::{
 use super::MaintenanceInput;
 use crate::alloc::TursoIteratorExt;
 use crate::incremental::dag;
-use crate::schema::{BTreeTable, Index, IndexColumn, Schema};
+use crate::schema::{BTreeTable, Index, IndexColumn, Schema, DBSP_INDEX_PREFIX};
 use crate::sync::Arc;
 use crate::translate::collate::{get_expr_collation_ctx_with_symbols, CollationSeq};
 use crate::translate::emitter::Resolver;
@@ -1107,6 +1107,7 @@ fn plan_phase(
                 keys,
                 &level_keys,
                 input_wheres[input].as_deref(),
+                |_| true,
             )
             .unwrap_or(LevelAccess::ScanAndProbe);
             let rank = match access {
@@ -2204,10 +2205,12 @@ pub(super) struct JoinKeyIndex {
 /// its rows by key, the way Materialize arranges every join input by its
 /// join key. For each base-table input and each other input it shares `=`
 /// terms with, an index on this input's compared columns is needed unless a
-/// rowid or an existing index already serves those keys. A key whose column
-/// affinity would make the index sort values differently from how `=`
-/// compares them is left out (`Affinity::index_affinity_ok`); a level whose
-/// keys are all left out keeps reading its table whole.
+/// rowid or a user index already serves those keys. Indexes that views
+/// created count as missing, so every view that needs one lists it and
+/// DROP VIEW can tell whether any remaining view still needs it. A key
+/// whose column affinity would make the index sort values differently from
+/// how `=` compares them is left out (`Affinity::index_affinity_ok`); a
+/// level whose keys are all left out keeps reading its table whole.
 ///
 /// `tables[i]` is the base table of input `i` when the view may index it:
 /// a plain scan of a table, not a derived input or a materialized view.
@@ -2261,6 +2264,7 @@ pub(super) fn needed_join_key_indexes(
                     &keys,
                     &shared_keys,
                     where_sql.as_deref(),
+                    |index| !index.name.starts_with(DBSP_INDEX_PREFIX),
                 )
                 .is_some()
             {
@@ -2686,7 +2690,8 @@ fn join_key_column(inputs: &[KeyInput], expr: &ast::Expr) -> Option<(usize, Join
 /// `level_keys` (indexes into `keys`) match. An index column is usable only
 /// when it sorts values the way `=` compares them: the same collation, and
 /// an affinity under which the comparison does not convert the stored values
-/// (SQLite's `sqlite3IndexAffinityOk`).
+/// (SQLite's `sqlite3IndexAffinityOk`). Only indexes `may_use` accepts
+/// are considered.
 fn persistent_key_access(
     schema: &Schema,
     arrangement: &ArrangementHandle,
@@ -2694,6 +2699,7 @@ fn persistent_key_access(
     keys: &[JoinKey],
     level_keys: &[usize],
     input_where: Option<&str>,
+    may_use: impl Fn(&Index) -> bool,
 ) -> Option<LevelAccess> {
     let table = arrangement.table();
     if !table.has_rowid {
@@ -2724,7 +2730,10 @@ fn persistent_key_access(
     }
 
     let mut best: Option<(Arc<Index>, Vec<usize>)> = None;
-    for index in schema.get_indices(&table.name) {
+    for index in schema
+        .get_indices(&table.name)
+        .filter(|index| may_use(index))
+    {
         // A partial index holds only the rows its WHERE accepts. It serves
         // the level when that WHERE is exactly the terms the level checks on
         // this input anyway, so the rows it leaves out could never match.
@@ -2796,7 +2805,6 @@ fn emit_key_affinity(
 #[cfg(test)]
 mod tests {
     use super::super::{compile_maintenance_program, MaintenanceInput};
-    use crate::incremental::view::owned_index_belongs_to_view;
     use crate::sync::Arc;
     use crate::vdbe::builder::CursorType;
     use crate::vdbe::insn::Insn;
@@ -2892,7 +2900,7 @@ mod tests {
         let mut owned: Vec<(String, Option<String>)> = ["t1", "t2", "t3", "t4", "t5", "t6"]
             .into_iter()
             .flat_map(|table| schema.get_indices(table).cloned().collect::<Vec<_>>())
-            .filter(|index| owned_index_belongs_to_view(&index.name, "v"))
+            .filter(|index| index.name.starts_with(crate::schema::DBSP_INDEX_PREFIX))
             .map(|index| {
                 (
                     index.table_name.clone(),
@@ -2913,6 +2921,39 @@ mod tests {
 
         let maintenance = compile_view_program(&conn, "v", MaintenanceInput::TransactionDelta);
         assert_eq!(stored_table_full_reads(&maintenance), Vec::<String>::new());
+    }
+
+    /// Two views that need the same index share it, and dropping one keeps
+    /// the index the other still reads its matches through.
+    #[test]
+    fn views_share_a_join_key_index() {
+        let conn = open_views_db("shared-join-key-index.db");
+        conn.execute("CREATE TABLE parent(id INTEGER PRIMARY KEY, name TEXT)")
+            .unwrap();
+        conn.execute("CREATE TABLE child(pid INT, v INT)").unwrap();
+        for view in ["v1", "v2"] {
+            conn.execute(format!(
+                "CREATE MATERIALIZED VIEW {view} AS \
+                 SELECT c.v, p.name FROM child c JOIN parent p ON c.pid = p.id"
+            ))
+            .unwrap();
+        }
+        let join_key_indexes = |conn: &Arc<Connection>| {
+            conn.schema
+                .read()
+                .get_indices("child")
+                .filter(|index| index.name.starts_with(crate::schema::DBSP_INDEX_PREFIX))
+                .count()
+        };
+        assert_eq!(join_key_indexes(&conn), 1);
+
+        conn.execute("DROP VIEW v1").unwrap();
+        assert_eq!(join_key_indexes(&conn), 1);
+        let maintenance = compile_view_program(&conn, "v2", MaintenanceInput::TransactionDelta);
+        assert_eq!(stored_table_full_reads(&maintenance), Vec::<String>::new());
+
+        conn.execute("DROP VIEW v2").unwrap();
+        assert_eq!(join_key_indexes(&conn), 0);
     }
 
     fn open_views_db(name: &str) -> Arc<Connection> {
