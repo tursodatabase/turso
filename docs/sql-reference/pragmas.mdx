@@ -186,6 +186,29 @@ Similar to `index_info` but includes additional columns.
 PRAGMA index_xinfo(index-name);
 ```
 
+### foreign_key_list
+
+Returns one row per parent key column of each foreign key constraint on a table. `id`
+numbers the constraints, `seq` is the position of the column within that constraint, and
+`from` and `to` are the child and parent columns. `on_update` and `on_delete` are
+`NO ACTION` unless the constraint declares an action, and `match` is always `NONE`.
+Constraints are reported newest declaration first, so a table-level `FOREIGN KEY` clause
+written last has `id` 0.
+
+```sql
+PRAGMA foreign_key_list(child);
+-- id | seq | table  | from     | to   | on_update | on_delete | match
+```
+
+An optional schema qualifier selects the database, and the same rows are available as the
+`pragma_foreign_key_list()` table-valued function. A name that is not a table with
+foreign keys, and a missing table argument, return no rows rather than an error.
+
+```sql
+PRAGMA main.foreign_key_list(child);
+SELECT * FROM pragma_foreign_key_list('child');
+```
+
 ### function_list
 
 Returns one row for each SQL function available.
