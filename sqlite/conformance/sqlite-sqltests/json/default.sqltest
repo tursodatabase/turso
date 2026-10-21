@@ -100,6 +100,18 @@ expect {
     {"aaa":123}
 }
 
+test json5-line-comment-ends-at-any-line-terminator {
+    SELECT json('[1,// c' || char(13) || '2]'),
+           json('[1,// c' || char(0x2028) || '2]'),
+           json('[1,// c' || char(0x2029) || '2]'),
+           json('[1,// c' || char(10) || '2]'),
+           json('[1,// c' || char(13, 10) || '2]'),
+           json('{a:// c' || char(0x2028) || '1}');
+}
+expect {
+    [1,2]|[1,2]|[1,2]|[1,2]|[1,2]|{"a":1}
+}
+
 test json5-ecma-script-1-pretty {
     select json_pretty('{a:5,b:6}') ;
 }
