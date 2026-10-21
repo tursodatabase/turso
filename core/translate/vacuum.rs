@@ -73,9 +73,6 @@ fn extract_path_from_expr(expr: &Expr) -> Result<String> {
         Expr::Literal(Literal::String(s)) => {
             // Remove surrounding quotes if present
             let path = s.trim_matches('\'').trim_matches('"');
-            if path.is_empty() {
-                bail_parse_error!("VACUUM INTO path cannot be empty");
-            }
             Ok(path.to_string())
         }
         Expr::Id(name) => {
@@ -111,11 +108,5 @@ mod tests {
         let expr = Expr::Id(Name::exact("myfile".to_string()));
         let path = extract_path_from_expr(&expr).unwrap();
         assert_eq!(path, "myfile");
-    }
-
-    #[test]
-    fn test_extract_path_empty_fails() {
-        let expr = Expr::Literal(Literal::String("''".to_string()));
-        assert!(extract_path_from_expr(&expr).is_err());
     }
 }

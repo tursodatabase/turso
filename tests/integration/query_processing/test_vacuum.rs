@@ -2680,6 +2680,32 @@ fn test_plain_vacuum_preserves_mvcc_after_reopen(tmp_db: TempDatabase) -> anyhow
     Ok(())
 }
 
+#[turso_macros::test]
+fn test_vacuum_into_names_that_are_not_exactly_memory_create_files(
+    tmp_db: TempDatabase,
+) -> anyhow::Result<()> {
+    let conn = tmp_db.connect_limbo();
+    conn.execute("CREATE TABLE t (a INTEGER)")?;
+    conn.execute("INSERT INTO t VALUES (1)")?;
+
+    for dest in [":memory:vacuum_into_target.db", " :memory:", ":memory: "] {
+        let dest_path = Path::new(dest);
+        let wal_path = format!("{dest}-wal");
+        let _ = std::fs::remove_file(dest_path);
+        let _ = std::fs::remove_file(&wal_path);
+
+        let result = conn.execute(format!("VACUUM INTO '{dest}'"));
+        let file_created = dest_path.exists();
+        let _ = std::fs::remove_file(dest_path);
+        let _ = std::fs::remove_file(&wal_path);
+
+        result?;
+        assert!(file_created, "VACUUM INTO '{dest}' should create a file");
+    }
+
+    Ok(())
+}
+
 #[test]
 fn test_vacuum_into_from_memory_database() -> anyhow::Result<()> {
     use std::sync::Arc;

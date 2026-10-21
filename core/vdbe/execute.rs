@@ -20159,8 +20159,11 @@ fn op_vacuum_into_inner(program: &Program, state: &mut ProgramState, insn: &Insn
                     .into());
                 }
 
-                // we always vacuum into a new file, so check if it exists
-                if std::path::Path::new(dest_path).exists() {
+                // Like SQLite, only the exact names ':memory:' and '' are
+                // in-memory targets; any other name is a file to create.
+                let output_in_memory =
+                    dest_path.is_empty() || dest_path == crate::util::MEMORY_PATH;
+                if !output_in_memory && std::path::Path::new(dest_path).exists() {
                     return Err(LimboError::ParseError(format!(
                         "output file already exists: {dest_path}"
                     ))
@@ -20222,9 +20225,11 @@ fn op_vacuum_into_inner(program: &Program, state: &mut ProgramState, insn: &Insn
                 // can resolve custom types, generated columns, vtab modules, etc.
                 let output_opts = vacuum_target_opts_from_source(&source_db);
 
-                // Always use PlatformIO for the output file, even if source
-                // is in-memory. This ensures VACUUM INTO writes to disk.
-                let io: Arc<dyn crate::IO> = Arc::new(crate::io::PlatformIO::new()?);
+                let io: Arc<dyn crate::IO> = if output_in_memory {
+                    Arc::new(crate::MemoryIO::new())
+                } else {
+                    Arc::new(crate::io::PlatformIO::new()?)
+                };
                 let page_codec = source_pager.page_codec_external();
                 let output_db = match &page_codec {
                     Some(codec) => crate::Database::open(

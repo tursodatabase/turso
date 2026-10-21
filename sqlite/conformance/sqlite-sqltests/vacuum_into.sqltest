@@ -1,11 +1,16 @@
 @database :memory:
 
-@backend rust
-test vacuum-into-empty-path-rejected {
+test vacuum-into-memory-and-empty-path {
+    CREATE TABLE t(a);
+    INSERT INTO t VALUES (1);
+    VACUUM INTO ':memory:';
+    VACUUM INTO ':memory:';
     VACUUM INTO '';
+    VACUUM INTO '';
+    SELECT count(*) FROM t;
 }
-expect error {
-    VACUUM INTO path cannot be empty
+expect {
+    1
 }
 
 @backend rust

@@ -88,6 +88,7 @@ In addition to the [common requirements](#common-requirements):
 - The destination file must not already exist. Delete or move it first if you want to overwrite.
 - The path must be provided as a string literal in the SQL statement.
 - `VACUUM temp INTO filename` is a no-op and does not create a file, matching SQLite's behavior.
+- `VACUUM INTO ':memory:'` and `VACUUM INTO ''` build the copy in an in-memory database that is discarded when the statement finishes, so no file is created. Only these exact names do this: any other name, such as `':memory:backup'`, is used as a file name.
 
 `VACUUM INTO` takes a consistent view of the source by starting an implicit read transaction for the duration of the copy, so the destination always reflects a single snapshot of the source even if other connections write to it during the copy.
 
@@ -154,7 +155,6 @@ VACUUM;
 | `cannot VACUUM while experimental multiprocess WAL is active in another process` | In-place `VACUUM` while another process holds the multi-process WAL. |
 | `cannot VACUUM an MVCC database with uncheckpointed changes; run PRAGMA wal_checkpoint(TRUNCATE) first` | In-place `VACUUM` on an MVCC database with pending log entries. |
 | `output file already exists: <path>` | The destination for `VACUUM INTO` already exists. |
-| `VACUUM INTO path cannot be empty` | `VACUUM INTO ''` was used. |
 | `VACUUM INTO requires a string literal path` | A non-literal expression (for example a bind parameter) was used for the destination. |
 | `no such database: <name>` | `VACUUM <schema> INTO` referenced an unknown schema. |
 
