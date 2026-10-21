@@ -369,6 +369,15 @@ fn try_prepare_special(pg_conn: &Arc<PgConnectionInner>, sql: &str) -> Result<Op
             crate::trigger::drop_trigger(&pg_conn.conn, drop, &session_search_path(pg_conn))?;
             return Ok(Some(noop_statement(&pg_conn.conn)?));
         }
+        Some(pg_query::protobuf::node::Node::DropStmt(drop))
+            if drop.remove_type() == pg_query::protobuf::ObjectType::ObjectFunction =>
+        {
+            crate::trigger::drop_triggers_of_dropped_functions(
+                &pg_conn.conn,
+                drop,
+                &session_search_path(pg_conn),
+            )?;
+        }
         _ => {}
     }
 

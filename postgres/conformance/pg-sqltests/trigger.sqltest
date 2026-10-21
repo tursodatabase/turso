@@ -8,6 +8,355 @@ setup log_table {
 }
 
 @setup log_table
+test after-insert-trigger-writes-to-another-table {
+    CREATE FUNCTION log_row() RETURNS trigger LANGUAGE plpgsql AS $$
+    BEGIN
+        INSERT INTO log VALUES (TG_OP, NEW.id, NEW.a);
+        RETURN NULL;
+    END
+    $$;
+    CREATE TRIGGER t_log AFTER INSERT ON t FOR EACH ROW EXECUTE FUNCTION log_row();
+    INSERT INTO t VALUES (1, 'one'), (2, 'two');
+    SELECT op, id, a FROM log ORDER BY id;
+}
+expect {
+    INSERT|1|one
+    INSERT|2|two
+}
+
+@setup log_table
+test new-is-null-in-delete-and-old-is-null-in-insert {
+    CREATE FUNCTION log_row() RETURNS trigger LANGUAGE plpgsql AS $$
+    BEGIN
+        INSERT INTO log VALUES (TG_OP, NEW.id, OLD.a);
+        RETURN NULL;
+    END
+    $$;
+    CREATE TRIGGER t_log AFTER INSERT OR DELETE ON t FOR EACH ROW EXECUTE FUNCTION log_row();
+    INSERT INTO t VALUES (1, 'one'), (2, 'two');
+    DELETE FROM t WHERE id = 1;
+    SELECT op, coalesce(id::text, 'null'), coalesce(a, 'null') FROM log ORDER BY op, id;
+}
+expect {
+    DELETE|null|one
+    INSERT|1|null
+    INSERT|2|null
+}
+
+@setup log_table
+test after-update-trigger-reads-old-and-new {
+    CREATE FUNCTION log_change() RETURNS trigger LANGUAGE plpgsql AS $$
+    BEGIN
+        INSERT INTO log VALUES (OLD.a || ' -> ' || NEW.a, NEW.id, TG_WHEN);
+        RETURN NEW;
+    END
+    $$;
+    CREATE TRIGGER t_change AFTER UPDATE ON t FOR EACH ROW EXECUTE FUNCTION log_change();
+    INSERT INTO t VALUES (1, 'one'), (2, 'two');
+    UPDATE t SET a = upper(a) WHERE id = 2;
+    SELECT op, id, a FROM log;
+}
+expect {
+    two -> TWO|2|AFTER
+}
+
+@setup log_table
+test star-of-a-subquery-reads-the-fields-of-new {
+    CREATE FUNCTION log_row() RETURNS trigger LANGUAGE plpgsql AS $$
+    BEGIN
+        INSERT INTO log SELECT * FROM (SELECT TG_OP, NEW.id, NEW.a) AS s;
+        RETURN NULL;
+    END
+    $$;
+    CREATE TRIGGER t_log AFTER INSERT ON t FOR EACH ROW EXECUTE FUNCTION log_row();
+    INSERT INTO t VALUES (1, 'one');
+    SELECT op, id, a FROM log;
+}
+expect {
+    INSERT|1|one
+}
+
+@setup log_table
+test trigger-function-reads-the-trigger-variables {
+    CREATE FUNCTION log_row() RETURNS trigger LANGUAGE plpgsql AS $$
+    BEGIN
+        INSERT INTO log VALUES (TG_NAME || ' ' || TG_TABLE_NAME || ' ' || TG_TABLE_SCHEMA || ' ' || TG_LEVEL, TG_NARGS, TG_ARGV[0] || coalesce(TG_ARGV[1], '') || coalesce(TG_ARGV[2], '-'));
+        RETURN NULL;
+    END
+    $$;
+    CREATE TRIGGER t_log AFTER INSERT ON t FOR EACH ROW EXECUTE FUNCTION log_row('a', 'b');
+    INSERT INTO t VALUES (1, 'one');
+    SELECT op, id, a FROM log;
+}
+expect {
+    t_log t public ROW|2|ab-
+}
+
+@skip-if postgres "PostgreSQL has no array_element function"
+test array-element-of-tg-argv-without-a-subscript-errors {
+    CREATE TABLE items (id int PRIMARY KEY);
+    CREATE TABLE log (msg text);
+    CREATE FUNCTION log_argument() RETURNS trigger LANGUAGE plpgsql AS $$
+    BEGIN
+        INSERT INTO log VALUES (array_element(TG_ARGV));
+        RETURN NULL;
+    END
+    $$;
+    CREATE TRIGGER items_log AFTER INSERT ON items FOR EACH ROW EXECUTE FUNCTION log_argument('a');
+    INSERT INTO items VALUES (1);
+}
+expect error {
+    TG_ARGV without a subscript is not supported
+}
+
+@setup log_table
+test update-of-trigger-fires-only-for-the-listed-columns {
+    CREATE FUNCTION log_row() RETURNS trigger LANGUAGE plpgsql AS $$
+    BEGIN
+        INSERT INTO log VALUES (TG_OP, NEW.id, NEW.a);
+        RETURN NULL;
+    END
+    $$;
+    CREATE TRIGGER t_log AFTER UPDATE OF a ON t FOR EACH ROW EXECUTE FUNCTION log_row();
+    INSERT INTO t VALUES (1, 'one');
+    UPDATE t SET id = 2;
+    UPDATE t SET a = 'uno';
+    SELECT op, id, a FROM log;
+}
+expect {
+    UPDATE|2|uno
+}
+
+@setup log_table
+test trigger-when-clause-filters-rows {
+    CREATE FUNCTION log_row() RETURNS trigger LANGUAGE plpgsql AS $$
+    BEGIN
+        INSERT INTO log VALUES (TG_OP, NEW.id, NEW.a);
+        RETURN NULL;
+    END
+    $$;
+    CREATE TRIGGER t_log AFTER UPDATE ON t FOR EACH ROW
+        WHEN (OLD.a IS DISTINCT FROM NEW.a) EXECUTE FUNCTION log_row();
+    INSERT INTO t VALUES (1, 'one'), (2, 'two');
+    UPDATE t SET a = 'uno' WHERE id = 1;
+    UPDATE t SET id = 3 WHERE id = 2;
+    SELECT op, id, a FROM log;
+}
+expect {
+    UPDATE|1|uno
+}
+
+test when-clause-compares-the-whole-old-and-new-rows {
+    CREATE TABLE items (id int PRIMARY KEY, a text);
+    CREATE TABLE changes (msg text);
+    CREATE FUNCTION log_change() RETURNS trigger LANGUAGE plpgsql AS $$
+    BEGIN
+        INSERT INTO changes VALUES (TG_NAME || ' ' || NEW.id);
+        RETURN NULL;
+    END
+    $$;
+    INSERT INTO items VALUES (1, 'a'), (2, 'c');
+    CREATE TRIGGER star AFTER UPDATE ON items FOR EACH ROW WHEN (OLD.* IS DISTINCT FROM NEW.*) EXECUTE FUNCTION log_change();
+    CREATE TRIGGER whole AFTER UPDATE ON items FOR EACH ROW WHEN (OLD IS DISTINCT FROM NEW) EXECUTE FUNCTION log_change();
+    UPDATE items SET a = 'a';
+    ALTER TABLE items ADD COLUMN b int;
+    UPDATE items SET b = 5 WHERE id = 1;
+    SELECT msg FROM changes ORDER BY msg;
+}
+expect {
+    star 1
+    star 2
+    whole 1
+    whole 2
+}
+
+@skip-if postgres "PostgreSQL reads whole rows in any expression"
+test when-clause-with-a-whole-row-outside-a-comparison-errors {
+    CREATE TABLE items (id int PRIMARY KEY, a text);
+    CREATE FUNCTION do_nothing() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RETURN NULL; END $$;
+    CREATE TRIGGER json AFTER UPDATE ON items FOR EACH ROW WHEN (to_jsonb(NEW) IS NOT NULL) EXECUTE FUNCTION do_nothing();
+}
+expect error {
+    a whole row in WHEN is supported only in a comparison of OLD and NEW
+}
+
+@setup log_table
+test statements-after-return-do-not-run {
+    CREATE FUNCTION log_row() RETURNS trigger LANGUAGE plpgsql AS $$
+    BEGIN
+        INSERT INTO log VALUES ('first', NEW.id, NEW.a);
+        RETURN NULL;
+        INSERT INTO log VALUES ('second', NEW.id, NEW.a);
+    END
+    $$;
+    CREATE TRIGGER t_log AFTER INSERT ON t FOR EACH ROW EXECUTE FUNCTION log_row();
+    INSERT INTO t VALUES (1, 'one');
+    SELECT op FROM log;
+}
+expect {
+    first
+}
+
+@setup log_table
+test replaced-function-changes-the-trigger {
+    CREATE FUNCTION log_row() RETURNS trigger LANGUAGE plpgsql AS $$
+    BEGIN
+        INSERT INTO log VALUES ('old body', NEW.id, NEW.a);
+        RETURN NULL;
+    END
+    $$;
+    CREATE TRIGGER t_log AFTER INSERT ON t FOR EACH ROW EXECUTE FUNCTION log_row();
+    INSERT INTO t VALUES (1, 'one');
+    CREATE OR REPLACE FUNCTION log_row() RETURNS trigger LANGUAGE plpgsql AS $$
+    BEGIN
+        INSERT INTO log VALUES ('new body', NEW.id, NEW.a);
+        RETURN NULL;
+    END
+    $$;
+    INSERT INTO t VALUES (2, 'two');
+    SELECT op, id FROM log ORDER BY id;
+}
+expect {
+    old body|1
+    new body|2
+}
+
+@setup log_table
+test triggers-with-the-same-name-on-two-tables {
+    CREATE TABLE u (id int, a text);
+    CREATE FUNCTION log_row() RETURNS trigger LANGUAGE plpgsql AS $$
+    BEGIN
+        INSERT INTO log VALUES (TG_TABLE_NAME, NEW.id, NEW.a);
+        RETURN NULL;
+    END
+    $$;
+    CREATE TRIGGER log_it AFTER INSERT ON t FOR EACH ROW EXECUTE FUNCTION log_row();
+    CREATE TRIGGER log_it AFTER INSERT ON u FOR EACH ROW EXECUTE FUNCTION log_row();
+    INSERT INTO t VALUES (1, 'one');
+    INSERT INTO u VALUES (2, 'two');
+    DROP TRIGGER log_it ON t;
+    INSERT INTO t VALUES (3, 'three');
+    INSERT INTO u VALUES (4, 'four');
+    SELECT op, id FROM log ORDER BY id;
+}
+expect {
+    t|1
+    u|2
+    u|4
+}
+
+@setup log_table
+test create-or-replace-trigger-replaces-the-trigger {
+    CREATE FUNCTION log_row() RETURNS trigger LANGUAGE plpgsql AS $$
+    BEGIN
+        INSERT INTO log VALUES (TG_OP, coalesce(NEW.id, OLD.id), TG_ARGV[0]);
+        RETURN NULL;
+    END
+    $$;
+    CREATE TRIGGER t_log AFTER INSERT ON t FOR EACH ROW EXECUTE FUNCTION log_row('first');
+    CREATE OR REPLACE TRIGGER t_log AFTER DELETE ON t FOR EACH ROW EXECUTE FUNCTION log_row('second');
+    INSERT INTO t VALUES (1, 'one');
+    DELETE FROM t;
+    SELECT op, id, a FROM log;
+}
+expect {
+    DELETE|1|second
+}
+
+@setup log_table
+test renamed-table-keeps-its-trigger {
+    CREATE FUNCTION log_row() RETURNS trigger LANGUAGE plpgsql AS $$
+    BEGIN
+        INSERT INTO log VALUES (TG_TABLE_NAME, NEW.id, NEW.a);
+        RETURN NULL;
+    END
+    $$;
+    CREATE TRIGGER t_log AFTER INSERT ON t FOR EACH ROW EXECUTE FUNCTION log_row();
+    ALTER TABLE t RENAME TO renamed;
+    INSERT INTO renamed VALUES (1, 'one');
+    DROP TRIGGER t_log ON renamed;
+    INSERT INTO renamed VALUES (2, 'two');
+    SELECT op, id FROM log;
+}
+expect {
+    renamed|1
+}
+
+test trigger-name-of-a-renamed-table-can-be-used-again {
+    CREATE TABLE t (id int PRIMARY KEY);
+    CREATE TABLE log (msg text);
+    CREATE FUNCTION log_insert() RETURNS trigger LANGUAGE plpgsql AS $$
+    BEGIN
+        INSERT INTO log VALUES (TG_TABLE_NAME || ' ' || NEW.id);
+        RETURN NEW;
+    END
+    $$;
+    CREATE TRIGGER tr AFTER INSERT ON t FOR EACH ROW EXECUTE FUNCTION log_insert();
+    ALTER TABLE t RENAME TO t_old;
+    CREATE TABLE t (id int PRIMARY KEY);
+    CREATE TRIGGER tr AFTER INSERT ON t FOR EACH ROW EXECUTE FUNCTION log_insert();
+    INSERT INTO t VALUES (1);
+    INSERT INTO t_old VALUES (2);
+    SELECT msg FROM log ORDER BY msg;
+}
+expect {
+    t 1
+    t_old 2
+}
+
+# Schema databases are file-backed, so the tables are dropped before each
+# create to keep repeated test runs independent of old sidecar files.
+test trigger-on-a-table-in-a-schema-writes-to-public {
+    CREATE SCHEMA IF NOT EXISTS trigger_auth;
+    DROP TABLE IF EXISTS trigger_auth.users;
+    CREATE TABLE trigger_auth.users (id int primary key, raw_user_meta_data jsonb);
+    CREATE TABLE public.profiles (id int primary key, full_name text);
+    CREATE FUNCTION public.handle_new_user() RETURNS trigger AS $$
+    BEGIN
+        INSERT INTO public.profiles (id, full_name)
+        VALUES (NEW.id, NEW.raw_user_meta_data->>'full_name');
+        RETURN NEW;
+    END;
+    $$ LANGUAGE plpgsql SECURITY DEFINER;
+    CREATE TRIGGER on_auth_user_created AFTER INSERT ON trigger_auth.users
+        FOR EACH ROW EXECUTE PROCEDURE public.handle_new_user();
+    INSERT INTO trigger_auth.users VALUES (7, '{"full_name": "Ann Lee"}');
+    SELECT id, full_name FROM profiles;
+}
+expect {
+    7|Ann Lee
+}
+
+test trigger-keeps-the-function-that-create-trigger-found {
+    CREATE SCHEMA IF NOT EXISTS trigger_function_schema;
+    DROP FUNCTION IF EXISTS trigger_function_schema.which_function();
+    CREATE TABLE items (id int PRIMARY KEY);
+    CREATE TABLE log (msg text);
+    CREATE FUNCTION trigger_function_schema.which_function() RETURNS trigger LANGUAGE plpgsql AS $$
+    BEGIN
+        INSERT INTO public.log VALUES ('schema ' || NEW.id);
+        RETURN NEW;
+    END
+    $$;
+    CREATE FUNCTION which_function() RETURNS trigger LANGUAGE plpgsql AS $$
+    BEGIN
+        INSERT INTO public.log VALUES ('public ' || NEW.id);
+        RETURN NEW;
+    END
+    $$;
+    SET search_path = trigger_function_schema, public;
+    CREATE TRIGGER items_which AFTER INSERT ON public.items FOR EACH ROW EXECUTE FUNCTION which_function();
+    INSERT INTO public.items VALUES (1);
+    SET search_path = public;
+    INSERT INTO items VALUES (2);
+    SELECT msg FROM log ORDER BY msg;
+}
+expect {
+    schema 1
+    schema 2
+}
+
+@setup log_table
 test create-trigger-twice-errors {
     CREATE FUNCTION log_row() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RETURN NULL; END $$;
     CREATE TRIGGER t_log AFTER INSERT ON t FOR EACH ROW EXECUTE FUNCTION log_row();
@@ -51,6 +400,21 @@ expect {
     1
 }
 
+@setup log_table
+test select-without-into-in-a-trigger-function-errors {
+    CREATE FUNCTION bad() RETURNS trigger LANGUAGE plpgsql AS $$
+    BEGIN
+        SELECT 1;
+        RETURN NULL;
+    END
+    $$;
+    CREATE TRIGGER t_bad AFTER INSERT ON t FOR EACH ROW EXECUTE FUNCTION bad();
+    INSERT INTO t VALUES (1, 'one');
+}
+expect error {
+    query has no destination for result data
+}
+
 @skip-if postgres "PostgreSQL supports statement-level triggers"
 @setup log_table
 test statement-level-trigger-errors {
@@ -59,6 +423,24 @@ test statement-level-trigger-errors {
 }
 expect error {
     statement-level triggers are not supported
+}
+
+@skip-if postgres "PostgreSQL supports loops in trigger functions"
+@setup log_table
+test loop-in-a-trigger-function-errors-when-the-trigger-fires {
+    CREATE FUNCTION loops() RETURNS trigger LANGUAGE plpgsql AS $$
+    BEGIN
+        LOOP
+            EXIT;
+        END LOOP;
+        RETURN NULL;
+    END
+    $$;
+    CREATE TRIGGER t_loops AFTER INSERT ON t FOR EACH ROW EXECUTE FUNCTION loops();
+    INSERT INTO t VALUES (1, 'one');
+}
+expect error {
+    LOOP is not supported yet \(PL/pgSQL function loops\(\) line 3 at LOOP\)
 }
 
 @setup log_table

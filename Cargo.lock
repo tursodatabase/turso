@@ -7279,6 +7279,7 @@ dependencies = [
  "parking_lot",
  "pg_query",
  "rustc-hash 2.1.1",
+ "serde_json",
  "strum",
  "tempfile",
  "turso_core",

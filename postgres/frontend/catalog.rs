@@ -5,7 +5,7 @@ use std::fmt::Debug;
 use std::marker::PhantomData;
 use std::sync::Arc;
 use turso_core::{
-    dialect::{FunctionCatalog, POSTGRES_TABLE_SQL_PREFIX},
+    dialect::{FunctionCatalog, TriggerBody, POSTGRES_TABLE_SQL_PREFIX},
     native_ext::{VirtualTable, VirtualTableCursor, VirtualTableModule},
     schema::{BTreeTable, FunctionDef, Index, Schema, Table},
     Connection, Dialect, Func, IOResult, LimboError, OpenOptions, Result, Statement, Value,
@@ -163,6 +163,15 @@ impl Dialect for PostgresDialect {
         turso_core::dialect::sqlite::resolve_builtin_function(name, arg_count)
     }
 
+    fn trigger_body(
+        &self,
+        trigger: &turso_core::schema::Trigger,
+        table: &BTreeTable,
+        functions: &dyn FunctionCatalog,
+    ) -> Result<Option<TriggerBody>> {
+        crate::plpgsql::compile_trigger(trigger, table, functions)
+    }
+
     fn compile_function_call(
         &self,
         function: &FunctionDef,
@@ -182,6 +191,14 @@ impl Dialect for PostgresDialect {
 
     fn qualified_function_names(&self) -> bool {
         true
+    }
+
+    fn trigger_when_clause(
+        &self,
+        trigger: &turso_core::schema::Trigger,
+        table: &turso_core::schema::BTreeTable,
+    ) -> Result<Option<turso_parser::ast::Expr>> {
+        crate::trigger::trigger_when_clause(trigger, table)
     }
 }
 

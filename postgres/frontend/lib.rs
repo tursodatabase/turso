@@ -1,7 +1,9 @@
+mod ast_walk;
 mod catalog;
 mod copy;
 mod functions;
 mod options;
+mod plpgsql;
 mod session;
 mod sql_function;
 mod trigger;

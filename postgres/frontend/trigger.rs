@@ -1,11 +1,12 @@
 use crate::user_function::{Language, UserFunction};
 use pg_query::protobuf::node::Node;
-use pg_query::protobuf::{CreateTrigStmt, DropStmt, RangeVar};
+use pg_query::protobuf::{CreateTrigStmt, DropBehavior, DropStmt, RangeVar};
 use pg_query::NodeRef;
 use std::sync::Arc;
-use turso_core::schema::{Schema, Trigger};
-use turso_core::{Connection, LimboError, Result};
+use turso_core::schema::{BTreeTable, FunctionDef, Schema, Trigger};
+use turso_core::{walk_expr_mut, Connection, LimboError, Result, WalkControl};
 use turso_parser::ast;
+use turso_pg_parser::input_parameter_count;
 use turso_pg_parser::translator::{call_name, PostgreSQLTranslator};
 
 pub(crate) const TRIGGER_DEFINITION_FUNCTION: &str = "__turso_postgres_trigger";
@@ -42,8 +43,8 @@ pub(crate) fn create_trigger(
         .relation
         .as_ref()
         .ok_or_else(|| LimboError::ParseError("CREATE TRIGGER missing table name".into()))?;
-    let (database, schema) = table_database(conn, relation, search_path)?;
-    check_trigger_function(conn, &statement.funcname, search_path)?;
+    let (database, mut schema) = table_database(conn, relation, search_path)?;
+    let function_database = check_trigger_function(conn, &statement.funcname, search_path)?;
 
     let existing = core_triggers_named(&schema, &relation.relname, &statement.trigname);
     if !existing.is_empty() {
@@ -54,6 +55,7 @@ pub(crate) fn create_trigger(
             )));
         }
         drop_core_triggers(conn, &database, existing)?;
+        schema = conn.database_schema(&database).unwrap_or(schema);
     }
 
     let mut stored = statement.clone();
@@ -61,15 +63,24 @@ pub(crate) fn create_trigger(
     if let Some(relation) = stored.relation.as_mut() {
         relation.schemaname = postgres_schema_name(&database).to_string();
     }
+    if let Some(function_name) = stored.funcname.last().cloned() {
+        stored.funcname = vec![
+            string_node(postgres_schema_name(&function_database)),
+            function_name,
+        ];
+    }
     let definition = NodeRef::CreateTrigStmt(&stored)
         .deparse()
         .map_err(|e| LimboError::ParseError(e.to_string()))?;
+    let table_columns = schema
+        .get_btree_table(&relation.relname)
+        .map(|table| column_names(&table))
+        .unwrap_or_default();
     let when_clause = statement
         .when_clause
         .as_deref()
-        .map(|when| PostgreSQLTranslator::new().translate_expression(when))
-        .transpose()
-        .map_err(|e| LimboError::ParseError(e.to_string()))?
+        .map(|when| translate_when_clause(when, &table_columns))
+        .transpose()?
         .map(Box::new);
     let time = if statement.timing & TRIGGER_TYPE_BEFORE != 0 {
         ast::TriggerTime::Before
@@ -98,7 +109,10 @@ pub(crate) fn create_trigger(
             }
             event => event,
         };
-        let core_name = core_trigger_name(&statement.trigname, &relation.relname, &event);
+        let core_name = free_core_trigger_name(
+            &schema,
+            core_trigger_name(&statement.trigname, &relation.relname, &event),
+        );
         let create = ast::Stmt::CreateTrigger {
             temporary: false,
             if_not_exists: false,
@@ -118,6 +132,96 @@ pub(crate) fn create_trigger(
             .run_ignore_rows()?;
     }
     Ok(())
+}
+
+/// The WHEN condition of a PostgreSQL trigger, with the columns that `table`
+/// has now.
+pub(crate) fn trigger_when_clause(
+    trigger: &Trigger,
+    table: &BTreeTable,
+) -> Result<Option<ast::Expr>> {
+    let Some(definition) = trigger_definition(trigger) else {
+        return Ok(None);
+    };
+    let statement = parse_trigger_definition(&definition)?;
+    statement
+        .when_clause
+        .as_deref()
+        .map(|when| translate_when_clause(when, &column_names(table)))
+        .transpose()
+}
+
+/// Translate the WHEN condition of a trigger. A comparison of the whole rows
+/// OLD and NEW, as in `OLD.* IS DISTINCT FROM NEW.*`, becomes a comparison
+/// of each column in `columns`.
+fn translate_when_clause(when: &pg_query::protobuf::Node, columns: &[String]) -> Result<ast::Expr> {
+    let mut condition = PostgreSQLTranslator::new()
+        .translate_expression(when)
+        .map_err(|e| LimboError::ParseError(e.to_string()))?;
+    walk_expr_mut(&mut condition, &mut |expr| {
+        if let ast::Expr::Binary(left, operator, right) = expr {
+            if let (Some(left), Some(right)) = (whole_row(left), whole_row(right)) {
+                *expr = compare_rows(left, *operator, right, columns)?;
+                return Ok(WalkControl::SkipChildren);
+            }
+        }
+        if whole_row(expr).is_some() {
+            return Err(LimboError::ParseError(
+                "a whole row in WHEN is supported only in a comparison of OLD and NEW".into(),
+            ));
+        }
+        Ok(WalkControl::Continue)
+    })?;
+    Ok(condition)
+}
+
+/// `old` or `new` when `expr` is the whole row OLD or NEW, which the
+/// translator writes as a bare name for both `OLD` and `OLD.*`.
+fn whole_row(expr: &ast::Expr) -> Option<&'static str> {
+    match expr {
+        ast::Expr::Id(name) if name.as_str().eq_ignore_ascii_case("old") => Some("old"),
+        ast::Expr::Id(name) if name.as_str().eq_ignore_ascii_case("new") => Some("new"),
+        _ => None,
+    }
+}
+
+fn compare_rows(
+    left: &str,
+    operator: ast::Operator,
+    right: &str,
+    columns: &[String],
+) -> Result<ast::Expr> {
+    let (column_operator, combine) = match operator {
+        ast::Operator::IsNot => (ast::Operator::IsNot, ast::Operator::Or),
+        ast::Operator::Is => (ast::Operator::Is, ast::Operator::And),
+        ast::Operator::Equals => (ast::Operator::Equals, ast::Operator::And),
+        ast::Operator::NotEquals => (ast::Operator::NotEquals, ast::Operator::Or),
+        _ => {
+            return Err(LimboError::ParseError(
+                "a whole row in WHEN is supported only in a comparison of OLD and NEW".into(),
+            ))
+        }
+    };
+    let field = |record: &str, column: &str| {
+        Box::new(ast::Expr::Qualified(
+            ast::Name::exact(record.to_string()),
+            ast::Name::exact(column.to_string()),
+        ))
+    };
+    columns
+        .iter()
+        .map(|column| ast::Expr::Binary(field(left, column), column_operator, field(right, column)))
+        .reduce(|all, next| ast::Expr::Binary(Box::new(all), combine, Box::new(next)))
+        .ok_or_else(|| LimboError::ParseError("the table of the trigger has no columns".into()))
+}
+
+fn column_names(table: &BTreeTable) -> Vec<String> {
+    table
+        .columns()
+        .iter()
+        .filter(|column| !column.hidden())
+        .filter_map(|column| column.name.clone())
+        .collect()
 }
 
 pub(crate) fn drop_trigger(
@@ -171,6 +275,81 @@ pub(crate) fn drop_trigger(
         drop_core_triggers(conn, &database, existing)?;
     }
     Ok(())
+}
+
+/// Without CASCADE, DROP FUNCTION of a function that a trigger calls gives
+/// the error of PostgreSQL. With CASCADE, the triggers that call the
+/// function are dropped first, as in PostgreSQL.
+pub(crate) fn drop_triggers_of_dropped_functions(
+    conn: &Arc<Connection>,
+    drop: &DropStmt,
+    search_path: &[String],
+) -> Result<()> {
+    for object in &drop.objects {
+        let Some(Node::ObjectWithArgs(function)) = &object.node else {
+            continue;
+        };
+        if !function.args_unspecified && input_parameter_count(&function.objfuncargs) > 0 {
+            continue;
+        }
+        let call_name =
+            call_name(&function.objname).map_err(|e| LimboError::ParseError(e.to_string()))?;
+        let Some((database, function)) =
+            find_function_without_parameters(conn, &call_name, search_path)
+        else {
+            continue;
+        };
+        let callers = triggers_that_call(conn, &database, &function.name, search_path);
+        if callers.is_empty() {
+            continue;
+        }
+        if drop.behavior() != DropBehavior::DropCascade {
+            return Err(LimboError::ParseError(format!(
+                "cannot drop function {}() because other objects depend on it",
+                function.name
+            )));
+        }
+        for (trigger_database, names) in callers {
+            drop_core_triggers(conn, &trigger_database, names)?;
+        }
+    }
+    Ok(())
+}
+
+/// The core triggers of each database whose definition calls the function
+/// `name` of `database`.
+fn triggers_that_call(
+    conn: &Connection,
+    database: &str,
+    name: &str,
+    search_path: &[String],
+) -> Vec<(String, Vec<String>)> {
+    let mut databases = vec!["main".to_string()];
+    databases.extend(conn.attached_database_names());
+    databases
+        .into_iter()
+        .filter_map(|trigger_database| {
+            let schema = conn.database_schema(&trigger_database)?;
+            let names: Vec<String> = schema
+                .triggers
+                .values()
+                .flatten()
+                .filter(|trigger| {
+                    trigger_definition(trigger)
+                        .and_then(|definition| parse_trigger_definition(&definition).ok())
+                        .and_then(|definition| call_name(&definition.funcname).ok())
+                        .and_then(|call_name| {
+                            find_function_without_parameters(conn, &call_name, search_path)
+                        })
+                        .is_some_and(|(found_database, found)| {
+                            found_database == database && found.name == name
+                        })
+                })
+                .map(|trigger| trigger.name.clone())
+                .collect();
+            (!names.is_empty()).then_some((trigger_database, names))
+        })
+        .collect()
 }
 
 pub(crate) fn trigger_definition(trigger: &Trigger) -> Option<String> {
@@ -227,26 +406,24 @@ pub(crate) fn postgres_schema_name(database: &str) -> &str {
     }
 }
 
+/// Find the trigger function of `CREATE TRIGGER`, and give the database
+/// that has it. The trigger keeps that function, as PostgreSQL keeps the
+/// function that it found, also when the search path changes later.
 fn check_trigger_function(
     conn: &Connection,
     funcname: &[pg_query::protobuf::Node],
     search_path: &[String],
-) -> Result<()> {
+) -> Result<String> {
     let call_name = call_name(funcname).map_err(|e| LimboError::ParseError(e.to_string()))?;
-    let (databases, name) = match call_name.split_once('.') {
-        Some((database, name)) => (vec![database.to_string()], name),
-        None => (search_order(conn, search_path), call_name.as_str()),
-    };
-    let function = databases.iter().find_map(|database| {
-        conn.database_schema(database)?
-            .get_function(name, 0)
-            .cloned()
-    });
-    let Some(function) = function else {
+    let Some((database, function)) =
+        find_function_without_parameters(conn, &call_name, search_path)
+    else {
+        let name = call_name.rsplit('.').next().unwrap_or(&call_name);
         return Err(LimboError::ParseError(format!(
             "function {name}() does not exist"
         )));
     };
+    let name = function.name.as_str();
     let user_function = UserFunction::parse(&function)?;
     let returns_trigger = user_function.return_type().is_some_and(|return_type| {
         return_type.names.last().is_some_and(|last| {
@@ -258,7 +435,35 @@ fn check_trigger_function(
             "function {name} must return type trigger"
         )));
     }
-    Ok(())
+    Ok(database)
+}
+
+/// The database and the definition of the function without parameters that
+/// `call_name` names, with the search path for a name without a schema.
+fn find_function_without_parameters(
+    conn: &Connection,
+    call_name: &str,
+    search_path: &[String],
+) -> Option<(String, Arc<FunctionDef>)> {
+    let (databases, name) = match call_name.split_once('.') {
+        Some((database, name)) => (vec![database.to_string()], name),
+        None => (search_order(conn, search_path), call_name),
+    };
+    databases.into_iter().find_map(|database| {
+        let function = conn
+            .database_schema(&database)?
+            .get_function(name, 0)?
+            .clone();
+        Some((database, function))
+    })
+}
+
+fn string_node(value: &str) -> pg_query::protobuf::Node {
+    pg_query::protobuf::Node {
+        node: Some(Node::String(pg_query::protobuf::String {
+            sval: value.to_string(),
+        })),
+    }
 }
 
 fn table_database(
@@ -331,6 +536,26 @@ fn drop_core_triggers(conn: &Arc<Connection>, database: &str, names: Vec<String>
             .run_ignore_rows()?;
     }
     Ok(())
+}
+
+/// `name`, or `name` with a number when the database has a trigger with that
+/// name already. A renamed table keeps the core names of its triggers, so a
+/// new table with the old name can need another name.
+fn free_core_trigger_name(schema: &Schema, name: String) -> String {
+    let is_free = |candidate: &str| {
+        !schema
+            .triggers
+            .values()
+            .flatten()
+            .any(|trigger| trigger.name.eq_ignore_ascii_case(candidate))
+    };
+    if is_free(&name) {
+        return name;
+    }
+    (2..)
+        .map(|number| format!("{name} {number}"))
+        .find(|candidate| is_free(candidate))
+        .expect("a database has fewer triggers than numbers")
 }
 
 fn core_trigger_name(trigger_name: &str, table: &str, event: &ast::TriggerEvent) -> String {

@@ -2471,7 +2471,8 @@ impl PostgreSQLTranslator {
                             // Regular column reference
                             let expr = self.translate_expr(val)?;
                             let alias: Option<ast::As> = if res_target.name.is_empty() {
-                                None
+                                last_string(&col_ref.fields)
+                                    .map(|name| ast::As::ImplicitColumnName(ast::Name::exact(name)))
                             } else {
                                 Some(ast::As::Elided(ast::Name::from_string(&res_target.name)))
                             };
@@ -5969,7 +5970,9 @@ mod tests {
                     if let ast::Expr::Id(name) = &**expr {
                         assert_eq!(name.as_str(), "id");
                     }
-                    assert!(alias.is_none());
+                    assert!(
+                        matches!(alias, Some(ast::As::ImplicitColumnName(name)) if name.as_str() == "id")
+                    );
                 } else {
                     panic!("Expected expression result column for first column");
                 }
@@ -5983,7 +5986,9 @@ mod tests {
                     if let ast::Expr::Id(name) = &**expr {
                         assert_eq!(name.as_str(), "name");
                     }
-                    assert!(alias.is_none());
+                    assert!(
+                        matches!(alias, Some(ast::As::ImplicitColumnName(name)) if name.as_str() == "name")
+                    );
                 } else {
                     panic!("Expected expression result column for second column");
                 }
@@ -6021,7 +6026,9 @@ mod tests {
                         assert_eq!(table_name.as_str(), "users");
                         assert_eq!(col_name.as_str(), "id");
                     }
-                    assert!(alias.is_none());
+                    assert!(
+                        matches!(alias, Some(ast::As::ImplicitColumnName(name)) if name.as_str() == "id")
+                    );
                 } else {
                     panic!("Expected expression result column for first qualified column");
                 }
@@ -6036,7 +6043,9 @@ mod tests {
                         assert_eq!(table_name.as_str(), "t");
                         assert_eq!(col_name.as_str(), "name");
                     }
-                    assert!(alias.is_none());
+                    assert!(
+                        matches!(alias, Some(ast::As::ImplicitColumnName(name)) if name.as_str() == "name")
+                    );
                 } else {
                     panic!("Expected expression result column for second qualified column");
                 }

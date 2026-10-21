@@ -455,7 +455,7 @@ Upgrade is not supported.
 | BEGIN ATOMIC function bodies | ❌ Not supported | |
 | CALL syntax for executing procedures | ❌ Not supported | |
 | CREATE FUNCTION | 🟡 Partial | `LANGUAGE sql` and `LANGUAGE plpgsql` are stored and listed in `pg_proc`. CREATE FUNCTION without a schema creates the function in the first schema of `search_path` that exists. A call of a SQL function whose body is one expression without FROM is inlined, with the null check of STRICT and a cast to the return type; other calls give an error. Functions are found by name and argument count only, so default argument values do not make a function match fewer arguments |
-| Column level triggers | ❌ Not supported | |
+| Column level triggers | ✅ Supported | `UPDATE OF` columns |
 | CREATE PROCEDURE syntax for SQL stored procedures | 🟡 Partial | Stored like functions; CALL is not supported |
 | Event triggers | ❌ Not supported | |
 | FILTER clause for aggregate functions | ✅ Supported | |
@@ -464,17 +464,18 @@ Upgrade is not supported.
 | Per function statistics | ❌ Not supported | |
 | RETURN QUERY EXECUTE | ❌ Not supported | |
 | RETURNS TABLE | ❌ Not supported | |
-| Statement level triggers | ❌ Not supported | CREATE TRIGGER not translated |
+| Row level triggers | 🟡 Partial | `AFTER` triggers whose PL/pgSQL function has SQL statements and `RETURN`; `BEFORE` triggers give an error when they fire. `SECURITY DEFINER` and `SET` options of the function are accepted and ignored |
+| Statement level triggers | ❌ Not supported | CREATE TRIGGER ... FOR EACH STATEMENT gives an error |
 | Statement level TRUNCATE triggers | ❌ Not supported | |
 | Triggers on views | ❌ Not supported | |
 | Variadic functions | ❌ Not supported | |
-| WHEN clause for CREATE TRIGGER | ❌ Not supported | |
+| WHEN clause for CREATE TRIGGER | ✅ Supported | |
 
 ## Procedural Languages
 
 | Feature | Status | Notes |
 |---------|--------|-------|
-| Procedural languages (PL/pgSQL, PL/Python, ...) | 🟡 Partial | CREATE FUNCTION ... LANGUAGE plpgsql is stored; other languages and DO are rejected with an error |
+| Procedural languages (PL/pgSQL, PL/Python, ...) | 🟡 Partial | PL/pgSQL functions run only as trigger functions, compiled to SQL statements for each trigger and event; loops, cursors, `EXCEPTION`, `EXECUTE` and `RETURN QUERY` give an error when the trigger fires. Other languages and DO are rejected with an error |
 | CASE in pl/pgsql | ❌ Not supported | |
 | CONTINUE statement for PL/pgSQL | ❌ Not supported | |
 | CREATE TRANSFORM | ❌ Not supported | |
