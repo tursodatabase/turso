@@ -385,6 +385,35 @@ DELETE FROM users WHERE id = 1;  -- allowed
 PRAGMA i_am_a_dummy = 1;      -- equivalent to require_where = 1
 ```
 
+### auto_vacuum
+
+Returns the database's auto-vacuum mode as `0` (none), `1` (full), or `2` (incremental).
+Databases start in mode `0`.
+
+```sql
+PRAGMA auto_vacuum;
+-- 0
+```
+
+<Warning>
+**Experimental.** Auto-vacuum must be turned on when the database is opened: pass
+`--experimental-autovacuum` to the CLI (or enable the corresponding option on
+`DatabaseOpts`). Without it, any write of a non-`NONE` mode fails with
+`Autovacuum is not enabled. Use --experimental-autovacuum flag to enable it.`
+Writing `NONE` is always allowed — it only restates the default.
+</Warning>
+
+```sql
+PRAGMA auto_vacuum = INCREMENTAL;  -- requires --experimental-autovacuum
+PRAGMA auto_vacuum = 1;            -- same as FULL
+PRAGMA auto_vacuum = NONE;         -- allowed without the flag
+```
+
+Like SQLite, the mode is fixed once page 1 of the database exists: on an initialized
+database a write of the pragma is silently ignored, so the mode must be requested before
+creating any tables. The write form accepts the bare words `NONE`, `FULL`, and
+`INCREMENTAL` (case-insensitively) as well as the numbers above.
+
 ## Integrity Checks
 
 ### integrity_check
