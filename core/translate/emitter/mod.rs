@@ -775,10 +775,6 @@ impl<'a> Resolver<'a> {
             .ok_or_else(|| LimboError::ParseError(format!("no such object: {object_name}")))
     }
 
-    /// The database of the object named `object_name` without a namespace.
-    /// None only when a search path is set and no schema of it has the
-    /// object. Without a search path the answer is main when no database
-    /// has it, so that the statement reports the missing object itself.
     fn find_unqualified_existing_database_id<F>(
         &self,
         object_name: &str,
@@ -869,10 +865,10 @@ impl<'a> Resolver<'a> {
         &self,
         qualified_name: &ast::QualifiedName,
     ) -> Result<usize> {
-        if qualified_name.namespace.is_some() {
-            return self.resolve_database_id(qualified_name);
-        }
-        self.resolve_existing_table_database_id(qualified_name.name.as_str())
+        self.find_existing_table_database_id_qualified(qualified_name)?
+            .ok_or_else(|| {
+                LimboError::ParseError(format!("no such object: {}", qualified_name.name.as_str()))
+            })
     }
 
     pub(crate) fn resolve_existing_table_database_id(&self, table_name: &str) -> Result<usize> {
@@ -880,9 +876,6 @@ impl<'a> Resolver<'a> {
             .ok_or_else(|| LimboError::ParseError(format!("no such object: {table_name}")))
     }
 
-    /// The database of the table or view that `qualified_name` names, or
-    /// None when the name has no namespace and no schema of the search path
-    /// has it, which DROP ... IF EXISTS treats as nothing to drop.
     pub(crate) fn find_existing_table_database_id_qualified(
         &self,
         qualified_name: &ast::QualifiedName,
@@ -926,9 +919,6 @@ impl<'a> Resolver<'a> {
             })
     }
 
-    /// The database of the index that `qualified_name` names, or None when
-    /// the name has no namespace and no schema of the search path has it,
-    /// which DROP INDEX IF EXISTS treats as nothing to drop.
     pub(crate) fn find_existing_index_database_id(
         &self,
         qualified_name: &ast::QualifiedName,
