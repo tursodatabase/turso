@@ -24120,7 +24120,6 @@ fn notexists_descends_the_btree_for_non_positive_rowids() {
 
     remove_file_from_database_registry(&db_path);
 
-    // Recovery replays uncheckpointed -1 into a fresh allocator (max 0 drops it).
     let io = Arc::new(PlatformIO::new().unwrap());
     let db2 = Database::open_file_with_flags(
         io,

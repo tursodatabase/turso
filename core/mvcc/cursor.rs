@@ -2036,7 +2036,6 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> CursorTrait
                         mvcc_versions.is_some()
                     );
 
-                    // If found in MVCC, update dual_peek and return true
                     if let Some(versions) = mvcc_versions {
                         self.dual_peek.mvcc_peek = CursorPeek::Row {
                             key: RowKey::Int(int_key),
@@ -2054,9 +2053,7 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> CursorTrait
                         return Ok(IOResult::Done(true));
                     }
 
-                    // MVCC doesn't have it, but we need to check B-tree too
                     if !self.is_btree_allocated() {
-                        // No B-tree allocated, row doesn't exist
                         self.state = None;
                         return Ok(IOResult::Done(false));
                     }
@@ -2099,23 +2096,18 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> CursorTrait
                         "BTree should be allocated when we are in ExistsBtree state"
                     );
 
-                    // Check if row exists in B-tree
                     let found = return_if_io!(self.btree_cursor.exists(key));
 
                     if !found {
-                        // Not found in B-tree either
                         self.state = None;
                         return Ok(IOResult::Done(false));
                     }
-                    // Found in B-tree, but need to verify it's not shadowed by MVCC tombstone
                     let row_key = RowKey::Int(int_key);
                     if !self.query_btree_version_is_valid(&row_key)? {
-                        // B-tree row is shadowed by MVCC (tombstone or update), so it doesn't exist
                         tracing::trace!("B-tree row {int_key} is shadowed by MVCC");
                         self.state = None;
                         return Ok(IOResult::Done(false));
                     }
-                    // B-tree row is visible (not shadowed), update dual_peek
                     self.dual_peek.btree_peek = CursorPeek::Row {
                         key: row_key.clone(),
                         versions: None,

@@ -10650,7 +10650,7 @@ impl RowidAllocator {
             .then(|| self.max_rowid.load(Ordering::SeqCst))
     }
 
-    /// Initialize from the visible max. Called once per table, under lock.
+    /// Initialize from btree max. Called once per table, under lock.
     pub fn initialize(&self, rowid: Option<i64>) {
         tracing::trace!("initialize({rowid:?})");
         let _ = self
