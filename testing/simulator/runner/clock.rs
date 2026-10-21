@@ -24,10 +24,13 @@ impl SimulatorClock {
 
     pub fn now(&self) -> DateTime<Utc> {
         let mut time = self.curr_time.borrow_mut();
-        let nanos = self
-            .rng
-            .borrow_mut()
-            .random_range(self.min_tick..self.max_tick);
+        let nanos = if self.min_tick < self.max_tick {
+            self.rng
+                .borrow_mut()
+                .random_range(self.min_tick..self.max_tick)
+        } else {
+            self.min_tick
+        };
         let nanos = std::time::Duration::from_micros(nanos);
         *time += nanos;
         *time
