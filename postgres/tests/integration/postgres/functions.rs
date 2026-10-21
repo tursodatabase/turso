@@ -225,6 +225,41 @@ fn test_pg_set_config_validates_arguments(db: TempDatabase) {
 }
 
 #[turso_macros::test(mvcc)]
+fn test_pg_current_setting_reads_connection_settings_when_executed(db: TempDatabase) {
+    let conn = db.connect_postgres();
+    let other = db.connect_postgres();
+    let mut reader = conn
+        .prepare("SELECT current_setting('search_path')")
+        .unwrap();
+    assert_eq!(
+        reader.run_collect_rows().unwrap(),
+        vec![vec![Value::build_text("\"$user\", public")]]
+    );
+    conn.execute("SET search_path TO public").unwrap();
+    reader.reset().unwrap();
+    assert_eq!(
+        reader.run_collect_rows().unwrap(),
+        vec![vec![Value::build_text("public")]]
+    );
+    assert_eq!(
+        query_text(&other, "SELECT current_setting('search_path')"),
+        ["\"$user\", public"]
+    );
+}
+
+#[turso_macros::test(mvcc)]
+fn test_pg_current_setting_reports_default_without_session_state(db: TempDatabase) {
+    let conn = db.connect_limbo();
+    assert_eq!(
+        conn.prepare("SELECT current_setting('search_path')")
+            .unwrap()
+            .run_collect_rows()
+            .unwrap(),
+        vec![vec![Value::build_text("\"$user\", public")]]
+    );
+}
+
+#[turso_macros::test(mvcc)]
 fn test_pg_is_in_recovery_returns_temporary_true_text(db: TempDatabase) {
     let conn = db.connect_postgres();
     assert_eq!(
