@@ -1164,14 +1164,11 @@ pub fn translate_create_table(
         other => (other, None),
     };
 
-    let database_id = if temporary {
-        crate::TEMP_DB_ID
-    } else {
-        resolver.resolve_database_id_for_create(&tbl_name)?
-    };
+    let resolved = resolver.resolve_for_create(&tbl_name, temporary)?;
+    let database_id = resolved.database_id();
     let schema_cookie = resolver.with_schema(database_id, |s| s.schema_version);
     program.begin_write_on_database(database_id, schema_cookie)?;
-    let normalized_tbl_name = normalize_ident(tbl_name.name.as_str());
+    let normalized_tbl_name = resolved.stored_name;
     validate(&body, &normalized_tbl_name, resolver, connection)?;
     let bound_sequence_names = resolver.dialect.binds_names_at_create()
         && bind_default_sequence_names(&mut body, resolver)?;
@@ -1924,11 +1921,10 @@ pub fn translate_drop_table(
     program: &mut ProgramBuilder,
     connection: &Arc<Connection>,
 ) -> Result<()> {
-    let name = tbl_name.name.as_str();
     let opts = ProgramBuilderOpts::new(4, 40, 4);
     program.extend(&opts);
 
-    let Some(database_id) = resolver.find_existing_table_database_id_qualified(&tbl_name)? else {
+    let Some(resolved) = resolver.find_existing_table(&tbl_name)? else {
         if if_exists {
             return Ok(());
         }
@@ -1937,6 +1933,8 @@ pub fn translate_drop_table(
             crate::util::table_name_for_error(&tbl_name)
         );
     };
+    let database_id = resolved.database_id();
+    let name = resolved.stored_name.as_str();
 
     let schema_cookie = resolver.with_schema(database_id, |s| s.schema_version);
     program.begin_write_on_database(database_id, schema_cookie)?;
@@ -1968,7 +1966,7 @@ pub fn translate_drop_table(
     let null_reg = program.alloc_register(); //  r1
     program.emit_null(null_reg, None);
     let table_name_and_root_page_register = program.alloc_register(); //  r2, this register is special because it's first used to track table name and then moved root page
-    let table_reg = program.emit_string8_new_reg(normalize_ident(tbl_name.name.as_str())); //  r3
+    let table_reg = program.emit_string8_new_reg(name.to_string()); //  r3
     program.mark_last_insn_constant();
     let _table_type = program.emit_string8_new_reg("trigger".to_string()); //  r4
     program.mark_last_insn_constant();
@@ -2086,11 +2084,10 @@ pub fn translate_drop_table(
         //   - it is unqualified AND dropping from main AND temp has no
         //     shadow table of the same name (in which case the
         //     unqualified reference resolves to main).
-        let temp_has_shadow = resolver.with_schema(crate::TEMP_DB_ID, |s| {
-            s.get_table(tbl_name.name.as_str()).is_some()
-        });
+        let temp_has_shadow =
+            resolver.with_schema(crate::TEMP_DB_ID, |s| s.get_table(name).is_some());
         let trigger_names_to_drop: Vec<String> = resolver.with_schema(crate::TEMP_DB_ID, |s| {
-            s.get_triggers_for_table(tbl_name.name.as_str())
+            s.get_triggers_for_table(name)
                 .filter(|trigger| match trigger.target_database_id {
                     Some(db_id) => db_id == database_id,
                     None => !temp_has_shadow && database_id == crate::MAIN_DB_ID,
@@ -2183,8 +2180,8 @@ pub fn translate_drop_table(
 
     //  2. Destroy the indices within a loop
     let indices: Vec<_> = resolver.with_schema(database_id, |s| {
-        s.get_indices(tbl_name.name.as_str())
-            .chain(s.get_unowned_backing_btrees(tbl_name.name.as_str()))
+        s.get_indices(name)
+            .chain(s.get_unowned_backing_btrees(name))
             .cloned()
             .collect()
     });
@@ -2421,8 +2418,7 @@ pub fn translate_drop_table(
     }) {
         let seq_cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(seq_table.clone()));
         let seq_table_name_reg = program.alloc_register();
-        let dropped_table_name_reg =
-            program.emit_string8_new_reg(normalize_ident(tbl_name.name.as_str()));
+        let dropped_table_name_reg = program.emit_string8_new_reg(name.to_string());
         program.mark_last_insn_constant();
 
         program.emit_insn(Insn::OpenWrite {
@@ -2492,8 +2488,7 @@ pub fn translate_drop_table(
             .map(|index| program.alloc_cursor_index(None, index))
             .transpose()?;
         let ver_table_name_reg = program.alloc_register();
-        let dropped_name_reg =
-            program.emit_string8_new_reg(normalize_ident(tbl_name.name.as_str()));
+        let dropped_name_reg = program.emit_string8_new_reg(name.to_string());
         program.mark_last_insn_constant();
 
         program.emit_insn(Insn::OpenWrite {
@@ -2576,7 +2571,7 @@ pub fn translate_drop_table(
         db: database_id,
         _p2: 0,
         _p3: 0,
-        table_name: tbl_name.name.as_str().to_string(),
+        table_name: name.to_string(),
     });
 
     // If the dropped table owned an implicit AUTOINCREMENT sequence, tear
@@ -2591,8 +2586,7 @@ pub fn translate_drop_table(
     // sequence/backing-table is somehow already missing — same idempotency
     // contract as DROP SEQUENCE IF EXISTS.
     if table.btree().is_some_and(|bt| bt.has_autoincrement) {
-        let seq_name =
-            crate::schema::autoincrement_sequence_name(&normalize_ident(tbl_name.name.as_str()));
+        let seq_name = crate::schema::autoincrement_sequence_name(name);
         crate::translate::sequence::emit_drop_sequence_cleanup(
             program,
             resolver,

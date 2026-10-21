@@ -3312,10 +3312,9 @@ impl Connection {
         &self.namespaces
     }
 
-    /// Adds namespace `name`, which refers to database `database_id`, so
-    /// that `name.t` names the objects of that database.
-    pub fn add_namespace(&self, name: &str, database_id: usize) {
-        self.namespaces.add(name, database_id);
+    /// Adds `namespace` under `name`, so that `name.t` names its objects.
+    pub fn add_namespace(&self, name: &str, namespace: crate::Namespace) {
+        self.namespaces.add(name, namespace);
         self.bump_prepare_context_generation();
     }
 
@@ -5246,6 +5245,38 @@ mod tests {
         assert_eq!(query_single_i64(&conn, "SELECT x FROM t"), 5);
         conn.execute("CREATE TABLE v(z INTEGER)").unwrap();
         assert_eq!(query_single_i64(&conn, "SELECT count(*) FROM main.v"), 0);
+    }
+
+    #[test]
+    fn test_a_namespace_with_a_prefix_names_the_objects_stored_under_the_prefix() {
+        let temp_dir = TempDir::new().unwrap();
+        let conn = open_connection_with_opts(&temp_dir.path().join("main.db"), DatabaseOpts::new());
+        conn.execute("CREATE TABLE \"app.t\"(x INTEGER); INSERT INTO \"app.t\" VALUES(5)")
+            .unwrap();
+        conn.execute("CREATE TABLE t(x INTEGER); INSERT INTO t VALUES(1)")
+            .unwrap();
+        conn.add_namespace(
+            "app",
+            crate::Namespace {
+                database_id: MAIN_DB_ID,
+                prefix: "app.".to_string(),
+            },
+        );
+
+        assert_eq!(query_single_i64(&conn, "SELECT x FROM app.t"), 5);
+        assert_eq!(query_single_i64(&conn, "SELECT x FROM t"), 1);
+        conn.execute("INSERT INTO app.t VALUES(6)").unwrap();
+        conn.execute("UPDATE app.t SET x = x + 10 WHERE x = 6")
+            .unwrap();
+        assert_eq!(query_single_i64(&conn, "SELECT sum(x) FROM app.t"), 21);
+        conn.execute("DELETE FROM app.t WHERE x = 16").unwrap();
+        assert_eq!(query_single_i64(&conn, "SELECT count(*) FROM app.t"), 1);
+        assert_eq!(query_single_i64(&conn, "SELECT count(*) FROM t"), 1);
+
+        conn.execute("DROP TABLE app.t").unwrap();
+        assert!(conn.prepare("SELECT x FROM app.t").is_err());
+        assert!(conn.prepare("SELECT x FROM \"app.t\"").is_err());
+        assert_eq!(query_single_i64(&conn, "SELECT x FROM t"), 1);
     }
 
     #[test]

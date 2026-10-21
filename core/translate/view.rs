@@ -66,10 +66,11 @@ pub fn translate_create_materialized_view(
     if connection.mvcc_enabled() {
         bail_parse_error!("Materialized views are not supported in MVCC mode");
     }
-    let database_id = resolver.resolve_database_id_for_create(view_name)?;
+    let resolved = resolver.resolve_for_create(view_name, false)?;
+    let database_id = resolved.database_id();
     let schema_cookie = resolver.with_schema(database_id, |s| s.schema_version);
     program.begin_write_on_database(database_id, schema_cookie)?;
-    let normalized_view_name = normalize_ident(view_name.name.as_str());
+    let normalized_view_name = resolved.stored_name;
 
     if if_not_exists
         && resolver.with_schema(database_id, |s| {
@@ -348,14 +349,11 @@ pub fn translate_create_view(
 ) -> Result<()> {
     // TEMP views always live in the temp schema. The parser rejects
     // CREATE TEMP VIEW with a database name other than "temp".
-    let database_id = if temporary {
-        crate::TEMP_DB_ID
-    } else {
-        resolver.resolve_database_id_for_create(view_name)?
-    };
+    let resolved = resolver.resolve_for_create(view_name, temporary)?;
+    let database_id = resolved.database_id();
     let schema_cookie = resolver.with_schema(database_id, |s| s.schema_version);
     program.begin_write_on_database(database_id, schema_cookie)?;
-    let normalized_view_name = normalize_ident(view_name.name.as_str());
+    let normalized_view_name = resolved.stored_name;
 
     if if_not_exists
         && resolver.with_schema(database_id, |s| {
@@ -475,15 +473,17 @@ pub fn translate_drop_view(
 ) -> Result<()> {
     // Unqualified names search the temp schema first, then main, then
     // attached databases, so DROP VIEW finds temp views like SQLite does.
-    let normalized_view_name = normalize_ident(view_name.name.as_str());
-    let Some(database_id) = resolver.find_existing_table_database_id_qualified(view_name)? else {
+    let Some(resolved) = resolver.find_existing_table(view_name)? else {
         if if_exists {
             return Ok(());
         }
         return Err(crate::LimboError::ParseError(format!(
-            "no such view: {normalized_view_name}"
+            "no such view: {}",
+            normalize_ident(view_name.name.as_str())
         )));
     };
+    let database_id = resolved.database_id();
+    let normalized_view_name = resolved.stored_name;
     let schema_cookie = resolver.with_schema(database_id, |s| s.schema_version);
     program.begin_write_on_database(database_id, schema_cookie)?;
 

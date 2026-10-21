@@ -272,9 +272,10 @@ pub fn translate_insert(
         // for RETURNING clause subqueries - handled below via with_for_returning.
     }
 
-    let database_id = resolver.resolve_existing_table_database_id_qualified(&tbl_name)?;
-    let table_name = &tbl_name.name;
-    let table = match resolver.with_schema(database_id, |s| s.get_table(table_name.as_str())) {
+    let resolved = resolver.resolve_existing_table(&tbl_name)?;
+    let database_id = resolved.database_id();
+    let table_name = resolved.stored_name.as_str();
+    let table = match resolver.with_schema(database_id, |s| s.get_table(table_name)) {
         Some(table) => table,
         None => crate::bail_parse_error!(
             "no such table: {}",
@@ -284,13 +285,7 @@ pub fn translate_insert(
     if program.trigger.is_some() && table.virtual_table().is_some() {
         crate::bail_parse_error!("unsafe use of virtual table \"{}\"", tbl_name.name.as_str());
     }
-    validate(
-        table_name.as_str(),
-        resolver,
-        &table,
-        database_id,
-        connection,
-    )?;
+    validate(table_name, resolver, &table, database_id, connection)?;
 
     let fk_enabled = connection.foreign_keys_enabled();
     if let Some(virtual_table) = &table.virtual_table() {
@@ -348,7 +343,7 @@ pub fn translate_insert(
                     .btree()
                     .expect("we shouldn't have got here without a BTree table"),
             ),
-            identifier: normalize_ident(table_name.as_str()),
+            identifier: normalize_ident(tbl_name.name.as_str()),
             internal_id: program.table_reference_counter.next(),
             op: Operation::default_scan_for(&table),
             unmatched_right_rows_plan: None,
@@ -395,10 +390,8 @@ pub fn translate_insert(
     let mut result_columns =
         process_returning_clause(&mut returning, &mut table_references, resolver)?;
     let has_fks = fk_enabled
-        && (resolver.with_schema(database_id, |s| s.has_child_fks(table_name.as_str()))
-            || resolver.with_schema(database_id, |s| {
-                s.any_resolved_fks_referencing(table_name.as_str())
-            }));
+        && (resolver.with_schema(database_id, |s| s.has_child_fks(table_name))
+            || resolver.with_schema(database_id, |s| s.any_resolved_fks_referencing(table_name)));
     if !btree_table.has_rowid {
         if has_fks {
             crate::bail_parse_error!("foreign keys on WITHOUT ROWID tables are not supported");
@@ -420,9 +413,7 @@ pub fn translate_insert(
                 "materialized views on WITHOUT ROWID tables are not supported"
             );
         }
-        if resolver.with_schema(database_id, |s| {
-            s.get_indices(table_name.as_str()).next().is_some()
-        }) {
+        if resolver.with_schema(database_id, |s| s.get_indices(table_name).next().is_some()) {
             crate::bail_parse_error!("secondary indexes on WITHOUT ROWID tables are not supported");
         }
     }
@@ -818,7 +809,7 @@ pub fn translate_insert(
     // Build a list of upsert constraints/indexes we need to run preflight
     // checks against, in the proper order of evaluation,
     let constraints = build_constraints_to_check(
-        table_name.as_str(),
+        table_name,
         &upsert_actions,
         ctx.table.has_rowid,
         has_user_provided_rowid,
@@ -984,7 +975,7 @@ pub fn translate_insert(
             None,
             after_record_reg,
             None,
-            table_name.as_str(),
+            table_name,
         )?;
     }
 

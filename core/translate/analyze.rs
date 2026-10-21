@@ -6,7 +6,7 @@ use crate::{
     schema::{BTreeTable, Index, RESERVED_TABLE_PREFIXES},
     storage::pager::CreateBTreeFlags,
     translate::{
-        emitter::Resolver,
+        emitter::{ResolvedName, Resolver},
         schema::{emit_schema_entry, SchemaEntryType, SQLITE_TABLEID},
     },
     util::normalize_ident,
@@ -40,12 +40,13 @@ fn resolve_analyze_targets(
 
             // If db_name is specified, resolve to that database
             if let Some(db_name) = &target.namespace {
-                let database_id = resolver.resolve_database_id(target)?;
+                let resolved = resolver.resolve_object(target)?;
+                let database_id = resolved.database_id();
                 let db_normalized = normalize_ident(db_name.as_str());
 
                 // "ANALYZE db.table" — the name part is the table/index
                 // But first check if the name is actually a database name too (shouldn't be with db_name set)
-                let targets = resolve_targets_in_db(&normalized, database_id, resolver)?;
+                let targets = resolve_targets_in_db(&resolved.stored_name, database_id, resolver)?;
                 if targets.is_empty() {
                     bail_parse_error!("no such table or index: {}.{}", db_normalized, normalized);
                 }
@@ -69,20 +70,22 @@ fn resolve_analyze_targets(
 
             // Like SQLite, look the name up as an index before a table, in the
             // same database order as other unqualified names (temp first).
-            let index_db_id = resolver
-                .find_existing_index_database_id(target)?
-                .unwrap_or(crate::MAIN_DB_ID);
-            if let Some(target) = find_index_target(&normalized, index_db_id, resolver) {
-                return Ok((index_db_id, vec![target]));
+            let index = resolver
+                .find_existing_index(target)?
+                .unwrap_or_else(|| ResolvedName::in_database(crate::MAIN_DB_ID, &normalized));
+            if let Some(target) =
+                find_index_target(&index.stored_name, index.database_id(), resolver)
+            {
+                return Ok((index.database_id(), vec![target]));
             }
-            let table_db_id = resolver
-                .find_existing_table_database_id_qualified(target)?
-                .unwrap_or(crate::MAIN_DB_ID);
-            let targets = resolve_targets_in_db(&normalized, table_db_id, resolver)?;
+            let table = resolver
+                .find_existing_table(target)?
+                .unwrap_or_else(|| ResolvedName::in_database(crate::MAIN_DB_ID, &normalized));
+            let targets = resolve_targets_in_db(&table.stored_name, table.database_id(), resolver)?;
             if targets.is_empty() {
                 bail_parse_error!("no such table or index: {}", target.name);
             }
-            Ok((table_db_id, targets))
+            Ok((table.database_id(), targets))
         }
         None => {
             // ANALYZE with no target — analyze all tables in main

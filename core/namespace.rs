@@ -11,19 +11,50 @@ use crate::sync::RwLock;
 use crate::{turso_assert, MAIN_DB_ID, TEMP_DB_ID};
 use rustc_hash::FxHashMap as HashMap;
 
+/// A namespace: the database that stores its objects and what is put in
+/// front of an object's name to get the name it is stored under in that
+/// database's schema. A namespace that is a whole database, like `main` or
+/// an attached database, has an empty prefix.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Namespace {
+    pub database_id: usize,
+    pub prefix: String,
+}
+
+impl Namespace {
+    /// The namespace of a whole database: its objects are stored under their
+    /// own names.
+    pub fn database(database_id: usize) -> Self {
+        Self {
+            database_id,
+            prefix: String::new(),
+        }
+    }
+
+    /// The name that object `name` is stored under in the database.
+    pub fn stored_name(&self, name: &str) -> String {
+        format!("{}{name}", self.prefix)
+    }
+}
+
 #[derive(Default)]
 pub struct Namespaces {
-    name_to_database: RwLock<HashMap<String, usize>>,
+    name_to_namespace: RwLock<HashMap<String, Namespace>>,
 }
 
 impl Namespaces {
+    /// The namespace called `name`. `name` is normalized.
+    pub fn get(&self, name: &str) -> Option<Namespace> {
+        match name {
+            "main" => Some(Namespace::database(MAIN_DB_ID)),
+            "temp" => Some(Namespace::database(TEMP_DB_ID)),
+            _ => self.name_to_namespace.read().get(name).cloned(),
+        }
+    }
+
     /// The database that namespace `name` refers to. `name` is normalized.
     pub fn database_id(&self, name: &str) -> Option<usize> {
-        match name {
-            "main" => Some(MAIN_DB_ID),
-            "temp" => Some(TEMP_DB_ID),
-            _ => self.name_to_database.read().get(name).copied(),
-        }
+        self.get(name).map(|namespace| namespace.database_id)
     }
 
     /// The name of the namespace that refers to database `database_id`.
@@ -32,10 +63,10 @@ impl Namespaces {
             MAIN_DB_ID => Some("main".to_string()),
             TEMP_DB_ID => Some("temp".to_string()),
             _ => self
-                .name_to_database
+                .name_to_namespace
                 .read()
                 .iter()
-                .find(|(_, &id)| id == database_id)
+                .find(|(_, namespace)| namespace.database_id == database_id)
                 .map(|(name, _)| name.clone()),
         }
     }
@@ -44,22 +75,24 @@ impl Namespaces {
     /// databases they refer to, ordered by database.
     pub fn others(&self) -> Vec<(usize, String)> {
         let mut namespaces: Vec<_> = self
-            .name_to_database
+            .name_to_namespace
             .read()
             .iter()
-            .filter(|(_, &id)| id != MAIN_DB_ID && id != TEMP_DB_ID)
-            .map(|(name, &id)| (id, name.clone()))
+            .filter(|(_, namespace)| {
+                namespace.database_id != MAIN_DB_ID && namespace.database_id != TEMP_DB_ID
+            })
+            .map(|(name, namespace)| (namespace.database_id, name.clone()))
             .collect();
         namespaces.sort();
         namespaces
     }
 
-    /// Adds namespace `name`, which refers to database `database_id`.
-    pub fn add(&self, name: &str, database_id: usize) {
+    /// Adds `namespace` under `name`.
+    pub fn add(&self, name: &str, namespace: Namespace) {
         let previous = self
-            .name_to_database
+            .name_to_namespace
             .write()
-            .insert(name.to_string(), database_id);
+            .insert(name.to_string(), namespace);
         turso_assert!(
             previous.is_none(),
             "namespace name already exists",
@@ -69,7 +102,10 @@ impl Namespaces {
 
     /// Removes namespace `name` and returns the database it referred to.
     pub fn remove(&self, name: &str) -> Option<usize> {
-        self.name_to_database.write().remove(name)
+        self.name_to_namespace
+            .write()
+            .remove(name)
+            .map(|namespace| namespace.database_id)
     }
 
     /// The databases that a name without a namespace is looked up in, in
@@ -103,13 +139,13 @@ impl Namespaces {
 
 #[cfg(test)]
 mod tests {
-    use super::Namespaces;
+    use super::{Namespace, Namespaces};
     use crate::{MAIN_DB_ID, TEMP_DB_ID};
 
     fn namespaces_with_app_and_other() -> Namespaces {
         let namespaces = Namespaces::default();
-        namespaces.add("app", 2);
-        namespaces.add("other", 3);
+        namespaces.add("app", Namespace::database(2));
+        namespaces.add("other", Namespace::database(3));
         namespaces
     }
 
@@ -157,7 +193,7 @@ mod tests {
     #[test]
     fn a_second_name_for_main_is_not_an_other_database() {
         let namespaces = namespaces_with_app_and_other();
-        namespaces.add("public", MAIN_DB_ID);
+        namespaces.add("public", Namespace::database(MAIN_DB_ID));
         assert_eq!(namespaces.database_id("public"), Some(MAIN_DB_ID));
         assert_eq!(namespaces.name(MAIN_DB_ID).as_deref(), Some("main"));
         assert_eq!(
@@ -169,6 +205,24 @@ mod tests {
             namespaces.search_order(Some(&search_path)),
             vec![MAIN_DB_ID, 2]
         );
+    }
+
+    #[test]
+    fn a_namespace_with_a_prefix_stores_its_objects_under_the_prefix() {
+        let namespaces = namespaces_with_app_and_other();
+        namespaces.add(
+            "app_in_main",
+            Namespace {
+                database_id: MAIN_DB_ID,
+                prefix: "app.".to_string(),
+            },
+        );
+        let app = namespaces.get("app_in_main").unwrap();
+        assert_eq!(app.database_id, MAIN_DB_ID);
+        assert_eq!(app.stored_name("t"), "app.t");
+        assert_eq!(namespaces.get("app").unwrap().stored_name("t"), "t");
+        assert_eq!(namespaces.get("main").unwrap().stored_name("t"), "t");
+        assert_eq!(namespaces.get("other").unwrap().stored_name("t"), "t");
     }
 
     #[test]
