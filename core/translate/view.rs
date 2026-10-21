@@ -304,7 +304,6 @@ pub fn translate_create_materialized_view(
         cursors: cursor_info,
     });
 
-    program.epilogue(resolver.schema());
     Ok(())
 }
 
@@ -816,6 +815,5 @@ pub fn translate_drop_view(
         p5: 1, // update version
     });
 
-    program.epilogue(resolver.schema());
     Ok(())
 }
