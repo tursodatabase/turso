@@ -5055,6 +5055,8 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
                         let (expr, collation) = constraint_column_collation(column.expr.as_ref())?;
                         let col_name = match expr {
                             Expr::Id(id) => normalize_ident(id.as_str()),
+                            Expr::Literal(Literal::True) => "true".to_owned(),
+                            Expr::Literal(Literal::False) => "false".to_owned(),
                             Expr::Literal(Literal::String(value)) => {
                                 value.trim_matches('\'').to_owned()
                             }
@@ -5086,6 +5088,8 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
                         let (expr, collation) = constraint_column_collation(column.expr.as_ref())?;
                         let col_name = match expr {
                             Expr::Id(id) => id.as_str().to_string(),
+                            Expr::Literal(Literal::True) => "true".to_owned(),
+                            Expr::Literal(Literal::False) => "false".to_owned(),
                             Expr::Literal(Literal::String(value)) => {
                                 value.trim_matches('\'').to_owned()
                             }
