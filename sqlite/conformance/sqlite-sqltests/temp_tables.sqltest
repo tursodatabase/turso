@@ -354,3 +354,67 @@ expect {
     ft_sentinel
     99
 }
+
+test analyze-temp-schema-by-name {
+    CREATE TEMP TABLE tt(a);
+    CREATE INDEX tt_i ON tt(a);
+    INSERT INTO tt VALUES (1), (2);
+    ANALYZE temp;
+    SELECT tbl, idx, stat FROM temp.sqlite_stat1;
+}
+expect {
+    tt|tt_i|2 1
+}
+
+test analyze-unqualified-temp-table {
+    CREATE TEMP TABLE tt(a);
+    CREATE INDEX tt_i ON tt(a);
+    INSERT INTO tt VALUES (1), (2);
+    ANALYZE tt;
+    SELECT tbl, idx, stat FROM temp.sqlite_stat1;
+}
+expect {
+    tt|tt_i|2 1
+}
+
+test analyze-unqualified-temp-index {
+    CREATE TEMP TABLE tt(a);
+    CREATE INDEX tt_i ON tt(a);
+    INSERT INTO tt VALUES (1), (2);
+    ANALYZE tt_i;
+    SELECT tbl, idx, stat FROM temp.sqlite_stat1;
+}
+expect {
+    tt|tt_i|2 1
+}
+
+test analyze-unqualified-name-prefers-temp-table-over-main-table {
+    CREATE TABLE tt(a);
+    CREATE INDEX main_i ON tt(a);
+    INSERT INTO tt VALUES (1);
+    CREATE TEMP TABLE tt(a);
+    CREATE INDEX temp_i ON tt(a);
+    INSERT INTO temp.tt VALUES (1), (2);
+    ANALYZE tt;
+    SELECT tbl, idx, stat FROM temp.sqlite_stat1;
+    SELECT count(*) FROM sqlite_schema WHERE name = 'sqlite_stat1';
+}
+expect {
+    tt|temp_i|2 1
+    0
+}
+
+test analyze-unqualified-name-prefers-main-index-over-temp-table {
+    CREATE TABLE m(a);
+    CREATE INDEX x ON m(a);
+    INSERT INTO m VALUES (1), (2);
+    CREATE TEMP TABLE x(a);
+    CREATE INDEX temp_i ON x(a);
+    ANALYZE x;
+    SELECT tbl, idx, stat FROM main.sqlite_stat1;
+    SELECT count(*) FROM temp.sqlite_schema WHERE name = 'sqlite_stat1';
+}
+expect {
+    m|x|2 1
+    0
+}
