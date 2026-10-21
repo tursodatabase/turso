@@ -657,6 +657,39 @@ expect {
     1|one
 }
 
+@skip-if postgres "PostgreSQL keeps the old key"
+test return-old-that-must-keep-a-changed-integer-primary-key-errors {
+    CREATE TABLE items (id int PRIMARY KEY, n int);
+    INSERT INTO items VALUES (1, 10);
+    CREATE FUNCTION keep_old() RETURNS trigger LANGUAGE plpgsql AS $$
+    BEGIN
+        RETURN OLD;
+    END
+    $$;
+    CREATE TRIGGER items_keep BEFORE UPDATE ON items FOR EACH ROW EXECUTE FUNCTION keep_old();
+    UPDATE items SET n = 20;
+    UPDATE items SET id = 5, n = 50;
+}
+expect error {
+    RETURN OLD cannot keep the old value of the INTEGER PRIMARY KEY column "id" yet
+}
+
+test return-old-keeps-the-row-when-the-integer-primary-key-does-not-change {
+    CREATE TABLE items (id int PRIMARY KEY, n int);
+    INSERT INTO items VALUES (1, 10);
+    CREATE FUNCTION keep_old() RETURNS trigger LANGUAGE plpgsql AS $$
+    BEGIN
+        RETURN OLD;
+    END
+    $$;
+    CREATE TRIGGER items_keep BEFORE UPDATE ON items FOR EACH ROW EXECUTE FUNCTION keep_old();
+    UPDATE items SET id = 1, n = 50;
+    SELECT id, n FROM items;
+}
+expect {
+    1|10
+}
+
 @setup log_table
 test return-coalesce-of-new-and-old-returns-the-row-of-the-event {
     CREATE FUNCTION mark() RETURNS trigger LANGUAGE plpgsql AS $$
@@ -815,4 +848,146 @@ expect {
     42
     43
     missing
+}
+
+@setup log_table
+test if-condition-is-calculated-before-the-statements-of-the-branch {
+    CREATE FUNCTION log_first() RETURNS trigger LANGUAGE plpgsql AS $$
+    BEGIN
+        IF NOT EXISTS (SELECT 1 FROM log) THEN
+            INSERT INTO log VALUES ('first', NEW.id, NEW.a);
+            INSERT INTO log VALUES ('second', NEW.id, NEW.a);
+        END IF;
+        RETURN NULL;
+    END
+    $$;
+    CREATE TRIGGER t_log AFTER INSERT ON t FOR EACH ROW EXECUTE FUNCTION log_first();
+    INSERT INTO t VALUES (1, 'one'), (2, 'two');
+    SELECT op, id FROM log ORDER BY op;
+}
+expect {
+    first|1
+    second|1
+}
+
+@setup log_table
+test else-runs-when-the-condition-is-null {
+    CREATE FUNCTION log_kind() RETURNS trigger LANGUAGE plpgsql AS $$
+    BEGIN
+        IF NEW.id > 0 THEN
+            INSERT INTO log VALUES ('positive', NEW.id, NEW.a);
+        ELSE
+            INSERT INTO log VALUES ('other', NEW.id, NEW.a);
+        END IF;
+        RETURN NULL;
+    END
+    $$;
+    CREATE TRIGGER t_log AFTER INSERT ON t FOR EACH ROW EXECUTE FUNCTION log_kind();
+    INSERT INTO t VALUES (1, 'one'), (NULL, 'none'), (-1, 'minus');
+    SELECT op, a FROM log ORDER BY a;
+}
+expect {
+    other|minus
+    other|none
+    positive|one
+}
+
+@setup log_table
+test nested-if-and-statements-of-a-branch-that-does-not-run {
+    CREATE TABLE totals (name text, n int);
+    INSERT INTO totals VALUES ('rows', 0);
+    CREATE FUNCTION count_rows() RETURNS trigger LANGUAGE plpgsql AS $$
+    BEGIN
+        IF NEW.id > 10 THEN
+            IF NEW.a = 'skip' THEN
+                RETURN NULL;
+            END IF;
+            UPDATE totals SET n = n + 100 WHERE name = 'rows';
+            INSERT INTO log SELECT 'count', count(*), NULL FROM t;
+            DELETE FROM log WHERE op = 'old';
+        ELSE
+            UPDATE totals SET n = n + 1 WHERE name = 'rows';
+            INSERT INTO log VALUES ('small', NEW.id, NEW.a);
+        END IF;
+        RETURN NULL;
+    END
+    $$;
+    INSERT INTO log VALUES ('old', 0, NULL);
+    CREATE TRIGGER t_count AFTER INSERT ON t FOR EACH ROW EXECUTE FUNCTION count_rows();
+    INSERT INTO t VALUES (1, 'one');
+    INSERT INTO t VALUES (20, 'skip');
+    SELECT n FROM totals;
+    SELECT op, id FROM log ORDER BY op;
+    INSERT INTO t VALUES (30, 'big');
+    SELECT n FROM totals;
+    SELECT op, id FROM log ORDER BY op, id;
+}
+expect {
+    1
+    old|0
+    small|1
+    101
+    count|3
+    small|1
+}
+
+@setup log_table
+test return-in-a-branch-stops-the-function {
+    CREATE FUNCTION log_unless_one() RETURNS trigger LANGUAGE plpgsql AS $$
+    BEGIN
+        IF NEW.id = 1 THEN
+            RETURN NULL;
+        END IF;
+        INSERT INTO log VALUES (TG_OP, NEW.id, NEW.a);
+        RETURN NULL;
+    END
+    $$;
+    CREATE TRIGGER t_log AFTER INSERT ON t FOR EACH ROW EXECUTE FUNCTION log_unless_one();
+    INSERT INTO t VALUES (1, 'one'), (2, 'two');
+    SELECT id FROM log;
+}
+expect {
+    2
+}
+
+test before-trigger-returns-old-or-new-on-different-paths {
+    CREATE TABLE items (id int PRIMARY KEY, n int, locked boolean);
+    CREATE FUNCTION keep_locked() RETURNS trigger LANGUAGE plpgsql AS $$
+    BEGIN
+        IF OLD.locked THEN
+            RETURN OLD;
+        END IF;
+        NEW.n := NEW.n * 10;
+        RETURN NEW;
+    END
+    $$;
+    INSERT INTO items VALUES (1, 1, true), (2, 2, false);
+    CREATE TRIGGER items_keep BEFORE UPDATE ON items FOR EACH ROW EXECUTE FUNCTION keep_locked();
+    UPDATE items SET n = n + 1;
+    SELECT id, n FROM items ORDER BY id;
+}
+expect {
+    1|1
+    2|30
+}
+
+test assignment-in-a-branch-changes-the-row-only-on-that-path {
+    CREATE TABLE tasks (id int PRIMARY KEY, status text, note text);
+    CREATE FUNCTION mark_done() RETURNS trigger LANGUAGE plpgsql AS $$
+    BEGIN
+        IF NEW.status = 'done' AND OLD.status <> 'done' THEN
+            NEW.note := 'done after ' || OLD.status;
+        END IF;
+        RETURN NEW;
+    END
+    $$;
+    INSERT INTO tasks VALUES (1, 'open', NULL), (2, 'open', NULL);
+    CREATE TRIGGER tasks_done BEFORE UPDATE ON tasks FOR EACH ROW EXECUTE FUNCTION mark_done();
+    UPDATE tasks SET status = 'done' WHERE id = 1;
+    UPDATE tasks SET status = 'waiting' WHERE id = 2;
+    SELECT id, status, note FROM tasks ORDER BY id;
+}
+expect {
+    1|done|done after open
+    2|waiting|
 }

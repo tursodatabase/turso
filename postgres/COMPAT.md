@@ -465,7 +465,7 @@ Upgrade is not supported.
 | Per function statistics | ❌ Not supported | |
 | RETURN QUERY EXECUTE | ❌ Not supported | |
 | RETURNS TABLE | ❌ Not supported | |
-| Row level triggers | 🟡 Partial | `BEFORE` and `AFTER` triggers whose PL/pgSQL function has SQL statements, assignments to fields of `NEW`, `IF` on the trigger variables such as `TG_OP`, and `RETURN`. A `BEFORE` trigger writes the row that it returns, or skips the row when it returns `NULL`. It cannot change an `INTEGER PRIMARY KEY` column. An assigned value is converted as in `INSERT`, so `NEW.n := 3.7` for an `int` column gives an error, where PostgreSQL stores 4. `SECURITY DEFINER` and `SET` options of the function are accepted and ignored |
+| Row level triggers | 🟡 Partial | `BEFORE` and `AFTER` triggers whose PL/pgSQL function has SQL statements, assignments to fields of `NEW`, `IF` and `RETURN`. A `BEFORE` trigger writes the row that it returns, or skips the row when it returns `NULL`. It cannot change an `INTEGER PRIMARY KEY` column. An assigned value is converted as in `INSERT`, so `NEW.n := 3.7` for an `int` column gives an error, where PostgreSQL stores 4. `SECURITY DEFINER` and `SET` options of the function are accepted and ignored |
 | Statement level triggers | ❌ Not supported | CREATE TRIGGER ... FOR EACH STATEMENT gives an error |
 | Statement level TRUNCATE triggers | ❌ Not supported | |
 | Triggers on views | ❌ Not supported | |

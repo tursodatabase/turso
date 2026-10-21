@@ -59,14 +59,19 @@ pub(crate) fn compile_trigger(
     let schema = statement.relation.as_ref().map_or("public", |relation| {
         postgres_schema_name(&relation.schemaname)
     });
+    let op = match trigger.event {
+        ast::TriggerEvent::Insert => "INSERT",
+        ast::TriggerEvent::Update | ast::TriggerEvent::UpdateOf(_) => "UPDATE",
+        ast::TriggerEvent::Delete => "DELETE",
+    };
     let mut compiler = Compiler {
         function_name: function.name.clone(),
+        variable_prefix: format!(
+            "{schema}.{}.{}.{op}",
+            trigger.table_name, statement.trigname
+        ),
         trigger: TriggerConstants {
-            op: match trigger.event {
-                ast::TriggerEvent::Insert => "INSERT",
-                ast::TriggerEvent::Update | ast::TriggerEvent::UpdateOf(_) => "UPDATE",
-                ast::TriggerEvent::Delete => "DELETE",
-            },
+            op,
             when: match trigger.time {
                 ast::TriggerTime::Before => "BEFORE",
                 ast::TriggerTime::After => "AFTER",
@@ -79,15 +84,16 @@ pub(crate) fn compile_trigger(
         },
         table,
         records: Records::new(plpgsql_function),
+        variable_count: 0,
         statements: Vec::new(),
         new_values: Vec::new(),
+        branch_condition: None,
+        return_variable: None,
+        conditional_returns: Vec::new(),
         changed_columns: Vec::new(),
     };
-    if compiler.compile_statement(action)? == Flow::Continues {
-        compiler.statements.push(raise_abort(
-            "control reached end of trigger procedure without RETURN",
-        ));
-    }
+    let flow = compiler.compile_statement(action)?;
+    compiler.finish(flow)?;
     Ok(Some(TriggerBody {
         statements: compiler.statements,
         changed_columns: compiler.changed_columns,
@@ -128,20 +134,65 @@ struct TriggerConstants {
 
 struct Compiler<'a> {
     function_name: String,
+    /// The start of the keys of the variables of this trigger and event.
+    variable_prefix: String,
     trigger: TriggerConstants,
     table: &'a BTreeTable,
     records: Records<'a>,
+    variable_count: usize,
     statements: Vec<ast::Stmt>,
-    /// The values that the function assigned to fields of NEW, in the order
-    /// of the first assignment. Each value reads NEW as the trigger got it.
-    new_values: Vec<(String, ast::Expr)>,
+    /// The fields of NEW that the function assigned, in the order of the
+    /// first assignment.
+    new_values: Vec<(String, NewValue)>,
+    /// The condition of the branch that compiles now. `None` at the top level.
+    branch_condition: Option<ast::Expr>,
+    /// The variable that a RETURN in a branch sets, so that the later
+    /// statements do not run.
+    return_variable: Option<String>,
+    conditional_returns: Vec<ReturnAction>,
     changed_columns: Vec<ChangedColumn>,
 }
 
-#[derive(PartialEq, Eq)]
+/// The value of a field of NEW after an assignment.
+enum NewValue {
+    /// An expression that reads NEW as the trigger got it. The compiler puts
+    /// it in each place that reads the field, so it must give the same value
+    /// each time.
+    Expression(ast::Expr),
+    /// A variable that has the value.
+    Variable(String),
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
 enum Flow {
     Continues,
     Returns,
+}
+
+/// What core does with the row when the trigger function returns.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ReturnAction {
+    WriteNew,
+    WriteOld,
+    Skip,
+    Continue,
+}
+
+impl ReturnAction {
+    fn name(self) -> &'static str {
+        match self {
+            Self::WriteNew => "new",
+            Self::WriteOld => "old",
+            Self::Skip => "skip",
+            Self::Continue => "continue",
+        }
+    }
+}
+
+/// A branch of IF: the condition and the statements.
+struct Branch<'j> {
+    condition: ast::Expr,
+    statements: Vec<&'j Json>,
 }
 
 impl Compiler<'_> {
@@ -157,7 +208,7 @@ impl Compiler<'_> {
             "PLpgSQL_stmt_assign" => self.compile_assignment(body).map(|()| Flow::Continues),
             "PLpgSQL_stmt_if" => self.compile_if(body),
             "PLpgSQL_stmt_return" if body.get("lineno").is_none() => Ok(Flow::Continues),
-            "PLpgSQL_stmt_return" => self.compile_return(body).map(|()| Flow::Returns),
+            "PLpgSQL_stmt_return" => self.compile_return(body),
             kind => Err(LimboError::ParseError(format!(
                 "{} is not supported yet",
                 statement_description(kind)
@@ -172,11 +223,14 @@ impl Compiler<'_> {
                 "EXCEPTION blocks are not supported".into(),
             ));
         }
-        self.compile_statements(block, "body")
+        self.compile_statements(json_array(block, "body"))
     }
 
-    fn compile_statements(&mut self, parent: &Json, key: &str) -> Result<Flow> {
-        for statement in json_array(parent, key) {
+    fn compile_statements<'j>(
+        &mut self,
+        statements: impl IntoIterator<Item = &'j Json>,
+    ) -> Result<Flow> {
+        for statement in statements {
             if self.compile_statement(statement)? == Flow::Returns {
                 return Ok(Flow::Returns);
             }
@@ -195,13 +249,8 @@ impl Compiler<'_> {
                 "query has no destination for result data".into(),
             ));
         }
-        if self.new_values.iter().any(|(_, value)| reads_table(value)) {
-            return Err(LimboError::ParseError(
-                "a SQL statement after an assignment to NEW that reads a table is not supported yet"
-                    .into(),
-            ));
-        }
         walk_stmt_exprs_mut(&mut stmt, &mut |expr| self.replace_trigger_values(expr))?;
+        let stmt = with_condition(stmt, self.statement_condition())?;
         self.statements.push(stmt);
         Ok(())
     }
@@ -227,103 +276,304 @@ impl Compiler<'_> {
         let query = expression_query(body.get("expr"))?;
         let mut value = translate_expression(assigned_value(query)?)?;
         walk_tree_mut(&mut value, &mut |expr| self.replace_trigger_values(expr))?;
+        let condition = self.statement_condition();
         match self.table.get_column(field) {
             None => {
-                self.statements.push(raise_abort(&format!(
-                    "record \"new\" has no field \"{field}\""
-                )));
+                self.statements.push(select_where(
+                    raise_abort_expr(text_literal(&format!(
+                        "record \"new\" has no field \"{field}\""
+                    ))),
+                    condition,
+                ));
                 return Ok(());
             }
             Some((_, column)) if column.is_generated() => return Ok(()),
             Some(_) => {}
         }
-        match self
+        let position = self
             .new_values
-            .iter_mut()
-            .find(|(name, _)| name.eq_ignore_ascii_case(field))
-        {
-            Some((_, old_value)) => *old_value = value,
-            None => self.new_values.push((field.to_string(), value)),
+            .iter()
+            .position(|(name, _)| name.eq_ignore_ascii_case(field));
+        let current_variable = position.and_then(|position| match &self.new_values[position].1 {
+            NewValue::Variable(key) => Some(key.clone()),
+            NewValue::Expression(_) => None,
+        });
+        if condition.is_none() && current_variable.is_none() && can_be_calculated_again(&value) {
+            match position {
+                Some(position) => self.new_values[position].1 = NewValue::Expression(value),
+                None => self
+                    .new_values
+                    .push((field.to_string(), NewValue::Expression(value))),
+            }
+            return Ok(());
         }
+        let key = match current_variable {
+            Some(key) => key,
+            None => {
+                let key = self.new_variable(&format!("new.{field}"));
+                let current = match position {
+                    Some(position) => self.read_new_value(position),
+                    None => {
+                        let mut current = record_field("new", field);
+                        walk_tree_mut(&mut current, &mut |expr| self.replace_trigger_values(expr))?;
+                        current
+                    }
+                };
+                self.statements
+                    .push(select_statement(set_variable(&key, current)));
+                match position {
+                    Some(position) => self.new_values[position].1 = NewValue::Variable(key.clone()),
+                    None => self
+                        .new_values
+                        .push((field.to_string(), NewValue::Variable(key.clone()))),
+                }
+                key
+            }
+        };
+        self.statements
+            .push(select_where(set_variable(&key, value), condition));
         Ok(())
     }
 
     fn compile_if(&mut self, body: &Json) -> Result<Flow> {
-        let elsif = json_array(body, "elsif_list")
-            .filter_map(|elsif| elsif.get("PLpgSQL_if_elsif"))
-            .map(|elsif| (elsif.get("cond"), elsif, "stmts"));
-        for (condition, parent, key) in
-            std::iter::once((body.get("cond"), body, "then_body")).chain(elsif)
+        let mut branches = vec![Branch {
+            condition: self.condition_expression(body.get("cond"))?,
+            statements: json_array(body, "then_body").collect(),
+        }];
+        for elsif in
+            json_array(body, "elsif_list").filter_map(|elsif| elsif.get("PLpgSQL_if_elsif"))
         {
-            if self.constant_condition(condition)? {
-                return self.compile_statements(parent, key);
-            }
+            branches.push(Branch {
+                condition: self.condition_expression(elsif.get("cond"))?,
+                statements: json_array(elsif, "stmts").collect(),
+            });
         }
-        self.compile_statements(body, "else_body")
+        self.compile_branches(branches, json_array(body, "else_body").collect())
     }
 
-    fn constant_condition(&self, condition: Option<&Json>) -> Result<bool> {
+    /// Compile the branches of IF. Each condition is calculated one time into
+    /// a variable, because a statement in a branch can change what the
+    /// condition reads. A condition that is constant, such as one on
+    /// `TG_OP`, selects its branch at compile time.
+    fn compile_branches(
+        &mut self,
+        branches: Vec<Branch<'_>>,
+        else_statements: Vec<&Json>,
+    ) -> Result<Flow> {
+        let outer_branch = self.branch_condition.clone();
+        let outer = self.statement_condition();
+        let mut earlier = Vec::new();
+        let mut every_branch_returns = true;
+        let mut can_reach_else = true;
+        for branch in branches {
+            let condition = branch.condition;
+            match constant_value(&condition).as_ref().map(Constant::is_true) {
+                Some(false) => continue,
+                Some(true) => {
+                    let branch_condition = and_all(outer_branch.clone(), earlier.iter().map(not));
+                    let flow = self.compile_branch(branch_condition, branch.statements)?;
+                    every_branch_returns &= flow == Flow::Returns;
+                    can_reach_else = false;
+                    break;
+                }
+                None => {
+                    let key = self.new_variable("condition");
+                    let value = coalesce_false(condition);
+                    let value = match and_all(outer.clone(), earlier.iter().map(not)) {
+                        Some(reached_when) => {
+                            case_when(reached_when, value, ast::Expr::Literal(ast::Literal::False))
+                        }
+                        None => value,
+                    };
+                    self.statements
+                        .push(select_statement(set_variable(&key, value)));
+                    let branch_condition = and(outer_branch.clone(), get_variable(&key));
+                    let flow = self.compile_branch(Some(branch_condition), branch.statements)?;
+                    every_branch_returns &= flow == Flow::Returns;
+                    earlier.push(get_variable(&key));
+                }
+            }
+        }
+        if can_reach_else {
+            let branch_condition = and_all(outer_branch, earlier.iter().map(not));
+            let flow = self.compile_branch(branch_condition, else_statements)?;
+            every_branch_returns &= flow == Flow::Returns;
+        }
+        Ok(if every_branch_returns {
+            Flow::Returns
+        } else {
+            Flow::Continues
+        })
+    }
+
+    fn compile_branch(
+        &mut self,
+        condition: Option<ast::Expr>,
+        statements: Vec<&Json>,
+    ) -> Result<Flow> {
+        let saved = std::mem::replace(&mut self.branch_condition, condition);
+        let flow = self.compile_statements(statements);
+        self.branch_condition = saved;
+        flow
+    }
+
+    fn condition_expression(&self, condition: Option<&Json>) -> Result<ast::Expr> {
         let mut condition = translate_expression(expression_query(condition)?)?;
         walk_tree_mut(&mut condition, &mut |expr| {
             self.replace_trigger_values(expr)
         })?;
-        match constant_value(&condition) {
-            Some(Constant::Integer(value)) => Ok(value != 0),
-            Some(Constant::Null) => Ok(false),
-            _ => Err(LimboError::ParseError(
-                "IF with a condition that is not constant is not supported yet".into(),
-            )),
-        }
+        Ok(condition)
     }
 
-    fn compile_return(&mut self, body: &Json) -> Result<()> {
-        if self.trigger.when != "BEFORE" {
-            return Ok(());
-        }
+    fn compile_return(&mut self, body: &Json) -> Result<Flow> {
         let Some(value) = body.get("expr") else {
             return Err(LimboError::ParseError(
                 "RETURN in a trigger function needs a value".into(),
             ));
         };
-        match (
-            self.returned_record(expression_query(Some(value))?)?,
-            self.trigger.op,
-        ) {
-            (Record::New, "INSERT" | "UPDATE") => {
-                if let Some((name, _)) = self.new_values.iter().find(|(name, _)| {
-                    self.table
-                        .get_column(name)
-                        .is_some_and(|(_, column)| column.is_rowid_alias())
-                }) {
-                    return Err(LimboError::ParseError(format!(
-                        "a BEFORE trigger cannot change the INTEGER PRIMARY KEY column \"{name}\" yet"
-                    )));
-                }
-                self.changed_columns = std::mem::take(&mut self.new_values)
-                    .into_iter()
-                    .map(|(name, value)| ChangedColumn { name, value })
-                    .collect();
+        let record = self.returned_record(expression_query(Some(value))?)?;
+        let action = match (self.trigger.when, record, self.trigger.op) {
+            ("BEFORE", Record::New, "INSERT" | "UPDATE") => ReturnAction::WriteNew,
+            ("BEFORE", Record::Old, "UPDATE") => ReturnAction::WriteOld,
+            ("BEFORE", Record::Old, "DELETE") => ReturnAction::Continue,
+            ("BEFORE", _, _) => ReturnAction::Skip,
+            _ => ReturnAction::Continue,
+        };
+        match action {
+            ReturnAction::WriteNew => self.check_new_row()?,
+            ReturnAction::WriteOld => self.check_old_row_key(),
+            ReturnAction::Skip | ReturnAction::Continue => {}
+        }
+        match self.statement_condition() {
+            None => match action {
+                ReturnAction::WriteNew => self.changed_columns = self.new_row(),
+                ReturnAction::WriteOld => self.changed_columns = self.old_row(None),
+                ReturnAction::Skip => self.statements.push(raise_ignore()),
+                ReturnAction::Continue => {}
+            },
+            Some(condition) => {
+                let key = self.return_variable();
+                self.statements.push(select_where(
+                    set_variable(&key, text_literal(action.name())),
+                    Some(condition),
+                ));
+                self.conditional_returns.push(action);
             }
-            (Record::Old, "UPDATE") => {
-                self.changed_columns = self
-                    .table
-                    .columns()
-                    .iter()
-                    .filter(|column| !column.is_generated() && !column.is_rowid_alias())
-                    .filter_map(|column| column.name.clone())
-                    .map(|name| ChangedColumn {
-                        value: ast::Expr::Qualified(
-                            ast::Name::exact("old".to_string()),
-                            ast::Name::exact(name.clone()),
-                        ),
-                        name,
-                    })
-                    .collect();
-            }
-            (Record::Old, "DELETE") => {}
-            _ => self.statements.push(raise_ignore()),
+        }
+        Ok(Flow::Returns)
+    }
+
+    /// After the body: the end of the function without RETURN gives an
+    /// error, and a RETURN in a branch decides what happens to the row.
+    fn finish(&mut self, flow: Flow) -> Result<()> {
+        if flow == Flow::Continues {
+            self.statements.push(select_where(
+                raise_abort_expr(text_literal(
+                    "control reached end of trigger procedure without RETURN",
+                )),
+                self.statement_condition(),
+            ));
+        }
+        let Some(key) = self.return_variable.clone() else {
+            return Ok(());
+        };
+        let returned = |action: ReturnAction| {
+            ast::Expr::Binary(
+                Box::new(get_variable(&key)),
+                ast::Operator::Equals,
+                Box::new(text_literal(action.name())),
+            )
+        };
+        if self.conditional_returns.contains(&ReturnAction::Skip) {
+            self.statements.push(select_where(
+                ast::Expr::Raise(ast::ResolveType::Ignore, None),
+                Some(returned(ReturnAction::Skip)),
+            ));
+        }
+        let writes_old = self.conditional_returns.contains(&ReturnAction::WriteOld);
+        if writes_old {
+            self.changed_columns = self.old_row(Some(returned(ReturnAction::WriteOld)));
+        } else if self.conditional_returns.contains(&ReturnAction::WriteNew) {
+            self.changed_columns = self.new_row();
         }
         Ok(())
+    }
+
+    /// The changed columns of RETURN NEW.
+    fn new_row(&self) -> Vec<ChangedColumn> {
+        (0..self.new_values.len())
+            .map(|position| ChangedColumn {
+                name: self.new_values[position].0.clone(),
+                value: self.read_new_value(position),
+            })
+            .collect()
+    }
+
+    /// The changed columns of RETURN OLD. With `old_when`, the function
+    /// returned OLD only when the condition is true, and NEW otherwise.
+    fn old_row(&self, old_when: Option<ast::Expr>) -> Vec<ChangedColumn> {
+        self.table
+            .columns()
+            .iter()
+            .filter(|column| !column.is_generated() && !column.is_rowid_alias())
+            .filter_map(|column| column.name.clone())
+            .map(|name| {
+                let old = record_field("old", &name);
+                let value = match &old_when {
+                    None => old,
+                    Some(condition) => {
+                        let new = match self
+                            .new_values
+                            .iter()
+                            .position(|(field, _)| field.eq_ignore_ascii_case(&name))
+                        {
+                            Some(position) => self.read_new_value(position),
+                            None => record_field("new", &name),
+                        };
+                        case_when(condition.clone(), old, new)
+                    }
+                };
+                ChangedColumn { name, value }
+            })
+            .collect()
+    }
+
+    fn check_new_row(&self) -> Result<()> {
+        match self.new_values.iter().find(|(name, _)| {
+            self.table
+                .get_column(name)
+                .is_some_and(|(_, column)| column.is_rowid_alias())
+        }) {
+            Some((name, _)) => Err(LimboError::ParseError(format!(
+                "a BEFORE trigger cannot change the INTEGER PRIMARY KEY column \"{name}\" yet"
+            ))),
+            None => Ok(()),
+        }
+    }
+
+    /// RETURN OLD in an UPDATE that changes the INTEGER PRIMARY KEY must keep
+    /// the old key, but core cannot change that column after the triggers.
+    fn check_old_row_key(&mut self) {
+        let Some(name) = self
+            .table
+            .columns()
+            .iter()
+            .find(|column| column.is_rowid_alias())
+            .and_then(|column| column.name.clone())
+        else {
+            return;
+        };
+        let key_changes = ast::Expr::Binary(
+            Box::new(record_field("new", &name)),
+            ast::Operator::IsNot,
+            Box::new(record_field("old", &name)),
+        );
+        self.statements.push(select_where(
+            raise_abort_expr(text_literal(&format!(
+                "RETURN OLD cannot keep the old value of the INTEGER PRIMARY KEY column \"{name}\" yet"
+            ))),
+            Some(and(self.statement_condition(), key_changes)),
+        ));
     }
 
     /// The record that `RETURN <query>` returns for this event. NEW is null in
@@ -358,6 +608,42 @@ impl Compiler<'_> {
             }
         }
         Ok(Record::Null)
+    }
+
+    /// The condition of the statement that compiles now: the condition of
+    /// the branch, and no RETURN yet.
+    fn statement_condition(&self) -> Option<ast::Expr> {
+        let no_return_yet = self
+            .return_variable
+            .as_ref()
+            .map(|key| ast::Expr::IsNull(Box::new(get_variable(key))));
+        match (self.branch_condition.clone(), no_return_yet) {
+            (Some(branch), Some(no_return_yet)) => Some(and(Some(branch), no_return_yet)),
+            (branch, no_return_yet) => branch.or(no_return_yet),
+        }
+    }
+
+    fn return_variable(&mut self) -> String {
+        if let Some(key) = &self.return_variable {
+            return key.clone();
+        }
+        let key = format!("{}.return", self.variable_prefix);
+        self.statements
+            .push(select_statement(set_variable(&key, null())));
+        self.return_variable = Some(key.clone());
+        key
+    }
+
+    fn new_variable(&mut self, name: &str) -> String {
+        self.variable_count += 1;
+        format!("{}.{name}.{}", self.variable_prefix, self.variable_count)
+    }
+
+    fn read_new_value(&self, position: usize) -> ast::Expr {
+        match &self.new_values[position].1 {
+            NewValue::Expression(value) => value.clone(),
+            NewValue::Variable(key) => get_variable(key),
+        }
     }
 
     fn translate_statement(&self, query: &str) -> Result<ast::Stmt> {
@@ -404,8 +690,12 @@ impl Compiler<'_> {
             ast::Expr::Qualified(record, field) => {
                 let record = record.as_str().to_ascii_lowercase();
                 if record == "new" {
-                    if let Some(value) = self.assigned_value(field.as_str())? {
-                        *expr = value;
+                    if let Some(position) = self
+                        .new_values
+                        .iter()
+                        .position(|(name, _)| name.eq_ignore_ascii_case(field.as_str()))
+                    {
+                        *expr = self.read_new_value(position);
                         return Ok(WalkControl::SkipChildren);
                     }
                 }
@@ -414,30 +704,12 @@ impl Compiler<'_> {
                 if !missing {
                     return Ok(WalkControl::Continue);
                 }
-                ast::Expr::Literal(ast::Literal::Null)
+                null()
             }
             _ => return Ok(WalkControl::Continue),
         };
         *expr = replacement;
         Ok(WalkControl::SkipChildren)
-    }
-
-    /// The value of `NEW.<field>` after the assignments so far. The value is
-    /// calculated again at each read, so it must give the same result each time.
-    fn assigned_value(&self, field: &str) -> Result<Option<ast::Expr>> {
-        let Some((_, value)) = self
-            .new_values
-            .iter()
-            .find(|(name, _)| name.eq_ignore_ascii_case(field))
-        else {
-            return Ok(None);
-        };
-        if !gives_same_value_each_time(value) {
-            return Err(LimboError::ParseError(format!(
-                "a read of NEW.{field} after an assignment of a function result or a query result is not supported yet"
-            )));
-        }
-        Ok(Some(value.clone()))
     }
 
     fn trigger_argument(&self, index: ast::Expr) -> ast::Expr {
@@ -448,7 +720,7 @@ impl Compiler<'_> {
                 .and_then(|i| self.trigger.args.get(i))
             {
                 Some(arg) => text_literal(arg),
-                None => ast::Expr::Literal(ast::Literal::Null),
+                None => null(),
             };
         }
         ast::Expr::Case {
@@ -526,6 +798,7 @@ impl<'a> Records<'a> {
     }
 }
 
+#[derive(Clone, Copy)]
 enum Record {
     New,
     Old,
@@ -687,26 +960,45 @@ fn parse_expression(expression: &str) -> Result<pg_query::protobuf::Node> {
     }
 }
 
-fn reads_table(expr: &ast::Expr) -> bool {
-    contains(expr, |expr| {
-        matches!(
-            expr,
-            ast::Expr::Subquery(_) | ast::Expr::Exists(_) | ast::Expr::InSelect { .. }
-        )
-    })
-}
+/// Functions that give the same value each time in one statement.
+const FUNCTIONS_WITH_ONE_VALUE: &[&str] = &[
+    "now",
+    "transaction_timestamp",
+    "statement_timestamp",
+    "coalesce",
+    "nullif",
+    "lower",
+    "upper",
+    "trim",
+    "btrim",
+    "ltrim",
+    "rtrim",
+    "length",
+    "abs",
+    "round",
+    "concat",
+    "concat_ws",
+    "replace",
+    "substr",
+    "substring",
+    "greatest",
+    "least",
+];
 
-fn gives_same_value_each_time(expr: &ast::Expr) -> bool {
-    !contains(expr, |expr| {
-        matches!(
-            expr,
-            ast::Expr::Subquery(_)
-                | ast::Expr::Exists(_)
-                | ast::Expr::InSelect { .. }
-                | ast::Expr::FunctionCall { .. }
-                | ast::Expr::FunctionCallStar { .. }
-                | ast::Expr::Raise(..)
-        )
+/// Whether the value can be calculated again in each place that reads it:
+/// it reads no table, and it calls only functions that give the same value
+/// each time.
+fn can_be_calculated_again(expr: &ast::Expr) -> bool {
+    !contains(expr, |expr| match expr {
+        ast::Expr::Subquery(_)
+        | ast::Expr::Exists(_)
+        | ast::Expr::InSelect { .. }
+        | ast::Expr::FunctionCallStar { .. }
+        | ast::Expr::Raise(..) => true,
+        ast::Expr::FunctionCall { name, .. } => !FUNCTIONS_WITH_ONE_VALUE
+            .iter()
+            .any(|function| name.as_str().eq_ignore_ascii_case(function)),
+        _ => false,
     })
 }
 
@@ -728,6 +1020,14 @@ enum Constant {
     Text(String),
 }
 
+impl Constant {
+    /// Whether a branch with this condition runs. NULL is false, as in
+    /// PL/pgSQL.
+    fn is_true(&self) -> bool {
+        matches!(self, Constant::Integer(value) if *value != 0)
+    }
+}
+
 /// The value of an expression that has only constants, as after the
 /// replacement of `TG_OP` and the other trigger values.
 fn constant_value(expr: &ast::Expr) -> Option<Constant> {
@@ -743,7 +1043,7 @@ fn constant_value(expr: &ast::Expr) -> Option<Constant> {
             value.parse().ok().map(Constant::Integer)
         }
         ast::Expr::Literal(ast::Literal::String(value)) => {
-            Some(Constant::Text(value.trim_matches('\'').replace("''", "'")))
+            Some(Constant::Text(value[1..value.len() - 1].replace("''", "'")))
         }
         ast::Expr::Unary(ast::UnaryOperator::Not, expr) => match constant_value(expr)? {
             Constant::Integer(value) => Some(Constant::Integer(i64::from(value == 0))),
@@ -798,26 +1098,115 @@ fn constant_value(expr: &ast::Expr) -> Option<Constant> {
     }
 }
 
-fn raise_abort(message: &str) -> ast::Stmt {
-    select_statement(ast::Expr::Raise(
-        ast::ResolveType::Abort,
-        Some(Box::new(text_literal(message))),
-    ))
+/// Make a statement of a branch run only when `condition` is true.
+fn with_condition(stmt: ast::Stmt, condition: Option<ast::Expr>) -> Result<ast::Stmt> {
+    let Some(condition) = condition else {
+        return Ok(stmt);
+    };
+    Ok(match stmt {
+        ast::Stmt::Insert {
+            with,
+            or_conflict,
+            tbl_name,
+            columns,
+            body,
+            returning,
+        } => {
+            let body = match body {
+                ast::InsertBody::Select(select, upsert) => {
+                    ast::InsertBody::Select(inserted_rows_with_condition(select, condition), upsert)
+                }
+                ast::InsertBody::DefaultValues => {
+                    return Err(LimboError::ParseError(
+                        "INSERT ... DEFAULT VALUES in a branch is not supported yet".into(),
+                    ))
+                }
+            };
+            ast::Stmt::Insert {
+                with,
+                or_conflict,
+                tbl_name,
+                columns,
+                body,
+                returning,
+            }
+        }
+        ast::Stmt::Update(mut update) => {
+            update.where_clause = Some(Box::new(and(
+                update.where_clause.map(|expr| *expr),
+                condition,
+            )));
+            ast::Stmt::Update(update)
+        }
+        ast::Stmt::Delete {
+            with,
+            tbl_name,
+            indexed,
+            where_clause,
+            returning,
+        } => ast::Stmt::Delete {
+            with,
+            tbl_name,
+            indexed,
+            where_clause: Some(Box::new(and(where_clause.map(|expr| *expr), condition))),
+            returning,
+        },
+        _ => {
+            return Err(LimboError::ParseError(
+                "this SQL statement in a branch is not supported yet".into(),
+            ))
+        }
+    })
 }
 
-fn raise_ignore() -> ast::Stmt {
-    select_statement(ast::Expr::Raise(ast::ResolveType::Ignore, None))
+/// The rows of `INSERT ... <select>` when `condition` is true, and no row
+/// otherwise. One row of VALUES becomes `SELECT values WHERE condition`, so
+/// that the values are calculated only when the condition is true.
+fn inserted_rows_with_condition(select: ast::Select, condition: ast::Expr) -> ast::Select {
+    if select.with.is_none()
+        && select.body.compounds.is_empty()
+        && select.order_by.is_empty()
+        && select.limit.is_none()
+    {
+        if let ast::OneSelect::Values(rows) = &select.body.select {
+            if let [row] = rows.as_slice() {
+                return one_select(
+                    row.iter()
+                        .map(|value| ast::ResultColumn::Expr(value.clone(), None))
+                        .collect(),
+                    None,
+                    Some(condition),
+                );
+            }
+        }
+    }
+    one_select(
+        vec![ast::ResultColumn::Star],
+        Some(ast::FromClause {
+            select: Box::new(ast::SelectTable::Select {
+                select,
+                alias: None,
+                lateral: false,
+            }),
+            joins: vec![],
+        }),
+        Some(condition),
+    )
 }
 
-fn select_statement(expr: ast::Expr) -> ast::Stmt {
-    ast::Stmt::Select(ast::Select {
+fn one_select(
+    columns: Vec<ast::ResultColumn>,
+    from: Option<ast::FromClause>,
+    where_clause: Option<ast::Expr>,
+) -> ast::Select {
+    ast::Select {
         with: None,
         body: ast::SelectBody {
             select: ast::OneSelect::Select {
                 distinctness: None,
-                columns: vec![ast::ResultColumn::Expr(Box::new(expr), None)],
-                from: None,
-                where_clause: None,
+                columns,
+                from,
+                where_clause: where_clause.map(Box::new),
                 group_by: None,
                 window_clause: vec![],
             },
@@ -825,7 +1214,90 @@ fn select_statement(expr: ast::Expr) -> ast::Stmt {
         },
         order_by: vec![],
         limit: None,
-    })
+    }
+}
+
+fn select_statement(expr: ast::Expr) -> ast::Stmt {
+    select_where(expr, None)
+}
+
+fn select_where(expr: ast::Expr, condition: Option<ast::Expr>) -> ast::Stmt {
+    ast::Stmt::Select(one_select(
+        vec![ast::ResultColumn::Expr(Box::new(expr), None)],
+        None,
+        condition,
+    ))
+}
+
+fn raise_ignore() -> ast::Stmt {
+    select_statement(ast::Expr::Raise(ast::ResolveType::Ignore, None))
+}
+
+fn raise_abort_expr(message: ast::Expr) -> ast::Expr {
+    ast::Expr::Raise(ast::ResolveType::Abort, Some(Box::new(message)))
+}
+
+fn set_variable(key: &str, value: ast::Expr) -> ast::Expr {
+    function_call(SET_VARIABLE, vec![text_literal(key), value])
+}
+
+fn get_variable(key: &str) -> ast::Expr {
+    function_call(GET_VARIABLE, vec![text_literal(key)])
+}
+
+fn function_call(name: &str, args: Vec<ast::Expr>) -> ast::Expr {
+    ast::Expr::FunctionCall {
+        name: ast::Name::exact(name.to_string()),
+        distinctness: None,
+        args: args.into_iter().map(Box::new).collect(),
+        order_by: vec![],
+        within_group: vec![],
+        filter_over: ast::FunctionTail {
+            filter_clause: None,
+            over_clause: None,
+        },
+    }
+}
+
+fn coalesce_false(condition: ast::Expr) -> ast::Expr {
+    function_call(
+        "coalesce",
+        vec![condition, ast::Expr::Literal(ast::Literal::False)],
+    )
+}
+
+fn case_when(condition: ast::Expr, then: ast::Expr, otherwise: ast::Expr) -> ast::Expr {
+    ast::Expr::Case {
+        base: None,
+        when_then_pairs: vec![(Box::new(condition), Box::new(then))],
+        else_expr: Some(Box::new(otherwise)),
+    }
+}
+
+fn and(left: Option<ast::Expr>, right: ast::Expr) -> ast::Expr {
+    match left {
+        Some(left) => ast::Expr::Binary(Box::new(left), ast::Operator::And, Box::new(right)),
+        None => right,
+    }
+}
+
+fn and_all(first: Option<ast::Expr>, rest: impl Iterator<Item = ast::Expr>) -> Option<ast::Expr> {
+    rest.fold(first, |all, next| Some(and(all, next)))
+}
+
+fn not(expr: &ast::Expr) -> ast::Expr {
+    ast::Expr::Unary(ast::UnaryOperator::Not, Box::new(expr.clone()))
+}
+
+fn null() -> ast::Expr {
+    ast::Expr::Literal(ast::Literal::Null)
+}
+
+fn record_field(record: &str, field: &str) -> ast::Expr {
+    ast::Expr::Qualified(
+        ast::Name::exact(record.to_string()),
+        ast::Name::exact(field.to_string()),
+    )
 }
 
 fn text_literal(text: &str) -> ast::Expr {
