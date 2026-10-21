@@ -414,6 +414,32 @@ DELETE FROM t WHERE x = 1;     -- rows deleted: 1
 PRAGMA count_changes = off;    -- statements return no rows again
 ```
 
+### locking_mode
+
+Returns the database locking mode, which is always reported as `exclusive`.
+
+```sql
+PRAGMA locking_mode;
+-- exclusive
+
+PRAGMA locking_mode = exclusive;
+```
+
+<Warning>
+Turso only accepts the value `EXCLUSIVE`, in any letter case and with or without quotes.
+SQLite's default value `NORMAL` is rejected:
+
+```sql
+PRAGMA locking_mode = normal;
+-- Error: locking_mode must be EXCLUSIVE
+```
+
+Writing the pragma does not change how Turso locks the database file. It only checks the
+value and then reports `exclusive`, the same as the read form. So a portable script that
+sets `locking_mode` back to `NORMAL` when it finishes will fail here even though it works
+on SQLite. This matches the `Partial` entry for `PRAGMA locking_mode` in `COMPAT.md`.
+</Warning>
+
 ## Integrity Checks
 
 ### integrity_check
