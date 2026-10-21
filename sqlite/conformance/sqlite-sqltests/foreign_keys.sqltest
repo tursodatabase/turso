@@ -2381,6 +2381,17 @@ expect {
     0
 }
 
+@cross-check-integrity
+test fk-cascade-delete-self-referential-deletes-grandchild-under-sibling {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE t(id INTEGER PRIMARY KEY, k INTEGER REFERENCES t(id) ON DELETE CASCADE);
+    INSERT INTO t VALUES(1,NULL),(2,1),(3,1),(4,2);
+    DELETE FROM t WHERE id=1;
+    SELECT id, k FROM t;
+}
+expect {
+}
+
 # EXPLAIN should print the recursive FK action once and then stop.
 test fk-cascade-delete-self-referential-explain-terminates {
     PRAGMA foreign_keys=ON;
@@ -2632,6 +2643,76 @@ test fk-setnull-delete-two-table-cycle {
 }
 expect {
     2|
+}
+
+@cross-check-integrity
+test fk-setnull-delete-self-referential-keeps-rows-that-did-not-match {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE t(id INTEGER PRIMARY KEY, p REFERENCES t ON DELETE SET NULL);
+    CREATE INDEX tp ON t(p);
+    INSERT INTO t VALUES (1, NULL), (2, 1), (3, 1);
+    DELETE FROM t WHERE p IS NULL;
+    SELECT * FROM t;
+}
+expect {
+    2|
+    3|
+}
+
+@cross-check-integrity
+test fk-setnull-delete-self-referential-deletes-every-matching-row {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE t(id INTEGER PRIMARY KEY, parent INTEGER REFERENCES t(id) ON DELETE SET NULL);
+    INSERT INTO t VALUES (1, NULL), (2, 1), (3, 2), (4, 3), (5, 4), (6, 5);
+    DELETE FROM t WHERE id > 1;
+    SELECT group_concat(id) FROM t;
+}
+expect {
+    1
+}
+
+@cross-check-integrity
+test fk-setnull-delete-self-referential-continues-after-first-cell-of-page {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE t(id INTEGER PRIMARY KEY, parent INTEGER REFERENCES t(id) ON DELETE SET NULL, pad TEXT);
+    WITH RECURSIVE s(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM s WHERE x < 12)
+    INSERT INTO t SELECT x, CASE WHEN x > 1 THEN x - 1 END, printf('%.900c', 'x') FROM s;
+    DELETE FROM t WHERE id > 4;
+    SELECT group_concat(id) FROM t;
+}
+expect {
+    1,2,3,4
+}
+
+@cross-check-integrity
+test fk-setnull-delete-update-write-back-deletes-every-matching-row {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE t(id INTEGER PRIMARY KEY, cref INTEGER REFERENCES c(x) ON UPDATE SET NULL);
+    CREATE TABLE c(id INTEGER PRIMARY KEY, x INTEGER UNIQUE REFERENCES t(id) ON DELETE SET NULL);
+    INSERT INTO t VALUES (1, NULL), (2, NULL), (3, NULL), (4, NULL), (5, NULL), (6, NULL);
+    INSERT INTO c(x) VALUES (2), (3), (4), (5), (6);
+    INSERT INTO t VALUES (1002, 2), (1003, 3), (1004, 4), (1005, 5), (1006, 6);
+    DELETE FROM t WHERE id BETWEEN 2 AND 6;
+    SELECT group_concat(id) FROM t;
+}
+expect {
+    1,1002,1003,1004,1005,1006
+}
+
+@cross-check-integrity
+test fk-setnull-delete-update-write-back-continues-after-first-cell-of-page {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE t(id INTEGER PRIMARY KEY, cref INTEGER REFERENCES c(x) ON UPDATE SET NULL, pad TEXT);
+    CREATE TABLE c(id INTEGER PRIMARY KEY, x INTEGER UNIQUE REFERENCES t(id) ON DELETE SET NULL);
+    WITH RECURSIVE s(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM s WHERE n < 12)
+    INSERT INTO t SELECT n, NULL, printf('%.900c', 'x') FROM s;
+    INSERT INTO c(x) VALUES (5);
+    INSERT INTO t VALUES (1005, 5, NULL);
+    DELETE FROM t WHERE id BETWEEN 5 AND 12;
+    SELECT group_concat(id) FROM t;
+}
+expect {
+    1,2,3,4,1005
 }
 
 # Basic ON UPDATE SET NULL
