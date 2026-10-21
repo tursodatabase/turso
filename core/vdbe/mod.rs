@@ -36,6 +36,7 @@ pub mod insn;
 pub mod metrics;
 #[cfg(test)]
 mod native_extension_tests;
+mod row_change;
 pub mod rowset;
 pub mod sorter;
 #[cfg(test)]
@@ -877,9 +878,8 @@ impl ActiveOpStateSlot {
         Delete,
         OpDeleteState,
         OpDeleteState {
-            sub_state: OpDeleteSubState::MaybeCaptureRecord,
-            route: None,
-            deleted_record: None,
+            sub_state: OpDeleteSubState::ResolveViewRoute,
+            view_change: None,
         }
     );
     active_state_accessor!(
@@ -925,9 +925,8 @@ impl ActiveOpStateSlot {
         Insert,
         OpInsertState,
         OpInsertState {
-            sub_state: OpInsertSubState::MaybeCaptureRecord,
-            route: None,
-            old_record: None,
+            sub_state: OpInsertSubState::ResolveViewRoute,
+            view_change: None,
             is_noop_update: false,
         }
     );
@@ -4516,8 +4515,7 @@ mod tests {
 
         *state.active_op_state.insert() = OpInsertState {
             sub_state: OpInsertSubState::Seek,
-            route: None,
-            old_record: None,
+            view_change: None,
             is_noop_update: false,
         };
         state.seek_state = OpSeekState::MoveLast;

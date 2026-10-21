@@ -51,6 +51,9 @@ use crate::vdbe::hash_table::{
 };
 use crate::vdbe::insn::InsertFlags;
 use crate::vdbe::metrics::HashJoinMetrics;
+use crate::vdbe::row_change::{
+    capture_row_change, change_log_route, log_row_change_for_views, RowWrite, ViewChange,
+};
 use crate::vdbe::vacuum::VacuumInPlaceOpContext;
 use crate::vdbe::value::ComparisonOp;
 use crate::vdbe::ValueIteratorExt;
@@ -12669,90 +12672,29 @@ pub fn op_yield(
 
 pub struct OpInsertState {
     pub sub_state: OpInsertSubState,
-    /// Change-log routing for the written table, resolved once per row in
-    /// MaybeCaptureRecord and reused by every later sub-state. Avoids
-    /// re-acquiring the schema read lock and re-walking the dependent-view
-    /// list on every sub-state transition.
-    pub(crate) route: Option<ChangeLogRoute>,
-    pub old_record: Option<(i64, crate::alloc::Vec<Value>)>,
+    /// Route and captured row change; None when no view depends on the written table.
+    pub(crate) view_change: Option<Box<ViewChange>>,
     /// Set by the NoopCheck sub-state to indicate the row already has the exact
     /// same payload, so the physical write can be skipped.
     pub is_noop_update: bool,
 }
 
-pub(crate) struct ChangeLogRoute {
-    table: Arc<crate::schema::BTreeTable>,
-    dependent_views: crate::alloc::Vec<String>,
-    is_materialized_view: bool,
-}
-
-/// Resolve change-log routing from the btree being written, never from the
-/// SQL spelling carried in the opcode for tracing/update hooks.
-fn change_log_route(
-    program: &Program,
-    state: &ProgramState,
-    cursor_id: usize,
-) -> Result<Option<ChangeLogRoute>> {
-    // Materialized views currently live in main. Writes to temp or attached
-    // databases must not be resolved through main's schema just because a
-    // table there happens to have the same name or root page.
-    if state.cursor_databases.get(cursor_id).copied().flatten() != Some(MAIN_DB_ID) {
-        return Ok(None);
-    }
-    let cursor_table = match program.cursor_ref.get(cursor_id) {
-        Some((_, CursorType::BTreeTable(table)))
-        | Some((_, CursorType::MaterializedView(table, _))) => table.clone(),
-        _ => return Ok(None),
-    };
-    let schema = program.connection.schema.read();
-    // Check for dependent views before doing anything else: a plain write to
-    // a table with no materialized views is the overwhelmingly common case,
-    // and it must stay as cheap as it was before change-log routing existed,
-    // i.e. a single schema-map lookup rather than also resolving the
-    // schema-owned table descriptor and the is_materialized_view check below.
-    let dependent_views = schema.get_dependent_materialized_views(&cursor_table.name);
-    if dependent_views.is_empty() {
-        return Ok(None);
-    }
-    // Maintenance write cursors intentionally use a synthetic physical
-    // descriptor that includes the trailing weight column. Resolve the bound
-    // cursor back to the schema-owned descriptor so change capture always
-    // deals in the relation's logical row shape.
-    let Some(table) = schema.get_btree_table(&cursor_table.name) else {
-        return Ok(None);
-    };
-    // A zero root belongs to a cursor whose btree is assigned at runtime
-    // (CREATE) or to an ephemeral relation. Otherwise the root is part of the
-    // bound relation identity and must still match the current schema.
-    if cursor_table.root_page != 0 && cursor_table.root_page != table.root_page {
-        return Err(LimboError::InternalError(format!(
-            "changed btree {} has root {}, but the current schema binds it to root {}",
-            cursor_table.name, cursor_table.root_page, table.root_page
-        )));
-    }
-    let is_materialized_view = schema.is_materialized_view(&table.name);
-    Ok(Some(ChangeLogRoute {
-        table,
-        dependent_views,
-        is_materialized_view,
-    }))
-}
-
 #[derive(Debug, PartialEq, Clone, Copy)]
 pub enum OpInsertSubState {
-    /// If this insert overwrites a record, capture the old record for incremental view maintenance.
-    /// If cursor is already positioned (no REQUIRE_SEEK), capture directly.
-    /// If REQUIRE_SEEK is set, transition to Seek first.
-    MaybeCaptureRecord,
+    /// Find out whether materialized views depend on the written btree.
+    /// If REQUIRE_SEEK is set, transition to Seek next.
+    ResolveViewRoute,
     /// Seek to the correct position if needed.
     /// In a table insert, if the caller does not pass InsertFlags::REQUIRE_SEEK, they must ensure that a seek has already happened to the correct location.
     /// This typically happens by invoking either Insn::NewRowid or Insn::NotExists, because:
     /// 1. op_new_rowid() seeks to the end of the table, which is the correct insertion position.
     /// 2. op_not_exists() seeks to the position in the table where the target rowid would be inserted.
     Seek,
-    /// Capture the old record at the current cursor position for IVM.
+    /// Capture the row change (old record at the cursor, new record from the
+    /// registers) for the dependent views, and decide the no-op check from the
+    /// two images, so that NoopCheck is skipped.
     /// The cursor must already be positioned (by a prior seek or by NotExists/NewRowid).
-    CaptureRecord,
+    CaptureRowChange,
     /// Check whether the update is a no-op (existing record matches new record).
     /// Must complete before Insert so that cursor.rowid()/record() are never
     /// interleaved with a partially-completed cursor.insert().
@@ -12762,99 +12704,8 @@ pub enum OpInsertSubState {
     /// Updating last_insert_rowid may return IO, so we need a separate state for it so that we don't
     /// start inserting the same row multiple times.
     UpdateLastRowid,
-    /// If the row being overwritten had dependent views, record its retraction.
-    ApplyRetraction,
-    /// Recording the retraction started a change-log spill; wait for it to
-    /// finish before recording anything else.
-    WaitForRetractionSpill,
-    /// Record the new row's contribution to any dependent views.
-    ApplyInsertion,
-    /// Recording the insertion started a change-log spill; wait for it to
-    /// finish before this opcode is done.
-    WaitForInsertionSpill,
-}
-
-fn materialized_view_record_change(
-    table_name: &str,
-    table: &crate::schema::BTreeTable,
-    mut physical_values: crate::alloc::Vec<Value>,
-    direction: isize,
-) -> Result<(crate::alloc::Vec<Value>, isize)> {
-    let logical_width = table.columns().len();
-    if physical_values.len() != logical_width + 1 {
-        return Err(LimboError::Corrupt(format!(
-            "materialized view {table_name} record has {} fields, expected {} logical fields and one weight",
-            physical_values.len(),
-            logical_width
-        )));
-    }
-    let stored_weight = match physical_values.pop() {
-        Some(Value::Numeric(Numeric::Integer(weight))) => weight,
-        _ => {
-            return Err(LimboError::Corrupt(format!(
-                "materialized view {table_name} record has a non-integer weight"
-            )));
-        }
-    };
-    if stored_weight <= 0 {
-        return Err(LimboError::Corrupt(format!(
-            "materialized view {table_name} record has non-positive weight {stored_weight}"
-        )));
-    }
-    let stored_weight = isize::try_from(stored_weight).map_err(|_| {
-        LimboError::Corrupt(format!(
-            "materialized view {table_name} weight does not fit the maintenance weight type"
-        ))
-    })?;
-    let weight = stored_weight.checked_mul(direction).ok_or_else(|| {
-        LimboError::Corrupt(format!(
-            "materialized view {table_name} maintenance weight overflow"
-        ))
-    })?;
-    Ok((physical_values, weight))
-}
-
-fn normalize_table_change_record(
-    table: &crate::schema::BTreeTable,
-    rowid: i64,
-    mut values: crate::alloc::Vec<Value>,
-) -> Result<crate::alloc::Vec<Value>> {
-    if values.len() > table.columns().len() {
-        return Err(LimboError::Corrupt(format!(
-            "table {} record has {} fields, but the schema has {} columns",
-            table.name,
-            values.len(),
-            table.columns().len()
-        )));
-    }
-
-    values.try_reserve(table.columns().len() - values.len())?;
-    for column in table.columns().iter().skip(values.len()) {
-        let mut value = if column.is_rowid_alias() {
-            Value::from_i64(rowid)
-        } else if let Some(default) = column.default.as_deref() {
-            crate::translate::alter::eval_constant_default_value(default)?
-        } else {
-            Value::Null
-        };
-        if let Some(converted) = column.affinity().convert(&value) {
-            value = match converted {
-                Either::Left(ValueRef::Numeric(numeric)) => Value::from(numeric),
-                Either::Left(_) => {
-                    unreachable!("affinity conversion returned an unexpected borrowed value")
-                }
-                Either::Right(value) => value,
-            };
-        }
-        values.push(value);
-    }
-
-    for (index, column) in table.columns().iter().enumerate() {
-        if column.is_rowid_alias() {
-            values[index] = Value::from_i64(rowid);
-        }
-    }
-    Ok(values)
+    /// Feed the captured row change to the materialized-view change log.
+    LogViewChange,
 }
 
 pub fn op_insert(
@@ -12869,34 +12720,27 @@ pub fn op_insert(
             key_reg,
             record_reg,
             flag,
-            table_name,
+            table_name: _,
         },
         insn
     );
 
     loop {
         match state.active_op_state.insert().sub_state {
-            OpInsertSubState::MaybeCaptureRecord => {
+            OpInsertSubState::ResolveViewRoute => {
                 let route = if program.prepared().has_materialized_views {
                     change_log_route(program, state, *cursor_id)?
                 } else {
                     None
                 };
-                let has_change_log_subscribers = route
-                    .as_ref()
-                    .is_some_and(|route| !route.dependent_views.is_empty());
-                state.active_op_state.insert().route = route;
-                // If there are no dependent views, we don't need to capture the old record.
-                // We also don't need to do it if the rowid of the UPDATEd row was changed, because
-                // op_delete already captured the deletion for IVM, and this insert only needs to
-                // record the new row (which ApplyViewChange handles without old_record).
-                let needs_capture =
-                    has_change_log_subscribers && !flag.has(InsertFlags::UPDATE_ROWID_CHANGE);
+                let has_dependent_views = route.is_some();
+                state.active_op_state.insert().view_change =
+                    route.map(|route| Box::new(ViewChange::new(route)));
 
                 if flag.has(InsertFlags::REQUIRE_SEEK) {
                     state.active_op_state.insert().sub_state = OpInsertSubState::Seek;
-                } else if needs_capture {
-                    state.active_op_state.insert().sub_state = OpInsertSubState::CaptureRecord;
+                } else if has_dependent_views {
+                    state.active_op_state.insert().sub_state = OpInsertSubState::CaptureRowChange;
                 } else {
                     state.active_op_state.insert().sub_state = OpInsertSubState::NoopCheck;
                 }
@@ -12927,70 +12771,44 @@ pub fn op_insert(
                 )? {
                     return Ok(state.suspend_on_io(io));
                 }
-                let has_change_log_subscribers = state
-                    .active_op_state
-                    .insert()
-                    .route
-                    .as_ref()
-                    .is_some_and(|route| !route.dependent_views.is_empty());
-                let needs_capture =
-                    has_change_log_subscribers && !flag.has(InsertFlags::UPDATE_ROWID_CHANGE);
-                if needs_capture {
-                    state.active_op_state.insert().sub_state = OpInsertSubState::CaptureRecord;
-                } else {
-                    state.active_op_state.insert().sub_state = OpInsertSubState::NoopCheck;
-                }
+                state.active_op_state.insert().sub_state =
+                    if state.active_op_state.insert().view_change.is_some() {
+                        OpInsertSubState::CaptureRowChange
+                    } else {
+                        OpInsertSubState::NoopCheck
+                    };
                 continue;
             }
-            OpInsertSubState::CaptureRecord => {
-                {
-                    let cursor = state.get_cursor(*cursor_id);
-                    let cursor = cursor.as_btree_mut();
-                    if !cursor.has_rowid() {
-                        state.active_op_state.insert().old_record = None;
-                        state.active_op_state.insert().sub_state = OpInsertSubState::NoopCheck;
-                        continue;
-                    }
-                }
-                let insert_key = match &state.registers[*key_reg].get_value() {
-                    Value::Numeric(Numeric::Integer(i)) => *i,
-                    _ => unreachable!("expected integer key in insert"),
+            OpInsertSubState::CaptureRowChange => {
+                let Some(view_change) = state.active_op_state.insert().view_change.as_ref() else {
+                    unreachable!("row change capture without dependent views");
                 };
-
-                let cursor = state.get_cursor(*cursor_id);
-                let cursor = cursor.as_btree_mut();
-                let maybe_key = return_if_io!(state, cursor.rowid());
-                let old_record =
-                    if let Some(key) = maybe_key {
-                        if key == insert_key {
-                            let maybe_record = return_if_io!(state, cursor.record());
-                            if let Some(record) = maybe_record {
-                                let values = record.get_values_owned()?;
-                                let route =
-                                    state.active_op_state.insert().route.as_ref().ok_or_else(
-                                        || {
-                                            LimboError::InternalError(format!(
-                                        "changed btree for {table_name} missing from schema"
-                                    ))
-                                        },
-                                    )?;
-                                let values = if route.is_materialized_view {
-                                    values
-                                } else {
-                                    normalize_table_change_record(&route.table, key, values)?
-                                };
-                                Some((key, values))
-                            } else {
-                                None
-                            }
-                        } else {
-                            None
-                        }
-                    } else {
-                        None
-                    };
-                state.active_op_state.insert().old_record = old_record;
-                state.active_op_state.insert().sub_state = OpInsertSubState::NoopCheck;
+                let table = view_change.route.table.clone();
+                // When a Delete on this cursor already ran (an UPDATE that changed
+                // the rowid), op_delete already captured the old row; this insert
+                // only adds the new one.
+                let write = RowWrite::Insert {
+                    key_reg: *key_reg,
+                    record_reg: *record_reg,
+                    may_replace_row: !flag.has(InsertFlags::UPDATE_ROWID_CHANGE),
+                };
+                let row_change =
+                    return_if_io!(state, capture_row_change(state, *cursor_id, table, write));
+                // The capture already read the stored row, so the no-op check
+                // compares the two images instead of reading the row again.
+                // This is the NoopCheck condition; when UPDATE_ROWID_CHANGE is set,
+                // there is no old image here.
+                let is_noop_update = flag.has(InsertFlags::SKIP_LAST_ROWID)
+                    && !get_cursor!(state, *cursor_id).as_btree_mut().is_mvcc()
+                    && row_change.writes_same_record();
+                let insert_state = state.active_op_state.insert();
+                insert_state
+                    .view_change
+                    .as_mut()
+                    .expect("just checked above")
+                    .row_change = Some(row_change);
+                insert_state.is_noop_update = is_noop_update;
+                insert_state.sub_state = OpInsertSubState::Insert;
                 continue;
             }
             // TODO: add some InsertFlags that allows us to skip this check when we know for
@@ -13095,7 +12913,6 @@ pub fn op_insert(
                     // actually being written to. Tracking deltas here would feed the
                     // sqlite_master record into the DBSP circuit as if it were data
                     // from the named table, corrupting the materialized view.
-                    state.active_op_state.insert().old_record = None;
                     break;
                 }
             }
@@ -13127,148 +12944,25 @@ pub fn op_insert(
                         state.record_statement_change();
                     }
                 }
-                let has_change_log_subscribers = state
-                    .active_op_state
-                    .insert()
-                    .route
-                    .as_ref()
-                    .is_some_and(|route| !route.dependent_views.is_empty());
-                if has_change_log_subscribers {
-                    if !has_rowid {
-                        return Err(LimboError::ParseError(
-                            "WITHOUT ROWID tables with dependent materialized views are not supported"
-                                .to_string(),
-                        ).into());
-                    }
-                    state.active_op_state.insert().sub_state = OpInsertSubState::ApplyRetraction;
+                if state.active_op_state.insert().view_change.is_some() {
+                    state.active_op_state.insert().sub_state = OpInsertSubState::LogViewChange;
                     continue;
                 }
                 break;
             }
-            OpInsertSubState::ApplyRetraction => {
-                if state.active_op_state.insert().is_noop_update {
-                    state.active_op_state.insert().old_record = None;
+            OpInsertSubState::LogViewChange => {
+                let insert_state = state.active_op_state.insert();
+                if insert_state.is_noop_update {
                     break;
                 }
-                let Some((key, values)) = state.active_op_state.insert().old_record.take() else {
-                    state.active_op_state.insert().sub_state = OpInsertSubState::ApplyInsertion;
-                    continue;
-                };
-                let insert_state = state.active_op_state.insert();
-                let route = insert_state.route.as_ref().ok_or_else(|| {
-                    LimboError::InternalError(format!(
-                        "changed btree for {table_name} missing from schema"
-                    ))
-                })?;
-                assert!(!route.dependent_views.is_empty());
-
-                let spill_started = if route.is_materialized_view {
-                    let (values, weight) = materialized_view_record_change(
-                        &route.table.name,
-                        &route.table,
-                        values,
-                        -1,
-                    )?;
-                    program.connection.transaction_changes.change(
-                        &route.table,
-                        &route.dependent_views,
-                        key,
-                        values,
-                        weight,
-                        program.connection.get_temp_store(),
-                    )?
-                } else {
-                    program.connection.transaction_changes.delete(
-                        &route.table,
-                        &route.dependent_views,
-                        key,
-                        values,
-                        program.connection.get_temp_store(),
-                    )?
-                };
-                state.active_op_state.insert().sub_state = if spill_started {
-                    OpInsertSubState::WaitForRetractionSpill
-                } else {
-                    OpInsertSubState::ApplyInsertion
-                };
-                continue;
-            }
-            OpInsertSubState::WaitForRetractionSpill => {
-                return_if_io!(state, program.connection.transaction_changes.finish_spill());
-                state.active_op_state.insert().sub_state = OpInsertSubState::ApplyInsertion;
-                continue;
-            }
-            OpInsertSubState::ApplyInsertion => {
-                let insert_state = state.active_op_state.insert();
-                let route = insert_state.route.as_ref().ok_or_else(|| {
-                    LimboError::InternalError(format!(
-                        "changed btree for {table_name} missing from schema"
-                    ))
-                })?;
-                assert!(!route.dependent_views.is_empty());
-
-                let (key, values) = {
-                    let key = match &state.registers[*key_reg].get_value() {
-                        Value::Numeric(Numeric::Integer(i)) => *i,
-                        _ => unreachable!("expected integer key"),
-                    };
-
-                    let record = match &state.registers[*record_reg] {
-                        Register::Record(r) => std::borrow::Cow::Borrowed(r),
-                        Register::Value(value) => {
-                            let values = [value];
-                            let record = ImmutableRecord::from_values(values, values.len())?;
-                            std::borrow::Cow::Owned(record)
-                        }
-                        Register::Aggregate(..) => {
-                            unreachable!("Cannot insert an aggregate value.")
-                        }
-                    };
-
-                    // Add insertion of new row to view deltas
-                    let new_values = record.get_values_owned()?;
-                    let new_values = if route.is_materialized_view {
-                        new_values
-                    } else {
-                        normalize_table_change_record(&route.table, key, new_values)?
-                    };
-
-                    (key, new_values)
-                };
-
-                let spill_started = if route.is_materialized_view {
-                    let (values, weight) = materialized_view_record_change(
-                        &route.table.name,
-                        &route.table,
-                        values,
-                        1,
-                    )?;
-                    program.connection.transaction_changes.change(
-                        &route.table,
-                        &route.dependent_views,
-                        key,
-                        values,
-                        weight,
-                        program.connection.get_temp_store(),
-                    )?
-                } else {
-                    program.connection.transaction_changes.insert(
-                        &route.table,
-                        &route.dependent_views,
-                        key,
-                        values,
-                        program.connection.get_temp_store(),
-                    )?
-                };
-                if spill_started {
-                    state.active_op_state.insert().sub_state =
-                        OpInsertSubState::WaitForInsertionSpill;
-                    continue;
-                }
-                break;
-            }
-            OpInsertSubState::WaitForInsertionSpill => {
-                return_if_io!(state, program.connection.transaction_changes.finish_spill());
+                let view_change = insert_state
+                    .view_change
+                    .as_mut()
+                    .expect("LogViewChange is only entered when ResolveViewRoute found a route");
+                return_if_io!(
+                    state,
+                    log_row_change_for_views(&program.connection, view_change)
+                );
                 break;
             }
         }
@@ -13301,25 +12995,20 @@ pub fn op_int_64(
 
 pub struct OpDeleteState {
     pub sub_state: OpDeleteSubState,
-    /// Change-log routing for the deleted table, resolved once per row in
-    /// MaybeCaptureRecord and reused by every later sub-state. Avoids
-    /// re-acquiring the schema read lock and re-walking the dependent-view
-    /// list on every sub-state transition.
-    pub(crate) route: Option<ChangeLogRoute>,
-    pub deleted_record: Option<(i64, crate::alloc::Vec<Value>)>,
+    /// Route and captured row change; None when no view depends on the deleted table.
+    pub(crate) view_change: Option<Box<ViewChange>>,
 }
 
 #[derive(Clone, Copy)]
 pub enum OpDeleteSubState {
-    /// Capture the record before deletion, if the are dependent views.
-    MaybeCaptureRecord,
+    /// Find out whether materialized views depend on the btree.
+    ResolveViewRoute,
+    /// Capture the record before deletion for the dependent views.
+    CaptureRowChange,
     /// Delete the record.
     Delete,
-    /// Apply the change to the dependent views.
-    ApplyViewChange,
-    /// Recording the change started a change-log spill; wait for it to
-    /// finish before this opcode is done.
-    WaitForSpill,
+    /// Feed the captured row change to the materialized-view change log.
+    LogViewChange,
 }
 
 pub fn op_delete(
@@ -13331,7 +13020,7 @@ pub fn op_delete(
     load_insn!(
         Delete {
             cursor_id,
-            table_name,
+            table_name: _,
             is_part_of_update,
         },
         insn
@@ -13339,7 +13028,7 @@ pub fn op_delete(
 
     loop {
         match state.active_op_state.delete().sub_state {
-            OpDeleteSubState::MaybeCaptureRecord => {
+            OpDeleteSubState::ResolveViewRoute => {
                 let route = if program.prepared().has_materialized_views {
                     change_log_route(program, state, *cursor_id)?
                 } else {
@@ -13349,36 +13038,26 @@ pub fn op_delete(
                     state.active_op_state.delete().sub_state = OpDeleteSubState::Delete;
                     continue;
                 };
-                if route.dependent_views.is_empty() {
-                    state.active_op_state.delete().route = Some(route);
-                    state.active_op_state.delete().sub_state = OpDeleteSubState::Delete;
-                    continue;
-                }
-
-                let deleted_record = {
-                    let cursor = state.get_cursor(*cursor_id);
-                    let cursor = cursor.as_btree_mut();
-                    // Get the current key
-                    let maybe_key = return_if_io!(state, cursor.rowid());
-                    let key = maybe_key.ok_or_else(|| {
-                        LimboError::InternalError("Cannot delete: no current row".to_string())
-                    })?;
-                    // Get the current record before deletion and extract values
-                    let maybe_record = return_if_io!(state, cursor.record());
-                    if let Some(record) = maybe_record {
-                        let values = record.get_values_owned()?;
-                        let values = if route.is_materialized_view {
-                            values
-                        } else {
-                            normalize_table_change_record(&route.table, key, values)?
-                        };
-                        Some((key, values))
-                    } else {
-                        None
-                    }
+                state.active_op_state.delete().view_change = Some(Box::new(ViewChange::new(route)));
+                state.active_op_state.delete().sub_state = OpDeleteSubState::CaptureRowChange;
+                continue;
+            }
+            OpDeleteSubState::CaptureRowChange => {
+                let Some(view_change) = state.active_op_state.delete().view_change.as_ref() else {
+                    unreachable!("row change capture without dependent views");
                 };
-                state.active_op_state.delete().deleted_record = deleted_record;
-                state.active_op_state.delete().route = Some(route);
+                let table = view_change.route.table.clone();
+                let row_change = return_if_io!(
+                    state,
+                    capture_row_change(state, *cursor_id, table, RowWrite::Delete)
+                );
+                state
+                    .active_op_state
+                    .delete()
+                    .view_change
+                    .as_mut()
+                    .expect("just checked above")
+                    .row_change = Some(row_change);
                 state.active_op_state.delete().sub_state = OpDeleteSubState::Delete;
                 continue;
             }
@@ -13390,63 +13069,22 @@ pub fn op_delete(
                 }
                 // Increment metrics for row write (DELETE is a write operation)
                 state.record_rows_written(1);
-                let has_change_log_subscribers = state
-                    .active_op_state
-                    .delete()
-                    .route
-                    .as_ref()
-                    .is_some_and(|route| !route.dependent_views.is_empty());
-                if !has_change_log_subscribers {
+                if state.active_op_state.delete().view_change.is_none() {
                     break;
                 }
-                state.active_op_state.delete().sub_state = OpDeleteSubState::ApplyViewChange;
+                state.active_op_state.delete().sub_state = OpDeleteSubState::LogViewChange;
                 continue;
             }
-            OpDeleteSubState::ApplyViewChange => {
-                let Some((key, values)) = state.active_op_state.delete().deleted_record.take()
-                else {
-                    // No record existed at the delete position; nothing to publish.
-                    break;
-                };
+            OpDeleteSubState::LogViewChange => {
                 let delete_state = state.active_op_state.delete();
-                let route = delete_state.route.as_ref().ok_or_else(|| {
-                    LimboError::InternalError(format!(
-                        "changed btree for {table_name} missing from schema"
-                    ))
-                })?;
-                assert!(!route.dependent_views.is_empty());
-                let spill_started = if route.is_materialized_view {
-                    let (values, weight) = materialized_view_record_change(
-                        &route.table.name,
-                        &route.table,
-                        values,
-                        -1,
-                    )?;
-                    program.connection.transaction_changes.change(
-                        &route.table,
-                        &route.dependent_views,
-                        key,
-                        values,
-                        weight,
-                        program.connection.get_temp_store(),
-                    )?
-                } else {
-                    program.connection.transaction_changes.delete(
-                        &route.table,
-                        &route.dependent_views,
-                        key,
-                        values,
-                        program.connection.get_temp_store(),
-                    )?
-                };
-                if spill_started {
-                    state.active_op_state.delete().sub_state = OpDeleteSubState::WaitForSpill;
-                    continue;
-                }
-                break;
-            }
-            OpDeleteSubState::WaitForSpill => {
-                return_if_io!(state, program.connection.transaction_changes.finish_spill());
+                let view_change = delete_state
+                    .view_change
+                    .as_mut()
+                    .expect("LogViewChange is only entered when ResolveViewRoute found a route");
+                return_if_io!(
+                    state,
+                    log_row_change_for_views(&program.connection, view_change)
+                );
                 break;
             }
         }
