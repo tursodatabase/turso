@@ -3335,7 +3335,16 @@ impl PostgreSQLTranslator {
 
         let translated_order = self.translate_order_by(&func_call.agg_order)?;
         let (order_by, within_group) = if func_call.agg_within_group {
-            (vec![], translated_order)
+            // mode() and the percentile functions skip NULL inputs, so the
+            // NULL order of their sort cannot change the result.
+            let within_group = translated_order
+                .into_iter()
+                .map(|column| ast::SortedColumn {
+                    nulls: None,
+                    ..column
+                })
+                .collect();
+            (vec![], within_group)
         } else {
             (translated_order, vec![])
         };
@@ -4012,7 +4021,10 @@ impl PostgreSQLTranslator {
                             Ok(pg_query::protobuf::SortByNulls::SortbyNullsLast) => {
                                 Some(ast::NullsOrder::Last)
                             }
-                            _ => None,
+                            _ => match order {
+                                Some(ast::SortOrder::Desc) => Some(ast::NullsOrder::First),
+                                _ => Some(ast::NullsOrder::Last),
+                            },
                         };
 
                     sorted_columns.push(ast::SortedColumn { expr, order, nulls });
@@ -7662,7 +7674,15 @@ mod tests {
         let translator = PostgreSQLTranslator::new();
 
         let cases = [
-            ("SELECT * FROM t ORDER BY a", None),
+            ("SELECT * FROM t ORDER BY a", Some(ast::NullsOrder::Last)),
+            (
+                "SELECT * FROM t ORDER BY a ASC",
+                Some(ast::NullsOrder::Last),
+            ),
+            (
+                "SELECT * FROM t ORDER BY a DESC",
+                Some(ast::NullsOrder::First),
+            ),
             (
                 "SELECT * FROM t ORDER BY a NULLS FIRST",
                 Some(ast::NullsOrder::First),

@@ -586,3 +586,93 @@ expect {
 expect @tursopg error {
     HAVING clause on a non-aggregate query
 }
+
+# PostgreSQL sorts NULL as larger than every value: ASC puts NULLs last and
+# DESC puts them first, the opposite of SQLite.
+
+setup null_order {
+    CREATE TABLE v (x int);
+    INSERT INTO v VALUES (1), (NULL), (2);
+}
+
+@setup null_order
+test order-by-asc-puts-nulls-last {
+    SELECT coalesce(x::text, 'N') FROM v ORDER BY x;
+    SELECT coalesce(x::text, 'N') FROM v ORDER BY x ASC;
+}
+expect {
+    1
+    2
+    N
+    1
+    2
+    N
+}
+
+@setup null_order
+test order-by-desc-puts-nulls-first {
+    SELECT coalesce(x::text, 'N') FROM v ORDER BY x DESC;
+}
+expect {
+    N
+    2
+    1
+}
+
+@setup null_order
+test order-by-with-limit-puts-nulls-last {
+    SELECT coalesce(x::text, 'N') FROM v ORDER BY x DESC LIMIT 2;
+    SELECT coalesce(x::text, 'N') FROM v ORDER BY x LIMIT 2;
+}
+expect {
+    N
+    2
+    1
+    2
+}
+
+@setup null_order
+test order-by-an-indexed-column-puts-nulls-last {
+    CREATE INDEX vx ON v (x);
+    SELECT coalesce(x::text, 'N') FROM v ORDER BY x;
+    SELECT coalesce(x::text, 'N') FROM v ORDER BY x DESC;
+}
+expect {
+    1
+    2
+    N
+    N
+    2
+    1
+}
+
+@setup null_order
+test order-by-after-union-puts-nulls-last {
+    SELECT coalesce(x::text, 'N') FROM (SELECT x FROM v UNION SELECT 3 ORDER BY x) AS u;
+}
+expect {
+    1
+    2
+    3
+    N
+}
+
+@setup null_order
+test window-order-by-puts-nulls-last {
+    SELECT coalesce(x::text, 'N'), row_number() OVER (ORDER BY x) FROM v ORDER BY 2;
+}
+expect {
+    1|1
+    2|2
+    N|3
+}
+
+@setup null_order
+test group-by-with-order-by-puts-nulls-last {
+    SELECT coalesce(x::text, 'N'), count(*) FROM v GROUP BY x ORDER BY x;
+}
+expect {
+    1|1
+    2|1
+    N|1
+}

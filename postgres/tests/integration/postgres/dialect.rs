@@ -2216,10 +2216,14 @@ fn test_postgres_order_by_nulls_first_last(db: TempDatabase) {
         results
     };
 
-    // Default ASC ordering treats NULLs as smallest, matching PostgreSQL.
+    // PostgreSQL treats NULLs as largest by default, unlike SQLite.
     assert_eq!(
         run("SELECT v FROM t ORDER BY v"),
-        vec![None, None, Some(5), Some(10), Some(20)]
+        vec![Some(5), Some(10), Some(20), None, None]
+    );
+    assert_eq!(
+        run("SELECT v FROM t ORDER BY v DESC"),
+        vec![None, None, Some(20), Some(10), Some(5)]
     );
     assert_eq!(
         run("SELECT v FROM t ORDER BY v NULLS FIRST"),
