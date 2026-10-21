@@ -7,8 +7,8 @@
 # by key. When a base table has no index on its join key, the view creates
 # one. Views that need the same index share it: DROP VIEW removes it once
 # no remaining view needs it, and DROP INDEX refuses it. When the WHERE
-# clause filters the join's first table, the index only holds the rows that
-# pass the filter.
+# clause has terms that read only that table, the index only holds the rows
+# that pass them.
 
 test matview-owned-index-partial {
     CREATE TABLE t1(id INTEGER PRIMARY KEY, p INT, v INT);
