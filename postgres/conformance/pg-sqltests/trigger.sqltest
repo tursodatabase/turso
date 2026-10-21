@@ -1,0 +1,74 @@
+# Triggers with PL/pgSQL trigger functions through the PostgreSQL frontend.
+
+@database :memory:
+
+setup log_table {
+    CREATE TABLE t (id int, a text);
+    CREATE TABLE log (op text, id int, a text);
+}
+
+@setup log_table
+test create-trigger-twice-errors {
+    CREATE FUNCTION log_row() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RETURN NULL; END $$;
+    CREATE TRIGGER t_log AFTER INSERT ON t FOR EACH ROW EXECUTE FUNCTION log_row();
+    CREATE TRIGGER t_log AFTER INSERT ON t FOR EACH ROW EXECUTE FUNCTION log_row();
+}
+expect error {
+    trigger "t_log" for relation "t" already exists
+}
+
+@setup log_table
+test create-trigger-with-missing-function-errors {
+    CREATE TRIGGER t_log AFTER INSERT ON t FOR EACH ROW EXECUTE FUNCTION missing();
+}
+expect error {
+    function missing\(\) does not exist
+}
+
+@setup log_table
+test create-trigger-with-function-that-is-not-a-trigger-function-errors {
+    CREATE FUNCTION forty_two() RETURNS int LANGUAGE sql AS 'SELECT 42';
+    CREATE TRIGGER t_log AFTER INSERT ON t FOR EACH ROW EXECUTE FUNCTION forty_two();
+}
+expect error {
+    function forty_two must return type trigger
+}
+
+@setup log_table
+test drop-missing-trigger-errors {
+    DROP TRIGGER missing ON t;
+}
+expect error {
+    trigger "missing" for table "t" does not exist
+}
+
+@setup log_table
+test drop-trigger-if-exists-ignores-a-missing-trigger {
+    DROP TRIGGER IF EXISTS missing ON t;
+    SELECT 1;
+}
+expect {
+    1
+}
+
+@skip-if postgres "PostgreSQL supports statement-level triggers"
+@setup log_table
+test statement-level-trigger-errors {
+    CREATE FUNCTION log_row() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RETURN NULL; END $$;
+    CREATE TRIGGER t_log AFTER INSERT ON t FOR EACH STATEMENT EXECUTE FUNCTION log_row();
+}
+expect error {
+    statement-level triggers are not supported
+}
+
+@setup log_table
+test dropped-trigger-can-be-created-again {
+    CREATE FUNCTION log_row() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RETURN NULL; END $$;
+    CREATE TRIGGER t_log AFTER INSERT OR UPDATE ON t FOR EACH ROW EXECUTE FUNCTION log_row();
+    DROP TRIGGER t_log ON t;
+    CREATE TRIGGER t_log AFTER INSERT ON t FOR EACH ROW EXECUTE FUNCTION log_row();
+    SELECT 1;
+}
+expect {
+    1
+}

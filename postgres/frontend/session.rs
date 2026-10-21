@@ -348,6 +348,30 @@ fn try_prepare_special(pg_conn: &Arc<PgConnectionInner>, sql: &str) -> Result<Op
         Err(_) => return Ok(None),
     };
 
+    let first_node = parse_result
+        .protobuf
+        .stmts
+        .first()
+        .and_then(|stmt| stmt.stmt.as_deref())
+        .and_then(|stmt| stmt.node.as_ref());
+    match first_node {
+        Some(pg_query::protobuf::node::Node::CreateTrigStmt(statement)) => {
+            crate::trigger::create_trigger(
+                &pg_conn.conn,
+                statement,
+                &session_search_path(pg_conn),
+            )?;
+            return Ok(Some(noop_statement(&pg_conn.conn)?));
+        }
+        Some(pg_query::protobuf::node::Node::DropStmt(drop))
+            if drop.remove_type() == pg_query::protobuf::ObjectType::ObjectTrigger =>
+        {
+            crate::trigger::drop_trigger(&pg_conn.conn, drop, &session_search_path(pg_conn))?;
+            return Ok(Some(noop_statement(&pg_conn.conn)?));
+        }
+        _ => {}
+    }
+
     if let Some(set_stmt) = try_extract_set(&parse_result) {
         let stmt = handle_pg_set(pg_conn, &set_stmt)?;
         return Ok(Some(stmt));
@@ -387,6 +411,18 @@ fn try_prepare_special(pg_conn: &Arc<PgConnectionInner>, sql: &str) -> Result<Op
     }
 
     Ok(None)
+}
+
+fn session_search_path(pg_conn: &PgConnectionInner) -> Vec<String> {
+    pg_conn
+        .conn
+        .context::<PgSessionState>()
+        .expect("PostgreSQL connections have session state")
+        .lock()
+        .unwrap()
+        .search_path
+        .clone()
+        .unwrap_or_default()
 }
 
 fn noop_statement(conn: &Arc<Connection>) -> Result<Statement> {

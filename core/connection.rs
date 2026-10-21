@@ -3026,6 +3026,16 @@ impl Connection {
         self.schema.read().clone()
     }
 
+    pub fn database_schema(&self, database_name: &str) -> Option<Arc<Schema>> {
+        let database_id = self
+            .namespaces
+            .database_id(&crate::util::normalize_ident(database_name))?;
+        Some(match database_id {
+            MAIN_DB_ID => self.current_schema(),
+            database_id => self.cached_non_main_schema(database_id),
+        })
+    }
+
     pub fn attached_database_names(&self) -> Vec<String> {
         self.namespaces
             .others()

@@ -4,6 +4,7 @@ mod functions;
 mod options;
 mod session;
 mod sql_function;
+mod trigger;
 mod unnest;
 mod user_function;
 

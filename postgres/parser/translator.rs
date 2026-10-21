@@ -106,6 +106,13 @@ impl PostgreSQLTranslator {
         }
     }
 
+    pub fn translate_expression(
+        &self,
+        node: &pg_query::protobuf::Node,
+    ) -> Result<ast::Expr, ParseError> {
+        self.translate_expr(node)
+    }
+
     /// Translate a PostgreSQL parse result into Turso's format.
     /// For statements that may generate prerequisites (e.g., serial columns),
     /// use `translate_with_prereqs` instead.
@@ -4459,7 +4466,7 @@ fn join_keeps_unmatched_right_rows(join: &ast::JoinedSelectTable) -> bool {
 }
 
 /// Maps a PostgreSQL schema name to the Turso schema that holds its tables.
-fn call_name(funcname: &[pg_query::protobuf::Node]) -> Result<String, ParseError> {
+pub fn call_name(funcname: &[pg_query::protobuf::Node]) -> Result<String, ParseError> {
     let names: Vec<&str> = funcname
         .iter()
         .filter_map(|node| match &node.node {
