@@ -558,3 +558,120 @@ expect {
     9
     10
 }
+
+test drop-if-exists-with-missing-schema-does-nothing {
+    DROP TABLE IF EXISTS sp_missing_ds.t;
+    DROP VIEW IF EXISTS sp_missing_ds.v;
+    DROP INDEX IF EXISTS sp_missing_ds.i;
+    DROP SEQUENCE IF EXISTS sp_missing_ds.s;
+    SET search_path TO sp_missing_ds;
+    DROP TABLE IF EXISTS sp_missing_ds.t;
+    SELECT 1;
+}
+expect {
+    1
+}
+
+test drop-table-stops-at-view-of-the-same-name-in-an-earlier-schema {
+    CREATE SCHEMA IF NOT EXISTS sp_dk1;
+    CREATE SCHEMA IF NOT EXISTS sp_dk2;
+    DROP VIEW IF EXISTS sp_dk1.t;
+    DROP TABLE IF EXISTS sp_dk2.t;
+    CREATE VIEW sp_dk1.t AS SELECT 1 AS c;
+    CREATE TABLE sp_dk2.t (x int);
+    SET search_path TO sp_dk1, sp_dk2;
+    DROP TABLE IF EXISTS t;
+}
+expect error {
+    "t" is not a table
+}
+
+test drop-view-stops-at-table-of-the-same-name-in-an-earlier-schema {
+    CREATE SCHEMA IF NOT EXISTS sp_dk3;
+    CREATE SCHEMA IF NOT EXISTS sp_dk4;
+    DROP TABLE IF EXISTS sp_dk3.v;
+    DROP VIEW IF EXISTS sp_dk4.v;
+    CREATE TABLE sp_dk3.v (x int);
+    CREATE VIEW sp_dk4.v AS SELECT 1 AS c;
+    SET search_path TO sp_dk3, sp_dk4;
+    DROP VIEW v;
+}
+expect error {
+    "v" is not a view
+}
+
+test drop-index-stops-at-table-of-the-same-name-in-an-earlier-schema {
+    CREATE SCHEMA IF NOT EXISTS sp_dk5;
+    CREATE SCHEMA IF NOT EXISTS sp_dk6;
+    DROP TABLE IF EXISTS sp_dk5.i;
+    DROP TABLE IF EXISTS sp_dk6.u;
+    CREATE TABLE sp_dk5.i (x int);
+    CREATE TABLE sp_dk6.u (x int);
+    CREATE INDEX i ON sp_dk6.u (x);
+    SET search_path TO sp_dk5, sp_dk6;
+    DROP INDEX IF EXISTS i;
+}
+expect error {
+    "i" is not an index
+}
+
+test drop-if-exists-of-missing-qualified-objects-under-search-path {
+    CREATE SCHEMA IF NOT EXISTS sp_dk7;
+    SET search_path TO sp_dk7, public;
+    DROP TABLE IF EXISTS public.nonexistent;
+    DROP VIEW IF EXISTS public.nonexistent;
+    DROP INDEX IF EXISTS public.nonexistent;
+    DROP SEQUENCE IF EXISTS public.nonexistent;
+    DROP TABLE IF EXISTS sp_dk7.nonexistent;
+    SELECT 1;
+}
+expect {
+    1
+}
+
+test drop-sequence-stops-at-table-of-the-same-name-in-an-earlier-schema {
+    CREATE SCHEMA IF NOT EXISTS sp_dk8;
+    CREATE SCHEMA IF NOT EXISTS sp_dk9;
+    DROP TABLE IF EXISTS sp_dk8.sq;
+    DROP SEQUENCE IF EXISTS sp_dk9.sq;
+    CREATE TABLE sp_dk8.sq (x int);
+    CREATE SEQUENCE sp_dk9.sq;
+    SET search_path TO sp_dk8, sp_dk9;
+    DROP SEQUENCE sq;
+}
+expect error {
+    "sq" is not a sequence
+}
+
+test nextval-stops-at-table-of-the-same-name-in-an-earlier-schema {
+    CREATE SCHEMA IF NOT EXISTS sp_dk10;
+    CREATE SCHEMA IF NOT EXISTS sp_dk11;
+    DROP TABLE IF EXISTS sp_dk10.sq;
+    DROP SEQUENCE IF EXISTS sp_dk11.sq;
+    CREATE TABLE sp_dk10.sq (x int);
+    CREATE SEQUENCE sp_dk11.sq;
+    SET search_path TO sp_dk10, sp_dk11;
+    SELECT nextval('sq');
+}
+expect error {
+    "sq" is not a sequence
+}
+
+@skip-if postgres "Turso drops only the first object of a multi-object DROP"
+test drop-if-exists-with-missing-schema-keeps-other-objects {
+    CREATE TABLE real_t (x int);
+    DROP TABLE IF EXISTS sp_missing_dm.t, real_t;
+}
+expect error {
+    no such database
+}
+
+@skip-if postgres "main is the database behind public in Turso, not a schema"
+test drop-if-exists-in-the-main-database {
+    CREATE TABLE t (x int);
+    DROP TABLE IF EXISTS main.t;
+    SELECT count(*) FROM pg_tables WHERE tablename = 't';
+}
+expect {
+    0
+}

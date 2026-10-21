@@ -2,7 +2,7 @@ use crate::schema::{BTreeCharacteristics, BTreeTable, SchemaObjectType, RESERVED
 use crate::storage::pager::CreateBTreeFlags;
 use crate::sync::Arc;
 use crate::translate::{
-    emitter::Resolver,
+    emitter::{RelationKind, Resolver},
     schema::{emit_schema_entry, SchemaEntryType, SQLITE_TABLEID},
 };
 use crate::util::{
@@ -472,7 +472,12 @@ pub fn translate_drop_view(
     // Unqualified names search the temp schema first, then main, then
     // attached databases, so DROP VIEW finds temp views like SQLite does.
     let normalized_view_name = normalize_ident(view_name.name.as_str());
-    let Some(database_id) = resolver.find_existing_table_database_id_qualified(view_name)? else {
+    let found = if resolver.uses_search_path() {
+        resolver.find_existing_relation_of_kind(view_name, RelationKind::View)?
+    } else {
+        resolver.find_existing_table_database_id_qualified(view_name)?
+    };
+    let Some(database_id) = found else {
         if if_exists {
             return Ok(());
         }

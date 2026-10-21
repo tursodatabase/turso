@@ -14,7 +14,7 @@ use crate::storage::pager::CreateBTreeFlags;
 use crate::translate::collate::CollationSeq;
 use crate::translate::emitter::{
     emit_cdc_autocommit_commit, emit_cdc_full_record, emit_cdc_insns, prepare_cdc_if_necessary,
-    OperationMode, Resolver,
+    OperationMode, RelationKind, Resolver,
 };
 use crate::translate::expr::{walk_expr, WalkControl};
 use crate::translate::fkeys::emit_fk_drop_table_check;
@@ -1892,7 +1892,12 @@ pub fn translate_drop_table(
     let opts = ProgramBuilderOpts::new(4, 40, 4);
     program.extend(&opts);
 
-    let Some(database_id) = resolver.find_existing_table_database_id_qualified(&tbl_name)? else {
+    let found = if resolver.uses_search_path() {
+        resolver.find_existing_relation_of_kind(&tbl_name, RelationKind::Table)?
+    } else {
+        resolver.find_existing_table_database_id_qualified(&tbl_name)?
+    };
+    let Some(database_id) = found else {
         if if_exists {
             return Ok(());
         }

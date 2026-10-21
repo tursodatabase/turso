@@ -203,9 +203,9 @@ pub(super) fn translate_sequence_function(
         (db_id, normalize_ident(name))
     } else {
         let name = normalize_ident(&seq_name_raw);
-        (resolver.resolve_existing_sequence_database_id(&name), name)
+        (resolver.resolve_existing_sequence_database_id(&name)?, name)
     };
-    let runtime_args = qualify_sequence_argument(args, resolver);
+    let runtime_args = qualify_sequence_argument(args, resolver)?;
     let args = runtime_args.as_deref().unwrap_or(args);
 
     let backing_table_name =
@@ -362,18 +362,25 @@ pub(super) fn translate_sequence_function(
 pub(super) fn qualify_sequence_argument(
     args: &[Box<ast::Expr>],
     resolver: &Resolver,
-) -> Option<Box<[Box<ast::Expr>]>> {
-    let seq_name_raw = extract_string_literal(args.first()?).ok()?;
+) -> Result<Option<Box<[Box<ast::Expr>]>>> {
+    let Some(seq_name_raw) = args
+        .first()
+        .and_then(|arg| extract_string_literal(arg).ok())
+    else {
+        return Ok(None);
+    };
     if seq_name_raw.contains('.') {
-        return None;
+        return Ok(None);
     }
     let name = normalize_ident(&seq_name_raw);
-    let database_id = resolver.resolve_existing_sequence_database_id(&name);
-    let runtime_name = resolver.runtime_sequence_name(database_id, &name)?;
+    let database_id = resolver.resolve_existing_sequence_database_id(&name)?;
+    let Some(runtime_name) = resolver.runtime_sequence_name(database_id, &name) else {
+        return Ok(None);
+    };
     let mut args = args.to_vec();
     args[0] = Box::new(ast::Expr::Literal(ast::Literal::String(format!(
         "'{}'",
         runtime_name.replace('\'', "''")
     ))));
-    Some(args.into_boxed_slice())
+    Ok(Some(args.into_boxed_slice()))
 }

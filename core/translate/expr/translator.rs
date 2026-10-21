@@ -2062,7 +2062,7 @@ fn translate_function_call_expr(
                     func_ctx,
                 ),
                 ScalarFunc::CurrVal => {
-                    let runtime_args = qualify_sequence_argument(args, resolver);
+                    let runtime_args = qualify_sequence_argument(args, resolver)?;
                     translate_function(
                         program,
                         runtime_args.as_deref().unwrap_or(args),
