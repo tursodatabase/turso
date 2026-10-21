@@ -617,7 +617,7 @@ fn resolve_type_name(type_name: &str, resolver: &Resolver) -> Result<CheckExprTy
     if let Ok(Some(resolved)) = resolver.schema().resolve_type_unchecked(type_name) {
         // Domains are transparent wrappers — resolve to the base primitive type
         // so CHECK constraint type checking compares primitives, not domain names.
-        if resolved.is_domain() {
+        if resolved.is_domain() || resolved.reads_stored_values_unchanged() {
             return resolve_type_name(&resolved.primitive, resolver);
         }
         return Ok(CheckExprType::CustomType(type_name.to_lowercase()));
