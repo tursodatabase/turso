@@ -883,6 +883,12 @@ impl Statement {
             .map_err(|err| *err)
     }
 
+    /// Makes a trigger or foreign key action see the same current time as
+    /// the statement that runs it, as SQLite does.
+    pub(crate) fn set_current_time(&mut self, now: crate::WallClockInstant) {
+        self.state.current_time = Some(now);
+    }
+
     pub(crate) fn abort_subprogram(&mut self, err: Option<&LimboError>) -> Result<()> {
         let result = self.program.abort(&self.pager, err, &mut self.state, false);
         self.state.execution_state = vdbe::ProgramExecutionState::Failed;

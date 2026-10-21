@@ -2787,3 +2787,18 @@ test datetime-modifier-date-offset-five-digit-year {
 expect {
     '2025-03-16 10:20:30'|'2023-01-12 09:20:30'|NULL
 }
+
+test current-time-same-for-whole-statement {
+    SELECT count(DISTINCT d), count(DISTINCT s), count(DISTINCT j), count(DISTINCT u), count(DISTINCT t)
+    FROM (SELECT datetime('subsecond') AS d, strftime('%Y-%m-%d %H:%M:%f', 'now') AS s, julianday('now') AS j, unixepoch('subsec') AS u, time('subsec') AS t FROM generate_series(1, 100000));
+}
+expect {
+    1|1|1|1|1
+}
+
+test current-time-same-for-streamed-rows {
+    SELECT count(*) FROM (SELECT DISTINCT datetime('subsecond') FROM generate_series(1, 100000));
+}
+expect {
+    1
+}

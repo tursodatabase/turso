@@ -1122,6 +1122,19 @@ impl ScalarFunc {
                 | Self::StringToArray
         )
     }
+
+    pub fn is_date_time_function(&self) -> bool {
+        matches!(
+            self,
+            Self::Date
+                | Self::Time
+                | Self::DateTime
+                | Self::JulianDay
+                | Self::UnixEpoch
+                | Self::StrfTime
+                | Self::TimeDiff
+        )
+    }
 }
 
 impl Display for ScalarFunc {
