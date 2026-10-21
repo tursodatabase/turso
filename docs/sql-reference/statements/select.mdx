@@ -506,6 +506,8 @@ Combine the results of two or more SELECT statements.
 
 All set operations require the same number of columns in each SELECT, with compatible types.
 
+For text comparisons in `UNION`, `INTERSECT`, and `EXCEPT`, each result column uses the first defined collation among the corresponding SELECT expressions, from left to right. This also applies to chains of three or more SELECT statements.
+
 ```sql
 -- Customers who are also employees
 SELECT name FROM customers
