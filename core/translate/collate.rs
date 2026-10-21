@@ -15,7 +15,7 @@ use crate::{
     translate::{
         emitter::Resolver,
         expr::{walk_expr, WalkControl},
-        plan::TableReferences,
+        plan::{SelectPlan, TableReferences},
     },
     Result,
 };
@@ -378,6 +378,33 @@ pub fn get_collseq_from_expr_with_symbols(
     Ok(explicit.or(column))
 }
 
+/// The collation a compound SELECT compares result column `index` with, for
+/// deduplication and ORDER BY alike, as SQLite 3.50's multiSelectCollSeq
+/// picks it: the leftmost of all `branches` whose expression has a collation
+/// decides. A branch's expression has one when it carries an explicit COLLATE
+/// or is a column (BINARY when the column declares none), as in
+/// sqlite3ExprCollSeq, so `SELECT a FROM t UNION SELECT b COLLATE NOCASE FROM
+/// u` compares under BINARY. Trailing UNION ALL branches count too:
+/// multiSelect builds one KeyInfo from the whole compound and attaches it to
+/// every temporary table.
+pub fn compound_column_collation(
+    branches: &[&SelectPlan],
+    index: usize,
+    resolver: &Resolver,
+) -> Result<Option<CollationSeq>> {
+    for branch in branches {
+        let collation = explicit_or_column_collation(
+            &branch.result_columns[index].expr,
+            &branch.table_references,
+            Some(resolver.symbol_table),
+        )?;
+        if collation.is_some() {
+            return Ok(collation);
+        }
+    }
+    Ok(None)
+}
+
 pub fn resolve_comparison_collseq_with_resolver(
     lhs_expr: &Expr,
     rhs_expr: &Expr,
@@ -408,15 +435,18 @@ pub fn resolve_comparison_collseq_with_resolver(
     Ok(lhs_explicit.or(rhs_explicit).or(lhs_column).or(rhs_column))
 }
 
-/// Collation of `x` or of `y` in `x IN (SELECT y ...)`: its explicit `COLLATE` if any,
-/// otherwise its column's collation (BINARY when the column declares none). `x` belongs
-/// to the outer query and `y` to the subquery, so each side is looked up in its own tables.
-pub fn in_subquery_side_collation(
+/// The collation an expression carries on its own, as SQLite's sqlite3ExprCollSeq
+/// computes it: its explicit `COLLATE` if any, otherwise its column's collation (BINARY
+/// when the column declares none), otherwise none. Used for each side of
+/// `x IN (SELECT y ...)`, where `x` and `y` are looked up in their own query's tables,
+/// and for each branch of a compound SELECT.
+pub fn explicit_or_column_collation(
     expr: &Expr,
     referenced_tables: &TableReferences,
+    symbol_table: Option<&SymbolTable>,
 ) -> Result<Option<CollationSeq>> {
     let (explicit, _) =
-        get_collseq_parts_from_expr_with_symbols(expr, referenced_tables, None, None)?;
+        get_collseq_parts_from_expr_with_symbols(expr, referenced_tables, symbol_table, None)?;
     let column = comparison_operand_column_collseq(expr, referenced_tables)?;
     Ok(explicit.or(column))
 }

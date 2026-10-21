@@ -18,7 +18,7 @@ use crate::{
     emit_explain,
     schema::{BTreeCharacteristics, BTreeTable, Column, Index, IndexColumn, Table},
     translate::{
-        collate::in_subquery_side_collation,
+        collate::explicit_or_column_collation,
         compound_select::emit_program_for_compound_select,
         emitter::select::{
             emit_materialized_build_inputs, emit_program_for_select_with_resolver, emit_query,
@@ -1012,7 +1012,11 @@ fn get_subquery_parser<'a>(
                         )
                         .aff_mask(),
                     );
-                    lhs_collations.push(in_subquery_side_collation(lhs_expr, referenced_tables)?);
+                    lhs_collations.push(explicit_or_column_collation(
+                        lhs_expr,
+                        referenced_tables,
+                        None,
+                    )?);
                 }
                 let in_affinity_str: Arc<String> = Arc::new(affinity_chars);
 
@@ -1020,7 +1024,8 @@ fn get_subquery_parser<'a>(
                     .iter()
                     .enumerate()
                     .map(|(i, c)| {
-                        let rhs_collation = in_subquery_side_collation(&c.expr, table_references)?;
+                        let rhs_collation =
+                            explicit_or_column_collation(&c.expr, table_references, None)?;
                         Ok::<_, crate::LimboError>(IndexColumn {
                             name: c.name(table_references).unwrap_or("").to_string(),
                             order: SortOrder::Asc,
