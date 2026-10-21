@@ -275,6 +275,27 @@ pub enum Stmt {
         /// domain name
         domain_name: String,
     },
+    /// `CREATE FUNCTION` of a frontend dialect. The engine stores the
+    /// definition and does not parse it.
+    CreateFunction {
+        /// `OR REPLACE`
+        or_replace: bool,
+        /// function name
+        func_name: QualifiedName,
+        /// number of arguments
+        arg_count: usize,
+        /// definition in the language of the frontend dialect
+        definition: String,
+    },
+    /// `DROP FUNCTION`
+    DropFunction {
+        /// `IF EXISTS`
+        if_exists: bool,
+        /// function name
+        func_name: QualifiedName,
+        /// number of arguments, or `None` for the only function with this name
+        arg_count: Option<usize>,
+    },
     /// `INSERT`
     Insert {
         /// CTE

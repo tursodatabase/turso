@@ -632,6 +632,23 @@ impl<'a> Resolver<'a> {
         }
     }
 
+    pub(crate) fn resolve_function_database_id(
+        &self,
+        name: &str,
+        arg_count: Option<usize>,
+    ) -> Option<usize> {
+        let has_function = |schema: &Schema, name: &str| {
+            schema
+                .functions_named(name)
+                .any(|function| arg_count.is_none_or(|count| function.arg_count == count))
+        };
+        let database_id = self
+            .resolve_unqualified_existing_database_id(name, has_function)
+            .ok()?;
+        self.with_schema(database_id, |schema| has_function(schema, name))
+            .then_some(database_id)
+    }
+
     pub(crate) fn enable_expr_to_reg_cache(&mut self) {
         self.expr_to_reg_cache_enabled = true;
     }

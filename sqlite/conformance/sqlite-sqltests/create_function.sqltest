@@ -1,0 +1,21 @@
+@database :memory:
+
+test create-function-is-a-syntax-error {
+    CREATE FUNCTION f() RETURNS int LANGUAGE sql AS 'SELECT 1';
+}
+expect error {
+    FUNCTION
+}
+
+test create-or-replace-function-is-a-syntax-error {
+    CREATE OR REPLACE FUNCTION f() RETURNS int LANGUAGE sql AS 'SELECT 1';
+}
+expect error {
+}
+
+test drop-function-is-a-syntax-error {
+    DROP FUNCTION IF EXISTS f();
+}
+expect error {
+    FUNCTION
+}

@@ -258,6 +258,10 @@ enum ReparsePhase {
         stmt: Box<Statement>,
         type_rows: Vec<String>,
     },
+    LoadFunctions {
+        stmt: Box<Statement>,
+        functions: Vec<crate::schema::FunctionDef>,
+    },
     /// Best-effort ANALYZE-stats refresh before finalizing.
     RefreshStats {
         stats: crate::stats::RefreshAnalyzeStatsState,
@@ -1631,9 +1635,7 @@ impl Connection {
                             type_rows: Vec::new(),
                         };
                     } else {
-                        inner.phase = ReparsePhase::RefreshStats {
-                            stats: Default::default(),
-                        };
+                        inner.phase = self.load_functions_or_refresh_stats(&inner.fresh)?;
                     }
                 }
                 ReparsePhase::LoadTypes { stmt, type_rows } => {
@@ -1643,6 +1645,16 @@ impl Connection {
                     }));
                     let type_rows = std::mem::take(type_rows);
                     inner.fresh.load_type_definitions(&type_rows)?;
+                    inner.phase = self.load_functions_or_refresh_stats(&inner.fresh)?;
+                }
+                ReparsePhase::LoadFunctions { stmt, functions } => {
+                    crate::return_if_io!(stmt.run_with_row_callback_nonblock(|row| {
+                        functions.push(function_from_row(row)?);
+                        Ok(())
+                    }));
+                    for function in std::mem::take(functions) {
+                        inner.fresh.add_function(function);
+                    }
                     inner.phase = ReparsePhase::RefreshStats {
                         stats: Default::default(),
                     };
@@ -1669,6 +1681,29 @@ impl Connection {
                 }
             }
         }
+    }
+
+    fn load_functions_or_refresh_stats(
+        self: &Arc<Connection>,
+        fresh: &Schema,
+    ) -> Result<ReparsePhase> {
+        if !fresh
+            .tables
+            .contains_key(crate::schema::TURSO_FUNCTIONS_TABLE_NAME)
+        {
+            return Ok(ReparsePhase::RefreshStats {
+                stats: Default::default(),
+            });
+        }
+        self.with_schema_mut(|schema| {
+            *schema = fresh.try_clone()?;
+            Ok::<_, crate::alloc::TryReserveError>(())
+        })??;
+        let stmt = self.prepare_internal(STORED_FUNCTIONS_QUERY)?;
+        Ok(ReparsePhase::LoadFunctions {
+            stmt: Box::new(stmt),
+            functions: Vec::new(),
+        })
     }
 
     pub(crate) fn read_current_schema_cookie(&self) -> Result<u32> {
@@ -1974,6 +2009,26 @@ impl Connection {
             Ok(())
         })?;
         Ok(type_rows)
+    }
+
+    pub(crate) fn query_stored_functions(
+        self: &Arc<Connection>,
+    ) -> Result<Vec<crate::schema::FunctionDef>> {
+        let has_functions_table = self
+            .schema
+            .read()
+            .tables
+            .contains_key(crate::schema::TURSO_FUNCTIONS_TABLE_NAME);
+        if !has_functions_table {
+            return Ok(Vec::new());
+        }
+        let mut stmt = self.prepare_internal(STORED_FUNCTIONS_QUERY)?;
+        let mut functions = Vec::new();
+        stmt.run_with_row_callback(|row| {
+            functions.push(function_from_row(row)?);
+            Ok(())
+        })?;
+        Ok(functions)
     }
 
     pub fn maybe_update_schema(&self) {
@@ -5040,6 +5095,20 @@ impl SymbolTable {
             self.index_methods.insert(name.clone(), module.clone());
         }
     }
+}
+
+const STORED_FUNCTIONS_QUERY: &str =
+    "SELECT name, arg_count, definition FROM __turso_internal_functions";
+
+fn function_from_row(row: &crate::Row) -> Result<crate::schema::FunctionDef> {
+    let arg_count = usize::try_from(row.get::<i64>(1)?).map_err(|_| {
+        LimboError::Corrupt("malformed database schema - negative function argument count".into())
+    })?;
+    Ok(crate::schema::FunctionDef {
+        name: row.get::<String>(0)?,
+        arg_count,
+        definition: row.get::<String>(2)?,
+    })
 }
 
 #[cfg(all(test, feature = "fs"))]

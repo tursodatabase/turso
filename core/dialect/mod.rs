@@ -532,6 +532,114 @@ mod tests {
         )
     }
 
+    fn create_function(
+        conn: &Arc<crate::Connection>,
+        or_replace: bool,
+        definition: &str,
+    ) -> crate::Result<()> {
+        let stmt = turso_parser::ast::Stmt::CreateFunction {
+            or_replace,
+            func_name: turso_parser::ast::QualifiedName::single(
+                turso_parser::ast::Name::from_string("add_n"),
+            ),
+            arg_count: 1,
+            definition: definition.to_string(),
+        };
+        conn.prepare_translated_stmt(stmt, "test: create add_n")?
+            .run_ignore_rows()
+    }
+
+    fn drop_function(conn: &Arc<crate::Connection>, if_exists: bool) -> crate::Result<()> {
+        let stmt = turso_parser::ast::Stmt::DropFunction {
+            if_exists,
+            func_name: turso_parser::ast::QualifiedName::single(
+                turso_parser::ast::Name::from_string("add_n"),
+            ),
+            arg_count: Some(1),
+        };
+        conn.prepare_translated_stmt(stmt, "test: drop add_n")?
+            .run_ignore_rows()
+    }
+
+    fn stored_definition(conn: &Arc<crate::Connection>) -> Option<String> {
+        conn.prepare("SELECT 1").unwrap();
+        conn.current_schema()
+            .get_function("add_n", 1)
+            .map(|function| function.definition.clone())
+    }
+
+    #[test]
+    fn stored_function_survives_reopen() {
+        let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+        {
+            let db = open_db(&io, "dialect-function.db", Arc::new(TestDialect::default())).unwrap();
+            let conn = db.connect(ConnectOpts::new()).unwrap();
+            create_function(&conn, false, "1").unwrap();
+            assert_eq!(stored_definition(&conn).as_deref(), Some("1"));
+            conn.close().unwrap();
+        }
+
+        let db = open_db(&io, "dialect-function.db", Arc::new(TestDialect::default())).unwrap();
+        let conn = db.connect(ConnectOpts::new()).unwrap();
+        assert_eq!(stored_definition(&conn).as_deref(), Some("1"));
+        let error = create_function(&conn, false, "2").unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "Parse error: function \"add_n\" already exists with same argument types"
+        );
+        assert_eq!(stored_definition(&conn).as_deref(), Some("1"));
+        conn.close().unwrap();
+    }
+
+    #[test]
+    fn replaced_and_dropped_functions_reach_other_connections() {
+        let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+        let db = open_db(
+            &io,
+            "dialect-function-replace.db",
+            Arc::new(TestDialect::default()),
+        )
+        .unwrap();
+        let conn = db.connect(ConnectOpts::new()).unwrap();
+        let other = db.connect(ConnectOpts::new()).unwrap();
+        create_function(&conn, false, "1").unwrap();
+        assert_eq!(stored_definition(&other).as_deref(), Some("1"));
+
+        create_function(&conn, true, "2").unwrap();
+        assert_eq!(stored_definition(&conn).as_deref(), Some("2"));
+        assert_eq!(stored_definition(&other).as_deref(), Some("2"));
+
+        drop_function(&conn, false).unwrap();
+        assert_eq!(stored_definition(&conn), None);
+        assert_eq!(stored_definition(&other), None);
+        drop_function(&conn, true).unwrap();
+        let error = drop_function(&conn, false).unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "Parse error: function add_n does not exist"
+        );
+        conn.close().unwrap();
+        other.close().unwrap();
+    }
+
+    #[test]
+    fn rolled_back_function_is_not_stored() {
+        let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+        let db = open_db(
+            &io,
+            "dialect-function-rollback.db",
+            Arc::new(TestDialect::default()),
+        )
+        .unwrap();
+        let conn = db.connect(ConnectOpts::new()).unwrap();
+        conn.execute("BEGIN").unwrap();
+        create_function(&conn, false, "1").unwrap();
+        assert_eq!(stored_definition(&conn).as_deref(), Some("1"));
+        conn.execute("ROLLBACK").unwrap();
+        assert_eq!(stored_definition(&conn), None);
+        conn.close().unwrap();
+    }
+
     #[test]
     fn schema_load_routes_through_dialect() {
         let io: Arc<dyn IO> = Arc::new(MemoryIO::new());

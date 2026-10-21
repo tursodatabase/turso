@@ -1694,7 +1694,7 @@ impl Database {
                         .as_ref()
                         .expect("db must be initialized in Init phase");
                     if db.get_mv_store().is_none() {
-                        Self::load_stored_types(state)?;
+                        Self::load_stored_types_and_functions(state)?;
                     }
 
                     state.phase = OpenDbAsyncPhase::BootstrapMvStore;
@@ -1730,7 +1730,7 @@ impl Database {
                         );
                         // Done — drop the bootstrap connection.
                         state.mvcc_bootstrap_conn = None;
-                        Self::load_stored_types(state)?;
+                        Self::load_stored_types_and_functions(state)?;
                     }
 
                     state.phase = OpenDbAsyncPhase::Done;
@@ -1749,11 +1749,11 @@ impl Database {
         }
     }
 
-    /// Read the stored custom types into the schema. The schema that
-    /// make_from_btree loaded has the table that stores them, but not its
-    /// rows. The types give DECODE, ENCODE and affinity metadata to all later
-    /// connections.
-    fn load_stored_types(state: &OpenDbAsyncState) -> Result<()> {
+    /// Read the stored custom types and functions into the schema. The schema
+    /// that make_from_btree loaded has the tables that store them, but not
+    /// their rows. The types give DECODE, ENCODE and affinity metadata to all
+    /// later connections.
+    fn load_stored_types_and_functions(state: &OpenDbAsyncState) -> Result<()> {
         let conn = state
             .conn
             .as_ref()
@@ -1770,6 +1770,16 @@ impl Database {
             if !type_sqls.is_empty() {
                 db.with_schema_mut(|schema| schema.load_type_definitions(&type_sqls))?;
             }
+        }
+        conn.maybe_update_schema();
+        let functions = conn.query_stored_functions()?;
+        if !functions.is_empty() {
+            db.with_schema_mut(|schema| {
+                for function in functions {
+                    schema.add_function(function);
+                }
+                Ok(())
+            })?;
         }
         Ok(())
     }

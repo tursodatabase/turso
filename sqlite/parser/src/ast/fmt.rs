@@ -881,6 +881,47 @@ impl ToTokens for Stmt {
                 s.append(TK_ID, Some(domain_name))?;
                 Ok(())
             }
+            Self::CreateFunction {
+                or_replace,
+                func_name,
+                arg_count,
+                definition,
+            } => {
+                s.append(TK_CREATE, None)?;
+                if *or_replace {
+                    s.append(TK_OR, None)?;
+                    s.append(TK_REPLACE, None)?;
+                }
+                s.append(TK_ID, Some("FUNCTION"))?;
+                func_name.to_tokens(s, context)?;
+                s.append(TK_LP, None)?;
+                s.append(TK_INTEGER, Some(&arg_count.to_string()))?;
+                s.append(TK_RP, None)?;
+                s.append(TK_AS, None)?;
+                s.append(
+                    TK_STRING,
+                    Some(&format!("'{}'", definition.replace('\'', "''"))),
+                )
+            }
+            Self::DropFunction {
+                if_exists,
+                func_name,
+                arg_count,
+            } => {
+                s.append(TK_DROP, None)?;
+                s.append(TK_ID, Some("FUNCTION"))?;
+                if *if_exists {
+                    s.append(TK_IF, None)?;
+                    s.append(TK_EXISTS, None)?;
+                }
+                func_name.to_tokens(s, context)?;
+                if let Some(arg_count) = arg_count {
+                    s.append(TK_LP, None)?;
+                    s.append(TK_INTEGER, Some(&arg_count.to_string()))?;
+                    s.append(TK_RP, None)?;
+                }
+                Ok(())
+            }
         }
     }
 }

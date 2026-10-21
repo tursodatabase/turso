@@ -1763,7 +1763,9 @@ where
         | ast::Stmt::Savepoint { .. }
         | ast::Stmt::Optimize { .. }
         | ast::Stmt::CreateSequence { .. }
-        | ast::Stmt::DropSequence { .. } => {}
+        | ast::Stmt::DropSequence { .. }
+        | ast::Stmt::CreateFunction { .. }
+        | ast::Stmt::DropFunction { .. } => {}
     }
     Ok(())
 }
