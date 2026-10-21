@@ -312,6 +312,19 @@ PRAGMA query_only = 1;    -- enable read-only mode
 PRAGMA query_only = 0;    -- disable read-only mode
 ```
 
+### vdbe_trace
+
+Turns per-statement bytecode tracing on or off for the current connection.
+
+```sql
+PRAGMA vdbe_trace = ON;    -- enable tracing
+PRAGMA vdbe_trace = OFF;   -- disable tracing
+```
+
+When enabled, every program executed on this connection prints each bytecode instruction about to run, plus one `R[i] = value` line for each register the previous instruction changed, to stderr. The trace starts with a `VDBE Trace:` header. `ON`, `TRUE`, `YES`, and any numeric value other than a plain `0` enable tracing; anything else disables it. The setting is per connection and defaults to off.
+
+Reading the pragma with `PRAGMA vdbe_trace;` returns no rows.
+
 ### foreign_keys
 
 Enables or disables foreign key constraint enforcement.
