@@ -6111,6 +6111,10 @@ impl Pager {
         self.set_schema_cookie(None);
         if schema_did_change {
             *connection.schema.write() = connection.db.clone_schema();
+            // Programs prepared against the rolled-back schema may use btrees
+            // that no longer exist, and later DDL can bring the schema version
+            // back to the number they were prepared with.
+            connection.bump_prepare_context_generation();
         }
         if is_write {
             if let Some(wal) = self.wal.as_ref() {
