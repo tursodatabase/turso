@@ -7319,12 +7319,16 @@ version = "0.9.0-pre.1"
 dependencies = [
  "anyhow",
  "async-trait",
+ "bytes",
  "futures",
  "pgwire",
+ "tempfile",
  "tokio",
  "tracing",
  "turso_core",
  "turso_pg",
+ "turso_pg_client",
+ "turso_pg_parser",
 ]
 
 [[package]]
@@ -7354,6 +7358,7 @@ dependencies = [
  "turso_macros",
  "turso_parser",
  "turso_pg",
+ "turso_pg_parser",
  "turso_sdk_kit",
  "twox-hash",
  "zerocopy",
