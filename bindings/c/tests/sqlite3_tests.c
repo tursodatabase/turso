@@ -1258,6 +1258,21 @@ void test_sqlite3_open_v2_flags()
     int rc;
 
     remove(path);
+
+    /* Flags must include READONLY, READWRITE, or READWRITE|CREATE */
+    rc = sqlite3_open_v2(path, &db, 0, NULL);
+    assert(rc == SQLITE_MISUSE);
+    rc = sqlite3_open_v2(path, &db, SQLITE_OPEN_CREATE, NULL);
+    assert(rc == SQLITE_MISUSE);
+    rc = sqlite3_open_v2(path, &db, SQLITE_OPEN_READONLY | SQLITE_OPEN_READWRITE, NULL);
+    assert(rc == SQLITE_MISUSE);
+    rc = sqlite3_open_v2(path, &db, SQLITE_OPEN_READONLY | SQLITE_OPEN_CREATE, NULL);
+    assert(rc == SQLITE_MISUSE);
+
+    /* Opening a non-existent file without CREATE fails with CANTOPEN */
+    rc = sqlite3_open_v2(path, &db, SQLITE_OPEN_READWRITE, NULL);
+    assert(rc == SQLITE_CANTOPEN);
+
     rc = sqlite3_open_v2(path, &db,
                          SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_NOMUTEX |
                              SQLITE_OPEN_PRIVATECACHE,
@@ -1269,12 +1284,23 @@ void test_sqlite3_open_v2_flags()
     assert(rc == SQLITE_OK);
     sqlite3_close(db);
 
+    /* Existing file can be opened read-write without CREATE */
+    rc = sqlite3_open_v2(path, &db, SQLITE_OPEN_READWRITE, NULL);
+    assert(rc == SQLITE_OK);
+    sqlite3_close(db);
+
     rc = sqlite3_open_v2(path, &db, SQLITE_OPEN_READONLY, NULL);
     assert(rc == SQLITE_OK);
     rc = sqlite3_exec(db, "INSERT INTO t VALUES (2);", NULL, NULL, NULL);
     assert(rc != SQLITE_OK);
     sqlite3_close(db);
     remove(path);
+
+    /* mode=rwc cannot escalate when open flags lack CREATE */
+    rc = sqlite3_open_v2("file:open_v2_flags?mode=rwc", &db,
+                         SQLITE_OPEN_READWRITE | SQLITE_OPEN_URI,
+                         NULL);
+    assert(rc == SQLITE_PERM);
 
     rc = sqlite3_open_v2("file:open_v2_flags?mode=memory&cache=shared", &db,
                          SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_URI |

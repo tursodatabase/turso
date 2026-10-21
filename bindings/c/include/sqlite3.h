@@ -7,6 +7,8 @@
 
 #define SQLITE_ERROR 1
 
+#define SQLITE_PERM 3
+
 #define SQLITE_ABORT 4
 
 #define SQLITE_BUSY 5
