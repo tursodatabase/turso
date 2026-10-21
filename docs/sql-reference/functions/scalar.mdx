@@ -464,6 +464,29 @@ SELECT typeof(x'CAFE');    -- 'blob'
 SELECT typeof(1 + 1.0);   -- 'real'
 ```
 
+### boolean_to_int(X) and int_to_boolean(X)
+
+The built-in conversion functions behind the `BOOLEAN` custom type
+(see `ENCODE boolean_to_int(value)` in `CREATE TYPE`), usable directly in any
+expression.
+
+`boolean_to_int` converts to `1` or `0`. `NULL` gives `NULL`. The integers `0`
+and `1` pass through; any other number gives
+`invalid input for type boolean`. Case-insensitive text `true`, `t`, `yes`,
+`on`, `1` gives `1`, and `false`, `f`, `no`, `off`, `0` gives `0`; other text
+gives the same error.
+
+`int_to_boolean` converts to the text `'false'` only for the integer `0`; any
+other non-NULL value gives `'true'`, and `NULL` gives `NULL`.
+
+```sql
+SELECT boolean_to_int('yes');    -- 1
+SELECT boolean_to_int('off');    -- 0
+SELECT boolean_to_int(2);        -- error: invalid input for type boolean: "2"
+SELECT int_to_boolean(0);        -- 'false'
+SELECT int_to_boolean('hello');  -- 'true'
+```
+
 ### unicode(X)
 
 Returns the Unicode code point of the first character of string X. Returns NULL if X is NULL or an empty string.
