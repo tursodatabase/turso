@@ -1492,15 +1492,7 @@ fn query_pragma(
             // HIR plans against this connection's schema, so it reads rows
             // only when the check uses that schema.
             let hir = (main_schema.as_ref().unwrap_or(hir.0), hir.1);
-            translate_integrity_check(
-                schema,
-                program,
-                resolver,
-                database_id,
-                max_errors,
-                &connection,
-                hir,
-            )?;
+            translate_integrity_check(schema, program, database_id, max_errors, &connection, hir)?;
             Ok(TransactionMode::Read)
         }
         PragmaName::QuickCheck => {
@@ -1509,15 +1501,7 @@ fn query_pragma(
                 .then(|| connection.db.schema.lock().clone());
             let schema = main_schema.as_deref().unwrap_or(schema);
             let hir = (main_schema.as_ref().unwrap_or(hir.0), hir.1);
-            translate_quick_check(
-                schema,
-                program,
-                resolver,
-                database_id,
-                max_errors,
-                &connection,
-                hir,
-            )?;
+            translate_quick_check(schema, program, database_id, max_errors, &connection, hir)?;
             Ok(TransactionMode::Read)
         }
         PragmaName::CaptureDataChangesConn | PragmaName::UnstableCaptureDataChangesConn => {

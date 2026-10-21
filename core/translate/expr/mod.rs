@@ -26,7 +26,7 @@ use crate::vdbe::builder::{CursorKey, SelfTableContext};
 use crate::vdbe::{
     builder::ProgramBuilder,
     insn::{CmpInsFlags, Insn},
-    BranchOffset, CursorID,
+    BranchOffset,
 };
 use crate::{LimboError, Numeric, Result, Value};
 
@@ -37,7 +37,6 @@ mod affinity;
 mod arrays;
 mod binary;
 mod binding;
-mod columns;
 mod condition;
 mod custom_types;
 mod emission;
@@ -55,8 +54,6 @@ use arrays::*;
 use binary::*;
 #[allow(unused_imports)]
 use binding::*;
-#[allow(unused_imports)]
-use columns::*;
 #[allow(unused_imports)]
 use condition::*;
 #[allow(unused_imports)]
@@ -82,8 +79,6 @@ pub(crate) use affinity::{
 };
 pub(crate) use binary::expr_is_array;
 pub use binding::{bind_and_rewrite_expr, BindingBehavior};
-pub use columns::emit_table_column;
-pub use condition::translate_condition_expr;
 pub(crate) use custom_types::{emit_type_expr, emit_user_facing_column_value};
 pub use emission::{emit_function_call, emit_literal};
 pub(crate) use metadata::emit_cond_jump;

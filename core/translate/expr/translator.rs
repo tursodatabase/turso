@@ -11,13 +11,11 @@ pub enum NoConstantOptReason {
 
 /// Controls how binary expressions are emitted.
 ///
-/// This makes scalar and row-valued paths explicit:
-/// - scalar binary expressions use mode to pick either value emission or conditional jump emission
-/// - row-valued binary expressions always emit a value register first, then optionally a conditional jump
+/// A binary expression's result goes to a value register; conditional jump
+/// emission went with the legacy condition translator.
 #[derive(Clone, Copy)]
 pub(super) enum BinaryEmitMode {
     Value,
-    Condition(ConditionMetadata),
 }
 
 /// Translate an expression into bytecode via [translate_expr()], and forbid any constant values from being hoisted

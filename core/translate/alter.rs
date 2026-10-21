@@ -16,7 +16,7 @@ use crate::{
     schema::{CheckConstraint, Column, ColumnLayout, ForeignKey, Table, RESERVED_TABLE_PREFIXES},
     translate::{
         emitter::{emit_check_constraints, gencol::compute_virtual_columns, Resolver},
-        expr::{translate_expr, walk_expr, walk_expr_mut, WalkControl},
+        expr::{walk_expr, walk_expr_mut, WalkControl},
         plan::{ColumnMask, ColumnUsedMask, OuterQueryReference, TableReferences},
         trigger::create_trigger_to_sql,
     },
@@ -843,57 +843,33 @@ fn emit_add_column_check_validation(
         program.preassign_label_to_next_insn(check_passed_label);
     };
 
-    // With HIR, every existing row is checked, with its other columns read
-    // from the row, as SQLite's check of the altered table does.
-    {
-        let (schema, settings) = hir;
-        let database = connection
-            .get_database_name_by_index(database_id)
-            .ok_or_else(|| {
-                crate::LimboError::InternalError(format!("no database with id {database_id}"))
-            })?;
-        let select = crate::translate::semantic_lowering::PlannedSelect::scan(
-            substituted.clone(),
-            database,
-            original_btree.name.clone(),
-            None,
-            schema,
-            settings,
-            connection,
-        )?;
-        if !select.decodes_stored_values() {
-            return select.emit_each_row(program, |program, values| {
-                for (i, check) in all_checks.iter().enumerate() {
-                    emit_check(program, values + i, check);
-                }
-                Ok(())
-            });
+    // Every existing row is checked, with its other columns read from the
+    // row, as SQLite's check of the altered table does. Like DML, a CHECK
+    // constraint reads custom-typed columns as stored.
+    let (schema, settings) = hir;
+    let database = connection
+        .get_database_name_by_index(database_id)
+        .ok_or_else(|| {
+            crate::LimboError::InternalError(format!("no database with id {database_id}"))
+        })?;
+    let select = crate::translate::semantic_lowering::PlannedSelect::scan(
+        substituted
+            .into_iter()
+            .map(crate::translate::semantic_lowering::ScanValue::Stored)
+            .collect(),
+        database,
+        original_btree.name.clone(),
+        None,
+        schema,
+        settings,
+        connection,
+    )?;
+    select.emit_each_row(program, |program, values| {
+        for (i, check) in all_checks.iter().enumerate() {
+            emit_check(program, values + i, check);
         }
-    }
-
-    // Open the table to check if it has rows.
-    let check_cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(original_btree.clone()));
-    program.emit_insn(Insn::OpenRead {
-        cursor_id: check_cursor_id,
-        root_page: original_btree.root_page,
-        db: database_id,
-    });
-
-    let skip_check_label = program.allocate_label();
-    program.emit_insn(Insn::Rewind {
-        cursor_id: check_cursor_id,
-        pc_if_empty: skip_check_label,
-    });
-
-    // Table has rows -- evaluate each CHECK constraint with the default value substituted.
-    for (check, substituted) in all_checks.iter().zip(&substituted) {
-        let result_reg = program.alloc_register();
-        translate_expr(program, None, substituted, result_reg, resolver)?;
-        emit_check(program, result_reg, check);
-    }
-
-    program.preassign_label_to_next_insn(skip_check_label);
-    Ok(())
+        Ok(())
+    })
 }
 
 pub fn translate_alter_table(

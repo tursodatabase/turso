@@ -5940,6 +5940,7 @@ fn prepare_hir_coroutine_loop<'a>(
     let destination = QueryDestination::CoroutineYield {
         yield_reg,
         coroutine_implementation_start: start,
+        stored_outputs: Vec::new(),
     };
     let row = match &planned_loop.access {
         HirSourceAccess::Derived { query, .. } | HirSourceAccess::Cte { query, .. } => {
@@ -8600,7 +8601,7 @@ fn emit_hir_sorter_rows(
     for (output, column) in output_columns.iter().enumerate() {
         program.emit_column_or_rowid(pseudo_cursor, *column, outputs + output);
     }
-    emit_array_results(program, document, output_definitions, outputs)?;
+    emit_array_results(program, document, output_definitions, outputs, &[])?;
     emit_hir_row_to_destination(program, destination, outputs, output_definitions.len())?;
     emit_after_row(
         program,
@@ -8836,6 +8837,13 @@ fn emit_query_row_with_inputs<'expr>(
         HirRowTarget::Sorter(sorter) if output.distinct.is_none() => Some(sorter),
         _ => None,
     };
+    let stored_outputs: &[usize] = match &output.target {
+        HirRowTarget::Direct {
+            destination: QueryDestination::CoroutineYield { stored_outputs, .. },
+            ..
+        } => stored_outputs,
+        _ => &[],
+    };
     if !output.needs_values() {
         for expression in expressions {
             super::expr::register_parameters(program, expression);
@@ -8846,19 +8854,26 @@ fn emit_query_row_with_inputs<'expr>(
                 Some(sorter) => sorter.row + sorter.output_columns[position],
                 None => start + position,
             };
-            super::expr::translate_expr_with_inputs_no_constant_opt(
-                program,
-                document,
-                expression,
-                register,
-                inputs.values,
-            )?;
+            let translate = |program: &mut ProgramBuilder| {
+                super::expr::translate_expr_with_inputs_no_constant_opt(
+                    program,
+                    document,
+                    expression,
+                    register,
+                    inputs.values,
+                )
+            };
+            if stored_outputs.contains(&position) {
+                super::dml::with_stored_values(program, translate)?;
+            } else {
+                translate(program)?;
+            }
             program.bind_output(outputs[position].id, register);
         }
     }
 
     if output.needs_values() && matches!(&output.target, HirRowTarget::Direct { .. }) {
-        emit_array_results(program, document, outputs, start)?;
+        emit_array_results(program, document, outputs, start, stored_outputs)?;
     }
 
     if let Some(distinct) = output.distinct {
@@ -9412,13 +9427,19 @@ fn emit_hir_window_output_subroutine(
     Ok(())
 }
 
+/// Decode each array output for display, except the outputs in
+/// `stored_outputs`, which keep the array as the table stores it.
 pub(super) fn emit_array_results(
     program: &mut ProgramBuilder,
     document: &HirDocument,
     outputs: &[hir::Output],
     start: usize,
+    stored_outputs: &[usize],
 ) -> Result<()> {
     for (position, output) in outputs.iter().enumerate() {
+        if stored_outputs.contains(&position) {
+            continue;
+        }
         if !output.type_fact.is_array() && !hir_expr_passes_array(document, &output.expr) {
             continue;
         }

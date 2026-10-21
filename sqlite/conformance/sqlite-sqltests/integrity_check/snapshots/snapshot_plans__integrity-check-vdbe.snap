@@ -12,7 +12,7 @@ QUERY PLAN
 
 BYTECODE
 addr  opcode          p1   p2   p3  p4                                   p5  comment
-   0  Init             0  133    0                                        0  Start at 133
+   0  Init             0  135    0                                        0  Start at 135
    1  Integer         99    2    0                                        0  r[2]=99
    2  Integer          0    3    0                                        0  r[3]=0
    3  IntegrityCk    100    0    0                                        0  db=0 roots=[2, 5, 4, 3, 1] dropped_roots=[] message_register=4
@@ -64,7 +64,7 @@ addr  opcode          p1   p2   p3  p4                                   p5  com
   47    Yield         10    0    0                                        0
   48  Next             3   22    0                                        1
   49  EndCoroutine    10    0    0                                        0
-  50    Yield         10  111    0                                        0
+  50    Yield         10  113    0                                        0
   51    AddImm         9    1    0                                        0  r[9]=r[9]+1
   52    NotNull       11   58    0                                        0  r[11]!=NULL -> goto 58
   53    String8        0    4    0  NULL value in t.b                     0  r[4]='NULL value in t.b'
@@ -72,80 +72,82 @@ addr  opcode          p1   p2   p3  p4                                   p5  com
   55    ResultRow      4    1    0                                        0  output=r[4]
   56    IfPos          2   58    1                                        0  r[2]>0 -> r[2]-=1, goto 58
   57    Halt           0    0    0                                        0
-  58    If            12   64    1                                        0  if r[12] goto 64
-  59    String8        0    4    0  CHECK constraint failed in t          0  r[4]='CHECK constraint failed in t'
-  60    Integer        1    3    0                                        0  r[3]=1
-  61    ResultRow      4    1    0                                        0  output=r[4]
-  62    IfPos          2   64    1                                        0  r[2]>0 -> r[2]-=1, goto 64
-  63    Halt           0    0    0                                        0
-  64    IfNot         13   77    1                                        0  if !r[13] goto 77
-  65    AddImm         6    1    0                                        0  r[6]=r[6]+1
-  66    Found          0   77   14                                        0  if found goto 77
-  67    String8        0    4    0  row                                   0  r[4]='row '
-  68    Concat         9    4    4                                        0  r[4]=r[4] + r[9]
-  69    String8        0    5    0   missing from index                   0  r[5]=' missing from index '
-  70    Concat         5    4    4                                        0  r[4]=r[4] + r[5]
-  71    String8        0    5    0  idx_t_expr_partial                    0  r[5]='idx_t_expr_partial'
+  58    If            12   60    1                                        0  if r[12] goto 60
+  59    Goto           0   61    0                                        0
+  60    Goto           0   66    0                                        0
+  61    String8        0    4    0  CHECK constraint failed in t          0  r[4]='CHECK constraint failed in t'
+  62    Integer        1    3    0                                        0  r[3]=1
+  63    ResultRow      4    1    0                                        0  output=r[4]
+  64    IfPos          2   66    1                                        0  r[2]>0 -> r[2]-=1, goto 66
+  65    Halt           0    0    0                                        0
+  66    IfNot         13   79    1                                        0  if !r[13] goto 79
+  67    AddImm         6    1    0                                        0  r[6]=r[6]+1
+  68    Found          0   79   14                                        0  if found goto 79
+  69    String8        0    4    0  row                                   0  r[4]='row '
+  70    Concat         9    4    4                                        0  r[4]=r[4] + r[9]
+  71    String8        0    5    0   missing from index                   0  r[5]=' missing from index '
   72    Concat         5    4    4                                        0  r[4]=r[4] + r[5]
-  73    Integer        1    3    0                                        0  r[3]=1
-  74    ResultRow      4    1    0                                        0  output=r[4]
-  75    IfPos          2   77    1                                        0  r[2]>0 -> r[2]-=1, goto 77
-  76    Halt           0    0    0                                        0
-  77    AddImm         7    1    0                                        0  r[7]=r[7]+1
-  78    Found          1   89   16                                        0  if found goto 89
-  79    String8        0    4    0  row                                   0  r[4]='row '
-  80    Concat         9    4    4                                        0  r[4]=r[4] + r[9]
-  81    String8        0    5    0   missing from index                   0  r[5]=' missing from index '
-  82    Concat         5    4    4                                        0  r[4]=r[4] + r[5]
-  83    String8        0    5    0  idx_t_c                               0  r[5]='idx_t_c'
+  73    String8        0    5    0  idx_t_expr_partial                    0  r[5]='idx_t_expr_partial'
+  74    Concat         5    4    4                                        0  r[4]=r[4] + r[5]
+  75    Integer        1    3    0                                        0  r[3]=1
+  76    ResultRow      4    1    0                                        0  output=r[4]
+  77    IfPos          2   79    1                                        0  r[2]>0 -> r[2]-=1, goto 79
+  78    Halt           0    0    0                                        0
+  79    AddImm         7    1    0                                        0  r[7]=r[7]+1
+  80    Found          1   91   16                                        0  if found goto 91
+  81    String8        0    4    0  row                                   0  r[4]='row '
+  82    Concat         9    4    4                                        0  r[4]=r[4] + r[9]
+  83    String8        0    5    0   missing from index                   0  r[5]=' missing from index '
   84    Concat         5    4    4                                        0  r[4]=r[4] + r[5]
-  85    Integer        1    3    0                                        0  r[3]=1
-  86    ResultRow      4    1    0                                        0  output=r[4]
-  87    IfPos          2   89    1                                        0  r[2]>0 -> r[2]-=1, goto 89
-  88    Halt           0    0    0                                        0
-  89    IsNull        16   98    0                                        0  if (r[16]==NULL) goto 98
-  90    Next           1   92    0                                        0
-  91    Goto           0   98    0                                        0
-  92    IdxGT          1   98   16                                        0  key=[16..16]
-  93    String8        0    4    0  non-unique entry in index idx_t_c     0  r[4]='non-unique entry in index idx_t_c'
-  94    Integer        1    3    0                                        0  r[3]=1
-  95    ResultRow      4    1    0                                        0  output=r[4]
-  96    IfPos          2   98    1                                        0  r[2]>0 -> r[2]-=1, goto 98
-  97    Halt           0    0    0                                        0
-  98    AddImm         8    1    0                                        0  r[8]=r[8]+1
-  99    Found          2  110   18                                        0  if found goto 110
- 100    String8        0    4    0  row                                   0  r[4]='row '
- 101    Concat         9    4    4                                        0  r[4]=r[4] + r[9]
- 102    String8        0    5    0   missing from index                   0  r[5]=' missing from index '
- 103    Concat         5    4    4                                        0  r[4]=r[4] + r[5]
- 104    String8        0    5    0  idx_t_b                               0  r[5]='idx_t_b'
+  85    String8        0    5    0  idx_t_c                               0  r[5]='idx_t_c'
+  86    Concat         5    4    4                                        0  r[4]=r[4] + r[5]
+  87    Integer        1    3    0                                        0  r[3]=1
+  88    ResultRow      4    1    0                                        0  output=r[4]
+  89    IfPos          2   91    1                                        0  r[2]>0 -> r[2]-=1, goto 91
+  90    Halt           0    0    0                                        0
+  91    IsNull        16  100    0                                        0  if (r[16]==NULL) goto 100
+  92    Next           1   94    0                                        0
+  93    Goto           0  100    0                                        0
+  94    IdxGT          1  100   16                                        0  key=[16..16]
+  95    String8        0    4    0  non-unique entry in index idx_t_c     0  r[4]='non-unique entry in index idx_t_c'
+  96    Integer        1    3    0                                        0  r[3]=1
+  97    ResultRow      4    1    0                                        0  output=r[4]
+  98    IfPos          2  100    1                                        0  r[2]>0 -> r[2]-=1, goto 100
+  99    Halt           0    0    0                                        0
+ 100    AddImm         8    1    0                                        0  r[8]=r[8]+1
+ 101    Found          2  112   18                                        0  if found goto 112
+ 102    String8        0    4    0  row                                   0  r[4]='row '
+ 103    Concat         9    4    4                                        0  r[4]=r[4] + r[9]
+ 104    String8        0    5    0   missing from index                   0  r[5]=' missing from index '
  105    Concat         5    4    4                                        0  r[4]=r[4] + r[5]
- 106    Integer        1    3    0                                        0  r[3]=1
- 107    ResultRow      4    1    0                                        0  output=r[4]
- 108    IfPos          2  110    1                                        0  r[2]>0 -> r[2]-=1, goto 110
- 109    Halt           0    0    0                                        0
- 110  Goto             0   50    0                                        0
- 111  Close            0    0    0                                        0
- 112  Count            1   35    0                                        0
- 113  Eq              35    7  119                                        0  if r[35]==r[7] goto 119
- 114  String8          0    4    0  wrong # of entries in index idx_t_c   0  r[4]='wrong # of entries in index idx_t_c'
- 115  Integer          1    3    0                                        0  r[3]=1
- 116  ResultRow        4    1    0                                        0  output=r[4]
- 117  IfPos            2  119    1                                        0  r[2]>0 -> r[2]-=1, goto 119
- 118  Halt             0    0    0                                        0
- 119  Close            1    0    0                                        0
- 120  Count            2   36    0                                        0
- 121  Eq              36    8  127                                        0  if r[36]==r[8] goto 127
- 122  String8          0    4    0  wrong # of entries in index idx_t_b   0  r[4]='wrong # of entries in index idx_t_b'
- 123  Integer          1    3    0                                        0  r[3]=1
- 124  ResultRow        4    1    0                                        0  output=r[4]
- 125  IfPos            2  127    1                                        0  r[2]>0 -> r[2]-=1, goto 127
- 126  Halt             0    0    0                                        0
- 127  Close            2    0    0                                        0
- 128  Integer          0   37    0                                        0  r[37]=0
- 129  If               3  132    0                                        0  if r[3] goto 132
- 130  String8          0    4    0  ok                                    0  r[4]='ok'
- 131  ResultRow        4    1    0                                        0  output=r[4]
- 132  Halt             0    0    0                                        0
- 133  Transaction      0    1    4                                        0  iDb=0 tx_mode=Read
- 134  Goto             0    1    0                                        0
+ 106    String8        0    5    0  idx_t_b                               0  r[5]='idx_t_b'
+ 107    Concat         5    4    4                                        0  r[4]=r[4] + r[5]
+ 108    Integer        1    3    0                                        0  r[3]=1
+ 109    ResultRow      4    1    0                                        0  output=r[4]
+ 110    IfPos          2  112    1                                        0  r[2]>0 -> r[2]-=1, goto 112
+ 111    Halt           0    0    0                                        0
+ 112  Goto             0   50    0                                        0
+ 113  Close            0    0    0                                        0
+ 114  Count            1   35    0                                        0
+ 115  Eq              35    7  121                                        0  if r[35]==r[7] goto 121
+ 116  String8          0    4    0  wrong # of entries in index idx_t_c   0  r[4]='wrong # of entries in index idx_t_c'
+ 117  Integer          1    3    0                                        0  r[3]=1
+ 118  ResultRow        4    1    0                                        0  output=r[4]
+ 119  IfPos            2  121    1                                        0  r[2]>0 -> r[2]-=1, goto 121
+ 120  Halt             0    0    0                                        0
+ 121  Close            1    0    0                                        0
+ 122  Count            2   36    0                                        0
+ 123  Eq              36    8  129                                        0  if r[36]==r[8] goto 129
+ 124  String8          0    4    0  wrong # of entries in index idx_t_b   0  r[4]='wrong # of entries in index idx_t_b'
+ 125  Integer          1    3    0                                        0  r[3]=1
+ 126  ResultRow        4    1    0                                        0  output=r[4]
+ 127  IfPos            2  129    1                                        0  r[2]>0 -> r[2]-=1, goto 129
+ 128  Halt             0    0    0                                        0
+ 129  Close            2    0    0                                        0
+ 130  Integer          0   37    0                                        0  r[37]=0
+ 131  If               3  134    0                                        0  if r[3] goto 134
+ 132  String8          0    4    0  ok                                    0  r[4]='ok'
+ 133  ResultRow        4    1    0                                        0  output=r[4]
+ 134  Halt             0    0    0                                        0
+ 135  Transaction      0    1    4                                        0  iDb=0 tx_mode=Read
+ 136  Goto             0    1    0                                        0

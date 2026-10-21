@@ -65,6 +65,21 @@ pub(crate) fn translate_select(
 pub(crate) struct PlannedSelect {
     plan: Arc<HirPlan>,
     query: hir::QueryId,
+    /// Outputs computed with custom-typed columns read as stored.
+    stored_outputs: Vec<usize>,
+}
+
+/// One value a schema statement reads from each row of a table.
+pub(crate) enum ScanValue {
+    /// An expression over the row, with custom-typed columns decoded, as a
+    /// query reads them.
+    Expr(ast::Expr),
+    /// An expression over the row with custom-typed columns read as stored:
+    /// an index key column, which DML writes as stored, or a CHECK
+    /// constraint, which DML checks over stored values.
+    Stored(ast::Expr),
+    /// The row's rowid, whatever the table's columns are named.
+    RowId,
 }
 
 impl PlannedSelect {
@@ -81,7 +96,11 @@ impl PlannedSelect {
             ));
         };
         let query = root.query;
-        Ok(Self { plan, query })
+        Ok(Self {
+            plan,
+            query,
+            stored_outputs: Vec::new(),
+        })
     }
 
     /// `SELECT <values>`, without FROM: how a schema statement evaluates
@@ -100,7 +119,7 @@ impl PlannedSelect {
     /// how a schema statement reads every row of a table. NOT INDEXED keeps
     /// it reading the table itself, never one of its indexes.
     pub(crate) fn scan(
-        values: Vec<ast::Expr>,
+        values: Vec<ScanValue>,
         database: String,
         table: String,
         filter: Option<Box<ast::Expr>>,
@@ -108,6 +127,25 @@ impl PlannedSelect {
         settings: &HirSettings<'_>,
         connection: &Arc<Connection>,
     ) -> Result<Self> {
+        let mut stored_outputs = Vec::new();
+        let mut rowid_outputs = Vec::new();
+        let columns = values
+            .into_iter()
+            .enumerate()
+            .map(|(position, value)| match value {
+                ScanValue::Expr(expr) => expr,
+                ScanValue::Stored(expr) => {
+                    stored_outputs.push(position);
+                    expr
+                }
+                // A rowid has no name in SQL when the table's columns take
+                // every rowid name; the output is rewritten after analysis.
+                ScanValue::RowId => {
+                    rowid_outputs.push(position);
+                    ast::Expr::Literal(ast::Literal::Null)
+                }
+            })
+            .collect();
         let from = ast::FromClause {
             select: Box::new(ast::SelectTable::Table(
                 ast::QualifiedName {
@@ -120,8 +158,22 @@ impl PlannedSelect {
             )),
             joins: vec![],
         };
-        let select = Self::select(values, Some(from), filter);
-        Self::new(select, schema, settings, connection)
+        let select = Self::select(columns, Some(from), filter);
+        let plan = HirSession::new(schema, settings, connection)?.plan_with(
+            SemanticRootInput::Statement(&ast::Stmt::Select(select)),
+            |document| rewrite_rowid_outputs(document, &rowid_outputs),
+        )?;
+        let HirRoot::Query(root) = &plan.document.root else {
+            return Err(LimboError::InternalError(
+                "HIR scan analysis did not produce a query root".into(),
+            ));
+        };
+        let query = root.query;
+        Ok(Self {
+            plan,
+            query,
+            stored_outputs,
+        })
     }
 
     fn select(
@@ -216,19 +268,6 @@ impl PlannedSelect {
         Ok(values)
     }
 
-    /// Whether the SELECT reads a column whose stored value it would decode:
-    /// a custom type or an array. An index stores the encoded value, so its
-    /// refill cannot read such a column through a SELECT.
-    pub(crate) fn decodes_stored_values(&self) -> bool {
-        self.plan.document.sources.iter().any(|source| {
-            source.column_type_programs.iter().any(Option::is_some)
-                || source
-                    .columns
-                    .iter()
-                    .any(|column| column.type_fact.is_array())
-        })
-    }
-
     /// Each column of the new table: the SELECT's output name, and the type
     /// SQLite derives from the output's affinity, as legacy does.
     pub(crate) fn columns(&self) -> Result<Vec<(String, &'static str)>> {
@@ -283,6 +322,7 @@ impl PlannedSelect {
                 &QueryDestination::CoroutineYield {
                     yield_reg,
                     coroutine_implementation_start: start,
+                    stored_outputs: self.stored_outputs.clone(),
                 },
             )
         })?;
@@ -604,7 +644,17 @@ impl<'a> HirSession<'a> {
 
     /// Analyze `input` into HIR and choose its access paths.
     pub(super) fn plan(&self, input: SemanticRootInput<'_>) -> Result<Arc<HirPlan>> {
-        let document = analyze_root(
+        self.plan_with(input, |_| Ok(()))
+    }
+
+    /// Like [`Self::plan`], with `rewrite` run on the analyzed document
+    /// before its access paths are chosen.
+    fn plan_with(
+        &self,
+        input: SemanticRootInput<'_>,
+        rewrite: impl FnOnce(&mut HirDocument) -> Result<()>,
+    ) -> Result<Arc<HirPlan>> {
+        let mut document = analyze_root(
             &self.catalog,
             self.symbols,
             SemanticOptions {
@@ -622,12 +672,50 @@ impl<'a> HirSession<'a> {
             },
             input,
         )?;
+        rewrite(&mut document)?;
         Ok(Arc::new(HirPlan::build(
             Arc::new(document),
             self.schema,
             cost_model_params(),
         )?))
     }
+}
+
+/// Make each output in `positions` of a scan's one query block read the
+/// scanned table's rowid.
+fn rewrite_rowid_outputs(document: &mut HirDocument, positions: &[usize]) -> Result<()> {
+    if positions.is_empty() {
+        return Ok(());
+    }
+    let HirRoot::Query(root) = &document.root else {
+        return Err(LimboError::InternalError(
+            "HIR scan analysis did not produce a query root".into(),
+        ));
+    };
+    let query = root.query;
+    let [block] = document.queries[query.index()].blocks.as_mut_slice() else {
+        return Err(LimboError::InternalError(
+            "HIR scan has more than one query block".into(),
+        ));
+    };
+    let source = block
+        .from
+        .as_ref()
+        .map(|from| from.first)
+        .ok_or_else(|| LimboError::InternalError("HIR scan reads no table".into()))?;
+    for &position in positions {
+        let output = block.outputs.get_mut(position).ok_or_else(|| {
+            LimboError::InternalError(format!("HIR scan has no output {position}"))
+        })?;
+        output.expr = hir::Expr::rowid(source);
+        output.type_fact = hir::TypeFact::known(Type::Integer);
+        output.affinity = Affinity::Integer;
+        output.schema_affinity = Affinity::Integer;
+        output.has_affinity = true;
+    }
+    document
+        .validate()
+        .map_err(|error| LimboError::InternalError(error.to_string()))
 }
 
 /// Analyze one statement into HIR and choose its access paths.

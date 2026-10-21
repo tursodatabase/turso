@@ -12,7 +12,7 @@ QUERY PLAN
 
 BYTECODE
 addr  opcode          p1   p2   p3  p4                                       p5  comment
-   0  Init             0  118    0                                            0  Start at 118
+   0  Init             0  120    0                                            0  Start at 120
    1  Integer         99    2    0                                            0  r[2]=99
    2  Integer          0    3    0                                            0  r[3]=0
    3  IntegrityCk    100    0    0                                            0  db=0 roots=[2, 4, 3, 5, 7, 6, 1] dropped_roots=[] message_register=4
@@ -94,7 +94,7 @@ addr  opcode          p1   p2   p3  p4                                       p5 
   77    Yield         25    0    0                                            0
   78  Next             5   65    0                                            1
   79  EndCoroutine    25    0    0                                            0
-  80    Yield         25   97    0                                            0
+  80    Yield         25   99    0                                            0
   81    AddImm        24    1    0                                            0  r[24]=r[24]+1
   82    NotNull       26   88    0                                            0  r[26]!=NULL -> goto 88
   83    String8        0    4    0  NULL value in t2.y                        0  r[4]='NULL value in t2.y'
@@ -102,35 +102,37 @@ addr  opcode          p1   p2   p3  p4                                       p5 
   85    ResultRow      4    1    0                                            0  output=r[4]
   86    IfPos          2   88    1                                            0  r[2]>0 -> r[2]-=1, goto 88
   87    Halt           0    0    0                                            0
-  88    If            27   94    1                                            0  if r[27] goto 94
-  89    String8        0    4    0  CHECK constraint failed in t2             0  r[4]='CHECK constraint failed in t2'
-  90    Integer        1    3    0                                            0  r[3]=1
-  91    ResultRow      4    1    0                                            0  output=r[4]
-  92    IfPos          2   94    1                                            0  r[2]>0 -> r[2]-=1, goto 94
-  93    Halt           0    0    0                                            0
-  94    AddImm        22    1    0                                            0  r[22]=r[22]+1
-  95    AddImm        23    1    0                                            0  r[23]=r[23]+1
-  96  Goto             0   80    0                                            0
-  97  Count            3   41    0                                            0
-  98  Eq              41   22  104                                            0  if r[41]==r[22] goto 104
-  99  String8          0    4    0  wrong # of entries in index idx_t2_expr   0  r[4]='wrong # of entries in index idx_t2_expr'
- 100  Integer          1    3    0                                            0  r[3]=1
- 101  ResultRow        4    1    0                                            0  output=r[4]
- 102  IfPos            2  104    1                                            0  r[2]>0 -> r[2]-=1, goto 104
- 103  Halt             0    0    0                                            0
- 104  Close            3    0    0                                            0
- 105  Count            4   42    0                                            0
- 106  Eq              42   23  112                                            0  if r[42]==r[23] goto 112
- 107  String8          0    4    0  wrong # of entries in index idx_t2_y      0  r[4]='wrong # of entries in index idx_t2_y'
- 108  Integer          1    3    0                                            0  r[3]=1
- 109  ResultRow        4    1    0                                            0  output=r[4]
- 110  IfPos            2  112    1                                            0  r[2]>0 -> r[2]-=1, goto 112
- 111  Halt             0    0    0                                            0
- 112  Close            4    0    0                                            0
- 113  Integer          0   43    0                                            0  r[43]=0
- 114  If               3  117    0                                            0  if r[3] goto 117
- 115  String8          0    4    0  ok                                        0  r[4]='ok'
- 116  ResultRow        4    1    0                                            0  output=r[4]
- 117  Halt             0    0    0                                            0
- 118  Transaction      0    1    6                                            0  iDb=0 tx_mode=Read
- 119  Goto             0    1    0                                            0
+  88    If            27   90    1                                            0  if r[27] goto 90
+  89    Goto           0   91    0                                            0
+  90    Goto           0   96    0                                            0
+  91    String8        0    4    0  CHECK constraint failed in t2             0  r[4]='CHECK constraint failed in t2'
+  92    Integer        1    3    0                                            0  r[3]=1
+  93    ResultRow      4    1    0                                            0  output=r[4]
+  94    IfPos          2   96    1                                            0  r[2]>0 -> r[2]-=1, goto 96
+  95    Halt           0    0    0                                            0
+  96    AddImm        22    1    0                                            0  r[22]=r[22]+1
+  97    AddImm        23    1    0                                            0  r[23]=r[23]+1
+  98  Goto             0   80    0                                            0
+  99  Count            3   41    0                                            0
+ 100  Eq              41   22  106                                            0  if r[41]==r[22] goto 106
+ 101  String8          0    4    0  wrong # of entries in index idx_t2_expr   0  r[4]='wrong # of entries in index idx_t2_expr'
+ 102  Integer          1    3    0                                            0  r[3]=1
+ 103  ResultRow        4    1    0                                            0  output=r[4]
+ 104  IfPos            2  106    1                                            0  r[2]>0 -> r[2]-=1, goto 106
+ 105  Halt             0    0    0                                            0
+ 106  Close            3    0    0                                            0
+ 107  Count            4   42    0                                            0
+ 108  Eq              42   23  114                                            0  if r[42]==r[23] goto 114
+ 109  String8          0    4    0  wrong # of entries in index idx_t2_y      0  r[4]='wrong # of entries in index idx_t2_y'
+ 110  Integer          1    3    0                                            0  r[3]=1
+ 111  ResultRow        4    1    0                                            0  output=r[4]
+ 112  IfPos            2  114    1                                            0  r[2]>0 -> r[2]-=1, goto 114
+ 113  Halt             0    0    0                                            0
+ 114  Close            4    0    0                                            0
+ 115  Integer          0   43    0                                            0  r[43]=0
+ 116  If               3  119    0                                            0  if r[3] goto 119
+ 117  String8          0    4    0  ok                                        0  r[4]='ok'
+ 118  ResultRow        4    1    0                                            0  output=r[4]
+ 119  Halt             0    0    0                                            0
+ 120  Transaction      0    1    6                                            0  iDb=0 tx_mode=Read
+ 121  Goto             0    1    0                                            0

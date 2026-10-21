@@ -128,13 +128,15 @@ resolver, `TableReferences`, parser-expression conversion, binding, or
 rewriting. Remaining parser types are frozen enums and literals already owned
 by HIR.
 
+The legacy SELECT and DML planners, their binders and emitters, and the
+bind and rewrite passes were deleted on 2026-10-21. What is left of the
+legacy expression path, and what keeps it alive:
+
 | Legacy work | HIR replacement | Why still live |
 |---|---|---|
-| SELECT binding in `select.rs` | Semantic analyzer and HIR | Production preparation still builds the legacy plan. |
-| `expr/binding.rs` | `semantic/expr.rs` | The legacy emitter still consumes parser expressions. |
-| `TableReferences` name lookup | Semantic `Scope` and `SourceId` | Legacy SELECT and DML callers still use it. |
-| `TableReferences` physical facts | HIR planned sources and loops | The legacy emitter still uses its cursor and ordering metadata. |
-| Bind and rewrite passes | Closed, validated HIR | Production cutover has not happened. |
+| `expr/binding.rs` and the parser-expression translator in `expr/` | `semantic/expr.rs` and `semantic_lowering/expr.rs` | ALTER TABLE still computes the new row's generated columns and CHECK constraints with it and rebinds a partial index's WHERE through `Index::bind_where_expr`; ATTACH keeps a fallback for an argument without a bound value; the DBSP expression compiler uses it for pure expressions; and `planner.rs` keeps WHERE and LIMIT parsers nothing calls. The integrity check, CREATE INDEX, REINDEX and ALTER TABLE's check of existing rows read tables through a planned HIR SELECT since 2026-10-21. |
+| `TableReferences` name lookup | Semantic `Scope` and `SourceId` | The callers above hand it one table so the legacy translator can resolve column names. |
+| `TableReferences` physical facts | HIR planned sources and loops | The optimizer's cost and constraint code still reads its cursor and ordering metadata while planning HIR sources. |
 
 Preserved binding restrictions, not HIR gaps:
 

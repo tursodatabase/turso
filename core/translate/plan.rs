@@ -834,6 +834,10 @@ pub enum QueryDestination {
         yield_reg: usize,
         /// The index of the first instruction in the bytecode that implements the coroutine.
         coroutine_implementation_start: BranchOffset,
+        /// Outputs computed from custom-typed columns as stored, not decoded:
+        /// the values a schema statement compares with an index entry or a
+        /// CHECK constraint, which DML computes the same way.
+        stored_outputs: alloc::Vec<usize>,
     },
     /// The results of the query are stored in an ephemeral index,
     /// later used by the parent query.
@@ -903,6 +907,7 @@ impl QueryDestination {
         QueryDestination::CoroutineYield {
             yield_reg: usize::MAX, // will be set later in bytecode emission
             coroutine_implementation_start: BranchOffset::Placeholder, // will be set later in bytecode emission
+            stored_outputs: alloc::Vec::new(),
         }
     }
 }
