@@ -366,6 +366,25 @@ Performs a faster but less thorough integrity check than `integrity_check`.
 PRAGMA quick_check;
 ```
 
+## Debugging
+
+### vdbe_trace
+
+Turns tracing of the bytecode program on for this connection. Off by default. A program
+stepped while it is on writes to standard error: one line for each register the previous
+opcode changed, written as `R[i] = value`, then the opcode that is about to run, printed the
+way `EXPLAIN` prints it. The listing of a program starts with a `VDBE Trace:` line. A
+register that holds an aggregate state or a record prints as `<aggregate>` or `<record>`
+instead of a value.
+
+```sql
+PRAGMA vdbe_trace = 1;    -- trace programs on this connection
+PRAGMA vdbe_trace = off;  -- stop tracing
+```
+
+Reading the pragma does nothing: `PRAGMA vdbe_trace;` returns no rows and does not report
+the current setting.
+
 ## WAL Operations
 
 ### wal_checkpoint
