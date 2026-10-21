@@ -63,7 +63,7 @@ Basics not enumerated by the official feature matrix.
 | Dollar-quoted strings, escape strings (`E'...'`), bit/hex string literals | ✅ Supported | |
 | generate_series | ✅ Supported | In FROM and with joins; column aliases on the function (`AS g(x)`) do not resolve |
 | pg_catalog emulation | 🟡 Partial | See Backend section |
-| SET / SHOW | 🟡 Partial | Passed through as PRAGMAs; no PostgreSQL GUCs other than search_path; `SHOW search_path` returns nothing |
+| SET / SHOW | 🟡 Partial | Passed through as PRAGMAs; no PostgreSQL GUCs other than search_path (`SET`, `SHOW`, `set_config`, `current_setting`) |
 
 ## Backend
 
