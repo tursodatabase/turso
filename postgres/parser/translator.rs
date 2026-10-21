@@ -2416,10 +2416,11 @@ impl PostgreSQLTranslator {
                                     if col_ref.fields.len() == 1 {
                                         // SELECT *
                                         result_columns.push(ast::ResultColumn::Star);
-                                    } else if let Some(first) = col_ref.fields.first() {
-                                        // SELECT table.* or alias.*
+                                    } else if let Some(table) = col_ref.fields.iter().rev().nth(1) {
+                                        // The relation is the last identifier before *; earlier
+                                        // identifiers may be a schema or catalog qualifier.
                                         if let Some(pg_query::protobuf::node::Node::String(s)) =
-                                            &first.node
+                                            &table.node
                                         {
                                             result_columns.push(ast::ResultColumn::TableStar(
                                                 ast::Name::from_string(&s.sval),
@@ -5898,6 +5899,28 @@ mod tests {
             }
         } else {
             panic!("Expected select query");
+        }
+    }
+
+    #[test]
+    fn test_schema_qualified_table_star_uses_table_name() {
+        let translator = PostgreSQLTranslator::new();
+
+        for sql in ["SELECT t.* FROM t", "SELECT public.t.* FROM t"] {
+            let parse_result = crate::parse(sql).unwrap();
+            let translated = translator.translate(&parse_result).unwrap();
+
+            let ast::Stmt::Select(select) = translated else {
+                panic!("Expected select query for {sql}");
+            };
+            let ast::OneSelect::Select { columns, .. } = &select.body.select else {
+                panic!("Expected OneSelect::Select for {sql}");
+            };
+            assert_eq!(columns.len(), 1, "{sql}");
+            match &columns[0] {
+                ast::ResultColumn::TableStar(name) => assert_eq!(name.as_str(), "t", "{sql}"),
+                other => panic!("Expected table-qualified star for {sql}, got {other:?}"),
+            }
         }
     }
 
