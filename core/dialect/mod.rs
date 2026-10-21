@@ -27,6 +27,13 @@ pub trait FunctionCatalog {
     ) -> Option<crate::sync::Arc<crate::schema::FunctionDef>>;
 }
 
+/// The statements that a dialect compiled for one trigger and one event.
+/// Unlike the statements of a SQLite trigger, they can name tables of other
+/// databases, and unqualified names resolve as in other statements.
+pub struct TriggerBody {
+    pub statements: Vec<turso_parser::ast::Stmt>,
+}
+
 /// SQL dialect layered on top of the engine.
 ///
 /// Every [`crate::Database`] carries a dialect, supplied explicitly by
@@ -188,6 +195,29 @@ pub trait Dialect: Send + Sync + 'static {
         )))
     }
 
+    /// The statements that run when `trigger` fires on a row of `table`, for
+    /// a trigger whose body the dialect owns. `None` runs the statements
+    /// stored with the trigger.
+    fn trigger_body(
+        &self,
+        _trigger: &crate::schema::Trigger,
+        _table: &crate::schema::BTreeTable,
+        _functions: &dyn FunctionCatalog,
+    ) -> crate::Result<Option<TriggerBody>> {
+        Ok(None)
+    }
+
+    /// The WHEN condition of `trigger` on `table`, for a trigger whose
+    /// condition the dialect owns. `None` uses the condition stored with the
+    /// trigger. The condition can read `NEW` and `OLD`.
+    fn trigger_when_clause(
+        &self,
+        _trigger: &crate::schema::Trigger,
+        _table: &crate::schema::BTreeTable,
+    ) -> crate::Result<Option<turso_parser::ast::Expr>> {
+        Ok(None)
+    }
+
     /// Whether this dialect needs the custom-type machinery (DECODE/ENCODE,
     /// affinity metadata) regardless of the experimental database flag.
     /// A dialect whose type system leans on custom types (e.g. PostgreSQL)
@@ -318,6 +348,66 @@ mod tests {
                 turso_ext::VTabKind::TableValuedFunction,
                 TestCatalogTable,
             )
+        }
+
+        fn trigger_body(
+            &self,
+            trigger: &crate::schema::Trigger,
+            _table: &BTreeTable,
+            _functions: &dyn FunctionCatalog,
+        ) -> crate::Result<Option<TriggerBody>> {
+            use turso_parser::ast::{Cmd, Expr, Literal, OneSelect, ResultColumn, TriggerCmd};
+            let [TriggerCmd::Select(select)] = trigger.commands.as_slice() else {
+                return Ok(None);
+            };
+            let OneSelect::Select { columns, .. } = &select.body.select else {
+                return Ok(None);
+            };
+            let [ResultColumn::Expr(call, _)] = columns.as_slice() else {
+                return Ok(None);
+            };
+            let Expr::FunctionCall { name, args, .. } = call.as_ref() else {
+                return Ok(None);
+            };
+            let [body] = args.as_slice() else {
+                return Ok(None);
+            };
+            let Expr::Literal(Literal::String(body)) = body.as_ref() else {
+                return Ok(None);
+            };
+            if name.as_str() != "test_trigger_body" {
+                return Ok(None);
+            }
+            let body = body.trim_matches('\'').replace("''", "'");
+            let (Some(Cmd::Stmt(stmt)), _) = sqlite::parse(&body)? else {
+                panic!("test trigger bodies are statements");
+            };
+            Ok(Some(TriggerBody {
+                statements: vec![stmt],
+            }))
+        }
+
+        fn trigger_when_clause(
+            &self,
+            trigger: &crate::schema::Trigger,
+            _table: &BTreeTable,
+        ) -> crate::Result<Option<turso_parser::ast::Expr>> {
+            if !trigger.name.ends_with("_dialect_when") {
+                return Ok(None);
+            }
+            let (Some(turso_parser::ast::Cmd::Stmt(turso_parser::ast::Stmt::Select(select))), _) =
+                sqlite::parse("SELECT new.a = 1")?
+            else {
+                panic!("the test condition is a SELECT");
+            };
+            let turso_parser::ast::OneSelect::Select { mut columns, .. } = select.body.select
+            else {
+                panic!("the test condition is one SELECT");
+            };
+            let Some(turso_parser::ast::ResultColumn::Expr(condition, _)) = columns.pop() else {
+                panic!("the test condition is one column");
+            };
+            Ok(Some(*condition))
         }
 
         fn compile_function_call(
@@ -748,6 +838,50 @@ mod tests {
         assert_eq!(has_add_n(&conn), vec![vec![crate::Value::from_i64(0)]]);
         create_function(&conn, false, "1").unwrap();
         assert_eq!(has_add_n(&conn), vec![vec![crate::Value::from_i64(1)]]);
+        conn.close().unwrap();
+    }
+
+    #[test]
+    fn dialect_trigger_body_names_tables_of_other_databases() {
+        let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+        let file = io
+            .open_file("dialect-trigger-body.db", OpenFlags::Create, true)
+            .unwrap();
+        let db = Database::open(
+            io.clone(),
+            "dialect-trigger-body.db",
+            crate::OpenOptions::new(Arc::new(TestDialect::default()))
+                .storage(Arc::new(DatabaseFile::new(file)))
+                .db_opts(DatabaseOpts::new().with_attach(true)),
+        )
+        .unwrap();
+        let conn = db.connect(ConnectOpts::new()).unwrap();
+        conn.execute("ATTACH DATABASE ':memory:' AS aux").unwrap();
+        conn.execute("CREATE TABLE aux.t (x INTEGER)").unwrap();
+        conn.execute("CREATE TABLE log (x INTEGER, earlier INTEGER)")
+            .unwrap();
+        conn.execute(
+            "CREATE TRIGGER aux.tr AFTER INSERT ON t BEGIN \
+             SELECT test_trigger_body('INSERT INTO main.log SELECT new.x, count(*) FROM main.log'); \
+             END",
+        )
+        .unwrap();
+
+        let mut insert = conn.prepare("INSERT INTO aux.t VALUES (1), (2)").unwrap();
+        insert.run_ignore_rows().unwrap();
+        assert_eq!(insert.n_change(), 2);
+        let rows = conn
+            .prepare("SELECT x, earlier FROM log ORDER BY x")
+            .unwrap()
+            .run_collect_rows()
+            .unwrap();
+        assert_eq!(
+            rows,
+            vec![
+                vec![crate::Value::from_i64(1), crate::Value::from_i64(0)],
+                vec![crate::Value::from_i64(2), crate::Value::from_i64(1)],
+            ]
+        );
         conn.close().unwrap();
     }
 

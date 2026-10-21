@@ -394,6 +394,81 @@ fn trigger_cmd_to_stmt_for_subprogram(
     }
 }
 
+fn rewrite_stmt_for_subprogram(stmt: &mut ast::Stmt, ctx: &TriggerSubprogramContext) -> Result<()> {
+    match stmt {
+        ast::Stmt::Insert {
+            with,
+            or_conflict,
+            body,
+            returning,
+            ..
+        } => {
+            rewrite_with_for_subprogram(with.as_mut(), ctx)?;
+            if let ast::InsertBody::Select(select, upsert) = body {
+                rewrite_expressions_in_select_for_subprogram(select, ctx)?;
+                rewrite_upsert_exprs_for_subprogram(upsert, ctx)?;
+            }
+            rewrite_result_columns_for_subprogram(returning, ctx)?;
+            *or_conflict = ctx.override_conflict.or(*or_conflict);
+        }
+        ast::Stmt::Update(update) => {
+            rewrite_with_for_subprogram(update.with.as_mut(), ctx)?;
+            for set in &mut update.sets {
+                rewrite_trigger_expr_for_subprogram(&mut set.expr, ctx)?;
+            }
+            if let Some(from) = &mut update.from {
+                rewrite_from_clause_expressions(from, &mut |e: &mut ast::Expr| {
+                    rewrite_trigger_expr_single_for_subprogram(e, ctx)
+                })?;
+            }
+            if let Some(where_clause) = &mut update.where_clause {
+                rewrite_trigger_expr_for_subprogram(where_clause, ctx)?;
+            }
+            rewrite_result_columns_for_subprogram(&mut update.returning, ctx)?;
+            update.or_conflict = ctx.override_conflict.or(update.or_conflict);
+        }
+        ast::Stmt::Delete {
+            with,
+            where_clause,
+            returning,
+            ..
+        } => {
+            rewrite_with_for_subprogram(with.as_mut(), ctx)?;
+            if let Some(where_clause) = where_clause {
+                rewrite_trigger_expr_for_subprogram(where_clause, ctx)?;
+            }
+            rewrite_result_columns_for_subprogram(returning, ctx)?;
+        }
+        ast::Stmt::Select(select) => rewrite_expressions_in_select_for_subprogram(select, ctx)?,
+        _ => bail_parse_error!(
+            "a trigger body can contain only INSERT, UPDATE, DELETE and SELECT statements"
+        ),
+    }
+    Ok(())
+}
+
+fn rewrite_with_for_subprogram(
+    with: Option<&mut ast::With>,
+    ctx: &TriggerSubprogramContext,
+) -> Result<()> {
+    for cte in with.into_iter().flat_map(|with| with.ctes.iter_mut()) {
+        rewrite_expressions_in_select_for_subprogram(&mut cte.select, ctx)?;
+    }
+    Ok(())
+}
+
+fn rewrite_result_columns_for_subprogram(
+    columns: &mut [ast::ResultColumn],
+    ctx: &TriggerSubprogramContext,
+) -> Result<()> {
+    for column in columns {
+        if let ast::ResultColumn::Expr(expr, _) = column {
+            rewrite_trigger_expr_for_subprogram(expr, ctx)?;
+        }
+    }
+    Ok(())
+}
+
 /// Rewrite NEW/OLD references in all expressions within a SELECT statement for subprogram
 fn rewrite_expressions_in_select_for_subprogram(
     select: &mut ast::Select,
@@ -592,13 +667,15 @@ fn execute_trigger_commands(
     } else {
         database_id
     };
-    // `resolver` is reborrowed as `&mut Resolver` on every trigger command
-    // below (`translate_inner` needs it), so the scope closure takes
-    // `resolver` as a parameter rather than capturing the outer binding -
-    // see `Resolver::with_database_scope_mut`.
-    resolver.with_trigger_scope(trigger_database_id, trigger.name.clone(), |resolver| {
-        for command in trigger.commands.iter() {
-            let stmt = trigger_cmd_to_stmt_for_subprogram(command, &subprogram_ctx)?;
+    let dialect = resolver.dialect.clone();
+    let dialect_body = dialect.trigger_body(trigger, &ctx.table, &*resolver)?;
+    if let Some(body) = dialect_body {
+        for mut stmt in body.statements {
+            rewrite_stmt_for_subprogram(&mut stmt, &subprogram_ctx)?;
+            let writes = matches!(
+                stmt,
+                ast::Stmt::Insert { .. } | ast::Stmt::Update(_) | ast::Stmt::Delete { .. }
+            );
             subprogram_builder.prologue();
             translate_inner(
                 stmt,
@@ -607,17 +684,38 @@ fn execute_trigger_commands(
                 connection,
                 "trigger subprogram",
             )?;
-            if matches!(
-                command,
-                ast::TriggerCmd::Insert { .. }
-                    | ast::TriggerCmd::Update { .. }
-                    | ast::TriggerCmd::Delete { .. }
-            ) {
+            if writes {
                 subprogram_builder.emit_insn(Insn::ResetCount);
             }
         }
-        Ok(())
-    })?;
+    } else {
+        // `resolver` is reborrowed as `&mut Resolver` on every trigger command
+        // below (`translate_inner` needs it), so the scope closure takes
+        // `resolver` as a parameter rather than capturing the outer binding -
+        // see `Resolver::with_database_scope_mut`.
+        resolver.with_trigger_scope(trigger_database_id, trigger.name.clone(), |resolver| {
+            for command in trigger.commands.iter() {
+                let stmt = trigger_cmd_to_stmt_for_subprogram(command, &subprogram_ctx)?;
+                subprogram_builder.prologue();
+                translate_inner(
+                    stmt,
+                    resolver,
+                    &mut subprogram_builder,
+                    connection,
+                    "trigger subprogram",
+                )?;
+                if matches!(
+                    command,
+                    ast::TriggerCmd::Insert { .. }
+                        | ast::TriggerCmd::Update { .. }
+                        | ast::TriggerCmd::Delete { .. }
+                ) {
+                    subprogram_builder.emit_insn(Insn::ResetCount);
+                }
+            }
+            Ok(())
+        })?;
+    }
     subprogram_builder.epilogue(resolver.schema());
     let built_subprogram =
         subprogram_builder.build(connection.clone(), true, "trigger subprogram")?;
@@ -886,7 +984,11 @@ pub fn fire_trigger(
         });
 
         // Evaluate WHEN clause if present
-        if let Some(mut when_expr) = trigger.when_clause.clone() {
+        let when_clause = match resolver.dialect.trigger_when_clause(&trigger, &ctx.table)? {
+            Some(when_clause) => Some(when_clause),
+            None => trigger.when_clause.clone(),
+        };
+        if let Some(mut when_expr) = when_clause {
             crate::stack::trace_stack!("when_clause");
             // Rewrite NEW/OLD references in WHEN clause to use registers
             rewrite_trigger_expr_for_when_clause(&mut when_expr, &ctx.table, ctx)?;
