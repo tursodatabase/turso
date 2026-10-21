@@ -385,6 +385,25 @@ DELETE FROM users WHERE id = 1;  -- allowed
 PRAGMA i_am_a_dummy = 1;      -- equivalent to require_where = 1
 ```
 
+### fts_merge_threshold
+
+<Info>
+**Turso Extension**: write-path merging for the `fts` index method has no SQLite equivalent.
+</Info>
+
+Controls how many visible segments a `fts` index may accumulate before Turso merges them
+as part of the write path. After each statement that flushes the index, Turso compares the
+visible segment count against the threshold and merges the excess. The default is 32.
+Setting it to `0` disables write-path merging. The value applies to the current connection;
+new connections start from the default again.
+
+```sql
+PRAGMA fts_merge_threshold;        -- 32
+PRAGMA fts_merge_threshold = 8;    -- merge once the index has more than 8 visible segments
+PRAGMA fts_merge_threshold = 0;    -- disable write-path merging
+PRAGMA fts_merge_threshold = -1;   -- error: must be 0 (disabled) or a positive integer
+```
+
 ## Integrity Checks
 
 ### integrity_check
