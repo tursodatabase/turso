@@ -289,16 +289,14 @@ impl PlannedSelect {
     }
 }
 
-/// Prepare a top-level DELETE through semantic HIR. Returns `false`, with
-/// nothing emitted, when the statement uses something only legacy lowers
-/// today; the caller then hands it to legacy.
+/// Prepare a top-level DELETE through semantic HIR.
 pub(crate) fn translate_delete(
     statement: &ast::Stmt,
     schema: &Arc<Schema>,
     settings: &HirSettings<'_>,
     program: &mut ProgramBuilder,
     connection: &Arc<Connection>,
-) -> Result<bool> {
+) -> Result<()> {
     let ast::Stmt::Delete { tbl_name, .. } = statement else {
         return Err(LimboError::InternalError(
             "HIR DELETE got another statement".into(),
@@ -316,38 +314,31 @@ pub(crate) fn translate_delete(
     if let Some(table) = dml::virtual_target(&plan.document, delete.target)? {
         program.set_dbpage_writable(dml::dbpage_write_allowed(&table, connection));
     }
-    if delete::needs_legacy(&plan.document, delete, access)? {
-        return Ok(false);
-    }
-    let Some(subprograms) = Subprograms::for_delete(&session, program, &plan, delete)? else {
-        return Ok(false);
-    };
+    delete::check(&plan.document, delete, access)?;
+    let subprograms = Subprograms::for_delete(&session, program, &plan, delete)?;
     program.set_hir_plan(plan.clone());
     delete::emit_delete(program, &plan, delete, access, &subprograms)?;
     if let Some(returning) = &delete.returning {
         program.resolved_result_columns =
             resolved_output_columns(&plan.document, &returning.outputs)?;
     }
-    Ok(true)
+    Ok(())
 }
 
-/// Prepare a top-level UPDATE through semantic HIR. Returns `false`, with
-/// nothing emitted, when the statement uses something only legacy lowers
-/// today; the caller then hands it to legacy.
+/// Prepare a top-level UPDATE through semantic HIR.
 pub(crate) fn translate_update(
     statement: &ast::Stmt,
     schema: &Arc<Schema>,
     settings: &HirSettings<'_>,
     program: &mut ProgramBuilder,
     connection: &Arc<Connection>,
-) -> Result<bool> {
+) -> Result<()> {
     translate_update_with(statement, schema, settings, program, connection, None)
 }
 
 /// Prepare the UPDATE of the schema table that ALTER TABLE generates. Like
 /// legacy, it may write the schema table, and change data capture records
-/// `ddl`, the ALTER statement, as the new `sql` value. Returns `false`, with
-/// nothing emitted, when the update needs legacy.
+/// `ddl`, the ALTER statement, as the new `sql` value.
 pub(crate) fn translate_schema_update(
     statement: &ast::Stmt,
     schema: &Arc<Schema>,
@@ -355,7 +346,7 @@ pub(crate) fn translate_schema_update(
     program: &mut ProgramBuilder,
     connection: &Arc<Connection>,
     ddl: &str,
-) -> Result<bool> {
+) -> Result<()> {
     translate_update_with(statement, schema, settings, program, connection, Some(ddl))
 }
 
@@ -366,7 +357,7 @@ fn translate_update_with(
     program: &mut ProgramBuilder,
     connection: &Arc<Connection>,
     schema_change: Option<&str>,
-) -> Result<bool> {
+) -> Result<()> {
     let ast::Stmt::Update(syntax) = statement else {
         return Err(LimboError::InternalError(
             "HIR UPDATE got another statement".into(),
@@ -382,12 +373,8 @@ fn translate_update_with(
         program.set_dbpage_writable(dml::dbpage_write_allowed(&table, connection));
     }
     let mvcc = uses_mvcc(connection, &plan.document, update.target);
-    if update::needs_legacy(&plan, update, access)? {
-        return Ok(false);
-    }
-    let Some(subprograms) = Subprograms::for_update(&session, program, &plan, update)? else {
-        return Ok(false);
-    };
+    update::check(&plan, update, access)?;
+    let subprograms = Subprograms::for_update(&session, program, &plan, update)?;
     program.set_hir_plan(plan.clone());
     update::emit_update(
         program,
@@ -403,19 +390,17 @@ fn translate_update_with(
         program.resolved_result_columns =
             resolved_output_columns(&plan.document, &returning.outputs)?;
     }
-    Ok(true)
+    Ok(())
 }
 
-/// Prepare a top-level INSERT through semantic HIR. Returns `false`, with
-/// nothing emitted, when the statement uses something only legacy lowers
-/// today; the caller then hands it to legacy.
+/// Prepare a top-level INSERT through semantic HIR.
 pub(crate) fn translate_insert(
     statement: &ast::Stmt,
     schema: &Arc<Schema>,
     settings: &HirSettings<'_>,
     program: &mut ProgramBuilder,
     connection: &Arc<Connection>,
-) -> Result<bool> {
+) -> Result<()> {
     let ast::Stmt::Insert { tbl_name, .. } = statement else {
         return Err(LimboError::InternalError(
             "HIR INSERT got another statement".into(),
@@ -428,12 +413,8 @@ pub(crate) fn translate_insert(
     if let Some(table) = dml::virtual_target(&plan.document, insert.target)? {
         program.set_dbpage_writable(dml::dbpage_write_allowed(&table, connection));
     }
-    if insert::needs_legacy(&plan, insert, program)? {
-        return Ok(false);
-    }
-    let Some(subprograms) = Subprograms::for_insert(&session, program, &plan, insert)? else {
-        return Ok(false);
-    };
+    insert::check(&plan, insert, program)?;
+    let subprograms = Subprograms::for_insert(&session, program, &plan, insert)?;
     program.set_hir_plan(plan.clone());
     insert::emit_insert(
         program,
@@ -447,13 +428,9 @@ pub(crate) fn translate_insert(
         program.resolved_result_columns =
             resolved_output_columns(&plan.document, &returning.outputs)?;
     }
-    Ok(true)
+    Ok(())
 }
 
-/// Checks of a DML target that legacy makes by name, in the main schema,
-/// before it looks the table up. A protected system table or a materialized
-/// view cannot be written. A table that materialized views read still needs
-/// legacy, which keeps the views up to date.
 /// Whether the database of `target` keeps its rows in MVCC.
 pub(super) fn uses_mvcc(
     connection: &Connection,
@@ -464,17 +441,6 @@ pub(super) fn uses_mvcc(
         .source(target)
         .and_then(|source| source.database)
         .is_some_and(|database| connection.mv_store_for_db(database.index()).is_some())
-}
-
-/// Record that a statement goes to the legacy planner for `reason`. With
-/// TURSO_HIR_NO_FALLBACK set the statement fails instead, naming the reason,
-/// so running the test suites with it lists what still needs legacy.
-pub(super) fn note_fallback(reason: &str) -> Result<()> {
-    static NO_FALLBACK: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    if *NO_FALLBACK.get_or_init(|| std::env::var_os("TURSO_HIR_NO_FALLBACK").is_some()) {
-        return Err(LimboError::InternalError(format!("HIR fallback: {reason}")));
-    }
-    Ok(())
 }
 
 fn check_target(

@@ -48,83 +48,49 @@ pub(super) struct Subprograms<'a> {
 }
 
 impl<'a> Subprograms<'a> {
-    /// What a DELETE fires. `None` means one needs legacy.
+    /// What a DELETE fires.
     pub(super) fn for_delete(
         session: &HirSession<'_>,
         parent: &ProgramBuilder,
         plan: &HirPlan,
         delete: &'a hir::Delete,
-    ) -> Result<Option<Self>> {
-        let Some(triggers) = super::trigger::delete_triggers(session, parent, plan, delete)? else {
-            return Ok(None);
-        };
-        let Some(actions) = super::fkey_action::delete_actions(session, parent, delete)? else {
-            return Ok(None);
-        };
-        Ok(Some(Self {
-            triggers,
-            actions,
+    ) -> Result<Self> {
+        Ok(Self {
+            triggers: super::trigger::delete_triggers(session, parent, plan, delete)?,
+            actions: super::fkey_action::delete_actions(session, parent, delete)?,
             ..Self::default()
-        }))
+        })
     }
 
-    /// What an UPDATE fires. `None` means one needs legacy.
+    /// What an UPDATE fires.
     pub(super) fn for_update(
         session: &HirSession<'_>,
         parent: &ProgramBuilder,
         plan: &HirPlan,
         update: &'a hir::Update,
-    ) -> Result<Option<Self>> {
-        let Some(triggers) = super::trigger::update_triggers(session, parent, plan, update)? else {
-            return Ok(None);
-        };
-        let Some(actions) = super::fkey_action::update_actions(session, parent, plan, update)?
-        else {
-            return Ok(None);
-        };
-        let Some(replace_actions) = super::update::replace_actions(session, parent, plan, update)?
-        else {
-            return Ok(None);
-        };
-        Ok(Some(Self {
-            triggers,
-            actions,
-            replace_actions,
+    ) -> Result<Self> {
+        Ok(Self {
+            triggers: super::trigger::update_triggers(session, parent, plan, update)?,
+            actions: super::fkey_action::update_actions(session, parent, plan, update)?,
+            replace_actions: super::update::replace_actions(session, parent, plan, update)?,
             ..Self::default()
-        }))
+        })
     }
 
-    /// What an INSERT fires. `None` means one needs legacy.
+    /// What an INSERT fires.
     pub(super) fn for_insert(
         session: &HirSession<'_>,
         parent: &ProgramBuilder,
         plan: &HirPlan,
         insert: &'a hir::Insert,
-    ) -> Result<Option<Self>> {
-        let Some(triggers) = super::trigger::insert_triggers(session, parent, plan, insert)? else {
-            return Ok(None);
-        };
-        let Some(upsert_triggers) =
-            super::trigger::upsert_update_triggers(session, parent, plan, insert)?
-        else {
-            return Ok(None);
-        };
-        let Some(replace_actions) = super::insert::replace_actions(session, parent, plan, insert)?
-        else {
-            return Ok(None);
-        };
-        let Some(upsert_actions) =
-            super::fkey_action::upsert_actions(session, parent, plan, insert)?
-        else {
-            return Ok(None);
-        };
-        Ok(Some(Self {
-            triggers,
+    ) -> Result<Self> {
+        Ok(Self {
+            triggers: super::trigger::insert_triggers(session, parent, plan, insert)?,
             actions: Vec::new(),
-            replace_actions,
-            upsert_triggers,
-            upsert_actions,
-        }))
+            replace_actions: super::insert::replace_actions(session, parent, plan, insert)?,
+            upsert_triggers: super::trigger::upsert_update_triggers(session, parent, plan, insert)?,
+            upsert_actions: super::fkey_action::upsert_actions(session, parent, plan, insert)?,
+        })
     }
 }
 

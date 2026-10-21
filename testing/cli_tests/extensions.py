@@ -573,6 +573,29 @@ def test_kv_hir():
             lambda res: res == "a\nk",
             "DELETE removes the row",
         )
+        # UPDATE ... FROM joins the virtual table with the FROM tables first
+        # and then updates each joined row once, as SQLite does. Legacy
+        # failed it with "no such column: rowid".
+        turso.execute_dot("create table m(k text, v text);")
+        turso.execute_dot("insert into m values ('a', 'A1'), ('a', 'A2'), ('k', 'K');")
+        turso.run_test_fn(
+            "update t set value = m.v || key from m where t.key = m.k and m.v <> 'A1';",
+            null,
+        )
+        turso.run_test_fn(
+            "select key, value from t order by key;",
+            lambda res: res == "a|A2a\nk|Kk",
+            "UPDATE ... FROM sets each joined row of a virtual table",
+        )
+        turso.run_test_fn(
+            "update t set key = key || m.k from m where t.key = m.k and m.k = 'k';",
+            null,
+        )
+        turso.run_test_fn(
+            "select key, value from t order by key;",
+            lambda res: res == "a|A2a\nkk|Kk",
+            "UPDATE ... FROM of a virtual table can change the key",
+        )
         turso.run_test_fn(
             "delete from t returning *;",
             lambda res: "DELETE RETURNING is not available on virtual tables" in res,

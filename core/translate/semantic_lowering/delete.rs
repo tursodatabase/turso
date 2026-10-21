@@ -1,12 +1,10 @@
 //! DELETE lowering from resolved HIR.
 //!
-//! This covers a plain DELETE from a B-tree table: one loop over the planned
-//! access path, index entries removed with `IdxDelete`, then the row removed
-//! with `Delete`. RETURNING rows are buffered and returned after the last
-//! row is deleted. A WHERE clause with a subquery first collects the rowids,
-//! as legacy does. Statements that need foreign-key actions, a RETURNING
-//! subquery, CDC, or a virtual table still go through legacy; see
-//! [`needs_legacy`].
+//! A DELETE from a B-tree table runs one loop over the planned access path,
+//! removes the index entries with `IdxDelete`, then the row with `Delete`.
+//! RETURNING rows are buffered and returned after the last row is deleted.
+//! A WHERE clause with a subquery first collects the rowids, as legacy does.
+//! A DELETE from a virtual table hands each row to the table with `VUpdate`.
 
 use turso_parser::ast::TriggerTime;
 
@@ -35,21 +33,22 @@ use super::query::{
 use super::trigger::{CompiledTrigger, TriggerRow};
 use crate::translate::emitter::OperationMode;
 
-/// Whether this DELETE uses something the HIR lowering does not handle yet.
-/// It is checked before any bytecode is emitted, so legacy can still take
-/// the whole statement.
-pub(super) fn needs_legacy(
+/// Check a DELETE before any bytecode is emitted: what the lowering expects
+/// of its target and plan.
+pub(super) fn check(
     document: &HirDocument,
     delete: &hir::Delete,
     access: &HirAccessPlan,
-) -> Result<bool> {
+) -> Result<()> {
+    // The parser rejects ORDER BY and LIMIT on a DELETE.
     if !delete.order_by.is_empty() || delete.limit.is_some() {
-        super::note_fallback("DELETE with ORDER BY or LIMIT")?;
-        return Ok(true);
+        return Err(LimboError::InternalError(
+            "HIR DELETE with ORDER BY or LIMIT is not lowered".into(),
+        ));
     }
     // Like legacy, writes to a virtual table record no change data.
     if super::dml::virtual_target(document, delete.target)?.is_some() {
-        return Ok(false);
+        return Ok(());
     }
     let [planned_loop] = access.loops.as_slice() else {
         return Err(LimboError::InternalError(format!(
@@ -58,18 +57,20 @@ pub(super) fn needs_legacy(
         )));
     };
     match &planned_loop.access {
+        // The planner builds an automatic index only for a table joined
+        // after another one, and the target is the only loop.
         HirSourceAccess::BTree { operation, .. } => {
             if operation_index(operation).is_some_and(|index| index.ephemeral) {
-                super::note_fallback("DELETE through an automatic index")?;
-                return Ok(true);
+                return Err(LimboError::InternalError(
+                    "HIR DELETE target reads an automatic index".into(),
+                ));
             }
-            Ok(false)
+            Ok(())
         }
-        HirSourceAccess::OrUnion(_) | HirSourceAccess::IndexMethod(_) => Ok(false),
-        _ => {
-            super::note_fallback("DELETE target without a table loop")?;
-            Ok(true)
-        }
+        HirSourceAccess::OrUnion(_) | HirSourceAccess::IndexMethod(_) => Ok(()),
+        _ => Err(LimboError::InternalError(
+            "HIR DELETE target is not read by a table loop".into(),
+        )),
     }
 }
 
@@ -83,7 +84,7 @@ fn returning_has_subquery(delete: &hir::Delete) -> bool {
     })
 }
 
-/// Emit a DELETE that [`needs_legacy`] accepted. `delete` is the plan's
+/// Emit a DELETE that [`check`] accepted. `delete` is the plan's
 /// root or one command of a trigger in it.
 pub(super) fn emit_delete(
     program: &mut ProgramBuilder,
@@ -611,7 +612,7 @@ mod tests {
         let plan = Arc::new(plan);
         let (delete, access) = root(&plan);
         let mut program = program();
-        assert!(!needs_legacy(&plan.document, delete, access).unwrap());
+        check(&plan.document, delete, access).unwrap();
         program.set_hir_plan(plan.clone());
         emit_delete(&mut program, &plan, delete, access, &Subprograms::default()).unwrap();
         program
@@ -759,19 +760,15 @@ mod tests {
             }
             schema
         };
-        for (sql, legacy) in [
-            ("DELETE FROM parent", false),
-            ("DELETE FROM child", false),
-            ("DELETE FROM other", false),
-            ("DELETE FROM cascade", false),
+        for sql in [
+            "DELETE FROM parent",
+            "DELETE FROM child",
+            "DELETE FROM other",
+            "DELETE FROM cascade",
         ] {
             let plan = analyze_plan(schema(), sql);
             let (delete, access) = root(&plan);
-            assert_eq!(
-                needs_legacy(&plan.document, delete, access).unwrap(),
-                legacy,
-                "{sql}"
-            );
+            check(&plan.document, delete, access).unwrap_or_else(|error| panic!("{sql}: {error}"));
         }
     }
 }

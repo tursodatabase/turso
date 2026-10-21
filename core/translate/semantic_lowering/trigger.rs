@@ -61,9 +61,8 @@ pub(super) struct TriggerRow {
 }
 
 /// Compile `triggers`, the triggers on `table` in `database` that the
-/// statement fires. `None` means a trigger needs legacy, so the whole
-/// statement must use legacy. A trigger that is already being compiled
-/// further up is left out, as legacy does.
+/// statement fires. A trigger that is already being compiled further up is
+/// left out, as legacy does.
 pub(super) fn compile_triggers(
     session: &HirSession<'_>,
     parent: &ProgramBuilder,
@@ -71,22 +70,20 @@ pub(super) fn compile_triggers(
     database: usize,
     triggers: &[hir::ResolvedTrigger],
     conflict_override: Option<ResolveType>,
-) -> Result<Option<Vec<CompiledTrigger>>> {
+) -> Result<Vec<CompiledTrigger>> {
     let mut compiled = Vec::with_capacity(triggers.len());
     for trigger in triggers {
         match compile_trigger(session, parent, table, database, trigger, conflict_override)? {
             Compiled::Trigger(trigger) => compiled.push(trigger),
             Compiled::AlreadyCompiling => {}
-            Compiled::NeedsLegacy => return Ok(None),
         }
     }
-    Ok(Some(compiled))
+    Ok(compiled)
 }
 
 enum Compiled {
     Trigger(CompiledTrigger),
     AlreadyCompiling,
-    NeedsLegacy,
 }
 
 fn compile_trigger(
@@ -140,37 +137,25 @@ fn compile_trigger(
     for (command, command_plan) in root.commands.iter().zip(commands) {
         let compiled = match (command, command_plan) {
             (hir::TriggerCommand::Select(_), HirTriggerCommandPlan::Select(_)) => {
-                Some(Subprograms::default())
+                Subprograms::default()
             }
             (hir::TriggerCommand::Insert(insert), HirTriggerCommandPlan::Insert) => {
-                if super::insert::needs_legacy(&plan, insert, &builder)? {
-                    None
-                } else {
-                    Subprograms::for_insert(session, &builder, &plan, insert)?
-                }
+                super::insert::check(&plan, insert, &builder)?;
+                Subprograms::for_insert(session, &builder, &plan, insert)?
             }
             (hir::TriggerCommand::Update(update), HirTriggerCommandPlan::Update(access)) => {
-                if super::update::needs_legacy(&plan, update, access)? {
-                    None
-                } else {
-                    Subprograms::for_update(session, &builder, &plan, update)?
-                }
+                super::update::check(&plan, update, access)?;
+                Subprograms::for_update(session, &builder, &plan, update)?
             }
             (hir::TriggerCommand::Delete(delete), HirTriggerCommandPlan::Delete(access)) => {
-                if super::delete::needs_legacy(&plan.document, delete, access)? {
-                    None
-                } else {
-                    Subprograms::for_delete(session, &builder, &plan, delete)?
-                }
+                super::delete::check(&plan.document, delete, access)?;
+                Subprograms::for_delete(session, &builder, &plan, delete)?
             }
             _ => {
                 return Err(LimboError::InternalError(
                     "HIR trigger command and its plan differ".into(),
                 ));
             }
-        };
-        let Some(compiled) = compiled else {
-            return Ok(Compiled::NeedsLegacy);
         };
         nested.push(compiled);
     }
@@ -303,7 +288,7 @@ fn compile_trigger(
     }))
 }
 
-/// Compile the triggers an INSERT fires. `None` means one needs legacy.
+/// Compile the triggers an INSERT fires.
 /// Like legacy, an INSERT's conflict clause other than ABORT also applies
 /// inside its triggers.
 pub(super) fn insert_triggers(
@@ -311,9 +296,9 @@ pub(super) fn insert_triggers(
     parent: &ProgramBuilder,
     plan: &HirPlan,
     insert: &hir::Insert,
-) -> Result<Option<Vec<CompiledTrigger>>> {
+) -> Result<Vec<CompiledTrigger>> {
     let hir::InsertTargetKind::BTree { triggers, .. } = &insert.target_kind else {
-        return Ok(Some(Vec::new()));
+        return Ok(Vec::new());
     };
     let conflict_override = parent.trigger_conflict_override.or_else(|| {
         insert
@@ -330,17 +315,17 @@ pub(super) fn insert_triggers(
     )
 }
 
-/// Compile the UPDATE triggers an UPSERT's DO UPDATE fires. `None` means one
-/// needs legacy. Like legacy, an OR IGNORE or OR REPLACE inside them does
-/// not hide an error: they run with ABORT.
+/// Compile the UPDATE triggers an UPSERT's DO UPDATE fires. Like legacy, an
+/// OR IGNORE or OR REPLACE inside them does not hide an error: they run with
+/// ABORT.
 pub(super) fn upsert_update_triggers(
     session: &HirSession<'_>,
     parent: &ProgramBuilder,
     plan: &HirPlan,
     insert: &hir::Insert,
-) -> Result<Option<Vec<CompiledTrigger>>> {
+) -> Result<Vec<CompiledTrigger>> {
     let hir::InsertTargetKind::BTree { triggers, .. } = &insert.target_kind else {
-        return Ok(Some(Vec::new()));
+        return Ok(Vec::new());
     };
     target_triggers(
         session,
@@ -352,16 +337,16 @@ pub(super) fn upsert_update_triggers(
     )
 }
 
-/// Compile the triggers an UPDATE fires. `None` means one needs legacy.
+/// Compile the triggers an UPDATE fires.
 /// The conflict clause applies inside them as for INSERT.
 pub(super) fn update_triggers(
     session: &HirSession<'_>,
     parent: &ProgramBuilder,
     plan: &HirPlan,
     update: &hir::Update,
-) -> Result<Option<Vec<CompiledTrigger>>> {
+) -> Result<Vec<CompiledTrigger>> {
     let hir::UpdateTargetKind::BTree { triggers, .. } = &update.target_kind else {
-        return Ok(Some(Vec::new()));
+        return Ok(Vec::new());
     };
     let conflict_override = parent.trigger_conflict_override.or_else(|| {
         update
@@ -378,15 +363,15 @@ pub(super) fn update_triggers(
     )
 }
 
-/// Compile the triggers a DELETE fires. `None` means one needs legacy.
+/// Compile the triggers a DELETE fires.
 pub(super) fn delete_triggers(
     session: &HirSession<'_>,
     parent: &ProgramBuilder,
     plan: &HirPlan,
     delete: &hir::Delete,
-) -> Result<Option<Vec<CompiledTrigger>>> {
+) -> Result<Vec<CompiledTrigger>> {
     let hir::DeleteTargetKind::BTree { triggers, .. } = &delete.target_kind else {
-        return Ok(Some(Vec::new()));
+        return Ok(Vec::new());
     };
     target_triggers(
         session,
@@ -409,9 +394,9 @@ fn target_triggers(
     target: hir::SourceId,
     triggers: &[hir::ResolvedTrigger],
     conflict_override: Option<ResolveType>,
-) -> Result<Option<Vec<CompiledTrigger>>> {
+) -> Result<Vec<CompiledTrigger>> {
     if triggers.is_empty() {
-        return Ok(Some(Vec::new()));
+        return Ok(Vec::new());
     }
     let source = plan
         .document

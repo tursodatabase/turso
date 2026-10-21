@@ -1,11 +1,11 @@
 //! INSERT lowering from resolved HIR.
 //!
-//! This covers a plain INSERT of VALUES rows or DEFAULT VALUES into a rowid
-//! B-tree table: the row is built in registers, its rowid taken from the
-//! statement or generated, NOT NULL, PRIMARY KEY and UNIQUE checked, then
-//! every index entry and the row are written. Several VALUES rows run as a
-//! coroutine, as in legacy. RETURNING reads the new row. Everything else
-//! still goes through legacy; see [`needs_legacy`].
+//! An INSERT into a B-tree table builds the row in registers, takes its
+//! rowid from the statement or generates one, checks NOT NULL, PRIMARY KEY
+//! and UNIQUE, then writes every index entry and the row. Several VALUES
+//! rows, and a SELECT, run as a coroutine, as in legacy. RETURNING reads the
+//! new row. An INSERT into a virtual table hands each row to the table with
+//! `VUpdate`.
 
 use std::num::NonZeroUsize;
 
@@ -38,18 +38,13 @@ use super::fkey_action::CompiledAction;
 use super::trigger::{CompiledTrigger, TriggerRow};
 use crate::translate::emitter::OperationMode;
 
-/// Whether this INSERT uses something the HIR lowering does not handle yet.
-/// It is checked before any bytecode is emitted, so legacy can still take
-/// the whole statement.
-pub(super) fn needs_legacy(
-    plan: &HirPlan,
-    insert: &hir::Insert,
-    program: &ProgramBuilder,
-) -> Result<bool> {
+/// Check an INSERT before any bytecode is emitted: what the lowering
+/// expects of its target, and legacy's errors for what it cannot write.
+pub(super) fn check(plan: &HirPlan, insert: &hir::Insert, program: &ProgramBuilder) -> Result<()> {
     let document = &plan.document;
     // Like legacy, writes to a virtual table record no change data.
     if super::dml::virtual_target(document, insert.target)?.is_some() {
-        return Ok(false);
+        return Ok(());
     }
     let Some(source) = document.source(insert.target) else {
         return Err(LimboError::InternalError(format!(
@@ -57,19 +52,23 @@ pub(super) fn needs_legacy(
             insert.target
         )));
     };
+    // Analysis resolves the target to a table, which is a B-tree once
+    // virtual tables are out of the way.
     let hir::SourceKind::Table(table) = &source.kind else {
-        super::note_fallback("INSERT into a target that is not a table")?;
-        return Ok(true);
+        return Err(LimboError::InternalError(
+            "HIR INSERT target is not a table".into(),
+        ));
     };
     let Some(table) = table.value().btree() else {
-        super::note_fallback("INSERT into a table without a B-tree")?;
-        return Ok(true);
+        return Err(LimboError::InternalError(
+            "HIR INSERT target has no B-tree".into(),
+        ));
     };
     if !table.has_rowid {
         without_rowid_errors(program, insert, source)?;
     }
     super::dml::check_strict_types(&table, source)?;
-    Ok(false)
+    Ok(())
 }
 
 /// What an INSERT into a WITHOUT ROWID table cannot do yet, with legacy's
@@ -96,7 +95,7 @@ fn without_rowid_errors(
     Ok(())
 }
 
-/// Emit an INSERT that [`needs_legacy`] accepted. `insert` is the plan's
+/// Emit an INSERT that [`check`] accepted. `insert` is the plan's
 /// root or one command of a trigger in it. `enforce_checks` is false under
 /// `PRAGMA ignore_check_constraints`.
 pub(super) fn emit_insert(
@@ -479,22 +478,21 @@ pub(super) fn column_positions(columns: &[hir::TargetColumn]) -> Vec<usize> {
         .collect()
 }
 
-/// Compile the ON DELETE actions of the rows REPLACE may delete. `None`
-/// means one needs legacy.
+/// Compile the ON DELETE actions of the rows REPLACE may delete.
 pub(super) fn replace_actions<'a>(
     session: &super::HirSession<'_>,
     parent: &ProgramBuilder,
     plan: &HirPlan,
     insert: &'a hir::Insert,
-) -> Result<Option<Vec<CompiledAction<'a>>>> {
+) -> Result<Vec<CompiledAction<'a>>> {
     let hir::InsertTargetKind::BTree { foreign_keys, .. } = &insert.target_kind else {
-        return Ok(Some(Vec::new()));
+        return Ok(Vec::new());
     };
     let source = plan.document.source(insert.target).ok_or_else(|| {
         LimboError::InternalError(format!("HIR INSERT target {} is missing", insert.target))
     })?;
     let hir::SourceKind::Table(table) = &source.kind else {
-        return Ok(Some(Vec::new()));
+        return Ok(Vec::new());
     };
     let table = table.value().require_btree()?;
     let may_replace = match insert.conflict {
@@ -508,7 +506,7 @@ pub(super) fn replace_actions<'a>(
         }
     };
     if !may_replace {
-        return Ok(Some(Vec::new()));
+        return Ok(Vec::new());
     }
     super::fkey_action::compile_actions(
         session,
@@ -2365,7 +2363,7 @@ mod tests {
             .unwrap();
         let plan = Arc::new(analyze_plan(schema, "INSERT INTO sv(a, c) VALUES (1, 'q')"));
         let insert = insert_root(&plan).unwrap();
-        assert!(!needs_legacy(&plan, insert, &program()).unwrap());
+        check(&plan, insert, &program()).unwrap();
         let mut program = program();
         program.set_hir_plan(plan.clone());
         let subprograms = Subprograms::default();
@@ -2397,7 +2395,7 @@ mod tests {
         schema.add_btree_table(Arc::new(table)).unwrap();
         let plan = analyze_plan(schema, "INSERT INTO hc VALUES (1, 2)");
         let insert = insert_root(&plan).unwrap();
-        assert!(!needs_legacy(&plan, insert, &program()).unwrap());
+        check(&plan, insert, &program()).unwrap();
         // Like legacy, the values go to `a` and `c`, and `b` stays NULL.
         let targets = insert
             .columns
@@ -2434,7 +2432,7 @@ mod tests {
             .unwrap();
         let plan = Arc::new(analyze_plan(schema, sql));
         let insert = insert_root(&plan).unwrap();
-        assert!(!needs_legacy(&plan, insert, &program()).unwrap(), "{sql}");
+        check(&plan, insert, &program()).unwrap_or_else(|error| panic!("{sql}: {error}"));
         let mut program = program();
         program.set_hir_plan(plan.clone());
         let subprograms = Subprograms {
@@ -2520,7 +2518,7 @@ mod tests {
         ] {
             let plan = Arc::new(analyze_plan(schema(), sql));
             let insert = insert_root(&plan).unwrap();
-            assert!(!needs_legacy(&plan, insert, &program()).unwrap(), "{sql}");
+            check(&plan, insert, &program()).unwrap_or_else(|error| panic!("{sql}: {error}"));
             let subprograms = Subprograms {
                 upsert_actions: insert.upserts.iter().map(|_| Vec::new()).collect(),
                 ..Subprograms::default()
@@ -2563,7 +2561,7 @@ mod tests {
         ] {
             let plan = analyze_plan(schema(), sql);
             let insert = insert_root(&plan).unwrap();
-            assert!(!needs_legacy(&plan, insert, &program()).unwrap(), "{sql}");
+            check(&plan, insert, &program()).unwrap_or_else(|error| panic!("{sql}: {error}"));
         }
     }
 
@@ -2571,7 +2569,7 @@ mod tests {
         let plan = Arc::new(analyze_plan(schema(), sql));
         let mut program = program();
         let insert = insert_root(&plan).unwrap();
-        assert!(!needs_legacy(&plan, insert, &program).unwrap(), "{sql}");
+        check(&plan, insert, &program).unwrap_or_else(|error| panic!("{sql}: {error}"));
         program.set_hir_plan(plan.clone());
         let subprograms = Subprograms {
             upsert_actions: insert.upserts.iter().map(|_| Vec::new()).collect(),
@@ -2729,7 +2727,7 @@ mod tests {
             "INSERT INTO tagged VALUES (1, '{a,b}', NULL)",
         ));
         let insert = insert_root(&plan).unwrap();
-        assert!(!needs_legacy(&plan, insert, &program()).unwrap());
+        check(&plan, insert, &program()).unwrap();
         let mut program = program();
         program.set_hir_plan(plan.clone());
         emit_insert(

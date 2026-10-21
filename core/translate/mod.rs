@@ -268,7 +268,8 @@ fn translate_statement(
                     "DELETE without a WHERE clause is not allowed when require_where (or i_am_a_dummy) is enabled"
                 );
             }
-            semantic_lowering::translate_delete(&stmt, schema, settings, program, connection)?
+            semantic_lowering::translate_delete(&stmt, schema, settings, program, connection)?;
+            true
         }
         (Some((schema, settings)), ast::Stmt::Update(update)) => {
             if update.where_clause.is_none() && connection.get_dml_require_where() {
@@ -276,10 +277,12 @@ fn translate_statement(
                     "UPDATE without a WHERE clause is not allowed when require_where (or i_am_a_dummy) is enabled"
                 );
             }
-            semantic_lowering::translate_update(&stmt, schema, settings, program, connection)?
+            semantic_lowering::translate_update(&stmt, schema, settings, program, connection)?;
+            true
         }
         (Some((schema, settings)), ast::Stmt::Insert { .. }) => {
-            semantic_lowering::translate_insert(&stmt, schema, settings, program, connection)?
+            semantic_lowering::translate_insert(&stmt, schema, settings, program, connection)?;
+            true
         }
         _ => false,
     };
