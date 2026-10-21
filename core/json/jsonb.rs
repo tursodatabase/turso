@@ -2517,10 +2517,7 @@ impl Jsonb {
 
         // Check for any non-whitespace characters after the JSON value
         if pos < input.len() {
-            return Err(PError::Message {
-                msg: "Unexpected input after json".to_string(),
-                location: Some(pos),
-            });
+            return Err(PError::TrailingInput);
         }
 
         Ok((result, info))

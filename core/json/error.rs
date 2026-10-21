@@ -15,6 +15,8 @@ pub enum Error {
         /// The location of the error, if applicable.
         location: Option<usize>,
     },
+    /// Input remains after a complete top-level JSON value.
+    TrailingInput,
     OutOfMemory,
 }
 
@@ -46,6 +48,7 @@ impl Display for Error {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Message { ref msg, .. } => write!(formatter, "{msg}"),
+            Self::TrailingInput => formatter.write_str("Unexpected input after json"),
             Self::OutOfMemory => formatter.write_str("out of memory"),
         }
     }
@@ -57,6 +60,9 @@ impl From<Error> for crate::LimboError {
     fn from(err: Error) -> Self {
         match err {
             Error::Message { msg, .. } => crate::LimboError::ParseError(msg),
+            Error::TrailingInput => {
+                crate::LimboError::ParseError("Unexpected input after json".into())
+            }
             Error::OutOfMemory => crate::LimboError::OutOfMemory,
         }
     }
