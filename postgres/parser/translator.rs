@@ -3335,8 +3335,6 @@ impl PostgreSQLTranslator {
 
         let translated_order = self.translate_order_by(&func_call.agg_order)?;
         let (order_by, within_group) = if func_call.agg_within_group {
-            // mode() and the percentile functions skip NULL inputs, so the
-            // NULL order of their sort cannot change the result.
             let within_group = translated_order
                 .into_iter()
                 .map(|column| ast::SortedColumn {

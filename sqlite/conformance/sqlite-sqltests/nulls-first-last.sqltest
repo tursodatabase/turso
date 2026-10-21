@@ -852,3 +852,53 @@ expect {
     5|2|4|2
     2|3|5|3
 }
+
+# ===== NULLS ordering on an indexed NOT NULL column =====
+
+setup not-null-index-table {
+    CREATE TABLE nn (x INTEGER NOT NULL, y INTEGER);
+    CREATE INDEX nn_x ON nn (x);
+    CREATE INDEX nn_y ON nn (y);
+    INSERT INTO nn VALUES (3, 3), (1, NULL), (2, 2);
+}
+
+@setup not-null-index-table
+test not-null-index-column-with-any-nulls-order {
+    SELECT x FROM nn ORDER BY x NULLS LAST LIMIT 2;
+    SELECT x FROM nn ORDER BY x DESC NULLS FIRST LIMIT 2;
+    SELECT y FROM nn ORDER BY y NULLS LAST;
+}
+expect {
+    1
+    2
+    3
+    2
+    2
+    3
+
+}
+
+@setup not-null-index-table
+snapshot-eqp not-null-index-column-nulls-last-uses-index {
+    SELECT x FROM nn ORDER BY x NULLS LAST LIMIT 2;
+}
+
+@setup not-null-index-table
+snapshot-eqp not-null-index-column-desc-nulls-first-uses-index {
+    SELECT x FROM nn ORDER BY x DESC NULLS FIRST LIMIT 2;
+}
+
+@setup not-null-index-table
+snapshot-eqp nullable-index-column-nulls-last-uses-sorter {
+    SELECT y FROM nn ORDER BY y NULLS LAST;
+}
+
+setup strict-primary-key-table {
+    CREATE TABLE spk (code TEXT PRIMARY KEY, n INT) STRICT;
+    INSERT INTO spk VALUES ('b', 1), ('a', 2);
+}
+
+@setup strict-primary-key-table
+snapshot-eqp strict-primary-key-nulls-last-uses-index {
+    SELECT code FROM spk ORDER BY code NULLS LAST LIMIT 2;
+}
