@@ -384,6 +384,18 @@ PRAGMA legacy_file_format;      -- no rows
 PRAGMA legacy_file_format = 1;  -- accepted, no effect
 ```
 
+### empty_result_callbacks
+
+Accepted for compatibility, but has no effect. SQLite deprecated this pragma long ago
+(it controlled whether callbacks still fired when a query returned no rows, which only
+matters to the C API callback loop). In Turso both forms are no-ops: the read form
+returns no rows, and the write form accepts any value without changing behavior.
+
+```sql
+PRAGMA empty_result_callbacks;        -- returns no rows
+PRAGMA empty_result_callbacks = ON;   -- accepted, does nothing
+```
+
 ### ignore_check_constraints
 
 When enabled, CHECK constraints are not enforced.
