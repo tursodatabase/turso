@@ -699,6 +699,7 @@ pub trait Wal: Debug + Send + Sync {
     ///
     /// TursoDB uses `page_no` and `size_after` from the supplied header, applies
     /// any configured page transform to the body, and overwrites the checksum.
+    /// Returns an error if this connection does not hold the WAL write lock.
     fn write_frame_raw(
         &self,
         buffer_pool: Arc<BufferPool>,
@@ -4012,6 +4013,11 @@ impl Wal for WalFile {
         page: &[u8],
         sync_type: FileSyncType,
     ) -> Result<()> {
+        if !self.holds_write_lock() {
+            return Err(LimboError::TxError(
+                "cannot write raw WAL frame without holding the WAL write lock".to_string(),
+            ));
+        }
         let Some(page_size) = PageSize::new(page.len() as u32) else {
             bail_corrupt_error!("invalid page size: {}", page.len());
         };
@@ -6968,6 +6974,7 @@ pub mod test {
     fn page_codec_round_trips_raw_wal_frames() {
         let page_size = 512;
         let (io, buffer_pool, wal) = make_initialized_memory_wal(page_size);
+        begin_write_tx_for_test(&wal);
         set_test_page_codec(&wal, Arc::new(TestPageCodec::Xor(0xa5)));
         let expected = (0..page_size).map(|i| i as u8).collect::<Vec<_>>();
 
@@ -6984,6 +6991,7 @@ pub mod test {
     fn page_codec_raw_wal_encode_error_does_not_advance_wal() {
         let page_size = 512;
         let (_io, buffer_pool, wal) = make_initialized_memory_wal(page_size);
+        begin_write_tx_for_test(&wal);
         set_test_page_codec(&wal, Arc::new(TestPageCodec::ErrorEncode));
         let page = vec![0; page_size as usize];
 
@@ -7000,6 +7008,7 @@ pub mod test {
     fn page_codec_raw_wal_duplicate_is_idempotent_and_detects_conflict() {
         let page_size = 512;
         let (_io, buffer_pool, wal) = make_initialized_memory_wal(page_size);
+        begin_write_tx_for_test(&wal);
         set_test_page_codec(&wal, Arc::new(TestPageCodec::Xor(0xa5)));
         let page = (0..page_size).map(|i| i as u8).collect::<Vec<_>>();
 
@@ -7022,6 +7031,7 @@ pub mod test {
     fn page_codec_raw_wal_read_rejects_wrong_buffer_size() {
         let page_size = 512;
         let (_io, buffer_pool, wal) = make_initialized_memory_wal(page_size);
+        begin_write_tx_for_test(&wal);
         set_test_page_codec(&wal, Arc::new(TestPageCodec::Xor(0xa5)));
         let page = vec![0; page_size as usize];
         wal.write_frame_raw(buffer_pool, 1, 44, 0, &page, FileSyncType::Fsync)
@@ -7066,6 +7076,7 @@ pub mod test {
     fn encryption_round_trips_raw_wal_frames() {
         let page_size = 4096;
         let (io, buffer_pool, wal) = make_initialized_memory_wal(page_size);
+        begin_write_tx_for_test(&wal);
         set_test_encryption(&wal, page_size as usize);
         let mut expected = (0..page_size).map(|i| i as u8).collect::<Vec<_>>();
         expected[page_size as usize - 64..].fill(0);
@@ -7084,6 +7095,7 @@ pub mod test {
     fn checksum_is_applied_to_raw_wal_frames() {
         let page_size = 4096;
         let (io, buffer_pool, wal) = make_initialized_memory_wal(page_size);
+        begin_write_tx_for_test(&wal);
         let mut source = (0..page_size).map(|i| i as u8).collect::<Vec<_>>();
         source[page_size as usize - 8..].fill(0);
 
@@ -7099,6 +7111,11 @@ pub mod test {
             &target.get_contents().as_ptr()[..page_size as usize - 8],
             &source[..page_size as usize - 8]
         );
+    }
+
+    fn begin_write_tx_for_test(wal: &WalFile) {
+        wal.begin_read_tx().unwrap();
+        wal.begin_write_tx(WalAutoActions::empty()).unwrap();
     }
 
     #[test]
