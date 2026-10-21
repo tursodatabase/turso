@@ -267,3 +267,30 @@ test serial-sequence-reachable-under-search-path {
 expect {
     1
 }
+
+test drop-if-exists-missing-object-under-search-path {
+    SET search_path TO sp_missing_di;
+    DROP TABLE IF EXISTS nope;
+    DROP VIEW IF EXISTS nope;
+    DROP INDEX IF EXISTS nope;
+    DROP SEQUENCE IF EXISTS nope;
+    SELECT 1;
+}
+expect {
+    1
+}
+
+test drop-if-exists-finds-object-through-search-path {
+    CREATE SCHEMA IF NOT EXISTS sp_di;
+    DROP TABLE IF EXISTS sp_di.t;
+    CREATE TABLE sp_di.t (x int);
+    CREATE INDEX t_x_idx ON sp_di.t (x);
+    SET search_path TO sp_di;
+    DROP INDEX IF EXISTS t_x_idx;
+    DROP TABLE IF EXISTS t;
+    CREATE TABLE sp_di.t (x int);
+    SELECT count(*) FROM t;
+}
+expect {
+    0
+}

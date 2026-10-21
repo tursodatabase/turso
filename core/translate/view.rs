@@ -471,10 +471,17 @@ pub fn translate_drop_view(
 ) -> Result<()> {
     // Unqualified names search the temp schema first, then main, then
     // attached databases, so DROP VIEW finds temp views like SQLite does.
-    let database_id = resolver.resolve_existing_table_database_id_qualified(view_name)?;
+    let normalized_view_name = normalize_ident(view_name.name.as_str());
+    let Some(database_id) = resolver.find_existing_table_database_id_qualified(view_name)? else {
+        if if_exists {
+            return Ok(());
+        }
+        return Err(crate::LimboError::ParseError(format!(
+            "no such view: {normalized_view_name}"
+        )));
+    };
     let schema_cookie = resolver.with_schema(database_id, |s| s.schema_version);
     program.begin_write_on_database(database_id, schema_cookie)?;
-    let normalized_view_name = normalize_ident(view_name.name.as_str());
 
     // Check if view exists: regular, materialized, or a broken sqlite_schema
     // row whose stored SQL failed to parse at load time. Broken views have no
