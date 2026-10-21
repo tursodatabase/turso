@@ -859,8 +859,8 @@ pub(super) fn subquery_query(subquery: &hir::SubqueryExpr) -> hir::QueryId {
     }
 }
 
-/// Whether the target is a STRICT table HIR does not lower yet: one with an
-/// array column, or a type name that is neither built in nor custom.
+/// Whether the target is a STRICT table HIR does not lower yet: one with a
+/// column whose type name is neither built in nor custom.
 pub(super) fn strict_needs_legacy(table: &BTreeTable, source: &hir::Source) -> bool {
     let builtin = |name: &str| {
         ["ANY", "INTEGER", "INT", "REAL", "BLOB", "TEXT"]
@@ -873,12 +873,9 @@ pub(super) fn strict_needs_legacy(table: &BTreeTable, source: &hir::Source) -> b
             .iter()
             .enumerate()
             .any(|(position, column)| {
-                if column.is_array() {
-                    // An array of a custom type is not lowered yet.
-                    !builtin(&column.ty_str)
-                } else {
-                    custom_chain(source, position).is_none() && !builtin(&column.ty_str)
-                }
+                !column.is_array()
+                    && custom_chain(source, position).is_none()
+                    && !builtin(&column.ty_str)
             })
 }
 
@@ -993,6 +990,31 @@ pub(super) fn emit_custom_type_writes(
             target_pc: skip,
         });
         let any = column.ty_str.eq_ignore_ascii_case("ANY") || column.array_dimensions() > 1;
+        // Like legacy, the elements of an array of a custom type are
+        // encoded one by one: the text or blob is first parsed as an array
+        // of anything, each element encoded, then the array checked against
+        // the element type like any other.
+        if let Some(programs) = source
+            .column_type_programs
+            .get(position)
+            .and_then(Option::as_ref)
+        {
+            program.emit_insn(Insn::ArrayEncode {
+                data: Box::new(crate::vdbe::insn::ArrayEncodeData {
+                    reg: register,
+                    element_affinity: crate::vdbe::affinity::Affinity::Blob,
+                    element_type: "ANY".into(),
+                    table_name: table.name.as_str().into(),
+                    col_name: column.name.as_deref().unwrap_or("").into(),
+                }),
+            });
+            super::expr::translate_schema_calls_on_elements(
+                program,
+                document,
+                &programs.encode,
+                register,
+            )?;
+        }
         program.emit_insn(Insn::ArrayEncode {
             data: Box::new(crate::vdbe::insn::ArrayEncodeData {
                 reg: register,
@@ -1016,6 +1038,10 @@ pub(super) fn emit_custom_type_writes(
         let Some(programs) = programs.as_ref().filter(|_| written(position)) else {
             continue;
         };
+        // An array's elements were encoded above.
+        if table.columns()[position].is_array() {
+            continue;
+        }
         let register = start + position;
         let skip = (!programs.encode_nulls).then(|| {
             let skip = program.allocate_label();

@@ -83,13 +83,26 @@ Deferred migration surfaces:
 
 ### What still reaches legacy with the switch on
 
-Audited on 2026-10-20 from `translate_statement`:
+Audited on 2026-10-21 from `translate_statement`:
 
 - SELECT always goes through HIR; there is no guard and no fallback.
 - DELETE, UPDATE and INSERT go through HIR unless `needs_legacy` says
   otherwise (see "DML through HIR"), a trigger or foreign-key action of
   theirs cannot be compiled through HIR, or a materialized view built by
-  another DBSP version reads the target.
+  another DBSP version reads the target. Each fallback names its reason, and
+  with `TURSO_HIR_NO_FALLBACK` set the statement fails with it instead, so
+  running the suites with the variable set lists what still needs legacy.
+  On 2026-10-21 nothing in the conformance corpora or the integration suite
+  does: what is left are writes to `sqlite_dbpage`, STRICT tables with a
+  type name that is neither built in nor custom, custom-typed virtual
+  columns, and targets with views built by another DBSP version.
+- A CTE a DML statement reads more than once, in UPDATE ... FROM and in its
+  expression subqueries, is filled once before any row changes, as legacy
+  fills it, so every reader sees the same rows; a correlated subquery still
+  reads it again on each run, as SQLite does.
+- The elements of an array of a custom type are encoded one by one when
+  written, as legacy encodes them, so STRICT tables with such columns go
+  through HIR.
 - Every other statement is translated by legacy code that is handed the HIR
   settings and prepares the SELECTs inside it through HIR where it can
   (CREATE TABLE AS, CREATE VIEW, CREATE MATERIALIZED VIEW, ATTACH). The

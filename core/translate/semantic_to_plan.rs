@@ -1786,6 +1786,26 @@ impl<'a> HirPlanContext<'a> {
         }
     }
 
+    /// How many times a DML statement reads a CTE: in its FROM clause and
+    /// in its expression subqueries. Like legacy, a CTE read more than once
+    /// is filled once, before any row changes, so every reader sees the same
+    /// rows; a correlated subquery still reads it again on each run.
+    fn dml_cte_reference_count(&self, target: hir::CteId) -> usize {
+        let from = match &self.document.root {
+            hir::HirRoot::Update(update) => update.from.as_ref(),
+            _ => None,
+        };
+        let in_from = from.map_or(0, |from| self.count_cte_references_in_from(from, target));
+        let in_queries = self
+            .document
+            .queries
+            .iter()
+            .filter(|query| query.parent.is_none())
+            .map(|query| self.cte_reference_count(query.id, target))
+            .sum::<usize>();
+        in_from + in_queries
+    }
+
     /// Count references in one query plan. A CTE body is a separate plan tree:
     /// when reached through a CTE source, its nested references are classified
     /// while that body is planned instead of being multiplied by its callers.
@@ -1913,18 +1933,37 @@ impl<'a> HirPlanContext<'a> {
                     .expect("validated HIR contains referenced CTE");
                 match &definition.body {
                     hir::CteBody::Query(query) => {
+                        let dml = !matches!(self.document.root, hir::HirRoot::Query(_));
                         let materialization = match self.definition(source).owner {
+                            hir::SourceOwner::QueryBlock(block) if dml => {
+                                if matches!(
+                                    definition.materialized,
+                                    turso_parser::ast::Materialized::Yes
+                                ) {
+                                    HirCteMaterialization::Explicit
+                                } else if self.dml_cte_reference_count(*cte) > 1
+                                    && !self.query_tree_has_outer_dependency(*query)
+                                    && !self.query_tree_has_outer_dependency(block.query)
+                                {
+                                    HirCteMaterialization::Shared
+                                } else {
+                                    HirCteMaterialization::PerReference
+                                }
+                            }
                             hir::SourceOwner::QueryBlock(block) => {
                                 self.cte_materialization(block.query, *cte, *query)
                             }
                             // The FROM clause of UPDATE ... FROM reads the CTE
-                            // once per reference, unless it is MATERIALIZED.
+                            // once per reference, unless it is MATERIALIZED or
+                            // a subquery of the statement reads it too.
                             hir::SourceOwner::Root => {
                                 if matches!(
                                     definition.materialized,
                                     turso_parser::ast::Materialized::Yes
                                 ) {
                                     HirCteMaterialization::Explicit
+                                } else if self.dml_cte_reference_count(*cte) > 1 {
+                                    HirCteMaterialization::Shared
                                 } else {
                                     HirCteMaterialization::PerReference
                                 }
