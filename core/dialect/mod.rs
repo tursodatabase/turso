@@ -27,6 +27,14 @@ pub trait FunctionCatalog {
     ) -> Option<crate::sync::Arc<crate::schema::FunctionDef>>;
 }
 
+/// The tables and views that the statements of a dialect trigger body can
+/// name. A name resolves as in those statements.
+pub trait TableCatalog {
+    /// The columns that `SELECT *` gives for the table or view `name`, or
+    /// `None` when no table or view has the name.
+    fn column_names(&self, name: &turso_parser::ast::QualifiedName) -> Option<Vec<String>>;
+}
+
 /// The statements that a dialect compiled for one trigger and one event.
 /// Unlike the statements of a SQLite trigger, they can name tables of other
 /// databases, and unqualified names resolve as in other statements.
@@ -209,12 +217,14 @@ pub trait Dialect: Send + Sync + 'static {
 
     /// The statements that run when `trigger` fires on a row of `table`, for
     /// a trigger whose body the dialect owns. `None` runs the statements
-    /// stored with the trigger.
+    /// stored with the trigger. `tables` gives the columns of the tables that
+    /// the statements can name.
     fn trigger_body(
         &self,
         _trigger: &crate::schema::Trigger,
         _table: &crate::schema::BTreeTable,
         _functions: &dyn FunctionCatalog,
+        _tables: &dyn TableCatalog,
     ) -> crate::Result<Option<TriggerBody>> {
         Ok(None)
     }
@@ -379,9 +389,10 @@ mod tests {
             trigger: &crate::schema::Trigger,
             _table: &BTreeTable,
             _functions: &dyn FunctionCatalog,
+            tables: &dyn TableCatalog,
         ) -> crate::Result<Option<TriggerBody>> {
             use turso_parser::ast::{
-                Cmd, Expr, Literal, OneSelect, ResultColumn, Stmt, TriggerCmd,
+                Cmd, Expr, Literal, Name, OneSelect, QualifiedName, ResultColumn, Stmt, TriggerCmd,
             };
             let [TriggerCmd::Select(select)] = trigger.commands.as_slice() else {
                 return Ok(None);
@@ -395,15 +406,40 @@ mod tests {
             let Expr::FunctionCall { name, args, .. } = call.as_ref() else {
                 return Ok(None);
             };
-            if name.as_str() != "test_trigger_body" {
-                return Ok(None);
-            }
             let text = |arg: &Expr| {
                 let Expr::Literal(Literal::String(text)) = arg else {
                     panic!("test trigger bodies are text");
                 };
                 text[1..text.len() - 1].replace("''", "'")
             };
+            if name.as_str() == "test_trigger_columns" {
+                let [table] = args.as_slice() else {
+                    panic!("test_trigger_columns names one table");
+                };
+                let table = text(table);
+                let table = match table.split_once('.') {
+                    Some((database, table)) => QualifiedName::fullname(
+                        Name::exact(database.to_string()),
+                        Name::exact(table.to_string()),
+                    ),
+                    None => QualifiedName::single(Name::exact(table)),
+                };
+                let columns = tables
+                    .column_names(&table)
+                    .map_or("none".to_string(), |columns| columns.join(","));
+                let (Some(Cmd::Stmt(stmt)), _) =
+                    sqlite::parse(&format!("INSERT INTO main.log VALUES ('{columns}')"))?
+                else {
+                    panic!("the log statement is a statement");
+                };
+                return Ok(Some(TriggerBody {
+                    statements: vec![stmt],
+                    changed_columns: Vec::new(),
+                }));
+            }
+            if name.as_str() != "test_trigger_body" {
+                return Ok(None);
+            }
             let [body, changes @ ..] = args.as_slice() else {
                 panic!("test trigger bodies have a statement");
             };
@@ -1289,6 +1325,40 @@ mod tests {
         conn.execute("INSERT INTO t VALUES (1), (2)").unwrap();
 
         assert_eq!(rows(&conn, "SELECT a FROM log"), vec![vec![int(1)]]);
+    }
+
+    #[test]
+    fn trigger_body_finds_the_columns_of_the_tables_that_it_names() {
+        let conn = open_trigger_db("trigger-body-table-columns.db");
+        conn.execute("CREATE TABLE t (a INTEGER, b TEXT)").unwrap();
+        conn.execute("CREATE VIEW v AS SELECT b AS c FROM t")
+            .unwrap();
+        conn.execute("CREATE TABLE log (columns TEXT)").unwrap();
+        for (trigger, table) in [
+            ("t1", "t"),
+            ("t2", "main.t"),
+            ("t3", "v"),
+            ("t4", "missing"),
+        ] {
+            conn.execute(format!(
+                "CREATE TRIGGER {trigger} AFTER INSERT ON t BEGIN \
+                 SELECT test_trigger_columns('{table}'); \
+                 END"
+            ))
+            .unwrap();
+        }
+
+        conn.execute("INSERT INTO t VALUES (1, 'x')").unwrap();
+
+        assert_eq!(
+            rows(&conn, "SELECT columns FROM log ORDER BY columns"),
+            vec![
+                vec![text("a,b")],
+                vec![text("a,b")],
+                vec![text("c")],
+                vec![text("none")],
+            ]
+        );
     }
 
     fn open_trigger_db(path: &str) -> Arc<crate::Connection> {

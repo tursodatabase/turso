@@ -5,7 +5,7 @@ use std::fmt::Debug;
 use std::marker::PhantomData;
 use std::sync::Arc;
 use turso_core::{
-    dialect::{FunctionCatalog, TriggerBody, POSTGRES_TABLE_SQL_PREFIX},
+    dialect::{FunctionCatalog, TableCatalog, TriggerBody, POSTGRES_TABLE_SQL_PREFIX},
     native_ext::{VirtualTable, VirtualTableCursor, VirtualTableModule},
     schema::{BTreeTable, FunctionDef, Index, Schema, Table},
     Connection, Dialect, Func, IOResult, LimboError, OpenOptions, Result, Statement, Value,
@@ -170,6 +170,7 @@ impl Dialect for PostgresDialect {
         trigger: &turso_core::schema::Trigger,
         table: &BTreeTable,
         functions: &dyn FunctionCatalog,
+        _tables: &dyn TableCatalog,
     ) -> Result<Option<TriggerBody>> {
         crate::plpgsql::compile_trigger(trigger, table, functions)
     }

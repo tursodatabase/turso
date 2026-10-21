@@ -685,7 +685,7 @@ fn execute_trigger_commands(
         database_id
     };
     let dialect = resolver.dialect.clone();
-    let dialect_body = dialect.trigger_body(trigger, &ctx.table, &*resolver)?;
+    let dialect_body = dialect.trigger_body(trigger, &ctx.table, &*resolver, &*resolver)?;
     let mut changed_columns = Vec::new();
     if let Some(body) = dialect_body {
         changed_columns = body.changed_columns;
@@ -1009,7 +1009,10 @@ pub fn columns_changed_by_triggers(
 ) -> Result<ColumnMask> {
     let mut columns = ColumnMask::default();
     for trigger in triggers {
-        let Some(body) = resolver.dialect.trigger_body(trigger, table, resolver)? else {
+        let Some(body) = resolver
+            .dialect
+            .trigger_body(trigger, table, resolver, resolver)?
+        else {
             continue;
         };
         for changed in body.changed_columns {

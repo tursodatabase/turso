@@ -1122,6 +1122,27 @@ impl crate::dialect::FunctionCatalog for Resolver<'_> {
     }
 }
 
+impl crate::dialect::TableCatalog for Resolver<'_> {
+    fn column_names(&self, name: &ast::QualifiedName) -> Option<Vec<String>> {
+        let database_id = self
+            .resolve_existing_table_database_id_qualified(name)
+            .ok()?;
+        self.with_schema(database_id, |schema| {
+            let names = |columns: &[Column]| {
+                columns
+                    .iter()
+                    .filter(|column| !column.hidden())
+                    .filter_map(|column| column.name.clone())
+                    .collect()
+            };
+            match schema.get_table(name.name.as_str()) {
+                Some(table) => Some(names(table.columns())),
+                None => Some(names(&schema.get_view(name.name.as_str())?.columns)),
+            }
+        })
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct LimitCtx {
     /// Register holding the LIMIT value (e.g. LIMIT 5)
