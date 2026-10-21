@@ -200,11 +200,6 @@ impl ExprPolicy {
         Self::insert_values(dqs_dml)
     }
 
-    pub(crate) const fn without_dqs_fallback(mut self) -> Self {
-        self.allow_dqs_fallback = false;
-        self
-    }
-
     const fn without_windows(mut self) -> Self {
         self.allow_windows = false;
         self
@@ -4989,17 +4984,6 @@ mod tests {
             missing_column.to_string(),
             "Parse error: no such column: items.absent"
         );
-    }
-
-    #[test]
-    fn clause_policy_can_disable_dqs_fallback() {
-        let error = analyze_expression(
-            &expression("SELECT \"missing\""),
-            &Scope::default(),
-            ExprPolicy::select(DoubleQuotedDml::Enabled).without_dqs_fallback(),
-        )
-        .expect_err("clause policy disables DQS");
-        assert_eq!(error.to_string(), "Parse error: no such column: missing");
     }
 
     #[test]

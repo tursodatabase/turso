@@ -48,9 +48,6 @@ fn connect() -> (TempDatabase, std::sync::Arc<turso_core::Connection>) {
 fn connect_sqlite() -> rusqlite::Connection {
     let conn = rusqlite::Connection::open_in_memory().unwrap();
     conn.execute_batch("PRAGMA foreign_keys = OFF").unwrap();
-    // Turso rejects double-quoted strings in DML by default.
-    conn.set_db_config(rusqlite::config::DbConfig::SQLITE_DBCONFIG_DQS_DML, false)
-        .unwrap();
     for statement in SETUP {
         conn.execute_batch(statement).unwrap();
     }
@@ -740,6 +737,12 @@ fn hir_insert_matches_sqlite() {
         ],
         &["INSERT INTO u(b) VALUES (49)", "SELECT last_insert_rowid()"],
         &["INSERT INTO u(rowid, b) VALUES ('x', 50)"],
+        // A double-quoted name that is no column is a string wherever it
+        // is, as in SQLite with double-quoted strings allowed in DML.
+        &["INSERT INTO u(b, c) VALUES (51, \"s\")"],
+        &["INSERT INTO u(b, c) VALUES (52, upper(\"s\"))"],
+        &["INSERT INTO u(b, c) VALUES (53, upper(\"s\")), (54, \"t\")"],
+        &["INSERT INTO u(b, c) VALUES (55, (SELECT \"s\"))"],
         &["INSERT INTO u(b) SELECT b + 100 FROM u"],
         &["INSERT OR REPLACE INTO u VALUES (1, 60, 'v', 1)"],
         &["INSERT INTO u(b) VALUES (1) ON CONFLICT DO NOTHING"],
@@ -809,39 +812,6 @@ fn hir_insert_matches_sqlite() {
     ] {
         assert_run_matches_sqlite(statements);
     }
-
-    // Like legacy, a double-quoted name is a string only as a whole value
-    // of a single VALUES row. SQLite accepts or rejects every double-quoted
-    // string together, so these are checked on their own.
-    assert_eq!(
-        run(&[
-            "INSERT INTO u(b, c) VALUES (51, \"s\")",
-            "SELECT b, c FROM u WHERE b = 51",
-        ])[2],
-        Ok(vec![vec![
-            rusqlite::types::Value::Integer(51),
-            rusqlite::types::Value::Text("s".to_string()),
-        ]])
-    );
-    assert!(run(&["INSERT INTO u(b, c) VALUES (52, upper(\"s\"))"])[0].is_err());
-    // A VALUES list of several rows takes every double-quoted name as a
-    // string, wherever it is.
-    assert_eq!(
-        run(&[
-            "INSERT INTO u(b, c) VALUES (53, upper(\"s\")), (54, \"t\")",
-            "SELECT b, c FROM u WHERE b >= 53 ORDER BY b",
-        ])[2],
-        Ok(vec![
-            vec![
-                rusqlite::types::Value::Integer(53),
-                rusqlite::types::Value::Text("S".to_string()),
-            ],
-            vec![
-                rusqlite::types::Value::Integer(54),
-                rusqlite::types::Value::Text("t".to_string()),
-            ],
-        ])
-    );
 }
 
 /// Tables with foreign keys for `hir_foreign_keys_match_sqlite`, filled

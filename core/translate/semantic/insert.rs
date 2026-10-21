@@ -162,11 +162,6 @@ impl<'ast> Analyzer<'_, '_, 'ast> {
                                     row.len()
                                 );
                             }
-                            // Like legacy, in a single VALUES row without a
-                            // subquery a double-quoted name falls back to a
-                            // string only when it is the whole value.
-                            let whole_values_only = rows.len() == 1
-                                && !row.iter().any(|syntax| contains_subquery(syntax));
                             let mut bound = Vec::with_capacity(row.len());
                             for (syntax, target_column) in row.iter().zip(&columns) {
                                 bound.push(self.analyze_insert_value(
@@ -175,10 +170,6 @@ impl<'ast> Analyzer<'_, '_, 'ast> {
                                     table.value(),
                                     target_column.column,
                                     expressions,
-                                    InsertValueRules {
-                                        without_dqs_fallback: whole_values_only
-                                            && !matches!(syntax.as_ref(), ast::Expr::Id(_)),
-                                    },
                                 )?);
                             }
                             bound_rows.push(bound);
@@ -516,15 +507,11 @@ impl<'ast> Analyzer<'_, '_, 'ast> {
         table: &Table,
         column: hir::TargetColumn,
         expressions: InsertExprContext<'_>,
-        rules: InsertValueRules,
     ) -> Result<hir::Expr> {
         if matches!(syntax, ast::Expr::Default) {
             return self.analyze_write_default(target, table, column);
         }
-        let mut policy = expressions.policies.insert_values();
-        if rules.without_dqs_fallback {
-            policy = policy.without_dqs_fallback();
-        }
+        let policy = expressions.policies.insert_values();
         Ok(self
             .analyze_root_expr_with_expected_type(
                 syntax,
@@ -993,14 +980,6 @@ impl<'ast> Analyzer<'_, '_, 'ast> {
     }
 }
 
-/// Legacy quirks of the values of a single VALUES row without a subquery.
-#[derive(Clone, Copy)]
-struct InsertValueRules {
-    /// A double-quoted name falls back to a string only when it is the
-    /// whole value.
-    without_dqs_fallback: bool,
-}
-
 fn is_simple_values(select: &ast::Select) -> bool {
     select.with.is_none()
         && select.body.compounds.is_empty()
@@ -1124,22 +1103,4 @@ fn unsupported_insert<T>(feature: &str) -> Result<T> {
     Err(LimboError::ParseError(format!(
         "semantic INSERT does not yet accept {feature}"
     )))
-}
-
-/// Whether a VALUES expression contains a subquery.
-fn contains_subquery(syntax: &ast::Expr) -> bool {
-    use crate::translate::expr::{walk_expr, WalkControl};
-    let mut found = false;
-    let _ = walk_expr(syntax, &mut |expression| {
-        found |= matches!(
-            expression,
-            ast::Expr::Subquery(_) | ast::Expr::InSelect { .. } | ast::Expr::Exists(_)
-        );
-        Ok(if found {
-            WalkControl::SkipChildren
-        } else {
-            WalkControl::Continue
-        })
-    });
-    found
 }
