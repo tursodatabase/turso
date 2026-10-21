@@ -26,8 +26,8 @@ use super::{
 use crate::alloc::{TryClone, TursoIteratorExt};
 use crate::instrument;
 use crate::schema::{
-    BTreeTable, CheckConstraint, Column, ColumnLayout, GeneratedType, Index, IndexColumn, Schema,
-    Table, EXPR_INDEX_SENTINEL,
+    BTreeTable, CheckConstraint, Column, ColumnLayout, FunctionDef, GeneratedType, Index,
+    IndexColumn, Schema, Table, EXPR_INDEX_SENTINEL,
 };
 use crate::translate::fkeys::FkActionCompileStack;
 use crate::translate::plan::{Aggregate, ColumnMask};
@@ -212,6 +212,7 @@ pub struct Resolver<'a> {
     /// that its own action program is already being built.
     pub(super) fk_action_compile_stack: FkActionCompileStack,
     unqualified_database_search_path: Option<Vec<String>>,
+    catalog_functions_being_compiled: RefCell<Vec<String>>,
 }
 
 #[derive(Clone)]
@@ -323,6 +324,7 @@ impl<'a> Resolver<'a> {
             has_temp_schema,
             fk_action_compile_stack: FkActionCompileStack::default(),
             unqualified_database_search_path: unqualified_database_search_path.clone(),
+            catalog_functions_being_compiled: RefCell::new(Vec::new()),
         }
     }
 
@@ -369,6 +371,9 @@ impl<'a> Resolver<'a> {
             has_temp_schema: self.has_temp_schema,
             fk_action_compile_stack: self.fk_action_compile_stack.clone(),
             unqualified_database_search_path: self.unqualified_database_search_path.clone(),
+            catalog_functions_being_compiled: RefCell::new(
+                self.catalog_functions_being_compiled.borrow().clone(),
+            ),
         }
     }
 
@@ -397,6 +402,9 @@ impl<'a> Resolver<'a> {
             has_temp_schema: self.has_temp_schema,
             fk_action_compile_stack: self.fk_action_compile_stack.clone(),
             unqualified_database_search_path: self.unqualified_database_search_path.clone(),
+            catalog_functions_being_compiled: RefCell::new(
+                self.catalog_functions_being_compiled.borrow().clone(),
+            ),
         }
     }
 
@@ -630,6 +638,50 @@ impl<'a> Resolver<'a> {
                 .resolve_function(func_name, arg_count)
                 .map(Func::External)),
         }
+    }
+
+    pub(crate) fn find_catalog_function(
+        &self,
+        call_name: &str,
+        arg_count: usize,
+    ) -> Option<(usize, Arc<FunctionDef>)> {
+        let (database_id, name) = match call_name.split_once('.') {
+            Some((namespace, name)) => (
+                self.namespace_database_id(&normalize_ident(namespace))?,
+                name,
+            ),
+            None => (
+                self.resolve_function_database_id(call_name, Some(arg_count))?,
+                call_name,
+            ),
+        };
+        self.with_schema(database_id, |schema| {
+            schema.get_function(name, arg_count).cloned()
+        })
+        .map(|function| (database_id, function))
+    }
+
+    pub(crate) fn with_catalog_function<T>(
+        &self,
+        function: &FunctionDef,
+        f: impl FnOnce() -> Result<T>,
+    ) -> Result<T> {
+        if self
+            .catalog_functions_being_compiled
+            .borrow()
+            .contains(&function.name)
+        {
+            return Err(LimboError::ParseError(format!(
+                "cannot execute function {}(): it calls itself",
+                function.name
+            )));
+        }
+        self.catalog_functions_being_compiled
+            .borrow_mut()
+            .push(function.name.clone());
+        let result = f();
+        self.catalog_functions_being_compiled.borrow_mut().pop();
+        result
     }
 
     pub(crate) fn resolve_function_database_id(

@@ -164,6 +164,19 @@ pub trait Dialect: Send + Sync + 'static {
         )))
     }
 
+    /// Compile a call to a function that `CREATE FUNCTION` stored into the
+    /// expression that the engine evaluates in place of the call.
+    fn compile_function_call(
+        &self,
+        function: &crate::schema::FunctionDef,
+        _args: &[Box<turso_parser::ast::Expr>],
+    ) -> crate::Result<turso_parser::ast::Expr> {
+        Err(crate::LimboError::ParseError(format!(
+            "cannot execute function {}()",
+            function.name
+        )))
+    }
+
     /// Whether this dialect needs the custom-type machinery (DECODE/ENCODE,
     /// affinity metadata) regardless of the experimental database flag.
     /// A dialect whose type system leans on custom types (e.g. PostgreSQL)
@@ -288,6 +301,21 @@ mod tests {
                 turso_ext::VTabKind::TableValuedFunction,
                 TestCatalogTable,
             )
+        }
+
+        fn compile_function_call(
+            &self,
+            function: &crate::schema::FunctionDef,
+            args: &[Box<turso_parser::ast::Expr>],
+        ) -> crate::Result<turso_parser::ast::Expr> {
+            let addend = turso_parser::ast::Expr::Literal(turso_parser::ast::Literal::Numeric(
+                function.definition.clone(),
+            ));
+            Ok(turso_parser::ast::Expr::Binary(
+                args[0].clone(),
+                turso_parser::ast::Operator::Add,
+                Box::new(addend),
+            ))
         }
     }
 
@@ -638,6 +666,64 @@ mod tests {
         conn.execute("ROLLBACK").unwrap();
         assert_eq!(stored_definition(&conn), None);
         conn.close().unwrap();
+    }
+
+    fn select_add_n(conn: &Arc<crate::Connection>) -> crate::Result<Vec<Vec<crate::Value>>> {
+        conn.prepare("SELECT add_n(41)")?.run_collect_rows()
+    }
+
+    #[test]
+    fn stored_function_call_is_compiled_by_the_dialect() {
+        let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+        let db = open_db(
+            &io,
+            "dialect-function-call.db",
+            Arc::new(TestDialect::default()),
+        )
+        .unwrap();
+        let conn = db.connect(ConnectOpts::new()).unwrap();
+        create_function(&conn, false, "1").unwrap();
+        assert_eq!(
+            select_add_n(&conn).unwrap(),
+            vec![vec![crate::Value::from_i64(42)]]
+        );
+        let error = conn.prepare("SELECT add_n(1, 2)").unwrap_err();
+        assert!(
+            error.to_string().contains("no such function: add_n"),
+            "unexpected error: {error}"
+        );
+        conn.close().unwrap();
+    }
+
+    #[test]
+    fn replaced_function_reprepares_statements_of_other_connections() {
+        let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+        let db = open_db(
+            &io,
+            "dialect-function-reprepare.db",
+            Arc::new(TestDialect::default()),
+        )
+        .unwrap();
+        let conn = db.connect(ConnectOpts::new()).unwrap();
+        let other = db.connect(ConnectOpts::new()).unwrap();
+        create_function(&conn, false, "1").unwrap();
+        let mut stmt = other.prepare("SELECT add_n(41)").unwrap();
+
+        create_function(&conn, true, "2").unwrap();
+        assert_eq!(
+            stmt.run_collect_rows().unwrap(),
+            vec![vec![crate::Value::from_i64(43)]]
+        );
+
+        drop_function(&conn, false).unwrap();
+        stmt.reset().unwrap();
+        let error = stmt.run_collect_rows().unwrap_err();
+        assert!(
+            error.to_string().contains("no such function: add_n"),
+            "unexpected error: {error}"
+        );
+        conn.close().unwrap();
+        other.close().unwrap();
     }
 
     #[test]

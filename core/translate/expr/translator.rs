@@ -891,14 +891,18 @@ fn translate_function_call_expr(
         unreachable!("translate_function_call_expr expects Expr::FunctionCall");
     };
     let args_count = args.len();
-    let func_type = resolver.resolve_function(name.as_str(), args_count)?;
-
-    if func_type.is_none() {
-        crate::bail_parse_error!("no such function: {}", name.as_str());
-    }
+    let Some(func) = resolver.resolve_function(name.as_str(), args_count)? else {
+        return translate_catalog_function_call(
+            program,
+            referenced_tables,
+            expr,
+            target_register,
+            resolver,
+        );
+    };
 
     let func_ctx = FuncCtx {
-        func: func_type.unwrap(),
+        func,
         arg_count: args_count,
     };
 
@@ -2162,6 +2166,48 @@ fn translate_function_call_expr(
         }
         Func::AlterTable(_) => unreachable!(),
     }
+}
+
+fn translate_catalog_function_call(
+    program: &mut ProgramBuilder,
+    referenced_tables: Option<&TableReferences>,
+    expr: &ast::Expr,
+    target_register: usize,
+    resolver: &Resolver,
+) -> Result<usize> {
+    let ast::Expr::FunctionCall {
+        name,
+        distinctness,
+        args,
+        filter_over,
+        order_by,
+        within_group,
+    } = expr
+    else {
+        unreachable!("translate_catalog_function_call expects Expr::FunctionCall");
+    };
+    let Some((database_id, function)) = resolver.find_catalog_function(name.as_str(), args.len())
+    else {
+        crate::bail_parse_error!("no such function: {}", name.as_str());
+    };
+    if database_id == crate::MAIN_DB_ID {
+        program.begin_read_operation()?;
+    } else {
+        let schema_cookie = resolver.with_schema(database_id, |schema| schema.schema_version);
+        program.begin_read_on_database(database_id, schema_cookie)?;
+    }
+    if distinctness.is_some()
+        || filter_over.filter_clause.is_some()
+        || filter_over.over_clause.is_some()
+        || !order_by.is_empty()
+        || !within_group.is_empty()
+    {
+        crate::bail_parse_error!("{}() is not an aggregate function", function.name);
+    }
+    resolver.with_catalog_function(&function, || {
+        let body = resolver.dialect.compile_function_call(&function, args)?;
+        translate_expr(program, referenced_tables, &body, target_register, resolver)
+    })
 }
 
 #[inline(never)]
