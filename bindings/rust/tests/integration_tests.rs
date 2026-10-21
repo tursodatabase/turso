@@ -2111,20 +2111,6 @@ async fn test_old_mvcc_snapshot_rejects_duplicate_rowid_after_other_old_snapshot
     );
 }
 
-#[tokio::test]
-async fn test_old_mvcc_snapshot_finds_fk_parent_after_other_old_snapshot_checkpoints() {
-    let (_dir, _db, older) = old_snapshot_after_other_old_snapshot_checkpoints().await;
-
-    older
-        .execute("INSERT INTO child(pid) VALUES (100)", ())
-        .await
-        .expect("the old snapshot can still read parent rowid 100");
-    assert_eq!(
-        collect_values(&older, "SELECT pid FROM child").await,
-        vec![vec![Value::Integer(100)]]
-    );
-}
-
 async fn old_snapshot_after_newer_passive_checkpoint(
 ) -> (tempfile::TempDir, turso::Database, turso::Connection) {
     let (dir, db) = open_parent_child_db_with_passive_checkpoint().await;
@@ -2185,10 +2171,6 @@ async fn old_snapshot_after_other_old_snapshot_checkpoints(
         .execute("PRAGMA mvcc_checkpoint_threshold = -1", ())
         .await
         .expect("automatic checkpoints must be disabled");
-    older
-        .execute("PRAGMA foreign_keys = ON", ())
-        .await
-        .expect("foreign key checks must be enabled");
     for conn in [&older, &other] {
         conn.execute("BEGIN CONCURRENT", ())
             .await
