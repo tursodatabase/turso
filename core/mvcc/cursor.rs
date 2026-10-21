@@ -6,7 +6,7 @@ use crate::types::IOResultOr;
 use crate::mvcc::clock::LogicalClock;
 use crate::mvcc::database::{
     create_seek_range, BtreeLast, MVTableId, MvStore, MvccReadSnapshot, Row, RowID, RowKey,
-    RowVersions, RowidAllocator, SortableIndexKey, WalPos,
+    RowVersions, SortableIndexKey, WalPos,
 };
 #[cfg(any(test, injected_yields))]
 use crate::mvcc::yield_hooks::{ProvidesYieldContext, YieldContext, YieldPointMarker};
@@ -568,7 +568,6 @@ pub struct MvccLazyCursor<Clock: LogicalClock + 'static, A: ConcurrentAllocator 
     btree_cursor: Box<dyn CursorTrait>,
     null_flag: bool,
     creating_new_rowid: bool,
-    rowid_allocator: Option<Arc<RowidAllocator>>,
     state: Option<MvccLazyCursorState>,
     // we keep count_state separate to be able to call other public functions like rewind and next
     count_state: Option<CountState>,
@@ -640,19 +639,12 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> MvccLazyCursor<Clock
             btree_cursor,
             null_flag: false,
             creating_new_rowid: false,
-            rowid_allocator: None,
             state: None,
             count_state: None,
             btree_advance_state: None,
             dual_peek: DualCursorPeek::default(),
             index_shadow_scan: IndexShadowScan::default(),
         })
-    }
-
-    fn rowid_allocator(&mut self) -> Arc<RowidAllocator> {
-        self.rowid_allocator
-            .get_or_insert_with(|| self.db.get_rowid_allocator(&self.table_id))
-            .clone()
     }
 
     fn btree_may_hold(&mut self, last: BtreeLast, rowid: i64) -> Result<bool> {
@@ -2057,7 +2049,10 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> CursorTrait
                         self.state = None;
                         return Ok(IOResult::Done(false));
                     }
-                    let Some(last) = self.rowid_allocator().btree_last(self.snapshot.read_mark)
+                    let Some(last) = self
+                        .db
+                        .get_rowid_allocator(&self.table_id)
+                        .btree_last(self.snapshot.read_mark)
                     else {
                         self.state
                             .replace(MvccLazyCursorState::Exists(ExistsState::SeekBtreeLast));
@@ -2081,7 +2076,9 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> CursorTrait
                         read_mark: WalPos::from_pair(self.btree_cursor.get_pager().wal_pos()),
                         rowid: return_if_io!(self.btree_cursor.rowid()),
                     };
-                    self.rowid_allocator().record_btree_last(last);
+                    self.db
+                        .get_rowid_allocator(&self.table_id)
+                        .record_btree_last(last);
                     if !self.btree_may_hold(last, int_key)? {
                         self.state = None;
                         return Ok(IOResult::Done(false));
