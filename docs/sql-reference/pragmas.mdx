@@ -255,7 +255,7 @@ Controls the fsync behavior for durability guarantees.
 ```sql
 PRAGMA synchronous;
 PRAGMA synchronous = OFF;    -- no fsync (fastest, risk of corruption on crash)
-PRAGMA synchronous = NORMAL; -- accepted, but costs the same as FULL today
+PRAGMA synchronous = NORMAL; -- no fsync on commit, fsync at checkpoint
 PRAGMA synchronous = FULL;   -- fsync after every transaction (safest)
 ```
 
@@ -263,8 +263,9 @@ Turso accepts `OFF`, `NORMAL`, and `FULL`, by name or by number (`0`, `1`, `2`).
 Anything else becomes `FULL`. `PRAGMA synchronous;` returns the number of the mode
 you set.
 
-`NORMAL` does not save work yet. The sync checks in the checkpoint path only ask
-whether the mode is `OFF`, so `NORMAL` fsyncs as much as `FULL` does.
+With `NORMAL`, a commit does not fsync the WAL. The WAL and the database file are
+fsynced at checkpoint time, so a crash can lose recent commits but does not corrupt
+the database.
 
 SQLite has a fourth level, `EXTRA`. Turso does not have it, and sets `FULL` for any
 value it does not know, `EXTRA` included.
