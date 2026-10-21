@@ -124,7 +124,10 @@ impl ScalarCall for PgScalarFunction {
             Self::CurrentDatabase => {
                 Value::build_text(crate::catalog::db_name_from_path(connection.db_file_path()))
             }
-            Self::CurrentSchema => Value::build_text("public"),
+            Self::CurrentSchema => match crate::session::current_schema(connection) {
+                Some(schema) => Value::build_text(schema),
+                None => Value::Null,
+            },
             Self::PgBackendPid => Value::from_i64(std::process::id() as i64),
             Self::PgIsInRecovery => {
                 // Temporary pg_dump compatibility: "t" means true, not actual recovery state.

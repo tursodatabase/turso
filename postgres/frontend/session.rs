@@ -233,20 +233,33 @@ fn create_table_schema_from_search_path(
     let Some(location) = unqualified_create_table_name_location(parse_result) else {
         return Ok(None);
     };
-    let Some(search_path) = search_path else {
+    if search_path.is_none() {
         return Ok(None);
-    };
-    let attached = pg_conn.conn.attached_database_names();
-    let schema = search_path
-        .iter()
-        .find(|schema| schema.eq_ignore_ascii_case("public") || attached.contains(schema))
-        .ok_or_else(|| {
-            LimboError::ParseError("no schema has been selected to create in".to_string())
-        })?;
+    }
+    let schema = current_schema(&pg_conn.conn).ok_or_else(|| {
+        LimboError::ParseError("no schema has been selected to create in".to_string())
+    })?;
     if schema.eq_ignore_ascii_case("public") {
         return Ok(None);
     }
-    Ok(Some((location, schema.clone())))
+    Ok(Some((location, schema)))
+}
+
+/// The first schema of `search_path` that exists, which is what PostgreSQL's
+/// current_schema() returns. None when no schema of `search_path` exists.
+/// The default search_path, "$user", public, gives public, since there is no
+/// schema named after a user.
+pub(crate) fn current_schema(conn: &Connection) -> Option<String> {
+    let Some(search_path) = conn
+        .context::<PgSessionState>()
+        .and_then(|state| state.lock().unwrap().search_path.clone())
+    else {
+        return Some("public".to_owned());
+    };
+    let attached = conn.attached_database_names();
+    search_path
+        .into_iter()
+        .find(|schema| schema.eq_ignore_ascii_case("public") || attached.contains(schema))
 }
 
 fn reject_catalog_dml(stmt: &ast::Stmt) -> Result<()> {
