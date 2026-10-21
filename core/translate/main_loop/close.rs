@@ -1009,7 +1009,8 @@ fn emit_unmatched_rows_subquery(
             &subquery.query_type,
             subquery.correlated,
         )
-    })
+    })?;
+    Ok(())
 }
 
 pub(super) struct AutoIndexResult {

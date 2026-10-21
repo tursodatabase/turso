@@ -17,7 +17,8 @@ use crate::{
         plan::{
             BitSet, Distinctness, EphemeralRowidMode, EvalAt, IndexMethodQuery, JoinOrderMember,
             NonFromClauseSubquery, Operation, QueryDestination, Scan, Search, SeekKeyComponent,
-            SelectPlan, SimpleAggregate, SubqueryEvalPhase, SubqueryState, TableReferences,
+            SelectPlan, SimpleAggregate, SubqueryEvalPhase, SubqueryOrigin, SubqueryState,
+            TableReferences,
         },
         planner::table_mask_from_expr,
         select::emit_simple_count,
@@ -113,9 +114,16 @@ pub fn emit_query<'a>(
     // For non-grouped aggregation queries that also have non-aggregate columns,
     // we need to ensure non-aggregate columns are only emitted once.
     // This flag helps track whether we've already emitted these columns.
+    // It also tells whether any row reached the aggregate, which a correlated
+    // subquery in the result columns needs even when every column contains an
+    // aggregate: if no row did, the subquery runs again against the NULL row.
     let has_ungrouped_nonagg_cols = !plan.aggregates.is_empty()
         && plan.group_by.is_none()
-        && plan.result_columns.iter().any(|c| !c.contains_aggregates);
+        && (plan.result_columns.iter().any(|c| !c.contains_aggregates)
+            || plan
+                .non_from_clause_subqueries
+                .iter()
+                .any(|s| s.correlated && s.origin == SubqueryOrigin::SelectList));
 
     if has_ungrouped_nonagg_cols {
         let flag = program.alloc_register();
