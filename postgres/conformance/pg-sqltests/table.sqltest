@@ -208,3 +208,21 @@ test table-delete-row-with-numeric-expression-index {
 expect {
     0
 }
+
+test table-uuid-column-omitted-from-insert-is-null {
+    CREATE TABLE t (id int PRIMARY KEY, u uuid);
+    INSERT INTO t (id) VALUES (1);
+    SELECT count(*) FROM t WHERE u IS NULL;
+}
+expect {
+    1
+}
+
+test table-uuid-column-with-explicit-default-generates-uuid {
+    CREATE TABLE t (id int PRIMARY KEY, u uuid DEFAULT gen_random_uuid());
+    INSERT INTO t (id) VALUES (1);
+    SELECT count(*) FROM t WHERE u IS NOT NULL;
+}
+expect {
+    1
+}
