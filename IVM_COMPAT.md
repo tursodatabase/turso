@@ -138,6 +138,14 @@ over it shows `A|2`. After `'A'` is deleted, the view shows `a|1`. A
 `DISTINCT` aggregate such as `SUM(DISTINCT x)` likewise uses the smallest
 value of each class.
 
+**Integer overflow in `SUM`.** A view keeps the exact total of each group. A
+write fails with `integer overflow` when it would leave a group's `SUM` outside
+the 64-bit integer range; the order of earlier writes does not matter. For
+example, with a group holding `9223372036854775807`, inserting `1` into it
+fails, while inserting `-5` and then `1` succeeds. SQLite accepts such a write
+into the base table and reports the overflow when the sum is read, so with a
+materialized view the same error surfaces earlier, on the write.
+
 ## Maintenance and schema behavior
 
 | Feature | Status | Comment |
