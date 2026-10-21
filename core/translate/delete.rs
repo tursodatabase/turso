@@ -135,7 +135,7 @@ pub fn translate_delete(
         }
     }
 
-    optimize_plan(program, &mut delete_plan, resolver)?;
+    optimize_plan(program, &mut delete_plan, resolver, connection)?;
     if let Plan::Delete(delete_plan_inner) = &mut delete_plan {
         // Re-check after optimization: chosen access paths can make "delete while scanning"
         // unsafe, so we may need to collect rowids first.
@@ -277,7 +277,14 @@ pub fn prepare_delete_plan(
     let has_delete_triggers = btree_table_for_triggers
         .as_ref()
         .map(|bt| {
-            has_triggers_including_temp(resolver, database_id, TriggerEvent::Delete, None, bt)
+            has_triggers_including_temp(
+                resolver,
+                database_id,
+                TriggerEvent::Delete,
+                None,
+                bt,
+                connection,
+            )
         })
         .unwrap_or(false);
 
