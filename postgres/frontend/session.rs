@@ -11,7 +11,7 @@ use turso_parser::ast::{self};
 use turso_pg_parser::translator::{
     is_comment_on, is_refresh_matview, is_set_transaction, try_extract_copy_from,
     try_extract_create_schema, try_extract_drop_schema, try_extract_set, try_extract_show,
-    unqualified_create_table_name_location, PgCopyFromStmt, PgCreateSchemaStmt, PgDropSchemaStmt,
+    unqualified_created_name_location, PgCopyFromStmt, PgCreateSchemaStmt, PgDropSchemaStmt,
     PgSetStmt, PgShowStmt, PostgreSQLTranslator,
 };
 
@@ -186,22 +186,28 @@ fn prepare_statement(pg_conn: &Arc<PgConnectionInner>, sql: &str) -> Result<Stat
         .unwrap()
         .search_path
         .clone();
-    let parse_result =
-        turso_pg_parser::parse(sql).map_err(|e| LimboError::ParseError(e.to_string()))?;
-    let (sql, parse_result) =
-        match create_table_schema_from_search_path(pg_conn, &parse_result, &search_path)? {
-            Some((location, schema)) => {
-                let sql = turso_pg_parser::qualify_create_table_name(sql, location, &schema);
-                let parse_result = turso_pg_parser::parse(&sql)
-                    .map_err(|e| LimboError::ParseError(e.to_string()))?;
-                (Cow::Owned(sql), parse_result)
-            }
-            None => (Cow::Borrowed(sql), parse_result),
-        };
     let translator = PostgreSQLTranslator::new();
-    let translated = translator
-        .translate_with_prereqs(&parse_result)
-        .map_err(|e| LimboError::ParseError(e.to_string()))?;
+    let translate = |sql: &str| -> Result<_> {
+        let parse_result =
+            turso_pg_parser::parse(sql).map_err(|e| LimboError::ParseError(e.to_string()))?;
+        let translated = translator
+            .translate_with_prereqs(&parse_result)
+            .map_err(|e| LimboError::ParseError(e.to_string()))?;
+        Ok((parse_result, translated))
+    };
+    let (parse_result, mut translated) = translate(sql)?;
+    let mut sql = Cow::Borrowed(sql);
+    if let Some((location, schema)) = created_object_schema_from_search_path(
+        pg_conn,
+        &parse_result,
+        translated.cmd.stmt(),
+        &search_path,
+    )? {
+        sql = Cow::Owned(turso_pg_parser::qualify_created_name(
+            &sql, location, &schema,
+        ));
+        translated = translate(&sql)?.1;
+    }
     reject_catalog_dml(translated.cmd.stmt())?;
 
     let options = PrepareOptions {
@@ -220,29 +226,87 @@ fn prepare_statement(pg_conn: &Arc<PgConnectionInner>, sql: &str) -> Result<Stat
         .prepare_translated_cmd_with_options(translated.cmd, &sql, &options)
 }
 
-/// The schema that a CREATE TABLE statement naming its table without a
-/// schema creates the table in, with the byte offset of the table name: the
-/// first schema of `search_path` that exists, like PostgreSQL. None when the
-/// statement is not such a CREATE TABLE, when `search_path` is not set, or
-/// when the table goes to public, which is where core puts it anyway.
-fn create_table_schema_from_search_path(
+/// The schema that a CREATE TABLE or CREATE VIEW statement naming its table
+/// or view without a schema creates it in, with the byte offset of the
+/// name: the first schema of `search_path` that exists, like PostgreSQL.
+/// None when the statement is not such a CREATE, when `search_path` is not
+/// set, or when the object goes to public, which is where core puts it
+/// anyway. A view goes to the schema of the tables it reads instead, since
+/// core only lets a view read tables of its own schema.
+fn created_object_schema_from_search_path(
     pg_conn: &Arc<PgConnectionInner>,
     parse_result: &turso_pg_parser::ParseResult,
+    stmt: &ast::Stmt,
     search_path: &Option<Vec<String>>,
 ) -> Result<Option<(usize, String)>> {
-    let Some(location) = unqualified_create_table_name_location(parse_result) else {
+    let Some(location) = unqualified_created_name_location(parse_result) else {
         return Ok(None);
     };
-    if search_path.is_none() {
+    let Some(search_path) = search_path else {
         return Ok(None);
-    }
-    let schema = current_schema(&pg_conn.conn).ok_or_else(|| {
-        LimboError::ParseError("no schema has been selected to create in".to_string())
-    })?;
+    };
+    let schema = match view_body_schema(pg_conn, stmt, search_path)? {
+        Some(schema) => schema,
+        None => current_schema(&pg_conn.conn).ok_or_else(|| {
+            LimboError::ParseError("no schema has been selected to create in".to_string())
+        })?,
+    };
     if schema.eq_ignore_ascii_case("public") {
         return Ok(None);
     }
     Ok(Some((location, schema)))
+}
+
+/// The schema of the tables that the body of a CREATE VIEW reads, found by
+/// preparing the body as a query under `search_path`, so names resolve the
+/// way a query resolves them. None when the statement is not a CREATE VIEW,
+/// when the body reads no table, or when it cannot be prepared, which
+/// CREATE VIEW itself then accepts or rejects. An error when the tables are
+/// in different schemas, since core only lets a view read tables of its own
+/// schema.
+fn view_body_schema(
+    pg_conn: &Arc<PgConnectionInner>,
+    stmt: &ast::Stmt,
+    search_path: &[String],
+) -> Result<Option<String>> {
+    let ast::Stmt::CreateView { select, .. } = stmt else {
+        return Ok(None);
+    };
+    let body = ast::Stmt::Select(select.clone());
+    let options = PrepareOptions {
+        unqualified_database_search_path: Some(search_path.to_vec()),
+    };
+    let Ok(body) =
+        pg_conn
+            .conn
+            .prepare_translated_stmt_with_options(body, &select.to_string(), &options)
+    else {
+        return Ok(None);
+    };
+    let databases = pg_conn.conn.list_all_databases();
+    let mut schemas: Vec<String> = body
+        .read_table_database_ids()
+        .map(|id| {
+            if id == turso_core::MAIN_DB_ID {
+                return "public".to_owned();
+            }
+            databases
+                .iter()
+                .find(|(database_id, _, _)| *database_id == id)
+                .map(|(_, name, _)| name.clone())
+                .expect("a prepared statement reads only attached databases")
+        })
+        .collect();
+    schemas.sort();
+    schemas.dedup();
+    match schemas.as_slice() {
+        [] => Ok(None),
+        [schema] => Ok(Some(schema.clone())),
+        _ => Err(LimboError::ParseError(format!(
+            "a view cannot read tables of different schemas: {}",
+            schemas.join(", ")
+        ))),
+    }
 }
 
 /// The first schema of `search_path` that exists, which is what PostgreSQL's

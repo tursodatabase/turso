@@ -63,9 +63,9 @@ pub fn quote_identifier(ident: &str) -> String {
     format!("\"{}\"", ident.replace('"', "\"\""))
 }
 
-/// `sql` with `schema` in front of the table name that starts at byte
-/// offset `location`.
-pub fn qualify_create_table_name(sql: &str, location: usize, schema: &str) -> String {
+/// `sql` with `schema` in front of the table or view name that starts at
+/// byte offset `location`.
+pub fn qualify_created_name(sql: &str, location: usize, schema: &str) -> String {
     let mut sql = sql.to_string();
     sql.insert_str(location, &format!("{}.", quote_identifier(schema)));
     sql

@@ -294,3 +294,172 @@ test drop-if-exists-finds-object-through-search-path {
 expect {
     0
 }
+
+test create-view-follows-search-path {
+    CREATE SCHEMA IF NOT EXISTS sp_cv;
+    DROP VIEW IF EXISTS sp_cv.v;
+    DROP TABLE IF EXISTS sp_cv.t;
+    CREATE TABLE sp_cv.t (x int);
+    INSERT INTO sp_cv.t VALUES (7);
+    SET search_path TO sp_cv, public;
+    CREATE VIEW v AS SELECT x FROM t;
+    SELECT x FROM v;
+    SELECT x FROM sp_cv.v;
+    DROP VIEW v;
+    CREATE OR REPLACE VIEW v AS SELECT x + 1 AS x FROM t;
+    SELECT x FROM sp_cv.v;
+}
+expect {
+    7
+    7
+    8
+}
+
+test create-view-is-not-in-public-under-search-path {
+    CREATE SCHEMA IF NOT EXISTS sp_cv2;
+    DROP VIEW IF EXISTS sp_cv2.v;
+    DROP TABLE IF EXISTS sp_cv2.t;
+    CREATE TABLE sp_cv2.t (x int);
+    SET search_path TO sp_cv2, public;
+    CREATE VIEW v AS SELECT x FROM t;
+    SELECT x FROM public.v;
+}
+expect error {}
+
+test create-view-with-no-existing-schema-in-search-path-errors {
+    SET search_path TO sp_missing_cv;
+    CREATE VIEW v AS SELECT 1 AS x;
+}
+expect error {
+    no schema has been selected to create in
+}
+
+test create-view-over-public-table-reads-it-under-search-path {
+    CREATE SCHEMA IF NOT EXISTS sp_cv3;
+    DROP VIEW IF EXISTS sp_cv3.v;
+    CREATE TABLE t (x int);
+    INSERT INTO t VALUES (9);
+    SET search_path TO sp_cv3, public;
+    CREATE VIEW v AS SELECT x FROM t;
+    SELECT x FROM v;
+}
+expect {
+    9
+}
+
+test create-view-over-catalog-under-search-path {
+    CREATE SCHEMA IF NOT EXISTS sp_cv5;
+    DROP VIEW IF EXISTS sp_cv5.v;
+    SET search_path TO sp_cv5, public;
+    CREATE VIEW v AS SELECT count(*) AS c FROM pg_class WHERE relname = 'zzz';
+    SELECT c FROM v;
+}
+expect {
+    0
+}
+
+test create-view-with-nested-cte-named-like-public-table {
+    CREATE SCHEMA IF NOT EXISTS sp_cv6;
+    DROP VIEW IF EXISTS sp_cv6.v;
+    CREATE TABLE t (x int);
+    SET search_path TO sp_cv6, public;
+    CREATE VIEW v AS SELECT x FROM (WITH t AS (SELECT 2 AS x) SELECT x FROM t) q;
+    SELECT x FROM sp_cv6.v;
+}
+expect {
+    2
+}
+
+test create-view-follows-its-table-into-a-later-schema {
+    CREATE SCHEMA IF NOT EXISTS sp_cv7;
+    DROP VIEW IF EXISTS sp_cv7.va;
+    DROP TABLE IF EXISTS sp_cv7.t;
+    CREATE TABLE sp_cv7.t (x int);
+    INSERT INTO sp_cv7.t VALUES (5);
+    SET search_path TO public, sp_cv7;
+    CREATE VIEW va AS SELECT x FROM t;
+    SELECT x FROM va;
+}
+expect {
+    5
+}
+
+@skip-if postgres "Turso does not support views that read tables of different schemas"
+test create-view-rejects-tables-of-different-schemas {
+    CREATE SCHEMA IF NOT EXISTS sp_cv8;
+    DROP TABLE IF EXISTS sp_cv8.ta;
+    CREATE TABLE sp_cv8.ta (x int);
+    CREATE TABLE tb (x int);
+    SET search_path TO sp_cv8, public;
+    CREATE VIEW v AS SELECT ta.x FROM ta, tb;
+}
+expect error {
+    a view cannot read tables of different schemas: public, sp_cv8
+}
+
+test create-view-reads-cte-named-like-table-of-another-schema {
+    CREATE SCHEMA IF NOT EXISTS sp_cv4;
+    DROP VIEW IF EXISTS sp_cv4.v;
+    CREATE TABLE t (x int);
+    INSERT INTO t VALUES (1);
+    SET search_path TO sp_cv4, public;
+    CREATE VIEW v AS WITH t AS (SELECT 2 AS x) SELECT x FROM t;
+    SELECT x FROM v;
+}
+expect {
+    2
+}
+
+test create-view-over-table-with-a-quote-in-its-name {
+    CREATE SCHEMA IF NOT EXISTS sp_cv9;
+    DROP VIEW IF EXISTS sp_cv9.v;
+    DROP TABLE IF EXISTS sp_cv9."a'b";
+    CREATE TABLE sp_cv9."a'b" (x int);
+    INSERT INTO sp_cv9."a'b" VALUES (6);
+    SET search_path TO sp_cv9, public;
+    CREATE VIEW v AS SELECT x FROM "a'b";
+    SELECT x FROM v;
+}
+expect {
+    6
+}
+
+test create-view-over-table-with-a-dot-in-its-name {
+    CREATE SCHEMA IF NOT EXISTS sp_cv10;
+    DROP VIEW IF EXISTS sp_cv10.v;
+    CREATE TABLE "a.b" (x int);
+    INSERT INTO "a.b" VALUES (7);
+    SET search_path TO sp_cv10, public;
+    CREATE VIEW v AS SELECT x FROM "a.b";
+    SELECT x FROM v;
+}
+expect {
+    7
+}
+
+test create-view-reads-a-table-beside-a-cte-of-the-same-name {
+    CREATE SCHEMA IF NOT EXISTS sp_cv11;
+    DROP VIEW IF EXISTS sp_cv11.v;
+    CREATE TABLE t (x int);
+    INSERT INTO t VALUES (1);
+    SET search_path TO sp_cv11, public;
+    CREATE VIEW v AS SELECT (WITH t AS (SELECT 2 AS y) SELECT y FROM t) AS b, (SELECT x FROM t) AS a;
+    SELECT b, a FROM v;
+}
+expect {
+    2|1
+}
+
+test create-view-over-subquery-of-a-table-in-search-path {
+    CREATE SCHEMA IF NOT EXISTS sp_cv12;
+    DROP VIEW IF EXISTS sp_cv12.w;
+    DROP TABLE IF EXISTS sp_cv12.u;
+    CREATE TABLE sp_cv12.u (y int);
+    INSERT INTO sp_cv12.u VALUES (4);
+    SET search_path TO sp_cv12, public;
+    CREATE VIEW w AS SELECT y FROM (SELECT y FROM u) s;
+    SELECT y FROM sp_cv12.w;
+}
+expect {
+    4
+}
