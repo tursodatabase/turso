@@ -242,7 +242,7 @@ avoid this window.
 | PRAGMA foreign_keys              | ✅ Yes         |                                              |
 | PRAGMA freelist_count            | ✅ Yes        |                                              |
 | PRAGMA full_column_names         | Not Needed | deprecated in SQLite                         |
-| PRAGMA fullfsync                 | ✅ Yes        |                                              |
+| PRAGMA fullfsync                 | 🚧 Partial    | Apple platforms only; ignored elsewhere      |
 | PRAGMA function_list             | ✅ Yes        |                                              |
 | PRAGMA hard_heap_limit           | ❌ No         |                                              |
 | PRAGMA ignore_check_constraints  | ✅ Yes        |                                              |
