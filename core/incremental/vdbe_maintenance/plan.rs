@@ -1083,7 +1083,7 @@ fn validate_planned_node(
     let node = &dag.nodes[node_id];
     let check_expr =
         |expr: &ast::Expr, input: dag::NodeId, unavailable_value: &str| -> Result<()> {
-            if expr_contains_nondeterministic_scalar_function(expr, resolver)? {
+            if changes_between_statements(expr, resolver)? {
                 return unsupported("non-deterministic expressions");
             }
             let input = &operator_states.for_node(input)?.output;
@@ -1160,7 +1160,7 @@ fn validate_planned_node(
                 .flat_map(|input| input.binding_rowids.iter().copied())
                 .collect::<Vec<_>>();
             for expr in on {
-                if expr_contains_nondeterministic_scalar_function(expr, resolver)? {
+                if changes_between_statements(expr, resolver)? {
                     return unsupported("non-deterministic expressions");
                 }
                 validate_stream_expr(
@@ -1262,6 +1262,32 @@ fn validate_planned_node(
         }
     }
     Ok(())
+}
+
+/// Whether `expr` can give a different value in a later statement than it gave
+/// when a row was added to the view: a non-deterministic function, or
+/// `CURRENT_DATE`, `CURRENT_TIME` or `CURRENT_TIMESTAMP`. Those literals are
+/// fixed within one statement, so the shared helper treats them as
+/// deterministic, but a view keeps its rows across statements.
+fn changes_between_statements(expr: &ast::Expr, resolver: &Resolver) -> Result<bool> {
+    if expr_contains_nondeterministic_scalar_function(expr, resolver)? {
+        return Ok(true);
+    }
+    let mut found = false;
+    crate::util::walk_expr_with_subqueries(expr, &mut |node| -> Result<WalkControl> {
+        if matches!(
+            node,
+            ast::Expr::Literal(
+                ast::Literal::CurrentDate
+                    | ast::Literal::CurrentTime
+                    | ast::Literal::CurrentTimestamp
+            )
+        ) {
+            found = true;
+        }
+        Ok(WalkControl::Continue)
+    })?;
+    Ok(found)
 }
 
 fn validate_terminal_delta_identity(
