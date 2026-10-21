@@ -1,7 +1,4 @@
-use super::binding::{
-    cache_stream_expr_reg, make_joined_table, remap_bound_expr, stream_table_references,
-    BindingRemap,
-};
+use super::binding::{cache_stream_expr_reg, make_joined_table, remap_bound_expr, BindingRemap};
 use super::output::{EmittedNodeOutput, NodeOutput, NodeOutputContract};
 use super::plan::OperatorStateDef;
 use super::source::materialize_node_output;
@@ -12,7 +9,7 @@ use super::stream::{
 use super::MaintenanceInput;
 use crate::alloc::TursoIteratorExt;
 use crate::incremental::dag;
-use crate::schema::{BTreeTable, Index, IndexColumn, Schema, DBSP_INDEX_PREFIX};
+use crate::schema::{is_materialized_view_join_key_index, BTreeTable, Index, IndexColumn, Schema};
 use crate::sync::Arc;
 use crate::translate::collate::{get_expr_collation_ctx_with_symbols, CollationSeq};
 use crate::translate::emitter::Resolver;
@@ -20,8 +17,11 @@ use crate::translate::expr::{
     comparison_affinity, expr_is_array, translate_condition_expr, walk_expr, walk_expr_mut,
     ConditionMetadata, WalkControl,
 };
-use crate::translate::plan::TableReferences;
+use crate::translate::optimizer::constraints::bind_partial_index_columns;
+use crate::translate::plan::{JoinedTable, TableReferences};
+use crate::translate::planner::{break_predicate_at_and_boundaries, rewrite_between_exprs};
 use crate::turso_assert;
+use crate::util::exprs_are_equivalent;
 use crate::vdbe::affinity::Affinity;
 use crate::vdbe::builder::{CursorType, ProgramBuilder};
 use crate::vdbe::insn::{
@@ -936,7 +936,8 @@ fn emit_join_phases(
 ) -> Result<()> {
     let input_count = contract.inputs.len();
     let key_inputs = contract.key_inputs();
-    let (binding_remap, table_references) = join_table_references(program, contract);
+    let (binding_remap, table_references) =
+        input_table_references(&key_inputs, |_| program.table_reference_counter.next());
     let keys = find_join_keys(
         &key_inputs,
         &contract.on,
@@ -949,8 +950,8 @@ fn emit_join_phases(
         .iter()
         .map(|term| term_input_positions(&key_inputs, term))
         .collect::<Result<Vec<_>>>()?;
-    let input_wheres = (0..input_count)
-        .map(|input| input_where_sql(&key_inputs, &contract.on, &term_inputs, input))
+    let input_filters = (0..input_count)
+        .map(|input| input_filter(&key_inputs, &contract.on, &term_inputs, input))
         .collect::<Vec<_>>();
     let terms = JoinTerms {
         exprs: &contract.on,
@@ -978,11 +979,17 @@ fn emit_join_phases(
     let minus_one_reg = program.alloc_register();
     program.emit_int(-1, minus_one_reg);
     for states in phases {
-        let driver = match states.iter().position(|state| *state == InputState::Delta) {
-            Some(driver) => driver,
-            None => population_driver(schema, contract, &keys, &term_inputs, &input_wheres),
+        let plan = match states.iter().position(|state| *state == InputState::Delta) {
+            Some(driver) => plan_phase(
+                schema,
+                contract,
+                &keys,
+                &term_inputs,
+                &input_filters,
+                driver,
+            ),
+            None => population_plan(schema, contract, &keys, &term_inputs, &input_filters),
         };
-        let plan = plan_phase(schema, contract, &keys, &term_inputs, &input_wheres, driver);
         emit_join_phase(
             program,
             resolver,
@@ -1065,7 +1072,7 @@ fn plan_phase(
     contract: &JoinContract,
     keys: &[JoinKey],
     term_inputs: &[Vec<usize>],
-    input_wheres: &[Option<String>],
+    input_filters: &[Option<InputFilter>],
     driver: usize,
 ) -> PhasePlan {
     let input_count = contract.inputs.len();
@@ -1106,7 +1113,7 @@ fn plan_phase(
                 input,
                 keys,
                 &level_keys,
-                input_wheres[input].as_deref(),
+                input_filters[input].as_ref(),
                 |_| true,
             )
             .unwrap_or(LevelAccess::ScanAndProbe);
@@ -1153,18 +1160,19 @@ fn plan_phase(
     }
 }
 
-/// The input that population starts from: the one whose phase looks the
-/// most inputs up by rowid or index instead of reading them whole.
-fn population_driver(
+/// The phase population runs: the one, among phases starting from each
+/// input, that looks the most inputs up by rowid or index instead of reading
+/// them whole.
+fn population_plan(
     schema: &Schema,
     contract: &JoinContract,
     keys: &[JoinKey],
     term_inputs: &[Vec<usize>],
-    input_wheres: &[Option<String>],
-) -> usize {
+    input_filters: &[Option<InputFilter>],
+) -> PhasePlan {
     (0..contract.inputs.len())
-        .min_by_key(|driver| {
-            let plan = plan_phase(schema, contract, keys, term_inputs, input_wheres, *driver);
+        .map(|driver| plan_phase(schema, contract, keys, term_inputs, input_filters, driver))
+        .min_by_key(|plan| {
             let reads_whole_inputs = plan
                 .levels
                 .iter()
@@ -1172,7 +1180,7 @@ fn population_driver(
                     matches!(level.access, LevelAccess::ScanAndProbe | LevelAccess::Cross)
                 })
                 .count();
-            (reads_whole_inputs, *driver)
+            (reads_whole_inputs, plan.driver)
         })
         .expect("a join has inputs")
 }
@@ -2173,22 +2181,28 @@ fn emit_terms(
     Ok(())
 }
 
-/// Phase-local bindings for every input of a join, so that its terms can be
-/// translated against registers.
-fn join_table_references(
-    program: &mut ProgramBuilder,
-    contract: &JoinContract,
+/// A table reference for every binding of the join's inputs, so that its
+/// terms can be translated or compared, each under the id `table_id` gives
+/// it.
+fn input_table_references(
+    inputs: &[KeyInput],
+    mut table_id: impl FnMut(ast::TableInternalId) -> ast::TableInternalId,
 ) -> (BindingRemap, TableReferences) {
-    let schema = dag::StreamSchema {
-        columns: Vec::new(),
-        bindings: contract
-            .inputs
-            .iter()
-            .flat_map(|input| input.schema.bindings.iter().cloned())
-            .collect(),
-    };
-    let (table_references, binding_remap) = stream_table_references(program, &schema);
-    (binding_remap, table_references)
+    let mut binding_remap = BindingRemap::default();
+    let tables = inputs
+        .iter()
+        .flat_map(|input| input.schema.bindings.iter())
+        .map(|binding| {
+            let id = table_id(binding.logical_id);
+            let previous = binding_remap.insert(binding.logical_id, id);
+            turso_assert!(
+                previous.is_none(),
+                "a join must expose each logical binding exactly once"
+            );
+            make_joined_table(&binding.table, &binding.identifier, id)
+        })
+        .collect();
+    (binding_remap, TableReferences::new(tables, vec![]))
 }
 
 /// An index one inner join needs on a base table, so that a level reading
@@ -2197,20 +2211,18 @@ pub(super) struct JoinKeyIndex {
     pub(super) table: Arc<BTreeTable>,
     /// Table columns with the collation `=` compares them with, in key order.
     pub(super) columns: Vec<(usize, CollationSeq)>,
-    /// The terms of the join that read only this table, as an index WHERE.
-    pub(super) where_sql: Option<String>,
+    /// The terms of the join that read only this table, written over its
+    /// column names, as a partial index WHERE.
+    pub(super) where_clause: Option<ast::Expr>,
 }
 
-/// The indexes an inner join needs so that every level of every phase finds
-/// its rows by key, the way Materialize arranges every join input by its
-/// join key. For each base-table input and each other input it shares `=`
-/// terms with, an index on this input's compared columns is needed unless a
-/// rowid or a user index already serves those keys. Indexes that views
-/// created count as missing, so every view that needs one lists it and
-/// DROP VIEW can tell whether any remaining view still needs it. A key
-/// whose column affinity would make the index sort values differently from
-/// how `=` compares them is left out (`Affinity::index_affinity_ok`); a
-/// level whose keys are all left out keeps reading its table whole.
+/// For each base-table input and each other input it shares `=` terms with,
+/// an index on this input's compared columns, unless a rowid or a user index
+/// already finds those rows. Indexes that views created are not counted, so
+/// the result lists every such index the join uses. A key whose column
+/// affinity would make the index sort values differently from how `=`
+/// compares them is left out (`Affinity::index_affinity_ok`); a level whose
+/// keys are all left out keeps reading its table whole.
 ///
 /// `tables[i]` is the base table of input `i` when the view may index it:
 /// a plain scan of a table, not a derived input or a materialized view.
@@ -2221,21 +2233,7 @@ pub(super) fn needed_join_key_indexes(
     schema: &Schema,
     resolver: &Resolver,
 ) -> Result<Vec<JoinKeyIndex>> {
-    let table_references = TableReferences::new(
-        inputs
-            .iter()
-            .flat_map(|input| input.schema.bindings.iter())
-            .map(|binding| {
-                make_joined_table(&binding.table, &binding.identifier, binding.logical_id)
-            })
-            .collect(),
-        vec![],
-    );
-    let binding_remap = inputs
-        .iter()
-        .flat_map(|input| input.schema.bindings.iter())
-        .map(|binding| (binding.logical_id, binding.logical_id))
-        .collect::<BindingRemap>();
+    let (binding_remap, table_references) = input_table_references(inputs, |id| id);
     let keys = find_join_keys(inputs, on, &binding_remap, &table_references, resolver)?;
     let term_inputs = on
         .iter()
@@ -2246,7 +2244,7 @@ pub(super) fn needed_join_key_indexes(
         let Some(table) = table else {
             continue;
         };
-        let where_sql = input_where_sql(inputs, on, &term_inputs, input);
+        let filter = input_filter(inputs, on, &term_inputs, input);
         let arrangement = base_arrangement(table.clone(), None);
         for other in (0..inputs.len()).filter(|other| *other != input) {
             let shared_keys = (0..keys.len())
@@ -2263,8 +2261,8 @@ pub(super) fn needed_join_key_indexes(
                     input,
                     &keys,
                     &shared_keys,
-                    where_sql.as_deref(),
-                    |index| !index.name.starts_with(DBSP_INDEX_PREFIX),
+                    filter.as_ref(),
+                    |index| !is_materialized_view_join_key_index(&index.name),
                 )
                 .is_some()
             {
@@ -2282,123 +2280,118 @@ pub(super) fn needed_join_key_indexes(
                     columns.push((column, keys[*key].collation));
                 }
             }
-            let index = JoinKeyIndex {
-                table: table.clone(),
-                columns,
-                where_sql: where_sql.clone(),
-            };
-            let already_needed = needed.iter().any(|needed| {
-                needed.table.name == index.table.name
-                    && needed.columns == index.columns
-                    && needed.where_sql == index.where_sql
-            });
-            if !index.columns.is_empty() && !already_needed {
-                needed.push(index);
+            if !columns.is_empty() {
+                needed.push(JoinKeyIndex {
+                    table: table.clone(),
+                    columns,
+                    where_clause: filter.as_ref().and_then(InputFilter::index_where),
+                });
             }
         }
     }
     Ok(needed)
 }
 
-/// The WHERE of a partial index on `input` that holds exactly the rows the
-/// join can use: the terms that read only `input`, written over its table's
-/// own column names, normalized by [`normalized_where_sql`]. `None` when the
-/// input is not one base table, has no such term, or a term uses an
-/// expression that is not plainly written back as SQL; a full index then
-/// takes its place.
-fn input_where_sql(
+/// The terms of a join that read only one input, when that input is one
+/// table. A partial index of the table serves the input when every row the
+/// terms accept is in the index.
+struct InputFilter<'a> {
+    /// The input's table, under the id the terms read it by.
+    table: JoinedTable,
+    terms: Vec<&'a ast::Expr>,
+}
+
+fn input_filter<'a>(
     inputs: &[KeyInput],
-    on: &[ast::Expr],
+    on: &'a [ast::Expr],
     term_inputs: &[Vec<usize>],
     input: usize,
-) -> Option<String> {
+) -> Option<InputFilter<'a>> {
     let [binding] = inputs[input].schema.bindings.as_slice() else {
         return None;
     };
-    let columns = binding.table.columns();
-    let mut combined: Option<ast::Expr> = None;
-    for (term, reads) in on.iter().zip(term_inputs) {
-        if reads.as_slice() != [input] {
-            continue;
-        }
-        let mut written = term.clone();
-        let mut writable = true;
-        walk_expr_mut(&mut written, &mut |node| {
-            match node {
-                ast::Expr::Column { table, column, .. } if *table == binding.logical_id => {
-                    match columns.get(*column).and_then(|column| column.name.clone()) {
-                        Some(name) => *node = ast::Expr::Id(ast::Name::exact(name)),
-                        None => writable = false,
-                    }
-                }
-                // A partial index whose WHERE reads the rowid makes every
-                // INSERT into the table fail (#9663), so such a term stays
-                // in the join only and the index covers every row.
-                ast::Expr::RowId { .. } => writable = false,
-                ast::Expr::Id(_)
-                | ast::Expr::Literal(_)
-                | ast::Expr::Binary(..)
-                | ast::Expr::Unary(..)
-                | ast::Expr::Parenthesized(_)
-                | ast::Expr::Between { .. }
-                | ast::Expr::IsNull(_)
-                | ast::Expr::NotNull(_)
-                | ast::Expr::Cast { .. }
-                | ast::Expr::Collate(..)
-                | ast::Expr::Case { .. } => {}
-                ast::Expr::InList { rhs, .. } => {
-                    writable &= rhs
-                        .iter()
-                        .all(|value| !matches!(**value, ast::Expr::Subquery(_)));
-                }
-                ast::Expr::Like { escape: None, .. } => {}
-                ast::Expr::FunctionCall {
-                    distinctness: None,
-                    order_by,
-                    within_group,
-                    filter_over,
-                    ..
-                } if order_by.is_empty()
-                    && within_group.is_empty()
-                    && filter_over.filter_clause.is_none()
-                    && filter_over.over_clause.is_none() => {}
-                _ => writable = false,
-            }
-            Ok(WalkControl::Continue)
-        })
-        .ok()?;
-        if !writable {
-            return None;
-        }
-        let written = ast::Expr::Parenthesized(vec![Box::new(written)]);
-        combined = Some(match combined {
-            None => written,
-            Some(earlier) => {
-                ast::Expr::Binary(Box::new(earlier), ast::Operator::And, Box::new(written))
-            }
-        });
-    }
-    normalized_where_sql(&combined?)
+    Some(InputFilter {
+        table: make_joined_table(&binding.table, &binding.identifier, binding.logical_id),
+        terms: on
+            .iter()
+            .zip(term_inputs)
+            .filter(|(_, reads)| reads.as_slice() == [input])
+            .map(|(term, _)| term)
+            .collect(),
+    })
 }
 
-/// The SQL text of an index WHERE, as the parser reads it back: a WHERE
-/// written by [`input_where_sql`] and one loaded from `sqlite_schema` give
-/// the same text exactly when they are the same expression. `None` when the
-/// text does not read back as one expression.
-fn normalized_where_sql(expr: &ast::Expr) -> Option<String> {
-    let sql = format!("SELECT {expr}");
-    let mut parser = turso_parser::parser::Parser::new(sql.as_bytes());
-    let Some(Ok(ast::Cmd::Stmt(ast::Stmt::Select(select)))) = parser.next() else {
-        return None;
-    };
-    let ast::OneSelect::Select { columns, .. } = &select.body.select else {
-        return None;
-    };
-    match columns.as_slice() {
-        [ast::ResultColumn::Expr(expr, _)] if select.body.compounds.is_empty() => {
-            Some(expr.to_string())
+impl InputFilter<'_> {
+    /// Whether every row the terms accept passes `index_where`: each of its
+    /// AND-ed parts is one of the terms, compared the way the optimizer
+    /// matches a partial index to a query.
+    fn implies(&self, index_where: &ast::Expr) -> bool {
+        let mut bound = index_where.clone();
+        bind_partial_index_columns(&mut bound, &self.table);
+        if rewrite_between_exprs(&mut bound).is_err() {
+            return false;
         }
-        _ => None,
+        let mut parts: Vec<ast::Expr> = Vec::new();
+        break_predicate_at_and_boundaries(&bound, &mut parts);
+        parts.iter().all(|part| {
+            self.terms
+                .iter()
+                .any(|term| exprs_are_equivalent(part, term))
+        })
+    }
+
+    /// The terms written over the table's column names, as the WHERE of a
+    /// partial index, in the form the parser reads back from
+    /// `sqlite_schema`. A term that reads the rowid is left out, because a
+    /// partial index whose WHERE reads the rowid makes every INSERT into
+    /// the table fail (#9663); the join still checks it. `None` when no term
+    /// is left or the text does not read back as one expression.
+    fn index_where(&self) -> Option<ast::Expr> {
+        let columns = self.table.columns();
+        let mut combined: Option<ast::Expr> = None;
+        for term in &self.terms {
+            let mut written = (*term).clone();
+            let mut writable = true;
+            walk_expr_mut(&mut written, &mut |node| {
+                match node {
+                    ast::Expr::Column { column, .. } => {
+                        match columns.get(*column).and_then(|column| column.name.clone()) {
+                            Some(name) => *node = ast::Expr::Id(ast::Name::exact(name)),
+                            None => writable = false,
+                        }
+                    }
+                    ast::Expr::RowId { .. } => writable = false,
+                    _ => {}
+                }
+                Ok(WalkControl::Continue)
+            })
+            .ok()?;
+            if !writable {
+                continue;
+            }
+            let written = ast::Expr::Parenthesized(vec![Box::new(written)]);
+            combined = Some(match combined {
+                None => written,
+                Some(earlier) => {
+                    ast::Expr::Binary(Box::new(earlier), ast::Operator::And, Box::new(written))
+                }
+            });
+        }
+        let sql = format!("SELECT {}", combined?);
+        let mut parser = turso_parser::parser::Parser::new(sql.as_bytes());
+        let Some(Ok(ast::Cmd::Stmt(ast::Stmt::Select(select)))) = parser.next() else {
+            return None;
+        };
+        if !select.body.compounds.is_empty() {
+            return None;
+        }
+        let ast::OneSelect::Select { mut columns, .. } = select.body.select else {
+            return None;
+        };
+        match columns.pop() {
+            Some(ast::ResultColumn::Expr(expr, _)) if columns.is_empty() => Some(*expr),
+            _ => None,
+        }
     }
 }
 
@@ -2694,7 +2687,7 @@ fn persistent_key_access(
     position: usize,
     keys: &[JoinKey],
     level_keys: &[usize],
-    input_where: Option<&str>,
+    input_filter: Option<&InputFilter>,
     may_use: impl Fn(&Index) -> bool,
 ) -> Option<LevelAccess> {
     let table = arrangement.table();
@@ -2731,13 +2724,11 @@ fn persistent_key_access(
         .filter(|index| may_use(index))
     {
         // A partial index holds only the rows its WHERE accepts. It serves
-        // the level when that WHERE is exactly the terms the level checks on
-        // this input anyway, so the rows it leaves out could never match.
+        // the level when the terms the level checks on this input anyway
+        // imply that WHERE, so the rows it leaves out could never match.
         let where_serves_level = match &index.where_clause {
             None => true,
-            Some(index_where) => input_where.is_some_and(|input_where| {
-                normalized_where_sql(index_where).as_deref() == Some(input_where)
-            }),
+            Some(index_where) => input_filter.is_some_and(|filter| filter.implies(index_where)),
         };
         if !where_serves_level || index.index_method.is_some() || !index.has_rowid {
             continue;
@@ -2896,7 +2887,7 @@ mod tests {
         let mut owned: Vec<(String, Option<String>)> = ["t1", "t2", "t3", "t4", "t5", "t6"]
             .into_iter()
             .flat_map(|table| schema.get_indices(table).cloned().collect::<Vec<_>>())
-            .filter(|index| index.name.starts_with(crate::schema::DBSP_INDEX_PREFIX))
+            .filter(|index| crate::schema::is_materialized_view_join_key_index(&index.name))
             .map(|index| {
                 (
                     index.table_name.clone(),
@@ -2938,7 +2929,7 @@ mod tests {
             conn.schema
                 .read()
                 .get_indices("child")
-                .filter(|index| index.name.starts_with(crate::schema::DBSP_INDEX_PREFIX))
+                .filter(|index| crate::schema::is_materialized_view_join_key_index(&index.name))
                 .count()
         };
         assert_eq!(join_key_indexes(&conn), 1);
@@ -2950,6 +2941,33 @@ mod tests {
 
         conn.execute("DROP VIEW v2").unwrap();
         assert_eq!(join_key_indexes(&conn), 0);
+    }
+
+    /// The partial index a view creates for a filtered table serves that
+    /// table's lookups for every kind of term an index WHERE may hold.
+    #[test]
+    fn view_reads_through_its_partial_index_for_every_filter_shape() {
+        let conn = open_views_db("partial-index-filter-shapes.db");
+        conn.execute("CREATE TABLE t1(id INTEGER PRIMARY KEY, p INT, v INT, s TEXT)")
+            .unwrap();
+        conn.execute("CREATE TABLE t2(id INTEGER PRIMARY KEY, w TEXT)")
+            .unwrap();
+        conn.execute(
+            "CREATE MATERIALIZED VIEW v AS SELECT t1.id, t2.w FROM t1 JOIN t2 ON t1.p = t2.id \
+             WHERE t1.s = 'a' COLLATE NOCASE AND CAST(t1.v AS TEXT) <> '9' \
+             AND CASE WHEN t1.v > 2 THEN 1 ELSE 0 END = 1 AND t1.v IN (3, 5) \
+             AND t1.v BETWEEN 1 AND 10 AND t1.s LIKE '%!_%' ESCAPE '!' AND abs(t1.v) > 1",
+        )
+        .unwrap();
+        let partial_indexes = conn
+            .schema
+            .read()
+            .get_indices("t1")
+            .filter(|index| index.where_clause.is_some())
+            .count();
+        assert_eq!(partial_indexes, 1);
+        let maintenance = compile_view_program(&conn, "v", MaintenanceInput::TransactionDelta);
+        assert_eq!(stored_table_full_reads(&maintenance), Vec::<String>::new());
     }
 
     fn open_views_db(name: &str) -> Arc<Connection> {

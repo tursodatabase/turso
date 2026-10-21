@@ -5,7 +5,7 @@ use super::output::NodeOutputContract;
 use super::stream::{binding_rowid_metadata_width, DeltaIdentity};
 use crate::function::{AggFunc, Func};
 use crate::incremental::dag;
-use crate::schema::BTreeTable;
+use crate::schema::{BTreeTable, Index, Table};
 use crate::sync::Arc;
 use crate::translate::collate::{get_collseq_from_expr_with_symbols, CollationSeq};
 use crate::translate::emitter::Resolver;
@@ -756,8 +756,9 @@ pub(crate) struct HiddenTableDef {
 /// up to date.
 #[derive(Debug, Clone)]
 pub(crate) struct JoinKeyIndexDef {
-    pub(crate) index_name: String,
-    pub(crate) table_name: String,
+    /// Not created yet: its root page is 0.
+    pub(crate) index: Arc<Index>,
+    pub(crate) table: Arc<BTreeTable>,
     pub(crate) create_sql: String,
 }
 
@@ -1078,8 +1079,6 @@ fn plan_join_key_indexes(
     operator_states: &OperatorStateCatalog,
     resolver: &Resolver,
 ) -> Result<Vec<JoinKeyIndexDef>> {
-    use crate::incremental::view::DBSP_CIRCUIT_VERSION;
-
     let schema = resolver.schema();
     let mut indexes: Vec<JoinKeyIndexDef> = Vec::new();
     for node in &dag.nodes {
@@ -1116,48 +1115,85 @@ fn plan_join_key_indexes(
         for needed in
             super::join::needed_join_key_indexes(&key_inputs, &tables, on, schema, resolver)?
         {
-            let columns = needed
-                .columns
+            let index = join_key_index_def(needed, resolver)?;
+            if !indexes
                 .iter()
-                .map(|(column, collation)| {
-                    let name = needed.table.columns()[*column]
-                        .name
-                        .clone()
-                        .expect("a join key column has a name");
-                    format!("{} COLLATE {collation}", ast::Name::exact(name).as_ident())
-                })
-                .collect::<Vec<_>>()
-                .join(", ");
-            let where_clause = needed
-                .where_sql
-                .as_ref()
-                .map(|where_sql| format!(" WHERE {where_sql}"))
-                .unwrap_or_default();
-            let definition = format!(
-                "{}({columns}){where_clause}",
-                ast::Name::exact(needed.table.name.clone()).as_ident(),
-            );
-            let index_name = format!(
-                "{}{DBSP_CIRCUIT_VERSION}_{}__{:016x}",
-                crate::schema::DBSP_INDEX_PREFIX,
-                needed.table.name,
-                twox_hash::XxHash3_64::oneshot(definition.as_bytes()),
-            );
-            if indexes.iter().any(|index| index.index_name == index_name) {
-                continue;
+                .any(|planned| planned.index.name == index.index.name)
+            {
+                indexes.push(index);
             }
-            let create_sql = format!(
-                "CREATE INDEX {} ON {definition}",
-                ast::Name::exact(index_name.clone()).as_ident(),
-            );
-            indexes.push(JoinKeyIndexDef {
-                index_name,
-                table_name: needed.table.name.clone(),
-                create_sql,
-            });
         }
     }
     Ok(indexes)
+}
+
+/// The index, and its CREATE INDEX statement, for one needed join key index.
+fn join_key_index_def(
+    needed: super::join::JoinKeyIndex,
+    resolver: &Resolver,
+) -> Result<JoinKeyIndexDef> {
+    use crate::incremental::view::DBSP_CIRCUIT_VERSION;
+
+    let table = needed.table;
+    let columns = needed
+        .columns
+        .iter()
+        .map(|(column, collation)| {
+            let name = table.columns()[*column]
+                .name
+                .clone()
+                .expect("a join key column has a name");
+            ast::SortedColumn {
+                expr: Box::new(ast::Expr::Collate(
+                    Box::new(ast::Expr::Id(ast::Name::exact(name))),
+                    ast::Name::exact(collation.to_string()),
+                )),
+                order: None,
+                nulls: None,
+            }
+        })
+        .collect::<Vec<_>>();
+    let mut index = Index {
+        name: String::new(),
+        table_name: table.name.clone(),
+        root_page: 0,
+        columns: crate::translate::index::resolve_sorted_columns(&table, &columns)?,
+        unique: false,
+        ephemeral: false,
+        has_rowid: true,
+        where_clause: needed.where_clause.map(Box::new),
+        index_method: None,
+        on_conflict: None,
+    };
+    // A WHERE that CREATE INDEX would refuse is left out: the index then
+    // holds every row, and the join still checks the terms.
+    if !index.validate_where_expr(&Table::BTree(table.clone()), resolver) {
+        index.where_clause = None;
+    }
+    let mut stmt = ast::Stmt::CreateIndex {
+        unique: false,
+        if_not_exists: false,
+        idx_name: ast::QualifiedName::single(ast::Name::exact(String::new())),
+        tbl_name: ast::Name::exact(table.name.clone()),
+        using: None,
+        columns,
+        with_clause: Vec::new(),
+        where_clause: index.where_clause.clone(),
+    };
+    index.name = format!(
+        "{}{DBSP_CIRCUIT_VERSION}_{}__{:016x}",
+        crate::schema::DBSP_INDEX_PREFIX,
+        table.name,
+        twox_hash::XxHash3_64::oneshot(stmt.to_string().as_bytes()),
+    );
+    if let ast::Stmt::CreateIndex { idx_name, .. } = &mut stmt {
+        idx_name.name = ast::Name::exact(index.name.clone());
+    }
+    Ok(JoinKeyIndexDef {
+        index: Arc::new(index),
+        table,
+        create_sql: stmt.to_string(),
+    })
 }
 
 /// Turn every correlated subquery the regular planner can rewrite into a join

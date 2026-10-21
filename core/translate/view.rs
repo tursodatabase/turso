@@ -14,8 +14,7 @@ use crate::util::{
 use crate::vdbe::builder::{CursorType, ProgramBuilder};
 use crate::vdbe::insn::{CmpInsFlags, Cookie, Insn, RegisterOrLiteral};
 use crate::{bail_parse_error, Connection, Result, MAIN_DB_ID};
-use turso_parser::ast::{self, Cmd};
-use turso_parser::parser::Parser;
+use turso_parser::ast;
 
 fn validate_materialized(
     connection: &Arc<crate::Connection>,
@@ -286,50 +285,9 @@ pub fn translate_create_materialized_view(
     // schema rows below makes the table's write path keep them up to date.
     // An index another view already created is shared: its name is derived
     // from its definition.
-    for owned in maintenance_plan.join_key_indexes() {
-        let Ok(Some(Cmd::Stmt(ast::Stmt::CreateIndex {
-            columns,
-            where_clause,
-            ..
-        }))) = Parser::new(owned.create_sql.as_bytes()).next().transpose()
-        else {
-            return Err(crate::LimboError::InternalError(format!(
-                "materialized view index does not parse: {}",
-                owned.create_sql
-            )));
-        };
-        let table = resolver
-            .with_schema(database_id, |s| s.get_btree_table(&owned.table_name))
-            .ok_or_else(|| {
-                crate::LimboError::InternalError(format!(
-                    "materialized view index on missing table {}",
-                    owned.table_name
-                ))
-            })?;
-        let index = Arc::new(Index {
-            name: owned.index_name.clone(),
-            table_name: table.name.clone(),
-            root_page: 0,
-            columns: crate::translate::index::resolve_sorted_columns(&table, &columns)?,
-            unique: false,
-            ephemeral: false,
-            has_rowid: table.has_rowid,
-            where_clause,
-            index_method: None,
-            on_conflict: None,
-        });
-        let existing = resolver.with_schema(database_id, |s| {
-            s.get_indices(&table.name)
-                .find(|existing| existing.name == index.name)
-                .cloned()
-        });
-        if let Some(existing) = existing {
-            if !same_index_definition(&existing, &index) {
-                return Err(crate::LimboError::InternalError(format!(
-                    "materialized view index {} exists with a different definition",
-                    index.name
-                )));
-            }
+    for needed in maintenance_plan.join_key_indexes() {
+        let index = &needed.index;
+        if !resolver.with_schema(database_id, |s| s.is_unique_idx_name(&index.name)) {
             continue;
         }
         let index_root_reg = program.alloc_register();
@@ -344,23 +302,23 @@ pub fn translate_create_materialized_view(
             sqlite_schema_cursor_id,
             None,
             SchemaEntryType::Index,
-            &owned.index_name,
-            &table.name,
+            &index.name,
+            &needed.table.name,
             index_root_reg,
-            Some(owned.create_sql.clone()),
+            Some(needed.create_sql.clone()),
         )?;
-        let index_cursor_id = program.alloc_cursor_index(None, &index)?;
+        let index_cursor_id = program.alloc_cursor_index(None, index)?;
         crate::translate::index::emit_refill_index(
             program,
             resolver,
             database_id,
-            &table,
-            &index,
+            &needed.table,
+            index,
             index_cursor_id,
             RegisterOrLiteral::Register(index_root_reg),
             None,
         )?;
-        parse_schema_names.push(escape_sql_string_literal(&owned.index_name));
+        parse_schema_names.push(escape_sql_string_literal(&index.name));
     }
 
     // Parse schema to load the new view (and its state table, if any)
@@ -390,20 +348,6 @@ pub fn translate_create_materialized_view(
     });
 
     Ok(())
-}
-
-/// Whether two indexes cover the same columns with the same collations and
-/// hold the same rows.
-fn same_index_definition(a: &Index, b: &Index) -> bool {
-    let columns = |index: &Index| {
-        index
-            .columns
-            .iter()
-            .map(|column| (column.pos_in_table, column.collation))
-            .collect::<Vec<_>>()
-    };
-    let where_sql = |index: &Index| index.where_clause.as_ref().map(|expr| expr.to_string());
-    a.table_name == b.table_name && columns(a) == columns(b) && where_sql(a) == where_sql(b)
 }
 
 fn validate_create_view(
@@ -982,7 +926,7 @@ fn join_key_indexes_no_other_view_needs(
             .indexes
             .values()
             .flatten()
-            .filter(|index| index.name.starts_with(crate::schema::DBSP_INDEX_PREFIX))
+            .filter(|index| crate::schema::is_materialized_view_join_key_index(&index.name))
             .cloned()
             .collect::<Vec<_>>();
         let other_views = s
@@ -1012,7 +956,7 @@ fn join_key_indexes_no_other_view_needs(
         needed.extend(
             plan.join_key_indexes()
                 .iter()
-                .map(|index| index.index_name.clone()),
+                .map(|index| index.index.name.clone()),
         );
     }
     Ok(join_key_indexes

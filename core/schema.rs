@@ -645,6 +645,12 @@ pub fn is_materialized_view_state_table(table_name: &str) -> bool {
     .any(|prefix| table_name.starts_with(prefix))
 }
 
+/// Check if an index is one materialized views create on a base table so that
+/// their joins can look that table up by key.
+pub fn is_materialized_view_join_key_index(index_name: &str) -> bool {
+    index_name.starts_with(DBSP_INDEX_PREFIX)
+}
+
 pub fn allow_user_dml(table_name: &str) -> bool {
     const NAMES: [&str; 2] = [SCHEMA_TABLE_NAME, SCHEMA_TABLE_NAME_ALT];
     !(NAMES.iter().any(|n| n.eq_ignore_ascii_case(table_name))
