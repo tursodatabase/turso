@@ -48,11 +48,7 @@ pub(super) fn needs_legacy(
         return Ok(true);
     }
     // Like legacy, writes to a virtual table record no change data.
-    if let Some(table) = super::dml::virtual_target(document, delete.target)? {
-        if super::dml::virtual_needs_legacy(&table) {
-            super::note_fallback("DELETE from sqlite_dbpage")?;
-            return Ok(true);
-        }
+    if super::dml::virtual_target(document, delete.target)?.is_some() {
         return Ok(false);
     }
     let [planned_loop] = access.loops.as_slice() else {
@@ -403,7 +399,7 @@ fn emit_virtual_delete(
     if delete.returning.is_some() {
         crate::bail_parse_error!("DELETE RETURNING is not available on virtual tables");
     }
-    if table.readonly() {
+    if table.readonly() && !program.dbpage_writable() {
         return Err(LimboError::ReadOnly);
     }
     program.begin_write_operation()?;

@@ -366,6 +366,9 @@ pub struct ProgramBuilder {
     /// Plan of the HIR statement being lowered. Expression subqueries emit
     /// their bodies from it where the expression is evaluated.
     hir_plan: Option<Arc<crate::translate::semantic_to_plan::HirPlan>>,
+    /// Whether this statement may write `sqlite_dbpage`, which only a
+    /// cli_only build opened with unsafe testing on may do.
+    dbpage_writable: bool,
     /// Expression subqueries that HIR lowering makes run every time they are
     /// reached, even when they read no outer row.
     rerun_subqueries: Vec<QueryId>,
@@ -854,6 +857,7 @@ impl ProgramBuilder {
             window_result_registers: HashMap::default(),
             subquery_bindings: HashMap::default(),
             hir_plan: None,
+            dbpage_writable: false,
             rerun_subqueries: Vec::new(),
             expression_registers: Vec::new(),
             id_register_overrides: HashMap::default(),
@@ -1137,6 +1141,14 @@ impl ProgramBuilder {
 
     pub(crate) fn reruns_subquery(&self, query: QueryId) -> bool {
         self.rerun_subqueries.contains(&query)
+    }
+
+    pub(crate) const fn set_dbpage_writable(&mut self, writable: bool) {
+        self.dbpage_writable = writable;
+    }
+
+    pub(crate) const fn dbpage_writable(&self) -> bool {
+        self.dbpage_writable
     }
 
     /// Mark that this statement may modify/insert multiple rows (mirrors SQLite's sqlite3MultiWrite).

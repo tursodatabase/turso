@@ -17,7 +17,7 @@ use crate::{
         insn::{to_u32, InsertFlags, Insn, RegisterOrLiteral},
         BranchOffset, CursorID,
     },
-    LimboError, Result,
+    Connection, LimboError, Result,
 };
 
 use super::fkey_action::CompiledAction;
@@ -608,10 +608,22 @@ pub(super) fn virtual_target(
     })
 }
 
-/// Whether a write to a virtual table stays in legacy: `sqlite_dbpage`,
-/// which legacy writes only in testing builds.
-pub(super) fn virtual_needs_legacy(table: &crate::vtab::VirtualTable) -> bool {
-    table.name == "sqlite_dbpage"
+/// Like legacy, `sqlite_dbpage` may be written only by a cli_only build
+/// opened with unsafe testing on; every other read-only virtual table
+/// rejects writes.
+pub(super) fn dbpage_write_allowed(
+    table: &crate::vtab::VirtualTable,
+    connection: &Connection,
+) -> bool {
+    #[cfg(feature = "cli_only")]
+    {
+        table.name == crate::dbpage::DBPAGE_TABLE_NAME && connection.db.opts.unsafe_testing
+    }
+    #[cfg(not(feature = "cli_only"))]
+    {
+        let _ = (table, connection);
+        false
+    }
 }
 
 /// Open a virtual table for writing, as legacy does: the rows a statement
@@ -859,24 +871,31 @@ pub(super) fn subquery_query(subquery: &hir::SubqueryExpr) -> hir::QueryId {
     }
 }
 
-/// Whether the target is a STRICT table HIR does not lower yet: one with a
-/// column whose type name is neither built in nor custom.
-pub(super) fn strict_needs_legacy(table: &BTreeTable, source: &hir::Source) -> bool {
+/// A STRICT table's column types are built in or custom; CREATE TABLE
+/// rejects any other, so one here is a schema this build does not know.
+pub(super) fn check_strict_types(table: &BTreeTable, source: &hir::Source) -> Result<()> {
     let builtin = |name: &str| {
         ["ANY", "INTEGER", "INT", "REAL", "BLOB", "TEXT"]
             .iter()
             .any(|builtin| name.eq_ignore_ascii_case(builtin))
     };
-    table.is_strict
-        && table
-            .columns()
-            .iter()
-            .enumerate()
-            .any(|(position, column)| {
-                !column.is_array()
-                    && custom_chain(source, position).is_none()
-                    && !builtin(&column.ty_str)
-            })
+    if !table.is_strict {
+        return Ok(());
+    }
+    for (position, column) in table.columns().iter().enumerate() {
+        if !column.is_array()
+            && custom_chain(source, position).is_none()
+            && !builtin(&column.ty_str)
+        {
+            crate::bail_parse_error!(
+                "unknown datatype for {}.{}: \"{}\"",
+                table.name,
+                column.name.as_deref().unwrap_or(""),
+                column.ty_str
+            );
+        }
+    }
+    Ok(())
 }
 
 /// STRICT: check each value of the row in `start..` against its column's

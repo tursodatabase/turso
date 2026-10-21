@@ -48,11 +48,7 @@ pub(super) fn needs_legacy(
 ) -> Result<bool> {
     let document = &plan.document;
     // Like legacy, writes to a virtual table record no change data.
-    if let Some(table) = super::dml::virtual_target(document, insert.target)? {
-        if super::dml::virtual_needs_legacy(&table) {
-            super::note_fallback("INSERT into sqlite_dbpage")?;
-            return Ok(true);
-        }
+    if super::dml::virtual_target(document, insert.target)?.is_some() {
         return Ok(false);
     }
     let Some(source) = document.source(insert.target) else {
@@ -72,22 +68,7 @@ pub(super) fn needs_legacy(
     if !table.has_rowid {
         without_rowid_errors(program, insert, source)?;
     }
-    if super::dml::strict_needs_legacy(&table, source) {
-        super::note_fallback("INSERT into a STRICT table with custom types")?;
-        return Ok(true);
-    }
-    // Custom types are lowered unless a virtual column has one.
-    if super::dml::has_custom_types(source) {
-        let custom_virtual = table
-            .columns()
-            .iter()
-            .zip(&source.column_type_programs)
-            .any(|(column, programs)| column.is_virtual_generated() && programs.is_some());
-        if custom_virtual {
-            super::note_fallback("INSERT into a table with a custom-typed virtual column")?;
-        }
-        return Ok(custom_virtual);
-    }
+    super::dml::check_strict_types(&table, source)?;
     Ok(false)
 }
 
@@ -385,7 +366,7 @@ fn emit_virtual_insert(
     insert: &hir::Insert,
     table: &crate::sync::Arc<crate::vtab::VirtualTable>,
 ) -> Result<()> {
-    if table.readonly() {
+    if table.readonly() && !program.dbpage_writable() {
         crate::bail_constraint_error!("Table is read-only: {}", table.name);
     }
     let document = &plan.document;

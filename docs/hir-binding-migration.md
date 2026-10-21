@@ -93,9 +93,16 @@ Audited on 2026-10-21 from `translate_statement`:
   with `TURSO_HIR_NO_FALLBACK` set the statement fails with it instead, so
   running the suites with the variable set lists what still needs legacy.
   On 2026-10-21 nothing in the conformance corpora or the integration suite
-  does: what is left are writes to `sqlite_dbpage`, STRICT tables with a
-  type name that is neither built in nor custom, custom-typed virtual
-  columns, and targets with views built by another DBSP version.
+  does, and only UPDATE ... FROM of a virtual table is left. The guards that
+  went with it: `sqlite_dbpage` is written through HIR under the same rule as
+  legacy (a cli_only build opened with unsafe testing on); a STRICT column
+  whose type is neither built in nor custom, which CREATE TABLE rejects, is
+  an error; a target with materialized views built by another DBSP version
+  gets legacy's error; and a virtual column of a custom type holds the value
+  its expression computes from the decoded columns it reads, which is what
+  it shows, what its index stores and what a seek looks for (legacy decodes
+  the computed value once more, so `cents AS (a * 2)` reads 0 while its
+  index holds 4 and a seek looks for 400).
 - A CTE a DML statement reads more than once, in UPDATE ... FROM and in its
   expression subqueries, is filled once before any row changes, as legacy
   fills it, so every reader sees the same rows; a correlated subquery still

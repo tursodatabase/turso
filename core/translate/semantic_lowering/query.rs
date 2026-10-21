@@ -676,7 +676,15 @@ impl SeekExpressionLowering<hir::Expr> for HirSeekExpressionLowering<'_> {
             else {
                 continue;
             };
-            if programs.encode.is_empty() {
+            // A virtual column's index holds its computed value, which is
+            // not encoded (see `column_child`).
+            let computed = matches!(
+                self.source
+                    .generated_expressions
+                    .get(index_column.pos_in_table),
+                Some(hir::ColumnReadExpression::Planned(_))
+            );
+            if programs.encode.is_empty() || computed {
                 continue;
             }
             let register = start_reg + position;

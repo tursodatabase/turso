@@ -304,9 +304,7 @@ pub(crate) fn translate_delete(
             "HIR DELETE got another statement".into(),
         ));
     };
-    if target_needs_legacy(schema, connection, tbl_name)? {
-        return Ok(false);
-    }
+    check_target(schema, connection, tbl_name, "DELETE from table")?;
     let session = HirSession::new(schema, settings, connection)?;
     let plan = session.plan(SemanticRootInput::Statement(statement))?;
     let (HirRoot::Delete(delete), HirRootPlan::Delete(access)) = (&plan.document.root, &plan.root)
@@ -315,6 +313,9 @@ pub(crate) fn translate_delete(
             "HIR DELETE analysis did not produce a DELETE root".into(),
         ));
     };
+    if let Some(table) = dml::virtual_target(&plan.document, delete.target)? {
+        program.set_dbpage_writable(dml::dbpage_write_allowed(&table, connection));
+    }
     if delete::needs_legacy(&plan.document, delete, access)? {
         return Ok(false);
     }
@@ -371,12 +372,15 @@ fn translate_update_with(
             "HIR UPDATE got another statement".into(),
         ));
     };
-    if schema_change.is_none() && target_needs_legacy(schema, connection, &syntax.tbl_name)? {
-        return Ok(false);
+    if schema_change.is_none() {
+        check_target(schema, connection, &syntax.tbl_name, "UPDATE table")?;
     }
     let session = HirSession::new(schema, settings, connection)?;
     let plan = session.plan(SemanticRootInput::Statement(statement))?;
     let (update, access) = update::update_root(&plan)?;
+    if let Some(table) = dml::virtual_target(&plan.document, update.target)? {
+        program.set_dbpage_writable(dml::dbpage_write_allowed(&table, connection));
+    }
     let mvcc = uses_mvcc(connection, &plan.document, update.target);
     if update::needs_legacy(&plan, update, access)? {
         return Ok(false);
@@ -417,12 +421,13 @@ pub(crate) fn translate_insert(
             "HIR INSERT got another statement".into(),
         ));
     };
-    if target_needs_legacy(schema, connection, tbl_name)? {
-        return Ok(false);
-    }
+    check_target(schema, connection, tbl_name, "INSERT into table")?;
     let session = HirSession::new(schema, settings, connection)?;
     let plan = session.plan(SemanticRootInput::Statement(statement))?;
     let insert = insert::insert_root(&plan)?;
+    if let Some(table) = dml::virtual_target(&plan.document, insert.target)? {
+        program.set_dbpage_writable(dml::dbpage_write_allowed(&table, connection));
+    }
     if insert::needs_legacy(&plan, insert, program)? {
         return Ok(false);
     }
@@ -472,11 +477,12 @@ pub(super) fn note_fallback(reason: &str) -> Result<()> {
     Ok(())
 }
 
-fn target_needs_legacy(
+fn check_target(
     schema: &Schema,
     connection: &Connection,
     name: &ast::QualifiedName,
-) -> Result<bool> {
+    statement: &str,
+) -> Result<()> {
     let table_name = crate::util::normalize_ident(name.name.as_str());
     // Like legacy, the statements the engine runs itself, such as VACUUM's,
     // may write its internal tables.
@@ -499,12 +505,19 @@ fn target_needs_legacy(
         crate::bail_parse_error!("materialized views on WITHOUT ROWID tables are not supported");
     }
     // The VM keeps dependent materialized views up to date as rows are
-    // written; legacy reports views built by another DBSP version.
-    if schema.with_incompatible_dependent_views(&table_name, |views| !views.is_empty()) {
-        note_fallback("target has materialized views built by another DBSP version")?;
-        return Ok(true);
-    }
-    Ok(false)
+    // written; like legacy, views built by another DBSP version are an error.
+    schema.with_incompatible_dependent_views(&table_name, |views| {
+        if views.is_empty() {
+            return Ok(());
+        }
+        use crate::incremental::compiler::DBSP_CIRCUIT_VERSION;
+        crate::bail_parse_error!(
+            "Cannot {statement} '{table_name}' because it has incompatible dependent materialized view(s): {}. \n\
+             These views were created with a different DBSP version than the current version ({DBSP_CIRCUIT_VERSION}). \n\
+             Please DROP and recreate the view(s) before modifying this table.",
+            views.iter().map(|view| view.as_str()).collect::<Vec<_>>().join(", "),
+        );
+    })
 }
 
 /// What every HIR document of one statement is analyzed and planned with:

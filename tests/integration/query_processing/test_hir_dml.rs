@@ -2501,3 +2501,56 @@ fn hir_dml_through_an_index_method_matches_legacy() {
         assert_eq!(hir_results, legacy_results, "{statements:?}");
     }
 }
+
+/// A virtual column of a custom type holds the value its expression
+/// computes from the decoded columns it reads: that value is what the
+/// column shows, what its index stores, and what a seek on the index looks
+/// for. Legacy decodes the computed value once more, so `cents AS (a * 2)`
+/// reads 0 while its index holds 4 and a seek looks for 400.
+#[test]
+fn hir_custom_typed_virtual_columns_keep_their_computed_value() {
+    let db = TempDatabase::builder()
+        .with_opts(
+            turso_core::DatabaseOpts::new()
+                .with_custom_types(true)
+                .with_generated_columns(true),
+        )
+        .build();
+    let conn = db.connect_limbo();
+    conn.set_experimental_hir(true);
+    for sql in [
+        "CREATE TYPE cents BASE integer ENCODE value * 100 DECODE value / 100",
+        "CREATE TABLE t(id INTEGER PRIMARY KEY, a cents, v cents AS (a * 2), w INTEGER AS (a + 1)) \
+         STRICT",
+        "CREATE INDEX tv ON t(v)",
+        "INSERT INTO t VALUES (1, 2), (2, 3)",
+        "UPDATE t SET a = 5 WHERE id = 1",
+        "INSERT INTO t VALUES (1, 7) ON CONFLICT DO UPDATE SET a = excluded.a",
+    ] {
+        limbo_exec_rows(&conn, sql);
+    }
+    let rows = |sql| {
+        limbo_exec_rows(&conn, sql)
+            .into_iter()
+            .map(|row| format!("{row:?}"))
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        rows("SELECT id, a, v, w FROM t ORDER BY id"),
+        [
+            "[Integer(1), Integer(7), Integer(14), Integer(8)]",
+            "[Integer(2), Integer(3), Integer(6), Integer(4)]"
+        ]
+    );
+    assert_eq!(
+        rows("SELECT id FROM t INDEXED BY tv WHERE v = 14"),
+        ["[Integer(1)]"]
+    );
+    assert_eq!(
+        rows("SELECT id FROM t WHERE v BETWEEN 5 AND 7"),
+        ["[Integer(2)]"]
+    );
+    limbo_exec_rows(&conn, "DELETE FROM t WHERE v = 14");
+    assert_eq!(rows("SELECT id FROM t"), ["[Integer(2)]"]);
+    assert_eq!(rows("PRAGMA integrity_check"), ["[Text(\"ok\")]"]);
+}

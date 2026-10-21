@@ -525,10 +525,11 @@ impl<'expr> ExprLowerer<'_, 'expr, '_> {
         let source = self.document.source(reference.source)?;
         let generated = source.generated_expressions.get(reference.column)?;
         if let hir::ColumnReadExpression::Planned(expression) = generated {
-            if index == 0 {
-                return Some(ColumnChild::Generated(expression));
-            }
-            index -= 1;
+            // A virtual column is computed from the decoded columns it reads
+            // and never stored, so its value is neither decoded nor given a
+            // default. Legacy decodes it once more and reads 0 for
+            // `cents AS (a * 2)`, while its index holds 4.
+            return (index == 0).then_some(ColumnChild::Generated(expression));
         }
 
         let column = source.columns.get(reference.column)?;
@@ -3115,14 +3116,17 @@ impl ExprLowerer<'_, '_, '_> {
                 reference.source, reference.column
             )));
         }
-        let encoded_default = matches!(default, hir::ColumnReadExpression::Planned(_))
+        let computed = matches!(generated, hir::ColumnReadExpression::Planned(_));
+        let encoded_default = !computed
+            && matches!(default, hir::ColumnReadExpression::Planned(_))
             && type_program
                 .as_ref()
                 .is_some_and(|programs| !programs.encode.is_empty());
 
         let suppress_custom_type_decode = self.program.flags.suppress_custom_type_decode();
+        // See `column_child`: a virtual column's value is not decoded.
         let decode_children =
-            if column.type_fact.array_dimensions > 0 || suppress_custom_type_decode {
+            if column.type_fact.array_dimensions > 0 || suppress_custom_type_decode || computed {
                 0
             } else {
                 type_program.as_ref().map_or(0, |programs| {

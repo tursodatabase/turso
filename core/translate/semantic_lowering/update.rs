@@ -54,13 +54,9 @@ pub(super) fn needs_legacy(
         return Ok(true);
     }
     // Like legacy, writes to a virtual table record no change data.
-    if let Some(table) = super::dml::virtual_target(document, update.target)? {
+    if super::dml::virtual_target(document, update.target)?.is_some() {
         if update.from.is_some() {
             super::note_fallback("UPDATE ... FROM of a virtual table")?;
-            return Ok(true);
-        }
-        if super::dml::virtual_needs_legacy(&table) {
-            super::note_fallback("UPDATE of sqlite_dbpage")?;
             return Ok(true);
         }
         return Ok(false);
@@ -79,25 +75,12 @@ pub(super) fn needs_legacy(
         super::note_fallback("UPDATE of a table without a B-tree")?;
         return Ok(true);
     };
-    if super::dml::strict_needs_legacy(&table, source) {
-        super::note_fallback("UPDATE of a STRICT table with custom types")?;
+    super::dml::check_strict_types(&table, source)?;
+    if super::dml::has_custom_types(source)
+        && !matches!(update.target_kind, hir::UpdateTargetKind::BTree { .. })
+    {
+        super::note_fallback("UPDATE with custom types of a target that is not a B-tree")?;
         return Ok(true);
-    }
-    // Custom types are lowered unless a virtual column has one.
-    if super::dml::has_custom_types(source) {
-        if !matches!(update.target_kind, hir::UpdateTargetKind::BTree { .. }) {
-            super::note_fallback("UPDATE with custom types of a target that is not a B-tree")?;
-            return Ok(true);
-        }
-        let custom_virtual = table
-            .columns()
-            .iter()
-            .zip(&source.column_type_programs)
-            .any(|(column, programs)| column.is_virtual_generated() && programs.is_some());
-        if custom_virtual {
-            super::note_fallback("UPDATE of a table with a custom-typed virtual column")?;
-            return Ok(true);
-        }
     }
     if update.from.is_some() {
         // UPDATE ... FROM fills a scratch table during the join, so no loop
@@ -498,7 +481,7 @@ fn emit_virtual_update(
     if update.returning.is_some() {
         crate::bail_parse_error!("UPDATE RETURNING is not available on virtual tables");
     }
-    if table.readonly() {
+    if table.readonly() && !program.dbpage_writable() {
         return Err(LimboError::ReadOnly);
     }
     let document = &plan.document;
