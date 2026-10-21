@@ -28,6 +28,8 @@ The UUID extension provides functions for generating and working with UUIDs. UUI
 | `uuid4_str()` | none | TEXT | Generate a random UUID v4 as string. Alias: `gen_random_uuid()` |
 | `uuid7()` | none | BLOB | Generate a time-ordered UUID v7 |
 | `uuid7(seconds)` | INTEGER | BLOB | Generate a UUID v7 with specified seconds since epoch |
+| `uuid7_str()` | none | TEXT | Generate a time-ordered UUID v7 as string |
+| `uuid7_str(seconds)` | INTEGER or TEXT | TEXT | Generate a UUID v7 with specified seconds since epoch, as string; errors with `Invalid timestamp` for arguments outside the representable range |
 | `uuid7_timestamp_ms(uuid)` | BLOB | INTEGER | Extract milliseconds since epoch from a UUID v7 |
 | `uuid_str(uuid)` | BLOB | TEXT | Convert a UUID blob to string representation |
 | `uuid_blob(uuid)` | TEXT | BLOB | Convert a UUID string to blob representation |
