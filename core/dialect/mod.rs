@@ -18,6 +18,15 @@ pub use sqlite::SqliteDialect;
 /// stores in `sqlite_schema`.
 pub const POSTGRES_TABLE_SQL_PREFIX: &str = "/* turso_frontend:postgres */ ";
 
+/// The functions that `CREATE FUNCTION` stored, as a statement finds them.
+pub trait FunctionCatalog {
+    fn find_function(
+        &self,
+        call_name: &str,
+        arg_count: usize,
+    ) -> Option<crate::sync::Arc<crate::schema::FunctionDef>>;
+}
+
 /// SQL dialect layered on top of the engine.
 ///
 /// Every [`crate::Database`] carries a dialect, supplied explicitly by
@@ -165,11 +174,13 @@ pub trait Dialect: Send + Sync + 'static {
     }
 
     /// Compile a call to a function that `CREATE FUNCTION` stored into the
-    /// expression that the engine evaluates in place of the call.
+    /// expression that the engine evaluates in place of the call. `functions`
+    /// finds the other stored functions that the statement can call.
     fn compile_function_call(
         &self,
         function: &crate::schema::FunctionDef,
         _args: &[Box<turso_parser::ast::Expr>],
+        _functions: &dyn FunctionCatalog,
     ) -> crate::Result<turso_parser::ast::Expr> {
         Err(crate::LimboError::ParseError(format!(
             "cannot execute function {}()",
@@ -307,7 +318,14 @@ mod tests {
             &self,
             function: &crate::schema::FunctionDef,
             args: &[Box<turso_parser::ast::Expr>],
+            functions: &dyn FunctionCatalog,
         ) -> crate::Result<turso_parser::ast::Expr> {
+            if let Some(other) = function.definition.strip_prefix("exists:") {
+                let exists = functions.find_function(other, 1).is_some();
+                return Ok(turso_parser::ast::Expr::Literal(
+                    turso_parser::ast::Literal::Numeric(i64::from(exists).to_string()),
+                ));
+            }
             let addend = turso_parser::ast::Expr::Literal(turso_parser::ast::Literal::Numeric(
                 function.definition.clone(),
             ));
@@ -565,10 +583,19 @@ mod tests {
         or_replace: bool,
         definition: &str,
     ) -> crate::Result<()> {
+        create_named_function(conn, "add_n", or_replace, definition)
+    }
+
+    fn create_named_function(
+        conn: &Arc<crate::Connection>,
+        name: &str,
+        or_replace: bool,
+        definition: &str,
+    ) -> crate::Result<()> {
         let stmt = turso_parser::ast::Stmt::CreateFunction {
             or_replace,
             func_name: turso_parser::ast::QualifiedName::single(
-                turso_parser::ast::Name::from_string("add_n"),
+                turso_parser::ast::Name::from_string(name),
             ),
             arg_count: 1,
             definition: definition.to_string(),
@@ -692,6 +719,29 @@ mod tests {
             error.to_string().contains("no such function: add_n"),
             "unexpected error: {error}"
         );
+        conn.close().unwrap();
+    }
+
+    #[test]
+    fn dialect_finds_other_stored_functions() {
+        let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+        let db = open_db(
+            &io,
+            "dialect-function-catalog.db",
+            Arc::new(TestDialect::default()),
+        )
+        .unwrap();
+        let conn = db.connect(ConnectOpts::new()).unwrap();
+        create_named_function(&conn, "has_add_n", false, "exists:add_n").unwrap();
+        let has_add_n = |conn: &Arc<crate::Connection>| {
+            conn.prepare("SELECT has_add_n(0)")
+                .unwrap()
+                .run_collect_rows()
+                .unwrap()
+        };
+        assert_eq!(has_add_n(&conn), vec![vec![crate::Value::from_i64(0)]]);
+        create_function(&conn, false, "1").unwrap();
+        assert_eq!(has_add_n(&conn), vec![vec![crate::Value::from_i64(1)]]);
         conn.close().unwrap();
     }
 

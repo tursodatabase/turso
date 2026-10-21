@@ -1,6 +1,7 @@
 use pg_query::protobuf::node::Node;
 use pg_query::protobuf::{CreateFunctionStmt, FunctionParameter, FunctionParameterMode, TypeName};
 use pg_query::NodeRef;
+use turso_core::dialect::FunctionCatalog;
 use turso_core::schema::FunctionDef;
 use turso_core::{LimboError, Result};
 use turso_parser::ast;
@@ -161,6 +162,7 @@ impl UserFunction {
 pub(crate) fn compile_function_call(
     function: &FunctionDef,
     _args: &[Box<ast::Expr>],
+    _functions: &dyn FunctionCatalog,
 ) -> Result<ast::Expr> {
     let user_function = UserFunction::parse(function)?;
     if user_function.is_procedure() {

@@ -1115,6 +1115,13 @@ impl<'a> Resolver<'a> {
     }
 }
 
+impl crate::dialect::FunctionCatalog for Resolver<'_> {
+    fn find_function(&self, call_name: &str, arg_count: usize) -> Option<Arc<FunctionDef>> {
+        self.find_catalog_function(call_name, arg_count)
+            .map(|(_, function)| function)
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct LimitCtx {
     /// Register holding the LIMIT value (e.g. LIMIT 5)

@@ -5,7 +5,7 @@ use std::fmt::Debug;
 use std::marker::PhantomData;
 use std::sync::Arc;
 use turso_core::{
-    dialect::POSTGRES_TABLE_SQL_PREFIX,
+    dialect::{FunctionCatalog, POSTGRES_TABLE_SQL_PREFIX},
     native_ext::{VirtualTable, VirtualTableCursor, VirtualTableModule},
     schema::{BTreeTable, FunctionDef, Index, Schema, Table},
     Connection, Dialect, Func, IOResult, LimboError, OpenOptions, Result, Statement, Value,
@@ -167,8 +167,9 @@ impl Dialect for PostgresDialect {
         &self,
         function: &FunctionDef,
         args: &[Box<turso_parser::ast::Expr>],
+        functions: &dyn FunctionCatalog,
     ) -> Result<turso_parser::ast::Expr> {
-        crate::user_function::compile_function_call(function, args)
+        crate::user_function::compile_function_call(function, args, functions)
     }
 
     fn requires_custom_types(&self) -> bool {

@@ -2205,7 +2205,9 @@ fn translate_catalog_function_call(
         crate::bail_parse_error!("{}() is not an aggregate function", function.name);
     }
     resolver.with_catalog_function(&function, || {
-        let body = resolver.dialect.compile_function_call(&function, args)?;
+        let body = resolver
+            .dialect
+            .compile_function_call(&function, args, resolver)?;
         translate_expr(program, referenced_tables, &body, target_register, resolver)
     })
 }
