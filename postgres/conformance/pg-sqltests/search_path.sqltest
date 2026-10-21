@@ -162,3 +162,28 @@ test create-table-with-no-existing-schema-in-search-path-errors {
 expect error {
     no schema has been selected to create in
 }
+
+test create-index-follows-table-schema-in-search-path {
+    CREATE SCHEMA IF NOT EXISTS sp_ci;
+    DROP TABLE IF EXISTS sp_ci.t;
+    CREATE TABLE sp_ci.t (x int);
+    SET search_path TO sp_ci, public;
+    CREATE INDEX t_x_idx ON t (x);
+    SELECT count(*) FROM pg_indexes WHERE schemaname = 'public' AND indexname = 't_x_idx';
+    DROP INDEX sp_ci.t_x_idx;
+    CREATE UNIQUE INDEX t_x_idx ON t (x);
+    DROP INDEX t_x_idx;
+}
+expect {
+    0
+}
+
+test create-index-skips-missing-schema-in-search-path {
+    CREATE TABLE t (x int);
+    SET search_path TO sp_missing_ci, public;
+    CREATE INDEX t_x_idx ON t (x);
+    SELECT schemaname, tablename FROM pg_indexes WHERE indexname = 't_x_idx';
+}
+expect {
+    public|t
+}
