@@ -327,6 +327,25 @@ PRAGMA data_sync_retry = 1;   -- retry on sync failure
 PRAGMA data_sync_retry = 0;   -- do not retry (default)
 ```
 
+### fullfsync
+
+<Warning>
+**Apple platforms only.** `F_FULLFSYNC` is a macOS and iOS system call. On other platforms
+Turso does not know the pragma name and ignores the statement, like any other unknown
+pragma, so it silently does nothing there.
+</Warning>
+
+On Apple platforms, enabling this makes Turso use `F_FULLFSYNC` instead of `fsync` when it
+syncs the database file, which also asks the storage device to flush its own cache to
+media. Off by default. It changes which sync call is used, not when the sync happens:
+`synchronous` still decides that.
+
+```sql
+PRAGMA fullfsync;        -- 0
+PRAGMA fullfsync = 1;    -- use F_FULLFSYNC
+PRAGMA fullfsync = off;  -- use fsync again
+```
+
 ### require_where
 
 <Info>
