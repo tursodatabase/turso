@@ -16745,6 +16745,7 @@ pub fn op_open_ephemeral(
                 Arc::new(SharedPagerState::new(Some(default_page1(None)))),
             )?);
 
+            pager.mark_ephemeral();
             pager.set_initial_page_size(page_size)?;
 
             *state.active_op_state.open_ephemeral() = OpOpenEphemeralState::StartingTxn {
