@@ -6,7 +6,7 @@ use crate::{
     schema::{BTreeTable, Index, RESERVED_TABLE_PREFIXES},
     storage::pager::CreateBTreeFlags,
     translate::{
-        emitter::{ResolvedName, Resolver},
+        emitter::Resolver,
         schema::{emit_schema_entry, SchemaEntryType, SQLITE_TABLEID},
     },
     util::normalize_ident,
@@ -72,7 +72,7 @@ fn resolve_analyze_targets(
             // same database order as other unqualified names (temp first).
             let index = resolver
                 .find_existing_index(target)?
-                .unwrap_or_else(|| ResolvedName::in_database(crate::MAIN_DB_ID, &normalized));
+                .unwrap_or_else(|| resolver.resolved_in_database(crate::MAIN_DB_ID, &normalized));
             if let Some(target) =
                 find_index_target(&index.stored_name, index.database_id(), resolver)
             {
@@ -80,7 +80,7 @@ fn resolve_analyze_targets(
             }
             let table = resolver
                 .find_existing_table(target)?
-                .unwrap_or_else(|| ResolvedName::in_database(crate::MAIN_DB_ID, &normalized));
+                .unwrap_or_else(|| resolver.resolved_in_database(crate::MAIN_DB_ID, &normalized));
             let targets = resolve_targets_in_db(&table.stored_name, table.database_id(), resolver)?;
             if targets.is_empty() {
                 bail_parse_error!("no such table or index: {}", target.name);

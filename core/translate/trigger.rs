@@ -274,7 +274,7 @@ fn resolve_create_trigger(
 ) -> Result<ResolvedName> {
     // TEMP triggers always live in the temp schema.
     if temporary {
-        return Ok(ResolvedName::in_database(
+        return Ok(resolver.resolved_in_database(
             crate::TEMP_DB_ID,
             &normalize_ident(trigger_name.name.as_str()),
         ));
@@ -289,10 +289,7 @@ fn resolve_create_trigger(
         crate::TEMP_DB_ID => crate::TEMP_DB_ID,
         _ => crate::MAIN_DB_ID,
     };
-    Ok(ResolvedName::in_database(
-        database_id,
-        &normalize_ident(trigger_name.name.as_str()),
-    ))
+    Ok(resolver.resolved_in_database(database_id, &normalize_ident(trigger_name.name.as_str())))
 }
 
 /// Validate that no table or expression reference in a trigger body points to a
