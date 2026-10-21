@@ -617,6 +617,36 @@ fn test_pg_stored_types_are_loaded_after_a_checkpoint_when_the_database_opens_ag
     assert_eq!(query_text(&conn, "SELECT m FROM feelings"), vec!["ok"]);
 }
 
+#[turso_macros::test(mvcc)]
+fn test_pg_stored_functions_are_loaded_when_the_database_opens_again(db: TempDatabase) {
+    let conn = db.connect_postgres();
+    conn.execute("CREATE FUNCTION add1(a int) RETURNS int LANGUAGE sql AS 'SELECT a + 1'")
+        .unwrap();
+    let conn = reopen(db, conn);
+    assert_eq!(query_integer(&conn, "SELECT add1(1)"), vec![2]);
+}
+
+#[turso_macros::test(mvcc)]
+fn test_pg_stored_functions_and_types_are_loaded_after_a_checkpoint_when_the_database_opens_again(
+    db: TempDatabase,
+) {
+    let conn = db.connect_postgres();
+    conn.execute("CREATE FUNCTION add1(a int) RETURNS int LANGUAGE sql AS 'SELECT a + 1'")
+        .unwrap();
+    conn.execute("CREATE TYPE mood AS ENUM ('sad', 'ok')")
+        .unwrap();
+    conn.execute("CREATE TABLE feelings (m mood)").unwrap();
+    conn.execute("INSERT INTO feelings VALUES ('ok')").unwrap();
+    conn.inner()
+        .checkpoint(turso_core::CheckpointMode::Truncate {
+            upper_bound_inclusive: None,
+        })
+        .unwrap();
+    let conn = reopen(db, conn);
+    assert_eq!(query_integer(&conn, "SELECT add1(1)"), vec![2]);
+    assert_eq!(query_text(&conn, "SELECT m FROM feelings"), vec!["ok"]);
+}
+
 /// Close the database of `db` and open it again from its file.
 fn reopen(db: TempDatabase, conn: PgConnection) -> PgConnection {
     let path = db.path.clone();

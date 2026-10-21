@@ -21,6 +21,14 @@ impl Volatility {
             Self::Volatile => "v",
         }
     }
+
+    pub(crate) fn keyword(self) -> &'static str {
+        match self {
+            Self::Immutable => "IMMUTABLE",
+            Self::Stable => "STABLE",
+            Self::Volatile => "VOLATILE",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -161,8 +169,8 @@ impl UserFunction {
 
 pub(crate) fn compile_function_call(
     function: &FunctionDef,
-    _args: &[Box<ast::Expr>],
-    _functions: &dyn FunctionCatalog,
+    args: &[Box<ast::Expr>],
+    functions: &dyn FunctionCatalog,
 ) -> Result<ast::Expr> {
     let user_function = UserFunction::parse(function)?;
     if user_function.is_procedure() {
@@ -171,12 +179,13 @@ pub(crate) fn compile_function_call(
             function.name
         )));
     }
-    let reason = match user_function.language {
-        Language::Sql => "SQL functions are not supported yet",
-        Language::Plpgsql => "PL/pgSQL functions can run only as triggers",
-    };
-    Err(LimboError::ParseError(format!(
-        "cannot execute function {}(): {reason}",
-        function.name
-    )))
+    match user_function.language {
+        Language::Sql => {
+            crate::sql_function::inline_sql_function(function, &user_function, args, functions)
+        }
+        Language::Plpgsql => Err(LimboError::ParseError(format!(
+            "cannot execute function {}(): PL/pgSQL functions can run only as triggers",
+            function.name
+        ))),
+    }
 }

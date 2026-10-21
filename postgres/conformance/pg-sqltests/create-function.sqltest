@@ -148,6 +148,21 @@ expect error {
     does not exist
 }
 
+test create-function-without-a-schema-uses-the-first-schema-of-search-path {
+    CREATE SCHEMA IF NOT EXISTS fn_path_schema;
+    DROP FUNCTION IF EXISTS fn_path_schema.path_function();
+    DROP FUNCTION IF EXISTS public.path_function();
+    SET search_path TO fn_path_missing, fn_path_schema, public;
+    CREATE FUNCTION path_function() RETURNS int LANGUAGE sql AS 'SELECT 42';
+    SELECT count(*) FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace
+    WHERE p.proname = 'path_function' AND n.nspname = 'public';
+    SELECT fn_path_schema.path_function();
+}
+expect {
+    0
+    42
+}
+
 test create-function-without-a-schema-errors-when-no-schema-of-search-path-exists {
     SET search_path TO fn_path_missing;
     CREATE FUNCTION path_function() RETURNS int LANGUAGE sql AS 'SELECT 42';
@@ -156,13 +171,185 @@ expect error {
     no schema has been selected to create in
 }
 
-@skip-if postgres "PostgreSQL executes SQL functions that Turso cannot inline yet"
-test call-of-a-function-that-turso-cannot-execute-errors {
-    CREATE FUNCTION add_tax(p numeric) RETURNS numeric LANGUAGE sql AS 'SELECT p * 1.2';
+test sql-function-with-one-expression-returns-its-value {
+    CREATE FUNCTION add_tax(p numeric) RETURNS numeric LANGUAGE sql IMMUTABLE AS 'SELECT p * 1.2';
     SELECT add_tax(10);
 }
+expect {
+    12.0
+}
+
+test strict-sql-function-returns-null-for-a-null-argument {
+    CREATE FUNCTION add_tax(p numeric) RETURNS numeric LANGUAGE sql STRICT AS 'SELECT coalesce(p, 0) * 1.2';
+    SELECT coalesce(add_tax(NULL)::text, 'null'), add_tax(10);
+}
+expect {
+    null|12.0
+}
+
+test sql-function-reads-parameters-by-position-and-by-qualified-name {
+    CREATE FUNCTION weigh(a int, b int) RETURNS int LANGUAGE sql AS 'SELECT $1 * 10 + weigh.b';
+    SELECT weigh(4, 2);
+}
+expect {
+    42
+}
+
+test sql-function-with-return-statement-body {
+    CREATE FUNCTION next_number(int) RETURNS int RETURN $1 + 1;
+    SELECT next_number(41);
+}
+expect {
+    42
+}
+
+test sql-function-runs-for-each-row {
+    CREATE TABLE people (name text);
+    INSERT INTO people VALUES ('bob'), ('ann');
+    CREATE FUNCTION greet(name text) RETURNS text LANGUAGE sql IMMUTABLE AS $$ SELECT 'hello ' || name $$;
+    SELECT greet(name) FROM people ORDER BY 1;
+}
+expect {
+    hello ann
+    hello bob
+}
+
+test sql-function-calls-another-sql-function {
+    CREATE TABLE people (name text);
+    INSERT INTO people VALUES ('bo'), ('ann');
+    CREATE FUNCTION greet(name text) RETURNS text LANGUAGE sql IMMUTABLE AS $$ SELECT 'hi ' || name $$;
+    CREATE FUNCTION is_long(name text) RETURNS boolean LANGUAGE sql STABLE AS $$ SELECT length(greet(name)) > 5 $$;
+    SELECT name FROM people WHERE is_long(name) ORDER BY 1;
+}
+expect {
+    ann
+}
+
+test sql-function-call-can-be-an-argument-of-a-call-of-the-same-function {
+    CREATE FUNCTION add1(a int) RETURNS int LANGUAGE sql IMMUTABLE AS 'SELECT a + 1';
+    CREATE FUNCTION add1_twice(a int) RETURNS int LANGUAGE sql IMMUTABLE AS 'SELECT add1(a) + add1(a)';
+    SELECT add1(add1(1)), add1_twice(1), add1(add1_twice(1));
+}
+expect {
+    3|4|5
+}
+
+test sql-function-can-call-a-function-with-the-same-name-and-other-arguments {
+    CREATE FUNCTION total_of(a int, b int) RETURNS int LANGUAGE sql AS 'SELECT a + b';
+    CREATE FUNCTION total_of(a int) RETURNS int LANGUAGE sql AS 'SELECT total_of(a, 10)';
+    SELECT total_of(1);
+}
+expect {
+    11
+}
+
+test sql-function-can-call-a-function-with-the-same-name-in-another-schema {
+    CREATE SCHEMA IF NOT EXISTS fn_other_schema;
+    DROP FUNCTION IF EXISTS fn_other_schema.double_of(int);
+    CREATE FUNCTION fn_other_schema.double_of(a int) RETURNS int LANGUAGE sql AS 'SELECT a * 2';
+    CREATE FUNCTION double_of(a int) RETURNS int LANGUAGE sql AS 'SELECT fn_other_schema.double_of(a) + 1';
+    SELECT double_of(5);
+}
+expect {
+    11
+}
+
+test sql-function-negates-a-negative-argument {
+    CREATE FUNCTION negated(a int) RETURNS int LANGUAGE sql IMMUTABLE AS 'SELECT -a';
+    SELECT negated(-3), negated(3);
+}
+expect {
+    3|-3
+}
+
+test sql-function-converts-its-arguments-to-the-types-of-its-parameters {
+    CREATE FUNCTION ratio(a float8, b float8) RETURNS float8 LANGUAGE sql IMMUTABLE AS 'SELECT a / b';
+    CREATE FUNCTION at_least_ten(a bigint) RETURNS boolean LANGUAGE sql IMMUTABLE AS 'SELECT a >= 10';
+    SELECT ratio(1, 4),
+        CASE WHEN at_least_ten('9') THEN 'yes' ELSE 'no' END,
+        CASE WHEN at_least_ten('12') THEN 'yes' ELSE 'no' END;
+}
+expect {
+    0.25|no|yes
+}
+
+test sql-function-in-a-column-default {
+    CREATE FUNCTION default_label() RETURNS text LANGUAGE sql STABLE AS $$ SELECT 'new' $$;
+    CREATE TABLE items (id int, label text DEFAULT default_label());
+    INSERT INTO items (id) VALUES (1);
+    SELECT label FROM items;
+}
+expect {
+    new
+}
+
+# Schema databases are file-backed, so the function is dropped before each
+# create to keep repeated test runs independent of old sidecar files.
+test sql-function-in-a-schema-is-called-with-the-schema-name {
+    CREATE SCHEMA IF NOT EXISTS fn_call_schema;
+    DROP FUNCTION IF EXISTS fn_call_schema.forty_two();
+    CREATE FUNCTION fn_call_schema.forty_two() RETURNS int LANGUAGE sql AS 'SELECT 42';
+    SELECT fn_call_schema.forty_two();
+}
+expect {
+    42
+}
+
+test replaced-sql-function-changes-the-result {
+    CREATE FUNCTION get_number() RETURNS int LANGUAGE sql AS 'SELECT 1';
+    SELECT get_number();
+    CREATE OR REPLACE FUNCTION get_number() RETURNS int LANGUAGE sql AS 'SELECT 42';
+    SELECT get_number();
+}
+expect {
+    1
+    42
+}
+
+@skip-if postgres "PostgreSQL executes SQL functions that Turso cannot inline yet"
+test call-of-a-sql-function-with-from-errors {
+    CREATE TABLE people (name text);
+    CREATE FUNCTION people_count() RETURNS bigint LANGUAGE sql AS 'SELECT count(*) FROM people';
+    SELECT people_count();
+}
 expect error {
-    cannot execute function add_tax()
+    cannot execute function people_count\(\): only a body of one expression without FROM is supported
+}
+
+@skip-if postgres "PostgreSQL executes SQL functions that Turso cannot inline yet"
+test call-that-uses-a-volatile-argument-two-times-errors {
+    CREATE FUNCTION twice(x float8) RETURNS float8 LANGUAGE sql AS 'SELECT x + x';
+    SELECT twice(random());
+}
+expect error {
+    argument 1 is volatile and the body uses it more than one time
+}
+
+@skip-if postgres "PostgreSQL executes SQL functions that Turso cannot inline yet"
+test call-of-a-function-that-is-more-volatile-than-its-declaration-errors {
+    CREATE FUNCTION dice() RETURNS float8 LANGUAGE sql IMMUTABLE AS 'SELECT random()';
+    SELECT dice();
+}
+expect error {
+    the body is more volatile than the declaration IMMUTABLE
+}
+
+@skip-if postgres "PostgreSQL executes SQL functions that Turso cannot inline yet"
+test call-of-a-function-that-calls-itself-errors {
+    CREATE FUNCTION forever(x int) RETURNS int LANGUAGE sql AS 'SELECT forever(x)';
+    SELECT forever(1);
+}
+expect error {
+    cannot execute function forever\(\): it calls itself
+}
+
+@skip-if postgres "PostgreSQL executes PL/pgSQL functions"
+test call-of-a-plpgsql-function-errors {
+    CREATE FUNCTION forty_two() RETURNS int LANGUAGE plpgsql AS $$ BEGIN RETURN 42; END $$;
+    SELECT forty_two();
+}
+expect error {
+    PL/pgSQL functions can run only as triggers
 }
 
 @skip-if postgres "PostgreSQL finds a function only in the schema of the call"

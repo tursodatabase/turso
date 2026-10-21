@@ -3,6 +3,7 @@ mod copy;
 mod functions;
 mod options;
 mod session;
+mod sql_function;
 mod unnest;
 mod user_function;
 

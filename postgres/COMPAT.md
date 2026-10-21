@@ -256,7 +256,7 @@ INTEGER. Unknown type names pass through as custom types.
 | Incremental sort for SELECT DISTINCT | ❌ Not supported | |
 | Incremental sort for window functions | ❌ Not supported | |
 | Inlined WITH queries (Common Table Expressions) | ❌ Not supported | |
-| Inlining of SQL functions | ❌ Not supported | |
+| Inlining of SQL functions | 🟡 Partial | Only a body of one expression without FROM, subquery, aggregate or window function; such functions cannot run without inlining |
 | Just-in-Time (JIT) compilation for expression evaluation and tuple deforming | ❌ Not supported | |
 | Load balancing for libpq / psql | ❌ Not supported | |
 | LZ4 compression for TOAST tables | ❌ Not supported | |
@@ -454,7 +454,7 @@ Upgrade is not supported.
 | ALTER TABLE / ENABLE REPLICA TRIGGER/RULE | ❌ Not supported | |
 | BEGIN ATOMIC function bodies | ❌ Not supported | |
 | CALL syntax for executing procedures | ❌ Not supported | |
-| CREATE FUNCTION | 🟡 Partial | `LANGUAGE sql` and `LANGUAGE plpgsql` are stored and listed in `pg_proc`; a call gives an error. CREATE FUNCTION without a schema creates the function in the first schema of `search_path` that exists. Functions are found by name and argument count only, so default argument values do not make a function match fewer arguments |
+| CREATE FUNCTION | 🟡 Partial | `LANGUAGE sql` and `LANGUAGE plpgsql` are stored and listed in `pg_proc`. CREATE FUNCTION without a schema creates the function in the first schema of `search_path` that exists. A call of a SQL function whose body is one expression without FROM is inlined, with the null check of STRICT and a cast to the return type; other calls give an error. Functions are found by name and argument count only, so default argument values do not make a function match fewer arguments |
 | Column level triggers | ❌ Not supported | |
 | CREATE PROCEDURE syntax for SQL stored procedures | 🟡 Partial | Stored like functions; CALL is not supported |
 | Event triggers | ❌ Not supported | |
@@ -489,7 +489,7 @@ Upgrade is not supported.
 | pl/pgsql installed by default | ✅ Supported | `plpgsql` is in `pg_language`; see the first row for what runs |
 | Polymorphic functions | ❌ Not supported | |
 | Python 3 support for pl/python | ❌ Not supported | |
-| Qualified function parameters | ❌ Not supported | |
+| Qualified function parameters | 🟡 Partial | Inlined SQL functions read `function_name.parameter` |
 | Query parallelism for RETURN QUERY | ❌ Not supported | |
 | RETURN QUERY in pl/pgsql | ❌ Not supported | |
 | ROWS and COST specification for functions | ❌ Not supported | |

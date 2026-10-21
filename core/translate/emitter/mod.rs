@@ -212,7 +212,7 @@ pub struct Resolver<'a> {
     /// that its own action program is already being built.
     pub(super) fk_action_compile_stack: FkActionCompileStack,
     unqualified_database_search_path: Option<Vec<String>>,
-    catalog_functions_being_compiled: RefCell<Vec<String>>,
+    catalog_functions_being_compiled: RefCell<Vec<(usize, String, usize)>>,
 }
 
 #[derive(Clone)]
@@ -663,22 +663,22 @@ impl<'a> Resolver<'a> {
 
     pub(crate) fn with_catalog_function<T>(
         &self,
+        database_id: usize,
         function: &FunctionDef,
         f: impl FnOnce() -> Result<T>,
     ) -> Result<T> {
+        let key = (database_id, function.name.clone(), function.arg_count);
         if self
             .catalog_functions_being_compiled
             .borrow()
-            .contains(&function.name)
+            .contains(&key)
         {
             return Err(LimboError::ParseError(format!(
                 "cannot execute function {}(): it calls itself",
                 function.name
             )));
         }
-        self.catalog_functions_being_compiled
-            .borrow_mut()
-            .push(function.name.clone());
+        self.catalog_functions_being_compiled.borrow_mut().push(key);
         let result = f();
         self.catalog_functions_being_compiled.borrow_mut().pop();
         result
