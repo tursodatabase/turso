@@ -6,9 +6,11 @@ mod session;
 mod statement;
 mod unnest;
 
+pub use catalog::PostgresDialect;
 pub use session::PgConnection as Connection;
 pub use session::{
-    open_database, open_database_with_io, split_statements, PgConnection, PgQueryRunner,
+    inspect, open_database, open_database_with_io, split_statements, PgConnection, PgQueryRunner,
+    StatementKind,
 };
 pub use statement::Statement;
 pub use turso_core::{
