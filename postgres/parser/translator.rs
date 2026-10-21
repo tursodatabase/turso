@@ -1003,7 +1003,7 @@ impl PostgreSQLTranslator {
                     0 => return Err(ParseError::ParseError("DROP: empty name list".into())),
                     1 => ast::QualifiedName::single(ast::Name::from_string(names[0].clone())),
                     _ => ast::QualifiedName::fullname(
-                        ast::Name::from_string(names[0].clone()),
+                        ast::Name::from_string(map_schema_name(&names[0])),
                         ast::Name::from_string(names[1].clone()),
                     ),
                 }
@@ -3476,6 +3476,14 @@ impl PostgreSQLTranslator {
             .unwrap_or(&func_name)
             .to_string();
 
+        let mut args = args;
+        if matches!(
+            func_name.to_ascii_lowercase().as_str(),
+            "nextval" | "currval" | "setval"
+        ) {
+            map_sequence_name_schema(&mut args);
+        }
+
         // Rewrite PG-specific function-name spellings to their core-native
         // equivalents so the core resolver doesn't need to carry aliases
         // that only matter when a query came through the PG parser. This
@@ -4454,6 +4462,26 @@ fn join_keeps_unmatched_right_rows(join: &ast::JoinedSelectTable) -> bool {
         join.operator,
         ast::JoinOperator::TypedJoin(Some(join_type)) if join_type.contains(ast::JoinType::RIGHT)
     )
+}
+
+/// `args` of nextval, currval or setval with the schema in the sequence
+/// name mapped like the schema of a table name, so that 'public.s' names
+/// the sequence s of main.
+fn map_sequence_name_schema(args: &mut [Box<ast::Expr>]) {
+    let Some(ast::Expr::Literal(ast::Literal::String(literal))) =
+        args.first_mut().map(|arg| arg.as_mut())
+    else {
+        return;
+    };
+    let Some(unquoted) = literal
+        .strip_prefix('\'')
+        .and_then(|rest| rest.strip_suffix('\''))
+    else {
+        return;
+    };
+    if let Some((schema, name)) = unquoted.split_once('.') {
+        *literal = format!("'{}.{name}'", map_schema_name(schema));
+    }
 }
 
 /// Maps a PostgreSQL schema name to the Turso schema that holds its tables.
