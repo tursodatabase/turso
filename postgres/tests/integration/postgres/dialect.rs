@@ -3740,3 +3740,29 @@ fn test_postgres_catalog_conkey_any_matches_no_rows(db: TempDatabase) {
     let rows = stmt.run_collect_rows().unwrap();
     assert_eq!(rows, vec![vec![Value::from_i64(0)]]);
 }
+
+#[turso_macros::test(mvcc)]
+fn test_postgres_show_search_path_reads_the_setting_when_executed(db: TempDatabase) {
+    let conn = db.connect_postgres();
+    let mut show = conn.prepare("SHOW search_path").unwrap();
+    assert_eq!(show.num_columns(), 1);
+    assert_eq!(show.get_column_name(0), "search_path");
+    assert_eq!(
+        show.run_collect_rows().unwrap(),
+        vec![vec![Value::build_text("\"$user\", public")]]
+    );
+    conn.execute("SET search_path TO public, pg_catalog")
+        .unwrap();
+    show.reset().unwrap();
+    assert_eq!(
+        show.run_collect_rows().unwrap(),
+        vec![vec![Value::build_text("public, pg_catalog")]]
+    );
+    assert_eq!(
+        conn.prepare("SHOW SEARCH_PATH")
+            .unwrap()
+            .run_collect_rows()
+            .unwrap(),
+        vec![vec![Value::build_text("public, pg_catalog")]]
+    );
+}

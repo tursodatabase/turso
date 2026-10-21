@@ -4,12 +4,14 @@ use std::str;
 use std::sync::{Arc, Mutex};
 
 use crate::catalog::{self, PostgresDialect};
+use crate::functions::ConfigParameter;
 use turso_core::{Connection, LimboError, PrepareOptions, Result, Statement, Value};
 use turso_parser::ast::{self};
 use turso_pg_parser::translator::{
     is_comment_on, is_refresh_matview, is_set_transaction, try_extract_copy_from,
     try_extract_create_schema, try_extract_drop_schema, try_extract_set, try_extract_show,
-    PgCopyFromStmt, PgCreateSchemaStmt, PgDropSchemaStmt, PgSetStmt, PostgreSQLTranslator,
+    PgCopyFromStmt, PgCreateSchemaStmt, PgDropSchemaStmt, PgSetStmt, PgShowStmt,
+    PostgreSQLTranslator,
 };
 
 use crate::copy::parse_copy_text_format;
@@ -262,8 +264,7 @@ fn try_prepare_special(pg_conn: &Arc<PgConnectionInner>, sql: &str) -> Result<Op
     }
 
     if let Some(show_stmt) = try_extract_show(&parse_result) {
-        let pragma_sql = format!("PRAGMA {}", show_stmt.name);
-        return Ok(Some(pg_conn.conn.prepare(&pragma_sql)?));
+        return Ok(Some(handle_pg_show(pg_conn, &show_stmt)?));
     }
 
     if let Some(stmt) = try_extract_create_schema(&parse_result) {
@@ -329,6 +330,15 @@ fn handle_pg_set(pg_conn: &Arc<PgConnectionInner>, set_stmt: &PgSetStmt) -> Resu
     })?;
     let pragma_sql = format!("PRAGMA {} = {}", set_stmt.name, value.to_sql_string());
     pg_conn.conn.prepare(&pragma_sql)
+}
+
+fn handle_pg_show(pg_conn: &Arc<PgConnectionInner>, show_stmt: &PgShowStmt) -> Result<Statement> {
+    match show_stmt.name.parse::<ConfigParameter>() {
+        Ok(ConfigParameter::SearchPath) => pg_conn
+            .conn
+            .prepare("SELECT current_setting('search_path') AS search_path"),
+        Err(_) => pg_conn.conn.prepare(format!("PRAGMA {}", show_stmt.name)),
+    }
 }
 
 pub(crate) fn set_search_path(conn: &Connection, value: Option<&str>) -> Result<Value> {

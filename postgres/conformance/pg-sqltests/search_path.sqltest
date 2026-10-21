@@ -99,3 +99,34 @@ test public-schema-qualified-column-reference {
 expect {
     b
 }
+
+test show-search-path-default {
+    SHOW search_path;
+}
+expect {
+    "$user", public
+}
+
+test show-search-path-after-set {
+    SET search_path TO public, pg_catalog;
+    SHOW search_path;
+    SET SEARCH_PATH TO public;
+    SHOW SEARCH_PATH;
+}
+expect {
+    public, pg_catalog
+    public
+}
+
+test show-search-path-after-set-config {
+    SELECT set_config('search_path', '', false);
+    SHOW search_path;
+    SELECT set_config('search_path', NULL, false);
+    SHOW search_path;
+}
+expect {
+    
+    
+    "$user", public
+    "$user", public
+}

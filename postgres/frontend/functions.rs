@@ -325,7 +325,7 @@ fn text_arg(args: &[Register], i: usize) -> String {
 
 #[derive(strum::EnumString)]
 #[strum(ascii_case_insensitive, serialize_all = "snake_case")]
-enum ConfigParameter {
+pub(crate) enum ConfigParameter {
     SearchPath,
 }
 
