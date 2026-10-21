@@ -343,6 +343,23 @@ DELETE FROM users WHERE id = 1;  -- allowed
 PRAGMA i_am_a_dummy = 1;      -- equivalent to require_where = 1
 ```
 
+### count_changes
+
+Off by default. When enabled, each top-level `INSERT`, `UPDATE` and `DELETE` returns one
+row with the number of rows it changed, in a column named `rows inserted`, `rows updated`
+or `rows deleted`. Trigger bodies, foreign key actions and other nested statements never
+emit count rows, and a statement with a `RETURNING` clause does not either, since it
+already returns rows.
+
+```sql
+PRAGMA count_changes;          -- count_changes: 0 (default)
+PRAGMA count_changes = 1;
+INSERT INTO t VALUES (1), (2); -- rows inserted: 2
+UPDATE t SET x = x + 1;        -- rows updated: 2
+DELETE FROM t WHERE x = 1;     -- rows deleted: 1
+PRAGMA count_changes = off;    -- statements return no rows again
+```
+
 ## Integrity Checks
 
 ### integrity_check

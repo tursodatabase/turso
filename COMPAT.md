@@ -229,7 +229,7 @@ avoid this window.
 | PRAGMA checkpoint_fullfsync      | ❌ No         |                                              |
 | PRAGMA collation_list            | ❌ No         |                                              |
 | PRAGMA compile_options           | ❌ No         |                                              |
-| PRAGMA count_changes             | Not Needed | deprecated in SQLite                         |
+| PRAGMA count_changes             | ✅ Yes         |                                              |
 | PRAGMA data_store_directory      | Not Needed | deprecated in SQLite                         |
 | PRAGMA data_version              | ❌ No         |                                              |
 | PRAGMA database_list             | ✅ Yes        |                                              |
