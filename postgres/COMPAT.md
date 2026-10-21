@@ -186,7 +186,7 @@ INTEGER. Unknown type names pass through as custom types.
 | Multirow VALUES | ✅ Supported | In INSERT and as standalone VALUES lists |
 | ORDER BY / LIMIT on a standalone VALUES list | ❌ Not supported | Rejected: "ORDER BY clause is not allowed with VALUES clause" |
 | Non-decimal integer literals | ✅ Supported | `0x`, `0o`, `0b` |
-| ORDER BY NULLS FIRST/LAST | ✅ Supported | Honored in SELECT, window, and compound SELECT ORDER BY; rejected (matching SQLite) in CREATE INDEX |
+| ORDER BY NULLS FIRST/LAST | ✅ Supported | Honored in SELECT, window, and compound SELECT ORDER BY; without it, NULLs sort last for ASC and first for DESC, as in PostgreSQL; rejected (matching SQLite) in CREATE INDEX |
 | range_agg range type aggregation function | ❌ Not supported | |
 | Recursive queries | 🟡 Partial | WITH RECURSIVE works with SQLite semantics (row-at-a-time recursive term, so e.g. DISTINCT in the recursive term over a multi-row anchor can differ from PG); SEARCH/CYCLE clauses are rejected |
 | regexp_count, regexp_instr, regexp_like | ❌ Not supported | Regex *operators* (`~`, `~*`, SIMILAR TO) work |
@@ -201,7 +201,7 @@ INTEGER. Unknown type names pass through as custom types.
 | unnest/array_agg | 🟡 Partial | array_agg works; unnest is not implemented |
 | Upsert (INSERT ... ON CONFLICT DO ...) | ✅ Supported | DO NOTHING and DO UPDATE SET ... (with EXCLUDED and conflict targets) |
 | Window functions | 🟡 Partial | Aggregate window functions (COUNT/SUM/AVG/MIN/MAX OVER), row_number, PARTITION BY/ORDER BY, frame clauses, and named WINDOW clauses work; rank, dense_rank, lag, lead, etc. are not implemented |
-| WITHIN GROUP clause | 🟡 Partial | Supports mode(), percentile_cont(), and percentile_disc() with one ORDER BY expression; DESC and explicit NULLS ordering are not supported |
+| WITHIN GROUP clause | 🟡 Partial | Supports mode(), percentile_cont(), and percentile_disc() with one ORDER BY expression; DESC is not supported; NULLS FIRST/LAST is accepted and has no effect because these functions skip NULLs |
 | WITH ORDINALITY clause | ❌ Not supported | |
 | WITH queries (Common Table Expressions) | ✅ Supported | Including WITH RECURSIVE; MATERIALIZED hints accepted |
 | Writable WITH queries (Common Table Expressions) | ❌ Not supported | "CTE query is not a SELECT statement" |

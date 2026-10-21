@@ -376,6 +376,19 @@ expect {
     1
 }
 
+test within-group-skips-nulls-with-any-null-order {
+    CREATE TABLE demo (value int);
+    INSERT INTO demo VALUES (1), (NULL), (2), (2);
+    SELECT percentile_cont(0.25) WITHIN GROUP (ORDER BY value) FROM demo;
+    SELECT percentile_disc(0) WITHIN GROUP (ORDER BY value NULLS FIRST) FROM demo;
+    SELECT mode() WITHIN GROUP (ORDER BY value NULLS LAST) FROM demo;
+}
+expect {
+    1.5
+    1
+    2
+}
+
 @skip-if postgres "Turso has the ACLs of PostgreSQL 16, without the MAINTAIN privilege (m) of PostgreSQL 17"
 test acldefault-object-kinds {
     SELECT pg_catalog.acldefault('c', 4294967294);

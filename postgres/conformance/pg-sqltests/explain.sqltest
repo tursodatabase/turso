@@ -90,3 +90,18 @@ test explain-format-json-errors {
     EXPLAIN (FORMAT JSON) SELECT 1;
 }
 expect error {}
+
+test explain-order-by-primary-key-uses-index {
+    CREATE TABLE k (code text PRIMARY KEY, n int);
+    CREATE TABLE k2 (code text, n int, PRIMARY KEY (code));
+    CREATE TABLE k3 (code text NOT NULL, n int);
+    CREATE INDEX k3_code ON k3 (code);
+    EXPLAIN SELECT code FROM k ORDER BY code LIMIT 3;
+    EXPLAIN SELECT code FROM k2 ORDER BY code DESC LIMIT 3;
+    EXPLAIN SELECT code FROM k3 ORDER BY code LIMIT 3;
+}
+expect {
+    1|0|0|SCAN k USING COVERING INDEX sqlite_autoindex_k_1
+    1|0|0|SCAN k2 USING COVERING INDEX sqlite_autoindex_k2_1
+    1|0|0|SCAN k3 USING COVERING INDEX k3_code
+}
