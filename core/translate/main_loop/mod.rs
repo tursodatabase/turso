@@ -7,7 +7,7 @@ use super::{
         TranslateCtx, UpdateRowSource,
     },
     expr::{
-        expr_references_subquery_id, translate_condition_expr, translate_expr,
+        emit_stored_column, expr_references_subquery_id, translate_condition_expr, translate_expr,
         translate_expr_no_constant_opt, walk_expr, walk_expr_mut, ConditionMetadata,
         NoConstantOptReason, WalkControl,
     },

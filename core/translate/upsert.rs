@@ -1341,14 +1341,17 @@ pub fn emit_upsert(
 
         // Read the before image before the delete below removes it; reading
         // it after the write would return the new row instead of the old one.
-        let cdc_before_rec = cdc_wants_before.then(|| {
-            emit_cdc_full_record(
-                program,
-                table.columns(),
-                ctx.cursor_id,
-                ctx.conflict_rowid_reg,
-            )
-        });
+        let cdc_before_rec = cdc_wants_before
+            .then(|| {
+                emit_cdc_full_record(
+                    program,
+                    resolver,
+                    table.columns(),
+                    ctx.cursor_id,
+                    ctx.conflict_rowid_reg,
+                )
+            })
+            .transpose()?;
 
         // Now replace the row
         program.emit_insn(Insn::Delete {
@@ -1401,14 +1404,17 @@ pub fn emit_upsert(
         cdc_before_rec
     } else {
         // Read the before image before the insert below overwrites it in place.
-        let cdc_before_rec = cdc_wants_before.then(|| {
-            emit_cdc_full_record(
-                program,
-                table.columns(),
-                ctx.cursor_id,
-                ctx.conflict_rowid_reg,
-            )
-        });
+        let cdc_before_rec = cdc_wants_before
+            .then(|| {
+                emit_cdc_full_record(
+                    program,
+                    resolver,
+                    table.columns(),
+                    ctx.cursor_id,
+                    ctx.conflict_rowid_reg,
+                )
+            })
+            .transpose()?;
         program.emit_insn(Insn::Insert {
             cursor: ctx.cursor_id,
             key_reg: ctx.conflict_rowid_reg,
