@@ -1,4 +1,4 @@
-use crate::plpgsql_names::{NameResolver, Variables};
+use crate::plpgsql_names::{NameResolver, VariableConflict, Variables};
 use crate::session::{set_trigger_variable, set_trigger_variable_once, trigger_variable};
 use crate::trigger::{parse_trigger_definition, postgres_schema_name, trigger_definition};
 use crate::user_function::{Language, UserFunction};
@@ -52,11 +52,10 @@ pub(crate) fn compile_trigger(
     let action = plpgsql_function.get("action").ok_or_else(malformed)?;
     let datums = Datums::new(plpgsql_function);
     let block_variables = block_variables(action, &datums)?;
+    let body = user_function.body_text().unwrap_or_default();
     let found = datums.found();
-    let uses_found = found.is_some()
-        && user_function
-            .body_text()
-            .is_some_and(|body| mentions_found(&body));
+    let uses_found = found.is_some() && mentions_found(&body);
+    let conflict = variable_conflict(&body)?;
     let args = statement
         .args
         .iter()
@@ -100,6 +99,7 @@ pub(crate) fn compile_trigger(
             variables: found.into_iter().collect(),
         }],
         uses_found,
+        conflict,
         variable_count: 0,
         statements: Vec::new(),
         new_values: Vec::new(),
@@ -173,6 +173,7 @@ struct Compiler<'a> {
     /// Whether the function reads FOUND, so that the statements that change
     /// FOUND must set it.
     uses_found: bool,
+    conflict: VariableConflict,
     variable_count: usize,
     statements: Vec<ast::Stmt>,
     /// The fields of NEW that the function assigned, in the order of the
@@ -1312,13 +1313,13 @@ impl<'a> Compiler<'a> {
     /// Replace the names of variables in `expr`, and give the first name that
     /// is both a column and a variable.
     fn resolve_expression(&self, expr: &mut ast::Expr) -> Result<Option<String>> {
-        let mut resolver = NameResolver::new(self, self.tables);
+        let mut resolver = NameResolver::new(self, self.tables, self.conflict);
         resolver.expression(expr)?;
         Ok(resolver.ambiguous)
     }
 
     fn resolve_statement(&self, stmt: &mut ast::Stmt) -> Result<Option<String>> {
-        let mut resolver = NameResolver::new(self, self.tables);
+        let mut resolver = NameResolver::new(self, self.tables, self.conflict);
         resolver.statement(stmt)?;
         Ok(resolver.ambiguous)
     }
@@ -1326,7 +1327,7 @@ impl<'a> Compiler<'a> {
     /// Replace the names of variables in a query, and give the first name
     /// that is both a column and a variable, and the number of columns.
     fn resolve_query(&self, select: &mut ast::Select) -> Result<(Option<String>, Option<usize>)> {
-        let mut resolver = NameResolver::new(self, self.tables);
+        let mut resolver = NameResolver::new(self, self.tables, self.conflict);
         let count = resolver.query(select)?;
         Ok((resolver.ambiguous, count))
     }
@@ -2005,6 +2006,74 @@ fn from_subquery(select: ast::Select, alias: &str) -> ast::FromClause {
         }),
         joins: vec![],
     }
+}
+
+/// The choice of `#variable_conflict` in the options at the start of the
+/// body of a function. Without it, a name that is both a column and a
+/// variable gives an error, as in PostgreSQL.
+fn variable_conflict(body: &str) -> Result<VariableConflict> {
+    let mut conflict = VariableConflict::Error;
+    let mut rest = skip_space_and_comments(body);
+    while let Some(option) = rest.strip_prefix('#') {
+        let (name, after_name) = first_word(skip_space_and_comments(option));
+        let (value, after_value) = first_word(skip_space_and_comments(after_name));
+        if name.eq_ignore_ascii_case("variable_conflict") {
+            conflict = match value.to_ascii_lowercase().as_str() {
+                "error" => VariableConflict::Error,
+                "use_variable" => VariableConflict::UseVariable,
+                "use_column" => VariableConflict::UseColumn,
+                _ => {
+                    return Err(LimboError::ParseError(format!(
+                        "unrecognized variable_conflict option \"{value}\""
+                    )))
+                }
+            };
+        }
+        rest = skip_space_and_comments(after_value);
+    }
+    Ok(conflict)
+}
+
+fn first_word(text: &str) -> (&str, &str) {
+    let end = text
+        .find(|c: char| !(c.is_alphanumeric() || c == '_'))
+        .unwrap_or(text.len());
+    text.split_at(end)
+}
+
+fn skip_space_and_comments(text: &str) -> &str {
+    let mut rest = text.trim_start();
+    loop {
+        if let Some(comment) = rest.strip_prefix("--") {
+            rest = comment.split_once('\n').map_or("", |(_, after)| after);
+        } else if let Some(comment) = rest.strip_prefix("/*") {
+            rest = after_block_comment(comment);
+        } else {
+            return rest;
+        }
+        rest = rest.trim_start();
+    }
+}
+
+/// The text after the end of a block comment. Block comments nest, as in
+/// PostgreSQL.
+fn after_block_comment(text: &str) -> &str {
+    let mut depth = 1;
+    let mut rest = text;
+    while depth > 0 {
+        match (rest.find("/*"), rest.find("*/")) {
+            (Some(open), Some(close)) if open < close => {
+                depth += 1;
+                rest = &rest[open + 2..];
+            }
+            (_, Some(close)) => {
+                depth -= 1;
+                rest = &rest[close + 2..];
+            }
+            (_, None) => return "",
+        }
+    }
+    rest
 }
 
 /// Whether the body of a function names FOUND. A word in a comment or a
