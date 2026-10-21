@@ -4092,7 +4092,10 @@ impl PostgreSQLTranslator {
             if is_star_qualified_by(node, target_qualifiers) {
                 columns.push(ast::ResultColumn::Star);
             } else {
-                columns.extend(self.translate_target_list(std::slice::from_ref(node))?);
+                let mut returning_target = node.clone();
+                normalize_returning_target_alias(&mut returning_target, target);
+                columns
+                    .extend(self.translate_target_list(std::slice::from_ref(&returning_target))?);
             }
         }
         Ok(columns)
@@ -4643,6 +4646,121 @@ fn is_star_qualified_by(node: &pg_query::protobuf::Node, target_qualifiers: &[&s
     qualifier.iter().rev().zip(target_qualifiers).all(
         |(field, expected)| matches!(&field.node, Some(Node::String(s)) if s.sval == *expected),
     )
+}
+
+/// Replace target-alias column qualifiers with the underlying relation name.
+/// The core DML AST carries the target table, not its PostgreSQL range-variable alias.
+fn normalize_returning_target_alias(
+    node: &mut pg_query::protobuf::Node,
+    target: &pg_query::protobuf::RangeVar,
+) {
+    let Some(alias) = target
+        .alias
+        .as_ref()
+        .filter(|alias| !alias.aliasname.is_empty())
+    else {
+        return;
+    };
+    normalize_returning_alias_node(node, &alias.aliasname, &target.relname);
+}
+
+fn normalize_returning_alias_node(
+    node: &mut pg_query::protobuf::Node,
+    alias: &str,
+    relation: &str,
+) {
+    use pg_query::protobuf::node::Node;
+
+    match node.node.as_mut() {
+        Some(Node::ColumnRef(col_ref)) => {
+            if col_ref.fields.len() == 2 {
+                if let Some(Node::String(qualifier)) = col_ref.fields[0].node.as_mut() {
+                    if qualifier.sval == alias {
+                        relation.clone_into(&mut qualifier.sval);
+                    }
+                }
+            }
+        }
+        Some(Node::ResTarget(res_target)) => {
+            normalize_returning_alias_option(&mut res_target.val, alias, relation);
+        }
+        Some(Node::AExpr(expr)) => {
+            normalize_returning_alias_option(&mut expr.lexpr, alias, relation);
+            normalize_returning_alias_option(&mut expr.rexpr, alias, relation);
+        }
+        Some(Node::BoolExpr(expr)) => {
+            normalize_returning_alias_list(&mut expr.args, alias, relation);
+        }
+        Some(Node::FuncCall(expr)) => {
+            normalize_returning_alias_list(&mut expr.args, alias, relation);
+            normalize_returning_alias_list(&mut expr.agg_order, alias, relation);
+            normalize_returning_alias_option(&mut expr.agg_filter, alias, relation);
+        }
+        Some(Node::CaseExpr(expr)) => {
+            normalize_returning_alias_option(&mut expr.arg, alias, relation);
+            normalize_returning_alias_list(&mut expr.args, alias, relation);
+            normalize_returning_alias_option(&mut expr.defresult, alias, relation);
+        }
+        Some(Node::CaseWhen(expr)) => {
+            normalize_returning_alias_option(&mut expr.expr, alias, relation);
+            normalize_returning_alias_option(&mut expr.result, alias, relation);
+        }
+        Some(Node::TypeCast(expr)) => {
+            normalize_returning_alias_option(&mut expr.arg, alias, relation);
+        }
+        Some(Node::CollateClause(expr)) => {
+            normalize_returning_alias_option(&mut expr.arg, alias, relation);
+        }
+        Some(Node::CoalesceExpr(expr)) => {
+            normalize_returning_alias_list(&mut expr.args, alias, relation);
+        }
+        Some(Node::MinMaxExpr(expr)) => {
+            normalize_returning_alias_list(&mut expr.args, alias, relation);
+        }
+        Some(Node::NullTest(expr)) => {
+            normalize_returning_alias_option(&mut expr.arg, alias, relation);
+        }
+        Some(Node::BooleanTest(expr)) => {
+            normalize_returning_alias_option(&mut expr.arg, alias, relation);
+        }
+        Some(Node::AArrayExpr(expr)) => {
+            normalize_returning_alias_list(&mut expr.elements, alias, relation);
+        }
+        Some(Node::ArrayExpr(expr)) => {
+            normalize_returning_alias_list(&mut expr.elements, alias, relation);
+        }
+        Some(Node::RowExpr(expr)) => {
+            normalize_returning_alias_list(&mut expr.args, alias, relation);
+        }
+        Some(Node::SortBy(expr)) => {
+            normalize_returning_alias_option(&mut expr.node, alias, relation);
+        }
+        Some(Node::SubLink(expr)) => {
+            // Rewrite the outer expression, but leave the nested query's scope alone.
+            normalize_returning_alias_option(&mut expr.testexpr, alias, relation);
+        }
+        _ => {}
+    }
+}
+
+fn normalize_returning_alias_option(
+    node: &mut Option<Box<pg_query::protobuf::Node>>,
+    alias: &str,
+    relation: &str,
+) {
+    if let Some(node) = node.as_deref_mut() {
+        normalize_returning_alias_node(node, alias, relation);
+    }
+}
+
+fn normalize_returning_alias_list(
+    nodes: &mut [pg_query::protobuf::Node],
+    alias: &str,
+    relation: &str,
+) {
+    for node in nodes {
+        normalize_returning_alias_node(node, alias, relation);
+    }
 }
 
 fn last_string(names: &[pg_query::protobuf::Node]) -> Option<String> {
@@ -6578,6 +6696,50 @@ mod tests {
             assert_eq!(returning.len(), 2);
         } else {
             panic!("Expected Insert");
+        }
+    }
+
+    #[test]
+    fn test_insert_target_alias_in_returning() {
+        let translator = PostgreSQLTranslator::new();
+        let parsed = crate::parse("INSERT INTO t AS x VALUES (9,9) RETURNING x.a").unwrap();
+        let translated = translator.translate(&parsed).unwrap();
+
+        let ast::Stmt::Insert { returning, .. } = translated else {
+            panic!("Expected Insert");
+        };
+        assert_eq!(returning.len(), 1);
+        let ast::ResultColumn::Expr(expr, _) = &returning[0] else {
+            panic!("Expected expression result column");
+        };
+        let ast::Expr::Qualified(table, column) = expr.as_ref() else {
+            panic!("Expected qualified target column, got {expr:?}");
+        };
+        assert_eq!(table.as_str(), "t");
+        assert_eq!(column.as_str(), "a");
+    }
+
+    #[test]
+    fn test_insert_target_alias_in_returning_expression() {
+        let translator = PostgreSQLTranslator::new();
+        let parsed = crate::parse("INSERT INTO t AS x VALUES (9,9) RETURNING x.a + x.b").unwrap();
+        let translated = translator.translate(&parsed).unwrap();
+
+        let ast::Stmt::Insert { returning, .. } = translated else {
+            panic!("Expected Insert");
+        };
+        let ast::ResultColumn::Expr(expr, _) = &returning[0] else {
+            panic!("Expected expression result column");
+        };
+        let ast::Expr::Binary(left, _, right) = expr.as_ref() else {
+            panic!("Expected binary expression, got {expr:?}");
+        };
+        for (expr, expected_column) in [(left.as_ref(), "a"), (right.as_ref(), "b")] {
+            let ast::Expr::Qualified(table, column) = expr else {
+                panic!("Expected qualified target column, got {expr:?}");
+            };
+            assert_eq!(table.as_str(), "t");
+            assert_eq!(column.as_str(), expected_column);
         }
     }
 
