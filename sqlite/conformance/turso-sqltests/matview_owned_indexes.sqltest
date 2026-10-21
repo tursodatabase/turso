@@ -152,3 +152,20 @@ expect {
     t1| ON t1(p COLLATE Binary) WHERE (v > 0)
     ok
 }
+
+# A filter that reads the rowid stays in the join and does not go into the
+# index's WHERE: a partial index whose WHERE reads the rowid makes every
+# INSERT into the table fail (#9663).
+test matview-owned-index-rowid-filter {
+    CREATE TABLE a(k, v);
+    CREATE TABLE b(k, v);
+    INSERT INTO b VALUES (1, 1), (2, 2);
+    CREATE MATERIALIZED VIEW w AS SELECT a.v AS av, b.v AS bv FROM a JOIN b ON a.k = b.k WHERE a.rowid > 1 AND a.oid < 100;
+    INSERT INTO a VALUES (1, 10), (2, 20), (1, 30);
+    UPDATE a SET k = 2 WHERE v = 30;
+    SELECT av, bv FROM w ORDER BY av;
+}
+expect {
+    20|2
+    30|2
+}

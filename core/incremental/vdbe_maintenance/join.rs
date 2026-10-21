@@ -2316,9 +2316,6 @@ fn input_where_sql(
         return None;
     };
     let columns = binding.table.columns();
-    let has_rowid_column = columns
-        .iter()
-        .any(|column| column.name.as_deref() == Some("rowid"));
     let mut combined: Option<ast::Expr> = None;
     for (term, reads) in on.iter().zip(term_inputs) {
         if reads.as_slice() != [input] {
@@ -2334,11 +2331,10 @@ fn input_where_sql(
                         None => writable = false,
                     }
                 }
-                ast::Expr::RowId { table, .. }
-                    if *table == binding.logical_id && !has_rowid_column =>
-                {
-                    *node = ast::Expr::Id(ast::Name::exact("rowid".to_string()));
-                }
+                // A partial index whose WHERE reads the rowid makes every
+                // INSERT into the table fail (#9663), so such a term stays
+                // in the join only and the index covers every row.
+                ast::Expr::RowId { .. } => writable = false,
                 ast::Expr::Id(_)
                 | ast::Expr::Literal(_)
                 | ast::Expr::Binary(..)
