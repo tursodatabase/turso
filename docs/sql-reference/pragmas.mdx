@@ -337,6 +337,30 @@ PRAGMA query_only = 1;    -- enable read-only mode
 PRAGMA query_only = 0;    -- disable read-only mode
 ```
 
+### full_column_names / short_column_names
+
+Legacy SQLite naming pragmas, kept for compatibility. Each is a per-connection boolean,
+off by default; the read form returns `0` or `1`. A write enables the flag for `ON`,
+`TRUE`, `YES`, `1` (case-insensitively) or any nonzero number, and disables it for
+anything else.
+
+```sql
+PRAGMA full_column_names;     -- 0
+PRAGMA full_column_names = 1;
+PRAGMA short_column_names = 1;
+```
+
+They only affect the names reported for result columns, never the data:
+
+- With `full_column_names` on, a column reference is named `TABLE.COLUMN` instead of the
+  default expression-text name, and `SELECT *` expands to those prefixed names.
+- With `short_column_names` on (and `full_column_names` off), a column reference is
+  named with just its column name.
+- An explicit `AS` alias always wins over both.
+
+SQLite deprecated both pragmas; prefer naming output columns with `AS` aliases in the
+query.
+
 ### foreign_keys
 
 Enables or disables foreign key constraint enforcement.
