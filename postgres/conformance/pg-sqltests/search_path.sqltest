@@ -463,3 +463,68 @@ test create-view-over-subquery-of-a-table-in-search-path {
 expect {
     4
 }
+
+test create-table-as-follows-search-path {
+    CREATE SCHEMA IF NOT EXISTS sp_ctas;
+    DROP TABLE IF EXISTS sp_ctas.u;
+    SET search_path TO sp_ctas, public;
+    CREATE TABLE u AS SELECT 3 AS x;
+    SELECT x FROM sp_ctas.u;
+    SELECT count(*) FROM pg_tables WHERE schemaname = 'public' AND tablename = 'u';
+}
+expect {
+    3
+    0
+}
+
+test create-table-as-with-no-existing-schema-in-search-path-errors {
+    SET search_path TO sp_missing_ctas;
+    CREATE TABLE u AS SELECT 3 AS x;
+}
+expect error {
+    no schema has been selected to create in
+}
+
+test create-sequence-follows-search-path {
+    CREATE SCHEMA IF NOT EXISTS sp_cs2;
+    DROP SEQUENCE IF EXISTS sp_cs2.s;
+    SET search_path TO sp_cs2, public;
+    CREATE SEQUENCE s START 40;
+    SELECT nextval('sp_cs2.s');
+    SELECT nextval('s');
+}
+expect {
+    40
+    41
+}
+
+test create-sequence-is-not-in-public-under-search-path {
+    CREATE SCHEMA IF NOT EXISTS sp_cs3;
+    DROP SEQUENCE IF EXISTS sp_cs3.s;
+    SET search_path TO sp_cs3, public;
+    CREATE SEQUENCE s;
+    SET search_path TO public;
+    SELECT nextval('s');
+}
+expect error {}
+
+test create-sequence-with-no-existing-schema-in-search-path-errors {
+    SET search_path TO sp_missing_cs;
+    CREATE SEQUENCE s;
+}
+expect error {
+    no schema has been selected to create in
+}
+
+test select-into-follows-search-path {
+    CREATE SCHEMA IF NOT EXISTS sp_si;
+    DROP TABLE IF EXISTS sp_si.sel;
+    CREATE TABLE base (x int);
+    INSERT INTO base VALUES (5);
+    SET search_path TO sp_si, public;
+    SELECT x INTO sel FROM base;
+    SELECT x FROM sp_si.sel;
+}
+expect {
+    5
+}

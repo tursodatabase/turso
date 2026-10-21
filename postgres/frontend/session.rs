@@ -226,13 +226,14 @@ fn prepare_statement(pg_conn: &Arc<PgConnectionInner>, sql: &str) -> Result<Stat
         .prepare_translated_cmd_with_options(translated.cmd, &sql, &options)
 }
 
-/// The schema that a CREATE TABLE or CREATE VIEW statement naming its table
-/// or view without a schema creates it in, with the byte offset of the
-/// name: the first schema of `search_path` that exists, like PostgreSQL.
-/// None when the statement is not such a CREATE, when `search_path` is not
-/// set, or when the object goes to public, which is where core puts it
-/// anyway. A view goes to the schema of the tables it reads instead, since
-/// core only lets a view read tables of its own schema.
+/// The schema that a CREATE TABLE, CREATE TABLE AS, CREATE VIEW or CREATE
+/// SEQUENCE statement naming its object without a schema creates it in,
+/// with the byte offset of the name: the first schema of `search_path`
+/// that exists, like PostgreSQL. None when the statement is not such a
+/// CREATE, when `search_path` is not set, or when the object goes to
+/// public, which is where core puts it anyway. A view goes to the schema
+/// of the tables it reads instead, since core only lets a view read tables
+/// of its own schema.
 fn created_object_schema_from_search_path(
     pg_conn: &Arc<PgConnectionInner>,
     parse_result: &turso_pg_parser::ParseResult,
