@@ -738,11 +738,12 @@ pub fn translate_alter_table(
         name: qualified_name,
         body: alter_table,
     } = alter;
-    let database_id = resolver.resolve_existing_table_database_id_qualified(&qualified_name)?;
+    let resolved = resolver.resolve_existing_table(&qualified_name)?;
+    let database_id = resolved.database_id();
     let schema_cookie = resolver.with_schema(database_id, |s| s.schema_version);
     program.begin_write_on_database(database_id, schema_cookie)?;
     program.begin_write_operation()?;
-    let table_name = qualified_name.name.as_str();
+    let table_name = resolved.stored_name.as_str();
     // For attached databases, qualify sqlite_schema with the database name
     // so that the UPDATE targets the correct database's schema table.
     let qualified_schema_table = schema_table_name_for_db(resolver, database_id);

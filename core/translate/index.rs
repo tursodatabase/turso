@@ -105,13 +105,16 @@ pub fn translate_create_index(
 
     let original_idx_name = idx_name;
     let original_tbl_name = tbl_name;
-    let database_id = if original_idx_name.namespace.is_some() {
-        resolver.resolve_database_id(&original_idx_name)?
+    let namespace = if original_idx_name.namespace.is_some() {
+        resolver.resolve_object(&original_idx_name)?.namespace
     } else {
-        resolver.resolve_existing_table_database_id(original_tbl_name.as_str())?
+        resolver
+            .resolve_existing_table_named(original_tbl_name.as_str())?
+            .namespace
     };
-    let idx_name = normalize_ident(original_idx_name.name.as_str());
-    let tbl_name = normalize_ident(original_tbl_name.as_str());
+    let database_id = namespace.database_id;
+    let idx_name = namespace.stored_name(&normalize_ident(original_idx_name.name.as_str()));
+    let tbl_name = namespace.stored_name(&normalize_ident(original_tbl_name.as_str()));
 
     validate(
         &tbl_name,
@@ -739,11 +742,12 @@ fn resolve_reindex_targets(
         bail_parse_error!("unable to identify the object to be reindexed");
     }
 
-    let database_id = resolver.resolve_database_id(name)?;
-    if let Some(targets) = find_reindex_table_in_db(&normalized_name, database_id, resolver) {
+    let resolved = resolver.resolve_object(name)?;
+    let database_id = resolved.database_id();
+    if let Some(targets) = find_reindex_table_in_db(&resolved.stored_name, database_id, resolver) {
         return Ok(targets);
     }
-    if let Some(target) = find_reindex_index_in_db(&normalized_name, database_id, resolver) {
+    if let Some(target) = find_reindex_index_in_db(&resolved.stored_name, database_id, resolver) {
         return Ok(vec![target]);
     }
     bail_parse_error!("unable to identify the object to be reindexed");
@@ -1225,19 +1229,20 @@ pub fn translate_drop_index(
     if_exists: bool,
     program: &mut ProgramBuilder,
 ) -> crate::Result<()> {
-    let idx_name = normalize_ident(qualified_name.name.as_str());
     let opts = ProgramBuilderOpts::new(5, 40, 5);
     program.extend(&opts);
 
-    let Some(database_id) = resolver.find_existing_index_database_id(qualified_name)? else {
+    let Some(resolved) = resolver.find_existing_index(qualified_name)? else {
         if if_exists {
             return Ok(());
         }
         return Err(crate::error::LimboError::InvalidArgument(format!(
             "No such index: {}",
-            &idx_name
+            normalize_ident(qualified_name.name.as_str())
         )));
     };
+    let database_id = resolved.database_id();
+    let idx_name = resolved.stored_name;
     let schema_cookie = resolver.with_schema(database_id, |s| s.schema_version);
     program.begin_write_on_database(database_id, schema_cookie)?;
 
@@ -1459,8 +1464,9 @@ pub fn translate_optimize(
 
     if let Some(name) = idx_name {
         // Optimize a specific index
-        let idx_name = normalize_ident(name.name.as_str());
-        let database_id = resolver.resolve_existing_index_database_id(&name)?;
+        let resolved = resolver.resolve_existing_index(&name)?;
+        let database_id = resolved.database_id();
+        let idx_name = resolved.stored_name;
         let mut found = false;
 
         resolver.with_schema(database_id, |schema| {

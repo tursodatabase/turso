@@ -25,6 +25,7 @@ use super::{
 };
 use crate::alloc::{TryClone, TursoIteratorExt};
 use crate::instrument;
+use crate::namespace::{Namespace, Namespaces};
 use crate::schema::{
     BTreeTable, CheckConstraint, Column, ColumnLayout, GeneratedType, Index, IndexColumn, Schema,
     Table, EXPR_INDEX_SENTINEL,
@@ -133,12 +134,37 @@ impl From<bool> for DoubleQuotedDml {
     }
 }
 
+/// Where an object named in SQL is: the namespace that holds it and the
+/// name it is stored under in the schema of the namespace's database.
+#[derive(Clone, Debug)]
+pub(crate) struct ResolvedName {
+    pub namespace: Namespace,
+    pub stored_name: String,
+}
+
+impl ResolvedName {
+    pub(crate) fn in_namespace(namespace: Namespace, name: &str) -> Self {
+        Self {
+            stored_name: namespace.stored_name(name),
+            namespace,
+        }
+    }
+
+    pub(crate) fn in_database(database_id: usize, name: &str) -> Self {
+        Self::in_namespace(Namespace::database(database_id), name)
+    }
+
+    pub fn database_id(&self) -> usize {
+        self.namespace.database_id
+    }
+}
+
 pub struct Resolver<'a> {
     schema: &'a Schema,
     database_schemas: &'a RwLock<HashMap<usize, Arc<Schema>>>,
     temp_database: &'a RwLock<Option<crate::connection::TempDatabase>>,
     attached_databases: &'a RwLock<DatabaseCatalog>,
-    namespaces: &'a crate::Namespaces,
+    namespaces: &'a Namespaces,
     non_main_schema_cache: RefCell<HashMap<usize, Arc<Schema>>>,
     pub symbol_table: &'a SymbolTable,
     pub expr_to_reg_cache_enabled: bool,
@@ -294,7 +320,7 @@ impl<'a> Resolver<'a> {
         database_schemas: &'a RwLock<HashMap<usize, Arc<Schema>>>,
         temp_database: &'a RwLock<Option<crate::connection::TempDatabase>>,
         attached_databases: &'a RwLock<DatabaseCatalog>,
-        namespaces: &'a crate::Namespaces,
+        namespaces: &'a Namespaces,
         symbol_table: &'a SymbolTable,
         enable_custom_types: bool,
         dqs_dml: DoubleQuotedDml,
@@ -766,51 +792,51 @@ impl<'a> Resolver<'a> {
             .try_collect()?)
     }
 
-    pub(crate) fn resolve_unqualified_existing_database_id<F>(
+    pub(crate) fn resolve_unqualified_existing<F>(
         &self,
         object_name: &str,
         schema_contains_object: F,
-    ) -> Result<usize>
+    ) -> Result<ResolvedName>
     where
         F: Fn(&Schema, &str) -> bool,
     {
-        self.find_unqualified_existing_database_id(object_name, schema_contains_object)
+        self.find_unqualified_existing(object_name, schema_contains_object)
             .ok_or_else(|| LimboError::ParseError(format!("no such object: {object_name}")))
     }
 
-    /// The database of an object named without a namespace: temp when it
-    /// has the object, else the first database of the search order that
-    /// has it. When none has it, the first database of the search order,
-    /// where the caller reports the object missing or does nothing for IF
-    /// EXISTS. None only when the search order is empty.
-    fn find_unqualified_existing_database_id<F>(
+    /// An object named without a namespace: in temp when temp has it, else
+    /// in the first namespace of the search order that has it. When none
+    /// has it, in the first namespace of the search order, where the caller
+    /// reports the object missing or does nothing for IF EXISTS. None only
+    /// when the search order is empty.
+    fn find_unqualified_existing<F>(
         &self,
         object_name: &str,
         schema_contains_object: F,
-    ) -> Option<usize>
+    ) -> Option<ResolvedName>
     where
         F: Fn(&Schema, &str) -> bool,
     {
+        let object_name = normalize_ident(object_name);
+        let has_object = |namespace: &Namespace| {
+            self.with_schema(namespace.database_id, |schema| {
+                schema_contains_object(schema, &namespace.stored_name(&object_name))
+            })
+        };
         // Only check the temp schema when a temp database actually exists.
         // This avoids expensive schema construction/lookup on every table
         // resolution when no temp objects have been created.
-        if self.has_temp_schema
-            && self.with_schema(crate::TEMP_DB_ID, |schema| {
-                schema_contains_object(schema, object_name)
-            })
-        {
-            return Some(crate::TEMP_DB_ID);
+        let temp = Namespace::database(crate::TEMP_DB_ID);
+        if self.has_temp_schema && has_object(&temp) {
+            return Some(ResolvedName::in_namespace(temp, &object_name));
         }
 
-        self.search_order
-            .iter()
-            .copied()
-            .find(|&database_id| {
-                self.with_schema(database_id, |schema| {
-                    schema_contains_object(schema, object_name)
-                })
-            })
-            .or_else(|| self.search_order.first().copied())
+        let mut candidates = self.search_order.iter().map(|&id| Namespace::database(id));
+        candidates
+            .clone()
+            .find(has_object)
+            .or_else(|| candidates.next())
+            .map(|namespace| ResolvedName::in_namespace(namespace, &object_name))
     }
 
     fn schema_has_table_like_object(schema: &Schema, table_name: &str) -> bool {
@@ -831,6 +857,10 @@ impl<'a> Resolver<'a> {
         schema.get_trigger(trigger_name).is_some()
     }
 
+    fn schema_has_sequence(schema: &Schema, sequence_name: &str) -> bool {
+        schema.get_sequence(sequence_name).is_some()
+    }
+
     fn resolve_schema_table_database_id(table_name: &str) -> Option<usize> {
         if table_name.eq_ignore_ascii_case(crate::schema::TEMP_SCHEMA_TABLE_NAME)
             || table_name.eq_ignore_ascii_case(crate::schema::TEMP_SCHEMA_TABLE_NAME_ALT)
@@ -847,32 +877,33 @@ impl<'a> Resolver<'a> {
         None
     }
 
-    pub(crate) fn resolve_existing_table_database_id_qualified(
+    /// The table, view or materialized view that `qualified_name` names.
+    pub(crate) fn resolve_existing_table(
         &self,
         qualified_name: &ast::QualifiedName,
-    ) -> Result<usize> {
-        self.find_existing_table_database_id_qualified(qualified_name)?
-            .ok_or_else(|| {
-                LimboError::ParseError(format!("no such object: {}", qualified_name.name.as_str()))
-            })
+    ) -> Result<ResolvedName> {
+        self.find_existing_table(qualified_name)?.ok_or_else(|| {
+            LimboError::ParseError(format!("no such object: {}", qualified_name.name.as_str()))
+        })
     }
 
-    pub(crate) fn resolve_existing_table_database_id(&self, table_name: &str) -> Result<usize> {
-        self.find_existing_table_database_id(table_name)
+    pub(crate) fn resolve_existing_table_named(&self, table_name: &str) -> Result<ResolvedName> {
+        self.find_existing_table_named(table_name)
             .ok_or_else(|| LimboError::ParseError(format!("no such object: {table_name}")))
     }
 
-    pub(crate) fn find_existing_table_database_id_qualified(
+    pub(crate) fn find_existing_table(
         &self,
         qualified_name: &ast::QualifiedName,
-    ) -> Result<Option<usize>> {
+    ) -> Result<Option<ResolvedName>> {
         if qualified_name.namespace.is_some() {
-            return self.resolve_database_id(qualified_name).map(Some);
+            return self.resolve_object(qualified_name).map(Some);
         }
-        Ok(self.find_existing_table_database_id(qualified_name.name.as_str()))
+        Ok(self.find_existing_table_named(qualified_name.name.as_str()))
     }
 
-    fn find_existing_table_database_id(&self, table_name: &str) -> Option<usize> {
+    fn find_existing_table_named(&self, table_name: &str) -> Option<ResolvedName> {
+        let table_name = normalize_ident(table_name);
         // A TEMP view or trigger carries a scope (so explicit `aux.table`
         // references still see its own database below), but the scope does
         // not restrict unqualified names: SQLite's schema fixer skips TEMP
@@ -881,99 +912,118 @@ impl<'a> Resolver<'a> {
         // same way a top-level query does, sqlite_schema included.
         if let Some(ctx) = self.database_scope.borrow().as_ref() {
             if ctx.restricts_db_references() {
-                return Some(ctx.database_id);
+                return Some(ResolvedName::in_database(ctx.database_id, &table_name));
             }
         }
 
-        if let Some(database_id) = Self::resolve_schema_table_database_id(table_name) {
-            return Some(database_id);
+        if let Some(database_id) = Self::resolve_schema_table_database_id(&table_name) {
+            return Some(ResolvedName::in_database(database_id, &table_name));
         }
 
-        self.find_unqualified_existing_database_id(table_name, Self::schema_has_table_like_object)
+        self.find_unqualified_existing(&table_name, Self::schema_has_table_like_object)
     }
 
-    pub(crate) fn resolve_existing_index_database_id(
+    pub(crate) fn resolve_existing_index(
         &self,
         qualified_name: &ast::QualifiedName,
-    ) -> Result<usize> {
-        self.find_existing_index_database_id(qualified_name)?
-            .ok_or_else(|| {
-                LimboError::ParseError(format!(
-                    "no such object: {}",
-                    normalize_ident(qualified_name.name.as_str())
-                ))
-            })
-    }
-
-    pub(crate) fn find_existing_index_database_id(
-        &self,
-        qualified_name: &ast::QualifiedName,
-    ) -> Result<Option<usize>> {
-        if qualified_name.namespace.is_some() {
-            return self.resolve_database_id(qualified_name).map(Some);
-        }
-
-        let index_name = normalize_ident(qualified_name.name.as_str());
-        Ok(self.find_unqualified_existing_database_id(&index_name, Self::schema_has_index))
-    }
-
-    pub(crate) fn resolve_existing_trigger_database_id(
-        &self,
-        qualified_name: &ast::QualifiedName,
-    ) -> Result<usize> {
-        if qualified_name.namespace.is_some() {
-            return self.resolve_database_id(qualified_name);
-        }
-
-        let trigger_name = qualified_name.name.as_str();
-        self.resolve_unqualified_existing_database_id(trigger_name, Self::schema_has_trigger)
-    }
-
-    /// The database of a sequence named without a namespace: the first
-    /// database of the search order that has it, or the first database of
-    /// the search order when none has it.
-    pub(crate) fn resolve_existing_sequence_database_id(&self, seq_name: &str) -> Result<usize> {
-        self.find_existing_sequence_database_id(seq_name)
-            .ok_or_else(|| LimboError::ParseError(format!("no such object: {seq_name}")))
-    }
-
-    pub(crate) fn find_existing_sequence_database_id(&self, seq_name: &str) -> Option<usize> {
-        self.find_unqualified_existing_database_id(seq_name, |schema, seq_name| {
-            schema.get_sequence(seq_name).is_some()
+    ) -> Result<ResolvedName> {
+        self.find_existing_index(qualified_name)?.ok_or_else(|| {
+            LimboError::ParseError(format!(
+                "no such object: {}",
+                normalize_ident(qualified_name.name.as_str())
+            ))
         })
     }
 
-    /// `seq_name` qualified with the database it resolved to, for the
-    /// opcodes that look a sequence up again by its name when the statement
-    /// runs.
-    pub(crate) fn runtime_sequence_name(&self, database_id: usize, seq_name: &str) -> String {
+    pub(crate) fn find_existing_index(
+        &self,
+        qualified_name: &ast::QualifiedName,
+    ) -> Result<Option<ResolvedName>> {
+        if qualified_name.namespace.is_some() {
+            return self.resolve_object(qualified_name).map(Some);
+        }
+        Ok(self.find_unqualified_existing(qualified_name.name.as_str(), Self::schema_has_index))
+    }
+
+    pub(crate) fn resolve_existing_trigger(
+        &self,
+        qualified_name: &ast::QualifiedName,
+    ) -> Result<ResolvedName> {
+        if qualified_name.namespace.is_some() {
+            return self.resolve_object(qualified_name);
+        }
+        self.resolve_unqualified_existing(qualified_name.name.as_str(), Self::schema_has_trigger)
+    }
+
+    /// The sequence that `qualified_name` names. A sequence named without a
+    /// namespace is in the first namespace of the search order that has it,
+    /// or in the first namespace of the search order when none has it.
+    pub(crate) fn resolve_existing_sequence(
+        &self,
+        qualified_name: &ast::QualifiedName,
+    ) -> Result<ResolvedName> {
+        self.find_existing_sequence(qualified_name)?.ok_or_else(|| {
+            LimboError::ParseError(format!("no such object: {}", qualified_name.name.as_str()))
+        })
+    }
+
+    pub(crate) fn find_existing_sequence(
+        &self,
+        qualified_name: &ast::QualifiedName,
+    ) -> Result<Option<ResolvedName>> {
+        if let Some(namespace) = &qualified_name.namespace {
+            let namespace = self.namespace_named(namespace)?;
+            return Ok(Some(ResolvedName::in_namespace(
+                namespace,
+                &normalize_ident(qualified_name.name.as_str()),
+            )));
+        }
+        Ok(self.find_unqualified_existing(qualified_name.name.as_str(), Self::schema_has_sequence))
+    }
+
+    /// The name of `sequence` qualified with its database, for the opcodes
+    /// that look a sequence up again by its name when the statement runs.
+    pub(crate) fn runtime_sequence_name(&self, sequence: &ResolvedName) -> String {
         let database_name = self
-            .namespace_name(database_id)
+            .namespace_name(sequence.database_id())
             .expect("the database of a sequence has a name");
-        format!("{database_name}.{seq_name}")
+        format!("{database_name}.{}", sequence.stored_name)
+    }
+
+    /// The object that `qualified_name` names in the namespace it names, or
+    /// in the namespace of the trigger or view being compiled, or in main.
+    pub(crate) fn resolve_object(
+        &self,
+        qualified_name: &ast::QualifiedName,
+    ) -> Result<ResolvedName> {
+        let namespace = self.resolve_namespace(qualified_name)?;
+        Ok(ResolvedName::in_namespace(
+            namespace,
+            &normalize_ident(qualified_name.name.as_str()),
+        ))
     }
 
     /// Resolve database ID from a qualified name
     pub(crate) fn resolve_database_id(&self, qualified_name: &ast::QualifiedName) -> Result<usize> {
+        Ok(self.resolve_namespace(qualified_name)?.database_id)
+    }
+
+    fn resolve_namespace(&self, qualified_name: &ast::QualifiedName) -> Result<Namespace> {
         // Check if this is a qualified name (database.table) or unqualified
-        let resolved_id = if let Some(db_name) = &qualified_name.namespace {
-            let db_name_normalized = normalize_ident(db_name.as_str());
-            self.namespace_database_id(&db_name_normalized)
-                .ok_or_else(|| {
-                    LimboError::InvalidArgument(format!("no such database: {db_name_normalized}"))
-                })
+        let namespace = if let Some(db_name) = &qualified_name.namespace {
+            self.namespace_named(db_name)
         } else {
             // Unqualified table name — when compiling the body of a trigger
             // or a view, resolve to that object's own database (matching
             // SQLite behavior). Otherwise default to main.
             if let Some(ctx) = self.database_scope.borrow().as_ref() {
                 if ctx.restricts_db_references() {
-                    Ok(ctx.database_id)
+                    Ok(Namespace::database(ctx.database_id))
                 } else {
-                    Ok(crate::MAIN_DB_ID)
+                    Ok(Namespace::database(crate::MAIN_DB_ID))
                 }
             } else {
-                Ok(0)
+                Ok(Namespace::database(crate::MAIN_DB_ID))
             }
         }?;
 
@@ -983,9 +1033,9 @@ impl<'a> Resolver<'a> {
         // database above.
         if let Some(ctx) = self.database_scope.borrow().as_ref() {
             if !ctx.restricts_db_references() {
-                return Ok(resolved_id);
+                return Ok(namespace);
             }
-            if resolved_id != ctx.database_id {
+            if namespace.database_id != ctx.database_id {
                 let db_name = qualified_name
                     .namespace
                     .as_ref()
@@ -998,21 +1048,40 @@ impl<'a> Resolver<'a> {
             }
         }
 
-        Ok(resolved_id)
+        Ok(namespace)
     }
 
-    /// Resolve the database that CREATE puts an object named `qualified_name`
-    /// in.
-    pub(crate) fn resolve_database_id_for_create(
+    fn namespace_named(&self, name: &ast::Name) -> Result<Namespace> {
+        let name = normalize_ident(name.as_str());
+        self.namespaces
+            .get(&name)
+            .ok_or_else(|| LimboError::InvalidArgument(format!("no such database: {name}")))
+    }
+
+    /// Where CREATE puts an object named `qualified_name`: temp for a TEMP
+    /// object, else the namespace the name has, else the first namespace of
+    /// the search order.
+    pub(crate) fn resolve_for_create(
         &self,
         qualified_name: &ast::QualifiedName,
-    ) -> Result<usize> {
-        if qualified_name.namespace.is_some() {
-            return self.resolve_database_id(qualified_name);
+        temporary: bool,
+    ) -> Result<ResolvedName> {
+        if temporary {
+            return Ok(ResolvedName::in_database(
+                crate::TEMP_DB_ID,
+                &normalize_ident(qualified_name.name.as_str()),
+            ));
         }
-        self.search_order.first().copied().ok_or_else(|| {
+        if qualified_name.namespace.is_some() {
+            return self.resolve_object(qualified_name);
+        }
+        let database_id = self.search_order.first().copied().ok_or_else(|| {
             LimboError::ParseError("no schema has been selected to create in".to_string())
-        })
+        })?;
+        Ok(ResolvedName::in_database(
+            database_id,
+            &normalize_ident(qualified_name.name.as_str()),
+        ))
     }
 
     /// The database that namespace `name` refers to. `name` is normalized.

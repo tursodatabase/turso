@@ -72,7 +72,10 @@ pub fn open_database_with_io(
 impl PgConnection {
     pub fn connect(db: &Arc<turso_core::Database>) -> crate::Result<Self> {
         let conn = db.connect_with_hooks(Arc::new(PgSessionState::default()))?;
-        conn.add_namespace("public", turso_core::MAIN_DB_ID);
+        conn.add_namespace(
+            "public",
+            turso_core::Namespace::database(turso_core::MAIN_DB_ID),
+        );
         set_search_path(&conn, None, SettingScope::Session)?;
         Ok(Self {
             inner: Arc::new(PgConnectionInner { conn }),

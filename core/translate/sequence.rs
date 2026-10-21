@@ -860,11 +860,12 @@ pub fn translate_create_sequence(
     resolver: &Resolver,
     program: &mut ProgramBuilder,
 ) -> Result<()> {
-    let database_id = resolver.resolve_database_id_for_create(seq_name)?;
+    let resolved = resolver.resolve_for_create(seq_name, false)?;
+    let database_id = resolved.database_id();
     let schema_cookie = resolver.with_schema(database_id, |s| s.schema_version);
     program.begin_write_on_database(database_id, schema_cookie)?;
 
-    let normalized_name = normalize_ident(seq_name.name.as_str());
+    let normalized_name = resolved.stored_name;
 
     // `__turso_internal_autoincrement_<table>` is reserved for the
     // implicit sequences CREATE TABLE ... AUTOINCREMENT installs.
@@ -1061,16 +1062,16 @@ pub fn translate_drop_sequence(
     resolver: &Resolver,
     program: &mut ProgramBuilder,
 ) -> Result<()> {
-    let normalized_name = normalize_ident(seq_name.name.as_str());
-    let database_id = if seq_name.namespace.is_some() {
-        resolver.resolve_database_id(seq_name)?
-    } else {
-        match resolver.find_existing_sequence_database_id(&normalized_name) {
-            Some(database_id) => database_id,
-            None if if_exists => return Ok(()),
-            None => bail_parse_error!("sequence \"{}\" does not exist", normalized_name),
-        }
+    let resolved = match resolver.find_existing_sequence(seq_name)? {
+        Some(resolved) => resolved,
+        None if if_exists => return Ok(()),
+        None => bail_parse_error!(
+            "sequence \"{}\" does not exist",
+            normalize_ident(seq_name.name.as_str())
+        ),
     };
+    let database_id = resolved.database_id();
+    let normalized_name = resolved.stored_name;
     let schema_cookie = resolver.with_schema(database_id, |s| s.schema_version);
     program.begin_write_on_database(database_id, schema_cookie)?;
 
