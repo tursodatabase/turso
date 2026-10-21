@@ -284,7 +284,8 @@ pub(super) fn emit_fk_violation(
     Ok(())
 }
 
-/// Stop the statement with a foreign-key error, for RESTRICT.
+/// Stop the statement with a foreign-key error at once: for RESTRICT, and
+/// for a missing parent of a single-row INSERT.
 pub(super) fn emit_fk_restrict_halt(program: &mut ProgramBuilder) -> Result<()> {
     program.emit_insn(Insn::Halt {
         err_code: SQLITE_CONSTRAINT_FOREIGNKEY,

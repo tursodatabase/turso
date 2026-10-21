@@ -232,12 +232,21 @@ pub(super) fn emit_insert_child_checks(
         let parent_table = btree(&foreign_key.parent_table)?;
         let self_reference = is_self_reference(foreign_key);
         let declaration = foreign_key.declaration.clone();
-        // A missing parent counts a violation; an immediate one fails the
-        // statement when it ends. Like SQLite, this lets one statement write
-        // a child before its parent, as `INSERT INTO t VALUES (7, 8), (8, 7)`
-        // does on a self-referencing table.
+        // Like SQLite, a statement that writes one row on its own stops at
+        // a missing parent at once, so it needs no statement journal to
+        // take the row back. Otherwise a missing parent counts a violation
+        // and an immediate one fails the statement when it ends, which lets
+        // one statement write a child before its parent, as `INSERT INTO t
+        // VALUES (7, 8), (8, 7)` does on a self-referencing table.
+        let halts = !foreign_key.declaration.deferred
+            && !program.flags.is_multi_write()
+            && !program.flags.is_subprogram();
         let violation = move |program: &mut ProgramBuilder| -> Result<()> {
-            emit_fk_violation(program, &declaration)
+            if halts {
+                emit_fk_restrict_halt(program)
+            } else {
+                emit_fk_violation(program, &declaration)
+            }
         };
         if foreign_key.parent_uses_rowid {
             let cursor = open_read_table(program, &parent_table, database);

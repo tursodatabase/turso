@@ -704,9 +704,7 @@ impl HirDocument {
                     }
                     TriggerBody::Program(_) => None,
                 },
-                HirRoot::Query(_) => None,
-                #[cfg(test)]
-                HirRoot::SchemaExpressions(_) => None,
+                HirRoot::Query(_) | HirRoot::SchemaExpressions(_) => None,
             },
         }
     }

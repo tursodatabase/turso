@@ -1,9 +1,6 @@
 use crate::function::{Func, ScalarFunc};
 use crate::translate::{
-    emitter::Resolver,
-    expr::{sanitize_string, translate_expr},
-    semantic_lowering::PlannedSelect,
-    ProgramBuilder, ProgramBuilderOpts,
+    expr::sanitize_string, semantic_lowering::PlannedSelect, ProgramBuilder, ProgramBuilderOpts,
 };
 use crate::util::normalize_ident;
 use crate::vdbe::insn::Insn;
@@ -40,7 +37,6 @@ impl<'a> Argument<'a> {
 /// the evaluated arguments run as one `SELECT` planned through HIR.
 fn emit_arguments(
     program: &mut ProgramBuilder,
-    resolver: &Resolver,
     connection: &Arc<Connection>,
     hir: HirContext<'_>,
     arguments: &[Argument<'_>],
@@ -69,7 +65,7 @@ fn emit_arguments(
                     dest,
                 });
             }
-            Argument::Value(expr) => match &mut hir_values {
+            Argument::Value(_) => match &mut hir_values {
                 Some(value) => {
                     program.emit_insn(Insn::Copy {
                         src_reg: *value,
@@ -79,7 +75,9 @@ fn emit_arguments(
                     *value += 1;
                 }
                 None => {
-                    translate_expr(program, None, expr, dest, resolver)?;
+                    return Err(crate::LimboError::InternalError(
+                        "ATTACH argument was not planned".to_string(),
+                    ))
                 }
             },
             Argument::Null => {
@@ -96,7 +94,6 @@ fn emit_arguments(
 /// Translate ATTACH statement
 pub fn translate_attach(
     expr: &Expr,
-    resolver: &Resolver,
     db_name: &Expr,
     key: &Option<Box<Expr>>,
     program: &mut ProgramBuilder,
@@ -124,7 +121,6 @@ pub fn translate_attach(
     };
     emit_arguments(
         program,
-        resolver,
         &connection,
         hir,
         &[Argument::new(expr), Argument::new(db_name), key],
@@ -148,7 +144,6 @@ pub fn translate_attach(
 /// Translate DETACH statement
 pub fn translate_detach(
     expr: &Expr,
-    resolver: &Resolver,
     program: &mut ProgramBuilder,
     connection: Arc<Connection>,
     hir: HirContext<'_>,
@@ -163,14 +158,7 @@ pub fn translate_detach(
 
     let arg_reg = program.alloc_registers(2); // 1 for arg + 1 for result
 
-    emit_arguments(
-        program,
-        resolver,
-        &connection,
-        hir,
-        &[Argument::new(expr)],
-        arg_reg,
-    )?;
+    emit_arguments(program, &connection, hir, &[Argument::new(expr)], arg_reg)?;
 
     // Call sqlite_detach function
     program.emit_insn(Insn::Function {

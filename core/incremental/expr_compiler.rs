@@ -6,15 +6,13 @@ use crate::numeric::Numeric;
 use crate::schema::Schema;
 use crate::storage::pager::Pager;
 use crate::sync::Arc;
-use crate::translate::emitter::{DoubleQuotedDml, Resolver};
-use crate::translate::expr::translate_expr;
+use crate::translate::semantic_lowering::{translate_register_expression, HirSettings};
 use crate::types::Text;
 use crate::vdbe::builder::{ProgramBuilder, ProgramBuilderOpts};
 use crate::vdbe::insn::Insn;
 use crate::vdbe::{Program, ProgramState, Register};
+use crate::SymbolTable;
 use crate::{Connection, QueryMode, Result, Value};
-use crate::{DatabaseCatalog, RwLock, SymbolTable};
-use rustc_hash::FxHashMap as HashMap;
 use turso_parser::ast::{Expr, Literal, Operator};
 
 // Transform an expression to replace column references with Register expressions Why do we want to
@@ -287,7 +285,7 @@ impl CompiledExpression {
     pub fn compile(
         expr: &Expr,
         input_column_names: &[String],
-        schema: &Schema,
+        schema: &Arc<Schema>,
         syms: &SymbolTable,
         connection: Arc<Connection>,
     ) -> Result<Self> {
@@ -320,29 +318,21 @@ impl CompiledExpression {
         // Transform the expression to replace column references with Register expressions
         let transformed_expr = transform_expr_for_dbsp(expr, input_column_names);
 
-        // Create a resolver for translate_expr
-        let database_schemas = RwLock::new(HashMap::default());
-        let temp_database = RwLock::new(None);
-        let attached_databases = RwLock::new(DatabaseCatalog::new());
-        let resolver = Resolver::new(
-            schema,
-            &database_schemas,
-            &temp_database,
-            &attached_databases,
-            syms,
-            true,
-            DoubleQuotedDml::Enabled,
-            std::sync::Arc::new(crate::dialect::SqliteDialect),
-            &None,
-        );
-
         // Translate the transformed expression to bytecode
-        translate_expr(
+        let settings = HirSettings::new(
+            &connection,
+            syms,
+            std::sync::Arc::new(crate::dialect::SqliteDialect),
+            None,
+        );
+        translate_register_expression(
             &mut builder,
-            None, // No table references needed for pure expressions
             &transformed_expr,
+            input_column_names,
+            schema,
+            &settings,
+            &connection,
             temp_result_register,
-            &resolver,
         )?;
 
         // Copy the result to register 0 for return
@@ -434,6 +424,121 @@ impl CompiledExpression {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use turso_parser::ast;
+
+    /// The first result column of `sql`, a SELECT.
+    fn parse_result_expr(sql: &str) -> Expr {
+        let command = turso_parser::parser::Parser::new(sql.as_bytes())
+            .next_cmd()
+            .expect("SQL parses")
+            .expect("SQL has a statement");
+        let ast::Cmd::Stmt(ast::Stmt::Select(select)) = command else {
+            panic!("SQL is a SELECT");
+        };
+        let ast::OneSelect::Select { mut columns, .. } = select.body.select else {
+            panic!("SELECT has result columns");
+        };
+        let ast::ResultColumn::Expr(expr, _) = columns.remove(0) else {
+            panic!("the first result column is an expression");
+        };
+        *expr
+    }
+
+    fn compile(expr: &Expr, inputs: &[&str]) -> Result<(CompiledExpression, Arc<Connection>)> {
+        let io = Arc::new(crate::MemoryIO::new());
+        let db =
+            crate::Database::open_file(io, ":memory:", Arc::new(crate::dialect::SqliteDialect))?;
+        let conn = db.connect()?;
+        let inputs: Vec<String> = inputs.iter().map(|name| name.to_string()).collect();
+        let compiled = CompiledExpression::compile(
+            expr,
+            &inputs,
+            &Arc::new(Schema::new()),
+            &SymbolTable::new(),
+            conn.clone(),
+        )?;
+        Ok((compiled, conn))
+    }
+
+    fn run(sql: &str, inputs: &[&str], values: &[Value]) -> Value {
+        let (compiled, conn) =
+            compile(&parse_result_expr(sql), inputs).expect("expression compiles");
+        assert!(
+            matches!(compiled.executor, ExpressionExecutor::Compiled(_)),
+            "{sql} needs the compiled program"
+        );
+        let pager = conn.pager.load().clone();
+        compiled.execute(values, pager).expect("expression runs")
+    }
+
+    fn text(value: &str) -> Value {
+        Value::Text(Text::new(value.to_string()))
+    }
+
+    #[test]
+    fn function_over_an_input_reads_its_register() {
+        assert_eq!(
+            run("SELECT upper(name) || '!'", &["name"], &[text("ab")]),
+            text("AB!")
+        );
+    }
+
+    #[test]
+    fn case_over_two_inputs_reads_each_register() {
+        let sql = "SELECT CASE WHEN a > b THEN a - b ELSE b - a END";
+        assert_eq!(
+            run(sql, &["a", "b"], &[Value::from_i64(3), Value::from_i64(10)]),
+            Value::from_i64(7)
+        );
+        assert_eq!(
+            run(
+                sql,
+                &["a", "b"],
+                &[Value::from_i64(12), Value::from_i64(10)]
+            ),
+            Value::from_i64(2)
+        );
+    }
+
+    #[test]
+    fn an_input_named_like_an_aggregate_is_read_by_position() {
+        // A projection after an aggregate reads the aggregate's value by the
+        // name the operator gave it, which is not a column name.
+        assert_eq!(
+            run(
+                "SELECT hex(\"count(*)\" + 2)",
+                &["count(*)"],
+                &[Value::from_i64(5)]
+            ),
+            text("37")
+        );
+    }
+
+    #[test]
+    fn a_register_outside_the_inputs_is_rejected() {
+        // A bare register is evaluated without a program, so wrap it in a
+        // call that needs one.
+        let expr = Expr::FunctionCall {
+            name: ast::Name::from_string("upper"),
+            distinctness: None,
+            args: vec![Box::new(Expr::Register(5))],
+            order_by: Vec::new(),
+            within_group: Vec::new(),
+            filter_over: ast::FunctionTail {
+                filter_clause: None,
+                over_clause: None,
+            },
+        };
+        let error = compile(&expr, &["a", "b"])
+            .err()
+            .expect("register 5 has no input");
+        assert!(
+            error
+                .to_string()
+                .contains("register 5 is outside the 2 inputs"),
+            "{error}"
+        );
+    }
 
     #[test]
     fn test_mixed_type_arithmetic() {

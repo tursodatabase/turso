@@ -1,76 +1,18 @@
 use super::{
     expr::{walk_expr, walk_expr_mut},
-    plan::{
-        EvalAt, JoinOrderMember, Operation, PredicateExpr, ResultSetColumn, TableReferences,
-        WhereTerm,
-    },
+    plan::{EvalAt, JoinOrderMember, Operation, TableReferences, WhereTerm},
 };
-use crate::translate::expr::bind_and_rewrite_expr;
 use crate::translate::plan::BitSet;
 use crate::translate::{
-    emitter::Resolver,
-    expr::{BindingBehavior, WalkControl},
+    expr::WalkControl,
     plan::{NonFromClauseSubquery, SubqueryState},
     semantic::hir::{self, HirDocument},
 };
-use crate::{ast::Limit, Result};
-use turso_parser::ast::{self, Expr, TableInternalId};
+use crate::Result;
+use turso_parser::ast::{self, Expr};
 
 /// Valid ways to refer to the rowid of a btree table.
 pub const ROWID_STRS: [&str; 3] = ["rowid", "_rowid_", "oid"];
-
-#[turso_macros::trace_stack]
-pub fn parse_where(
-    where_clause: Option<&Expr>,
-    table_references: &mut TableReferences,
-    result_columns: Option<&[ResultSetColumn]>,
-    out_where_clause: &mut Vec<WhereTerm>,
-    resolver: &Resolver,
-) -> Result<()> {
-    if let Some(where_expr) = where_clause {
-        let start_idx = out_where_clause.len();
-        where_expr.append_conjuncts(out_where_clause);
-        for expr in out_where_clause[start_idx..].iter_mut() {
-            bind_and_rewrite_expr(
-                &mut expr.expr,
-                Some(table_references),
-                result_columns,
-                resolver,
-                BindingBehavior::TryCanonicalColumnsFirst,
-            )?;
-            rewrite_between_exprs(&mut expr.expr)?;
-        }
-        // BETWEEN in WHERE is rewritten to binary terms here so each side can be
-        // considered independently by constraint extraction and range planning.
-        // Re-break any ANDs that were created so they become separate WhereTerms for
-        // constraint extraction.
-        let mut i = start_idx;
-        while i < out_where_clause.len() {
-            if matches!(
-                &out_where_clause[i].expr,
-                Expr::Binary(_, ast::Operator::And, _)
-            ) {
-                let term = out_where_clause.remove(i);
-                let mut new_terms: Vec<WhereTerm> = Vec::new();
-                term.expr.append_conjuncts(&mut new_terms);
-                // Preserve from_outer_join from the original term
-                for new_term in new_terms.iter_mut() {
-                    new_term.from_outer_join = term.from_outer_join;
-                }
-                let count = new_terms.len();
-                for (j, new_term) in new_terms.into_iter().enumerate() {
-                    out_where_clause.insert(i + j, new_term);
-                }
-                i += count;
-            } else {
-                i += 1;
-            }
-        }
-        Ok(())
-    } else {
-        Ok(())
-    }
-}
 
 pub fn rewrite_between_exprs(expr: &mut Expr) -> Result<()> {
     walk_expr_mut(expr, &mut |e: &mut Expr| -> Result<WalkControl> {
@@ -399,53 +341,4 @@ pub fn determine_where_to_eval_expr(
     })?;
 
     Ok(eval_at)
-}
-
-pub fn parse_row_id<F>(
-    column_name: &str,
-    table_id: TableInternalId,
-    fn_check: F,
-) -> Result<Option<Expr>>
-where
-    F: FnOnce() -> bool,
-{
-    if ROWID_STRS
-        .iter()
-        .any(|s| s.eq_ignore_ascii_case(column_name))
-    {
-        if fn_check() {
-            crate::bail_parse_error!("ROWID is ambiguous");
-        }
-
-        return Ok(Some(Expr::RowId {
-            database: None, // TODO: support different databases
-            table: table_id,
-        }));
-    }
-    Ok(None)
-}
-
-#[allow(clippy::type_complexity)]
-#[turso_macros::trace_stack]
-pub fn parse_limit(
-    mut limit: Limit,
-    resolver: &Resolver,
-) -> Result<(Option<Box<Expr>>, Option<Box<Expr>>)> {
-    bind_and_rewrite_expr(
-        &mut limit.expr,
-        None,
-        None,
-        resolver,
-        BindingBehavior::TryResultColumnsFirst,
-    )?;
-    if let Some(ref mut off_expr) = limit.offset {
-        bind_and_rewrite_expr(
-            off_expr,
-            None,
-            None,
-            resolver,
-            BindingBehavior::TryResultColumnsFirst,
-        )?;
-    }
-    Ok((Some(limit.expr), limit.offset))
 }

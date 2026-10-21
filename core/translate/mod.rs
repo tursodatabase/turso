@@ -254,15 +254,7 @@ fn translate_statement(
         }
         ast::Stmt::Analyze { name } => translate_analyze(name, resolver, program)?,
         ast::Stmt::Attach { expr, db_name, key } => {
-            attach::translate_attach(
-                &expr,
-                resolver,
-                &db_name,
-                &key,
-                program,
-                connection.clone(),
-                hir,
-            )?;
+            attach::translate_attach(&expr, &db_name, &key, program, connection.clone(), hir)?;
         }
         ast::Stmt::Begin { typ, name } => translate_tx_begin(typ, name, resolver, program)?,
         ast::Stmt::Commit { name } => {
@@ -355,7 +347,7 @@ fn translate_statement(
             translate_create_virtual_table(vtab, resolver, program, connection)?
         }
         ast::Stmt::Detach { name } => {
-            attach::translate_detach(&name, resolver, program, connection.clone(), hir)?
+            attach::translate_detach(&name, program, connection.clone(), hir)?
         }
         ast::Stmt::DropIndex {
             if_exists,

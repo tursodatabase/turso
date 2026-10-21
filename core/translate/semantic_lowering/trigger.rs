@@ -197,7 +197,6 @@ fn compile_trigger(
                 jump_if_condition_is_true: false,
                 jump_target_when_true: passed,
                 jump_target_when_false: done,
-                jump_target_when_null: done,
             },
         )?;
         builder.preassign_label_to_next_insn(passed);

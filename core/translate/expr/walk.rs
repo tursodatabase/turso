@@ -1,4 +1,5 @@
-use super::*;
+use crate::Result;
+use turso_parser::ast;
 
 pub enum WalkControl {
     Continue,     // Visit children

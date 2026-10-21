@@ -245,18 +245,14 @@ fn infer_expression_primitive(
             // JSON ops fall through to the affinity machinery — `->` returns
             // JSON / blob, `->>` returns TEXT; the existing affinity rules
             // give the correct answer.
-            Operator::ArrowRight | Operator::ArrowRightShift => affinity_to_primitive(
-                translate::expr::get_expr_affinity(expr, referenced_tables, None),
-            ),
+            Operator::ArrowRight | Operator::ArrowRightShift => {
+                affinity_to_primitive(translate::expr::get_expr_affinity(expr, referenced_tables))
+            }
         },
         Expr::RowId { .. } => Some("INTEGER"),
         // CAST, column references, and anything else: defer to the affinity
         // machinery, which handles these shapes correctly.
-        _ => affinity_to_primitive(translate::expr::get_expr_affinity(
-            expr,
-            referenced_tables,
-            None,
-        )),
+        _ => affinity_to_primitive(translate::expr::get_expr_affinity(expr, referenced_tables)),
     }
 }
 
@@ -1379,11 +1375,8 @@ impl Statement {
             return affinity_to_primitive(column.affinity).map(str::to_string);
         }
         let column = &self.program.result_columns.get(idx)?;
-        let affinity = translate::expr::get_expr_affinity(
-            &column.expr,
-            Some(&self.program.table_references),
-            None,
-        );
+        let affinity =
+            translate::expr::get_expr_affinity(&column.expr, Some(&self.program.table_references));
         affinity_to_primitive(affinity).map(str::to_string)
     }
 

@@ -129,14 +129,30 @@ rewriting. Remaining parser types are frozen enums and literals already owned
 by HIR.
 
 The legacy SELECT and DML planners, their binders and emitters, and the
-bind and rewrite passes were deleted on 2026-10-21. What is left of the
-legacy expression path, and what keeps it alive:
+bind and rewrite passes were deleted on 2026-10-21. The legacy expression
+binder and translator (`expr/binding.rs`, `expr/translator.rs` and the
+condition, binary, custom-type and function emitters next to them) were
+deleted the same day, once their last callers moved to HIR:
+
+- ALTER TABLE ADD COLUMN checks a new virtual column's NOT NULL and CHECK
+  constraints against existing rows through a planned HIR SELECT of the
+  table, and DROP COLUMN finds a partial index's use of the column by name
+  in its WHERE clause.
+- ATTACH and DETACH evaluate their arguments through HIR only.
+- The DBSP expression compiler analyzes an expression over register inputs
+  through `SemanticRootInput::RegisterExpressions`, which gives it a
+  `SchemaExpressions` root whose one positional source the compiler binds
+  to registers.
+- The planner's unused WHERE, LIMIT and rowid parsers are gone.
+
+What is left of `expr/` is the helpers both HIR and the planner share: AST
+walking, affinity rules, literal emission, conditional jumps, and array and
+row-value shape checks. What remains of the legacy data types:
 
 | Legacy work | HIR replacement | Why still live |
 |---|---|---|
-| `expr/binding.rs` and the parser-expression translator in `expr/` | `semantic/expr.rs` and `semantic_lowering/expr.rs` | ALTER TABLE still computes the new row's generated columns and CHECK constraints with it and rebinds a partial index's WHERE through `Index::bind_where_expr`; ATTACH keeps a fallback for an argument without a bound value; the DBSP expression compiler uses it for pure expressions; and `planner.rs` keeps WHERE and LIMIT parsers nothing calls. The integrity check, CREATE INDEX, REINDEX and ALTER TABLE's check of existing rows read tables through a planned HIR SELECT since 2026-10-21. |
-| `TableReferences` name lookup | Semantic `Scope` and `SourceId` | The callers above hand it one table so the legacy translator can resolve column names. |
-| `TableReferences` physical facts | HIR planned sources and loops | The optimizer's cost and constraint code still reads its cursor and ordering metadata while planning HIR sources. |
+| `TableReferences` physical facts | HIR planned sources and loops | The optimizer's cost and constraint code still reads its cursor and ordering metadata while planning HIR sources; `plan.rs` still derives subquery output columns from it. |
+| `Resolver` | Semantic catalog and `HirSettings` | Schema statements, pragmas and transaction statements still look databases, functions and collations up through it. |
 
 Preserved binding restrictions, not HIR gaps:
 
@@ -819,6 +835,8 @@ The next phase must replace that production handoff. Only then can we delete:
 - `expr/binding.rs`
 - name-resolution state and methods from `TableReferences`
 - parser-expression fields retained solely by legacy plans
+
+(All of these were deleted on 2026-10-21; see the cutover deletion map.)
 
 This boundary must not be crossed by running HIR and legacy planning together,
 or by converting HIR expressions back into parser AST.

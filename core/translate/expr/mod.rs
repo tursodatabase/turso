@@ -1,89 +1,23 @@
-use crate::error::{SQLITE_CONSTRAINT_TRIGGER, SQLITE_ERROR};
-use crate::translate::optimizer::constraints::ConstraintOperator;
-use tracing::{instrument, Level};
-use turso_parser::ast::{self, Expr, ResolveType, SubqueryType, TableInternalId, UnaryOperator};
-
-use super::collate::{get_collseq_from_expr_with_symbols, CollationSeq};
-use super::emitter::Resolver;
-use super::optimizer::Optimizable;
-use super::plan::TableReferences;
-#[cfg(all(feature = "fts", not(target_family = "wasm")))]
-use crate::function::FtsFunc;
-#[cfg(feature = "json")]
-use crate::function::JsonFunc;
-use crate::function::{AggFunc, Func, FuncCtx, MathFuncArity, ScalarFunc, VectorFunc};
-use crate::functions::datetime;
-use crate::schema::{ColDef, Column, GeneratedType, Table, Type, TypeDef};
-use crate::sync::Arc;
-use crate::translate::expression_index::{
-    normalize_expr_for_index_matching, single_table_column_usage,
-};
-use crate::translate::plan::{Operation, ResultSetColumn, Search};
-use crate::translate::planner::parse_row_id;
-use crate::util::{exprs_are_equivalent, normalize_ident, parse_numeric_literal};
-use crate::vdbe::affinity::Affinity;
-use crate::vdbe::builder::{CursorKey, SelfTableContext};
-use crate::vdbe::{
-    builder::ProgramBuilder,
-    insn::{CmpInsFlags, Insn},
-    BranchOffset,
-};
-use crate::{LimboError, Numeric, Result, Value};
-
-#[macro_use]
-mod metadata;
+//! Expression helpers shared by the HIR lowering and the planner: AST
+//! walking, affinity rules, literal emission, and conditional jumps.
 
 mod affinity;
 mod arrays;
-mod binary;
-mod binding;
-mod condition;
-mod custom_types;
 mod emission;
 pub(crate) mod functions;
-mod translator;
+mod metadata;
 mod utils;
 mod vectors;
 mod walk;
 
-#[allow(unused_imports)]
-use affinity::*;
-#[allow(unused_imports)]
-use arrays::*;
-#[allow(unused_imports)]
-use binary::*;
-#[allow(unused_imports)]
-use binding::*;
-#[allow(unused_imports)]
-use condition::*;
-#[allow(unused_imports)]
-use custom_types::*;
-#[allow(unused_imports)]
-use emission::*;
-#[allow(unused_imports)]
-use functions::*;
-pub(crate) use metadata::assert_register_range_allocated as assert_vector_register_range_allocated;
-#[allow(unused_imports)]
-use metadata::*;
-#[allow(unused_imports)]
-use translator::*;
-#[allow(unused_imports)]
-use utils::*;
-#[allow(unused_imports)]
-use vectors::*;
-#[allow(unused_imports)]
-use walk::*;
-
 pub(crate) use affinity::{
     comparison_affinity, expr_data_type, get_expr_affinity, StorageClassMask,
 };
-pub(crate) use binary::expr_is_array;
-pub use binding::{bind_and_rewrite_expr, BindingBehavior};
-pub(crate) use custom_types::{emit_type_expr, emit_user_facing_column_value};
-pub use emission::{emit_function_call, emit_literal};
+pub(crate) use arrays::expr_is_array;
+pub use emission::emit_literal;
+pub(crate) use metadata::assert_register_range_allocated as assert_vector_register_range_allocated;
 pub(crate) use metadata::emit_cond_jump;
 pub use metadata::ConditionMetadata;
-pub use translator::{translate_expr, translate_expr_no_constant_opt, NoConstantOptReason};
 pub use utils::{
     as_binary_components, maybe_apply_affinity, sanitize_string, truth_test_rhs, unwrap_parens,
 };

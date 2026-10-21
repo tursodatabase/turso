@@ -32,7 +32,10 @@ use crate::{
         },
         semantic_to_plan::{HirPlan, HirRootPlan},
     },
-    vdbe::{affinity::Affinity, builder::ProgramBuilder},
+    vdbe::{
+        affinity::Affinity,
+        builder::{ProgramBuilder, SourceBinding},
+    },
     Connection, LimboError, Result,
 };
 
@@ -654,7 +657,18 @@ impl<'a> HirSession<'a> {
         input: SemanticRootInput<'_>,
         rewrite: impl FnOnce(&mut HirDocument) -> Result<()>,
     ) -> Result<Arc<HirPlan>> {
-        let mut document = analyze_root(
+        let mut document = self.analyze(input)?;
+        rewrite(&mut document)?;
+        Ok(Arc::new(HirPlan::build(
+            Arc::new(document),
+            self.schema,
+            cost_model_params(),
+        )?))
+    }
+
+    /// Analyze `input` into HIR without choosing access paths.
+    fn analyze(&self, input: SemanticRootInput<'_>) -> Result<HirDocument> {
+        analyze_root(
             &self.catalog,
             self.symbols,
             SemanticOptions {
@@ -671,14 +685,42 @@ impl<'a> HirSession<'a> {
                     && !self.connection.get_short_column_names(),
             },
             input,
-        )?;
-        rewrite(&mut document)?;
-        Ok(Arc::new(HirPlan::build(
-            Arc::new(document),
-            self.schema,
-            cost_model_params(),
-        )?))
+        )
     }
+}
+
+/// Compile `expression` over `inputs.len()` values, which the program
+/// holds in registers `0..inputs.len()` when it runs, leaving the result
+/// in `target`. The expression reads input `n` as `Register(n)`.
+pub(crate) fn translate_register_expression(
+    program: &mut ProgramBuilder,
+    expression: &ast::Expr,
+    inputs: &[String],
+    schema: &Arc<Schema>,
+    settings: &HirSettings<'_>,
+    connection: &Arc<Connection>,
+    target: usize,
+) -> Result<()> {
+    let document = HirSession::new(schema, settings, connection)?.analyze(
+        SemanticRootInput::RegisterExpressions {
+            inputs,
+            expressions: std::slice::from_ref(expression),
+        },
+    )?;
+    let HirRoot::SchemaExpressions(root) = &document.root else {
+        return Err(LimboError::InternalError(
+            "register expression analysis did not produce an expression root".into(),
+        ));
+    };
+    program.bind_source(
+        root.source,
+        SourceBinding::Registers {
+            start: 0,
+            rowid: None,
+        },
+    );
+    expr::translate_expr_no_constant_opt(program, &document, &root.expressions[0], target)?;
+    Ok(())
 }
 
 /// Make each output in `positions` of a scan's one query block read the

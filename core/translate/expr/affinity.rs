@@ -1,6 +1,8 @@
-use super::*;
+use crate::translate::plan::TableReferences;
+use crate::vdbe::affinity::Affinity;
 use crate::{translate::alter::literal_default_value, types::ValueType};
 use bitflags::bitflags;
+use turso_parser::ast;
 
 bitflags! {
     /// Storage class flags that represent the possible storage classes an expression can yield.
@@ -47,17 +49,9 @@ impl StorageClassMask {
 pub(crate) fn get_expr_affinity(
     expr: &ast::Expr,
     referenced_tables: Option<&TableReferences>,
-    resolver: Option<&Resolver>,
 ) -> Affinity {
     match expr {
         ast::Expr::Column { table, column, .. } => {
-            if table.is_self_table() {
-                if let Some(resolver) = resolver {
-                    if let Some(aff) = resolver.self_table_affinity(*column) {
-                        return aff;
-                    }
-                }
-            }
             if let Some(tables) = referenced_tables {
                 if let Some((_, table_ref)) = tables.find_table_by_internal_id(*table) {
                     if let Some(col) = table_ref.get_column_at(*column) {
@@ -82,34 +76,11 @@ pub(crate) fn get_expr_affinity(
             }
         }
         ast::Expr::Parenthesized(exprs) if exprs.len() == 1 => {
-            get_expr_affinity(exprs.first().unwrap(), referenced_tables, resolver)
+            get_expr_affinity(exprs.first().unwrap(), referenced_tables)
         }
-        ast::Expr::Collate(expr, _) => get_expr_affinity(expr, referenced_tables, resolver),
+        ast::Expr::Collate(expr, _) => get_expr_affinity(expr, referenced_tables),
         // Literals have NO affinity in SQLite.
         ast::Expr::Literal(_) => Affinity::None,
-        ast::Expr::Register(reg) => {
-            // During UPDATE expression index evaluation, column references are
-            // rewritten to Expr::Register. Look up the original column affinity
-            // from the resolver's register_affinities map.
-            if let Some(resolver) = resolver {
-                if let Some(aff) = resolver.register_affinities.get(reg) {
-                    return *aff;
-                }
-            }
-            Affinity::None
-        }
-        ast::Expr::SubqueryResult {
-            subquery_id,
-            query_type: ast::SubqueryType::RowValue { num_regs, .. },
-            ..
-        } if *num_regs == 1 => {
-            if let Some(resolver) = resolver {
-                if let Some(aff) = resolver.subquery_affinities.borrow().get(subquery_id) {
-                    return *aff;
-                }
-            }
-            Affinity::None
-        }
         _ => Affinity::None,
     }
 }
@@ -147,7 +118,7 @@ pub(crate) fn expr_data_type(
         | ast::Expr::RowId { .. }
         | ast::Expr::Cast { .. }
         | ast::Expr::Subquery(_) => {
-            let aff = get_expr_affinity(expr, referenced_tables, None);
+            let aff = get_expr_affinity(expr, referenced_tables);
             if aff.is_numeric() {
                 StorageClassMask::NUMERIC | StorageClassMask::BLOB
             } else if matches!(aff, Affinity::Text) {
@@ -205,37 +176,24 @@ pub fn comparison_affinity(
     lhs: impl HasComparableAffinity,
     rhs: impl HasComparableAffinity,
     referenced_tables: Option<&TableReferences>,
-    resolver: Option<&Resolver>,
 ) -> Affinity {
-    let lhs = lhs.comparison_affinity(referenced_tables, resolver);
-    let rhs = rhs.comparison_affinity(referenced_tables, resolver);
+    let lhs = lhs.comparison_affinity(referenced_tables);
+    let rhs = rhs.comparison_affinity(referenced_tables);
     do_comparison_affinity(lhs, rhs)
 }
 
 pub(crate) trait HasComparableAffinity {
-    fn comparison_affinity(
-        &self,
-        referenced_tables: Option<&TableReferences>,
-        resolver: Option<&Resolver>,
-    ) -> Affinity;
+    fn comparison_affinity(&self, referenced_tables: Option<&TableReferences>) -> Affinity;
 }
 
 impl HasComparableAffinity for &ast::Expr {
-    fn comparison_affinity(
-        &self,
-        referenced_tables: Option<&TableReferences>,
-        resolver: Option<&Resolver>,
-    ) -> Affinity {
-        get_expr_affinity(self, referenced_tables, resolver)
+    fn comparison_affinity(&self, referenced_tables: Option<&TableReferences>) -> Affinity {
+        get_expr_affinity(self, referenced_tables)
     }
 }
 
 impl HasComparableAffinity for Affinity {
-    fn comparison_affinity(
-        &self,
-        _referenced_tables: Option<&TableReferences>,
-        _resolver: Option<&Resolver>,
-    ) -> Affinity {
+    fn comparison_affinity(&self, _referenced_tables: Option<&TableReferences>) -> Affinity {
         *self
     }
 }

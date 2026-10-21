@@ -4647,7 +4647,6 @@ impl<'expr> hir::ExprVisitor<'expr> for ConditionLowerer<'_, 'expr> {
                     expr::ConditionMetadata {
                         jump_if_condition_is_true: true,
                         jump_target_when_false: next_operand,
-                        jump_target_when_null: next_operand,
                         ..metadata
                     },
                 )))
@@ -9890,7 +9889,6 @@ mod tests {
                     jump_if_condition_is_true: false,
                     jump_target_when_true: when_true,
                     jump_target_when_false: when_false,
-                    jump_target_when_null: when_false,
                 },
             )
             .expect("condition lowers");
@@ -9936,7 +9934,6 @@ mod tests {
                 jump_if_condition_is_true: false,
                 jump_target_when_true: when_true,
                 jump_target_when_false: when_false,
-                jump_target_when_null: when_false,
             },
         )
         .expect("deep condition lowers");

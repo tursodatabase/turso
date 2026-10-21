@@ -48,7 +48,7 @@ use super::emitter::OperationMode;
 /// The affinity (and whether it's a real declared one) determines comparison
 /// behavior in IN expressions, etc.
 fn infer_type_from_expr(expr: &ast::Expr, tables: Option<&TableReferences>) -> Affinity {
-    get_expr_affinity(expr, tables, None)
+    get_expr_affinity(expr, tables)
 }
 
 /// Computes the affinity of column `i` of a compound (UNION/INTERSECT/EXCEPT)
@@ -68,7 +68,7 @@ fn compound_column_affinity(arms: &[&SelectPlan], i: usize) -> Affinity {
     let col_affinities = |arm: &SelectPlan| {
         arm.result_columns
             .get(i)
-            .map(|rc| get_expr_affinity(&rc.expr, Some(&arm.table_references), None))
+            .map(|rc| get_expr_affinity(&rc.expr, Some(&arm.table_references)))
             .unwrap_or(Affinity::None)
     };
     let col_data_type = |arm: &SelectPlan| {
@@ -169,7 +169,7 @@ impl ResultSetColumn {
     /// Returns the canonical short type name for this column's affinity,
     /// matching SQLite's `azType[]` in `createTableStmt()` (build.c).
     pub fn declared_type(&self, tables: &TableReferences) -> &'static str {
-        get_expr_affinity(&self.expr, Some(tables), None).short_type_name()
+        get_expr_affinity(&self.expr, Some(tables)).short_type_name()
     }
 }
 

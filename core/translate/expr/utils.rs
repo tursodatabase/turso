@@ -1,4 +1,9 @@
-use super::*;
+use super::expr_vector_size;
+use crate::schema::Type;
+use crate::translate::optimizer::constraints::ConstraintOperator;
+use crate::vdbe::{builder::ProgramBuilder, insn::Insn};
+use crate::Result;
+use turso_parser::ast;
 
 pub fn maybe_apply_affinity(col_type: Type, target_register: usize, program: &mut ProgramBuilder) {
     if col_type == Type::Real {

@@ -6,6 +6,7 @@ use crate::{
     schema::{Type, TypeDef},
     sync::Arc,
     util::parse_numeric_literal,
+    vdbe::affinity::Affinity,
     LimboError, Result, Value,
 };
 
@@ -15,10 +16,10 @@ use super::{
     hir::{
         BoundSchemaProgram, CatalogObjectId, ColumnReadExpression, ColumnRef, CompoundArm, Cte,
         CteId, DatabaseId, Delete, DeleteTargetKind, Expr, FunctionEvaluation, HirDocument,
-        HirRoot, Insert, InsertTargetKind, Limit, OrderTerm, Output, OutputId, OutputNameKind,
-        OutputOwner, Query, QueryBlock, QueryBlockBody, QueryBlockId, QueryId, QueryRoot,
-        SchemaProgramId, Source, SourceId, SourceKind, TriggerBody, TriggerCommand, TypeFact,
-        Update, UpdateTargetKind,
+        HirRoot, IndexCoverage, IndexHint, Insert, InsertTargetKind, Limit, OrderTerm, Output,
+        OutputId, OutputNameKind, OutputOwner, Query, QueryBlock, QueryBlockBody, QueryBlockId,
+        QueryId, QueryRoot, SchemaExpressionRoot, SchemaProgramId, Source, SourceColumn, SourceId,
+        SourceKind, SourceOwner, TriggerBody, TriggerCommand, TypeFact, Update, UpdateTargetKind,
     },
     query::FromContext,
     scope::{ExpandedColumn, ExprCollation, ResolvedScopeExpr, Scope},
@@ -91,6 +92,10 @@ pub(crate) fn analyze<'context, 'catalog, 'ast>(
             analyzer.analyze_trigger_delete(context, delete)?
         }
         AnalyzeInput::TriggerProgram(input) => analyzer.analyze_trigger_program(input)?,
+        AnalyzeInput::RegisterExpressions {
+            inputs,
+            expressions,
+        } => analyzer.analyze_register_expressions(inputs, expressions)?,
     };
     analyzer.finish_column_reads(&root)?;
     let document = analyzer.finish(root)?;
@@ -123,9 +128,7 @@ fn collect_root_dml<'a>(
                 }
             }
         },
-        HirRoot::Query(_) => {}
-        #[cfg(test)]
-        HirRoot::SchemaExpressions(_) => {}
+        HirRoot::Query(_) | HirRoot::SchemaExpressions(_) => {}
     }
 }
 
@@ -160,6 +163,9 @@ pub(super) struct Analyzer<'context, 'catalog, 'ast> {
     /// For each subquery being analyzed, the block of the expression it is
     /// in, when that expression may hold aggregates.
     pub(super) aggregate_hosts: Vec<Option<QueryBlockId>>,
+    /// The source a `Register(n)` expression reads column `n` of, while
+    /// expressions over register inputs are analyzed.
+    pub(super) register_source: Option<SourceId>,
     /// Stored view SELECTs live in the catalog and are analyzed like the
     /// statement's own AST, so the catalog must outlive the AST borrow.
     _catalog_outlives_ast: std::marker::PhantomData<&'ast &'catalog ()>,
@@ -231,8 +237,67 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
             views_in_progress: Vec::new(),
             aggregate_counts: HashMap::default(),
             aggregate_hosts: Vec::new(),
+            register_source: None,
             _catalog_outlives_ast: std::marker::PhantomData,
         }
+    }
+
+    /// Analyze `expressions` over `inputs.len()` values that the consumer
+    /// holds in registers, which the expressions read as `Register(n)`.
+    /// The inputs have no declared types, like the values an incremental
+    /// view operator computes.
+    fn analyze_register_expressions(
+        &mut self,
+        inputs: &[String],
+        expressions: &[ast::Expr],
+    ) -> Result<HirRoot> {
+        let source_id = self.reserve_source();
+        let columns = inputs
+            .iter()
+            .map(|name| SourceColumn {
+                name: name.clone(),
+                type_fact: TypeFact::dynamic(),
+                affinity: Affinity::Blob,
+                has_affinity: false,
+                collation: None,
+                hidden: false,
+                rowid_alias: false,
+            })
+            .collect::<Vec<_>>();
+        let width = columns.len();
+        let source = Source {
+            id: source_id,
+            owner: SourceOwner::Root,
+            database: None,
+            name: "register inputs".to_string(),
+            alias: None,
+            kind: SourceKind::SchemaExpression,
+            columns,
+            generated_expressions: vec![ColumnReadExpression::Absent; width],
+            default_expressions: vec![ColumnReadExpression::Absent; width],
+            column_type_programs: vec![None; width],
+            check_constraints: None,
+            rowid_available: false,
+            index_hint: IndexHint::None,
+            index_expressions: Vec::new(),
+            index_coverage: IndexCoverage::Selective,
+            index_method_patterns: Vec::new(),
+        };
+        let mut scope = Scope::default();
+        scope.add_source(&source, true);
+        self.insert_source(source_id, source)?;
+        self.register_source = Some(source_id);
+        let expressions = expressions
+            .iter()
+            .map(|expression| {
+                self.analyze_expr(expression, &scope, ExprPolicy::schema_expression())
+            })
+            .collect::<Result<Vec<_>>>()?;
+        self.register_source = None;
+        Ok(HirRoot::SchemaExpressions(SchemaExpressionRoot {
+            source: source_id,
+            expressions,
+        }))
     }
 
     pub(super) const fn context(&self) -> &SemanticContext<'catalog> {

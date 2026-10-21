@@ -266,7 +266,6 @@ impl<'document> HirValidator<'document> {
                     }
                 }
             }
-            #[cfg(test)]
             HirRoot::SchemaExpressions(root) => {
                 self.visit_source(root.source, Some(SourceOwner::Root))?;
                 for expression in &root.expressions {

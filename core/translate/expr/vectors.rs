@@ -1,4 +1,7 @@
-use super::*;
+use super::unwrap_parens;
+use crate::translate::semantic::supports_row_value_binary_comparison;
+use crate::Result;
+use turso_parser::ast::{self, Expr, SubqueryType};
 
 /// Get the number of values returned by an expression
 pub fn expr_vector_size(expr: &Expr) -> Result<usize> {
@@ -20,7 +23,7 @@ pub fn expr_vector_size(expr: &Expr) -> Result<usize> {
             if evs_left != evs_right {
                 crate::bail_parse_error!("row value misused");
             }
-            if evs_left > 1 && !supports_row_value_binary_comparison(operator) {
+            if evs_left > 1 && !supports_row_value_binary_comparison(*operator) {
                 crate::bail_parse_error!("row value misused");
             }
             1

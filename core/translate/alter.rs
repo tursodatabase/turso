@@ -1,10 +1,7 @@
 use crate::alloc::TursoIteratorExt;
 use crate::sync::Arc;
 use crate::{bail_parse_error, schema::BTreeTable, turso_assert_eq, turso_assert_ne};
-use turso_parser::{
-    ast::{self, TableInternalId},
-    parser::Parser,
-};
+use turso_parser::{ast, parser::Parser};
 
 use super::{
     schema::{validate_check_expr, SQLITE_TABLEID},
@@ -13,11 +10,12 @@ use super::{
 use crate::{
     error::SQLITE_CONSTRAINT_CHECK,
     function::{AlterTableFunc, Func},
-    schema::{CheckConstraint, Column, ColumnLayout, ForeignKey, Table, RESERVED_TABLE_PREFIXES},
+    schema::{
+        CheckConstraint, Column, ColumnLayout, ForeignKey, GeneratedType, RESERVED_TABLE_PREFIXES,
+    },
     translate::{
-        emitter::{emit_check_constraints, gencol::compute_virtual_columns, Resolver},
+        emitter::Resolver,
         expr::{walk_expr, walk_expr_mut, WalkControl},
-        plan::{ColumnMask, ColumnUsedMask, OuterQueryReference, TableReferences},
         trigger::create_trigger_to_sql,
     },
     util::{
@@ -27,7 +25,7 @@ use crate::{
     },
     vdbe::{
         affinity::Affinity,
-        builder::{CursorType, DmlColumnContext, ProgramBuilder},
+        builder::{CursorType, ProgramBuilder},
         insn::{to_u32, AddColumnData, CmpInsFlags, Cookie, Insn, RegisterOrLiteral},
     },
     vtab::VirtualTable,
@@ -562,16 +560,19 @@ fn emit_add_column_default_type_validation(
     Ok(())
 }
 
-/// Validate NOT NULL and CHECK constraints for a new virtual generated column
-/// by scanning each row and computing the expression.
-#[allow(clippy::too_many_arguments)]
+/// Check NOT NULL and the CHECK constraints of a new virtual generated
+/// column against every existing row, as SQLite does. The rows are read
+/// through a planned HIR SELECT of the table as it is before the column is
+/// added: the column's value is its expression, and each CHECK has the
+/// column's name replaced by that expression. Like DML, a CHECK reads
+/// custom-typed columns as stored.
 fn emit_add_virtual_column_validation(
     program: &mut ProgramBuilder,
     table: &BTreeTable,
     column: &Column,
     constraints: &[ast::NamedColumnConstraint],
-    resolver: &Resolver,
     connection: &Arc<crate::Connection>,
+    hir: crate::translate::HirContext<'_>,
     database_id: usize,
 ) -> Result<()> {
     let has_notnull = column.notnull();
@@ -594,120 +595,135 @@ fn emit_add_virtual_column_validation(
     if !has_notnull && check_constraints.is_empty() {
         return Ok(());
     }
-
-    let mut resolved_table = table.clone();
-    resolved_table.prepare_generated_columns()?;
-    let new_column_name = column
+    let GeneratedType::Virtual {
+        expr: generated, ..
+    } = column.generated_type()
+    else {
+        return Err(LimboError::InternalError(
+            "new virtual column has no generation expression".to_string(),
+        ));
+    };
+    // A table whose generated columns were prepared holds the expression
+    // with its columns resolved to positions; the planned SELECT needs
+    // their names.
+    let mut generated = ast::Expr::clone(generated);
+    name_self_table_columns(&mut generated, table.columns());
+    let generated = &generated;
+    let column_name = column
         .name
         .as_deref()
         .ok_or_else(|| LimboError::ParseError("generated column name is missing".to_string()))?;
-    let (new_column_idx, _) = resolved_table.get_column(new_column_name).ok_or_else(|| {
-        LimboError::ParseError(format!(
-            "new generated column unexpectedly missing from table {}",
-            resolved_table.name
-        ))
-    })?;
-
-    let mut original_table = table.clone();
-    original_table
-        .columns_mut()
-        .retain(|c| !c.is_virtual_generated());
-    let original_table = Arc::new(original_table);
-    let cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(original_table.clone()));
-    program.emit_insn(Insn::OpenRead {
-        cursor_id,
-        root_page: original_table.root_page,
-        db: database_id,
-    });
-
-    let skip_label = program.allocate_label();
-    let loop_start = program.allocate_label();
-    program.emit_insn(Insn::Rewind {
-        cursor_id,
-        pc_if_empty: skip_label,
-    });
-    program.preassign_label_to_next_insn(loop_start);
-
-    let rowid_reg = program.alloc_register();
-    program.emit_insn(Insn::RowId {
-        cursor_id,
-        dest: rowid_reg,
-    });
-
-    let layout = resolved_table.column_layout()?;
-    let base_dest_reg = program.alloc_registers(layout.column_count());
-    for (idx, table_column) in resolved_table.columns().iter().enumerate() {
-        if table_column.is_virtual_generated() || table_column.is_rowid_alias() {
-            continue;
-        }
-
-        program.emit_column_or_rowid(
-            cursor_id,
-            layout.to_reg_offset(idx),
-            layout.to_register(base_dest_reg, idx),
+    let table_name = &table.name;
+    let col_name_lower = normalize_ident(column_name);
+    // A CHECK that names the new column reads its expression instead.
+    let substitute = |check: &ast::Expr| -> ast::Expr {
+        let mut substituted = check.clone();
+        let _ = walk_expr_mut(
+            &mut substituted,
+            &mut |e: &mut ast::Expr| -> Result<WalkControl> {
+                match e {
+                    ast::Expr::Id(name) if normalize_ident(name.as_str()) == col_name_lower => {
+                        *e = ast::Expr::clone(generated);
+                        Ok(WalkControl::SkipChildren)
+                    }
+                    ast::Expr::Qualified(tbl, col)
+                        if normalize_ident(tbl.as_str()) == normalize_ident(table_name)
+                            && normalize_ident(col.as_str()) == col_name_lower =>
+                    {
+                        *e = ast::Expr::clone(generated);
+                        Ok(WalkControl::SkipChildren)
+                    }
+                    _ => Ok(WalkControl::Continue),
+                }
+            },
         );
+        substituted
+    };
+
+    let mut values = Vec::with_capacity(check_constraints.len() + 1);
+    for check in &check_constraints {
+        values.push(crate::translate::semantic_lowering::ScanValue::Stored(
+            substitute(&check.expr),
+        ));
     }
-
-    let dml_ctx =
-        DmlColumnContext::layout(resolved_table.columns(), base_dest_reg, rowid_reg, layout);
-    let resolved_table_arc = Arc::new(resolved_table.clone());
-    compute_virtual_columns(
-        program,
-        &resolved_table.columns_topo_sort()?,
-        &dml_ctx,
-        resolver,
-        &resolved_table_arc,
-    )?;
-    let result_reg = dml_ctx.to_column_reg(new_column_idx);
-
-    if !check_constraints.is_empty() {
-        let mut check_resolver = resolver.fork();
-        let skip_row_label = program.allocate_label();
-        emit_check_constraints(
-            program,
-            &check_constraints,
-            &mut check_resolver,
-            resolved_table.name.as_str(),
-            rowid_reg,
-            resolved_table
-                .columns()
-                .iter()
-                .enumerate()
-                .filter_map(|(idx, col)| {
-                    col.name
-                        .as_deref()
-                        .map(|name| (name, dml_ctx.to_column_reg(idx)))
-                }),
-            connection,
-            ast::ResolveType::Abort,
-            skip_row_label,
-            None,
-        )?;
-    }
-
     if has_notnull {
-        let notnull_passed = program.allocate_label();
-        program.emit_insn(Insn::NotNull {
-            reg: result_reg,
-            target_pc: notnull_passed,
-        });
-        program.emit_insn(Insn::Halt {
-            err_code: 1,
-            description: "NOT NULL constraint failed".to_string(),
-            on_error: None,
-            description_reg: None,
-        });
-        program.preassign_label_to_next_insn(notnull_passed);
+        values.push(crate::translate::semantic_lowering::ScanValue::Expr(
+            ast::Expr::clone(generated),
+        ));
     }
+    let (schema, settings) = hir;
+    let database = connection
+        .get_database_name_by_index(database_id)
+        .ok_or_else(|| LimboError::InternalError(format!("no database with id {database_id}")))?;
+    let select = crate::translate::semantic_lowering::PlannedSelect::scan(
+        values,
+        database,
+        table.name.clone(),
+        None,
+        schema,
+        settings,
+        connection,
+    )?;
+    select.emit_each_row(program, |program, values| {
+        // Like SQLite, a NULL value is reported before a failed CHECK of
+        // the same row.
+        if has_notnull {
+            let notnull_passed = program.allocate_label();
+            program.emit_insn(Insn::NotNull {
+                reg: values + check_constraints.len(),
+                target_pc: notnull_passed,
+            });
+            program.emit_insn(Insn::Halt {
+                err_code: 1,
+                description: "NOT NULL constraint failed".to_string(),
+                on_error: None,
+                description_reg: None,
+            });
+            program.preassign_label_to_next_insn(notnull_passed);
+        }
+        for (i, check) in check_constraints.iter().enumerate() {
+            emit_check_result(program, values + i, &check.error_description());
+        }
+        Ok(())
+    })
+}
 
-    program.emit_insn(Insn::Next {
-        cursor_id,
-        pc_if_next: loop_start,
-        fullscan: false,
+/// Replace each column of the table itself that was resolved to a position
+/// by its name, so the expression can be analyzed again.
+fn name_self_table_columns(expr: &mut ast::Expr, columns: &[Column]) {
+    // The closure is infallible, so walk_expr_mut cannot fail.
+    let _ = walk_expr_mut(expr, &mut |e: &mut ast::Expr| -> Result<WalkControl> {
+        if let ast::Expr::Column { table, column, .. } = e {
+            if table.is_self_table() {
+                if let Some(name) = columns.get(*column).and_then(|c| c.name.as_deref()) {
+                    *e = ast::Expr::Id(ast::Name::exact(name.to_string()));
+                }
+            }
+        }
+        Ok(WalkControl::Continue)
     });
+}
 
-    program.preassign_label_to_next_insn(skip_label);
-    Ok(())
+/// Halt with a CHECK constraint error unless `result_reg` holds NULL or a
+/// true value, as SQLite passes a CHECK whose result is unknown.
+fn emit_check_result(program: &mut ProgramBuilder, result_reg: usize, description: &str) {
+    let check_passed_label = program.allocate_label();
+    program.emit_insn(Insn::IsNull {
+        reg: result_reg,
+        target_pc: check_passed_label,
+    });
+    program.emit_insn(Insn::If {
+        reg: result_reg,
+        target_pc: check_passed_label,
+        jump_if_null: false,
+    });
+    program.emit_insn(Insn::Halt {
+        err_code: SQLITE_CONSTRAINT_CHECK,
+        description: description.to_string(),
+        on_error: None,
+        description_reg: None,
+    });
+    program.preassign_label_to_next_insn(check_passed_label);
 }
 
 /// Validate CHECK constraints on a newly added column against the column's DEFAULT value.
@@ -805,9 +821,8 @@ fn emit_add_column_check_validation(
         })
         .collect();
 
-    // CHECK passes if the result is NULL or non-zero (truthy); otherwise halt
-    // with a constraint error. SQLite reports the constraint name, or the
-    // expression's source text as written.
+    // SQLite reports the constraint name, or the expression's source text as
+    // written.
     let emit_check = |program: &mut ProgramBuilder,
                       result_reg: usize,
                       (constraint_name, check_source, check_expr): &(
@@ -815,32 +830,12 @@ fn emit_add_column_check_validation(
         Option<String>,
         Box<ast::Expr>,
     )| {
-        let check_passed_label = program.allocate_label();
-
-        program.emit_insn(Insn::IsNull {
-            reg: result_reg,
-            target_pc: check_passed_label,
-        });
-
-        program.emit_insn(Insn::If {
-            reg: result_reg,
-            target_pc: check_passed_label,
-            jump_if_null: false,
-        });
-
         let name = match (constraint_name, check_source) {
             (Some(name), _) => name.clone(),
             (None, Some(source)) => crate::util::check_source_for_error(source),
             (None, None) => format!("{check_expr}"),
         };
-        program.emit_insn(Insn::Halt {
-            err_code: SQLITE_CONSTRAINT_CHECK,
-            description: name,
-            on_error: None,
-            description_reg: None,
-        });
-
-        program.preassign_label_to_next_insn(check_passed_label);
+        emit_check_result(program, result_reg, &name);
     };
 
     // Every existing row is checked, with its other columns read from the
@@ -1008,51 +1003,8 @@ pub fn translate_alter_table(
                     }
                 }
                 // Referenced in partial index
-                if index.where_clause.is_some() {
-                    let mut table_references = TableReferences::new(
-                        vec![],
-                        vec![OuterQueryReference {
-                            identifier: table_name.to_string(),
-                            internal_id: TableInternalId::from(0),
-                            table: Table::BTree(Arc::new(btree.clone())),
-                            using_dedup_hidden_cols: ColumnMask::default(),
-                            col_used_mask: ColumnUsedMask::default(),
-                            cte_select: None,
-                            cte_explicit_columns: vec![],
-                            cte_id: None,
-                            cte_definition_only: false,
-                            rowid_referenced: false,
-                            scope_depth: 0,
-                        }],
-                    );
-                    let where_copy = index
-                        .bind_where_expr(Some(&mut table_references), resolver)?
-                        .ok_or_else(|| {
-                            LimboError::ParseError(
-                                "index where clause unexpectedly missing".to_string(),
-                            )
-                        })?;
-                    let mut column_referenced = false;
-                    walk_expr(
-                        &where_copy,
-                        &mut |e: &ast::Expr| -> crate::Result<WalkControl> {
-                            if let ast::Expr::Column {
-                                table,
-                                column: column_index,
-                                ..
-                            } = e
-                            {
-                                if *table == TableInternalId::from(0)
-                                    && *column_index == dropped_index
-                                {
-                                    column_referenced = true;
-                                    return Ok(WalkControl::SkipChildren);
-                                }
-                            }
-                            Ok(WalkControl::Continue)
-                        },
-                    )?;
-                    if column_referenced {
+                if let Some(where_clause) = index.where_clause.as_deref() {
+                    if check_expr_references_column(where_clause, &col_normalized) {
                         return Err(LimboError::ParseError(format!(
                             "cannot drop column \"{column_name}\": indexed"
                         )));
@@ -1478,8 +1430,8 @@ pub fn translate_alter_table(
                     &btree,
                     &column,
                     &constraints,
-                    resolver,
                     connection,
+                    hir,
                     database_id,
                 )?;
             } else {
@@ -2264,8 +2216,8 @@ pub fn translate_alter_table(
                     &rewritten_table,
                     &rewritten_table.columns()[column_index],
                     &definition.constraints,
-                    resolver,
                     connection,
+                    hir,
                     database_id,
                 )?;
 

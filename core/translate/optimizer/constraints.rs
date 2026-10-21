@@ -19,7 +19,6 @@ use crate::{
             TableMask, ROWID_STRS,
         },
         semantic::hir,
-        Resolver,
     },
     util::exprs_are_equivalent,
     vdbe::affinity::Affinity,
@@ -144,7 +143,6 @@ impl Constraint<ast::Expr> {
         &self,
         where_clause: &[WhereTerm],
         referenced_tables: Option<&TableReferences>,
-        resolver: Option<&Resolver>,
     ) -> (ast::Operator, ast::Expr, Affinity) {
         // For multi-index branches, use the pre-computed constraining expression
         if let Some(constraining) = &self.constraining_expr {
@@ -158,11 +156,7 @@ impl Constraint<ast::Expr> {
         };
         let mut affinity = Affinity::Blob;
         if op.as_ast_operator().is_some_and(|op| op.is_comparison()) {
-            // The resolver matters here: a scalar subquery's affinity is only
-            // known through it. Without it, `text_col < (SELECT int_col ...)`
-            // would take the TEXT side's affinity and the seek would compare
-            // the integer as text.
-            affinity = comparison_affinity(lhs, rhs, referenced_tables, resolver);
+            affinity = comparison_affinity(lhs, rhs, referenced_tables);
         }
 
         if side == BinaryExprSide::Lhs {
@@ -1741,7 +1735,7 @@ pub fn constraints_from_where_clause(
                 let cmp_aff = operator
                     .as_ast_operator()
                     .filter(|op| op.is_comparison())
-                    .map(|_| comparison_affinity(lhs, rhs, Some(table_references), None));
+                    .map(|_| comparison_affinity(lhs, rhs, Some(table_references)));
                 // A WHERE term must not constrain the loop of a table that an
                 // outer join can null-extend, with two exceptions below.
                 // Consuming the term into the access path filters that table's
@@ -2009,7 +2003,7 @@ pub fn constraints_from_where_clause(
                 let selectivity = estimate_in_selectivity(estimated_values, row_count, *not);
                 // SQLite's `comparisonAffinity` for IN-list (`x IN (lit, ...)`)
                 // is the LHS column's affinity; the RHS literals are not folded.
-                let cmp_aff = Some(get_expr_affinity(lhs, Some(table_references), None));
+                let cmp_aff = Some(get_expr_affinity(lhs, Some(table_references)));
 
                 match lhs.as_ref() {
                     ast::Expr::Column { table, column, .. }
@@ -3257,7 +3251,7 @@ pub(crate) fn analyze_binary_term_for_index(
     // Compute the affinity for the constraining expression
     let affinity = if let Some(ast_op) = operator.as_ast_operator() {
         if ast_op.is_comparison() && table_col_pos.is_some() {
-            comparison_affinity(lhs, rhs, Some(table_references), None)
+            comparison_affinity(lhs, rhs, Some(table_references))
         } else {
             Affinity::Blob
         }

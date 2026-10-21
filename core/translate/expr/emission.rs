@@ -1,5 +1,10 @@
-use super::*;
+use super::sanitize_string;
 use crate::alloc::TursoIteratorExt;
+use crate::functions::datetime;
+use crate::util::parse_numeric_literal;
+use crate::vdbe::{builder::ProgramBuilder, insn::Insn};
+use crate::{Numeric, Result, Value};
+use turso_parser::ast;
 
 /// Emit literal values - shared between regular and RETURNING expression evaluation
 pub fn emit_literal(
@@ -105,28 +110,4 @@ pub fn emit_literal(
             Ok(target_register)
         }
     }
-}
-
-/// Emit a function call instruction with pre-allocated argument registers
-/// This is shared between different function call contexts
-pub fn emit_function_call(
-    program: &mut ProgramBuilder,
-    func_ctx: FuncCtx,
-    arg_registers: &[usize],
-    target_register: usize,
-) -> Result<()> {
-    let start_reg = if arg_registers.is_empty() {
-        target_register // If no arguments, use target register as start
-    } else {
-        arg_registers[0] // Use first argument register as start
-    };
-
-    program.emit_insn(Insn::Function {
-        constant_mask: 0,
-        start_reg,
-        dest: target_register,
-        func: func_ctx,
-    });
-
-    Ok(())
 }

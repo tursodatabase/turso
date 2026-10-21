@@ -1655,7 +1655,7 @@ impl DbspCompiler {
         let temp_syms = SymbolTable::new();
 
         // Get a minimal schema for compilation (we don't need the full schema for expressions)
-        let schema = crate::schema::Schema::new();
+        let schema = Arc::new(crate::schema::Schema::new());
 
         // Compile the expression using the existing CompiledExpression::compile
         let compiled = CompiledExpression::compile(

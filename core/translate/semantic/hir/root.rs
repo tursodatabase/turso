@@ -23,14 +23,14 @@ pub enum HirRoot {
     Update(Update),
     Delete(Delete),
     Trigger(TriggerRoot),
-    /// A batch of stored expressions over one source, which the planner
-    /// tests analyze on their own.
-    #[cfg(test)]
+    /// A batch of expressions over one positional source whose columns the
+    /// consumer binds to registers: the values a materialized view computes
+    /// from an operator's row, and the stored expressions the planner tests
+    /// analyze on their own.
     SchemaExpressions(SchemaExpressionRoot),
 }
 
-/// A closed batch of stored expressions sharing one positional source.
-#[cfg(test)]
+/// A closed batch of expressions sharing one positional source.
 #[derive(Clone, Debug)]
 pub struct SchemaExpressionRoot {
     pub source: SourceId,

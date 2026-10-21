@@ -317,7 +317,6 @@ pub(crate) enum HirRootPlan {
     Update(HirAccessPlan),
     Delete(HirAccessPlan),
     Trigger(HirTriggerPlan),
-    #[cfg(test)]
     SchemaExpressions,
 }
 
@@ -806,7 +805,6 @@ impl<'a> HirPlanContext<'a> {
             hir::HirRoot::Trigger(trigger) => self
                 .plan_trigger(trigger, schema, params, query_estimate)
                 .map(HirRootPlan::Trigger),
-            #[cfg(test)]
             hir::HirRoot::SchemaExpressions(_) => Ok(HirRootPlan::SchemaExpressions),
         }
     }

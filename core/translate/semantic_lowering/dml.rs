@@ -272,7 +272,6 @@ pub(super) fn emit_access_predicates(
                 jump_if_condition_is_true: false,
                 jump_target_when_true: passed,
                 jump_target_when_false: fail,
-                jump_target_when_null: fail,
             },
         )?;
         program.preassign_label_to_next_insn(passed);

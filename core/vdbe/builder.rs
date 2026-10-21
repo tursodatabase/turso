@@ -8,7 +8,7 @@ use turso_parser::ast::{self, ResolveType, SortOrder, TableInternalId};
 use crate::{
     index_method::IndexMethodAttachment,
     parameters::{ParameterSpelling, Parameters},
-    schema::{BTreeTable, Column, ColumnLayout, Index, PseudoCursorType, Schema, Table, Trigger},
+    schema::{BTreeTable, Index, PseudoCursorType, Schema, Table, Trigger},
     translate::{
         collate::CollationSeq,
         emitter::{MaterializedColumnRef, TransactionMode},
@@ -172,56 +172,6 @@ impl CursorKey {
     }
 }
 
-/// Context for resolving `Expr::Column` that has a `TableInternalId::SELF_TABLE` placeholder.
-#[derive(Clone)]
-pub enum SelfTableContext {
-    ForSelect {
-        table_ref_id: TableInternalId,
-        referenced_tables: TableReferences,
-    },
-    ForDML {
-        dml_ctx: DmlColumnContext,
-        table: Arc<BTreeTable>,
-    },
-}
-
-/// Where a DML statement keeps the values of the row it writes: the
-/// columns in `layout` from `base_reg`, and the rowid alias, if any, in
-/// `rowid_reg`.
-#[derive(Clone)]
-pub struct DmlColumnContext {
-    base_reg: usize,
-    rowid_reg: usize,
-    layout: ColumnLayout,
-    rowid_alias_col: Option<usize>,
-}
-
-impl DmlColumnContext {
-    pub fn layout(
-        columns: &[Column],
-        base_reg: usize,
-        rowid_reg: usize,
-        layout: ColumnLayout,
-    ) -> Self {
-        let rowid_alias_col = columns.iter().position(|c| c.is_rowid_alias());
-
-        Self {
-            base_reg,
-            rowid_reg,
-            layout,
-            rowid_alias_col,
-        }
-    }
-
-    pub fn to_column_reg(&self, col_idx: usize) -> usize {
-        if self.rowid_alias_col == Some(col_idx) {
-            self.rowid_reg
-        } else {
-            self.layout.to_register(self.base_reg, col_idx)
-        }
-    }
-}
-
 enum BuilderQueryMode {
     Normal,
     Explain,
@@ -378,21 +328,6 @@ pub struct ProgramBuilder {
     next_cte_id: usize,
     /// Counter for subquery numbering in EXPLAIN QUERY PLAN output.
     next_subquery_eqp_id: usize,
-    /// Write-context for union-typed columns: tells `union_value('tag', val)`
-    /// which union TypeDef to resolve the tag against.
-    ///
-    /// Unlike read-path functions (`union_tag(col)`, `union_extract(col, 'tag')`)
-    /// which resolve the union type from the column expression they operate on,
-    /// `union_value()` constructs a *new* value — the SQL syntax doesn't reference
-    /// the target column, so the type must come from the INSERT/UPDATE/UPSERT context.
-    ///
-    /// This follows the same save/restore pattern as `id_register_overrides`
-    /// (ENCODE/DECODE context).
-    /// Callers must save with `.take()`, set the new value, translate the expression,
-    /// then restore the saved value. For nested unions (union-in-union), the
-    /// `UnionValueFunc` handler in expr.rs saves/restores this to the inner union
-    /// type before translating the value argument.
-    pub(crate) target_union_type: Option<Arc<crate::schema::TypeDef>>,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -834,7 +769,6 @@ impl ProgramBuilder {
             materialized_ctes: HashMap::default(),
             ctes_being_defined: Vec::new(),
             next_subquery_eqp_id: 1,
-            target_union_type: None,
         }
     }
 
@@ -1195,7 +1129,7 @@ impl ProgramBuilder {
     }
 
     /// Get the index of the next constant span.
-    /// Used in [crate::translate::expr::translate_expr_no_constant_opt()] to invalidate
+    /// Used in [crate::translate::semantic_lowering::expr::translate_expr_no_constant_opt()] to invalidate
     /// all constant spans after the given index.
     pub const fn constant_spans_next_idx(&self) -> usize {
         self.constant_spans.len()
@@ -1203,7 +1137,7 @@ impl ProgramBuilder {
 
     /// Invalidate all constant spans after the given index. This is used when we want to
     /// be sure that constant optimization is never used for translating a given expression.
-    /// See [crate::translate::expr::translate_expr_no_constant_opt()] for more details.
+    /// See [crate::translate::semantic_lowering::expr::translate_expr_no_constant_opt()] for more details.
     pub fn constant_spans_invalidate_after(&mut self, idx: usize) {
         self.constant_spans.truncate(idx);
     }

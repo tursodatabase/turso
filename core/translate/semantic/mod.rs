@@ -7,6 +7,7 @@ mod cte;
 mod delete;
 mod dml;
 mod expr;
+pub(crate) use expr::supports_row_value_binary_comparison;
 pub(crate) mod hir;
 mod insert;
 mod query;
@@ -43,6 +44,11 @@ pub(crate) enum SemanticRootInput<'ast> {
         predicate: Option<&'ast turso_parser::ast::Expr>,
         commands: &'ast [turso_parser::ast::TriggerCmd],
         conflict_override: Option<turso_parser::ast::ResolveType>,
+    },
+    /// Expressions over values held in registers, read as `Register(n)`.
+    RegisterExpressions {
+        inputs: &'ast [String],
+        expressions: &'ast [turso_parser::ast::Expr],
     },
 }
 
@@ -94,6 +100,13 @@ pub(crate) fn analyze_root(
                 conflict_override,
             })
         }
+        SemanticRootInput::RegisterExpressions {
+            inputs,
+            expressions,
+        } => AnalyzeInput::RegisterExpressions {
+            inputs,
+            expressions,
+        },
     };
     analyze::analyze(&context, input)
 }
@@ -127,6 +140,10 @@ pub(crate) enum AnalyzeInput<'ast> {
         delete: TriggerDelete<'ast>,
     },
     TriggerProgram(TriggerProgramInput<'ast>),
+    RegisterExpressions {
+        inputs: &'ast [String],
+        expressions: &'ast [turso_parser::ast::Expr],
+    },
 }
 
 pub(crate) struct TriggerProgramInput<'ast> {

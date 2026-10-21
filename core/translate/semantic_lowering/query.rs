@@ -1213,7 +1213,6 @@ fn emit_query_block_without_from(
                         jump_if_condition_is_true: false,
                         jump_target_when_true: emit_row,
                         jump_target_when_false: block_done,
-                        jump_target_when_null: block_done,
                     },
                 )?;
                 program.preassign_label_to_next_insn(emit_row);
@@ -1562,7 +1561,6 @@ fn emit_hir_ungrouped_without_from(
                 jump_if_condition_is_true: false,
                 jump_target_when_true: emit_step,
                 jump_target_when_false: scan_done,
-                jump_target_when_null: scan_done,
             },
         )?;
         program.preassign_label_to_next_insn(emit_step);
@@ -2388,7 +2386,6 @@ fn emit_hir_group_result(
                 jump_if_condition_is_true: false,
                 jump_target_when_true: emit_row,
                 jump_target_when_false: runtime.state.output_done,
-                jump_target_when_null: runtime.state.output_done,
             },
         )?;
         program.preassign_label_to_next_insn(emit_row);
@@ -2448,7 +2445,6 @@ fn emit_hir_aggregate_result(
                 jump_if_condition_is_true: false,
                 jump_target_when_true: emit_row,
                 jump_target_when_false: block_done,
-                jump_target_when_null: block_done,
             },
         )?;
         program.preassign_label_to_next_insn(emit_row);
@@ -5034,7 +5030,6 @@ impl HirLoopNest<'_, '_> {
                     jump_if_condition_is_true: false,
                     jump_target_when_true: passed,
                     jump_target_when_false: next,
-                    jump_target_when_null: next,
                 },
             )?;
             program.preassign_label_to_next_insn(passed);
@@ -8140,7 +8135,6 @@ fn emit_ready_predicates(
                 jump_if_condition_is_true: false,
                 jump_target_when_true: passed,
                 jump_target_when_false: fail,
-                jump_target_when_null: fail,
             },
         )?;
         program.preassign_label_to_next_insn(passed);

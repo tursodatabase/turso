@@ -377,59 +377,6 @@ pub fn get_collseq_from_expr_with_symbols(
     Ok(explicit.or(column))
 }
 
-/// Return the collation context that standalone expression translation would
-/// propagate to a parent comparison when this expression is reused from cache.
-///
-/// This differs from `get_collseq_from_expr()` in one important way: plain
-/// column references keep their default BINARY collation, because standalone
-/// column translation records that fact in `ProgramBuilder::curr_collation_ctx()`.
-/// Synthetic expressions such as aggregates must opt out by storing `None` in
-/// the cache entry instead of calling this helper.
-pub fn get_expr_collation_ctx_with_symbols(
-    top_expr: &Expr,
-    referenced_tables: &TableReferences,
-    symbol_table: Option<&SymbolTable>,
-) -> Result<Option<(CollationSeq, bool)>> {
-    let mut maybe_column_collseq = None;
-    let mut maybe_explicit_collseq = None;
-
-    walk_expr(top_expr, &mut |expr: &Expr| -> Result<WalkControl> {
-        match expr {
-            Expr::Collate(_, seq) => {
-                if maybe_explicit_collseq.is_none() {
-                    maybe_explicit_collseq = Some(
-                        resolve_collation_name(seq.as_str(), symbol_table).unwrap_or_default(),
-                    );
-                }
-                return Ok(WalkControl::SkipChildren);
-            }
-            Expr::Column { table, column, .. } => {
-                // generated columns (the SELF_TABLE placeholder) don't inherit an implicit
-                // collation from their expression, so we skip them
-                if !table.is_self_table() {
-                    let (_, table_ref) = referenced_tables
-                        .find_table_by_internal_id(*table)
-                        .ok_or_else(|| {
-                            crate::LimboError::ParseError("table not found".to_string())
-                        })?;
-                    let column = table_ref.get_column_at(*column).ok_or_else(|| {
-                        crate::LimboError::ParseError("column not found".to_string())
-                    })?;
-                    if maybe_column_collseq.is_none() {
-                        maybe_column_collseq = Some(column.collation());
-                    }
-                }
-            }
-            _ => {}
-        }
-        Ok(WalkControl::Continue)
-    })?;
-
-    Ok(maybe_explicit_collseq
-        .map(|collation| (collation, true))
-        .or_else(|| maybe_column_collseq.map(|collation| (collation, false))))
-}
-
 /// Resolve the collation for a binary comparison (=, <, >, etc.) per SQLite rules:
 /// 1. Explicit COLLATE operator on either side wins (LHS takes precedence)
 /// 2. Column with defined collation on either side wins (LHS takes precedence)

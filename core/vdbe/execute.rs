@@ -3533,7 +3533,7 @@ pub fn halt(
                 && state.get_fk_immediate_violations_during_stmt() > 0
             {
                 return Err(LimboError::ForeignKeyConstraint(
-                    "immediate foreign key constraint failed".to_string(),
+                    "FOREIGN KEY constraint failed".to_string(),
                 ));
             }
 
@@ -3593,7 +3593,7 @@ pub fn halt(
         && state.get_fk_immediate_violations_during_stmt() > 0
     {
         return Err(LimboError::ForeignKeyConstraint(
-            "immediate foreign key constraint failed".to_string(),
+            "FOREIGN KEY constraint failed".to_string(),
         ));
     }
 
@@ -16976,7 +16976,7 @@ pub fn op_fk_check(
     };
     if v > 0 {
         return Err(LimboError::ForeignKeyConstraint(
-            "immediate foreign key constraint failed".to_string(),
+            "FOREIGN KEY constraint failed".to_string(),
         ));
     }
     state.pc += 1;

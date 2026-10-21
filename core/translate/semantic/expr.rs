@@ -2832,6 +2832,21 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
                 let [inner] = expect_expr_children(children)?;
                 Ok(null_test_expr(inner, false))
             }
+            ast::Expr::Register(index) => {
+                expect_no_expr_children(children)?;
+                let Some(source) = self.register_source else {
+                    crate::bail_parse_error!(
+                        "a register reference is only allowed in an expression over register inputs"
+                    );
+                };
+                let width = self.source(source).map_or(0, |source| source.columns.len());
+                if *index >= width {
+                    crate::bail_parse_error!(
+                        "register {index} is outside the {width} inputs of the expression"
+                    );
+                }
+                self.resolve_atomic_expr(hir::Expr::column(source, *index), scope)
+            }
             ast::Expr::Raise(action, message) => {
                 validate_raise(*action, policy.raise)?;
                 let message = match message {
@@ -4729,7 +4744,7 @@ fn in_operand_comparison(
     }
 }
 
-fn supports_row_value_binary_comparison(operator: ast::Operator) -> bool {
+pub(crate) fn supports_row_value_binary_comparison(operator: ast::Operator) -> bool {
     matches!(
         operator,
         ast::Operator::Equals
