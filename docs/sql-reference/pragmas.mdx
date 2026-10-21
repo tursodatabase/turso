@@ -335,10 +335,13 @@ Foreign key enforcement is off by default for SQLite compatibility.
 
 ### legacy_file_format
 
-Returns the legacy file format flag.
+Accepted and ignored. SQLite dropped the legacy file format and made this PRAGMA a
+no-op, and Turso matches it: the query returns no rows, and a value assigned to it has
+no effect.
 
 ```sql
-PRAGMA legacy_file_format;
+PRAGMA legacy_file_format;      -- no rows
+PRAGMA legacy_file_format = 1;  -- accepted, no effect
 ```
 
 ### ignore_check_constraints
