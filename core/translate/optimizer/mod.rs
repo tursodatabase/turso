@@ -1426,12 +1426,17 @@ fn update_write_set_reason(
             .iter()
             .map(|set_clause| set_clause.column_index)
             .try_collect()?;
+        let updated_col_names: Vec<_> = plan
+            .set_clauses
+            .iter()
+            .flat_map(|set_clause| set_clause.column_names.iter().cloned())
+            .try_collect()?;
         let database_id = table_ref.database_id;
         if has_triggers_including_temp(
             resolver,
             database_id,
             TriggerEvent::Update,
-            Some(&updated_cols),
+            Some(&updated_col_names),
             btree_table,
         ) {
             break 'requires Some(DmlSafetyReason::Trigger);

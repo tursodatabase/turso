@@ -493,26 +493,41 @@ fn collect_update_set_clauses(
                     table.columns()[*idx].ensure_not_generated("UPDATE", col_name.as_str())?;
                     *idx
                 }
-                None if ROWID_STRS.iter().any(|s| s.eq_ignore_ascii_case(&ident)) => table
-                    .columns()
-                    .iter()
-                    .enumerate()
-                    .find(|(_i, c)| c.is_rowid_alias())
-                    .map_or(ROWID_SENTINEL, |(idx, _col)| idx),
-                None => crate::bail_parse_error!("no such column: {}.{}", table_name, col_name),
+                None => match rowid_name_column_index(table, &ident) {
+                    Some(idx) => idx,
+                    None => {
+                        crate::bail_parse_error!("no such column: {}.{}", table_name, col_name)
+                    }
+                },
             };
 
             match set_clauses
                 .iter_mut()
                 .find(|set| set.column_index == col_index)
             {
-                Some(existing) => compose_update_set_clause(existing, expr),
-                None => set_clauses.push(UpdateSetClause::new(col_index, expr)),
+                Some(existing) => {
+                    existing.column_names.push(col_name.clone());
+                    compose_update_set_clause(existing, expr)
+                }
+                None => set_clauses.push(UpdateSetClause::new(col_index, col_name.clone(), expr)),
             }
         }
     }
 
     Ok(set_clauses)
+}
+
+pub(crate) fn rowid_name_column_index(table: &Table, name: &str) -> Option<usize> {
+    if !ROWID_STRS.iter().any(|s| s.eq_ignore_ascii_case(name)) {
+        return None;
+    }
+    Some(
+        table
+            .columns()
+            .iter()
+            .position(|c| c.is_rowid_alias())
+            .unwrap_or(ROWID_SENTINEL),
+    )
 }
 
 fn compose_update_set_clause(existing: &mut UpdateSetClause, expr: Box<Expr>) {

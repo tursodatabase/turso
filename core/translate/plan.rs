@@ -974,6 +974,10 @@ pub struct DeletePlan {
 #[derive(Debug, Clone)]
 pub struct UpdateSetClause {
     pub column_index: usize,
+    /// Names the SET list used for this column, as written. UPDATE OF triggers
+    /// match against these, so `SET rowid` and `SET id` differ even when `id` is
+    /// the INTEGER PRIMARY KEY.
+    pub column_names: Vec<ast::Name>,
     /// Original user-visible SET expression.
     pub expr: Box<ast::Expr>,
     /// In UPDATE FROM, SET clause expressions are rewritten to read from the
@@ -988,9 +992,10 @@ pub struct UpdateSetClause {
 }
 
 impl UpdateSetClause {
-    pub fn new(column_index: usize, expr: Box<ast::Expr>) -> Self {
+    pub fn new(column_index: usize, column_name: ast::Name, expr: Box<ast::Expr>) -> Self {
         Self {
             column_index,
+            column_names: vec![column_name],
             expr,
             update_from_result: None,
         }
