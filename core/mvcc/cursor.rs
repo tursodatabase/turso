@@ -647,6 +647,10 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> MvccLazyCursor<Clock
         })
     }
 
+    fn btree_wal_pos(&self) -> WalPos {
+        WalPos::from_pair(self.btree_cursor.get_pager().wal_pos())
+    }
+
     fn btree_may_hold(&mut self, last: BtreeLast, rowid: i64) -> Result<bool> {
         Ok(last.may_hold(rowid) && self.query_btree_version_is_valid(&RowKey::Int(rowid))?)
     }
@@ -2052,7 +2056,7 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> CursorTrait
                     let Some(last) = self
                         .db
                         .get_rowid_allocator(&self.table_id)
-                        .btree_last(self.snapshot.read_mark)
+                        .btree_last(self.btree_wal_pos())
                     else {
                         self.state
                             .replace(MvccLazyCursorState::Exists(ExistsState::SeekBtreeLast));
@@ -2073,7 +2077,7 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> CursorTrait
                 }
                 Some(MvccLazyCursorState::Exists(ExistsState::ReadBtreeLast)) => {
                     let last = BtreeLast {
-                        read_mark: WalPos::from_pair(self.btree_cursor.get_pager().wal_pos()),
+                        read_mark: self.btree_wal_pos(),
                         rowid: return_if_io!(self.btree_cursor.rowid()),
                     };
                     self.db
