@@ -826,6 +826,7 @@ async fn async_main(opts: Opts) -> Result<(), Box<dyn std::error::Error + Send +
                         match result {
                             Ok(rows) if rows == [Value::Text("ok".into())] => {
                                 sql_logger.log(&thread, sql, "OK");
+                                turso_macros::turso_assert_reachable!("integrity check succeeded", { "thread": thread });
                             }
                             Ok(rows) if rows.is_empty() => {
                                 sql_logger.log(&thread, sql, "ERROR: no rows");
