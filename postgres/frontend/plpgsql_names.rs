@@ -2,6 +2,15 @@ use turso_core::dialect::TableCatalog;
 use turso_core::{walk_expr_mut, LimboError, Result, WalkControl};
 use turso_parser::ast;
 
+/// What a name that is both a column and a PL/pgSQL variable means, as
+/// `#variable_conflict` sets it.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum VariableConflict {
+    Error,
+    UseVariable,
+    UseColumn,
+}
+
 /// The PL/pgSQL names that a query can read in place of columns.
 pub(crate) trait Variables {
     /// The value of the variable `name`, or of `qualifier.name` for a
@@ -19,6 +28,7 @@ pub(crate) trait Variables {
 pub(crate) struct NameResolver<'a> {
     variables: &'a dyn Variables,
     tables: &'a dyn TableCatalog,
+    conflict: VariableConflict,
     ctes: Vec<ScopeTable>,
     /// The first name that is both a column and a variable.
     pub(crate) ambiguous: Option<String>,
@@ -48,10 +58,15 @@ enum ColumnLookup {
 }
 
 impl<'a> NameResolver<'a> {
-    pub(crate) fn new(variables: &'a dyn Variables, tables: &'a dyn TableCatalog) -> Self {
+    pub(crate) fn new(
+        variables: &'a dyn Variables,
+        tables: &'a dyn TableCatalog,
+        conflict: VariableConflict,
+    ) -> Self {
         Self {
             variables,
             tables,
+            conflict,
             ctes: Vec::new(),
             ambiguous: None,
         }
@@ -467,20 +482,25 @@ impl<'a> NameResolver<'a> {
             Some(qualifier) => format!("{qualifier}.{name}"),
             None => name.to_string(),
         };
-        match scope.find(qualifier, name) {
-            ColumnLookup::NotFound => {
-                *expr = value;
-                Ok(WalkControl::SkipChildren)
-            }
-            ColumnLookup::Found => {
+        let use_variable = match (scope.find(qualifier, name), self.conflict) {
+            (ColumnLookup::NotFound, _) | (_, VariableConflict::UseVariable) => true,
+            (_, VariableConflict::UseColumn) => false,
+            (ColumnLookup::Found, VariableConflict::Error) => {
                 self.ambiguous.get_or_insert_with(full_name);
-                Ok(WalkControl::Continue)
+                false
             }
-            ColumnLookup::Unknown => Err(LimboError::ParseError(format!(
-                "the variable \"{}\" in a query that reads a table function is not supported yet",
-                full_name()
-            ))),
+            (ColumnLookup::Unknown, VariableConflict::Error) => {
+                return Err(LimboError::ParseError(format!(
+                    "the variable \"{}\" in a query that reads a table function is not supported yet",
+                    full_name()
+                )))
+            }
+        };
+        if !use_variable {
+            return Ok(WalkControl::Continue);
         }
+        *expr = value;
+        Ok(WalkControl::SkipChildren)
     }
 }
 

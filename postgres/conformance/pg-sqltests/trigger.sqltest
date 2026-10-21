@@ -1984,3 +1984,72 @@ expect {
     1 5
     2 11
 }
+
+test variable-and-quoted-column-with-other-letter-case-are-different-names {
+    CREATE TABLE items (id int PRIMARY KEY);
+    CREATE TABLE others (id int PRIMARY KEY);
+    CREATE TABLE profiles ("userId" int, "displayName" text);
+    CREATE TABLE log (msg text);
+    INSERT INTO profiles VALUES (1, 'ann'), (2, 'bob');
+    CREATE FUNCTION log_profile() RETURNS trigger LANGUAGE plpgsql AS $$
+    DECLARE
+        userid int := NEW.id;
+    BEGIN
+        INSERT INTO log SELECT "displayName" FROM profiles WHERE "userId" = userid;
+        RETURN NEW;
+    END
+    $$;
+    CREATE FUNCTION log_profile_use_column() RETURNS trigger LANGUAGE plpgsql AS $$
+    #variable_conflict use_column
+    DECLARE
+        userid int := NEW.id;
+    BEGIN
+        INSERT INTO log SELECT 'column ' || "displayName" FROM profiles WHERE "userId" = userid;
+        RETURN NEW;
+    END
+    $$;
+    CREATE TRIGGER items_log AFTER INSERT ON items FOR EACH ROW EXECUTE FUNCTION log_profile();
+    CREATE TRIGGER others_log AFTER INSERT ON others FOR EACH ROW EXECUTE FUNCTION log_profile_use_column();
+    INSERT INTO items VALUES (1);
+    INSERT INTO others VALUES (2);
+    SELECT msg FROM log ORDER BY msg;
+}
+expect {
+    ann
+    column bob
+}
+
+test variable-conflict-option-chooses-the-column-or-the-variable {
+    CREATE TABLE counts (id int PRIMARY KEY, n int);
+    CREATE TABLE trig (id int);
+    INSERT INTO counts VALUES (1, 0), (2, 0);
+    CREATE FUNCTION use_column() RETURNS trigger LANGUAGE plpgsql AS $$
+    #variable_conflict use_column
+    DECLARE
+        n int := 100;
+    BEGIN
+        UPDATE counts SET n = n + 1 WHERE id = 1;
+        RETURN NEW;
+    END
+    $$;
+    CREATE FUNCTION use_variable() RETURNS trigger LANGUAGE plpgsql AS $$
+    -- a comment before the option
+    /* and a /* nested */ comment */
+    #print_strict_params on
+    #variable_conflict use_variable
+    DECLARE
+        n int := 100;
+    BEGIN
+        UPDATE counts SET n = n + 1 WHERE id = 2;
+        RETURN NEW;
+    END
+    $$;
+    CREATE TRIGGER a_use_column AFTER INSERT ON trig FOR EACH ROW EXECUTE FUNCTION use_column();
+    CREATE TRIGGER b_use_variable AFTER INSERT ON trig FOR EACH ROW EXECUTE FUNCTION use_variable();
+    INSERT INTO trig VALUES (1);
+    SELECT id, n FROM counts ORDER BY id;
+}
+expect {
+    1|1
+    2|101
+}
