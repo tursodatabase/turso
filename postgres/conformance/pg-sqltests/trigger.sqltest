@@ -1186,3 +1186,429 @@ test perform-runs-the-query-of-its-branch {
 expect {
     4
 }
+
+test variables-have-defaults-and-take-assigned-values {
+    CREATE TABLE items (id int PRIMARY KEY, n int);
+    CREATE TABLE log (msg text);
+    CREATE FUNCTION track() RETURNS trigger LANGUAGE plpgsql AS $$
+    DECLARE
+        total int := NEW.n * 2;
+        label text := TG_ARGV[0];
+        counter int;
+    BEGIN
+        counter := 1;
+        IF total > 10 THEN
+            counter := counter + 10;
+        END IF;
+        INSERT INTO log VALUES (label || ' ' || total || ' ' || counter);
+        RETURN NEW;
+    END
+    $$;
+    CREATE TRIGGER items_track AFTER INSERT ON items FOR EACH ROW EXECUTE FUNCTION track('item');
+    INSERT INTO items VALUES (1, 3), (2, 8);
+    SELECT msg FROM log ORDER BY msg;
+}
+expect {
+    item 16 11
+    item 6 1
+}
+
+test expression-with-from-gives-the-value-of-its-query {
+    CREATE TABLE items (id int PRIMARY KEY, n int);
+    CREATE TABLE orders (id int, user_id int, amount int);
+    CREATE TABLE log (msg text);
+    INSERT INTO orders VALUES (1, 7, 10), (2, 7, 20), (3, 8, 30);
+    CREATE FUNCTION count_orders() RETURNS trigger LANGUAGE plpgsql AS $$
+    DECLARE
+        total int := sum(amount) FROM orders WHERE user_id = NEW.n;
+        cnt int;
+    BEGIN
+        cnt := count(*) FROM orders WHERE user_id = NEW.n;
+        INSERT INTO log VALUES ('count ' || cnt || ' total ' || total);
+        IF count(*) > 1 FROM orders WHERE user_id = NEW.n THEN
+            INSERT INTO log VALUES ('more than one');
+        END IF;
+        cnt := id FROM orders WHERE user_id = 100;
+        INSERT INTO log VALUES ('none ' || coalesce(cnt::text, 'null'));
+        RETURN NEW;
+    END
+    $$;
+    CREATE TRIGGER items_count AFTER INSERT ON items FOR EACH ROW EXECUTE FUNCTION count_orders();
+    INSERT INTO items VALUES (1, 7);
+    SELECT msg FROM log ORDER BY msg;
+}
+expect {
+    count 2 total 30
+    more than one
+    none null
+}
+
+test expression-with-from-that-gives-more-than-one-row-errors {
+    CREATE TABLE items (id int PRIMARY KEY, n int);
+    CREATE TABLE orders (id int, user_id int);
+    INSERT INTO orders VALUES (1, 7), (2, 7);
+    CREATE FUNCTION first_order() RETURNS trigger LANGUAGE plpgsql AS $$
+    DECLARE
+        order_id int;
+    BEGIN
+        order_id := id FROM orders WHERE user_id = NEW.n;
+        RETURN NEW;
+    END
+    $$;
+    CREATE TRIGGER items_first AFTER INSERT ON items FOR EACH ROW EXECUTE FUNCTION first_order();
+    INSERT INTO items VALUES (1, 7);
+}
+expect error {
+    returned more than one row
+}
+
+test variables-start-again-for-each-row {
+    CREATE TABLE items (id int PRIMARY KEY, n int);
+    CREATE TABLE log (msg text);
+    CREATE FUNCTION track() RETURNS trigger LANGUAGE plpgsql AS $$
+    DECLARE
+        seen text;
+    BEGIN
+        IF NEW.n > 5 THEN
+            seen := 'big';
+        END IF;
+        INSERT INTO log VALUES (NEW.id || ':' || coalesce(seen, 'none'));
+        RETURN NEW;
+    END
+    $$;
+    CREATE TRIGGER items_track AFTER INSERT ON items FOR EACH ROW EXECUTE FUNCTION track();
+    INSERT INTO items VALUES (1, 9), (2, 1);
+    SELECT msg FROM log ORDER BY msg;
+}
+expect {
+    1:big
+    2:none
+}
+
+test assignment-converts-the-value-to-the-type-of-the-variable {
+    CREATE TABLE items (id int PRIMARY KEY);
+    CREATE TABLE log (msg text);
+    CREATE FUNCTION track() RETURNS trigger LANGUAGE plpgsql AS $$
+    DECLARE
+        number int := '5';
+        word text;
+    BEGIN
+        word := 7;
+        IF number = 5 AND word = '7' THEN
+            INSERT INTO log VALUES ('converted');
+        END IF;
+        RETURN NEW;
+    END
+    $$;
+    CREATE TRIGGER items_track AFTER INSERT ON items FOR EACH ROW EXECUTE FUNCTION track();
+    INSERT INTO items VALUES (1);
+    SELECT msg FROM log;
+}
+expect {
+    converted
+}
+
+test variable-of-an-inner-block-hides-the-variable-of-the-outer-block {
+    CREATE TABLE items (id int PRIMARY KEY);
+    CREATE TABLE log (msg text);
+    CREATE FUNCTION track() RETURNS trigger LANGUAGE plpgsql AS $$
+    <<outer_block>>
+    DECLARE
+        x text := 'outer';
+    BEGIN
+        <<inner_block>>
+        DECLARE
+            x text := 'inner';
+            y text := x || '+';
+        BEGIN
+            INSERT INTO log VALUES ('1 ' || x || ' ' || y);
+            INSERT INTO log VALUES ('2 ' || outer_block.x || ' ' || inner_block.x);
+            outer_block.x := 'changed';
+        END;
+        INSERT INTO log VALUES ('3 ' || x);
+        RETURN NEW;
+    END
+    $$;
+    CREATE TRIGGER items_track AFTER INSERT ON items FOR EACH ROW EXECUTE FUNCTION track();
+    INSERT INTO items VALUES (1);
+    SELECT msg FROM log ORDER BY msg;
+}
+expect {
+    1 inner inner+
+    2 outer inner
+    3 changed
+}
+
+test before-trigger-writes-a-value-from-a-variable {
+    CREATE TABLE items (id int PRIMARY KEY, n int, note text);
+    CREATE FUNCTION set_note() RETURNS trigger LANGUAGE plpgsql AS $$
+    DECLARE
+        size text := 'small';
+    BEGIN
+        IF NEW.n > 10 THEN
+            size := 'large';
+        END IF;
+        NEW.note := size;
+        size := 'unused';
+        RETURN NEW;
+    END
+    $$;
+    CREATE TRIGGER items_note BEFORE INSERT ON items FOR EACH ROW EXECUTE FUNCTION set_note();
+    INSERT INTO items (id, n) VALUES (1, 5), (2, 50);
+    SELECT id, note FROM items ORDER BY id;
+}
+expect {
+    1|small
+    2|large
+}
+
+test variable-that-is-also-a-column-gives-an-error {
+    CREATE TABLE items (id int PRIMARY KEY, n int);
+    CREATE TABLE counts (id int PRIMARY KEY, n int);
+    INSERT INTO counts VALUES (1, 0);
+    CREATE FUNCTION count_items() RETURNS trigger LANGUAGE plpgsql AS $$
+    DECLARE
+        n int := 1;
+    BEGIN
+        UPDATE counts SET n = n + 1 WHERE id = 1;
+        RETURN NEW;
+    END
+    $$;
+    CREATE TRIGGER items_count AFTER INSERT ON items FOR EACH ROW EXECUTE FUNCTION count_items();
+    INSERT INTO items VALUES (1, 1);
+}
+expect error {
+    column reference "n" is ambiguous
+}
+
+test variable-that-is-also-a-column-of-a-subquery-gives-an-error {
+    CREATE TABLE items (id int PRIMARY KEY);
+    CREATE TABLE prices (id int, y int);
+    CREATE TABLE log (msg text);
+    CREATE FUNCTION track() RETURNS trigger LANGUAGE plpgsql AS $$
+    DECLARE
+        y int := 5;
+    BEGIN
+        INSERT INTO log VALUES ((SELECT count(*) FROM prices WHERE y > 0));
+        RETURN NEW;
+    END
+    $$;
+    CREATE TRIGGER items_track AFTER INSERT ON items FOR EACH ROW EXECUTE FUNCTION track();
+    INSERT INTO items VALUES (1);
+}
+expect error {
+    column reference "y" is ambiguous
+}
+
+test label-of-a-block-that-is-also-a-table-name-gives-an-error {
+    CREATE TABLE items (id int PRIMARY KEY, x int);
+    CREATE TABLE log (msg text);
+    INSERT INTO items VALUES (1, 10);
+    CREATE FUNCTION track() RETURNS trigger LANGUAGE plpgsql AS $$
+    <<items>>
+    DECLARE
+        x int := 3;
+    BEGIN
+        INSERT INTO log SELECT items.x FROM items WHERE items.id = 1;
+        RETURN NEW;
+    END
+    $$;
+    CREATE TABLE trig (id int);
+    CREATE TRIGGER trig_track AFTER INSERT ON trig FOR EACH ROW EXECUTE FUNCTION track();
+    INSERT INTO trig VALUES (1);
+}
+expect error {
+    column reference "items.x" is ambiguous
+}
+
+test variable-is-not-a-column-where-no-table-of-the-query-has-the-column {
+    CREATE TABLE items (id int PRIMARY KEY, x int, a int);
+    CREATE TABLE prices (id int, y int);
+    CREATE TABLE trig (id int);
+    INSERT INTO items VALUES (1, 10, 0);
+    INSERT INTO prices VALUES (1, 100);
+    CREATE FUNCTION track() RETURNS trigger LANGUAGE plpgsql AS $$
+    DECLARE
+        x int := 7;
+        y int := 5;
+    BEGIN
+        INSERT INTO items (id, x) VALUES (NEW.id + 100, x);
+        UPDATE items SET a = (SELECT max(prices.y) FROM prices) + y WHERE items.id = 1;
+        INSERT INTO items (id, a) SELECT NEW.id + 200, items.x + y FROM items WHERE items.id = 1;
+        RETURN NEW;
+    END
+    $$;
+    CREATE TRIGGER trig_track AFTER INSERT ON trig FOR EACH ROW EXECUTE FUNCTION track();
+    INSERT INTO trig VALUES (1);
+    SELECT id, x, a FROM items ORDER BY id;
+}
+expect {
+    1|10|105
+    101|7|
+    201||15
+}
+
+test ambiguous-name-in-a-branch-that-does-not-run-gives-no-error {
+    CREATE TABLE items (id int PRIMARY KEY, n int);
+    CREATE TABLE log (msg text);
+    CREATE FUNCTION track() RETURNS trigger LANGUAGE plpgsql AS $$
+    DECLARE
+        n int := 1;
+    BEGIN
+        IF NEW.id < 0 THEN
+            UPDATE items SET n = n + 1;
+        END IF;
+        INSERT INTO log VALUES ('ok ' || n);
+        RETURN NEW;
+    END
+    $$;
+    CREATE TRIGGER items_track AFTER INSERT ON items FOR EACH ROW EXECUTE FUNCTION track();
+    INSERT INTO items VALUES (1, 1);
+    SELECT msg FROM log;
+}
+expect {
+    ok 1
+}
+
+test ambiguous-name-gives-an-error-on-an-empty-table {
+    CREATE TABLE items (id int PRIMARY KEY);
+    CREATE TABLE empty (x int);
+    CREATE FUNCTION track() RETURNS trigger LANGUAGE plpgsql AS $$
+    DECLARE
+        x int := 3;
+    BEGIN
+        DELETE FROM empty WHERE x = 1;
+        RETURN NEW;
+    END
+    $$;
+    CREATE TRIGGER items_track AFTER INSERT ON items FOR EACH ROW EXECUTE FUNCTION track();
+    INSERT INTO items VALUES (1);
+}
+expect error {
+    column reference "x" is ambiguous
+}
+
+test group-by-and-order-by-read-a-variable-of-the-select-list {
+    CREATE TABLE items (id int PRIMARY KEY);
+    CREATE TABLE events (id int, day int);
+    CREATE TABLE stats (day int, cnt int, last_id int);
+    INSERT INTO events VALUES (1, 5), (2, 5), (3, 6);
+    CREATE FUNCTION count_events() RETURNS trigger LANGUAGE plpgsql AS $$
+    DECLARE
+        d int := 5;
+    BEGIN
+        INSERT INTO stats (day, cnt) SELECT d, count(*) FROM events WHERE day = d GROUP BY d;
+        INSERT INTO stats (day, last_id) SELECT d, id FROM events ORDER BY d, id DESC LIMIT 1;
+        RETURN NEW;
+    END
+    $$;
+    CREATE TRIGGER items_count AFTER INSERT ON items FOR EACH ROW EXECUTE FUNCTION count_events();
+    INSERT INTO items VALUES (1);
+    SELECT day, coalesce(cnt, 0), coalesce(last_id, 0) FROM stats ORDER BY 2 DESC;
+}
+expect {
+    5|2|0
+    5|0|3
+}
+
+test variable-with-the-name-of-a-table-of-the-query-is-ambiguous {
+    CREATE TABLE items (id int PRIMARY KEY);
+    CREATE TABLE prices (id int, amount int);
+    CREATE TABLE log (msg text);
+    INSERT INTO prices VALUES (1, 100);
+    CREATE FUNCTION log_price() RETURNS trigger LANGUAGE plpgsql AS $$
+    DECLARE
+        prices int := 5;
+    BEGIN
+        INSERT INTO log SELECT 'p=' || prices FROM prices WHERE id = 1;
+        RETURN NEW;
+    END
+    $$;
+    CREATE TRIGGER items_log AFTER INSERT ON items FOR EACH ROW EXECUTE FUNCTION log_price();
+    INSERT INTO items VALUES (1);
+}
+expect error {
+    column reference "prices" is ambiguous
+}
+
+test variable-in-limit-that-is-also-a-column-of-the-query-is-ambiguous {
+    CREATE TABLE items (id int PRIMARY KEY);
+    CREATE TABLE a (id int, n int);
+    CREATE TABLE log (msg text);
+    INSERT INTO a VALUES (1, 10), (2, 20);
+    CREATE FUNCTION log_first() RETURNS trigger LANGUAGE plpgsql AS $$
+    DECLARE
+        n int := 1;
+    BEGIN
+        INSERT INTO log SELECT id FROM a ORDER BY id LIMIT n;
+        RETURN NEW;
+    END
+    $$;
+    CREATE TRIGGER items_log AFTER INSERT ON items FOR EACH ROW EXECUTE FUNCTION log_first();
+    INSERT INTO items VALUES (1);
+}
+expect error {
+    column reference "n" is ambiguous
+}
+
+test variable-in-a-recursive-cte-without-a-column-list {
+    CREATE TABLE items (id int PRIMARY KEY);
+    CREATE TABLE log (msg text);
+    CREATE FUNCTION count_up() RETURNS trigger LANGUAGE plpgsql AS $$
+    DECLARE
+        lim int := 3;
+    BEGIN
+        INSERT INTO log
+        WITH RECURSIVE r AS (SELECT 1 AS k UNION ALL SELECT k + 1 FROM r WHERE k < lim)
+        SELECT 'k=' || k FROM r;
+        RETURN NEW;
+    END
+    $$;
+    CREATE TRIGGER items_count AFTER INSERT ON items FOR EACH ROW EXECUTE FUNCTION count_up();
+    INSERT INTO items VALUES (1);
+    SELECT msg FROM log ORDER BY msg;
+}
+expect {
+    k=1
+    k=2
+    k=3
+}
+
+test order-by-an-output-column-that-is-also-a-variable {
+    CREATE TABLE items (id int PRIMARY KEY, n int);
+    CREATE TABLE log (msg text);
+    CREATE TABLE trig (id int);
+    INSERT INTO items VALUES (1, 30), (2, 20);
+    CREATE FUNCTION track() RETURNS trigger LANGUAGE plpgsql AS $$
+    DECLARE
+        k int := 1;
+    BEGIN
+        INSERT INTO log SELECT n AS k FROM items ORDER BY k LIMIT k;
+        RETURN NEW;
+    END
+    $$;
+    CREATE TRIGGER trig_track AFTER INSERT ON trig FOR EACH ROW EXECUTE FUNCTION track();
+    INSERT INTO trig VALUES (1);
+    SELECT msg FROM log;
+}
+expect {
+    20
+}
+
+test assignment-of-null-to-a-not-null-variable-gives-an-error {
+    CREATE TABLE items (id int PRIMARY KEY, n int);
+    CREATE FUNCTION track() RETURNS trigger LANGUAGE plpgsql AS $$
+    DECLARE
+        d int NOT NULL := 1;
+    BEGIN
+        d := NEW.n;
+        RETURN NEW;
+    END
+    $$;
+    CREATE TRIGGER items_track AFTER INSERT ON items FOR EACH ROW EXECUTE FUNCTION track();
+    INSERT INTO items VALUES (1, 2);
+    INSERT INTO items VALUES (2, NULL);
+}
+expect error {
+    null value cannot be assigned to variable "d" declared NOT NULL
+}

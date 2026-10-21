@@ -170,9 +170,9 @@ impl Dialect for PostgresDialect {
         trigger: &turso_core::schema::Trigger,
         table: &BTreeTable,
         functions: &dyn FunctionCatalog,
-        _tables: &dyn TableCatalog,
+        tables: &dyn TableCatalog,
     ) -> Result<Option<TriggerBody>> {
-        crate::plpgsql::compile_trigger(trigger, table, functions)
+        crate::plpgsql::compile_trigger(trigger, table, functions, tables)
     }
 
     /// PostgreSQL fires the triggers of one event in the order of their names.

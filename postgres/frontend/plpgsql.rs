@@ -1,17 +1,18 @@
-use crate::ast_walk::{walk_stmt_exprs_mut, walk_tree_mut};
+use crate::plpgsql_names::{NameResolver, Variables};
 use crate::session::{set_trigger_variable, trigger_variable};
 use crate::trigger::{parse_trigger_definition, postgres_schema_name, trigger_definition};
 use crate::user_function::{Language, UserFunction};
 use pg_query::protobuf::node::Node;
 use serde_json::Value as Json;
+use std::collections::HashMap;
 use std::sync::Arc;
-use turso_core::dialect::{ChangedColumn, FunctionCatalog, TriggerBody};
+use turso_core::dialect::{ChangedColumn, FunctionCatalog, TableCatalog, TriggerBody};
 use turso_core::native_ext::{FunctionArity, ScalarCall, ScalarFunction};
 use turso_core::schema::{BTreeTable, Trigger};
 use turso_core::types::IOResultOr;
 use turso_core::{
-    walk_expr, Connection, ExternalFunc, IOResult, LimboError, OpenOptions, Register, Result,
-    Value, WalkControl,
+    walk_expr, walk_expr_mut, Connection, ExternalFunc, IOResult, LimboError, OpenOptions,
+    Register, Result, Value, WalkControl,
 };
 use turso_parser::ast;
 use turso_pg_parser::translator::{call_name, PostgreSQLTranslator};
@@ -20,6 +21,7 @@ pub(crate) fn compile_trigger(
     trigger: &Trigger,
     table: &BTreeTable,
     functions: &dyn FunctionCatalog,
+    tables: &dyn TableCatalog,
 ) -> Result<Option<TriggerBody>> {
     let Some(definition) = trigger_definition(trigger) else {
         return Ok(None);
@@ -48,6 +50,8 @@ pub(crate) fn compile_trigger(
         .and_then(|function| function.get("PLpgSQL_function"))
         .ok_or_else(malformed)?;
     let action = plpgsql_function.get("action").ok_or_else(malformed)?;
+    let datums = Datums::new(plpgsql_function);
+    let block_variables = block_variables(action, &datums)?;
     let args = statement
         .args
         .iter()
@@ -83,7 +87,10 @@ pub(crate) fn compile_trigger(
             args,
         },
         table,
-        records: Records::new(plpgsql_function),
+        tables,
+        datums,
+        block_variables,
+        scopes: Vec::new(),
         variable_count: 0,
         statements: Vec::new(),
         new_values: Vec::new(),
@@ -138,7 +145,13 @@ struct Compiler<'a> {
     variable_prefix: String,
     trigger: TriggerConstants,
     table: &'a BTreeTable,
-    records: Records<'a>,
+    tables: &'a dyn TableCatalog,
+    datums: Datums<'a>,
+    /// The variables that each block declares, by the address of the block.
+    block_variables: HashMap<usize, Vec<usize>>,
+    /// The blocks that enclose the statement that compiles now, the
+    /// innermost last.
+    scopes: Vec<BlockScope>,
     variable_count: usize,
     statements: Vec<ast::Stmt>,
     /// The fields of NEW that the function assigned, in the order of the
@@ -151,6 +164,13 @@ struct Compiler<'a> {
     return_variable: Option<String>,
     conditional_returns: Vec<ReturnAction>,
     changed_columns: Vec<ChangedColumn>,
+}
+
+/// The variables of a block that a name can read.
+struct BlockScope {
+    label: Option<String>,
+    /// The datums of the variables, in the order of their declaration.
+    variables: Vec<usize>,
 }
 
 /// The value of a field of NEW after an assignment.
@@ -192,8 +212,15 @@ impl ReturnAction {
 
 /// A branch of IF or CASE: the condition and the statements.
 struct Branch<'j> {
-    condition: ast::Expr,
+    condition: Condition,
     statements: Vec<&'j Json>,
+}
+
+/// The condition of a branch, or the name that is both a column and a
+/// variable in it.
+enum Condition {
+    Value(ast::Expr),
+    Ambiguous(String),
 }
 
 /// What happens when no branch of IF or CASE runs.
@@ -213,12 +240,12 @@ impl Compiler<'_> {
         let new_values_before = self.new_values.clone();
         let result = match kind.as_str() {
             "PLpgSQL_stmt_block" => self.compile_block(body),
-            "PLpgSQL_stmt_execsql" => self.compile_sql_statement(body).map(|()| Flow::Continues),
-            "PLpgSQL_stmt_assign" => self.compile_assignment(body).map(|()| Flow::Continues),
+            "PLpgSQL_stmt_execsql" => self.compile_sql_statement(body),
+            "PLpgSQL_stmt_assign" => self.compile_assignment(body),
             "PLpgSQL_stmt_if" => self.compile_if(body),
             "PLpgSQL_stmt_case" => self.compile_case(body),
             "PLpgSQL_stmt_raise" => self.compile_raise(body),
-            "PLpgSQL_stmt_perform" => self.compile_perform(body).map(|()| Flow::Continues),
+            "PLpgSQL_stmt_perform" => self.compile_perform(body),
             "PLpgSQL_stmt_return" if body.get("lineno").is_none() => Ok(Flow::Continues),
             "PLpgSQL_stmt_return" => self.compile_return(body),
             kind => Err(LimboError::ParseError(format!(
@@ -246,7 +273,56 @@ impl Compiler<'_> {
                 "EXCEPTION blocks are not supported".into(),
             ));
         }
-        self.compile_statements(json_array(block, "body"))
+        let variables = self
+            .block_variables
+            .get(&block_address(block))
+            .cloned()
+            .unwrap_or_default();
+        self.scopes.push(BlockScope {
+            label: block
+                .get("label")
+                .and_then(Json::as_str)
+                .map(str::to_string),
+            variables: Vec::new(),
+        });
+        let mut flow = Flow::Continues;
+        for dno in variables {
+            flow = self.declare_variable(dno)?;
+            if flow == Flow::Returns {
+                break;
+            }
+            self.scopes
+                .last_mut()
+                .expect("the scope of the block is on the stack")
+                .variables
+                .push(dno);
+        }
+        if flow == Flow::Continues {
+            flow = self.compile_statements(json_array(block, "body"))?;
+        }
+        self.scopes.pop();
+        Ok(flow)
+    }
+
+    /// Set a variable of a block to its default value, as PL/pgSQL does each
+    /// time that the block starts.
+    fn declare_variable(&mut self, dno: usize) -> Result<Flow> {
+        let declaration = self.datums.declaration(dno)?;
+        let value = match declaration.default {
+            Some(default) => match self.compile_expression(default)? {
+                Some(value) => cast(value, declaration.cast),
+                None => return Ok(self.flow_after_error()),
+            },
+            None => null(),
+        };
+        let key = self.variable_key(dno);
+        let condition = self.statement_condition();
+        self.statements
+            .push(select_where(set_variable(&key, value), condition.clone()));
+        if declaration.not_null {
+            self.check_not_null(&key, declaration.name, condition);
+        }
+        Ok(Flow::Continues)
     }
 
     fn compile_statements<'j>(
@@ -261,7 +337,7 @@ impl Compiler<'_> {
         Ok(Flow::Continues)
     }
 
-    fn compile_sql_statement(&mut self, body: &Json) -> Result<()> {
+    fn compile_sql_statement(&mut self, body: &Json) -> Result<Flow> {
         if body.get("into").and_then(Json::as_bool) == Some(true) {
             return Err(LimboError::ParseError("INTO is not supported yet".into()));
         }
@@ -272,45 +348,79 @@ impl Compiler<'_> {
                 "query has no destination for result data".into(),
             ));
         }
-        walk_stmt_exprs_mut(&mut stmt, &mut |expr| self.replace_trigger_values(expr))?;
+        if let Some(name) = self.resolve_statement(&mut stmt)? {
+            return Ok(self.raise_ambiguous(&name));
+        }
         let stmt = with_condition(stmt, self.statement_condition())?;
         self.statements.push(stmt);
-        Ok(())
+        Ok(Flow::Continues)
     }
 
-    fn compile_perform(&mut self, body: &Json) -> Result<()> {
+    fn compile_perform(&mut self, body: &Json) -> Result<Flow> {
         let query = expression_query(body.get("expr"))?;
         let mut stmt = self.translate_statement(query)?;
-        walk_stmt_exprs_mut(&mut stmt, &mut |expr| self.replace_trigger_values(expr))?;
+        if let Some(name) = self.resolve_statement(&mut stmt)? {
+            return Ok(self.raise_ambiguous(&name));
+        }
         let ast::Stmt::Select(select) = stmt else {
             return Err(LimboError::Corrupt("PERFORM without a query".into()));
         };
         let select = select_with_condition(select, self.statement_condition())?;
         self.statements.push(ast::Stmt::Select(select));
-        Ok(())
+        Ok(Flow::Continues)
     }
 
-    fn compile_assignment(&mut self, body: &Json) -> Result<()> {
+    fn compile_assignment(&mut self, body: &Json) -> Result<Flow> {
         let varno = body
             .get("varno")
             .and_then(Json::as_u64)
             .ok_or_else(|| LimboError::Corrupt("malformed PL/pgSQL assignment".into()))?;
-        let field = match self.records.assignment_target(varno) {
-            Target::NewField(field) => field,
+        let query = expression_query(body.get("expr"))?;
+        let Some(value) = self.compile_expression(assigned_value(query)?)? else {
+            return Ok(self.flow_after_error());
+        };
+        match self.datums.assignment_target(varno) {
+            Target::NewField(field) => self.assign_new_field(field, value)?,
+            Target::Variable(dno) => self.assign_variable(dno, value)?,
             Target::OldField => {
                 return Err(LimboError::ParseError(
                     "assignment to OLD is not supported".into(),
                 ))
             }
-            Target::Variable => {
+            Target::Other => {
                 return Err(LimboError::ParseError(
-                    "variables are not supported yet".into(),
+                    "assignment to this variable is not supported yet".into(),
                 ))
             }
-        };
-        let query = expression_query(body.get("expr"))?;
-        let mut value = translate_expression(assigned_value(query)?)?;
-        walk_tree_mut(&mut value, &mut |expr| self.replace_trigger_values(expr))?;
+        }
+        Ok(Flow::Continues)
+    }
+
+    fn assign_variable(&mut self, dno: usize, value: ast::Expr) -> Result<()> {
+        let declaration = self.datums.declaration(dno)?;
+        let key = self.variable_key(dno);
+        let condition = self.statement_condition();
+        self.statements.push(select_where(
+            set_variable(&key, cast(value, declaration.cast)),
+            condition.clone(),
+        ));
+        if declaration.not_null {
+            self.check_not_null(&key, declaration.name, condition);
+        }
+        Ok(())
+    }
+
+    fn check_not_null(&mut self, key: &str, name: &str, condition: Option<ast::Expr>) {
+        let is_null = ast::Expr::IsNull(Box::new(get_variable(key)));
+        self.statements.push(select_where(
+            raise_abort_expr(text_literal(&format!(
+                "null value cannot be assigned to variable \"{name}\" declared NOT NULL"
+            ))),
+            Some(and(condition, is_null)),
+        ));
+    }
+
+    fn assign_new_field(&mut self, field: &str, value: ast::Expr) -> Result<()> {
         let condition = self.statement_condition();
         match self.table.get_column(field) {
             None => {
@@ -350,7 +460,7 @@ impl Compiler<'_> {
                     Some(position) => self.read_new_value(position),
                     None => {
                         let mut current = record_field("new", field);
-                        walk_tree_mut(&mut current, &mut |expr| self.replace_trigger_values(expr))?;
+                        self.replace_trigger_value(&mut current)?;
                         current
                     }
                 };
@@ -391,8 +501,9 @@ impl Compiler<'_> {
         let case_value = match body.get("t_expr") {
             Some(value) => {
                 let varno = body.get("t_varno").and_then(Json::as_u64).unwrap_or(0);
-                let mut value = translate_expression(expression_query(Some(value))?)?;
-                walk_tree_mut(&mut value, &mut |expr| self.replace_trigger_values(expr))?;
+                let Some(value) = self.compile_expression(expression_query(Some(value))?)? else {
+                    return Ok(self.flow_after_error());
+                };
                 let value = if constant_value(&value).is_some() {
                     value
                 } else {
@@ -441,7 +552,19 @@ impl Compiler<'_> {
         let mut every_branch_returns = true;
         let mut can_reach_no_branch = true;
         for branch in branches {
-            let condition = branch.condition;
+            let condition = match branch.condition {
+                Condition::Value(condition) => condition,
+                Condition::Ambiguous(name) => {
+                    let reached_when = and_all(outer.clone(), earlier.iter().map(not));
+                    let always = reached_when.is_none();
+                    self.statements
+                        .push(raise_ambiguous_statement(&name, reached_when));
+                    if always {
+                        return Ok(Flow::Returns);
+                    }
+                    continue;
+                }
+            };
             match constant_value(&condition).as_ref().map(Constant::is_true) {
                 Some(false) => continue,
                 Some(true) => {
@@ -512,18 +635,21 @@ impl Compiler<'_> {
         &self,
         condition: Option<&Json>,
         case_value: Option<&(String, ast::Expr)>,
-    ) -> Result<ast::Expr> {
+    ) -> Result<Condition> {
         let mut condition = translate_expression(expression_query(condition)?)?;
-        walk_tree_mut(&mut condition, &mut |expr| {
-            if let (Some((name, value)), ast::Expr::Id(id)) = (case_value, &*expr) {
-                if id.as_str() == name {
+        if let Some((name, value)) = case_value {
+            walk_expr_mut(&mut condition, &mut |expr| {
+                if matches!(expr, ast::Expr::Id(id) if id.as_str() == name) {
                     *expr = value.clone();
                     return Ok(WalkControl::SkipChildren);
                 }
-            }
-            self.replace_trigger_values(expr)
-        })?;
-        Ok(condition)
+                Ok(WalkControl::Continue)
+            })?;
+        }
+        Ok(match self.resolve_expression(&mut condition)? {
+            None => Condition::Value(condition),
+            Some(name) => Condition::Ambiguous(name),
+        })
     }
 
     fn compile_raise(&mut self, body: &Json) -> Result<Flow> {
@@ -537,7 +663,10 @@ impl Compiler<'_> {
             return Ok(Flow::Continues);
         }
         let mut message = match body.get("message").and_then(Json::as_str) {
-            Some(format) => Some(self.raise_message(format, json_array(body, "params"))?),
+            Some(format) => match self.raise_message(format, json_array(body, "params"))? {
+                Some(message) => Some(message),
+                None => return Ok(self.flow_after_error()),
+            },
             None => None,
         };
         let mut error_code = None;
@@ -555,8 +684,10 @@ impl Compiler<'_> {
                     "RAISE option already specified: MESSAGE".into(),
                 ));
             }
-            let mut value = translate_expression(expression_query(option.get("expr"))?)?;
-            walk_tree_mut(&mut value, &mut |expr| self.replace_trigger_values(expr))?;
+            let Some(value) = self.compile_expression(expression_query(option.get("expr"))?)?
+            else {
+                return Ok(self.flow_after_error());
+            };
             if option_type == Some(MESSAGE_OPTION) {
                 message = Some(cast_to_text(value));
             } else {
@@ -587,12 +718,13 @@ impl Compiler<'_> {
     }
 
     /// The message of `RAISE '<format>', params`: each `%` takes the next
-    /// parameter, and `%%` is one `%`.
+    /// parameter, and `%%` is one `%`. `None` when a name in a parameter is
+    /// ambiguous.
     fn raise_message<'j>(
-        &self,
+        &mut self,
         format: &str,
         params: impl Iterator<Item = &'j Json>,
-    ) -> Result<ast::Expr> {
+    ) -> Result<Option<ast::Expr>> {
         let mut params = params.peekable();
         let mut parts = Vec::new();
         let mut text = String::new();
@@ -612,8 +744,9 @@ impl Compiler<'_> {
                     "too few parameters specified for RAISE".into(),
                 ));
             };
-            let mut value = translate_expression(expression_query(Some(param))?)?;
-            walk_tree_mut(&mut value, &mut |expr| self.replace_trigger_values(expr))?;
+            let Some(value) = self.compile_expression(expression_query(Some(param))?)? else {
+                return Ok(None);
+            };
             parts.push(text_literal(&std::mem::take(&mut text)));
             parts.push(function_call(
                 "coalesce",
@@ -626,12 +759,14 @@ impl Compiler<'_> {
             ));
         }
         parts.push(text_literal(&text));
-        Ok(parts
-            .into_iter()
-            .reduce(|left, right| {
-                ast::Expr::Binary(Box::new(left), ast::Operator::Concat, Box::new(right))
-            })
-            .expect("the message has at least one part"))
+        Ok(Some(
+            parts
+                .into_iter()
+                .reduce(|left, right| {
+                    ast::Expr::Binary(Box::new(left), ast::Operator::Concat, Box::new(right))
+                })
+                .expect("the message has at least one part"),
+        ))
     }
 
     fn compile_return(&mut self, body: &Json) -> Result<Flow> {
@@ -832,14 +967,6 @@ impl Compiler<'_> {
         }
     }
 
-    /// The flow after a statement that always gives an error when it runs.
-    fn flow_after_error(&self) -> Flow {
-        match self.statement_condition() {
-            None => Flow::Returns,
-            Some(_) => Flow::Continues,
-        }
-    }
-
     fn return_variable(&mut self) -> String {
         if let Some(key) = &self.return_variable {
             return key.clone();
@@ -863,6 +990,55 @@ impl Compiler<'_> {
         }
     }
 
+    /// Translate a PL/pgSQL expression and replace the names of variables in
+    /// it. When a name is both a column and a variable, the compiler adds a
+    /// statement that gives the error, and the result is `None`.
+    fn compile_expression(&mut self, query: &str) -> Result<Option<ast::Expr>> {
+        let mut expr = translate_expression(query)?;
+        match self.resolve_expression(&mut expr)? {
+            None => Ok(Some(expr)),
+            Some(name) => {
+                self.raise_ambiguous(&name);
+                Ok(None)
+            }
+        }
+    }
+
+    /// Replace the names of variables in `expr`, and give the first name that
+    /// is both a column and a variable.
+    fn resolve_expression(&self, expr: &mut ast::Expr) -> Result<Option<String>> {
+        let mut resolver = NameResolver::new(self, self.tables);
+        resolver.expression(expr)?;
+        Ok(resolver.ambiguous)
+    }
+
+    fn resolve_statement(&self, stmt: &mut ast::Stmt) -> Result<Option<String>> {
+        let mut resolver = NameResolver::new(self, self.tables);
+        resolver.statement(stmt)?;
+        Ok(resolver.ambiguous)
+    }
+
+    /// Add the statement that gives the error of PostgreSQL for a name that
+    /// is both a column and a variable. As in PostgreSQL, the error comes
+    /// only when the statement runs.
+    fn raise_ambiguous(&mut self, name: &str) -> Flow {
+        self.statements
+            .push(raise_ambiguous_statement(name, self.statement_condition()));
+        self.flow_after_error()
+    }
+
+    /// The flow after a statement that always gives an error when it runs.
+    fn flow_after_error(&self) -> Flow {
+        match self.statement_condition() {
+            None => Flow::Returns,
+            Some(_) => Flow::Continues,
+        }
+    }
+
+    fn variable_key(&self, dno: usize) -> String {
+        format!("{}.variable.{dno}", self.variable_prefix)
+    }
+
     fn translate_statement(&self, query: &str) -> Result<ast::Stmt> {
         let parsed =
             turso_pg_parser::parse(query).map_err(|e| LimboError::ParseError(e.to_string()))?;
@@ -876,33 +1052,55 @@ impl Compiler<'_> {
             .map_err(|e| LimboError::ParseError(e.to_string()))
     }
 
-    fn replace_trigger_values(&self, expr: &mut ast::Expr) -> Result<WalkControl> {
-        let replacement = match expr {
-            ast::Expr::Id(name) => match name.as_str().to_ascii_lowercase().as_str() {
-                "tg_op" => text_literal(self.trigger.op),
-                "tg_when" => text_literal(self.trigger.when),
-                "tg_level" => text_literal("ROW"),
-                "tg_name" => text_literal(&self.trigger.name),
-                "tg_table_name" | "tg_relname" => text_literal(&self.trigger.table_name),
-                "tg_table_schema" => text_literal(&self.trigger.table_schema),
-                "tg_nargs" => {
-                    ast::Expr::Literal(ast::Literal::Numeric(self.trigger.args.len().to_string()))
-                }
-                "tg_argv" => {
-                    return Err(LimboError::ParseError(
-                        "TG_ARGV without a subscript is not supported".into(),
-                    ))
-                }
-                _ => return Ok(WalkControl::Continue),
-            },
+    fn with_context(&self, error: LimboError, line: u64, kind: &str) -> LimboError {
+        match error {
+            LimboError::ParseError(message) if !message.contains("PL/pgSQL function") => {
+                LimboError::ParseError(format!(
+                    "{message} (PL/pgSQL function {}() line {line} at {})",
+                    self.function_name,
+                    statement_description(kind)
+                ))
+            }
+            error => error,
+        }
+    }
+}
+
+impl Variables for Compiler<'_> {
+    fn variable(&self, qualifier: Option<&str>, name: &str) -> Result<Option<ast::Expr>> {
+        for scope in self.scopes.iter().rev() {
+            if qualifier.is_some_and(|label| scope.label.as_deref() != Some(label)) {
+                continue;
+            }
+            if let Some(dno) = scope
+                .variables
+                .iter()
+                .rev()
+                .copied()
+                .find(|&dno| self.datums.name(dno) == Some(name))
+            {
+                return Ok(Some(get_variable(&self.variable_key(dno))));
+            }
+        }
+        if qualifier.is_some() {
+            return Ok(None);
+        }
+        if name == "found" {
+            return Err(LimboError::ParseError("FOUND is not supported yet".into()));
+        }
+        self.trigger_constant(name)
+    }
+
+    fn replace_trigger_value(&self, expr: &mut ast::Expr) -> Result<WalkControl> {
+        match expr {
             ast::Expr::FunctionCall { name, args, .. }
                 if name.as_str().eq_ignore_ascii_case("array_element")
                     && args.len() == 2
                     && matches!(args[0].as_ref(), ast::Expr::Id(array) if array.as_str().eq_ignore_ascii_case("tg_argv")) =>
             {
-                let mut index = args[1].as_ref().clone();
-                walk_tree_mut(&mut index, &mut |e| self.replace_trigger_values(e))?;
-                self.trigger_argument(index)
+                let index = args[1].as_ref().clone();
+                *expr = self.trigger_argument(index);
+                Ok(WalkControl::Continue)
             }
             ast::Expr::Qualified(record, field) => {
                 let record = record.as_str().to_ascii_lowercase();
@@ -921,12 +1119,35 @@ impl Compiler<'_> {
                 if !missing {
                     return Ok(WalkControl::Continue);
                 }
-                null()
+                *expr = null();
+                Ok(WalkControl::SkipChildren)
             }
-            _ => return Ok(WalkControl::Continue),
-        };
-        *expr = replacement;
-        Ok(WalkControl::SkipChildren)
+            _ => Ok(WalkControl::Continue),
+        }
+    }
+}
+
+impl Compiler<'_> {
+    /// The value of `TG_OP` and the other trigger variables, which are
+    /// constants for one trigger and one event.
+    fn trigger_constant(&self, name: &str) -> Result<Option<ast::Expr>> {
+        Ok(Some(match name.to_ascii_lowercase().as_str() {
+            "tg_op" => text_literal(self.trigger.op),
+            "tg_when" => text_literal(self.trigger.when),
+            "tg_level" => text_literal("ROW"),
+            "tg_name" => text_literal(&self.trigger.name),
+            "tg_table_name" | "tg_relname" => text_literal(&self.trigger.table_name),
+            "tg_table_schema" => text_literal(&self.trigger.table_schema),
+            "tg_nargs" => {
+                ast::Expr::Literal(ast::Literal::Numeric(self.trigger.args.len().to_string()))
+            }
+            "tg_argv" => {
+                return Err(LimboError::ParseError(
+                    "TG_ARGV without a subscript is not supported".into(),
+                ))
+            }
+            _ => return Ok(None),
+        }))
     }
 
     fn trigger_argument(&self, index: ast::Expr) -> ast::Expr {
@@ -957,24 +1178,11 @@ impl Compiler<'_> {
             else_expr: None,
         }
     }
-
-    fn with_context(&self, error: LimboError, line: u64, kind: &str) -> LimboError {
-        match error {
-            LimboError::ParseError(message) if !message.contains("PL/pgSQL function") => {
-                LimboError::ParseError(format!(
-                    "{message} (PL/pgSQL function {}() line {line} at {})",
-                    self.function_name,
-                    statement_description(kind)
-                ))
-            }
-            error => error,
-        }
-    }
 }
 
-/// The NEW and OLD records of a trigger function, and the record fields that
-/// its assignments name.
-struct Records<'a> {
+/// The datums of a PL/pgSQL function: its variables, the NEW and OLD
+/// records, and the record fields that its assignments name.
+struct Datums<'a> {
     datums: &'a [Json],
     new_varno: Option<u64>,
     old_varno: Option<u64>,
@@ -983,10 +1191,20 @@ struct Records<'a> {
 enum Target<'a> {
     NewField(&'a str),
     OldField,
-    Variable,
+    Variable(usize),
+    Other,
 }
 
-impl<'a> Records<'a> {
+/// The declaration of a variable.
+struct Declaration<'a> {
+    name: &'a str,
+    default: Option<&'a str>,
+    not_null: bool,
+    /// The type that an assigned value is converted to.
+    cast: Option<ast::Type>,
+}
+
+impl<'a> Datums<'a> {
     fn new(function: &'a Json) -> Self {
         Self {
             datums: function
@@ -999,20 +1217,170 @@ impl<'a> Records<'a> {
     }
 
     fn assignment_target(&self, varno: u64) -> Target<'a> {
-        let Some(field) = usize::try_from(varno)
+        let Some((dno, datum)) = usize::try_from(varno)
             .ok()
-            .and_then(|varno| self.datums.get(varno))
-            .and_then(|datum| datum.get("PLpgSQL_recfield"))
+            .and_then(|dno| Some((dno, self.datums.get(dno)?)))
         else {
-            return Target::Variable;
+            return Target::Other;
+        };
+        if datum.get("PLpgSQL_var").is_some() {
+            return Target::Variable(dno);
+        }
+        let Some(field) = datum.get("PLpgSQL_recfield") else {
+            return Target::Other;
         };
         let parent = field.get("recparentno").and_then(Json::as_u64);
         match field.get("fieldname").and_then(Json::as_str) {
             Some(name) if parent.is_some() && parent == self.new_varno => Target::NewField(name),
             Some(_) if parent.is_some() && parent == self.old_varno => Target::OldField,
-            _ => Target::Variable,
+            _ => Target::Other,
         }
     }
+
+    /// The name of a variable or a record that a block declares.
+    fn name(&self, dno: usize) -> Option<&'a str> {
+        let datum = self.datums.get(dno)?;
+        datum
+            .get("PLpgSQL_var")
+            .or_else(|| datum.get("PLpgSQL_rec"))?
+            .get("refname")
+            .and_then(Json::as_str)
+    }
+
+    fn declaration(&self, dno: usize) -> Result<Declaration<'a>> {
+        let datum = &self.datums[dno];
+        if let Some(record) = datum.get("PLpgSQL_rec") {
+            let name = record.get("refname").and_then(Json::as_str).unwrap_or("");
+            return Err(LimboError::ParseError(format!(
+                "the record variable \"{name}\" is not supported yet"
+            )));
+        }
+        let variable = datum
+            .get("PLpgSQL_var")
+            .ok_or_else(|| LimboError::Corrupt("malformed PL/pgSQL variable".into()))?;
+        let name = variable
+            .get("refname")
+            .and_then(Json::as_str)
+            .ok_or_else(|| LimboError::Corrupt("malformed PL/pgSQL variable".into()))?;
+        if name == "found" && variable.get("lineno").is_none() {
+            return Err(LimboError::ParseError("FOUND is not supported yet".into()));
+        }
+        if variable.get("cursor_explicit_expr").is_some() {
+            return Err(LimboError::ParseError("cursors are not supported".into()));
+        }
+        let type_name = variable
+            .get("datatype")
+            .and_then(|datatype| datatype.get("PLpgSQL_type"))
+            .and_then(|datatype| datatype.get("typname"))
+            .and_then(Json::as_str)
+            .map(str::trim)
+            .ok_or_else(|| LimboError::Corrupt("malformed PL/pgSQL variable".into()))?;
+        if type_name.contains('%') {
+            return Err(LimboError::ParseError(format!(
+                "the type {type_name} of variable \"{name}\" is not supported yet"
+            )));
+        }
+        Ok(Declaration {
+            name,
+            default: variable
+                .get("default_val")
+                .map(|default| expression_query(Some(default)))
+                .transpose()?,
+            not_null: variable.get("notnull").and_then(Json::as_bool) == Some(true),
+            cast: cast_type(type_name)?,
+        })
+    }
+}
+
+/// The variables that each block declares, by the address of the block.
+/// The JSON of a block does not list its variables, so a variable belongs to
+/// the first block whose BEGIN is on the line of the variable or after it:
+/// the declarations of a block come just before its BEGIN. The variable of
+/// CASE and the variables of loops are not declarations.
+fn block_variables(action: &Json, datums: &Datums) -> Result<HashMap<usize, Vec<usize>>> {
+    let mut blocks = Vec::new();
+    collect_blocks(std::iter::once(action), &mut blocks);
+    let block_line = |block: &Json| block.get("lineno").and_then(Json::as_u64).unwrap_or(0);
+    let mut variables: HashMap<usize, Vec<usize>> = HashMap::new();
+    for (dno, datum) in datums.datums.iter().enumerate() {
+        let Some(variable) = datum
+            .get("PLpgSQL_var")
+            .or_else(|| datum.get("PLpgSQL_rec"))
+        else {
+            continue;
+        };
+        let is_case_variable = variable
+            .get("refname")
+            .and_then(Json::as_str)
+            .is_some_and(|name| name.starts_with("__Case__Variable_"));
+        let Some(line) = variable.get("lineno").and_then(Json::as_u64) else {
+            continue;
+        };
+        if is_case_variable {
+            continue;
+        }
+        let Some(begin) = blocks
+            .iter()
+            .map(|block| block_line(block))
+            .filter(|&begin| begin >= line)
+            .min()
+        else {
+            continue;
+        };
+        let mut candidates = blocks.iter().filter(|block| block_line(block) == begin);
+        let block = candidates.next().expect("a block starts on the line");
+        if line == begin && candidates.next().is_some() {
+            return Err(LimboError::ParseError(
+                "variables of blocks that start on one line are not supported yet".into(),
+            ));
+        }
+        variables.entry(block_address(block)).or_default().push(dno);
+    }
+    Ok(variables)
+}
+
+/// Add the blocks among `statements` and their nested statements to
+/// `blocks`, in the order of the source.
+fn collect_blocks<'j>(statements: impl IntoIterator<Item = &'j Json>, blocks: &mut Vec<&'j Json>) {
+    for statement in statements {
+        let Some((kind, body)) = statement
+            .as_object()
+            .and_then(|object| object.iter().next())
+        else {
+            continue;
+        };
+        if kind == "PLpgSQL_stmt_block" {
+            blocks.push(body);
+        }
+        collect_blocks(json_array(body, "then_body"), blocks);
+        for elsif in
+            json_array(body, "elsif_list").filter_map(|elsif| elsif.get("PLpgSQL_if_elsif"))
+        {
+            collect_blocks(json_array(elsif, "stmts"), blocks);
+        }
+        collect_blocks(json_array(body, "else_body"), blocks);
+        for when in
+            json_array(body, "case_when_list").filter_map(|when| when.get("PLpgSQL_case_when"))
+        {
+            collect_blocks(json_array(when, "stmts"), blocks);
+        }
+        collect_blocks(json_array(body, "else_stmts"), blocks);
+        collect_blocks(json_array(body, "body"), blocks);
+        let exceptions = body
+            .get("exceptions")
+            .and_then(|exceptions| exceptions.get("PLpgSQL_exception_block"));
+        for exception in exceptions
+            .into_iter()
+            .flat_map(|exceptions| json_array(exceptions, "exc_list"))
+            .filter_map(|exception| exception.get("PLpgSQL_exception"))
+        {
+            collect_blocks(json_array(exception, "action"), blocks);
+        }
+    }
+}
+
+fn block_address(block: &Json) -> usize {
+    block as *const Json as usize
 }
 
 #[derive(Clone, Copy)]
@@ -1159,32 +1527,135 @@ fn assigned_value(assignment: &str) -> Result<&str> {
         .ok_or_else(unsupported)
 }
 
+/// Translate a PL/pgSQL expression, which PostgreSQL runs as the query
+/// `SELECT <expression>`. When that query has FROM, WHERE or other clauses,
+/// the expression is a subquery that gives NULL when the query gives no row.
 fn translate_expression(expression: &str) -> Result<ast::Expr> {
-    PostgreSQLTranslator::new()
-        .translate_expression(&parse_expression(expression)?)
-        .map_err(|e| LimboError::ParseError(e.to_string()))
+    let query = parse_expression_query(expression)?;
+    match single_expression(&query) {
+        Some(value) => PostgreSQLTranslator::new()
+            .translate_expression(&value)
+            .map_err(|e| LimboError::ParseError(e.to_string())),
+        None => one_row_value(expression),
+    }
 }
 
 fn parse_expression(expression: &str) -> Result<pg_query::protobuf::Node> {
+    single_expression(&parse_expression_query(expression)?)
+        .ok_or_else(|| LimboError::ParseError(format!("expected one expression: {expression}")))
+}
+
+fn parse_expression_query(expression: &str) -> Result<pg_query::protobuf::SelectStmt> {
     let parsed = turso_pg_parser::parse(&format!("SELECT {expression}"))
         .map_err(|e| LimboError::ParseError(e.to_string()))?;
     let invalid = || LimboError::ParseError(format!("expected one expression: {expression}"));
     let [statement] = parsed.protobuf.stmts.as_slice() else {
         return Err(invalid());
     };
-    let Some(Node::SelectStmt(select)) = statement
+    match statement
         .stmt
         .as_ref()
         .and_then(|statement| statement.node.as_ref())
-    else {
-        return Err(invalid());
-    };
-    let [target] = select.target_list.as_slice() else {
-        return Err(invalid());
-    };
-    match &target.node {
-        Some(Node::ResTarget(target)) => target.val.as_deref().cloned().ok_or_else(invalid),
+    {
+        Some(Node::SelectStmt(select)) => Ok(select.as_ref().clone()),
         _ => Err(invalid()),
+    }
+}
+
+/// The expression of a query that has only one expression and no clause.
+fn single_expression(query: &pg_query::protobuf::SelectStmt) -> Option<pg_query::protobuf::Node> {
+    let only_target = query.op() == pg_query::protobuf::SetOperation::SetopNone
+        && query.from_clause.is_empty()
+        && query.where_clause.is_none()
+        && query.group_clause.is_empty()
+        && query.having_clause.is_none()
+        && query.window_clause.is_empty()
+        && query.distinct_clause.is_empty()
+        && query.sort_clause.is_empty()
+        && query.limit_offset.is_none()
+        && query.limit_count.is_none()
+        && query.with_clause.is_none()
+        && query.values_lists.is_empty()
+        && query.into_clause.is_none()
+        && query.locking_clause.is_empty();
+    match query.target_list.as_slice() {
+        [target] if only_target => match &target.node {
+            Some(Node::ResTarget(target)) => target.val.as_deref().cloned(),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// The value of the query `SELECT <expression>` with FROM or other clauses,
+/// as PL/pgSQL gives it: NULL when the query gives no row, and an error when
+/// it gives more than one row.
+fn one_row_value(expression: &str) -> Result<ast::Expr> {
+    let query = format!("SELECT {expression}");
+    let parsed =
+        turso_pg_parser::parse(&query).map_err(|e| LimboError::ParseError(e.to_string()))?;
+    let statement = PostgreSQLTranslator::new()
+        .translate(&parsed)
+        .map_err(|e| LimboError::ParseError(e.to_string()))?;
+    let ast::Stmt::Select(mut select) = statement else {
+        return Err(LimboError::ParseError(format!(
+            "expected one expression: {expression}"
+        )));
+    };
+    let ast::OneSelect::Select { columns, .. } = &mut select.body.select else {
+        return Err(LimboError::ParseError(format!(
+            "query \"{query}\" is not supported yet"
+        )));
+    };
+    let [ast::ResultColumn::Expr(_, alias)] = columns.as_mut_slice() else {
+        return Err(LimboError::ParseError(format!(
+            "query \"{query}\" must return one column"
+        )));
+    };
+    *alias = Some(ast::As::As(ast::Name::exact(VALUE_COLUMN.to_string())));
+    let value = ast::Expr::Id(ast::Name::exact(VALUE_COLUMN.to_string()));
+    let mut first_rows = one_select(
+        vec![ast::ResultColumn::Expr(Box::new(value.clone()), None)],
+        Some(from_subquery(select, "__query")),
+        None,
+    );
+    first_rows.limit = Some(ast::Limit {
+        expr: Box::new(ast::Expr::Literal(ast::Literal::Numeric("2".into()))),
+        offset: None,
+    });
+    let row_count = ast::Expr::FunctionCallStar {
+        name: ast::Name::exact("count".to_string()),
+        filter_over: ast::FunctionTail {
+            filter_clause: None,
+            over_clause: None,
+        },
+    };
+    let checked_value = case_when(
+        ast::Expr::Binary(
+            Box::new(row_count),
+            ast::Operator::Greater,
+            Box::new(ast::Expr::Literal(ast::Literal::Numeric("1".into()))),
+        ),
+        raise_abort_expr(text_literal("query returned more than one row")),
+        function_call("min", vec![value]),
+    );
+    Ok(ast::Expr::Subquery(Box::new(one_select(
+        vec![ast::ResultColumn::Expr(Box::new(checked_value), None)],
+        Some(from_subquery(first_rows, "__rows")),
+        None,
+    ))))
+}
+
+const VALUE_COLUMN: &str = "__value";
+
+fn from_subquery(select: ast::Select, alias: &str) -> ast::FromClause {
+    ast::FromClause {
+        select: Box::new(ast::SelectTable::Select {
+            select,
+            alias: Some(ast::As::As(ast::Name::exact(alias.to_string()))),
+            lateral: false,
+        }),
+        joins: vec![],
     }
 }
 
@@ -1488,6 +1959,15 @@ fn raise_abort_expr(message: ast::Expr) -> ast::Expr {
     ast::Expr::Raise(ast::ResolveType::Abort, Some(Box::new(message)))
 }
 
+fn raise_ambiguous_statement(name: &str, condition: Option<ast::Expr>) -> ast::Stmt {
+    select_where(
+        raise_abort_expr(text_literal(&format!(
+            "column reference \"{name}\" is ambiguous"
+        ))),
+        condition,
+    )
+}
+
 fn set_variable(key: &str, value: ast::Expr) -> ast::Expr {
     function_call(SET_VARIABLE, vec![text_literal(key), value])
 }
@@ -1522,6 +2002,27 @@ fn case_when(condition: ast::Expr, then: ast::Expr, otherwise: ast::Expr) -> ast
         base: None,
         when_then_pairs: vec![(Box::new(condition), Box::new(then))],
         else_expr: Some(Box::new(otherwise)),
+    }
+}
+
+/// The type of a cast to the PostgreSQL type `type_name`, as the translator
+/// converts it.
+fn cast_type(type_name: &str) -> Result<Option<ast::Type>> {
+    match translate_expression(&format!("CAST(NULL AS {type_name})"))? {
+        ast::Expr::Cast { type_name, .. } => Ok(type_name),
+        _ => Err(LimboError::ParseError(format!(
+            "type {type_name} is not supported yet"
+        ))),
+    }
+}
+
+fn cast(value: ast::Expr, type_name: Option<ast::Type>) -> ast::Expr {
+    match type_name {
+        Some(type_name) => ast::Expr::Cast {
+            expr: Box::new(value),
+            type_name: Some(type_name),
+        },
+        None => value,
     }
 }
 
