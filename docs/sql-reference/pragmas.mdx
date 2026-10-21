@@ -303,6 +303,30 @@ PRAGMA busy_timeout;
 PRAGMA busy_timeout = 5000;   -- 5 seconds
 ```
 
+### locking_mode
+
+Returns the database locking mode.
+
+```sql
+PRAGMA locking_mode;
+-- exclusive
+```
+
+Turso always opens databases in `EXCLUSIVE` locking mode, so the read form always
+returns `exclusive`.
+
+<Warning>
+**Only `EXCLUSIVE` is supported.** Assigning `EXCLUSIVE` is accepted but changes
+nothing, and any other value (such as `NORMAL`) is rejected with
+`locking_mode must be EXCLUSIVE`. `COMPAT.md` tracks this as
+[🚧 Partial](https://github.com/tursodatabase/turso/blob/main/COMPAT.md).
+</Warning>
+
+```sql
+PRAGMA locking_mode = exclusive;  -- no-op
+PRAGMA locking_mode = NORMAL;     -- rejected
+```
+
 ### query_only
 
 When enabled, prevents any changes to the database.
@@ -384,6 +408,32 @@ DELETE FROM users WHERE id = 1;  -- allowed
 
 PRAGMA i_am_a_dummy = 1;      -- equivalent to require_where = 1
 ```
+
+### locking_mode
+
+Returns the database locking mode, which is always reported as `exclusive`.
+
+```sql
+PRAGMA locking_mode;
+-- exclusive
+
+PRAGMA locking_mode = exclusive;
+```
+
+<Warning>
+Turso only accepts the value `EXCLUSIVE`, in any letter case and with or without quotes.
+SQLite's default value `NORMAL` is rejected:
+
+```sql
+PRAGMA locking_mode = normal;
+-- Error: locking_mode must be EXCLUSIVE
+```
+
+Writing the pragma does not change how Turso locks the database file. It only checks the
+value and then reports `exclusive`, the same as the read form. So a portable script that
+sets `locking_mode` back to `NORMAL` when it finishes will fail here even though it works
+on SQLite. This matches the `Partial` entry for `PRAGMA locking_mode` in `COMPAT.md`.
+</Warning>
 
 ## Integrity Checks
 
