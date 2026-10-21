@@ -1223,11 +1223,19 @@ pub fn translate_drop_index(
     if_exists: bool,
     program: &mut ProgramBuilder,
 ) -> crate::Result<()> {
-    let database_id = resolver.resolve_existing_index_database_id(qualified_name)?;
     let idx_name = normalize_ident(qualified_name.name.as_str());
     let opts = ProgramBuilderOpts::new(5, 40, 5);
     program.extend(&opts);
 
+    let Some(database_id) = resolver.find_existing_index_database_id(qualified_name)? else {
+        if if_exists {
+            return Ok(());
+        }
+        return Err(crate::error::LimboError::InvalidArgument(format!(
+            "No such index: {}",
+            &idx_name
+        )));
+    };
     let schema_cookie = resolver.with_schema(database_id, |s| s.schema_version);
     program.begin_write_on_database(database_id, schema_cookie)?;
 

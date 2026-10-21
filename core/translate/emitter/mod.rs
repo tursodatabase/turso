@@ -771,6 +771,18 @@ impl<'a> Resolver<'a> {
     where
         F: Fn(&Schema, &str) -> bool,
     {
+        self.find_unqualified_existing_database_id(object_name, schema_contains_object)
+            .ok_or_else(|| LimboError::ParseError(format!("no such object: {object_name}")))
+    }
+
+    fn find_unqualified_existing_database_id<F>(
+        &self,
+        object_name: &str,
+        schema_contains_object: F,
+    ) -> Option<usize>
+    where
+        F: Fn(&Schema, &str) -> bool,
+    {
         // Only check the temp schema when a temp database actually exists.
         // This avoids expensive schema construction/lookup on every table
         // resolution when no temp objects have been created.
@@ -779,33 +791,29 @@ impl<'a> Resolver<'a> {
                 schema_contains_object(schema, object_name)
             })
         {
-            return Ok(crate::TEMP_DB_ID);
+            return Some(crate::TEMP_DB_ID);
         }
 
         if let Some(search_path) = &self.unqualified_database_search_path {
-            for schema_name in search_path {
-                let Some(database_id) = self.resolve_search_path_database_id(schema_name) else {
-                    continue;
-                };
-                if self.with_schema(database_id, |schema| {
-                    schema_contains_object(schema, object_name)
-                }) {
-                    return Ok(database_id);
-                }
-            }
-            return Err(LimboError::ParseError(format!(
-                "no such object: {object_name}"
-            )));
+            return search_path
+                .iter()
+                .filter_map(|schema_name| self.resolve_search_path_database_id(schema_name))
+                .find(|&database_id| {
+                    self.with_schema(database_id, |schema| {
+                        schema_contains_object(schema, object_name)
+                    })
+                });
         }
 
-        Ok(self
-            .namespaces
-            .find_in_search_order(&mut |database_id| {
-                self.with_schema(database_id, |schema| {
-                    schema_contains_object(schema, object_name)
+        Some(
+            self.namespaces
+                .find_in_search_order(&mut |database_id| {
+                    self.with_schema(database_id, |schema| {
+                        schema_contains_object(schema, object_name)
+                    })
                 })
-            })
-            .unwrap_or(crate::MAIN_DB_ID))
+                .unwrap_or(crate::MAIN_DB_ID),
+        )
     }
 
     fn resolve_search_path_database_id(&self, schema_name: &str) -> Option<usize> {
@@ -857,13 +865,28 @@ impl<'a> Resolver<'a> {
         &self,
         qualified_name: &ast::QualifiedName,
     ) -> Result<usize> {
-        if qualified_name.namespace.is_some() {
-            return self.resolve_database_id(qualified_name);
-        }
-        self.resolve_existing_table_database_id(qualified_name.name.as_str())
+        self.find_existing_table_database_id_qualified(qualified_name)?
+            .ok_or_else(|| {
+                LimboError::ParseError(format!("no such object: {}", qualified_name.name.as_str()))
+            })
     }
 
     pub(crate) fn resolve_existing_table_database_id(&self, table_name: &str) -> Result<usize> {
+        self.find_existing_table_database_id(table_name)
+            .ok_or_else(|| LimboError::ParseError(format!("no such object: {table_name}")))
+    }
+
+    pub(crate) fn find_existing_table_database_id_qualified(
+        &self,
+        qualified_name: &ast::QualifiedName,
+    ) -> Result<Option<usize>> {
+        if qualified_name.namespace.is_some() {
+            return self.resolve_database_id(qualified_name).map(Some);
+        }
+        Ok(self.find_existing_table_database_id(qualified_name.name.as_str()))
+    }
+
+    fn find_existing_table_database_id(&self, table_name: &str) -> Option<usize> {
         // A TEMP view or trigger carries a scope (so explicit `aux.table`
         // references still see its own database below), but the scope does
         // not restrict unqualified names: SQLite's schema fixer skips TEMP
@@ -872,30 +895,40 @@ impl<'a> Resolver<'a> {
         // same way a top-level query does, sqlite_schema included.
         if let Some(ctx) = self.database_scope.borrow().as_ref() {
             if ctx.restricts_db_references() {
-                return Ok(ctx.database_id);
+                return Some(ctx.database_id);
             }
         }
 
         if let Some(database_id) = Self::resolve_schema_table_database_id(table_name) {
-            return Ok(database_id);
+            return Some(database_id);
         }
 
-        self.resolve_unqualified_existing_database_id(
-            table_name,
-            Self::schema_has_table_like_object,
-        )
+        self.find_unqualified_existing_database_id(table_name, Self::schema_has_table_like_object)
     }
 
     pub(crate) fn resolve_existing_index_database_id(
         &self,
         qualified_name: &ast::QualifiedName,
     ) -> Result<usize> {
+        self.find_existing_index_database_id(qualified_name)?
+            .ok_or_else(|| {
+                LimboError::ParseError(format!(
+                    "no such object: {}",
+                    normalize_ident(qualified_name.name.as_str())
+                ))
+            })
+    }
+
+    pub(crate) fn find_existing_index_database_id(
+        &self,
+        qualified_name: &ast::QualifiedName,
+    ) -> Result<Option<usize>> {
         if qualified_name.namespace.is_some() {
-            return self.resolve_database_id(qualified_name);
+            return self.resolve_database_id(qualified_name).map(Some);
         }
 
         let index_name = normalize_ident(qualified_name.name.as_str());
-        self.resolve_unqualified_existing_database_id(&index_name, Self::schema_has_index)
+        Ok(self.find_unqualified_existing_database_id(&index_name, Self::schema_has_index))
     }
 
     pub(crate) fn resolve_existing_trigger_database_id(
