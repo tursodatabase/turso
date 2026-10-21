@@ -618,6 +618,11 @@ fn test_delete_collects_rowids_first_only_when_foreign_keys_are_on(
     assert!(!delete_uses_rowset(&conn, "parent"));
     conn.execute("PRAGMA foreign_keys = ON")?;
     assert!(delete_uses_rowset(&conn, "parent"));
+    assert!(
+        !limbo_exec_rows(&conn, "EXPLAIN DELETE FROM parent WHERE id = 1")
+            .iter()
+            .any(|row| row[1] == RValue::Text("RowSetAdd".to_string()))
+    );
     assert!(!delete_uses_rowset(&conn, "plain_parent"));
     Ok(())
 }
