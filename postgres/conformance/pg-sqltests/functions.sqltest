@@ -651,3 +651,148 @@ expect {
     1|3
     2|-1
 }
+
+test json-to-recordset-column-list {
+    SELECT (id + 10) || ':' || v FROM json_to_recordset('[{"id":1,"v":"a"},{"id":2,"v":"b"}]') AS _("id" integer, "v" text) ORDER BY id;
+    SELECT (id + 10) || ':' || v FROM jsonb_to_recordset('[{"id":3,"v":"c"},{"id":4,"v":"d"}]'::jsonb) AS _("id" integer, "v" text) ORDER BY id;
+    SELECT count(*) FROM json_to_recordset('[]') AS _(id integer);
+    SELECT count(*) FROM json_to_recordset(NULL) AS _(id integer);
+}
+expect {
+    11:a
+    12:b
+    13:c
+    14:d
+    0
+    0
+}
+
+test json-to-record-column-list {
+    SELECT (id + 10) || ':' || v FROM json_to_record('{"id":1,"v":"a"}') AS _("id" integer, "v" text);
+    SELECT (id + 10) || ':' || v FROM jsonb_to_record('{"id":5,"v":"e"}'::jsonb) AS _("id" integer, "v" text);
+    SELECT coalesce(m, 'none') FROM json_to_record('{"id":1}') AS _(id integer, m text);
+    SELECT coalesce(id, -1) FROM json_to_record(NULL) AS _(id integer);
+}
+expect {
+    11:a
+    15:e
+    none
+    -1
+}
+
+test json-to-record-value-conversion {
+    SELECT id + 1, n, j, s FROM json_to_record('{"id":"5","n":{"z":[1]},"j":"q","s":"x"}') AS _(id integer, n text, j json, s text);
+    SELECT * FROM json_to_record('{"a b":1,"c.d":2,"$x":3,"q\"r":4}') AS _("a b" integer, "c.d" integer, "$x" integer, "q""r" integer);
+}
+expect {
+    6|{"z":[1]}|"q"|x
+    1|2|3|4
+}
+
+test json-to-recordset-correlated {
+    CREATE TABLE json_bodies (id int, body text);
+    INSERT INTO json_bodies VALUES (1, '[{"v":"a"},{"v":"b"}]'), (2, '[{"v":"c"}]');
+    SELECT b.id, r.v FROM json_bodies AS b, json_to_recordset(b.body::json) AS r(v text) ORDER BY b.id, r.v;
+}
+expect {
+    1|a
+    1|b
+    2|c
+}
+
+test json-to-record-requires-column-list {
+    SELECT * FROM json_to_record('{"id":1}') AS _;
+}
+expect error {
+    a column definition list is required for functions returning "record"
+}
+
+test json-to-record-argument-named-like-json-each-column {
+    CREATE TABLE json_each_names (value text, key text, type text);
+    INSERT INTO json_each_names VALUES ('[{"v":"a"},{"v":"b"}]', '{"v":"k"}', '[{"v":"t"}]');
+    SELECT r.v, s.v FROM json_each_names, json_to_recordset(value::json) AS r(v text), json_to_record(key::json) AS s(v text) ORDER BY r.v;
+    SELECT r.v FROM json_each_names, jsonb_to_recordset(type::jsonb) AS r(v text);
+}
+expect {
+    a|k
+    b|k
+    t
+}
+
+test json-to-record-without-alias-uses-function-name {
+    SELECT json_to_recordset.id FROM json_to_recordset('[{"id":1},{"id":2}]') AS (id int) ORDER BY json_to_recordset.id;
+    SELECT jsonb_to_record.id FROM jsonb_to_record('{"id":3}'::jsonb) AS (id int);
+}
+expect {
+    1
+    2
+    3
+}
+
+test json-to-recordset-object-errors {
+    SELECT * FROM json_to_recordset('{"a":1}') AS _(a int);
+}
+expect error {
+    cannot call json_to_recordset on an object
+}
+
+test json-to-recordset-scalar-errors {
+    SELECT * FROM jsonb_to_recordset('5'::jsonb) AS _(a int);
+}
+expect error {
+    cannot call jsonb_to_recordset on a non-array
+}
+
+test json-to-recordset-json-scalar-errors {
+    SELECT * FROM json_to_recordset('5') AS _(a int);
+}
+expect error {
+    cannot call json_to_recordset on a scalar
+}
+
+test json-to-recordset-non-object-element-errors {
+    SELECT * FROM json_to_recordset('[{"a":1},5]') AS _(a int);
+}
+expect error {
+    argument of json_to_recordset must be an array of objects
+}
+
+test json-to-recordset-null-element-errors {
+    SELECT * FROM jsonb_to_recordset('[null]'::jsonb) AS _(a int);
+}
+expect error {
+    argument of jsonb_to_recordset must be an array of objects
+}
+
+test json-to-record-array-errors {
+    SELECT * FROM json_to_record('[{"a":1}]') AS _(a int);
+}
+expect error {
+    cannot call populate_composite on an array
+}
+
+test json-to-record-scalar-errors {
+    SELECT * FROM jsonb_to_record('null'::jsonb) AS _(a int);
+}
+expect error {
+    cannot call populate_composite on a scalar
+}
+
+test json-to-record-text-column-keeps-json-text {
+    SELECT a, b, c, d, e, f, g FROM json_to_record('{"a":true,"b":1e2,"c":12345678901234567890,"d":-0,"e":false,"f":1.50,"g":"s"}') AS _(a text, b text, c text, d varchar, e text, f text, g text);
+    SELECT a, b FROM jsonb_to_recordset('[{"a":12345678901234567890,"b":true}]'::jsonb) AS _(a text, b varchar);
+}
+expect {
+    true|1e2|12345678901234567890|-0|false|1.50|s
+    12345678901234567890|true
+}
+
+test json-to-record-json-null-is-sql-null {
+    SELECT coalesce(a::text, '<null>'), coalesce(b::text, '<null>'), coalesce(c, '<null>'), coalesce(d, -1) FROM jsonb_to_record('{"a":null,"b":null,"c":null,"d":null}'::jsonb) AS _(a jsonb, b json, c text, d int);
+    SELECT coalesce(a::text, '<null>'), b FROM json_to_recordset('[{"a":null,"b":"x"},{"a":{"y":2},"b":"z"}]') AS _(a json, b json);
+}
+expect {
+    <null>|<null>|<null>|-1
+    <null>|"x"
+    {"y":2}|"z"
+}
