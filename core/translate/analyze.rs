@@ -45,12 +45,11 @@ fn resolve_analyze_targets(
 
                 // "ANALYZE db.table" — the name part is the table/index
                 // But first check if the name is actually a database name too (shouldn't be with db_name set)
-                let Some(target) = find_index_target(&normalized, database_id, resolver)
-                    .or_else(|| find_table_target(&normalized, database_id, resolver))
-                else {
+                let targets = resolve_targets_in_db(&normalized, database_id, resolver)?;
+                if targets.is_empty() {
                     bail_parse_error!("no such table or index: {}.{}", db_normalized, normalized);
-                };
-                return Ok((database_id, vec![target]));
+                }
+                return Ok((database_id, targets));
             }
 
             // No db_name — check if the name is a database name first
@@ -79,10 +78,11 @@ fn resolve_analyze_targets(
             let table_db_id = resolver
                 .find_existing_table_database_id_qualified(target)?
                 .unwrap_or(crate::MAIN_DB_ID);
-            let Some(target) = find_table_target(&normalized, table_db_id, resolver) else {
+            let targets = resolve_targets_in_db(&normalized, table_db_id, resolver)?;
+            if targets.is_empty() {
                 bail_parse_error!("no such table or index: {}", target.name);
-            };
-            Ok((table_db_id, vec![target]))
+            }
+            Ok((table_db_id, targets))
         }
         None => {
             // ANALYZE with no target — analyze all tables in main
@@ -111,6 +111,26 @@ fn collect_all_tables_in_db(database_id: usize, resolver: &Resolver) -> Vec<Anal
     })
 }
 
+/// Resolve a name as a table or index within a specific database.
+fn resolve_targets_in_db(
+    name: &str,
+    database_id: usize,
+    resolver: &Resolver,
+) -> Result<Vec<AnalyzeTarget>> {
+    // Try as a table first
+    let table_opt: Option<Arc<BTreeTable>> =
+        resolver.with_schema(database_id, |s| s.get_btree_table(name));
+    if let Some(table) = table_opt {
+        return Ok(vec![(table, None)]);
+    }
+
+    if let Some(target) = find_index_target(name, database_id, resolver) {
+        return Ok(vec![target]);
+    }
+
+    Ok(vec![])
+}
+
 fn find_index_target(name: &str, database_id: usize, resolver: &Resolver) -> Option<AnalyzeTarget> {
     resolver.with_schema(database_id, |schema| {
         schema.indexes.iter().find_map(|(table_name, indexes)| {
@@ -121,12 +141,6 @@ fn find_index_target(name: &str, database_id: usize, resolver: &Resolver) -> Opt
             Some((table, Some(index.clone())))
         })
     })
-}
-
-fn find_table_target(name: &str, database_id: usize, resolver: &Resolver) -> Option<AnalyzeTarget> {
-    resolver
-        .with_schema(database_id, |schema| schema.get_btree_table(name))
-        .map(|table| (table, None))
 }
 
 pub fn translate_analyze(
