@@ -4776,15 +4776,9 @@ pub fn render_gencol_expr_sql_with_new_names(expr: &Expr, columns: &[Column]) ->
 
 pub(crate) fn is_deterministic_schema_function_call(func: &Func, args: &[Box<Expr>]) -> bool {
     match func {
-        Func::Scalar(
-            ScalarFunc::Date
-            | ScalarFunc::Time
-            | ScalarFunc::DateTime
-            | ScalarFunc::UnixEpoch
-            | ScalarFunc::JulianDay
-            | ScalarFunc::StrfTime
-            | ScalarFunc::TimeDiff,
-        ) => is_deterministic_datetime_call(func, args),
+        Func::Scalar(scalar_func) if scalar_func.is_date_time_function() => {
+            is_deterministic_datetime_call(func, args)
+        }
         _ => func.is_deterministic(),
     }
 }

@@ -71,9 +71,10 @@ use crate::{
         builder::CursorType,
         insn::{IdxInsertFlags, Insn, SavepointOp},
     },
-    CaptureDataChangesInfo, CdcVersion, CheckpointMode, Completion, ConnectOpts, Connection,
-    Database, DatabaseStorage, IOExt, MvCursor, NonNan, OpenFlags, QueryMode, Statement,
-    TransactionState, ValueRef, WalAutoActions, MAIN_DB_ID, TEMP_DB_ID,
+    CaptureDataChangesInfo, CdcVersion, CheckpointMode, Clock, Completion, ConnectOpts, Connection,
+    Database, DatabaseStorage, IOExt, MonotonicInstant, MvCursor, NonNan, OpenFlags, QueryMode,
+    Statement, TransactionState, ValueRef, WalAutoActions, WallClockInstant, MAIN_DB_ID,
+    TEMP_DB_ID,
 };
 use crate::{
     error::{
@@ -99,6 +100,7 @@ use std::any::Any;
 use std::str::FromStr;
 use std::{
     borrow::BorrowMut,
+    cell::Cell,
     num::NonZero,
     sync::{atomic::Ordering, Arc},
 };
@@ -6062,6 +6064,10 @@ pub fn op_program(
                 // so we must not call it again after the loop.
                 let mut subprogram_aborted = false;
                 loop {
+                    let now = *state
+                        .current_time
+                        .get_or_insert_with(|| pager.io.current_time_wall_clock());
+                    statement.set_current_time(now);
                     let res = statement.step_subprogram();
                     match res {
                         Ok(step_result) => match step_result {
@@ -10785,13 +10791,15 @@ pub fn op_function(
             ScalarFunc::Date => {
                 let values =
                     registers_to_ref_values(&state.registers[*start_reg..*start_reg + arg_count]);
-                let result = exec_date(pager.io.as_ref(), values);
+                let clock = StatementClock::new(pager.io.as_ref(), &mut state.current_time);
+                let result = exec_date(&clock, values);
                 state.registers[*dest].set_value(result);
             }
             ScalarFunc::Time => {
                 let values =
                     registers_to_ref_values(&state.registers[*start_reg..*start_reg + arg_count]);
-                let result = exec_time(pager.io.as_ref(), values);
+                let clock = StatementClock::new(pager.io.as_ref(), &mut state.current_time);
+                let result = exec_time(&clock, values);
                 state.registers[*dest].set_value(result);
             }
             ScalarFunc::TimeDiff => {
@@ -10801,8 +10809,8 @@ pub fn op_function(
                     let start = state.registers[*start_reg].get_value();
                     let end = state.registers[*start_reg + 1].get_value();
 
-                    let result =
-                        crate::functions::datetime::exec_timediff(pager.io.as_ref(), [start, end]);
+                    let clock = StatementClock::new(pager.io.as_ref(), &mut state.current_time);
+                    let result = crate::functions::datetime::exec_timediff(&clock, [start, end]);
 
                     state.registers[*dest].set_value(result);
                 }
@@ -10815,19 +10823,22 @@ pub fn op_function(
             ScalarFunc::DateTime => {
                 let values =
                     registers_to_ref_values(&state.registers[*start_reg..*start_reg + arg_count]);
-                let result = exec_datetime_full(pager.io.as_ref(), values);
+                let clock = StatementClock::new(pager.io.as_ref(), &mut state.current_time);
+                let result = exec_datetime_full(&clock, values);
                 state.registers[*dest].set_value(result);
             }
             ScalarFunc::JulianDay => {
                 let values =
                     registers_to_ref_values(&state.registers[*start_reg..*start_reg + arg_count]);
-                let result = exec_julianday(pager.io.as_ref(), values);
+                let clock = StatementClock::new(pager.io.as_ref(), &mut state.current_time);
+                let result = exec_julianday(&clock, values);
                 state.registers[*dest].set_value(result);
             }
             ScalarFunc::UnixEpoch => {
                 let values =
                     registers_to_ref_values(&state.registers[*start_reg..*start_reg + arg_count]);
-                let result = exec_unixepoch(pager.io.as_ref(), values);
+                let clock = StatementClock::new(pager.io.as_ref(), &mut state.current_time);
+                let result = exec_unixepoch(&clock, values);
                 state.registers[*dest].set_value(result);
             }
             ScalarFunc::TursoVersion => {
@@ -10877,7 +10888,8 @@ pub fn op_function(
             ScalarFunc::StrfTime => {
                 let values =
                     registers_to_ref_values(&state.registers[*start_reg..*start_reg + arg_count]);
-                let result = exec_strftime(pager.io.as_ref(), values);
+                let clock = StatementClock::new(pager.io.as_ref(), &mut state.current_time);
+                let result = exec_strftime(&clock, values);
                 state.registers[*dest].set_value(result);
             }
             ScalarFunc::Printf => {
@@ -11549,9 +11561,10 @@ pub fn op_function(
                 check_arg_count!(arg_count, 2);
                 let lhs = state.registers[*start_reg].get_value();
                 let rhs = state.registers[*start_reg + 1].get_value();
+                let clock = StatementClock::new(pager.io.as_ref(), &mut state.current_time);
                 let result = match scalar_func {
-                    ScalarFunc::DatePlus => exec_date_plus(pager.io.as_ref(), lhs, rhs)?,
-                    ScalarFunc::DateMinus => exec_date_minus(pager.io.as_ref(), lhs, rhs)?,
+                    ScalarFunc::DatePlus => exec_date_plus(&clock, lhs, rhs)?,
+                    ScalarFunc::DateMinus => exec_date_minus(&clock, lhs, rhs)?,
                     _ => unreachable!(),
                 };
                 state.registers[*dest].set_value(result);
@@ -12486,6 +12499,38 @@ pub fn op_function(
     }
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
+}
+
+/// The clock seen by the date and time functions. Like SQLite's
+/// `sqlite3StmtCurrentTime`, it reads the wall clock on the first request and
+/// returns that same time until the step that requested it ends.
+struct StatementClock<'a> {
+    io: &'a dyn Clock,
+    now: &'a Cell<Option<WallClockInstant>>,
+}
+
+impl<'a> StatementClock<'a> {
+    fn new(io: &'a dyn Clock, now: &'a mut Option<WallClockInstant>) -> Self {
+        Self {
+            io,
+            now: Cell::from_mut(now),
+        }
+    }
+}
+
+impl Clock for StatementClock<'_> {
+    fn current_time_monotonic(&self) -> MonotonicInstant {
+        self.io.current_time_monotonic()
+    }
+
+    fn current_time_wall_clock(&self) -> WallClockInstant {
+        let now = self
+            .now
+            .get()
+            .unwrap_or_else(|| self.io.current_time_wall_clock());
+        self.now.set(Some(now));
+        now
+    }
 }
 
 pub(crate) type OpAttachState = crate::dialect::sqlite::attach::AttachDatabaseState;

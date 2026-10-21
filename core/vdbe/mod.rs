@@ -1102,6 +1102,9 @@ pub struct ProgramState {
     /// `SQLITE_BUSY` halt through `op_halt`, which would mis-wrap it as
     /// a constraint error.
     pub sequence_inner_retry_count: u32,
+    /// The time "now" means for the date and time functions during the
+    /// current step. See `StatementClock`.
+    pub(crate) current_time: Option<crate::WallClockInstant>,
     #[cfg(feature = "json")]
     json_cache: JsonCacheCell,
     active_op_state: ActiveOpStateSlot,
@@ -1243,6 +1246,7 @@ impl ProgramState {
             sequence_inner_commit: None,
             sequence_inner_tx_pending: None,
             sequence_inner_retry_count: 0,
+            current_time: None,
             #[cfg(feature = "json")]
             json_cache: JsonCacheCell::new(),
             active_op_state: ActiveOpStateSlot::default(),
@@ -1394,6 +1398,7 @@ impl ProgramState {
         self.execution_state = ProgramExecutionState::Init;
         self.query_deadline = None;
         self.explicit_checkpoint_guard = None;
+        self.current_time = None;
         #[cfg(feature = "json")]
         self.json_cache.clear();
 
@@ -2501,6 +2506,9 @@ impl Program {
                 state.execution_state = ProgramExecutionState::Failed;
             }
             _ => {}
+        }
+        if !matches!(result, ProgramStep::IO | ProgramStep::Yield) {
+            state.current_time = None;
         }
         return result;
 

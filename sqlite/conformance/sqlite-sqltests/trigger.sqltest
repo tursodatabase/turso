@@ -2561,3 +2561,16 @@ test create-before-trigger-on-view-rejected {
 expect error {
     cannot create BEFORE trigger on view: v
 }
+
+test current-time-same-in-trigger {
+    CREATE TABLE t(x);
+    CREATE TABLE log(x, d);
+    CREATE TRIGGER t_ai AFTER INSERT ON t BEGIN
+      INSERT INTO log VALUES (NEW.x, datetime('subsecond'));
+    END;
+    INSERT INTO t SELECT value FROM generate_series(1, 2000);
+    SELECT count(*), count(DISTINCT d) FROM log;
+}
+expect {
+    2000|1
+}
