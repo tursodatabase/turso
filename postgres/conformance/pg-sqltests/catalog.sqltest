@@ -273,14 +273,16 @@ expect {
     pg_is_in_recovery|c|0|2612
 }
 
-@skip-if postgres "PostgreSQL has the plpgsql language"
-test pg-object-dump-language-discovery-is-empty {
+@skip-if postgres "PostgreSQL has handler functions for plpgsql, and its owner is postgres"
+test pg-object-dump-language-discovery-finds-plpgsql {
     SET search_path TO '';
     SELECT tableoid, oid, lanname, lanpltrusted, lanplcallfoid, laninline,
            lanvalidator, lanacl, acldefault('l', lanowner) AS acldefault, lanowner
     FROM pg_language WHERE lanispl ORDER BY oid;
 }
-expect {}
+expect {
+    2612|13612|plpgsql|t|0|0|0||{=U/turso,turso=U/turso}|10
+}
 
 @skip-if postgres "PostgreSQL fills these catalogs, and only a superuser can read pg_subscription"
 test pg-object-unsupported-catalogs-are-empty {

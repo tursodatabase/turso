@@ -10,11 +10,61 @@ expect error {
     function "add_tax" already exists with same argument types
 }
 
+test create-or-replace-function-replaces-the-body {
+    CREATE FUNCTION add_tax(p numeric) RETURNS numeric LANGUAGE sql AS 'SELECT p * 1.2';
+    CREATE OR REPLACE FUNCTION add_tax(p numeric) RETURNS numeric LANGUAGE sql AS 'SELECT p';
+    SELECT prosrc FROM pg_proc WHERE proname = 'add_tax';
+}
+expect {
+    SELECT p
+}
+
+test pg-proc-shows-the-attributes-of-a-function {
+    CREATE FUNCTION add_tax(p numeric) RETURNS numeric LANGUAGE sql IMMUTABLE STRICT AS 'SELECT p * 1.2';
+    SELECT proname, prokind, provolatile, proisstrict, prosecdef, pronargs, prorettype, proargnames, prosrc
+    FROM pg_proc WHERE proname = 'add_tax';
+}
+expect {
+    add_tax|f|i|t|f|1|1700|{p}|SELECT p * 1.2
+}
+
+test pg-proc-shows-the-language-of-a-trigger-function {
+    CREATE FUNCTION touch() RETURNS trigger LANGUAGE plpgsql SECURITY DEFINER AS $$
+    BEGIN
+        RETURN NEW;
+    END
+    $$;
+    SELECT l.lanname, p.prorettype, p.pronargs, p.prosecdef
+    FROM pg_proc p JOIN pg_language l ON l.oid = p.prolang
+    WHERE p.proname = 'touch';
+}
+expect {
+    plpgsql|2279|0|t
+}
+
+test pg-language-has-sql-and-plpgsql {
+    SELECT lanname, lanispl, lanpltrusted FROM pg_language
+    WHERE lanname IN ('sql', 'plpgsql') ORDER BY lanname;
+}
+expect {
+    plpgsql|t|t
+    sql|f|t
+}
+
 test create-function-with-unknown-language-errors {
     CREATE FUNCTION js() RETURNS int LANGUAGE plv8 AS 'return 1';
 }
 expect error {
     language "plv8" does not exist
+}
+
+test drop-function-removes-it {
+    CREATE FUNCTION add_tax(p numeric) RETURNS numeric LANGUAGE sql AS 'SELECT p * 1.2';
+    DROP FUNCTION add_tax(numeric);
+    SELECT count(*) FROM pg_proc WHERE proname = 'add_tax';
+}
+expect {
+    0
 }
 
 test drop-missing-function-errors {
@@ -40,6 +90,15 @@ expect {
     1
 }
 
+test drop-function-without-arguments-drops-the-only-function {
+    CREATE FUNCTION add_tax(p numeric) RETURNS numeric LANGUAGE sql AS 'SELECT p * 1.2';
+    DROP FUNCTION add_tax;
+    SELECT count(*) FROM pg_proc WHERE proname = 'add_tax';
+}
+expect {
+    0
+}
+
 test drop-function-without-arguments-errors-when-missing {
     DROP FUNCTION add_tax;
 }
@@ -54,6 +113,26 @@ test drop-function-without-arguments-errors-when-not-unique {
 }
 expect error {
     function name "pick" is not unique
+}
+
+test drop-function-drops-each-listed-function {
+    CREATE FUNCTION f1(a int) RETURNS int LANGUAGE sql AS 'SELECT a';
+    CREATE FUNCTION f2(a int) RETURNS int LANGUAGE sql AS 'SELECT a';
+    DROP FUNCTION f1(int), f2(int);
+    SELECT count(*) FROM pg_proc WHERE proname IN ('f1', 'f2');
+}
+expect {
+    0
+}
+
+test functions-with-the-same-name-and-other-argument-counts-can-exist-together {
+    CREATE FUNCTION pick(a int) RETURNS int LANGUAGE sql AS 'SELECT a';
+    CREATE FUNCTION pick(a int, b int) RETURNS int LANGUAGE sql AS 'SELECT b';
+    DROP FUNCTION pick(int);
+    SELECT pronargs FROM pg_proc WHERE proname = 'pick';
+}
+expect {
+    2
 }
 
 # Schema databases are file-backed, so the function is dropped before each

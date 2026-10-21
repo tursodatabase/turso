@@ -70,8 +70,9 @@ Basics not enumerated by the official feature matrix.
 The pg_catalog tables emulated (live, reflecting real schema): `pg_class`,
 `pg_namespace`, `pg_attribute`, `pg_type` (builtin + array + enum types),
 `pg_index`, `pg_constraint`, `pg_attrdef`, `pg_tables`, `pg_sequences`,
-`pg_database`, `pg_roles` (single hardcoded `turso` role), `pg_proc`, `pg_am`,
-plus `pg_input_error_info`. Present but always empty: `pg_policy`,
+`pg_database`, `pg_roles` (single hardcoded `turso` role), `pg_proc`
+(built-in functions and the functions of the `public` schema), `pg_language`,
+`pg_am`, plus `pg_input_error_info`. Present but always empty: `pg_policy`,
 `pg_trigger`, `pg_statistic_ext`, `pg_inherits`, `pg_rewrite`,
 `pg_foreign_table`, `pg_partitioned_table`, `pg_collation`, `pg_description`,
 `pg_publication*`. Catalog introspection functions: `format_type`,
@@ -453,7 +454,7 @@ Upgrade is not supported.
 | ALTER TABLE / ENABLE REPLICA TRIGGER/RULE | ❌ Not supported | |
 | BEGIN ATOMIC function bodies | ❌ Not supported | |
 | CALL syntax for executing procedures | ❌ Not supported | |
-| CREATE FUNCTION | 🟡 Partial | `LANGUAGE sql` and `LANGUAGE plpgsql` are stored; a call gives an error. CREATE FUNCTION without a schema creates the function in the first schema of `search_path` that exists. Functions are found by name and argument count only, so default argument values do not make a function match fewer arguments |
+| CREATE FUNCTION | 🟡 Partial | `LANGUAGE sql` and `LANGUAGE plpgsql` are stored and listed in `pg_proc`; a call gives an error. CREATE FUNCTION without a schema creates the function in the first schema of `search_path` that exists. Functions are found by name and argument count only, so default argument values do not make a function match fewer arguments |
 | Column level triggers | ❌ Not supported | |
 | CREATE PROCEDURE syntax for SQL stored procedures | 🟡 Partial | Stored like functions; CALL is not supported |
 | Event triggers | ❌ Not supported | |
@@ -485,7 +486,7 @@ Upgrade is not supported.
 | IN/OUT/INOUT parameters for pl/pgsql and PL/SQL | ❌ Not supported | |
 | Named parameters | ❌ Not supported | |
 | Non-superuser language creation | ❌ Not supported | |
-| pl/pgsql installed by default | ❌ Not supported | |
+| pl/pgsql installed by default | ✅ Supported | `plpgsql` is in `pg_language`; see the first row for what runs |
 | Polymorphic functions | ❌ Not supported | |
 | Python 3 support for pl/python | ❌ Not supported | |
 | Qualified function parameters | ❌ Not supported | |
