@@ -4580,6 +4580,9 @@ impl PostgreSQLTranslator {
                     let order = match pg_query::protobuf::SortByDir::try_from(sort_by.sortby_dir) {
                         Ok(pg_query::protobuf::SortByDir::SortbyAsc) => Some(ast::SortOrder::Asc),
                         Ok(pg_query::protobuf::SortByDir::SortbyDesc) => Some(ast::SortOrder::Desc),
+                        Ok(pg_query::protobuf::SortByDir::SortbyUsing) => {
+                            return Err(not_supported("ORDER BY ... USING operator"))
+                        }
                         _ => None, // Default or undefined
                     };
 
@@ -9785,5 +9788,14 @@ mod tests {
     fn fail_closed_schema_qualified_table_star() {
         assert_not_supported("SELECT public.t.* FROM public.t", "schema.table.*");
         assert_translates("SELECT t.*, * FROM t");
+    }
+
+    #[test]
+    fn fail_closed_order_by_using() {
+        assert_not_supported("SELECT a FROM t ORDER BY a USING >", "USING operator");
+        assert_not_supported(
+            "SELECT string_agg(a, ',' ORDER BY a USING <) FROM t",
+            "USING operator",
+        );
     }
 }
