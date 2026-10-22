@@ -6419,7 +6419,7 @@ pub fn try_extract_copy_from(
             }
             "delimiter" => {
                 let val = copy_string_option(def)?;
-                if val.chars().count() != 1 {
+                if val.len() != 1 {
                     return Err(ParseError::ParseError(
                         "COPY delimiter must be a single one-byte character".into(),
                     ));
@@ -9639,6 +9639,10 @@ mod tests {
             ),
             (
                 "COPY t FROM '/tmp/d' WITH (DELIMITER '')",
+                "single one-byte",
+            ),
+            (
+                "COPY t FROM '/tmp/d' WITH (DELIMITER 'é')",
                 "single one-byte",
             ),
         ] {
