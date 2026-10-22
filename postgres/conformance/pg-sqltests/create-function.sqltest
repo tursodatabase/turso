@@ -122,6 +122,7 @@ expect {
     1
 }
 
+@skip-if postgres "PostgreSQL supports CREATE PROCEDURE"
 test create-procedure-is-not-supported {
     CREATE PROCEDURE p() LANGUAGE sql AS 'SELECT 1';
 }
