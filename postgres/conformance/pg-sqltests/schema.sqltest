@@ -342,3 +342,13 @@ expect {
     1
     1
 }
+
+@skip-if postgres "PostgreSQL keeps a public index named app.i apart from the index i of schema app; Turso stores both under the same name"
+test create-schema-errors-when-a-public-index-is-named-under-its-prefix {
+    CREATE TABLE t (x int);
+    CREATE INDEX "app.i" ON t (x);
+    CREATE SCHEMA app;
+}
+expect error {
+    cannot create schema "app"
+}

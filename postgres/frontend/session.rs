@@ -890,7 +890,8 @@ fn schema_objects(conn: &Arc<Connection>, schema: &str) -> Vec<SchemaObject> {
         .collect()
 }
 
-/// The names of the tables, views and sequences of the main database.
+/// The names of the tables, views, indexes, triggers and sequences of the
+/// main database.
 fn object_names(schema: &turso_core::schema::Schema) -> Vec<String> {
     schema
         .tables
@@ -899,6 +900,20 @@ fn object_names(schema: &turso_core::schema::Schema) -> Vec<String> {
         .chain(schema.materialized_view_names.iter())
         .chain(schema.sequences.keys())
         .cloned()
+        .chain(
+            schema
+                .indexes
+                .values()
+                .flatten()
+                .map(|index| index.name.clone()),
+        )
+        .chain(
+            schema
+                .triggers
+                .values()
+                .flatten()
+                .map(|trigger| trigger.name.clone()),
+        )
         .collect()
 }
 
