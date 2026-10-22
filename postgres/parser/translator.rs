@@ -1762,8 +1762,6 @@ impl PostgreSQLTranslator {
         &self,
         select: &pg_query::protobuf::SelectStmt,
     ) -> Result<ast::Select, ParseError> {
-        use pg_query::protobuf::SetOperation;
-
         // Top-level SELECT INTO is intercepted (and its IntoClause stripped)
         // before translation, so an INTO seen here is in a nested position,
         // which PG rejects during parse analysis.
@@ -1777,9 +1775,7 @@ impl PostgreSQLTranslator {
             return Err(not_supported("SELECT ... FOR UPDATE / FOR SHARE"));
         }
 
-        // Check if this is a UNION/INTERSECT/EXCEPT (set operation)
-        let set_op = select.op();
-        if set_op != SetOperation::SetopNone && set_op != SetOperation::Undefined {
+        if is_set_operation(select) {
             return self.translate_set_operation(select);
         }
 
