@@ -1077,6 +1077,9 @@ impl PostgreSQLTranslator {
         if !idx.index_including_params.is_empty() {
             return Err(not_supported("CREATE INDEX ... INCLUDE"));
         }
+        if idx.nulls_not_distinct {
+            return Err(not_supported("NULLS NOT DISTINCT"));
+        }
         // SQLite names the database on the index, not on the table, and
         // looks the table up there.
         let idx_name = if relation.schemaname.is_empty() {
@@ -9391,5 +9394,13 @@ mod tests {
     #[test]
     fn fail_closed_index_include() {
         assert_not_supported("CREATE INDEX i ON t (a) INCLUDE (b)", "INCLUDE");
+    }
+
+    #[test]
+    fn fail_closed_index_nulls_not_distinct() {
+        assert_not_supported(
+            "CREATE UNIQUE INDEX i ON t (a) NULLS NOT DISTINCT",
+            "NULLS NOT DISTINCT",
+        );
     }
 }
