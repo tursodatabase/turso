@@ -5096,9 +5096,74 @@ fn rename_result_columns(select: &mut ast::Select, names: &[String]) -> Result<(
     if names.is_empty() {
         return Ok(());
     }
+    // A VALUES list names its columns column1, column2, ...; rename them
+    // through a SELECT over the VALUES.
+    if let ast::OneSelect::Values(rows) = &select.body.select {
+        if !select.body.compounds.is_empty() {
+            return Err(ParseError::ParseError(
+                "a column alias list on a compound VALUES is not supported".into(),
+            ));
+        }
+        let width = rows.first().map_or(0, |row| row.len());
+        if names.len() > width {
+            return Err(ParseError::ParseError(format!(
+                "table has {width} columns available but {} columns specified",
+                names.len()
+            )));
+        }
+        let columns = (0..width)
+            .map(|i| {
+                ast::ResultColumn::Expr(
+                    Box::new(ast::Expr::Id(ast::Name::from_string(format!(
+                        "column{}",
+                        i + 1
+                    )))),
+                    names
+                        .get(i)
+                        .map(|name| ast::As::Elided(ast::Name::from_string(name))),
+                )
+            })
+            .collect();
+        let values = std::mem::replace(
+            select,
+            ast::Select {
+                with: None,
+                body: ast::SelectBody {
+                    select: ast::OneSelect::Values(vec![]),
+                    compounds: vec![],
+                },
+                order_by: vec![],
+                limit: None,
+            },
+        );
+        *select = ast::Select {
+            with: None,
+            body: ast::SelectBody {
+                select: ast::OneSelect::Select {
+                    distinctness: None,
+                    columns,
+                    from: Some(ast::FromClause {
+                        select: Box::new(ast::SelectTable::Select {
+                            select: values,
+                            alias: None,
+                            lateral: false,
+                        }),
+                        joins: vec![],
+                    }),
+                    where_clause: None,
+                    group_by: None,
+                    window_clause: vec![],
+                },
+                compounds: vec![],
+            },
+            order_by: vec![],
+            limit: None,
+        };
+        return Ok(());
+    }
     let ast::OneSelect::Select { columns, .. } = &mut select.body.select else {
         return Err(ParseError::ParseError(
-            "a column alias list on a VALUES subquery is not supported".into(),
+            "a column alias list on this subquery is not supported".into(),
         ));
     };
     // A * expands to an unknown number of columns, so positions after it
@@ -6753,11 +6818,16 @@ mod tests {
         assert!(sql.contains("1 p") && sql.contains("2 q"), "{sql}");
         let sql = translate("SELECT g.n FROM generate_series(1, 3) AS g(n)").unwrap();
         assert!(sql.contains("value n"), "{sql}");
+        let sql = translate("SELECT v.a FROM (VALUES (1, 2, 3)) AS v(a, b)").unwrap();
+        assert!(
+            sql.contains("column1 a") && sql.contains("column2 b") && sql.contains("column3"),
+            "{sql}"
+        );
         for (sql, needle) in [
             ("SELECT * FROM (SELECT * FROM t) AS s(a, b)", "selects *"),
             (
-                "SELECT * FROM (VALUES (1, 2)) AS v(a, b)",
-                "VALUES subquery",
+                "SELECT * FROM (VALUES (1)) AS v(a, b)",
+                "1 columns available but 2",
             ),
             (
                 "SELECT * FROM (SELECT 1) AS s(a, b)",

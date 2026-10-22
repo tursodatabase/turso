@@ -848,3 +848,15 @@ expect {
     6
     7
 }
+
+test values-column-alias-list-renames-columns {
+    SELECT v.a, v.b FROM (VALUES (1, 'x'), (2, 'y')) AS v(a, b) ORDER BY v.a;
+    SELECT a, column2 FROM (VALUES (1, 2)) v(a);
+    SELECT t.id, v.n FROM (VALUES (1, 10)) v(id, n) JOIN (VALUES (1)) t(id) ON t.id = v.id;
+}
+expect {
+    1|x
+    2|y
+    1|2
+    1|10
+}
