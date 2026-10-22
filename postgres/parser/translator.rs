@@ -1166,7 +1166,12 @@ impl PostgreSQLTranslator {
         let remove_type = ObjectType::try_from(drop.remove_type)
             .map_err(|_| ParseError::ParseError("Invalid object type in DROP".into()))?;
 
-        // Extract the first qualified name from drop.objects
+        if drop.objects.len() > 1 {
+            return Err(not_supported(format!(
+                "DROP {} of several objects",
+                drop_object_type_name(remove_type)
+            )));
+        }
         let obj_node = drop
             .objects
             .first()
@@ -9442,5 +9447,12 @@ mod tests {
             "operator classes in CREATE INDEX",
         );
         assert_translates("CREATE INDEX i ON t (a DESC NULLS LAST, (lower(b)))");
+    }
+
+    #[test]
+    fn fail_closed_drop_multiple_objects() {
+        assert_not_supported("DROP TABLE a, b", "several objects");
+        assert_not_supported("DROP INDEX IF EXISTS i1, i2", "several objects");
+        assert_not_supported("DROP VIEW v1, v2", "several objects");
     }
 }
