@@ -3806,9 +3806,9 @@ pub fn emit_fk_child_insert_checks(
     database_id: usize,
     layout: &ColumnLayout,
 ) -> crate::Result<()> {
-    for fk_ref in
-        resolver.with_schema(database_id, |s| s.resolved_fks_for_child(&child_tbl.name))?
-    {
+    for fk_ref in resolver.with_schema(database_id, |s| {
+        s.resolved_fks_for_child(&child_tbl.name, None)
+    })? {
         let is_self_ref = fk_ref.fk.parent_table.eq_ignore_ascii_case(&child_tbl.name);
 
         // Short-circuit if any NEW component is NULL

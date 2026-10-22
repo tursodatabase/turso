@@ -470,6 +470,150 @@ test fk-parent-unique-index-missing {
 expect error {
 }
 
+# A parent key without a UNIQUE index is a mismatch, but only statements that
+# check the key report it. An UPDATE that does not assign the FK column succeeds.
+@cross-check-integrity
+test fk-mismatch-update-other-column-ok {
+    CREATE TABLE p(a, b);
+    CREATE TABLE c(x, y REFERENCES p(b));
+    INSERT INTO c VALUES (1, NULL);
+    PRAGMA foreign_keys=ON;
+    UPDATE c SET x = 2;
+    SELECT * FROM c;
+}
+expect {
+    2|
+}
+
+@cross-check-integrity
+test fk-mismatch-update-from-other-column-ok {
+    CREATE TABLE p(a, b);
+    CREATE TABLE c(x, y REFERENCES p(b));
+    CREATE TABLE t(v);
+    INSERT INTO t VALUES (5);
+    INSERT INTO c VALUES (1, NULL);
+    PRAGMA foreign_keys=ON;
+    UPDATE c SET x = t.v FROM t;
+    SELECT * FROM c;
+}
+expect {
+    5|
+}
+
+test fk-mismatch-update-fk-column {
+    CREATE TABLE p(a, b);
+    CREATE TABLE c(x, y REFERENCES p(b));
+    INSERT INTO c VALUES (1, NULL);
+    PRAGMA foreign_keys=ON;
+    UPDATE c SET y = 2;
+}
+expect error {
+    foreign key mismatch - "c" referencing "p"
+}
+
+@cross-check-integrity
+test fk-mismatch-update-parent-other-column-ok {
+    CREATE TABLE p(a, b);
+    CREATE TABLE c(x, y REFERENCES p(b));
+    INSERT INTO p VALUES (1, 1);
+    PRAGMA foreign_keys=ON;
+    UPDATE p SET a = 2;
+    SELECT * FROM p;
+}
+expect {
+    2|1
+}
+
+test fk-mismatch-self-ref-update-parent-key {
+    CREATE TABLE c(id INTEGER PRIMARY KEY, x, y REFERENCES c(x));
+    INSERT INTO c VALUES (1, 1, NULL);
+    PRAGMA foreign_keys=ON;
+    UPDATE c SET x = 7;
+}
+expect error {
+    foreign key mismatch - "c" referencing "c"
+}
+
+test fk-mismatch-self-ref-deferred-update-parent-key {
+    CREATE TABLE c(id INTEGER PRIMARY KEY, x, y REFERENCES c(x) DEFERRABLE INITIALLY DEFERRED);
+    INSERT INTO c VALUES (1, 1, NULL);
+    PRAGMA foreign_keys=ON;
+    UPDATE c SET x = 7;
+}
+expect error {
+    foreign key mismatch - "c" referencing "c"
+}
+
+test fk-mismatch-self-ref-upsert-parent-key {
+    CREATE TABLE c(id INTEGER PRIMARY KEY, x, y REFERENCES c(x));
+    INSERT INTO c VALUES (1, 1, NULL);
+    PRAGMA foreign_keys=ON;
+    INSERT INTO c VALUES (1, 1, NULL) ON CONFLICT(id) DO UPDATE SET x = 9;
+}
+expect error {
+    foreign key mismatch - "c" referencing "c"
+}
+
+@cross-check-integrity
+test fk-mismatch-self-ref-update-other-column-ok {
+    CREATE TABLE c(id INTEGER PRIMARY KEY, x, y REFERENCES c(x));
+    INSERT INTO c VALUES (1, 1, NULL);
+    PRAGMA foreign_keys=ON;
+    UPDATE c SET id = 7;
+    SELECT * FROM c;
+}
+expect {
+    7|1|
+}
+
+# A self-referencing FK is checked whenever the UPDATE changes any FK key of
+# the table, even when its own child columns are not assigned.
+test fk-mismatch-self-ref-other-fk-parent-key-changed {
+    CREATE TABLE c(x UNIQUE, w, y REFERENCES c(x), z REFERENCES c(w));
+    INSERT INTO c VALUES (1, 1, NULL, NULL);
+    PRAGMA foreign_keys=ON;
+    UPDATE c SET x = 5;
+}
+expect error {
+    foreign key mismatch - "c" referencing "c"
+}
+
+test fk-mismatch-self-ref-other-fk-child-key-changed {
+    CREATE TABLE p(a UNIQUE);
+    CREATE TABLE c(w, q REFERENCES p(a), z REFERENCES c(w));
+    INSERT INTO c VALUES (1, NULL, NULL);
+    PRAGMA foreign_keys=ON;
+    UPDATE c SET q = NULL;
+}
+expect error {
+    foreign key mismatch - "c" referencing "c"
+}
+
+test fk-mismatch-self-ref-other-table-parent-key-changed {
+    CREATE TABLE c(x UNIQUE, w, z REFERENCES c(w));
+    CREATE TABLE d(r REFERENCES c(x));
+    INSERT INTO c VALUES (1, 1, NULL);
+    PRAGMA foreign_keys=ON;
+    UPDATE c SET x = 5;
+}
+expect error {
+    foreign key mismatch - "c" referencing "c"
+}
+
+@cross-check-integrity
+test fk-update-parent-key-columns-in-other-order-ok {
+    CREATE TABLE p(b, c, UNIQUE(b, c));
+    CREATE TABLE ch(y, z, FOREIGN KEY(y, z) REFERENCES p(c, b));
+    INSERT INTO p VALUES (1, 2);
+    PRAGMA foreign_keys=ON;
+    UPDATE p SET b = 5;
+    INSERT INTO p VALUES (5, 2) ON CONFLICT(b, c) DO UPDATE SET b = 6;
+    SELECT * FROM p;
+}
+expect {
+    6|2
+}
+
 # NULL in child short-circuits FK check
 @cross-check-integrity
 test fk-child-null-shortcircuit {
