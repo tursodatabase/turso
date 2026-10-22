@@ -181,6 +181,7 @@ PRAGMA index_info(index-name);
 ### index_xinfo
 
 Similar to `index_info` but includes additional columns.
+The `name` is `NULL` for the implicit rowid entry, which has a `cid` of `-1`.
 
 ```sql
 PRAGMA index_xinfo(index-name);
