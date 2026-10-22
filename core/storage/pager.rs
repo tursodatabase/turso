@@ -1689,8 +1689,7 @@ pub struct Pager {
     cursor_allocations: Mutex<Vec<Box<std::mem::MaybeUninit<crate::storage::btree::BTreeCursor>>>>,
 }
 
-/// Retired record buffers kept per pager. Each holds an allocation of at most
-/// the largest page size.
+/// Retired record buffers kept per pager. Each holds a page-sized allocation.
 const RECORD_POOL_SIZE: usize = 8;
 
 /// Retired cursor allocations kept per pager.
@@ -2011,9 +2010,7 @@ impl Pager {
     }
 
     /// Keep a retired record buffer for the next cursor on this pager. Extra
-    /// buffers beyond the pool size are freed, and so are buffers that grew
-    /// past the largest page size while holding a record with overflow pages,
-    /// so that one large row does not stay allocated for the pager's lifetime.
+    /// buffers beyond the pool size or larger than the largest page are freed.
     pub(crate) fn recycle_record_buf(&self, buf: crate::types::RecordBuf) {
         if buf.capacity() > PageSize::MAX as usize {
             return;
