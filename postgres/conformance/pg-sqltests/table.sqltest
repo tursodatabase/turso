@@ -315,3 +315,87 @@ test table-returning-table-name-star-after-alias-rejected {
     INSERT INTO users AS u VALUES (4, 'dave', 40, false) RETURNING users.*;
 }
 expect error {}
+
+setup defaults_table {
+    CREATE TABLE d (a int DEFAULT 42, b int);
+}
+
+@setup defaults_table
+test table-insert-default-without-column-list {
+    INSERT INTO d VALUES (DEFAULT, 5);
+    INSERT INTO d VALUES (1, DEFAULT), (DEFAULT, DEFAULT);
+    SELECT a, b FROM d ORDER BY a, b NULLS FIRST;
+}
+expect {
+    1|
+    42|
+    42|5
+}
+
+@setup defaults_table
+test table-insert-default-with-column-list {
+    INSERT INTO d (a, b) VALUES (DEFAULT, 1), (5, 2);
+    INSERT INTO d (b, a) VALUES (7, DEFAULT);
+    INSERT INTO d (a) VALUES (DEFAULT), (DEFAULT);
+    SELECT a, b FROM d ORDER BY a, b NULLS FIRST;
+}
+expect {
+    5|2
+    42|
+    42|
+    42|1
+    42|7
+}
+
+setup defaults_pk_table {
+    CREATE TABLE dp (a int PRIMARY KEY DEFAULT 1, b int);
+}
+
+@setup defaults_pk_table
+test table-insert-all-default-on-conflict {
+    INSERT INTO dp (a) VALUES (DEFAULT) ON CONFLICT DO NOTHING;
+    INSERT INTO dp (a) VALUES (DEFAULT) ON CONFLICT DO NOTHING;
+    INSERT INTO dp (a, b) VALUES (DEFAULT, 9) ON CONFLICT (a) DO UPDATE SET b = excluded.b;
+    SELECT a, b FROM dp;
+}
+expect {
+    1|9
+}
+
+setup values_body_table {
+    CREATE TABLE vb (a int);
+}
+
+@setup values_body_table
+test table-insert-parenthesized-values-order-by-limit {
+    INSERT INTO vb (VALUES (2), (1) ORDER BY 1 LIMIT 1);
+    INSERT INTO vb (VALUES (7), (8), (9) ORDER BY 1 DESC LIMIT 1 OFFSET 1);
+    SELECT a FROM vb ORDER BY a;
+}
+expect {
+    1
+    8
+}
+
+@setup values_body_table
+test table-insert-parenthesized-values-with {
+    INSERT INTO vb (WITH c AS (SELECT 5) VALUES ((SELECT * FROM c)));
+    SELECT a FROM vb;
+}
+expect {
+    5
+}
+
+@setup values_body_table
+test table-insert-values-clauses-with-default-rejected {
+    INSERT INTO vb (VALUES (DEFAULT), (1) ORDER BY 1);
+}
+expect error {}
+
+test table-values-order-by-limit {
+    VALUES (3, 'a'), (1, 'b'), (2, 'c') ORDER BY column1 DESC LIMIT 2;
+}
+expect {
+    3|a
+    2|c
+}
