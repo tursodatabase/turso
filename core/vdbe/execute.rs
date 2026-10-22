@@ -80,7 +80,7 @@ use crate::{
     error::{
         LimboError, SQLITE_CONSTRAINT, SQLITE_CONSTRAINT_CHECK, SQLITE_CONSTRAINT_FOREIGNKEY,
         SQLITE_CONSTRAINT_NOTNULL, SQLITE_CONSTRAINT_PRIMARYKEY, SQLITE_CONSTRAINT_TRIGGER,
-        SQLITE_ERROR, SQLITE_FULL,
+        SQLITE_ERROR, SQLITE_FULL, SQLITE_MISMATCH,
     },
     function::{AggFunc, MathFunc, MathFuncArity, ScalarFunc, VectorFunc},
     functions::{
@@ -3851,6 +3851,7 @@ pub fn halt(
         }
         SQLITE_CONSTRAINT_TRIGGER => Some(LimboError::Constraint(description.to_string())),
         SQLITE_FULL => Some(LimboError::DatabaseFull),
+        SQLITE_MISMATCH => Some(LimboError::DatatypeMismatch),
         // SQLITE_ERROR is a generic error (e.g. ALTER TABLE validation), not a constraint.
         // SqlError displays bare like sqlite3_errmsg and abort() doesn't apply
         // ON CONFLICT resolution to it.
@@ -7292,7 +7293,7 @@ pub fn op_decr_jump_zero(
             }
         }
         Register::Value(_) | Register::Record(_) => {
-            bail_constraint_error!("datatype mismatch");
+            return Err(LimboError::DatatypeMismatch.into());
         }
         Register::Aggregate(_) => {
             mark_unlikely();
@@ -14132,7 +14133,7 @@ pub fn op_must_be_int(
             state.pc = target_pc.as_offset_int();
             return Ok(InsnFunctionStepResult::Step);
         }
-        bail_constraint_error!("datatype mismatch");
+        return Err(LimboError::DatatypeMismatch.into());
     }
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
@@ -20966,7 +20967,7 @@ mod tests {
             Ok(_) => panic!("non-integer register must fail"),
             Err(err) => err,
         };
-        assert!(matches!(*err, LimboError::Constraint(message) if message == "datatype mismatch"));
+        assert!(matches!(*err, LimboError::DatatypeMismatch));
         assert_eq!(state.pc, 0);
     }
 

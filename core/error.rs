@@ -127,6 +127,8 @@ pub enum LimboError {
     CheckpointFailed(String),
     #[error("Unsupported text encoding: {0}. Only UTF-8 is supported.")]
     UnsupportedEncoding(String),
+    #[error("datatype mismatch")]
+    DatatypeMismatch,
     #[error("Out of memory")]
     OutOfMemory,
 }
@@ -170,6 +172,7 @@ impl LimboError {
     pub fn sqlite_result_code(&self) -> i32 {
         match self {
             Self::Constraint(_) | Self::ForeignKeyConstraint(_) | Self::Raise(..) => 19,
+            Self::DatatypeMismatch => 20,
             Self::Busy | Self::BusySnapshot | Self::StatementsInProgress(_) => 5,
             Self::TableLocked => 6,
             Self::ReadOnly => 8,
@@ -380,6 +383,7 @@ pub const SQLITE_CONSTRAINT_NOTNULL: usize = SQLITE_CONSTRAINT | (5 << 8);
 pub const SQLITE_CONSTRAINT_TRIGGER: usize = SQLITE_CONSTRAINT | (7 << 8);
 pub const SQLITE_FULL: usize = 13; // we want this in autoincrement - incase if user inserts max allowed int
 pub const SQLITE_CONSTRAINT_UNIQUE: usize = 2067;
+pub const SQLITE_MISMATCH: usize = 20;
 // Standard SQLite error code; kept for documentation and potential
 // reuse. The sequence inner-tx wrap used to emit Insn::Halt with this
 // code, but halt()'s constraint catch-all mis-wrapped it; Busy is now

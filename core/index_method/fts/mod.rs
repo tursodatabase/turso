@@ -3072,8 +3072,7 @@ impl IndexMethodCursor for FtsCursor {
                     }
                     _ => None,
                 };
-                coerced
-                    .ok_or_else(|| LimboError::Constraint("datatype mismatch (19)".to_string()))?
+                coerced.ok_or_else(|| LimboError::DatatypeMismatch)?
             } else {
                 return Err(LimboError::InternalError(
                     "FTS query_start: LIMIT pattern selected but no limit value captured"

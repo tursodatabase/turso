@@ -1,0 +1,34 @@
+@database :memory:
+
+# Datatype mismatch for non-integer rowid assignment
+# https://github.com/tursodatabase/turso/issues/10320
+
+@cross-check-integrity
+test update-set-rowid-non-integer-mismatch {
+    CREATE TABLE u(v);
+    INSERT INTO u VALUES(1);
+    UPDATE u SET rowid = 'x';
+}
+expect error {
+    datatype mismatch
+}
+
+@cross-check-integrity
+test update-set-rowid-float-mismatch {
+    CREATE TABLE u(v);
+    INSERT INTO u VALUES(1);
+    UPDATE u SET rowid = 1.5;
+}
+expect error {
+    datatype mismatch
+}
+
+@cross-check-integrity
+test update-or-ignore-set-rowid-non-integer-mismatch {
+    CREATE TABLE u(v);
+    INSERT INTO u VALUES(1);
+    UPDATE OR IGNORE u SET rowid = 'x';
+}
+expect error {
+    datatype mismatch
+}
