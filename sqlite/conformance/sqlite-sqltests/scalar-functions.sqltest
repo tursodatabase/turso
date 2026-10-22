@@ -405,6 +405,21 @@ test replace-null {
 expect {
 }
 
+test replace-empty-pattern-null-replacement {
+    select quote(replace('abc', '', NULL)), quote(replace(-1, '', NULL)), quote(replace('abc', x'', NULL)), quote(replace('abc', 'b', NULL));
+}
+expect {
+    'abc'|'-1'|'abc'|NULL
+}
+
+test replace-empty-pattern-null-replacement-filter {
+    WITH t(c0, c2) AS (VALUES ('', -1))
+    SELECT c2 FROM t WHERE replace(c2, c0, NULL);
+}
+expect {
+    -1
+}
+
 test replace-wrong-arg-count-0 {
     select replace()
 }
