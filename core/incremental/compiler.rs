@@ -1880,6 +1880,40 @@ impl DbspCompiler {
                     type_name: type_name.clone(),
                 })
             }
+            LogicalExpr::UnaryExpr { op, expr } => {
+                let inner_expr = Box::new(Self::logical_to_ast_expr_with_schema(expr, schema)?);
+                Ok(ast::Expr::Unary(*op, inner_expr))
+            }
+            LogicalExpr::Case {
+                expr,
+                when_then,
+                else_expr,
+            } => {
+                let base = expr
+                    .as_deref()
+                    .map(|base| Self::logical_to_ast_expr_with_schema(base, schema))
+                    .transpose()?
+                    .map(Box::new);
+                let when_then_pairs = when_then
+                    .iter()
+                    .map(|(when, then)| {
+                        Ok((
+                            Box::new(Self::logical_to_ast_expr_with_schema(when, schema)?),
+                            Box::new(Self::logical_to_ast_expr_with_schema(then, schema)?),
+                        ))
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                let else_expr = else_expr
+                    .as_deref()
+                    .map(|otherwise| Self::logical_to_ast_expr_with_schema(otherwise, schema))
+                    .transpose()?
+                    .map(Box::new);
+                Ok(ast::Expr::Case {
+                    base,
+                    when_then_pairs,
+                    else_expr,
+                })
+            }
             _ => Err(LimboError::ParseError(format!(
                 "Cannot convert LogicalExpr to AST Expr: {expr:?}"
             ))),
