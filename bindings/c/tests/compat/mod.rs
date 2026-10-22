@@ -153,6 +153,18 @@ extern "C" {
     fn sqlite3_value_blob(value: *mut libc::c_void) -> *const libc::c_void;
     fn sqlite3_value_bytes(value: *mut libc::c_void) -> i32;
     fn sqlite3_result_int64(context: *mut libc::c_void, val: i64);
+    fn sqlite3_result_text(
+        context: *mut libc::c_void,
+        text: *const libc::c_char,
+        len: i32,
+        destroy: *mut libc::c_void,
+    );
+    fn sqlite3_result_blob(
+        context: *mut libc::c_void,
+        blob: *const libc::c_void,
+        len: i32,
+        destroy: *mut libc::c_void,
+    );
     fn sqlite3_create_function_v2(
         db: *mut sqlite3,
         name: *const libc::c_char,
@@ -3134,6 +3146,78 @@ mod tests {
             );
 
             assert_eq!(sqlite3_finalize(stmt2), SQLITE_OK);
+            assert_eq!(sqlite3_close(db), SQLITE_OK);
+        }
+    }
+
+    #[test]
+    fn test_result_text_and_blob_call_custom_destructors() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        static DESTROYED: AtomicUsize = AtomicUsize::new(0);
+
+        unsafe extern "C" fn destroy_value(ptr: *mut libc::c_void) {
+            drop(Box::from_raw(ptr as *mut u8));
+            DESTROYED.fetch_add(1, Ordering::SeqCst);
+        }
+
+        unsafe extern "C" fn result_fn(
+            context: *mut libc::c_void,
+            _argc: i32,
+            _argv: *mut *mut libc::c_void,
+        ) {
+            let text = Box::into_raw(Box::new(b't'));
+            sqlite3_result_text(
+                context,
+                text as *const libc::c_char,
+                1,
+                destroy_value as *const () as *mut libc::c_void,
+            );
+
+            let blob = Box::into_raw(Box::new(b'b'));
+            sqlite3_result_blob(
+                context,
+                blob as *const libc::c_void,
+                1,
+                destroy_value as *const () as *mut libc::c_void,
+            );
+        }
+
+        unsafe {
+            DESTROYED.store(0, Ordering::SeqCst);
+            let mut db = ptr::null_mut();
+            assert_eq!(sqlite3_open(c":memory:".as_ptr(), &mut db), SQLITE_OK);
+            assert_eq!(
+                sqlite3_create_function_v2(
+                    db,
+                    c"result_with_destructors".as_ptr(),
+                    0,
+                    SQLITE_UTF8,
+                    ptr::null_mut(),
+                    Some(result_fn),
+                    None,
+                    None,
+                    None,
+                ),
+                SQLITE_OK
+            );
+
+            let mut stmt = ptr::null_mut();
+            assert_eq!(
+                sqlite3_prepare_v2(
+                    db,
+                    c"SELECT result_with_destructors()".as_ptr(),
+                    -1,
+                    &mut stmt,
+                    ptr::null_mut(),
+                ),
+                SQLITE_OK
+            );
+            assert_eq!(sqlite3_step(stmt), SQLITE_ROW);
+            assert_eq!(DESTROYED.load(Ordering::SeqCst), 2);
+            assert_eq!(sqlite3_column_type(stmt, 0), SQLITE_BLOB);
+            assert_eq!(sqlite3_column_blob(stmt, 0).cast::<u8>().read(), b'b');
+            assert_eq!(sqlite3_finalize(stmt), SQLITE_OK);
             assert_eq!(sqlite3_close(db), SQLITE_OK);
         }
     }
