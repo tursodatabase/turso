@@ -178,7 +178,9 @@ pub use turso_macros::{
 pub use turso_parser::ast::EqpFormat;
 pub use types::{IOResult, Value, ValueBlob, ValueRef};
 pub use util::IOExt;
-pub use util::{walk_select_expressions_mut, walk_stmt_expressions_mut};
+pub use util::{
+    walk_expr_with_subqueries_mut, walk_select_expressions_mut, walk_stmt_expressions_mut,
+};
 pub use vdbe::array::array_values_from_any;
 pub use vdbe::{
     builder::QueryMode, explain::EXPLAIN_COLUMNS, explain::EXPLAIN_QUERY_PLAN_COLUMNS,

@@ -7,7 +7,7 @@
 //! literal.
 
 use serde_json::Value as Json;
-use turso_core::dialect::TriggerFunctionCall;
+use turso_core::dialect::{TriggerFunctionBody, TriggerFunctionCall, TriggerReturn};
 use turso_core::schema::Schema;
 use turso_core::{walk_stmt_expressions_mut, LimboError, Result, WalkControl};
 use turso_parser::ast::{self, Expr, Literal, TriggerCmd, TriggerEvent, TriggerTime};
@@ -26,11 +26,12 @@ pub(crate) struct TriggerContext<'a> {
     pub args: &'a [String],
 }
 
-/// The commands of the trigger `call`, compiled from its function.
+/// The body of the trigger `call`, compiled from its function. The function
+/// does not change the row yet.
 pub(crate) fn expand_trigger_function(
     schema: &Schema,
     call: &TriggerFunctionCall<'_>,
-) -> Result<Vec<TriggerCmd>> {
+) -> Result<TriggerFunctionBody> {
     let name = call.function.name.as_str();
     let Some(stored) = schema.get_user_function(name, 0) else {
         return Err(parse_error(format!("function {name}() does not exist")));
@@ -63,7 +64,10 @@ pub(crate) fn expand_trigger_function(
         },
         args: call.args,
     };
-    compile_trigger_function(&stored.sql, &context)
+    Ok(TriggerFunctionBody {
+        commands: compile_trigger_function(&stored.sql, &context)?,
+        returned_row: TriggerReturn::Unchanged,
+    })
 }
 
 /// Compile the PL/pgSQL function that `function_sql` creates for the

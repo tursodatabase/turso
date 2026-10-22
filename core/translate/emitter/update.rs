@@ -44,7 +44,8 @@ use crate::{
         planner::ROWID_STRS,
         subquery::{emit_non_from_clause_subqueries_for_eval_at, emit_non_from_clause_subquery},
         trigger_exec::{
-            fire_trigger, get_triggers_including_temp, has_triggers_including_temp, TriggerContext,
+            columns_changed_by_triggers, fire_trigger, get_triggers_including_temp,
+            has_triggers_including_temp, TriggerContext,
         },
         ProgramBuilder,
     },
@@ -1080,6 +1081,34 @@ fn emit_deferred_notnull_checks<'a>(
     Ok(())
 }
 
+/// Apply the column affinities of a non-STRICT table to the NEW row values.
+fn emit_new_row_affinity(
+    program: &mut ProgramBuilder,
+    table: &BTreeTable,
+    start: usize,
+    layout: &ColumnLayout,
+) {
+    if table.is_strict {
+        return;
+    }
+    let affinity = table
+        .columns()
+        .iter()
+        .filter(|c| !c.is_virtual_generated())
+        .map(|c| c.affinity());
+
+    // Only emit Affinity if there's meaningful affinity to apply
+    if affinity.clone().any(|a| a != Affinity::Blob) {
+        if let Ok(count) = NonZeroUsize::try_from(layout.num_non_virtual_cols()) {
+            program.emit_insn(Insn::Affinity {
+                start_reg: start,
+                count,
+                affinities: affinity.map(|a| a.aff_mask()).collect(),
+            });
+        }
+    }
+}
+
 #[instrument(skip_all, level = Level::DEBUG)]
 #[allow(clippy::too_many_arguments)]
 /// Emits the instructions for the UPDATE loop.
@@ -1211,14 +1240,45 @@ fn emit_update_insns<'a>(
 
     let not_exists_check_required = updates_rowid || iteration_cursor_id != target_table_cursor_id;
     let update_database_id = target_table.database_id;
-    let updated_column_indices: ColumnMask = set_clauses
-        .iter()
-        .map(|set_clause| set_clause.column_index)
-        .try_collect()?;
     let updated_column_names: Vec<_> = set_clauses
         .iter()
         .flat_map(|set_clause| set_clause.column_names.iter().cloned())
         .try_collect()?;
+
+    // A BEFORE UPDATE trigger can change the row before constraint checks run,
+    // so NOT NULL checks on SET-clause columns are deferred until after those
+    // triggers fire (see emit_deferred_notnull_checks below). AFTER triggers
+    // run once the row is already written and do not affect this ordering, so
+    // they must not defer the checks. Skipping the inline check for any update
+    // trigger, but only re-emitting it when a BEFORE trigger exists, would drop
+    // the NOT NULL check entirely for a table that has only AFTER triggers.
+    let relevant_before_update_triggers = match target_table.table.btree() {
+        Some(btree_table) => get_triggers_including_temp(
+            &t_ctx.resolver,
+            update_database_id,
+            TriggerEvent::Update,
+            TriggerTime::Before,
+            Some(&updated_column_names),
+            &btree_table,
+        ),
+        None => Vec::new(),
+    };
+    // The columns that the rows returned by the BEFORE triggers change get
+    // the same checks and conversions as the columns of the SET clauses.
+    let columns_changed_by_triggers = match target_table.table.btree() {
+        Some(btree_table) => columns_changed_by_triggers(
+            &t_ctx.resolver,
+            &relevant_before_update_triggers,
+            &btree_table,
+            update_database_id,
+        )?,
+        None => ColumnMask::default(),
+    };
+    let mut updated_column_indices: ColumnMask = set_clauses
+        .iter()
+        .map(|set_clause| set_clause.column_index)
+        .try_collect()?;
+    updated_column_indices.union_with(&columns_changed_by_triggers)?;
     let has_any_update_triggers = if let Some(btree_table) = target_table.table.btree() {
         has_triggers_including_temp(
             &t_ctx.resolver,
@@ -1338,24 +1398,6 @@ fn emit_update_insns<'a>(
     };
     let skip_set_clauses = false;
 
-    // A BEFORE UPDATE trigger can change the row before constraint checks run,
-    // so NOT NULL checks on SET-clause columns are deferred until after those
-    // triggers fire (see emit_deferred_notnull_checks below). AFTER triggers
-    // run once the row is already written and do not affect this ordering, so
-    // they must not defer the checks. Skipping the inline check for any update
-    // trigger, but only re-emitting it when a BEFORE trigger exists, would drop
-    // the NOT NULL check entirely for a table that has only AFTER triggers.
-    let relevant_before_update_triggers = match target_table.table.btree() {
-        Some(btree_table) => get_triggers_including_temp(
-            &t_ctx.resolver,
-            update_database_id,
-            TriggerEvent::Update,
-            TriggerTime::Before,
-            Some(&updated_column_names),
-            &btree_table,
-        ),
-        None => Vec::new(),
-    };
     let has_before_triggers = !relevant_before_update_triggers.is_empty();
 
     let table_column_was_read = emit_update_column_values(
@@ -1373,28 +1415,14 @@ fn emit_update_insns<'a>(
     // This must happen before index operations and triggers so that all operations
     // use the converted values.
     if let Some(btree_table) = target_table.table.btree() {
-        if !btree_table.is_strict {
-            let affinity = btree_table
-                .columns()
-                .iter()
-                .filter(|c| !c.is_virtual_generated())
-                .map(|c| c.affinity());
-
-            // Only emit Affinity if there's meaningful affinity to apply
-            if affinity.clone().any(|a| a != Affinity::Blob) {
-                if let Ok(count) = NonZeroUsize::try_from(layout.num_non_virtual_cols()) {
-                    program.emit_insn(Insn::Affinity {
-                        start_reg: start,
-                        count,
-                        affinities: affinity.map(|a| a.aff_mask()).collect(),
-                    });
-                }
-            }
-        }
+        emit_new_row_affinity(program, &btree_table, start, &layout);
     }
 
     // Fire BEFORE UPDATE triggers and preserve old_registers for AFTER triggers
     let mut has_after_triggers = false;
+    // The values of the columns that the BEFORE triggers changed, saved
+    // across the second read of the row: (column index, register).
+    let mut trigger_written_values: Vec<(usize, usize)> = Vec::new();
     let preserved_old_registers: Option<Vec<usize>> =
         if let Some(btree_table) = target_table.table.btree() {
             has_after_triggers = has_triggers_including_temp(
@@ -1483,6 +1511,15 @@ fn emit_update_insns<'a>(
                         trigger_ignore_jump_label,
                     )?;
                 }
+                for column in columns_changed_by_triggers.iter() {
+                    let saved_reg = program.alloc_register();
+                    program.emit_insn(Insn::Copy {
+                        src_reg: layout.to_register(start, column),
+                        dst_reg: saved_reg,
+                        extra_amount: 0,
+                    });
+                    trigger_written_values.push((column, saved_reg));
+                }
 
                 // BEFORE UPDATE Triggers may have altered the btree so we need to seek again.
                 program.emit_insn(Insn::NotExists {
@@ -1546,6 +1583,20 @@ fn emit_update_insns<'a>(
             skip_row_label,
             false,
         )?;
+
+        // The rows the triggers returned win over the row on disk.
+        for (column, saved_reg) in &trigger_written_values {
+            program.emit_insn(Insn::Copy {
+                src_reg: *saved_reg,
+                dst_reg: layout.to_register(start, *column),
+                extra_amount: 0,
+            });
+        }
+        if !trigger_written_values.is_empty() {
+            if let Some(btree_table) = target_table.table.btree() {
+                emit_new_row_affinity(program, &btree_table, start, &layout);
+            }
+        }
 
         // Now emit NOT NULL checks for SET clause columns that were deferred
         // from the first emit_update_column_values call. In SQLite, NOT NULL

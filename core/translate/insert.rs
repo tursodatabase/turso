@@ -39,7 +39,8 @@ use crate::{
             plan_subqueries_from_returning,
         },
         trigger_exec::{
-            fire_trigger, get_triggers_including_temp, has_triggers_including_temp, TriggerContext,
+            columns_changed_by_triggers, fire_trigger, get_triggers_including_temp,
+            has_triggers_including_temp, TriggerContext,
         },
         upsert::{
             collect_set_clauses_for_upsert, emit_upsert, resolve_upsert_target,
@@ -494,34 +495,6 @@ pub fn translate_insert(
         |_| true,
     )?;
 
-    let has_user_provided_rowid = ctx.table.has_rowid && insertion.key.is_provided_by_user();
-
-    // For non-STRICT tables, apply column affinity to the values early.
-    // This must happen before BEFORE triggers (matching SQLite's order) so that
-    // trigger bodies see affinity-applied values. Affinity is idempotent, so
-    // applying it here means we can skip the per-trigger Copy+Affinity in fire_trigger.
-    if !ctx.table.is_strict {
-        let affinity = insertion
-            .col_mappings
-            .iter()
-            .filter(|cm| !cm.column.is_virtual_generated())
-            .map(|col_mapping| col_mapping.column.affinity());
-
-        // Only emit Affinity if there's meaningful affinity to apply
-        // (i.e., not all BLOB/NONE affinity)
-        if affinity.clone().any(|a| a != Affinity::Blob) {
-            if let Ok(count) = NonZeroUsize::try_from(insertion.num_non_virtual_cols) {
-                program.emit_insn(Insn::Affinity {
-                    start_reg: insertion.first_col_register(),
-                    count,
-                    affinities: affinity.map(|a| a.aff_mask()).collect(),
-                });
-            }
-        }
-    }
-
-    // Fire BEFORE INSERT triggers
-
     let relevant_before_triggers = get_triggers_including_temp(
         resolver,
         database_id,
@@ -530,6 +503,28 @@ pub fn translate_insert(
         None,
         &btree_table,
     );
+    let columns_changed_by_triggers = columns_changed_by_triggers(
+        resolver,
+        &relevant_before_triggers,
+        &btree_table,
+        database_id,
+    )?;
+    let trigger_changes_rowid_alias = ctx
+        .table
+        .columns()
+        .iter()
+        .position(|column| column.is_rowid_alias())
+        .is_some_and(|column| columns_changed_by_triggers.get(column));
+    let has_user_provided_rowid =
+        ctx.table.has_rowid && (insertion.key.is_provided_by_user() || trigger_changes_rowid_alias);
+
+    // For non-STRICT tables, apply column affinity to the values early.
+    // This must happen before BEFORE triggers (matching SQLite's order) so that
+    // trigger bodies see affinity-applied values. Affinity is idempotent, so
+    // applying it here means we can skip the per-trigger Copy+Affinity in fire_trigger.
+    emit_column_affinity(program, &ctx, &insertion);
+
+    // Fire BEFORE INSERT triggers
 
     let dml_ctx =
         DmlColumnContext::from_column_reg_mapping(insertion.col_mappings.iter().map(|cm| {
@@ -556,7 +551,7 @@ pub fn translate_insert(
         // In SQLite, NEW.<rowid_alias> returns -1 in BEFORE INSERT triggers when the rowid
         // hasn't been assigned yet (i.e., it's NULL). We need to temporarily set the key
         // register to -1 so the trigger sees the correct value.
-        let saved_key_reg = if has_user_provided_rowid {
+        let saved_key_reg = if insertion.key.is_provided_by_user() {
             // User provided a value that might be NULL. Save original value, replace NULL with -1.
             let save_reg = program.alloc_register();
             program.emit_insn(Insn::Copy {
@@ -635,13 +630,44 @@ pub fn translate_insert(
             )?;
         }
         // Restore the original key register value so the post-trigger NotNull check
-        // correctly routes NULL keys to NewRowid generation.
-        if let Some(save_reg) = saved_key_reg {
+        // correctly routes NULL keys to NewRowid generation. A trigger that
+        // returns a row with the INTEGER PRIMARY KEY column keeps its value:
+        // the key register still holds -1 only when no trigger changed it.
+        if trigger_changes_rowid_alias {
+            let key_changed_label = program.allocate_label();
+            let minus_one_reg = program.alloc_register();
+            program.emit_insn(Insn::Integer {
+                value: -1,
+                dest: minus_one_reg,
+            });
+            program.emit_insn(Insn::Ne {
+                lhs: insertion.key_register(),
+                rhs: minus_one_reg,
+                target_pc: key_changed_label,
+                flags: Default::default(),
+                collation: None,
+            });
+            match saved_key_reg {
+                Some(save_reg) => program.emit_insn(Insn::Copy {
+                    src_reg: save_reg,
+                    dst_reg: insertion.key_register(),
+                    extra_amount: 0,
+                }),
+                None => program.emit_insn(Insn::Null {
+                    dest: insertion.key_register(),
+                    dest_end: None,
+                }),
+            }
+            program.preassign_label_to_next_insn(key_changed_label);
+        } else if let Some(save_reg) = saved_key_reg {
             program.emit_insn(Insn::Copy {
                 src_reg: save_reg,
                 dst_reg: insertion.key_register(),
                 extra_amount: 0,
             });
+        }
+        if !columns_changed_by_triggers.is_empty() {
+            emit_column_affinity(program, &ctx, &insertion);
         }
     }
 
@@ -1140,6 +1166,31 @@ pub fn translate_insert(
     program.result_columns = result_columns;
     program.table_references.extend(table_references);
     Ok(())
+}
+
+/// Apply the column affinities of a non-STRICT table to the values of the
+/// row, so that every later step sees the converted values.
+fn emit_column_affinity(program: &mut ProgramBuilder, ctx: &InsertEmitCtx, insertion: &Insertion) {
+    if ctx.table.is_strict {
+        return;
+    }
+    let affinity = insertion
+        .col_mappings
+        .iter()
+        .filter(|cm| !cm.column.is_virtual_generated())
+        .map(|col_mapping| col_mapping.column.affinity());
+
+    // Only emit Affinity if there's meaningful affinity to apply
+    // (i.e., not all BLOB/NONE affinity)
+    if affinity.clone().any(|a| a != Affinity::Blob) {
+        if let Ok(count) = NonZeroUsize::try_from(insertion.num_non_virtual_cols) {
+            program.emit_insn(Insn::Affinity {
+                start_reg: insertion.first_col_register(),
+                count,
+                affinities: affinity.map(|a| a.aff_mask()).collect(),
+            });
+        }
+    }
 }
 
 /// If the user provided an explicit rowid for this insert, we must validate that it is an Integer and non-null

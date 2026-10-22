@@ -225,7 +225,7 @@ impl Dialect for PostgresDialect {
         &self,
         schema: &Schema,
         call: &turso_core::dialect::TriggerFunctionCall<'_>,
-    ) -> Result<Vec<turso_parser::ast::TriggerCmd>> {
+    ) -> Result<turso_core::dialect::TriggerFunctionBody> {
         crate::plpgsql::expand_trigger_function(schema, call)
     }
 
