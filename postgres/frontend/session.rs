@@ -70,7 +70,7 @@ pub fn open_database_with_io(
         turso_core::OpenOptions::new(Arc::new(PostgresDialect))
             .storage(db_file)
             .flags(flags)
-            .db_opts(opts),
+            .db_opts(opts.with_mvcc(true)),
     )
 }
 
@@ -115,9 +115,8 @@ impl PgConnection {
     }
 
     pub fn pragma_update(&self, name: &str, value: impl std::fmt::Display) -> Result<()> {
-        let sql = format!("PRAGMA {name} = {value}");
-        let mut stmt = self.inner.conn.prepare_internal(sql)?;
-        stmt.run_ignore_rows()
+        self.inner.conn.pragma_update(name, value)?;
+        Ok(())
     }
 
     pub fn query_runner<'a>(&'a self, sql: &'a [u8]) -> PgQueryRunner<'a> {
@@ -740,7 +739,7 @@ fn handle_pg_copy_from(conn: &Arc<Connection>, stmt: &PgCopyFromStmt) -> Result<
     let rows = parse_copy_text_format(&data, delimiter, null_string, num_columns, stmt.header)?;
 
     let rows_inserted = rows.len();
-    let mut begin = conn.prepare_sqlite("BEGIN")?;
+    let mut begin = conn.prepare_sqlite("BEGIN CONCURRENT")?;
     begin.run_ignore_rows()?;
 
     let result = (|| {

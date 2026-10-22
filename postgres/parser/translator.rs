@@ -670,7 +670,7 @@ impl PostgreSQLTranslator {
         match TransactionStmtKind::try_from(txn.kind) {
             Ok(TransactionStmtKind::TransStmtBegin | TransactionStmtKind::TransStmtStart) => {
                 Ok(ast::Stmt::Begin {
-                    typ: None,
+                    typ: Some(ast::TransactionType::Concurrent),
                     name: None,
                 })
             }
@@ -6981,7 +6981,10 @@ mod tests {
         let begin = crate::parse("BEGIN").unwrap();
         assert!(matches!(
             translator.translate(&begin).unwrap(),
-            ast::Stmt::Begin { .. }
+            ast::Stmt::Begin {
+                typ: Some(ast::TransactionType::Concurrent),
+                ..
+            }
         ));
 
         let commit = crate::parse("COMMIT").unwrap();
