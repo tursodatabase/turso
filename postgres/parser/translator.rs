@@ -3824,6 +3824,16 @@ impl PostgreSQLTranslator {
         };
         if let Some(type_name) = cast_type {
             if args.len() == 1 {
+                // A cast has nowhere to put aggregate or window clauses.
+                if distinctness.is_some()
+                    || filter_over.filter_clause.is_some()
+                    || filter_over.over_clause.is_some()
+                    || !func_call.agg_order.is_empty()
+                {
+                    return Err(not_supported(format!(
+                        "DISTINCT, ORDER BY, FILTER or OVER on {func_name}()"
+                    )));
+                }
                 return Ok(ast::Expr::Cast {
                     expr: args.into_iter().next().unwrap(),
                     type_name: Some(ast::Type {
@@ -9617,5 +9627,13 @@ mod tests {
             "SELECT * FROM generate_series(DISTINCT 1, 3)",
             "function in FROM",
         );
+    }
+
+    #[test]
+    fn fail_closed_cast_function_clauses() {
+        assert_not_supported("SELECT int4(DISTINCT a) FROM t", "int4()");
+        assert_not_supported("SELECT text(a) OVER () FROM t", "text()");
+        assert_not_supported("SELECT float8(a ORDER BY b) FROM t", "float8()");
+        assert_translates("SELECT int4(a) FROM t");
     }
 }
