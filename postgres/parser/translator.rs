@@ -4871,6 +4871,20 @@ impl PostgreSQLTranslator {
             .as_ref()
             .ok_or_else(|| ParseError::ParseError("CREATE DOMAIN missing base type".into()))?;
         let pg_type = extract_type_name_from_typename(type_name_node)?;
+        // The domain stores only a base type name, so modifiers such as the
+        // length in varchar(5) would be lost.
+        if !type_name_node.typmods.is_empty() {
+            return Err(not_supported(format!(
+                "type modifiers on {pg_type} in CREATE DOMAIN"
+            )));
+        }
+        if domain
+            .coll_clause
+            .as_ref()
+            .is_some_and(|c| !is_binary_collation(&c.collname))
+        {
+            return Err(not_supported("a non-binary COLLATE in CREATE DOMAIN"));
+        }
         let base_type = match map_pg_type(&pg_type, &[]) {
             Some(mapping) => mapping.type_name,
             None => pg_type, // custom type or domain — pass through
@@ -4883,19 +4897,28 @@ impl PostgreSQLTranslator {
 
         for constraint_node in &domain.constraints {
             let Some(Node::Constraint(constraint)) = &constraint_node.node else {
-                continue;
+                return Err(ParseError::ParseError(
+                    "CREATE DOMAIN: unexpected constraint node".into(),
+                ));
             };
             reject_constraint_attributes(constraint, "")?;
             let contype = ConstrType::try_from(constraint.contype).unwrap_or(ConstrType::Undefined);
             match contype {
                 ConstrType::ConstrDefault => {
-                    if let Some(ref raw_expr) = constraint.raw_expr {
-                        default = Some(Box::new(self.translate_expr(raw_expr)?));
+                    if default.is_some() {
+                        return Err(ParseError::ParseError(
+                            "multiple default expressions".into(),
+                        ));
                     }
+                    let raw_expr = constraint.raw_expr.as_ref().ok_or_else(|| {
+                        ParseError::ParseError("DEFAULT missing expression".into())
+                    })?;
+                    default = Some(Box::new(self.translate_expr(raw_expr)?));
                 }
                 ConstrType::ConstrNotnull => {
                     not_null = true;
                 }
+                ConstrType::ConstrNull => {}
                 ConstrType::ConstrCheck => {
                     if let Some(ref raw_expr) = constraint.raw_expr {
                         let check_expr = self.translate_expr(raw_expr)?;
@@ -4908,9 +4931,18 @@ impl PostgreSQLTranslator {
                             name,
                             check: Box::new(check_expr),
                         });
+                    } else {
+                        return Err(ParseError::ParseError(
+                            "CHECK constraint missing expression".into(),
+                        ));
                     }
                 }
-                _ => {}
+                other => {
+                    return Err(not_supported(format!(
+                        "domain constraint {}",
+                        constr_type_name(other)
+                    )))
+                }
             }
         }
 
@@ -9933,5 +9965,14 @@ mod tests {
         assert_not_supported("CREATE TYPE s.mood AS ENUM ('a')", "schema-qualified type");
         assert_translates("CREATE DOMAIN public.d AS int");
         assert_translates("CREATE TYPE public.mood AS ENUM ('a')");
+    }
+
+    #[test]
+    fn fail_closed_create_domain() {
+        assert_not_supported("CREATE DOMAIN d AS varchar(5)", "type modifiers");
+        assert_not_supported("CREATE DOMAIN d AS numeric(10, 2)", "type modifiers");
+        assert_not_supported("CREATE DOMAIN d AS text COLLATE \"en_US\"", "COLLATE");
+        assert_translates("CREATE DOMAIN d AS int NULL DEFAULT 1 CHECK (VALUE > 0)");
+        assert_translates("CREATE DOMAIN d AS text COLLATE \"C\"");
     }
 }
