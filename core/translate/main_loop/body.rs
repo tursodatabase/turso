@@ -393,6 +393,40 @@ fn emit_loop_source<'a>(
                         {
                             Ok(WalkControl::SkipChildren)
                         }
+                        Expr::SubqueryResult {
+                            subquery_id,
+                            query_type:
+                                turso_parser::ast::SubqueryType::RowValue { num_regs: 1, .. }
+                                | turso_parser::ast::SubqueryType::Exists { .. },
+                            ..
+                        } if plan.non_from_clause_subqueries.iter().any(|subquery| {
+                            subquery.internal_id == *subquery_id
+                                && subquery.correlated
+                                && matches!(
+                                    subquery.state,
+                                    SubqueryState::Evaluated {
+                                        evaluated_at: EvalAt::Loop(_),
+                                        ..
+                                    }
+                                )
+                        }) =>
+                        {
+                            let reg = program.alloc_register();
+                            translate_expr(
+                                program,
+                                Some(&plan.table_references),
+                                expr,
+                                reg,
+                                &t_ctx.resolver,
+                            )?;
+                            t_ctx.resolver.cache_scalar_expr_reg(
+                                Cow::Owned(expr.clone()),
+                                reg,
+                                false,
+                                &plan.table_references,
+                            )?;
+                            Ok(WalkControl::SkipChildren)
+                        }
                         Expr::Column { .. } | Expr::RowId { .. } => {
                             let reg = program.alloc_register();
                             translate_expr(

@@ -256,6 +256,8 @@ FROM quarterly_sales s,
 
 Groups rows that share the same values in the specified columns. Typically used with aggregate functions.
 
+Without `GROUP BY`, a correlated scalar subquery combined with an aggregate result reads from a row that contributes to the aggregate, not a row rejected by the join or `WHERE` condition. If no rows contribute, references to the query's input columns read as `NULL`.
+
 ```sql
 SELECT department, COUNT(*) AS employee_count, AVG(salary) AS avg_salary
 FROM employees
