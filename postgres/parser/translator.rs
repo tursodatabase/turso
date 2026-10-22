@@ -5647,14 +5647,22 @@ fn like_pattern_to_glob(pattern: &str) -> Option<String> {
     (glob.len() <= SQLITE_MAX_LIKE_PATTERN_LENGTH).then_some(glob)
 }
 
-/// Convert a SQL SIMILAR TO pattern to a POSIX regex anchored with ^...$
-/// `%` → `.*`, `_` → `.`, other regex metacharacters are kept as-is since
-/// SIMILAR TO patterns are already regex-like in SQL standard.
+/// Convert a SQL SIMILAR TO pattern to a regex anchored with ^(?:...)$.
+/// `%` → `.*`, `_` → `.`, and `.`, `^`, `$`, which are literals in SIMILAR TO,
+/// are escaped; other regex metacharacters and escapes are kept as-is.
 fn similar_to_regex(pattern: &str) -> String {
-    let mut regex = String::with_capacity(pattern.len() + 2);
-    regex.push('^');
+    let mut regex = String::with_capacity(pattern.len() + 8);
+    regex.push_str("^(?:");
+    let mut in_bracket = false;
     let mut chars = pattern.chars().peekable();
     while let Some(c) = chars.next() {
+        if in_bracket {
+            regex.push(c);
+            if c == ']' {
+                in_bracket = false;
+            }
+            continue;
+        }
         match c {
             '%' => regex.push_str(".*"),
             '_' => regex.push('.'),
@@ -5665,10 +5673,24 @@ fn similar_to_regex(pattern: &str) -> String {
                     regex.push(next);
                 }
             }
+            '.' | '^' | '$' => {
+                regex.push('\\');
+                regex.push(c);
+            }
+            '[' => {
+                in_bracket = true;
+                regex.push(c);
+                if chars.peek() == Some(&'^') {
+                    regex.push(chars.next().unwrap());
+                }
+                if chars.peek() == Some(&']') {
+                    regex.push(chars.next().unwrap());
+                }
+            }
             _ => regex.push(c),
         }
     }
-    regex.push('$');
+    regex.push_str(")$");
     regex
 }
 
