@@ -203,6 +203,7 @@ fn prepare_statement(pg_conn: &Arc<PgConnectionInner>, sql: &str) -> Result<Stat
         .translate_with_prereqs(&parse_result, Some(&sql))
         .map_err(|e| LimboError::ParseError(e.to_string()))?;
     reject_catalog_dml(translated.cmd.stmt())?;
+    check_trigger_function(&pg_conn.conn, translated.cmd.stmt())?;
 
     let options = PrepareOptions {
         unqualified_database_search_path: search_path,
@@ -260,6 +261,34 @@ pub(crate) fn current_schema(conn: &Connection) -> Option<String> {
     search_path
         .into_iter()
         .find(|schema| schema.eq_ignore_ascii_case("public") || attached.contains(schema))
+}
+
+/// PostgreSQL checks the function of a trigger when the trigger is created:
+/// it must exist and return `trigger`.
+fn check_trigger_function(conn: &Connection, stmt: &ast::Stmt) -> Result<()> {
+    let ast::Stmt::CreateTrigger { commands, .. } = stmt else {
+        return Ok(());
+    };
+    for command in commands {
+        let ast::TriggerCmd::ExecuteFunction { name, .. } = command else {
+            continue;
+        };
+        let function_name = name.name.as_str();
+        let schema = conn.current_schema();
+        let Some(stored) = schema.get_user_function(function_name, 0) else {
+            return Err(LimboError::ParseError(format!(
+                "function {function_name}() does not exist"
+            )));
+        };
+        let function = turso_pg_parser::function::PgFunction::parse(&stored.sql)
+            .map_err(|e| LimboError::ParseError(e.to_string()))?;
+        if !function.is_trigger() {
+            return Err(LimboError::ParseError(format!(
+                "function {function_name} must return type trigger"
+            )));
+        }
+    }
+    Ok(())
 }
 
 fn reject_catalog_dml(stmt: &ast::Stmt) -> Result<()> {

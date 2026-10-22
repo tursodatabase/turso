@@ -1308,6 +1308,33 @@ fn wire_create_function_returns_create_function_tag() {
 }
 
 #[test]
+fn wire_trigger_writes_do_not_count_in_the_command_tag() {
+    let (mut server, port) = start_tursopg_server();
+    let mut client = PgTestClient::connect(port);
+
+    client.query_command_tags("CREATE TABLE users (id int)");
+    client.query_command_tags("CREATE TABLE audit (user_id int)");
+    client.query_command_tags(
+        "CREATE FUNCTION log_user() RETURNS trigger LANGUAGE plpgsql AS $$ \
+         BEGIN INSERT INTO audit VALUES (NEW.id), (NEW.id); RETURN NEW; END $$",
+    );
+    let tags = client.query_command_tags(
+        "CREATE TRIGGER log_users AFTER INSERT ON users FOR EACH ROW EXECUTE FUNCTION log_user()",
+    );
+    assert_eq!(tags, vec!["CREATE TRIGGER"]);
+
+    let tags = client.query_command_tags("INSERT INTO users VALUES (1), (2), (3)");
+    assert_eq!(tags, vec!["INSERT 0 3"]);
+    assert_eq!(client.query_single_text("SELECT count(*) FROM audit"), "6");
+
+    let tags = client.query_command_tags("DROP TRIGGER log_users ON users");
+    assert_eq!(tags, vec!["DROP TRIGGER"]);
+
+    server.kill().ok();
+    server.wait().ok();
+}
+
+#[test]
 fn repl_load_extension_still_attempts_to_open_the_file() {
     let output = run_tursopg(b"SELECT load_extension('/nonexistent/turso-audit-ext');\n");
     let combined = format!(

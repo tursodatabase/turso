@@ -3,6 +3,7 @@ mod copy;
 mod functions;
 mod inline;
 mod options;
+mod plpgsql;
 mod session;
 mod unnest;
 

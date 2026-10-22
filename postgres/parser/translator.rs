@@ -4,6 +4,7 @@
 // representation, handling the semantic differences between PostgreSQL and SQLite.
 
 use crate::function::{display_type_name, PgFunction};
+use crate::trigger::PgTrigger;
 use crate::ParseError;
 use pg_query::protobuf::JoinType as PgJoinType;
 use pg_query::{NodeRef, ParseResult};
@@ -33,7 +34,7 @@ impl PostgreSQLTranslator {
     }
 
     /// Build a `QualifiedName` from a PG `RangeVar`, preserving schema qualifier.
-    fn qualified_name_from_range_var(
+    pub(crate) fn qualified_name_from_range_var(
         &self,
         range_var: &pg_query::protobuf::RangeVar,
     ) -> ast::QualifiedName {
@@ -201,6 +202,7 @@ impl PostgreSQLTranslator {
             }
             NodeRef::CreateSeqStmt(seq) => self.translate_create_sequence(seq)?,
             NodeRef::CreateFunctionStmt(function) => translate_create_function(function, source)?,
+            NodeRef::CreateTrigStmt(trigger) => translate_create_trigger(trigger)?,
             _ => {
                 return Err(ParseError::ParseError(format!(
                     "{} is not supported",
@@ -1003,6 +1005,9 @@ impl PostgreSQLTranslator {
 
         if remove_type == ObjectType::ObjectFunction {
             return translate_drop_function(drop);
+        }
+        if remove_type == ObjectType::ObjectTrigger {
+            return translate_drop_trigger(drop);
         }
 
         // Extract the first qualified name from drop.objects
@@ -4830,6 +4835,44 @@ fn translate_create_function(
         arg_count: function.params.len(),
         sql: source.trim().trim_end_matches(';').trim_end().to_string(),
     }))
+}
+
+/// Translate `CREATE TRIGGER`. The engine gets one trigger for the first
+/// event; it stores the statement text and loads one trigger for each event
+/// from it.
+fn translate_create_trigger(
+    stmt: &pg_query::protobuf::CreateTrigStmt,
+) -> Result<ast::Stmt, ParseError> {
+    let trigger = PgTrigger::from_stmt(stmt)?;
+    trigger
+        .to_turso_statements()
+        .into_iter()
+        .next()
+        .ok_or_else(|| ParseError::ParseError("CREATE TRIGGER missing event".to_string()))
+}
+
+/// Translate `DROP TRIGGER [IF EXISTS] name ON table`.
+fn translate_drop_trigger(drop: &pg_query::protobuf::DropStmt) -> Result<ast::Stmt, ParseError> {
+    use pg_query::protobuf::node::Node;
+
+    let [object] = drop.objects.as_slice() else {
+        return Err(ParseError::ParseError(
+            "DROP TRIGGER with more than one trigger is not supported".into(),
+        ));
+    };
+    let Some(Node::List(names)) = &object.node else {
+        return Err(ParseError::ParseError(
+            "DROP TRIGGER: unexpected object format".into(),
+        ));
+    };
+    // The list is the table name, with its schema when given, then the
+    // trigger name.
+    let name = last_string(&names.items)
+        .ok_or_else(|| ParseError::ParseError("DROP TRIGGER missing trigger name".into()))?;
+    Ok(ast::Stmt::DropTrigger {
+        if_exists: drop.missing_ok,
+        trigger_name: ast::QualifiedName::single(ast::Name::exact(name)),
+    })
 }
 
 /// Translate `DROP FUNCTION [IF EXISTS] name[(types)]`.

@@ -454,7 +454,7 @@ Upgrade is not supported.
 | BEGIN ATOMIC function bodies | ❌ Not supported | |
 | CALL syntax for executing procedures | ❌ Not supported | |
 | CREATE FUNCTION | 🟡 Partial | `CREATE [OR REPLACE] FUNCTION` and `DROP FUNCTION` keep the function in the catalog (`pg_proc`, `pg_language`); functions are resolved by name and number of parameters, so overloads by parameter type are rejected; `SECURITY DEFINER` and `SET` options are accepted and ignored; a call to a SQL function with a body of one expression is inlined (see Inlining of SQL functions); a call to any other function gives an error |
-| Column level triggers | ❌ Not supported | |
+| Column level triggers | ✅ Supported | `UPDATE OF column` |
 | CREATE PROCEDURE syntax for SQL stored procedures | ❌ Not supported | Rejected with an error |
 | Event triggers | ❌ Not supported | |
 | FILTER clause for aggregate functions | ✅ Supported | |
@@ -463,23 +463,23 @@ Upgrade is not supported.
 | Per function statistics | ❌ Not supported | |
 | RETURN QUERY EXECUTE | ❌ Not supported | |
 | RETURNS TABLE | ❌ Not supported | |
-| Statement level triggers | ❌ Not supported | CREATE TRIGGER not translated |
+| Statement level triggers | ❌ Not supported | `FOR EACH ROW` triggers work (see Procedural Languages); `FOR EACH STATEMENT` is rejected |
 | Statement level TRUNCATE triggers | ❌ Not supported | |
 | Triggers on views | ❌ Not supported | |
 | Variadic functions | ❌ Not supported | |
-| WHEN clause for CREATE TRIGGER | ❌ Not supported | |
+| WHEN clause for CREATE TRIGGER | ✅ Supported | |
 
 ## Procedural Languages
 
 | Feature | Status | Notes |
 |---------|--------|-------|
-| Procedural languages (PL/pgSQL, PL/Python, ...) | 🟡 Partial | `CREATE FUNCTION ... LANGUAGE plpgsql` is stored in the catalog; the function cannot be called yet; DO is rejected with an error |
-| CASE in pl/pgsql | ❌ Not supported | |
+| Procedural languages (PL/pgSQL, PL/Python, ...) | 🟡 Partial | PL/pgSQL trigger functions: `CREATE TRIGGER ... FOR EACH ROW [WHEN (...)] EXECUTE FUNCTION f(args)` compiles the function for each trigger and each event when a statement that fires the trigger is prepared; the body can hold `INSERT`, `UPDATE`, `DELETE` with `NEW`, `OLD` and the `TG_*` variables, and `RETURN NEW` (a `BEFORE` trigger cannot change the row yet); `DECLARE`, `IF`, `CASE`, `RAISE`, `PERFORM`, `SELECT INTO`, loops, cursors, `EXCEPTION` and `EXECUTE` give an error when the trigger is used; `ALTER TABLE ... RENAME` of a table with such a trigger is rejected; the function cannot be called directly; DO is rejected with an error |
+| CASE in pl/pgsql | ❌ Not supported | Gives an error when the trigger is used |
 | CONTINUE statement for PL/pgSQL | ❌ Not supported | |
 | CREATE TRANSFORM | ❌ Not supported | |
 | DO statement for pl/perl | ❌ Not supported | |
 | DO statement for pl/pgsql | ❌ Not supported | |
-| EXCEPTION support in PL/pgSQL | ❌ Not supported | |
+| EXCEPTION support in PL/pgSQL | ❌ Not supported | Gives an error when the trigger is used |
 | EXECUTE USING in PL/pgSQL | ❌ Not supported | |
 | FOREACH IN ARRAY in pl/pgsql | ❌ Not supported | |
 | IN/OUT/INOUT parameters for pl/pgsql and PL/SQL | ❌ Not supported | |

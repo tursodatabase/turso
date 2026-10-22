@@ -14,6 +14,7 @@ use turso_parser::ast::RefAct;
 
 use turso_pg_parser::function::{PgFunction, Volatility};
 pub use turso_pg_parser::translator::is_catalog_table_name;
+use turso_pg_parser::trigger::PgTrigger;
 
 /// PostgreSQL uses OID zero when no object is referenced.
 const PG_INVALID_OID: i64 = 0;
@@ -189,6 +190,43 @@ impl Dialect for PostgresDialect {
         args: &[turso_parser::ast::Expr],
     ) -> Result<Option<turso_parser::ast::Expr>> {
         crate::inline::expand_function_call(schema, name, args)
+    }
+
+    fn parse_trigger_sql(&self, sql: &str) -> Result<Vec<turso_parser::ast::Stmt>> {
+        let Some(raw_sql) = decode_stored_pg_schema_sql(sql) else {
+            return turso_core::dialect::sqlite::parse_trigger_sql(sql);
+        };
+        let trigger =
+            PgTrigger::parse(raw_sql).map_err(|e| LimboError::ParseError(e.to_string()))?;
+        Ok(trigger.to_turso_statements())
+    }
+
+    /// A trigger that executes a function keeps its PostgreSQL text, which
+    /// names every event of the trigger. A trigger with SQL statements in
+    /// its body came through the SQLite fallback of `parse`, so it is
+    /// stored as SQLite text.
+    fn format_trigger_sql(&self, input: &str, stmt: &turso_parser::ast::Stmt) -> Result<String> {
+        let executes_function = matches!(
+            stmt,
+            turso_parser::ast::Stmt::CreateTrigger { commands, .. }
+                if commands.iter().any(|command| {
+                    matches!(command, turso_parser::ast::TriggerCmd::ExecuteFunction { .. })
+                })
+        );
+        if executes_function {
+            return Ok(encode_pg_schema_sql(
+                input.trim().trim_end_matches(';').trim_end(),
+            ));
+        }
+        turso_core::dialect::sqlite::format_trigger_sql(stmt)
+    }
+
+    fn expand_trigger_function(
+        &self,
+        schema: &Schema,
+        call: &turso_core::dialect::TriggerFunctionCall<'_>,
+    ) -> Result<Vec<turso_parser::ast::TriggerCmd>> {
+        crate::plpgsql::expand_trigger_function(schema, call)
     }
 
     fn requires_custom_types(&self) -> bool {

@@ -3,6 +3,7 @@ use thiserror::Error;
 
 pub mod function;
 pub mod translator;
+pub mod trigger;
 
 #[derive(Debug, Error)]
 pub enum ParseError {
@@ -13,6 +14,12 @@ pub enum ParseError {
 /// Parse a PostgreSQL SQL statement using pg_query
 pub fn parse(sql: &str) -> Result<ParseResult, ParseError> {
     pg_query::parse(sql).map_err(|e| ParseError::ParseError(e.to_string()))
+}
+
+/// Parse the PL/pgSQL body of a `CREATE FUNCTION` statement into its parse
+/// tree, as JSON.
+pub fn parse_plpgsql(sql: &str) -> Result<serde_json::Value, ParseError> {
+    pg_query::parse_plpgsql(sql).map_err(|e| ParseError::ParseError(e.to_string()))
 }
 
 /// Split a multi-statement SQL string into individual statements.

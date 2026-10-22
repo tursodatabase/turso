@@ -1,0 +1,302 @@
+# Triggers whose function is written in PL/pgSQL, through the PostgreSQL
+# frontend. Turso compiles the function for each trigger and each event and
+# runs the SQL statements of its body.
+
+@database :memory:
+
+setup users_audit {
+    CREATE TABLE users (id int PRIMARY KEY, name text);
+    CREATE TABLE audit (seq serial, op text, user_id int, name text);
+}
+
+@setup users_audit
+test after-insert-trigger-runs-its-function {
+    CREATE FUNCTION log_new_user() RETURNS trigger LANGUAGE plpgsql AS $$
+    BEGIN
+      INSERT INTO audit (op, user_id, name) VALUES (TG_OP, NEW.id, NEW.name);
+      RETURN NEW;
+    END;
+    $$;
+    CREATE TRIGGER log_users AFTER INSERT ON users FOR EACH ROW EXECUTE FUNCTION log_new_user();
+    INSERT INTO users VALUES (1, 'ann'), (2, 'bob');
+    SELECT op, user_id, name FROM audit ORDER BY seq;
+}
+expect {
+    INSERT|1|ann
+    INSERT|2|bob
+}
+
+@setup users_audit
+test trigger-for-several-events {
+    CREATE FUNCTION log_op() RETURNS trigger LANGUAGE plpgsql AS $$
+    BEGIN
+      INSERT INTO audit (op) VALUES (TG_OP);
+      RETURN NULL;
+    END;
+    $$;
+    CREATE TRIGGER log_ops AFTER INSERT OR UPDATE OR DELETE ON users FOR EACH ROW EXECUTE FUNCTION log_op();
+    INSERT INTO users VALUES (1, 'ann');
+    UPDATE users SET name = 'anne' WHERE id = 1;
+    DELETE FROM users WHERE id = 1;
+    SELECT op FROM audit ORDER BY seq;
+}
+expect {
+    INSERT
+    UPDATE
+    DELETE
+}
+
+@setup users_audit
+test after-update-trigger-sees-old-and-new {
+    CREATE FUNCTION log_rename() RETURNS trigger LANGUAGE plpgsql AS $$
+    BEGIN
+      INSERT INTO audit (op, user_id, name) VALUES (OLD.name, NEW.id, NEW.name);
+      RETURN NEW;
+    END;
+    $$;
+    CREATE TRIGGER log_renames AFTER UPDATE ON users FOR EACH ROW EXECUTE FUNCTION log_rename();
+    INSERT INTO users VALUES (1, 'ann');
+    UPDATE users SET name = 'anne' WHERE id = 1;
+    SELECT op, user_id, name FROM audit ORDER BY seq;
+}
+expect {
+    ann|1|anne
+}
+
+@setup users_audit
+test after-delete-trigger-sees-old {
+    CREATE FUNCTION log_delete() RETURNS trigger LANGUAGE plpgsql AS $$
+    BEGIN
+      INSERT INTO audit (op, user_id, name) VALUES (TG_OP, OLD.id, OLD.name);
+      RETURN OLD;
+    END;
+    $$;
+    CREATE TRIGGER log_deletes AFTER DELETE ON users FOR EACH ROW EXECUTE PROCEDURE log_delete();
+    INSERT INTO users VALUES (1, 'ann'), (2, 'bob');
+    DELETE FROM users WHERE id = 2;
+    SELECT op, user_id, name FROM audit ORDER BY seq;
+}
+expect {
+    DELETE|2|bob
+}
+
+@setup users_audit
+test update-of-column-trigger-fires-only-for-that-column {
+    CREATE FUNCTION log_name_change() RETURNS trigger LANGUAGE plpgsql AS $$
+    BEGIN
+      INSERT INTO audit (op, name) VALUES (OLD.name, NEW.name);
+      RETURN NEW;
+    END;
+    $$;
+    CREATE TRIGGER log_name_changes AFTER UPDATE OF name ON users FOR EACH ROW EXECUTE FUNCTION log_name_change();
+    INSERT INTO users VALUES (1, 'ann');
+    UPDATE users SET id = 2 WHERE id = 1;
+    UPDATE users SET name = 'anne' WHERE id = 2;
+    SELECT op, name FROM audit ORDER BY seq;
+}
+expect {
+    ann|anne
+}
+
+@setup users_audit
+test trigger-when-clause-filters-rows {
+    CREATE FUNCTION log_user() RETURNS trigger LANGUAGE plpgsql AS $$
+    BEGIN
+      INSERT INTO audit (op, user_id) VALUES (TG_OP, NEW.id);
+      RETURN NEW;
+    END;
+    $$;
+    CREATE TRIGGER log_big_ids AFTER INSERT ON users FOR EACH ROW WHEN (NEW.id > 10) EXECUTE FUNCTION log_user();
+    INSERT INTO users VALUES (1, 'ann'), (11, 'bob'), (12, 'cid');
+    SELECT user_id FROM audit ORDER BY seq;
+}
+expect {
+    11
+    12
+}
+
+@setup users_audit
+test trigger-arguments-and-variables-are-constants {
+    CREATE FUNCTION log_context() RETURNS trigger LANGUAGE plpgsql AS $$
+    BEGIN
+      INSERT INTO audit (op, name) VALUES (TG_ARGV[0] || '/' || TG_ARGV[1] || '/' || TG_NARGS, TG_NAME || '/' || TG_TABLE_NAME || '/' || TG_TABLE_SCHEMA || '/' || TG_WHEN || '/' || TG_LEVEL);
+      RETURN NEW;
+    END;
+    $$;
+    CREATE TRIGGER log_ctx AFTER INSERT ON users FOR EACH ROW EXECUTE FUNCTION log_context('a', 'b');
+    INSERT INTO users VALUES (1, 'ann');
+    SELECT op, name FROM audit;
+}
+expect {
+    a/b/2|log_ctx/users/public/AFTER/ROW
+}
+
+@setup users_audit
+test before-insert-trigger-runs-before-the-row-is-written {
+    CREATE FUNCTION count_users() RETURNS trigger LANGUAGE plpgsql AS $$
+    BEGIN
+      INSERT INTO audit (op, user_id) VALUES (TG_WHEN, (SELECT count(*) FROM users));
+      RETURN NEW;
+    END;
+    $$;
+    CREATE TRIGGER count_before BEFORE INSERT ON users FOR EACH ROW EXECUTE FUNCTION count_users();
+    CREATE TRIGGER count_after AFTER INSERT ON users FOR EACH ROW EXECUTE FUNCTION count_users();
+    INSERT INTO users VALUES (1, 'ann');
+    SELECT op, user_id FROM audit ORDER BY seq;
+}
+expect {
+    BEFORE|0
+    AFTER|1
+}
+
+@setup users_audit
+test trigger-function-calls-a-sql-function {
+    CREATE FUNCTION next_id(id int) RETURNS int LANGUAGE sql AS 'SELECT id + 1';
+    CREATE FUNCTION log_next() RETURNS trigger LANGUAGE plpgsql AS $$
+    BEGIN
+      INSERT INTO audit (op, user_id) VALUES (TG_OP, next_id(NEW.id));
+      RETURN NEW;
+    END;
+    $$;
+    CREATE TRIGGER log_nexts AFTER INSERT ON users FOR EACH ROW EXECUTE FUNCTION log_next();
+    INSERT INTO users VALUES (1, 'ann');
+    SELECT user_id FROM audit;
+}
+expect {
+    2
+}
+
+@setup users_audit
+test trigger-fires-a-trigger-on-the-table-it-writes {
+    CREATE TABLE audit_copy (op text);
+    CREATE FUNCTION log_user() RETURNS trigger LANGUAGE plpgsql AS $$
+    BEGIN
+      INSERT INTO audit (op, user_id) VALUES (TG_OP, NEW.id);
+      RETURN NEW;
+    END;
+    $$;
+    CREATE FUNCTION copy_audit() RETURNS trigger LANGUAGE plpgsql AS $$
+    BEGIN
+      INSERT INTO audit_copy (op) VALUES (NEW.op || '/' || TG_TABLE_NAME);
+      RETURN NEW;
+    END;
+    $$;
+    CREATE TRIGGER log_users AFTER INSERT ON users FOR EACH ROW EXECUTE FUNCTION log_user();
+    CREATE TRIGGER copy_audits AFTER INSERT ON audit FOR EACH ROW EXECUTE FUNCTION copy_audit();
+    INSERT INTO users VALUES (1, 'ann');
+    SELECT op FROM audit_copy;
+}
+expect {
+    INSERT/audit
+}
+
+@setup users_audit
+test drop-trigger-stops-the-trigger {
+    CREATE FUNCTION log_user() RETURNS trigger LANGUAGE plpgsql AS $$
+    BEGIN
+      INSERT INTO audit (op, user_id) VALUES (TG_OP, NEW.id);
+      RETURN NEW;
+    END;
+    $$;
+    CREATE TRIGGER log_users AFTER INSERT OR UPDATE ON users FOR EACH ROW EXECUTE FUNCTION log_user();
+    INSERT INTO users VALUES (1, 'ann');
+    DROP TRIGGER log_users ON users;
+    INSERT INTO users VALUES (2, 'bob');
+    UPDATE users SET name = 'anne' WHERE id = 1;
+    SELECT count(*) FROM audit;
+}
+expect {
+    1
+}
+
+@setup users_audit
+test replacing-the-function-changes-the-trigger {
+    CREATE FUNCTION log_user() RETURNS trigger LANGUAGE plpgsql AS $$
+    BEGIN
+      INSERT INTO audit (op, user_id) VALUES ('first', NEW.id);
+      RETURN NEW;
+    END;
+    $$;
+    CREATE TRIGGER log_users AFTER INSERT ON users FOR EACH ROW EXECUTE FUNCTION log_user();
+    INSERT INTO users VALUES (1, 'ann');
+    CREATE OR REPLACE FUNCTION log_user() RETURNS trigger LANGUAGE plpgsql AS $$
+    BEGIN
+      INSERT INTO audit (op, user_id) VALUES ('second', NEW.id);
+      RETURN NEW;
+    END;
+    $$;
+    INSERT INTO users VALUES (2, 'bob');
+    SELECT op, user_id FROM audit ORDER BY seq;
+}
+expect {
+    first|1
+    second|2
+}
+
+@setup users_audit
+test create-trigger-needs-an-existing-function {
+    CREATE TRIGGER log_users AFTER INSERT ON users FOR EACH ROW EXECUTE FUNCTION nope();
+}
+expect error {
+    function nope\(\) does not exist
+}
+
+@setup users_audit
+test create-trigger-needs-a-trigger-function {
+    CREATE FUNCTION add_one(a int) RETURNS int LANGUAGE sql AS 'SELECT a + 1';
+    CREATE FUNCTION not_a_trigger() RETURNS int LANGUAGE sql AS 'SELECT 1';
+    CREATE TRIGGER log_users AFTER INSERT ON users FOR EACH ROW EXECUTE FUNCTION not_a_trigger();
+}
+expect error {
+    function not_a_trigger must return type trigger
+}
+
+@setup users_audit
+test drop-missing-trigger-is-an-error {
+    DROP TRIGGER nope ON users;
+}
+expect error {
+    nope
+}
+
+@setup users_audit
+test drop-missing-trigger-if-exists-does-nothing {
+    DROP TRIGGER IF EXISTS nope ON users;
+    SELECT 1;
+}
+expect {
+    1
+}
+
+@skip-if postgres "PostgreSQL supports statement-level triggers"
+@setup users_audit
+test statement-level-trigger-is-not-supported {
+    CREATE FUNCTION log_op() RETURNS trigger LANGUAGE plpgsql AS $$
+    BEGIN
+      INSERT INTO audit (op) VALUES (TG_OP);
+      RETURN NULL;
+    END;
+    $$;
+    CREATE TRIGGER log_ops AFTER INSERT ON users FOR EACH STATEMENT EXECUTE FUNCTION log_op();
+}
+expect error {
+    statement-level triggers
+}
+
+@skip-if postgres "PostgreSQL supports IF in PL/pgSQL"
+@setup users_audit
+test unsupported-plpgsql-gives-an-error-when-the-trigger-is-used {
+    CREATE FUNCTION check_user() RETURNS trigger LANGUAGE plpgsql AS $$
+    BEGIN
+      IF NEW.id < 0 THEN
+        RAISE EXCEPTION 'negative id';
+      END IF;
+      RETURN NEW;
+    END;
+    $$;
+    CREATE TRIGGER check_users BEFORE INSERT ON users FOR EACH ROW EXECUTE FUNCTION check_user();
+    INSERT INTO users VALUES (1, 'ann');
+}
+expect error {
+    IF is not supported yet in trigger functions
+}
