@@ -1692,6 +1692,10 @@ mod immutable_record {
         pub fn alloc() -> Self {
             Self(crate::alloc::vec![])
         }
+
+        pub fn capacity(&self) -> usize {
+            self.0.capacity()
+        }
     }
 
     impl ImmutableRecord {
