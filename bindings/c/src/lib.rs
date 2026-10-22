@@ -2304,12 +2304,10 @@ pub unsafe extern "C" fn sqlite3_bind_text(
             return rc;
         }
 
-        if len >= 0 {
-            destructor_guard.disarm();
-            stmt_ref
-                .destructors
-                .push((idx as usize, destructor, text as *mut ffi::c_void));
-        }
+        destructor_guard.disarm();
+        stmt_ref
+            .destructors
+            .push((idx as usize, destructor, text as *mut ffi::c_void));
     }
 
     SQLITE_OK
