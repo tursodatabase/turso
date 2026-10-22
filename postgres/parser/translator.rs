@@ -1893,7 +1893,7 @@ impl PostgreSQLTranslator {
             Option<ast::CompoundOperator>,
             &pg_query::protobuf::SelectStmt,
         )> = Vec::new();
-        Self::flatten_set_operation(select, &mut parts);
+        Self::flatten_set_operation(select, &mut parts)?;
 
         if parts.is_empty() {
             return Err(ParseError::ParseError("Empty set operation".to_string()));
@@ -1935,14 +1935,14 @@ impl PostgreSQLTranslator {
             Option<ast::CompoundOperator>,
             &'a pg_query::protobuf::SelectStmt,
         )>,
-    ) {
+    ) -> Result<(), ParseError> {
         use pg_query::protobuf::SetOperation;
 
         let set_op = stmt.op();
         if set_op == SetOperation::SetopNone || set_op == SetOperation::Undefined {
             // Leaf select
             parts.push((None, stmt));
-            return;
+            return Ok(());
         }
 
         let operator = match (set_op, stmt.all) {
@@ -1950,20 +1950,34 @@ impl PostgreSQLTranslator {
             (SetOperation::SetopUnion, false) => ast::CompoundOperator::Union,
             (SetOperation::SetopIntersect, _) => ast::CompoundOperator::Intersect,
             (SetOperation::SetopExcept, _) => ast::CompoundOperator::Except,
-            _ => return,
+            (other, _) => {
+                return Err(ParseError::ParseError(format!(
+                    "Unsupported set operation: {other:?}"
+                )))
+            }
         };
 
         if let Some(larg) = &stmt.larg {
-            Self::flatten_set_operation(larg, parts);
+            Self::flatten_set_operation(larg, parts)?;
         }
         if let Some(rarg) = &stmt.rarg {
+            // The flattened list is evaluated left to right, which matches the
+            // tree only while it is left-deep. A set operation on the right,
+            // from INTERSECT's higher precedence (`A UNION B INTERSECT C`) or
+            // from parentheses (`A EXCEPT (B UNION C)`), would be regrouped.
+            if !matches!(rarg.op(), SetOperation::SetopNone | SetOperation::Undefined) {
+                return Err(not_supported(
+                    "a set operation nested on the right of another (from parentheses or INTERSECT precedence)",
+                ));
+            }
             // The first element pushed from rarg gets the operator
             let prev_len = parts.len();
-            Self::flatten_set_operation(rarg, parts);
+            Self::flatten_set_operation(rarg, parts)?;
             if parts.len() > prev_len {
                 parts[prev_len].0 = Some(operator);
             }
         }
+        Ok(())
     }
 
     /// Translate a single leaf SELECT (no set operations) into a OneSelect.
@@ -9669,5 +9683,21 @@ mod tests {
         assert_translates("INSERT INTO t (a, b) VALUES (DEFAULT, 5)");
         assert_translates("INSERT INTO t (a, b) VALUES (DEFAULT, 1), (5, 2)");
         assert_translates("INSERT INTO t (a) VALUES (DEFAULT)");
+    }
+
+    #[test]
+    fn fail_closed_right_nested_set_operations() {
+        assert_not_supported(
+            "SELECT 1 UNION SELECT 2 INTERSECT SELECT 3",
+            "nested on the right",
+        );
+        assert_not_supported(
+            "SELECT 1 EXCEPT (SELECT 1 UNION SELECT 2)",
+            "nested on the right",
+        );
+        // Left-deep chains keep their meaning when evaluated left to right.
+        assert_translates("SELECT 1 UNION SELECT 2 UNION ALL SELECT 3 EXCEPT SELECT 4");
+        assert_translates("SELECT 1 INTERSECT SELECT 2 UNION SELECT 3");
+        assert_translates("(SELECT 1 UNION SELECT 2) INTERSECT SELECT 3");
     }
 }
