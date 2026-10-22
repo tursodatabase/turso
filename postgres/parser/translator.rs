@@ -885,11 +885,12 @@ impl PostgreSQLTranslator {
                 if col_def.raw_default.is_some() {
                     return Err(not_supported("ALTER COLUMN TYPE ... USING"));
                 }
-                let col = self.translate_column_def(col_def, &relation.schemaname)?;
-                ast::AlterTableBody::AlterColumn {
-                    old: ast::Name::from_string(&cmd.name),
-                    new: col,
-                }
+                // Validate the new definition so the specific errors above
+                // win, then reject: the engine cannot keep the column's name
+                // through ALTER COLUMN, and it does not convert existing
+                // values to the new type the way PostgreSQL does.
+                self.translate_column_def(col_def, &relation.schemaname)?;
+                return Err(not_supported("ALTER TABLE ... ALTER COLUMN ... TYPE"));
             }
             AlterTableType::AtColumnDefault => {
                 return Err(ParseError::ParseError(
@@ -8856,21 +8857,12 @@ mod tests {
 
     #[test]
     fn test_alter_table_alter_column_type() {
-        let translator = PostgreSQLTranslator::new();
-        let sql = "ALTER TABLE users ALTER COLUMN age TYPE bigint";
-        let parsed = crate::parse(sql).unwrap();
-        let translated = translator.translate(&parsed).unwrap();
-
-        if let ast::Stmt::AlterTable(alter) = translated {
-            assert_eq!(alter.name.name.as_str(), "users");
-            if let ast::AlterTableBody::AlterColumn { old, .. } = &alter.body {
-                assert_eq!(old.as_str(), "age");
-            } else {
-                panic!("Expected AlterColumn, got: {:?}", alter.body);
-            }
-        } else {
-            panic!("Expected AlterTable");
-        }
+        // Translated, this renamed the column to "" (the ColumnDef carries
+        // no name); the engine cannot do a same-name type change yet.
+        assert_not_supported(
+            "ALTER TABLE users ALTER COLUMN age TYPE bigint",
+            "ALTER COLUMN ... TYPE",
+        );
     }
 
     #[test]
@@ -9984,7 +9976,10 @@ mod tests {
             "ALTER TABLE t ALTER COLUMN a TYPE int USING a::int * 10",
             "USING",
         );
-        assert_translates("ALTER TABLE t ALTER COLUMN a TYPE bigint");
+        assert_not_supported(
+            "ALTER TABLE t ALTER COLUMN a TYPE bigint",
+            "ALTER COLUMN ... TYPE",
+        );
     }
 
     #[test]
