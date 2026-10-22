@@ -909,7 +909,15 @@ impl PostgreSQLTranslator {
                     ))),
                     None => None,
                 },
-                _ => None,
+                ConstrType::ConstrNull
+                | ConstrType::ConstrAttrNotDeferrable
+                | ConstrType::ConstrAttrImmediate => None,
+                other => {
+                    return Err(not_supported(format!(
+                        "column constraint {} in ALTER TABLE",
+                        constr_type_name(other)
+                    )))
+                }
             };
             if let Some(c) = constraint_ast {
                 constraints.push(ast::NamedColumnConstraint {
@@ -9009,5 +9017,19 @@ mod tests {
             "GENERATED ALWAYS AS",
         );
         assert_translates("CREATE TABLE t (a int NULL)");
+    }
+
+    #[test]
+    fn fail_closed_alter_table_column_constraint_kinds() {
+        assert_not_supported("ALTER TABLE t ADD COLUMN a int CHECK (a > 0)", "CHECK");
+        assert_not_supported(
+            "ALTER TABLE t ADD COLUMN a int REFERENCES p(id)",
+            "REFERENCES",
+        );
+        assert_not_supported(
+            "ALTER TABLE t ADD COLUMN a int GENERATED ALWAYS AS IDENTITY",
+            "AS IDENTITY",
+        );
+        assert_translates("ALTER TABLE t ADD COLUMN a int NOT NULL DEFAULT 0");
     }
 }
