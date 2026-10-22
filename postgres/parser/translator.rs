@@ -1837,11 +1837,7 @@ impl PostgreSQLTranslator {
 
         let order_by = self.translate_order_by(&select.sort_clause)?;
 
-        let distinctness = if !select.distinct_clause.is_empty() {
-            Some(ast::Distinctness::Distinct)
-        } else {
-            None
-        };
+        let distinctness = translate_distinct_clause(&select.distinct_clause)?;
 
         let group_by = self.translate_group_by(&select.group_clause, &select.having_clause)?;
 
@@ -2012,11 +2008,7 @@ impl PostgreSQLTranslator {
             None
         };
 
-        let distinctness = if !select.distinct_clause.is_empty() {
-            Some(ast::Distinctness::Distinct)
-        } else {
-            None
-        };
+        let distinctness = translate_distinct_clause(&select.distinct_clause)?;
 
         let group_by = self.translate_group_by(&select.group_clause, &select.having_clause)?;
 
@@ -6273,6 +6265,20 @@ fn reject_set_operation_branch_clauses(
     Ok(())
 }
 
+/// Plain DISTINCT is a distinct_clause holding one empty node; DISTINCT ON
+/// lists its expressions instead, and is not supported.
+fn translate_distinct_clause(
+    distinct_clause: &[pg_query::protobuf::Node],
+) -> Result<Option<ast::Distinctness>, ParseError> {
+    if distinct_clause.is_empty() {
+        return Ok(None);
+    }
+    if distinct_clause.iter().any(|n| n.node.is_some()) {
+        return Err(not_supported("SELECT DISTINCT ON"));
+    }
+    Ok(Some(ast::Distinctness::Distinct))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -9443,5 +9449,18 @@ mod tests {
         ] {
             assert_not_supported(sql, "FOR UPDATE");
         }
+    }
+
+    #[test]
+    fn fail_closed_distinct_on() {
+        assert_not_supported(
+            "SELECT DISTINCT ON (a) a, b FROM t ORDER BY a, b",
+            "DISTINCT ON",
+        );
+        assert_not_supported(
+            "SELECT DISTINCT ON (a) a FROM t UNION SELECT 1",
+            "DISTINCT ON",
+        );
+        assert_translates("SELECT DISTINCT a, b FROM t");
     }
 }
