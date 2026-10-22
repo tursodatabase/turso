@@ -2222,6 +2222,11 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
         operator: ast::Operator,
         rhs: ResolvedScopeExpr,
     ) -> Result<ResolvedScopeExpr> {
+        let (lhs, rhs) = if operator.is_comparison() {
+            read_other_side_as_array(lhs, rhs)
+        } else {
+            (lhs, rhs)
+        };
         let custom = self.resolve_custom_binary_operator(operator, &lhs, &rhs)?;
         let type_fact = binary_type_fact(operator, &lhs.type_fact, &rhs.type_fact);
         let array_concat = operator == ast::Operator::Concat
@@ -3790,6 +3795,65 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
             affinity,
         )
     }
+}
+
+/// When one side of a comparison is declared as an array, such as a `text[]`
+/// column, and the other side is not, the other side is read as an array of
+/// the same element type, the way a write to that column reads it: a text
+/// literal is parsed, a record blob is checked. The two sides then compare
+/// as arrays, so `tags = '{z}'` matches the row whose `tags` holds `{z}`,
+/// with or without an index. A NULL literal is left alone, so `IS NULL`
+/// keeps its own plan. Arrays of a custom type encode their elements on
+/// write, which a comparison does not do, so they are left alone too.
+fn read_other_side_as_array(
+    lhs: ResolvedScopeExpr,
+    rhs: ResolvedScopeExpr,
+) -> (ResolvedScopeExpr, ResolvedScopeExpr) {
+    fn declared_array(operand: &ResolvedScopeExpr) -> Option<hir::DeclaredType> {
+        operand
+            .type_fact
+            .declared
+            .as_ref()
+            .filter(|declared| declared.array_dimensions > 0 && declared.custom_chain.is_empty())
+            .cloned()
+    }
+    fn is_plain_scalar(operand: &ResolvedScopeExpr) -> bool {
+        !operand.type_fact.is_array()
+            && !operand.type_fact.array_rank_unbounded
+            && !matches!(operand.expr, hir::Expr::Literal(ast::Literal::Null))
+    }
+    match (declared_array(&lhs), declared_array(&rhs)) {
+        (Some(declared), None) if is_plain_scalar(&rhs) => {
+            let rhs = read_as_array(rhs, &declared);
+            (lhs, rhs)
+        }
+        (None, Some(declared)) if is_plain_scalar(&lhs) => {
+            let lhs = read_as_array(lhs, &declared);
+            (lhs, rhs)
+        }
+        _ => (lhs, rhs),
+    }
+}
+
+/// `value` cast to the array type `declared` names.
+fn read_as_array(value: ResolvedScopeExpr, declared: &hir::DeclaredType) -> ResolvedScopeExpr {
+    let target = builtin_cast_target(
+        &ast::Type {
+            name: declared.name.clone(),
+            size: None,
+            array_dimensions: declared.array_dimensions,
+        },
+        Vec::new(),
+    );
+    let type_fact = target.type_fact.clone();
+    computed_expr(
+        hir::Expr::Cast {
+            expr: Box::new(value.expr),
+            target,
+        },
+        type_fact,
+        value.collation,
+    )
 }
 
 fn builtin_cast_target(syntax: &ast::Type, parameters: Vec<hir::Expr>) -> hir::TypeName {

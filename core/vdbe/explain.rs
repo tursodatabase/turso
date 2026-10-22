@@ -706,10 +706,14 @@ pub fn insn_to_row(
                 0,
                 Value::build_text(""),
                 0,
-                format!(
-                    "{}.{} ({})",
-                    data.table_name, data.col_name, data.element_type
-                ),
+                if data.table_name.is_empty() {
+                    format!("CAST ({}[])", data.element_type)
+                } else {
+                    format!(
+                        "{}.{} ({})",
+                        data.table_name, data.col_name, data.element_type
+                    )
+                },
             ),
             Insn::ArrayDecode { reg } => (
                 "ArrayDecode",

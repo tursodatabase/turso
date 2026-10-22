@@ -1792,7 +1792,9 @@ impl<'expr> ExprLowerer<'_, 'expr, '_> {
             may_fail |= match expression {
                 hir::Expr::Function(_) => true,
                 hir::Expr::Cast { target, .. } => {
-                    !target.programs.encode.is_empty() || target.programs.domain.is_some()
+                    !target.programs.encode.is_empty()
+                        || target.programs.domain.is_some()
+                        || target.array_dimensions > 0
                 }
                 _ => false,
             };
@@ -3051,6 +3053,32 @@ impl ExprLowerer<'_, '_, '_> {
                 return Err(LimboError::InternalError(
                     "HIR built-in CAST contains custom programs".to_string(),
                 ));
+            }
+            if target.array_dimensions > 0 {
+                // A cast to an array type reads the value the way a write to
+                // a column of that type reads it: a text literal is parsed and
+                // each element checked against the element type, a record
+                // blob is checked. The outer array of a multi-dimensional
+                // type checks only that its elements are arrays.
+                let any = target.name.eq_ignore_ascii_case("ANY") || target.array_dimensions > 1;
+                self.program.emit_insn(Insn::ArrayEncode {
+                    data: Box::new(crate::vdbe::insn::ArrayEncodeData {
+                        reg: value,
+                        element_affinity: if any {
+                            crate::vdbe::affinity::Affinity::Blob
+                        } else {
+                            crate::vdbe::affinity::Affinity::affinity(&target.name)
+                        },
+                        element_type: if any {
+                            "ANY".into()
+                        } else {
+                            target.name.to_uppercase().into()
+                        },
+                        table_name: "".into(),
+                        col_name: "".into(),
+                    }),
+                });
+                return Ok(value);
             }
             self.program.emit_insn(Insn::Cast {
                 reg: value,
