@@ -1239,7 +1239,16 @@ impl PostgreSQLTranslator {
         &self,
         truncate: &pg_query::protobuf::TruncateStmt,
     ) -> Result<ast::Stmt, ParseError> {
-        // TRUNCATE TABLE t → DELETE FROM t (first relation only)
+        // TRUNCATE TABLE t → DELETE FROM t
+        if truncate.relations.len() > 1 {
+            return Err(not_supported("TRUNCATE of several tables"));
+        }
+        if truncate.restart_seqs {
+            return Err(not_supported("TRUNCATE ... RESTART IDENTITY"));
+        }
+        if truncate.behavior == pg_query::protobuf::DropBehavior::DropCascade as i32 {
+            return Err(not_supported("TRUNCATE ... CASCADE"));
+        }
         let relation = truncate
             .relations
             .first()
@@ -9138,5 +9147,13 @@ mod tests {
         assert_not_supported("DROP DOMAIN other.d", "schema-qualified type");
         assert_translates("DROP TYPE public.mood");
         assert_translates("DROP TABLE public.t");
+    }
+
+    #[test]
+    fn fail_closed_truncate() {
+        assert_not_supported("TRUNCATE a, b", "several tables");
+        assert_not_supported("TRUNCATE t RESTART IDENTITY", "RESTART IDENTITY");
+        assert_not_supported("TRUNCATE t CASCADE", "CASCADE");
+        assert_translates("TRUNCATE TABLE t CONTINUE IDENTITY RESTRICT");
     }
 }
