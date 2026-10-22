@@ -722,6 +722,36 @@ impl PostgreSQLTranslator {
     ) -> Result<ast::Stmt, ParseError> {
         use pg_query::protobuf::TransactionStmtKind;
 
+        if txn.chain {
+            return Err(not_supported("COMMIT/ROLLBACK AND CHAIN"));
+        }
+        // Isolation levels and DEFERRABLE are accepted: Turso transactions are
+        // serializable, which satisfies every level a client can request.
+        // READ ONLY is a restriction that is not enforced, so it must not be
+        // silently dropped.
+        for opt in &txn.options {
+            let Some(pg_query::protobuf::node::Node::DefElem(def)) = &opt.node else {
+                return Err(not_supported("transaction option"));
+            };
+            match def.defname.as_str() {
+                "transaction_isolation" | "transaction_deferrable" => {}
+                "transaction_read_only" => {
+                    // pg_query encodes READ WRITE as integer 0 and READ ONLY as 1.
+                    let read_write = matches!(
+                        def.arg.as_ref().and_then(|n| n.node.as_ref()),
+                        Some(pg_query::protobuf::node::Node::AConst(pg_query::protobuf::AConst {
+                            val: Some(pg_query::protobuf::a_const::Val::Ival(i)),
+                            ..
+                        })) if i.ival == 0
+                    );
+                    if !read_write {
+                        return Err(not_supported("READ ONLY transactions"));
+                    }
+                }
+                other => return Err(not_supported(format!("transaction option {other}"))),
+            }
+        }
+
         match TransactionStmtKind::try_from(txn.kind) {
             Ok(TransactionStmtKind::TransStmtBegin | TransactionStmtKind::TransStmtStart) => {
                 Ok(ast::Stmt::Begin {
@@ -9325,5 +9355,20 @@ mod tests {
         assert_not_supported("ALTER TABLE IF EXISTS t RENAME COLUMN a TO b", "IF EXISTS");
         assert_translates("ALTER TABLE t RENAME COLUMN a TO b");
         assert_translates("ALTER TABLE t RENAME TO u");
+    }
+
+    #[test]
+    fn fail_closed_transaction_options() {
+        assert_not_supported("BEGIN READ ONLY", "READ ONLY");
+        assert_not_supported(
+            "START TRANSACTION ISOLATION LEVEL SERIALIZABLE, READ ONLY",
+            "READ ONLY",
+        );
+        assert_not_supported("COMMIT AND CHAIN", "AND CHAIN");
+        assert_not_supported("ROLLBACK AND CHAIN", "AND CHAIN");
+        assert_translates("BEGIN ISOLATION LEVEL READ COMMITTED");
+        assert_translates("BEGIN ISOLATION LEVEL SERIALIZABLE, READ WRITE");
+        assert_translates("START TRANSACTION DEFERRABLE");
+        assert_translates("COMMIT AND NO CHAIN");
     }
 }
