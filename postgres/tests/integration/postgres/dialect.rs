@@ -171,6 +171,23 @@ fn test_postgres_prepared_begin_read_only(db: TempDatabase) {
 }
 
 #[turso_macros::test(mvcc)]
+fn test_postgres_read_only_transaction_keeps_query_only_set_before_it(db: TempDatabase) {
+    let conn = db.connect_postgres();
+    conn.execute("CREATE TABLE ro_items (v INTEGER)").unwrap();
+    conn.pragma_update("query_only", 1).unwrap();
+    conn.execute("BEGIN READ ONLY").unwrap();
+    conn.execute("COMMIT").unwrap();
+    conn.execute("SELECT 1").unwrap();
+    assert!(conn.inner().get_query_only());
+    conn.execute("BEGIN").unwrap();
+    conn.execute("SET TRANSACTION READ ONLY").unwrap();
+    conn.execute("SET TRANSACTION READ WRITE").unwrap();
+    assert!(conn.inner().get_query_only());
+    conn.execute("COMMIT").unwrap();
+    assert!(conn.execute("INSERT INTO ro_items VALUES (1)").is_err());
+}
+
+#[turso_macros::test(mvcc)]
 fn test_postgres_set_transaction_read_only_takes_effect_when_run(db: TempDatabase) {
     let conn = db.connect_postgres();
     conn.execute("CREATE TABLE ro_items (v INTEGER)").unwrap();

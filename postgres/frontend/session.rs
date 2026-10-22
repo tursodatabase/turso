@@ -41,6 +41,7 @@ struct TransactionState {
     read_only: bool,
     queried: bool,
     savepoint: bool,
+    query_only_before: bool,
 }
 
 type PgSessionState = Mutex<SessionState>;
@@ -252,15 +253,18 @@ fn reset_transaction_state_outside_transaction(conn: &Connection) {
     }
     let mut state = session_state(conn).lock().unwrap();
     if state.transaction.read_only {
-        conn.set_query_only(false);
+        conn.set_query_only(state.transaction.query_only_before);
     }
     state.transaction = TransactionState::default();
 }
 
 fn set_read_only(conn: &Connection, transaction: &mut TransactionState, read_only: bool) {
     if transaction.read_only != read_only {
+        if read_only {
+            transaction.query_only_before = conn.get_query_only();
+        }
         transaction.read_only = read_only;
-        conn.set_query_only(read_only);
+        conn.set_query_only(read_only || transaction.query_only_before);
     }
 }
 
