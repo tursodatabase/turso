@@ -71,3 +71,30 @@ fn test_create_function_survives_a_reopen(db: TempDatabase) {
         vec![vec![Value::build_text("SELECT 2")]]
     );
 }
+
+#[turso_macros::test(mvcc)]
+fn test_prepared_statement_uses_the_replaced_function_body(db: TempDatabase) {
+    let conn = db.connect_postgres();
+    conn.execute("CREATE FUNCTION stored_v() RETURNS int LANGUAGE sql AS 'SELECT 1'")
+        .unwrap();
+    let mut stmt = conn.prepare("SELECT stored_v()").unwrap();
+    assert_eq!(
+        stmt.run_collect_rows().unwrap(),
+        vec![vec![Value::from_i64(1)]]
+    );
+    stmt.reset().unwrap();
+
+    let other = db.connect_postgres();
+    other
+        .execute("CREATE OR REPLACE FUNCTION stored_v() RETURNS int LANGUAGE sql AS 'SELECT 2'")
+        .unwrap();
+    assert_eq!(
+        stmt.run_collect_rows().unwrap(),
+        vec![vec![Value::from_i64(2)]]
+    );
+    stmt.reset().unwrap();
+
+    other.execute("DROP FUNCTION stored_v()").unwrap();
+    let err = stmt.run_collect_rows().unwrap_err();
+    assert!(err.to_string().contains("stored_v"), "{err}");
+}

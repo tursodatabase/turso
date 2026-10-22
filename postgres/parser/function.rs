@@ -9,7 +9,8 @@ use crate::ParseError;
 use pg_query::protobuf::node::Node;
 use pg_query::protobuf::{self, FunctionParameterMode};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// How much the result of a function can change, from least to most.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Volatility {
     Immutable,
     Stable,
@@ -170,6 +171,67 @@ impl PgFunction {
             .as_deref()
             .is_some_and(|return_type| return_type.eq_ignore_ascii_case("trigger"))
     }
+
+    /// The body as one Turso expression, when this is a SQL function whose
+    /// body is `SELECT expr` or `RETURN expr` with no other clause. The
+    /// parameters are `Expr::Id` names, or `Expr::Variable` for `$1`.
+    pub fn single_expression(&self) -> Result<Option<turso_parser::ast::Expr>, ParseError> {
+        if self.language != "sql" {
+            return Ok(None);
+        }
+        let translator = crate::translator::PostgreSQLTranslator::new();
+        if let Some(sql_body) = &self.sql_body {
+            return match &sql_body.node {
+                Some(Node::ReturnStmt(return_stmt)) => return_stmt
+                    .returnval
+                    .as_deref()
+                    .map(|value| translator.translate_expr(value))
+                    .transpose(),
+                _ => Ok(None),
+            };
+        }
+        let Some(body) = &self.body else {
+            return Ok(None);
+        };
+        let parse_result = crate::parse(body)?;
+        let [statement] = parse_result.protobuf.stmts.as_slice() else {
+            return Ok(None);
+        };
+        let Some(Node::SelectStmt(select)) = statement
+            .stmt
+            .as_deref()
+            .and_then(|stmt| stmt.node.as_ref())
+        else {
+            return Ok(None);
+        };
+        let has_other_clauses = !select.distinct_clause.is_empty()
+            || select.into_clause.is_some()
+            || !select.from_clause.is_empty()
+            || select.where_clause.is_some()
+            || !select.group_clause.is_empty()
+            || select.having_clause.is_some()
+            || !select.window_clause.is_empty()
+            || !select.values_lists.is_empty()
+            || !select.sort_clause.is_empty()
+            || select.limit_offset.is_some()
+            || select.limit_count.is_some()
+            || !select.locking_clause.is_empty()
+            || select.with_clause.is_some()
+            || select.op != protobuf::SetOperation::SetopNone as i32;
+        if has_other_clauses {
+            return Ok(None);
+        }
+        let [target] = select.target_list.as_slice() else {
+            return Ok(None);
+        };
+        let Some(Node::ResTarget(target)) = &target.node else {
+            return Ok(None);
+        };
+        let Some(value) = target.val.as_deref() else {
+            return Ok(None);
+        };
+        Ok(Some(translator.translate_expr(value)?))
+    }
 }
 
 fn def_elem_string(option: &protobuf::DefElem) -> Option<String> {
@@ -278,6 +340,47 @@ mod tests {
         assert_eq!(function.language, "sql");
         assert!(function.body.is_none());
         assert!(function.sql_body.is_some());
+    }
+
+    #[test]
+    fn single_expression_of_a_select_body() {
+        let function = PgFunction::parse(
+            "CREATE FUNCTION add_tax(price numeric) RETURNS numeric LANGUAGE sql \
+             AS 'SELECT price * 1.2'",
+        )
+        .unwrap();
+        assert_eq!(
+            function.single_expression().unwrap().unwrap().to_string(),
+            "price * 1.2"
+        );
+    }
+
+    #[test]
+    fn single_expression_of_a_return_body() {
+        let function = PgFunction::parse("CREATE FUNCTION two() RETURNS int RETURN 1 + 1").unwrap();
+        assert_eq!(
+            function.single_expression().unwrap().unwrap().to_string(),
+            "1 + 1"
+        );
+    }
+
+    #[test]
+    fn no_single_expression_for_other_bodies() {
+        for sql in [
+            "CREATE FUNCTION f() RETURNS int LANGUAGE sql AS 'SELECT count(*) FROM pg_class'",
+            "CREATE FUNCTION f() RETURNS int LANGUAGE sql AS 'SELECT 1; SELECT 2'",
+            "CREATE FUNCTION f() RETURNS int LANGUAGE sql AS 'SELECT 1, 2'",
+            "CREATE FUNCTION f() RETURNS int LANGUAGE sql AS 'SELECT 1 UNION SELECT 2'",
+            "CREATE FUNCTION f() RETURNS int LANGUAGE sql AS 'SELECT 1 LIMIT 1'",
+            "CREATE FUNCTION f() RETURNS int LANGUAGE sql AS 'SELECT DISTINCT 1'",
+            "CREATE FUNCTION f() RETURNS int LANGUAGE sql AS 'VALUES (1)'",
+            "CREATE FUNCTION f() RETURNS int LANGUAGE sql AS 'INSERT INTO t VALUES (1) RETURNING 1'",
+            "CREATE FUNCTION f() RETURNS int LANGUAGE sql BEGIN ATOMIC SELECT 1; END",
+            "CREATE FUNCTION f() RETURNS int LANGUAGE plpgsql AS 'BEGIN RETURN 1; END'",
+        ] {
+            let function = PgFunction::parse(sql).unwrap();
+            assert!(function.single_expression().unwrap().is_none(), "{sql}");
+        }
     }
 
     #[test]

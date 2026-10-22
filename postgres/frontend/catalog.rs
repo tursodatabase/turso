@@ -184,6 +184,15 @@ impl Dialect for PostgresDialect {
         turso_core::dialect::sqlite::resolve_builtin_function(name, arg_count)
     }
 
+    fn expand_function_call(
+        &self,
+        schema: &Schema,
+        name: &str,
+        args: &[turso_parser::ast::Expr],
+    ) -> Result<Option<turso_parser::ast::Expr>> {
+        crate::inline::expand_function_call(schema, name, args)
+    }
+
     fn requires_custom_types(&self) -> bool {
         true
     }

@@ -1,0 +1,158 @@
+# Calls to SQL functions with a body of one expression, which Turso inlines
+# into the calling statement like PostgreSQL does.
+
+@database :memory:
+
+setup inc {
+    CREATE FUNCTION inc(a int) RETURNS int LANGUAGE sql AS 'SELECT a + 1';
+}
+
+@setup inc
+test sql-function-call-in-select {
+    SELECT inc(41);
+}
+expect {
+    42
+}
+
+@setup inc
+test sql-function-call-with-a-column-argument {
+    CREATE TABLE items (price int);
+    INSERT INTO items VALUES (1), (2), (3);
+    SELECT price FROM items WHERE inc(price) > 2 ORDER BY inc(price) DESC;
+}
+expect {
+    3
+    2
+}
+
+@setup inc
+test sql-function-call-in-insert-and-update {
+    CREATE TABLE items (price int);
+    INSERT INTO items VALUES (inc(1));
+    UPDATE items SET price = inc(price);
+    SELECT price FROM items;
+}
+expect {
+    3
+}
+
+@setup inc
+test sql-function-calls-another-sql-function {
+    CREATE FUNCTION inc2(a int) RETURNS int LANGUAGE sql AS 'SELECT inc(inc(a))';
+    SELECT inc2(1), inc(inc2(1));
+}
+expect {
+    3|4
+}
+
+@setup inc
+test sql-function-call-with-a-schema-name {
+    SELECT public.inc(1);
+}
+expect {
+    2
+}
+
+test sql-function-with-a-return-body {
+    CREATE FUNCTION two() RETURNS int RETURN 1 + 1;
+    SELECT two();
+}
+expect {
+    2
+}
+
+test sql-function-with-numbered-parameters {
+    CREATE FUNCTION dbl(int) RETURNS int LANGUAGE sql AS 'SELECT $1 * 2';
+    SELECT dbl(21);
+}
+expect {
+    42
+}
+
+test sql-function-parameter-used-twice {
+    CREATE FUNCTION sq(a int) RETURNS int LANGUAGE sql AS 'SELECT a * a';
+    SELECT sq(7);
+}
+expect {
+    49
+}
+
+test sql-function-with-a-text-result {
+    CREATE FUNCTION greet(who text) RETURNS text LANGUAGE sql AS $$ SELECT 'hello ' || who $$;
+    SELECT greet('world');
+}
+expect {
+    hello world
+}
+
+@setup inc
+test sql-function-is-null-for-a-null-argument {
+    SELECT coalesce(inc(NULL), -1);
+}
+expect {
+    -1
+}
+
+test strict-sql-function-is-null-for-a-null-argument {
+    CREATE FUNCTION add(a int, b int) RETURNS int LANGUAGE sql STRICT AS 'SELECT coalesce(a, 0) + coalesce(b, 0)';
+    SELECT coalesce(add(1, NULL), -1), add(1, 2);
+}
+expect {
+    -1|3
+}
+
+test create-or-replace-changes-the-result-of-a-call {
+    CREATE FUNCTION v() RETURNS int LANGUAGE sql AS 'SELECT 1';
+    SELECT v();
+    CREATE OR REPLACE FUNCTION v() RETURNS int LANGUAGE sql AS 'SELECT 2';
+    SELECT v();
+}
+expect {
+    1
+    2
+}
+
+@setup inc
+test dropped-sql-function-cannot-be-called {
+    DROP FUNCTION inc(int);
+    SELECT inc(1);
+}
+expect error {
+    inc
+}
+
+@skip-if postgres "PostgreSQL executes every SQL function"
+test sql-function-with-from-cannot-be-called {
+    CREATE FUNCTION cnt() RETURNS bigint LANGUAGE sql AS 'SELECT count(*) FROM pg_class';
+    SELECT cnt();
+}
+expect error {
+    function cnt cannot be executed
+}
+
+@skip-if postgres "PostgreSQL executes the function without inlining it"
+test sql-function-parameter-used-twice-with-a-volatile-argument {
+    CREATE FUNCTION sq(a int) RETURNS int LANGUAGE sql AS 'SELECT a * a';
+    SELECT sq(random());
+}
+expect error {
+    used more than once with a volatile argument
+}
+
+@skip-if postgres "PostgreSQL executes the function without inlining it"
+test immutable-sql-function-with-a-volatile-body-cannot-be-called {
+    CREATE FUNCTION r() RETURNS double precision LANGUAGE sql IMMUTABLE AS 'SELECT random()';
+    SELECT r();
+}
+expect error {
+    more volatile than its declaration
+}
+
+test plpgsql-function-cannot-be-called-directly {
+    CREATE FUNCTION trg() RETURNS trigger LANGUAGE plpgsql AS 'BEGIN RETURN NEW; END';
+    SELECT trg();
+}
+expect error {
+    trigger functions can only be called as triggers
+}

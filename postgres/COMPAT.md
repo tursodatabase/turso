@@ -255,7 +255,7 @@ INTEGER. Unknown type names pass through as custom types.
 | Incremental sort for SELECT DISTINCT | ❌ Not supported | |
 | Incremental sort for window functions | ❌ Not supported | |
 | Inlined WITH queries (Common Table Expressions) | ❌ Not supported | |
-| Inlining of SQL functions | ❌ Not supported | |
+| Inlining of SQL functions | 🟡 Partial | A SQL function whose body is one expression without FROM is inlined into the calling statement, with the STRICT null test and a cast to the return type; this is the only way Turso executes a function |
 | Just-in-Time (JIT) compilation for expression evaluation and tuple deforming | ❌ Not supported | |
 | Load balancing for libpq / psql | ❌ Not supported | |
 | LZ4 compression for TOAST tables | ❌ Not supported | |
@@ -453,7 +453,7 @@ Upgrade is not supported.
 | ALTER TABLE / ENABLE REPLICA TRIGGER/RULE | ❌ Not supported | |
 | BEGIN ATOMIC function bodies | ❌ Not supported | |
 | CALL syntax for executing procedures | ❌ Not supported | |
-| CREATE FUNCTION | 🟡 Partial | `CREATE [OR REPLACE] FUNCTION` and `DROP FUNCTION` keep the function in the catalog (`pg_proc`, `pg_language`); functions are resolved by name and number of parameters, so overloads by parameter type are rejected; `SECURITY DEFINER` and `SET` options are accepted and ignored; a call to a function gives an error |
+| CREATE FUNCTION | 🟡 Partial | `CREATE [OR REPLACE] FUNCTION` and `DROP FUNCTION` keep the function in the catalog (`pg_proc`, `pg_language`); functions are resolved by name and number of parameters, so overloads by parameter type are rejected; `SECURITY DEFINER` and `SET` options are accepted and ignored; a call to a SQL function with a body of one expression is inlined (see Inlining of SQL functions); a call to any other function gives an error |
 | Column level triggers | ❌ Not supported | |
 | CREATE PROCEDURE syntax for SQL stored procedures | ❌ Not supported | Rejected with an error |
 | Event triggers | ❌ Not supported | |

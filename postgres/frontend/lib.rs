@@ -1,6 +1,7 @@
 mod catalog;
 mod copy;
 mod functions;
+mod inline;
 mod options;
 mod session;
 mod unnest;

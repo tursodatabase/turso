@@ -2498,7 +2498,10 @@ impl PostgreSQLTranslator {
         Ok(result_columns)
     }
 
-    fn translate_expr(&self, node: &pg_query::protobuf::Node) -> Result<ast::Expr, ParseError> {
+    pub(crate) fn translate_expr(
+        &self,
+        node: &pg_query::protobuf::Node,
+    ) -> Result<ast::Expr, ParseError> {
         match &node.node {
             Some(pg_query::protobuf::node::Node::ColumnRef(col_ref)) => {
                 // Extract column name from fields
@@ -5016,8 +5019,17 @@ fn pg_type_name_to_ast_type(type_name: &pg_query::protobuf::TypeName) -> Option<
     if parts.is_empty() {
         return None;
     }
-    let pg_type = parts.join(" ");
+    Some(cast_type_for_pg_type(
+        &parts.join(" "),
+        type_name.array_bounds.len() as u32,
+    ))
+}
 
+/// The Turso type of a CAST to the PostgreSQL type `pg_type`, such as `int4`
+/// or `numeric`. Maps PG types to their base SQLite storage types. Other
+/// names are kept as written so that enums and domains resolve to their
+/// custom type.
+pub fn cast_type_for_pg_type(pg_type: &str, array_dimensions: u32) -> ast::Type {
     let name = match pg_type.to_uppercase().as_str() {
         "INTEGER" | "INT" | "INT4" | "SMALLINT" | "INT2" | "BIGINT" | "INT8" | "SERIAL"
         | "BIGSERIAL" | "SMALLSERIAL" | "OID" | "REGCLASS" | "REGTYPE" => "INTEGER",
@@ -5036,14 +5048,14 @@ fn pg_type_name_to_ast_type(type_name: &pg_query::protobuf::TypeName) -> Option<
             "TEXT"
         }
         "BYTEA" | "BLOB" => "BLOB",
-        _ => &pg_type,
+        _ => pg_type,
     };
 
-    Some(ast::Type {
+    ast::Type {
         name: name.to_string(),
         size: None,
-        array_dimensions: type_name.array_bounds.len() as u32,
-    })
+        array_dimensions,
+    }
 }
 
 pub(crate) fn extract_type_name_from_typename(
