@@ -3822,3 +3822,29 @@ fn test_postgres_prepared_statement_follows_search_path_changes(db: TempDatabase
         vec![vec![Value::build_text("from public")]]
     );
 }
+
+#[turso_macros::test(mvcc)]
+fn test_postgres_unnamed_index_keeps_its_name_after_reprepare(db: TempDatabase) {
+    let conn = db.connect_postgres();
+    conn.execute("CREATE TABLE t (a int, b int)").unwrap();
+
+    let mut first = conn.prepare("CREATE INDEX ON t (a)").unwrap();
+    let mut second = conn.prepare("CREATE INDEX ON t (b)").unwrap();
+    first.run_ignore_rows().unwrap();
+    second.run_ignore_rows().unwrap();
+    assert_eq!(
+        second.stmt_status(turso_core::StatementStatusCounter::Reprepare),
+        1
+    );
+
+    let mut names = conn
+        .prepare("SELECT indexname FROM pg_indexes WHERE tablename = 't' ORDER BY indexname")
+        .unwrap();
+    assert_eq!(
+        names.run_collect_rows().unwrap(),
+        vec![
+            vec![Value::build_text("t_a_idx")],
+            vec![Value::build_text("t_b_idx")],
+        ]
+    );
+}
