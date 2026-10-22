@@ -1305,6 +1305,9 @@ impl PostgreSQLTranslator {
             return Err(not_supported("CREATE OR REPLACE VIEW"));
         }
         reject_temporary(relation, "CREATE TEMPORARY VIEW")?;
+        if relation.relpersistence == "u" {
+            return Err(not_supported("CREATE UNLOGGED VIEW"));
+        }
         if !view.options.is_empty() {
             return Err(not_supported("CREATE VIEW ... WITH (options)"));
         }
@@ -1344,6 +1347,26 @@ impl PostgreSQLTranslator {
             }
         };
         let select = self.translate_select(select_stmt)?;
+        // The engine requires the column list to name every select-list
+        // column, and cannot count the columns of a *.
+        if !columns.is_empty() {
+            let ast::OneSelect::Select {
+                columns: result_columns,
+                ..
+            } = &select.body.select
+            else {
+                return Err(not_supported("a column list on a VALUES view"));
+            };
+            if result_columns
+                .iter()
+                .any(|c| !matches!(c, ast::ResultColumn::Expr(..)))
+                || result_columns.len() != columns.len()
+            {
+                return Err(not_supported(
+                    "a view column list that does not name every select-list column",
+                ));
+            }
+        }
 
         Ok(ast::Stmt::CreateView {
             temporary: false,
@@ -10015,6 +10038,20 @@ mod tests {
             "CREATE OR REPLACE VIEW v AS SELECT 1",
             "CREATE OR REPLACE VIEW",
         );
+    }
+
+    #[test]
+    fn fail_closed_view_column_list() {
+        assert_not_supported("CREATE UNLOGGED VIEW v AS SELECT 1", "UNLOGGED VIEW");
+        for sql in [
+            "CREATE VIEW v (p, q, r) AS SELECT a, b FROM t",
+            "CREATE VIEW v (p) AS SELECT a, b FROM t",
+            "CREATE VIEW v (p, q) AS SELECT * FROM t",
+        ] {
+            assert_not_supported(sql, "view column list");
+        }
+        assert_translates("CREATE VIEW v (p, q) AS SELECT a, b FROM t");
+        assert_translates("CREATE VIEW v AS SELECT * FROM t");
     }
 
     #[test]
