@@ -315,3 +315,52 @@ test table-returning-table-name-star-after-alias-rejected {
     INSERT INTO users AS u VALUES (4, 'dave', 40, false) RETURNING users.*;
 }
 expect error {}
+
+setup conflict_expr_table {
+    CREATE TABLE ce (a text, b int);
+    CREATE UNIQUE INDEX ce_lower_a ON ce ((lower(a)));
+    INSERT INTO ce VALUES ('Foo', 1);
+}
+
+@setup conflict_expr_table
+test table-on-conflict-expression-target-do-nothing {
+    INSERT INTO ce VALUES ('FOO', 2) ON CONFLICT ((lower(a))) DO NOTHING;
+    INSERT INTO ce VALUES ('bar', 3) ON CONFLICT ((lower(a))) DO NOTHING;
+    SELECT a, b FROM ce ORDER BY b;
+}
+expect {
+    Foo|1
+    bar|3
+}
+
+@setup conflict_expr_table
+test table-on-conflict-expression-target-do-update {
+    INSERT INTO ce VALUES ('fOO', 4) ON CONFLICT ((lower(a))) DO UPDATE SET b = excluded.b;
+    SELECT a, b FROM ce ORDER BY b;
+}
+expect {
+    Foo|4
+}
+
+setup conflict_expr_multi_table {
+    CREATE TABLE cm (a text, b int);
+    CREATE UNIQUE INDEX cm_lower_a_b ON cm ((lower(a)), b);
+    INSERT INTO cm VALUES ('Foo', 1);
+}
+
+@setup conflict_expr_multi_table
+test table-on-conflict-expression-and-column-target {
+    INSERT INTO cm VALUES ('FOO', 1) ON CONFLICT ((lower(a)), b) DO NOTHING;
+    INSERT INTO cm VALUES ('FOO', 2) ON CONFLICT ((lower(a)), b) DO NOTHING;
+    SELECT a, b FROM cm ORDER BY b;
+}
+expect {
+    Foo|1
+    FOO|2
+}
+
+@setup conflict_expr_table
+test table-on-conflict-expression-target-without-index-rejected {
+    INSERT INTO ce VALUES ('x', 1) ON CONFLICT ((upper(a))) DO NOTHING;
+}
+expect error {}

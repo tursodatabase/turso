@@ -1118,10 +1118,7 @@ impl PostgreSQLTranslator {
         }
         let idx_name = ast::QualifiedName::single(ast::Name::from_string(&idx.idxname));
 
-        self.translating_index.set(true);
-        let index_parts = self.translate_index_parts(idx);
-        self.translating_index.set(false);
-        let (columns, where_clause) = index_parts?;
+        let (columns, where_clause) = self.in_index_mode(|| self.translate_index_parts(idx))?;
 
         Ok(ast::Stmt::CreateIndex {
             unique: idx.unique,
@@ -1133,6 +1130,15 @@ impl PostgreSQLTranslator {
             with_clause: vec![],
             where_clause,
         })
+    }
+
+    /// Runs `f` with expressions translated the way an index stores them, so
+    /// that an ON CONFLICT target matches the index it infers.
+    fn in_index_mode<T>(&self, f: impl FnOnce() -> T) -> T {
+        self.translating_index.set(true);
+        let result = f();
+        self.translating_index.set(false);
+        result
     }
 
     fn translate_index_parts(
@@ -4661,34 +4667,42 @@ impl PostgreSQLTranslator {
                 return Err(not_supported("ON CONFLICT ON CONSTRAINT"));
             }
             if !infer.index_elems.is_empty() {
-                let targets: Vec<ast::SortedColumn> = infer
-                    .index_elems
-                    .iter()
-                    .map(|elem| match &elem.node {
-                        Some(Node::IndexElem(idx_elem)) => {
-                            reject_index_elem_clauses(idx_elem, "an ON CONFLICT target")?;
-                            if idx_elem.name.is_empty() {
-                                return Err(not_supported("expressions in an ON CONFLICT target"));
+                let (targets, where_clause) = self.in_index_mode(|| {
+                    let targets: Vec<ast::SortedColumn> = infer
+                        .index_elems
+                        .iter()
+                        .map(|elem| match &elem.node {
+                            Some(Node::IndexElem(idx_elem)) => {
+                                reject_index_elem_clauses(idx_elem, "an ON CONFLICT target")?;
+                                let expr = if !idx_elem.name.is_empty() {
+                                    Box::new(ast::Expr::Id(ast::Name::from_string(&idx_elem.name)))
+                                } else if let Some(expr_node) = &idx_elem.expr {
+                                    Box::new(self.translate_expr(expr_node)?)
+                                } else {
+                                    return Err(ParseError::ParseError(
+                                        "ON CONFLICT: conflict target has no name or expression"
+                                            .into(),
+                                    ));
+                                };
+                                Ok(ast::SortedColumn {
+                                    expr,
+                                    order: None,
+                                    nulls: None,
+                                })
                             }
-                            Ok(ast::SortedColumn {
-                                expr: Box::new(ast::Expr::Id(ast::Name::from_string(
-                                    &idx_elem.name,
-                                ))),
-                                order: None,
-                                nulls: None,
-                            })
-                        }
-                        _ => Err(ParseError::ParseError(
-                            "ON CONFLICT: unexpected conflict target".into(),
-                        )),
-                    })
-                    .collect::<Result<_, _>>()?;
+                            _ => Err(ParseError::ParseError(
+                                "ON CONFLICT: unexpected conflict target".into(),
+                            )),
+                        })
+                        .collect::<Result<_, ParseError>>()?;
 
-                let where_clause = if let Some(wc) = &infer.where_clause {
-                    Some(Box::new(self.translate_expr(wc)?))
-                } else {
-                    None
-                };
+                    let where_clause = if let Some(wc) = &infer.where_clause {
+                        Some(Box::new(self.translate_expr(wc)?))
+                    } else {
+                        None
+                    };
+                    Ok::<_, ParseError>((targets, where_clause))
+                })?;
 
                 Some(ast::UpsertIndex {
                     targets,
@@ -10239,9 +10253,9 @@ mod tests {
 
     #[test]
     fn fail_closed_on_conflict_targets() {
-        assert_not_supported(
-            "INSERT INTO t VALUES ('a') ON CONFLICT ((lower(a))) DO NOTHING",
-            "expressions in an ON CONFLICT target",
+        assert_translates("INSERT INTO t VALUES ('a') ON CONFLICT ((lower(a))) DO NOTHING");
+        assert_translates(
+            "INSERT INTO t VALUES ('a', 'b') ON CONFLICT ((lower(a)), b) DO UPDATE SET b = 'c'",
         );
         assert_not_supported(
             "INSERT INTO t VALUES ('a') ON CONFLICT (a COLLATE \"en_US\") DO NOTHING",
