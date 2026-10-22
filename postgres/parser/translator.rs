@@ -1068,6 +1068,9 @@ impl PostgreSQLTranslator {
                 idx.access_method
             )));
         }
+        if !idx.index_including_params.is_empty() {
+            return Err(not_supported("CREATE INDEX ... INCLUDE"));
+        }
         let idx_name = ast::QualifiedName::single(ast::Name::from_string(&idx.idxname));
 
         self.translating_index.set(true);
@@ -9052,5 +9055,10 @@ mod tests {
         assert_not_supported("CREATE INDEX i ON t USING gin (a)", "USING gin");
         assert_not_supported("CREATE INDEX i ON t USING hash (a)", "USING hash");
         assert_translates("CREATE INDEX i ON t USING btree (a)");
+    }
+
+    #[test]
+    fn fail_closed_index_include() {
+        assert_not_supported("CREATE INDEX i ON t (a) INCLUDE (b)", "INCLUDE");
     }
 }
