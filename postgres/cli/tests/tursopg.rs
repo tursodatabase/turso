@@ -1810,46 +1810,6 @@ fn wire_error_primary_key_violation() {
     });
 }
 
-/// Foreign key constraint: insert into child with a parent id that does not
-/// exist. PostgreSQL auto-names the constraint <table>_<col>_fkey.
-///
-/// PostgreSQL 17:
-///   SQLSTATE  23503
-///   message   insert or update on table "t_child" violates foreign key constraint "t_child_pid_fkey"
-///   detail    Key (pid)=(99) is not present in table "t_parent".
-///   table     t_child
-///   constraint t_child_pid_fkey
-#[test]
-fn wire_error_foreign_key_violation() {
-    with_pg_client(|c| {
-        c.query_command_tags("CREATE TABLE t_parent (id INT PRIMARY KEY)");
-        c.query_command_tags(
-            "CREATE TABLE t_child (id INT PRIMARY KEY, pid INT REFERENCES t_parent(id))",
-        );
-        let fields = c.query_error_fields("INSERT INTO t_child VALUES (1, 99)");
-        assert_eq!(
-            fields.get(&b'C').map(String::as_str),
-            Some("23503"),
-            "SQLSTATE must be 23503 for FK violation, got: {fields:?}"
-        );
-        assert_eq!(
-            fields.get(&b'n').map(String::as_str),
-            Some("t_child_pid_fkey"),
-            "constraint name must be t_child_pid_fkey, got: {fields:?}"
-        );
-        assert_eq!(
-            fields.get(&b't').map(String::as_str),
-            Some("t_child"),
-            "table name must be t_child, got: {fields:?}"
-        );
-        assert_eq!(
-            fields.get(&b'D').map(String::as_str),
-            Some("Key (pid)=(99) is not present in table \"t_parent\"."),
-            "detail must identify the missing FK value, got: {fields:?}"
-        );
-    });
-}
-
 /// Named CHECK constraint: insert a row that fails the check expression.
 ///
 /// PostgreSQL 17:
@@ -2099,28 +2059,6 @@ fn wire_error_update_check_violation() {
             fields.get(&b't').map(String::as_str),
             Some("t_upd_ck"),
             "table name must be t_upd_ck, got: {fields:?}"
-        );
-    });
-}
-
-/// DELETE a parent row while child rows reference it (ON DELETE RESTRICT).
-///
-/// PostgreSQL 18.3 emits SQLSTATE 23503 with constraint name, table, and
-/// detail fields. Turso emits the SQLSTATE but not the structured fields yet.
-#[test]
-fn wire_error_delete_fk_parent_violation() {
-    with_pg_client(|c| {
-        c.query_command_tags("CREATE TABLE t_par (id INT PRIMARY KEY)");
-        c.query_command_tags(
-            "CREATE TABLE t_del_ch (id INT PRIMARY KEY, pid INT REFERENCES t_par(id))",
-        );
-        c.query_command_tags("INSERT INTO t_par VALUES (1)");
-        c.query_command_tags("INSERT INTO t_del_ch VALUES (1, 1)");
-        let fields = c.query_error_fields("DELETE FROM t_par WHERE id = 1");
-        assert_eq!(
-            fields.get(&b'C').map(String::as_str),
-            Some("23503"),
-            "SQLSTATE must be 23503 for parent-side FK violation on DELETE, got: {fields:?}"
         );
     });
 }

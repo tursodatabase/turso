@@ -331,7 +331,6 @@ impl PostgreSQLTranslator {
             }
         }
 
-
         // Check for table-level PK (to suppress column-level PK emission)
         let mut has_table_pk = false;
         for elt in &create.table_elts {
