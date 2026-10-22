@@ -356,3 +356,14 @@ test fk-self-referencing-drop-and-delete {
 expect {
     0
 }
+
+test fk-self-referencing-update-key-and-reference {
+    CREATE TABLE fku_t (id int PRIMARY KEY, parent int REFERENCES fku_t (id));
+    INSERT INTO fku_t VALUES (1, NULL), (2, 1);
+    UPDATE fku_t SET id = id + 10, parent = parent + 10;
+    SELECT id, CASE WHEN parent IS NULL THEN 0 ELSE parent END FROM fku_t ORDER BY id;
+}
+expect {
+    11|0
+    12|11
+}

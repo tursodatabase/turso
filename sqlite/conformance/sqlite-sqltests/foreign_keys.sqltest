@@ -4714,3 +4714,16 @@ test fk-cascade-delete-keeps-grandchild-violation {
 }
 expect error {
 }
+
+@cross-check-integrity
+test fk-self-ref-update-key-and-reference-in-one-statement {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE t (id INTEGER PRIMARY KEY, parent INTEGER REFERENCES t(id));
+    INSERT INTO t VALUES (1, NULL), (2, 1);
+    UPDATE t SET id = id + 10, parent = parent + 10;
+    SELECT id, parent FROM t ORDER BY id;
+}
+expect {
+    11|
+    12|11
+}
