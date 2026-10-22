@@ -66,6 +66,34 @@ tx.commit().await?;
 # }
 ```
 
+## TLS crypto providers
+
+The default `tls-aws-lc` feature uses AWS-LC, preserving the driver's existing
+TLS configuration. To use Ring without enabling AWS-LC through this driver:
+
+```toml
+turso_serverless = { version = "0.1.3", default-features = false, features = ["tls-ring"] }
+```
+
+`tls-ring` enables Ring support. Install it once at application startup, before
+creating a connection (add `rustls = { version = "0.23", default-features = false,
+features = ["ring", "std", "tls12"] }` to your application's dependencies):
+
+```rust
+rustls::crypto::ring::default_provider()
+    .install_default()
+    .expect("crypto provider must be installed before creating a connection");
+```
+
+Reqwest uses the installed provider and configures platform certificate
+verification. If both provider features are enabled, the installed provider
+takes precedence; otherwise Reqwest falls back to AWS-LC when enabled. Other
+dependencies can still enable AWS-LC through Cargo feature unification.
+
+With both provider features disabled, the application must install a Rustls
+crypto provider before creating a connection. HTTP/2 and system proxy support
+remain enabled in all configurations.
+
 ## Conformance tests
 
 The [`conformance`](https://github.com/tursodatabase/turso/tree/main/serverless/rust/conformance)
