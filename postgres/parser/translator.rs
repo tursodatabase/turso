@@ -908,6 +908,11 @@ impl PostgreSQLTranslator {
         reject_column_def_clauses(col_def)?;
 
         let pg_type = extract_type_name(col_def)?;
+        // Serial columns need the implicit sequence that only CREATE TABLE
+        // generates.
+        if is_serial_type(&pg_type) {
+            return Err(not_supported(format!("{pg_type} in ALTER TABLE")));
+        }
         let typmods = extract_integer_typmods(col_def)?;
         let mapping = map_column_type(&pg_type, &typmods)?;
         let size = match mapping.type_params.as_slice() {
@@ -9206,5 +9211,17 @@ mod tests {
         // char(n) arrives as bpchar, which maps to unbounded TEXT.
         assert_not_supported("CREATE TABLE t (a char(2))", "type modifiers on bpchar");
         assert_translates("CREATE TABLE t (a varchar(3), b numeric(10, 2), c text, d int[])");
+    }
+
+    #[test]
+    fn fail_closed_add_column_serial() {
+        assert_not_supported(
+            "ALTER TABLE t ADD COLUMN id serial",
+            "serial in ALTER TABLE",
+        );
+        assert_not_supported(
+            "ALTER TABLE t ALTER COLUMN id TYPE bigserial",
+            "bigserial in ALTER TABLE",
+        );
     }
 }
