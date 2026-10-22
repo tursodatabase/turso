@@ -299,6 +299,29 @@ pub(crate) fn set_plpgsql_value(conn: &Connection, key: &str, value: Value) {
         .insert(key.to_string(), value);
 }
 
+/// `__pl_set_one(key, value)`: keep the value of the one row that
+/// `RETURNING ... INTO` expects. The rows of the statement are counted in
+/// the key with the suffix `.rows`, which the compiler sets to 0 before the
+/// statement, so a second row is an error.
+pub(crate) fn set_plpgsql_value_once(conn: &Connection, key: &str, value: Value) -> Result<()> {
+    let mut state = session_state(conn).lock().unwrap();
+    let rows_key = format!("{key}.rows");
+    let rows = state
+        .plpgsql_values
+        .get(&rows_key)
+        .and_then(Value::as_int)
+        .unwrap_or(0)
+        + 1;
+    if rows > 1 {
+        return Err(LimboError::InvalidArgument(
+            "query returned more than one row".to_string(),
+        ));
+    }
+    state.plpgsql_values.insert(rows_key, Value::from_i64(rows));
+    state.plpgsql_values.insert(key.to_string(), value);
+    Ok(())
+}
+
 /// `__pl_get(key)`: the value of a PL/pgSQL variable, NULL when nothing set
 /// it.
 pub(crate) fn plpgsql_value(conn: &Connection, key: &str) -> Value {

@@ -1,0 +1,261 @@
+# Variables of PL/pgSQL trigger functions: DECLARE, assignment, SELECT INTO,
+# RETURNING INTO and FOUND. Turso keeps each variable in the connection with
+# the native functions __pl_set and __pl_get.
+
+@database :memory:
+
+setup shop {
+    CREATE TABLE products (id int PRIMARY KEY, name text, price int);
+    CREATE TABLE orders (id int PRIMARY KEY, product_id int, qty int, total int, note text);
+    CREATE TABLE audit (seq serial, event text);
+}
+
+@setup shop
+test declared-variables-have-defaults-and-get-assigned {
+    CREATE FUNCTION price_order() RETURNS trigger LANGUAGE plpgsql AS $$
+    DECLARE
+      unit int := 10;
+      label text;
+    BEGIN
+      unit := unit * NEW.qty;
+      label := 'order ' || NEW.id || ' costs ' || unit;
+      NEW.total := unit;
+      INSERT INTO audit (event) VALUES (label);
+      RETURN NEW;
+    END;
+    $$;
+    CREATE TRIGGER price_orders BEFORE INSERT ON orders FOR EACH ROW EXECUTE FUNCTION price_order();
+    INSERT INTO orders (id, product_id, qty) VALUES (1, 1, 3), (2, 1, 5);
+    SELECT id, total FROM orders ORDER BY id;
+    SELECT event FROM audit ORDER BY seq;
+}
+expect {
+    1|30
+    2|50
+    order 1 costs 30
+    order 2 costs 50
+}
+
+@setup shop
+test select-into-reads-one-row-and-sets-found {
+    CREATE FUNCTION price_order() RETURNS trigger LANGUAGE plpgsql AS $$
+    DECLARE
+      unit int;
+      product_name text;
+    BEGIN
+      SELECT price, name INTO unit, product_name FROM products WHERE id = NEW.product_id;
+      IF NOT FOUND THEN
+        RAISE EXCEPTION 'no product %', NEW.product_id;
+      END IF;
+      NEW.total := unit * NEW.qty;
+      NEW.note := product_name;
+      RETURN NEW;
+    END;
+    $$;
+    CREATE TRIGGER price_orders BEFORE INSERT ON orders FOR EACH ROW EXECUTE FUNCTION price_order();
+    INSERT INTO products VALUES (1, 'pen', 2), (2, 'book', 15);
+    INSERT INTO orders (id, product_id, qty) VALUES (1, 2, 3), (2, 1, 4);
+    SELECT id, total, note FROM orders ORDER BY id;
+}
+expect {
+    1|45|book
+    2|8|pen
+}
+
+@setup shop
+test select-into-without-a-row-leaves-found-false {
+    CREATE FUNCTION price_order() RETURNS trigger LANGUAGE plpgsql AS $$
+    DECLARE
+      unit int;
+    BEGIN
+      SELECT price INTO unit FROM products WHERE id = NEW.product_id;
+      IF NOT FOUND THEN
+        RAISE EXCEPTION 'no product %', NEW.product_id;
+      END IF;
+      RETURN NEW;
+    END;
+    $$;
+    CREATE TRIGGER price_orders BEFORE INSERT ON orders FOR EACH ROW EXECUTE FUNCTION price_order();
+    INSERT INTO products VALUES (1, 'pen', 2);
+    INSERT INTO orders (id, product_id, qty) VALUES (1, 1, 3);
+    INSERT INTO orders (id, product_id, qty) VALUES (3, 9, 1);
+}
+expect error {
+    no product 9
+}
+
+@setup shop
+test select-into-without-a-row-gives-null {
+    CREATE FUNCTION note_order() RETURNS trigger LANGUAGE plpgsql AS $$
+    DECLARE
+      product_name text := 'unset';
+    BEGIN
+      SELECT name INTO product_name FROM products WHERE id = NEW.product_id;
+      IF FOUND THEN
+        NEW.note := 'found ' || product_name;
+      ELSE
+        NEW.note := coalesce(product_name, 'null');
+      END IF;
+      RETURN NEW;
+    END;
+    $$;
+    CREATE TRIGGER note_orders BEFORE INSERT ON orders FOR EACH ROW EXECUTE FUNCTION note_order();
+    INSERT INTO products VALUES (1, 'pen', 2);
+    INSERT INTO orders (id, product_id, qty) VALUES (1, 1, 1), (2, 7, 1);
+    SELECT id, note FROM orders ORDER BY id;
+}
+expect {
+    1|found pen
+    2|null
+}
+
+@setup shop
+test select-count-into-a-variable {
+    CREATE FUNCTION count_orders() RETURNS trigger LANGUAGE plpgsql AS $$
+    DECLARE
+      n int;
+    BEGIN
+      SELECT count(*) INTO n FROM orders WHERE product_id = NEW.product_id;
+      NEW.note := 'order ' || (n + 1) || ' of product';
+      RETURN NEW;
+    END;
+    $$;
+    CREATE TRIGGER count_orders_trg BEFORE INSERT ON orders FOR EACH ROW EXECUTE FUNCTION count_orders();
+    INSERT INTO orders (id, product_id, qty) VALUES (1, 1, 1), (2, 1, 1), (3, 2, 1);
+    SELECT id, note FROM orders ORDER BY id;
+}
+expect {
+    1|order 1 of product
+    2|order 2 of product
+    3|order 1 of product
+}
+
+@setup shop
+test returning-into-reads-the-inserted-row {
+    CREATE FUNCTION audit_order() RETURNS trigger LANGUAGE plpgsql AS $$
+    DECLARE
+      audit_id int;
+    BEGIN
+      INSERT INTO audit (event) VALUES ('order ' || NEW.id) RETURNING seq INTO audit_id;
+      NEW.note := 'audit ' || audit_id;
+      RETURN NEW;
+    END;
+    $$;
+    CREATE TRIGGER audit_orders BEFORE INSERT ON orders FOR EACH ROW EXECUTE FUNCTION audit_order();
+    INSERT INTO orders (id, product_id, qty) VALUES (1, 1, 1), (2, 1, 1);
+    SELECT id, note FROM orders ORDER BY id;
+}
+expect {
+    1|audit 1
+    2|audit 2
+}
+
+@setup shop
+test returning-into-with-two-rows-is-an-error {
+    CREATE FUNCTION audit_order() RETURNS trigger LANGUAGE plpgsql AS $$
+    DECLARE
+      audit_id int;
+    BEGIN
+      INSERT INTO audit (event) VALUES ('a'), ('b') RETURNING seq INTO audit_id;
+      RETURN NEW;
+    END;
+    $$;
+    CREATE TRIGGER audit_orders BEFORE INSERT ON orders FOR EACH ROW EXECUTE FUNCTION audit_order();
+    INSERT INTO orders (id, product_id, qty) VALUES (1, 1, 1);
+}
+expect error {
+    query returned more than one row
+}
+
+@skip-if postgres "PostgreSQL supports RETURNING INTO with UPDATE"
+@setup shop
+test returning-into-with-update-is-not-supported {
+    CREATE FUNCTION audit_order() RETURNS trigger LANGUAGE plpgsql AS $$
+    DECLARE
+      audit_id int;
+    BEGIN
+      UPDATE audit SET event = event || '!' RETURNING seq INTO audit_id;
+      RETURN NEW;
+    END;
+    $$;
+    CREATE TRIGGER audit_orders BEFORE INSERT ON orders FOR EACH ROW EXECUTE FUNCTION audit_order();
+    INSERT INTO orders (id, product_id, qty) VALUES (1, 1, 1);
+}
+expect error {
+    RETURNING INTO with UPDATE or DELETE is not supported yet
+}
+
+@setup shop
+test a-name-that-is-a-column-and-a-variable-is-an-error {
+    CREATE FUNCTION find_product() RETURNS trigger LANGUAGE plpgsql AS $$
+    DECLARE
+      id int := NEW.product_id;
+    BEGIN
+      SELECT name INTO NEW.note FROM products WHERE products.id = id;
+      RETURN NEW;
+    END;
+    $$;
+    CREATE TRIGGER find_products BEFORE INSERT ON orders FOR EACH ROW EXECUTE FUNCTION find_product();
+    INSERT INTO products VALUES (1, 'pen', 2);
+    INSERT INTO orders (id, product_id, qty) VALUES (1, 1, 1);
+}
+expect error {
+    column reference "id" is ambiguous
+}
+
+@setup shop
+test a-variable-default-reads-the-row {
+    CREATE FUNCTION total_order() RETURNS trigger LANGUAGE plpgsql AS $$
+    DECLARE
+      amount int := NEW.qty * 2;
+    BEGIN
+      IF amount > 5 THEN
+        NEW.note := 'big ' || amount;
+      END IF;
+      NEW.total := amount;
+      RETURN NEW;
+    END;
+    $$;
+    CREATE TRIGGER total_orders BEFORE INSERT ON orders FOR EACH ROW EXECUTE FUNCTION total_order();
+    INSERT INTO orders (id, product_id, qty) VALUES (1, 1, 1), (2, 1, 4);
+    SELECT id, total, note FROM orders ORDER BY id;
+}
+expect {
+    1|2|
+    2|8|big 8
+}
+
+@skip-if postgres "PostgreSQL supports %TYPE"
+@setup shop
+test a-variable-with-a-column-type-is-not-supported {
+    CREATE FUNCTION typed() RETURNS trigger LANGUAGE plpgsql AS $$
+    DECLARE
+      unit products.price%TYPE;
+    BEGIN
+      RETURN NEW;
+    END;
+    $$;
+    CREATE TRIGGER typed_orders BEFORE INSERT ON orders FOR EACH ROW EXECUTE FUNCTION typed();
+    INSERT INTO orders (id, product_id, qty) VALUES (1, 1, 1);
+}
+expect error {
+    the type products.price%TYPE of the variable unit is not supported
+}
+
+@skip-if postgres "PostgreSQL supports SELECT INTO STRICT"
+@setup shop
+test select-into-strict-is-not-supported {
+    CREATE FUNCTION strict_price() RETURNS trigger LANGUAGE plpgsql AS $$
+    DECLARE
+      unit int;
+    BEGIN
+      SELECT price INTO STRICT unit FROM products WHERE id = NEW.product_id;
+      RETURN NEW;
+    END;
+    $$;
+    CREATE TRIGGER strict_orders BEFORE INSERT ON orders FOR EACH ROW EXECUTE FUNCTION strict_price();
+    INSERT INTO orders (id, product_id, qty) VALUES (1, 1, 1);
+}
+expect error {
+    SELECT INTO STRICT is not supported yet
+}

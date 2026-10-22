@@ -35,6 +35,7 @@ macro_rules! scalar_functions {
             fn name(&self) -> &str {
                 match self {
                     Self::PlSet => "__pl_set",
+                    Self::PlSetOne => "__pl_set_one",
                     Self::PlGet => "__pl_get",
                     _ => self.as_ref(),
                 }
@@ -88,6 +89,7 @@ scalar_functions! {
     Now | TransactionTimestamp | StatementTimestamp(FunctionArity::Variadic, false),
     ClockTimestamp(FunctionArity::Exact(0), false),
     PlSet(FunctionArity::Exact(2), false),
+    PlSetOne(FunctionArity::Exact(2), false),
     PlGet(FunctionArity::Exact(1), false),
 }
 
@@ -157,6 +159,15 @@ impl ScalarCall for PgScalarFunction {
             Self::PlSet => {
                 let value = args[1].get_value().clone();
                 crate::session::set_plpgsql_value(connection, &text_arg(args, 0), value.clone());
+                value
+            }
+            Self::PlSetOne => {
+                let value = args[1].get_value().clone();
+                crate::session::set_plpgsql_value_once(
+                    connection,
+                    &text_arg(args, 0),
+                    value.clone(),
+                )?;
                 value
             }
             Self::PlGet => crate::session::plpgsql_value(connection, &text_arg(args, 0)),

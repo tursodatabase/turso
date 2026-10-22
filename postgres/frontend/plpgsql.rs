@@ -7,6 +7,7 @@
 //! literal.
 
 use serde_json::Value as Json;
+use std::cell::Cell;
 use std::collections::HashMap;
 use turso_core::dialect::{TriggerFunctionBody, TriggerFunctionCall, TriggerReturn};
 use turso_core::schema::Schema;
@@ -16,7 +17,7 @@ use turso_core::{
 };
 use turso_parser::ast::{self, Expr, Literal, TriggerCmd, TriggerEvent, TriggerTime};
 use turso_pg_parser::function::PgFunction;
-use turso_pg_parser::translator::PostgreSQLTranslator;
+use turso_pg_parser::translator::{cast_type_for_pg_type, PostgreSQLTranslator};
 
 /// What is constant for one trigger and one event.
 pub(crate) struct TriggerContext<'a> {
@@ -30,6 +31,9 @@ pub(crate) struct TriggerContext<'a> {
     pub args: &'a [String],
     /// The columns of the table, in table order.
     pub columns: &'a [TriggerColumn],
+    /// The columns of a table of the schema, by table name: a name in a
+    /// statement that is both a column and a variable is an error.
+    pub table_columns: &'a dyn Fn(&str) -> Option<Vec<String>>,
 }
 
 pub(crate) struct TriggerColumn {
@@ -89,6 +93,15 @@ pub(crate) fn expand_trigger_function(
         },
         args: call.args,
         columns: &columns,
+        table_columns: &|table| {
+            schema.get_table(table).map(|table| {
+                table
+                    .columns()
+                    .iter()
+                    .filter_map(|column| column.name.clone())
+                    .collect()
+            })
+        },
     };
     compile_trigger_function(&stored.sql, &context)
 }
@@ -105,18 +118,6 @@ pub(crate) fn compile_trigger_function(
         .get(0)
         .and_then(|function| function.get("PLpgSQL_function"))
         .ok_or_else(|| parse_error("PL/pgSQL function has no parse tree".to_string()))?;
-
-    for datum in json_array(function.get("datums")) {
-        if let Some(variable) = datum.get("PLpgSQL_var") {
-            let name = json_str(variable.get("refname"));
-            if variable.get("lineno").is_some() && !name.starts_with(CASE_VARIABLE_PREFIX) {
-                return Err(not_supported_yet(&format!(
-                    "the variable {name} of DECLARE"
-                )));
-            }
-        }
-    }
-
     let body = function
         .get("action")
         .and_then(|action| action.get("PLpgSQL_stmt_block"))
@@ -134,8 +135,11 @@ pub(crate) fn compile_trigger_function(
         early_returns: Vec::new(),
         final_return: None,
         case_variables: HashMap::new(),
+        variables: HashMap::new(),
+        found_used: Cell::new(false),
         keys: 0,
     };
+    compiler.declare_variables()?;
     compiler.compile_block(body)?;
     compiler.finish()
 }
@@ -207,7 +211,26 @@ struct Compiler<'a> {
     /// The variable key of the value of each `CASE expr`, by the name the
     /// parser gives it.
     case_variables: HashMap<String, String>,
+    /// The variables of DECLARE and `FOUND`, by lowercase name.
+    variables: HashMap<String, Variable>,
+    /// The body reads or sets `FOUND`, so each firing starts it false.
+    found_used: Cell<bool>,
     keys: usize,
+}
+
+/// A variable of the function.
+struct Variable {
+    key: String,
+    /// The declared type: a value the variable gets is cast to it.
+    type_name: String,
+}
+
+/// What an assignment or an INTO list writes.
+enum AssignmentTarget {
+    /// A variable, by lowercase name.
+    Variable(String),
+    /// A column of NEW, by index.
+    NewColumn(usize),
 }
 
 impl Compiler<'_> {
@@ -240,11 +263,7 @@ impl Compiler<'_> {
         };
         match kind.as_str() {
             "PLpgSQL_stmt_execsql" => {
-                if node.get("into").is_some() {
-                    return Err(not_supported_yet("SELECT INTO"));
-                }
-                let command = self.compile_sql(expr_query(node.get("sqlstmt")))?;
-                self.push_command(command);
+                self.compile_execsql(node)?;
                 Ok(true)
             }
             "PLpgSQL_stmt_return" => {
@@ -571,12 +590,9 @@ impl Compiler<'_> {
 
     /// `PERFORM query` runs the query for its effect.
     fn compile_perform(&mut self, query: &str) -> Result<()> {
-        let parse_result = turso_pg_parser::parse(query).map_err(|e| parse_error(e.to_string()))?;
-        let mut stmt = self
-            .translator
-            .translate(&parse_result)
-            .map_err(|e| parse_error(e.to_string()))?;
-        walk_stmt_expressions_mut(&mut stmt, &mut |expr| self.rewrite_trigger_reference(expr))?;
+        let Some(stmt) = self.translate_statement(query)? else {
+            return Ok(());
+        };
         let ast::Stmt::Select(select) = stmt else {
             return Err(parse_error(format!("PERFORM needs a query: {query}")));
         };
@@ -584,42 +600,43 @@ impl Compiler<'_> {
         Ok(())
     }
 
-    /// `NEW.column := value`. At the top level, a value that reads only the
-    /// rows of the statement replaces the column in the statements that
-    /// follow and in the returned row. In a branch, or when the value reads
-    /// a table or a variable, a variable holds the column from this point
-    /// on: the assignment sets it when it runs.
+    /// `NEW.column := value` or `variable := value`. A variable gets the
+    /// value when the assignment runs. At the top level, a value for a
+    /// column that reads only the rows of the statement replaces the
+    /// column in the statements that follow and in the returned row. In a
+    /// branch, or when the value reads a table or a variable, a variable
+    /// holds the column from this point on: the assignment sets it when it
+    /// runs.
     fn compile_assignment(&mut self, varno: usize, value: &str) -> Result<()> {
-        let (record, field) = self.assignment_target(varno)?;
-        if !record.eq_ignore_ascii_case("new") {
-            return Err(not_supported(&format!(
-                "assignment to {}.{field}",
-                record.to_ascii_uppercase()
-            )));
-        }
-        if self.context.event == "DELETE" {
-            return Err(parse_error(
-                "record \"new\" is not assigned yet in a DELETE trigger".to_string(),
-            ));
-        }
-        let Some(column) = self.column_index(&field) else {
-            return Err(parse_error(format!(
-                "record \"new\" has no field \"{field}\""
-            )));
-        };
-        if self.context.columns[column].is_generated {
-            return Err(parse_error(format!(
-                "a trigger cannot change the generated column {field}"
-            )));
-        }
+        let target = self.assignment_target(varno)?;
         let value = self.translate_expression(value)?;
-        let value = cast_to_column_type(value, &self.context.columns[column].type_name);
         let condition = self.condition();
+        let column = match target {
+            AssignmentTarget::Variable(name) => {
+                let variable = &self.variables[&name];
+                let key = variable.key.clone();
+                let value = cast_to_variable_type(value, &variable.type_name);
+                self.commands
+                    .push(select_command(self.pl_set(&key, value), condition));
+                return Ok(());
+            }
+            AssignmentTarget::NewColumn(column) => column,
+        };
+        let value = cast_to_column_type(value, &self.context.columns[column].type_name);
         if condition.is_none() && !self.column_variables[column] && !reads_table_or_variable(&value)
         {
             self.new_values[column] = Some(value);
             return Ok(());
         }
+        let key = self.column_variable_key(column);
+        self.commands
+            .push(select_command(self.pl_set(&key, value), condition));
+        Ok(())
+    }
+
+    /// The key of the variable that holds the column of NEW from now on.
+    /// The variable starts with the value the column has so far.
+    fn column_variable_key(&mut self, column: usize) -> String {
         let name = self.context.columns[column].name.clone();
         let key = self.key(&format!("new.{name}"));
         if !self.column_variables[column] {
@@ -631,37 +648,331 @@ impl Compiler<'_> {
             self.column_variables[column] = true;
             self.new_values[column] = Some(self.pl_get(&key));
         }
-        self.commands
-            .push(select_command(self.pl_set(&key, value), condition));
-        Ok(())
+        key
     }
 
-    /// The record and field that the variable `varno` of an assignment
-    /// names, such as `("new", "updated_at")`.
-    fn assignment_target(&self, varno: usize) -> Result<(String, String)> {
+    /// The variable or the column of NEW that the variable `varno` of an
+    /// assignment names.
+    fn assignment_target(&self, varno: usize) -> Result<AssignmentTarget> {
         let datum = self
             .datums
             .get(varno)
             .ok_or_else(|| parse_error(format!("unknown assignment target {varno}")))?;
         if let Some(variable) = datum.get("PLpgSQL_var") {
-            return Err(not_supported_yet(&format!(
-                "assignment to the variable {}",
-                json_str(variable.get("refname"))
-            )));
+            let name = json_str(variable.get("refname")).to_ascii_lowercase();
+            if !self.variables.contains_key(&name) {
+                return Err(not_supported(&format!("assignment to {name}")));
+            }
+            return Ok(AssignmentTarget::Variable(name));
         }
         let Some(field) = datum.get("PLpgSQL_recfield") else {
             return Err(not_supported_yet("this assignment target"));
         };
-        let parent = field
+        let record = field
             .get("recparentno")
             .and_then(Json::as_u64)
             .and_then(|parent| self.datums.get(parent as usize))
             .and_then(|parent| parent.get("PLpgSQL_rec"))
+            .map(|parent| json_str(parent.get("refname")))
             .ok_or_else(|| parse_error(format!("unknown assignment target {varno}")))?;
-        Ok((
-            json_str(parent.get("refname")).to_string(),
-            json_str(field.get("fieldname")).to_string(),
-        ))
+        let field = json_str(field.get("fieldname"));
+        if !record.eq_ignore_ascii_case("new") {
+            return Err(not_supported(&format!(
+                "assignment to {}.{field}",
+                record.to_ascii_uppercase()
+            )));
+        }
+        if self.context.event == "DELETE" {
+            return Err(parse_error(
+                "record \"new\" is not assigned yet in a DELETE trigger".to_string(),
+            ));
+        }
+        let Some(column) = self.column_index(field) else {
+            return Err(parse_error(format!(
+                "record \"new\" has no field \"{field}\""
+            )));
+        };
+        if self.context.columns[column].is_generated {
+            return Err(parse_error(format!(
+                "a trigger cannot change the generated column {field}"
+            )));
+        }
+        Ok(AssignmentTarget::NewColumn(column))
+    }
+
+    /// The variables of DECLARE get their first value at the start of each
+    /// firing, in the order of the declarations. `FOUND` starts false.
+    fn declare_variables(&mut self) -> Result<()> {
+        for datum in self.datums {
+            if let Some(record) = datum.get("PLpgSQL_rec") {
+                if record.get("lineno").is_some() {
+                    return Err(not_supported(&format!(
+                        "the record variable {}",
+                        json_str(record.get("refname"))
+                    )));
+                }
+            }
+            let Some(variable) = datum.get("PLpgSQL_var") else {
+                continue;
+            };
+            let name = json_str(variable.get("refname")).to_string();
+            if name.starts_with(CASE_VARIABLE_PREFIX) {
+                continue;
+            }
+            let key = self.key(&format!("var.{}", name.to_ascii_lowercase()));
+            let type_name = json_str(
+                variable
+                    .get("datatype")
+                    .and_then(|datatype| datatype.get("PLpgSQL_type"))
+                    .and_then(|datatype| datatype.get("typname")),
+            )
+            .trim()
+            .to_string();
+            if type_name.contains('%') {
+                return Err(not_supported(&format!(
+                    "the type {type_name} of the variable {name}"
+                )));
+            }
+            if type_name.eq_ignore_ascii_case("record") {
+                return Err(not_supported(&format!("the record variable {name}")));
+            }
+            if variable.get("lineno").is_none() {
+                // FOUND, which the parser declares.
+                self.variables
+                    .insert(name.to_ascii_lowercase(), Variable { key, type_name });
+                continue;
+            }
+            let value = match variable.get("default_val") {
+                Some(default) => cast_to_variable_type(
+                    self.translate_expression(expr_query(Some(default)))?,
+                    &type_name,
+                ),
+                None => Expr::Literal(Literal::Null),
+            };
+            self.prologue
+                .push(select_command(self.pl_set(&key, value), None));
+            self.variables
+                .insert(name.to_ascii_lowercase(), Variable { key, type_name });
+        }
+        Ok(())
+    }
+
+    /// The key of `FOUND`, which each firing then starts false.
+    fn found_key(&self) -> String {
+        self.found_used.set(true);
+        self.variables["found"].key.clone()
+    }
+
+    /// A SQL statement of the body. With INTO, the row of its result goes
+    /// to variables or columns of NEW.
+    fn compile_execsql(&mut self, node: &Json) -> Result<()> {
+        if node.get("strict").and_then(Json::as_bool).unwrap_or(false) {
+            return Err(not_supported_yet("SELECT INTO STRICT"));
+        }
+        let targets = match node.get("target") {
+            Some(target) => self.targets_of_into(target)?,
+            None => Vec::new(),
+        };
+        let Some(stmt) = self.translate_statement(expr_query(node.get("sqlstmt")))? else {
+            return Ok(());
+        };
+        if targets.is_empty() {
+            let (command, returning) = command_from_statement(stmt, self.context.table_schema)?;
+            if !returning.is_empty() {
+                return Err(no_destination());
+            }
+            self.push_command(command);
+            return Ok(());
+        }
+        match stmt {
+            ast::Stmt::Select(select) => self.compile_select_into(select, targets),
+            other => self.compile_returning_into(other, targets),
+        }
+    }
+
+    /// The variables and columns of NEW of an INTO list.
+    fn targets_of_into(&self, target: &Json) -> Result<Vec<AssignmentTarget>> {
+        let Some(row) = target.get("PLpgSQL_row") else {
+            return Err(not_supported("this INTO target"));
+        };
+        json_array(row.get("fields"))
+            .iter()
+            .map(|field| {
+                let varno = field.get("varno").and_then(Json::as_u64).unwrap_or(0) as usize;
+                self.assignment_target(varno)
+            })
+            .collect()
+    }
+
+    fn target_key(&mut self, target: &AssignmentTarget) -> String {
+        match target {
+            AssignmentTarget::Variable(name) => self.variables[name].key.clone(),
+            AssignmentTarget::NewColumn(column) => self.column_variable_key(*column),
+        }
+    }
+
+    /// `SELECT a, b INTO x, y FROM ...`: one statement sets each variable
+    /// from the first row and `FOUND` from whether there is a row:
+    /// `SELECT __pl_set(x, q.c0), __pl_set(y, q.c1), __pl_set(found, q.k IS NOT NULL)
+    /// FROM (SELECT 1) LEFT JOIN (SELECT *, 1 AS k FROM (query) LIMIT 1) q ON 1`.
+    /// Without a row, the variables get NULL.
+    fn compile_select_into(
+        &mut self,
+        mut select: ast::Select,
+        targets: Vec<AssignmentTarget>,
+    ) -> Result<()> {
+        let ast::OneSelect::Select { columns, .. } = &mut select.body.select else {
+            return Err(not_supported("VALUES with INTO"));
+        };
+        if columns.len() != targets.len() {
+            return Err(parse_error(format!(
+                "the query gives {} columns for {} targets of INTO",
+                columns.len(),
+                targets.len()
+            )));
+        }
+        for (i, column) in columns.iter_mut().enumerate() {
+            let ast::ResultColumn::Expr(_, alias) = column else {
+                return Err(not_supported("SELECT * with INTO"));
+            };
+            *alias = Some(ast::As::As(ast::Name::exact(format!("c{i}"))));
+        }
+        let keys: Vec<String> = targets
+            .iter()
+            .map(|target| self.target_key(target))
+            .collect();
+        let found_key = self.found_key();
+
+        let mut first_row = simple_select(
+            vec![
+                ast::ResultColumn::Star,
+                ast::ResultColumn::Expr(
+                    Box::new(number(1)),
+                    Some(ast::As::As(ast::Name::exact("k".to_string()))),
+                ),
+            ],
+            Some(ast::FromClause {
+                select: Box::new(ast::SelectTable::Select {
+                    select,
+                    alias: None,
+                    lateral: false,
+                }),
+                joins: vec![],
+            }),
+            None,
+        );
+        first_row.limit = Some(ast::Limit {
+            expr: Box::new(number(1)),
+            offset: None,
+        });
+
+        let mut columns: Vec<ast::ResultColumn> = keys
+            .iter()
+            .enumerate()
+            .map(|(i, key)| {
+                ast::ResultColumn::Expr(
+                    Box::new(self.pl_set(key, record_column("q", &format!("c{i}")))),
+                    None,
+                )
+            })
+            .collect();
+        columns.push(ast::ResultColumn::Expr(
+            Box::new(self.pl_set(&found_key, Expr::NotNull(Box::new(record_column("q", "k"))))),
+            None,
+        ));
+        let from = ast::FromClause {
+            select: Box::new(ast::SelectTable::Select {
+                select: simple_select(
+                    vec![ast::ResultColumn::Expr(Box::new(number(1)), None)],
+                    None,
+                    None,
+                ),
+                alias: None,
+                lateral: false,
+            }),
+            joins: vec![ast::JoinedSelectTable {
+                operator: ast::JoinOperator::TypedJoin(Some(
+                    ast::JoinType::LEFT | ast::JoinType::OUTER,
+                )),
+                table: Box::new(ast::SelectTable::Select {
+                    select: first_row,
+                    alias: Some(ast::As::As(ast::Name::exact("q".to_string()))),
+                    lateral: false,
+                }),
+                constraint: Some(ast::JoinConstraint::On(Box::new(number(1)))),
+            }],
+        };
+        let condition = self.condition();
+        self.commands.push(TriggerCmd::Select(simple_select(
+            columns,
+            Some(from),
+            condition,
+        )));
+        Ok(())
+    }
+
+    /// `INSERT ... RETURNING a, b INTO x, y`: the variables start as NULL,
+    /// the RETURNING list sets them for the row, `__pl_set_one` gives an
+    /// error on a second row, and `FOUND` tells whether there was a row.
+    fn compile_returning_into(
+        &mut self,
+        stmt: ast::Stmt,
+        targets: Vec<AssignmentTarget>,
+    ) -> Result<()> {
+        let (command, returning) = command_from_statement(stmt, self.context.table_schema)?;
+        if returning.is_empty() {
+            return Err(parse_error(
+                "INTO used with a command that cannot return data".to_string(),
+            ));
+        }
+        if !matches!(command, TriggerCmd::Insert { .. }) {
+            return Err(not_supported_yet("RETURNING INTO with UPDATE or DELETE"));
+        }
+        if returning.len() != targets.len() {
+            return Err(parse_error(format!(
+                "RETURNING gives {} columns for {} targets of INTO",
+                returning.len(),
+                targets.len()
+            )));
+        }
+        let keys: Vec<String> = targets
+            .iter()
+            .map(|target| self.target_key(target))
+            .collect();
+        let found_key = self.found_key();
+        let condition = self.condition();
+        for key in &keys {
+            self.commands.push(select_command(
+                self.pl_set(key, Expr::Literal(Literal::Null)),
+                condition.clone(),
+            ));
+        }
+        self.commands.push(select_command(
+            self.pl_set(&format!("{}.rows", keys[0]), number(0)),
+            condition.clone(),
+        ));
+        self.commands.push(select_command(
+            self.pl_set(&found_key, number(0)),
+            condition,
+        ));
+        let mut values = Vec::new();
+        for (i, column) in returning.into_iter().enumerate() {
+            let ast::ResultColumn::Expr(value, _) = column else {
+                return Err(not_supported("RETURNING * with INTO"));
+            };
+            let value = if i == 0 {
+                function_call("__pl_set_one", vec![text(&keys[0]), *value])
+            } else {
+                self.pl_set(&keys[i], *value)
+            };
+            values.push(ast::ResultColumn::Expr(Box::new(value), None));
+        }
+        values.push(ast::ResultColumn::Expr(
+            Box::new(self.pl_set(&found_key, number(1))),
+            None,
+        ));
+        self.push_command(with_returning(command, values));
+        Ok(())
     }
 
     fn column_index(&self, name: &str) -> Option<usize> {
@@ -694,98 +1005,63 @@ impl Compiler<'_> {
         Ok(*expr)
     }
 
-    /// Translate one SQL statement of the function body to a trigger command.
-    fn compile_sql(&self, query: &str) -> Result<TriggerCmd> {
+    /// A SQL statement of the body, over the rows of the statement that
+    /// fires the trigger. A name that is both a column of a table of the
+    /// statement and a variable gives the PostgreSQL error when the
+    /// statement runs.
+    fn translate_statement(&mut self, query: &str) -> Result<Option<ast::Stmt>> {
         let parse_result = turso_pg_parser::parse(query).map_err(|e| parse_error(e.to_string()))?;
         let mut stmt = self
             .translator
             .translate(&parse_result)
             .map_err(|e| parse_error(e.to_string()))?;
+        if let Some(name) = self.ambiguous_name(&stmt)? {
+            let condition = self.condition();
+            self.commands.push(select_command(
+                raise_abort(text(&format!("column reference \"{name}\" is ambiguous"))),
+                condition,
+            ));
+            return Ok(None);
+        }
         walk_stmt_expressions_mut(&mut stmt, &mut |expr| self.rewrite_trigger_reference(expr))?;
-        match stmt {
-            ast::Stmt::Insert {
-                with: None,
-                or_conflict,
-                tbl_name,
-                columns,
-                body: ast::InsertBody::Select(select, upsert),
-                returning,
-            } => {
-                if !returning.is_empty() {
-                    return Err(no_destination());
-                }
-                Ok(TriggerCmd::Insert {
-                    or_conflict,
-                    tbl_name: self.local_table_name(tbl_name)?,
-                    col_names: columns,
-                    select,
-                    upsert,
-                    returning: vec![],
-                })
-            }
-            ast::Stmt::Update(ast::Update {
-                with: None,
-                or_conflict,
-                tbl_name,
-                indexed: None,
-                sets,
-                from,
-                where_clause,
-                returning,
-            }) => {
-                if !returning.is_empty() {
-                    return Err(no_destination());
-                }
-                Ok(TriggerCmd::Update {
-                    or_conflict,
-                    tbl_name: self.local_table_name(tbl_name)?,
-                    sets,
-                    from,
-                    where_clause,
-                })
-            }
-            ast::Stmt::Delete {
-                with: None,
-                tbl_name,
-                indexed: None,
-                where_clause,
-                returning,
-            } => {
-                if !returning.is_empty() {
-                    return Err(no_destination());
-                }
-                Ok(TriggerCmd::Delete {
-                    tbl_name: self.local_table_name(tbl_name)?,
-                    where_clause,
-                })
-            }
-            ast::Stmt::Select(_) => Err(no_destination()),
-            other => Err(not_supported(&format!(
-                "the statement {} in a trigger function",
-                statement_kind(&other)
-            ))),
-        }
+        Ok(Some(stmt))
     }
 
-    /// The table name without its schema: a trigger reads and writes tables
-    /// of its own schema only.
-    fn local_table_name(&self, name: ast::QualifiedName) -> Result<ast::Name> {
-        if let Some(schema) = &name.namespace {
-            let is_own_schema = schema.as_str().eq_ignore_ascii_case("main")
-                || schema
-                    .as_str()
-                    .eq_ignore_ascii_case(self.context.table_schema);
-            if !is_own_schema {
-                return Err(not_supported(&format!(
-                    "the table {}.{} of another schema in a trigger function",
-                    schema.as_str(),
-                    name.name.as_str()
-                )));
+    /// A variable of the function that a table of the statement also has as
+    /// a column.
+    fn ambiguous_name(&self, stmt: &ast::Stmt) -> Result<Option<String>> {
+        let tables = scoped_tables(stmt);
+        if tables.is_empty() {
+            return Ok(None);
+        }
+        let mut names: Vec<String> = Vec::new();
+        let mut copy = stmt.clone();
+        walk_stmt_expressions_mut(&mut copy, &mut |expr| {
+            if let Expr::Id(id) = expr {
+                let name = id.as_str().to_ascii_lowercase();
+                if self.variables.contains_key(&name) && !names.contains(&name) {
+                    names.push(name);
+                }
+            }
+            Ok(WalkControl::Continue)
+        })?;
+        for name in names {
+            for table in &tables {
+                let Some(columns) = (self.context.table_columns)(table) else {
+                    continue;
+                };
+                if columns
+                    .iter()
+                    .any(|column| column.eq_ignore_ascii_case(&name))
+                {
+                    return Ok(Some(name));
+                }
             }
         }
-        Ok(name.name)
+        Ok(None)
     }
 
+    /// Add a command that runs under the condition of this point of the
     /// Add a command that runs under the condition of this point of the
     /// body.
     fn push_command(&mut self, command: TriggerCmd) {
@@ -846,7 +1122,17 @@ impl Compiler<'_> {
                 ))),
                 "tg_relid" => return Err(not_supported("TG_RELID")),
                 "tg_argv" => return Err(not_supported("TG_ARGV without an index")),
-                name => self.case_variables.get(name).map(|key| self.pl_get(key)),
+                name => self
+                    .case_variables
+                    .get(name)
+                    .map(|key| self.pl_get(key))
+                    .or_else(|| {
+                        let variable = self.variables.get(name)?;
+                        if name == "found" {
+                            self.found_used.set(true);
+                        }
+                        Some(self.pl_get(&variable.key))
+                    }),
             },
             Expr::FunctionCall { name, args, .. }
                 if name.as_str().eq_ignore_ascii_case("array_element")
@@ -880,7 +1166,12 @@ impl Compiler<'_> {
     /// The commands of the trigger, and the row the function returns.
     fn finish(mut self) -> Result<TriggerFunctionBody> {
         let returned_row = self.returned_row();
-        let mut commands = std::mem::take(&mut self.prologue);
+        let mut commands = Vec::new();
+        if self.found_used.get() {
+            let key = self.variables["found"].key.clone();
+            commands.push(select_command(self.pl_set(&key, number(0)), None));
+        }
+        commands.append(&mut self.prologue);
         if self.has_early_return {
             let key = self.key("ret");
             commands.push(select_command(
@@ -959,6 +1250,184 @@ impl Compiler<'_> {
         }
         TriggerReturn::Row { skip_when, columns }
     }
+}
+
+/// The trigger command of a SQL statement of the body, and its RETURNING
+/// list.
+fn command_from_statement(
+    stmt: ast::Stmt,
+    table_schema: &str,
+) -> Result<(TriggerCmd, Vec<ast::ResultColumn>)> {
+    match stmt {
+        ast::Stmt::Insert {
+            with: None,
+            or_conflict,
+            tbl_name,
+            columns,
+            body: ast::InsertBody::Select(select, upsert),
+            returning,
+        } => Ok((
+            TriggerCmd::Insert {
+                or_conflict,
+                tbl_name: local_table_name(tbl_name, table_schema)?,
+                col_names: columns,
+                select,
+                upsert,
+                returning: vec![],
+            },
+            returning,
+        )),
+        ast::Stmt::Update(ast::Update {
+            with: None,
+            or_conflict,
+            tbl_name,
+            indexed: None,
+            sets,
+            from,
+            where_clause,
+            returning,
+        }) => Ok((
+            TriggerCmd::Update {
+                or_conflict,
+                tbl_name: local_table_name(tbl_name, table_schema)?,
+                sets,
+                from,
+                where_clause,
+            },
+            returning,
+        )),
+        ast::Stmt::Delete {
+            with: None,
+            tbl_name,
+            indexed: None,
+            where_clause,
+            returning,
+        } => Ok((
+            TriggerCmd::Delete {
+                tbl_name: local_table_name(tbl_name, table_schema)?,
+                where_clause,
+            },
+            returning,
+        )),
+        ast::Stmt::Select(_) => Err(no_destination()),
+        other => Err(not_supported(&format!(
+            "the statement {} in a trigger function",
+            statement_kind(&other)
+        ))),
+    }
+}
+
+/// The table name without its schema: a trigger reads and writes tables
+/// of its own schema only.
+fn local_table_name(name: ast::QualifiedName, table_schema: &str) -> Result<ast::Name> {
+    if let Some(schema) = &name.namespace {
+        let is_own_schema = schema.as_str().eq_ignore_ascii_case("main")
+            || schema.as_str().eq_ignore_ascii_case(table_schema);
+        if !is_own_schema {
+            return Err(not_supported(&format!(
+                "the table {}.{} of another schema in a trigger function",
+                schema.as_str(),
+                name.name.as_str()
+            )));
+        }
+    }
+    Ok(name.name)
+}
+
+/// The INSERT command with a RETURNING list. The engine runs the list for
+/// each row and drops the rows. The engine commands for UPDATE and DELETE
+/// have no RETURNING list.
+fn with_returning(command: TriggerCmd, returning: Vec<ast::ResultColumn>) -> TriggerCmd {
+    match command {
+        TriggerCmd::Insert {
+            or_conflict,
+            tbl_name,
+            col_names,
+            select,
+            upsert,
+            ..
+        } => TriggerCmd::Insert {
+            or_conflict,
+            tbl_name,
+            col_names,
+            select,
+            upsert,
+            returning,
+        },
+        other => other,
+    }
+}
+
+/// The tables whose columns the names of a statement can refer to: the
+/// tables of its FROM clauses and the table that UPDATE and DELETE change.
+fn scoped_tables(stmt: &ast::Stmt) -> Vec<String> {
+    let mut tables = Vec::new();
+    match stmt {
+        ast::Stmt::Select(select) => select_tables(select, &mut tables),
+        ast::Stmt::Insert {
+            body: ast::InsertBody::Select(select, _),
+            ..
+        } => select_tables(select, &mut tables),
+        ast::Stmt::Update(update) => {
+            tables.push(update.tbl_name.name.as_str().to_string());
+            if let Some(from) = &update.from {
+                from_tables(from, &mut tables);
+            }
+        }
+        ast::Stmt::Delete { tbl_name, .. } => tables.push(tbl_name.name.as_str().to_string()),
+        _ => {}
+    }
+    tables
+}
+
+fn select_tables(select: &ast::Select, tables: &mut Vec<String>) {
+    one_select_tables(&select.body.select, tables);
+    for compound in &select.body.compounds {
+        one_select_tables(&compound.select, tables);
+    }
+}
+
+fn one_select_tables(select: &ast::OneSelect, tables: &mut Vec<String>) {
+    if let ast::OneSelect::Select {
+        from: Some(from), ..
+    } = select
+    {
+        from_tables(from, tables);
+    }
+}
+
+fn from_tables(from: &ast::FromClause, tables: &mut Vec<String>) {
+    select_table_tables(&from.select, tables);
+    for join in &from.joins {
+        select_table_tables(&join.table, tables);
+    }
+}
+
+fn select_table_tables(table: &ast::SelectTable, tables: &mut Vec<String>) {
+    match table {
+        ast::SelectTable::Table(name, ..) => tables.push(name.name.as_str().to_string()),
+        ast::SelectTable::Select { select, .. } => select_tables(select, tables),
+        ast::SelectTable::Sub(from, _) => from_tables(from, tables),
+        ast::SelectTable::TableCall(..) => {}
+    }
+}
+
+/// The value of a variable gets the cast of the translator for the
+/// declared type, as an assigned column does. A boolean keeps its value,
+/// because a cast to INTEGER would lose the text forms of true and false.
+fn cast_to_variable_type(expr: Expr, type_name: &str) -> Expr {
+    let base = type_name.trim();
+    let base = base.strip_prefix("pg_catalog.").unwrap_or(base);
+    let base = base
+        .split(['(', '['])
+        .next()
+        .unwrap_or(base)
+        .trim()
+        .trim_matches('"');
+    if base.eq_ignore_ascii_case("boolean") || base.eq_ignore_ascii_case("bool") {
+        return expr;
+    }
+    cast_to_column_type(expr, &cast_type_for_pg_type(base, 0).name)
 }
 
 /// The query text of a `PLpgSQL_expr` node.
@@ -1309,10 +1778,23 @@ mod tests {
         ]
     }
 
+    fn test_table_columns(table: &str) -> Option<Vec<String>> {
+        let columns: &[&str] = match table {
+            "log" => &["id", "name"],
+            "t" => &["id", "x", "y"],
+            _ => return None,
+        };
+        Some(columns.iter().map(|column| column.to_string()).collect())
+    }
+
     fn compile_for(body: &str, timing: &str, event: &str) -> Result<(Vec<String>, String)> {
-        let function_sql = format!(
-            "CREATE FUNCTION f() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN {body} END $$"
-        );
+        compile_source(&format!("BEGIN {body} END"), timing, event)
+    }
+
+    /// Compile a function whose source starts with DECLARE or BEGIN.
+    fn compile_source(source: &str, timing: &str, event: &str) -> Result<(Vec<String>, String)> {
+        let function_sql =
+            format!("CREATE FUNCTION f() RETURNS trigger LANGUAGE plpgsql AS $$ {source} $$");
         let columns = columns();
         let context = TriggerContext {
             trigger_name: "trg",
@@ -1322,6 +1804,7 @@ mod tests {
             event,
             args: &["a".to_string(), "b".to_string()],
             columns: &columns,
+            table_columns: &test_table_columns,
         };
         let body = compile_trigger_function(&function_sql, &context)?;
         let returned = match body.returned_row {
@@ -1678,6 +2161,161 @@ mod tests {
     }
 
     #[test]
+    fn declared_variables_get_their_first_value_at_the_start_of_each_firing() {
+        let (commands, returned) = compile_source(
+            "DECLARE v int := 5; w text; ok boolean := NEW.x > 0; \
+             BEGIN \
+               v := v + NEW.x; \
+               INSERT INTO log VALUES (v, w); \
+               IF ok THEN NEW.y := v; END IF; \
+               RETURN NEW; \
+             END",
+            "BEFORE",
+            "INSERT",
+        )
+        .unwrap();
+        assert_eq!(
+            commands,
+            vec![
+                "SELECT __pl_set ('trg.INSERT.var.v', CAST (5 AS INTEGER))",
+                "SELECT __pl_set ('trg.INSERT.var.w', NULL)",
+                "SELECT __pl_set ('trg.INSERT.var.ok', new.x > 0)",
+                "SELECT __pl_set ('trg.INSERT.new.y', new.y)",
+                "SELECT __pl_set ('trg.INSERT.var.v', CAST (__pl_get ('trg.INSERT.var.v') + new.x AS INTEGER))",
+                "INSERT INTO log VALUES (__pl_get ('trg.INSERT.var.v'), __pl_get ('trg.INSERT.var.w'))",
+                "SELECT __pl_set ('trg.INSERT.c1', coalesce (__pl_get ('trg.INSERT.var.ok'), 0))",
+                "SELECT __pl_set ('trg.INSERT.new.y', __pl_get ('trg.INSERT.var.v')) WHERE __pl_get ('trg.INSERT.c1')",
+            ]
+        );
+        assert_eq!(returned, "row y = __pl_get ('trg.INSERT.new.y')");
+    }
+
+    #[test]
+    fn select_into_sets_the_variables_and_found_from_the_first_row() {
+        let (commands, _) = compile_source(
+            "DECLARE a int; b text; \
+             BEGIN \
+               SELECT id, name INTO a, b FROM log WHERE id = NEW.x ORDER BY id; \
+               IF NOT FOUND THEN RETURN NULL; END IF; \
+               RETURN NEW; \
+             END",
+            "BEFORE",
+            "INSERT",
+        )
+        .unwrap();
+        assert_eq!(
+            &commands[..4],
+            &[
+                "SELECT __pl_set ('trg.INSERT.var.found', 0)",
+                "SELECT __pl_set ('trg.INSERT.var.a', NULL)",
+                "SELECT __pl_set ('trg.INSERT.var.b', NULL)",
+                "SELECT __pl_set ('trg.INSERT.ret', NULL)",
+            ]
+        );
+        assert_eq!(
+            commands[4],
+            "SELECT __pl_set ('trg.INSERT.var.a', q.c0), __pl_set ('trg.INSERT.var.b', q.c1), \
+             __pl_set ('trg.INSERT.var.found', q.k NOTNULL) \
+             FROM (SELECT 1) LEFT OUTER JOIN (SELECT *, 1 AS k \
+             FROM (SELECT id AS c0, name AS c1 FROM log WHERE id = new.x ORDER BY id NULLS LAST) LIMIT 1) \
+             AS q ON 1"
+        );
+        assert_eq!(
+            commands[5],
+            "SELECT __pl_set ('trg.INSERT.c1', coalesce (NOT __pl_get ('trg.INSERT.var.found'), 0))"
+        );
+    }
+
+    #[test]
+    fn returning_into_sets_the_variable_from_the_one_row() {
+        let (commands, _) = compile_source(
+            "DECLARE v int; \
+             BEGIN \
+               INSERT INTO log (id) VALUES (NEW.x) RETURNING id INTO v; \
+               NEW.y := v; \
+               RETURN NEW; \
+             END",
+            "BEFORE",
+            "INSERT",
+        )
+        .unwrap();
+        assert_eq!(
+            commands,
+            vec![
+                "SELECT __pl_set ('trg.INSERT.var.found', 0)",
+                "SELECT __pl_set ('trg.INSERT.var.v', NULL)",
+                "SELECT __pl_set ('trg.INSERT.new.y', new.y)",
+                "SELECT __pl_set ('trg.INSERT.var.v', NULL)",
+                "SELECT __pl_set ('trg.INSERT.var.v.rows', 0)",
+                "SELECT __pl_set ('trg.INSERT.var.found', 0)",
+                "INSERT INTO log (id) VALUES (new.x) RETURNING __pl_set_one ('trg.INSERT.var.v', id), \
+                 __pl_set ('trg.INSERT.var.found', 1)",
+                "SELECT __pl_set ('trg.INSERT.new.y', __pl_get ('trg.INSERT.var.v'))",
+            ]
+        );
+    }
+
+    #[test]
+    fn a_name_that_is_a_column_and_a_variable_is_an_error_when_the_statement_runs() {
+        let (commands, _) = compile_source(
+            "DECLARE id int := 1; \
+             BEGIN \
+               UPDATE log SET name = 'x' WHERE id = id; \
+               INSERT INTO log (id, name) VALUES (id, 'y'); \
+               RETURN NEW; \
+             END",
+            "AFTER",
+            "INSERT",
+        )
+        .unwrap();
+        assert_eq!(
+            commands,
+            vec![
+                "SELECT __pl_set ('trg.INSERT.var.id', CAST (1 AS INTEGER))",
+                "SELECT RAISE (ABORT, 'column reference \"id\" is ambiguous')",
+                "INSERT INTO log (id, name) VALUES (__pl_get ('trg.INSERT.var.id'), 'y')",
+            ]
+        );
+    }
+
+    #[test]
+    fn unsupported_variable_forms_are_errors() {
+        for (source, message) in [
+            (
+                "DECLARE n log.id%TYPE; BEGIN RETURN NEW; END",
+                "the type log.id%TYPE of the variable n",
+            ),
+            (
+                "DECLARE r record; BEGIN RETURN NEW; END",
+                "the record variable r",
+            ),
+            (
+                "DECLARE v int; BEGIN SELECT id INTO STRICT v FROM log; RETURN NEW; END",
+                "SELECT INTO STRICT",
+            ),
+            (
+                "DECLARE v int; BEGIN SELECT * INTO v FROM log; RETURN NEW; END",
+                "SELECT * with INTO",
+            ),
+            (
+                "DECLARE v int; w int; BEGIN SELECT id INTO v, w FROM log; RETURN NEW; END",
+                "1 columns for 2 targets",
+            ),
+            (
+                "DECLARE v int; BEGIN INSERT INTO log (id) VALUES (1) INTO v; RETURN NEW; END",
+                "INTO used with a command that cannot return data",
+            ),
+            (
+                "DECLARE v int; BEGIN UPDATE log SET name = 'x' RETURNING id INTO v; RETURN NEW; END",
+                "RETURNING INTO with UPDATE or DELETE is not supported yet",
+            ),
+        ] {
+            let err = compile_source(source, "BEFORE", "INSERT").unwrap_err();
+            assert!(err.to_string().contains(message), "{source}: {err}");
+        }
+    }
+
+    #[test]
     fn the_value_of_an_assignment_follows_its_target() {
         assert_eq!(assigned_value("NEW.x := a = b", 2), Some("a = b"));
         assert_eq!(assigned_value("NEW.\"a\"\"b\" = 1", 2), Some("1"));
@@ -1690,10 +2328,6 @@ mod tests {
     fn unsupported_constructs_are_errors() {
         for (body, message) in [
             ("SELECT 1;", "no destination"),
-            (
-                "SELECT 1 INTO NEW.x; RETURN NEW;",
-                "SELECT INTO is not supported yet",
-            ),
             (
                 "LOOP EXIT; END LOOP; RETURN NEW;",
                 "a loop is not supported",
@@ -1714,22 +2348,5 @@ mod tests {
             let err = compile(body, "INSERT").unwrap_err();
             assert!(err.to_string().contains(message), "{body}: {err}");
         }
-    }
-
-    #[test]
-    fn declared_variables_are_not_supported_yet() {
-        let function_sql = "CREATE FUNCTION f() RETURNS trigger LANGUAGE plpgsql AS $$ \
-                            DECLARE v int; BEGIN RETURN NEW; END $$";
-        let context = TriggerContext {
-            trigger_name: "trg",
-            table_name: "t",
-            table_schema: "public",
-            timing: "AFTER",
-            event: "INSERT",
-            args: &[],
-            columns: &[],
-        };
-        let err = compile_trigger_function(function_sql, &context).unwrap_err();
-        assert!(err.to_string().contains("variable v of DECLARE"), "{err}");
     }
 }
