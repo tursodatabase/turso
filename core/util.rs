@@ -2116,6 +2116,9 @@ pub fn validate_select_for_views(
 ) -> Result<()> {
     validate_select_for_unsupported_features(select_stmt)?;
 
+    if view_database_id == crate::TEMP_DB_ID {
+        return Ok(());
+    }
     validate_no_cross_db_references(select_stmt, resolver, view_database_id)?;
 
     walk_select_expressions(select_stmt, &mut |expr| {

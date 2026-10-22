@@ -35,3 +35,13 @@ test create-temp-view-qualified-main-is-rejected {
 }
 expect error {
 }
+
+test temp-view-may-name-the-database-of-its-table {
+    CREATE TABLE t(x);
+    INSERT INTO t VALUES (1);
+    CREATE TEMP VIEW tv AS SELECT x FROM main.t;
+    SELECT x FROM tv;
+}
+expect {
+    1
+}
