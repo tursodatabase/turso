@@ -3742,17 +3742,7 @@ impl PostgreSQLTranslator {
     ) -> Result<ast::Expr, ParseError> {
         let func_name = object_name(&func_call.funcname, is_pg_catalog, "function")?;
         if func_name.eq_ignore_ascii_case("substring")
-            && func_call.args.get(1).is_some_and(|arg| {
-                matches!(
-                    &arg.node,
-                    Some(pg_query::protobuf::node::Node::AConst(
-                        pg_query::protobuf::AConst {
-                            val: Some(pg_query::protobuf::a_const::Val::Sval(_)),
-                            ..
-                        }
-                    ))
-                )
-            })
+            && func_call.args.get(1).is_some_and(is_text_pattern)
         {
             return Err(not_supported(
                 "substring() with a regular expression or SIMILAR pattern",
@@ -6803,6 +6793,31 @@ fn uses_only_set_operation(
                     .is_some_and(|arg| uses_only_set_operation(arg, op, all))
             })
         }
+        _ => false,
+    }
+}
+
+fn is_text_pattern(node: &pg_query::protobuf::Node) -> bool {
+    use pg_query::protobuf::node::Node;
+    match &node.node {
+        Some(Node::AConst(pg_query::protobuf::AConst {
+            val: Some(pg_query::protobuf::a_const::Val::Sval(_)),
+            ..
+        })) => true,
+        Some(Node::TypeCast(cast)) => cast.type_name.as_ref().is_some_and(|t| {
+            extract_key_columns(&t.names).is_ok_and(|names| {
+                names.last().is_some_and(|name| {
+                    matches!(
+                        name.to_ascii_lowercase().as_str(),
+                        "text" | "varchar" | "bpchar" | "char" | "name"
+                    )
+                })
+            })
+        }),
+        Some(Node::AExpr(expr)) => expr
+            .name
+            .iter()
+            .any(|n| matches!(&n.node, Some(Node::String(s)) if s.sval == "||")),
         _ => false,
     }
 }
@@ -10332,6 +10347,14 @@ mod tests {
         assert_not_supported(
             "SELECT substring('foobar' similar '%#\"o_b#\"%' escape '#')",
             "SIMILAR pattern",
+        );
+        assert_not_supported(
+            "SELECT substring('foobar' from 'o.b'::text)",
+            "regular expression",
+        );
+        assert_not_supported(
+            "SELECT substring('foobar' from 'o' || '.b')",
+            "regular expression",
         );
         assert_translates("SELECT substring('foobar' from 2 for 3), substring('foobar', 2)");
     }
