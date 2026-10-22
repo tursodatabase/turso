@@ -100,6 +100,20 @@ expect {
     b
 }
 
+test schema-qualified-column-reference-in-join {
+    CREATE SCHEMA IF NOT EXISTS sp_join;
+    DROP TABLE IF EXISTS sp_join.jt;
+    DROP TABLE IF EXISTS sp_join.ju;
+    CREATE TABLE sp_join.jt (id int, b text);
+    CREATE TABLE sp_join.ju (id int);
+    INSERT INTO sp_join.jt VALUES (1, 'x');
+    INSERT INTO sp_join.ju VALUES (1);
+    SELECT sp_join.jt.b, jt.b FROM sp_join.jt JOIN sp_join.ju ON jt.id = ju.id;
+}
+expect {
+    x|x
+}
+
 test show-search-path-default {
     SHOW search_path;
 }
