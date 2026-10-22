@@ -176,6 +176,7 @@ fn test_postgres_rejects_unsupported_set_and_show(db: TempDatabase) {
         "SET row_security = on",
         "SET client_encoding = 'LATIN1'",
         "SET standard_conforming_strings = off",
+        "SET client_min_messages = bogus",
     ] {
         assert!(conn.prepare(sql).is_err(), "{sql} was accepted");
     }
