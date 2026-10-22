@@ -320,7 +320,9 @@ fn try_prepare_special(pg_conn: &Arc<PgConnectionInner>, sql: &str) -> Result<Op
         return Ok(Some(handle_pg_show(pg_conn, &show_stmt)?));
     }
 
-    if let Some(stmt) = try_extract_create_schema(&parse_result) {
+    if let Some(stmt) = try_extract_create_schema(&parse_result)
+        .map_err(|e| LimboError::ParseError(e.to_string()))?
+    {
         handle_pg_create_schema(&pg_conn.conn, &stmt)?;
         return Ok(Some(noop_statement(&pg_conn.conn)?));
     }
