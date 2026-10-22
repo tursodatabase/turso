@@ -269,6 +269,7 @@ fn emit_loop_source<'a>(
                 );
                 program.emit_insn(Insn::AggStep {
                     data: Box::new(AggStepData {
+                        skip_bare_columns_reg: None,
                         acc_reg: start_reg,
                         col: expr_reg,
                         delimiter: 0,
@@ -322,6 +323,7 @@ fn emit_loop_source<'a>(
                     AggArgumentSource::new_from_expression(&agg.func, &agg.args, &agg.distinctness),
                     reg,
                     &t_ctx.resolver,
+                    t_ctx.reg_nonagg_emit_once_flag,
                 )?;
                 if let Distinctness::Distinct { ctx } = &agg.distinctness {
                     let ctx = ctx

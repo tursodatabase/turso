@@ -1378,7 +1378,7 @@ pub fn insn_to_row(
             ),
             Insn::AggStep { data } => (
                 "AggStep",
-                0,
+                data.skip_bare_columns_reg.unwrap_or(0) as i64,
                 data.col as i64,
                 data.acc_reg as i64,
                 Value::build_text(match &data.collation {

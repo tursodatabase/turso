@@ -10,6 +10,7 @@ use crate::{
             MaterializedBuildInput, MaterializedBuildInputMode, MaterializedColumnRef,
             OperationMode, ResultSetColumn, TableMask, TranslateCtx,
         },
+        expr::{walk_expr, WalkControl},
         group_by::{group_by_agg_phase, group_by_emit_row_phase, EmitGroupBy, GroupByRowSource},
         main_loop::{init_distinct, CloseLoop, InitLoop, LoopBodyEmitter, OpenLoop},
         optimizer::{constraints::partial_index, mark_partial_index_predicate_terms_consumed},
@@ -123,9 +124,32 @@ pub fn emit_query<'a>(
     // It also tells whether any row reached the aggregate, which a correlated
     // subquery in the result columns needs even when every column contains an
     // aggregate: if no row did, the subquery runs again against the NULL row.
+    let mut has_minmax_bare_column = false;
+    if plan.aggregates.iter().any(|agg| {
+        matches!(
+            agg.func,
+            crate::function::AggFunc::Min | crate::function::AggFunc::Max
+        )
+    }) {
+        for column in &plan.result_columns {
+            walk_expr(&column.expr, &mut |expr| -> Result<WalkControl> {
+                if plan.aggregates.iter().any(|agg| agg.original_expr == *expr) {
+                    return Ok(WalkControl::SkipChildren);
+                }
+                if matches!(expr, Expr::Column { .. } | Expr::RowId { .. }) {
+                    has_minmax_bare_column = true;
+                }
+                Ok(WalkControl::Continue)
+            })?;
+        }
+    }
     let has_ungrouped_nonagg_cols = !plan.aggregates.is_empty()
-        && plan.group_by.is_none()
-        && (plan.result_columns.iter().any(|c| !c.contains_aggregates)
+        && plan
+            .group_by
+            .as_ref()
+            .is_none_or(|group| group.exprs.is_empty())
+        && (has_minmax_bare_column
+            || plan.result_columns.iter().any(|c| !c.contains_aggregates)
             || plan
                 .non_from_clause_subqueries
                 .iter()

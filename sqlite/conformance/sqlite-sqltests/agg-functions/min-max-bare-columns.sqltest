@@ -1,0 +1,97 @@
+@database :memory:
+
+setup minmax-inputs {
+    CREATE TABLE t(g INTEGER, label TEXT, v);
+    INSERT INTO t VALUES(1,'first',3),(2,'second',1),(1,'middle',2),
+                       (2,'largest',5),(3,'null',NULL),(1,'smallest',-1);
+}
+
+@setup minmax-inputs
+test minmax-bare-column-ungrouped {
+    SELECT max(v),label FROM t;
+    SELECT min(v),label FROM t;
+    SELECT max(v ORDER BY label),label FROM t;
+    SELECT min(DISTINCT v),label FROM t;
+    SELECT max(v) FILTER (WHERE g=1),label FROM t;
+}
+expect {
+    5|largest
+    -1|smallest
+    5|largest
+    -1|smallest
+    3|first
+}
+
+@setup minmax-inputs
+test minmax-bare-column-grouped {
+    SELECT g,max(v),label FROM t GROUP BY g;
+    SELECT g,min(v),label FROM t GROUP BY g;
+    CREATE INDEX by_group ON t(g);
+    SELECT g,max(v),label FROM t GROUP BY g;
+    SELECT g,min(v),label FROM t GROUP BY g;
+}
+expect {
+    1|3|first
+    2|5|largest
+    3||null
+    1|-1|smallest
+    2|1|second
+    3||null
+    1|3|first
+    2|5|largest
+    3||null
+    1|-1|smallest
+    2|1|second
+    3||null
+}
+
+test minmax-bare-column-collation-and-types {
+    CREATE TABLE t(v COLLATE nocase, label);
+    INSERT INTO t VALUES ('Z','first'),('a','smallest'),('B','middle');
+    SELECT min(v),label FROM t;
+    SELECT max(v),label FROM t;
+    DELETE FROM t;
+    INSERT INTO t VALUES (1,'first'),(4.5,'largest'),(-2.5,'smallest'),(NULL,'null');
+    SELECT max(v),label FROM t;
+    SELECT min(v),label FROM t;
+}
+expect {
+    a|smallest
+    Z|first
+    4.5|largest
+    -2.5|smallest
+}
+
+test minmax-bare-column-null-and-ties {
+    CREATE TABLE t(v,label);
+    INSERT INTO t VALUES (NULL,'first'),(NULL,'last');
+    SELECT max(v),label FROM t;
+    INSERT INTO t VALUES (2,'best'),(2,'tie'),(NULL,'null');
+    SELECT max(v),label FROM t;
+    SELECT max(v),label FROM t WHERE 0;
+}
+expect {
+    |last
+    2|best
+    |
+}
+
+@setup minmax-inputs
+test minmax-bare-column-expressions {
+    SELECT max(v) || ':' || label FROM t;
+    SELECT max(v), (SELECT label) FROM t;
+    SELECT g,max(v) || ':' || label FROM t GROUP BY g HAVING max(v) IS NOT NULL;
+    SELECT max(v),label FROM t HAVING max(v)>0;
+    SELECT g,(SELECT max(v) || ':' || label FROM t WHERE t.g=o.g HAVING max(v) IS NOT NULL)
+    FROM (SELECT 1 AS g UNION ALL SELECT 2 UNION ALL SELECT 1) o;
+}
+expect {
+    5:largest
+    5|largest
+    1|3:first
+    2|5:largest
+    5|largest
+    1|3:first
+    2|5:largest
+    1|3:first
+}
