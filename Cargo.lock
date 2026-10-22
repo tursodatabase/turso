@@ -7300,6 +7300,7 @@ dependencies = [
  "criterion",
  "miette",
  "pg_query",
+ "regex",
  "thiserror 2.0.16",
  "turso_parser",
 ]

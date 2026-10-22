@@ -17,11 +17,13 @@ path = "lib.rs"
 [dependencies]
 pg_query = "6.1"
 miette = { workspace = true }
+regex = { workspace = true }
 thiserror = { workspace = true }
 turso_parser = { workspace = true }
 
 [dev-dependencies]
 criterion = { workspace = true }
+regex = { workspace = true }
 
 [features]
 default = []

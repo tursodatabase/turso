@@ -2242,7 +2242,6 @@ fn test_postgres_similar_to(db: TempDatabase) {
     conn.execute("INSERT INTO words VALUES ('world')").unwrap();
     conn.execute("INSERT INTO words VALUES ('helm')").unwrap();
 
-    // SIMILAR TO with % wildcard
     let mut stmt = conn
         .prepare("SELECT w FROM words WHERE w SIMILAR TO 'hel%' ORDER BY w")
         .unwrap();
@@ -2258,6 +2257,80 @@ fn test_postgres_similar_to(db: TempDatabase) {
         }
     }
     assert_eq!(results, vec!["hello", "helm", "help"]);
+
+    let mut rows = conn
+        .query("SELECT CASE WHEN '[a' SIMILAR TO '[[]a' THEN 1 ELSE 0 END, CASE WHEN 'a&&b' SIMILAR TO 'a[&&]+b' THEN 1 ELSE 0 END, CASE WHEN '~' SIMILAR TO '[a~~b]' THEN 1 ELSE 0 END")
+        .unwrap()
+        .unwrap();
+    let StepResult::Row = rows.step().unwrap() else {
+        panic!("expected row");
+    };
+    let row = rows.row().unwrap();
+    assert_eq!(row.get_value(0).to_string(), "1");
+    assert_eq!(row.get_value(1).to_string(), "1");
+    assert_eq!(row.get_value(2).to_string(), "1");
+
+    assert!(conn.prepare("SELECT 'a' SIMILAR TO '[a'").is_err());
+
+    let mut rows = conn
+        .query("SELECT CASE WHEN 'b' SIMILAR TO '[^a]' THEN 1 ELSE 0 END, CASE WHEN 'a' SIMILAR TO '[^a]' THEN 1 ELSE 0 END")
+        .unwrap()
+        .unwrap();
+    let StepResult::Row = rows.step().unwrap() else {
+        panic!("expected row");
+    };
+    let row = rows.row().unwrap();
+    assert_eq!(row.get_value(0).to_string(), "1");
+    assert_eq!(row.get_value(1).to_string(), "0");
+
+    let mut rows = conn
+        .query("SELECT CASE WHEN ']' SIMILAR TO '[]abc]' THEN 1 ELSE 0 END, CASE WHEN 'b' SIMILAR TO '[]abc]' THEN 1 ELSE 0 END, CASE WHEN 'x' SIMILAR TO '[]abc]' THEN 1 ELSE 0 END, CASE WHEN 'x' SIMILAR TO '[^]abc]' THEN 1 ELSE 0 END, CASE WHEN ']' SIMILAR TO '[^]abc]' THEN 1 ELSE 0 END")
+        .unwrap()
+        .unwrap();
+    let StepResult::Row = rows.step().unwrap() else {
+        panic!("expected row");
+    };
+    let row = rows.row().unwrap();
+    assert_eq!(row.get_value(0).to_string(), "1");
+    assert_eq!(row.get_value(1).to_string(), "1");
+    assert_eq!(row.get_value(2).to_string(), "0");
+    assert_eq!(row.get_value(3).to_string(), "1");
+    assert_eq!(row.get_value(4).to_string(), "0");
+
+    let mut rows = conn
+        .query("SELECT CASE WHEN '[a]' SIMILAR TO '\\[a\\]' THEN 1 ELSE 0 END, CASE WHEN 'a%b' SIMILAR TO 'a\\%b' THEN 1 ELSE 0 END")
+        .unwrap()
+        .unwrap();
+    let StepResult::Row = rows.step().unwrap() else {
+        panic!("expected row");
+    };
+    let row = rows.row().unwrap();
+    assert_eq!(row.get_value(0).to_string(), "1");
+    assert_eq!(row.get_value(1).to_string(), "1");
+
+    let mut rows = conn
+        .query("SELECT CASE WHEN 'g' SIMILAR TO '[a-z]' THEN 1 ELSE 0 END, CASE WHEN 'A' SIMILAR TO '[a-z]' THEN 1 ELSE 0 END, CASE WHEN 'hello' SIMILAR TO '[a-z]+' THEN 1 ELSE 0 END")
+        .unwrap()
+        .unwrap();
+    let StepResult::Row = rows.step().unwrap() else {
+        panic!("expected row");
+    };
+    let row = rows.row().unwrap();
+    assert_eq!(row.get_value(0).to_string(), "1");
+    assert_eq!(row.get_value(1).to_string(), "0");
+    assert_eq!(row.get_value(2).to_string(), "1");
+
+    let mut rows = conn
+        .query("SELECT NULL SIMILAR TO 'hel%', 'hello' SIMILAR TO NULL, NULL SIMILAR TO NULL")
+        .unwrap()
+        .unwrap();
+    let StepResult::Row = rows.step().unwrap() else {
+        panic!("expected row");
+    };
+    let row = rows.row().unwrap();
+    assert!(matches!(row.get_value(0), Value::Null));
+    assert!(matches!(row.get_value(1), Value::Null));
+    assert!(matches!(row.get_value(2), Value::Null));
 }
 
 #[turso_macros::test(mvcc)]
