@@ -38,7 +38,7 @@ impl PostgreSQLTranslator {
     ) -> Result<ast::QualifiedName, ParseError> {
         // db.schema.table: the database part would be dropped.
         if !range_var.catalogname.is_empty() {
-            return Err(not_supported("cross-database references"));
+            return Err(not_supported("a cross-database reference"));
         }
         let is_schemata = range_var
             .schemaname
@@ -1064,7 +1064,7 @@ impl PostgreSQLTranslator {
         }
         reject_table_storage_clauses(&idx.options, &idx.table_space, "")?;
         if !relation.catalogname.is_empty() {
-            return Err(not_supported("cross-database references"));
+            return Err(not_supported("a cross-database reference"));
         }
         // SQLite names the database on the index, not on the table, and
         // looks the table up there.
@@ -1178,7 +1178,7 @@ impl PostgreSQLTranslator {
                         ast::Name::from_string(map_schema_name(schema)),
                         ast::Name::from_string(name.clone()),
                     ),
-                    _ => return Err(not_supported("cross-database references")),
+                    _ => return Err(not_supported("a cross-database reference")),
                 }
             }
             Some(Node::String(s)) => {
@@ -1192,7 +1192,7 @@ impl PostgreSQLTranslator {
                     [name] => name,
                     [schema, name] if map_schema_name(schema) == "main" => name,
                     [] => return Err(ParseError::ParseError("DROP TYPE: empty type name".into())),
-                    _ => return Err(not_supported("schema-qualified type names")),
+                    _ => return Err(not_supported("a schema-qualified type name")),
                 };
                 ast::QualifiedName::single(ast::Name::from_string(type_name.clone()))
             }
@@ -2864,7 +2864,7 @@ impl PostgreSQLTranslator {
                                             ast::Name::from_string(parts[1].clone()),
                                         ))
                                     }
-                                    _ => Err(not_supported("cross-database references")),
+                                    _ => Err(not_supported("a cross-database reference")),
                                 }
                             }
                         }
@@ -2920,7 +2920,7 @@ impl PostgreSQLTranslator {
                 // The cast target carries no size, so varchar(3) would not
                 // truncate and numeric(5,2) would not round.
                 if !pg_type_name.typmods.is_empty() {
-                    return Err(not_supported("type modifiers in a cast"));
+                    return Err(not_supported("a type modifier in a cast"));
                 }
                 let type_name = pg_type_name_to_ast_type(pg_type_name).ok_or_else(|| {
                     ParseError::ParseError("TypeCast has an empty type name".into())
@@ -3407,7 +3407,7 @@ impl PostgreSQLTranslator {
             [] => return Err(ParseError::ParseError("Missing operator name".to_string())),
             _ => {
                 return Err(not_supported(
-                    "operators qualified with a schema other than pg_catalog",
+                    "an operator qualified with a schema other than pg_catalog",
                 ))
             }
         };
@@ -3824,7 +3824,7 @@ impl PostgreSQLTranslator {
             ));
         }
         if func_call.func_variadic {
-            return Err(not_supported("VARIADIC function arguments"));
+            return Err(not_supported("a VARIADIC function argument"));
         }
 
         // Translate FILTER clause
@@ -4576,7 +4576,9 @@ impl PostgreSQLTranslator {
                         Some(Node::IndexElem(idx_elem)) => {
                             reject_index_elem_clauses(idx_elem, "an ON CONFLICT target")?;
                             if idx_elem.name.is_empty() {
-                                return Err(not_supported("expressions in an ON CONFLICT target"));
+                                return Err(not_supported(
+                                    "an expression in an ON CONFLICT target",
+                                ));
                             }
                             Ok(ast::SortedColumn {
                                 expr: Box::new(ast::Expr::Id(ast::Name::from_string(
@@ -4910,7 +4912,7 @@ impl PostgreSQLTranslator {
         }
         if !type_name_node.typmods.is_empty() {
             return Err(not_supported(format!(
-                "type modifiers on {pg_type} in CREATE DOMAIN"
+                "a type modifier on {pg_type} in CREATE DOMAIN"
             )));
         }
         if domain
@@ -5797,7 +5799,7 @@ fn map_column_type(pg_type: &str, typmods: &[i64]) -> Result<PgTypeMapping, Pars
     let mapping = map_pg_type(pg_type, typmods)
         .ok_or_else(|| ParseError::ParseError(format!("unsupported PostgreSQL type: {pg_type}")))?;
     if !typmods.is_empty() && mapping.type_params.is_empty() {
-        return Err(not_supported(format!("type modifiers on {pg_type}")));
+        return Err(not_supported(format!("a type modifier on {pg_type}")));
     }
     Ok(mapping)
 }
@@ -6003,7 +6005,7 @@ fn check_transaction_options(
                     })) if i.ival == 0
                 );
                 if !not_deferrable {
-                    return Err(not_supported("DEFERRABLE transactions"));
+                    return Err(not_supported("a DEFERRABLE transaction"));
                 }
             }
             "transaction_read_only" => {
@@ -6016,7 +6018,7 @@ fn check_transaction_options(
                     })) if i.ival == 0
                 );
                 if !read_write && !read_only_allowed {
-                    return Err(not_supported("READ ONLY transactions"));
+                    return Err(not_supported("a READ ONLY transaction"));
                 }
             }
             other => return Err(not_supported(format!("transaction option {other}"))),
@@ -6760,7 +6762,9 @@ fn reject_constraint_attributes(
             ConstrType::ConstrAttrDeferrable | ConstrType::ConstrAttrDeferred
         )
     {
-        return Err(not_supported("DEFERRABLE / INITIALLY DEFERRED constraints"));
+        return Err(not_supported(
+            "a DEFERRABLE / INITIALLY DEFERRED constraint",
+        ));
     }
     // A foreign key can only reference a table in the referencing table's own
     // schema, because the translated clause carries no schema.
@@ -6797,13 +6801,13 @@ fn reject_constraint_attributes(
     }
     // An empty match type is the default, and "s" is an explicit MATCH SIMPLE.
     if !matches!(constraint.fk_matchtype.as_str(), "" | "s") {
-        return Err(not_supported("MATCH FULL / MATCH PARTIAL foreign keys"));
+        return Err(not_supported("a MATCH FULL / MATCH PARTIAL foreign key"));
     }
     if constraint.is_no_inherit {
-        return Err(not_supported("NO INHERIT constraints"));
+        return Err(not_supported("a NO INHERIT constraint"));
     }
     if constraint.skip_validation {
-        return Err(not_supported("NOT VALID constraints"));
+        return Err(not_supported("a NOT VALID constraint"));
     }
     Ok(())
 }
@@ -6876,7 +6880,7 @@ fn reject_index_elem_clauses(
         return Err(not_supported(format!("a non-binary COLLATE in {context}")));
     }
     if !elem.opclass.is_empty() || !elem.opclassopts.is_empty() {
-        return Err(not_supported(format!("operator classes in {context}")));
+        return Err(not_supported(format!("an operator class in {context}")));
     }
     Ok(())
 }
@@ -6959,7 +6963,7 @@ fn function_name(funcname: &[pg_query::protobuf::Node]) -> Result<String, ParseE
         [name] => Ok(name.clone()),
         [schema, name] if schema == "pg_catalog" => Ok(name.clone()),
         [] => Err(ParseError::ParseError("Missing function name".to_string())),
-        _ => Err(not_supported("schema-qualified function names")),
+        _ => Err(not_supported("a schema-qualified function name")),
     }
 }
 
@@ -6989,7 +6993,7 @@ fn created_type_name(names: &[pg_query::protobuf::Node]) -> Result<String, Parse
         [name] => Ok(name.clone()),
         [schema, name] if map_schema_name(schema) == "main" => Ok(name.clone()),
         [] => Err(ParseError::ParseError("missing type name".into())),
-        _ => Err(not_supported("schema-qualified type names")),
+        _ => Err(not_supported("a schema-qualified type name")),
     }
 }
 
@@ -9953,19 +9957,19 @@ mod tests {
 
     #[test]
     fn fail_closed_column_type_modifiers() {
-        assert_not_supported("CREATE TABLE t (a timestamp(3))", "type modifiers");
-        assert_not_supported("CREATE TABLE t (a time(0))", "type modifiers");
-        assert_not_supported("CREATE TABLE t (a bit(8))", "type modifiers");
+        assert_not_supported("CREATE TABLE t (a timestamp(3))", "a type modifier");
+        assert_not_supported("CREATE TABLE t (a time(0))", "a type modifier");
+        assert_not_supported("CREATE TABLE t (a bit(8))", "a type modifier");
         assert_not_supported(
             "ALTER TABLE t ADD COLUMN a timestamptz(0)",
-            "type modifiers",
+            "a type modifier",
         );
         assert_not_supported(
             "CREATE TABLE t (a mytype('x'))",
             "non-integer type modifier",
         );
         // char(n) arrives as bpchar, which maps to unbounded TEXT.
-        assert_not_supported("CREATE TABLE t (a char(2))", "type modifiers on bpchar");
+        assert_not_supported("CREATE TABLE t (a char(2))", "a type modifier on bpchar");
         assert_translates("CREATE TABLE t (a varchar(3), b numeric(10, 2), c text, d int[])");
     }
 
@@ -10087,7 +10091,7 @@ mod tests {
         );
         assert_not_supported(
             "CREATE INDEX i ON t (a text_pattern_ops)",
-            "operator classes in CREATE INDEX",
+            "an operator class in CREATE INDEX",
         );
         assert_translates("CREATE INDEX i ON t (a DESC NULLS LAST, (lower(b)))");
     }
@@ -10473,12 +10477,12 @@ mod tests {
 
     #[test]
     fn fail_closed_cast_type_modifiers() {
-        assert_not_supported("SELECT '1.239'::numeric(5, 2)", "type modifiers in a cast");
+        assert_not_supported("SELECT '1.239'::numeric(5, 2)", "a type modifier in a cast");
         assert_not_supported(
             "SELECT CAST('abcdef' AS varchar(3))",
-            "type modifiers in a cast",
+            "a type modifier in a cast",
         );
-        assert_not_supported("SELECT now()::timestamp(0)", "type modifiers in a cast");
+        assert_not_supported("SELECT now()::timestamp(0)", "a type modifier in a cast");
         assert_translates("SELECT '1.5'::numeric, 'a'::varchar, 1::int[]");
     }
 
@@ -10501,7 +10505,7 @@ mod tests {
 
     #[test]
     fn fail_closed_schema_qualified_operators() {
-        assert_not_supported("SELECT 1 OPERATOR(myschema.+) 2", "operators qualified");
+        assert_not_supported("SELECT 1 OPERATOR(myschema.+) 2", "an operator qualified");
         assert_translates("SELECT 'a' OPERATOR(pg_catalog.~) '^a'");
     }
 
@@ -10559,7 +10563,7 @@ mod tests {
     fn fail_closed_on_conflict_targets() {
         assert_not_supported(
             "INSERT INTO t VALUES ('a') ON CONFLICT ((lower(a))) DO NOTHING",
-            "expressions in an ON CONFLICT target",
+            "an expression in an ON CONFLICT target",
         );
         assert_not_supported(
             "INSERT INTO t VALUES ('a') ON CONFLICT (a COLLATE \"en_US\") DO NOTHING",
@@ -10567,7 +10571,7 @@ mod tests {
         );
         assert_not_supported(
             "INSERT INTO t VALUES ('a') ON CONFLICT (a text_pattern_ops) DO NOTHING",
-            "operator classes in an ON CONFLICT target",
+            "an operator class in an ON CONFLICT target",
         );
         assert_translates("INSERT INTO t VALUES ('a') ON CONFLICT (a) WHERE a > 'a' DO NOTHING");
     }
@@ -10635,8 +10639,8 @@ mod tests {
 
     #[test]
     fn fail_closed_create_domain() {
-        assert_not_supported("CREATE DOMAIN d AS varchar(5)", "type modifiers");
-        assert_not_supported("CREATE DOMAIN d AS numeric(10, 2)", "type modifiers");
+        assert_not_supported("CREATE DOMAIN d AS varchar(5)", "a type modifier");
+        assert_not_supported("CREATE DOMAIN d AS numeric(10, 2)", "a type modifier");
         assert_not_supported("CREATE DOMAIN d AS text COLLATE \"en_US\"", "COLLATE");
         assert_translates("CREATE DOMAIN d AS int NULL DEFAULT 1 CHECK (VALUE > 0)");
         assert_translates("CREATE DOMAIN d AS text COLLATE \"C\"");
