@@ -38,6 +38,28 @@ impl Namespace {
         format!("{}{name}", self.prefix)
     }
 
+    /// The name to write into the SQL text of an object named `written`
+    /// in this namespace: the name as written when the namespace has no
+    /// prefix, else the stored name.
+    pub fn name_in_sql(&self, written: &turso_parser::ast::Name) -> turso_parser::ast::Name {
+        if self.prefix.is_empty() {
+            return written.clone();
+        }
+        turso_parser::ast::Name::exact(self.stored_name(written.as_str()))
+    }
+
+    /// Like [`Namespace::name_in_sql`] for a qualified name: the stored
+    /// name has no qualifier, since the prefix says where the object is.
+    pub fn qualified_name_in_sql(
+        &self,
+        written: &turso_parser::ast::QualifiedName,
+    ) -> turso_parser::ast::QualifiedName {
+        if self.prefix.is_empty() {
+            return written.clone();
+        }
+        turso_parser::ast::QualifiedName::single(self.name_in_sql(&written.name))
+    }
+
     /// Whether `self` and `other` hold the same objects: two names for the
     /// same database and prefix, like `main` and `public`.
     pub fn holds_the_same_objects_as(&self, other: &Namespace) -> bool {
@@ -82,20 +104,40 @@ impl Namespaces {
         }
     }
 
-    /// The namespaces of the databases other than main and temp, ordered by
-    /// database, then by name.
-    pub fn others(&self) -> Vec<Namespace> {
-        let mut namespaces: Vec<_> = self
-            .name_to_namespace
+    /// The namespace of database `database_id` that holds the object stored
+    /// as `stored_name`: the one with the longest prefix the name starts
+    /// with, or the whole database when no prefix matches.
+    pub fn of_stored_name(&self, database_id: usize, stored_name: &str) -> Option<Namespace> {
+        self.name_to_namespace
             .read()
             .values()
             .filter(|namespace| {
-                namespace.database_id != MAIN_DB_ID && namespace.database_id != TEMP_DB_ID
+                namespace.database_id == database_id
+                    && !namespace.prefix.is_empty()
+                    && stored_name.starts_with(&namespace.prefix)
             })
+            .max_by_key(|namespace| namespace.prefix.len())
             .cloned()
-            .collect();
+            .or_else(|| self.of_database(database_id))
+    }
+
+    /// The namespaces other than main and temp, ordered by database, then
+    /// by name.
+    pub fn others(&self) -> Vec<Namespace> {
+        let mut namespaces: Vec<_> = self.name_to_namespace.read().values().cloned().collect();
         namespaces.sort_by(|a, b| (a.database_id, &a.name).cmp(&(b.database_id, &b.name)));
         namespaces
+    }
+
+    /// The namespaces of the attached databases: the databases other than
+    /// main and temp, ordered by database.
+    pub fn attached_databases(&self) -> Vec<Namespace> {
+        self.others()
+            .into_iter()
+            .filter(|namespace| {
+                namespace.database_id != MAIN_DB_ID && namespace.database_id != TEMP_DB_ID
+            })
+            .collect()
     }
 
     /// Adds `namespace` under its name.
@@ -134,7 +176,7 @@ impl Namespaces {
     pub fn search_order(&self, search_path: Option<&[String]>) -> Vec<Namespace> {
         let Some(search_path) = search_path else {
             let mut order = vec![Namespace::database("main", MAIN_DB_ID)];
-            order.extend(self.others());
+            order.extend(self.attached_databases());
             return order;
         };
         let mut order: Vec<Namespace> = Vec::new();
@@ -221,7 +263,18 @@ mod tests {
         namespaces.add(Namespace::database("public", MAIN_DB_ID));
         assert_eq!(namespaces.database_id("public"), Some(MAIN_DB_ID));
         assert_eq!(namespaces.of_database(MAIN_DB_ID).unwrap().name, "main");
-        assert_eq!(names_of(&namespaces.others()), vec!["app", "other"]);
+        assert_eq!(
+            names_of(&namespaces.others()),
+            vec!["public", "app", "other"]
+        );
+        assert_eq!(
+            names_of(&namespaces.attached_databases()),
+            vec!["app", "other"]
+        );
+        assert_eq!(
+            names_of(&namespaces.search_order(None)),
+            vec!["main", "app", "other"]
+        );
         let search_path = names(&["public", "main", "app"]);
         assert_eq!(
             names_of(&namespaces.search_order(Some(&search_path))),
@@ -263,6 +316,31 @@ mod tests {
     }
 
     #[test]
+    fn a_stored_name_is_in_the_namespace_of_its_longest_prefix() {
+        let namespaces = namespaces_with_app_and_other();
+        namespaces.add(Namespace {
+            name: "app_main".to_string(),
+            database_id: MAIN_DB_ID,
+            prefix: "app.".to_string(),
+        });
+        namespaces.add(Namespace {
+            name: "app_sub".to_string(),
+            database_id: MAIN_DB_ID,
+            prefix: "app.sub.".to_string(),
+        });
+        let namespace_of = |stored_name: &str| {
+            namespaces
+                .of_stored_name(MAIN_DB_ID, stored_name)
+                .unwrap()
+                .name
+        };
+        assert_eq!(namespace_of("t"), "main");
+        assert_eq!(namespace_of("app.t"), "app_main");
+        assert_eq!(namespace_of("app.sub.t"), "app_sub");
+        assert_eq!(namespaces.of_stored_name(2, "app.t").unwrap().name, "app");
+    }
+
+    #[test]
     fn main_and_temp_always_exist() {
         let namespaces = namespaces_with_app_and_other();
         assert_eq!(namespaces.database_id("main"), Some(MAIN_DB_ID));
@@ -270,6 +348,6 @@ mod tests {
         assert_eq!(namespaces.of_database(TEMP_DB_ID).unwrap().name, "temp");
         assert_eq!(namespaces.remove("other"), Some(3));
         assert_eq!(namespaces.of_database(3), None);
-        assert_eq!(names_of(&namespaces.others()), vec!["app"]);
+        assert_eq!(names_of(&namespaces.attached_databases()), vec!["app"]);
     }
 }

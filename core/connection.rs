@@ -2939,7 +2939,7 @@ impl Connection {
 
     pub fn attached_database_names(&self) -> Vec<String> {
         self.namespaces
-            .others()
+            .attached_databases()
             .into_iter()
             .map(|namespace| namespace.name)
             .collect()
@@ -3208,7 +3208,7 @@ impl Connection {
 
     pub(crate) fn is_attached(&self, alias: &str) -> bool {
         self.namespaces
-            .others()
+            .attached_databases()
             .iter()
             .any(|namespace| namespace.name == alias)
     }
@@ -3332,9 +3332,19 @@ impl Connection {
             .map(|namespace| namespace.name)
     }
 
+    /// The namespace called `name`. `name` is normalized.
+    pub fn namespace(&self, name: &str) -> Option<crate::Namespace> {
+        self.namespaces.get(name)
+    }
+
     /// The database that namespace `name` refers to. `name` is normalized.
     pub fn namespace_database_id(&self, name: &str) -> Option<usize> {
         self.namespaces.database_id(name)
+    }
+
+    /// The namespaces other than main and temp.
+    pub fn other_namespaces(&self) -> Vec<crate::Namespace> {
+        self.namespaces.others()
     }
 
     /// Sets the namespace names that a name without a namespace is looked
@@ -3422,7 +3432,7 @@ impl Connection {
 
         // Add attached databases
         let attached_dbs = self.attached_databases.read();
-        for namespace in self.namespaces.others() {
+        for namespace in self.namespaces.attached_databases() {
             let seq_number = namespace.database_id;
             let file_path = if let Some(entry) = attached_dbs.index_to_data.get(&seq_number) {
                 Self::get_canonical_path_for_database(&entry.db)

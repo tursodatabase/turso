@@ -92,9 +92,10 @@ pub fn translate_create_trigger(
     temporary: bool,
     if_not_exists: bool,
     time: Option<ast::TriggerTime>,
+    event: &ast::TriggerEvent,
     tbl_name: QualifiedName,
+    for_each_row: bool,
     program: &mut ProgramBuilder,
-    sql: String,
     commands: &[ast::TriggerCmd],
     when_clause: Option<&ast::Expr>,
 ) -> Result<()> {
@@ -110,6 +111,7 @@ pub fn translate_create_trigger(
     }
     let trigger = resolve_create_trigger(resolver, &trigger_name, &tbl_name, temporary)?;
     let database_id = trigger.database_id();
+    let trigger_name_in_sql = trigger.namespace.qualified_name_in_sql(&trigger_name);
     let normalized_trigger_name = trigger.stored_name;
     let target_table = if temporary {
         // A temp trigger's target table can be in any schema.
@@ -120,6 +122,17 @@ pub fn translate_create_trigger(
         ResolvedName::in_namespace(trigger.namespace, &normalize_ident(tbl_name.name.as_str()))
     };
     let target_table_database_id = target_table.database_id();
+    let sql = create_trigger_to_sql(
+        temporary,
+        if_not_exists,
+        &trigger_name_in_sql,
+        time,
+        event,
+        &target_table.namespace.qualified_name_in_sql(&tbl_name),
+        for_each_row,
+        when_clause,
+        commands,
+    );
     let normalized_table_name = target_table.stored_name;
     // Temp triggers are allowed to reference tables in other databases.
     if target_table_database_id != database_id && database_id != crate::TEMP_DB_ID {

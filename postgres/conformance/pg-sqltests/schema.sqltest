@@ -84,3 +84,136 @@ test create-schema-rejects-elements-in-another-schema {
 expect error {
     different from the one being created
 }
+
+test tables-of-two-schemas-with-the-same-name {
+    CREATE SCHEMA a;
+    CREATE SCHEMA b;
+    CREATE TABLE a.t (v text);
+    CREATE TABLE b.t (v text);
+    CREATE TABLE t (v text);
+    INSERT INTO a.t VALUES ('a');
+    INSERT INTO b.t VALUES ('b');
+    INSERT INTO t VALUES ('public');
+    SELECT v FROM a.t UNION ALL SELECT v FROM b.t UNION ALL SELECT v FROM public.t;
+}
+expect {
+    a
+    b
+    public
+}
+
+test schema-and-table-qualified-columns {
+    CREATE SCHEMA app;
+    CREATE TABLE app.items (id int, label text);
+    INSERT INTO app.items VALUES (1, 'a'), (2, 'b');
+    SELECT app.items.label, items.id FROM app.items ORDER BY id;
+}
+expect {
+    a|1
+    b|2
+}
+
+test update-and-delete-with-table-qualified-columns {
+    CREATE SCHEMA app;
+    CREATE TABLE app.t (x int);
+    INSERT INTO app.t VALUES (1), (2);
+    UPDATE app.t SET x = t.x * 10 WHERE t.x = 1;
+    DELETE FROM app.t WHERE t.x = 2;
+    SELECT x FROM app.t;
+}
+expect {
+    10
+}
+
+test create-table-in-missing-schema-errors {
+    CREATE TABLE missing_schema.t (x int);
+}
+expect error {
+    schema "missing_schema" does not exist
+}
+
+test index-names-are-per-schema {
+    CREATE SCHEMA app;
+    CREATE TABLE t (x int);
+    CREATE TABLE app.t (x int);
+    CREATE INDEX t_x ON t (x);
+    CREATE INDEX t_x ON app.t (x);
+    DROP INDEX app.t_x;
+    DROP INDEX t_x;
+    SELECT 1;
+}
+expect {
+    1
+}
+
+test rename-table-in-schema {
+    CREATE SCHEMA app;
+    CREATE TABLE app.t (x int);
+    INSERT INTO app.t VALUES (1);
+    ALTER TABLE app.t RENAME TO u;
+    SELECT x FROM app.u;
+}
+expect {
+    1
+}
+
+test sequence-in-schema {
+    CREATE SCHEMA app;
+    CREATE SEQUENCE app.s;
+    CREATE SEQUENCE s START 10;
+    SELECT nextval('app.s');
+    SELECT nextval('app.s');
+    SELECT nextval('s');
+    SELECT currval('app.s');
+}
+expect {
+    1
+    2
+    10
+    2
+}
+
+test catalogs-report-schema-of-objects {
+    CREATE SCHEMA app;
+    CREATE TABLE app.t (x int);
+    CREATE INDEX t_x ON app.t (x);
+    CREATE SEQUENCE app.s;
+    SELECT n.nspname, c.relname FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace WHERE c.relname IN ('t', 't_x') ORDER BY c.relname;
+    SELECT schemaname, tablename FROM pg_tables WHERE tablename = 't';
+    SELECT schemaname, tablename, indexname FROM pg_indexes WHERE indexname = 't_x';
+    SELECT schemaname, sequencename FROM pg_sequences WHERE sequencename = 's';
+}
+expect {
+    app|t
+    app|t_x
+    app|t
+    app|t|t_x
+    app|s
+}
+
+test serial-columns-in-schema-and-public {
+    CREATE SCHEMA app;
+    CREATE TABLE app.t (id serial, label text);
+    CREATE TABLE t (id serial, label text);
+    INSERT INTO app.t (label) VALUES ('a'), ('b');
+    INSERT INTO t (label) VALUES ('c');
+    SELECT id, label FROM app.t UNION ALL SELECT id, label FROM t ORDER BY label;
+}
+expect {
+    1|a
+    2|b
+    1|c
+}
+
+test view-in-schema-finds-its-tables-without-a-schema-name {
+    CREATE SCHEMA app;
+    SET search_path TO app;
+    CREATE TABLE t (a int);
+    INSERT INTO t VALUES (1);
+    CREATE VIEW v AS SELECT a FROM t;
+    SET search_path TO public;
+    SELECT a FROM app.v;
+}
+expect {
+    1
+}

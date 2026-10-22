@@ -70,6 +70,7 @@ pub fn translate_create_materialized_view(
     let database_id = resolved.database_id();
     let schema_cookie = resolver.with_schema(database_id, |s| s.schema_version);
     program.begin_write_on_database(database_id, schema_cookie)?;
+    let view_name_in_sql = resolved.namespace.name_in_sql(&view_name.name);
     let normalized_view_name = resolved.stored_name;
 
     if if_not_exists
@@ -115,7 +116,7 @@ pub fn translate_create_materialized_view(
     // first (#9456): a TEMP table that happens to share a source table's
     // name must not shadow it here.
     let maintenance_plan =
-        resolver.with_view_scope(database_id, normalized_view_name.clone(), || {
+        resolver.with_view_scope(resolved.namespace, normalized_view_name.clone(), || {
             resolver.with_schema(database_id, |_| {
                 crate::incremental::vdbe_maintenance::plan_view(
                     &normalized_view_name,
@@ -140,7 +141,7 @@ pub fn translate_create_materialized_view(
     // Reconstruct the SQL string for storage
     let sql = create_view_to_str(
         "MATERIALIZED VIEW",
-        &view_name.name.as_ident(),
+        &view_name_in_sql.as_ident(),
         columns,
         select_stmt,
     );
@@ -353,6 +354,7 @@ pub fn translate_create_view(
     let database_id = resolved.database_id();
     let schema_cookie = resolver.with_schema(database_id, |s| s.schema_version);
     program.begin_write_on_database(database_id, schema_cookie)?;
+    let view_name_in_sql = resolved.namespace.name_in_sql(&view_name.name);
     let normalized_view_name = resolved.stored_name;
 
     if if_not_exists
@@ -405,7 +407,7 @@ pub fn translate_create_view(
     if resolver.dialect.binds_names_at_create() {
         bind_sequence_names_in_select(&mut select_stmt, resolver)?;
     }
-    let sql = create_view_to_str("VIEW", &view_name.name.as_ident(), columns, &select_stmt);
+    let sql = create_view_to_str("VIEW", &view_name_in_sql.as_ident(), columns, &select_stmt);
 
     // Open cursor to sqlite_schema table
     let table = resolver.schema().get_btree_table(SQLITE_TABLEID).unwrap();

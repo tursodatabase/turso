@@ -38,9 +38,12 @@ use turso_parser::ast::{self, Expr, QualifiedName, SortOrder, SortedColumn};
 
 use super::schema::{emit_schema_entry, SchemaEntryType, SQLITE_TABLEID};
 
-fn canonical_create_index_sql(stmt: &ast::Stmt) -> String {
+fn canonical_create_index_sql(stmt: &ast::Stmt, namespace: &crate::Namespace) -> String {
     let mut canonical_stmt = stmt.clone();
-    let ast::Stmt::CreateIndex { idx_name, .. } = &mut canonical_stmt else {
+    let ast::Stmt::CreateIndex {
+        idx_name, tbl_name, ..
+    } = &mut canonical_stmt
+    else {
         unreachable!("canonical_create_index_sql requires a CREATE INDEX statement");
     };
     // Attached db's index names may have a connection-local schema alias like `aux.idx1`.
@@ -48,6 +51,8 @@ fn canonical_create_index_sql(stmt: &ast::Stmt) -> String {
     // when the same database is reopened or attached under a different alias.
     // e.g. CREATE INDEX aux.idx1 ON t1 (name) -> CREATE INDEX idx1 ON t1 (name)
     idx_name.namespace = None;
+    idx_name.name = namespace.name_in_sql(&idx_name.name);
+    *tbl_name = namespace.name_in_sql(tbl_name);
     canonical_stmt.to_string()
 }
 
@@ -88,7 +93,7 @@ pub fn translate_create_index(
     resolver: &Resolver,
     stmt: ast::Stmt,
 ) -> crate::Result<()> {
-    let sql = canonical_create_index_sql(&stmt);
+    let written_stmt = stmt.clone();
     let ast::Stmt::CreateIndex {
         unique,
         if_not_exists,
@@ -113,6 +118,7 @@ pub fn translate_create_index(
             .namespace
     };
     let database_id = namespace.database_id;
+    let sql = canonical_create_index_sql(&written_stmt, &namespace);
     let idx_name = namespace.stored_name(&normalize_ident(original_idx_name.name.as_str()));
     let tbl_name = namespace.stored_name(&normalize_ident(original_tbl_name.as_str()));
 
@@ -1553,7 +1559,10 @@ mod tests {
             Some("aux")
         );
 
-        let canonical_sql = canonical_create_index_sql(&stmt);
+        let canonical_sql = canonical_create_index_sql(
+            &stmt,
+            &crate::Namespace::database("main", crate::MAIN_DB_ID),
+        );
         assert_eq!(canonical_sql, "CREATE INDEX idx1 ON t1 (name)");
     }
 }

@@ -79,6 +79,49 @@ pub fn name_create_index(sql: &str, location: usize, name: &str) -> String {
     sql
 }
 
+/// `sql`, a CREATE TABLE statement, with its table named `name` and no
+/// schema. `sql` is returned as it is when the table is already called
+/// `name` or when `sql` is not a CREATE TABLE statement.
+pub fn name_create_table(sql: &str, name: &str) -> Result<String, ParseError> {
+    use pg_query::protobuf::Token;
+    use pg_query::NodeRef;
+
+    let parse_result = parse(sql)?;
+    let nodes = parse_result.protobuf.nodes();
+    let Some((NodeRef::CreateStmt(create), ..)) = nodes.first() else {
+        return Ok(sql.to_string());
+    };
+    let Some(relation) = create.relation.as_ref() else {
+        return Ok(sql.to_string());
+    };
+    let start = relation.location as usize;
+    let scan = pg_query::scan(sql).map_err(|e| ParseError::ParseError(e.to_string()))?;
+    let mut tokens = scan
+        .tokens
+        .iter()
+        .skip_while(|token| (token.start as usize) < start);
+    let first = tokens
+        .next()
+        .ok_or_else(|| ParseError::ParseError("CREATE TABLE names no table".to_string()))?;
+    let mut end = first.end as usize;
+    let mut rest = tokens.peekable();
+    if rest
+        .peek()
+        .is_some_and(|token| token.token == Token::Ascii46 as i32)
+    {
+        rest.next();
+        if let Some(ident) = rest.next() {
+            end = ident.end as usize;
+        }
+    }
+    Ok(format!(
+        "{}{}{}",
+        &sql[..start],
+        quote_identifier(name),
+        &sql[end..]
+    ))
+}
+
 /// pg_query's scanner is the same lexer the PostgreSQL server uses, so its
 /// keyword classification matches server-side quote_identifier().
 fn keyword_requires_quoting(ident: &str) -> bool {
@@ -97,6 +140,43 @@ fn keyword_requires_quoting(ident: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn name_create_table_writes_the_stored_name_over_the_written_one() {
+        assert_eq!(
+            name_create_table("CREATE TABLE t (x int)", "app.t").unwrap(),
+            "CREATE TABLE \"app.t\" (x int)"
+        );
+        assert_eq!(
+            name_create_table("CREATE TABLE \"app\".t(x int)", "app.t").unwrap(),
+            "CREATE TABLE \"app.t\"(x int)"
+        );
+        assert_eq!(
+            name_create_table("create table if not exists app . \"T\" (x int)", "app.T").unwrap(),
+            "create table if not exists \"app.T\" (x int)"
+        );
+        assert_eq!(
+            name_create_table("CREATE TABLE t (x int)", "t").unwrap(),
+            "CREATE TABLE t (x int)"
+        );
+        assert_eq!(name_create_table("SELECT 1", "t").unwrap(), "SELECT 1");
+    }
+
+    #[test]
+    fn name_create_table_drops_the_database_of_a_name_that_is_already_the_stored_name() {
+        assert_eq!(
+            name_create_table(
+                "CREATE TABLE main.\"pg_turso_schema_app\" (schema_name TEXT)",
+                "pg_turso_schema_app"
+            )
+            .unwrap(),
+            "CREATE TABLE pg_turso_schema_app (schema_name TEXT)"
+        );
+        assert_eq!(
+            name_create_table("CREATE TABLE public.t2(a INT)", "t2").unwrap(),
+            "CREATE TABLE t2(a INT)"
+        );
+    }
 
     #[test]
     fn test_parse_simple_select() {

@@ -5115,6 +5115,16 @@ fn serial_sequence_namespace(tbl_name: &ast::QualifiedName) -> String {
         .unwrap_or_else(|| "main".to_string())
 }
 
+/// What is put in front of the name of an object of schema `schema` to get
+/// the name it is stored under in the main database: table `t` of schema
+/// `s` is stored as `s.t`, and the objects of public keep their names.
+pub fn stored_name_prefix(schema: &str) -> String {
+    if schema.is_empty() || map_schema_name(schema) == "main" {
+        return String::new();
+    }
+    format!("{}.", schema.to_ascii_lowercase())
+}
+
 /// Maps a PostgreSQL schema name to the Turso schema that holds its tables.
 fn map_schema_name(schema: &str) -> &str {
     match schema.to_ascii_lowercase().as_str() {
@@ -5712,12 +5722,15 @@ fn extract_key_columns(keys: &[pg_query::protobuf::Node]) -> Result<Vec<String>,
 fn extract_foreign_key(
     constraint: &pg_query::protobuf::Constraint,
 ) -> Result<PgForeignKey, ParseError> {
-    let ref_table = constraint
+    let pktable = constraint
         .pktable
         .as_ref()
-        .ok_or_else(|| ParseError::ParseError("REFERENCES missing table name".into()))?
-        .relname
-        .clone();
+        .ok_or_else(|| ParseError::ParseError("REFERENCES missing table name".into()))?;
+    let ref_table = format!(
+        "{}{}",
+        stored_name_prefix(&pktable.schemaname),
+        pktable.relname
+    );
     let ref_columns = extract_key_columns(&constraint.pk_attrs)?;
     let on_delete = pg_fk_action_to_string(&constraint.fk_del_action)?;
     let on_update = pg_fk_action_to_string(&constraint.fk_upd_action)?;

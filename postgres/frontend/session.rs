@@ -1,13 +1,13 @@
 use chumsky::{error::EmptyErr, prelude::*};
 use std::borrow::Cow;
-use std::collections::HashMap;
 use std::num::NonZero;
 use std::str;
 use std::sync::{Arc, Mutex};
 
 use crate::catalog::{self, PostgresDialect};
 use crate::functions::ConfigParameter;
-use turso_core::{Connection, LimboError, Result, Statement, Value};
+use turso_core::schema::SEQ_BACKING_TABLE_PREFIX;
+use turso_core::{Connection, LimboError, Namespace, Result, Statement, Value};
 use turso_parser::ast::{self};
 use turso_pg_parser::translator::{
     check_set_transaction, is_comment_on, is_refresh_matview, try_extract_copy_from,
@@ -37,6 +37,13 @@ struct SessionState {
 type PgSessionState = Mutex<SessionState>;
 
 pub(crate) const DEFAULT_SEARCH_PATH: &str = "\"$user\", public";
+
+/// The prefix of the name of the table that marks that a schema exists.
+/// Table `t` of schema `s` is table `s.t` of the main database, and an
+/// empty schema has no table, so each schema has a marker table. The
+/// marker is a row of the schema, so the schemas are rebuilt from the
+/// schema whenever it reloads.
+const SCHEMA_MARKER_PREFIX: &str = "pg_turso_schema_";
 
 /// Open a database with the PostgreSQL schema dialect, resolving the IO
 /// backend from `vfs` or the path like [`turso_core::Database::open_new`].
@@ -82,6 +89,7 @@ impl PgConnection {
             "public",
             turso_core::MAIN_DB_ID,
         ));
+        sync_namespaces(&conn);
         set_search_path(&conn, None)?;
         Ok(Self {
             inner: Arc::new(PgConnectionInner { conn }),
@@ -179,6 +187,7 @@ fn prepare_statement(pg_conn: &Arc<PgConnectionInner>, sql: &str) -> Result<Stat
     }
 
     reject_sqlite_catalog_access(sql)?;
+    sync_namespaces(&pg_conn.conn);
 
     if let Some(stmt) = try_prepare_special(pg_conn, sql)? {
         return Ok(stmt);
@@ -214,11 +223,29 @@ fn prepare_statement(pg_conn: &Arc<PgConnectionInner>, sql: &str) -> Result<Stat
 
     for prereq in translated.prereqs {
         let input = prereq.to_string();
-        let mut stmt = pg_conn.conn.prepare_translated_stmt(prereq, &input)?;
+        let mut stmt = pg_conn
+            .conn
+            .prepare_translated_stmt(prereq, &input)
+            .map_err(schema_error)?;
         stmt.run_ignore_rows()?;
     }
 
-    pg_conn.conn.prepare_translated_cmd(translated.cmd, &sql)
+    pg_conn
+        .conn
+        .prepare_translated_cmd(translated.cmd, &sql)
+        .map_err(schema_error)
+}
+
+/// Core reports a name whose namespace does not exist as a missing
+/// database; in PostgreSQL that is a missing schema.
+fn schema_error(error: LimboError) -> LimboError {
+    let LimboError::InvalidArgument(message) = &error else {
+        return error;
+    };
+    match message.strip_prefix("no such database: ") {
+        Some(schema) => LimboError::ParseError(format!("schema \"{schema}\" does not exist")),
+        None => error,
+    }
 }
 
 /// The schema that a CREATE TABLE statement naming its table without a
@@ -246,52 +273,52 @@ fn create_table_schema_from_search_path(
 /// sequence named `name`, which makes PostgreSQL choose another name for a
 /// new index on the table. A table named with a schema is in that schema.
 /// Otherwise the table is looked up in the same order as core does: temp
-/// first, then the databases of the search path. Main when no database has
-/// the table.
+/// first, then the namespaces of the search path. Main when no namespace
+/// has the table.
 fn relation_name_is_taken(
     conn: &Arc<Connection>,
     schema: Option<&str>,
     table: &str,
     name: &str,
 ) -> Result<bool> {
-    let database_names: HashMap<usize, String> = conn
-        .list_all_databases()
-        .into_iter()
-        .map(|(id, database, _)| (id, database))
-        .collect();
-    let databases: Vec<String> = match schema {
-        Some(schema) if schema.eq_ignore_ascii_case("public") => vec!["main".to_string()],
-        Some(schema) => database_names
-            .values()
-            .filter(|database| database.eq_ignore_ascii_case(schema))
-            .cloned()
-            .collect(),
-        None => database_names
-            .contains_key(&turso_core::TEMP_DB_ID)
-            .then_some(turso_core::TEMP_DB_ID)
-            .into_iter()
-            .chain(conn.search_order())
-            .chain(std::iter::once(turso_core::MAIN_DB_ID))
-            .map(|id| database_names[&id].clone())
-            .collect(),
+    let namespaces: Vec<Namespace> = match schema {
+        Some(schema) => conn.namespace(&schema.to_lowercase()).into_iter().collect(),
+        None => {
+            let has_temp = conn
+                .list_all_databases()
+                .iter()
+                .any(|(id, _, _)| *id == turso_core::TEMP_DB_ID);
+            has_temp
+                .then(|| Namespace::database("temp", turso_core::TEMP_DB_ID))
+                .into_iter()
+                .chain(conn.search_order())
+                .chain(std::iter::once(Namespace::database(
+                    "main",
+                    turso_core::MAIN_DB_ID,
+                )))
+                .collect()
+        }
     };
     let mut taken = false;
-    for database in databases {
+    for namespace in namespaces {
+        let database = conn
+            .namespace_name(namespace.database_id)
+            .expect("the database of a namespace has a name");
         let mut stmt = conn.prepare_sqlite(format!(
             "SELECT \
              EXISTS (SELECT 1 FROM \"{database}\".sqlite_schema \
                      WHERE type = 'table' AND name COLLATE NOCASE = ?1), \
              EXISTS (SELECT 1 FROM \"{database}\".sqlite_schema \
                      WHERE type IN ('table', 'index', 'view') \
-                     AND name COLLATE NOCASE IN (?2, '{SEQUENCE_TABLE_PREFIX}' || ?2))"
+                     AND name COLLATE NOCASE IN (?2, '{SEQ_BACKING_TABLE_PREFIX}' || ?2))"
         ))?;
         stmt.bind_at(
             NonZero::new(1).unwrap(),
-            Value::build_text(table.to_string()),
+            Value::build_text(namespace.stored_name(table)),
         )?;
         stmt.bind_at(
             NonZero::new(2).unwrap(),
-            Value::build_text(name.to_string()),
+            Value::build_text(namespace.stored_name(name)),
         )?;
         let row = &stmt.run_collect_rows()?[0];
         taken = row[1] == Value::from_i64(1);
@@ -581,7 +608,7 @@ fn handle_pg_create_schema(
         )));
     }
 
-    if schema_exists(conn, &name)? {
+    if schema_exists(conn, &name) {
         if stmt.if_not_exists {
             return Ok(());
         }
@@ -594,20 +621,30 @@ fn handle_pg_create_schema(
             "unacceptable schema name \"{name}\": the prefix \"pg_\" is reserved for system schemas"
         )));
     }
+    let prefix = schema_prefix(&name);
+    if let Some(object) = object_names(&conn.current_schema())
+        .into_iter()
+        .find(|object| object.starts_with(&prefix))
+    {
+        return Err(LimboError::ParseError(format!(
+            "cannot create schema \"{name}\": the name of \"{object}\" in public starts with it"
+        )));
+    }
 
-    // A failed element is undone by dropping the schema, and DETACH cannot
-    // run inside a transaction.
     if !stmt.elements.is_empty() && !conn.get_auto_commit() {
         return Err(LimboError::ParseError(
             "CREATE SCHEMA with schema elements cannot run inside a transaction block".to_string(),
         ));
     }
 
-    let path = schema_file_path(conn, &name);
     execute_sqlite(
         conn,
-        format!("ATTACH '{}' AS \"{}\"", path.replace('\'', "''"), name),
+        format!(
+            "CREATE TABLE main.\"{}\" (schema_name TEXT)",
+            schema_marker_table(&name).replace('"', "\"\"")
+        ),
     )?;
+    sync_namespaces(conn);
     if stmt.elements.is_empty() {
         return Ok(());
     }
@@ -637,22 +674,9 @@ fn handle_pg_create_schema(
     Ok(())
 }
 
-fn schema_file_path(conn: &Connection, schema_name: &str) -> String {
-    let main_path = conn.db_file_path();
-    let filename = format!("turso-postgres-schema-{schema_name}.db");
-    if main_path == ":memory:" {
-        filename
-    } else {
-        let parent = std::path::Path::new(&main_path)
-            .parent()
-            .unwrap_or_else(|| std::path::Path::new("."));
-        parent.join(&filename).to_string_lossy().to_string()
-    }
-}
-
 fn handle_pg_drop_schema(conn: &Arc<Connection>, stmt: &PgDropSchemaStmt) -> Result<()> {
     let name = stmt.name.to_lowercase();
-    if name != "public" && !schema_exists(conn, &name)? {
+    if name != "public" && !schema_exists(conn, &name) {
         if stmt.if_exists {
             return Ok(());
         }
@@ -661,8 +685,7 @@ fn handle_pg_drop_schema(conn: &Arc<Connection>, stmt: &PgDropSchemaStmt) -> Res
         )));
     }
 
-    let database = if name == "public" { "main" } else { &name };
-    let objects = schema_objects(conn, database)?;
+    let objects = schema_objects(conn, &name);
     if !stmt.cascade && !objects.is_empty() {
         return Err(LimboError::ParseError(format!(
             "cannot drop schema \"{name}\" because other objects depend on it"
@@ -671,7 +694,7 @@ fn handle_pg_drop_schema(conn: &Arc<Connection>, stmt: &PgDropSchemaStmt) -> Res
 
     without_foreign_keys(conn, || {
         for object in &objects {
-            execute_sqlite(conn, object.drop_sql(database))?;
+            execute_sqlite(conn, object.drop_sql())?;
         }
         Ok(())
     })?;
@@ -680,7 +703,15 @@ fn handle_pg_drop_schema(conn: &Arc<Connection>, stmt: &PgDropSchemaStmt) -> Res
     if name == "public" {
         return Ok(());
     }
-    execute_sqlite(conn, format!("DETACH \"{name}\""))
+    execute_sqlite(
+        conn,
+        format!(
+            "DROP TABLE main.\"{}\"",
+            schema_marker_table(&name).replace('"', "\"\"")
+        ),
+    )?;
+    sync_namespaces(conn);
+    Ok(())
 }
 
 /// Runs `f` with foreign keys not enforced. DROP SCHEMA ... CASCADE drops
@@ -694,7 +725,8 @@ fn without_foreign_keys(conn: &Arc<Connection>, f: impl FnOnce() -> Result<()>) 
     result
 }
 
-/// An object of a schema, which DROP SCHEMA ... CASCADE drops.
+/// An object of a schema, which DROP SCHEMA ... CASCADE drops, by its
+/// stored name.
 enum SchemaObject {
     View(String),
     Table(String),
@@ -702,16 +734,15 @@ enum SchemaObject {
 }
 
 impl SchemaObject {
-    fn drop_sql(&self, database: &str) -> String {
+    /// The statement that drops the object. The stored name is qualified
+    /// with main so that the search path does not change what it names.
+    fn drop_sql(&self) -> String {
         let kind = match self {
             SchemaObject::View(_) => "VIEW",
             SchemaObject::Table(_) => "TABLE",
             SchemaObject::Sequence(_) => "SEQUENCE",
         };
-        format!(
-            "DROP {kind} \"{database}\".\"{}\"",
-            self.name().replace('"', "\"\"")
-        )
+        format!("DROP {kind} main.\"{}\"", self.name().replace('"', "\"\""))
     }
 
     fn name(&self) -> &str {
@@ -723,37 +754,128 @@ impl SchemaObject {
     }
 }
 
-/// The table in which core stores sequence `s` is named
-/// `__turso_internal_seq_s`.
-const SEQUENCE_TABLE_PREFIX: &str = "__turso_internal_seq_";
-
-/// The objects of the schema that database `database` holds, in the order
-/// that DROP SCHEMA drops them: views first, because they depend on tables.
-/// Indexes and triggers go with their tables.
-fn schema_objects(conn: &Arc<Connection>, database: &str) -> Result<Vec<SchemaObject>> {
-    let mut stmt = conn.prepare_sqlite(format!(
-        "SELECT type, name FROM \"{database}\".sqlite_schema \
-         WHERE type IN ('view', 'table') ORDER BY name"
-    ))?;
-    let mut views = Vec::new();
-    let mut tables = Vec::new();
-    let mut sequences = Vec::new();
-    for row in stmt.run_collect_rows()? {
-        let (Some(Value::Text(kind)), Some(Value::Text(name))) = (row.first(), row.get(1)) else {
-            continue;
+/// The objects of schema `schema`, in the order that DROP SCHEMA drops
+/// them: views first, because they depend on tables. Indexes and triggers
+/// go with their tables. An object is in public when its stored name has
+/// no schema's prefix.
+fn schema_objects(conn: &Arc<Connection>, schema: &str) -> Vec<SchemaObject> {
+    let current = conn.current_schema();
+    let prefixes: Vec<String> = schema_names(conn)
+        .iter()
+        .map(|name| schema_prefix(name))
+        .collect();
+    let in_schema = |stored: &str| {
+        let in_this_schema = if schema == "public" {
+            !prefixes.iter().any(|prefix| stored.starts_with(prefix))
+        } else {
+            stored.starts_with(&schema_prefix(schema))
         };
-        let name = name.as_str().to_string();
-        if kind.as_str() == "view" {
-            views.push(SchemaObject::View(name));
-        } else if let Some(sequence) = name.strip_prefix(SEQUENCE_TABLE_PREFIX) {
-            if !sequence.starts_with("__turso_internal_") {
-                sequences.push(SchemaObject::Sequence(sequence.to_string()));
-            }
-        } else if !name.starts_with("sqlite_") && !name.starts_with("__turso_internal_") {
-            tables.push(SchemaObject::Table(name));
+        in_this_schema
+            && !stored.starts_with("sqlite_")
+            && !stored.starts_with("__turso_internal_")
+            && !stored.starts_with(SCHEMA_MARKER_PREFIX)
+    };
+    let mut views: Vec<String> = current
+        .views
+        .keys()
+        .chain(current.materialized_view_names.iter())
+        .filter(|name| in_schema(name))
+        .cloned()
+        .collect();
+    let mut tables: Vec<String> = current
+        .tables
+        .iter()
+        .filter(|(name, table)| {
+            in_schema(name)
+                && matches!(table.as_ref(), turso_core::schema::Table::BTree(_))
+                && !current.materialized_view_names.contains(*name)
+        })
+        .map(|(name, _)| name.clone())
+        .collect();
+    let mut sequences: Vec<String> = current
+        .sequences
+        .keys()
+        .filter(|name| in_schema(name))
+        .cloned()
+        .collect();
+    views.sort();
+    tables.sort();
+    sequences.sort();
+    views
+        .into_iter()
+        .map(SchemaObject::View)
+        .chain(tables.into_iter().map(SchemaObject::Table))
+        .chain(sequences.into_iter().map(SchemaObject::Sequence))
+        .collect()
+}
+
+/// The names of the tables, views and sequences of the main database.
+fn object_names(schema: &turso_core::schema::Schema) -> Vec<String> {
+    schema
+        .tables
+        .keys()
+        .chain(schema.views.keys())
+        .chain(schema.materialized_view_names.iter())
+        .chain(schema.sequences.keys())
+        .cloned()
+        .collect()
+}
+
+/// The schemas other than public: the names of the marker tables of the
+/// main database, in name order.
+fn schema_names(conn: &Connection) -> Vec<String> {
+    let mut names: Vec<String> = conn
+        .current_schema()
+        .tables
+        .keys()
+        .filter_map(|table| table.strip_prefix(SCHEMA_MARKER_PREFIX))
+        .map(str::to_string)
+        .collect();
+    names.sort();
+    names
+}
+
+fn schema_exists(conn: &Connection, schema_name: &str) -> bool {
+    schema_names(conn).iter().any(|name| name == schema_name)
+}
+
+fn schema_prefix(name: &str) -> String {
+    turso_pg_parser::translator::stored_name_prefix(name)
+}
+
+fn schema_marker_table(name: &str) -> String {
+    format!("{SCHEMA_MARKER_PREFIX}{name}")
+}
+
+/// Makes the namespaces of the connection the schemas of the main
+/// database: one per marker table, besides public. The marker tables are
+/// rows of the schema, so this follows every schema change, including
+/// those of other connections and rolled back ones.
+pub(crate) fn sync_namespaces(conn: &Connection) {
+    conn.maybe_update_schema();
+    let wanted = schema_names(conn);
+    let current: Vec<String> = conn
+        .other_namespaces()
+        .into_iter()
+        .filter(|namespace| {
+            namespace.database_id == turso_core::MAIN_DB_ID && !namespace.prefix.is_empty()
+        })
+        .map(|namespace| namespace.name)
+        .collect();
+    for name in &current {
+        if !wanted.contains(name) {
+            conn.remove_namespace(name);
         }
     }
-    Ok(views.into_iter().chain(tables).chain(sequences).collect())
+    for name in wanted {
+        if !current.contains(&name) {
+            conn.add_namespace(turso_core::Namespace {
+                prefix: schema_prefix(&name),
+                name,
+                database_id: turso_core::MAIN_DB_ID,
+            });
+        }
+    }
 }
 
 fn handle_pg_copy_from(conn: &Arc<Connection>, stmt: &PgCopyFromStmt) -> Result<usize> {
@@ -848,16 +970,6 @@ fn get_table_columns(
             _ => None,
         })
         .collect())
-}
-
-fn schema_exists(conn: &Arc<Connection>, schema_name: &str) -> Result<bool> {
-    let sql = format!(
-        "SELECT 1 FROM pragma_database_list WHERE name = '{}'",
-        schema_name.replace('\'', "''")
-    );
-    let mut stmt = conn.prepare_internal(&sql)?;
-    let rows = stmt.run_collect_rows()?;
-    Ok(!rows.is_empty())
 }
 
 #[cfg(test)]

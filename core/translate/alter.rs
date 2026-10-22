@@ -1431,7 +1431,8 @@ pub fn translate_alter_table(
             )?
         }
         ast::AlterTableBody::RenameTo(new_name) => {
-            let new_name = new_name.as_str();
+            let new_name_in_sql = resolved.namespace.name_in_sql(&new_name);
+            let new_name = new_name_in_sql.as_str();
             let normalized_old_name = normalize_ident(table_name);
             let normalized_new_name = normalize_ident(new_name);
             let mut temp_triggers_to_rewrite: Vec<(String, String, bool)> = Vec::new();
