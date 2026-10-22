@@ -4210,6 +4210,21 @@ impl PostgreSQLTranslator {
             SubLinkType::ExprSublink => Ok(ast::Expr::Subquery(select)),
             SubLinkType::ArraySublink => Ok(Self::translate_array_subquery(*select)),
             SubLinkType::AnySublink => {
+                // Only `= ANY` (which is also how IN is parsed) maps to IN;
+                // `x > ANY (SELECT ...)` and friends would become IN.
+                let op = extract_key_columns(&sub_link.oper_name)?;
+                let is_equality = match op.as_slice() {
+                    [] => true,
+                    [op] => op == "=",
+                    [schema, op] => schema == "pg_catalog" && op == "=",
+                    _ => false,
+                };
+                if !is_equality {
+                    return Err(not_supported(format!(
+                        "{} ANY/SOME (subquery)",
+                        op.last().map(String::as_str).unwrap_or_default()
+                    )));
+                }
                 // ANY/IN subquery: testexpr IN (SELECT ...)
                 let test_node = sub_link.testexpr.as_ref().ok_or_else(|| {
                     ParseError::ParseError("ANY SubLink missing testexpr".to_string())
@@ -9797,5 +9812,14 @@ mod tests {
             "SELECT string_agg(a, ',' ORDER BY a USING <) FROM t",
             "USING operator",
         );
+    }
+
+    #[test]
+    fn fail_closed_any_sublink_operators() {
+        assert_not_supported("SELECT 1 > ANY (SELECT a FROM t)", "> ANY/SOME");
+        assert_not_supported("SELECT 1 <> SOME (SELECT a FROM t)", "<> ANY/SOME");
+        assert_translates("SELECT 1 = ANY (SELECT a FROM t)");
+        assert_translates("SELECT 1 IN (SELECT a FROM t)");
+        assert_translates("SELECT 1 NOT IN (SELECT a FROM t)");
     }
 }
