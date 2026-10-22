@@ -3258,11 +3258,10 @@ impl PostgreSQLTranslator {
             AExprKind::AexprLike | AExprKind::AexprIlike => self.translate_like_expr(a_expr),
             AExprKind::AexprOpAny => self.translate_any_all_expr(a_expr, false),
             AExprKind::AexprOpAll => self.translate_any_all_expr(a_expr, true),
-            AExprKind::AexprBetween | AExprKind::AexprBetweenSym => {
-                self.translate_between_expr(a_expr, false)
-            }
-            AExprKind::AexprNotBetween | AExprKind::AexprNotBetweenSym => {
-                self.translate_between_expr(a_expr, true)
+            AExprKind::AexprBetween => self.translate_between_expr(a_expr, false),
+            AExprKind::AexprNotBetween => self.translate_between_expr(a_expr, true),
+            AExprKind::AexprBetweenSym | AExprKind::AexprNotBetweenSym => {
+                Err(not_supported("BETWEEN SYMMETRIC"))
             }
             AExprKind::AexprDistinct => {
                 // IS DISTINCT FROM → lhs IS NOT rhs
@@ -9726,5 +9725,15 @@ mod tests {
         assert_not_supported("SELECT CURRENT_TIMESTAMP(3)", "fractional-second precision");
         assert_not_supported("SELECT LOCALTIME(6)", "fractional-second precision");
         assert_translates("SELECT CURRENT_TIMESTAMP(0), CURRENT_TIMESTAMP, LOCALTIMESTAMP");
+    }
+
+    #[test]
+    fn fail_closed_between_symmetric() {
+        assert_not_supported("SELECT 5 BETWEEN SYMMETRIC 10 AND 1", "BETWEEN SYMMETRIC");
+        assert_not_supported(
+            "SELECT 5 NOT BETWEEN SYMMETRIC 10 AND 1",
+            "BETWEEN SYMMETRIC",
+        );
+        assert_translates("SELECT 5 BETWEEN ASYMMETRIC 1 AND 10");
     }
 }
