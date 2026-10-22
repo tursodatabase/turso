@@ -309,6 +309,7 @@ impl PostgreSQLTranslator {
                     columns.push(col);
                 }
                 Node::Constraint(constraint) => {
+                    reject_constraint_attributes(constraint)?;
                     let contype =
                         ConstrType::try_from(constraint.contype).unwrap_or(ConstrType::Undefined);
                     match contype {
@@ -463,6 +464,7 @@ impl PostgreSQLTranslator {
             let Some(Node::Constraint(constraint)) = &constraint_node.node else {
                 continue;
             };
+            reject_constraint_attributes(constraint)?;
             let contype = ConstrType::try_from(constraint.contype).unwrap_or(ConstrType::Undefined);
             match contype {
                 ConstrType::ConstrPrimary => is_primary_key = true,
@@ -876,6 +878,7 @@ impl PostgreSQLTranslator {
             let Some(Node::Constraint(constraint)) = &constraint_node.node else {
                 continue;
             };
+            reject_constraint_attributes(constraint)?;
             let contype = ConstrType::try_from(constraint.contype).unwrap_or(ConstrType::Undefined);
             let constraint_ast = match contype {
                 ConstrType::ConstrPrimary => Some(ast::ColumnConstraint::PrimaryKey {
@@ -4472,6 +4475,7 @@ impl PostgreSQLTranslator {
             let Some(Node::Constraint(constraint)) = &constraint_node.node else {
                 continue;
             };
+            reject_constraint_attributes(constraint)?;
             let contype = ConstrType::try_from(constraint.contype).unwrap_or(ConstrType::Undefined);
             match contype {
                 ConstrType::ConstrDefault => {
@@ -6108,6 +6112,33 @@ fn drop_object_type_name(obj_type: pg_query::protobuf::ObjectType) -> String {
         .strip_prefix("Object")
         .unwrap_or(&debug)
         .to_ascii_uppercase()
+}
+
+fn not_supported(what: impl std::fmt::Display) -> ParseError {
+    ParseError::ParseError(format!("{what} is not supported"))
+}
+
+/// Rejects constraint clauses that have no Turso equivalent. The parser
+/// accepts the full PostgreSQL grammar, so a clause that is not translated
+/// must fail here instead of being dropped.
+fn reject_constraint_attributes(
+    constraint: &pg_query::protobuf::Constraint,
+) -> Result<(), ParseError> {
+    use pg_query::protobuf::ConstrType;
+
+    let contype = ConstrType::try_from(constraint.contype).unwrap_or(ConstrType::Undefined);
+    // Table-level constraints carry deferral as flags; column-level ones get
+    // separate attribute nodes after the constraint they modify.
+    if constraint.deferrable
+        || constraint.initdeferred
+        || matches!(
+            contype,
+            ConstrType::ConstrAttrDeferrable | ConstrType::ConstrAttrDeferred
+        )
+    {
+        return Err(not_supported("DEFERRABLE / INITIALLY DEFERRED constraints"));
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -8751,5 +8782,45 @@ mod tests {
             };
             assert!(select.with.is_some(), "{sql}: WITH clause was dropped");
         }
+    }
+
+    /// Asserts that `sql` is rejected with a "not supported" error that
+    /// mentions `needle`, instead of being translated with part of its
+    /// meaning silently dropped.
+    fn assert_not_supported(sql: &str, needle: &str) {
+        let parsed = crate::parse(sql).unwrap();
+        let err = PostgreSQLTranslator::new()
+            .translate_with_prereqs(&parsed)
+            .expect_err(sql)
+            .to_string();
+        assert!(
+            err.contains("not supported") && err.contains(needle),
+            "{sql}: expected a not-supported error mentioning {needle:?}, got: {err}"
+        );
+    }
+
+    /// Asserts that `sql` translates without error.
+    fn assert_translates(sql: &str) {
+        let parsed = crate::parse(sql).unwrap();
+        if let Err(err) = PostgreSQLTranslator::new().translate_with_prereqs(&parsed) {
+            panic!("{sql}: {err}");
+        }
+    }
+
+    #[test]
+    fn fail_closed_deferrable_constraints() {
+        for sql in [
+            "CREATE TABLE c (pid int REFERENCES p(id) DEFERRABLE INITIALLY DEFERRED)",
+            "CREATE TABLE c (pid int REFERENCES p(id) DEFERRABLE)",
+            "CREATE TABLE c (pid int, FOREIGN KEY (pid) REFERENCES p(id) DEFERRABLE INITIALLY DEFERRED)",
+            "CREATE TABLE c (id int, UNIQUE (id) DEFERRABLE)",
+            "ALTER TABLE c ADD COLUMN pid int UNIQUE DEFERRABLE",
+        ] {
+            assert_not_supported(sql, "DEFERRABLE");
+        }
+        // Restating the defaults is fine.
+        assert_translates(
+            "CREATE TABLE c (pid int REFERENCES p(id) NOT DEFERRABLE INITIALLY IMMEDIATE)",
+        );
     }
 }
