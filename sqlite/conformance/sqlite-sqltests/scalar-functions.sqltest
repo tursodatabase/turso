@@ -670,6 +670,28 @@ expect {
     X'AABB'
 }
 
+test unhex-separators-from-non-text-value {
+    SELECT quote(unhex('12-34', -1)), quote(unhex('1234', 0)), quote(unhex('12.34', 0.5)), quote(unhex('12 34', x'20'));
+}
+expect {
+    X'1234'|X'1234'|X'1234'|X'1234'
+}
+
+test unhex-separators-from-integer-expression {
+    WITH t(c) AS (VALUES (-17))
+    SELECT quote(unhex(c, c)), quote(unhex('12-34', c)) FROM t;
+}
+expect {
+    X'17'|X'1234'
+}
+
+test unhex-null-separators {
+    SELECT quote(unhex('12', NULL));
+}
+expect {
+    NULL
+}
+
 test trim {
     SELECT trim('   Limbo    ');
 }

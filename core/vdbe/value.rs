@@ -687,10 +687,9 @@ impl Value {
                     }
                     None => Value::Null,
                 },
-                Some(ignore) => match ignore {
-                    Value::Text(_) => {
+                Some(ignore) => match ignore.cast_text_ref() {
+                    Some(ignore) => {
                         let input = self.to_string();
-                        let ignore = ignore.to_string();
                         let mut chars = input.chars().peekable();
                         let mut out =
                             <crate::ValueBlob as crate::alloc::TursoVecExt<u8>>::with_capacity(
@@ -725,7 +724,7 @@ impl Value {
                             out.push(((hi << 4) | lo) as u8);
                         }
                     }
-                    _ => Value::Null,
+                    None => Value::Null,
                 },
             },
         }
