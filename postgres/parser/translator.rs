@@ -4531,11 +4531,24 @@ fn rename_result_columns(select: &mut ast::Select, names: &[String]) -> Result<(
     if names.is_empty() {
         return Ok(());
     }
-    let ast::OneSelect::Select { columns, .. } = &mut select.body.select else {
+    if !select.order_by.is_empty() {
+        return Err(ParseError::ParseError(
+            "a column alias list on a subquery with ORDER BY is not supported".into(),
+        ));
+    }
+    let ast::OneSelect::Select {
+        columns, group_by, ..
+    } = &mut select.body.select
+    else {
         return Err(ParseError::ParseError(
             "a column alias list on a VALUES subquery is not supported".into(),
         ));
     };
+    if group_by.is_some() {
+        return Err(ParseError::ParseError(
+            "a column alias list on a subquery with GROUP BY is not supported".into(),
+        ));
+    }
     // A * expands to an unknown number of columns, so positions after it
     // cannot be matched to names.
     if columns
@@ -5903,6 +5916,18 @@ mod tests {
             (
                 "SELECT * FROM (SELECT 1) AS s(a, b)",
                 "1 columns available but 2",
+            ),
+            (
+                "SELECT * FROM (SELECT b AS a FROM t ORDER BY a LIMIT 1) AS s(x)",
+                "with ORDER BY",
+            ),
+            (
+                "SELECT * FROM (SELECT a AS k, count(*) FROM t GROUP BY k) AS s(x, y)",
+                "with GROUP BY",
+            ),
+            (
+                "SELECT * FROM (SELECT a AS k FROM t UNION SELECT 9 ORDER BY k DESC LIMIT 1) AS s(x)",
+                "with ORDER BY",
             ),
         ] {
             let err = translate(sql).unwrap_err().to_string();
