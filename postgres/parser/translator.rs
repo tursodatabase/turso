@@ -1772,6 +1772,12 @@ impl PostgreSQLTranslator {
             ));
         }
 
+        // Row locks are not taken, so FOR UPDATE / FOR SHARE (and their
+        // NOWAIT / SKIP LOCKED variants) cannot be honoured.
+        if !select.locking_clause.is_empty() {
+            return Err(not_supported("SELECT ... FOR UPDATE / FOR SHARE"));
+        }
+
         // Check if this is a UNION/INTERSECT/EXCEPT (set operation)
         let set_op = select.op();
         if set_op != SetOperation::SetopNone && set_op != SetOperation::Undefined {
@@ -1980,6 +1986,9 @@ impl PostgreSQLTranslator {
             return Err(ParseError::ParseError(
                 "SELECT ... INTO is not allowed here".into(),
             ));
+        }
+        if !select.locking_clause.is_empty() {
+            return Err(not_supported("SELECT ... FOR UPDATE / FOR SHARE"));
         }
 
         let from_clause = if !select.from_clause.is_empty() {
@@ -9420,5 +9429,19 @@ mod tests {
             "parenthesized set operation branch",
         );
         assert_translates("SELECT a FROM t UNION SELECT a FROM u ORDER BY 1 LIMIT 2");
+    }
+
+    #[test]
+    fn fail_closed_locking_clause() {
+        for sql in [
+            "SELECT * FROM t FOR UPDATE",
+            "SELECT * FROM t FOR SHARE NOWAIT",
+            "SELECT * FROM t ORDER BY id LIMIT 1 FOR UPDATE SKIP LOCKED",
+            "SELECT * FROM t FOR NO KEY UPDATE OF t",
+            "(SELECT a FROM t FOR UPDATE) UNION SELECT 1",
+            "SELECT * FROM (SELECT * FROM t FOR UPDATE) s",
+        ] {
+            assert_not_supported(sql, "FOR UPDATE");
+        }
     }
 }
