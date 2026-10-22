@@ -1074,6 +1074,7 @@ impl PostgreSQLTranslator {
         if idx.nulls_not_distinct {
             return Err(not_supported("NULLS NOT DISTINCT"));
         }
+        reject_table_storage_clauses(&idx.options, &idx.table_space, "")?;
         let idx_name = ast::QualifiedName::single(ast::Name::from_string(&idx.idxname));
 
         self.translating_index.set(true);
@@ -9071,5 +9072,14 @@ mod tests {
             "CREATE UNIQUE INDEX i ON t (a) NULLS NOT DISTINCT",
             "NULLS NOT DISTINCT",
         );
+    }
+
+    #[test]
+    fn fail_closed_index_storage_clauses() {
+        assert_not_supported(
+            "CREATE INDEX i ON t (a) WITH (fillfactor = 70)",
+            "storage parameters",
+        );
+        assert_not_supported("CREATE INDEX i ON t (a) TABLESPACE ts", "TABLESPACE");
     }
 }
