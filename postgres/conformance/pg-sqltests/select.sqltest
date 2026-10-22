@@ -893,6 +893,20 @@ expect {
     0|1|0|1|1|1|1|1|1|1|1|0|1
 }
 
+test similar-to-character-classes-and-operators {
+    SELECT CASE WHEN '[a' SIMILAR TO '[[]a' THEN 1 ELSE 0 END, CASE WHEN 'a&&b' SIMILAR TO 'a[&&]+b' THEN 1 ELSE 0 END, CASE WHEN '~' SIMILAR TO '[a~~b]' THEN 1 ELSE 0 END, CASE WHEN 'a--b' SIMILAR TO 'a[--]+b' THEN 1 ELSE 0 END, CASE WHEN ']' SIMILAR TO '[]abc]' THEN 1 ELSE 0 END, CASE WHEN 'x' SIMILAR TO '[^]abc]' THEN 1 ELSE 0 END, CASE WHEN 'hello' SIMILAR TO '[a-z]+' THEN 1 ELSE 0 END;
+}
+expect {
+    1|1|1|1|1|1|1
+}
+
+test similar-to-null-operands {
+    SELECT NULL SIMILAR TO 'hel%', 'hello' SIMILAR TO NULL, NULL SIMILAR TO NULL;
+}
+expect {
+    ||
+}
+
 test with-clause-on-set-operation-and-values {
     WITH c AS (SELECT 1 AS x) SELECT x FROM c UNION SELECT 2 ORDER BY 1;
     WITH c AS (SELECT 3 AS x) VALUES ((SELECT x FROM c));

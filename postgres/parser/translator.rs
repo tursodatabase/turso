@@ -3013,7 +3013,7 @@ impl PostgreSQLTranslator {
                             .strip_prefix('\'')
                             .and_then(|s| s.strip_suffix('\''))
                             .unwrap_or(pat);
-                        let regex = similar_to_regex(unquoted);
+                        let regex = similar_to_regex(unquoted)?;
                         // Re-wrap with quotes for the AST
                         ast::Expr::Literal(ast::Literal::String(format!("'{regex}'")))
                     }
@@ -6024,30 +6024,110 @@ fn like_pattern_to_glob(pattern: &str) -> Option<String> {
     (glob.len() <= SQLITE_MAX_LIKE_PATTERN_LENGTH).then_some(glob)
 }
 
-/// Convert a SQL SIMILAR TO pattern to a regex anchored with ^(?:...)$.
-/// `%` → `.*`, `_` → `.`, and `.`, `^`, `$`, which are literals in SIMILAR TO,
-/// are escaped; other regex metacharacters and escapes are kept as-is.
-fn similar_to_regex(pattern: &str) -> String {
+fn similar_to_regex(pattern: &str) -> Result<String, ParseError> {
+    const POSIX_CLASSES: &[&str] = &[
+        "[:alnum:]",
+        "[:alpha:]",
+        "[:ascii:]",
+        "[:blank:]",
+        "[:cntrl:]",
+        "[:digit:]",
+        "[:graph:]",
+        "[:lower:]",
+        "[:print:]",
+        "[:punct:]",
+        "[:space:]",
+        "[:upper:]",
+        "[:word:]",
+        "[:xdigit:]",
+        "[:^alnum:]",
+        "[:^alpha:]",
+        "[:^ascii:]",
+        "[:^blank:]",
+        "[:^cntrl:]",
+        "[:^digit:]",
+        "[:^graph:]",
+        "[:^lower:]",
+        "[:^print:]",
+        "[:^punct:]",
+        "[:^space:]",
+        "[:^upper:]",
+        "[:^word:]",
+        "[:^xdigit:]",
+    ];
+
     let mut regex = String::with_capacity(pattern.len() + 8);
     regex.push_str("^(?:");
     let mut in_bracket = false;
-    let mut chars = pattern.chars().peekable();
-    while let Some(c) = chars.next() {
+    let mut bracket_at_start = false;
+    let chars: Vec<char> = pattern.chars().collect();
+    let mut i = 0;
+    while i < chars.len() {
+        let c = chars[i];
         if in_bracket {
-            regex.push(c);
-            if c == ']' {
-                in_bracket = false;
+            match c {
+                '\\' => {
+                    regex.push('\\');
+                    i += 1;
+                    if i < chars.len() {
+                        regex.push(chars[i]);
+                    }
+                    bracket_at_start = false;
+                }
+                ']' if bracket_at_start => {
+                    regex.push(']');
+                    bracket_at_start = false;
+                }
+                ']' => {
+                    regex.push(']');
+                    in_bracket = false;
+                }
+                '[' => {
+                    let remaining: String = chars[i..].iter().collect();
+                    if let Some(&posix) = POSIX_CLASSES.iter().find(|&&p| remaining.starts_with(p))
+                    {
+                        regex.push_str(posix);
+                        i += posix.chars().count() - 1;
+                    } else {
+                        regex.push_str("\\[");
+                    }
+                    bracket_at_start = false;
+                }
+                '&' if i + 1 < chars.len() && chars[i + 1] == '&' => {
+                    regex.push('&');
+                    regex.push_str("\\&");
+                    i += 1;
+                    bracket_at_start = false;
+                }
+                '~' if i + 1 < chars.len() && chars[i + 1] == '~' => {
+                    regex.push('~');
+                    regex.push_str("\\~");
+                    i += 1;
+                    bracket_at_start = false;
+                }
+                '-' if i + 1 < chars.len() && chars[i + 1] == '-' => {
+                    regex.push('-');
+                    regex.push_str("\\-");
+                    i += 1;
+                    bracket_at_start = false;
+                }
+                other => {
+                    regex.push(other);
+                    bracket_at_start = false;
+                }
             }
+            i += 1;
             continue;
         }
+
         match c {
             '%' => regex.push_str(".*"),
             '_' => regex.push('.'),
             '\\' => {
-                // Escaped character: pass through literally
-                if let Some(next) = chars.next() {
+                if i + 1 < chars.len() {
                     regex.push('\\');
-                    regex.push(next);
+                    i += 1;
+                    regex.push(chars[i]);
                 }
             }
             '.' | '^' | '$' => {
@@ -6056,19 +6136,33 @@ fn similar_to_regex(pattern: &str) -> String {
             }
             '[' => {
                 in_bracket = true;
-                regex.push(c);
-                if chars.peek() == Some(&'^') {
-                    regex.push(chars.next().unwrap());
+                regex.push('[');
+                if i + 1 < chars.len() && chars[i + 1] == '^' {
+                    i += 1;
+                    regex.push('^');
                 }
-                if chars.peek() == Some(&']') {
-                    regex.push(chars.next().unwrap());
-                }
+                bracket_at_start = true;
             }
             _ => regex.push(c),
         }
+        i += 1;
     }
+
+    if in_bracket {
+        return Err(ParseError::ParseError(
+            "invalid regular expression: brackets [] not balanced".into(),
+        ));
+    }
+
     regex.push_str(")$");
-    regex
+
+    if let Err(err) = regex::Regex::new(&regex) {
+        return Err(ParseError::ParseError(format!(
+            "invalid regular expression: {err}"
+        )));
+    }
+
+    Ok(regex)
 }
 
 /// Converts a CamelCase identifier to UPPER CASE SQL keywords.
@@ -8751,5 +8845,81 @@ mod tests {
             };
             assert!(select.with.is_some(), "{sql}: WITH clause was dropped");
         }
+    }
+
+    #[test]
+    fn similar_to_regex_character_class_set_operators() {
+        let re = regex::Regex::new(&similar_to_regex("[[]a").unwrap()).unwrap();
+        assert!(re.is_match("[a"));
+        assert!(!re.is_match("aa"));
+
+        let re = regex::Regex::new(&similar_to_regex("a[&&]+b").unwrap()).unwrap();
+        assert!(re.is_match("a&&b"));
+        assert!(re.is_match("a&b"));
+        assert!(!re.is_match("ab"));
+
+        let re = regex::Regex::new(&similar_to_regex("[a~~b]").unwrap()).unwrap();
+        assert!(re.is_match("~"));
+        assert!(re.is_match("a"));
+        assert!(re.is_match("b"));
+        assert!(!re.is_match("c"));
+    }
+
+    #[test]
+    fn similar_to_regex_unbalanced_bracket_is_error() {
+        let err = similar_to_regex("[a").unwrap_err();
+        assert!(err.to_string().contains("brackets [] not balanced"));
+    }
+
+    #[test]
+    fn similar_to_regex_negated_class() {
+        let re = regex::Regex::new(&similar_to_regex("[^abc]").unwrap()).unwrap();
+        assert!(re.is_match("d"));
+        assert!(!re.is_match("a"));
+    }
+
+    #[test]
+    fn similar_to_regex_literal_close_bracket_at_start_of_class() {
+        let re = regex::Regex::new(&similar_to_regex("[]abc]").unwrap()).unwrap();
+        assert!(re.is_match("]"));
+        assert!(re.is_match("a"));
+        assert!(!re.is_match("d"));
+    }
+
+    #[test]
+    fn similar_to_regex_escaped_brackets() {
+        let re = regex::Regex::new(&similar_to_regex("\\[a\\]").unwrap()).unwrap();
+        assert!(re.is_match("[a]"));
+        assert!(!re.is_match("a"));
+    }
+
+    #[test]
+    fn similar_to_regex_ordinary_ranges_and_wildcards() {
+        let re = regex::Regex::new(&similar_to_regex("[a-z]%_").unwrap()).unwrap();
+        assert!(re.is_match("hello!"));
+        assert!(!re.is_match("Hello!"));
+    }
+
+    #[test]
+    fn similar_to_regex_set_difference_operator() {
+        let re = regex::Regex::new(&similar_to_regex("a[--]+b").unwrap()).unwrap();
+        assert!(re.is_match("a--b"));
+        assert!(re.is_match("a-b"));
+        assert!(!re.is_match("ab"));
+    }
+
+    #[test]
+    fn similar_to_regex_dot_caret_dollar_are_literals() {
+        let re = regex::Regex::new(&similar_to_regex("a.b").unwrap()).unwrap();
+        assert!(re.is_match("a.b"));
+        assert!(!re.is_match("axb"));
+    }
+
+    #[test]
+    fn similar_to_regex_posix_classes() {
+        let re = regex::Regex::new(&similar_to_regex("_[_[:alpha:]_]_").unwrap()).unwrap();
+        assert!(re.is_match("xax"));
+        assert!(re.is_match("x_x"));
+        assert!(!re.is_match("x1x"));
     }
 }

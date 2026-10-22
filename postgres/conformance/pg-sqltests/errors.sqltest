@@ -47,3 +47,8 @@ test error-drop-domain-used-by-table-in-other-schema {
     DROP DOMAIN pos;
 }
 expect error {}
+
+test error-similar-to-unbalanced-bracket {
+    SELECT 'a' SIMILAR TO '[a';
+}
+expect error {}
