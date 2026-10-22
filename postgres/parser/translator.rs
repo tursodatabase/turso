@@ -3757,10 +3757,6 @@ impl PostgreSQLTranslator {
                 "substring() with a regular expression or SIMILAR pattern",
             ));
         }
-        if func_call.func_variadic {
-            return Err(not_supported("a VARIADIC function argument"));
-        }
-
         // Translate FILTER clause
         let filter_clause = if let Some(ref filter) = func_call.agg_filter {
             Some(Box::new(self.translate_expr(filter)?))
@@ -3788,10 +3784,57 @@ impl PostgreSQLTranslator {
             });
         }
 
-        // Translate function arguments
-        let args = func_call
-            .args
-            .iter()
+        let mut arg_nodes: Vec<_> = func_call.args.iter().collect();
+        if func_call.func_variadic {
+            let args_before_variadic = match func_name.as_str() {
+                "concat" => 0,
+                "concat_ws" | "format" => 1,
+                _ => {
+                    return Err(not_supported(format_args!(
+                        "VARIADIC on function {func_name}"
+                    )));
+                }
+            };
+            let (variadic, fixed) = func_call
+                .args
+                .split_last()
+                .expect("the parser only sets VARIADIC on a call with arguments");
+            if fixed.len() != args_before_variadic {
+                return Err(ParseError::ParseError(format!(
+                    "VARIADIC must be argument {} of {func_name}",
+                    args_before_variadic + 1
+                )));
+            }
+            let Some(pg_query::protobuf::node::Node::AArrayExpr(array)) = &variadic.node else {
+                return Err(not_supported(
+                    "VARIADIC with an argument other than an ARRAY[...] literal",
+                ));
+            };
+            let element_types = array
+                .elements
+                .iter()
+                .map(variadic_element_type)
+                .collect::<Option<Vec<_>>>()
+                .ok_or_else(|| {
+                    not_supported(
+                        "VARIADIC ARRAY[...] with an element other than a string literal, \
+                         an integer literal, NULL or a cast to a non-array type",
+                    )
+                })?;
+            let mut typed_elements = element_types
+                .iter()
+                .filter(|element_type| **element_type != VariadicElementType::Null);
+            if let Some(first) = typed_elements.next() {
+                if typed_elements.any(|element_type| element_type != first) {
+                    return Err(not_supported(
+                        "VARIADIC ARRAY[...] with elements of different types",
+                    ));
+                }
+            }
+            arg_nodes = fixed.iter().chain(&array.elements).collect();
+        }
+        let args = arg_nodes
+            .into_iter()
             .map(|arg| Ok(Box::new(self.translate_expr(arg)?)))
             .collect::<Result<Vec<_>, ParseError>>()?;
 
@@ -4909,6 +4952,34 @@ impl PostgreSQLTranslator {
             not_null,
             constraints,
         })
+    }
+}
+
+#[derive(PartialEq)]
+enum VariadicElementType {
+    Null,
+    StringLiteral,
+    IntegerLiteral,
+    Cast(String),
+}
+
+fn variadic_element_type(element: &pg_query::protobuf::Node) -> Option<VariadicElementType> {
+    use pg_query::protobuf::{a_const::Val, node::Node};
+    match element.node.as_ref()? {
+        Node::AConst(a_const) => match &a_const.val {
+            None => Some(VariadicElementType::Null),
+            Some(Val::Sval(_)) => Some(VariadicElementType::StringLiteral),
+            Some(Val::Ival(_)) => Some(VariadicElementType::IntegerLiteral),
+            Some(_) => None,
+        },
+        Node::TypeCast(cast) => {
+            let type_name = cast.type_name.as_ref()?;
+            let name = last_string(&type_name.names)?;
+            let is_array =
+                !type_name.array_bounds.is_empty() || map_pg_type(&name, &[])?.array_dimensions > 0;
+            (!is_array).then_some(VariadicElementType::Cast(name))
+        }
+        _ => None,
     }
 }
 
@@ -9591,6 +9662,50 @@ mod tests {
     }
 
     #[test]
+    fn variadic_array_from_a_column_is_rejected() {
+        assert_not_supported(
+            "SELECT format('%s-%s', VARIADIC a) FROM t",
+            "VARIADIC with an argument other than an ARRAY[...] literal",
+        );
+    }
+
+    #[test]
+    fn variadic_array_element_without_a_known_type_is_rejected() {
+        for sql in [
+            "SELECT format('%s-%s', VARIADIC ARRAY[ARRAY['a', 'b'], ARRAY['c', 'd']])",
+            "SELECT concat_ws(',', VARIADIC ARRAY[['a', 'b'], ['c', 'd']])",
+            "SELECT concat(VARIADIC ARRAY[ARRAY['a', 'b']::text[]])",
+            "SELECT concat(VARIADIC ARRAY['{1,2}'::_int4])",
+            "SELECT concat(VARIADIC ARRAY['{a}'::pg_catalog._varchar])",
+            "SELECT concat(VARIADIC ARRAY[(SELECT ARRAY['a', 'b'])])",
+            "SELECT concat(VARIADIC ARRAY[a, b]) FROM t",
+            "SELECT concat(VARIADIC ARRAY[1.5])",
+        ] {
+            assert_not_supported(sql, "VARIADIC ARRAY[...] with an element other than");
+        }
+    }
+
+    #[test]
+    fn variadic_array_with_elements_of_different_types_is_rejected() {
+        for sql in [
+            "SELECT concat(VARIADIC ARRAY[1, '01'])",
+            "SELECT concat(VARIADIC ARRAY['a', 1])",
+            "SELECT format('%s|%s', VARIADIC ARRAY[1, ' 2'])",
+            "SELECT concat(VARIADIC ARRAY['a'::text, 1::int])",
+        ] {
+            assert_not_supported(sql, "VARIADIC ARRAY[...] with elements of different types");
+        }
+        for sql in [
+            "SELECT concat(VARIADIC ARRAY['a', NULL, 'b'])",
+            "SELECT concat(VARIADIC ARRAY[1, NULL, 2])",
+            "SELECT concat(VARIADIC ARRAY['1'::int, '01'::int])",
+            "SELECT concat(VARIADIC ARRAY[NULL, NULL])",
+        ] {
+            assert_translates(sql);
+        }
+    }
+
+    #[test]
     fn with_clause_kept_on_set_operations_and_values() {
         for sql in [
             "WITH c AS (SELECT 1 AS x) SELECT x FROM c UNION SELECT 2",
@@ -10379,7 +10494,11 @@ mod tests {
 
     #[test]
     fn fail_closed_variadic() {
-        assert_not_supported("SELECT concat(VARIADIC ARRAY['a', 'b'])", "VARIADIC");
+        assert_not_supported(
+            "SELECT upper(VARIADIC ARRAY['a'])",
+            "VARIADIC on function upper",
+        );
+        assert_translates("SELECT concat(VARIADIC ARRAY['a', 'b'])");
     }
 
     #[test]

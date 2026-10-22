@@ -809,3 +809,71 @@ expect {
     <null>|"x"
     {"y":2}|"z"
 }
+
+test concat-variadic-array {
+    SELECT concat(VARIADIC ARRAY['a', 'b']);
+}
+expect {
+    ab
+}
+
+test concat-variadic-array-skips-nulls {
+    SELECT concat(VARIADIC ARRAY['a', NULL, 'c']);
+}
+expect {
+    ac
+}
+
+test concat-ws-variadic-array {
+    SELECT concat_ws(',', VARIADIC ARRAY['a', 'b']);
+}
+expect {
+    a,b
+}
+
+test format-variadic-array {
+    SELECT format('%s-%s', VARIADIC ARRAY['a', 'b']);
+}
+expect {
+    a-b
+}
+
+test variadic-on-non-variadic-function {
+    SELECT upper(VARIADIC ARRAY['a']);
+}
+expect error {}
+
+test variadic-in-wrong-argument-position {
+    SELECT concat('x', VARIADIC ARRAY['a']);
+}
+expect error {}
+
+test variadic-argument-not-an-array {
+    SELECT concat(VARIADIC 'a');
+}
+expect error {}
+
+test concat-variadic-array-of-integer-casts {
+    SELECT concat(VARIADIC ARRAY['1'::int, NULL, '01'::int]);
+}
+expect {
+    11
+}
+
+@skip-if postgres "PostgreSQL casts the elements to a common type, which Turso does not do, so Turso rejects the call"
+test variadic-array-elements-of-different-types {
+    SELECT concat(VARIADIC ARRAY[1, '01']);
+}
+expect error {}
+
+@skip-if postgres "PostgreSQL concatenates the leaves of the array, which Turso does not do, so Turso rejects the call"
+test variadic-array-of-array-casts {
+    SELECT concat(VARIADIC ARRAY[ARRAY['a', 'b']::text[]]);
+}
+expect error {}
+
+@skip-if postgres "PostgreSQL concatenates the leaves of the array, which Turso does not do, so Turso rejects the call"
+test variadic-array-of-underscore-array-casts {
+    SELECT concat(VARIADIC ARRAY['{1,2}'::_int4]);
+}
+expect error {}

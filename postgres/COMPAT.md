@@ -469,7 +469,7 @@ Upgrade is not supported.
 | Statement level triggers | ❌ Not supported | CREATE TRIGGER not translated |
 | Statement level TRUNCATE triggers | ❌ Not supported | |
 | Triggers on views | ❌ Not supported | |
-| Variadic functions | ❌ Not supported | VARIADIC arguments rejected |
+| Variadic functions | ❌ Not supported | Calls to `concat`, `concat_ws` and `format` accept `VARIADIC ARRAY[...]` literals whose elements are all string literals, all integer literals, or all casts to the same non-array type (NULL may appear among any of these); other elements and any other array expression are rejected |
 | WHEN clause for CREATE TRIGGER | ❌ Not supported | |
 
 ## Procedural Languages
