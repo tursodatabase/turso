@@ -764,6 +764,16 @@ impl PostgreSQLTranslator {
             .ok_or_else(|| ParseError::ParseError("ALTER TABLE missing table name".into()))?;
         let name = self.qualified_name_from_range_var(relation);
 
+        // ALTER INDEX/VIEW/SEQUENCE/... share AlterTableStmt with ALTER TABLE.
+        if alter.objtype != pg_query::protobuf::ObjectType::ObjectTable as i32 {
+            return Err(not_supported(format!(
+                "ALTER {}",
+                drop_object_type_name(
+                    pg_query::protobuf::ObjectType::try_from(alter.objtype)
+                        .unwrap_or(pg_query::protobuf::ObjectType::Undefined)
+                )
+            )));
+        }
         if alter.missing_ok {
             return Err(not_supported("ALTER TABLE IF EXISTS"));
         }
@@ -9261,5 +9271,18 @@ mod tests {
         assert_not_supported("ALTER TABLE t DROP COLUMN IF EXISTS a", "IF [NOT] EXISTS");
         assert_not_supported("ALTER TABLE t DROP COLUMN a CASCADE", "CASCADE");
         assert_translates("ALTER TABLE t DROP COLUMN a RESTRICT");
+    }
+
+    #[test]
+    fn fail_closed_alter_non_table() {
+        assert_not_supported("ALTER VIEW v ALTER COLUMN a SET DEFAULT 1", "ALTER VIEW");
+        assert_not_supported(
+            "ALTER FOREIGN TABLE f ADD COLUMN a int",
+            "ALTER FOREIGNTABLE",
+        );
+        assert_not_supported(
+            "ALTER MATERIALIZED VIEW m ALTER COLUMN a SET STATISTICS 1",
+            "ALTER MATVIEW",
+        );
     }
 }
