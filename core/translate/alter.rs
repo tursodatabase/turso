@@ -73,7 +73,7 @@ fn schema_table_name_for_db(resolver: &Resolver, database_id: usize) -> String {
         format!("temp.{SQLITE_TABLEID}")
     } else {
         let db_name = resolver
-            .get_database_name_by_index(database_id)
+            .namespace_name(database_id)
             .unwrap_or_else(|| "main".to_string());
         format!("{db_name}.{SQLITE_TABLEID}")
     }
@@ -1613,7 +1613,7 @@ pub fn translate_alter_table(
                     // referencing `aux.t` would be wrongly rewritten
                     // during `ALTER TABLE main.t RENAME TO ...`.
                     let renamed_db_name = resolver
-                        .get_database_name_by_index(database_id)
+                        .namespace_name(database_id)
                         .unwrap_or_else(|| "main".to_string());
                     let new_sql = rewrite_trigger_sql_for_table_rename(
                         &trigger_entry.trigger.sql,
@@ -2068,13 +2068,11 @@ pub fn translate_alter_table(
                         }
                     }
                 }
-                let target_db_name = resolver
-                    .get_database_name_by_index(database_id)
-                    .ok_or_else(|| {
-                        LimboError::InternalError(format!(
-                            "unknown database id {database_id} during ALTER TABLE"
-                        ))
-                    })?;
+                let target_db_name = resolver.namespace_name(database_id).ok_or_else(|| {
+                    LimboError::InternalError(format!(
+                        "unknown database id {database_id} during ALTER TABLE"
+                    ))
+                })?;
                 views_to_rewrite = resolver.with_schema(database_id, |s| -> Result<_> {
                     let mut rewrites = Vec::new();
                     for (view_name, view) in s.views.iter() {

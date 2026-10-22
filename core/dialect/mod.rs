@@ -128,12 +128,6 @@ pub trait Dialect: Send + Sync + 'static {
         options
     }
 
-    /// Create the namespaces of a new connection. SQLite has one namespace
-    /// per database: `main`, `temp` and each attached database.
-    fn new_namespaces(&self) -> crate::sync::Arc<dyn crate::NamespaceCatalog> {
-        crate::sync::Arc::new(sqlite::attach::AttachedNamespaces::default())
-    }
-
     /// Resolve a function name in user SQL to the engine's function IR.
     ///
     /// The dialect owns its scalar function surface: the SQLite dialect
@@ -178,6 +172,17 @@ pub trait Dialect: Send + Sync + 'static {
     /// `c`. PostgreSQL stops there and reports that the column does not
     /// exist.
     fn qualified_column_uses_nearest_table_only(&self) -> bool {
+        false
+    }
+
+    /// Whether a sequence named without a schema in a column default or a
+    /// view body is bound to the schema it is found in when the table or
+    /// view is created.
+    ///
+    /// PostgreSQL stores the bound name, so the default or view keeps its
+    /// sequence after the search path changes. SQLite looks the name up
+    /// each time the default or view runs.
+    fn binds_names_at_create(&self) -> bool {
         false
     }
 }
@@ -349,97 +354,6 @@ mod tests {
         }
     }
 
-    /// Namespaces where CREATE needs a namespace, so a connection that uses
-    /// them cannot create an object without one.
-    #[derive(Default)]
-    struct CreateNeedsNamespace(sqlite::attach::AttachedNamespaces);
-
-    impl crate::NamespaceCatalog for CreateNeedsNamespace {
-        fn database_id(&self, name: &str) -> Option<usize> {
-            self.0.database_id(name)
-        }
-
-        fn name(&self, database_id: usize) -> Option<String> {
-            self.0.name(database_id)
-        }
-
-        fn others(&self) -> Vec<(usize, String)> {
-            self.0.others()
-        }
-
-        fn add(&self, name: &str, database_id: usize) {
-            self.0.add(name, database_id)
-        }
-
-        fn remove(&self, name: &str) -> Option<usize> {
-            self.0.remove(name)
-        }
-
-        fn find_in_search_order(&self, contains: &mut dyn FnMut(usize) -> bool) -> Option<usize> {
-            self.0.find_in_search_order(contains)
-        }
-
-        fn database_for_create(&self) -> crate::Result<usize> {
-            Err(crate::LimboError::ParseError(
-                "no namespace for create".to_string(),
-            ))
-        }
-    }
-
-    /// A dialect whose connections use [`CreateNeedsNamespace`].
-    struct CreateNeedsNamespaceDialect;
-
-    impl Dialect for CreateNeedsNamespaceDialect {
-        fn name(&self) -> &'static str {
-            "create-needs-namespace"
-        }
-
-        fn parse(&self, sql: &str) -> crate::Result<(Option<turso_parser::ast::Cmd>, usize)> {
-            sqlite::parse(sql)
-        }
-
-        fn parse_table_sql(&self, sql: &str, root_page: i64) -> crate::Result<BTreeTable> {
-            BTreeTable::from_sql(sql, root_page)
-        }
-
-        fn parse_table_sql_ast(&self, sql: &str) -> crate::Result<turso_parser::ast::Stmt> {
-            sqlite::parse_table_sql_ast(sql)
-        }
-
-        fn table_sql_for_replay(&self, sql: &str) -> crate::Result<String> {
-            sqlite::table_sql_for_replay(sql)
-        }
-
-        fn format_table_sql(
-            &self,
-            input: &str,
-            tbl_name: &turso_parser::ast::QualifiedName,
-            body: &turso_parser::ast::CreateTableBody,
-        ) -> crate::Result<String> {
-            SqliteDialect.format_table_sql(input, tbl_name, body)
-        }
-
-        fn register_catalog(
-            &self,
-            schema: &mut crate::schema::Schema,
-            enable_custom_types: bool,
-        ) -> crate::Result<()> {
-            sqlite::register_builtin_catalog(schema, enable_custom_types)
-        }
-
-        fn resolve_function(
-            &self,
-            name: &str,
-            arg_count: usize,
-        ) -> crate::Result<Option<crate::function::Func>> {
-            sqlite::resolve_builtin_function(name, arg_count)
-        }
-
-        fn new_namespaces(&self) -> Arc<dyn crate::NamespaceCatalog> {
-            Arc::new(CreateNeedsNamespace::default())
-        }
-    }
-
     /// A one-row catalog table installed by [`TestDialect`],
     /// standing in for a frontend catalog surface like `pg_class`.
     #[derive(Debug)]
@@ -578,25 +492,6 @@ mod tests {
             1
         );
         assert_eq!(dialect.statement_parse_calls.load(Ordering::SeqCst), 2);
-        conn.close().unwrap();
-    }
-
-    #[test]
-    fn connections_use_the_namespaces_of_the_dialect() {
-        let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
-        let db = open_db(
-            &io,
-            "dialect-namespaces.db",
-            Arc::new(CreateNeedsNamespaceDialect),
-        )
-        .unwrap();
-        let conn = db.connect(ConnectOpts::new()).unwrap();
-
-        let Err(crate::LimboError::ParseError(message)) = conn.execute("CREATE TABLE t (x)") else {
-            panic!("CREATE without a namespace must use the dialect's namespaces");
-        };
-        assert_eq!(message, "no namespace for create");
-        conn.execute("CREATE TABLE main.t (x)").unwrap();
         conn.close().unwrap();
     }
 

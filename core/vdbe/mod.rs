@@ -237,7 +237,6 @@ pub(crate) fn step_view_delta_batch(
                         0,
                         crate::statement::StatementOrigin::Subprogram,
                         false,
-                        crate::connection::PrepareOptions::default(),
                     )));
                 }
 

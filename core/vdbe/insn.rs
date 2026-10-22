@@ -1760,12 +1760,12 @@ pub enum Insn {
         was_empty_reg: usize,
         out_value_reg: usize,
     },
-    /// Record this connection's currval for a sequence after a successful
-    /// nextval/setval. Pure synchronous register operation. currval is
-    /// per-connection global (not schema-qualified), so no database id
-    /// is carried — schema-qualified currvals would be a separate feature.
+    /// Record this connection's currval for the sequence `seq_name` of
+    /// database `db` after a successful nextval/setval. Pure synchronous
+    /// register operation.
     SetSequenceCurrval {
-        seq_name_reg: usize,
+        db: usize,
+        seq_name: String,
         value_reg: usize,
     },
     /// Publish sequence allocation metadata for sync watermarks after a

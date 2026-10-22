@@ -1483,7 +1483,6 @@ fn emit_rowid_generation(
             &seq_name,
             &seq,
             insertion.key_register(),
-            None,
         )?;
     } else if let Some(meta) = ctx.autoincrement_meta {
         reload_autoincrement_state(program, meta);

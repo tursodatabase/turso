@@ -2603,7 +2603,8 @@ impl Database {
             closed: AtomicBool::new(false),
             temp: crate::connection::TempDbContext::new(),
             attached_databases: RwLock::new(DatabaseCatalog::new()),
-            namespaces: self.dialect.new_namespaces(),
+            namespaces: crate::Namespaces::default(),
+            search_path: RwLock::new(None),
             has_non_main_pagers: AtomicBool::new(false),
             query_only: AtomicBool::new(false),
             vdbe_trace: AtomicBool::new(false),
@@ -3505,47 +3506,8 @@ pub(crate) struct AttachedDatabase {
     pub(crate) sync_mode: SyncMode,
 }
 
-/// The namespaces of a connection: the names that qualify object names in
-/// SQL.
-///
-/// A namespace is what the qualifier of an object name selects, like `aux`
-/// in `aux.t`. Every namespace refers to a database, the storage that holds
-/// its objects. Core asks [`NamespaceCatalog`] whenever it turns a namespace
-/// name into a database or a database into a namespace name, and when it
-/// looks up a name without a namespace.
-///
-/// SQLite has one namespace per database: `main`, `temp` and one for each
-/// attached database.
-/// [`crate::dialect::sqlite::attach::AttachedNamespaces`] implements that.
-pub trait NamespaceCatalog: Send + Sync {
-    /// The database that namespace `name` refers to. `name` is normalized.
-    fn database_id(&self, name: &str) -> Option<usize>;
-
-    /// The name of the namespace that refers to database `database_id`.
-    fn name(&self, database_id: usize) -> Option<String>;
-
-    /// The namespaces other than `main` and `temp`, with the databases they
-    /// refer to, ordered by database.
-    fn others(&self) -> Vec<(usize, String)>;
-
-    /// Adds namespace `name`, which refers to database `database_id`.
-    fn add(&self, name: &str, database_id: usize);
-
-    /// Removes namespace `name` and returns the database it referred to.
-    fn remove(&self, name: &str) -> Option<usize>;
-
-    /// The first database that `contains` accepts, in the order that a name
-    /// without a namespace is looked up in. The temporary database comes
-    /// before all of them when it has objects.
-    fn find_in_search_order(&self, contains: &mut dyn FnMut(usize) -> bool) -> Option<usize>;
-
-    /// The database that CREATE puts an object in when its name has no
-    /// namespace.
-    fn database_for_create(&self) -> Result<usize>;
-}
-
 /// The databases of a connection other than main and temp, by database id.
-/// Their names are in the connection's [`NamespaceCatalog`].
+/// Their names are in the connection's [`crate::Namespaces`].
 // Optimized for fast get() operations and supports unlimited attached databases.
 pub(crate) struct DatabaseCatalog {
     allocated: Vec<u64>,

@@ -6,7 +6,7 @@ use std::sync::{Arc, Mutex};
 
 use crate::catalog::{self, PostgresDialect};
 use crate::functions::ConfigParameter;
-use turso_core::{Connection, LimboError, PrepareOptions, Result, Statement, Value};
+use turso_core::{Connection, LimboError, Result, Statement, Value};
 use turso_parser::ast::{self};
 use turso_pg_parser::translator::{
     is_comment_on, is_refresh_matview, is_set_transaction, try_extract_copy_from,
@@ -26,9 +26,10 @@ struct PgConnectionInner {
     conn: Arc<Connection>,
 }
 
+/// The text that `search_path` was set to, for SHOW. The search path itself
+/// is on the connection.
 #[derive(Default)]
 struct SessionState {
-    search_path: Option<Vec<String>>,
     search_path_setting: Option<String>,
 }
 
@@ -76,6 +77,8 @@ impl PgConnection {
     pub fn connect(db: &Arc<turso_core::Database>) -> Result<Self> {
         let context = Arc::new(PgSessionState::default());
         let conn = db.connect_with_context(context)?;
+        conn.add_namespace("public", turso_core::MAIN_DB_ID);
+        set_search_path(&conn, None)?;
         Ok(Self {
             inner: Arc::new(PgConnectionInner { conn }),
         })
@@ -178,64 +181,44 @@ fn prepare_statement(pg_conn: &Arc<PgConnectionInner>, sql: &str) -> Result<Stat
         return Ok(stmt);
     }
 
-    let search_path = pg_conn
-        .conn
-        .context::<PgSessionState>()
-        .expect("PostgreSQL connections have session state")
-        .lock()
-        .unwrap()
-        .search_path
-        .clone();
     let parse_result =
         turso_pg_parser::parse(sql).map_err(|e| LimboError::ParseError(e.to_string()))?;
-    let (sql, parse_result) =
-        match create_table_schema_from_search_path(pg_conn, &parse_result, &search_path)? {
-            Some((location, schema)) => {
-                let sql = turso_pg_parser::qualify_create_table_name(sql, location, &schema);
-                let parse_result = turso_pg_parser::parse(&sql)
-                    .map_err(|e| LimboError::ParseError(e.to_string()))?;
-                (Cow::Owned(sql), parse_result)
-            }
-            None => (Cow::Borrowed(sql), parse_result),
-        };
+    let (sql, parse_result) = match create_table_schema_from_search_path(pg_conn, &parse_result)? {
+        Some((location, schema)) => {
+            let sql = turso_pg_parser::qualify_create_table_name(sql, location, &schema);
+            let parse_result =
+                turso_pg_parser::parse(&sql).map_err(|e| LimboError::ParseError(e.to_string()))?;
+            (Cow::Owned(sql), parse_result)
+        }
+        None => (Cow::Borrowed(sql), parse_result),
+    };
     let translator = PostgreSQLTranslator::new();
     let translated = translator
         .translate_with_prereqs(&parse_result)
         .map_err(|e| LimboError::ParseError(e.to_string()))?;
     reject_catalog_dml(translated.cmd.stmt())?;
 
-    let options = PrepareOptions {
-        unqualified_database_search_path: search_path,
-    };
     for prereq in translated.prereqs {
         let input = prereq.to_string();
-        let mut stmt = pg_conn
-            .conn
-            .prepare_translated_stmt_with_options(prereq, &input, &options)?;
+        let mut stmt = pg_conn.conn.prepare_translated_stmt(prereq, &input)?;
         stmt.run_ignore_rows()?;
     }
 
-    pg_conn
-        .conn
-        .prepare_translated_cmd_with_options(translated.cmd, &sql, &options)
+    pg_conn.conn.prepare_translated_cmd(translated.cmd, &sql)
 }
 
 /// The schema that a CREATE TABLE statement naming its table without a
 /// schema creates the table in, with the byte offset of the table name: the
 /// first schema of `search_path` that exists, like PostgreSQL. None when the
-/// statement is not such a CREATE TABLE, when `search_path` is not set, or
-/// when the table goes to public, which is where core puts it anyway.
+/// statement is not such a CREATE TABLE or when the table goes to public,
+/// which is where core puts it anyway.
 fn create_table_schema_from_search_path(
     pg_conn: &Arc<PgConnectionInner>,
     parse_result: &turso_pg_parser::ParseResult,
-    search_path: &Option<Vec<String>>,
 ) -> Result<Option<(usize, String)>> {
     let Some(location) = unqualified_create_table_name_location(parse_result) else {
         return Ok(None);
     };
-    if search_path.is_none() {
-        return Ok(None);
-    }
     let schema = current_schema(&pg_conn.conn).ok_or_else(|| {
         LimboError::ParseError("no schema has been selected to create in".to_string())
     })?;
@@ -250,16 +233,11 @@ fn create_table_schema_from_search_path(
 /// The default search_path, "$user", public, gives public, since there is no
 /// schema named after a user.
 pub(crate) fn current_schema(conn: &Connection) -> Option<String> {
-    let Some(search_path) = conn
-        .context::<PgSessionState>()
-        .and_then(|state| state.lock().unwrap().search_path.clone())
-    else {
+    let database_id = *conn.search_order().first()?;
+    if database_id == turso_core::MAIN_DB_ID {
         return Some("public".to_owned());
-    };
-    let attached = conn.attached_database_names();
-    search_path
-        .into_iter()
-        .find(|schema| schema.eq_ignore_ascii_case("public") || attached.contains(schema))
+    }
+    conn.namespace_name(database_id)
 }
 
 fn reject_catalog_dml(stmt: &ast::Stmt) -> Result<()> {
@@ -394,17 +372,25 @@ fn handle_pg_show(pg_conn: &Arc<PgConnectionInner>, show_stmt: &PgShowStmt) -> R
     }
 }
 
+/// `$user` stands for a schema named after the session user, which does
+/// not exist, so it is not a name that core looks up.
 pub(crate) fn set_search_path(conn: &Connection, value: Option<&str>) -> Result<Value> {
-    let path = value.map(parse_search_path).transpose()?;
+    let mut path = parse_search_path(value.unwrap_or(DEFAULT_SEARCH_PATH))?;
+    path.retain(|name| name != "$user" && !is_core_database_name(name));
     let state = conn.context::<PgSessionState>().ok_or_else(|| {
         LimboError::InvalidArgument("PostgreSQL session state is not initialized".to_string())
     })?;
-    let mut state = state.lock().unwrap();
-    state.search_path = path;
-    state.search_path_setting = value.map(str::to_owned);
+    state.lock().unwrap().search_path_setting = value.map(str::to_owned);
+    conn.set_search_path(Some(path));
     Ok(Value::build_text(
         value.unwrap_or(DEFAULT_SEARCH_PATH).to_owned(),
     ))
+}
+
+/// `main` and `temp` name databases in core, not PostgreSQL schemas, so a
+/// search_path that lists them finds nothing there, as in PostgreSQL.
+fn is_core_database_name(name: &str) -> bool {
+    name.eq_ignore_ascii_case("main") || name.eq_ignore_ascii_case("temp")
 }
 
 pub(crate) fn search_path_setting(conn: &Connection) -> Option<String> {

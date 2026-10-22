@@ -227,7 +227,7 @@ fn translate_integrity_check_for_schema(
     });
 
     let database_name = resolver
-        .get_database_name_by_index(database_id)
+        .namespace_name(database_id)
         .expect("resolved integrity-check database must still exist");
     program.emit_string8(
         format!("*** in database {database_name} ***\n"),

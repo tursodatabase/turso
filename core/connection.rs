@@ -16,7 +16,6 @@ use crate::types::{WalFrameInfo, WalState};
 #[cfg(feature = "fs")]
 use crate::util::{OpenMode, OpenOptions};
 use crate::vdbe::MvccCommitStateMachine;
-use crate::NamespaceCatalog;
 #[cfg(all(feature = "fs", feature = "conn_raw_api"))]
 use crate::Page;
 use crate::{
@@ -182,11 +181,6 @@ impl Drop for SchemaReparseGuard {
             .schema_reparse_in_progress
             .store(false, Ordering::SeqCst);
     }
-}
-
-#[derive(Debug, Default, Clone)]
-pub struct PrepareOptions {
-    pub unqualified_database_search_path: Option<Vec<String>>,
 }
 
 /// Re-entrant state for [`Connection::reparse_schema_nonblock`] and the
@@ -411,8 +405,12 @@ pub struct Connection {
     pub(crate) temp: TempDbContext,
     /// Attached databases
     pub(super) attached_databases: RwLock<DatabaseCatalog>,
-    /// The names of the databases in SQL
-    pub(super) namespaces: Arc<dyn NamespaceCatalog>,
+    /// The names that qualify object names in SQL, each referring to a
+    /// database.
+    pub(super) namespaces: crate::Namespaces,
+    /// The namespace names that a name without a namespace is looked up
+    /// through, in order. None means main, then the other databases by id.
+    pub(super) search_path: RwLock<Option<Vec<String>>>,
     /// Set before the first temp or attached database is installed and
     /// never cleared, so the statement paths that visit the non-main pagers
     /// can skip the catalog locks while no such pager can exist.
@@ -550,8 +548,9 @@ pub struct Connection {
     /// MUST be incremented whenever any setting that affects PrepareContext changes,
     /// and this is not currently centralized; each setter bumps the generation individually.
     pub(crate) prepare_context_generation: AtomicU64,
-    /// Per-connection last-returned value for each sequence (for currval()).
-    pub(crate) sequence_currvals: RwLock<HashMap<String, i64>>,
+    /// Per-connection last-returned value for each sequence (for currval()),
+    /// by the database and normalized name of the sequence.
+    pub(crate) sequence_currvals: RwLock<HashMap<(usize, String), i64>>,
 }
 
 // SAFETY: This needs to be audited for thread safety.
@@ -980,7 +979,6 @@ impl Connection {
         cmd: Cmd,
         input: &str,
         origin: StatementOrigin,
-        prepare_options: &PrepareOptions,
     ) -> Result<(Program, Arc<Pager>, QueryMode)> {
         self.maybe_update_schema();
 
@@ -998,7 +996,6 @@ impl Connection {
             mode,
             input,
             origin,
-            prepare_options,
         ) {
             Ok(program) => Ok((program, pager, mode)),
             Err(err) if self.should_retry_cross_process_schema_lookup(&err)? => {
@@ -1030,7 +1027,6 @@ impl Connection {
                     mode,
                     input,
                     origin,
-                    prepare_options,
                 )
                 .map(|program| (program, pager, mode))
             }
@@ -1094,8 +1090,7 @@ impl Connection {
             let input = str::from_utf8(&sql.as_bytes()[..byte_offset_end])
                 .unwrap()
                 .trim();
-            let prepare_options = PrepareOptions::default();
-            let (program, pager, mode) = self.compile_cmd(cmd, input, origin, &prepare_options)?;
+            let (program, pager, mode) = self.compile_cmd(cmd, input, origin)?;
 
             Ok(Statement::new_with_origin(
                 program,
@@ -1104,7 +1099,6 @@ impl Connection {
                 byte_offset_end,
                 origin,
                 needs_nested_guard,
-                prepare_options,
             ))
         })();
         if result.is_err() && needs_nested_guard {
@@ -1128,15 +1122,6 @@ impl Connection {
         self.prepare_translated_cmd(ast::Cmd::Stmt(stmt), input)
     }
 
-    pub fn prepare_translated_stmt_with_options(
-        self: &Arc<Connection>,
-        stmt: ast::Stmt,
-        input: &str,
-        prepare_options: &PrepareOptions,
-    ) -> Result<Statement> {
-        self.prepare_translated_cmd_with_options(ast::Cmd::Stmt(stmt), input, prepare_options)
-    }
-
     /// Prepare an already-translated command while keeping the original SQL
     /// text.
     pub fn prepare_translated_cmd(
@@ -1144,16 +1129,7 @@ impl Connection {
         cmd: ast::Cmd,
         input: &str,
     ) -> Result<Statement> {
-        self.prepare_translated_cmd_with_options(cmd, input, &PrepareOptions::default())
-    }
-
-    pub fn prepare_translated_cmd_with_options(
-        self: &Arc<Connection>,
-        cmd: ast::Cmd,
-        input: &str,
-        prepare_options: &PrepareOptions,
-    ) -> Result<Statement> {
-        self.prepare_cmd_with_input_and_origin(cmd, input, StatementOrigin::Root, prepare_options)
+        self.prepare_cmd_with_input_and_origin(cmd, input, StatementOrigin::Root)
     }
 
     #[turso_macros::trace_stack]
@@ -1162,7 +1138,6 @@ impl Connection {
         cmd: ast::Cmd,
         input: &str,
         origin: StatementOrigin,
-        prepare_options: &PrepareOptions,
     ) -> Result<Statement> {
         if self.is_closed() {
             return Err(LimboError::InternalError("Connection closed".to_string()));
@@ -1172,7 +1147,7 @@ impl Connection {
             self.start_nested();
         }
         let result = (|| {
-            let (program, pager, mode) = self.compile_cmd(cmd, input, origin, prepare_options)?;
+            let (program, pager, mode) = self.compile_cmd(cmd, input, origin)?;
             Ok(Statement::new_with_origin(
                 program,
                 pager,
@@ -1180,7 +1155,6 @@ impl Connection {
                 0,
                 origin,
                 needs_nested_guard,
-                prepare_options.clone(),
             ))
         })();
         if result.is_err() && needs_nested_guard {
@@ -1715,13 +1689,11 @@ impl Connection {
         tracing::trace!("Preparing and executing batch: {}", sql);
 
         let mut remaining = sql;
-        let prepare_options = PrepareOptions::default();
         while let (Some(cmd), byte_offset_end) = self.parse_sql(remaining)? {
             let input = str::from_utf8(&remaining.as_bytes()[..byte_offset_end])
                 .unwrap()
                 .trim();
-            let (program, pager, mode) =
-                self.compile_cmd(cmd, input, StatementOrigin::Root, &prepare_options)?;
+            let (program, pager, mode) = self.compile_cmd(cmd, input, StatementOrigin::Root)?;
             Statement::new(program, pager, mode, 0).run_ignore_rows()?;
             remaining = &remaining[byte_offset_end..];
         }
@@ -1755,9 +1727,7 @@ impl Connection {
         if self.is_closed() {
             return Err(LimboError::InternalError("Connection closed".to_string()));
         }
-        let prepare_options = PrepareOptions::default();
-        let (program, pager, mode) =
-            self.compile_cmd(cmd, input, StatementOrigin::Root, &prepare_options)?;
+        let (program, pager, mode) = self.compile_cmd(cmd, input, StatementOrigin::Root)?;
         let stmt = Statement::new(program, pager, mode, 0);
         Ok(Some(stmt))
     }
@@ -1776,13 +1746,11 @@ impl Connection {
         }
         let sql = sql.as_ref();
         let mut remaining = sql;
-        let prepare_options = PrepareOptions::default();
         while let (Some(cmd), byte_offset_end) = self.parse_sql(remaining)? {
             let input = str::from_utf8(&remaining.as_bytes()[..byte_offset_end])
                 .unwrap()
                 .trim();
-            let (program, pager, mode) =
-                self.compile_cmd(cmd, input, StatementOrigin::Root, &prepare_options)?;
+            let (program, pager, mode) = self.compile_cmd(cmd, input, StatementOrigin::Root)?;
             {
                 crate::stack::trace_stack!("run");
                 Statement::new(program, pager.clone(), mode, 0).run_ignore_rows()?;
@@ -1804,9 +1772,7 @@ impl Connection {
         let input = str::from_utf8(&sql.as_ref().as_bytes()[..byte_offset_end])
             .unwrap()
             .trim();
-        let prepare_options = PrepareOptions::default();
-        let (program, pager, mode) =
-            self.compile_cmd(cmd, input, StatementOrigin::Root, &prepare_options)?;
+        let (program, pager, mode) = self.compile_cmd(cmd, input, StatementOrigin::Root)?;
         let stmt = Statement::new(program, pager, mode, 0);
         Ok(Some((stmt, byte_offset_end)))
     }
@@ -3214,12 +3180,6 @@ impl Connection {
         }
     }
 
-    /// Get the database name for a given database index.
-    /// Returns "main" for index 0, "temp" for index 1, and the alias for attached databases.
-    pub(crate) fn get_database_name_by_index(&self, index: usize) -> Option<String> {
-        self.namespaces.name(index)
-    }
-
     /// Get the database id for a schema name ("main", "temp", or an attached db alias).
     pub(crate) fn get_database_id_by_name(&self, name: &str) -> Result<usize> {
         self.namespaces
@@ -3348,8 +3308,50 @@ impl Connection {
         &self.attached_databases
     }
 
-    pub(crate) fn namespaces(&self) -> &dyn NamespaceCatalog {
-        self.namespaces.as_ref()
+    pub(crate) fn namespaces(&self) -> &crate::Namespaces {
+        &self.namespaces
+    }
+
+    /// Adds namespace `name`, which refers to database `database_id`, so
+    /// that `name.t` names the objects of that database.
+    pub fn add_namespace(&self, name: &str, database_id: usize) {
+        self.namespaces.add(name, database_id);
+        self.bump_prepare_context_generation();
+    }
+
+    /// Removes namespace `name` and returns the database it referred to.
+    pub fn remove_namespace(&self, name: &str) -> Option<usize> {
+        let database_id = self.namespaces.remove(name);
+        self.bump_prepare_context_generation();
+        database_id
+    }
+
+    /// The name of the namespace that refers to database `database_id`.
+    pub fn namespace_name(&self, database_id: usize) -> Option<String> {
+        self.namespaces.name(database_id)
+    }
+
+    /// Sets the namespace names that a name without a namespace is looked
+    /// up through, in order, or None for the default: main, then the other
+    /// databases by id. Names that do not exist are skipped when a name is
+    /// looked up. Prepared statements compile again with the new search
+    /// path when they next run.
+    pub fn set_search_path(&self, search_path: Option<Vec<String>>) {
+        *self.search_path.write() = search_path;
+        self.bump_prepare_context_generation();
+    }
+
+    /// The search path set with [`Connection::set_search_path`].
+    pub fn search_path(&self) -> Option<Vec<String>> {
+        self.search_path.read().clone()
+    }
+
+    /// The databases that a name without a namespace is looked up in, in
+    /// order. The first one is where CREATE puts an object whose name has
+    /// no namespace.
+    pub fn search_order(&self) -> Vec<usize> {
+        self.namespaces
+            .search_order(self.search_path.read().as_deref())
     }
 
     /// Access schema for a database using a closure pattern to avoid cloning
@@ -3566,34 +3568,53 @@ impl Connection {
         self.bump_prepare_context_generation();
     }
 
-    /// Find a sequence by name, supporting optional schema qualification.
-    ///
-    /// - `"my_seq"` → searches main database only
-    /// - `"aux.my_seq"` → searches the attached database named `aux`
-    pub fn find_sequence(&self, name: &str) -> Result<Arc<crate::schema::Sequence>> {
-        let (db_id, seq_name) = if let Some((schema, seq)) = name.split_once('.') {
-            let db_id = self.get_database_id_by_name(schema)?;
-            (db_id, crate::util::normalize_ident(seq))
-        } else {
-            (MAIN_DB_ID, crate::util::normalize_ident(name))
+    /// The sequence that `name` refers to and its database. `aux.my_seq`
+    /// names the sequence of the namespace `aux`. A name without a
+    /// namespace is looked up like the resolver does when a statement is
+    /// compiled: in temp when there is a temp database, then through the
+    /// search order.
+    pub fn find_sequence(&self, name: &str) -> Result<(usize, Arc<crate::schema::Sequence>)> {
+        let not_found = |seq_name: &str| {
+            LimboError::ParseError(format!("sequence \"{seq_name}\" does not exist"))
         };
-
-        self.with_schema(db_id, |schema| {
-            schema.get_sequence(&seq_name).map(Arc::clone)
-        })
-        .ok_or_else(|| LimboError::ParseError(format!("sequence \"{name}\" does not exist")))
+        let get = |db_id: usize, seq_name: &str| {
+            self.with_schema(db_id, |schema| {
+                schema.get_sequence(seq_name).map(Arc::clone)
+            })
+            .map(|sequence| (db_id, sequence))
+        };
+        if let Some((schema, seq)) = name.split_once('.') {
+            let db_id = self.get_database_id_by_name(schema)?;
+            let seq_name = crate::util::normalize_ident(seq);
+            return get(db_id, &seq_name).ok_or_else(|| not_found(&seq_name));
+        }
+        let seq_name = crate::util::normalize_ident(name);
+        let mut databases = Vec::new();
+        if self.temp.database.read().is_some() {
+            databases.push(TEMP_DB_ID);
+        }
+        databases.extend(self.search_order());
+        databases
+            .into_iter()
+            .find_map(|db_id| get(db_id, &seq_name))
+            .ok_or_else(|| not_found(&seq_name))
     }
 
     /// Record that this connection has seen a value from the named sequence (for currval).
-    pub fn set_sequence_currval(&self, name: &str, value: i64) {
+    pub fn set_sequence_currval(&self, database_id: usize, name: &str, value: i64) {
         let normalized = crate::util::normalize_ident(name);
-        self.sequence_currvals.write().insert(normalized, value);
+        self.sequence_currvals
+            .write()
+            .insert((database_id, normalized), value);
     }
 
     /// Get the last value returned by nextval/setval for the named sequence on this connection.
-    pub fn get_sequence_currval(&self, name: &str) -> Option<i64> {
+    pub fn get_sequence_currval(&self, database_id: usize, name: &str) -> Option<i64> {
         let normalized = crate::util::normalize_ident(name);
-        self.sequence_currvals.read().get(&normalized).copied()
+        self.sequence_currvals
+            .read()
+            .get(&(database_id, normalized))
+            .copied()
     }
 
     /// Drop this connection's currval entry for a sequence. Called on DROP
@@ -3602,9 +3623,20 @@ impl Connection {
     /// the stale per-session currval from the prior sequence — `currval()`
     /// on the fresh sequence must error with "not yet defined in this
     /// session" until a nextval/setval establishes it.
-    pub fn clear_sequence_currval(&self, name: &str) {
+    pub fn clear_sequence_currval(&self, database_id: usize, name: &str) {
         let normalized = crate::util::normalize_ident(name);
-        self.sequence_currvals.write().remove(&normalized);
+        self.sequence_currvals
+            .write()
+            .remove(&(database_id, normalized));
+    }
+
+    /// Drop this connection's currval entries of every sequence of a
+    /// database. Called on DETACH, since the next ATTACH can get the same
+    /// database id.
+    pub(crate) fn clear_sequence_currvals_of_database(&self, database_id: usize) {
+        self.sequence_currvals
+            .write()
+            .retain(|(db, _), _| *db != database_id);
     }
 
     /// Total times this connection's autonomous sequence inner-tx ran into
@@ -5181,6 +5213,39 @@ mod tests {
             .find(|row| text_value(&row[1]) == "aux")
             .expect("attached aux database must be listed");
         assert_eq!(text_value(&aux[2]), "");
+    }
+
+    #[test]
+    fn test_search_path_decides_where_names_are_looked_up_and_created() {
+        let temp_dir = TempDir::new().unwrap();
+        let main_path = temp_dir.path().join("main.db");
+        let conn = open_connection_with_opts(&main_path, DatabaseOpts::new().with_attach(true));
+        conn.execute("ATTACH ':memory:aux' AS aux").unwrap();
+        conn.execute("CREATE TABLE aux.t(x INTEGER); INSERT INTO aux.t VALUES(5)")
+            .unwrap();
+        assert_eq!(query_single_i64(&conn, "SELECT x FROM t"), 5);
+
+        conn.set_search_path(Some(vec!["main".to_string()]));
+        assert!(conn.prepare("SELECT x FROM t").is_err());
+        conn.execute("DROP TABLE IF EXISTS t").unwrap();
+        assert_eq!(query_single_i64(&conn, "SELECT x FROM aux.t"), 5);
+
+        conn.set_search_path(Some(vec!["missing".to_string(), "aux".to_string()]));
+        assert_eq!(query_single_i64(&conn, "SELECT x FROM t"), 5);
+        conn.execute("CREATE TABLE u(y INTEGER)").unwrap();
+        assert_eq!(query_single_i64(&conn, "SELECT count(*) FROM aux.u"), 0);
+
+        conn.set_search_path(Some(vec!["missing".to_string()]));
+        let Err(LimboError::ParseError(message)) = conn.execute("CREATE TABLE v(z INTEGER)") else {
+            panic!("CREATE without a namespace needs a database in the search path");
+        };
+        assert_eq!(message, "no schema has been selected to create in");
+        conn.execute("DROP TABLE IF EXISTS t").unwrap();
+
+        conn.set_search_path(None);
+        assert_eq!(query_single_i64(&conn, "SELECT x FROM t"), 5);
+        conn.execute("CREATE TABLE v(z INTEGER)").unwrap();
+        assert_eq!(query_single_i64(&conn, "SELECT count(*) FROM main.v"), 0);
     }
 
     #[test]

@@ -1326,7 +1326,7 @@ fn query_pragma(
             };
             for current_database_id in &database_ids {
                 let database_name = connection
-                    .get_database_name_by_index(current_database_id)
+                    .namespace_name(current_database_id)
                     .unwrap_or_else(|| "main".to_string());
                 resolver.with_schema(current_database_id, |schema| {
                     emit_table_list_rows_for_schema(

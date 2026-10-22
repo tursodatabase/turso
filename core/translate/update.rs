@@ -672,7 +672,7 @@ fn check_update_from_column_ambiguity(
             .any(|preceding| preceding.identifier == table.identifier)
         {
             let db_name = connection
-                .get_database_name_by_index(table.database_id)
+                .namespace_name(table.database_id)
                 .unwrap_or_else(|| "main".to_string());
             bail_parse_error!(
                 "ambiguous column name: {db_name}.{}._ROWID_",

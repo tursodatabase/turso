@@ -3796,3 +3796,29 @@ fn test_postgres_prepared_statement_keeps_search_path_after_schema_change(db: Te
         vec![vec![Value::build_text("from sp")]]
     );
 }
+
+#[turso_macros::test]
+fn test_postgres_prepared_statement_follows_search_path_changes(db: TempDatabase) {
+    let conn = db.connect_postgres();
+    conn.execute("CREATE TABLE demo (label text)").unwrap();
+    conn.execute("INSERT INTO demo VALUES ('from public')")
+        .unwrap();
+    conn.execute("CREATE SCHEMA sp").unwrap();
+    conn.execute("CREATE TABLE sp.demo (label text)").unwrap();
+    conn.execute("INSERT INTO sp.demo VALUES ('from sp')")
+        .unwrap();
+    conn.execute("SET search_path TO sp").unwrap();
+
+    let mut stmt = conn.prepare("SELECT label FROM demo").unwrap();
+    assert_eq!(
+        stmt.run_collect_rows().unwrap(),
+        vec![vec![Value::build_text("from sp")]]
+    );
+
+    conn.execute("SET search_path TO public").unwrap();
+    stmt.reset().unwrap();
+    assert_eq!(
+        stmt.run_collect_rows().unwrap(),
+        vec![vec![Value::build_text("from public")]]
+    );
+}

@@ -155,7 +155,7 @@ pub fn translate_create_index(
         // The index's target table always lives in the index's own database,
         // so SQLite qualifies the missing table with that database name.
         let db_name = resolver
-            .get_database_name_by_index(database_id)
+            .namespace_name(database_id)
             .unwrap_or_else(|| "main".to_string());
         crate::bail_parse_error!("no such table: {}.{}", db_name, original_tbl_name.as_str());
     };
