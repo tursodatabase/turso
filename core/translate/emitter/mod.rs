@@ -763,7 +763,7 @@ impl<'a> Resolver<'a> {
             .try_collect()?)
     }
 
-    fn resolve_unqualified_existing_database_id<F>(
+    pub(crate) fn resolve_unqualified_existing_database_id<F>(
         &self,
         object_name: &str,
         schema_contains_object: F,
