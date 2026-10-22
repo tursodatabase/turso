@@ -1758,7 +1758,7 @@ fn parse_from_clause_table(
                 .joined_tables_mut()
                 .last_mut()
                 .expect("the nested SELECT added one table");
-            keep_parenthesized_join_columns(table)
+            keep_parenthesized_join_columns(table, resolver)
         }
     }
 }
@@ -1767,7 +1767,7 @@ fn parse_from_clause_table(
 ///
 /// A normal `SELECT *` removes duplicate `USING` columns and all rowids.
 /// SQLite keeps those values because an outer query can use qualified names.
-fn keep_parenthesized_join_columns(table: &mut JoinedTable) -> Result<()> {
+fn keep_parenthesized_join_columns(table: &mut JoinedTable, resolver: &Resolver) -> Result<()> {
     let Table::FromClauseSubquery(subquery) = &mut table.table else {
         unreachable!("a parenthesized join must produce a subquery table");
     };
@@ -1814,8 +1814,13 @@ fn keep_parenthesized_join_columns(table: &mut JoinedTable) -> Result<()> {
                     .any(|name| name.as_str().eq_ignore_ascii_case(column_name))
         };
 
-        let database_id = matches!(source_table.table, Table::BTree(_) | Table::Virtual(_))
-            .then_some(source_table.database_id);
+        let namespace =
+            matches!(source_table.table, Table::BTree(_) | Table::Virtual(_)).then(|| {
+                resolver.namespace_of_stored_name(
+                    source_table.database_id,
+                    source_table.table.get_name(),
+                )
+            });
         let source_join_columns = source_table.table.parenthesized_join_columns();
         for (column_index, column) in source_table.columns().iter().enumerate() {
             let Some(column_name) = column.name.as_deref() else {
@@ -1828,7 +1833,7 @@ fn keep_parenthesized_join_columns(table: &mut JoinedTable) -> Result<()> {
                 None if column.hidden() => continue,
                 None => ParenthesizedJoinColumn {
                     source: ParenthesizedJoinColumnSource::Table {
-                        database_id,
+                        namespace: namespace.clone(),
                         table_name: source_table.identifier.clone(),
                         column_name: column_name.to_string(),
                     },
@@ -1873,7 +1878,7 @@ fn keep_parenthesized_join_columns(table: &mut JoinedTable) -> Result<()> {
             ));
             join_columns.push(ParenthesizedJoinColumn {
                 source: ParenthesizedJoinColumnSource::RowId {
-                    database_id,
+                    namespace: namespace.clone(),
                     table_name: source_table.identifier.clone(),
                 },
                 visibility: ParenthesizedJoinColumnVisibility::Visible,

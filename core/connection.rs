@@ -5379,6 +5379,30 @@ mod tests {
     }
 
     #[test]
+    fn test_a_column_named_with_its_namespace_reads_the_table_of_that_namespace() {
+        let temp_dir = TempDir::new().unwrap();
+        let conn = open_connection_with_opts(&temp_dir.path().join("main.db"), DatabaseOpts::new());
+        conn.execute("CREATE TABLE \"app.t\"(x INTEGER); INSERT INTO \"app.t\" VALUES(1)")
+            .unwrap();
+        conn.execute("CREATE TABLE t(x INTEGER); INSERT INTO t VALUES(2)")
+            .unwrap();
+        conn.add_namespace(crate::Namespace {
+            name: "app".to_string(),
+            database_id: MAIN_DB_ID,
+            prefix: "app.".to_string(),
+        });
+
+        for (sql, expected) in [
+            ("SELECT app.t.x FROM app.t JOIN main.t", 1),
+            ("SELECT main.t.x FROM app.t JOIN main.t", 2),
+            ("SELECT app.t.x FROM (app.t JOIN main.t)", 1),
+            ("SELECT main.t.x FROM (app.t JOIN main.t)", 2),
+        ] {
+            assert_eq!(query_single_i64(&conn, sql), expected, "{sql}");
+        }
+    }
+
+    #[test]
     fn test_named_memory_parent_can_attach_real_file_database() {
         let temp_dir = TempDir::new().unwrap();
         let aux_path = temp_dir.path().join("aux.db");

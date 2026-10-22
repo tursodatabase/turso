@@ -4573,13 +4573,13 @@ pub(crate) enum ParenthesizedJoinColumnSource {
     /// Turso keeps these names separate because quoted names can contain dots.
     /// SQLite's dot-separated string cannot represent those names.
     Table {
-        database_id: Option<usize>,
+        namespace: Option<crate::Namespace>,
         table_name: String,
         column_name: String,
     },
     /// An implicit rowid keeps its table name but matches each rowid alias.
     RowId {
-        database_id: Option<usize>,
+        namespace: Option<crate::Namespace>,
         table_name: String,
     },
 }
@@ -4589,17 +4589,36 @@ impl ParenthesizedJoinColumnSource {
         match self {
             Self::Using { .. } => false,
             Self::Table {
-                database_id: saved_database,
+                namespace: saved_namespace,
                 table_name: saved_table,
                 ..
             }
             | Self::RowId {
-                database_id: saved_database,
+                namespace: saved_namespace,
                 table_name: saved_table,
             } => {
-                database_id.is_none_or(|database| *saved_database == Some(database))
-                    && saved_table.eq_ignore_ascii_case(table_name)
+                database_id.is_none_or(|database| {
+                    saved_namespace
+                        .as_ref()
+                        .is_some_and(|saved| saved.database_id == database)
+                }) && saved_table.eq_ignore_ascii_case(table_name)
             }
+        }
+    }
+
+    pub(crate) fn in_namespace(&self, namespace: &crate::Namespace) -> bool {
+        match self {
+            Self::Using { .. } => false,
+            Self::Table {
+                namespace: saved_namespace,
+                ..
+            }
+            | Self::RowId {
+                namespace: saved_namespace,
+                ..
+            } => saved_namespace
+                .as_ref()
+                .is_some_and(|saved| saved.holds_the_same_objects_as(namespace)),
         }
     }
 

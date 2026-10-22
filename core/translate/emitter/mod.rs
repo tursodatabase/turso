@@ -1006,7 +1006,10 @@ impl<'a> Resolver<'a> {
         Ok(self.resolve_namespace(qualified_name)?.database_id)
     }
 
-    fn resolve_namespace(&self, qualified_name: &ast::QualifiedName) -> Result<Namespace> {
+    pub(crate) fn resolve_namespace(
+        &self,
+        qualified_name: &ast::QualifiedName,
+    ) -> Result<Namespace> {
         // Check if this is a qualified name (database.table) or unqualified
         let namespace = if let Some(db_name) = &qualified_name.namespace {
             self.namespace_named(db_name)

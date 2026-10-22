@@ -274,3 +274,17 @@ test drop-of-a-schema-marker-table-errors {
 expect error {
     reserved for schema markers
 }
+
+test column-named-with-its-schema-reads-the-table-of-that-schema {
+    CREATE SCHEMA app;
+    CREATE TABLE app.t (x int);
+    CREATE TABLE t (x int);
+    INSERT INTO app.t VALUES (1);
+    INSERT INTO t VALUES (2);
+    SELECT app.t.x, public.t.x FROM app.t JOIN public.t ON true;
+    SELECT public.t.x, app.t.x FROM (app.t JOIN public.t ON true);
+}
+expect {
+    1|2
+    2|1
+}
