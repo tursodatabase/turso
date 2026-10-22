@@ -48,19 +48,21 @@ impl PostgreSQLTranslator {
         } else {
             self.map_table_name(&range_var.relname)
         };
-        let name = ast::Name::from_string(mapped_name);
+        let name = ast::Name::exact(mapped_name);
         let alias = range_var
             .alias
             .as_ref()
             .filter(|a| !a.aliasname.is_empty())
-            .map(|a| ast::Name::from_string(&a.aliasname));
+            .map(|a| ast::Name::exact(a.aliasname.clone()));
         let schema = if range_var.schemaname.is_empty() {
             is_catalog_table_name(name.as_str()).then_some("main")
         } else {
             Some(map_schema_name(&range_var.schemaname))
         };
         let mut qn = match schema {
-            Some(schema) => ast::QualifiedName::fullname(ast::Name::from_string(schema), name),
+            Some(schema) => {
+                ast::QualifiedName::fullname(ast::Name::exact(schema.to_string()), name)
+            }
             None => ast::QualifiedName::single(name),
         };
         qn.alias = alias;
@@ -5117,12 +5119,21 @@ fn serial_sequence_namespace(tbl_name: &ast::QualifiedName) -> String {
 
 /// What is put in front of the name of an object of schema `schema` to get
 /// the name it is stored under in the main database: table `t` of schema
-/// `s` is stored as `s.t`, and the objects of public keep their names.
+/// `s` is stored as `s.t`, and the objects of public keep their names. A
+/// schema whose name has a dot or a quote in it is written quoted, as SQL
+/// writes it, so that table `t` of schema `a.b` is stored as `"a.b".t` and
+/// table `b.t` of schema `a` as `a.b.t`: no two objects share a stored
+/// name, since a dot ends an unquoted schema name and a quote followed by
+/// a dot ends a quoted one.
 pub fn stored_name_prefix(schema: &str) -> String {
     if schema.is_empty() || map_schema_name(schema) == "main" {
         return String::new();
     }
-    format!("{}.", schema.to_ascii_lowercase())
+    let schema = schema.to_ascii_lowercase();
+    if schema.contains('.') || schema.contains('"') {
+        return format!("\"{}\".", schema.replace('"', "\"\""));
+    }
+    format!("{schema}.")
 }
 
 /// Maps a PostgreSQL schema name to the Turso schema that holds its tables.
@@ -6932,6 +6943,18 @@ fn is_binary_collation(collname: &[pg_query::protobuf::Node]) -> bool {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn stored_name_prefix_quotes_a_schema_name_with_a_dot_or_a_quote() {
+        assert_eq!(stored_name_prefix("public"), "");
+        assert_eq!(stored_name_prefix("app"), "app.");
+        assert_eq!(stored_name_prefix("a.b"), "\"a.b\".");
+        assert_eq!(stored_name_prefix("x\"y"), "\"x\"\"y\".");
+        assert_ne!(
+            format!("{}t", stored_name_prefix("a.b")),
+            format!("{}b.t", stored_name_prefix("a"))
+        );
+    }
+
     use super::*;
 
     #[test]

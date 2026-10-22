@@ -227,3 +227,24 @@ test public-object-named-under-a-schema-prefix-errors {
 expect error {
     the prefix of app
 }
+
+test schema-named-with-a-dot-keeps-its-tables-apart {
+    CREATE SCHEMA a;
+    CREATE SCHEMA "a.b";
+    CREATE TABLE "a.b".t (x int);
+    CREATE TABLE a."b.t" (x int);
+    INSERT INTO "a.b".t VALUES (1);
+    INSERT INTO a."b.t" VALUES (2);
+    SELECT schemaname, tablename FROM pg_tables WHERE tablename IN ('t', 'b.t') ORDER BY schemaname;
+    SELECT x FROM a."b.t";
+    DROP SCHEMA a CASCADE;
+    SELECT x FROM "a.b".t;
+    SELECT count(*) FROM pg_tables WHERE tablename = 'b.t';
+}
+expect {
+    a|b.t
+    a.b|t
+    2
+    1
+    0
+}
