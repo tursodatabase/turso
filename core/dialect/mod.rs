@@ -164,6 +164,21 @@ pub trait Dialect: Send + Sync + 'static {
         )))
     }
 
+    /// Replace a call to a function that `CREATE FUNCTION` created with the
+    /// expression that computes it. The engine calls this before it plans a
+    /// statement, for each function call whose name is in
+    /// [`crate::schema::Schema::user_functions`]. `Ok(None)` means the call
+    /// is not to such a function, so the engine resolves the name as usual.
+    /// `Err` means the function exists but the dialect cannot execute it.
+    fn expand_function_call(
+        &self,
+        _schema: &crate::schema::Schema,
+        _name: &str,
+        _args: &[turso_parser::ast::Expr],
+    ) -> crate::Result<Option<turso_parser::ast::Expr>> {
+        Ok(None)
+    }
+
     /// Whether this dialect needs the custom-type machinery (DECODE/ENCODE,
     /// affinity metadata) regardless of the experimental database flag.
     /// A dialect whose type system leans on custom types (e.g. PostgreSQL)
@@ -272,6 +287,49 @@ mod tests {
             Ok(crate::Value::Numeric(crate::numeric::Numeric::Integer(
                 v + 1,
             )))
+        }
+
+        /// The stored text of a function is an expression over the parameter
+        /// `x`, such as `x * 2`.
+        fn expand_function_call(
+            &self,
+            schema: &crate::schema::Schema,
+            name: &str,
+            args: &[turso_parser::ast::Expr],
+        ) -> crate::Result<Option<turso_parser::ast::Expr>> {
+            use turso_parser::ast::{Cmd, Expr, OneSelect, ResultColumn, Stmt};
+            use turso_parser::parser::Parser;
+
+            let Some(function) = schema.get_user_function(name, args.len()) else {
+                if schema.user_functions_named(name).is_empty() {
+                    return Ok(None);
+                }
+                return Err(crate::LimboError::ParseError(format!(
+                    "function {name} does not take {} arguments",
+                    args.len()
+                )));
+            };
+            let Ok(Some(Cmd::Stmt(Stmt::Select(select)))) =
+                Parser::new(format!("SELECT {}", function.sql).as_bytes()).next_cmd()
+            else {
+                return Err(crate::LimboError::ParseError(format!(
+                    "function {name} has an invalid body"
+                )));
+            };
+            let OneSelect::Select { columns, .. } = select.body.select else {
+                unreachable!("SELECT without VALUES");
+            };
+            let Some(ResultColumn::Expr(mut body, _)) = columns.into_iter().next() else {
+                unreachable!("SELECT with one column");
+            };
+            crate::translate::expr::walk_expr_mut(&mut body, &mut |expr| {
+                if matches!(expr, Expr::Id(id) if id.as_str() == "x") {
+                    *expr = args[0].clone();
+                    return Ok(crate::translate::expr::WalkControl::SkipChildren);
+                }
+                Ok(crate::translate::expr::WalkControl::Continue)
+            })?;
+            Ok(Some(*body))
         }
 
         fn register_catalog(
@@ -700,6 +758,72 @@ mod tests {
             vec![(0, "CREATE FUNCTION kept() RETURN 1".to_string())]
         );
         assert!(stored_function_sqls(&conn, "add_tax").is_empty());
+        conn.close().unwrap();
+    }
+
+    #[test]
+    fn dialect_expands_calls_to_stored_functions() {
+        let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+        let db = open_db(&io, "dialect-expand.db", Arc::new(TestDialect::default())).unwrap();
+        let conn = db.connect(ConnectOpts::new()).unwrap();
+        conn.execute("CREATE TABLE t (v INTEGER)").unwrap();
+        conn.execute("INSERT INTO t VALUES (1), (5), (20)").unwrap();
+
+        // Without a stored function of that name, the call is an unknown function.
+        let err = conn.prepare("SELECT twice(21)").unwrap_err();
+        assert!(err.to_string().contains("no such function"), "{err}");
+
+        run_cmd(&conn, create_function_cmd("twice", 1, "x * 2", false)).unwrap();
+        run_cmd(&conn, create_function_cmd("half", 1, "x / 2", false)).unwrap();
+        let query = |sql: &str| {
+            conn.prepare(sql)
+                .unwrap()
+                .run_collect_rows()
+                .unwrap()
+                .into_iter()
+                .map(|row| row[0].clone())
+                .collect::<Vec<_>>()
+        };
+        let ints = |values: &[i64]| {
+            values
+                .iter()
+                .map(|v| crate::Value::from_i64(*v))
+                .collect::<Vec<_>>()
+        };
+
+        assert_eq!(query("SELECT twice(21)"), ints(&[42]));
+        // A call inside a call, and calls in every clause of a statement.
+        assert_eq!(query("SELECT twice(twice(half(21)))"), ints(&[40]));
+        assert_eq!(
+            query("SELECT twice(v) FROM t WHERE twice(v) > 5 ORDER BY half(twice(v)) DESC"),
+            ints(&[40, 10])
+        );
+        assert_eq!(
+            query("SELECT (SELECT max(twice(v)) FROM t WHERE twice(v) < twice(10))"),
+            ints(&[10])
+        );
+        assert_eq!(
+            query("SELECT count(*) FROM t WHERE v IN (SELECT half(v) FROM t)"),
+            ints(&[0])
+        );
+        conn.execute("UPDATE t SET v = twice(v) WHERE half(v) = 10")
+            .unwrap();
+        conn.execute("INSERT INTO t VALUES (twice(50))").unwrap();
+        conn.execute("DELETE FROM t WHERE twice(v) = 2").unwrap();
+        assert_eq!(query("SELECT v FROM t ORDER BY v"), ints(&[5, 40, 100]));
+
+        // A name with the wrong number of arguments is an error from the dialect.
+        let err = conn.prepare("SELECT twice(1, 2)").unwrap_err();
+        assert!(
+            err.to_string().contains("does not take 2 arguments"),
+            "{err}"
+        );
+        // Built-in functions keep their meaning.
+        assert_eq!(query("SELECT abs(-3)"), ints(&[3]));
+
+        run_cmd(&conn, drop_function_cmd("twice", None)).unwrap();
+        let err = conn.prepare("SELECT twice(21)").unwrap_err();
+        assert!(err.to_string().contains("no such function"), "{err}");
         conn.close().unwrap();
     }
 
