@@ -276,9 +276,13 @@ fn note_transaction_block(conn: &Connection, stmt: &ast::Stmt) {
 
 /// The time the transaction block started: the time of BEGIN, or the time
 /// of the first statement that asked when BEGIN did not go through the
-/// session.
+/// session. A connection without PostgreSQL session state gets the time of
+/// the statement.
 pub(crate) fn transaction_block_start(conn: &Connection, statement_time: &str) -> String {
-    session_state(conn)
+    let Some(state) = conn.context::<PgSessionState>() else {
+        return statement_time.to_string();
+    };
+    state
         .lock()
         .unwrap()
         .transaction_start
@@ -287,7 +291,9 @@ pub(crate) fn transaction_block_start(conn: &Connection, statement_time: &str) -
 }
 
 pub(crate) fn end_transaction_block(conn: &Connection) {
-    session_state(conn).lock().unwrap().transaction_start = None;
+    if let Some(state) = conn.context::<PgSessionState>() {
+        state.lock().unwrap().transaction_start = None;
+    }
 }
 
 /// `__pl_set(key, value)`: keep the value of a PL/pgSQL variable.

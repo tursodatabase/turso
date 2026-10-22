@@ -87,7 +87,7 @@ scalar_functions! {
     PgIsInRecovery(FunctionArity::Exact(0), false),
     PgLockAccessShare(FunctionArity::Exact(0), false),
     Now | TransactionTimestamp | StatementTimestamp(FunctionArity::Variadic, false),
-    ClockTimestamp(FunctionArity::Exact(0), false),
+    ClockTimestamp(FunctionArity::Variadic, false),
     PlSet(FunctionArity::Exact(2), false),
     PlSetOne(FunctionArity::Exact(2), false),
     PlGet(FunctionArity::Exact(1), false),
