@@ -484,6 +484,7 @@ impl PostgreSQLTranslator {
         use pg_query::protobuf::node::Node;
         use pg_query::protobuf::ConstrType;
 
+        reject_column_def_clauses(col_def)?;
         let name = col_def.colname.clone();
         let pg_type = extract_type_name(col_def)?;
         let typmods = extract_integer_typmods(col_def);
@@ -903,6 +904,7 @@ impl PostgreSQLTranslator {
         use pg_query::protobuf::ConstrType;
 
         let col_name = ast::Name::from_string(&col_def.colname);
+        reject_column_def_clauses(col_def)?;
 
         let pg_type = extract_type_name(col_def)?;
         let typmods = extract_integer_typmods(col_def);
@@ -6292,6 +6294,14 @@ fn reject_table_storage_clauses(
     Ok(())
 }
 
+/// Rejects column-definition clauses that are not translated.
+fn reject_column_def_clauses(col_def: &pg_query::protobuf::ColumnDef) -> Result<(), ParseError> {
+    if col_def.coll_clause.is_some() {
+        return Err(not_supported("COLLATE on a column definition"));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -9148,5 +9158,15 @@ mod tests {
     #[test]
     fn fail_closed_on_commit() {
         assert_not_supported("CREATE TEMP TABLE t (a int) ON COMMIT DROP", "TEMPORARY");
+    }
+
+    #[test]
+    fn fail_closed_column_collate() {
+        assert_not_supported("CREATE TABLE t (a text COLLATE \"C\")", "COLLATE");
+        assert_not_supported("ALTER TABLE t ADD COLUMN a text COLLATE \"C\"", "COLLATE");
+        assert_not_supported(
+            "ALTER TABLE t ALTER COLUMN a TYPE text COLLATE \"C\"",
+            "COLLATE",
+        );
     }
 }
