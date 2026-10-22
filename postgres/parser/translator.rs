@@ -1151,6 +1151,12 @@ impl PostgreSQLTranslator {
         let remove_type = ObjectType::try_from(drop.remove_type)
             .map_err(|_| ParseError::ParseError("Invalid object type in DROP".into()))?;
 
+        if drop.behavior == pg_query::protobuf::DropBehavior::DropCascade as i32 {
+            return Err(not_supported(format!(
+                "DROP {} ... CASCADE",
+                drop_object_type_name(remove_type)
+            )));
+        }
         if drop.objects.len() > 1 {
             return Err(not_supported(format!(
                 "DROP {} of several objects",
@@ -9123,5 +9129,12 @@ mod tests {
         assert_not_supported("DROP TABLE a, b", "several objects");
         assert_not_supported("DROP INDEX IF EXISTS i1, i2", "several objects");
         assert_not_supported("DROP VIEW v1, v2", "several objects");
+    }
+
+    #[test]
+    fn fail_closed_drop_cascade() {
+        assert_not_supported("DROP TABLE t CASCADE", "CASCADE");
+        assert_not_supported("DROP TYPE mood CASCADE", "CASCADE");
+        assert_translates("DROP TABLE t RESTRICT");
     }
 }
