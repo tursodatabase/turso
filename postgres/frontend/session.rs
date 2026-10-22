@@ -806,8 +806,6 @@ fn without_foreign_keys(conn: &Arc<Connection>, f: impl FnOnce() -> Result<()>) 
     result
 }
 
-/// An object of a schema, which DROP SCHEMA ... CASCADE drops, by its
-/// stored name.
 enum SchemaObject {
     View(String),
     Table(String),
@@ -890,8 +888,6 @@ fn schema_objects(conn: &Arc<Connection>, schema: &str) -> Vec<SchemaObject> {
         .collect()
 }
 
-/// The names of the tables, views, indexes, triggers and sequences of the
-/// main database.
 fn object_names(schema: &turso_core::schema::Schema) -> Vec<String> {
     schema
         .tables
@@ -917,8 +913,6 @@ fn object_names(schema: &turso_core::schema::Schema) -> Vec<String> {
         .collect()
 }
 
-/// The schemas other than public: the names of the marker tables of the
-/// main database, in name order.
 fn schema_names(conn: &Connection) -> Vec<String> {
     let mut names: Vec<String> = conn
         .current_schema()

@@ -3312,7 +3312,6 @@ impl Connection {
         &self.namespaces
     }
 
-    /// Adds `namespace` under its name, so that `name.t` names its objects.
     pub fn add_namespace(&self, namespace: crate::Namespace) {
         self.namespaces.add(namespace);
         self.bump_prepare_context_generation();
@@ -3325,14 +3324,12 @@ impl Connection {
         database_id
     }
 
-    /// The name of the namespace that is the whole of database `database_id`.
     pub fn namespace_name(&self, database_id: usize) -> Option<String> {
         self.namespaces
             .of_database(database_id)
             .map(|namespace| namespace.name)
     }
 
-    /// The namespace called `name`. `name` is normalized.
     pub fn namespace(&self, name: &str) -> Option<crate::Namespace> {
         self.namespaces.get(name)
     }
@@ -3342,7 +3339,6 @@ impl Connection {
         self.namespaces.database_id(name)
     }
 
-    /// The namespaces other than main and temp.
     pub fn other_namespaces(&self) -> Vec<crate::Namespace> {
         self.namespaces.others()
     }

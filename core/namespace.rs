@@ -23,8 +23,6 @@ pub struct Namespace {
 }
 
 impl Namespace {
-    /// The namespace of a whole database: its objects are stored under their
-    /// own names.
     pub fn database(name: &str, database_id: usize) -> Self {
         Self {
             name: name.to_string(),
@@ -33,14 +31,10 @@ impl Namespace {
         }
     }
 
-    /// The name that object `name` is stored under in the database.
     pub fn stored_name(&self, name: &str) -> String {
         format!("{}{name}", self.prefix)
     }
 
-    /// The name to write into the SQL text of an object named `written`
-    /// in this namespace: the name as written when the namespace has no
-    /// prefix, else the stored name.
     pub fn name_in_sql(&self, written: &turso_parser::ast::Name) -> turso_parser::ast::Name {
         if self.prefix.is_empty() {
             return written.clone();
@@ -48,8 +42,6 @@ impl Namespace {
         turso_parser::ast::Name::exact(self.stored_name(written.as_str()))
     }
 
-    /// Like [`Namespace::name_in_sql`] for a qualified name: the stored
-    /// name has no qualifier, since the prefix says where the object is.
     pub fn qualified_name_in_sql(
         &self,
         written: &turso_parser::ast::QualifiedName,
@@ -60,8 +52,6 @@ impl Namespace {
         turso_parser::ast::QualifiedName::single(self.name_in_sql(&written.name))
     }
 
-    /// Whether `self` and `other` hold the same objects: two names for the
-    /// same database and prefix, like `main` and `public`.
     pub fn holds_the_same_objects_as(&self, other: &Namespace) -> bool {
         self.database_id == other.database_id && self.prefix == other.prefix
     }
@@ -73,7 +63,6 @@ pub struct Namespaces {
 }
 
 impl Namespaces {
-    /// The namespace called `name`. `name` is normalized.
     pub fn get(&self, name: &str) -> Option<Namespace> {
         match name {
             "main" => Some(Namespace::database("main", MAIN_DB_ID)),
@@ -82,13 +71,10 @@ impl Namespaces {
         }
     }
 
-    /// The database that namespace `name` refers to. `name` is normalized.
     pub fn database_id(&self, name: &str) -> Option<usize> {
         self.get(name).map(|namespace| namespace.database_id)
     }
 
-    /// The namespace that is the whole of database `database_id`: main,
-    /// temp or an attached database.
     pub fn of_database(&self, database_id: usize) -> Option<Namespace> {
         match database_id {
             MAIN_DB_ID => Some(Namespace::database("main", MAIN_DB_ID)),
@@ -121,16 +107,12 @@ impl Namespaces {
             .or_else(|| self.of_database(database_id))
     }
 
-    /// The namespaces other than main and temp, ordered by database, then
-    /// by name.
     pub fn others(&self) -> Vec<Namespace> {
         let mut namespaces: Vec<_> = self.name_to_namespace.read().values().cloned().collect();
         namespaces.sort_by(|a, b| (a.database_id, &a.name).cmp(&(b.database_id, &b.name)));
         namespaces
     }
 
-    /// The namespaces of the attached databases: the databases other than
-    /// main and temp, ordered by database.
     pub fn attached_databases(&self) -> Vec<Namespace> {
         self.others()
             .into_iter()
@@ -140,7 +122,6 @@ impl Namespaces {
             .collect()
     }
 
-    /// Adds `namespace` under its name.
     pub fn add(&self, namespace: Namespace) {
         let name = namespace.name.clone();
         let previous = self

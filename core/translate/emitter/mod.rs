@@ -298,7 +298,6 @@ impl SelfTableScope {
 /// object itself lives in, not through the normal temp-first search.
 #[derive(Debug, Clone)]
 pub(crate) struct DatabaseScopeContext {
-    /// The namespace the object belongs to.
     namespace: Namespace,
     /// "trigger" or "view" (for error messages).
     kind: &'static str,
@@ -875,7 +874,6 @@ impl<'a> Resolver<'a> {
         None
     }
 
-    /// The table, view or materialized view that `qualified_name` names.
     pub(crate) fn resolve_existing_table(
         &self,
         qualified_name: &ast::QualifiedName,
@@ -1116,8 +1114,6 @@ impl<'a> Resolver<'a> {
         )))
     }
 
-    /// The object called `name` in the namespace that is the whole of
-    /// database `database_id`.
     pub(crate) fn resolved_in_database(&self, database_id: usize, name: &str) -> ResolvedName {
         ResolvedName::in_namespace(self.namespace_of_database(database_id), name)
     }
@@ -1128,8 +1124,6 @@ impl<'a> Resolver<'a> {
             .expect("a database has a namespace")
     }
 
-    /// The namespace of database `database_id` that holds the object
-    /// stored as `stored_name`.
     pub(crate) fn namespace_of_stored_name(
         &self,
         database_id: usize,

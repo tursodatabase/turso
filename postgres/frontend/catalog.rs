@@ -2856,7 +2856,6 @@ trait SnapshotRows: Debug + Send + Sync + 'static {
     fn load_rows(conn: &Connection, schemas: &[UserSchema]) -> Vec<Vec<Value>>;
 }
 
-/// A schema other than public, with the OID the catalogs give it.
 #[derive(Debug)]
 pub(crate) struct UserSchema {
     oid: i64,
@@ -2864,14 +2863,10 @@ pub(crate) struct UserSchema {
     prefix: String,
 }
 
-/// OID of the public schema.
 const PUBLIC_NAMESPACE_OID: i64 = 2200;
 
-/// OID of the first schema other than public, in name order.
 const FIRST_USER_SCHEMA_OID: i64 = 16384;
 
-/// The schemas other than public: the namespaces of the main database that
-/// store their objects under a prefix, in name order.
 fn user_schemas(conn: &Connection) -> Vec<UserSchema> {
     conn.other_namespaces()
         .into_iter()
@@ -2887,8 +2882,6 @@ fn user_schemas(conn: &Connection) -> Vec<UserSchema> {
         .collect()
 }
 
-/// Where an object of the main database is in PostgreSQL: its schema, its
-/// name in the schema, and the OID of the schema.
 struct Placement<'a> {
     schema: &'a str,
     name: &'a str,

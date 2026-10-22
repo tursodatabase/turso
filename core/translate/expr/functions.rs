@@ -361,8 +361,6 @@ pub(crate) fn qualify_sequence_argument(
     Some(args.into_boxed_slice())
 }
 
-/// The name of a sequence as a sequence function names it: `name` or
-/// `namespace.name`.
 fn sequence_qualified_name(name: &str) -> ast::QualifiedName {
     let (namespace, name) = crate::util::split_qualified_name(name);
     ast::QualifiedName {

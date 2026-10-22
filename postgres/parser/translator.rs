@@ -5940,20 +5940,12 @@ pub fn unqualified_create_table_name_location(parse_result: &ParseResult) -> Opt
     Some(relation.location as usize)
 }
 
-/// The tables that the foreign keys of a CREATE TABLE statement name
-/// without a schema.
 pub struct UnqualifiedForeignKeyTargets {
-    /// The table the statement creates.
     pub table: String,
-    /// The schema the statement names for the table, if any.
     pub schema: Option<String>,
-    /// The byte offset and name of each referenced table, in order.
     pub targets: Vec<(usize, String)>,
 }
 
-/// The tables that the foreign keys of a CREATE TABLE statement name
-/// without a schema, in the column constraints and the table constraints.
-/// None for other statements.
 pub fn unqualified_foreign_key_targets(
     parse_result: &ParseResult,
 ) -> Option<UnqualifiedForeignKeyTargets> {

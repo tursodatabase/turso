@@ -69,8 +69,6 @@ pub fn qualify_create_table_name(sql: &str, location: usize, schema: &str) -> St
     qualify_table_names(sql, &[(location, schema.to_string())])
 }
 
-/// `sql` with each schema of `names` in front of the table name that starts
-/// at the byte offset given with it.
 pub fn qualify_table_names(sql: &str, names: &[(usize, String)]) -> String {
     let mut names: Vec<&(usize, String)> = names.iter().collect();
     names.sort_by_key(|(location, _)| std::cmp::Reverse(*location));
