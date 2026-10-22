@@ -3334,11 +3334,6 @@ impl Connection {
         self.namespaces.get(name)
     }
 
-    /// The database that namespace `name` refers to. `name` is normalized.
-    pub fn namespace_database_id(&self, name: &str) -> Option<usize> {
-        self.namespaces.database_id(name)
-    }
-
     pub fn other_namespaces(&self) -> Vec<crate::Namespace> {
         self.namespaces.others()
     }

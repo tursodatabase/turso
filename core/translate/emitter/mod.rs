@@ -854,10 +854,6 @@ impl<'a> Resolver<'a> {
         schema.get_trigger(trigger_name).is_some()
     }
 
-    fn schema_has_sequence(schema: &Schema, sequence_name: &str) -> bool {
-        schema.get_sequence(sequence_name).is_some()
-    }
-
     fn resolve_schema_table_database_id(table_name: &str) -> Option<usize> {
         if table_name.eq_ignore_ascii_case(crate::schema::TEMP_SCHEMA_TABLE_NAME)
             || table_name.eq_ignore_ascii_case(crate::schema::TEMP_SCHEMA_TABLE_NAME_ALT)
@@ -983,7 +979,11 @@ impl<'a> Resolver<'a> {
                 &normalize_ident(qualified_name.name.as_str()),
             )));
         }
-        Ok(self.find_unqualified_existing(qualified_name.name.as_str(), Self::schema_has_sequence))
+        Ok(
+            self.find_unqualified_existing(qualified_name.name.as_str(), |schema, seq_name| {
+                schema.get_sequence(seq_name).is_some()
+            }),
+        )
     }
 
     /// The name of `sequence` qualified with its namespace, for the opcodes

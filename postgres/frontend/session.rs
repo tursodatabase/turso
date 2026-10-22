@@ -10,11 +10,11 @@ use turso_core::schema::SEQ_BACKING_TABLE_PREFIX;
 use turso_core::{Connection, LimboError, Namespace, Result, Statement, Value};
 use turso_parser::ast::{self};
 use turso_pg_parser::translator::{
-    check_set_transaction, is_comment_on, is_refresh_matview, try_extract_copy_from,
-    try_extract_create_schema, try_extract_drop_schema, try_extract_set, try_extract_show,
-    unnamed_index_name, unqualified_create_table_name_location, unqualified_foreign_key_targets,
-    PgCopyFromStmt, PgCreateSchemaStmt, PgDropSchemaStmt, PgSetStmt, PgSetValue, PgShowStmt,
-    PostgreSQLTranslator,
+    check_set_transaction, is_comment_on, is_refresh_matview, stored_name_prefix,
+    try_extract_copy_from, try_extract_create_schema, try_extract_drop_schema, try_extract_set,
+    try_extract_show, unnamed_index_name, unqualified_create_table_name_location,
+    unqualified_foreign_key_targets, PgCopyFromStmt, PgCreateSchemaStmt, PgDropSchemaStmt,
+    PgSetStmt, PgSetValue, PgShowStmt, PostgreSQLTranslator,
 };
 
 use crate::copy::parse_copy_text_format;
@@ -702,7 +702,7 @@ fn handle_pg_create_schema(
             "unacceptable schema name \"{name}\": the prefix \"pg_\" is reserved for system schemas"
         )));
     }
-    let prefix = schema_prefix(&name);
+    let prefix = stored_name_prefix(&name);
     if let Some(object) = object_names(&conn.current_schema())
         .into_iter()
         .find(|object| object.starts_with(&prefix))
@@ -841,13 +841,13 @@ fn schema_objects(conn: &Arc<Connection>, schema: &str) -> Vec<SchemaObject> {
     let current = conn.current_schema();
     let prefixes: Vec<String> = schema_names(conn)
         .iter()
-        .map(|name| schema_prefix(name))
+        .map(|name| stored_name_prefix(name))
         .collect();
     let in_schema = |stored: &str| {
         let in_this_schema = if schema == "public" {
             !prefixes.iter().any(|prefix| stored.starts_with(prefix))
         } else {
-            stored.starts_with(&schema_prefix(schema))
+            stored.starts_with(&stored_name_prefix(schema))
         };
         in_this_schema
             && !stored.starts_with("sqlite_")
@@ -929,10 +929,6 @@ fn schema_exists(conn: &Connection, schema_name: &str) -> bool {
     schema_names(conn).iter().any(|name| name == schema_name)
 }
 
-fn schema_prefix(name: &str) -> String {
-    turso_pg_parser::translator::stored_name_prefix(name)
-}
-
 fn schema_marker_table(name: &str) -> String {
     format!("{SCHEMA_MARKER_PREFIX}{name}")
 }
@@ -960,7 +956,7 @@ pub(crate) fn sync_namespaces(conn: &Connection) {
     for name in wanted {
         if !current.contains(&name) {
             conn.add_namespace(turso_core::Namespace {
-                prefix: schema_prefix(&name),
+                prefix: stored_name_prefix(&name),
                 name,
                 database_id: turso_core::MAIN_DB_ID,
             });
