@@ -196,8 +196,6 @@ fn render_in_terminal(content: &str) -> anyhow::Result<()> {
 
 fn handle_event(view: &mut MadView, event: Event) -> ControlFlow<()> {
     match event {
-        // Windows reports key releases too, including the release of the Enter key that
-        // submitted `.manual`, so only key presses may act.
         Event::Key(key) if key.kind == KeyEventKind::Press => match key.code {
             KeyCode::Up | KeyCode::Char('k') => view.try_scroll_lines(-1),
             KeyCode::Down | KeyCode::Char('j') => view.try_scroll_lines(1),
