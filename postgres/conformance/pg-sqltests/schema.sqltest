@@ -352,3 +352,14 @@ test create-schema-errors-when-a-public-index-is-named-under-its-prefix {
 expect error {
     cannot create schema "app"
 }
+
+test drop-schema-cascade-drops-the-tables-of-a-schema-named-with-a-dot {
+    CREATE SCHEMA "a.b";
+    CREATE TABLE "a.b".t (x int);
+    CREATE INDEX i ON "a.b".t (x);
+    DROP SCHEMA "a.b" CASCADE;
+    SELECT count(*) FROM pg_tables WHERE tablename = 't';
+}
+expect {
+    0
+}
