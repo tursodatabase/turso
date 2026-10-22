@@ -60,3 +60,27 @@ test drop-schema-public-cascade-drops-its-objects {
 expect {
     0
 }
+
+test create-schema-creates-its-elements-in-the-new-schema {
+    CREATE SCHEMA IF NOT EXISTS create_elements;
+    DROP SCHEMA create_elements CASCADE;
+    CREATE SCHEMA create_elements
+        CREATE VIEW v AS SELECT a FROM t
+        CREATE TABLE t (a int)
+        CREATE INDEX t_a ON t (a)
+        CREATE SEQUENCE seq;
+    INSERT INTO create_elements.t VALUES (nextval('create_elements.seq') + 41);
+    SELECT a FROM create_elements.v;
+    SHOW search_path;
+}
+expect {
+    42
+    "$user", public
+}
+
+test create-schema-rejects-elements-in-another-schema {
+    CREATE SCHEMA create_elsewhere CREATE TABLE public.t (a int);
+}
+expect error {
+    different from the one being created
+}

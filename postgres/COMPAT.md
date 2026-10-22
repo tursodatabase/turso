@@ -50,7 +50,7 @@ Basics not enumerated by the official feature matrix.
 | CREATE INDEX | ✅ Supported | UNIQUE, multi-column, partial (WHERE), expression indexes, IF NOT EXISTS |
 | CREATE VIEW | ✅ Supported | Column aliases supported; TEMP silently ignored |
 | COMMENT ON | 🟡 Partial | Accepted but discarded; comments are not persisted in `pg_description` |
-| CREATE SCHEMA / DROP SCHEMA | ✅ Supported | Schemas are ATTACHed databases; DROP ... CASCADE; `public` is special-cased; CREATE TABLE without a schema creates the table in the first schema of `search_path` that exists |
+| CREATE SCHEMA / DROP SCHEMA | ✅ Supported | Schemas are ATTACHed databases; DROP ... CASCADE; `public` is special-cased; CREATE TABLE without a schema creates the table in the first schema of `search_path` that exists; CREATE SCHEMA can contain CREATE TABLE, VIEW, INDEX and SEQUENCE statements, which create their objects in the new schema, but not inside a transaction block |
 | CREATE SEQUENCE / nextval / currval / setval | ✅ Supported | START, INCREMENT, MIN/MAXVALUE, CYCLE; CACHE accepted (no-op); pg_sequences view; a sequence named without a schema is looked up through `search_path`, and a column default or view binds it to the schema it is in when the table or view is created; a serial column's sequence is created in the table's schema |
 | CREATE DOMAIN | ✅ Supported | Base type + DEFAULT, NOT NULL, CHECK constraints enforced |
 | CREATE TYPE ... AS ENUM | ✅ Supported | Values validated on write; other CREATE TYPE forms unsupported |
