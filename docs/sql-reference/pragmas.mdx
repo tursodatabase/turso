@@ -218,6 +218,23 @@ PRAGMA function_list;
 -- name | builtin | type | enc | narg | flags
 ```
 
+### module_list
+
+Returns one row for each virtual table module registered on the connection, in arbitrary
+order.
+
+```sql
+PRAGMA module_list;
+-- completion
+-- generate_series
+```
+
+A freshly opened database reports the built-in `generate_series` module, which is
+compiled in through the default `series` feature. The `tursodb` shell also registers a
+`completion` module for tab completion, so it shows up when you run the pragma there.
+Virtual table modules registered by loaded extensions show up here as well. The pragma takes no arguments: a write form such as
+`PRAGMA module_list = 1;` is accepted and does nothing.
+
 ### pragma_list
 
 Returns the list of all supported PRAGMA commands.
@@ -251,6 +268,29 @@ PRAGMA journal_mode = mvcc;
 When MVCC mode is active, you can use `BEGIN CONCURRENT` for optimistic concurrent write transactions. See [Transactions](/docs/sql-reference/statements/transactions#begin-concurrent) for details.
 </Info>
 
+### auto_vacuum
+
+Returns or sets the auto-vacuum mode. The bare form returns the current mode as an integer.
+
+```sql
+PRAGMA auto_vacuum;              -- 0 (none), 1 (full), or 2 (incremental)
+PRAGMA auto_vacuum = none;       -- same as = 0
+PRAGMA auto_vacuum = full;       -- same as = 1
+PRAGMA auto_vacuum = incremental; -- same as = 2
+```
+
+Auto-vacuum is experimental: setting a mode other than `none` fails with
+`Autovacuum is not enabled. Use --experimental-autovacuum flag to enable it.`
+unless the database was opened with the `--experimental-autovacuum` flag. Writing
+`none` is always allowed, and unrecognized names or numbers are treated as `none`.
+The `incremental` mode can be set but is not supported yet: the next write fails with
+`Incremental auto-vacuum is not supported`.
+
+Like SQLite, the mode is fixed once page 1 of the database file exists: setting the
+pragma after the database has been initialized is silently ignored. Opening a database
+that already has auto-vacuum enabled without the flag logs a warning and opens the
+connection read-only.
+
 ### cache_size
 
 Returns or sets the suggested maximum number of database pages held in memory.
@@ -278,10 +318,19 @@ Controls the fsync behavior for durability guarantees.
 ```sql
 PRAGMA synchronous;
 PRAGMA synchronous = OFF;    -- no fsync (fastest, risk of corruption on crash)
+PRAGMA synchronous = NORMAL; -- no fsync on commit, fsync at checkpoint
 PRAGMA synchronous = FULL;   -- fsync after every transaction (safest)
 ```
 
-Only `OFF` and `FULL` are supported in Turso.
+Turso accepts `OFF`, `NORMAL`, and `FULL`, by name or by number (`0`, `1`, `2`).
+Anything else becomes `FULL`. `PRAGMA synchronous;` returns the number of the mode
+you set.
+
+With `NORMAL`, a commit does not fsync the WAL. The fsyncs happen at checkpoint
+time instead.
+
+SQLite has a fourth level, `EXTRA`. Turso does not have it, and sets `FULL` for any
+value it does not know, `EXTRA` included.
 
 ### temp_store
 
@@ -312,6 +361,32 @@ PRAGMA query_only = 1;    -- enable read-only mode
 PRAGMA query_only = 0;    -- disable read-only mode
 ```
 
+### full_column_names / short_column_names
+
+Legacy SQLite naming pragmas, kept for compatibility. Each is a per-connection boolean.
+As in SQLite, `full_column_names` is off by default and `short_column_names` is on by
+default. The read form returns `0` or `1`. A write enables the flag for `ON`, `TRUE`,
+`YES` (case-insensitively) or any positive number, and disables it for anything else.
+
+```sql
+PRAGMA full_column_names;      -- 0
+PRAGMA short_column_names;     -- 1
+PRAGMA full_column_names = 1;
+PRAGMA short_column_names = 0;
+```
+
+They only affect the names reported for result columns, never the data:
+
+- With `full_column_names` on, a column reference is named `TABLE.COLUMN` instead of the
+  default expression-text name. `SELECT *` expands to those prefixed names only when
+  `short_column_names` is also off.
+- With `short_column_names` on (and `full_column_names` off), a column reference is
+  named with just its column name.
+- An explicit `AS` alias always wins over both.
+
+SQLite deprecated both pragmas; prefer naming output columns with `AS` aliases in the
+query.
+
 ### foreign_keys
 
 Enables or disables foreign key constraint enforcement.
@@ -326,10 +401,25 @@ Foreign key enforcement is off by default for SQLite compatibility.
 
 ### legacy_file_format
 
-Returns the legacy file format flag.
+Accepted and ignored. SQLite dropped the legacy file format and made this PRAGMA a
+no-op, and Turso matches it: the query returns no rows, and a value assigned to it has
+no effect.
 
 ```sql
-PRAGMA legacy_file_format;
+PRAGMA legacy_file_format;      -- no rows
+PRAGMA legacy_file_format = 1;  -- accepted, no effect
+```
+
+### empty_result_callbacks
+
+Accepted for compatibility, but has no effect. SQLite deprecated this pragma long ago
+(it controlled whether callbacks still fired when a query returned no rows, which only
+matters to the C API callback loop). In Turso both forms are no-ops: the read form
+returns no rows, and the write form accepts any value without changing behavior.
+
+```sql
+PRAGMA empty_result_callbacks;        -- returns no rows
+PRAGMA empty_result_callbacks = ON;   -- accepted, does nothing
 ```
 
 ### ignore_check_constraints
@@ -383,6 +473,68 @@ DELETE FROM users;            -- rejected: no WHERE clause
 DELETE FROM users WHERE id = 1;  -- allowed
 
 PRAGMA i_am_a_dummy = 1;      -- equivalent to require_where = 1
+```
+
+### count_changes
+
+Off by default. When enabled, each top-level `INSERT`, `UPDATE` and `DELETE` returns one
+row with the number of rows it changed, in a column named `rows inserted`, `rows updated`
+or `rows deleted`. Trigger bodies, foreign key actions and other nested statements never
+emit count rows, and a statement with a `RETURNING` clause does not either, since it
+already returns rows.
+
+```sql
+PRAGMA count_changes;          -- count_changes: 0 (default)
+PRAGMA count_changes = 1;
+INSERT INTO t VALUES (1), (2); -- rows inserted: 2
+UPDATE t SET x = x + 1;        -- rows updated: 2
+DELETE FROM t WHERE x = 1;     -- rows deleted: 1
+PRAGMA count_changes = off;    -- statements return no rows again
+```
+
+### locking_mode
+
+Returns the database locking mode, which is always reported as `exclusive`.
+
+```sql
+PRAGMA locking_mode;
+-- exclusive
+
+PRAGMA locking_mode = exclusive;
+```
+
+<Warning>
+Turso only accepts the value `EXCLUSIVE`, in any letter case and with or without quotes.
+SQLite's default value `NORMAL` is rejected:
+
+```sql
+PRAGMA locking_mode = normal;
+-- Parse error: locking_mode must be EXCLUSIVE
+```
+
+Writing the pragma does not change how Turso locks the database file. It only checks the
+value and then reports `exclusive`, the same as the read form. So a portable script that
+sets `locking_mode` back to `NORMAL` when it finishes will fail here even though it works
+on SQLite. This matches the `Partial` entry for `PRAGMA locking_mode` in `COMPAT.md`.
+</Warning>
+
+### fts_merge_threshold
+
+<Info>
+**Turso Extension**: write-path merging for the `fts` index method has no SQLite equivalent.
+</Info>
+
+Controls how many visible segments a `fts` index may accumulate before Turso merges them
+as part of the write path. After each statement that flushes the index, Turso compares the
+visible segment count against the threshold and merges the excess. The default is 32.
+Setting it to `0` disables write-path merging. The value applies to the current connection;
+new connections start from the default again.
+
+```sql
+PRAGMA fts_merge_threshold;        -- 32
+PRAGMA fts_merge_threshold = 8;    -- merge once the index has more than 8 visible segments
+PRAGMA fts_merge_threshold = 0;    -- disable write-path merging
+PRAGMA fts_merge_threshold = -1;   -- error: must be 0 (disabled) or a positive integer
 ```
 
 ## Integrity Checks

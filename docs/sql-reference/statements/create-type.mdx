@@ -265,12 +265,16 @@ Turso provides the following built-in custom types in STRICT tables:
 | `smallint` | integer | -- | Integer constrained to -32768 through 32767. Aliases: `int2`. |
 | `bigint` | integer | -- | Integer (no range constraint). Aliases: `int8`. |
 | `varchar(N)` | text | `maxlen` | Text with a maximum length of N characters. |
-| `date` | text | -- | ISO 8601 date (YYYY-MM-DD), validated on insert. |
+| `date` | text | -- | ISO 8601 date (YYYY-MM-DD), validated on insert. Supports `+` and `-` with whole-day integers. |
 | `time` | text | -- | ISO 8601 time (HH:MM:SS), validated on insert. |
 | `timestamp` | text | -- | ISO 8601 datetime, validated on insert. |
+| `timestamptz` | text | -- | ISO 8601 datetime with the same validation and normalization as `timestamp`. PostgreSQL-compatible name; the stored text carries no offset. |
 | `numeric(P,S)` | blob | `precision`, `scale` | Fixed-point decimal with P total digits and S decimal places. Supports arithmetic operators. |
 | `uuid` | blob | -- | UUID stored as 16-byte blob, displayed as string. Default: `uuid4_str()`. |
 | `inet` | text | -- | Validated IP address (IPv4 or IPv6). |
+| `cidr` | text | -- | Network address in CIDR notation. Stored as given; no validation yet. |
+| `macaddr` | text | -- | MAC address text. Stored as given; no validation yet. |
+| `macaddr8` | text | -- | MAC address text, allowing longer (8-byte) forms. Stored as given; no validation yet. |
 | `bytea` | blob | -- | Binary data (PostgreSQL-compatible alias). |
 | `json` | text | -- | Validated JSON text. |
 | `jsonb` | blob | -- | JSON stored in binary format, returned as JSON text on read. |
