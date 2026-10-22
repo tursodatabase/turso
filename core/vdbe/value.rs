@@ -1495,18 +1495,15 @@ impl Value {
             return Value::Null;
         }
 
-        let separator = match registers
+        let Some(separator) = registers
             .next()
             .expect("registers should have at least one element after length check")
-        {
-            Value::Null | Value::Blob(_) => return Value::Null,
-            v => format!("{v}"),
+            .cast_text_ref()
+        else {
+            return Value::Null;
         };
 
-        let parts = registers.filter_map(|val| match val {
-            Value::Text(_) | Value::Numeric(_) => Some(format!("{val}")),
-            _ => None,
-        });
+        let parts = registers.filter_map(Value::cast_text_ref);
 
         let result = parts.collect::<Vec<_>>().join(&separator);
         Value::build_text(result)
