@@ -24,6 +24,16 @@ test('encodeValue sends floats as type float', t => {
   t.is(result.value, 0.5);
 });
 
+test('encodeValue sends Date arguments as integer epoch milliseconds', t => {
+  const result = encodeValue(new Date('2024-01-02T03:04:05.006Z'));
+  t.is(result.type, 'integer');
+  t.is(result.value, '1704164645006');
+});
+
+test('encodeValue rejects invalid Date arguments', t => {
+  t.throws(() => encodeValue(new Date(Number.NaN)));
+});
+
 // --- decodeValue ---
 
 test('decodeValue decodes empty base64 blob as empty Buffer', t => {
