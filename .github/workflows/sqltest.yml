@@ -137,8 +137,8 @@ jobs:
         run: make -C postgres/conformance build-tursopg
       - name: Build test runner
         run: make -C postgres/conformance build-runner
-      - name: Run tests
-        run: make -C postgres/conformance run
+      - name: Run tests and check matrix cases against PostgreSQL
+        run: make -C postgres/conformance run-matrix
 
   sqltest-postgres:
     name: Run SQL tests (PostgreSQL)
