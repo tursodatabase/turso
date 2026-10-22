@@ -387,7 +387,7 @@ impl PathOperation for SetOperation {
                     (obj_value_size as isize + delta) as usize,
                     true,
                 )?;
-                (new_h_delta - obj_value_header_size) as isize
+                new_h_delta as isize - obj_value_header_size as isize
             } else {
                 0
             };
@@ -552,7 +552,7 @@ impl PathOperation for ReplaceOperation {
                     (obj_value_size as isize + delta) as usize,
                     true,
                 )?;
-                (new_h_delta - obj_value_header_size) as isize
+                new_h_delta as isize - obj_value_header_size as isize
             } else {
                 0
             };
@@ -633,7 +633,7 @@ impl PathOperation for InsertOperation {
                     (obj_value_size as isize + delta) as usize,
                     true,
                 )?;
-                (new_h_delta - obj_value_header_size) as isize
+                new_h_delta as isize - obj_value_header_size as isize
             } else {
                 0
             };
