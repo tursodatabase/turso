@@ -1082,7 +1082,7 @@ impl Schema {
         let functions = self
             .user_functions
             .entry(normalize_ident(&function.name))
-            .or_default();
+            .or_insert_with(|| vec![]);
         functions.retain(|existing| existing.arg_count != function.arg_count);
         functions.push(Arc::new(function));
     }
@@ -1114,7 +1114,7 @@ impl Schema {
     /// Register the functions read from the internal functions table. This is
     /// the shared entry point of the initial database open and the schema
     /// reparse.
-    pub fn load_user_functions(&mut self, functions: Vec<UserFunction>) {
+    pub fn load_user_functions(&mut self, functions: impl IntoIterator<Item = UserFunction>) {
         for function in functions {
             self.add_user_function(function);
         }
