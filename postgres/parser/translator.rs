@@ -771,13 +771,23 @@ impl PostgreSQLTranslator {
         if txn.chain {
             return Err(not_supported("COMMIT/ROLLBACK AND CHAIN"));
         }
-        check_transaction_options(&txn.options, false)?;
+        check_transaction_options(&txn.options, true)?;
 
         match TransactionStmtKind::try_from(txn.kind) {
             Ok(TransactionStmtKind::TransStmtBegin | TransactionStmtKind::TransStmtStart) => {
+                let access_mode = last_access_mode_option(&txn.options).map(|ro| {
+                    if ro {
+                        ast::AccessMode::ReadOnly
+                    } else {
+                        ast::AccessMode::ReadWrite
+                    }
+                });
+                let isolation_level = last_isolation_level_option(&txn.options);
                 Ok(ast::Stmt::Begin {
                     typ: Some(ast::TransactionType::Concurrent),
                     name: None,
+                    access_mode,
+                    isolation_level,
                 })
             }
             Ok(TransactionStmtKind::TransStmtCommit) => Ok(ast::Stmt::Commit { name: None }),
@@ -6100,6 +6110,128 @@ pub fn check_set_transaction(parse_result: &ParseResult) -> Result<bool, ParseEr
     }
 }
 
+pub fn is_begin(parse_result: &ParseResult) -> bool {
+    use pg_query::{protobuf::TransactionStmtKind, NodeRef};
+
+    let nodes = parse_result.protobuf.nodes();
+    let Some(NodeRef::TransactionStmt(txn)) = nodes.first().map(|n| &n.0) else {
+        return false;
+    };
+    matches!(
+        TransactionStmtKind::try_from(txn.kind),
+        Ok(TransactionStmtKind::TransStmtBegin | TransactionStmtKind::TransStmtStart)
+    )
+}
+
+/// The access mode a BEGIN/START TRANSACTION statement names: Some(true) for
+/// READ ONLY, Some(false) for READ WRITE, None when the statement is not a
+/// BEGIN or names no access mode.
+pub fn begin_access_mode(parse_result: &ParseResult) -> Option<bool> {
+    use pg_query::NodeRef;
+
+    if !is_begin(parse_result) {
+        return None;
+    }
+    let nodes = parse_result.protobuf.nodes();
+    let Some(NodeRef::TransactionStmt(txn)) = nodes.first().map(|n| &n.0) else {
+        return None;
+    };
+    last_access_mode_option(&txn.options)
+}
+
+pub fn is_commit_or_rollback(parse_result: &ParseResult) -> bool {
+    use pg_query::{protobuf::TransactionStmtKind, NodeRef};
+
+    let nodes = parse_result.protobuf.nodes();
+    let Some(NodeRef::TransactionStmt(txn)) = nodes.first().map(|n| &n.0) else {
+        return false;
+    };
+    matches!(
+        TransactionStmtKind::try_from(txn.kind),
+        Ok(TransactionStmtKind::TransStmtCommit | TransactionStmtKind::TransStmtRollback)
+    )
+}
+
+/// The access mode a SET TRANSACTION statement names: Some(true) for READ
+/// ONLY, Some(false) for READ WRITE, None when the statement is not SET
+/// TRANSACTION or names no access mode.
+pub fn set_transaction_access_mode(parse_result: &ParseResult) -> Option<bool> {
+    use pg_query::{protobuf::VariableSetKind, NodeRef};
+
+    let nodes = parse_result.protobuf.nodes();
+    let Some(NodeRef::VariableSetStmt(stmt)) = nodes.first().map(|n| &n.0) else {
+        return None;
+    };
+    if stmt.kind != VariableSetKind::VarSetMulti as i32
+        || !stmt.name.eq_ignore_ascii_case("transaction")
+    {
+        return None;
+    }
+    last_access_mode_option(&stmt.args)
+}
+
+/// The access mode set by a list of transaction options: Some(true) for READ
+/// ONLY, Some(false) for READ WRITE, None when no access-mode option appears.
+/// PostgreSQL applies the LAST access-mode option when multiple are given,
+/// e.g. BEGIN READ ONLY, READ WRITE is READ WRITE.
+fn last_access_mode_option(options: &[pg_query::protobuf::Node]) -> Option<bool> {
+    use pg_query::protobuf::node::Node;
+
+    options
+        .iter()
+        .filter_map(|opt| {
+            let Node::DefElem(def) = opt.node.as_ref()? else {
+                return None;
+            };
+            if def.defname != "transaction_read_only" {
+                return None;
+            }
+            Some(!matches!(
+                def.arg.as_ref().and_then(|n| n.node.as_ref()),
+                Some(Node::AConst(pg_query::protobuf::AConst {
+                    val: Some(pg_query::protobuf::a_const::Val::Ival(i)),
+                    ..
+                })) if i.ival == 0
+            ))
+        })
+        .next_back()
+}
+
+/// The isolation level set by a list of transaction options. PostgreSQL applies
+/// the last isolation level option when multiple are given.
+fn last_isolation_level_option(
+    options: &[pg_query::protobuf::Node],
+) -> Option<turso_parser::ast::IsolationLevel> {
+    use pg_query::protobuf::node::Node;
+    use turso_parser::ast::IsolationLevel;
+
+    options
+        .iter()
+        .filter_map(|opt| {
+            let Node::DefElem(def) = opt.node.as_ref()? else {
+                return None;
+            };
+            if def.defname != "transaction_isolation" {
+                return None;
+            }
+            let Node::AConst(pg_query::protobuf::AConst {
+                val: Some(pg_query::protobuf::a_const::Val::Sval(s)),
+                ..
+            }) = def.arg.as_ref().and_then(|n| n.node.as_ref())?
+            else {
+                return None;
+            };
+            match s.sval.to_ascii_lowercase().as_str() {
+                "read uncommitted" => Some(IsolationLevel::ReadUncommitted),
+                "read committed" => Some(IsolationLevel::ReadCommitted),
+                "repeatable read" => Some(IsolationLevel::RepeatableRead),
+                "serializable" => Some(IsolationLevel::Serializable),
+                _ => None,
+            }
+        })
+        .next_back()
+}
+
 /// The byte offset of the table name in a CREATE TABLE statement that names
 /// its table without a schema. None for temporary tables and for other
 /// statements.
@@ -10184,14 +10316,85 @@ mod tests {
 
     #[test]
     fn fail_closed_transaction_options() {
-        assert_not_supported("BEGIN READ ONLY", "READ ONLY");
-        assert_not_supported(
-            "START TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY",
-            "READ ONLY",
-        );
+        assert_translates("BEGIN READ ONLY");
+        assert_translates("START TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY");
         assert_not_supported("COMMIT AND CHAIN", "AND CHAIN");
         assert_not_supported("ROLLBACK AND CHAIN", "AND CHAIN");
         assert_translates("COMMIT AND NO CHAIN");
+    }
+
+    #[test]
+    fn begin_access_mode_detects_read_only_flag() {
+        let begin_ro = crate::parse("BEGIN READ ONLY").unwrap();
+        let begin_plain = crate::parse("BEGIN").unwrap();
+        let begin_rw = crate::parse("BEGIN READ WRITE").unwrap();
+        let start_ro = crate::parse("START TRANSACTION READ ONLY").unwrap();
+        let commit = crate::parse("COMMIT").unwrap();
+        assert_eq!(begin_access_mode(&begin_ro), Some(true));
+        assert_eq!(begin_access_mode(&begin_plain), None);
+        assert_eq!(begin_access_mode(&begin_rw), Some(false));
+        assert_eq!(begin_access_mode(&start_ro), Some(true));
+        assert_eq!(begin_access_mode(&commit), None);
+    }
+
+    #[test]
+    fn begin_access_mode_uses_last_access_mode_option() {
+        // PostgreSQL applies the last access-mode option when multiple are given.
+        let ro_then_rw = crate::parse("BEGIN READ ONLY, READ WRITE").unwrap();
+        let rw_then_ro = crate::parse("BEGIN READ WRITE, READ ONLY").unwrap();
+        assert_eq!(begin_access_mode(&ro_then_rw), Some(false));
+        assert_eq!(begin_access_mode(&rw_then_ro), Some(true));
+    }
+
+    #[test]
+    fn is_begin_detects_transaction_start() {
+        assert!(is_begin(&crate::parse("BEGIN").unwrap()));
+        assert!(is_begin(&crate::parse("START TRANSACTION").unwrap()));
+        assert!(is_begin(&crate::parse("BEGIN READ ONLY").unwrap()));
+        assert!(!is_begin(&crate::parse("COMMIT").unwrap()));
+        assert!(!is_begin(&crate::parse("SELECT 1").unwrap()));
+    }
+
+    #[test]
+    fn is_commit_or_rollback_detects_transaction_end() {
+        let commit = crate::parse("COMMIT").unwrap();
+        let rollback = crate::parse("ROLLBACK").unwrap();
+        let rollback_to = crate::parse("ROLLBACK TO SAVEPOINT sp").unwrap();
+        let begin = crate::parse("BEGIN").unwrap();
+        let select = crate::parse("SELECT 1").unwrap();
+        assert!(is_commit_or_rollback(&commit));
+        assert!(is_commit_or_rollback(&rollback));
+        assert!(!is_commit_or_rollback(&rollback_to));
+        assert!(!is_commit_or_rollback(&begin));
+        assert!(!is_commit_or_rollback(&select));
+    }
+
+    #[test]
+    fn set_transaction_access_mode_detects_access_modes() {
+        let set_rw = crate::parse("SET TRANSACTION READ WRITE").unwrap();
+        let set_ro = crate::parse("SET TRANSACTION READ ONLY").unwrap();
+        let set_iso_only = crate::parse("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ").unwrap();
+        let set_rw_with_iso =
+            crate::parse("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ WRITE").unwrap();
+        let begin_ro = crate::parse("BEGIN READ ONLY").unwrap();
+        let commit = crate::parse("COMMIT").unwrap();
+        let select = crate::parse("SELECT 1").unwrap();
+        assert_eq!(set_transaction_access_mode(&set_rw), Some(false));
+        assert_eq!(set_transaction_access_mode(&set_ro), Some(true));
+        assert_eq!(set_transaction_access_mode(&set_iso_only), None);
+        assert_eq!(set_transaction_access_mode(&set_rw_with_iso), Some(false));
+        assert_eq!(set_transaction_access_mode(&begin_ro), None);
+        assert_eq!(set_transaction_access_mode(&commit), None);
+        assert_eq!(set_transaction_access_mode(&select), None);
+    }
+
+    #[test]
+    fn set_transaction_access_mode_uses_last_access_mode_option() {
+        // PostgreSQL applies the last access-mode option when multiple are given.
+        let rw_then_ro = crate::parse("SET TRANSACTION READ WRITE, READ ONLY").unwrap();
+        let ro_then_rw = crate::parse("SET TRANSACTION READ ONLY, READ WRITE").unwrap();
+        assert_eq!(set_transaction_access_mode(&rw_then_ro), Some(true));
+        assert_eq!(set_transaction_access_mode(&ro_then_rw), Some(false));
     }
 
     #[test]

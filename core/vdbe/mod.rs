@@ -3862,7 +3862,9 @@ impl Program {
                     }
                     TxnCleanup::None => {
                         if can_autocommit_now
-                            || (!self.connection.get_auto_commit() && err.is_some())
+                            || (!self.connection.get_auto_commit()
+                                && err.is_some()
+                                && unfinished_writer)
                         {
                             self.rollback_current_txn(pager);
                         }

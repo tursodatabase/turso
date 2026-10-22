@@ -76,6 +76,10 @@ pub enum LimboError {
     EnvVarError(#[from] std::env::VarError),
     #[error("{0}")]
     TxError(String),
+    #[error("cannot {op} - no transaction is active")]
+    NoActiveTransaction { op: &'static str },
+    #[error("cannot start a transaction within a transaction")]
+    TransactionAlreadyActive,
     #[error(transparent)]
     CompletionError(#[from] CompletionError),
     #[error("Locking error: {0}")]

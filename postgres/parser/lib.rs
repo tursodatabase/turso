@@ -79,6 +79,41 @@ pub fn name_create_index(sql: &str, location: usize, name: &str) -> String {
     sql
 }
 
+/// How a SQL statement relates to transaction control.
+#[derive(Debug, PartialEq)]
+pub enum TxStmt {
+    Begin,
+    Commit,
+    FullRollback,
+    SavepointRollback,
+    Other,
+}
+
+/// Classify a single SQL statement by its transaction-control role.
+/// Uses the parser so that embedded comments and keyword aliases (ABORT for
+/// ROLLBACK, END for COMMIT) are handled correctly.
+pub fn classify_tx_stmt(sql: &str) -> TxStmt {
+    use pg_query::{protobuf::TransactionStmtKind, NodeRef};
+    let Ok(parsed) = parse(sql.trim()) else {
+        return TxStmt::Other;
+    };
+    let Some((node, ..)) = parsed.protobuf.nodes().into_iter().next() else {
+        return TxStmt::Other;
+    };
+    let NodeRef::TransactionStmt(t) = node else {
+        return TxStmt::Other;
+    };
+    match TransactionStmtKind::try_from(t.kind) {
+        Ok(TransactionStmtKind::TransStmtBegin | TransactionStmtKind::TransStmtStart) => {
+            TxStmt::Begin
+        }
+        Ok(TransactionStmtKind::TransStmtCommit) => TxStmt::Commit,
+        Ok(TransactionStmtKind::TransStmtRollback) => TxStmt::FullRollback,
+        Ok(TransactionStmtKind::TransStmtRollbackTo) => TxStmt::SavepointRollback,
+        _ => TxStmt::Other,
+    }
+}
+
 /// pg_query's scanner is the same lexer the PostgreSQL server uses, so its
 /// keyword classification matches server-side quote_identifier().
 fn keyword_requires_quoting(ident: &str) -> bool {

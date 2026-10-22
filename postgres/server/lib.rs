@@ -10,6 +10,7 @@ use futures::{stream, Sink, SinkExt};
 use tokio::net::TcpListener;
 use tracing::{error, info};
 use turso_core::Value;
+use turso_pg::{classify_tx_stmt, TxStmt};
 use turso_pg::{split_statements, Connection, PgConnection};
 
 use pgwire::api::auth::StartupHandler;
@@ -23,11 +24,12 @@ use pgwire::api::stmt::{NoopQueryParser, StoredStatement};
 use pgwire::api::store::PortalStore;
 use pgwire::api::{
     ClientInfo, ClientPortalStore, NoopHandler, PgWireConnectionState, PgWireServerHandlers, Type,
+    DEFAULT_NAME,
 };
 use pgwire::error::{ErrorInfo, PgWireError, PgWireResult};
 use pgwire::messages::data::DataRow;
 use pgwire::messages::extendedquery::{Describe, Execute};
-use pgwire::messages::response::{ErrorResponse, ReadyForQuery};
+use pgwire::messages::response::{ErrorResponse, ReadyForQuery, TransactionStatus};
 use pgwire::messages::simplequery::Query;
 use pgwire::messages::PgWireBackendMessage;
 use pgwire::tokio::process_socket;
@@ -188,11 +190,33 @@ impl SimpleQueryHandler for TursoPgHandler {
         C::Error: Debug,
         PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
     {
+        // pgwire initializes its local transaction-status tracking from
+        // client.transaction_status() at the top of _on_query, so we must
+        // set the status BEFORE calling _on_query.  For ROLLBACK TO SAVEPOINT
+        // in the Error state, we pre-execute the savepoint rollback and then
+        // advance the status to Transaction so _on_query starts from the right
+        // state.  The statement will run again inside do_query, but that second
+        // execution is a no-op (no work has been done since the pre-execution).
+        if client.transaction_status() == TransactionStatus::Error {
+            let stmts = split_statements(&query.query).unwrap_or_default();
+            if let Some(first) = stmts.first() {
+                if matches!(classify_tx_stmt(first), TxStmt::SavepointRollback) {
+                    let conn = self.conn.lock().unwrap().clone();
+                    if conn
+                        .prepare(first)
+                        .and_then(|mut s| s.run_ignore_rows())
+                        .is_ok()
+                    {
+                        client.set_transaction_status(TransactionStatus::Transaction);
+                    }
+                }
+            }
+        }
         let result = self._on_query(client, query).await;
         finish_query(client, result, false).await
     }
 
-    async fn do_query<C>(&self, _client: &mut C, query: &str) -> PgWireResult<Vec<Response>>
+    async fn do_query<C>(&self, client: &mut C, query: &str) -> PgWireResult<Vec<Response>>
     where
         C: ClientInfo + Unpin + Send + Sync,
     {
@@ -201,22 +225,120 @@ impl SimpleQueryHandler for TursoPgHandler {
         // Per the PostgreSQL simple query protocol, a query string may contain
         // multiple semicolon-separated statements. Split and execute each one.
         let statements = split_statements(query).map_err(pg_error)?;
-
         let mut responses = Vec::new();
-        for sql in &statements {
-            let mut stmt = conn.prepare(sql).map_err(pg_error)?;
+        let mut start_idx = 0;
 
-            if stmt.num_columns() == 0 || is_pg_non_query(sql) {
-                let response = execute_non_query(&mut stmt, sql)?;
-                self.cleanup_dropped_schema_file(sql);
-                responses.push(response);
-            } else {
-                let header = Arc::new(build_field_info(&stmt, &Format::UnifiedText));
-                responses.push(execute_query(&mut stmt, header)?);
+        if client.transaction_status() == TransactionStatus::Error {
+            let first = statements.first().map(|s| s.as_str()).unwrap_or("");
+            match classify_tx_stmt(first) {
+                TxStmt::SavepointRollback => {
+                    let mut stmt = conn.prepare(first).map_err(pg_error)?;
+                    stmt.run_ignore_rows().map_err(pg_error)?;
+                    responses.push(Response::TransactionStart(Tag::new("ROLLBACK")));
+                    start_idx = 1;
+                }
+                TxStmt::FullRollback | TxStmt::Commit => {
+                    // Validate the statement through the translator first so unsupported
+                    // variants like AND CHAIN are rejected rather than silently replaced.
+                    if let Err(e) = conn.prepare(first) {
+                        return batch_error(responses, pg_error(e));
+                    }
+                    // Exit the aborted transaction. COMMIT/END become ROLLBACK (PostgreSQL behavior).
+                    // Ignore errors: the core may have already auto-rolled back the transaction.
+                    let _ = conn
+                        .prepare("ROLLBACK")
+                        .and_then(|mut s| s.run_ignore_rows());
+                    responses.push(Response::TransactionEnd(Tag::new("ROLLBACK")));
+                    start_idx = 1;
+                }
+                _ => {
+                    return Err(pg_error(turso_pg::Error::aborted_transaction()));
+                }
             }
         }
 
+        for sql in &statements[start_idx..] {
+            let mut stmt = match conn.prepare(sql) {
+                Ok(s) => s,
+                Err(e) => {
+                    return batch_error(responses, pg_error(e));
+                }
+            };
+
+            let resp = if stmt.num_columns() == 0 || is_pg_non_query(sql) {
+                match execute_non_query(&mut stmt, sql) {
+                    Ok(r) => {
+                        self.cleanup_dropped_schema_file(sql);
+                        r
+                    }
+                    Err(e) if matches!(classify_tx_stmt(sql), TxStmt::Commit) => {
+                        let err = rollback_after_failed_commit(client, &conn, e);
+                        return batch_error(responses, err);
+                    }
+                    Err(e) => return batch_error(responses, e),
+                }
+            } else {
+                let header = Arc::new(build_field_info(&stmt, &Format::UnifiedText));
+                match execute_query(&mut stmt, header) {
+                    Ok(r) => r,
+                    Err(e) => return batch_error(responses, e),
+                }
+            };
+
+            responses.push(resp);
+        }
+
         Ok(responses)
+    }
+}
+
+/// A statement in a simple-query batch failed. With no responses produced yet,
+/// return the error itself so finish_query reports the full error fields
+/// (table, column, constraint). With earlier responses (e.g. TransactionStart
+/// from a prior BEGIN), keep them and append the error inline so pgwire
+/// applies the transaction-status transition of each response in sequence;
+/// pgwire's ErrorInfo cannot carry the table/column/constraint fields.
+fn batch_error(mut responses: Vec<Response>, err: PgWireError) -> PgWireResult<Vec<Response>> {
+    if responses.is_empty() {
+        return Err(err);
+    }
+    responses.push(pg_error_to_response(err)?);
+    Ok(responses)
+}
+
+/// COMMIT itself failed (e.g. a deferred constraint fired at commit time).
+/// PostgreSQL then rolls the transaction back and returns to Idle instead of
+/// entering the aborted state.
+fn rollback_after_failed_commit<C>(
+    client: &mut C,
+    conn: &turso_pg::Connection,
+    err: PgWireError,
+) -> PgWireError
+where
+    C: ClientInfo,
+{
+    let _ = conn
+        .prepare("ROLLBACK")
+        .and_then(|mut s| s.run_ignore_rows());
+    client.set_transaction_status(TransactionStatus::Idle);
+    err
+}
+
+fn pg_error_to_response(err: PgWireError) -> PgWireResult<Response> {
+    let PgWireError::ApiError(e) = err else {
+        return Err(err);
+    };
+    match e.downcast::<turso_pg::Error>() {
+        Ok(pg_err) => {
+            let mut info = ErrorInfo::new(
+                "ERROR".to_owned(),
+                pg_err.sqlstate.to_owned(),
+                pg_err.message.clone(),
+            );
+            info.detail.clone_from(&pg_err.detail);
+            Ok(Response::Error(Box::new(info)))
+        }
+        Err(e) => Err(PgWireError::ApiError(e)),
     }
 }
 
@@ -232,6 +354,24 @@ impl ExtendedQueryHandler for TursoPgHandler {
         C::Error: Debug,
         PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
     {
+        // Same pre-execution trick as on_query: advance wire status to Transaction
+        // before _on_execute reads it so pgwire uses the right initial value.
+        if client.transaction_status() == TransactionStatus::Error {
+            let portal_name = message.name.as_deref().unwrap_or(DEFAULT_NAME);
+            if let Some(portal) = client.portal_store().get_portal(portal_name) {
+                let query = portal.statement.statement.as_str();
+                if matches!(classify_tx_stmt(query), TxStmt::SavepointRollback) {
+                    let conn = self.conn.lock().unwrap().clone();
+                    if conn
+                        .prepare(query)
+                        .and_then(|mut s| s.run_ignore_rows())
+                        .is_ok()
+                    {
+                        client.set_transaction_status(TransactionStatus::Transaction);
+                    }
+                }
+            }
+        }
         let result = self._on_execute(client, message).await;
         finish_query(client, result, true).await
     }
@@ -253,7 +393,7 @@ impl ExtendedQueryHandler for TursoPgHandler {
 
     async fn do_query<C>(
         &self,
-        _client: &mut C,
+        client: &mut C,
         portal: &Portal<Self::Statement>,
         _max_rows: usize,
     ) -> PgWireResult<Response>
@@ -263,16 +403,49 @@ impl ExtendedQueryHandler for TursoPgHandler {
         let conn = self.conn.lock().unwrap().clone();
         let query = &portal.statement.statement;
 
+        if client.transaction_status() == TransactionStatus::Error {
+            match classify_tx_stmt(query) {
+                TxStmt::SavepointRollback => {
+                    let mut stmt = conn.prepare(query).map_err(pg_error)?;
+                    stmt.run_ignore_rows().map_err(pg_error)?;
+                    return Ok(Response::TransactionStart(Tag::new("ROLLBACK")));
+                }
+                TxStmt::FullRollback | TxStmt::Commit => {
+                    // Validate the statement through the translator first so unsupported
+                    // variants like AND CHAIN are rejected rather than silently replaced.
+                    if let Err(e) = conn.prepare(query) {
+                        return Err(pg_error(e));
+                    }
+                    // Exit the aborted transaction. COMMIT/END become ROLLBACK (PostgreSQL behavior).
+                    // Ignore errors: the core may have already auto-rolled back the transaction.
+                    let _ = conn
+                        .prepare("ROLLBACK")
+                        .and_then(|mut s| s.run_ignore_rows());
+                    return Ok(Response::TransactionEnd(Tag::new("ROLLBACK")));
+                }
+                _ => {
+                    return Err(pg_error(turso_pg::Error::aborted_transaction()));
+                }
+            }
+        }
+
         let mut stmt = conn.prepare(query).map_err(pg_error)?;
 
         // Bind parameters from the portal
         bind_portal_parameters(&mut stmt, portal)?;
 
         if stmt.num_columns() == 0 || is_pg_non_query(query) {
-            let response = execute_non_query(&mut stmt, query)?;
-            // Clean up schema file after successful DROP SCHEMA execution
-            self.cleanup_dropped_schema_file(query);
-            return Ok(response);
+            return match execute_non_query(&mut stmt, query) {
+                Ok(response) => {
+                    // Clean up schema file after successful DROP SCHEMA execution
+                    self.cleanup_dropped_schema_file(query);
+                    Ok(response)
+                }
+                Err(e) if matches!(classify_tx_stmt(query), TxStmt::Commit) => {
+                    Err(rollback_after_failed_commit(client, &conn, e))
+                }
+                Err(e) => Err(e),
+            };
         }
 
         let header = Arc::new(build_field_info(&stmt, &portal.result_column_format));
@@ -287,14 +460,19 @@ impl ExtendedQueryHandler for TursoPgHandler {
     where
         C: ClientInfo + Unpin + Send + Sync,
     {
-        let conn = self.conn.lock().unwrap().clone();
-        let stmt = conn.prepare(&target.statement).map_err(pg_error)?;
-
         let param_types: Vec<Type> = target
             .parameter_types
             .iter()
             .map(|t| t.clone().unwrap_or(Type::TEXT))
             .collect();
+
+        let stmt_sql = &target.statement;
+        if !matches!(classify_tx_stmt(stmt_sql), TxStmt::Other) || is_pg_non_query(stmt_sql) {
+            return Ok(DescribeStatementResponse::new(param_types, vec![]));
+        }
+
+        let conn = self.conn.lock().unwrap().clone();
+        let stmt = conn.prepare_for_describe(stmt_sql).map_err(pg_error)?;
 
         let fields = build_field_info(&stmt, &Format::UnifiedText);
         Ok(DescribeStatementResponse::new(param_types, fields))
@@ -308,10 +486,13 @@ impl ExtendedQueryHandler for TursoPgHandler {
     where
         C: ClientInfo + Unpin + Send + Sync,
     {
+        let stmt_sql = &portal.statement.statement;
+        if !matches!(classify_tx_stmt(stmt_sql), TxStmt::Other) || is_pg_non_query(stmt_sql) {
+            return Ok(DescribePortalResponse::new(vec![]));
+        }
+
         let conn = self.conn.lock().unwrap().clone();
-        let stmt = conn
-            .prepare(&portal.statement.statement)
-            .map_err(pg_error)?;
+        let stmt = conn.prepare_for_describe(stmt_sql).map_err(pg_error)?;
 
         let fields = build_field_info(&stmt, &portal.result_column_format);
         Ok(DescribePortalResponse::new(fields))
@@ -444,13 +625,16 @@ fn execute_query(
     Ok(Response::Query(QueryResponse::new(header, data_stream)))
 }
 
-/// Execute a non-SELECT statement and build an Execution response.
 fn execute_non_query(stmt: &mut turso_pg::Statement, query: &str) -> PgWireResult<Response> {
     stmt.run_ignore_rows().map_err(pg_error)?;
 
     let affected = stmt.n_change();
     let tag = command_tag(query, affected as usize);
-    Ok(Response::Execution(tag))
+    match classify_tx_stmt(query) {
+        TxStmt::Begin => Ok(Response::TransactionStart(tag)),
+        TxStmt::Commit | TxStmt::FullRollback => Ok(Response::TransactionEnd(tag)),
+        _ => Ok(Response::Execution(tag)),
+    }
 }
 
 /// Extract parameters from a Portal and bind them to a prepared statement.
@@ -671,6 +855,12 @@ fn sqlite_type_to_pg_type(type_str: &str) -> Type {
 /// PG statements handled by `try_prepare_pg()` that return a dummy SELECT
 /// but should produce a command-tag response, not a result set.
 fn is_pg_non_query(sql: &str) -> bool {
+    // Transaction-control statements can prepare as no-op SELECTs (e.g. COMMIT
+    // outside a transaction block), so route them by classification rather
+    // than by the prepared statement's column count.
+    if !matches!(classify_tx_stmt(sql), TxStmt::Other) {
+        return true;
+    }
     let upper = sql.trim().to_uppercase();
     upper.starts_with("COPY")
         || upper.starts_with("SET")
@@ -718,9 +908,9 @@ fn command_tag(query: &str, affected_rows: usize) -> Tag {
         Tag::new("ALTER TABLE")
     } else if upper.starts_with("BEGIN") || upper.starts_with("START") {
         Tag::new("BEGIN")
-    } else if upper.starts_with("COMMIT") {
+    } else if upper.starts_with("COMMIT") || upper.starts_with("END") {
         Tag::new("COMMIT")
-    } else if upper.starts_with("ROLLBACK") {
+    } else if upper.starts_with("ROLLBACK") || upper.starts_with("ABORT") {
         Tag::new("ROLLBACK")
     } else if upper.starts_with("SAVEPOINT") {
         Tag::new("SAVEPOINT")
@@ -1135,5 +1325,201 @@ mod tests {
 
         assert!(!ends_with_with_no_data("CREATE TABLE T AS SELECT 1"));
         assert!(!ends_with_with_no_data("SELECT 'WITH NO DATA'"));
+    }
+
+    #[test]
+    fn command_tag_maps_transaction_keyword_aliases() {
+        assert_eq!(command_tag("END", 0), Tag::new("COMMIT"));
+        assert_eq!(command_tag("ABORT", 0), Tag::new("ROLLBACK"));
+        assert_eq!(command_tag("COMMIT", 0), Tag::new("COMMIT"));
+        assert_eq!(command_tag("ROLLBACK", 0), Tag::new("ROLLBACK"));
+    }
+
+    #[test]
+    fn test_begin_returns_transaction_start_response() {
+        let (_io, db) = turso_pg::open_database(
+            ":memory:",
+            None,
+            turso_pg::OpenFlags::default(),
+            turso_pg::DatabaseOpts::new(),
+        )
+        .unwrap();
+        let conn = Connection::connect(&db).unwrap();
+        for sql in ["BEGIN", "BEGIN READ ONLY", "START TRANSACTION"] {
+            let mut stmt = conn.prepare(sql).unwrap();
+            let resp = execute_non_query(&mut stmt, sql).unwrap();
+            assert!(
+                matches!(resp, Response::TransactionStart(_)),
+                "{sql} should produce TransactionStart"
+            );
+            conn.execute("ROLLBACK").unwrap();
+        }
+    }
+
+    #[test]
+    fn test_commit_rollback_return_transaction_end_response() {
+        let (_io, db) = turso_pg::open_database(
+            ":memory:",
+            None,
+            turso_pg::OpenFlags::default(),
+            turso_pg::DatabaseOpts::new(),
+        )
+        .unwrap();
+        let conn = Connection::connect(&db).unwrap();
+        for sql in ["COMMIT", "ROLLBACK"] {
+            conn.execute("BEGIN").unwrap();
+            let mut stmt = conn.prepare(sql).unwrap();
+            let resp = execute_non_query(&mut stmt, sql).unwrap();
+            assert!(
+                matches!(resp, Response::TransactionEnd(_)),
+                "{sql} should produce TransactionEnd"
+            );
+        }
+        // ROLLBACK TO SAVEPOINT stays in the transaction — must not produce TransactionEnd.
+        conn.execute("BEGIN").unwrap();
+        conn.execute("SAVEPOINT sp").unwrap();
+        let mut stmt = conn.prepare("ROLLBACK TO sp").unwrap();
+        let resp = execute_non_query(&mut stmt, "ROLLBACK TO sp").unwrap();
+        assert!(
+            matches!(resp, Response::Execution(_)),
+            "ROLLBACK TO sp should produce Execution, not TransactionEnd"
+        );
+        conn.execute("ROLLBACK").unwrap();
+    }
+
+    #[test]
+    fn classify_tx_stmt_correctly_identifies_transaction_statements() {
+        assert!(matches!(classify_tx_stmt("ROLLBACK"), TxStmt::FullRollback));
+        assert!(matches!(
+            classify_tx_stmt("  rollback  "),
+            TxStmt::FullRollback
+        ));
+        assert!(matches!(
+            classify_tx_stmt("ROLLBACK WORK"),
+            TxStmt::FullRollback
+        ));
+        assert!(matches!(classify_tx_stmt("ABORT"), TxStmt::FullRollback));
+        assert!(matches!(classify_tx_stmt("COMMIT"), TxStmt::Commit));
+        assert!(matches!(classify_tx_stmt("END"), TxStmt::Commit));
+        assert!(matches!(
+            classify_tx_stmt("ROLLBACK /*comment*/ TO SAVEPOINT sp"),
+            TxStmt::SavepointRollback
+        ));
+        assert!(matches!(
+            classify_tx_stmt("ROLLBACK TO sp"),
+            TxStmt::SavepointRollback
+        ));
+        assert!(matches!(
+            classify_tx_stmt("ROLLBACK WORK TO SAVEPOINT sp"),
+            TxStmt::SavepointRollback
+        ));
+        assert!(matches!(classify_tx_stmt("BEGIN"), TxStmt::Begin));
+        assert!(matches!(
+            classify_tx_stmt("START TRANSACTION"),
+            TxStmt::Begin
+        ));
+        assert!(matches!(classify_tx_stmt("SELECT 1"), TxStmt::Other));
+    }
+
+    /// No statement the PostgreSQL frontend accepts today can make COMMIT
+    /// itself fail (deferred constraints are rejected at CREATE TABLE), so the
+    /// commit failure is synthesized and the test checks what the server must
+    /// do with it: roll the transaction back and report the wire connection as
+    /// Idle, like PostgreSQL, instead of leaving an open transaction in the
+    /// Error state.
+    #[test]
+    fn failed_commit_rolls_back_and_reports_idle() {
+        let (_io, db) = turso_pg::open_database(
+            ":memory:",
+            None,
+            turso_pg::OpenFlags::default(),
+            turso_pg::DatabaseOpts::new(),
+        )
+        .unwrap();
+        let conn = Connection::connect(&db).unwrap();
+        conn.execute("CREATE TABLE t (a int)").unwrap();
+        conn.execute("BEGIN").unwrap();
+        conn.execute("INSERT INTO t VALUES (1)").unwrap();
+        assert!(!conn.inner().get_auto_commit());
+
+        let commit_err = pg_error(turso_pg::Error::from(turso_pg::LimboError::InternalError(
+            "commit failed".to_string(),
+        )));
+        let mut client =
+            pgwire::api::DefaultClient::<String>::new("127.0.0.1:1".parse().unwrap(), false);
+        client.set_transaction_status(TransactionStatus::Transaction);
+        let err = rollback_after_failed_commit(&mut client, &conn, commit_err);
+        assert!(matches!(err, PgWireError::ApiError(_)));
+        assert_eq!(client.transaction_status(), TransactionStatus::Idle);
+        assert!(
+            conn.inner().get_auto_commit(),
+            "a failed COMMIT must end with the transaction rolled back"
+        );
+        let mut count = conn.prepare("SELECT count(*) FROM t").unwrap();
+        let rows = count.run_collect_rows().unwrap();
+        assert_eq!(rows, vec![vec![Value::from_i64(0)]]);
+    }
+
+    #[test]
+    fn prepare_for_describe_does_not_clear_read_only() {
+        let (_io, db) = turso_pg::open_database(
+            ":memory:",
+            None,
+            turso_pg::OpenFlags::default(),
+            turso_pg::DatabaseOpts::new(),
+        )
+        .unwrap();
+        let conn = Connection::connect(&db).unwrap();
+        conn.execute("BEGIN READ ONLY").unwrap();
+        assert!(
+            conn.inner().is_tx_read_only(),
+            "BEGIN READ ONLY must mark the transaction read-only"
+        );
+        let _stmt = conn.prepare_for_describe("COMMIT").unwrap();
+        assert!(
+            conn.inner().is_tx_read_only(),
+            "prepare_for_describe(COMMIT) must not clear the read-only transaction mode"
+        );
+        conn.execute("ROLLBACK").unwrap();
+    }
+
+    #[test]
+    fn prepare_begin_read_only_does_not_set_read_only_before_execute() {
+        let (_io, db) = turso_pg::open_database(
+            ":memory:",
+            None,
+            turso_pg::OpenFlags::default(),
+            turso_pg::DatabaseOpts::new(),
+        )
+        .unwrap();
+        let conn = Connection::connect(&db).unwrap();
+        let _stmt = conn.prepare("BEGIN READ ONLY").unwrap();
+        assert!(
+            !conn.inner().is_tx_read_only(),
+            "prepare(BEGIN READ ONLY) must not set read-only mode before execute"
+        );
+    }
+
+    #[test]
+    fn prepare_commit_does_not_clear_read_only_before_execute() {
+        let (_io, db) = turso_pg::open_database(
+            ":memory:",
+            None,
+            turso_pg::OpenFlags::default(),
+            turso_pg::DatabaseOpts::new(),
+        )
+        .unwrap();
+        let conn = Connection::connect(&db).unwrap();
+        conn.execute("BEGIN READ ONLY").unwrap();
+        assert!(
+            conn.inner().is_tx_read_only(),
+            "BEGIN READ ONLY must mark the transaction read-only"
+        );
+        let _stmt = conn.prepare("COMMIT").unwrap();
+        assert!(
+            conn.inner().is_tx_read_only(),
+            "prepare(COMMIT) must not clear read-only mode before execute"
+        );
+        conn.execute("ROLLBACK").unwrap();
     }
 }

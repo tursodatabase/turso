@@ -9519,11 +9519,10 @@ fn test_commit_without_tx() {
 
     // expect error on trying to commit a non-existent interactive transaction
     let err = conn.execute("COMMIT").unwrap_err();
-    if let LimboError::TxError(e) = err {
-        assert_eq!(e, "cannot commit - no transaction is active");
-    } else {
-        panic!("Expected TxError");
-    }
+    assert!(
+        matches!(err, LimboError::NoActiveTransaction { .. }),
+        "expected NoActiveTransaction, got: {err:?}"
+    );
 }
 
 fn get_rows(conn: &Arc<Connection>, query: &str) -> Vec<Vec<Value>> {
@@ -21484,10 +21483,10 @@ fn abandoned_exclusive_commit_should_not_block_subsequent_concurrent_writer() {
         other => panic!("tx should yield, got: {other:?}"),
     }
 
-    assert!(
-        matches!(conn_a.prepare("COMMIT").unwrap().step().err().unwrap(),
-            LimboError::TxError(msg) if msg == "cannot commit - no transaction is active")
-    );
+    assert!(matches!(
+        conn_a.prepare("COMMIT").unwrap().step().err().unwrap(),
+        LimboError::NoActiveTransaction { .. }
+    ));
 
     conn_b.execute("BEGIN CONCURRENT").unwrap();
     conn_b.execute("INSERT INTO t VALUES (2, 'b')").unwrap();
@@ -22165,9 +22164,8 @@ fn test_sequence_write_conflict_rolls_back_outer_tx_and_rejects_commit() {
     );
 
     let commit = nextval_conn.execute("COMMIT");
-    let expected = "cannot commit - no transaction is active";
     assert!(
-        matches!(commit, Err(LimboError::TxError(ref msg)) if msg == expected),
+        matches!(commit, Err(LimboError::NoActiveTransaction { .. })),
         "COMMIT after conflict rollback must report no active transaction, got {commit:?}"
     );
 
