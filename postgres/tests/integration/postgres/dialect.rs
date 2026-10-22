@@ -166,6 +166,8 @@ fn test_postgres_rejects_unsupported_set_and_show(db: TempDatabase) {
         "SET client_min_messages = warning",
         "SET default_tablespace = ''",
         "SET default_table_access_method = heap",
+        "SET transaction_timeout = 0",
+        "SET xmloption = content",
     ] {
         conn.execute(sql).unwrap_or_else(|e| panic!("{sql}: {e}"));
     }

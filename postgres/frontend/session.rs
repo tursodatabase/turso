@@ -484,6 +484,8 @@ fn set_value_already_in_effect(name: &str, values: &[PgSetValue]) -> bool {
         "check_function_bodies" | "synchronize_seqscans" => is_on || is_off,
         "default_tablespace" => value.is_empty(),
         "default_table_access_method" => value == "heap",
+        "transaction_timeout" => value == "0",
+        "xmloption" => value == "content",
         // These only label the session or filter notices.
         "application_name" => true,
         "client_min_messages" => matches!(
