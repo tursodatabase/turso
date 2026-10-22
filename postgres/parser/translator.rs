@@ -283,6 +283,11 @@ impl PostgreSQLTranslator {
         if create.of_typename.is_some() {
             return Err(not_supported("CREATE TABLE ... OF type"));
         }
+        reject_table_storage_clauses(
+            &create.options,
+            &create.tablespacename,
+            &create.access_method,
+        )?;
 
         if create.table_elts.is_empty() {
             return Err(ParseError::ParseError(
@@ -6258,6 +6263,26 @@ fn reject_temporary(relation: &pg_query::protobuf::RangeVar, what: &str) -> Resu
     Ok(())
 }
 
+/// Rejects the physical-storage clauses of CREATE TABLE and its relatives.
+fn reject_table_storage_clauses(
+    options: &[pg_query::protobuf::Node],
+    tablespace: &str,
+    access_method: &str,
+) -> Result<(), ParseError> {
+    if !options.is_empty() {
+        return Err(not_supported("WITH (storage parameters)"));
+    }
+    if !tablespace.is_empty() {
+        return Err(not_supported("TABLESPACE"));
+    }
+    if !access_method.is_empty() && !access_method.eq_ignore_ascii_case("heap") {
+        return Err(not_supported(format!(
+            "table access method {access_method}"
+        )));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -9098,5 +9123,16 @@ mod tests {
             "partitioning",
         );
         assert_not_supported("CREATE TABLE t OF mytype", "OF type");
+    }
+
+    #[test]
+    fn fail_closed_create_table_storage_clauses() {
+        assert_not_supported(
+            "CREATE TABLE t (a int) WITH (fillfactor = 70)",
+            "storage parameters",
+        );
+        assert_not_supported("CREATE TABLE t (a int) TABLESPACE ts", "TABLESPACE");
+        assert_not_supported("CREATE TABLE t (a int) USING columnar", "access method");
+        assert_translates("CREATE TABLE t (a int) USING heap");
     }
 }
