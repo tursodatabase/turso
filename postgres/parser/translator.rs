@@ -2543,7 +2543,7 @@ impl PostgreSQLTranslator {
                         .as_str(),
                     "json" | "jsonb"
                 );
-                let cast_type = pg_type_name_to_ast_type(type_name);
+                let cast_type = Some(pg_type_name_to_ast_type(type_name)?);
                 let path = Box::new(ast::Expr::Literal(ast::Literal::String(format!(
                     "'$.\"{}\"'",
                     col_def
@@ -2923,9 +2923,7 @@ impl PostgreSQLTranslator {
                 if !pg_type_name.typmods.is_empty() {
                     return Err(not_supported("a type modifier in a cast"));
                 }
-                let type_name = pg_type_name_to_ast_type(pg_type_name).ok_or_else(|| {
-                    ParseError::ParseError("TypeCast has an empty type name".into())
-                })?;
+                let type_name = pg_type_name_to_ast_type(pg_type_name)?;
                 Ok(ast::Expr::Cast {
                     expr,
                     type_name: Some(type_name),
@@ -5642,21 +5640,10 @@ fn json_type_or_raise(
 /// Convert a pg_query TypeName to a Turso AST Type for use in CAST expressions.
 /// Maps PG types to their base SQLite storage types. Other names are kept as
 /// written so that enums and domains resolve to their custom type.
-fn pg_type_name_to_ast_type(type_name: &pg_query::protobuf::TypeName) -> Option<ast::Type> {
-    use pg_query::protobuf::node::Node;
-
-    let mut parts = Vec::new();
-    for name_node in &type_name.names {
-        if let Some(Node::String(s)) = &name_node.node {
-            if s.sval != "pg_catalog" {
-                parts.push(s.sval.clone());
-            }
-        }
-    }
-    if parts.is_empty() {
-        return None;
-    }
-    let pg_type = parts.join(" ");
+fn pg_type_name_to_ast_type(
+    type_name: &pg_query::protobuf::TypeName,
+) -> Result<ast::Type, ParseError> {
+    let pg_type = object_name(&type_name.names, is_default_schema, "type")?;
 
     let name = match pg_type.to_uppercase().as_str() {
         "INTEGER" | "INT" | "INT4" | "SMALLINT" | "INT2" | "BIGINT" | "INT8" | "SERIAL"
@@ -5679,7 +5666,7 @@ fn pg_type_name_to_ast_type(type_name: &pg_query::protobuf::TypeName) -> Option<
         _ => &pg_type,
     };
 
-    Some(ast::Type {
+    Ok(ast::Type {
         name: name.to_string(),
         size: None,
         array_dimensions: type_name.array_bounds.len() as u32,
@@ -5689,20 +5676,7 @@ fn pg_type_name_to_ast_type(type_name: &pg_query::protobuf::TypeName) -> Option<
 fn extract_type_name_from_typename(
     type_name: &pg_query::protobuf::TypeName,
 ) -> Result<String, ParseError> {
-    use pg_query::protobuf::node::Node;
-
-    let mut parts = Vec::new();
-    for name_node in &type_name.names {
-        if let Some(Node::String(s)) = &name_node.node {
-            if s.sval != "pg_catalog" {
-                parts.push(s.sval.clone());
-            }
-        }
-    }
-    if parts.is_empty() {
-        return Err(ParseError::ParseError("empty type name".into()));
-    }
-    let mut name = parts.join(" ");
+    let mut name = object_name(&type_name.names, is_default_schema, "type")?;
     if !type_name.array_bounds.is_empty() {
         for _ in &type_name.array_bounds {
             name.push_str("[]");
@@ -5731,37 +5705,11 @@ fn extract_def_elem_bool(elem: &pg_query::protobuf::DefElem) -> bool {
 }
 
 fn extract_type_name(col_def: &pg_query::protobuf::ColumnDef) -> Result<String, ParseError> {
-    use pg_query::protobuf::node::Node;
-
     let type_name = col_def
         .type_name
         .as_ref()
         .ok_or_else(|| ParseError::ParseError("column missing type".into()))?;
-
-    // TypeName.names is a list of String nodes (e.g., ["pg_catalog", "int4"])
-    // Skip "pg_catalog" prefix if present
-    let mut parts = Vec::new();
-    for name_node in &type_name.names {
-        if let Some(Node::String(s)) = &name_node.node {
-            if s.sval != "pg_catalog" {
-                parts.push(s.sval.clone());
-            }
-        }
-    }
-    if parts.is_empty() {
-        return Err(ParseError::ParseError("column has empty type name".into()));
-    }
-    let mut name = parts.join(" ");
-
-    // PG represents array types like `integer[]` with array_bounds on the TypeName,
-    // not by appending `[]` to the type name. Detect and append it.
-    if !type_name.array_bounds.is_empty() {
-        for _ in &type_name.array_bounds {
-            name.push_str("[]");
-        }
-    }
-
-    Ok(name)
+    extract_type_name_from_typename(type_name)
 }
 
 /// Extract integer type modifiers from a column definition.
@@ -10332,6 +10280,16 @@ mod tests {
         assert_translates("INSERT INTO t (a, b) VALUES (DEFAULT, 5)");
         assert_translates("INSERT INTO t (a, b) VALUES (DEFAULT, 1), (5, 2)");
         assert_translates("INSERT INTO t (a) VALUES (DEFAULT)");
+    }
+
+    #[test]
+    fn fail_closed_schema_qualified_type_names() {
+        assert_not_supported("SELECT '5'::foo.int4", "schema-qualified type name");
+        assert_not_supported("SELECT CAST('5' AS foo.int4)", "schema-qualified type name");
+        assert_not_supported("CREATE TABLE w (a foo.int4)", "schema-qualified type name");
+        assert_translates("SELECT 'b'::public.mood");
+        assert_translates("SELECT '5'::pg_catalog.int4");
+        assert_translates("CREATE TABLE w (a public.mood)");
     }
 
     #[test]

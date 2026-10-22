@@ -943,3 +943,17 @@ expect {
     1
     2
 }
+
+test cast-to-public-qualified-type {
+    CREATE TYPE qmood AS ENUM ('a', 'b');
+    SELECT 'b'::public.qmood, '5'::pg_catalog.int4 + 1;
+}
+expect {
+    b|6
+}
+
+test cast-to-type-in-unknown-schema-errors {
+    SELECT '5'::nosuchschema.int4;
+}
+expect error {
+}
