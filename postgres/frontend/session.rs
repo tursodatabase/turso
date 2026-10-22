@@ -548,7 +548,11 @@ fn handle_pg_create_schema(
     let path = schema_file_path(conn, &name);
     execute_sqlite(
         conn,
-        format!("ATTACH '{}' AS \"{}\"", path.replace('\'', "''"), name),
+        format!(
+            "ATTACH '{}' AS \"{}\"",
+            path.replace('\'', "''"),
+            name.replace('"', "\"\"")
+        ),
     )?;
     if stmt.elements.is_empty() {
         return Ok(());
@@ -622,7 +626,7 @@ fn handle_pg_drop_schema(conn: &Arc<Connection>, stmt: &PgDropSchemaStmt) -> Res
     if name == "public" {
         return Ok(());
     }
-    execute_sqlite(conn, format!("DETACH \"{name}\""))
+    execute_sqlite(conn, format!("DETACH \"{}\"", name.replace('"', "\"\"")))
 }
 
 /// Runs `f` with foreign keys not enforced. DROP SCHEMA ... CASCADE drops
@@ -651,7 +655,8 @@ impl SchemaObject {
             SchemaObject::Sequence(_) => "SEQUENCE",
         };
         format!(
-            "DROP {kind} \"{database}\".\"{}\"",
+            "DROP {kind} \"{}\".\"{}\"",
+            database.replace('"', "\"\""),
             self.name().replace('"', "\"\"")
         )
     }
@@ -674,8 +679,9 @@ const SEQUENCE_TABLE_PREFIX: &str = "__turso_internal_seq_";
 /// Indexes and triggers go with their tables.
 fn schema_objects(conn: &Arc<Connection>, database: &str) -> Result<Vec<SchemaObject>> {
     let mut stmt = conn.prepare_sqlite(format!(
-        "SELECT type, name FROM \"{database}\".sqlite_schema \
-         WHERE type IN ('view', 'table') ORDER BY name"
+        "SELECT type, name FROM \"{}\".sqlite_schema \
+         WHERE type IN ('view', 'table') ORDER BY name",
+        database.replace('"', "\"\"")
     ))?;
     let mut views = Vec::new();
     let mut tables = Vec::new();

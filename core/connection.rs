@@ -3583,7 +3583,7 @@ impl Connection {
             })
             .map(|sequence| (db_id, sequence))
         };
-        if let Some((schema, seq)) = name.split_once('.') {
+        if let Some((schema, seq)) = name.rsplit_once('.') {
             let db_id = self.get_database_id_by_name(schema)?;
             let seq_name = crate::util::normalize_ident(seq);
             return get(db_id, &seq_name).ok_or_else(|| not_found(&seq_name));

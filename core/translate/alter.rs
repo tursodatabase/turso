@@ -75,7 +75,7 @@ fn schema_table_name_for_db(resolver: &Resolver, database_id: usize) -> String {
         let db_name = resolver
             .namespace_name(database_id)
             .unwrap_or_else(|| "main".to_string());
-        format!("{db_name}.{SQLITE_TABLEID}")
+        format!("\"{}\".{SQLITE_TABLEID}", db_name.replace('"', "\"\""))
     }
 }
 

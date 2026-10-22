@@ -84,3 +84,21 @@ test create-schema-rejects-elements-in-another-schema {
 expect error {
     different from the one being created
 }
+
+test create-schema-with-dots-or-quotes {
+    CREATE SCHEMA "q'r";
+    CREATE TABLE "q'r".t (id serial, x int);
+    INSERT INTO "q'r".t (x) VALUES (1);
+    SELECT id, x FROM "q'r".t;
+    DROP SCHEMA "q'r" CASCADE;
+    CREATE SCHEMA "q.r";
+    CREATE TABLE "q.r".t (id serial, x int);
+    INSERT INTO "q.r".t (x) VALUES (2);
+    SELECT id, x FROM "q.r".t;
+    DROP SCHEMA "q.r" CASCADE;
+}
+expect {
+    1|1
+    1|2
+}
+
