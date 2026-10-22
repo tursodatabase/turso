@@ -2609,6 +2609,15 @@ impl PostgreSQLTranslator {
         join_expr: &pg_query::protobuf::JoinExpr,
         joins: &mut Vec<ast::JoinedSelectTable>,
     ) -> Result<ast::SelectTable, ParseError> {
+        // Joins are flattened into one list, so there is no node left to
+        // carry an alias for the join's combined columns.
+        if join_expr.alias.is_some() {
+            return Err(not_supported("an alias on a parenthesized JOIN"));
+        }
+        if join_expr.join_using_alias.is_some() {
+            return Err(not_supported("JOIN ... USING (...) AS alias"));
+        }
+
         // Recursively process the left side
         let primary_table = if let Some(larg) = &join_expr.larg {
             match &larg.node {
@@ -9487,5 +9496,22 @@ mod tests {
             "WITH TIES",
         );
         assert_translates("SELECT * FROM t ORDER BY a FETCH FIRST 3 ROWS ONLY");
+    }
+
+    #[test]
+    fn fail_closed_join_aliases() {
+        assert_not_supported(
+            "SELECT j.a FROM (a JOIN b ON a.id = b.id) AS j",
+            "alias on a parenthesized JOIN",
+        );
+        assert_not_supported(
+            "SELECT * FROM x JOIN (a JOIN b USING (id)) AS j ON x.id = j.id",
+            "alias on a parenthesized JOIN",
+        );
+        assert_not_supported(
+            "SELECT u.id FROM a JOIN b USING (id) AS u",
+            "USING (...) AS alias",
+        );
+        assert_translates("SELECT * FROM a JOIN b USING (id)");
     }
 }
