@@ -60,3 +60,18 @@ test drop-schema-public-cascade-drops-its-objects {
 expect {
     0
 }
+
+test create-index-on-schema-qualified-table-indexes-that-table {
+    CREATE SCHEMA IF NOT EXISTS idx_s;
+    DROP TABLE IF EXISTS idx_s.t;
+    DROP TABLE IF EXISTS t;
+    CREATE TABLE t (x int);
+    CREATE TABLE idx_s.t (x int);
+    CREATE UNIQUE INDEX idx_s_t_x ON idx_s.t (x);
+    INSERT INTO t VALUES (1);
+    INSERT INTO t VALUES (1);
+    SELECT count(*) FROM t;
+}
+expect {
+    2
+}

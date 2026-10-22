@@ -910,7 +910,16 @@ impl PostgreSQLTranslator {
             .ok_or_else(|| ParseError::ParseError("CREATE INDEX missing table name".into()))?;
         let tbl_name = ast::Name::from_string(self.map_table_name(&relation.relname));
 
-        let idx_name = ast::QualifiedName::single(ast::Name::from_string(&idx.idxname));
+        // SQLite places the index in the schema named on the index, and looks
+        // the table up in that same schema, so carry the table's schema over.
+        let idx_name = if relation.schemaname.is_empty() {
+            ast::QualifiedName::single(ast::Name::from_string(&idx.idxname))
+        } else {
+            ast::QualifiedName::fullname(
+                ast::Name::from_string(map_schema_name(&relation.schemaname)),
+                ast::Name::from_string(&idx.idxname),
+            )
+        };
 
         self.translating_index.set(true);
         let index_parts = self.translate_index_parts(idx);
@@ -5684,6 +5693,17 @@ fn drop_object_type_name(obj_type: pg_query::protobuf::ObjectType) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn create_index_keeps_table_schema() {
+        let parsed = crate::parse("CREATE INDEX i ON s.t (a)").unwrap();
+        let stmt = PostgreSQLTranslator::new().translate(&parsed).unwrap();
+        let ast::Stmt::CreateIndex { idx_name, .. } = stmt else {
+            panic!("expected CREATE INDEX, got {stmt:?}");
+        };
+        assert_eq!(idx_name.namespace.as_ref().map(|n| n.as_str()), Some("s"));
+        assert_eq!(idx_name.name.as_str(), "i");
+    }
 
     #[test]
     fn test_type_mapping() {
