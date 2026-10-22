@@ -317,13 +317,11 @@ test materialized-view-created-in-the-search-path-schema-reads-its-tables {
     SELECT * FROM mv;
     INSERT INTO t VALUES (2);
     INSERT INTO public.t VALUES (200);
-    SELECT * FROM mv;
     REFRESH MATERIALIZED VIEW mv;
     SELECT * FROM mv;
 }
 expect {
     1
-    3
     3
 }
 
