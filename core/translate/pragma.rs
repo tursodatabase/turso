@@ -129,13 +129,21 @@ fn resolve_index_pragma_database_id(
     };
     let has_index =
         |schema: &Schema, name: &str| !matches!(find_index_by_name(schema, name), Ok(None));
-    let database_id = catalog.resolve_existing_index_database_id(&qualified_name)?;
-    if catalog.with_schema(database_id, |schema| has_index(schema, index_name)) {
-        return Ok(database_id);
+    if let Ok(database_id) = catalog.resolve_existing_index_database_id(&qualified_name) {
+        if catalog.with_schema(database_id, |schema| has_index(schema, index_name)) {
+            return Ok(database_id);
+        }
     }
-    // The name may be a WITHOUT ROWID table, whose primary key the index
-    // pragmas report as an index.
-    catalog.resolve_existing_table_database_id(index_name)
+    // The name may be a WITHOUT ROWID table, or the automatic index name of
+    // one, whose primary key the index pragmas report as an index.
+    let table_name = index_name
+        .strip_prefix(PRIMARY_KEY_AUTOMATIC_INDEX_NAME_PREFIX)
+        .and_then(|rest| rest.strip_suffix("_1"))
+        .unwrap_or(index_name);
+    catalog
+        .resolve_existing_table_database_id(table_name)
+        .or_else(|_| catalog.resolve_existing_table_database_id(index_name))
+        .or(Ok(default_database_id))
 }
 
 fn foreign_key_action_name(action: ast::RefAct) -> &'static str {

@@ -11,7 +11,7 @@ use std::num::NonZeroUsize;
 
 use turso_parser::ast::{ResolveType, TriggerTime};
 
-use super::emit::{any_effective_replace, constraint_may_abort, halt_desc_and_on_error};
+use super::emit::{any_effective_replace, constraint_may_abort};
 use crate::{
     error::{SQLITE_CONSTRAINT_NOTNULL, SQLITE_CONSTRAINT_PRIMARYKEY, SQLITE_CONSTRAINT_UNIQUE},
     schema::{Column, EXPR_INDEX_SENTINEL},
@@ -1423,6 +1423,13 @@ impl UpdateRow<'_, '_> {
             .map(|_| program.alloc_registers(2 * columns));
         // A BEFORE trigger runs before NOT NULL is checked.
         self.emit_new_values(program, layout, !has_before, updates)?;
+        // STRICT: the values the UPDATE sets are checked, and converted
+        // where SQLite allows, before the generated columns read them and
+        // before any conflict is resolved. Custom-typed values are checked
+        // when they are encoded.
+        if table.is_strict && !super::dml::has_custom_types(source) {
+            super::dml::emit_strict_type_check(program, table, self.start());
+        }
         self.emit_virtual_columns(program, layout, !has_before)?;
         if let (Some(updates), Some((position, ddl))) = (updates, layout.schema_change) {
             program.emit_insn(Insn::String8 {
@@ -1539,9 +1546,8 @@ impl UpdateRow<'_, '_> {
                 self.start(),
                 Some(&set),
             )?;
-        } else if table.is_strict {
-            super::dml::emit_strict_type_check(program, table, self.start());
         }
+        super::dml::emit_strict_generated_check(program, table, self.start());
         super::dml::emit_check_constraints(
             program,
             document,
@@ -2085,15 +2091,10 @@ impl UpdateRow<'_, '_> {
                     .find(|column| column.is_rowid_alias())
                     .and_then(|column| column.name.as_deref())
                     .unwrap_or("rowid");
-                let (description, on_error) = halt_desc_and_on_error(
-                    &format!("{}.{column}", table.name),
-                    conflict,
-                    self.has_statement_conflict,
-                );
                 program.emit_insn(Insn::Halt {
                     err_code: SQLITE_CONSTRAINT_PRIMARYKEY,
-                    description,
-                    on_error,
+                    description: format!("{}.{column}", table.name),
+                    on_error: program.constraint_halt_on_error(conflict),
                     description_reg: None,
                 });
             }
@@ -2226,12 +2227,10 @@ impl UpdateRow<'_, '_> {
                     .map(|column| format!("{table_name}.{}", column.name))
                     .collect::<Vec<_>>()
                     .join(", ");
-                let (description, on_error) =
-                    halt_desc_and_on_error(&columns, conflict, self.has_statement_conflict);
                 program.emit_insn(Insn::Halt {
                     err_code: SQLITE_CONSTRAINT_UNIQUE,
-                    description,
-                    on_error,
+                    description: columns,
+                    on_error: program.constraint_halt_on_error(conflict),
                     description_reg: None,
                 });
             }

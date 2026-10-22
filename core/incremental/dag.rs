@@ -5,43 +5,55 @@
 //! operation). Each node consumes the delta stream(s) of its input node(s) and
 //! produces its own delta stream; the root node's stream is the view's change.
 //! This is the DBSP circuit model described in
-//! `docs/ivm-vdbe-rewrite-writeup.md`, and it is the replacement boundary for
-//! the deleted per-shape classifier.
+//! `docs/ivm-vdbe-rewrite-writeup.md`.
 //!
 //! This module owns only the *structure*. Delta-stream wiring, validation,
 //! hidden-state derivation, and bytecode emission live in
 //! `vdbe_maintenance`, all consuming this representation.
 //!
-//! Expressions are `ast::Expr` throughout, bound through the shared translator
-//! — deliberately *not* a parallel expression layer. The old engine's
-//! `LogicalExpr` and interpreted operators (deleted at `5e17d8ea0`) are not
-//! resurrected; only its DAG composition model is.
+//! Expressions are the analyzed `hir::Expr` of the view's query throughout,
+//! lowered by the shared expression lowering over register-bound stream
+//! values: deliberately *not* a parallel expression layer.
 
 use std::sync::Arc;
 
 use turso_parser::ast;
 
+use crate::function::AggFunc;
 use crate::schema::BTreeTable;
 use crate::translate::collate::CollationSeq;
-use crate::translate::plan::Aggregate;
+use crate::translate::semantic::hir::{self, SourceId};
 use crate::{error::LimboError, Result};
-use turso_parser::ast::TableInternalId;
 
 /// Index into [`MaintenanceDag::nodes`]. A node's inputs always have smaller
 /// indices, so iterating `0..nodes.len()` visits the DAG in topological order.
 pub type NodeId = usize;
 
-/// Base-table namespace needed to bind expressions carried across an
-/// ephemeral operator edge. The physical stream may have one cursor, but its
-/// values retain the logical names from all contributing inputs.
-#[derive(Debug, Clone)]
+/// One source of the view's query whose rows a stream carries. The physical
+/// stream may have one cursor, but its values keep the sources of all
+/// contributing inputs, so a rowid read names the source it belongs to.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StreamBinding {
-    pub table: Arc<BTreeTable>,
-    pub identifier: String,
-    /// Stable logical binding assigned by the main planner. Physical emitter
-    /// phases remap this id mechanically to their local cursor binding; names
-    /// are presentation metadata and are never resolved again.
-    pub logical_id: TableInternalId,
+    /// The source of the view's analyzed query whose columns this binding
+    /// carries. Expressions read it as `hir::Expr::Column` and
+    /// `hir::Expr::RowId`; emitters bind those reads to registers.
+    pub source: SourceId,
+}
+
+/// One aggregate of an [`OpNode::Aggregate`].
+#[derive(Debug, Clone)]
+pub struct Aggregate {
+    pub func: AggFunc,
+    /// The argument expressions, bound against the node's input schema.
+    /// Empty for `COUNT(*)`.
+    pub args: Vec<hir::Expr>,
+    pub distinct: bool,
+    /// The FILTER clause, bound against the node's input schema.
+    pub filter: Option<hir::Expr>,
+    /// The expression downstream operators read this aggregate's value
+    /// through: the aggregate call of the view's query. `None` for the
+    /// hidden liveness `COUNT(*)`, which no expression reads.
+    pub published: Option<hir::Expr>,
 }
 
 /// The value layout of an operator's delta stream.
@@ -53,7 +65,7 @@ pub struct StreamSchema {
     /// Canonical expression used by downstream operators to bind each value
     /// slot. Base-table columns without a SQL name cannot be referenced by a
     /// later expression, so their slot deliberately has no expression.
-    pub columns: Vec<Option<ast::Expr>>,
+    pub columns: Vec<Option<hir::Expr>>,
     pub bindings: Vec<StreamBinding>,
 }
 
@@ -120,9 +132,7 @@ pub enum OpNode {
     /// Output schema: the table's columns.
     Scan {
         table: Arc<BTreeTable>,
-        /// The identifier columns bind under (alias or table name).
-        identifier: String,
-        logical_id: TableInternalId,
+        source: SourceId,
     },
 
     /// Selection (σ). Linear — its incremental form is itself applied to the
@@ -130,14 +140,14 @@ pub enum OpNode {
     Filter {
         input: NodeId,
         /// Binds against the input's output schema.
-        predicate: ast::Expr,
+        predicate: hir::Expr,
     },
 
     /// Projection (π). Linear. Output schema: `projections`, each an
     /// expression over the input's output schema.
     Project {
         input: NodeId,
-        projections: Vec<ast::Expr>,
+        projections: Vec<hir::Expr>,
     },
 
     /// Rename a derived relation into the namespace exposed by its FROM-clause
@@ -147,8 +157,7 @@ pub enum OpNode {
     Alias {
         input: NodeId,
         table: Arc<BTreeTable>,
-        identifier: String,
-        logical_id: TableInternalId,
+        source: SourceId,
     },
 
     /// Binary join (⋈) with arbitrary ON predicates. Pure: no projection, no
@@ -166,7 +175,7 @@ pub enum OpNode {
         inputs: [NodeId; 2],
         /// ON predicates, desugared from USING/NATURAL; bind against the
         /// concatenated input schema.
-        on: Vec<ast::Expr>,
+        on: Vec<hir::Expr>,
         kind: JoinKind,
     },
 
@@ -190,7 +199,7 @@ pub enum OpNode {
         input: NodeId,
         /// Group keys, bound against the input's output schema. Empty for a
         /// scalar aggregate (`scalar`).
-        group_exprs: Vec<ast::Expr>,
+        group_exprs: Vec<hir::Expr>,
         /// One entry per group key.
         group_keys: Vec<KeyColumn>,
         /// `aggregates[0]` is the hidden liveness `COUNT(*)`. Its physical
@@ -316,29 +325,19 @@ impl DagBuilder {
 
     fn derive_output_schema(&self, node: &OpNode) -> Result<StreamSchema> {
         let (columns, bindings) = match node {
-            OpNode::Scan {
-                table,
-                identifier,
-                logical_id,
-            } => (
+            OpNode::Scan { table, source } => (
                 table
                     .columns()
                     .iter()
                     .enumerate()
                     .map(|(column_index, column)| {
-                        column.name.as_ref().map(|_| ast::Expr::Column {
-                            database: None,
-                            table: *logical_id,
-                            column: column_index,
-                            is_rowid_alias: column.is_rowid_alias(),
-                        })
+                        column
+                            .name
+                            .as_ref()
+                            .map(|_| hir::Expr::column(*source, column_index))
                     })
                     .collect(),
-                vec![StreamBinding {
-                    table: table.clone(),
-                    identifier: identifier.clone(),
-                    logical_id: *logical_id,
-                }],
+                vec![StreamBinding { source: *source }],
             ),
             OpNode::Filter { input, .. } => (
                 self.output_schemas[*input].columns.clone(),
@@ -351,8 +350,7 @@ impl DagBuilder {
             OpNode::Alias {
                 input,
                 table,
-                identifier,
-                logical_id,
+                source,
             } => {
                 if self.output_schemas[*input].len() != table.columns().len() {
                     return Err(LimboError::InternalError(
@@ -365,19 +363,13 @@ impl DagBuilder {
                         .iter()
                         .enumerate()
                         .map(|(column_index, column)| {
-                            column.name.as_ref().map(|_| ast::Expr::Column {
-                                database: None,
-                                table: *logical_id,
-                                column: column_index,
-                                is_rowid_alias: column.is_rowid_alias(),
-                            })
+                            column
+                                .name
+                                .as_ref()
+                                .map(|_| hir::Expr::column(*source, column_index))
                         })
                         .collect(),
-                    vec![StreamBinding {
-                        table: table.clone(),
-                        identifier: identifier.clone(),
-                        logical_id: *logical_id,
-                    }],
+                    vec![StreamBinding { source: *source }],
                 )
             }
             OpNode::Join {
@@ -435,9 +427,11 @@ impl DagBuilder {
                     .iter()
                     .cloned()
                     .map(Some)
-                    .chain(aggregates.iter().enumerate().map(|(index, aggregate)| {
-                        (index != 0).then(|| aggregate.original_expr.clone())
-                    }))
+                    .chain(
+                        aggregates
+                            .iter()
+                            .map(|aggregate| aggregate.published.clone()),
+                    )
                     .collect(),
                 self.output_schemas[*input].bindings.clone(),
             ),
@@ -467,9 +461,7 @@ impl DagBuilder {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::function::AggFunc;
     use crate::schema::BTreeCharacteristics;
-    use crate::translate::plan::Distinctness;
 
     fn scan(name: &str, id: usize) -> OpNode {
         OpNode::Scan {
@@ -484,8 +476,7 @@ mod tests {
                 crate::alloc::vec![],
                 None,
             )),
-            identifier: name.to_string(),
-            logical_id: TableInternalId::from(id),
+            source: SourceId::new(id),
         }
     }
 
@@ -503,21 +494,13 @@ mod tests {
 
     #[test]
     fn aggregate_schema_does_not_publish_hidden_liveness_count() {
-        let count = ast::Expr::FunctionCallStar {
-            name: ast::Name::exact("count".to_string()),
-            filter_over: ast::FunctionTail {
-                filter_clause: None,
-                over_clause: None,
-            },
-        };
-        let aggregate = || {
-            Aggregate::new(
-                AggFunc::Count0,
-                &[],
-                &count,
-                Distinctness::NonDistinct,
-                None,
-            )
+        let count = hir::Expr::Literal(ast::Literal::Numeric("0".to_string()));
+        let aggregate = |published: Option<hir::Expr>| Aggregate {
+            func: AggFunc::Count0,
+            args: Vec::new(),
+            distinct: false,
+            filter: None,
+            published,
         };
         let mut builder = DagBuilder::new();
         let input = builder.push(scan("t", 0)).unwrap();
@@ -529,16 +512,17 @@ mod tests {
                     collation: CollationSeq::Binary,
                     ambiguous: false,
                 }],
-                aggregates: vec![aggregate(), aggregate()],
+                aggregates: vec![aggregate(None), aggregate(Some(count.clone()))],
                 multiset_keys: vec![None, None],
                 scalar: false,
             })
             .unwrap();
         let dag = builder.finish(root).unwrap();
 
-        assert_eq!(
-            dag.root_schema().columns,
-            vec![Some(count.clone()), None, Some(count)]
-        );
+        let columns = &dag.root_schema().columns;
+        assert_eq!(columns.len(), 3);
+        assert!(columns[0].as_ref().is_some_and(|c| c.equivalent(&count)));
+        assert!(columns[1].is_none());
+        assert!(columns[2].as_ref().is_some_and(|c| c.equivalent(&count)));
     }
 }

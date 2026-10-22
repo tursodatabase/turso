@@ -903,7 +903,7 @@ impl<'expr> hir::ExprVisitor<'expr> for ExprLowerer<'_, 'expr, '_> {
                         let width = comparison
                             .as_ref()
                             .map_or(1, |comparison| comparison.components.len());
-                        let operands = if lhs.equivalent(rhs) {
+                        let operands = if lhs.equivalent(rhs) && expression_is_deterministic(lhs) {
                             BinaryOperands::Shared(self.program.alloc_registers(width))
                         } else {
                             let lhs = self.program.alloc_registers(width * 2);
@@ -1186,11 +1186,22 @@ impl<'expr> hir::ExprVisitor<'expr> for ExprLowerer<'_, 'expr, '_> {
                     0 => registers.lhs,
                     value_child => {
                         if value_child == 1 {
-                            self.program.emit_insn(Insn::BitAnd {
-                                lhs: registers.lhs,
-                                rhs: registers.lhs,
-                                dest: registers.null_flag,
-                            });
+                            if registers.width == 1 {
+                                self.program.emit_insn(Insn::BitAnd {
+                                    lhs: registers.lhs,
+                                    rhs: registers.lhs,
+                                    dest: registers.null_flag,
+                                });
+                            } else {
+                                // Row values set this flag only when a value
+                                // whose other components all match has a
+                                // NULL component, so (NULL,1) IN ((2,2)) is
+                                // false and (NULL,2) IN ((2,2)) is NULL.
+                                self.program.emit_insn(Insn::Integer {
+                                    value: 0,
+                                    dest: registers.null_flag,
+                                });
+                            }
                         } else {
                             self.finish_in_list_value(registers, &comparisons[value_child - 2])?;
                         }
@@ -2180,10 +2191,18 @@ impl<'expr> ExprLowerer<'_, 'expr, '_> {
                     &registers,
                     comparisons.last().expect("non-empty IN has a comparison"),
                 )?;
-                self.program.emit_insn(Insn::IsNull {
-                    reg: registers.null_flag,
-                    target_pc: registers.null_label,
-                });
+                if registers.width == 1 {
+                    self.program.emit_insn(Insn::IsNull {
+                        reg: registers.null_flag,
+                        target_pc: registers.null_label,
+                    });
+                } else {
+                    self.program.emit_insn(Insn::If {
+                        reg: registers.null_flag,
+                        target_pc: registers.null_label,
+                        jump_if_null: false,
+                    });
+                }
                 self.program.emit_insn(Insn::Goto {
                     target_pc: registers.false_label,
                 });
@@ -3278,8 +3297,20 @@ impl ExprLowerer<'_, '_, '_> {
         self.program
             .emit_column_or_rowid(read.cursor, read.column, context.target);
         let stored_value = self.program.allocate_label();
-        self.program
-            .emit_column_has_field(read.cursor, reference.column, stored_value);
+        if matches!(
+            self.program.get_cursor_type(read.cursor),
+            Some(CursorType::BTreeIndex(_))
+        ) {
+            // An index entry holds the value as stored, NULL included: a
+            // missing table field has no entry to read, so the DEFAULT is
+            // never applied to a value read from an index.
+            self.program.emit_insn(Insn::Goto {
+                target_pc: stored_value,
+            });
+        } else {
+            self.program
+                .emit_column_has_field(read.cursor, reference.column, stored_value);
+        }
         context.registers = ExprRegisters::ColumnPrograms(ColumnProgramRegisters {
             call: None,
             arguments_start: 0,
@@ -3563,14 +3594,14 @@ impl ExprLowerer<'_, '_, '_> {
                 "HIR IN comparison width changed between values".to_string(),
             ));
         }
-        self.program.emit_insn(Insn::BitAnd {
-            lhs: registers.null_flag,
-            rhs: registers.rhs,
-            dest: registers.null_flag,
-        });
         match comparison.components.as_slice() {
             [] => unreachable!("IN comparison width was checked"),
             [component] => {
+                self.program.emit_insn(Insn::BitAnd {
+                    lhs: registers.null_flag,
+                    rhs: registers.rhs,
+                    dest: registers.null_flag,
+                });
                 self.program.emit_insn(Insn::Eq {
                     lhs: registers.lhs,
                     rhs: registers.rhs,
@@ -3580,26 +3611,40 @@ impl ExprLowerer<'_, '_, '_> {
                 });
             }
             components => {
+                // A component that is not equal (NULL compares as not jumping)
+                // skips this value. Once every component is equal or NULL, a
+                // NULL on either side makes the result NULL unless a later
+                // value matches; otherwise this value matches.
                 let skip_label = self.program.allocate_label();
+                let set_null_flag_label = self.program.allocate_label();
                 for (index, component) in components.iter().enumerate() {
-                    if index + 1 == components.len() {
-                        self.program.emit_insn(Insn::Eq {
-                            lhs: registers.lhs + index,
-                            rhs: registers.rhs + index,
-                            target_pc: registers.match_label,
-                            flags: comparison_flags(component),
-                            collation: comparison_collation(component),
-                        });
-                    } else {
-                        self.program.emit_insn(Insn::Ne {
-                            lhs: registers.lhs + index,
-                            rhs: registers.rhs + index,
-                            target_pc: skip_label,
-                            flags: comparison_flags(component),
-                            collation: comparison_collation(component),
-                        });
-                    }
+                    self.program.emit_insn(Insn::Ne {
+                        lhs: registers.lhs + index,
+                        rhs: registers.rhs + index,
+                        target_pc: skip_label,
+                        flags: comparison_flags(component),
+                        collation: comparison_collation(component),
+                    });
                 }
+                for index in 0..components.len() {
+                    self.program.emit_insn(Insn::IsNull {
+                        reg: registers.lhs + index,
+                        target_pc: set_null_flag_label,
+                    });
+                    self.program.emit_insn(Insn::IsNull {
+                        reg: registers.rhs + index,
+                        target_pc: set_null_flag_label,
+                    });
+                }
+                self.program.emit_insn(Insn::Goto {
+                    target_pc: registers.match_label,
+                });
+                self.program
+                    .preassign_label_to_next_insn(set_null_flag_label);
+                self.program.emit_insn(Insn::Integer {
+                    value: 1,
+                    dest: registers.null_flag,
+                });
                 self.program.preassign_label_to_next_insn(skip_label);
             }
         }
@@ -4626,6 +4671,11 @@ impl<'expr> hir::ExprVisitor<'expr> for ConditionLowerer<'_, 'expr> {
     type Error = LimboError;
 
     fn child(&mut self, expression: &'expr hir::Expr, index: usize) -> Option<&'expr hir::Expr> {
+        // A condition whose value a register already holds, such as a GROUP
+        // BY key the HAVING clause repeats, is tested from that register.
+        if self.program.expression_register(expression).is_some() {
+            return None;
+        }
         let hir::Expr::Binary {
             lhs,
             operator: Operator::And | Operator::Or,
@@ -4706,17 +4756,20 @@ impl<'expr> hir::ExprVisitor<'expr> for ConditionLowerer<'_, 'expr> {
         context: ConditionContext,
         _children: &[()],
     ) -> Result<()> {
-        if matches!(
-            expression,
-            hir::Expr::Binary {
-                operator: Operator::And | Operator::Or,
-                custom: None,
-                ..
-            }
-        ) {
+        let stored = self.program.expression_register(expression).is_some();
+        if !stored
+            && matches!(
+                expression,
+                hir::Expr::Binary {
+                    operator: Operator::And | Operator::Or,
+                    custom: None,
+                    ..
+                }
+            )
+        {
             return Ok(());
         }
-        if self.emit_comparison_jump(expression, context.metadata())? {
+        if !stored && self.emit_comparison_jump(expression, context.metadata())? {
             return Ok(());
         }
         let register = self.program.alloc_register();
@@ -4742,6 +4795,22 @@ fn translate_condition_operand(
         program.constant_span_end(span);
     }
     result
+}
+
+/// Whether every function `expression` calls gives the same value for the
+/// same arguments, so two equal copies of it may share one evaluation.
+fn expression_is_deterministic(expression: &hir::Expr) -> bool {
+    let mut deterministic = true;
+    expression.for_each(&mut |expression| match expression {
+        hir::Expr::Function(call) => {
+            if !crate::function::Deterministic::is_deterministic(call.function.value()) {
+                deterministic = false;
+            }
+        }
+        hir::Expr::Subquery(_) => deterministic = false,
+        _ => {}
+    });
+    deterministic
 }
 
 /// Whether an expression has the same value on every row. An expression

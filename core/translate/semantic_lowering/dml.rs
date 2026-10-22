@@ -22,7 +22,7 @@ use crate::{
 
 use super::fkey_action::CompiledAction;
 use super::query::{
-    close_hir_btree_loop, emit_array_results, predicate_loop, prepare_hir_loop_unexplained,
+    close_hir_btree_loop, emit_array_results, predicate_ready_loop, prepare_hir_loop_unexplained,
     start_hir_loop,
 };
 use super::trigger::CompiledTrigger;
@@ -251,17 +251,26 @@ pub(super) fn emit_access_predicates(
     loop_index: Option<usize>,
     fail: BranchOffset,
 ) -> Result<()> {
-    for predicate in access
+    for (index, predicate) in access
         .predicates
         .iter()
-        .filter(|predicate| !predicate.consumed)
+        .enumerate()
+        .filter(|(_, predicate)| !predicate.consumed)
     {
         if predicate.from_outer_join.is_some() {
             return Err(LimboError::InternalError(
                 "HIR DML predicate belongs to an outer join".into(),
             ));
         }
-        if predicate_loop(program, document, &predicate.expr, &access.loops)? != loop_index {
+        let ready_at = predicate_ready_loop(
+            program,
+            document,
+            &access.loops,
+            &access.deferred_predicates,
+            &access.predicates,
+            index,
+        )?;
+        if ready_at != loop_index {
             continue;
         }
         let passed = program.allocate_label();
@@ -312,19 +321,11 @@ fn emit_index_key_values(
             .then(|| table.columns().get(column.pos_in_table))
             .flatten();
         match (expression, table_column) {
-            (Some(expression), _) => {
-                super::expr::translate_expr_no_constant_opt(
-                    program, document, expression, register,
-                )?;
-                // An indexed virtual generated column keeps its declared
-                // affinity.
-                if let Some(table_column) =
-                    table_column.filter(|table_column| table_column.is_virtual_generated())
-                {
-                    program.emit_column_affinity(register, table_column.affinity());
-                }
-            }
-            (None, Some(table_column)) if table_column.is_virtual_generated() => {
+            // An index on a virtual generated column stores the column's
+            // value: the generated expression computed with the standard
+            // operators, even over custom-typed columns, so the key is read
+            // as the column, never as the index's copy of its expression.
+            (_, Some(table_column)) if table_column.is_virtual_generated() => {
                 super::expr::translate_expr_no_constant_opt(
                     program,
                     document,
@@ -333,6 +334,12 @@ fn emit_index_key_values(
                         column: column.pos_in_table,
                     }),
                     register,
+                )?;
+                program.emit_column_affinity(register, table_column.affinity());
+            }
+            (Some(expression), _) => {
+                super::expr::translate_expr_no_constant_opt(
+                    program, document, expression, register,
                 )?;
             }
             (None, Some(_)) => {
@@ -818,7 +825,7 @@ fn emit_check_constraint_list<'c>(
             program.emit_insn(Insn::Halt {
                 err_code: SQLITE_CONSTRAINT_CHECK,
                 description: constraint.description.clone(),
-                on_error: None,
+                on_error: program.constraint_halt_on_error(or_conflict),
                 description_reg: None,
             });
         }
@@ -864,31 +871,61 @@ pub(super) fn check_strict_types(table: &BTreeTable, source: &hir::Source) -> Re
     Ok(())
 }
 
-/// STRICT: check each value of the row in `start..` against its column's
-/// type, converting it where SQLite allows and failing otherwise. A STRICT
-/// table gets this instead of column affinity.
+/// `table` for a type check of a row held in registers `start + column`
+/// for every column, virtual ones included: the check reads each column
+/// at its logical position, not at its position in the stored record.
+fn type_check_table(table: &BTreeTable) -> BTreeTable {
+    let mut checked = table.clone();
+    checked.logical_to_physical_map = (0..table.columns().len()).collect();
+    checked
+}
+
+/// STRICT: check each stored value of the row in `start..` against its
+/// column's type, converting it where SQLite allows and failing otherwise.
+/// A STRICT table gets this instead of column affinity. A virtual column
+/// is not computed yet, so it is checked as ANY; see
+/// [`emit_strict_generated_check`].
 pub(super) fn emit_strict_type_check(
     program: &mut ProgramBuilder,
     table: &Arc<BTreeTable>,
     start: usize,
 ) {
-    // Like SQLite, a virtual column is not checked: it is checked as ANY.
-    let table_reference = if table.has_virtual_columns() {
-        let mut checked = (**table).clone();
-        for column in checked.columns_mut().iter_mut() {
-            if column.is_virtual_generated() {
-                column.ty_str = "ANY".to_string();
-            }
+    let mut checked = type_check_table(table);
+    for column in checked.columns_mut().iter_mut() {
+        if column.is_virtual_generated() {
+            column.ty_str = "ANY".to_string();
         }
-        Arc::new(checked)
-    } else {
-        table.clone()
-    };
+    }
     program.emit_insn(Insn::TypeCheck {
         start_reg: start,
         count: table.columns().len(),
         check_generated: true,
-        table_reference,
+        table_reference: Arc::new(checked),
+    });
+}
+
+/// STRICT: check each computed virtual generated column of the row in
+/// `start..` against its declared type, like SQLite 3.51. The stored
+/// columns were checked before the virtual ones were computed.
+pub(super) fn emit_strict_generated_check(
+    program: &mut ProgramBuilder,
+    table: &Arc<BTreeTable>,
+    start: usize,
+) {
+    if !table.is_strict || !table.has_virtual_columns() {
+        return;
+    }
+    let mut checked = type_check_table(table);
+    for column in checked.columns_mut().iter_mut() {
+        if !column.is_virtual_generated() {
+            column.ty_str = "ANY".to_string();
+        }
+    }
+    program.emit_insn(Insn::TypeCheck {
+        start_reg: start,
+        count: table.columns().len(),
+        check_generated: true,
+        table_reference: Arc::new(checked),
     });
 }
 
@@ -926,7 +963,7 @@ pub(super) fn emit_custom_type_writes(
 ) -> Result<()> {
     let written = |column: usize| only.is_none_or(|only| only.contains(&column));
     let check_table = |input: bool| {
-        let mut checked = (**table).clone();
+        let mut checked = type_check_table(table);
         for (position, column) in checked.columns_mut().iter_mut().enumerate() {
             if column.is_virtual_generated() || (input && !written(position)) {
                 column.ty_str = "ANY".to_string();

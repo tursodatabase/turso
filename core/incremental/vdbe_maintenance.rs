@@ -27,100 +27,52 @@
 use rustc_hash::FxHashMap;
 use turso_parser::ast;
 
+use crate::incremental::dag;
 use crate::schema::Schema;
 use crate::sync::Arc;
-use crate::translate::semantic::context::SemanticContext;
+use crate::translate::{capture_catalog, semantic_context};
+use crate::vdbe::builder::{ProgramBuilder, ProgramBuilderOpts};
 use crate::vdbe::{PreparedProgram, Program};
-use crate::{Connection, LimboError, Result};
+use crate::{Connection, LimboError, QueryMode, Result};
 
-// The maintenance planner and code generators were written against the
-// deleted legacy planner. They are being rebuilt over HIR; until then they
-// do not compile and every entry point below reports that.
-#[cfg(any())]
-mod aggregate;
-#[cfg(any())]
-mod arrangement;
-#[cfg(any())]
-mod binding;
-#[cfg(any())]
-mod consolidate;
-#[cfg(any())]
-mod join;
-#[cfg(any())]
-mod linear;
-#[cfg(any())]
-mod members;
-#[cfg(any())]
-mod output;
-#[cfg(any())]
-mod plan;
-#[cfg(any())]
-mod set_op;
-#[cfg(any())]
-mod sink;
-#[cfg(any())]
-mod source;
-#[cfg(any())]
 mod stream;
+
+mod consolidate;
+use consolidate::consolidate_delta;
+
+mod binding;
+
+mod sink;
+use sink::{emit_terminal_delta, ViewSink};
+
+mod output;
+use output::NodeOutput;
+
+mod source;
+use source::{materialize_node_output, scan_node_output};
+
+mod join;
+use join::{emit_inner_join, emit_semi_or_anti_join, JoinContract};
+
+mod aggregate;
+use aggregate::emit_group_aggregate;
+
+mod set_op;
+use set_op::emit_set_op;
+
+mod plan;
+pub(crate) use plan::{plan_view, MaintenancePlan};
 
 mod delta_cursor;
 pub use delta_cursor::DeltaCursor;
 
-fn not_ported<T>() -> Result<T> {
-    Err(LimboError::ParseError(
-        "materialized views are not available until their maintenance is rebuilt over the HIR planner"
-            .to_string(),
-    ))
-}
+mod linear;
+use linear::{emit_alias, emit_filter, emit_pad, emit_project};
 
-/// A hidden table that stores one operator's state.
-#[derive(Debug, Clone)]
-pub(crate) struct HiddenTableDef {
-    pub(crate) table_name: String,
-    pub(crate) create_sql: String,
-    pub(crate) primary_key_index: bool,
-}
+mod members;
 
-/// The validated maintenance plan of a view: its operator graph and the
-/// storage derived from it.
-pub(crate) struct MaintenancePlan {
-    hidden_tables: Vec<HiddenTableDef>,
-    output_arity: usize,
-}
-
-impl MaintenancePlan {
-    pub(crate) fn output_arity(&self) -> usize {
-        self.output_arity
-    }
-
-    pub(crate) fn hidden_tables(&self) -> impl Iterator<Item = &HiddenTableDef> {
-        self.hidden_tables.iter()
-    }
-}
-
-#[cfg(feature = "test_helper")]
-impl Connection {
-    /// For each column of materialized view `view_name`: the name of the
-    /// collation under which maintenance chose the value the column shows
-    /// among several values that compare equal, or `None` when the value is
-    /// exact.
-    pub fn materialized_view_chosen_value_collations(
-        self: &Arc<Self>,
-        _view_name: &str,
-    ) -> Result<Vec<Option<String>>> {
-        not_ported()
-    }
-}
-
-/// Validate a view and build its executable maintenance plan.
-pub(crate) fn plan_view(
-    _view_name: &str,
-    _select: &ast::Select,
-    _catalog: &SemanticContext<'_>,
-    _connection: &Arc<Connection>,
-) -> Result<MaintenancePlan> {
-    not_ported()
-}
+mod arrangement;
+use arrangement::publish_node_output;
 
 /// What the maintenance program reads as its input relation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -167,8 +119,6 @@ impl MaintenanceProgramCache {
             .cloned()
     }
 
-    /// Keeps a compiled program; used once maintenance compiles again.
-    #[allow(dead_code)]
     fn insert(&self, key: MaintenanceProgramCacheKey, program: Arc<PreparedProgram>) {
         let mut entries = self.entries.write();
         entries.retain(|existing, _| existing.schema_version == key.schema_version);
@@ -178,11 +128,11 @@ impl MaintenanceProgramCache {
 
 pub(crate) fn compile_maintenance_program(
     view_name: &str,
-    _select: &ast::Select,
+    select: &ast::Select,
     view_root_page: i64,
     num_view_columns: usize,
     input: MaintenanceInput,
-    schema: &Schema,
+    schema: &Arc<Schema>,
     connection: &Arc<Connection>,
 ) -> Result<Program> {
     let key = MaintenanceProgramCacheKey {
@@ -195,5 +145,358 @@ pub(crate) fn compile_maintenance_program(
     if let Some(prepared) = connection.maintenance_program_cache.get(&key, connection) {
         return Ok(prepared.bind(connection.clone()));
     }
-    not_ported()
+    let plan = build_plan_for_connection(view_name, select, schema, connection)?;
+    let program = compile_maintenance_plan(
+        view_name,
+        view_root_page,
+        num_view_columns,
+        input,
+        &plan,
+        schema,
+        connection,
+    )?;
+    connection
+        .maintenance_program_cache
+        .insert(key, program.prepared().clone());
+    Ok(program)
+}
+
+fn compile_maintenance_plan(
+    view_name: &str,
+    view_root_page: i64,
+    num_view_columns: usize,
+    input: MaintenanceInput,
+    plan: &MaintenancePlan,
+    schema: &Schema,
+    connection: &Arc<Connection>,
+) -> Result<Program> {
+    let mut program = ProgramBuilder::new_for_subprogram(
+        QueryMode::Normal,
+        None,
+        ProgramBuilderOpts {
+            num_cursors: 13,
+            approx_num_insns: 128 + 64 * num_view_columns,
+            approx_num_labels: 48,
+        },
+        connection.mvcc_enabled(),
+    );
+    program.prologue();
+    emit_plan_to_sink(
+        &mut program,
+        view_name,
+        plan,
+        input,
+        &ViewSink {
+            root_page: view_root_page,
+            num_columns: num_view_columns,
+        },
+        schema,
+    )?;
+    program.epilogue(schema);
+    program.build(
+        connection.clone(),
+        false,
+        "materialized view DAG maintenance",
+    )
+}
+
+#[cfg(feature = "test_helper")]
+impl Connection {
+    /// For each column of materialized view `view_name`: the name of the
+    /// collation under which maintenance chose the value the column shows
+    /// among several values that compare equal, or `None` when the value is
+    /// exact.
+    ///
+    /// SQL leaves that choice open: under NOCASE, a GROUP BY key or a MIN may
+    /// show 'a' or 'A', and a fresh query shows whichever its plan meets
+    /// first. A view shows the smallest under BINARY instead. A tool that
+    /// checks a view against a fresh run of its definition may accept, in
+    /// such a column only, any value equal to the expected one under the
+    /// named collation.
+    pub fn materialized_view_chosen_value_collations(
+        self: &Arc<Self>,
+        view_name: &str,
+    ) -> Result<Vec<Option<String>>> {
+        let schema = self.schema.read().clone();
+        let view = schema.get_materialized_view(view_name).ok_or_else(|| {
+            LimboError::InvalidArgument(format!("no such materialized view: {view_name}"))
+        })?;
+        let select = view.lock().select_stmt.clone();
+        let plan = build_plan_for_connection(view_name, &select, &schema, self)?;
+        Ok(plan
+            .chosen_value_collations()
+            .into_iter()
+            .map(|collation| collation.map(|collation| collation.name()))
+            .collect())
+    }
+}
+
+/// Analyze the view's query against the connection's catalog and build its
+/// maintenance plan. The plan itself pins the view's unqualified table names
+/// to the main database, the way CREATE resolved them (#9456).
+fn build_plan_for_connection(
+    view_name: &str,
+    select: &ast::Select,
+    schema: &Arc<Schema>,
+    connection: &Arc<Connection>,
+) -> Result<MaintenancePlan> {
+    let dialect = crate::dialect::SqliteDialect;
+    let catalog = capture_catalog(schema, connection, &dialect, None)?;
+    let syms = connection.syms.read();
+    let context = semantic_context(&catalog, &syms, connection, Arc::new(dialect))?;
+    plan_view(view_name, select, &context)
+}
+
+/// Emit every node once in DAG topological order.
+///
+/// The output table is keyed by [`dag::NodeId`], making fan-out explicit:
+/// downstream nodes consume the already-compiled [`NodeOutput`] of each
+/// declared input rather than recursively re-emitting its subtree.
+fn emit_plan_nodes(
+    program: &mut ProgramBuilder,
+    view_name: &str,
+    plan: &MaintenancePlan,
+    input: MaintenanceInput,
+    schema: &Schema,
+) -> Result<NodeOutput> {
+    let dag = plan.dag();
+    let document = plan.document();
+    let operator_states = plan.operator_states();
+    let mut outputs: Vec<Option<NodeOutput>> = vec![None; dag.nodes.len()];
+    for node_id in 0..dag.nodes.len() {
+        let operator_state = operator_states.for_node(node_id)?;
+        let output_contract = &operator_state.output;
+        let output = match &dag.nodes[node_id] {
+            dag::OpNode::Scan { .. } => scan_node_output(dag, node_id, output_contract, schema)?,
+            dag::OpNode::Filter {
+                input: upstream,
+                predicate,
+            } => {
+                let upstream_id = *upstream;
+                let upstream = outputs[upstream_id].as_ref().ok_or_else(|| {
+                    LimboError::InternalError(format!(
+                        "filter DAG node {node_id} input {upstream} was not compiled"
+                    ))
+                })?;
+                let upstream =
+                    materialize_node_output(program, view_name, upstream_id, upstream, input)?;
+                emit_filter(
+                    program,
+                    document,
+                    view_name,
+                    node_id,
+                    &upstream,
+                    output_contract,
+                    predicate,
+                )?
+            }
+            dag::OpNode::Project {
+                input: upstream,
+                projections,
+            } => {
+                let upstream_id = *upstream;
+                let upstream_output = outputs[upstream_id].as_ref().ok_or_else(|| {
+                    LimboError::InternalError(format!(
+                        "project DAG node {node_id} input {upstream} was not compiled"
+                    ))
+                })?;
+                let upstream = materialize_node_output(
+                    program,
+                    view_name,
+                    upstream_id,
+                    upstream_output,
+                    input,
+                )?;
+                emit_project(
+                    program,
+                    document,
+                    view_name,
+                    node_id,
+                    &upstream,
+                    projections,
+                    output_contract,
+                )?
+            }
+            dag::OpNode::Alias {
+                input: upstream, ..
+            } => {
+                let upstream_id = *upstream;
+                let upstream_output = outputs[upstream_id].as_ref().ok_or_else(|| {
+                    LimboError::InternalError(format!(
+                        "alias DAG node {node_id} input {upstream} was not compiled"
+                    ))
+                })?;
+                let upstream = materialize_node_output(
+                    program,
+                    view_name,
+                    upstream_id,
+                    upstream_output,
+                    input,
+                )?;
+                emit_alias(program, view_name, node_id, &upstream, output_contract)?
+            }
+            dag::OpNode::Join { inputs, on, kind } => {
+                let declared_input = |input_id: dag::NodeId| {
+                    outputs[input_id].as_ref().ok_or_else(|| {
+                        LimboError::InternalError(format!(
+                            "join DAG node {node_id} input {input_id} was not compiled"
+                        ))
+                    })
+                };
+                let declared_inputs = [declared_input(inputs[0])?, declared_input(inputs[1])?];
+                let contract = JoinContract::from_outputs(declared_inputs, on)?;
+                match kind {
+                    dag::JoinKind::Inner => emit_inner_join(
+                        program,
+                        document,
+                        view_name,
+                        node_id,
+                        output_contract,
+                        &contract,
+                        input,
+                    )?,
+                    dag::JoinKind::Semi | dag::JoinKind::Anti => emit_semi_or_anti_join(
+                        program,
+                        document,
+                        view_name,
+                        node_id,
+                        *kind,
+                        &contract,
+                        output_contract,
+                        input,
+                        operator_state,
+                        schema,
+                    )?,
+                }
+            }
+            dag::OpNode::Pad {
+                input: upstream,
+                before,
+                ..
+            } => {
+                let upstream_id = *upstream;
+                let upstream_output = outputs[upstream_id].as_ref().ok_or_else(|| {
+                    LimboError::InternalError(format!(
+                        "pad DAG node {node_id} input {upstream} was not compiled"
+                    ))
+                })?;
+                let upstream = materialize_node_output(
+                    program,
+                    view_name,
+                    upstream_id,
+                    upstream_output,
+                    input,
+                )?;
+                emit_pad(
+                    program,
+                    view_name,
+                    node_id,
+                    &upstream,
+                    before,
+                    output_contract,
+                )?
+            }
+            dag::OpNode::SetOp {
+                inputs: set_inputs,
+                operators,
+                prefix_len,
+                key_columns,
+                ..
+            } => {
+                let mut channels = Vec::with_capacity(set_inputs.len());
+                for upstream_id in set_inputs {
+                    let upstream = outputs[*upstream_id].as_ref().ok_or_else(|| {
+                        LimboError::InternalError(format!(
+                            "set-op DAG node {node_id} input {upstream_id} was not compiled"
+                        ))
+                    })?;
+                    channels.push(materialize_node_output(
+                        program,
+                        view_name,
+                        *upstream_id,
+                        upstream,
+                        input,
+                    )?);
+                }
+                emit_set_op(
+                    program,
+                    view_name,
+                    node_id,
+                    &channels,
+                    operators,
+                    *prefix_len,
+                    key_columns,
+                    output_contract,
+                    operator_state,
+                    schema,
+                )?
+            }
+            dag::OpNode::Aggregate {
+                input: upstream,
+                group_exprs,
+                group_keys,
+                aggregates,
+                multiset_keys,
+                scalar,
+                ..
+            } => {
+                let upstream_id = *upstream;
+                let upstream = outputs[upstream_id].as_ref().ok_or_else(|| {
+                    LimboError::InternalError(format!(
+                        "aggregate DAG node {node_id} input {upstream} was not compiled"
+                    ))
+                })?;
+                let upstream =
+                    materialize_node_output(program, view_name, upstream_id, upstream, input)?;
+                emit_group_aggregate(
+                    program,
+                    document,
+                    view_name,
+                    node_id,
+                    &upstream,
+                    group_exprs,
+                    group_keys,
+                    aggregates,
+                    multiset_keys,
+                    *scalar,
+                    input,
+                    output_contract,
+                    operator_state,
+                    schema,
+                )?
+            }
+        };
+        let output = publish_node_output(
+            program,
+            view_name,
+            node_id,
+            output,
+            input,
+            operator_state,
+            schema,
+        )?;
+        outputs[node_id] = Some(output);
+    }
+
+    outputs[dag.root].take().ok_or_else(|| {
+        LimboError::InternalError(format!(
+            "maintenance DAG root node {} was not compiled",
+            dag.root
+        ))
+    })
+}
+
+fn emit_plan_to_sink(
+    program: &mut ProgramBuilder,
+    view_name: &str,
+    plan: &MaintenancePlan,
+    input: MaintenanceInput,
+    sink: &ViewSink,
+    schema: &Schema,
+) -> Result<()> {
+    let node_output = emit_plan_nodes(program, view_name, plan, input, schema)?;
+    let root = plan.dag().root;
+    let stream = materialize_node_output(program, view_name, root, &node_output, input)?;
+    let stream = consolidate_delta(program, &format!("{view_name}_sink_input"), &stream)?;
+    emit_terminal_delta(program, view_name, &stream, sink)
 }

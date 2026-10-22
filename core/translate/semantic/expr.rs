@@ -1318,6 +1318,18 @@ fn take_scalar_operand(mut operand: ExprOperand) -> Result<ResolvedScopeExpr> {
         .expect("scalar operand contains one value"))
 }
 
+/// The first explicit COLLATE among `facts`, if any: the collation an
+/// operator or call over them carries.
+fn explicit_collation<'a>(facts: impl IntoIterator<Item = &'a ResolvedScopeExpr>) -> ExprCollation {
+    facts
+        .into_iter()
+        .find_map(|fact| match &fact.collation {
+            ExprCollation::Explicit(collation) => Some(ExprCollation::Explicit(collation.clone())),
+            _ => None,
+        })
+        .unwrap_or(ExprCollation::Absent)
+}
+
 fn expression_operands_collation<'a>(
     operands: impl IntoIterator<Item = &'a ExprOperand>,
 ) -> ExprCollation {
@@ -1670,6 +1682,41 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
     /// subquery whose arguments read only columns of the enclosing block
     /// is an aggregate of that block, which then runs as an aggregate query;
     /// otherwise it belongs to `block`, the block it is written in.
+    /// Whether an aggregate of `block` reads a column of another query
+    /// block: an aggregate of the enclosing query, which is a misuse
+    /// where that query allows no aggregates.
+    fn aggregate_reads_outside(
+        &self,
+        block: hir::QueryBlockId,
+        input: &FunctionInput,
+        filter: Option<&ResolvedScopeExpr>,
+    ) -> bool {
+        let mut reads_outside = false;
+        let mut visit = |expression: &hir::Expr| {
+            expression.for_each(&mut |expression| {
+                let source = match expression {
+                    hir::Expr::Column(column) => column.source,
+                    hir::Expr::RowId(source) => *source,
+                    _ => return,
+                };
+                match self.source(source).map(|source| source.owner) {
+                    Some(hir::SourceOwner::QueryBlock(owner)) if owner == block => {}
+                    _ => reads_outside = true,
+                }
+            });
+        };
+        for value in input.facts() {
+            visit(&value.expr);
+        }
+        for term in input.order_terms() {
+            visit(&term.value.expr);
+        }
+        if let Some(filter) = filter {
+            visit(&filter.expr);
+        }
+        reads_outside
+    }
+
     fn aggregate_owner(
         &self,
         block: hir::QueryBlockId,
@@ -1819,15 +1866,7 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
                 .map(|(lhs, rhs)| comparison_component(lhs, rhs))
                 .collect(),
         };
-        let collation =
-            lhs.iter()
-                .zip(&rhs)
-                .fold(ExprCollation::Absent, |collation, (lhs, rhs)| {
-                    expression_collation(
-                        &expression_collation(&collation, &lhs.collation),
-                        &rhs.collation,
-                    )
-                });
+        let collation = ExprCollation::Absent;
         let lhs = if lhs.len() == 1 {
             lhs.into_iter()
                 .next()
@@ -2181,7 +2220,7 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
         }
         if matches!(operator, ast::Operator::Is | ast::Operator::IsNot) {
             if let Some(is_true) = truth_test_rhs(rhs_syntax) {
-                let collation = expression_operands_collation([&lhs, &rhs]);
+                let collation = ExprCollation::Absent;
                 return Ok(truth_test_expr(
                     take_scalar_operand(lhs)?,
                     is_true,
@@ -2234,7 +2273,11 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
         let comparison = operator
             .is_comparison()
             .then(|| comparison_semantics(&lhs, &rhs));
-        let collation = expression_collation(&lhs.collation, &rhs.collation);
+        // The value of an operator keeps an explicit COLLATE of either
+        // operand, as SQLite propagates one through operators, but not an
+        // operand's column collation; a comparison's operands decide the
+        // comparison's own collation above.
+        let collation = explicit_collation([&lhs, &rhs]);
         Ok(computed_expr(
             hir::Expr::Binary {
                 lhs: Box::new(lhs.expr),
@@ -2308,7 +2351,7 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
         }
         let start_comparison = expression_operand_comparison(&expr.components, &start.components);
         let end_comparison = expression_operand_comparison(&expr.components, &end.components);
-        let collation = expression_operands_collation([&expr, &start, &end]);
+        let collation = ExprCollation::Absent;
         Ok(computed_expr(
             hir::Expr::Between {
                 expr: Box::new(expr.expr),
@@ -2575,8 +2618,7 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
                     .iter()
                     .map(|value| in_operand_comparison(&lhs.components, &value.components))
                     .collect();
-                let collation =
-                    expression_operands_collation(std::iter::once(&lhs).chain(values.iter()));
+                let collation = ExprCollation::Absent;
                 Ok(computed_expr(
                     hir::Expr::InList {
                         lhs: Box::new(lhs.expr),
@@ -2609,11 +2651,8 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
                         children.len()
                     )));
                 }
-                let collation = children
-                    .iter()
-                    .fold(ExprCollation::Absent, |current, child| {
-                        expression_collation(&current, &child.collation)
-                    });
+                // A CASE value carries no collation, whatever its arms read.
+                let collation = ExprCollation::Absent;
                 let mut children = children.into_iter();
                 let base = base_syntax.as_ref().map(|_| {
                     children
@@ -3005,6 +3044,12 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
             }
         };
         let binding = bind_function(&function, window.is_some(), name, policy, functions)?;
+        if matches!(binding, FunctionBinding::Scalar) && filter.is_some() {
+            crate::bail_parse_error!(
+                "FILTER may not be used with non-aggregate {}()",
+                function_name
+            );
+        }
         let aggregate = matches!(binding, FunctionBinding::Aggregate(_));
         let window_evaluation = matches!(binding, FunctionBinding::Window(_));
         let window = match (window_evaluation, window) {
@@ -3105,13 +3150,18 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
         let id = self.catalog_object_id(
             None,
             CatalogObjectKind::Function { argument_count },
-            function_name,
+            function_name.clone(),
         );
         let function =
             hir::CatalogObject::new(id, self.context().snapshot(), None, Arc::new(function));
         let evaluation = match binding {
             FunctionBinding::Scalar => hir::FunctionEvaluation::Scalar,
             FunctionBinding::Aggregate(binding) => {
+                if self.aggregate_hosts.last() == Some(&None)
+                    && self.aggregate_reads_outside(binding.block, &input, filter.as_ref())
+                {
+                    crate::bail_parse_error!("misuse of aggregate: {}()", function_name);
+                }
                 let block = self.aggregate_owner(binding.block, &input, filter.as_ref());
                 hir::FunctionEvaluation::Aggregate {
                     id: self.allocate_aggregate(block),
@@ -3132,6 +3182,9 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
                 filter: filter.map(|filter| Box::new(filter.expr)),
             },
         };
+        // A function's value keeps an explicit COLLATE of an argument, as
+        // SQLite propagates one through calls, but not a column collation.
+        let collation = explicit_collation(input.facts());
         let arguments = input.into_hir();
         Ok(computed_expr(
             hir::Expr::Function(hir::FunctionCall {
@@ -3142,7 +3195,7 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
                 operation,
             }),
             result_type,
-            ExprCollation::Absent,
+            collation,
         ))
     }
 
@@ -3389,7 +3442,7 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
         lhs: &ResolvedScopeExpr,
         rhs: &ResolvedScopeExpr,
     ) -> Result<Option<hir::CustomBinaryOperator>> {
-        if custom_operator_symbol(operator).is_none() {
+        if self.standard_operators_only || custom_operator_symbol(operator).is_none() {
             return Ok(None);
         }
         let lhs_column = self.custom_operator_column(lhs)?;
@@ -3476,9 +3529,13 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
                 reference.source
             ))
         })?;
+        // The row a write builds (NEW, or the row an UPDATE writes) has the
+        // table's columns, so its custom types keep their operators there.
         if !matches!(
             &source.kind,
-            hir::SourceKind::Table(_) | hir::SourceKind::TableFunction { .. }
+            hir::SourceKind::Table(_)
+                | hir::SourceKind::TableFunction { .. }
+                | hir::SourceKind::Pseudo { .. }
         ) {
             return Ok(None);
         }
@@ -3529,10 +3586,14 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
                 })?;
                 (database, normalize_ident(name))
             }
-            None => (
-                hir::DatabaseId::new(crate::MAIN_DB_ID),
-                normalize_ident(&user_name),
-            ),
+            None => {
+                let name = normalize_ident(&user_name);
+                let database = self
+                    .context()
+                    .resolve_existing_sequence_database_id(&name)
+                    .unwrap_or(crate::MAIN_DB_ID);
+                (hir::DatabaseId::new(database), name)
+            }
         };
         let backing_table_name =
             crate::translate::sequence::sequence_backing_table_name(&normalized_name);
@@ -3645,14 +3706,17 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
                     type_fact: column.type_fact.clone(),
                     affinity: column.affinity,
                     has_affinity: column.has_affinity,
-                    collation: ExprCollation::inherited(column.collation.clone()),
+                    collation: ExprCollation::column(
+                        column.collation.clone(),
+                        &self.binary_collation,
+                    ),
                 })
             }
             hir::Expr::MergedColumn(merged) => Ok(ResolvedScopeExpr {
                 type_fact: merged.type_fact.clone(),
                 affinity: merged.affinity,
                 has_affinity: merged.has_affinity,
-                collation: ExprCollation::inherited(merged.collation.clone()),
+                collation: ExprCollation::column(merged.collation.clone(), &self.binary_collation),
                 expr: hir::Expr::MergedColumn(merged),
             }),
             hir::Expr::RowId(source) => Ok(ResolvedScopeExpr {
@@ -4373,10 +4437,9 @@ fn bind_function(
         Func::Agg(_) => bind_aggregate(function, context),
         Func::External(external) if external.func.is_aggregate() => {
             if has_over {
-                bind_window(function, context)
-            } else {
-                bind_aggregate(function, context)
+                crate::bail_parse_error!("{} cannot be used as a window function", name.as_str())
             }
+            bind_aggregate(function, context)
         }
         Func::Window(_) if has_over => bind_window(function, context),
         Func::Window(window) => {
@@ -4641,12 +4704,22 @@ fn function_result_type(function: &Func, arguments: &[ResolvedScopeExpr]) -> hir
     }
 }
 
+/// The collation of a comparison of `lhs` with `rhs`: an explicit COLLATE
+/// on either side, the left one first; else the column collation of either
+/// side, the left one first, where a column without a declared collation
+/// counts as BINARY; else none.
 fn expression_collation(lhs: &ExprCollation, rhs: &ExprCollation) -> ExprCollation {
     match (lhs, rhs) {
         (ExprCollation::Explicit(collation), _) => ExprCollation::Explicit(collation.clone()),
         (_, ExprCollation::Explicit(collation)) => ExprCollation::Explicit(collation.clone()),
         (ExprCollation::Inherited(collation), _) => ExprCollation::Inherited(collation.clone()),
+        (ExprCollation::InheritedBinary(binary), _) => {
+            ExprCollation::InheritedBinary(binary.clone())
+        }
         (_, ExprCollation::Inherited(collation)) => ExprCollation::Inherited(collation.clone()),
+        (_, ExprCollation::InheritedBinary(binary)) => {
+            ExprCollation::InheritedBinary(binary.clone())
+        }
         (ExprCollation::Absent, ExprCollation::Absent) => ExprCollation::Absent,
     }
 }
@@ -4734,7 +4807,7 @@ fn comparison_component(
     hir::ComparisonComponent {
         affinity,
         collation: expression_collation(&lhs.collation, &rhs.collation)
-            .value()
+            .comparison_value()
             .cloned(),
         array: lhs.type_fact.is_array() && rhs.type_fact.is_array(),
     }
@@ -4803,7 +4876,7 @@ fn in_operand_comparison(
             .map(|(lhs, rhs)| hir::ComparisonComponent {
                 affinity: lhs.affinity,
                 collation: expression_collation(&lhs.collation, &rhs.collation)
-                    .value()
+                    .comparison_value()
                     .cloned(),
                 array: lhs.type_fact.is_array() && rhs.type_fact.is_array(),
             })

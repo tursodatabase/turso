@@ -112,12 +112,7 @@ pub fn translate_create_materialized_view(
     // first (#9456): a TEMP table that happens to share a source table's
     // name must not shadow it here.
     let maintenance_plan = catalog.with_schema(database_id, |_| {
-        crate::incremental::vdbe_maintenance::plan_view(
-            &normalized_view_name,
-            select_stmt,
-            catalog,
-            &connection,
-        )
+        crate::incremental::vdbe_maintenance::plan_view(&normalized_view_name, select_stmt, catalog)
     })?;
     if maintenance_plan.output_arity() != view_columns.len() {
         return Err(crate::LimboError::InternalError(format!(

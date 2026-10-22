@@ -810,6 +810,21 @@ impl ProgramBuilder {
         self.expression_registers.len()
     }
 
+    /// Stop reading `expression` from its bound register, so it is
+    /// evaluated again. Returns the register it was read from, for
+    /// [Self::bind_expression_register] to restore.
+    pub(crate) fn unbind_expression_register(
+        &mut self,
+        expression: &crate::translate::semantic::hir::Expr,
+    ) -> Option<usize> {
+        let address = std::ptr::from_ref(expression) as usize;
+        let position = self
+            .expression_registers
+            .iter()
+            .position(|(bound, _)| *bound == address)?;
+        Some(self.expression_registers.remove(position).1)
+    }
+
     pub(crate) fn truncate_expression_registers(&mut self, count: usize) {
         self.expression_registers.truncate(count);
     }

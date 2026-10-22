@@ -2260,6 +2260,25 @@ pub fn translate_alter_table(
 
             if let Some(altered_table) = altered_table {
                 let altered_table = Arc::new(altered_table);
+                // The catalog still holds the column under its old name and
+                // type; constraints and index keys read the altered table
+                // and its indexes as they will be.
+                let altered_indexes = table_indexes
+                    .iter()
+                    .map(|index| {
+                        indexes_to_rewrite
+                            .iter()
+                            .find(|rewritten| rewritten.name == index.name)
+                            .unwrap_or(index)
+                            .clone()
+                    })
+                    .collect();
+                let altered_catalog = catalog.with_altered_table(
+                    crate::translate::semantic::hir::DatabaseId::new(database_id),
+                    Arc::new(crate::schema::Table::BTree(altered_table.clone())),
+                    altered_indexes,
+                );
+                let catalog = &altered_catalog;
                 emit_column_constraints_validation(
                     program,
                     &altered_table,

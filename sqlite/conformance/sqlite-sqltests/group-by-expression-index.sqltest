@@ -78,6 +78,8 @@ test expr-index-covering-scan-filters-on-the-expression {
 expect {
     14
     22
+}
+
 # An expression index stores the value for a real row. A LEFT JOIN can replace
 # that row with NULL, so SQLite computes the expression again.
 @cross-check-integrity

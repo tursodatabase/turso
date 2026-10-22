@@ -10,6 +10,7 @@ mod expr;
 pub(crate) mod hir;
 mod insert;
 mod query;
+pub(crate) use query::compound_column_affinity;
 mod schema_program;
 mod scope;
 mod trigger;

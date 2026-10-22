@@ -327,27 +327,6 @@ pub(crate) fn format_unique_violation_desc(table_name: &str, index: &Index) -> S
     }
 }
 
-/// The error text and halt mode for a constraint whose own ON CONFLICT is
-/// FAIL or ROLLBACK. The text is formatted here so the VM raises it with
-/// that mode. With a statement-level OR clause, the program's own mode
-/// applies and the text is left as is.
-pub(super) fn halt_desc_and_on_error(
-    description: &str,
-    effective: ResolveType,
-    has_statement_conflict: bool,
-) -> (String, Option<ResolveType>) {
-    if has_statement_conflict {
-        return (description.to_string(), None);
-    }
-    match effective {
-        ResolveType::Fail | ResolveType::Rollback => (
-            format!("UNIQUE constraint failed: {description}"),
-            Some(effective),
-        ),
-        _ => (description.to_string(), None),
-    }
-}
-
 /// Whether any constraint resolves to REPLACE: the statement's OR clause
 /// when it has one, otherwise the INTEGER PRIMARY KEY's or an index's own
 /// ON CONFLICT.

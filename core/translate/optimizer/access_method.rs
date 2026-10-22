@@ -654,8 +654,13 @@ pub(super) fn choose_btree_access_method<C, I, O>(
         input_cardinality,
         base_row_count,
         params,
-    )?
-    .expect("B-tree candidate selection always includes a scan candidate");
+    )?;
+    // The scan candidate is always there, unless INDEXED BY forces an
+    // expression index that the right table of a RIGHT or FULL JOIN cannot
+    // use: SQLite reports that as no query solution.
+    let Some(chosen) = chosen else {
+        crate::bail_parse_error!("no query solution");
+    };
 
     build_btree_access_method(source, constraints, chosen, analyze_stats, params)
 }
@@ -740,11 +745,13 @@ pub(super) fn choose_best_in_seek_candidate<E>(
                 continue;
             };
             // A WHERE-clause IN term on a table an outer join can
-            // null-extend is not `usable`: it must stay a plain filter that
-            // also runs on the null-extended row, and an IN term cannot be
-            // re-checked after the seek, since `InSeek` iterates the IN
-            // list's cursor and the check would probe that same cursor.
-            if not || !constraint.usable || !lhs_mask.contains_all_set_bits_of(&constraint.lhs_mask)
+            // null-extend must stay a plain filter that also runs on the
+            // null-extended row, and an IN term cannot be re-checked after
+            // the seek, since `InSeek` iterates the IN list's cursor and the
+            // check would probe that same cursor.
+            if not
+                || !constraint.outer_join_compatible
+                || !lhs_mask.contains_all_set_bits_of(&constraint.lhs_mask)
             {
                 continue;
             }
@@ -913,11 +920,14 @@ pub(super) fn choose_single_btree_access_method<E, I, O>(
     );
     // A temporary index is only built for a table joined after another one.
     // A correlated subquery's first table is scanned on each run; the
-    // subquery-to-join rewrite in `semantic_unnest` speeds those up.
+    // subquery-to-join rewrite in `semantic_unnest` speeds those up. A
+    // table a RIGHT or FULL JOIN keeps is read through its own cursor, so
+    // the pass over its unmatched rows can key them by rowid.
     if source.allows_alternative_access()
         && uses_full_table_scan
         && !lhs_mask.is_empty()
         && !source.forbids_automatic_index()
+        && !source.keeps_right_rows()
     {
         let constraint_refs = usable_constraints_for_lhs_mask(
             &constraints.constraints,
@@ -1056,7 +1066,7 @@ fn replace_if_cheaper(
     }
 }
 
-pub(super) fn find_best_hir_access_method_for_vtab<E>(
+pub(crate) fn find_best_hir_access_method_for_vtab<E>(
     vtab: &VirtualTable,
     constraints: &[Constraint<E>],
     source_position: usize,

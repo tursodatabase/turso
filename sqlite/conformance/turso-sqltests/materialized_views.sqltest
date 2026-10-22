@@ -2568,8 +2568,8 @@ test matview-projection-functions-over-aggregates {
     SELECT * FROM g ORDER BY initial;
 }
 expect {
-    34|130.0
-    35|1130.0
+    34|130
+    35|1130
     a|101
     c|112
     z|200
@@ -2881,4 +2881,47 @@ test matview-untyped-column-compares-without-affinity {
 }
 expect {
     Y|1
+}
+
+# A parenthesized join is joined on its own and read under the group's name,
+# both as an inner join input and as the NULL-filled side of a LEFT JOIN. The
+# group's rows are kept up to date as its tables change.
+test matview-parenthesized-join-group {
+    CREATE TABLE a(id INTEGER PRIMARY KEY, x);
+    CREATE TABLE b(id INTEGER PRIMARY KEY, y);
+    CREATE TABLE c(id INTEGER PRIMARY KEY, z);
+    INSERT INTO a VALUES (1,1),(2,2),(3,3);
+    INSERT INTO b VALUES (1,10),(2,20),(4,40);
+    INSERT INTO c VALUES (1,100),(3,300),(4,400);
+    CREATE MATERIALIZED VIEW inner_group AS
+      SELECT a.id, b.y, c.z FROM a JOIN (b JOIN c ON b.id = c.id) ON a.id = b.id;
+    CREATE MATERIALIZED VIEW left_group AS
+      SELECT a.id, b.y, c.z FROM a LEFT JOIN (b JOIN c ON b.id = c.id) ON a.id = b.id;
+    CREATE MATERIALIZED VIEW using_group AS
+      SELECT id, y, z FROM (b JOIN c USING (id));
+    SELECT 'inner', * FROM inner_group ORDER BY 2;
+    SELECT 'left', * FROM left_group ORDER BY 2;
+    SELECT 'using', * FROM using_group ORDER BY 2;
+    INSERT INTO c VALUES (2,200);
+    DELETE FROM b WHERE id = 1;
+    INSERT INTO a VALUES (4,4);
+    SELECT 'inner2', * FROM inner_group ORDER BY 2;
+    SELECT 'left2', * FROM left_group ORDER BY 2;
+    SELECT 'using2', * FROM using_group ORDER BY 2;
+}
+expect {
+    inner|1|10|100
+    left|1|10|100
+    left|2||
+    left|3||
+    using|1|10|100
+    using|4|40|400
+    inner2|2|20|200
+    inner2|4|40|400
+    left2|1||
+    left2|2|20|200
+    left2|3||
+    left2|4|40|400
+    using2|2|20|200
+    using2|4|40|400
 }

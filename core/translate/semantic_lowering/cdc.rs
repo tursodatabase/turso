@@ -173,6 +173,13 @@ impl<'a> Capture<'a> {
         if program.flags.is_subprogram() {
             return Ok(());
         }
+        let has_commit_record = program
+            .capture_data_changes_info()
+            .as_ref()
+            .is_some_and(|info| info.cdc_version().has_commit_record());
+        if !has_commit_record {
+            return Ok(());
+        }
         emit_cdc_statement_commit(program, None, &self.change_ids, Some(self.cursor))
     }
 }

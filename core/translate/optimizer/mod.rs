@@ -125,6 +125,11 @@ pub(crate) struct HirVirtualTableOperation {
     pub(crate) idx_num: i32,
     pub(crate) idx_str: Option<String>,
     pub(crate) arguments: Vec<hir::Expr>,
+    /// For the right table of a RIGHT or FULL JOIN: the read that finds its
+    /// unmatched rows after the main loops, planned from the table-function
+    /// arguments alone, as SQLite plans that read from a one-table FROM
+    /// clause.
+    pub(crate) unmatched_right_rows: Option<Box<HirVirtualTableOperation>>,
 }
 
 trait BtreeOperationBuilder<E, P> {
@@ -513,8 +518,8 @@ pub(crate) fn hir_or_union_with_cost(
         split(&term.expr, ast::Operator::Or, &mut disjuncts);
         let mut branches = Vec::with_capacity(disjuncts.len());
         let mut covers_term = true;
-        let mut union_cost = Cost(0.0);
-        let mut union_rows = 0.0;
+        let mut branch_cost = Cost(0.0);
+        let mut branch_rows = Vec::with_capacity(disjuncts.len());
         for disjunct in disjuncts {
             let mut conjuncts = Vec::new();
             split(disjunct, ast::Operator::And, &mut conjuncts);
@@ -561,8 +566,50 @@ pub(crate) fn hir_or_union_with_cost(
                 branches.clear();
                 break;
             }
-            union_cost = union_cost + access.cost;
-            union_rows += access.estimated_rows_per_outer_row;
+            // A branch only collects rowids, so it reads no table row: the
+            // union looks each rowid up once below.
+            if let AccessMethodParams::BTreeTable {
+                index,
+                constraint_refs,
+                ..
+            } = &access.params
+            {
+                let index_info = match index.as_ref() {
+                    Some(index) => cost::IndexInfo {
+                        unique: index.unique,
+                        covering: true,
+                        column_count: index.columns.len(),
+                        rows_per_leaf_page: cost::rows_per_leaf_page_for_index(
+                            index.columns.len(),
+                            &source.table,
+                            params.rows_per_table_page,
+                        ),
+                    },
+                    None => cost::IndexInfo {
+                        unique: true,
+                        covering: true,
+                        column_count: 1,
+                        rows_per_leaf_page: params.rows_per_table_page,
+                    },
+                };
+                let analyze_ctx = cost::AnalyzeCtx {
+                    table_name: source.table.get_name(),
+                    index: index.as_ref(),
+                    stats: &schema.analyze_stats,
+                };
+                access.cost = cost::estimate_cost_for_scan_or_seek(
+                    Some(index_info),
+                    &constraints.constraints,
+                    constraint_refs,
+                    1.0,
+                    base_row_count,
+                    false,
+                    params,
+                    Some(&analyze_ctx),
+                );
+            }
+            branch_cost = branch_cost + access.cost;
+            branch_rows.push(access.estimated_rows_per_outer_row);
             branches.push(apply_hir_selected_btree_access(
                 source,
                 &constraints,
@@ -591,9 +638,21 @@ pub(crate) fn hir_or_union_with_cost(
         if branches.is_empty() {
             continue;
         }
-        // Every rowid is added to and read from the row set, then looked up
-        // in the table.
-        let union_cost = union_cost + Cost(union_rows * 2.0 * params.cpu_cost_per_seek);
+        // The branches' rows overlap as independent conditions would:
+        // P(A OR B) = 1 - (1 - P(A)) * (1 - P(B)).
+        let base_rows = *base_row_count;
+        let mut unique_row_ratio = 1.0_f64;
+        for rows in &branch_rows {
+            unique_row_ratio *= 1.0 - (rows / base_rows).min(1.0);
+        }
+        let union_rows = base_rows * (1.0 - unique_row_ratio);
+        // Every rowid is added to and read from the row set, then the
+        // rows are read from the table in rowid order.
+        let rows_before_dedup: f64 = branch_rows.iter().sum();
+        let row_set_cost = rows_before_dedup * params.cpu_cost_per_row * 2.0;
+        let table_pages = (base_rows / params.rows_per_table_page).max(1.0);
+        let table_fetch_cost = union_rows / base_rows.max(1.0) * table_pages;
+        let union_cost = branch_cost + Cost(row_set_cost + table_fetch_cost);
         if union_cost.0 < scan_cost.0 {
             let union = HirOrUnion {
                 branches,
@@ -746,6 +805,7 @@ pub(crate) fn apply_hir_selected_virtual_access(
         idx_num: *idx_num,
         idx_str: idx_str.clone(),
         arguments,
+        unmatched_right_rows: None,
     })
 }
 

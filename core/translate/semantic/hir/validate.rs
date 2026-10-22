@@ -631,13 +631,13 @@ impl<'document> HirValidator<'document> {
                 ));
             }
         };
-        let updated_columns = assignments
+        // Like SQLite, an `UPDATE OF` trigger matches the SET column names
+        // as written: `SET rowid = 1` fires a trigger on `rowid`, not one on
+        // the INTEGER PRIMARY KEY column.
+        let updated_names = assignments
             .iter()
-            .flat_map(|assignment| assignment.columns.iter())
-            .filter_map(|column| match column {
-                TargetColumn::Column(position) => Some(*position),
-                TargetColumn::RowId => None,
-            })
+            .flat_map(|assignment| assignment.names.iter())
+            .map(|name| crate::util::normalize_ident(name))
             .collect::<HashSet<_>>();
         let mut identities = HashSet::with_capacity(triggers.len());
         for trigger in triggers {
@@ -679,10 +679,7 @@ impl<'document> HirValidator<'document> {
                     turso_parser::ast::TriggerEvent::UpdateOf(columns),
                     turso_parser::ast::TriggerEvent::Update,
                 ) => columns.iter().any(|column| {
-                    target_table
-                        .value()
-                        .get_column_by_name(&crate::util::normalize_ident(column.as_str()))
-                        .is_some_and(|(position, _)| updated_columns.contains(&position))
+                    updated_names.contains(&crate::util::normalize_ident(column.as_str()))
                 }),
                 _ => false,
             };

@@ -805,6 +805,9 @@ pub(crate) enum HirPlanSource {
         join_info: Option<HirJoinInfo>,
         /// The order the subquery's plan returns its rows in.
         output_order: Vec<crate::translate::optimizer::order::HirOutputOrder>,
+        /// A LATERAL subquery that reads sources of the same FROM clause:
+        /// it runs again for each of their rows, after all of them.
+        lateral: bool,
     },
     Cte {
         source: crate::translate::semantic::hir::SourceId,
@@ -836,6 +839,12 @@ impl HirPlanSource {
             | Self::RecursiveCte { source, .. }
             | Self::RecursiveInput { source, .. } => *source,
         }
+    }
+
+    /// Whether this is a LATERAL subquery that reads sources of its own
+    /// FROM clause.
+    pub(crate) fn is_lateral(&self) -> bool {
+        matches!(self, Self::Derived { lateral: true, .. })
     }
 
     pub(crate) fn join_info_mut(&mut self) -> Option<&mut HirJoinInfo> {
@@ -910,6 +919,24 @@ impl<I, H, E, J> PlannedSource<I, H, E, J> {
             }
             Self::index_covers_columns(index, btree, &required_columns)
         }
+    }
+
+    /// Whether the index holds every column the query reads from the table,
+    /// without counting the expressions it keys. A row the join
+    /// NULL-extends reads NULL from every column, so an expression the index
+    /// supplies must be computed from the NULL columns instead: `coalesce(v,
+    /// -1)` is -1 on that row, not the stored key.
+    pub(crate) fn index_covers_columns_without_expressions(&self, index: &Index) -> bool {
+        let Table::BTree(btree) = &self.table else {
+            return false;
+        };
+        if index.index_method.is_some() {
+            return false;
+        }
+        if self.col_used_mask.is_empty() {
+            return index.where_clause.is_none();
+        }
+        Self::index_covers_columns(index, btree, &self.col_used_mask)
     }
 
     /// Remove columns fully supplied by expression keys in this index.
@@ -1030,6 +1057,13 @@ impl
             normalized_expr: Box::new(expression),
             columns_mask,
         });
+    }
+
+    /// Whether the index stores every column the query reads from this
+    /// source as a column. An index storing only an expression of a column
+    /// does not count: a hash build input copies the column itself.
+    pub(crate) fn index_stores_read_columns(&self, index: &Index) -> bool {
+        self.index_is_covering_with(index, |_, _| false)
     }
 
     pub(crate) fn index_is_covering(

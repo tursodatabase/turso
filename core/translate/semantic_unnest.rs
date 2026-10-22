@@ -979,9 +979,9 @@ fn try_semi_or_anti_join(
         }
         let sources = expression_sources(term);
         let reads_outer = sources.iter().any(|source| *source != inner_source);
-        // A term that reads the outer row must be an `=` between the inner
-        // source and outer sources.
-        if reads_outer && !is_inner_outer_equality(term, inner_source) {
+        // A term that reads the outer row must be a comparison between
+        // the inner source and outer sources.
+        if reads_outer && !is_inner_outer_comparison(term, inner_source) {
             return false;
         }
         // Every NOT EXISTS term must read the inner source. Moving a
@@ -1046,12 +1046,12 @@ fn push_join_before_semi_anti(from: &mut hir::From, join: hir::Join) {
     from.joins.insert(first_semi_anti, join);
 }
 
-/// Whether one side of an `=` reads only the inner source and the other
-/// only outer sources.
-fn is_inner_outer_equality(expression: &hir::Expr, inner_source: SourceId) -> bool {
+/// Whether one side of a comparison reads only the inner source and the
+/// other only outer sources.
+fn is_inner_outer_comparison(expression: &hir::Expr, inner_source: SourceId) -> bool {
     let hir::Expr::Binary {
         lhs,
-        operator: Operator::Equals,
+        operator,
         rhs,
         custom: None,
         ..
@@ -1059,6 +1059,9 @@ fn is_inner_outer_equality(expression: &hir::Expr, inner_source: SourceId) -> bo
     else {
         return false;
     };
+    if !operator.is_comparison() {
+        return false;
+    }
     let side = |expression: &hir::Expr| {
         let sources = expression_sources(expression);
         if sources.is_empty() {

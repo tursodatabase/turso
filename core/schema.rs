@@ -2849,6 +2849,10 @@ impl Schema {
 
         let mut out = Vec::try_with_capacity_ext(child.foreign_keys.len())?;
         for fk in &child.foreign_keys {
+            // An UPDATE that leaves a constraint's child key alone never
+            // checks it, so a parent it cannot resolve is not an error. A
+            // self-referencing constraint is always resolved, as its parent
+            // key may be the one that changes.
             if let Some(updated_cols) = updated_cols {
                 let is_self_ref = fk.parent_table.eq_ignore_ascii_case(&child.name);
                 if !is_self_ref && !fk.child_key_assigned(&child, updated_cols) {

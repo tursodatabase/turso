@@ -89,6 +89,11 @@ pub struct Constraint<E = ast::Expr> {
     /// many NULL keys, so such a constraint can match many rows and its cost
     /// and row estimates must not be taken from equality statistics.
     pub null_matching: bool,
+    /// Whether the term may drive this source's loop: an ON term of the
+    /// source's own outer join, or any term on a source no outer join
+    /// NULL-extends. A WHERE term on a NULL-extended source stays a filter
+    /// that also runs on the NULL row, so an IN seek cannot use it.
+    pub outer_join_compatible: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -497,6 +502,8 @@ fn hir_binary_constraints_for_term(
             comparison_affinity: part.comparison_affinity,
             comparison_collation: part.comparison_collation,
             null_matching,
+            outer_join_compatible: term.from_outer_join == Some(source)
+                || !from.outer_join_may_null_extend(source),
         });
     }
     Ok(constraints)
@@ -580,6 +587,8 @@ fn hir_is_null_constraint_for_term(
         comparison_affinity: None,
         comparison_collation: None,
         null_matching: true,
+        outer_join_compatible: term.from_outer_join == Some(source)
+            || !from.outer_join_may_null_extend(source),
     }))
 }
 
@@ -1004,12 +1013,15 @@ fn hir_in_list_constraint_for_term(
         comparison_affinity: Some(comparison_affinity),
         comparison_collation,
         null_matching: false,
+        outer_join_compatible: term.from_outer_join == Some(source)
+            || !from.outer_join_may_null_extend(source),
     }))
 }
 
 #[allow(clippy::too_many_arguments)]
 fn hir_in_query_constraint_for_term(
     document: &hir::HirDocument,
+    from: &impl HirFromScope,
     term_position: usize,
     term: &HirWhereTerm,
     constraint_source: HirConstraintSource<'_>,
@@ -1081,6 +1093,8 @@ fn hir_in_query_constraint_for_term(
         comparison_affinity: Some(comparison_affinity),
         comparison_collation,
         null_matching: false,
+        outer_join_compatible: term.from_outer_join == Some(source)
+            || !from.outer_join_may_null_extend(source),
     }))
 }
 
@@ -1122,6 +1136,7 @@ pub(crate) fn hir_constraints_for_source(
         }
         if let Some(constraint) = hir_in_query_constraint_for_term(
             document,
+            from,
             term_position,
             term,
             constraint_source,
@@ -1209,10 +1224,12 @@ pub(crate) fn hir_constraints_for_source(
         let constrained_column = constraint
             .table_col_pos
             .and_then(|position| table.table.columns().get(position));
-        if matches!(
-            (constraint.comparison_collation, constrained_column),
-            (Some(comparison), Some(column)) if comparison != column.collation()
-        ) {
+        // A comparison without a collation of its own compares as BINARY,
+        // so an index of a column declared with another collation does not
+        // order it.
+        if constrained_column.is_some_and(|column| {
+            constraint.comparison_collation.unwrap_or_default() != column.collation()
+        }) {
             constraint.usable = false;
             continue;
         }
@@ -2096,6 +2113,7 @@ mod tests {
             lhs_mask: TableMask::default(),
             selectivity: 0.1,
             usable: true,
+            outer_join_compatible: true,
             is_rowid: false,
             comparison_affinity: Some(Affinity::Integer),
             comparison_collation: None,
@@ -2131,6 +2149,7 @@ mod tests {
                 comparison_affinity: Some(Affinity::Integer),
                 comparison_collation: None,
                 null_matching: false,
+                outer_join_compatible: true,
             }],
             candidates: vec![ConstraintUseCandidate {
                 index: None,
@@ -2171,11 +2190,12 @@ mod tests {
                 .collect::<Vec<_>>(),
             [3]
         );
+        // A rowid IN seek compares as NUMERIC, like any numeric column.
         assert!(matches!(
             access_method.params,
             crate::translate::optimizer::access_method::AccessMethodParams::InSeek {
                 index: None,
-                affinity: Affinity::Integer,
+                affinity: Affinity::Numeric,
                 where_term_idx: 3,
             }
         ));
@@ -2200,6 +2220,7 @@ mod tests {
                 comparison_affinity: Some(Affinity::Integer),
                 comparison_collation: None,
                 null_matching: false,
+                outer_join_compatible: true,
             }],
             candidates: vec![ConstraintUseCandidate {
                 index: None,
@@ -2658,6 +2679,7 @@ mod tests {
 
         let fallback = hir_in_query_constraint_for_term(
             &document,
+            &from,
             0,
             &term,
             HirConstraintSource::BTree(&table),
@@ -2677,6 +2699,7 @@ mod tests {
         let correlated = hir_document_with_query(source, query, vec![captured]);
         assert!(hir_in_query_constraint_for_term(
             &correlated,
+            &from,
             0,
             &HirWhereTerm {
                 expr: expression,

@@ -10,10 +10,7 @@ use std::num::NonZeroUsize;
 
 use turso_parser::ast::{ResolveType, TriggerTime};
 
-use super::emit::{
-    any_effective_replace, constraint_may_abort, format_unique_violation_desc,
-    halt_desc_and_on_error,
-};
+use super::emit::{any_effective_replace, constraint_may_abort, format_unique_violation_desc};
 use crate::{
     error::{SQLITE_CONSTRAINT_NOTNULL, SQLITE_CONSTRAINT_PRIMARYKEY, SQLITE_CONSTRAINT_UNIQUE},
     schema::{Column, EXPR_INDEX_SENTINEL},
@@ -31,7 +28,7 @@ use crate::{
     CaptureDataChangesExt, LimboError, Result,
 };
 
-use super::autoincrement::Sequence;
+use super::autoincrement::{Sequence, StatementSequence};
 use super::dml::{DmlTarget, ReturningBuffer, Subprograms};
 use super::fkey_action::CompiledAction;
 use super::trigger::{CompiledTrigger, TriggerRow};
@@ -215,14 +212,10 @@ pub(super) fn emit_insert(
         .as_ref()
         .map(|autoincrement| Sequence::new(autoincrement, target.database, table, mvcc))
         .transpose()?;
-    if several_rows {
-        if let Some(sequence) = &sequence {
-            sequence.ensure_row(program);
-        }
-    }
     let returning = ReturningBuffer::open(program, table, insert.returning.as_ref());
     let table_cursor = target.open_table_for_write(program);
     let index_cursors = target.open_indexes_for_write(program, None)?;
+    let sequence = sequence.as_ref().map(|sequence| sequence.begin(program));
     let row = InsertRow {
         target: &target,
         table_cursor,
@@ -332,6 +325,9 @@ pub(super) fn emit_insert(
         }
     }
     program.preassign_label_to_next_insn(done);
+    if let Some(sequence) = &sequence {
+        sequence.emit_end(program);
+    }
     target.emit_capture_commit(program)?;
     if let Some(returning) = returning {
         returning.emit_rows(program);
@@ -392,7 +388,26 @@ fn emit_virtual_insert(
     let conflict_action = insert
         .conflict
         .map_or(0, |conflict| conflict.bit_value() as u16);
-    program.begin_read_operation()?;
+    // The statement is a writer: while one of its native writes is pending,
+    // no other write statement or transaction end may start.
+    match document
+        .source(insert.target)
+        .and_then(|source| source.database)
+    {
+        Some(database) => {
+            let schema_version = document
+                .database(database)
+                .ok_or_else(|| {
+                    LimboError::InternalError(format!(
+                        "HIR INSERT target {} references missing database {database:?}",
+                        insert.target
+                    ))
+                })?
+                .schema_version;
+            program.begin_write_on_database(database.index(), schema_version)?;
+        }
+        None => program.begin_write_operation()?,
+    }
     let returning = ReturningBuffer::open_scratch(program, insert.returning.as_ref());
     let cursor = super::dml::open_virtual_for_write(program, table);
     let resolved_table = match document.source(insert.target).map(|source| &source.kind) {
@@ -743,7 +758,7 @@ struct InsertRow<'a> {
     /// False under `PRAGMA ignore_check_constraints`.
     enforce_checks: bool,
     /// AUTOINCREMENT: the target's sequence.
-    sequence: Option<&'a Sequence>,
+    sequence: Option<&'a StatementSequence<'a>>,
     /// The UPDATE triggers an UPSERT's DO UPDATE fires.
     upsert_triggers: &'a [CompiledTrigger],
     /// The ON UPDATE actions of each UPSERT clause's DO UPDATE.
@@ -766,7 +781,7 @@ impl InsertRow<'_> {
     ) -> Result<()> {
         let document = self.target.document;
         let table = self.target.table;
-        let sequence = self.sequence.map(|sequence| sequence.open(program));
+        let sequence = self.sequence;
         let emit_value = |program: &mut ProgramBuilder, position: usize, register: usize| {
             match values {
                 RowValues::Expressions(values) => {
@@ -938,10 +953,21 @@ impl InsertRow<'_> {
         if let (Some(sequence), Some(_)) = (&sequence, rowid_value) {
             sequence.emit_given_rowid(program, self.rowid)?;
         }
+        if let Some(sequence) = &sequence {
+            sequence.emit_visible_to_triggers(program);
+        }
 
         // CHECK constraints, index expressions, partial-index WHERE terms
         // and RETURNING read the new row.
         self.bind_new_row(program);
+        // NOT NULL of the stored columns comes first: under REPLACE a NULL
+        // becomes the column's DEFAULT, which the generated columns, the
+        // CHECK constraints and the index keys must see.
+        for (position, column) in table.columns().iter().enumerate() {
+            if column.notnull() && !column.is_rowid_alias() && !column.is_virtual_generated() {
+                self.emit_notnull_check(program, position, column, row_done)?;
+            }
+        }
         super::dml::emit_virtual_columns(
             program,
             document,
@@ -949,7 +975,13 @@ impl InsertRow<'_> {
             table,
             self.columns,
         )?;
-        // CHECK constraints run once the rowid is known, before NOT NULL.
+        super::dml::emit_strict_generated_check(program, table, self.columns);
+        for (position, column) in table.columns().iter().enumerate() {
+            if column.notnull() && column.is_virtual_generated() {
+                self.emit_notnull_check(program, position, column, row_done)?;
+            }
+        }
+        // CHECK constraints run after NOT NULL, as in SQLite.
         if self.enforce_checks {
             super::dml::emit_check_constraints(
                 program,
@@ -958,11 +990,6 @@ impl InsertRow<'_> {
                 self.or_conflict,
                 row_done,
             )?;
-        }
-        for (position, column) in table.columns().iter().enumerate() {
-            if column.notnull() && !column.is_rowid_alias() {
-                self.emit_notnull_check(program, position, column, row_done)?;
-            }
         }
         // The constraints an UPSERT names are checked first, in the
         // UPSERT's order, then the rowid and the indexes.
@@ -1114,9 +1141,6 @@ impl InsertRow<'_> {
             self.target.database,
             self.may_replace(),
         )?;
-        if let Some(sequence) = &sequence {
-            sequence.emit_close(program, self.rowid);
-        }
         // The change is captured after the AFTER triggers ran.
         if let Some(capture) = &self.target.capture {
             let after = capture.after_record(program, table, self.columns, self.rowid);
@@ -1327,6 +1351,7 @@ impl InsertRow<'_> {
             },
         );
         super::dml::emit_virtual_columns(program, document, new_source.id, table, new_row)?;
+        super::dml::emit_strict_generated_check(program, table, new_row);
         // Every CHECK constraint is checked with ABORT.
         if self.enforce_checks {
             super::dml::emit_check_constraints(
@@ -1406,6 +1431,15 @@ impl InsertRow<'_> {
                 rowid_reg: conflict,
                 target_pc: row_done,
             });
+            // The trigger may have changed the columns the UPDATE does not
+            // set, so they are read again, as stored, and the generated
+            // columns are computed again from them.
+            for (position, (column, value)) in table.columns().iter().zip(&values).enumerate() {
+                if value.is_none() && !column.is_rowid_alias() && !column.is_virtual_generated() {
+                    program.emit_column_or_rowid(self.table_cursor, position, new_row + position);
+                }
+            }
+            super::dml::emit_virtual_columns(program, document, new_source.id, table, new_row)?;
         }
         // A new rowid must not belong to another row; this is checked with
         // ABORT before the indexes.
@@ -2039,15 +2073,10 @@ impl InsertRow<'_> {
                     .get_rowid_alias_column()
                     .and_then(|(_, column)| column.name.clone())
                     .unwrap_or_else(|| "rowid".to_string());
-                let (description, on_error) = halt_desc_and_on_error(
-                    &format!("{}.{column}", table.name),
-                    conflict,
-                    self.has_statement_conflict,
-                );
                 program.emit_insn(Insn::Halt {
                     err_code: SQLITE_CONSTRAINT_PRIMARYKEY,
-                    description,
-                    on_error,
+                    description: format!("{}.{column}", table.name),
+                    on_error: program.constraint_halt_on_error(conflict),
                     description_reg: None,
                 });
             }
@@ -2115,12 +2144,10 @@ impl InsertRow<'_> {
                     .map(|(name, _)| format!("{}.{name}", table.name))
                     .collect::<Vec<_>>()
                     .join(", ");
-                let (description, on_error) =
-                    halt_desc_and_on_error(&columns, conflict, self.has_statement_conflict);
                 program.emit_insn(Insn::Halt {
                     err_code: SQLITE_CONSTRAINT_PRIMARYKEY,
-                    description,
-                    on_error,
+                    description: columns,
+                    on_error: program.constraint_halt_on_error(conflict),
                     description_reg: None,
                 });
             }
@@ -2252,15 +2279,10 @@ impl InsertRow<'_> {
                     self.emit_replace_delete(program, index_cursors, conflicting)?;
                 }
                 conflict => {
-                    let (description, on_error) = halt_desc_and_on_error(
-                        &format_unique_violation_desc(&table.name, index),
-                        conflict,
-                        self.has_statement_conflict,
-                    );
                     program.emit_insn(Insn::Halt {
                         err_code: SQLITE_CONSTRAINT_UNIQUE,
-                        description,
-                        on_error,
+                        description: format_unique_violation_desc(&table.name, index),
+                        on_error: program.constraint_halt_on_error(conflict),
                         description_reg: None,
                     });
                 }
@@ -2636,9 +2658,14 @@ mod tests {
             1
         );
         assert!(writes_sequence(&program) > 0);
-        // A rowid from the statement raises the sequence too.
+        // A rowid from the statement raises the largest rowid too, and the
+        // sequence is written the same way, when the statement ends.
         let given = emit("INSERT INTO counted VALUES (5, 1)");
-        assert!(writes_sequence(&given) > writes_sequence(&program));
+        assert_eq!(writes_sequence(&given), writes_sequence(&program));
+        assert_eq!(
+            count(&given, |insn| matches!(insn, Insn::MemMax { .. })),
+            count(&program, |insn| matches!(insn, Insn::MemMax { .. })) + 1
+        );
     }
 
     #[test]

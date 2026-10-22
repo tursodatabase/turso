@@ -529,7 +529,10 @@ pub(crate) fn emit_disk_setval(
         cursor: cursor_id,
         key_reg: start_reg + 1,
         record_reg,
-        flag: InsertFlags::new().require_seek().skip_all_change_counts(),
+        flag: InsertFlags::new()
+            .require_seek()
+            .skip_all_change_counts()
+            .skip_last_rowid(),
         table_name: seq_name.to_string(),
     });
     program.emit_insn(Insn::SetSequenceCurrval {

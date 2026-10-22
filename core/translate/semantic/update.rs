@@ -114,7 +114,11 @@ impl<'ast> Analyzer<'_, '_, 'ast> {
             hir::UpdateTargetKind::BTree {
                 defaults: self.analyze_replace_defaults(target, table.value())?,
                 triggers: self.analyze_update_triggers(&table, &assignments)?,
-                foreign_keys: self.analyze_dml_foreign_keys(&table, new_source)?,
+                foreign_keys: self.analyze_dml_foreign_keys(
+                    &table,
+                    new_source,
+                    Some(&updated_column_mask(table.value(), &assignments)?),
+                )?,
                 autoincrement: self.analyze_autoincrement(&table)?,
                 capture_changes: self.analyze_capture_changes(&table)?,
             }
@@ -151,17 +155,12 @@ impl<'ast> Analyzer<'_, '_, 'ast> {
         table: &hir::ResolvedTable,
         assignments: &[hir::Assignment],
     ) -> Result<Vec<hir::ResolvedTrigger>> {
-        let updated_columns = assignments
+        let updated_names = assignments
             .iter()
-            .flat_map(|assignment| assignment.columns.iter())
-            .filter_map(|column| match column {
-                hir::TargetColumn::Column(column) => Some(*column),
-                hir::TargetColumn::RowId => None,
-            })
+            .flat_map(|assignment| assignment.names.iter().cloned())
             .collect::<Vec<_>>();
-        let target = table.value();
         self.table_triggers(table, |trigger| {
-            trigger_matches_update(trigger, target, &updated_columns)
+            trigger_matches_update(trigger, &updated_names)
         })
     }
 
@@ -299,6 +298,11 @@ impl<'ast> Analyzer<'_, '_, 'ast> {
                         .iter()
                         .map(|name| resolve_update_target(table, name))
                         .collect::<Result<Vec<_>>>()?;
+                    let names = set
+                        .col_names
+                        .iter()
+                        .map(|name| normalize_ident(name.as_str()))
+                        .collect::<Vec<_>>();
                     let expected_outputs = columns
                         .iter()
                         .map(|column| self.write_target_type(new_source, table, *column))
@@ -326,7 +330,7 @@ impl<'ast> Analyzer<'_, '_, 'ast> {
                             output_width
                         );
                     }
-                    merge_update_row_assignment(&mut assignments, columns, query)?;
+                    merge_update_row_assignment(&mut assignments, columns, names, query)?;
                     continue;
                 }
             }
@@ -374,7 +378,12 @@ impl<'ast> Analyzer<'_, '_, 'ast> {
                     )?
                     .expr
                 };
-                merge_update_assignment(&mut assignments, column, value)?;
+                merge_update_assignment(
+                    &mut assignments,
+                    column,
+                    normalize_ident(name.as_str()),
+                    value,
+                )?;
             }
         }
         Ok(assignments)
@@ -404,6 +413,7 @@ fn resolve_update_target(table: &Table, name: &ast::Name) -> Result<hir::TargetC
 fn merge_update_assignment(
     assignments: &mut Vec<hir::Assignment>,
     column: hir::TargetColumn,
+    name: String,
     mut value: hir::Expr,
 ) -> Result<()> {
     split_overlapping_row_assignment(assignments, column)?;
@@ -413,10 +423,16 @@ fn merge_update_assignment(
     else {
         assignments.push(hir::Assignment {
             columns: vec![column],
+            names: vec![name],
             value,
         });
         return Ok(());
     };
+    // Every name the column was set under fires its `UPDATE OF` triggers:
+    // `SET oid = 7, rowid = 8` fires triggers on both names.
+    if !existing.names.iter().any(|known| known == &name) {
+        existing.names.push(name);
+    }
 
     if let hir::Expr::Function(call) = &mut value {
         if matches!(
@@ -437,6 +453,7 @@ fn merge_update_assignment(
 fn merge_update_row_assignment(
     assignments: &mut Vec<hir::Assignment>,
     columns: Vec<hir::TargetColumn>,
+    names: Vec<String>,
     query: hir::QueryId,
 ) -> Result<()> {
     if columns
@@ -444,10 +461,11 @@ fn merge_update_row_assignment(
         .enumerate()
         .any(|(index, column)| columns[..index].contains(column))
     {
-        for (output, column) in columns.into_iter().enumerate() {
+        for (output, (column, name)) in columns.into_iter().zip(names).enumerate() {
             merge_update_assignment(
                 assignments,
                 column,
+                name,
                 hir::Expr::Subquery(hir::SubqueryExpr::Scalar { query, output }),
             )?;
         }
@@ -465,6 +483,7 @@ fn merge_update_row_assignment(
     });
     assignments.push(hir::Assignment {
         columns,
+        names,
         value: hir::Expr::Subquery(hir::SubqueryExpr::Row { query }),
     });
     Ok(())
@@ -485,11 +504,17 @@ fn split_overlapping_row_assignment(
             "multi-column UPDATE assignment is not a row subquery".to_string(),
         ));
     };
-    for (output, column) in assignment.columns.into_iter().enumerate() {
+    for (output, (column, name)) in assignment
+        .columns
+        .into_iter()
+        .zip(assignment.names)
+        .enumerate()
+    {
         assignments.insert(
             index + output,
             hir::Assignment {
                 columns: vec![column],
+                names: vec![name],
                 value: hir::Expr::Subquery(hir::SubqueryExpr::Scalar { query, output }),
             },
         );
@@ -507,5 +532,34 @@ fn row_assignment_subquery(mut expression: &ast::Expr) -> Option<&ast::Select> {
     match expression {
         ast::Expr::Subquery(select) => Some(select),
         _ => None,
+    }
+}
+
+/// The columns `assignments` change, as a mask over the table's columns:
+/// the SET columns, the INTEGER PRIMARY KEY for a rowid assignment, and the
+/// generated columns they feed.
+fn updated_column_mask(
+    table: &Table,
+    assignments: &[hir::Assignment],
+) -> Result<crate::translate::plan::ColumnMask> {
+    let mut mask = crate::translate::plan::ColumnMask::default();
+    for column in assignments
+        .iter()
+        .flat_map(|assignment| assignment.columns.iter())
+    {
+        let position = match column {
+            hir::TargetColumn::Column(position) => Some(*position),
+            hir::TargetColumn::RowId => table
+                .columns()
+                .iter()
+                .position(crate::schema::Column::is_rowid_alias),
+        };
+        if let Some(position) = position {
+            mask.set(position)?;
+        }
+    }
+    match table {
+        Table::BTree(table) => table.columns_affected_by_update(mask.iter()),
+        _ => Ok(mask),
     }
 }

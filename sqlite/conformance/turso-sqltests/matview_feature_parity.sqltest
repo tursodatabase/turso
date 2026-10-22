@@ -445,7 +445,9 @@ expect {
 
 # A collation-sensitive aggregate result can itself become a downstream join
 # key. MIN shows the smallest member of its class under BINARY, and changes to
-# that member must preserve MIN's comparison semantics in the join.
+# that member must preserve the join's NOCASE comparison. The join names its
+# collation: as in SQLite, MIN(name) does not pass the NOCASE collation of
+# its argument on to the comparison.
 test matview-parity-collated-min-to-join {
     CREATE TABLE familiar_names(
       school TEXT,
@@ -461,7 +463,7 @@ test matview-parity-collated-min-to-join {
         FROM familiar_names
         GROUP BY school
       ) AS grouped
-      JOIN exact_familiars AS exact ON grouped.chosen = exact.name;
+      JOIN exact_familiars AS exact ON grouped.chosen = exact.name COLLATE NOCASE;
     SELECT 'init', * FROM chosen_familiars;
     DELETE FROM familiar_names WHERE name = 'A' COLLATE BINARY;
     SELECT 'after-delete', * FROM chosen_familiars;

@@ -229,7 +229,7 @@ impl<'ast> Analyzer<'_, '_, 'ast> {
                 defaults: self.analyze_insert_defaults(target, table.value(), &columns)?,
                 replace_defaults: self.analyze_replace_defaults(target, table.value())?,
                 triggers: self.analyze_insert_triggers(table, &upserts)?,
-                foreign_keys: self.analyze_dml_foreign_keys(table, target)?,
+                foreign_keys: self.analyze_dml_foreign_keys(table, target, None)?,
                 capture_changes: self.analyze_capture_changes(table)?,
             }
         };
@@ -333,9 +333,27 @@ impl<'ast> Analyzer<'_, '_, 'ast> {
             }
             _ => None,
         };
+        let table_name = table.value().get_name();
+        let inserts_into_table = |schema: &crate::schema::Schema| {
+            schema
+                .triggers
+                .values()
+                .flatten()
+                .flat_map(|trigger| trigger.commands.iter())
+                .any(|command| {
+                    matches!(command, ast::TriggerCmd::Insert { tbl_name, .. }
+                        if normalize_ident(tbl_name.as_str()).eq_ignore_ascii_case(table_name))
+                })
+        };
+        let temp = hir::DatabaseId::new(crate::TEMP_DB_ID);
+        let triggers_insert_into_table = inserts_into_table(self.context().schema(database)?)
+            || (database != temp
+                && self.context().has_temp_database()
+                && inserts_into_table(self.context().schema(temp)?));
         Ok(Some(hir::ResolvedAutoincrement {
             sqlite_sequence,
             mvcc_sequence,
+            triggers_insert_into_table,
         }))
     }
 
@@ -345,25 +363,23 @@ impl<'ast> Analyzer<'_, '_, 'ast> {
         upserts: &[hir::Upsert],
     ) -> Result<hir::InsertTriggers> {
         let mut has_upsert_update = false;
-        let mut updated_columns = Vec::new();
+        let mut updated_names = Vec::new();
         for upsert in upserts {
             if let hir::UpsertAction::Update { assignments, .. } = &upsert.action {
                 has_upsert_update = true;
-                updated_columns.extend(assignments.iter().flat_map(|assignment| {
-                    assignment.columns.iter().filter_map(|column| match column {
-                        hir::TargetColumn::Column(column) => Some(*column),
-                        hir::TargetColumn::RowId => None,
-                    })
-                }));
+                updated_names.extend(
+                    assignments
+                        .iter()
+                        .flat_map(|assignment| assignment.names.iter().cloned()),
+                );
             }
         }
         let insert = self.table_triggers(table, |trigger| {
             matches!(trigger.event, ast::TriggerEvent::Insert)
         })?;
         let upsert_update = if has_upsert_update {
-            let target = table.value();
             self.table_triggers(table, |trigger| {
-                trigger_matches_update(trigger, target, &updated_columns)
+                trigger_matches_update(trigger, &updated_names)
             })?
         } else {
             Vec::new()
@@ -447,10 +463,7 @@ impl<'ast> Analyzer<'_, '_, 'ast> {
         })?;
         let indexes = self
             .context()
-            .schema(database)?
-            .get_indices(table.value().get_name())
-            .cloned()
-            .collect::<Vec<_>>();
+            .table_indexes(database, table.value().get_name())?;
         let mut index_expressions = Vec::with_capacity(indexes.len());
         let mut index_ids = Vec::with_capacity(indexes.len());
         for index in indexes {
@@ -702,7 +715,9 @@ impl<'ast> Analyzer<'_, '_, 'ast> {
                             Ok(hir::ConflictTerm {
                                 collation: match resolved.collation {
                                     ExprCollation::Explicit(collation) => Some(collation),
-                                    ExprCollation::Absent | ExprCollation::Inherited(_) => None,
+                                    ExprCollation::Absent
+                                    | ExprCollation::Inherited(_)
+                                    | ExprCollation::InheritedBinary(_) => None,
                                 },
                                 expr: resolved.expr,
                             })
@@ -815,11 +830,19 @@ impl<'ast> Analyzer<'_, '_, 'ast> {
                     if matched[position] {
                         return false;
                     }
+                    // A column names an index column on it, generated or
+                    // not; an expression names only an expression column,
+                    // never a generated column that computes it.
+                    let key_column = &index.columns[position];
+                    let is_expression_column =
+                        key_column.pos_in_table == crate::schema::EXPR_INDEX_SENTINEL;
                     let same_key = match (target_column(expression), &expressions.columns[position])
                     {
-                        (Some(column), None) => index.columns[position].pos_in_table == column,
-                        (None, Some(key)) => key.equivalent(expression),
-                        _ => false,
+                        (Some(column), _) => {
+                            !is_expression_column && key_column.pos_in_table == column
+                        }
+                        (None, Some(key)) => is_expression_column && key.equivalent(expression),
+                        (None, None) => false,
                     };
                     same_key
                         && collation.is_none_or(|collation| collation == key_collation(position))
@@ -913,9 +936,18 @@ impl<'ast> Analyzer<'_, '_, 'ast> {
                     .iter_mut()
                     .find(|assignment| assignment.columns == [column])
                 {
-                    Some(existing) => existing.value = value,
+                    Some(existing) => {
+                        // Every name the column was set under fires its
+                        // `UPDATE OF` triggers.
+                        let name = normalize_ident(name.as_str());
+                        if !existing.names.contains(&name) {
+                            existing.names.push(name);
+                        }
+                        existing.value = value;
+                    }
                     None => assignments.push(hir::Assignment {
                         columns: vec![column],
+                        names: vec![normalize_ident(name.as_str())],
                         value,
                     }),
                 }

@@ -6,6 +6,7 @@ use crate::{
         optimizer::access_method::AccessMethodParams,
         optimizer::constraints::RangeConstraintRef,
         plan::{HirPlanSource, HirPlannedSource, IterationDirection},
+        planner::TableMask,
         semantic::hir,
     },
     LimboError, Result,
@@ -111,16 +112,25 @@ pub(crate) fn hir_plan_satisfies_order_target(
     order_target: &HirOrderTarget<'_>,
     schema: &Schema,
 ) -> Result<bool> {
-    // A hash join scans its probe table first and looks the build table up,
-    // so its loops do not run in the plan's join order, and the order of a
-    // hash join is never kept.
-    if plan.data.iter().any(|(_, method)| {
-        matches!(
-            access_methods.get(*method).map(|method| &method.params),
-            Some(AccessMethodParams::HashJoin { .. })
-        )
-    }) {
-        return Ok(false);
+    // A hash build is read into an unordered hash table, so its scan order
+    // never orders the output; the loops before the build keep theirs. A
+    // build input folds the loops before the probe into the table, so none
+    // of them orders the output, and an outer hash join emits its unmatched
+    // build rows in hash order.
+    let mut hash_build_sources = TableMask::default();
+    for (_, method) in &plan.data {
+        if let Some(AccessMethodParams::HashJoin {
+            build_table_idx,
+            join_type,
+            materialize_build_input,
+            ..
+        }) = access_methods.get(*method).map(|method| &method.params)
+        {
+            hash_build_sources.set(*build_table_idx)?;
+            if *materialize_build_input || join_type.keeps_unmatched_build_rows() {
+                return Ok(false);
+            }
+        }
     }
     // A RIGHT or FULL join adds its unmatched rows after every loop ends.
     let join_kind = |source_position: usize| {
@@ -140,6 +150,9 @@ pub(crate) fn hir_plan_satisfies_order_target(
     let columns = order_target.columns.len();
     let mut consumed_columns = 0;
     for (loop_position, (source_position, access_method_position)) in plan.data.iter().enumerate() {
+        if hash_build_sources.get(*source_position) {
+            return Ok(false);
+        }
         // A LEFT JOIN adds a NULL row after its scan or seek, so
         // its order cannot give the terms that read its own columns. The
         // terms before them keep the order of the loops before it.

@@ -24,17 +24,14 @@ use crate::{
         optimizer::cost_model_params,
         plan::QueryDestination,
         semantic::{
-            analyze_root,
+            analyze_root, compound_column_affinity,
             context::SemanticContext,
             hir::{self, HirDocument, HirRoot, OutputNameKind},
             SemanticRootInput,
         },
         semantic_to_plan::{HirPlan, HirRootPlan},
     },
-    vdbe::{
-        affinity::Affinity,
-        builder::{ProgramBuilder, SourceBinding},
-    },
+    vdbe::{affinity::Affinity, builder::ProgramBuilder},
     Connection, LimboError, Result,
 };
 
@@ -278,7 +275,8 @@ impl PlannedSelect {
             .output
             .iter()
             .zip(names)
-            .map(|(output, column)| {
+            .enumerate()
+            .map(|(position, (output, column))| {
                 let output = document.output(*output).ok_or_else(|| {
                     LimboError::InternalError("HIR CTAS output is missing".into())
                 })?;
@@ -291,7 +289,15 @@ impl PlannedSelect {
                     ResolvedResultValue::RowId { name, .. } if !column.name_is_alias => name,
                     _ => column.name,
                 };
-                Ok((name, output.schema_affinity.short_type_name()))
+                // Like SQLite, a compound SELECT's column takes the affinity
+                // its arms agree on; arms of different classes leave it
+                // without a declared type.
+                let affinity = if query.blocks.len() > 1 {
+                    compound_column_affinity(query, position, &|source| document.source(source)).0
+                } else {
+                    output.schema_affinity
+                };
+                Ok((name, affinity.short_type_name()))
             })
             .collect()
     }
@@ -545,12 +551,19 @@ fn check_target(
     {
         crate::bail_parse_error!("table {table_name} may not be modified");
     }
-    if schema.is_materialized_view(&table_name) {
+    // Materialized views live in the main database: a table of the same
+    // name in an attached database is an ordinary table.
+    let in_main = name
+        .namespace
+        .as_ref()
+        .is_none_or(|db| crate::util::normalize_ident(db.as_str()) == "main");
+    if in_main && schema.is_materialized_view(&table_name) {
         crate::bail_parse_error!("cannot modify materialized view {table_name}");
     }
-    if schema
-        .get_btree_table(&table_name)
-        .is_some_and(|table| !table.has_rowid)
+    if in_main
+        && schema
+            .get_btree_table(&table_name)
+            .is_some_and(|table| !table.has_rowid)
         && !schema
             .get_dependent_materialized_views(&table_name)
             .is_empty()
@@ -619,46 +632,10 @@ impl<'a> HirSession<'a> {
     }
 }
 
-/// Compile `expression` over `inputs.len()` values, which the program
-/// holds in registers `0..inputs.len()` when it runs, leaving the result
-/// in `target`. The expression reads input `n` as `Register(n)`.
-/// Materialized view maintenance will compile its operator expressions
-/// this way; nothing uses it until that is rebuilt over HIR.
-#[allow(dead_code)]
-pub(crate) fn translate_register_expression(
-    program: &mut ProgramBuilder,
-    expression: &ast::Expr,
-    inputs: &[String],
-    schema: &Arc<Schema>,
-    symbols: &crate::SymbolTable,
-    connection: &Arc<Connection>,
-    target: usize,
-) -> Result<()> {
-    // The expression is SQLite text over the main schema, whatever the
-    // database's dialect or the prepare call's search path.
-    let dialect: Arc<dyn crate::dialect::Dialect> = Arc::new(crate::dialect::SqliteDialect);
-    let catalog = crate::translate::capture_catalog(schema, connection, dialect.as_ref(), None)?;
-    let context = crate::translate::semantic_context(&catalog, symbols, connection, dialect)?;
-    let document =
-        HirSession::new(&context, connection).analyze(SemanticRootInput::RegisterExpressions {
-            inputs,
-            expressions: std::slice::from_ref(expression),
-        })?;
-    let HirRoot::SchemaExpressions(root) = &document.root else {
-        return Err(LimboError::InternalError(
-            "register expression analysis did not produce an expression root".into(),
-        ));
-    };
-    program.bind_source(
-        root.source,
-        SourceBinding::Registers {
-            start: 0,
-            rowid: None,
-        },
-    );
-    expr::translate_expr_no_constant_opt(program, &document, &root.expressions[0], target)?;
-    Ok(())
-}
+/// The expression lowering, for materialized view maintenance programs,
+/// whose operators lower the analyzed expressions of a view's query over
+/// register-bound stream values.
+pub(crate) use expr::{translate_condition_expr, translate_expr_no_constant_opt};
 
 /// Make each output in `positions` of a scan's one query block read the
 /// scanned table's rowid.

@@ -71,6 +71,18 @@ pub(crate) struct SemanticContext<'catalog> {
     /// See [super::SemanticOptions::long_column_names].
     long_column_names: bool,
     snapshot: CatalogSnapshot,
+    /// A table definition that stands in for the catalog's while a schema
+    /// statement rewrites it: ALTER COLUMN validates constraints and refills
+    /// indexes against the table as it will be, before the catalog has it.
+    altered_table: Option<AlteredTable>,
+}
+
+/// See [`SemanticContext::with_altered_table`].
+#[derive(Clone)]
+struct AlteredTable {
+    database: DatabaseId,
+    table: Arc<Table>,
+    indexes: Vec<Arc<Index>>,
 }
 
 impl<'catalog> SemanticContext<'catalog> {
@@ -184,7 +196,85 @@ impl<'catalog> SemanticContext<'catalog> {
             capture_changes_table: None,
             long_column_names: false,
             snapshot: CatalogSnapshot::from_id(snapshot),
+            altered_table: None,
         })
+    }
+
+    /// This context with every unqualified name resolved in `database`
+    /// alone, the way a view's body resolves its names: a TEMP table does
+    /// not shadow a table of the view's own database.
+    pub(crate) fn scoped_to_database(&self, database: DatabaseId) -> Self {
+        Self {
+            catalog: self.catalog,
+            main_schema: self.main_schema,
+            database_schemas: self.database_schemas.clone(),
+            symbols: self.symbols,
+            custom_types_enabled: self.custom_types_enabled,
+            dialect: self.dialect.clone(),
+            database_names: self.database_names.clone(),
+            unqualified_database_search_path: vec![database],
+            has_temp_database: false,
+            search_path_configured: self.search_path_configured,
+            dqs_dml: self.dqs_dml,
+            foreign_keys_enabled: self.foreign_keys_enabled,
+            capture_changes_table: self.capture_changes_table.clone(),
+            long_column_names: self.long_column_names,
+            snapshot: self.snapshot,
+            altered_table: self.altered_table.clone(),
+        }
+    }
+
+    /// This context with `table` and its `indexes` read in place of the
+    /// catalog's table of the same name in `database`.
+    pub(crate) fn with_altered_table(
+        &self,
+        database: DatabaseId,
+        table: Arc<Table>,
+        indexes: Vec<Arc<Index>>,
+    ) -> Self {
+        Self {
+            catalog: self.catalog,
+            main_schema: self.main_schema,
+            database_schemas: self.database_schemas.clone(),
+            symbols: self.symbols,
+            custom_types_enabled: self.custom_types_enabled,
+            dialect: self.dialect.clone(),
+            database_names: self.database_names.clone(),
+            unqualified_database_search_path: self.unqualified_database_search_path.clone(),
+            has_temp_database: self.has_temp_database,
+            search_path_configured: self.search_path_configured,
+            dqs_dml: self.dqs_dml,
+            foreign_keys_enabled: self.foreign_keys_enabled,
+            capture_changes_table: self.capture_changes_table.clone(),
+            long_column_names: self.long_column_names,
+            snapshot: self.snapshot,
+            altered_table: Some(AlteredTable {
+                database,
+                table,
+                indexes,
+            }),
+        }
+    }
+
+    /// The indexes of `table_name` in `database`, other than the ones that
+    /// back a table.
+    pub(crate) fn table_indexes(
+        &self,
+        database: DatabaseId,
+        table_name: &str,
+    ) -> Result<Vec<Arc<Index>>> {
+        if let Some(altered) = &self.altered_table {
+            if altered.database == database
+                && altered.table.get_name().eq_ignore_ascii_case(table_name)
+            {
+                return Ok(altered.indexes.clone());
+            }
+        }
+        Ok(self
+            .schema(database)?
+            .get_indices(table_name)
+            .cloned()
+            .collect())
     }
 
     pub(crate) fn with_temp_database(mut self, has_temp_database: bool) -> Self {
@@ -282,8 +372,9 @@ impl<'catalog> SemanticContext<'catalog> {
             return self.resolve_database_id(qualified_name);
         }
         self.unqualified_database_search_path
-            .first()
+            .iter()
             .map(|database| database.index())
+            .find(|database| *database != crate::TEMP_DB_ID)
             .ok_or_else(|| {
                 LimboError::ParseError("no schema has been selected to create in".to_string())
             })
@@ -478,8 +569,35 @@ impl<'catalog> SemanticContext<'catalog> {
         snapshots
     }
 
-    /// Whether `name` resolves to a table, without reporting a missing one.
-    pub(crate) fn table_exists(&self, name: &turso_parser::ast::QualifiedName) -> Result<bool> {
+    /// The databases an unqualified name `table_name` is looked up in, in
+    /// order. Inside the body of a view of database `view_database`, only
+    /// that database, except that a TEMP view may name any database and the
+    /// schema table of a TEMP view is main's.
+    fn unqualified_databases(
+        &self,
+        table_name: &str,
+        view_database: Option<DatabaseId>,
+    ) -> Vec<DatabaseId> {
+        match view_database {
+            Some(database) if database.index() != TEMP_DB_ID => vec![database],
+            Some(_) if schema_table_database(table_name).is_some() => {
+                vec![DatabaseId::new(MAIN_DB_ID)]
+            }
+            _ => schema_table_database(table_name)
+                .filter(|database| self.unqualified_database_search_path.contains(database))
+                .map(|database| vec![database])
+                .unwrap_or_else(|| self.unqualified_database_search_path.clone()),
+        }
+    }
+
+    /// Whether `name` resolves to a table, without reporting a missing one,
+    /// with unqualified names looked up as inside a
+    /// view of `view_database`.
+    pub(crate) fn table_exists_in(
+        &self,
+        name: &turso_parser::ast::QualifiedName,
+        view_database: Option<DatabaseId>,
+    ) -> Result<bool> {
         let table_name = normalize_ident(name.name.as_str());
         Ok(match &name.namespace {
             Some(database) => {
@@ -492,7 +610,7 @@ impl<'catalog> SemanticContext<'catalog> {
                 self.schema(database)?.get_table(&table_name).is_some()
             }
             None => self
-                .unqualified_database_search_path
+                .unqualified_databases(&table_name, view_database)
                 .iter()
                 .any(|database| {
                     self.database_schemas
@@ -503,11 +621,13 @@ impl<'catalog> SemanticContext<'catalog> {
     }
 
     /// Find a view by name when no table has it, searching databases in the
-    /// same order as tables.
-    pub(crate) fn resolve_view(
+    /// same order as tables, with unqualified names looked up as inside a
+    /// view of `view_database`. Returns the database the view is in.
+    pub(crate) fn resolve_view_in(
         &self,
         name: &turso_parser::ast::QualifiedName,
-    ) -> Result<Option<&'catalog crate::schema::View>> {
+        view_database: Option<DatabaseId>,
+    ) -> Result<Option<(DatabaseId, &'catalog crate::schema::View)>> {
         let view_name = normalize_ident(name.name.as_str());
         let has_view = |database: &DatabaseId| {
             self.database_schemas
@@ -522,20 +642,34 @@ impl<'catalog> SemanticContext<'catalog> {
                 ))
             })?),
             None => self
-                .unqualified_database_search_path
-                .iter()
-                .copied()
+                .unqualified_databases(&view_name, view_database)
+                .into_iter()
                 .find(has_view),
         };
-        Ok(database
-            .and_then(|database| self.database_schemas.get(&database).copied())
+        let Some(database) = database else {
+            return Ok(None);
+        };
+        Ok(self
+            .database_schemas
+            .get(&database)
+            .copied()
             .and_then(|schema| schema.views.get(&view_name))
-            .map(AsRef::as_ref))
+            .map(|view| (database, view.as_ref())))
     }
 
     pub(crate) fn resolve_table(
         &self,
         name: &turso_parser::ast::QualifiedName,
+    ) -> Result<(DatabaseId, Arc<Table>)> {
+        self.resolve_table_in(name, None)
+    }
+
+    /// [`Self::resolve_table`] with unqualified names looked up as inside a
+    /// view of `view_database`.
+    pub(crate) fn resolve_table_in(
+        &self,
+        name: &turso_parser::ast::QualifiedName,
+        view_database: Option<DatabaseId>,
     ) -> Result<(DatabaseId, Arc<Table>)> {
         let table_name = normalize_ident(name.name.as_str());
         let database = match &name.namespace {
@@ -545,20 +679,23 @@ impl<'catalog> SemanticContext<'catalog> {
                     normalize_ident(database.as_str())
                 ))
             })?,
-            None => schema_table_database(&table_name)
-                .filter(|database| self.unqualified_database_search_path.contains(database))
-                .or_else(|| {
-                    self.unqualified_database_search_path
-                        .iter()
-                        .copied()
-                        .find(|database| {
-                            self.database_schemas
-                                .get(database)
-                                .is_some_and(|schema| schema.get_table(&table_name).is_some())
-                        })
+            None => self
+                .unqualified_databases(&table_name, view_database)
+                .into_iter()
+                .find(|database| {
+                    self.database_schemas
+                        .get(database)
+                        .is_some_and(|schema| schema.get_table(&table_name).is_some())
                 })
                 .ok_or_else(|| no_such_table(name))?,
         };
+        if let Some(altered) = &self.altered_table {
+            if altered.database == database
+                && altered.table.get_name().eq_ignore_ascii_case(&table_name)
+            {
+                return Ok((database, altered.table.clone()));
+            }
+        }
         let table = self
             .schema(database)?
             .get_table(&table_name)
