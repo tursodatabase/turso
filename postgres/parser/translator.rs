@@ -2741,15 +2741,24 @@ impl PostgreSQLTranslator {
                                     if col_ref.fields.len() == 1 {
                                         // SELECT *
                                         result_columns.push(ast::ResultColumn::Star);
-                                    } else if let Some(first) = col_ref.fields.first() {
-                                        // SELECT table.* or alias.*
-                                        if let Some(pg_query::protobuf::node::Node::String(s)) =
-                                            &first.node
-                                        {
-                                            result_columns.push(ast::ResultColumn::TableStar(
-                                                ast::Name::from_string(&s.sval),
+                                    } else {
+                                        // SELECT table.* or alias.*. A schema-qualified
+                                        // s.t.* would otherwise expand the wrong name.
+                                        let [table, _] = col_ref.fields.as_slice() else {
+                                            return Err(not_supported(
+                                                "schema.table.* in a select list",
                                             ));
-                                        }
+                                        };
+                                        let Some(pg_query::protobuf::node::Node::String(s)) =
+                                            &table.node
+                                        else {
+                                            return Err(ParseError::ParseError(
+                                                "invalid table.* reference".into(),
+                                            ));
+                                        };
+                                        result_columns.push(ast::ResultColumn::TableStar(
+                                            ast::Name::from_string(&s.sval),
+                                        ));
                                     }
                                     continue;
                                 }
@@ -10093,5 +10102,11 @@ mod tests {
         );
         assert_not_supported("SELECT db.s.t.a FROM s.t", "cross-database");
         assert_translates("SELECT s.t.a, t.a, a FROM s.t");
+    }
+
+    #[test]
+    fn fail_closed_schema_qualified_table_star() {
+        assert_not_supported("SELECT public.t.* FROM public.t", "schema.table.*");
+        assert_translates("SELECT t.*, * FROM t");
     }
 }
