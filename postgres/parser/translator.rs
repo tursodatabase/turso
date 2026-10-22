@@ -1818,7 +1818,7 @@ impl PostgreSQLTranslator {
                 compounds: vec![],
             };
             let order_by = self.translate_order_by(&select.sort_clause)?;
-            let limit = self.translate_limit(&select.limit_count, &select.limit_offset)?;
+            let limit = self.translate_select_limit(select)?;
             let with = self.translate_with_clause(&select.with_clause)?;
             return Ok(ast::Select {
                 with,
@@ -1858,7 +1858,7 @@ impl PostgreSQLTranslator {
 
         let window_clause = self.translate_window_clause(&select.window_clause)?;
 
-        let limit = self.translate_limit(&select.limit_count, &select.limit_offset)?;
+        let limit = self.translate_select_limit(select)?;
 
         let one_select = ast::OneSelect::Select {
             distinctness,
@@ -1918,7 +1918,7 @@ impl PostgreSQLTranslator {
         }
 
         let order_by = self.translate_order_by(&select.sort_clause)?;
-        let limit = self.translate_limit(&select.limit_count, &select.limit_offset)?;
+        let limit = self.translate_select_limit(select)?;
         let with = self.translate_with_clause(&select.with_clause)?;
 
         Ok(ast::Select {
@@ -4289,6 +4289,18 @@ impl PostgreSQLTranslator {
             recursive: with_clause.recursive,
             ctes,
         }))
+    }
+
+    /// Translates a SELECT's LIMIT/OFFSET, rejecting `FETCH ... WITH TIES`,
+    /// which would otherwise become a plain LIMIT.
+    fn translate_select_limit(
+        &self,
+        select: &pg_query::protobuf::SelectStmt,
+    ) -> Result<Option<ast::Limit>, ParseError> {
+        if select.limit_option() == pg_query::protobuf::LimitOption::WithTies {
+            return Err(not_supported("FETCH FIRST ... WITH TIES"));
+        }
+        self.translate_limit(&select.limit_count, &select.limit_offset)
     }
 
     fn translate_limit(
@@ -9789,5 +9801,18 @@ mod tests {
             "DISTINCT ON",
         );
         assert_translates("SELECT DISTINCT a, b FROM t");
+    }
+
+    #[test]
+    fn fail_closed_fetch_with_ties() {
+        assert_not_supported(
+            "SELECT * FROM t ORDER BY a FETCH FIRST 3 ROWS WITH TIES",
+            "WITH TIES",
+        );
+        assert_not_supported(
+            "SELECT a FROM t UNION SELECT a FROM u ORDER BY 1 FETCH FIRST 1 ROW WITH TIES",
+            "WITH TIES",
+        );
+        assert_translates("SELECT * FROM t ORDER BY a FETCH FIRST 3 ROWS ONLY");
     }
 }
