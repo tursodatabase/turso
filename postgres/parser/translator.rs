@@ -5102,7 +5102,7 @@ fn serial_sequence_namespace(tbl_name: &ast::QualifiedName) -> String {
 /// name, since a dot ends an unquoted schema name and a quote followed by
 /// a dot ends a quoted one.
 pub fn stored_name_prefix(schema: &str) -> String {
-    if schema.is_empty() || map_schema_name(schema) == "main" {
+    if schema.is_empty() || is_default_schema(schema) {
         return String::new();
     }
     let schema = schema.to_ascii_lowercase();
@@ -5119,10 +5119,12 @@ fn ident(name: impl AsRef<str>) -> ast::Name {
     ast::Name::exact(name.as_ref().to_string())
 }
 
-/// Maps a PostgreSQL schema name to the Turso schema that holds its tables.
+/// Maps a PostgreSQL schema name to the Turso namespace that holds its
+/// tables. The connection names the main database public too, so public
+/// stays as written and the errors about its objects name it.
 fn map_schema_name(schema: &str) -> &str {
     match schema.to_ascii_lowercase().as_str() {
-        "pg_catalog" | "public" | "information_schema" => "main",
+        "pg_catalog" | "information_schema" => "main",
         _ => schema,
     }
 }
@@ -6967,7 +6969,10 @@ fn is_pg_catalog(schema: &str) -> bool {
 }
 
 fn is_default_schema(schema: &str) -> bool {
-    map_schema_name(schema) == "main"
+    matches!(
+        schema.to_ascii_lowercase().as_str(),
+        "main" | "public" | "pg_catalog" | "information_schema"
+    )
 }
 
 fn is_binary_collation(collname: &[pg_query::protobuf::Node]) -> bool {

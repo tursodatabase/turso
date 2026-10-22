@@ -384,3 +384,12 @@ expect {
     a.b|t_id_seq
     0
 }
+
+@skip-if postgres "PostgreSQL keeps a public table named s.t apart from the table t of schema s; Turso stores both under the same name"
+test public-object-named-with-public-under-a-schema-prefix-errors {
+    CREATE SCHEMA s;
+    CREATE TABLE public."s.t" (x int);
+}
+expect error {
+    cannot create "s.t" in public
+}

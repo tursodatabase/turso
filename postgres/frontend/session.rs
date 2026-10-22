@@ -435,10 +435,10 @@ fn reject_schema_marker_names(stmt: &ast::Stmt) -> Result<()> {
 }
 
 fn reject_schema_marker_name(verb: &str, table_name: &ast::QualifiedName) -> Result<()> {
-    let in_public = table_name
-        .namespace
-        .as_ref()
-        .is_none_or(|namespace| namespace.as_str().eq_ignore_ascii_case("main"));
+    let in_public = table_name.namespace.as_ref().is_none_or(|namespace| {
+        namespace.as_str().eq_ignore_ascii_case("main")
+            || namespace.as_str().eq_ignore_ascii_case("public")
+    });
     let name = table_name.name.as_str();
     if in_public && name.to_ascii_lowercase().starts_with(SCHEMA_MARKER_PREFIX) {
         return Err(LimboError::ParseError(format!(
