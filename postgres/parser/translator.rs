@@ -1337,15 +1337,11 @@ impl PostgreSQLTranslator {
         }
 
         // Translate column aliases
-        let columns: Vec<ast::IndexedColumn> = view
+        let column_names: Vec<String> = view
             .aliases
             .iter()
             .filter_map(|alias| match &alias.node {
-                Some(pg_query::protobuf::node::Node::String(s)) => Some(ast::IndexedColumn {
-                    col_name: ast::Name::from_string(&s.sval),
-                    collation_name: None,
-                    order: None,
-                }),
+                Some(pg_query::protobuf::node::Node::String(s)) => Some(s.sval.clone()),
                 _ => None,
             })
             .collect();
@@ -1363,33 +1359,14 @@ impl PostgreSQLTranslator {
                 ));
             }
         };
-        let select = self.translate_select(select_stmt)?;
-        // The engine requires the column list to name every select-list
-        // column, and cannot count the columns of a *.
-        if !columns.is_empty() {
-            let ast::OneSelect::Select {
-                columns: result_columns,
-                ..
-            } = &select.body.select
-            else {
-                return Err(not_supported("a column list on a VALUES view"));
-            };
-            if result_columns
-                .iter()
-                .any(|c| !matches!(c, ast::ResultColumn::Expr(..)))
-                || result_columns.len() != columns.len()
-            {
-                return Err(not_supported(
-                    "a view column list that does not name every select-list column",
-                ));
-            }
-        }
+        let mut select = self.translate_select(select_stmt)?;
+        apply_view_column_names(&mut select, &column_names)?;
 
         Ok(ast::Stmt::CreateView {
             temporary: false,
             if_not_exists: false,
             view_name,
-            columns,
+            columns: vec![],
             select,
         })
     }
@@ -1449,25 +1426,22 @@ impl PostgreSQLTranslator {
         }
 
         // Column aliases from the INTO clause
-        let columns: Vec<ast::IndexedColumn> = into_clause
+        let column_names: Vec<String> = into_clause
             .col_names
             .iter()
             .filter_map(|node| match &node.node {
-                Some(pg_query::protobuf::node::Node::String(s)) => Some(ast::IndexedColumn {
-                    col_name: ast::Name::from_string(&s.sval),
-                    collation_name: None,
-                    order: None,
-                }),
+                Some(pg_query::protobuf::node::Node::String(s)) => Some(s.sval.clone()),
                 _ => None,
             })
             .collect();
 
-        let select = self.translate_select(select_stmt)?;
+        let mut select = self.translate_select(select_stmt)?;
+        apply_view_column_names(&mut select, &column_names)?;
 
         Ok(ast::Stmt::CreateMaterializedView {
             if_not_exists: ctas.if_not_exists,
             view_name,
-            columns,
+            columns: vec![],
             select,
         })
     }
@@ -5127,6 +5101,16 @@ fn rename_result_columns(select: &mut ast::Select, names: &[String]) -> Result<(
     Ok(())
 }
 
+/// Applies a view's column list by renaming the leading result columns of its
+/// SELECT. The engine's own column list must name every column, whereas PG
+/// lets it name only the leading ones.
+fn apply_view_column_names(select: &mut ast::Select, names: &[String]) -> Result<(), ParseError> {
+    if !names.is_empty() && !matches!(select.body.select, ast::OneSelect::Select { .. }) {
+        return Err(not_supported("a column list on a VALUES view"));
+    }
+    rename_result_columns(select, names)
+}
+
 fn join_keeps_unmatched_right_rows(join: &ast::JoinedSelectTable) -> bool {
     matches!(
         join.operator,
@@ -8385,13 +8369,26 @@ mod tests {
         let translated = translator.translate(&parsed).unwrap();
 
         if let ast::Stmt::CreateView {
-            view_name, columns, ..
+            view_name,
+            columns,
+            select,
+            ..
         } = translated
         {
             assert_eq!(view_name.name.as_str(), "v");
-            assert_eq!(columns.len(), 2);
-            assert_eq!(columns[0].col_name.as_str(), "col1");
-            assert_eq!(columns[1].col_name.as_str(), "col2");
+            // The names are applied as aliases of the select list instead.
+            assert!(columns.is_empty());
+            let ast::OneSelect::Select { columns, .. } = &select.body.select else {
+                panic!("expected select body");
+            };
+            let aliases: Vec<_> = columns
+                .iter()
+                .map(|c| match c {
+                    ast::ResultColumn::Expr(_, Some(ast::As::Elided(name))) => name.as_str(),
+                    other => panic!("expected an aliased column, got: {other:?}"),
+                })
+                .collect();
+            assert_eq!(aliases, ["col1", "col2"]);
         } else {
             panic!("Expected CreateView");
         }
@@ -9807,17 +9804,36 @@ mod tests {
     }
 
     #[test]
-    fn fail_closed_view_column_list() {
+    fn view_column_list_renames_leading_columns() {
         assert_not_supported("CREATE UNLOGGED VIEW v AS SELECT 1", "UNLOGGED VIEW");
+        assert_not_supported("CREATE VIEW v (p, q) AS SELECT * FROM t", "selects *");
+        assert_not_supported("CREATE VIEW v (p) AS SELECT * FROM t", "selects *");
+        assert_not_supported("CREATE VIEW v (p) AS VALUES (1, 2)", "VALUES view");
+        assert_not_supported(
+            "CREATE MATERIALIZED VIEW m (p) AS SELECT * FROM t",
+            "selects *",
+        );
+        // More names than columns is an error in PG too.
         for sql in [
             "CREATE VIEW v (p, q, r) AS SELECT a, b FROM t",
-            "CREATE VIEW v (p) AS SELECT a, b FROM t",
-            "CREATE VIEW v (p, q) AS SELECT * FROM t",
+            "CREATE MATERIALIZED VIEW m (p, q, r) AS SELECT a, b FROM t",
         ] {
-            assert_not_supported(sql, "view column list");
+            let parsed = crate::parse(sql).unwrap();
+            let err = PostgreSQLTranslator::new()
+                .translate_with_prereqs(&parsed)
+                .expect_err(sql)
+                .to_string();
+            assert!(err.contains("3 columns specified"), "{sql}: {err}");
         }
-        assert_translates("CREATE VIEW v (p, q) AS SELECT a, b FROM t");
-        assert_translates("CREATE VIEW v AS SELECT * FROM t");
+        for sql in [
+            "CREATE VIEW v (p, q) AS SELECT a, b FROM t",
+            "CREATE VIEW v (p) AS SELECT a, b FROM t",
+            "CREATE VIEW v (p) AS SELECT a, * FROM t",
+            "CREATE VIEW v AS SELECT * FROM t",
+            "CREATE MATERIALIZED VIEW m (p) AS SELECT a, b FROM t",
+        ] {
+            assert_translates(sql);
+        }
     }
 
     #[test]

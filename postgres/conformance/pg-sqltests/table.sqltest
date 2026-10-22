@@ -315,3 +315,83 @@ test table-returning-table-name-star-after-alias-rejected {
     INSERT INTO users AS u VALUES (4, 'dave', 40, false) RETURNING users.*;
 }
 expect error {}
+
+setup view_columns {
+    CREATE TABLE vt (a int, b int, c int);
+    INSERT INTO vt VALUES (1, 2, 3), (4, 5, 6);
+}
+
+@setup view_columns
+test table-view-column-list-names-leading-columns {
+    CREATE VIEW vc (p) AS SELECT a, b FROM vt;
+    SELECT p, b FROM vc ORDER BY p;
+}
+expect {
+    1|2
+    4|5
+}
+
+@setup view_columns
+test table-view-column-list-star-expansion {
+    CREATE VIEW vc (p) AS SELECT a, b, c FROM vt;
+    SELECT * FROM vc ORDER BY p;
+}
+expect {
+    1|2|3
+    4|5|6
+}
+
+@setup view_columns
+test table-view-column-list-hides-original-name {
+    CREATE VIEW vc (p) AS SELECT a, b FROM vt;
+    SELECT a FROM vc;
+}
+expect error {}
+
+@setup view_columns
+test table-view-column-list-before-star {
+    CREATE VIEW vc (p) AS SELECT a, * FROM vt;
+    SELECT p, b FROM vc ORDER BY p;
+}
+expect {
+    1|2
+    4|5
+}
+
+@setup view_columns
+test table-view-column-list-names-every-column {
+    CREATE VIEW vc (p, q) AS SELECT a, b FROM vt;
+    SELECT q, p FROM vc ORDER BY p;
+}
+expect {
+    2|1
+    5|4
+}
+
+@setup view_columns
+test table-view-column-list-expression-and-union {
+    CREATE VIEW vc (s) AS SELECT a + b, c FROM vt UNION ALL SELECT c, a FROM vt;
+    SELECT s FROM vc ORDER BY s;
+}
+expect {
+    3
+    3
+    6
+    9
+}
+
+@setup view_columns
+test table-materialized-view-column-list-names-leading-columns {
+    CREATE MATERIALIZED VIEW mc (p) AS SELECT a, b FROM vt;
+    SELECT p, b FROM mc ORDER BY p;
+}
+expect {
+    1|2
+    4|5
+}
+
+@setup view_columns
+test table-view-column-list-more-names-than-columns-rejected {
+    CREATE VIEW vc (p, q, r) AS SELECT a, b FROM vt;
+}
+expect error {}
