@@ -7300,6 +7300,7 @@ dependencies = [
  "criterion",
  "miette",
  "pg_query",
+ "serde_json",
  "thiserror 2.0.16",
  "turso_parser",
 ]
