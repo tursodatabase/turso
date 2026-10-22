@@ -4900,6 +4900,9 @@ impl PostgreSQLTranslator {
         let pg_type = extract_type_name_from_typename(type_name_node)?;
         // The domain stores only a base type name, so modifiers such as the
         // length in varchar(5) would be lost.
+        if !type_name_node.array_bounds.is_empty() {
+            return Err(not_supported("CREATE DOMAIN over an array type"));
+        }
         if !type_name_node.typmods.is_empty() {
             return Err(not_supported(format!(
                 "type modifiers on {pg_type} in CREATE DOMAIN"
@@ -10139,6 +10142,12 @@ mod tests {
         assert_not_supported("CREATE TYPE s.mood AS ENUM ('a')", "schema-qualified type");
         assert_translates("CREATE DOMAIN public.d AS int");
         assert_translates("CREATE TYPE public.mood AS ENUM ('a')");
+    }
+
+    #[test]
+    fn fail_closed_domain_array() {
+        assert_not_supported("CREATE DOMAIN d AS int[]", "array type");
+        assert_not_supported("CREATE DOMAIN d AS text[][]", "array type");
     }
 
     #[test]
