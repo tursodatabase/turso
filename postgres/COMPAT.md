@@ -89,7 +89,10 @@ forms; the first schema of `search_path` that exists), `pg_backend_pid()`, `quot
 is not persisted. DML against pg_catalog is rejected. `pg_typeof` is not
 implemented.
 Configuration settings functions: `set_config()` and `current_setting()`,
-for `search_path` only.
+for `search_path` only. Setting changes follow the transaction as in
+PostgreSQL: ROLLBACK undoes the setting changes of the transaction,
+ROLLBACK TO SAVEPOINT undoes the changes after the savepoint, and a
+statement that fails undoes its own changes.
 
 | Feature | Status | Notes |
 |---------|--------|-------|

@@ -7,7 +7,7 @@ use std::sync::{Arc, Mutex};
 
 use crate::catalog::{self, PostgresDialect};
 use crate::functions::ConfigParameter;
-use turso_core::{Connection, LimboError, Result, Statement, Value};
+use turso_core::{Connection, LimboError, Result, SettingScope, Statement, Value};
 use turso_parser::ast::{self};
 use turso_pg_parser::translator::{
     check_set_transaction, is_comment_on, is_refresh_matview, try_extract_copy_from,
@@ -27,14 +27,12 @@ struct PgConnectionInner {
     conn: Arc<Connection>,
 }
 
-/// The text that `search_path` was set to, for SHOW. The search path itself
-/// is on the connection.
 #[derive(Default)]
-struct SessionState {
-    search_path_setting: Option<String>,
-}
+struct SessionState {}
 
 type PgSessionState = Mutex<SessionState>;
+
+const SEARCH_PATH_SETTING: &str = "search_path";
 
 pub(crate) const DEFAULT_SEARCH_PATH: &str = "\"$user\", public";
 
@@ -507,11 +505,12 @@ fn handle_pg_show(pg_conn: &Arc<PgConnectionInner>, show_stmt: &PgShowStmt) -> R
 pub(crate) fn set_search_path(conn: &Connection, value: Option<&str>) -> Result<Value> {
     let mut path = parse_search_path(value.unwrap_or(DEFAULT_SEARCH_PATH))?;
     path.retain(|name| name != "$user" && !is_core_database_name(name));
-    let state = conn.context::<PgSessionState>().ok_or_else(|| {
-        LimboError::InvalidArgument("PostgreSQL session state is not initialized".to_string())
-    })?;
-    state.lock().unwrap().search_path_setting = value.map(str::to_owned);
-    conn.set_search_path(Some(path));
+    conn.set_search_path(Some(path), SettingScope::Session);
+    conn.set_setting(
+        SEARCH_PATH_SETTING,
+        value.map(str::to_owned),
+        SettingScope::Session,
+    );
     Ok(Value::build_text(
         value.unwrap_or(DEFAULT_SEARCH_PATH).to_owned(),
     ))
@@ -524,8 +523,7 @@ fn is_core_database_name(name: &str) -> bool {
 }
 
 pub(crate) fn search_path_setting(conn: &Connection) -> Option<String> {
-    conn.context::<PgSessionState>()
-        .and_then(|state| state.lock().unwrap().search_path_setting.clone())
+    conn.setting(SEARCH_PATH_SETTING)
 }
 
 fn parse_search_path(value: &str) -> Result<Vec<String>> {

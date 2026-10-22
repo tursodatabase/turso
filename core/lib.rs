@@ -76,6 +76,7 @@ mod pseudo;
 mod regexp;
 #[cfg(feature = "series")]
 mod series;
+mod settings;
 mod stack;
 mod statement;
 mod stats;
@@ -158,6 +159,7 @@ pub use io::{
 };
 pub use namespace::Namespaces;
 pub use numeric::{nonnan::NonNan, Numeric};
+pub use settings::SettingScope;
 pub use statement::{ColumnTypeInfo, ColumnTypeKind, Statement, StatementStatusCounter};
 pub use storage::{
     buffer_pool::BufferPool,
