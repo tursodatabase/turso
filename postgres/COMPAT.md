@@ -43,18 +43,18 @@ Basics not enumerated by the official feature matrix.
 | JOINs (INNER, LEFT, RIGHT, FULL, CROSS, NATURAL, USING) | ✅ Supported | |
 | UNION / UNION ALL / INTERSECT / EXCEPT | 🟡 Partial | Including ORDER BY/LIMIT on compounds; INTERSECT ALL / EXCEPT ALL, a set operation nested on the right (`A UNION B INTERSECT C`, `A EXCEPT (B UNION C)`) and ORDER BY/LIMIT/WITH on a parenthesized branch are rejected |
 | Subqueries (FROM, IN, EXISTS, scalar) | ✅ Supported | `= ANY(array)` and `<> ALL(array)` work, including bound text-array parameters; other ANY/ALL array operators are rejected; `ALL`/row comparison subqueries error |
-| INSERT (column lists, multi-row VALUES, DEFAULT, INSERT ... SELECT) | ✅ Supported | |
-| UPDATE (incl. FROM clause) | ✅ Supported | Multi-column `SET (a,b) = (...)` not supported |
+| INSERT (column lists, multi-row VALUES, DEFAULT, INSERT ... SELECT) | ✅ Supported | Duplicate target columns, DEFAULT without a column list, array-element/field targets and OVERRIDING are rejected |
+| UPDATE (incl. FROM clause) | ✅ Supported | Multi-column `SET (a,b) = (...)` not supported; duplicate assignments and array-element/field targets rejected |
 | DELETE | 🟡 Partial | `USING` clause rejected |
 | CREATE TABLE | ✅ Supported | PK, NOT NULL, UNIQUE, DEFAULT, CHECK, FK (with ON DELETE/UPDATE actions); IF NOT EXISTS; tables are created STRICT |
 | CREATE TABLE AS / SELECT INTO | ✅ Supported | Schema derived from the SELECT; WITH NO DATA supported (lowered to LIMIT 0, so errors in an overridden LIMIT go unreported); explicit column list rejected; INTO on the first leaf of a compound SELECT (legal in PG) rejected; TEMP, WITH (...), TABLESPACE, USING and ON COMMIT rejected; completes with `SELECT n` like PostgreSQL, though an IF NOT EXISTS skip tags `SELECT 0` instead of `CREATE TABLE AS` |
-| ALTER TABLE | 🟡 Partial | ADD/DROP COLUMN, RENAME TABLE/COLUMN work; ALTER COLUMN TYPE translates but fails at execution; SET/DROP DEFAULT, SET/DROP NOT NULL, ADD CONSTRAINT rejected |
+| ALTER TABLE | 🟡 Partial | ADD/DROP COLUMN, RENAME TABLE/COLUMN work; one subcommand per statement; ALTER COLUMN TYPE, IF [NOT] EXISTS and CASCADE rejected; SET/DROP DEFAULT, SET/DROP NOT NULL, ADD CONSTRAINT rejected |
 | CREATE INDEX | ✅ Supported | UNIQUE, multi-column, partial (WHERE), expression indexes, IF NOT EXISTS |
-| CREATE VIEW | ✅ Supported | Column aliases supported; TEMP, OR REPLACE, WITH (options) and WITH CHECK OPTION rejected |
+| CREATE VIEW | ✅ Supported | Column aliases supported when they name every select-list column; TEMP, UNLOGGED, OR REPLACE, WITH (options) and WITH CHECK OPTION rejected |
 | COMMENT ON | 🟡 Partial | Accepted but discarded; comments are not persisted in `pg_description` |
 | CREATE SCHEMA / DROP SCHEMA | ✅ Supported | Schemas are ATTACHed databases; DROP ... CASCADE; `public` is special-cased; AUTHORIZATION and embedded schema elements rejected; CREATE TABLE without a schema creates the table in the first schema of `search_path` that exists |
 | CREATE SEQUENCE / nextval / currval / setval | ✅ Supported | START, INCREMENT, MIN/MAXVALUE, CYCLE; AS smallint/integer/bigint bounds the range; CACHE accepted (no-op); OWNED BY a column, TEMP and other options rejected; pg_sequences view; a sequence named without a schema is looked up through `search_path`, then in `public` |
-| CREATE DOMAIN | ✅ Supported | Base type + DEFAULT, NOT NULL, CHECK constraints enforced |
+| CREATE DOMAIN | ✅ Supported | Base type + DEFAULT, NOT NULL, CHECK constraints enforced; array base types, type modifiers and non-binary COLLATE rejected |
 | CREATE TYPE ... AS ENUM | ✅ Supported | Values validated on write; other CREATE TYPE forms unsupported |
 | TRUNCATE | 🟡 Partial | Lowered to DELETE of one table; several tables, CASCADE and RESTART IDENTITY rejected |
 | BEGIN / COMMIT / ROLLBACK | ✅ Supported | Isolation levels and DEFERRABLE accepted (transactions are always serializable); READ ONLY and AND CHAIN rejected |
@@ -182,7 +182,7 @@ INTEGER. Unknown type names pass through as custom types.
 | DISTINCT ON | ❌ Not supported | Rejected |
 | FETCH FIRST .. WITH TIES | ❌ Not supported | `FETCH FIRST n ROWS ONLY` works (lowered to LIMIT); WITH TIES rejected |
 | GROUPING SETS, CUBE and ROLLUP support | ❌ Not supported | Translation error |
-| INSERT/UPDATE/DELETE RETURNING | ✅ Supported | Including `RETURNING *` and UPDATE ... FROM ... RETURNING |
+| INSERT/UPDATE/DELETE RETURNING | ✅ Supported | Including `RETURNING *`; on UPDATE ... FROM, `RETURNING *` is rejected (it would omit the FROM tables' columns) |
 | LATERAL clause | 🟡 Partial | LATERAL subqueries work with a comma, [CROSS] JOIN, and LEFT JOIN. Column alias lists such as `AS s(x)` work on subqueries, unnest() and generate_series(); outer columns in LIMIT/OFFSET are not supported; LATERAL tvf() is not supported     |
 | MERGE | ❌ Not supported | |
 | MERGE ... RETURNING | ❌ Not supported | |
@@ -206,7 +206,7 @@ INTEGER. Unknown type names pass through as custom types.
 | Window functions | 🟡 Partial | Aggregate window functions (COUNT/SUM/AVG/MIN/MAX OVER), row_number, PARTITION BY/ORDER BY, frame clauses, and named WINDOW clauses work; rank, dense_rank, lag, lead, etc. are not implemented |
 | WITHIN GROUP clause | 🟡 Partial | Supports mode(), percentile_cont(), and percentile_disc() with one ORDER BY expression; DESC is not supported; NULLS FIRST/LAST is accepted and has no effect because these functions skip NULLs |
 | WITH ORDINALITY clause | ❌ Not supported | Rejected |
-| WITH queries (Common Table Expressions) | ✅ Supported | Including WITH RECURSIVE; MATERIALIZED hints accepted |
+| WITH queries (Common Table Expressions) | ✅ Supported | Including WITH RECURSIVE; MATERIALIZED hints accepted; WITH on a set operation or a bare VALUES is rejected |
 | Writable WITH queries (Common Table Expressions) | ❌ Not supported | "CTE query is not a SELECT statement" |
 
 ## Data Definition Language (DDL)
