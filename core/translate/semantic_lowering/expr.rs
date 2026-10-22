@@ -1838,6 +1838,27 @@ impl<'expr> ExprLowerer<'_, 'expr, '_> {
             }
             return Ok(target);
         }
+        // An FTS search or score has a value only through the FTS index
+        // the planner selected for it, which binds it to a register above.
+        match expression {
+            #[cfg(all(feature = "fts", not(target_family = "wasm")))]
+            hir::Expr::Function(call) => match call.function.value() {
+                Func::Fts(crate::function::FtsFunc::Match) => {
+                    crate::bail_parse_error!("fts_match requires an FTS index query")
+                }
+                Func::Fts(crate::function::FtsFunc::Score) => {
+                    crate::bail_parse_error!(
+                        "fts_score requires columns and query from the selected FTS index"
+                    )
+                }
+                _ => {}
+            },
+            hir::Expr::Like {
+                operator: turso_parser::ast::LikeOperator::Match,
+                ..
+            } => crate::bail_parse_error!("MATCH requires an FTS index query"),
+            _ => {}
+        }
         match expression {
             hir::Expr::Literal(literal) => emit_literal(self.program, literal, target),
             hir::Expr::Parameter(parameter) => Ok(emit_parameter(self.program, parameter, target)),
@@ -7527,8 +7548,10 @@ mod tests {
         ));
     }
 
+    /// MATCH has a value only through an FTS index search, which binds it
+    /// to a register before lowering reaches it.
     #[test]
-    fn match_places_row_columns_before_the_query() {
+    fn match_without_an_index_query_is_an_error() {
         let expression = hir::Expr::Like {
             lhs: Box::new(hir::Expr::Row(vec![
                 hir::Expr::Literal(Literal::String("'one'".to_string())),
@@ -7543,24 +7566,11 @@ mod tests {
         };
         let mut program = program();
 
-        translate_expr(&mut program, &expression, 8).unwrap();
-        assert!(matches!(
-            program.insns.as_slice(),
-            [
-                (Insn::String8 { dest: 1, .. }, _),
-                (Insn::String8 { dest: 2, .. }, _),
-                (Insn::String8 { dest: 3, .. }, _),
-                (
-                    Insn::Function {
-                        constant_mask: 0,
-                        start_reg: 1,
-                        dest: 8,
-                        func: FuncCtx { arg_count: 3, .. },
-                    },
-                    _,
-                ),
-            ]
-        ));
+        let error = translate_expr(&mut program, &expression, 8).unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "Parse error: MATCH requires an FTS index query"
+        );
     }
 
     #[test]

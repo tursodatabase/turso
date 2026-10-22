@@ -7,7 +7,6 @@ use crate::{
     schema::{BTreeTable, Table, EXPR_INDEX_SENTINEL},
     sync::Arc,
     translate::{
-        expr::ConditionMetadata,
         optimizer::HirBtreeOperation,
         semantic::hir::{self, HirDocument, SourceId},
         semantic_to_plan::HirAccessPlan,
@@ -300,18 +299,7 @@ pub(super) fn emit_access_predicates(
         if ready_at != loop_index {
             continue;
         }
-        let passed = program.allocate_label();
-        super::expr::translate_condition_expr(
-            program,
-            document,
-            &predicate.expr,
-            ConditionMetadata {
-                jump_if_condition_is_true: false,
-                jump_target_when_true: passed,
-                jump_target_when_false: fail,
-            },
-        )?;
-        program.preassign_label_to_next_insn(passed);
+        super::query::emit_hir_predicate(program, document, predicate, fail)?;
     }
     Ok(())
 }

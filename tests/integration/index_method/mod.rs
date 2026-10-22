@@ -1736,6 +1736,54 @@ fn test_fts_score_uses_selected_match_index(tmp_db: TempDatabase) {
     );
 }
 
+/// The planner tells the index which of its columns a query names after the
+/// query text, so a query text that looks like a column number is still a
+/// search term.
+#[cfg(all(feature = "fts", not(target_family = "wasm")))]
+#[turso_macros::test]
+fn test_fts_numeric_query_text_is_a_search_term(tmp_db: TempDatabase) {
+    let conn = tmp_db.connect_limbo();
+    conn.execute("CREATE TABLE docs(id INTEGER PRIMARY KEY, title TEXT, body TEXT)")
+        .unwrap();
+    conn.execute("CREATE INDEX docs_fts ON docs USING fts(title, body)")
+        .unwrap();
+    conn.execute("INSERT INTO docs VALUES (1, 'room 7', 'floor 0'), (2, 'room 0', 'floor 7')")
+        .unwrap();
+    for (query, expected) in [
+        (
+            "SELECT id FROM docs WHERE fts_match(title, '7')",
+            vec![row![1]],
+        ),
+        (
+            "SELECT id FROM docs WHERE fts_match(body, '7')",
+            vec![row![2]],
+        ),
+        (
+            "SELECT id FROM docs WHERE fts_match(body, '0')",
+            vec![row![1]],
+        ),
+        (
+            "SELECT id FROM docs WHERE fts_match(body, title, '7') ORDER BY id",
+            vec![row![1], row![2]],
+        ),
+        (
+            "SELECT id FROM docs WHERE (title, body) MATCH '0' ORDER BY id",
+            vec![row![1], row![2]],
+        ),
+        (
+            "SELECT id FROM docs WHERE fts_match(title, '99') OR fts_match(title, '7')",
+            vec![],
+        ),
+    ] {
+        if expected.is_empty() {
+            let error = conn.prepare(query).expect_err(query);
+            assert!(error.to_string().contains("FTS"), "{query}: {error}");
+        } else {
+            assert_eq!(limbo_exec_rows(&conn, query), expected, "{query}");
+        }
+    }
+}
+
 #[cfg(all(feature = "fts", not(target_family = "wasm")))]
 #[turso_macros::test]
 fn test_fts_query_restricts_matches_to_named_field(tmp_db: TempDatabase) {

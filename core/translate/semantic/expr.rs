@@ -1677,19 +1677,18 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
         }
     }
 
-    /// The block an aggregate call belongs to. Like SQLite, a call in a
-    /// subquery whose arguments read only columns of the enclosing block
-    /// is an aggregate of that block, which then runs as an aggregate query;
-    /// otherwise it belongs to `block`, the block it is written in.
-    /// Whether an aggregate of `block` reads a column of another query
-    /// block: an aggregate of the enclosing query, which is a misuse
-    /// where that query allows no aggregates.
+    /// Whether an aggregate written in `block` reads columns of other query
+    /// blocks only, so that, as in SQLite, it is an aggregate of the
+    /// enclosing query: a misuse where that query allows no aggregates. An
+    /// aggregate that reads any column of `block`, in its arguments, their
+    /// ORDER BY or its FILTER, belongs to `block`.
     fn aggregate_reads_outside(
         &self,
         block: hir::QueryBlockId,
         input: &FunctionInput,
         filter: Option<&ResolvedScopeExpr>,
     ) -> bool {
+        let mut reads_block = false;
         let mut reads_outside = false;
         let mut visit = |expression: &hir::Expr| {
             expression.for_each(&mut |expression| {
@@ -1699,7 +1698,9 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
                     _ => return,
                 };
                 match self.source(source).map(|source| source.owner) {
-                    Some(hir::SourceOwner::QueryBlock(owner)) if owner == block => {}
+                    Some(hir::SourceOwner::QueryBlock(owner)) if owner == block => {
+                        reads_block = true
+                    }
                     _ => reads_outside = true,
                 }
             });
@@ -1713,9 +1714,13 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
         if let Some(filter) = filter {
             visit(&filter.expr);
         }
-        reads_outside
+        reads_outside && !reads_block
     }
 
+    /// The block an aggregate call belongs to. Like SQLite, a call in a
+    /// subquery whose arguments read only columns of the enclosing block
+    /// is an aggregate of that block, which then runs as an aggregate query;
+    /// otherwise it belongs to `block`, the block it is written in.
     fn aggregate_owner(
         &self,
         block: hir::QueryBlockId,

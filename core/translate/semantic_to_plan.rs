@@ -1310,6 +1310,11 @@ impl<'a> HirPlanContext<'a> {
         ) else {
             return Ok(None);
         };
+        // The search runs before the loop finds a row, so its arguments
+        // cannot read one.
+        if self.index_method_reads_source(&matched.access, source.id) {
+            return Ok(None);
+        }
         if let Some(position) = matched.predicate {
             input.predicates[position].consumed = true;
         }
@@ -2931,6 +2936,11 @@ impl<'a> HirPlanContext<'a> {
         ) else {
             return Ok(None);
         };
+        // The search runs before the loop finds a row, so its arguments
+        // cannot read one.
+        if self.index_method_reads_source(&matched.access, source.id) {
+            return Ok(None);
+        }
         if let Some(position) = matched.predicate {
             input.predicates[position].consumed = true;
         }
@@ -2963,10 +2973,29 @@ impl<'a> HirPlanContext<'a> {
         }))
     }
 
+    /// Whether the arguments of an index-method search read `source`,
+    /// directly or through a correlated subquery.
+    fn index_method_reads_source(
+        &self,
+        access: &crate::translate::hir_index_method::HirIndexMethodAccess,
+        source: SourceId,
+    ) -> bool {
+        let mut reads = false;
+        for argument in &access.arguments {
+            self.document.visit_expr_sources(argument, &mut |read| {
+                reads |= read == source;
+            });
+        }
+        reads
+    }
+
     /// Plan an inner join whose tables include one read through an index
-    /// method, such as FTS, for one of its WHERE terms. That table becomes
-    /// the outer loop; the other tables are planned as if its columns were
-    /// known values, so the join terms can seek them.
+    /// method, such as FTS, for one of its WHERE terms. The search's
+    /// arguments may read other tables of the join, which then loop outside
+    /// it; the rest loop inside it, planned as if its columns were known
+    /// values, so the join terms can seek them. A table whose search reads
+    /// its own row keeps its usual access: the term is then checked through
+    /// the index for each row the loop finds.
     #[allow(clippy::too_many_arguments)]
     fn plan_index_method_join(
         &self,
@@ -2994,14 +3023,25 @@ impl<'a> HirPlanContext<'a> {
         if grouping.is_some() {
             return Ok(None);
         }
-        let Some((position, matched)) =
+        let block_sources = input
+            .sources
+            .iter()
+            .map(HirPlanSource::source)
+            .collect::<Vec<_>>();
+        // A CROSS JOIN fixes the order of the tables around it.
+        let order_fixed = input.sources.iter().any(|source| {
+            source
+                .join_info()
+                .is_some_and(|join| join.kind == hir::JoinKind::Cross)
+        });
+        let Some((position, matched, outer)) =
             input
                 .sources
                 .iter()
                 .enumerate()
                 .find_map(|(position, source)| {
                     let source = self.definition(source.btree()?.internal_id);
-                    crate::translate::hir_index_method::match_index_methods(
+                    let matched = crate::translate::hir_index_method::match_index_methods(
                         &crate::translate::hir_index_method::IndexMethodQuery {
                             document: self.document,
                             source,
@@ -3013,8 +3053,32 @@ impl<'a> HirPlanContext<'a> {
                             rows_are_output: false,
                         },
                     )
-                    .filter(|matched| matched.predicate.is_some())
-                    .map(|matched| (position, matched))
+                    .filter(|matched| matched.predicate.is_some())?;
+                    // The positions of the tables the search's arguments
+                    // read, which loop outside the index.
+                    let mut outer = Vec::new();
+                    for argument in &matched.access.arguments {
+                        self.document.visit_expr_sources(argument, &mut |read| {
+                            if let Some(read) = block_sources.iter().position(|id| *id == read) {
+                                if !outer.contains(&read) {
+                                    outer.push(read);
+                                }
+                            }
+                        });
+                    }
+                    if outer.contains(&position) {
+                        return None;
+                    }
+                    if order_fixed {
+                        // Every table the search reads must already come
+                        // first, and then so does every table before it.
+                        if outer.iter().any(|read| *read > position) {
+                            return None;
+                        }
+                        outer = (0..position).collect();
+                    }
+                    outer.sort_unstable();
+                    Some((position, matched, outer))
                 })
         else {
             return Ok(None);
@@ -3022,63 +3086,155 @@ impl<'a> HirPlanContext<'a> {
         if let Some(predicate) = matched.predicate {
             input.predicates[predicate].consumed = true;
         }
-        let indexed = input.sources.remove(position);
-        let rest = HirQueryBlockPlanInput {
-            sources: std::mem::take(&mut input.sources),
-            groups: Vec::new(),
-            predicates: std::mem::take(&mut input.predicates),
-            where_start: input.where_start,
-            later_on_terms: std::mem::take(&mut input.later_on_terms),
-            subqueries: Vec::new(),
-            argument_predicates: std::mem::take(&mut input.argument_predicates),
-        };
-        let access = self
-            .plan_source_access(
-                rest,
-                None,
-                true,
-                &crate::translate::optimizer::join::HirHashJoins::NONE,
-                false,
-                initial_cardinality,
-                schema,
-                params,
-                query_estimate,
-            )?
-            .ok_or_else(|| {
-                LimboError::InternalError("HIR join produced no access plan".to_string())
-            })?;
-        let mut loops = Vec::with_capacity(access.loops.len() + 1);
-        loops.push(HirPlannedLoop {
-            source: indexed.source(),
+        let indexed_source = input.sources[position].source();
+        let index_loop = HirPlannedLoop {
+            source: indexed_source,
             source_position: position,
             access: HirSourceAccess::IndexMethod(matched.access),
             estimate: None,
             unmatched_right_rows: None,
-        });
-        loops.extend(access.loops.into_iter().map(|mut planned_loop| {
-            if planned_loop.source_position >= position {
-                planned_loop.source_position += 1;
+        };
+        let mut sources = std::mem::take(&mut input.sources)
+            .into_iter()
+            .map(Some)
+            .collect::<Vec<_>>();
+        let mut outer_sources = Vec::with_capacity(outer.len());
+        for read in &outer {
+            outer_sources.push(sources[*read].take().expect("outer source taken once"));
+        }
+        let inner: Vec<usize> = (0..sources.len())
+            .filter(|index| *index != position && !outer.contains(index))
+            .collect();
+        let inner_sources = inner
+            .iter()
+            .map(|index| sources[*index].take().expect("inner source taken once"))
+            .collect::<Vec<_>>();
+        let mut predicates = std::mem::take(&mut input.predicates);
+        let mut later_on_terms = std::mem::take(&mut input.later_on_terms);
+        let mut argument_predicates = std::mem::take(&mut input.argument_predicates);
+        let mut loops = Vec::with_capacity(sources.len());
+        let mut deferred_predicates = Vec::new();
+        let mut subquery_calls = Vec::new();
+        let mut output_cardinality = 1.0;
+        let mut cost = Cost(1.0);
+
+        if !outer_sources.is_empty() {
+            let outer_ids = outer_sources
+                .iter()
+                .map(HirPlanSource::source)
+                .collect::<Vec<_>>();
+            // The terms that read the index's table or an inner table
+            // cannot run in the outer loops, so planning them hides those.
+            let hidden = predicates
+                .iter()
+                .enumerate()
+                .filter(|(_, term)| {
+                    let mut reads_later = false;
+                    self.document.visit_expr_sources(&term.expr, &mut |read| {
+                        reads_later |= block_sources.contains(&read) && !outer_ids.contains(&read);
+                    });
+                    !term.consumed && reads_later
+                })
+                .map(|(index, _)| index)
+                .collect::<Vec<_>>();
+            let mut outer_predicates = predicates.clone();
+            for index in &hidden {
+                outer_predicates[*index].consumed = true;
             }
-            planned_loop
-        }));
+            let (outer_arguments, inner_arguments): (Vec<_>, Vec<_>) = argument_predicates
+                .drain(..)
+                .partition(|(source, _)| outer_ids.contains(source));
+            argument_predicates = inner_arguments;
+            let outer_plan = self
+                .plan_source_access(
+                    HirQueryBlockPlanInput {
+                        sources: outer_sources,
+                        groups: Vec::new(),
+                        predicates: outer_predicates,
+                        where_start: input.where_start,
+                        later_on_terms: Vec::new(),
+                        subqueries: Vec::new(),
+                        argument_predicates: outer_arguments,
+                    },
+                    None,
+                    true,
+                    &crate::translate::optimizer::join::HirHashJoins::NONE,
+                    false,
+                    initial_cardinality,
+                    schema,
+                    params,
+                    query_estimate,
+                )?
+                .ok_or_else(|| {
+                    LimboError::InternalError("HIR join produced no access plan".to_string())
+                })?;
+            predicates = outer_plan.predicates;
+            for index in hidden {
+                predicates[index].consumed = false;
+            }
+            loops.extend(outer_plan.loops.into_iter().map(|mut planned_loop| {
+                planned_loop.source_position = outer[planned_loop.source_position];
+                planned_loop
+            }));
+            deferred_predicates.extend(outer_plan.deferred_predicates);
+            subquery_calls.extend(outer_plan.subquery_calls);
+            output_cardinality = outer_plan.output_cardinality;
+            cost = outer_plan.cost;
+        }
+        loops.push(index_loop);
+        if !inner_sources.is_empty() {
+            let inner_plan = self
+                .plan_source_access(
+                    HirQueryBlockPlanInput {
+                        sources: inner_sources,
+                        groups: Vec::new(),
+                        predicates,
+                        where_start: input.where_start,
+                        later_on_terms: std::mem::take(&mut later_on_terms),
+                        subqueries: Vec::new(),
+                        argument_predicates,
+                    },
+                    None,
+                    true,
+                    &crate::translate::optimizer::join::HirHashJoins::NONE,
+                    false,
+                    initial_cardinality,
+                    schema,
+                    params,
+                    query_estimate,
+                )?
+                .ok_or_else(|| {
+                    LimboError::InternalError("HIR join produced no access plan".to_string())
+                })?;
+            predicates = inner_plan.predicates;
+            later_on_terms = inner_plan.later_on_terms;
+            loops.extend(inner_plan.loops.into_iter().map(|mut planned_loop| {
+                planned_loop.source_position = inner[planned_loop.source_position];
+                planned_loop
+            }));
+            deferred_predicates.extend(inner_plan.deferred_predicates);
+            subquery_calls.extend(inner_plan.subquery_calls);
+            output_cardinality = inner_plan.output_cardinality;
+            cost = inner_plan.cost;
+        }
         Ok(Some(HirQueryBlockPlan {
             block: block.id,
             groups: Vec::new(),
             loops,
-            predicates: access.predicates,
+            predicates,
             where_start: input.where_start,
-            later_on_terms: access.later_on_terms,
+            later_on_terms,
             group_sort_elided: false,
             order_sort_elided: false,
             window_sort_elided: false,
-            subquery_calls: Vec::new(),
-            deferred_predicates: Vec::new(),
+            subquery_calls,
+            deferred_predicates,
             limit_applied: false,
             min_max_first_value: false,
             simple_count: false,
             inner_joins: Vec::new(),
-            output_cardinality: access.output_cardinality,
-            cost: access.cost,
+            output_cardinality,
+            cost,
         }))
     }
 

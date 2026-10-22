@@ -28,6 +28,10 @@ pub(crate) struct HirIndexMethodAccess {
     /// Query expressions the index returns, each with the column of the
     /// index cursor that holds it.
     pub(crate) covered: Vec<(hir::Expr, usize)>,
+    /// Which of the pattern's FTS columns the query names, as a
+    /// comma-separated list of positions ("0,2"); None for other methods.
+    /// Passed to the index after the placeholder values.
+    pub(crate) fields: Option<String>,
 }
 
 /// What an index method takes over from a query block.
@@ -57,11 +61,16 @@ pub(crate) struct IndexMethodQuery<'a> {
 }
 
 /// The first query pattern of an index on the source's table that matches
-/// the query, if any.
+/// the query, if any. A source with an INDEXED BY or NOT INDEXED hint keeps
+/// its hinted access.
 pub(crate) fn match_index_methods(query: &IndexMethodQuery<'_>) -> Option<IndexMethodMatch> {
     if !matches!(query.source.index_hint, hir::IndexHint::None) {
         return None;
     }
+    match_index_methods_ignoring_hint(query)
+}
+
+fn match_index_methods_ignoring_hint(query: &IndexMethodQuery<'_>) -> Option<IndexMethodMatch> {
     let hir::SourceKind::Table(table) = &query.source.kind else {
         return None;
     };
@@ -88,6 +97,35 @@ pub(crate) fn match_index_methods(query: &IndexMethodQuery<'_>) -> Option<IndexM
                     match_pattern(query, table_name, &index, position, pattern)
                 })
         })
+}
+
+/// A query pattern that applies one WHERE or ON term of `source` to a row
+/// the source's own loop already found: the arguments of the term may read
+/// that row, so the index cannot drive the loop, but it can say whether the
+/// row is among the term's matches. Only patterns that neither sort nor
+/// limit rows qualify, and the source's index hint does not matter, since
+/// the hinted access still reads the rows.
+pub(crate) fn match_index_method_predicate(
+    document: &HirDocument,
+    source: &hir::Source,
+    term: &HirWhereTerm,
+) -> Option<HirIndexMethodAccess> {
+    let term = HirWhereTerm {
+        expr: term.expr.clone(),
+        from_outer_join: None,
+        consumed: false,
+    };
+    let matched = match_index_methods_ignoring_hint(&IndexMethodQuery {
+        document,
+        source,
+        outputs: &[],
+        predicates: std::slice::from_ref(&term),
+        where_start: 0,
+        order_by: &[],
+        limit: None,
+        rows_are_output: false,
+    })?;
+    matched.predicate.is_some().then_some(matched.access)
 }
 
 fn match_pattern(
@@ -130,6 +168,7 @@ fn match_pattern(
         document: query.document,
         source: query.source,
         captures: HashMap::default(),
+        fields: None,
     };
     if applies_order_by {
         if pattern.order_by.len() != query.order_by.len() {
@@ -232,17 +271,121 @@ fn match_pattern(
         }
     }
 
+    // The index's score for a row is the score of the search that found
+    // it: a `fts_score` over the same columns and query reads it from the
+    // index even when the pattern returns no column for it.
+    if let Some(fts_arguments) = fts_search_arguments(pattern) {
+        let score_column = fts_score_column(position);
+        let mut visit = |expression: &hir::Expr| {
+            if covered
+                .iter()
+                .any(|(existing, _)| existing.equivalent(expression))
+            {
+                return;
+            }
+            let hir::Expr::Function(call) = expression else {
+                return;
+            };
+            if !call
+                .function
+                .value()
+                .to_string()
+                .eq_ignore_ascii_case("fts_score")
+            {
+                return;
+            }
+            let mut attempt = matcher.clone();
+            if attempt.capture_call("fts_score", fts_arguments, expression)
+                && attempt.captures.len() == matcher.captures.len()
+            {
+                covered.push((expression.clone(), score_column));
+            }
+        };
+        for output in query.outputs {
+            output.expr.for_each(&mut visit);
+        }
+        for term in query.order_by {
+            term.expr.for_each(&mut visit);
+        }
+        for (position, term) in &where_terms {
+            if Some(*position) != predicate {
+                term.expr.for_each(&mut visit);
+            }
+        }
+    }
+
+    let fields = matcher.fields.as_ref().map(|fields| {
+        fields
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join(",")
+    });
+
     Some(IndexMethodMatch {
         access: HirIndexMethodAccess {
             index: index.clone(),
             pattern: position,
             arguments,
             covered,
+            fields,
         },
         predicate,
         applies_order_by,
         applies_limit,
     })
+}
+
+/// The arguments of the FTS search an FTS pattern runs, its columns then
+/// the query placeholder: those of its `fts_match` WHERE term, else of its
+/// `fts_score` result column. None for a pattern of another method.
+fn fts_search_arguments(pattern: &ast::Select) -> Option<&[Box<ast::Expr>]> {
+    let ast::OneSelect::Select {
+        columns,
+        where_clause,
+        ..
+    } = &pattern.body.select
+    else {
+        return None;
+    };
+    fn fts_call<'p>(expression: &'p ast::Expr, function: &str) -> Option<&'p [Box<ast::Expr>]> {
+        match expression {
+            ast::Expr::FunctionCall { name, args, .. }
+                if name.as_str().eq_ignore_ascii_case(function) =>
+            {
+                Some(args.as_slice())
+            }
+            _ => None,
+        }
+    }
+    where_clause
+        .as_deref()
+        .and_then(|where_clause| fts_call(where_clause, "fts_match"))
+        .or_else(|| {
+            columns.iter().find_map(|column| match column {
+                ast::ResultColumn::Expr(expression, _) => fts_call(expression, "fts_score"),
+                _ => None,
+            })
+        })
+}
+
+/// The column of an FTS index cursor that holds the row's score: the
+/// second for the `fts_match`-only patterns, whose first column says the
+/// row matched, else the first.
+fn fts_score_column(pattern: usize) -> usize {
+    #[cfg(all(feature = "fts", not(target_family = "wasm")))]
+    {
+        usize::from(matches!(
+            pattern as i64,
+            crate::index_method::fts::FTS_PATTERN_MATCH
+                | crate::index_method::fts::FTS_PATTERN_MATCH_LIMIT
+        ))
+    }
+    #[cfg(not(all(feature = "fts", not(target_family = "wasm"))))]
+    {
+        let _ = pattern;
+        0
+    }
 }
 
 /// The result column a pattern's ORDER BY names by its alias, or the term
@@ -270,6 +413,9 @@ struct Matcher<'a> {
     document: &'a HirDocument,
     source: &'a hir::Source,
     captures: HashMap<u32, &'a hir::Expr>,
+    /// The pattern's FTS column positions the query names, sorted. Every
+    /// FTS function of one query names the same columns.
+    fields: Option<Vec<usize>>,
 }
 
 impl<'a> Matcher<'a> {
@@ -328,9 +474,22 @@ impl<'a> Matcher<'a> {
                 && filter_over.filter_clause.is_none()
                 && filter_over.over_clause.is_none() =>
             {
-                let hir::Expr::Function(call) = query else {
-                    return false;
-                };
+                self.capture_call(name.as_str(), args, query)
+            }
+            _ => false,
+        }
+    }
+
+    /// Whether `query` is a call of the function `name` with the pattern
+    /// arguments `args`. An FTS function names any non-empty subset of the
+    /// pattern's columns, in any order, and the same subset in every call
+    /// of one query; the arguments after the columns are positional.
+    /// `x MATCH y` and `(x, ...) MATCH y` are calls of `fts_match`.
+    fn capture_call(&mut self, name: &str, args: &[Box<ast::Expr>], query: &'a hir::Expr) -> bool {
+        let query = self.resolve(query);
+        let mut row_values: Vec<&'a hir::Expr> = Vec::new();
+        let values: &[&'a hir::Expr] = match query {
+            hir::Expr::Function(call) => {
                 let hir::FunctionArguments::Expressions {
                     values,
                     distinctness: None,
@@ -342,39 +501,70 @@ impl<'a> Matcher<'a> {
                 };
                 if !matches!(call.evaluation, hir::FunctionEvaluation::Scalar)
                     || !call_order_by.is_empty()
-                    || values.len() != args.len()
-                    || !call
-                        .function
-                        .value()
-                        .to_string()
-                        .eq_ignore_ascii_case(name.as_str())
+                    || !call.function.value().to_string().eq_ignore_ascii_case(name)
                 {
                     return false;
                 }
-                let columns = fts_column_arguments(name.as_str(), args.len());
-                // FTS functions accept their columns in any order.
-                let mut used = vec![false; columns];
-                for value in &values[..columns] {
-                    let Some(position) = (0..columns).find(|&position| {
-                        !used[position] && {
-                            let mut attempt = self.clone();
-                            attempt.capture(&args[position], value) && {
-                                *self = attempt;
-                                true
-                            }
-                        }
-                    }) else {
-                        return false;
-                    };
-                    used[position] = true;
-                }
-                args[columns..]
-                    .iter()
-                    .zip(&values[columns..])
-                    .all(|(arg, value)| self.capture(arg, value))
+                row_values.extend(values.iter());
+                &row_values
             }
-            _ => false,
+            hir::Expr::Like {
+                lhs,
+                negated: false,
+                operator: ast::LikeOperator::Match,
+                rhs,
+                escape: None,
+                ..
+            } if name.eq_ignore_ascii_case("fts_match") => {
+                match lhs.as_ref() {
+                    hir::Expr::Row(items) => row_values.extend(items.iter()),
+                    other => row_values.push(other),
+                }
+                row_values.push(rhs);
+                &row_values
+            }
+            _ => return false,
+        };
+        let columns = fts_column_arguments(name, args.len());
+        if columns == 0 {
+            return values.len() == args.len()
+                && args
+                    .iter()
+                    .zip(values)
+                    .all(|(arg, value)| self.capture(arg, value));
         }
+        let rest = args.len() - columns;
+        let Some(query_columns) = values.len().checked_sub(rest) else {
+            return false;
+        };
+        if query_columns == 0 || query_columns > columns {
+            return false;
+        }
+        let mut used = vec![false; columns];
+        for value in &values[..query_columns] {
+            let Some(position) = (0..columns).find(|&position| {
+                !used[position] && {
+                    let mut attempt = self.clone();
+                    attempt.capture(&args[position], value) && {
+                        *self = attempt;
+                        true
+                    }
+                }
+            }) else {
+                return false;
+            };
+            used[position] = true;
+        }
+        let fields = (0..columns).filter(|&position| used[position]).collect();
+        match &self.fields {
+            Some(previous) if *previous != fields => return false,
+            Some(_) => {}
+            None => self.fields = Some(fields),
+        }
+        args[columns..]
+            .iter()
+            .zip(&values[query_columns..])
+            .all(|(arg, value)| self.capture(arg, value))
     }
 }
 

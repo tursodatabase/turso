@@ -7655,20 +7655,14 @@ fn start_hir_index_method_loop(
     let loop_start = program.allocate_label();
     let next = program.allocate_label();
     let exhausted = program.allocate_label();
-    // The pattern's number, then the values of its placeholders.
-    let arguments = &prepared.access.arguments;
-    let start = program.alloc_registers(arguments.len() + 1);
-    program.emit_int(prepared.access.pattern as i64, start);
-    for (position, argument) in arguments.iter().enumerate() {
-        super::expr::translate_expr(program, document, argument, start + 1 + position)?;
-    }
-    program.emit_insn(Insn::IndexMethodQuery {
-        db: prepared.database,
-        cursor_id: prepared.index_cursor,
-        start_reg: start,
-        count_reg: arguments.len() + 1,
-        pc_if_empty: exhausted,
-    });
+    emit_index_method_query(
+        program,
+        document,
+        prepared.access,
+        prepared.database,
+        prepared.index_cursor,
+        exhausted,
+    )?;
     program.preassign_label_to_next_insn(loop_start);
     program.emit_insn(Insn::DeferredSeek {
         index_cursor_id: prepared.index_cursor,
@@ -7690,6 +7684,174 @@ fn start_hir_index_method_loop(
         },
         left_join,
     })
+}
+
+/// Start an index method's search on `cursor`: the pattern's number, the
+/// values of its placeholders, then the FTS columns the query names, when
+/// the method has them.
+fn emit_index_method_query(
+    program: &mut ProgramBuilder,
+    document: &HirDocument,
+    access: &crate::translate::hir_index_method::HirIndexMethodAccess,
+    database: usize,
+    cursor: CursorID,
+    pc_if_empty: BranchOffset,
+) -> Result<()> {
+    let arguments = &access.arguments;
+    let fields = access.fields.as_ref();
+    let count = arguments.len() + 1 + usize::from(fields.is_some());
+    let start = program.alloc_registers(count);
+    program.emit_int(access.pattern as i64, start);
+    for (position, argument) in arguments.iter().enumerate() {
+        super::expr::translate_expr(program, document, argument, start + 1 + position)?;
+    }
+    if let Some(fields) = fields {
+        program.emit_string8(fields.clone(), start + 1 + arguments.len());
+    }
+    program.emit_insn(Insn::IndexMethodQuery {
+        db: database,
+        cursor_id: cursor,
+        start_reg: start,
+        count_reg: count,
+        pc_if_empty,
+    });
+    Ok(())
+}
+
+/// Emit a WHERE or ON term for the row the loops found, jumping to `fail`
+/// when it does not hold. A term an index method answers, such as
+/// `fts_match(x, y)` with an FTS index on `x`, is checked through the
+/// index: the term's arguments are read from the row, the index searches
+/// for them, and the row passes when its rowid is among the results. Any
+/// other term is evaluated as an expression.
+pub(super) fn emit_hir_predicate(
+    program: &mut ProgramBuilder,
+    document: &HirDocument,
+    predicate: &crate::translate::plan::HirWhereTerm,
+    fail: BranchOffset,
+) -> Result<()> {
+    let passed = program.allocate_label();
+    if let Some((source, access)) = index_method_predicate(document, predicate) {
+        emit_index_method_predicate(program, document, source, &access, passed, fail)?;
+    } else {
+        super::expr::translate_condition_expr(
+            program,
+            document,
+            &predicate.expr,
+            ConditionMetadata {
+                jump_if_condition_is_true: false,
+                jump_target_when_true: passed,
+                jump_target_when_false: fail,
+            },
+        )?;
+    }
+    program.preassign_label_to_next_insn(passed);
+    Ok(())
+}
+
+/// The source whose index method answers `predicate` for a row of it, with
+/// the search to run.
+fn index_method_predicate(
+    document: &HirDocument,
+    predicate: &crate::translate::plan::HirWhereTerm,
+) -> Option<(
+    SourceId,
+    crate::translate::hir_index_method::HirIndexMethodAccess,
+)> {
+    let mut sources = Vec::new();
+    document.visit_expr_sources(&predicate.expr, &mut |source| {
+        if !sources.contains(&source) {
+            sources.push(source);
+        }
+    });
+    sources.into_iter().find_map(|source_id| {
+        let source = document.source(source_id)?;
+        if source.index_expressions.is_empty() {
+            return None;
+        }
+        crate::translate::hir_index_method::match_index_method_predicate(
+            document, source, predicate,
+        )
+        .map(|access| (source_id, access))
+    })
+}
+
+fn emit_index_method_predicate(
+    program: &mut ProgramBuilder,
+    document: &HirDocument,
+    source_id: SourceId,
+    access: &crate::translate::hir_index_method::HirIndexMethodAccess,
+    passed: BranchOffset,
+    fail: BranchOffset,
+) -> Result<()> {
+    let source = document.source(source_id).ok_or_else(|| {
+        LimboError::InternalError(format!(
+            "HIR index-method predicate references missing source {source_id}"
+        ))
+    })?;
+    let database = source
+        .database
+        .ok_or_else(|| {
+            LimboError::InternalError(format!(
+                "HIR index-method predicate source {source_id} has no database"
+            ))
+        })?
+        .index();
+    crate::emit_explain!(
+        program,
+        false,
+        EqpDetail::IndexMethod {
+            method: access
+                .index
+                .index_method
+                .as_ref()
+                .map(|method| method.definition().method_name.to_string())
+                .unwrap_or_default(),
+            estimate: None,
+        }
+    );
+    // The index is searched with its own cursor, so the loop's cursors
+    // stay on the row.
+    let cursor = program.alloc_cursor_index(None, &access.index)?;
+    let opened = program.allocate_label();
+    program.emit_insn(Insn::Once {
+        target_pc_when_reentered: opened,
+    });
+    program.emit_insn(Insn::OpenRead {
+        cursor_id: cursor,
+        root_page: access.index.root_page,
+        db: database,
+    });
+    program.preassign_label_to_next_insn(opened);
+    let rowid = program.alloc_register();
+    super::expr::translate_expr(program, document, &hir::Expr::RowId(source_id), rowid)?;
+    program.emit_insn(Insn::IsNull {
+        reg: rowid,
+        target_pc: fail,
+    });
+    emit_index_method_query(program, document, access, database, cursor, fail)?;
+    let found = program.alloc_register();
+    let search_next = program.allocate_label();
+    program.preassign_label_to_next_insn(search_next);
+    program.emit_insn(Insn::IdxRowId {
+        cursor_id: cursor,
+        dest: found,
+    });
+    program.emit_insn(Insn::Eq {
+        lhs: rowid,
+        rhs: found,
+        target_pc: passed,
+        flags: crate::vdbe::insn::CmpInsFlags::default(),
+        collation: None,
+    });
+    program.emit_insn(Insn::Next {
+        cursor_id: cursor,
+        is_index: program.cursor_is_index(cursor),
+        pc_if_next: search_next,
+        fullscan: false,
+    });
+    program.emit_insn(Insn::Goto { target_pc: fail });
+    Ok(())
 }
 
 fn prepare_hir_shared_cte_loop<'a>(
@@ -8767,18 +8929,7 @@ fn emit_ready_predicates(
         if evaluate_at != loop_index {
             continue;
         }
-        let passed = program.allocate_label();
-        super::expr::translate_condition_expr(
-            program,
-            document,
-            &predicate.expr,
-            ConditionMetadata {
-                jump_if_condition_is_true: false,
-                jump_target_when_true: passed,
-                jump_target_when_false: fail,
-            },
-        )?;
-        program.preassign_label_to_next_insn(passed);
+        emit_hir_predicate(program, document, predicate, fail)?;
     }
     Ok(())
 }

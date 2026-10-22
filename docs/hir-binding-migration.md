@@ -102,6 +102,16 @@ by main's own sqltests:
   by the names written, per-trigger-step conflict modes, ALTER COLUMN
   conversion, the whole-table DELETE fast path, and sequence names
   qualified at CREATE.
+- Index methods (FTS): a query names any subset of an index's columns, in
+  any order, and the index receives the chosen columns after the
+  placeholder values; `x MATCH y` matches patterns as `fts_match`; a
+  search whose arguments read the table's own row, or a table that loops
+  later, cannot drive the scan, so the term is checked through the index
+  for each row the loop finds (`emit_hir_predicate`); a search whose
+  arguments read earlier tables loops inside them; `fts_score` over the
+  selected columns and query reads the index's score, and any other
+  `fts_match`, `fts_score` or MATCH fails at prepare time with an error
+  that names the FTS index.
 
 The sqltest expectations that differ from main only in instruction
 addresses or ephemeral index names (`_s<id>` for a HIR source, where the
