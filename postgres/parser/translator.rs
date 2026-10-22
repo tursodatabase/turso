@@ -5833,6 +5833,9 @@ fn reject_constraint_attributes(
     {
         return Err(not_supported("DEFERRABLE / INITIALLY DEFERRED constraints"));
     }
+    if constraint.nulls_not_distinct {
+        return Err(not_supported("NULLS NOT DISTINCT"));
+    }
     if !constraint.fk_del_set_cols.is_empty() {
         return Err(not_supported(
             "ON DELETE SET NULL / SET DEFAULT with a column list",
@@ -8542,6 +8545,18 @@ mod tests {
         );
         assert_translates(
             "CREATE TABLE c (t int, a int, FOREIGN KEY (t, a) REFERENCES p(t, a) ON DELETE SET NULL)",
+        );
+    }
+
+    #[test]
+    fn fail_closed_nulls_not_distinct_constraint() {
+        assert_not_supported(
+            "CREATE TABLE c (a int UNIQUE NULLS NOT DISTINCT)",
+            "NULLS NOT DISTINCT",
+        );
+        assert_not_supported(
+            "CREATE TABLE c (a int, UNIQUE NULLS NOT DISTINCT (a))",
+            "NULLS NOT DISTINCT",
         );
     }
 }
