@@ -481,13 +481,11 @@ impl PostgreSQLTranslator {
         reject_column_def_clauses(col_def)?;
         let name = col_def.colname.clone();
         let pg_type = extract_type_name(col_def)?;
-        let typmods = extract_integer_typmods(col_def);
+        let typmods = extract_integer_typmods(col_def)?;
 
         let is_serial = is_serial_type(&pg_type);
 
-        let mapping = map_pg_type(&pg_type, &typmods).ok_or_else(|| {
-            ParseError::ParseError(format!("unsupported PostgreSQL type: {pg_type}"))
-        })?;
+        let mapping = map_column_type(&pg_type, &typmods)?;
 
         // Serial does NOT imply PRIMARY KEY in PostgreSQL
         let mut is_primary_key = false;
@@ -899,10 +897,8 @@ impl PostgreSQLTranslator {
         reject_column_def_clauses(col_def)?;
 
         let pg_type = extract_type_name(col_def)?;
-        let typmods = extract_integer_typmods(col_def);
-        let mapping = map_pg_type(&pg_type, &typmods).ok_or_else(|| {
-            ParseError::ParseError(format!("unsupported PostgreSQL type: {pg_type}"))
-        })?;
+        let typmods = extract_integer_typmods(col_def)?;
+        let mapping = map_column_type(&pg_type, &typmods)?;
         let size = match mapping.type_params.as_slice() {
             [p, s] => Some(ast::TypeSize::TypeSize(
                 Box::new(ast::Expr::Literal(ast::Literal::Numeric(p.to_string()))),
@@ -5236,25 +5232,38 @@ fn extract_type_name(col_def: &pg_query::protobuf::ColumnDef) -> Result<String, 
 
 /// Extract integer type modifiers from a column definition.
 /// For `varchar(50)` this returns `[50]`, for `numeric(10, 2)` returns `[10, 2]`.
-fn extract_integer_typmods(col_def: &pg_query::protobuf::ColumnDef) -> Vec<i64> {
+fn extract_integer_typmods(
+    col_def: &pg_query::protobuf::ColumnDef,
+) -> Result<Vec<i64>, ParseError> {
     use pg_query::protobuf::a_const::Val;
     use pg_query::protobuf::node::Node;
 
     let Some(type_name) = &col_def.type_name else {
-        return vec![];
+        return Ok(vec![]);
     };
     type_name
         .typmods
         .iter()
-        .filter_map(|node| match &node.node {
-            Some(Node::Integer(i)) => Some(i.ival as i64),
+        .map(|node| match &node.node {
+            Some(Node::Integer(i)) => Ok(i.ival as i64),
             Some(Node::AConst(a_const)) => match &a_const.val {
-                Some(Val::Ival(i)) => Some(i.ival as i64),
-                _ => None,
+                Some(Val::Ival(i)) => Ok(i.ival as i64),
+                _ => Err(not_supported("non-integer type modifier")),
             },
-            _ => None,
+            _ => Err(not_supported("non-integer type modifier")),
         })
         .collect()
+}
+
+/// Maps a column's PG type, rejecting type modifiers the mapping would drop
+/// (e.g. the precision in `timestamp(3)`).
+fn map_column_type(pg_type: &str, typmods: &[i64]) -> Result<PgTypeMapping, ParseError> {
+    let mapping = map_pg_type(pg_type, typmods)
+        .ok_or_else(|| ParseError::ParseError(format!("unsupported PostgreSQL type: {pg_type}")))?;
+    if !typmods.is_empty() && mapping.type_params.is_empty() {
+        return Err(not_supported(format!("type modifiers on {pg_type}")));
+    }
+    Ok(mapping)
 }
 
 fn extract_key_columns(keys: &[pg_query::protobuf::Node]) -> Result<Vec<String>, ParseError> {
@@ -8837,5 +8846,23 @@ mod tests {
             "CREATE TABLE t (a int REFERENCES p(id) REFERENCES q(id))",
             "multiple REFERENCES",
         );
+    }
+
+    #[test]
+    fn fail_closed_column_type_modifiers() {
+        assert_not_supported("CREATE TABLE t (a timestamp(3))", "type modifiers");
+        assert_not_supported("CREATE TABLE t (a time(0))", "type modifiers");
+        assert_not_supported("CREATE TABLE t (a bit(8))", "type modifiers");
+        assert_not_supported(
+            "ALTER TABLE t ADD COLUMN a timestamptz(0)",
+            "type modifiers",
+        );
+        assert_not_supported(
+            "CREATE TABLE t (a mytype('x'))",
+            "non-integer type modifier",
+        );
+        // char(n) arrives as bpchar, which maps to unbounded TEXT.
+        assert_not_supported("CREATE TABLE t (a char(2))", "type modifiers on bpchar");
+        assert_translates("CREATE TABLE t (a varchar(3), b numeric(10, 2), c text, d int[])");
     }
 }
