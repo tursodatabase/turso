@@ -1378,6 +1378,11 @@ impl PostgreSQLTranslator {
         })?;
         let view_name = self.qualified_name_from_range_var(relation);
         reject_into_clause(into_clause, relation, "CREATE MATERIALIZED VIEW")?;
+        // Materialized views here are maintained incrementally and always
+        // populated, so there is no unpopulated state to create.
+        if into_clause.skip_data {
+            return Err(not_supported("CREATE MATERIALIZED VIEW ... WITH NO DATA"));
+        }
 
         // Column aliases from the INTO clause
         let columns: Vec<ast::IndexedColumn> = into_clause
@@ -9242,5 +9247,14 @@ mod tests {
             "TABLESPACE",
         );
         assert_translates("CREATE UNLOGGED TABLE t AS SELECT 1 AS a");
+    }
+
+    #[test]
+    fn fail_closed_matview_with_no_data() {
+        assert_not_supported(
+            "CREATE MATERIALIZED VIEW m AS SELECT 1 AS a WITH NO DATA",
+            "WITH NO DATA",
+        );
+        assert_translates("CREATE TABLE t AS SELECT 1 AS a WITH NO DATA");
     }
 }
