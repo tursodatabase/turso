@@ -3521,6 +3521,25 @@ impl PostgreSQLTranslator {
             _ => func_name,
         };
 
+        // The time functions get the time the statement started as their
+        // argument, which the engine keeps constant for the whole statement
+        // and its triggers. now() keeps the first one of a transaction block.
+        if args.is_empty()
+            && matches!(
+                func_name.as_str(),
+                "now" | "transaction_timestamp" | "statement_timestamp"
+            )
+        {
+            return Ok(ast::Expr::FunctionCall {
+                name: ast::Name::from_string(func_name),
+                distinctness,
+                args: vec![Box::new(statement_time_expr())],
+                order_by: vec![],
+                within_group: vec![],
+                filter_over,
+            });
+        }
+
         // PG type-cast functions: float8(x) → CAST(x AS REAL), int4(x) → CAST(x AS INTEGER), etc.
         let cast_type = match func_name.to_uppercase().as_str() {
             "FLOAT8" | "FLOAT4" => Some("REAL"),
@@ -5357,6 +5376,27 @@ pub fn try_extract_set(parse_result: &ParseResult) -> Option<PgSetStmt> {
         values,
         is_local: set_stmt.is_local,
     })
+}
+
+/// The time the statement started, in the text form of the `timestamptz`
+/// type: `rtrim(rtrim(strftime('%Y-%m-%d %H:%M:%f', 'now'), '0'), '.')`,
+/// so that a stored timestamp compares equal to the time functions.
+fn statement_time_expr() -> ast::Expr {
+    let call = |name: &str, args: Vec<ast::Expr>| ast::Expr::FunctionCall {
+        name: ast::Name::from_string(name),
+        distinctness: None,
+        args: args.into_iter().map(Box::new).collect(),
+        order_by: vec![],
+        within_group: vec![],
+        filter_over: ast::FunctionTail {
+            filter_clause: None,
+            over_clause: None,
+        },
+    };
+    let text = |value: &str| ast::Expr::Literal(ast::Literal::String(format!("'{value}'")));
+    let with_milliseconds = call("strftime", vec![text("%Y-%m-%d %H:%M:%f"), text("now")]);
+    let without_trailing_zeros = call("rtrim", vec![with_milliseconds, text("0")]);
+    call("rtrim", vec![without_trailing_zeros, text(".")])
 }
 
 pub fn is_set_transaction(parse_result: &ParseResult) -> bool {

@@ -30,6 +30,9 @@ struct PgConnectionInner {
 struct SessionState {
     search_path: Option<Vec<String>>,
     search_path_setting: Option<String>,
+    /// The time of BEGIN, which `now()` returns until the transaction block
+    /// ends.
+    transaction_start: Option<String>,
 }
 
 type PgSessionState = Mutex<SessionState>;
@@ -204,6 +207,7 @@ fn prepare_statement(pg_conn: &Arc<PgConnectionInner>, sql: &str) -> Result<Stat
         .map_err(|e| LimboError::ParseError(e.to_string()))?;
     reject_catalog_dml(translated.cmd.stmt())?;
     check_trigger_function(&pg_conn.conn, translated.cmd.stmt())?;
+    note_transaction_block(&pg_conn.conn, translated.cmd.stmt());
 
     let options = PrepareOptions {
         unqualified_database_search_path: search_path,
@@ -250,6 +254,44 @@ fn create_table_schema_from_search_path(
 /// current_schema() returns. None when no schema of `search_path` exists.
 /// The default search_path, "$user", public, gives public, since there is no
 /// schema named after a user.
+/// Keep the time BEGIN starts a transaction block, so `now()` returns it
+/// until COMMIT or ROLLBACK ends the block.
+fn note_transaction_block(conn: &Connection, stmt: &ast::Stmt) {
+    match stmt {
+        ast::Stmt::Begin { .. } if conn.get_auto_commit() => {
+            session_state(conn).lock().unwrap().transaction_start =
+                Some(crate::functions::clock_time());
+        }
+        ast::Stmt::Commit { .. }
+        | ast::Stmt::Rollback {
+            savepoint_name: None,
+            ..
+        } => end_transaction_block(conn),
+        _ => {}
+    }
+}
+
+/// The time the transaction block started: the time of BEGIN, or the time
+/// of the first statement that asked when BEGIN did not go through the
+/// session.
+pub(crate) fn transaction_block_start(conn: &Connection, statement_time: &str) -> String {
+    session_state(conn)
+        .lock()
+        .unwrap()
+        .transaction_start
+        .get_or_insert_with(|| statement_time.to_string())
+        .clone()
+}
+
+pub(crate) fn end_transaction_block(conn: &Connection) {
+    session_state(conn).lock().unwrap().transaction_start = None;
+}
+
+fn session_state(conn: &Connection) -> &PgSessionState {
+    conn.context::<PgSessionState>()
+        .expect("PostgreSQL connections have session state")
+}
+
 pub(crate) fn current_schema(conn: &Connection) -> Option<String> {
     let Some(search_path) = conn
         .context::<PgSessionState>()
