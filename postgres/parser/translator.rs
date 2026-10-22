@@ -528,6 +528,9 @@ impl PostgreSQLTranslator {
                     }
                 }
                 ConstrType::ConstrForeign => {
+                    if foreign_key.is_some() {
+                        return Err(not_supported("multiple REFERENCES on one column"));
+                    }
                     foreign_key = extract_foreign_key(constraint);
                 }
                 // NULL, NOT DEFERRABLE and INITIALLY IMMEDIATE restate the defaults.
@@ -8825,6 +8828,14 @@ mod tests {
         assert_not_supported(
             "ALTER TABLE t ALTER COLUMN a TYPE text COLLATE \"C\"",
             "COLLATE",
+        );
+    }
+
+    #[test]
+    fn fail_closed_multiple_references() {
+        assert_not_supported(
+            "CREATE TABLE t (a int REFERENCES p(id) REFERENCES q(id))",
+            "multiple REFERENCES",
         );
     }
 }
