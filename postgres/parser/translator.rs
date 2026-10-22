@@ -6216,23 +6216,33 @@ pub struct PgCopyFromStmt {
 
 /// Try to extract a COPY FROM file statement from pg_query parse output.
 /// Returns None if the statement is not a COPY FROM with a filename.
-pub fn try_extract_copy_from(parse_result: &ParseResult) -> Option<PgCopyFromStmt> {
+///
+/// Returns `Ok(None)` for statements that are not a file COPY FROM, and an
+/// error for a COPY FROM using an option this frontend does not implement.
+pub fn try_extract_copy_from(
+    parse_result: &ParseResult,
+) -> Result<Option<PgCopyFromStmt>, ParseError> {
     use pg_query::NodeRef;
 
     let nodes = parse_result.protobuf.nodes();
     if nodes.is_empty() {
-        return None;
+        return Ok(None);
     }
     let NodeRef::CopyStmt(copy) = &nodes[0].0 else {
-        return None;
+        return Ok(None);
     };
 
     // Only handle COPY FROM with a file path (not STDIN, not COPY TO)
     if !copy.is_from || copy.filename.is_empty() || copy.is_program {
-        return None;
+        return Ok(None);
+    }
+    if copy.where_clause.is_some() {
+        return Err(not_supported("COPY FROM ... WHERE"));
     }
 
-    let relation = copy.relation.as_ref()?;
+    let Some(relation) = copy.relation.as_ref() else {
+        return Ok(None);
+    };
     let table_name = relation.relname.clone();
     let schema_name = if relation.schemaname.is_empty()
         || matches!(
@@ -6247,15 +6257,7 @@ pub fn try_extract_copy_from(parse_result: &ParseResult) -> Option<PgCopyFromStm
     let columns = if copy.attlist.is_empty() {
         None
     } else {
-        let cols: Vec<String> = copy
-            .attlist
-            .iter()
-            .filter_map(|n| match &n.node {
-                Some(pg_query::protobuf::node::Node::String(s)) => Some(s.sval.clone()),
-                _ => None,
-            })
-            .collect();
-        Some(cols)
+        Some(extract_key_columns(&copy.attlist)?)
     };
 
     let mut delimiter = None;
@@ -6264,25 +6266,32 @@ pub fn try_extract_copy_from(parse_result: &ParseResult) -> Option<PgCopyFromStm
 
     for opt in &copy.options {
         let Some(pg_query::protobuf::node::Node::DefElem(def)) = &opt.node else {
-            continue;
+            return Err(ParseError::ParseError(
+                "COPY: unexpected option node".into(),
+            ));
         };
         match def.defname.as_str() {
             "format" => {
                 // Only support text format for now
                 if let Some(val) = def_elem_string_val(def) {
                     if val.to_lowercase() != "text" {
-                        return None; // unsupported format
+                        return Err(not_supported(format!("COPY FORMAT {val}")));
                     }
                 }
             }
             "delimiter" => delimiter = def_elem_string_val(def),
             "header" => header = def_elem_bool_val(def).unwrap_or(true),
             "null" => null_string = def_elem_string_val(def),
-            _ => {}
+            other => {
+                return Err(not_supported(format!(
+                    "COPY option {}",
+                    other.to_uppercase()
+                )))
+            }
         }
     }
 
-    Some(PgCopyFromStmt {
+    Ok(Some(PgCopyFromStmt {
         table_name,
         schema_name,
         columns,
@@ -6290,7 +6299,7 @@ pub fn try_extract_copy_from(parse_result: &ParseResult) -> Option<PgCopyFromStm
         delimiter,
         header,
         null_string,
-    })
+    }))
 }
 
 /// Parse a SQL referential action string to an AST RefAct.
@@ -9358,7 +9367,7 @@ mod tests {
     #[test]
     fn test_try_extract_copy_from() {
         let parsed = crate::parse("COPY users FROM '/tmp/data.tsv'").unwrap();
-        let copy = try_extract_copy_from(&parsed).unwrap();
+        let copy = try_extract_copy_from(&parsed).unwrap().unwrap();
         assert_eq!(copy.table_name, "users");
         assert!(copy.schema_name.is_none());
         assert!(copy.columns.is_none());
@@ -9371,19 +9380,38 @@ mod tests {
     #[test]
     fn test_try_extract_copy_from_not_to() {
         let parsed = crate::parse("COPY users TO '/tmp/out.tsv'").unwrap();
-        assert!(try_extract_copy_from(&parsed).is_none());
+        assert!(try_extract_copy_from(&parsed).unwrap().is_none());
     }
 
     #[test]
     fn test_try_extract_copy_from_not_stdin() {
         let parsed = crate::parse("COPY users FROM STDIN").unwrap();
-        assert!(try_extract_copy_from(&parsed).is_none());
+        assert!(try_extract_copy_from(&parsed).unwrap().is_none());
+    }
+
+    #[test]
+    fn fail_closed_copy_from_options() {
+        for (sql, needle) in [
+            ("COPY t FROM '/tmp/d' WITH (FORMAT csv)", "FORMAT csv"),
+            ("COPY t FROM '/tmp/d' WITH (QUOTE '\"')", "QUOTE"),
+            ("COPY t FROM '/tmp/d' WITH (ENCODING 'LATIN1')", "ENCODING"),
+            ("COPY t FROM '/tmp/d' WITH (FORCE_NULL (a))", "FORCE_NULL"),
+            ("COPY t FROM '/tmp/d' WITH (FREEZE)", "FREEZE"),
+            ("COPY t FROM '/tmp/d' WHERE a > 1", "WHERE"),
+        ] {
+            let parsed = crate::parse(sql).unwrap();
+            let err = try_extract_copy_from(&parsed).expect_err(sql).to_string();
+            assert!(
+                err.contains("not supported") && err.contains(needle),
+                "{sql}: {err}"
+            );
+        }
     }
 
     #[test]
     fn test_try_extract_copy_from_with_columns() {
         let parsed = crate::parse("COPY users (id, name) FROM '/tmp/data.tsv'").unwrap();
-        let copy = try_extract_copy_from(&parsed).unwrap();
+        let copy = try_extract_copy_from(&parsed).unwrap().unwrap();
         let cols = copy.columns.unwrap();
         assert_eq!(cols, vec!["id", "name"]);
     }
