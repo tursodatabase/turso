@@ -3356,17 +3356,19 @@ impl PostgreSQLTranslator {
         &self,
         a_expr: &pg_query::protobuf::AExpr,
     ) -> Result<ast::Expr, ParseError> {
-        // Extract operator name — use the last String node to handle
-        // schema-qualified operators like OPERATOR(pg_catalog.~)
-        let op_name = a_expr
-            .name
-            .iter()
-            .rev()
-            .find_map(|name| match &name.node {
-                Some(pg_query::protobuf::node::Node::String(s)) => Some(s.sval.as_str()),
-                _ => None,
-            })
-            .ok_or_else(|| ParseError::ParseError("Missing operator name".to_string()))?;
+        // OPERATOR(pg_catalog.~) names a built-in operator; any other schema
+        // would name a user-defined one that does not exist here.
+        let op_name = match extract_key_columns(&a_expr.name)?.as_slice() {
+            [name] => name.clone(),
+            [schema, name] if schema == "pg_catalog" => name.clone(),
+            [] => return Err(ParseError::ParseError("Missing operator name".to_string())),
+            _ => {
+                return Err(not_supported(
+                    "operators qualified with a schema other than pg_catalog",
+                ))
+            }
+        };
+        let op_name = op_name.as_str();
 
         // Handle unary operators (no left expression)
         if a_expr.lexpr.is_none() {
@@ -10058,5 +10060,11 @@ mod tests {
             "BETWEEN SYMMETRIC",
         );
         assert_translates("SELECT 5 BETWEEN ASYMMETRIC 1 AND 10");
+    }
+
+    #[test]
+    fn fail_closed_schema_qualified_operators() {
+        assert_not_supported("SELECT 1 OPERATOR(myschema.+) 2", "operators qualified");
+        assert_translates("SELECT 'a' OPERATOR(pg_catalog.~) '^a'");
     }
 }
