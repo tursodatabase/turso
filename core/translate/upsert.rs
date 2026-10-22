@@ -1024,6 +1024,7 @@ pub fn emit_upsert(
                     new_start,
                     rowid_new_reg,
                     &directly_changed_cols,
+                    !affected_parent_fks.is_empty(),
                     upsert_database_id,
                     resolver,
                     &layout,

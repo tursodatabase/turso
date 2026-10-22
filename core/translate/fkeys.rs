@@ -1069,6 +1069,7 @@ pub fn emit_fk_child_update_counters(
     new_start_reg: usize,
     new_rowid_reg: usize,
     updated_cols: &ColumnMask,
+    parent_key_changed: bool,
     database_id: usize,
     resolver: &Resolver,
     layout: &ColumnLayout,
@@ -1112,10 +1113,17 @@ pub fn emit_fk_child_update_counters(
         Ok(Some((dml_ctx, fk_col_positions, null_skip_label)))
     };
 
-    for fk_ref in
-        resolver.with_schema(database_id, |s| s.resolved_fks_for_child(child_table_name))?
-    {
-        // If the child-side FK columns did not change, there is nothing to do.
+    let child_key_changed = child_tbl
+        .foreign_keys
+        .iter()
+        .any(|fk| fk.child_key_assigned(child_tbl, updated_cols));
+    if !child_key_changed && !parent_key_changed {
+        return Ok(());
+    }
+
+    for fk_ref in resolver.with_schema(database_id, |s| {
+        s.resolved_fks_for_child(child_table_name, Some(updated_cols))
+    })? {
         if !fk_ref.child_key_changed(updated_cols, child_tbl) {
             continue;
         }
