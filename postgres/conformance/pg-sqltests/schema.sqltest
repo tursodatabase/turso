@@ -87,3 +87,11 @@ test create-index-on-schema-qualified-table-constrains-that-table {
     INSERT INTO idx_s2.t VALUES (1);
 }
 expect error {}
+
+test create-index-on-pg-temp-table-constrains-it {
+    CREATE TEMP TABLE idx_tq (x int);
+    CREATE UNIQUE INDEX idx_tqi ON pg_temp.idx_tq (x);
+    INSERT INTO idx_tq VALUES (1);
+    INSERT INTO idx_tq VALUES (1);
+}
+expect error {}

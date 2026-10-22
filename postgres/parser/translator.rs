@@ -910,7 +910,9 @@ impl PostgreSQLTranslator {
             .ok_or_else(|| ParseError::ParseError("CREATE INDEX missing table name".into()))?;
         let tbl_name = ast::Name::from_string(self.map_table_name(&relation.relname));
 
-        let idx_name = if relation.schemaname.is_empty() {
+        let idx_name = if relation.schemaname.is_empty()
+            || relation.schemaname.eq_ignore_ascii_case("pg_temp")
+        {
             ast::QualifiedName::single(ast::Name::from_string(&idx.idxname))
         } else {
             ast::QualifiedName::fullname(
@@ -5691,6 +5693,16 @@ fn drop_object_type_name(obj_type: pg_query::protobuf::ObjectType) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn create_index_on_pg_temp_table_is_unqualified() {
+        let parsed = crate::parse("CREATE INDEX i ON pg_temp.t (a)").unwrap();
+        let stmt = PostgreSQLTranslator::new().translate(&parsed).unwrap();
+        let ast::Stmt::CreateIndex { idx_name, .. } = stmt else {
+            panic!("expected CREATE INDEX, got {stmt:?}");
+        };
+        assert!(idx_name.namespace.is_none(), "{idx_name:?}");
+    }
 
     #[test]
     fn create_index_keeps_table_schema() {
