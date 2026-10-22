@@ -727,63 +727,7 @@ impl PostgreSQLTranslator {
         if txn.chain {
             return Err(not_supported("COMMIT/ROLLBACK AND CHAIN"));
         }
-        // Turso has no isolation levels: every transaction reads one snapshot
-        // taken at its start. That is PostgreSQL's REPEATABLE READ. It is not
-        // SERIALIZABLE (MVCC allows write skew), and it is not READ COMMITTED
-        // (no per-statement snapshots), so only REPEATABLE READ is accepted.
-        // DEFERRABLE and READ ONLY are restrictions that are not enforced.
-        for opt in &txn.options {
-            let Some(pg_query::protobuf::node::Node::DefElem(def)) = &opt.node else {
-                return Err(not_supported("transaction option"));
-            };
-            match def.defname.as_str() {
-                "transaction_isolation" => {
-                    let level = match def.arg.as_ref().and_then(|n| n.node.as_ref()) {
-                        Some(pg_query::protobuf::node::Node::AConst(
-                            pg_query::protobuf::AConst {
-                                val: Some(pg_query::protobuf::a_const::Val::Sval(s)),
-                                ..
-                            },
-                        )) => s.sval.to_lowercase(),
-                        _ => return Err(not_supported("this transaction isolation level")),
-                    };
-                    if level != "repeatable read" {
-                        return Err(not_supported(format!(
-                            "ISOLATION LEVEL {} (Turso transactions are snapshot isolation, \
-                             i.e. REPEATABLE READ)",
-                            level.to_uppercase()
-                        )));
-                    }
-                }
-                "transaction_deferrable" => {
-                    // pg_query encodes NOT DEFERRABLE as integer 0.
-                    let not_deferrable = matches!(
-                        def.arg.as_ref().and_then(|n| n.node.as_ref()),
-                        Some(pg_query::protobuf::node::Node::AConst(pg_query::protobuf::AConst {
-                            val: Some(pg_query::protobuf::a_const::Val::Ival(i)),
-                            ..
-                        })) if i.ival == 0
-                    );
-                    if !not_deferrable {
-                        return Err(not_supported("DEFERRABLE transactions"));
-                    }
-                }
-                "transaction_read_only" => {
-                    // pg_query encodes READ WRITE as integer 0 and READ ONLY as 1.
-                    let read_write = matches!(
-                        def.arg.as_ref().and_then(|n| n.node.as_ref()),
-                        Some(pg_query::protobuf::node::Node::AConst(pg_query::protobuf::AConst {
-                            val: Some(pg_query::protobuf::a_const::Val::Ival(i)),
-                            ..
-                        })) if i.ival == 0
-                    );
-                    if !read_write {
-                        return Err(not_supported("READ ONLY transactions"));
-                    }
-                }
-                other => return Err(not_supported(format!("transaction option {other}"))),
-            }
-        }
+        check_transaction_options(&txn.options, false)?;
 
         match TransactionStmtKind::try_from(txn.kind) {
             Ok(TransactionStmtKind::TransStmtBegin | TransactionStmtKind::TransStmtStart) => {
@@ -6018,15 +5962,84 @@ pub fn try_extract_set(parse_result: &ParseResult) -> Option<PgSetStmt> {
     })
 }
 
-pub fn is_set_transaction(parse_result: &ParseResult) -> bool {
+/// Checks BEGIN / SET TRANSACTION options against what Turso provides.
+fn check_transaction_options(
+    options: &[pg_query::protobuf::Node],
+    read_only_allowed: bool,
+) -> Result<(), ParseError> {
+    // Turso has no isolation levels: every transaction reads one snapshot
+    // taken at its start. That is PostgreSQL's REPEATABLE READ. It is not
+    // SERIALIZABLE (MVCC allows write skew), and it is not READ COMMITTED
+    // (no per-statement snapshots), so only REPEATABLE READ is accepted.
+    // DEFERRABLE and READ ONLY are restrictions that are not enforced.
+    for opt in options {
+        let Some(pg_query::protobuf::node::Node::DefElem(def)) = &opt.node else {
+            return Err(not_supported("transaction option"));
+        };
+        match def.defname.as_str() {
+            "transaction_isolation" => {
+                let level = match def.arg.as_ref().and_then(|n| n.node.as_ref()) {
+                    Some(pg_query::protobuf::node::Node::AConst(pg_query::protobuf::AConst {
+                        val: Some(pg_query::protobuf::a_const::Val::Sval(s)),
+                        ..
+                    })) => s.sval.to_lowercase(),
+                    _ => return Err(not_supported("this transaction isolation level")),
+                };
+                if level != "repeatable read" {
+                    return Err(not_supported(format!(
+                        "ISOLATION LEVEL {} (Turso transactions are snapshot isolation, \
+                         i.e. REPEATABLE READ)",
+                        level.to_uppercase()
+                    )));
+                }
+            }
+            "transaction_deferrable" => {
+                // pg_query encodes NOT DEFERRABLE as integer 0.
+                let not_deferrable = matches!(
+                    def.arg.as_ref().and_then(|n| n.node.as_ref()),
+                    Some(pg_query::protobuf::node::Node::AConst(pg_query::protobuf::AConst {
+                        val: Some(pg_query::protobuf::a_const::Val::Ival(i)),
+                        ..
+                    })) if i.ival == 0
+                );
+                if !not_deferrable {
+                    return Err(not_supported("DEFERRABLE transactions"));
+                }
+            }
+            "transaction_read_only" => {
+                // pg_query encodes READ WRITE as integer 0 and READ ONLY as 1.
+                let read_write = matches!(
+                    def.arg.as_ref().and_then(|n| n.node.as_ref()),
+                    Some(pg_query::protobuf::node::Node::AConst(pg_query::protobuf::AConst {
+                        val: Some(pg_query::protobuf::a_const::Val::Ival(i)),
+                        ..
+                    })) if i.ival == 0
+                );
+                if !read_write && !read_only_allowed {
+                    return Err(not_supported("READ ONLY transactions"));
+                }
+            }
+            other => return Err(not_supported(format!("transaction option {other}"))),
+        }
+    }
+    Ok(())
+}
+
+/// Whether the statement is `SET TRANSACTION ...`, after rejecting options
+/// Turso cannot honour. READ ONLY is accepted because pg_dump sends it.
+pub fn check_set_transaction(parse_result: &ParseResult) -> Result<bool, ParseError> {
     use pg_query::{protobuf::VariableSetKind, NodeRef};
 
-    matches!(
-        parse_result.protobuf.nodes().first().map(|node| &node.0),
+    match parse_result.protobuf.nodes().first().map(|node| &node.0) {
         Some(NodeRef::VariableSetStmt(stmt))
             if stmt.kind == VariableSetKind::VarSetMulti as i32
-                && stmt.name.eq_ignore_ascii_case("transaction")
-    )
+                && stmt.name.eq_ignore_ascii_case("transaction") =>
+        {
+            check_transaction_options(&stmt.args, true)?;
+            Ok(true)
+        }
+        _ => Ok(false),
+    }
 }
 
 /// The byte offset of the table name in a CREATE TABLE statement that names
@@ -10658,5 +10671,40 @@ mod tests {
         }
         assert_translates("BEGIN ISOLATION LEVEL REPEATABLE READ, READ WRITE, NOT DEFERRABLE");
         assert_translates("BEGIN");
+    }
+
+    #[test]
+    fn fail_closed_set_transaction_options() {
+        for (sql, needle) in [
+            (
+                "SET TRANSACTION ISOLATION LEVEL SERIALIZABLE",
+                "SERIALIZABLE",
+            ),
+            (
+                "SET TRANSACTION ISOLATION LEVEL READ COMMITTED",
+                "READ COMMITTED",
+            ),
+            ("SET TRANSACTION DEFERRABLE", "DEFERRABLE"),
+        ] {
+            let err = check_set_transaction(&crate::parse(sql).unwrap())
+                .expect_err(sql)
+                .to_string();
+            assert!(
+                err.contains("not supported") && err.contains(needle),
+                "{sql}: {err}"
+            );
+        }
+        for sql in [
+            "SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY",
+            "SET TRANSACTION READ WRITE, NOT DEFERRABLE",
+        ] {
+            assert!(
+                check_set_transaction(&crate::parse(sql).unwrap()).unwrap(),
+                "{sql}"
+            );
+        }
+        assert!(
+            !check_set_transaction(&crate::parse("SET search_path TO public").unwrap()).unwrap()
+        );
     }
 }
