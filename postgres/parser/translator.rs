@@ -1068,6 +1068,12 @@ impl PostgreSQLTranslator {
             .ok_or_else(|| ParseError::ParseError("CREATE INDEX missing table name".into()))?;
         let tbl_name = ast::Name::from_string(self.map_table_name(&relation.relname));
 
+        if !idx.access_method.is_empty() && !idx.access_method.eq_ignore_ascii_case("btree") {
+            return Err(not_supported(format!(
+                "CREATE INDEX ... USING {}",
+                idx.access_method
+            )));
+        }
         // SQLite names the database on the index, not on the table, and
         // looks the table up there.
         let idx_name = if relation.schemaname.is_empty() {
@@ -9370,5 +9376,12 @@ mod tests {
         assert_translates("BEGIN ISOLATION LEVEL SERIALIZABLE, READ WRITE");
         assert_translates("START TRANSACTION DEFERRABLE");
         assert_translates("COMMIT AND NO CHAIN");
+    }
+
+    #[test]
+    fn fail_closed_index_access_method() {
+        assert_not_supported("CREATE INDEX i ON t USING gin (a)", "USING gin");
+        assert_not_supported("CREATE INDEX i ON t USING hash (a)", "USING hash");
+        assert_translates("CREATE INDEX i ON t USING btree (a)");
     }
 }
