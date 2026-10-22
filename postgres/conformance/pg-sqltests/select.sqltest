@@ -737,9 +737,17 @@ setup set_operation_operands {
 }
 
 @setup set_operation_operands
+@skip-if postgres "PostgreSQL accepts it"
+test set-operation-leading-operand-selecting-star-rejected {
+    (SELECT * FROM t ORDER BY a LIMIT 1) UNION SELECT * FROM u;
+}
+expect error {
+}
+
+@setup set_operation_operands
 test set-operation-operands-keep-their-own-order-by-and-limit {
     (SELECT a FROM t ORDER BY a DESC LIMIT 1) UNION ALL (SELECT a FROM u ORDER BY a LIMIT 1) ORDER BY a;
-    (SELECT * FROM t ORDER BY a DESC LIMIT 2) UNION SELECT * FROM u ORDER BY a;
+    (SELECT a, b FROM t ORDER BY a DESC LIMIT 2) UNION SELECT a, b FROM u ORDER BY a;
     SELECT 0 UNION ALL (SELECT a FROM u ORDER BY a OFFSET 1) ORDER BY 1;
 }
 expect {

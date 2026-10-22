@@ -1892,7 +1892,7 @@ impl PostgreSQLTranslator {
         // The leftmost operand names the result columns. Selecting * from it
         // as a subquery would rename duplicate names (`a`, `a:1`).
         if (is_set_operation(leftmost) || has_own_select_clauses(leftmost))
-            && !has_distinct_output_names(leftmost)
+            && !self.has_distinct_output_names(leftmost)
         {
             return Err(not_supported(
                 "a parenthesized leading set operation operand without distinct column names",
@@ -1923,6 +1923,47 @@ impl PostgreSQLTranslator {
             order_by,
             limit,
         })
+    }
+
+    fn has_distinct_output_names(&self, stmt: &pg_query::protobuf::SelectStmt) -> bool {
+        use pg_query::protobuf::node::Node;
+        let mut leaf = stmt;
+        while is_set_operation(leaf) {
+            let Some(larg) = &leaf.larg else {
+                return false;
+            };
+            leaf = larg;
+        }
+        if leaf.target_list.is_empty() {
+            return !leaf.values_lists.is_empty();
+        }
+        let mut names = std::collections::HashSet::new();
+        for target in &leaf.target_list {
+            let Some(Node::ResTarget(res_target)) = &target.node else {
+                return false;
+            };
+            let Some(val) = res_target.val.as_deref() else {
+                return false;
+            };
+            if let Some(Node::ColumnRef(col_ref)) = &val.node {
+                if col_ref
+                    .fields
+                    .last()
+                    .is_some_and(|f| matches!(f.node, Some(Node::AStar(_))))
+                {
+                    return false;
+                }
+            }
+            let name = if res_target.name.is_empty() {
+                derived_column_name(val).unwrap_or_else(|| "?column?".to_string())
+            } else {
+                res_target.name.clone()
+            };
+            if !names.insert(name.to_lowercase()) {
+                return false;
+            }
+        }
+        true
     }
 
     fn translate_compound_operand(
@@ -6739,54 +6780,6 @@ fn has_own_select_clauses(stmt: &pg_query::protobuf::SelectStmt) -> bool {
         || !stmt.locking_clause.is_empty()
 }
 
-/// Whether the output columns of `stmt` are known to have distinct names.
-fn has_distinct_output_names(stmt: &pg_query::protobuf::SelectStmt) -> bool {
-    use pg_query::protobuf::node::Node;
-    let mut leaf = stmt;
-    while is_set_operation(leaf) {
-        let Some(larg) = &leaf.larg else {
-            return false;
-        };
-        leaf = larg;
-    }
-    if leaf.target_list.is_empty() {
-        return !leaf.values_lists.is_empty();
-    }
-    let mut names = std::collections::HashSet::new();
-    for target in &leaf.target_list {
-        let Some(Node::ResTarget(res_target)) = &target.node else {
-            return false;
-        };
-        let Some(val) = res_target.val.as_deref() else {
-            return false;
-        };
-        if let Some(Node::ColumnRef(col_ref)) = &val.node {
-            if col_ref
-                .fields
-                .last()
-                .is_some_and(|f| matches!(f.node, Some(Node::AStar(_))))
-            {
-                return leaf.target_list.len() == 1
-                    && matches!(
-                        leaf.from_clause.as_slice(),
-                        [pg_query::protobuf::Node {
-                            node: Some(Node::RangeVar(_))
-                        }]
-                    );
-            }
-        }
-        let name = if res_target.name.is_empty() {
-            derived_column_name(val).unwrap_or_else(|| "?column?".to_string())
-        } else {
-            res_target.name.clone()
-        };
-        if !names.insert(name.to_lowercase()) {
-            return false;
-        }
-    }
-    true
-}
-
 fn compound_operator(
     stmt: &pg_query::protobuf::SelectStmt,
 ) -> Result<ast::CompoundOperator, ParseError> {
@@ -10256,8 +10249,8 @@ mod tests {
             "SELECT * FROM (SELECT 1 UNION SELECT 2 LIMIT 1) UNION SELECT 3"
         );
         assert_eq!(
-            translate_to_sql("(WITH c AS (SELECT 1) SELECT * FROM c) UNION SELECT 2"),
-            "SELECT * FROM (WITH c AS (SELECT 1) SELECT * FROM c) UNION SELECT 2"
+            translate_to_sql("(WITH c AS (SELECT 1 AS x) SELECT x FROM c) UNION SELECT 2"),
+            "SELECT * FROM (WITH c AS (SELECT 1 x) SELECT x FROM c) UNION SELECT 2"
         );
         assert_eq!(
             translate_to_sql("SELECT a FROM t UNION SELECT a FROM u ORDER BY 1 LIMIT 2"),
@@ -10274,6 +10267,10 @@ mod tests {
         );
         assert_not_supported(
             "(SELECT * FROM t, u LIMIT 1) UNION SELECT 1, 2",
+            "without distinct column names",
+        );
+        assert_not_supported(
+            "(WITH c AS (SELECT 1 AS a, 2 AS a) SELECT * FROM c LIMIT 1) UNION SELECT 3, 4",
             "without distinct column names",
         );
         assert_translates("SELECT 1, 2 UNION (SELECT 3, 4 LIMIT 1)");
