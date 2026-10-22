@@ -55,34 +55,36 @@ impl AggFunc for Percentile {
 
     fn step(state: &mut Self::State, args: &[Value]) {
         let (values, p_value, err_value) = state;
-        if let (Some(y), Some(p)) = (
-            args.first().and_then(Value::to_float),
-            args.get(1).and_then(Value::to_float),
-        ) {
-            if !(0.0..=100.0).contains(&p) {
-                err_value.get_or_insert("Invalid percentile value");
+        let Some(p) = args.get(1).and_then(Value::to_float) else {
+            err_value.get_or_insert("Invalid percentile value");
+            return;
+        };
+        if !(0.0..=100.0).contains(&p) {
+            err_value.get_or_insert("Invalid percentile value");
+            return;
+        }
+
+        if let Some(existing_p) = *p_value {
+            if (existing_p - p).abs() >= 0.001 {
+                err_value.get_or_insert("Inconsistent percentile values across rows");
                 return;
             }
+        } else {
+            *p_value = Some(p);
+        }
 
-            if let Some(existing_p) = *p_value {
-                if (existing_p - p).abs() >= 0.001 {
-                    err_value.get_or_insert("Inconsistent percentile values across rows");
-                    return;
-                }
-            } else {
-                *p_value = Some(p);
-            }
+        if let Some(y) = args.first().and_then(Value::to_float) {
             values.push(y);
         }
     }
 
     fn finalize(state: Self::State) -> Result<Value, Self::Error> {
         let (mut values, p_value, err_value) = state;
-        if values.is_empty() {
-            return Ok(Value::null());
-        }
         if let Some(err) = err_value {
             return Err(err);
+        }
+        if values.is_empty() {
+            return Ok(Value::null());
         }
         if values.len() == 1 {
             return Ok(Value::from_float(values[0]));
@@ -117,34 +119,36 @@ impl AggFunc for PercentileCont {
 
     fn step(state: &mut Self::State, args: &[Value]) {
         let (values, p_value, err_state) = state;
-        if let (Some(y), Some(p)) = (
-            args.first().and_then(Value::to_float),
-            args.get(1).and_then(Value::to_float),
-        ) {
-            if !(0.0..=1.0).contains(&p) {
-                err_state.get_or_insert("Percentile value must be between 0.0 and 1.0 inclusive");
+        let Some(p) = args.get(1).and_then(Value::to_float) else {
+            err_state.get_or_insert("Percentile value must be between 0.0 and 1.0 inclusive");
+            return;
+        };
+        if !(0.0..=1.0).contains(&p) {
+            err_state.get_or_insert("Percentile value must be between 0.0 and 1.0 inclusive");
+            return;
+        }
+
+        if let Some(existing_p) = *p_value {
+            if (existing_p - p).abs() >= 0.001 {
+                err_state.get_or_insert("Inconsistent percentile values across rows");
                 return;
             }
+        } else {
+            *p_value = Some(p);
+        }
 
-            if let Some(existing_p) = *p_value {
-                if (existing_p - p).abs() >= 0.001 {
-                    err_state.get_or_insert("Inconsistent percentile values across rows");
-                    return;
-                }
-            } else {
-                *p_value = Some(p);
-            }
+        if let Some(y) = args.first().and_then(Value::to_float) {
             values.push(y);
         }
     }
 
     fn finalize(state: Self::State) -> Result<Value, Self::Error> {
         let (mut values, p_value, err_state) = state;
-        if values.is_empty() {
-            return Ok(Value::null());
-        }
         if let Some(err) = err_state {
             return Err(err);
+        }
+        if values.is_empty() {
+            return Ok(Value::null());
         }
         if values.len() == 1 {
             return Ok(Value::from_float(values[0]));
@@ -187,11 +191,11 @@ impl AggFunc for PercentileDisc {
 
     fn finalize(state: Self::State) -> Result<Value, Self::Error> {
         let (mut values, p_value, err_value) = state;
-        if values.is_empty() {
-            return Ok(Value::null());
-        }
         if let Some(err) = err_value {
             return Err(err);
+        }
+        if values.is_empty() {
+            return Ok(Value::null());
         }
 
         let p = p_value.ok_or("percentile value must be provided")?;
@@ -274,23 +278,57 @@ mod tests {
 
     #[test]
     fn percentile_disc_rejects_percentages() {
-        // Used to inherit percentile()'s [0, 100] validation while indexing by
-        // fraction, reading past the end of the sorted values.
+        // Fraction in [0, 1]; invalid p must produce an error even if all rows have bad p.
         for p in [100.0, 2.0, 1.5, -0.5] {
-            // All rows rejected, so NULL rather than an out-of-bounds read.
             assert_eq!(
-                run::<PercentileDisc>(&[1.0, 2.0], p).unwrap().value_type(),
-                ValueType::Null,
-                "percentile_disc should not index with p = {p}"
+                run::<PercentileDisc>(&[1.0, 2.0], p).err(),
+                Some("Percentile value must be between 0.0 and 1.0 inclusive"),
+                "percentile_disc should reject p = {p}"
             );
-            // A leading valid row keeps values non-empty, so finalize reports
-            // the rejection instead of collapsing to NULL.
             assert_eq!(
                 run_rows::<PercentileDisc>(&[(1.0, 0.5), (2.0, p)]).err(),
                 Some("Percentile value must be between 0.0 and 1.0 inclusive"),
                 "percentile_disc should reject p = {p}"
             );
         }
+    }
+
+    #[test]
+    fn percentile_cont_rejects_out_of_range() {
+        for p in [100.0, 2.0, 1.5, -0.5] {
+            assert_eq!(
+                run::<PercentileCont>(&[1.0, 2.0], p).err(),
+                Some("Percentile value must be between 0.0 and 1.0 inclusive"),
+                "percentile_cont should reject p = {p}"
+            );
+        }
+    }
+
+    #[test]
+    fn percentile_rejects_out_of_range() {
+        for p in [-0.5, 100.5, 150.0] {
+            assert_eq!(
+                run::<Percentile>(&[1.0, 2.0], p).err(),
+                Some("Invalid percentile value"),
+                "percentile should reject p = {p}"
+            );
+        }
+    }
+
+    #[test]
+    fn percentile_empty_table_returns_null() {
+        assert_eq!(
+            run::<PercentileCont>(&[], 0.5).unwrap().value_type(),
+            ValueType::Null
+        );
+        assert_eq!(
+            run::<PercentileDisc>(&[], 0.5).unwrap().value_type(),
+            ValueType::Null
+        );
+        assert_eq!(
+            run::<Percentile>(&[], 50.0).unwrap().value_type(),
+            ValueType::Null
+        );
     }
 
     #[test]
