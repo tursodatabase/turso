@@ -205,6 +205,48 @@ expect {
     0
 }
 
+test create-index-without-name-checks-names-in-table-schema {
+    CREATE SCHEMA IF NOT EXISTS sp_un;
+    DROP TABLE IF EXISTS sp_un.t;
+    CREATE TABLE sp_un.t (x int);
+    CREATE TABLE t_x_idx (y int);
+    SET search_path TO sp_un, public;
+    CREATE INDEX ON t (x);
+    CREATE INDEX ON t (x);
+    DROP INDEX sp_un.t_x_idx;
+    DROP INDEX sp_un.t_x_idx1;
+}
+expect {}
+
+test create-index-without-name-on-schema-qualified-table {
+    CREATE SCHEMA IF NOT EXISTS sp_uq;
+    DROP TABLE IF EXISTS sp_uq.t;
+    CREATE TABLE t (x int);
+    CREATE TABLE sp_uq.t (x int);
+    CREATE INDEX ON sp_uq.t (x);
+    CREATE INDEX ON sp_uq.t (x);
+    DROP INDEX sp_uq.t_x_idx;
+    DROP INDEX sp_uq.t_x_idx1;
+    SELECT count(*) FROM pg_indexes WHERE tablename = 't';
+}
+expect {
+    0
+}
+
+test create-index-without-name-on-quoted-mixed-case-schema {
+    CREATE SCHEMA IF NOT EXISTS "Sp_Mc";
+    DROP TABLE IF EXISTS "Sp_Mc".t;
+    CREATE TABLE "Sp_Mc".t (x int);
+    CREATE INDEX ON "Sp_Mc".t (x);
+    CREATE INDEX ON "Sp_Mc".t (x);
+    DROP INDEX "Sp_Mc".t_x_idx;
+    DROP INDEX "Sp_Mc".t_x_idx1;
+    SELECT 1;
+}
+expect {
+    1
+}
+
 test create-index-skips-missing-schema-in-search-path {
     CREATE TABLE t (x int);
     SET search_path TO sp_missing_ci, public;

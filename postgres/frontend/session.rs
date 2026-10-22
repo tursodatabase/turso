@@ -1,5 +1,6 @@
 use chumsky::{error::EmptyErr, prelude::*};
 use std::borrow::Cow;
+use std::collections::HashMap;
 use std::num::NonZero;
 use std::str;
 use std::sync::{Arc, Mutex};
@@ -11,8 +12,8 @@ use turso_parser::ast::{self};
 use turso_pg_parser::translator::{
     is_comment_on, is_refresh_matview, is_set_transaction, try_extract_copy_from,
     try_extract_create_schema, try_extract_drop_schema, try_extract_set, try_extract_show,
-    unqualified_create_table_name_location, PgCopyFromStmt, PgCreateSchemaStmt, PgDropSchemaStmt,
-    PgSetStmt, PgShowStmt, PostgreSQLTranslator,
+    unnamed_index_name, unqualified_create_table_name_location, PgCopyFromStmt, PgCreateSchemaStmt,
+    PgDropSchemaStmt, PgSetStmt, PgShowStmt, PostgreSQLTranslator,
 };
 
 use crate::copy::parse_copy_text_format;
@@ -183,9 +184,20 @@ fn prepare_statement(pg_conn: &Arc<PgConnectionInner>, sql: &str) -> Result<Stat
 
     let parse_result =
         turso_pg_parser::parse(sql).map_err(|e| LimboError::ParseError(e.to_string()))?;
-    let (sql, parse_result) = match create_table_schema_from_search_path(pg_conn, &parse_result)? {
-        Some((location, schema)) => {
-            let sql = turso_pg_parser::qualify_create_table_name(sql, location, &schema);
+    let rewritten_sql = if let Some((location, schema)) =
+        create_table_schema_from_search_path(pg_conn, &parse_result)?
+    {
+        Some(turso_pg_parser::qualify_create_table_name(
+            sql, location, &schema,
+        ))
+    } else {
+        unnamed_index_name(sql, &parse_result, |schema, table, name| {
+            relation_name_is_taken(&pg_conn.conn, schema, table, name)
+        })?
+        .map(|(location, name)| turso_pg_parser::name_create_index(sql, location, &name))
+    };
+    let (sql, parse_result) = match rewritten_sql {
+        Some(sql) => {
             let parse_result =
                 turso_pg_parser::parse(&sql).map_err(|e| LimboError::ParseError(e.to_string()))?;
             (Cow::Owned(sql), parse_result)
@@ -226,6 +238,66 @@ fn create_table_schema_from_search_path(
         return Ok(None);
     }
     Ok(Some((location, schema)))
+}
+
+/// Whether the schema of table `table` already has a table, index, view or
+/// sequence named `name`, which makes PostgreSQL choose another name for a
+/// new index on the table. A table named with a schema is in that schema.
+/// Otherwise the table is looked up in the same order as core does: temp
+/// first, then the databases of the search path. Main when no database has
+/// the table.
+fn relation_name_is_taken(
+    conn: &Arc<Connection>,
+    schema: Option<&str>,
+    table: &str,
+    name: &str,
+) -> Result<bool> {
+    let database_names: HashMap<usize, String> = conn
+        .list_all_databases()
+        .into_iter()
+        .map(|(id, database, _)| (id, database))
+        .collect();
+    let databases: Vec<String> = match schema {
+        Some(schema) if schema.eq_ignore_ascii_case("public") => vec!["main".to_string()],
+        Some(schema) => database_names
+            .values()
+            .filter(|database| database.eq_ignore_ascii_case(schema))
+            .cloned()
+            .collect(),
+        None => database_names
+            .contains_key(&turso_core::TEMP_DB_ID)
+            .then_some(turso_core::TEMP_DB_ID)
+            .into_iter()
+            .chain(conn.search_order())
+            .chain(std::iter::once(turso_core::MAIN_DB_ID))
+            .map(|id| database_names[&id].clone())
+            .collect(),
+    };
+    let mut taken = false;
+    for database in databases {
+        let mut stmt = conn.prepare_sqlite(format!(
+            "SELECT \
+             EXISTS (SELECT 1 FROM \"{database}\".sqlite_schema \
+                     WHERE type = 'table' AND name COLLATE NOCASE = ?1), \
+             EXISTS (SELECT 1 FROM \"{database}\".sqlite_schema \
+                     WHERE type IN ('table', 'index', 'view') \
+                     AND name COLLATE NOCASE IN (?2, '{SEQUENCE_TABLE_PREFIX}' || ?2))"
+        ))?;
+        stmt.bind_at(
+            NonZero::new(1).unwrap(),
+            Value::build_text(table.to_string()),
+        )?;
+        stmt.bind_at(
+            NonZero::new(2).unwrap(),
+            Value::build_text(name.to_string()),
+        )?;
+        let row = &stmt.run_collect_rows()?[0];
+        taken = row[1] == Value::from_i64(1);
+        if row[0] == Value::from_i64(1) {
+            break;
+        }
+    }
+    Ok(taken)
 }
 
 /// The first schema of `search_path` that exists, which is what PostgreSQL's
