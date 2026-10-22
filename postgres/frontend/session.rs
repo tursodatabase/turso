@@ -10,10 +10,10 @@ use crate::functions::ConfigParameter;
 use turso_core::{Connection, LimboError, Result, Statement, Value};
 use turso_parser::ast::{self};
 use turso_pg_parser::translator::{
-    is_comment_on, is_refresh_matview, is_set_transaction, try_extract_copy_from,
+    check_set_transaction, is_comment_on, is_refresh_matview, try_extract_copy_from,
     try_extract_create_schema, try_extract_drop_schema, try_extract_set, try_extract_show,
     unnamed_index_name, unqualified_create_table_name_location, PgCopyFromStmt, PgCreateSchemaStmt,
-    PgDropSchemaStmt, PgSetStmt, PgShowStmt, PostgreSQLTranslator,
+    PgDropSchemaStmt, PgSetStmt, PgSetValue, PgShowStmt, PostgreSQLTranslator,
 };
 
 use crate::copy::parse_copy_text_format;
@@ -362,7 +362,7 @@ fn try_prepare_special(pg_conn: &Arc<PgConnectionInner>, sql: &str) -> Result<Op
         return Ok(Some(stmt));
     }
 
-    if is_set_transaction(&parse_result) {
+    if check_set_transaction(&parse_result).map_err(|e| LimboError::ParseError(e.to_string()))? {
         return Ok(Some(noop_statement(&pg_conn.conn)?));
     }
 
@@ -382,7 +382,7 @@ fn try_prepare_special(pg_conn: &Arc<PgConnectionInner>, sql: &str) -> Result<Op
         return Ok(Some(noop_statement(&pg_conn.conn)?));
     }
 
-    if is_refresh_matview(&parse_result) {
+    if is_refresh_matview(&parse_result).map_err(|e| LimboError::ParseError(e.to_string()))? {
         return Ok(Some(noop_statement(&pg_conn.conn)?));
     }
 
@@ -390,7 +390,9 @@ fn try_prepare_special(pg_conn: &Arc<PgConnectionInner>, sql: &str) -> Result<Op
         return Ok(Some(noop_statement(&pg_conn.conn)?));
     }
 
-    if let Some(stmt) = try_extract_copy_from(&parse_result) {
+    if let Some(stmt) =
+        try_extract_copy_from(&parse_result).map_err(|e| LimboError::ParseError(e.to_string()))?
+    {
         let rows_inserted = handle_pg_copy_from(&pg_conn.conn, &stmt)?;
         let stmt = noop_statement(&pg_conn.conn)?;
         stmt.set_n_change(rows_inserted as i64);
@@ -430,11 +432,63 @@ fn handle_pg_set(pg_conn: &Arc<PgConnectionInner>, set_stmt: &PgSetStmt) -> Resu
             set_stmt.is_local
         ));
     }
-    let value = set_stmt.values.first().ok_or_else(|| {
-        LimboError::ParseError(format!("SET {}: no value provided", set_stmt.name))
-    })?;
-    let pragma_sql = format!("PRAGMA {} = {}", set_stmt.name, value.to_sql_string());
-    pg_conn.conn.prepare(&pragma_sql)
+    if set_value_already_in_effect(&set_stmt.name, &set_stmt.values) {
+        return noop_statement(&pg_conn.conn);
+    }
+    Err(LimboError::ParseError(format!(
+        "SET {} is not supported",
+        set_stmt.name
+    )))
+}
+
+fn set_value_already_in_effect(name: &str, values: &[PgSetValue]) -> bool {
+    let Some(values) = values
+        .iter()
+        .map(|value| match value {
+            PgSetValue::Identifier(s) | PgSetValue::StringLiteral(s) | PgSetValue::Number(s) => {
+                Some(s.to_ascii_lowercase())
+            }
+            PgSetValue::Bool(b) => Some(if *b { "on" } else { "off" }.to_string()),
+            _ => None,
+        })
+        .collect::<Option<Vec<_>>>()
+    else {
+        return false;
+    };
+    let value = values.join(", ");
+    let is_on = matches!(value.as_str(), "on" | "true" | "1");
+    let is_off = matches!(value.as_str(), "off" | "false" | "0");
+    match name.to_ascii_lowercase().as_str() {
+        "statement_timeout" | "lock_timeout" | "idle_in_transaction_session_timeout" => {
+            value == "0"
+        }
+        "datestyle" => matches!(value.as_str(), "iso" | "iso, mdy" | "iso, ymd" | "iso, dmy"),
+        "intervalstyle" => value == "postgres",
+        "client_encoding" => matches!(value.as_str(), "utf8" | "utf-8" | "unicode"),
+        "extra_float_digits" => matches!(value.as_str(), "1" | "2" | "3"),
+        "standard_conforming_strings" => is_on,
+        "row_security" | "quote_all_identifiers" => is_off,
+        "check_function_bodies" | "synchronize_seqscans" => is_on || is_off,
+        "default_tablespace" => value.is_empty(),
+        "default_table_access_method" => value == "heap",
+        "transaction_timeout" => value == "0",
+        "xmloption" => value == "content",
+        "application_name" => true,
+        "client_min_messages" => matches!(
+            value.as_str(),
+            "debug5"
+                | "debug4"
+                | "debug3"
+                | "debug2"
+                | "debug1"
+                | "debug"
+                | "log"
+                | "notice"
+                | "warning"
+                | "error"
+        ),
+        _ => false,
+    }
 }
 
 fn handle_pg_show(pg_conn: &Arc<PgConnectionInner>, show_stmt: &PgShowStmt) -> Result<Statement> {
@@ -442,7 +496,10 @@ fn handle_pg_show(pg_conn: &Arc<PgConnectionInner>, show_stmt: &PgShowStmt) -> R
         Ok(ConfigParameter::SearchPath) => pg_conn
             .conn
             .prepare("SELECT current_setting('search_path') AS search_path"),
-        Err(_) => pg_conn.conn.prepare(format!("PRAGMA {}", show_stmt.name)),
+        Err(_) => Err(LimboError::ParseError(format!(
+            "SHOW {} is not supported",
+            show_stmt.name
+        ))),
     }
 }
 

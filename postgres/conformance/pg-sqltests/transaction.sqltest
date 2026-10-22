@@ -45,7 +45,6 @@ test txn-set-transaction-options-rollback {
     BEGIN;
     SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY;
     SET TRANSACTION READ WRITE;
-    SET TRANSACTION ISOLATION LEVEL SERIALIZABLE, NOT DEFERRABLE;
     SELECT 17;
     UPDATE counter SET n = 23;
     ROLLBACK;
@@ -54,6 +53,14 @@ test txn-set-transaction-options-rollback {
 expect {
     17
     0
+}
+
+@skip-if postgres "Turso transactions are snapshot isolation, so only REPEATABLE READ is accepted"
+test txn-set-transaction-serializable-rejected {
+    BEGIN;
+    SET TRANSACTION ISOLATION LEVEL SERIALIZABLE, NOT DEFERRABLE;
+}
+expect error {
 }
 
 @setup counter

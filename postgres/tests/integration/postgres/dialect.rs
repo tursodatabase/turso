@@ -129,6 +129,57 @@ fn test_postgres_rejects_unsupported_transaction_commands(db: TempDatabase) {
 }
 
 #[turso_macros::test(mvcc)]
+fn test_postgres_rejects_unsupported_set_and_show(db: TempDatabase) {
+    let conn = db.connect_postgres();
+    for sql in [
+        "SET statement_timeout = 1000",
+        "SET foreign_keys = off",
+        "SET LOCAL lock_timeout = '1s'",
+        "SHOW server_version",
+        "SHOW journal_mode",
+    ] {
+        let err = conn
+            .prepare(sql)
+            .err()
+            .unwrap_or_else(|| panic!("{sql} was accepted"));
+        assert!(err.to_string().contains("is not supported"), "{sql}: {err}");
+    }
+    conn.prepare("SET search_path TO public").unwrap();
+    conn.prepare("SHOW search_path").unwrap();
+
+    for sql in [
+        "SET DATESTYLE = ISO",
+        "SET INTERVALSTYLE = POSTGRES",
+        "SET extra_float_digits TO 3",
+        "SET synchronize_seqscans TO off",
+        "SET statement_timeout = 0",
+        "SET lock_timeout = 0",
+        "SET idle_in_transaction_session_timeout = 0",
+        "SET row_security = off",
+        "SET client_encoding = 'UTF8'",
+        "SET standard_conforming_strings = on",
+        "SET check_function_bodies = false",
+        "SET client_min_messages = warning",
+        "SET default_tablespace = ''",
+        "SET default_table_access_method = heap",
+        "SET transaction_timeout = 0",
+        "SET xmloption = content",
+    ] {
+        conn.execute(sql).unwrap_or_else(|e| panic!("{sql}: {e}"));
+    }
+    for sql in [
+        "SET DATESTYLE = SQL",
+        "SET extra_float_digits = 0",
+        "SET row_security = on",
+        "SET client_encoding = 'LATIN1'",
+        "SET standard_conforming_strings = off",
+        "SET client_min_messages = bogus",
+    ] {
+        assert!(conn.prepare(sql).is_err(), "{sql} was accepted");
+    }
+}
+
+#[turso_macros::test(mvcc)]
 fn test_postgres_frontend_rejects_pragma(db: TempDatabase) {
     let conn = db.connect_postgres();
 

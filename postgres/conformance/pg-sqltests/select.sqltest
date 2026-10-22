@@ -931,3 +931,29 @@ test insert-values-with-clause {
 expect {
     5
 }
+
+test set-operation-nested-on-the-right-with-same-operator {
+    SELECT 1 UNION ALL (SELECT 2 UNION ALL SELECT 3) ORDER BY 1;
+    SELECT 1 UNION (SELECT 1 UNION SELECT 2) ORDER BY 1;
+}
+expect {
+    1
+    2
+    3
+    1
+    2
+}
+
+test cast-to-public-qualified-type {
+    CREATE TYPE qmood AS ENUM ('a', 'b');
+    SELECT 'b'::public.qmood, '5'::pg_catalog.int4 + 1;
+}
+expect {
+    b|6
+}
+
+test cast-to-type-in-unknown-schema-errors {
+    SELECT '5'::nosuchschema.int4;
+}
+expect error {
+}
