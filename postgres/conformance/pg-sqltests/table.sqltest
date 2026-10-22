@@ -315,3 +315,118 @@ test table-returning-table-name-star-after-alias-rejected {
     INSERT INTO users AS u VALUES (4, 'dave', 40, false) RETURNING users.*;
 }
 expect error {}
+
+setup delete_using {
+    CREATE TABLE dt (id int, v int);
+    CREATE TABLE du (id int, w int);
+    CREATE TABLE dw (id int);
+    INSERT INTO dt VALUES (1, 1), (2, 2), (3, 3), (4, 4), (5, 5), (5, 50), (6, 6);
+    INSERT INTO du VALUES (1, 10), (1, 11), (2, 20), (9, 90);
+    INSERT INTO dw VALUES (3), (4);
+}
+
+@setup delete_using
+test table-delete-using {
+    DELETE FROM dt USING du WHERE dt.id = du.id;
+    SELECT id, v FROM dt ORDER BY id, v;
+}
+expect {
+    3|3
+    4|4
+    5|5
+    5|50
+    6|6
+}
+
+@setup delete_using
+test table-delete-using-duplicates-delete-each-row-once {
+    DELETE FROM dt USING du WHERE dt.id = du.id;
+    SELECT count(*) FROM dt;
+}
+expect {
+    5
+}
+
+@setup delete_using
+test table-delete-using-target-alias {
+    DELETE FROM dt AS x USING du WHERE x.id = du.id + 3;
+    SELECT id, v FROM dt ORDER BY id, v;
+}
+expect {
+    1|1
+    2|2
+    3|3
+    6|6
+}
+
+@setup delete_using
+test table-delete-using-extra-target-condition {
+    DELETE FROM dt USING du WHERE dt.id = du.id AND dt.v = 1 AND du.w = 11;
+    SELECT id, v FROM dt ORDER BY id, v;
+}
+expect {
+    2|2
+    3|3
+    4|4
+    5|5
+    5|50
+    6|6
+}
+
+@setup delete_using
+test table-delete-using-several-tables {
+    DELETE FROM dt USING du, dw WHERE dt.id = dw.id AND du.id = 9;
+    SELECT id, v FROM dt ORDER BY id, v;
+}
+expect {
+    1|1
+    2|2
+    5|5
+    5|50
+    6|6
+}
+
+@setup delete_using
+test table-delete-using-join {
+    DELETE FROM dt AS x USING du JOIN dw ON du.w = dw.id * 10 - 20 WHERE x.id = dw.id + 2;
+    SELECT id, v FROM dt ORDER BY id, v;
+}
+expect {
+    1|1
+    2|2
+    3|3
+    4|4
+}
+
+@setup delete_using
+test table-delete-using-no-where {
+    DELETE FROM dt USING dw;
+    SELECT count(*) FROM dt;
+}
+expect {
+    0
+}
+
+@setup delete_using
+test table-delete-using-empty-table-deletes-nothing {
+    DELETE FROM dt USING du WHERE du.id = 100;
+    DELETE FROM dt USING (SELECT 1 AS id WHERE false) AS e;
+    SELECT count(*) FROM dt;
+}
+expect {
+    7
+}
+
+@setup delete_using
+test table-delete-using-subquery {
+    DELETE FROM dt USING (SELECT id FROM du WHERE w > 15) AS s WHERE dt.id = s.id;
+    SELECT id, v FROM dt ORDER BY id, v;
+}
+expect {
+    1|1
+    3|3
+    4|4
+    5|5
+    5|50
+    6|6
+}

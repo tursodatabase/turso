@@ -1817,15 +1817,44 @@ impl PostgreSQLTranslator {
             .ok_or_else(|| ParseError::ParseError("DELETE missing target table".into()))?;
         let tbl_name = self.qualified_name_from_range_var(relation)?;
 
-        if !delete.using_clause.is_empty() {
-            return Err(not_supported("DELETE ... USING"));
-        }
-
-        // Translate WHERE clause
-        let where_clause = if let Some(where_node) = &delete.where_clause {
-            Some(Box::new(self.translate_expr(where_node)?))
+        // The engine has no DELETE ... USING, so the USING tables move into an
+        // EXISTS subquery that sees the target row: each target row is deleted
+        // once if any USING row satisfies the WHERE clause, as in PG. RETURNING
+        // could not see the USING tables from there.
+        let where_clause = if delete.using_clause.is_empty() {
+            match &delete.where_clause {
+                Some(where_node) => Some(Box::new(self.translate_expr(where_node)?)),
+                None => None,
+            }
         } else {
-            None
+            if !delete.returning_list.is_empty() {
+                return Err(not_supported("DELETE ... USING with RETURNING"));
+            }
+            let from = self.translate_from_items(&delete.using_clause)?;
+            let inner_where = match &delete.where_clause {
+                Some(where_node) => Some(Box::new(self.translate_expr(where_node)?)),
+                None => None,
+            };
+            let exists = ast::Select {
+                with: None,
+                body: ast::SelectBody {
+                    select: ast::OneSelect::Select {
+                        distinctness: None,
+                        columns: vec![ast::ResultColumn::Expr(
+                            Box::new(ast::Expr::Literal(ast::Literal::Numeric("1".into()))),
+                            None,
+                        )],
+                        from: Some(from),
+                        where_clause: inner_where,
+                        group_by: None,
+                        window_clause: vec![],
+                    },
+                    compounds: vec![],
+                },
+                order_by: vec![],
+                limit: None,
+            };
+            Some(Box::new(ast::Expr::Exists(Box::new(exists))))
         };
 
         let returning = self.translate_returning(&delete.returning_list, relation)?;
@@ -9921,11 +9950,20 @@ mod tests {
     }
 
     #[test]
-    fn fail_closed_delete_using() {
-        assert_not_supported(
+    fn delete_using_becomes_exists() {
+        for sql in [
             "DELETE FROM t USING u WHERE t.id = u.id",
-            "DELETE ... USING",
-        );
+            "DELETE FROM t USING u WHERE t.id = u.id RETURNING t.id",
+            "DELETE FROM t USING u RETURNING *",
+        ] {
+            if sql.contains("RETURNING") {
+                assert_not_supported(sql, "DELETE ... USING with RETURNING");
+            } else {
+                assert_translates(sql);
+            }
+        }
+        assert_translates("DELETE FROM t AS x USING u, v JOIN w ON v.a = w.a WHERE x.id = u.id");
+        assert_translates("DELETE FROM t USING u");
     }
 
     #[test]
