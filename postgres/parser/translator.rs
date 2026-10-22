@@ -4530,6 +4530,10 @@ impl PostgreSQLTranslator {
 
         // Translate conflict target (the columns in ON CONFLICT (col1, col2))
         let index = if let Some(infer) = &clause.infer {
+            // Without a column list the clause would match any constraint.
+            if !infer.conname.is_empty() {
+                return Err(not_supported("ON CONFLICT ON CONSTRAINT"));
+            }
             if !infer.index_elems.is_empty() {
                 let targets: Vec<ast::SortedColumn> = infer
                     .index_elems
@@ -9821,5 +9825,13 @@ mod tests {
         assert_translates("SELECT 1 = ANY (SELECT a FROM t)");
         assert_translates("SELECT 1 IN (SELECT a FROM t)");
         assert_translates("SELECT 1 NOT IN (SELECT a FROM t)");
+    }
+
+    #[test]
+    fn fail_closed_on_conflict_on_constraint() {
+        assert_not_supported(
+            "INSERT INTO t VALUES (1) ON CONFLICT ON CONSTRAINT t_pkey DO NOTHING",
+            "ON CONSTRAINT",
+        );
     }
 }
