@@ -1,11 +1,12 @@
 use crate::ParseError;
 use pg_query::protobuf::{
     self, node::Node, CoercionForm, CreateFunctionStmt, DefElem, FunctionParameterMode,
-    KeywordKind, ResTarget, ScanToken, SelectStmt, SetOperation, Token, TypeName,
+    KeywordKind, ObjectType, ResTarget, ScanToken, SelectStmt, SetOperation, Token, TypeName,
 };
 use pg_query::ParseResult;
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
+use std::fmt;
 use std::sync::Arc;
 
 const EXPRESSION_PREFIX: &str = "SELECT ";
@@ -50,6 +51,19 @@ pub struct SqlFunction {
     body: Body,
 }
 
+#[derive(Debug)]
+pub struct DropFunction {
+    pub missing_ok: bool,
+    pub functions: Vec<FunctionReference>,
+}
+
+#[derive(Debug)]
+pub struct FunctionReference {
+    pub schema: Option<String>,
+    pub name: String,
+    pub argument_types: Option<Vec<SqlType>>,
+}
+
 #[derive(Debug, Clone)]
 pub struct Parameter {
     pub name: Option<String>,
@@ -81,6 +95,13 @@ pub fn is_create_function(parse_result: &ParseResult) -> bool {
     )
 }
 
+pub fn is_drop_function(parse_result: &ParseResult) -> bool {
+    matches!(
+        first_statement(parse_result),
+        Some(Node::DropStmt(drop)) if drop.remove_type() == ObjectType::ObjectFunction
+    )
+}
+
 impl CreateFunction {
     pub fn parse(sql: &str) -> Result<Self, ParseError> {
         let parse_result = crate::parse(sql)?;
@@ -105,6 +126,75 @@ impl CreateFunction {
                 body,
             },
         })
+    }
+}
+
+impl DropFunction {
+    pub fn parse(sql: &str) -> Result<Self, ParseError> {
+        let parse_result = crate::parse(sql)?;
+        let Some(Node::DropStmt(drop)) = first_statement(&parse_result) else {
+            return Err(error("expected a DROP FUNCTION statement"));
+        };
+        let functions = drop
+            .objects
+            .iter()
+            .map(|object| {
+                let Some(Node::ObjectWithArgs(object)) = &object.node else {
+                    unreachable!("DROP FUNCTION names ObjectWithArgs nodes");
+                };
+                let (schema, name) = qualified_name(&object.objname)?;
+                let argument_types = (!object.args_unspecified).then(|| {
+                    object
+                        .objargs
+                        .iter()
+                        .map(|argument| match &argument.node {
+                            Some(Node::TypeName(type_name)) => SqlType::named_by(type_name),
+                            _ => unreachable!("DROP FUNCTION arguments are TypeName nodes"),
+                        })
+                        .collect()
+                });
+                Ok(FunctionReference {
+                    schema,
+                    name,
+                    argument_types,
+                })
+            })
+            .collect::<Result<_, ParseError>>()?;
+        Ok(Self {
+            missing_ok: drop.missing_ok,
+            functions,
+        })
+    }
+}
+
+impl FunctionReference {
+    pub fn matches(&self, function: &SqlFunction) -> bool {
+        self.argument_types.as_ref().is_none_or(|argument_types| {
+            argument_types.iter().eq(function
+                .parameters
+                .iter()
+                .map(|parameter| &parameter.sql_type))
+        })
+    }
+}
+
+impl fmt::Display for SqlType {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let name = match self.name.as_str() {
+            "bool" => "boolean",
+            "int2" => "smallint",
+            "int4" => "integer",
+            "int8" => "bigint",
+            "float4" => "real",
+            "float8" => "double precision",
+            "varchar" => "character varying",
+            "bpchar" => "character",
+            "time" => "time without time zone",
+            "timestamp" => "timestamp without time zone",
+            "timestamptz" => "timestamp with time zone",
+            name => name,
+        };
+        write!(f, "{name}{}", "[]".repeat(self.array_dimensions))
     }
 }
 
@@ -232,19 +322,22 @@ fn set_returning_error() -> ParseError {
 
 impl SqlType {
     fn from_type_name(type_name: &TypeName) -> Result<Self, ParseError> {
-        let names = strings(&type_name.names);
-        let name = match names.as_slice() {
-            [name] => name,
-            [schema, name] if schema == "pg_catalog" => name,
-            _ => return Err(unsupported_type_error(&names.join("."))),
-        };
-        if type_name.pct_type || !SUPPORTED_TYPES.contains(&name.as_str()) {
-            return Err(unsupported_type_error(name));
+        let sql_type = Self::named_by(type_name);
+        if type_name.pct_type || !SUPPORTED_TYPES.contains(&sql_type.name.as_str()) {
+            return Err(unsupported_type_error(&sql_type.name));
         }
-        Ok(Self {
-            name: name.clone(),
+        Ok(sql_type)
+    }
+
+    fn named_by(type_name: &TypeName) -> Self {
+        let name = match strings(&type_name.names).as_slice() {
+            [schema, name] if schema == "pg_catalog" => name.clone(),
+            names => names.join("."),
+        };
+        Self {
+            name,
             array_dimensions: type_name.array_bounds.len(),
-        })
+        }
     }
 }
 

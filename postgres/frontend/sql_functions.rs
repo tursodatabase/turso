@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::num::NonZero;
 use std::sync::{Arc, Mutex};
 use turso_core::{Connection, LimboError, Result, Statement, Value};
-use turso_pg_parser::sql_function::{CreateFunction, SqlFunction};
+use turso_pg_parser::sql_function::{CreateFunction, DropFunction, FunctionReference, SqlFunction};
 use turso_pg_parser::{ParseError, ParseResult};
 
 const FUNCTIONS_TABLE: &str = "pg_turso_sql_functions";
@@ -47,6 +47,36 @@ impl SqlFunctions {
         insert.bind_at(parameter(1), Value::build_text(function.name))?;
         insert.bind_at(parameter(2), Value::build_text(sql.to_string()))?;
         Ok(insert)
+    }
+
+    pub(crate) fn drop_functions(&self, sql: &str) -> Result<Option<Statement>> {
+        let drop = DropFunction::parse(sql).map_err(limbo_error)?;
+        let mut names = Vec::with_capacity(drop.functions.len());
+        for reference in &drop.functions {
+            let function = match reference.schema.as_deref() {
+                None | Some("public") => self.find(&reference.name)?,
+                Some(_) => None,
+            };
+            match function {
+                Some(function) if reference.matches(&function) => {
+                    names.push(reference.name.clone())
+                }
+                _ if drop.missing_ok => {}
+                _ => return Err(function_not_found(reference)),
+            }
+        }
+        if names.is_empty() {
+            return Ok(None);
+        }
+        let parameters: Vec<String> = (1..=names.len()).map(|index| format!("${index}")).collect();
+        let mut delete = self.conn.prepare(format!(
+            "DELETE FROM public.{FUNCTIONS_TABLE} WHERE name IN ({})",
+            parameters.join(", ")
+        ))?;
+        for (index, name) in names.into_iter().enumerate() {
+            delete.bind_at(parameter(index + 1), Value::build_text(name))?;
+        }
+        Ok(Some(delete))
     }
 
     pub(crate) fn inline_calls(
@@ -221,6 +251,24 @@ fn check_replacement(existing: &SqlFunction, function: &SqlFunction, replace: bo
         }
     }
     Ok(())
+}
+
+fn function_not_found(reference: &FunctionReference) -> LimboError {
+    let name = match &reference.schema {
+        Some(schema) => format!("{schema}.{}", reference.name),
+        None => reference.name.clone(),
+    };
+    LimboError::ParseError(match &reference.argument_types {
+        None => format!("could not find a function named \"{name}\""),
+        Some(argument_types) => {
+            let argument_types: Vec<String> =
+                argument_types.iter().map(ToString::to_string).collect();
+            format!(
+                "function {name}({}) does not exist",
+                argument_types.join(", ")
+            )
+        }
+    })
 }
 
 fn has_functions_table(conn: &Connection) -> bool {

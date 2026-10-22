@@ -457,6 +457,7 @@ Upgrade is not supported.
 | BEGIN ATOMIC function bodies | ❌ Not supported | CREATE FUNCTION rejects RETURN and BEGIN ATOMIC bodies |
 | CALL syntax for executing procedures | ❌ Not supported | |
 | CREATE FUNCTION | 🟡 Partial | Only `LANGUAGE sql` functions that can be inlined: each call is replaced with the function body. The body must be one `SELECT` of one expression, without `FROM`, subqueries, or aggregates. Only `IN` parameters without defaults, and one result of a built-in scalar type. No `STRICT`, `SECURITY DEFINER`, `SET`, or overloading. Functions go in schema `public` and cannot have the name of a built-in function. Calls work in `SELECT`, `INSERT`, `UPDATE`, `DELETE`, and `EXPLAIN`, but not in `FROM`, views, or defaults. Only a call that is a full select item gets the function name as column name. Functions are not shown in `pg_proc` |
+| DROP FUNCTION | ✅ Supported | For the SQL functions that CREATE FUNCTION accepts. `CASCADE` and `RESTRICT` have no effect, because no other object can use these functions |
 | Column level triggers | ❌ Not supported | |
 | CREATE PROCEDURE syntax for SQL stored procedures | ❌ Not supported | Rejected with an error |
 | Event triggers | ❌ Not supported | |

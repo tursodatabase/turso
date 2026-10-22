@@ -10,7 +10,7 @@ use crate::functions::ConfigParameter;
 use crate::sql_functions::SqlFunctions;
 use turso_core::{Connection, LimboError, Result, Statement, Value};
 use turso_parser::ast::{self};
-use turso_pg_parser::sql_function::is_create_function;
+use turso_pg_parser::sql_function::{is_create_function, is_drop_function};
 use turso_pg_parser::translator::{
     check_set_transaction, is_comment_on, is_refresh_matview, try_extract_copy_from,
     try_extract_create_schema, try_extract_drop_schema, try_extract_set, try_extract_show,
@@ -398,6 +398,13 @@ fn try_prepare_special(pg_conn: &Arc<PgConnectionInner>, sql: &str) -> Result<Op
 
     if is_create_function(&parse_result) {
         return pg_conn.sql_functions.create(sql).map(Some);
+    }
+
+    if is_drop_function(&parse_result) {
+        return match pg_conn.sql_functions.drop_functions(sql)? {
+            Some(stmt) => Ok(Some(stmt)),
+            None => Ok(Some(noop_statement(&pg_conn.conn)?)),
+        };
     }
 
     if is_refresh_matview(&parse_result).map_err(|e| LimboError::ParseError(e.to_string()))? {

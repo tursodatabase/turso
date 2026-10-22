@@ -204,6 +204,98 @@ expect error {
     parameter name "a" used more than once
 }
 
+setup dropped-function-f {
+    CREATE FUNCTION f() RETURNS integer LANGUAGE sql AS 'SELECT 1';
+    DROP FUNCTION f;
+}
+
+@setup dropped-function-f
+test sql-function-call-after-drop {
+    SELECT f();
+}
+expect error {}
+
+test sql-function-drop-and-create-again {
+    CREATE FUNCTION f(a integer) RETURNS integer LANGUAGE sql AS 'SELECT a + 1';
+    SELECT f(1);
+    DROP FUNCTION f(integer);
+    CREATE FUNCTION f(a integer) RETURNS integer LANGUAGE sql AS 'SELECT a + 10';
+    SELECT f(1);
+}
+expect {
+    2
+    11
+}
+
+test sql-function-drop-in-public-when-search-path-does-not-include-public {
+    CREATE FUNCTION f(a integer) RETURNS integer LANGUAGE sql AS 'SELECT a + 1';
+    CREATE SCHEMA IF NOT EXISTS sql_function_search_path;
+    SET search_path TO sql_function_search_path;
+    DROP FUNCTION public.f(integer);
+    CREATE FUNCTION public.f(a integer) RETURNS integer LANGUAGE sql AS 'SELECT a + 10';
+    SELECT public.f(1);
+}
+expect {
+    11
+}
+
+test sql-function-drop-with-argument-types {
+    CREATE FUNCTION f(a integer, b text) RETURNS integer LANGUAGE sql AS 'SELECT a';
+    DROP FUNCTION f(int4, text);
+    CREATE FUNCTION f(a text) RETURNS text LANGUAGE sql AS 'SELECT a';
+    SELECT f('x');
+}
+expect {
+    x
+}
+
+test sql-function-drop-two-functions {
+    CREATE FUNCTION f() RETURNS integer LANGUAGE sql AS 'SELECT 1';
+    CREATE FUNCTION g() RETURNS integer LANGUAGE sql AS 'SELECT 2';
+    DROP FUNCTION f, g;
+    CREATE FUNCTION f() RETURNS integer LANGUAGE sql AS 'SELECT 3';
+    CREATE FUNCTION g() RETURNS integer LANGUAGE sql AS 'SELECT 4';
+    SELECT f(), g();
+}
+expect {
+    3|4
+}
+
+test sql-function-drop-if-exists {
+    DROP FUNCTION IF EXISTS f;
+    DROP FUNCTION IF EXISTS f(integer);
+    SELECT 1;
+}
+expect {
+    1
+}
+
+test sql-function-drop-missing-function {
+    DROP FUNCTION f;
+}
+expect error {
+    could not find a function named "f"
+}
+
+test sql-function-drop-with-other-argument-types {
+    CREATE FUNCTION f(a integer) RETURNS integer LANGUAGE sql AS 'SELECT a';
+    DROP FUNCTION f(text);
+}
+expect error {
+    function f.text. does not exist
+}
+
+@setup function-f
+test sql-function-drop-in-rolled-back-transaction {
+    BEGIN;
+    DROP FUNCTION f;
+    ROLLBACK;
+    SELECT f();
+}
+expect {
+    1
+}
+
 @skip-if postgres "PostgreSQL supports procedures"
 test sql-procedure-is-rejected {
     CREATE PROCEDURE p() LANGUAGE sql AS 'SELECT 1';
