@@ -881,6 +881,31 @@ impl ToTokens for Stmt {
                 s.append(TK_ID, Some(domain_name))?;
                 Ok(())
             }
+            Self::CreateFunction(CreateFunction { sql, .. }) => s.append(TK_ID, Some(sql)),
+            Self::DropFunction {
+                if_exists,
+                name,
+                arg_types,
+            } => {
+                s.append(TK_DROP, None)?;
+                s.append(TK_ID, Some("FUNCTION"))?;
+                if *if_exists {
+                    s.append(TK_IF, None)?;
+                    s.append(TK_EXISTS, None)?;
+                }
+                name.to_tokens(s, context)?;
+                if let Some(arg_types) = arg_types {
+                    s.append(TK_LP, None)?;
+                    for (i, arg_type) in arg_types.iter().enumerate() {
+                        if i > 0 {
+                            s.append(TK_COMMA, None)?;
+                        }
+                        s.append(TK_ID, Some(arg_type))?;
+                    }
+                    s.append(TK_RP, None)?;
+                }
+                Ok(())
+            }
         }
     }
 }

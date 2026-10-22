@@ -181,6 +181,8 @@ pub fn translate_inner(
             | ast::Stmt::CreateVirtualTable(..)
             | ast::Stmt::CreateType { .. }
             | ast::Stmt::CreateDomain { .. }
+            | ast::Stmt::CreateFunction(_)
+            | ast::Stmt::DropFunction { .. }
             | ast::Stmt::Delete { .. }
             | ast::Stmt::DropIndex { .. }
             | ast::Stmt::DropTable { .. }
@@ -427,6 +429,20 @@ pub fn translate_inner(
             }
             schema::translate_drop_type(&domain_name, if_exists, true, resolver, program)?
         }
+        ast::Stmt::CreateFunction(function) => {
+            schema::translate_create_function(&function, resolver, program)?
+        }
+        ast::Stmt::DropFunction {
+            if_exists,
+            name,
+            arg_types,
+        } => schema::translate_drop_function(
+            if_exists,
+            &name,
+            arg_types.as_deref(),
+            resolver,
+            program,
+        )?,
         ast::Stmt::Pragma { .. } => {
             bail_parse_error!("PRAGMA statement cannot be evaluated in a nested context")
         }
@@ -559,6 +575,8 @@ fn stmt_kind(stmt: &ast::Stmt) -> &'static str {
         ast::Stmt::DropTable { .. } => "drop_table",
         ast::Stmt::DropType { .. } => "drop_type",
         ast::Stmt::DropDomain { .. } => "drop_domain",
+        ast::Stmt::CreateFunction(_) => "create_function",
+        ast::Stmt::DropFunction { .. } => "drop_function",
         ast::Stmt::DropTrigger { .. } => "drop_trigger",
         ast::Stmt::DropView { .. } => "drop_view",
         ast::Stmt::Insert { .. } => "insert",

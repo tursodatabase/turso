@@ -135,6 +135,7 @@ pub const TEMP_SCHEMA_TABLE_NAME: &str = "sqlite_temp_schema";
 pub const TEMP_SCHEMA_TABLE_NAME_ALT: &str = "sqlite_temp_master";
 pub const SQLITE_SEQUENCE_TABLE_NAME: &str = "sqlite_sequence";
 pub const TURSO_TYPES_TABLE_NAME: &str = "__turso_internal_types";
+pub const TURSO_FUNCTIONS_TABLE_NAME: &str = "__turso_internal_functions";
 pub const DBSP_TABLE_PREFIX: &str = "__turso_internal_dbsp_state_v";
 /// Hidden per-view value-multiset table backing MIN/MAX and DISTINCT
 /// aggregates.
@@ -759,6 +760,16 @@ pub enum SchemaObjectType {
     Index,
 }
 
+/// A function that `CREATE FUNCTION` created. The engine stores its text as
+/// written and does not read it: the dialect of the database parses the text
+/// when a statement calls the function.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UserFunction {
+    pub name: String,
+    pub arg_count: usize,
+    pub sql: String,
+}
+
 #[derive(Debug)]
 pub struct Schema {
     pub tables: HashMap<String, Arc<Table>>,
@@ -811,6 +822,9 @@ pub struct Schema {
     pub generated_columns_enabled: bool,
     /// Named sequences (CREATE SEQUENCE)
     pub sequences: HashMap<String, Arc<Sequence>>,
+    /// Functions that `CREATE FUNCTION` created, by lowercase name. A name
+    /// can have one function for each number of parameters.
+    pub user_functions: HashMap<String, Vec<Arc<UserFunction>>>,
 }
 
 impl Default for Schema {
@@ -955,6 +969,7 @@ impl Schema {
             type_registry,
             generated_columns_enabled: false,
             sequences: HashMap::default(),
+            user_functions: HashMap::default(),
         };
         dialect.register_catalog(&mut schema, enable_custom_types)?;
         Ok(schema)
@@ -1059,6 +1074,50 @@ impl Schema {
 
     pub fn remove_type(&mut self, type_name: &str) {
         self.type_registry.remove(&type_registry_key(type_name));
+    }
+
+    /// Register a function that `CREATE FUNCTION` created. A function with
+    /// the same name and number of parameters is replaced.
+    pub fn add_user_function(&mut self, function: UserFunction) {
+        let functions = self
+            .user_functions
+            .entry(normalize_ident(&function.name))
+            .or_default();
+        functions.retain(|existing| existing.arg_count != function.arg_count);
+        functions.push(Arc::new(function));
+    }
+
+    pub fn remove_user_function(&mut self, name: &str, arg_count: usize) {
+        let name = normalize_ident(name);
+        if let Some(functions) = self.user_functions.get_mut(&name) {
+            functions.retain(|function| function.arg_count != arg_count);
+            if functions.is_empty() {
+                self.user_functions.remove(&name);
+            }
+        }
+    }
+
+    pub fn get_user_function(&self, name: &str, arg_count: usize) -> Option<&Arc<UserFunction>> {
+        self.user_functions_named(name)
+            .iter()
+            .find(|function| function.arg_count == arg_count)
+    }
+
+    /// The functions with this name, one for each number of parameters.
+    pub fn user_functions_named(&self, name: &str) -> &[Arc<UserFunction>] {
+        self.user_functions
+            .get(&normalize_ident(name))
+            .map(Vec::as_slice)
+            .unwrap_or_default()
+    }
+
+    /// Register the functions read from the internal functions table. This is
+    /// the shared entry point of the initial database open and the schema
+    /// reparse.
+    pub fn load_user_functions(&mut self, functions: Vec<UserFunction>) {
+        for function in functions {
+            self.add_user_function(function);
+        }
     }
 
     /// Chase the base type chain: domain_a → domain_b → integer
@@ -3286,6 +3345,7 @@ impl TryClone for Schema {
             type_registry: self.type_registry.try_clone()?,
             generated_columns_enabled: self.generated_columns_enabled,
             sequences: self.sequences.try_clone()?,
+            user_functions: self.user_functions.clone(),
         })
     }
 }

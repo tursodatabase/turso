@@ -15140,6 +15140,41 @@ pub fn op_add_type(
     Ok(InsnFunctionStepResult::Step)
 }
 
+pub fn op_add_function(
+    program: &Program,
+    state: &mut ProgramState,
+    insn: &Insn,
+    _pager: &Arc<Pager>,
+) -> InsnResult {
+    load_insn!(AddFunction { db, function }, insn);
+    let conn = program.connection.clone();
+    conn.with_database_schema_mut(*db, |schema| {
+        schema.add_user_function(function.as_ref().clone())
+    })?;
+    state.pc += 1;
+    Ok(InsnFunctionStepResult::Step)
+}
+
+pub fn op_drop_function(
+    program: &Program,
+    state: &mut ProgramState,
+    insn: &Insn,
+    _pager: &Arc<Pager>,
+) -> InsnResult {
+    load_insn!(
+        DropFunction {
+            db,
+            name,
+            arg_count
+        },
+        insn
+    );
+    let conn = program.connection.clone();
+    conn.with_database_schema_mut(*db, |schema| schema.remove_user_function(name, *arg_count))?;
+    state.pc += 1;
+    Ok(InsnFunctionStepResult::Step)
+}
+
 /// Compute the next value of a sequence from a watermark row that has
 /// already been loaded into registers by the surrounding bytecode. Pure
 /// arithmetic — no I/O. The translator emits a cursor seek + Column reads

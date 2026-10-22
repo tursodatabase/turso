@@ -1757,6 +1757,8 @@ where
         | ast::Stmt::DropView { .. }
         | ast::Stmt::DropType { .. }
         | ast::Stmt::DropDomain { .. }
+        | ast::Stmt::CreateFunction(_)
+        | ast::Stmt::DropFunction { .. }
         | ast::Stmt::Reindex { .. }
         | ast::Stmt::Release { .. }
         | ast::Stmt::Rollback { .. }

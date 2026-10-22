@@ -200,6 +200,8 @@ pub enum Stmt {
         /// type body
         body: CreateTypeBody,
     },
+    /// `CREATE FUNCTION`
+    CreateFunction(CreateFunction),
     /// `CREATE DOMAIN`
     CreateDomain {
         /// `IF NOT EXISTS`
@@ -274,6 +276,15 @@ pub enum Stmt {
         if_exists: bool,
         /// domain name
         domain_name: String,
+    },
+    /// `DROP FUNCTION`
+    DropFunction {
+        /// `IF EXISTS`
+        if_exists: bool,
+        /// function name
+        name: Name,
+        /// parameter types, when the statement names them
+        arg_types: Option<Vec<String>>,
     },
     /// `INSERT`
     Insert {
@@ -1456,6 +1467,22 @@ pub struct TypeParam {
     pub name: String,
     /// Type annotation. None means untyped (backward compat).
     pub ty: Option<String>,
+}
+
+/// `CREATE FUNCTION`: a function whose text is in the dialect of the frontend.
+/// The engine stores the text as written and gives it back to the dialect
+/// when a statement calls the function.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct CreateFunction {
+    /// `OR REPLACE`
+    pub or_replace: bool,
+    /// function name
+    pub name: Name,
+    /// number of parameters
+    pub arg_count: usize,
+    /// the statement text, as written
+    pub sql: String,
 }
 
 /// A single named CHECK constraint on a domain

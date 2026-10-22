@@ -581,6 +581,128 @@ mod tests {
         conn.close().unwrap();
     }
 
+    /// `CREATE FUNCTION` as a frontend dialect translates it: the engine
+    /// gets the name, the number of parameters and the text to store.
+    fn create_function_cmd(
+        name: &str,
+        arg_count: usize,
+        sql: &str,
+        or_replace: bool,
+    ) -> turso_parser::ast::Cmd {
+        turso_parser::ast::Cmd::Stmt(turso_parser::ast::Stmt::CreateFunction(
+            turso_parser::ast::CreateFunction {
+                or_replace,
+                name: turso_parser::ast::Name::exact(name.to_string()),
+                arg_count,
+                sql: sql.to_string(),
+            },
+        ))
+    }
+
+    fn drop_function_cmd(name: &str, arg_types: Option<Vec<&str>>) -> turso_parser::ast::Cmd {
+        turso_parser::ast::Cmd::Stmt(turso_parser::ast::Stmt::DropFunction {
+            if_exists: false,
+            name: turso_parser::ast::Name::exact(name.to_string()),
+            arg_types: arg_types.map(|types| types.into_iter().map(str::to_string).collect()),
+        })
+    }
+
+    fn run_cmd(conn: &Arc<crate::Connection>, cmd: turso_parser::ast::Cmd) -> crate::Result<()> {
+        let input = cmd.to_string();
+        conn.prepare_translated_cmd(cmd, &input)?.run_ignore_rows()
+    }
+
+    fn stored_function_sqls(conn: &Arc<crate::Connection>, name: &str) -> Vec<(usize, String)> {
+        let mut functions: Vec<(usize, String)> = conn
+            .current_schema()
+            .user_functions_named(name)
+            .iter()
+            .map(|function| (function.arg_count, function.sql.clone()))
+            .collect();
+        functions.sort();
+        functions
+    }
+
+    #[test]
+    fn create_function_stores_the_text_for_the_dialect() {
+        let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+        let db = open_db(
+            &io,
+            "dialect-functions.db",
+            Arc::new(TestDialect::default()),
+        )
+        .unwrap();
+        let conn = db.connect(ConnectOpts::new()).unwrap();
+        let other = db.connect(ConnectOpts::new()).unwrap();
+
+        let one_param = "CREATE FUNCTION add_tax(price) RETURN price * 1.2";
+        run_cmd(&conn, create_function_cmd("add_tax", 1, one_param, false)).unwrap();
+        // The same name with another number of parameters is another function.
+        let two_params = "CREATE FUNCTION add_tax(price, rate) RETURN price * rate";
+        run_cmd(&conn, create_function_cmd("add_tax", 2, two_params, false)).unwrap();
+        assert_eq!(
+            stored_function_sqls(&conn, "add_tax"),
+            vec![(1, one_param.to_string()), (2, two_params.to_string())]
+        );
+
+        // The second definition needs OR REPLACE.
+        let err = run_cmd(&conn, create_function_cmd("add_tax", 1, one_param, false)).unwrap_err();
+        assert!(err.to_string().contains("already exists"), "{err}");
+        let replaced = "CREATE FUNCTION add_tax(price) RETURN price * 1.3";
+        run_cmd(&conn, create_function_cmd("ADD_TAX", 1, replaced, true)).unwrap();
+        assert_eq!(
+            stored_function_sqls(&conn, "add_tax"),
+            vec![(1, replaced.to_string()), (2, two_params.to_string())]
+        );
+
+        // The other connection loads the functions with the changed schema.
+        other.execute("SELECT 1").unwrap();
+        assert_eq!(
+            stored_function_sqls(&other, "add_tax"),
+            vec![(1, replaced.to_string()), (2, two_params.to_string())]
+        );
+
+        // DROP FUNCTION without parameter types needs one function of the name.
+        let err = run_cmd(&conn, drop_function_cmd("add_tax", None)).unwrap_err();
+        assert!(err.to_string().contains("is not unique"), "{err}");
+        run_cmd(
+            &conn,
+            drop_function_cmd("add_tax", Some(vec!["real", "real"])),
+        )
+        .unwrap();
+        run_cmd(&conn, drop_function_cmd("add_tax", None)).unwrap();
+        assert!(stored_function_sqls(&conn, "add_tax").is_empty());
+        let err = run_cmd(&conn, drop_function_cmd("add_tax", Some(vec!["real"]))).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "Parse error: function add_tax(real) does not exist"
+        );
+
+        run_cmd(
+            &conn,
+            create_function_cmd("kept", 0, "CREATE FUNCTION kept() RETURN 1", false),
+        )
+        .unwrap();
+        conn.close().unwrap();
+        other.close().unwrap();
+        drop(db);
+
+        // The functions are read from the database file at open.
+        let db = open_db(
+            &io,
+            "dialect-functions.db",
+            Arc::new(TestDialect::default()),
+        )
+        .unwrap();
+        let conn = db.connect(ConnectOpts::new()).unwrap();
+        assert_eq!(
+            stored_function_sqls(&conn, "kept"),
+            vec![(0, "CREATE FUNCTION kept() RETURN 1".to_string())]
+        );
+        assert!(stored_function_sqls(&conn, "add_tax").is_empty());
+        conn.close().unwrap();
+    }
+
     #[test]
     fn connections_use_the_namespaces_of_the_dialect() {
         let io: Arc<dyn IO> = Arc::new(MemoryIO::new());

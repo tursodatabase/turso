@@ -2062,6 +2062,28 @@ pub fn insn_to_row(
                 0,
                 "ADD TYPE".to_string(),
             ),
+            Insn::AddFunction { db, function } => (
+                "AddFunction",
+                *db as i64,
+                function.arg_count as i64,
+                0,
+                Value::build_text(function.name.clone()),
+                0,
+                format!("ADD FUNCTION {}", function.name),
+            ),
+            Insn::DropFunction {
+                db,
+                name,
+                arg_count,
+            } => (
+                "DropFunction",
+                *db as i64,
+                *arg_count as i64,
+                0,
+                Value::build_text(name.clone()),
+                0,
+                format!("DROP FUNCTION {name}"),
+            ),
             Insn::DropView { db, view_name } => (
                 "DropView",
                 *db as i64,
