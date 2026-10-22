@@ -1057,6 +1057,11 @@ impl PostgreSQLTranslator {
             .ok_or_else(|| ParseError::ParseError("CREATE INDEX missing table name".into()))?;
         let tbl_name = ast::Name::from_string(self.map_table_name(&relation.relname));
 
+        // PostgreSQL derives a name such as t_a_idx; until that is implemented,
+        // an unnamed index would be created with an empty name.
+        if idx.idxname.is_empty() {
+            return Err(not_supported("CREATE INDEX without an index name"));
+        }
         let idx_name = ast::QualifiedName::single(ast::Name::from_string(&idx.idxname));
 
         self.translating_index.set(true);
@@ -9028,5 +9033,11 @@ mod tests {
         assert_translates("BEGIN ISOLATION LEVEL SERIALIZABLE, READ WRITE");
         assert_translates("START TRANSACTION DEFERRABLE");
         assert_translates("COMMIT AND NO CHAIN");
+    }
+
+    #[test]
+    fn fail_closed_unnamed_index() {
+        assert_not_supported("CREATE INDEX ON t (a)", "without an index name");
+        assert_translates("CREATE INDEX t_a ON t (a)");
     }
 }
