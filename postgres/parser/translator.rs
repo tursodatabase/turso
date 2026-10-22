@@ -1187,14 +1187,7 @@ impl PostgreSQLTranslator {
             Some(Node::TypeName(tn)) => {
                 // DROP TYPE/DOMAIN use TypeName nodes. Types live in a single
                 // namespace, so only an unqualified or public name is accepted.
-                let names = extract_key_columns(&tn.names)?;
-                let type_name = match names.as_slice() {
-                    [name] => name,
-                    [schema, name] if map_schema_name(schema) == "main" => name,
-                    [] => return Err(ParseError::ParseError("DROP TYPE: empty type name".into())),
-                    _ => return Err(not_supported("a schema-qualified type name")),
-                };
-                ast::QualifiedName::single(ast::Name::from_string(type_name.clone()))
+                ast::QualifiedName::single(ast::Name::from_string(type_name(&tn.names)?))
             }
             _ => {
                 return Err(ParseError::ParseError(
@@ -3401,11 +3394,13 @@ impl PostgreSQLTranslator {
     ) -> Result<ast::Expr, ParseError> {
         // OPERATOR(pg_catalog.~) names a built-in operator; any other schema
         // would name a user-defined one that does not exist here.
-        let op_name = match extract_key_columns(&a_expr.name)?.as_slice() {
-            [name] => name.clone(),
-            [schema, name] if schema == "pg_catalog" => name.clone(),
-            [] => return Err(ParseError::ParseError("Missing operator name".to_string())),
-            _ => {
+        let names = extract_key_columns(&a_expr.name)?;
+        if names.is_empty() {
+            return Err(ParseError::ParseError("Missing operator name".to_string()));
+        }
+        let op_name = match unqualified_name(&names, is_pg_catalog) {
+            Some(name) => name.clone(),
+            None => {
                 return Err(not_supported(
                     "an operator qualified with a schema other than pg_catalog",
                 ))
@@ -4233,12 +4228,8 @@ impl PostgreSQLTranslator {
                 // Only `= ANY` (which is also how IN is parsed) maps to IN;
                 // `x > ANY (SELECT ...)` and friends would become IN.
                 let op = extract_key_columns(&sub_link.oper_name)?;
-                let is_equality = match op.as_slice() {
-                    [] => true,
-                    [op] => op == "=",
-                    [schema, op] => schema == "pg_catalog" && op == "=",
-                    _ => false,
-                };
+                let is_equality =
+                    op.is_empty() || unqualified_name(&op, is_pg_catalog).is_some_and(|o| o == "=");
                 if !is_equality {
                     return Err(not_supported(format!(
                         "{} ANY/SOME (subquery)",
@@ -4897,7 +4888,7 @@ impl PostgreSQLTranslator {
         use pg_query::protobuf::node::Node;
         use pg_query::protobuf::ConstrType;
 
-        let domain_name = created_type_name(&domain.domainname)?;
+        let domain_name = type_name(&domain.domainname)?;
 
         // Extract base type from type_name and map PG type names to Turso names
         let type_name_node = domain
@@ -5534,7 +5525,7 @@ fn translate_create_enum(
 ) -> Result<ast::Stmt, ParseError> {
     use pg_query::protobuf::node::Node;
 
-    let type_name = created_type_name(&enum_stmt.type_name)?;
+    let type_name = type_name(&enum_stmt.type_name)?;
 
     // Extract enum labels
     let mut labels = Vec::new();
@@ -6959,12 +6950,31 @@ fn reject_column_aliases(
 /// name is accepted: user functions live in no schema, so any other
 /// qualifier would be dropped and resolve to a built-in of the same name.
 fn function_name(funcname: &[pg_query::protobuf::Node]) -> Result<String, ParseError> {
-    match extract_key_columns(funcname)?.as_slice() {
-        [name] => Ok(name.clone()),
-        [schema, name] if schema == "pg_catalog" => Ok(name.clone()),
-        [] => Err(ParseError::ParseError("Missing function name".to_string())),
-        _ => Err(not_supported("a schema-qualified function name")),
+    let names = extract_key_columns(funcname)?;
+    if names.is_empty() {
+        return Err(ParseError::ParseError("Missing function name".to_string()));
     }
+    unqualified_name(&names, is_pg_catalog)
+        .cloned()
+        .ok_or_else(|| not_supported("a schema-qualified function name"))
+}
+
+/// The last part of a name that is unqualified or qualified with a schema
+/// `allowed_schema` accepts.
+fn unqualified_name(names: &[String], allowed_schema: fn(&str) -> bool) -> Option<&String> {
+    match names {
+        [name] => Some(name),
+        [schema, name] if allowed_schema(schema) => Some(name),
+        _ => None,
+    }
+}
+
+fn is_pg_catalog(schema: &str) -> bool {
+    schema == "pg_catalog"
+}
+
+fn is_default_schema(schema: &str) -> bool {
+    map_schema_name(schema) == "main"
 }
 
 /// Whether a collation name means plain byte-wise comparison. Turso always
@@ -6974,27 +6984,25 @@ fn is_binary_collation(collname: &[pg_query::protobuf::Node]) -> bool {
     let Ok(names) = extract_key_columns(collname) else {
         return false;
     };
-    let name = match names.as_slice() {
-        [name] => name,
-        [schema, name] if schema == "pg_catalog" => name,
-        _ => return false,
-    };
-    matches!(
-        name.to_ascii_lowercase().as_str(),
-        "c" | "posix" | "default" | "ucs_basic"
-    )
+    unqualified_name(&names, is_pg_catalog).is_some_and(|name| {
+        matches!(
+            name.to_ascii_lowercase().as_str(),
+            "c" | "posix" | "default" | "ucs_basic"
+        )
+    })
 }
 
-/// The name of a type being created. Types live in a single namespace, so
+/// The name of a type being created or dropped. Types live in a single namespace, so
 /// only an unqualified, `public.` or `pg_catalog.` name is accepted; any
 /// other schema would be dropped.
-fn created_type_name(names: &[pg_query::protobuf::Node]) -> Result<String, ParseError> {
-    match extract_key_columns(names)?.as_slice() {
-        [name] => Ok(name.clone()),
-        [schema, name] if map_schema_name(schema) == "main" => Ok(name.clone()),
-        [] => Err(ParseError::ParseError("missing type name".into())),
-        _ => Err(not_supported("a schema-qualified type name")),
+fn type_name(names: &[pg_query::protobuf::Node]) -> Result<String, ParseError> {
+    let names = extract_key_columns(names)?;
+    if names.is_empty() {
+        return Err(ParseError::ParseError("missing type name".into()));
     }
+    unqualified_name(&names, is_default_schema)
+        .cloned()
+        .ok_or_else(|| not_supported("a schema-qualified type name"))
 }
 
 #[cfg(test)]
