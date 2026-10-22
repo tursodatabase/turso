@@ -6030,39 +6030,50 @@ fn like_pattern_to_glob(pattern: &str) -> Option<String> {
 fn similar_to_regex(pattern: &str) -> String {
     let mut regex = String::with_capacity(pattern.len() + 8);
     regex.push_str("^(?:");
-    let mut in_bracket = false;
+    let mut bracket_depth = 0usize;
+    let mut charclass_pos = 0usize;
     let mut chars = pattern.chars().peekable();
     while let Some(c) = chars.next() {
-        if in_bracket {
-            regex.push(c);
-            if c == ']' {
-                in_bracket = false;
+        if c == '\\' {
+            // Escaped character: pass through literally without ending a bracket
+            if let Some(next) = chars.next() {
+                regex.push('\\');
+                regex.push(next);
+                if bracket_depth > 0 {
+                    charclass_pos = 3;
+                }
+            } else {
+                regex.push('\\');
             }
             continue;
         }
+
+        if bracket_depth > 0 {
+            regex.push(c);
+            if c == ']' && charclass_pos > 2 {
+                bracket_depth -= 1;
+            } else if c == '[' {
+                bracket_depth += 1;
+                charclass_pos = 3;
+            } else if c == '^' {
+                charclass_pos += 1;
+            } else {
+                charclass_pos = 3;
+            }
+            continue;
+        }
+
         match c {
             '%' => regex.push_str(".*"),
             '_' => regex.push('.'),
-            '\\' => {
-                // Escaped character: pass through literally
-                if let Some(next) = chars.next() {
-                    regex.push('\\');
-                    regex.push(next);
-                }
-            }
             '.' | '^' | '$' => {
                 regex.push('\\');
                 regex.push(c);
             }
             '[' => {
-                in_bracket = true;
+                bracket_depth = 1;
+                charclass_pos = 1;
                 regex.push(c);
-                if chars.peek() == Some(&'^') {
-                    regex.push(chars.next().unwrap());
-                }
-                if chars.peek() == Some(&']') {
-                    regex.push(chars.next().unwrap());
-                }
             }
             _ => regex.push(c),
         }
@@ -8751,5 +8762,16 @@ mod tests {
             };
             assert!(select.with.is_some(), "{sql}: WITH clause was dropped");
         }
+    }
+
+    #[test]
+    fn test_similar_to_regex_bracket_tracking() {
+        assert_eq!(similar_to_regex(r"[a\]%]"), r"^(?:[a\]%])$");
+        assert_eq!(similar_to_regex(r"[[:alpha:]_]"), r"^(?:[[:alpha:]_])$");
+        assert_eq!(
+            similar_to_regex(r"[]%][^]%][^%]%"),
+            r"^(?:[]%][^]%][^%].*)$"
+        );
+        assert_eq!(similar_to_regex(r"[^^]^"), r"^(?:[^^]\^)$");
     }
 }
