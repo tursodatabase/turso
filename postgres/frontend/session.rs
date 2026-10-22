@@ -639,10 +639,7 @@ fn handle_pg_copy_from(conn: &Arc<Connection>, stmt: &PgCopyFromStmt) -> Result<
         .unwrap_or('\t');
     let null_string = stmt.null_string.as_deref().unwrap_or("\\N");
 
-    let mut rows = parse_copy_text_format(&data, delimiter, null_string, num_columns)?;
-    if stmt.header && !rows.is_empty() {
-        rows.remove(0);
-    }
+    let rows = parse_copy_text_format(&data, delimiter, null_string, num_columns, stmt.header)?;
 
     let rows_inserted = rows.len();
     let mut begin = conn.prepare_sqlite("BEGIN")?;
