@@ -80,6 +80,7 @@ impl PgConnection {
         let conn = db.connect_with_context(context)?;
         conn.add_namespace("public", turso_core::MAIN_DB_ID);
         set_search_path(&conn, None)?;
+        conn.set_foreign_keys_enabled(true);
         Ok(Self {
             inner: Arc::new(PgConnectionInner { conn }),
         })
