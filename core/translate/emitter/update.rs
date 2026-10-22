@@ -508,6 +508,8 @@ struct UpdateColumnCtx<'a> {
     cdc_updates_register: Option<usize>,
     layout: &'a ColumnLayout,
     affected_columns: &'a ColumnMask,
+    /// The columns that the rows returned by the BEFORE triggers change.
+    columns_changed_by_triggers: &'a ColumnMask,
 }
 
 impl UpdateColumnCtx<'_> {
@@ -923,6 +925,15 @@ fn emit_update_column_values<'a>(
                                     target_reg,
                                     &t_ctx.resolver,
                                     NoConstantOptReason::CustomTypeEncode,
+                                )
+                            } else if column_ctx.columns_changed_by_triggers.get(idx) {
+                                translate_expr_no_constant_opt(
+                                    program,
+                                    Some(table_references),
+                                    expr,
+                                    target_reg,
+                                    &t_ctx.resolver,
+                                    NoConstantOptReason::TriggerReturnsRow,
                                 )
                             } else {
                                 translate_expr(
@@ -1395,6 +1406,7 @@ fn emit_update_insns<'a>(
         cdc_updates_register,
         layout: &layout,
         affected_columns: &affected_columns,
+        columns_changed_by_triggers: &columns_changed_by_triggers,
     };
     let skip_set_clauses = false;
 

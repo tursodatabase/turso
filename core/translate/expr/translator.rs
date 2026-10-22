@@ -30,6 +30,10 @@ pub enum NoConstantOptReason {
     /// Each value reuses the same register, so hoisting would collapse
     /// all values into the last one.
     InListEphemeral,
+    /// A BEFORE trigger function returns a row that the engine writes into
+    /// the register of the column inside the row loop. A hoisted constant
+    /// would then carry the value the trigger gave one row to the next row.
+    TriggerReturnsRow,
 }
 
 /// Controls how binary expressions are emitted.

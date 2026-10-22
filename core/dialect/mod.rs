@@ -1394,6 +1394,38 @@ mod tests {
     }
 
     #[test]
+    fn returned_row_does_not_change_the_constant_set_values_of_the_next_row() {
+        let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+        let db = open_db(&io, "constant-set.db", Arc::new(TestDialect::default())).unwrap();
+        let conn = db.connect(ConnectOpts::new()).unwrap();
+        conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER, w TEXT)")
+            .unwrap();
+        run_cmd(
+            &conn,
+            create_function_cmd(
+                "keep_v",
+                0,
+                "RETURN v = CASE WHEN OLD.w = 'keep' THEN OLD.v ELSE NEW.v END",
+                false,
+            ),
+        )
+        .unwrap();
+        create_test_trigger(
+            &conn,
+            "test-trigger: keep BEFORE UPDATE ON t EXECUTE keep_v",
+        );
+        conn.execute(
+            "INSERT INTO t VALUES (1, 1, 'keep'), (2, 1, 'x'), (3, 1, 'keep'), (4, 1, 'x')",
+        )
+        .unwrap();
+        conn.execute("UPDATE t SET v = 8").unwrap();
+        assert_eq!(
+            query_text(&conn, "SELECT id, v FROM t ORDER BY id"),
+            vec!["1|1", "2|8", "3|1", "4|8"]
+        );
+    }
+
+    #[test]
     fn before_trigger_function_skips_the_row() {
         let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
         let db = open_db(&io, "skipped-row.db", Arc::new(TestDialect::default())).unwrap();
