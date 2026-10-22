@@ -217,3 +217,13 @@ test view-in-schema-finds-its-tables-without-a-schema-name {
 expect {
     1
 }
+
+@skip-if postgres "PostgreSQL keeps a public table named app.u apart from the table u of schema app; Turso stores both under the same name"
+test public-object-named-under-a-schema-prefix-errors {
+    CREATE SCHEMA app;
+    CREATE TABLE app.t (x int);
+    CREATE TABLE "app.u" (y int);
+}
+expect error {
+    the prefix of app
+}

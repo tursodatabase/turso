@@ -5314,6 +5314,34 @@ mod tests {
     }
 
     #[test]
+    fn test_an_object_of_main_cannot_take_a_name_under_the_prefix_of_a_namespace() {
+        let temp_dir = TempDir::new().unwrap();
+        let conn = open_connection_with_opts(&temp_dir.path().join("main.db"), DatabaseOpts::new());
+        conn.execute("CREATE TABLE t(x INTEGER)").unwrap();
+        conn.add_namespace(crate::Namespace {
+            name: "app".to_string(),
+            database_id: MAIN_DB_ID,
+            prefix: "app.".to_string(),
+        });
+
+        for sql in [
+            "CREATE TABLE \"app.u\"(x INTEGER)",
+            "CREATE TABLE main.\"app.u\"(x INTEGER)",
+            "CREATE VIEW \"app.v\" AS SELECT 1",
+            "CREATE SEQUENCE \"app.s\"",
+            "CREATE INDEX \"app.i\" ON t(x)",
+            "CREATE TRIGGER \"app.tr\" AFTER INSERT ON t BEGIN SELECT 1; END",
+            "ALTER TABLE t RENAME TO \"app.u\"",
+        ] {
+            let err = conn.execute(sql).unwrap_err().to_string();
+            assert!(err.contains("the prefix of app"), "{sql}: {err}");
+        }
+        conn.execute("CREATE TABLE app.u(x INTEGER); INSERT INTO app.u VALUES(2)")
+            .unwrap();
+        assert_eq!(query_single_i64(&conn, "SELECT x FROM app.u"), 2);
+    }
+
+    #[test]
     fn test_the_search_path_finds_objects_through_a_namespace_with_a_prefix() {
         let temp_dir = TempDir::new().unwrap();
         let conn = open_connection_with_opts(&temp_dir.path().join("main.db"), DatabaseOpts::new());

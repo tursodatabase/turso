@@ -119,7 +119,12 @@ pub fn translate_create_index(
     };
     let database_id = namespace.database_id;
     let sql = canonical_create_index_sql(&written_stmt, &namespace);
-    let idx_name = namespace.stored_name(&normalize_ident(original_idx_name.name.as_str()));
+    let resolved_idx_name = crate::translate::emitter::ResolvedName::in_namespace(
+        namespace.clone(),
+        &normalize_ident(original_idx_name.name.as_str()),
+    );
+    resolver.check_name_is_not_under_another_prefix(&resolved_idx_name)?;
+    let idx_name = resolved_idx_name.stored_name;
     let tbl_name = namespace.stored_name(&normalize_ident(original_tbl_name.as_str()));
 
     validate(

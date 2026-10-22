@@ -292,17 +292,19 @@ fn resolve_create_trigger(
             &normalize_ident(trigger_name.name.as_str()),
         ));
     }
-    if trigger_name.namespace.is_some() {
-        return resolver.resolve_object(trigger_name);
-    }
-
-    // Unqualified trigger names default to main, except when the trigger is
-    // attached to a temp object. SQLite stores those triggers in temp.
-    let database_id = match resolver.resolve_existing_table(tbl_name)?.database_id() {
-        crate::TEMP_DB_ID => crate::TEMP_DB_ID,
-        _ => crate::MAIN_DB_ID,
+    let resolved = if trigger_name.namespace.is_some() {
+        resolver.resolve_object(trigger_name)?
+    } else {
+        // Unqualified trigger names default to main, except when the trigger is
+        // attached to a temp object. SQLite stores those triggers in temp.
+        let database_id = match resolver.resolve_existing_table(tbl_name)?.database_id() {
+            crate::TEMP_DB_ID => crate::TEMP_DB_ID,
+            _ => crate::MAIN_DB_ID,
+        };
+        resolver.resolved_in_database(database_id, &normalize_ident(trigger_name.name.as_str()))
     };
-    Ok(resolver.resolved_in_database(database_id, &normalize_ident(trigger_name.name.as_str())))
+    resolver.check_name_is_not_under_another_prefix(&resolved)?;
+    Ok(resolved)
 }
 
 /// Validate that no table or expression reference in a trigger body points to a

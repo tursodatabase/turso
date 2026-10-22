@@ -1064,22 +1064,43 @@ impl<'a> Resolver<'a> {
         qualified_name: &ast::QualifiedName,
         temporary: bool,
     ) -> Result<ResolvedName> {
-        if temporary {
-            return Ok(self.resolved_in_database(
+        let resolved = if temporary {
+            self.resolved_in_database(
                 crate::TEMP_DB_ID,
                 &normalize_ident(qualified_name.name.as_str()),
-            ));
-        }
-        if qualified_name.namespace.is_some() {
-            return self.resolve_object(qualified_name);
-        }
-        let namespace = self.search_order.first().cloned().ok_or_else(|| {
-            LimboError::ParseError("no schema has been selected to create in".to_string())
-        })?;
-        Ok(ResolvedName::in_namespace(
-            namespace,
-            &normalize_ident(qualified_name.name.as_str()),
-        ))
+            )
+        } else if qualified_name.namespace.is_some() {
+            self.resolve_object(qualified_name)?
+        } else {
+            let namespace = self.search_order.first().cloned().ok_or_else(|| {
+                LimboError::ParseError("no schema has been selected to create in".to_string())
+            })?;
+            ResolvedName::in_namespace(namespace, &normalize_ident(qualified_name.name.as_str()))
+        };
+        self.check_name_is_not_under_another_prefix(&resolved)?;
+        Ok(resolved)
+    }
+
+    /// Refuses the name of a new object when its stored name starts with
+    /// the prefix of a namespace nested under its own, like a table of main
+    /// called "app.u" next to a namespace app with the prefix "app.": the
+    /// object would read and drop as the table u of app.
+    pub(crate) fn check_name_is_not_under_another_prefix(
+        &self,
+        resolved: &ResolvedName,
+    ) -> Result<()> {
+        let own = &resolved.namespace;
+        let Some(other) = self.namespaces.others().into_iter().find(|other| {
+            other.database_id == own.database_id
+                && other.prefix.len() > own.prefix.len()
+                && resolved.stored_name.starts_with(&other.prefix)
+        }) else {
+            return Ok(());
+        };
+        Err(LimboError::ParseError(format!(
+            "cannot create \"{}\" in {}: the name starts with \"{}\", the prefix of {}",
+            resolved.name, own.name, other.prefix, other.name
+        )))
     }
 
     /// The object called `name` in the namespace that is the whole of

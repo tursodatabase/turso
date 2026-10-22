@@ -20,7 +20,9 @@ use crate::{
         RESERVED_TABLE_PREFIXES,
     },
     translate::{
-        emitter::{emit_check_constraints, gencol::compute_virtual_columns, Resolver},
+        emitter::{
+            emit_check_constraints, gencol::compute_virtual_columns, ResolvedName, Resolver,
+        },
         expr::{emit_stored_column, walk_expr, walk_expr_mut, WalkControl},
         plan::{
             ColumnMask, ColumnUsedMask, JoinedTable, Operation, OuterQueryReference,
@@ -1431,6 +1433,10 @@ pub fn translate_alter_table(
             )?
         }
         ast::AlterTableBody::RenameTo(new_name) => {
+            resolver.check_name_is_not_under_another_prefix(&ResolvedName::in_namespace(
+                resolved.namespace.clone(),
+                &normalize_ident(new_name.as_str()),
+            ))?;
             let new_name_in_sql = resolved.namespace.name_in_sql(&new_name);
             let new_name = new_name_in_sql.as_str();
             let normalized_old_name = normalize_ident(table_name);
