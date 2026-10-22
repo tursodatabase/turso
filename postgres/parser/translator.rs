@@ -716,16 +716,47 @@ impl PostgreSQLTranslator {
         if txn.chain {
             return Err(not_supported("COMMIT/ROLLBACK AND CHAIN"));
         }
-        // Isolation levels and DEFERRABLE are accepted: Turso transactions are
-        // serializable, which satisfies every level a client can request.
-        // READ ONLY is a restriction that is not enforced, so it must not be
-        // silently dropped.
+        // Turso has no isolation levels: every transaction reads one snapshot
+        // taken at its start. That is PostgreSQL's REPEATABLE READ. It is not
+        // SERIALIZABLE (MVCC allows write skew), and it is not READ COMMITTED
+        // (no per-statement snapshots), so only REPEATABLE READ is accepted.
+        // DEFERRABLE and READ ONLY are restrictions that are not enforced.
         for opt in &txn.options {
             let Some(pg_query::protobuf::node::Node::DefElem(def)) = &opt.node else {
                 return Err(not_supported("transaction option"));
             };
             match def.defname.as_str() {
-                "transaction_isolation" | "transaction_deferrable" => {}
+                "transaction_isolation" => {
+                    let level = match def.arg.as_ref().and_then(|n| n.node.as_ref()) {
+                        Some(pg_query::protobuf::node::Node::AConst(
+                            pg_query::protobuf::AConst {
+                                val: Some(pg_query::protobuf::a_const::Val::Sval(s)),
+                                ..
+                            },
+                        )) => s.sval.to_lowercase(),
+                        _ => return Err(not_supported("this transaction isolation level")),
+                    };
+                    if level != "repeatable read" {
+                        return Err(not_supported(format!(
+                            "ISOLATION LEVEL {} (Turso transactions are snapshot isolation, \
+                             i.e. REPEATABLE READ)",
+                            level.to_uppercase()
+                        )));
+                    }
+                }
+                "transaction_deferrable" => {
+                    // pg_query encodes NOT DEFERRABLE as integer 0.
+                    let not_deferrable = matches!(
+                        def.arg.as_ref().and_then(|n| n.node.as_ref()),
+                        Some(pg_query::protobuf::node::Node::AConst(pg_query::protobuf::AConst {
+                            val: Some(pg_query::protobuf::a_const::Val::Ival(i)),
+                            ..
+                        })) if i.ival == 0
+                    );
+                    if !not_deferrable {
+                        return Err(not_supported("DEFERRABLE transactions"));
+                    }
+                }
                 "transaction_read_only" => {
                     // pg_query encodes READ WRITE as integer 0 and READ ONLY as 1.
                     let read_write = matches!(
@@ -9680,14 +9711,11 @@ mod tests {
     fn fail_closed_transaction_options() {
         assert_not_supported("BEGIN READ ONLY", "READ ONLY");
         assert_not_supported(
-            "START TRANSACTION ISOLATION LEVEL SERIALIZABLE, READ ONLY",
+            "START TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY",
             "READ ONLY",
         );
         assert_not_supported("COMMIT AND CHAIN", "AND CHAIN");
         assert_not_supported("ROLLBACK AND CHAIN", "AND CHAIN");
-        assert_translates("BEGIN ISOLATION LEVEL READ COMMITTED");
-        assert_translates("BEGIN ISOLATION LEVEL SERIALIZABLE, READ WRITE");
-        assert_translates("START TRANSACTION DEFERRABLE");
         assert_translates("COMMIT AND NO CHAIN");
     }
 
@@ -10315,5 +10343,28 @@ mod tests {
             "WITH on a set operation or VALUES",
         );
         assert_translates("WITH c AS (SELECT 1 AS x) SELECT x FROM c");
+    }
+
+    #[test]
+    fn fail_closed_transaction_isolation_levels() {
+        for (sql, needle) in [
+            (
+                "BEGIN ISOLATION LEVEL SERIALIZABLE",
+                "ISOLATION LEVEL SERIALIZABLE",
+            ),
+            (
+                "BEGIN ISOLATION LEVEL READ COMMITTED",
+                "ISOLATION LEVEL READ COMMITTED",
+            ),
+            (
+                "START TRANSACTION ISOLATION LEVEL READ UNCOMMITTED",
+                "ISOLATION LEVEL READ UNCOMMITTED",
+            ),
+            ("START TRANSACTION DEFERRABLE", "DEFERRABLE"),
+        ] {
+            assert_not_supported(sql, needle);
+        }
+        assert_translates("BEGIN ISOLATION LEVEL REPEATABLE READ, READ WRITE, NOT DEFERRABLE");
+        assert_translates("BEGIN");
     }
 }
