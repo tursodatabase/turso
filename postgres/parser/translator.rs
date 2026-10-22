@@ -1921,7 +1921,7 @@ impl PostgreSQLTranslator {
             ));
         }
 
-        let result_columns = self.translate_target_list(target_list)?;
+        let result_columns = self.translate_target_list(target_list, &select.from_clause)?;
 
         let where_clause = if let Some(where_clause) = &select.where_clause {
             Some(self.translate_expr(where_clause)?)
@@ -2094,7 +2094,7 @@ impl PostgreSQLTranslator {
             ));
         }
 
-        let result_columns = self.translate_target_list(target_list)?;
+        let result_columns = self.translate_target_list(target_list, &select.from_clause)?;
 
         let where_clause = if let Some(where_clause) = &select.where_clause {
             Some(self.translate_expr(where_clause)?)
@@ -2839,6 +2839,7 @@ impl PostgreSQLTranslator {
     fn translate_target_list(
         &self,
         target_list: &[pg_query::protobuf::Node],
+        from_clause: &[pg_query::protobuf::Node],
     ) -> Result<Vec<ast::ResultColumn>, ParseError> {
         let mut result_columns = Vec::new();
 
@@ -2859,22 +2860,48 @@ impl PostgreSQLTranslator {
                                         // SELECT *
                                         result_columns.push(ast::ResultColumn::Star);
                                     } else {
-                                        // SELECT table.* or alias.*. A schema-qualified
-                                        // s.t.* would otherwise expand the wrong name.
-                                        let [table, _] = col_ref.fields.as_slice() else {
-                                            return Err(not_supported(
-                                                "schema.table.* in a select list",
-                                            ));
-                                        };
-                                        let Some(pg_query::protobuf::node::Node::String(s)) =
-                                            &table.node
-                                        else {
-                                            return Err(ParseError::ParseError(
-                                                "invalid table.* reference".into(),
-                                            ));
+                                        // SELECT table.* or alias.*. The engine matches
+                                        // the name against FROM items only, so s.t.* is
+                                        // accepted only when it names exactly one
+                                        // unaliased FROM relation, which FROM exposes as t.
+                                        let qualifier: Option<Vec<&str>> = col_ref.fields
+                                            [..col_ref.fields.len() - 1]
+                                            .iter()
+                                            .map(|f| match &f.node {
+                                                Some(pg_query::protobuf::node::Node::String(s)) => {
+                                                    Some(s.sval.as_str())
+                                                }
+                                                _ => None,
+                                            })
+                                            .collect();
+                                        let table = match qualifier.as_deref() {
+                                            Some([table]) => table,
+                                            Some([schema, table]) => {
+                                                if !from_exposes_relation(
+                                                    from_clause,
+                                                    schema,
+                                                    table,
+                                                ) {
+                                                    return Err(not_supported(
+                                                        "schema.table.* that does not name an \
+                                                         unaliased FROM relation",
+                                                    ));
+                                                }
+                                                table
+                                            }
+                                            Some(_) => {
+                                                return Err(not_supported(
+                                                    "cross-database references",
+                                                ));
+                                            }
+                                            None => {
+                                                return Err(ParseError::ParseError(
+                                                    "invalid table.* reference".into(),
+                                                ));
+                                            }
                                         };
                                         result_columns.push(ast::ResultColumn::TableStar(
-                                            ast::Name::from_string(&s.sval),
+                                            ast::Name::from_string(table),
                                         ));
                                     }
                                     continue;
@@ -4579,7 +4606,7 @@ impl PostgreSQLTranslator {
             if is_star_qualified_by(node, target_qualifiers) {
                 columns.push(ast::ResultColumn::Star);
             } else {
-                columns.extend(self.translate_target_list(std::slice::from_ref(node))?);
+                columns.extend(self.translate_target_list(std::slice::from_ref(node), &[])?);
             }
         }
         Ok(columns)
@@ -5296,6 +5323,75 @@ fn is_bare_star(node: &pg_query::protobuf::Node) -> bool {
         }
         _ => false,
     }
+}
+
+/// Returns whether `schema.table` names exactly one FROM item, and that item is
+/// the relation `schema.table` without an alias, so `table` is how FROM exposes
+/// it. An unqualified FROM relation counts as being in `public`.
+fn from_exposes_relation(
+    from_clause: &[pg_query::protobuf::Node],
+    schema: &str,
+    table: &str,
+) -> bool {
+    use pg_query::protobuf::node::Node;
+
+    fn alias_name(alias: &Option<pg_query::protobuf::Alias>) -> Option<&str> {
+        alias
+            .as_ref()
+            .map(|a| a.aliasname.as_str())
+            .filter(|n| !n.is_empty())
+    }
+
+    // Collects (exposed name, is an unaliased relation in `schema`) per FROM item.
+    fn collect<'a>(
+        nodes: &'a [pg_query::protobuf::Node],
+        schema: &str,
+        out: &mut Vec<(&'a str, bool)>,
+    ) {
+        for node in nodes {
+            match &node.node {
+                Some(Node::RangeVar(rv)) => match alias_name(&rv.alias) {
+                    Some(alias) => out.push((alias, false)),
+                    None => {
+                        let in_schema = rv.catalogname.is_empty()
+                            && if rv.schemaname.is_empty() {
+                                schema.eq_ignore_ascii_case("public")
+                            } else {
+                                rv.schemaname == schema
+                            };
+                        out.push((rv.relname.as_str(), in_schema));
+                    }
+                },
+                Some(Node::JoinExpr(join)) => match alias_name(&join.alias) {
+                    Some(alias) => out.push((alias, false)),
+                    None => {
+                        if let Some(l) = &join.larg {
+                            collect(std::slice::from_ref(l), schema, out);
+                        }
+                        if let Some(r) = &join.rarg {
+                            collect(std::slice::from_ref(r), schema, out);
+                        }
+                    }
+                },
+                Some(Node::RangeSubselect(sub)) => {
+                    if let Some(alias) = alias_name(&sub.alias) {
+                        out.push((alias, false));
+                    }
+                }
+                Some(Node::RangeFunction(func)) => {
+                    if let Some(alias) = alias_name(&func.alias) {
+                        out.push((alias, false));
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    let mut items = Vec::new();
+    collect(from_clause, schema, &mut items);
+    let mut named = items.iter().filter(|(name, _)| *name == table);
+    matches!((named.next(), named.next()), (Some((_, true)), None))
 }
 
 fn is_star_qualified_by(node: &pg_query::protobuf::Node, target_qualifiers: &[&str]) -> bool {
@@ -10206,9 +10302,25 @@ mod tests {
     }
 
     #[test]
-    fn fail_closed_schema_qualified_table_star() {
-        assert_not_supported("SELECT public.t.* FROM public.t", "schema.table.*");
+    fn schema_qualified_table_star() {
+        assert_translates("SELECT public.t.* FROM public.t");
+        assert_translates("SELECT public.t.* FROM t");
+        assert_translates("SELECT s.t.* FROM s.t");
+        assert_translates("SELECT s.t.*, u.* FROM s.t JOIN u ON t.id = u.id");
         assert_translates("SELECT t.*, * FROM t");
+        // Aliased, wrong schema, or ambiguous: the name would not resolve to s.t.
+        for sql in [
+            "SELECT s.t.* FROM s.t AS x",
+            "SELECT s.t.* FROM t",
+            "SELECT s.t.* FROM s.t, u.t",
+            "SELECT s.t.* FROM s.t, t",
+            "SELECT s.t.* FROM (SELECT 1) AS t",
+            "SELECT s.t.* FROM s.t AS x, t",
+            "SELECT s.t.* FROM u",
+        ] {
+            assert_not_supported(sql, "schema.table.*");
+        }
+        assert_not_supported("SELECT db.s.t.* FROM s.t", "cross-database");
     }
 
     #[test]

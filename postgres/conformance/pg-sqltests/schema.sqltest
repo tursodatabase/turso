@@ -60,3 +60,43 @@ test drop-schema-public-cascade-drops-its-objects {
 expect {
     0
 }
+
+test select-schema-qualified-table-star {
+    CREATE SCHEMA IF NOT EXISTS star_s;
+    DROP SCHEMA star_s CASCADE;
+    CREATE SCHEMA star_s;
+    CREATE TABLE star_s.st (a int, b text);
+    INSERT INTO star_s.st VALUES (1, 'x'), (2, 'y');
+    SELECT star_s.st.* FROM star_s.st ORDER BY a;
+}
+expect {
+    1|x
+    2|y
+}
+
+test select-schema-qualified-table-star-with-join {
+    CREATE SCHEMA IF NOT EXISTS star_j;
+    DROP SCHEMA star_j CASCADE;
+    CREATE SCHEMA star_j;
+    CREATE TABLE star_j.jt (a int, b text);
+    CREATE TABLE star_j.ju (a int, c text);
+    INSERT INTO star_j.jt VALUES (1, 'x'), (2, 'y');
+    INSERT INTO star_j.ju VALUES (1, 'p'), (3, 'q');
+    SELECT star_j.ju.*, jt.b FROM star_j.jt JOIN star_j.ju ON jt.a = ju.a;
+    SELECT star_j.jt.* FROM star_j.jt, star_j.ju WHERE jt.a = ju.a;
+}
+expect {
+    1|p|x
+    1|x
+}
+
+test select-public-qualified-table-star {
+    CREATE TABLE star_p (a int, b text);
+    INSERT INTO star_p VALUES (1, 'x');
+    SELECT public.star_p.* FROM star_p;
+    SELECT public.star_p.* FROM public.star_p;
+}
+expect {
+    1|x
+    1|x
+}
