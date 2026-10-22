@@ -241,6 +241,13 @@ pub fn plan_subqueries_from_select_plan(
     resolver: &Resolver,
     connection: &Arc<Connection>,
 ) -> Result<()> {
+    resolver.begin_collecting_aggregates_from_subqueries(
+        plan.table_references
+            .joined_tables()
+            .iter()
+            .map(|table| table.internal_id)
+            .collect(),
+    );
     // Common-subexpression elimination for scalar subqueries shared by GROUP BY and the SELECT
     // list (e.g. `SELECT (subq) AS rs ... GROUP BY rs`, where the GROUP BY term is a copy of the
     // result column): plan and evaluate the subquery once instead of once per use.
@@ -412,6 +419,8 @@ pub fn plan_subqueries_from_select_plan(
         recollect_aggregates(plan, resolver)?;
     }
 
+    plan.aggregates
+        .extend(resolver.take_aggregates_from_subqueries());
     assign_select_subquery_eval_phases(plan);
     mark_shared_cte_materialization_requirements(
         &mut plan.table_references,
@@ -2320,7 +2329,7 @@ fn assign_select_subquery_eval_phases(plan: &mut SelectPlan) {
         // in the outer query's aggregate-output phase, after that aggregate has
         // been finalized into a register; run earlier, the aggregate expression
         // inside the subquery has no register to read.
-        if subquery_reads_outer_aggregate(subquery) {
+        if subquery_reads_outer_aggregate(subquery, &plan.aggregates) {
             subquery.eval_phase = if has_grouped_output {
                 SubqueryEvalPhase::GroupedOutput
             } else {
@@ -2394,29 +2403,52 @@ fn expr_reads_subquery(expr: &ast::Expr, subquery_ids: &[ast::TableInternalId]) 
 /// Window functions (an aggregate name with an `OVER` clause) are computed by
 /// the subquery itself, not the outer query, so they are not counted here even
 /// though they also do not appear in `aggregates`.
-fn subquery_reads_outer_aggregate(subquery: &NonFromClauseSubquery) -> bool {
+fn subquery_reads_outer_aggregate(
+    subquery: &NonFromClauseSubquery,
+    aggregates: &[Aggregate],
+) -> bool {
     let SubqueryState::Unevaluated { plan: Some(plan) } = &subquery.state else {
         return false;
     };
-    let Plan::Select(select) = plan.as_ref() else {
-        return false;
-    };
+    plan_reads_outer_aggregate(plan, aggregates)
+}
+
+fn plan_reads_outer_aggregate(plan: &Plan, aggregates: &[Aggregate]) -> bool {
+    match plan {
+        Plan::Select(select) => select_reads_outer_aggregate(select, aggregates),
+        Plan::CompoundSelect {
+            left, right_most, ..
+        } => {
+            select_reads_outer_aggregate(right_most, aggregates)
+                || left
+                    .iter()
+                    .any(|(select, _)| select_reads_outer_aggregate(select, aggregates))
+        }
+        Plan::RecursiveCte(cte) => {
+            plan_reads_outer_aggregate(&cte.initial_query, aggregates)
+                || plan_reads_outer_aggregate(&cte.recursive_query, aggregates)
+        }
+        Plan::Delete(_) | Plan::Update(_) => false,
+    }
+}
+
+fn select_reads_outer_aggregate(select: &SelectPlan, aggregates: &[Aggregate]) -> bool {
     let mut found = false;
     for rc in &select.result_columns {
         let _ = walk_expr(&rc.expr, &mut |e: &ast::Expr| -> Result<WalkControl> {
-            if let ast::Expr::FunctionCall {
-                name,
-                args,
-                filter_over,
-                ..
-            } = e
+            if aggregates.iter().any(|agg| agg.original_expr == *e)
+                && !select.aggregates.iter().any(|agg| agg.original_expr == *e)
             {
-                let is_plain_aggregate = filter_over.over_clause.is_none()
-                    && matches!(
-                        crate::function::Func::resolve_function(name.as_str(), args.len()),
-                        Ok(Some(crate::function::Func::Agg(_)))
-                    );
-                if is_plain_aggregate && !select.aggregates.iter().any(|a| a.original_expr == *e) {
+                found = true;
+                return Ok(WalkControl::SkipChildren);
+            }
+            if let ast::Expr::SubqueryResult { subquery_id, .. } = e {
+                let nested = select
+                    .non_from_clause_subqueries
+                    .iter()
+                    .find(|nested| nested.internal_id == *subquery_id)
+                    .expect("subquery result must have a planned subquery");
+                if subquery_reads_outer_aggregate(nested, aggregates) {
                     found = true;
                     return Ok(WalkControl::SkipChildren);
                 }
@@ -2424,8 +2456,14 @@ fn subquery_reads_outer_aggregate(subquery: &NonFromClauseSubquery) -> bool {
             Ok(WalkControl::Continue)
         });
         if found {
-            break;
+            return true;
         }
     }
-    found
+    select.joined_tables().iter().any(|table| {
+        if let Table::FromClauseSubquery(subquery) = &table.table {
+            plan_reads_outer_aggregate(&subquery.plan, aggregates)
+        } else {
+            false
+        }
+    })
 }
