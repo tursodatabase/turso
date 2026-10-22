@@ -131,3 +131,44 @@ fn test_rename_of_a_table_with_a_plpgsql_trigger_is_rejected(db: TempDatabase) {
         vec![vec![Value::from_i64(1)]]
     );
 }
+
+#[turso_macros::test]
+fn test_prepared_update_maintains_the_index_of_the_column_the_replaced_function_sets(
+    db: TempDatabase,
+) {
+    let conn = db.connect_postgres();
+    conn.execute("CREATE TABLE docs (id int PRIMARY KEY, title text, tag text)")
+        .unwrap();
+    conn.execute("CREATE INDEX docs_tag ON docs (tag)").unwrap();
+    conn.execute("INSERT INTO docs VALUES (1, 'a', 'none')")
+        .unwrap();
+    let create_set_tag = |tag: &str| {
+        conn.execute(format!(
+            "CREATE OR REPLACE FUNCTION set_tag() RETURNS trigger LANGUAGE plpgsql AS $$ \
+             BEGIN NEW.tag := '{tag}'; RETURN NEW; END $$"
+        ))
+        .unwrap();
+    };
+    create_set_tag("first");
+    conn.execute(
+        "CREATE TRIGGER docs_set_tag BEFORE UPDATE ON docs FOR EACH ROW EXECUTE FUNCTION set_tag()",
+    )
+    .unwrap();
+    let mut update = conn
+        .prepare("UPDATE docs SET title = 'b' WHERE id = 1")
+        .unwrap();
+    update.run_ignore_rows().unwrap();
+    update.reset().unwrap();
+    let tags_through_index =
+        |tag: &str| query_rows(&conn, &format!("SELECT id FROM docs WHERE tag = '{tag}'"));
+    assert_eq!(tags_through_index("first"), vec![vec![Value::from_i64(1)]]);
+
+    create_set_tag("second");
+    update.run_ignore_rows().unwrap();
+    assert_eq!(tags_through_index("second"), vec![vec![Value::from_i64(1)]]);
+    assert!(tags_through_index("first").is_empty());
+    assert_eq!(
+        query_rows(&conn, "SELECT title, tag FROM docs"),
+        vec![vec![Value::build_text("b"), Value::build_text("second")]]
+    );
+}

@@ -300,3 +300,217 @@ test unsupported-plpgsql-gives-an-error-when-the-trigger-is-used {
 expect error {
     IF is not supported yet in trigger functions
 }
+
+# BEFORE triggers: the row the function returns is the row the statement
+# writes. `RETURN NULL` skips the row.
+
+setup docs {
+    CREATE TABLE docs (id int PRIMARY KEY, title text, updated_at timestamptz);
+    CREATE TABLE audit (seq serial, title text);
+    CREATE FUNCTION set_updated_at() RETURNS trigger LANGUAGE plpgsql AS $$
+    BEGIN
+      NEW.updated_at := now();
+      RETURN NEW;
+    END;
+    $$;
+}
+
+@setup docs
+test before-trigger-sets-a-column-of-the-new-row {
+    CREATE TRIGGER docs_updated_at BEFORE INSERT OR UPDATE ON docs FOR EACH ROW EXECUTE FUNCTION set_updated_at();
+    INSERT INTO docs (id, title) VALUES (1, 'a'), (2, 'b');
+    SELECT count(*) FROM docs WHERE updated_at IS NOT NULL;
+    SELECT count(DISTINCT updated_at) FROM docs;
+    BEGIN;
+    UPDATE docs SET title = 'c' WHERE id = 2;
+    SELECT count(*) FROM docs WHERE updated_at = now();
+    COMMIT;
+    SELECT title FROM docs WHERE id = 2;
+}
+expect {
+    2
+    1
+    1
+    c
+}
+
+@setup docs
+test before-trigger-sets-the-row-of-an-upsert {
+    CREATE TRIGGER docs_updated_at BEFORE INSERT OR UPDATE ON docs FOR EACH ROW EXECUTE FUNCTION set_updated_at();
+    INSERT INTO docs (id, title) VALUES (1, 'a');
+    BEGIN;
+    INSERT INTO docs (id, title) VALUES (1, 'b') ON CONFLICT (id) DO UPDATE SET title = excluded.title;
+    SELECT title FROM docs WHERE updated_at = now();
+    COMMIT;
+}
+expect {
+    b
+}
+
+@setup docs
+test assigned-value-is-seen-by-the-statements-after-it {
+    CREATE FUNCTION upper_title() RETURNS trigger LANGUAGE plpgsql AS $$
+    BEGIN
+      NEW.title := upper(NEW.title);
+      INSERT INTO audit (title) VALUES (NEW.title || '/' || TG_OP);
+      NEW.title := NEW.title || '!';
+      RETURN NEW;
+    END;
+    $$;
+    CREATE TRIGGER docs_upper BEFORE INSERT OR UPDATE ON docs FOR EACH ROW EXECUTE FUNCTION upper_title();
+    INSERT INTO docs (id, title) VALUES (1, 'ann');
+    UPDATE docs SET title = 'bob' WHERE id = 1;
+    SELECT title FROM docs;
+    SELECT title FROM audit ORDER BY seq;
+}
+expect {
+    BOB!
+    ANN/INSERT
+    BOB/UPDATE
+}
+
+@setup docs
+test triggers-fire-in-name-order-and-see-the-returned-row {
+    CREATE FUNCTION add_one() RETURNS trigger LANGUAGE plpgsql AS $$
+    BEGIN
+      NEW.title := NEW.title || '1';
+      RETURN NEW;
+    END;
+    $$;
+    CREATE FUNCTION add_two() RETURNS trigger LANGUAGE plpgsql AS $$
+    BEGIN
+      NEW.title := NEW.title || '2';
+      RETURN NEW;
+    END;
+    $$;
+    CREATE TRIGGER b_trigger BEFORE INSERT ON docs FOR EACH ROW EXECUTE FUNCTION add_two();
+    CREATE TRIGGER a_trigger BEFORE INSERT ON docs FOR EACH ROW EXECUTE FUNCTION add_one();
+    INSERT INTO docs (id, title) VALUES (1, 'x');
+    SELECT title FROM docs;
+}
+expect {
+    x12
+}
+
+@setup docs
+test index-of-a-column-the-trigger-changed-is-updated {
+    CREATE INDEX docs_title ON docs (title);
+    CREATE FUNCTION title_from_id() RETURNS trigger LANGUAGE plpgsql AS $$
+    BEGIN
+      NEW.title := 'doc' || NEW.id;
+      RETURN NEW;
+    END;
+    $$;
+    CREATE TRIGGER docs_title_from_id BEFORE INSERT OR UPDATE ON docs FOR EACH ROW EXECUTE FUNCTION title_from_id();
+    INSERT INTO docs (id, title) VALUES (1, 'a');
+    UPDATE docs SET id = 2 WHERE id = 1;
+    SELECT id FROM docs WHERE title = 'doc2';
+    SELECT count(*) FROM docs WHERE title = 'doc1';
+}
+expect {
+    2
+    0
+}
+
+@setup docs
+test return-null-skips-the-row {
+    CREATE FUNCTION skip_row() RETURNS trigger LANGUAGE plpgsql AS $$
+    BEGIN
+      INSERT INTO audit (title) VALUES (TG_OP);
+      RETURN NULL;
+    END;
+    $$;
+    INSERT INTO docs (id, title) VALUES (1, 'a');
+    CREATE TRIGGER docs_skip BEFORE INSERT OR UPDATE OR DELETE ON docs FOR EACH ROW EXECUTE FUNCTION skip_row();
+    INSERT INTO docs (id, title) VALUES (2, 'b');
+    UPDATE docs SET title = 'c' WHERE id = 1;
+    DELETE FROM docs WHERE id = 1;
+    SELECT id, title FROM docs;
+    SELECT title FROM audit ORDER BY seq;
+}
+expect {
+    1|a
+    INSERT
+    UPDATE
+    DELETE
+}
+
+@setup docs
+test return-old-in-a-before-update-trigger-keeps-the-old-values {
+    CREATE FUNCTION keep_old() RETURNS trigger LANGUAGE plpgsql AS $$
+    BEGIN
+      RETURN OLD;
+    END;
+    $$;
+    CREATE TRIGGER docs_keep_old BEFORE UPDATE ON docs FOR EACH ROW EXECUTE FUNCTION keep_old();
+    INSERT INTO docs (id, title) VALUES (1, 'a');
+    UPDATE docs SET title = 'b' WHERE id = 1;
+    SELECT title FROM docs;
+}
+expect {
+    a
+}
+
+@setup docs
+test before-insert-trigger-sets-the-primary-key {
+    CREATE FUNCTION set_id() RETURNS trigger LANGUAGE plpgsql AS $$
+    BEGIN
+      NEW.id := length(NEW.title) * 10;
+      RETURN NEW;
+    END;
+    $$;
+    CREATE TRIGGER docs_set_id BEFORE INSERT ON docs FOR EACH ROW EXECUTE FUNCTION set_id();
+    INSERT INTO docs (id, title) VALUES (1, 'abc'), (2, 'abcd');
+    SELECT id, title FROM docs ORDER BY id;
+}
+expect {
+    30|abc
+    40|abcd
+}
+
+@setup docs
+test assignment-to-an-unknown-column-is-an-error {
+    CREATE FUNCTION set_nope() RETURNS trigger LANGUAGE plpgsql AS $$
+    BEGIN
+      NEW.nope := 1;
+      RETURN NEW;
+    END;
+    $$;
+    CREATE TRIGGER docs_nope BEFORE INSERT ON docs FOR EACH ROW EXECUTE FUNCTION set_nope();
+    INSERT INTO docs (id, title) VALUES (1, 'a');
+}
+expect error {
+    record "new" has no field "nope"
+}
+
+@setup docs
+test trigger-function-without-return-is-an-error {
+    CREATE FUNCTION no_return() RETURNS trigger LANGUAGE plpgsql AS $$
+    BEGIN
+      INSERT INTO audit (title) VALUES (NEW.title);
+    END;
+    $$;
+    CREATE TRIGGER docs_no_return BEFORE INSERT ON docs FOR EACH ROW EXECUTE FUNCTION no_return();
+    INSERT INTO docs (id, title) VALUES (1, 'a');
+}
+expect error {
+    control reached end of trigger procedure without RETURN
+}
+
+@setup docs
+test assigned-value-is-cast-to-the-type-of-the-column {
+    CREATE TABLE nums (id int PRIMARY KEY, n int, label text);
+    CREATE FUNCTION set_n() RETURNS trigger LANGUAGE plpgsql AS $$
+    BEGIN
+      NEW.n := 2.5 * 2;
+      NEW.label := 'n=' || NEW.n;
+      RETURN NEW;
+    END;
+    $$;
+    CREATE TRIGGER nums_set_n BEFORE INSERT ON nums FOR EACH ROW EXECUTE FUNCTION set_n();
+    INSERT INTO nums (id) VALUES (1);
+    SELECT n, label FROM nums;
+}
+expect {
+    5|n=5
+}

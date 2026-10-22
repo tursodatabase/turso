@@ -229,6 +229,12 @@ impl Dialect for PostgresDialect {
         crate::plpgsql::expand_trigger_function(schema, call)
     }
 
+    /// PostgreSQL fires the triggers of one event in the order of their
+    /// names.
+    fn triggers_fire_in_name_order(&self) -> bool {
+        true
+    }
+
     fn requires_custom_types(&self) -> bool {
         true
     }
