@@ -5833,6 +5833,9 @@ fn reject_constraint_attributes(
     {
         return Err(not_supported("DEFERRABLE / INITIALLY DEFERRED constraints"));
     }
+    if constraint.skip_validation {
+        return Err(not_supported("NOT VALID constraints"));
+    }
     Ok(())
 }
 
@@ -8479,6 +8482,18 @@ mod tests {
         // Restating the defaults is fine.
         assert_translates(
             "CREATE TABLE c (pid int REFERENCES p(id) NOT DEFERRABLE INITIALLY IMMEDIATE)",
+        );
+    }
+
+    #[test]
+    fn fail_closed_not_valid_constraints() {
+        assert_not_supported(
+            "CREATE TABLE c (pid int, FOREIGN KEY (pid) REFERENCES p(id) NOT VALID)",
+            "NOT VALID",
+        );
+        assert_not_supported(
+            "CREATE TABLE c (a int, CHECK (a > 0) NOT VALID)",
+            "NOT VALID",
         );
     }
 }
