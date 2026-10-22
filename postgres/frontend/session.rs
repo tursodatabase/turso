@@ -242,7 +242,13 @@ fn prepare_statement(pg_conn: &Arc<PgConnectionInner>, sql: &str) -> Result<Stat
     let stmt = pg_conn.conn.prepare_translated_cmd(translated.cmd, &sql)?;
     // query_only only covers statements that core classifies as writes by
     // their kind. A SELECT can write too, e.g. SELECT nextval('s').
-    if read_only && !is_transaction_control && !stmt.get_program().is_readonly() {
+    if read_only
+        && !is_transaction_control
+        && (&stmt.get_program().prepared().write_databases)
+            .into_iter()
+            .next()
+            .is_some()
+    {
         return Err(read_only_transaction_error("this statement"));
     }
     Ok(stmt)

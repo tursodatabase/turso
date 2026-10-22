@@ -94,6 +94,28 @@ test txn-read-only-rejects-nextval {
 expect error {}
 
 @setup counter
+test txn-read-only-allows-window-function {
+    BEGIN READ ONLY;
+    SELECT row_number() OVER () FROM counter;
+    SELECT sum(n) OVER (ORDER BY n) FROM counter;
+    COMMIT;
+}
+expect {
+    1
+    0
+}
+
+@setup counter
+test txn-read-only-allows-materialized-cte {
+    BEGIN READ ONLY;
+    WITH c AS MATERIALIZED (SELECT n FROM counter) SELECT count(*) FROM c;
+    COMMIT;
+}
+expect {
+    1
+}
+
+@setup counter
 test txn-read-write-after-query-rejected {
     BEGIN READ ONLY;
     SELECT n FROM counter;
