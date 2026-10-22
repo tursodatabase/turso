@@ -1377,6 +1377,7 @@ impl PostgreSQLTranslator {
             ParseError::ParseError("CREATE MATERIALIZED VIEW: missing view name".into())
         })?;
         let view_name = self.qualified_name_from_range_var(relation);
+        reject_into_clause(into_clause, relation, "CREATE MATERIALIZED VIEW")?;
 
         // Column aliases from the INTO clause
         let columns: Vec<ast::IndexedColumn> = into_clause
@@ -1404,8 +1405,7 @@ impl PostgreSQLTranslator {
 
     /// Translate CREATE TABLE AS / SELECT INTO into Turso's
     /// `CREATE TABLE ... AS SELECT`. The new table's schema is derived from
-    /// the SELECT by the engine. TEMP is silently ignored (the table is
-    /// persistent), like in CREATE TABLE.
+    /// the SELECT by the engine.
     fn translate_ctas_table(
         &self,
         into_clause: &pg_query::protobuf::IntoClause,
@@ -1417,6 +1417,7 @@ impl PostgreSQLTranslator {
             .as_ref()
             .ok_or_else(|| ParseError::ParseError("CREATE TABLE AS: missing table name".into()))?;
         let tbl_name = self.qualified_name_from_range_var(relation);
+        reject_into_clause(into_clause, relation, "CREATE TABLE AS")?;
 
         // The engine names the new table's columns after the SELECT's output
         // columns and has no way to override them, so reject an explicit
@@ -6155,6 +6156,29 @@ fn reject_index_elem_clauses(
     Ok(())
 }
 
+/// Rejects the clauses of a CREATE TABLE AS / SELECT INTO / CREATE
+/// MATERIALIZED VIEW target that are not translated.
+fn reject_into_clause(
+    into_clause: &pg_query::protobuf::IntoClause,
+    relation: &pg_query::protobuf::RangeVar,
+    label: &str,
+) -> Result<(), ParseError> {
+    reject_temporary(relation, &format!("{label} with a temporary table"))?;
+    reject_table_storage_clauses(
+        &into_clause.options,
+        &into_clause.table_space_name,
+        &into_clause.access_method,
+    )?;
+    if matches!(
+        pg_query::protobuf::OnCommitAction::try_from(into_clause.on_commit),
+        Ok(pg_query::protobuf::OnCommitAction::OncommitDeleteRows
+            | pg_query::protobuf::OnCommitAction::OncommitDrop)
+    ) {
+        return Err(not_supported("ON COMMIT DELETE ROWS / DROP"));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -9195,5 +9219,28 @@ mod tests {
             "CREATE VIEW v AS SELECT a FROM t WHERE a > 0 WITH LOCAL CHECK OPTION",
             "CHECK OPTION",
         );
+    }
+
+    #[test]
+    fn fail_closed_into_clause() {
+        assert_not_supported("CREATE TEMP TABLE t AS SELECT 1 AS a", "temporary table");
+        assert_not_supported("SELECT 1 AS a INTO TEMP t", "temporary table");
+        assert_not_supported(
+            "CREATE TABLE t WITH (fillfactor = 70) AS SELECT 1 AS a",
+            "storage parameters",
+        );
+        assert_not_supported(
+            "CREATE TABLE t TABLESPACE ts AS SELECT 1 AS a",
+            "TABLESPACE",
+        );
+        assert_not_supported(
+            "CREATE MATERIALIZED VIEW m USING columnar AS SELECT 1 AS a",
+            "access method",
+        );
+        assert_not_supported(
+            "CREATE MATERIALIZED VIEW m TABLESPACE ts AS SELECT 1 AS a",
+            "TABLESPACE",
+        );
+        assert_translates("CREATE UNLOGGED TABLE t AS SELECT 1 AS a");
     }
 }
