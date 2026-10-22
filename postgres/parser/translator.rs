@@ -5833,6 +5833,17 @@ fn reject_constraint_attributes(
     {
         return Err(not_supported("DEFERRABLE / INITIALLY DEFERRED constraints"));
     }
+    if !constraint.including.is_empty() {
+        return Err(not_supported("INCLUDE on a constraint"));
+    }
+    if !constraint.options.is_empty() || !constraint.indexspace.is_empty() {
+        return Err(not_supported(
+            "WITH (storage parameters) / USING INDEX TABLESPACE on a constraint",
+        ));
+    }
+    if !constraint.indexname.is_empty() {
+        return Err(not_supported("constraint USING INDEX"));
+    }
     if constraint.nulls_not_distinct {
         return Err(not_supported("NULLS NOT DISTINCT"));
     }
@@ -8557,6 +8568,22 @@ mod tests {
         assert_not_supported(
             "CREATE TABLE c (a int, UNIQUE NULLS NOT DISTINCT (a))",
             "NULLS NOT DISTINCT",
+        );
+    }
+
+    #[test]
+    fn fail_closed_constraint_index_clauses() {
+        assert_not_supported(
+            "CREATE TABLE c (a int, b int, UNIQUE (a) INCLUDE (b))",
+            "INCLUDE",
+        );
+        assert_not_supported(
+            "CREATE TABLE c (a int, PRIMARY KEY (a) WITH (fillfactor = 70))",
+            "storage parameters",
+        );
+        assert_not_supported(
+            "CREATE TABLE c (a int, UNIQUE (a) USING INDEX TABLESPACE ts)",
+            "TABLESPACE",
         );
     }
 }
