@@ -367,3 +367,13 @@ expect {
     11|0
     12|11
 }
+
+test fk-drop-self-referencing-table-with-rows {
+    CREATE TABLE fkr_t (id int PRIMARY KEY, parent int REFERENCES fkr_t (id));
+    INSERT INTO fkr_t VALUES (1, NULL), (2, 1);
+    DROP TABLE fkr_t;
+    SELECT count(*) FROM pg_tables WHERE tablename = 'fkr_t';
+}
+expect {
+    0
+}

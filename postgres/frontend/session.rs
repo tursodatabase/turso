@@ -218,6 +218,15 @@ fn prepare_statement(pg_conn: &Arc<PgConnectionInner>, sql: &str) -> Result<Stat
         stmt.run_ignore_rows()?;
     }
 
+    if matches!(translated.cmd.stmt(), ast::Stmt::DropTable { .. }) {
+        without_foreign_keys(&pg_conn.conn, || {
+            pg_conn
+                .conn
+                .prepare_translated_cmd(translated.cmd, &sql)?
+                .run_ignore_rows()
+        })?;
+        return noop_statement(&pg_conn.conn);
+    }
     pg_conn.conn.prepare_translated_cmd(translated.cmd, &sql)
 }
 
