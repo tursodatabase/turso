@@ -435,9 +435,6 @@ fn handle_pg_set(pg_conn: &Arc<PgConnectionInner>, set_stmt: &PgSetStmt) -> Resu
     if set_value_already_in_effect(&set_stmt.name, &set_stmt.values) {
         return noop_statement(&pg_conn.conn);
     }
-    // Other parameters used to be forwarded as `PRAGMA name = value`, which
-    // silently ignored unknown PostgreSQL parameters and exposed SQLite
-    // pragmas under PostgreSQL syntax.
     Err(LimboError::ParseError(format!(
         "SET {} is not supported",
         set_stmt.name

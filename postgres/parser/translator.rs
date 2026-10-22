@@ -1573,7 +1573,6 @@ impl PostgreSQLTranslator {
             // But only when the INSERT had explicit column names — an empty
             // column list means "all columns" (positional VALUES), not defaults.
             if filtered_columns.is_empty() && has_explicit_columns {
-                // DEFAULT VALUES has no place for an upsert clause.
                 if upsert.is_some() {
                     return Err(not_supported(
                         "ON CONFLICT on an INSERT whose values are all DEFAULT",
@@ -4822,7 +4821,6 @@ impl PostgreSQLTranslator {
                             }
                         }
                     }
-                    // OWNED BY NONE is the default.
                     "owned_by"
                         if matches!(
                             elem.arg.as_ref().and_then(|n| n.node.as_ref()),
@@ -5301,9 +5299,6 @@ fn cast_or_case_name(node: &pg_query::protobuf::Node) -> Option<String> {
     }
 }
 
-/// Whether `node` is a `qualifier.*` RETURNING target whose qualifier, read
-/// from the table name outwards, is a non-empty prefix of `target_qualifiers`.
-/// Rejects a column named twice in an INSERT column list or a SET list.
 fn reject_duplicate_columns<'a>(
     names: impl IntoIterator<Item = &'a str>,
     what: &str,
@@ -5319,7 +5314,6 @@ fn reject_duplicate_columns<'a>(
     Ok(())
 }
 
-/// Whether a target-list entry is an unqualified `*`.
 fn is_bare_star(node: &pg_query::protobuf::Node) -> bool {
     use pg_query::protobuf::node::Node;
     let Some(Node::ResTarget(res_target)) = &node.node else {
@@ -5334,6 +5328,8 @@ fn is_bare_star(node: &pg_query::protobuf::Node) -> bool {
     }
 }
 
+/// Whether `node` is a `qualifier.*` RETURNING target whose qualifier, read
+/// from the table name outwards, is a non-empty prefix of `target_qualifiers`.
 fn is_star_qualified_by(node: &pg_query::protobuf::Node, target_qualifiers: &[&str]) -> bool {
     use pg_query::protobuf::node::Node;
     let Some(Node::ResTarget(res_target)) = &node.node else {
@@ -5969,6 +5965,14 @@ fn check_transaction_options(
         let Some(pg_query::protobuf::node::Node::DefElem(def)) = &opt.node else {
             return Err(not_supported("transaction option"));
         };
+        // pg_query encodes NOT DEFERRABLE and READ WRITE as integer 0.
+        let arg_is_zero = matches!(
+            def.arg.as_ref().and_then(|n| n.node.as_ref()),
+            Some(pg_query::protobuf::node::Node::AConst(pg_query::protobuf::AConst {
+                val: Some(pg_query::protobuf::a_const::Val::Ival(i)),
+                ..
+            })) if i.ival == 0
+        );
         match def.defname.as_str() {
             "transaction_isolation" => {
                 let level = match def.arg.as_ref().and_then(|n| n.node.as_ref()) {
@@ -5986,32 +5990,13 @@ fn check_transaction_options(
                     )));
                 }
             }
-            "transaction_deferrable" => {
-                // pg_query encodes NOT DEFERRABLE as integer 0.
-                let not_deferrable = matches!(
-                    def.arg.as_ref().and_then(|n| n.node.as_ref()),
-                    Some(pg_query::protobuf::node::Node::AConst(pg_query::protobuf::AConst {
-                        val: Some(pg_query::protobuf::a_const::Val::Ival(i)),
-                        ..
-                    })) if i.ival == 0
-                );
-                if !not_deferrable {
-                    return Err(not_supported("a DEFERRABLE transaction"));
-                }
+            "transaction_deferrable" if !arg_is_zero => {
+                return Err(not_supported("a DEFERRABLE transaction"));
             }
-            "transaction_read_only" => {
-                // pg_query encodes READ WRITE as integer 0 and READ ONLY as 1.
-                let read_write = matches!(
-                    def.arg.as_ref().and_then(|n| n.node.as_ref()),
-                    Some(pg_query::protobuf::node::Node::AConst(pg_query::protobuf::AConst {
-                        val: Some(pg_query::protobuf::a_const::Val::Ival(i)),
-                        ..
-                    })) if i.ival == 0
-                );
-                if !read_write && !read_only_allowed {
-                    return Err(not_supported("a READ ONLY transaction"));
-                }
+            "transaction_read_only" if !arg_is_zero && !read_only_allowed => {
+                return Err(not_supported("a READ ONLY transaction"));
             }
+            "transaction_deferrable" | "transaction_read_only" => {}
             other => return Err(not_supported(format!("transaction option {other}"))),
         }
     }
@@ -6830,7 +6815,6 @@ fn reject_temporary(relation: &pg_query::protobuf::RangeVar, what: &str) -> Resu
     Ok(())
 }
 
-/// Rejects the physical-storage clauses of CREATE TABLE and its relatives.
 fn reject_table_storage_clauses(
     options: &[pg_query::protobuf::Node],
     tablespace: &str,
@@ -6850,7 +6834,6 @@ fn reject_table_storage_clauses(
     Ok(())
 }
 
-/// Rejects column-definition clauses that are not translated.
 fn reject_column_def_clauses(col_def: &pg_query::protobuf::ColumnDef) -> Result<(), ParseError> {
     if col_def
         .coll_clause
@@ -6862,7 +6845,6 @@ fn reject_column_def_clauses(col_def: &pg_query::protobuf::ColumnDef) -> Result<
     Ok(())
 }
 
-/// Rejects per-column index clauses that are not translated.
 fn reject_index_elem_clauses(
     elem: &pg_query::protobuf::IndexElem,
     context: &str,
@@ -9742,7 +9724,6 @@ mod tests {
         );
     }
 
-    /// Asserts that `sql` translates without error.
     fn assert_translates(sql: &str) {
         let parsed = crate::parse(sql).unwrap();
         if let Err(err) = PostgreSQLTranslator::new().translate_with_prereqs(&parsed) {
