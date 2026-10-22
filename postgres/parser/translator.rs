@@ -1181,7 +1181,11 @@ impl PostgreSQLTranslator {
             Some(Node::TypeName(tn)) => {
                 // DROP TYPE/DOMAIN use TypeName nodes. Types live in a single
                 // namespace, so only an unqualified or public name is accepted.
-                ast::QualifiedName::single(ast::Name::from_string(type_name(&tn.names)?))
+                ast::QualifiedName::single(ast::Name::from_string(object_name(
+                    &tn.names,
+                    is_default_schema,
+                    "type",
+                )?))
             }
             _ => {
                 return Err(ParseError::ParseError(
@@ -2242,7 +2246,7 @@ impl PostgreSQLTranslator {
             }
         };
 
-        let func_name = function_name(&func_call.funcname)?;
+        let func_name = object_name(&func_call.funcname, is_pg_catalog, "function")?;
         let func_name = func_name.as_str();
         // Only the name and plain arguments of a function in FROM are used.
         if func_call.func_variadic
@@ -3795,7 +3799,7 @@ impl PostgreSQLTranslator {
         &self,
         func_call: &pg_query::protobuf::FuncCall,
     ) -> Result<ast::Expr, ParseError> {
-        let func_name = function_name(&func_call.funcname)?;
+        let func_name = object_name(&func_call.funcname, is_pg_catalog, "function")?;
         // substring(s FROM 'regex') and substring(s SIMILAR p ESCAPE e) pick
         // PostgreSQL's pattern overloads by their text second argument; the
         // engine's substring only takes numeric positions.
@@ -4885,7 +4889,7 @@ impl PostgreSQLTranslator {
         use pg_query::protobuf::node::Node;
         use pg_query::protobuf::ConstrType;
 
-        let domain_name = type_name(&domain.domainname)?;
+        let domain_name = object_name(&domain.domainname, is_default_schema, "type")?;
 
         // Extract base type from type_name and map PG type names to Turso names
         let type_name_node = domain
@@ -5520,7 +5524,7 @@ fn translate_create_enum(
 ) -> Result<ast::Stmt, ParseError> {
     use pg_query::protobuf::node::Node;
 
-    let type_name = type_name(&enum_stmt.type_name)?;
+    let type_name = object_name(&enum_stmt.type_name, is_default_schema, "type")?;
 
     // Extract enum labels
     let mut labels = Vec::new();
@@ -6928,17 +6932,18 @@ fn reject_column_aliases(
     Ok(())
 }
 
-/// The name of a called function. Only an unqualified or `pg_catalog.`
-/// name is accepted: user functions live in no schema, so any other
-/// qualifier would be dropped and resolve to a built-in of the same name.
-fn function_name(funcname: &[pg_query::protobuf::Node]) -> Result<String, ParseError> {
-    let names = extract_key_columns(funcname)?;
+fn object_name(
+    names: &[pg_query::protobuf::Node],
+    allowed_schema: fn(&str) -> bool,
+    kind: &str,
+) -> Result<String, ParseError> {
+    let names = extract_key_columns(names)?;
     if names.is_empty() {
-        return Err(ParseError::ParseError("Missing function name".to_string()));
+        return Err(ParseError::ParseError(format!("missing {kind} name")));
     }
-    unqualified_name(&names, is_pg_catalog)
+    unqualified_name(&names, allowed_schema)
         .cloned()
-        .ok_or_else(|| not_supported("a schema-qualified function name"))
+        .ok_or_else(|| not_supported(format!("a schema-qualified {kind} name")))
 }
 
 /// The last part of a name that is unqualified or qualified with a schema
@@ -6972,19 +6977,6 @@ fn is_binary_collation(collname: &[pg_query::protobuf::Node]) -> bool {
             "c" | "posix" | "default" | "ucs_basic"
         )
     })
-}
-
-/// The name of a type being created or dropped. Types live in a single namespace, so
-/// only an unqualified, `public.` or `pg_catalog.` name is accepted; any
-/// other schema would be dropped.
-fn type_name(names: &[pg_query::protobuf::Node]) -> Result<String, ParseError> {
-    let names = extract_key_columns(names)?;
-    if names.is_empty() {
-        return Err(ParseError::ParseError("missing type name".into()));
-    }
-    unqualified_name(&names, is_default_schema)
-        .cloned()
-        .ok_or_else(|| not_supported("a schema-qualified type name"))
 }
 
 #[cfg(test)]
