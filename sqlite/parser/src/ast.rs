@@ -2118,6 +2118,15 @@ pub enum TriggerCmd {
     },
     /// `SELECT`
     Select(Select),
+    /// `EXECUTE FUNCTION`: the body is a function of the dialect of the
+    /// frontend, which gives the engine the commands when the trigger is
+    /// compiled.
+    ExecuteFunction {
+        /// function name
+        name: QualifiedName,
+        /// arguments, which are all strings
+        args: Vec<String>,
+    },
 }
 
 /// Conflict resolution types

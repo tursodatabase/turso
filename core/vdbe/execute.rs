@@ -12113,6 +12113,15 @@ pub fn op_function(
                                 mut when_clause,
                                 mut commands,
                             } => {
+                                // The body of such a trigger is in its function,
+                                // and the translator refused a rename of its own
+                                // table, so the row stays as the dialect wrote it.
+                                if commands
+                                    .iter()
+                                    .any(|c| matches!(c, ast::TriggerCmd::ExecuteFunction { .. }))
+                                {
+                                    break 'sql None;
+                                }
                                 let trigger_tbl = normalize_ident(trigger_tbl_name.name.as_str());
 
                                 // Rewrite ON table name if it matches the renamed table

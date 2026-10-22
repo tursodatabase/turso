@@ -335,6 +335,9 @@ fn validate_trigger_no_cross_db_refs(
             ast::TriggerCmd::Select(select) => {
                 ctx.check_select(select)?;
             }
+            // The body is in the function, which the dialect compiles for
+            // the trigger's own database.
+            ast::TriggerCmd::ExecuteFunction { .. } => {}
         }
     }
 

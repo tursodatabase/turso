@@ -391,6 +391,12 @@ fn trigger_cmd_to_stmt_for_subprogram(
             rewrite_expressions_in_select_for_subprogram(&mut select_clone, subprogram_ctx)?;
             Ok(ast::Stmt::Select(select_clone))
         }
+        ast::TriggerCmd::ExecuteFunction { name, .. } => {
+            Err(crate::LimboError::InternalError(format!(
+                "trigger function {} was not expanded before compilation",
+                name.name.as_str()
+            )))
+        }
     }
 }
 
@@ -596,8 +602,9 @@ fn execute_trigger_commands(
     // below (`translate_inner` needs it), so the scope closure takes
     // `resolver` as a parameter rather than capturing the outer binding -
     // see `Resolver::with_database_scope_mut`.
+    let commands = trigger_commands(resolver, trigger, &ctx.table, database_id)?;
     resolver.with_trigger_scope(trigger_database_id, trigger.name.clone(), |resolver| {
-        for command in trigger.commands.iter() {
+        for command in commands.iter() {
             let stmt = trigger_cmd_to_stmt_for_subprogram(command, &subprogram_ctx)?;
             subprogram_builder.prologue();
             translate_inner(
@@ -681,6 +688,36 @@ fn execute_trigger_commands(
     });
 
     Ok(true)
+}
+
+/// The commands of a trigger body. A body that executes a function of the
+/// dialect gets its commands from the dialect, which compiles the function
+/// for this trigger.
+fn trigger_commands<'a>(
+    resolver: &Resolver,
+    trigger: &'a Trigger,
+    table: &BTreeTable,
+    database_id: usize,
+) -> Result<std::borrow::Cow<'a, [ast::TriggerCmd]>> {
+    let [ast::TriggerCmd::ExecuteFunction { name, args }] = trigger.commands.as_slice() else {
+        return Ok(std::borrow::Cow::Borrowed(&trigger.commands));
+    };
+    let database_name = if database_id == crate::MAIN_DB_ID {
+        None
+    } else {
+        resolver.get_database_name_by_index(database_id)
+    };
+    let call = crate::dialect::TriggerFunctionCall {
+        trigger,
+        table,
+        database_name: database_name.as_deref(),
+        function: name,
+        args,
+    };
+    let commands = resolver
+        .dialect
+        .expand_trigger_function(resolver.schema(), &call)?;
+    Ok(std::borrow::Cow::Owned(commands))
 }
 
 /// Check if there are any triggers for a given event (regardless of time).
@@ -974,6 +1011,7 @@ fn trigger_command_kind(command: &ast::TriggerCmd) -> &'static str {
         ast::TriggerCmd::Update { .. } => "update",
         ast::TriggerCmd::Delete { .. } => "delete",
         ast::TriggerCmd::Select(_) => "select",
+        ast::TriggerCmd::ExecuteFunction { .. } => "execute_function",
     }
 }
 

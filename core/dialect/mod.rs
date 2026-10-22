@@ -18,6 +18,18 @@ pub use sqlite::SqliteDialect;
 /// stores in `sqlite_schema`.
 pub const POSTGRES_TABLE_SQL_PREFIX: &str = "/* turso_frontend:postgres */ ";
 
+/// A trigger body that executes a function of the dialect, with what the
+/// dialect needs to compile the function for this trigger.
+pub struct TriggerFunctionCall<'a> {
+    pub trigger: &'a crate::schema::Trigger,
+    /// The table the trigger is on.
+    pub table: &'a crate::schema::BTreeTable,
+    /// The attached database of the table, or `None` for the main database.
+    pub database_name: Option<&'a str>,
+    pub function: &'a turso_parser::ast::QualifiedName,
+    pub args: &'a [String],
+}
+
 /// SQL dialect layered on top of the engine.
 ///
 /// Every [`crate::Database`] carries a dialect, supplied explicitly by
@@ -91,6 +103,44 @@ pub trait Dialect: Send + Sync + 'static {
         tbl_name: &turso_parser::ast::QualifiedName,
         body: &turso_parser::ast::CreateTableBody,
     ) -> crate::Result<String>;
+
+    /// Parse a `sqlite_schema` `type='trigger'` row's SQL into the triggers
+    /// it holds, one `CREATE TRIGGER` statement for each. A dialect can keep
+    /// one row for several engine triggers of the same name, one for each
+    /// event the row names, so the engine fires each event on its own.
+    fn parse_trigger_sql(&self, sql: &str) -> crate::Result<Vec<turso_parser::ast::Stmt>> {
+        sqlite::parse_trigger_sql(sql)
+    }
+
+    /// Produce the SQL text to store in `sqlite_schema` for a `CREATE
+    /// TRIGGER`. `input` is the original statement text as the user wrote
+    /// it, in the frontend's dialect; `stmt` is the translated AST. The
+    /// SQLite dialect formats canonical SQLite text from the AST; a frontend
+    /// dialect typically stores `input` with a marker it can recognize in
+    /// [`Dialect::parse_trigger_sql`].
+    fn format_trigger_sql(
+        &self,
+        input: &str,
+        stmt: &turso_parser::ast::Stmt,
+    ) -> crate::Result<String> {
+        let _ = input;
+        sqlite::format_trigger_sql(stmt)
+    }
+
+    /// The engine commands of a trigger whose body is `EXECUTE FUNCTION`:
+    /// the dialect compiles the function for this trigger. The engine calls
+    /// this each time it compiles a statement that fires the trigger, so a
+    /// change of the function text is seen on the next compilation.
+    fn expand_trigger_function(
+        &self,
+        _schema: &crate::schema::Schema,
+        call: &TriggerFunctionCall<'_>,
+    ) -> crate::Result<Vec<turso_parser::ast::TriggerCmd>> {
+        Err(crate::LimboError::ParseError(format!(
+            "no such function: {}",
+            call.function.name.as_str()
+        )))
+    }
 
     /// Produce stored SQL after the engine rewrites a `CREATE TABLE` AST.
     ///
@@ -287,6 +337,117 @@ mod tests {
             Ok(crate::Value::Numeric(crate::numeric::Numeric::Integer(
                 v + 1,
             )))
+        }
+
+        /// A trigger that executes a function is stored as
+        /// `test-trigger: <name> <time> <event>[,<event>] ON <table> EXECUTE <function>`,
+        /// one row for every event, like a frontend dialect would store its
+        /// own text.
+        fn parse_trigger_sql(&self, sql: &str) -> crate::Result<Vec<turso_parser::ast::Stmt>> {
+            let Some(text) = sql.strip_prefix("test-trigger: ") else {
+                return sqlite::parse_trigger_sql(sql);
+            };
+            let words: Vec<&str> = text.split_whitespace().collect();
+            let [name, time, events, "ON", table, "EXECUTE", function] = words.as_slice() else {
+                return Err(crate::LimboError::ParseError(format!(
+                    "invalid test trigger: {sql}"
+                )));
+            };
+            let time = match *time {
+                "BEFORE" => turso_parser::ast::TriggerTime::Before,
+                _ => turso_parser::ast::TriggerTime::After,
+            };
+            events
+                .split(',')
+                .map(|event| {
+                    let event = match event {
+                        "INSERT" => turso_parser::ast::TriggerEvent::Insert,
+                        "UPDATE" => turso_parser::ast::TriggerEvent::Update,
+                        _ => turso_parser::ast::TriggerEvent::Delete,
+                    };
+                    Ok(turso_parser::ast::Stmt::CreateTrigger {
+                        temporary: false,
+                        if_not_exists: false,
+                        trigger_name: turso_parser::ast::QualifiedName::single(
+                            turso_parser::ast::Name::exact(name.to_string()),
+                        ),
+                        time: Some(time),
+                        event,
+                        tbl_name: turso_parser::ast::QualifiedName::single(
+                            turso_parser::ast::Name::exact(table.to_string()),
+                        ),
+                        for_each_row: true,
+                        when_clause: None,
+                        commands: vec![turso_parser::ast::TriggerCmd::ExecuteFunction {
+                            name: turso_parser::ast::QualifiedName::single(
+                                turso_parser::ast::Name::exact(function.to_string()),
+                            ),
+                            args: vec![],
+                        }],
+                    })
+                })
+                .collect()
+        }
+
+        fn format_trigger_sql(
+            &self,
+            input: &str,
+            stmt: &turso_parser::ast::Stmt,
+        ) -> crate::Result<String> {
+            if input.starts_with("test-trigger: ") {
+                return Ok(input.to_string());
+            }
+            sqlite::format_trigger_sql(stmt)
+        }
+
+        /// The stored text of a trigger function is a statement list in
+        /// which `{event}` stands for the event that fires the trigger.
+        fn expand_trigger_function(
+            &self,
+            schema: &crate::schema::Schema,
+            call: &TriggerFunctionCall<'_>,
+        ) -> crate::Result<Vec<turso_parser::ast::TriggerCmd>> {
+            use turso_parser::ast::{Cmd, Stmt, TriggerCmd, TriggerEvent};
+            use turso_parser::parser::Parser;
+
+            let name = call.function.name.as_str();
+            let Some(function) = schema.get_user_function(name, 0) else {
+                return Err(crate::LimboError::ParseError(format!(
+                    "no such function: {name}"
+                )));
+            };
+            let event = match call.trigger.event {
+                TriggerEvent::Insert => "insert",
+                TriggerEvent::Update | TriggerEvent::UpdateOf(_) => "update",
+                TriggerEvent::Delete => "delete",
+            };
+            let body = function.sql.replace("{event}", event);
+            let mut parser = Parser::new(body.as_bytes());
+            let mut commands = Vec::new();
+            while let Some(Cmd::Stmt(stmt)) = parser.next_cmd()? {
+                commands.push(match stmt {
+                    Stmt::Insert {
+                        tbl_name,
+                        columns,
+                        body: turso_parser::ast::InsertBody::Select(select, upsert),
+                        ..
+                    } => TriggerCmd::Insert {
+                        or_conflict: None,
+                        tbl_name: tbl_name.name,
+                        col_names: columns,
+                        select,
+                        upsert,
+                        returning: vec![],
+                    },
+                    Stmt::Select(select) => TriggerCmd::Select(select),
+                    other => {
+                        return Err(crate::LimboError::ParseError(format!(
+                            "unsupported trigger function statement: {other}"
+                        )))
+                    }
+                });
+            }
+            Ok(commands)
         }
 
         /// The stored text of a function is an expression over the parameter
@@ -824,6 +985,131 @@ mod tests {
         run_cmd(&conn, drop_function_cmd("twice", None)).unwrap();
         let err = conn.prepare("SELECT twice(21)").unwrap_err();
         assert!(err.to_string().contains("no such function"), "{err}");
+        conn.close().unwrap();
+    }
+
+    #[test]
+    fn dialect_triggers_execute_stored_functions() {
+        use turso_parser::ast::{Cmd, Name, QualifiedName, Stmt, TriggerCmd, TriggerEvent};
+
+        let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+        let db = open_db(&io, "dialect-triggers.db", Arc::new(TestDialect::default())).unwrap();
+        let conn = db.connect(ConnectOpts::new()).unwrap();
+        conn.execute("CREATE TABLE t (v INTEGER)").unwrap();
+        conn.execute("CREATE TABLE log (event TEXT, v INTEGER)")
+            .unwrap();
+        run_cmd(
+            &conn,
+            create_function_cmd(
+                "log_change",
+                0,
+                "INSERT INTO log VALUES ('{event}', NEW.v)",
+                false,
+            ),
+        )
+        .unwrap();
+
+        // The dialect translates its CREATE TRIGGER to one engine trigger, the
+        // first event, and stores its own text, which holds every event.
+        let input = "test-trigger: trg AFTER INSERT,UPDATE ON t EXECUTE log_change";
+        let create_trigger = Cmd::Stmt(Stmt::CreateTrigger {
+            temporary: false,
+            if_not_exists: false,
+            trigger_name: QualifiedName::single(Name::exact("trg".to_string())),
+            time: Some(turso_parser::ast::TriggerTime::After),
+            event: TriggerEvent::Insert,
+            tbl_name: QualifiedName::single(Name::exact("t".to_string())),
+            for_each_row: true,
+            when_clause: None,
+            commands: vec![TriggerCmd::ExecuteFunction {
+                name: QualifiedName::single(Name::exact("log_change".to_string())),
+                args: vec![],
+            }],
+        });
+        conn.prepare_translated_cmd(create_trigger, input)
+            .unwrap()
+            .run_ignore_rows()
+            .unwrap();
+        let stored = conn
+            .prepare("SELECT sql FROM sqlite_schema WHERE type = 'trigger'")
+            .unwrap()
+            .run_collect_rows()
+            .unwrap();
+        assert_eq!(stored, vec![vec![crate::Value::build_text(input)]]);
+        let events = |conn: &Arc<crate::Connection>| {
+            let mut events: Vec<TriggerEvent> = conn
+                .current_schema()
+                .get_triggers_for_table("t")
+                .map(|trigger| trigger.event.clone())
+                .collect();
+            events.sort_by_key(|event| format!("{event:?}"));
+            events
+        };
+        assert_eq!(
+            events(&conn),
+            vec![TriggerEvent::Insert, TriggerEvent::Update]
+        );
+
+        let query = |sql: &str| {
+            conn.prepare(sql)
+                .unwrap()
+                .run_collect_rows()
+                .unwrap()
+                .into_iter()
+                .map(|row| {
+                    row.iter()
+                        .map(|value| value.to_string())
+                        .collect::<Vec<_>>()
+                        .join("|")
+                })
+                .collect::<Vec<_>>()
+        };
+        conn.execute("INSERT INTO t VALUES (1), (2)").unwrap();
+        conn.execute("UPDATE t SET v = 3 WHERE v = 2").unwrap();
+        conn.execute("DELETE FROM t WHERE v = 1").unwrap();
+        assert_eq!(
+            query("SELECT event, v FROM log ORDER BY rowid"),
+            vec!["insert|1", "insert|2", "update|3"]
+        );
+
+        // The next compilation of a statement uses the new function text.
+        run_cmd(
+            &conn,
+            create_function_cmd(
+                "log_change",
+                0,
+                "INSERT INTO log VALUES ('{event}!', NEW.v)",
+                true,
+            ),
+        )
+        .unwrap();
+        conn.execute("INSERT INTO t VALUES (4)").unwrap();
+        assert_eq!(
+            query("SELECT event, v FROM log WHERE v = 4"),
+            vec!["insert!|4"]
+        );
+
+        // The triggers are loaded again from the stored text at open.
+        conn.close().unwrap();
+        drop(db);
+        let db = open_db(&io, "dialect-triggers.db", Arc::new(TestDialect::default())).unwrap();
+        let conn = db.connect(ConnectOpts::new()).unwrap();
+        assert_eq!(
+            events(&conn),
+            vec![TriggerEvent::Insert, TriggerEvent::Update]
+        );
+
+        // DROP TRIGGER removes both triggers of the name.
+        conn.execute("DROP TRIGGER trg").unwrap();
+        assert!(events(&conn).is_empty());
+        conn.execute("INSERT INTO t VALUES (5)").unwrap();
+        assert_eq!(
+            conn.prepare("SELECT count(*) FROM log")
+                .unwrap()
+                .run_collect_rows()
+                .unwrap(),
+            vec![vec![crate::Value::from_i64(4)]]
+        );
         conn.close().unwrap();
     }
 

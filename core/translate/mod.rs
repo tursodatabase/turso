@@ -272,29 +272,22 @@ pub fn translate_inner(
             connection,
             input,
         )?,
-        ast::Stmt::CreateTrigger {
-            temporary,
-            if_not_exists,
-            trigger_name,
-            time,
-            event,
-            tbl_name,
-            for_each_row,
-            when_clause,
-            commands,
-        } => {
-            // Reconstruct SQL for storage
-            let sql = trigger::create_trigger_to_sql(
+        stmt @ ast::Stmt::CreateTrigger { .. } => {
+            let sql = resolver.dialect.format_trigger_sql(input, &stmt)?;
+            let ast::Stmt::CreateTrigger {
                 temporary,
                 if_not_exists,
-                &trigger_name,
+                trigger_name,
                 time,
-                &event,
-                &tbl_name,
-                for_each_row,
-                when_clause.as_deref(),
-                &commands,
-            );
+                event: _,
+                tbl_name,
+                for_each_row: _,
+                when_clause,
+                commands,
+            } = stmt
+            else {
+                unreachable!("matched CREATE TRIGGER above");
+            };
             trigger::translate_create_trigger(
                 trigger_name,
                 resolver,

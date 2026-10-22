@@ -83,6 +83,35 @@ fn database_uses_mvcc(connection: &Arc<crate::Connection>, database_id: usize) -
     connection.mv_store_for_db(database_id).is_some()
 }
 
+/// A rename rewrites the stored SQL of each trigger of the table. The body of
+/// a trigger that executes a function is in that function, which the engine
+/// cannot rewrite, so the statement is refused.
+fn reject_triggers_that_execute_a_function(
+    resolver: &Resolver,
+    database_id: usize,
+    table_name: &str,
+) -> Result<()> {
+    let table_name = normalize_ident(table_name);
+    for entry in collect_triggers_for_alter_target(resolver, database_id) {
+        if normalize_ident(&entry.trigger.table_name) != table_name {
+            continue;
+        }
+        if let Some(ast::TriggerCmd::ExecuteFunction { name, .. }) = entry
+            .trigger
+            .commands
+            .iter()
+            .find(|command| matches!(command, ast::TriggerCmd::ExecuteFunction { .. }))
+        {
+            return Err(LimboError::ParseError(format!(
+                "cannot rename in table {table_name}: trigger {} executes function {}",
+                entry.trigger.name,
+                name.name.as_str()
+            )));
+        }
+    }
+    Ok(())
+}
+
 fn collect_triggers_for_alter_target(
     resolver: &Resolver,
     target_database_id: usize,
@@ -1570,6 +1599,7 @@ pub fn translate_alter_table(
             let normalized_old_name = normalize_ident(table_name);
             let normalized_new_name = normalize_ident(new_name);
             let mut temp_triggers_to_rewrite: Vec<(String, String, bool)> = Vec::new();
+            reject_triggers_that_execute_a_function(resolver, database_id, table_name)?;
 
             // Views whose SQL failed to load are absent from the schema maps
             // but their rows are still in sqlite_schema, so the name is taken.
@@ -1807,6 +1837,7 @@ pub fn translate_alter_table(
         }
         body @ (ast::AlterTableBody::AlterColumn { .. }
         | ast::AlterTableBody::RenameColumn { .. }) => {
+            reject_triggers_that_execute_a_function(resolver, database_id, table_name)?;
             let from;
             let definition;
             let col_name;
@@ -4363,6 +4394,7 @@ fn apply_trigger_cmd_for_column_rename(
                 resolver,
             )?;
         }
+        ast::TriggerCmd::ExecuteFunction { .. } => {}
     }
 
     Ok(())
@@ -4668,6 +4700,9 @@ fn validate_trigger_columns_after_drop(
                     return Ok(Some(bad));
                 }
             }
+            // The body is in the function, which the dialect compiles when
+            // the trigger fires, so a dropped column is an error at that time.
+            ast::TriggerCmd::ExecuteFunction { .. } => {}
         }
     }
 
@@ -4858,6 +4893,7 @@ fn validate_trigger_cmd_table_refs_after_rename(
                 return Ok(Some(missing_table));
             }
         }
+        ast::TriggerCmd::ExecuteFunction { .. } => {}
     }
 
     Ok(None)

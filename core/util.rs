@@ -4258,6 +4258,7 @@ pub fn rewrite_trigger_cmd_table_refs(cmd: &mut ast::TriggerCmd, old_tbl: &str, 
         ast::TriggerCmd::Select(select) => {
             rewrite_select_table_refs(select, old_tbl, new_tbl);
         }
+        ast::TriggerCmd::ExecuteFunction { .. } => {}
     }
 }
 

@@ -2426,6 +2426,19 @@ impl ToTokens for TriggerCmd {
                 Ok(())
             }
             Self::Select(select) => select.to_tokens(s, context),
+            Self::ExecuteFunction { name, args } => {
+                s.append(TK_ID, Some("EXECUTE"))?;
+                s.append(TK_ID, Some("FUNCTION"))?;
+                name.to_tokens(s, context)?;
+                s.append(TK_LP, None)?;
+                for (i, arg) in args.iter().enumerate() {
+                    if i > 0 {
+                        s.append(TK_COMMA, None)?;
+                    }
+                    s.append(TK_STRING, Some(&format!("'{}'", arg.replace('\'', "''"))))?;
+                }
+                s.append(TK_RP, None)
+            }
         }
     }
 }
