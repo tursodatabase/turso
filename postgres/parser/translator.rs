@@ -1932,8 +1932,11 @@ impl PostgreSQLTranslator {
         let operator = match (set_op, stmt.all) {
             (SetOperation::SetopUnion, true) => ast::CompoundOperator::UnionAll,
             (SetOperation::SetopUnion, false) => ast::CompoundOperator::Union,
-            (SetOperation::SetopIntersect, _) => ast::CompoundOperator::Intersect,
-            (SetOperation::SetopExcept, _) => ast::CompoundOperator::Except,
+            (SetOperation::SetopIntersect, false) => ast::CompoundOperator::Intersect,
+            (SetOperation::SetopExcept, false) => ast::CompoundOperator::Except,
+            (SetOperation::SetopIntersect | SetOperation::SetopExcept, true) => {
+                return Err(not_supported("INTERSECT ALL / EXCEPT ALL"))
+            }
             (other, _) => {
                 return Err(ParseError::ParseError(format!(
                     "Unsupported set operation: {other:?}"
@@ -9372,5 +9375,11 @@ mod tests {
         assert_translates("SELECT 1 UNION SELECT 2 UNION ALL SELECT 3 EXCEPT SELECT 4");
         assert_translates("SELECT 1 INTERSECT SELECT 2 UNION SELECT 3");
         assert_translates("(SELECT 1 UNION SELECT 2) INTERSECT SELECT 3");
+    }
+
+    #[test]
+    fn fail_closed_intersect_except_all() {
+        assert_not_supported("SELECT 1 INTERSECT ALL SELECT 1", "INTERSECT ALL");
+        assert_not_supported("SELECT 1 EXCEPT ALL SELECT 1", "EXCEPT ALL");
     }
 }
