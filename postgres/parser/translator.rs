@@ -3341,6 +3341,11 @@ impl PostgreSQLTranslator {
 
                 let pattern_node = match &rhs_node.node {
                     Some(pg_query::protobuf::node::Node::FuncCall(fc)) => {
+                        // similar_to_escape(pattern, escape) carries an ESCAPE
+                        // character that the regex conversion does not honour.
+                        if fc.args.len() > 1 {
+                            return Err(not_supported("SIMILAR TO ... ESCAPE"));
+                        }
                         // Extract the first argument (the pattern) from similar_to_escape()
                         fc.args.first().unwrap_or(rhs_node)
                     }
@@ -3359,7 +3364,9 @@ impl PostgreSQLTranslator {
                         // Re-wrap with quotes for the AST
                         ast::Expr::Literal(ast::Literal::String(format!("'{regex}'")))
                     }
-                    other => other,
+                    // Only a literal pattern can be rewritten to a regular
+                    // expression; anything else would be matched as POSIX regex.
+                    _ => return Err(not_supported("SIMILAR TO with a non-literal pattern")),
                 };
 
                 Ok(ast::Expr::Like {
@@ -9743,5 +9750,12 @@ mod tests {
     fn fail_closed_schema_qualified_operators() {
         assert_not_supported("SELECT 1 OPERATOR(myschema.+) 2", "operators qualified");
         assert_translates("SELECT 'a' OPERATOR(pg_catalog.~) '^a'");
+    }
+
+    #[test]
+    fn fail_closed_similar_to() {
+        assert_not_supported("SELECT 'a%' SIMILAR TO 'a#%' ESCAPE '#'", "ESCAPE");
+        assert_not_supported("SELECT a SIMILAR TO b FROM t", "non-literal pattern");
+        assert_translates("SELECT 'abc' SIMILAR TO 'a%'");
     }
 }
