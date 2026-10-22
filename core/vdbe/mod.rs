@@ -50,7 +50,6 @@ use crate::{
     return_if_io,
     schema::Trigger,
     state_machine::StateMachine,
-    translate::plan::TableReferences,
     types::{IOCompletions, IOResult},
     vdbe::{
         execute::{
@@ -73,7 +72,6 @@ use crate::json::JsonCacheCell;
 use crate::sync::RwLock;
 use crate::{
     storage::pager::Pager,
-    translate::plan::ResultSetColumn,
     types::{AggContext, Cursor, ImmutableRecord, RecordBuf, Value},
     vdbe::{builder::CursorType, insn::Insn},
 };
@@ -1606,8 +1604,6 @@ pub struct PreparedProgram {
     /// Flag that detect if the sqlite statement will directly manipulate the database file.\
     /// mirrors: https://sqlite.org/c3ref/stmt_readonly.html.
     pub readonly: bool,
-    pub result_columns: Vec<ResultSetColumn>,
-    pub table_references: TableReferences,
     /// Result columns of a statement prepared from semantic HIR; see
     /// [crate::vdbe::builder::ProgramBuilder::resolved_result_columns].
     pub(crate) resolved_result_columns:
@@ -3100,37 +3096,43 @@ impl Program {
                         "RaiseIgnore should be caught by op_program, not reach abort"
                     );
                 }
-                _ => match state.auto_txn_cleanup {
-                    TxnCleanup::RollbackTxn => {
-                        if must_rollback_tx_if_needed {
-                            self.rollback_current_txn(pager);
+                _ => {
+                    match state.auto_txn_cleanup {
+                        TxnCleanup::RollbackTxn => {
+                            if must_rollback_tx_if_needed {
+                                self.rollback_current_txn(pager);
+                            }
                         }
-                    }
-                    TxnCleanup::RollbackSavepoint => {
-                        if can_autocommit_now {
-                            self.rollback_current_txn(pager);
-                        } else if err.is_none() && !pager.is_checkpointing() {
-                            if let Err(end_stmt_err) = state.end_statement(
-                                &self.connection,
-                                pager,
-                                EndStatement::RollbackSavepoint,
-                            ) {
-                                capture_abort_error(
-                                    &mut abort_error,
-                                    end_stmt_err,
-                                    "Failed to rollback statement savepoint during abort",
-                                );
+                        TxnCleanup::RollbackSavepoint => {
+                            if can_autocommit_now {
+                                self.rollback_current_txn(pager);
+                            } else if err.is_none() && !pager.is_checkpointing() {
+                                if let Err(end_stmt_err) = state.end_statement(
+                                    &self.connection,
+                                    pager,
+                                    EndStatement::RollbackSavepoint,
+                                ) {
+                                    capture_abort_error(
+                                        &mut abort_error,
+                                        end_stmt_err,
+                                        "Failed to rollback statement savepoint during abort",
+                                    );
+                                }
+                            }
+                        }
+                        TxnCleanup::None => {
+                            if can_autocommit_now
+                                || (!self.connection.get_auto_commit() && err.is_some())
+                            {
+                                self.rollback_current_txn(pager);
                             }
                         }
                     }
-                    TxnCleanup::None => {
-                        if can_autocommit_now
-                            || (!self.connection.get_auto_commit() && err.is_some())
-                        {
-                            self.rollback_current_txn(pager);
-                        }
+                    // Like SQLite, a statement that fails changed nothing.
+                    if err.is_some() {
+                        self.connection.set_changes(0);
                     }
-                },
+                }
             }
         }
         if state.uses_subjournal {

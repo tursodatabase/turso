@@ -125,51 +125,38 @@ impl Func {
 
 ### Function translation
 
-How to translate the function into bytecode `Instruction`?
-- `date` function can have zero to many arguments.
-- in case there are arguments, we loop through the args and allocate a register `let target_reg = program.alloc_register();`
-for each argument expression.
-- then we emit the bytecode instruction for Function `program.emit_insn(Insn::Function {...})`
+How does a call become a bytecode `Instruction`? Statements are analyzed
+into HIR (`core/translate/semantic/`) and lowered to bytecode by
+`core/translate/semantic_lowering/expr.rs`. The analyzer resolves the
+function name through `Func::resolve_function`, so step 3 above is what
+makes `date(...)` a known call. The lowering then evaluates each argument
+into consecutive registers and emits `Insn::Function` for the call.
 
-https://github.com/tursodatabase/turso/blob/69e3dd28f77e59927da4313e517b2b428ede480d/core/translate/expr.rs#L1235C1-L1256C26
-
+A plain scalar function only needs a line in `plain_function_lowering`
+in `core/translate/semantic_lowering/expr.rs`, which says where the
+arguments start when the call has none. `date` can be called with no
+arguments and still needs one register for the call, so it is listed
+under `EmptyArgumentStart::ReserveOneRegister`:
 
 ```diff
-// file core/translate/expr.rs
-pub fn translate_expr(...) -> Result<usize> {
-  // ...
-  match expr {
-    // ..
-    ast::Expr::FunctionCall {
-      // ...
-      match &func_ctx.func {
+// file core/translate/semantic_lowering/expr.rs
+fn plain_function_lowering(function: &Func) -> Option<EmptyArgumentStart> {
+    match function {
         // ...
-        Func::Scalar(srf) => {
-          // ...
-+          ScalarFunc::Date => {
-+              if let Some(args) = args {
-+                  for arg in args.iter() {
-+                      // register containing result of each argument expression
-+                      let target_reg = program.alloc_register();
-+                      _ = translate_expr(
-+                          program,
-+                          referenced_tables,
-+                          arg,
-+                          target_reg,
-+                          precomputed_exprs_to_registers,
-+                      )?;
-+                  }
-+              }
-+              program.emit_insn(Insn::Function {
-+                  constant_mask: 0,
-+                  start_reg: target_register + 1,
-+                  dest: target_register,
-+                  func: func_ctx,
-+              });
-+              Ok(target_register)
-+          }
-// ...
+        Func::Scalar(
+            ScalarFunc::Changes
+            | ScalarFunc::TotalChanges
+            | ScalarFunc::Random
++           | ScalarFunc::Date
+            | ScalarFunc::DateTime
+            // ...
+        ) => Some(EmptyArgumentStart::ReserveOneRegister),
+        // ...
 ```
+
+A function that needs its own instruction sequence (like `substr`,
+`iif` or `coalesce`) gets its own arm in the `hir::Expr::FunctionCall`
+lowering in the same file instead.
 
 ### Function execution
 

@@ -52,12 +52,12 @@ info:
   database: ':memory:'
 ---
 QUERY PLAN
-|--SCALAR SUBQUERY 1
-|  `--SCAN (subquery-0)
-|     |--SCAN lineitem
-|     `--USE SORTER FOR GROUP BY
 |--SCAN revenue
 |  |--SCAN lineitem
 |  `--USE SORTER FOR GROUP BY
 |--SEARCH supplier USING INTEGER PRIMARY KEY (rowid=?)
+|--SCALAR SUBQUERY 1
+|  `--SCAN (subquery-0)
+|     |--SCAN lineitem
+|     `--USE SORTER FOR GROUP BY
 `--USE SORTER FOR ORDER BY

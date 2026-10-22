@@ -61,28 +61,25 @@ info:
   database: ':memory:'
 ---
 QUERY PLAN
-|--SCALAR SUBQUERY 1
-|  |--SCALAR SUBQUERY 2
-|  |  `--SCAN ordered_points
-|  |     |--SCAN sample_points
-|  |     |--USE HASH TABLE FOR DISTINCT
-|  |     `--USE SORTER FOR ORDER BY
-|  |--SCAN sample_points
-|  |--USE HASH TABLE FOR DISTINCT
-|  |--USE SORTER FOR ORDER BY
-|  `--SCAN run_ids
-|     `--SCAN window_subquery_0
-|        `--SCAN run_markers
-|           `--SCAN previous_points
-|              |--SCAN ordered_points AS p1
-|              `--CORRELATED SCALAR SUBQUERY 3
-|                 `--SEARCH p2 USING INDEX ephemeral_subquery_t59 (point_key<?)
-`--SCAN run_lengths
+|--SCAN run_lengths
+|  |--SCAN run_ids
+|  |  `--SCAN run_markers
+|  |     `--SCAN previous_points
+|  |        |--SCAN sample_points
+|  |        |--USE HASH TABLE FOR DISTINCT
+|  |        |--USE SORTER FOR ORDER BY
+|  |        |--SCAN ordered_points AS p1
+|  |        |--CORRELATED SCALAR SUBQUERY 1
+|  |        |  `--SEARCH p2 USING INDEX ephemeral_subquery_s2 (point_key<?)
+|  |        |     |--USE HASH TABLE FOR DISTINCT
+|  |        |     |--USE SORTER FOR ORDER BY
+|  |        |     |--USE HASH TABLE FOR DISTINCT
+|  |        |     `--USE SORTER FOR ORDER BY
+|  |        `--CORRELATED SCALAR SUBQUERY 3
+|  `--USE SORTER FOR GROUP BY
+`--SCALAR SUBQUERY 2
    |--SCAN run_ids
-   |  `--SCAN window_subquery_0
-   |     `--SCAN run_markers
-   |        `--SCAN previous_points
-   |           |--SCAN ordered_points AS p1
-   |           `--CORRELATED SCALAR SUBQUERY 4
-   |              `--SEARCH p2 USING INDEX ephemeral_subquery_t45 (point_key<?)
-   `--USE SORTER FOR GROUP BY
+   `--SCALAR SUBQUERY 4
+      `--SCAN ordered_points
+         |--USE HASH TABLE FOR DISTINCT
+         `--USE SORTER FOR ORDER BY

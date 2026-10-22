@@ -34,7 +34,7 @@ addr  opcode            p1  p2  p3  p4              p5  comment
   14    HaltIfNull    1299   0   5  products.price   0
   15    Column           0   3  10  0                0  r[10]=products.quantity
   16    Subtract        10  11   6                   0  r[6]=r[10]-r[11]
-  17    Column           1   0   7                   0  r[7]=idx_products_category.category
+  17    Column           0   4   7                   0  r[7]=products.category
   18    Affinity         3   5   0                   0  r[3..8] = D, B, E, D, B
   19    MakeRecord       3   5  12                   0  r[12]=mkrec(r[3..7])
   20    Insert           0  12   2  products         8  intkey=r[2] data=r[12]

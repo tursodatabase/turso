@@ -1,5 +1,5 @@
 //! Changes a correlated subquery into a join of the query block that uses it,
-//! like legacy's `optimizer/unnest.rs`, when both forms give the same rows.
+//! when both forms give the same rows.
 //!
 //! - `EXISTS` becomes a semi-join. It keeps an outer row when an inner row
 //!   matches.
@@ -8,16 +8,16 @@
 //! - A direct positive `IN` becomes a semi-join with one extra equality test.
 //! - A subquery that returns one aggregate value becomes a FROM subquery
 //!   grouped by the columns that link it to the outer row, LEFT JOINed on
-//!   those columns (legacy's group-first form). When computing the
-//!   aggregate for keys no outer row asks for could fail, a direct WHERE
-//!   comparison may instead LEFT JOIN the inner table and group by the outer
-//!   rowid (legacy's join-first form).
+//!   those columns (the group-first form). When computing the aggregate
+//!   for keys no outer row asks for could fail, a direct WHERE comparison
+//!   may instead LEFT JOIN the inner table and group by the outer rowid
+//!   (the join-first form).
 //!
 //! The rewrite works on HIR only: the subquery's source moves into the outer
 //! block's FROM clause with its identity, so every column reference to it
 //! stays valid, and its WHERE terms move into the outer block's WHERE clause.
-//! Like legacy, the planner plans both forms and keeps the rewritten one when
-//! it costs no more than the original.
+//! The planner plans both forms and keeps the rewritten one when it costs no
+//! more than the original.
 
 use turso_parser::ast::{Distinctness, Operator, UnaryOperator};
 
@@ -84,8 +84,8 @@ pub(crate) fn unnest_correlated_subqueries(
         };
         let original_cost = query_cost(original, block.query, params);
         let rewritten_cost = query_cost(&rewritten_plan, block.query, params);
-        // Like legacy: equal work is better without one subquery call per
-        // outer row, and a block with a FULL join whose correlated
+        // Equal work is better without one subquery call per outer row,
+        // and a block with a FULL join whose correlated
         // subqueries all became joins always keeps that form.
         if complete_full_join_rewrite(&rewritten, block)
             || matches!(
@@ -101,8 +101,7 @@ pub(crate) fn unnest_correlated_subqueries(
     Ok((document, dropped_parameters))
 }
 
-/// Whether `block` has a FULL join and no correlated subquery left, legacy's
-/// `full_join_rewrite_is_complete`.
+/// Whether `block` has a FULL join and no correlated subquery left.
 fn complete_full_join_rewrite(document: &HirDocument, block: QueryBlockId) -> bool {
     document
         .query_block(block)
@@ -143,9 +142,9 @@ fn queries_innermost_first(document: &HirDocument) -> Vec<QueryId> {
     order
 }
 
-/// Like legacy's `estimated_cost`: the work of one run of `query`, plus the
-/// work of every subquery in its expressions for the number of times the
-/// plan runs it, plus the work of starting each call.
+/// The work of one run of `query`, plus the work of every subquery in its
+/// expressions for the number of times the plan runs it, plus the work of
+/// starting each call.
 fn query_cost(plan: &HirPlan, query: QueryId, params: &CostModelParams) -> Option<f64> {
     let planned = plan.planned_query(query)?;
     let mut cost = planned.cost.0;
@@ -236,11 +235,10 @@ fn has_candidate(document: &HirDocument, block: QueryBlockId) -> bool {
         .any(|query| document.reads_outer_sources(query))
 }
 
-/// Rewrite every subquery of `block` that may become a join, as legacy's
-/// `rewrite_correlated_subqueries` does: `EXISTS` and `NOT EXISTS` first,
-/// then `IN` and one-value subqueries in the order legacy lists them: WHERE,
-/// GROUP BY, the result columns, then ORDER BY. Return whether anything
-/// changed.
+/// Rewrite every subquery of `block` that may become a join: `EXISTS` and
+/// `NOT EXISTS` first, then `IN` and one-value subqueries in clause order:
+/// WHERE, GROUP BY, the result columns, then ORDER BY. Return whether
+/// anything changed.
 fn rewrite_block(
     document: &mut HirDocument,
     block: QueryBlockId,
@@ -278,8 +276,8 @@ fn rewrite_block(
         .find(|query| !tried.contains(query) && document.reads_outer_sources(*query))
     {
         tried.insert(query);
-        // Like legacy's `same_query`: a later copy of a rewritten subquery
-        // in the same clause reads the same grouped table.
+        // A later copy of a rewritten subquery in the same clause reads the
+        // same grouped table.
         let clause = subquery_clause(document, block, query);
         if let Some(replacement) = grouped
             .iter()
@@ -319,8 +317,7 @@ fn rewrite_block(
     Ok(changed)
 }
 
-/// The clause of a block a subquery is first used in, as legacy's
-/// `SubqueryOrigin` tells them apart.
+/// The clause of a block a subquery is first used in.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Clause {
     Where,
@@ -485,8 +482,8 @@ enum AggregateRewrite {
     Joined,
 }
 
-/// The subqueries in the expressions of `block`, in the order legacy plans
-/// them: WHERE, GROUP BY and HAVING, the result columns, then the query's
+/// The subqueries in the expressions of `block`, in the order they are
+/// planned: WHERE, GROUP BY and HAVING, the result columns, then the query's
 /// ORDER BY and LIMIT when the block is the whole query.
 fn block_subqueries(document: &HirDocument, block_id: QueryBlockId) -> Vec<QueryId> {
     let mut subqueries = Vec::new();
@@ -504,7 +501,7 @@ fn block_subqueries(document: &HirDocument, block_id: QueryBlockId) -> Vec<Query
 }
 
 /// Visit the expressions of `block` whose subqueries a rewrite may replace,
-/// in the order legacy lists them. Join constraints are not visited.
+/// in clause order. Join constraints are not visited.
 fn for_each_block_expression(
     document: &HirDocument,
     block_id: QueryBlockId,
@@ -793,9 +790,8 @@ fn and(lhs: hir::Expr, rhs: hir::Expr) -> hir::Expr {
     }
 }
 
-/// Move one subquery of `block` into it as a semi-join or anti-join, the
-/// port of legacy's `rewrite_as_semi_or_anti_join` and its checks. Return
-/// whether it moved.
+/// Move one subquery of `block` into it as a semi-join or anti-join, when
+/// every check below passes. Return whether it moved.
 fn try_semi_or_anti_join(
     document: &mut HirDocument,
     block_id: QueryBlockId,
@@ -874,12 +870,12 @@ fn try_semi_or_anti_join(
         _ => return false,
     }
 
-    // Like legacy, every source the subquery reads from outside is a table
-    // of this block's own FROM clause, and none of them is NULL-filled by a
-    // LEFT JOIN (its right side) or a RIGHT JOIN (its left side, which legacy
-    // makes the right side of a LEFT JOIN): a LEFT JOIN whose NULL row a
-    // WHERE term rejects becomes an inner join, and the link of a NOT EXISTS
-    // must not count as such a term. Like legacy, FULL JOIN sides are allowed.
+    // Every source the subquery reads from outside is a table of this
+    // block's own FROM clause, and none of them is NULL-filled by a LEFT
+    // JOIN (its right side) or a RIGHT JOIN (every source on its left side):
+    // a LEFT JOIN whose NULL row a WHERE term rejects becomes an inner join,
+    // and the link of a NOT EXISTS must not count as such a term. FULL JOIN
+    // sides are allowed.
     let outer_sources = document.outer_sources(subquery_id);
     if outer_sources.is_empty()
         || outer_sources.iter().any(|source| {
@@ -899,8 +895,8 @@ fn try_semi_or_anti_join(
         return false;
     }
 
-    // Like legacy, a subquery in the subquery's own clauses must not read any
-    // row from outside itself. One in the WHERE clause moves with its term
+    // A subquery in the subquery's own clauses must not read any row from
+    // outside itself. One in the WHERE clause moves with its term
     // and stays a subquery of the outer block; one in the SELECT list of an
     // EXISTS is never run, and is dropped with that list.
     let nested = document.expression_subqueries(subquery_id);
@@ -948,8 +944,8 @@ fn try_semi_or_anti_join(
             let [output] = inner_block.outputs.as_slice() else {
                 return false;
             };
-            // Like legacy, a semi-join changes which expressions run and how
-            // many times: IN runs the inner query to the end, while a
+            // A semi-join changes which expressions run and how many
+            // times: IN runs the inner query to the end, while a
             // semi-join stops at its first match, and the left side runs once
             // for every inner row instead of once. So nothing involved may
             // fail.
@@ -978,8 +974,8 @@ fn try_semi_or_anti_join(
         }
         let sources = expression_sources(term);
         let reads_outer = sources.iter().any(|source| *source != inner_source);
-        // Like legacy's `can_move_join_term`: a term that reads the outer
-        // row must be an `=` between the inner source and outer sources.
+        // A term that reads the outer row must be an `=` between the inner
+        // source and outer sources.
         if reads_outer && !is_inner_outer_equality(term, inner_source) {
             return false;
         }
@@ -991,9 +987,8 @@ fn try_semi_or_anti_join(
         }
     }
 
-    // Every check passed. Move the source and its terms. Like legacy's
-    // `phantom_params`, the parameters of the dropped SELECT list are kept
-    // so callers can still bind them.
+    // Every check passed. Move the source and its terms. The parameters of
+    // the dropped SELECT list are kept so callers can still bind them.
     let outer_query = block_id.query;
     for query in moved_nested {
         document.queries[query.index()].parent = Some(outer_query);
@@ -1034,8 +1029,20 @@ fn try_semi_or_anti_join(
     true
 }
 
-/// Like legacy's `is_inner_outer_equal_check`: one side of an `=` reads only
-/// the inner source and the other only outer sources.
+/// Add the LEFT JOIN a rewritten subquery becomes. A semi-join or anti-join
+/// from a WHERE EXISTS or IN rewritten earlier must stay the last join: it
+/// only filters the rows before it, and the loops are built in this order.
+fn push_join_before_semi_anti(from: &mut hir::From, join: hir::Join) {
+    let first_semi_anti = from
+        .joins
+        .iter()
+        .position(|join| matches!(join.kind, hir::JoinKind::Semi | hir::JoinKind::Anti))
+        .unwrap_or(from.joins.len());
+    from.joins.insert(first_semi_anti, join);
+}
+
+/// Whether one side of an `=` reads only the inner source and the other
+/// only outer sources.
 fn is_inner_outer_equality(expression: &hir::Expr, inner_source: SourceId) -> bool {
     let hir::Expr::Binary {
         lhs,
@@ -1167,8 +1174,8 @@ fn aggregate_function(expression: &hir::Expr) -> Option<&crate::function::AggFun
     }
 }
 
-/// Port of legacy's `result_on_empty_input`: the result of a one-value
-/// aggregate subquery for no input rows, if it is known.
+/// The result of a one-value aggregate subquery for no input rows, if it is
+/// known.
 fn result_on_empty_input(expression: &hir::Expr) -> Option<EmptyInputValue> {
     use crate::function::AggFunc;
     if let Some(function) = aggregate_function(expression) {
@@ -1187,8 +1194,7 @@ fn result_on_empty_input(expression: &hir::Expr) -> Option<EmptyInputValue> {
     is_null_on_empty_input(expression).then_some(EmptyInputValue::Null)
 }
 
-/// Port of legacy's `is_null_on_empty_input`: whether an expression must be
-/// NULL when its aggregates read no row.
+/// Whether an expression must be NULL when its aggregates read no row.
 fn is_null_on_empty_input(expression: &hir::Expr) -> bool {
     use crate::function::AggFunc;
     if aggregate_function(expression).is_some_and(|function| {
@@ -1238,8 +1244,8 @@ struct ColumnPair {
     term: hir::Expr,
 }
 
-/// Port of legacy's `read_column_pair`: an `=` between one column of the
-/// subquery's own sources and one column of `outer`.
+/// An `=` between one column of the subquery's own sources and one column
+/// of `outer`.
 fn read_column_pair(
     term: &hir::Expr,
     inner_sources: &[SourceId],
@@ -1276,9 +1282,9 @@ fn source_column(document: &HirDocument, column: hir::ColumnRef) -> Option<&hir:
     document.source(column.source)?.columns.get(column.column)
 }
 
-/// Port of legacy's `column_pair_compares_the_same`: grouping by the inner
-/// column and joining on the `=` must use the same number/text conversion
-/// and the same text order, or an outer row could match two groups.
+/// Grouping by the inner column and joining on the `=` must use the same
+/// number/text conversion and the same text order, or an outer row could
+/// match two groups.
 fn column_pair_compares_the_same(document: &HirDocument, pair: &ColumnPair) -> bool {
     use crate::translate::collate::CollationSeq;
     let (Some(inner), Some(outer)) = (
@@ -1305,8 +1311,8 @@ fn column_pair_compares_the_same(document: &HirDocument, pair: &ColumnPair) -> b
     affinity(inner) == affinity(outer) && collation(inner) == collation(outer)
 }
 
-/// Port of legacy's `aggregate_can_run_for_unused_rows`: whether computing
-/// the aggregate for keys no outer row asks for cannot fail.
+/// Whether computing the aggregate for keys no outer row asks for cannot
+/// fail.
 fn aggregate_can_run_for_unused_rows(
     document: &HirDocument,
     block: &hir::QueryBlock,
@@ -1404,8 +1410,7 @@ fn join_constraints_read(
 }
 
 /// Turn one correlated aggregate subquery of `block` into a grouped FROM
-/// subquery, the port of legacy's `try_rewrite_single_value_aggregate`
-/// group-first form:
+/// subquery, the group-first form:
 ///
 /// ```sql
 /// SELECT * FROM o WHERE o.v < (SELECT avg(i.v) FROM i WHERE i.k = o.k)
@@ -1429,7 +1434,7 @@ fn try_aggregate_rewrite(
     let Some(from) = &block.from else {
         return None;
     };
-    // Like legacy, a block with a FULL join keeps its aggregate subqueries.
+    // A block with a FULL join keeps its aggregate subqueries.
     if from
         .joins
         .iter()
@@ -1456,7 +1461,7 @@ fn try_aggregate_rewrite(
         return None;
     }
     let query = document.query(query_id)?;
-    // Port of legacy's `can_rewrite_single_value_aggregate`.
+    // The subquery must be one plain block with one aggregate output.
     let [inner_block] = query.blocks.as_slice() else {
         return None;
     };
@@ -1686,16 +1691,14 @@ fn try_aggregate_rewrite(
         .reduce(and)
         .expect("a grouped table has a link");
     let block = &mut document.queries[block_id.query.index()].blocks[block_id.index];
-    block
-        .from
-        .as_mut()
-        .expect("checked above")
-        .joins
-        .push(hir::Join {
+    push_join_before_semi_anti(
+        block.from.as_mut().expect("checked above"),
+        hir::Join {
             right: grouped,
             kind: hir::JoinKind::Left,
             constraint: hir::JoinConstraint::On(link),
-        });
+        },
+    );
 
     let result = hir::Expr::Column(hir::ColumnRef {
         source: grouped,
@@ -1755,8 +1758,7 @@ fn reads_rowid_table(document: &HirDocument, source: SourceId) -> bool {
 }
 
 /// Join the inner table of one correlated aggregate subquery to `block`
-/// before computing the aggregate, the port of legacy's
-/// `rewrite_aggregate_as_join_then_group`:
+/// before computing the aggregate, the join-first form:
 ///
 /// ```sql
 /// SELECT o.id FROM o WHERE o.limit > (SELECT sum(i.x) FROM i WHERE i.key = o.key)
@@ -1767,8 +1769,8 @@ fn reads_rowid_table(document: &HirDocument, source: SourceId) -> bool {
 /// ```
 ///
 /// The join only reads inner rows some outer row asks for, so it never
-/// computes an aggregate that could fail for an unused key. Like legacy,
-/// the outer block reads one rowid table and does nothing else that the new
+/// computes an aggregate that could fail for an unused key. The outer block
+/// must read one rowid table and do nothing else that the new
 /// grouping would change, the subquery reads one rowid table, and its value
 /// is one whole side of one WHERE comparison. Return whether it changed.
 fn try_join_first(document: &mut HirDocument, block_id: QueryBlockId, query_id: QueryId) -> bool {
@@ -1815,10 +1817,9 @@ fn try_join_first(document: &mut HirDocument, block_id: QueryBlockId, query_id: 
     let inner = inner_from.first;
     let result = inner_block.outputs[0].expr.clone();
 
-    // Port of legacy's `find_direct_aggregate_comparison`: the subquery is
-    // one whole side of one WHERE comparison, and every other WHERE term
-    // gives the same value each time it runs, since it runs once for every
-    // joined copy of an outer row.
+    // The subquery must be one whole side of one WHERE comparison, and every
+    // other WHERE term must give the same value each time it runs, since it
+    // runs once for every joined copy of an outer row.
     if block
         .outputs
         .iter()
@@ -1928,19 +1929,17 @@ fn try_join_first(document: &mut HirDocument, block_id: QueryBlockId, query_id: 
     let mut remaining = conjuncts;
     remaining.remove(position);
     let block = &mut document.queries[block_id.query.index()].blocks[block_id.index];
-    block
-        .from
-        .as_mut()
-        .expect("checked above")
-        .joins
-        .push(hir::Join {
+    push_join_before_semi_anti(
+        block.from.as_mut().expect("checked above"),
+        hir::Join {
             right: inner,
             kind: hir::JoinKind::Left,
             constraint: match inner_filter {
                 Some(filter) => hir::JoinConstraint::On(filter),
                 None => hir::JoinConstraint::None,
             },
-        });
+        },
+    );
     block.aggregate_count += inner_aggregates;
     let hir::QueryBlockBody::Select {
         filter, grouping, ..

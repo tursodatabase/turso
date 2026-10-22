@@ -62,8 +62,10 @@ planner-created runtime objects may remain separate.
 
 ## Current status
 
-Core SELECT and top-level DML binding are present. The user-visible SELECT
-coverage audit is complete; deferred migration work remains below.
+The cutover is complete: every statement is prepared from validated HIR or
+from schema translators over the semantic context, and the legacy planner,
+binder, emitter, `TableReferences` and `Resolver` are deleted. The
+sections below record what was audited and how each statement kind runs.
 
 ### Remaining binding coverage audit
 
@@ -79,7 +81,47 @@ Deferred migration surfaces:
 
 | Surface | Why deferred |
 |---|---|
-| Production entry point and whole-query lowering | Statement and whole-trigger-program inputs produce validated HIR from an owned multi-database semantic catalog. Standalone HIR expression lowering is now being ported in narrow checkpoints, but preparation still enters the legacy plan and emitter path. |
+| None | Statement and whole-trigger-program inputs produce validated HIR from an owned multi-database semantic catalog, and every statement is prepared from it. The legacy planner was deleted on 2026-10-21. |
+
+### What goes through HIR
+
+Audited on 2026-10-21 from `translate_statement`, after the legacy planner
+was deleted:
+
+- SELECT always goes through HIR; there is no guard and no fallback.
+- DELETE, UPDATE and INSERT always go through HIR as well, with their
+  triggers and foreign-key actions; the HIR entry points return nothing and
+  there is no fallback left. The last guards to go: `sqlite_dbpage` is
+  written through HIR under the same rule as legacy (a cli_only build opened
+  with unsafe testing on); a STRICT column whose type is neither built in
+  nor custom, which CREATE TABLE rejects, is an error; a target with
+  materialized views built by another DBSP version gets legacy's error; a
+  virtual column of a custom type holds the value its expression computes
+  from the decoded columns it reads, which is what it shows, what its index
+  stores and what a seek looks for (legacy decodes the computed value once
+  more, so `cents AS (a * 2)` reads 0 while its index holds 4 and a seek
+  looks for 400); and UPDATE ... FROM of a virtual table writes each joined
+  row's new values into a scratch table keyed by rowid during the join and
+  hands them to the table afterwards, as SQLite does (legacy failed it with
+  "no such column: rowid"). What cannot happen, such as a DML target that
+  is not a table or an automatic index on the target's loop, is an internal
+  error.
+- A CTE a DML statement reads more than once, in UPDATE ... FROM and in its
+  expression subqueries, is filled once before any row changes, as legacy
+  fills it, so every reader sees the same rows; a correlated subquery still
+  reads it again on each run, as SQLite does.
+- The elements of an array of a custom type are encoded one by one when
+  written, as legacy encodes them, so STRICT tables with such columns go
+  through HIR.
+- Schema statements (CREATE TABLE AS, CREATE VIEW, CREATE MATERIALIZED
+  VIEW, ATTACH, ALTER TABLE, DROP TABLE, pragmas) prepare the SELECTs and
+  DML inside them through HIR: DROP TABLE checks foreign keys by lowering a
+  DELETE of the whole table without its triggers, and ALTER TABLE rewrites
+  rows through an HIR UPDATE. There is no `translate_inner` and no legacy
+  plan left to reach.
+
+CI runs the conformance corpora through HIR (`.github/workflows/sqltest.yml`),
+with the snapshot tests regenerated from HIR's bytecode.
 
 ### Cutover deletion map
 
@@ -88,13 +130,56 @@ resolver, `TableReferences`, parser-expression conversion, binding, or
 rewriting. Remaining parser types are frozen enums and literals already owned
 by HIR.
 
-| Legacy work | HIR replacement | Why still live |
-|---|---|---|
-| SELECT binding in `select.rs` | Semantic analyzer and HIR | Production preparation still builds the legacy plan. |
-| `expr/binding.rs` | `semantic/expr.rs` | The legacy emitter still consumes parser expressions. |
-| `TableReferences` name lookup | Semantic `Scope` and `SourceId` | Legacy SELECT and DML callers still use it. |
-| `TableReferences` physical facts | HIR planned sources and loops | The legacy emitter still uses its cursor and ordering metadata. |
-| Bind and rewrite passes | Closed, validated HIR | Production cutover has not happened. |
+The legacy SELECT and DML planners, their binders and emitters, and the
+bind and rewrite passes were deleted on 2026-10-21. The legacy expression
+binder and translator (`expr/binding.rs`, `expr/translator.rs` and the
+condition, binary, custom-type and function emitters next to them) were
+deleted the same day, once their last callers moved to HIR:
+
+- ALTER TABLE ADD COLUMN checks a new virtual column's NOT NULL and CHECK
+  constraints against existing rows through a planned HIR SELECT of the
+  table, and DROP COLUMN finds a partial index's use of the column by name
+  in its WHERE clause.
+- ATTACH and DETACH evaluate their arguments through HIR only.
+- The DBSP expression compiler analyzes an expression over register inputs
+  through `SemanticRootInput::RegisterExpressions`, which gives it a
+  `SchemaExpressions` root whose one positional source the compiler binds
+  to registers.
+- The planner's unused WHERE, LIMIT and rowid parsers are gone.
+
+What is left of `expr/` is the helpers both HIR and the planner share: AST
+walking, the storage-class mask, literal emission and conditional jumps.
+
+The parser-expression optimizer went the same day: `compute_best_join_order`
+and its access-method, multi-index, constraint and ordering code over
+`JoinedTable`, `WhereTerm` and `TableReferences`; the `Plan`/`SelectPlan`
+types and the plan display; `Table::FromClauseSubquery`; the statement's
+legacy result-column metadata (PRAGMA and change-count columns are now
+resolved result columns like every other); and the program builder's
+cursor overrides, CTE name stack, hash-build signatures and subquery result
+registers. HIR planning had its own generic versions of all of them
+(`HirPlannedSource`, `HirWhereTerm`, `HirTableConstraints`,
+`compute_hir_join_order`), which `plan.rs` and `optimizer/` now hold alone,
+with the shared `PlannedSource`, `PredicateTerm`, `SeekDef`, `BitSet` and
+`QueryDestination` types.
+
+`Resolver`, the last legacy data type, was deleted on 2026-10-21. Schema
+statements, pragmas and transaction statements now look databases, tables,
+indexes, triggers, functions and collations up through the same
+`SemanticContext` that semantic analysis builds from the captured catalog,
+so no statement resolves a name outside the binding step's catalog.
+
+Nothing of the legacy data types remains.
+
+Each prepared statement captures the catalog once (`capture_catalog` in
+`translate/mod.rs`) and builds one `SemanticContext` from it and the
+connection's settings. Schema statements read that context directly, and
+the `HirSession` that analyzes, plans and lowers SELECT, DML and trigger
+programs borrows it instead of capturing a catalog of its own. The one
+exception is `PRAGMA integrity_check` on an MVCC main database, which reads
+the latest shared schema: it builds a second catalog over that schema with
+`SemanticContext::catalog_with_main_schema`. Change data capture's register
+expressions, compiled outside any statement, capture their own catalog.
 
 Preserved binding restrictions, not HIR gaps:
 
@@ -116,22 +201,27 @@ Internal or already-normalized parser nodes are not new SQL coverage:
 - `Func::AlterTable` is created by ALTER TABLE translation, not by a SELECT
   function call.
 
-### Opt-in production entry point
+### Production entry point
 
-Setting `TURSO_EXPERIMENTAL_HIR` (any value) when a connection opens, or
-calling `Connection::set_experimental_hir(true)`, prepares top-level SELECT
+Since the cutover on 2026-10-20, every connection prepares top-level SELECT
 statements through HIR: the owned semantic catalog, `analyze_root`,
 `HirPlan::build`, and HIR lowering. Statements the engine prepares inside
 another one, such as the copy statements of VACUUM, take the same path; like
-legacy, they may write internal tables. There is no fallback: a SELECT that HIR cannot lower fails to
-prepare, so running the test suites with the variable set lists the remaining
-gaps. Top-level DELETE, UPDATE and INSERT also go through HIR, except the
-cases listed under "DML through HIR", which still go to legacy. The variable and the legacy path
-are removed at cutover.
+legacy, they may write internal tables. There is no fallback: a SELECT that
+HIR cannot lower fails to prepare. Top-level DELETE, UPDATE and INSERT also
+go through HIR. The legacy planner, `TURSO_LEGACY_PLANNER` and
+`Connection::set_experimental_hir` were deleted on 2026-10-21: the SELECT
+and DML planners, binders, emitters and optimizer passes that only legacy
+used are gone, and the remaining `plan.rs` types, optimizer and emitter
+helpers are the ones HIR lowering builds on.
 
 Result-column names, table names, and declared types come from the HIR outputs
 and the same alias, `full_column_names`, and `short_column_names` rules as
-legacy. Two known differences are legacy artifacts: legacy reports its internal
+legacy. With `full_column_names` on and `short_column_names` off, `SELECT *`
+and `t.*` name each column after its source during analysis, as legacy and
+SQLite do: the alias, or the table name or `(subquery-N)` without one, so a
+FROM subquery passes those names up (`(subquery-0).a.id`). RETURNING `*`
+keeps plain names, as in legacy. Two known differences are legacy artifacts: legacy reports its internal
 window subquery as the table of every output of a window query, and BLOB as
 the declared type of expressions such as `count(*)` there. HIR reports the real
 table and no declared type, like SQLite. `get_column_type_info` infers
@@ -148,7 +238,7 @@ right before reading its result. Uncorrelated subqueries run once through
 through the source bindings in effect at that point. An IN seek driven by a
 subquery emits the same shell when its loop opens.
 
-`scripts/hir-conformance.sh` runs every `.sqltest` file with the switch on,
+`scripts/hir-conformance.sh` runs every `.sqltest` file through HIR,
 one process per file, and groups failures by cause. The first run on
 2026-10-14 passed 13602 conformance tests and failed 568. On 2026-10-16 a run
 failed 29, with every file running to the end; legacy passes all of them. On
@@ -206,7 +296,11 @@ join. The right loop records each matched rowid in an ephemeral table, and
 after the main loops a second pass scans the right table, or the ephemeral
 table of a materialized subquery, for rows not in it,
 with the left tables reading NULL. As in SQLite, WHERE terms run only after the
-match is recorded, and the second pass checks WHERE terms but not ON terms.
+match is recorded, and the second pass checks WHERE terms and the ON terms of
+the inner joins written after the outer join, which apply to its NULL-extended
+rows the same way (`LEFT JOIN t3 ON ... JOIN t4 ON t3.d IS t4.d` keeps the
+rows whose t3 side is NULL only where t4.d is NULL too), but not the ON terms
+of the outer join itself or of the joins before it.
 HIR keeps legacy's FULL JOIN errors for shapes legacy has no hash plan for
 (chaining, a recursive CTE reference, USING or NATURAL). It accepts correlated
 subqueries next to FULL JOIN. HIR matches SQLite where legacy does not:
@@ -370,11 +464,14 @@ order checks where the code allows:
   stored table, so setup costs two passes. A correlated subquery counts the
   rows of an outer FROM subquery or CTE as its number of runs.
 - A scanned FROM subquery or CTE returns its rows in the order of its ORDER
-  BY, its GROUP BY keys, or the one subquery it passes through
-  (`subquery_intrinsic_order_consumed`), so an outer ORDER BY in that order
-  needs no sort; a CTE stored once is read backwards for the opposite order.
-  Not ported: the order of a plain table scan inside the subquery, and using
-  a temporary index's order.
+  BY, its GROUP BY keys, the one subquery it passes through, or the plain
+  scan of its one table (an index's columns and then the rowid, or the
+  rowid alone, when the subquery exposes them), so an outer ORDER BY in
+  that order needs no sort; a CTE stored once is read backwards for the
+  opposite order. A subquery read through the temporary index over its
+  stored rows returns each seek's rows in the index's order after the seek
+  prefix, in either direction, so an outer ORDER BY on the earlier loops'
+  columns and then the seek column needs no sort either.
 - A block with windows aims for the innermost window's PARTITION BY and
   ORDER BY order, like legacy's window source subquery, so an index or an
   ordered CTE replaces that window's sorter. EXPLAIN shows `USE SORTER FOR
@@ -448,8 +545,9 @@ does not set from the loop's cursor; an INSERT passes NULL, the given rowid
 or NULL, and every column. Where legacy differs, HIR follows SQLite: every
 VALUES row is inserted (legacy keeps the last), INSERT ... RETURNING
 returns the values given, and DELETE or UPDATE ... RETURNING fail with
-SQLite's error (legacy panics or returns nothing). `sqlite_dbpage`, which
-legacy writes only in testing builds, still goes to legacy.
+SQLite's error (legacy panics or returns nothing). `sqlite_dbpage` may be
+written only by a cli_only build opened with unsafe testing on; any other
+write to it is rejected as a write to a protected table.
 
 Change data capture (`semantic_lowering/cdc.rs`) writes the rows legacy
 writes. Semantic analysis resolves the capture table, and the sequence that
@@ -471,16 +569,15 @@ Writes to a virtual table record no change data. Legacy records none
 either, but writes a COMMIT row after each UPDATE and DELETE of one.
 
 A table with materialized views is written like any other: the VM updates
-the views as rows are inserted and deleted. Only views built by another
-DBSP version, which legacy reports as an error, still go to legacy.
+the views as rows are inserted and deleted. A table with a dependent view
+built by another DBSP version cannot be written: the statement fails with
+an error naming the views, as before.
 
-Whether a DELETE needs legacy is decided before any bytecode is emitted. These
-still go to legacy:
-
-| DELETE feature | What HIR needs first |
-|---|---|
-| `sqlite_dbpage`, materialized views built by another DBSP version, protected system tables | Lowering for each |
-| Automatic indexes chosen by the planner | Building them before the delete loop |
+There is no other DML path. A write to `sqlite_schema` or to one of the
+engine's internal tables fails with "table X may not be modified", unless
+the engine itself runs the statement, as VACUUM does. The planner never
+reads a DELETE or UPDATE target through an automatic index; a plan that did
+would be an internal error, not a fallback.
 
 UPDATE of a B-tree table is lowered from HIR (`semantic_lowering/update.rs`).
 The new row
@@ -503,16 +600,8 @@ as SQLite does (legacy loses a row when a constraint's REPLACE runs during
 such a loop). UPDATE ... FROM stores the new rowid in its scratch table with the
 other new values. Like SQLite, when the rowid is set twice, as `id` and
 `rowid`, the last assignment wins. A RETURNING subquery of UPDATE ... FROM that is not correlated
-runs once, as in SQLite (legacy runs one that reads the target through a
-derived table again for each row). These still go to legacy:
-
-| UPDATE feature | What HIR needs first |
-|---|---|
-| `sqlite_dbpage` | As for DELETE |
-| A RETURNING subquery of UPDATE ... FROM that reads a CTE | One copy of a CTE that FROM and RETURNING both read |
-| A loop over an index built for the statement | Its lowering |
-| Arrays of a custom type | Decoding and encoding their elements on every write path |
-| A custom-typed virtual column | Decoding computed columns |
+runs once, as in SQLite (legacy ran one that read the target through a
+derived table again for each row).
 
 INSERT of VALUES rows or DEFAULT VALUES into a rowid B-tree table is lowered
 from HIR (`semantic_lowering/insert.rs`). Several VALUES rows run as a
@@ -524,13 +613,7 @@ target source is bound to the new row's registers for index expressions,
 partial-index WHERE terms and RETURNING. As in legacy and SQLite, when
 several VALUES rows read the target table (through a subquery) or the INSERT
 fires triggers, every row is computed into an ephemeral table before any is
-inserted. These still go to legacy:
-
-| INSERT feature | What HIR needs first |
-|---|---|
-| `sqlite_dbpage` | As for DELETE |
-| Arrays of a custom type | Decoding and encoding their elements on every write path |
-| A custom-typed virtual column | Decoding computed columns |
+inserted.
 
 CHECK constraints are checked as in legacy: an INSERT checks all of them once
 the rowid is known, before NOT NULL; an UPDATE checks, after NOT NULL, only
@@ -629,8 +712,8 @@ subprogram loads OLD and NEW from its parameters, tests WHEN, and lowers each
 command with the same DELETE, UPDATE and INSERT code; a command's own
 triggers are compiled the same way, and a trigger already being compiled is
 not fired again. TEMP triggers fire first. Every command of every trigger is
-checked before anything is emitted, so if one needs legacy the whole
-statement goes to legacy. As in SQLite, OLD.x and NEW.x compare without the
+checked before anything is emitted, so a command that cannot be lowered
+fails the whole statement before any bytecode is written. As in SQLite, OLD.x and NEW.x compare without the
 column's affinity (a rowid alias keeps INTEGER), and triggers stored in the
 temp schema find unqualified tables by the normal temp-then-main lookup.
 
@@ -725,7 +808,7 @@ clause has a RIGHT or FULL JOIN, which must not NULL-extend the target. Like
 legacy, a FROM clause that names a table twice, or whose NATURAL/USING column
 is also exposed by two other tables, is rejected up front.
 
-HIR DML does not use legacy's `Resolver`, `TableReferences` or AST
+HIR DML does not use the deleted `Resolver`, `TableReferences` or AST
 rewriting. Its settings (functions, dialect, custom types, double-quoted
 strings, search path) come from the connection through `HirSettings`, the
 checks that a target may be written run in `semantic_lowering`, and the
@@ -736,8 +819,9 @@ lowering, such as `ConditionMetadata` and `QueryDestination`.
 
 ### Schema statements through HIR
 
-Schema statements still go through legacy's translators, but the parts that
-read or write table rows use HIR:
+Schema statements have their own translators over the semantic context,
+the same captured catalog semantic analysis uses, and the parts that read
+or write table rows are planned through HIR:
 
 - The UPDATE of `sqlite_schema` that ALTER TABLE generates is lowered from
   HIR, writing the new CREATE statement into the `sql` column.
@@ -748,9 +832,12 @@ read or write table rows use HIR:
 - CREATE INDEX and REINDEX fill the index from `SELECT <index columns>,
   rowid FROM <table> NOT INDEXED [WHERE <partial condition>]`, planned
   through HIR. NOT INDEXED keeps REINDEX reading the table, not an index it
-  rebuilds. Legacy still fills the index when the table has a custom type or
-  array column (the SELECT would decode the stored value), or when real
-  columns take all of `rowid`, `_rowid_` and `oid`.
+  rebuilds. Index columns are read as DML writes them: a plain column as
+  stored, so a custom-typed value is not decoded, and an expression or
+  virtual generated column computed from decoded values. The rowid output
+  is written into the analyzed HIR after name resolution, so a table whose
+  real columns take all of `rowid`, `_rowid_` and `oid` is filled the same
+  way.
 
 ### Non-lowering phase complete
 
@@ -768,6 +855,8 @@ The next phase must replace that production handoff. Only then can we delete:
 - `expr/binding.rs`
 - name-resolution state and methods from `TableReferences`
 - parser-expression fields retained solely by legacy plans
+
+(All of these were deleted on 2026-10-21; see the cutover deletion map.)
 
 This boundary must not be crossed by running HIR and legacy planning together,
 or by converting HIR expressions back into parser AST.

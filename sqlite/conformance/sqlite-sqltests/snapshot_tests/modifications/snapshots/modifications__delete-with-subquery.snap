@@ -15,55 +15,51 @@ info:
   database: ':memory:'
 ---
 QUERY PLAN
-|--LIST SUBQUERY 1
-|  `--SCAN users
-`--SEARCH orders USING COVERING INDEX idx_orders_user_id (user_id=?)
+|--SEARCH orders USING COVERING INDEX idx_orders_user_id (user_id=?)
+`--LIST SUBQUERY 1
+   `--SCAN users
 
 BYTECODE
-addr  opcode            p1  p2  p3  p4            p5  comment
-   0  Init               0  43   0                 0  Start at 43
-   1  OpenWrite          1   5   0                 0  root=5; iDb=0
-   2  OpenWrite          2  13   0                 0  root=13; iDb=0
-   3  OpenWrite          3  12   0                 0  root=12; iDb=0
-   4  Null               0   1   0                 0  r[1]=NULL
-   5  Once              15   0   0                 0  goto 15
-   6  OpenEphemeral      0   0   0                 0  cursor=0 is_table=false
-   7  OpenRead           4   3   0  k(4,B,B,B,B)   0  table=users, root=3, iDb=0
-   8  Rewind             4  15   0                 0  Rewind table users
-   9    Column           4   3   4  active         0  r[4]=users.status
-  10    Ne               4   5  14  Binary         0  if r[4]!=r[5] goto 14
-  11    RowId            4   2   0                 0  r[2]=users.rowid
-  12    MakeRecord       2   1   6                 0  r[6]=mkrec(r[2..2]); for ephemeral_index_where_sub_t2
-  13    IdxInsert        0   6   0                 8  key=r[6]
-  14  Next               4   9   0                 1
-  15  OpenRead           3  12   0  k(2,B)         0  index=idx_orders_user_id, root=12, iDb=0
-  16  NullRow            0   0   0                 0  Set cursor 0 to a (pseudo) NULL row
-  17  Rewind             0  27   0                 0  Rewind index ephemeral(ephemeral_index_where_sub_t2)
-  18    Column           0   0   8                 0  r[8]=ephemeral(ephemeral_index_where_sub_t2).id
-  19    IsNull           8  26   0                 0  if (r[8]==NULL) goto 26
-  20    SeekGE           3  26   8                 0  key=[8..8]
-  21      IdxGT          3  26   8                 0  key=[8..8]
-  22      DeferredSeek   3   1   0                 0
-  23      IdxRowId       3   7   0                 0  r[7]=cursor 3 for index idx_orders_user_id.rowid
-  24      RowSetAdd      1   7   0                 0
-  25    Next             3  21   0                 0
-  26  Next               0  18   0                 0
-  27  Close              1   0   0                 0
-  28  OpenWrite          1   5   0                 0  root=5; iDb=0
-  29  OpenWrite          5  13   0                 0  root=13; iDb=0
-  30  OpenWrite          6  12   0                 0  root=12; iDb=0
-  31    RowSetRead       1  42   9                 0
-  32    NotExists        1  41   9                 0
-  33    NotExists        1  41   9                 0
-  34    Column           1   2  10                 0  r[10]=orders.product_id
-  35    RowId            1  11   0                 0  r[11]=orders.rowid
-  36    IdxDelete        2  10   2                 1
-  37    Column           1   1  12                 0  r[12]=orders.user_id
-  38    RowId            1  13   0                 0  r[13]=orders.rowid
-  39    IdxDelete        3  12   2                 1
-  40    Delete           1   0   0  orders         0
-  41  Goto               0  31   0                 0
-  42  Halt               0   0   0                 0
-  43  Transaction        0   2  10                 0  iDb=0 tx_mode=Write
-  44  String8            0   5   0  inactive       0  r[5]='inactive'
-  45  Goto               0   1   0                 0
+addr  opcode         p1  p2  p3  p4            p5  comment
+   0  Init            0  39   0                 0  Start at 39
+   1  Null            0   1   0                 0  r[1]=NULL
+   2  OpenRead        0  12   0  k(2,B)         0  index=idx_orders_user_id, root=12, iDb=0
+   3  Once           14   0   0                 0  goto 14
+   4  OpenEphemeral   1   0   0                 0  cursor=1 is_table=false
+   5  Once            7   0   0                 0  goto 7
+   6  OpenRead        2   3   0  k(4,B,B,B,B)   0  table=users, root=3, iDb=0
+   7  Rewind          2  14   0                 0  Rewind table users
+   8    Column        2   3   2  active         0  r[2]=users.status
+   9    Ne            2   3  13                 0  if r[2]!=r[3] goto 13
+  10    RowId         2   4   0                 0  r[4]=users.rowid
+  11    MakeRecord    4   1   5                 0  r[5]=mkrec(r[4..4]); for ephemeral_index_hir_sub_0
+  12    IdxInsert     1   5   0                 8  key=r[5]
+  13  Next            2   8   0                 1
+  14  NullRow         1   0   0                 0  Set cursor 1 to a (pseudo) NULL row
+  15  Rewind          1  24   0                 0  Rewind index ephemeral(ephemeral_index_hir_sub_0)
+  16    Column        1   0   6                 0  r[6]=ephemeral(ephemeral_index_hir_sub_0).id
+  17    IsNull        6  23   0                 0  if (r[6]==NULL) goto 23
+  18    SeekGE        0  23   6                 0  key=[6..6]
+  19      IdxGT       0  23   6                 0  key=[6..6]
+  20      IdxRowId    0   7   0                 0  r[7]=cursor 0.rowid
+  21      RowSetAdd   1   7   0                 0
+  22    Next          0  19   0                 0
+  23  Next            1  16   0                 0
+  24  Close           0   0   0                 0
+  25  OpenWrite       3   5   0                 0  root=5; iDb=0
+  26  OpenWrite       4  13   0                 0  root=13; iDb=0
+  27  OpenWrite       5  12   0                 0  root=12; iDb=0
+  28    RowSetRead    1  38   8                 0
+  29    NotExists     3  28   8                 0
+  30    Column        3   2   9                 0  r[9]=orders.product_id
+  31    RowId         3  10   0                 0  r[10]=orders.rowid
+  32    IdxDelete     4   9   2                 1
+  33    Column        3   1  11                 0  r[11]=orders.user_id
+  34    RowId         3  12   0                 0  r[12]=orders.rowid
+  35    IdxDelete     5  11   2                 1
+  36    Delete        3   0   0  orders         0
+  37  Goto            0  28   0                 0
+  38  Halt            0   0   0                 0
+  39  Transaction     0   2  10                 0  iDb=0 tx_mode=Write
+  40  String8         0   3   0  inactive       0  r[3]='inactive'
+  41  Goto            0   1   0                 0

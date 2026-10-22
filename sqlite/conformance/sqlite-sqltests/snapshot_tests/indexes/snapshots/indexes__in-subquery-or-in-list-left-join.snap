@@ -18,7 +18,7 @@ info:
   database: ':memory:'
 ---
 QUERY PLAN
-|--LIST SUBQUERY 1
-|  `--SCAN in_or_rhs_a
 |--HASH JOIN in_or_tags
-`--SCAN in_or_values
+|--SCAN in_or_values
+`--LIST SUBQUERY 1
+   `--SCAN in_or_rhs_a

@@ -1,8 +1,8 @@
-//! AUTOINCREMENT for HIR INSERT: like SQLite and legacy, the largest rowid a
+//! AUTOINCREMENT for HIR INSERT: like SQLite, the largest rowid a
 //! table has ever used is kept in its `sqlite_sequence` row, and a new rowid
 //! is always larger than it.
 //!
-//! Under MVCC, like legacy, the table's hidden sequence hands out new rowids
+//! Under MVCC, the table's hidden sequence hands out new rowids
 //! instead and keeps `sqlite_sequence` itself; a rowid from the statement, or
 //! one an UPDATE or UPSERT moves a row to, advances it.
 
@@ -43,15 +43,17 @@ impl Sequence {
             })?;
             return Ok(Self::Mvcc(operation));
         }
+        let sqlite_sequence = autoincrement.sqlite_sequence.value().require_btree()?;
+        check_sqlite_sequence(&sqlite_sequence)?;
         Ok(Self::Table(TableSequence {
-            table: autoincrement.sqlite_sequence.value().require_btree()?,
+            table: sqlite_sequence,
             database,
             name: table.name.clone(),
         }))
     }
 
     /// Before an INSERT of several rows: add the target's row to
-    /// `sqlite_sequence` with 0 when it has none, as legacy does.
+    /// `sqlite_sequence` with 0 when it has none.
     pub(super) fn ensure_row(&self, program: &mut ProgramBuilder) {
         if let Self::Table(sequence) = self {
             sequence.ensure_row(program);
@@ -67,7 +69,7 @@ impl Sequence {
     }
 
     /// After a row was moved to the rowid in `rowid`: under MVCC, advance the
-    /// hidden sequence past it, as legacy does. `sqlite_sequence` is left
+    /// hidden sequence past it. `sqlite_sequence` is left
     /// alone, as in SQLite: the next new rowid is larger than every rowid
     /// anyway.
     pub(super) fn emit_moved_row(&self, program: &mut ProgramBuilder, rowid: usize) -> Result<()> {
@@ -173,6 +175,32 @@ fn emit_advance_past(
     )
 }
 
+/// A `sqlite_sequence` table that does not have the shape
+/// SQLite creates, (name, seq) with a rowid, is corruption, not a table to
+/// read through.
+fn check_sqlite_sequence(table: &BTreeTable) -> Result<()> {
+    if !table.has_rowid {
+        crate::bail_corrupt_error!("malformed sqlite_sequence: table must have rowid");
+    }
+    let columns = table.columns();
+    if columns.len() != 2 {
+        crate::bail_corrupt_error!(
+            "malformed sqlite_sequence: expected 2 columns, got {}",
+            columns.len()
+        );
+    }
+    let named = |column: &crate::schema::Column, name: &str| {
+        column
+            .name
+            .as_deref()
+            .is_some_and(|column| column.eq_ignore_ascii_case(name))
+    };
+    if !named(&columns[0], "name") || !named(&columns[1], "seq") {
+        crate::bail_corrupt_error!("malformed sqlite_sequence: expected columns (name, seq)");
+    }
+    Ok(())
+}
+
 /// The `sqlite_sequence` table of the target's database and the name of the
 /// target's row in it.
 pub(super) struct TableSequence {
@@ -183,7 +211,7 @@ pub(super) struct TableSequence {
 
 impl TableSequence {
     /// Before an INSERT of several rows: add the target's row with 0 when
-    /// it has none, as legacy does.
+    /// it has none.
     pub(super) fn ensure_row(&self, program: &mut ProgramBuilder) {
         let cursor = self.open_write(program);
         let name = program.emit_string8_new_reg(self.name.clone());

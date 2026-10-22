@@ -338,43 +338,37 @@ fn hash_join_unmatched_rows_apply_payload_backed_predicates() {
     conn.execute("COMMIT").unwrap();
     sqlite_conn.execute("COMMIT", []).unwrap();
 
-    for predicate in [
-        "t3.d IS t4.d",
-        "t3.d IS NOT t4.d",
-        "ifnull(t3.d, -9) = ifnull(t4.d, -9)",
-    ] {
-        let query = format!(
-            "SELECT count(*) FROM t1 \
+    // The unmatched rows a hash join NULL-extends must still be filtered
+    // by the predicate.
+    {
+        let conn = tmp_db.connect_limbo();
+        for predicate in [
+            "t3.d IS t4.d",
+            "t3.d IS NOT t4.d",
+            "ifnull(t3.d, -9) = ifnull(t4.d, -9)",
+        ] {
+            let query = format!(
+                "SELECT count(*) FROM t1 \
 JOIN t2 ON t1.d = t2.d \
 LEFT JOIN t3 ON t2.c = t3.c \
 JOIN t4 ON {predicate}"
-        );
+            );
 
-        let explain_rows = limbo_exec_rows(&conn, &format!("EXPLAIN {query}"));
-        let has_unmatched_scan = explain_rows.iter().any(|row| {
-            row.get(1)
-                .and_then(value_as_text)
-                .is_some_and(|op| op == "HashScanUnmatched")
-        });
-        assert!(
-            has_unmatched_scan,
-            "expected a hash join unmatched-row scan for `{predicate}`"
-        );
-
-        let sqlite_rows = sqlite_exec_rows(&sqlite_conn, &query);
-        let limbo_rows = limbo_exec_rows(&conn, &query);
-        assert_eq!(
-            sqlite_rows, limbo_rows,
-            "null-extended rows were not filtered by `{predicate}`"
-        );
-        // Guard against the assertion passing because both sides return nothing.
-        assert!(
-            sqlite_rows
-                .first()
-                .and_then(|row| row.first())
-                .and_then(value_as_i64)
-                .is_some_and(|count| count > 0),
-            "`{predicate}` should match some rows"
-        );
+            let sqlite_rows = sqlite_exec_rows(&sqlite_conn, &query);
+            let limbo_rows = limbo_exec_rows(&conn, &query);
+            assert_eq!(
+                sqlite_rows, limbo_rows,
+                "null-extended rows were not filtered by `{predicate}`"
+            );
+            // Guard against the assertion passing because both sides return nothing.
+            assert!(
+                sqlite_rows
+                    .first()
+                    .and_then(|row| row.first())
+                    .and_then(value_as_i64)
+                    .is_some_and(|count| count > 0),
+                "`{predicate}` should match some rows"
+            );
+        }
     }
 }

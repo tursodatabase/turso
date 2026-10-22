@@ -200,11 +200,6 @@ impl ExprPolicy {
         Self::insert_values(dqs_dml)
     }
 
-    pub(crate) const fn without_dqs_fallback(mut self) -> Self {
-        self.allow_dqs_fallback = false;
-        self
-    }
-
     const fn without_windows(mut self) -> Self {
         self.allow_windows = false;
         self
@@ -309,6 +304,7 @@ impl ExprPolicies {
 type ExprChildren = SmallVec<[ResolvedScopeExpr; 3]>;
 type FrameChildren = SmallVec<[FrameValue; 3]>;
 
+#[allow(clippy::large_enum_variant)]
 enum FrameValue {
     Scalar(ResolvedScopeExpr),
     RowSubquery {
@@ -396,8 +392,8 @@ impl QueryFunctionState {
         std::mem::take(&mut self.windows)
     }
 
-    /// Return the block window for one call, sharing an earlier window the
-    /// way legacy planning does: a call with an inline OVER clause reuses any
+    /// Return the block window for one call, sharing an earlier window when
+    /// it can: a call with an inline OVER clause reuses any
     /// window with the same frame, PARTITION BY, and ORDER BY; a call naming
     /// its window reuses the latest window with that name and frame.
     fn allocate_resolved_window(
@@ -539,11 +535,13 @@ struct FunctionWindowFrame {
 #[derive(Clone)]
 struct NamedFunctionWindow {
     name: String,
+    #[allow(clippy::vec_box)]
     partition_by: Vec<Box<ast::Expr>>,
     order_by: Vec<ast::SortedColumn>,
     frame: Option<ast::FrameClause>,
 }
 
+#[allow(clippy::large_enum_variant)]
 enum FunctionOver {
     Named(String),
     Inline {
@@ -656,6 +654,7 @@ impl FunctionOrderTerm {
     }
 }
 
+#[allow(clippy::large_enum_variant)]
 enum FunctionInput {
     Star,
     Expressions {
@@ -1169,9 +1168,9 @@ impl<'a> ExprFrame<'a> {
                     )
                 }
             }
-            ast::Expr::Raise(_, message) => {
-                (self.next_child == 0).then(|| message.as_deref()).flatten()
-            }
+            ast::Expr::Raise(_, message) => (self.next_child == 0)
+                .then_some(message.as_deref())
+                .flatten(),
             _ => None,
         };
         if child.is_some() {
@@ -1280,7 +1279,7 @@ fn take_expression_operands<'a>(
     }
 
     let mut children = children.into_iter();
-    Ok(syntaxes
+    syntaxes
         .into_iter()
         .map(|syntax| {
             let values = children
@@ -1306,7 +1305,7 @@ fn take_expression_operands<'a>(
             );
             Ok(ExprOperand { expr, components })
         })
-        .collect::<Result<_>>()?)
+        .collect::<Result<_>>()
 }
 
 fn take_scalar_operand(mut operand: ExprOperand) -> Result<ResolvedScopeExpr> {
@@ -1372,12 +1371,14 @@ fn frame_bound_expr(bound: &ast::FrameBound) -> Option<&ast::Expr> {
 }
 
 fn window_function_ignores_frame(name: &ast::Name, argument_count: usize) -> bool {
-    match (normalize_ident(name.as_str()).as_str(), argument_count) {
-        ("row_number" | "rank" | "dense_rank" | "percent_rank" | "cume_dist", 0)
-        | ("ntile", 1)
-        | ("lag" | "lead", 1..=3) => true,
-        _ => false,
-    }
+    matches!(
+        (normalize_ident(name.as_str()).as_str(), argument_count),
+        (
+            "row_number" | "rank" | "dense_rank" | "percent_rank" | "cume_dist",
+            0
+        ) | ("ntile", 1)
+            | ("lag" | "lead", 1..=3)
+    )
 }
 
 fn function_ignores_user_frame(function: &Func) -> bool {
@@ -2221,6 +2222,11 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
         operator: ast::Operator,
         rhs: ResolvedScopeExpr,
     ) -> Result<ResolvedScopeExpr> {
+        let (lhs, rhs) = if operator.is_comparison() {
+            read_other_side_as_array(lhs, rhs)
+        } else {
+            (lhs, rhs)
+        };
         let custom = self.resolve_custom_binary_operator(operator, &lhs, &rhs)?;
         let type_fact = binary_type_fact(operator, &lhs.type_fact, &rhs.type_fact);
         let array_concat = operator == ast::Operator::Concat
@@ -2261,7 +2267,7 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
         {
             crate::bail_parse_error!("row value misused");
         }
-        // Like legacy, BETWEEN on a custom type is `x >= a AND x <= b` with
+        // BETWEEN on a custom type is `x >= a AND x <= b` with
         // the type's own comparison operators.
         if expr.components.len() == 1 {
             let (tested, low, high) = (
@@ -2831,6 +2837,21 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
                 let [inner] = expect_expr_children(children)?;
                 Ok(null_test_expr(inner, false))
             }
+            ast::Expr::Register(index) => {
+                expect_no_expr_children(children)?;
+                let Some(source) = self.register_source else {
+                    crate::bail_parse_error!(
+                        "a register reference is only allowed in an expression over register inputs"
+                    );
+                };
+                let width = self.source(source).map_or(0, |source| source.columns.len());
+                if *index >= width {
+                    crate::bail_parse_error!(
+                        "register {index} is outside the {width} inputs of the expression"
+                    );
+                }
+                self.resolve_atomic_expr(hir::Expr::column(source, *index), scope)
+            }
             ast::Expr::Raise(action, message) => {
                 validate_raise(*action, policy.raise)?;
                 let message = match message {
@@ -2953,6 +2974,7 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
         ))
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn build_function_call(
         &mut self,
         name: &ast::Name,
@@ -3247,7 +3269,7 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
                     &arguments[1],
                     "struct_extract() second argument must be a string literal",
                 )?;
-                // Legacy reports an unknown type and an unknown field alike.
+                // An unknown type and an unknown field report the same error.
                 let unresolved = || {
                     LimboError::ParseError(format!(
                         "cannot resolve struct field '{field_name}' for struct_extract"
@@ -3557,7 +3579,6 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
         Ok(Some((
             hir::FunctionOperation::Sequence(hir::SequenceOperation {
                 kind,
-                user_name,
                 normalized_name,
                 sequence,
                 backing_table,
@@ -3774,6 +3795,65 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
             affinity,
         )
     }
+}
+
+/// When one side of a comparison is declared as an array, such as a `text[]`
+/// column, and the other side is not, the other side is read as an array of
+/// the same element type, the way a write to that column reads it: a text
+/// literal is parsed, a record blob is checked. The two sides then compare
+/// as arrays, so `tags = '{z}'` matches the row whose `tags` holds `{z}`,
+/// with or without an index. A NULL literal is left alone, so `IS NULL`
+/// keeps its own plan. Arrays of a custom type encode their elements on
+/// write, which a comparison does not do, so they are left alone too.
+fn read_other_side_as_array(
+    lhs: ResolvedScopeExpr,
+    rhs: ResolvedScopeExpr,
+) -> (ResolvedScopeExpr, ResolvedScopeExpr) {
+    fn declared_array(operand: &ResolvedScopeExpr) -> Option<hir::DeclaredType> {
+        operand
+            .type_fact
+            .declared
+            .as_ref()
+            .filter(|declared| declared.array_dimensions > 0 && declared.custom_chain.is_empty())
+            .cloned()
+    }
+    fn is_plain_scalar(operand: &ResolvedScopeExpr) -> bool {
+        !operand.type_fact.is_array()
+            && !operand.type_fact.array_rank_unbounded
+            && !matches!(operand.expr, hir::Expr::Literal(ast::Literal::Null))
+    }
+    match (declared_array(&lhs), declared_array(&rhs)) {
+        (Some(declared), None) if is_plain_scalar(&rhs) => {
+            let rhs = read_as_array(rhs, &declared);
+            (lhs, rhs)
+        }
+        (None, Some(declared)) if is_plain_scalar(&lhs) => {
+            let lhs = read_as_array(lhs, &declared);
+            (lhs, rhs)
+        }
+        _ => (lhs, rhs),
+    }
+}
+
+/// `value` cast to the array type `declared` names.
+fn read_as_array(value: ResolvedScopeExpr, declared: &hir::DeclaredType) -> ResolvedScopeExpr {
+    let target = builtin_cast_target(
+        &ast::Type {
+            name: declared.name.clone(),
+            size: None,
+            array_dimensions: declared.array_dimensions,
+        },
+        Vec::new(),
+    );
+    let type_fact = target.type_fact.clone();
+    computed_expr(
+        hir::Expr::Cast {
+            expr: Box::new(value.expr),
+            target,
+        },
+        type_fact,
+        value.collation,
+    )
 }
 
 fn builtin_cast_target(syntax: &ast::Type, parameters: Vec<hir::Expr>) -> hir::TypeName {
@@ -4630,7 +4710,7 @@ fn comparison_component(
     lhs: &ResolvedScopeExpr,
     rhs: &ResolvedScopeExpr,
 ) -> hir::ComparisonComponent {
-    // Like legacy and SQLite's sqlite3CompareAffinity, a numeric affinity on
+    // Like SQLite's sqlite3CompareAffinity, a numeric affinity on
     // either side compares as NUMERIC, even alone: REAL affinity would turn a
     // large integer into a float and lose its exact value.
     let lone = |affinity: Affinity| {
@@ -4727,7 +4807,7 @@ fn in_operand_comparison(
     }
 }
 
-fn supports_row_value_binary_comparison(operator: ast::Operator) -> bool {
+pub(crate) fn supports_row_value_binary_comparison(operator: ast::Operator) -> bool {
     matches!(
         operator,
         ast::Operator::Equals
@@ -4982,17 +5062,6 @@ mod tests {
             missing_column.to_string(),
             "Parse error: no such column: items.absent"
         );
-    }
-
-    #[test]
-    fn clause_policy_can_disable_dqs_fallback() {
-        let error = analyze_expression(
-            &expression("SELECT \"missing\""),
-            &Scope::default(),
-            ExprPolicy::select(DoubleQuotedDml::Enabled).without_dqs_fallback(),
-        )
-        .expect_err("clause policy disables DQS");
-        assert_eq!(error.to_string(), "Parse error: no such column: missing");
     }
 
     #[test]

@@ -185,9 +185,6 @@ pub enum SequenceOperationKind {
 #[derive(Clone, Debug)]
 pub struct SequenceOperation {
     pub kind: SequenceOperationKind,
-    /// The string supplied by SQL, without its outer quotes. Runtime currval
-    /// tracking uses this spelling, including an optional schema prefix.
-    pub user_name: String,
     pub normalized_name: String,
     pub sequence: ResolvedSequence,
     pub backing_table: ResolvedTable,
@@ -347,6 +344,7 @@ pub enum SubqueryExpr {
 
 /// An expression whose names and type-dependent operations are fully resolved.
 #[derive(Clone, Debug)]
+#[allow(clippy::large_enum_variant)]
 pub enum Expr {
     Literal(Literal),
     Parameter(Parameter),
@@ -547,12 +545,13 @@ impl Expr {
         Self::Column(ColumnRef { source, column })
     }
 
-    pub fn rowid(source: SourceId) -> Self {
-        Self::RowId(source)
-    }
-
+    #[cfg(test)]
     pub fn output(output: OutputId) -> Self {
         Self::Output(output)
+    }
+
+    pub fn rowid(source: SourceId) -> Self {
+        Self::RowId(source)
     }
 
     pub(crate) fn child(&self, mut index: usize) -> Option<&Self> {
@@ -667,7 +666,7 @@ impl Expr {
                 _ => None,
             },
             Self::FieldAccess(access) => (index == 0).then_some(access.base.as_ref()),
-            Self::Raise { message, .. } => (index == 0).then(|| message.as_deref()).flatten(),
+            Self::Raise { message, .. } => (index == 0).then_some(message.as_deref()).flatten(),
         }
     }
 

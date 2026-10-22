@@ -8,6 +8,7 @@ use crate::{
 use super::hir::DatabaseId;
 
 /// Owned catalog inputs for one semantic-analysis pass.
+#[derive(Clone)]
 pub(crate) struct SemanticCatalogDatabase {
     pub(crate) id: DatabaseId,
     pub(crate) name: String,
@@ -18,9 +19,30 @@ pub(crate) struct SemanticCatalogDatabase {
 pub(crate) struct SemanticCatalog {
     pub(crate) databases: Vec<SemanticCatalogDatabase>,
     pub(crate) unqualified_database_search_path: Vec<DatabaseId>,
+    /// Whether the connection has a TEMP database with objects of its own.
+    pub(crate) has_temp_database: bool,
+    /// Whether the prepare call set the search path, in which case an
+    /// unqualified name that is in none of its databases is an error.
+    pub(crate) search_path_configured: bool,
 }
 
 impl SemanticCatalog {
+    /// This catalog with the main database's schema replaced by `schema`.
+    pub(crate) fn with_main_schema(&self, schema: Arc<Schema>) -> Self {
+        let mut databases = self.databases.clone();
+        for database in &mut databases {
+            if database.id.index() == MAIN_DB_ID {
+                database.schema = schema.clone();
+            }
+        }
+        Self {
+            databases,
+            unqualified_database_search_path: self.unqualified_database_search_path.clone(),
+            has_temp_database: self.has_temp_database,
+            search_path_configured: self.search_path_configured,
+        }
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn capture(
         main_schema: Arc<Schema>,
@@ -113,6 +135,8 @@ impl SemanticCatalog {
         Ok(Self {
             databases,
             unqualified_database_search_path,
+            has_temp_database: has_temp_schema,
+            search_path_configured: configured_search_path.is_some(),
         })
     }
 }

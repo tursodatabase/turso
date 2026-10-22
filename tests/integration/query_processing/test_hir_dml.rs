@@ -1,6 +1,6 @@
-//! DML prepared through semantic HIR must change the database exactly as the
-//! legacy planner does. Each case runs on two fresh databases, one per
-//! planner, and compares what is left behind.
+//! DML prepared through semantic HIR must change the database exactly as
+//! SQLite does. Each case runs on a fresh database and on SQLite, and
+//! compares what each statement returned and what is left behind.
 
 use crate::common::{limbo_exec_rows, limbo_exec_rows_fallible, sqlite_exec_rows, TempDatabase};
 
@@ -30,9 +30,8 @@ const SETUP: &[&str] = &[
 
 type Rows = Vec<Vec<rusqlite::types::Value>>;
 
-/// A fresh database with the test tables, and a connection to it that
-/// prepares statements through HIR or legacy.
-fn connect(hir: bool) -> (TempDatabase, std::sync::Arc<turso_core::Connection>) {
+/// A fresh database with the test tables, and a connection to it.
+fn connect() -> (TempDatabase, std::sync::Arc<turso_core::Connection>) {
     let db = TempDatabase::builder()
         .with_opts(turso_core::DatabaseOpts::new().with_generated_columns(true))
         .build();
@@ -40,13 +39,24 @@ fn connect(hir: bool) -> (TempDatabase, std::sync::Arc<turso_core::Connection>) 
     for statement in SETUP {
         conn.execute(statement).unwrap();
     }
-    conn.set_experimental_hir(hir);
     (db, conn)
 }
 
+/// SQLite with the test tables, set up like a Turso connection: the bundled
+/// SQLite enforces foreign keys by default and Turso does not, so a run
+/// turns them on itself when it wants them.
+fn connect_sqlite() -> rusqlite::Connection {
+    let conn = rusqlite::Connection::open_in_memory().unwrap();
+    conn.execute_batch("PRAGMA foreign_keys = OFF").unwrap();
+    for statement in SETUP {
+        conn.execute_batch(statement).unwrap();
+    }
+    conn
+}
+
 /// The EXPLAIN QUERY PLAN rows of `sql`, without their ids.
-fn query_plan(hir: bool, sql: &str) -> Vec<String> {
-    let (_db, conn) = connect(hir);
+fn query_plan(sql: &str) -> Vec<String> {
+    let (_db, conn) = connect();
     limbo_exec_rows(&conn, &format!("EXPLAIN QUERY PLAN {sql}"))
         .into_iter()
         .map(|row| match row.last() {
@@ -56,29 +66,117 @@ fn query_plan(hir: bool, sql: &str) -> Vec<String> {
         .collect()
 }
 
-/// Run `statements` on a fresh database with HIR on or off, then return
-/// what each one returned or its error, every row left in the tables, and
-/// the integrity check.
-fn run(hir: bool, statements: &[&str]) -> Vec<Result<Rows, String>> {
-    let (db, conn) = connect(hir);
+/// What a run returns per statement: its rows, or that it failed. SQLite
+/// and Turso word their errors differently, so only the failure counts.
+type Outcome = Result<Rows, ()>;
+
+/// Run `statements` on a fresh database, then return what each one returned
+/// or whether it failed, every row left in the tables, and the integrity
+/// check.
+fn run(statements: &[&str]) -> Vec<Outcome> {
+    let (db, conn) = connect();
+    run_each(statements, |sql| {
+        limbo_exec_rows_fallible(&db, &conn, sql).map_err(|_| ())
+    })
+}
+
+/// The outcomes of `statements` on one engine, in a form SQLite's run can be
+/// compared with: `changes()` after each data change (SQLite leaves it
+/// untouched after other statements, Turso resets it), rows in any order
+/// unless the statement orders them, then the final state.
+fn run_each(statements: &[&str], mut execute: impl FnMut(&str) -> Outcome) -> Vec<Outcome> {
+    let mut results = Vec::new();
+    for statement in statements {
+        let rows = execute(statement);
+        results.push(if statement.contains("ORDER BY") {
+            rows
+        } else {
+            rows.map(sorted)
+        });
+        if is_data_change(statement) {
+            results.push(execute("SELECT changes()"));
+        }
+    }
+    for sql in FINAL_STATE {
+        results.push(execute(sql));
+    }
+    results
+}
+
+fn is_data_change(statement: &str) -> bool {
+    let first_word = statement
+        .trim_start()
+        .split(|c: char| !c.is_alphanumeric())
+        .next()
+        .unwrap_or_default()
+        .to_ascii_uppercase();
+    matches!(
+        first_word.as_str(),
+        "INSERT" | "UPDATE" | "DELETE" | "REPLACE" | "WITH"
+    )
+}
+
+fn sorted(mut rows: Rows) -> Rows {
+    rows.sort_by_key(|row| format!("{row:?}"));
+    rows
+}
+
+/// What is read back after a run.
+const FINAL_STATE: &[&str] = &[
+    "SELECT a, b, c, d, g FROM t ORDER BY a",
+    "SELECT a, b, c, d FROM u ORDER BY a",
+    "SELECT a FROM log ORDER BY a",
+    "PRAGMA integrity_check",
+];
+
+/// Like [`run`], with each failure's message, for runs SQLite cannot mirror.
+fn run_with_errors(statements: &[&str]) -> Vec<Result<Rows, String>> {
+    let (db, conn) = connect();
     let mut results = Vec::new();
     for statement in statements {
         results.push(limbo_exec_rows_fallible(&db, &conn, statement).map_err(|e| e.to_string()));
         results.push(Ok(limbo_exec_rows(&conn, "SELECT changes()")));
     }
-    for sql in [
-        "SELECT a, b, c, d, g FROM t ORDER BY a",
-        "SELECT a, b, c, d FROM u ORDER BY a",
-        "SELECT a FROM log ORDER BY a",
-        "PRAGMA integrity_check",
-    ] {
+    for sql in FINAL_STATE {
         results.push(Ok(limbo_exec_rows(&conn, sql)));
     }
     results
 }
 
+/// The same run on SQLite.
+fn run_sqlite(statements: &[&str]) -> Vec<Outcome> {
+    let conn = connect_sqlite();
+    run_each(statements, |sql| {
+        sqlite_exec_rows_fallible(&conn, sql).map_err(|_| ())
+    })
+}
+
+/// The rows of `sql` on SQLite, or its error.
+fn sqlite_exec_rows_fallible(
+    conn: &rusqlite::Connection,
+    sql: &str,
+) -> Result<Rows, rusqlite::Error> {
+    let mut stmt = conn.prepare(sql)?;
+    let columns = stmt.column_count();
+    let rows = stmt
+        .query_map([], |row| {
+            (0..columns).map(|column| row.get(column)).collect()
+        })?
+        .collect::<Result<Vec<Vec<rusqlite::types::Value>>, _>>()?;
+    Ok(rows)
+}
+
+/// `statements` leave the same results and tables behind on HIR and SQLite.
+fn assert_run_matches_sqlite(statements: &[&str]) {
+    assert_eq!(
+        run(statements),
+        run_sqlite(statements),
+        "results differ from SQLite for {statements:?}"
+    );
+}
+
 #[test]
-fn hir_delete_matches_legacy() {
+fn hir_delete_matches_sqlite() {
     for statements in [
         &["DELETE FROM t WHERE b = 2"][..],
         &["DELETE FROM t WHERE a = 3"],
@@ -186,7 +284,6 @@ fn hir_delete_matches_legacy() {
             "DELETE FROM orphan WHERE x = 1",
             "SELECT x FROM orphan",
         ],
-        // Statements that still go through legacy.
         &["DELETE FROM t WHERE b = 2 RETURNING (SELECT count(*) FROM t)"],
         &[
             "CREATE TRIGGER lg AFTER INSERT ON log BEGIN DELETE FROM u WHERE a = new.a; END",
@@ -201,16 +298,12 @@ fn hir_delete_matches_legacy() {
             "SELECT x FROM child ORDER BY x",
         ],
     ] {
-        assert_eq!(
-            run(true, statements),
-            run(false, statements),
-            "results differ for {statements:?}"
-        );
+        assert_run_matches_sqlite(statements);
     }
 }
 
 #[test]
-fn hir_update_matches_legacy() {
+fn hir_update_matches_sqlite() {
     for statements in [
         &["UPDATE u SET c = 'k' WHERE a = 3"][..],
         &["UPDATE u SET b = b + 10, d = 5 WHERE c = 'yy'"],
@@ -331,7 +424,6 @@ fn hir_update_matches_legacy() {
             "UPDATE u SET a = 1, rowid = 20 WHERE a = 2",
             "UPDATE u SET rowid = 7, a = 8 WHERE a = 20",
         ],
-        // Statements that still go through legacy.
         &[
             "CREATE TABLE r(a INTEGER PRIMARY KEY, b INTEGER NOT NULL ON CONFLICT REPLACE DEFAULT 9)",
             "INSERT INTO r VALUES (1, 1)",
@@ -412,16 +504,12 @@ fn hir_update_matches_legacy() {
             "UPDATE OR IGNORE u SET c = 'k' WHERE a < 3",
         ],
     ] {
-        assert_eq!(
-            run(true, statements),
-            run(false, statements),
-            "results differ for {statements:?}"
-        );
+        assert_run_matches_sqlite(statements);
     }
 }
 
 #[test]
-fn hir_insert_matches_legacy() {
+fn hir_insert_matches_sqlite() {
     for statements in [
         &["INSERT INTO u VALUES (10, 10, 'n', 1.5)"][..],
         &["INSERT INTO u(b, d) VALUES (20, 2), (21, -1), (22, '4')"],
@@ -457,14 +545,14 @@ fn hir_insert_matches_legacy() {
         &["INSERT INTO u(b, c) SELECT g, 'g' FROM t WHERE g > 4 AND EXISTS (SELECT 1 FROM u WHERE u.b = 1)"],
         &[
             "CREATE TRIGGER tr AFTER INSERT ON u BEGIN INSERT INTO log VALUES (new.a); END",
-            "INSERT INTO u(b) SELECT a + 50 FROM t",
+            "INSERT INTO u(b) SELECT a + 50 FROM t ORDER BY a",
         ],
         &[
             "INSERT INTO u(a, b) SELECT a, b + 1000 FROM t WHERE true \
              ON CONFLICT(a) DO UPDATE SET c = 'from t'",
         ],
         &["INSERT OR REPLACE INTO u(a, b, c) SELECT a, a, 'r' FROM t"],
-        &["PRAGMA count_changes = 1", "INSERT INTO u(b) SELECT a + 60 FROM t"],
+        &["PRAGMA count_changes = 1", "INSERT INTO u(b) SELECT a + 60 FROM t ORDER BY a"],
         // UPSERT: the clause naming a conflict decides what happens.
         &["INSERT INTO u VALUES (1, 50, 'n', 0) ON CONFLICT DO NOTHING"],
         &["INSERT INTO u VALUES (1, 50, 'n', 0) ON CONFLICT(a) DO UPDATE SET c = excluded.c || c, d = d + 1"],
@@ -649,12 +737,12 @@ fn hir_insert_matches_legacy() {
         ],
         &["INSERT INTO u(b) VALUES (49)", "SELECT last_insert_rowid()"],
         &["INSERT INTO u(rowid, b) VALUES ('x', 50)"],
-        // Like legacy, a double-quoted name is a string only as a whole
-        // value of a single VALUES row.
+        // A double-quoted name that is no column is a string wherever it
+        // is, as in SQLite with double-quoted strings allowed in DML.
         &["INSERT INTO u(b, c) VALUES (51, \"s\")"],
         &["INSERT INTO u(b, c) VALUES (52, upper(\"s\"))"],
         &["INSERT INTO u(b, c) VALUES (53, upper(\"s\")), (54, \"t\")"],
-        // Statements that still go through legacy.
+        &["INSERT INTO u(b, c) VALUES (55, (SELECT \"s\"))"],
         &["INSERT INTO u(b) SELECT b + 100 FROM u"],
         &["INSERT OR REPLACE INTO u VALUES (1, 60, 'v', 1)"],
         &["INSERT INTO u(b) VALUES (1) ON CONFLICT DO NOTHING"],
@@ -722,15 +810,11 @@ fn hir_insert_matches_legacy() {
             "SELECT * FROM auto",
         ],
     ] {
-        assert_eq!(
-            run(true, statements),
-            run(false, statements),
-            "results differ for {statements:?}"
-        );
+        assert_run_matches_sqlite(statements);
     }
 }
 
-/// Tables with foreign keys for `hir_foreign_keys_match_legacy`, filled
+/// Tables with foreign keys for `hir_foreign_keys_match_sqlite`, filled
 /// with foreign keys off so that some child rows have no parent.
 const FK_SETUP: &[&str] = &[
     "CREATE TABLE p(id INTEGER PRIMARY KEY, k TEXT UNIQUE, a INTEGER, b INTEGER, UNIQUE(a, b))",
@@ -760,7 +844,7 @@ const FK_SETUP: &[&str] = &[
 ];
 
 #[test]
-fn hir_foreign_keys_match_legacy() {
+fn hir_foreign_keys_match_sqlite() {
     for statements in [
         &["DELETE FROM p WHERE id = 5"][..],
         // A new rowid changes a rowid parent key; a row may be its own parent
@@ -921,53 +1005,60 @@ fn hir_foreign_keys_match_legacy() {
                 "SELECT k, up, typeof(k), typeof(up) FROM q ORDER BY rowid",
                 "SELECT * FROM rk ORDER BY rowid",
                 "SELECT * FROM ck ORDER BY rowid",
-                "PRAGMA foreign_key_check",
             ])
             .copied()
             .collect::<Vec<_>>();
-        assert_eq!(
-            run(true, &statements),
-            run(false, &statements),
-            "results differ for {statements:?}"
-        );
+        assert_run_matches_sqlite(&statements);
     }
 }
 
 #[test]
-fn hir_delete_returning_names_columns_like_legacy() {
+fn hir_delete_returning_names_columns() {
     let db = TempDatabase::new_empty();
     let conn = db.connect_limbo();
     conn.execute("CREATE TABLE r(a INTEGER PRIMARY KEY, b TEXT, c REAL)")
         .unwrap();
-    for sql in [
-        "DELETE FROM r RETURNING *",
-        "DELETE FROM r AS x RETURNING x.a, b AS bee, c + 1, rowid",
+    for (sql, expected) in [
+        (
+            "DELETE FROM r RETURNING *",
+            vec![
+                ("a".to_string(), Some("INTEGER".to_string())),
+                ("b".to_string(), Some("TEXT".to_string())),
+                ("c".to_string(), Some("REAL".to_string())),
+            ],
+        ),
+        (
+            // Like SQLite, `rowid` takes the alias column's name and type.
+            "DELETE FROM r AS x RETURNING x.a, b AS bee, c + 1, rowid",
+            vec![
+                ("a".to_string(), Some("INTEGER".to_string())),
+                ("bee".to_string(), Some("TEXT".to_string())),
+                ("c + 1".to_string(), None),
+                ("a".to_string(), Some("INTEGER".to_string())),
+            ],
+        ),
     ] {
-        let metadata = |hir: bool| {
-            conn.set_experimental_hir(hir);
-            let stmt = conn.prepare(sql).unwrap();
-            (0..stmt.num_columns())
-                .map(|column| {
-                    (
-                        stmt.get_column_name(column).to_string(),
-                        stmt.get_column_decltype(column),
-                    )
-                })
-                .collect::<Vec<_>>()
-        };
-        assert_eq!(metadata(true), metadata(false), "{sql}");
+        let stmt = conn.prepare(sql).unwrap();
+        let metadata = (0..stmt.num_columns())
+            .map(|column| {
+                (
+                    stmt.get_column_name(column).to_string(),
+                    stmt.get_column_decltype(column),
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(metadata, expected, "{sql}");
     }
 }
 
 #[test]
 fn hir_delete_returning_commits_when_reset_after_the_first_row() {
-    let run = |hir: bool| {
+    let run = || {
         let db = TempDatabase::new_empty();
         let conn = db.connect_limbo();
         conn.execute("CREATE TABLE r(a INTEGER PRIMARY KEY)")
             .unwrap();
         conn.execute("INSERT INTO r VALUES (1), (2), (3)").unwrap();
-        conn.set_experimental_hir(hir);
         let mut stmt = conn
             .prepare("DELETE FROM r WHERE a > 1 RETURNING a")
             .unwrap();
@@ -984,12 +1075,12 @@ fn hir_delete_returning_commits_when_reset_after_the_first_row() {
         drop(stmt);
         limbo_exec_rows(&conn, "SELECT a FROM r ORDER BY a")
     };
-    assert_eq!(run(true), run(false));
+    assert_eq!(run(), [[rusqlite::types::Value::Integer(1)]]);
 }
 
 #[test]
-fn hir_delete_binds_parameters_like_legacy() {
-    let run = |hir: bool| {
+fn hir_delete_binds_parameters() {
+    let run = || {
         let db = TempDatabase::new_empty();
         let conn = db.connect_limbo();
         conn.execute("CREATE TABLE p(a INTEGER PRIMARY KEY, b TEXT)")
@@ -997,7 +1088,6 @@ fn hir_delete_binds_parameters_like_legacy() {
         conn.execute("CREATE INDEX p_b ON p(b)").unwrap();
         conn.execute("INSERT INTO p VALUES (1, 'x'), (2, 'y'), (3, 'x'), (4, 'z')")
             .unwrap();
-        conn.set_experimental_hir(hir);
         let mut stmt = conn
             .prepare("DELETE FROM p WHERE b = ?1 OR a = :id")
             .unwrap();
@@ -1008,7 +1098,13 @@ fn hir_delete_binds_parameters_like_legacy() {
         stmt.run_ignore_rows().unwrap();
         limbo_exec_rows(&conn, "SELECT a, b FROM p ORDER BY a")
     };
-    assert_eq!(run(true), run(false));
+    assert_eq!(
+        run(),
+        [[
+            rusqlite::types::Value::Integer(2),
+            rusqlite::types::Value::Text("y".into()),
+        ]]
+    );
 }
 
 /// Subqueries in an UPDATE's SET and WHERE see the table as SQLite's do.
@@ -1021,7 +1117,6 @@ fn hir_update_subqueries_match_sqlite() {
     ];
     let db = TempDatabase::new_empty();
     let conn = db.connect_limbo();
-    conn.set_experimental_hir(true);
     let sqlite = rusqlite::Connection::open_in_memory().unwrap();
     for sql in setup {
         conn.execute(sql).unwrap();
@@ -1062,7 +1157,6 @@ fn hir_insert_values_subqueries_match_sqlite() {
     ];
     let db = TempDatabase::new_empty();
     let conn = db.connect_limbo();
-    conn.set_experimental_hir(true);
     let sqlite = rusqlite::Connection::open_in_memory().unwrap();
     for sql in setup {
         conn.execute(sql).unwrap();
@@ -1104,7 +1198,6 @@ fn hir_returning_subqueries_match_sqlite() {
     ];
     let db = TempDatabase::new_empty();
     let conn = db.connect_limbo();
-    conn.set_experimental_hir(true);
     let sqlite = rusqlite::Connection::open_in_memory().unwrap();
     for sql in setup {
         conn.execute(sql).unwrap();
@@ -1151,7 +1244,6 @@ fn hir_generated_columns_match_sqlite() {
         .with_opts(turso_core::DatabaseOpts::new().with_generated_columns(true))
         .build();
     let conn = db.connect_limbo();
-    conn.set_experimental_hir(true);
     let sqlite = rusqlite::Connection::open_in_memory().unwrap();
     for sql in [
         "CREATE TABLE g(a INTEGER PRIMARY KEY, b, c AS (b * 2), d TEXT, e AS (c + length(d)) NOT NULL, f AS (a + 100), CHECK (c < 100))",
@@ -1215,7 +1307,6 @@ fn hir_generated_columns_match_sqlite() {
 fn hir_foreign_key_actions_match_sqlite() {
     let db = TempDatabase::new_empty();
     let conn = db.connect_limbo();
-    conn.set_experimental_hir(true);
     let sqlite = rusqlite::Connection::open_in_memory().unwrap();
     for sql in [
         "PRAGMA foreign_keys = ON",
@@ -1363,7 +1454,6 @@ fn hir_foreign_key_actions_match_sqlite() {
 fn hir_upsert_other_conflicts_match_sqlite() {
     let db = TempDatabase::new_empty();
     let conn = db.connect_limbo();
-    conn.set_experimental_hir(true);
     let sqlite = rusqlite::Connection::open_in_memory().unwrap();
     for sql in [
         "CREATE TABLE uo(a INTEGER PRIMARY KEY, b UNIQUE, c)",
@@ -1396,7 +1486,6 @@ fn hir_upsert_other_conflicts_match_sqlite() {
 fn hir_upsert_triggers_match_sqlite() {
     let db = TempDatabase::new_empty();
     let conn = db.connect_limbo();
-    conn.set_experimental_hir(true);
     let sqlite = rusqlite::Connection::open_in_memory().unwrap();
     for sql in [
         "CREATE TABLE t(a INTEGER PRIMARY KEY, b UNIQUE, c, n DEFAULT 0)",
@@ -1426,7 +1515,6 @@ fn hir_upsert_triggers_match_sqlite() {
 fn hir_upsert_moving_rows_match_sqlite() {
     let db = TempDatabase::new_empty();
     let conn = db.connect_limbo();
-    conn.set_experimental_hir(true);
     let sqlite = rusqlite::Connection::open_in_memory().unwrap();
     for sql in [
         "CREATE TABLE um(a INTEGER PRIMARY KEY, b UNIQUE, c)",
@@ -1473,7 +1561,6 @@ fn hir_upsert_moving_rows_match_sqlite() {
 fn hir_update_through_a_changing_index_matches_sqlite() {
     let db = TempDatabase::new_empty();
     let conn = db.connect_limbo();
-    conn.set_experimental_hir(true);
     let sqlite = rusqlite::Connection::open_in_memory().unwrap();
     for sql in [
         "CREATE TABLE t(id INTEGER PRIMARY KEY, a, b, c UNIQUE ON CONFLICT REPLACE)",
@@ -1504,7 +1591,6 @@ fn hir_update_through_a_changing_index_matches_sqlite() {
 fn hir_dml_keeps_materialized_views_up_to_date() {
     let db = TempDatabase::builder().with_views(true).build();
     let conn = db.connect_limbo();
-    conn.set_experimental_hir(true);
     let sqlite = rusqlite::Connection::open_in_memory().unwrap();
     for sql in [
         "CREATE TABLE t(id INTEGER PRIMARY KEY, a, b, c UNIQUE ON CONFLICT REPLACE)",
@@ -1545,7 +1631,7 @@ fn hir_dml_keeps_materialized_views_up_to_date() {
 /// again; CHECK constraints and foreign keys compare stored values; index
 /// expressions, RETURNING, `excluded` and triggers see decoded values.
 #[test]
-fn hir_custom_type_writes_match_legacy() {
+fn hir_custom_type_writes_keep_their_results() {
     let statements = [
         "CREATE TYPE cents BASE integer ENCODE value * 100 DECODE value / 100",
         "CREATE TYPE rev BASE text ENCODE upper(value) DECODE lower(value)",
@@ -1607,21 +1693,18 @@ fn hir_custom_type_writes_match_legacy() {
         "DELETE FROM p WHERE id = 1",
         "SELECT count(*) FROM c",
     ];
-    let run = |hir: bool| {
-        let db = TempDatabase::builder()
-            .with_opts(turso_core::DatabaseOpts::new().with_custom_types(true))
-            .build();
-        let conn = db.connect_limbo();
-        conn.set_experimental_hir(hir);
-        statements
-            .iter()
-            .map(|sql| limbo_exec_rows_fallible(&db, &conn, sql).map_err(|e| e.to_string()))
-            .collect::<Vec<_>>()
-    };
-    let (legacy, hir) = (run(false), run(true));
-    for ((sql, legacy), hir) in statements.iter().zip(legacy).zip(hir) {
-        assert_eq!(legacy, hir, "{sql}");
-    }
+    let db = TempDatabase::builder()
+        .with_opts(turso_core::DatabaseOpts::new().with_custom_types(true))
+        .build();
+    let conn = db.connect_limbo();
+    let results = statements
+        .iter()
+        .map(|sql| limbo_exec_rows_fallible(&db, &conn, sql).map_err(|e| e.to_string()))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        format!("{results:?}"),
+        r#"[Ok([]), Ok([]), Ok([]), Ok([]), Ok([]), Ok([]), Ok([]), Ok([]), Ok([]), Ok([[Integer(1), Text("hello")], [Integer(2), Text("world")]]), Err("cannot store TEXT value in INTEGER column p.id (19)"), Ok([]), Err("FOREIGN KEY constraint failed"), Err("CHECK constraint failed: amount < CAST(50 AS cents)"), Err("NOT NULL constraint failed: c.t"), Ok([]), Err("Parse error: cannot ORDER BY column 'id' of type 'cents': type does not declare OPERATOR '<'"), Err("Parse error: cannot ORDER BY column 'id' of type 'cents': type does not declare OPERATOR '<'"), Ok([[Integer(1), Text("hello")]]), Ok([[Integer(1), Integer(1), Integer(20), Integer(7)]]), Ok([[Text("hello:1")], [Text("world:2")]]), Ok([]), Ok([[Integer(2), Text("again")]]), Ok([[Integer(2), Text("again")]]), Err("cannot store TEXT value in INTEGER column p.id (19)"), Err("CHECK constraint failed: amount < CAST(50 AS cents)"), Ok([[Integer(25)]]), Err("FOREIGN KEY constraint failed"), Ok([]), Ok([]), Ok([[Integer(9), Integer(1), Integer(25), Null]]), Err("Parse error: cannot ORDER BY column 'id' of type 'cents': type does not declare OPERATOR '<'"), Ok([[Integer(9), Integer(1), Integer(25), Null]]), Ok([[Text("hello:1")], [Text("world:2")], [Text("world>again")]]), Ok([]), Ok([]), Ok([]), Ok([[Text("a"), Integer(6), Integer(2)]]), Ok([[Text("a"), Integer(6), Integer(8)]]), Err("NOT NULL constraint failed: u.w"), Err("cannot store TEXT value in INTEGER column u.w (19)"), Ok([]), Ok([[Text("a"), Text("61"), Integer(6), Integer(8)], [Text("c"), Text("63"), Integer(1), Integer(1)]]), Ok([[Text("hello:1")], [Text("world:2")], [Text("world>again")], [Text("a1>a6")], [Text("a6>a6")], [Text("b1>c1")]]), Ok([]), Ok([[Integer(9), Integer(1), Integer(25), Null]]), Ok([]), Ok([[Integer(1), Text("{a,b}"), Text("{\"{1\",\"2}\",\"{3}\"}")], [Integer(2), Text("{c}"), Null]]), Err("cannot store non-array value in TEXT column arr.tags (19)"), Err("NOT NULL constraint failed: arr.tags"), Ok([[Text("{z,b}")]]), Ok([]), Ok([]), Ok([[Integer(1), Text("{z,b}"), Text("{\"{1\",\"2}\",\"{3}\"}"), Text("b")], [Integer(2), Text("{d}"), Text("{\"{9}\"}"), Null]]), Ok([]), Ok([[Integer(0)]])]"#
+    );
 }
 
 /// BEFORE triggers and virtual columns of a table with custom types read
@@ -1639,7 +1722,6 @@ fn hir_custom_type_triggers_and_virtual_columns_read_sql_values() {
         )
         .build();
     let conn = db.connect_limbo();
-    conn.set_experimental_hir(true);
     for sql in [
         "CREATE TYPE cents BASE integer ENCODE value * 100 DECODE value / 100",
         "CREATE TABLE t(id INTEGER PRIMARY KEY, a cents, b cents, v INTEGER AS (a + b)) STRICT",
@@ -1684,7 +1766,7 @@ fn hir_custom_type_triggers_and_virtual_columns_read_sql_values() {
 /// comparison operators, and an array of a custom type has its elements
 /// decoded for display, as legacy does.
 #[test]
-fn hir_custom_type_queries_match_legacy() {
+fn hir_custom_type_queries_decode_once() {
     let statements = [
         "CREATE TABLE t(id INTEGER PRIMARY KEY, val numeric(10,2), grp TEXT, flag INTEGER) STRICT",
         "INSERT INTO t VALUES (1, 100, 'a', 1), (2, 9, 'a', 0), (3, 50, 'b', 1), (4, -5, 'b', 0)",
@@ -1698,22 +1780,21 @@ fn hir_custom_type_queries_match_legacy() {
         "SELECT id, c FROM a ORDER BY id",
         "SELECT c FROM a ORDER BY id DESC",
     ];
-    let run = |hir: bool| {
-        let db = TempDatabase::builder()
-            .with_opts(turso_core::DatabaseOpts::new().with_custom_types(true))
-            .build();
-        let conn = db.connect_limbo();
-        conn.set_experimental_hir(hir);
-        statements
-            .iter()
-            .map(|sql| limbo_exec_rows_fallible(&db, &conn, sql).map_err(|e| e.to_string()))
-            .collect::<Vec<_>>()
-    };
-    let (legacy, hir) = (run(false), run(true));
-    for ((sql, legacy), hir) in statements.iter().zip(legacy).zip(hir) {
-        assert!(legacy.is_ok(), "{sql}: {legacy:?}");
-        assert_eq!(legacy, hir, "{sql}");
+    let db = TempDatabase::builder()
+        .with_opts(turso_core::DatabaseOpts::new().with_custom_types(true))
+        .build();
+    let conn = db.connect_limbo();
+    let results = statements
+        .iter()
+        .map(|sql| limbo_exec_rows_fallible(&db, &conn, sql).map_err(|e| e.to_string()))
+        .collect::<Vec<_>>();
+    for (sql, result) in statements.iter().zip(&results) {
+        assert!(result.is_ok(), "{sql}: {result:?}");
     }
+    assert_eq!(
+        format!("{results:?}"),
+        r#"[Ok([]), Ok([]), Ok([[Text("a"), Real(109.0), Text("100.00")], [Text("b"), Real(45.0), Text("50.00")]]), Ok([[Text("a"), Real(100.0)], [Text("b"), Real(50.0)]]), Ok([[Integer(2), Text("9.00")], [Integer(3), Text("50.00")]]), Ok([[Integer(1)], [Integer(4)]]), Ok([]), Ok([]), Ok([]), Ok([[Integer(1), Text("{1,2,3}")], [Integer(2), Text("{7}")]]), Ok([[Text("{7}")], [Text("{1,2,3}")]])]"#
+    );
 }
 
 /// Change data capture through HIR writes one row per changed row and one
@@ -1725,7 +1806,6 @@ fn hir_custom_type_queries_match_legacy() {
 fn hir_change_capture_records_each_change_once() {
     let db = TempDatabase::new_empty();
     let conn = db.connect_limbo();
-    conn.set_experimental_hir(true);
     for sql in [
         "CREATE TABLE p(id INTEGER PRIMARY KEY, v)",
         "CREATE TABLE l(m)",
@@ -1811,7 +1891,6 @@ fn hir_change_capture_records_each_change_once() {
 fn hir_update_from_returning_subqueries_match_sqlite() {
     let db = TempDatabase::new_empty();
     let conn = db.connect_limbo();
-    conn.set_experimental_hir(true);
     let sqlite = rusqlite::Connection::open_in_memory().unwrap();
     for sql in [
         "CREATE TABLE t(id INTEGER PRIMARY KEY, v INTEGER)",
@@ -1839,7 +1918,6 @@ fn hir_update_from_returning_subqueries_match_sqlite() {
 fn hir_update_from_moving_rows_match_sqlite() {
     let db = TempDatabase::new_empty();
     let conn = db.connect_limbo();
-    conn.set_experimental_hir(true);
     let sqlite = rusqlite::Connection::open_in_memory().unwrap();
     for sql in [
         "CREATE TABLE t(id INTEGER PRIMARY KEY, v, w UNIQUE)",
@@ -1877,7 +1955,6 @@ fn hir_update_from_moving_rows_match_sqlite() {
 fn hir_rowid_default_matches_sqlite() {
     let db = TempDatabase::new_empty();
     let conn = db.connect_limbo();
-    conn.set_experimental_hir(true);
     let sqlite = rusqlite::Connection::open_in_memory().unwrap();
     for sql in [
         "CREATE TABLE d1(id INTEGER PRIMARY KEY DEFAULT 5, v)",
@@ -1913,7 +1990,6 @@ fn hir_upsert_on_rowid_matches_sqlite() {
     ];
     let db = TempDatabase::new_empty();
     let conn = db.connect_limbo();
-    conn.set_experimental_hir(true);
     let sqlite = rusqlite::Connection::open_in_memory().unwrap();
     for sql in statements {
         conn.execute(sql).unwrap();
@@ -1929,35 +2005,53 @@ fn hir_upsert_on_rowid_matches_sqlite() {
 }
 
 #[test]
-fn hir_delete_errors_match_legacy() {
+fn hir_delete_errors_name_what_is_wrong() {
     let db = TempDatabase::new_empty();
-    let legacy = db.connect_limbo();
-    legacy
-        .execute("CREATE TABLE t(a INTEGER PRIMARY KEY, b)")
-        .unwrap();
-    legacy.set_experimental_hir(false);
     let hir = db.connect_limbo();
-    hir.set_experimental_hir(true);
-    for sql in [
-        "DELETE FROM nosuch",
-        "DELETE FROM main.nosuch",
-        "DELETE FROM nosuch.t",
-        "DELETE FROM t WHERE nosuch = 1",
-        "DELETE FROM sqlite_schema",
-        "DELETE FROM t INDEXED BY nosuch",
-        "DELETE FROM t RETURNING t.*",
-        "UPDATE sqlite_schema SET name = 'x'",
-        "INSERT INTO sqlite_master VALUES (1, 2, 3, 4, 5)",
-        "INSERT INTO t VALUES (1, 2) ON CONFLICT(b) DO NOTHING",
-        "INSERT INTO t VALUES (1, 2) ON CONFLICT(a NULLS FIRST) DO NOTHING",
+    hir.execute("CREATE TABLE t(a INTEGER PRIMARY KEY, b)")
+        .unwrap();
+    for (sql, message) in [
+        ("DELETE FROM nosuch", "Parse error: no such table: nosuch"),
+        (
+            "DELETE FROM main.nosuch",
+            "Parse error: no such table: main.nosuch",
+        ),
+        ("DELETE FROM nosuch.t", "no such database: nosuch"),
+        (
+            "DELETE FROM t WHERE nosuch = 1",
+            "Parse error: no such column: nosuch",
+        ),
+        (
+            "DELETE FROM sqlite_schema",
+            "Parse error: table sqlite_schema may not be modified",
+        ),
+        (
+            "DELETE FROM t INDEXED BY nosuch",
+            "Parse error: no such index: nosuch",
+        ),
+        (
+            "DELETE FROM t RETURNING t.*",
+            "Parse error: RETURNING may not use \"TABLE.*\" wildcards",
+        ),
+        (
+            "UPDATE sqlite_schema SET name = 'x'",
+            "Parse error: table sqlite_schema may not be modified",
+        ),
+        (
+            "INSERT INTO sqlite_master VALUES (1, 2, 3, 4, 5)",
+            "Parse error: table sqlite_master may not be modified",
+        ),
+        (
+            "INSERT INTO t VALUES (1, 2) ON CONFLICT(b) DO NOTHING",
+            "Parse error: ON CONFLICT clause does not match any PRIMARY KEY or UNIQUE constraint",
+        ),
+        (
+            "INSERT INTO t VALUES (1, 2) ON CONFLICT(a NULLS FIRST) DO NOTHING",
+            "Parse error: unsupported use of NULLS FIRST",
+        ),
     ] {
-        let legacy_error = legacy
-            .prepare(sql)
-            .err()
-            .unwrap_or_else(|| panic!("legacy rejects {sql}"))
-            .to_string();
-        let hir_error = hir.prepare(sql).err().expect("HIR rejects").to_string();
-        assert_eq!(hir_error, legacy_error, "{sql}");
+        let hir_error = hir.prepare(sql).expect_err("HIR rejects").to_string();
+        assert_eq!(hir_error, message, "{sql}");
     }
     // Legacy differs from SQLite on these: it reports a missing constraint
     // for an unknown column, accepts COLLATE on the INTEGER PRIMARY KEY and
@@ -1978,12 +2072,8 @@ fn hir_delete_errors_match_legacy() {
         ),
         ("DELETE FROM t WHERE x.b = 1", "no such column: x.b"),
     ] {
-        let sqlite_error = sqlite
-            .prepare(sql)
-            .err()
-            .expect("SQLite rejects")
-            .to_string();
-        let hir_error = hir.prepare(sql).err().expect("HIR rejects").to_string();
+        let sqlite_error = sqlite.prepare(sql).expect_err("SQLite rejects").to_string();
+        let hir_error = hir.prepare(sql).expect_err("HIR rejects").to_string();
         assert!(
             sqlite_error.contains(message),
             "{sql}: SQLite {sqlite_error}"
@@ -2038,7 +2128,6 @@ fn hir_dml_writes_fts_indexes() {
         .with_opts(turso_core::DatabaseOpts::new().with_index_method(true))
         .build();
     let conn = db.connect_limbo();
-    conn.set_experimental_hir(true);
     for sql in [
         "CREATE TABLE docs(id INTEGER PRIMARY KEY, body TEXT)",
         "CREATE INDEX docs_fts ON docs USING fts(body)",
@@ -2078,7 +2167,6 @@ fn hir_inserts_into_without_rowid_tables() {
         .with_opts(turso_core::DatabaseOpts::new().with_without_rowid(true))
         .build();
     let conn = db.connect_limbo();
-    conn.set_experimental_hir(true);
     for sql in [
         "CREATE TABLE w(b, a TEXT PRIMARY KEY) WITHOUT ROWID",
         "CREATE TABLE w2(a INTEGER, b TEXT, c, PRIMARY KEY (b, a)) WITHOUT ROWID",
@@ -2127,7 +2215,7 @@ fn hir_inserts_into_without_rowid_tables() {
 /// capture still records the ALTER statement as the new `sql` value, so the
 /// schema, the rows and the captured changes match legacy.
 #[test]
-fn hir_alter_table_schema_updates_match_legacy() {
+fn hir_alter_table_schema_updates_are_recorded() {
     let statements = [
         "PRAGMA capture_data_changes_conn('full')",
         "CREATE TABLE w(a INTEGER PRIMARY KEY, b TEXT, c INT)",
@@ -2143,21 +2231,9 @@ fn hir_alter_table_schema_updates_match_legacy() {
          bin_record_json_object(table_columns_json_array('sqlite_schema'), updates) \
          FROM turso_cdc WHERE table_name = 'sqlite_schema' ORDER BY change_id",
     ];
-    assert_eq!(run(true, &statements), run(false, &statements));
-
-    let program = |hir: bool| {
-        let db = TempDatabase::new_empty();
-        let conn = db.connect_limbo();
-        conn.execute("PRAGMA capture_data_changes_conn('full')")
-            .unwrap();
-        conn.execute("CREATE TABLE w(a, b, c)").unwrap();
-        conn.set_experimental_hir(hir);
-        limbo_exec_rows(&conn, "EXPLAIN ALTER TABLE w DROP COLUMN b")
-    };
-    assert_ne!(
-        program(true),
-        program(false),
-        "HIR lowers the schema-row UPDATE itself"
+    assert_eq!(
+        format!("{:?}", run_with_errors(&statements)),
+        r#"[Ok([]), Ok([[Integer(1)]]), Ok([]), Ok([[Integer(1)]]), Ok([]), Ok([[Integer(2)]]), Ok([]), Ok([[Integer(0)]]), Ok([]), Ok([[Integer(0)]]), Ok([]), Ok([[Integer(0)]]), Ok([]), Ok([[Integer(0)]]), Ok([]), Ok([[Integer(0)]]), Ok([[Integer(1), Text("x"), Text("z")], [Integer(2), Text("y"), Text("z")]]), Ok([[Integer(0)]]), Ok([[Text("table"), Text("__turso_internal_seq___turso_internal_autoincrement_turso_cdc"), Text("__turso_internal_seq___turso_internal_autoincrement_turso_cdc"), Text("CREATE TABLE \"__turso_internal_seq___turso_internal_autoincrement_turso_cdc\"(value INTEGER PRIMARY KEY,is_called INTEGER,start INTEGER,inc INTEGER,min INTEGER,max INTEGER,cycle INTEGER)")], [Text("table"), Text("log"), Text("log"), Text("CREATE TABLE log (a INTEGER)")], [Text("index"), Text("sqlite_autoindex_turso_cdc_version_1"), Text("turso_cdc_version"), Null], [Text("table"), Text("sqlite_sequence"), Text("sqlite_sequence"), Text("CREATE TABLE sqlite_sequence(name,seq)")], [Text("table"), Text("t"), Text("t"), Text("CREATE TABLE t (a INTEGER PRIMARY KEY, b INTEGER, c TEXT, d REAL, g AS (b * 2) VIRTUAL)")], [Text("index"), Text("t_b"), Text("t"), Text("CREATE INDEX t_b ON t (b)")], [Text("index"), Text("t_c_desc"), Text("t"), Text("CREATE INDEX t_c_desc ON t (c DESC, b)")], [Text("index"), Text("t_d"), Text("t"), Text("CREATE INDEX t_d ON t (d)")], [Text("index"), Text("t_expr"), Text("t"), Text("CREATE INDEX t_expr ON t (b + length (c))")], [Text("index"), Text("t_g"), Text("t"), Text("CREATE INDEX t_g ON t (g)")], [Text("index"), Text("t_partial"), Text("t"), Text("CREATE INDEX t_partial ON t (c) WHERE t.b > 2")], [Text("index"), Text("t_unique"), Text("t"), Text("CREATE UNIQUE INDEX t_unique ON t (c, d)")], [Text("table"), Text("turso_cdc"), Text("turso_cdc"), Text("CREATE TABLE turso_cdc (change_id INTEGER PRIMARY KEY AUTOINCREMENT, change_time INTEGER, change_txn_id INTEGER, change_type INTEGER, table_name TEXT, id, \"before\" BLOB, \"after\" BLOB, updates BLOB)")], [Text("table"), Text("turso_cdc_version"), Text("turso_cdc_version"), Text("CREATE TABLE turso_cdc_version (table_name TEXT PRIMARY KEY, version TEXT NOT NULL)")], [Text("table"), Text("u"), Text("u"), Text("CREATE TABLE u (a INTEGER PRIMARY KEY, b INTEGER NOT NULL, c TEXT, d REAL)")], [Text("index"), Text("u_b"), Text("u"), Text("CREATE UNIQUE INDEX u_b ON u (b)")], [Text("index"), Text("u_c"), Text("u"), Text("CREATE INDEX u_c ON u (c, d DESC)")], [Text("index"), Text("u_expr"), Text("u"), Text("CREATE INDEX u_expr ON u (c || 'x', b)")], [Text("index"), Text("u_partial"), Text("u"), Text("CREATE INDEX u_partial ON u (c) WHERE u.d > 0")], [Text("index"), Text("u_partial_unique"), Text("u"), Text("CREATE UNIQUE INDEX u_partial_unique ON u (d) WHERE c = 'p'")], [Text("table"), Text("w2"), Text("w2"), Text("CREATE TABLE w2 (a INTEGER PRIMARY KEY, bb TEXT, d TEXT DEFAULT 'z')")], [Text("index"), Text("w_b"), Text("w2"), Text("CREATE INDEX w_b ON w2 (bb)")]]), Ok([[Integer(0)]]), Ok([[Integer(1), Text("sqlite_schema"), Integer(21), Null], [Integer(1), Text("sqlite_schema"), Integer(22), Null], [Integer(0), Text("sqlite_schema"), Integer(21), Text("{\"type\":0,\"name\":0,\"tbl_name\":0,\"rootpage\":0,\"sql\":1}")], [Integer(0), Text("sqlite_schema"), Integer(21), Text("{\"type\":0,\"name\":0,\"tbl_name\":0,\"rootpage\":0,\"sql\":1}")]]), Ok([[Integer(0)]]), Ok([[Integer(1), Integer(1), Text("x"), Real(1.0), Integer(2)], [Integer(2), Integer(2), Text("yy"), Real(2.5), Integer(4)], [Integer(3), Integer(3), Text("z"), Real(3.0), Integer(6)], [Integer(4), Null, Null, Null, Null], [Integer(5), Integer(5), Text("x"), Real(5.5), Integer(10)], [Integer(6), Integer(2), Text("w"), Real(-0.0), Integer(4)], [Integer(7), Integer(7), Text("yy"), Real(7.0), Integer(14)]]), Ok([[Integer(1), Integer(1), Text("x"), Real(1.0)], [Integer(2), Integer(2), Text("yy"), Real(-1.0)], [Integer(3), Integer(3), Text("z"), Real(3.0)], [Integer(4), Integer(4), Null, Null], [Integer(5), Integer(5), Text("p"), Real(5.0)], [Integer(6), Integer(6), Text("q"), Real(5.0)]]), Ok([]), Ok([[Text("ok")]])]"#
     );
 }
 
@@ -2165,7 +2241,7 @@ fn hir_alter_table_schema_updates_match_legacy() {
 /// the new table's column names and types come from HIR's outputs, and its
 /// rows from HIR's SELECT, matching legacy.
 #[test]
-fn hir_create_table_as_select_matches_legacy() {
+fn hir_create_table_as_select_names_and_types_its_columns() {
     let statements = [
         "CREATE TABLE s(a INTEGER PRIMARY KEY, b TEXT, c REAL, d, e NUMERIC, f BLOB)",
         "INSERT INTO s VALUES (1, 'x', 1.5, NULL, 10, x'01'), (2, 'y', 2.5, 'q', 20, NULL), \
@@ -2191,26 +2267,17 @@ fn hir_create_table_as_select_matches_legacy() {
         "SELECT * FROM c10 ORDER BY 1",
         "SELECT typeof(a), typeof(b), typeof(e) FROM c1 ORDER BY a",
     ];
-    assert_eq!(run(true, &statements), run(false, &statements));
-
-    let program = |hir: bool| {
-        let db = TempDatabase::new_empty();
-        let conn = db.connect_limbo();
-        conn.execute("CREATE TABLE s(a, b)").unwrap();
-        conn.set_experimental_hir(hir);
-        limbo_exec_rows(
-            &conn,
-            "EXPLAIN CREATE TABLE c AS SELECT a, count(*) FROM s GROUP BY a",
-        )
-    };
-    assert_ne!(program(true), program(false), "HIR plans the SELECT itself");
+    assert_eq!(
+        format!("{:?}", run_with_errors(&statements)),
+        r#"[Ok([]), Ok([[Integer(7)]]), Ok([]), Ok([[Integer(3)]]), Ok([]), Ok([[Integer(3)]]), Ok([]), Ok([[Integer(3)]]), Ok([]), Ok([[Integer(3)]]), Ok([]), Ok([[Integer(3)]]), Ok([]), Ok([[Integer(3)]]), Ok([]), Ok([[Integer(3)]]), Ok([]), Ok([[Integer(3)]]), Ok([]), Ok([[Integer(3)]]), Ok([]), Ok([[Integer(3)]]), Ok([]), Ok([[Integer(3)]]), Ok([[Text("c1"), Text("CREATE TABLE c1(a INT,b TEXT,c REAL,d,e NUM,f)")], [Text("c10"), Text("CREATE TABLE c10(column1,column2)")], [Text("c2"), Text("CREATE TABLE c2(a INT,bee TEXT,\"c * 2\",\"1\",\"'lit'\",\"a + 1\",\"a || b\",\"count(*) OVER ()\")")], [Text("c3"), Text("CREATE TABLE c3(b TEXT,\"count(*)\",\"sum(c)\",\"max(a)\")")], [Text("c4"), Text("CREATE TABLE c4(a INT,\"a:1\" INT,\"a:2\" TEXT)")], [Text("c5"), Text("CREATE TABLE c5(a INT,b TEXT)")], [Text("c6"), Text("CREATE TABLE c6(a INT)")], [Text("c7"), Text("CREATE TABLE c7(a INT,e NUM)")], [Text("c8"), Text("CREATE TABLE c8(t TEXT,m,e NUM)")], [Text("c9"), Text("CREATE TABLE c9(a INT,b TEXT,c REAL,d,e NUM,f)")]]), Ok([[Integer(3)]]), Ok([[Integer(1), Text("x"), Real(3.0), Integer(1), Text("lit"), Integer(2), Text("1x"), Integer(3)], [Integer(2), Text("y"), Real(5.0), Integer(1), Text("lit"), Integer(3), Text("2y"), Integer(3)], [Integer(3), Null, Null, Integer(1), Text("lit"), Integer(4), Null, Integer(3)]]), Ok([[Integer(3)]]), Ok([[Null, Integer(1), Null, Integer(3)], [Text("x"), Integer(1), Real(1.5), Integer(1)], [Text("y"), Integer(1), Real(2.5), Integer(2)]]), Ok([[Integer(3)]]), Ok([[Integer(1), Integer(1), Text("x")], [Integer(2), Integer(2), Text("y")], [Integer(3), Integer(3), Null]]), Ok([[Integer(3)]]), Ok([[Integer(1), Text("y")], [Integer(2), Null]]), Ok([[Integer(3)]]), Ok([[Null], [Integer(1)], [Real(1.5)], [Integer(2)], [Real(2.5)], [Integer(3)]]), Ok([[Integer(3)]]), Ok([[Text("1"), Real(2.5), Integer(10)], [Text("2"), Real(2.5), Integer(20)], [Text("3"), Real(2.5), Integer(30)]]), Ok([[Integer(3)]]), Ok([[Integer(1), Text("a")], [Integer(2), Text("b")]]), Ok([[Integer(3)]]), Ok([[Text("integer"), Text("text"), Text("integer")], [Text("integer"), Text("text"), Text("integer")], [Text("integer"), Text("null"), Text("integer")]]), Ok([[Integer(3)]]), Ok([[Integer(1), Integer(1), Text("x"), Real(1.0), Integer(2)], [Integer(2), Integer(2), Text("yy"), Real(2.5), Integer(4)], [Integer(3), Integer(3), Text("z"), Real(3.0), Integer(6)], [Integer(4), Null, Null, Null, Null], [Integer(5), Integer(5), Text("x"), Real(5.5), Integer(10)], [Integer(6), Integer(2), Text("w"), Real(-0.0), Integer(4)], [Integer(7), Integer(7), Text("yy"), Real(7.0), Integer(14)]]), Ok([[Integer(1), Integer(1), Text("x"), Real(1.0)], [Integer(2), Integer(2), Text("yy"), Real(-1.0)], [Integer(3), Integer(3), Text("z"), Real(3.0)], [Integer(4), Integer(4), Null, Null], [Integer(5), Integer(5), Text("p"), Real(5.0)], [Integer(6), Integer(6), Text("q"), Real(5.0)]]), Ok([]), Ok([[Text("ok")]])]"#
+    );
 }
 
 /// CREATE INDEX and REINDEX fill the index from a SELECT planned through
 /// HIR: plain, expression, partial and generated-column indexes, collations,
 /// a table whose `rowid` name is taken, and a UNIQUE index that fails.
 #[test]
-fn hir_create_index_and_reindex_fill_the_index_like_legacy() {
+fn hir_create_index_and_reindex_fill_the_index() {
     let statements = [
         "CREATE TABLE x(id INTEGER PRIMARY KEY, a TEXT, b INT, c REAL, v INT AS (a || '') VIRTUAL)",
         "INSERT INTO x(id, a, b, c) VALUES (1, 'B', 3, 1.5), (2, 'a', 1, NULL), (3, NULL, 2, 2.5), \
@@ -2236,19 +2303,9 @@ fn hir_create_index_and_reindex_fill_the_index_like_legacy() {
         "SELECT name FROM sqlite_schema WHERE type = 'index' ORDER BY name",
         "PRAGMA integrity_check",
     ];
-    assert_eq!(run(true, &statements), run(false, &statements));
-
-    let program = |hir: bool| {
-        let db = TempDatabase::new_empty();
-        let conn = db.connect_limbo();
-        conn.execute("CREATE TABLE s(a, b)").unwrap();
-        conn.set_experimental_hir(hir);
-        limbo_exec_rows(&conn, "EXPLAIN CREATE INDEX s2 ON s(a + 1) WHERE b > 0")
-    };
-    assert_ne!(
-        program(true),
-        program(false),
-        "HIR plans the SELECT that fills the index"
+    assert_eq!(
+        format!("{:?}", run_with_errors(&statements)),
+        r#"[Ok([]), Ok([[Integer(7)]]), Ok([]), Ok([[Integer(5)]]), Ok([]), Ok([[Integer(0)]]), Ok([]), Ok([[Integer(0)]]), Ok([]), Ok([[Integer(0)]]), Ok([]), Ok([[Integer(0)]]), Ok([]), Ok([[Integer(0)]]), Ok([]), Ok([[Integer(0)]]), Ok([]), Ok([[Integer(2)]]), Ok([]), Ok([[Integer(0)]]), Ok([]), Ok([[Integer(0)]]), Ok([]), Ok([[Integer(0)]]), Ok([]), Ok([[Integer(0)]]), Err("UNIQUE constraint failed: x.b % 2"), Ok([[Integer(0)]]), Ok([]), Ok([[Integer(0)]]), Ok([[Integer(3)], [Integer(1)], [Integer(5)]]), Ok([[Integer(0)]]), Ok([[Integer(12), Text("integer"), Integer(4)], [Text("A"), Text("text"), Integer(5)], [Text("B"), Text("text"), Integer(1)], [Text("a"), Text("text"), Integer(2)]]), Ok([[Integer(0)]]), Ok([[Integer(1), Integer(3)], [Integer(2), Integer(1)], [Integer(3), Integer(2)], [Integer(4), Null], [Integer(5), Integer(5)]]), Ok([[Integer(0)]]), Ok([[Text("a")], [Text("b")]]), Ok([[Integer(0)]]), Ok([[Integer(10), Text("r1")], [Integer(20), Text("r2")]]), Ok([[Integer(0)]]), Ok([[Text("r1")], [Text("t_b")], [Text("t_c_desc")], [Text("t_d")], [Text("t_expr")], [Text("t_g")], [Text("t_partial")], [Text("t_unique")], [Text("u_b")], [Text("u_c")], [Text("u_expr")], [Text("u_partial")], [Text("u_partial_unique")], [Text("x1")], [Text("x2")], [Text("x3")], [Text("x4")], [Text("x5")]]), Ok([[Integer(0)]]), Ok([[Text("ok")]]), Ok([[Integer(0)]]), Ok([[Integer(1), Integer(1), Text("x"), Real(1.0), Integer(2)], [Integer(2), Integer(2), Text("yy"), Real(2.5), Integer(4)], [Integer(3), Integer(3), Text("z"), Real(3.0), Integer(6)], [Integer(4), Null, Null, Null, Null], [Integer(5), Integer(5), Text("x"), Real(5.5), Integer(10)], [Integer(6), Integer(2), Text("w"), Real(-0.0), Integer(4)], [Integer(7), Integer(7), Text("yy"), Real(7.0), Integer(14)]]), Ok([[Integer(1), Integer(1), Text("x"), Real(1.0)], [Integer(2), Integer(2), Text("yy"), Real(-1.0)], [Integer(3), Integer(3), Text("z"), Real(3.0)], [Integer(4), Integer(4), Null, Null], [Integer(5), Integer(5), Text("p"), Real(5.0)], [Integer(6), Integer(6), Text("q"), Real(5.0)]]), Ok([]), Ok([[Text("ok")]])]"#
     );
 }
 
@@ -2260,7 +2317,6 @@ fn hir_create_index_and_reindex_fill_the_index_like_legacy() {
 fn hir_alter_add_column_checks_each_row_like_sqlite() {
     let db = TempDatabase::new_empty();
     let conn = db.connect_limbo();
-    conn.set_experimental_hir(true);
     let sqlite = rusqlite::Connection::open_in_memory().unwrap();
     for sql in [
         "CREATE TABLE t(a, b)",
@@ -2287,7 +2343,6 @@ fn hir_attach_evaluates_its_arguments() {
         .with_opts(turso_core::DatabaseOpts::new().with_attach(true))
         .build();
     let conn = db.connect_limbo();
-    conn.set_experimental_hir(true);
     let dir = db
         .path
         .parent()
@@ -2321,10 +2376,10 @@ fn hir_attach_evaluates_its_arguments() {
 /// SELECT planned by HIR, and find the same broken NOT NULL and CHECK
 /// constraints and missing or repeated index entries as legacy.
 #[test]
-fn hir_integrity_check_finds_what_legacy_finds() {
+fn hir_integrity_check_finds_each_kind_of_corruption() {
     let fixtures =
         std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../sqlite/conformance/database");
-    let check = |hir: bool, fixture: &str| {
+    let check = |fixture: &str| {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join(fixture);
         std::fs::copy(fixtures.join(fixture), &path).unwrap();
@@ -2333,13 +2388,7 @@ fn hir_integrity_check_finds_what_legacy_finds() {
             turso_core::DatabaseOpts::new().with_generated_columns(true),
         );
         let conn = db.connect_limbo();
-        conn.set_experimental_hir(hir);
-        [
-            "PRAGMA integrity_check",
-            "PRAGMA quick_check",
-            "EXPLAIN PRAGMA integrity_check",
-        ]
-        .map(|sql| limbo_exec_rows(&conn, sql))
+        ["PRAGMA integrity_check", "PRAGMA quick_check"].map(|sql| limbo_exec_rows(&conn, sql))
     };
     for fixture in [
         "integrity_check_constraint_violation.db",
@@ -2351,16 +2400,14 @@ fn hir_integrity_check_finds_what_legacy_finds() {
         "integrity_non_unique_index_entry.db",
         "integrity_not_null_violation.db",
     ] {
-        let [hir_check, hir_quick, hir_program] = check(true, fixture);
-        let [check, quick, program] = check(false, fixture);
-        assert_eq!(hir_check, check, "{fixture}");
-        assert_eq!(hir_quick, quick, "{fixture}");
-        assert_ne!(
-            hir_check,
-            vec![vec![rusqlite::types::Value::Text("ok".into())]],
-            "{fixture} is broken"
-        );
-        assert_ne!(hir_program, program, "{fixture}: HIR reads the rows");
+        let ok = vec![vec![rusqlite::types::Value::Text("ok".into())]];
+        let [check, quick] = check(fixture);
+        assert_ne!(check, ok, "{fixture} is broken");
+        // quick_check skips the index checks, so only a row that breaks a
+        // constraint of its own is found twice.
+        if fixture.contains("violation") {
+            assert_ne!(quick, ok, "{fixture} is broken for quick_check too");
+        }
     }
 }
 
@@ -2369,7 +2416,7 @@ fn hir_integrity_check_finds_what_legacy_finds() {
 /// branches give rowids in rowid order through a row set, so the statement
 /// collects them first, then writes each row once.
 #[test]
-fn hir_dml_with_or_terms_seeks_each_branch_like_legacy() {
+fn hir_dml_with_or_terms_seeks_each_branch() {
     for (sql, plan) in [
         (
             "DELETE FROM u WHERE b = 2 OR c = 'z'",
@@ -2405,9 +2452,8 @@ fn hir_dml_with_or_terms_seeks_each_branch_like_legacy() {
             "MULTI-INDEX OR t (t_b, t_expr)",
         ),
     ] {
-        assert_eq!(query_plan(true, sql), vec![plan.to_string()], "{sql}");
-        assert_eq!(query_plan(false, sql), vec![plan.to_string()], "{sql}");
-        assert_eq!(run(true, &[sql]), run(false, &[sql]), "{sql}");
+        assert_eq!(query_plan(sql), vec![plan.to_string()], "{sql}");
+        assert_run_matches_sqlite(&[sql]);
     }
     for statements in [
         &[
@@ -2419,11 +2465,7 @@ fn hir_dml_with_or_terms_seeks_each_branch_like_legacy() {
             "UPDATE OR REPLACE u SET b = 1 WHERE b = 3 OR c = 'q'",
         ],
     ] {
-        assert_eq!(
-            run(true, statements),
-            run(false, statements),
-            "{statements:?}"
-        );
+        assert_run_matches_sqlite(statements);
     }
 }
 
@@ -2432,7 +2474,7 @@ fn hir_dml_with_or_terms_seeks_each_branch_like_legacy() {
 /// index. The index may stream rows lazily, so the statement collects their
 /// rowids first, then writes each row.
 #[test]
-fn hir_dml_through_an_index_method_matches_legacy() {
+fn hir_dml_through_an_index_method_collects_rowids_first() {
     const FTS_SETUP: &[&str] = &[
         "CREATE TABLE docs(id INTEGER PRIMARY KEY, body TEXT, n INT)",
         "CREATE INDEX docs_fts ON docs USING fts (body)",
@@ -2440,7 +2482,7 @@ fn hir_dml_through_an_index_method_matches_legacy() {
         "INSERT INTO docs VALUES (1, 'red apple', 1), (2, 'green apple', 2), \
          (3, 'red pear', 3), (4, 'apple apple', 4), (5, 'plum', 5)",
     ];
-    let run = |hir: bool, statements: &[&str]| -> (Vec<String>, Vec<Result<Rows, String>>) {
+    let run = |statements: &[&str]| -> (Vec<String>, Vec<Result<Rows, String>>) {
         let db = TempDatabase::builder()
             .with_opts(turso_core::DatabaseOpts::new().with_index_method(true))
             .build();
@@ -2448,7 +2490,6 @@ fn hir_dml_through_an_index_method_matches_legacy() {
         for statement in FTS_SETUP {
             conn.execute(statement).unwrap();
         }
-        conn.set_experimental_hir(hir);
         let mut plans = Vec::new();
         let mut results = Vec::new();
         for statement in statements {
@@ -2474,30 +2515,93 @@ fn hir_dml_through_an_index_method_matches_legacy() {
         }
         (plans, results)
     };
-    for statements in [
-        &["DELETE FROM docs WHERE fts_match(body, 'apple')"][..],
-        &["DELETE FROM docs WHERE fts_match(body, 'apple') AND n > 1"],
-        &["UPDATE docs SET body = 'pear', n = n + 10 WHERE fts_match(body, 'apple')"],
-        &["UPDATE docs SET n = 0 WHERE fts_match(body, 'red') RETURNING id, n"],
-        &["DELETE FROM docs WHERE fts_match(body, 'apple') RETURNING id"],
-        &[
-            "CREATE TRIGGER ad AFTER DELETE ON docs BEGIN \
-             UPDATE docs SET n = n + 100 WHERE id = old.id + 1; END",
-            "DELETE FROM docs WHERE fts_match(body, 'red')",
-        ],
-        &[
-            "DELETE FROM docs WHERE fts_match(body, 'apple')",
-            "UPDATE docs SET body = 'apple' WHERE fts_match(body, 'plum')",
-            "DELETE FROM docs WHERE fts_match(body, 'apple')",
-        ],
+    for (statements, expected) in [
+        (
+            vec!["DELETE FROM docs WHERE fts_match(body, 'apple')"],
+            r#"[Ok([]), Ok([[Integer(3)]]), Ok([[Integer(3), Text("red pear"), Integer(3)], [Integer(5), Text("plum"), Integer(5)]]), Ok([]), Ok([[Integer(3)]]), Ok([[Text("ok")]])]"#,
+        ),
+        (
+            vec!["DELETE FROM docs WHERE fts_match(body, 'apple') AND n > 1"],
+            r#"[Ok([]), Ok([[Integer(2)]]), Ok([[Integer(1), Text("red apple"), Integer(1)], [Integer(3), Text("red pear"), Integer(3)], [Integer(5), Text("plum"), Integer(5)]]), Ok([[Integer(1)]]), Ok([[Integer(3)]]), Ok([[Text("ok")]])]"#,
+        ),
+        (
+            vec!["UPDATE docs SET body = 'pear', n = n + 10 WHERE fts_match(body, 'apple')"],
+            r#"[Ok([]), Ok([[Integer(3)]]), Ok([[Integer(1), Text("pear"), Integer(11)], [Integer(2), Text("pear"), Integer(12)], [Integer(3), Text("red pear"), Integer(3)], [Integer(4), Text("pear"), Integer(14)], [Integer(5), Text("plum"), Integer(5)]]), Ok([]), Ok([[Integer(1)], [Integer(2)], [Integer(3)], [Integer(4)]]), Ok([[Text("ok")]])]"#,
+        ),
+        (
+            vec!["UPDATE docs SET n = 0 WHERE fts_match(body, 'red') RETURNING id, n"],
+            r#"[Ok([[Integer(1), Integer(0)], [Integer(3), Integer(0)]]), Ok([[Integer(2)]]), Ok([[Integer(1), Text("red apple"), Integer(0)], [Integer(2), Text("green apple"), Integer(2)], [Integer(3), Text("red pear"), Integer(0)], [Integer(4), Text("apple apple"), Integer(4)], [Integer(5), Text("plum"), Integer(5)]]), Ok([[Integer(1)], [Integer(2)], [Integer(4)]]), Ok([[Integer(3)]]), Ok([[Text("ok")]])]"#,
+        ),
+        (
+            vec!["DELETE FROM docs WHERE fts_match(body, 'apple') RETURNING id"],
+            r#"[Ok([[Integer(1)], [Integer(2)], [Integer(4)]]), Ok([[Integer(3)]]), Ok([[Integer(3), Text("red pear"), Integer(3)], [Integer(5), Text("plum"), Integer(5)]]), Ok([]), Ok([[Integer(3)]]), Ok([[Text("ok")]])]"#,
+        ),
+        (
+            vec!["CREATE TRIGGER ad AFTER DELETE ON docs BEGIN UPDATE docs SET n = n + 100 WHERE id = old.id + 1; END", "DELETE FROM docs WHERE fts_match(body, 'red')"],
+            r#"[Ok([]), Ok([[Integer(5)]]), Ok([]), Ok([[Integer(2)]]), Ok([[Integer(2), Text("green apple"), Integer(102)], [Integer(4), Text("apple apple"), Integer(104)], [Integer(5), Text("plum"), Integer(5)]]), Ok([[Integer(2)], [Integer(4)]]), Ok([]), Ok([[Text("ok")]])]"#,
+        ),
+        (
+            vec!["DELETE FROM docs WHERE fts_match(body, 'apple')", "UPDATE docs SET body = 'apple' WHERE fts_match(body, 'plum')", "DELETE FROM docs WHERE fts_match(body, 'apple')"],
+            r#"[Ok([]), Ok([[Integer(3)]]), Ok([]), Ok([[Integer(1)]]), Ok([]), Ok([[Integer(1)]]), Ok([[Integer(3), Text("red pear"), Integer(3)]]), Ok([]), Ok([[Integer(3)]]), Ok([[Text("ok")]])]"#,
+        ),
     ] {
-        let (hir_plans, hir_results) = run(true, statements);
-        let (legacy_plans, legacy_results) = run(false, statements);
+        let (plans, results) = run(&statements);
         assert!(
-            hir_plans.iter().all(|row| row == "QUERY INDEX METHOD fts"),
-            "{statements:?}: {hir_plans:?}"
+            plans.iter().all(|row| row == "QUERY INDEX METHOD fts"),
+            "{statements:?}: {plans:?}"
         );
-        assert_eq!(hir_plans, legacy_plans, "{statements:?}");
-        assert_eq!(hir_results, legacy_results, "{statements:?}");
+        assert_eq!(format!("{results:?}"), expected, "{statements:?}");
     }
+}
+
+/// A virtual column of a custom type holds the value its expression
+/// computes from the decoded columns it reads: that value is what the
+/// column shows, what its index stores, and what a seek on the index looks
+/// for. Legacy decodes the computed value once more, so `cents AS (a * 2)`
+/// reads 0 while its index holds 4 and a seek looks for 400.
+#[test]
+fn hir_custom_typed_virtual_columns_keep_their_computed_value() {
+    let db = TempDatabase::builder()
+        .with_opts(
+            turso_core::DatabaseOpts::new()
+                .with_custom_types(true)
+                .with_generated_columns(true),
+        )
+        .build();
+    let conn = db.connect_limbo();
+    for sql in [
+        "CREATE TYPE cents BASE integer ENCODE value * 100 DECODE value / 100",
+        "CREATE TABLE t(id INTEGER PRIMARY KEY, a cents, v cents AS (a * 2), w INTEGER AS (a + 1)) \
+         STRICT",
+        "CREATE INDEX tv ON t(v)",
+        "INSERT INTO t VALUES (1, 2), (2, 3)",
+        "UPDATE t SET a = 5 WHERE id = 1",
+        "INSERT INTO t VALUES (1, 7) ON CONFLICT DO UPDATE SET a = excluded.a",
+    ] {
+        limbo_exec_rows(&conn, sql);
+    }
+    let rows = |sql| {
+        limbo_exec_rows(&conn, sql)
+            .into_iter()
+            .map(|row| format!("{row:?}"))
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        rows("SELECT id, a, v, w FROM t ORDER BY id"),
+        [
+            "[Integer(1), Integer(7), Integer(14), Integer(8)]",
+            "[Integer(2), Integer(3), Integer(6), Integer(4)]"
+        ]
+    );
+    assert_eq!(
+        rows("SELECT id FROM t INDEXED BY tv WHERE v = 14"),
+        ["[Integer(1)]"]
+    );
+    assert_eq!(
+        rows("SELECT id FROM t WHERE v BETWEEN 5 AND 7"),
+        ["[Integer(2)]"]
+    );
+    limbo_exec_rows(&conn, "DELETE FROM t WHERE v = 14");
+    assert_eq!(rows("SELECT id FROM t"), ["[Integer(2)]"]);
+    assert_eq!(rows("PRAGMA integrity_check"), ["[Text(\"ok\")]"]);
 }

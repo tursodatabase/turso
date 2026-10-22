@@ -71,7 +71,29 @@ expect error {
     Parse error: no such column: 4.000000,5.000000,6.000000
 }
 
+# With double-quoted strings allowed in DML (the default), a double-quoted
+# vector literal is text, as in SQLite.
 test vector-insert-double-quotes {
+    CREATE TABLE IF NOT EXISTS vector_test (
+        id INTEGER PRIMARY KEY,
+        format TEXT NOT NULL,
+        vec_data F32_BLOB(3) -- 3-dimensional vector
+    );
+    INSERT INTO vector_test (id, format, vec_data)
+    VALUES (2, 'Bracketed_comma_separated', vector("[4.000000,5.000000,6.000000]"));
+    SELECT vector_extract(vec_data) FROM vector_test WHERE id = 2;
+}
+expect {
+    [4,5,6]
+}
+
+setup dqs_dml_off {
+    .dbconfig dqs_dml off
+}
+
+@backend cli
+@setup dqs_dml_off
+test vector-insert-double-quotes-without-dqs {
     CREATE TABLE IF NOT EXISTS vector_test (
         id INTEGER PRIMARY KEY,
         format TEXT NOT NULL,

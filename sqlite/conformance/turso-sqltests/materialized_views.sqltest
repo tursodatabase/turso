@@ -2508,3 +2508,90 @@ test matview-reserved-prefix-sqlite {
 expect error {
     object name reserved for internal use: sqlite_matview
 }
+
+# Computed columns that need a compiled program: function calls, string
+# concatenation and nested arithmetic over the row's values. The view is
+# maintained through inserts and deletes.
+test matview-projection-functions-over-row-values {
+    CREATE TABLE t(a INTEGER, name TEXT);
+    INSERT INTO t VALUES (1, 'ab'), (12, 'cd');
+    CREATE MATERIALIZED VIEW v AS
+    SELECT upper(name) || '!' AS shout,
+           abs(a - 10) AS dist,
+           length(name) * 2 + a AS mixed,
+           coalesce(nullif(a, 12), 0) AS not_twelve
+    FROM t;
+    SELECT * FROM v ORDER BY dist;
+    INSERT INTO t VALUES (7, 'efg');
+    DELETE FROM t WHERE a = 12;
+    SELECT * FROM v ORDER BY dist;
+}
+expect {
+    CD!|2|16|0
+    AB!|9|5|1
+    EFG!|3|13|7
+    AB!|9|5|1
+}
+
+# A projection over aggregate results reads each aggregate by position:
+# its name, such as count(*), is not a column name.
+test matview-projection-functions-over-aggregates {
+    CREATE TABLE t(a INTEGER, name TEXT);
+    INSERT INTO t VALUES (1, 'ab'), (12, 'cd');
+    CREATE MATERIALIZED VIEW w AS SELECT hex(count(*) + 2) AS h, sum(a) * 10 AS s FROM t;
+    SELECT * FROM w;
+    INSERT INTO t VALUES (100, 'z');
+    SELECT * FROM w;
+    CREATE MATERIALIZED VIEW g AS
+    SELECT substr(name, 1, 1) AS initial, count(*) * 100 + max(a) AS score
+    FROM t GROUP BY substr(name, 1, 1);
+    SELECT * FROM g ORDER BY initial;
+}
+expect {
+    34|130.0
+    35|1130.0
+    a|101
+    c|112
+    z|200
+}
+
+# A projection or filter may use CASE and negative literals. Both are
+# compiled to bytecode for the view, so they are kept up to date as rows
+# are inserted and deleted.
+test matview-case-and-negative-literal-projections {
+    CREATE TABLE t(a INTEGER PRIMARY KEY, b INTEGER);
+    INSERT INTO t VALUES (1, 5), (2, -3);
+    CREATE MATERIALIZED VIEW signs AS
+    SELECT a, CASE WHEN b > 0 THEN 'pos' ELSE 'neg' END AS sign, -1 AS m, b * -1 AS n
+    FROM t;
+    SELECT * FROM signs ORDER BY a;
+    INSERT INTO t VALUES (3, 0);
+    DELETE FROM t WHERE a = 1;
+    SELECT * FROM signs ORDER BY a;
+}
+expect {
+    1|pos|-1|-5
+    2|neg|-1|3
+    2|neg|-1|3
+    3|neg|-1|0
+}
+
+test matview-case-with-base-and-negative-filter {
+    CREATE TABLE t(a INTEGER PRIMARY KEY, b INTEGER);
+    INSERT INTO t VALUES (1, 5), (2, -3), (3, 0), (4, -7);
+    CREATE MATERIALIZED VIEW w AS
+    SELECT a, CASE b WHEN 0 THEN 'zero' WHEN -7 THEN 'minus seven' END AS word
+    FROM t WHERE b > -5;
+    SELECT * FROM w ORDER BY a;
+    INSERT INTO t VALUES (5, -4), (6, -9);
+    SELECT * FROM w ORDER BY a;
+}
+expect {
+    1|
+    2|
+    3|zero
+    1|
+    2|
+    3|zero
+    5|
+}

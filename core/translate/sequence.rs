@@ -11,6 +11,7 @@
 // contract (the outer `Statement::step()` must return
 // `StepResult::IO` rather than blocking).
 
+use crate::translate::semantic::context::SemanticContext;
 use std::sync::Arc;
 
 use crate::bail_parse_error;
@@ -20,7 +21,6 @@ use crate::schema::{
     SQLITE_SEQUENCE_TABLE_NAME,
 };
 use crate::storage::pager::CreateBTreeFlags;
-use crate::translate::emitter::Resolver;
 use crate::translate::schema::{emit_schema_entry, SchemaEntryType, SQLITE_TABLEID};
 use crate::util::{escape_sql_string_literal, normalize_ident};
 use crate::vdbe::builder::{CursorType, ProgramBuilder};
@@ -34,15 +34,16 @@ pub fn sequence_backing_table_name(seq_name: &str) -> String {
     String::from(SEQ_BACKING_TABLE_PREFIX) + seq_name
 }
 
-/// Legacy catalog lookup kept outside sequence bytecode emission. Resolved HIR
-/// callers already own this table and bypass this helper.
+/// Look up the backing table of a sequence in the catalog. Only the change
+/// data capture change-id emitter needs this; HIR sequence operations carry
+/// this table directly.
 pub(crate) fn resolve_sequence_backing_table(
-    resolver: &Resolver,
+    catalog: &SemanticContext<'_>,
     database_id: usize,
     seq_name: &str,
 ) -> Result<Arc<BTreeTable>> {
     let backing_table_name = sequence_backing_table_name(seq_name);
-    resolver
+    catalog
         .with_schema(database_id, |schema| {
             schema.get_btree_table(&backing_table_name)
         })
@@ -53,15 +54,16 @@ pub(crate) fn resolve_sequence_backing_table(
         })
 }
 
-/// Legacy catalog lookup for the optional SQLite compatibility table. HIR
-/// sequence operations carry this object directly.
+/// Look up the optional `sqlite_sequence` compatibility table of an
+/// AUTOINCREMENT sequence in the catalog. HIR sequence operations carry this
+/// table directly.
 pub(crate) fn resolve_autoincrement_sqlite_sequence(
-    resolver: &Resolver,
+    catalog: &SemanticContext<'_>,
     database_id: usize,
     seq_name: &str,
 ) -> Option<Arc<BTreeTable>> {
     seq_name.strip_prefix(AUTOINCREMENT_SEQ_PREFIX)?;
-    resolver.with_schema(database_id, |schema| {
+    catalog.with_schema(database_id, |schema| {
         schema.get_btree_table(SQLITE_SEQUENCE_TABLE_NAME)
     })
 }
@@ -90,7 +92,7 @@ pub fn sequence_backing_table_sql(seq_name: &str) -> String {
 #[allow(clippy::too_many_arguments)]
 pub fn emit_sequence_backing_table(
     program: &mut ProgramBuilder,
-    resolver: &Resolver,
+    catalog: &SemanticContext<'_>,
     database_id: usize,
     sqlite_schema_cursor_id: usize,
     seq_name: &str,
@@ -112,7 +114,7 @@ pub fn emit_sequence_backing_table(
 
     emit_schema_entry(
         program,
-        resolver,
+        catalog,
         sqlite_schema_cursor_id,
         None,
         SchemaEntryType::Table,
@@ -206,6 +208,7 @@ pub fn emit_sequence_backing_table(
 /// The seq descriptor's `start/inc/min/max/cycle` are baked into the
 /// bytecode as `Insn::Integer` literals — they are immutable schema and
 /// reading them back from the row would be wasteful.
+#[allow(clippy::too_many_arguments)]
 pub fn emit_disk_read_nextval(
     program: &mut ProgramBuilder,
     database_id: usize,
@@ -730,11 +733,10 @@ pub fn emit_disk_advance_past(
 /// time nextval / advance_past inserts a new watermark row, so the
 /// backing table stays at exactly one row across the run.
 ///
-/// Replaces the legacy commit-time compaction that ran via
-/// `prepare_internal()` from inside a vdbe handler. Keeping the loop
-/// here (in bytecode emitted at prepare time) preserves the vdbe async
-/// contract — every page read is a normal `StepResult::IO` yield, not
-/// a synchronous `pager.io.step()` drive.
+/// The loop is bytecode emitted at prepare time, not a statement run from
+/// inside a vdbe handler at commit time, which preserves the vdbe async
+/// contract — every page read is a normal `StepResult::IO` yield, not a
+/// synchronous `pager.io.step()` drive.
 pub(crate) fn emit_backing_table_compaction(
     program: &mut ProgramBuilder,
     cursor_id: usize,
@@ -945,11 +947,11 @@ pub fn translate_create_sequence(
     min_value: &Option<i64>,
     max_value: &Option<i64>,
     cycle: bool,
-    resolver: &Resolver,
+    catalog: &SemanticContext<'_>,
     program: &mut ProgramBuilder,
 ) -> Result<()> {
-    let database_id = resolver.resolve_database_id(seq_name)?;
-    let schema_cookie = resolver.with_schema(database_id, |s| s.schema_version);
+    let database_id = catalog.resolve_database_id(seq_name)?;
+    let schema_cookie = catalog.with_schema(database_id, |s| s.schema_version);
     program.begin_write_on_database(database_id, schema_cookie)?;
 
     let normalized_name = normalize_ident(seq_name.name.as_str());
@@ -974,7 +976,7 @@ pub fn translate_create_sequence(
     }
 
     // Check if sequence already exists
-    let exists = resolver.with_schema(database_id, |s| s.get_sequence(&normalized_name).is_some());
+    let exists = catalog.with_schema(database_id, |s| s.get_sequence(&normalized_name).is_some());
     if exists {
         if if_not_exists {
             return Ok(());
@@ -993,7 +995,7 @@ pub fn translate_create_sequence(
     )?;
 
     // Open cursor to sqlite_schema (in the target database)
-    let table = resolver.with_schema(database_id, |s| s.get_btree_table(SQLITE_TABLEID).unwrap());
+    let table = catalog.with_schema(database_id, |s| s.get_btree_table(SQLITE_TABLEID).unwrap());
     let sqlite_schema_cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(table));
     program.emit_insn(Insn::OpenWrite {
         cursor_id: sqlite_schema_cursor_id,
@@ -1003,7 +1005,7 @@ pub fn translate_create_sequence(
 
     emit_sequence_backing_table(
         program,
-        resolver,
+        catalog,
         database_id,
         sqlite_schema_cursor_id,
         &normalized_name,
@@ -1050,12 +1052,12 @@ pub fn translate_create_sequence(
 /// so the caller can decide whether that's a no-op or an error.
 pub(crate) fn emit_drop_sequence_cleanup(
     program: &mut ProgramBuilder,
-    resolver: &Resolver,
+    catalog: &SemanticContext<'_>,
     database_id: usize,
     seq_name: &str,
 ) -> Result<bool> {
     let backing_table_name = sequence_backing_table_name(seq_name);
-    let root_page = resolver.with_schema(database_id, |s| {
+    let root_page = catalog.with_schema(database_id, |s| {
         s.get_sequence(seq_name)?;
         Some(s.get_btree_table(&backing_table_name)?.root_page)
     });
@@ -1065,7 +1067,7 @@ pub(crate) fn emit_drop_sequence_cleanup(
 
     // Open sqlite_schema for writing (in the target database)
     let schema_table =
-        resolver.with_schema(database_id, |s| s.get_btree_table(SQLITE_TABLEID).unwrap());
+        catalog.with_schema(database_id, |s| s.get_btree_table(SQLITE_TABLEID).unwrap());
     let sqlite_schema_cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(schema_table));
     program.emit_insn(Insn::OpenWrite {
         cursor_id: sqlite_schema_cursor_id,
@@ -1145,15 +1147,15 @@ pub(crate) fn emit_drop_sequence_cleanup(
 pub fn translate_drop_sequence(
     seq_name: &ast::QualifiedName,
     if_exists: bool,
-    resolver: &Resolver,
+    catalog: &SemanticContext<'_>,
     program: &mut ProgramBuilder,
 ) -> Result<()> {
-    let database_id = resolver.resolve_database_id(seq_name)?;
-    let schema_cookie = resolver.with_schema(database_id, |s| s.schema_version);
+    let database_id = catalog.resolve_database_id(seq_name)?;
+    let schema_cookie = catalog.with_schema(database_id, |s| s.schema_version);
     program.begin_write_on_database(database_id, schema_cookie)?;
 
     let normalized_name = normalize_ident(seq_name.name.as_str());
-    let dropped = emit_drop_sequence_cleanup(program, resolver, database_id, &normalized_name)?;
+    let dropped = emit_drop_sequence_cleanup(program, catalog, database_id, &normalized_name)?;
     if !dropped {
         if if_exists {
             return Ok(());

@@ -1,8 +1,8 @@
 //! Foreign-key actions compiled from HIR: ON DELETE and ON UPDATE CASCADE,
 //! SET NULL and SET DEFAULT.
 //!
-//! Like legacy, an action is the SQL statement it stands for, on the child
-//! table, matching the child key against the old parent key:
+//! An action is the SQL statement it stands for, on the child table,
+//! matching the child key against the old parent key:
 //!
 //! - CASCADE on delete: `DELETE FROM child WHERE c1 = ?1 AND ...`
 //! - CASCADE on update: `UPDATE child SET c1 = ?n+1, ... WHERE c1 = ?1 ...`
@@ -86,14 +86,15 @@ pub(super) fn has_action(foreign_key: &hir::ResolvedForeignKey, change: ParentCh
 
 /// Compile the actions of the foreign keys whose parent is the target, for
 /// `change`. For an UPDATE, only keys among the columns at `assigned` count.
-/// `None` means an action needs legacy, so the whole statement must use it.
+/// A key whose action for `change` is NO ACTION or RESTRICT is skipped: it
+/// is checked by `fkey`, not compiled here.
 pub(super) fn compile_actions<'a>(
     session: &HirSession<'_>,
     parent: &ProgramBuilder,
     foreign_keys: &'a hir::DmlForeignKeys,
     change: ParentChange,
     assigned: &[usize],
-) -> Result<Option<Vec<CompiledAction<'a>>>> {
+) -> Result<Vec<CompiledAction<'a>>> {
     let mut compiled = Vec::new();
     for foreign_key in &foreign_keys.incoming {
         let Some(action) = action_of(foreign_key, change) else {
@@ -104,12 +105,15 @@ pub(super) fn compile_actions<'a>(
         {
             continue;
         }
-        match compile_action(session, parent, foreign_key, change, action)? {
-            Some(action) => compiled.push(action),
-            None => return Ok(None),
-        }
+        compiled.push(compile_action(
+            session,
+            parent,
+            foreign_key,
+            change,
+            action,
+        )?);
     }
-    Ok(Some(compiled))
+    Ok(compiled)
 }
 
 fn compile_action<'a>(
@@ -118,7 +122,7 @@ fn compile_action<'a>(
     foreign_key: &'a hir::ResolvedForeignKey,
     change: ParentChange,
     action: RefAct,
-) -> Result<Option<CompiledAction<'a>>> {
+) -> Result<CompiledAction<'a>> {
     let declaration = &foreign_key.declaration;
     // An action reached again while its program is being built calls it.
     let in_progress = session
@@ -129,12 +133,12 @@ fn compile_action<'a>(
         .find(|entry| entry.change == change && Arc::ptr_eq(&entry.foreign_key, declaration))
         .map(|entry| entry.slot.clone());
     if let Some(slot) = in_progress {
-        return Ok(Some(CompiledAction {
+        return Ok(CompiledAction {
             foreign_key,
             action,
             program: Subprogram::Pending(slot),
             databases: Vec::new(),
-        }));
+        });
     }
 
     let statement = action_statement(session, foreign_key, change, action)?;
@@ -161,26 +165,16 @@ fn compile_action<'a>(
     );
     match (&plan.document.root, &plan.root) {
         (hir::HirRoot::Delete(delete), HirRootPlan::Delete(access)) => {
-            if super::delete::needs_legacy(&plan.document, delete, access)? {
-                return Ok(None);
-            }
-            let Some(subprograms) = Subprograms::for_delete(session, &builder, &plan, delete)?
-            else {
-                return Ok(None);
-            };
+            super::delete::check(&plan.document, delete, access)?;
+            let subprograms = Subprograms::for_delete(session, &builder, &plan, delete)?;
             builder.prologue();
             builder.set_hir_plan(plan.clone());
             super::delete::emit_delete(&mut builder, &plan, delete, access, &subprograms)?;
         }
         (hir::HirRoot::Update(_), HirRootPlan::Update(_)) => {
             let (update, access) = super::update::update_root(&plan)?;
-            if super::update::needs_legacy(&plan, update, access)? {
-                return Ok(None);
-            }
-            let Some(subprograms) = Subprograms::for_update(session, &builder, &plan, update)?
-            else {
-                return Ok(None);
-            };
+            super::update::check(&plan, update, access)?;
+            let subprograms = Subprograms::for_update(session, &builder, &plan, update)?;
             builder.prologue();
             builder.set_hir_plan(plan.clone());
             super::update::emit_update(
@@ -200,7 +194,7 @@ fn compile_action<'a>(
             ))
         }
     }
-    builder.epilogue(session.schema);
+    builder.epilogue(session.context.main_schema());
     let built = builder.build(connection.clone(), true, "fk action")?;
     let prepared = built.prepared().clone();
     slot.set(Arc::downgrade(&prepared))
@@ -229,12 +223,12 @@ fn compile_action<'a>(
             .schema_version;
         databases.push((database, schema_version, write));
     }
-    Ok(Some(CompiledAction {
+    Ok(CompiledAction {
         foreign_key,
         action,
         program: Subprogram::PreparedProgram(prepared),
         databases,
-    }))
+    })
 }
 
 /// Compile the ON DELETE actions a DELETE fires.
@@ -242,12 +236,12 @@ pub(super) fn delete_actions<'a>(
     session: &HirSession<'_>,
     parent: &ProgramBuilder,
     delete: &'a hir::Delete,
-) -> Result<Option<Vec<CompiledAction<'a>>>> {
+) -> Result<Vec<CompiledAction<'a>>> {
     match &delete.target_kind {
         hir::DeleteTargetKind::BTree { foreign_keys, .. } => {
             compile_actions(session, parent, foreign_keys, ParentChange::Delete, &[])
         }
-        hir::DeleteTargetKind::Virtual => Ok(Some(Vec::new())),
+        hir::DeleteTargetKind::Virtual => Ok(Vec::new()),
     }
 }
 
@@ -257,7 +251,7 @@ pub(super) fn update_actions<'a>(
     parent: &ProgramBuilder,
     plan: &super::HirPlan,
     update: &'a hir::Update,
-) -> Result<Option<Vec<CompiledAction<'a>>>> {
+) -> Result<Vec<CompiledAction<'a>>> {
     match &update.target_kind {
         hir::UpdateTargetKind::BTree { foreign_keys, .. } => {
             let assigned = super::update::changed_positions(plan, update)?;
@@ -269,7 +263,7 @@ pub(super) fn update_actions<'a>(
                 &assigned,
             )
         }
-        hir::UpdateTargetKind::Virtual => Ok(Some(Vec::new())),
+        hir::UpdateTargetKind::Virtual => Ok(Vec::new()),
     }
 }
 
@@ -280,8 +274,8 @@ pub(super) fn upsert_actions<'a>(
     parent: &ProgramBuilder,
     plan: &super::HirPlan,
     insert: &'a hir::Insert,
-) -> Result<Option<Vec<Vec<CompiledAction<'a>>>>> {
-    let none = || Ok(Some(insert.upserts.iter().map(|_| Vec::new()).collect()));
+) -> Result<Vec<Vec<CompiledAction<'a>>>> {
+    let none = || Ok(insert.upserts.iter().map(|_| Vec::new()).collect());
     let hir::InsertTargetKind::BTree { foreign_keys, .. } = &insert.target_kind else {
         return none();
     };
@@ -302,19 +296,15 @@ pub(super) fn upsert_actions<'a>(
             &table,
             assignments,
         )?);
-        let Some(actions) = compile_actions(
+        compiled.push(compile_actions(
             session,
             parent,
             foreign_keys,
             ParentChange::Update,
             &assigned,
-        )?
-        else {
-            return Ok(None);
-        };
-        compiled.push(actions);
+        )?);
     }
-    Ok(Some(compiled))
+    Ok(compiled)
 }
 
 fn database_index(foreign_key: &hir::ResolvedForeignKey) -> Result<usize> {
@@ -325,7 +315,7 @@ fn database_index(foreign_key: &hir::ResolvedForeignKey) -> Result<usize> {
         .ok_or_else(|| LimboError::InternalError("HIR foreign key has no database".into()))
 }
 
-/// The statement an action stands for, as legacy builds it.
+/// The statement an action stands for.
 fn action_statement(
     session: &HirSession<'_>,
     foreign_key: &hir::ResolvedForeignKey,

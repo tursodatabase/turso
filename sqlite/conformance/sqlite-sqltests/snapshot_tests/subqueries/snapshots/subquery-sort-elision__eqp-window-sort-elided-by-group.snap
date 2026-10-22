@@ -16,7 +16,6 @@ info:
   database: ':memory:'
 ---
 QUERY PLAN
-`--SCAN window_subquery_0
-   `--SCAN grouped
-      |--SCAN t1
-      `--USE SORTER FOR GROUP BY
+`--SCAN grouped
+   |--SCAN t1
+   `--USE SORTER FOR GROUP BY

@@ -1,11 +1,10 @@
 //! INSERT lowering from resolved HIR.
 //!
-//! This covers a plain INSERT of VALUES rows or DEFAULT VALUES into a rowid
-//! B-tree table: the row is built in registers, its rowid taken from the
-//! statement or generated, NOT NULL, PRIMARY KEY and UNIQUE checked, then
-//! every index entry and the row are written. Several VALUES rows run as a
-//! coroutine, as in legacy. RETURNING reads the new row. Everything else
-//! still goes through legacy; see [`needs_legacy`].
+//! An INSERT into a B-tree table builds the row in registers, takes its
+//! rowid from the statement or generates one, checks NOT NULL, PRIMARY KEY
+//! and UNIQUE, then writes every index entry and the row. Several VALUES
+//! rows, and a SELECT, run as a coroutine. RETURNING reads the new row. An
+//! INSERT into a virtual table hands each row to the table with `VUpdate`.
 
 use std::num::NonZeroUsize;
 
@@ -38,18 +37,13 @@ use super::fkey_action::CompiledAction;
 use super::trigger::{CompiledTrigger, TriggerRow};
 use crate::translate::emitter::OperationMode;
 
-/// Whether this INSERT uses something the HIR lowering does not handle yet.
-/// It is checked before any bytecode is emitted, so legacy can still take
-/// the whole statement.
-pub(super) fn needs_legacy(
-    plan: &HirPlan,
-    insert: &hir::Insert,
-    program: &ProgramBuilder,
-) -> Result<bool> {
+/// Check an INSERT before any bytecode is emitted: what the lowering
+/// expects of its target, and an error for each target it cannot write.
+pub(super) fn check(plan: &HirPlan, insert: &hir::Insert, program: &ProgramBuilder) -> Result<()> {
     let document = &plan.document;
-    // Like legacy, writes to a virtual table record no change data.
-    if let Some(table) = super::dml::virtual_target(document, insert.target)? {
-        return Ok(super::dml::virtual_needs_legacy(&table));
+    // Writes to a virtual table record no change data.
+    if super::dml::virtual_target(document, insert.target)?.is_some() {
+        return Ok(());
     }
     let Some(source) = document.source(insert.target) else {
         return Err(LimboError::InternalError(format!(
@@ -57,32 +51,27 @@ pub(super) fn needs_legacy(
             insert.target
         )));
     };
+    // Analysis resolves the target to a table, which is a B-tree once
+    // virtual tables are out of the way.
     let hir::SourceKind::Table(table) = &source.kind else {
-        return Ok(true);
+        return Err(LimboError::InternalError(
+            "HIR INSERT target is not a table".into(),
+        ));
     };
     let Some(table) = table.value().btree() else {
-        return Ok(true);
+        return Err(LimboError::InternalError(
+            "HIR INSERT target has no B-tree".into(),
+        ));
     };
     if !table.has_rowid {
         without_rowid_errors(program, insert, source)?;
     }
-    if super::dml::strict_needs_legacy(&table, source) {
-        return Ok(true);
-    }
-    // Custom types are lowered unless a virtual column has one.
-    if super::dml::has_custom_types(source) {
-        let custom_virtual = table
-            .columns()
-            .iter()
-            .zip(&source.column_type_programs)
-            .any(|(column, programs)| column.is_virtual_generated() && programs.is_some());
-        return Ok(custom_virtual);
-    }
-    Ok(false)
+    super::dml::check_strict_types(&table, source)?;
+    Ok(())
 }
 
-/// What an INSERT into a WITHOUT ROWID table cannot do yet, with legacy's
-/// errors: only the primary key may be checked and written.
+/// What an INSERT into a WITHOUT ROWID table cannot do yet, as errors:
+/// only the primary key may be checked and written.
 fn without_rowid_errors(
     program: &ProgramBuilder,
     insert: &hir::Insert,
@@ -105,7 +94,7 @@ fn without_rowid_errors(
     Ok(())
 }
 
-/// Emit an INSERT that [`needs_legacy`] accepted. `insert` is the plan's
+/// Emit an INSERT that [`check`] accepted. `insert` is the plan's
 /// root or one command of a trigger in it. `enforce_checks` is false under
 /// `PRAGMA ignore_check_constraints`.
 pub(super) fn emit_insert(
@@ -177,7 +166,7 @@ pub(super) fn emit_insert(
         }
     }
 
-    // Same statement-journal facts as legacy.
+    // Whether the statement needs a statement journal.
     let several_rows = rows.len() > 1 || query.is_some();
     let indexes = &target.source.index_expressions;
     let any_replace = any_effective_replace(
@@ -287,8 +276,8 @@ pub(super) fn emit_insert(
             program.preassign_label_to_next_insn(row_done);
         }
         _ => {
-            // Like legacy, the VALUES rows run as a coroutine that yields
-            // one row at a time into the same registers.
+            // The VALUES rows run as a coroutine that yields one row at a
+            // time into the same registers.
             let width = insert.columns.len();
             let yield_reg = program.alloc_register();
             let values = program.alloc_registers(width.max(1));
@@ -318,7 +307,7 @@ pub(super) fn emit_insert(
             }
             program.emit_insn(Insn::EndCoroutine { yield_reg });
             program.preassign_label_to_next_insn(defined);
-            // Like legacy and SQLite, the rows are computed before any is
+            // Like SQLite, the rows are computed before any is
             // inserted when they read the target table or the INSERT fires
             // triggers.
             let target_table = target.resolved_table()?;
@@ -365,17 +354,17 @@ fn subquery_reads_table(
     reads
 }
 
-/// INSERT into a virtual table, as legacy does it: each row is handed to the
-/// table with `VUpdate`, as NULL, its rowid (NULL unless given) and every
-/// column, NULL where the statement gives none. Unlike legacy, which keeps
-/// only the last, every VALUES row is inserted, as in SQLite.
+/// INSERT into a virtual table: each row is handed to the table with
+/// `VUpdate`, as NULL, its rowid (NULL unless given) and every column, NULL
+/// where the statement gives none. Every VALUES row is inserted, as in
+/// SQLite.
 fn emit_virtual_insert(
     program: &mut ProgramBuilder,
     plan: &HirPlan,
     insert: &hir::Insert,
     table: &crate::sync::Arc<crate::vtab::VirtualTable>,
 ) -> Result<()> {
-    if table.readonly() {
+    if table.readonly() && !program.dbpage_writable() {
         crate::bail_constraint_error!("Table is read-only: {}", table.name);
     }
     let document = &plan.document;
@@ -488,22 +477,21 @@ pub(super) fn column_positions(columns: &[hir::TargetColumn]) -> Vec<usize> {
         .collect()
 }
 
-/// Compile the ON DELETE actions of the rows REPLACE may delete. `None`
-/// means one needs legacy.
+/// Compile the ON DELETE actions of the rows REPLACE may delete.
 pub(super) fn replace_actions<'a>(
     session: &super::HirSession<'_>,
     parent: &ProgramBuilder,
     plan: &HirPlan,
     insert: &'a hir::Insert,
-) -> Result<Option<Vec<CompiledAction<'a>>>> {
+) -> Result<Vec<CompiledAction<'a>>> {
     let hir::InsertTargetKind::BTree { foreign_keys, .. } = &insert.target_kind else {
-        return Ok(Some(Vec::new()));
+        return Ok(Vec::new());
     };
     let source = plan.document.source(insert.target).ok_or_else(|| {
         LimboError::InternalError(format!("HIR INSERT target {} is missing", insert.target))
     })?;
     let hir::SourceKind::Table(table) = &source.kind else {
-        return Ok(Some(Vec::new()));
+        return Ok(Vec::new());
     };
     let table = table.value().require_btree()?;
     let may_replace = match insert.conflict {
@@ -517,7 +505,7 @@ pub(super) fn replace_actions<'a>(
         }
     };
     if !may_replace {
-        return Ok(Some(Vec::new()));
+        return Ok(Vec::new());
     }
     super::fkey_action::compile_actions(
         session,
@@ -554,8 +542,8 @@ struct RowSink<'a, 'b> {
 }
 
 /// INSERT ... SELECT: the query runs as a coroutine that yields one row at
-/// a time. Like legacy and SQLite, when the query reads the target table, or
-/// the INSERT fires triggers, every row is first copied into an ephemeral
+/// a time. Like SQLite, when the query reads the target table, or the
+/// INSERT fires triggers, every row is first copied into an ephemeral
 /// table, so inserting never changes what the query reads.
 fn emit_select_rows(
     program: &mut ProgramBuilder,
@@ -585,7 +573,7 @@ fn emit_select_rows(
         query,
         &QueryDestination::CoroutineYield {
             yield_reg,
-            coroutine_implementation_start: start,
+            stored_outputs: Vec::new(),
         },
     )?;
     program.emit_insn(Insn::EndCoroutine { yield_reg });
@@ -811,8 +799,8 @@ impl InsertRow<'_> {
         if let Some(position) = rowid_value {
             emit_value(program, position, self.rowid)?;
         }
-        // Like legacy, apply column affinity before any check reads the row.
-        // A STRICT table is type checked once the rowid is known instead.
+        // Apply column affinity before any check reads the row. A STRICT
+        // table is type checked once the rowid is known instead.
         let affinities = table
             .columns()
             .iter()
@@ -844,7 +832,7 @@ impl InsertRow<'_> {
             .iter()
             .any(|trigger| trigger.time == TriggerTime::Before)
         {
-            // Like legacy and SQLite, NEW.rowid reads -1 in a BEFORE trigger
+            // Like SQLite, NEW.rowid reads -1 in a BEFORE trigger
             // while the rowid is not known yet.
             let saved = rowid_value.map(|_| {
                 let saved = program.alloc_register();
@@ -867,7 +855,7 @@ impl InsertRow<'_> {
                 dest: self.rowid,
             });
             program.preassign_label_to_next_insn(known);
-            // Like legacy, a BEFORE trigger sees the virtual columns of NEW.
+            // A BEFORE trigger sees the virtual columns of NEW.
             // Custom-typed values are not encoded yet, so they are read as
             // they are.
             self.bind_new_row(program);
@@ -960,8 +948,7 @@ impl InsertRow<'_> {
             table,
             self.columns,
         )?;
-        // Like legacy, CHECK constraints run once the rowid is known, before
-        // NOT NULL.
+        // CHECK constraints run once the rowid is known, before NOT NULL.
         if self.enforce_checks {
             super::dml::emit_check_constraints(
                 program,
@@ -976,8 +963,8 @@ impl InsertRow<'_> {
                 self.emit_notnull_check(program, position, column, row_done)?;
             }
         }
-        // Like legacy, the constraints an UPSERT names are checked first, in
-        // the UPSERT's order, then the rowid and the indexes.
+        // The constraints an UPSERT names are checked first, in the
+        // UPSERT's order, then the rowid and the indexes.
         let arms = self
             .upserts
             .iter()
@@ -1017,7 +1004,7 @@ impl InsertRow<'_> {
             .filter(|upsert| upsert.target.is_none())
             .map(|_| self.upserts.len() - 1);
         // Check every index before writing any of them. Under REPLACE, an
-        // index is written as soon as it is checked, as in legacy.
+        // index is written as soon as it is checked.
         let mut keys = (0..index_cursors.len()).map(|_| None).collect::<Vec<_>>();
         for (constraint, upsert) in constraints {
             let route = upsert.or(catch_all).map(|upsert| (upsert, arms[upsert]));
@@ -1048,7 +1035,7 @@ impl InsertRow<'_> {
             .collect::<Result<Vec<_>>>()?;
 
         let record = super::dml::emit_row_record(program, table, self.columns);
-        // Like legacy, the parent must exist before anything is written.
+        // The parent must exist before anything is written.
         super::fkey::emit_insert_child_checks(
             program,
             document,
@@ -1129,7 +1116,7 @@ impl InsertRow<'_> {
         if let Some(sequence) = &sequence {
             sequence.emit_close(program, self.rowid);
         }
-        // Like legacy, the change is captured after the AFTER triggers ran.
+        // The change is captured after the AFTER triggers ran.
         if let Some(capture) = &self.target.capture {
             let after = capture.after_record(program, table, self.columns, self.rowid);
             capture.emit_row(
@@ -1174,8 +1161,8 @@ impl InsertRow<'_> {
     }
 
     /// The DO UPDATE arm of an UPSERT, entered with the conflicting row's
-    /// rowid in `conflict_rowid`: like legacy, rewrite that row from its
-    /// current values and `excluded`, checking every UNIQUE constraint with
+    /// rowid in `conflict_rowid`: rewrite that row from its current values
+    /// and `excluded`, checking every UNIQUE constraint with
     /// ABORT, then go to the next row.
     #[allow(clippy::too_many_arguments)]
     fn emit_do_update(
@@ -1310,8 +1297,8 @@ impl InsertRow<'_> {
             .map(|column| column.affinity())
             .collect::<Vec<_>>();
         if super::dml::has_custom_types(source) {
-            // Like legacy, every column was read decoded, so every column is
-            // checked as input, encoded and checked again.
+            // Every column was read decoded, so every column is checked as
+            // input, encoded and checked again.
             super::dml::emit_custom_type_writes(program, document, source, table, new_row, None)?;
         } else if table.is_strict {
             super::dml::emit_strict_type_check(program, table, new_row);
@@ -1338,7 +1325,7 @@ impl InsertRow<'_> {
             },
         );
         super::dml::emit_virtual_columns(program, document, new_source.id, table, new_row)?;
-        // Like legacy, every CHECK constraint is checked with ABORT.
+        // Every CHECK constraint is checked with ABORT.
         if self.enforce_checks {
             super::dml::emit_check_constraints(
                 program,
@@ -1348,8 +1335,8 @@ impl InsertRow<'_> {
                 row_done,
             )?;
         }
-        // Like legacy, the UPDATE triggers see the conflicting row as OLD
-        // and the new row as NEW; BEFORE triggers run once the new row
+        // The UPDATE triggers see the conflicting row as OLD and the new
+        // row as NEW; BEFORE triggers run once the new row
         // passed its CHECK constraints.
         let fires = |time: TriggerTime| {
             self.upsert_triggers
@@ -1418,8 +1405,8 @@ impl InsertRow<'_> {
                 target_pc: row_done,
             });
         }
-        // Like legacy, a new rowid must not belong to another row; this is
-        // checked with ABORT before the indexes.
+        // A new rowid must not belong to another row; this is checked with
+        // ABORT before the indexes.
         if let Some(new_rowid) = new_rowid {
             let free = program.allocate_label();
             program.emit_insn(Insn::Eq {
@@ -1492,15 +1479,15 @@ impl InsertRow<'_> {
                 super::fkey::emit_parent_key(program, document, action.foreign_key, source.id)
             })
             .collect::<Result<Vec<_>>>()?;
-        // The row before the change, for change data capture. Legacy reads
-        // it after the write, so its before image is the new row.
+        // The row before the change, for change data capture, read before
+        // anything is written.
         let capture_before =
             self.target.capture.as_ref().and_then(|capture| {
                 capture.before_record(program, table, self.table_cursor, conflict)
             });
 
-        // Like legacy, every UNIQUE constraint is checked against the new
-        // row before any index changes.
+        // Every UNIQUE constraint is checked against the new row before
+        // any index changes.
         struct Rebuild<'x> {
             cursor: CursorID,
             old: &'x hir::IndexExpressions,
@@ -1641,7 +1628,8 @@ impl InsertRow<'_> {
                     flags: CmpInsFlags::default(),
                     collation: program.curr_collation(),
                 });
-                // Legacy reports this as a PRIMARY KEY failure.
+                // A conflict in another row is reported as a PRIMARY KEY
+                // failure.
                 program.emit_insn(Insn::Halt {
                     err_code: SQLITE_CONSTRAINT_PRIMARYKEY,
                     description: format_unique_violation_desc(&table.name, index),
@@ -1751,7 +1739,7 @@ impl InsertRow<'_> {
             action.emit_fire(program, old_key, Some(new_key))?;
             program.preassign_label_to_next_insn(unchanged);
         }
-        // Like legacy, a moved row is captured as deleted and inserted.
+        // A moved row is captured as deleted and inserted.
         if let Some(capture) = &self.target.capture {
             let after = capture.after_record(program, table, new_row, written);
             match new_rowid {
@@ -1910,8 +1898,8 @@ impl InsertRow<'_> {
                 program.preassign_label_to_next_insn(not_null);
             }
         }
-        // Like legacy, a custom-typed value is checked as decoded, so an
-        // encoding that decodes to NULL is rejected too.
+        // A custom-typed value is checked as decoded, so an encoding that
+        // decodes to NULL is rejected too.
         let register = match self.target.source.column_type_programs[position]
             .as_ref()
             .filter(|programs| !programs.decode.is_empty())
@@ -1979,8 +1967,8 @@ impl InsertRow<'_> {
         Ok(())
     }
 
-    /// Write an index entry for the new row as soon as it is checked, as
-    /// legacy does under REPLACE.
+    /// Write an index entry for the new row as soon as it is checked, which
+    /// REPLACE does.
     fn emit_index_insert(
         &self,
         program: &mut ProgramBuilder,
@@ -2066,8 +2054,8 @@ impl InsertRow<'_> {
         Ok(())
     }
 
-    /// Like legacy, check that no row of a WITHOUT ROWID table has the new
-    /// row's primary key.
+    /// Check that no row of a WITHOUT ROWID table has the new row's primary
+    /// key.
     fn emit_primary_key_check(
         &self,
         program: &mut ProgramBuilder,
@@ -2374,7 +2362,7 @@ mod tests {
             .unwrap();
         let plan = Arc::new(analyze_plan(schema, "INSERT INTO sv(a, c) VALUES (1, 'q')"));
         let insert = insert_root(&plan).unwrap();
-        assert!(!needs_legacy(&plan, insert, &program()).unwrap());
+        check(&plan, insert, &program()).unwrap();
         let mut program = program();
         program.set_hir_plan(plan.clone());
         let subprograms = Subprograms::default();
@@ -2406,8 +2394,8 @@ mod tests {
         schema.add_btree_table(Arc::new(table)).unwrap();
         let plan = analyze_plan(schema, "INSERT INTO hc VALUES (1, 2)");
         let insert = insert_root(&plan).unwrap();
-        assert!(!needs_legacy(&plan, insert, &program()).unwrap());
-        // Like legacy, the values go to `a` and `c`, and `b` stays NULL.
+        check(&plan, insert, &program()).unwrap();
+        // The values go to `a` and `c`, and `b` stays NULL.
         let targets = insert
             .columns
             .iter()
@@ -2443,7 +2431,7 @@ mod tests {
             .unwrap();
         let plan = Arc::new(analyze_plan(schema, sql));
         let insert = insert_root(&plan).unwrap();
-        assert!(!needs_legacy(&plan, insert, &program()).unwrap(), "{sql}");
+        check(&plan, insert, &program()).unwrap_or_else(|error| panic!("{sql}: {error}"));
         let mut program = program();
         program.set_hir_plan(plan.clone());
         let subprograms = Subprograms {
@@ -2529,7 +2517,7 @@ mod tests {
         ] {
             let plan = Arc::new(analyze_plan(schema(), sql));
             let insert = insert_root(&plan).unwrap();
-            assert!(!needs_legacy(&plan, insert, &program()).unwrap(), "{sql}");
+            check(&plan, insert, &program()).unwrap_or_else(|error| panic!("{sql}: {error}"));
             let subprograms = Subprograms {
                 upsert_actions: insert.upserts.iter().map(|_| Vec::new()).collect(),
                 ..Subprograms::default()
@@ -2572,7 +2560,7 @@ mod tests {
         ] {
             let plan = analyze_plan(schema(), sql);
             let insert = insert_root(&plan).unwrap();
-            assert!(!needs_legacy(&plan, insert, &program()).unwrap(), "{sql}");
+            check(&plan, insert, &program()).unwrap_or_else(|error| panic!("{sql}: {error}"));
         }
     }
 
@@ -2580,7 +2568,7 @@ mod tests {
         let plan = Arc::new(analyze_plan(schema(), sql));
         let mut program = program();
         let insert = insert_root(&plan).unwrap();
-        assert!(!needs_legacy(&plan, insert, &program).unwrap(), "{sql}");
+        check(&plan, insert, &program).unwrap_or_else(|error| panic!("{sql}: {error}"));
         program.set_hir_plan(plan.clone());
         let subprograms = Subprograms {
             upsert_actions: insert.upserts.iter().map(|_| Vec::new()).collect(),
@@ -2738,7 +2726,7 @@ mod tests {
             "INSERT INTO tagged VALUES (1, '{a,b}', NULL)",
         ));
         let insert = insert_root(&plan).unwrap();
-        assert!(!needs_legacy(&plan, insert, &program()).unwrap());
+        check(&plan, insert, &program()).unwrap();
         let mut program = program();
         program.set_hir_plan(plan.clone());
         emit_insert(

@@ -1,10 +1,11 @@
 //! UPDATE lowering from resolved HIR.
 //!
-//! This covers a plain UPDATE of a B-tree table that changes neither the
-//! rowid nor the index the loop reads: one loop over the planned access path,
-//! the new row built in registers, NOT NULL and UNIQUE checks, then the
-//! changed index entries and the row rewritten. RETURNING reads the new row.
-//! Everything else still goes through legacy; see [`needs_legacy`].
+//! An UPDATE of a B-tree table runs one loop over the planned access path,
+//! builds the new row in registers, checks NOT NULL and UNIQUE, then rewrites
+//! the changed index entries and the row. RETURNING reads the new row. An
+//! UPDATE that changes the rowid or the index its loop reads, or one with a
+//! FROM clause, collects its rows first. An UPDATE of a virtual table hands
+//! each row to the table with `VUpdate`.
 
 use std::num::NonZeroUsize;
 
@@ -40,21 +41,19 @@ use super::query::{
 use super::trigger::{CompiledTrigger, TriggerRow};
 use crate::translate::emitter::OperationMode;
 
-/// Whether this UPDATE uses something the HIR lowering does not handle yet.
-/// It is checked before any bytecode is emitted, so legacy can still take
-/// the whole statement.
-pub(super) fn needs_legacy(
-    plan: &HirPlan,
-    update: &hir::Update,
-    access: &HirAccessPlan,
-) -> Result<bool> {
+/// Check an UPDATE before any bytecode is emitted: what the lowering expects
+/// of its target and plan, and an error for each target it cannot write.
+pub(super) fn check(plan: &HirPlan, update: &hir::Update, access: &HirAccessPlan) -> Result<()> {
     let document = &plan.document;
+    // The parser rejects ORDER BY and LIMIT on an UPDATE.
     if !update.order_by.is_empty() || update.limit.is_some() {
-        return Ok(true);
+        return Err(LimboError::InternalError(
+            "HIR UPDATE with ORDER BY or LIMIT is not lowered".into(),
+        ));
     }
-    // Like legacy, writes to a virtual table record no change data.
-    if let Some(table) = super::dml::virtual_target(document, update.target)? {
-        return Ok(update.from.is_some() || super::dml::virtual_needs_legacy(&table));
+    // Writes to a virtual table record no change data.
+    if super::dml::virtual_target(document, update.target)?.is_some() {
+        return Ok(());
     }
     let Some(source) = document.source(update.target) else {
         return Err(LimboError::InternalError(format!(
@@ -62,46 +61,20 @@ pub(super) fn needs_legacy(
             update.target
         )));
     };
+    // Analysis resolves the target to a table, which is a B-tree once
+    // virtual tables are out of the way.
     let hir::SourceKind::Table(table) = &source.kind else {
-        return Ok(true);
+        return Err(LimboError::InternalError(
+            "HIR UPDATE target is not a table".into(),
+        ));
     };
     let Some(table) = table.value().btree() else {
-        return Ok(true);
+        return Err(LimboError::InternalError(
+            "HIR UPDATE target has no B-tree".into(),
+        ));
     };
-    if super::dml::strict_needs_legacy(&table, source) {
-        return Ok(true);
-    }
-    // Custom types are lowered unless a virtual column has one.
-    if super::dml::has_custom_types(source) {
-        if !matches!(update.target_kind, hir::UpdateTargetKind::BTree { .. }) {
-            return Ok(true);
-        }
-        let custom_virtual = table
-            .columns()
-            .iter()
-            .zip(&source.column_type_programs)
-            .any(|(column, programs)| column.is_virtual_generated() && programs.is_some());
-        if custom_virtual {
-            return Ok(true);
-        }
-    }
+    super::dml::check_strict_types(&table, source)?;
     if update.from.is_some() {
-        // A RETURNING subquery may read a CTE the FROM clause reads too.
-        // SQLite may keep one copy of it, read before any row changes, but
-        // HIR would read it again after triggers ran.
-        if update.returning.as_ref().is_some_and(|returning| {
-            returning.outputs.iter().any(|output| {
-                let mut reads_cte = false;
-                output.expr.for_each(&mut |expression| {
-                    if let hir::Expr::Subquery(subquery) = expression {
-                        reads_cte |= document.query_reads_cte(super::dml::subquery_query(subquery));
-                    }
-                });
-                reads_cte
-            })
-        }) {
-            return Ok(true);
-        }
         // UPDATE ... FROM fills a scratch table during the join, so no loop
         // reads a table it changes. RETURNING reads only the updated row.
         let reads_from = update.returning.as_ref().is_some_and(|returning| {
@@ -116,7 +89,13 @@ pub(super) fn needs_legacy(
                 other
             })
         });
-        return Ok(reads_from);
+        // Analysis rejects a RETURNING value that reads a FROM table.
+        if reads_from {
+            return Err(LimboError::InternalError(
+                "HIR UPDATE ... FROM RETURNING reads a FROM table".into(),
+            ));
+        }
+        return Ok(());
     }
     let [planned_loop] = access.loops.as_slice() else {
         return Err(LimboError::InternalError(format!(
@@ -125,16 +104,24 @@ pub(super) fn needs_legacy(
         )));
     };
     match &planned_loop.access {
-        // A loop over an index built for this statement is not lowered yet.
+        // The planner builds an automatic index only for a table joined
+        // after another one, and without FROM the target is the only loop.
         HirSourceAccess::BTree { operation, .. } => {
-            Ok(operation_index(operation).is_some_and(|index| index.ephemeral))
+            if operation_index(operation).is_some_and(|index| index.ephemeral) {
+                return Err(LimboError::InternalError(
+                    "HIR UPDATE target reads an automatic index".into(),
+                ));
+            }
+            Ok(())
         }
-        HirSourceAccess::OrUnion(_) | HirSourceAccess::IndexMethod(_) => Ok(false),
-        _ => Ok(true),
+        HirSourceAccess::OrUnion(_) | HirSourceAccess::IndexMethod(_) => Ok(()),
+        _ => Err(LimboError::InternalError(
+            "HIR UPDATE target is not read by a table loop".into(),
+        )),
     }
 }
 
-/// Emit an UPDATE that [`needs_legacy`] accepted. `update` is the plan's
+/// Emit an UPDATE that [`check`] accepted. `update` is the plan's
 /// root or one command of a trigger in it.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn emit_update(
@@ -173,7 +160,7 @@ pub(super) fn emit_update(
             }
             // One seek per branch of an OR term reads rows in rowid order
             // through a row set, and an index method may stream its rows
-            // lazily; like legacy, the UPDATE then collects its rowids first.
+            // lazily; the UPDATE then collects its rowids first.
             let operation = match &planned_loop.access {
                 HirSourceAccess::BTree { operation, .. } => Some(operation),
                 HirSourceAccess::OrUnion(_) | HirSourceAccess::IndexMethod(_) => None,
@@ -258,7 +245,7 @@ pub(super) fn emit_update(
         changed_indexes.push((old, new));
     }
 
-    // Same statement-journal facts as legacy.
+    // Whether the statement needs a statement journal.
     let has_foreign_keys = !foreign_keys.incoming.is_empty() || !foreign_keys.outgoing.is_empty();
     let replaces = any_effective_replace(
         has_statement_conflict,
@@ -417,9 +404,9 @@ pub(super) fn emit_update(
         actions,
         replace_actions,
         sequence: sequence.as_ref(),
-        // ALTER TABLE rewrites a schema row with a generated UPDATE; like
-        // legacy, change data capture records the user's DDL as the new
-        // `sql` value instead.
+        // ALTER TABLE rewrites a schema row with a generated UPDATE; change
+        // data capture records the user's DDL as the new `sql` value
+        // instead.
         schema_change: schema_change.and_then(|ddl| {
             table
                 .columns()
@@ -430,14 +417,14 @@ pub(super) fn emit_update(
         }),
     };
     let done = program.allocate_label();
-    // Like legacy, an UPDATE with triggers, OR REPLACE or a subquery in its
-    // WHERE clause first collects its rowids, since a trigger or a REPLACE
+    // An UPDATE with triggers, OR REPLACE or a subquery in its WHERE
+    // clause first collects its rowids, since a trigger or a REPLACE
     // can change the table, and the subquery must not see changed rows.
     let statement_replace = has_statement_conflict && or_conflict == ResolveType::Replace;
     let where_subquery = update.predicate.as_ref().is_some_and(has_subquery);
-    // Like legacy, an UPDATE that moves rows, changes the key of the index
-    // its loop reads, or may REPLACE rows while reading an index collects
-    // its rows first, so the loop never reaches a changed row again.
+    // An UPDATE that moves rows, changes the key of the index its loop
+    // reads, or may REPLACE rows while reading an index collects its rows
+    // first, so the loop never reaches a changed row again.
     let moves_rows = rowid_value.is_some()
         || single_loop
             .and_then(|(_, operation)| operation_index(operation?))
@@ -477,8 +464,8 @@ pub(super) fn emit_update(
     Ok(())
 }
 
-/// UPDATE of a virtual table, as legacy does it: each row the loop finds is
-/// handed to the table with `VUpdate`, as its old rowid, its new rowid and
+/// UPDATE of a virtual table: each row the loop finds is handed to the
+/// table with `VUpdate`, as its old rowid, its new rowid and
 /// every column, the columns it does not set read from the row.
 fn emit_virtual_update(
     program: &mut ProgramBuilder,
@@ -490,7 +477,7 @@ fn emit_virtual_update(
     if update.returning.is_some() {
         crate::bail_parse_error!("UPDATE RETURNING is not available on virtual tables");
     }
-    if table.readonly() {
+    if table.readonly() && !program.dbpage_writable() {
         return Err(LimboError::ReadOnly);
     }
     let document = &plan.document;
@@ -519,10 +506,46 @@ fn emit_virtual_update(
         .map_or(0, |conflict| conflict.bit_value() as u16);
     program.begin_write_operation()?;
     let cursor = super::dml::open_virtual_for_write(program, table);
+    // UPDATE ... FROM: like SQLite, the join of the FROM clause and the
+    // target writes each row's new values into a scratch table keyed by the
+    // row's rowid (a row joined more than once keeps the last values), and
+    // the table is updated from the scratch table afterwards, so that no
+    // loop reads a table it changes.
+    let scratch = update.from.as_ref().map(|_| {
+        let table = crate::sync::Arc::new(crate::schema::BTreeTable::new(
+            0,
+            "update_from_scratch".to_string(),
+            Vec::new(),
+            (0..columns + 2)
+                .map(|column| {
+                    crate::schema::Column::new(
+                        Some(format!("value_{column}")),
+                        "BLOB".to_string(),
+                        None,
+                        None,
+                        crate::schema::Type::Blob,
+                        None,
+                        crate::schema::ColDef::default(),
+                    )
+                })
+                .collect(),
+            crate::schema::BTreeCharacteristics::HAS_ROWID,
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            None,
+        ));
+        let cursor = program.alloc_cursor_id(CursorType::BTreeTable(table));
+        program.emit_insn(Insn::OpenEphemeral {
+            cursor_id: cursor,
+            is_table: true,
+        });
+        cursor
+    });
     super::query::emit_dml_join_loops(
         program,
         plan,
-        None,
+        update.from.as_ref(),
         super::query::HirLoopsPlan::of_access(access),
         &|program, next| {
             // The columns the UPDATE does not set are read from the loop's
@@ -542,7 +565,7 @@ fn emit_virtual_update(
                 &hir::Expr::RowId(update.target),
                 start,
             )?;
-            // Like legacy, a row without a rowid is skipped.
+            // A row without a rowid is skipped.
             program.emit_insn(Insn::IsNull {
                 reg: start,
                 target_pc: next,
@@ -579,15 +602,69 @@ fn emit_virtual_update(
                     }),
                 }
             }
-            program.emit_insn(Insn::VUpdate {
-                cursor_id: cursor,
-                arg_count: columns + 2,
-                start_reg: start,
-                conflict_action,
-            });
+            match scratch {
+                Some(scratch) => {
+                    let record = program.alloc_register();
+                    program.emit_insn(Insn::MakeRecord {
+                        start_reg: to_u32(start),
+                        count: to_u32(columns + 2),
+                        dest_reg: to_u32(record),
+                        index_name: None,
+                        affinity_str: None,
+                    });
+                    program.emit_insn(Insn::Insert {
+                        cursor: scratch,
+                        key_reg: start,
+                        record_reg: record,
+                        flag: InsertFlags::new()
+                            .require_seek()
+                            .is_ephemeral_table_insert(),
+                        table_name: String::new(),
+                    });
+                }
+                None => program.emit_insn(Insn::VUpdate {
+                    cursor_id: cursor,
+                    arg_count: columns + 2,
+                    start_reg: start,
+                    conflict_action,
+                }),
+            }
             Ok(())
         },
-    )
+    )?;
+    let Some(scratch) = scratch else {
+        return Ok(());
+    };
+    let empty = program.allocate_label();
+    let next = program.allocate_label();
+    program.emit_insn(Insn::Rewind {
+        cursor_id: scratch,
+        pc_if_empty: empty,
+    });
+    let start = program.alloc_registers(columns + 2);
+    program.preassign_label_to_next_insn(next);
+    for column in 0..columns + 2 {
+        program.emit_insn(Insn::Column {
+            cursor_id: scratch,
+            column,
+            dest: start + column,
+            default: None,
+        });
+    }
+    program.emit_insn(Insn::VUpdate {
+        cursor_id: cursor,
+        arg_count: columns + 2,
+        start_reg: start,
+        conflict_action,
+    });
+    program.emit_insn(Insn::Next {
+        cursor_id: scratch,
+        pc_if_next: next,
+        fullscan: false,
+    });
+    program.preassign_label_to_next_insn(empty);
+    program.emit_insn(Insn::Close { cursor_id: scratch });
+    Ok(())
 }
 
 /// The new value of one column an UPDATE sets.
@@ -704,8 +781,8 @@ fn emit_scan_update(
     done: BranchOffset,
 ) -> Result<()> {
     let document = target.document;
-    // Like legacy, open the table, the index the loop reads, then each index
-    // the UPDATE changes, all for writing.
+    // Open the table, the index the loop reads, then each index the UPDATE
+    // changes, all for writing.
     let iteration_index = operation_index(operation);
     let table_cursor = target.open_table_for_write(program);
     let iteration_cursor = iteration_index.map(|index| {
@@ -768,8 +845,8 @@ fn emit_scan_update(
 }
 
 /// Collect the rowids of the rows to update with read cursors, then update
-/// each collected row. Like legacy, an UPDATE with triggers does this, since
-/// a trigger can change the table.
+/// each collected row. An UPDATE with triggers does this, since a trigger
+/// can change the table.
 fn emit_rowset_update(
     program: &mut ProgramBuilder,
     plan: &HirPlan,
@@ -816,10 +893,10 @@ fn emit_rowset_update(
     Ok(())
 }
 
-/// UPDATE ... FROM: like legacy, run the join of the FROM clause and the
-/// target first, writing the assigned values of each target row into a
-/// scratch table keyed by its rowid (a target row joined more than once
-/// keeps the last values), then update each row of the scratch table.
+/// UPDATE ... FROM: run the join of the FROM clause and the target first,
+/// writing the assigned values of each target row into a scratch table keyed
+/// by its rowid (a target row joined more than once keeps the last values),
+/// then update each row of the scratch table.
 #[allow(clippy::too_many_arguments)]
 fn emit_from_update(
     program: &mut ProgramBuilder,
@@ -973,7 +1050,7 @@ fn open_changed_indexes<'a>(
         .iter()
         .map(|(old, _)| {
             // An index method without a B-tree of its own (such as FTS)
-            // gets its own kind of cursor, as in legacy.
+            // gets its own kind of cursor.
             let cursor = program.alloc_cursor_index(None, &old.index.handle())?;
             program.emit_insn(Insn::OpenWrite {
                 cursor_id: cursor,
@@ -1073,29 +1150,28 @@ pub(super) fn with_generated_dependents(
     Ok(assigned)
 }
 
-/// Compile the ON DELETE actions of the rows REPLACE may delete. `None`
-/// means one needs legacy.
+/// Compile the ON DELETE actions of the rows REPLACE may delete.
 pub(super) fn replace_actions<'a>(
     session: &super::HirSession<'_>,
     parent: &ProgramBuilder,
     plan: &HirPlan,
     update: &'a hir::Update,
-) -> Result<Option<Vec<CompiledAction<'a>>>> {
+) -> Result<Vec<CompiledAction<'a>>> {
     let hir::UpdateTargetKind::BTree { foreign_keys, .. } = &update.target_kind else {
-        return Ok(Some(Vec::new()));
+        return Ok(Vec::new());
     };
     let source = plan.document.source(update.target).ok_or_else(|| {
         LimboError::InternalError(format!("HIR UPDATE target {} is missing", update.target))
     })?;
     let hir::SourceKind::Table(table) = &source.kind else {
-        return Ok(Some(Vec::new()));
+        return Ok(Vec::new());
     };
     let table = table.value().require_btree()?;
     let sets_rowid = assigned_columns(update)?
         .iter()
         .any(|column| is_rowid_target(&table, column));
     if !may_replace(update, source, &table, sets_rowid) {
-        return Ok(Some(Vec::new()));
+        return Ok(Vec::new());
     }
     super::fkey_action::compile_actions(
         session,
@@ -1200,7 +1276,7 @@ impl UpdateRow<'_, '_> {
 
     /// Bind the NEW row to its registers and compute its virtual generated
     /// columns there. With `check_notnull`, a changed NOT NULL virtual
-    /// column is checked too, as legacy does.
+    /// column is checked too.
     fn emit_virtual_columns(
         &self,
         program: &mut ProgramBuilder,
@@ -1327,7 +1403,7 @@ impl UpdateRow<'_, '_> {
                 .filter(move |trigger| trigger.time == time)
         };
         let has_before = fires(TriggerTime::Before).next().is_some();
-        // The old row is read from the table, as legacy does.
+        // The old row is read from the table.
         program.bind_source(
             source.id,
             SourceBinding::BTree {
@@ -1343,7 +1419,7 @@ impl UpdateRow<'_, '_> {
             .as_ref()
             .filter(|_| super::cdc::Capture::records_updates(program))
             .map(|_| program.alloc_registers(2 * columns));
-        // Like legacy, a BEFORE trigger runs before NOT NULL is checked.
+        // A BEFORE trigger runs before NOT NULL is checked.
         self.emit_new_values(program, layout, !has_before, updates)?;
         self.emit_virtual_columns(program, layout, !has_before)?;
         if let (Some(updates), Some((position, ddl))) = (updates, layout.schema_change) {
@@ -1353,7 +1429,7 @@ impl UpdateRow<'_, '_> {
             });
         }
         if let Some(updates) = updates {
-            // Like legacy, a changed virtual column records its value.
+            // A changed virtual column records its value.
             for &position in layout.assigned {
                 if table.columns()[position].is_virtual_generated() {
                     program.emit_insn(Insn::Copy {
@@ -1408,7 +1484,7 @@ impl UpdateRow<'_, '_> {
                 // RAISE(IGNORE) skips the rest of this row.
                 trigger.emit_fire(program, old_row, Some(new_row), columns, self.skip_row)?;
             }
-            // Like legacy and SQLite: the trigger may have deleted the row,
+            // Like SQLite: the trigger may have deleted the row,
             // and the columns the UPDATE does not set are read again, since
             // the trigger may have changed them.
             program.emit_insn(Insn::NotExists {
@@ -1437,16 +1513,16 @@ impl UpdateRow<'_, '_> {
             // The trigger may have changed the columns they read.
             self.emit_virtual_columns(program, layout, true)?;
         }
-        // Like legacy, a new rowid is checked first, unless REPLACE resolves
-        // its conflict, which happens after the indexes are checked.
+        // A new rowid is checked first, unless REPLACE resolves its
+        // conflict, which happens after the indexes are checked.
         if self.new_rowid.is_some() && self.rowid_conflict() != ResolveType::Replace {
             self.emit_rowid_check(program)?;
         }
-        // Like legacy, a STRICT type check and then CHECK constraints run
-        // after NOT NULL and before any index is checked.
+        // A STRICT type check and then CHECK constraints run after NOT NULL
+        // and before any index is checked.
         if super::dml::has_custom_types(source) {
-            // Like legacy, only the values the UPDATE sets are checked as
-            // input and encoded; the others are read as stored.
+            // Only the values the UPDATE sets are checked as input and
+            // encoded; the others are read as stored.
             let set = layout
                 .values
                 .iter()
@@ -1472,7 +1548,7 @@ impl UpdateRow<'_, '_> {
             self.skip_row,
         )?;
 
-        // Like legacy, check every changed index before changing any of them:
+        // Check every changed index before changing any of them:
         // build the new keys and check UNIQUE, then delete the old entries,
         // then insert the new ones.
         let mut new_keys = Vec::with_capacity(layout.changed_indexes.len());
@@ -1484,8 +1560,8 @@ impl UpdateRow<'_, '_> {
                 self.emit_rowid_replace(program, layout, cursors, new_rowid)?;
             }
         }
-        // Like legacy, foreign keys are checked after the other constraints
-        // and before anything is rewritten.
+        // Foreign keys are checked after the other constraints and before
+        // anything is rewritten.
         let pending_repairs = super::fkey::emit_update_checks(
             program,
             document,
@@ -1587,7 +1663,7 @@ impl UpdateRow<'_, '_> {
         if let (Some(sequence), Some(_)) = (layout.sequence, self.new_rowid) {
             sequence.emit_moved_row(program, self.written_rowid())?;
         }
-        // Like legacy and SQLite, the actions run once the row is written,
+        // Like SQLite, the actions run once the row is written,
         // for a parent key that changed, before RETURNING reads the row.
         for (action, old_key) in layout.actions.iter().zip(action_keys) {
             let new_key = super::fkey::emit_parent_key(
@@ -1617,7 +1693,7 @@ impl UpdateRow<'_, '_> {
             });
             program.preassign_label_to_next_insn(back);
         }
-        // Like legacy, a moved row is captured as deleted and inserted.
+        // A moved row is captured as deleted and inserted.
         if let Some(capture) = &self.target.capture {
             let after = capture.after_record(program, table, self.start(), self.written_rowid());
             if self.new_rowid.is_some() {
@@ -1663,7 +1739,7 @@ impl UpdateRow<'_, '_> {
             let start = returning.emit_values(program, document, self.target.resolved_table()?)?;
             returning.emit_buffer(program, start);
         }
-        // Like legacy, AFTER triggers fire after RETURNING has read the row,
+        // AFTER triggers fire after RETURNING has read the row,
         // and RAISE(IGNORE) in one only ends that trigger's body.
         let after_triggers = program.allocate_label();
         for trigger in fires(TriggerTime::After) {
@@ -1748,8 +1824,8 @@ impl UpdateRow<'_, '_> {
                 None => program.emit_column_or_rowid(self.table_cursor, position, register),
             }
         }
-        // Like legacy, the changed columns record their new values before
-        // affinity is applied; a changed INTEGER PRIMARY KEY records NULL.
+        // The changed columns record their new values before affinity is
+        // applied; a changed INTEGER PRIMARY KEY records NULL.
         if let Some(updates) = updates {
             let columns = table.columns().len();
             for (position, value) in layout.values.iter().enumerate() {
@@ -1765,8 +1841,8 @@ impl UpdateRow<'_, '_> {
                 }
             }
         }
-        // Like legacy, apply column affinity to the new row before any index
-        // or constraint reads it. A STRICT table is type checked later.
+        // Apply column affinity to the new row before any index or
+        // constraint reads it. A STRICT table is type checked later.
         let affinities = table
             .columns()
             .iter()
@@ -1979,8 +2055,8 @@ impl UpdateRow<'_, '_> {
         }
     }
 
-    /// A new rowid must not belong to another row. Like legacy, this runs
-    /// before the indexes are checked; then the cursor goes back to the row.
+    /// A new rowid must not belong to another row. This runs before the
+    /// indexes are checked; then the cursor goes back to the row.
     fn emit_rowid_check(&self, program: &mut ProgramBuilder) -> Result<()> {
         let new_rowid = self.new_rowid.expect("the UPDATE sets the rowid");
         let free = program.allocate_label();
@@ -2031,8 +2107,8 @@ impl UpdateRow<'_, '_> {
         Ok(())
     }
 
-    /// REPLACE on a new rowid: like legacy, after the indexes are checked,
-    /// delete the row that has it, then go back to this row.
+    /// REPLACE on a new rowid: after the indexes are checked, delete the
+    /// row that has it, then go back to this row.
     fn emit_rowid_replace(
         &self,
         program: &mut ProgramBuilder,
@@ -2122,7 +2198,7 @@ impl UpdateRow<'_, '_> {
                 target_pc: self.skip_row,
             }),
             ResolveType::Replace => {
-                // Like legacy, delete the other row, then go back to this one.
+                // Delete the other row, then go back to this one.
                 super::dml::emit_replace_delete(
                     program,
                     self.target,
@@ -2229,7 +2305,7 @@ mod tests {
         let plan = Arc::new(analyze_plan(schema, sql));
         let mut program = program();
         let (update, access) = update_root(&plan).unwrap();
-        assert!(!needs_legacy(&plan, update, access).unwrap(), "{sql}");
+        check(&plan, update, access).unwrap_or_else(|error| panic!("{sql}: {error}"));
         program.set_hir_plan(plan.clone());
         emit_update(
             &mut program,
@@ -2438,7 +2514,7 @@ mod tests {
         ] {
             let plan = analyze_plan(schema(), sql);
             let (update, access) = update_root(&plan).unwrap();
-            assert!(!needs_legacy(&plan, update, access).unwrap(), "{sql}");
+            check(&plan, update, access).unwrap_or_else(|error| panic!("{sql}: {error}"));
         }
     }
 

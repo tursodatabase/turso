@@ -309,7 +309,6 @@ fn is_with_non_null_literal_key_is_a_point_lookup_for_order_by() {
 fn hir_skips_the_sorter_after_a_one_row_loop() {
     let tmp_db = TempDatabase::new_empty();
     let conn = tmp_db.connect_limbo();
-    conn.set_experimental_hir(true);
 
     limbo_exec_rows(&conn, "CREATE TABLE t1(x UNIQUE)");
     limbo_exec_rows(&conn, "CREATE TABLE t2(y)");

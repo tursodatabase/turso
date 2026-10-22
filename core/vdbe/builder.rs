@@ -3,16 +3,15 @@ use crate::{alloc, turso_assert, turso_assert_eq, Result, Value, ValueRef};
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 use std::ops::Range;
 use tracing::{instrument, Level};
-use turso_parser::ast::{self, ResolveType, SortOrder, TableInternalId};
+use turso_parser::ast::{self, ResolveType, SortOrder};
 
 use crate::{
     index_method::IndexMethodAttachment,
     parameters::{ParameterSpelling, Parameters},
-    schema::{BTreeTable, Column, ColumnLayout, Index, PseudoCursorType, Schema, Table, Trigger},
+    schema::{BTreeTable, Index, PseudoCursorType, Schema, Trigger},
     translate::{
         collate::CollationSeq,
-        emitter::{MaterializedColumnRef, TransactionMode},
-        plan::{ResultSetColumn, TableReferences},
+        emitter::TransactionMode,
         semantic::hir::{
             AggregateId, CteId, OutputId, QueryBlockId, QueryId, SourceId, WindowFunctionId,
         },
@@ -22,26 +21,6 @@ use crate::{
 
 // Keep distinct hash-table ids far from table internal ids to avoid collisions.
 const HASH_TABLE_ID_BASE: usize = 1 << 30;
-
-#[derive(Default)]
-pub struct TableRefIdCounter {
-    next_free: ast::TableInternalId,
-}
-
-impl TableRefIdCounter {
-    pub fn new() -> Self {
-        Self {
-            next_free: TableInternalId::default(),
-        }
-    }
-
-    #[allow(clippy::should_implement_trait)]
-    pub fn next(&mut self) -> ast::TableInternalId {
-        let id = self.next_free;
-        self.next_free += 1;
-        id
-    }
-}
 
 use super::{
     affinity::Affinity, explain::ExplainInfo, BranchOffset, CursorID, Insn, InsnReference,
@@ -54,8 +33,6 @@ use std::num::NonZeroUsize;
 /// The resolved source that owns a cursor.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CursorOwner {
-    /// Parser-AST identity used by the legacy translator.
-    TableReference(TableInternalId),
     /// Document-local identity used by HIR lowering.
     Source(SourceId),
 }
@@ -115,32 +92,6 @@ pub struct CursorKey {
 }
 
 impl CursorKey {
-    pub fn table(table_reference_id: TableInternalId) -> Self {
-        Self {
-            owner: CursorOwner::TableReference(table_reference_id),
-            index: None,
-            is_build: false,
-        }
-    }
-
-    pub fn index(table_reference_id: TableInternalId, index: Arc<Index>) -> Self {
-        Self {
-            owner: CursorOwner::TableReference(table_reference_id),
-            index: Some(index),
-            is_build: false,
-        }
-    }
-
-    /// Create a cursor key for hash join build operations.
-    /// This creates a separate cursor from the regular table cursor.
-    pub fn hash_build(table_reference_id: TableInternalId) -> Self {
-        Self {
-            owner: CursorOwner::TableReference(table_reference_id),
-            index: None,
-            is_build: true,
-        }
-    }
-
     pub fn source(source: SourceId) -> Self {
         Self {
             owner: CursorOwner::Source(source),
@@ -168,90 +119,6 @@ impl CursorKey {
             (Some(self_index), Some(other_index)) => self_index.name == other_index.name,
             (None, None) => true,
             _ => false,
-        }
-    }
-}
-
-/// Context for resolving `Expr::Column` that has a `TableInternalId::SELF_TABLE` placeholder.
-#[derive(Clone)]
-pub enum SelfTableContext {
-    ForSelect {
-        table_ref_id: TableInternalId,
-        referenced_tables: TableReferences,
-    },
-    ForDML {
-        dml_ctx: DmlColumnContext,
-        table: Arc<BTreeTable>,
-    },
-}
-
-#[derive(Clone)]
-enum DmlColumnRegisters {
-    // Used to compute column registers lazily
-    Layout {
-        base_reg: usize,
-        rowid_reg: usize,
-        layout: ColumnLayout,
-    },
-    Indexed {
-        column_regs: Vec<usize>,
-    },
-}
-
-#[derive(Clone)]
-pub struct DmlColumnContext {
-    registers: DmlColumnRegisters,
-    rowid_alias_col: Option<usize>,
-}
-
-impl DmlColumnContext {
-    pub fn layout(
-        columns: &[Column],
-        base_reg: usize,
-        rowid_reg: usize,
-        layout: ColumnLayout,
-    ) -> Self {
-        let rowid_alias_col = columns.iter().position(|c| c.is_rowid_alias());
-
-        Self {
-            registers: DmlColumnRegisters::Layout {
-                base_reg,
-                rowid_reg,
-                layout,
-            },
-            rowid_alias_col,
-        }
-    }
-
-    pub fn from_column_reg_mapping<'a>(pairs: impl Iterator<Item = (&'a Column, usize)>) -> Self {
-        let mut rowid_alias_col = None;
-        let mut column_regs = Vec::new();
-        for (idx, (col, reg)) in pairs.enumerate() {
-            column_regs.push(reg);
-            if col.is_rowid_alias() {
-                rowid_alias_col = Some(idx);
-            }
-        }
-        Self {
-            registers: DmlColumnRegisters::Indexed { column_regs },
-            rowid_alias_col,
-        }
-    }
-
-    pub fn to_column_reg(&self, col_idx: usize) -> usize {
-        match &self.registers {
-            DmlColumnRegisters::Layout {
-                base_reg,
-                rowid_reg,
-                layout,
-            } => {
-                if self.rowid_alias_col == Some(col_idx) {
-                    *rowid_reg
-                } else {
-                    layout.to_register(*base_reg, col_idx)
-                }
-            }
-            DmlColumnRegisters::Indexed { column_regs } => column_regs[col_idx],
         }
     }
 }
@@ -310,23 +177,17 @@ pub struct ProgramBuilder {
     label_to_resolved_offset: Vec<Option<InsnReference>>,
     explain: ExplainInfo,
     pub parameters: Parameters,
-    pub result_columns: Vec<ResultSetColumn>,
-    /// Result columns of a statement prepared from semantic HIR. When set,
-    /// `result_columns` and `table_references` are empty.
+    /// Result columns of the statement, as HIR analysis named and typed
+    /// them.
     pub(crate) resolved_result_columns:
         Vec<crate::translate::semantic_lowering::ResolvedResultColumn>,
     /// Instruction, the function to execute it with, and its original index in the vector.
     pub insns: Vec<(Insn, usize)>,
-    /// Registry of materialized CTEs, keyed by legacy or HIR identity.
+    /// Registry of materialized CTEs, keyed by HIR CTE identity.
     /// Used to share materialized data across multiple CTE references via OpenDup.
     materialized_ctes: HashMap<MaterializedCteKey, MaterializedCteInfo>,
-    /// Stack of CTE names currently being planned. Used to detect circular
-    /// references in non-recursive CTEs and to prevent fallthrough to schema
-    /// resolution for same-named tables/views.
-    ctes_being_defined: Vec<String>,
     /// If this ProgramBuilder is building trigger subprogram, a ref to the trigger is stored here.
     pub trigger: Option<Arc<Trigger>>,
-    pub table_reference_counter: TableRefIdCounter,
     /// Curr collation sequence. Bool indicates whether it was set by a COLLATE expr
     collation: Option<(CollationSeq, bool)>,
     capture_data_changes_info: Option<CaptureDataChangesInfo>,
@@ -342,9 +203,6 @@ pub struct ProgramBuilder {
     write_database_cookies: HashMap<usize, u32>,
     /// Schema cookies for attached databases opened for reading.
     read_database_cookies: HashMap<usize, u32>,
-    /// Temporary cursor overrides maps table internal IDs to cursor IDs that should be used instead of the normal resolution.
-    /// This allows for things like hash build to use a separate cursor for iterating the same table.
-    cursor_overrides: HashMap<usize, CursorID>,
     /// Physical value locations for resolved HIR sources.
     source_bindings: HashMap<SourceId, SourceBinding>,
     /// EXPLAIN QUERY PLAN row of each resolved HIR source's loop.
@@ -366,23 +224,15 @@ pub struct ProgramBuilder {
     /// Plan of the HIR statement being lowered. Expression subqueries emit
     /// their bodies from it where the expression is evaluated.
     hir_plan: Option<Arc<crate::translate::semantic_to_plan::HirPlan>>,
+    /// Whether this statement may write `sqlite_dbpage`, which only a
+    /// cli_only build opened with unsafe testing on may do.
+    dbpage_writable: bool,
     /// Expression subqueries that HIR lowering makes run every time they are
     /// reached, even when they read no outer row.
     rerun_subqueries: Vec<QueryId>,
     /// Registers already holding the value of exact HIR expression nodes,
     /// keyed by node address, such as GROUP BY keys while a group is output.
     expression_registers: Vec<(usize, usize)>,
-    /// Maps identifier names to registers for custom type encode/decode expressions.
-    /// When set, `Expr::Id("value")` resolves to the register holding the input value,
-    /// and type parameter names resolve to registers holding their concrete values.
-    pub id_register_overrides: HashMap<String, usize>,
-    /// Hash join build signatures keyed by hash table id.
-    hash_build_signatures: HashMap<usize, HashBuildSignature>,
-    /// Hash tables to keep open across subplans (e.g. materialization).
-    hash_tables_to_keep_open: BitSet,
-    /// Maps table internal_id to result_columns_start_reg for FROM clause subqueries.
-    /// Used when nested subqueries need to reference columns from outer query subqueries.
-    subquery_result_regs: HashMap<TableInternalId, usize>,
     /// The mode in which the query is being executed.
     mode: BuilderQueryMode,
     pub flags: ProgramBuilderFlags,
@@ -393,37 +243,17 @@ pub struct ProgramBuilder {
     next_free_cursor_id: usize,
     free_cursor_ids: Vec<usize>,
     next_hash_table_id: usize,
-    pub table_references: TableReferences,
     /// Current parsing nesting level
     nested_level: usize,
     init_label: BranchOffset,
     start_offset: BranchOffset,
-    pub(crate) reg_result_cols_start: Option<usize>,
     pub resolve_type: ResolveType,
     /// When set, all triggers fired from this program should use this conflict resolution.
     /// This is used in UPSERT DO UPDATE context to ensure nested trigger's OR IGNORE/REPLACE
     /// clauses don't suppress errors.
     pub trigger_conflict_override: Option<ResolveType>,
-    /// Counter for CTE identity tracking. Each CTE definition gets a unique ID
-    /// so that multiple references to the same CTE can share materialized data.
-    next_cte_id: usize,
     /// Counter for subquery numbering in EXPLAIN QUERY PLAN output.
     next_subquery_eqp_id: usize,
-    /// Write-context for union-typed columns: tells `union_value('tag', val)`
-    /// which union TypeDef to resolve the tag against.
-    ///
-    /// Unlike read-path functions (`union_tag(col)`, `union_extract(col, 'tag')`)
-    /// which resolve the union type from the column expression they operate on,
-    /// `union_value()` constructs a *new* value — the SQL syntax doesn't reference
-    /// the target column, so the type must come from the INSERT/UPDATE/UPSERT context.
-    ///
-    /// This follows the same save/restore pattern as `id_register_overrides`
-    /// (ENCODE/DECODE context).
-    /// Callers must save with `.take()`, set the new value, translate the expression,
-    /// then restore the saved value. For nested unions (union-in-union), the
-    /// `UnionValueFunc` handler in expr.rs saves/restores this to the inner union
-    /// type before translating the value argument.
-    pub(crate) target_union_type: Option<Arc<crate::schema::TypeDef>>,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -523,12 +353,6 @@ impl ProgramBuilderFlags {
     }
 
     #[inline]
-    /// Whether the resolve_type was explicitly set from a statement-level OR clause.
-    /// When false, per-constraint ON CONFLICT clauses from CREATE TABLE should be used.
-    pub fn has_statement_conflict(self) -> bool {
-        self.get(Self::HAS_STATEMENT_CONFLICT)
-    }
-    #[inline]
     pub fn set_has_statement_conflict(&mut self, v: bool) {
         self.set(Self::HAS_STATEMENT_CONFLICT, v)
     }
@@ -558,30 +382,6 @@ impl ProgramBuilderFlags {
     }
 }
 
-#[derive(Debug, Clone, Copy, Eq, PartialEq)]
-pub enum MaterializedBuildInputModeTag {
-    RowidOnly,
-    Payload,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-/// Signature of a hash build to allow reuse when inputs are unchanged.
-/// TODO: this is very heavy... we might consider hashing instead of storing full data.
-pub struct HashBuildSignature {
-    /// WHERE term indices used as hash join keys.
-    pub join_key_indices: Vec<usize>,
-    /// Build-table columns stored as payload.
-    pub payload_refs: Vec<MaterializedColumnRef>,
-    /// Affinity string applied to join keys.
-    pub key_affinities: String,
-    /// Whether a bloom filter is enabled for this build.
-    pub use_bloom_filter: bool,
-    /// Rowid input cursor when the build side is materialized.
-    pub materialized_input_cursor: Option<CursorID>,
-    /// RowidOnly vs KeyPayload
-    pub materialized_mode: Option<MaterializedBuildInputModeTag>,
-}
-
 /// Information about a materialized CTE, used for sharing data across multiple references.
 #[derive(Debug, Clone)]
 pub struct MaterializedCteInfo {
@@ -589,13 +389,10 @@ pub struct MaterializedCteInfo {
     pub cursor_id: CursorID,
     /// The table definition, needed for allocating dup cursors with the same CursorType.
     pub table: Arc<BTreeTable>,
-    /// Number of result columns.
-    pub num_columns: usize,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 enum MaterializedCteKey {
-    Legacy(usize),
     Hir(CteId),
 }
 
@@ -745,31 +542,6 @@ impl ProgramBuilder {
         }
     }
 
-    /// Register an `ast::Variable` in the parameter list. Returns the
-    /// `NonZeroUsize` index for use in `Insn::Variable`.
-    pub fn register_variable(&mut self, variable: &ast::Variable) -> NonZeroUsize {
-        let spelling = if let Some(name) = variable.name.as_deref() {
-            ParameterSpelling::Named(name.to_owned())
-        } else if variable.numbered {
-            ParameterSpelling::Numbered
-        } else {
-            ParameterSpelling::Anonymous
-        };
-        self.register_parameter(variable.index, &spelling)
-    }
-
-    /// Run a nested emission scope without leaking its result-column register base
-    /// into the surrounding builder state.
-    pub fn with_scoped_result_cols_start<T>(
-        &mut self,
-        f: impl FnOnce(&mut Self) -> crate::Result<T>,
-    ) -> crate::Result<T> {
-        let saved = self.reg_result_cols_start;
-        let result = f(self);
-        self.reg_result_cols_start = saved;
-        result
-    }
-
     pub fn new(
         query_mode: QueryMode,
         capture_data_changes_info: Option<CaptureDataChangesInfo>,
@@ -810,7 +582,6 @@ impl ProgramBuilder {
         is_subprogram: bool,
     ) -> Self {
         Self {
-            table_reference_counter: TableRefIdCounter::new(),
             next_free_register: 1,
             free_register_ranges: Vec::new(),
             next_free_cursor_id: 0,
@@ -822,9 +593,7 @@ impl ProgramBuilder {
             label_to_resolved_offset: Vec::with_capacity(opts.approx_num_labels),
             explain: ExplainInfo::default(),
             parameters: Parameters::new(),
-            result_columns: Vec::new(),
             resolved_result_columns: Vec::new(),
-            table_references: TableReferences::new(vec![], vec![]),
             collation: None,
             nested_level: 0,
             // These labels will be filled when `prologue()` is called
@@ -838,13 +607,11 @@ impl ProgramBuilder {
             write_database_cookies: HashMap::default(),
             read_database_cookies: HashMap::default(),
             mode: BuilderQueryMode::new(query_mode),
-            reg_result_cols_start: None,
             flags: ProgramBuilderFlags::new(is_subprogram),
             emitted_function_call: false,
             trigger,
             resolve_type: ResolveType::Abort,
             trigger_conflict_override: None,
-            cursor_overrides: HashMap::default(),
             source_bindings: HashMap::default(),
             source_explain_rows: HashMap::default(),
             coroutine_rows: HashMap::default(),
@@ -854,17 +621,11 @@ impl ProgramBuilder {
             window_result_registers: HashMap::default(),
             subquery_bindings: HashMap::default(),
             hir_plan: None,
+            dbpage_writable: false,
             rerun_subqueries: Vec::new(),
             expression_registers: Vec::new(),
-            id_register_overrides: HashMap::default(),
-            hash_build_signatures: HashMap::default(),
-            hash_tables_to_keep_open: BitSet::default(),
-            subquery_result_regs: HashMap::default(),
-            next_cte_id: 0,
             materialized_ctes: HashMap::default(),
-            ctes_being_defined: Vec::new(),
             next_subquery_eqp_id: 1,
-            target_union_type: None,
         }
     }
 
@@ -883,27 +644,6 @@ impl ProgramBuilder {
         id
     }
 
-    /// Allocate a unique CTE identity. Each CTE definition in a query gets a unique ID
-    /// so that multiple references to the same CTE can share materialized data via OpenDup.
-    pub const fn alloc_cte_id(&mut self) -> usize {
-        let id = self.next_cte_id;
-        self.next_cte_id += 1;
-        id
-    }
-
-    /// Check if a CTE has already been materialized.
-    /// Returns the materialization info if the CTE cursor can be shared via OpenDup.
-    pub fn get_materialized_cte(&self, cte_id: usize) -> Option<&MaterializedCteInfo> {
-        self.materialized_ctes
-            .get(&MaterializedCteKey::Legacy(cte_id))
-    }
-
-    /// Register a materialized CTE so that subsequent references can share it via OpenDup.
-    pub fn register_materialized_cte(&mut self, cte_id: usize, info: MaterializedCteInfo) {
-        self.materialized_ctes
-            .insert(MaterializedCteKey::Legacy(cte_id), info);
-    }
-
     pub(crate) fn hir_materialized_cte(&self, cte: CteId) -> Option<&MaterializedCteInfo> {
         self.materialized_ctes.get(&MaterializedCteKey::Hir(cte))
     }
@@ -911,58 +651,6 @@ impl ProgramBuilder {
     pub(crate) fn register_hir_materialized_cte(&mut self, cte: CteId, info: MaterializedCteInfo) {
         self.materialized_ctes
             .insert(MaterializedCteKey::Hir(cte), info);
-    }
-
-    /// Mark a CTE name as currently being planned. While on the stack,
-    /// `parse_table` will reject references to this name with "circular
-    /// reference" instead of falling through to schema resolution.
-    pub fn push_cte_being_defined(&mut self, name: String) {
-        self.ctes_being_defined.push(name);
-    }
-
-    /// Remove the most recently pushed CTE name after planning completes.
-    pub fn pop_cte_being_defined(&mut self) {
-        self.ctes_being_defined.pop();
-    }
-
-    /// Check whether a name refers to a CTE currently being planned.
-    pub fn is_cte_being_defined(&self, name: &str) -> bool {
-        self.ctes_being_defined.iter().any(|n| n == name)
-    }
-
-    /// Hide CTEs being defined whose names an inner WITH clause redefines:
-    /// the inner definitions shadow the outer names for that lexical scope,
-    /// so references to them are not circular. Returns the hidden names for
-    /// [Self::unmask_shadowed_ctes_being_defined].
-    pub fn mask_shadowed_ctes_being_defined(&mut self, shadowing_names: &[String]) -> Vec<String> {
-        let mut masked = Vec::new();
-        self.ctes_being_defined.retain(|name| {
-            if shadowing_names.contains(name) {
-                masked.push(name.clone());
-                false
-            } else {
-                true
-            }
-        });
-        masked
-    }
-
-    /// Restore names hidden by [Self::mask_shadowed_ctes_being_defined] when
-    /// their shadowing scope ends. Membership is all that matters for the
-    /// circular-reference check, so restore order is irrelevant.
-    pub fn unmask_shadowed_ctes_being_defined(&mut self, masked: Vec<String>) {
-        self.ctes_being_defined.extend(masked);
-    }
-
-    /// Temporarily take the CTE-being-defined stack (e.g. during view
-    /// expansion, which should not see CTE context from the caller).
-    pub fn take_ctes_being_defined(&mut self) -> Vec<String> {
-        std::mem::take(&mut self.ctes_being_defined)
-    }
-
-    /// Restore the CTE-being-defined stack after a context-isolated expansion.
-    pub fn restore_ctes_being_defined(&mut self, saved: Vec<String>) {
-        self.ctes_being_defined = saved;
     }
 
     pub const fn set_resolve_type(&mut self, resolve_type: ResolveType) {
@@ -973,63 +661,6 @@ impl ProgramBuilder {
     /// should use this conflict resolution instead of their own OR clauses.
     pub const fn set_trigger_conflict_override(&mut self, resolve_type: ResolveType) {
         self.trigger_conflict_override = Some(resolve_type);
-    }
-
-    /// Returns true if the given hash table id should be kept open across subplans.
-    pub fn should_keep_hash_table_open(&self, hash_table_id: usize) -> bool {
-        self.hash_tables_to_keep_open.get(hash_table_id)
-    }
-
-    /// Set the set of hash tables to keep open across subplans.
-    pub fn set_hash_tables_to_keep_open(&mut self, tables: &BitSet) {
-        self.hash_tables_to_keep_open.clone_from(tables);
-    }
-
-    /// Reset the set of hash tables to keep open.
-    pub fn clear_hash_tables_to_keep_open(&mut self) {
-        self.hash_tables_to_keep_open = BitSet::default();
-    }
-
-    /// Returns true if the given hash build signature matches the recorded one for the given hash table id.
-    pub fn hash_build_signature_matches(
-        &self,
-        hash_table_id: usize,
-        signature: &HashBuildSignature,
-    ) -> bool {
-        self.hash_build_signatures
-            .get(&hash_table_id)
-            .is_some_and(|existing| existing == signature)
-    }
-
-    /// Returns true if there is a recorded hash build signature for the given hash table id.
-    pub fn has_hash_build_signature(&self, hash_table_id: usize) -> bool {
-        self.hash_build_signatures.contains_key(&hash_table_id)
-    }
-
-    /// Insert or update the hash build signature for the given hash table id.
-    pub fn record_hash_build_signature(
-        &mut self,
-        hash_table_id: usize,
-        signature: HashBuildSignature,
-    ) {
-        self.hash_build_signatures.insert(hash_table_id, signature);
-    }
-
-    /// Clear the hash build signature for the given hash table id.
-    pub fn clear_hash_build_signature(&mut self, hash_table_id: usize) {
-        self.hash_build_signatures.remove(&hash_table_id);
-    }
-
-    /// Store the result_columns_start_reg for a FROM clause subquery by its internal_id.
-    /// Used so nested subqueries can access columns from outer query subqueries.
-    pub fn set_subquery_result_reg(&mut self, internal_id: TableInternalId, result_reg: usize) {
-        self.subquery_result_regs.insert(internal_id, result_reg);
-    }
-
-    /// Look up the result_columns_start_reg for a FROM clause subquery by its internal_id.
-    /// Returns None if the subquery hasn't been emitted yet.
-    pub fn get_subquery_result_reg(&self, internal_id: TableInternalId) -> Option<usize> {
-        self.subquery_result_regs.get(&internal_id).copied()
     }
 
     pub(crate) fn bind_source(&mut self, source: SourceId, binding: SourceBinding) {
@@ -1139,6 +770,14 @@ impl ProgramBuilder {
         self.rerun_subqueries.contains(&query)
     }
 
+    pub(crate) const fn set_dbpage_writable(&mut self, writable: bool) {
+        self.dbpage_writable = writable;
+    }
+
+    pub(crate) const fn dbpage_writable(&self) -> bool {
+        self.dbpage_writable
+    }
+
     /// Mark that this statement may modify/insert multiple rows (mirrors SQLite's sqlite3MultiWrite).
     /// When false, statement journals are skipped since single-write statements are atomic.
     pub const fn set_multi_write(&mut self, is_multi_write: bool) {
@@ -1217,7 +856,7 @@ impl ProgramBuilder {
     }
 
     /// Get the index of the next constant span.
-    /// Used in [crate::translate::expr::translate_expr_no_constant_opt()] to invalidate
+    /// Used in [crate::translate::semantic_lowering::expr::translate_expr_no_constant_opt()] to invalidate
     /// all constant spans after the given index.
     pub const fn constant_spans_next_idx(&self) -> usize {
         self.constant_spans.len()
@@ -1225,7 +864,7 @@ impl ProgramBuilder {
 
     /// Invalidate all constant spans after the given index. This is used when we want to
     /// be sure that constant optimization is never used for translating a given expression.
-    /// See [crate::translate::expr::translate_expr_no_constant_opt()] for more details.
+    /// See [crate::translate::semantic_lowering::expr::translate_expr_no_constant_opt()] for more details.
     pub fn constant_spans_invalidate_after(&mut self, idx: usize) {
         self.constant_spans.truncate(idx);
     }
@@ -1255,43 +894,6 @@ impl ProgramBuilder {
         reg
     }
 
-    /// Allow later code to use registers that a removed plan had reserved.
-    pub(crate) fn release_registers(&mut self, start: usize, amount: usize) {
-        if amount == 0 {
-            return;
-        }
-        let end = start.checked_add(amount).expect("register range overflow");
-        turso_assert!(start > 0 && end <= self.next_free_register);
-        self.free_register_ranges.push(start..end);
-        self.free_register_ranges
-            .sort_unstable_by_key(|range| range.start);
-
-        let mut merged: Vec<Range<usize>> = Vec::with_capacity(self.free_register_ranges.len());
-        for range in self.free_register_ranges.drain(..) {
-            if let Some(last) = merged.last_mut() {
-                turso_assert!(last.end <= range.start, "register range released twice");
-                if last.end == range.start {
-                    last.end = range.end;
-                    continue;
-                }
-            }
-            merged.push(range);
-        }
-        self.free_register_ranges = merged;
-
-        while self
-            .free_register_ranges
-            .last()
-            .is_some_and(|range| range.end == self.next_free_register)
-        {
-            let range = self
-                .free_register_ranges
-                .pop()
-                .expect("last register range was present");
-            self.next_free_register = range.start;
-        }
-    }
-
     /// Returns the next register that will be allocated by alloc_register/alloc_registers.
     pub const fn peek_next_register(&self) -> usize {
         self.next_free_register
@@ -1310,29 +912,6 @@ impl ProgramBuilder {
         reg
     }
 
-    pub fn alloc_cursor_id_keyed(&mut self, key: CursorKey, cursor_type: CursorType) -> usize {
-        turso_assert!(
-            !self
-                .cursor_ref
-                .iter()
-                .any(|(k, _)| k.as_ref().is_some_and(|k| k.equals(&key))),
-            "duplicate cursor key"
-        );
-        self._alloc_cursor_id(Some(key), cursor_type)
-    }
-
-    pub fn alloc_cursor_id_keyed_if_not_exists(
-        &mut self,
-        key: CursorKey,
-        cursor_type: CursorType,
-    ) -> usize {
-        if let Some(cursor_id) = self.resolve_cursor_id_safe(&key) {
-            cursor_id
-        } else {
-            self._alloc_cursor_id(Some(key), cursor_type)
-        }
-    }
-
     /// allocate proper cursor for the given index (either [CursorType::BTreeIndex] or [CursorType::IndexMethod])
     pub fn alloc_cursor_index(
         &mut self,
@@ -1347,18 +926,6 @@ impl ProgramBuilder {
             }
         }
         Ok(self._alloc_cursor_id(key, CursorType::BTreeIndex(index.clone())))
-    }
-
-    pub fn alloc_cursor_index_if_not_exists(
-        &mut self,
-        key: CursorKey,
-        index: &Arc<Index>,
-    ) -> crate::Result<usize> {
-        if let Some(cursor_id) = self.resolve_cursor_id_safe(&key) {
-            Ok(cursor_id)
-        } else {
-            self.alloc_cursor_index(Some(key), index)
-        }
     }
 
     pub fn alloc_cursor_id(&mut self, cursor_type: CursorType) -> usize {
@@ -1377,41 +944,18 @@ impl ProgramBuilder {
         cursor
     }
 
-    /// Allow later code to use a cursor that a removed plan had reserved.
-    pub(crate) fn release_cursor_id(&mut self, cursor_id: usize) {
-        turso_assert!(cursor_id < self.next_free_cursor_id);
-        turso_assert!(!self.free_cursor_ids.contains(&cursor_id));
-
-        if cursor_id + 1 == self.next_free_cursor_id {
-            self.cursor_ref.pop();
-            self.next_free_cursor_id -= 1;
-            while let Some(index) = self
-                .free_cursor_ids
-                .iter()
-                .position(|id| *id + 1 == self.next_free_cursor_id)
-            {
-                self.free_cursor_ids.remove(index);
-                self.cursor_ref.pop();
-                self.next_free_cursor_id -= 1;
-            }
-            return;
-        }
-
-        self.free_cursor_ids.push(cursor_id);
-        self.free_cursor_ids
-            .sort_unstable_by(|left, right| right.cmp(left));
-    }
-
+    /// Add a result column that is not read from a table and has no
+    /// declared or inferred type, as PRAGMA results and change counts are.
     pub fn add_pragma_result_column(&mut self, col_name: String) {
-        // TODO figure out a better type definition for ResultSetColumn
-        // or invent another way to set pragma result columns
-        let expr = ast::Expr::Id(ast::Name::empty());
-        self.result_columns.push(ResultSetColumn {
-            expr,
-            alias: Some(col_name),
-            implicit_column_name: None,
-            contains_aggregates: false,
-        });
+        self.resolved_result_columns.push(
+            crate::translate::semantic_lowering::ResolvedResultColumn {
+                name: col_name,
+                name_is_alias: true,
+                value: crate::translate::semantic_lowering::ResolvedResultValue::Expression,
+                affinity: crate::vdbe::affinity::Affinity::None,
+                primitive: None,
+            },
+        );
     }
 
     #[instrument(skip(self), level = Level::DEBUG)]
@@ -1810,30 +1354,6 @@ impl ProgramBuilder {
         self.label_to_resolved_offset[label_number as usize] = Some(anchor);
     }
 
-    /// Resolve `dest` so that it ends up pointing at the same final offset as
-    /// `anchor`. `anchor` must already be preassigned. Use when several labels
-    /// have to target the same logical program point but the point was
-    /// anchored earlier (or in a different function) and
-    /// `preassign_label_to_next_insn` cannot be called again at that moment.
-    ///
-    /// Using this helper (instead of capturing a raw `BranchOffset::Offset`
-    /// from `program.offset()` and passing it to multiple resolutions) keeps
-    /// all the linked labels correctly remapped when `emit_constant_insns`
-    /// hoists compile-time constants — raw offsets don't get remapped, but
-    /// label resolutions do.
-    #[inline]
-    pub fn link_label_to_other_label(&mut self, dest: BranchOffset, anchor: BranchOffset) {
-        let BranchOffset::Label(dest_n) = dest else {
-            unreachable!("link_label_to_other_label dest must be a Label, got {dest:?}");
-        };
-        let BranchOffset::Label(anchor_n) = anchor else {
-            unreachable!("link_label_to_other_label anchor must be a Label, got {anchor:?}");
-        };
-        let resolution = self.label_to_resolved_offset[anchor_n as usize]
-            .expect("anchor label must already be preassigned/resolved");
-        self.label_to_resolved_offset[dest_n as usize] = Some(resolution);
-    }
-
     /// Resolve unresolved labels to a specific offset in the instruction list.
     ///
     /// This function scans all instructions and resolves any labels to their corresponding offsets.
@@ -2069,85 +1589,7 @@ impl ProgramBuilder {
         Ok(())
     }
 
-    /// Set a cursor override for a table. When resolving a table cursor for this table,
-    /// the override cursor will be used instead of the normal resolution.
-    pub fn set_cursor_override(&mut self, table_ref_id: TableInternalId, cursor_id: CursorID) {
-        self.cursor_overrides.insert(table_ref_id.into(), cursor_id);
-    }
-
-    /// Clear the cursor override for a table.
-    pub fn clear_cursor_override(&mut self, table_ref_id: TableInternalId) {
-        self.cursor_overrides.remove(&table_ref_id.into());
-    }
-
-    /// Clear all cursor overrides.
-    pub fn clear_all_cursor_overrides(&mut self) {
-        self.cursor_overrides.clear();
-    }
-
-    /// Check if a cursor override is active for a given table.
-    pub fn has_cursor_override(&self, table_ref_id: TableInternalId) -> bool {
-        self.cursor_overrides.contains_key(&table_ref_id.into())
-    }
-
     // translate [CursorKey] to cursor id
-    pub fn resolve_cursor_id_safe(&self, key: &CursorKey) -> Option<CursorID> {
-        // Check cursor overrides first, only apply override for table cursors.
-        // Index cursor lookups are not overridden because when a cursor override is active,
-        // the calling code (translate_expr) should skip index logic entirely.
-        if key.index.is_none() && !key.is_build {
-            if let CursorOwner::TableReference(table_reference_id) = key.owner {
-                let table_id: usize = table_reference_id.into();
-                if let Some(&cursor_id) = self.cursor_overrides.get(&table_id) {
-                    return Some(cursor_id);
-                }
-            }
-        }
-        self.cursor_ref
-            .iter()
-            .position(|(k, _)| k.as_ref().is_some_and(|k| k.equals(key)))
-    }
-
-    pub fn resolve_cursor_id(&self, key: &CursorKey) -> CursorID {
-        self.resolve_cursor_id_safe(key)
-            .unwrap_or_else(|| panic!("Cursor not found: {key:?}"))
-    }
-
-    /// Resolve the first allocated index cursor for a given table reference.
-    /// This method exists due to a limitation of our translation system where
-    /// a subquery that references an outer query table cannot know whether a
-    /// table cursor, index cursor, or both were opened for that table reference.
-    /// Hence: currently we first try to resolve a table cursor, and if that fails,
-    /// we resolve an index cursor via this method.
-    pub fn resolve_any_index_cursor_id_for_table(&self, table_ref_id: TableInternalId) -> CursorID {
-        self.resolve_any_index_cursor_id_for_table_safe(table_ref_id)
-            .unwrap_or_else(|| panic!("No index cursor found for table {table_ref_id}"))
-    }
-
-    pub fn resolve_any_index_cursor_id_for_table_safe(
-        &self,
-        table_ref_id: TableInternalId,
-    ) -> Option<CursorID> {
-        self.cursor_ref.iter().position(|(k, _)| {
-            k.as_ref().is_some_and(|k| {
-                k.owner == CursorOwner::TableReference(table_ref_id) && k.index.is_some()
-            })
-        })
-    }
-
-    /// Resolve the [Index] that a given cursor is associated with.
-    pub fn resolve_index_for_cursor_id(&self, cursor_id: CursorID) -> Arc<Index> {
-        let cursor_ref = &self
-            .cursor_ref
-            .get(cursor_id)
-            .unwrap_or_else(|| panic!("Cursor not found: {cursor_id}"))
-            .1;
-        let CursorType::BTreeIndex(index) = cursor_ref else {
-            panic!("Cursor is not an index: {cursor_id}");
-        };
-        index.clone()
-    }
-
     /// Get the [CursorType] of a given cursor.
     pub fn get_cursor_type(&self, cursor_id: CursorID) -> Option<&CursorType> {
         self.cursor_ref
@@ -2155,12 +1597,13 @@ impl ProgramBuilder {
             .map(|(_, cursor_type)| cursor_type)
     }
 
-    pub const fn set_collation(&mut self, c: Option<(CollationSeq, bool)>) {
-        self.collation = c
-    }
-
+    #[cfg(test)]
     pub const fn curr_collation_ctx(&self) -> Option<(CollationSeq, bool)> {
         self.collation
+    }
+
+    pub const fn set_collation(&mut self, c: Option<(CollationSeq, bool)>) {
+        self.collation = c
     }
 
     pub fn curr_collation(&self) -> Option<CollationSeq> {
@@ -2337,27 +1780,6 @@ impl ProgramBuilder {
             self.emit_insn(Insn::Goto {
                 target_pc: self.start_offset,
             });
-        }
-    }
-
-    /// Checks whether `table` or any of its indices has been opened in the program
-    pub fn is_table_open(&self, table: &Table) -> bool {
-        self.table_references.contains_table(table)
-    }
-
-    /// Returns true if the cursor is backed by a table or index B-tree.
-    pub fn cursor_is_btree(&self, cursor_id: CursorID) -> bool {
-        matches!(
-            self.cursor_ref[cursor_id].1,
-            CursorType::BTreeTable(_) | CursorType::BTreeIndex(_)
-        )
-    }
-
-    /// Returns the BTreeTable for the given cursor, if it is a BTreeTable cursor.
-    pub fn btree_table_from_cursor(&self, cursor_id: CursorID) -> Option<&Arc<BTreeTable>> {
-        match &self.cursor_ref[cursor_id].1 {
-            CursorType::BTreeTable(t) => Some(t),
-            _ => None,
         }
     }
 
@@ -2555,8 +1977,6 @@ impl ProgramBuilder {
             parameters: self.parameters,
             change_cnt_on,
             readonly: self.flags.readonly(),
-            result_columns: self.result_columns,
-            table_references: self.table_references,
             resolved_result_columns: self.resolved_result_columns,
             sql: sql.to_string(),
             needs_stmt_subtransactions: crate::Arc::new(crate::AtomicBool::new(
@@ -2607,49 +2027,6 @@ mod tests {
 
     fn program() -> ProgramBuilder {
         ProgramBuilder::new(QueryMode::Normal, None, ProgramBuilderOpts::new(0, 0, 0))
-    }
-
-    #[test]
-    fn legacy_and_hir_cursor_owners_do_not_collide() {
-        let mut program = program();
-        let table = TableInternalId::from(0);
-        let source = SourceId::new(0);
-
-        let table_cursor =
-            program.alloc_cursor_id_keyed(CursorKey::table(table), CursorType::Sorter);
-        let source_cursor =
-            program.alloc_cursor_id_keyed(CursorKey::source(source), CursorType::Sorter);
-
-        assert_ne!(table_cursor, source_cursor);
-        assert_eq!(
-            program.resolve_cursor_id(&CursorKey::table(table)),
-            table_cursor
-        );
-        assert_eq!(
-            program.resolve_cursor_id(&CursorKey::source(source)),
-            source_cursor
-        );
-    }
-
-    #[test]
-    fn legacy_cursor_override_does_not_affect_hir_source() {
-        let mut program = program();
-        let table = TableInternalId::from(0);
-        let source = SourceId::new(0);
-        let source_cursor =
-            program.alloc_cursor_id_keyed(CursorKey::source(source), CursorType::Sorter);
-        let override_cursor = program.alloc_cursor_id(CursorType::Sorter);
-
-        program.set_cursor_override(table, override_cursor);
-
-        assert_eq!(
-            program.resolve_cursor_id(&CursorKey::table(table)),
-            override_cursor
-        );
-        assert_eq!(
-            program.resolve_cursor_id(&CursorKey::source(source)),
-            source_cursor
-        );
     }
 
     #[test]

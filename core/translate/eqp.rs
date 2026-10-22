@@ -7,10 +7,7 @@ use std::fmt::{self, Display, Formatter, Write as _};
 
 use crate::{
     schema::Index,
-    translate::plan::{
-        IterationDirection, JoinInfo, JoinType, JoinedTable, Operation, Scan, Search, SeekDef,
-        SeekKeyComponent, SetOperation,
-    },
+    translate::plan::{JoinInfo, JoinType, SeekDef, SeekKeyComponent},
     types::SeekOp,
     vdbe::{insn::Insn, Program},
 };
@@ -23,14 +20,6 @@ pub struct EqpTable {
 }
 
 impl EqpTable {
-    pub(crate) fn from_joined(table: &JoinedTable) -> Self {
-        let name = table.table.get_name();
-        Self {
-            name: name.to_string(),
-            alias: (name != table.identifier).then(|| table.identifier.clone()),
-        }
-    }
-
     /// `users AS u` form
     fn name_with_alias(&self) -> String {
         match &self.alias {
@@ -424,125 +413,6 @@ pub(crate) fn seek_constraint_parts<E>(index: &Index, seek_def: &SeekDef<E>) -> 
     parts
 }
 
-fn eqp_index(index: &Index, covering: bool) -> EqpIndex {
-    EqpIndex {
-        name: index.name.clone(),
-        covering,
-        ephemeral: index.ephemeral,
-    }
-}
-
-/// Build the [EqpDetail] for a joined table.
-pub(crate) fn eqp_detail_for_table_op(
-    table: &JoinedTable,
-    join: Option<EqpJoin>,
-    subquery: Option<EqpSubquery>,
-) -> EqpDetail {
-    let eqp_table = EqpTable::from_joined(table);
-    match &table.op {
-        Operation::Scan(scan) => {
-            let (index, source, backwards) = match scan {
-                Scan::BTreeTable { iter_dir, index } => (
-                    index
-                        .as_ref()
-                        .map(|index| eqp_index(index, table.utilizes_covering_index())),
-                    EqpRowSource::BTreeTable,
-                    *iter_dir == IterationDirection::Backwards,
-                ),
-                Scan::VirtualTable { .. } => (None, EqpRowSource::VirtualTable, false),
-                Scan::Subquery { iter_dir } => (
-                    None,
-                    EqpRowSource::Subquery,
-                    *iter_dir == IterationDirection::Backwards,
-                ),
-                Scan::RecursiveCteInput => (None, EqpRowSource::RecursiveCteInput, false),
-            };
-            EqpDetail::Scan {
-                table: eqp_table,
-                index,
-                source,
-                backwards,
-                join,
-                subquery,
-            }
-        }
-        Operation::Search(search) => {
-            let (kind, index, constraints, backwards) = match search {
-                Search::RowidEq { .. } => (
-                    EqpSearchKind::RowidEq,
-                    None,
-                    vec!["rowid=?".to_string()],
-                    false,
-                ),
-                Search::Seek { index, seek_def } => (
-                    EqpSearchKind::Seek,
-                    index
-                        .as_ref()
-                        .map(|index| eqp_index(index, table.utilizes_covering_index())),
-                    match index {
-                        Some(index) => seek_constraint_parts(index, seek_def),
-                        None => vec!["rowid=?".to_string()],
-                    },
-                    seek_def.iter_dir == IterationDirection::Backwards,
-                ),
-                Search::InSeek { index, .. } => (
-                    EqpSearchKind::InSeek,
-                    index
-                        .as_ref()
-                        .map(|index| eqp_index(index, table.utilizes_covering_index())),
-                    match index {
-                        Some(index) => index
-                            .columns
-                            .first()
-                            .map(|col| vec![format!("{}=?", col.name)])
-                            .unwrap_or_default(),
-                        None => vec!["rowid=?".to_string()],
-                    },
-                    false,
-                ),
-            };
-            EqpDetail::Search {
-                table: eqp_table,
-                kind,
-                index,
-                constraints,
-                backwards,
-                join,
-                subquery,
-            }
-        }
-        Operation::MultiIndexScan(multi_idx) => EqpDetail::MultiIndex {
-            table: eqp_table,
-            union: matches!(multi_idx.set_op, SetOperation::Union),
-            indexes: multi_idx
-                .branches
-                .iter()
-                .map(|b| {
-                    b.index
-                        .as_ref()
-                        .map(|i| i.name.clone())
-                        .unwrap_or_else(|| "PRIMARY KEY".to_string())
-                })
-                .collect(),
-        },
-        Operation::IndexMethodQuery(query) => EqpDetail::IndexMethod {
-            method: query
-                .index
-                .index_method
-                .as_ref()
-                .unwrap()
-                .definition()
-                .method_name
-                .to_string(),
-        },
-        Operation::HashJoin(_) => EqpDetail::HashJoin {
-            table: eqp_table,
-            join,
-            subquery,
-        },
-    }
-}
-
 /// A CTE materialized before the main query runs.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EqpCteMaterialization {
@@ -807,19 +677,7 @@ pub fn program_plan_json(program: &Program) -> String {
     top.num("version", 1);
     top.str("sql", &program.sql);
 
-    // A program prepared through HIR names its columns in
-    // `resolved_result_columns` instead.
-    let column_names: Vec<String> = if program.resolved_result_columns.is_empty() {
-        program
-            .result_columns
-            .iter()
-            .enumerate()
-            .map(|(i, col)| match col.name(&program.table_references) {
-                Some(name) => name.to_string(),
-                None => format!("column{}", i + 1),
-            })
-            .collect()
-    } else {
+    let column_names: Vec<String> = {
         program
             .resolved_result_columns
             .iter()
@@ -829,11 +687,9 @@ pub fn program_plan_json(program: &Program) -> String {
                 {
                     source.column_name.clone()
                 }
-                crate::translate::semantic_lowering::ResolvedResultValue::RowId(name)
-                    if !column.name_is_alias =>
-                {
-                    name.clone()
-                }
+                crate::translate::semantic_lowering::ResolvedResultValue::RowId {
+                    name, ..
+                } if !column.name_is_alias => name.clone(),
                 _ => column.name.clone(),
             })
             .collect()

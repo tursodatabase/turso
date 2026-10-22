@@ -19,6 +19,7 @@ impl HirValidationError {
         }
     }
 
+    #[cfg(test)]
     pub fn message(&self) -> &str {
         &self.message
     }
@@ -250,7 +251,9 @@ impl<'document> HirValidator<'document> {
             HirRoot::Trigger(root) => {
                 self.visit_trigger_environment(&root.environment)?;
                 match &root.body {
+                    #[cfg(test)]
                     TriggerBody::Predicate(expression) => self.visit_expr(expression),
+                    #[cfg(test)]
                     TriggerBody::Command(command) => self.visit_trigger_command(command),
                     TriggerBody::Program(program) => {
                         if let Some(predicate) = &program.predicate {
@@ -1417,10 +1420,6 @@ impl<'document> HirValidator<'document> {
                 self.query_block(block)?;
                 Ok(())
             }
-            SourceOwner::Cte(cte) => {
-                self.cte(cte)?;
-                Ok(())
-            }
         }
     }
 
@@ -1435,10 +1434,6 @@ impl<'document> HirValidator<'document> {
                     source.id, block.query
                 ),
             ),
-            SourceOwner::Cte(cte) => self.invalid(format!(
-                "query {query} captures source {} owned directly by CTE {cte}",
-                source.id
-            )),
         }
     }
 
@@ -2121,13 +2116,16 @@ impl<'document> HirValidator<'document> {
             let require_complete = matches!(
                 &self.document.root,
                 HirRoot::Insert(insert) if insert.target == source.id
-            ) || matches!(
-                &self.document.root,
-                HirRoot::Trigger(TriggerRoot {
-                    body: TriggerBody::Command(TriggerCommand::Insert(insert)),
-                    ..
-                }) if insert.target == source.id
             );
+            #[cfg(test)]
+            let require_complete = require_complete
+                || matches!(
+                    &self.document.root,
+                    HirRoot::Trigger(TriggerRoot {
+                        body: TriggerBody::Command(TriggerCommand::Insert(insert)),
+                        ..
+                    }) if insert.target == source.id
+                );
             if require_complete {
                 self.require(
                     constraints.len() == table.check_constraints.len(),
@@ -2778,7 +2776,6 @@ mod tests {
 
         let invalid_backing = SequenceOperation {
             kind: SequenceOperationKind::NextValue,
-            user_name: "seq".to_string(),
             normalized_name: "seq".to_string(),
             sequence: sequence.clone(),
             backing_table: non_btree(2, "__turso_internal_seq_seq"),
@@ -2803,7 +2800,6 @@ mod tests {
         );
         let invalid_sqlite_sequence = SequenceOperation {
             kind: SequenceOperationKind::NextValue,
-            user_name: "seq".to_string(),
             normalized_name: "seq".to_string(),
             sequence,
             backing_table: valid_backing,

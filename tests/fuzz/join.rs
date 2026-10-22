@@ -327,8 +327,9 @@ mod join_fuzz_tests {
             let query = format!(
                 "{with_clause}SELECT {select_clause} {from_clause} {where_clause} {order_clause} LIMIT {limit}",
             );
-            // Print some sample queries to verify generation
-            if iter < 10 {
+            // Print some sample queries to verify generation, or every
+            // query under VERBOSE to find the one that panics.
+            if iter < 10 || std::env::var("VERBOSE").is_ok() {
                 println!("query[{iter}]: {query}");
             }
             let sqlite_rows = sqlite_exec_rows(&sqlite_conn, &query);

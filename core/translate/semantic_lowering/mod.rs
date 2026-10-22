@@ -5,6 +5,7 @@ mod cdc;
 mod delete;
 mod dml;
 mod emit;
+pub(crate) use emit::format_unique_violation_desc;
 pub(super) mod expr;
 mod fkey;
 mod fkey_action;
@@ -24,29 +25,30 @@ use crate::{
         plan::QueryDestination,
         semantic::{
             analyze_root,
-            catalog::SemanticCatalog,
-            context::DoubleQuotedDml,
+            context::SemanticContext,
             hir::{self, HirDocument, HirRoot, OutputNameKind},
-            SemanticOptions, SemanticRootInput,
+            SemanticRootInput,
         },
         semantic_to_plan::{HirPlan, HirRootPlan},
     },
-    vdbe::{affinity::Affinity, builder::ProgramBuilder},
+    vdbe::{
+        affinity::Affinity,
+        builder::{ProgramBuilder, SourceBinding},
+    },
     Connection, LimboError, Result,
 };
 
 use dml::Subprograms;
 
 /// Prepare a top-level SELECT through semantic HIR: analyze, plan, and lower
-/// it without the legacy binder, planner, or emitter.
+/// it.
 pub(crate) fn translate_select(
     statement: &ast::Stmt,
-    schema: &Arc<Schema>,
-    settings: &HirSettings<'_>,
+    context: &SemanticContext<'_>,
     program: &mut ProgramBuilder,
     connection: &Arc<Connection>,
 ) -> Result<()> {
-    let plan = analyze_and_plan(statement, schema, settings, connection)?;
+    let plan = analyze_and_plan(statement, context, connection)?;
     let HirRoot::Query(root) = &plan.document.root else {
         return Err(LimboError::InternalError(
             "HIR SELECT analysis did not produce a query root".into(),
@@ -64,49 +66,84 @@ pub(crate) fn translate_select(
 pub(crate) struct PlannedSelect {
     plan: Arc<HirPlan>,
     query: hir::QueryId,
+    /// Outputs computed with custom-typed columns read as stored.
+    stored_outputs: Vec<usize>,
+}
+
+/// One value a schema statement reads from each row of a table.
+pub(crate) enum ScanValue {
+    /// An expression over the row, with custom-typed columns decoded, as a
+    /// query reads them.
+    Expr(ast::Expr),
+    /// An expression over the row with custom-typed columns read as stored:
+    /// an index key column, which DML writes as stored, or a CHECK
+    /// constraint, which DML checks over stored values.
+    Stored(ast::Expr),
+    /// The row's rowid, whatever the table's columns are named.
+    RowId,
 }
 
 impl PlannedSelect {
     pub(crate) fn new(
         select: ast::Select,
-        schema: &Arc<Schema>,
-        settings: &HirSettings<'_>,
+        context: &SemanticContext<'_>,
         connection: &Arc<Connection>,
     ) -> Result<Self> {
-        let plan = analyze_and_plan(&ast::Stmt::Select(select), schema, settings, connection)?;
+        let plan = analyze_and_plan(&ast::Stmt::Select(select), context, connection)?;
         let HirRoot::Query(root) = &plan.document.root else {
             return Err(LimboError::InternalError(
                 "HIR CTAS analysis did not produce a query root".into(),
             ));
         };
         let query = root.query;
-        Ok(Self { plan, query })
+        Ok(Self {
+            plan,
+            query,
+            stored_outputs: Vec::new(),
+        })
     }
 
     /// `SELECT <values>`, without FROM: how a schema statement evaluates
     /// expressions that read no table, such as the arguments of ATTACH.
     pub(crate) fn values(
         values: Vec<ast::Expr>,
-        schema: &Arc<Schema>,
-        settings: &HirSettings<'_>,
+        context: &SemanticContext<'_>,
         connection: &Arc<Connection>,
     ) -> Result<Self> {
         let select = Self::select(values, None, None);
-        Self::new(select, schema, settings, connection)
+        Self::new(select, context, connection)
     }
 
     /// `SELECT <values> FROM <database>.<table> NOT INDEXED [WHERE <filter>]`:
     /// how a schema statement reads every row of a table. NOT INDEXED keeps
     /// it reading the table itself, never one of its indexes.
     pub(crate) fn scan(
-        values: Vec<ast::Expr>,
+        values: Vec<ScanValue>,
         database: String,
         table: String,
         filter: Option<Box<ast::Expr>>,
-        schema: &Arc<Schema>,
-        settings: &HirSettings<'_>,
+        context: &SemanticContext<'_>,
         connection: &Arc<Connection>,
     ) -> Result<Self> {
+        let mut stored_outputs = Vec::new();
+        let mut rowid_outputs = Vec::new();
+        let columns = values
+            .into_iter()
+            .enumerate()
+            .map(|(position, value)| match value {
+                ScanValue::Expr(expr) => expr,
+                ScanValue::Stored(expr) => {
+                    stored_outputs.push(position);
+                    expr
+                }
+                // A rowid has no name in SQL when the table's columns take
+                // every rowid name; the output is rewritten after analysis.
+                ScanValue::RowId => {
+                    rowid_outputs.push(position);
+                    ast::Expr::Literal(ast::Literal::Null)
+                }
+            })
+            .collect();
         let from = ast::FromClause {
             select: Box::new(ast::SelectTable::Table(
                 ast::QualifiedName {
@@ -119,8 +156,22 @@ impl PlannedSelect {
             )),
             joins: vec![],
         };
-        let select = Self::select(values, Some(from), filter);
-        Self::new(select, schema, settings, connection)
+        let select = Self::select(columns, Some(from), filter);
+        let plan = HirSession::new(context, connection).plan_with(
+            SemanticRootInput::Statement(&ast::Stmt::Select(select)),
+            |document| rewrite_rowid_outputs(document, &rowid_outputs),
+        )?;
+        let HirRoot::Query(root) = &plan.document.root else {
+            return Err(LimboError::InternalError(
+                "HIR scan analysis did not produce a query root".into(),
+            ));
+        };
+        let query = root.query;
+        Ok(Self {
+            plan,
+            query,
+            stored_outputs,
+        })
     }
 
     fn select(
@@ -166,7 +217,7 @@ impl PlannedSelect {
             start_offset: start,
         });
         program.preassign_label_to_next_insn(start);
-        let values = self.emit_rows(program, yield_reg, start)?;
+        let values = self.emit_rows(program, yield_reg)?;
         program.emit_insn(Insn::EndCoroutine { yield_reg });
         program.preassign_label_to_next_insn(after_definition);
 
@@ -215,21 +266,8 @@ impl PlannedSelect {
         Ok(values)
     }
 
-    /// Whether the SELECT reads a column whose stored value it would decode:
-    /// a custom type or an array. An index stores the encoded value, so its
-    /// refill cannot read such a column through a SELECT.
-    pub(crate) fn decodes_stored_values(&self) -> bool {
-        self.plan.document.sources.iter().any(|source| {
-            source.column_type_programs.iter().any(Option::is_some)
-                || source
-                    .columns
-                    .iter()
-                    .any(|column| column.type_fact.is_array())
-        })
-    }
-
     /// Each column of the new table: the SELECT's output name, and the type
-    /// SQLite derives from the output's affinity, as legacy does.
+    /// SQLite derives from the output's affinity.
     pub(crate) fn columns(&self) -> Result<Vec<(String, &'static str)>> {
         let document = &self.plan.document;
         let query = document
@@ -244,13 +282,13 @@ impl PlannedSelect {
                 let output = document.output(*output).ok_or_else(|| {
                     LimboError::InternalError("HIR CTAS output is missing".into())
                 })?;
-                // Like legacy, a column read keeps its own name, without the
-                // table that qualifies it, unless it has an alias.
+                // A column read keeps its own name, without the table that
+                // qualifies it, unless it has an alias.
                 let name = match column.value {
                     ResolvedResultValue::Column(source) if !column.name_is_alias => {
                         source.column_name
                     }
-                    ResolvedResultValue::RowId(name) if !column.name_is_alias => name,
+                    ResolvedResultValue::RowId { name, .. } if !column.name_is_alias => name,
                     _ => column.name,
                 };
                 Ok((name, output.schema_affinity.short_type_name()))
@@ -264,7 +302,6 @@ impl PlannedSelect {
         &self,
         program: &mut ProgramBuilder,
         yield_reg: usize,
-        start: crate::vdbe::BranchOffset,
     ) -> Result<usize> {
         let width = self
             .plan
@@ -281,7 +318,7 @@ impl PlannedSelect {
                 self.query,
                 &QueryDestination::CoroutineYield {
                     yield_reg,
-                    coroutine_implementation_start: start,
+                    stored_outputs: self.stored_outputs.clone(),
                 },
             )
         })?;
@@ -289,25 +326,65 @@ impl PlannedSelect {
     }
 }
 
-/// Prepare a top-level DELETE through semantic HIR. Returns `false`, with
-/// nothing emitted, when the statement uses something only legacy lowers
-/// today; the caller then hands it to legacy.
-pub(crate) fn translate_delete(
-    statement: &ast::Stmt,
-    schema: &Arc<Schema>,
-    settings: &HirSettings<'_>,
+/// The DELETE that DROP TABLE runs first when foreign keys are on and other
+/// tables reference the table, as SQLite does: it fires the ON DELETE
+/// actions of those foreign keys and counts the RESTRICT and NO ACTION
+/// violations, with the table's own triggers off. The caller checks the
+/// count.
+pub(crate) fn translate_drop_table_delete(
+    database: &str,
+    table: &str,
+    context: &SemanticContext<'_>,
     program: &mut ProgramBuilder,
     connection: &Arc<Connection>,
-) -> Result<bool> {
+) -> Result<()> {
+    let statement = ast::Stmt::Delete {
+        with: None,
+        tbl_name: ast::QualifiedName {
+            db_name: Some(ast::Name::exact(database.to_string())),
+            name: ast::Name::exact(table.to_string()),
+            alias: None,
+        },
+        indexed: None,
+        where_clause: None,
+        returning: Vec::new(),
+    };
+    let session = HirSession::new(context, connection);
+    let plan = session.plan(SemanticRootInput::Statement(&statement))?;
+    let (HirRoot::Delete(delete), HirRootPlan::Delete(access)) = (&plan.document.root, &plan.root)
+    else {
+        return Err(LimboError::InternalError(
+            "HIR DELETE analysis did not produce a DELETE root".into(),
+        ));
+    };
+    delete::check(&plan.document, delete, access)?;
+    let subprograms = Subprograms {
+        actions: fkey_action::delete_actions(&session, program, delete)?,
+        ..Subprograms::default()
+    };
+    program.set_hir_plan(plan.clone());
+    delete::emit_delete(program, &plan, delete, access, &subprograms)
+}
+
+/// Prepare a top-level DELETE through semantic HIR.
+pub(crate) fn translate_delete(
+    statement: &ast::Stmt,
+    context: &SemanticContext<'_>,
+    program: &mut ProgramBuilder,
+    connection: &Arc<Connection>,
+) -> Result<()> {
     let ast::Stmt::Delete { tbl_name, .. } = statement else {
         return Err(LimboError::InternalError(
             "HIR DELETE got another statement".into(),
         ));
     };
-    if target_needs_legacy(schema, connection, tbl_name)? {
-        return Ok(false);
-    }
-    let session = HirSession::new(schema, settings, connection)?;
+    check_target(
+        context.main_schema(),
+        connection,
+        tbl_name,
+        "DELETE from table",
+    )?;
+    let session = HirSession::new(context, connection);
     let plan = session.plan(SemanticRootInput::Statement(statement))?;
     let (HirRoot::Delete(delete), HirRootPlan::Delete(access)) = (&plan.document.root, &plan.root)
     else {
@@ -315,75 +392,72 @@ pub(crate) fn translate_delete(
             "HIR DELETE analysis did not produce a DELETE root".into(),
         ));
     };
-    if delete::needs_legacy(&plan.document, delete, access)? {
-        return Ok(false);
+    if let Some(table) = dml::virtual_target(&plan.document, delete.target)? {
+        program.set_dbpage_writable(dml::dbpage_write_allowed(&table, connection));
     }
-    let Some(subprograms) = Subprograms::for_delete(&session, program, &plan, delete)? else {
-        return Ok(false);
-    };
+    delete::check(&plan.document, delete, access)?;
+    let subprograms = Subprograms::for_delete(&session, program, &plan, delete)?;
     program.set_hir_plan(plan.clone());
     delete::emit_delete(program, &plan, delete, access, &subprograms)?;
     if let Some(returning) = &delete.returning {
         program.resolved_result_columns =
             resolved_output_columns(&plan.document, &returning.outputs)?;
     }
-    Ok(true)
+    Ok(())
 }
 
-/// Prepare a top-level UPDATE through semantic HIR. Returns `false`, with
-/// nothing emitted, when the statement uses something only legacy lowers
-/// today; the caller then hands it to legacy.
+/// Prepare a top-level UPDATE through semantic HIR.
 pub(crate) fn translate_update(
     statement: &ast::Stmt,
-    schema: &Arc<Schema>,
-    settings: &HirSettings<'_>,
+    context: &SemanticContext<'_>,
     program: &mut ProgramBuilder,
     connection: &Arc<Connection>,
-) -> Result<bool> {
-    translate_update_with(statement, schema, settings, program, connection, None)
+) -> Result<()> {
+    translate_update_with(statement, context, program, connection, None)
 }
 
-/// Prepare the UPDATE of the schema table that ALTER TABLE generates. Like
-/// legacy, it may write the schema table, and change data capture records
-/// `ddl`, the ALTER statement, as the new `sql` value. Returns `false`, with
-/// nothing emitted, when the update needs legacy.
+/// Prepare the UPDATE of the schema table that ALTER TABLE generates. It
+/// may write the schema table, and change data capture records `ddl`, the
+/// ALTER statement, as the new `sql` value.
 pub(crate) fn translate_schema_update(
     statement: &ast::Stmt,
-    schema: &Arc<Schema>,
-    settings: &HirSettings<'_>,
+    context: &SemanticContext<'_>,
     program: &mut ProgramBuilder,
     connection: &Arc<Connection>,
     ddl: &str,
-) -> Result<bool> {
-    translate_update_with(statement, schema, settings, program, connection, Some(ddl))
+) -> Result<()> {
+    translate_update_with(statement, context, program, connection, Some(ddl))
 }
 
 fn translate_update_with(
     statement: &ast::Stmt,
-    schema: &Arc<Schema>,
-    settings: &HirSettings<'_>,
+    context: &SemanticContext<'_>,
     program: &mut ProgramBuilder,
     connection: &Arc<Connection>,
     schema_change: Option<&str>,
-) -> Result<bool> {
+) -> Result<()> {
     let ast::Stmt::Update(syntax) = statement else {
         return Err(LimboError::InternalError(
             "HIR UPDATE got another statement".into(),
         ));
     };
-    if schema_change.is_none() && target_needs_legacy(schema, connection, &syntax.tbl_name)? {
-        return Ok(false);
+    if schema_change.is_none() {
+        check_target(
+            context.main_schema(),
+            connection,
+            &syntax.tbl_name,
+            "UPDATE table",
+        )?;
     }
-    let session = HirSession::new(schema, settings, connection)?;
+    let session = HirSession::new(context, connection);
     let plan = session.plan(SemanticRootInput::Statement(statement))?;
     let (update, access) = update::update_root(&plan)?;
-    let mvcc = uses_mvcc(connection, &plan.document, update.target);
-    if update::needs_legacy(&plan, update, access)? {
-        return Ok(false);
+    if let Some(table) = dml::virtual_target(&plan.document, update.target)? {
+        program.set_dbpage_writable(dml::dbpage_write_allowed(&table, connection));
     }
-    let Some(subprograms) = Subprograms::for_update(&session, program, &plan, update)? else {
-        return Ok(false);
-    };
+    let mvcc = uses_mvcc(connection, &plan.document, update.target);
+    update::check(&plan, update, access)?;
+    let subprograms = Subprograms::for_update(&session, program, &plan, update)?;
     program.set_hir_plan(plan.clone());
     update::emit_update(
         program,
@@ -399,36 +473,35 @@ fn translate_update_with(
         program.resolved_result_columns =
             resolved_output_columns(&plan.document, &returning.outputs)?;
     }
-    Ok(true)
+    Ok(())
 }
 
-/// Prepare a top-level INSERT through semantic HIR. Returns `false`, with
-/// nothing emitted, when the statement uses something only legacy lowers
-/// today; the caller then hands it to legacy.
+/// Prepare a top-level INSERT through semantic HIR.
 pub(crate) fn translate_insert(
     statement: &ast::Stmt,
-    schema: &Arc<Schema>,
-    settings: &HirSettings<'_>,
+    context: &SemanticContext<'_>,
     program: &mut ProgramBuilder,
     connection: &Arc<Connection>,
-) -> Result<bool> {
+) -> Result<()> {
     let ast::Stmt::Insert { tbl_name, .. } = statement else {
         return Err(LimboError::InternalError(
             "HIR INSERT got another statement".into(),
         ));
     };
-    if target_needs_legacy(schema, connection, tbl_name)? {
-        return Ok(false);
-    }
-    let session = HirSession::new(schema, settings, connection)?;
+    check_target(
+        context.main_schema(),
+        connection,
+        tbl_name,
+        "INSERT into table",
+    )?;
+    let session = HirSession::new(context, connection);
     let plan = session.plan(SemanticRootInput::Statement(statement))?;
     let insert = insert::insert_root(&plan)?;
-    if insert::needs_legacy(&plan, insert, program)? {
-        return Ok(false);
+    if let Some(table) = dml::virtual_target(&plan.document, insert.target)? {
+        program.set_dbpage_writable(dml::dbpage_write_allowed(&table, connection));
     }
-    let Some(subprograms) = Subprograms::for_insert(&session, program, &plan, insert)? else {
-        return Ok(false);
-    };
+    insert::check(&plan, insert, program)?;
+    let subprograms = Subprograms::for_insert(&session, program, &plan, insert)?;
     program.set_hir_plan(plan.clone());
     insert::emit_insert(
         program,
@@ -442,13 +515,9 @@ pub(crate) fn translate_insert(
         program.resolved_result_columns =
             resolved_output_columns(&plan.document, &returning.outputs)?;
     }
-    Ok(true)
+    Ok(())
 }
 
-/// Checks of a DML target that legacy makes by name, in the main schema,
-/// before it looks the table up. A protected system table or a materialized
-/// view cannot be written. A table that materialized views read still needs
-/// legacy, which keeps the views up to date.
 /// Whether the database of `target` keeps its rows in MVCC.
 pub(super) fn uses_mvcc(
     connection: &Connection,
@@ -461,14 +530,15 @@ pub(super) fn uses_mvcc(
         .is_some_and(|database| connection.mv_store_for_db(database.index()).is_some())
 }
 
-fn target_needs_legacy(
+fn check_target(
     schema: &Schema,
     connection: &Connection,
     name: &ast::QualifiedName,
-) -> Result<bool> {
+    statement: &str,
+) -> Result<()> {
     let table_name = crate::util::normalize_ident(name.name.as_str());
-    // Like legacy, the statements the engine runs itself, such as VACUUM's,
-    // may write its internal tables.
+    // The statements the engine runs itself, such as VACUUM's, may write
+    // its internal tables.
     if !connection.is_nested_stmt()
         && !connection.is_mvcc_bootstrap_connection()
         && !crate::schema::allow_user_dml(&table_name)
@@ -488,122 +558,152 @@ fn target_needs_legacy(
         crate::bail_parse_error!("materialized views on WITHOUT ROWID tables are not supported");
     }
     // The VM keeps dependent materialized views up to date as rows are
-    // written; legacy reports views built by another DBSP version.
-    Ok(schema.with_incompatible_dependent_views(&table_name, |views| !views.is_empty()))
+    // written; views built by another DBSP version are an error.
+    schema.with_incompatible_dependent_views(&table_name, |views| {
+        if views.is_empty() {
+            return Ok(());
+        }
+        use crate::incremental::compiler::DBSP_CIRCUIT_VERSION;
+        crate::bail_parse_error!(
+            "Cannot {statement} '{table_name}' because it has incompatible dependent materialized view(s): {}. \n\
+             These views were created with a different DBSP version than the current version ({DBSP_CIRCUIT_VERSION}). \n\
+             Please DROP and recreate the view(s) before modifying this table.",
+            views.iter().map(|view| view.as_str()).collect::<Vec<_>>().join(", "),
+        );
+    })
 }
 
 /// What every HIR document of one statement is analyzed and planned with:
 /// the statement itself and each trigger it fires.
 pub(super) struct HirSession<'a> {
-    pub(super) schema: &'a Arc<Schema>,
+    pub(super) context: &'a SemanticContext<'a>,
     pub(super) connection: &'a Arc<Connection>,
-    catalog: SemanticCatalog,
-    symbols: &'a crate::SymbolTable,
-    dialect: Arc<dyn crate::dialect::Dialect>,
-    custom_types_enabled: bool,
-    dqs_dml: DoubleQuotedDml,
     /// The foreign-key actions being compiled.
     actions: fkey_action::ActionStack,
 }
 
-/// The settings a statement is analyzed with, taken from the connection
-/// and the prepare call rather than from legacy's resolver.
-pub(crate) struct HirSettings<'a> {
-    symbols: &'a crate::SymbolTable,
-    dialect: Arc<dyn crate::dialect::Dialect>,
-    custom_types_enabled: bool,
-    dqs_dml: DoubleQuotedDml,
-    /// The databases an unqualified name is looked up in, when the prepare
-    /// call sets them.
-    search_path: Option<&'a [String]>,
-}
-
-impl<'a> HirSettings<'a> {
-    pub(crate) fn new(
-        connection: &Connection,
-        symbols: &'a crate::SymbolTable,
-        dialect: Arc<dyn crate::dialect::Dialect>,
-        search_path: Option<&'a [String]>,
-    ) -> Self {
-        Self {
-            symbols,
-            dialect,
-            custom_types_enabled: connection.experimental_custom_types_enabled(),
-            dqs_dml: if connection.get_dqs_dml() {
-                DoubleQuotedDml::Enabled
-            } else {
-                DoubleQuotedDml::Disabled
-            },
-            search_path,
-        }
-    }
-}
-
 impl<'a> HirSession<'a> {
-    fn new(
-        schema: &'a Arc<Schema>,
-        settings: &HirSettings<'a>,
-        connection: &'a Arc<Connection>,
-    ) -> Result<Self> {
-        let catalog = SemanticCatalog::capture(
-            schema.clone(),
-            connection.database_schemas(),
-            &connection.temp.database,
-            connection.attached_databases(),
-            settings.custom_types_enabled,
-            settings.dialect.as_ref(),
-            settings.search_path,
-        )?;
-        Ok(Self {
-            schema,
+    fn new(context: &'a SemanticContext<'a>, connection: &'a Arc<Connection>) -> Self {
+        Self {
+            context,
             connection,
-            catalog,
-            symbols: settings.symbols,
-            dialect: settings.dialect.clone(),
-            custom_types_enabled: settings.custom_types_enabled,
-            dqs_dml: settings.dqs_dml,
             actions: fkey_action::ActionStack::default(),
-        })
+        }
     }
 
     /// Analyze `input` into HIR and choose its access paths.
     pub(super) fn plan(&self, input: SemanticRootInput<'_>) -> Result<Arc<HirPlan>> {
-        let document = analyze_root(
-            &self.catalog,
-            self.symbols,
-            SemanticOptions {
-                dialect: self.dialect.clone(),
-                custom_types_enabled: self.custom_types_enabled,
-                dqs_dml: self.dqs_dml,
-                foreign_keys_enabled: self.connection.foreign_keys_enabled(),
-                capture_changes_table: self
-                    .connection
-                    .get_capture_data_changes_info()
-                    .as_ref()
-                    .map(|info| info.table.clone()),
-            },
-            input,
-        )?;
+        self.plan_with(input, |_| Ok(()))
+    }
+
+    /// Like [`Self::plan`], with `rewrite` run on the analyzed document
+    /// before its access paths are chosen.
+    fn plan_with(
+        &self,
+        input: SemanticRootInput<'_>,
+        rewrite: impl FnOnce(&mut HirDocument) -> Result<()>,
+    ) -> Result<Arc<HirPlan>> {
+        let mut document = self.analyze(input)?;
+        rewrite(&mut document)?;
         Ok(Arc::new(HirPlan::build(
             Arc::new(document),
-            self.schema,
+            self.context.main_schema(),
             cost_model_params(),
         )?))
     }
+
+    /// Analyze `input` into HIR without choosing access paths.
+    fn analyze(&self, input: SemanticRootInput<'_>) -> Result<HirDocument> {
+        analyze_root(self.context, input)
+    }
+}
+
+/// Compile `expression` over `inputs.len()` values, which the program
+/// holds in registers `0..inputs.len()` when it runs, leaving the result
+/// in `target`. The expression reads input `n` as `Register(n)`.
+pub(crate) fn translate_register_expression(
+    program: &mut ProgramBuilder,
+    expression: &ast::Expr,
+    inputs: &[String],
+    schema: &Arc<Schema>,
+    symbols: &crate::SymbolTable,
+    connection: &Arc<Connection>,
+    target: usize,
+) -> Result<()> {
+    // The expression is SQLite text over the main schema, whatever the
+    // database's dialect or the prepare call's search path.
+    let dialect: Arc<dyn crate::dialect::Dialect> = Arc::new(crate::dialect::SqliteDialect);
+    let catalog = crate::translate::capture_catalog(schema, connection, dialect.as_ref(), None)?;
+    let context = crate::translate::semantic_context(&catalog, symbols, connection, dialect)?;
+    let document =
+        HirSession::new(&context, connection).analyze(SemanticRootInput::RegisterExpressions {
+            inputs,
+            expressions: std::slice::from_ref(expression),
+        })?;
+    let HirRoot::SchemaExpressions(root) = &document.root else {
+        return Err(LimboError::InternalError(
+            "register expression analysis did not produce an expression root".into(),
+        ));
+    };
+    program.bind_source(
+        root.source,
+        SourceBinding::Registers {
+            start: 0,
+            rowid: None,
+        },
+    );
+    expr::translate_expr_no_constant_opt(program, &document, &root.expressions[0], target)?;
+    Ok(())
+}
+
+/// Make each output in `positions` of a scan's one query block read the
+/// scanned table's rowid.
+fn rewrite_rowid_outputs(document: &mut HirDocument, positions: &[usize]) -> Result<()> {
+    if positions.is_empty() {
+        return Ok(());
+    }
+    let HirRoot::Query(root) = &document.root else {
+        return Err(LimboError::InternalError(
+            "HIR scan analysis did not produce a query root".into(),
+        ));
+    };
+    let query = root.query;
+    let [block] = document.queries[query.index()].blocks.as_mut_slice() else {
+        return Err(LimboError::InternalError(
+            "HIR scan has more than one query block".into(),
+        ));
+    };
+    let source = block
+        .from
+        .as_ref()
+        .map(|from| from.first)
+        .ok_or_else(|| LimboError::InternalError("HIR scan reads no table".into()))?;
+    for &position in positions {
+        let output = block.outputs.get_mut(position).ok_or_else(|| {
+            LimboError::InternalError(format!("HIR scan has no output {position}"))
+        })?;
+        output.expr = hir::Expr::rowid(source);
+        output.type_fact = hir::TypeFact::known(Type::Integer);
+        output.affinity = Affinity::Integer;
+        output.schema_affinity = Affinity::Integer;
+        output.has_affinity = true;
+    }
+    document
+        .validate()
+        .map_err(|error| LimboError::InternalError(error.to_string()))
 }
 
 /// Analyze one statement into HIR and choose its access paths.
 fn analyze_and_plan(
     statement: &ast::Stmt,
-    schema: &Arc<Schema>,
-    settings: &HirSettings<'_>,
+    context: &SemanticContext<'_>,
     connection: &Arc<Connection>,
 ) -> Result<Arc<HirPlan>> {
-    HirSession::new(schema, settings, connection)?.plan(SemanticRootInput::Statement(statement))
+    HirSession::new(context, connection).plan(SemanticRootInput::Statement(statement))
 }
 
 /// Result-column metadata for a statement prepared from resolved HIR. It
-/// answers the same column-name and type questions as the legacy plan's
+/// answers the column-name and type questions `Statement` asks about its
 /// result columns, without parser expressions or table references.
 #[derive(Debug, Clone)]
 pub(crate) struct ResolvedResultColumn {
@@ -614,7 +714,7 @@ pub(crate) struct ResolvedResultColumn {
     pub(crate) value: ResolvedResultValue,
     pub(crate) affinity: Affinity,
     /// The type name `Statement::get_column_type_info` reports for a
-    /// computed value, inferred as legacy does.
+    /// computed value, inferred by [`expression_primitive`].
     pub(crate) primitive: Option<&'static str>,
 }
 
@@ -623,8 +723,13 @@ pub(crate) enum ResolvedResultValue {
     Expression,
     /// The output reads one source column directly.
     Column(ResolvedResultSourceColumn),
-    /// The output reads a source rowid; this is the name legacy reports.
-    RowId(String),
+    /// The output reads a source rowid, named after its INTEGER PRIMARY KEY
+    /// alias when the table has one, else `rowid`.
+    RowId {
+        name: String,
+        /// The alias column's declared type, like SQLite reports.
+        declared_type: Option<String>,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -674,7 +779,7 @@ fn resolved_output_columns(
         .collect()
 }
 
-/// The type name of a computed value, by legacy's rules: a literal has its
+/// The type name of a computed value: a literal has its
 /// own type; arithmetic over two INTEGERs is INTEGER, over INTEGERs and REALs
 /// REAL, and NUMERIC otherwise; comparisons, logic and bitwise operators give
 /// INTEGER; `||` gives TEXT; anything else reports its affinity.
@@ -748,8 +853,8 @@ fn expression_primitive(document: &HirDocument, expression: &hir::Expr) -> Optio
     }
 }
 
-/// The affinity legacy gives an operand: a column's or CAST's own, and
-/// none for other expressions.
+/// The affinity of an operand: a column's or CAST's own, and none for other
+/// expressions.
 fn expression_affinity(document: &HirDocument, expression: &hir::Expr) -> Affinity {
     match expression {
         hir::Expr::Column(reference) => document
@@ -799,8 +904,7 @@ fn resolved_result_value(
                 ))
             })?;
             let declared = column.type_fact.declared.as_ref();
-            // Like legacy, a subquery column that reads a rowid is declared
-            // INTEGER.
+            // A subquery column that reads a rowid is declared INTEGER.
             let reads_rowid = declared.is_none()
                 && matches!(
                     &source.kind,
@@ -825,8 +929,8 @@ fn resolved_result_value(
                 )
             };
             Ok(ResolvedResultValue::Column(ResolvedResultSourceColumn {
-                // Legacy reports a FROM subquery by its alias and a CTE by
-                // its name.
+                // A FROM subquery is reported by its alias and a CTE by its
+                // name.
                 table_name: match (&source.kind, &source.alias) {
                     (hir::SourceKind::Derived(_), Some(alias)) => alias.clone(),
                     _ => source.name.clone(),
@@ -844,11 +948,18 @@ fn resolved_result_value(
                 .and_then(|table| {
                     table
                         .get_rowid_alias_column()
-                        .and_then(|(_, column)| column.name.clone())
+                        .map(|(_, column)| (column.name.clone(), column.ty_str.clone()))
                 });
-            Ok(ResolvedResultValue::RowId(
-                alias.unwrap_or_else(|| "rowid".to_string()),
-            ))
+            Ok(match alias {
+                Some((name, declared_type)) => ResolvedResultValue::RowId {
+                    name: name.unwrap_or_else(|| "rowid".to_string()),
+                    declared_type: (!declared_type.is_empty()).then_some(declared_type),
+                },
+                None => ResolvedResultValue::RowId {
+                    name: "rowid".to_string(),
+                    declared_type: None,
+                },
+            })
         }
         _ => Ok(ResolvedResultValue::Expression),
     }

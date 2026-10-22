@@ -15,6 +15,7 @@ mod scope;
 mod trigger;
 mod update;
 
+#[cfg(test)]
 pub(crate) struct SemanticOptions {
     pub(crate) dialect: crate::sync::Arc<dyn crate::dialect::Dialect>,
     pub(crate) custom_types_enabled: bool,
@@ -22,6 +23,9 @@ pub(crate) struct SemanticOptions {
     pub(crate) foreign_keys_enabled: bool,
     /// The table change data capture writes to, when it is on.
     pub(crate) capture_changes_table: Option<String>,
+    /// `full_column_names` on and `short_column_names` off: like SQLite,
+    /// `SELECT *` then names each column `source.column`.
+    pub(crate) long_column_names: bool,
 }
 
 pub(crate) enum SemanticRootInput<'ast> {
@@ -41,9 +45,15 @@ pub(crate) enum SemanticRootInput<'ast> {
         commands: &'ast [turso_parser::ast::TriggerCmd],
         conflict_override: Option<turso_parser::ast::ResolveType>,
     },
+    /// Expressions over values held in registers, read as `Register(n)`.
+    RegisterExpressions {
+        inputs: &'ast [String],
+        expressions: &'ast [turso_parser::ast::Expr],
+    },
 }
 
-pub(crate) fn analyze_root(
+#[cfg(test)]
+pub(crate) fn analyze_root_with_options(
     catalog: &catalog::SemanticCatalog,
     symbols: &crate::SymbolTable,
     options: SemanticOptions,
@@ -57,7 +67,16 @@ pub(crate) fn analyze_root(
         options.dqs_dml,
         options.foreign_keys_enabled,
     )?
-    .with_capture_changes(options.capture_changes_table);
+    .with_capture_changes(options.capture_changes_table)
+    .with_long_column_names(options.long_column_names);
+    analyze_root(&context, input)
+}
+
+/// Analyze `input` against `context` into validated HIR.
+pub(crate) fn analyze_root(
+    context: &context::SemanticContext<'_>,
+    input: SemanticRootInput<'_>,
+) -> crate::Result<hir::HirDocument> {
     let input = match input {
         SemanticRootInput::Statement(statement) => AnalyzeInput::Statement(statement),
         SemanticRootInput::TriggerProgram {
@@ -90,33 +109,50 @@ pub(crate) fn analyze_root(
                 conflict_override,
             })
         }
+        SemanticRootInput::RegisterExpressions {
+            inputs,
+            expressions,
+        } => AnalyzeInput::RegisterExpressions {
+            inputs,
+            expressions,
+        },
     };
-    analyze::analyze(&context, input)
+    analyze::analyze(context, input)
 }
 
 pub(crate) enum AnalyzeInput<'ast> {
     Statement(&'ast turso_parser::ast::Stmt),
+    /// One trigger body part on its own, which the analyzer tests analyze.
+    #[cfg(test)]
     TriggerPredicate {
         context: TriggerAnalysis,
         expression: &'ast turso_parser::ast::Expr,
     },
+    #[cfg(test)]
     TriggerSelect {
         context: TriggerAnalysis,
         select: &'ast turso_parser::ast::Select,
     },
+    #[cfg(test)]
     TriggerInsert {
         context: TriggerAnalysis,
         insert: TriggerInsert<'ast>,
     },
+    #[cfg(test)]
     TriggerUpdate {
         context: TriggerAnalysis,
         update: TriggerUpdate<'ast>,
     },
+    #[cfg(test)]
     TriggerDelete {
         context: TriggerAnalysis,
         delete: TriggerDelete<'ast>,
     },
     TriggerProgram(TriggerProgramInput<'ast>),
+    RegisterExpressions {
+        inputs: &'ast [String],
+        expressions: &'ast [turso_parser::ast::Expr],
+    },
 }
 
 pub(crate) struct TriggerProgramInput<'ast> {
@@ -215,8 +251,9 @@ mod tests {
             dqs_dml: DoubleQuotedDml::Disabled,
             foreign_keys_enabled: true,
             capture_changes_table: None,
+            long_column_names: false,
         };
-        let document = analyze_root(
+        let document = analyze_root_with_options(
             &catalog,
             &symbols,
             options(),
@@ -248,7 +285,7 @@ mod tests {
         else {
             panic!("SQL contains CREATE TRIGGER");
         };
-        let document = analyze_root(
+        let document = analyze_root_with_options(
             &catalog,
             &symbols,
             options(),
@@ -273,7 +310,7 @@ mod tests {
         assert!(program.predicate.is_some());
         assert_eq!(program.commands.len(), 1);
 
-        let error = analyze_root(
+        let error = analyze_root_with_options(
             &catalog,
             &symbols,
             options(),

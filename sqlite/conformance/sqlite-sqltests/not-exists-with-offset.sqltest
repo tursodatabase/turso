@@ -1,0 +1,53 @@
+@database :memory:
+
+# OFFSET skips a row that passed a NOT EXISTS or EXISTS filter, which runs
+# as an anti-join or semi-join. Skipping must move on to the next outer row:
+# going on with the inner loop would emit the same outer row again, once
+# for each later inner row.
+setup exists-offset-schema {
+    CREATE TABLE t1 (id INT PRIMARY KEY, value1 INTEGER);
+    CREATE TABLE t2 (id INT PRIMARY KEY, ref_id INTEGER, data INTEGER);
+    CREATE TABLE t3 (id INT PRIMARY KEY, category INTEGER);
+    INSERT INTO t1 VALUES (1, 0), (2, 0), (3, 0), (4, 0), (5, 0), (6, 0), (7, 0);
+    INSERT INTO t2 VALUES (1, 1, 0), (2, 5, 0), (3, 6, 0), (4, 2, 0), (5, 7, 0), (6, 8, 0),
+        (7, 9, 0), (8, 3, 0), (9, 10, 0), (10, 11, 0), (11, 12, 0), (12, 13, 0);
+    INSERT INTO t3 VALUES (1, 1), (2, 2), (3, 3), (4, 4), (5, 1), (6, 2);
+}
+
+@setup exists-offset-schema
+test not-exists-with-literal-offset {
+    SELECT * FROM t2 WHERE NOT EXISTS (SELECT 1 FROM t3 WHERE t3.category = t2.ref_id)
+    LIMIT 100 OFFSET 7;
+}
+expect {
+11|12|0
+12|13|0
+}
+
+@setup exists-offset-schema
+test not-exists-with-subquery-limit-and-offset {
+    SELECT * FROM t2 WHERE NOT EXISTS (SELECT 1 FROM t3 WHERE t3.category = t2.ref_id)
+    LIMIT (SELECT count(*) FROM t2) OFFSET (SELECT count(*) FROM t1);
+}
+expect {
+11|12|0
+12|13|0
+}
+
+@setup exists-offset-schema
+test not-exists-with-offset-past-the-end {
+    SELECT * FROM t3 WHERE NOT EXISTS (SELECT 1 FROM t2 WHERE t2.ref_id = t3.category)
+    LIMIT (SELECT count(*) FROM t2) OFFSET (SELECT count(*) FROM t1);
+}
+expect {
+}
+
+@setup exists-offset-schema
+test exists-with-offset-and-repeated-matches {
+    SELECT * FROM t2 WHERE EXISTS (SELECT 1 FROM t3 WHERE t3.category = t2.ref_id)
+    LIMIT 10 OFFSET 1;
+}
+expect {
+4|2|0
+8|3|0
+}

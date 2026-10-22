@@ -1,18 +1,13 @@
 use crate::function::{Func, ScalarFunc};
 use crate::translate::{
-    emitter::Resolver,
-    expr::{sanitize_string, translate_expr},
-    semantic_lowering::{HirSettings, PlannedSelect},
-    ProgramBuilder, ProgramBuilderOpts,
+    expr::sanitize_string, semantic_lowering::PlannedSelect, ProgramBuilder, ProgramBuilderOpts,
 };
 use crate::util::normalize_ident;
 use crate::vdbe::insn::Insn;
-use crate::{schema::Schema, sync::Arc, Connection, Result};
+use crate::{sync::Arc, Connection, Result};
 use turso_parser::ast::{Expr, Literal};
 
-/// The HIR settings ATTACH and DETACH evaluate their arguments with, when
-/// HIR is on.
-type HirContext<'a> = Option<(&'a Arc<Schema>, &'a HirSettings<'a>)>;
+use crate::translate::semantic::context::SemanticContext;
 
 /// How an ATTACH or DETACH argument gets its value.
 enum Argument<'a> {
@@ -40,9 +35,8 @@ impl<'a> Argument<'a> {
 /// the evaluated arguments run as one `SELECT` planned through HIR.
 fn emit_arguments(
     program: &mut ProgramBuilder,
-    resolver: &Resolver,
     connection: &Arc<Connection>,
-    hir: HirContext<'_>,
+    catalog: &SemanticContext<'_>,
     arguments: &[Argument<'_>],
     start: usize,
 ) -> Result<()> {
@@ -53,12 +47,11 @@ fn emit_arguments(
             _ => None,
         })
         .collect();
-    let mut hir_values = match hir {
-        Some((schema, settings)) if !values.is_empty() => {
-            let select = PlannedSelect::values(values, schema, settings, connection)?;
-            Some(select.emit_values(program)?)
-        }
-        _ => None,
+    let mut hir_values = if values.is_empty() {
+        None
+    } else {
+        let select = PlannedSelect::values(values, catalog, connection)?;
+        Some(select.emit_values(program)?)
     };
     for (i, argument) in arguments.iter().enumerate() {
         let dest = start + i;
@@ -69,7 +62,7 @@ fn emit_arguments(
                     dest,
                 });
             }
-            Argument::Value(expr) => match &mut hir_values {
+            Argument::Value(_) => match &mut hir_values {
                 Some(value) => {
                     program.emit_insn(Insn::Copy {
                         src_reg: *value,
@@ -79,7 +72,9 @@ fn emit_arguments(
                     *value += 1;
                 }
                 None => {
-                    translate_expr(program, None, expr, dest, resolver)?;
+                    return Err(crate::LimboError::InternalError(
+                        "ATTACH argument was not planned".to_string(),
+                    ))
                 }
             },
             Argument::Null => {
@@ -96,12 +91,11 @@ fn emit_arguments(
 /// Translate ATTACH statement
 pub fn translate_attach(
     expr: &Expr,
-    resolver: &Resolver,
     db_name: &Expr,
     key: &Option<Box<Expr>>,
     program: &mut ProgramBuilder,
     connection: Arc<Connection>,
-    hir: HirContext<'_>,
+    catalog: &SemanticContext<'_>,
 ) -> Result<()> {
     if !connection.experimental_attach_enabled() {
         return Err(crate::LimboError::ParseError(
@@ -124,9 +118,8 @@ pub fn translate_attach(
     };
     emit_arguments(
         program,
-        resolver,
         &connection,
-        hir,
+        catalog,
         &[Argument::new(expr), Argument::new(db_name), key],
         arg_reg,
     )?;
@@ -148,10 +141,9 @@ pub fn translate_attach(
 /// Translate DETACH statement
 pub fn translate_detach(
     expr: &Expr,
-    resolver: &Resolver,
     program: &mut ProgramBuilder,
     connection: Arc<Connection>,
-    hir: HirContext<'_>,
+    catalog: &SemanticContext<'_>,
 ) -> Result<()> {
     if !connection.experimental_attach_enabled() {
         return Err(crate::LimboError::ParseError(
@@ -165,9 +157,8 @@ pub fn translate_detach(
 
     emit_arguments(
         program,
-        resolver,
         &connection,
-        hir,
+        catalog,
         &[Argument::new(expr)],
         arg_reg,
     )?;

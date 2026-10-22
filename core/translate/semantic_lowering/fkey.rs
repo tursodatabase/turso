@@ -1,9 +1,8 @@
 //! Foreign-key checks for DML lowered from HIR.
 //!
-//! The checks follow legacy's bytecode (`translate/fkeys.rs`), but read key
-//! values through HIR sources instead of the resolver. Only NO ACTION and
-//! RESTRICT are lowered here: a statement whose parent-side action is
-//! CASCADE, SET NULL or SET DEFAULT still goes to legacy.
+//! The checks read key values through HIR sources. Only NO ACTION and
+//! RESTRICT are lowered here: a parent-side CASCADE, SET NULL or SET DEFAULT
+//! changes the child rows instead, through `fkey_action`.
 //!
 //! Violations of an immediate constraint add to the statement's counter,
 //! checked when the statement ends; deferred ones add to the connection's
@@ -61,8 +60,8 @@ fn child_key_changes(foreign_key: &hir::ResolvedForeignKey, assigned: &[usize]) 
 /// row that pointed at a missing parent takes back the violation it added.
 ///
 /// `replacement` is a row that REPLACE writes in place of this one, bound to
-/// its registers. Like legacy, an immediate NO ACTION constraint whose key
-/// it keeps is not checked.
+/// its registers. An immediate NO ACTION constraint whose key it keeps is
+/// not checked.
 pub(super) fn emit_delete_checks(
     program: &mut ProgramBuilder,
     document: &HirDocument,
@@ -97,15 +96,7 @@ pub(super) fn emit_delete_checks(
         }
     }
     for foreign_key in &foreign_keys.outgoing {
-        if foreign_key.declaration.deferred {
-            emit_deleted_child_releases_violation(
-                program,
-                document,
-                foreign_key,
-                target,
-                database,
-            )?;
-        }
+        emit_deleted_child_releases_violation(program, document, foreign_key, target, database)?;
     }
     Ok(())
 }
@@ -136,8 +127,8 @@ fn emit_children_still_point_here(
             emit_fk_violation(program, &declaration)
         }
     };
-    // Like legacy, a self-reference scans the table so that the row being
-    // deleted does not count as its own child.
+    // A self-reference scans the table so that the row being deleted does
+    // not count as its own child.
     match foreign_key.child_index.as_ref().filter(|_| !self_reference) {
         Some(index) => {
             let cursor = open_read_index(program, &index.handle(), database);
@@ -158,8 +149,11 @@ fn emit_children_still_point_here(
     Ok(())
 }
 
-/// A deleted child row whose parent was missing added one to the deferred
-/// counter when it was written; take that back.
+/// A deleted child row whose parent is missing counted one violation, when
+/// it was written or when its parent went earlier in this statement; take
+/// that back. Like SQLite, this holds for immediate constraints too: a
+/// statement that deletes a parent and its children, such as `DELETE FROM
+/// t` on a self-referencing table, is checked when it ends, not row by row.
 fn emit_deleted_child_releases_violation(
     program: &mut ProgramBuilder,
     document: &HirDocument,
@@ -168,6 +162,7 @@ fn emit_deleted_child_releases_violation(
     database: usize,
 ) -> Result<()> {
     let width = foreign_key.child_positions.len();
+    let deferred = foreign_key.declaration.deferred;
     let key = emit_child_key(program, document, foreign_key, target)?;
     let skip = program.allocate_label();
     emit_skip_if_any_null(program, key, width, skip);
@@ -194,7 +189,7 @@ fn emit_deleted_child_releases_violation(
         program.emit_insn(Insn::Goto { target_pc: skip });
         program.preassign_label_to_next_insn(missing);
         program.emit_insn(Insn::Close { cursor_id: cursor });
-        emit_guarded_fk_decrement(program, skip, true);
+        emit_guarded_fk_decrement(program, skip, deferred);
     } else {
         let index = parent_index(foreign_key)?;
         let cursor = open_read_index(program, &index.handle(), database);
@@ -207,7 +202,7 @@ fn emit_deleted_child_releases_violation(
             num_regs: width,
         });
         program.emit_insn(Insn::Close { cursor_id: cursor });
-        emit_guarded_fk_decrement(program, found, true);
+        emit_guarded_fk_decrement(program, found, deferred);
         program.preassign_label_to_next_insn(found);
         program.emit_insn(Insn::Close { cursor_id: cursor });
     }
@@ -235,13 +230,21 @@ pub(super) fn emit_insert_child_checks(
         emit_skip_if_any_null(program, key, width, ok);
         let parent_table = btree(&foreign_key.parent_table)?;
         let self_reference = is_self_reference(foreign_key);
-        let deferred = foreign_key.declaration.deferred;
         let declaration = foreign_key.declaration.clone();
+        // Like SQLite, a statement that writes one row on its own stops at
+        // a missing parent at once, so it needs no statement journal to
+        // take the row back. Otherwise a missing parent counts a violation
+        // and an immediate one fails the statement when it ends, which lets
+        // one statement write a child before its parent, as `INSERT INTO t
+        // VALUES (7, 8), (8, 7)` does on a self-referencing table.
+        let halts = !foreign_key.declaration.deferred
+            && !program.flags.is_multi_write()
+            && !program.flags.is_subprogram();
         let violation = move |program: &mut ProgramBuilder| -> Result<()> {
-            if deferred {
-                emit_fk_violation(program, &declaration)
-            } else {
+            if halts {
                 emit_fk_restrict_halt(program)
+            } else {
+                emit_fk_violation(program, &declaration)
             }
         };
         if foreign_key.parent_uses_rowid {
@@ -297,8 +300,7 @@ pub(super) fn emit_insert_child_checks(
 /// violation. `target` must be bound to the row's registers.
 ///
 /// Under REPLACE (`replaced`), a deleted conflicting row may have counted
-/// children of any constraint, so every constraint is repaired, as legacy
-/// does.
+/// children of any constraint, so every constraint is repaired.
 pub(super) fn emit_insert_parent_repairs(
     program: &mut ProgramBuilder,
     document: &HirDocument,
@@ -375,7 +377,7 @@ pub(super) fn emit_insert_parent_repairs(
 /// row's registers, and `rowid` must hold the rowid; `assigned` lists the
 /// columns the UPDATE sets.
 ///
-/// Like legacy, where the target is the parent and the parent key changes,
+/// Where the target is the parent and the parent key changes,
 /// children of the old key become violations (RESTRICT stops at once) and
 /// children of the new key take back deferred violations. Where the target
 /// is the child and the child key changes, the old key takes back its
@@ -582,7 +584,7 @@ pub(super) struct PendingRepair<'a> {
 }
 
 /// After the row is written, children of a new deferred parent key take
-/// back their violations, as legacy does under REPLACE.
+/// back their violations.
 pub(super) fn emit_update_repairs(
     program: &mut ProgramBuilder,
     pending: &[PendingRepair<'_>],
@@ -633,8 +635,7 @@ fn emit_new_parent_key_repairs(
     )
 }
 
-/// Jump to `same` when the two keys are equal, NULLs included, as legacy's
-/// parent-key change test does.
+/// Jump to `same` when the two keys are equal, NULLs included.
 pub(super) fn emit_skip_if_same_key(
     program: &mut ProgramBuilder,
     old_key: usize,
@@ -665,9 +666,9 @@ pub(super) fn emit_skip_if_same_key(
 }
 
 /// Run `on_match` for child rows that point at the parent key in `key`,
-/// skipping the child row `exclude` and keys with a NULL. Like legacy, an
-/// index that lists exactly the child key is probed, and otherwise the child
-/// table is scanned.
+/// skipping the child row `exclude` and keys with a NULL. An index that
+/// lists exactly the child key is probed, and otherwise the child table is
+/// scanned.
 fn emit_child_probe(
     program: &mut ProgramBuilder,
     foreign_key: &hir::ResolvedForeignKey,
@@ -706,8 +707,8 @@ fn emit_child_probe(
 
 /// Jump to `ok` when the child key in `child_key` equals the parent key of
 /// the same row `row`, compared as stored and with BINARY: once written, the
-/// row is its own parent. Like legacy and SQLite, the parent's affinity is
-/// not applied here.
+/// row is its own parent. Like SQLite, the parent's affinity is not applied
+/// here.
 fn emit_own_parent_check(
     program: &mut ProgramBuilder,
     document: &HirDocument,
@@ -761,8 +762,8 @@ pub(super) fn emit_parent_key(
     Ok(start)
 }
 
-/// Like [`emit_parent_key`], with custom-typed columns as stored: like
-/// legacy, the checks compare stored keys.
+/// Like [`emit_parent_key`], with custom-typed columns as stored: the
+/// checks compare stored keys.
 fn emit_stored_parent_key(
     program: &mut ProgramBuilder,
     document: &HirDocument,

@@ -3,22 +3,19 @@ use crate::error::SQLITE_CONSTRAINT_UNIQUE;
 use crate::function::Func;
 use crate::index_method::IndexMethodConfiguration;
 use crate::numeric::Numeric;
-use crate::schema::{Column, GeneratedType, Table, EXPR_INDEX_SENTINEL, RESERVED_TABLE_PREFIXES};
+use crate::schema::{Column, GeneratedType, EXPR_INDEX_SENTINEL, RESERVED_TABLE_PREFIXES};
 use crate::sync::Arc;
+use crate::translate::semantic::context::SemanticContext;
 use crate::translate::{
     collate::CollationSeq,
     emitter::{
         emit_cdc_autocommit_commit, emit_cdc_full_record, emit_cdc_insns, prepare_cdc_if_necessary,
-        OperationMode, Resolver,
+        OperationMode,
     },
-    expr::{
-        bind_and_rewrite_expr, translate_condition_expr, translate_expr, unwrap_parens, walk_expr,
-        BindingBehavior, ConditionMetadata, WalkControl,
-    },
-    insert::format_unique_violation_desc,
-    plan::{ColumnUsedMask, IterationDirection, JoinedTable, Operation, Scan, TableReferences},
+    expr::{unwrap_parens, walk_expr, WalkControl},
+    semantic_lowering::{format_unique_violation_desc, PlannedSelect, ScanValue},
 };
-use crate::vdbe::builder::{CursorKey, ProgramBuilderOpts, SelfTableContext};
+use crate::vdbe::builder::ProgramBuilderOpts;
 use crate::vdbe::insn::{to_u32, CmpInsFlags, Cookie};
 use crate::{bail_parse_error, CaptureDataChangesExt, LimboError, MAIN_DB_ID, TEMP_DB_ID};
 use crate::{
@@ -85,9 +82,8 @@ fn validate(
 pub fn translate_create_index(
     program: &mut ProgramBuilder,
     connection: &Arc<crate::Connection>,
-    resolver: &Resolver,
+    catalog: &SemanticContext<'_>,
     stmt: ast::Stmt,
-    hir: HirContext<'_>,
 ) -> crate::Result<()> {
     let sql = canonical_create_index_sql(&stmt);
     let ast::Stmt::CreateIndex {
@@ -107,9 +103,9 @@ pub fn translate_create_index(
     let original_idx_name = idx_name;
     let original_tbl_name = tbl_name;
     let database_id = if original_idx_name.db_name.is_some() {
-        resolver.resolve_database_id(&original_idx_name)?
+        catalog.resolve_database_id(&original_idx_name)?
     } else {
-        resolver.resolve_existing_table_database_id(original_tbl_name.as_str())?
+        catalog.resolve_existing_table_database_id(original_tbl_name.as_str())?
     };
     let idx_name = normalize_ident(original_idx_name.name.as_str());
     let tbl_name = normalize_ident(original_tbl_name.as_str());
@@ -125,12 +121,12 @@ pub fn translate_create_index(
     let opts = ProgramBuilderOpts::new(5, 40, 5);
     program.extend(&opts);
 
-    let schema_cookie = resolver.with_schema(database_id, |s| s.schema_version);
+    let schema_cookie = catalog.with_schema(database_id, |s| s.schema_version);
     program.begin_write_on_database(database_id, schema_cookie)?;
 
     // Check if the index is being created on a valid btree table and
     // the name is globally unique in the schema.
-    let schema_unique = resolver.with_schema(database_id, |s| s.is_unique_idx_name(&idx_name));
+    let schema_unique = catalog.with_schema(database_id, |s| s.is_unique_idx_name(&idx_name));
     if !schema_unique {
         // If IF NOT EXISTS is specified, silently return without error
         if if_not_exists {
@@ -138,17 +134,17 @@ pub fn translate_create_index(
         }
         crate::bail_parse_error!("index {} already exists", original_idx_name.name.as_str());
     }
-    let table = resolver.with_schema(database_id, |s| s.get_table(&tbl_name));
+    let table = catalog.with_schema(database_id, |s| s.get_table(&tbl_name));
     let Some(table) = table else {
-        if resolver.with_schema(database_id, |s| {
+        if catalog.with_schema(database_id, |s| {
             s.get_view(&tbl_name).is_some() || s.is_materialized_view(&tbl_name)
         }) {
             crate::bail_parse_error!("views may not be indexed");
         }
         // The index's target table always lives in the index's own database,
         // so SQLite qualifies the missing table with that database name.
-        let db_name = resolver
-            .get_database_name_by_index(database_id)
+        let db_name = catalog
+            .database_name_by_index(database_id)
             .unwrap_or_else(|| "main".to_string());
         crate::bail_parse_error!("no such table: {}.{}", db_name, original_tbl_name.as_str());
     };
@@ -158,15 +154,15 @@ pub fn translate_create_index(
     if !tbl.has_rowid {
         bail_parse_error!("CREATE INDEX on WITHOUT ROWID tables is not supported");
     }
-    let columns = resolve_sorted_columns_with_resolver(&tbl, &columns, Some(resolver))?;
+    let columns = resolve_sorted_columns_with_resolver(&tbl, &columns, Some(catalog))?;
 
     // Block CREATE INDEX on non-orderable custom type columns and STRUCT/UNION columns
     for col in &columns {
         if col.expr.is_none() {
             // Simple column reference (not expression index)
             if let Some(column) = tbl.columns().get(col.pos_in_table) {
-                if let Some(type_def) = resolver
-                    .schema()
+                if let Some(type_def) = catalog
+                    .main_schema()
                     .get_type_def(&column.ty_str, tbl.is_strict)
                 {
                     if type_def.is_struct() || type_def.is_union() {
@@ -197,7 +193,7 @@ pub fn translate_create_index(
 
     let mut index_method = None;
     if let Some(using) = &using {
-        let index_modules = &resolver.symbol_table.index_methods;
+        let index_modules = &catalog.symbols().index_methods;
         let using = using.as_str();
         let index_module = index_modules.get(using);
         if index_module.is_none() {
@@ -228,7 +224,7 @@ pub fn translate_create_index(
         on_conflict: None,
     });
 
-    if !idx.validate_where_expr(&table, resolver) {
+    if !idx.validate_where_expr(&table) {
         crate::bail_parse_error!(
             "Error: cannot use aggregate, window functions or reference other tables in WHERE clause of CREATE INDEX:\n {}",
             where_clause
@@ -238,7 +234,10 @@ pub fn translate_create_index(
         );
     }
 
-    let sqlite_table = resolver.schema().get_btree_table(SQLITE_TABLEID).unwrap();
+    let sqlite_table = catalog
+        .main_schema()
+        .get_btree_table(SQLITE_TABLEID)
+        .unwrap();
     let sqlite_schema_cursor_id =
         program.alloc_cursor_id(CursorType::BTreeTable(sqlite_table.clone()));
 
@@ -266,10 +265,10 @@ pub fn translate_create_index(
         root_page: RegisterOrLiteral::Literal(sqlite_table.root_page),
         db: database_id,
     });
-    let cdc_table = prepare_cdc_if_necessary(program, resolver.schema(), Some(SQLITE_TABLEID))?;
+    let cdc_table = prepare_cdc_if_necessary(program, catalog.main_schema(), Some(SQLITE_TABLEID))?;
     emit_schema_entry(
         program,
-        resolver,
+        catalog,
         sqlite_schema_cursor_id,
         cdc_table.map(|x| x.0),
         SchemaEntryType::Index,
@@ -281,9 +280,8 @@ pub fn translate_create_index(
 
     emit_refill_index(
         program,
-        resolver,
         connection,
-        hir,
+        catalog,
         database_id,
         &tbl,
         &idx,
@@ -292,7 +290,7 @@ pub fn translate_create_index(
         None,
     )?;
 
-    let current_schema_version = resolver.with_schema(database_id, |s| s.schema_version);
+    let current_schema_version = catalog.with_schema(database_id, |s| s.schema_version);
     program.emit_insn(Insn::SetCookie {
         db: database_id,
         cookie: Cookie::SchemaVersion,
@@ -315,178 +313,56 @@ pub fn translate_create_index(
     Ok(())
 }
 
-/// The HIR settings a schema statement plans its SELECTs with, when HIR is on.
-type HirContext<'a> = Option<(
-    &'a Arc<crate::schema::Schema>,
-    &'a crate::translate::semantic_lowering::HirSettings<'a>,
-)>;
-
-/// How a refill reads the rows of the indexed table.
-enum RefillRows {
-    /// Scan the table cursor, and check and compute each index column with
-    /// the legacy expression translator.
-    Legacy {
-        table_cursor_id: usize,
-        table_references: Box<TableReferences>,
-        where_clause: Option<Box<ast::Expr>>,
-    },
-    /// Run `SELECT <index columns>, rowid FROM <table> NOT INDEXED [WHERE
-    /// <partial index condition>]`, planned through HIR.
-    Hir(crate::translate::semantic_lowering::PlannedSelect),
-}
-
-/// Plan the rows that fill `idx` through HIR. Returns `None` when the table
-/// stores values a SELECT would decode, or when every rowid name is taken by
-/// a real column; legacy fills the index then.
+/// Plan the rows that fill `idx`: each index column as DML writes it, then
+/// the rowid.
 fn hir_refill_select(
     connection: &Arc<crate::Connection>,
-    hir: HirContext<'_>,
+    catalog: &SemanticContext<'_>,
     database_id: usize,
     tbl: &BTreeTable,
     idx: &Index,
-) -> crate::Result<Option<crate::translate::semantic_lowering::PlannedSelect>> {
-    let Some((schema, settings)) = hir else {
-        return Ok(None);
+) -> crate::Result<PlannedSelect> {
+    let database = connection
+        .get_database_name_by_index(database_id)
+        .ok_or_else(|| LimboError::InternalError(format!("no database with id {database_id}")))?;
+    let column = |position: usize| -> crate::Result<Expr> {
+        let name = tbl.columns()[position].name.as_deref().ok_or_else(|| {
+            LimboError::InternalError(format!("column {position} of {} has no name", tbl.name))
+        })?;
+        Ok(Expr::Qualified(
+            ast::Name::exact(tbl.name.clone()),
+            ast::Name::exact(name.to_string()),
+        ))
     };
-    let Some(rowid_name) = ["rowid", "_rowid_", "oid"].into_iter().find(|name| {
-        !tbl.columns().iter().any(|column| {
-            column
-                .name
-                .as_deref()
-                .is_some_and(|column| column.eq_ignore_ascii_case(name))
-        })
-    }) else {
-        return Ok(None);
-    };
-    let Some(database) = connection.get_database_name_by_index(database_id) else {
-        return Ok(None);
-    };
-    let table = || ast::Name::exact(tbl.name.clone());
     let mut values = Vec::with_capacity(idx.columns.len() + 1);
-    for column in &idx.columns {
-        // A virtual generated column's index entry holds its bound
-        // expression; name the column instead, and the SELECT computes it.
-        let value = if column.pos_in_table == EXPR_INDEX_SENTINEL {
-            let Some(expr) = &column.expr else {
+    for column_def in &idx.columns {
+        // Values are read the way DML writes the index: a plain column as
+        // stored, an expression or a virtual generated column computed from
+        // decoded values.
+        let value = if column_def.pos_in_table == EXPR_INDEX_SENTINEL {
+            let Some(expr) = &column_def.expr else {
                 return Err(LimboError::InternalError(format!(
                     "expression index column of {} has no expression",
                     idx.name
                 )));
             };
-            *expr.clone()
+            ScanValue::Expr(*expr.clone())
+        } else if tbl.columns()[column_def.pos_in_table].is_virtual_generated() {
+            ScanValue::Expr(column(column_def.pos_in_table)?)
         } else {
-            let Some(name) = tbl.columns()[column.pos_in_table].name.clone() else {
-                return Ok(None);
-            };
-            Expr::Qualified(table(), ast::Name::exact(name))
+            ScanValue::Stored(column(column_def.pos_in_table)?)
         };
         values.push(value);
     }
-    values.push(Expr::Qualified(
-        table(),
-        ast::Name::exact(rowid_name.into()),
-    ));
-    let select = crate::translate::semantic_lowering::PlannedSelect::scan(
+    values.push(ScanValue::RowId);
+    PlannedSelect::scan(
         values,
         database,
         tbl.name.clone(),
         idx.where_clause.clone(),
-        schema,
-        settings,
+        catalog,
         connection,
-    )?;
-    if select.decodes_stored_values() {
-        return Ok(None);
-    }
-    Ok(Some(select))
-}
-
-/// Emit a loop over the rows that fill `idx`. For each row, `body` gets the
-/// first of `idx.columns.len() + 1` registers: the index columns, then the
-/// rowid.
-#[allow(clippy::too_many_arguments)]
-fn emit_refill_rows(
-    program: &mut ProgramBuilder,
-    resolver: &Resolver,
-    database_id: usize,
-    tbl: &Arc<BTreeTable>,
-    idx: &Index,
-    rows: &mut RefillRows,
-    body: impl FnOnce(&mut ProgramBuilder, usize) -> crate::Result<()>,
-) -> crate::Result<()> {
-    let columns = &idx.columns;
-    match rows {
-        RefillRows::Hir(select) => select.emit_each_row(program, body)?,
-        RefillRows::Legacy {
-            table_cursor_id,
-            table_references,
-            where_clause,
-        } => {
-            let table_cursor_id = *table_cursor_id;
-            program.emit_insn(Insn::OpenRead {
-                cursor_id: table_cursor_id,
-                root_page: tbl.root_page,
-                db: database_id,
-            });
-
-            let loop_start_label = program.allocate_label();
-            let loop_end_label = program.allocate_label();
-            program.emit_insn(Insn::Rewind {
-                cursor_id: table_cursor_id,
-                pc_if_empty: loop_end_label,
-            });
-            program.preassign_label_to_next_insn(loop_start_label);
-
-            let mut skip_row_label = None;
-            if let Some(where_clause) = where_clause {
-                let label = program.allocate_label();
-                let condition_true_label = program.allocate_label();
-                translate_condition_expr(
-                    program,
-                    table_references,
-                    where_clause,
-                    ConditionMetadata {
-                        jump_if_condition_is_true: false,
-                        jump_target_when_false: label,
-                        jump_target_when_true: condition_true_label,
-                        jump_target_when_null: label,
-                    },
-                    resolver,
-                )?;
-                program.preassign_label_to_next_insn(condition_true_label);
-                skip_row_label = Some(label);
-            }
-
-            let start_reg = program.alloc_registers(columns.len() + 1);
-            for (i, col) in columns.iter().enumerate() {
-                emit_index_column_value_from_cursor(
-                    program,
-                    resolver,
-                    table_references,
-                    table_cursor_id,
-                    tbl,
-                    col,
-                    start_reg + i,
-                )?;
-            }
-            program.emit_insn(Insn::RowId {
-                cursor_id: table_cursor_id,
-                dest: start_reg + columns.len(),
-            });
-            body(program, start_reg)?;
-
-            if let Some(skip_row_label) = skip_row_label {
-                program.preassign_label_to_next_insn(skip_row_label);
-            }
-            program.emit_insn(Insn::Next {
-                cursor_id: table_cursor_id,
-                pc_if_next: loop_start_label,
-                fullscan: false,
-            });
-            program.preassign_label_to_next_insn(loop_end_label);
-        }
-    }
-    Ok(())
+    )
 }
 
 /// Emits the bytecode that rebuilds `idx` from a full scan of `tbl`.
@@ -498,9 +374,8 @@ fn emit_refill_rows(
 #[allow(clippy::too_many_arguments)]
 fn emit_refill_index(
     program: &mut ProgramBuilder,
-    resolver: &Resolver,
     connection: &Arc<crate::Connection>,
-    hir: HirContext<'_>,
+    catalog: &SemanticContext<'_>,
     database_id: usize,
     tbl: &Arc<BTreeTable>,
     idx: &Arc<Index>,
@@ -508,50 +383,10 @@ fn emit_refill_index(
     index_root_page: RegisterOrLiteral<i64>,
     clear_existing_root: Option<i64>,
 ) -> crate::Result<()> {
-    let mut rows = match hir_refill_select(connection, hir, database_id, tbl, idx)? {
-        Some(select) => RefillRows::Hir(select),
-        None => {
-            let table_ref = program.table_reference_counter.next();
-            let table_cursor_id = program.alloc_cursor_id_keyed(
-                CursorKey::table(table_ref),
-                CursorType::BTreeTable(tbl.clone()),
-            );
-            let mut table_references = TableReferences::new(
-                vec![JoinedTable {
-                    op: Operation::Scan(Scan::BTreeTable {
-                        iter_dir: IterationDirection::Forwards,
-                        index: None,
-                    }),
-                    table: Table::BTree(tbl.clone()),
-                    identifier: normalize_ident(tbl.name.as_str()),
-                    internal_id: table_ref,
-                    join_info: None,
-                    col_used_mask: ColumnUsedMask::default(),
-                    column_use_counts: Vec::new(),
-                    expression_index_usages: Vec::new(),
-                    database_id,
-                    indexed: None,
-                }],
-                vec![],
-            );
-            let where_clause = idx.bind_where_expr(Some(&mut table_references), resolver)?;
-            RefillRows::Legacy {
-                table_cursor_id,
-                table_references: Box::new(table_references),
-                where_clause: where_clause.map(Box::new),
-            }
-        }
-    };
+    let rows = hir_refill_select(connection, catalog, database_id, tbl, idx)?;
     let columns = &idx.columns;
     let tbl_name = normalize_ident(tbl.name.as_str());
     let mut cursors = vec![index_cursor_id];
-    if let RefillRows::Legacy {
-        table_cursor_id, ..
-    } = &rows
-    {
-        cursors.push(*table_cursor_id);
-    }
-
     if idx
         .index_method
         .as_ref()
@@ -562,32 +397,24 @@ fn emit_refill_index(
             root_page: index_root_page,
             db: database_id,
         });
-        emit_refill_rows(
-            program,
-            resolver,
-            database_id,
-            tbl,
-            idx,
-            &mut rows,
-            |program, start_reg| {
-                let record_reg = program.alloc_register();
-                program.emit_insn(Insn::MakeRecord {
-                    start_reg: to_u32(start_reg),
-                    count: to_u32(columns.len() + 1),
-                    dest_reg: to_u32(record_reg),
-                    index_name: Some(idx.name.clone()),
-                    affinity_str: None,
-                });
-                program.emit_insn(Insn::IdxInsert {
-                    cursor_id: index_cursor_id,
-                    record_reg,
-                    unpacked_start: Some(start_reg),
-                    unpacked_count: Some((columns.len() + 1) as u32),
-                    flags: IdxInsertFlags::new().use_seek(false),
-                });
-                Ok(())
-            },
-        )?;
+        rows.emit_each_row(program, |program, start_reg| {
+            let record_reg = program.alloc_register();
+            program.emit_insn(Insn::MakeRecord {
+                start_reg: to_u32(start_reg),
+                count: to_u32(columns.len() + 1),
+                dest_reg: to_u32(record_reg),
+                index_name: Some(idx.name.clone()),
+                affinity_str: None,
+            });
+            program.emit_insn(Insn::IdxInsert {
+                cursor_id: index_cursor_id,
+                record_reg,
+                unpacked_start: Some(start_reg),
+                unpacked_count: Some((columns.len() + 1) as u32),
+                flags: IdxInsertFlags::new().use_seek(false),
+            });
+            Ok(())
+        })?;
     } else {
         let sorter_cursor_id = program.alloc_cursor_id(CursorType::Sorter);
         let pseudo_cursor_id = program.alloc_cursor_id(CursorType::Pseudo(PseudoCursorType {
@@ -616,29 +443,21 @@ fn emit_refill_index(
             num_fields: columns.len() + 1,
         });
 
-        emit_refill_rows(
-            program,
-            resolver,
-            database_id,
-            tbl,
-            idx,
-            &mut rows,
-            |program, start_reg| {
-                let record_reg = program.alloc_register();
-                program.emit_insn(Insn::MakeRecord {
-                    start_reg: to_u32(start_reg),
-                    count: to_u32(columns.len() + 1),
-                    dest_reg: to_u32(record_reg),
-                    index_name: Some(idx.name.clone()),
-                    affinity_str: None,
-                });
-                program.emit_insn(Insn::SorterInsert {
-                    cursor_id: sorter_cursor_id,
-                    record_reg,
-                });
-                Ok(())
-            },
-        )?;
+        rows.emit_each_row(program, |program, start_reg| {
+            let record_reg = program.alloc_register();
+            program.emit_insn(Insn::MakeRecord {
+                start_reg: to_u32(start_reg),
+                count: to_u32(columns.len() + 1),
+                dest_reg: to_u32(record_reg),
+                index_name: Some(idx.name.clone()),
+                affinity_str: None,
+            });
+            program.emit_insn(Insn::SorterInsert {
+                cursor_id: sorter_cursor_id,
+                record_reg,
+            });
+            Ok(())
+        })?;
 
         if let Some(root) = clear_existing_root {
             program.emit_insn(Insn::ClearBtree {
@@ -722,10 +541,9 @@ type ReindexTarget = (usize, Arc<BTreeTable>, Arc<Index>);
 /// each resolved index.
 pub fn translate_reindex(
     name: Option<QualifiedName>,
-    resolver: &Resolver,
+    catalog: &SemanticContext<'_>,
     program: &mut ProgramBuilder,
     connection: &Arc<crate::Connection>,
-    hir: HirContext<'_>,
 ) -> crate::Result<()> {
     if connection.mvcc_enabled() {
         bail_parse_error!("REINDEX is not supported in MVCC mode");
@@ -734,7 +552,7 @@ pub fn translate_reindex(
     let opts = ProgramBuilderOpts::new(5, 40, 5);
     program.extend(&opts);
 
-    let targets = resolve_reindex_targets(name.as_ref(), resolver, connection)?;
+    let targets = resolve_reindex_targets(name.as_ref(), catalog, connection)?;
     if targets.is_empty() {
         return Ok(());
     }
@@ -745,7 +563,7 @@ pub fn translate_reindex(
     let mut write_databases = Vec::new();
     for (database_id, _, _) in &targets {
         if !write_databases.contains(database_id) {
-            let schema_cookie = resolver.with_schema(*database_id, |s| s.schema_version);
+            let schema_cookie = catalog.with_schema(*database_id, |s| s.schema_version);
             program.begin_write_on_database(*database_id, schema_cookie)?;
             write_databases.push(*database_id);
         }
@@ -767,9 +585,8 @@ pub fn translate_reindex(
         let index_cursor_id = program.alloc_cursor_index(None, &index)?;
         emit_refill_index(
             program,
-            resolver,
             connection,
-            hir,
+            catalog,
             database_id,
             &table,
             &index,
@@ -788,34 +605,34 @@ pub fn translate_reindex(
 /// names are schema-local and can only refer to a table or index in that database.
 fn resolve_reindex_targets(
     name: Option<&QualifiedName>,
-    resolver: &Resolver,
+    catalog: &SemanticContext<'_>,
     connection: &Arc<crate::Connection>,
 ) -> crate::Result<Vec<ReindexTarget>> {
     let Some(name) = name else {
-        return Ok(collect_all_reindex_targets(resolver, connection));
+        return Ok(collect_all_reindex_targets(catalog, connection));
     };
 
     let normalized_name = normalize_ident(name.name.as_str());
     if name.db_name.is_none() {
         if let Ok(collation) = CollationSeq::new(&normalized_name) {
             return Ok(collect_reindex_targets_by_collation(
-                resolver, connection, collation,
+                catalog, connection, collation,
             ));
         }
-        if let Some(targets) = find_reindex_table(&normalized_name, resolver, connection) {
+        if let Some(targets) = find_reindex_table(&normalized_name, catalog, connection) {
             return Ok(targets);
         }
-        if let Some(target) = find_reindex_index(&normalized_name, resolver, connection) {
+        if let Some(target) = find_reindex_index(&normalized_name, catalog, connection) {
             return Ok(vec![target]);
         }
         bail_parse_error!("unable to identify the object to be reindexed");
     }
 
-    let database_id = resolver.resolve_database_id(name)?;
-    if let Some(targets) = find_reindex_table_in_db(&normalized_name, database_id, resolver) {
+    let database_id = catalog.resolve_database_id(name)?;
+    if let Some(targets) = find_reindex_table_in_db(&normalized_name, database_id, catalog) {
         return Ok(targets);
     }
-    if let Some(target) = find_reindex_index_in_db(&normalized_name, database_id, resolver) {
+    if let Some(target) = find_reindex_index_in_db(&normalized_name, database_id, catalog) {
         return Ok(vec![target]);
     }
     bail_parse_error!("unable to identify the object to be reindexed");
@@ -823,26 +640,26 @@ fn resolve_reindex_targets(
 
 /// Returns every reindexable index across temp, main, and attached databases.
 fn collect_all_reindex_targets(
-    resolver: &Resolver,
+    catalog: &SemanticContext<'_>,
     connection: &Arc<crate::Connection>,
 ) -> Vec<ReindexTarget> {
     let mut targets = Vec::new();
     for (database_id, _, _) in connection.list_all_databases() {
-        targets.extend(collect_all_reindex_targets_in_db(database_id, resolver));
+        targets.extend(collect_all_reindex_targets_in_db(database_id, catalog));
     }
     targets
 }
 
 /// Returns every index across all schemas that contains at least one column using `collation`.
 fn collect_reindex_targets_by_collation(
-    resolver: &Resolver,
+    catalog: &SemanticContext<'_>,
     connection: &Arc<crate::Connection>,
     collation: CollationSeq,
 ) -> Vec<ReindexTarget> {
     let mut targets = Vec::new();
     for (database_id, _, _) in connection.list_all_databases() {
         targets.extend(
-            collect_all_reindex_targets_in_db(database_id, resolver)
+            collect_all_reindex_targets_in_db(database_id, catalog)
                 .into_iter()
                 .filter(|(_, _, index)| index_matches_collation(index, collation)),
         );
@@ -853,9 +670,9 @@ fn collect_reindex_targets_by_collation(
 /// Returns every reindexable index in one schema database.
 fn collect_all_reindex_targets_in_db(
     database_id: usize,
-    resolver: &Resolver,
+    catalog: &SemanticContext<'_>,
 ) -> Vec<ReindexTarget> {
-    resolver.with_schema(database_id, |schema| {
+    catalog.with_schema(database_id, |schema| {
         schema
             .indexes
             .iter()
@@ -880,11 +697,11 @@ fn collect_all_reindex_targets_in_db(
 /// temp first, main second, then attached databases by numeric database id.
 fn find_reindex_table(
     table_name: &str,
-    resolver: &Resolver,
+    catalog: &SemanticContext<'_>,
     connection: &Arc<crate::Connection>,
 ) -> Option<Vec<ReindexTarget>> {
     for database_id in reindex_unqualified_search_database_ids(connection) {
-        if let Some(targets) = find_reindex_table_in_db(table_name, database_id, resolver) {
+        if let Some(targets) = find_reindex_table_in_db(table_name, database_id, catalog) {
             return Some(targets);
         }
     }
@@ -898,9 +715,9 @@ fn find_reindex_table(
 fn find_reindex_table_in_db(
     table_name: &str,
     database_id: usize,
-    resolver: &Resolver,
+    catalog: &SemanticContext<'_>,
 ) -> Option<Vec<ReindexTarget>> {
-    resolver.with_schema(database_id, |schema| {
+    catalog.with_schema(database_id, |schema| {
         let object_type = schema.get_object_type(table_name)?;
         if object_type == SchemaObjectType::View {
             return Some(Vec::new());
@@ -931,11 +748,11 @@ fn find_reindex_table_in_db(
 /// This is tried only after collation and table lookup fail.
 fn find_reindex_index(
     index_name: &str,
-    resolver: &Resolver,
+    catalog: &SemanticContext<'_>,
     connection: &Arc<crate::Connection>,
 ) -> Option<ReindexTarget> {
     for database_id in reindex_unqualified_search_database_ids(connection) {
-        if let Some(target) = find_reindex_index_in_db(index_name, database_id, resolver) {
+        if let Some(target) = find_reindex_index_in_db(index_name, database_id, catalog) {
             return Some(target);
         }
     }
@@ -946,9 +763,9 @@ fn find_reindex_index(
 fn find_reindex_index_in_db(
     index_name: &str,
     database_id: usize,
-    resolver: &Resolver,
+    catalog: &SemanticContext<'_>,
 ) -> Option<ReindexTarget> {
-    resolver.with_schema(database_id, |schema| {
+    catalog.with_schema(database_id, |schema| {
         for (table_name, indexes) in &schema.indexes {
             if let Some(index) = indexes
                 .iter()
@@ -992,19 +809,10 @@ pub fn resolve_sorted_columns(
     resolve_sorted_columns_with_resolver(table, cols, None)
 }
 
-pub fn reject_explicit_nulls(cols: &[SortedColumn]) -> crate::Result<()> {
-    for sc in cols {
-        if let Some(nulls) = sc.nulls {
-            crate::bail_parse_error!("unsupported use of {}", nulls);
-        }
-    }
-    Ok(())
-}
-
 fn resolve_sorted_columns_with_resolver(
     table: &BTreeTable,
     cols: &[SortedColumn],
-    resolver: Option<&Resolver>,
+    catalog: Option<&SemanticContext<'_>>,
 ) -> crate::Result<crate::alloc::Vec<IndexColumn>> {
     let mut resolved =
         <crate::alloc::Vec<_> as crate::alloc::TursoTryWithCapacityExt>::try_with_capacity_ext(
@@ -1013,7 +821,7 @@ fn resolve_sorted_columns_with_resolver(
     for sc in cols {
         let order = sc.order.unwrap_or(SortOrder::Asc);
         let nulls = sc.nulls;
-        let (explicit_collation, base_expr) = extract_collation(sc.expr.as_ref(), resolver)?;
+        let (explicit_collation, base_expr) = extract_collation(sc.expr.as_ref(), catalog)?;
         // Unwrap parentheses for column resolution (SQLite treats (('col')) same as 'col')
         let unwrapped_expr = unwrap_parens(base_expr)?;
         if let Some((pos, column_name, column)) = resolve_index_column(unwrapped_expr, table) {
@@ -1058,7 +866,7 @@ fn resolve_sorted_columns_with_resolver(
 /// returns (Some(CollationSeq), Expr::Id(col1))
 fn extract_collation<'a>(
     expr: &'a Expr,
-    resolver: Option<&Resolver>,
+    catalog: Option<&SemanticContext<'_>>,
 ) -> crate::Result<(Option<CollationSeq>, &'a Expr)> {
     let mut current = expr;
     let mut coll = None;
@@ -1067,8 +875,8 @@ fn extract_collation<'a>(
         match current {
             Expr::Collate(inner, seq) => {
                 if coll.is_none() {
-                    let collation = match resolver {
-                        Some(resolver) => resolver.resolve_collation(seq.as_str())?,
+                    let collation = match catalog {
+                        Some(catalog) => catalog.resolve_collation(seq.as_str())?,
                         None => CollationSeq::new(seq.as_str())?,
                     };
                     if collation.is_custom() {
@@ -1216,50 +1024,6 @@ fn validate_index_expression(expr: &Expr, table: &BTreeTable) -> bool {
     ok
 }
 
-fn emit_index_column_value_from_cursor(
-    program: &mut ProgramBuilder,
-    resolver: &Resolver,
-    table_references: &mut TableReferences,
-    table_cursor_id: usize,
-    table: &BTreeTable,
-    idx_col: &IndexColumn,
-    dest_reg: usize,
-) -> crate::Result<()> {
-    if let Some(expr) = &idx_col.expr {
-        let mut expr = expr.as_ref().clone();
-        bind_and_rewrite_expr(
-            &mut expr,
-            Some(table_references),
-            None,
-            resolver,
-            BindingBehavior::ResultColumnsNotAllowed,
-        )?;
-        let self_table_context =
-            table_references
-                .joined_tables()
-                .first()
-                .map(|jt| SelfTableContext::ForSelect {
-                    table_ref_id: jt.internal_id,
-                    referenced_tables: table_references.clone(),
-                });
-        resolver.with_self_table_context(program, self_table_context.as_ref(), |program, _| {
-            translate_expr(program, Some(table_references), &expr, dest_reg, resolver)?;
-            Ok(())
-        })?;
-        // For virtual generated column references, apply the column's
-        // declared affinity to the computed expression result.
-        if idx_col.pos_in_table != EXPR_INDEX_SENTINEL {
-            let column = &table.columns()[idx_col.pos_in_table];
-            if column.is_virtual_generated() {
-                program.emit_column_affinity(dest_reg, column.affinity());
-            }
-        }
-    } else {
-        program.emit_column_or_rowid(table_cursor_id, idx_col.pos_in_table, dest_reg);
-    }
-    Ok(())
-}
-
 pub fn resolve_index_method_parameters(
     parameters: Vec<(turso_parser::ast::Name, Box<Expr>)>,
 ) -> crate::Result<HashMap<String, crate::Value>> {
@@ -1296,21 +1060,21 @@ pub fn resolve_index_method_parameters(
 
 pub fn translate_drop_index(
     qualified_name: &QualifiedName,
-    resolver: &Resolver,
+    catalog: &SemanticContext<'_>,
     if_exists: bool,
     program: &mut ProgramBuilder,
 ) -> crate::Result<()> {
-    let database_id = resolver.resolve_existing_index_database_id(qualified_name)?;
+    let database_id = catalog.resolve_existing_index_database_id(qualified_name)?;
     let idx_name = normalize_ident(qualified_name.name.as_str());
     let opts = ProgramBuilderOpts::new(5, 40, 5);
     program.extend(&opts);
 
-    let schema_cookie = resolver.with_schema(database_id, |s| s.schema_version);
+    let schema_cookie = catalog.with_schema(database_id, |s| s.schema_version);
     program.begin_write_on_database(database_id, schema_cookie)?;
 
     // Find the index in Schema
     let mut maybe_index = None;
-    let indexes: Vec<_> = resolver.with_schema(database_id, |s| {
+    let indexes: Vec<_> = catalog.with_schema(database_id, |s| {
         s.indexes
             .values()
             .flat_map(|v| v.iter())
@@ -1348,7 +1112,7 @@ pub fn translate_drop_index(
         }
     }
 
-    let cdc_table = prepare_cdc_if_necessary(program, resolver.schema(), Some(SQLITE_TABLEID))?;
+    let cdc_table = prepare_cdc_if_necessary(program, catalog.main_schema(), Some(SQLITE_TABLEID))?;
 
     // According to sqlite should emit Null instruction
     // but why?
@@ -1364,7 +1128,10 @@ pub fn translate_drop_index(
     let row_id_reg = program.alloc_register();
 
     // We're going to use this cursor to search through sqlite_schema
-    let sqlite_table = resolver.schema().get_btree_table(SQLITE_TABLEID).unwrap();
+    let sqlite_table = catalog
+        .main_schema()
+        .get_btree_table(SQLITE_TABLEID)
+        .unwrap();
     let sqlite_schema_cursor_id =
         program.alloc_cursor_id(CursorType::BTreeTable(sqlite_table.clone()));
 
@@ -1435,7 +1202,7 @@ pub fn translate_drop_index(
         };
         emit_cdc_insns(
             program,
-            resolver,
+            catalog,
             OperationMode::DELETE,
             cdc_cursor_id,
             row_id_reg,
@@ -1461,10 +1228,10 @@ pub fn translate_drop_index(
 
     program.preassign_label_to_next_insn(loop_end_label);
     if let Some((cdc_cursor_id, _)) = cdc_table {
-        emit_cdc_autocommit_commit(program, resolver, cdc_cursor_id)?;
+        emit_cdc_autocommit_commit(program, catalog, cdc_cursor_id)?;
     }
 
-    let current_schema_version = resolver.with_schema(database_id, |s| s.schema_version);
+    let current_schema_version = catalog.with_schema(database_id, |s| s.schema_version);
     program.emit_insn(Insn::SetCookie {
         db: database_id,
         cookie: Cookie::SchemaVersion,
@@ -1503,7 +1270,7 @@ pub fn translate_drop_index(
 /// If idx_name is None, optimize all index method indexes.
 pub fn translate_optimize(
     idx_name: Option<ast::QualifiedName>,
-    resolver: &Resolver,
+    catalog: &SemanticContext<'_>,
     program: &mut ProgramBuilder,
     connection: &Arc<crate::Connection>,
 ) -> crate::Result<()> {
@@ -1521,10 +1288,10 @@ pub fn translate_optimize(
     if let Some(name) = idx_name {
         // Optimize a specific index
         let idx_name = normalize_ident(name.name.as_str());
-        let database_id = resolver.resolve_existing_index_database_id(&name)?;
+        let database_id = catalog.resolve_existing_index_database_id(&name)?;
         let mut found = false;
 
-        resolver.with_schema(database_id, |schema| {
+        catalog.with_schema(database_id, |schema| {
             for val in schema.indexes.values() {
                 for idx in val {
                     if idx.name == idx_name {
@@ -1555,7 +1322,7 @@ pub fn translate_optimize(
     } else {
         // Optimize all index method indexes across all visible databases.
         for (database_id, _, _) in connection.list_all_databases() {
-            resolver.with_schema(database_id, |schema| {
+            catalog.with_schema(database_id, |schema| {
                 for val in schema.indexes.values() {
                     for idx in val {
                         if idx.index_method.is_some() && !idx.is_backing_btree_index() {

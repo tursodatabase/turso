@@ -422,6 +422,30 @@ pub fn limbo_exec_rows(
     conn: &Arc<turso_core::Connection>,
     query: &str,
 ) -> Vec<Vec<rusqlite::types::Value>> {
+    let rows = limbo_exec_rows_capture(conn, query);
+    if let Some(sql) = query.strip_prefix("EXPLAIN QUERY PLAN ") {
+        let details: Vec<String> = rows
+            .iter()
+            .map(|row| match row.last() {
+                Some(rusqlite::types::Value::Text(t)) => t.clone(),
+                _ => String::new(),
+            })
+            .collect();
+        eprintln!("CAPTURE_PLAN\t{}\t{details:?}", sql.replace('\t', " "));
+        CAPTURED_PLANS.with(|plans| plans.borrow_mut().insert(sql.to_string(), details));
+    }
+    rows
+}
+thread_local! {
+    static CAPTURED_PLANS: std::cell::RefCell<std::collections::HashMap<String, Vec<String>>> = Default::default();
+}
+pub fn last_captured_plan(sql: &str) -> Option<Vec<String>> {
+    CAPTURED_PLANS.with(|plans| plans.borrow().get(sql).cloned())
+}
+pub fn limbo_exec_rows_capture(
+    conn: &Arc<turso_core::Connection>,
+    query: &str,
+) -> Vec<Vec<rusqlite::types::Value>> {
     let mut stmt = conn.prepare(query).unwrap();
     let mut rows = Vec::new();
 

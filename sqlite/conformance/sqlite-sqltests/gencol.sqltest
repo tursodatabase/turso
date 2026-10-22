@@ -3396,6 +3396,62 @@ expect {
     2|42|43
 }
 
+# A CHECK may name the new column with the table name in front
+test gencol_alter_add_virtual_check_qualified_name_violation {
+    CREATE TABLE t1(a, b);
+    INSERT INTO t1 VALUES(1, 2), (3, -4);
+    ALTER TABLE t1 ADD COLUMN d AS (b + 1) CHECK(t1.d > 0);
+}
+expect error {
+    CHECK constraint failed
+}
+
+# A CHECK whose result is NULL passes, like SQLite
+test gencol_alter_add_virtual_check_null_result_passes {
+    CREATE TABLE t1(a, b);
+    INSERT INTO t1 VALUES(1, 2), (3, NULL);
+    ALTER TABLE t1 ADD COLUMN d AS (b + 1) CHECK(d > 0);
+    SELECT a, b, d FROM t1 ORDER BY a;
+}
+expect {
+    1|2|3
+    3||
+}
+
+# When one row breaks both NOT NULL and a CHECK, SQLite reports NOT NULL
+test gencol_alter_add_virtual_not_null_reported_before_check {
+    CREATE TABLE t1(a, b);
+    INSERT INTO t1 VALUES(1, 2), (3, NULL);
+    ALTER TABLE t1 ADD COLUMN d AS (b + 1) NOT NULL CHECK(a < 2);
+}
+expect error {
+    NOT NULL constraint failed
+}
+
+# Rows are checked in table order: the first failing row decides the error
+test gencol_alter_add_virtual_first_failing_row_decides {
+    CREATE TABLE t1(a, b);
+    INSERT INTO t1 VALUES(3, 1), (1, NULL);
+    ALTER TABLE t1 ADD COLUMN d AS (b + 1) NOT NULL CHECK(a < 2);
+}
+expect error {
+    CHECK constraint failed
+}
+
+# A CHECK on the new column is checked against a row stored before the
+# column existed, reading a column added later with its DEFAULT
+test gencol_alter_add_virtual_check_with_default_column {
+    CREATE TABLE t1(a INTEGER);
+    INSERT INTO t1 VALUES(1), (2);
+    ALTER TABLE t1 ADD COLUMN b INTEGER DEFAULT 42;
+    ALTER TABLE t1 ADD COLUMN c AS (b + 1) CHECK(c = 43);
+    SELECT a, b, c FROM t1 ORDER BY a;
+}
+expect {
+    1|42|43
+    2|42|43
+}
+
 # ADD COLUMN STORED is rejected (SQLite allows STORED, limbo does not)
 @skip-if sqlite "limbo does not support STORED generated columns"
 test gencol_alter_add_stored_rejected {

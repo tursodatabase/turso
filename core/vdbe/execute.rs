@@ -2466,6 +2466,12 @@ pub fn op_array_encode(
         state.pc += 1;
         return Ok(InsnFunctionStepResult::Step);
     }
+    // A write names its column; a CAST to an array type names the type.
+    let target = if table_name.is_empty() {
+        format!("{element_type}[]")
+    } else {
+        format!("{element_type} column {table_name}.{col_name}")
+    };
 
     // Fast path: blob input with ANY type — validate it is a well-formed record
     // before accepting. This avoids the redundant extract→reserialize when MakeArray
@@ -2481,10 +2487,8 @@ pub fn op_array_encode(
                     .unwrap_or(false);
             if !valid {
                 bail_constraint_error!(
-                    "cannot store non-array value in {} column {}.{} ({})",
-                    element_type,
-                    table_name,
-                    col_name,
+                    "cannot store non-array value in {} ({})",
+                    target,
                     SQLITE_CONSTRAINT
                 );
             }
@@ -2501,10 +2505,8 @@ pub fn op_array_encode(
     };
     let Some(raw_elements) = raw_elements else {
         bail_constraint_error!(
-            "cannot store non-array value in {} column {}.{} ({})",
-            element_type,
-            table_name,
-            col_name,
+            "cannot store non-array value in {} ({})",
+            target,
             SQLITE_CONSTRAINT
         );
     };
@@ -2512,7 +2514,7 @@ pub fn op_array_encode(
     const MAX_ARRAY_ELEMENTS: usize = 100_000;
     if raw_elements.len() > MAX_ARRAY_ELEMENTS {
         bail_constraint_error!(
-            "array exceeds maximum element count ({MAX_ARRAY_ELEMENTS}) for column {table_name}.{col_name} ({SQLITE_CONSTRAINT})"
+            "array exceeds maximum element count ({MAX_ARRAY_ELEMENTS}) for {target} ({SQLITE_CONSTRAINT})"
         );
     }
 
@@ -3533,7 +3535,7 @@ pub fn halt(
                 && state.get_fk_immediate_violations_during_stmt() > 0
             {
                 return Err(LimboError::ForeignKeyConstraint(
-                    "immediate foreign key constraint failed".to_string(),
+                    "FOREIGN KEY constraint failed".to_string(),
                 ));
             }
 
@@ -3593,7 +3595,7 @@ pub fn halt(
         && state.get_fk_immediate_violations_during_stmt() > 0
     {
         return Err(LimboError::ForeignKeyConstraint(
-            "immediate foreign key constraint failed".to_string(),
+            "FOREIGN KEY constraint failed".to_string(),
         ));
     }
 
@@ -16976,7 +16978,7 @@ pub fn op_fk_check(
     };
     if v > 0 {
         return Err(LimboError::ForeignKeyConstraint(
-            "immediate foreign key constraint failed".to_string(),
+            "FOREIGN KEY constraint failed".to_string(),
         ));
     }
     state.pc += 1;

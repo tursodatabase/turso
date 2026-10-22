@@ -12,18 +12,11 @@ pub(crate) mod alter;
 pub(crate) mod analyze;
 pub(crate) mod attach;
 pub(crate) mod collate;
-mod compound_select;
-pub(crate) mod delete;
-pub(crate) mod display;
 pub(crate) mod emitter;
 pub mod eqp;
 pub(crate) mod expr;
-pub(crate) mod expression_index;
-pub(crate) mod fkeys;
-pub(crate) mod group_by;
 pub(crate) mod hir_index_method;
 pub(crate) mod index;
-pub(crate) mod insert;
 pub(crate) mod integrity_check;
 pub(crate) mod logical;
 pub(crate) mod main_loop;
@@ -36,21 +29,15 @@ pub(crate) mod recursive_cte;
 pub(crate) mod result_row;
 pub(crate) mod rollback;
 pub(crate) mod schema;
-pub(crate) mod select;
 pub(crate) mod semantic;
 pub(crate) mod semantic_lowering;
 pub(crate) mod semantic_to_plan;
 pub(crate) mod semantic_unnest;
 pub(crate) mod sequence;
-pub(crate) mod stmt_journal;
-pub(crate) mod subquery;
 pub(crate) mod transaction;
 pub(crate) mod trigger;
-pub(crate) mod trigger_exec;
 pub(crate) mod update;
-pub(crate) mod upsert;
 pub(crate) mod vacuum;
-mod values;
 pub(crate) mod view;
 mod window;
 
@@ -58,22 +45,67 @@ use crate::connection::PrepareOptions;
 use crate::schema::Schema;
 use crate::storage::pager::Pager;
 use crate::sync::Arc;
-use crate::translate::delete::translate_delete;
-use crate::translate::emitter::Resolver;
+use crate::translate::semantic::context::SemanticContext;
 use crate::vdbe::builder::{ProgramBuilder, ProgramBuilderOpts, QueryMode};
 use crate::vdbe::Program;
 use crate::{bail_parse_error, Connection, Result, SymbolTable};
 use alter::translate_alter_table;
 use analyze::translate_analyze;
 use index::{translate_create_index, translate_drop_index, translate_optimize, translate_reindex};
-use insert::translate_insert;
 use rollback::{translate_release, translate_rollback, translate_savepoint};
 use schema::{translate_create_table, translate_create_virtual_table, translate_drop_table};
-use select::translate_select;
 use tracing::{instrument, Level};
 use transaction::{translate_tx_begin, translate_tx_commit};
 use turso_parser::ast;
-use update::translate_update;
+
+/// Snapshot every database a statement prepared against `schema` can name.
+pub(crate) fn capture_catalog(
+    schema: &Arc<Schema>,
+    connection: &Connection,
+    dialect: &dyn crate::dialect::Dialect,
+    search_path: Option<&[String]>,
+) -> Result<semantic::catalog::SemanticCatalog> {
+    semantic::catalog::SemanticCatalog::capture(
+        schema.clone(),
+        connection.database_schemas(),
+        &connection.temp.database,
+        connection.attached_databases(),
+        connection.experimental_custom_types_enabled(),
+        dialect,
+        search_path,
+    )
+}
+
+/// The context a statement is analyzed, planned and lowered with: the
+/// captured catalog and the connection's settings.
+pub(crate) fn semantic_context<'a>(
+    catalog: &'a semantic::catalog::SemanticCatalog,
+    syms: &'a SymbolTable,
+    connection: &Connection,
+    dialect: Arc<dyn crate::dialect::Dialect>,
+) -> Result<SemanticContext<'a>> {
+    Ok(SemanticContext::for_catalog(
+        catalog,
+        syms,
+        connection.experimental_custom_types_enabled(),
+        dialect,
+        if connection.get_dqs_dml() {
+            semantic::context::DoubleQuotedDml::Enabled
+        } else {
+            semantic::context::DoubleQuotedDml::Disabled
+        },
+        connection.foreign_keys_enabled(),
+    )?
+    .with_capture_changes(
+        connection
+            .get_capture_data_changes_info()
+            .as_ref()
+            .map(|info| info.table.clone()),
+    )
+    .with_long_column_names(
+        connection.get_full_column_names() && !connection.get_short_column_names(),
+    ))
+}
 
 #[instrument(skip_all, level = Level::DEBUG)]
 #[allow(clippy::too_many_arguments)]
@@ -122,57 +154,27 @@ pub fn translate(
     } else {
         connection.dialect()
     };
-    let hir_settings = semantic_lowering::HirSettings::new(
-        &connection,
-        syms,
-        dialect.clone(),
-        prepare_options.unqualified_database_search_path.as_deref(),
-    );
-    let mut resolver = Resolver::new(
+    let captured = capture_catalog(
         schema,
-        connection.database_schemas(),
-        &connection.temp.database,
-        connection.attached_databases(),
-        syms,
-        connection.experimental_custom_types_enabled(),
-        connection.get_dqs_dml().into(),
-        dialect,
-        &prepare_options.unqualified_database_search_path,
-    );
+        &connection,
+        dialect.as_ref(),
+        prepare_options.unqualified_database_search_path.as_deref(),
+    )?;
+    let catalog = semantic_context(&captured, syms, &connection, dialect)?;
 
     match stmt {
         // There can be no nesting with pragma, so lift it up here
         ast::Stmt::Pragma { name, body } => {
-            let hir = connection
-                .experimental_hir_enabled()
-                .then_some((schema, &hir_settings));
             pragma::translate_pragma(
-                &resolver,
+                &catalog,
                 &name,
                 body,
                 pager,
                 connection.clone(),
                 &mut program,
-                hir,
             )?;
         }
-        stmt @ ast::Stmt::Select(_) if connection.experimental_hir_enabled() => {
-            semantic_lowering::translate_select(
-                &stmt,
-                schema,
-                &hir_settings,
-                &mut program,
-                &connection,
-            )?
-        }
-        stmt => {
-            // DML that HIR lowers today goes through it; everything else,
-            // and DML it does not lower yet, stays on legacy.
-            let hir = connection
-                .experimental_hir_enabled()
-                .then_some((schema, &hir_settings));
-            translate_statement(stmt, &mut resolver, &mut program, &connection, input, hir)?
-        }
+        stmt => translate_statement(stmt, &catalog, &mut program, &connection, input)?,
     };
 
     program.epilogue(schema);
@@ -180,29 +182,16 @@ pub fn translate(
     program.build(connection, change_cnt_on, input)
 }
 
-// TODO: for now leaving the return value as a Program. But ideally to support nested parsing of arbitraty
-// statements, we would have to return a program builder instead
-/// Translate SQL statement into bytecode program.
-pub fn translate_inner(
-    stmt: ast::Stmt,
-    resolver: &mut Resolver,
-    program: &mut ProgramBuilder,
-    connection: &Arc<Connection>,
-    input: &str,
-) -> Result<()> {
-    translate_statement(stmt, resolver, program, connection, input, None)
-}
-
-/// Translate one statement. With `hir`, a statement that HIR can lower goes
-/// through semantic HIR instead of legacy.
+/// Translate one statement. SELECT, DELETE, UPDATE and INSERT go through
+/// semantic HIR; the other statements have their own translation, with the
+/// queries inside them planned through HIR.
 #[turso_macros::trace_stack(detail = stmt_kind(&stmt))]
 fn translate_statement(
     stmt: ast::Stmt,
-    resolver: &mut Resolver,
+    catalog: &SemanticContext<'_>,
     program: &mut ProgramBuilder,
     connection: &Arc<Connection>,
     input: &str,
-    hir: Option<(&Arc<Schema>, &semantic_lowering::HirSettings<'_>)>,
 ) -> Result<()> {
     let is_write = matches!(
         stmt,
@@ -238,7 +227,6 @@ fn translate_statement(
         bail_parse_error!("Cannot execute write statement in query_only mode")
     }
 
-    let is_select = matches!(stmt, ast::Stmt::Select { .. });
     let is_dml = matches!(
         stmt,
         ast::Stmt::Delete { .. } | ast::Stmt::Insert { .. } | ast::Stmt::Update { .. }
@@ -261,52 +249,47 @@ fn translate_statement(
         None
     };
 
-    let lowered_by_hir = match (hir, &stmt) {
-        (Some((schema, settings)), ast::Stmt::Delete { where_clause, .. }) => {
-            if where_clause.is_none() && connection.get_dml_require_where() {
-                bail_parse_error!(
-                    "DELETE without a WHERE clause is not allowed when require_where (or i_am_a_dummy) is enabled"
-                );
-            }
-            semantic_lowering::translate_delete(&stmt, schema, settings, program, connection)?
+    match stmt {
+        ast::Stmt::Select(_) => {
+            semantic_lowering::translate_select(&stmt, catalog, program, connection)?
         }
-        (Some((schema, settings)), ast::Stmt::Update(update)) => {
+        ast::Stmt::Delete { .. } => {
+            if let ast::Stmt::Delete {
+                where_clause: None, ..
+            } = &stmt
+            {
+                if connection.get_dml_require_where() {
+                    bail_parse_error!(
+                        "DELETE without a WHERE clause is not allowed when require_where (or i_am_a_dummy) is enabled"
+                    );
+                }
+            }
+            semantic_lowering::translate_delete(&stmt, catalog, program, connection)?
+        }
+        ast::Stmt::Update(ref update) => {
             if update.where_clause.is_none() && connection.get_dml_require_where() {
                 bail_parse_error!(
                     "UPDATE without a WHERE clause is not allowed when require_where (or i_am_a_dummy) is enabled"
                 );
             }
-            semantic_lowering::translate_update(&stmt, schema, settings, program, connection)?
+            semantic_lowering::translate_update(&stmt, catalog, program, connection)?
         }
-        (Some((schema, settings)), ast::Stmt::Insert { .. }) => {
-            semantic_lowering::translate_insert(&stmt, schema, settings, program, connection)?
+        ast::Stmt::Insert { .. } => {
+            semantic_lowering::translate_insert(&stmt, catalog, program, connection)?
         }
-        _ => false,
-    };
-
-    match stmt {
-        _ if lowered_by_hir => {}
         ast::Stmt::AlterTable(alter) => {
-            translate_alter_table(alter, resolver, program, connection, input, hir)?;
+            translate_alter_table(alter, catalog, program, connection, input)?;
         }
-        ast::Stmt::Analyze { name } => translate_analyze(name, resolver, program)?,
+        ast::Stmt::Analyze { name } => translate_analyze(name, catalog, program)?,
         ast::Stmt::Attach { expr, db_name, key } => {
-            attach::translate_attach(
-                &expr,
-                resolver,
-                &db_name,
-                &key,
-                program,
-                connection.clone(),
-                hir,
-            )?;
+            attach::translate_attach(&expr, &db_name, &key, program, connection.clone(), catalog)?;
         }
-        ast::Stmt::Begin { typ, name } => translate_tx_begin(typ, name, resolver, program)?,
+        ast::Stmt::Begin { typ, name } => translate_tx_begin(typ, name, catalog, program)?,
         ast::Stmt::Commit { name } => {
-            translate_tx_commit(name, resolver.schema(), resolver, program)?
+            translate_tx_commit(name, catalog.main_schema(), catalog, program)?
         }
         ast::Stmt::CreateIndex { .. } => {
-            translate_create_index(program, connection, resolver, stmt, hir)?;
+            translate_create_index(program, connection, catalog, stmt)?;
         }
         ast::Stmt::CreateTable {
             temporary,
@@ -315,14 +298,13 @@ fn translate_statement(
             body,
         } => translate_create_table(
             tbl_name,
-            resolver,
+            catalog,
             temporary,
             if_not_exists,
             body,
             program,
             connection,
             input,
-            hir,
         )?,
         ast::Stmt::CreateTrigger {
             temporary,
@@ -349,7 +331,7 @@ fn translate_statement(
             );
             trigger::translate_create_trigger(
                 trigger_name,
-                resolver,
+                catalog,
                 temporary,
                 if_not_exists,
                 time,
@@ -368,7 +350,7 @@ fn translate_statement(
             temporary,
         } => view::translate_create_view(
             &view_name,
-            resolver,
+            catalog,
             &select,
             &columns,
             temporary,
@@ -382,57 +364,34 @@ fn translate_statement(
             ..
         } => view::translate_create_materialized_view(
             &view_name,
-            resolver,
+            catalog,
             &select,
             if_not_exists,
             connection.clone(),
             program,
         )?,
         ast::Stmt::CreateVirtualTable(vtab) => {
-            translate_create_virtual_table(vtab, resolver, program, connection)?
-        }
-        ast::Stmt::Delete {
-            tbl_name,
-            where_clause,
-            returning,
-            indexed,
-            with,
-        } => {
-            if where_clause.is_none() && connection.get_dml_require_where() {
-                bail_parse_error!(
-                    "DELETE without a WHERE clause is not allowed when require_where (or i_am_a_dummy) is enabled"
-                );
-            }
-            translate_delete(
-                &tbl_name,
-                resolver,
-                where_clause,
-                returning,
-                indexed,
-                with,
-                program,
-                connection,
-            )?
+            translate_create_virtual_table(vtab, catalog, program, connection)?
         }
         ast::Stmt::Detach { name } => {
-            attach::translate_detach(&name, resolver, program, connection.clone(), hir)?
+            attach::translate_detach(&name, program, connection.clone(), catalog)?
         }
         ast::Stmt::DropIndex {
             if_exists,
             idx_name,
-        } => translate_drop_index(&idx_name, resolver, if_exists, program)?,
+        } => translate_drop_index(&idx_name, catalog, if_exists, program)?,
         ast::Stmt::DropTable {
             if_exists,
             tbl_name,
-        } => translate_drop_table(tbl_name, resolver, if_exists, program, connection)?,
+        } => translate_drop_table(tbl_name, catalog, if_exists, program, connection)?,
         ast::Stmt::DropTrigger {
             if_exists,
             trigger_name,
-        } => trigger::translate_drop_trigger(resolver, &trigger_name, if_exists, program)?,
+        } => trigger::translate_drop_trigger(catalog, &trigger_name, if_exists, program)?,
         ast::Stmt::DropView {
             if_exists,
             view_name,
-        } => view::translate_drop_view(resolver, &view_name, if_exists, program)?,
+        } => view::translate_drop_view(catalog, &view_name, if_exists, program)?,
         ast::Stmt::CreateType {
             if_not_exists,
             type_name,
@@ -441,7 +400,7 @@ fn translate_statement(
             if !connection.experimental_custom_types_enabled() {
                 bail_parse_error!("Custom types require --experimental-custom-types flag");
             }
-            schema::translate_create_type(&type_name, &body, if_not_exists, resolver, program)?
+            schema::translate_create_type(&type_name, &body, if_not_exists, catalog, program)?
         }
         ast::Stmt::CreateDomain {
             if_not_exists,
@@ -461,7 +420,7 @@ fn translate_statement(
                 &constraints,
                 default,
                 if_not_exists,
-                resolver,
+                catalog,
                 program,
             )?
         }
@@ -472,7 +431,7 @@ fn translate_statement(
             if !connection.experimental_custom_types_enabled() {
                 bail_parse_error!("Custom types require --experimental-custom-types flag");
             }
-            schema::translate_drop_type(&type_name, if_exists, false, resolver, program)?
+            schema::translate_drop_type(&type_name, if_exists, false, catalog, program)?
         }
         ast::Stmt::DropDomain {
             if_exists,
@@ -481,14 +440,14 @@ fn translate_statement(
             if !connection.experimental_custom_types_enabled() {
                 bail_parse_error!("Custom types require --experimental-custom-types flag");
             }
-            schema::translate_drop_type(&domain_name, if_exists, true, resolver, program)?
+            schema::translate_drop_type(&domain_name, if_exists, true, catalog, program)?
         }
         ast::Stmt::Pragma { .. } => {
             bail_parse_error!("PRAGMA statement cannot be evaluated in a nested context")
         }
-        ast::Stmt::Reindex { name } => translate_reindex(name, resolver, program, connection, hir)?,
+        ast::Stmt::Reindex { name } => translate_reindex(name, catalog, program, connection)?,
         ast::Stmt::Optimize { idx_name } => {
-            translate_optimize(idx_name, resolver, program, connection)?
+            translate_optimize(idx_name, catalog, program, connection)?
         }
         ast::Stmt::Release { name } => translate_release(program, name)?,
         ast::Stmt::Rollback {
@@ -496,44 +455,9 @@ fn translate_statement(
             savepoint_name,
         } => translate_rollback(program, tx_name, savepoint_name)?,
         ast::Stmt::Savepoint { name } => translate_savepoint(program, name)?,
-        ast::Stmt::Select(select) => {
-            translate_select(
-                select,
-                resolver,
-                program,
-                plan::QueryDestination::ResultRows,
-                connection,
-            )?;
-        }
-        ast::Stmt::Update(update) => {
-            if update.where_clause.is_none() && connection.get_dml_require_where() {
-                bail_parse_error!(
-                    "UPDATE without a WHERE clause is not allowed when require_where (or i_am_a_dummy) is enabled"
-                );
-            }
-            translate_update(update, resolver, program, connection)?
-        }
         ast::Stmt::Vacuum { name, into } => {
             vacuum::translate_vacuum(program, name.as_ref(), into.as_deref(), connection.clone())?
         }
-        ast::Stmt::Insert {
-            with,
-            or_conflict,
-            tbl_name,
-            columns,
-            body,
-            returning,
-        } => translate_insert(
-            resolver,
-            or_conflict,
-            tbl_name,
-            columns,
-            body,
-            returning,
-            with,
-            program,
-            connection,
-        )?,
         ast::Stmt::CreateSequence {
             if_not_exists,
             seq_name,
@@ -551,7 +475,7 @@ fn translate_statement(
                 &min_value,
                 &max_value,
                 cycle,
-                resolver,
+                catalog,
                 program,
             )?;
         }
@@ -559,7 +483,7 @@ fn translate_statement(
             if_exists,
             seq_name,
         } => {
-            sequence::translate_drop_sequence(&seq_name, if_exists, resolver, program)?;
+            sequence::translate_drop_sequence(&seq_name, if_exists, catalog, program)?;
         }
     };
 
@@ -575,15 +499,10 @@ fn translate_statement(
         }
     }
 
-    // Indicate read operations so that in the epilogue we can emit the correct type of transaction
-    if is_select && !program.table_references.is_empty() {
-        program.begin_read_operation()?;
-    }
-
     // A statement with RETURNING already produces rows, so it never also returns
     // a count row (same as SQLite).
     if let Some(column_name) = count_changes_column {
-        if program.result_columns.is_empty() && program.resolved_result_columns.is_empty() {
+        if program.resolved_result_columns.is_empty() {
             let reg = program.alloc_register();
             program.emit_insn(crate::vdbe::insn::Insn::ChangeCount { dest: reg });
             program.emit_result_row(reg, 1);

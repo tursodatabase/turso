@@ -1,7 +1,7 @@
 //! Resolved statement and trigger roots.
 
 use crate::{alloc::BoxedSlice, schema::ForeignKey, sync::Arc};
-use turso_parser::ast::{ResolveType, SortOrder};
+use turso_parser::ast::ResolveType;
 
 use super::{
     Expr, From, Limit, OrderTerm, Output, QueryId, ResolvedCollation, ResolvedIndex, ResolvedTable,
@@ -16,16 +16,21 @@ pub struct CdcPlan {
 }
 
 #[derive(Clone, Debug)]
+#[allow(clippy::large_enum_variant)]
 pub enum HirRoot {
     Query(QueryRoot),
     Insert(Insert),
     Update(Update),
     Delete(Delete),
     Trigger(TriggerRoot),
+    /// A batch of expressions over one positional source whose columns the
+    /// consumer binds to registers: the values a materialized view computes
+    /// from an operator's row, and the stored expressions the planner tests
+    /// analyze on their own.
     SchemaExpressions(SchemaExpressionRoot),
 }
 
-/// A closed batch of stored expressions sharing one positional source.
+/// A closed batch of expressions sharing one positional source.
 #[derive(Clone, Debug)]
 pub struct SchemaExpressionRoot {
     pub source: SourceId,
@@ -44,8 +49,13 @@ pub struct TriggerRoot {
 }
 
 #[derive(Clone, Debug)]
+#[allow(clippy::large_enum_variant)]
 pub enum TriggerBody {
+    /// One part of a trigger body on its own, which the analyzer tests
+    /// analyze.
+    #[cfg(test)]
     Predicate(Expr),
+    #[cfg(test)]
     Command(TriggerCommand),
     Program(TriggerProgram),
 }
@@ -57,6 +67,7 @@ pub struct TriggerProgram {
 }
 
 #[derive(Clone, Debug)]
+#[allow(clippy::large_enum_variant)]
 pub enum TriggerCommand {
     Select(QueryId),
     Insert(Insert),
@@ -89,6 +100,7 @@ pub struct Insert {
 
 /// Metadata required by the concrete kind of INSERT destination.
 #[derive(Clone, Debug)]
+#[allow(clippy::large_enum_variant)]
 pub enum InsertTargetKind {
     BTree {
         autoincrement: Option<ResolvedAutoincrement>,
@@ -173,10 +185,10 @@ pub struct ConflictTarget {
 pub struct ConflictTerm {
     pub expr: Expr,
     pub collation: Option<ResolvedCollation>,
-    pub order: SortOrder,
 }
 
 #[derive(Clone, Debug)]
+#[allow(clippy::large_enum_variant)]
 pub enum UpsertAction {
     Nothing,
     Update {
@@ -217,6 +229,7 @@ pub struct Update {
 
 /// Metadata required by the concrete kind of UPDATE destination.
 #[derive(Clone, Debug)]
+#[allow(clippy::large_enum_variant)]
 pub enum UpdateTargetKind {
     BTree {
         /// The DEFAULT of each NOT NULL column that declares one: what NOT
@@ -244,6 +257,7 @@ pub struct Delete {
 
 /// Metadata required by the concrete kind of DELETE destination.
 #[derive(Clone, Debug)]
+#[allow(clippy::large_enum_variant)]
 pub enum DeleteTargetKind {
     BTree {
         triggers: Vec<ResolvedTrigger>,
@@ -286,11 +300,4 @@ pub struct ResolvedForeignKey {
 #[derive(Clone, Debug)]
 pub struct Returning {
     pub outputs: Vec<Output>,
-}
-
-/// The final type fact for a writable DML destination.
-#[derive(Clone, Debug)]
-pub struct DestinationType {
-    pub column: TargetColumn,
-    pub type_fact: super::TypeFact,
 }

@@ -147,10 +147,6 @@ impl CatalogSnapshot {
     pub(crate) const fn from_id(id: u64) -> Self {
         Self(id)
     }
-
-    pub const fn id(self) -> u64 {
-        self.0
-    }
 }
 
 /// Stable identity of one object within a catalog snapshot.
@@ -161,10 +157,6 @@ pub struct CatalogObjectId(u64);
 impl CatalogObjectId {
     pub(crate) const fn new(id: u64) -> Self {
         Self(id)
-    }
-
-    pub const fn id(self) -> u64 {
-        self.0
     }
 }
 
@@ -677,27 +669,32 @@ impl HirDocument {
                     .get(id.index)
                     .filter(|output| output.id == id),
                 HirRoot::Trigger(root) => match &root.body {
+                    #[cfg(test)]
                     TriggerBody::Command(TriggerCommand::Insert(insert)) => insert
                         .returning
                         .as_ref()?
                         .outputs
                         .get(id.index)
                         .filter(|output| output.id == id),
+                    #[cfg(test)]
                     TriggerBody::Command(TriggerCommand::Update(update)) => update
                         .returning
                         .as_ref()?
                         .outputs
                         .get(id.index)
                         .filter(|output| output.id == id),
+                    #[cfg(test)]
                     TriggerBody::Command(TriggerCommand::Delete(delete)) => delete
                         .returning
                         .as_ref()?
                         .outputs
                         .get(id.index)
                         .filter(|output| output.id == id),
-                    TriggerBody::Predicate(_)
-                    | TriggerBody::Command(TriggerCommand::Select(_))
-                    | TriggerBody::Program(_) => None,
+                    #[cfg(test)]
+                    TriggerBody::Predicate(_) | TriggerBody::Command(TriggerCommand::Select(_)) => {
+                        None
+                    }
+                    TriggerBody::Program(_) => None,
                 },
                 HirRoot::Query(_) | HirRoot::SchemaExpressions(_) => None,
             },

@@ -169,7 +169,7 @@ fn normalize_json_plan(text: &str) -> Option<String> {
             let mut node = nodes[index].clone();
             if let Some(fields) = node.as_object_mut() {
                 fields.insert("id".to_string(), Value::from(renumbered[&ids[index]]));
-                let parent = fields.get("parent").map(&renumber).unwrap_or(Value::Null);
+                let parent = fields.get("parent").map(renumber).unwrap_or(Value::Null);
                 fields.insert("parent".to_string(), parent);
             }
             node

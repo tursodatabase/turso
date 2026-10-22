@@ -6,6 +6,7 @@ use crate::{
     schema::{Type, TypeDef},
     sync::Arc,
     util::parse_numeric_literal,
+    vdbe::affinity::Affinity,
     LimboError, Result, Value,
 };
 
@@ -15,10 +16,10 @@ use super::{
     hir::{
         BoundSchemaProgram, CatalogObjectId, ColumnReadExpression, ColumnRef, CompoundArm, Cte,
         CteId, DatabaseId, Delete, DeleteTargetKind, Expr, FunctionEvaluation, HirDocument,
-        HirRoot, Insert, InsertTargetKind, Limit, OrderTerm, Output, OutputId, OutputNameKind,
-        OutputOwner, Query, QueryBlock, QueryBlockBody, QueryBlockId, QueryId, QueryRoot,
-        SchemaProgramId, Source, SourceId, SourceKind, TriggerBody, TriggerCommand, TypeFact,
-        Update, UpdateTargetKind,
+        HirRoot, IndexCoverage, IndexHint, Insert, InsertTargetKind, Limit, OrderTerm, Output,
+        OutputId, OutputNameKind, OutputOwner, Query, QueryBlock, QueryBlockBody, QueryBlockId,
+        QueryId, QueryRoot, SchemaExpressionRoot, SchemaProgramId, Source, SourceColumn, SourceId,
+        SourceKind, SourceOwner, TriggerBody, TriggerCommand, TypeFact, Update, UpdateTargetKind,
     },
     query::FromContext,
     scope::{ExpandedColumn, ExprCollation, ResolvedScopeExpr, Scope},
@@ -69,23 +70,32 @@ pub(crate) fn analyze<'context, 'catalog, 'ast>(
                     .to_string(),
             ));
         }
+        #[cfg(test)]
         AnalyzeInput::TriggerPredicate {
             context,
             expression,
         } => analyzer.analyze_trigger_predicate(context, expression)?,
+        #[cfg(test)]
         AnalyzeInput::TriggerSelect { context, select } => {
             analyzer.analyze_trigger_select(context, select)?
         }
+        #[cfg(test)]
         AnalyzeInput::TriggerInsert { context, insert } => {
             analyzer.analyze_trigger_insert(context, insert)?
         }
+        #[cfg(test)]
         AnalyzeInput::TriggerUpdate { context, update } => {
             analyzer.analyze_trigger_update(context, update)?
         }
+        #[cfg(test)]
         AnalyzeInput::TriggerDelete { context, delete } => {
             analyzer.analyze_trigger_delete(context, delete)?
         }
         AnalyzeInput::TriggerProgram(input) => analyzer.analyze_trigger_program(input)?,
+        AnalyzeInput::RegisterExpressions {
+            inputs,
+            expressions,
+        } => analyzer.analyze_register_expressions(inputs, expressions)?,
     };
     analyzer.finish_column_reads(&root)?;
     let document = analyzer.finish(root)?;
@@ -106,7 +116,9 @@ fn collect_root_dml<'a>(
         HirRoot::Update(update) => updates.push(update),
         HirRoot::Delete(delete) => deletes.push(delete),
         HirRoot::Trigger(root) => match &root.body {
+            #[cfg(test)]
             TriggerBody::Predicate(_) => {}
+            #[cfg(test)]
             TriggerBody::Command(command) => {
                 collect_trigger_command_dml(command, inserts, updates, deletes);
             }
@@ -151,6 +163,9 @@ pub(super) struct Analyzer<'context, 'catalog, 'ast> {
     /// For each subquery being analyzed, the block of the expression it is
     /// in, when that expression may hold aggregates.
     pub(super) aggregate_hosts: Vec<Option<QueryBlockId>>,
+    /// The source a `Register(n)` expression reads column `n` of, while
+    /// expressions over register inputs are analyzed.
+    pub(super) register_source: Option<SourceId>,
     /// Stored view SELECTs live in the catalog and are analyzed like the
     /// statement's own AST, so the catalog must outlive the AST borrow.
     _catalog_outlives_ast: std::marker::PhantomData<&'ast &'catalog ()>,
@@ -222,8 +237,67 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
             views_in_progress: Vec::new(),
             aggregate_counts: HashMap::default(),
             aggregate_hosts: Vec::new(),
+            register_source: None,
             _catalog_outlives_ast: std::marker::PhantomData,
         }
+    }
+
+    /// Analyze `expressions` over `inputs.len()` values that the consumer
+    /// holds in registers, which the expressions read as `Register(n)`.
+    /// The inputs have no declared types, like the values an incremental
+    /// view operator computes.
+    fn analyze_register_expressions(
+        &mut self,
+        inputs: &[String],
+        expressions: &[ast::Expr],
+    ) -> Result<HirRoot> {
+        let source_id = self.reserve_source();
+        let columns = inputs
+            .iter()
+            .map(|name| SourceColumn {
+                name: name.clone(),
+                type_fact: TypeFact::dynamic(),
+                affinity: Affinity::Blob,
+                has_affinity: false,
+                collation: None,
+                hidden: false,
+                rowid_alias: false,
+            })
+            .collect::<Vec<_>>();
+        let width = columns.len();
+        let source = Source {
+            id: source_id,
+            owner: SourceOwner::Root,
+            database: None,
+            name: "register inputs".to_string(),
+            alias: None,
+            kind: SourceKind::SchemaExpression,
+            columns,
+            generated_expressions: vec![ColumnReadExpression::Absent; width],
+            default_expressions: vec![ColumnReadExpression::Absent; width],
+            column_type_programs: vec![None; width],
+            check_constraints: None,
+            rowid_available: false,
+            index_hint: IndexHint::None,
+            index_expressions: Vec::new(),
+            index_coverage: IndexCoverage::Selective,
+            index_method_patterns: Vec::new(),
+        };
+        let mut scope = Scope::default();
+        scope.add_source(&source, true);
+        self.insert_source(source_id, source)?;
+        self.register_source = Some(source_id);
+        let expressions = expressions
+            .iter()
+            .map(|expression| {
+                self.analyze_expr(expression, &scope, ExprPolicy::schema_expression())
+            })
+            .collect::<Result<Vec<_>>>()?;
+        self.register_source = None;
+        Ok(HirRoot::SchemaExpressions(SchemaExpressionRoot {
+            source: source_id,
+            expressions,
+        }))
     }
 
     pub(super) const fn context(&self) -> &SemanticContext<'catalog> {
@@ -590,9 +664,10 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
                 .transpose()?;
 
             for expression in generated.iter().chain(default.iter()) {
-                expression.for_each(&mut |expression| match expression {
-                    Expr::Column(dependency) => pending.push(*dependency),
-                    _ => {}
+                expression.for_each(&mut |expression| {
+                    if let Expr::Column(dependency) = expression {
+                        pending.push(*dependency);
+                    }
                 });
             }
 
@@ -618,34 +693,6 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
         self.analyze_select_with_scope(
             select,
             None,
-            None,
-            None,
-            ExprPolicies::statement(self.context.dqs_dml()),
-        )
-    }
-
-    pub(super) fn analyze_select_with_expected_outputs(
-        &mut self,
-        select: &'ast ast::Select,
-        expected_outputs: &[Option<Arc<TypeDef>>],
-    ) -> Result<QueryId> {
-        self.analyze_select_with_scope(
-            select,
-            None,
-            None,
-            Some(expected_outputs),
-            ExprPolicies::statement(self.context.dqs_dml()),
-        )
-    }
-
-    pub(super) fn analyze_select_with_parent(
-        &mut self,
-        select: &'ast ast::Select,
-        parent: Option<QueryId>,
-    ) -> Result<QueryId> {
-        self.analyze_select_with_scope(
-            select,
-            parent,
             None,
             None,
             ExprPolicies::statement(self.context.dqs_dml()),
@@ -859,6 +906,7 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn analyze_select_block(
         &mut self,
         select: &'ast ast::OneSelect,
@@ -983,9 +1031,9 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
             })
             .transpose()?;
         let aggregate_query = grouping.is_some() || self.aggregate_count(functions.block()) > 0;
-        // Like legacy, an aggregate that appears only in ORDER BY is a misuse
-        // when the block reads a FROM clause; without one it makes the block
-        // an aggregate query of one row.
+        // An aggregate that appears only in ORDER BY is a misuse when the
+        // block reads a FROM clause; without one it makes the block an
+        // aggregate query of one row.
         let order_by_allows_aggregates = aggregate_query || from.is_none();
         let output_windows = functions.window_function_count() > 0;
         let dropped_order = if self.aggregate_count(functions.block()) > 0
@@ -1041,6 +1089,7 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
         ))
     }
 
+    #[allow(clippy::vec_box)]
     fn analyze_values_block(
         &mut self,
         rows: &'ast [Vec<Box<ast::Expr>>],
@@ -1156,7 +1205,7 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
             None => None,
         };
         // Aggregates that appear only in ORDER BY are analyzed later and do
-        // not count, as in legacy planning.
+        // not count.
         if syntax.exprs.is_empty()
             && having.is_some()
             && self.aggregate_count(functions.block()) == 0
@@ -1388,9 +1437,9 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
             .collect()
     }
 
-    /// Like legacy and SQLite, an ORDER BY term of a compound SELECT that is
-    /// not a position or a name is resolved in each arm's FROM clause and
-    /// matches the arm's output with the same expression: `ORDER BY t1.b`
+    /// Like SQLite, an ORDER BY term of a compound SELECT that is not a
+    /// position or a name is resolved in each arm's FROM clause and matches
+    /// the arm's output with the same expression: `ORDER BY t1.b`
     /// matches `SELECT t1.b FROM t1`. A term that does not resolve in the arm
     /// does not match it.
     pub(super) fn compound_order_by_arm_match(
@@ -1532,11 +1581,19 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
         expanded: Vec<ExpandedColumn>,
         scope: &Scope,
     ) -> Result<()> {
+        // Like SQLite, with full_column_names on and short_column_names off
+        // the column is named after its source.
+        let long_names = self.context().long_column_names();
         for column in expanded {
             let resolved = self.resolve_atomic_expr(column.resolved.expr, scope)?;
+            let name = if long_names {
+                format!("{}.{}", column.qualifier, column.name)
+            } else {
+                column.name
+            };
             outputs.push(output_from_resolved(
                 OutputId::query(block, outputs.len()),
-                column.name,
+                name,
                 OutputNameKind::StarExpansion,
                 resolved,
             ));
@@ -1544,6 +1601,7 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn analyze_output(
         &mut self,
         block: QueryBlockId,
@@ -4817,8 +4875,8 @@ mod tests {
 
     #[test]
     fn long_cte_chains_bind_without_deep_recursion() {
-        // Legacy planning handles this chain on a 2 MiB stack. Lazy binding
-        // used to recurse once per link and overflow there.
+        // This chain must bind on a 2 MiB stack. Lazy binding used to
+        // recurse once per link and overflow there.
         const LINKS: usize = 90;
         let mut sql = String::from("WITH c0 AS (SELECT 1 AS v)");
         for index in 1..LINKS {
@@ -7827,7 +7885,6 @@ mod tests {
             primary.terms.as_slice(),
             [hir::ConflictTerm {
                 expr: Expr::Column(column),
-                order: ast::SortOrder::Desc,
                 ..
             }] if column.source == insert.target && column.column == 0
         ));
@@ -7841,7 +7898,6 @@ mod tests {
             .as_ref()
             .expect("ordinary UNIQUE index is frozen");
         assert_eq!(ordinary_index.value().name, "guarded_value");
-        assert_eq!(ordinary.terms[0].order, ast::SortOrder::Desc);
         assert!(ordinary.terms[0].collation.as_ref().is_some_and(
             |collation| collation.value() == &crate::translate::collate::CollationSeq::Binary
         ));
@@ -8307,8 +8363,7 @@ mod tests {
             &schema,
             "INSERT INTO writable(id) VALUES (4) RETURNING writable.*",
         )
-        .err()
-        .expect("qualified RETURNING star is rejected");
+        .expect_err("qualified RETURNING star is rejected");
         assert_eq!(
             qualified.to_string(),
             "Parse error: RETURNING may not use \"TABLE.*\" wildcards"
@@ -9946,21 +10001,18 @@ mod tests {
             panic!("SELECT produces query root");
         };
         let outputs = &document.query(root.query).expect("query exists").blocks[0].outputs;
-        for (index, expected_kind, expected_user_name) in [
+        for (index, expected_kind) in [
             (
                 0,
                 crate::translate::semantic::hir::SequenceOperationKind::NextValue,
-                "orders",
             ),
             (
                 1,
                 crate::translate::semantic::hir::SequenceOperationKind::SetValue,
-                "main.orders",
             ),
             (
                 2,
                 crate::translate::semantic::hir::SequenceOperationKind::SetValue,
-                "orders",
             ),
         ] {
             let Expr::Function(call) = &outputs[index].expr else {
@@ -9970,7 +10022,6 @@ mod tests {
                 panic!("sequence write keeps its resolved operation");
             };
             assert_eq!(operation.kind, expected_kind);
-            assert_eq!(operation.user_name, expected_user_name);
             assert_eq!(operation.normalized_name, "orders");
             assert_eq!(operation.sequence.value().name, "orders");
             assert_eq!(
@@ -10372,7 +10423,7 @@ mod tests {
     }
 
     #[test]
-    fn equivalent_windows_share_one_block_window_like_legacy() {
+    fn equivalent_windows_share_one_block_window() {
         let schema = schema_with_items();
         for (sql, expected) in [
             // Same inline definition and frame.
@@ -10380,7 +10431,7 @@ mod tests {
                 "SELECT sum(score) OVER (ORDER BY id), avg(score) OVER (ORDER BY id) FROM items",
                 1,
             ),
-            // lag and lead coerce different frames, as in legacy.
+            // lag and lead coerce different frames.
             (
                 "SELECT lag(score) OVER (ORDER BY id), lead(score) OVER (ORDER BY id) FROM items",
                 2,
@@ -10391,7 +10442,7 @@ mod tests {
                  WINDOW w AS (ORDER BY id)",
                 1,
             ),
-            // Named windows merge only by name, as in legacy.
+            // Named windows merge only by name.
             (
                 "SELECT sum(score) OVER a, sum(score) OVER b FROM items \
                  WINDOW a AS (ORDER BY id), b AS (ORDER BY id)",

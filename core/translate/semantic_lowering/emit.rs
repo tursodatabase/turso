@@ -1,8 +1,8 @@
 //! Small bytecode helpers for HIR DML lowering: foreign-key probes, cursor
 //! opening, constraint error text and statement journal flags.
 //!
-//! They are copies of legacy helpers, so HIR lowering does not depend on the
-//! legacy translate modules that will be deleted.
+//! They are shared by the INSERT, UPDATE and DELETE lowering and by the
+//! foreign-key and trigger modules.
 
 use std::num::NonZeroUsize;
 
@@ -284,7 +284,8 @@ pub(super) fn emit_fk_violation(
     Ok(())
 }
 
-/// Stop the statement with a foreign-key error, for RESTRICT.
+/// Stop the statement with a foreign-key error at once: for RESTRICT, and
+/// for a missing parent of a single-row INSERT.
 pub(super) fn emit_fk_restrict_halt(program: &mut ProgramBuilder) -> Result<()> {
     program.emit_insn(Insn::Halt {
         err_code: SQLITE_CONSTRAINT_FOREIGNKEY,
@@ -314,7 +315,7 @@ pub(super) fn emit_guarded_fk_decrement(
 
 /// The UNIQUE error text for `index`, as SQLite writes it: `t.c` for one
 /// column, `t.(a, b)` for several.
-pub(super) fn format_unique_violation_desc(table_name: &str, index: &Index) -> String {
+pub(crate) fn format_unique_violation_desc(table_name: &str, index: &Index) -> String {
     match index.columns.as_slice() {
         [column] => format!("{table_name}.{}", column.name),
         columns => {

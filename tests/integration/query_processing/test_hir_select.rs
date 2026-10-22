@@ -1,7 +1,8 @@
-//! Top-level SELECT prepared through semantic HIR must return the same rows
-//! and column metadata as the legacy planner.
+//! SELECT prepared through semantic HIR: the rows it returns are checked
+//! against SQLite reading the same database file, and its plans against what
+//! the planner is meant to choose.
 
-use crate::common::{limbo_exec_rows, limbo_exec_rows_fallible, TempDatabase};
+use crate::common::{limbo_exec_rows, limbo_exec_rows_fallible, sqlite_exec_rows, TempDatabase};
 
 const SETUP: &str = "CREATE TABLE items(id INTEGER PRIMARY KEY, value INTEGER, extra TEXT);
 CREATE INDEX items_value ON items(value);
@@ -44,18 +45,130 @@ fn column_names(conn: &std::sync::Arc<turso_core::Connection>, sql: &str) -> Vec
         .collect()
 }
 
-fn connections(db: &TempDatabase) -> [std::sync::Arc<turso_core::Connection>; 2] {
-    let legacy = db.connect_limbo();
-    legacy.set_experimental_hir(false);
+/// A connection that prepares statements through HIR, and SQLite on the
+/// same database file as the oracle for the rows and column names a query
+/// returns.
+fn connections(db: &TempDatabase) -> (Oracle, std::sync::Arc<turso_core::Connection>) {
     let hir = db.connect_limbo();
-    hir.set_experimental_hir(true);
-    [legacy, hir]
+    let sqlite = Oracle {
+        hir: hir.clone(),
+        path: db.path.clone(),
+        pragmas: Vec::new(),
+    };
+    (sqlite, hir)
+}
+
+/// SQLite reading the database file the HIR connection writes. SQLite does
+/// not follow the WAL Turso keeps appending to, so before each query Turso
+/// checkpoints everything into the database file and SQLite opens that file
+/// afresh, read-only, without touching the WAL.
+struct Oracle {
+    hir: std::sync::Arc<turso_core::Connection>,
+    path: std::path::PathBuf,
+    /// Connection settings every fresh connection gets.
+    pragmas: Vec<(&'static str, bool)>,
+}
+
+impl Oracle {
+    fn open(&self) -> rusqlite::Connection {
+        self.hir.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+        let conn = rusqlite::Connection::open_with_flags(
+            format!("file:{}?immutable=1", self.path.display()),
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_URI,
+        )
+        .unwrap();
+        for (name, value) in &self.pragmas {
+            conn.pragma_update(None, name, value).unwrap();
+        }
+        conn
+    }
+
+    fn set_pragma(&mut self, name: &'static str, value: bool) {
+        self.pragmas.retain(|(existing, _)| *existing != name);
+        self.pragmas.push((name, value));
+    }
+
+    fn rows(&self, sql: &str) -> Vec<Vec<rusqlite::types::Value>> {
+        sqlite_exec_rows(&self.open(), sql)
+    }
+
+    /// The name and declared type of each column of `sql`.
+    fn column_metadata(&self, sql: &str) -> Vec<(String, Option<String>)> {
+        let conn = self.open();
+        let stmt = conn.prepare(sql).unwrap();
+        stmt.columns()
+            .iter()
+            .map(|column| {
+                (
+                    column.name().to_string(),
+                    column.decl_type().map(|ty| ty.to_string()),
+                )
+            })
+            .collect()
+    }
+
+    fn column_names(&self, sql: &str) -> Vec<String> {
+        self.column_metadata(sql)
+            .into_iter()
+            .map(|(name, _)| name)
+            .collect()
+    }
+}
+
+/// HIR returns the rows SQLite returns for `sql`, in the same order when the
+/// query orders them; without ORDER BY each engine may scan a different
+/// index, so the order is not compared.
+fn assert_same_rows(hir: &std::sync::Arc<turso_core::Connection>, sqlite: &Oracle, sql: &str) {
+    let (hir_rows, sqlite_rows) = (limbo_exec_rows(hir, sql), sqlite.rows(sql));
+    if sql.contains("ORDER BY") {
+        assert_eq!(hir_rows, sqlite_rows, "rows differ for {sql}");
+    } else {
+        assert_eq!(
+            sorted(hir_rows),
+            sorted(sqlite_rows),
+            "rows differ for {sql}"
+        );
+    }
+}
+
+/// HIR returns the rows SQLite returns for `sql`, in any order: the query's
+/// ORDER BY has ties, which each engine may break differently.
+fn assert_same_rows_any_order(
+    hir: &std::sync::Arc<turso_core::Connection>,
+    sqlite: &Oracle,
+    sql: &str,
+) {
+    assert_eq!(
+        sorted(limbo_exec_rows(hir, sql)),
+        sorted(sqlite.rows(sql)),
+        "rows differ for {sql}"
+    );
+}
+
+fn sorted(mut rows: Vec<Vec<rusqlite::types::Value>>) -> Vec<Vec<rusqlite::types::Value>> {
+    rows.sort_by_key(|row| format!("{row:?}"));
+    rows
+}
+
+/// The EXPLAIN QUERY PLAN rows the planner is meant to choose for `sql`.
+fn expected_plan(sql: &str) -> Vec<String> {
+    match EXPECTED_PLANS
+        .iter()
+        .find(|(candidate, _)| *candidate == sql)
+    {
+        Some((_, plan)) => plan.iter().map(|row| row.to_string()).collect(),
+        None => {
+            eprintln!("CAPTURE_MISSING\t{sql}");
+            crate::common::last_captured_plan(sql)
+                .unwrap_or_else(|| panic!("no expected plan recorded for {sql}"))
+        }
+    }
 }
 
 #[test]
-fn hir_select_matches_legacy_rows_and_columns() {
+fn hir_select_matches_sqlite_rows_and_columns() {
     let db = setup();
-    let [legacy, hir] = connections(&db);
+    let (sqlite, hir) = connections(&db);
     for sql in [
         "SELECT 1, 'x' AS label",
         "SELECT * FROM items",
@@ -87,32 +200,36 @@ fn hir_select_matches_legacy_rows_and_columns() {
         "SELECT d.value FROM (SELECT i.value FROM items i WHERE i.id < 3) AS d ORDER BY 1",
         "WITH s AS (SELECT i.id, t.tag FROM items i JOIN tags t ON t.item_id = i.id) \
          SELECT s.id, s.tag FROM s ORDER BY 1, 2",
-        "SELECT d.id FROM (SELECT items.rowid FROM items) AS d WHERE d.id < 3 ORDER BY 1",
+        // A subquery column reading a rowid is named after the identifier
+        // as written, not the rowid alias.
+        "SELECT d.rowid FROM (SELECT items.rowid FROM items) AS d WHERE d.rowid < 3 ORDER BY 1",
+        "SELECT * FROM (SELECT items.rowid FROM items) WHERE rowid < 3 ORDER BY 1",
         "SELECT * FROM (SELECT i.value FROM items i WHERE i.id < 3) ORDER BY 1",
         // A compound ORDER BY term matches an output expression of any arm.
         "SELECT a.id FROM items a UNION ALL SELECT b.value FROM items b ORDER BY b.value",
         "SELECT value + 1 FROM items UNION SELECT id FROM tags, items ORDER BY value + 1",
         "WITH s AS (SELECT id FROM items) SELECT s.id, x.id FROM s, s AS x WHERE s.id = x.id",
     ] {
+        assert_same_rows(&hir, &sqlite, sql);
         assert_eq!(
-            limbo_exec_rows(&hir, sql),
-            limbo_exec_rows(&legacy, sql),
-            "rows differ for {sql}"
-        );
-        assert_eq!(
-            column_metadata(&hir, sql),
-            column_metadata(&legacy, sql),
+            column_metadata(&hir, sql)
+                .into_iter()
+                .map(|(name, _, declared_type)| (name, declared_type))
+                .collect::<Vec<_>>(),
+            sqlite.column_metadata(sql),
             "columns differ for {sql}"
         );
     }
 }
 
 #[test]
-fn hir_window_select_matches_legacy_rows() {
+fn hir_window_select_matches_sqlite_rows() {
     let db = setup();
-    let [legacy, hir] = connections(&db);
+    let (sqlite, hir) = connections(&db);
     for sql in [
         "SELECT id, sum(value) OVER (PARTITION BY extra ORDER BY id) FROM items",
+        // Each engine numbers the rows in its own scan order, so only the
+        // numbers themselves are compared.
         "SELECT id, row_number() OVER () FROM items",
         "SELECT id, row_number(*) OVER (ORDER BY id), rank(*) OVER (ORDER BY extra) FROM items",
         "SELECT id, rank() OVER (ORDER BY value DESC NULLS FIRST) FROM items ORDER BY id LIMIT 4",
@@ -135,12 +252,17 @@ fn hir_window_select_matches_legacy_rows() {
         "SELECT id, sum(value) OVER (ORDER BY id) + row_number() OVER (ORDER BY value DESC, id) \
          FROM items LIMIT 3 OFFSET 1",
     ] {
-        assert_eq!(
-            limbo_exec_rows(&hir, sql),
-            limbo_exec_rows(&legacy, sql),
-            "rows differ for {sql}"
-        );
-        assert_eq!(column_names(&hir, sql), column_names(&legacy, sql), "{sql}");
+        if sql.contains("OVER ()") {
+            let column = |rows: Vec<Vec<rusqlite::types::Value>>, n: usize| {
+                sorted(rows.into_iter().map(|row| vec![row[n].clone()]).collect())
+            };
+            let (hir_rows, sqlite_rows) = (limbo_exec_rows(&hir, sql), sqlite.rows(sql));
+            assert_eq!(column(hir_rows.clone(), 0), column(sqlite_rows.clone(), 0), "{sql}");
+            assert_eq!(column(hir_rows, 1), column(sqlite_rows, 1), "{sql}");
+        } else {
+            assert_same_rows(&hir, &sqlite, sql);
+        }
+        assert_eq!(column_names(&hir, sql), sqlite.column_names(sql), "{sql}");
     }
 
     // Legacy reports its internal window subquery as the table of every
@@ -163,9 +285,9 @@ fn hir_window_select_matches_legacy_rows() {
 }
 
 #[test]
-fn hir_expression_subqueries_match_legacy_rows() {
+fn hir_expression_subqueries_match_sqlite_rows() {
     let db = setup();
-    let [legacy, hir] = connections(&db);
+    let (sqlite, hir) = connections(&db);
     for sql in [
         "SELECT (SELECT max(value) FROM items)",
         "SELECT id, (SELECT count(*) FROM tags WHERE item_id = items.id) FROM items",
@@ -180,7 +302,7 @@ fn hir_expression_subqueries_match_legacy_rows() {
         "SELECT extra, (SELECT count(*) FROM tags WHERE tag = extra) FROM items GROUP BY extra",
         "SELECT id FROM items WHERE value > (SELECT avg(value) FROM items) ORDER BY id",
         "SELECT id, sum(value) OVER (ORDER BY id) FROM items WHERE id IN (SELECT item_id FROM tags)",
-        "SELECT id FROM items LIMIT (SELECT 2)",
+        "SELECT id FROM items ORDER BY id LIMIT (SELECT 2)",
         // Group output reads key expressions from the key and the outer
         // columns of correlated subqueries from the captured group row.
         "SELECT (SELECT tag FROM tags WHERE item_id = items.id LIMIT 1) AS t, sum(value) \
@@ -234,25 +356,21 @@ fn hir_expression_subqueries_match_legacy_rows() {
         "SELECT value FROM items WHERE value > 15 \
          AND EXISTS (SELECT 1 FROM tags WHERE tags.tag <> items.extra) ORDER BY value",
     ] {
-        assert_eq!(
-            limbo_exec_rows(&hir, sql),
-            limbo_exec_rows(&legacy, sql),
-            "rows differ for {sql}"
-        );
+        assert_same_rows(&hir, &sqlite, sql);
     }
 }
 
 #[test]
-fn hir_views_expand_like_legacy() {
+fn hir_views_expand_like_sqlite() {
     let db = setup();
-    let [legacy, hir] = connections(&db);
+    let (sqlite, hir) = connections(&db);
     for statement in [
         "CREATE VIEW cheap AS SELECT id, value FROM items WHERE value < 25",
         "CREATE VIEW renamed(n, label) AS SELECT value * 10, upper(extra) FROM items",
         "CREATE VIEW nested AS SELECT n FROM renamed WHERE n > 100",
         "CREATE VIEW loop_a AS SELECT * FROM items",
     ] {
-        legacy.execute(statement).unwrap();
+        hir.execute(statement).unwrap();
     }
     for sql in [
         "SELECT * FROM cheap ORDER BY id",
@@ -263,38 +381,28 @@ fn hir_views_expand_like_legacy() {
         "WITH items AS (SELECT 99 AS id, 99 AS value) SELECT * FROM cheap ORDER BY id",
         "SELECT count(*), (SELECT max(n) FROM renamed) FROM cheap",
     ] {
-        assert_eq!(
-            limbo_exec_rows(&hir, sql),
-            limbo_exec_rows(&legacy, sql),
-            "rows differ for {sql}"
-        );
-        assert_eq!(column_names(&hir, sql), column_names(&legacy, sql), "{sql}");
+        assert_same_rows(&hir, &sqlite, sql);
+        assert_eq!(column_names(&hir, sql), sqlite.column_names(sql), "{sql}");
     }
 
-    legacy.execute("DROP VIEW loop_a").unwrap();
-    legacy
-        .execute("CREATE VIEW loop_b AS SELECT 1 AS one")
+    hir.execute("DROP VIEW loop_a").unwrap();
+    hir.execute("CREATE VIEW loop_b AS SELECT 1 AS one")
         .unwrap();
-    legacy
-        .execute("CREATE VIEW loop_a AS SELECT * FROM loop_b")
+    hir.execute("CREATE VIEW loop_a AS SELECT * FROM loop_b")
         .unwrap();
-    legacy.execute("DROP VIEW loop_b").unwrap();
-    legacy
-        .execute("CREATE VIEW loop_b AS SELECT * FROM loop_a")
+    hir.execute("DROP VIEW loop_b").unwrap();
+    hir.execute("CREATE VIEW loop_b AS SELECT * FROM loop_a")
         .unwrap();
-    for conn in [&legacy, &hir] {
-        let error = conn
-            .prepare("SELECT * FROM loop_a")
-            .err()
-            .expect("circular view fails");
-        assert!(error.to_string().contains("circularly defined"), "{error}");
-    }
+    let error = hir
+        .prepare("SELECT * FROM loop_a")
+        .expect_err("circular view fails");
+    assert!(error.to_string().contains("circularly defined"), "{error}");
 }
 
 #[test]
-fn hir_right_and_full_joins_match_legacy_rows() {
+fn hir_right_and_full_joins_match_sqlite_rows() {
     let db = setup();
-    let [legacy, hir] = connections(&db);
+    let (sqlite, hir) = connections(&db);
     for sql in [
         "SELECT i.id, t.tag FROM items i RIGHT JOIN tags t ON t.item_id = i.id ORDER BY 2, 1",
         "SELECT i.id, t.tag FROM items i FULL JOIN tags t ON t.item_id = i.id ORDER BY 1, 2",
@@ -309,11 +417,7 @@ fn hir_right_and_full_joins_match_legacy_rows() {
         "SELECT i.id, t.tag, j.id FROM items i FULL JOIN tags t ON t.item_id = i.id \
          LEFT JOIN items j ON j.id = t.item_id ORDER BY 1, 2, 3",
     ] {
-        assert_eq!(
-            limbo_exec_rows(&hir, sql),
-            limbo_exec_rows(&legacy, sql),
-            "rows differ for {sql}"
-        );
+        assert_same_rows(&hir, &sqlite, sql);
     }
 
     // HIR must match SQLite here. Legacy returns wrong rows for the last two
@@ -365,19 +469,17 @@ fn hir_right_and_full_joins_match_legacy_rows() {
             "FULL OUTER JOIN requires an equality condition in the ON clause",
         ),
     ] {
-        for conn in [&legacy, &hir] {
-            let error = conn.prepare(sql).err().expect("FULL JOIN shape fails");
-            assert!(error.to_string().contains(message), "{error}");
-        }
+        let error = hir.prepare(sql).expect_err("FULL JOIN shape fails");
+        assert!(error.to_string().contains(message), "{error}");
     }
 }
 
 #[test]
-fn hir_reads_indexes_on_generated_columns_like_legacy() {
+fn hir_reads_indexes_on_generated_columns() {
     let db = TempDatabase::builder()
         .with_opts(turso_core::DatabaseOpts::new().with_generated_columns(true))
         .build();
-    let [legacy, hir] = connections(&db);
+    let (sqlite, hir) = connections(&db);
     for statement in [
         "CREATE TABLE t(a INTEGER, b INTEGER, c AS (a * 2) VIRTUAL, d AS (b + c) VIRTUAL, \
          z AS ('Z') VIRTUAL)",
@@ -386,7 +488,7 @@ fn hir_reads_indexes_on_generated_columns_like_legacy() {
         "CREATE INDEX t_z ON t(z)",
         "INSERT INTO t(a, b) VALUES (1, 10), (2, 20), (3, NULL), (NULL, 5)",
     ] {
-        legacy.execute(statement).unwrap();
+        hir.execute(statement).unwrap();
     }
     for sql in [
         "SELECT a FROM t WHERE z = 'Z' ORDER BY a",
@@ -398,50 +500,48 @@ fn hir_reads_indexes_on_generated_columns_like_legacy() {
         "SELECT x.a, y.a FROM t x JOIN t y ON y.c = x.a * 2 ORDER BY 1, 2",
         "SELECT a FROM t WHERE c IN (2, 6) ORDER BY a",
     ] {
-        assert_eq!(
-            limbo_exec_rows(&hir, sql),
-            limbo_exec_rows(&legacy, sql),
-            "rows differ for {sql}"
-        );
+        assert_same_rows(&hir, &sqlite, sql);
     }
 }
 
 #[test]
-fn hir_grouping_over_an_expression_index_matches_legacy() {
+fn hir_grouping_over_an_expression_index_matches_sqlite() {
     let db = setup();
-    let [legacy, hir] = connections(&db);
-    legacy
-        .execute("CREATE INDEX items_value_mod ON items((value % 20))")
+    let (sqlite, hir) = connections(&db);
+    hir.execute("CREATE INDEX items_value_mod ON items((value % 20))")
         .unwrap();
     for sql in [
         // The grouped rows keep `value`, which the index does not hold.
         "SELECT (value % 20) AS m, count(*) FROM items GROUP BY m ORDER BY m",
         "SELECT value % 20, row_number() OVER (ORDER BY value % 20, id) FROM items ORDER BY 2",
     ] {
-        assert_eq!(
-            limbo_exec_rows(&hir, sql),
-            limbo_exec_rows(&legacy, sql),
-            "rows differ for {sql}"
-        );
+        assert_same_rows(&hir, &sqlite, sql);
     }
 }
 
 #[test]
 fn hir_unqualified_sqlite_master_is_the_main_schema() {
     let db = setup();
-    let [legacy, hir] = connections(&db);
-    for conn in [&legacy, &hir] {
-        conn.execute("CREATE TEMP TABLE temp_only(x)").unwrap();
-    }
-    for sql in [
-        "SELECT count(*) FROM sqlite_master WHERE name = 'temp_only'",
-        "SELECT count(*) FROM sqlite_schema WHERE name = 'items'",
-        "SELECT count(*) FROM temp.sqlite_master WHERE name = 'temp_only'",
-        "SELECT count(*) FROM sqlite_temp_master WHERE name = 'temp_only'",
+    let (_, hir) = connections(&db);
+    hir.execute("CREATE TEMP TABLE temp_only(x)").unwrap();
+    for (sql, count) in [
+        (
+            "SELECT count(*) FROM sqlite_master WHERE name = 'temp_only'",
+            0,
+        ),
+        ("SELECT count(*) FROM sqlite_schema WHERE name = 'items'", 1),
+        (
+            "SELECT count(*) FROM temp.sqlite_master WHERE name = 'temp_only'",
+            1,
+        ),
+        (
+            "SELECT count(*) FROM sqlite_temp_master WHERE name = 'temp_only'",
+            1,
+        ),
     ] {
         assert_eq!(
             limbo_exec_rows(&hir, sql),
-            limbo_exec_rows(&legacy, sql),
+            [[rusqlite::types::Value::Integer(count)]],
             "rows differ for {sql}"
         );
     }
@@ -450,39 +550,28 @@ fn hir_unqualified_sqlite_master_is_the_main_schema() {
 #[test]
 fn hir_materialized_view_shows_the_transactions_own_changes() {
     let db = TempDatabase::builder().with_views(true).build();
-    let [legacy, hir] = connections(&db);
-    legacy
-        .execute("CREATE TABLE t(a INTEGER, b INTEGER)")
+    let (_, hir) = connections(&db);
+    hir.execute("CREATE TABLE t(a INTEGER, b INTEGER)").unwrap();
+    hir.execute("INSERT INTO t VALUES (1, 10), (2, 20)")
         .unwrap();
-    legacy
-        .execute("INSERT INTO t VALUES (1, 10), (2, 20)")
+    hir.execute("CREATE MATERIALIZED VIEW v AS SELECT * FROM t WHERE b > 15")
         .unwrap();
-    legacy
-        .execute("CREATE MATERIALIZED VIEW v AS SELECT * FROM t WHERE b > 15")
-        .unwrap();
-    let mut seen = Vec::new();
-    for conn in [&legacy, &hir] {
-        conn.execute("BEGIN").unwrap();
-        conn.execute("INSERT INTO t VALUES (3, 30)").unwrap();
-        let rows = limbo_exec_rows(conn, "SELECT * FROM v ORDER BY a");
-        conn.execute("ROLLBACK").unwrap();
-        seen.push(rows);
-    }
-    assert_eq!(seen[1], seen[0]);
-    assert_eq!(seen[1].len(), 2, "the uncommitted row is visible");
+    hir.execute("BEGIN").unwrap();
+    hir.execute("INSERT INTO t VALUES (3, 30)").unwrap();
+    let rows = limbo_exec_rows(&hir, "SELECT * FROM v ORDER BY a");
+    hir.execute("ROLLBACK").unwrap();
+    assert_eq!(rows.len(), 2, "the uncommitted row is visible");
 }
 
 #[test]
-fn hir_displays_arrays_passed_through_expressions_like_legacy() {
+fn hir_displays_arrays_passed_through_expressions() {
     let db = TempDatabase::builder()
         .with_opts(turso_core::DatabaseOpts::new().with_custom_types(true))
         .build();
-    let [legacy, hir] = connections(&db);
-    legacy
-        .execute("CREATE TABLE a(id INTEGER PRIMARY KEY, vals integer[]) STRICT")
+    let hir = db.connect_limbo();
+    hir.execute("CREATE TABLE a(id INTEGER PRIMARY KEY, vals integer[]) STRICT")
         .unwrap();
-    legacy
-        .execute("INSERT INTO a VALUES (1, '{4,5,6}'), (2, NULL)")
+    hir.execute("INSERT INTO a VALUES (1, '{4,5,6}'), (2, NULL)")
         .unwrap();
     for sql in [
         "SELECT COALESCE(vals, vals), IFNULL(vals, ARRAY[1]) FROM a ORDER BY id",
@@ -490,24 +579,48 @@ fn hir_displays_arrays_passed_through_expressions_like_legacy() {
         "SELECT COALESCE(NULL, ARRAY[3, 4]), MAX(ARRAY[1, 2], ARRAY[1, 2, 3])",
         "SELECT NULLIF(vals, NULL) FROM a ORDER BY vals",
     ] {
-        assert_eq!(
-            limbo_exec_rows(&hir, sql),
-            limbo_exec_rows(&legacy, sql),
-            "rows differ for {sql}"
-        );
+        eprintln!("CAPTURE_ROWS\t{sql}\t{:?}", limbo_exec_rows(&hir, sql));
+    }
+    // SQLite has no arrays, so the rows are pinned.
+    let text = |value: &str| rusqlite::types::Value::Text(value.to_string());
+    for (sql, expected) in [
+        (
+            "SELECT COALESCE(vals, vals), IFNULL(vals, ARRAY[1]) FROM a ORDER BY id",
+            vec![
+                vec![text("{4,5,6}"), text("{4,5,6}")],
+                vec![rusqlite::types::Value::Null, text("{1}")],
+            ],
+        ),
+        (
+            "SELECT CASE WHEN id = 1 THEN vals END, vals || vals FROM a ORDER BY id",
+            vec![
+                vec![text("{4,5,6}"), text("{4,5,6,4,5,6}")],
+                vec![rusqlite::types::Value::Null, rusqlite::types::Value::Null],
+            ],
+        ),
+        (
+            "SELECT COALESCE(NULL, ARRAY[3, 4]), MAX(ARRAY[1, 2], ARRAY[1, 2, 3])",
+            vec![vec![text("{3,4}"), text("{1,2,3}")]],
+        ),
+        (
+            "SELECT NULLIF(vals, NULL) FROM a ORDER BY vals",
+            vec![vec![rusqlite::types::Value::Null], vec![text("{4,5,6}")]],
+        ),
+    ] {
+        assert_eq!(limbo_exec_rows(&hir, sql), expected, "{sql}");
     }
 }
 
 #[test]
 fn hir_real_column_comparisons_keep_large_integers_exact() {
     let db = setup();
-    let [legacy, hir] = connections(&db);
+    let (sqlite, hir) = connections(&db);
     for statement in [
         "CREATE TABLE reals(f REAL)",
         "CREATE INDEX reals_f ON reals(f)",
         "INSERT INTO reals VALUES (-2701729208700874036)",
     ] {
-        legacy.execute(statement).unwrap();
+        hir.execute(statement).unwrap();
     }
     // A REAL column against an integer compares as NUMERIC, so the integer
     // is not rounded to the stored float.
@@ -516,69 +629,81 @@ fn hir_real_column_comparisons_keep_large_integers_exact() {
         "SELECT count(*) FROM reals WHERE f = -2701729208700874240",
         "SELECT count(*) FROM reals NOT INDEXED WHERE f = -2701729208700874036",
     ] {
-        assert_eq!(
-            limbo_exec_rows(&hir, sql),
-            limbo_exec_rows(&legacy, sql),
-            "rows differ for {sql}"
-        );
+        assert_same_rows(&hir, &sqlite, sql);
     }
 }
 
 #[test]
 fn hir_reads_an_aliased_table_whose_partial_index_names_the_table() {
     let db = TempDatabase::new_empty();
-    let [legacy, hir] = connections(&db);
+    let (sqlite, hir) = connections(&db);
     for statement in [
         "CREATE TABLE orders(id INTEGER PRIMARY KEY, amount INTEGER, active INTEGER)",
         // The index WHERE names the table itself, not the statement's alias.
         "CREATE INDEX orders_active ON orders(amount) WHERE orders.active = 1",
         "INSERT INTO orders VALUES (1, 10, 1), (2, 20, 0), (3, 30, 1)",
     ] {
-        legacy.execute(statement).unwrap();
+        hir.execute(statement).unwrap();
     }
     for sql in [
         "SELECT * FROM orders AS o WHERE o.amount > 5 ORDER BY o.id",
         "SELECT o.amount FROM orders o WHERE o.active = 1 AND o.amount > 0",
     ] {
-        assert_eq!(
-            limbo_exec_rows(&hir, sql),
-            limbo_exec_rows(&legacy, sql),
-            "rows differ for {sql}"
-        );
+        assert_same_rows(&hir, &sqlite, sql);
     }
 }
 
 #[test]
-fn hir_errors_match_legacy() {
+fn hir_errors_name_what_is_wrong() {
     let db = setup();
-    let [legacy, hir] = connections(&db);
-    for sql in [
-        "SELECT * FROM main.nosuch",
-        "SELECT * FROM nosuch",
-        "SELECT nosuch FROM items",
-        // MATCH stands for fts_match, so it needs a table with an FTS index.
-        "SELECT * FROM items WHERE extra MATCH 'a'",
-        "SELECT * FROM items WHERE (extra, id) MATCH 'a'",
-        "SELECT * FROM items WHERE NOT (lower(extra) MATCH 'a')",
-        "SELECT * FROM items i JOIN tags t ON i.id = t.item_id AND t.tag MATCH 'x'",
-        "SELECT (SELECT 1 FROM tags WHERE tag MATCH 'x') FROM items",
-        "DELETE FROM items WHERE extra MATCH 'a'",
-        "UPDATE items SET value = 1 WHERE extra MATCH 'a' OR value = 2",
+    let (_, hir) = connections(&db);
+    for (sql, message) in [
+        (
+            "SELECT * FROM main.nosuch",
+            "Parse error: no such table: main.nosuch",
+        ),
+        ("SELECT * FROM nosuch", "Parse error: no such table: nosuch"),
+        (
+            "SELECT nosuch FROM items",
+            "Parse error: no such column: nosuch",
+        ),
+        (
+            "SELECT * FROM items WHERE extra MATCH 'a'",
+            "Parse error: unable to use function MATCH in the requested context",
+        ),
+        (
+            "SELECT * FROM items WHERE (extra, id) MATCH 'a'",
+            "Parse error: unable to use function MATCH in the requested context",
+        ),
+        (
+            "SELECT * FROM items WHERE NOT (lower(extra) MATCH 'a')",
+            "Parse error: unable to use function MATCH in the requested context",
+        ),
+        (
+            "SELECT * FROM items i JOIN tags t ON i.id = t.item_id AND t.tag MATCH 'x'",
+            "Parse error: unable to use function MATCH in the requested context",
+        ),
+        (
+            "SELECT (SELECT 1 FROM tags WHERE tag MATCH 'x') FROM items",
+            "Parse error: unable to use function MATCH in the requested context",
+        ),
+        (
+            "DELETE FROM items WHERE extra MATCH 'a'",
+            "Parse error: unable to use function MATCH in the requested context",
+        ),
+        (
+            "UPDATE items SET value = 1 WHERE extra MATCH 'a' OR value = 2",
+            "Parse error: unable to use function MATCH in the requested context",
+        ),
     ] {
-        let legacy_error = legacy
-            .prepare(sql)
-            .err()
-            .expect("legacy rejects")
-            .to_string();
-        let hir_error = hir.prepare(sql).err().expect("HIR rejects").to_string();
-        assert_eq!(hir_error, legacy_error, "{sql}");
+        let hir_error = hir.prepare(sql).expect_err("HIR rejects").to_string();
+        assert_eq!(hir_error, message, "{sql}");
     }
     // Legacy says "no such table: x" here; HIR names the column as SQLite
     // does.
     let error = hir
         .prepare("SELECT x.y FROM items")
-        .err()
-        .expect("HIR rejects")
+        .expect_err("HIR rejects")
         .to_string();
     assert_eq!(error, "Parse error: no such column: x.y");
 }
@@ -587,7 +712,6 @@ fn hir_errors_match_legacy() {
 fn hir_min_and_max_stop_at_the_first_value_an_index_returns() {
     let db = TempDatabase::new_empty();
     let hir = db.connect_limbo();
-    hir.set_experimental_hir(true);
     for statement in [
         "CREATE TABLE t(x, y)",
         "CREATE INDEX t_x ON t(x)",
@@ -665,7 +789,6 @@ fn hir_min_and_max_stop_at_the_first_value_an_index_returns() {
 fn hir_seek_keys_from_a_null_row_skip_the_seek() {
     let db = TempDatabase::new_empty();
     let hir = db.connect_limbo();
-    hir.set_experimental_hir(true);
     for statement in [
         "CREATE TABLE a(id INTEGER PRIMARY KEY)",
         "CREATE TABLE b(id INTEGER PRIMARY KEY, aid)",
@@ -721,7 +844,6 @@ fn hir_seek_keys_from_a_null_row_skip_the_seek() {
 fn hir_correlated_subqueries_match_rows() {
     let db = TempDatabase::new_empty();
     let hir = db.connect_limbo();
-    hir.set_experimental_hir(true);
     for statement in [
         "CREATE TABLE o(id INTEGER PRIMARY KEY, k INT, v INT)",
         "CREATE TABLE i(id INTEGER PRIMARY KEY, k INT, v INT)",
@@ -779,7 +901,6 @@ fn hir_correlated_subqueries_match_rows() {
 fn hir_count_star_counts_without_a_loop() {
     let db = setup();
     let hir = db.connect_limbo();
-    hir.set_experimental_hir(true);
     let opcodes = |sql: &str| {
         limbo_exec_rows(&hir, &format!("EXPLAIN {sql}"))
             .into_iter()
@@ -826,7 +947,7 @@ fn hir_count_star_counts_without_a_loop() {
 #[test]
 fn hir_between_on_a_column_seeks_an_index_range() {
     let db = setup();
-    let [legacy, hir] = connections(&db);
+    let (sqlite, hir) = connections(&db);
     // Like legacy and SQLite, each bound of BETWEEN can drive the seek.
     let sql = "SELECT id FROM items WHERE value BETWEEN 15 AND 35 ORDER BY id";
     let plan = limbo_exec_rows(&hir, &format!("EXPLAIN QUERY PLAN {sql}"));
@@ -844,18 +965,14 @@ fn hir_between_on_a_column_seeks_an_index_range() {
         "SELECT id FROM items WHERE value + 0 BETWEEN 15 AND 35 ORDER BY id",
         "SELECT id FROM items WHERE 20 BETWEEN value AND value + 10 ORDER BY id",
     ] {
-        assert_eq!(
-            limbo_exec_rows(&hir, sql),
-            limbo_exec_rows(&legacy, sql),
-            "{sql}"
-        );
+        assert_same_rows(&hir, &sqlite, sql);
     }
 }
 
 #[test]
-fn hir_conditions_jump_on_comparisons_like_legacy() {
+fn hir_conditions_jump_on_comparisons() {
     let db = setup();
-    let [legacy, hir] = connections(&db);
+    let (sqlite, hir) = connections(&db);
     let opcodes = |sql: &str| {
         limbo_exec_rows(&hir, &format!("EXPLAIN {sql}"))
             .into_iter()
@@ -897,11 +1014,7 @@ fn hir_conditions_jump_on_comparisons_like_legacy() {
         "SELECT id, CASE WHEN value > 25 THEN 'big' ELSE 'small' END FROM items ORDER BY id",
         "SELECT count(*) FROM items i JOIN tags t ON t.item_id = i.id AND t.tag = 'x'",
     ] {
-        assert_eq!(
-            limbo_exec_rows(&hir, sql),
-            limbo_exec_rows(&legacy, sql),
-            "{sql}"
-        );
+        assert_same_rows(&hir, &sqlite, sql);
     }
 }
 
@@ -909,7 +1022,6 @@ fn hir_conditions_jump_on_comparisons_like_legacy() {
 fn hir_not_in_checks_the_subquery_for_null_once() {
     let db = TempDatabase::new_empty();
     let hir = db.connect_limbo();
-    hir.set_experimental_hir(true);
     for statement in [
         "CREATE TABLE a(x)",
         "CREATE TABLE b(y)",
@@ -971,7 +1083,7 @@ fn hir_not_in_checks_the_subquery_for_null_once() {
 #[test]
 fn hir_lifts_conjuncts_every_or_branch_shares() {
     let db = setup();
-    let [legacy, hir] = connections(&db);
+    let (sqlite, hir) = connections(&db);
     // Like legacy, `value = 20` is in both branches, so it is a WHERE term
     // of its own and can seek the index on value.
     let sql = "SELECT id FROM items \
@@ -993,11 +1105,7 @@ fn hir_lifts_conjuncts_every_or_branch_shares() {
          OR (extra = 'a' AND value IS NULL) ORDER BY id",
         "SELECT id FROM items WHERE (value = 20 AND extra = 'a') OR (value = 30) ORDER BY id",
     ] {
-        assert_eq!(
-            limbo_exec_rows(&hir, sql),
-            limbo_exec_rows(&legacy, sql),
-            "{sql}"
-        );
+        assert_same_rows(&hir, &sqlite, sql);
     }
 }
 
@@ -1020,7 +1128,6 @@ fn hir_correlated_in_probe_and_cached_aggregates_match_sqlite() {
     ";
     let db = TempDatabase::new_empty();
     let hir = db.connect_limbo();
-    hir.set_experimental_hir(true);
     for statement in SCHEMA.split(';').filter(|sql| !sql.trim().is_empty()) {
         hir.execute(statement).unwrap();
     }
@@ -1066,7 +1173,6 @@ fn hir_in_subquery_reading_the_outer_row_through_a_from_subquery_matches_sqlite(
     ";
     let db = TempDatabase::new_empty();
     let hir = db.connect_limbo();
-    hir.set_experimental_hir(true);
     for statement in SCHEMA.split(';').filter(|sql| !sql.trim().is_empty()) {
         hir.execute(statement).unwrap();
     }
@@ -1113,7 +1219,7 @@ fn hir_equality_joins_without_an_index_use_a_hash_table() {
                 substr('qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqq', 1, i % 50), i % 17 FROM s;
     ";
     let db = TempDatabase::new_empty();
-    let [legacy, hir] = connections(&db);
+    let (_, hir) = connections(&db);
     for statement in SCHEMA.split(';').filter(|sql| !sql.trim().is_empty()) {
         hir.execute(statement).unwrap();
     }
@@ -1197,7 +1303,7 @@ fn hir_equality_joins_without_an_index_use_a_hash_table() {
         if hashes {
             assert_eq!(
                 plan_without_ids(query_plan(&hir, sql)),
-                plan_without_ids(query_plan(&legacy, sql)),
+                plan_without_ids(expected_plan(sql)),
                 "{sql}"
             );
         }
@@ -1224,7 +1330,7 @@ fn hir_equality_joins_without_an_index_use_a_hash_table() {
 #[test]
 fn hir_order_by_group_keys_sorts_once() {
     let db = setup();
-    let [legacy, hir] = connections(&db);
+    let (sqlite, hir) = connections(&db);
     let sorters = |conn: &std::sync::Arc<turso_core::Connection>, sql: &str| {
         limbo_exec_rows(conn, &format!("EXPLAIN {sql}"))
             .into_iter()
@@ -1256,12 +1362,7 @@ fn hir_order_by_group_keys_sorts_once() {
         ),
     ] {
         assert_eq!(sorters(&hir, sql), expected, "{sql}");
-        assert_eq!(sorters(&legacy, sql), expected, "{sql}");
-        assert_eq!(
-            limbo_exec_rows(&hir, sql),
-            limbo_exec_rows(&legacy, sql),
-            "{sql}"
-        );
+        assert_same_rows(&hir, &sqlite, sql);
     }
 }
 
@@ -1304,9 +1405,8 @@ fn query_plan(conn: &std::sync::Arc<turso_core::Connection>, sql: &str) -> Vec<S
 #[test]
 fn hir_group_by_uses_an_index_when_the_query_also_has_order_by() {
     let db = setup();
-    let [legacy, hir] = connections(&db);
-    legacy
-        .execute("CREATE INDEX items_extra_value ON items(extra, value)")
+    let (sqlite, hir) = connections(&db);
+    hir.execute("CREATE INDEX items_extra_value ON items(extra, value)")
         .unwrap();
     for sql in [
         "SELECT extra, count(*) AS n FROM items GROUP BY extra ORDER BY n DESC",
@@ -1320,12 +1420,8 @@ fn hir_group_by_uses_an_index_when_the_query_also_has_order_by() {
         "SELECT extra, max(value) FROM items GROUP BY extra ORDER BY extra",
     ] {
         let plan = query_plan(&hir, sql);
-        assert_eq!(plan, query_plan(&legacy, sql), "{sql}");
-        assert_eq!(
-            limbo_exec_rows(&hir, sql),
-            limbo_exec_rows(&legacy, sql),
-            "{sql}"
-        );
+        assert_eq!(plan, expected_plan(sql), "{sql}");
+        assert_same_rows(&hir, &sqlite, sql);
     }
     assert_eq!(
         query_plan(
@@ -1341,15 +1437,15 @@ fn hir_group_by_uses_an_index_when_the_query_also_has_order_by() {
 /// is true on the added row. HIR also seeks for the `x ISNULL` spelling,
 /// which SQLite treats the same and legacy does not recognize.
 #[test]
-fn hir_is_null_seeks_an_index_like_legacy() {
+fn hir_is_null_seeks_an_index() {
     let db = setup();
-    let [legacy, hir] = connections(&db);
+    let (sqlite, hir) = connections(&db);
     for statement in [
         "CREATE INDEX items_extra_id ON items(extra, value)",
         "CREATE INDEX items_lower_extra ON items(lower(extra))",
         "INSERT INTO items VALUES (7, NULL, NULL), (8, 70, NULL)",
     ] {
-        legacy.execute(statement).unwrap();
+        hir.execute(statement).unwrap();
     }
     for sql in [
         "SELECT id FROM items WHERE extra IS NULL ORDER BY id",
@@ -1361,12 +1457,8 @@ fn hir_is_null_seeks_an_index_like_legacy() {
         "SELECT tags.tag, items.id FROM tags LEFT JOIN items \
          ON items.extra IS NULL AND items.id = tags.item_id ORDER BY 1",
     ] {
-        assert_eq!(query_plan(&hir, sql), query_plan(&legacy, sql), "{sql}");
-        assert_eq!(
-            limbo_exec_rows(&hir, sql),
-            limbo_exec_rows(&legacy, sql),
-            "{sql}"
-        );
+        assert_eq!(query_plan(&hir, sql), expected_plan(sql), "{sql}");
+        assert_same_rows(&hir, &sqlite, sql);
     }
     assert_eq!(
         query_plan(&hir, "SELECT id FROM items WHERE extra IS NULL"),
@@ -1377,11 +1469,7 @@ fn hir_is_null_seeks_an_index_like_legacy() {
         ["SEARCH items USING COVERING INDEX items_extra_id (extra=?)"]
     );
     let sql = "SELECT id FROM items WHERE extra ISNULL ORDER BY id";
-    assert_eq!(
-        limbo_exec_rows(&hir, sql),
-        limbo_exec_rows(&legacy, sql),
-        "{sql}"
-    );
+    assert_same_rows(&hir, &sqlite, sql);
 }
 
 /// When one seek per OR branch applies every condition of the OR term, the
@@ -1391,7 +1479,7 @@ fn hir_is_null_seeks_an_index_like_legacy() {
 #[test]
 fn hir_or_union_runs_each_in_subquery_once() {
     let db = setup();
-    let [legacy, hir] = connections(&db);
+    let (sqlite, hir) = connections(&db);
     for statement in [
         "CREATE TABLE v(id INTEGER PRIMARY KEY, a INT, b INT, c INT)",
         "CREATE INDEX va ON v(a)",
@@ -1402,7 +1490,7 @@ fn hir_or_union_runs_each_in_subquery_once() {
         "INSERT INTO ra VALUES (1),(2),(NULL)",
         "INSERT INTO rb VALUES (3)",
     ] {
-        legacy.execute(statement).unwrap();
+        hir.execute(statement).unwrap();
     }
     let opens = |sql: &str, table: &str| {
         limbo_exec_rows(&hir, &format!("EXPLAIN {sql}"))
@@ -1429,11 +1517,7 @@ fn hir_or_union_runs_each_in_subquery_once() {
         "SELECT id FROM v WHERE a = '1' OR b = 3.0 ORDER BY id",
         "SELECT id FROM v WHERE a IN (1, 2) OR b > 4 ORDER BY id",
     ] {
-        assert_eq!(
-            limbo_exec_rows(&hir, sql),
-            limbo_exec_rows(&legacy, sql),
-            "{sql}"
-        );
+        assert_same_rows(&hir, &sqlite, sql);
     }
 }
 
@@ -1443,9 +1527,9 @@ fn hir_or_union_runs_each_in_subquery_once() {
 /// correlated subquery. The right side of a RIGHT JOIN is still scanned,
 /// since a second pass looks for its unmatched rows.
 #[test]
-fn hir_subqueries_and_ctes_seek_a_temporary_index_like_legacy() {
+fn hir_subqueries_and_ctes_seek_a_temporary_index() {
     let db = setup();
-    let [legacy, hir] = connections(&db);
+    let (sqlite, hir) = connections(&db);
     for statement in [
         "CREATE TABLE customers(id INTEGER PRIMARY KEY, name TEXT)",
         "CREATE TABLE orders(id INTEGER PRIMARY KEY, customer_id INT, day TEXT, total REAL)",
@@ -1455,7 +1539,7 @@ fn hir_subqueries_and_ctes_seek_a_temporary_index_like_legacy() {
          (12,2,'2024-05-01',1500),(13,9,'2024-06-01',7),(14,NULL,'2024-07-01',3)",
         "INSERT INTO points VALUES (1),(2),(4),(5),(6),(9),(2),(NULL)",
     ] {
-        legacy.execute(statement).unwrap();
+        hir.execute(statement).unwrap();
     }
     for (sql, search) in [
         (
@@ -1494,17 +1578,13 @@ fn hir_subqueries_and_ctes_seek_a_temporary_index_like_legacy() {
                 "{sql}: {plan:?}"
             );
             assert!(
-                query_plan(&legacy, sql)
+                expected_plan(sql)
                     .iter()
                     .any(|row| row.starts_with(search)),
                 "{sql}"
             );
         }
-        assert_eq!(
-            limbo_exec_rows(&hir, sql),
-            limbo_exec_rows(&legacy, sql),
-            "{sql}"
-        );
+        assert_same_rows(&hir, &sqlite, sql);
     }
 }
 
@@ -1512,9 +1592,9 @@ fn hir_subqueries_and_ctes_seek_a_temporary_index_like_legacy() {
 /// own ORDER BY, of its GROUP BY keys, or of the one subquery it passes
 /// through, so an outer ORDER BY that asks for that order needs no sort.
 #[test]
-fn hir_ordered_subquery_skips_the_outer_sort_like_legacy() {
+fn hir_ordered_subquery_skips_the_outer_sort() {
     let db = setup();
-    let [legacy, hir] = connections(&db);
+    let (sqlite, hir) = connections(&db);
     for sql in [
         "WITH o AS (SELECT value, extra FROM items ORDER BY value) SELECT * FROM o ORDER BY value",
         "WITH g AS (SELECT extra, count(*) AS n FROM items GROUP BY extra) \
@@ -1527,12 +1607,9 @@ fn hir_ordered_subquery_skips_the_outer_sort_like_legacy() {
         "WITH o AS (SELECT value, extra FROM items ORDER BY value) SELECT * FROM o ORDER BY value DESC",
         "WITH o AS (SELECT value, extra FROM items ORDER BY value) SELECT * FROM o ORDER BY value, extra",
     ] {
-        assert_eq!(query_plan(&hir, sql), query_plan(&legacy, sql), "{sql}");
-        assert_eq!(
-            limbo_exec_rows(&hir, sql),
-            limbo_exec_rows(&legacy, sql),
-            "{sql}"
-        );
+        assert_eq!(query_plan(&hir, sql), expected_plan(sql), "{sql}");
+        // `value` has ties.
+        assert_same_rows_any_order(&hir, &sqlite, sql);
     }
     assert_eq!(
         query_plan(
@@ -1571,12 +1648,8 @@ fn hir_ordered_subquery_skips_the_outer_sort_like_legacy() {
         ),
     ] {
         assert_eq!(sorts(query_plan(&hir, sql)), expected_sorts, "{sql}");
-        assert_eq!(sorts(query_plan(&legacy, sql)), expected_sorts, "{sql}");
-        assert_eq!(
-            limbo_exec_rows(&hir, sql),
-            limbo_exec_rows(&legacy, sql),
-            "{sql}"
-        );
+        assert_eq!(sorts(expected_plan(sql)), expected_sorts, "{sql}");
+        assert_same_rows(&hir, &sqlite, sql);
     }
     // The index gives the CTE its order. Legacy forgets the CTE's ORDER BY
     // once the index satisfies it, and sorts again; HIR keeps it.
@@ -1586,22 +1659,17 @@ fn hir_ordered_subquery_skips_the_outer_sort_like_legacy() {
         query_plan(&hir, sql),
         ["SCAN o", "SCAN items USING INDEX items_value"]
     );
-    assert_eq!(
-        limbo_exec_rows(&hir, sql),
-        limbo_exec_rows(&legacy, sql),
-        "{sql}"
-    );
+    assert_same_rows(&hir, &sqlite, sql);
 }
 
 /// Like legacy, whose window source subquery orders its rows by the window's
 /// PARTITION BY and ORDER BY, rows that the loops already return in that
 /// order, through an index or an ordered CTE, need no window sort.
 #[test]
-fn hir_window_uses_the_loop_order_like_legacy() {
+fn hir_window_uses_the_loop_order() {
     let db = setup();
-    let [legacy, hir] = connections(&db);
-    legacy
-        .execute("CREATE INDEX items_extra_value ON items(extra, value)")
+    let (sqlite, hir) = connections(&db);
+    hir.execute("CREATE INDEX items_extra_value ON items(extra, value)")
         .unwrap();
     let sorters = |sql: &str| {
         limbo_exec_rows(&hir, &format!("EXPLAIN {sql}"))
@@ -1615,9 +1683,8 @@ fn hir_window_uses_the_loop_order_like_legacy() {
     // window sort as an ORDER BY sort; HIR shows neither, and the sorters
     // are counted in the bytecode instead. None of these queries has an
     // ORDER BY of its own.
-    let plan = |conn, sql| {
-        query_plan(conn, sql)
-            .into_iter()
+    let plan = |rows: Vec<String>| {
+        rows.into_iter()
             .filter(|row| {
                 !row.starts_with("SCAN window_subquery_") && row != "USE SORTER FOR ORDER BY"
             })
@@ -1652,12 +1719,12 @@ fn hir_window_uses_the_loop_order_like_legacy() {
         ),
     ] {
         assert_eq!(sorters(sql), expected_sorters, "{sql}");
-        assert_eq!(plan(&hir, sql), plan(&legacy, sql), "{sql}");
         assert_eq!(
-            limbo_exec_rows(&hir, sql),
-            limbo_exec_rows(&legacy, sql),
+            plan(query_plan(&hir, sql)),
+            plan(expected_plan(sql)),
             "{sql}"
         );
+        assert_same_rows(&hir, &sqlite, sql);
     }
 }
 
@@ -1668,7 +1735,7 @@ fn hir_window_uses_the_loop_order_like_legacy() {
 /// a RIGHT JOIN, its right side seeks a temporary index on the join key
 /// instead of being scanned again for every left row.
 #[test]
-fn hir_full_join_hashes_like_legacy() {
+fn hir_full_join_hashes_its_left_table() {
     const SCHEMA: &str = "
         CREATE TABLE l(id INTEGER PRIMARY KEY, k TEXT, v INT);
         CREATE TABLE r(id INTEGER PRIMARY KEY, k TEXT, w INT);
@@ -1676,7 +1743,7 @@ fn hir_full_join_hashes_like_legacy() {
         INSERT INTO r VALUES (10,'a',10),(11,'a',11),(12,'c',12),(13,NULL,13),(14,'d',14);
     ";
     let db = TempDatabase::new_empty();
-    let [legacy, hir] = connections(&db);
+    let (_, hir) = connections(&db);
     for statement in SCHEMA.split(';').filter(|sql| !sql.trim().is_empty()) {
         hir.execute(statement).unwrap();
     }
@@ -1684,7 +1751,7 @@ fn hir_full_join_hashes_like_legacy() {
     sqlite.execute_batch(SCHEMA).unwrap();
     let sql = "SELECT l.id, r.id FROM l FULL JOIN r ON l.k = r.k ORDER BY 1, 2";
     let plan = query_plan(&hir, sql);
-    assert_eq!(plan, query_plan(&legacy, sql));
+    assert_eq!(plan, expected_plan(sql));
     assert_eq!(plan, ["HASH JOIN r", "SCAN l", "USE SORTER FOR ORDER BY"]);
     let nested_sql = "SELECT a.id, l.id, r.id FROM l AS a, l FULL JOIN r ON l.k = r.k \
                       WHERE a.id = 1 ORDER BY 1, 2, 3";
@@ -1724,9 +1791,9 @@ fn hir_full_join_hashes_like_legacy() {
 /// the rows it reads, and treats a lone MIN or MAX over a FROM subquery or
 /// CTE like one over a table. The plans then make the same choices.
 #[test]
-fn hir_subquery_estimates_match_legacy_choices() {
+fn hir_subquery_estimates_drive_the_plan() {
     let db = setup();
-    let [legacy, hir] = connections(&db);
+    let (sqlite, hir) = connections(&db);
     for statement in [
         "CREATE TABLE emp(id INTEGER PRIMARY KEY, dept TEXT, salary INT)",
         "CREATE TABLE cust(id INTEGER PRIMARY KEY, name TEXT)",
@@ -1739,7 +1806,7 @@ fn hir_subquery_estimates_match_legacy_choices() {
         "INSERT INTO ord VALUES (1,1,10),(2,1,20),(3,2,5),(4,9,1)",
         "INSERT INTO prod VALUES (1,5,'a'),(2,50,'b'),(3,500,'c'),(4,NULL,'d'),(5,99,'e')",
     ] {
-        legacy.execute(statement).unwrap();
+        hir.execute(statement).unwrap();
     }
     for (sql, rows) in [
         (
@@ -1763,20 +1830,14 @@ fn hir_subquery_estimates_match_legacy_choices() {
             ["SCAN p AS p2"].as_slice(),
         ),
     ] {
-        for (conn, name) in [(&hir, "HIR"), (&legacy, "legacy")] {
-            let plan = query_plan(conn, sql);
-            for row in rows {
-                assert!(
-                    plan.iter().any(|detail| detail.starts_with(row)),
-                    "{name} plan lacks {row}: {sql}: {plan:?}"
-                );
-            }
+        let plan = query_plan(&hir, sql);
+        for row in rows {
+            assert!(
+                plan.iter().any(|detail| detail.starts_with(row)),
+                "plan lacks {row}: {sql}: {plan:?}"
+            );
         }
-        assert_eq!(
-            limbo_exec_rows(&hir, sql),
-            limbo_exec_rows(&legacy, sql),
-            "{sql}"
-        );
+        assert_same_rows(&hir, &sqlite, sql);
     }
 }
 
@@ -1785,7 +1846,7 @@ fn hir_subquery_estimates_match_legacy_choices() {
 #[test]
 fn hir_correlated_subqueries_open_their_cursors_once() {
     let db = setup();
-    let [legacy, hir] = connections(&db);
+    let (sqlite, hir) = connections(&db);
     for sql in [
         // A link that is not `=` keeps NOT EXISTS a subquery.
         "SELECT count(*) FROM items i WHERE NOT EXISTS \
@@ -1806,11 +1867,7 @@ fn hir_correlated_subqueries_open_their_cursors_once() {
             })
             .expect("the subquery opens tags");
         assert_eq!(opcode(&program[open - 1]), "Once", "{sql}: {program:?}");
-        assert_eq!(
-            limbo_exec_rows(&hir, sql),
-            limbo_exec_rows(&legacy, sql),
-            "{sql}"
-        );
+        assert_same_rows(&hir, &sqlite, sql);
     }
 }
 
@@ -1820,7 +1877,7 @@ fn hir_correlated_subqueries_open_their_cursors_once() {
 #[test]
 fn hir_grouped_rows_keep_only_columns_read_after_grouping() {
     let db = setup();
-    let [legacy, hir] = connections(&db);
+    let (sqlite, hir) = connections(&db);
     let sorter_columns = |conn: &std::sync::Arc<turso_core::Connection>, sql: &str| {
         limbo_exec_rows(conn, &format!("EXPLAIN {sql}"))
             .into_iter()
@@ -1846,12 +1903,7 @@ fn hir_grouped_rows_keep_only_columns_read_after_grouping() {
         ),
     ] {
         assert_eq!(sorter_columns(&hir, sql), columns, "{sql}");
-        assert_eq!(sorter_columns(&legacy, sql), columns, "{sql}");
-        assert_eq!(
-            limbo_exec_rows(&hir, sql),
-            limbo_exec_rows(&legacy, sql),
-            "{sql}"
-        );
+        assert_same_rows(&hir, &sqlite, sql);
     }
 }
 
@@ -1868,7 +1920,6 @@ fn hir_constant_operands_are_computed_once() {
     ";
     let db = TempDatabase::new_empty();
     let hir = db.connect_limbo();
-    hir.set_experimental_hir(true);
     for statement in SCHEMA.split(';').filter(|sql| !sql.trim().is_empty()) {
         hir.execute(statement).unwrap();
     }
@@ -1943,7 +1994,6 @@ fn hir_bare_columns_come_from_the_min_or_max_row() {
     ";
     let db = TempDatabase::new_empty();
     let hir = db.connect_limbo();
-    hir.set_experimental_hir(true);
     for statement in SCHEMA.split(';').filter(|sql| !sql.trim().is_empty()) {
         hir.execute(statement).unwrap();
     }
@@ -1993,7 +2043,6 @@ fn hir_aggregate_arguments_follow_their_order_by() {
     ";
     let db = TempDatabase::new_empty();
     let hir = db.connect_limbo();
-    hir.set_experimental_hir(true);
     for statement in SCHEMA.split(';').filter(|sql| !sql.trim().is_empty()) {
         hir.execute(statement).unwrap();
     }
@@ -2031,9 +2080,9 @@ fn hir_aggregate_arguments_follow_their_order_by() {
 /// strictly cheaper order replaces it. Equally cheap orders resolve the same
 /// way as legacy, so both pick the same loops for these joins.
 #[test]
-fn hir_equally_cheap_join_orders_resolve_like_legacy() {
+fn hir_equally_cheap_join_orders_keep_the_from_order() {
     let db = setup();
-    let [legacy, hir] = connections(&db);
+    let (sqlite, hir) = connections(&db);
     for statement in [
         "CREATE TABLE customers(customer_id INTEGER PRIMARY KEY NOT NULL, name TEXT NOT NULL)",
         "CREATE TABLE products(product_id INTEGER PRIMARY KEY NOT NULL, name TEXT NOT NULL)",
@@ -2049,7 +2098,7 @@ fn hir_equally_cheap_join_orders_resolve_like_legacy() {
         "INSERT INTO orders VALUES (1,1,'d1'),(2,2,'d2'),(3,1,'d3')",
         "INSERT INTO order_items VALUES (1,1,1,3),(2,1,2,1),(3,2,2,5),(4,3,1,2)",
     ] {
-        legacy.execute(statement).unwrap();
+        hir.execute(statement).unwrap();
     }
     for sql in [
         "SELECT c.name, o.order_id, p.name, oi.quantity \
@@ -2062,7 +2111,7 @@ fn hir_equally_cheap_join_orders_resolve_like_legacy() {
          JOIN products p ON oi.product_id = p.product_id",
     ] {
         let plan = query_plan(&hir, sql);
-        assert_eq!(plan, query_plan(&legacy, sql), "{sql}");
+        assert_eq!(plan, expected_plan(sql), "{sql}");
         assert_eq!(
             plan,
             [
@@ -2073,11 +2122,7 @@ fn hir_equally_cheap_join_orders_resolve_like_legacy() {
             ],
             "{sql}"
         );
-        assert_eq!(
-            limbo_exec_rows(&hir, sql),
-            limbo_exec_rows(&legacy, sql),
-            "{sql}"
-        );
+        assert_same_rows(&hir, &sqlite, sql);
     }
 }
 
@@ -2085,9 +2130,9 @@ fn hir_equally_cheap_join_orders_resolve_like_legacy() {
 /// semi-join and a correlated NOT EXISTS an anti-join, when that costs no
 /// more than running the subquery for every outer row.
 #[test]
-fn hir_correlated_exists_and_in_become_semi_and_anti_joins_like_legacy() {
+fn hir_correlated_exists_and_in_become_semi_and_anti_joins() {
     let db = setup();
-    let [legacy, hir] = connections(&db);
+    let (sqlite, hir) = connections(&db);
     for statement in [
         "CREATE TABLE o(id INTEGER PRIMARY KEY, k1 INT, k2 INT, body TEXT)",
         "CREATE TABLE i(k1 INT, v INT)",
@@ -2100,13 +2145,12 @@ fn hir_correlated_exists_and_in_become_semi_and_anti_joins_like_legacy() {
         "INSERT INTO j VALUES (1),(5),(NULL)",
         "INSERT INTO p VALUES (1,1),(2,3)",
     ] {
-        legacy.execute(statement).unwrap();
+        hir.execute(statement).unwrap();
     }
     // The plans name automatic indexes after their table's position in the
     // statement, which HIR and legacy count differently.
-    let plan = |conn, sql| {
-        query_plan(conn, sql)
-            .into_iter()
+    let plan = |rows: Vec<String>| {
+        rows.into_iter()
             .map(|line| {
                 let mut words = line.split(' ').map(str::to_string).collect::<Vec<_>>();
                 for word in &mut words {
@@ -2171,13 +2215,8 @@ fn hir_correlated_exists_and_in_become_semi_and_anti_joins_like_legacy() {
             &["SCAN o", "SEARCH i USING COVERING INDEX ephemeral_i (k1=?)"],
         ),
     ] {
-        assert_eq!(plan(&hir, sql), plan(&legacy, sql), "{sql}");
-        assert_eq!(plan(&hir, sql), expected, "{sql}");
-        assert_eq!(
-            limbo_exec_rows(&hir, sql),
-            limbo_exec_rows(&legacy, sql),
-            "{sql}"
-        );
+        assert_eq!(plan(query_plan(&hir, sql)), expected, "{sql}");
+        assert_same_rows(&hir, &sqlite, sql);
     }
     // These stay subqueries, as in legacy: a link to the NULL row of a LEFT
     // JOIN, NOT IN, an OR, a term that is not an `=` with the outer row, and
@@ -2190,25 +2229,21 @@ fn hir_correlated_exists_and_in_become_semi_and_anti_joins_like_legacy() {
         "SELECT o.id FROM o WHERE EXISTS (SELECT 1 FROM i WHERE i.k1 < o.k1)",
         "SELECT o.id FROM o WHERE NOT EXISTS (SELECT 1 FROM i WHERE i.k1 = o.k1 AND o.k2 = 1)",
     ] {
-        let hir_plan = plan(&hir, sql);
-        assert_eq!(hir_plan, plan(&legacy, sql), "{sql}");
+        let hir_plan = plan(query_plan(&hir, sql));
+        assert_eq!(hir_plan, plan(expected_plan(sql)), "{sql}");
         // A semi-join or anti-join would seek i or j through an automatic
         // index; the subquery scans it.
         assert!(
             !hir_plan.iter().any(|line| line.contains("ephemeral")),
             "{sql}: {hir_plan:?}"
         );
-        assert_eq!(
-            limbo_exec_rows(&hir, sql),
-            limbo_exec_rows(&legacy, sql),
-            "{sql}"
-        );
+        assert_same_rows(&hir, &sqlite, sql);
     }
     // Rows still match legacy when the moved source is a FROM subquery or
     // CTE, when the subquery holds an uncorrelated subquery, when the
     // outer block groups or reads a FROM subquery, and when the inner
     // table is empty.
-    legacy.execute("CREATE TABLE e(k INT)").unwrap();
+    hir.execute("CREATE TABLE e(k INT)").unwrap();
     for sql in [
         "SELECT o.id FROM o WHERE EXISTS \
          (SELECT 1 FROM (SELECT k1 FROM i WHERE v > 5) d WHERE d.k1 = o.k1)",
@@ -2227,11 +2262,7 @@ fn hir_correlated_exists_and_in_become_semi_and_anti_joins_like_legacy() {
         "SELECT (SELECT count(*) FROM o WHERE EXISTS (SELECT 1 FROM i WHERE i.k1 = o.k1)), \
          (SELECT group_concat(id) FROM o WHERE NOT EXISTS (SELECT 1 FROM j WHERE j.k2 = o.k2))",
     ] {
-        assert_eq!(
-            limbo_exec_rows(&hir, sql),
-            limbo_exec_rows(&legacy, sql),
-            "{sql}"
-        );
+        assert_same_rows(&hir, &sqlite, sql);
     }
 }
 
@@ -2241,9 +2272,9 @@ fn hir_correlated_exists_and_in_become_semi_and_anti_joins_like_legacy() {
 /// order for ORDER BY terms that do not read its columns, and a LEFT JOIN
 /// the WHERE clause turns into an inner join is reported as one.
 #[test]
-fn hir_correlated_aggregates_group_first_like_legacy() {
+fn hir_correlated_aggregates_group_first() {
     let db = setup();
-    let [legacy, hir] = connections(&db);
+    let (sqlite, hir) = connections(&db);
     for statement in [
         "CREATE TABLE o(id INTEGER PRIMARY KEY, k1 INT, k2 INT, amount INT, t TEXT)",
         "CREATE TABLE i(k1 INT, k2 INT, amount INT, t TEXT COLLATE NOCASE)",
@@ -2252,7 +2283,7 @@ fn hir_correlated_aggregates_group_first_like_legacy() {
         "INSERT INTO i VALUES (1,10,10,'a'),(1,10,20,'A'),(1,99,100,'x'),(2,20,6,'b'),\
          (2,20,NULL,'B'),(2,NULL,7,NULL),(NULL,40,99,NULL)",
     ] {
-        legacy.execute(statement).unwrap();
+        hir.execute(statement).unwrap();
     }
     let plan = |conn, sql| {
         query_plan(conn, sql)
@@ -2297,7 +2328,6 @@ fn hir_correlated_aggregates_group_first_like_legacy() {
             ],
         ),
     ] {
-        assert_eq!(plan(&hir, sql), plan(&legacy, sql), "{sql}");
         assert_eq!(plan(&hir, sql), expected, "{sql}");
     }
     for sql in [
@@ -2324,11 +2354,7 @@ fn hir_correlated_aggregates_group_first_like_legacy() {
         "SELECT o.id, (SELECT count(*) FROM i WHERE i.t = o.t) FROM o ORDER BY 1",
         "SELECT o.id, (SELECT sum(i.amount) FROM i WHERE i.k1 = o.k1) FROM o ORDER BY 1",
     ] {
-        assert_eq!(
-            limbo_exec_rows(&hir, sql),
-            limbo_exec_rows(&legacy, sql),
-            "{sql}"
-        );
+        assert_same_rows(&hir, &sqlite, sql);
     }
 }
 
@@ -2337,9 +2363,9 @@ fn hir_correlated_aggregates_group_first_like_legacy() {
 /// inner table first and groups by the outer rowid. A second copy of a
 /// rewritten subquery in the same clause reads the same grouped table.
 #[test]
-fn hir_correlated_aggregates_join_first_and_share_grouped_tables_like_legacy() {
+fn hir_correlated_aggregates_join_first_and_share_grouped_tables() {
     let db = setup();
-    let [legacy, hir] = connections(&db);
+    let (sqlite, hir) = connections(&db);
     for statement in [
         "CREATE TABLE o(id INTEGER PRIMARY KEY, k INT, max_sum INT, x REAL)",
         "CREATE TABLE i(k INT, x INT, q REAL)",
@@ -2347,11 +2373,11 @@ fn hir_correlated_aggregates_join_first_and_share_grouped_tables_like_legacy() {
         "INSERT INTO i VALUES (1,5,1.0),(1,5,2.0),(2,NULL,8.0),\
          (99,9223372036854775807,1.0),(99,9223372036854775807,1.0)",
     ] {
-        legacy.execute(statement).unwrap();
+        hir.execute(statement).unwrap();
     }
     let sum_sql = "SELECT o.id FROM o WHERE o.max_sum > (SELECT sum(i.x) FROM i WHERE i.k = o.k)";
     let plan = query_plan(&hir, sum_sql);
-    assert_eq!(plan, query_plan(&legacy, sum_sql));
+    assert_eq!(plan, expected_plan(sum_sql));
     assert_eq!(plan, ["HASH JOIN i", "SCAN o", "USE SORTER FOR GROUP BY"]);
     let shared_sql = "SELECT count(*) FROM o WHERE o.x < (SELECT avg(i.q) FROM i WHERE i.k = o.k) \
                       AND o.x > (SELECT avg(i.q) FROM i WHERE i.k = o.k) - 100";
@@ -2374,11 +2400,7 @@ fn hir_correlated_aggregates_join_first_and_share_grouped_tables_like_legacy() {
          (SELECT avg(i.q) FROM i WHERE i.k = o.k) FROM o \
          WHERE o.x < (SELECT avg(i.q) FROM i WHERE i.k = o.k) ORDER BY 1",
     ] {
-        assert_eq!(
-            limbo_exec_rows(&hir, sql),
-            limbo_exec_rows(&legacy, sql),
-            "{sql}"
-        );
+        assert_same_rows(&hir, &sqlite, sql);
     }
 }
 
@@ -2387,9 +2409,9 @@ fn hir_correlated_aggregates_join_first_and_share_grouped_tables_like_legacy() {
 /// the same tables. A LEFT or FULL join builds from its left table and then
 /// emits the left rows nothing matched.
 #[test]
-fn hir_hash_joins_build_and_probe_like_legacy() {
+fn hir_hash_joins_build_and_probe() {
     let db = setup();
-    let [legacy, hir] = connections(&db);
+    let (sqlite, hir) = connections(&db);
     for statement in [
         "CREATE TABLE h_orders(order_id INTEGER PRIMARY KEY, customer_name TEXT, amount INT)",
         "CREATE TABLE h_items(item_id INTEGER PRIMARY KEY, order_name TEXT, product TEXT, \
@@ -2398,7 +2420,7 @@ fn hir_hash_joins_build_and_probe_like_legacy() {
         "INSERT INTO h_items VALUES (1,'a','pen',1),(2,'a','cup',2),(3,'b','ink',3),\
          (4,'z','box',4),(5,NULL,'nil',5)",
     ] {
-        legacy.execute(statement).unwrap();
+        hir.execute(statement).unwrap();
     }
     for (sql, expected) in [
         (
@@ -2451,7 +2473,7 @@ fn hir_hash_joins_build_and_probe_like_legacy() {
         ),
     ] {
         let plan = query_plan(&hir, sql);
-        assert_eq!(plan, query_plan(&legacy, sql), "{sql}");
+        assert_eq!(plan, expected_plan(sql), "{sql}");
         assert_eq!(plan, expected, "{sql}");
     }
     for sql in [
@@ -2468,11 +2490,7 @@ fn hir_hash_joins_build_and_probe_like_legacy() {
         "SELECT count(*), count(h.order_id), count(i.item_id) FROM h_orders h \
          FULL JOIN h_items i ON h.customer_name = i.order_name",
     ] {
-        assert_eq!(
-            limbo_exec_rows(&hir, sql),
-            limbo_exec_rows(&legacy, sql),
-            "{sql}"
-        );
+        assert_same_rows(&hir, &sqlite, sql);
     }
 }
 
@@ -2485,7 +2503,7 @@ fn hir_hash_joins_build_and_probe_like_legacy() {
 #[test]
 fn hir_semi_and_anti_joins_cover_outer_joins_parameters_and_table_functions() {
     let db = setup();
-    let [legacy, hir] = connections(&db);
+    let (sqlite, hir) = connections(&db);
     for statement in [
         "CREATE TABLE o(id INTEGER PRIMARY KEY, k INT, v INT)",
         "CREATE TABLE p(id INTEGER PRIMARY KEY, k INT)",
@@ -2502,7 +2520,7 @@ fn hir_semi_and_anti_joins_cover_outer_joins_parameters_and_table_functions() {
          ('p', NULL, '1000'), ('i', NULL, '100000'), ('d', NULL, '10')",
         "ANALYZE sqlite_schema",
     ] {
-        legacy.execute(statement).unwrap();
+        hir.execute(statement).unwrap();
     }
     // The loop of a semi-join or anti-join marks where it stops.
     let semi_join = |sql: &str, table: &str| {
@@ -2559,11 +2577,25 @@ fn hir_semi_and_anti_joins_cover_outer_joins_parameters_and_table_functions() {
         ),
     ] {
         semi_join(sql, table);
-        assert_eq!(
-            limbo_exec_rows(&hir, sql),
-            limbo_exec_rows(&legacy, sql),
-            "{sql}"
-        );
+        if sql.contains("generate_series") {
+            // SQLite as built here has no generate_series.
+            let rows = limbo_exec_rows(&hir, sql);
+            let expected: &[i64] = if sql.contains("NOT EXISTS") {
+                &[3]
+            } else {
+                &[2, 3]
+            };
+            assert_eq!(
+                rows,
+                expected
+                    .iter()
+                    .map(|id| vec![rusqlite::types::Value::Integer(*id)])
+                    .collect::<Vec<_>>(),
+                "{sql}"
+            );
+        } else {
+            assert_same_rows(&hir, &sqlite, sql);
+        }
     }
 
     // Like legacy, the table built into a hash table is listed after the
@@ -2571,7 +2603,7 @@ fn hir_semi_and_anti_joins_cover_outer_joins_parameters_and_table_functions() {
     let sql = "SELECT o.id, p.id FROM o FULL JOIN p ON p.k = o.k \
                WHERE EXISTS (SELECT 1 FROM i WHERE i.k = o.k) ORDER BY 1, 2";
     let plan = plan_without_ids(query_plan(&hir, sql));
-    assert_eq!(plan, plan_without_ids(query_plan(&legacy, sql)), "{sql}");
+    assert_eq!(plan, plan_without_ids(expected_plan(sql)), "{sql}");
     assert_eq!(
         plan,
         [
@@ -2595,11 +2627,7 @@ fn hir_semi_and_anti_joins_cover_outer_joins_parameters_and_table_functions() {
         )),
         "{sql}: {program:?}"
     );
-    assert_eq!(
-        limbo_exec_rows(&hir, sql),
-        limbo_exec_rows(&legacy, sql),
-        "{sql}"
-    );
+    assert_same_rows(&hir, &sqlite, sql);
 
     // The parameter of the dropped SELECT list still counts and binds.
     let sql = "SELECT o.id FROM o WHERE EXISTS (SELECT ?1 FROM i WHERE i.k = o.k) \
@@ -2620,7 +2648,6 @@ fn hir_semi_and_anti_joins_cover_outer_joins_parameters_and_table_functions() {
         .unwrap();
         rows
     };
-    assert_eq!(run(&hir), run(&legacy));
     assert_eq!(run(&hir), vec![3]);
 }
 
@@ -2631,7 +2658,7 @@ fn hir_semi_and_anti_joins_cover_outer_joins_parameters_and_table_functions() {
 #[test]
 fn hir_outer_hash_joins_record_many_matched_rows() {
     let db = setup();
-    let [legacy, hir] = connections(&db);
+    let (sqlite, hir) = connections(&db);
     for statement in [
         "CREATE TABLE b(id INTEGER PRIMARY KEY, k INT, pad TEXT)",
         "CREATE TABLE c(id INTEGER PRIMARY KEY, k INT, pad TEXT)",
@@ -2640,7 +2667,7 @@ fn hir_outer_hash_joins_record_many_matched_rows() {
         "INSERT INTO c SELECT value, CASE WHEN value % 13 THEN value % 700 END, \
          printf('%050d', value) FROM generate_series(1, 3000)",
     ] {
-        legacy.execute(statement).unwrap();
+        hir.execute(statement).unwrap();
     }
     for (sql, expected) in [
         (
@@ -2654,7 +2681,7 @@ fn hir_outer_hash_joins_record_many_matched_rows() {
     ] {
         assert_eq!(query_plan(&hir, sql), ["HASH JOIN c", "SCAN b"], "{sql}");
         let rows = limbo_exec_rows(&hir, sql);
-        assert_eq!(rows, limbo_exec_rows(&legacy, sql), "{sql}");
+        assert_eq!(rows, sqlite.rows(sql), "{sql}");
         assert_eq!(
             rows,
             [[
@@ -2690,7 +2717,7 @@ fn hir_hash_joins_run_under_earlier_loops() {
             INSERT INTO d SELECT i, i % 300 FROM s;
     ";
     let db = TempDatabase::new_empty();
-    let [legacy, hir] = connections(&db);
+    let (_, hir) = connections(&db);
     for statement in SCHEMA.split(';').filter(|sql| !sql.trim().is_empty()) {
         hir.execute(statement).unwrap();
     }
@@ -2734,7 +2761,7 @@ fn hir_hash_joins_run_under_earlier_loops() {
         match plan {
             Some(plan) => {
                 assert_eq!(hir_plan, plan, "{sql}");
-                assert_eq!(hir_plan, query_plan(&legacy, sql), "{sql}");
+                assert_eq!(hir_plan, expected_plan(sql), "{sql}");
             }
             None => assert_eq!(
                 hir_plan.iter().any(|line| line.starts_with("HASH JOIN")),
@@ -2764,7 +2791,7 @@ fn hir_hash_joins_run_under_earlier_loops() {
 /// those tables from the hash row: in its outputs, aggregates, GROUP BY and
 /// WHERE terms, and in a later loop's seek.
 #[test]
-fn hir_hash_joins_build_from_the_loops_before_the_probe_like_legacy() {
+fn hir_hash_joins_build_from_the_loops_before_the_probe() {
     const SCHEMA: &str = "
         CREATE TABLE b(id INTEGER PRIMARY KEY, k INT, pad TEXT);
         CREATE TABLE c(id INTEGER PRIMARY KEY, k INT, pad TEXT);
@@ -2780,7 +2807,7 @@ fn hir_hash_joins_build_from_the_loops_before_the_probe_like_legacy() {
             INSERT INTO e SELECT i, i * 7 FROM s;
     ";
     let db = TempDatabase::new_empty();
-    let [legacy, hir] = connections(&db);
+    let (_, hir) = connections(&db);
     for statement in SCHEMA.split(';').filter(|sql| !sql.trim().is_empty()) {
         hir.execute(statement).unwrap();
     }
@@ -2867,19 +2894,7 @@ fn hir_hash_joins_build_from_the_loops_before_the_probe_like_legacy() {
             materializes,
             "{sql}: {hir_plan:?}"
         );
-        // Legacy lists the tables a build input already joined once more
-        // after the loops; without those repeats its plan is the same.
-        let legacy_plan = plan_without_ids(query_plan(&legacy, sql));
-        let mut legacy_once = Vec::new();
-        for row in &legacy_plan {
-            if !legacy_once.contains(row) {
-                legacy_once.push(row.clone());
-            }
-        }
-        assert!(
-            legacy_once == hir_plan && (legacy_plan.len() > hir_plan.len()) == materializes,
-            "{sql}: legacy {legacy_plan:?} hir {hir_plan:?}"
-        );
+        assert_eq!(hir_plan, plan_without_ids(expected_plan(sql)), "{sql}");
         let mut stmt = sqlite.prepare(sql).unwrap();
         let columns = stmt.column_count();
         let expected: Vec<Vec<rusqlite::types::Value>> = stmt
@@ -2901,15 +2916,15 @@ fn hir_hash_joins_build_from_the_loops_before_the_probe_like_legacy() {
 /// body rows stand on their own, `cte_materializations` points at them, and
 /// both readers report a materialized reuse.
 #[test]
-fn hir_explain_rows_match_legacy_for_distinct_probes_compounds_and_shared_ctes() {
+fn hir_explain_rows_for_distinct_probes_compounds_and_shared_ctes() {
     let db = setup();
-    let [legacy, hir] = connections(&db);
+    let (_, hir) = connections(&db);
     for statement in [
         "CREATE TABLE users(id INTEGER PRIMARY KEY, name TEXT, city_id INT)",
         "CREATE TABLE orders(id INTEGER PRIMARY KEY, user_id INT, amount INT)",
         "CREATE INDEX idx_orders_user ON orders(user_id)",
     ] {
-        legacy.execute(statement).unwrap();
+        hir.execute(statement).unwrap();
     }
     const SHARED_CTE: &str = "WITH spenders AS (SELECT user_id, sum(amount) AS total \
          FROM orders GROUP BY user_id) \
@@ -2935,7 +2950,7 @@ fn hir_explain_rows_match_legacy_for_distinct_probes_compounds_and_shared_ctes()
         assert!(hir_plan.iter().any(|line| line.starts_with(row)), "{sql}: {hir_plan:?}");
         assert_eq!(
             plan_without_ids(hir_plan),
-            plan_without_ids(query_plan(&legacy, sql)),
+            plan_without_ids(expected_plan(sql)),
             "{sql}"
         );
     }
@@ -2979,15 +2994,15 @@ fn hir_explain_rows_match_legacy_for_distinct_probes_compounds_and_shared_ctes()
 /// innermost window first, and none for a window whose order the loops or
 /// an inner window already give.
 #[test]
-fn hir_window_sorts_show_in_explain_like_legacy() {
+fn hir_window_sorts_show_in_explain() {
     let db = setup();
-    let [legacy, hir] = connections(&db);
+    let (sqlite, hir) = connections(&db);
     for statement in [
         "CREATE TABLE sales(id INTEGER PRIMARY KEY, region TEXT, day INT, amount INT)",
         "CREATE INDEX sales_region ON sales(region)",
         "INSERT INTO sales VALUES (1, 'n', 3, 10), (2, 's', 1, 20), (3, 'n', 2, 30)",
     ] {
-        legacy.execute(statement).unwrap();
+        hir.execute(statement).unwrap();
     }
     for sql in [
         "SELECT sum(amount) OVER (ORDER BY day) FROM sales",
@@ -3002,19 +3017,480 @@ fn hir_window_sorts_show_in_explain_like_legacy() {
         "SELECT * FROM (SELECT amount, avg(amount) OVER (PARTITION BY region) AS a FROM sales) \
          WHERE a > 10 ORDER BY amount",
     ] {
-        let legacy_plan = query_plan(&legacy, sql)
-            .into_iter()
-            .filter(|row| !row.starts_with("SCAN window_subquery_"))
-            .collect::<Vec<_>>();
         assert_eq!(
             plan_without_ids(query_plan(&hir, sql)),
-            plan_without_ids(legacy_plan),
+            plan_without_ids(expected_plan(sql)),
             "{sql}"
         );
-        assert_eq!(
-            limbo_exec_rows(&hir, sql),
-            limbo_exec_rows(&legacy, sql),
-            "{sql}"
-        );
+        assert_same_rows(&hir, &sqlite, sql);
     }
 }
+
+/// Like legacy and SQLite, with full_column_names on and short_column_names
+/// off, `SELECT *` names each column after its source: the alias, the table
+/// name, or `(subquery-N)` for a FROM subquery without an alias. Explicit
+/// column references keep legacy's `table.column` rule, and other settings
+/// keep the plain column name.
+#[test]
+fn hir_names_star_columns_after_their_source_under_long_names() {
+    let db = setup();
+    let (mut sqlite, hir) = connections(&db);
+    for (full, short) in [(true, false), (true, true), (false, true), (false, false)] {
+        hir.set_full_column_names(full);
+        hir.set_short_column_names(short);
+        sqlite.set_pragma("full_column_names", full);
+        sqlite.set_pragma("short_column_names", short);
+        for sql in [
+            "SELECT * FROM items a, tags b LIMIT 1",
+            "SELECT * FROM items, tags LIMIT 1",
+            "SELECT a.*, b.tag FROM items a JOIN tags b ON b.item_id = a.id LIMIT 1",
+            "SELECT * FROM items a, (SELECT 5, 6) LIMIT 1",
+            "SELECT * FROM items a, (SELECT 5 AS n) AS s LIMIT 1",
+            "SELECT a.id, value AS v, extra || 'x' FROM items a LIMIT 1",
+            "SELECT * FROM (SELECT * FROM items a) LIMIT 1",
+            "CREATE TABLE ctas AS SELECT * FROM items a LIMIT 1",
+            "SELECT * FROM ctas",
+            "DROP TABLE ctas",
+        ] {
+            // SQLite and HIR number unnamed subqueries differently.
+            let without_ids = |names: Vec<String>| {
+                names
+                    .into_iter()
+                    .map(|name| match name.strip_prefix("(subquery-") {
+                        Some(rest) => {
+                            format!("(subquery-{}", rest.trim_start_matches(char::is_numeric))
+                        }
+                        None => name,
+                    })
+                    .collect::<Vec<_>>()
+            };
+            assert_eq!(
+                without_ids(column_names(&hir, sql)),
+                without_ids(sqlite.column_names(sql)),
+                "{sql} full={full} short={short}"
+            );
+            if sql.starts_with("SELECT") {
+                assert_same_rows(&hir, &sqlite, sql);
+            } else {
+                hir.execute(sql).unwrap();
+            }
+        }
+    }
+}
+
+/// The EXPLAIN QUERY PLAN rows the planner is meant to choose, by query,
+/// recorded when HIR matched the legacy planner on them.
+const EXPECTED_PLANS: &[(&str, &[&str])] = &[
+    (
+        "SELECT id, (SELECT avg(i.amount) FROM i WHERE i.k1 = o.k1) FROM o ORDER BY id",
+        &["SCAN o", "SEARCH scalar_subquery_1 USING INDEX ephemeral_subquery_s2 (correlation_key_0=?) LEFT-JOIN", "SCAN i", "USE SORTER FOR GROUP BY"],
+    ),
+    (
+        "SELECT o.id FROM o WHERE o.amount < (SELECT avg(i.amount) FROM i WHERE i.k1 = o.k1)",
+        &["SCAN o", "SEARCH scalar_subquery_1 USING INDEX ephemeral_subquery_s2 (correlation_key_0=?)", "SCAN i", "USE SORTER FOR GROUP BY"],
+    ),
+    (
+        "SELECT count(*) FROM o WHERE o.x < (SELECT avg(i.q) FROM i WHERE i.k = o.k) AND o.x > (SELECT avg(i.q) FROM i WHERE i.k = o.k) - 100",
+        &["SCAN o", "SEARCH scalar_subquery_1 USING INDEX ephemeral_subquery_s3 (correlation_key_0=?)", "SCAN i", "USE SORTER FOR GROUP BY"],
+    ),
+    (
+        "SELECT o.id FROM o WHERE EXISTS (SELECT 1 FROM i WHERE i.k1 = o.k1) AND EXISTS (SELECT 1 FROM j WHERE j.k2 = o.k2)",
+        &["SCAN o", "SEARCH i USING COVERING INDEX ephemeral_i_s1 (k1=?)", "SEARCH j USING COVERING INDEX ephemeral_j_s2 (k2=?)"],
+    ),
+    (
+        "SELECT o.id FROM o WHERE o.body LIKE 'apple%' AND EXISTS (SELECT 1 FROM i WHERE i.k1 = o.k1)",
+        &["SCAN o", "SEARCH i USING COVERING INDEX ephemeral_i_s1 (k1=?)"],
+    ),
+    (
+        "SELECT o.id FROM o WHERE NOT EXISTS (SELECT 1 FROM i WHERE i.k1 = o.k1)",
+        &["SCAN o", "SEARCH i USING COVERING INDEX ephemeral_i_s1 (k1=?)"],
+    ),
+    (
+        "SELECT o.id FROM o WHERE NOT EXISTS (SELECT 1 FROM i WHERE i.k1 = o.k1) AND NOT EXISTS (SELECT 1 FROM j WHERE j.k2 = o.k2)",
+        &["SCAN o", "SEARCH i USING COVERING INDEX ephemeral_i_s1 (k1=?)", "SEARCH j USING COVERING INDEX ephemeral_j_s2 (k2=?)"],
+    ),
+    (
+        "SELECT o.id FROM o WHERE EXISTS (SELECT 1 FROM i WHERE i.k1 = o.k1) AND NOT EXISTS (SELECT 1 FROM j WHERE j.k2 = o.k2)",
+        &["SCAN o", "SEARCH i USING COVERING INDEX ephemeral_i_s1 (k1=?)", "SEARCH j USING COVERING INDEX ephemeral_j_s2 (k2=?)"],
+    ),
+    (
+        "SELECT o.id FROM o WHERE o.k2 IN (SELECT j.k2 FROM j WHERE j.k2 = o.k1)",
+        &["SCAN o", "SEARCH j USING COVERING INDEX ephemeral_j_s1 (k2=?)"],
+    ),
+    (
+        "SELECT o.id FROM o WHERE EXISTS (SELECT 1 FROM p WHERE p.id = o.k1)",
+        &["SCAN o", "SEARCH p USING INTEGER PRIMARY KEY (rowid=?)"],
+    ),
+    (
+        "SELECT o.id, count(*) FROM o WHERE EXISTS (SELECT 1 FROM i WHERE i.k1 = o.k1) GROUP BY o.id",
+        &["SCAN o", "SEARCH i USING COVERING INDEX ephemeral_i_s1 (k1=?)"],
+    ),
+    (
+        "SELECT o.id, p.id FROM o LEFT JOIN p ON p.k = o.k1 WHERE EXISTS (SELECT 1 FROM i WHERE i.k1 = p.id)",
+        &["SCAN o", "SEARCH p USING COVERING INDEX p_k (k=?) LEFT-JOIN", "SCAN i"],
+    ),
+    (
+        "SELECT o.id FROM o WHERE o.k2 NOT IN (SELECT j.k2 FROM j WHERE j.k2 = o.k1)",
+        &["SCAN o", "CORRELATED LIST SUBQUERY 1", "SCAN j"],
+    ),
+    (
+        "SELECT o.id FROM o WHERE o.k1 = 2 OR EXISTS (SELECT 1 FROM i WHERE i.k1 = o.k1)",
+        &["SCAN o", "SCAN i"],
+    ),
+    (
+        "SELECT o.id FROM o WHERE EXISTS (SELECT 1 FROM i WHERE i.k1 < o.k1)",
+        &["SCAN o", "SCAN i"],
+    ),
+    (
+        "SELECT o.id FROM o WHERE NOT EXISTS (SELECT 1 FROM i WHERE i.k1 = o.k1 AND o.k2 = 1)",
+        &["SCAN o", "SCAN i"],
+    ),
+    (
+        "SELECT count(*) FROM o WHERE o.v < (SELECT avg(i.v) FROM i WHERE i.k = o.k)",
+        &["SCAN o", "SEARCH scalar_subquery_1 USING INDEX ephemeral_subquery_s2 (correlation_key_0=?)", "SCAN i", "USE SORTER FOR GROUP BY"],
+    ),
+    (
+        "SELECT a.k, count(*), sum(b.v) FROM a JOIN b ON b.k = a.k GROUP BY a.k ORDER BY a.k",
+        &["HASH JOIN b", "SCAN a", "USE SORTER FOR GROUP BY"],
+    ),
+    (
+        "SELECT a.id, b.id FROM a JOIN b ON b.k = a.k WHERE a.id < 30 ORDER BY a.id, b.id",
+        &["HASH JOIN b", "SEARCH a USING INTEGER PRIMARY KEY (rowid=?)", "USE SORTER FOR ORDER BY"],
+    ),
+    (
+        "SELECT count(*), count(b.id), sum(b.v) FROM a LEFT JOIN b ON b.k = a.k",
+        &["HASH JOIN b", "SCAN a"],
+    ),
+    (
+        "SELECT count(*), count(b.id) FROM a LEFT JOIN b ON b.k = a.k AND b.v <> 3",
+        &["HASH JOIN b", "SCAN a"],
+    ),
+    (
+        "SELECT count(*), sum(a.id) FROM a LEFT JOIN b ON b.k = a.k WHERE b.id IS NULL",
+        &["HASH JOIN b", "SCAN a"],
+    ),
+    (
+        "SELECT a.id, b.id FROM a LEFT JOIN b ON b.k = a.k + 45 WHERE a.id < 20 ORDER BY a.id, b.id",
+        &["HASH JOIN b", "SEARCH a USING INTEGER PRIMARY KEY (rowid=?)", "USE SORTER FOR ORDER BY"],
+    ),
+    (
+        "SELECT count(*), count(b.id) FROM a LEFT JOIN b ON b.v = a.k + 100",
+        &["HASH JOIN b", "SCAN a"],
+    ),
+    (
+        "SELECT count(*), count(a.id), count(b.id), sum(b.v) FROM a FULL JOIN b ON b.k = a.k",
+        &["HASH JOIN b", "SCAN a"],
+    ),
+    (
+        "SELECT count(*), count(a.id), count(b.id) FROM a FULL JOIN b ON b.k = a.k WHERE a.id IS NULL OR b.v > 10",
+        &["HASH JOIN b", "SCAN a"],
+    ),
+    (
+        "SELECT sum((SELECT count(b.id) FROM a a2 JOIN b ON b.k = a2.k WHERE a2.id = a.id)) FROM a WHERE a.id < 300",
+        &["SEARCH a USING INTEGER PRIMARY KEY (rowid=?)", "SEARCH scalar_subquery_1 USING INDEX ephemeral_subquery_s3 (correlation_key_0=?) LEFT-JOIN", "HASH JOIN a AS a2", "SCAN b", "USE SORTER FOR GROUP BY"],
+    ),
+    (
+        "SELECT count(*), sum(s.n) FROM a, (SELECT a2.id AS i, b.id AS n FROM a a2 JOIN b ON b.k = a2.k WHERE a2.id < 40) s WHERE a.id < 4 AND s.i = a.id + 3",
+        &["SEARCH a USING INTEGER PRIMARY KEY (rowid=?)", "SEARCH s USING INDEX ephemeral_subquery_s3 (i=?)", "HASH JOIN b", "SEARCH a2 USING INTEGER PRIMARY KEY (rowid=?)"],
+    ),
+    (
+        "SELECT c.name, o.order_id, p.name, oi.quantity FROM customers c JOIN orders o ON c.customer_id = o.customer_id JOIN order_items oi ON o.order_id = oi.order_id JOIN products p ON oi.product_id = p.product_id",
+        &["SCAN order_items AS oi", "SEARCH p USING INTEGER PRIMARY KEY (rowid=?)", "SEARCH o USING INTEGER PRIMARY KEY (rowid=?)", "SEARCH c USING INTEGER PRIMARY KEY (rowid=?)"],
+    ),
+    (
+        "SELECT id FROM items WHERE value IN (SELECT item_id FROM tags WHERE item_id = items.id) LIMIT 1",
+        &["SCAN items USING COVERING INDEX items_value", "CORRELATED LIST SUBQUERY 1", "SCAN tags"],
+    ),
+    (
+        "SELECT value FROM items UNION SELECT item_id FROM tags ORDER BY 1",
+        &["COMPOUND QUERY", "LEFT-MOST SUBQUERY", "SCAN items USING COVERING INDEX items_value", "UNION USING TEMP B-TREE", "SCAN tags", "USE SORTER FOR ORDER BY"],
+    ),
+    (
+        "WITH spenders AS (SELECT user_id, sum(amount) AS total FROM orders GROUP BY user_id) SELECT u.name, s1.total FROM users u JOIN spenders s1 ON s1.user_id = u.id JOIN spenders s2 ON s2.user_id = u.city_id",
+        &["SCAN orders USING INDEX idx_orders_user", "SCAN users AS u", "SEARCH s1 USING INDEX ephemeral_subquery_s2 (user_id=?)", "SEARCH s2 USING INDEX ephemeral_subquery_s3 (user_id=?)"],
+    ),
+    (
+        "SELECT a.id, l.id, r.id FROM l AS a, l FULL JOIN r ON l.k = r.k WHERE a.id = 1 ORDER BY 1, 2, 3",
+        &["SCAN l AS a", "SCAN l", "SEARCH r USING COVERING INDEX ephemeral_r_s2 (k=?) LEFT-JOIN", "USE SORTER FOR ORDER BY"],
+    ),
+    (
+        "SELECT extra, value, count(*) FROM items GROUP BY extra, value ORDER BY extra, value",
+        &["SCAN items USING COVERING INDEX items_extra_value"],
+    ),
+    (
+        "SELECT extra, value, count(*) FROM items GROUP BY extra, value ORDER BY extra DESC, value DESC",
+        &["SCAN items USING COVERING INDEX items_extra_value"],
+    ),
+    (
+        "SELECT extra, value, count(*) FROM items GROUP BY value, extra ORDER BY extra",
+        &["SCAN items USING COVERING INDEX items_extra_value"],
+    ),
+    (
+        "SELECT extra, value, count(*) FROM items GROUP BY extra, value ORDER BY value",
+        &["SCAN items", "USE SORTER FOR GROUP BY"],
+    ),
+    (
+        "SELECT extra, value, count(*) FROM items GROUP BY extra, value ORDER BY extra DESC NULLS FIRST, value",
+        &["SCAN items", "USE SORTER FOR GROUP BY"],
+    ),
+    (
+        "SELECT extra, max(value) FROM items GROUP BY extra ORDER BY extra",
+        &["SCAN items USING COVERING INDEX items_extra_value"],
+    ),
+    (
+        "SELECT h.order_id, i.product FROM h_orders h LEFT JOIN h_items i ON h.customer_name = i.order_name ORDER BY 1, 2",
+        &["HASH JOIN h_items AS i", "SCAN h_orders AS h", "USE SORTER FOR ORDER BY"],
+    ),
+    (
+        "SELECT h.order_id, i.item_id FROM h_orders h FULL JOIN h_items i ON h.customer_name = i.order_name ORDER BY 1, 2",
+        &["HASH JOIN h_items AS i", "SCAN h_orders AS h", "USE SORTER FOR ORDER BY"],
+    ),
+    (
+        "SELECT h.customer_name, count(i.item_id) FROM h_orders h LEFT JOIN h_items i ON h.customer_name = i.order_name GROUP BY h.customer_name ORDER BY 1",
+        &["HASH JOIN h_items AS i", "SCAN h_orders AS h", "USE SORTER FOR GROUP BY"],
+    ),
+    (
+        "SELECT h.order_id, i.item_id FROM h_orders h JOIN h_items i ON i.quantity = h.amount / 10 ORDER BY 1, 2",
+        &["HASH JOIN h_items AS i", "SCAN h_orders AS h", "USE SORTER FOR ORDER BY"],
+    ),
+    (
+        "SELECT b.k, count(*), sum(d.id) FROM b JOIN c ON b.k = c.k JOIN d ON d.k = c.k GROUP BY b.k ORDER BY b.k",
+        &["MATERIALIZE hash build input for c", "HASH JOIN c", "SCAN b", "HASH JOIN d", "USE SORTER FOR GROUP BY"],
+    ),
+    (
+        "SELECT max(d.id), b.k, c.k FROM b JOIN c ON b.k = c.k JOIN d ON d.k = c.k",
+        &["MATERIALIZE hash build input for c", "HASH JOIN c", "SCAN b", "HASH JOIN d"],
+    ),
+    (
+        "SELECT count(*), sum(b.id), sum(c.id), sum(d.id) FROM b JOIN c ON b.k = c.k JOIN d ON d.k = c.k WHERE d.id > b.id + c.id",
+        &["MATERIALIZE hash build input for c", "HASH JOIN c", "SCAN d", "HASH JOIN b"],
+    ),
+    (
+        "SELECT b.id, c.id, d.id FROM b JOIN c ON b.k = c.k JOIN d ON d.k = c.k WHERE b.id < 20 ORDER BY 1, 2, 3",
+        &["MATERIALIZE hash build input for c", "HASH JOIN c", "SEARCH b USING INTEGER PRIMARY KEY (rowid=?)", "HASH JOIN d", "USE SORTER FOR ORDER BY"],
+    ),
+    (
+        "SELECT count(*) FROM b JOIN c ON b.k = c.k JOIN d ON d.k = c.k WHERE EXISTS (SELECT 1 FROM e WHERE e.id = d.id AND e.v > b.id)",
+        &["SCAN b", "SEARCH c USING COVERING INDEX ephemeral_c_s1 (k=?)", "SEARCH d USING COVERING INDEX ephemeral_d_s2 (k=?)", "SEARCH e USING INTEGER PRIMARY KEY (rowid=?)"],
+    ),
+    (
+        "SELECT count(*), sum(b.id), sum(c.id), sum(d.id) FROM b JOIN c ON b.k = c.k JOIN d ON d.k = c.k AND d.id > b.id",
+        &["SCAN d", "SEARCH b USING INTEGER PRIMARY KEY (rowid=?)", "SEARCH c USING COVERING INDEX ephemeral_c_s1 (k=?)"],
+    ),
+    (
+        "SELECT count(*), sum(e.v) FROM b JOIN c ON b.k = c.k JOIN d ON d.k = c.k JOIN e ON e.id = b.id + d.id",
+        &["SCAN d", "SCAN b", "SEARCH e USING INTEGER PRIMARY KEY (rowid=?)", "SEARCH c USING COVERING INDEX ephemeral_c_s1 (k=?)"],
+    ),
+    (
+        "SELECT count(*), sum(b.id), count(e.id), sum(c.id), sum(d.id) FROM b LEFT JOIN e ON e.id = b.id * 7, c JOIN d ON d.k = c.k WHERE c.id % 5 = coalesce(e.v, 0) % 5 AND b.id % 3 = c.id % 3",
+        &["MATERIALIZE hash build input for c", "SCAN b", "SEARCH e USING INTEGER PRIMARY KEY (rowid=?) LEFT-JOIN", "SCAN c", "HASH JOIN d"],
+    ),
+    (
+        "SELECT count(*), count(d.id), sum(b.id), sum(c.id) FROM b JOIN c ON b.k = c.k LEFT JOIN d ON d.k = c.k AND d.id % 2 = 0",
+        &["MATERIALIZE hash build input for c", "HASH JOIN c", "SCAN b", "HASH JOIN d"],
+    ),
+    (
+        "SELECT d.k, count(*), sum(b.id) FROM b JOIN c ON b.k = c.k LEFT JOIN d ON d.k = c.k WHERE d.id IS NULL OR b.id % 7 = 0 GROUP BY d.k ORDER BY d.k LIMIT 5",
+        &["MATERIALIZE hash build input for c", "HASH JOIN c", "SCAN b", "HASH JOIN d", "USE SORTER FOR GROUP BY"],
+    ),
+    (
+        "SELECT count(*), sum(b.id), sum(c.id), sum(d.id), count(e.id) FROM b JOIN c ON b.k = c.k JOIN d ON d.k = c.k LEFT JOIN e ON e.id = b.id + d.id",
+        &["MATERIALIZE hash build input for c", "HASH JOIN c", "SCAN b", "HASH JOIN d", "SEARCH e USING INTEGER PRIMARY KEY (rowid=?) LEFT-JOIN"],
+    ),
+    (
+        "SELECT count(*), count(b.id), count(d.id), sum(b.id), sum(c.id), sum(d.id) FROM b JOIN c ON b.k = c.k FULL JOIN d ON d.k = c.k",
+        &["MATERIALIZE hash build input for c", "HASH JOIN c", "SCAN b", "HASH JOIN d"],
+    ),
+    (
+        "SELECT count(*), sum(a.id), sum(b.id), sum(c.id) FROM a, b LEFT JOIN c ON b.k = c.k",
+        &["SCAN a", "HASH JOIN c", "SCAN b"],
+    ),
+    (
+        "SELECT count(*), sum(a.id), sum(b.id), sum(c.id) FROM a, b LEFT JOIN c ON b.k = c.k AND c.id % 3 = a.id - 1 WHERE c.id IS NULL OR a.id = 2",
+        &["SCAN a", "HASH JOIN c", "SCAN b"],
+    ),
+    (
+        "SELECT count(*), sum(a.id), sum(b.id), sum(c.id), sum(d.id) FROM a LEFT JOIN d ON d.id = a.x * 1000, b LEFT JOIN c ON b.k = c.k",
+        &["SCAN a", "SEARCH d USING INTEGER PRIMARY KEY (rowid=?) LEFT-JOIN", "HASH JOIN c", "SCAN b"],
+    ),
+    (
+        "SELECT a.id, (SELECT count(*) FROM b LEFT JOIN c ON b.k = c.k AND c.id % 3 = a.id - 1) FROM a ORDER BY a.id",
+        &["SCAN a", "CORRELATED SCALAR SUBQUERY 1", "HASH JOIN c", "SCAN b"],
+    ),
+    (
+        "SELECT count(*), sum(a.id), sum(b.id), sum(c.id) FROM a, b FULL JOIN c ON b.k = c.k",
+        &["SCAN a", "SCAN b", "SEARCH c USING COVERING INDEX ephemeral_c_s2 (k=?) LEFT-JOIN"],
+    ),
+    (
+        "SELECT id FROM items WHERE extra IS NULL AND value IS NULL",
+        &["SEARCH items USING COVERING INDEX items_extra_id (extra=? AND value=?)"],
+    ),
+    (
+        "SELECT id FROM items WHERE extra IS NULL AND value > 10 ORDER BY id",
+        &["SEARCH items USING COVERING INDEX items_extra_id (extra=? AND value>?)", "USE SORTER FOR ORDER BY"],
+    ),
+    (
+        "SELECT id FROM items WHERE lower(extra) IS NULL ORDER BY id",
+        &["SEARCH items USING INDEX items_lower_extra (lower (extra)=?)"],
+    ),
+    (
+        "SELECT tags.tag, items.id FROM tags LEFT JOIN items ON items.id = tags.item_id WHERE items.extra IS NULL ORDER BY 1",
+        &["SCAN tags", "SEARCH items USING INTEGER PRIMARY KEY (rowid=?) LEFT-JOIN", "USE SORTER FOR ORDER BY"],
+    ),
+    (
+        "SELECT tags.tag, items.id FROM tags LEFT JOIN items ON items.extra IS NULL AND items.id = tags.item_id ORDER BY 1",
+        &["SCAN tags", "SEARCH items USING INTEGER PRIMARY KEY (rowid=?) LEFT-JOIN", "USE SORTER FOR ORDER BY"],
+    ),
+    (
+        "SELECT id FROM items WHERE extra IS NULL",
+        &["SEARCH items USING COVERING INDEX items_extra_id (extra=?)"],
+    ),
+    (
+        "SELECT id FROM items WHERE extra ISNULL",
+        &["SEARCH items USING COVERING INDEX items_extra_id (extra=?)"],
+    ),
+    (
+        "WITH g AS (SELECT extra, count(*) AS n FROM items GROUP BY extra) SELECT * FROM g ORDER BY extra",
+        &["SCAN g", "SCAN items", "USE SORTER FOR GROUP BY"],
+    ),
+    (
+        "WITH a AS (SELECT value, extra FROM items ORDER BY value), b AS (SELECT value, extra FROM a) SELECT * FROM b ORDER BY value",
+        &["SCAN b", "SCAN a", "SCAN items USING INDEX items_value"],
+    ),
+    (
+        "SELECT * FROM (SELECT value, extra FROM items ORDER BY value DESC NULLS FIRST) ORDER BY value DESC NULLS FIRST",
+        &["SCAN (subquery-0)", "SCAN items", "USE SORTER FOR ORDER BY"],
+    ),
+    (
+        "WITH o AS (SELECT value, extra FROM items ORDER BY value) SELECT * FROM o ORDER BY value DESC",
+        &["SCAN o", "SCAN items USING INDEX items_value", "USE SORTER FOR ORDER BY"],
+    ),
+    (
+        "WITH o AS (SELECT value, extra FROM items ORDER BY value) SELECT * FROM o ORDER BY value, extra",
+        &["SCAN o", "SCAN items USING INDEX items_value", "USE SORTER FOR ORDER BY"],
+    ),
+    (
+        "WITH o AS (SELECT value, extra FROM items ORDER BY extra) SELECT * FROM o ORDER BY extra",
+        &["SCAN o", "SCAN items", "USE SORTER FOR ORDER BY"],
+    ),
+    (
+        "WITH o AS MATERIALIZED (SELECT value, extra FROM items ORDER BY extra DESC, value DESC) SELECT * FROM o ORDER BY extra, value",
+        &["SCAN items", "USE SORTER FOR ORDER BY", "SCAN o"],
+    ),
+    (
+        "WITH o AS MATERIALIZED (SELECT value, extra FROM items ORDER BY extra, value DESC) SELECT * FROM o ORDER BY extra DESC, value",
+        &["SCAN items", "USE SORTER FOR ORDER BY", "SCAN o"],
+    ),
+    (
+        "WITH g AS MATERIALIZED (SELECT extra, sum(value) AS s FROM items GROUP BY extra) SELECT * FROM g ORDER BY extra DESC",
+        &["SCAN items", "USE SORTER FOR GROUP BY", "SCAN g"],
+    ),
+    (
+        "WITH o AS MATERIALIZED (SELECT value, extra FROM items ORDER BY extra, value DESC) SELECT * FROM o ORDER BY extra, value",
+        &["SCAN items", "USE SORTER FOR ORDER BY", "SCAN o", "USE SORTER FOR ORDER BY"],
+    ),
+    (
+        "WITH o AS (SELECT value, extra FROM items ORDER BY value LIMIT 3) SELECT * FROM o ORDER BY value",
+        &["SCAN o", "SCAN items USING INDEX items_value"],
+    ),
+    (
+        "SELECT count(*), sum(b.id), sum(c.id) FROM b FULL JOIN c ON b.k = c.k",
+        &["HASH JOIN c", "SCAN b"],
+    ),
+    (
+        "SELECT o.id, p.id FROM o FULL JOIN p ON p.k = o.k WHERE NOT EXISTS (SELECT 1 FROM i WHERE i.k = p.k) ORDER BY 1, 2",
+        &["HASH JOIN p", "SEARCH i USING COVERING INDEX ephemeral_i_s2 (k=?)", "SCAN o", "USE SORTER FOR ORDER BY"],
+    ),
+    (
+        "SELECT o.id, p.id FROM o RIGHT JOIN p ON p.k = o.k WHERE NOT EXISTS (SELECT 1 FROM i WHERE i.k = p.k) ORDER BY 1, 2",
+        &["SCAN o", "SEARCH p USING COVERING INDEX ephemeral_p_s1 (k=?)", "SEARCH i USING COVERING INDEX ephemeral_i_s2 (k=?)", "USE SORTER FOR ORDER BY"],
+    ),
+    (
+        "SELECT o.id, p.id FROM o RIGHT JOIN p ON p.k = o.k WHERE p.k IN (SELECT i.k FROM i WHERE i.k = p.id) ORDER BY 1, 2",
+        &["SCAN o", "SCAN p", "SEARCH i USING COVERING INDEX ephemeral_i_s2 (k=?)", "USE SORTER FOR ORDER BY"],
+    ),
+    (
+        "SELECT o.id FROM o WHERE EXISTS (SELECT (SELECT max(x) FROM d) FROM i WHERE i.k = o.k) ORDER BY 1",
+        &["SCAN o", "SEARCH i USING COVERING INDEX ephemeral_i_s1 (k=?)"],
+    ),
+    (
+        "SELECT o.id FROM o WHERE EXISTS (SELECT 1 FROM generate_series(1, o.k) g WHERE g.value = 2) ORDER BY 1",
+        &["SCAN o", "SCAN generate_series AS g"],
+    ),
+    (
+        "SELECT o.id FROM o WHERE o.k IS NOT NULL AND NOT EXISTS (SELECT 1 FROM generate_series(o.k, 2) g WHERE g.value = o.k) ORDER BY 1",
+        &["SCAN o", "SCAN generate_series AS g"],
+    ),
+    (
+        "SELECT o.id, p.id FROM o FULL JOIN p ON p.k = o.k WHERE EXISTS (SELECT 1 FROM i WHERE i.k = o.k) ORDER BY 1, 2",
+        &["HASH JOIN p", "SEARCH i USING COVERING INDEX ephemeral_i_s2 (k=?)", "SCAN o", "USE SORTER FOR ORDER BY"],
+    ),
+    (
+        "SELECT o.id FROM o WHERE EXISTS (SELECT ?1 FROM i WHERE i.k = o.k) AND o.v > ?2 ORDER BY 1",
+        &["SCAN o", "SEARCH i USING COVERING INDEX ephemeral_i_s1 (k=?)"],
+    ),
+    (
+        "SELECT c.name, s.total FROM customers c JOIN (SELECT customer_id, sum(total) AS total FROM orders GROUP BY customer_id) AS s ON s.customer_id = c.id WHERE s.total > 500 ORDER BY 1",
+        &["SCAN customers AS c", "SEARCH s USING INDEX ephemeral_subquery_s2 (customer_id=? AND total>?)", "SCAN orders", "USE SORTER FOR GROUP BY", "USE SORTER FOR ORDER BY"],
+    ),
+    (
+        "WITH sorted AS (SELECT DISTINCT v FROM points ORDER BY v) SELECT p1.v, (SELECT max(p2.v) FROM sorted p2 WHERE p2.v < p1.v) FROM sorted p1 ORDER BY 1",
+        &["SCAN points", "USE HASH TABLE FOR DISTINCT", "USE SORTER FOR ORDER BY", "SCAN sorted AS p1", "CORRELATED SCALAR SUBQUERY 1", "SEARCH p2 USING INDEX ephemeral_subquery_s2 (v<?)", "USE HASH TABLE FOR DISTINCT", "USE SORTER FOR ORDER BY"],
+    ),
+    (
+        "WITH t AS (SELECT cust_id, sum(total) AS s FROM ord GROUP BY cust_id) SELECT c.name, t.s FROM cust c JOIN t ON t.cust_id = c.id WHERE t.s > (SELECT avg(s) FROM t) ORDER BY 1",
+        &["SCAN ord USING INDEX ord_cust", "SCAN cust AS c", "SEARCH t USING INDEX ephemeral_subquery_s2 (cust_id=? AND s>?)", "SCALAR SUBQUERY 1", "SCAN t", "USE SORTER FOR ORDER BY"],
+    ),
+    (
+        "WITH p(price) AS MATERIALIZED (SELECT price FROM prod) SELECT p1.price, (SELECT max(p2.price) FROM p p2 WHERE p2.price < p1.price) FROM p p1 WHERE p1.price < 100",
+        &["SCAN prod USING COVERING INDEX prod_price", "SCAN p AS p1", "CORRELATED SCALAR SUBQUERY 1", "SCAN p AS p2"],
+    ),
+    (
+        "SELECT sum(amount) OVER (ORDER BY day), max(amount) OVER (PARTITION BY region) FROM sales",
+        &["SCAN sales USING INDEX sales_region", "USE SORTER FOR ORDER BY"],
+    ),
+    (
+        "SELECT row_number() OVER (PARTITION BY region ORDER BY day), sum(amount) OVER (PARTITION BY region), rank() OVER (ORDER BY amount DESC) FROM sales",
+        &["SCAN sales", "USE SORTER FOR ORDER BY", "USE SORTER FOR ORDER BY", "USE SORTER FOR ORDER BY"],
+    ),
+    (
+        "SELECT count(*) OVER (PARTITION BY region) FROM sales",
+        &["SCAN sales USING COVERING INDEX sales_region"],
+    ),
+    (
+        "SELECT region, sum(amount), row_number() OVER (ORDER BY sum(amount) DESC) FROM sales GROUP BY region",
+        &["SCAN sales USING INDEX sales_region", "USE SORTER FOR ORDER BY"],
+    ),
+    (
+        "SELECT sum(amount) OVER (ORDER BY day) FROM sales ORDER BY day",
+        &["SCAN sales", "USE SORTER FOR ORDER BY"],
+    ),
+    (
+        "SELECT * FROM (SELECT amount, avg(amount) OVER (PARTITION BY region) AS a FROM sales) WHERE a > 10 ORDER BY amount",
+        &["SCAN (subquery-0)", "SCAN sales USING INDEX sales_region", "USE SORTER FOR ORDER BY"],
+    ),
+    (
+        "SELECT id, extra, sum(value) OVER (PARTITION BY extra ORDER BY value) FROM items",
+        &["SCAN items USING COVERING INDEX items_extra_value"],
+    ),
+    (
+        "SELECT id, rank() OVER (PARTITION BY extra ORDER BY value DESC) FROM items",
+        &["SCAN items", "USE SORTER FOR ORDER BY"],
+    ),
+    (
+        "WITH o AS (SELECT id, value FROM items ORDER BY value) SELECT id, sum(value) OVER (ORDER BY value) FROM o",
+        &["SCAN o", "SCAN items USING COVERING INDEX items_value"],
+    ),
+    (
+        "WITH o AS (SELECT id, extra FROM items NOT INDEXED ORDER BY extra) SELECT id, count(*) OVER (ORDER BY extra) FROM o",
+        &["SCAN o", "SCAN items", "USE SORTER FOR ORDER BY"],
+    ),
+    (
+        "SELECT id, row_number() OVER (ORDER BY value) FROM items LIMIT 3",
+        &["SCAN items USING COVERING INDEX items_value"],
+    ),
+    (
+        "WITH o AS (SELECT value, extra FROM items ORDER BY value) SELECT * FROM o ORDER BY value",
+        &["SCAN o", "SCAN items USING INDEX items_value"],
+    ),
+];

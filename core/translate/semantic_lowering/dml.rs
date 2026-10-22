@@ -17,7 +17,7 @@ use crate::{
         insn::{to_u32, InsertFlags, Insn, RegisterOrLiteral},
         BranchOffset, CursorID,
     },
-    LimboError, Result,
+    Connection, LimboError, Result,
 };
 
 use super::fkey_action::CompiledAction;
@@ -30,7 +30,8 @@ use super::{HirPlan, HirSession};
 use crate::translate::semantic_to_plan::HirPlannedLoop;
 
 /// The subprograms a DML statement fires. They are compiled before anything
-/// is emitted, so one that needs legacy leaves the whole statement to it.
+/// is emitted, so one that fails to compile fails the whole statement before
+/// any bytecode is emitted.
 #[derive(Default)]
 pub(super) struct Subprograms<'a> {
     /// The statement's row triggers.
@@ -48,83 +49,49 @@ pub(super) struct Subprograms<'a> {
 }
 
 impl<'a> Subprograms<'a> {
-    /// What a DELETE fires. `None` means one needs legacy.
+    /// What a DELETE fires.
     pub(super) fn for_delete(
         session: &HirSession<'_>,
         parent: &ProgramBuilder,
         plan: &HirPlan,
         delete: &'a hir::Delete,
-    ) -> Result<Option<Self>> {
-        let Some(triggers) = super::trigger::delete_triggers(session, parent, plan, delete)? else {
-            return Ok(None);
-        };
-        let Some(actions) = super::fkey_action::delete_actions(session, parent, delete)? else {
-            return Ok(None);
-        };
-        Ok(Some(Self {
-            triggers,
-            actions,
+    ) -> Result<Self> {
+        Ok(Self {
+            triggers: super::trigger::delete_triggers(session, parent, plan, delete)?,
+            actions: super::fkey_action::delete_actions(session, parent, delete)?,
             ..Self::default()
-        }))
+        })
     }
 
-    /// What an UPDATE fires. `None` means one needs legacy.
+    /// What an UPDATE fires.
     pub(super) fn for_update(
         session: &HirSession<'_>,
         parent: &ProgramBuilder,
         plan: &HirPlan,
         update: &'a hir::Update,
-    ) -> Result<Option<Self>> {
-        let Some(triggers) = super::trigger::update_triggers(session, parent, plan, update)? else {
-            return Ok(None);
-        };
-        let Some(actions) = super::fkey_action::update_actions(session, parent, plan, update)?
-        else {
-            return Ok(None);
-        };
-        let Some(replace_actions) = super::update::replace_actions(session, parent, plan, update)?
-        else {
-            return Ok(None);
-        };
-        Ok(Some(Self {
-            triggers,
-            actions,
-            replace_actions,
+    ) -> Result<Self> {
+        Ok(Self {
+            triggers: super::trigger::update_triggers(session, parent, plan, update)?,
+            actions: super::fkey_action::update_actions(session, parent, plan, update)?,
+            replace_actions: super::update::replace_actions(session, parent, plan, update)?,
             ..Self::default()
-        }))
+        })
     }
 
-    /// What an INSERT fires. `None` means one needs legacy.
+    /// What an INSERT fires.
     pub(super) fn for_insert(
         session: &HirSession<'_>,
         parent: &ProgramBuilder,
         plan: &HirPlan,
         insert: &'a hir::Insert,
-    ) -> Result<Option<Self>> {
-        let Some(triggers) = super::trigger::insert_triggers(session, parent, plan, insert)? else {
-            return Ok(None);
-        };
-        let Some(upsert_triggers) =
-            super::trigger::upsert_update_triggers(session, parent, plan, insert)?
-        else {
-            return Ok(None);
-        };
-        let Some(replace_actions) = super::insert::replace_actions(session, parent, plan, insert)?
-        else {
-            return Ok(None);
-        };
-        let Some(upsert_actions) =
-            super::fkey_action::upsert_actions(session, parent, plan, insert)?
-        else {
-            return Ok(None);
-        };
-        Ok(Some(Self {
-            triggers,
+    ) -> Result<Self> {
+        Ok(Self {
+            triggers: super::trigger::insert_triggers(session, parent, plan, insert)?,
             actions: Vec::new(),
-            replace_actions,
-            upsert_triggers,
-            upsert_actions,
-        }))
+            replace_actions: super::insert::replace_actions(session, parent, plan, insert)?,
+            upsert_triggers: super::trigger::upsert_update_triggers(session, parent, plan, insert)?,
+            upsert_actions: super::fkey_action::upsert_actions(session, parent, plan, insert)?,
+        })
     }
 }
 
@@ -246,7 +213,7 @@ impl<'a> DmlTarget<'a> {
                 continue;
             }
             // An index method without a B-tree of its own (such as FTS) gets
-            // its own kind of cursor, as in legacy.
+            // its own kind of cursor.
             let cursor = program.alloc_cursor_index(None, &expressions.index.handle())?;
             program.emit_insn(Insn::OpenWrite {
                 cursor_id: cursor,
@@ -306,7 +273,6 @@ pub(super) fn emit_access_predicates(
                 jump_if_condition_is_true: false,
                 jump_target_when_true: passed,
                 jump_target_when_false: fail,
-                jump_target_when_null: fail,
             },
         )?;
         program.preassign_label_to_next_insn(passed);
@@ -315,8 +281,8 @@ pub(super) fn emit_access_predicates(
 }
 
 /// Read one index's key for the current row, followed by the rowid. Values
-/// come from the table row, like legacy's old-image reads: plain columns are
-/// read as stored, and generated columns and expressions are computed.
+/// come from the table row: plain columns are read as stored, and generated
+/// columns and expressions are computed.
 pub(super) fn emit_index_key(
     program: &mut ProgramBuilder,
     document: &HirDocument,
@@ -387,10 +353,10 @@ fn emit_index_key_values(
     Ok((start, count))
 }
 
-/// REPLACE: delete the row whose rowid is in `conflict`, as legacy does:
-/// the foreign-key checks of deleting it, its entry in each of `indexes`,
-/// then the row. No DELETE trigger fires. The target is left bound to
-/// `table_cursor`, which no longer sits on any row.
+/// REPLACE: delete the row whose rowid is in `conflict`: the foreign-key
+/// checks of deleting it, its entry in each of `indexes`, then the row. No
+/// DELETE trigger fires. The target is left bound to `table_cursor`, which
+/// no longer sits on any row.
 ///
 /// `replacement` is the row an UPDATE writes in its place: an immediate NO
 /// ACTION parent key it keeps cannot leave a child without its parent.
@@ -435,8 +401,7 @@ pub(super) fn emit_replace_delete(
         database,
         replacement,
     )?;
-    // Like legacy, the ON DELETE actions of the deleted row run once it is
-    // gone.
+    // The ON DELETE actions of the deleted row run once it is gone.
     let action_keys = actions
         .iter()
         .map(|action| {
@@ -504,8 +469,6 @@ pub(super) fn operation_index(operation: &HirBtreeOperation) -> Option<&Arc<crat
     }
 }
 
-/// Legacy's single-row test for a DML access path: a rowid lookup, or a
-/// seek where every column of a unique index (or the rowid) is fixed by `=`.
 /// Run the statement's loop with read cursors and collect the rowid of each
 /// row it finds into a row set, then close those cursors. The loop reads the
 /// table, an index, or one seek per branch of an OR term. Returns the row
@@ -547,6 +510,8 @@ pub(super) fn collect_target_rowids(
     Ok(rowset)
 }
 
+/// Whether a DML access path finds at most one row: a rowid lookup, or a
+/// seek where every column of a unique index (or the rowid) is fixed by `=`.
 pub(super) fn touches_at_most_one_row(operation: &HirBtreeOperation) -> bool {
     use crate::translate::plan::SeekKeyComponent;
     match operation {
@@ -608,15 +573,27 @@ pub(super) fn virtual_target(
     })
 }
 
-/// Whether a write to a virtual table stays in legacy: `sqlite_dbpage`,
-/// which legacy writes only in testing builds.
-pub(super) fn virtual_needs_legacy(table: &crate::vtab::VirtualTable) -> bool {
-    table.name == "sqlite_dbpage"
+/// `sqlite_dbpage` may be written only by a cli_only build
+/// opened with unsafe testing on; every other read-only virtual table
+/// rejects writes.
+pub(super) fn dbpage_write_allowed(
+    table: &crate::vtab::VirtualTable,
+    connection: &Connection,
+) -> bool {
+    #[cfg(feature = "cli_only")]
+    {
+        table.name == crate::dbpage::DBPAGE_TABLE_NAME && connection.db.opts.unsafe_testing
+    }
+    #[cfg(not(feature = "cli_only"))]
+    {
+        let _ = (table, connection);
+        false
+    }
 }
 
-/// Open a virtual table for writing, as legacy does: the rows a statement
-/// writes are handed to the table with `VUpdate` through this cursor, inside
-/// the table's own transaction.
+/// Open a virtual table for writing: the rows a statement writes are handed
+/// to the table with `VUpdate` through this cursor, inside the table's own
+/// transaction.
 pub(super) fn open_virtual_for_write(
     program: &mut ProgramBuilder,
     table: &Arc<crate::vtab::VirtualTable>,
@@ -627,8 +604,8 @@ pub(super) fn open_virtual_for_write(
     cursor
 }
 
-/// RETURNING rows of a DML statement. Like legacy, they wait in an
-/// ephemeral table until every row is written, then are returned.
+/// RETURNING rows of a DML statement. They wait in an ephemeral table
+/// until every row is written, then are returned.
 #[derive(Clone, Copy)]
 pub(super) struct ReturningBuffer<'a> {
     cursor: CursorID,
@@ -715,7 +692,7 @@ impl<'a> ReturningBuffer<'a> {
                 start + position,
             )?;
         }
-        emit_array_results(program, document, self.outputs, start)?;
+        emit_array_results(program, document, self.outputs, start, &[])?;
         Ok(start)
     }
 
@@ -746,7 +723,7 @@ impl<'a> ReturningBuffer<'a> {
 
     /// After the last row is written: return the buffered rows.
     pub(super) fn emit_rows(&self, program: &mut ProgramBuilder) {
-        // Legacy checks foreign keys before returning any row.
+        // Foreign keys are checked before any row is returned.
         program.emit_insn(Insn::FkCheck { deferred: false });
         let done = program.allocate_label();
         let next = program.allocate_label();
@@ -778,12 +755,8 @@ impl<'a> ReturningBuffer<'a> {
     }
 }
 
-/// Check each CHECK constraint against the new row, which the constraint's
-/// source must be bound to. Like SQLite, a NULL result passes. A failure
-/// skips the row under IGNORE and stops the statement otherwise; REPLACE
-/// does not apply to CHECK.
-/// Run `emit` reading custom-typed columns as stored, not decoded. Like
-/// legacy, CHECK constraints compare stored values.
+/// Run `emit` reading custom-typed columns as stored, not decoded. CHECK
+/// constraints compare stored values.
 pub(super) fn with_stored_values<T>(
     program: &mut ProgramBuilder,
     emit: impl FnOnce(&mut ProgramBuilder) -> Result<T>,
@@ -795,6 +768,10 @@ pub(super) fn with_stored_values<T>(
     result
 }
 
+/// Check each CHECK constraint against the new row, which the constraint's
+/// source must be bound to. Like SQLite, a NULL result passes. A failure
+/// skips the row under IGNORE and stops the statement otherwise; REPLACE
+/// does not apply to CHECK.
 pub(super) fn emit_check_constraints<'c>(
     program: &mut ProgramBuilder,
     document: &HirDocument,
@@ -859,32 +836,36 @@ pub(super) fn subquery_query(subquery: &hir::SubqueryExpr) -> hir::QueryId {
     }
 }
 
-/// Whether the target is a STRICT table HIR does not lower yet: one with an
-/// array column, or a type name that is neither built in nor custom.
-pub(super) fn strict_needs_legacy(table: &BTreeTable, source: &hir::Source) -> bool {
+/// A STRICT table's column types are built in or custom; CREATE TABLE
+/// rejects any other, so one here is a schema this build does not know.
+pub(super) fn check_strict_types(table: &BTreeTable, source: &hir::Source) -> Result<()> {
     let builtin = |name: &str| {
         ["ANY", "INTEGER", "INT", "REAL", "BLOB", "TEXT"]
             .iter()
             .any(|builtin| name.eq_ignore_ascii_case(builtin))
     };
-    table.is_strict
-        && table
-            .columns()
-            .iter()
-            .enumerate()
-            .any(|(position, column)| {
-                if column.is_array() {
-                    // An array of a custom type is not lowered yet.
-                    !builtin(&column.ty_str)
-                } else {
-                    custom_chain(source, position).is_none() && !builtin(&column.ty_str)
-                }
-            })
+    if !table.is_strict {
+        return Ok(());
+    }
+    for (position, column) in table.columns().iter().enumerate() {
+        if !column.is_array()
+            && custom_chain(source, position).is_none()
+            && !builtin(&column.ty_str)
+        {
+            crate::bail_parse_error!(
+                "unknown datatype for {}.{}: \"{}\"",
+                table.name,
+                column.name.as_deref().unwrap_or(""),
+                column.ty_str
+            );
+        }
+    }
+    Ok(())
 }
 
 /// STRICT: check each value of the row in `start..` against its column's
-/// type, converting it where SQLite allows and failing otherwise, as legacy
-/// does. A STRICT table gets this instead of column affinity.
+/// type, converting it where SQLite allows and failing otherwise. A STRICT
+/// table gets this instead of column affinity.
 pub(super) fn emit_strict_type_check(
     program: &mut ProgramBuilder,
     table: &Arc<BTreeTable>,
@@ -930,10 +911,10 @@ pub(super) fn has_custom_types(source: &hir::Source) -> bool {
             .any(|column| column.type_fact.is_array())
 }
 
-/// STRICT with custom types, as legacy does it: check each value in
-/// `start..` against the type its column accepts as input, encode it, then
-/// check the encoded value against the column's base type. Only the columns
-/// at `only` are checked as input and encoded; `None` means all of them.
+/// STRICT with custom types: check each value in `start..` against the type
+/// its column accepts as input, encode it, then check the encoded value
+/// against the column's base type. Only the columns at `only` are checked as
+/// input and encoded; `None` means all of them.
 pub(super) fn emit_custom_type_writes(
     program: &mut ProgramBuilder,
     document: &HirDocument,
@@ -953,8 +934,8 @@ pub(super) fn emit_custom_type_writes(
                 }
                 continue;
             }
-            // Like legacy, an array is given as text or a blob, and is
-            // stored as a record blob.
+            // An array is given as text or a blob, and is stored as a
+            // record blob.
             if column.is_array() {
                 column.ty_str = if input { "ANY" } else { "BLOB" }.to_string();
                 column.override_affinity(crate::vdbe::affinity::Affinity::Blob);
@@ -979,8 +960,8 @@ pub(super) fn emit_custom_type_writes(
         check_generated: true,
         table_reference: check_table(true),
     });
-    // Like legacy, an array is parsed and its elements checked against the
-    // element type, then stored as a record blob. Only the outer array of a
+    // An array is parsed and its elements checked against the element
+    // type, then stored as a record blob. Only the outer array of a
     // multi-dimensional one checks nothing but that its elements are arrays.
     for (position, column) in table.columns().iter().enumerate() {
         if !column.is_array() || column.is_virtual_generated() || !written(position) {
@@ -993,6 +974,31 @@ pub(super) fn emit_custom_type_writes(
             target_pc: skip,
         });
         let any = column.ty_str.eq_ignore_ascii_case("ANY") || column.array_dimensions() > 1;
+        // The elements of an array of a custom type are encoded one by
+        // one: the text or blob is first parsed as an array of anything,
+        // each element encoded, then the array checked against the element
+        // type like any other.
+        if let Some(programs) = source
+            .column_type_programs
+            .get(position)
+            .and_then(Option::as_ref)
+        {
+            program.emit_insn(Insn::ArrayEncode {
+                data: Box::new(crate::vdbe::insn::ArrayEncodeData {
+                    reg: register,
+                    element_affinity: crate::vdbe::affinity::Affinity::Blob,
+                    element_type: "ANY".into(),
+                    table_name: table.name.as_str().into(),
+                    col_name: column.name.as_deref().unwrap_or("").into(),
+                }),
+            });
+            super::expr::translate_schema_calls_on_elements(
+                program,
+                document,
+                &programs.encode,
+                register,
+            )?;
+        }
         program.emit_insn(Insn::ArrayEncode {
             data: Box::new(crate::vdbe::insn::ArrayEncodeData {
                 reg: register,
@@ -1016,6 +1022,10 @@ pub(super) fn emit_custom_type_writes(
         let Some(programs) = programs.as_ref().filter(|_| written(position)) else {
             continue;
         };
+        // An array's elements were encoded above.
+        if table.columns()[position].is_array() {
+            continue;
+        }
         let register = start + position;
         let skip = (!programs.encode_nulls).then(|| {
             let skip = program.allocate_label();
@@ -1045,10 +1055,10 @@ pub(super) fn emit_custom_type_writes(
 }
 
 /// Compute each virtual generated column of the row in registers
-/// `start + column` into its register, in dependency order, as legacy does.
-/// `source` must be bound to those registers. Reads of the row through
-/// `source` compute virtual columns anyway; this fills the registers that
-/// are copied directly, such as index keys, NOT NULL checks and triggers.
+/// `start + column` into its register, in dependency order. `source` must be
+/// bound to those registers. Reads of the row through `source` compute
+/// virtual columns anyway; this fills the registers that are copied
+/// directly, such as index keys, NOT NULL checks and triggers.
 pub(super) fn emit_virtual_columns(
     program: &mut ProgramBuilder,
     document: &HirDocument,

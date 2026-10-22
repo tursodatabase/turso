@@ -272,7 +272,7 @@ impl LoweringContext {
     }
 }
 
-/// A constant operand computed once, as legacy computes it.
+/// A constant operand computed once.
 #[derive(Clone, Copy)]
 enum Hoisted {
     /// An operand without a function call, moved before the loops by this
@@ -525,10 +525,11 @@ impl<'expr> ExprLowerer<'_, 'expr, '_> {
         let source = self.document.source(reference.source)?;
         let generated = source.generated_expressions.get(reference.column)?;
         if let hir::ColumnReadExpression::Planned(expression) = generated {
-            if index == 0 {
-                return Some(ColumnChild::Generated(expression));
-            }
-            index -= 1;
+            // A virtual column is computed from the decoded columns it reads
+            // and never stored, so its value is neither decoded nor given a
+            // default: decoding it once more would read 0 for
+            // `cents AS (a * 2)` while its index holds 4.
+            return (index == 0).then_some(ColumnChild::Generated(expression));
         }
 
         let column = source.columns.get(reference.column)?;
@@ -1771,7 +1772,7 @@ impl<'expr> hir::ExprVisitor<'expr> for ExprLowerer<'_, 'expr, '_> {
 }
 
 impl<'expr> ExprLowerer<'_, 'expr, '_> {
-    /// Like legacy, an operand with the same value on every row, such as
+    /// An operand with the same value on every row, such as
     /// the `1` of `a + 1` or the `upper('x')` of `upper('x') || b`, is not
     /// computed again for each row. Without a function call or a CAST to a
     /// custom type it cannot fail, so it moves before the loops. A function
@@ -1791,7 +1792,9 @@ impl<'expr> ExprLowerer<'_, 'expr, '_> {
             may_fail |= match expression {
                 hir::Expr::Function(_) => true,
                 hir::Expr::Cast { target, .. } => {
-                    !target.programs.encode.is_empty() || target.programs.domain.is_some()
+                    !target.programs.encode.is_empty()
+                        || target.programs.domain.is_some()
+                        || target.array_dimensions > 0
                 }
                 _ => false,
             };
@@ -3051,6 +3054,32 @@ impl ExprLowerer<'_, '_, '_> {
                     "HIR built-in CAST contains custom programs".to_string(),
                 ));
             }
+            if target.array_dimensions > 0 {
+                // A cast to an array type reads the value the way a write to
+                // a column of that type reads it: a text literal is parsed and
+                // each element checked against the element type, a record
+                // blob is checked. The outer array of a multi-dimensional
+                // type checks only that its elements are arrays.
+                let any = target.name.eq_ignore_ascii_case("ANY") || target.array_dimensions > 1;
+                self.program.emit_insn(Insn::ArrayEncode {
+                    data: Box::new(crate::vdbe::insn::ArrayEncodeData {
+                        reg: value,
+                        element_affinity: if any {
+                            crate::vdbe::affinity::Affinity::Blob
+                        } else {
+                            crate::vdbe::affinity::Affinity::affinity(&target.name)
+                        },
+                        element_type: if any {
+                            "ANY".into()
+                        } else {
+                            target.name.to_uppercase().into()
+                        },
+                        table_name: "".into(),
+                        col_name: "".into(),
+                    }),
+                });
+                return Ok(value);
+            }
             self.program.emit_insn(Insn::Cast {
                 reg: value,
                 affinity: target.affinity,
@@ -3115,14 +3144,17 @@ impl ExprLowerer<'_, '_, '_> {
                 reference.source, reference.column
             )));
         }
-        let encoded_default = matches!(default, hir::ColumnReadExpression::Planned(_))
+        let computed = matches!(generated, hir::ColumnReadExpression::Planned(_));
+        let encoded_default = !computed
+            && matches!(default, hir::ColumnReadExpression::Planned(_))
             && type_program
                 .as_ref()
                 .is_some_and(|programs| !programs.encode.is_empty());
 
         let suppress_custom_type_decode = self.program.flags.suppress_custom_type_decode();
+        // See `column_child`: a virtual column's value is not decoded.
         let decode_children =
-            if column.type_fact.array_dimensions > 0 || suppress_custom_type_decode {
+            if column.type_fact.array_dimensions > 0 || suppress_custom_type_decode || computed {
                 0
             } else {
                 type_program.as_ref().map_or(0, |programs| {
@@ -3450,7 +3482,7 @@ impl ExprLowerer<'_, '_, '_> {
             column
                 .collation
                 .as_ref()
-                .map(|collation| (collation.value().clone(), false)),
+                .map(|collation| (*collation.value(), false)),
         );
     }
 
@@ -4643,7 +4675,6 @@ impl<'expr> hir::ExprVisitor<'expr> for ConditionLowerer<'_, 'expr> {
                     expr::ConditionMetadata {
                         jump_if_condition_is_true: true,
                         jump_target_when_false: next_operand,
-                        jump_target_when_null: next_operand,
                         ..metadata
                     },
                 )))
@@ -4694,9 +4725,9 @@ impl<'expr> hir::ExprVisitor<'expr> for ConditionLowerer<'_, 'expr> {
     }
 }
 
-/// Lower a value a condition tests into its own register. Like legacy, a
-/// value that is the same on every row, such as the `5` of `x = 5`, is
-/// computed once before the loops.
+/// Lower a value a condition tests into its own register. A value that is
+/// the same on every row, such as the `5` of `x = 5`, is computed once
+/// before the loops.
 fn translate_condition_operand(
     program: &mut ProgramBuilder,
     document: &hir::HirDocument,
@@ -4750,7 +4781,7 @@ fn hir_expr_is_constant(program: &ProgramBuilder, expression: &hir::Expr) -> boo
 }
 
 impl ConditionLowerer<'_, '_> {
-    /// Like legacy, a scalar comparison jumps on its own result instead of
+    /// A scalar comparison jumps on its own result instead of
     /// computing a truth value first: `WHERE x = 1` becomes one `Ne` that
     /// skips the row. As with a computed value, NULL counts as false. Returns
     /// false, having emitted nothing, for other expressions.
@@ -4915,11 +4946,10 @@ pub(crate) fn translate_expr_with_inputs_no_constant_opt<'expr>(
     result
 }
 
-/// Apply bound schema calls to a value already stored in `target`.
-/// Like legacy's per-element loop for arrays of a custom type: apply
-/// `calls` to each element of the array blob in `register`, then rebuild it.
-/// As in legacy, an array with more elements than the loop's register block
-/// fails the statement.
+/// Apply bound schema calls to a value already stored in `target`: apply
+/// `calls` to each element of the array blob in `register`, then rebuild
+/// it. An array with more elements than the loop's register block fails the
+/// statement.
 pub(crate) fn translate_schema_calls_on_elements(
     program: &mut ProgramBuilder,
     document: &hir::HirDocument,
@@ -5121,6 +5151,8 @@ mod tests {
                 schema: Arc::new(schema),
             }],
             unqualified_database_search_path: vec![hir::DatabaseId::new(MAIN_DB_ID)],
+            has_temp_database: false,
+            search_path_configured: false,
         };
         let statement = match Parser::new(sql.as_bytes())
             .next_cmd()
@@ -5130,7 +5162,7 @@ mod tests {
             turso_parser::ast::Cmd::Stmt(statement) => statement,
             _ => panic!("SQL contains a statement"),
         };
-        let document = crate::translate::semantic::analyze_root(
+        let document = crate::translate::semantic::analyze_root_with_options(
             &catalog,
             &SymbolTable::new(),
             SemanticOptions {
@@ -5139,6 +5171,7 @@ mod tests {
                 dqs_dml: DoubleQuotedDml::Enabled,
                 foreign_keys_enabled: true,
                 capture_changes_table: None,
+                long_column_names: false,
             },
             SemanticRootInput::Statement(&statement),
         )
@@ -5587,7 +5620,7 @@ mod tests {
     }
 
     #[test]
-    fn in_subquery_uses_the_bound_index_and_legacy_null_scan() {
+    fn in_subquery_uses_the_bound_index_and_branches_on_null_components() {
         let document = analyze_sql(
             crate::schema::Schema::new(),
             "SELECT (1, 2) IN (SELECT 3, 4)",
@@ -5611,8 +5644,8 @@ mod tests {
         super::translate_expr(&mut program, &document, expression, target)
             .expect("bound IN subquery lowers");
 
-        // Keep the legacy row evaluation order: after each component is
-        // evaluated, branch before evaluating the next component if it is NULL.
+        // After each component is evaluated, branch before evaluating the
+        // next component if it is NULL.
         assert!(matches!(
             program.insns.as_slice(),
             [
@@ -6392,7 +6425,6 @@ mod tests {
             result_type: TypeFact::known(crate::schema::Type::Integer),
             operation: hir::FunctionOperation::Sequence(hir::SequenceOperation {
                 kind,
-                user_name: "aux.seq".to_string(),
                 normalized_name,
                 sequence: hir::CatalogObject::new(
                     hir::CatalogObjectId::new(2),
@@ -7314,7 +7346,7 @@ mod tests {
     }
 
     #[test]
-    fn like_uses_legacy_argument_order_and_resolved_function() {
+    fn like_passes_pattern_then_text_to_the_resolved_function() {
         let expression = hir::Expr::Like {
             lhs: Box::new(hir::Expr::Literal(Literal::String("'value'".to_string()))),
             negated: false,
@@ -9032,7 +9064,7 @@ mod tests {
     }
 
     #[test]
-    fn zero_argument_dialect_function_keeps_legacy_start_register() {
+    fn zero_argument_dialect_function_reserves_a_start_register() {
         let expression =
             ordinary_scalar_call(Func::Dialect("catalog_value".to_string()), Vec::new());
         let mut program = program();
@@ -9053,7 +9085,7 @@ mod tests {
     }
 
     #[test]
-    fn math_functions_keep_legacy_argument_registers() {
+    fn math_functions_read_arguments_from_consecutive_registers() {
         use crate::function::MathFunc;
 
         let cases = [
@@ -9186,7 +9218,7 @@ mod tests {
     }
 
     #[test]
-    fn plain_builtin_functions_use_legacy_argument_registers() {
+    fn plain_builtin_functions_read_arguments_from_consecutive_registers() {
         let mut empty_program = program();
         let expression = ordinary_scalar_call(Func::Scalar(ScalarFunc::Char), Vec::new());
 
@@ -9261,7 +9293,7 @@ mod tests {
     }
 
     #[test]
-    fn struct_pack_uses_legacy_make_array_register_shape() {
+    fn struct_pack_builds_its_array_from_consecutive_registers() {
         let mut empty_program = program();
         let empty = ordinary_scalar_call(Func::Scalar(ScalarFunc::StructPack), Vec::new());
 
@@ -9392,7 +9424,7 @@ mod tests {
     }
 
     #[test]
-    fn direct_like_functions_use_plain_legacy_argument_registers() {
+    fn direct_like_functions_read_plain_argument_registers() {
         for function in [ScalarFunc::Like, ScalarFunc::Glob] {
             for argument_count in [2, 3] {
                 let arguments = (0..argument_count)
@@ -9455,7 +9487,7 @@ mod tests {
     }
 
     #[test]
-    fn concat_ws_keeps_legacy_result_and_argument_registers() {
+    fn concat_ws_writes_its_result_after_the_argument_registers() {
         for argument_count in [2, 3] {
             let arguments = (0..argument_count)
                 .map(|value| hir::Expr::Literal(Literal::Numeric(value.to_string())))
@@ -9496,7 +9528,7 @@ mod tests {
     }
 
     #[test]
-    fn ifnull_keeps_legacy_short_circuit_register_and_opcode_shape() {
+    fn ifnull_short_circuits_on_the_first_non_null_argument() {
         let expression = ordinary_scalar_call(
             Func::Scalar(ScalarFunc::IfNull),
             vec![
@@ -9527,7 +9559,7 @@ mod tests {
     }
 
     #[test]
-    fn iif_keeps_legacy_branch_register_and_opcode_shapes() {
+    fn iif_branches_on_its_condition_register() {
         for (argument_count, expected_shape) in [
             (2, "condition if-not value goto null"),
             (
@@ -9572,7 +9604,7 @@ mod tests {
     }
 
     #[test]
-    fn coalesce_keeps_legacy_target_register_and_opcode_shape() {
+    fn coalesce_writes_the_first_non_null_argument_to_the_target() {
         for argument_count in [2, 3] {
             let arguments = (0..argument_count)
                 .map(|value| hir::Expr::Literal(Literal::Numeric(value.to_string())))
@@ -9594,7 +9626,7 @@ mod tests {
     }
 
     #[test]
-    fn last_insert_rowid_keeps_legacy_ignored_argument_behavior() {
+    fn last_insert_rowid_ignores_its_arguments() {
         for argument_count in [0, 2] {
             let arguments = (0..argument_count)
                 .map(|value| hir::Expr::Literal(Literal::Numeric(value.to_string())))
@@ -9624,7 +9656,7 @@ mod tests {
     }
 
     #[test]
-    fn version_functions_keep_legacy_output_register_and_copy_shape() {
+    fn version_functions_copy_their_constant_into_the_target() {
         for function in [
             ScalarFunc::SqliteVersion,
             ScalarFunc::TursoVersion,
@@ -9664,7 +9696,7 @@ mod tests {
     }
 
     #[test]
-    fn substring_functions_always_reserve_three_legacy_argument_registers() {
+    fn substring_functions_always_reserve_three_argument_registers() {
         for function in [ScalarFunc::Substr, ScalarFunc::Substring] {
             for argument_count in [2, 3] {
                 let arguments = (0..argument_count)
@@ -9697,7 +9729,7 @@ mod tests {
     }
 
     #[test]
-    fn empty_plain_functions_reserve_the_legacy_start_register() {
+    fn empty_plain_functions_reserve_a_start_register() {
         for function in [
             ScalarFunc::Changes,
             ScalarFunc::TotalChanges,
@@ -9885,7 +9917,6 @@ mod tests {
                     jump_if_condition_is_true: false,
                     jump_target_when_true: when_true,
                     jump_target_when_false: when_false,
-                    jump_target_when_null: when_false,
                 },
             )
             .expect("condition lowers");
@@ -9931,7 +9962,6 @@ mod tests {
                 jump_if_condition_is_true: false,
                 jump_target_when_true: when_true,
                 jump_target_when_false: when_false,
-                jump_target_when_null: when_false,
             },
         )
         .expect("deep condition lowers");
