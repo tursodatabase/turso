@@ -450,6 +450,23 @@ fn unnamed_check_with_multiple_columns_reports_table_name() {
 }
 
 #[test]
+fn upsert_do_update_unique_violation_reports_structured_fields() {
+    let (_io, conn) = pg_connection();
+    conn.execute("CREATE TABLE t (a INT PRIMARY KEY, c TEXT UNIQUE)")
+        .unwrap();
+    conn.execute("INSERT INTO t VALUES (1, 'q')").unwrap();
+    conn.execute("INSERT INTO t VALUES (2, 'x')").unwrap();
+    let e = exec_err(
+        &conn,
+        "INSERT INTO t VALUES (1, 'q') ON CONFLICT(a) DO UPDATE SET c = 'x'",
+    );
+    assert_eq!(e.sqlstate, "23505");
+    let cv = constraint_violation(&e);
+    assert_eq!(cv.constraint_name.as_deref(), Some("t_c_key"));
+    assert_eq!(cv.table_name.as_deref(), Some("t"));
+}
+
+#[test]
 fn foreign_key_update_keeps_key_values_when_later_rows_reuse_registers() {
     let (_io, conn) = pg_connection_with_fk();
     conn.execute("CREATE TABLE parent (a INT, b TEXT, PRIMARY KEY (a, b))")
