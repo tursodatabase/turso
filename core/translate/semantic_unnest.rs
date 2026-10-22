@@ -942,6 +942,11 @@ fn try_semi_or_anti_join(
             {
                 return false;
             }
+            // A join can skip an inner row the subquery tests, and so hide
+            // an error that row's WHERE terms would raise.
+            if terms.iter().any(|term| hir_expr_can_fail(document, term)) {
+                return false;
+            }
         }
         Candidate::In {
             lhs, comparison, ..

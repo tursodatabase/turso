@@ -12,4 +12,4 @@ info:
   database: ':memory:'
 ---
 QUERY PLAN
-`--MULTI-INDEX OR t2 (idx_t2_b, PRIMARY KEY)
+`--SCAN t2 USING COVERING INDEX idx_t2_b

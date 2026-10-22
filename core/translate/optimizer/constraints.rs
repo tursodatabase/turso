@@ -856,6 +856,27 @@ fn hir_index_expressions<'a>(
     Ok(expressions)
 }
 
+/// Whether a query WHERE term proves an index predicate conjunct: the term
+/// is the conjunct, or the conjunct is an OR with a branch the term proves.
+fn hir_query_term_implies_predicate(query: &hir::Expr, predicate: &hir::Expr) -> bool {
+    if query.equivalent(predicate) {
+        return true;
+    }
+    match predicate {
+        hir::Expr::Binary {
+            lhs,
+            operator: ast::Operator::Or,
+            rhs,
+            custom: None,
+            ..
+        } => {
+            hir_query_term_implies_predicate(query, lhs)
+                || hir_query_term_implies_predicate(query, rhs)
+        }
+        _ => false,
+    }
+}
+
 fn hir_partial_index_predicate_terms(
     from: &impl HirFromScope,
     source: hir::SourceId,
@@ -864,15 +885,25 @@ fn hir_partial_index_predicate_terms(
 ) -> Option<SmallVec<[usize; 4]>> {
     let full_join = from.full_join_may_null_extend(source);
     let outer_join = from.outer_join_may_null_extend(source);
-    let can_use_query_term =
-        |term: &HirWhereTerm| !full_join && (!outer_join || term.from_outer_join == Some(source));
+    // A term from another join's ON clause only holds for rows that pass
+    // that join, so it proves nothing about which rows of this table are
+    // in the index.
+    let can_use_query_term = |term: &HirWhereTerm| {
+        !full_join
+            && match term.from_outer_join {
+                Some(joined) => joined == source,
+                None => !outer_join,
+            }
+    };
     let mut matched_terms = SmallVec::new();
     for index_conjunct in &crate::translate::plan::hir_planning_conjuncts(predicate) {
-        let (term_position, _) = query_where_clause
-            .iter()
-            .enumerate()
-            .find(|(_, term)| can_use_query_term(term) && index_conjunct.equivalent(&term.expr))?;
-        if !matched_terms.contains(&term_position) {
+        let (term_position, term) = query_where_clause.iter().enumerate().find(|(_, term)| {
+            can_use_query_term(term) && hir_query_term_implies_predicate(&term.expr, index_conjunct)
+        })?;
+        // A query term that proves one branch of an OR makes the partial
+        // index usable, but the index also holds rows of the other branch,
+        // so the term stays a filter unless it is the whole conjunct.
+        if index_conjunct.equivalent(&term.expr) && !matched_terms.contains(&term_position) {
             matched_terms.push(term_position);
         }
     }
@@ -1320,7 +1351,7 @@ pub(crate) fn hir_constraints_for_source(
             .sort_by_key(|reference| reference.index_col_pos);
     }
     table_constraints.temporary_index_terms =
-        automatic_index_terms(&table.table, &table_constraints)
+        automatic_index_terms(&table.table, &table_constraints, schema)
             .into_iter()
             .filter(|reference| {
                 !matches!(
@@ -1339,12 +1370,27 @@ pub(crate) fn hir_constraints_for_source(
 pub(super) fn automatic_index_terms<E>(
     table: &crate::schema::Table,
     constraints: &TableConstraints<E>,
+    schema: &Schema,
 ) -> SmallVec<[ConstraintRef; 4]> {
     let columns = table.columns();
+    // A custom type orders its stored values by its own rules, which the
+    // automatic index does not know, so only `=` terms can seek it.
+    let can_use_term = |term: &Constraint<E>| {
+        if !term.can_drive_index_seek(columns) {
+            return false;
+        }
+        let column = &columns[term
+            .table_col_pos
+            .expect("a term that can drive an index seek has a column")];
+        let has_custom_type = schema
+            .get_type_def(&column.ty_str, table.is_strict())
+            .is_some();
+        !has_custom_type || term.operator == ast::Operator::Equals.into()
+    };
     let usable_constraints: SmallVec<[&Constraint<E>; 4]> = constraints
         .constraints
         .iter()
-        .filter(|term| term.can_drive_index_seek(columns))
+        .filter(|term| can_use_term(term))
         .collect();
     let index_columns = ordered_ephemeral_key_columns(&usable_constraints);
 
@@ -1352,7 +1398,7 @@ pub(super) fn automatic_index_terms<E>(
         .constraints
         .iter()
         .enumerate()
-        .filter(|(_, term)| term.can_drive_index_seek(columns))
+        .filter(|(_, term)| can_use_term(term))
         .filter_map(|(term_index, term)| {
             let table_col_pos = term.table_col_pos?;
             Some(ConstraintRef {

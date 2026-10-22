@@ -16,7 +16,7 @@ use crate::{
     },
     vdbe::{
         builder::{CursorType, ProgramBuilder, SourceBinding},
-        insn::{Insn, RegisterOrLiteral},
+        insn::{ClearBtreeCount, Insn, RegisterOrLiteral},
         BranchOffset, CursorID,
     },
     LimboError, Result,
@@ -125,6 +125,23 @@ pub(super) fn emit_delete(
     };
     let target = DmlTarget::new(program, document, delete.target, "DELETE")?
         .with_capture(program, capture_changes.as_ref())?;
+    if subprograms.may_clear_btrees
+        && delete.predicate.is_none()
+        && delete.returning.is_none()
+        && triggers.is_empty()
+        && actions.is_empty()
+        && capture_changes.is_none()
+        && foreign_keys.incoming.is_empty()
+        && foreign_keys.outgoing.is_empty()
+        && target
+            .source
+            .index_expressions
+            .iter()
+            .all(|expressions| expressions.index.value().index_method.is_none())
+    {
+        emit_clear_btrees(program, &target);
+        return Ok(());
+    }
     // A DELETE that fires triggers or foreign-key actions first collects
     // its rowids, since they can change the table.
     let uses_rowset =
@@ -174,6 +191,25 @@ pub(super) fn emit_delete(
         returning.emit_rows(program);
     }
     Ok(())
+}
+
+/// Delete every row of the table at once by clearing each index B-tree and
+/// then the table B-tree, like SQLite's truncate optimization. Only the
+/// table's clear counts the deleted rows as changes; every clear counts the
+/// entries it removes as rows written.
+fn emit_clear_btrees(program: &mut ProgramBuilder, target: &DmlTarget<'_>) {
+    for expressions in &target.source.index_expressions {
+        program.emit_insn(Insn::ClearBtree {
+            db: target.database,
+            root: expressions.index.value().root_page,
+            count: ClearBtreeCount::RowsWritten,
+        });
+    }
+    program.emit_insn(Insn::ClearBtree {
+        db: target.database,
+        root: target.table.root_page,
+        count: ClearBtreeCount::ChangesAndRowsWritten,
+    });
 }
 
 /// Whether the DELETE first collects the rowids of the rows to delete, then

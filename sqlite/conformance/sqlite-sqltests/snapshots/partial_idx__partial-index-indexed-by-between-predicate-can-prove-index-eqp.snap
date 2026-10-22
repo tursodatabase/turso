@@ -14,4 +14,4 @@ info:
   database: ':memory:'
 ---
 QUERY PLAN
-`--SCAN t_between_forced USING INDEX idx_between_forced
+`--SCAN t_between_forced USING COVERING INDEX idx_between_forced

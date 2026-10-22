@@ -2271,13 +2271,19 @@ fn extract_view_columns_inner(
     let mut columns = Vec::new();
     let mut column_name_counts = HashMap::default();
 
-    let ast::OneSelect::Select {
-        from,
-        columns: select_columns,
-        ..
-    } = &select_stmt.body.select
-    else {
-        return Ok(ViewColumnSchema { tables, columns });
+    let (from, select_columns) = match &select_stmt.body.select {
+        ast::OneSelect::Select { from, columns, .. } => (from, columns),
+        ast::OneSelect::Values(rows) => {
+            // A VALUES body has one column per value of its first row, named
+            // column1, column2, ... like SQLite names them.
+            for (index, expr) in rows.first().into_iter().flatten().enumerate() {
+                let mut column = view_result_column(expr, &[]);
+                column.column.name = Some(format!("column{}", index + 1));
+                deduplicate_view_column_name(&mut column, &mut column_name_counts);
+                columns.push(column);
+            }
+            return Ok(ViewColumnSchema { tables, columns });
+        }
     };
 
     let sources = from

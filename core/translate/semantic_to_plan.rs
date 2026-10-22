@@ -258,23 +258,62 @@ fn is_simple_count(
     let hir::Expr::Function(call) = &output.expr else {
         return false;
     };
-    matches!(
-        call.function.value(),
-        crate::function::Func::Agg(crate::function::AggFunc::Count0)
-    ) && matches!(
-        call.evaluation,
-        hir::FunctionEvaluation::Aggregate { filter: None, .. }
-    ) && block.aggregate_count == 1
+    let [HirPlanSource::BTree(source)] = input.sources.as_slice() else {
+        return false;
+    };
+    if !matches!(source.table, Table::BTree(_)) {
+        return false;
+    }
+    // `count(x)` counts every row too when `x` can never be NULL.
+    let counts_every_row = match call.function.value() {
+        crate::function::Func::Agg(crate::function::AggFunc::Count0) => true,
+        crate::function::Func::Agg(crate::function::AggFunc::Count) => match &call.arguments {
+            hir::FunctionArguments::Expressions {
+                values,
+                distinctness,
+                ..
+            } => {
+                !matches!(
+                    distinctness,
+                    Some(turso_parser::ast::Distinctness::Distinct)
+                ) && matches!(
+                    values.as_slice(),
+                    [argument] if hir_column_never_null(argument, source)
+                )
+            }
+            _ => false,
+        },
+        _ => false,
+    };
+    counts_every_row
+        && matches!(
+            call.evaluation,
+            hir::FunctionEvaluation::Aggregate { filter: None, .. }
+        )
+        && block.aggregate_count == 1
         && matches!(
             &block.body,
             hir::QueryBlockBody::Select { grouping: None, .. }
         )
         && limit.is_none()
-        && matches!(
-            input.sources.as_slice(),
-            [HirPlanSource::BTree(source)] if matches!(source.table, Table::BTree(_))
-        )
         && input.predicates.is_empty()
+}
+
+/// Whether `expression` is the rowid of `source`, or one of its columns
+/// declared NOT NULL or standing for the rowid.
+fn hir_column_never_null(expression: &hir::Expr, source: &HirPlannedSource) -> bool {
+    match expression {
+        hir::Expr::RowId(rowid_source) => *rowid_source == source.internal_id,
+        hir::Expr::Column(column) => {
+            column.source == source.internal_id
+                && source
+                    .table
+                    .columns()
+                    .get(column.column)
+                    .is_some_and(|column| column.notnull() || column.is_rowid_alias())
+        }
+        _ => false,
+    }
 }
 
 enum HirFromItem<'a> {
@@ -479,6 +518,160 @@ fn hir_source_may_be_null_extended(
         })
 }
 
+/// The FROM clause as the unmatched-row read of one table sees it: a
+/// one-table FROM clause, like SQLite plans that read from, where no join
+/// NULL-extends the table.
+struct HirUnmatchedReadScope<'a>(&'a HirFromLayout<'a>);
+
+impl crate::translate::planner::HirFromScope for HirUnmatchedReadScope<'_> {
+    fn source_position(&self, source: SourceId) -> Option<usize> {
+        self.0.source_position(source)
+    }
+
+    fn outer_join_may_null_extend(&self, _source: SourceId) -> bool {
+        false
+    }
+
+    fn full_join_may_null_extend(&self, _source: SourceId) -> bool {
+        false
+    }
+}
+
+/// Plan the read that finds the unmatched rows of a B-tree table on the
+/// right of a RIGHT or FULL JOIN, after the main loops. SQLite plans it as
+/// a new query over that one table: the ON terms are not used, since they
+/// decide which rows match; a WHERE term is used when every source it reads
+/// is at or before this loop, and not at all when a later RIGHT or FULL
+/// JOIN takes this table as its left input, since the main loops check
+/// WHERE terms only after that later join. No automatic index is built for
+/// this one pass. An INDEXED BY or NOT INDEXED hint applies to this read
+/// like to the main loop. The pass checks every WHERE term again itself.
+#[allow(clippy::too_many_arguments)]
+fn plan_hir_unmatched_btree_read(
+    document: &HirDocument,
+    source: &HirPlannedSource,
+    source_position: usize,
+    input: &HirQueryBlockPlanInput,
+    prior_sources: &crate::translate::planner::TableMask,
+    base_row_count: RowCountEstimate,
+    schema: &Schema,
+    params: &CostModelParams,
+    query_rows: &dyn Fn(QueryId) -> Option<f64>,
+    or_union: bool,
+) -> Result<HirPlannedLoop> {
+    let layout = HirFromLayout::new(&input.sources, &input.groups);
+    let definition = document.source(source.internal_id).ok_or_else(|| {
+        LimboError::InternalError(format!(
+            "HIR unmatched-row read references missing source {}",
+            source.internal_id
+        ))
+    })?;
+    let mut available = crate::alloc::TryClone::try_clone(prior_sources)?;
+    available.set(source_position)?;
+    let left_of_later_right_join = input.sources.iter().skip(source_position + 1).any(|later| {
+        later
+            .join_info()
+            .is_some_and(|join| matches!(join.kind, hir::JoinKind::Right | hir::JoinKind::Full))
+    });
+    // A term this read cannot use becomes a literal true at its position,
+    // so the seek and union plans keep their term positions.
+    let mut predicates = input.predicates.clone();
+    for (index, term) in predicates.iter_mut().enumerate() {
+        let usable = index >= input.where_start
+            && !left_of_later_right_join
+            && term.from_outer_join.is_none()
+            && available.contains_all_set_bits_of(&layout.table_mask(document, &term.expr)?);
+        if usable {
+            // The main loop may have used the term for its own seek.
+            term.consumed = false;
+        } else {
+            term.expr = hir::Expr::Literal(turso_parser::ast::Literal::Numeric("1".into()));
+            term.consumed = true;
+        }
+    }
+    let scope = HirUnmatchedReadScope(&layout);
+    let mut constraints = hir_constraints_for_source(
+        document,
+        &scope,
+        &predicates,
+        HirConstraintSource::BTree(source),
+        schema,
+        params,
+        query_rows,
+    )?;
+    if constraints.candidates.is_empty() {
+        // INDEXED BY names a partial index this read cannot prove: the main
+        // loop already checked the hint, so this read scans the table.
+        constraints
+            .candidates
+            .push(super::optimizer::constraints::ConstraintUseCandidate {
+                index: None,
+                refs: Vec::new(),
+                partial_index: None,
+            });
+    }
+    // The read itself has no outer join: an INDEXED BY expression index is
+    // read like for any table, its seek terms are consumed like any other,
+    // and an OR term may become one seek per branch.
+    let mut unmatched_source = source.clone();
+    unmatched_source.join_info = None;
+    let mut method = super::optimizer::access_method::choose_hir_single_read_access_method(
+        &unmatched_source,
+        definition,
+        &constraints,
+        prior_sources,
+        source_position,
+        schema,
+        base_row_count,
+        params,
+    )?;
+    let operation = apply_hir_selected_btree_access(
+        &unmatched_source,
+        &constraints,
+        &mut predicates,
+        &mut method,
+        prior_sources,
+        source_position,
+    )?;
+    let union = match operation {
+        HirBtreeOperation::Scan { .. } if or_union => {
+            crate::translate::optimizer::plan_hir_or_union(
+                document,
+                &layout,
+                &unmatched_source,
+                source_position,
+                &predicates,
+                prior_sources,
+                base_row_count,
+                schema,
+                params,
+            )?
+        }
+        _ => None,
+    };
+    let access = match union {
+        Some(union) => HirSourceAccess::OrUnion(union),
+        None => {
+            let table_lookup = selected_btree_index(&operation)
+                .filter(|index| !source.index_is_covering(definition, index))
+                .map_or(BtreeTableLookup::ScanOnly, |_| {
+                    BtreeTableLookup::TableRequired
+                });
+            HirSourceAccess::BTree {
+                operation,
+                table_lookup,
+            }
+        }
+    };
+    Ok(HirPlannedLoop {
+        source: source.internal_id,
+        source_position,
+        access,
+        estimate: None,
+        unmatched_right_rows: None,
+    })
+}
+
 /// Plan the read that finds the unmatched rows of a virtual table on the
 /// right of a RIGHT or FULL JOIN. The main loop's read may use ON and WHERE
 /// terms whose left columns are NULL in that pass, so this read passes the
@@ -641,6 +834,10 @@ pub(crate) struct HirPlannedLoop {
     /// The planner's row and cost estimate for this loop, shown in JSON
     /// query plans. A loop the join planner did not price has none.
     pub(crate) estimate: Option<crate::translate::plan::TablePlanEstimate>,
+    /// For a B-tree table on the right of a RIGHT or FULL JOIN: the read
+    /// that finds its unmatched rows after the main loops. See
+    /// [`plan_hir_unmatched_btree_read`].
+    pub(crate) unmatched_right_rows: Option<Box<HirPlannedLoop>>,
 }
 
 impl HirPlannedLoop {
@@ -790,26 +987,47 @@ fn materialized_hash_build_inputs(
 /// right sources of those joins. Its ON terms become ordinary terms.
 fn left_joins_rejected_by_where(input: &mut HirQueryBlockPlanInput) -> Vec<SourceId> {
     let mut converted = Vec::new();
-    // A parenthesized group's join is left alone.
-    if !input.groups.is_empty() {
-        return converted;
-    }
     loop {
+        let rejects_rows_of = |source: SourceId| {
+            input
+                .predicates
+                .iter()
+                .any(|term| term.from_outer_join.is_none() && rejects_null_row(&term.expr, source))
+        };
         let rejected = input.sources.iter().position(|source| {
             source
                 .join_info()
                 .is_some_and(|join| join.kind == hir::JoinKind::Left)
-                && input.predicates.iter().any(|term| {
-                    term.from_outer_join.is_none() && rejects_null_row(&term.expr, source.source())
-                })
+                && rejects_rows_of(source.source())
         });
-        let Some(position) = rejected else {
-            return converted;
+        // A parenthesized group's LEFT JOIN NULL-extends every source in
+        // it, so a term that rejects the NULL row of any of them makes
+        // the group's join an inner join.
+        let rejected_group = input.groups.iter().position(|group| {
+            group
+                .join_info
+                .as_ref()
+                .is_some_and(|join| join.kind == hir::JoinKind::Left)
+                && group
+                    .source_range
+                    .clone()
+                    .any(|position| rejects_rows_of(input.sources[position].source()))
+        });
+        let source = match (rejected, rejected_group) {
+            (Some(position), _) => {
+                if let Some(join) = input.sources[position].join_info_mut() {
+                    join.kind = hir::JoinKind::Inner;
+                }
+                input.sources[position].source()
+            }
+            (None, Some(position)) => {
+                if let Some(join) = &mut input.groups[position].join_info {
+                    join.kind = hir::JoinKind::Inner;
+                }
+                input.groups[position].source
+            }
+            (None, None) => return converted,
         };
-        let source = input.sources[position].source();
-        if let Some(join) = input.sources[position].join_info_mut() {
-            join.kind = hir::JoinKind::Inner;
-        }
         for term in &mut input.predicates {
             if term.from_outer_join == Some(source) {
                 term.from_outer_join = None;
@@ -821,7 +1039,7 @@ fn left_joins_rejected_by_where(input: &mut HirQueryBlockPlanInput) -> Vec<Sourc
 
 /// Whether `expr` can never be TRUE when every column of `source` is NULL
 /// (SQLite's `impliesNotNullRow`). When unsure, it says no.
-fn rejects_null_row(expr: &hir::Expr, source: SourceId) -> bool {
+pub(crate) fn rejects_null_row(expr: &hir::Expr, source: SourceId) -> bool {
     use turso_parser::ast::Operator::{And, Is, IsNot, Or};
     let rejects = |expr: &hir::Expr| rejects_null_row(expr, source);
     match expr {
@@ -993,6 +1211,7 @@ impl<'a> HirPlanContext<'a> {
         if let Some(predicate) = &update.predicate {
             append_predicates(&mut input.predicates, predicate, None);
         }
+        self.add_implied_in_terms(&mut input);
         self.check_match_terms(&input.predicates)?;
 
         if let Some(plan) = self.plan_dml_index_method(&mut input)? {
@@ -1101,6 +1320,7 @@ impl<'a> HirPlanContext<'a> {
                 source_position: 0,
                 access: HirSourceAccess::IndexMethod(matched.access),
                 estimate: None,
+                unmatched_right_rows: None,
             }],
             predicates: std::mem::take(&mut input.predicates),
             where_start: input.where_start,
@@ -1137,6 +1357,7 @@ impl<'a> HirPlanContext<'a> {
         if let Some(predicate) = &delete.predicate {
             append_predicates(&mut input.predicates, predicate, None);
         }
+        self.add_implied_in_terms(&mut input);
         self.check_match_terms(&input.predicates)?;
         for term in &delete.order_by {
             self.register_expression_index_usage(&mut input.sources, &term.expr)?;
@@ -2168,6 +2389,77 @@ impl<'a> HirPlanContext<'a> {
         Ok(())
     }
 
+    /// Add the `col IN (...)` terms the OR terms imply (see
+    /// [crate::translate::plan::hir_implied_in_terms]). An OR term of an
+    /// outer join's ON clause is left alone: as a plain term, its IN could
+    /// reject rows the join must keep.
+    fn add_implied_in_terms(&self, input: &mut HirQueryBlockPlanInput) {
+        // The IN term is checked as a WHERE term. An OR term of an inner
+        // join's ON clause before a RIGHT or FULL JOIN is not one: the IN
+        // would reject the rows that join NULL-extends.
+        let right_or_full_join = input.sources.iter().any(|source| {
+            source
+                .join_info()
+                .is_some_and(|join| matches!(join.kind, hir::JoinKind::Right | hir::JoinKind::Full))
+        });
+        let predicates = &mut input.predicates;
+        let mut implied: Vec<HirWhereTerm> = Vec::new();
+        for (position, term) in predicates.iter().enumerate() {
+            if term.from_outer_join.is_some()
+                || (position < input.where_start && right_or_full_join)
+            {
+                continue;
+            }
+            let terms =
+                crate::translate::plan::hir_implied_in_terms(&term.expr, &|source, columns| {
+                    self.sole_indexed_column(source, columns)
+                });
+            for expr in terms {
+                if !predicates
+                    .iter()
+                    .chain(implied.iter())
+                    .any(|known| known.expr.equivalent(&expr))
+                {
+                    implied.push(HirWhereTerm {
+                        expr,
+                        from_outer_join: None,
+                        consumed: false,
+                    });
+                }
+            }
+        }
+        predicates.extend(implied);
+    }
+
+    /// Of `columns` of `source`, the one that alone starts an index: none
+    /// when another of them starts one too, or when one index starts with
+    /// two of them, which a seek on one column would use less well.
+    fn sole_indexed_column(&self, source: SourceId, columns: &[usize]) -> Option<usize> {
+        let indexes = self
+            .definition(source)
+            .index_expressions
+            .iter()
+            .map(|expressions| expressions.index.value())
+            .filter(|index| index.index_method.is_none());
+        if indexes.clone().any(|index| {
+            index.columns.len() > 1
+                && index.columns[0].expr.is_none()
+                && index.columns[1].expr.is_none()
+                && columns.contains(&index.columns[0].pos_in_table)
+                && columns.contains(&index.columns[1].pos_in_table)
+        }) {
+            return None;
+        }
+        let mut indexed = columns.iter().copied().filter(|column| {
+            indexes.clone().any(|index| {
+                index.where_clause.is_none()
+                    && index.column_table_pos_to_index_pos(*column) == Some(0)
+            })
+        });
+        let column = indexed.next()?;
+        indexed.next().is_none().then_some(column)
+    }
+
     fn append_join_predicates(
         &self,
         predicates: &mut Vec<HirWhereTerm>,
@@ -2220,6 +2512,7 @@ impl<'a> HirPlanContext<'a> {
         {
             append_predicates(&mut input.predicates, filter, None);
         }
+        self.add_implied_in_terms(&mut input);
 
         // GROUP BY and window lowering copy every column the block reads into
         // a sorter or buffer, so an expression index cannot stand in for the
@@ -2255,13 +2548,19 @@ impl<'a> HirPlanContext<'a> {
         }
         // A WHERE term equal to a partial index's predicate is not evaluated
         // when the index is read, so the columns only it reads need not be
-        // in the index.
-        let where_terms = input.predicates[input.where_start..]
-            .iter()
-            .map(|term| term.expr.clone())
-            .collect::<Vec<_>>();
-        for term in &where_terms {
-            self.register_expression_index_usage(&mut input.sources, term)?;
+        // in the index. The terms are the WHERE clause's own conjuncts, not
+        // the planning conjuncts: `a BETWEEN 2 AND 4` is planned as `a >= 2`
+        // and `a <= 4`, and matching the first to an index predicate `a >= 2`
+        // would count the one read of `a` as covered while the second still
+        // reads it.
+        if let hir::QueryBlockBody::Select {
+            filter: Some(filter),
+            ..
+        } = &block.body
+        {
+            for term in filter.conjuncts() {
+                self.register_expression_index_usage(&mut input.sources, term)?;
+            }
         }
 
         Ok(input)
@@ -2645,6 +2944,7 @@ impl<'a> HirPlanContext<'a> {
                 source_position: 0,
                 access: HirSourceAccess::IndexMethod(matched.access),
                 estimate: None,
+                unmatched_right_rows: None,
             }],
             predicates,
             where_start: input.where_start,
@@ -2753,6 +3053,7 @@ impl<'a> HirPlanContext<'a> {
             source_position: position,
             access: HirSourceAccess::IndexMethod(matched.access),
             estimate: None,
+            unmatched_right_rows: None,
         });
         loops.extend(access.loops.into_iter().map(|mut planned_loop| {
             if planned_loop.source_position >= position {
@@ -3042,6 +3343,7 @@ impl<'a> HirPlanContext<'a> {
                         table_lookup,
                     },
                     estimate,
+                    unmatched_right_rows: None,
                 });
                 prior_sources.set(source_position)?;
                 continue;
@@ -3131,6 +3433,7 @@ impl<'a> HirPlanContext<'a> {
                         source_position: *build_table_idx,
                         access: HirSourceAccess::Hash(lookup),
                         estimate: build_estimate,
+                        unmatched_right_rows: None,
                     }
                 } else {
                     let build_loop: HirPlannedLoop = loops.pop().ok_or_else(|| {
@@ -3167,6 +3470,7 @@ impl<'a> HirPlanContext<'a> {
                         table_lookup: BtreeTableLookup::ScanOnly,
                     },
                     estimate,
+                    unmatched_right_rows: None,
                 });
                 loops.push(build_loop);
                 prior_sources.set(source_position)?;
@@ -3336,11 +3640,38 @@ impl<'a> HirPlanContext<'a> {
                     HirSourceAccess::RecursiveInput { cte: *cte }
                 }
             };
+            // The right table of a RIGHT or FULL JOIN is read again after
+            // the main loops, for its unmatched rows.
+            let unmatched_right_rows = match (&input.sources[source_position], &access) {
+                (
+                    HirPlanSource::BTree(source),
+                    HirSourceAccess::BTree { .. } | HirSourceAccess::OrUnion(_),
+                ) if matches!(source.table, Table::BTree(_))
+                    && source.join_info.as_ref().is_some_and(|join| {
+                        matches!(join.kind, hir::JoinKind::Right | hir::JoinKind::Full)
+                    }) =>
+                {
+                    Some(Box::new(plan_hir_unmatched_btree_read(
+                        self.document,
+                        source,
+                        source_position,
+                        &input,
+                        &prior_sources,
+                        base_rows[source_position],
+                        schema,
+                        params,
+                        &query_rows,
+                        or_union,
+                    )?))
+                }
+                _ => None,
+            };
             loops.push(HirPlannedLoop {
                 source: input.sources[source_position].source(),
                 source_position,
                 access,
                 estimate,
+                unmatched_right_rows,
             });
             prior_sources.set(source_position)?;
         }
@@ -3630,7 +3961,24 @@ impl<'a> HirPlanContext<'a> {
         })
     }
 
+    /// Record every part of `expression` an expression index could supply,
+    /// such as `lower(a)` inside `sum(CASE WHEN lower(a) = 'x' THEN 1 END)`.
     fn register_expression_index_usage(
+        &self,
+        sources: &mut [HirPlanSource],
+        expression: &hir::Expr,
+    ) -> Result<()> {
+        let mut result = Ok(());
+        expression.for_each(&mut |part| {
+            // A column read on its own is never an index expression.
+            if result.is_ok() && !matches!(part, hir::Expr::Column(_) | hir::Expr::RowId(_)) {
+                result = self.register_expression_index_usage_part(sources, part);
+            }
+        });
+        result
+    }
+
+    fn register_expression_index_usage_part(
         &self,
         sources: &mut [HirPlanSource],
         expression: &hir::Expr,

@@ -25,74 +25,86 @@ QUERY PLAN
    `--SCAN u3
 
 BYTECODE
-addr  opcode             p1  p2  p3  p4             p5  comment
-   0  Init                0  68   0                  0  Start at 68
-   1  OpenRead            0   2   0  k(3,NoCase,B)   0  table=u1, root=2, iDb=0
-   2  OpenRead            2   3   0  k(3,B,B)        0  table=u2, root=3, iDb=0
-   3  OpenRead            4   4   0  k(3,B,B)        0  table=u3, root=4, iDb=0
-   4  Null                0   6   0                  0  r[6]=NULL
-   5  OpenEphemeral       1   0   0                  0  cursor=1 is_table=false
-   6  Null                0   9   0                  0  r[9]=NULL
-   7  OpenEphemeral       3   0   0                  0  cursor=3 is_table=false
-   8  Rewind              0  50   0                  0  Rewind table u1
-   9    Rewind            2  48   0                  0  Rewind table u2
-  10      Column          0   0  11                  0  r[11]=u1.id
-  11      Column          2   0  12                  0  r[12]=u2.id
-  12      Ne             11  12  46  NoCase          0  if r[11]!=r[12] goto 46
-  13      RowId           2   5   0                  0  r[5]=u2.rowid
-  14      Found           1  18   5                  0  if found goto 18
-  15      MakeRecord      5   1  13                  0  r[13]=mkrec(r[5..5])
-  16      IdxInsert       1  13   5                  0  key=r[13]
-  17      FilterAdd       1   5   1                  0  bloom_filter_add(r[5..6])
-  18      BeginSubrtn     6   0   0                  0  r[6]=NULL
-  19      Integer         0   7   0                  0  r[7]=0
-  20      Rewind          4  42   0                  0  Rewind table u3
-  21        Column        0   0  15                  0  r[15]=u1.id
-  22        NotNull      15  24   0                  0  r[15]!=NULL -> goto 24
-  23        Column        2   0  15                  0  r[15]=u2.id
-  24        Column        4   0  16                  0  r[16]=u3.id
-  25        Ne           15  16  40  NoCase          0  if r[15]!=r[16] goto 40
-  26        RowId         4   8   0                  0  r[8]=u3.rowid
-  27        Found         3  31   8                  0  if found goto 31
-  28        MakeRecord    8   1  17                  0  r[17]=mkrec(r[8..8])
-  29        IdxInsert     3  17   8                  0  key=r[17]
-  30        FilterAdd     3   8   1                  0  bloom_filter_add(r[8..9])
-  31        Integer       1   7   0                  0  r[7]=1
-  32        BeginSubrtn   9   0   0                  0  r[9]=NULL
-  33        Column        2   0   1                  0  r[1]=u2.id
-  34        NotNull       1  36   0                  0  r[1]!=NULL -> goto 36
-  35        Column        4   0   1                  0  r[1]=u3.id
-  36        Column        0   1   2                  0  r[2]=u1.a
-  37        Column        2   1   3                  0  r[3]=u2.b
-  38        Column        4   1   4                  0  r[4]=u3.c
-  39        ResultRow     1   4   0                  0  output=r[1..4]
-  40        Return        9   0   1                  0
-  41      Next            4  21   0                  1
-  42      Return          9   0   1                  0
-  43      IfPos           7  46   0                  0  r[7]>0 -> r[7]-=0, goto 46
-  44      NullRow         4   0   0                  0  Set cursor 4 to a (pseudo) NULL row
-  45      Goto            0  31   0                  0
-  46      Return          6   0   1                  0
-  47    Next              2  10   0                  1
-  48    Return            6   0   1                  0
-  49  Next                0   9   0                  1
-  50  NullRow             0   0   0                  0  Set cursor 0 to a (pseudo) NULL row
-  51  OpenRead            2   3   0  k(3,B,B)        0  table=u2, root=3, iDb=0
-  52  Rewind              2  58   0                  0  Rewind table u2
-  53    RowId             2   5   0                  0  r[5]=u2.rowid
-  54    Filter            1  56   5                  1  if !bloom_filter(r[5..6]) goto 56
-  55    Found             1  57   5                  0  if found goto 57
-  56    Gosub             6  19   0                  0
-  57  Next                2  53   0                  1
-  58  NullRow             0   0   0                  0  Set cursor 0 to a (pseudo) NULL row
-  59  NullRow             2   0   0                  0  Set cursor 2 to a (pseudo) NULL row
-  60  OpenRead            4   4   0  k(3,B,B)        0  table=u3, root=4, iDb=0
-  61  Rewind              4  67   0                  0  Rewind table u3
-  62    RowId             4   8   0                  0  r[8]=u3.rowid
-  63    Filter            3  65   8                  1  if !bloom_filter(r[8..9]) goto 65
-  64    Found             3  66   8                  0  if found goto 66
-  65    Gosub             9  33   0                  0
-  66  Next                4  62   0                  1
-  67  Halt                0   0   0                  0
-  68  Transaction         0   1   3                  0  iDb=0 tx_mode=Read
-  69  Goto                0   1   0                  0
+addr  opcode           p1  p2  p3  p4             p5  comment
+   0  Init              0  80   0                  0  Start at 80
+   1  OpenRead          0   2   0  k(3,NoCase,B)   0  table=u1, root=2, iDb=0
+   2  OpenRead          1   3   0  k(3,B,B)        0  table=u2, root=3, iDb=0
+   3  OpenRead          2   4   0  k(3,B,B)        0  table=u3, root=4, iDb=0
+   4  OpenEphemeral     3   1   0                  0  cursor=3 is_table=true
+   5  Null              0   3   0                  0  r[3]=NULL
+   6  MakeRecord        3   1   4                  0  r[4]=mkrec(r[3..3])
+   7  OpenEphemeral     4   1   0                  0  cursor=4 is_table=true
+   8  Null              0   5   0                  0  r[5]=NULL
+   9  MakeRecord        5   1   6                  0  r[6]=mkrec(r[5..5])
+  10  Rewind            0  38   0                  0  Rewind table u1
+  11    Rewind          1  37   0                  0  Rewind table u2
+  12      Column        0   0   7                  0  r[7]=u1.id
+  13      Column        1   0   8                  0  r[8]=u2.id
+  14      Ne            7   8  36  NoCase          0  if r[7]!=r[8] goto 36
+  15      RowId         1   9   0                  0  r[9]=u2.rowid
+  16      Insert        3   4   9                  6  intkey=r[9] data=r[4]
+  17      Integer       0   2   0                  0  r[2]=0
+  18      Rewind        2  33   0                  0  Rewind table u3
+  19        Column      1   0  10                  0  r[10]=u2.id
+  20        Column      2   0  11                  0  r[11]=u3.id
+  21        Ne         10  11  32  Binary          0  if r[10]!=r[11] goto 32
+  22        RowId       2  12   0                  0  r[12]=u3.rowid
+  23        Insert      4   6  12                  6  intkey=r[12] data=r[6]
+  24        Integer     1   2   0                  0  r[2]=1
+  25        Column      1   0  13                  0  r[13]=u2.id
+  26        NotNull    13  28   0                  0  r[13]!=NULL -> goto 28
+  27        Column      2   0  13                  0  r[13]=u3.id
+  28        Column      0   1  14                  0  r[14]=u1.a
+  29        Column      1   1  15                  0  r[15]=u2.b
+  30        Column      2   1  16                  0  r[16]=u3.c
+  31        ResultRow  13   4   0                  0  output=r[13..16]
+  32      Next          2  19   0                  1
+  33      IfPos         2  36   0                  0  r[2]>0 -> r[2]-=0, goto 36
+  34      NullRow       2   0   0                  0  Set cursor 2 to a (pseudo) NULL row
+  35      Goto          0  24   0                  0
+  36    Next            1  12   0                  1
+  37  Next              0  11   0                  1
+  38  NullRow           0   0   0                  0  Set cursor 0 to a (pseudo) NULL row
+  39  OpenRead          5   3   0  k(3,B,B)        0  table=u2, root=3, iDb=0
+  40  Rewind            5  64   0                  0  Rewind table u2
+  41    RowId           5  17   0                  0  r[17]=u2.rowid
+  42    NotExists       3  44  17                  0
+  43    Goto            0  63   0                  0
+  44    Integer         0  19   0                  0  r[19]=0
+  45    Rewind          2  60   0                  0  Rewind table u3
+  46      Column        5   0  20                  0  r[20]=u2.id
+  47      Column        2   0  21                  0  r[21]=u3.id
+  48      Ne           20  21  59  Binary          0  if r[20]!=r[21] goto 59
+  49      RowId         2  22   0                  0  r[22]=u3.rowid
+  50      Insert        4   6  22                  6  intkey=r[22] data=r[6]
+  51      Integer       1  19   0                  0  r[19]=1
+  52      Column        5   0  23                  0  r[23]=u2.id
+  53      NotNull      23  55   0                  0  r[23]!=NULL -> goto 55
+  54      Column        2   0  23                  0  r[23]=u3.id
+  55      Column        0   1  24                  0  r[24]=u1.a
+  56      Column        5   1  25                  0  r[25]=u2.b
+  57      Column        2   1  26                  0  r[26]=u3.c
+  58      ResultRow    23   4   0                  0  output=r[23..26]
+  59    Next            2  46   0                  1
+  60    IfPos          19  63   0                  0  r[19]>0 -> r[19]-=0, goto 63
+  61    NullRow         2   0   0                  0  Set cursor 2 to a (pseudo) NULL row
+  62    Goto            0  51   0                  0
+  63  Next              5  41   0                  1
+  64  NullRow           0   0   0                  0  Set cursor 0 to a (pseudo) NULL row
+  65  NullRow           1   0   0                  0  Set cursor 1 to a (pseudo) NULL row
+  66  OpenRead          6   4   0  k(3,B,B)        0  table=u3, root=4, iDb=0
+  67  Rewind            6  79   0                  0  Rewind table u3
+  68    RowId           6  27   0                  0  r[27]=u3.rowid
+  69    NotExists       4  71  27                  0
+  70    Goto            0  78   0                  0
+  71    Column          1   0  30                  0  r[30]=u2.id
+  72    NotNull        30  74   0                  0  r[30]!=NULL -> goto 74
+  73    Column          6   0  30                  0  r[30]=u3.id
+  74    Column          0   1  31                  0  r[31]=u1.a
+  75    Column          1   1  32                  0  r[32]=u2.b
+  76    Column          6   1  33                  0  r[33]=u3.c
+  77    ResultRow      30   4   0                  0  output=r[30..33]
+  78  Next              6  68   0                  1
+  79  Halt              0   0   0                  0
+  80  Transaction       0   1   3                  0  iDb=0 tx_mode=Read
+  81  Goto              0   1   0                  0

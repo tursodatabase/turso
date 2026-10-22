@@ -36,9 +36,9 @@ addr  opcode       p1  p2  p3  p4                                     p5  commen
    5  Integer       0   3   0                                          0  r[3]=0
    6  Rewind        0  30   0                                          0  Rewind table lineitem
    7    Column      0  10   4                                          0  r[4]=lineitem.L_SHIPDATE
-   8    Lt          4   5  29                                          0  if r[4]<r[5] goto 29
+   8    Lt          4   5  29  Binary                                  0  if r[4]<r[5] goto 29
    9    Column      0  10   6                                          0  r[6]=lineitem.L_SHIPDATE
-  10    Ge          6   7  29                                          0  if r[6]>=r[7] goto 29
+  10    Ge          6   7  29  Binary                                  0  if r[6]>=r[7] goto 29
   11    Column      0   1   8                                          0  r[8]=lineitem.L_PARTKEY
   12    SeekRowid   1   8  29                                          0  if (r[8]!=cursor 1.rowid) goto 29
   13    Column      1   4  12                                          0  r[12]=part.P_TYPE

@@ -253,6 +253,149 @@ fn lift_or_common_conjuncts(
     ))
 }
 
+/// `col IN (v1, v2, ...)` terms an OR term implies: every branch of the
+/// OR, its ANDs flattened, compares `col` with a literal by `=`. The OR
+/// stays, since the IN only narrows the rows it is checked on, but the IN
+/// can drive an index seek the OR cannot. With several such columns of one
+/// table, only the one that alone starts an index is used, so that two
+/// seeks do not compete for the same table.
+pub(crate) fn hir_implied_in_terms(
+    expression: &crate::translate::semantic::hir::Expr,
+    sole_indexed_column: &dyn Fn(
+        crate::translate::semantic::hir::SourceId,
+        &[usize],
+    ) -> Option<usize>,
+) -> Vec<crate::translate::semantic::hir::Expr> {
+    use crate::translate::semantic::hir::{ColumnRef, Expr};
+    let mut disjuncts = Vec::new();
+    hir_operands(expression, ast::Operator::Or, &mut disjuncts);
+    if disjuncts.len() < 2 {
+        return Vec::new();
+    }
+    let branches = disjuncts
+        .into_iter()
+        .map(|disjunct| {
+            let mut conjuncts = Vec::new();
+            hir_operands(disjunct, ast::Operator::And, &mut conjuncts);
+            conjuncts
+        })
+        .collect::<Vec<_>>();
+    // A filter true for every branch names a column of the first branch.
+    let mut candidates: Vec<ColumnRef> = Vec::new();
+    for term in &branches[0] {
+        if let Some((column, _, _)) = hir_column_literal_equality(term) {
+            if !candidates.contains(&column) {
+                candidates.push(column);
+            }
+        }
+    }
+    let mut filters: Vec<(ColumnRef, Expr)> = Vec::new();
+    'candidates: for column in candidates {
+        let mut values: Vec<Expr> = Vec::new();
+        let mut comparisons = Vec::new();
+        for branch in &branches {
+            let mut found = false;
+            for term in branch {
+                let Some((other, value, comparison)) = hir_column_literal_equality(term) else {
+                    continue;
+                };
+                if other != column {
+                    continue;
+                }
+                found = true;
+                if !values.iter().any(|known| known.equivalent(value)) {
+                    values.push(value.clone());
+                    comparisons.push(comparison.clone());
+                }
+            }
+            if !found {
+                // This branch does not restrict the column, so a filter on
+                // it could reject rows of this branch.
+                continue 'candidates;
+            }
+        }
+        // One value for every branch is a conjunct the OR shares, which
+        // `hir_planning_conjuncts` lifts out of it.
+        if values.len() > 1 {
+            filters.push((
+                column,
+                Expr::InList {
+                    lhs: Box::new(Expr::Column(column)),
+                    negated: false,
+                    values,
+                    comparisons,
+                },
+            ));
+        }
+    }
+    filters
+        .iter()
+        .filter_map(|(column, filter)| {
+            let same_source = filters
+                .iter()
+                .filter(|(other, _)| other.source == column.source)
+                .map(|(other, _)| other.column)
+                .collect::<Vec<_>>();
+            (same_source.len() == 1
+                || sole_indexed_column(column.source, &same_source) == Some(column.column))
+            .then(|| filter.clone())
+        })
+        .collect()
+}
+
+/// The column and literal of `col = literal` or `literal = col`, with the
+/// comparison's semantics.
+fn hir_column_literal_equality(
+    expression: &crate::translate::semantic::hir::Expr,
+) -> Option<(
+    crate::translate::semantic::hir::ColumnRef,
+    &crate::translate::semantic::hir::Expr,
+    &crate::translate::semantic::hir::ComparisonSemantics,
+)> {
+    use crate::translate::semantic::hir::Expr;
+    let Expr::Binary {
+        lhs,
+        operator: ast::Operator::Equals,
+        rhs,
+        custom: None,
+        comparison: Some(comparison),
+        ..
+    } = expression
+    else {
+        return None;
+    };
+    match (lhs.as_ref(), rhs.as_ref()) {
+        (Expr::Column(column), value) if hir_literal_can_be_copied(value) => {
+            Some((*column, value, comparison))
+        }
+        (value, Expr::Column(column)) if hir_literal_can_be_copied(value) => {
+            Some((*column, value, comparison))
+        }
+        _ => None,
+    }
+}
+
+/// A number, string, blob or boolean, possibly signed. NULL never satisfies
+/// `=`, so it is left out.
+fn hir_literal_can_be_copied(expression: &crate::translate::semantic::hir::Expr) -> bool {
+    use crate::translate::semantic::hir::Expr;
+    use turso_parser::ast::{Literal, UnaryOperator};
+    match expression {
+        Expr::Literal(
+            Literal::Numeric(_)
+            | Literal::String(_)
+            | Literal::Blob(_)
+            | Literal::True
+            | Literal::False,
+        ) => true,
+        Expr::Unary {
+            operator: UnaryOperator::Negative | UnaryOperator::Positive,
+            expr,
+        } => matches!(expr.as_ref(), Expr::Literal(Literal::Numeric(_))),
+        _ => false,
+    }
+}
+
 fn split_column_between(
     conjunct: &crate::translate::semantic::hir::Expr,
     conjuncts: &mut Vec<crate::translate::semantic::hir::Expr>,
@@ -1608,13 +1751,16 @@ pub enum HashJoinType {
     LeftOuter,
     /// Like LeftOuter, plus unmatched probe rows get NULLs for the build side.
     FullOuter,
+    /// Only the build rows no probe row matched appear: the probe side is
+    /// the inner table of a NOT EXISTS.
+    LeftAnti,
 }
 
 impl HashJoinType {
     /// Whether the build rows that no probe row matched are emitted after
     /// the probe loop.
     pub fn keeps_unmatched_build_rows(self) -> bool {
-        matches!(self, Self::LeftOuter | Self::FullOuter)
+        matches!(self, Self::LeftOuter | Self::FullOuter | Self::LeftAnti)
     }
 }
 
@@ -1955,6 +2101,104 @@ mod tests {
             ctes: Vec::new(),
             schema_programs: Vec::new(),
             cdc: None,
+        }
+    }
+
+    #[test]
+    fn hir_implied_in_terms_need_every_or_branch_to_fix_the_column() {
+        use crate::translate::semantic::hir::Expr;
+        let table = hir::SourceId::new(1);
+        let comparison = hir::ComparisonSemantics {
+            components: vec![hir::ComparisonComponent {
+                affinity: Affinity::Integer,
+                collation: None,
+                array: false,
+            }],
+        };
+        let equals = |column: usize, value: Expr| Expr::Binary {
+            lhs: Box::new(Expr::column(table, column)),
+            operator: ast::Operator::Equals,
+            rhs: Box::new(value),
+            array_concat: false,
+            custom: None,
+            comparison: Some(comparison.clone()),
+        };
+        let or = |lhs: Expr, rhs: Expr| Expr::Binary {
+            lhs: Box::new(lhs),
+            operator: ast::Operator::Or,
+            rhs: Box::new(rhs),
+            array_concat: false,
+            custom: None,
+            comparison: None,
+        };
+        let negative = |value: i64| Expr::Unary {
+            operator: ast::UnaryOperator::Negative,
+            expr: Box::new(hir_integer(value)),
+        };
+        let in_values = |term: &Expr| match term {
+            Expr::InList {
+                lhs,
+                negated: false,
+                values,
+                comparisons,
+            } => {
+                assert_eq!(values.len(), comparisons.len());
+                let Expr::Column(column) = lhs.as_ref() else {
+                    panic!("an implied IN tests a column");
+                };
+                (column.column, values.clone())
+            }
+            _ => panic!("an implied term is an IN list"),
+        };
+
+        // Both columns are fixed by every branch; only the one that starts
+        // an index gets a filter. A repeated value is listed once.
+        let expression = or(
+            or(
+                hir_and(equals(0, hir_integer(1)), equals(1, hir_integer(10))),
+                hir_and(equals(1, hir_integer(20)), equals(0, negative(2))),
+            ),
+            hir_and(equals(0, hir_integer(1)), equals(1, hir_integer(30))),
+        );
+        let starts_index = |_: hir::SourceId, columns: &[usize]| {
+            assert_eq!(columns, [0, 1]);
+            Some(1)
+        };
+        let same_values = |values: &[Expr], expected: &[Expr]| {
+            values.len() == expected.len()
+                && values
+                    .iter()
+                    .zip(expected)
+                    .all(|(value, expected)| value.equivalent(expected))
+        };
+        let implied = hir_implied_in_terms(&expression, &starts_index);
+        assert_eq!(implied.len(), 1);
+        let (column, values) = in_values(&implied[0]);
+        assert_eq!(column, 1);
+        assert!(same_values(
+            &values,
+            &[hir_integer(10), hir_integer(20), hir_integer(30)]
+        ));
+
+        // With one fixed column, no index is needed.
+        let expression = or(equals(0, hir_integer(1)), equals(0, negative(2)));
+        let implied = hir_implied_in_terms(&expression, &|_, _| None);
+        assert_eq!(implied.len(), 1);
+        let (column, values) = in_values(&implied[0]);
+        assert_eq!(column, 0);
+        assert!(same_values(&values, &[hir_integer(1), negative(2)]));
+
+        // A branch that does not fix the column, or fixes it to a non-literal
+        // or to NULL, gives no filter.
+        for expression in [
+            or(equals(0, hir_integer(1)), equals(1, hir_integer(2))),
+            or(equals(0, hir_integer(1)), equals(0, Expr::column(table, 2))),
+            or(
+                equals(0, hir_integer(1)),
+                equals(0, Expr::Literal(ast::Literal::Null)),
+            ),
+        ] {
+            assert!(hir_implied_in_terms(&expression, &|_, _| None).is_empty());
         }
     }
 

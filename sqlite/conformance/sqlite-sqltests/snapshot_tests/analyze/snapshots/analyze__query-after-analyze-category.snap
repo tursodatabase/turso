@@ -18,7 +18,7 @@ addr  opcode          p1  p2  p3  p4                p5  comment
    1  OpenRead         0   2   0  k(6,B,B,B,B,B,B)   0  table=products, root=2, iDb=0
    2  Rewind           0  11   0                     0  Rewind table products
    3    Column         0   3   1                     0  r[1]=products.category
-   4    Ne             1   2  10                     0  if r[1]!=r[2] goto 10
+   4    Ne             1   2  10  Binary             0  if r[1]!=r[2] goto 10
    5    RowId          0   3   0                     0  r[3]=products.rowid
    6    Column         0   2   4                     0  r[4]=products.name
    7    Column         0   4   5                     0  r[5]=products.price

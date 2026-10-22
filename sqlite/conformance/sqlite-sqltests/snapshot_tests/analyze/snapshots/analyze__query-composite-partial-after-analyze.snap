@@ -21,7 +21,7 @@ addr  opcode           p1  p2  p3  p4              p5  comment
    1  OpenRead          0   2   0  k(5,B,B,B,B,B)   0  table=orders, root=2, iDb=0
    2  Rewind            0  11   0                   0  Rewind table orders
    3    Column          0   1   1                   0  r[1]=orders.customer_id
-   4    Ne              1   2  10                   0  if r[1]!=r[2] goto 10
+   4    Ne              1   2  10  Binary           0  if r[1]!=r[2] goto 10
    5    RowId           0   3   0                   0  r[3]=orders.rowid
    6    Column          0   2   4                   0  r[4]=orders.order_date
    7    Column          0   4   5                   0  r[5]=orders.total_amount

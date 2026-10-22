@@ -1097,6 +1097,10 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
             Some(grouping) => move_having_terms_to_where(grouping, &outputs, filter),
             None => filter,
         };
+        let mut from = from;
+        if let (Some(from), Some(filter)) = (from.as_mut(), filter.as_ref()) {
+            self.reduce_full_joins_rejected_by_where(from, filter);
+        }
         let aggregate_query = grouping.is_some() || self.aggregate_count(functions.block()) > 0;
         // An aggregate that appears only in ORDER BY is a misuse when the
         // block reads a FROM clause; without one it makes the block an
@@ -1234,7 +1238,7 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
         scope: &Scope,
         outputs: &[Output],
         block: QueryBlockId,
-        functions: &mut QueryFunctionState,
+        functions: &mut QueryFunctionState<'ast>,
         policies: ExprPolicies,
     ) -> Result<super::hir::Grouping> {
         let mut grouping_scope = scope.clone().without_outer_resolution();
@@ -1296,12 +1300,21 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
         block: QueryBlockId,
         aggregate_query: bool,
         dropped: DroppedOrderTerms,
-        functions: &mut QueryFunctionState,
+        functions: &mut QueryFunctionState<'ast>,
         policies: ExprPolicies,
     ) -> Result<Vec<OrderTerm>> {
         let mut order_scope = scope.clone();
         order_scope.set_outputs(outputs);
         let mut terms: Vec<OrderTerm> = Vec::with_capacity(syntax.len());
+        // SQLite drops the terms after the rowid before it looks for
+        // aggregates, so an aggregate in one is not a misuse, unless a
+        // dropped term has a window function: SQLite moves window functions
+        // out of the ORDER BY first, and that pass finds the aggregates.
+        let cut_terms_have_window = matches!(dropped, DroppedOrderTerms::AfterRowidOf(_))
+            && syntax
+                .iter()
+                .skip(1)
+                .any(|term| window_calls(&term.expr).is_ok_and(|calls| !calls.is_empty()));
         for syntax in syntax {
             let checks = match dropped {
                 DroppedOrderTerms::None => RowValueChecks::All,
@@ -1336,7 +1349,7 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
                             &order_scope,
                             policies
                                 .with_row_value_checks(checks)
-                                .order_by(aggregate_query),
+                                .order_by(aggregate_query || !cut_terms_have_window),
                             functions,
                         )
                         .and_then(|resolved| {
@@ -1605,7 +1618,7 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
         block: QueryBlockId,
         columns: &'ast [ast::ResultColumn],
         scope: &Scope,
-        functions: &mut QueryFunctionState,
+        functions: &mut QueryFunctionState<'ast>,
         expected_outputs: Option<&[Option<Arc<TypeDef>>]>,
         policies: ExprPolicies,
     ) -> Result<Vec<Output>> {
@@ -1675,7 +1688,7 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
         index: usize,
         column: &'ast ast::ResultColumn,
         scope: &Scope,
-        functions: &mut QueryFunctionState,
+        functions: &mut QueryFunctionState<'ast>,
         expected_type: Option<Arc<TypeDef>>,
         policies: ExprPolicies,
     ) -> Result<Output> {
@@ -3543,10 +3556,7 @@ mod tests {
              JOIN (SELECT outer_items.id AS captured) AS derived",
         )
         .expect_err("FROM subquery cannot capture the outer source scope");
-        assert_eq!(
-            error.to_string(),
-            "Parse error: no such column: outer_items.id"
-        );
+        assert_eq!(error.to_string(), "Parse error: no such table: outer_items");
     }
 
     #[test]
@@ -5257,10 +5267,7 @@ mod tests {
              ) FROM items AS outer_items",
         )
         .expect_err("CTE cannot see sibling sources from its owning SELECT");
-        assert_eq!(
-            error.to_string(),
-            "Parse error: no such column: local_items.id"
-        );
+        assert_eq!(error.to_string(), "Parse error: no such table: local_items");
     }
 
     #[test]
@@ -5730,11 +5737,18 @@ mod tests {
             };
             assert_eq!(table.value().get_name(), "json_each");
             assert_eq!(argument_predicates.len(), 1);
+            // SQLite wraps every table-function argument in unary plus so the
+            // argument keeps its written value and the planner never folds the
+            // predicate into an index lookup on the outer table.
             assert!(matches!(
                 &argument_predicates[0],
                 Expr::Binary { lhs, operator: ast::Operator::Equals, rhs, comparison: Some(_), .. }
                     if matches!(lhs.as_ref(), Expr::Column(reference) if reference.source == function_id)
-                        && matches!(rhs.as_ref(), Expr::Column(reference) if reference.source == items_id && reference.column == 1)
+                        && matches!(
+                            rhs.as_ref(),
+                            Expr::Unary { operator: ast::UnaryOperator::Positive, expr }
+                                if matches!(expr.as_ref(), Expr::Column(reference) if reference.source == items_id && reference.column == 1)
+                        )
             ));
         }
     }
@@ -5742,6 +5756,9 @@ mod tests {
     #[cfg(feature = "json")]
     #[test]
     fn null_table_function_arguments_become_hidden_column_is_null_predicates() {
+        // SQLite passes a NULL table-function argument as `hidden = +NULL`, so
+        // the argument reaches the virtual table as a NULL constraint value
+        // instead of becoming an IS NULL filter on the hidden column.
         let schema = schema_with_items();
         let document = analyze_sql_with_schema(&schema, "SELECT value FROM json_each(NULL)")
             .expect("NULL table-function argument binds");
@@ -5763,8 +5780,13 @@ mod tests {
         };
         assert!(matches!(
             argument_predicates.as_slice(),
-            [Expr::IsNull(expression)]
-                if matches!(expression.as_ref(), Expr::Column(reference) if reference.source == source)
+            [Expr::Binary { lhs, operator: ast::Operator::Equals, rhs, comparison: Some(_), .. }]
+                if matches!(lhs.as_ref(), Expr::Column(reference) if reference.source == source)
+                    && matches!(
+                        rhs.as_ref(),
+                        Expr::Unary { operator: ast::UnaryOperator::Positive, expr }
+                            if matches!(expr.as_ref(), Expr::Literal(ast::Literal::Null))
+                    )
         ));
 
         let query = root.query;
@@ -5790,14 +5812,14 @@ mod tests {
         else {
             panic!("table function uses virtual-table access");
         };
-        assert!(operation.arguments.is_empty());
+        assert!(matches!(
+            operation.arguments.as_slice(),
+            [Expr::Unary { operator: ast::UnaryOperator::Positive, expr }]
+                if matches!(expr.as_ref(), Expr::Literal(ast::Literal::Null))
+        ));
         assert!(matches!(
             block.predicates.as_slice(),
-            [crate::translate::plan::HirWhereTerm {
-                expr: Expr::IsNull(_),
-                consumed: false,
-                ..
-            }]
+            [crate::translate::plan::HirWhereTerm { consumed: true, .. }]
         ));
     }
 
@@ -5835,7 +5857,8 @@ mod tests {
         };
         assert!(matches!(
             operation.arguments.as_slice(),
-            [Expr::Literal(ast::Literal::String(_))]
+            [Expr::Unary { operator: ast::UnaryOperator::Positive, expr }]
+                if matches!(expr.as_ref(), Expr::Literal(ast::Literal::String(_)))
         ));
         assert!(block.predicates[0].consumed);
     }
@@ -5886,7 +5909,11 @@ mod tests {
         assert!(matches!(
             argument_predicates.as_slice(),
             [Expr::Binary { rhs, comparison: Some(_), .. }]
-                if matches!(rhs.as_ref(), Expr::Column(reference) if reference.source == outer_source && reference.column == 1)
+                if matches!(
+                    rhs.as_ref(),
+                    Expr::Unary { operator: ast::UnaryOperator::Positive, expr }
+                        if matches!(expr.as_ref(), Expr::Column(reference) if reference.source == outer_source && reference.column == 1)
+                )
         ));
     }
 
@@ -7573,7 +7600,7 @@ mod tests {
         for (sql, expected) in [
             (
                 "INSERT INTO guarded(id) VALUES ((SELECT guarded.id))",
-                "Parse error: no such column: guarded.id",
+                "Parse error: no such table: guarded",
             ),
             (
                 "INSERT INTO guarded(id) VALUES ((SELECT 1, 2))",
@@ -9853,11 +9880,12 @@ mod tests {
 
     #[test]
     fn scalar_function_modifiers_follow_production_normalization() {
+        // SQLite drops DISTINCT on a scalar call and accepts `random(*)`, but
+        // rejects FILTER on a non-aggregate function.
         let schema = schema_with_items();
         let document = analyze_sql_with_schema(
             &schema,
             "SELECT length(DISTINCT value), \
-                    length(value) FILTER (WHERE id > 0), \
                     random(*) \
              FROM items",
         )
@@ -9871,7 +9899,7 @@ mod tests {
         };
         let block = &document.query(root.query).expect("query exists").blocks[0];
         assert_eq!(block.aggregate_count, 0);
-        for output in &block.outputs[..2] {
+        for output in &block.outputs[..1] {
             let Expr::Function(call) = &output.expr else {
                 panic!("scalar output becomes a function call");
             };
@@ -9886,7 +9914,7 @@ mod tests {
                 } if values.len() == 1 && order_by.is_empty()
             ));
         }
-        let Expr::Function(random) = &block.outputs[2].expr else {
+        let Expr::Function(random) = &block.outputs[1].expr else {
             panic!("random(*) becomes a function call");
         };
         assert!(matches!(
@@ -9909,31 +9937,23 @@ mod tests {
                 "Parse error: wrong number of arguments to function length()",
             ),
             (
+                "SELECT length(value) FILTER (WHERE id > 0) FROM items",
+                "Parse error: FILTER may not be used with non-aggregate length()",
+            ),
+            // The filter expression binds before the call it belongs to, so
+            // an unknown column in it reports first.
+            (
                 "SELECT length(value) FILTER (WHERE missing > 0) FROM items",
                 "Parse error: no such column: missing",
+            ),
+            (
+                "SELECT length(value) FILTER (WHERE sum(id) > 0) FROM items",
+                "Parse error: FILTER may not be used with non-aggregate length()",
             ),
         ] {
             let error = analyze_sql_with_schema(&schema, sql).expect_err("invalid call fails");
             assert_eq!(error.to_string(), expected, "{sql}");
         }
-
-        let document = analyze_sql_with_schema(
-            &schema,
-            "SELECT length(value) FILTER (WHERE sum(id) > 0) FROM items",
-        )
-        .expect("ignored scalar filter still binds its expression");
-        document
-            .validate()
-            .expect("ignored scalar filter leaves a closed document");
-        let HirRoot::Query(root) = &document.root else {
-            panic!("SELECT produces query root");
-        };
-        let block = &document.query(root.query).expect("query exists").blocks[0];
-        assert_eq!(block.aggregate_count, 1);
-        assert!(matches!(
-            block.outputs[0].expr,
-            Expr::Function(ref call) if matches!(call.evaluation, FunctionEvaluation::Scalar)
-        ));
     }
 
     #[cfg(feature = "json")]
@@ -11364,21 +11384,33 @@ mod tests {
             .iter()
             .all(|trigger| trigger.database() == Some(DatabaseId::new(MAIN_DB_ID))));
 
-        let rowid = analyze_sql_with_schema(&schema, "UPDATE writable SET rowid = 9")
-            .expect("rowid-alias UPDATE binds matching triggers");
-        let HirRoot::Update(update) = &rowid.root else {
-            panic!("UPDATE produces UPDATE root");
-        };
-        let hir::UpdateTargetKind::BTree { triggers, .. } = &update.target_kind else {
-            panic!("catalog table UPDATE has B-tree metadata");
-        };
-        assert_eq!(
-            triggers
-                .iter()
-                .map(|trigger| trigger.value().name.as_str())
-                .collect::<Vec<_>>(),
-            ["update_id", "update_all"]
-        );
+        // SQLite matches UPDATE OF column lists against the SET names as
+        // written, so `SET rowid` does not fire a trigger on the alias column
+        // `id`, while `SET id` does.
+        for (sql, expected) in [
+            ("UPDATE writable SET rowid = 9", vec!["update_all"]),
+            (
+                "UPDATE writable SET id = 9",
+                vec!["update_id", "update_all"],
+            ),
+        ] {
+            let update = analyze_sql_with_schema(&schema, sql)
+                .expect("rowid-alias UPDATE binds matching triggers");
+            let HirRoot::Update(update) = &update.root else {
+                panic!("UPDATE produces UPDATE root");
+            };
+            let hir::UpdateTargetKind::BTree { triggers, .. } = &update.target_kind else {
+                panic!("catalog table UPDATE has B-tree metadata");
+            };
+            assert_eq!(
+                triggers
+                    .iter()
+                    .map(|trigger| trigger.value().name.as_str())
+                    .collect::<Vec<_>>(),
+                expected,
+                "{sql}"
+            );
+        }
     }
 
     #[test]

@@ -20,7 +20,7 @@ addr  opcode         p1  p2  p3  p4                  p5  comment
    3    Column        0   1   1                       0  r[1]=sqlite_schema.name
    4    Ne            1   2  14  NoCase               0  if r[1]!=r[2] goto 14
    5    Column        0   0   3                       0  r[3]=sqlite_schema.type
-   6    Ne            3   4  14                       0  if r[3]!=r[4] goto 14
+   6    Ne            3   4  14  Binary               0  if r[3]!=r[4] goto 14
    7    RowId         0   5   0                       0  r[5]=sqlite_schema.rowid
    8    IsNull        5  15   0                       0  if (r[5]==NULL) goto 15
    9    ColumnRange   0   0   6  4                    0  r[6..9]=sqlite_schema.type..rootpage

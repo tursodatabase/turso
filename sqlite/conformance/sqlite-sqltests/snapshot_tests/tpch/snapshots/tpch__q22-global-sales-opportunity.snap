@@ -49,8 +49,9 @@ info:
 ---
 QUERY PLAN
 |--SCAN custsale
+|  |--HASH JOIN orders
+|  |--SCAN customer
 |  |--SCALAR SUBQUERY 1
 |  |  `--SCAN customer
-|  |--HASH JOIN orders
-|  `--SCAN customer
+|  `--SCALAR SUBQUERY 2
 `--USE SORTER FOR GROUP BY

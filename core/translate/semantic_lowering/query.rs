@@ -51,7 +51,8 @@ use crate::{
     vdbe::{
         affinity::Affinity,
         builder::{
-            CursorType, MaterializedCteInfo, ProgramBuilder, SourceBinding, SubqueryBinding,
+            CteFillSubroutine, CursorType, MaterializedCteInfo, ProgramBuilder, SourceBinding,
+            SubqueryBinding,
         },
         insn::{to_u32, HashDistinctData, InsertFlags, Insn, SorterOpenData},
         BranchOffset, CursorID,
@@ -3136,6 +3137,8 @@ pub(super) struct PreparedHirMaterializedLoop<'a> {
     /// Backwards reads a stored CTE from its last row, for an outer ORDER BY
     /// in the opposite direction of the CTE's own order.
     direction: IterationDirection,
+    /// The subroutine that fills the table, when the fill runs in one.
+    fill_subroutine: Option<CteFillSubroutine>,
 }
 
 pub(super) struct PreparedHirVirtualLoop<'a> {
@@ -3359,6 +3362,9 @@ struct HirNullRegisters {
 /// RIGHT JOIN: matched rows come first, then the rest.
 struct HirRightOuterJoin {
     source: SourceId,
+    /// RIGHT, FULL, or an anti-join run as a hash join, whose matched build
+    /// rows are never emitted.
+    kind: hir::JoinKind,
     /// The source whose ON terms decide a match: `source` itself, or the
     /// probe table of an outer hash join built from `source`.
     owner: SourceId,
@@ -3416,7 +3422,10 @@ fn hash_outer_join(from: &hir::From, loops_plan: HirLoopsPlan<'_>) -> Option<Hir
             let kind = from.joins.iter().find(|join| join.right == probe)?.kind;
             let outer = match kind {
                 hir::JoinKind::Left => !loops_plan.inner_joins.contains(&probe),
-                hir::JoinKind::Full => true,
+                // A hash anti-join: the build rows the probe matches are
+                // remembered, and only the others come out, after the
+                // probe loop.
+                hir::JoinKind::Full | hir::JoinKind::Anti => true,
                 _ => false,
             };
             outer.then_some(HirHashOuterJoin {
@@ -4480,7 +4489,6 @@ fn emit_join_loops(
                 "HIR FROM clause contains an unsupported join".into(),
             ));
         }
-        check_hir_full_join_shape(document, from, &joins)?;
         joins
             .owners
             .retain(|(owner, _)| !loops_plan.inner_joins.contains(owner));
@@ -4574,6 +4582,13 @@ fn emit_join_loops(
         .loops
         .iter()
         .map(|planned_loop| {
+            // The probe of a hash anti-join runs as the join's unmatched
+            // pass, not as a nested anti-join loop.
+            if hash_outer.as_ref().is_some_and(|hash_outer| {
+                hash_outer.probe == planned_loop.source && hash_outer.kind == hir::JoinKind::Anti
+            }) {
+                return None;
+            }
             from.and_then(|from| {
                 from.joins.iter().find_map(|join| {
                     (join.right == planned_loop.source
@@ -4594,6 +4609,7 @@ fn emit_join_loops(
     }
 
     let nest = HirLoopNest {
+        plan,
         document,
         loops_plan,
         prepared_loops: &prepared_loops,
@@ -4639,6 +4655,7 @@ fn emit_join_loops(
 /// Everything needed to emit the nested loops of one block, or a suffix of
 /// them, followed by the block's row body.
 struct HirLoopNest<'n, 'a> {
+    plan: &'a HirPlan,
     document: &'n HirDocument,
     loops_plan: HirLoopsPlan<'n>,
     prepared_loops: &'n [PreparedHirLoop<'a>],
@@ -4821,6 +4838,21 @@ impl HirLoopNest<'_, '_> {
                 },
                 left_joins,
             )?;
+            // A build row of a hash anti-join that passes every check has a
+            // match: it is remembered, so that the pass after the loops
+            // skips it, and never emitted.
+            if let Some(right_outer) = self.right_outer.iter().find(|right_outer| {
+                right_outer.loop_index == loop_index && right_outer.kind == hir::JoinKind::Anti
+            }) {
+                program.add_comment(
+                    program.offset(),
+                    "hash anti-join: match found, remember the build row",
+                );
+                right_outer.emit_mark_matched(program, self.document)?;
+                program.emit_insn(Insn::Goto {
+                    target_pc: hir_loop.next,
+                });
+            }
             // A row of an anti-join loop that passes every check is a
             // match, so the rows before it are rejected.
             if self.semi_anti[loop_index] == Some(hir::JoinKind::Anti) {
@@ -5047,6 +5079,55 @@ impl HirLoopNest<'_, '_> {
                 program.emit_insn(Insn::NullRow { cursor_id: cursor });
             }
         }
+        // A B-tree table runs the read planned for its unmatched rows,
+        // which may seek an index, through new cursors.
+        let planned_read = match (&self.prepared_loops[right], right_outer.materialized) {
+            (PreparedHirLoop::BTree(_), None) => {
+                self.loops_plan.loops[right].unmatched_right_rows.as_deref()
+            }
+            _ => None,
+        };
+        // A recursive CTE's current row is the one right row: the body runs
+        // once for it, when no left row matched it.
+        if let (PreparedHirLoop::Registers(_), None) =
+            (&self.prepared_loops[right], right_outer.materialized)
+        {
+            let loop_start = program.allocate_label();
+            let next = program.allocate_label();
+            let exhausted = program.allocate_label();
+            program.preassign_label_to_next_insn(loop_start);
+            let hir_loop = HirBtreeLoop {
+                cursor: None,
+                loop_start,
+                next,
+                exhausted,
+                advance: HirLoopAdvance::None,
+                left_join: None,
+            };
+            self.emit_unmatched_right_row_body(program, right_outer, &hir_loop, None)?;
+            close_hir_btree_loop(program, &hir_loop, &[]);
+            restore_unmatched_pass_bindings(program, None, register_bindings, index_key_bindings);
+            return Ok(());
+        }
+        if let Some(planned_read) = planned_read {
+            let original = program.source_binding(right_outer.source).cloned();
+            let prepared = prepare_hir_loop_unexplained(program, self.plan, planned_read)?;
+            let hir_loop = start_hir_loop(program, self.document, &prepared, None)?;
+            self.emit_unmatched_right_row_body(program, right_outer, &hir_loop, None)?;
+            close_hir_btree_loop(program, &hir_loop, &[]);
+            if let PreparedHirLoop::BTree(prepared) = &prepared {
+                for (expression, _) in &prepared.index_keys {
+                    program.unbind_expression_register(expression);
+                }
+            }
+            restore_unmatched_pass_bindings(
+                program,
+                original.map(|original| (right_outer.source, original)),
+                register_bindings,
+                index_key_bindings,
+            );
+            return Ok(());
+        }
         // A materialized subquery is scanned again through its own cursor.
         // A table gets a new cursor, since its loop may have read an index.
         // A virtual table is opened again on its cursor, since the loop
@@ -5130,6 +5211,14 @@ impl HirLoopNest<'_, '_> {
         let done = program.allocate_label();
         let loop_start = program.allocate_label();
         let next = program.allocate_label();
+        let advance = if virtual_read.is_some() {
+            HirLoopAdvance::Virtual
+        } else {
+            HirLoopAdvance::Cursor {
+                direction: IterationDirection::Forwards,
+                fullscan: true,
+            }
+        };
         if let Some(operation) = virtual_read {
             // The arguments are evaluated here, after the left sources
             // became NULL rows: an argument that reads one is NULL now.
@@ -5160,14 +5249,68 @@ impl HirLoopNest<'_, '_> {
             });
         }
         program.preassign_label_to_next_insn(loop_start);
+        let hir_loop = HirBtreeLoop {
+            cursor: Some(scan),
+            loop_start,
+            next,
+            exhausted: done,
+            advance,
+            left_join: None,
+        };
+        self.emit_unmatched_right_row_body(program, right_outer, &hir_loop, hash_input)?;
+        close_hir_btree_loop(program, &hir_loop, &[]);
+        restore_unmatched_pass_bindings(
+            program,
+            original.map(|original| (right_outer.source, original)),
+            register_bindings,
+            index_key_bindings,
+        );
+        Ok(())
+    }
+
+    /// The body of the pass over a RIGHT or FULL join's unmatched rows, for
+    /// the right row `hir_loop` is positioned on: skip the row when the
+    /// matched set has it, check the WHERE terms, and run the loops after
+    /// the right source.
+    fn emit_unmatched_right_row_body(
+        &self,
+        program: &mut ProgramBuilder,
+        right_outer: &HirRightOuterJoin,
+        hir_loop: &HirBtreeLoop,
+        hash_input: Option<&PreparedHirHashLoop<'_>>,
+    ) -> Result<()> {
+        let right = right_outer.loop_index;
+        let next = hir_loop.next;
         match &right_outer.key {
             HirMatchedKey::Rowid => {
                 let unmatched = program.allocate_label();
                 let rowid = program.alloc_register();
-                program.emit_insn(Insn::RowId {
-                    cursor_id: scan,
-                    dest: rowid,
-                });
+                // A planned read may have positioned an index cursor: the
+                // source's rowid comes through its current binding. A
+                // register-backed row has the constant key it was marked by.
+                if self.loops_plan.loops[right].unmatched_right_rows.is_some() {
+                    super::expr::translate_expr(
+                        program,
+                        self.document,
+                        &hir::Expr::RowId(right_outer.source),
+                        rowid,
+                    )?;
+                } else if let Some(cursor) = hir_loop.cursor {
+                    program.emit_insn(Insn::RowId {
+                        cursor_id: cursor,
+                        dest: rowid,
+                    });
+                } else if let Some(register) = right_outer.matched_rowid {
+                    program.emit_insn(Insn::Copy {
+                        src_reg: register,
+                        dst_reg: rowid,
+                        extra_amount: 0,
+                    });
+                } else {
+                    return Err(LimboError::InternalError(
+                        "HIR RIGHT or FULL JOIN unmatched pass has no row key".into(),
+                    ));
+                }
                 program.emit_insn(Insn::NotExists {
                     cursor: right_outer.matched,
                     rowid_reg: rowid,
@@ -5215,6 +5358,18 @@ impl HirLoopNest<'_, '_> {
             .filter(|_| !later_right_outer);
         for index in later_on_terms.chain(where_terms) {
             let predicate = &self.loops_plan.predicates[index];
+            // A hash anti-join's own terms read its probe table, which is
+            // NULL here: they decided the matches, not the unmatched rows.
+            if right_outer.kind == hir::JoinKind::Anti {
+                let mut reads_probe = false;
+                self.document
+                    .visit_expr_sources(&predicate.expr, &mut |source| {
+                        reads_probe |= source == right_outer.owner;
+                    });
+                if reads_probe {
+                    continue;
+                }
+            }
             let ready_at = predicate_ready_loop(
                 program,
                 self.document,
@@ -5239,34 +5394,7 @@ impl HirLoopNest<'_, '_> {
             )?;
             program.preassign_label_to_next_insn(passed);
         }
-        self.emit_loops(program, right + 1, next, Some(right))?;
-        program.preassign_label_to_next_insn(next);
-        if virtual_read.is_some() {
-            program.emit_insn(Insn::VNext {
-                cursor_id: scan,
-                pc_if_next: loop_start,
-            });
-        } else {
-            program.emit_insn(Insn::Next {
-                cursor_id: scan,
-                is_index: program.cursor_is_index(scan),
-                pc_if_next: loop_start,
-                fullscan: true,
-            });
-        }
-        program.preassign_label_to_next_insn(done);
-        if let Some(original) = original {
-            program.bind_source(right_outer.source, original);
-        }
-        for (source, original) in register_bindings {
-            if let Some(original) = original {
-                program.bind_source(source, original);
-            }
-        }
-        for (expression, register) in index_key_bindings {
-            program.bind_expression_register(expression, register);
-        }
-        Ok(())
+        self.emit_loops(program, right + 1, next, Some(right))
     }
 }
 
@@ -5282,8 +5410,15 @@ fn prepare_hir_right_outer_joins(
     let mut right_outer = joins
         .right_outer
         .iter()
-        .map(|(source, _)| {
-            prepare_hir_right_outer_join(program, block_plan, prepared_loops, *source, hash_outer)
+        .map(|(source, kind)| {
+            prepare_hir_right_outer_join(
+                program,
+                block_plan,
+                prepared_loops,
+                *source,
+                *kind,
+                hash_outer,
+            )
         })
         .collect::<Result<Vec<_>>>()?;
     right_outer.sort_by_key(|right_outer| right_outer.loop_index);
@@ -5297,6 +5432,7 @@ fn prepare_hir_right_outer_join(
     block_plan: HirLoopsPlan<'_>,
     prepared_loops: &[PreparedHirLoop<'_>],
     source: SourceId,
+    kind: hir::JoinKind,
     hash_outer: Option<&HirHashOuterJoin>,
 ) -> Result<HirRightOuterJoin> {
     let loop_index = block_plan
@@ -5325,6 +5461,7 @@ fn prepare_hir_right_outer_join(
                 let (matched, key) = open_hir_primary_key_matched_set(program, &table)?;
                 return Ok(HirRightOuterJoin {
                     source,
+                    kind,
                     owner: source,
                     loop_index,
                     matched,
@@ -5338,6 +5475,17 @@ fn prepare_hir_right_outer_join(
             (table, None)
         }
         PreparedHirLoop::Virtual(prepared) => (hir_matched_rows_table(prepared.source), None),
+        // A recursive CTE's current row lives in registers: the one right
+        // row of each run of the loops, keyed by the constant 1.
+        PreparedHirLoop::Registers(prepared) => {
+            let one = program.alloc_register();
+            program.emit_insn(Insn::Integer {
+                value: 1,
+                dest: one,
+            });
+            matched_rowid = Some(one);
+            (hir_matched_rows_table(prepared.source), None)
+        }
         PreparedHirLoop::Materialized(prepared) => (prepared.table.clone(), Some(prepared.cursor)),
         PreparedHirLoop::Hash(prepared) => match &prepared.build_input {
             Some(input) => {
@@ -5348,7 +5496,6 @@ fn prepare_hir_right_outer_join(
         },
         PreparedHirLoop::IndexMethod(_)
         | PreparedHirLoop::OrUnion(_)
-        | PreparedHirLoop::Registers(_)
         | PreparedHirLoop::Coroutine(_) => {
             return Err(LimboError::InternalError(format!(
                 "HIR RIGHT or FULL JOIN source {source} has no rowids"
@@ -5382,6 +5529,7 @@ fn prepare_hir_right_outer_join(
         .filter(|probe_loop| *probe_loop > 0);
     Ok(HirRightOuterJoin {
         source,
+        kind,
         owner,
         loop_index,
         matched,
@@ -5542,6 +5690,28 @@ impl HirRightOuterJoin {
     }
 }
 
+/// After the pass over a RIGHT or FULL join's unmatched rows: the right
+/// source and the register-backed left sources read their main-loop rows
+/// again, and the expressions the left indexes supply come from them again.
+fn restore_unmatched_pass_bindings(
+    program: &mut ProgramBuilder,
+    right_source: Option<(SourceId, SourceBinding)>,
+    register_bindings: Vec<(SourceId, Option<SourceBinding>)>,
+    index_key_bindings: Vec<(&hir::Expr, usize)>,
+) {
+    if let Some((source, original)) = right_source {
+        program.bind_source(source, original);
+    }
+    for (source, original) in register_bindings {
+        if let Some(original) = original {
+            program.bind_source(source, original);
+        }
+    }
+    for (expression, register) in index_key_bindings {
+        program.bind_expression_register(expression, register);
+    }
+}
+
 fn supported_btree_from(
     document: &HirDocument,
     from: &hir::From,
@@ -5596,41 +5766,6 @@ fn supported_btree_from(
 
 /// A FULL join over a recursive reference has no unmatched-row pass: the
 /// recursive row is not stored anywhere the pass could read again.
-fn check_hir_full_join_shape(
-    document: &HirDocument,
-    from: &hir::From,
-    _joins: &HirOuterJoins,
-) -> Result<()> {
-    if !from
-        .joins
-        .iter()
-        .any(|join| join.kind == hir::JoinKind::Full)
-    {
-        return Ok(());
-    }
-    let mut sources = Vec::new();
-    collect_hir_from_sources(document, from, &mut sources);
-    if sources.iter().any(|source| {
-        document
-            .source(*source)
-            .is_some_and(|source| matches!(source.kind, hir::SourceKind::RecursiveInput(_)))
-    }) {
-        crate::bail_parse_error!("FULL OUTER JOIN with a recursive reference is not yet supported");
-    }
-    Ok(())
-}
-
-fn collect_hir_from_sources(document: &HirDocument, from: &hir::From, sources: &mut Vec<SourceId>) {
-    for source in std::iter::once(from.first).chain(from.joins.iter().map(|join| join.right)) {
-        sources.push(source);
-        if let Some(hir::SourceKind::FromGroup(group)) =
-            document.source(source).map(|source| &source.kind)
-        {
-            collect_hir_from_sources(document, &group.from, sources);
-        }
-    }
-}
-
 fn ordinary_btree_from(document: &HirDocument, from: &hir::From) -> bool {
     from.joins.iter().all(|join| {
         matches!(
@@ -5714,11 +5849,12 @@ fn prepare_hir_left_joins(
                 if let Some(table_cursor) = prepared.table_cursor() {
                     null_cursors.push(table_cursor);
                 }
-                // A register-backed row, of a recursive CTE's current row
-                // or of a coroutine's yielded row, is NULL-extended by
-                // reading a private copy that the NULL row clears.
+                // A coroutine's yielded row is NULL-extended by clearing
+                // its registers. A recursive CTE's current row is not: like
+                // SQLite, the unmatched row of a LEFT or FULL JOIN whose
+                // right side is the recursive reference still reads the
+                // current row.
                 let register_source = match prepared {
-                    PreparedHirLoop::Registers(registers) => Some((registers.source, false)),
                     PreparedHirLoop::Coroutine(coroutine) => Some((coroutine.source, true)),
                     _ => None,
                 };
@@ -5824,6 +5960,7 @@ fn materialize_hir_shared_ctes(
                     MaterializedCteInfo {
                         cursor_id: prepared.cursor,
                         table: prepared.table.clone(),
+                        fill_subroutine: prepared.fill_subroutine,
                     },
                 );
             }
@@ -5929,7 +6066,56 @@ fn emit_hir_loops_explain(
     for (source, detail) in builds {
         program.emit_source_explain(source, detail);
     }
+    // SQLite lists the pass over each RIGHT or FULL JOIN's unmatched rows
+    // after the loops, under a `RIGHT-JOIN` row.
+    for planned_loop in loops {
+        if !hir_loop_keeps_right_rows(document, from, planned_loop.source) {
+            continue;
+        }
+        let table = hir_eqp_table(document, planned_loop.source)?;
+        emit_explain!(program, true, EqpDetail::RightJoin { table });
+        let read = match (&planned_loop.unmatched_right_rows, &planned_loop.access) {
+            (Some(read), _) => hir_loop_explain(document, None, inner_joins, read)?,
+            (
+                None,
+                HirSourceAccess::Virtual(HirVirtualTableOperation {
+                    unmatched_right_rows: Some(read),
+                    ..
+                }),
+            ) => hir_loop_explain(
+                document,
+                None,
+                inner_joins,
+                &HirPlannedLoop {
+                    source: planned_loop.source,
+                    source_position: planned_loop.source_position,
+                    access: HirSourceAccess::Virtual((**read).clone()),
+                    estimate: None,
+                    unmatched_right_rows: None,
+                },
+            )?,
+            // A stored subquery or hash input is scanned again.
+            _ => hir_loop_explain(document, None, inner_joins, planned_loop)?,
+        };
+        emit_explain!(program, false, read);
+        program.pop_current_parent_explain();
+    }
     Ok(())
+}
+
+/// Whether `source` is the right side of a RIGHT or FULL JOIN of `from`,
+/// directly or inside a parenthesized join.
+fn hir_loop_keeps_right_rows(document: &HirDocument, from: &hir::From, source: SourceId) -> bool {
+    from.joins.iter().any(|join| {
+        if join.right == source {
+            return matches!(join.kind, hir::JoinKind::Right | hir::JoinKind::Full);
+        }
+        matches!(
+            document.source(join.right).map(|right| &right.kind),
+            Some(hir::SourceKind::FromGroup(group))
+                if hir_loop_keeps_right_rows(document, &group.from, source)
+        )
+    })
 }
 
 /// The EXPLAIN QUERY PLAN row of one planned loop. A DML target loop has
@@ -6091,6 +6277,7 @@ pub(super) fn hir_loop_explain(
                             table_lookup: *table_lookup,
                         },
                         estimate: planned_loop.estimate,
+                        unmatched_right_rows: None,
                     },
                 );
             }
@@ -7524,6 +7711,14 @@ fn prepare_hir_shared_cte_loop<'a>(
         let cursor = if filled_here {
             shared.cursor_id
         } else {
+            // The reader that filled the table may sit in a loop that never
+            // runs, so fill it from here too before reading.
+            if let Some(fill_subroutine) = shared.fill_subroutine {
+                program.emit_insn(Insn::Gosub {
+                    target_pc: fill_subroutine.label,
+                    return_reg: fill_subroutine.return_reg,
+                });
+            }
             let cursor = program.alloc_cursor_id(CursorType::BTreeTable(shared.table.clone()));
             program.emit_insn(Insn::OpenDup {
                 new_cursor_id: cursor,
@@ -7543,6 +7738,7 @@ fn prepare_hir_shared_cte_loop<'a>(
             cursor,
             table: shared.table,
             direction: IterationDirection::Forwards,
+            fill_subroutine: None,
         });
     }
 
@@ -7552,6 +7748,7 @@ fn prepare_hir_shared_cte_loop<'a>(
         MaterializedCteInfo {
             cursor_id: prepared.cursor,
             table: prepared.table.clone(),
+            fill_subroutine: prepared.fill_subroutine,
         },
     );
     Ok(prepared)
@@ -7613,6 +7810,7 @@ fn prepare_hir_recursive_cte_loop<'a>(
             cursor,
             table: shared.table,
             direction: IterationDirection::Forwards,
+            fill_subroutine: None,
         });
     }
 
@@ -7653,6 +7851,7 @@ fn prepare_hir_recursive_cte_loop<'a>(
             MaterializedCteInfo {
                 cursor_id: cursor,
                 table: table.clone(),
+                fill_subroutine: None,
             },
         );
     }
@@ -7661,6 +7860,7 @@ fn prepare_hir_recursive_cte_loop<'a>(
         cursor,
         table,
         direction: IterationDirection::Forwards,
+        fill_subroutine: None,
     })
 }
 
@@ -7828,12 +8028,32 @@ fn prepare_hir_materialized_loop<'a>(
 
     let table = hir_materialized_table(source);
     let cursor = program.alloc_cursor_id(CursorType::BTreeTable(table.clone()));
-    let materialized = program.allocate_label();
-    if !correlated {
-        program.emit_insn(Insn::Once {
-            target_pc_when_reentered: materialized,
+    // An uncorrelated table is filled once for the whole statement, in a
+    // subroutine. A correlated parent loop can reach this point more than
+    // once, and the other readers of a shared CTE call the subroutine too,
+    // so the table is filled even when this reader's loop never ran.
+    let fill_subroutine = if correlated {
+        None
+    } else {
+        let fill_subroutine = CteFillSubroutine {
+            label: program.allocate_label(),
+            return_reg: program.alloc_register(),
+        };
+        let fill_end = program.allocate_label();
+        let after_subroutine = program.allocate_label();
+        program.emit_insn(Insn::Gosub {
+            target_pc: fill_subroutine.label,
+            return_reg: fill_subroutine.return_reg,
         });
-    }
+        program.emit_insn(Insn::Goto {
+            target_pc: after_subroutine,
+        });
+        program.preassign_label_to_next_insn(fill_subroutine.label);
+        program.emit_insn(Insn::Once {
+            target_pc_when_reentered: fill_end,
+        });
+        Some((fill_subroutine, fill_end, after_subroutine))
+    };
     program.emit_insn(Insn::OpenEphemeral {
         cursor_id: cursor,
         is_table: true,
@@ -7848,7 +8068,14 @@ fn prepare_hir_materialized_loop<'a>(
             rowid_mode: EphemeralRowidMode::Auto,
         },
     )?;
-    program.preassign_label_to_next_insn(materialized);
+    if let Some((fill_subroutine, fill_end, after_subroutine)) = fill_subroutine {
+        program.preassign_label_to_next_insn(fill_end);
+        program.emit_insn(Insn::Return {
+            return_reg: fill_subroutine.return_reg,
+            can_fallthrough: false,
+        });
+        program.preassign_label_to_next_insn(after_subroutine);
+    }
     program.bind_source(
         source_id,
         SourceBinding::BTree {
@@ -7861,6 +8088,7 @@ fn prepare_hir_materialized_loop<'a>(
         cursor,
         table,
         direction: IterationDirection::Forwards,
+        fill_subroutine: fill_subroutine.map(|(fill_subroutine, _, _)| fill_subroutine),
     })
 }
 
@@ -12762,9 +12990,14 @@ pub(super) mod tests {
         let HirSourceAccess::Virtual(operation) = &planned_loop.access else {
             panic!("table function uses virtual-table access");
         };
+        // Table-function arguments keep SQLite's unary plus wrapper so the
+        // virtual table receives the argument as written.
         assert!(matches!(
             operation.arguments.as_slice(),
-            [Expr::Literal(Literal::String(_))]
+            [Expr::Unary {
+                operator: turso_parser::ast::UnaryOperator::Positive,
+                expr
+            }] if matches!(expr.as_ref(), Expr::Literal(Literal::String(_)))
         ));
         let mut program = program();
 

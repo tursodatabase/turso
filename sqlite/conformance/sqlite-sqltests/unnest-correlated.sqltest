@@ -1696,7 +1696,7 @@ test correlated-comparison-uses-joins {
 }
 expect {
     1|0|0|SCAN outer_rows AS o
-    2|0|0|SEARCH i USING COVERING INDEX ephemeral_inner_rows_t3 (key1=?)
+    2|0|0|SEARCH i USING COVERING INDEX ephemeral_inner_rows_s1 (key1=?)
     1|0|0|HASH JOIN inner_rows AS i
     2|0|0|SCAN outer_rows AS o
 }

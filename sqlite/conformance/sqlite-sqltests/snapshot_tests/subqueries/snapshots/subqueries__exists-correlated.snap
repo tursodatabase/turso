@@ -35,7 +35,7 @@ addr  opcode             p1  p2  p3  p4            p5  comment
    8      DeferredSeek    1   2   0                 0
    9      Column          2   3   2                 0  r[2]=orders.total_amount
   10      RealAffinity    2   0   0                 0
-  11      Le              2   3  16                 0  if r[2]<=r[3] goto 16
+  11      Le              2   3  16  Binary         0  if r[2]<=r[3] goto 16
   12      RowId           0   4   0                 0  r[4]=customers.rowid
   13      Column          0   1   5                 0  r[5]=customers.name
   14      ResultRow       4   2   0                 0  output=r[4..5]

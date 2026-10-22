@@ -719,11 +719,17 @@ impl Scope {
     ) -> Result<QualifiedLookup> {
         let mut found: Option<ResolvedScopeExpr> = None;
         let mut table_seen = false;
+        // Like SQLite's `lookupName`: of the copies of a USING column that
+        // the name matches, a LEFT or inner join reads the left one, a
+        // RIGHT JOIN the right one, and a FULL JOIN the coalesced value.
         let mut add =
             |candidate: ResolvedScopeExpr, merged: Option<hir::MergedColumnValue>| -> Result<()> {
                 match (merged, &found) {
                     (Some(hir::MergedColumnValue::Right), _) | (_, None) => found = Some(candidate),
-                    (Some(_), Some(_)) => {}
+                    (Some(hir::MergedColumnValue::Coalesce), Some(_)) => {
+                        found = Some(self.merged_star_column_named(column, &written())?);
+                    }
+                    (Some(hir::MergedColumnValue::Left), Some(_)) => {}
                     (None, Some(_)) => {
                         crate::bail_parse_error!("ambiguous column name: {}", written());
                     }
@@ -1323,7 +1329,9 @@ impl Scope {
         self.outputs.iter().find(|output| output.id == id)
     }
 
-    fn has_qualifier(&self, qualifier: &str) -> bool {
+    /// Whether a source of this scope or an enclosing one is named
+    /// `qualifier` (normalized), whatever this scope may resolve.
+    pub(crate) fn has_qualifier(&self, qualifier: &str) -> bool {
         self.sources
             .iter()
             .any(|source| source.qualifier == qualifier)

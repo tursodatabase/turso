@@ -25,7 +25,7 @@ addr  opcode            p1  p2  p3  p4                         p5  comment
    3  OpenRead           1   5   0  k(6,B,B,B,B,B,B)            0  table=orders, root=5, iDb=0
    4  Rewind             1  13   0                              0  Rewind table orders
    5    Column           1   5  15                              0  r[15]=orders.created_at
-   6    Ge              15  16  12                              0  if r[15]>=r[16] goto 12
+   6    Ge              15  16  12  Binary                      0  if r[15]>=r[16] goto 12
    7    RowId            1  17   0                              0  r[17]=orders.rowid
    8    ColumnRange      1   1  18  4                           0  r[18..21]=orders.user_id..total_price
    9    RealAffinity    21   0   0                              0

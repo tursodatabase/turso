@@ -113,7 +113,7 @@ addr  opcode          p1   p2   p3  p4                                       p5 
   96    Column         5    2   38                                            0  r[38]=t2.z
   97    Integer        0   39    0                                            0  r[39]=0
   98    Integer        1   33    0                                            0  r[33]=1
-  99    Gt            38   39  101                                            0  if r[38]>r[39] goto 101
+  99    Gt            38   39  101  Binary                                    0  if r[38]>r[39] goto 101
  100    ZeroOrNull    38   33   39                                            0  ((r[38]=NULL)|(r[39]=NULL)) ? r[33]=NULL : r[33]=0
  101    Column         5    1   40                                            0  r[40]=t2.y
  102    Function       0   40   34  lower                                     0  r[34]=func(r[40])

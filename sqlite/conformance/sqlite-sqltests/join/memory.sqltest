@@ -83,7 +83,7 @@ test expression-index-hash-build-reads-source-table {
     WHERE orders.customer_id = 100;
 }
 expect pattern {
-    (?s)MATERIALIZE hash build input for expression_build_orders AS orders.*HASH JOIN expression_build_inventory AS inventory.*SEARCH orders USING INTEGER PRIMARY KEY
+    (?s)MATERIALIZE hash build input for expression_build_orders AS orders.*SEARCH orders USING INDEX expression_build_order_key.*HASH JOIN expression_build_inventory AS inventory
 }
 
 @setup indexed-hash-build-rows
@@ -1687,7 +1687,7 @@ test hash-build-row-limit-counts-prefix-rows {
       ON build_rows.key = probe_rows.key;
 }
 expect pattern {
-    "detail":"SEARCH probe_rows USING COVERING INDEX ephemeral_prefix_row_limit_probe_t3
+    "detail":"SEARCH probe_rows USING COVERING INDEX ephemeral_prefix_row_limit_probe_s2
 }
 
 @skip-if sqlite "Turso uses its own join cost model"

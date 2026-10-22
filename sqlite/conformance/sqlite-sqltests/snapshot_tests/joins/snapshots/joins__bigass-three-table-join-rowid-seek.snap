@@ -26,5 +26,5 @@ QUERY PLAN
 |--HASH JOIN customer_support_tickets AS t
 |--SEARCH oi USING INDEX idx_order_items_order_id (order_id=?)
 |--SCAN orders AS o
-|--USE SORTER FOR GROUP BY
-`--USE HASH TABLE FOR count(DISTINCT)
+|--USE HASH TABLE FOR count(DISTINCT)
+`--USE SORTER FOR GROUP BY

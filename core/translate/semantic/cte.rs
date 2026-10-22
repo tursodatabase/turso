@@ -496,6 +496,14 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
         Ok(())
     }
 
+    /// Whether a CTE named `name` (normalized) is defined in a WITH clause
+    /// the current query can read.
+    pub(super) fn cte_is_defined(&self, name: &str) -> bool {
+        self.cte_scopes
+            .iter()
+            .any(|scope| scope.entries.iter().any(|entry| entry.name == name))
+    }
+
     pub(super) fn resolve_cte(
         &mut self,
         name: &str,

@@ -7386,7 +7386,19 @@ mod tests {
                 _ => None,
             })
             .collect::<Vec<_>>();
-        assert_eq!(comparisons, vec![("ne", 2, 5), ("eq", 3, 6)]);
+        // Every component is compared with Ne so a mismatch skips the value,
+        // and a NULL on either side only makes the result NULL once all other
+        // components are equal, like SQLite's row-value IN.
+        assert_eq!(comparisons, vec![("ne", 2, 5), ("ne", 3, 6)]);
+        let null_checks = program
+            .insns
+            .iter()
+            .filter_map(|(instruction, _)| match instruction {
+                Insn::IsNull { reg, .. } => Some(*reg),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(null_checks, vec![2, 5, 3, 6]);
     }
 
     #[test]

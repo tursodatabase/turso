@@ -24,60 +24,65 @@ info:
 ---
 QUERY PLAN
 |--SCAN filtered_products AS fp
-|  |--LIST SUBQUERY 1
-|  |  `--SCAN categories
-|  `--SEARCH p USING INDEX idx_products_category (category_id=?)
+|  |--SEARCH p USING INDEX idx_products_category (category_id=?)
+|  `--LIST SUBQUERY 1
+|     `--SCAN categories
 `--USE SORTER FOR ORDER BY
 
 BYTECODE
 addr  opcode             p1  p2  p3  p4              p5  comment
-   0  Init                0  47   0                   0  Start at 47
-   1  InitCoroutine       1  29   2                   0
-   2  Once               12   0   0                   0  goto 12
-   3  OpenEphemeral       0   0   0                   0  cursor=0 is_table=false
-   4  OpenRead            1   3   0  k(3,B,B,B)       0  table=categories, root=3, iDb=0
-   5  Rewind              1  12   0                   0  Rewind table categories
-   6    Column            1   2   3                   0  r[3]=categories.parent_id
-   7    NotNull           3  11   0                   0  r[3]!=NULL -> goto 11
-   8    RowId             1   2   0                   0  r[2]=categories.rowid
-   9    MakeRecord        2   1   4                   0  r[4]=mkrec(r[2..2]); for ephemeral_index_where_sub_t2
-  10    IdxInsert         0   4   0                   8  key=r[4]
-  11  Next                1   6   0                   1
-  12  OpenRead            2   2   0  k(5,B,B,B,B,B)   0  table=products, root=2, iDb=0
-  13  OpenRead            3   8   0  k(2,B)           0  index=idx_products_category, root=8, iDb=0
-  14  NullRow             0   0   0                   0  Set cursor 0 to a (pseudo) NULL row
-  15  Rewind              0  28   0                   0  Rewind  ephemeral(ephemeral_index_where_sub_t2)
-  16    Column            0   0   8                   0  r[8]=ephemeral(ephemeral_index_where_sub_t2).id
-  17    IsNull            8  27   0                   0  if (r[8]==NULL) goto 27
-  18    SeekGE            3  27   8                   0  key=[8..8]
-  19      IdxGT           3  27   8                   0  key=[8..8]
-  20      DeferredSeek    3   2   0                   0
-  21      IdxRowId        3   5   0                   0  r[5]=cursor 3 for index idx_products_category.rowid
-  22      Column          2   1   6                   0  r[6]=products.name
-  23      Column          2   3   7                   0  r[7]=products.price
-  24      RealAffinity    7   0   0                   0
-  25      Yield           1   0   0                   0
-  26    Next              3  19   0                   0
-  27  Next                0  16   0                   0
-  28  EndCoroutine        1   0   0                   0
-  29  SorterOpen          4   1   0  k(1,-Binary)     0  cursor=4
-  30  InitCoroutine       1   0   2                   0
-  31    Yield             1  39   0                   0
-  32    Copy              7  13   0                   0  r[13]=r[7]
-  33    Le               13  14  38  Binary           0  if r[13]<=r[14] goto 38
-  34    Copy              7  15   0                   0  r[15]=r[7]
-  35    Copy              6  16   0                   0  r[16]=r[6]
-  36    MakeRecord       15   2  11                   0  r[11]=mkrec(r[15..16])
-  37    SorterInsert      4  11   0  0                0  key=r[11]
-  38  Goto                0  31   0                   0
-  39  OpenPseudo          5  11   2                   0  2 columns in r[11]
-  40  SorterSort          4  46   0                   0
-  41    SorterData        4  11   5                   0  r[11]=data
-  42    Column            5   1   9                   0  r[9]=pseudo.column 1
-  43    Column            5   0  10                   0  r[10]=pseudo.column 0
-  44    ResultRow         9   2   0                   0  output=r[9..10]
-  45  SorterNext          4  41   0                   0
-  46  Halt                0   0   0                   0
-  47  Transaction         0   1  11                   0  iDb=0 tx_mode=Read
-  48  Integer           100  14   0                   0  r[14]=100
-  49  Goto                0   1   0                   0
+   0  Init                0  52   0                   0  Start at 52
+   1  SorterOpen          0   1   0  k(1,-B)          0  cursor=0
+   2  InitCoroutine       4  35   3                   0
+   3  OpenRead            1   8   0  k(2,B)           0  index=idx_products_category, root=8, iDb=0
+   4  OpenRead            2   2   0  k(5,B,B,B,B,B)   0  table=products, root=2, iDb=0
+   5  Once               19   0   0                   0  goto 19
+   6  OpenEphemeral       3   0   0                   0  cursor=3 is_table=false
+   7  Once                9   0   0                   0  goto 9
+   8  OpenRead            4   3   0  k(3,B,B,B)       0  table=categories, root=3, iDb=0
+   9  Rewind              4  19   0                   0  Rewind table categories
+  10    Column            4   2   9                   0  r[9]=categories.parent_id
+  11    Integer           1   8   0                   0  r[8]=1
+  12    IsNull            9  14   0                   0  if (r[9]==NULL) goto 14
+  13    Integer           0   8   0                   0  r[8]=0
+  14    IfNot             8  18   1                   0  if !r[8] goto 18
+  15    RowId             4  10   0                   0  r[10]=categories.rowid
+  16    MakeRecord       10   1  11                   0  r[11]=mkrec(r[10..10]); for ephemeral_index_hir_sub_2
+  17    IdxInsert         3  11   0                   8  key=r[11]
+  18  Next                4  10   0                   1
+  19  NullRow             3   0   0                   0  Set cursor 3 to a (pseudo) NULL row
+  20  Rewind              3  34   0                   0  Rewind index ephemeral(ephemeral_index_hir_sub_2)
+  21    Column            3   0  12                   0  r[12]=ephemeral(ephemeral_index_hir_sub_2).id
+  22    IsNull           12  33   0                   0  if (r[12]==NULL) goto 33
+  23    SeekGE            1  33  12                   0  key=[12..12]
+  24      IdxGT           1  33  12                   0  key=[12..12]
+  25      DeferredSeek    1   2   0                   0
+  26      IdxRowId        1  13   0                   0  r[13]=cursor 1.rowid
+  27      Column          2   1  14                   0  r[14]=products.name
+  28      Column          2   3  15                   0  r[15]=products.price
+  29      RealAffinity   15   0   0                   0
+  30      Copy           13   5   2                   0  r[5]=r[13]
+  31      Yield           4   0   0                   0
+  32    Next              1  24   0                   0
+  33  Next                3  21   0                   0
+  34  EndCoroutine        4   0   0                   0
+  35  InitCoroutine       4   0   3                   0
+  36    Yield             4  44   0                   0
+  37    Copy              7  16   0                   0  r[16]=r[7]
+  38    Le               16  17  43  Binary           0  if r[16]<=r[17] goto 43
+  39    Copy              6   3   0                   0  r[3]=r[6]
+  40    Copy              7   2   0                   0  r[2]=r[7]
+  41    MakeRecord        2   2   1                   0  r[1]=mkrec(r[2..3])
+  42    SorterInsert      0   1   0  0                0  key=r[1]
+  43  Goto                0  36   0                   0
+  44  OpenPseudo          5   1   2                   0  2 columns in r[1]
+  45  SorterSort          0  51   0                   0
+  46    SorterData        0   1   5                   0  r[1]=data
+  47    Column            5   1  20                   0  r[20]=pseudo.column 1
+  48    Column            5   0  21                   0  r[21]=pseudo.column 0
+  49    ResultRow        20   2   0                   0  output=r[20..21]
+  50  SorterNext          0  46   0                   0
+  51  Halt                0   0   0                   0
+  52  Transaction         0   1  11                   0  iDb=0 tx_mode=Read
+  53  Integer           100  17   0                   0  r[17]=100
+  54  Goto                0   1   0                   0

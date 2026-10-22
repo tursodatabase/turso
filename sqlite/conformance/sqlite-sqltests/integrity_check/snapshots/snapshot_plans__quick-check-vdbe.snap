@@ -40,7 +40,7 @@ addr  opcode          p1  p2  p3  p4                                   p5  comme
   23    Column         3   2  29                                        0  r[29]=t.c
   24    Integer        0  30   0                                        0  r[30]=0
   25    Integer        1  21   0                                        0  r[21]=1
-  26    Gt            29  30  28                                        0  if r[29]>r[30] goto 28
+  26    Gt            29  30  28  Binary                                0  if r[29]>r[30] goto 28
   27    ZeroOrNull    29  21  30                                        0  ((r[29]=NULL)|(r[30]=NULL)) ? r[21]=NULL : r[21]=0
   28    Column         3   3  31                                        0  r[31]=t.d
   29    Integer        1  22   0                                        0  r[22]=1

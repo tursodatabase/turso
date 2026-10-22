@@ -60,7 +60,7 @@ test temporary-subquery-index-gives-the-order {
 expect {
     1|0|0|SCAN t1
     2|0|0|SEARCH s USING INDEX ephemeral_subquery_s2 (x>?)
-    6|2|0|SCAN t2
+    8|2|0|SCAN t2
     1|2
     1|2
     1|2
@@ -81,7 +81,7 @@ test temporary-subquery-index-read-backwards-gives-the-opposite-order {
 expect {
     1|0|0|SCAN t1
     2|0|0|SEARCH s USING INDEX ephemeral_subquery_s2 (x>?)
-    6|2|0|SCAN t2
+    8|2|0|SCAN t2
     1|11
     1|11
     1|11
@@ -98,8 +98,8 @@ test temporary-subquery-index-does-not-order-a-later-column {
 expect {
     1|0|0|SCAN t1
     2|0|0|SEARCH s USING INDEX ephemeral_subquery_s2 (x>?)
-    7|2|0|SCAN t2
-    32|0|0|USE SORTER FOR ORDER BY
+    9|2|0|SCAN t2
+    35|0|0|USE SORTER FOR ORDER BY
 }
 
 @setup subquery_index
@@ -110,8 +110,8 @@ test temporary-cte-index-gives-the-order {
 expect {
     1|0|0|SCAN t1
     2|0|0|SEARCH c USING INDEX ephemeral_subquery_s3 (x>?)
-    8|2|0|SCAN t2
-    16|2|0|SCAN c
+    12|2|0|SCAN t2
+    21|2|0|SCAN c
     1|2
     1|2
     1|2

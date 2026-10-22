@@ -19,111 +19,125 @@ info:
 ---
 QUERY PLAN
 |--SCAN grouped_values AS gv USING INDEX idx_grouped_values_grp
-|--SEARCH scalar_subquery_t2 USING INDEX ephemeral_subquery_t2 (correlation_key_0=?) LEFT-JOIN
+|--SEARCH scalar_subquery_1 USING INDEX ephemeral_subquery_s2 (correlation_key_0=?) LEFT-JOIN
 |  `--SCAN grouped_values AS gv2 USING INDEX idx_grouped_values_grp
 `--USE SORTER FOR ORDER BY
 
 BYTECODE
-addr  opcode          p1   p2  p3  p4                   p5  comment
-   0  Init             0  100   0                        0  Start at 100
-   1  Once            42    0   0                        0  goto 42
-   2  OpenEphemeral    0    0   0                        0  cursor=0 is_table=false
-   3  Null             0    8   0                        0  r[8]=NULL
-   4  Integer          0    5   0                        0  r[5]=0; clear group by abort flag
-   5  Null             0    6   0                        0  r[6]=NULL; initialize group by comparison registers to NULL
-   6  Gosub           12   39   0                        0  ; go to clear accumulator subroutine
-   7  OpenRead         1    2   0  k(3,B,B)              0  table=grouped_values, root=2, iDb=0
-   8  OpenRead         2    3   0  k(2,B)                0  index=idx_grouped_values_grp, root=3, iDb=0
-   9  Rewind           2   24   0                        0  Rewind index idx_grouped_values_grp
-  10    DeferredSeek   2    1   0                        0
-  11    Column         2    0  10                        0  r[10]=idx_grouped_values_grp.grp
-  12    Column         1    1  11                        0  r[11]=grouped_values.val
-  13    Compare        6   10   1  k(1, Binary)          0  r[6..6]==r[10..10]
-  14    Jump          15   19  15                        0  ; start new group if comparison is not equal
-  15    Gosub          3   28   0                        0  ; check if ended group had data, and output if so
-  16    Move          10    6   1                        0  r[6..6]=r[10..10]
-  17    IfPos          5   42   0                        0  r[5]>0 -> r[5]-=0, goto 42; check abort flag
-  18    Gosub         12   39   0                        0  ; goto clear accumulator subroutine
-  19    AggStep        0   11   8  max(Binary)           0  accum=r[8] step(r[11])
-  20    If             4   22   0                        0  if r[4] goto 22; don't emit group columns if continuing existing group
-  21    Column         2    0   7                        0  r[7]=idx_grouped_values_grp.grp
-  22    Integer        1    4   0                        0  r[4]=1; indicate data in accumulator
-  23  Next             2   10   0                        1
-  24  Gosub            3   28   0                        0  ; emit row for final group
-  25  Goto             0   42   0                        0  ; group by finished
-  26  Integer          1    5   0                        0  r[5]=1
-  27  Return           3    0   0                        0
-  28  IfPos            4   30   0                        0  r[4]>0 -> r[4]-=0, goto 30; output group by row subroutine start
-  29  Return           3    0   0                        0
-  30  AggFinal         0    8   0  max                   0  accum=r[8]
-  31  Copy             8    1   0                        0  r[1]=r[8]
-  32  Copy             7    2   0                        0  r[2]=r[7]
-  33  Copy             2   14   0                        0  r[14]=r[2]
-  34  Copy             1   15   0                        0  r[15]=r[1]
-  35  Sequence         0   16   0                        0
-  36  MakeRecord      14    3  13                        0  r[13]=mkrec(r[14..16]); for ephemeral_subquery_t2
-  37  IdxInsert        0   13   0                        8  key=r[13]
-  38  Return           3    0   0                        0
-  39  Null             0    7   8                        0  r[7..8]=NULL; clear accumulator subroutine start
-  40  Integer          0    4   0                        0  r[4]=0
-  41  Return          12    0   0                        0
-  42  SorterOpen       3    2   0  k(2,-Binary,Binary)   0  cursor=3
-  43  Null             0   26   0                        0  r[26]=NULL
-  44  Integer          0   22   0                        0  r[22]=0; clear group by abort flag
-  45  Null             0   23   0                        0  r[23]=NULL; initialize group by comparison registers to NULL
-  46  Gosub           31   90   0                        0  ; go to clear accumulator subroutine
-  47  OpenRead         4    2   0  k(3,B,B)              0  table=grouped_values, root=2, iDb=0
-  48  OpenRead         5    3   0  k(2,B)                0  index=idx_grouped_values_grp, root=3, iDb=0
-  49  Rewind           5   76   0                        0  Rewind index idx_grouped_values_grp
-  50    DeferredSeek   5    4   0                        0
-  51    Integer        0   32   0                        0  r[32]=0
-  52    Column         5    0  33                        0  r[33]=idx_grouped_values_grp.grp
-  53    IsNull        33   72   0                        0  if (r[33]==NULL) goto 72
-  54    SeekGE         0   72  33                        0  key=[33..33]
-  55      IdxGT        0   72  33                        0  key=[33..33]
-  56      Integer      1   32   0                        0  r[32]=1
-  57      Column       5    0  28                        0  r[28]=idx_grouped_values_grp.grp
-  58      Column       0    1  29                        0  r[29]=ephemeral(ephemeral_subquery_t2).MAX(gv2.val)
-  59      Column       4    1  30                        0  r[30]=grouped_values.val
-  60      Compare     23   28   1  k(1, Binary)          0  r[23..23]==r[28..28]
-  61      Jump        62   66  62                        0  ; start new group if comparison is not equal
-  62      Gosub       20   80   0                        0  ; check if ended group had data, and output if so
-  63      Move        28   23   1                        0  r[23..23]=r[28..28]
-  64      IfPos       22   93   0                        0  r[22]>0 -> r[22]-=0, goto 93; check abort flag
-  65      Gosub       31   90   0                        0  ; goto clear accumulator subroutine
-  66      AggStep      0   30  26  sum                   0  accum=r[26] step(r[30])
-  67      If          21   70   0                        0  if r[21] goto 70; don't emit group columns if continuing existing group
-  68      Column       5    0  24                        0  r[24]=idx_grouped_values_grp.grp
-  69      Column       0    1  25                        0  r[25]=ephemeral(ephemeral_subquery_t2).MAX(gv2.val)
-  70      Integer      1   21   0                        0  r[21]=1; indicate data in accumulator
-  71    Next           0   55   0                        0
-  72    IfPos         32   75   0                        0  r[32]>0 -> r[32]-=0, goto 75
-  73    NullRow        0    0   0                        0  Set cursor 0 to a (pseudo) NULL row
-  74    Goto           0   56   0                        0
-  75  Next             5   50   0                        1
-  76  Gosub           20   80   0                        0  ; emit row for final group
-  77  Goto             0   93   0                        0  ; group by finished
-  78  Integer          1   22   0                        0  r[22]=1
-  79  Return          20    0   0                        0
-  80  IfPos           21   82   0                        0  r[21]>0 -> r[21]-=0, goto 82; output group by row subroutine start
-  81  Return          20    0   0                        0
-  82  AggFinal         0   26   0  sum                   0  accum=r[26]
-  83  Copy            25   34   0                        0  r[34]=r[25]
-  84  Sequence         3   35   0                        0
-  85  Copy            24   36   0                        0  r[36]=r[24]
-  86  Copy            26   37   0                        0  r[37]=r[26]
-  87  MakeRecord      34    4  19                        0  r[19]=mkrec(r[34..37])
-  88  SorterInsert     3   19   0  0                     0  key=r[19]
-  89  Return          20    0   0                        0
-  90  Null             0   24  26                        0  r[24..26]=NULL; clear accumulator subroutine start
-  91  Integer          0   21   0                        0  r[21]=0
-  92  Return          31    0   0                        0
-  93  OpenPseudo       6   19   4                        0  4 columns in r[19]
-  94  SorterSort       3   99   0                        0
-  95    SorterData     3   19   6                        0  r[19]=data
-  96    ColumnRange    6    2  17  2                     0  r[17..18]=pseudo.column 2..column 3
-  97    ResultRow     17    2   0                        0  output=r[17..18]
-  98  SorterNext       3   95   0                        0
-  99  Halt             0    0   0                        0
- 100  Transaction      0    1   2                        0  iDb=0 tx_mode=Read
- 101  Goto             0    1   0                        0
+addr  opcode           p1   p2  p3  p4                 p5  comment
+   0  Init              0  114   0                      0  Start at 114
+   1  SorterOpen        0    1   0  k(1,-B)             0  cursor=0
+   2  Null              0    5   0                      0  r[5]=NULL
+   3  Integer           0   16   0                      0  r[16]=0
+   4  Null              0   17   0                      0  r[17]=NULL
+   5  Gosub            15  104   0                      0
+   6  OpenRead          1    3   0  k(2,B)              0  index=idx_grouped_values_grp, root=3, iDb=0
+   7  OpenRead          2    2   0  k(3,B,B)            0  table=grouped_values, root=2, iDb=0
+   8  Gosub            19   10   0                      0
+   9  Goto              0   55   0                      0
+  10  Once             54    0   0                      0  goto 54
+  11  OpenEphemeral     3    1   0                      0  cursor=3 is_table=true
+  12  Null              0   20   0                      0  r[20]=NULL
+  13  Integer           0   28   0                      0  r[28]=0
+  14  Null              0   29   0                      0  r[29]=NULL
+  15  Gosub            27   51   0                      0
+  16  OpenRead          4    3   0  k(2,B)              0  index=idx_grouped_values_grp, root=3, iDb=0
+  17  OpenRead          5    2   0  k(3,B,B)            0  table=grouped_values, root=2, iDb=0
+  18  Rewind            4   40   0                      0  Rewind index idx_grouped_values_grp
+  19    DeferredSeek    4    5   0                      0
+  20    Column          4    0  30                      0  r[30]=idx_grouped_values_grp.grp
+  21    Column          5    1  23                      0  r[23]=grouped_values.val
+  22    Compare        29   30   1  k(1, Binary)        0  r[29..29]==r[30..30]
+  23    Jump           24   27  24                      0
+  24    Gosub          26   42   0                      0
+  25    Move           30   29   1                      0  r[29..29]=r[30..30]
+  26    Gosub          27   51   0                      0
+  27    Copy           23   31   0                      0  r[31]=r[23]
+  28    AggStep         0   31  20  max(Binary)         0  accum=r[20] step(r[31])
+  29    AggValue        0   20  32  max                 0  accum=r[20] dest=r[32]
+  30    If             28   32   0                      0  if r[28] goto 32
+  31    Goto            0   36   0                      0
+  32    IsNull         21   35   0                      0  if (r[21]==NULL) goto 35
+  33    Eq             21   32  38  Binary              0  if r[21]==r[32] goto 38
+  34    Goto            0   36   0                      0
+  35    IsNull         32   38   0                      0  if (r[32]==NULL) goto 38
+  36    Copy           32   21   0                      0  r[21]=r[32]
+  37    Copy           23   25   0                      0  r[25]=r[23]
+  38    Integer         1   28   0                      0  r[28]=1
+  39  Next              4   19   0                      1
+  40  Gosub            26   42   0                      0
+  41  Goto              0   54   0                      0
+  42  IfPos            28   44   0                      0  r[28]>0 -> r[28]-=0, goto 44
+  43  Return           26    0   0                      0
+  44  AggFinal          0   20   0  max                 0  accum=r[20]
+  45  Copy             20   33   0                      0  r[33]=r[20]
+  46  Copy             29   34   0                      0  r[34]=r[29]
+  47  MakeRecord       33    2  35                      0  r[35]=mkrec(r[33..34]); for scalar_subquery_1
+  48  NewRowid          3   36   0                      0  r[36]=rowid
+  49  Insert            3   35  36  scalar_subquery_1   4  intkey=r[36] data=r[35]
+  50  Return           26    0   0                      0
+  51  Null              0   20   0                      0  r[20]=NULL
+  52  Integer           0   28   0                      0  r[28]=0
+  53  Return           27    0   0                      0
+  54  Return           19    0   0                      0
+  55  Rewind            1   93   0                      0  Rewind index idx_grouped_values_grp
+  56    DeferredSeek    1    2   0                      0
+  57    Integer         0   37   0                      0  r[37]=0
+  58    Once           68    0   0                      0  goto 68
+  59    OpenAutoindex   6    0   0                      0  cursor=6
+  60    Rewind          3   68   0                      0  Rewind table ephemeral(scalar_subquery_1)
+  61      Column        3    1  38                      0  r[38]=ephemeral(scalar_subquery_1).correlation_key_0
+  62      Column        3    0  39                      0  r[39]=ephemeral(scalar_subquery_1).MAX(gv2.val)
+  63      RowId         3   40   0                      0  r[40]=ephemeral(scalar_subquery_1).rowid
+  64      MakeRecord   38    3  41                      0  r[41]=mkrec(r[38..40]); for ephemeral_subquery_s2
+  65      FilterAdd     6   38   1                      0  bloom_filter_add(r[38..39])
+  66      IdxInsert     6   41  38                      0  key=r[41]
+  67    Next            3   61   0                      0
+  68    Column          1    0  42                      0  r[42]=idx_grouped_values_grp.grp
+  69    IsNull         42   89   0                      0  if (r[42]==NULL) goto 89
+  70    Filter          6   89  42                      1  if !bloom_filter(r[42..43]) goto 89
+  71    SeekGE          6   89  42                      0  key=[42..42]
+  72      IdxGT         6   89  42                      0  key=[42..42]
+  73      Integer       1   37   0                      0  r[37]=1
+  74      Column        1    0  18                      0  r[18]=idx_grouped_values_grp.grp
+  75      Column        2    1   7                      0  r[7]=grouped_values.val
+  76      Column        6    1  10                      0  r[10]=ephemeral(ephemeral_subquery_s2).MAX(gv2.val)
+  77      Compare      17   18   1  k(1, Binary)        0  r[17..17]==r[18..18]
+  78      Jump         79   82  79                      0
+  79      Gosub        14   95   0                      0
+  80      Move         18   17   1                      0  r[17..17]=r[18..18]
+  81      Gosub        15  104   0                      0
+  82      Copy          7   43   0                      0  r[43]=r[7]
+  83      AggStep       0   43   5  sum                 0  accum=r[5] step(r[43])
+  84      If           16   87   0                      0  if r[16] goto 87
+  85      Copy          7    9   0                      0  r[9]=r[7]
+  86      Copy         10   12   0                      0  r[12]=r[10]
+  87      Integer       1   16   0                      0  r[16]=1
+  88    Next            6   72   0                      0
+  89    IfPos          37   92   0                      0  r[37]>0 -> r[37]-=0, goto 92
+  90    NullRow         6    0   0                      0  Set cursor 6 to a (pseudo) NULL row
+  91    Goto            0   73   0                      0
+  92  Next              1   56   0                      1
+  93  Gosub            14   95   0                      0
+  94  Goto              0  107   0                      0
+  95  IfPos            16   97   0                      0  r[16]>0 -> r[16]-=0, goto 97
+  96  Return           14    0   0                      0
+  97  AggFinal          0    5   0  sum                 0  accum=r[5]
+  98  Copy             17    3   0                      0  r[3]=r[17]
+  99  Copy              5    4   0                      0  r[4]=r[5]
+ 100  Copy             12    2   0                      0  r[2]=r[12]
+ 101  MakeRecord        2    3   1                      0  r[1]=mkrec(r[2..4])
+ 102  SorterInsert      0    1   0  0                   0  key=r[1]
+ 103  Return           14    0   0                      0
+ 104  Null              0    5   0                      0  r[5]=NULL
+ 105  Integer           0   16   0                      0  r[16]=0
+ 106  Return           15    0   0                      0
+ 107  OpenPseudo        7    1   3                      0  3 columns in r[1]
+ 108  SorterSort        0  113   0                      0
+ 109    SorterData      0    1   7                      0  r[1]=data
+ 110    ColumnRange     7    1  46  2                   0  r[46..47]=pseudo.column 1..column 2
+ 111    ResultRow      46    2   0                      0  output=r[46..47]
+ 112  SorterNext        0  109   0                      0
+ 113  Halt              0    0   0                      0
+ 114  Transaction       0    1   2                      0  iDb=0 tx_mode=Read
+ 115  Goto              0    1   0                      0

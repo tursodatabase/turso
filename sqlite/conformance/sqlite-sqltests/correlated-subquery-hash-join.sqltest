@@ -243,8 +243,8 @@ test correlated-subquery-materialized-hash-build-reads-the-outer-row-uses-no-has
 }
 expect {
     1|0|0|SCAN o
-    4|0|0|CORRELATED SCALAR SUBQUERY 1
-    7|4|0|SCAN (subquery-0)
-    9|7|0|SEARCH q USING INDEX q_x (x=?)
-    10|7|0|SEARCH p USING COVERING INDEX ephemeral_p_t3 (y=?)
+    5|0|0|CORRELATED SCALAR SUBQUERY 1
+    8|5|0|SCAN (subquery-0)
+    12|8|0|SEARCH q USING INDEX q_x (x=?)
+    13|8|0|SEARCH p USING COVERING INDEX ephemeral_p_s1 (y=?)
 }

@@ -874,6 +874,54 @@ pub(super) fn choose_in_seek_access_method<E>(
 }
 
 #[allow(clippy::too_many_arguments)]
+/// The best access method of one HIR B-tree table read once, after the
+/// loops of `lhs_mask`, with no order to satisfy: the read of a RIGHT or
+/// FULL JOIN's unmatched rows. `source` carries no join, so an INDEXED BY
+/// expression index is read like for any table. No automatic index is
+/// built for a read that runs once; an IN seek is still considered.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn choose_hir_single_read_access_method(
+    source: &HirPlannedSource,
+    definition: &hir::Source,
+    constraints: &TableConstraints<hir::Expr>,
+    lhs_mask: &TableMask,
+    source_position: usize,
+    schema: &Schema,
+    base_row_count: RowCountEstimate,
+    params: &CostModelParams,
+) -> Result<AccessMethod> {
+    let source = HirAccessSource::new(source, definition);
+    let mut best = choose_btree_access_method(
+        &source,
+        constraints,
+        lhs_mask,
+        source_position,
+        None::<&OrderTarget<hir::SourceId, &hir::Expr>>,
+        schema,
+        &schema.analyze_stats,
+        1.0,
+        base_row_count,
+        params,
+    )?;
+    let mut best_cost = best.cost;
+    let has_rowid = source.table().btree().is_some_and(|btree| btree.has_rowid);
+    if source.allows_alternative_access() && has_rowid {
+        if let Some(in_seek) = choose_in_seek_access_method(
+            &source,
+            constraints,
+            lhs_mask,
+            1.0,
+            base_row_count,
+            params,
+            best_cost,
+        )? {
+            replace_if_cheaper(&mut best, &mut best_cost, in_seek, &[], 1.0, params);
+        }
+    }
+    Ok(best)
+}
+
+#[allow(clippy::too_many_arguments)]
 pub(super) fn choose_single_btree_access_method<E, I, O>(
     source: &impl BtreeAccessSource<I, O>,
     constraints: &TableConstraints<E>,

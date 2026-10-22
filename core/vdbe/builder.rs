@@ -398,6 +398,18 @@ pub struct MaterializedCteInfo {
     pub cursor_id: CursorID,
     /// The table definition, needed for allocating dup cursors with the same CursorType.
     pub table: Arc<BTreeTable>,
+    /// The subroutine that fills the table, when the fill runs in one. A
+    /// later reader calls it before opening its own cursor, so the table is
+    /// filled even when the first reader's loop never ran.
+    pub fill_subroutine: Option<CteFillSubroutine>,
+}
+
+/// The subroutine that fills a shared CTE's table: `Gosub` to `label` with
+/// `return_reg` fills the table the first time and returns at once after.
+#[derive(Debug, Clone, Copy)]
+pub struct CteFillSubroutine {
+    pub label: BranchOffset,
+    pub return_reg: usize,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]

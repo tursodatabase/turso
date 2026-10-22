@@ -448,6 +448,12 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
                             let right = resolve_source_column(definition, &name)?;
                             let left =
                                 scope.resolve_using_left(&name, natural, has_right_or_full_join)?;
+                            // The columns compare as `left = right` written
+                            // in an ON clause would: a table column without
+                            // a declared collation decides the comparison
+                            // as BINARY, like any column decides it.
+                            let right = self.using_operand(right, &scope)?;
+                            let left = self.using_operand(left, &scope)?;
                             let value = merged_column_value(kind);
                             let mut column = build_using_column(name, left.clone(), right, value)?;
                             if value == hir::MergedColumnValue::Coalesce {
@@ -560,15 +566,31 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
         }
 
         let policy = context.expr_policies().select();
-        for (syntax_join, join) in syntax_joins.iter().zip(&mut joins) {
-            if let Some(ast::JoinConstraint::On(expression)) = &syntax_join.constraint {
-                join.constraint = hir::JoinConstraint::On(self.analyze_source_scalar_expr(
-                    expression,
-                    &scope,
-                    policy,
-                    context.query_parent(),
-                )?);
+        for (index, syntax_join) in syntax_joins.iter().enumerate() {
+            let Some(ast::JoinConstraint::On(expression)) = &syntax_join.constraint else {
+                continue;
+            };
+            let constraint = self.analyze_source_scalar_expr(
+                expression,
+                &scope,
+                policy,
+                context.query_parent(),
+            )?;
+            // An ON clause may read any table of the FROM list, but a
+            // LATERAL subquery to its right runs after it and is not visible.
+            let later_laterals: Vec<hir::SourceId> = joins[index + 1..]
+                .iter()
+                .map(|join| join.right)
+                .filter(|right| lateral_sources.contains(right))
+                .collect();
+            if let Some(read) = self.expr_reads_any_source(&constraint, &later_laterals) {
+                let read = self.source(read).expect("FROM source exists");
+                crate::bail_parse_error!(
+                    "no such table: {}",
+                    read.alias.as_deref().unwrap_or(&read.name)
+                );
             }
+            joins[index].constraint = hir::JoinConstraint::On(constraint);
         }
 
         Ok((
@@ -988,6 +1010,77 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
         Ok(())
     }
 
+    /// Like SQLite, a FULL JOIN whose WHERE clause rejects the NULL row of
+    /// one side keeps only the other side's unmatched rows: it runs as a
+    /// RIGHT JOIN when a term rejects the right side's NULL row, as a LEFT
+    /// JOIN when one rejects the left side's, and as an inner join when
+    /// terms reject both. A merged USING column keeps its coalesced value,
+    /// which equals the kept side's value on every row left.
+    pub(super) fn reduce_full_joins_rejected_by_where(
+        &self,
+        from: &mut hir::From,
+        filter: &hir::Expr,
+    ) {
+        let mut terms = Vec::new();
+        where_conjuncts(filter, &mut terms);
+        let rejects = |sources: &[hir::SourceId]| {
+            sources.iter().any(|source| {
+                terms
+                    .iter()
+                    .any(|term| crate::translate::semantic_to_plan::rejects_null_row(term, *source))
+            })
+        };
+        let mut left = Vec::new();
+        self.collect_from_item_sources(from.first, &mut left);
+        for join in &mut from.joins {
+            let mut right = Vec::new();
+            self.collect_from_item_sources(join.right, &mut right);
+            if join.kind == hir::JoinKind::Full {
+                join.kind = match (rejects(&left), rejects(&right)) {
+                    (true, true) => hir::JoinKind::Inner,
+                    (true, false) => hir::JoinKind::Left,
+                    (false, true) => hir::JoinKind::Right,
+                    (false, false) => hir::JoinKind::Full,
+                };
+                if let hir::JoinConstraint::Using(columns) | hir::JoinConstraint::Natural(columns) =
+                    &mut join.constraint
+                {
+                    for column in columns {
+                        column.value = merged_column_value(join.kind);
+                    }
+                }
+            }
+            left.append(&mut right);
+        }
+    }
+
+    /// `source` and, for a parenthesized join, every source inside it.
+    fn collect_from_item_sources(&self, source: hir::SourceId, sources: &mut Vec<hir::SourceId>) {
+        sources.push(source);
+        if let Some(hir::SourceKind::FromGroup(group)) =
+            self.source(source).map(|source| &source.kind)
+        {
+            for inner in std::iter::once(group.from.first)
+                .chain(group.from.joins.iter().map(|join| join.right))
+            {
+                self.collect_from_item_sources(inner, sources);
+            }
+        }
+    }
+
+    /// A USING operand with the collation its table column supplies, as a
+    /// column reference written in an expression has.
+    fn using_operand(
+        &self,
+        operand: ResolvedScopeExpr,
+        scope: &Scope,
+    ) -> Result<ResolvedScopeExpr> {
+        match operand.expr {
+            hir::Expr::Column(_) => self.resolve_atomic_expr(operand.expr, scope),
+            _ => Ok(operand),
+        }
+    }
+
     fn analyze_source_scalar_expr(
         &mut self,
         syntax: &'ast ast::Expr,
@@ -1163,6 +1256,41 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
     }
 
     /// The first of `candidates` that `query` or a query nested in it reads.
+    /// The first of `candidates` that `expression` reads, directly or
+    /// through a subquery written in it.
+    fn expr_reads_any_source(
+        &self,
+        expression: &hir::Expr,
+        candidates: &[hir::SourceId],
+    ) -> Option<hir::SourceId> {
+        if candidates.is_empty() {
+            return None;
+        }
+        let mut found = None;
+        expression.for_each(&mut |expression| {
+            if found.is_some() {
+                return;
+            }
+            found = match expression {
+                hir::Expr::Column(reference) if candidates.contains(&reference.source) => {
+                    Some(reference.source)
+                }
+                hir::Expr::RowId(source) if candidates.contains(source) => Some(*source),
+                hir::Expr::Subquery(subquery) => {
+                    let query = match subquery {
+                        hir::SubqueryExpr::Scalar { query, .. }
+                        | hir::SubqueryExpr::Row { query }
+                        | hir::SubqueryExpr::In { query, .. }
+                        | hir::SubqueryExpr::Exists(query) => *query,
+                    };
+                    self.query_reads_any_source(query, candidates)
+                }
+                _ => None,
+            };
+        });
+        found
+    }
+
     fn query_reads_any_source(
         &self,
         query: hir::QueryId,
@@ -1725,6 +1853,22 @@ fn is_full_join(kind: ast::JoinType) -> bool {
     let right = kind.contains(ast::JoinType::RIGHT);
     let outer = kind.contains(ast::JoinType::OUTER);
     (left && right) || (outer && !left && !right)
+}
+
+/// The terms a WHERE clause ANDs together.
+fn where_conjuncts<'e>(expression: &'e hir::Expr, terms: &mut Vec<&'e hir::Expr>) {
+    match expression {
+        hir::Expr::Binary {
+            lhs,
+            operator: ast::Operator::And,
+            rhs,
+            ..
+        } => {
+            where_conjuncts(lhs, terms);
+            where_conjuncts(rhs, terms);
+        }
+        _ => terms.push(expression),
+    }
 }
 
 fn merged_column_value(kind: hir::JoinKind) -> hir::MergedColumnValue {

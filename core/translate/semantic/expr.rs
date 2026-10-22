@@ -353,16 +353,16 @@ struct ExprOperand {
 }
 
 #[derive(Clone)]
-pub(super) struct QueryFunctionState {
+pub(super) struct QueryFunctionState<'ast> {
     block: hir::QueryBlockId,
     window_function_count: usize,
-    named_windows: Vec<NamedFunctionWindow>,
+    named_windows: Vec<NamedFunctionWindow<'ast>>,
     windows: Vec<hir::ResolvedWindow>,
     /// The `OVER name` of each window in `windows`, if any.
     window_names: Vec<Option<String>>,
 }
 
-impl QueryFunctionState {
+impl<'ast> QueryFunctionState<'ast> {
     pub(super) const fn new(block: hir::QueryBlockId) -> Self {
         Self {
             block,
@@ -468,9 +468,9 @@ fn frames_are_equivalent(left: &hir::WindowFrame, right: &hir::WindowFrame) -> b
         }
 }
 
-enum FunctionContext<'state> {
+enum FunctionContext<'state, 'ast> {
     ScalarOnly,
-    Query(&'state mut QueryFunctionState),
+    Query(&'state mut QueryFunctionState<'ast>),
 }
 
 #[derive(Clone, Copy)]
@@ -533,12 +533,11 @@ struct FunctionWindowFrame {
 /// it, so they may read the block's aggregates, and a definition no
 /// function uses is never analyzed.
 #[derive(Clone)]
-struct NamedFunctionWindow {
+struct NamedFunctionWindow<'ast> {
     name: String,
-    #[allow(clippy::vec_box)]
-    partition_by: Vec<Box<ast::Expr>>,
-    order_by: Vec<ast::SortedColumn>,
-    frame: Option<ast::FrameClause>,
+    partition_by: &'ast [Box<ast::Expr>],
+    order_by: &'ast [ast::SortedColumn],
+    frame: Option<&'ast ast::FrameClause>,
 }
 
 #[allow(clippy::large_enum_variant)]
@@ -1552,7 +1551,7 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
         syntax: &'ast ast::Expr,
         scope: &Scope,
         policy: ExprPolicy,
-        functions: &mut QueryFunctionState,
+        functions: &mut QueryFunctionState<'ast>,
     ) -> Result<ResolvedScopeExpr> {
         self.analyze_query_expr_with_expected_type(syntax, scope, policy, functions, None)
     }
@@ -1562,7 +1561,7 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
         syntax: &'ast ast::Expr,
         scope: &Scope,
         policy: ExprPolicy,
-        functions: &mut QueryFunctionState,
+        functions: &mut QueryFunctionState<'ast>,
         expected_type: Option<Arc<TypeDef>>,
     ) -> Result<ResolvedScopeExpr> {
         let owner = ExprOwner::Query(functions.block.query);
@@ -1619,7 +1618,7 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
         scope: &Scope,
         policy: ExprPolicy,
         owner: ExprOwner,
-        functions: &mut FunctionContext<'_>,
+        functions: &mut FunctionContext<'_, 'ast>,
         expected_type: Option<Arc<TypeDef>>,
     ) -> Result<ResolvedScopeExpr> {
         let mut frames = vec![ExprFrame::new(syntax, expected_type)?];
@@ -1945,15 +1944,15 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
     pub(super) fn analyze_named_windows(
         &mut self,
         definitions: &'ast [ast::WindowDef],
-        functions: &mut QueryFunctionState,
+        functions: &mut QueryFunctionState<'ast>,
     ) -> Result<()> {
         for definition in definitions {
             let window = &definition.window;
             let mut named = NamedFunctionWindow {
                 name: normalize_ident(definition.name.as_str()),
-                partition_by: window.partition_by.clone(),
-                order_by: window.order_by.clone(),
-                frame: window.frame_clause.clone(),
+                partition_by: &window.partition_by,
+                order_by: &window.order_by,
+                frame: window.frame_clause.as_ref(),
             };
             if let Some(base) = &window.base {
                 // SQLite ignores the base on the first WINDOW definition.
@@ -1970,9 +1969,9 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
                         inherited.frame.is_some(),
                         &base,
                     )?;
-                    named.partition_by.clone_from(&inherited.partition_by);
+                    named.partition_by = inherited.partition_by;
                     if named.order_by.is_empty() {
-                        named.order_by.clone_from(&inherited.order_by);
+                        named.order_by = inherited.order_by;
                     }
                 }
             }
@@ -1982,14 +1981,15 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
     }
 
     /// The PARTITION BY and ORDER BY of a named window, analyzed where a
-    /// window function uses it.
+    /// window function uses it. They are analyzed as expressions of the
+    /// block's query, so they may hold subqueries.
     fn analyze_named_window(
         &mut self,
         name: &str,
         scope: &Scope,
         policy: ExprPolicy,
-        functions: &mut QueryFunctionState,
-    ) -> Result<(FunctionWindow, NamedFunctionWindow)> {
+        functions: &mut QueryFunctionState<'ast>,
+    ) -> Result<(FunctionWindow, NamedFunctionWindow<'ast>)> {
         let named = functions
             .named_windows
             .iter()
@@ -1997,27 +1997,14 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
             .cloned()
             .ok_or_else(|| LimboError::ParseError(format!("no such window: {name}")))?;
         let policy = policy.without_windows();
-        let mut context = FunctionContext::Query(functions);
         let mut partition_by = ExprChildren::new();
-        for expression in &named.partition_by {
-            partition_by.push(self.analyze_resolved_expr_with_functions(
-                expression,
-                scope,
-                policy,
-                &mut context,
-                None,
-            )?);
+        for expression in named.partition_by {
+            partition_by.push(self.analyze_query_expr(expression, scope, policy, functions)?);
         }
         let mut order_by = Vec::with_capacity(named.order_by.len());
-        for term in &named.order_by {
+        for term in named.order_by {
             order_by.push(FunctionOrderTerm {
-                value: self.analyze_resolved_expr_with_functions(
-                    &term.expr,
-                    scope,
-                    policy,
-                    &mut context,
-                    None,
-                )?,
+                value: self.analyze_query_expr(&term.expr, scope, policy, functions)?,
                 order: term.order.unwrap_or(ast::SortOrder::Asc),
                 nulls: term.nulls,
             });
@@ -2074,7 +2061,7 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
         function: &Func,
         scope: &Scope,
         policy: ExprPolicy,
-        functions: &mut QueryFunctionState,
+        functions: &mut QueryFunctionState<'ast>,
     ) -> Result<FunctionWindow> {
         match over {
             FunctionOver::Named(name) => {
@@ -2084,7 +2071,6 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
                 if !function_ignores_user_frame(function) {
                     window.frame = named
                         .frame
-                        .as_ref()
                         .map(|frame| self.analyze_window_frame(frame, scope, policy))
                         .transpose()?;
                 }
@@ -2107,7 +2093,7 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
         syntax: &ast::Expr,
         scope: &Scope,
         policy: ExprPolicy,
-        functions: &mut FunctionContext<'_>,
+        functions: &mut FunctionContext<'_, 'ast>,
         expected_type: Option<Arc<TypeDef>>,
     ) -> Result<ResolvedScopeExpr> {
         let mut frames = vec![ExprFrame::new(syntax, expected_type)?];
@@ -2160,7 +2146,7 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
         children: FrameChildren,
         scope: &Scope,
         policy: ExprPolicy,
-        functions: &mut FunctionContext<'_>,
+        functions: &mut FunctionContext<'_, 'ast>,
         expected_type: Option<&Arc<TypeDef>>,
     ) -> Result<ResolvedScopeExpr> {
         match syntax {
@@ -2372,7 +2358,7 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
         children: ExprChildren,
         scope: &Scope,
         policy: ExprPolicy,
-        functions: &mut FunctionContext<'_>,
+        functions: &mut FunctionContext<'_, 'ast>,
         expected_type: Option<&Arc<TypeDef>>,
     ) -> Result<ResolvedScopeExpr> {
         match syntax {
@@ -2425,6 +2411,18 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
                     {
                         return self.build_field_access(base, column.as_str());
                     }
+                }
+                // In a query, no visible source named that way means the
+                // table is missing, not the column. A CTE defined for the
+                // query but not in its FROM is a known name, so only its
+                // column is missing. The expressions of a DML statement
+                // outside a query, like an upsert's SET, report the column.
+                let normalized_table = normalize_ident(table.as_str());
+                if matches!(functions, FunctionContext::Query(_))
+                    && !scope.has_qualifier(&normalized_table)
+                    && !self.cte_is_defined(&normalized_table)
+                {
+                    crate::bail_parse_error!("no such table: {normalized_table}");
                 }
                 crate::bail_parse_error!("no such column: {}.{}", table.as_str(), column.as_str());
             }
@@ -3026,7 +3024,7 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
         window: Option<FunctionOver>,
         scope: &Scope,
         policy: ExprPolicy,
-        functions: &mut FunctionContext<'_>,
+        functions: &mut FunctionContext<'_, 'ast>,
         expected_type: Option<&Arc<TypeDef>>,
     ) -> Result<ResolvedScopeExpr> {
         let parsed_argument_count = input.argument_count();
@@ -3043,7 +3041,14 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
                 function
             }
         };
-        let binding = bind_function(&function, window.is_some(), name, policy, functions)?;
+        let binding = bind_function(
+            &function,
+            window.is_some(),
+            matches!(input, FunctionInput::Star),
+            name,
+            policy,
+            functions,
+        )?;
         if matches!(binding, FunctionBinding::Scalar) && filter.is_some() {
             crate::bail_parse_error!(
                 "FILTER may not be used with non-aggregate {}()",
@@ -3788,17 +3793,20 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
                 programs: builtin_cast_programs(),
             });
         };
+        // SQLite dequotes the CAST type name before reading its affinity, so
+        // `CAST(x AS "BLOB" INTEGER)` casts to the type named BLOB.
+        let name = crate::util::dequote(&syntax.name);
         if self.context().custom_types_enabled() {
-            if let Some(resolved) = self
-                .context()
-                .main_schema()
-                .resolve_type_unchecked(&syntax.name)?
-            {
+            if let Some(resolved) = self.context().main_schema().resolve_type_unchecked(&name)? {
                 if resolved.leaf().user_params().count() != parameters.len() {
-                    return Ok(builtin_cast_target(syntax, parameter_expressions));
+                    return Ok(builtin_cast_target(
+                        &name,
+                        syntax.array_dimensions,
+                        parameter_expressions,
+                    ));
                 }
                 let (type_fact, affinity) =
-                    self.freeze_type_fact(&syntax.name, resolved, syntax.array_dimensions);
+                    self.freeze_type_fact(&name, resolved, syntax.array_dimensions);
                 let custom_chain = type_fact
                     .declared
                     .as_ref()
@@ -3817,7 +3825,7 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
                     .map(|_| self.bind_domain_constraints(&type_fact, &custom_chain))
                     .transpose()?;
                 return Ok(hir::TypeName {
-                    name: syntax.name.clone(),
+                    name,
                     parameters: parameter_expressions,
                     array_dimensions: syntax.array_dimensions,
                     type_fact,
@@ -3830,7 +3838,11 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
                 });
             }
         }
-        Ok(builtin_cast_target(syntax, parameter_expressions))
+        Ok(builtin_cast_target(
+            &name,
+            syntax.array_dimensions,
+            parameter_expressions,
+        ))
     }
 
     pub(super) fn freeze_type_fact(
@@ -3905,14 +3917,7 @@ fn read_other_side_as_array(
 
 /// `value` cast to the array type `declared` names.
 fn read_as_array(value: ResolvedScopeExpr, declared: &hir::DeclaredType) -> ResolvedScopeExpr {
-    let target = builtin_cast_target(
-        &ast::Type {
-            name: declared.name.clone(),
-            size: None,
-            array_dimensions: declared.array_dimensions,
-        },
-        Vec::new(),
-    );
+    let target = builtin_cast_target(&declared.name, declared.array_dimensions, Vec::new());
     let type_fact = target.type_fact.clone();
     computed_expr(
         hir::Expr::Cast {
@@ -3924,18 +3929,23 @@ fn read_as_array(value: ResolvedScopeExpr, declared: &hir::DeclaredType) -> Reso
     )
 }
 
-fn builtin_cast_target(syntax: &ast::Type, parameters: Vec<hir::Expr>) -> hir::TypeName {
-    let affinity = Affinity::affinity(&syntax.name);
+/// The CAST target for the built-in type `name`, already dequoted.
+fn builtin_cast_target(
+    name: &str,
+    array_dimensions: u32,
+    parameters: Vec<hir::Expr>,
+) -> hir::TypeName {
+    let affinity = Affinity::of_written_type(name);
     let type_fact = hir::TypeFact::declared(hir::DeclaredType {
-        name: syntax.name.clone(),
+        name: name.to_string(),
         storage: affinity.to_type(),
         custom_chain: Vec::new(),
-        array_dimensions: syntax.array_dimensions,
+        array_dimensions,
     });
     hir::TypeName {
-        name: syntax.name.clone(),
+        name: name.to_string(),
         parameters,
-        array_dimensions: syntax.array_dimensions,
+        array_dimensions,
         type_fact,
         affinity,
         programs: builtin_cast_programs(),
@@ -4402,27 +4412,30 @@ fn coerced_window_frame(function: &WindowFunc) -> Option<hir::WindowFrame> {
 fn bind_function(
     function: &Func,
     has_over: bool,
+    star: bool,
     name: &ast::Name,
     policy: ExprPolicy,
-    context: &mut FunctionContext<'_>,
+    context: &mut FunctionContext<'_, '_>,
 ) -> Result<FunctionBinding> {
+    // A call written `count(*)` is named that way in its error.
+    let arguments = if star { "*" } else { "" };
     let aggregate = matches!(function, Func::Agg(_))
         || matches!(function, Func::External(external) if external.func.is_aggregate());
     if aggregate && !has_over {
         match policy.aggregates {
             AggregatePolicy::Allow => {}
             AggregatePolicy::RejectFunction => {
-                crate::bail_parse_error!("misuse of aggregate function {}()", function)
+                crate::bail_parse_error!("misuse of aggregate function {function}({arguments})")
             }
             AggregatePolicy::RejectMisuse => {
-                crate::bail_parse_error!("misuse of aggregate: {}()", function)
+                crate::bail_parse_error!("misuse of aggregate: {function}({arguments})")
             }
         }
     }
     if has_over && !policy.allow_windows {
         match function {
             Func::Agg(_) | Func::Window(_) => {
-                crate::bail_parse_error!("misuse of window function {}()", function)
+                crate::bail_parse_error!("misuse of window function {function}({arguments})")
             }
             Func::External(external) if external.func.is_aggregate() => {
                 crate::bail_parse_error!("misuse of window function {}()", function)
@@ -4453,7 +4466,7 @@ fn bind_function(
     }
 }
 
-fn bind_window(function: &Func, context: &mut FunctionContext<'_>) -> Result<FunctionBinding> {
+fn bind_window(function: &Func, context: &mut FunctionContext<'_, '_>) -> Result<FunctionBinding> {
     match context {
         FunctionContext::ScalarOnly => {
             crate::bail_parse_error!("misuse of window function {}()", function)
@@ -4464,7 +4477,10 @@ fn bind_window(function: &Func, context: &mut FunctionContext<'_>) -> Result<Fun
     }
 }
 
-fn bind_aggregate(function: &Func, context: &mut FunctionContext<'_>) -> Result<FunctionBinding> {
+fn bind_aggregate(
+    function: &Func,
+    context: &mut FunctionContext<'_, '_>,
+) -> Result<FunctionBinding> {
     match context {
         FunctionContext::ScalarOnly => {
             crate::bail_parse_error!("misuse of aggregate function {}()", function)

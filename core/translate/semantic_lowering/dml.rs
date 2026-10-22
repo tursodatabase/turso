@@ -46,6 +46,11 @@ pub(super) struct Subprograms<'a> {
     /// INSERT: the ON UPDATE actions of each UPSERT clause's DO UPDATE, in
     /// clause order.
     pub(super) upsert_actions: Vec<Vec<CompiledAction<'a>>>,
+    /// DELETE: whether a DELETE of every row may clear the table's B-trees
+    /// instead of deleting row by row. False when MVCC holds the rows or a
+    /// materialized view depends on the table, since both need to see each
+    /// deleted row.
+    pub(super) may_clear_btrees: bool,
 }
 
 impl<'a> Subprograms<'a> {
@@ -59,6 +64,7 @@ impl<'a> Subprograms<'a> {
         Ok(Self {
             triggers: super::trigger::delete_triggers(session, parent, plan, delete)?,
             actions: super::fkey_action::delete_actions(session, parent, delete)?,
+            may_clear_btrees: may_clear_btrees(session, &plan.document, delete.target),
             ..Self::default()
         })
     }
@@ -91,8 +97,29 @@ impl<'a> Subprograms<'a> {
             replace_actions: super::insert::replace_actions(session, parent, plan, insert)?,
             upsert_triggers: super::trigger::upsert_update_triggers(session, parent, plan, insert)?,
             upsert_actions: super::fkey_action::upsert_actions(session, parent, plan, insert)?,
+            may_clear_btrees: false,
         })
     }
+}
+
+/// Whether a DELETE of every row of `target` may clear its B-trees instead
+/// of deleting row by row. See [`Subprograms::may_clear_btrees`].
+fn may_clear_btrees(session: &HirSession<'_>, document: &HirDocument, target: SourceId) -> bool {
+    if super::uses_mvcc(session.connection, document, target) {
+        return false;
+    }
+    let Some(source) = document.source(target) else {
+        return false;
+    };
+    let (hir::SourceKind::Table(table), Some(database)) = (&source.kind, source.database) else {
+        return false;
+    };
+    let table_name = table.value().get_name();
+    session.context.with_schema(database.index(), |schema| {
+        schema
+            .get_dependent_materialized_views(table_name)
+            .is_empty()
+    })
 }
 
 /// The B-tree table a DELETE or UPDATE writes, with what HIR resolved for it.

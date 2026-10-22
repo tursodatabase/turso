@@ -1474,10 +1474,13 @@ fn hir_try_hash_join_access_method(
     }
     let probe_kind = probe_source.join_info.as_ref().map(|join| join.kind);
     let build_kind = build_source.join_info.as_ref().map(|join| join.kind);
-    // A RIGHT join has no hash form, and semi/anti-joins prefer a nested
-    // loop with an index seek.
+    // A RIGHT join has no hash form, and a semi-join prefers a nested loop
+    // with an index seek, which stops at its first match. An anti-join
+    // hashes: the build rows the probe matches are remembered, and the
+    // others come out after the probe loop.
     let hash_join_type = match probe_kind {
-        Some(JoinKind::Right | JoinKind::Semi | JoinKind::Anti) => return None,
+        Some(JoinKind::Right | JoinKind::Semi) => return None,
+        Some(JoinKind::Anti) => HashJoinType::LeftAnti,
         Some(JoinKind::Full) => HashJoinType::FullOuter,
         Some(JoinKind::Left) => HashJoinType::LeftOuter,
         _ => HashJoinType::Inner,
@@ -1533,7 +1536,8 @@ fn hir_try_hash_join_access_method(
         if term.from_outer_join.is_some() && !own_on_term {
             continue;
         }
-        if hash_join_type != HashJoinType::Inner && !own_on_term {
+        // An anti-join's terms are plain terms that read its inner table.
+        if !matches!(hash_join_type, HashJoinType::Inner | HashJoinType::LeftAnti) && !own_on_term {
             continue;
         }
         let hir::Expr::Binary {
@@ -1752,6 +1756,8 @@ fn hir_try_hash_join_access_method(
         HashJoinType::FullOuter => rows_per_build_row
             .max(1.0)
             .max(probe_cardinality / build_cardinality.max(1.0)),
+        // Each build row comes out at most once, without a probe row.
+        HashJoinType::LeftAnti => 1.0,
     };
     let cost = estimate_hash_join_cost(
         build_cardinality,
