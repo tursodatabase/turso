@@ -6540,8 +6540,12 @@ fn reject_table_storage_clauses(
 
 /// Rejects column-definition clauses that are not translated.
 fn reject_column_def_clauses(col_def: &pg_query::protobuf::ColumnDef) -> Result<(), ParseError> {
-    if col_def.coll_clause.is_some() {
-        return Err(not_supported("COLLATE on a column definition"));
+    if col_def
+        .coll_clause
+        .as_ref()
+        .is_some_and(|c| !is_binary_collation(&c.collname))
+    {
+        return Err(not_supported("a non-binary COLLATE on a column definition"));
     }
     Ok(())
 }
@@ -6551,8 +6555,8 @@ fn reject_index_elem_clauses(
     elem: &pg_query::protobuf::IndexElem,
     context: &str,
 ) -> Result<(), ParseError> {
-    if !elem.collation.is_empty() {
-        return Err(not_supported(format!("COLLATE in {context}")));
+    if !elem.collation.is_empty() && !is_binary_collation(&elem.collation) {
+        return Err(not_supported(format!("a non-binary COLLATE in {context}")));
     }
     if !elem.opclass.is_empty() || !elem.opclassopts.is_empty() {
         return Err(not_supported(format!("operator classes in {context}")));
@@ -6640,6 +6644,24 @@ fn function_name(funcname: &[pg_query::protobuf::Node]) -> Result<String, ParseE
         [] => Err(ParseError::ParseError("Missing function name".to_string())),
         _ => Err(not_supported("schema-qualified function names")),
     }
+}
+
+/// Whether a collation name means plain byte-wise comparison. Turso always
+/// compares text that way, so these collations are honoured as written;
+/// any other collation would silently become binary.
+fn is_binary_collation(collname: &[pg_query::protobuf::Node]) -> bool {
+    let Ok(names) = extract_key_columns(collname) else {
+        return false;
+    };
+    let name = match names.as_slice() {
+        [name] => name,
+        [schema, name] if schema == "pg_catalog" => name,
+        _ => return false,
+    };
+    matches!(
+        name.to_ascii_lowercase().as_str(),
+        "c" | "posix" | "default" | "ucs_basic"
+    )
 }
 
 #[cfg(test)]
@@ -9502,11 +9524,18 @@ mod tests {
 
     #[test]
     fn fail_closed_column_collate() {
-        assert_not_supported("CREATE TABLE t (a text COLLATE \"C\")", "COLLATE");
-        assert_not_supported("ALTER TABLE t ADD COLUMN a text COLLATE \"C\"", "COLLATE");
+        assert_not_supported("CREATE TABLE t (a text COLLATE \"en_US\")", "COLLATE");
         assert_not_supported(
-            "ALTER TABLE t ALTER COLUMN a TYPE text COLLATE \"C\"",
+            "ALTER TABLE t ADD COLUMN a text COLLATE \"de-x-icu\"",
             "COLLATE",
+        );
+        assert_not_supported(
+            "ALTER TABLE t ALTER COLUMN a TYPE text COLLATE \"en_US\"",
+            "COLLATE",
+        );
+        // Binary collations match how Turso compares text, so they are kept.
+        assert_translates(
+            "CREATE TABLE t (a text COLLATE \"C\", b text COLLATE pg_catalog.\"default\")",
         );
     }
 
@@ -9649,7 +9678,7 @@ mod tests {
     #[test]
     fn fail_closed_index_element_clauses() {
         assert_not_supported(
-            "CREATE INDEX i ON t (a COLLATE \"C\")",
+            "CREATE INDEX i ON t (a COLLATE \"en_US\")",
             "COLLATE in CREATE INDEX",
         );
         assert_not_supported(
