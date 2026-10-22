@@ -23,10 +23,13 @@ SQLTEST := cargo run --manifest-path $(RUNNER_DIR)/Cargo.toml --bin sqltest $(CA
 # Test corpora (relative to this directory)
 PG_TESTS := pg-sqltests
 
+# With PG_DSN set, matrix cases are checked against that PostgreSQL server
+POSTGRES_ORACLE := $(if $(PG_DSN),--postgres-dsn "$(PG_DSN)")
+
 # 2 * num_cpu (arbitrary multiplier)
 POSTGRES_JOBS ?= $(shell expr 2 \* $$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo 2))
 
-.PHONY: all build build-tursopg build-runner check run test run-one run-postgres run-one-postgres test-pgdump run-upstream clean
+.PHONY: all build build-tursopg build-runner check run run-matrix test run-one run-postgres run-one-postgres test-pgdump run-upstream clean
 
 # Build everything
 all: build
@@ -46,16 +49,23 @@ build-runner:
 check: build-runner
 	$(SQLTEST) check $(PG_TESTS)
 
-# Run all tests against a spawned tursopg server
+# Run all tests against a spawned tursopg server. Matrix cases are skipped
+# unless PG_DSN is set.
 run: build
-	$(SQLTEST) run $(PG_TESTS) --timeout 600 --backend tursopg --binary $(TURSOPG)
+	$(SQLTEST) run $(PG_TESTS) --timeout 600 --backend tursopg --binary $(TURSOPG) $(POSTGRES_ORACLE)
+
+# Run all tests against a spawned tursopg server, and check the matrix cases
+# against a real PostgreSQL server. Uses the server at PG_DSN, or starts a
+# throwaway Docker container (see with-postgres.sh).
+run-matrix: build
+	./with-postgres.sh $(MAKE) run
 
 # Alias for run
 test: run
 
 # Run a single test file: make run-one FILE=pg-sqltests/select.sqltest
 run-one: build
-	$(SQLTEST) run $(FILE) --backend tursopg --binary $(TURSOPG)
+	$(SQLTEST) run $(FILE) --backend tursopg --binary $(TURSOPG) $(POSTGRES_ORACLE)
 
 # Run all tests against a real PostgreSQL server. Uses the server at PG_DSN,
 # or starts a throwaway Docker container (see with-postgres.sh).

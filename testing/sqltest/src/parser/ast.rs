@@ -200,8 +200,9 @@ pub struct MatrixVar {
 /// A matrix test case: one SQL template expanded over the cross-product of
 /// its `@var` decorators. Each expansion becomes an individual case named
 /// `<matrix>[<slug>]...[<slug>]` and is verified differentially at run
-/// time: Turso and the bundled SQLite oracle must produce the same rows,
-/// or both must reject the statement.
+/// time: Turso and the oracle (the bundled SQLite, or PostgreSQL for the
+/// tursopg backend) must produce the same rows, or both must reject the
+/// statement.
 #[derive(Debug, Clone, PartialEq)]
 pub struct MatrixCase {
     /// Base name for the expansions

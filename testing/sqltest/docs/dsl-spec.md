@@ -468,8 +468,11 @@ decorators, generating an individual case per combination. Use it when the
 same query shape must be pinned across many parameter combinations (frame
 clauses, type affinities, collations) without writing each case by hand.
 
-> **Note:** Like snapshots, matrix cases only run on the **Rust backend**
-> and use the first `@database` declaration.
+> **Note:** Like snapshots, matrix cases use the first `@database`
+> declaration. They run on the **Rust backend**, checked against the bundled
+> SQLite, and on the **tursopg backend**, checked against the PostgreSQL
+> server that `--postgres-dsn` names. On tursopg without `--postgres-dsn` they
+> are skipped. Other backends do not run them.
 
 ### Basic Syntax
 
@@ -504,6 +507,16 @@ incidental float-formatting differences cannot produce false failures.
 The oracle's SQLite version is pinned by `Cargo.lock`; when SQLite's own
 behavior changes across versions, updating the oracle is a deliberate,
 reviewable dependency bump rather than silent drift.
+
+On the tursopg backend the oracle is the PostgreSQL server at
+`--postgres-dsn`. Each expansion runs its setups and statement on tursopg and
+in a new database on that server. Both servers send rows as text over the
+same PostgreSQL wire-protocol client, so the comparison is of that text.
+`make -C postgres/conformance run-matrix` runs the PostgreSQL corpus this way.
+
+Because two errors count as agreement, a typo in a template passes silently.
+For example, `-$a` with `$a` set to `-8` becomes the SQL comment `--8`. Check
+new templates on the oracle by hand.
 
 ### Example
 

@@ -7,7 +7,7 @@ use sqltest::{
     backends::cli::CliBackend, backends::js::JsBackend, backends::postgres::PostgresBackend,
     backends::rust::RustBackend, backends::tursopg::TursopgBackend, create_output,
     find_all_pending_snapshots, generate_database, generate_integrity_fixture, load_test_files,
-    summarize, tcl_converter,
+    matrix_oracle::MatrixOracle, summarize, tcl_converter,
 };
 use std::process::ExitCode;
 use std::rc::Rc;
@@ -92,8 +92,10 @@ enum Commands {
         #[arg(long)]
         cross_check_binary: Option<PathBuf>,
 
-        /// URL of the PostgreSQL server for --backend postgres, for example
-        /// postgres://postgres@127.0.0.1:5432/postgres. Each test gets a new
+        /// URL of a PostgreSQL server, for example
+        /// postgres://postgres@127.0.0.1:5432/postgres. With --backend postgres
+        /// the tests run on this server. With --backend tursopg the matrix
+        /// cases are checked against this server. Each test gets a new
         /// database on this server, so the user in the URL must be able to
         /// create and drop databases.
         #[arg(long)]
@@ -248,8 +250,8 @@ async fn run_tests(
             eprintln!("postgres/conformance/with-postgres.sh starts a server in Docker");
             return ExitCode::from(2);
         }
-        (Some(_), backend) if backend != "postgres" => {
-            eprintln!("Error: --postgres-dsn works only with --backend postgres");
+        (Some(_), backend) if backend != "postgres" && backend != "tursopg" => {
+            eprintln!("Error: --postgres-dsn works only with --backend postgres or tursopg");
             return ExitCode::from(2);
         }
         _ => {}
@@ -462,6 +464,19 @@ async fn run_tests(
             if let Some(resolver) = resolver {
                 backend = backend.with_default_db_resolver(resolver);
             }
+            let config = match postgres_dsn {
+                Some(dsn) => {
+                    match PostgresBackend::connect(&dsn, Duration::from_secs(timeout)).await {
+                        Ok(oracle) => config
+                            .with_tursopg_matrix_oracle(MatrixOracle::Postgres(Arc::new(oracle))),
+                        Err(e) => {
+                            eprintln!("Error: {e}");
+                            return ExitCode::from(2);
+                        }
+                    }
+                }
+                None => config,
+            };
             let runner = TestRunner::new(backend).with_config(config);
             runner
                 .run_loaded_tests(loaded, |result| {
