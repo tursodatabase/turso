@@ -1533,6 +1533,17 @@ impl PostgreSQLTranslator {
         let upsert = self.translate_on_conflict(&insert.on_conflict_clause)?;
 
         let (body, columns) = if !select_stmt.values_lists.is_empty() {
+            // The VALUES rows are rebuilt below without the statement's other
+            // clauses, so they must not have any.
+            if !select_stmt.sort_clause.is_empty()
+                || select_stmt.limit_count.is_some()
+                || select_stmt.limit_offset.is_some()
+                || !select_stmt.locking_clause.is_empty()
+            {
+                return Err(not_supported(
+                    "ORDER BY, LIMIT or OFFSET on INSERT ... VALUES",
+                ));
+            }
             // VALUES clause — compute which columns are DEFAULT in ALL rows.
             let (rows, default_mask) = self.translate_values(&select_stmt.values_lists)?;
             // Strip columns that use DEFAULT in every row
@@ -9623,5 +9634,15 @@ mod tests {
             "DELETE FROM t USING u WHERE t.id = u.id",
             "DELETE ... USING",
         );
+    }
+
+    #[test]
+    fn fail_closed_insert_values_clauses() {
+        assert_not_supported(
+            "INSERT INTO t (VALUES (2), (1) ORDER BY 1 LIMIT 1)",
+            "INSERT ... VALUES",
+        );
+        assert_translates("INSERT INTO t (WITH c AS (SELECT 1) VALUES (1))");
+        assert_translates("WITH c AS (SELECT 1) INSERT INTO t VALUES (1)");
     }
 }
