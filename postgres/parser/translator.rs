@@ -6438,6 +6438,27 @@ pub fn try_extract_copy_from(
                 };
             }
             "null" => null_string = Some(copy_string_option(def)?),
+            "encoding" => {
+                let val = copy_string_option(def)?;
+                if !matches!(val.to_lowercase().as_str(), "utf8" | "utf-8" | "unicode") {
+                    return Err(not_supported(format!("COPY ENCODING {val}")));
+                }
+            }
+            "freeze" => {
+                use pg_query::protobuf::node::Node;
+                let freeze = match def.arg.as_ref().and_then(|n| n.node.as_ref()) {
+                    None => true,
+                    Some(Node::Boolean(b)) => b.boolval,
+                    Some(Node::Integer(i)) if matches!(i.ival, 0 | 1) => i.ival == 1,
+                    Some(Node::String(s)) => {
+                        !matches!(s.sval.to_lowercase().as_str(), "false" | "off" | "0")
+                    }
+                    _ => true,
+                };
+                if freeze {
+                    return Err(not_supported("COPY ... FREEZE"));
+                }
+            }
             other => {
                 return Err(not_supported(format!(
                     "COPY option {}",
@@ -9609,6 +9630,18 @@ mod tests {
     }
 
     #[test]
+    fn copy_from_accepts_options_turso_already_follows() {
+        for sql in [
+            "COPY t FROM '/tmp/d' WITH (ENCODING 'UTF8')",
+            "COPY t FROM '/tmp/d' WITH (ENCODING 'utf-8')",
+            "COPY t FROM '/tmp/d' WITH (FREEZE false)",
+        ] {
+            let parsed = crate::parse(sql).unwrap();
+            assert!(try_extract_copy_from(&parsed).unwrap().is_some(), "{sql}");
+        }
+    }
+
+    #[test]
     fn fail_closed_copy_from_options() {
         for (sql, needle) in [
             ("COPY t FROM '/tmp/d' WITH (FORMAT csv)", "FORMAT csv"),
@@ -9617,6 +9650,7 @@ mod tests {
             ("COPY t FROM '/tmp/d' WITH (FORCE_NULL (a))", "FORCE_NULL"),
             ("COPY t FROM '/tmp/d' WITH (FREEZE)", "FREEZE"),
             ("COPY t FROM '/tmp/d' WHERE a > 1", "WHERE"),
+            ("COPY t FROM '/tmp/d' WITH (FREEZE true)", "FREEZE"),
         ] {
             let parsed = crate::parse(sql).unwrap();
             let err = try_extract_copy_from(&parsed).expect_err(sql).to_string();
