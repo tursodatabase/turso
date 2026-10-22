@@ -731,6 +731,7 @@ pub fn emit_upsert(
         translate_result?;
         if col.notnull() && !col.is_rowid_alias() {
             program.emit_insn(Insn::HaltIfNull {
+                constraint_info: None,
                 target_reg: layout.to_register(new_start, *col_idx),
                 err_code: SQLITE_CONSTRAINT_NOTNULL,
                 description: String::from(table.get_name()) + "." + col.name.as_ref().unwrap(),
@@ -1107,6 +1108,7 @@ pub fn emit_upsert(
             target_pc: ok,
         });
         program.emit_insn(Insn::Halt {
+            constraint_info: None,
             err_code: SQLITE_CONSTRAINT_PRIMARYKEY,
             description: format!(
                 "{}.{}",
@@ -1260,6 +1262,7 @@ pub fn emit_upsert(
                 });
                 let description = format_unique_violation_desc(table.get_name(), &idx_meta);
                 program.emit_insn(Insn::Halt {
+                    constraint_info: None,
                     err_code: SQLITE_CONSTRAINT_PRIMARYKEY,
                     description,
                     on_error: None,

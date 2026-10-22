@@ -33,6 +33,10 @@ pub trait Dialect: Send + Sync + 'static {
     /// reject an open whose dialect differs from the already-open instance.
     fn name(&self) -> &'static str;
 
+    fn format_error(&self, error: crate::LimboError) -> crate::LimboError {
+        error.into_sqlite_error()
+    }
+
     /// Parse the first statement in `sql` into the engine AST.
     ///
     /// Returns the parsed command, if any, and the number of input bytes

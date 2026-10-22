@@ -34,7 +34,7 @@ use crate::translate::plan::{Aggregate, ColumnMask};
 use crate::vdbe::{
     affinity::Affinity,
     builder::{CursorKey, CursorType, DmlColumnContext, ProgramBuilder, SelfTableContext},
-    insn::{to_u32, InsertFlags, Insn},
+    insn::{to_u32, ConstraintInfo, InsertFlags, Insn},
     BranchOffset, CursorID,
 };
 use crate::{
@@ -2464,6 +2464,7 @@ fn emit_index_column_value_new_image(
 
 /// Emit bytecode for evaluating CHECK constraints.
 /// Assumes the resolver cache is already populated with column-to-register mappings.
+#[allow(clippy::too_many_arguments)]
 fn emit_check_constraint_bytecode(
     program: &mut ProgramBuilder,
     check_constraints: &[CheckConstraint],
@@ -2472,6 +2473,7 @@ fn emit_check_constraint_bytecode(
     skip_row_label: BranchOffset,
     referenced_tables: Option<&TableReferences>,
     table_name: &str,
+    column_mappings: &[(&str, usize)],
 ) -> Result<()> {
     for check_constraint in check_constraints {
         let expr_result_reg = program.alloc_register();
@@ -2537,7 +2539,16 @@ fn emit_check_constraint_bytecode(
             | ResolveType::Fail
             | ResolveType::Rollback
             | ResolveType::Replace => {
+                let col_regs: Vec<usize> = column_mappings.iter().map(|(_, r)| *r).collect();
+                let col_names: Vec<String> =
+                    column_mappings.iter().map(|(n, _)| n.to_string()).collect();
                 program.emit_insn(Insn::Halt {
+                    constraint_info: Some(Box::new(ConstraintInfo::check(
+                        table_name,
+                        check_constraint.name.clone(),
+                        col_regs,
+                        col_names,
+                    ))),
                     err_code: SQLITE_CONSTRAINT_CHECK,
                     description: constraint_name.to_string(),
                     on_error: program.constraint_halt_on_error(or_conflict),
@@ -2659,6 +2670,7 @@ pub(crate) fn emit_check_constraints<'a>(
         skip_row_label,
         referenced_tables,
         table_name,
+        &column_mappings,
     );
 
     // Always restore resolver state, even on error.

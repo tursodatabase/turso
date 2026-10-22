@@ -2,6 +2,45 @@ use thiserror::Error;
 
 use crate::storage::page_cache::CacheError;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConstraintKind {
+    PrimaryKey,
+    Unique,
+    ForeignKey,
+    NotNull,
+    Check,
+    Other,
+}
+
+#[derive(Debug, Clone)]
+pub struct ConstraintViolation {
+    pub kind: ConstraintKind,
+    pub message: String,
+    pub table_name: Option<String>,
+    pub constraint_name: Option<String>,
+    pub index_name: Option<String>,
+    pub column_names: Vec<String>,
+    pub values: Vec<crate::Value>,
+    pub row_values: bool,
+    pub parent_table: Option<String>,
+}
+
+impl ConstraintViolation {
+    pub fn new(kind: ConstraintKind, message: String) -> Self {
+        Self {
+            kind,
+            message,
+            table_name: None,
+            constraint_name: None,
+            index_name: None,
+            column_names: Vec::new(),
+            values: Vec::new(),
+            row_values: false,
+            parent_table: None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Error, miette::Diagnostic)]
 pub enum LimboError {
     #[error("Corrupt database: {0}")]
@@ -57,6 +96,8 @@ pub enum LimboError {
     InvalidFormatter(String),
     #[error("{0}")]
     Constraint(String),
+    #[error("{}", .0.message)]
+    ConstraintViolation(Box<ConstraintViolation>),
     #[error("{0}")]
     /// We need to specify for ROLLBACK|FAIL resolve types when to roll the tx back
     /// so instead of matching on the string, we introduce a specific ForeignKeyConstraint error
@@ -169,7 +210,10 @@ impl LimboError {
     /// shell appends after a runtime error message ("... (19)").
     pub fn sqlite_result_code(&self) -> i32 {
         match self {
-            Self::Constraint(_) | Self::ForeignKeyConstraint(_) | Self::Raise(..) => 19,
+            Self::Constraint(_)
+            | Self::ConstraintViolation(_)
+            | Self::ForeignKeyConstraint(_)
+            | Self::Raise(..) => 19,
             Self::Busy | Self::BusySnapshot | Self::StatementsInProgress(_) => 5,
             Self::TableLocked => 6,
             Self::ReadOnly => 8,
@@ -380,6 +424,7 @@ pub const SQLITE_CONSTRAINT_NOTNULL: usize = SQLITE_CONSTRAINT | (5 << 8);
 pub const SQLITE_CONSTRAINT_TRIGGER: usize = SQLITE_CONSTRAINT | (7 << 8);
 pub const SQLITE_FULL: usize = 13; // we want this in autoincrement - incase if user inserts max allowed int
 pub const SQLITE_CONSTRAINT_UNIQUE: usize = 2067;
+
 // Standard SQLite error code; kept for documentation and potential
 // reuse. The sequence inner-tx wrap used to emit Insn::Halt with this
 // code, but halt()'s constraint catch-all mis-wrapped it; Busy is now
@@ -387,3 +432,38 @@ pub const SQLITE_CONSTRAINT_UNIQUE: usize = 2067;
 // op_sequence_commit_inner_tx.
 #[allow(dead_code)]
 pub const SQLITE_BUSY: usize = 5;
+
+impl LimboError {
+    pub fn into_sqlite_error(self) -> Self {
+        match self {
+            Self::ConstraintViolation(violation) => {
+                if violation.kind == ConstraintKind::ForeignKey {
+                    Self::ForeignKeyConstraint(violation.message)
+                } else {
+                    Self::Constraint(violation.message)
+                }
+            }
+            error => error,
+        }
+    }
+
+    pub(crate) fn into_structured_constraint(self) -> Self {
+        match self {
+            Self::Constraint(message) => Self::ConstraintViolation(Box::new(
+                ConstraintViolation::new(ConstraintKind::Other, message),
+            )),
+            Self::ForeignKeyConstraint(message) => Self::ConstraintViolation(Box::new(
+                ConstraintViolation::new(ConstraintKind::ForeignKey, message),
+            )),
+            error => error,
+        }
+    }
+
+    pub(crate) fn is_foreign_key_constraint(&self) -> bool {
+        match self {
+            Self::ForeignKeyConstraint(_) => true,
+            Self::ConstraintViolation(violation) => violation.kind == ConstraintKind::ForeignKey,
+            _ => false,
+        }
+    }
+}

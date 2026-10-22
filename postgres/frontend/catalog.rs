@@ -33,6 +33,10 @@ impl Dialect for PostgresDialect {
         "postgres"
     }
 
+    fn format_error(&self, error: LimboError) -> LimboError {
+        error
+    }
+
     fn parse(&self, sql: &str) -> Result<(Option<turso_parser::ast::Cmd>, usize)> {
         // Engine-generated helper statements and pragmas are canonical SQLite
         // text that pg_query rejects, so anything the PostgreSQL parser cannot

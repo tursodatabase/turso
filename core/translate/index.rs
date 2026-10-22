@@ -233,6 +233,7 @@ pub fn translate_create_index(
         where_clause: where_clause.clone(),
         index_method: index_method.clone(),
         on_conflict: None,
+        constraint_name: None,
     });
 
     if !idx.validate_where_expr(&table, resolver) {
@@ -599,6 +600,7 @@ pub(crate) fn emit_refill_index(
                 pc_when_nonequal: goto_label,
             });
             program.emit_insn(Insn::Halt {
+                constraint_info: None,
                 err_code: SQLITE_CONSTRAINT_UNIQUE,
                 description: format_unique_violation_desc(tbl_name.as_str(), idx),
                 on_error: None,

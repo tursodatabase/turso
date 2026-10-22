@@ -600,6 +600,7 @@ fn create_dedupe_index(
         where_clause: None,
         index_method: None,
         on_conflict: None,
+        constraint_name: None,
     });
     let cursor_id = program.alloc_cursor_id(CursorType::BTreeIndex(dedupe_index.clone()));
     program.emit_insn(Insn::OpenEphemeral {
@@ -827,6 +828,7 @@ fn create_collection_index(
         where_clause: None,
         index_method: None,
         on_conflict: None,
+        constraint_name: None,
     });
     let cursor_id = program.alloc_cursor_id(CursorType::BTreeIndex(index.clone()));
     program.emit_insn(Insn::OpenEphemeral {

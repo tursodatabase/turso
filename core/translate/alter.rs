@@ -551,6 +551,7 @@ fn emit_add_column_default_type_validation(
     });
 
     program.emit_insn(Insn::Halt {
+        constraint_info: None,
         err_code: 1,
         description: "type mismatch on DEFAULT".to_string(),
         on_error: None,
@@ -706,6 +707,7 @@ fn emit_column_constraints_validation(
             target_pc: notnull_passed,
         });
         program.emit_insn(Insn::Halt {
+            constraint_info: None,
             err_code: 1,
             description: "NOT NULL constraint failed".to_string(),
             on_error: None,
@@ -1241,6 +1243,10 @@ pub fn translate_alter_table(
                             .max()
                             .map_or(0, |order| order + 1);
                         let fk = ForeignKey {
+                            constraint_name: constraint
+                                .name
+                                .as_ref()
+                                .map(|n| normalize_ident(n.as_str())),
                             parent_table: normalize_ident(clause.tbl_name.as_str()),
                             parent_columns: clause
                                 .columns
@@ -1380,6 +1386,7 @@ pub fn translate_alter_table(
                     });
 
                     program.emit_insn(Insn::Halt {
+                        constraint_info: None,
                         err_code: 1,
                         description: error_message.to_string(),
                         on_error: None,

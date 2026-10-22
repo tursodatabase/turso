@@ -41,6 +41,7 @@ pub(super) fn emit_array_element_loop(
         collation: None,
     });
     program.emit_insn(Insn::Halt {
+        constraint_info: None,
         err_code: SQLITE_CONSTRAINT,
         description: format!(
             "array exceeds maximum element count for custom type transform ({MAX_ARRAY_LOOP_ELEMENTS})"
