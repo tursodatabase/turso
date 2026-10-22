@@ -1345,7 +1345,7 @@ impl PostgreSQLTranslator {
                 (ast::InsertBody::DefaultValues, filtered_columns)
             } else {
                 let select = ast::Select {
-                    with: None,
+                    with: self.translate_with_clause(&select_stmt.with_clause)?,
                     body: ast::SelectBody {
                         select: ast::OneSelect::Values(rows),
                         compounds: vec![],
@@ -1576,8 +1576,9 @@ impl PostgreSQLTranslator {
             };
             let order_by = self.translate_order_by(&select.sort_clause)?;
             let limit = self.translate_limit(&select.limit_count, &select.limit_offset)?;
+            let with = self.translate_with_clause(&select.with_clause)?;
             return Ok(ast::Select {
-                with: None,
+                with,
                 body,
                 order_by,
                 limit,
@@ -1678,9 +1679,10 @@ impl PostgreSQLTranslator {
 
         let order_by = self.translate_order_by(&select.sort_clause)?;
         let limit = self.translate_limit(&select.limit_count, &select.limit_offset)?;
+        let with = self.translate_with_clause(&select.with_clause)?;
 
         Ok(ast::Select {
-            with: None,
+            with,
             body: ast::SelectBody {
                 select: first_select,
                 compounds,
@@ -8446,5 +8448,20 @@ mod tests {
             err.to_string().contains("SEARCH clause"),
             "expected SEARCH clause rejection, got: {err}"
         );
+    }
+
+    #[test]
+    fn with_clause_kept_on_set_operations_and_values() {
+        for sql in [
+            "WITH c AS (SELECT 1 AS x) SELECT x FROM c UNION SELECT 2",
+            "WITH c AS (SELECT 1 AS x) VALUES ((SELECT x FROM c))",
+        ] {
+            let parsed = crate::parse(sql).unwrap();
+            let ast::Stmt::Select(select) = PostgreSQLTranslator::new().translate(&parsed).unwrap()
+            else {
+                panic!("{sql}: expected SELECT");
+            };
+            assert!(select.with.is_some(), "{sql}: WITH clause was dropped");
+        }
     }
 }
