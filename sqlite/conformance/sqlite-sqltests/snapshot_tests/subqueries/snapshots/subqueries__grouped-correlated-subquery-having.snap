@@ -43,7 +43,7 @@ addr  opcode          p1  p2  p3  p4            p5  comment
   16    Move          10   6   1                 0  r[6..6]=r[10..10]
   17    IfPos          5  42   0                 0  r[5]>0 -> r[5]-=0, goto 42; check abort flag
   18    Gosub         12  39   0                 0  ; goto clear accumulator subroutine
-  19    AggStep        0  11   8  max(Binary)    0  accum=r[8] step(r[11])
+  19    AggStep        4  11   8  max(Binary)    0  accum=r[8] step(r[11])
   20    If             4  22   0                 0  if r[4] goto 22; don't emit group columns if continuing existing group
   21    Column         2   0   7                 0  r[7]=idx_grouped_values_grp.grp
   22    Integer        1   4   0                 0  r[4]=1; indicate data in accumulator

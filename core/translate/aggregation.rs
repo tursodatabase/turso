@@ -377,6 +377,7 @@ pub fn emit_aggregate_step(
     source: AggArgumentSource,
     target_register: usize,
     resolver: &Resolver,
+    skip_bare_columns_reg: Option<usize>,
 ) -> Result<usize> {
     let Some(cursor_id) = aggregate.order_cursor else {
         return translate_aggregation_step(
@@ -386,6 +387,7 @@ pub fn emit_aggregate_step(
             target_register,
             resolver,
             aggregate.fraction_reg,
+            skip_bare_columns_reg,
         );
     };
     let span_idx = program.constant_spans_next_idx();
@@ -492,6 +494,7 @@ pub fn emit_aggregate_final(
             target_register,
             resolver,
             aggregate.fraction_reg,
+            None,
         )?;
         if let Some(label) = duplicate {
             program.preassign_label_to_next_insn(label);
@@ -567,6 +570,7 @@ pub fn translate_aggregation_step(
     // For `percentile_cont` / `percentile_disc`: register pre-evaluated by
     // `InitLoop::emit`. `None` for any other aggregate.
     fraction_reg: Option<usize>,
+    skip_bare_columns_reg: Option<usize>,
 ) -> Result<usize> {
     let num_args = agg_arg_source.num_args();
     let func = agg_arg_source.agg_func();
@@ -579,6 +583,7 @@ pub fn translate_aggregation_step(
             handle_distinct(program, agg_arg_source.distinctness(), expr_reg);
             program.emit_insn(Insn::AggStep {
                 data: Box::new(AggStepData {
+                    skip_bare_columns_reg: None,
                     acc_reg: target_register,
                     col: expr_reg,
                     delimiter: 0,
@@ -595,6 +600,7 @@ pub fn translate_aggregation_step(
             handle_distinct(program, agg_arg_source.distinctness(), expr_reg);
             program.emit_insn(Insn::AggStep {
                 data: Box::new(AggStepData {
+                    skip_bare_columns_reg: None,
                     acc_reg: target_register,
                     col: expr_reg,
                     delimiter: 0,
@@ -613,6 +619,7 @@ pub fn translate_aggregation_step(
             handle_distinct(program, agg_arg_source.distinctness(), expr_reg);
             program.emit_insn(Insn::AggStep {
                 data: Box::new(AggStepData {
+                    skip_bare_columns_reg: None,
                     acc_reg: target_register,
                     col: expr_reg,
                     delimiter: 0,
@@ -641,6 +648,7 @@ pub fn translate_aggregation_step(
 
             program.emit_insn(Insn::AggStep {
                 data: Box::new(AggStepData {
+                    skip_bare_columns_reg: None,
                     acc_reg: target_register,
                     col: expr_reg,
                     delimiter: delimiter_reg,
@@ -664,6 +672,7 @@ pub fn translate_aggregation_step(
                 super::order_by::custom_type_comparator(expr, referenced_tables, resolver);
             program.emit_insn(Insn::AggStep {
                 data: Box::new(AggStepData {
+                    skip_bare_columns_reg,
                     acc_reg: target_register,
                     col: expr_reg,
                     delimiter: 0,
@@ -686,6 +695,7 @@ pub fn translate_aggregation_step(
                 super::order_by::custom_type_comparator(expr, referenced_tables, resolver);
             program.emit_insn(Insn::AggStep {
                 data: Box::new(AggStepData {
+                    skip_bare_columns_reg,
                     acc_reg: target_register,
                     col: expr_reg,
                     delimiter: 0,
@@ -707,6 +717,7 @@ pub fn translate_aggregation_step(
 
             program.emit_insn(Insn::AggStep {
                 data: Box::new(AggStepData {
+                    skip_bare_columns_reg: None,
                     acc_reg: target_register,
                     col: expr_reg,
                     delimiter: value_reg,
@@ -726,6 +737,7 @@ pub fn translate_aggregation_step(
             handle_distinct(program, agg_arg_source.distinctness(), expr_reg);
             program.emit_insn(Insn::AggStep {
                 data: Box::new(AggStepData {
+                    skip_bare_columns_reg: None,
                     acc_reg: target_register,
                     col: expr_reg,
                     delimiter: 0,
@@ -747,6 +759,7 @@ pub fn translate_aggregation_step(
 
             program.emit_insn(Insn::AggStep {
                 data: Box::new(AggStepData {
+                    skip_bare_columns_reg: None,
                     acc_reg: target_register,
                     col: expr_reg,
                     delimiter: delimiter_reg,
@@ -766,6 +779,7 @@ pub fn translate_aggregation_step(
             handle_distinct(program, agg_arg_source.distinctness(), expr_reg);
             program.emit_insn(Insn::AggStep {
                 data: Box::new(AggStepData {
+                    skip_bare_columns_reg: None,
                     acc_reg: target_register,
                     col: expr_reg,
                     delimiter: 0,
@@ -784,6 +798,7 @@ pub fn translate_aggregation_step(
             handle_distinct(program, agg_arg_source.distinctness(), expr_reg);
             program.emit_insn(Insn::AggStep {
                 data: Box::new(AggStepData {
+                    skip_bare_columns_reg: None,
                     acc_reg: target_register,
                     col: expr_reg,
                     delimiter: 0,
@@ -803,6 +818,7 @@ pub fn translate_aggregation_step(
             handle_distinct(program, agg_arg_source.distinctness(), expr_reg);
             program.emit_insn(Insn::AggStep {
                 data: Box::new(AggStepData {
+                    skip_bare_columns_reg: None,
                     acc_reg: target_register,
                     col: expr_reg,
                     delimiter: 0,
@@ -824,6 +840,7 @@ pub fn translate_aggregation_step(
             let arg_collation = agg_arg_collation(referenced_tables, expr, resolver);
             program.emit_insn(Insn::AggStep {
                 data: Box::new(AggStepData {
+                    skip_bare_columns_reg: None,
                     acc_reg: target_register,
                     col: value_reg,
                     delimiter: 0,
@@ -849,6 +866,7 @@ pub fn translate_aggregation_step(
             let arg_collation = agg_arg_collation(referenced_tables, expr, resolver);
             program.emit_insn(Insn::AggStep {
                 data: Box::new(AggStepData {
+                    skip_bare_columns_reg: None,
                     acc_reg: target_register,
                     col: value_reg,
                     delimiter: fraction_reg,
@@ -887,6 +905,7 @@ pub fn translate_aggregation_step(
             }
             program.emit_insn(Insn::AggStep {
                 data: Box::new(AggStepData {
+                    skip_bare_columns_reg: None,
                     acc_reg: target_register,
                     col: expr_reg,
                     delimiter: 0,

@@ -363,6 +363,7 @@ pub struct SorterOpenData {
 /// Data for AggStep instruction (boxed to keep Insn small).
 #[derive(Debug, Clone)]
 pub struct AggStepData {
+    pub skip_bare_columns_reg: Option<usize>,
     pub acc_reg: usize,
     pub col: usize,
     pub delimiter: usize,
