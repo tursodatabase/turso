@@ -74,6 +74,13 @@ enum BodyPart {
     Parameter(usize),
 }
 
+pub fn is_create_function(parse_result: &ParseResult) -> bool {
+    matches!(
+        first_statement(parse_result),
+        Some(Node::CreateFunctionStmt(_))
+    )
+}
+
 impl CreateFunction {
     pub fn parse(sql: &str) -> Result<Self, ParseError> {
         let parse_result = crate::parse(sql)?;
@@ -662,6 +669,19 @@ impl SqlFunction {
             .iter()
             .filter(|part| **part == BodyPart::Parameter(index))
             .count()
+    }
+
+    pub fn call_with_null_arguments(&self) -> String {
+        let arguments: Vec<String> = self
+            .parameters
+            .iter()
+            .map(|parameter| format!("CAST(NULL AS {})", parameter.sql_type.to_sql()))
+            .collect();
+        format!(
+            "{}({})",
+            crate::quote_identifier(&self.name),
+            arguments.join(", ")
+        )
     }
 }
 

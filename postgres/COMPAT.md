@@ -454,29 +454,29 @@ Upgrade is not supported.
 |---------|--------|-------|
 | ALTER TABLE ENABLE/DISABLE TRIGGER | ❌ Not supported | |
 | ALTER TABLE / ENABLE REPLICA TRIGGER/RULE | ❌ Not supported | |
-| BEGIN ATOMIC function bodies | ❌ Not supported | |
+| BEGIN ATOMIC function bodies | ❌ Not supported | CREATE FUNCTION rejects RETURN and BEGIN ATOMIC bodies |
 | CALL syntax for executing procedures | ❌ Not supported | |
-| CREATE FUNCTION | ❌ Not supported | Rejected with an error |
+| CREATE FUNCTION | 🟡 Partial | Only `LANGUAGE sql` functions that can be inlined: each call is replaced with the function body. The body must be one `SELECT` of one expression, without `FROM`, subqueries, or aggregates. Only `IN` parameters without defaults, and one result of a built-in scalar type. No `STRICT`, `SECURITY DEFINER`, `SET`, or overloading. Functions go in schema `public` and cannot have the name of a built-in function. Calls work in `SELECT`, `INSERT`, `UPDATE`, `DELETE`, and `EXPLAIN`, but not in `FROM`, views, or defaults. Only a call that is a full select item gets the function name as column name. Functions are not shown in `pg_proc` |
 | Column level triggers | ❌ Not supported | |
-| CREATE PROCEDURE syntax for SQL stored procedures | ❌ Not supported | |
+| CREATE PROCEDURE syntax for SQL stored procedures | ❌ Not supported | Rejected with an error |
 | Event triggers | ❌ Not supported | |
 | FILTER clause for aggregate functions | ✅ Supported | |
 | ORDER BY support within aggregates | ❌ Not supported | Silently dropped |
-| Per function GUC settings | ❌ Not supported | |
+| Per function GUC settings | ❌ Not supported | CREATE FUNCTION rejects `SET` clauses |
 | Per function statistics | ❌ Not supported | |
 | RETURN QUERY EXECUTE | ❌ Not supported | |
-| RETURNS TABLE | ❌ Not supported | |
+| RETURNS TABLE | ❌ Not supported | Rejected with an error |
 | Statement level triggers | ❌ Not supported | CREATE TRIGGER not translated |
 | Statement level TRUNCATE triggers | ❌ Not supported | |
 | Triggers on views | ❌ Not supported | |
-| Variadic functions | ❌ Not supported | VARIADIC arguments rejected |
+| Variadic functions | ❌ Not supported | VARIADIC arguments rejected. CREATE FUNCTION rejects `VARIADIC` parameters |
 | WHEN clause for CREATE TRIGGER | ❌ Not supported | |
 
 ## Procedural Languages
 
 | Feature | Status | Notes |
 |---------|--------|-------|
-| Procedural languages (PL/pgSQL, PL/Python, ...) | ❌ Not supported | CREATE FUNCTION and DO are rejected with an error |
+| Procedural languages (PL/pgSQL, PL/Python, ...) | ❌ Not supported | CREATE FUNCTION accepts only `LANGUAGE sql`, and DO is rejected with an error |
 | CASE in pl/pgsql | ❌ Not supported | |
 | CONTINUE statement for PL/pgSQL | ❌ Not supported | |
 | CREATE TRANSFORM | ❌ Not supported | |
@@ -486,15 +486,15 @@ Upgrade is not supported.
 | EXECUTE USING in PL/pgSQL | ❌ Not supported | |
 | FOREACH IN ARRAY in pl/pgsql | ❌ Not supported | |
 | IN/OUT/INOUT parameters for pl/pgsql and PL/SQL | ❌ Not supported | |
-| Named parameters | ❌ Not supported | |
+| Named parameters | 🟡 Partial | SQL function bodies can refer to parameters by name. Calls in named notation (`f(a => 1)`) are rejected |
 | Non-superuser language creation | ❌ Not supported | |
 | pl/pgsql installed by default | ❌ Not supported | |
 | Polymorphic functions | ❌ Not supported | |
 | Python 3 support for pl/python | ❌ Not supported | |
-| Qualified function parameters | ❌ Not supported | |
+| Qualified function parameters | 🟡 Partial | SQL function bodies can refer to a parameter as `function_name.parameter` |
 | Query parallelism for RETURN QUERY | ❌ Not supported | |
 | RETURN QUERY in pl/pgsql | ❌ Not supported | |
-| ROWS and COST specification for functions | ❌ Not supported | |
+| ROWS and COST specification for functions | 🟡 Partial | CREATE FUNCTION accepts `ROWS` and `COST` and ignores them |
 | Scrollable and updatable cursor support for pl/pgsql | ❌ Not supported | |
 | SQLERRM/SQLSTATE for pl/pgsql | ❌ Not supported | |
 | Unicode object support in PL/python | ❌ Not supported | |

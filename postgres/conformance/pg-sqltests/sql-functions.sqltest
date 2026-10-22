@@ -1,0 +1,450 @@
+# SQL functions through the PostgreSQL frontend.
+#
+# Turso runs a SQL function by replacing each call with the body of the
+# function. Tests without @skip-if postgres use functions that PostgreSQL
+# also accepts, and give the same results on both servers. Turso rejects the
+# functions and calls that it cannot inline, but PostgreSQL runs them, so
+# those tests have @skip-if postgres.
+
+@database :memory:
+
+test sql-function-call-in-select-list {
+    CREATE FUNCTION add_one(a integer) RETURNS integer LANGUAGE sql AS 'SELECT a + 1';
+    SELECT add_one(41);
+}
+expect {
+    42
+}
+
+test sql-function-positional-parameters {
+    CREATE FUNCTION add(integer, integer) RETURNS integer LANGUAGE sql AS 'SELECT $1 + $2';
+    SELECT add(40, 2);
+}
+expect {
+    42
+}
+
+test sql-function-parameter-qualified-with-function-name {
+    CREATE FUNCTION add_one(a integer) RETURNS integer LANGUAGE sql AS 'SELECT add_one.a + 1';
+    SELECT add_one(1);
+}
+expect {
+    2
+}
+
+test sql-function-dollar-quoted-body {
+    CREATE FUNCTION greet(name text) RETURNS text LANGUAGE sql AS $$ SELECT 'Hello, ' || name || '!' $$;
+    SELECT greet('Bob');
+}
+expect {
+    Hello, Bob!
+}
+
+test sql-function-calls-in-where-and-order-by {
+    CREATE TABLE t (x integer);
+    INSERT INTO t VALUES (3), (1), (2);
+    CREATE FUNCTION neg(a integer) RETURNS integer LANGUAGE sql AS 'SELECT -a';
+    SELECT x FROM t WHERE neg(x) < -1 ORDER BY neg(x);
+}
+expect {
+    3
+    2
+}
+
+test sql-function-calls-in-insert-update-and-delete {
+    CREATE TABLE t (x integer);
+    CREATE FUNCTION add_one(a integer) RETURNS integer LANGUAGE sql AS 'SELECT a + 1';
+    INSERT INTO t VALUES (add_one(1)), (add_one(10));
+    UPDATE t SET x = add_one(x) WHERE x = add_one(1);
+    DELETE FROM t WHERE x = add_one(10);
+    SELECT x FROM t;
+}
+expect {
+    3
+}
+
+test sql-function-call-in-returning {
+    CREATE TABLE t (x integer);
+    CREATE FUNCTION add_one(a integer) RETURNS integer LANGUAGE sql AS 'SELECT a + 1';
+    INSERT INTO t VALUES (1) RETURNING add_one(x);
+}
+expect {
+    2
+}
+
+test sql-function-calls-another-sql-function {
+    CREATE FUNCTION add_one(a integer) RETURNS integer LANGUAGE sql AS 'SELECT a + 1';
+    CREATE FUNCTION add_two(a integer) RETURNS integer LANGUAGE sql AS 'SELECT add_one(add_one(a))';
+    SELECT add_two(1), add_one(add_two(1));
+}
+expect {
+    3|4
+}
+
+test sql-function-result-column-has-function-name {
+    CREATE FUNCTION add_one(a integer) RETURNS integer LANGUAGE sql AS 'SELECT a + 1';
+    SELECT s.add_one FROM (SELECT add_one(1)) AS s;
+}
+expect {
+    2
+}
+
+test sql-function-arguments-are-cast-to-parameter-types {
+    CREATE FUNCTION half(a float8) RETURNS float8 LANGUAGE sql AS 'SELECT a / 2';
+    SELECT half(3);
+}
+expect {
+    1.5
+}
+
+test sql-function-result-is-cast-to-return-type {
+    CREATE FUNCTION three() RETURNS text LANGUAGE sql AS 'SELECT 1 + 2';
+    SELECT three() || '!';
+}
+expect {
+    3!
+}
+
+test sql-function-argument-used-twice {
+    CREATE TABLE t (x integer);
+    INSERT INTO t VALUES (3);
+    CREATE FUNCTION square(a integer) RETURNS integer LANGUAGE sql AS 'SELECT a * a';
+    SELECT square(x + 1) FROM t;
+}
+expect {
+    16
+}
+
+test sql-function-create-or-replace {
+    CREATE FUNCTION f(a integer) RETURNS integer LANGUAGE sql AS 'SELECT a + 1';
+    CREATE OR REPLACE FUNCTION f(a integer) RETURNS integer LANGUAGE sql AS 'SELECT a + 100';
+    SELECT f(1);
+}
+expect {
+    101
+}
+
+setup function-f {
+    CREATE FUNCTION f() RETURNS integer LANGUAGE sql AS 'SELECT 1';
+}
+
+@setup function-f
+test sql-function-replace-in-rolled-back-transaction {
+    BEGIN;
+    CREATE OR REPLACE FUNCTION f() RETURNS integer LANGUAGE sql AS 'SELECT 2';
+    ROLLBACK;
+    SELECT f();
+}
+expect {
+    1
+}
+
+test sql-function-storage-is-not-listed-in-pg-class {
+    CREATE FUNCTION f() RETURNS integer LANGUAGE sql AS 'SELECT 1';
+    SELECT count(*) FROM pg_class WHERE relname = 'pg_turso_sql_functions';
+}
+expect {
+    0
+}
+
+test sql-function-create-twice {
+    CREATE FUNCTION f(a integer) RETURNS integer LANGUAGE sql AS 'SELECT a';
+    CREATE FUNCTION f(a integer) RETURNS integer LANGUAGE sql AS 'SELECT a';
+}
+expect error {
+    already exists with same argument types
+}
+
+test sql-function-replace-cannot-change-return-type {
+    CREATE FUNCTION f(a integer) RETURNS integer LANGUAGE sql AS 'SELECT a';
+    CREATE OR REPLACE FUNCTION f(a integer) RETURNS bigint LANGUAGE sql AS 'SELECT a';
+}
+expect error {
+    cannot change return type of existing function
+}
+
+test sql-function-replace-cannot-rename-parameter {
+    CREATE FUNCTION f(a integer) RETURNS integer LANGUAGE sql AS 'SELECT a';
+    CREATE OR REPLACE FUNCTION f(b integer) RETURNS integer LANGUAGE sql AS 'SELECT b';
+}
+expect error {
+    cannot change name of input parameter "a"
+}
+
+test sql-function-body-with-unknown-column {
+    CREATE FUNCTION f(a integer) RETURNS integer LANGUAGE sql AS 'SELECT b';
+}
+expect error {
+    column "b" does not exist
+}
+
+test sql-function-body-with-unknown-parameter-number {
+    CREATE FUNCTION f(a integer) RETURNS integer LANGUAGE sql AS 'SELECT $2';
+}
+expect error {
+    there is no parameter
+}
+
+test sql-function-body-with-two-columns {
+    CREATE FUNCTION f(a integer) RETURNS integer LANGUAGE sql AS 'SELECT a, a';
+}
+expect error {}
+
+test sql-function-without-language {
+    CREATE FUNCTION f() RETURNS integer AS 'SELECT 1';
+}
+expect error {
+    no language specified
+}
+
+test sql-function-with-duplicate-parameter-names {
+    CREATE FUNCTION f(a integer, a integer) RETURNS integer LANGUAGE sql AS 'SELECT a';
+}
+expect error {
+    parameter name "a" used more than once
+}
+
+@skip-if postgres "PostgreSQL supports procedures"
+test sql-procedure-is-rejected {
+    CREATE PROCEDURE p() LANGUAGE sql AS 'SELECT 1';
+}
+expect error {
+    CREATE PROCEDURE is not supported
+}
+
+@skip-if postgres "PostgreSQL supports PL/pgSQL functions"
+test sql-function-in-plpgsql-is-rejected {
+    CREATE FUNCTION f() RETURNS integer LANGUAGE plpgsql AS 'BEGIN RETURN 1; END';
+}
+expect error {
+    language "plpgsql" is not supported
+}
+
+@skip-if postgres "PostgreSQL runs SQL functions that it cannot inline"
+test sql-function-that-updates-is-rejected {
+    CREATE TABLE t (x integer);
+    CREATE FUNCTION f(a integer) RETURNS integer LANGUAGE sql AS 'UPDATE t SET x = a RETURNING x';
+}
+expect error {
+    its body must be a single SELECT
+}
+
+@skip-if postgres "PostgreSQL runs SQL functions that it cannot inline"
+test sql-function-that-inserts-is-rejected {
+    CREATE TABLE t (x integer);
+    CREATE FUNCTION f(a integer) RETURNS integer LANGUAGE sql AS 'INSERT INTO t VALUES (a) RETURNING x';
+}
+expect error {
+    its body must be a single SELECT
+}
+
+@skip-if postgres "PostgreSQL runs SQL functions that it cannot inline"
+test sql-function-with-two-statements-is-rejected {
+    CREATE FUNCTION f() RETURNS integer LANGUAGE sql AS 'SELECT 1; SELECT 2';
+}
+expect error {
+    its body must be a single SELECT
+}
+
+@skip-if postgres "PostgreSQL runs SQL functions that it cannot inline"
+test sql-function-with-from-clause-is-rejected {
+    CREATE TABLE t (x integer);
+    CREATE FUNCTION f() RETURNS bigint LANGUAGE sql AS 'SELECT count(*) FROM t';
+}
+expect error {
+    without FROM or any other clause
+}
+
+@skip-if postgres "PostgreSQL runs SQL functions that it cannot inline"
+test sql-function-with-subquery-is-rejected {
+    CREATE FUNCTION f() RETURNS integer LANGUAGE sql AS 'SELECT (SELECT 1)';
+}
+expect error {
+    its body contains a subquery
+}
+
+@skip-if postgres "PostgreSQL runs SQL functions that it cannot inline"
+test sql-function-with-aggregate-is-rejected {
+    CREATE FUNCTION f(a integer) RETURNS bigint LANGUAGE sql AS 'SELECT sum(a)';
+}
+expect error {
+    misuse of aggregate function
+}
+
+@skip-if postgres "PostgreSQL supports set-returning SQL functions"
+test sql-function-returning-setof-is-rejected {
+    CREATE FUNCTION f() RETURNS SETOF integer LANGUAGE sql AS 'SELECT 1';
+}
+expect error {
+    SETOF or TABLE are not supported yet
+}
+
+@skip-if postgres "PostgreSQL supports set-returning SQL functions"
+test sql-function-returning-table-is-rejected {
+    CREATE FUNCTION f() RETURNS TABLE (x integer) LANGUAGE sql AS 'SELECT 1';
+}
+expect error {
+    SETOF or TABLE are not supported yet
+}
+
+@skip-if postgres "PostgreSQL supports OUT parameters"
+test sql-function-with-out-parameter-is-rejected {
+    CREATE FUNCTION f(OUT x integer) LANGUAGE sql AS 'SELECT 1';
+}
+expect error {
+    OUT, INOUT, and VARIADIC parameters are not supported yet
+}
+
+@skip-if postgres "PostgreSQL supports VARIADIC parameters"
+test sql-function-with-variadic-parameter-is-rejected {
+    CREATE FUNCTION f(VARIADIC x integer[]) RETURNS integer LANGUAGE sql AS 'SELECT 1';
+}
+expect error {
+    OUT, INOUT, and VARIADIC parameters are not supported yet
+}
+
+@skip-if postgres "PostgreSQL supports parameter defaults"
+test sql-function-with-parameter-default-is-rejected {
+    CREATE FUNCTION f(a integer DEFAULT 1) RETURNS integer LANGUAGE sql AS 'SELECT a';
+}
+expect error {
+    parameter defaults are not supported yet
+}
+
+@skip-if postgres "PostgreSQL supports STRICT SQL functions"
+test sql-function-strict-is-rejected {
+    CREATE FUNCTION f(a integer) RETURNS integer LANGUAGE sql STRICT AS 'SELECT a';
+}
+expect error {
+    STRICT SQL functions are not supported yet
+}
+
+@skip-if postgres "PostgreSQL runs SQL functions that it cannot inline"
+test sql-function-security-definer-is-rejected {
+    CREATE FUNCTION f() RETURNS integer LANGUAGE sql SECURITY DEFINER AS 'SELECT 1';
+}
+expect error {
+    SECURITY DEFINER functions cannot be inlined
+}
+
+@skip-if postgres "PostgreSQL runs SQL functions that it cannot inline"
+test sql-function-with-set-clause-is-rejected {
+    CREATE FUNCTION f() RETURNS integer LANGUAGE sql SET search_path = public AS 'SELECT 1';
+}
+expect error {
+    SET clause cannot be inlined
+}
+
+@skip-if postgres "PostgreSQL runs SQL functions that it cannot inline"
+test sql-function-returning-void-is-rejected {
+    CREATE FUNCTION f() RETURNS void LANGUAGE sql AS 'SELECT 1';
+}
+expect error {
+    return void cannot be inlined
+}
+
+@skip-if postgres "PostgreSQL supports SQL functions of all types"
+test sql-function-with-unsupported-type-is-rejected {
+    CREATE TYPE mood AS ENUM ('sad', 'happy');
+    CREATE FUNCTION f(m mood) RETURNS integer LANGUAGE sql AS 'SELECT 1';
+}
+expect error {
+    type "mood" is not supported in SQL functions yet
+}
+
+@skip-if postgres "PostgreSQL supports SQL-standard function bodies"
+test sql-function-with-return-body-is-rejected {
+    CREATE FUNCTION f(a integer) RETURNS integer LANGUAGE sql RETURN a + 1;
+}
+expect error {
+    RETURN or BEGIN ATOMIC are not supported yet
+}
+
+@skip-if postgres "PostgreSQL supports functions in all schemas"
+test sql-function-in-other-schema-is-rejected {
+    CREATE SCHEMA IF NOT EXISTS sql_function_schema;
+    CREATE FUNCTION sql_function_schema.f() RETURNS integer LANGUAGE sql AS 'SELECT 1';
+}
+expect error {
+    can be created only in schema public
+}
+
+test sql-function-in-public-when-search-path-does-not-include-public {
+    CREATE SCHEMA IF NOT EXISTS sql_function_search_path;
+    SET search_path TO sql_function_search_path;
+    CREATE FUNCTION public.add_one(a integer) RETURNS integer LANGUAGE sql AS 'SELECT a + 1';
+    SELECT public.add_one(1);
+}
+expect {
+    2
+}
+
+@skip-if postgres "PostgreSQL lets a function in public have the name of a built-in function"
+test sql-function-with-built-in-name-is-rejected {
+    CREATE FUNCTION lower(a text) RETURNS text LANGUAGE sql AS 'SELECT a';
+}
+expect error {
+    already exists as a built-in function
+}
+
+@skip-if postgres "PostgreSQL supports overloaded functions"
+test sql-function-overload-is-rejected {
+    CREATE FUNCTION f(a integer) RETURNS integer LANGUAGE sql AS 'SELECT a';
+    CREATE FUNCTION f(a text) RETURNS integer LANGUAGE sql AS 'SELECT 1';
+}
+expect error {
+    overloading is not supported yet
+}
+
+@skip-if postgres "PostgreSQL runs recursive SQL functions"
+test sql-function-recursive-is-rejected {
+    CREATE FUNCTION f(a integer) RETURNS integer LANGUAGE sql AS 'SELECT f(a)';
+}
+expect error {
+    cannot inline recursive SQL function "f"
+}
+
+@skip-if postgres "PostgreSQL runs SQL functions that it cannot inline"
+test sql-function-call-with-volatile-argument-used-twice-is-rejected {
+    CREATE FUNCTION square(a float8) RETURNS float8 LANGUAGE sql AS 'SELECT a * a';
+    SELECT square(random());
+}
+expect error {
+    argument 1 is used more than once
+}
+
+@skip-if postgres "PostgreSQL supports SQL functions in FROM"
+test sql-function-call-in-from-is-rejected {
+    CREATE FUNCTION f() RETURNS integer LANGUAGE sql AS 'SELECT 1';
+    SELECT * FROM f();
+}
+expect error {
+    cannot be called in FROM yet
+}
+
+@skip-if postgres "PostgreSQL supports named argument notation"
+test sql-function-call-with-named-argument-is-rejected {
+    CREATE FUNCTION f(a integer) RETURNS integer LANGUAGE sql AS 'SELECT a';
+    SELECT f(a => 1);
+}
+expect error {
+    Named argument notation is not supported
+}
+
+@skip-if postgres "PostgreSQL supports SQL functions in views"
+test sql-function-call-in-view-is-rejected {
+    CREATE FUNCTION f() RETURNS integer LANGUAGE sql AS 'SELECT 1';
+    CREATE VIEW v AS SELECT f();
+}
+expect error {
+    can be called only in SELECT, INSERT, UPDATE, DELETE, and EXPLAIN statements
+}
+
+@skip-if postgres "PostgreSQL supports SQL functions in column defaults"
+test sql-function-call-in-column-default-is-rejected {
+    CREATE FUNCTION f() RETURNS integer LANGUAGE sql AS 'SELECT 1';
+    CREATE TABLE t (x integer DEFAULT f());
+}
+expect error {
+    can be called only in SELECT, INSERT, UPDATE, DELETE, and EXPLAIN statements
+}

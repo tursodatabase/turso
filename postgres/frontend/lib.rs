@@ -3,6 +3,7 @@ mod copy;
 mod functions;
 mod options;
 mod session;
+mod sql_functions;
 mod unnest;
 
 pub use catalog::PostgresDialect;

@@ -26,7 +26,7 @@ Sorted by implementation difficulty.
 
 ## Hard (a week+)
 
-16. **User-defined functions (CREATE FUNCTION)** — needs a function registry, PL/pgSQL is out of scope but SQL-body functions are feasible
+16. **User-defined functions (CREATE FUNCTION)** — SQL functions that can be inlined are done; still missing: bodies with FROM, set-returning functions, STRICT, defaults, overloading, and calls in FROM, views, and defaults. PL/pgSQL is out of scope
 17. **INTERVAL type with arithmetic** — needs a custom type in Turso core with operator overloading
 18. **Full COPY protocol** — wire-level CopyData/CopyDone/CopyFail message handling in `postgres/server/lib.rs`
 19. **Triggers** — Turso has experimental trigger support but wiring PG syntax is non-trivial
