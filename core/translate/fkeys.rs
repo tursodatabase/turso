@@ -181,14 +181,10 @@ pub fn affected_parent_fks_for_update(
     updated_positions: &ColumnMask,
     database_id: usize,
 ) -> Result<crate::alloc::Vec<ResolvedFkRef>> {
+    let affected_positions = table_btree.columns_affected_by_update(updated_positions)?;
     let mut affected_fks = resolver.with_schema(database_id, |s| {
-        s.resolved_fks_referencing(&table_btree.name)
+        s.resolved_fks_referencing(&table_btree.name, Some(&affected_positions))
     })?;
-    let affected_positions = if affected_fks.iter().any(|fk| !fk.parent_uses_rowid) {
-        table_btree.columns_affected_by_update(updated_positions)?
-    } else {
-        ColumnMask::default()
-    };
     affected_fks.retain(|fk| {
         fk.parent_key_may_change_with_affected_columns(
             updated_positions,
@@ -2137,7 +2133,7 @@ impl ForeignKeyActions<PreparedFkDeleteAction> {
         let mut prepared = Vec::new();
 
         for fk_ref in resolver.with_schema(database_id, |s| {
-            s.resolved_fks_referencing(parent_table_name)
+            s.resolved_fks_referencing(parent_table_name, None)
         })? {
             let parent_cols: &[String] = &fk_ref.parent_cols;
             let ncols = parent_cols.len();
@@ -2422,7 +2418,7 @@ pub fn emit_fk_drop_table_check(
 
     // Get all FK references to this parent table
     let fk_refs = resolver.with_schema(database_id, |s| {
-        s.resolved_fks_referencing(parent_table_name)
+        s.resolved_fks_referencing(parent_table_name, None)
     })?;
 
     if fk_refs.is_empty() {
