@@ -1,3 +1,4 @@
+use crate::alloc::TursoIteratorExt;
 use crate::schema::ColumnLayout;
 use crate::translate::emitter::{
     emit_index_column_value_old_image, emit_partial_index_where_old_image, gencol,
@@ -544,6 +545,18 @@ pub fn translate_insert(
         }));
 
     let has_before_triggers = !relevant_before_triggers.is_empty();
+    let key_before_triggers =
+        has_before_triggers && resolver.dialect.rowid_before_insert_triggers();
+    if key_before_triggers {
+        emit_key(
+            program,
+            &ctx,
+            &insertion,
+            resolver,
+            is_mvcc,
+            has_user_provided_rowid,
+        )?;
+    }
     if has_before_triggers {
         compute_virtual_columns(
             program,
@@ -556,7 +569,9 @@ pub fn translate_insert(
         // In SQLite, NEW.<rowid_alias> returns -1 in BEFORE INSERT triggers when the rowid
         // hasn't been assigned yet (i.e., it's NULL). We need to temporarily set the key
         // register to -1 so the trigger sees the correct value.
-        let saved_key_reg = if has_user_provided_rowid {
+        let saved_key_reg = if key_before_triggers {
+            None
+        } else if has_user_provided_rowid {
             // User provided a value that might be NULL. Save original value, replace NULL with -1.
             let save_reg = program.alloc_register();
             program.emit_insn(Insn::Copy {
@@ -622,7 +637,8 @@ pub fn translate_insert(
                 Some(new_registers),
                 None, // No OLD for INSERT
             )
-        };
+        }
+        .with_changeable_new_columns((0..btree_table.columns().len()).try_collect()?);
         for trigger in relevant_before_triggers {
             fire_trigger(
                 program,
@@ -645,17 +661,16 @@ pub fn translate_insert(
         }
     }
 
-    if has_user_provided_rowid {
-        emit_check_for_user_provided_rowid(program, &insertion, &ctx);
+    if !key_before_triggers {
+        emit_key(
+            program,
+            &ctx,
+            &insertion,
+            resolver,
+            is_mvcc,
+            has_user_provided_rowid,
+        )?;
     }
-
-    program.preassign_label_to_next_insn(ctx.key_labels.key_generation);
-
-    if ctx.table.has_rowid {
-        emit_rowid_generation(program, &ctx, &insertion, resolver, is_mvcc)?;
-    }
-
-    program.preassign_label_to_next_insn(ctx.key_labels.key_ready_for_check);
 
     //TODO building the type-check table is expensive, we should cache it somehow.
     let maybe_type_check_table = ctx
@@ -1143,6 +1158,29 @@ pub fn translate_insert(
 }
 
 /// If the user provided an explicit rowid for this insert, we must validate that it is an Integer and non-null
+/// Use the rowid that the statement gives, or make a new one.
+fn emit_key(
+    program: &mut ProgramBuilder,
+    ctx: &InsertEmitCtx,
+    insertion: &Insertion,
+    resolver: &Resolver,
+    is_mvcc: bool,
+    has_user_provided_rowid: bool,
+) -> Result<()> {
+    if has_user_provided_rowid {
+        emit_check_for_user_provided_rowid(program, insertion, ctx);
+    }
+
+    program.preassign_label_to_next_insn(ctx.key_labels.key_generation);
+
+    if ctx.table.has_rowid {
+        emit_rowid_generation(program, ctx, insertion, resolver, is_mvcc)?;
+    }
+
+    program.preassign_label_to_next_insn(ctx.key_labels.key_ready_for_check);
+    Ok(())
+}
+
 fn emit_check_for_user_provided_rowid(
     program: &mut ProgramBuilder,
     insertion: &Insertion,

@@ -695,6 +695,9 @@ impl Statement {
     fn prepare_step(&mut self, waker: Option<&Waker>) -> Result<Option<StepResult>> {
         if !self.counted_as_active_root && matches!(self.origin, StatementOrigin::Root) {
             self.program.connection.start_root_statement()?;
+            let now = self.pager.io.current_time_wall_clock();
+            self.program.connection.record_statement_start(now);
+            self.state.current_time = Some(now);
             self.counted_as_active_root = true;
             // After the root count, so the checkpoint guard's subtraction
             // can only read stale-high (see release_active_root_if_counted).

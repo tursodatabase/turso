@@ -6,5 +6,6 @@ mod functions;
 mod parse_edge_cases;
 mod sequence;
 mod table;
+mod trigger;
 mod type_aliases;
 mod update_from;

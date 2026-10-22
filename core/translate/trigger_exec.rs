@@ -1,6 +1,8 @@
+use crate::dialect::ChangedColumn;
 use crate::schema::{BTreeTable, Trigger};
 use crate::sync::Arc;
 use crate::translate::expr::WalkControl;
+use crate::translate::plan::ColumnMask;
 use crate::translate::subquery::{
     emit_non_from_clause_subquery, plan_subqueries_from_trigger_when_clause,
 };
@@ -17,6 +19,7 @@ use crate::vdbe::BranchOffset;
 use crate::{bail_parse_error, QueryMode, Result};
 use std::cell::RefCell;
 use std::num::NonZero;
+use turso_macros::turso_assert;
 use turso_parser::ast::{self, Expr, TriggerEvent, TriggerTime};
 
 /// Context for trigger execution
@@ -38,6 +41,10 @@ pub struct TriggerContext {
     /// True for AFTER triggers (values have been encoded for storage).
     /// False for BEFORE triggers (values are still user-facing).
     pub new_encoded: bool,
+    /// The columns of NEW that a BEFORE trigger can change. The statement
+    /// writes the values that the trigger puts into these NEW registers.
+    /// `None` when the statement does not let a trigger change NEW.
+    pub changeable_new_columns: Option<ColumnMask>,
 }
 
 impl TriggerContext {
@@ -52,6 +59,7 @@ impl TriggerContext {
             old_registers,
             override_conflict: None,
             new_encoded: false,
+            changeable_new_columns: None,
         }
     }
 
@@ -67,6 +75,7 @@ impl TriggerContext {
             old_registers,
             override_conflict: None,
             new_encoded: true,
+            changeable_new_columns: None,
         }
     }
 
@@ -85,6 +94,7 @@ impl TriggerContext {
             old_registers,
             override_conflict: Some(override_conflict),
             new_encoded: false,
+            changeable_new_columns: None,
         }
     }
 
@@ -101,7 +111,14 @@ impl TriggerContext {
             old_registers,
             override_conflict: Some(override_conflict),
             new_encoded: true,
+            changeable_new_columns: None,
         }
+    }
+
+    /// Let BEFORE triggers change these columns of NEW.
+    pub fn with_changeable_new_columns(mut self, columns: ColumnMask) -> Self {
+        self.changeable_new_columns = Some(columns);
+        self
     }
 }
 
@@ -394,6 +411,81 @@ fn trigger_cmd_to_stmt_for_subprogram(
     }
 }
 
+fn rewrite_stmt_for_subprogram(stmt: &mut ast::Stmt, ctx: &TriggerSubprogramContext) -> Result<()> {
+    match stmt {
+        ast::Stmt::Insert {
+            with,
+            or_conflict,
+            body,
+            returning,
+            ..
+        } => {
+            rewrite_with_for_subprogram(with.as_mut(), ctx)?;
+            if let ast::InsertBody::Select(select, upsert) = body {
+                rewrite_expressions_in_select_for_subprogram(select, ctx)?;
+                rewrite_upsert_exprs_for_subprogram(upsert, ctx)?;
+            }
+            rewrite_result_columns_for_subprogram(returning, ctx)?;
+            *or_conflict = ctx.override_conflict.or(*or_conflict);
+        }
+        ast::Stmt::Update(update) => {
+            rewrite_with_for_subprogram(update.with.as_mut(), ctx)?;
+            for set in &mut update.sets {
+                rewrite_trigger_expr_for_subprogram(&mut set.expr, ctx)?;
+            }
+            if let Some(from) = &mut update.from {
+                rewrite_from_clause_expressions(from, &mut |e: &mut ast::Expr| {
+                    rewrite_trigger_expr_single_for_subprogram(e, ctx)
+                })?;
+            }
+            if let Some(where_clause) = &mut update.where_clause {
+                rewrite_trigger_expr_for_subprogram(where_clause, ctx)?;
+            }
+            rewrite_result_columns_for_subprogram(&mut update.returning, ctx)?;
+            update.or_conflict = ctx.override_conflict.or(update.or_conflict);
+        }
+        ast::Stmt::Delete {
+            with,
+            where_clause,
+            returning,
+            ..
+        } => {
+            rewrite_with_for_subprogram(with.as_mut(), ctx)?;
+            if let Some(where_clause) = where_clause {
+                rewrite_trigger_expr_for_subprogram(where_clause, ctx)?;
+            }
+            rewrite_result_columns_for_subprogram(returning, ctx)?;
+        }
+        ast::Stmt::Select(select) => rewrite_expressions_in_select_for_subprogram(select, ctx)?,
+        _ => bail_parse_error!(
+            "a trigger body can contain only INSERT, UPDATE, DELETE and SELECT statements"
+        ),
+    }
+    Ok(())
+}
+
+fn rewrite_with_for_subprogram(
+    with: Option<&mut ast::With>,
+    ctx: &TriggerSubprogramContext,
+) -> Result<()> {
+    for cte in with.into_iter().flat_map(|with| with.ctes.iter_mut()) {
+        rewrite_expressions_in_select_for_subprogram(&mut cte.select, ctx)?;
+    }
+    Ok(())
+}
+
+fn rewrite_result_columns_for_subprogram(
+    columns: &mut [ast::ResultColumn],
+    ctx: &TriggerSubprogramContext,
+) -> Result<()> {
+    for column in columns {
+        if let ast::ResultColumn::Expr(expr, _) = column {
+            rewrite_trigger_expr_for_subprogram(expr, ctx)?;
+        }
+    }
+    Ok(())
+}
+
 /// Rewrite NEW/OLD references in all expressions within a SELECT statement for subprogram
 fn rewrite_expressions_in_select_for_subprogram(
     select: &mut ast::Select,
@@ -592,13 +684,17 @@ fn execute_trigger_commands(
     } else {
         database_id
     };
-    // `resolver` is reborrowed as `&mut Resolver` on every trigger command
-    // below (`translate_inner` needs it), so the scope closure takes
-    // `resolver` as a parameter rather than capturing the outer binding -
-    // see `Resolver::with_database_scope_mut`.
-    resolver.with_trigger_scope(trigger_database_id, trigger.name.clone(), |resolver| {
-        for command in trigger.commands.iter() {
-            let stmt = trigger_cmd_to_stmt_for_subprogram(command, &subprogram_ctx)?;
+    let dialect = resolver.dialect.clone();
+    let dialect_body = dialect.trigger_body(trigger, &ctx.table, &*resolver, &*resolver)?;
+    let mut changed_columns = Vec::new();
+    if let Some(body) = dialect_body {
+        changed_columns = body.changed_columns;
+        for mut stmt in body.statements {
+            rewrite_stmt_for_subprogram(&mut stmt, &subprogram_ctx)?;
+            let writes = matches!(
+                stmt,
+                ast::Stmt::Insert { .. } | ast::Stmt::Update(_) | ast::Stmt::Delete { .. }
+            );
             subprogram_builder.prologue();
             translate_inner(
                 stmt,
@@ -607,17 +703,38 @@ fn execute_trigger_commands(
                 connection,
                 "trigger subprogram",
             )?;
-            if matches!(
-                command,
-                ast::TriggerCmd::Insert { .. }
-                    | ast::TriggerCmd::Update { .. }
-                    | ast::TriggerCmd::Delete { .. }
-            ) {
+            if writes {
                 subprogram_builder.emit_insn(Insn::ResetCount);
             }
         }
-        Ok(())
-    })?;
+    } else {
+        // `resolver` is reborrowed as `&mut Resolver` on every trigger command
+        // below (`translate_inner` needs it), so the scope closure takes
+        // `resolver` as a parameter rather than capturing the outer binding -
+        // see `Resolver::with_database_scope_mut`.
+        resolver.with_trigger_scope(trigger_database_id, trigger.name.clone(), |resolver| {
+            for command in trigger.commands.iter() {
+                let stmt = trigger_cmd_to_stmt_for_subprogram(command, &subprogram_ctx)?;
+                subprogram_builder.prologue();
+                translate_inner(
+                    stmt,
+                    resolver,
+                    &mut subprogram_builder,
+                    connection,
+                    "trigger subprogram",
+                )?;
+                if matches!(
+                    command,
+                    ast::TriggerCmd::Insert { .. }
+                        | ast::TriggerCmd::Update { .. }
+                        | ast::TriggerCmd::Delete { .. }
+                ) {
+                    subprogram_builder.emit_insn(Insn::ResetCount);
+                }
+            }
+            Ok(())
+        })?;
+    }
     subprogram_builder.epilogue(resolver.schema());
     let built_subprogram =
         subprogram_builder.build(connection.clone(), true, "trigger subprogram")?;
@@ -679,8 +796,72 @@ fn execute_trigger_commands(
         program: Subprogram::PreparedProgram(built_subprogram.prepared().clone()),
         ignore_jump_target,
     });
+    if !changed_columns.is_empty() {
+        emit_changed_columns(program, resolver, trigger, ctx, changed_columns, connection)?;
+    }
 
     Ok(true)
+}
+
+/// Write the values of the columns that a BEFORE trigger changes into NEW.
+/// Core calculates all values before it writes one, because each value reads
+/// NEW as the trigger saw it.
+fn emit_changed_columns(
+    program: &mut ProgramBuilder,
+    resolver: &mut Resolver,
+    trigger: &Trigger,
+    ctx: &TriggerContext,
+    changed_columns: Vec<ChangedColumn>,
+    connection: &Arc<crate::Connection>,
+) -> Result<()> {
+    let (Some(new_registers), Some(changeable_columns)) =
+        (&ctx.new_registers, &ctx.changeable_new_columns)
+    else {
+        bail_parse_error!(
+            "trigger {} cannot change the row in this statement",
+            trigger.name
+        );
+    };
+    let mut values = Vec::with_capacity(changed_columns.len());
+    for ChangedColumn { name, mut value } in changed_columns {
+        let Some((index, column)) = ctx.table.get_column(&normalize_ident(&name)) else {
+            bail_parse_error!("no such column: {}", name);
+        };
+        if column.is_rowid_alias() || column.is_generated() {
+            bail_parse_error!("trigger {} cannot change column {}", trigger.name, name);
+        }
+        turso_assert!(
+            changeable_columns.get(index),
+            "the statement must let the trigger change each column that it changes"
+        );
+        rewrite_trigger_expr_for_when_clause(&mut value, &ctx.table, ctx)?;
+        let mut subqueries = Vec::new();
+        plan_subqueries_from_trigger_when_clause(
+            program,
+            &mut subqueries,
+            &mut value,
+            resolver,
+            connection,
+        )?;
+        for subquery in &mut subqueries {
+            let plan = subquery.consume_plan(crate::translate::plan::EvalAt::BeforeLoop);
+            emit_non_from_clause_subquery(program, resolver, *plan, &subquery.query_type, true)?;
+        }
+        let value_register = program.alloc_register();
+        translate_expr(program, None, &value, value_register, resolver)?;
+        values.push((new_registers[index], value_register, column.affinity()));
+    }
+    for (new_register, value_register, affinity) in values {
+        program.emit_insn(Insn::Copy {
+            src_reg: value_register,
+            dst_reg: new_register,
+            extra_amount: 0,
+        });
+        if !ctx.table.is_strict {
+            program.emit_column_affinity(new_register, affinity);
+        }
+    }
+    Ok(())
 }
 
 /// Check if there are any triggers for a given event (regardless of time).
@@ -814,7 +995,35 @@ pub fn get_triggers_including_temp(
         }
         triggers = list.into();
     }
+    resolver.dialect.order_triggers(&mut triggers);
     triggers
+}
+
+/// The columns of `table` that these BEFORE triggers of a dialect change. An
+/// UPDATE writes them as if the statement set them. A trigger cannot change
+/// the rowid alias or a generated column; compiling the trigger reports that.
+pub fn columns_changed_by_triggers(
+    resolver: &Resolver,
+    triggers: &[Arc<Trigger>],
+    table: &BTreeTable,
+) -> Result<ColumnMask> {
+    let mut columns = ColumnMask::default();
+    for trigger in triggers {
+        let Some(body) = resolver
+            .dialect
+            .trigger_body(trigger, table, resolver, resolver)?
+        else {
+            continue;
+        };
+        for changed in body.changed_columns {
+            if let Some((index, column)) = table.get_column(&normalize_ident(&changed.name)) {
+                if !column.is_rowid_alias() && !column.is_generated() {
+                    columns.set(index)?;
+                }
+            }
+        }
+    }
+    Ok(columns)
 }
 
 /// Like [`has_relevant_triggers_type_only`], but also checks the temp schema.
@@ -886,7 +1095,11 @@ pub fn fire_trigger(
         });
 
         // Evaluate WHEN clause if present
-        if let Some(mut when_expr) = trigger.when_clause.clone() {
+        let when_clause = match resolver.dialect.trigger_when_clause(&trigger, &ctx.table)? {
+            Some(when_clause) => Some(when_clause),
+            None => trigger.when_clause.clone(),
+        };
+        if let Some(mut when_expr) = when_clause {
             crate::stack::trace_stack!("when_clause");
             // Rewrite NEW/OLD references in WHEN clause to use registers
             rewrite_trigger_expr_for_when_clause(&mut when_expr, &ctx.table, ctx)?;
@@ -985,6 +1198,10 @@ fn decode_trigger_registers(
     resolver: &Resolver,
     ctx: &TriggerContext,
 ) -> Result<TriggerContext> {
+    turso_assert!(
+        !ctx.new_encoded || ctx.changeable_new_columns.is_none(),
+        "a trigger cannot change NEW registers that have encoded values"
+    );
     if !ctx.table.is_strict {
         // Non-STRICT tables never have custom type encoding
         return Ok(TriggerContext {
@@ -993,6 +1210,7 @@ fn decode_trigger_registers(
             old_registers: ctx.old_registers.clone(),
             override_conflict: ctx.override_conflict,
             new_encoded: false,
+            changeable_new_columns: ctx.changeable_new_columns.clone(),
         });
     }
 
@@ -1006,6 +1224,7 @@ fn decode_trigger_registers(
                 resolver,
                 columns,
                 &|i| new_regs[i],
+                &|_| true,
                 rowid_reg,
                 true, // is_strict
             )?)
@@ -1023,6 +1242,7 @@ fn decode_trigger_registers(
             resolver,
             columns,
             &|i| old_regs[i],
+            &|_| true,
             rowid_reg,
             true, // is_strict
         )?)
@@ -1036,6 +1256,7 @@ fn decode_trigger_registers(
         old_registers: decoded_old,
         override_conflict: ctx.override_conflict,
         new_encoded: false, // decoded now
+        changeable_new_columns: ctx.changeable_new_columns.clone(),
     })
 }
 

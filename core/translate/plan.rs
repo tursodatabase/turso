@@ -1001,6 +1001,19 @@ impl UpdateSetClause {
         }
     }
 
+    /// `SET c = c` for a column that the statement does not name, because a
+    /// `BEFORE UPDATE` trigger can change the column. The clause has no
+    /// column names, so `UPDATE OF` triggers do not fire for such a column,
+    /// as in PostgreSQL.
+    pub fn new_for_trigger_change(column_index: usize, expr: Box<ast::Expr>) -> Self {
+        Self {
+            column_index,
+            column_names: Vec::new(),
+            expr,
+            update_from_result: None,
+        }
+    }
+
     /// If UPDATE ... FROM, the this is the materialized result of a SET clause expression derived from the FROM clause;
     /// otherwise, it is the original expression.
     pub fn emitted_expr(&self) -> &ast::Expr {

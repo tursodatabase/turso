@@ -2,8 +2,13 @@ mod catalog;
 mod copy;
 mod functions;
 mod options;
+mod plpgsql;
+mod plpgsql_names;
 mod session;
+mod sql_function;
+mod trigger;
 mod unnest;
+mod user_function;
 
 pub use session::PgConnection as Connection;
 pub use session::{

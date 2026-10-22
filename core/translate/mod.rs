@@ -19,6 +19,7 @@ pub mod eqp;
 pub(crate) mod expr;
 pub(crate) mod expression_index;
 pub(crate) mod fkeys;
+mod function_catalog;
 pub(crate) mod group_by;
 pub(crate) mod index;
 pub(crate) mod insert;
@@ -193,6 +194,8 @@ pub fn translate_inner(
             | ast::Stmt::Insert { .. }
             | ast::Stmt::CreateSequence { .. }
             | ast::Stmt::DropSequence { .. }
+            | ast::Stmt::CreateFunction { .. }
+            | ast::Stmt::DropFunction { .. }
     );
     let is_vacuum = matches!(stmt, ast::Stmt::Vacuum { .. });
 
@@ -505,6 +508,21 @@ pub fn translate_inner(
         } => {
             sequence::translate_drop_sequence(&seq_name, if_exists, resolver, program)?;
         }
+        ast::Stmt::CreateFunction {
+            or_replace,
+            func_name,
+            arg_count,
+            definition,
+        } => function_catalog::translate_create_function(
+            or_replace, &func_name, arg_count, definition, resolver, program,
+        )?,
+        ast::Stmt::DropFunction {
+            if_exists,
+            func_name,
+            arg_count,
+        } => function_catalog::translate_drop_function(
+            if_exists, &func_name, arg_count, resolver, program,
+        )?,
     };
 
     if is_write {
@@ -573,6 +591,8 @@ fn stmt_kind(stmt: &ast::Stmt) -> &'static str {
         ast::Stmt::Optimize { .. } => "optimize",
         ast::Stmt::CreateSequence { .. } => "create_sequence",
         ast::Stmt::DropSequence { .. } => "drop_sequence",
+        ast::Stmt::CreateFunction { .. } => "create_function",
+        ast::Stmt::DropFunction { .. } => "drop_function",
     }
 }
 

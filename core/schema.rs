@@ -135,6 +135,7 @@ pub const TEMP_SCHEMA_TABLE_NAME: &str = "sqlite_temp_schema";
 pub const TEMP_SCHEMA_TABLE_NAME_ALT: &str = "sqlite_temp_master";
 pub const SQLITE_SEQUENCE_TABLE_NAME: &str = "sqlite_sequence";
 pub const TURSO_TYPES_TABLE_NAME: &str = "__turso_internal_types";
+pub const TURSO_FUNCTIONS_TABLE_NAME: &str = "__turso_internal_functions";
 pub const DBSP_TABLE_PREFIX: &str = "__turso_internal_dbsp_state_v";
 /// Hidden per-view value-multiset table backing MIN/MAX and DISTINCT
 /// aggregates.
@@ -811,6 +812,17 @@ pub struct Schema {
     pub generated_columns_enabled: bool,
     /// Named sequences (CREATE SEQUENCE)
     pub sequences: HashMap<String, Arc<Sequence>>,
+    /// Functions of the frontend dialect, by name, loaded from
+    /// `__turso_internal_functions`
+    pub functions: HashMap<String, Vec<Arc<FunctionDef>>>,
+}
+
+/// A function that a frontend dialect defined with `CREATE FUNCTION`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FunctionDef {
+    pub name: String,
+    pub arg_count: usize,
+    pub definition: String,
 }
 
 impl Default for Schema {
@@ -955,6 +967,7 @@ impl Schema {
             type_registry,
             generated_columns_enabled: false,
             sequences: HashMap::default(),
+            functions: HashMap::default(),
         };
         dialect.register_catalog(&mut schema, enable_custom_types)?;
         Ok(schema)
@@ -1147,6 +1160,37 @@ impl Schema {
         }
         self.resolve_all_custom_type_affinities()?;
         Ok(())
+    }
+
+    pub fn get_function(&self, name: &str, arg_count: usize) -> Option<&Arc<FunctionDef>> {
+        self.functions_named(name)
+            .find(|function| function.arg_count == arg_count)
+    }
+
+    pub fn functions_named(&self, name: &str) -> impl Iterator<Item = &Arc<FunctionDef>> {
+        self.functions
+            .get(&normalize_ident(name))
+            .into_iter()
+            .flatten()
+    }
+
+    pub fn add_function(&mut self, function: FunctionDef) {
+        let overloads = self
+            .functions
+            .entry(function.name.clone())
+            .or_insert_with(|| vec![]);
+        overloads.retain(|existing| existing.arg_count != function.arg_count);
+        overloads.push(Arc::new(function));
+    }
+
+    pub fn remove_function(&mut self, name: &str, arg_count: usize) {
+        let Some(overloads) = self.functions.get_mut(name) else {
+            return;
+        };
+        overloads.retain(|existing| existing.arg_count != arg_count);
+        if overloads.is_empty() {
+            self.functions.remove(name);
+        }
     }
 
     /// Resolve custom type affinities for all STRICT tables in the schema.
@@ -3286,6 +3330,7 @@ impl TryClone for Schema {
             type_registry: self.type_registry.try_clone()?,
             generated_columns_enabled: self.generated_columns_enabled,
             sequences: self.sequences.try_clone()?,
+            functions: self.functions.try_clone()?,
         })
     }
 }

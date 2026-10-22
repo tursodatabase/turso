@@ -125,3 +125,49 @@ test bracket-analyze-table-name {
 expect {
     0
 }
+
+test quoted-function-name-with-a-dot-is-one-name {
+    SELECT "x.lower"('A');
+}
+expect error {
+    no such function: x.lower
+}
+
+test backtick-quoted-function-name-with-a-dot-is-one-name {
+    SELECT `x.lower`('A');
+}
+expect error {
+    no such function: x.lower
+}
+
+test quoted-function-name-with-the-main-schema-is-one-name {
+    SELECT "main.lower"('A');
+}
+expect error {
+    no such function: main.lower
+}
+
+test quoted-names-of-builtin-functions-call-the-functions {
+    SELECT "lower"('A'), `upper`('b'), "length"('abc');
+}
+expect {
+    a|B|3
+}
+
+test function-call-with-a-schema-is-a-syntax-error {
+    SELECT main.lower('A');
+}
+expect error {
+}
+
+test quoted-function-name-with-a-dot-in-a-trigger-is-one-name {
+    CREATE TABLE t(a);
+    CREATE TABLE log(x);
+    CREATE TRIGGER tr AFTER INSERT ON t BEGIN
+        INSERT INTO log VALUES ("x.lower"(NEW.a));
+    END;
+    INSERT INTO t VALUES ('A');
+}
+expect error {
+    no such function: x.lower
+}

@@ -106,6 +106,13 @@ impl PostgreSQLTranslator {
         }
     }
 
+    pub fn translate_expression(
+        &self,
+        node: &pg_query::protobuf::Node,
+    ) -> Result<ast::Expr, ParseError> {
+        self.translate_expr(node)
+    }
+
     /// Translate a PostgreSQL parse result into Turso's format.
     /// For statements that may generate prerequisites (e.g., serial columns),
     /// use `translate_with_prereqs` instead.
@@ -138,6 +145,23 @@ impl PostgreSQLTranslator {
                 prereqs: translated.prereqs,
                 cmd: translated.cmd,
             });
+        }
+
+        if let NodeRef::DropStmt(drop) = &node.0 {
+            use pg_query::protobuf::ObjectType;
+            if matches!(
+                drop.remove_type(),
+                ObjectType::ObjectFunction | ObjectType::ObjectProcedure
+            ) {
+                let mut prereqs = crate::function::translate_drop_functions(drop)?;
+                let last = prereqs
+                    .pop()
+                    .ok_or_else(|| ParseError::ParseError("DROP missing object name".into()))?;
+                return Ok(TranslateResult {
+                    prereqs,
+                    cmd: ast::Cmd::Stmt(last),
+                });
+            }
         }
 
         let cmd = match node.0 {
@@ -177,6 +201,9 @@ impl PostgreSQLTranslator {
             NodeRef::CreateTableAsStmt(ctas) => self.translate_create_table_as(ctas)?,
             NodeRef::CreateEnumStmt(enum_stmt) => translate_create_enum(enum_stmt)?,
             NodeRef::CreateDomainStmt(domain) => self.translate_create_domain(domain)?,
+            NodeRef::CreateFunctionStmt(function) => {
+                crate::function::translate_create_function(function)?
+            }
             NodeRef::CopyStmt(_) => {
                 return Err(ParseError::ParseError(
                     "COPY is handled at the postgres frontend layer".to_string(),
@@ -2444,7 +2471,8 @@ impl PostgreSQLTranslator {
                             // Regular column reference
                             let expr = self.translate_expr(val)?;
                             let alias: Option<ast::As> = if res_target.name.is_empty() {
-                                None
+                                last_string(&col_ref.fields)
+                                    .map(|name| ast::As::ImplicitColumnName(ast::Name::exact(name)))
                             } else {
                                 Some(ast::As::Elided(ast::Name::from_string(&res_target.name)))
                             };
@@ -3416,19 +3444,7 @@ impl PostgreSQLTranslator {
         &self,
         func_call: &pg_query::protobuf::FuncCall,
     ) -> Result<ast::Expr, ParseError> {
-        // Extract function name
-        let func_name = func_call
-            .funcname
-            .iter()
-            .filter_map(|node| {
-                if let Some(pg_query::protobuf::node::Node::String(s)) = &node.node {
-                    Some(s.sval.clone())
-                } else {
-                    None
-                }
-            })
-            .next_back()
-            .ok_or_else(|| ParseError::ParseError("Missing function name".to_string()))?;
+        let func_name = call_name(&func_call.funcname)?;
 
         // Translate FILTER clause
         let filter_clause = if let Some(ref filter) = func_call.agg_filter {
@@ -3469,12 +3485,6 @@ impl PostgreSQLTranslator {
         } else {
             None
         };
-
-        // Strip pg_catalog. schema prefix from function names
-        let func_name = func_name
-            .strip_prefix("pg_catalog.")
-            .unwrap_or(&func_name)
-            .to_string();
 
         // Rewrite PG-specific function-name spellings to their core-native
         // equivalents so the core resolver doesn't need to carry aliases
@@ -4457,7 +4467,26 @@ fn join_keeps_unmatched_right_rows(join: &ast::JoinedSelectTable) -> bool {
 }
 
 /// Maps a PostgreSQL schema name to the Turso schema that holds its tables.
-fn map_schema_name(schema: &str) -> &str {
+pub fn call_name(funcname: &[pg_query::protobuf::Node]) -> Result<String, ParseError> {
+    let names: Vec<&str> = funcname
+        .iter()
+        .filter_map(|node| match &node.node {
+            Some(pg_query::protobuf::node::Node::String(s)) => Some(s.sval.as_str()),
+            _ => None,
+        })
+        .collect();
+    match names.as_slice() {
+        [name] | ["pg_catalog", name] => Ok(name.to_string()),
+        [schema, name] => Ok(format!("{}.{name}", map_schema_name(schema))),
+        [] => Err(ParseError::ParseError("Missing function name".to_string())),
+        _ => Err(ParseError::ParseError(format!(
+            "improper qualified name (too many dotted names): {}",
+            names.join(".")
+        ))),
+    }
+}
+
+pub(crate) fn map_schema_name(schema: &str) -> &str {
     match schema.to_ascii_lowercase().as_str() {
         "pg_catalog" | "public" | "information_schema" => "main",
         _ => schema,
@@ -5941,7 +5970,9 @@ mod tests {
                     if let ast::Expr::Id(name) = &**expr {
                         assert_eq!(name.as_str(), "id");
                     }
-                    assert!(alias.is_none());
+                    assert!(
+                        matches!(alias, Some(ast::As::ImplicitColumnName(name)) if name.as_str() == "id")
+                    );
                 } else {
                     panic!("Expected expression result column for first column");
                 }
@@ -5955,7 +5986,9 @@ mod tests {
                     if let ast::Expr::Id(name) = &**expr {
                         assert_eq!(name.as_str(), "name");
                     }
-                    assert!(alias.is_none());
+                    assert!(
+                        matches!(alias, Some(ast::As::ImplicitColumnName(name)) if name.as_str() == "name")
+                    );
                 } else {
                     panic!("Expected expression result column for second column");
                 }
@@ -5993,7 +6026,9 @@ mod tests {
                         assert_eq!(table_name.as_str(), "users");
                         assert_eq!(col_name.as_str(), "id");
                     }
-                    assert!(alias.is_none());
+                    assert!(
+                        matches!(alias, Some(ast::As::ImplicitColumnName(name)) if name.as_str() == "id")
+                    );
                 } else {
                     panic!("Expected expression result column for first qualified column");
                 }
@@ -6008,7 +6043,9 @@ mod tests {
                         assert_eq!(table_name.as_str(), "t");
                         assert_eq!(col_name.as_str(), "name");
                     }
-                    assert!(alias.is_none());
+                    assert!(
+                        matches!(alias, Some(ast::As::ImplicitColumnName(name)) if name.as_str() == "name")
+                    );
                 } else {
                     panic!("Expected expression result column for second qualified column");
                 }

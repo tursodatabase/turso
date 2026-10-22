@@ -18,7 +18,8 @@ use crate::translate::insert::{format_unique_violation_desc, InsertEmitCtx};
 use crate::translate::plan::ColumnMask;
 use crate::translate::planner::ROWID_STRS;
 use crate::translate::trigger_exec::{
-    fire_trigger, get_triggers_including_temp, has_triggers_including_temp, TriggerContext,
+    columns_changed_by_triggers, fire_trigger, get_triggers_including_temp,
+    has_triggers_including_temp, TriggerContext,
 };
 use crate::translate::update::rowid_name_column_index;
 use crate::vdbe::insn::{to_u32, CmpInsFlags};
@@ -711,14 +712,6 @@ pub fn emit_upsert(
         );
         program.target_union_type = prev_union;
         translate_result?;
-        if col.notnull() && !col.is_rowid_alias() {
-            program.emit_insn(Insn::HaltIfNull {
-                target_reg: layout.to_register(new_start, *col_idx),
-                err_code: SQLITE_CONSTRAINT_NOTNULL,
-                description: String::from(table.get_name()) + "." + col.name.as_ref().unwrap(),
-                on_error: None,
-            });
-        }
         if col.is_rowid_alias() {
             // Must be integer; remember the NEW rowid value
             let r = program.alloc_register();
@@ -732,6 +725,196 @@ pub fn emit_upsert(
                 target_pc: None,
             });
             new_rowid_reg = Some(r);
+        }
+    }
+
+    // Fire BEFORE UPDATE triggers
+    let upsert_database_id = ctx.database_id;
+    let relevant_before_update_triggers = match table.btree() {
+        Some(btree_table) => get_triggers_including_temp(
+            resolver,
+            upsert_database_id,
+            TriggerEvent::Update,
+            TriggerTime::Before,
+            Some(set_column_names),
+            &btree_table,
+        ),
+        None => Vec::new(),
+    };
+    let trigger_changed_positions = match table.btree() {
+        Some(btree_table) => {
+            columns_changed_by_triggers(resolver, &relevant_before_update_triggers, &btree_table)?
+        }
+        None => ColumnMask::default(),
+    };
+    let mut updated_positions: ColumnMask = set_pairs
+        .iter()
+        .map(|(col_idx, _)| *col_idx)
+        .try_collect()?;
+    updated_positions.union_with(&trigger_changed_positions)?;
+    let preserved_old_registers: Option<Vec<usize>> = if let Some(btree_table) = table.btree() {
+        // OLD row values are in current_start registers
+        let old_registers: Vec<usize> = (0..num_cols)
+            .map(|i| layout.to_register(current_start, i))
+            .chain(std::iter::once(ctx.conflict_rowid_reg))
+            .collect();
+        if !relevant_before_update_triggers.is_empty() {
+            // NEW row values are in new_start registers, decoded at this point.
+            emit_new_row_conversion_before_triggers(
+                program,
+                resolver,
+                &btree_table,
+                new_start,
+                &layout,
+            )?;
+            compute_new_row_virtual_columns(
+                program,
+                ctx,
+                new_start,
+                new_rowid_reg.unwrap_or(ctx.conflict_rowid_reg),
+                &layout,
+                resolver,
+            )?;
+            let new_rowid_for_trigger = new_rowid_reg.unwrap_or(ctx.conflict_rowid_reg);
+            let new_registers: Vec<usize> = (0..num_cols)
+                .map(|i| layout.to_register(new_start, i))
+                .chain(std::iter::once(new_rowid_for_trigger))
+                .collect();
+
+            // In UPSERT DO UPDATE context, trigger's INSERT/UPDATE OR IGNORE/REPLACE
+            // clauses should not suppress errors. Override conflict resolution to Abort.
+            let trigger_ctx = TriggerContext::new_with_override_conflict(
+                btree_table.clone(),
+                Some(new_registers),
+                Some(old_registers.clone()),
+                ast::ResolveType::Abort,
+            )
+            .with_changeable_new_columns(updated_positions.clone());
+
+            for trigger in relevant_before_update_triggers {
+                fire_trigger(
+                    program,
+                    resolver,
+                    trigger,
+                    &trigger_ctx,
+                    connection,
+                    upsert_database_id,
+                    ctx.loop_labels.row_done,
+                )?;
+            }
+
+            // BEFORE UPDATE triggers may have altered the btree, need to re-seek
+            program.emit_insn(Insn::NotExists {
+                cursor: ctx.cursor_id,
+                rowid_reg: ctx.conflict_rowid_reg,
+                target_pc: ctx.loop_labels.row_done,
+            });
+
+            // The triggers may also have changed this row, so re-read it:
+            // index deletion must use the row as it is on disk now, or the
+            // trigger's index entries are left behind (#8744).
+            if let Some(before) = before_start {
+                for (i, column) in table.columns().iter().enumerate() {
+                    emit_table_column(
+                        program,
+                        ctx.cursor_id,
+                        table_ref_id,
+                        table_references,
+                        column,
+                        i,
+                        layout.to_register(before, i),
+                        resolver,
+                    )?;
+                }
+            }
+
+            // Same for the NEW image: like SQLite, columns not in the SET list
+            // must keep the values the triggers wrote, while SET columns keep
+            // their values computed from the pre-trigger row. The NEW image is
+            // decoded here, so decode the columns read again.
+            let mut reread_positions = ColumnMask::default();
+            for (i, column) in table.columns().iter().enumerate() {
+                if updated_positions.get(i) || column.is_virtual_generated() {
+                    continue;
+                }
+                emit_table_column(
+                    program,
+                    ctx.cursor_id,
+                    table_ref_id,
+                    table_references,
+                    column,
+                    i,
+                    layout.to_register(new_start, i),
+                    resolver,
+                )?;
+                reread_positions.set(i)?;
+            }
+            if btree_table.is_strict {
+                crate::translate::expr::emit_custom_type_decode_columns(
+                    program,
+                    resolver,
+                    btree_table.columns(),
+                    new_start,
+                    Some(&reread_positions),
+                    &layout,
+                )?;
+            }
+
+            let has_relevant_after_triggers = has_triggers_including_temp(
+                resolver,
+                upsert_database_id,
+                TriggerEvent::Update,
+                Some(set_column_names),
+                &btree_table,
+            );
+            if has_relevant_after_triggers {
+                // Preserve OLD registers for AFTER triggers
+                let preserved: Vec<usize> = old_registers
+                    .iter()
+                    .map(|old_reg| {
+                        let preserved_reg = program.alloc_register();
+                        program.emit_insn(Insn::Copy {
+                            src_reg: *old_reg,
+                            dst_reg: preserved_reg,
+                            extra_amount: 0,
+                        });
+                        preserved_reg
+                    })
+                    .collect();
+                Some(preserved)
+            } else {
+                None
+            }
+        } else {
+            // Check if we need to preserve for AFTER triggers
+            let has_relevant_after_triggers = has_triggers_including_temp(
+                resolver,
+                upsert_database_id,
+                TriggerEvent::Update,
+                Some(set_column_names),
+                &btree_table,
+            );
+            if has_relevant_after_triggers {
+                Some(old_registers)
+            } else {
+                None
+            }
+        }
+    } else {
+        None
+    };
+
+    for col_idx in updated_positions.iter() {
+        let Some(col) = table.columns().get(col_idx) else {
+            continue;
+        };
+        if col.notnull() && !col.is_rowid_alias() {
+            program.emit_insn(Insn::HaltIfNull {
+                target_reg: layout.to_register(new_start, col_idx),
+                err_code: SQLITE_CONSTRAINT_NOTNULL,
+                description: String::from(table.get_name()) + "." + col.name.as_ref().unwrap(),
+                on_error: None,
+            });
         }
     }
 
@@ -826,14 +1009,9 @@ pub fn emit_upsert(
         )?;
     }
 
-    let (directly_changed_cols, rowid_changed) = collect_changed_cols(table, set_pairs);
+    let (mut directly_changed_cols, rowid_changed) = collect_changed_cols(table, set_pairs);
+    directly_changed_cols.union_with(&trigger_changed_positions)?;
 
-    // Fire BEFORE UPDATE triggers
-    let upsert_database_id = ctx.database_id;
-    let updated_positions: ColumnMask = set_pairs
-        .iter()
-        .map(|(col_idx, _)| *col_idx)
-        .try_collect()?;
     let table_btree = table.btree();
     let affected_parent_fks = match (connection.foreign_keys_enabled(), table_btree.as_deref()) {
         (true, Some(table)) => {
@@ -853,148 +1031,6 @@ pub fn emit_upsert(
             ast::RefAct::Cascade | ast::RefAct::SetNull | ast::RefAct::SetDefault
         )
     });
-    let preserved_old_registers: Option<Vec<usize>> = if let Some(btree_table) = table_btree {
-        let relevant_before_update_triggers = get_triggers_including_temp(
-            resolver,
-            upsert_database_id,
-            TriggerEvent::Update,
-            TriggerTime::Before,
-            Some(set_column_names),
-            &btree_table,
-        );
-        // OLD row values are in current_start registers
-        let old_registers: Vec<usize> = (0..num_cols)
-            .map(|i| layout.to_register(current_start, i))
-            .chain(std::iter::once(ctx.conflict_rowid_reg))
-            .collect();
-        if !relevant_before_update_triggers.is_empty() {
-            // NEW row values are in new_start registers. At this point they are
-            // encoded (post-encode for STRICT custom types). Mark new_encoded=true
-            // so fire_trigger's decode_trigger_registers will decode them.
-            let new_rowid_for_trigger = new_rowid_reg.unwrap_or(ctx.conflict_rowid_reg);
-            let new_registers: Vec<usize> = (0..num_cols)
-                .map(|i| layout.to_register(new_start, i))
-                .chain(std::iter::once(new_rowid_for_trigger))
-                .collect();
-
-            // In UPSERT DO UPDATE context, trigger's INSERT/UPDATE OR IGNORE/REPLACE
-            // clauses should not suppress errors. Override conflict resolution to Abort.
-            // Use new_after variant because NEW values are encoded at this point.
-            let trigger_ctx = TriggerContext::new_after_with_override_conflict(
-                btree_table.clone(),
-                Some(new_registers),
-                Some(old_registers.clone()),
-                ast::ResolveType::Abort,
-            );
-
-            for trigger in relevant_before_update_triggers {
-                fire_trigger(
-                    program,
-                    resolver,
-                    trigger,
-                    &trigger_ctx,
-                    connection,
-                    upsert_database_id,
-                    ctx.loop_labels.row_done,
-                )?;
-            }
-
-            // BEFORE UPDATE triggers may have altered the btree, need to re-seek
-            program.emit_insn(Insn::NotExists {
-                cursor: ctx.cursor_id,
-                rowid_reg: ctx.conflict_rowid_reg,
-                target_pc: ctx.loop_labels.row_done,
-            });
-
-            // The triggers may also have changed this row, so re-read it:
-            // index deletion must use the row as it is on disk now, or the
-            // trigger's index entries are left behind (#8744).
-            if let Some(before) = before_start {
-                for (i, column) in table.columns().iter().enumerate() {
-                    emit_table_column(
-                        program,
-                        ctx.cursor_id,
-                        table_ref_id,
-                        table_references,
-                        column,
-                        i,
-                        layout.to_register(before, i),
-                        resolver,
-                    )?;
-                }
-            }
-
-            // Same for the NEW image: like SQLite, columns not in the SET list
-            // must keep the values the triggers wrote, while SET columns keep
-            // their values computed from the pre-trigger row. Virtual columns
-            // are recomputed from the refreshed base columns.
-            for (i, column) in table.columns().iter().enumerate() {
-                if updated_positions.get(i) || column.is_virtual_generated() {
-                    continue;
-                }
-                emit_table_column(
-                    program,
-                    ctx.cursor_id,
-                    table_ref_id,
-                    table_references,
-                    column,
-                    i,
-                    layout.to_register(new_start, i),
-                    resolver,
-                )?;
-            }
-            compute_new_row_virtual_columns(
-                program,
-                ctx,
-                new_start,
-                new_rowid_reg.unwrap_or(ctx.conflict_rowid_reg),
-                &layout,
-                resolver,
-            )?;
-
-            let has_relevant_after_triggers = has_triggers_including_temp(
-                resolver,
-                upsert_database_id,
-                TriggerEvent::Update,
-                Some(set_column_names),
-                &btree_table,
-            );
-            if has_relevant_after_triggers {
-                // Preserve OLD registers for AFTER triggers
-                let preserved: Vec<usize> = old_registers
-                    .iter()
-                    .map(|old_reg| {
-                        let preserved_reg = program.alloc_register();
-                        program.emit_insn(Insn::Copy {
-                            src_reg: *old_reg,
-                            dst_reg: preserved_reg,
-                            extra_amount: 0,
-                        });
-                        preserved_reg
-                    })
-                    .collect();
-                Some(preserved)
-            } else {
-                None
-            }
-        } else {
-            // Check if we need to preserve for AFTER triggers
-            let has_relevant_after_triggers = has_triggers_including_temp(
-                resolver,
-                upsert_database_id,
-                TriggerEvent::Update,
-                Some(set_column_names),
-                &btree_table,
-            );
-            if has_relevant_after_triggers {
-                Some(old_registers)
-            } else {
-                None
-            }
-        }
-    } else {
-        None
-    };
     let rowid_alias_idx = table.columns().iter().position(|c| c.is_rowid_alias());
     let has_direct_rowid_update = set_pairs
         .iter()
@@ -1603,6 +1639,47 @@ pub fn emit_upsert(
     program.emit_insn(Insn::Goto {
         target_pc: ctx.loop_labels.row_done,
     });
+    Ok(())
+}
+
+/// Convert the new row as SQLite does before the BEFORE UPDATE triggers: the
+/// input type check of a STRICT table, or the column affinity of another
+/// table. The checks after the triggers convert the values that a trigger
+/// changes.
+fn emit_new_row_conversion_before_triggers(
+    program: &mut ProgramBuilder,
+    resolver: &Resolver,
+    table: &Arc<BTreeTable>,
+    new_start: usize,
+    layout: &ColumnLayout,
+) -> crate::Result<()> {
+    if table.is_strict {
+        program.emit_insn(Insn::TypeCheck {
+            start_reg: new_start,
+            count: layout.num_non_virtual_cols(),
+            check_generated: false,
+            table_reference: BTreeTable::input_type_check_table_ref(
+                table,
+                resolver.schema(),
+                None,
+            )?,
+        });
+        return Ok(());
+    }
+    let affinity = table
+        .columns()
+        .iter()
+        .filter(|c| !c.is_virtual_generated())
+        .map(|c| c.affinity());
+    if affinity.clone().any(|a| a != Affinity::Blob) {
+        if let Ok(count) = NonZeroUsize::try_from(layout.num_non_virtual_cols()) {
+            program.emit_insn(Insn::Affinity {
+                start_reg: new_start,
+                count,
+                affinities: affinity.map(|a| a.aff_mask()).collect(),
+            });
+        }
+    }
     Ok(())
 }
 

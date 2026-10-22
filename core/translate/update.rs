@@ -7,6 +7,7 @@ use crate::translate::expr::{bind_and_rewrite_expr, BindingBehavior};
 use crate::translate::expression_index::expression_index_column_usage;
 use crate::translate::plan::{ColumnMask, Operation};
 use crate::translate::planner::ROWID_STRS;
+use crate::translate::trigger_exec::{columns_changed_by_triggers, get_triggers_including_temp};
 use crate::{
     bail_parse_error,
     schema::Table,
@@ -14,7 +15,7 @@ use crate::{
     vdbe::builder::{ProgramBuilder, ProgramBuilderOpts},
     CaptureDataChangesExt, Connection,
 };
-use turso_parser::ast::{self, Expr};
+use turso_parser::ast::{self, Expr, TriggerEvent, TriggerTime};
 
 use super::emitter::emit_program;
 use super::expr::process_returning_clause;
@@ -387,7 +388,14 @@ fn prepare_update_plan(
         connection,
     )?;
 
-    let set_clauses = collect_update_set_clauses(&mut body.sets, &table, table_name)?;
+    let mut set_clauses = collect_update_set_clauses(&mut body.sets, &table, table_name)?;
+    add_columns_that_before_triggers_change(
+        &mut set_clauses,
+        &table,
+        database_id,
+        &mut read_scope_tables,
+        resolver,
+    )?;
 
     let result_columns = if !body.returning.is_empty() {
         // Plan subqueries in RETURNING expressions before processing
@@ -528,6 +536,54 @@ pub(crate) fn rowid_name_column_index(table: &Table, name: &str) -> Option<usize
             .position(|c| c.is_rowid_alias())
             .unwrap_or(ROWID_SENTINEL),
     )
+}
+
+/// A `BEFORE UPDATE` trigger can change columns that the statement does not
+/// name. Add `SET c = c` for each of them, so that the update writes the value
+/// that the trigger puts into NEW and updates the indexes on the column.
+fn add_columns_that_before_triggers_change(
+    set_clauses: &mut Vec<UpdateSetClause>,
+    table: &Table,
+    database_id: usize,
+    read_scope_tables: &mut TableReferences,
+    resolver: &Resolver,
+) -> crate::Result<()> {
+    use crate::alloc::TursoIteratorExt;
+    let Some(btree_table) = table.btree() else {
+        return Ok(());
+    };
+    let named_columns: Vec<_> = set_clauses
+        .iter()
+        .flat_map(|set| set.column_names.iter().cloned())
+        .try_collect()?;
+    let triggers = get_triggers_including_temp(
+        resolver,
+        database_id,
+        TriggerEvent::Update,
+        TriggerTime::Before,
+        Some(&named_columns),
+        &btree_table,
+    );
+    let target_table_id = read_scope_tables.joined_tables()[0].internal_id;
+    for column_index in columns_changed_by_triggers(resolver, &triggers, &btree_table)?.iter() {
+        if set_clauses
+            .iter()
+            .any(|set| set.column_index == column_index)
+        {
+            continue;
+        }
+        read_scope_tables.mark_column_used(target_table_id, column_index);
+        set_clauses.push(UpdateSetClause::new_for_trigger_change(
+            column_index,
+            Box::new(Expr::Column {
+                database: Some(database_id),
+                table: target_table_id,
+                column: column_index,
+                is_rowid_alias: false,
+            }),
+        ));
+    }
+    Ok(())
 }
 
 fn compose_update_set_clause(existing: &mut UpdateSetClause, expr: Box<Expr>) {

@@ -1,12 +1,13 @@
 use crate::functions::validate_pg_input;
+use crate::user_function::{Language, UserFunction, Volatility};
 use rustc_hash::FxHashMap as HashMap;
 use std::fmt::Debug;
 use std::marker::PhantomData;
 use std::sync::Arc;
 use turso_core::{
-    dialect::POSTGRES_TABLE_SQL_PREFIX,
+    dialect::{FunctionCatalog, TableCatalog, TriggerBody, POSTGRES_TABLE_SQL_PREFIX},
     native_ext::{VirtualTable, VirtualTableCursor, VirtualTableModule},
-    schema::{BTreeTable, Index, Schema, Table},
+    schema::{BTreeTable, FunctionDef, Index, Schema, Table},
     Connection, Dialect, Func, IOResult, LimboError, OpenOptions, Result, Statement, Value,
 };
 use turso_ext::{ConstraintInfo, IndexInfo, OrderByInfo, ResultCode, VTabKind};
@@ -155,11 +156,40 @@ impl Dialect for PostgresDialect {
     }
 
     fn register_native_extensions(&self, options: OpenOptions) -> OpenOptions {
-        register_catalog_modules(crate::functions::register_functions(options))
+        register_catalog_modules(crate::plpgsql::register_trigger_variable_functions(
+            crate::functions::register_functions(options),
+        ))
     }
 
     fn resolve_function(&self, name: &str, arg_count: usize) -> Result<Option<Func>> {
         turso_core::dialect::sqlite::resolve_builtin_function(name, arg_count)
+    }
+
+    fn trigger_body(
+        &self,
+        trigger: &turso_core::schema::Trigger,
+        table: &BTreeTable,
+        functions: &dyn FunctionCatalog,
+        tables: &dyn TableCatalog,
+    ) -> Result<Option<TriggerBody>> {
+        crate::plpgsql::compile_trigger(trigger, table, functions, tables)
+    }
+
+    /// PostgreSQL fires the triggers of one event in the order of their names.
+    fn order_triggers(&self, triggers: &mut [Arc<turso_core::schema::Trigger>]) {
+        triggers.sort_by(|left, right| {
+            crate::trigger::postgres_trigger_name(left)
+                .cmp(crate::trigger::postgres_trigger_name(right))
+        });
+    }
+
+    fn compile_function_call(
+        &self,
+        function: &FunctionDef,
+        args: &[Box<turso_parser::ast::Expr>],
+        functions: &dyn FunctionCatalog,
+    ) -> Result<turso_parser::ast::Expr> {
+        crate::user_function::compile_function_call(function, args, functions)
     }
 
     fn requires_custom_types(&self) -> bool {
@@ -168,6 +198,22 @@ impl Dialect for PostgresDialect {
 
     fn qualified_column_uses_nearest_table_only(&self) -> bool {
         true
+    }
+
+    fn qualified_function_names(&self) -> bool {
+        true
+    }
+
+    fn rowid_before_insert_triggers(&self) -> bool {
+        true
+    }
+
+    fn trigger_when_clause(
+        &self,
+        trigger: &turso_core::schema::Trigger,
+        table: &turso_core::schema::BTreeTable,
+    ) -> Result<Option<turso_parser::ast::Expr>> {
+        crate::trigger::trigger_when_clause(trigger, table)
     }
 }
 
@@ -791,7 +837,145 @@ impl SnapshotRows for PgProcTable {
             ]);
             oid += 1;
         }
+        rows.extend(user_function_rows(&conn.current_schema()));
         rows
+    }
+}
+
+const USER_FUNCTION_OID_START: i64 = 40000;
+const PUBLIC_NAMESPACE_OID: i64 = 2200;
+const TRIGGER_TYPE_OID: i64 = 2279;
+const VOID_TYPE_OID: i64 = 2278;
+const RECORD_TYPE_OID: i64 = 2249;
+
+fn user_functions_sorted(schema: &Schema) -> Vec<&Arc<FunctionDef>> {
+    let mut functions: Vec<_> = schema.functions.values().flatten().collect();
+    functions.sort_by(|a, b| (&a.name, a.arg_count).cmp(&(&b.name, b.arg_count)));
+    functions
+}
+
+fn user_function_rows(schema: &Schema) -> Vec<Vec<Value>> {
+    user_functions_sorted(schema)
+        .into_iter()
+        .enumerate()
+        .map(|(i, function)| user_function_row(USER_FUNCTION_OID_START + i as i64, function))
+        .collect()
+}
+
+fn user_function_row(oid: i64, function: &FunctionDef) -> Vec<Value> {
+    let parsed = UserFunction::parse(function).ok();
+    let language_oid = parsed
+        .as_ref()
+        .map_or(Value::Null, |f| Value::from_i64(f.language.oid()));
+    let kind = match &parsed {
+        Some(f) if f.is_procedure() => "p",
+        _ => "f",
+    };
+    let volatility = parsed
+        .as_ref()
+        .map_or(Volatility::Volatile, UserFunction::volatility);
+    let returns_set = parsed.as_ref().is_some_and(UserFunction::returns_set);
+    let return_type_oid = match parsed.as_ref().map(UserFunction::return_type) {
+        Some(Some(return_type)) => pg_type_oid(return_type),
+        _ => VOID_TYPE_OID,
+    };
+    let parameters: Vec<_> = parsed
+        .as_ref()
+        .map(|f| f.input_parameters().collect())
+        .unwrap_or_default();
+    let argument_types = parameters
+        .iter()
+        .map(|parameter| {
+            parameter
+                .arg_type
+                .as_ref()
+                .map_or(RECORD_TYPE_OID, pg_type_oid)
+                .to_string()
+        })
+        .collect::<Vec<_>>()
+        .join(" ");
+    let argument_names = if parameters
+        .iter()
+        .any(|parameter| !parameter.name.is_empty())
+    {
+        Value::build_text(format!(
+            "{{{}}}",
+            parameters
+                .iter()
+                .map(|parameter| parameter.name.as_str())
+                .collect::<Vec<_>>()
+                .join(",")
+        ))
+    } else {
+        Value::Null
+    };
+    let defaults = parameters
+        .iter()
+        .filter(|parameter| parameter.defexpr.is_some())
+        .count();
+    let source = parsed
+        .as_ref()
+        .and_then(UserFunction::body_text)
+        .map_or(Value::Null, Value::build_text);
+    vec![
+        Value::from_i64(oid),
+        Value::build_text(function.name.clone()),
+        Value::from_i64(PUBLIC_NAMESPACE_OID),
+        Value::from_i64(10),
+        language_oid,
+        Value::from_f64(100.0),
+        Value::from_f64(if returns_set { 1000.0 } else { 0.0 }),
+        Value::from_i64(0),
+        Value::build_text(kind),
+        Value::from_i64(i64::from(
+            parsed
+                .as_ref()
+                .is_some_and(UserFunction::is_security_definer),
+        )),
+        Value::from_i64(0),
+        Value::from_i64(i64::from(
+            parsed.as_ref().is_some_and(UserFunction::is_strict),
+        )),
+        Value::from_i64(i64::from(returns_set)),
+        Value::build_text(volatility.catalog_code()),
+        Value::build_text("u"),
+        Value::from_i64(function.arg_count as i64),
+        Value::from_i64(defaults as i64),
+        Value::from_i64(return_type_oid),
+        Value::build_text(argument_types),
+        Value::Null,
+        Value::Null,
+        argument_names,
+        Value::Null,
+        Value::Null,
+        source,
+        Value::Null,
+        Value::Null,
+        Value::Null,
+        Value::Null,
+    ]
+}
+
+fn pg_type_oid(type_name: &pg_query::protobuf::TypeName) -> i64 {
+    let name = type_name
+        .names
+        .iter()
+        .filter_map(|name| match &name.node {
+            Some(pg_query::protobuf::node::Node::String(name)) => Some(name.sval.as_str()),
+            _ => None,
+        })
+        .next_back()
+        .unwrap_or_default();
+    let base = match name {
+        "trigger" => return TRIGGER_TYPE_OID,
+        "void" => return VOID_TYPE_OID,
+        "record" => return RECORD_TYPE_OID,
+        name => PG_BASE_TYPES.iter().find(|t| t.name == name),
+    };
+    match base {
+        Some(base) if !type_name.array_bounds.is_empty() => base.typarray,
+        Some(base) => base.oid,
+        None => user_type_oid(name),
     }
 }
 
@@ -2394,25 +2578,30 @@ impl SnapshotRows for PgLanguageTable {
     )";
     const TABLE_OID: Option<i64> = Some(2612);
     const ESTIMATED_COST: f64 = 1.0;
-    const ESTIMATED_ROWS: u32 = 2;
+    const ESTIMATED_ROWS: u32 = 4;
 
     fn load_rows(_conn: &Connection) -> Vec<Vec<Value>> {
-        [(12, "internal"), (13, "c")]
-            .into_iter()
-            .map(|(oid, name)| {
-                vec![
-                    Value::from_i64(oid),
-                    Value::build_text(name),
-                    Value::from_i64(10),
-                    Value::from_i64(0),
-                    Value::from_i64(0),
-                    Value::from_i64(0),
-                    Value::from_i64(0),
-                    Value::from_i64(0),
-                    Value::Null,
-                ]
-            })
-            .collect()
+        [
+            (12, "internal", false, false),
+            (13, "c", false, false),
+            (Language::SQL_OID, "sql", false, true),
+            (Language::PLPGSQL_OID, "plpgsql", true, true),
+        ]
+        .into_iter()
+        .map(|(oid, name, procedural, trusted)| {
+            vec![
+                Value::from_i64(oid),
+                Value::build_text(name),
+                Value::from_i64(10),
+                Value::from_i64(i64::from(procedural)),
+                Value::from_i64(i64::from(trusted)),
+                Value::from_i64(0),
+                Value::from_i64(0),
+                Value::from_i64(0),
+                Value::Null,
+            ]
+        })
+        .collect()
     }
 }
 

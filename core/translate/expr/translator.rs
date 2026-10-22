@@ -891,14 +891,18 @@ fn translate_function_call_expr(
         unreachable!("translate_function_call_expr expects Expr::FunctionCall");
     };
     let args_count = args.len();
-    let func_type = resolver.resolve_function(name.as_str(), args_count)?;
-
-    if func_type.is_none() {
-        crate::bail_parse_error!("no such function: {}", name.as_str());
-    }
+    let Some(func) = resolver.resolve_function(name.as_str(), args_count)? else {
+        return translate_catalog_function_call(
+            program,
+            referenced_tables,
+            expr,
+            target_register,
+            resolver,
+        );
+    };
 
     let func_ctx = FuncCtx {
-        func: func_type.unwrap(),
+        func,
         arg_count: args_count,
     };
 
@@ -2162,6 +2166,120 @@ fn translate_function_call_expr(
         }
         Func::AlterTable(_) => unreachable!(),
     }
+}
+
+fn translate_catalog_function_call(
+    program: &mut ProgramBuilder,
+    referenced_tables: Option<&TableReferences>,
+    expr: &ast::Expr,
+    target_register: usize,
+    resolver: &Resolver,
+) -> Result<usize> {
+    let ast::Expr::FunctionCall { name, args, .. } = expr else {
+        unreachable!("translate_catalog_function_call expects Expr::FunctionCall");
+    };
+    let Some((database_id, function)) = resolver.find_catalog_function(name.as_str(), args.len())
+    else {
+        let qualified_name = resolver
+            .dialect
+            .qualified_function_names()
+            .then(|| name.as_str().split_once('.'))
+            .flatten();
+        if let Some((_, bare_name)) = qualified_name {
+            if resolver.resolve_function(bare_name, args.len())?.is_some() {
+                let mut bare_call = expr.clone();
+                let ast::Expr::FunctionCall { name, .. } = &mut bare_call else {
+                    unreachable!("bare_call is a copy of a function call");
+                };
+                *name = ast::Name::exact(bare_name.to_string());
+                return translate_function_call_expr(
+                    program,
+                    referenced_tables,
+                    &bare_call,
+                    target_register,
+                    resolver,
+                );
+            }
+        }
+        crate::bail_parse_error!("no such function: {}", name.as_str());
+    };
+    let body = inline_catalog_function_call(program, resolver, database_id, &function, expr)?;
+    translate_expr(program, referenced_tables, &body, target_register, resolver)
+}
+
+/// The expression that replaces a call of a stored function. The calls of
+/// stored functions in the arguments become expressions before the body
+/// does, so that a call in an argument is not a call from the body.
+fn inline_catalog_function_call(
+    program: &mut ProgramBuilder,
+    resolver: &Resolver,
+    database_id: usize,
+    function: &crate::schema::FunctionDef,
+    call: &ast::Expr,
+) -> Result<ast::Expr> {
+    let ast::Expr::FunctionCall {
+        distinctness,
+        args,
+        filter_over,
+        order_by,
+        within_group,
+        ..
+    } = call
+    else {
+        unreachable!("inline_catalog_function_call expects Expr::FunctionCall");
+    };
+    if database_id == crate::MAIN_DB_ID {
+        program.begin_read_operation()?;
+    } else {
+        let schema_cookie = resolver.with_schema(database_id, |schema| schema.schema_version);
+        program.begin_read_on_database(database_id, schema_cookie)?;
+    }
+    if distinctness.is_some()
+        || filter_over.filter_clause.is_some()
+        || filter_over.over_clause.is_some()
+        || !order_by.is_empty()
+        || !within_group.is_empty()
+    {
+        crate::bail_parse_error!("{}() is not an aggregate function", function.name);
+    }
+    let args = args
+        .iter()
+        .map(|arg| inline_catalog_function_calls(program, resolver, arg).map(Box::new))
+        .collect::<Result<Vec<_>>>()?;
+    resolver.with_catalog_function(database_id, function, || {
+        let body = resolver
+            .dialect
+            .compile_function_call(function, &args, resolver)?;
+        inline_catalog_function_calls(program, resolver, &body)
+    })
+}
+
+/// `expr` with each call of a stored function replaced by its expression.
+fn inline_catalog_function_calls(
+    program: &mut ProgramBuilder,
+    resolver: &Resolver,
+    expr: &ast::Expr,
+) -> Result<ast::Expr> {
+    let mut expr = expr.clone();
+    walk_expr_mut(&mut expr, &mut |e| {
+        let ast::Expr::FunctionCall { name, args, .. } = &*e else {
+            return Ok(WalkControl::Continue);
+        };
+        if resolver
+            .resolve_function(name.as_str(), args.len())?
+            .is_some()
+        {
+            return Ok(WalkControl::Continue);
+        }
+        let Some((database_id, function)) =
+            resolver.find_catalog_function(name.as_str(), args.len())
+        else {
+            return Ok(WalkControl::Continue);
+        };
+        *e = inline_catalog_function_call(program, resolver, database_id, &function, e)?;
+        Ok(WalkControl::SkipChildren)
+    })?;
+    Ok(expr)
 }
 
 #[inline(never)]

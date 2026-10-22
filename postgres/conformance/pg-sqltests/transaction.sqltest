@@ -93,3 +93,17 @@ expect {
     29
     0
 }
+
+test now-is-the-start-time-of-the-transaction {
+    CREATE TABLE times (t text);
+    BEGIN;
+    INSERT INTO times VALUES (now());
+    SELECT count(*) FROM generate_series(1, 1000000);
+    INSERT INTO times VALUES (transaction_timestamp());
+    COMMIT;
+    SELECT count(DISTINCT t) FROM times;
+}
+expect {
+    1000000
+    1
+}

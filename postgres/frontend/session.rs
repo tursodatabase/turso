@@ -1,5 +1,6 @@
 use chumsky::{error::EmptyErr, prelude::*};
 use std::borrow::Cow;
+use std::collections::{HashMap, HashSet};
 use std::num::NonZero;
 use std::str;
 use std::sync::{Arc, Mutex};
@@ -30,6 +31,11 @@ struct PgConnectionInner {
 struct SessionState {
     search_path: Option<Vec<String>>,
     search_path_setting: Option<String>,
+    /// The values of the variables of the compiled PL/pgSQL triggers, by key.
+    trigger_variables: HashMap<String, Value>,
+    /// The trigger variables that `set_trigger_variable_once` set after the
+    /// last `set_trigger_variable` of the same key.
+    trigger_variables_set_once: HashSet<String>,
 }
 
 type PgSessionState = Mutex<SessionState>;
@@ -198,6 +204,15 @@ fn prepare_statement(pg_conn: &Arc<PgConnectionInner>, sql: &str) -> Result<Stat
             }
             None => (Cow::Borrowed(sql), parse_result),
         };
+    let (sql, parse_result) =
+        match create_function_sql_from_search_path(pg_conn, &parse_result, &search_path)? {
+            Some(function_sql) => {
+                let parse_result = turso_pg_parser::parse(&function_sql)
+                    .map_err(|e| LimboError::ParseError(e.to_string()))?;
+                (Cow::Owned(function_sql), parse_result)
+            }
+            None => (sql, parse_result),
+        };
     let translator = PostgreSQLTranslator::new();
     let translated = translator
         .translate_with_prereqs(&parse_result)
@@ -233,6 +248,38 @@ fn create_table_schema_from_search_path(
     let Some(location) = unqualified_create_table_name_location(parse_result) else {
         return Ok(None);
     };
+    Ok(creation_schema(pg_conn, search_path)?.map(|schema| (location, schema)))
+}
+
+/// The SQL text of a CREATE FUNCTION statement that names its function
+/// without a schema, with the function name in the first schema of
+/// `search_path` that exists, like PostgreSQL. None when the statement is not
+/// such a CREATE FUNCTION, when `search_path` is not set, or when the
+/// function goes to public, which is where core puts it anyway.
+fn create_function_sql_from_search_path(
+    pg_conn: &Arc<PgConnectionInner>,
+    parse_result: &turso_pg_parser::ParseResult,
+    search_path: &Option<Vec<String>>,
+) -> Result<Option<String>> {
+    let Some(function) = turso_pg_parser::unqualified_create_function(parse_result) else {
+        return Ok(None);
+    };
+    let Some(schema) = creation_schema(pg_conn, search_path)? else {
+        return Ok(None);
+    };
+    turso_pg_parser::qualify_create_function_name(function, &schema)
+        .map(Some)
+        .map_err(|e| LimboError::ParseError(e.to_string()))
+}
+
+/// The schema that a CREATE statement creates an object in when it names
+/// the object without a schema: the first schema of `search_path` that
+/// exists. None when `search_path` is not set, or when the object goes to
+/// public.
+fn creation_schema(
+    pg_conn: &Arc<PgConnectionInner>,
+    search_path: &Option<Vec<String>>,
+) -> Result<Option<String>> {
     if search_path.is_none() {
         return Ok(None);
     }
@@ -242,7 +289,7 @@ fn create_table_schema_from_search_path(
     if schema.eq_ignore_ascii_case("public") {
         return Ok(None);
     }
-    Ok(Some((location, schema)))
+    Ok(Some(schema))
 }
 
 /// The first schema of `search_path` that exists, which is what PostgreSQL's
@@ -307,6 +354,39 @@ fn try_prepare_special(pg_conn: &Arc<PgConnectionInner>, sql: &str) -> Result<Op
         Err(_) => return Ok(None),
     };
 
+    let first_node = parse_result
+        .protobuf
+        .stmts
+        .first()
+        .and_then(|stmt| stmt.stmt.as_deref())
+        .and_then(|stmt| stmt.node.as_ref());
+    match first_node {
+        Some(pg_query::protobuf::node::Node::CreateTrigStmt(statement)) => {
+            crate::trigger::create_trigger(
+                &pg_conn.conn,
+                statement,
+                &session_search_path(pg_conn),
+            )?;
+            return Ok(Some(noop_statement(&pg_conn.conn)?));
+        }
+        Some(pg_query::protobuf::node::Node::DropStmt(drop))
+            if drop.remove_type() == pg_query::protobuf::ObjectType::ObjectTrigger =>
+        {
+            crate::trigger::drop_trigger(&pg_conn.conn, drop, &session_search_path(pg_conn))?;
+            return Ok(Some(noop_statement(&pg_conn.conn)?));
+        }
+        Some(pg_query::protobuf::node::Node::DropStmt(drop))
+            if drop.remove_type() == pg_query::protobuf::ObjectType::ObjectFunction =>
+        {
+            crate::trigger::drop_triggers_of_dropped_functions(
+                &pg_conn.conn,
+                drop,
+                &session_search_path(pg_conn),
+            )?;
+        }
+        _ => {}
+    }
+
     if let Some(set_stmt) = try_extract_set(&parse_result) {
         let stmt = handle_pg_set(pg_conn, &set_stmt)?;
         return Ok(Some(stmt));
@@ -346,6 +426,18 @@ fn try_prepare_special(pg_conn: &Arc<PgConnectionInner>, sql: &str) -> Result<Op
     }
 
     Ok(None)
+}
+
+fn session_search_path(pg_conn: &PgConnectionInner) -> Vec<String> {
+    pg_conn
+        .conn
+        .context::<PgSessionState>()
+        .expect("PostgreSQL connections have session state")
+        .lock()
+        .unwrap()
+        .search_path
+        .clone()
+        .unwrap_or_default()
 }
 
 fn noop_statement(conn: &Arc<Connection>) -> Result<Statement> {
@@ -405,6 +497,43 @@ pub(crate) fn set_search_path(conn: &Connection, value: Option<&str>) -> Result<
     Ok(Value::build_text(
         value.unwrap_or(DEFAULT_SEARCH_PATH).to_owned(),
     ))
+}
+
+pub(crate) fn set_trigger_variable(conn: &Connection, key: &str, value: Value) -> Result<()> {
+    let mut state = session_state(conn)?.lock().unwrap();
+    state.trigger_variables_set_once.remove(key);
+    state.trigger_variables.insert(key.to_string(), value);
+    Ok(())
+}
+
+/// Set a trigger variable that one statement can set only one time, as
+/// `RETURNING ... INTO` does. A second set before the next
+/// `set_trigger_variable` of the key gives the error of PostgreSQL.
+pub(crate) fn set_trigger_variable_once(conn: &Connection, key: &str, value: Value) -> Result<()> {
+    let mut state = session_state(conn)?.lock().unwrap();
+    if !state.trigger_variables_set_once.insert(key.to_string()) {
+        return Err(LimboError::SqlError(
+            "query returned more than one row".to_string(),
+        ));
+    }
+    state.trigger_variables.insert(key.to_string(), value);
+    Ok(())
+}
+
+pub(crate) fn trigger_variable(conn: &Connection, key: &str) -> Result<Value> {
+    Ok(session_state(conn)?
+        .lock()
+        .unwrap()
+        .trigger_variables
+        .get(key)
+        .cloned()
+        .unwrap_or(Value::Null))
+}
+
+fn session_state(conn: &Connection) -> Result<&PgSessionState> {
+    conn.context::<PgSessionState>().ok_or_else(|| {
+        LimboError::InvalidArgument("PostgreSQL session state is not initialized".to_string())
+    })
 }
 
 pub(crate) fn search_path_setting(conn: &Connection) -> Option<String> {

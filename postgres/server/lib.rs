@@ -647,11 +647,14 @@ fn is_pg_non_query(sql: &str) -> bool {
         || upper.starts_with("DROP SCHEMA")
         || upper.starts_with("REFRESH MATERIALIZED VIEW")
         || upper.starts_with("COMMENT")
+        || function_or_trigger_tag(&upper).is_some()
 }
 
 fn command_tag(query: &str, affected_rows: usize) -> Tag {
     let upper = query.trim().to_uppercase();
-    if upper.starts_with("INSERT") {
+    if let Some(tag) = function_or_trigger_tag(&upper) {
+        tag
+    } else if upper.starts_with("INSERT") {
         Tag::new("INSERT").with_oid(0).with_rows(affected_rows)
     } else if upper.starts_with("UPDATE") {
         Tag::new("UPDATE").with_rows(affected_rows)
@@ -711,6 +714,29 @@ fn command_tag(query: &str, affected_rows: usize) -> Tag {
     } else {
         Tag::new("OK")
     }
+}
+
+fn function_or_trigger_tag(upper: &str) -> Option<Tag> {
+    let mut tokens = upper.split_whitespace();
+    let verb = tokens.next()?;
+    let mut object = tokens.next()?;
+    match verb {
+        "CREATE" => {
+            if object == "OR" {
+                if tokens.next()? != "REPLACE" {
+                    return None;
+                }
+                object = tokens.next()?;
+            }
+            if object == "CONSTRAINT" {
+                object = tokens.next()?;
+            }
+        }
+        "DROP" => {}
+        _ => return None,
+    }
+    matches!(object, "FUNCTION" | "PROCEDURE" | "TRIGGER")
+        .then(|| Tag::new(&format!("{verb} {object}")))
 }
 
 /// Whether the statement ends with `WITH NO DATA`, token-wise (ignoring
@@ -848,6 +874,48 @@ mod tests {
         ));
         assert!(is_pg_non_query("  lock\ntable items in access share mode"));
         assert!(!is_pg_non_query("SELECT 'LOCK TABLE items'"));
+    }
+
+    #[test]
+    fn test_trigger_statements_are_non_queries() {
+        for sql in [
+            "CREATE TRIGGER t AFTER INSERT ON x FOR EACH ROW EXECUTE FUNCTION f()",
+            "create or replace trigger t after insert on x for each row execute function f()",
+            "DROP TRIGGER t ON x",
+        ] {
+            assert!(is_pg_non_query(sql), "{sql}");
+        }
+    }
+
+    #[test]
+    fn test_function_and_trigger_command_tags() {
+        for (query, tag) in [
+            (
+                "CREATE FUNCTION f() RETURNS int RETURN 1",
+                "CREATE FUNCTION",
+            ),
+            (
+                "create or replace function f() returns int return 1",
+                "CREATE FUNCTION",
+            ),
+            (
+                "CREATE PROCEDURE p() LANGUAGE sql AS ''",
+                "CREATE PROCEDURE",
+            ),
+            ("DROP FUNCTION IF EXISTS f()", "DROP FUNCTION"),
+            ("DROP PROCEDURE p", "DROP PROCEDURE"),
+            (
+                "CREATE TRIGGER t AFTER INSERT ON x FOR EACH ROW EXECUTE FUNCTION f()",
+                "CREATE TRIGGER",
+            ),
+            (
+                "CREATE OR REPLACE TRIGGER t AFTER INSERT ON x FOR EACH ROW EXECUTE FUNCTION f()",
+                "CREATE TRIGGER",
+            ),
+            ("DROP TRIGGER t ON x", "DROP TRIGGER"),
+        ] {
+            assert_eq!(command_tag(query, 0), Tag::new(tag), "{query}");
+        }
     }
 
     #[test]

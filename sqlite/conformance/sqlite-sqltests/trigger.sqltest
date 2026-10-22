@@ -2574,3 +2574,361 @@ test current-time-same-in-trigger {
 expect {
     2000|1
 }
+
+test trigger-before-update-fires-before-the-not-null-check {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, a NOT NULL);
+    CREATE TRIGGER tr BEFORE UPDATE ON t BEGIN
+        SELECT RAISE(ABORT, 'before update trigger');
+    END;
+    INSERT INTO t VALUES (1, 1);
+    UPDATE t SET a = NULL;
+}
+expect error {
+    before update trigger
+}
+
+test trigger-before-update-fires-before-the-check-constraint {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, a CHECK (a > 0));
+    CREATE TRIGGER tr BEFORE UPDATE ON t BEGIN
+        SELECT RAISE(ABORT, 'before update trigger');
+    END;
+    INSERT INTO t VALUES (1, 1);
+    UPDATE t SET a = -1;
+}
+expect error {
+    before update trigger
+}
+
+test trigger-before-update-fires-before-the-unique-check {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, a UNIQUE);
+    CREATE TRIGGER tr BEFORE UPDATE ON t BEGIN
+        SELECT RAISE(ABORT, 'before update trigger');
+    END;
+    INSERT INTO t VALUES (1, 1), (2, 2);
+    UPDATE t SET a = 2 WHERE id = 1;
+}
+expect error {
+    before update trigger
+}
+
+test trigger-before-update-sees-new-values-after-affinity {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, a INTEGER, b TEXT);
+    CREATE TABLE log(x, ty);
+    CREATE TRIGGER tr BEFORE UPDATE ON t BEGIN
+        INSERT INTO log VALUES (NEW.a, typeof(NEW.a));
+        INSERT INTO log VALUES (NEW.b, typeof(NEW.b));
+    END;
+    INSERT INTO t VALUES (1, 1, 'x');
+    UPDATE t SET a = '5', b = 7;
+    SELECT * FROM log;
+}
+expect {
+    5|integer
+    7|text
+}
+
+test trigger-before-update-sees-the-columns-that-set-does-not-name {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, a, b, c);
+    CREATE TABLE log(na, nb, nc);
+    CREATE TRIGGER tr BEFORE UPDATE ON t BEGIN
+        INSERT INTO log VALUES (NEW.a, NEW.b, NEW.c);
+    END;
+    INSERT INTO t VALUES (1, 'a', 'b', 'c');
+    UPDATE t SET b = 'B';
+    SELECT * FROM log;
+}
+expect {
+    a|B|c
+}
+
+test trigger-before-update-when-clause-sees-new-values-after-affinity {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, q INTEGER);
+    CREATE TABLE log(x);
+    CREATE TRIGGER tr BEFORE UPDATE ON t WHEN NEW.q IS NOT OLD.q BEGIN
+        INSERT INTO log VALUES (NEW.q);
+    END;
+    INSERT INTO t VALUES (1, 5), (2, 5);
+    UPDATE t SET q = '5' WHERE id = 1;
+    UPDATE t SET q = '6' WHERE id = 2;
+    SELECT * FROM log;
+}
+expect {
+    6
+}
+
+test trigger-update-not-null-check-fails-after-a-before-update-trigger-that-passes {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, a NOT NULL);
+    CREATE TABLE log(x);
+    CREATE TRIGGER tr BEFORE UPDATE ON t BEGIN
+        INSERT INTO log VALUES (OLD.a);
+    END;
+    INSERT INTO t VALUES (1, 1);
+    UPDATE t SET a = NULL;
+}
+expect error {
+    NOT NULL constraint failed
+}
+
+@cross-check-integrity
+
+test trigger-update-with-before-and-after-triggers-keeps-the-indexes-correct {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, a, b);
+    CREATE INDEX t_a ON t(a);
+    CREATE UNIQUE INDEX t_b ON t(b);
+    CREATE TABLE log(ev, a, b);
+    CREATE TRIGGER bu BEFORE UPDATE ON t BEGIN
+        INSERT INTO log VALUES ('before', NEW.a, NEW.b);
+    END;
+    CREATE TRIGGER au AFTER UPDATE ON t BEGIN
+        INSERT INTO log VALUES ('after', NEW.a, NEW.b);
+    END;
+    INSERT INTO t VALUES (1, 'x', 10), (2, 'y', 20);
+    UPDATE t SET a = 'z', b = b + 1 WHERE id = 1;
+    SELECT id FROM t WHERE a = 'z';
+    SELECT id FROM t WHERE b = 11;
+    SELECT count(*) FROM t WHERE a = 'x' OR b = 10;
+    SELECT * FROM log;
+}
+expect {
+    1
+    1
+    0
+    before|z|11
+    after|z|11
+}
+
+test trigger-update-returning-with-before-and-after-triggers {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, a);
+    CREATE TABLE log(ev, a);
+    CREATE TRIGGER bu BEFORE UPDATE ON t BEGIN
+        INSERT INTO log VALUES ('before', NEW.a);
+    END;
+    CREATE TRIGGER au AFTER UPDATE ON t BEGIN
+        INSERT INTO log VALUES ('after', NEW.a);
+    END;
+    INSERT INTO t VALUES (1, 1), (2, 2);
+    UPDATE t SET a = a * 10 RETURNING id, a;
+    SELECT * FROM log;
+}
+expect {
+    1|10
+    2|20
+    before|10
+    after|10
+    before|20
+    after|20
+}
+
+test trigger-update-of-fires-for-a-column-that-set-gives-the-same-value {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, a, b);
+    CREATE TABLE log(ev);
+    CREATE TRIGGER ta BEFORE UPDATE OF a ON t BEGIN
+        INSERT INTO log VALUES ('a');
+    END;
+    CREATE TRIGGER tb AFTER UPDATE OF b ON t BEGIN
+        INSERT INTO log VALUES ('b');
+    END;
+    INSERT INTO t VALUES (1, 1, 1);
+    UPDATE t SET a = a;
+    UPDATE t SET b = 2;
+    SELECT ev FROM log;
+}
+expect {
+    a
+    b
+}
+
+test trigger-before-insert-fires-before-the-not-null-check {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, a NOT NULL);
+    CREATE TRIGGER tr BEFORE INSERT ON t BEGIN
+        SELECT RAISE(ABORT, 'before insert trigger');
+    END;
+    INSERT INTO t VALUES (1, NULL);
+}
+expect error {
+    before insert trigger
+}
+
+test trigger-before-insert-fires-before-the-check-constraint {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, a CHECK (a > 0));
+    CREATE TRIGGER tr BEFORE INSERT ON t BEGIN
+        SELECT RAISE(ABORT, 'before insert trigger');
+    END;
+    INSERT INTO t VALUES (1, -1);
+}
+expect error {
+    before insert trigger
+}
+
+test trigger-before-insert-fires-before-the-unique-check {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, a UNIQUE);
+    INSERT INTO t VALUES (1, 1);
+    CREATE TRIGGER tr BEFORE INSERT ON t BEGIN
+        SELECT RAISE(ABORT, 'before insert trigger');
+    END;
+    INSERT INTO t VALUES (2, 1);
+}
+expect error {
+    before insert trigger
+}
+
+test trigger-before-insert-sees-the-default-values {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, a, b DEFAULT 'dflt', c INTEGER DEFAULT 7);
+    CREATE TABLE log(a, b, c);
+    CREATE TRIGGER tr BEFORE INSERT ON t BEGIN
+        INSERT INTO log VALUES (NEW.a, NEW.b, NEW.c);
+    END;
+    INSERT INTO t(id, a) VALUES (1, 'x');
+    SELECT * FROM log;
+}
+expect {
+    x|dflt|7
+}
+
+test trigger-before-and-after-insert-for-insert-select {
+    CREATE TABLE src(v);
+    CREATE TABLE t(id INTEGER PRIMARY KEY, v);
+    CREATE TABLE log(ev, v);
+    CREATE TRIGGER bi BEFORE INSERT ON t BEGIN
+        INSERT INTO log VALUES ('before', NEW.v);
+    END;
+    CREATE TRIGGER ai AFTER INSERT ON t BEGIN
+        INSERT INTO log VALUES ('after', NEW.v);
+    END;
+    INSERT INTO src VALUES ('a'), ('b');
+    INSERT INTO t(v) SELECT v FROM src ORDER BY v;
+    SELECT * FROM log;
+    SELECT * FROM t;
+}
+expect {
+    before|a
+    after|a
+    before|b
+    after|b
+    1|a
+    2|b
+}
+
+test trigger-insert-or-replace-fires-insert-triggers-but-no-delete-triggers {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, a);
+    CREATE TABLE log(ev, a);
+    CREATE TRIGGER bi BEFORE INSERT ON t BEGIN
+        INSERT INTO log VALUES ('before insert', NEW.a);
+    END;
+    CREATE TRIGGER bd BEFORE DELETE ON t BEGIN
+        INSERT INTO log VALUES ('before delete', OLD.a);
+    END;
+    CREATE TRIGGER ai AFTER INSERT ON t BEGIN
+        INSERT INTO log VALUES ('after insert', NEW.a);
+    END;
+    INSERT INTO t VALUES (1, 'old');
+    DELETE FROM log;
+    INSERT OR REPLACE INTO t VALUES (1, 'new');
+    SELECT * FROM log;
+    SELECT * FROM t;
+}
+expect {
+    before insert|new
+    after insert|new
+    1|new
+}
+
+test trigger-multiple-before-update-fire-in-reverse-creation-order {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, a);
+    CREATE TABLE log(seq INTEGER PRIMARY KEY, ev);
+    CREATE TRIGGER b_first BEFORE UPDATE ON t BEGIN
+        INSERT INTO log(ev) VALUES ('b_first');
+    END;
+    CREATE TRIGGER a_second BEFORE UPDATE ON t BEGIN
+        INSERT INTO log(ev) VALUES ('a_second');
+    END;
+    CREATE TRIGGER c_third BEFORE UPDATE ON t BEGIN
+        INSERT INTO log(ev) VALUES ('c_third');
+    END;
+    INSERT INTO t VALUES (1, 1);
+    UPDATE t SET a = 2;
+    SELECT ev FROM log ORDER BY seq;
+}
+expect {
+    c_third
+    a_second
+    b_first
+}
+
+test trigger-multiple-after-insert-fire-in-reverse-creation-order {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, a);
+    CREATE TABLE log(seq INTEGER PRIMARY KEY, ev);
+    CREATE TRIGGER b_first AFTER INSERT ON t BEGIN
+        INSERT INTO log(ev) VALUES ('b_first');
+    END;
+    CREATE TRIGGER a_second AFTER INSERT ON t BEGIN
+        INSERT INTO log(ev) VALUES ('a_second');
+    END;
+    INSERT INTO t VALUES (1, 1);
+    SELECT ev FROM log ORDER BY seq;
+}
+expect {
+    a_second
+    b_first
+}
+
+test trigger-multiple-after-delete-fire-in-reverse-creation-order {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, a);
+    CREATE TABLE log(seq INTEGER PRIMARY KEY, ev);
+    CREATE TRIGGER b_first AFTER DELETE ON t BEGIN
+        INSERT INTO log(ev) VALUES ('b_first');
+    END;
+    CREATE TRIGGER a_second AFTER DELETE ON t BEGIN
+        INSERT INTO log(ev) VALUES ('a_second');
+    END;
+    INSERT INTO t VALUES (1, 1);
+    DELETE FROM t;
+    SELECT ev FROM log ORDER BY seq;
+}
+expect {
+    a_second
+    b_first
+}
+
+test trigger-update-and-update-of-triggers-fire-in-reverse-creation-order {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, a, b);
+    CREATE TABLE log(seq INTEGER PRIMARY KEY, ev);
+    CREATE TRIGGER z_any BEFORE UPDATE ON t BEGIN
+        INSERT INTO log(ev) VALUES ('z_any');
+    END;
+    CREATE TRIGGER y_of_a BEFORE UPDATE OF a ON t BEGIN
+        INSERT INTO log(ev) VALUES ('y_of_a');
+    END;
+    CREATE TRIGGER x_of_b BEFORE UPDATE OF b ON t BEGIN
+        INSERT INTO log(ev) VALUES ('x_of_b');
+    END;
+    INSERT INTO t VALUES (1, 1, 1);
+    UPDATE t SET a = 2, b = 2;
+    SELECT ev FROM log ORDER BY seq;
+}
+expect {
+    x_of_b
+    y_of_a
+    z_any
+}
+
+test trigger-created-again-fires-first {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, a);
+    CREATE TABLE log(seq INTEGER PRIMARY KEY, ev);
+    CREATE TRIGGER one AFTER INSERT ON t BEGIN
+        INSERT INTO log(ev) VALUES ('one');
+    END;
+    CREATE TRIGGER two AFTER INSERT ON t BEGIN
+        INSERT INTO log(ev) VALUES ('two');
+    END;
+    DROP TRIGGER one;
+    CREATE TRIGGER one AFTER INSERT ON t BEGIN
+        INSERT INTO log(ev) VALUES ('one');
+    END;
+    INSERT INTO t VALUES (1, 1);
+    SELECT ev FROM log ORDER BY seq;
+}
+expect {
+    one
+    two
+}

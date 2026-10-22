@@ -258,6 +258,10 @@ enum ReparsePhase {
         stmt: Box<Statement>,
         type_rows: Vec<String>,
     },
+    LoadFunctions {
+        stmt: Box<Statement>,
+        functions: Vec<crate::schema::FunctionDef>,
+    },
     /// Best-effort ANALYZE-stats refresh before finalizing.
     RefreshStats {
         stats: crate::stats::RefreshAnalyzeStatsState,
@@ -372,6 +376,12 @@ pub struct Connection {
     pub(super) database_schemas: RwLock<HashMap<usize, Arc<Schema>>>,
     /// Whether to automatically commit transaction
     pub(crate) auto_commit: AtomicBool,
+    /// When the current root statement started, in microseconds since the
+    /// Unix epoch.
+    pub(super) statement_start_micros: AtomicI64,
+    /// When the current transaction started, in microseconds since the Unix
+    /// epoch: the start of BEGIN, or of the statement in autocommit mode.
+    pub(super) transaction_start_micros: AtomicI64,
     pub(super) transaction_state: AtomicTransactionState,
     /// True when an unfinished write statement inside an explicit transaction
     /// was reset or dropped and there was no statement savepoint to undo only
@@ -1631,9 +1641,7 @@ impl Connection {
                             type_rows: Vec::new(),
                         };
                     } else {
-                        inner.phase = ReparsePhase::RefreshStats {
-                            stats: Default::default(),
-                        };
+                        inner.phase = self.load_functions_or_refresh_stats(&inner.fresh)?;
                     }
                 }
                 ReparsePhase::LoadTypes { stmt, type_rows } => {
@@ -1643,6 +1651,16 @@ impl Connection {
                     }));
                     let type_rows = std::mem::take(type_rows);
                     inner.fresh.load_type_definitions(&type_rows)?;
+                    inner.phase = self.load_functions_or_refresh_stats(&inner.fresh)?;
+                }
+                ReparsePhase::LoadFunctions { stmt, functions } => {
+                    crate::return_if_io!(stmt.run_with_row_callback_nonblock(|row| {
+                        functions.push(function_from_row(row)?);
+                        Ok(())
+                    }));
+                    for function in std::mem::take(functions) {
+                        inner.fresh.add_function(function);
+                    }
                     inner.phase = ReparsePhase::RefreshStats {
                         stats: Default::default(),
                     };
@@ -1669,6 +1687,29 @@ impl Connection {
                 }
             }
         }
+    }
+
+    fn load_functions_or_refresh_stats(
+        self: &Arc<Connection>,
+        fresh: &Schema,
+    ) -> Result<ReparsePhase> {
+        if !fresh
+            .tables
+            .contains_key(crate::schema::TURSO_FUNCTIONS_TABLE_NAME)
+        {
+            return Ok(ReparsePhase::RefreshStats {
+                stats: Default::default(),
+            });
+        }
+        self.with_schema_mut(|schema| {
+            *schema = fresh.try_clone()?;
+            Ok::<_, crate::alloc::TryReserveError>(())
+        })??;
+        let stmt = self.prepare_internal(STORED_FUNCTIONS_QUERY)?;
+        Ok(ReparsePhase::LoadFunctions {
+            stmt: Box::new(stmt),
+            functions: Vec::new(),
+        })
     }
 
     pub(crate) fn read_current_schema_cookie(&self) -> Result<u32> {
@@ -1974,6 +2015,26 @@ impl Connection {
             Ok(())
         })?;
         Ok(type_rows)
+    }
+
+    pub(crate) fn query_stored_functions(
+        self: &Arc<Connection>,
+    ) -> Result<Vec<crate::schema::FunctionDef>> {
+        let has_functions_table = self
+            .schema
+            .read()
+            .tables
+            .contains_key(crate::schema::TURSO_FUNCTIONS_TABLE_NAME);
+        if !has_functions_table {
+            return Ok(Vec::new());
+        }
+        let mut stmt = self.prepare_internal(STORED_FUNCTIONS_QUERY)?;
+        let mut functions = Vec::new();
+        stmt.run_with_row_callback(|row| {
+            functions.push(function_from_row(row)?);
+            Ok(())
+        })?;
+        Ok(functions)
     }
 
     pub fn maybe_update_schema(&self) {
@@ -2808,6 +2869,28 @@ impl Connection {
         self.auto_commit.load(Ordering::SeqCst)
     }
 
+    /// Remember when a root statement started. In autocommit mode the
+    /// statement also starts a transaction.
+    pub(crate) fn record_statement_start(&self, now: crate::io::clock::WallClockInstant) {
+        let micros = now.secs * 1_000_000 + i64::from(now.micros);
+        self.statement_start_micros.store(micros, Ordering::SeqCst);
+        if self.get_auto_commit() {
+            self.transaction_start_micros
+                .store(micros, Ordering::SeqCst);
+        }
+    }
+
+    /// When the current root statement started.
+    pub fn statement_start_time(&self) -> std::time::SystemTime {
+        time_from_micros(self.statement_start_micros.load(Ordering::SeqCst))
+    }
+
+    /// When the current transaction started: the start of BEGIN, or of the
+    /// statement in autocommit mode.
+    pub fn transaction_start_time(&self) -> std::time::SystemTime {
+        time_from_micros(self.transaction_start_micros.load(Ordering::SeqCst))
+    }
+
     /// Mark the active explicit transaction poisoned so COMMIT rolls it back.
     ///
     /// This is used when a write statement under BEGIN is abandoned before it
@@ -2969,6 +3052,16 @@ impl Connection {
 
     pub fn current_schema(&self) -> Arc<Schema> {
         self.schema.read().clone()
+    }
+
+    pub fn database_schema(&self, database_name: &str) -> Option<Arc<Schema>> {
+        let database_id = self
+            .namespaces
+            .database_id(&crate::util::normalize_ident(database_name))?;
+        Some(match database_id {
+            MAIN_DB_ID => self.current_schema(),
+            database_id => self.cached_non_main_schema(database_id),
+        })
     }
 
     pub fn attached_database_names(&self) -> Vec<String> {
@@ -5042,6 +5135,28 @@ impl SymbolTable {
     }
 }
 
+const STORED_FUNCTIONS_QUERY: &str =
+    "SELECT name, arg_count, definition FROM __turso_internal_functions";
+
+fn function_from_row(row: &crate::Row) -> Result<crate::schema::FunctionDef> {
+    let arg_count = usize::try_from(row.get::<i64>(1)?).map_err(|_| {
+        LimboError::Corrupt("malformed database schema - negative function argument count".into())
+    })?;
+    Ok(crate::schema::FunctionDef {
+        name: row.get::<String>(0)?,
+        arg_count,
+        definition: row.get::<String>(2)?,
+    })
+}
+
+fn time_from_micros(micros: i64) -> std::time::SystemTime {
+    crate::io::clock::WallClockInstant {
+        secs: micros.div_euclid(1_000_000),
+        micros: micros.rem_euclid(1_000_000) as u32,
+    }
+    .to_system_time()
+}
+
 #[cfg(all(test, feature = "fs"))]
 mod tests {
     use super::*;
@@ -5115,6 +5230,26 @@ mod tests {
         let catalog = conn.attached_databases.read();
         let entry = catalog.index_to_data.get(&index).unwrap();
         (entry.db.clone(), entry.pager.clone())
+    }
+
+    #[test]
+    fn transaction_start_time_is_the_start_of_begin() {
+        let dir = TempDir::new().unwrap();
+        let conn = open_connection(&dir.path().join("start-times.db"));
+        conn.execute("CREATE TABLE t (x)").unwrap();
+        conn.execute("BEGIN").unwrap();
+        let begin = conn.transaction_start_time();
+        std::thread::sleep(std::time::Duration::from_millis(2));
+
+        conn.execute("INSERT INTO t VALUES (1)").unwrap();
+        assert_eq!(conn.transaction_start_time(), begin);
+        assert!(conn.statement_start_time() > begin);
+
+        conn.execute("COMMIT").unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        conn.execute("INSERT INTO t VALUES (2)").unwrap();
+        assert!(conn.transaction_start_time() > begin);
+        assert_eq!(conn.transaction_start_time(), conn.statement_start_time());
     }
 
     #[test]

@@ -1,0 +1,20 @@
+@database :memory:
+
+test cdc-update-record-is-the-same-with-a-before-update-trigger {
+    CREATE TABLE plain(id INTEGER PRIMARY KEY, a INTEGER, b TEXT);
+    CREATE TABLE with_trigger(id INTEGER PRIMARY KEY, a INTEGER, b TEXT);
+    CREATE TABLE log(x);
+    CREATE TRIGGER tr BEFORE UPDATE ON with_trigger BEGIN
+        INSERT INTO log VALUES (NEW.a);
+    END;
+    INSERT INTO plain VALUES (1, 1, 'x');
+    INSERT INTO with_trigger VALUES (1, 1, 'x');
+    PRAGMA capture_data_changes_conn('full');
+    UPDATE plain SET a = '5', b = 7;
+    UPDATE with_trigger SET a = '5', b = 7;
+    SELECT table_name, bin_record_json_object('["id?","a?","b?","id","a","b"]', updates) FROM turso_cdc WHERE table_name IN ('plain', 'with_trigger') ORDER BY table_name;
+}
+expect {
+    plain|{"id?":0,"a?":1,"b?":1,"id":null,"a":"5","b":7}
+    with_trigger|{"id?":0,"a?":1,"b?":1,"id":null,"a":"5","b":7}
+}
