@@ -20198,12 +20198,31 @@ fn op_vacuum_into_inner(program: &Program, state: &mut ProgramState, insn: &Insn
                     .into());
                 }
 
-                // we always vacuum into a new file, so check if it exists
-                if std::path::Path::new(dest_path).exists() {
-                    return Err(LimboError::ParseError(format!(
-                        "output file already exists: {dest_path}"
-                    ))
+                let target = crate::util::OpenOptions::parse(dest_path)?;
+                if target.cipher.is_some() || target.hexkey.is_some() {
+                    return Err(LimboError::InvalidArgument(
+                        "VACUUM INTO does not support the cipher and hexkey URI parameters"
+                            .to_string(),
+                    )
                     .into());
+                }
+                let output_in_memory = target.path.is_empty()
+                    || target.path == crate::util::MEMORY_PATH
+                    || target.mode == crate::util::OpenMode::Memory;
+                if !output_in_memory {
+                    if target.mode != crate::util::OpenMode::ReadWriteCreate {
+                        return Err(LimboError::InvalidArgument(format!(
+                            "unable to open database: {dest_path}"
+                        ))
+                        .into());
+                    }
+                    if std::path::Path::new(&target.path).exists() {
+                        return Err(LimboError::ParseError(format!(
+                            "output file already exists: {}",
+                            target.path
+                        ))
+                        .into());
+                    }
                 }
 
                 // Pin source metadata before building the output database. The
@@ -20261,14 +20280,24 @@ fn op_vacuum_into_inner(program: &Program, state: &mut ProgramState, insn: &Insn
                 // can resolve custom types, generated columns, vtab modules, etc.
                 let output_opts = vacuum_target_opts_from_source(&source_db);
 
-                // Always use PlatformIO for the output file, even if source
-                // is in-memory. This ensures VACUUM INTO writes to disk.
-                let io: Arc<dyn crate::IO> = Arc::new(crate::io::PlatformIO::new()?);
+                let (io, dest_path): (Arc<dyn crate::IO>, String) = if output_in_memory {
+                    (
+                        Arc::new(crate::MemoryIO::new()),
+                        crate::util::MEMORY_PATH.to_string(),
+                    )
+                } else if crate::is_memory_like(&target.path) {
+                    (
+                        Arc::new(crate::io::PlatformIO::new()?),
+                        format!("./{}", target.path),
+                    )
+                } else {
+                    (Arc::new(crate::io::PlatformIO::new()?), target.path)
+                };
                 let page_codec = source_pager.page_codec_external();
                 let output_db = match &page_codec {
                     Some(codec) => crate::Database::open(
                         io,
-                        dest_path,
+                        &dest_path,
                         crate::OpenOptions::new(source_db.dialect())
                             .flags(OpenFlags::Create)
                             .db_opts(output_opts)
@@ -20276,7 +20305,7 @@ fn op_vacuum_into_inner(program: &Program, state: &mut ProgramState, insn: &Insn
                     )?,
                     None => crate::Database::open_file_with_flags(
                         io,
-                        dest_path,
+                        &dest_path,
                         OpenFlags::Create,
                         output_opts,
                         None,

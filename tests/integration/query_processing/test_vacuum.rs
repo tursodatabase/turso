@@ -2680,6 +2680,55 @@ fn test_plain_vacuum_preserves_mvcc_after_reopen(tmp_db: TempDatabase) -> anyhow
     Ok(())
 }
 
+#[cfg(not(windows))]
+#[turso_macros::test(mvcc)]
+fn test_vacuum_into_file_targets_create_the_named_file(tmp_db: TempDatabase) -> anyhow::Result<()> {
+    let conn = tmp_db.connect_limbo();
+    conn.execute("CREATE TABLE t (a INTEGER)")?;
+    conn.execute("INSERT INTO t VALUES (1)")?;
+
+    let tag = if tmp_db.enable_mvcc {
+        "vacuum_into_mvcc"
+    } else {
+        "vacuum_into_wal"
+    };
+    let targets = [
+        (format!("':memory:{tag}'"), format!(":memory:{tag}")),
+        (format!("' :memory:{tag}'"), format!(" :memory:{tag}")),
+        (format!("'file:{tag}_uri.db'"), format!("{tag}_uri.db")),
+        (
+            format!("'file:{tag}%20space.db'"),
+            format!("{tag} space.db"),
+        ),
+        (
+            format!("'file:file::memory:{tag}'"),
+            format!("file::memory:{tag}"),
+        ),
+        (format!("'''{tag}'''"), format!("'{tag}'")),
+        (format!("'\"{tag}\"'"), format!("\"{tag}\"")),
+    ];
+    for (literal, file_name) in targets {
+        let remove_files = || {
+            let _ = std::fs::remove_file(&file_name);
+            let _ = std::fs::remove_file(format!("{file_name}-wal"));
+            let _ = std::fs::remove_file(Path::new(&file_name).with_extension("db-log"));
+        };
+        remove_files();
+
+        let result = conn.execute(format!("VACUUM INTO {literal}"));
+        let file_created = Path::new(&file_name).exists();
+        remove_files();
+
+        result?;
+        assert!(
+            file_created,
+            "VACUUM INTO {literal} should create the file {file_name:?}"
+        );
+    }
+
+    Ok(())
+}
+
 #[test]
 fn test_vacuum_into_from_memory_database() -> anyhow::Result<()> {
     use std::sync::Arc;
