@@ -66,8 +66,18 @@ pub fn quote_identifier(ident: &str) -> String {
 /// `sql` with `schema` in front of the table name that starts at byte
 /// offset `location`.
 pub fn qualify_create_table_name(sql: &str, location: usize, schema: &str) -> String {
+    qualify_table_names(sql, &[(location, schema.to_string())])
+}
+
+/// `sql` with each schema of `names` in front of the table name that starts
+/// at the byte offset given with it.
+pub fn qualify_table_names(sql: &str, names: &[(usize, String)]) -> String {
+    let mut names: Vec<&(usize, String)> = names.iter().collect();
+    names.sort_by_key(|(location, _)| std::cmp::Reverse(*location));
     let mut sql = sql.to_string();
-    sql.insert_str(location, &format!("{}.", quote_identifier(schema)));
+    for (location, schema) in names {
+        sql.insert_str(*location, &format!("{}.", quote_identifier(schema)));
+    }
     sql
 }
 
@@ -160,6 +170,39 @@ mod tests {
             "CREATE TABLE t (x int)"
         );
         assert_eq!(name_create_table("SELECT 1", "t").unwrap(), "SELECT 1");
+    }
+
+    #[test]
+    fn unqualified_foreign_key_targets_lists_the_tables_named_without_a_schema() {
+        let parse_result = parse(
+            "CREATE TABLE app.c (a int REFERENCES p (id), b int REFERENCES app.q (id), \
+             FOREIGN KEY (a, b) REFERENCES r (x, y))",
+        )
+        .unwrap();
+        let foreign_keys = translator::unqualified_foreign_key_targets(&parse_result).unwrap();
+        assert_eq!(foreign_keys.table, "c");
+        assert_eq!(foreign_keys.schema.as_deref(), Some("app"));
+        let names: Vec<&str> = foreign_keys
+            .targets
+            .iter()
+            .map(|(_, name)| name.as_str())
+            .collect();
+        assert_eq!(names, ["p", "r"]);
+        let sql = "CREATE TABLE c (a int REFERENCES p (id), FOREIGN KEY (a) REFERENCES r (x))";
+        let parse_result = parse(sql).unwrap();
+        let targets = translator::unqualified_foreign_key_targets(&parse_result)
+            .unwrap()
+            .targets;
+        let schemas: Vec<(usize, String)> = targets
+            .iter()
+            .zip(["app", "a.b"])
+            .map(|((location, _), schema)| (*location, schema.to_string()))
+            .collect();
+        assert_eq!(
+            qualify_table_names(sql, &schemas),
+            "CREATE TABLE c (a int REFERENCES app.p (id), FOREIGN KEY (a) REFERENCES \"a.b\".r (x))"
+        );
+        assert!(translator::unqualified_foreign_key_targets(&parse("SELECT 1").unwrap()).is_none());
     }
 
     #[test]

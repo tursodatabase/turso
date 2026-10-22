@@ -5955,6 +5955,64 @@ pub fn unqualified_create_table_name_location(parse_result: &ParseResult) -> Opt
     Some(relation.location as usize)
 }
 
+/// The tables that the foreign keys of a CREATE TABLE statement name
+/// without a schema.
+pub struct UnqualifiedForeignKeyTargets {
+    /// The table the statement creates.
+    pub table: String,
+    /// The schema the statement names for the table, if any.
+    pub schema: Option<String>,
+    /// The byte offset and name of each referenced table, in order.
+    pub targets: Vec<(usize, String)>,
+}
+
+/// The tables that the foreign keys of a CREATE TABLE statement name
+/// without a schema, in the column constraints and the table constraints.
+/// None for other statements.
+pub fn unqualified_foreign_key_targets(
+    parse_result: &ParseResult,
+) -> Option<UnqualifiedForeignKeyTargets> {
+    use pg_query::protobuf::{node::Node, ConstrType};
+    use pg_query::NodeRef;
+
+    let nodes = parse_result.protobuf.nodes();
+    let NodeRef::CreateStmt(create) = &nodes.first()?.0 else {
+        return None;
+    };
+    let relation = create.relation.as_ref()?;
+    let mut targets = Vec::new();
+    let mut add = |constraint: &pg_query::protobuf::Constraint| {
+        if ConstrType::try_from(constraint.contype) != Ok(ConstrType::ConstrForeign) {
+            return;
+        }
+        let Some(pktable) = &constraint.pktable else {
+            return;
+        };
+        if pktable.schemaname.is_empty() {
+            targets.push((pktable.location as usize, pktable.relname.clone()));
+        }
+    };
+    for elt in &create.table_elts {
+        match &elt.node {
+            Some(Node::ColumnDef(column)) => {
+                for constraint in &column.constraints {
+                    if let Some(Node::Constraint(constraint)) = &constraint.node {
+                        add(constraint);
+                    }
+                }
+            }
+            Some(Node::Constraint(constraint)) => add(constraint),
+            _ => {}
+        }
+    }
+    targets.sort_by_key(|(location, _)| *location);
+    Some(UnqualifiedForeignKeyTargets {
+        table: relation.relname.clone(),
+        schema: (!relation.schemaname.is_empty()).then(|| relation.schemaname.clone()),
+        targets,
+    })
+}
+
 /// For a CREATE INDEX statement without an index name, the name PostgreSQL
 /// chooses and the byte offset of the `ON` keyword, where the name goes in
 /// the statement text. The name is `<table>_<columns>_idx`, with a number

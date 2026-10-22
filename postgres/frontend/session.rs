@@ -12,8 +12,9 @@ use turso_parser::ast::{self};
 use turso_pg_parser::translator::{
     check_set_transaction, is_comment_on, is_refresh_matview, try_extract_copy_from,
     try_extract_create_schema, try_extract_drop_schema, try_extract_set, try_extract_show,
-    unnamed_index_name, unqualified_create_table_name_location, PgCopyFromStmt, PgCreateSchemaStmt,
-    PgDropSchemaStmt, PgSetStmt, PgSetValue, PgShowStmt, PostgreSQLTranslator,
+    unnamed_index_name, unqualified_create_table_name_location, unqualified_foreign_key_targets,
+    PgCopyFromStmt, PgCreateSchemaStmt, PgDropSchemaStmt, PgSetStmt, PgSetValue, PgShowStmt,
+    PostgreSQLTranslator,
 };
 
 use crate::copy::parse_copy_text_format;
@@ -195,12 +196,15 @@ fn prepare_statement(pg_conn: &Arc<PgConnectionInner>, sql: &str) -> Result<Stat
 
     let parse_result =
         turso_pg_parser::parse(sql).map_err(|e| LimboError::ParseError(e.to_string()))?;
-    let rewritten_sql = if let Some((location, schema)) =
-        create_table_schema_from_search_path(pg_conn, &parse_result)?
-    {
-        Some(turso_pg_parser::qualify_create_table_name(
-            sql, location, &schema,
-        ))
+    let table_schema = create_table_schema_from_search_path(pg_conn, &parse_result)?;
+    let mut qualified_names: Vec<(usize, String)> = table_schema.iter().cloned().collect();
+    qualified_names.extend(foreign_key_target_schemas(
+        &pg_conn.conn,
+        &parse_result,
+        table_schema.as_ref().map(|(_, schema)| schema.as_str()),
+    ));
+    let rewritten_sql = if !qualified_names.is_empty() {
+        Some(turso_pg_parser::qualify_table_names(sql, &qualified_names))
     } else {
         unnamed_index_name(sql, &parse_result, |schema, table, name| {
             relation_name_is_taken(&pg_conn.conn, schema, table, name)
@@ -268,6 +272,46 @@ fn create_table_schema_from_search_path(
         return Ok(None);
     }
     Ok(Some((location, schema)))
+}
+
+/// The schemas of the tables that the foreign keys of a CREATE TABLE
+/// statement name without a schema, with the byte offsets of the names, so
+/// that the statement text binds them the way PostgreSQL binds them when
+/// the table is created: to the first schema of `search_path` that has the
+/// table. A table that names itself is in the schema the statement names,
+/// or in `created_in`, when no schema has it yet. A table of public, or of
+/// no schema, keeps its name as written, since that is where core looks.
+fn foreign_key_target_schemas(
+    conn: &Connection,
+    parse_result: &turso_pg_parser::ParseResult,
+    created_in: Option<&str>,
+) -> Vec<(usize, String)> {
+    let Some(foreign_keys) = unqualified_foreign_key_targets(parse_result) else {
+        return Vec::new();
+    };
+    let schema = conn.current_schema();
+    let search_order = conn.search_order();
+    let created_in = foreign_keys.schema.as_deref().or(created_in);
+    foreign_keys
+        .targets
+        .into_iter()
+        .filter_map(|(location, table)| {
+            let found = search_order
+                .iter()
+                .filter(|namespace| namespace.database_id == turso_core::MAIN_DB_ID)
+                .find(|namespace| schema.get_table(&namespace.stored_name(&table)).is_some())
+                .map(|namespace| namespace.name.clone())
+                .or_else(|| {
+                    (table == foreign_keys.table)
+                        .then(|| created_in.map(str::to_string))
+                        .flatten()
+                });
+            match found {
+                Some(schema) if !schema.eq_ignore_ascii_case("public") => Some((location, schema)),
+                _ => None,
+            }
+        })
+        .collect()
 }
 
 /// Whether the schema of table `table` already has a table, index, view or
