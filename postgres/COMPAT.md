@@ -89,7 +89,12 @@ forms; the first schema of `search_path` that exists), `pg_backend_pid()`, `quot
 is not persisted. DML against pg_catalog is rejected. `pg_typeof` is not
 implemented.
 Configuration settings functions: `set_config()` and `current_setting()`,
-for `search_path` only.
+for `search_path` and for custom parameters (see Configuration Management).
+Setting changes follow the transaction as in PostgreSQL: a value that
+`set_config()` sets with `is_local = true` ends with the transaction,
+ROLLBACK undoes the setting changes of the transaction, ROLLBACK TO
+SAVEPOINT undoes the changes after the savepoint, and a statement that
+fails undoes its own changes.
 
 | Feature | Status | Notes |
 |---------|--------|-------|
@@ -360,6 +365,7 @@ Upgrade is not supported.
 | Feature | Status | Notes |
 |---------|--------|-------|
 | SET / SHOW configuration parameters | 🟡 Partial | Only search_path; other parameters are rejected, except SET to a value matching existing behaviour (see SET / SHOW above) |
+| Custom configuration parameters (`app.user_id`) | 🟡 Partial | `set_config()` and `current_setting()` only, not SET or SHOW; in server mode, all clients share the values |
 | ALTER SYSTEM | ❌ Not supported | |
 | Fractional input for "integer" values | ❌ Not supported | |
 | Include directives for pg_hba.conf and pg_ident.conf | ❌ Not supported | |

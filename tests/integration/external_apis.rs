@@ -12,7 +12,7 @@ use std::{
         Arc,
     },
 };
-use turso_core::{ConnectOpts, Connection, LimboError, StepResult};
+use turso_core::{ConnectOpts, Connection, ConnectionHooks, LimboError, SavepointMemo, StepResult};
 use turso_ext::{
     AggCtx, ContextDestructor, FinalizeFunction, InitAggFunction, ResultCode, ScalarDerive,
     ScalarFunc, ScalarFunction, StepFunction, Value as ExtValue, ValueDestructor,
@@ -58,6 +58,80 @@ fn connection_context_is_typed_and_isolated(tmp_db: TempDatabase) -> anyhow::Res
         .unwrap() = 23;
     assert_eq!(*context.lock().unwrap(), 13);
     Ok(())
+}
+
+#[turso_macros::test(mvcc)]
+fn connection_hooks_see_statement_ends_rollbacks_and_savepoints(
+    tmp_db: TempDatabase,
+) -> anyhow::Result<()> {
+    let hooks = Arc::new(RecordingHooks::default());
+    let conn = tmp_db.limbo_database().connect_with_hooks(hooks.clone())?;
+    assert!(std::ptr::eq(
+        hooks.as_ref(),
+        conn.context::<RecordingHooks>().unwrap()
+    ));
+    hooks.events.lock().unwrap().clear();
+
+    conn.execute("CREATE TABLE t(x INTEGER PRIMARY KEY)")?;
+    conn.execute("INSERT INTO t VALUES (1)")?;
+    assert!(conn.execute("INSERT INTO t VALUES (1)").is_err());
+    conn.execute("BEGIN")?;
+    conn.execute("SAVEPOINT a")?;
+    conn.execute("SAVEPOINT b")?;
+    conn.execute("ROLLBACK TO a")?;
+    conn.execute("ROLLBACK")?;
+
+    assert_eq!(
+        *hooks.events.lock().unwrap(),
+        [
+            "statement ended, failed: false",
+            "statement ended, failed: false",
+            "statement ended, failed: true",
+            "statement ended, failed: false",
+            "savepoint 0 created",
+            "statement ended, failed: false",
+            "savepoint 1 created",
+            "statement ended, failed: false",
+            "rolled back to savepoint 0",
+            "statement ended, failed: false",
+            "transaction rolled back",
+            "statement ended, failed: false",
+        ]
+    );
+    Ok(())
+}
+
+#[derive(Default)]
+struct RecordingHooks {
+    events: std::sync::Mutex<Vec<String>>,
+    savepoints_created: AtomicUsize,
+}
+
+impl ConnectionHooks for RecordingHooks {
+    fn root_statement_ended(&self, _conn: &Connection, failed: bool) {
+        self.record(format!("statement ended, failed: {failed}"));
+    }
+
+    fn transaction_rolled_back(&self, _conn: &Connection) {
+        self.record("transaction rolled back".to_string());
+    }
+
+    fn savepoint_created(&self, _conn: &Connection) -> SavepointMemo {
+        let id = self.savepoints_created.fetch_add(1, AtomicOrdering::SeqCst);
+        self.record(format!("savepoint {id} created"));
+        Arc::new(id)
+    }
+
+    fn rolled_back_to_savepoint(&self, _conn: &Connection, memo: &SavepointMemo) {
+        let id = memo.downcast_ref::<usize>().unwrap();
+        self.record(format!("rolled back to savepoint {id}"));
+    }
+}
+
+impl RecordingHooks {
+    fn record(&self, event: String) {
+        self.events.lock().unwrap().push(event);
+    }
 }
 
 #[turso_macros::test(mvcc)]

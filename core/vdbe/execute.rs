@@ -5416,6 +5416,9 @@ pub fn op_auto_commit(
                 conn.rollback_temp_schema();
                 vtab_rollback_all(&conn)?;
                 conn.index_methods_on_transaction_rolled_back();
+                if let Some(hooks) = conn.hooks() {
+                    hooks.transaction_rolled_back(&conn);
+                }
                 conn.set_tx_state(TransactionState::None);
                 conn.auto_commit.store(true, Ordering::SeqCst);
                 conn.set_cdc_transaction_id(-1);
@@ -5668,6 +5671,7 @@ pub fn op_savepoint(
                         main_schema_snapshot,
                         temp_schema_snapshot,
                         staged_schema_snapshot,
+                        hooks_memo: conn.hooks().map(|hooks| hooks.savepoint_created(&conn)),
                     };
                     // Mirror onto attached/temp pagers. If any pager fails
                     // mid-flight, earlier ones already opened a savepoint
@@ -5803,6 +5807,9 @@ pub fn op_savepoint(
                 }
                 *conn.database_schemas().write() = info.staged_schema_snapshot;
                 conn.bump_prepare_context_generation();
+                if let (Some(hooks), Some(memo)) = (conn.hooks(), &info.hooks_memo) {
+                    hooks.rolled_back_to_savepoint(&conn, memo);
+                }
             }
 
             // Invalidate cached schema cookies on ALL pagers whose pages may

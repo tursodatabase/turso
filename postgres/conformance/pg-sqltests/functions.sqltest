@@ -293,6 +293,297 @@ test current-setting-with-three-arguments-errors {
 }
 expect error {}
 
+test set-config-custom-parameter {
+    SELECT set_config('app.user_id', '42', false);
+    SELECT current_setting('app.user_id');
+    SELECT current_setting('APP.User_Id');
+    SELECT current_setting('app.user_id', true);
+}
+expect {
+    42
+    42
+    42
+    42
+}
+
+test set-config-custom-parameter-names {
+    SELECT set_config('a.b.c', 'three parts', false);
+    SELECT set_config('_a._b', 'underscores', false);
+    SELECT set_config('app.x1$', 'digit and dollar', false);
+    SELECT set_config('é.ü', 'not ASCII', false);
+    SELECT current_setting('A.B.C'), current_setting('_A._B'), current_setting('APP.X1$'), current_setting('é.ü');
+}
+expect {
+    three parts
+    underscores
+    digit and dollar
+    not ASCII
+    three parts|underscores|digit and dollar|not ASCII
+}
+
+test set-config-custom-parameter-name-is-not-case-sensitive-when-set {
+    SELECT set_config('APP.Mixed_Case', 'v', false);
+    SELECT current_setting('app.mixed_case');
+}
+expect {
+    v
+    v
+}
+
+test custom-parameter-name-ignores-only-the-case-of-ascii-letters {
+    SELECT set_config('app.é', 'lower', false);
+    SELECT current_setting('APP.é');
+    SELECT coalesce(current_setting('app.É', true), '<null>');
+}
+expect {
+    lower
+    lower
+    <null>
+}
+
+test current-setting-undefined-custom-parameter-errors {
+    SELECT current_setting('app.never_set');
+}
+expect error {
+    unrecognized configuration parameter "app\.never_set"
+}
+
+test set-config-custom-parameter-null-value-resets-it {
+    SELECT set_config('app.reset_me', 'v', false);
+    SELECT quote_literal(set_config('app.reset_me', NULL, false));
+    SELECT quote_literal(current_setting('app.reset_me'));
+    SELECT quote_literal(current_setting('app.reset_me', true));
+}
+expect {
+    v
+    ''
+    ''
+    ''
+}
+
+test set-config-custom-parameter-name-with-an-empty-part-errors {
+    SELECT set_config('app..user_id', 'v', false);
+}
+expect error {
+    invalid configuration parameter name "app\.\.user_id"
+}
+
+test set-config-custom-parameter-name-with-a-trailing-dot-errors {
+    SELECT set_config('app.', 'v', false);
+}
+expect error {
+    invalid configuration parameter name "app\."
+}
+
+test set-config-custom-parameter-name-with-a-leading-digit-errors {
+    SELECT set_config('app.1user', 'v', false);
+}
+expect error {
+    invalid configuration parameter name "app\.1user"
+}
+
+test set-config-custom-parameter-name-with-a-space-errors {
+    SELECT set_config('app.user id', 'v', false);
+}
+expect error {
+    invalid configuration parameter name "app\.user id"
+}
+
+test set-config-unknown-parameter-without-a-dot-errors {
+    SELECT set_config('no_such_setting', 'v', false);
+}
+expect error {
+    unrecognized configuration parameter "no_such_setting"
+}
+
+test set-config-local-custom-parameter-in-one-statement {
+    SELECT set_config('app.tx_value', 'local', true), current_setting('app.tx_value');
+}
+expect {
+    local|local
+}
+
+test set-config-local-custom-parameter-ends-with-its-statement-outside-a-transaction {
+    SELECT set_config('app.autocommit_local', 'local', true);
+    SELECT quote_literal(current_setting('app.autocommit_local'));
+}
+expect {
+    local
+    ''
+}
+
+test set-config-local-custom-parameter-ends-at-commit {
+    BEGIN;
+    SELECT set_config('app.tx_value', 'local', true);
+    SELECT current_setting('app.tx_value');
+    COMMIT;
+    SELECT quote_literal(current_setting('app.tx_value'));
+    SELECT quote_literal(current_setting('app.tx_value', true));
+}
+expect {
+    local
+    local
+    ''
+    ''
+}
+
+test set-config-local-custom-parameter-ends-at-rollback {
+    BEGIN;
+    SELECT set_config('app.tx_value', 'local', true);
+    ROLLBACK;
+    SELECT quote_literal(current_setting('app.tx_value'));
+}
+expect {
+    local
+    ''
+}
+
+test set-config-local-custom-parameter-hides-the-session-value {
+    BEGIN;
+    SELECT set_config('app.mode', 'session', false);
+    COMMIT;
+    BEGIN;
+    SELECT set_config('app.mode', 'local', true);
+    SELECT current_setting('app.mode');
+    COMMIT;
+    SELECT current_setting('app.mode');
+    BEGIN;
+    SELECT set_config('app.mode', 'local', true);
+    ROLLBACK;
+    SELECT current_setting('app.mode');
+}
+expect {
+    session
+    local
+    local
+    session
+    local
+    session
+}
+
+test set-config-session-value-stays-after-a-later-local-value-ends {
+    BEGIN;
+    SELECT set_config('app.mode', 'session', false);
+    SELECT set_config('app.mode', 'local', true);
+    SELECT current_setting('app.mode');
+    COMMIT;
+    SELECT current_setting('app.mode');
+}
+expect {
+    session
+    local
+    local
+    session
+}
+
+test set-config-session-value-replaces-a-local-value {
+    BEGIN;
+    SELECT set_config('app.mode', 'local', true);
+    SELECT set_config('app.mode', 'session', false);
+    COMMIT;
+    SELECT current_setting('app.mode');
+}
+expect {
+    local
+    session
+    session
+}
+
+test set-config-rollback-undoes-a-session-value {
+    BEGIN;
+    SELECT set_config('app.rb_value', 'before', false);
+    COMMIT;
+    BEGIN;
+    SELECT set_config('app.rb_value', 'in transaction', false);
+    ROLLBACK;
+    SELECT current_setting('app.rb_value');
+}
+expect {
+    before
+    in transaction
+    before
+}
+
+test set-config-custom-parameter-stays-defined-after-rollback {
+    BEGIN;
+    SELECT set_config('app.rb_new', 'x', false);
+    ROLLBACK;
+    SELECT quote_literal(current_setting('app.rb_new'));
+}
+expect {
+    x
+    ''
+}
+
+test set-config-rollback-to-savepoint-undoes-later-values {
+    BEGIN;
+    SELECT set_config('app.sp_value', 'before savepoint', false);
+    SAVEPOINT s;
+    SELECT set_config('app.sp_value', 'after savepoint', false);
+    SELECT set_config('app.sp_local', 'local', true);
+    ROLLBACK TO SAVEPOINT s;
+    SELECT current_setting('app.sp_value'), quote_literal(current_setting('app.sp_local'));
+    COMMIT;
+    SELECT current_setting('app.sp_value');
+}
+expect {
+    before savepoint
+    after savepoint
+    local
+    before savepoint|''
+    before savepoint
+}
+
+test set-config-release-savepoint-keeps-values {
+    BEGIN;
+    SAVEPOINT s;
+    SELECT set_config('app.rel_session', 'session', false);
+    SELECT set_config('app.rel_local', 'local', true);
+    RELEASE SAVEPOINT s;
+    SELECT current_setting('app.rel_session'), current_setting('app.rel_local');
+    COMMIT;
+    SELECT current_setting('app.rel_session'), quote_literal(current_setting('app.rel_local'));
+}
+expect {
+    session
+    local
+    session|local
+    session|''
+}
+
+test set-config-rollback-undoes-values-of-a-released-savepoint {
+    BEGIN;
+    SAVEPOINT s;
+    SELECT set_config('app.rel_rb', 'released', false);
+    RELEASE SAVEPOINT s;
+    ROLLBACK;
+    SELECT quote_literal(current_setting('app.rel_rb'));
+}
+expect {
+    released
+    ''
+}
+
+test set-config-rollback-to-an-outer-savepoint {
+    BEGIN;
+    SELECT set_config('app.nested', 'outer', false);
+    SAVEPOINT a;
+    SELECT set_config('app.nested', 'a', false);
+    SAVEPOINT b;
+    SELECT set_config('app.nested', 'b', true);
+    ROLLBACK TO SAVEPOINT a;
+    SELECT current_setting('app.nested');
+    COMMIT;
+    SELECT current_setting('app.nested');
+}
+expect {
+    outer
+    a
+    b
+    outer
+    outer
+}
+
 test obj-description-unknown-oid-is-null {
     SELECT obj_description(0, 'pg_class');
 }
