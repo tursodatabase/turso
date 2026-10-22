@@ -894,6 +894,22 @@ impl PostgreSQLTranslator {
             .ok_or_else(|| ParseError::ParseError("RENAME missing relation".into()))?;
         let name = self.qualified_name_from_range_var(relation);
 
+        if rename.missing_ok {
+            return Err(not_supported("ALTER ... IF EXISTS ... RENAME"));
+        }
+        // RENAME COLUMN records the kind of relation separately; only tables
+        // are handled here.
+        if rename_type == ObjectType::ObjectColumn
+            && rename.relation_type != ObjectType::ObjectTable as i32
+        {
+            return Err(not_supported(format!(
+                "ALTER {} ... RENAME COLUMN",
+                drop_object_type_name(
+                    ObjectType::try_from(rename.relation_type).unwrap_or(ObjectType::Undefined)
+                )
+            )));
+        }
+
         match rename_type {
             ObjectType::ObjectTable => {
                 let new_name = ast::Name::from_string(&rename.newname);
@@ -8955,5 +8971,17 @@ mod tests {
             "USING",
         );
         assert_translates("ALTER TABLE t ALTER COLUMN a TYPE bigint");
+    }
+
+    #[test]
+    fn fail_closed_rename() {
+        assert_not_supported(
+            "ALTER VIEW v RENAME COLUMN a TO b",
+            "ALTER VIEW ... RENAME COLUMN",
+        );
+        assert_not_supported("ALTER TABLE IF EXISTS t RENAME TO u", "IF EXISTS");
+        assert_not_supported("ALTER TABLE IF EXISTS t RENAME COLUMN a TO b", "IF EXISTS");
+        assert_translates("ALTER TABLE t RENAME COLUMN a TO b");
+        assert_translates("ALTER TABLE t RENAME TO u");
     }
 }
