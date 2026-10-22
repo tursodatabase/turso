@@ -1545,6 +1545,13 @@ impl PostgreSQLTranslator {
             })
             .collect::<Result<_, _>>()?;
         reject_duplicate_columns(columns.iter().map(|c| c.as_str()), "INSERT")?;
+        if matches!(
+            pg_query::protobuf::OverridingKind::try_from(insert.r#override),
+            Ok(pg_query::protobuf::OverridingKind::OverridingUserValue
+                | pg_query::protobuf::OverridingKind::OverridingSystemValue)
+        ) {
+            return Err(not_supported("INSERT ... OVERRIDING SYSTEM/USER VALUE"));
+        }
         let has_explicit_columns = !columns.is_empty();
 
         // Translate body (VALUES or SELECT)
@@ -10188,6 +10195,18 @@ mod tests {
                 .to_string();
             assert!(err.contains("specified more than once"), "{sql}: {err}");
         }
+    }
+
+    #[test]
+    fn fail_closed_overriding() {
+        assert_not_supported(
+            "INSERT INTO t OVERRIDING SYSTEM VALUE VALUES (1)",
+            "OVERRIDING",
+        );
+        assert_not_supported(
+            "INSERT INTO t OVERRIDING USER VALUE VALUES (1)",
+            "OVERRIDING",
+        );
     }
 
     #[test]
