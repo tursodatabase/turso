@@ -417,6 +417,7 @@ fn reject_catalog_dml(stmt: &ast::Stmt) -> Result<()> {
 fn reject_schema_marker_names(stmt: &ast::Stmt) -> Result<()> {
     let (verb, table_name) = match stmt {
         ast::Stmt::CreateTable { tbl_name, .. } => ("create", tbl_name),
+        ast::Stmt::CreateMaterializedView { view_name, .. } => ("create", view_name),
         ast::Stmt::DropTable { tbl_name, .. } => ("drop", tbl_name),
         ast::Stmt::AlterTable(alter) => match &alter.body {
             ast::AlterTableBody::RenameTo(new_name) => {
@@ -914,10 +915,11 @@ fn object_names(schema: &turso_core::schema::Schema) -> Vec<String> {
 }
 
 fn schema_names(conn: &Connection) -> Vec<String> {
-    let mut names: Vec<String> = conn
-        .current_schema()
+    let schema = conn.current_schema();
+    let mut names: Vec<String> = schema
         .tables
         .keys()
+        .filter(|table| !schema.materialized_view_names.contains(*table))
         .filter_map(|table| table.strip_prefix(SCHEMA_MARKER_PREFIX))
         .map(str::to_string)
         .collect();

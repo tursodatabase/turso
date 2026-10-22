@@ -391,3 +391,12 @@ test public-object-named-with-public-under-a-schema-prefix-errors {
 expect error {
     cannot create "s.t" in public
 }
+
+@skip-if postgres "Turso marks each schema with a table named pg_turso_schema_<schema>; PostgreSQL has no such tables"
+test materialized-view-named-like-a-schema-marker-errors {
+    CREATE TABLE src (a int);
+    CREATE MATERIALIZED VIEW pg_turso_schema_foo AS SELECT a FROM src;
+}
+expect error {
+    reserved for schema markers
+}
