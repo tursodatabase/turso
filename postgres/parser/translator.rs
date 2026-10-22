@@ -2877,11 +2877,22 @@ impl PostgreSQLTranslator {
                     ParseError::ParseError("TypeCast missing inner expression".into())
                 })?;
                 let expr = Box::new(self.translate_expr(arg)?);
-                let type_name = type_cast
+                let pg_type_name = type_cast
                     .type_name
                     .as_ref()
-                    .and_then(pg_type_name_to_ast_type);
-                Ok(ast::Expr::Cast { expr, type_name })
+                    .ok_or_else(|| ParseError::ParseError("TypeCast missing type name".into()))?;
+                // The cast target carries no size, so varchar(3) would not
+                // truncate and numeric(5,2) would not round.
+                if !pg_type_name.typmods.is_empty() {
+                    return Err(not_supported("type modifiers in a cast"));
+                }
+                let type_name = pg_type_name_to_ast_type(pg_type_name).ok_or_else(|| {
+                    ParseError::ParseError("TypeCast has an empty type name".into())
+                })?;
+                Ok(ast::Expr::Cast {
+                    expr,
+                    type_name: Some(type_name),
+                })
             }
             Some(pg_query::protobuf::node::Node::SubLink(sub_link)) => {
                 self.translate_sublink(sub_link)
@@ -10006,5 +10017,16 @@ mod tests {
         // psql's catalog queries use these.
         assert_translates("SELECT relname COLLATE pg_catalog.default FROM pg_class");
         assert_translates("SELECT * FROM t ORDER BY name COLLATE \"C\"");
+    }
+
+    #[test]
+    fn fail_closed_cast_type_modifiers() {
+        assert_not_supported("SELECT '1.239'::numeric(5, 2)", "type modifiers in a cast");
+        assert_not_supported(
+            "SELECT CAST('abcdef' AS varchar(3))",
+            "type modifiers in a cast",
+        );
+        assert_not_supported("SELECT now()::timestamp(0)", "type modifiers in a cast");
+        assert_translates("SELECT '1.5'::numeric, 'a'::varchar, 1::int[]");
     }
 }
