@@ -1103,8 +1103,11 @@ impl PostgreSQLTranslator {
         let mut columns = Vec::new();
         for param_node in &idx.index_params {
             let Some(Node::IndexElem(elem)) = &param_node.node else {
-                continue;
+                return Err(ParseError::ParseError(
+                    "CREATE INDEX: unexpected index element".into(),
+                ));
             };
+            reject_index_elem_clauses(elem, "CREATE INDEX")?;
             let expr = if !elem.name.is_empty() {
                 Box::new(ast::Expr::Id(ast::Name::from_string(&elem.name)))
             } else if let Some(ref expr_node) = elem.expr {
@@ -6110,6 +6113,20 @@ fn reject_column_def_clauses(col_def: &pg_query::protobuf::ColumnDef) -> Result<
     Ok(())
 }
 
+/// Rejects per-column index clauses that are not translated.
+fn reject_index_elem_clauses(
+    elem: &pg_query::protobuf::IndexElem,
+    context: &str,
+) -> Result<(), ParseError> {
+    if !elem.collation.is_empty() {
+        return Err(not_supported(format!("COLLATE in {context}")));
+    }
+    if !elem.opclass.is_empty() || !elem.opclassopts.is_empty() {
+        return Err(not_supported(format!("operator classes in {context}")));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -9081,5 +9098,18 @@ mod tests {
             "storage parameters",
         );
         assert_not_supported("CREATE INDEX i ON t (a) TABLESPACE ts", "TABLESPACE");
+    }
+
+    #[test]
+    fn fail_closed_index_element_clauses() {
+        assert_not_supported(
+            "CREATE INDEX i ON t (a COLLATE \"C\")",
+            "COLLATE in CREATE INDEX",
+        );
+        assert_not_supported(
+            "CREATE INDEX i ON t (a text_pattern_ops)",
+            "operator classes in CREATE INDEX",
+        );
+        assert_translates("CREATE INDEX i ON t (a DESC NULLS LAST, (lower(b)))");
     }
 }
