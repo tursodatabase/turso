@@ -173,6 +173,7 @@ pub struct Builder {
     enable_index_method: bool,
     enable_materialized_views: bool,
     enable_vacuum: bool,
+    enable_autovacuum: bool,
     enable_generated_columns: bool,
     enable_multiprocess_wal: bool,
     enable_without_rowid: bool,
@@ -194,6 +195,7 @@ impl Builder {
             enable_index_method: false,
             enable_materialized_views: false,
             enable_vacuum: false,
+            enable_autovacuum: false,
             enable_generated_columns: false,
             enable_multiprocess_wal: false,
             enable_without_rowid: false,
@@ -254,6 +256,11 @@ impl Builder {
         self
     }
 
+    pub fn experimental_autovacuum(mut self, enabled: bool) -> Self {
+        self.enable_autovacuum = enabled;
+        self
+    }
+
     pub fn experimental_multiprocess_wal(mut self, enabled: bool) -> Self {
         self.enable_multiprocess_wal = enabled;
         self
@@ -305,6 +312,9 @@ impl Builder {
         }
         if self.enable_vacuum {
             features.push("vacuum");
+        }
+        if self.enable_autovacuum {
+            features.push("autovacuum");
         }
         if self.enable_generated_columns {
             features.push("generated_columns");
@@ -944,6 +954,45 @@ mod tests {
             wal_size as f64 / 1024.0
         );
         assert!(wal_size > 0, "WAL file should exist and be non-empty");
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_builder_experimental_autovacuum() -> Result<()> {
+        let temp_file = NamedTempFile::new().unwrap();
+        let db_path = temp_file.path().to_str().unwrap();
+
+        {
+            let db = Builder::new_local(db_path)
+                .experimental_autovacuum(true)
+                .build()
+                .await?;
+            let conn = db.connect()?;
+            conn.execute("PRAGMA auto_vacuum = FULL;", ()).await?;
+            conn.execute("CREATE TABLE t(x);", ()).await?;
+            conn.execute("INSERT INTO t VALUES (1);", ()).await?;
+        }
+
+        {
+            let db = Builder::new_local(db_path).build().await?;
+            let conn = db.connect()?;
+            let result = conn.execute("INSERT INTO t VALUES (2);", ()).await;
+            assert!(matches!(result, Err(Error::Readonly(_))));
+        }
+
+        {
+            let db = Builder::new_local(db_path)
+                .experimental_autovacuum(true)
+                .build()
+                .await?;
+            let conn = db.connect()?;
+            conn.execute("INSERT INTO t VALUES (2);", ()).await?;
+
+            let mut rows = conn.query("SELECT count(*) FROM t;", ()).await?;
+            let row = rows.next().await?.unwrap();
+            assert_eq!(row.get_value(0)?, Value::Integer(2));
+        }
 
         Ok(())
     }
