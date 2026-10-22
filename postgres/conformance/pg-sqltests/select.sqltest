@@ -848,3 +848,140 @@ expect {
     6
     7
 }
+
+# BETWEEN SYMMETRIC is (x BETWEEN a AND b) OR (x BETWEEN b AND a), including NULL bounds.
+
+test between-symmetric-01 {
+    SELECT CASE WHEN (5 BETWEEN SYMMETRIC 10 AND 1) IS NULL THEN 'null' WHEN 5 BETWEEN SYMMETRIC 10 AND 1 THEN 'true' ELSE 'false' END;
+}
+expect {
+    true
+}
+
+test between-symmetric-02 {
+    SELECT CASE WHEN (5 BETWEEN SYMMETRIC 1 AND 10) IS NULL THEN 'null' WHEN 5 BETWEEN SYMMETRIC 1 AND 10 THEN 'true' ELSE 'false' END;
+}
+expect {
+    true
+}
+
+test between-symmetric-03 {
+    SELECT CASE WHEN (15 BETWEEN SYMMETRIC 10 AND 1) IS NULL THEN 'null' WHEN 15 BETWEEN SYMMETRIC 10 AND 1 THEN 'true' ELSE 'false' END;
+}
+expect {
+    false
+}
+
+test between-symmetric-04 {
+    SELECT CASE WHEN (0 BETWEEN SYMMETRIC 10 AND 1) IS NULL THEN 'null' WHEN 0 BETWEEN SYMMETRIC 10 AND 1 THEN 'true' ELSE 'false' END;
+}
+expect {
+    false
+}
+
+test between-symmetric-05 {
+    SELECT CASE WHEN (5 NOT BETWEEN SYMMETRIC 10 AND 1) IS NULL THEN 'null' WHEN 5 NOT BETWEEN SYMMETRIC 10 AND 1 THEN 'true' ELSE 'false' END;
+}
+expect {
+    false
+}
+
+test between-symmetric-06 {
+    SELECT CASE WHEN (15 NOT BETWEEN SYMMETRIC 10 AND 1) IS NULL THEN 'null' WHEN 15 NOT BETWEEN SYMMETRIC 10 AND 1 THEN 'true' ELSE 'false' END;
+}
+expect {
+    true
+}
+
+test between-symmetric-07 {
+    SELECT CASE WHEN (5 BETWEEN SYMMETRIC NULL AND 10) IS NULL THEN 'null' WHEN 5 BETWEEN SYMMETRIC NULL AND 10 THEN 'true' ELSE 'false' END;
+}
+expect {
+    null
+}
+
+test between-symmetric-08 {
+    SELECT CASE WHEN (50 BETWEEN SYMMETRIC NULL AND 10) IS NULL THEN 'null' WHEN 50 BETWEEN SYMMETRIC NULL AND 10 THEN 'true' ELSE 'false' END;
+}
+expect {
+    null
+}
+
+test between-symmetric-09 {
+    SELECT CASE WHEN (5 BETWEEN SYMMETRIC 10 AND NULL) IS NULL THEN 'null' WHEN 5 BETWEEN SYMMETRIC 10 AND NULL THEN 'true' ELSE 'false' END;
+}
+expect {
+    null
+}
+
+test between-symmetric-10 {
+    SELECT CASE WHEN (5 BETWEEN SYMMETRIC NULL AND 1) IS NULL THEN 'null' WHEN 5 BETWEEN SYMMETRIC NULL AND 1 THEN 'true' ELSE 'false' END;
+}
+expect {
+    null
+}
+
+test between-symmetric-11 {
+    SELECT CASE WHEN (0 BETWEEN SYMMETRIC NULL AND 1) IS NULL THEN 'null' WHEN 0 BETWEEN SYMMETRIC NULL AND 1 THEN 'true' ELSE 'false' END;
+}
+expect {
+    null
+}
+
+test between-symmetric-12 {
+    SELECT CASE WHEN (NULL BETWEEN SYMMETRIC 1 AND 10) IS NULL THEN 'null' WHEN NULL BETWEEN SYMMETRIC 1 AND 10 THEN 'true' ELSE 'false' END;
+}
+expect {
+    null
+}
+
+test between-symmetric-13 {
+    SELECT CASE WHEN (5 BETWEEN SYMMETRIC NULL AND NULL) IS NULL THEN 'null' WHEN 5 BETWEEN SYMMETRIC NULL AND NULL THEN 'true' ELSE 'false' END;
+}
+expect {
+    null
+}
+
+test between-symmetric-14 {
+    SELECT CASE WHEN (5 NOT BETWEEN SYMMETRIC NULL AND 10) IS NULL THEN 'null' WHEN 5 NOT BETWEEN SYMMETRIC NULL AND 10 THEN 'true' ELSE 'false' END;
+}
+expect {
+    null
+}
+
+test between-symmetric-15 {
+    SELECT CASE WHEN (50 NOT BETWEEN SYMMETRIC NULL AND 10) IS NULL THEN 'null' WHEN 50 NOT BETWEEN SYMMETRIC NULL AND 10 THEN 'true' ELSE 'false' END;
+}
+expect {
+    null
+}
+
+test between-symmetric-16 {
+    SELECT CASE WHEN (0 NOT BETWEEN SYMMETRIC 10 AND NULL) IS NULL THEN 'null' WHEN 0 NOT BETWEEN SYMMETRIC 10 AND NULL THEN 'true' ELSE 'false' END;
+}
+expect {
+    null
+}
+
+test between-symmetric-17 {
+    SELECT CASE WHEN (5 NOT BETWEEN SYMMETRIC NULL AND 1) IS NULL THEN 'null' WHEN 5 NOT BETWEEN SYMMETRIC NULL AND 1 THEN 'true' ELSE 'false' END;
+}
+expect {
+    null
+}
+
+test between-symmetric-18 {
+    SELECT CASE WHEN (NULL NOT BETWEEN SYMMETRIC 1 AND 10) IS NULL THEN 'null' WHEN NULL NOT BETWEEN SYMMETRIC 1 AND 10 THEN 'true' ELSE 'false' END;
+}
+expect {
+    null
+}
+
+test between-symmetric-series {
+    SELECT count(*) FROM generate_series(1, 10) AS g(x) WHERE x BETWEEN SYMMETRIC 7 AND 3;
+    SELECT count(*) FROM generate_series(1, 10) AS g(x) WHERE x NOT BETWEEN SYMMETRIC 7 AND 3;
+}
+expect {
+    5
+    5
+}

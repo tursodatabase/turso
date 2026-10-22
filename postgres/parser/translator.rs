@@ -3361,11 +3361,10 @@ impl PostgreSQLTranslator {
             AExprKind::AexprLike | AExprKind::AexprIlike => self.translate_like_expr(a_expr),
             AExprKind::AexprOpAny => self.translate_any_all_expr(a_expr, false),
             AExprKind::AexprOpAll => self.translate_any_all_expr(a_expr, true),
-            AExprKind::AexprBetween => self.translate_between_expr(a_expr, false),
-            AExprKind::AexprNotBetween => self.translate_between_expr(a_expr, true),
-            AExprKind::AexprBetweenSym | AExprKind::AexprNotBetweenSym => {
-                Err(not_supported("BETWEEN SYMMETRIC"))
-            }
+            AExprKind::AexprBetween => self.translate_between_expr(a_expr, false, false),
+            AExprKind::AexprNotBetween => self.translate_between_expr(a_expr, true, false),
+            AExprKind::AexprBetweenSym => self.translate_between_expr(a_expr, false, true),
+            AExprKind::AexprNotBetweenSym => self.translate_between_expr(a_expr, true, true),
             AExprKind::AexprDistinct => {
                 // IS DISTINCT FROM → lhs IS NOT rhs
                 let lhs = a_expr
@@ -3854,13 +3853,14 @@ impl PostgreSQLTranslator {
         &self,
         a_expr: &pg_query::protobuf::AExpr,
         not: bool,
+        symmetric: bool,
     ) -> Result<ast::Expr, ParseError> {
         // BETWEEN: lexpr is the test expression, rexpr is a List of [low, high]
-        let lhs = a_expr
+        let lhs_node = a_expr
             .lexpr
             .as_ref()
             .ok_or_else(|| ParseError::ParseError("BETWEEN: missing test expression".into()))?;
-        let lhs = self.translate_operand(lhs)?;
+        let lhs = self.translate_operand(lhs_node)?;
 
         let rexpr = a_expr
             .rexpr
@@ -3882,12 +3882,42 @@ impl PostgreSQLTranslator {
         let start = self.translate_operand(&items[0])?;
         let end = self.translate_operand(&items[1])?;
 
-        Ok(ast::Expr::Between {
+        if !symmetric {
+            return Ok(ast::Expr::Between {
+                lhs: Box::new(lhs),
+                not,
+                start: Box::new(start),
+                end: Box::new(end),
+            });
+        }
+
+        // SYMMETRIC is `(x BETWEEN a AND b) OR (x BETWEEN b AND a)`, which is the
+        // PostgreSQL definition including NULL handling. Turso's scalar min/max
+        // return NULL on any NULL argument, so they cannot express least/greatest.
+        // NOT BETWEEN SYMMETRIC is the negation of that. The operands are
+        // translated a second time for the swapped bounds.
+        let lhs2 = self.translate_operand(lhs_node)?;
+        let start2 = self.translate_operand(&items[0])?;
+        let end2 = self.translate_operand(&items[1])?;
+        let forward = ast::Expr::Between {
             lhs: Box::new(lhs),
-            not,
+            not: false,
             start: Box::new(start),
             end: Box::new(end),
-        })
+        };
+        let swapped = ast::Expr::Between {
+            lhs: Box::new(lhs2),
+            not: false,
+            start: Box::new(end2),
+            end: Box::new(start2),
+        };
+        let either = ast::Expr::Binary(Box::new(forward), ast::Operator::Or, Box::new(swapped));
+        let either = ast::Expr::Parenthesized(vec![Box::new(either)]);
+        if not {
+            Ok(ast::Expr::Unary(ast::UnaryOperator::Not, Box::new(either)))
+        } else {
+            Ok(either)
+        }
     }
 
     fn translate_func_call(
@@ -10172,12 +10202,9 @@ mod tests {
     }
 
     #[test]
-    fn fail_closed_between_symmetric() {
-        assert_not_supported("SELECT 5 BETWEEN SYMMETRIC 10 AND 1", "BETWEEN SYMMETRIC");
-        assert_not_supported(
-            "SELECT 5 NOT BETWEEN SYMMETRIC 10 AND 1",
-            "BETWEEN SYMMETRIC",
-        );
+    fn between_symmetric() {
+        assert_translates("SELECT 5 BETWEEN SYMMETRIC 10 AND 1");
+        assert_translates("SELECT 5 NOT BETWEEN SYMMETRIC 10 AND 1");
         assert_translates("SELECT 5 BETWEEN ASYMMETRIC 1 AND 10");
     }
 
