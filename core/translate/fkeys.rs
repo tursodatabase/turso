@@ -580,9 +580,13 @@ pub fn build_index_affinity_string(idx: &Index, table: &BTreeTable) -> String {
 /// Increment a foreign key violation counter; for deferred FKs, this is a global counter
 /// on the connection; for immediate FKs, this is a per-statement counter in the program state.
 /// Used for NO ACTION behavior where violation is checked at statement/transaction end.
-pub fn emit_fk_violation(program: &mut ProgramBuilder, fk: &ForeignKey) -> Result<()> {
+pub fn emit_fk_violation(
+    program: &mut ProgramBuilder,
+    fk: &ForeignKey,
+    constraint_info: Option<Box<ConstraintInfo>>,
+) -> Result<()> {
     program.emit_insn(Insn::FkCounter {
-        constraint_info: None,
+        constraint_info,
         increment_value: 1,
         deferred: fk.deferred,
     });
@@ -590,29 +594,12 @@ pub fn emit_fk_violation(program: &mut ProgramBuilder, fk: &ForeignKey) -> Resul
 }
 
 /// Emit an immediate HALT for FK violations.
-pub fn emit_fk_restrict_halt(program: &mut ProgramBuilder) -> Result<()> {
-    program.emit_insn(Insn::Halt {
-        constraint_info: None,
-        err_code: SQLITE_CONSTRAINT_FOREIGNKEY,
-        description: "FOREIGN KEY constraint failed".to_string(),
-        on_error: None,
-        description_reg: None,
-    });
-    Ok(())
-}
-
-pub fn emit_fk_restrict_halt_with_metadata(
+pub fn emit_fk_restrict_halt(
     program: &mut ProgramBuilder,
-    child_table: &str,
-    fk: &ForeignKey,
-    violation_regs: Vec<usize>,
+    constraint_info: Option<Box<ConstraintInfo>>,
 ) -> Result<()> {
     program.emit_insn(Insn::Halt {
-        constraint_info: Some(Box::new(fk_constraint_info(
-            child_table,
-            fk,
-            violation_regs,
-        ))),
+        constraint_info,
         err_code: SQLITE_CONSTRAINT_FOREIGNKEY,
         description: "FOREIGN KEY constraint failed".to_string(),
         on_error: None,
@@ -948,10 +935,10 @@ fn emit_fk_parent_key_probe(
             (_, ParentProbePass::Old) => {
                 if is_restrict {
                     // RESTRICT: immediate halt
-                    emit_fk_restrict_halt(p)?;
+                    emit_fk_restrict_halt(p, None)?;
                 } else {
                     // NO ACTION: increment counter (checked at statement/transaction end)
-                    emit_fk_violation(p, &fk_ref.fk)?;
+                    emit_fk_violation(p, &fk_ref.fk, None)?;
                 }
             }
 
@@ -1347,14 +1334,23 @@ pub fn emit_fk_child_update_counters(
             // missing: violation (immediate HALT or deferred +1)
             program.preassign_label_to_next_insn(violation);
             program.emit_insn(Insn::Close { cursor_id: pcur });
-            emit_fk_child_update_violation(
-                program,
-                child_tbl,
-                &fk_ref.fk,
-                new_start_reg,
-                new_rowid_reg,
-                layout,
-            )?;
+            let constraint_info = (!fk_ref.fk.deferred).then(|| {
+                let regs = fk_ref
+                    .fk
+                    .child_columns
+                    .iter()
+                    .map(|name| {
+                        let (pos, col) = child_tbl.get_column(name).unwrap();
+                        if col.is_rowid_alias() {
+                            new_rowid_reg
+                        } else {
+                            layout.to_register(new_start_reg, pos)
+                        }
+                    })
+                    .collect();
+                Box::new(fk_constraint_info(&child_tbl.name, &fk_ref.fk, regs))
+            });
+            emit_fk_violation(program, &fk_ref.fk, constraint_info)?;
         } else {
             let parent_tbl = resolver
                 .with_schema(database_id, |s| s.get_btree_table(&fk_ref.fk.parent_table))
@@ -1399,14 +1395,23 @@ pub fn emit_fk_child_update_counters(
                 ncols,
                 |_p| Ok(()),
                 |p| {
-                    emit_fk_child_update_violation(
-                        p,
-                        child_tbl,
-                        &fk_ref.fk,
-                        new_start_reg,
-                        new_rowid_reg,
-                        layout,
-                    )?;
+                    let constraint_info = (!fk_ref.fk.deferred).then(|| {
+                        let regs = fk_ref
+                            .fk
+                            .child_columns
+                            .iter()
+                            .map(|name| {
+                                let (pos, col) = child_tbl.get_column(name).unwrap();
+                                if col.is_rowid_alias() {
+                                    new_rowid_reg
+                                } else {
+                                    layout.to_register(new_start_reg, pos)
+                                }
+                            })
+                            .collect();
+                        Box::new(fk_constraint_info(&child_tbl.name, &fk_ref.fk, regs))
+                    });
+                    emit_fk_violation(p, &fk_ref.fk, constraint_info)?;
                     Ok(())
                 },
             )?;
@@ -1420,40 +1425,11 @@ pub fn emit_fk_child_update_counters(
     Ok(())
 }
 
-fn emit_fk_child_update_violation(
-    program: &mut ProgramBuilder,
-    child_table: &BTreeTable,
+pub(crate) fn fk_constraint_info(
+    child_table: &str,
     fk: &ForeignKey,
-    new_start_reg: usize,
-    new_rowid_reg: usize,
-    layout: &ColumnLayout,
-) -> Result<()> {
-    let constraint_info = if !fk.deferred {
-        let regs = fk
-            .child_columns
-            .iter()
-            .map(|name| {
-                let (pos, column) = child_table.get_column(name).unwrap();
-                if column.is_rowid_alias() {
-                    new_rowid_reg
-                } else {
-                    layout.to_register(new_start_reg, pos)
-                }
-            })
-            .collect();
-        Some(Box::new(fk_constraint_info(&child_table.name, fk, regs)))
-    } else {
-        None
-    };
-    program.emit_insn(Insn::FkCounter {
-        constraint_info,
-        increment_value: 1,
-        deferred: fk.deferred,
-    });
-    Ok(())
-}
-
-fn fk_constraint_info(child_table: &str, fk: &ForeignKey, regs: Vec<usize>) -> ConstraintInfo {
+    regs: Vec<usize>,
+) -> ConstraintInfo {
     let columns = fk.child_columns.to_vec();
     let name = fk.constraint_name.clone();
     ConstraintInfo::fk(child_table, name, columns, regs, fk.parent_table.clone())
@@ -1519,9 +1495,9 @@ fn emit_fk_delete_parent_existence_check_single(
     // Closure to emit the appropriate violation based on action type
     let emit_violation = |p: &mut ProgramBuilder| -> Result<()> {
         if is_restrict {
-            emit_fk_restrict_halt(p)?;
+            emit_fk_restrict_halt(p, None)?;
         } else {
-            emit_fk_violation(p, &fk_ref.fk)?;
+            emit_fk_violation(p, &fk_ref.fk, None)?;
         }
         Ok(())
     };
@@ -2734,7 +2710,7 @@ pub fn emit_fk_drop_table_check(
         });
 
         // There were violations, halt with FK error
-        emit_fk_restrict_halt(program)?;
+        emit_fk_restrict_halt(program, None)?;
         program.preassign_label_to_next_insn(no_violations);
     }
 

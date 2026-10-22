@@ -23,9 +23,9 @@ use crate::{
             walk_expr, BindingBehavior, NoConstantOptReason, ReturningBufferCtx, WalkControl,
         },
         fkeys::{
-            build_index_affinity_string, emit_fk_restrict_halt_with_metadata, emit_fk_violation,
-            emit_guarded_fk_decrement, emit_skip_if_any_null, index_probe, index_scan_match_any,
-            open_read_index, open_read_table, ForeignKeyActions,
+            build_index_affinity_string, emit_fk_restrict_halt, emit_fk_violation,
+            emit_guarded_fk_decrement, emit_skip_if_any_null, fk_constraint_info, index_probe,
+            index_scan_match_any, open_read_index, open_read_table, ForeignKeyActions,
         },
         plan::{
             ColumnUsedMask, EvalAt, JoinedTable, Operation, QueryDestination, ResultSetColumn,
@@ -3992,7 +3992,7 @@ pub fn emit_fk_child_insert_checks(
             program.preassign_label_to_next_insn(violation);
             program.emit_insn(Insn::Close { cursor_id: pcur });
             if fk_ref.fk.deferred || inserting_multiple_rows {
-                emit_fk_violation(program, &fk_ref.fk)?;
+                emit_fk_violation(program, &fk_ref.fk, None)?;
             } else {
                 let fk_col_regs: Vec<usize> = fk_ref
                     .fk
@@ -4007,11 +4007,13 @@ pub fn emit_fk_child_insert_checks(
                         }
                     })
                     .collect();
-                emit_fk_restrict_halt_with_metadata(
+                emit_fk_restrict_halt(
                     program,
-                    child_tbl.name.as_str(),
-                    &fk_ref.fk,
-                    fk_col_regs,
+                    Some(Box::new(fk_constraint_info(
+                        child_tbl.name.as_str(),
+                        &fk_ref.fk,
+                        fk_col_regs,
+                    ))),
                 )?;
             }
             program.preassign_label_to_next_insn(fk_ok);
@@ -4110,7 +4112,7 @@ pub fn emit_fk_child_insert_checks(
                 // on_not_found: counted for a deferred FK or a multi-row insert, otherwise Halt
                 |p| {
                     if fk_ref.fk.deferred || inserting_multiple_rows {
-                        emit_fk_violation(p, &fk_ref.fk)?;
+                        emit_fk_violation(p, &fk_ref.fk, None)?;
                     } else {
                         let fk_col_regs: Vec<usize> = fk_ref
                             .fk
@@ -4125,11 +4127,13 @@ pub fn emit_fk_child_insert_checks(
                                 }
                             })
                             .collect();
-                        emit_fk_restrict_halt_with_metadata(
+                        emit_fk_restrict_halt(
                             p,
-                            child_tbl.name.as_str(),
-                            &fk_ref.fk,
-                            fk_col_regs,
+                            Some(Box::new(fk_constraint_info(
+                                child_tbl.name.as_str(),
+                                &fk_ref.fk,
+                                fk_col_regs,
+                            ))),
                         )?;
                     }
                     Ok(())
