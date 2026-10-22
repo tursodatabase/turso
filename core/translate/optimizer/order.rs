@@ -174,27 +174,46 @@ pub(crate) fn hir_plan_satisfies_order_target(
                     ..
                 },
             ) => {
-                let Some(AccessMethod {
-                    params: AccessMethodParams::Subquery { iter_dir },
-                    ..
-                }) = access_methods.get(*access_method_position)
-                else {
+                let Some(access_method) = access_methods.get(*access_method_position) else {
                     return Ok(false);
                 };
-                let consumed = hir_subquery_intrinsic_order_consumed(
-                    *subquery_source,
-                    output_order,
-                    *iter_dir,
-                    &order_target.columns[consumed_columns..],
-                );
-                if consumed == 0 {
+                let consumed = match &access_method.params {
+                    AccessMethodParams::Subquery { iter_dir } => OrderConsumption {
+                        consumed: hir_subquery_intrinsic_order_consumed(
+                            *subquery_source,
+                            output_order,
+                            *iter_dir,
+                            &order_target.columns[consumed_columns..],
+                        ),
+                        includes_rowid: false,
+                    },
+                    // Read through its temporary index, the subquery's rows
+                    // come out in the index's order after the seek prefix.
+                    AccessMethodParams::MaterializedSubquery {
+                        index,
+                        constraint_refs,
+                        iter_dir,
+                    } => hir_materialized_subquery_order_consumed(
+                        *subquery_source,
+                        index,
+                        constraint_refs,
+                        *iter_dir,
+                        order_target,
+                        consumed_columns,
+                        schema,
+                        EqualityPrefixScope::ConstantEquality,
+                    ),
+                    _ => return Ok(false),
+                };
+                if consumed.consumed == 0 {
                     return Ok(false);
                 }
-                consumed_columns += consumed;
+                consumed_columns += consumed.consumed;
                 if consumed_columns == columns {
                     return Ok(true);
                 }
-                // The scan may repeat the values ordered so far.
+                // The loop may repeat the values ordered so far, unless it
+                // finds at most one row.
                 let next_comes_from_later_loop = order_target
                     .columns
                     .get(consumed_columns)
@@ -205,7 +224,9 @@ pub(crate) fn hir_plan_satisfies_order_target(
                                 .is_some_and(|later| later.source() == column.source)
                         })
                     });
-                if next_comes_from_later_loop {
+                if next_comes_from_later_loop
+                    && !access_method_emits_unique_order_prefix(access_method, &consumed)
+                {
                     return Ok(false);
                 }
                 continue;
@@ -404,7 +425,9 @@ fn match_intrinsic_order_by<I, E, J, F>(
 
 trait OrderedSource<I, E> {
     fn id(&self) -> I;
-    fn table(&self) -> &Table;
+    /// Whether column `col_no` has a custom type. Such a column stores
+    /// encoded blobs, whose byte order is not the type's order.
+    fn column_has_custom_type(&self, col_no: usize, schema: &Schema) -> bool;
     fn expressions_match(&self, target: E, indexed: E) -> bool;
 }
 
@@ -420,6 +443,10 @@ impl<'a> HirOrderSource<'a> {
             planned,
             definition,
         }
+    }
+
+    fn table(&self) -> &Table {
+        &self.planned.table
     }
 
     fn index_expressions(&self, index: &Index) -> Result<&'a hir::IndexExpressions> {
@@ -441,13 +468,79 @@ impl<'a> OrderedSource<hir::SourceId, &'a hir::Expr> for HirOrderSource<'a> {
         self.definition.id
     }
 
-    fn table(&self) -> &Table {
-        &self.planned.table
+    fn column_has_custom_type(&self, col_no: usize, schema: &Schema) -> bool {
+        self.table().columns().get(col_no).is_some_and(|column| {
+            schema
+                .get_type_def(&column.ty_str, self.table().is_strict())
+                .is_some()
+        })
     }
 
     fn expressions_match(&self, target: &'a hir::Expr, indexed: &'a hir::Expr) -> bool {
         target.equivalent(indexed)
     }
+}
+
+/// A FROM subquery or CTE read through the temporary index over its stored
+/// rows. Its columns are the subquery's outputs: none has a custom type the
+/// index would store encoded, and the index has no expression columns.
+struct SubqueryOrderSource(hir::SourceId);
+
+impl<'a> OrderedSource<hir::SourceId, &'a hir::Expr> for SubqueryOrderSource {
+    fn id(&self) -> hir::SourceId {
+        self.0
+    }
+
+    fn column_has_custom_type(&self, _col_no: usize, _schema: &Schema) -> bool {
+        false
+    }
+
+    fn expressions_match(&self, _target: &'a hir::Expr, _indexed: &'a hir::Expr) -> bool {
+        false
+    }
+}
+
+/// How many leading `order_target` columns from `start_col` a FROM subquery
+/// or CTE supplies when its stored rows are read through `index`, the
+/// temporary index [`crate::translate::optimizer::access_method::find_best_hir_access_method_for_subquery`]
+/// builds over them, seeking it with `constraint_refs` in `iter_dir`. The
+/// index holds the key columns first and then every other column, all
+/// ascending, so after an equality-pinned prefix the rows come out in the
+/// order of the remaining index columns.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn hir_materialized_subquery_order_consumed<'a>(
+    source: hir::SourceId,
+    index: &Index,
+    constraint_refs: &[RangeConstraintRef],
+    iter_dir: IterationDirection,
+    order_target: &HirOrderTarget<'a>,
+    start_col: usize,
+    schema: &Schema,
+    equality_prefix_scope: EqualityPrefixScope,
+) -> OrderConsumption {
+    let target_columns = &order_target.columns[start_col..];
+    if target_columns.is_empty() {
+        return OrderConsumption::NONE;
+    }
+    index_columns_order_consumed(
+        &SubqueryOrderSource(source),
+        iter_dir,
+        constraint_refs,
+        order_target,
+        target_columns,
+        schema,
+        equality_prefix_scope,
+        index.columns.iter().map(|column| IndexOrderColumn {
+            pos_in_table: column.pos_in_table,
+            order: column.order,
+            nulls_order: column.nulls_order,
+            collation: column.collation,
+            expr: None,
+        }),
+        index.columns.len(),
+        false,
+        None,
+    )
 }
 
 /// The index column values needed to check its row order.
@@ -665,13 +758,8 @@ where
         // Custom type columns store encoded blobs. The B-tree's byte order
         // does not match the custom type's order.
         if let ColumnTarget::Column(col_no) = &target_col.target {
-            if let Some(col) = source.table().columns().get(*col_no) {
-                if schema
-                    .get_type_def(&col.ty_str, source.table().is_strict())
-                    .is_some()
-                {
-                    break;
-                }
+            if source.column_has_custom_type(*col_no, schema) {
+                break;
             }
         }
 

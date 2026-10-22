@@ -464,11 +464,14 @@ order checks where the code allows:
   stored table, so setup costs two passes. A correlated subquery counts the
   rows of an outer FROM subquery or CTE as its number of runs.
 - A scanned FROM subquery or CTE returns its rows in the order of its ORDER
-  BY, its GROUP BY keys, or the one subquery it passes through
-  (`subquery_intrinsic_order_consumed`), so an outer ORDER BY in that order
-  needs no sort; a CTE stored once is read backwards for the opposite order.
-  Not ported: the order of a plain table scan inside the subquery, and using
-  a temporary index's order.
+  BY, its GROUP BY keys, the one subquery it passes through, or the plain
+  scan of its one table (an index's columns and then the rowid, or the
+  rowid alone, when the subquery exposes them), so an outer ORDER BY in
+  that order needs no sort; a CTE stored once is read backwards for the
+  opposite order. A subquery read through the temporary index over its
+  stored rows returns each seek's rows in the index's order after the seek
+  prefix, in either direction, so an outer ORDER BY on the earlier loops'
+  columns and then the seek column needs no sort either.
 - A block with windows aims for the innermost window's PARTITION BY and
   ORDER BY order, like legacy's window source subquery, so an index or an
   ordered CTE replaces that window's sorter. EXPLAIN shows `USE SORTER FOR

@@ -1228,6 +1228,7 @@ fn hir_join_step(
             input_cardinality,
             base_row_count,
             params,
+            schema,
         )?,
         HirPlanSource::Cte {
             source,
@@ -1255,6 +1256,7 @@ fn hir_join_step(
             input_cardinality,
             base_row_count,
             params,
+            schema,
         )?,
         HirPlanSource::RecursiveCte { .. } | HirPlanSource::RecursiveInput { .. } => {
             let rows = *base_row_count;

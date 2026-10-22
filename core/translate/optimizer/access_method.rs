@@ -1143,9 +1143,9 @@ pub fn estimate_hash_join_cost(
 /// second pass finds by scanning the stored table.
 ///
 /// Without seek constraints, the scan reads a stored CTE backwards when
-/// that gives `order_target`.
-///
-/// The order of the temporary index is not used to skip an outer sort.
+/// that gives `order_target`. With them, the temporary index is read in
+/// the direction that gives `order_target` after its seek prefix, if one
+/// does, and is credited with the sort it saves.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn find_best_hir_access_method_for_subquery(
     document: &hir::HirDocument,
@@ -1163,6 +1163,7 @@ pub(crate) fn find_best_hir_access_method_for_subquery(
     input_cardinality: f64,
     base_row_count: RowCountEstimate,
     params: &CostModelParams,
+    schema: &Schema,
 ) -> Result<AccessMethod> {
     use super::constraints::ConstraintRef;
     let scan = |cost| AccessMethod {
@@ -1344,6 +1345,44 @@ pub(crate) fn find_best_hir_access_method_for_subquery(
         input_cardinality * params.cpu_cost_per_seek
             + input_cardinality * estimated_rows_per_outer_row * params.cpu_cost_per_row,
     );
+    // When the index gives the rest of `order_target` from this source's
+    // first term on, after its seek prefix, read in the direction that
+    // does, and credit the index with the sort it saves. The terms before
+    // that one belong to earlier loops, which the join order checks.
+    let (iter_dir, order_bonus) = order_target
+        .and_then(|target| {
+            let start = target
+                .columns
+                .iter()
+                .position(|column| column.source == source)?;
+            let gives_order = |direction| {
+                super::order::hir_materialized_subquery_order_consumed(
+                    source,
+                    &index,
+                    &constraint_refs,
+                    direction,
+                    target,
+                    start,
+                    schema,
+                    EqualityPrefixScope::AnyEquality,
+                )
+                .consumed
+                    == target.columns.len() - start
+            };
+            let direction = if gives_order(IterationDirection::Forwards) {
+                IterationDirection::Forwards
+            } else if gives_order(IterationDirection::Backwards) {
+                IterationDirection::Backwards
+            } else {
+                return None;
+            };
+            let n = *base_row_count;
+            Some((
+                direction,
+                Cost(n * n.max(1.0).log2() * params.sort_cpu_per_row),
+            ))
+        })
+        .unwrap_or((IterationDirection::Forwards, Cost(0.0)));
     let scan_method = scan(scan_cost);
     let index_method = AccessMethod {
         cost: subquery_cost + seek_setup_cost + seek_cost,
@@ -1355,12 +1394,12 @@ pub(crate) fn find_best_hir_access_method_for_subquery(
         params: AccessMethodParams::MaterializedSubquery {
             index,
             constraint_refs,
-            iter_dir: IterationDirection::Forwards,
+            iter_dir,
         },
     };
     let scan_cost = cost_with_where_work(&scan_method, ready_where, input_cardinality, params);
     let index_cost = cost_with_where_work(&index_method, ready_where, input_cardinality, params);
-    Ok(if index_cost >= scan_cost {
+    Ok(if index_cost >= scan_cost + order_bonus {
         scan_method
     } else {
         index_method

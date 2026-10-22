@@ -1359,46 +1359,85 @@ impl<'a> HirPlanContext<'a> {
                     return columns;
                 };
                 let table_columns = table.value().columns();
+                let rowid_alias = table_columns
+                    .iter()
+                    .position(|column| column.is_rowid_alias());
+                // An output that reads the rowid, as `rowid` or through its
+                // alias column.
+                let rowid_output_position = || {
+                    query.output.iter().position(|id| {
+                        self.document
+                            .output(*id)
+                            .is_some_and(|output| match &output.expr {
+                                hir::Expr::RowId(rowid_source) => *rowid_source == source,
+                                hir::Expr::Column(reference) => {
+                                    reference.source == source
+                                        && rowid_alias == Some(reference.column)
+                                }
+                                _ => false,
+                            })
+                    })
+                };
+                // The keys a scan reads the table in: an index's columns,
+                // then the rowid that orders equal keys of a rowid table;
+                // without an index, the rowid.
+                enum ScanKey {
+                    Column(usize),
+                    RowId,
+                }
                 let keys: Vec<(
-                    usize,
+                    ScanKey,
                     SortOrder,
                     Option<crate::translate::collate::CollationSeq>,
                     Option<NullsOrder>,
                 )> = match index {
                     Some(index) => {
                         let mut keys = Vec::new();
+                        let mut every_column_is_plain = true;
                         for column in &index.columns {
                             if column.expr.is_some() {
+                                every_column_is_plain = false;
                                 break;
                             }
                             keys.push((
-                                column.pos_in_table,
+                                ScanKey::Column(column.pos_in_table),
                                 column.order,
                                 column.collation,
                                 column.nulls_order,
                             ));
                         }
+                        if every_column_is_plain && index.has_rowid {
+                            keys.push((ScanKey::RowId, SortOrder::Asc, None, None));
+                        }
                         keys
                     }
-                    None => match table_columns
-                        .iter()
-                        .position(|column| column.is_rowid_alias())
-                    {
-                        Some(rowid) => vec![(rowid, SortOrder::Asc, None, None)],
-                        None => Vec::new(),
-                    },
+                    None => vec![(ScanKey::RowId, SortOrder::Asc, None, None)],
                 };
-                for (table_column, order, key_collation, key_nulls) in keys {
-                    let Some(column) = source_column_position(table_column) else {
-                        break;
+                for (key, order, key_collation, key_nulls) in keys {
+                    let (column, collation) = match key {
+                        ScanKey::Column(table_column) => {
+                            let Some(column) = source_column_position(table_column) else {
+                                break;
+                            };
+                            (
+                                column,
+                                key_collation
+                                    .or_else(|| table_columns[table_column].collation_opt())
+                                    .unwrap_or_default(),
+                            )
+                        }
+                        ScanKey::RowId => {
+                            let Some(column) = rowid_output_position() else {
+                                break;
+                            };
+                            (column, Default::default())
+                        }
                     };
                     let forward_nulls = nulls(order, key_nulls);
                     columns.push(HirOutputOrder {
                         column,
                         order: if backwards { reverse(order) } else { order },
-                        collation: key_collation
-                            .or_else(|| table_columns[table_column].collation_opt())
-                            .unwrap_or_default(),
+                        collation,
                         nulls: if backwards {
                             forward_nulls.reverse()
                         } else {

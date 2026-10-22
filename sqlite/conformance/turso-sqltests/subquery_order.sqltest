@@ -1,0 +1,118 @@
+@database :memory:
+
+# An outer ORDER BY needs no sorter when the FROM subquery already returns
+# its rows in that order. The plans below are Turso's own, so these tests
+# do not run against SQLite.
+
+# A plain scan of a rowid table returns rows in rowid order, so a subquery
+# that exposes the rowid is ordered by it.
+test subquery-rowid-of-plain-scan-skips-the-sort {
+    CREATE TABLE t2(x INTEGER, y INTEGER);
+    INSERT INTO t2 VALUES (30, 1), (10, 2), (20, 3);
+    EXPLAIN QUERY PLAN SELECT * FROM (SELECT rowid AS r, x FROM t2) ORDER BY r;
+    SELECT * FROM (SELECT rowid AS r, x FROM t2) ORDER BY r;
+}
+expect {
+    1|0|0|SCAN (subquery-0)
+    3|1|0|SCAN t2
+    1|30
+    2|10
+    3|20
+}
+
+# An index scan returns equal keys in rowid order, so the rowid alias may
+# follow the index columns in the outer ORDER BY.
+test subquery-index-then-rowid-skips-the-sort {
+    CREATE TABLE t(a INTEGER PRIMARY KEY, b INTEGER);
+    CREATE INDEX tb ON t(b);
+    INSERT INTO t VALUES (1, 5), (2, 3), (3, 5), (4, 3);
+    EXPLAIN QUERY PLAN SELECT * FROM (SELECT b, a FROM t INDEXED BY tb) ORDER BY b, a;
+    SELECT * FROM (SELECT b, a FROM t INDEXED BY tb) ORDER BY b, a;
+}
+expect {
+    1|0|0|SCAN (subquery-0)
+    3|1|0|SCAN t USING COVERING INDEX tb
+    3|2
+    3|4
+    5|1
+    5|3
+}
+
+setup subquery_index {
+    CREATE TABLE t1(a INTEGER PRIMARY KEY, v INTEGER);
+    CREATE TABLE t2(x INTEGER, y INTEGER);
+    WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 200) INSERT INTO t2 SELECT i % 12, (i * 7) % 5 FROM n;
+    WITH RECURSIVE m(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM m WHERE i < 100) INSERT INTO t1 SELECT i, i FROM m;
+    ANALYZE;
+}
+
+# When a subquery is read through the temporary index built over its stored
+# rows, the rows of each seek come out in the index's order, so an outer
+# ORDER BY on the outer loop's rowid and then the seek column needs no
+# sorter. The index is read backwards for the opposite order.
+@setup subquery_index
+test temporary-subquery-index-gives-the-order {
+    EXPLAIN QUERY PLAN SELECT t1.a, s.x FROM t1 CROSS JOIN (SELECT x, y FROM t2) s ON s.x > t1.a ORDER BY t1.a, s.x;
+    SELECT t1.a, s.x FROM t1 CROSS JOIN (SELECT x, y FROM t2) s ON s.x > t1.a ORDER BY t1.a, s.x LIMIT 3;
+    SELECT t1.a, s.x FROM t1 CROSS JOIN (SELECT x, y FROM t2) s ON s.x > t1.a ORDER BY t1.a, s.x LIMIT 3 OFFSET 16;
+    SELECT t1.a, s.x FROM t1 CROSS JOIN (SELECT x, y FROM t2) s ON s.x > t1.a ORDER BY t1.a, s.x LIMIT 3 OFFSET 166;
+}
+expect {
+    1|0|0|SCAN t1
+    2|0|0|SEARCH s USING INDEX ephemeral_subquery_s2 (x>?)
+    6|2|0|SCAN t2
+    1|2
+    1|2
+    1|2
+    1|2
+    1|3
+    1|3
+    1|11
+    2|3
+    2|3
+}
+
+@setup subquery_index
+test temporary-subquery-index-read-backwards-gives-the-opposite-order {
+    EXPLAIN QUERY PLAN SELECT t1.a, s.x FROM t1 CROSS JOIN (SELECT x, y FROM t2) s ON s.x > t1.a ORDER BY t1.a, s.x DESC;
+    SELECT t1.a, s.x FROM t1 CROSS JOIN (SELECT x, y FROM t2) s ON s.x > t1.a ORDER BY t1.a, s.x DESC LIMIT 3;
+    SELECT t1.a, s.x FROM t1 CROSS JOIN (SELECT x, y FROM t2) s ON s.x > t1.a ORDER BY t1.a, s.x DESC LIMIT 3 OFFSET 30;
+}
+expect {
+    1|0|0|SCAN t1
+    2|0|0|SEARCH s USING INDEX ephemeral_subquery_s2 (x>?)
+    6|2|0|SCAN t2
+    1|11
+    1|11
+    1|11
+    1|10
+    1|10
+    1|9
+}
+
+# A column the index does not order next still needs the sorter.
+@setup subquery_index
+test temporary-subquery-index-does-not-order-a-later-column {
+    EXPLAIN QUERY PLAN SELECT t1.a, s.y FROM t1 CROSS JOIN (SELECT x, y FROM t2) s ON s.x > t1.a ORDER BY t1.a, s.y;
+}
+expect {
+    1|0|0|SCAN t1
+    2|0|0|SEARCH s USING INDEX ephemeral_subquery_s2 (x>?)
+    7|2|0|SCAN t2
+    32|0|0|USE SORTER FOR ORDER BY
+}
+
+@setup subquery_index
+test temporary-cte-index-gives-the-order {
+    EXPLAIN QUERY PLAN SELECT t1.a, c.x FROM t1 CROSS JOIN (WITH c AS MATERIALIZED (SELECT x, y FROM t2) SELECT * FROM c) c ON c.x > t1.a ORDER BY t1.a, c.x;
+    SELECT t1.a, c.x FROM t1 CROSS JOIN (WITH c AS MATERIALIZED (SELECT x, y FROM t2) SELECT * FROM c) c ON c.x > t1.a ORDER BY t1.a, c.x LIMIT 3;
+}
+expect {
+    1|0|0|SCAN t1
+    2|0|0|SEARCH c USING INDEX ephemeral_subquery_s3 (x>?)
+    8|2|0|SCAN t2
+    16|2|0|SCAN c
+    1|2
+    1|2
+    1|2
+}
