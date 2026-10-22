@@ -1,5 +1,6 @@
 //! Translation of VACUUM statements to VDBE bytecode.
 
+use crate::translate::expr::sanitize_string;
 use crate::vdbe::builder::ProgramBuilder;
 use crate::vdbe::insn::Insn;
 use crate::{bail_parse_error, Connection, Result};
@@ -70,11 +71,7 @@ pub fn translate_vacuum(
 /// - An identifier (variable name, though not commonly used)
 fn extract_path_from_expr(expr: &Expr) -> Result<String> {
     match expr {
-        Expr::Literal(Literal::String(s)) => {
-            // Remove surrounding quotes if present
-            let path = s.trim_matches('\'').trim_matches('"');
-            Ok(path.to_string())
-        }
+        Expr::Literal(Literal::String(s)) => Ok(sanitize_string(s)),
         Expr::Id(name) => {
             // Allow identifier as path (unusual but valid)
             Ok(name.as_str().to_string())
@@ -97,10 +94,15 @@ mod tests {
     }
 
     #[test]
-    fn test_extract_path_from_string_literal_double_quotes() {
-        let expr = Expr::Literal(Literal::String("\"test.db\"".to_string()));
-        let path = extract_path_from_expr(&expr).unwrap();
-        assert_eq!(path, "test.db");
+    fn test_extract_path_from_string_literal_keeps_quote_characters() {
+        for (literal, path) in [
+            ("''''", "'"),
+            ("'\"\"'", "\"\""),
+            ("''':memory:'''", "':memory:'"),
+        ] {
+            let expr = Expr::Literal(Literal::String(literal.to_string()));
+            assert_eq!(extract_path_from_expr(&expr).unwrap(), path);
+        }
     }
 
     #[test]

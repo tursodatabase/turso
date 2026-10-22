@@ -2681,27 +2681,49 @@ fn test_plain_vacuum_preserves_mvcc_after_reopen(tmp_db: TempDatabase) -> anyhow
 }
 
 #[cfg(not(windows))]
-#[turso_macros::test]
-fn test_vacuum_into_names_that_are_not_exactly_memory_create_files(
-    tmp_db: TempDatabase,
-) -> anyhow::Result<()> {
+#[turso_macros::test(mvcc)]
+fn test_vacuum_into_file_targets_create_the_named_file(tmp_db: TempDatabase) -> anyhow::Result<()> {
     let conn = tmp_db.connect_limbo();
     conn.execute("CREATE TABLE t (a INTEGER)")?;
     conn.execute("INSERT INTO t VALUES (1)")?;
 
-    for dest in [":memory:vacuum_into_target.db", " :memory:", ":memory: "] {
-        let dest_path = Path::new(dest);
-        let wal_path = format!("{dest}-wal");
-        let _ = std::fs::remove_file(dest_path);
-        let _ = std::fs::remove_file(&wal_path);
+    let tag = if tmp_db.enable_mvcc {
+        "vacuum_into_mvcc"
+    } else {
+        "vacuum_into_wal"
+    };
+    let targets = [
+        (format!("':memory:{tag}'"), format!(":memory:{tag}")),
+        (format!("' :memory:{tag}'"), format!(" :memory:{tag}")),
+        (format!("'file:{tag}_uri.db'"), format!("{tag}_uri.db")),
+        (
+            format!("'file:{tag}%20space.db'"),
+            format!("{tag} space.db"),
+        ),
+        (
+            format!("'file:file::memory:{tag}'"),
+            format!("file::memory:{tag}"),
+        ),
+        (format!("'''{tag}'''"), format!("'{tag}'")),
+        (format!("'\"{tag}\"'"), format!("\"{tag}\"")),
+    ];
+    for (literal, file_name) in targets {
+        let remove_files = || {
+            let _ = std::fs::remove_file(&file_name);
+            let _ = std::fs::remove_file(format!("{file_name}-wal"));
+            let _ = std::fs::remove_file(Path::new(&file_name).with_extension("db-log"));
+        };
+        remove_files();
 
-        let result = conn.execute(format!("VACUUM INTO '{dest}'"));
-        let file_created = dest_path.exists();
-        let _ = std::fs::remove_file(dest_path);
-        let _ = std::fs::remove_file(&wal_path);
+        let result = conn.execute(format!("VACUUM INTO {literal}"));
+        let file_created = Path::new(&file_name).exists();
+        remove_files();
 
         result?;
-        assert!(file_created, "VACUUM INTO '{dest}' should create a file");
+        assert!(
+            file_created,
+            "VACUUM INTO {literal} should create the file {file_name:?}"
+        );
     }
 
     Ok(())
