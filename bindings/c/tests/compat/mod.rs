@@ -665,6 +665,38 @@ mod tests {
     }
 
     #[test]
+    fn test_sqlite3_column_name_negative_index_returns_null() {
+        const CHILD: &str = "TURSO_TEST_COLUMN_NAME_NEGATIVE_INDEX_CHILD";
+
+        if std::env::var_os(CHILD).is_some() {
+            unsafe {
+                let mut db = ptr::null_mut();
+                assert_eq!(sqlite3_open(c":memory:".as_ptr(), &mut db), SQLITE_OK);
+
+                let mut stmt = ptr::null_mut();
+                assert_eq!(
+                    sqlite3_prepare_v2(db, c"SELECT 1".as_ptr(), -1, &mut stmt, ptr::null_mut()),
+                    SQLITE_OK
+                );
+                assert!(sqlite3_column_name(stmt, -1).is_null());
+                assert_eq!(sqlite3_finalize(stmt), SQLITE_OK);
+                assert_eq!(sqlite3_close(db), SQLITE_OK);
+            }
+            return;
+        }
+
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "tests::test_sqlite3_column_name_negative_index_returns_null",
+            ])
+            .env(CHILD, "1")
+            .status()
+            .unwrap();
+        assert!(status.success(), "child process failed with {status}");
+    }
+
+    #[test]
     fn test_ctas_column_count_is_zero() {
         unsafe {
             let mut db = ptr::null_mut();

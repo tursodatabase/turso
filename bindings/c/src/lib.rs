@@ -2373,7 +2373,9 @@ pub unsafe extern "C" fn sqlite3_column_name(
     stmt: *mut sqlite3_stmt,
     idx: ffi::c_int,
 ) -> *const ffi::c_char {
-    let idx = idx.try_into().unwrap();
+    let Ok(idx) = usize::try_from(idx) else {
+        return std::ptr::null();
+    };
     let stmt = &mut *stmt;
 
     let binding = stmt.stmt.get_column_name(idx).into_owned();
