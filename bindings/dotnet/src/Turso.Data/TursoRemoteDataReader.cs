@@ -12,6 +12,8 @@ internal sealed class TursoRemoteDataReader : DbDataReader
     private readonly IReadOnlyList<RemoteStatementResult> _results;
     private readonly CommandBehavior _behavior;
     private readonly int _recordsAffected;
+    private IDisposable? _syncOperation;
+    private TursoConnection? _syncConnection;
     private int _resultIndex;
     private int _rowIndex = -1;
     private bool _isClosed;
@@ -21,7 +23,11 @@ internal sealed class TursoRemoteDataReader : DbDataReader
     {
     }
 
-    public TursoRemoteDataReader(TursoConnection? connection, IReadOnlyList<RemoteStatementResult> results, CommandBehavior behavior)
+    public TursoRemoteDataReader(
+        TursoConnection? connection,
+        IReadOnlyList<RemoteStatementResult> results,
+        CommandBehavior behavior,
+        IDisposable? syncOperation = null)
     {
         ArgumentNullException.ThrowIfNull(results);
 
@@ -30,6 +36,13 @@ internal sealed class TursoRemoteDataReader : DbDataReader
         _behavior = behavior;
         foreach (var result in results)
             _recordsAffected = checked(_recordsAffected + (int)result.AffectedRowCount);
+
+        _syncOperation = syncOperation;
+        if (syncOperation is not null && connection is not null)
+        {
+            _syncConnection = connection;
+            connection.RegisterSyncReader(this);
+        }
     }
 
     public override bool GetBoolean(int ordinal)
@@ -67,13 +80,17 @@ internal sealed class TursoRemoteDataReader : DbDataReader
 
     public override string GetDataTypeName(int ordinal)
     {
-        var value = HasCurrentRow ? CurrentValue(ordinal) : null;
-        if (value is not null)
-            return GetTypeName(value.Type);
+        EnsureOpen();
+        ValidateOrdinal(ordinal);
 
-        return ordinal >= 0 && ordinal < CurrentResult.Columns.Count
-            ? CurrentResult.Columns[ordinal].DeclType ?? string.Empty
-            : string.Empty;
+        var declaredType = ordinal < CurrentResult.Columns.Count
+            ? CurrentResult.Columns[ordinal].DeclType
+            : null;
+        if (!string.IsNullOrWhiteSpace(declaredType))
+            return declaredType;
+
+        var value = FirstNonNullValue(ordinal);
+        return value is null ? string.Empty : GetTypeName(value.Type);
     }
 
     public override DateTime GetDateTime(int ordinal)
@@ -99,18 +116,14 @@ internal sealed class TursoRemoteDataReader : DbDataReader
         EnsureOpen();
         ValidateOrdinal(ordinal);
 
-        if (HasCurrentRow)
-            return GetClrType(CurrentResult.Rows[_rowIndex][ordinal].Type);
-
         if (ordinal < CurrentResult.Columns.Count
-            && TryGetClrTypeFromDeclaredType(CurrentResult.Columns[ordinal].DeclType, out var declaredType))
+            && DataReaderCompatibility.TryGetClrTypeFromDeclaredType(CurrentResult.Columns[ordinal].DeclType, out var declaredType))
         {
             return declaredType;
         }
 
-        return CurrentResult.Rows.Count > 0 && ordinal < CurrentResult.Rows[0].Count
-            ? GetClrType(CurrentResult.Rows[0][ordinal].Type)
-            : typeof(object);
+        var value = FirstNonNullValue(ordinal);
+        return value is null ? typeof(object) : GetClrType(value.Type);
     }
 
     public override float GetFloat(int ordinal)
@@ -120,7 +133,7 @@ internal sealed class TursoRemoteDataReader : DbDataReader
 
     public override Guid GetGuid(int ordinal)
     {
-        return Guid.Parse(GetString(ordinal));
+        return DataReaderCompatibility.ToGuid(GetValue(ordinal));
     }
 
     public override short GetInt16(int ordinal)
@@ -196,6 +209,12 @@ internal sealed class TursoRemoteDataReader : DbDataReader
             ? CurrentResult.Rows[0].Count
             : 0;
 
+    public override DataTable GetSchemaTable()
+    {
+        EnsureOpen();
+        return DataReaderCompatibility.CreateSchemaTable(this);
+    }
+
     public override object this[int ordinal] => GetValue(ordinal);
 
     public override object this[string name] => GetValue(GetOrdinal(name));
@@ -229,8 +248,15 @@ internal sealed class TursoRemoteDataReader : DbDataReader
 
     protected override void Dispose(bool disposing)
     {
-        if (disposing && !_isClosed && (_behavior & CommandBehavior.CloseConnection) == CommandBehavior.CloseConnection)
-            _connection?.Close();
+        if (disposing && !_isClosed)
+        {
+            _syncOperation?.Dispose();
+            _syncOperation = null;
+            _syncConnection?.UnregisterSyncReader(this);
+            _syncConnection = null;
+            if ((_behavior & CommandBehavior.CloseConnection) == CommandBehavior.CloseConnection)
+                _connection?.Close();
+        }
 
         _isClosed = true;
         base.Dispose(disposing);
@@ -344,32 +370,19 @@ internal sealed class TursoRemoteDataReader : DbDataReader
             "float" => typeof(double),
             "text" => typeof(string),
             "blob" => typeof(byte[]),
-            "null" => typeof(DBNull),
             _ => typeof(object),
         };
     }
 
-    private static bool TryGetClrTypeFromDeclaredType(string? declaredType, [System.Diagnostics.CodeAnalysis.NotNullWhen(true)] out Type? clrType)
+    private RemoteResponseValue? FirstNonNullValue(int ordinal)
     {
-        clrType = null;
-        if (string.IsNullOrWhiteSpace(declaredType))
-            return false;
+        foreach (var row in CurrentResult.Rows)
+        {
+            if (ordinal < row.Count && row[ordinal].Type != "null")
+                return row[ordinal];
+        }
 
-        var normalized = declaredType.Trim().ToUpperInvariant();
-        if (normalized.Contains("INT", StringComparison.Ordinal))
-            clrType = typeof(long);
-        else if (normalized.Contains("REAL", StringComparison.Ordinal)
-                 || normalized.Contains("FLOA", StringComparison.Ordinal)
-                 || normalized.Contains("DOUB", StringComparison.Ordinal))
-            clrType = typeof(double);
-        else if (normalized.Contains("TEXT", StringComparison.Ordinal)
-                 || normalized.Contains("CHAR", StringComparison.Ordinal)
-                 || normalized.Contains("CLOB", StringComparison.Ordinal))
-            clrType = typeof(string);
-        else if (normalized.Contains("BLOB", StringComparison.Ordinal))
-            clrType = typeof(byte[]);
-
-        return clrType is not null;
+        return null;
     }
 
     private void EnsureOpen()

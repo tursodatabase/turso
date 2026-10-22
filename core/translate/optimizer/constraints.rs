@@ -133,9 +133,8 @@ impl<E> Constraint<E> {
 
     /// Whether this constraint can drive an index seek on its target column.
     /// Composes the `usable`/`table_col_pos` gates with the affinity check
-    /// against the column at `table_col_pos` in `columns` (set `is_strict`
-    /// only for STRICT tables; subqueries pass `false`).
-    pub fn can_drive_index_seek(&self, columns: &[Column], is_strict: bool) -> bool {
+    /// against the column at `table_col_pos` in `columns`.
+    pub fn can_drive_index_seek(&self, columns: &[Column]) -> bool {
         if !self.usable {
             return false;
         }
@@ -145,7 +144,7 @@ impl<E> Constraint<E> {
         let col = columns.get(pos).unwrap_or_else(|| {
             unreachable!("constraint table_col_pos {pos} out of bounds for {columns:?}")
         });
-        self.satisfies_index_affinity(col.affinity_with_strict(is_strict))
+        self.satisfies_index_affinity(col.affinity())
     }
 }
 
@@ -1281,9 +1280,7 @@ pub(crate) fn hir_constraints_for_source(
                 {
                     continue;
                 }
-                if !constraint.satisfies_index_affinity(
-                    constrained_column.affinity_with_strict(table.table.is_strict()),
-                ) {
+                if !constraint.satisfies_index_affinity(constrained_column.affinity()) {
                     continue;
                 }
             } else if constraint.comparison_collation.unwrap_or_default()
@@ -1327,11 +1324,10 @@ pub(super) fn automatic_index_terms<E>(
     constraints: &TableConstraints<E>,
 ) -> SmallVec<[ConstraintRef; 4]> {
     let columns = table.columns();
-    let is_strict = table.is_strict();
     let usable_constraints: SmallVec<[&Constraint<E>; 4]> = constraints
         .constraints
         .iter()
-        .filter(|term| term.can_drive_index_seek(columns, is_strict))
+        .filter(|term| term.can_drive_index_seek(columns))
         .collect();
     let index_columns = ordered_ephemeral_key_columns(&usable_constraints);
 
@@ -1339,7 +1335,7 @@ pub(super) fn automatic_index_terms<E>(
         .constraints
         .iter()
         .enumerate()
-        .filter(|(_, term)| term.can_drive_index_seek(columns, is_strict))
+        .filter(|(_, term)| term.can_drive_index_seek(columns))
         .filter_map(|(term_index, term)| {
             let table_col_pos = term.table_col_pos?;
             Some(ConstraintRef {
@@ -1626,7 +1622,7 @@ pub fn usable_constraints_for_lhs_mask<E>(
         if other_side_refers_to_self {
             // Self-referential constraints cannot seed a lookup, but if they are
             // on a later index column they also terminate the usable prefix.
-            if cref.index_col_pos != current_required_column_pos {
+            if cref.index_col_pos > current_required_column_pos {
                 break;
             }
             continue;
@@ -1635,7 +1631,7 @@ pub fn usable_constraints_for_lhs_mask<E>(
             // Join-dependent constraints are only usable when every referenced
             // outer table is already on the left side of the join order. As
             // above, a missing earlier prefix column terminates the prefix.
-            if cref.index_col_pos != current_required_column_pos {
+            if cref.index_col_pos > current_required_column_pos {
                 break;
             }
             continue;

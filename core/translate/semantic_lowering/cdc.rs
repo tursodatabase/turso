@@ -94,15 +94,10 @@ impl<'a> Capture<'a> {
         table_cursor: CursorID,
         rowid: usize,
     ) -> Option<usize> {
-        program.capture_data_changes_info().has_before().then(|| {
-            emit_cdc_full_record(
-                program,
-                table.columns(),
-                table_cursor,
-                rowid,
-                table.is_strict,
-            )
-        })
+        program
+            .capture_data_changes_info()
+            .has_before()
+            .then(|| emit_cdc_full_record(program, table.columns(), table_cursor, rowid))
     }
 
     /// The after image of the row in registers `start + column`, whose
@@ -178,6 +173,6 @@ impl<'a> Capture<'a> {
         if program.flags.is_subprogram() {
             return Ok(());
         }
-        emit_cdc_statement_commit(program, &self.change_ids, self.cursor)
+        emit_cdc_statement_commit(program, None, &self.change_ids, Some(self.cursor))
     }
 }

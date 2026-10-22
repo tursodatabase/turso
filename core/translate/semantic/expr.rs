@@ -1150,7 +1150,7 @@ impl<'a> ExprFrame<'a> {
                     window_child(
                         name,
                         args.len(),
-                        filter_over.over_clause.as_ref(),
+                        filter_over.over_clause.as_deref(),
                         self.next_child - filter_end,
                     )
                 }
@@ -1163,7 +1163,7 @@ impl<'a> ExprFrame<'a> {
                     window_child(
                         name,
                         0,
-                        filter_over.over_clause.as_ref(),
+                        filter_over.over_clause.as_deref(),
                         self.next_child - filter_end,
                     )
                 }
@@ -2722,7 +2722,7 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
                     + order_by.len()
                     + within_group.len()
                     + usize::from(filter_over.filter_clause.is_some())
-                    + window_expression_count(name, args.len(), filter_over.over_clause.as_ref());
+                    + window_expression_count(name, args.len(), filter_over.over_clause.as_deref());
                 if children.len() != expected_children {
                     return Err(LimboError::InternalError(format!(
                         "function expression expected {} child values, got {}",
@@ -2758,7 +2758,7 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
                 let window = take_function_window(
                     name,
                     args.len(),
-                    filter_over.over_clause.as_ref(),
+                    filter_over.over_clause.as_deref(),
                     &mut children,
                 )?;
                 let input = match ordered_set {
@@ -2789,7 +2789,7 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
             }
             ast::Expr::FunctionCallStar { name, filter_over } => {
                 let expected_children = usize::from(filter_over.filter_clause.is_some())
-                    + window_expression_count(name, 0, filter_over.over_clause.as_ref());
+                    + window_expression_count(name, 0, filter_over.over_clause.as_deref());
                 if children.len() != expected_children {
                     return Err(LimboError::InternalError(format!(
                         "star function expression expected {expected_children} child values, got {}",
@@ -2802,8 +2802,12 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
                         .next()
                         .expect("star function child count includes FILTER")
                 });
-                let window =
-                    take_function_window(name, 0, filter_over.over_clause.as_ref(), &mut children)?;
+                let window = take_function_window(
+                    name,
+                    0,
+                    filter_over.over_clause.as_deref(),
+                    &mut children,
+                )?;
                 self.build_function_call(
                     name,
                     FunctionInput::Star,

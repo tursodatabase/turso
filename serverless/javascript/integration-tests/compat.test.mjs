@@ -84,3 +84,68 @@ test.serial('compat execute preserves lastInsertRowid of 0', async t => {
 
   client.close();
 });
+
+test.serial('reconnect restores usability after close', async t => {
+  const client = createClient({
+    url: 'http://localhost:0',
+  });
+
+  client.close();
+  t.true(client.closed);
+
+  const error = await t.throwsAsync(async () => {
+    await client.execute('SELECT 1');
+  }, { instanceOf: LibsqlError });
+  t.is(error.code, 'CLIENT_CLOSED');
+
+  client.reconnect();
+  t.false(client.closed);
+
+  client.session.execute = async () => ({
+    columns: ['1'],
+    columnTypes: ['INTEGER'],
+    rows: [[1]],
+    rowsAffected: 0,
+    lastInsertRowid: undefined,
+  });
+
+  const result = await client.execute('SELECT 1');
+  t.is(result.rows[0][0], 1);
+
+  client.close();
+});
+
+test.serial('reconnect works while client is active', async t => {
+  const client = createClient({
+    url: 'http://localhost:0',
+  });
+
+  client.session.execute = async () => ({
+    columns: ['1'],
+    columnTypes: ['INTEGER'],
+    rows: [[1]],
+    rowsAffected: 0,
+    lastInsertRowid: undefined,
+  });
+
+  const result1 = await client.execute('SELECT 1');
+  t.is(result1.rows[0][0], 1);
+
+  const oldSession = client.session;
+  client.reconnect();
+  t.false(client.closed);
+  t.not(client.session, oldSession);
+
+  client.session.execute = async () => ({
+    columns: ['2'],
+    columnTypes: ['INTEGER'],
+    rows: [[2]],
+    rowsAffected: 0,
+    lastInsertRowid: undefined,
+  });
+
+  const result2 = await client.execute('SELECT 2');
+  t.is(result2.rows[0][0], 2);
+
+  client.close();
+});

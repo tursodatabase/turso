@@ -10,7 +10,6 @@
 pub(crate) mod aggregation;
 pub(crate) mod alter;
 pub(crate) mod analyze;
-pub(crate) mod attach;
 pub(crate) mod collate;
 pub(crate) mod emitter;
 pub mod eqp;
@@ -18,7 +17,6 @@ pub(crate) mod expr;
 pub(crate) mod hir_index_method;
 pub(crate) mod index;
 pub(crate) mod integrity_check;
-pub(crate) mod logical;
 pub(crate) mod main_loop;
 pub(crate) mod optimizer;
 pub(crate) mod order_by;
@@ -41,11 +39,12 @@ pub(crate) mod vacuum;
 pub(crate) mod view;
 mod window;
 
-use crate::connection::PrepareOptions;
 use crate::schema::Schema;
 use crate::storage::pager::Pager;
 use crate::sync::Arc;
+use crate::translate::expr::WalkControl;
 use crate::translate::semantic::context::SemanticContext;
+use crate::util::walk_stmt_expressions;
 use crate::vdbe::builder::{ProgramBuilder, ProgramBuilderOpts, QueryMode};
 use crate::vdbe::Program;
 use crate::{bail_parse_error, Connection, Result, SymbolTable};
@@ -70,6 +69,7 @@ pub(crate) fn capture_catalog(
         connection.database_schemas(),
         &connection.temp.database,
         connection.attached_databases(),
+        connection.namespaces(),
         connection.experimental_custom_types_enabled(),
         dialect,
         search_path,
@@ -120,7 +120,6 @@ pub fn translate(
     query_mode: QueryMode,
     input: &str,
     origin: crate::statement::StatementOrigin,
-    prepare_options: &PrepareOptions,
 ) -> Result<Program> {
     tracing::trace!("querying {}", input);
     let change_cnt_on = matches!(
@@ -149,18 +148,33 @@ pub fn translate(
     // Engine-generated helper statements are always SQLite text and must
     // resolve functions with SQLite semantics regardless of the database's
     // dialect — the same invariant as unmarked schema rows.
-    let dialect = if matches!(origin, crate::statement::StatementOrigin::InternalHelper) {
+    // They look names up in every database, like SQLite does, whatever
+    // the connection's search path says.
+    let is_internal_helper = matches!(origin, crate::statement::StatementOrigin::InternalHelper);
+    let dialect = if is_internal_helper {
         Arc::new(crate::dialect::SqliteDialect) as Arc<dyn crate::dialect::Dialect>
     } else {
         connection.dialect()
+    };
+    let search_path = if is_internal_helper {
+        None
+    } else {
+        connection.search_path()
     };
     let captured = capture_catalog(
         schema,
         &connection,
         dialect.as_ref(),
-        prepare_options.unqualified_database_search_path.as_deref(),
+        search_path.as_deref(),
     )?;
     let catalog = semantic_context(&captured, syms, &connection, dialect)?;
+
+    walk_stmt_expressions(&stmt, &mut |expr| {
+        if let ast::Expr::Variable(variable) = expr {
+            program.register_variable(variable);
+        }
+        Ok(WalkControl::Continue)
+    })?;
 
     match stmt {
         // There can be no nesting with pragma, so lift it up here
@@ -208,6 +222,7 @@ fn translate_statement(
             | ast::Stmt::Delete { .. }
             | ast::Stmt::DropIndex { .. }
             | ast::Stmt::DropTable { .. }
+            | ast::Stmt::DropTrigger { .. }
             | ast::Stmt::DropType { .. }
             | ast::Stmt::DropDomain { .. }
             | ast::Stmt::DropView { .. }
@@ -282,7 +297,14 @@ fn translate_statement(
         }
         ast::Stmt::Analyze { name } => translate_analyze(name, catalog, program)?,
         ast::Stmt::Attach { expr, db_name, key } => {
-            attach::translate_attach(&expr, &db_name, &key, program, connection.clone(), catalog)?;
+            crate::dialect::sqlite::attach::translate_attach(
+                &expr,
+                catalog,
+                &db_name,
+                &key,
+                program,
+                connection.clone(),
+            )?;
         }
         ast::Stmt::Begin { typ, name } => translate_tx_begin(typ, name, catalog, program)?,
         ast::Stmt::Commit { name } => {
@@ -360,12 +382,13 @@ fn translate_statement(
         ast::Stmt::CreateMaterializedView {
             view_name,
             select,
+            columns,
             if_not_exists,
-            ..
         } => view::translate_create_materialized_view(
             &view_name,
             catalog,
             &select,
+            &columns,
             if_not_exists,
             connection.clone(),
             program,
@@ -373,9 +396,12 @@ fn translate_statement(
         ast::Stmt::CreateVirtualTable(vtab) => {
             translate_create_virtual_table(vtab, catalog, program, connection)?
         }
-        ast::Stmt::Detach { name } => {
-            attach::translate_detach(&name, program, connection.clone(), catalog)?
-        }
+        ast::Stmt::Detach { name } => crate::dialect::sqlite::attach::translate_detach(
+            &name,
+            catalog,
+            program,
+            connection.clone(),
+        )?,
         ast::Stmt::DropIndex {
             if_exists,
             idx_name,
@@ -557,7 +583,8 @@ mod tests {
     use crate::alloc::TryClone;
     use crate::io::MemoryIO;
     use crate::schema::{BTreeTable, Table, SQLITE_SEQUENCE_TABLE_NAME};
-    use crate::vdbe::insn::Insn;
+    use crate::vdbe::insn::{ClearBtreeCount, Insn};
+    use crate::ConnectOpts;
     use crate::Database;
     use crate::SqliteDialect;
 
@@ -566,7 +593,7 @@ mod tests {
     fn test_regexp_no_function_registered() {
         let io = Arc::new(MemoryIO::new());
         let db = Database::open_file(io, ":memory:", Arc::new(SqliteDialect)).unwrap();
-        let conn = db.connect().unwrap();
+        let conn = db.connect(ConnectOpts::new()).unwrap();
         let schema = db.schema.lock().clone();
         let pager = conn.pager.load().clone();
 
@@ -588,7 +615,6 @@ mod tests {
             QueryMode::Normal,
             "",
             crate::statement::StatementOrigin::Root,
-            &crate::connection::PrepareOptions::default(),
         );
         let err = result.unwrap_err().to_string();
         assert!(
@@ -601,7 +627,7 @@ mod tests {
     fn nth_value_reads_from_saved_rows_without_an_accumulator() {
         let io = Arc::new(MemoryIO::new());
         let db = Database::open_file(io, ":memory:", Arc::new(SqliteDialect)).unwrap();
-        let conn = db.connect().unwrap();
+        let conn = db.connect(ConnectOpts::new()).unwrap();
         conn.execute("CREATE TABLE items(value)").unwrap();
 
         let statement = conn
@@ -633,10 +659,147 @@ mod tests {
     }
 
     #[test]
+    fn delete_without_where_clears_table_and_index_btrees() {
+        let io = Arc::new(MemoryIO::new());
+        let db = Database::open_file(io, ":memory:", Arc::new(SqliteDialect)).unwrap();
+        let conn = db.connect(ConnectOpts::new()).unwrap();
+        conn.execute("CREATE TABLE items(id INTEGER PRIMARY KEY, name TEXT, score INTEGER)")
+            .unwrap();
+        conn.execute("CREATE UNIQUE INDEX items_name ON items(name)")
+            .unwrap();
+        conn.execute("CREATE INDEX items_score ON items(score) WHERE score > 0")
+            .unwrap();
+        conn.execute("INSERT INTO items VALUES(1, 'one', -1), (2, 'two', 0), (3, 'three', 1)")
+            .unwrap();
+
+        let mut statement = conn.prepare("DELETE FROM items").unwrap();
+        let instructions = &statement.get_program().insns;
+        let clears = instructions
+            .iter()
+            .filter_map(|(instruction, _)| match instruction {
+                Insn::ClearBtree { count, .. } => Some(*count),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            clears,
+            vec![
+                ClearBtreeCount::RowsWritten,
+                ClearBtreeCount::RowsWritten,
+                ClearBtreeCount::ChangesAndRowsWritten,
+            ],
+            "both indexes and then the table must be cleared, and only the table counts changes"
+        );
+        assert!(
+            instructions
+                .iter()
+                .all(|(instruction, _)| !matches!(instruction, Insn::Delete { .. })),
+            "a whole-table delete must not emit the row-at-a-time Delete opcode"
+        );
+
+        statement.run_ignore_rows().unwrap();
+        assert_eq!(statement.n_change(), 3);
+        assert_eq!(
+            statement.metrics().rows_written,
+            7,
+            "metrics must count table, full-index, and partial-index entries"
+        );
+
+        statement.reset().unwrap();
+        statement.reset_metrics();
+        statement.run_ignore_rows().unwrap();
+        assert_eq!(statement.n_change(), 0);
+        assert_eq!(statement.metrics().rows_written, 0);
+
+        statement.reset().unwrap();
+        statement.reset_metrics();
+        conn.execute("INSERT INTO items VALUES(4, 'four', -1), (5, 'five', 1)")
+            .unwrap();
+        statement.run_ignore_rows().unwrap();
+        assert_eq!(statement.n_change(), 2);
+        assert_eq!(
+            statement.metrics().rows_written,
+            5,
+            "reused statements must recount table and index entries"
+        );
+
+        statement.reset().unwrap();
+        statement.reset_metrics();
+        conn.execute(
+            "WITH RECURSIVE c(x) AS (VALUES(1) UNION ALL SELECT x + 1 FROM c WHERE x < 3000) \
+             INSERT INTO items SELECT x, printf('name-%0200d', x), x % 2 FROM c",
+        )
+        .unwrap();
+        statement.run_ignore_rows().unwrap();
+        assert_eq!(statement.n_change(), 3000);
+        assert_eq!(
+            statement.metrics().rows_written,
+            3000 + 3000 + 1500,
+            "interior cells of the index B-trees are entries, interior cells of the table are not"
+        );
+    }
+
+    #[test]
+    fn delete_keeps_row_loop_when_rows_need_individual_processing() {
+        let io = Arc::new(MemoryIO::new());
+        let db = Database::open_file(io, ":memory:", Arc::new(SqliteDialect)).unwrap();
+        let conn = db.connect(ConnectOpts::new()).unwrap();
+        conn.execute("CREATE TABLE items(id INTEGER PRIMARY KEY, name TEXT)")
+            .unwrap();
+
+        for sql in [
+            "DELETE FROM items WHERE 1",
+            "DELETE FROM items RETURNING id",
+        ] {
+            let statement = conn.prepare(sql).unwrap();
+            assert!(
+                statement
+                    .get_program()
+                    .insns
+                    .iter()
+                    .all(|(instruction, _)| !matches!(instruction, Insn::ClearBtree { .. })),
+                "{sql} must process rows individually"
+            );
+        }
+
+        conn.execute("CREATE TABLE deleted_items(id)").unwrap();
+        conn.execute(
+            "CREATE TRIGGER log_item_delete AFTER DELETE ON items \
+             BEGIN INSERT INTO deleted_items VALUES(old.id); END",
+        )
+        .unwrap();
+        let statement = conn.prepare("DELETE FROM items").unwrap();
+        assert!(
+            statement
+                .get_program()
+                .insns
+                .iter()
+                .all(|(instruction, _)| !matches!(instruction, Insn::ClearBtree { .. })),
+            "DELETE triggers require the row loop"
+        );
+
+        conn.execute("PRAGMA foreign_keys = ON").unwrap();
+        conn.execute("CREATE TABLE parents(id INTEGER PRIMARY KEY)")
+            .unwrap();
+        conn.execute("CREATE TABLE children(parent_id REFERENCES parents(id))")
+            .unwrap();
+        let statement = conn.prepare("DELETE FROM parents").unwrap();
+        assert!(
+            statement
+                .get_program()
+                .insns
+                .iter()
+                .all(|(instruction, _)| !matches!(instruction, Insn::ClearBtree { .. })),
+            "foreign-key actions require the row loop"
+        );
+    }
+
+    #[test]
     fn test_insert_autoincrement_with_malformed_sqlite_sequence_is_corrupt() {
         let io = Arc::new(MemoryIO::new());
         let db = Database::open_file(io, ":memory:", Arc::new(SqliteDialect)).unwrap();
-        let conn = db.connect().unwrap();
+        let conn = db.connect(ConnectOpts::new()).unwrap();
         conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY AUTOINCREMENT, v TEXT)")
             .unwrap();
 
@@ -672,7 +835,6 @@ mod tests {
             QueryMode::Normal,
             "",
             crate::statement::StatementOrigin::Root,
-            &crate::connection::PrepareOptions::default(),
         )
         .expect_err("translation should fail with malformed sqlite_sequence");
         match err {
@@ -690,7 +852,7 @@ mod tests {
     fn test_insert_autoincrement_with_missing_sqlite_sequence_is_corrupt() {
         let io = Arc::new(MemoryIO::new());
         let db = Database::open_file(io, ":memory:", Arc::new(SqliteDialect)).unwrap();
-        let conn = db.connect().unwrap();
+        let conn = db.connect(ConnectOpts::new()).unwrap();
         conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY AUTOINCREMENT, v TEXT)")
             .unwrap();
 
@@ -716,7 +878,6 @@ mod tests {
             QueryMode::Normal,
             "",
             crate::statement::StatementOrigin::Root,
-            &crate::connection::PrepareOptions::default(),
         )
         .expect_err("translation should fail with missing sqlite_sequence");
         match err {
@@ -734,7 +895,7 @@ mod tests {
     fn test_trigger_compile_error_does_not_poison_future_insert_compilation() {
         let io = Arc::new(MemoryIO::new());
         let db = Database::open_file(io, ":memory:", Arc::new(SqliteDialect)).unwrap();
-        let conn = db.connect().unwrap();
+        let conn = db.connect(ConnectOpts::new()).unwrap();
 
         conn.execute("CREATE TABLE ref(x);").unwrap();
         conn.execute("CREATE TABLE t(a INTEGER);").unwrap();

@@ -243,13 +243,13 @@ impl RecursiveRefCounter<'_> {
     fn count_from_table(&self, table: &ast::SelectTable, scope: &mut RecursiveRefScope) -> usize {
         match table {
             ast::SelectTable::Table(name, _, _) => {
-                if name.db_name.is_some() {
+                if name.namespace.is_some() {
                     return 0;
                 }
                 self.name_weight(&crate::util::normalize_ident(name.name.as_str()), scope)
             }
             ast::SelectTable::TableCall(name, arguments, _) => {
-                let mut count = if name.db_name.is_none() {
+                let mut count = if name.namespace.is_none() {
                     self.name_weight(&crate::util::normalize_ident(name.name.as_str()), scope)
                 } else {
                     0
@@ -260,7 +260,7 @@ impl RecursiveRefCounter<'_> {
                     .sum::<usize>();
                 count
             }
-            ast::SelectTable::Select(select, _) => self.count_select(select, scope),
+            ast::SelectTable::Select { select, .. } => self.count_select(select, scope),
             ast::SelectTable::Sub(from, _) => self.count_from_clause(from, scope),
         }
     }
@@ -330,7 +330,7 @@ impl RecursiveRefCounter<'_> {
         ) -> usize {
             match table {
                 ast::SelectTable::Table(name, _, _) | ast::SelectTable::TableCall(name, _, _) => {
-                    if name.db_name.is_some() {
+                    if name.namespace.is_some() {
                         return 0;
                     }
                     let name = crate::util::normalize_ident(name.name.as_str());
@@ -339,7 +339,7 @@ impl RecursiveRefCounter<'_> {
                             && !scope.iter().any(|(scope_name, _)| *scope_name == name),
                     )
                 }
-                ast::SelectTable::Select(_, _) => 0,
+                ast::SelectTable::Select { .. } => 0,
                 ast::SelectTable::Sub(from, _) => {
                     direct(counter, &from.select, scope)
                         + from

@@ -22,7 +22,7 @@ use rand::{Rng, RngCore, SeedableRng};
 use rand_chacha::ChaCha8Rng;
 use sql_generation::generation::Opts;
 use tracing::{debug, error, info};
-use turso_core::{Database, DatabaseOpts, LimboError, OpenFlags};
+use turso_core::{ConnectOpts, Database, DatabaseOpts, LimboError, OpenFlags};
 
 use crate::chaotic_elle::{ChaoticWorkload, ChaoticWorkloadProfile};
 use crate::operations::{FiberState, OpResult, Operation, TxMode};
@@ -271,11 +271,13 @@ impl MultiprocessWhopper {
                 io,
                 db_path.to_str().unwrap(),
                 OpenFlags::default(),
-                DatabaseOpts::new().with_multiprocess_wal(true),
+                DatabaseOpts::new()
+                    .with_multiprocess_wal(true)
+                    .with_index_method(true),
                 None,
                 Arc::new(SqliteDialect),
             )?;
-            let conn = db.connect()?;
+            let conn = db.connect(ConnectOpts::new())?;
 
             if opts.enable_mvcc {
                 conn.execute("PRAGMA journal_mode = 'mvcc'")?;

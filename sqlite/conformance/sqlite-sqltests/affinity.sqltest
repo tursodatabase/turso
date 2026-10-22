@@ -576,6 +576,33 @@ expect {
 }
 
 @cross-check-integrity
+test affinity-any-strict-index-comparisons {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, c ANY) STRICT;
+    INSERT INTO t VALUES (1, '000123'), (2, 123), (3, '123');
+    SELECT id FROM t WHERE c = 123 ORDER BY id;
+    SELECT id FROM t WHERE c = '123' ORDER BY id;
+    CREATE UNIQUE INDEX t_c ON t(c);
+    SELECT id FROM t INDEXED BY t_c WHERE c = 123 ORDER BY id;
+    SELECT id FROM t INDEXED BY t_c WHERE c = '123' ORDER BY id;
+    SELECT id FROM t INDEXED BY t_c WHERE c = '000123' ORDER BY id;
+    UPDATE t SET c = '1.5' WHERE id = 1;
+    INSERT INTO t VALUES (2, '000456') ON CONFLICT(id) DO UPDATE SET c = excluded.c;
+    SELECT id, c, typeof(c) FROM t ORDER BY id;
+    PRAGMA integrity_check;
+}
+expect {
+    2
+    3
+    2
+    3
+    1
+    1|1.5|text
+    2|000456|text
+    3|123|text
+    ok
+}
+
+@cross-check-integrity
 test cast-text-to-numeric-integral-float {
     SELECT CAST('3.0' AS NUMERIC), typeof(CAST('3.0' AS NUMERIC));
     SELECT CAST('3.5' AS NUMERIC), typeof(CAST('3.5' AS NUMERIC));
@@ -781,4 +808,100 @@ test affinity-sum-of-text-i64-min {
 }
 expect {
     integer|-9223372036854775808
+}
+
+@cross-check-integrity
+test affinity-type-name-with-comment {
+    CREATE TABLE t (a BLOB/*INT*/REAL);
+    INSERT INTO t VALUES ('123');
+    SELECT type FROM pragma_table_info('t');
+    SELECT typeof(a), quote(a) FROM t;
+    SELECT typeof(CAST('123' AS BLOB/*INT*/REAL)), quote(CAST('123' AS BLOB/*INT*/REAL));
+}
+expect {
+    BLOB/*INT*/REAL
+    integer|123
+    integer|123
+}
+
+@cross-check-integrity
+test affinity-type-name-with-quotes {
+    CREATE TABLE t (a "BLOB" INTEGER, b "INT", c 'TEXT' INT, d "a""b" INT, e [x] INT);
+    INSERT INTO t VALUES ('123', '123', '123', '123', '123');
+    SELECT type FROM pragma_table_info('t');
+    SELECT typeof(a), typeof(b), typeof(c), typeof(d), typeof(e) FROM t;
+    SELECT typeof(CAST('123' AS "BLOB" INTEGER)), typeof(CAST('123' AS "INT")), typeof(CAST('123' AS [x] TEXT));
+}
+expect {
+    BLOB
+    INT
+    TEXT
+    a"b
+    x] IN
+    text|integer|text|integer|integer
+    blob|integer|integer
+}
+
+@cross-check-integrity
+test affinity-type-name-empty-after-quotes-removed {
+    CREATE TABLE t (a "" INT, b "", c);
+    INSERT INTO t VALUES ('12', '12', '12');
+    SELECT typeof(a), typeof(b), typeof(c) FROM t;
+    SELECT typeof(CAST('12' AS "")), typeof(CAST('12' AS "") + 0);
+}
+expect {
+    integer|integer|text
+    integer|integer
+}
+
+@cross-check-integrity
+test affinity-strict-quoted-type-name {
+    CREATE TABLE t (a "INT", b [TEXT]) STRICT;
+    INSERT INTO t VALUES ('1', 'x');
+    SELECT typeof(a), typeof(b) FROM t;
+}
+expect {
+    integer|text
+}
+
+test affinity-strict-type-name-with-quotes-and-more-words {
+    CREATE TABLE t (a "INT" X) STRICT;
+}
+expect error {
+    unknown datatype for t.a: "INT"
+}
+
+test affinity-strict-single-quoted-type-name-with-more-words {
+    CREATE TABLE t (a 'TEXT' INT) STRICT;
+}
+expect error {
+    unknown datatype for t.a: "TEXT"
+}
+
+test affinity-strict-add-column-type-name-with-quotes-and-more-words {
+    CREATE TABLE t (a INT) STRICT;
+    ALTER TABLE t ADD COLUMN b "INT" X;
+}
+expect error {
+    unknown datatype for t.b: "INT"
+}
+
+test affinity-strict-add-column-single-quoted-type-name-with-more-words {
+    CREATE TABLE t (a INT) STRICT;
+    ALTER TABLE t ADD COLUMN b 'TEXT' INT;
+}
+expect error {
+    unknown datatype for t.b: "TEXT"
+}
+
+@cross-check-integrity
+test affinity-strict-add-column-quoted-type-name {
+    CREATE TABLE t (a INT) STRICT;
+    ALTER TABLE t ADD COLUMN b "INT";
+    ALTER TABLE t ADD COLUMN c [TEXT];
+    INSERT INTO t VALUES (1, '2', 'x');
+    SELECT typeof(b), typeof(c) FROM t;
+}
+expect {
+    integer|text
 }

@@ -1769,6 +1769,7 @@ pub(crate) fn emit_window_full_scan_runtime(
         cursor_id: scan_cursor,
         pc_if_next: label_loop,
         fullscan: false,
+        is_index: false,
     });
     program.preassign_label_to_next_insn(label_break);
     emit_phase(program, WindowScanPhase::Finalize)?;
@@ -2292,6 +2293,7 @@ pub(crate) fn emit_window_operation(
         cursor_id: cursor_for_op,
         pc_if_next: label_after_next,
         fullscan: false,
+        is_index: false,
     });
     if let Some(break_target) = break_on_eof {
         program.emit_insn(Insn::Goto {

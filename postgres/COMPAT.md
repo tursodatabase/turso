@@ -50,19 +50,20 @@ Basics not enumerated by the official feature matrix.
 | CREATE INDEX | ✅ Supported | UNIQUE, multi-column, partial (WHERE), expression indexes, IF NOT EXISTS |
 | CREATE VIEW | ✅ Supported | Column aliases supported; TEMP silently ignored |
 | COMMENT ON | 🟡 Partial | Accepted but discarded; comments are not persisted in `pg_description` |
-| CREATE SCHEMA / DROP SCHEMA | ✅ Supported | Schemas are ATTACHed databases; DROP ... CASCADE; `public` is special-cased |
-| CREATE SEQUENCE / nextval / currval / setval | ✅ Supported | START, INCREMENT, MIN/MAXVALUE, CYCLE; CACHE accepted (no-op); pg_sequences view |
+| CREATE SCHEMA / DROP SCHEMA | ✅ Supported | Schemas are ATTACHed databases; DROP ... CASCADE; `public` is special-cased; CREATE TABLE without a schema creates the table in the first schema of `search_path` that exists; CREATE SCHEMA can contain CREATE TABLE, VIEW, INDEX and SEQUENCE statements, which create their objects in the new schema, but not inside a transaction block |
+| CREATE SEQUENCE / nextval / currval / setval | ✅ Supported | START, INCREMENT, MIN/MAXVALUE, CYCLE; CACHE accepted (no-op); pg_sequences view; a sequence named without a schema is looked up through `search_path`, and a column default or view binds it to the schema it is in when the table or view is created; a serial column's sequence is created in the table's schema |
 | CREATE DOMAIN | ✅ Supported | Base type + DEFAULT, NOT NULL, CHECK constraints enforced |
 | CREATE TYPE ... AS ENUM | ✅ Supported | Values validated on write; other CREATE TYPE forms unsupported |
 | TRUNCATE | 🟡 Partial | Lowered to DELETE of the first table only; CASCADE / RESTART IDENTITY dropped |
 | BEGIN / COMMIT / ROLLBACK | ✅ Supported | Isolation-level and READ ONLY/WRITE options accepted but ignored |
+| LOCK TABLE | 🟡 Partial | ACCESS SHARE without NOWAIT is accepted as a no-op inside a transaction for pg_dump compatibility; table names are not checked, no locks are acquired, and no read snapshot is started; other modes are rejected |
 | Casts (`expr::type`, CAST) | ✅ Supported | Also `int4(x)`-style cast functions |
 | Parameters (`$1`, `$2`, ...) | 🟡 Partial | Work through the extended wire protocol; text-format values only |
-| Operators: `\|\|`, `%`, bitwise, ILIKE, SIMILAR TO, `~`/`~*`/`!~`/`!~*`, IS [NOT] DISTINCT FROM, BETWEEN | ✅ Supported | Regex operators lower to REGEXP; case-insensitive variants treated as sensitive |
+| Operators: `\|\|`, `%`, bitwise, LIKE/ILIKE [ESCAPE], SIMILAR TO, `~`/`~*`/`!~`/`!~*`, IS [NOT] DISTINCT FROM, BETWEEN | ✅ Supported | Regex operators lower to REGEXP; `~*`/`!~*` add the `(?i)` flag. LIKE is case-sensitive with `\` as the default escape; ILIKE applies LOWER() to both sides, then matches like LIKE. In CREATE INDEX, LIKE and ILIKE need a string-literal pattern without ESCAPE |
 | Dollar-quoted strings, escape strings (`E'...'`), bit/hex string literals | ✅ Supported | |
 | generate_series | ✅ Supported | In FROM and with joins; column aliases on the function (`AS g(x)`) do not resolve |
 | pg_catalog emulation | 🟡 Partial | See Backend section |
-| SET / SHOW | 🟡 Partial | Passed through as PRAGMAs; no PostgreSQL GUCs (e.g. `SHOW search_path` returns nothing) |
+| SET / SHOW | 🟡 Partial | Passed through as PRAGMAs; no PostgreSQL GUCs other than search_path (`SET`, `SHOW`, `set_config`, `current_setting`) |
 
 ## Backend
 
@@ -74,15 +75,19 @@ plus `pg_input_error_info`. Present but always empty: `pg_policy`,
 `pg_trigger`, `pg_statistic_ext`, `pg_inherits`, `pg_rewrite`,
 `pg_foreign_table`, `pg_partitioned_table`, `pg_collation`, `pg_description`,
 `pg_publication*`. Catalog introspection functions: `format_type`,
-`pg_get_constraintdef`, `pg_get_indexdef`, `pg_get_userbyid`,
-`pg_*_is_visible`, `pg_encoding_to_char`, `pg_input_is_valid`, `to_char`
-(numeric), `now`/`clock_timestamp`/`transaction_timestamp`/`statement_timestamp`.
+`pg_get_constraintdef`, `pg_get_indexdef`, `pg_get_expr` (returns TursoPG's
+stored SQL; relation oid and pretty printing do not change the output),
+`pg_get_userbyid`, `pg_*_is_visible`, `pg_encoding_to_char`,
+`pg_input_is_valid`, `to_char` (numeric), `now`/`clock_timestamp`/
+`transaction_timestamp`/`statement_timestamp`.
 Session information functions: `version()`, `current_database()` /
 `current_catalog`, `current_schema` (call, bare-keyword, and FROM-position
-forms), `pg_backend_pid()`, `quote_ident()`, `quote_literal()`;
+forms; the first schema of `search_path` that exists), `pg_backend_pid()`, `quote_ident()`, `quote_literal()`;
 `obj_description()`/`col_description()` always return NULL because COMMENT ON
 is not persisted. DML against pg_catalog is rejected. `pg_typeof` is not
 implemented.
+Configuration settings functions: `set_config()` and `current_setting()`,
+for `search_path` only.
 
 | Feature | Status | Notes |
 |---------|--------|-------|
@@ -175,13 +180,13 @@ INTEGER. Unknown type names pass through as custom types.
 | FETCH FIRST .. WITH TIES | ❌ Not supported | `FETCH FIRST n ROWS ONLY` works (lowered to LIMIT); WITH TIES silently ignored |
 | GROUPING SETS, CUBE and ROLLUP support | ❌ Not supported | Translation error |
 | INSERT/UPDATE/DELETE RETURNING | ✅ Supported | Including `RETURNING *` and UPDATE ... FROM ... RETURNING |
-| LATERAL clause | ❌ Not supported | Keyword accepted but silently ignored |
+| LATERAL clause | 🟡 Partial | LATERAL subqueries work with a comma, [CROSS] JOIN, and LEFT JOIN. Column alias lists such as `AS s(x)` and outer columns in LIMIT/OFFSET are not supported; LATERAL tvf() is not supported     |
 | MERGE | ❌ Not supported | |
 | MERGE ... RETURNING | ❌ Not supported | |
 | Multirow VALUES | ✅ Supported | In INSERT and as standalone VALUES lists |
 | ORDER BY / LIMIT on a standalone VALUES list | ❌ Not supported | Rejected: "ORDER BY clause is not allowed with VALUES clause" |
 | Non-decimal integer literals | ✅ Supported | `0x`, `0o`, `0b` |
-| ORDER BY NULLS FIRST/LAST | ✅ Supported | Honored in SELECT, window, and compound SELECT ORDER BY; rejected (matching SQLite) in CREATE INDEX |
+| ORDER BY NULLS FIRST/LAST | ✅ Supported | Honored in SELECT, window, and compound SELECT ORDER BY; without it, NULLs sort last for ASC and first for DESC, as in PostgreSQL; rejected (matching SQLite) in CREATE INDEX |
 | range_agg range type aggregation function | ❌ Not supported | |
 | Recursive queries | 🟡 Partial | WITH RECURSIVE works with SQLite semantics (row-at-a-time recursive term, so e.g. DISTINCT in the recursive term over a multi-row anchor can differ from PG); SEARCH/CYCLE clauses are rejected |
 | regexp_count, regexp_instr, regexp_like | ❌ Not supported | Regex *operators* (`~`, `~*`, SIMILAR TO) work |
@@ -196,7 +201,7 @@ INTEGER. Unknown type names pass through as custom types.
 | unnest/array_agg | 🟡 Partial | array_agg works; unnest is not implemented |
 | Upsert (INSERT ... ON CONFLICT DO ...) | ✅ Supported | DO NOTHING and DO UPDATE SET ... (with EXCLUDED and conflict targets) |
 | Window functions | 🟡 Partial | Aggregate window functions (COUNT/SUM/AVG/MIN/MAX OVER), row_number, PARTITION BY/ORDER BY, frame clauses, and named WINDOW clauses work; rank, dense_rank, lag, lead, etc. are not implemented |
-| WITHIN GROUP clause | ❌ Not supported | Silently dropped; ordered-set aggregates (percentile_cont) missing |
+| WITHIN GROUP clause | 🟡 Partial | Supports mode(), percentile_cont(), and percentile_disc() with one ORDER BY expression; DESC is not supported; NULLS FIRST/LAST is accepted and has no effect because these functions skip NULLs |
 | WITH ORDINALITY clause | ❌ Not supported | |
 | WITH queries (Common Table Expressions) | ✅ Supported | Including WITH RECURSIVE; MATERIALIZED hints accepted |
 | Writable WITH queries (Common Table Expressions) | ❌ Not supported | "CTE query is not a SELECT statement" |
@@ -289,6 +294,7 @@ INTEGER. Unknown type names pass through as custom types.
 | JSONB-modifying operators and functions | ❌ Not supported | |
 | JSONB subscripting | ❌ Not supported | |
 | JSON data type | 🟡 Partial | Same as jsonb (see above) |
+| json_to_record / json_to_recordset (and jsonb_ variants) | 🟡 Partial | Work with a column definition list; WITH ORDINALITY and ROWS FROM are not supported; error messages for malformed input differ from PostgreSQL; a repeated key reads its first value, like `->>`; a json/jsonb column drops whitespace (`{"y": 2}` comes back as `{"y":2}`), like `->`; an array column (`int[]`) accepts only an array literal string such as `"{1,2}"`, not a JSON array |
 | SQL/JSON constructors | ❌ Not supported | |
 | SQL/JSON: datetime() | ❌ Not supported | |
 | SQL/JSON IS JSON | ❌ Not supported | |
@@ -350,7 +356,7 @@ Upgrade is not supported.
 
 | Feature | Status | Notes |
 |---------|--------|-------|
-| SET / SHOW configuration parameters | 🟡 Partial | Passed through as PRAGMAs; PostgreSQL GUCs (search_path, work_mem, ...) are not recognized |
+| SET / SHOW configuration parameters | 🟡 Partial | Passed through as PRAGMAs; PostgreSQL GUCs other than search_path are not recognized |
 | ALTER SYSTEM | ❌ Not supported | |
 | Fractional input for "integer" values | ❌ Not supported | |
 | Include directives for pg_hba.conf and pg_ident.conf | ❌ Not supported | |
@@ -523,7 +529,7 @@ Upgrade is not supported.
 
 | Feature | Status | Notes |
 |---------|--------|-------|
-| psql-style REPL | 🟡 Partial | `tursopg` (not psql itself); supports `\d[+]`, `\dt[+]`, `\di`, `\dv`, `\dn`, `\dT`, `\du`/`\dg`, `\df`, `\l`, `\x`, `\timing`, `\echo`, `\conninfo`, `\?`, `\q`; no `\copy`, `\i`, `\e`, `\set`, `\pset`, `\g`, `\watch` |
+| psql-style REPL | 🟡 Partial | `tursopg` (not psql itself); supports `\d[+]`, `\dt[+]`, `\di`, `\dv`, `\dn`, `\dT`, `\du`/`\dg`, `\df`, `\l`, `\x`, `\timing`, `\echo`, `\conninfo`, `\?`, `\q`, and interactive `quit`/`exit`; no `\copy`, `\i`, `\e`, `\set`, `\pset`, `\g`, `\watch` |
 | pgbench | ❌ Not supported | |
 | pg_combinebackup | ❌ Not supported | |
 | pg_createsubscriber | ❌ Not supported | |

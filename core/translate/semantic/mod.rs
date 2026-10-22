@@ -46,6 +46,9 @@ pub(crate) enum SemanticRootInput<'ast> {
         conflict_override: Option<turso_parser::ast::ResolveType>,
     },
     /// Expressions over values held in registers, read as `Register(n)`.
+    /// Materialized view maintenance will compile its operator expressions
+    /// this way; nothing uses it until that is rebuilt over HIR.
+    #[allow(dead_code)]
     RegisterExpressions {
         inputs: &'ast [String],
         expressions: &'ast [turso_parser::ast::Expr],
@@ -230,6 +233,7 @@ mod tests {
                 &database_schemas,
                 &temp_database,
                 &attached_databases,
+                &crate::Namespaces::default(),
                 true,
                 &SqliteDialect,
                 None,

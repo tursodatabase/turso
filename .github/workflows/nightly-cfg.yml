@@ -34,13 +34,8 @@ jobs:
           toolchain: nightly-2025-12-17
       - name: Setup mold linker
         uses: "./.github/shared/setup-mold"
-      - uses: Swatinem/rust-cache@v2
-        with:
-          # Separate cache from the stable v1-rust caches: nightly rustc
-          # artifacts are not interchangeable with stable ones and would
-          # otherwise evict/thrash the stable cache entries.
-          prefix-key: "v1-rust-nightly-cfg"
-          cache-on-failure: true
+      # No Rust cache: the job takes ~1 min uncached, and the cache space is
+      # worth more to the jobs with long builds.
       - name: Check core with the nightly allocator cfg
         env:
           RUSTFLAGS: "--cfg nightly"

@@ -109,7 +109,6 @@ impl SequenceCursor<'_> {
                     &operation.normalized_name,
                     operation.sequence.value(),
                     rowid,
-                    None,
                 )
             }
         }
@@ -234,6 +233,7 @@ impl TableSequence {
         });
         program.emit_insn(Insn::Next {
             cursor_id: cursor,
+            is_index: program.cursor_is_index(cursor),
             pc_if_next: next,
             fullscan: false,
         });
@@ -484,6 +484,7 @@ impl TableSequenceCursor<'_> {
         program.preassign_label_to_next_insn(other);
         program.emit_insn(Insn::Next {
             cursor_id: self.cursor,
+            is_index: program.cursor_is_index(self.cursor),
             pc_if_next: next,
             fullscan: false,
         });

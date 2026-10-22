@@ -177,7 +177,10 @@ pub fn emit_sequence_backing_table(
         cursor: seq_cursor_id,
         key_reg: base_reg, // base_reg holds the start value
         record_reg,
-        flag: InsertFlags::new().require_seek().skip_all_change_counts(),
+        flag: InsertFlags::new()
+            .require_seek()
+            .skip_last_rowid()
+            .skip_all_change_counts(),
         table_name: seq_name.to_string(),
     });
 
@@ -217,16 +220,9 @@ pub fn emit_disk_read_nextval(
     seq_name: &str,
     seq: &Sequence,
     target_register: usize,
-    // Optional caller-supplied register already holding the seq name as
-    // text (e.g. populated by user-arg evaluation in the SQL translator).
-    // When `None` the helper allocates its own.
-    seq_name_reg: Option<usize>,
 ) -> Result<()> {
     let root_page = backing_table.root_page;
     let cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(backing_table));
-
-    let seq_name_reg =
-        seq_name_reg.unwrap_or_else(|| program.emit_string8_new_reg(seq_name.to_string()));
 
     // Inner-tx wrap state, shared by Begin/Commit. See
     // Insn::SequenceBeginInnerTx doc for the path-kind / saved-outer
@@ -288,7 +284,7 @@ pub fn emit_disk_read_nextval(
 
     program.emit_insn(Insn::SequenceComputeNext {
         db: database_id,
-        seq_name_reg,
+        seq_name: seq_name.to_string(),
         in_value_reg: col_base,
         in_is_called_reg: col_base + 1,
         was_empty_reg,
@@ -318,7 +314,10 @@ pub fn emit_disk_read_nextval(
         cursor: cursor_id,
         key_reg: target_register,
         record_reg,
-        flag: InsertFlags::new().require_seek().skip_all_change_counts(),
+        flag: InsertFlags::new()
+            .require_seek()
+            .skip_last_rowid()
+            .skip_all_change_counts(),
         table_name: seq_name.to_string(),
     });
 
@@ -397,7 +396,7 @@ pub fn emit_disk_read_nextval(
     // `op_sequence_register_allocation`.
     program.emit_insn(Insn::SequenceRegisterAllocation {
         db: database_id,
-        seq_name_reg,
+        seq_name: seq_name.to_string(),
         value_reg: target_register,
         saved_outer_reg,
     });
@@ -427,12 +426,13 @@ pub fn emit_disk_read_nextval(
 
     program.emit_insn(Insn::SequenceTrackAllocation {
         db: database_id,
-        seq_name_reg,
+        seq_name: seq_name.to_string(),
         value_reg: target_register,
     });
 
     program.emit_insn(Insn::SetSequenceCurrval {
-        seq_name_reg,
+        db: database_id,
+        seq_name: seq_name.to_string(),
         value_reg: target_register,
     });
 
@@ -491,6 +491,7 @@ pub(crate) fn emit_disk_setval(
     });
     program.emit_insn(Insn::Next {
         cursor_id,
+        is_index: false,
         pc_if_next: loop_label,
         fullscan: false,
     });
@@ -532,7 +533,8 @@ pub(crate) fn emit_disk_setval(
         table_name: seq_name.to_string(),
     });
     program.emit_insn(Insn::SetSequenceCurrval {
-        seq_name_reg: start_reg,
+        db: database_id,
+        seq_name: seq_name.to_string(),
         value_reg: start_reg + 1,
     });
     program.emit_insn(Insn::Close { cursor_id });
@@ -550,11 +552,15 @@ pub(crate) fn emit_disk_setval(
     )
 }
 
-/// Emit bytecode that ensures the sequence's disk watermark is at least
-/// `value_reg`. If the current MAX is below the value, INSERTs a new
-/// watermark row at the value; otherwise no-op. Used for AUTOINCREMENT
-/// when the user supplies an explicit rowid that exceeds the running
-/// watermark — mirrors `Sequence::advance_past` but on disk.
+/// Emit bytecode that makes the sequence's next id come after `value_reg`.
+/// Used for AUTOINCREMENT when an INSERT supplies an explicit rowid, so that
+/// later generated ids never reuse it. Mirrors `Sequence::advance_past`, but
+/// on the backing table.
+///
+/// The backing table's last row is `(value, is_called)`. The next id is
+/// `value` when is_called is 0 (not handed out yet) and the id after `value`
+/// when is_called is 1. If the explicit rowid is the next id or later, this
+/// writes a row `(rowid, is_called = 1)`; otherwise it does nothing.
 pub fn emit_disk_advance_past(
     program: &mut ProgramBuilder,
     database_id: usize,
@@ -608,26 +614,57 @@ pub fn emit_disk_advance_past(
         });
     }
     program.emit_column_or_rowid(cursor_id, 0, col_value_reg);
+    let col_is_called_reg = program.alloc_register();
+    program.emit_column_or_rowid(cursor_id, 1, col_is_called_reg);
 
-    // For ascending sequences advance only if value > current; for
-    // descending advance only if value < current.
+    // Advance when the explicit rowid is the next id or later. For an
+    // ascending sequence:
+    //
+    //   rowid < value                    -> the rowid is behind; do nothing
+    //   rowid > value                    -> advance
+    //   rowid = value, is_called = 1     -> value is already used; do nothing
+    //   rowid = value, is_called = 0     -> value is the next id; advance
+    //
+    // The last case is a new table: its row is (1, is_called = 0). Without
+    // it, an explicit rowid 1 left the next id at 1, and the next generated
+    // id replaced that row. A descending sequence uses the same rule with
+    // the comparisons reversed.
     if seq.increment_by >= 0 {
-        program.emit_insn(Insn::Le {
+        program.emit_insn(Insn::Lt {
             lhs: value_reg,
             rhs: col_value_reg,
             target_pc: done_seek_label,
+            flags: CmpInsFlags::default(),
+            collation: program.curr_collation(),
+        });
+        program.emit_insn(Insn::Gt {
+            lhs: value_reg,
+            rhs: col_value_reg,
+            target_pc: do_advance_label,
             flags: CmpInsFlags::default(),
             collation: program.curr_collation(),
         });
     } else {
-        program.emit_insn(Insn::Ge {
+        program.emit_insn(Insn::Gt {
             lhs: value_reg,
             rhs: col_value_reg,
             target_pc: done_seek_label,
             flags: CmpInsFlags::default(),
             collation: program.curr_collation(),
         });
+        program.emit_insn(Insn::Lt {
+            lhs: value_reg,
+            rhs: col_value_reg,
+            target_pc: do_advance_label,
+            flags: CmpInsFlags::default(),
+            collation: program.curr_collation(),
+        });
     }
+    program.emit_insn(Insn::If {
+        reg: col_is_called_reg,
+        target_pc: done_seek_label,
+        jump_if_null: false,
+    });
 
     program.preassign_label_to_next_insn(do_advance_label);
 
@@ -655,12 +692,15 @@ pub fn emit_disk_advance_past(
         cursor: cursor_id,
         key_reg: value_reg,
         record_reg,
-        flag: InsertFlags::new().require_seek().skip_all_change_counts(),
+        flag: InsertFlags::new()
+            .require_seek()
+            .skip_last_rowid()
+            .skip_all_change_counts(),
         table_name: seq_name.to_string(),
     });
-    let seq_name_reg = program.emit_string8_new_reg(seq_name.to_string());
     program.emit_insn(Insn::SetSequenceCurrval {
-        seq_name_reg,
+        db: database_id,
+        seq_name: seq_name.to_string(),
         value_reg,
     });
     // Inline compaction is gated the same way as the nextval path —
@@ -687,8 +727,8 @@ pub fn emit_disk_advance_past(
     }
 
     // Mirror the watermark into `sqlite_sequence` ONLY when the
-    // advance branch actually fired. If `value_reg` is at-or-below the
-    // current watermark we fall through to `done_seek_label` without
+    // advance branch actually fired. If `value_reg` does not advance the
+    // watermark we fall through to `done_seek_label` without
     // updating the backing table — emitting the sync after the label
     // would clobber `sqlite_sequence.seq` with a *lower* value than the
     // engine's actual watermark, regressing the SQLite-compatibility
@@ -771,6 +811,7 @@ pub(crate) fn emit_backing_table_compaction(
         cursor_id,
         pc_if_next: loop_top_label,
         fullscan: false,
+        is_index: false,
     });
     program.preassign_label_to_next_insn(skip_label);
 }
@@ -842,6 +883,7 @@ pub(crate) fn emit_sqlite_sequence_sync(
     program.preassign_label_to_next_insn(skip_delete_label);
     program.emit_insn(Insn::Next {
         cursor_id: sseq_cursor,
+        is_index: false,
         pc_if_next: loop_top_label,
         fullscan: false,
     });
@@ -877,7 +919,10 @@ pub(crate) fn emit_sqlite_sequence_sync(
         cursor: sseq_cursor,
         key_reg: rowid_reg,
         record_reg,
-        flag: InsertFlags::new().require_seek().skip_all_change_counts(),
+        flag: InsertFlags::new()
+            .require_seek()
+            .skip_last_rowid()
+            .skip_all_change_counts(),
         table_name: SQLITE_SEQUENCE_TABLE_NAME.to_string(),
     });
     program.emit_insn(Insn::Close {
@@ -950,7 +995,7 @@ pub fn translate_create_sequence(
     catalog: &SemanticContext<'_>,
     program: &mut ProgramBuilder,
 ) -> Result<()> {
-    let database_id = catalog.resolve_database_id(seq_name)?;
+    let database_id = catalog.resolve_database_id_for_create(seq_name)?;
     let schema_cookie = catalog.with_schema(database_id, |s| s.schema_version);
     program.begin_write_on_database(database_id, schema_cookie)?;
 
@@ -1121,6 +1166,7 @@ pub(crate) fn emit_drop_sequence_cleanup(
     program.preassign_label_to_next_insn(skip_delete_label);
     program.emit_insn(Insn::Next {
         cursor_id: sqlite_schema_cursor_id,
+        is_index: false,
         pc_if_next: loop_start_label,
         fullscan: false,
     });
@@ -1150,11 +1196,19 @@ pub fn translate_drop_sequence(
     catalog: &SemanticContext<'_>,
     program: &mut ProgramBuilder,
 ) -> Result<()> {
-    let database_id = catalog.resolve_database_id(seq_name)?;
+    let normalized_name = normalize_ident(seq_name.name.as_str());
+    let database_id = if seq_name.namespace.is_some() {
+        catalog.resolve_database_id(seq_name)?
+    } else {
+        match catalog.resolve_existing_sequence_database_id(&normalized_name) {
+            Some(database_id) => database_id,
+            None if if_exists => return Ok(()),
+            None => bail_parse_error!("sequence \"{}\" does not exist", normalized_name),
+        }
+    };
     let schema_cookie = catalog.with_schema(database_id, |s| s.schema_version);
     program.begin_write_on_database(database_id, schema_cookie)?;
 
-    let normalized_name = normalize_ident(seq_name.name.as_str());
     let dropped = emit_drop_sequence_cleanup(program, catalog, database_id, &normalized_name)?;
     if !dropped {
         if if_exists {
@@ -1172,4 +1226,78 @@ pub fn translate_drop_sequence(
     });
 
     Ok(())
+}
+
+/// Qualifies each sequence named without a schema in `expr` with the schema
+/// it resolves to now, so the expression keeps that sequence after the
+/// search path changes. Returns whether a name was qualified.
+pub(crate) fn bind_sequence_names(
+    expr: &mut ast::Expr,
+    catalog: &SemanticContext<'_>,
+) -> Result<bool> {
+    let mut bound = false;
+    crate::translate::expr::walk_expr_mut(expr, &mut |expr: &mut ast::Expr| {
+        bound |= bind_sequence_call(expr, catalog);
+        Ok(crate::translate::expr::WalkControl::Continue)
+    })?;
+    Ok(bound)
+}
+
+/// [`bind_sequence_names`] for every expression of a SELECT.
+pub(crate) fn bind_sequence_names_in_select(
+    select: &mut ast::Select,
+    catalog: &SemanticContext<'_>,
+) -> Result<()> {
+    crate::util::rewrite_select_expressions(select, &mut |expr: &mut ast::Expr| {
+        bind_sequence_call(expr, catalog);
+        Ok(())
+    })
+}
+
+fn bind_sequence_call(expr: &mut ast::Expr, catalog: &SemanticContext<'_>) -> bool {
+    let ast::Expr::FunctionCall { name, args, .. } = expr else {
+        return false;
+    };
+    if !is_sequence_function(name.as_str()) {
+        return false;
+    }
+    let Some(qualified_args) = qualify_sequence_argument(args, catalog) else {
+        return false;
+    };
+    *args = qualified_args;
+    true
+}
+
+fn is_sequence_function(name: &str) -> bool {
+    name.eq_ignore_ascii_case("nextval")
+        || name.eq_ignore_ascii_case("currval")
+        || name.eq_ignore_ascii_case("setval")
+}
+
+/// The arguments of a sequence function with its unqualified sequence name
+/// replaced by `database.name`, the name the opcodes look the sequence up
+/// by when the statement runs. `None` when the name is already qualified,
+/// is not a string literal, or names no sequence.
+#[allow(clippy::vec_box)]
+fn qualify_sequence_argument(
+    args: &[Box<ast::Expr>],
+    catalog: &SemanticContext<'_>,
+) -> Option<Vec<Box<ast::Expr>>> {
+    let ast::Expr::Literal(ast::Literal::String(seq_name_raw)) = args.first()?.as_ref() else {
+        return None;
+    };
+    let seq_name_raw = seq_name_raw.trim_matches('\'');
+    if seq_name_raw.contains('.') {
+        return None;
+    }
+    let name = crate::util::normalize_ident(seq_name_raw);
+    let database_id = catalog.resolve_existing_sequence_database_id(&name)?;
+    let database_name = catalog.namespace_name(database_id)?;
+    let runtime_name = format!("{database_name}.{name}");
+    let mut args = args.to_vec();
+    args[0] = Box::new(ast::Expr::Literal(ast::Literal::String(format!(
+        "'{}'",
+        runtime_name.replace('\'', "''")
+    ))));
+    Some(args)
 }

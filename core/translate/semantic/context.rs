@@ -101,39 +101,6 @@ impl<'catalog> SemanticContext<'catalog> {
         })
     }
 
-    /// A context with this one's settings over `catalog` instead.
-    pub(crate) fn for_other_catalog<'other>(
-        &self,
-        catalog: &'other SemanticCatalog,
-    ) -> Result<SemanticContext<'other>>
-    where
-        'catalog: 'other,
-    {
-        SemanticContext::for_catalog(
-            catalog,
-            self.symbols,
-            self.custom_types_enabled,
-            self.dialect.clone(),
-            self.dqs_dml,
-            self.foreign_keys_enabled,
-        )
-        .map(|context| {
-            context
-                .with_capture_changes(self.capture_changes_table.clone())
-                .with_long_column_names(self.long_column_names)
-        })
-    }
-
-    /// The captured catalog with the main database's schema replaced by
-    /// `schema`, for a statement that must read the latest shared schema.
-    pub(crate) fn catalog_with_main_schema(&self, schema: Arc<Schema>) -> Result<SemanticCatalog> {
-        self.catalog
-            .map(|catalog| catalog.with_main_schema(schema))
-            .ok_or_else(|| {
-                LimboError::InternalError("semantic context has no captured catalog".to_string())
-            })
-    }
-
     fn with_catalog(mut self, catalog: &'catalog SemanticCatalog) -> Self {
         self.catalog = Some(catalog);
         self
@@ -263,6 +230,15 @@ impl<'catalog> SemanticContext<'catalog> {
         Ok(ids.into_iter().try_collect()?)
     }
 
+    /// The namespace that refers to database `index`, if any.
+    pub(crate) fn namespace_name(&self, index: usize) -> Option<String> {
+        self.database_name_by_index(index)
+    }
+
+    pub(crate) fn dialect(&self) -> &Arc<dyn Dialect> {
+        &self.dialect
+    }
+
     pub(crate) fn database_name_by_index(&self, index: usize) -> Option<String> {
         self.database_name(DatabaseId::new(index))
             .map(str::to_string)
@@ -283,7 +259,7 @@ impl<'catalog> SemanticContext<'catalog> {
         &self,
         qualified_name: &turso_parser::ast::QualifiedName,
     ) -> Result<usize> {
-        let Some(db_name) = &qualified_name.db_name else {
+        let Some(db_name) = &qualified_name.namespace else {
             return Ok(MAIN_DB_ID);
         };
         let db_name = normalize_ident(db_name.as_str());
@@ -296,13 +272,41 @@ impl<'catalog> SemanticContext<'catalog> {
         }
     }
 
+    /// The database a CREATE puts an object whose name has no qualifier
+    /// in: the first database of the search path.
+    pub(crate) fn resolve_database_id_for_create(
+        &self,
+        qualified_name: &turso_parser::ast::QualifiedName,
+    ) -> Result<usize> {
+        if qualified_name.namespace.is_some() {
+            return self.resolve_database_id(qualified_name);
+        }
+        self.unqualified_database_search_path
+            .first()
+            .map(|database| database.index())
+            .ok_or_else(|| {
+                LimboError::ParseError("no schema has been selected to create in".to_string())
+            })
+    }
+
+    /// The database of a sequence named without a qualifier: the first
+    /// database of the search path that has it.
+    pub(crate) fn resolve_existing_sequence_database_id(&self, seq_name: &str) -> Option<usize> {
+        self.unqualified_database_search_path
+            .iter()
+            .map(|database| database.index())
+            .find(|&database| {
+                self.with_schema(database, |schema| schema.get_sequence(seq_name).is_some())
+            })
+    }
+
     /// The database holding the table, view or materialized view
     /// `qualified_name` names.
     pub(crate) fn resolve_existing_table_database_id_qualified(
         &self,
         qualified_name: &turso_parser::ast::QualifiedName,
     ) -> Result<usize> {
-        if qualified_name.db_name.is_some() {
+        if qualified_name.namespace.is_some() {
             return self.resolve_database_id(qualified_name);
         }
         self.resolve_existing_table_database_id(qualified_name.name.as_str())
@@ -332,7 +336,7 @@ impl<'catalog> SemanticContext<'catalog> {
         &self,
         qualified_name: &turso_parser::ast::QualifiedName,
     ) -> Result<usize> {
-        if qualified_name.db_name.is_some() {
+        if qualified_name.namespace.is_some() {
             return self.resolve_database_id(qualified_name);
         }
         let index_name = normalize_ident(qualified_name.name.as_str());
@@ -349,7 +353,7 @@ impl<'catalog> SemanticContext<'catalog> {
         &self,
         qualified_name: &turso_parser::ast::QualifiedName,
     ) -> Result<usize> {
-        if qualified_name.db_name.is_some() {
+        if qualified_name.namespace.is_some() {
             return self.resolve_database_id(qualified_name);
         }
         self.resolve_unqualified_existing_database_id(
@@ -477,7 +481,7 @@ impl<'catalog> SemanticContext<'catalog> {
     /// Whether `name` resolves to a table, without reporting a missing one.
     pub(crate) fn table_exists(&self, name: &turso_parser::ast::QualifiedName) -> Result<bool> {
         let table_name = normalize_ident(name.name.as_str());
-        Ok(match &name.db_name {
+        Ok(match &name.namespace {
             Some(database) => {
                 let database = self.database(database.as_str()).ok_or_else(|| {
                     LimboError::InvalidArgument(format!(
@@ -510,7 +514,7 @@ impl<'catalog> SemanticContext<'catalog> {
                 .get(database)
                 .is_some_and(|schema| schema.views.contains_key(&view_name))
         };
-        let database = match &name.db_name {
+        let database = match &name.namespace {
             Some(database) => Some(self.database(database.as_str()).ok_or_else(|| {
                 LimboError::InvalidArgument(format!(
                     "no such database: {}",
@@ -534,7 +538,7 @@ impl<'catalog> SemanticContext<'catalog> {
         name: &turso_parser::ast::QualifiedName,
     ) -> Result<(DatabaseId, Arc<Table>)> {
         let table_name = normalize_ident(name.name.as_str());
-        let database = match &name.db_name {
+        let database = match &name.namespace {
             Some(database) => self.database(database.as_str()).ok_or_else(|| {
                 LimboError::InvalidArgument(format!(
                     "no such database: {}",
@@ -571,7 +575,7 @@ impl<'catalog> SemanticContext<'catalog> {
                 .get(database)
                 .is_some_and(|schema| schema.broken_views.contains(&view_name))
         };
-        match &name.db_name {
+        match &name.namespace {
             Some(database) => self
                 .database(database.as_str())
                 .is_some_and(|database| broken(&database)),

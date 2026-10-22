@@ -92,3 +92,37 @@ expect {
     0|1
     1|5
 }
+
+# An aggregate of an outer column in a subquery belongs to the outer query, but
+# the outer query cannot compute an aggregate in its WHERE clause.
+test outer-aggregate-in-a-where-subquery-is-an-error {
+    CREATE TABLE t(a);
+    INSERT INTO t VALUES (1), (2), (3);
+    SELECT * FROM t WHERE (SELECT max(t.a)) > 1;
+}
+expect error {
+    misuse of aggregate: max()
+}
+
+# An ON clause is part of the outer query's WHERE clause.
+test outer-aggregate-in-an-on-subquery-is-an-error {
+    CREATE TABLE t(a);
+    INSERT INTO t VALUES (1), (2), (3);
+    CREATE TABLE u(b);
+    INSERT INTO u VALUES (10), (20);
+    SELECT * FROM t JOIN u ON (SELECT max(t.a)) > 1;
+}
+expect error {
+    misuse of aggregate: max()
+}
+
+# The arguments of a table-valued function in FROM are also part of the outer
+# query's WHERE clause.
+test outer-aggregate-in-a-table-function-argument-is-an-error {
+    CREATE TABLE t(a);
+    INSERT INTO t VALUES (1), (2), (3);
+    SELECT t.a, j.value FROM t, json_each((SELECT json_group_array(t.a))) AS j;
+}
+expect error {
+    misuse of aggregate: json_group_array()
+}

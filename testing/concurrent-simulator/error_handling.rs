@@ -43,22 +43,10 @@ pub fn recoverable_error_action(in_tx: bool) -> ErrorAction {
 /// drivers compute this from their own fiber-state tracking before
 /// calling in.
 pub fn classify_op_error(err: &LimboError, in_tx: bool) -> ErrorAction {
-    // DatabaseFull is overloaded — it is raised for both real storage
-    // exhaustion (pager.rs) and autoincrement max-rowid overflow
-    // (translate/insert.rs). Only swallow the well-defined "non-
-    // cycling sequence reached its max/min value" case — the
-    // workload generator easily triggers this with tight bounds
-    // (e.g. start=1, increment=5, max=36 → only 8 values exist).
-    // sequence_rmw_nextval emits messages that start with the
-    // literal "nextval: reached "; other DatabaseFull paths use
-    // unrelated messages, so a substring match keeps the tolerance
-    // scoped to true sequence exhaustion. Generalising this match
-    // risks hiding pager out-of-pages, which is a real bug.
-    let is_seq_exhaustion = matches!(
-        err,
-        LimboError::DatabaseFull(msg) if msg.starts_with("nextval: reached ")
-    );
-
+    // A non-cycling sequence reaching its max/min value is expected: the
+    // workload generator easily triggers it with tight bounds (e.g.
+    // start=1, increment=5, max=36 → only 8 values exist). DatabaseFull
+    // (pager out of pages, autoincrement rowid overflow) stays fatal.
     match err {
         LimboError::SchemaUpdated
         | LimboError::SchemaConflict
@@ -71,7 +59,7 @@ pub fn classify_op_error(err: &LimboError, in_tx: bool) -> ErrorAction {
         | LimboError::ParseError(..)
         | LimboError::TxError(..)
         | LimboError::OutOfMemory => recoverable_error_action(in_tx),
-        LimboError::DatabaseFull(_) if is_seq_exhaustion => recoverable_error_action(in_tx),
+        LimboError::SequenceExhausted { .. } => recoverable_error_action(in_tx),
         LimboError::Corrupt(_) | LimboError::CheckpointFailed(_) => ErrorAction::Respawn,
         _ => ErrorAction::Fatal,
     }
@@ -95,14 +83,17 @@ mod tests {
 
     #[test]
     fn sequence_exhaustion_is_swallowed() {
-        let err = LimboError::DatabaseFull("nextval: reached minimum value of \"s\"".into());
+        let err = LimboError::SequenceExhausted {
+            name: "s".into(),
+            ascending: false,
+        };
         assert_eq!(classify_op_error(&err, true), ErrorAction::Rollback);
         assert_eq!(classify_op_error(&err, false), ErrorAction::ClearTxn);
     }
 
     #[test]
     fn generic_database_full_is_fatal() {
-        let err = LimboError::DatabaseFull("disk image is full".into());
+        let err = LimboError::DatabaseFull;
         assert_eq!(classify_op_error(&err, true), ErrorAction::Fatal);
         assert_eq!(classify_op_error(&err, false), ErrorAction::Fatal);
     }

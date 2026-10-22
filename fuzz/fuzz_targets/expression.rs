@@ -4,6 +4,7 @@ use std::{error::Error, num::NonZero, sync::Arc};
 
 use arbitrary::Arbitrary;
 use libfuzzer_sys::{fuzz_target, Corpus};
+use turso_core::ConnectOpts;
 
 macro_rules! str_enum {
     ($vis:vis enum $name:ident { $($variant:ident => $value:literal),*, }) => {
@@ -76,7 +77,7 @@ impl From<Value> for turso_core::Value {
             Value::Null => turso_core::Value::Null,
             Value::Integer(v) => turso_core::Value::from_i64(v),
             Value::Real(v) => turso_core::Value::from_f64(v),
-            Value::Text(v) => turso_core::Value::from_text(&v),
+            Value::Text(v) => turso_core::Value::from_text(v),
             Value::Blob(v) => turso_core::Value::from_blob(v.to_owned()),
         }
     }
@@ -265,17 +266,23 @@ fn do_fuzz(expr: Expr) -> Result<Corpus, Box<dyn Error>> {
 
     let found = 'value: {
         let io = Arc::new(turso_core::MemoryIO::new());
-        let db = turso_core::Database::open_file(io.clone(), ":memory:", false)?;
-        let conn = db.connect()?;
+        let db = turso_core::Database::open_file(
+            io.clone(),
+            ":memory:",
+            Arc::new(turso_core::SqliteDialect),
+        )?;
+        let conn = db.connect(ConnectOpts::new())?;
 
         let mut stmt = conn.prepare(sql)?;
         for (idx, value) in expr.parameters.iter().enumerate() {
-            stmt.bind_at(NonZero::new(idx + 1).unwrap(), value.clone().into())
+            stmt.bind_at(NonZero::new(idx + 1).unwrap(), value.clone().into())?;
         }
         loop {
             use turso_core::StepResult;
             match stmt.step()? {
-                StepResult::IO | StepResult::Yield | StepResult::Sleep { .. } => stmt.run_once()?,
+                StepResult::IO | StepResult::Yield | StepResult::Sleep { .. } => {
+                    stmt.get_pager().io.step()?
+                }
                 StepResult::Row => {
                     let row = stmt.row().unwrap();
                     assert_eq!(row.len(), 1, "expr: {:?}", expr);

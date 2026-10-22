@@ -59,8 +59,11 @@ uv-sync-test:
 	uv sync --all-extras --dev --package turso_test
 .PHONE: uv-sync
 
-test: build uv-sync-test test-compat test-sqlite3 test-shell test-memory test-write test-update test-constraint test-collate test-extensions test-sqltest test-sqltest-js test-sqltest-cli
+test: test-without-sqltest test-sqltest test-sqltest-js test-sqltest-cli
 .PHONY: test
+
+test-without-sqltest: build uv-sync-test test-compat test-sqlite3 test-shell test-memory test-write test-update test-constraint test-collate test-extensions
+.PHONY: test-without-sqltest
 
 test-sqltest:
 	@make -C sqlite/conformance run
@@ -118,35 +121,27 @@ test-memory: build uv-sync-test
 .PHONY: test-memory
 
 test-write: build uv-sync-test
-	@if [ "$(SQLITE_EXEC)" != "scripts/limbo-sqlite3" ]; then \
-		RUST_LOG=$(RUST_LOG) SQLITE_EXEC=$(SQLITE_EXEC) uv run --package turso_test test-write; \
-	else \
-		echo "Skipping test-write: SQLITE_EXEC does not have indexes scripts/limbo-sqlite3"; \
-	fi
+	RUST_LOG=$(RUST_LOG) SQLITE_EXEC=$(SQLITE_EXEC) uv run --package turso_test test-write
 .PHONY: test-write
 
 test-update: build uv-sync-test
-	@if [ "$(SQLITE_EXEC)" != "scripts/limbo-sqlite3" ]; then \
-		RUST_LOG=$(RUST_LOG) SQLITE_EXEC=$(SQLITE_EXEC) uv run --package turso_test test-update; \
-	else \
-		echo "Skipping test-update: SQLITE_EXEC does not have indexes scripts/limbo-sqlite3"; \
-	fi
+	RUST_LOG=$(RUST_LOG) SQLITE_EXEC=$(SQLITE_EXEC) uv run --package turso_test test-update
 .PHONY: test-update
 
+# Turso applies a column's collation to expressions built from the column,
+# e.g. GROUP BY (d || '') or ORDER BY (c || ''), where SQLite uses BINARY,
+# so two of these tests fail against Turso (#8722, #9869). Run them only
+# against other shells until that is fixed.
 test-collate: build uv-sync-test
 	@if [ "$(SQLITE_EXEC)" != "scripts/limbo-sqlite3" ]; then \
 		RUST_LOG=$(RUST_LOG) SQLITE_EXEC=$(SQLITE_EXEC) uv run --package turso_test test-collate; \
 	else \
-		echo "Skipping test-collate: SQLITE_EXEC does not have indexes scripts/limbo-sqlite3"; \
+		echo "Skipping test-collate: Turso applies a column's collation to expressions like (d || ''); SQLite uses BINARY"; \
 	fi
 .PHONY: test-collate
 
 test-constraint: build uv-sync-test
-	@if [ "$(SQLITE_EXEC)" != "scripts/limbo-sqlite3" ]; then \
-		RUST_LOG=$(RUST_LOG) SQLITE_EXEC=$(SQLITE_EXEC) uv run --package turso_test test-constraint; \
-	else \
-		echo "Skipping test-constraint: SQLITE_EXEC does not have indexes scripts/limbo-sqlite3"; \
-	fi
+	RUST_LOG=$(RUST_LOG) SQLITE_EXEC=$(SQLITE_EXEC) uv run --package turso_test test-constraint
 .PHONY: test-constraint
 
 test-multiprocess:

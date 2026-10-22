@@ -90,16 +90,12 @@ export interface ResultSet {
 /**
  * Result set returned by batch().
  */
-export interface BatchResultSet {
-  /** Column names in the result set */
-  columns: Array<string>;
-  /** Column type information */
-  columnTypes: Array<string>;
-  /** Result rows */
-  rows: Array<BatchRow>;
-  /** Number of rows affected by the statement */
-  rowsAffected: number;
-}
+/**
+ * Result set returned for each statement of `batch()`. Matches the libSQL
+ * client's `ResultSet` shape exactly, including `lastInsertRowid` and
+ * `toJSON()`.
+ */
+export type BatchResultSet = ResultSet;
 
 /**
  * libSQL-compatible error class with error codes.
@@ -157,6 +153,7 @@ export interface Client {
   close(): void;
   closed: boolean;
   protocol: string;
+  reconnect(): void;
 }
 
 class LibSQLClient implements Client {
@@ -267,13 +264,25 @@ class LibSQLClient implements Client {
     return resultSet;
   }
 
+  /** Wrap a batch failure in a LibsqlError, preserving the per-statement
+   * metadata batch() attaches. */
+  private wrapBatchError(error: any): LibsqlError {
+    const wrapped = mapDatabaseError(error, "BATCH_ERROR");
+    if (error?.batchIndex !== undefined) {
+      (wrapped as any).batchIndex = error.batchIndex;
+    }
+    if (error?.batchResults !== undefined) {
+      (wrapped as any).batchResults = error.batchResults.map((result: any) =>
+        result === null ? null : this.convertBatchResult(result),
+      );
+    }
+    return wrapped;
+  }
+
   private convertBatchResult(result: any): BatchResultSet {
-    return {
-      columns: result.columns || [],
-      columnTypes: result.columnTypes || [],
-      rows: result.rows || [],
-      rowsAffected: result.rowsAffected || 0,
-    };
+    // libSQL's batch() returns full ResultSets, lastInsertRowid and
+    // toJSON() included; conform exactly.
+    return this.convertResult(result);
   }
 
   private normalizeBatchOptions(options?: TransactionMode | BatchOptions): { mode?: TransactionMode; raw: boolean } {
@@ -346,7 +355,7 @@ class LibSQLClient implements Client {
       if (error instanceof LibsqlError) {
         throw error;
       }
-      throw mapDatabaseError(error, "BATCH_ERROR");
+      throw this.wrapBatchError(error);
     } finally {
       this.execLock.release();
     }
@@ -438,7 +447,10 @@ class LibSQLClient implements Client {
           );
           return results.map((result: any) => this.convertBatchResult(result));
         } catch (error: any) {
-          throw mapDatabaseError(error, "BATCH_ERROR");
+          if (error instanceof LibsqlError) {
+            throw error;
+          }
+          throw this.wrapBatchError(error);
         }
       },
       executeMultiple: async (sql: string): Promise<void> => {
@@ -513,6 +525,19 @@ class LibSQLClient implements Client {
     this.session.close().catch(error => {
       console.error('Error closing session:', error);
     });
+  }
+
+  reconnect(): void {
+    const wasOpen = !this._closed;
+    this._closed = false;
+
+    if (wasOpen) {
+      this.session.close().catch(error => {
+        console.error('Error closing session during reconnect:', error);
+      });
+    }
+
+    this.session = new Session(this.sessionConfig);
   }
 }
 

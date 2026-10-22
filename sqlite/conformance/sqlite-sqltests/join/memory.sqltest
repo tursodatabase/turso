@@ -1,5 +1,149 @@
 @database :memory:
 
+setup indexed-hash-build-rows {
+    CREATE TABLE expression_build_orders(
+        id INTEGER PRIMARY KEY,
+        customer_id INTEGER,
+        order_date TEXT
+    );
+    CREATE INDEX expression_build_order_key
+        ON expression_build_orders(customer_id, lower(order_date));
+    CREATE TABLE expression_build_inventory(product_id INTEGER, quantity INTEGER);
+    INSERT INTO expression_build_orders VALUES
+        (1, 100, 'ABC'), (2, 100, 'DeF'), (3, 100, NULL),
+        (4, 200, 'GHI'), (6, 100, 'xyz');
+    INSERT INTO expression_build_inventory VALUES
+        (1, 2), (1, 3), (2, 4), (3, 5), (5, 6);
+
+    CREATE TABLE covering_build_orders(
+        id INTEGER PRIMARY KEY,
+        customer_id INTEGER,
+        order_date TEXT
+    );
+    INSERT INTO covering_build_orders SELECT * FROM expression_build_orders;
+    CREATE INDEX covering_build_order_key
+        ON covering_build_orders(customer_id, order_date);
+
+    CREATE TABLE expression_covering_build_orders(
+        id INTEGER PRIMARY KEY,
+        customer_id INTEGER,
+        order_date TEXT
+    );
+    INSERT INTO expression_covering_build_orders SELECT * FROM expression_build_orders;
+    CREATE INDEX expression_covering_build_order_key
+        ON expression_covering_build_orders(customer_id, lower(order_date), order_date);
+
+    CREATE TABLE noncovering_build_orders(
+        id INTEGER PRIMARY KEY,
+        customer_id INTEGER,
+        order_date TEXT
+    );
+    INSERT INTO noncovering_build_orders SELECT * FROM expression_build_orders;
+    CREATE INDEX noncovering_build_order_key
+        ON noncovering_build_orders(customer_id);
+
+    CREATE TABLE partial_build_orders(
+        id INTEGER PRIMARY KEY,
+        customer_id INTEGER,
+        order_date TEXT
+    );
+    INSERT INTO partial_build_orders SELECT * FROM expression_build_orders;
+    CREATE INDEX partial_build_order_key
+        ON partial_build_orders(customer_id, order_date)
+        WHERE customer_id = 100;
+
+    CREATE TABLE expression_build_customers(id INTEGER PRIMARY KEY, enabled INTEGER);
+    INSERT INTO expression_build_customers VALUES (100, 1), (200, 0);
+}
+
+@setup indexed-hash-build-rows
+test expression-index-hash-build-keeps-source-column {
+    SELECT orders.id, lower(orders.order_date), inventory.quantity
+    FROM expression_build_orders AS orders
+    JOIN expression_build_inventory AS inventory
+      ON orders.id = inventory.product_id
+    WHERE orders.customer_id = 100
+    ORDER BY orders.id, inventory.quantity;
+}
+expect {
+    1|abc|2
+    1|abc|3
+    2|def|4
+    3||5
+}
+
+@setup indexed-hash-build-rows
+@skip-if sqlite "SQLite does not have a hash join plan"
+test expression-index-hash-build-reads-source-table {
+    EXPLAIN QUERY PLAN
+    SELECT orders.id, lower(orders.order_date), inventory.quantity
+    FROM expression_build_orders AS orders
+    JOIN expression_build_inventory AS inventory
+      ON orders.id = inventory.product_id
+    WHERE orders.customer_id = 100;
+}
+expect pattern {
+    (?s)MATERIALIZE hash build input for expression_build_orders AS orders.*HASH JOIN expression_build_inventory AS inventory.*SEARCH orders USING INTEGER PRIMARY KEY
+}
+
+@setup indexed-hash-build-rows
+@var build_table { expression_build_orders | covering_build_orders | expression_covering_build_orders | noncovering_build_orders | partial_build_orders }
+@var join_type { JOIN | LEFT JOIN | FULL OUTER JOIN }
+@var date_value { orders.order_date | lower(orders.order_date) }
+matrix indexed-hash-build-join-results {
+    SELECT orders.id, $date_value, inventory.quantity
+    FROM $build_table AS orders
+    $join_type expression_build_inventory AS inventory
+      ON orders.id = inventory.product_id
+    WHERE orders.customer_id = 100 OR orders.id IS NULL
+    ORDER BY orders.id, inventory.quantity;
+}
+
+setup expression-index-prefix-stats {
+    ANALYZE;
+    DELETE FROM sqlite_stat1;
+    INSERT INTO sqlite_stat1(tbl, idx, stat) VALUES
+        ('expression_build_customers', NULL, '1000'),
+        ('expression_build_orders', NULL, '100000'),
+        ('expression_build_orders', 'expression_build_order_key', '100000 100'),
+        ('expression_build_inventory', NULL, '100000');
+    ANALYZE sqlite_schema;
+}
+
+@setup indexed-hash-build-rows
+@setup expression-index-prefix-stats
+test expression-index-after-earlier-join-keeps-source-column {
+    SELECT customers.id, orders.id, lower(orders.order_date), inventory.quantity
+    FROM expression_build_customers AS customers
+    CROSS JOIN expression_build_orders AS orders
+    JOIN expression_build_inventory AS inventory
+      ON inventory.product_id = orders.id
+    WHERE orders.customer_id = customers.id AND customers.enabled = 1
+    ORDER BY customers.id, orders.id, inventory.quantity;
+}
+expect {
+    100|1|abc|2
+    100|1|abc|3
+    100|2|def|4
+    100|3||5
+}
+
+@setup indexed-hash-build-rows
+@setup expression-index-prefix-stats
+@skip-if sqlite "SQLite does not have a hash join plan"
+test expression-index-after-earlier-join-reads-source-table {
+    EXPLAIN QUERY PLAN
+    SELECT customers.id, orders.id, lower(orders.order_date), inventory.quantity
+    FROM expression_build_customers AS customers
+    CROSS JOIN expression_build_orders AS orders
+    JOIN expression_build_inventory AS inventory
+      ON inventory.product_id = orders.id
+    WHERE orders.customer_id = customers.id AND customers.enabled = 1;
+}
+expect pattern {
+    (?s)MATERIALIZE hash build input for expression_build_orders AS orders.*SCAN expression_build_customers AS customers.*SEARCH orders USING INDEX expression_build_order_key.*HASH JOIN expression_build_inventory AS inventory
+}
+
 # regression test for issue 2794: not nulling out rowid properly when left join does not match
 @cross-check-integrity
 test min-null-regression-test {
@@ -154,6 +298,81 @@ expect {
     17|17|20|17
 }
 
+# A later ON term cannot be a hash key for an earlier LEFT JOIN. Otherwise,
+# the hash join can keep an unmatched row from the wrong table.
+@cross-check-integrity
+test left-join-does-not-use-later-on-term-as-hash-key {
+    CREATE TABLE hash_owner_t1(c);
+    CREATE TABLE hash_owner_t2(b, c);
+    CREATE TABLE hash_owner_t3(b);
+    INSERT INTO hash_owner_t1 VALUES(-2);
+    INSERT INTO hash_owner_t3 VALUES(2);
+
+    SELECT hash_owner_t1.c, hash_owner_t2.b, hash_owner_t3.b
+    FROM hash_owner_t1
+    LEFT JOIN hash_owner_t2 ON hash_owner_t1.c = hash_owner_t2.c
+    LEFT JOIN hash_owner_t3 ON hash_owner_t2.b = hash_owner_t3.b
+    WHERE hash_owner_t3.b = 2 AND hash_owner_t1.c = -2;
+}
+expect {
+}
+
+# A temporary index must follow the same rule. This path is used for a
+# materialized common table expression.
+@cross-check-integrity
+test left-join-temp-index-does-not-use-later-on-term {
+    CREATE TABLE temp_index_t1(a, c);
+    CREATE TABLE temp_index_t2(a, b, c, d);
+    CREATE TABLE temp_index_t3(id INTEGER PRIMARY KEY, b);
+    INSERT INTO temp_index_t1 VALUES(1, -2);
+    INSERT INTO temp_index_t3 VALUES(20052, 2);
+
+    WITH cte_t2 AS MATERIALIZED (
+        SELECT a, b, c, d, c + d AS cd FROM temp_index_t2
+    )
+    SELECT temp_index_t1.a, cte_t2.a, temp_index_t3.id
+    FROM temp_index_t1
+    LEFT JOIN cte_t2 ON temp_index_t1.c = cte_t2.c
+    LEFT JOIN temp_index_t3 ON cte_t2.b = temp_index_t3.b
+    WHERE temp_index_t3.b = 2 AND temp_index_t1.c IS -2;
+}
+expect {
+}
+
+# A materialized hash input can remove an inner join's right table from the
+# main loop. The ON terms must still run when the remaining table is read.
+@cross-check-integrity
+test materialized-hash-input-keeps-on-term-for-remaining-table {
+    CREATE TABLE materialized_hash_t1(a);
+    CREATE TABLE materialized_hash_t2(id INTEGER PRIMARY KEY, a, b);
+    CREATE TABLE materialized_hash_t3(id INTEGER PRIMARY KEY, b, c, d);
+    CREATE TABLE materialized_hash_t4(a, c, d);
+    INSERT INTO materialized_hash_t1 VALUES(-10);
+    INSERT INTO materialized_hash_t2 VALUES(10143, -10, 5);
+    INSERT INTO materialized_hash_t3 VALUES(20159, 5, NULL, 0);
+    INSERT INTO materialized_hash_t4 VALUES(1, 999, 999);
+
+    WITH cte_t4 AS (
+        SELECT * FROM materialized_hash_t4 WHERE a IS NOT NULL
+    )
+    SELECT materialized_hash_t1.a,
+           materialized_hash_t2.id,
+           materialized_hash_t3.id,
+           cte_t4.a
+    FROM materialized_hash_t1
+    JOIN materialized_hash_t2
+      ON materialized_hash_t1.a = materialized_hash_t2.a
+    JOIN materialized_hash_t3
+      ON materialized_hash_t2.b = materialized_hash_t3.b
+     AND materialized_hash_t2.b IS materialized_hash_t3.b
+    JOIN cte_t4
+      ON materialized_hash_t3.c = cte_t4.c
+     AND materialized_hash_t3.d = cte_t4.d
+    WHERE materialized_hash_t3.c IS NULL;
+}
+expect {
+}
+
 # regression test: ORDER BY cannot be satisfied by a deeper join loop when the
 # earlier loop can emit duplicate prefixes for the consumed order terms
 @cross-check-integrity
@@ -217,6 +436,41 @@ test test-spill-hash-join-rows {
 expect {
     aaaa|abcd
     aaaa|abcd
+}
+
+@cross-check-integrity
+test hash-join-offset-continues-with-the-next-match {
+    CREATE TABLE offset_hash_left(id INTEGER PRIMARY KEY, key INTEGER);
+    CREATE TABLE offset_hash_right(id INTEGER PRIMARY KEY, key INTEGER);
+    INSERT INTO offset_hash_left SELECT value, value % 20 FROM generate_series(1, 200);
+    INSERT INTO offset_hash_right SELECT value, value % 20 FROM generate_series(1, 220);
+    SELECT count(*) FROM (
+        SELECT offset_hash_left.id, offset_hash_right.id
+        FROM offset_hash_left
+        JOIN offset_hash_right ON offset_hash_left.key = offset_hash_right.key
+        LIMIT 50 OFFSET 500
+    );
+}
+expect {
+    50
+}
+
+@cross-check-integrity
+test hash-left-join-offset-skips-unmatched-rows {
+    CREATE TABLE offset_unmatched_left(x INTEGER);
+    CREATE TABLE offset_unmatched_right(x INTEGER);
+    INSERT INTO offset_unmatched_left
+        VALUES (1), (2), (3), (4), (5), (6), (7), (8), (9), (10);
+    SELECT count(*) FROM (
+        SELECT offset_unmatched_left.x, offset_unmatched_right.x
+        FROM offset_unmatched_left
+        LEFT JOIN offset_unmatched_right
+            ON offset_unmatched_right.x = offset_unmatched_left.x
+        LIMIT 1 OFFSET 1
+    );
+}
+expect {
+    1
 }
 
 @cross-check-integrity
@@ -475,7 +729,6 @@ expect {
     3|3
 }
 
-@skip-if sqlite "sqlite supports full outer joins"
 @cross-check-integrity
 test full-outer-join {
 	create table t(a);
@@ -484,7 +737,337 @@ test full-outer-join {
 	insert into u values (2), (3);
 	select coalesce(t.a, u.a) as a from t full outer join u using(a) order by a;
 }
-expect error {
+expect {
+    1
+    2
+    3
+}
+
+# SQLite plans the unmatched-right pass with WHERE terms that can be used at
+# that point. The second read of r must use r_b instead of scanning all rows.
+@cross-check-integrity
+test right-join-plans-unmatched-rows-with-safe-where-term {
+    CREATE TABLE right_plan_left(a INTEGER);
+    CREATE TABLE right_plan_right(a INTEGER, b INTEGER);
+    CREATE INDEX right_plan_b ON right_plan_right(b);
+    EXPLAIN QUERY PLAN
+    SELECT right_plan_left.a, right_plan_right.a, right_plan_right.b
+    FROM right_plan_left
+    RIGHT JOIN right_plan_right
+        ON right_plan_left.a=right_plan_right.a
+    WHERE right_plan_right.b=5;
+}
+expect pattern {
+    (?s)RIGHT-JOIN right_plan_right.*SEARCH right_plan_right USING INDEX right_plan_b \(b=\?\)
+}
+
+# An ON term decides whether rows match. It must not remove rows from the
+# unmatched-right read, even when it can use an index in the main loop.
+test right-join-does-not-plan-unmatched-rows-with-on-term {
+    CREATE TABLE right_on_left(a INTEGER);
+    CREATE TABLE right_on_right(a INTEGER, b INTEGER);
+    CREATE INDEX right_on_b ON right_on_right(b);
+    EXPLAIN QUERY PLAN
+    SELECT *
+    FROM right_on_left
+    RIGHT JOIN right_on_right
+        ON right_on_left.a=right_on_right.a AND right_on_right.b=5;
+}
+expect pattern {
+    (?s)RIGHT-JOIN right_on_right.*SCAN right_on_right
+}
+
+# A later table is not ready when SQLite plans this unmatched-right read.
+# A WHERE term that needs that table cannot supply the search key.
+test right-join-does-not-plan-unmatched-rows-with-later-table {
+    CREATE TABLE right_later_left(a INTEGER);
+    CREATE TABLE right_later_right(a INTEGER, b INTEGER);
+    CREATE TABLE right_later_last(b INTEGER);
+    CREATE INDEX right_later_b ON right_later_right(b);
+    CREATE INDEX right_later_last_b ON right_later_last(b);
+    EXPLAIN QUERY PLAN
+    SELECT *
+    FROM right_later_left
+    RIGHT JOIN right_later_right
+        ON right_later_left.a=right_later_right.a
+    CROSS JOIN right_later_last
+    WHERE right_later_right.b=right_later_last.b;
+}
+expect pattern {
+    (?s)RIGHT-JOIN right_later_right.*SCAN right_later_right
+}
+
+# SQLite does not apply WHERE terms to the unmatched read of a table that is
+# left of a later RIGHT JOIN. That later join can still replace the row.
+test chained-right-join-does-not-constrain-first-unmatched-read {
+    CREATE TABLE right_chain_a(id INTEGER);
+    CREATE TABLE right_chain_b(id INTEGER, x INTEGER);
+    CREATE TABLE right_chain_c(id INTEGER);
+    CREATE INDEX right_chain_b_x ON right_chain_b(x);
+    EXPLAIN QUERY PLAN
+    SELECT *
+    FROM right_chain_a
+    RIGHT JOIN right_chain_b ON right_chain_a.id=right_chain_b.id
+    RIGHT JOIN right_chain_c ON right_chain_b.id=right_chain_c.id
+    WHERE right_chain_b.x IS NULL;
+}
+expect pattern {
+    (?s)RIGHT-JOIN right_chain_b.*SCAN right_chain_b.*RIGHT-JOIN right_chain_c.*SCAN right_chain_c
+}
+
+# SQLite can use an `IN` term to drive the unmatched-right index read.
+test right-join-plans-unmatched-rows-with-in-search {
+    CREATE TABLE right_in_left(a INTEGER);
+    CREATE TABLE right_in_right(a INTEGER, b INTEGER);
+    CREATE INDEX right_in_b ON right_in_right(b);
+    EXPLAIN QUERY PLAN
+    SELECT *
+    FROM right_in_left
+    RIGHT JOIN right_in_right ON right_in_left.a=right_in_right.a
+    WHERE right_in_right.b IN (5, 7);
+}
+expect pattern {
+    (?s)RIGHT-JOIN right_in_right.*SEARCH right_in_right USING INDEX right_in_b \(b=\?\)
+}
+
+@cross-check-integrity
+test right-join-in-search-emits-unmatched-rows {
+    CREATE TABLE right_in_rows_left(a INTEGER);
+    CREATE TABLE right_in_rows_right(a INTEGER, b INTEGER);
+    CREATE INDEX right_in_rows_b ON right_in_rows_right(b);
+    INSERT INTO right_in_rows_left VALUES(1), (2);
+    INSERT INTO right_in_rows_right VALUES(1,5), (2,6), (3,7), (4,8);
+    SELECT right_in_rows_left.a, right_in_rows_right.a, right_in_rows_right.b
+    FROM right_in_rows_left
+    RIGHT JOIN right_in_rows_right
+        ON right_in_rows_left.a=right_in_rows_right.a
+    WHERE right_in_rows_right.b IN (5, 7)
+    ORDER BY right_in_rows_right.a;
+}
+expect {
+    1|1|5
+    |3|7
+}
+
+# A rowid equality can reduce the unmatched pass to one table lookup.
+test right-join-plans-unmatched-rows-with-rowid-search {
+    CREATE TABLE right_rowid_left(a INTEGER);
+    CREATE TABLE right_rowid_right(a INTEGER, b INTEGER);
+    EXPLAIN QUERY PLAN
+    SELECT *
+    FROM right_rowid_left
+    RIGHT JOIN right_rowid_right
+        ON right_rowid_left.a=right_rowid_right.a
+    WHERE right_rowid_right.rowid=2;
+}
+expect pattern {
+    (?s)RIGHT-JOIN right_rowid_right.*SEARCH right_rowid_right USING INTEGER PRIMARY KEY \(rowid=\?\)
+}
+
+@cross-check-integrity
+test right-join-rowid-search-emits-unmatched-row {
+    CREATE TABLE right_rowid_rows_left(a INTEGER);
+    CREATE TABLE right_rowid_rows_right(a INTEGER, b INTEGER);
+    INSERT INTO right_rowid_rows_left VALUES(1);
+    INSERT INTO right_rowid_rows_right VALUES(1,5), (2,6), (3,7);
+    SELECT right_rowid_rows_left.a, right_rowid_rows_right.a
+    FROM right_rowid_rows_left
+    RIGHT JOIN right_rowid_rows_right
+        ON right_rowid_rows_left.a=right_rowid_rows_right.a
+    WHERE right_rowid_rows_right.rowid=2;
+}
+expect {
+    |2
+}
+
+# SQLite permits the normal range planner in the unmatched-right read.
+test right-join-plans-unmatched-rows-with-range-search {
+    CREATE TABLE right_range_left(a INTEGER);
+    CREATE TABLE right_range_right(a INTEGER, b INTEGER);
+    CREATE INDEX right_range_b ON right_range_right(b);
+    EXPLAIN QUERY PLAN
+    SELECT *
+    FROM right_range_left
+    RIGHT JOIN right_range_right ON right_range_left.a=right_range_right.a
+    WHERE right_range_right.b>=5 AND right_range_right.b<9;
+}
+expect pattern {
+    (?s)RIGHT-JOIN right_range_right.*SEARCH right_range_right USING INDEX right_range_b \(b
+}
+
+# A safe WHERE term can prove the predicate of a partial index. The main join
+# cannot use that index, but SQLite can use it for the unmatched-right read.
+test right-join-plans-unmatched-rows-with-partial-index {
+    CREATE TABLE right_partial_left(a INTEGER);
+    CREATE TABLE right_partial_right(a INTEGER, b INTEGER);
+    CREATE INDEX right_partial_b5 ON right_partial_right(b) WHERE b=5;
+    EXPLAIN QUERY PLAN
+    SELECT *
+    FROM right_partial_left
+    RIGHT JOIN right_partial_right ON right_partial_left.a=right_partial_right.a
+    WHERE right_partial_right.b=5;
+}
+expect pattern {
+    (?s)RIGHT-JOIN right_partial_right.*SEARCH right_partial_right USING INDEX right_partial_b5
+}
+
+@cross-check-integrity
+test right-join-partial-index-emits-unmatched-rows {
+    CREATE TABLE right_partial_rows_left(a INTEGER);
+    CREATE TABLE right_partial_rows_right(a INTEGER, b INTEGER);
+    CREATE INDEX right_partial_rows_b5 ON right_partial_rows_right(b) WHERE b=5;
+    INSERT INTO right_partial_rows_left VALUES(1), (2);
+    INSERT INTO right_partial_rows_right VALUES(1,5), (2,6), (3,5);
+    SELECT right_partial_rows_left.a, right_partial_rows_right.a,
+           right_partial_rows_right.b
+    FROM right_partial_rows_left
+    RIGHT JOIN right_partial_rows_right
+        ON right_partial_rows_left.a=right_partial_rows_right.a
+    WHERE right_partial_rows_right.b=5
+    ORDER BY right_partial_rows_right.a;
+}
+expect {
+    1|1|5
+    |3|5
+}
+
+# The second read can use an expression index because it also reopens the
+# table cursor. Result expressions do not depend on the index cursor.
+test right-join-plans-unmatched-rows-with-expression-index {
+    CREATE TABLE right_expr_left(a INTEGER);
+    CREATE TABLE right_expr_right(a INTEGER, b INTEGER);
+    CREATE INDEX right_expr_b ON right_expr_right(b+1);
+    EXPLAIN QUERY PLAN
+    SELECT *
+    FROM right_expr_left
+    RIGHT JOIN right_expr_right ON right_expr_left.a=right_expr_right.a
+    WHERE right_expr_right.b+1=5;
+}
+expect pattern {
+    (?s)RIGHT-JOIN right_expr_right.*SEARCH right_expr_right USING INDEX right_expr_b
+}
+
+# SQLite can combine indexes for an OR term in the unmatched-right read.
+test right-join-plans-unmatched-rows-with-multi-index-or {
+    CREATE TABLE right_multi_left(a INTEGER);
+    CREATE TABLE right_multi_right(a INTEGER, b INTEGER, c INTEGER);
+    CREATE INDEX right_multi_b ON right_multi_right(b);
+    CREATE INDEX right_multi_c ON right_multi_right(c);
+    EXPLAIN QUERY PLAN
+    SELECT *
+    FROM right_multi_left
+    RIGHT JOIN right_multi_right ON right_multi_left.a=right_multi_right.a
+    WHERE right_multi_right.b=5 OR right_multi_right.c=7;
+}
+expect pattern {
+    (?s)RIGHT-JOIN right_multi_right.*MULTI-INDEX OR
+}
+
+@cross-check-integrity
+test right-join-multi-index-or-emits-each-row-once {
+    CREATE TABLE right_multi_rows_left(a INTEGER);
+    CREATE TABLE right_multi_rows_right(a INTEGER, b INTEGER, c INTEGER);
+    CREATE INDEX right_multi_rows_b ON right_multi_rows_right(b);
+    CREATE INDEX right_multi_rows_c ON right_multi_rows_right(c);
+    INSERT INTO right_multi_rows_left VALUES(1), (2);
+    INSERT INTO right_multi_rows_right VALUES
+        (1,5,0), (2,0,7), (3,5,7), (4,0,0);
+    SELECT right_multi_rows_left.a, right_multi_rows_right.a,
+           right_multi_rows_right.b, right_multi_rows_right.c
+    FROM right_multi_rows_left
+    RIGHT JOIN right_multi_rows_right
+        ON right_multi_rows_left.a=right_multi_rows_right.a
+    WHERE right_multi_rows_right.b=5 OR right_multi_rows_right.c=7
+    ORDER BY right_multi_rows_right.a;
+}
+expect {
+    1|1|5|0
+    2|2|0|7
+    |3|5|7
+}
+
+# SQLite does not build an automatic index for the unmatched-right read.
+test right-join-does-not-build-auto-index-for-unmatched-rows {
+    CREATE TABLE right_auto_left(a INTEGER);
+    CREATE TABLE right_auto_right(a INTEGER, b INTEGER);
+    EXPLAIN QUERY PLAN
+    SELECT *
+    FROM right_auto_left
+    RIGHT JOIN right_auto_right ON right_auto_left.a=right_auto_right.a
+    WHERE right_auto_right.b=5;
+}
+expect pattern {
+    (?s)RIGHT-JOIN right_auto_right.*SCAN right_auto_right
+}
+
+# An explicit index choice also applies to the unmatched-right read.
+test right-join-indexed-by-applies-to-unmatched-rows {
+    CREATE TABLE right_forced_left(a INTEGER);
+    CREATE TABLE right_forced_right(a INTEGER, b INTEGER);
+    CREATE INDEX right_forced_b ON right_forced_right(b);
+    EXPLAIN QUERY PLAN
+    SELECT *
+    FROM right_forced_left
+    RIGHT JOIN right_forced_right INDEXED BY right_forced_b
+        ON right_forced_left.a=right_forced_right.a
+    WHERE right_forced_right.b=5;
+}
+expect pattern {
+    (?s)RIGHT-JOIN right_forced_right.*SEARCH right_forced_right USING INDEX right_forced_b
+}
+
+# NOT INDEXED must also apply to the unmatched-right read.
+test right-join-not-indexed-applies-to-unmatched-rows {
+    CREATE TABLE right_no_index_left(a INTEGER);
+    CREATE TABLE right_no_index_right(a INTEGER, b INTEGER);
+    CREATE INDEX right_no_index_b ON right_no_index_right(b);
+    EXPLAIN QUERY PLAN
+    SELECT *
+    FROM right_no_index_left
+    RIGHT JOIN right_no_index_right NOT INDEXED
+        ON right_no_index_left.a=right_no_index_right.a
+    WHERE right_no_index_right.b=5;
+}
+expect pattern {
+    (?s)RIGHT-JOIN right_no_index_right.*SCAN right_no_index_right
+}
+
+# RIGHT chooses the second table's USING value. A later FULL JOIN keeps that
+# value even when its storage class differs from the third table's value.
+@cross-check-integrity
+test right-then-full-using-keeps-right-value {
+    CREATE TABLE right_using_first(id INTEGER);
+    CREATE TABLE right_using_second(id TEXT);
+    CREATE TABLE right_using_third(id INTEGER);
+    INSERT INTO right_using_second VALUES('01');
+    INSERT INTO right_using_third VALUES(1);
+    SELECT quote(id), typeof(id), id=1, id='1',
+           right_using_first.id, right_using_second.id, right_using_third.id
+    FROM right_using_first
+    RIGHT JOIN right_using_second USING(id)
+    FULL JOIN right_using_third USING(id);
+}
+expect {
+    '01'|text|0|0||01|1
+}
+
+# The generated USING merge gets its collation from the first source. A user
+# coalesce() call keeps the normal function collation rules.
+@skip-if sqlite "SQLite 3.50.4 does not apply the left collation to a merged USING column"
+@cross-check-integrity
+test full-using-merge-does-not-change-user-coalesce-collation {
+    CREATE TABLE full_collate_left(id TEXT COLLATE NOCASE);
+    CREATE TABLE full_collate_right(id TEXT);
+    INSERT INTO full_collate_right VALUES('a');
+    SELECT id='A',
+           coalesce(full_collate_left.id, full_collate_right.id)='A',
+           id,
+           typeof(id)
+    FROM full_collate_left
+    FULL JOIN full_collate_right USING(id);
+}
+expect {
+    1|0|a|text
 }
 
 # Regression test for LEFT JOIN + materialized subquery bug
@@ -623,6 +1206,26 @@ expect {
     200
 }
 
+# The first hash join removes its build table from the loop.
+# Its other ON term must run when the probe reads the hash payload.
+@cross-check-integrity
+test materialized-hash-join-keeps-inner-on-filter {
+    CREATE TABLE h_orders(order_id INTEGER PRIMARY KEY, name TEXT, amount INTEGER);
+    CREATE TABLE h_items(item_id INTEGER PRIMARY KEY, name TEXT, product TEXT, quantity INTEGER);
+    CREATE TABLE h_returns(return_id INTEGER PRIMARY KEY, name TEXT, reason TEXT);
+    INSERT INTO h_orders VALUES (1, 'a', 100), (2, 'b', 1);
+    INSERT INTO h_items VALUES (1, 'a', 'x', 50), (2, 'b', 'y', 2);
+    INSERT INTO h_returns VALUES (1, 'a', 'ra'), (2, 'b', 'rb');
+    SELECT h.order_id, i.product, r.reason
+    FROM h_orders AS h
+    JOIN h_items AS i ON h.name = i.name AND h.amount < i.quantity
+    JOIN h_returns AS r ON h.name = r.name
+    ORDER BY h.order_id;
+}
+expect {
+    2|y|rb
+}
+
 # Regression test for materialized hash joins dropping build-side LEFT JOIN ON predicates.
 @cross-check-integrity
 test left-hash-join-materialized-prefix-keeps-build-side-on-const {
@@ -666,6 +1269,27 @@ expect {
     1|1|1
     2|2|-1
     3|3|3
+}
+
+# Keep the selected build rows and their values when an IN seek feeds a hash join.
+@cross-check-integrity
+test hash-build-keeps-in-seek-rows-and-values {
+    CREATE TABLE requested(id INTEGER PRIMARY KEY, limit_value INTEGER);
+    CREATE TABLE allowed(id INTEGER PRIMARY KEY);
+    CREATE TABLE events(requested_id INTEGER, amount INTEGER, active INTEGER);
+    INSERT INTO requested VALUES (1, 10), (2, 20), (3, 30);
+    INSERT INTO allowed VALUES (1), (3);
+    INSERT INTO events VALUES (1, 4, 1), (1, 7, 0), (2, 8, 1), (3, 5, 1), (3, 6, 1);
+    SELECT requested.id, requested.limit_value, coalesce(sum(events.amount), 0)
+    FROM requested
+    LEFT JOIN events ON events.requested_id = requested.id AND events.active = 1
+    WHERE requested.id IN (SELECT id FROM allowed)
+    GROUP BY requested.id
+    ORDER BY requested.id;
+}
+expect {
+    1|10|4
+    3|30|11
 }
 
 # The second hash join builds a3 after an earlier hash join reads a2. The a2
@@ -748,4 +1372,384 @@ test join-3-4-2 {
 }
 expect error {
     cannot join using column d - column not present in both tables
+}
+
+@skip-if sqlite "Turso can replace the reversed primary-key lookup with a hash join"
+test indexed-build-hashes-an-unfiltered-large-probe {
+    CREATE TABLE indexed_hash_parent(id INTEGER PRIMARY KEY, selected INTEGER);
+    CREATE TABLE indexed_hash_child(parent_id INTEGER, payload INTEGER);
+    ANALYZE;
+    DELETE FROM sqlite_stat1;
+    INSERT INTO sqlite_stat1(tbl, idx, stat) VALUES
+        ('indexed_hash_parent', NULL, '200000'),
+        ('indexed_hash_child', NULL, '6000000');
+    ANALYZE sqlite_schema;
+
+    EXPLAIN QUERY PLAN
+    SELECT count(*)
+    FROM indexed_hash_parent AS parent
+    JOIN indexed_hash_child AS child ON child.parent_id = parent.id
+    WHERE parent.selected = 1;
+}
+expect pattern {
+    (?s)HASH JOIN indexed_hash_child AS child.*SCAN indexed_hash_parent AS parent
+}
+
+@skip-if sqlite "Turso compares correlated subqueries with grouped joins"
+test group-sort-cost-keeps-cheaper-correlated-seeks {
+    CREATE TABLE sort_cost_parent(id INTEGER PRIMARY KEY, selected INTEGER);
+    CREATE TABLE sort_cost_filter(id INTEGER PRIMARY KEY, selected INTEGER);
+    CREATE TABLE sort_cost_child(
+        parent_id INTEGER,
+        filter_id INTEGER,
+        value INTEGER,
+        PRIMARY KEY(parent_id, filter_id)
+    );
+    ANALYZE;
+    DELETE FROM sqlite_stat1;
+    INSERT INTO sqlite_stat1(tbl, idx, stat) VALUES
+        ('sort_cost_parent', NULL, '85000'),
+        ('sort_cost_filter', NULL, '100'),
+        ('sort_cost_child', NULL, '800000'),
+        ('sort_cost_child', 'sqlite_autoindex_sort_cost_child_1', '800000 4 1');
+    ANALYZE sqlite_schema;
+
+    EXPLAIN QUERY PLAN
+    SELECT parent.id
+    FROM sort_cost_parent AS parent
+    WHERE parent.selected = 1
+      AND 0 = (
+          SELECT min(child.value)
+          FROM sort_cost_child AS child
+          JOIN sort_cost_filter AS kept ON kept.id = child.filter_id
+          WHERE child.parent_id = parent.id AND kept.selected = 1
+      );
+}
+expect pattern {
+    (?s)CORRELATED SCALAR SUBQUERY.*SEARCH child USING INDEX sqlite_autoindex_sort_cost_child_1 \(parent_id=\?\)
+}
+
+@skip-if sqlite "Turso can use a hash join when an index cannot seek by the join column"
+test index-suffix-does-not-prevent-hash-join {
+    CREATE TABLE suffix_hash_parent(id INTEGER PRIMARY KEY, selected INTEGER);
+    CREATE TABLE suffix_hash_child(
+        group_id INTEGER,
+        parent_id INTEGER,
+        payload INTEGER,
+        PRIMARY KEY(group_id, parent_id)
+    );
+    ANALYZE;
+    DELETE FROM sqlite_stat1;
+    INSERT INTO sqlite_stat1(tbl, idx, stat) VALUES
+        ('suffix_hash_parent', NULL, '1000'),
+        ('suffix_hash_child', NULL, '5000000'),
+        ('suffix_hash_child', 'sqlite_autoindex_suffix_hash_child_1', '5000000 5000 1');
+    ANALYZE sqlite_schema;
+
+    EXPLAIN QUERY PLAN
+    SELECT count(*)
+    FROM suffix_hash_parent AS parent
+    JOIN suffix_hash_child AS child ON child.parent_id = parent.id
+    WHERE parent.selected = 1;
+}
+expect pattern {
+    (?s)HASH JOIN suffix_hash_child AS child.*SCAN suffix_hash_parent AS parent
+}
+
+test index-suffix-join-keeps-null-and-duplicate-rows {
+    CREATE TABLE suffix_result_parent(id INTEGER PRIMARY KEY, selected INTEGER);
+    CREATE TABLE suffix_result_child(
+        group_id INTEGER,
+        parent_id INTEGER,
+        payload INTEGER,
+        PRIMARY KEY(group_id, parent_id)
+    );
+    INSERT INTO suffix_result_parent VALUES (1, 1), (2, 1), (3, 0), (4, 1);
+    INSERT INTO suffix_result_child VALUES
+        (10, 1, 7), (20, 1, 8), (30, 2, 9), (40, NULL, 10), (NULL, 1, 11);
+    ANALYZE;
+    DELETE FROM sqlite_stat1;
+    INSERT INTO sqlite_stat1(tbl, idx, stat) VALUES
+        ('suffix_result_parent', NULL, '1000'),
+        ('suffix_result_child', NULL, '5000000'),
+        ('suffix_result_child', 'sqlite_autoindex_suffix_result_child_1', '5000000 5000 1');
+    ANALYZE sqlite_schema;
+
+    SELECT parent.id, child.group_id, child.payload
+    FROM suffix_result_parent AS parent
+    LEFT JOIN suffix_result_child AS child ON child.parent_id = parent.id
+    WHERE parent.selected = 1
+    ORDER BY parent.id, child.group_id, child.payload;
+}
+expect {
+    1||11
+    1|10|7
+    1|20|8
+    2|30|9
+    4||
+}
+
+@skip-if sqlite "Turso can use a hash join when the current join prefix cannot seek an index"
+test future-table-cannot-make-index-usable {
+    CREATE TABLE future_index_parent(id INTEGER PRIMARY KEY, selected INTEGER);
+    CREATE TABLE future_index_group(id INTEGER PRIMARY KEY);
+    CREATE TABLE future_index_child(
+        group_id INTEGER,
+        parent_id INTEGER,
+        PRIMARY KEY(group_id, parent_id)
+    );
+    ANALYZE;
+    DELETE FROM sqlite_stat1;
+    INSERT INTO sqlite_stat1(tbl, idx, stat) VALUES
+        ('future_index_parent', NULL, '1000'),
+        ('future_index_group', NULL, '1000000'),
+        ('future_index_child', NULL, '5000000'),
+        ('future_index_child', 'sqlite_autoindex_future_index_child_1', '5000000 5000 1');
+    ANALYZE sqlite_schema;
+
+    EXPLAIN QUERY PLAN
+    SELECT count(*)
+    FROM future_index_parent AS parent
+    CROSS JOIN future_index_child AS child ON child.parent_id = parent.id
+    CROSS JOIN future_index_group AS group_table ON child.group_id = group_table.id
+    WHERE parent.selected = 1;
+}
+expect pattern {
+    (?s)HASH JOIN future_index_child AS child.*SEARCH group_table USING INTEGER PRIMARY KEY.*SCAN future_index_parent AS parent
+}
+
+test future-table-index-does-not-change-join-results {
+    CREATE TABLE future_result_parent(id INTEGER PRIMARY KEY, selected INTEGER);
+    CREATE TABLE future_result_group(id INTEGER PRIMARY KEY);
+    CREATE TABLE future_result_child(
+        group_id INTEGER,
+        parent_id INTEGER,
+        PRIMARY KEY(group_id, parent_id)
+    );
+    INSERT INTO future_result_parent VALUES (1, 1), (2, 1), (3, 0);
+    INSERT INTO future_result_group VALUES (10), (30);
+    INSERT INTO future_result_child VALUES
+        (10, 1), (20, 1), (10, 2), (30, 2), (NULL, 1);
+    ANALYZE;
+    DELETE FROM sqlite_stat1;
+    INSERT INTO sqlite_stat1(tbl, idx, stat) VALUES
+        ('future_result_parent', NULL, '1000'),
+        ('future_result_group', NULL, '1000000'),
+        ('future_result_child', NULL, '5000000'),
+        ('future_result_child', 'sqlite_autoindex_future_result_child_1', '5000000 5000 1');
+    ANALYZE sqlite_schema;
+
+    SELECT parent.id, child.group_id, group_table.id
+    FROM future_result_parent AS parent
+    CROSS JOIN future_result_child AS child ON child.parent_id = parent.id
+    CROSS JOIN future_result_group AS group_table ON child.group_id = group_table.id
+    WHERE parent.selected = 1
+    ORDER BY parent.id, child.group_id, group_table.id;
+}
+expect {
+    1|10|10
+    2|10|10
+    2|30|30
+}
+
+setup hash-index-prefix-rows {
+    CREATE TABLE prefix_parent(id INTEGER PRIMARY KEY, selected INTEGER);
+    CREATE TABLE prefix_child(group_id INTEGER, parent_id INTEGER, payload INTEGER,
+        PRIMARY KEY(group_id, parent_id));
+    CREATE INDEX prefix_child_positive
+        ON prefix_child(group_id, parent_id) WHERE payload > 0;
+    INSERT INTO prefix_parent VALUES (1, 1), (2, 1), (3, 1), (4, 0);
+    INSERT INTO prefix_child VALUES
+        (10, 1, -1), (20, 1, 9), (30, 2, 8), (40, 3, -5), (50, NULL, 6);
+    ANALYZE;
+    DELETE FROM sqlite_stat1;
+    INSERT INTO sqlite_stat1(tbl, idx, stat) VALUES
+        ('prefix_parent', NULL, '1000'),
+        ('prefix_child', NULL, '5000000'),
+        ('prefix_child', 'sqlite_autoindex_prefix_child_1', '5000000 5000 1'),
+        ('prefix_child', 'prefix_child_positive', '5000000 5000 1');
+    ANALYZE sqlite_schema;
+}
+
+@setup hash-index-prefix-rows
+@skip-if sqlite "SQLite does not have a hash join plan"
+test range-prefix-still-allows-hash-join {
+    EXPLAIN QUERY PLAN
+    SELECT parent.id, child.group_id, child.payload
+    FROM prefix_parent AS parent
+    LEFT JOIN prefix_child AS child
+      ON child.parent_id = parent.id AND child.group_id > 15 AND child.payload >= 8
+    WHERE parent.selected = 1;
+}
+expect pattern {
+    HASH JOIN prefix_child AS child
+}
+
+@setup hash-index-prefix-rows
+@skip-if sqlite "SQLite does not have a hash join plan"
+test equality-prefix-keeps-index-search {
+    EXPLAIN QUERY PLAN
+    SELECT count(*)
+    FROM prefix_parent AS parent
+    LEFT JOIN prefix_child AS child
+      ON child.parent_id = parent.id AND child.group_id = 10
+    WHERE parent.selected = 1;
+}
+expect pattern {
+    SEARCH child USING COVERING INDEX sqlite_autoindex_prefix_child_1 \(group_id=\? AND parent_id=\?\)
+}
+
+@setup hash-index-prefix-rows
+@var join_type { JOIN | LEFT JOIN }
+@var first_column { child.group_id > 15 | child.group_id IN (10, 20) | child.group_id = 10 | child.payload > 0 }
+matrix index-prefix-join-results {
+    SELECT parent.id, child.group_id, child.payload
+    FROM prefix_parent AS parent
+    $join_type prefix_child AS child
+      ON child.parent_id = parent.id AND $first_column
+    WHERE parent.selected = 1
+    ORDER BY parent.id, child.group_id, child.payload;
+}
+
+@skip-if sqlite "Turso reports hash join estimates in its JSON plan"
+test unique-composite-hash-key-uses-one-key-estimate {
+    CREATE TABLE composite_hash_parent(first INTEGER, second INTEGER, selected INTEGER);
+    CREATE UNIQUE INDEX composite_hash_parent_key
+        ON composite_hash_parent(first, second);
+    CREATE TABLE composite_hash_child(first INTEGER, second INTEGER);
+    ANALYZE;
+    DELETE FROM sqlite_stat1;
+    INSERT INTO sqlite_stat1(tbl, idx, stat) VALUES
+        ('composite_hash_parent', NULL, '1000'),
+        ('composite_hash_parent', 'composite_hash_parent_key', '1000 10 1'),
+        ('composite_hash_child', NULL, '5000');
+    ANALYZE sqlite_schema;
+
+    EXPLAIN QUERY PLAN FORMAT=JSON
+    SELECT count(*)
+    FROM composite_hash_parent AS parent
+    JOIN composite_hash_child AS child
+      ON child.first = parent.first AND child.second = parent.second
+    WHERE parent.selected = 1;
+}
+expect pattern {
+    (?s)"detail":"HASH JOIN composite_hash_child AS child".*"rows_per_input":5
+}
+
+@skip-if sqlite "Turso reports hash join estimates in its JSON plan"
+test unique-hash-key-does-not-apply-to-a-different-collation {
+    CREATE TABLE collation_unique_build(key TEXT UNIQUE);
+    CREATE TABLE collation_unique_probe(key TEXT);
+    INSERT INTO collation_unique_build VALUES
+        ('aaa'), ('aaA'), ('aAa'), ('aAA'),
+        ('Aaa'), ('AaA'), ('AAa'), ('AAA');
+    INSERT INTO collation_unique_probe VALUES ('aaa');
+    ANALYZE;
+
+    EXPLAIN QUERY PLAN FORMAT=JSON
+    SELECT count(*)
+    FROM collation_unique_build
+    CROSS JOIN collation_unique_probe
+      ON collation_unique_probe.key COLLATE NOCASE = collation_unique_build.key;
+}
+expect pattern {
+    (?s)"detail":"HASH JOIN collation_unique_probe".*"rows_per_input":0.1
+}
+
+@skip-if sqlite "Turso reports hash join estimates in its JSON plan"
+test hash-join-cost-includes-rows-visited {
+    CREATE TABLE hash_cost_left(key INTEGER);
+    CREATE TABLE hash_cost_right(key INTEGER);
+
+    EXPLAIN QUERY PLAN FORMAT=JSON
+    SELECT count(*)
+    FROM hash_cost_left
+    JOIN hash_cost_right ON hash_cost_left.key = hash_cost_right.key;
+}
+expect pattern {
+    (?s)"detail":"HASH JOIN hash_cost_right".*"access_cost":300110000
+}
+
+@skip-if sqlite "Turso reports its selected plan in JSON"
+test hash-build-row-limit-counts-prefix-rows {
+    CREATE TABLE prefix_row_limit_outer(value INTEGER);
+    CREATE TABLE prefix_row_limit_build(value INTEGER, key INTEGER);
+    CREATE INDEX prefix_row_limit_build_value
+        ON prefix_row_limit_build(value);
+    CREATE TABLE prefix_row_limit_probe(key INTEGER);
+
+    EXPLAIN QUERY PLAN FORMAT=JSON
+    SELECT count(*)
+    FROM prefix_row_limit_outer AS outer_rows
+    CROSS JOIN prefix_row_limit_build AS build_rows
+      ON build_rows.value = outer_rows.value
+    CROSS JOIN prefix_row_limit_probe AS probe_rows
+      ON build_rows.key = probe_rows.key;
+}
+expect pattern {
+    "detail":"SEARCH probe_rows USING COVERING INDEX ephemeral_prefix_row_limit_probe_t3
+}
+
+@skip-if sqlite "Turso uses its own join cost model"
+test no-stats-hash-join-keeps-unindexed-probe-fanout {
+    CREATE TABLE a(id INTEGER PRIMARY KEY, b_id INTEGER, chosen INTEGER);
+    CREATE TABLE b(id INTEGER PRIMARY KEY, c_key INTEGER);
+    CREATE TABLE c(c_key INTEGER, d_id INTEGER);
+    CREATE TABLE d(id INTEGER PRIMARY KEY);
+
+    EXPLAIN QUERY PLAN FORMAT=JSON
+    SELECT count(*)
+    FROM a
+    CROSS JOIN b ON b.id = a.b_id
+    CROSS JOIN c ON c.c_key = b.c_key
+    CROSS JOIN d ON d.id = c.d_id
+    WHERE a.chosen = 1;
+}
+expect pattern {
+    (?s)"detail":"HASH JOIN c".*"rows_per_input":100000.*"detail":"SEARCH d USING INTEGER PRIMARY KEY
+}
+
+@skip-if sqlite "Turso uses its own join cost model"
+test partial-stats-hash-join-uses-known-unique-key-count {
+    CREATE TABLE a(id INTEGER PRIMARY KEY, b_id INTEGER, chosen INTEGER);
+    CREATE TABLE b(id INTEGER PRIMARY KEY, c_key INTEGER);
+    CREATE UNIQUE INDEX b_c_key ON b(c_key);
+    CREATE TABLE c(c_key INTEGER, d_id INTEGER);
+    CREATE TABLE d(id INTEGER PRIMARY KEY);
+    ANALYZE;
+    DELETE FROM sqlite_stat1;
+    INSERT INTO sqlite_stat1(tbl, idx, stat) VALUES
+        ('b', NULL, '1000'),
+        ('b', 'b_c_key', '1000 1'),
+        ('c', NULL, '5000');
+    ANALYZE sqlite_schema;
+
+    EXPLAIN QUERY PLAN FORMAT=JSON
+    SELECT count(*)
+    FROM a
+    CROSS JOIN b ON b.id = a.b_id
+    CROSS JOIN c ON c.c_key = b.c_key
+    CROSS JOIN d ON d.id = c.d_id
+    WHERE a.chosen = 1;
+}
+expect pattern {
+    (?s)"detail":"HASH JOIN c".*"rows_per_input":5.*"detail":"SEARCH d USING INTEGER PRIMARY KEY
+}
+
+@skip-if sqlite "Turso can materialize a hash build input"
+test materialized-hash-build-keeps-index-search {
+    CREATE TABLE selected_hash_build(id INTEGER PRIMARY KEY, key INTEGER, selected INTEGER);
+    CREATE INDEX selected_hash_build_selected
+        ON selected_hash_build(selected);
+    CREATE TABLE selected_hash_probe(key INTEGER);
+
+    EXPLAIN QUERY PLAN FORMAT=JSON
+    SELECT count(*)
+    FROM selected_hash_build AS build_rows
+    JOIN selected_hash_probe AS probe_rows
+      ON build_rows.key = probe_rows.key
+    WHERE build_rows.selected = 1;
+}
+expect pattern {
+    (?s)"detail":"MATERIALIZE hash build input for selected_hash_build AS build_rows".*"detail":"SEARCH build_rows USING INDEX selected_hash_build_selected.*"detail":"HASH JOIN selected_hash_probe AS probe_rows"
 }

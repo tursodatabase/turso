@@ -2548,7 +2548,6 @@ impl<'expr> ExprLowerer<'_, 'expr, '_> {
                             &operation.normalized_name,
                             operation.sequence.value(),
                             target,
-                            Some(start_reg),
                         )?;
                     }
                     hir::SequenceOperationKind::SetValue => {
@@ -2973,6 +2972,7 @@ impl ExprLowerer<'_, '_, '_> {
             self.program.emit_insn(Insn::HaltIfNull {
                 target_reg: value,
                 err_code: SQLITE_CONSTRAINT_NOTNULL,
+                on_error: None,
                 description: description.clone(),
             });
         }
@@ -3763,6 +3763,7 @@ impl ExprLowerer<'_, '_, '_> {
             self.program.preassign_label_to_next_insn(null_next_label);
             self.program.emit_insn(Insn::Next {
                 cursor_id: cursor,
+                is_index: self.program.cursor_is_index(cursor),
                 pc_if_next: null_loop_label,
                 fullscan: false,
             });

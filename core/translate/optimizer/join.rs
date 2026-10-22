@@ -1630,13 +1630,6 @@ fn hir_try_hash_join_access_method(
                 .map_or(params.sel_eq_unindexed, |constraint| constraint.selectivity)
         })
         .product::<f64>();
-    let cost = estimate_hash_join_cost(
-        build_cardinality,
-        probe_cardinality,
-        crate::vdbe::hash_table::DEFAULT_MEM_BUDGET,
-        probe_multiplier,
-        params,
-    );
     let rows_per_build_row = probe_cardinality * join_selectivity;
     let estimated_rows_per_outer_row = match hash_join_type {
         HashJoinType::Inner => rows_per_build_row,
@@ -1645,6 +1638,15 @@ fn hir_try_hash_join_access_method(
             .max(1.0)
             .max(probe_cardinality / build_cardinality.max(1.0)),
     };
+    let cost = estimate_hash_join_cost(
+        build_cardinality,
+        probe_cardinality,
+        build_cardinality * estimated_rows_per_outer_row * probe_multiplier,
+        hash_join_type,
+        crate::vdbe::hash_table::DEFAULT_MEM_BUDGET,
+        probe_multiplier,
+        params,
+    );
     Some(AccessMethod {
         cost,
         estimated_rows_per_outer_row,
@@ -1881,9 +1883,15 @@ fn hir_hash_join_candidate(
         // probe scan runs once. Between such plans, the tie-breaker prefers
         // the one whose build includes earlier tables.
         let tie_breaker = prior_mask.iter().min().unwrap_or(0) as f64 * 1.0e-6;
+        let join_type = match &method.params {
+            AccessMethodParams::HashJoin { join_type, .. } => *join_type,
+            _ => unreachable!("a hash join access method"),
+        };
         method.cost = estimate_hash_join_cost(
             estimated_filtered_rows,
             probe_cardinality,
+            estimated_filtered_rows * method.estimated_rows_per_outer_row,
+            join_type,
             crate::vdbe::hash_table::DEFAULT_MEM_BUDGET,
             1.0,
             params,
@@ -2289,6 +2297,26 @@ mod tests {
     };
 
     #[test]
+    fn hash_join_cost_includes_probe_scan() {
+        let params = &DEFAULT_PARAMS;
+        let cost = estimate_hash_join_cost(
+            100.0,
+            1_000.0,
+            250.0,
+            HashJoinType::Inner,
+            usize::MAX,
+            1.0,
+            params,
+        );
+        let expected = 100.0 * (params.hash_cpu_cost + params.hash_insert_cost)
+            + 1_000.0 / params.rows_per_table_page
+            + 1_000.0 * params.cpu_cost_per_row
+            + 1_000.0 * (params.hash_cpu_cost + params.hash_lookup_cost)
+            + 250.0 * params.cpu_cost_per_row;
+        assert!((cost.0 - expected).abs() < f64::EPSILON);
+    }
+
+    #[test]
     fn hir_group_predicate_owner_is_ready_only_when_current_leaf_completes_group() -> Result<()> {
         let sources = (0..3)
             .map(|id| {
@@ -2691,8 +2719,11 @@ mod tests {
             c.ty,
             None,
             ColDef {
-                primary_key: false,
-                rowid_alias: c.is_rowid_alias,
+                flags: if c.is_rowid_alias {
+                    crate::schema::ColDefFlags::RowIdAlias
+                } else {
+                    crate::schema::ColDefFlags::empty()
+                },
                 ..Default::default()
             },
         )

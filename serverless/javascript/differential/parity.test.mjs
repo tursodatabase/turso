@@ -89,6 +89,34 @@ function typeTag(v) {
 // Cell value comparison with float epsilon and buffer equality
 // ---------------------------------------------------------------------------
 
+/** Build the statement objects passed to `batch()` for a param_batch op. */
+function batchStatements(op) {
+  return op.stmts.map(stmt => {
+    if (stmt.insert) return { sql: `INSERT INTO ${stmt.insert} VALUES (?, ?)`, args: stmt.values };
+    if (stmt.select) return { sql: `SELECT a, b FROM ${stmt.select}` };
+    return { sql: stmt.errorSql };
+  });
+}
+
+/** Normalize one per-statement ResultSet of a batch() call (raw row mode)
+ * into the comparison shape, or null for a statement that did not
+ * complete. The server-side statistics are excluded: the serverless
+ * driver reports them and the embedded driver does not, by design. */
+function normalizeBatchResultSet(rs) {
+  if (rs == null) return null;
+  const rows = (rs.rows ?? []).map(row => Array.from(row));
+  return {
+    success: true,
+    columnCount: (rs.columns ?? []).length,
+    columnNames: rs.columns ?? [],
+    rowCount: rows.length,
+    valueTypes: rows.map(row => row.map(typeTag)),
+    values: rows,
+    affectedRows: rs.rowsAffected,
+    lastInsertRowid: rs.lastInsertRowid ?? undefined,
+  };
+}
+
 function cellsEqual(a, b) {
   if (a === null || a === undefined) return b === null || b === undefined;
   if (b === null || b === undefined) return false;
@@ -351,6 +379,19 @@ function _buildOpArb(opSpec) {
     ).map(([goodOp, badSql, recoveryOp]) => ({ kind: id, goodOp, badSql, recoveryOp }));
   }
 
+  // Parameterized batch: 1-4 statements through the batch() API
+  if (fields.stmts === 'batch_stmts') {
+    const arbBatchStmt = fc.oneof(
+      fc.tuple(arbTableName, arbValue, arbValue).map(([t, a, b]) => ({ insert: t, values: [a, b] })),
+      arbTableName.map(t => ({ select: t })),
+      fc.constantFrom(..._SPEC.constants.error_sqls).map(sql => ({ errorSql: sql })),
+    );
+    return fc.tuple(
+      fc.array(arbBatchStmt, { minLength: 1, maxLength: 4 }),
+      fc.constantFrom(undefined, 'deferred', 'immediate'),
+    ).map(([stmts, mode]) => ({ kind: id, stmts, mode }));
+  }
+
   // Fallback: constant
   return fc.constant({ kind: id });
 }
@@ -474,6 +515,18 @@ async function executeOpLocal(db, op) {
       return { success: true, lastInsertRowid: rowid };
     } catch {
       return { success: false };
+    }
+  }
+  if (op.kind === 'param_batch') {
+    try {
+      const results = await db.batch(batchStatements(op), { mode: op.mode, raw: true });
+      return { success: true, batchResults: results.map(normalizeBatchResultSet) };
+    } catch (e) {
+      return {
+        success: false,
+        batchIndex: e.batchIndex,
+        batchResults: (e.batchResults ?? []).map(normalizeBatchResultSet),
+      };
     }
   }
   if (op.kind === 'batch') {
@@ -605,6 +658,16 @@ function applyPrefix(op, prefix) {
     // into a table this test case may have created).
     op.sql = op.sql.replaceAll('{prefix}', String(prefix)).replace(re, repl);
   }
+  if (op.stmts) {
+    op.stmts = op.stmts.map(stmt => ({
+      ...stmt,
+      ...(stmt.insert ? { insert: stmt.insert.replace(re, repl) } : {}),
+      ...(stmt.select ? { select: stmt.select.replace(re, repl) } : {}),
+      ...(stmt.errorSql
+        ? { errorSql: stmt.errorSql.replaceAll('{prefix}', String(prefix)).replace(re, repl) }
+        : {}),
+    }));
+  }
   if (op.innerOps) op.innerOps = op.innerOps.map(o => applyPrefix(o, prefix));
   if (op.goodOp) op.goodOp = applyPrefix(op.goodOp, prefix);
   if (op.recoveryOp) op.recoveryOp = applyPrefix(op.recoveryOp, prefix);
@@ -663,6 +726,52 @@ testFn('api parity: local vs remote produce identical results', async (t) => {
                 `    remote: ok=${remoteResult.success} cols=${remoteResult.columnCount} rows=${remoteResult.rowCount}`
               );
               const traceDump = `\n\nFull trace (prefix=${prefix}):\n${trace.join('\n')}`;
+
+              // Parameterized batch: compare the whole per-statement
+              // outcome — every completed statement's result, and on
+              // failure the failing index and the partial results.
+              if (op.kind === 'param_batch') {
+                try {
+                  if (localResult.success !== remoteResult.success) {
+                    throw new Error(
+                      `success mismatch on op #${i} ${JSON.stringify(op)}\n` +
+                      `  local:  ${JSON.stringify(localResult)}\n` +
+                      `  remote: ${JSON.stringify(remoteResult)}`
+                    );
+                  }
+                  const local = localResult.batchResults ?? [];
+                  const remote = remoteResult.batchResults ?? [];
+                  if (local.length !== remote.length) {
+                    throw new Error(
+                      `batchResults length mismatch on op #${i} ${JSON.stringify(op)}\n` +
+                      `  local:  ${JSON.stringify(localResult)}\n` +
+                      `  remote: ${JSON.stringify(remoteResult)}`
+                    );
+                  }
+                  if (!localResult.success && localResult.batchIndex !== remoteResult.batchIndex) {
+                    throw new Error(
+                      `batchIndex mismatch on op #${i} ${JSON.stringify(op)}\n` +
+                      `  local:  ${JSON.stringify(localResult)}\n` +
+                      `  remote: ${JSON.stringify(remoteResult)}`
+                    );
+                  }
+                  for (let j = 0; j < local.length; j++) {
+                    if ((local[j] === null) !== (remote[j] === null)) {
+                      throw new Error(
+                        `statement ${j} completion mismatch on op #${i} ${JSON.stringify(op)}\n` +
+                        `  local:  ${JSON.stringify(localResult)}\n` +
+                        `  remote: ${JSON.stringify(remoteResult)}`
+                      );
+                    }
+                    if (local[j] !== null) {
+                      compareResults(local[j], remote[j], `${i} statement ${j}`, op);
+                    }
+                  }
+                } catch (e) {
+                  throw new Error(e.message + traceDump);
+                }
+                continue;
+              }
 
               // ErrorCheck only compares success/failure -- error messages legitimately differ.
               if (op.kind === 'error_check') {

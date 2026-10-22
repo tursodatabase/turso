@@ -12,11 +12,7 @@ use crate::{
 };
 use turso_parser::ast::{self, SortOrder};
 
-use super::{
-    access_method::AccessMethod,
-    cost::{is_unique_point_lookup, IndexInfo},
-    join::JoinN,
-};
+use super::{access_method::AccessMethod, cost::index_access_is_unique_point_lookup, join::JoinN};
 
 /// Target component in an ORDER BY/GROUP BY that may be a plain column or an expression.
 #[derive(Debug, PartialEq, Clone)]
@@ -302,12 +298,8 @@ fn access_method_emits_unique_order_prefix(
     if order_consumption.includes_rowid {
         return true;
     }
-    // Otherwise the only safe claim is a point lookup: a UNIQUE index with
-    // every column pinned by plain `=` returns at most one row. Anything
-    // weaker can emit duplicate prefixes: an `IS` equality matches NULL keys
-    // (a UNIQUE index stores any number of NULL keys), and counting
-    // equality-pinned columns together with consumed ORDER BY terms counts
-    // the same column twice when the ORDER BY mentions the equality column.
+    // A complete lookup on a UNIQUE index also returns at most one row.
+    // Each key column must use `=`. `IS` can match many NULL entries.
     match &access_method.params {
         AccessMethodParams::BTreeTable {
             index,
@@ -315,35 +307,17 @@ fn access_method_emits_unique_order_prefix(
             constraint_refs,
             ..
         } => {
-            !*build_index
-                && is_unique_point_lookup(index_info_for_access(index.as_deref()), constraint_refs)
+            !*build_index && index_access_is_unique_point_lookup(index.as_deref(), constraint_refs)
         }
         AccessMethodParams::MaterializedSubquery {
             index,
             constraint_refs,
             ..
-        } => is_unique_point_lookup(index_info_for_access(Some(index.as_ref())), constraint_refs),
+        } => index_access_is_unique_point_lookup(Some(index.as_ref()), constraint_refs),
         AccessMethodParams::Subquery { .. }
         | AccessMethodParams::HashJoin { .. }
         | AccessMethodParams::VirtualTable { .. }
         | AccessMethodParams::InSeek { .. } => false,
-    }
-}
-
-fn index_info_for_access(index: Option<&Index>) -> IndexInfo {
-    match index {
-        Some(index) => IndexInfo {
-            unique: index.unique,
-            column_count: index.columns.len(),
-            covering: false,
-            rows_per_leaf_page: 0.0, // unused here — only unique/column_count matter
-        },
-        None => IndexInfo {
-            unique: true,
-            column_count: 1,
-            covering: false,
-            rows_per_leaf_page: 0.0, // unused here — only unique/column_count matter
-        },
     }
 }
 
@@ -428,6 +402,8 @@ trait OrderedSource<I, E> {
     /// Whether column `col_no` has a custom type. Such a column stores
     /// encoded blobs, whose byte order is not the type's order.
     fn column_has_custom_type(&self, col_no: usize, schema: &Schema) -> bool;
+    /// Whether column `col_no` may hold NULL. False for a NOT NULL column.
+    fn column_can_be_null(&self, col_no: usize) -> bool;
     fn expressions_match(&self, target: E, indexed: E) -> bool;
 }
 
@@ -476,6 +452,13 @@ impl<'a> OrderedSource<hir::SourceId, &'a hir::Expr> for HirOrderSource<'a> {
         })
     }
 
+    fn column_can_be_null(&self, col_no: usize) -> bool {
+        self.table()
+            .columns()
+            .get(col_no)
+            .is_none_or(|column| !column.notnull())
+    }
+
     fn expressions_match(&self, target: &'a hir::Expr, indexed: &'a hir::Expr) -> bool {
         target.equivalent(indexed)
     }
@@ -493,6 +476,10 @@ impl<'a> OrderedSource<hir::SourceId, &'a hir::Expr> for SubqueryOrderSource {
 
     fn column_has_custom_type(&self, _col_no: usize, _schema: &Schema) -> bool {
         false
+    }
+
+    fn column_can_be_null(&self, _col_no: usize) -> bool {
+        true
     }
 
     fn expressions_match(&self, _target: &'a hir::Expr, _indexed: &'a hir::Expr) -> bool {
@@ -775,6 +762,7 @@ where
             break;
         }
         if !order_target.is_extremum()
+            && target_can_be_null(target_col, source)
             && target_col.effective_nulls_order() != idx_col.nulls_order(iter_dir)
         {
             break;
@@ -803,6 +791,19 @@ where
     OrderConsumption {
         consumed: col_idx,
         includes_rowid,
+    }
+}
+
+/// Whether an order term may be NULL, so that its NULLS placement must
+/// match the index's. A rowid and a NOT NULL column never are.
+fn target_can_be_null<I, E>(
+    target_col: &ColumnOrder<I, E>,
+    source: &impl OrderedSource<I, E>,
+) -> bool {
+    match target_col.target {
+        ColumnTarget::RowId => false,
+        ColumnTarget::Column(col_no) => source.column_can_be_null(col_no),
+        ColumnTarget::Expr(_) => true,
     }
 }
 

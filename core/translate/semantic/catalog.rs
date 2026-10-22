@@ -27,28 +27,13 @@ pub(crate) struct SemanticCatalog {
 }
 
 impl SemanticCatalog {
-    /// This catalog with the main database's schema replaced by `schema`.
-    pub(crate) fn with_main_schema(&self, schema: Arc<Schema>) -> Self {
-        let mut databases = self.databases.clone();
-        for database in &mut databases {
-            if database.id.index() == MAIN_DB_ID {
-                database.schema = schema.clone();
-            }
-        }
-        Self {
-            databases,
-            unqualified_database_search_path: self.unqualified_database_search_path.clone(),
-            has_temp_database: self.has_temp_database,
-            search_path_configured: self.search_path_configured,
-        }
-    }
-
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn capture(
         main_schema: Arc<Schema>,
         database_schemas: &RwLock<HashMap<usize, Arc<Schema>>>,
         temp_database: &RwLock<Option<TempDatabase>>,
         attached_databases: &RwLock<DatabaseCatalog>,
+        namespaces: &crate::Namespaces,
         custom_types_enabled: bool,
         dialect: &dyn Dialect,
         configured_search_path: Option<&[String]>,
@@ -64,14 +49,13 @@ impl SemanticCatalog {
         let mut attached = {
             let catalog = attached_databases.read();
             catalog
-                .name_to_index
+                .index_to_data
                 .iter()
-                .map(|(name, database)| {
-                    let (database_handle, _) = catalog
-                        .index_to_data
-                        .get(database)
-                        .expect("attached database name must have matching catalog data");
-                    (*database, name.clone(), database_handle.clone())
+                .map(|(database, attached)| {
+                    let name = namespaces
+                        .name(*database)
+                        .expect("attached database must have a namespace");
+                    (*database, name, attached.db.clone())
                 })
                 .collect::<Vec<_>>()
         };
@@ -158,6 +142,7 @@ mod tests {
             &database_schemas,
             &temp_database,
             &attached_databases,
+            &crate::Namespaces::default(),
             true,
             &SqliteDialect,
             None,

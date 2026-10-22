@@ -254,21 +254,27 @@ pub struct ProgramBuilder {
     pub trigger_conflict_override: Option<ResolveType>,
     /// Counter for subquery numbering in EXPLAIN QUERY PLAN output.
     next_subquery_eqp_id: usize,
+    /// Whether the schema this program was translated against has any
+    /// materialized views at all, set once by `epilogue()`. A schema change
+    /// bumps the schema cookie, which forces a reprepare (see
+    /// `PreparedProgram::has_materialized_views`), so this can't go stale
+    /// while the built program runs.
+    has_materialized_views: bool,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 #[repr(transparent)]
-pub struct ProgramBuilderFlags(u8);
+pub struct ProgramBuilderFlags(u16);
 
 impl ProgramBuilderFlags {
-    const ROLLBACK: u8 = 1 << 0;
-    const IS_MULTI_WRITE: u8 = 1 << 1;
-    const MAY_ABORT: u8 = 1 << 2;
-    const READONLY: u8 = 1 << 3;
-    const IS_SUBPROGRAM: u8 = 1 << 4;
-    const HAS_STATEMENT_CONFLICT: u8 = 1 << 5;
-    const SUPPRESS_CUSTOM_TYPE_DECODE: u8 = 1 << 6;
-    const SUPPRESS_COLUMN_DEFAULT: u8 = 1 << 7;
+    const ROLLBACK: u16 = 1 << 0;
+    const IS_MULTI_WRITE: u16 = 1 << 1;
+    const MAY_ABORT: u16 = 1 << 2;
+    const READONLY: u16 = 1 << 3;
+    const IS_SUBPROGRAM: u16 = 1 << 4;
+    const HAS_STATEMENT_CONFLICT: u16 = 1 << 5;
+    const SUPPRESS_CUSTOM_TYPE_DECODE: u16 = 1 << 6;
+    const SUPPRESS_COLUMN_DEFAULT: u16 = 1 << 7;
 
     const fn new(is_subprogram: bool) -> Self {
         let mut new = Self(0);
@@ -282,12 +288,12 @@ impl ProgramBuilderFlags {
     }
 
     #[inline]
-    const fn get(self, bit: u8) -> bool {
+    const fn get(self, bit: u16) -> bool {
         (self.0 & bit) != 0
     }
 
     #[inline]
-    const fn set(&mut self, bit: u8, value: bool) {
+    const fn set(&mut self, bit: u16, value: bool) {
         if value {
             self.0 |= bit;
         } else {
@@ -353,6 +359,9 @@ impl ProgramBuilderFlags {
     }
 
     #[inline]
+    pub fn has_statement_conflict(self) -> bool {
+        self.get(Self::HAS_STATEMENT_CONFLICT)
+    }
     pub fn set_has_statement_conflict(&mut self, v: bool) {
         self.set(Self::HAS_STATEMENT_CONFLICT, v)
     }
@@ -408,6 +417,13 @@ pub enum CursorType {
         Arc<BTreeTable>,
         Arc<crate::sync::Mutex<crate::incremental::view::IncrementalView>>,
     ),
+    /// Read-only cursor over the transaction's captured delta for one base
+    /// table of a materialized view. Rows are the base columns plus a
+    /// trailing weight column; opened by maintenance programs at commit time.
+    ViewDelta {
+        view_name: String,
+        table: Arc<BTreeTable>,
+    },
 }
 
 impl CursorType {
@@ -513,7 +529,7 @@ impl ProgramBuilderOpts {
 
 /// Use this macro to emit an OP_Explain instruction.
 /// Please use this macro instead of calling emit_explain() directly,
-/// because we want to avoid building the [EqpDetail] if we are not in explain mode.
+/// because we want to avoid building the `EqpDetail` if we are not in explain mode.
 #[macro_export]
 macro_rules! emit_explain {
     ($builder:expr, $push:expr, $detail:expr) => {
@@ -524,6 +540,23 @@ macro_rules! emit_explain {
 }
 
 impl ProgramBuilder {
+    /// Register a parameter as written in the statement, so its index and
+    /// name are known before any expression that reads it is lowered.
+    pub fn register_variable(&mut self, variable: &ast::Variable) -> NonZeroUsize {
+        let index = usize::try_from(variable.index.get())
+            .expect("u32 variable index must fit into usize")
+            .try_into()
+            .expect("variable index must be non-zero");
+        if let Some(name) = variable.name.as_deref() {
+            self.parameters.push_named_at(name, index);
+        } else if variable.numbered {
+            self.parameters.push_numbered(index);
+        } else {
+            self.parameters.push_index(index);
+        }
+        index
+    }
+
     /// Register a parameter whose index and spelling were fixed before
     /// bytecode lowering.
     pub fn register_parameter(
@@ -547,13 +580,25 @@ impl ProgramBuilder {
         capture_data_changes_info: Option<CaptureDataChangesInfo>,
         opts: ProgramBuilderOpts,
     ) -> Self {
-        ProgramBuilder::_new(query_mode, capture_data_changes_info, opts, None, false)
+        ProgramBuilder::_new(
+            query_mode,
+            capture_data_changes_info,
+            opts,
+            None,
+            false,
+            false,
+        )
     }
+    /// Create a ProgramBuilder for a trigger subprogram. `mvcc_enabled` must match the
+    /// parent program's `is_mvcc_enabled()`: a trigger runs inside the same transaction
+    /// as its parent statement, so code emitted for it (e.g. CDC change id allocation)
+    /// must take the same MVCC-aware or MVCC-unaware path the parent takes.
     pub fn new_for_trigger(
         query_mode: QueryMode,
         capture_data_changes_info: Option<CaptureDataChangesInfo>,
         opts: ProgramBuilderOpts,
         trigger: Arc<Trigger>,
+        mvcc_enabled: bool,
     ) -> Self {
         ProgramBuilder::_new(
             query_mode,
@@ -561,25 +606,41 @@ impl ProgramBuilder {
             opts,
             Some(trigger),
             true,
+            mvcc_enabled,
         )
     }
     /// Create a ProgramBuilder for a subprogram (FK actions, etc.) that runs within
     /// an existing transaction and doesn't emit Transaction instructions.
+    ///
+    /// `mvcc_enabled` must match the parent program's `is_mvcc_enabled()`: the
+    /// subprogram runs inside the same transaction as its parent statement, so code
+    /// emitted for it (e.g. CDC change id allocation) must take the same MVCC-aware
+    /// or MVCC-unaware path the parent takes.
     pub fn new_for_subprogram(
         query_mode: QueryMode,
         capture_data_changes_info: Option<CaptureDataChangesInfo>,
         opts: ProgramBuilderOpts,
+        mvcc_enabled: bool,
     ) -> Self {
-        ProgramBuilder::_new(query_mode, capture_data_changes_info, opts, None, true)
+        ProgramBuilder::_new(
+            query_mode,
+            capture_data_changes_info,
+            opts,
+            None,
+            true,
+            mvcc_enabled,
+        )
     }
 
     #[turso_macros::trace_stack]
+    #[allow(clippy::too_many_arguments)]
     fn _new(
         query_mode: QueryMode,
         capture_data_changes_info: Option<CaptureDataChangesInfo>,
         opts: ProgramBuilderOpts,
         trigger: Option<Arc<Trigger>>,
         is_subprogram: bool,
+        mvcc_enabled: bool,
     ) -> Self {
         Self {
             next_free_register: 1,
@@ -600,7 +661,7 @@ impl ProgramBuilder {
             init_label: BranchOffset::Placeholder,
             start_offset: BranchOffset::Placeholder,
             capture_data_changes_info,
-            mvcc_enabled: false,
+            mvcc_enabled,
             txn_mode: TransactionMode::None,
             write_databases: BitSet::default(),
             read_databases: BitSet::default(),
@@ -626,6 +687,7 @@ impl ProgramBuilder {
             expression_registers: Vec::new(),
             materialized_ctes: HashMap::default(),
             next_subquery_eqp_id: 1,
+            has_materialized_views: false,
         }
     }
 
@@ -655,6 +717,21 @@ impl ProgramBuilder {
 
     pub const fn set_resolve_type(&mut self, resolve_type: ResolveType) {
         self.resolve_type = resolve_type;
+    }
+
+    /// The resolve type a constraint Halt must carry for a constraint whose
+    /// effective conflict resolution is `effective`. A statement's own OR
+    /// clause is applied through the program's resolve_type, except in a
+    /// trigger: its program holds every trigger step, each with its own OR
+    /// clause, so each Halt carries its step's resolve type, as in SQLite.
+    pub fn constraint_halt_on_error(&self, effective: ResolveType) -> Option<ResolveType> {
+        if self.flags.has_statement_conflict() && self.trigger.is_none() {
+            return None;
+        }
+        match effective {
+            ResolveType::Fail | ResolveType::Rollback => Some(effective),
+            _ => None,
+        }
     }
 
     /// Set the trigger conflict override. When set, all triggers fired from this program
@@ -803,13 +880,23 @@ impl ProgramBuilder {
         &self.capture_data_changes_info
     }
 
-    /// Whether the main database uses MVCC journal mode. See [`Self::mvcc_enabled`].
+    /// Whether the main database uses MVCC journal mode. See `Self::mvcc_enabled`.
     pub const fn is_mvcc_enabled(&self) -> bool {
         self.mvcc_enabled
     }
 
     pub fn set_mvcc_enabled(&mut self, enabled: bool) {
         self.mvcc_enabled = enabled;
+    }
+
+    /// Whether this program has already emitted a call to a trigger or FK action
+    /// subprogram (an `Insn::Program`). Used to tell whether a trigger or FK action fired
+    /// during the statement, which may have captured a CDC row even when this program's own
+    /// target table was not captured (e.g. a TEMP table).
+    pub fn has_emitted_program_call(&self) -> bool {
+        self.insns
+            .iter()
+            .any(|(insn, _)| matches!(insn, Insn::Program { .. }))
     }
 
     pub fn extend(&mut self, opts: &ProgramBuilderOpts) {
@@ -1474,6 +1561,12 @@ impl ProgramBuilder {
                 } => {
                     resolve(target_pc, "NotNull")?;
                 }
+                Insn::IsType { target_pc, .. } => {
+                    resolve(target_pc, "IsType")?;
+                }
+                Insn::IfNullRow { target_pc, .. } => {
+                    resolve(target_pc, "IfNullRow")?;
+                }
                 Insn::ColumnHasField { target_pc, .. } => {
                     resolve(target_pc, "ColumnHasField")?;
                 }
@@ -1560,7 +1653,14 @@ impl ProgramBuilder {
                 Insn::NotFound { target_pc, .. } => resolve(target_pc, "NotFound")?,
                 Insn::FkIfZero { target_pc, .. } => resolve(target_pc, "FkIfZero")?,
                 Insn::Filter { target_pc, .. } => resolve(target_pc, "Filter")?,
-                Insn::HashProbe { target_pc, .. } => resolve(target_pc, "HashProbe")?,
+                Insn::HashProbe {
+                    target_pc,
+                    deferred_target_pc,
+                    ..
+                } => {
+                    resolve(target_pc, "HashProbe")?;
+                    resolve(deferred_target_pc, "HashProbe")?;
+                }
                 Insn::HashNext { target_pc, .. } => resolve(target_pc, "HashNext")?,
                 Insn::HashDistinct { data } => resolve(&mut data.target_pc, "HashDistinct")?,
                 Insn::HashScanUnmatched { target_pc, .. } => {
@@ -1661,7 +1761,7 @@ impl ProgramBuilder {
         }
     }
 
-    /// Tries to mirror: https://github.com/sqlite/sqlite/blob/e77e589a35862f6ac9c4141cfd1beb2844b84c61/src/build.c#L5379
+    /// Tries to mirror: <https://github.com/sqlite/sqlite/blob/e77e589a35862f6ac9c4141cfd1beb2844b84c61/src/build.c#L5379>
     pub fn begin_write_operation(&mut self) -> Result<(), alloc::TryReserveError> {
         self.txn_mode = TransactionMode::Write;
         self.write_databases.set(crate::MAIN_DB_ID)
@@ -1718,6 +1818,7 @@ impl ProgramBuilder {
     /// Note that although these are the final instructions, typically an SQLite
     /// query will jump to the Transaction instruction via init_label.
     pub fn epilogue(&mut self, schema: &Schema) {
+        self.has_materialized_views = !schema.table_to_materialized_views.is_empty();
         if self.flags.is_subprogram() {
             // Subprograms (triggers, FK actions) just emit Halt without Transaction
             let description = if self.trigger.is_some() {
@@ -1784,7 +1885,11 @@ impl ProgramBuilder {
     }
 
     #[inline]
-    pub fn cursor_loop(&mut self, cursor_id: CursorID, f: impl Fn(&mut ProgramBuilder, usize)) {
+    pub fn cursor_loop<R>(
+        &mut self,
+        cursor_id: CursorID,
+        f: impl FnOnce(&mut ProgramBuilder, usize) -> R,
+    ) -> R {
         let loop_start = self.allocate_label();
         let loop_end = self.allocate_label();
 
@@ -1806,14 +1911,26 @@ impl ProgramBuilder {
             target_pc: loop_end,
         });
 
-        f(self, rowid);
+        let result = f(self, rowid);
 
         self.emit_insn(Insn::Next {
             cursor_id,
             pc_if_next: loop_start,
             fullscan: false,
+            is_index: false,
         });
         self.preassign_label_to_next_insn(loop_end);
+        result
+    }
+
+    /// Whether `cursor_id` reads an index rather than a table.
+    pub fn cursor_is_index(&self, cursor_id: CursorID) -> bool {
+        matches!(
+            self.cursor_ref
+                .get(cursor_id)
+                .map(|(_, cursor_type)| cursor_type),
+            Some(CursorType::BTreeIndex(_))
+        )
     }
 
     pub fn emit_column_or_rowid(&mut self, cursor_id: CursorID, column: usize, out: usize) {
@@ -1841,7 +1958,9 @@ impl ProgramBuilder {
 
     /// Emit a ColumnHasField instruction that jumps to `target_pc` if the
     /// cursor's record has a field at the given logical column index.
-    /// Falls through if the record is short (ALTER TABLE ADD COLUMN).
+    /// Also jumps on a NULL row (the unmatched side of a LEFT JOIN), so the
+    /// column stays NULL. Falls through if the record is short (ALTER TABLE
+    /// ADD COLUMN).
     pub fn emit_column_has_field(
         &mut self,
         cursor_id: CursorID,
@@ -1862,6 +1981,9 @@ impl ProgramBuilder {
 
     /// Emit an Affinity instruction for a single register with the given column affinity.
     pub fn emit_column_affinity(&mut self, register: usize, affinity: Affinity) {
+        if matches!(affinity, Affinity::Blob | Affinity::None) {
+            return;
+        }
         self.emit_insn(Insn::Affinity {
             start_reg: register,
             count: NonZeroUsize::MIN,
@@ -1958,6 +2080,26 @@ impl ProgramBuilder {
     ) -> crate::Result<PreparedProgram> {
         self.resolve_labels()?;
 
+        // Fill in the is_index field on Next and Prev, now that we know all cursor types
+        for (insn, _) in self.insns.iter_mut() {
+            if let Insn::Next {
+                cursor_id,
+                is_index,
+                ..
+            }
+            | Insn::Prev {
+                cursor_id,
+                is_index,
+                ..
+            } = insn
+            {
+                *is_index = self
+                    .cursor_ref
+                    .get(*cursor_id)
+                    .is_some_and(|(_, cursor_type)| cursor_type.is_index());
+            }
+        }
+
         self.parameters.list.dedup();
 
         // Mirrors SQLite's: usesStmtJournal = isMultiWrite && mayAbort
@@ -1979,11 +2121,17 @@ impl ProgramBuilder {
             readonly: self.flags.readonly(),
             resolved_result_columns: self.resolved_result_columns,
             sql: sql.to_string(),
+            refreshes_analyze_stats: sql
+                .trim_start()
+                .as_bytes()
+                .get(..7)
+                .is_some_and(|head| head.eq_ignore_ascii_case(b"ANALYZE")),
             needs_stmt_subtransactions: crate::Arc::new(crate::AtomicBool::new(
                 needs_stmt_subtransactions,
             )),
             trigger: self.trigger.take(),
             is_subprogram: self.flags.is_subprogram(),
+            has_materialized_views: self.has_materialized_views,
             resolve_type: self.resolve_type,
             prepare_context,
             write_databases: self.write_databases,

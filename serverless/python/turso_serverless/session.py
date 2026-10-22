@@ -316,6 +316,20 @@ class Session:
             raise decoder.step_error
         return decoder.result
 
+    def execute_batch(self, steps: list[dict]) -> dict:
+        """Execute a batch request on the pipeline endpoint (section 6.2)
+        and return its raw result: `step_results` and `step_errors` arrays
+        with one entry per step. Step failures are reported in those
+        arrays, not raised here."""
+        results = self.execute_pipeline([{"type": "batch", "batch": {"steps": steps}}])
+        result = results[0]
+        if result.get("type") == "error":
+            raise _server_error(result.get("error"))
+        response = result.get("response") or {}
+        if response.get("type") != "batch" or not isinstance(response.get("result"), dict):
+            raise ProtocolError(f"expected batch result in pipeline response, got {response}")
+        return response["result"]
+
     def close(self) -> None:
         """Close the stream (section 6.8). Errors are ignored: the stream
         may already have expired."""

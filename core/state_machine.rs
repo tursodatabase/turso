@@ -1,3 +1,4 @@
+use crate::types::IOResultOr;
 use crate::{
     types::{IOCompletions, IOResult},
     Result,
@@ -62,7 +63,7 @@ impl<State: StateTransition> StateMachine<State> {
         }
     }
 
-    pub fn step(&mut self, context: &State::Context) -> Result<IOResult<State::SMResult>> {
+    pub fn step(&mut self, context: &State::Context) -> IOResultOr<State::SMResult> {
         loop {
             if self.is_finalized {
                 unreachable!("StateMachine::transition: state machine is finalized");

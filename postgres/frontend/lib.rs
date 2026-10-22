@@ -1,8 +1,9 @@
-mod aliases;
 mod catalog;
 mod copy;
 mod functions;
+mod options;
 mod session;
+mod unnest;
 
 pub use session::PgConnection as Connection;
 pub use session::{

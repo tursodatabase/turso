@@ -6,7 +6,7 @@ use jni::sys::{jint, jlong};
 use jni::JNIEnv;
 use std::sync::Arc;
 use turso_core::SqliteDialect;
-use turso_core::{Database, DatabaseOpts, EncryptionKey, EncryptionOpts, OpenFlags};
+use turso_core::{ConnectOpts, Database, DatabaseOpts, EncryptionKey, EncryptionOpts, OpenFlags};
 
 struct TursoDB {
     db: Arc<Database>,
@@ -207,9 +207,12 @@ pub extern "system" fn Java_tech_turso_core_TursoDB_connect0<'local>(
         None
     };
 
-    // Use connect_with_encryption to properly set up encryption context
+    // Pass the encryption key at connect time to set up the encryption context
     // before the pager reads page 1. This is required for encrypted databases.
-    let conn = match db.db.connect_with_encryption(encryption_key) {
+    let conn = match db
+        .db
+        .connect(ConnectOpts::new().with_encryption_key(encryption_key))
+    {
         Ok(conn) => conn,
         Err(e) => {
             set_err_msg_and_throw_exception(&mut env, obj, TURSO_ETC, e.to_string());
@@ -222,10 +225,15 @@ pub extern "system" fn Java_tech_turso_core_TursoDB_connect0<'local>(
 
 #[no_mangle]
 pub extern "system" fn Java_tech_turso_core_TursoDB_close0<'local>(
-    _env: JNIEnv<'local>,
-    _obj: JObject<'local>,
+    mut env: JNIEnv<'local>,
+    obj: JObject<'local>,
     db_pointer: jlong,
 ) {
+    if db_pointer == 0 {
+        let e = TursoError::InvalidDatabasePointer;
+        set_err_msg_and_throw_exception(&mut env, obj, TURSO_ETC, e.to_string());
+        return;
+    }
     TursoDB::drop(db_pointer);
 }
 

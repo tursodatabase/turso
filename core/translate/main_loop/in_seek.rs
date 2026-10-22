@@ -164,6 +164,7 @@ pub(crate) fn emit_in_seek_advance(
             cursor_id: scan_cursor,
             pc_if_next: loop_start,
             fullscan: false,
+            is_index: false,
         });
     }
     program.preassign_label_to_next_insn(state.next_value);
@@ -171,5 +172,6 @@ pub(crate) fn emit_in_seek_advance(
         cursor_id: state.source_cursor,
         pc_if_next: state.outer_loop_start,
         fullscan: false,
+        is_index: false,
     });
 }

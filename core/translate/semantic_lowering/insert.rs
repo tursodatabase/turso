@@ -652,9 +652,9 @@ fn emit_coroutine_rows(
                 .iter()
                 .map(|target| match target.column {
                     hir::TargetColumn::RowId => Affinity::Integer.aff_mask(),
-                    hir::TargetColumn::Column(column) => table.columns()[column]
-                        .affinity_with_strict(table.is_strict)
-                        .aff_mask(),
+                    hir::TargetColumn::Column(column) => {
+                        table.columns()[column].affinity().aff_mask()
+                    }
                 })
                 .collect(),
         ),
@@ -705,6 +705,7 @@ fn emit_coroutine_rows(
     program.preassign_label_to_next_insn(next);
     program.emit_insn(Insn::Next {
         cursor_id: temp,
+        is_index: program.cursor_is_index(temp),
         pc_if_next: top,
         fullscan: false,
     });
@@ -1267,6 +1268,7 @@ impl InsertRow<'_> {
                         program.emit_insn(Insn::HaltIfNull {
                             target_reg: register,
                             err_code: SQLITE_CONSTRAINT_NOTNULL,
+                            on_error: None,
                             description: format!(
                                 "{}.{}",
                                 table.name,
@@ -1452,6 +1454,7 @@ impl InsertRow<'_> {
                 program.emit_insn(Insn::HaltIfNull {
                     target_reg: new_row + position,
                     err_code: SQLITE_CONSTRAINT_NOTNULL,
+                    on_error: None,
                     description: format!(
                         "{}.{}",
                         table.name,
@@ -1601,9 +1604,7 @@ impl InsertRow<'_> {
                                 if column.pos_in_table == EXPR_INDEX_SENTINEL {
                                     Affinity::Blob.aff_mask()
                                 } else {
-                                    table.columns()[column.pos_in_table]
-                                        .affinity_with_strict(table.is_strict)
-                                        .aff_mask()
+                                    table.columns()[column.pos_in_table].affinity().aff_mask()
                                 }
                             })
                             .collect(),
@@ -1935,6 +1936,7 @@ impl InsertRow<'_> {
             _ => program.emit_insn(Insn::HaltIfNull {
                 target_reg: register,
                 err_code: SQLITE_CONSTRAINT_NOTNULL,
+                on_error: program.constraint_halt_on_error(conflict),
                 description: format!(
                     "{}.{}",
                     self.target.table.name,
@@ -2091,11 +2093,7 @@ impl InsertRow<'_> {
                 count,
                 affinities: positions
                     .iter()
-                    .map(|position| {
-                        table.columns()[*position]
-                            .affinity_with_strict(table.is_strict)
-                            .aff_mask()
-                    })
+                    .map(|position| table.columns()[*position].affinity().aff_mask())
                     .collect(),
             });
         }
@@ -2211,9 +2209,7 @@ impl InsertRow<'_> {
                             if column.pos_in_table == EXPR_INDEX_SENTINEL {
                                 Affinity::Blob.aff_mask()
                             } else {
-                                table.columns()[column.pos_in_table]
-                                    .affinity_with_strict(table.is_strict)
-                                    .aff_mask()
+                                table.columns()[column.pos_in_table].affinity().aff_mask()
                             }
                         })
                         .collect(),

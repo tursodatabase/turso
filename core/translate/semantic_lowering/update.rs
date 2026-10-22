@@ -659,6 +659,7 @@ fn emit_virtual_update(
     });
     program.emit_insn(Insn::Next {
         cursor_id: scratch,
+        is_index: program.cursor_is_index(scratch),
         pc_if_next: next,
         fullscan: false,
     });
@@ -1002,6 +1003,7 @@ fn emit_from_update(
     program.preassign_label_to_next_insn(next);
     program.emit_insn(Insn::Next {
         cursor_id: scratch,
+        is_index: program.cursor_is_index(scratch),
         pc_if_next: top,
         fullscan: false,
     });
@@ -1909,6 +1911,7 @@ impl UpdateRow<'_, '_> {
             _ => program.emit_insn(Insn::HaltIfNull {
                 target_reg: register,
                 err_code: SQLITE_CONSTRAINT_NOTNULL,
+                on_error: program.constraint_halt_on_error(conflict),
                 description: format!(
                     "{}.{}",
                     self.target.table.name,
@@ -2005,9 +2008,7 @@ impl UpdateRow<'_, '_> {
                         if column.pos_in_table == EXPR_INDEX_SENTINEL {
                             Affinity::Blob.aff_mask()
                         } else {
-                            table.columns()[column.pos_in_table]
-                                .affinity_with_strict(table.is_strict)
-                                .aff_mask()
+                            table.columns()[column.pos_in_table].affinity().aff_mask()
                         }
                     })
                     .collect(),

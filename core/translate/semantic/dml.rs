@@ -85,9 +85,7 @@ impl<'ast> Analyzer<'_, '_, 'ast> {
             return Ok(None);
         };
         let target_name = target.value().get_name();
-        if target_name == name
-            || target_name == crate::translate::pragma::TURSO_CDC_VERSION_TABLE_NAME
-        {
+        if target_name == name || target_name == crate::cdc::TURSO_CDC_VERSION_TABLE_NAME {
             return Ok(None);
         }
         let database = hir::DatabaseId::new(crate::MAIN_DB_ID);
@@ -121,7 +119,7 @@ impl<'ast> Analyzer<'_, '_, 'ast> {
         let (outgoing, incoming) = {
             let schema = self.context().schema(database)?;
             (
-                schema.resolved_fks_for_child(target.value().get_name())?,
+                schema.resolved_fks_for_child(target.value().get_name(), None)?,
                 schema.resolved_fks_referencing(target.value().get_name())?,
             )
         };

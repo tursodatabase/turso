@@ -2780,6 +2780,7 @@ fn emit_hir_deduplicated_rows(
     program.preassign_label_to_next_insn(next);
     program.emit_insn(Insn::Next {
         cursor_id: cursor,
+        is_index: program.cursor_is_index(cursor),
         pc_if_next: loop_start,
         fullscan: false,
     });
@@ -2837,6 +2838,7 @@ fn emit_hir_intersect_rows(
     program.preassign_label_to_next_insn(next);
     program.emit_insn(Insn::Next {
         cursor_id: left_cursor,
+        is_index: program.cursor_is_index(left_cursor),
         pc_if_next: loop_start,
         fullscan: false,
     });
@@ -2958,6 +2960,7 @@ fn emit_hir_compound_order_by(
     );
     program.emit_insn(Insn::Next {
         cursor_id: collection_cursor,
+        is_index: program.cursor_is_index(collection_cursor),
         pc_if_next: collection_loop,
         fullscan: false,
     });
@@ -4068,6 +4071,7 @@ fn emit_hir_ordered_aggregate_steps(
     program.truncate_expression_registers(bound);
     program.emit_insn(Insn::Next {
         cursor_id: ordered.cursor,
+        is_index: program.cursor_is_index(ordered.cursor),
         pc_if_next: row,
         fullscan: false,
     });
@@ -5036,6 +5040,7 @@ impl HirLoopNest<'_, '_> {
         program.preassign_label_to_next_insn(next);
         program.emit_insn(Insn::Next {
             cursor_id: scan,
+            is_index: program.cursor_is_index(scan),
             pc_if_next: loop_start,
             fullscan: true,
         });
@@ -5526,7 +5531,14 @@ fn emit_hir_loops_explain(
             continue;
         };
         let table = hir_eqp_table(document, planned_loop.source)?;
-        emit_explain!(program, true, EqpDetail::HashBuild { table });
+        emit_explain!(
+            program,
+            true,
+            EqpDetail::HashBuild {
+                table,
+                estimate: None
+            }
+        );
         emit_hir_loops_explain(program, document, from, inner_joins, &input.loops)?;
         program.pop_current_parent_explain();
     }
@@ -5546,6 +5558,7 @@ fn emit_hir_loops_explain(
             .is_some_and(|next| matches!(next.access, HirSourceAccess::Hash(_)));
         if probes {
             if let EqpDetail::Scan {
+                estimate: None,
                 table,
                 join,
                 subquery,
@@ -5553,6 +5566,7 @@ fn emit_hir_loops_explain(
             } = detail
             {
                 detail = EqpDetail::HashJoin {
+                    estimate: None,
                     table,
                     join,
                     subquery,
@@ -5603,6 +5617,7 @@ pub(super) fn hir_loop_explain(
         EqpSubqueryExec::Materialized
     };
     let subquery = |cte: Option<hir::CteId>, recursive| EqpDetail::Scan {
+        estimate: None,
         table: table.clone(),
         index: None,
         source: EqpRowSource::Subquery,
@@ -5628,6 +5643,7 @@ pub(super) fn hir_loop_explain(
             )));
         };
         Ok(EqpDetail::Search {
+            estimate: None,
             table: table.clone(),
             kind: EqpSearchKind::Seek,
             index: Some(EqpIndex {
@@ -5661,6 +5677,7 @@ pub(super) fn hir_loop_explain(
             };
             let search =
                 |kind, index: Option<EqpIndex>, constraints, backwards| EqpDetail::Search {
+                    estimate: None,
                     table: table.clone(),
                     kind,
                     index,
@@ -5671,6 +5688,7 @@ pub(super) fn hir_loop_explain(
                 };
             match operation {
                 HirBtreeOperation::Scan { iter_dir, index } => EqpDetail::Scan {
+                    estimate: None,
                     table: table.clone(),
                     index: index.as_ref().map(eqp_index),
                     source: EqpRowSource::BTreeTable,
@@ -5725,6 +5743,7 @@ pub(super) fn hir_loop_explain(
                 );
             }
             None => EqpDetail::Scan {
+                estimate: None,
                 table,
                 index: None,
                 source: EqpRowSource::BTreeTable,
@@ -5734,6 +5753,7 @@ pub(super) fn hir_loop_explain(
             },
         },
         HirSourceAccess::OrUnion(union) => EqpDetail::MultiIndex {
+            estimate: None,
             table,
             union: true,
             indexes: union
@@ -5746,6 +5766,7 @@ pub(super) fn hir_loop_explain(
                 .collect(),
         },
         HirSourceAccess::IndexMethod(access) => EqpDetail::IndexMethod {
+            estimate: None,
             method: access
                 .index
                 .index_method
@@ -5754,6 +5775,7 @@ pub(super) fn hir_loop_explain(
                 .unwrap_or_default(),
         },
         HirSourceAccess::Virtual(_) => EqpDetail::Scan {
+            estimate: None,
             table,
             index: None,
             source: EqpRowSource::VirtualTable,
@@ -5776,6 +5798,7 @@ pub(super) fn hir_loop_explain(
         } => subquery(Some(*cte), false),
         HirSourceAccess::RecursiveCte { cte } => subquery(Some(*cte), true),
         HirSourceAccess::RecursiveInput { .. } => EqpDetail::Scan {
+            estimate: None,
             table,
             index: None,
             source: EqpRowSource::RecursiveCteInput,
@@ -6507,6 +6530,7 @@ fn start_hir_hash_loop(
     });
     program.emit_insn(Insn::Next {
         cursor_id: build_cursor,
+        is_index: program.cursor_is_index(build_cursor),
         pc_if_next: build_loop,
         fullscan: true,
     });
@@ -6578,6 +6602,9 @@ fn start_hir_hash_loop(
         num_keys: to_u32(keys.len()),
         dest_reg: to_u32(prepared.rowid),
         target_pc: exhausted,
+        // A probe row stored for a partition on disk is neither matched
+        // nor unmatched yet: it skips the NULL row of a LEFT JOIN.
+        deferred_target_pc: next,
         payload_dest_reg: Some(to_u32(prepared.payload)),
         num_payload: to_u32(column_count),
         probe_rowid_reg: Some(to_u32(prepared.probe_rowid)),
@@ -6663,6 +6690,7 @@ fn emit_hir_hash_waiting_lookups(
         num_keys: to_u32(prepared.lookup.keys.len()),
         dest_reg: to_u32(prepared.rowid),
         target_pc: unmatched,
+        deferred_target_pc: unmatched,
         payload_dest_reg: Some(to_u32(prepared.payload)),
         num_payload: to_u32(column_count),
         probe_rowid_reg: None,
@@ -7539,7 +7567,11 @@ fn hir_materialized_table(source: &hir::Source) -> Arc<BTreeTable> {
                     .as_ref()
                     .map(|collation| *collation.value()),
                 ColDef {
-                    hidden: column.hidden,
+                    flags: if column.hidden {
+                        crate::schema::ColDefFlags::Hidden
+                    } else {
+                        crate::schema::ColDefFlags::empty()
+                    },
                     ..ColDef::default()
                 },
             )
@@ -8182,11 +8214,13 @@ pub(super) fn close_hir_btree_loop(
             match direction {
                 IterationDirection::Forwards => program.emit_insn(Insn::Next {
                     cursor_id: cursor,
+                    is_index: program.cursor_is_index(cursor),
                     pc_if_next: hir_loop.loop_start,
                     fullscan: *fullscan,
                 }),
                 IterationDirection::Backwards => program.emit_insn(Insn::Prev {
                     cursor_id: cursor,
+                    is_index: program.cursor_is_index(cursor),
                     pc_if_prev: hir_loop.loop_start,
                     fullscan: *fullscan,
                 }),

@@ -1,4 +1,5 @@
 use super::*;
+use crate::database::remove_file_from_database_registry;
 use crate::storage::database::DatabaseFile;
 use crate::sync::atomic::Ordering;
 use std::process::Command;
@@ -24,6 +25,8 @@ const MULTIPROCESS_SHM_COUNT_CHILD_TEST: &str =
     "multiprocess_tests::multiprocess_shm_count_child_process";
 const MULTIPROCESS_SHM_HOLD_READ_TX_CHILD_TEST: &str =
     "multiprocess_tests::multiprocess_shm_hold_read_tx_child_process";
+const MULTIPROCESS_SHM_DB_FILE_READER_CHILD_TEST: &str =
+    "multiprocess_tests::multiprocess_shm_db_file_reader_child_process";
 const MULTIPROCESS_SHM_SCHEMA_CHILD_TEST: &str =
     "multiprocess_tests::multiprocess_shm_schema_child_process";
 const MULTIPROCESS_SHM_INSERT_AND_CLOSE_CHILD_TEST: &str =
@@ -181,7 +184,6 @@ fn open_db_async_state_drop_clears_opening_registry_entry() {
     );
     {
         let mut manager = DATABASE_MANAGER.lock();
-        manager.clear();
         manager.insert(key.clone(), RegistryEntry::Opening);
     }
 
@@ -189,12 +191,11 @@ fn open_db_async_state_drop_clears_opening_registry_entry() {
     state.registry_key = Some(key.clone());
     drop(state);
 
-    let mut manager = DATABASE_MANAGER.lock();
+    let manager = DATABASE_MANAGER.lock();
     assert!(
         !manager.contains_key(&key),
         "dropping an incomplete async open must clear the Opening sentinel"
     );
-    manager.clear();
 }
 
 fn flip_db_header_reserved_byte(path: &std::path::Path) {
@@ -325,7 +326,7 @@ fn multiprocess_wal_rejects_journal_mode_mvcc_pragma() {
     let io: Arc<dyn IO> = multiprocess_test_io();
 
     let db = open_multiprocess_db(io, db_path_str).unwrap();
-    let conn = db.connect().unwrap();
+    let conn = db.connect(ConnectOpts::new()).unwrap();
     let err = conn
         .execute("PRAGMA journal_mode = mvcc")
         .expect_err("switching a multiprocess-coordinated database to MVCC must be rejected");
@@ -344,7 +345,7 @@ fn multiprocess_wal_rejects_opening_mvcc_database() {
 
     {
         let db = Database::open_file(io.clone(), db_path_str, Arc::new(SqliteDialect)).unwrap();
-        let conn = db.connect().unwrap();
+        let conn = db.connect(ConnectOpts::new()).unwrap();
         conn.execute("create table test(id integer primary key, value text)")
             .unwrap();
         conn.execute("PRAGMA journal_mode = mvcc").unwrap();
@@ -369,7 +370,7 @@ fn readonly_open_with_experimental_multiprocess_wal_allows_missing_coordination_
 
     {
         let db = Database::open_file(io.clone(), db_path_str, Arc::new(SqliteDialect)).unwrap();
-        let conn = db.connect().unwrap();
+        let conn = db.connect(ConnectOpts::new()).unwrap();
         conn.execute("create table test(id integer primary key, value text)")
             .unwrap();
     }
@@ -438,7 +439,7 @@ fn database_open_async_with_default_flags_allows_second_multiprocess_process() {
     let db_path_str = db_path.to_str().unwrap();
     let io: Arc<dyn IO> = multiprocess_test_io();
     let db = open_multiprocess_db_async(io, db_path_str).unwrap();
-    let conn = db.connect().unwrap();
+    let conn = db.connect(ConnectOpts::new()).unwrap();
     conn.execute("create table test(id integer primary key, value text)")
         .unwrap();
     conn.execute("insert into test(value) values ('parent')")
@@ -468,7 +469,7 @@ fn multiprocess_async_open_child_process() {
 
     let io: Arc<dyn IO> = multiprocess_test_io();
     let db = open_multiprocess_db_async(io, db_path.to_str().unwrap()).unwrap();
-    let conn = db.connect().unwrap();
+    let conn = db.connect(ConnectOpts::new()).unwrap();
     assert_eq!(count_test_rows(&conn), 1);
 }
 
@@ -517,7 +518,7 @@ fn reject_live_multiprocess_probe_uses_configured_wal_path() {
     // Parent keeps the multiprocess database open so a second (child) opener
     // flips the authority into multiprocess mode.
     let db = open_multiprocess_db(io.clone(), db_path_str).unwrap();
-    let conn = db.connect().unwrap();
+    let conn = db.connect(ConnectOpts::new()).unwrap();
     conn.execute("create table test(id integer primary key, value text)")
         .unwrap();
 
@@ -593,7 +594,7 @@ fn database_open_rebuilds_from_disk_scan_when_exclusive_shm_snapshot_is_stale() 
     let io: Arc<dyn IO> = multiprocess_test_io();
 
     let db_a = open_multiprocess_db(io.clone(), db_path_str).unwrap();
-    let conn_a = db_a.connect().unwrap();
+    let conn_a = db_a.connect(ConnectOpts::new()).unwrap();
     conn_a
         .execute("create table test(id integer primary key, value text)")
         .unwrap();
@@ -612,9 +613,7 @@ fn database_open_rebuilds_from_disk_scan_when_exclusive_shm_snapshot_is_stale() 
 
     drop(conn_a);
     drop(db_a);
-    let mut manager = DATABASE_MANAGER.lock();
-    manager.clear();
-    drop(manager);
+    remove_file_from_database_registry(db_path_str);
 
     let db_b = open_multiprocess_db(io, db_path_str).unwrap();
     assert!(
@@ -626,7 +625,7 @@ fn database_open_rebuilds_from_disk_scan_when_exclusive_shm_snapshot_is_stale() 
         "cold reopen should fall back to a WAL disk scan when tshm snapshot is stale"
     );
 
-    let conn_b = db_b.connect().unwrap();
+    let conn_b = db_b.connect(ConnectOpts::new()).unwrap();
     let rows = get_rows(&conn_b, "select id, value from test order by id");
     assert_eq!(rows.len(), 2);
     assert_eq!(rows[0][0].as_int().unwrap(), 1);
@@ -643,7 +642,7 @@ fn database_open_reuses_trusted_tshm_snapshot_without_disk_scan_when_no_backfill
     let io: Arc<dyn IO> = multiprocess_test_io();
 
     let db = open_multiprocess_db(io.clone(), db_path_str).unwrap();
-    let conn = db.connect().unwrap();
+    let conn = db.connect(ConnectOpts::new()).unwrap();
     conn.execute("create table test(id integer primary key, value text)")
         .unwrap();
     conn.execute("insert into test(value) values ('before-reopen')")
@@ -669,9 +668,7 @@ fn database_open_reuses_trusted_tshm_snapshot_without_disk_scan_when_no_backfill
 
     drop(conn);
     drop(db);
-    let mut manager = DATABASE_MANAGER.lock();
-    manager.clear();
-    drop(manager);
+    remove_file_from_database_registry(db_path_str);
 
     let reopened = open_multiprocess_db(io, db_path_str).unwrap();
     assert!(
@@ -696,7 +693,7 @@ fn database_open_reuses_trusted_tshm_snapshot_without_disk_scan_when_no_backfill
         "trusted reopen must preserve durable frame-index content"
     );
 
-    let reopened_conn = reopened.connect().unwrap();
+    let reopened_conn = reopened.connect(ConnectOpts::new()).unwrap();
     assert_eq!(count_test_rows(&reopened_conn), 2);
 }
 
@@ -710,7 +707,7 @@ fn database_open_rebuilds_from_disk_scan_after_partial_checkpoint_without_backfi
     let io: Arc<dyn IO> = multiprocess_test_io();
 
     let db = open_multiprocess_db(io.clone(), db_path_str).unwrap();
-    let conn = db.connect().unwrap();
+    let conn = db.connect(ConnectOpts::new()).unwrap();
     conn.wal_auto_actions_disable();
     conn.execute("create table test(id integer primary key, value blob)")
         .unwrap();
@@ -746,9 +743,7 @@ fn database_open_rebuilds_from_disk_scan_after_partial_checkpoint_without_backfi
 
     drop(conn);
     drop(db);
-    let mut manager = DATABASE_MANAGER.lock();
-    manager.clear();
-    drop(manager);
+    remove_file_from_database_registry(db_path_str);
 
     let reopened = open_multiprocess_db(io, db_path_str).unwrap();
     let mut expected_snapshot = snapshot_before;
@@ -770,7 +765,7 @@ fn database_open_rebuilds_from_disk_scan_after_partial_checkpoint_without_backfi
         "disk-scan reopen must preserve the WAL generation while clearing untrusted positive nbackfills"
     );
 
-    let reopened_conn = reopened.connect().unwrap();
+    let reopened_conn = reopened.connect(ConnectOpts::new()).unwrap();
     assert_eq!(
         count_test_rows(&reopened_conn),
         32,
@@ -788,7 +783,7 @@ fn database_open_rebuilds_from_disk_scan_after_wal_append_invalidates_backfill_p
     let io: Arc<dyn IO> = multiprocess_test_io();
 
     let db = open_multiprocess_db(io.clone(), db_path_str).unwrap();
-    let conn = db.connect().unwrap();
+    let conn = db.connect(ConnectOpts::new()).unwrap();
     conn.wal_auto_actions_disable();
     conn.execute("create table test(id integer primary key, value blob)")
         .unwrap();
@@ -827,9 +822,7 @@ fn database_open_rebuilds_from_disk_scan_after_wal_append_invalidates_backfill_p
 
     drop(conn);
     drop(db);
-    let mut manager = DATABASE_MANAGER.lock();
-    manager.clear();
-    drop(manager);
+    remove_file_from_database_registry(db_path_str);
 
     let reopened = open_multiprocess_db(io, db_path_str).unwrap();
     assert!(
@@ -842,7 +835,7 @@ fn database_open_rebuilds_from_disk_scan_after_wal_append_invalidates_backfill_p
         "reopen must rebuild from disk after a WAL append invalidates the tshm backfill proof"
     );
 
-    let reopened_conn = reopened.connect().unwrap();
+    let reopened_conn = reopened.connect(ConnectOpts::new()).unwrap();
     assert_eq!(
         count_test_rows(&reopened_conn),
         33,
@@ -860,7 +853,7 @@ fn database_open_rebuilds_from_disk_scan_after_db_header_mismatch_invalidates_ba
     let io: Arc<dyn IO> = multiprocess_test_io();
 
     let db = open_multiprocess_db(io.clone(), db_path_str).unwrap();
-    let conn = db.connect().unwrap();
+    let conn = db.connect(ConnectOpts::new()).unwrap();
     conn.wal_auto_actions_disable();
     conn.execute("create table test(id integer primary key, value blob)")
         .unwrap();
@@ -892,9 +885,7 @@ fn database_open_rebuilds_from_disk_scan_after_db_header_mismatch_invalidates_ba
     drop(conn);
     drop(db);
     flip_db_header_reserved_byte(&db_path);
-    let mut manager = DATABASE_MANAGER.lock();
-    manager.clear();
-    drop(manager);
+    remove_file_from_database_registry(db_path_str);
 
     let reopened = open_multiprocess_db(io, db_path_str).unwrap();
     let mut expected_snapshot = snapshot_before;
@@ -916,7 +907,7 @@ fn database_open_rebuilds_from_disk_scan_after_db_header_mismatch_invalidates_ba
         "disk-scan reopen must preserve the WAL generation while clearing untrusted positive nbackfills"
     );
 
-    let reopened_conn = reopened.connect().unwrap();
+    let reopened_conn = reopened.connect(ConnectOpts::new()).unwrap();
     assert_eq!(
         count_test_rows(&reopened_conn),
         32,
@@ -970,7 +961,7 @@ fn multiprocess_shm_insert_child_process() {
     assert_eq!(wal_file.coordination_backend_name(), "tshm");
     assert_eq!(wal_file.coordination_open_mode_name(), Some("multiprocess"));
 
-    let conn = db.connect().unwrap();
+    let conn = db.connect(ConnectOpts::new()).unwrap();
     conn.execute("insert into test(value) values ('child')")
         .unwrap();
 }
@@ -991,7 +982,7 @@ fn multiprocess_shm_insert_and_close_child_process() {
     assert_eq!(wal_file.coordination_backend_name(), "tshm");
     assert_eq!(wal_file.coordination_open_mode_name(), Some("multiprocess"));
 
-    let conn = db.connect().unwrap();
+    let conn = db.connect(ConnectOpts::new()).unwrap();
     conn.execute("insert into test(value) values ('child-close')")
         .unwrap();
     conn.close().unwrap();
@@ -1017,7 +1008,7 @@ fn multiprocess_shm_count_child_process() {
     assert_eq!(wal_file.coordination_backend_name(), "tshm");
     assert_eq!(wal_file.coordination_open_mode_name(), Some("multiprocess"));
 
-    let conn = db.connect().unwrap();
+    let conn = db.connect(ConnectOpts::new()).unwrap();
     assert_eq!(count_test_rows(&conn), expected_count);
 }
 
@@ -1058,13 +1049,47 @@ fn multiprocess_shm_hold_read_tx_child_process() {
         "child reopen path did not match expected disk-scan behavior"
     );
 
-    let conn = db.connect().unwrap();
+    let conn = db.connect(ConnectOpts::new()).unwrap();
     let pager = conn.pager.load();
     let wal = pager.wal.as_ref().unwrap();
     wal.begin_read_tx().unwrap();
     std::fs::write(&ready_file, b"ready").unwrap();
     wait_for_file(&release_file);
     wal.end_read_tx();
+}
+
+/// Opens a read transaction while the WAL is fully backfilled, so the
+/// snapshot reads the database file directly, then reports what it sees in
+/// a table it has not touched yet after the parent has changed and
+/// checkpointed that table.
+#[test]
+fn multiprocess_shm_db_file_reader_child_process() {
+    let Some(db_path) = std::env::var_os("TURSO_MULTIPROCESS_DB_PATH") else {
+        return;
+    };
+    let ready_file = std::env::var_os("TURSO_MULTIPROCESS_READY_FILE")
+        .map(std::path::PathBuf::from)
+        .unwrap();
+    let release_file = std::env::var_os("TURSO_MULTIPROCESS_RELEASE_FILE")
+        .map(std::path::PathBuf::from)
+        .unwrap();
+    let result_file = std::env::var_os("TURSO_MULTIPROCESS_RESULT_FILE")
+        .map(std::path::PathBuf::from)
+        .unwrap();
+
+    let io: Arc<dyn IO> = multiprocess_test_io();
+    let db = open_multiprocess_db(io, db_path.to_str().unwrap()).unwrap();
+    let conn = db.connect(ConnectOpts::new()).unwrap();
+    conn.execute("begin").unwrap();
+    assert_eq!(count_test_rows(&conn), 1);
+    std::fs::write(&ready_file, b"ready").unwrap();
+    wait_for_file(&release_file);
+    let rows = get_rows(&conn, "select value from other where id = 1");
+    let Value::Text(seen) = &rows[0][0] else {
+        panic!("unexpected row: {rows:?}");
+    };
+    std::fs::write(&result_file, seen.as_str()).unwrap();
+    conn.execute("commit").unwrap();
 }
 
 #[test]
@@ -1083,7 +1108,7 @@ fn multiprocess_shm_schema_child_process() {
     assert_eq!(wal_file.coordination_backend_name(), "tshm");
     assert_eq!(wal_file.coordination_open_mode_name(), Some("multiprocess"));
 
-    let conn = db.connect().unwrap();
+    let conn = db.connect(ConnectOpts::new()).unwrap();
     conn.execute("create table child_table(id integer primary key, value text)")
         .unwrap();
     conn.execute("insert into child_table(value) values ('child-schema')")
@@ -1105,7 +1130,7 @@ fn subprocess_database_open_selects_multiprocess_shm_backend() {
     assert_eq!(wal_file.coordination_backend_name(), "tshm");
     assert_eq!(wal_file.coordination_open_mode_name(), Some("exclusive"));
 
-    let conn = db.connect().unwrap();
+    let conn = db.connect(ConnectOpts::new()).unwrap();
     conn.execute("create table test(id integer primary key, value text)")
         .unwrap();
     conn.execute("insert into test(value) values ('parent')")
@@ -1158,7 +1183,7 @@ fn plain_vacuum_rejects_multiprocess_wal_database() {
         Arc::new(SqliteDialect),
     )
     .unwrap();
-    let conn = db.connect().unwrap();
+    let conn = db.connect(ConnectOpts::new()).unwrap();
     conn.execute("create table test(id integer primary key, value text)")
         .unwrap();
     conn.execute("insert into test(value) values ('parent')")
@@ -1185,7 +1210,7 @@ fn subprocess_child_close_skips_shutdown_checkpoint_in_multiprocess_wal_mode() {
     let db_path_str = db_path.to_str().unwrap();
     let io: Arc<dyn IO> = multiprocess_test_io();
     let db = open_multiprocess_db(io, db_path_str).unwrap();
-    let conn = db.connect().unwrap();
+    let conn = db.connect(ConnectOpts::new()).unwrap();
 
     conn.execute("create table test(id integer primary key, value text)")
         .unwrap();
@@ -1234,7 +1259,7 @@ fn subprocess_database_open_survives_truncate_rewrite_cycles() {
     let db_path_str = db_path.to_str().unwrap();
     let io: Arc<dyn IO> = multiprocess_test_io();
     let db = open_multiprocess_db(io, db_path_str).unwrap();
-    let conn = db.connect().unwrap();
+    let conn = db.connect(ConnectOpts::new()).unwrap();
     conn.execute("create table test(id integer primary key, value text)")
         .unwrap();
     conn.execute("insert into test(value) values ('parent-0')")
@@ -1297,7 +1322,7 @@ fn subprocess_database_open_peer_refreshes_remote_schema_without_reopen() {
     let db_path_str = db_path.to_str().unwrap();
     let io: Arc<dyn IO> = multiprocess_test_io();
     let db = open_multiprocess_db(io, db_path_str).unwrap();
-    let conn = db.connect().unwrap();
+    let conn = db.connect(ConnectOpts::new()).unwrap();
     conn.execute("create table t(value integer, next_value integer)")
         .unwrap();
 
@@ -1360,7 +1385,7 @@ fn subprocess_database_open_parent_directly_uses_child_created_table() {
     let db_path_str = db_path.to_str().unwrap();
     let io: Arc<dyn IO> = multiprocess_test_io();
     let db = open_multiprocess_db(io, db_path_str).unwrap();
-    let conn = db.connect().unwrap();
+    let conn = db.connect(ConnectOpts::new()).unwrap();
     conn.execute("create table t(value integer)").unwrap();
 
     let current_exe = std::env::current_exe().unwrap();
@@ -1399,7 +1424,7 @@ fn subprocess_database_open_parent_translated_stmt_uses_child_created_table() {
     let db_path_str = db_path.to_str().unwrap();
     let io: Arc<dyn IO> = multiprocess_test_io();
     let db = open_multiprocess_db(io, db_path_str).unwrap();
-    let conn = db.connect().unwrap();
+    let conn = db.connect(ConnectOpts::new()).unwrap();
     conn.execute("create table t(value integer)").unwrap();
 
     let current_exe = std::env::current_exe().unwrap();
@@ -1441,7 +1466,7 @@ fn subprocess_database_open_parent_execute_uses_child_created_table() {
     let db_path_str = db_path.to_str().unwrap();
     let io: Arc<dyn IO> = multiprocess_test_io();
     let db = open_multiprocess_db(io, db_path_str).unwrap();
-    let conn = db.connect().unwrap();
+    let conn = db.connect(ConnectOpts::new()).unwrap();
     conn.execute("create table t(value integer)").unwrap();
 
     let current_exe = std::env::current_exe().unwrap();
@@ -1481,7 +1506,7 @@ fn subprocess_readonly_child_reader_blocks_restart_and_truncate_checkpoints() {
     let io: Arc<dyn IO> = multiprocess_test_io();
 
     let db = open_multiprocess_db(io, db_path_str).unwrap();
-    let conn = db.connect().unwrap();
+    let conn = db.connect(ConnectOpts::new()).unwrap();
     conn.wal_auto_actions_disable();
     conn.execute("create table test(id integer primary key, value blob)")
         .unwrap();
@@ -1564,6 +1589,211 @@ fn subprocess_readonly_child_reader_blocks_restart_and_truncate_checkpoints() {
 }
 
 #[test]
+fn subprocess_db_file_reader_stops_checkpoint_in_other_process() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("coordination-db-file-reader.db");
+    let ready_file = dir.path().join("child-ready");
+    let release_file = dir.path().join("child-release");
+    let result_file = dir.path().join("child-result");
+    let db_path_str = db_path.to_str().unwrap();
+    let io: Arc<dyn IO> = multiprocess_test_io();
+
+    let db = open_multiprocess_db(io, db_path_str).unwrap();
+    let conn = db.connect(ConnectOpts::new()).unwrap();
+    conn.wal_auto_actions_disable();
+    conn.execute("create table test(id integer primary key, value text)")
+        .unwrap();
+    conn.execute("create table other(id integer primary key, value text)")
+        .unwrap();
+    conn.execute("insert into test(id, value) values (1, 'x')")
+        .unwrap();
+    conn.execute("insert into other(id, value) values (1, 'old')")
+        .unwrap();
+    let checkpoint = run_checkpoint(
+        &conn,
+        CheckpointMode::Passive {
+            upper_bound_inclusive: None,
+        },
+    );
+    assert!(
+        checkpoint.everything_backfilled(),
+        "the child must start its snapshot with nothing left in the WAL"
+    );
+    let backfilled_frame = checkpoint.wal_total_backfilled;
+    assert!(backfilled_frame > 0);
+
+    let authority = db.shared_wal_coordination().unwrap().unwrap();
+    assert_eq!(authority.min_active_reader_frame(), None);
+
+    let current_exe = std::env::current_exe().unwrap();
+    let mut child = Command::new(&current_exe)
+        .arg(MULTIPROCESS_SHM_DB_FILE_READER_CHILD_TEST)
+        .arg("--exact")
+        .arg("--nocapture")
+        .env("TURSO_MULTIPROCESS_DB_PATH", db_path_str)
+        .env("TURSO_MULTIPROCESS_READY_FILE", &ready_file)
+        .env("TURSO_MULTIPROCESS_RELEASE_FILE", &release_file)
+        .env("TURSO_MULTIPROCESS_RESULT_FILE", &result_file)
+        .spawn()
+        .unwrap();
+
+    wait_for_file(&ready_file);
+    assert!(
+        authority.has_active_db_file_reader(),
+        "a reader that bypasses the WAL must still be visible to other processes"
+    );
+    assert_eq!(authority.min_active_reader_frame(), None);
+
+    conn.execute("update other set value = 'new' where id = 1")
+        .unwrap();
+    assert!(wal_max_frame(&conn) > backfilled_frame);
+    let checkpoint = conn
+        .checkpoint(CheckpointMode::Passive {
+            upper_bound_inclusive: None,
+        })
+        .unwrap();
+    assert_eq!(
+        checkpoint.wal_checkpoint_backfilled, 0,
+        "no frame past the child's snapshot may reach the database file while it reads"
+    );
+    assert_eq!(checkpoint.wal_total_backfilled, backfilled_frame);
+
+    std::fs::write(&release_file, b"release").unwrap();
+    let child_status = child.wait().unwrap();
+    assert!(child_status.success(), "child failed: {child_status:?}");
+    assert_eq!(
+        std::fs::read_to_string(&result_file).unwrap(),
+        "old",
+        "the child's snapshot must not see the update committed after it began"
+    );
+
+    assert!(!authority.has_active_db_file_reader());
+    let checkpoint = conn
+        .checkpoint(CheckpointMode::Passive {
+            upper_bound_inclusive: None,
+        })
+        .unwrap();
+    assert!(checkpoint.everything_backfilled());
+}
+
+#[test]
+fn subprocess_db_file_reader_allows_wal_restart_but_stops_backfill() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("coordination-db-file-reader-restart.db");
+    let ready_file = dir.path().join("child-ready");
+    let release_file = dir.path().join("child-release");
+    let result_file = dir.path().join("child-result");
+    let db_path_str = db_path.to_str().unwrap();
+    let io: Arc<dyn IO> = multiprocess_test_io();
+
+    let db = open_multiprocess_db(io, db_path_str).unwrap();
+    let conn = db.connect(ConnectOpts::new()).unwrap();
+    conn.execute("create table test(id integer primary key, value text)")
+        .unwrap();
+    conn.execute("create table other(id integer primary key, value text)")
+        .unwrap();
+    conn.execute("insert into test(id, value) values (1, 'x')")
+        .unwrap();
+    conn.execute("insert into other(id, value) values (1, 'old')")
+        .unwrap();
+    let checkpoint = run_checkpoint(
+        &conn,
+        CheckpointMode::Passive {
+            upper_bound_inclusive: None,
+        },
+    );
+    assert!(checkpoint.everything_backfilled());
+    let backfilled_frame = checkpoint.wal_total_backfilled;
+
+    let current_exe = std::env::current_exe().unwrap();
+    let mut child = Command::new(&current_exe)
+        .arg(MULTIPROCESS_SHM_DB_FILE_READER_CHILD_TEST)
+        .arg("--exact")
+        .arg("--nocapture")
+        .env("TURSO_MULTIPROCESS_DB_PATH", db_path_str)
+        .env("TURSO_MULTIPROCESS_READY_FILE", &ready_file)
+        .env("TURSO_MULTIPROCESS_RELEASE_FILE", &release_file)
+        .env("TURSO_MULTIPROCESS_RESULT_FILE", &result_file)
+        .spawn()
+        .unwrap();
+
+    wait_for_file(&ready_file);
+    let authority = db.shared_wal_coordination().unwrap().unwrap();
+    assert!(authority.has_active_db_file_reader());
+
+    conn.execute("update other set value = 'new' where id = 1")
+        .unwrap();
+    let max_frame = wal_max_frame(&conn);
+    assert!(
+        max_frame < backfilled_frame,
+        "a database file reader in another process must not stop the WAL restart, \
+         but the write appended at frame {max_frame} after frame {backfilled_frame}"
+    );
+    let checkpoint = conn
+        .checkpoint(CheckpointMode::Passive {
+            upper_bound_inclusive: None,
+        })
+        .unwrap();
+    assert_eq!(
+        checkpoint.wal_checkpoint_backfilled, 0,
+        "no frame of the restarted WAL may reach the database file while the child reads"
+    );
+
+    std::fs::write(&release_file, b"release").unwrap();
+    let child_status = child.wait().unwrap();
+    assert!(child_status.success(), "child failed: {child_status:?}");
+    assert_eq!(
+        std::fs::read_to_string(&result_file).unwrap(),
+        "old",
+        "the child's snapshot must not see the update committed after it began"
+    );
+
+    assert!(!authority.has_active_db_file_reader());
+    let checkpoint = conn
+        .checkpoint(CheckpointMode::Passive {
+            upper_bound_inclusive: None,
+        })
+        .unwrap();
+    assert!(checkpoint.everything_backfilled());
+    let rows = get_rows(&conn, "select value from other where id = 1");
+    assert_eq!(rows[0][0].to_string(), "new");
+}
+
+#[test]
+fn write_after_full_checkpoint_restarts_wal() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("coordination-restart-after-checkpoint.db");
+    let io: Arc<dyn IO> = multiprocess_test_io();
+
+    let db = open_multiprocess_db(io, db_path.to_str().unwrap()).unwrap();
+    let conn = db.connect(ConnectOpts::new()).unwrap();
+    conn.execute("create table test(id integer primary key, value text)")
+        .unwrap();
+    for _ in 0..20 {
+        conn.execute("insert into test(value) values ('x')")
+            .unwrap();
+    }
+    let checkpoint = run_checkpoint(
+        &conn,
+        CheckpointMode::Passive {
+            upper_bound_inclusive: None,
+        },
+    );
+    assert!(checkpoint.everything_backfilled());
+    let backfilled_frame = checkpoint.wal_total_backfilled;
+
+    conn.execute("insert into test(value) values ('after')")
+        .unwrap();
+    let max_frame = wal_max_frame(&conn);
+    assert!(
+        max_frame < backfilled_frame,
+        "a write that starts after a full checkpoint must restart the WAL from frame 1, \
+         but it appended at frame {max_frame} after frame {backfilled_frame}"
+    );
+    assert_eq!(count_test_rows(&conn), 21);
+}
+
+#[test]
 fn subprocess_readonly_disk_scan_child_reader_stays_in_shared_coordination() {
     let dir = tempfile::tempdir().unwrap();
     let db_path = dir
@@ -1575,7 +1805,7 @@ fn subprocess_readonly_disk_scan_child_reader_stays_in_shared_coordination() {
     let io: Arc<dyn IO> = multiprocess_test_io();
 
     let db = open_multiprocess_db(io.clone(), db_path_str).unwrap();
-    let conn = db.connect().unwrap();
+    let conn = db.connect(ConnectOpts::new()).unwrap();
     conn.wal_auto_actions_disable();
     conn.execute("create table test(id integer primary key, value blob)")
         .unwrap();
@@ -1611,9 +1841,7 @@ fn subprocess_readonly_disk_scan_child_reader_stays_in_shared_coordination() {
 
     drop(conn);
     drop(db);
-    let mut manager = DATABASE_MANAGER.lock();
-    manager.clear();
-    drop(manager);
+    remove_file_from_database_registry(db_path_str);
 
     let current_exe = std::env::current_exe().unwrap();
     let mut child = Command::new(&current_exe)
@@ -1638,7 +1866,7 @@ fn subprocess_readonly_disk_scan_child_reader_stays_in_shared_coordination() {
     );
 
     let reopened = open_multiprocess_db(io, db_path_str).unwrap();
-    let reopened_conn = reopened.connect().unwrap();
+    let reopened_conn = reopened.connect(ConnectOpts::new()).unwrap();
 
     let restart_err = reopened_conn
         .checkpoint(CheckpointMode::Restart)
@@ -1660,9 +1888,7 @@ fn subprocess_readonly_disk_scan_child_reader_stays_in_shared_coordination() {
 
     drop(reopened_conn);
     drop(reopened);
-    let mut manager = DATABASE_MANAGER.lock();
-    manager.clear();
-    drop(manager);
+    remove_file_from_database_registry(db_path_str);
 
     let wal_len = std::fs::metadata(format!("{db_path_str}-wal"))
         .unwrap_or_else(|_| panic!("expected WAL file at {db_path_str}-wal"))
@@ -1680,7 +1906,7 @@ fn subprocess_readonly_disk_scan_child_reader_stays_in_shared_coordination() {
     );
 
     let reopened = open_multiprocess_db(multiprocess_test_io(), db_path_str).unwrap();
-    let reopened_conn = reopened.connect().unwrap();
+    let reopened_conn = reopened.connect(ConnectOpts::new()).unwrap();
     let checkpoint = reopened_conn
         .checkpoint(CheckpointMode::Truncate {
             upper_bound_inclusive: None,
@@ -1706,7 +1932,7 @@ fn subprocess_database_truncate_checkpoint_reclaims_dead_child_reader_slot() {
     let db_path_str = db_path.to_str().unwrap();
     let io: Arc<dyn IO> = multiprocess_test_io();
     let db = open_multiprocess_db(io, db_path_str).unwrap();
-    let conn = db.connect().unwrap();
+    let conn = db.connect(ConnectOpts::new()).unwrap();
     conn.execute("create table test(id integer primary key, value text)")
         .unwrap();
     conn.execute("insert into test(value) values ('before-reader')")
@@ -1788,13 +2014,11 @@ fn subprocess_database_truncate_checkpoint_reclaims_dead_child_reader_slot() {
 
     drop(conn);
     drop(db);
-    let mut manager = DATABASE_MANAGER.lock();
-    manager.clear();
-    drop(manager);
+    remove_file_from_database_registry(db_path_str);
 
     let io: Arc<dyn IO> = multiprocess_test_io();
     let reopened = open_multiprocess_db(io, db_path_str).unwrap();
-    let reopened_conn = reopened.connect().unwrap();
+    let reopened_conn = reopened.connect(ConnectOpts::new()).unwrap();
     assert_eq!(
         count_test_rows(&reopened_conn),
         2,
@@ -1812,7 +2036,7 @@ fn database_open_reopen_with_live_child_reader_does_not_clobber_authority() {
     let io: Arc<dyn IO> = multiprocess_test_io();
 
     let db = open_multiprocess_db(io.clone(), db_path_str).unwrap();
-    let conn = db.connect().unwrap();
+    let conn = db.connect(ConnectOpts::new()).unwrap();
     conn.wal_auto_actions_disable();
     conn.execute("create table test(id integer primary key, value blob)")
         .unwrap();
@@ -1868,9 +2092,7 @@ fn database_open_reopen_with_live_child_reader_does_not_clobber_authority() {
 
     drop(conn);
     drop(db);
-    let mut manager = DATABASE_MANAGER.lock();
-    manager.clear();
-    drop(manager);
+    remove_file_from_database_registry(db_path_str);
 
     let reopened = open_multiprocess_db(io, db_path_str).unwrap();
     let reopened_authority = reopened.shared_wal_coordination().unwrap().unwrap();
@@ -1893,7 +2115,7 @@ fn database_open_reopen_with_live_child_reader_does_not_clobber_authority() {
         "child reader should exit cleanly after reopen repair: {child_status:?}"
     );
 
-    let reopened_conn = reopened.connect().unwrap();
+    let reopened_conn = reopened.connect(ConnectOpts::new()).unwrap();
     assert_eq!(
         count_test_rows(&reopened_conn),
         32,
@@ -1911,7 +2133,7 @@ fn database_open_rebuilds_from_disk_scan_when_shared_frame_index_overflowed() {
     let io: Arc<dyn IO> = multiprocess_test_io();
 
     let db_a = open_multiprocess_db(io.clone(), db_path_str).unwrap();
-    let conn_a = db_a.connect().unwrap();
+    let conn_a = db_a.connect(ConnectOpts::new()).unwrap();
     conn_a
         .execute("create table test(id integer primary key, value text)")
         .unwrap();
@@ -1951,9 +2173,7 @@ fn database_open_rebuilds_from_disk_scan_when_shared_frame_index_overflowed() {
 
     drop(conn_a);
     drop(db_a);
-    let mut manager = DATABASE_MANAGER.lock();
-    manager.clear();
-    drop(manager);
+    remove_file_from_database_registry(db_path_str);
 
     let db_b = open_multiprocess_db(io, db_path_str).unwrap();
     assert!(
@@ -1977,7 +2197,7 @@ fn database_open_rebuilds_from_disk_scan_when_shared_frame_index_overflowed() {
         "disk-scan reopen should repopulate the durable frame index from the WAL"
     );
 
-    let conn_b = db_b.connect().unwrap();
+    let conn_b = db_b.connect(ConnectOpts::new()).unwrap();
     let rows = get_rows(&conn_b, "select value from test order by id");
     assert_eq!(rows.len(), 2);
     assert_eq!(rows[0][0].to_string(), "before-overflow");
@@ -2001,7 +2221,7 @@ fn memory_database_keeps_in_process_wal_backend() {
 fn memory_database_query_can_close_without_checkpointing() {
     let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
     let db = Database::open_file(io, ":memory:", Arc::new(SqliteDialect)).unwrap();
-    let conn = db.connect().unwrap();
+    let conn = db.connect(ConnectOpts::new()).unwrap();
 
     conn.query("VALUES ('ok')").unwrap();
     conn.close().unwrap();
@@ -2053,7 +2273,7 @@ fn multiprocess_sequence_nextval_child_process() {
 
     let io: Arc<dyn IO> = multiprocess_test_io();
     let db = open_multiprocess_db(io, db_path.to_str().unwrap()).unwrap();
-    let conn = db.connect().unwrap();
+    let conn = db.connect(ConnectOpts::new()).unwrap();
 
     // Signal that the connection is open (atomic loaded from disk). This is
     // what we need to overlap across all participating children.
@@ -2187,7 +2407,7 @@ fn test_multiprocess_concurrent_nextval_returns_distinct_values() {
     {
         let io: Arc<dyn IO> = multiprocess_test_io();
         let db = open_multiprocess_db(io, db_path_str).unwrap();
-        let conn = db.connect().unwrap();
+        let conn = db.connect(ConnectOpts::new()).unwrap();
         conn.execute("CREATE SEQUENCE s START 1 INCREMENT 1")
             .unwrap();
         conn.close().unwrap();
@@ -2213,7 +2433,7 @@ fn test_multiprocess_nextval_after_other_process_committed_is_monotonic() {
 
     let io: Arc<dyn IO> = multiprocess_test_io();
     let db = open_multiprocess_db(io.clone(), db_path_str).unwrap();
-    let conn_a = db.connect().unwrap();
+    let conn_a = db.connect(ConnectOpts::new()).unwrap();
     conn_a
         .execute("CREATE SEQUENCE s START 1 INCREMENT 1")
         .unwrap();
@@ -2267,7 +2487,7 @@ fn test_multiprocess_setval_visible_to_other_process_nextval() {
 
     let io: Arc<dyn IO> = multiprocess_test_io();
     let db = open_multiprocess_db(io.clone(), db_path_str).unwrap();
-    let conn_a = db.connect().unwrap();
+    let conn_a = db.connect(ConnectOpts::new()).unwrap();
     conn_a
         .execute("CREATE SEQUENCE s START 1 INCREMENT 1")
         .unwrap();
@@ -2353,7 +2573,7 @@ fn multiprocess_sequence_nextval_burst_child_process() {
 
     let io: Arc<dyn IO> = multiprocess_test_io();
     let db = open_multiprocess_db(io, db_path.to_str().unwrap()).unwrap();
-    let conn = db.connect().unwrap();
+    let conn = db.connect(ConnectOpts::new()).unwrap();
 
     std::fs::write(&ready_path, b"").expect("write ready marker");
 
@@ -2432,7 +2652,7 @@ fn test_multiprocess_nextval_burst_no_duplicates() {
     {
         let io: Arc<dyn IO> = multiprocess_test_io();
         let db = open_multiprocess_db(io, db_path_str).unwrap();
-        let conn = db.connect().unwrap();
+        let conn = db.connect(ConnectOpts::new()).unwrap();
         conn.execute("CREATE SEQUENCE s START 1 INCREMENT 1")
             .unwrap();
         conn.close().unwrap();
@@ -2558,7 +2778,7 @@ fn multiprocess_autoinc_burst_child_process() {
 
     let io: Arc<dyn IO> = multiprocess_test_io();
     let db = open_multiprocess_db(io, db_path.to_str().unwrap()).unwrap();
-    let conn = db.connect().unwrap();
+    let conn = db.connect(ConnectOpts::new()).unwrap();
 
     std::fs::write(&ready_path, b"").expect("write ready marker");
 
@@ -2650,7 +2870,7 @@ fn test_multiprocess_autoinc_burst_no_duplicates() {
     {
         let io: Arc<dyn IO> = multiprocess_test_io();
         let db = open_multiprocess_db(io, db_path_str).unwrap();
-        let conn = db.connect().unwrap();
+        let conn = db.connect(ConnectOpts::new()).unwrap();
         conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY AUTOINCREMENT, payload TEXT)")
             .unwrap();
         conn.close().unwrap();
@@ -2750,7 +2970,9 @@ fn test_multiprocess_autoinc_burst_no_duplicates() {
     let observer_io: Arc<dyn IO> = multiprocess_test_io();
     let observer_db =
         open_multiprocess_db(observer_io, db_path_str).expect("reopen db for fresh observer");
-    let observer_conn = observer_db.connect().expect("connect fresh observer");
+    let observer_conn = observer_db
+        .connect(ConnectOpts::new())
+        .expect("connect fresh observer");
 
     let count_rows = get_rows(&observer_conn, "SELECT COUNT(*) FROM t");
     let total_rows = count_rows[0][0]
@@ -2799,4 +3021,113 @@ fn test_multiprocess_autoinc_burst_no_duplicates() {
     );
 
     observer_conn.close().unwrap();
+}
+
+#[test]
+fn checkpoints_and_reads_stay_correct_while_a_reader_holds_a_late_wal_frame() {
+    let dir = tempfile::tempdir().unwrap();
+    let io = multiprocess_test_io();
+    let db = open_multiprocess_db(io, dir.path().join("late-reader.db").to_str().unwrap()).unwrap();
+    let readers = [
+        db.connect(ConnectOpts::new()).unwrap(),
+        db.connect(ConnectOpts::new()).unwrap(),
+    ];
+    let writer = db.connect(ConnectOpts::new()).unwrap();
+    writer.execute("PRAGMA synchronous = NORMAL").unwrap();
+    writer
+        .execute("CREATE TABLE test(id INTEGER PRIMARY KEY, k BLOB UNIQUE, v BLOB)")
+        .unwrap();
+    let insert = "INSERT INTO test(k, v) VALUES(randomblob(16), randomblob(200))";
+
+    readers[0].execute("BEGIN").unwrap();
+    count_test_rows(&readers[0]);
+    let mut open_reader = 0;
+    let mut rows = 0;
+    while wal_max_frame(&writer) < 9000 {
+        writer.execute(insert).unwrap();
+        rows += 1;
+        if rows % 50 == 0 {
+            let next = 1 - open_reader;
+            readers[next].execute("BEGIN").unwrap();
+            assert_eq!(count_test_rows(&readers[next]), rows);
+            readers[open_reader].execute("COMMIT").unwrap();
+            open_reader = next;
+        }
+    }
+
+    let held_reader = &readers[1 - open_reader];
+    held_reader.execute("BEGIN").unwrap();
+    let held_rows = count_test_rows(held_reader);
+    assert_eq!(held_rows, rows);
+    readers[open_reader].execute("COMMIT").unwrap();
+    let held_frame = wal_max_frame(&writer);
+    let passive = CheckpointMode::Passive {
+        upper_bound_inclusive: None,
+    };
+    let checkpoint = run_checkpoint(&writer, passive);
+    assert_eq!(checkpoint.wal_total_backfilled, held_frame);
+
+    for _ in 0..1500 {
+        writer.execute(insert).unwrap();
+        rows += 1;
+    }
+    assert!(wal_max_frame(&writer) > held_frame + 1000);
+    assert_eq!(count_test_rows(held_reader), held_rows);
+    assert_eq!(count_test_rows(&writer), rows);
+    let authority = db.shared_wal_coordination().unwrap().unwrap();
+    authority.take_frame_index_blocks_scanned_for_tests();
+    let checkpoint = run_checkpoint(&writer, passive);
+    assert_eq!(checkpoint.wal_total_backfilled, held_frame);
+    assert_eq!(checkpoint.wal_checkpoint_backfilled, 0);
+    assert_eq!(authority.take_frame_index_blocks_scanned_for_tests(), 0);
+
+    held_reader.execute("COMMIT").unwrap();
+    let checkpoint = run_checkpoint(
+        &writer,
+        CheckpointMode::Truncate {
+            upper_bound_inclusive: None,
+        },
+    );
+    assert!(checkpoint.everything_backfilled());
+    assert_eq!(wal_max_frame(&writer), 0);
+    let fresh = db.connect(ConnectOpts::new()).unwrap();
+    assert_eq!(count_test_rows(&fresh), rows);
+    assert_eq!(
+        get_rows(&fresh, "PRAGMA integrity_check")[0][0].to_string(),
+        "ok"
+    );
+}
+
+#[test]
+fn subprocess_idle_begin_sees_table_created_by_other_process() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("coordination-idle-begin-schema.db");
+    let db_path_str = db_path.to_str().unwrap();
+    let io: Arc<dyn IO> = multiprocess_test_io();
+    let db = open_multiprocess_db(io, db_path_str).unwrap();
+    let conn = db.connect(ConnectOpts::new()).unwrap();
+    conn.execute("create table test(id integer primary key, value text)")
+        .unwrap();
+    conn.execute("begin").unwrap();
+
+    let current_exe = std::env::current_exe().unwrap();
+    let schema_output = Command::new(&current_exe)
+        .arg(MULTIPROCESS_SHM_SCHEMA_CHILD_TEST)
+        .arg("--exact")
+        .arg("--nocapture")
+        .env("TURSO_MULTIPROCESS_DB_PATH", db_path_str)
+        .output()
+        .unwrap();
+    assert!(
+        schema_output.status.success(),
+        "child schema process failed: stderr={}",
+        String::from_utf8_lossy(&schema_output.stderr)
+    );
+
+    let result = conn
+        .prepare("select value from child_table")
+        .and_then(|mut stmt| stmt.run_collect_rows());
+    let rows = result.unwrap();
+    assert_eq!(rows.len(), 1);
+    conn.execute("commit").unwrap();
 }

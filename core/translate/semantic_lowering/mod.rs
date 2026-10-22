@@ -147,7 +147,7 @@ impl PlannedSelect {
         let from = ast::FromClause {
             select: Box::new(ast::SelectTable::Table(
                 ast::QualifiedName {
-                    db_name: Some(ast::Name::exact(database)),
+                    namespace: Some(ast::Name::exact(database)),
                     name: ast::Name::exact(table),
                     alias: None,
                 },
@@ -341,7 +341,7 @@ pub(crate) fn translate_drop_table_delete(
     let statement = ast::Stmt::Delete {
         with: None,
         tbl_name: ast::QualifiedName {
-            db_name: Some(ast::Name::exact(database.to_string())),
+            namespace: Some(ast::Name::exact(database.to_string())),
             name: ast::Name::exact(table.to_string()),
             alias: None,
         },
@@ -563,7 +563,7 @@ fn check_target(
         if views.is_empty() {
             return Ok(());
         }
-        use crate::incremental::compiler::DBSP_CIRCUIT_VERSION;
+        use crate::incremental::view::DBSP_CIRCUIT_VERSION;
         crate::bail_parse_error!(
             "Cannot {statement} '{table_name}' because it has incompatible dependent materialized view(s): {}. \n\
              These views were created with a different DBSP version than the current version ({DBSP_CIRCUIT_VERSION}). \n\
@@ -605,10 +605,11 @@ impl<'a> HirSession<'a> {
     ) -> Result<Arc<HirPlan>> {
         let mut document = self.analyze(input)?;
         rewrite(&mut document)?;
-        Ok(Arc::new(HirPlan::build(
+        Ok(Arc::new(HirPlan::build_with_unnesting_mode(
             Arc::new(document),
             self.context.main_schema(),
             cost_model_params(),
+            self.connection.subquery_unnesting_mode(),
         )?))
     }
 
@@ -621,6 +622,9 @@ impl<'a> HirSession<'a> {
 /// Compile `expression` over `inputs.len()` values, which the program
 /// holds in registers `0..inputs.len()` when it runs, leaving the result
 /// in `target`. The expression reads input `n` as `Register(n)`.
+/// Materialized view maintenance will compile its operator expressions
+/// this way; nothing uses it until that is rebuilt over HIR.
+#[allow(dead_code)]
 pub(crate) fn translate_register_expression(
     program: &mut ProgramBuilder,
     expression: &ast::Expr,

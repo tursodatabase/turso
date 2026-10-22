@@ -4,7 +4,9 @@ use rusqlite::types::Value;
 use turso_core::types::ImmutableRecord;
 use turso_core::CDC_VERSION_CURRENT;
 
+use crate::assertions::{AssertColumn, Cell};
 use crate::common::{limbo_exec_rows, limbo_exec_rows_fallible, TempDatabase};
+use asserting::prelude::*;
 
 fn replace_column_with_null(rows: Vec<Vec<Value>>, column: usize) -> Vec<Vec<Value>> {
     rows.into_iter()
@@ -314,6 +316,58 @@ fn test_cdc_simple_full(db: TempDatabase) {
 }
 
 #[turso_macros::test]
+fn test_cdc_delete_all_keeps_one_record_per_deleted_row(db: TempDatabase) {
+    let conn = db.connect_limbo();
+    conn.execute("CREATE TABLE t (x INTEGER PRIMARY KEY, y)")
+        .unwrap();
+    conn.execute("PRAGMA capture_data_changes_conn('full')")
+        .unwrap();
+    conn.execute("INSERT INTO t VALUES (1, 2), (3, 4)").unwrap();
+
+    conn.execute("DELETE FROM t").unwrap();
+
+    assert_eq!(
+        normalize_cdc_v2_rows(limbo_exec_rows(&conn, "SELECT * FROM turso_cdc")),
+        vec![
+            v2_row(
+                1,
+                "t",
+                1,
+                None,
+                Some(record([Value::Integer(1), Value::Integer(2)])),
+                None,
+            ),
+            v2_row(
+                1,
+                "t",
+                3,
+                None,
+                Some(record([Value::Integer(3), Value::Integer(4)])),
+                None,
+            ),
+            v2_commit(),
+            v2_row(
+                -1,
+                "t",
+                1,
+                Some(record([Value::Integer(1), Value::Integer(2)])),
+                None,
+                None,
+            ),
+            v2_row(
+                -1,
+                "t",
+                3,
+                Some(record([Value::Integer(3), Value::Integer(4)])),
+                None,
+                None,
+            ),
+            v2_commit(),
+        ]
+    );
+}
+
+#[turso_macros::test]
 fn test_cdc_crud(db: TempDatabase) {
     let conn = db.connect_limbo();
     conn.execute("CREATE TABLE t (x INTEGER PRIMARY KEY, y)")
@@ -525,6 +579,66 @@ fn test_cdc_ignore_changes_in_cdc_table(db: TempDatabase) {
             // INSERT (2, 20) + COMMIT
             v2_row(1, "t", 2, None, None, None),
             v2_commit(),
+        ]
+    );
+}
+
+#[turso_macros::test()]
+fn test_cdc_update_cdc_table_in_full_mode(db: TempDatabase) {
+    let conn = db.connect_limbo();
+    conn.execute("CREATE TABLE t (x)").unwrap();
+    conn.execute("PRAGMA capture_data_changes_conn('full')")
+        .unwrap();
+    conn.execute("INSERT INTO t VALUES (1)").unwrap();
+    conn.execute("UPDATE turso_cdc SET table_name = 'u' WHERE change_type = 1")
+        .unwrap();
+    let rows = limbo_exec_rows(
+        &conn,
+        "SELECT change_type, table_name FROM turso_cdc ORDER BY change_id",
+    );
+    assert_eq!(
+        rows,
+        vec![
+            vec![Value::Integer(1), Value::Text("u".to_string())],
+            vec![Value::Integer(2), Value::Null],
+        ]
+    );
+}
+
+#[turso_macros::test()]
+fn test_cdc_ignore_changes_in_temp_tables(db: TempDatabase) {
+    let conn = db.connect_limbo();
+    conn.execute("CREATE TABLE m (x)").unwrap();
+    conn.execute("PRAGMA capture_data_changes_conn('full')")
+        .unwrap();
+    for sql in [
+        "CREATE TEMP TABLE X AS SELECT 1 AS a",
+        "INSERT INTO X VALUES (2)",
+        "CREATE TABLE temp.Y (b PRIMARY KEY, c)",
+        "CREATE INDEX temp.y_c ON Y (c)",
+        "INSERT INTO Y VALUES (3, 3)",
+        "INSERT INTO Y VALUES (3, 3) ON CONFLICT (b) DO UPDATE SET c = 4",
+        "INSERT OR REPLACE INTO Y VALUES (3, 5)",
+        "UPDATE Y SET c = 6",
+        "ALTER TABLE Y ADD COLUMN d",
+        "ALTER TABLE Y RENAME TO Z",
+        "DELETE FROM Z",
+        "DROP INDEX y_c",
+        "DROP TABLE X",
+        "DROP TABLE temp.Z",
+        "INSERT INTO m VALUES (1)",
+    ] {
+        conn.execute(sql).unwrap();
+    }
+    let rows = limbo_exec_rows(
+        &conn,
+        "SELECT change_type, table_name FROM turso_cdc ORDER BY change_id",
+    );
+    assert_eq!(
+        rows,
+        vec![
+            vec![Value::Integer(1), Value::Text("m".to_string())],
+            vec![Value::Integer(2), Value::Null],
         ]
     );
 }
@@ -1738,10 +1852,11 @@ fn test_cdc_v2_no_change_commit_then_rollback(db: TempDatabase) {
         &conn,
         "SELECT change_txn_id FROM turso_cdc WHERE change_type = 2",
     );
-    assert_eq!(commits.len(), 2);
-    assert!(commits
-        .iter()
-        .all(|row| !matches!(row[0], Value::Integer(-1))));
+    assert_that!(commits)
+        .named("commit records")
+        .has_length(2)
+        .column(0)
+        .does_not_contain(Cell::from(-1));
 }
 
 #[turso_macros::test]
@@ -1957,4 +2072,833 @@ fn test_journal_mode_mvcc_switch_allowed_without_cdc(db: TempDatabase) {
     conn.execute("INSERT INTO t VALUES (1, 'a')").unwrap();
     let rows = limbo_exec_rows(&conn, "SELECT COUNT(*) FROM t");
     assert_eq!(rows, vec![vec![Value::Integer(1)]]);
+}
+
+/// Regression test for https://github.com/tursodatabase/turso/issues/9069: the
+/// `before` image for `ON CONFLICT DO UPDATE` used to hold the NEW row instead
+/// of the OLD one, because it was read from the cursor after the UPSERT had
+/// already overwritten the row in place.
+#[turso_macros::test]
+fn test_cdc_upsert_before_image_in_place(db: TempDatabase) {
+    let conn = db.connect_limbo();
+    conn.execute("CREATE TABLE t (x INTEGER PRIMARY KEY, y)")
+        .unwrap();
+    conn.execute("INSERT INTO t VALUES (1, 'old')").unwrap();
+    conn.execute("PRAGMA capture_data_changes_conn('full')")
+        .unwrap();
+
+    conn.execute("INSERT INTO t VALUES (1, 'new') ON CONFLICT(x) DO UPDATE SET y = excluded.y")
+        .unwrap();
+
+    let rows = normalize_cdc_v2_rows(limbo_exec_rows(&conn, "SELECT * FROM turso_cdc"));
+    assert_eq!(
+        rows,
+        vec![
+            v2_row(
+                0,
+                "t",
+                1,
+                Some(record([Value::Integer(1), Value::Text("old".to_string())])),
+                Some(record([Value::Integer(1), Value::Text("new".to_string())])),
+                None,
+            ),
+            v2_commit(),
+        ]
+    );
+}
+
+/// Same repro as above, but with capture mode `before`: only the before image
+/// is recorded, and it must still be the OLD row.
+#[turso_macros::test]
+fn test_cdc_upsert_before_image_in_place_before_mode(db: TempDatabase) {
+    let conn = db.connect_limbo();
+    conn.execute("CREATE TABLE t (x INTEGER PRIMARY KEY, y)")
+        .unwrap();
+    conn.execute("INSERT INTO t VALUES (1, 'old')").unwrap();
+    conn.execute("PRAGMA capture_data_changes_conn('before')")
+        .unwrap();
+
+    conn.execute("INSERT INTO t VALUES (1, 'new') ON CONFLICT(x) DO UPDATE SET y = excluded.y")
+        .unwrap();
+
+    let rows = normalize_cdc_v2_rows(limbo_exec_rows(&conn, "SELECT * FROM turso_cdc"));
+    assert_eq!(
+        rows,
+        vec![
+            v2_row(
+                0,
+                "t",
+                1,
+                Some(record([Value::Integer(1), Value::Text("old".to_string())])),
+                None,
+                None,
+            ),
+            v2_commit(),
+        ]
+    );
+}
+
+/// A BEFORE UPDATE trigger changes a column (`z`) that is not in the upsert's
+/// own SET list. The upsert's before image must reflect the row exactly as it
+/// sat on disk right before the upsert's own write: `y` still holds its
+/// pre-SET value ('a'), while `z` already holds the trigger's write (999), not
+/// the original value ('orig') that was there before the statement started.
+///
+/// Also a regression test for https://github.com/tursodatabase/turso/issues/10152: under
+/// MVCC, the trigger's nested UPDATE and the upsert's own UPDATE used to collide on the same
+/// CDC change id (see `test_cdc_trigger_after_insert_captures_trigger_row` for the cause), so
+/// only one of the two rows below survived.
+#[turso_macros::test(mvcc)]
+fn test_cdc_upsert_before_image_reflects_before_update_trigger(db: TempDatabase) {
+    let conn = db.connect_limbo();
+    conn.execute("CREATE TABLE t (x INTEGER PRIMARY KEY, y, z)")
+        .unwrap();
+    conn.execute(
+        "CREATE TRIGGER trg BEFORE UPDATE ON t BEGIN UPDATE t SET z = 999 WHERE x = NEW.x; END",
+    )
+    .unwrap();
+    conn.execute("INSERT INTO t VALUES (1, 'a', 'orig')")
+        .unwrap();
+    conn.execute("PRAGMA capture_data_changes_conn('before')")
+        .unwrap();
+
+    conn.execute(
+        "INSERT INTO t VALUES (1, 'b', 'ignored') ON CONFLICT(x) DO UPDATE SET y = excluded.y",
+    )
+    .unwrap();
+
+    let rows = normalize_cdc_v2_rows(limbo_exec_rows(&conn, "SELECT * FROM turso_cdc"));
+    assert_eq!(
+        rows,
+        vec![
+            // The trigger's own nested UPDATE (z: 'orig' -> 999).
+            v2_row(
+                0,
+                "t",
+                1,
+                Some(record([
+                    Value::Integer(1),
+                    Value::Text("a".to_string()),
+                    Value::Text("orig".to_string()),
+                ])),
+                None,
+                None,
+            ),
+            // The upsert's own row: before image is the row as it sat on disk
+            // right before the upsert wrote it: y still 'a' (pre-SET), z
+            // already 999 (post-trigger).
+            v2_row(
+                0,
+                "t",
+                1,
+                Some(record([
+                    Value::Integer(1),
+                    Value::Text("a".to_string()),
+                    Value::Integer(999),
+                ])),
+                None,
+                None,
+            ),
+            v2_commit(),
+        ]
+    );
+}
+
+/// `ON CONFLICT DO UPDATE` that changes the rowid alias takes the DELETE+INSERT
+/// path. The DELETE's before image must be the OLD row (old rowid, old `y`),
+/// not a row read after the delete+insert already happened.
+#[turso_macros::test]
+fn test_cdc_upsert_before_image_rowid_change(db: TempDatabase) {
+    let conn = db.connect_limbo();
+    conn.execute("CREATE TABLE t (x INTEGER PRIMARY KEY, y)")
+        .unwrap();
+    conn.execute("INSERT INTO t VALUES (1, 'old')").unwrap();
+    conn.execute("PRAGMA capture_data_changes_conn('full')")
+        .unwrap();
+
+    conn.execute(
+        "INSERT INTO t VALUES (1, 'ignored') ON CONFLICT(x) DO UPDATE SET x = 2, y = 'new'",
+    )
+    .unwrap();
+
+    let rows = normalize_cdc_v2_rows(limbo_exec_rows(&conn, "SELECT * FROM turso_cdc"));
+    assert_eq!(
+        rows,
+        vec![
+            v2_row(
+                -1,
+                "t",
+                1,
+                Some(record([Value::Integer(1), Value::Text("old".to_string())])),
+                None,
+                None,
+            ),
+            v2_row(
+                1,
+                "t",
+                2,
+                None,
+                Some(record([Value::Integer(2), Value::Text("new".to_string())])),
+                None,
+            ),
+            v2_commit(),
+        ]
+    );
+}
+
+/// A table with a virtual generated column: the upsert's before image must
+/// have the same shape as today's plain-UPDATE before image for that table
+/// (the virtual column `v` excluded, only stored columns `x`/`y` present).
+#[turso_macros::test]
+fn test_cdc_upsert_before_image_excludes_virtual_generated_column(db: TempDatabase) {
+    let conn = db.connect_limbo();
+    conn.execute(
+        "CREATE TABLE t (x INTEGER PRIMARY KEY, y, v GENERATED ALWAYS AS (y * 2) VIRTUAL)",
+    )
+    .unwrap();
+    conn.execute("INSERT INTO t VALUES (1, 5)").unwrap();
+    conn.execute("PRAGMA capture_data_changes_conn('before')")
+        .unwrap();
+
+    conn.execute("INSERT INTO t VALUES (1, 99) ON CONFLICT(x) DO UPDATE SET y = excluded.y")
+        .unwrap();
+    // A plain UPDATE on the same, now-updated row, for comparison.
+    conn.execute("UPDATE t SET y = 100 WHERE x = 1").unwrap();
+
+    let rows = limbo_exec_rows(
+        &conn,
+        "SELECT change_type, before FROM turso_cdc WHERE change_type = 0 ORDER BY change_id",
+    );
+    assert_eq!(
+        rows,
+        vec![
+            vec![
+                Value::Integer(0),
+                Value::Blob(record([Value::Integer(1), Value::Integer(5)])),
+            ],
+            vec![
+                Value::Integer(0),
+                Value::Blob(record([Value::Integer(1), Value::Integer(99)])),
+            ],
+        ]
+    );
+}
+
+/// MVCC variant of the in-place repro, with the conflicting row still held
+/// in the in-memory MVCC version store (not checkpointed) when the upsert
+/// runs.
+#[turso_macros::test]
+fn test_cdc_upsert_before_image_in_place_mvcc(db: TempDatabase) {
+    let conn = db.connect_limbo();
+    conn.execute("PRAGMA journal_mode = 'mvcc'").unwrap();
+    conn.execute("CREATE TABLE t (x INTEGER PRIMARY KEY, y)")
+        .unwrap();
+    conn.execute("INSERT INTO t VALUES (1, 'old')").unwrap();
+    conn.execute("PRAGMA capture_data_changes_conn('full')")
+        .unwrap();
+
+    conn.execute("INSERT INTO t VALUES (1, 'new') ON CONFLICT(x) DO UPDATE SET y = excluded.y")
+        .unwrap();
+
+    let rows = normalize_cdc_v2_rows(limbo_exec_rows(&conn, "SELECT * FROM turso_cdc"));
+    assert_eq!(
+        rows,
+        vec![
+            v2_row(
+                0,
+                "t",
+                1,
+                Some(record([Value::Integer(1), Value::Text("old".to_string())])),
+                Some(record([Value::Integer(1), Value::Text("new".to_string())])),
+                None,
+            ),
+            v2_commit(),
+        ]
+    );
+}
+
+/// MVCC variant of the rowid-changing repro.
+#[turso_macros::test]
+fn test_cdc_upsert_before_image_rowid_change_mvcc(db: TempDatabase) {
+    let conn = db.connect_limbo();
+    conn.execute("PRAGMA journal_mode = 'mvcc'").unwrap();
+    conn.execute("CREATE TABLE t (x INTEGER PRIMARY KEY, y)")
+        .unwrap();
+    conn.execute("INSERT INTO t VALUES (1, 'old')").unwrap();
+    conn.execute("PRAGMA capture_data_changes_conn('full')")
+        .unwrap();
+
+    conn.execute(
+        "INSERT INTO t VALUES (1, 'ignored') ON CONFLICT(x) DO UPDATE SET x = 2, y = 'new'",
+    )
+    .unwrap();
+
+    let rows = normalize_cdc_v2_rows(limbo_exec_rows(&conn, "SELECT * FROM turso_cdc"));
+    assert_eq!(
+        rows,
+        vec![
+            v2_row(
+                -1,
+                "t",
+                1,
+                Some(record([Value::Integer(1), Value::Text("old".to_string())])),
+                None,
+                None,
+            ),
+            v2_row(
+                1,
+                "t",
+                2,
+                None,
+                Some(record([Value::Integer(2), Value::Text("new".to_string())])),
+                None,
+            ),
+            v2_commit(),
+        ]
+    );
+}
+
+/// A trigger or FK action compiles as its own subprogram; it must never write its own CDC
+/// COMMIT record. Only the root statement writes the single COMMIT record for the whole
+/// statement, and it must be the last row (https://github.com/tursodatabase/turso/issues/10148).
+fn assert_single_trailing_commit(conn: &std::sync::Arc<turso_core::Connection>) {
+    let rows = limbo_exec_rows(conn, "SELECT change_type FROM turso_cdc ORDER BY change_id");
+    let commit_count = rows
+        .iter()
+        .filter(|row| row[0] == Value::Integer(2))
+        .count();
+    assert_eq!(
+        commit_count, 1,
+        "expected exactly one COMMIT record, got {rows:?}"
+    );
+    assert_eq!(
+        rows.last().unwrap()[0],
+        Value::Integer(2),
+        "the COMMIT record must be the last row, got {rows:?}"
+    );
+}
+
+#[turso_macros::test]
+fn test_cdc_trigger_after_insert_autocommit_single_commit(db: TempDatabase) {
+    let conn = db.connect_limbo();
+    conn.execute("CREATE TABLE t(x INTEGER PRIMARY KEY, y)")
+        .unwrap();
+    conn.execute("CREATE TABLE audit(msg)").unwrap();
+    conn.execute(
+        "CREATE TRIGGER trg AFTER INSERT ON t BEGIN INSERT INTO audit VALUES ('fired'); END",
+    )
+    .unwrap();
+    conn.execute("PRAGMA capture_data_changes_conn('full')")
+        .unwrap();
+
+    conn.execute("INSERT INTO t VALUES (1, 'a')").unwrap();
+
+    assert_single_trailing_commit(&conn);
+}
+
+#[turso_macros::test]
+fn test_cdc_fk_cascade_delete_autocommit_single_commit(db: TempDatabase) {
+    let conn = db.connect_limbo();
+    conn.execute("PRAGMA foreign_keys = ON").unwrap();
+    conn.execute("CREATE TABLE parent(id INTEGER PRIMARY KEY)")
+        .unwrap();
+    conn.execute(
+        "CREATE TABLE child(id INTEGER PRIMARY KEY, pid INTEGER REFERENCES parent(id) ON DELETE CASCADE)",
+    )
+    .unwrap();
+    conn.execute("INSERT INTO parent VALUES (1)").unwrap();
+    conn.execute("INSERT INTO child VALUES (10, 1)").unwrap();
+    conn.execute("PRAGMA capture_data_changes_conn('full')")
+        .unwrap();
+
+    conn.execute("DELETE FROM parent WHERE id = 1").unwrap();
+
+    assert_single_trailing_commit(&conn);
+}
+
+/// Guard, not a regression test for the TEMP-root fix below: `t` is itself captured, so
+/// `cdc_cursor_id` is always `Some` here and the TEMP-root fallback path never runs. This
+/// passes with or without that fix; it only checks the single-commit invariant still holds
+/// for an explicit transaction.
+#[turso_macros::test]
+fn test_cdc_trigger_after_insert_explicit_transaction_single_commit_guard(db: TempDatabase) {
+    let conn = db.connect_limbo();
+    conn.execute("CREATE TABLE t(x INTEGER PRIMARY KEY, y)")
+        .unwrap();
+    conn.execute("CREATE TABLE audit(msg)").unwrap();
+    conn.execute(
+        "CREATE TRIGGER trg AFTER INSERT ON t BEGIN INSERT INTO audit VALUES ('fired'); END",
+    )
+    .unwrap();
+    conn.execute("PRAGMA capture_data_changes_conn('full')")
+        .unwrap();
+
+    conn.execute("BEGIN").unwrap();
+    conn.execute("INSERT INTO t VALUES (1, 'a')").unwrap();
+    conn.execute("COMMIT").unwrap();
+
+    assert_single_trailing_commit(&conn);
+}
+
+/// A root statement on a TEMP table is never captured, but a trigger it fires can still
+/// capture a row on a main (captured) table. The root statement must still write the one
+/// COMMIT record for the whole statement.
+///
+/// Also a regression test for https://github.com/tursodatabase/turso/issues/10154: under
+/// MVCC, each row's trigger-fired audit INSERT used to collide with (and get overwritten by)
+/// a later CDC row, because the trigger subprogram allocated its change id with the plain
+/// `NewRowid` path instead of the CDC table's AUTOINCREMENT sequence the root statement uses.
+/// See `test_cdc_trigger_after_insert_captures_trigger_row` for the single-row case and the
+/// underlying cause.
+#[turso_macros::test(mvcc)]
+fn test_cdc_trigger_temp_root_with_captured_write_single_commit(db: TempDatabase) {
+    let conn = db.connect_limbo();
+    conn.execute("CREATE TABLE audit(msg)").unwrap();
+    conn.execute("CREATE TEMP TABLE src(x)").unwrap();
+    conn.execute(
+        "CREATE TRIGGER trg AFTER INSERT ON src BEGIN INSERT INTO audit VALUES ('fired'); END",
+    )
+    .unwrap();
+    conn.execute("PRAGMA capture_data_changes_conn('full')")
+        .unwrap();
+
+    // Two rows: the trigger subprogram is invoked (and compiles its end-of-statement
+    // COMMIT check) once per row. A per-invocation COMMIT would show up as 2 records,
+    // one of them before the last row's own write.
+    conn.execute("INSERT INTO src VALUES (1), (2)").unwrap();
+
+    let rows = limbo_exec_rows(
+        &conn,
+        "SELECT change_type, table_name FROM turso_cdc ORDER BY change_id",
+    );
+    assert_eq!(
+        rows,
+        vec![
+            vec![Value::Integer(1), Value::Text("audit".to_string())],
+            vec![Value::Integer(1), Value::Text("audit".to_string())],
+            vec![Value::Integer(2), Value::Null],
+        ],
+        "expected two audit INSERT rows followed by exactly one COMMIT, got {rows:?}"
+    );
+}
+
+/// Single-row variant of the above: a TEMP root statement whose trigger captures exactly one
+/// row on a main table. Regression test for
+/// https://github.com/tursodatabase/turso/issues/10154.
+#[turso_macros::test(mvcc)]
+fn test_cdc_trigger_temp_root_with_captured_write_single_row(db: TempDatabase) {
+    let conn = db.connect_limbo();
+    conn.execute("CREATE TABLE audit(msg)").unwrap();
+    conn.execute("CREATE TEMP TABLE src(x)").unwrap();
+    conn.execute(
+        "CREATE TRIGGER trg AFTER INSERT ON src BEGIN INSERT INTO audit VALUES ('fired'); END",
+    )
+    .unwrap();
+    conn.execute("PRAGMA capture_data_changes_conn('full')")
+        .unwrap();
+
+    conn.execute("INSERT INTO src VALUES (1)").unwrap();
+
+    let rows = limbo_exec_rows(
+        &conn,
+        "SELECT change_id, change_type, table_name FROM turso_cdc ORDER BY change_id",
+    );
+    assert_eq!(
+        rows,
+        vec![
+            vec![
+                Value::Integer(1),
+                Value::Integer(1),
+                Value::Text("audit".to_string())
+            ],
+            vec![Value::Integer(2), Value::Integer(2), Value::Null],
+        ],
+        "expected one audit INSERT row with change_id 1, then one COMMIT with change_id 2, got {rows:?}"
+    );
+}
+
+/// Regression test for https://github.com/tursodatabase/turso/issues/10154: under MVCC, a
+/// trigger subprogram allocated its CDC change id with the plain `NewRowid` path (the one used
+/// when CDC is not running under MVCC at all) instead of the CDC table's AUTOINCREMENT
+/// sequence, because `ProgramBuilder::new_for_trigger` did not inherit the parent program's
+/// MVCC flag and defaulted it to `false`. The trigger's audit row then landed on the same
+/// change id the root statement's own end-of-statement COMMIT record computed from the
+/// sequence, and the COMMIT's INSERT silently overwrote the audit row.
+#[turso_macros::test(mvcc)]
+fn test_cdc_trigger_after_insert_captures_trigger_row(db: TempDatabase) {
+    let conn = db.connect_limbo();
+    conn.execute("CREATE TABLE audit(msg)").unwrap();
+    conn.execute("CREATE TABLE t(x)").unwrap();
+    conn.execute(
+        "CREATE TRIGGER trg AFTER INSERT ON t BEGIN INSERT INTO audit VALUES ('fired'); END",
+    )
+    .unwrap();
+    conn.execute("PRAGMA capture_data_changes_conn('full')")
+        .unwrap();
+
+    conn.execute("INSERT INTO t VALUES (1)").unwrap();
+
+    let rows = limbo_exec_rows(
+        &conn,
+        "SELECT change_id, change_type, table_name FROM turso_cdc ORDER BY change_id",
+    );
+    assert_eq!(
+        rows,
+        vec![
+            vec![
+                Value::Integer(1),
+                Value::Integer(1),
+                Value::Text("t".to_string())
+            ],
+            vec![
+                Value::Integer(2),
+                Value::Integer(1),
+                Value::Text("audit".to_string())
+            ],
+            vec![Value::Integer(3), Value::Integer(2), Value::Null],
+        ],
+        "expected the root's own INSERT, the trigger's audit INSERT, then one COMMIT, each with a distinct increasing change id, got {rows:?}"
+    );
+}
+
+/// Same root cause as `test_cdc_trigger_after_insert_captures_trigger_row`, but for an FK
+/// ON DELETE CASCADE action subprogram instead of a trigger: `emit_fk_action_subprogram` built
+/// the cascade's `ProgramBuilder` the same way, without inheriting the parent's MVCC flag.
+/// Regression test for https://github.com/tursodatabase/turso/issues/10154.
+#[turso_macros::test(mvcc)]
+fn test_cdc_fk_cascade_delete_captures_child_row(db: TempDatabase) {
+    let conn = db.connect_limbo();
+    conn.execute("PRAGMA foreign_keys = ON").unwrap();
+    conn.execute("CREATE TABLE parent(id INTEGER PRIMARY KEY)")
+        .unwrap();
+    conn.execute(
+        "CREATE TABLE child(id INTEGER PRIMARY KEY, pid INTEGER REFERENCES parent(id) ON DELETE CASCADE)",
+    )
+    .unwrap();
+    conn.execute("INSERT INTO parent VALUES (1)").unwrap();
+    conn.execute("INSERT INTO child VALUES (10, 1)").unwrap();
+    conn.execute("PRAGMA capture_data_changes_conn('full')")
+        .unwrap();
+
+    conn.execute("DELETE FROM parent WHERE id = 1").unwrap();
+
+    let rows = limbo_exec_rows(
+        &conn,
+        "SELECT change_id, change_type, table_name, id FROM turso_cdc ORDER BY change_id",
+    );
+    assert_eq!(
+        rows,
+        vec![
+            vec![
+                Value::Integer(1),
+                Value::Integer(-1),
+                Value::Text("parent".to_string()),
+                Value::Integer(1)
+            ],
+            vec![
+                Value::Integer(2),
+                Value::Integer(-1),
+                Value::Text("child".to_string()),
+                Value::Integer(10)
+            ],
+            vec![
+                Value::Integer(3),
+                Value::Integer(2),
+                Value::Null,
+                Value::Null
+            ],
+        ],
+        "expected the DELETE on parent, the cascade DELETE on child, then one COMMIT, each with a distinct increasing change id, got {rows:?}"
+    );
+}
+
+/// Non-COMMIT rows in `change_id` order, as (change_type, table_name, id). Each CDC row must
+/// appear in the order its write actually happened
+/// (https://github.com/tursodatabase/turso/issues/10149).
+fn cdc_change_order(conn: &std::sync::Arc<turso_core::Connection>) -> Vec<(i64, String, i64)> {
+    limbo_exec_rows(
+        conn,
+        "SELECT change_type, table_name, id FROM turso_cdc WHERE change_type != 2 ORDER BY change_id",
+    )
+    .into_iter()
+    .map(|row| {
+        let Value::Integer(change_type) = row[0] else {
+            panic!("expected integer change_type, got {:?}", row[0]);
+        };
+        let Value::Text(ref table_name) = row[1] else {
+            panic!("expected text table_name, got {:?}", row[1]);
+        };
+        let Value::Integer(id) = row[2] else {
+            panic!("expected integer id, got {:?}", row[2]);
+        };
+        (change_type, table_name.clone(), id)
+    })
+    .collect()
+}
+
+#[turso_macros::test]
+fn test_cdc_order_after_insert_trigger_follows_the_insert(db: TempDatabase) {
+    let conn = db.connect_limbo();
+    conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, x)")
+        .unwrap();
+    conn.execute("CREATE TABLE audit(id INTEGER PRIMARY KEY, msg)")
+        .unwrap();
+    conn.execute(
+        "CREATE TRIGGER t_ai AFTER INSERT ON t BEGIN INSERT INTO audit(msg) VALUES ('inserted ' || new.id); END",
+    )
+    .unwrap();
+    conn.execute("PRAGMA capture_data_changes_conn('full')")
+        .unwrap();
+
+    conn.execute("INSERT INTO t VALUES (1, 'a')").unwrap();
+
+    assert_eq!(
+        cdc_change_order(&conn),
+        vec![(1, "t".to_string(), 1), (1, "audit".to_string(), 1)]
+    );
+}
+
+#[turso_macros::test]
+fn test_cdc_order_after_update_trigger_follows_the_update(db: TempDatabase) {
+    let conn = db.connect_limbo();
+    conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, x)")
+        .unwrap();
+    conn.execute("CREATE TABLE audit(id INTEGER PRIMARY KEY, msg)")
+        .unwrap();
+    conn.execute("INSERT INTO t VALUES (1, 'a')").unwrap();
+    conn.execute(
+        "CREATE TRIGGER t_au AFTER UPDATE ON t BEGIN INSERT INTO audit(msg) VALUES ('updated ' || new.id); END",
+    )
+    .unwrap();
+    conn.execute("PRAGMA capture_data_changes_conn('full')")
+        .unwrap();
+
+    conn.execute("UPDATE t SET x = 'b' WHERE id = 1").unwrap();
+
+    assert_eq!(
+        cdc_change_order(&conn),
+        vec![(0, "t".to_string(), 1), (1, "audit".to_string(), 1)]
+    );
+}
+
+#[turso_macros::test]
+fn test_cdc_order_after_delete_trigger_follows_the_delete(db: TempDatabase) {
+    let conn = db.connect_limbo();
+    conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, x)")
+        .unwrap();
+    conn.execute("CREATE TABLE audit(id INTEGER PRIMARY KEY, msg)")
+        .unwrap();
+    conn.execute("INSERT INTO t VALUES (1, 'a')").unwrap();
+    conn.execute(
+        "CREATE TRIGGER t_ad AFTER DELETE ON t BEGIN INSERT INTO audit(msg) VALUES ('deleted ' || old.id); END",
+    )
+    .unwrap();
+    conn.execute("PRAGMA capture_data_changes_conn('full')")
+        .unwrap();
+
+    conn.execute("DELETE FROM t WHERE id = 1").unwrap();
+
+    assert_eq!(
+        cdc_change_order(&conn),
+        vec![(-1, "t".to_string(), 1), (1, "audit".to_string(), 1)]
+    );
+}
+
+#[turso_macros::test]
+fn test_cdc_order_before_insert_trigger_precedes_the_insert(db: TempDatabase) {
+    let conn = db.connect_limbo();
+    conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, x)")
+        .unwrap();
+    conn.execute("CREATE TABLE log(id INTEGER PRIMARY KEY, msg)")
+        .unwrap();
+    conn.execute(
+        "CREATE TRIGGER t_bi BEFORE INSERT ON t BEGIN INSERT INTO log(msg) VALUES ('before insert'); END",
+    )
+    .unwrap();
+    conn.execute("PRAGMA capture_data_changes_conn('full')")
+        .unwrap();
+
+    conn.execute("INSERT INTO t VALUES (1, 'a')").unwrap();
+
+    assert_eq!(
+        cdc_change_order(&conn),
+        vec![(1, "log".to_string(), 1), (1, "t".to_string(), 1)]
+    );
+}
+
+#[turso_macros::test]
+fn test_cdc_order_before_update_trigger_precedes_the_update(db: TempDatabase) {
+    let conn = db.connect_limbo();
+    conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, x)")
+        .unwrap();
+    conn.execute("CREATE TABLE log(id INTEGER PRIMARY KEY, msg)")
+        .unwrap();
+    conn.execute("INSERT INTO t VALUES (1, 'a')").unwrap();
+    conn.execute(
+        "CREATE TRIGGER t_bu BEFORE UPDATE ON t BEGIN INSERT INTO log(msg) VALUES ('before update'); END",
+    )
+    .unwrap();
+    conn.execute("PRAGMA capture_data_changes_conn('full')")
+        .unwrap();
+
+    conn.execute("UPDATE t SET x = 'b' WHERE id = 1").unwrap();
+
+    assert_eq!(
+        cdc_change_order(&conn),
+        vec![(1, "log".to_string(), 1), (0, "t".to_string(), 1)]
+    );
+}
+
+#[turso_macros::test]
+fn test_cdc_order_before_delete_trigger_precedes_the_delete(db: TempDatabase) {
+    let conn = db.connect_limbo();
+    conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, x)")
+        .unwrap();
+    conn.execute("CREATE TABLE log(id INTEGER PRIMARY KEY, msg)")
+        .unwrap();
+    conn.execute("INSERT INTO t VALUES (1, 'a')").unwrap();
+    conn.execute(
+        "CREATE TRIGGER t_bd BEFORE DELETE ON t BEGIN INSERT INTO log(msg) VALUES ('before delete'); END",
+    )
+    .unwrap();
+    conn.execute("PRAGMA capture_data_changes_conn('full')")
+        .unwrap();
+
+    conn.execute("DELETE FROM t WHERE id = 1").unwrap();
+
+    assert_eq!(
+        cdc_change_order(&conn),
+        vec![(1, "log".to_string(), 1), (-1, "t".to_string(), 1)]
+    );
+}
+
+#[turso_macros::test]
+fn test_cdc_order_fk_cascade_delete_parent_before_child(db: TempDatabase) {
+    let conn = db.connect_limbo();
+    conn.execute("PRAGMA foreign_keys = ON").unwrap();
+    conn.execute("CREATE TABLE parent(id INTEGER PRIMARY KEY)")
+        .unwrap();
+    conn.execute(
+        "CREATE TABLE child(id INTEGER PRIMARY KEY, pid INTEGER REFERENCES parent(id) ON DELETE CASCADE)",
+    )
+    .unwrap();
+    conn.execute("INSERT INTO parent VALUES (1)").unwrap();
+    conn.execute("INSERT INTO child VALUES (10, 1)").unwrap();
+    conn.execute("PRAGMA capture_data_changes_conn('full')")
+        .unwrap();
+
+    conn.execute("DELETE FROM parent WHERE id = 1").unwrap();
+
+    assert_eq!(
+        cdc_change_order(&conn),
+        vec![(-1, "parent".to_string(), 1), (-1, "child".to_string(), 10)]
+    );
+}
+
+#[turso_macros::test]
+fn test_cdc_order_fk_cascade_update_parent_before_child(db: TempDatabase) {
+    let conn = db.connect_limbo();
+    conn.execute("PRAGMA foreign_keys = ON").unwrap();
+    conn.execute("CREATE TABLE parent(id INTEGER PRIMARY KEY, code TEXT UNIQUE)")
+        .unwrap();
+    conn.execute(
+        "CREATE TABLE child(id INTEGER PRIMARY KEY, pcode TEXT REFERENCES parent(code) ON UPDATE CASCADE)",
+    )
+    .unwrap();
+    conn.execute("INSERT INTO parent VALUES (1, 'a')").unwrap();
+    conn.execute("INSERT INTO child VALUES (10, 'a')").unwrap();
+    conn.execute("PRAGMA capture_data_changes_conn('full')")
+        .unwrap();
+
+    conn.execute("UPDATE parent SET code = 'b' WHERE id = 1")
+        .unwrap();
+
+    assert_eq!(
+        cdc_change_order(&conn),
+        vec![(0, "parent".to_string(), 1), (0, "child".to_string(), 10)]
+    );
+}
+
+#[turso_macros::test]
+fn test_cdc_order_upsert_do_update_fk_cascade_parent_before_child(db: TempDatabase) {
+    let conn = db.connect_limbo();
+    conn.execute("PRAGMA foreign_keys = ON").unwrap();
+    conn.execute("CREATE TABLE parent(id INTEGER PRIMARY KEY, code TEXT UNIQUE)")
+        .unwrap();
+    conn.execute(
+        "CREATE TABLE child(id INTEGER PRIMARY KEY, pcode TEXT REFERENCES parent(code) ON UPDATE CASCADE)",
+    )
+    .unwrap();
+    conn.execute("INSERT INTO parent VALUES (1, 'a')").unwrap();
+    conn.execute("INSERT INTO child VALUES (10, 'a')").unwrap();
+    conn.execute("PRAGMA capture_data_changes_conn('full')")
+        .unwrap();
+
+    conn.execute(
+        "INSERT INTO parent(id, code) VALUES (1, 'b') ON CONFLICT(id) DO UPDATE SET code = excluded.code",
+    )
+    .unwrap();
+
+    assert_eq!(
+        cdc_change_order(&conn),
+        vec![(0, "parent".to_string(), 1), (0, "child".to_string(), 10)]
+    );
+}
+
+// TODO: cannot use mvcc, FK CASCADE writes are not captured by CDC under mvcc at all
+#[turso_macros::test()]
+fn test_cdc_order_update_rowid_change_fk_cascade_parent_before_child(db: TempDatabase) {
+    let conn = db.connect_limbo();
+    conn.execute("PRAGMA foreign_keys = ON").unwrap();
+    conn.execute("CREATE TABLE parent(id INTEGER PRIMARY KEY)")
+        .unwrap();
+    conn.execute(
+        "CREATE TABLE child(id INTEGER PRIMARY KEY, pid INTEGER REFERENCES parent(id) ON UPDATE CASCADE)",
+    )
+    .unwrap();
+    conn.execute("INSERT INTO parent VALUES (1)").unwrap();
+    conn.execute("INSERT INTO child VALUES (10, 1)").unwrap();
+    conn.execute("PRAGMA capture_data_changes_conn('full')")
+        .unwrap();
+
+    conn.execute("UPDATE parent SET id = 2 WHERE id = 1")
+        .unwrap();
+
+    assert_eq!(
+        cdc_change_order(&conn),
+        vec![
+            (-1, "parent".to_string(), 1),
+            (1, "parent".to_string(), 2),
+            (0, "child".to_string(), 10),
+        ]
+    );
+}
+
+// TODO: cannot use mvcc, FK CASCADE writes are not captured by CDC under mvcc at all
+#[turso_macros::test()]
+fn test_cdc_order_upsert_do_update_rowid_change_fk_cascade_parent_before_child(db: TempDatabase) {
+    let conn = db.connect_limbo();
+    conn.execute("PRAGMA foreign_keys = ON").unwrap();
+    conn.execute("CREATE TABLE parent(id INTEGER PRIMARY KEY)")
+        .unwrap();
+    conn.execute(
+        "CREATE TABLE child(id INTEGER PRIMARY KEY, pid INTEGER REFERENCES parent(id) ON UPDATE CASCADE)",
+    )
+    .unwrap();
+    conn.execute("INSERT INTO parent VALUES (1)").unwrap();
+    conn.execute("INSERT INTO child VALUES (10, 1)").unwrap();
+    conn.execute("PRAGMA capture_data_changes_conn('full')")
+        .unwrap();
+
+    conn.execute("INSERT INTO parent(id) VALUES (1) ON CONFLICT(id) DO UPDATE SET id = 2")
+        .unwrap();
+
+    assert_eq!(
+        cdc_change_order(&conn),
+        vec![
+            (-1, "parent".to_string(), 1),
+            (1, "parent".to_string(), 2),
+            (0, "child".to_string(), 10),
+        ]
+    );
 }

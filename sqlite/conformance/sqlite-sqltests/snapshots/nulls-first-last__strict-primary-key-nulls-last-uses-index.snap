@@ -1,0 +1,13 @@
+---
+source: nulls-first-last.sqltest
+expression: SELECT code FROM spk ORDER BY code NULLS LAST LIMIT 2;
+info:
+  statement_type: SELECT
+  tables:
+  - spk
+  setup_blocks:
+  - strict-primary-key-table
+  database: ':memory:'
+---
+QUERY PLAN
+`--SCAN spk USING COVERING INDEX sqlite_autoindex_spk_1

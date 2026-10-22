@@ -23,7 +23,7 @@ pub struct TranslateResult {
 /// Translates a PostgreSQL query into Turso's AST
 #[derive(Default)]
 pub struct PostgreSQLTranslator {
-    // TODO: Add schema information, type mappings, etc.
+    translating_index: std::cell::Cell<bool>,
 }
 
 impl PostgreSQLTranslator {
@@ -36,22 +36,29 @@ impl PostgreSQLTranslator {
         &self,
         range_var: &pg_query::protobuf::RangeVar,
     ) -> ast::QualifiedName {
-        let mapped_name = self.map_table_name(&range_var.relname);
+        let is_schemata = range_var
+            .schemaname
+            .eq_ignore_ascii_case("information_schema")
+            && range_var.relname.eq_ignore_ascii_case("schemata");
+        let mapped_name = if is_schemata {
+            "pg_information_schema_schemata".to_string()
+        } else {
+            self.map_table_name(&range_var.relname)
+        };
         let name = ast::Name::from_string(mapped_name);
         let alias = range_var
             .alias
             .as_ref()
             .filter(|a| !a.aliasname.is_empty())
             .map(|a| ast::Name::from_string(&a.aliasname));
-        let mut qn = if range_var.schemaname.is_empty()
-            || matches!(
-                range_var.schemaname.to_lowercase().as_str(),
-                "pg_catalog" | "public" | "information_schema"
-            ) {
-            ast::QualifiedName::single(name)
+        let schema = if range_var.schemaname.is_empty() {
+            is_catalog_table_name(name.as_str()).then_some("main")
         } else {
-            let schema = ast::Name::from_string(range_var.schemaname.clone());
-            ast::QualifiedName::fullname(schema, name)
+            Some(map_schema_name(&range_var.schemaname))
+        };
+        let mut qn = match schema {
+            Some(schema) => ast::QualifiedName::fullname(ast::Name::from_string(schema), name),
+            None => ast::QualifiedName::single(name),
         };
         qn.alias = alias;
         qn
@@ -88,7 +95,10 @@ impl PostgreSQLTranslator {
             | "pg_publication_namespace"
             | "pg_publication_rel"
             | "pg_get_tabledef"
-            | "pg_tables" => table_name.to_string(),
+            | "pg_settings"
+            | "pg_extension"
+            | "pg_tables"
+            | "pg_indexes" => table_name.to_string(),
             "information_schema.tables" => "sqlite_master".to_string(),
             "information_schema.columns" => "pragma_table_info".to_string(),
             // Default: keep original name
@@ -157,6 +167,7 @@ impl PostgreSQLTranslator {
             NodeRef::UpdateStmt(update) => self.translate_update(update)?,
             NodeRef::DeleteStmt(delete) => self.translate_delete(delete)?,
             NodeRef::TransactionStmt(txn) => self.translate_transaction(txn)?,
+            NodeRef::LockStmt(lock) => self.translate_lock_stub(lock)?,
             NodeRef::DropStmt(drop) => self.translate_drop(drop)?,
             NodeRef::AlterTableStmt(alter) => self.translate_alter_table(alter)?,
             NodeRef::RenameStmt(rename) => self.translate_rename_stmt(rename)?,
@@ -201,6 +212,49 @@ impl PostgreSQLTranslator {
         })
     }
 
+    fn translate_lock_stub(
+        &self,
+        lock: &pg_query::protobuf::LockStmt,
+    ) -> Result<ast::Stmt, ParseError> {
+        if lock.mode != 1 || lock.nowait {
+            return Err(ParseError::ParseError(
+                "only LOCK IN ACCESS SHARE MODE without NOWAIT is supported".to_string(),
+            ));
+        }
+        Ok(ast::Stmt::Select(ast::Select {
+            with: None,
+            body: ast::SelectBody {
+                select: ast::OneSelect::Select {
+                    distinctness: None,
+                    columns: vec![ast::ResultColumn::Expr(
+                        Box::new(ast::Expr::Literal(ast::Literal::Numeric("0".into()))),
+                        None,
+                    )],
+                    from: None,
+                    where_clause: None,
+                    group_by: None,
+                    window_clause: vec![],
+                },
+                compounds: vec![],
+            },
+            order_by: vec![],
+            limit: Some(ast::Limit {
+                expr: Box::new(ast::Expr::FunctionCall {
+                    name: ast::Name::from_string("pg_lock_access_share"),
+                    distinctness: None,
+                    args: vec![],
+                    order_by: vec![],
+                    within_group: vec![],
+                    filter_over: ast::FunctionTail {
+                        filter_clause: None,
+                        over_clause: None,
+                    },
+                }),
+                offset: None,
+            }),
+        }))
+    }
+
     /// Translate a PostgreSQL CREATE TABLE statement into Turso AST.
     /// PG-created tables are always STRICT to enable Turso custom types.
     fn translate_create_table(
@@ -228,9 +282,6 @@ impl PostgreSQLTranslator {
         // Collect implicit sequence names for serial columns
         let mut serial_sequences: Vec<String> = Vec::new();
 
-        // Extract table name for serial sequence naming
-        let tbl_name_str = tbl_name.name.as_str().to_string();
-
         // Check for table-level PK (to suppress column-level PK emission)
         let mut has_table_pk = false;
         for elt in &create.table_elts {
@@ -252,7 +303,7 @@ impl PostgreSQLTranslator {
                     let col = self.translate_create_table_column(
                         col_def,
                         has_table_pk,
-                        &tbl_name_str,
+                        &tbl_name,
                         &mut serial_sequences,
                     )?;
                     columns.push(col);
@@ -343,18 +394,27 @@ impl PostgreSQLTranslator {
     }
 
     /// Translate CREATE TABLE, generating prerequisite CREATE SEQUENCE statements
-    /// for any serial columns.
+    /// for any serial columns. The sequences go to the namespace of the table,
+    /// which the column defaults name too, so they stay bound to the table
+    /// whatever `search_path` is later.
     fn translate_create_table_with_prereqs(
         &self,
         create: &pg_query::protobuf::CreateStmt,
     ) -> Result<TranslateResult, ParseError> {
         let (stmt, serial_sequences) = self.translate_create_table(create)?;
+        let ast::Stmt::CreateTable { tbl_name, .. } = &stmt else {
+            unreachable!("translate_create_table returns a CREATE TABLE statement");
+        };
+        let namespace = serial_sequence_namespace(tbl_name);
 
         let prereqs = serial_sequences
             .into_iter()
             .map(|seq_name| ast::Stmt::CreateSequence {
                 if_not_exists: true,
-                seq_name: ast::QualifiedName::single(ast::Name::from_string(seq_name)),
+                seq_name: ast::QualifiedName::fullname(
+                    ast::Name::from_string(&namespace),
+                    ast::Name::from_string(seq_name),
+                ),
                 start: None,
                 increment: None,
                 min_value: None,
@@ -375,7 +435,7 @@ impl PostgreSQLTranslator {
         &self,
         col_def: &pg_query::protobuf::ColumnDef,
         has_table_pk: bool,
-        table_name: &str,
+        tbl_name: &ast::QualifiedName,
         serial_sequences: &mut Vec<String>,
     ) -> Result<ast::ColumnDefinition, ParseError> {
         use pg_query::protobuf::node::Node;
@@ -459,15 +519,20 @@ impl PostgreSQLTranslator {
         // Build constraints list
         let mut constraints = Vec::new();
 
-        // For serial columns, add DEFAULT nextval('tablename_colname_seq')
+        // For serial columns, add DEFAULT nextval('namespace.tablename_colname_seq')
         if is_serial && default_expr.is_none() {
-            let seq_name = format!("{}_{}_seq", table_name.to_lowercase(), name.to_lowercase());
+            let seq_name = format!(
+                "{}_{}_seq",
+                tbl_name.name.as_str().to_lowercase(),
+                name.to_lowercase()
+            );
             serial_sequences.push(seq_name.clone());
+            let namespace = serial_sequence_namespace(tbl_name);
             default_expr = Some(ast::Expr::FunctionCall {
                 name: ast::Name::from_string("nextval"),
                 distinctness: None,
                 args: vec![Box::new(ast::Expr::Literal(ast::Literal::String(format!(
-                    "'{seq_name}'"
+                    "'{namespace}.{seq_name}'"
                 ))))],
                 order_by: vec![],
                 within_group: vec![],
@@ -850,15 +915,45 @@ impl PostgreSQLTranslator {
         &self,
         idx: &pg_query::protobuf::IndexStmt,
     ) -> Result<ast::Stmt, ParseError> {
-        use pg_query::protobuf::node::Node;
-
         let relation = idx
             .relation
             .as_ref()
             .ok_or_else(|| ParseError::ParseError("CREATE INDEX missing table name".into()))?;
         let tbl_name = ast::Name::from_string(self.map_table_name(&relation.relname));
 
-        let idx_name = ast::QualifiedName::single(ast::Name::from_string(&idx.idxname));
+        // SQLite names the database on the index, not on the table, and
+        // looks the table up there.
+        let idx_name = if relation.schemaname.is_empty() {
+            ast::QualifiedName::single(ast::Name::from_string(&idx.idxname))
+        } else {
+            ast::QualifiedName::fullname(
+                ast::Name::from_string(map_schema_name(&relation.schemaname)),
+                ast::Name::from_string(&idx.idxname),
+            )
+        };
+
+        self.translating_index.set(true);
+        let index_parts = self.translate_index_parts(idx);
+        self.translating_index.set(false);
+        let (columns, where_clause) = index_parts?;
+
+        Ok(ast::Stmt::CreateIndex {
+            unique: idx.unique,
+            if_not_exists: idx.if_not_exists,
+            idx_name,
+            tbl_name,
+            using: None,
+            columns,
+            with_clause: vec![],
+            where_clause,
+        })
+    }
+
+    fn translate_index_parts(
+        &self,
+        idx: &pg_query::protobuf::IndexStmt,
+    ) -> Result<(Vec<ast::SortedColumn>, Option<Box<ast::Expr>>), ParseError> {
+        use pg_query::protobuf::node::Node;
 
         let mut columns = Vec::new();
         for param_node in &idx.index_params {
@@ -898,16 +993,7 @@ impl PostgreSQLTranslator {
             None
         };
 
-        Ok(ast::Stmt::CreateIndex {
-            unique: idx.unique,
-            if_not_exists: idx.if_not_exists,
-            idx_name,
-            tbl_name,
-            using: None,
-            columns,
-            with_clause: vec![],
-            where_clause,
-        })
+        Ok((columns, where_clause))
     }
 
     fn translate_drop(&self, drop: &pg_query::protobuf::DropStmt) -> Result<ast::Stmt, ParseError> {
@@ -1259,7 +1345,7 @@ impl PostgreSQLTranslator {
                 (ast::InsertBody::DefaultValues, filtered_columns)
             } else {
                 let select = ast::Select {
-                    with: None,
+                    with: self.translate_with_clause(&select_stmt.with_clause)?,
                     body: ast::SelectBody {
                         select: ast::OneSelect::Values(rows),
                         compounds: vec![],
@@ -1275,7 +1361,7 @@ impl PostgreSQLTranslator {
             (ast::InsertBody::Select(select, upsert), columns)
         };
 
-        let returning = self.translate_returning(&insert.returning_list)?;
+        let returning = self.translate_returning(&insert.returning_list, relation)?;
         let with = self.translate_with_clause(&insert.with_clause)?;
 
         Ok(ast::Stmt::Insert {
@@ -1403,7 +1489,7 @@ impl PostgreSQLTranslator {
             None
         };
 
-        let returning = self.translate_returning(&update.returning_list)?;
+        let returning = self.translate_returning(&update.returning_list, relation)?;
         let with = self.translate_with_clause(&update.with_clause)?;
 
         Ok(ast::Stmt::Update(ast::Update {
@@ -1436,7 +1522,7 @@ impl PostgreSQLTranslator {
             None
         };
 
-        let returning = self.translate_returning(&delete.returning_list)?;
+        let returning = self.translate_returning(&delete.returning_list, relation)?;
         let with = self.translate_with_clause(&delete.with_clause)?;
 
         Ok(ast::Stmt::Delete {
@@ -1490,8 +1576,9 @@ impl PostgreSQLTranslator {
             };
             let order_by = self.translate_order_by(&select.sort_clause)?;
             let limit = self.translate_limit(&select.limit_count, &select.limit_offset)?;
+            let with = self.translate_with_clause(&select.with_clause)?;
             return Ok(ast::Select {
-                with: None,
+                with,
                 body,
                 order_by,
                 limit,
@@ -1592,9 +1679,10 @@ impl PostgreSQLTranslator {
 
         let order_by = self.translate_order_by(&select.sort_clause)?;
         let limit = self.translate_limit(&select.limit_count, &select.limit_offset)?;
+        let with = self.translate_with_clause(&select.with_clause)?;
 
         Ok(ast::Select {
-            with: None,
+            with,
             body: ast::SelectBody {
                 select: first_select,
                 compounds,
@@ -1712,8 +1800,19 @@ impl PostgreSQLTranslator {
                 Some(pg_query::protobuf::node::Node::JoinExpr(join_expr)) => {
                     // A JoinExpr as a comma-separated item — flatten its joins
                     let nested = self.translate_join_expr(join_expr)?;
+                    if nested.joins.iter().any(join_keeps_unmatched_right_rows) {
+                        return Err(ParseError::ParseError(
+                            "RIGHT and FULL joins after a comma in FROM are not supported"
+                                .to_string(),
+                        ));
+                    }
+                    from_clause.joins.push(ast::JoinedSelectTable {
+                        operator: ast::JoinOperator::Comma,
+                        table: nested.select,
+                        constraint: None,
+                    });
                     from_clause.joins.extend(nested.joins);
-                    *nested.select
+                    continue;
                 }
                 Some(pg_query::protobuf::node::Node::RangeFunction(range_func)) => {
                     self.translate_range_function(range_func)?
@@ -1778,10 +1877,14 @@ impl PostgreSQLTranslator {
         range_var: &pg_query::protobuf::RangeVar,
     ) -> Result<ast::SelectTable, ParseError> {
         let qualified_name = self.qualified_name_from_range_var(range_var);
-        let alias = range_var
-            .alias
-            .as_ref()
-            .map(|a| ast::As::Elided(ast::Name::from_string(a.aliasname.clone())));
+        let alias = match &range_var.alias {
+            Some(a) => Some(a.aliasname.clone()),
+            None if qualified_name.name.as_str() != range_var.relname => {
+                Some(range_var.relname.clone())
+            }
+            None => None,
+        }
+        .map(|name| ast::As::Elided(ast::Name::from_string(name)));
 
         Ok(ast::SelectTable::Table(qualified_name, alias, None))
     }
@@ -1802,12 +1905,19 @@ impl PostgreSQLTranslator {
                 ));
             }
         };
-        let select = self.translate_select(select_stmt)?;
+        let mut select = self.translate_select(select_stmt)?;
+        if let Some(alias) = &range_sub.alias {
+            rename_result_columns(&mut select, &alias.aliasname, alias_column_names(alias)?)?;
+        }
         let alias = range_sub
             .alias
             .as_ref()
             .map(|a| ast::As::Elided(ast::Name::from_string(a.aliasname.clone())));
-        Ok(ast::SelectTable::Select(select, alias))
+        Ok(ast::SelectTable::Select {
+            select,
+            alias,
+            lateral: range_sub.lateral,
+        })
     }
 
     fn translate_range_function(
@@ -1919,14 +2029,284 @@ impl PostgreSQLTranslator {
                 order_by: vec![],
                 limit: None,
             };
-            return Ok(ast::SelectTable::Select(select, alias));
+            return Ok(ast::SelectTable::Select {
+                select,
+                alias,
+                lateral: false,
+            });
         }
 
-        Ok(ast::SelectTable::TableCall(
-            ast::QualifiedName::single(ast::Name::from_string(func_name)),
+        let name = ast::Name::from_string(func_name);
+        let qualified_name = if is_catalog_table_name(func_name) {
+            ast::QualifiedName::fullname(ast::Name::from_string("main"), name)
+        } else {
+            ast::QualifiedName::single(name)
+        };
+        if func_name == "unnest" {
+            if args.len() != 1 || range_func.ordinality || range_func.functions.len() != 1 {
+                return Err(ParseError::ParseError(
+                    "unnest currently requires one array without WITH ORDINALITY or ROWS FROM"
+                        .into(),
+                ));
+            }
+            let column_name = match range_func.alias.as_ref() {
+                Some(alias) if alias.colnames.len() > 1 => {
+                    return Err(ParseError::ParseError(
+                        "unnest has only one output column".into(),
+                    ));
+                }
+                Some(alias) => match alias.colnames.first().and_then(|node| node.node.as_ref()) {
+                    Some(pg_query::protobuf::node::Node::String(name)) => name.sval.clone(),
+                    None => alias.aliasname.clone(),
+                    _ => {
+                        return Err(ParseError::ParseError("invalid unnest column alias".into()));
+                    }
+                },
+                None => "unnest".into(),
+            };
+            return Ok(ast::SelectTable::Select {
+                select: single_column_function_select(qualified_name, args, "unnest", column_name),
+                alias,
+                lateral: true,
+            });
+        }
+        if matches!(
+            func_name,
+            "json_to_record" | "json_to_recordset" | "jsonb_to_record" | "jsonb_to_recordset"
+        ) {
+            return self.translate_json_to_record(func_name, range_func, &args, alias);
+        }
+        if func_name == "generate_series" {
+            if let Some(range_alias) = &range_func.alias {
+                let names = alias_column_names(range_alias)?;
+                if names.len() > 1 {
+                    return Err(ParseError::ParseError(format!(
+                        "table \"{}\" has 1 columns available but {} columns specified",
+                        range_alias.aliasname,
+                        names.len()
+                    )));
+                }
+                if let Some(column_name) = names.into_iter().next() {
+                    return Ok(ast::SelectTable::Select {
+                        select: single_column_function_select(
+                            qualified_name,
+                            args,
+                            "value",
+                            column_name,
+                        ),
+                        alias,
+                        lateral: true,
+                    });
+                }
+            }
+        }
+        Ok(ast::SelectTable::TableCall(qualified_name, args, alias))
+    }
+
+    fn translate_json_to_record(
+        &self,
+        func_name: &str,
+        range_func: &pg_query::protobuf::RangeFunction,
+        args: &[Box<ast::Expr>],
+        alias: Option<ast::As>,
+    ) -> Result<ast::SelectTable, ParseError> {
+        if range_func.ordinality || range_func.functions.len() != 1 {
+            return Err(ParseError::ParseError(format!(
+                "{func_name} does not support WITH ORDINALITY or ROWS FROM"
+            )));
+        }
+        let [arg] = args else {
+            return Err(ParseError::ParseError(format!(
+                "{func_name} requires exactly one argument"
+            )));
+        };
+        if range_func.coldeflist.is_empty() {
+            return Err(ParseError::ParseError(
+                "a column definition list is required for functions returning \"record\"".into(),
+            ));
+        }
+        let is_recordset = func_name.ends_with("recordset");
+        let (arg_type, other_type_errors, scalar_error) = match func_name {
+            "json_to_recordset" => (
+                "array",
+                vec![("object", format!("cannot call {func_name} on an object"))],
+                format!("cannot call {func_name} on a scalar"),
+            ),
+            "jsonb_to_recordset" => (
+                "array",
+                vec![],
+                format!("cannot call {func_name} on a non-array"),
+            ),
+            _ => (
+                "object",
+                vec![("array", "cannot call populate_composite on an array".into())],
+                "cannot call populate_composite on a scalar".into(),
+            ),
+        };
+        let json_type = |args: Vec<Box<ast::Expr>>| ast::Expr::FunctionCall {
+            name: ast::Name::from_string("json_type"),
+            distinctness: None,
             args,
-            alias,
-        ))
+            order_by: vec![],
+            within_group: vec![],
+            filter_over: ast::FunctionTail {
+                filter_clause: None,
+                over_clause: None,
+            },
+        };
+        let checked_arg = json_type_or_raise(
+            json_type(vec![arg.clone()]),
+            (**arg).clone(),
+            arg_type,
+            &other_type_errors,
+            &scalar_error,
+        );
+        let arg_subquery = ast::SelectTable::Select {
+            select: ast::Select {
+                with: None,
+                body: ast::SelectBody {
+                    select: ast::OneSelect::Select {
+                        distinctness: None,
+                        columns: vec![ast::ResultColumn::Expr(
+                            Box::new(checked_arg),
+                            Some(ast::As::Elided(ast::Name::from_string("json"))),
+                        )],
+                        from: None,
+                        where_clause: None,
+                        group_by: None,
+                        window_clause: vec![],
+                    },
+                    compounds: vec![],
+                },
+                order_by: vec![],
+                limit: None,
+            },
+            alias: Some(ast::As::Elided(ast::Name::from_string("arg"))),
+            lateral: false,
+        };
+        let arg_json = ast::Expr::Qualified(
+            ast::Name::from_string("arg"),
+            ast::Name::from_string("json"),
+        );
+        let (source, joins) = if is_recordset {
+            let json_each = ast::SelectTable::TableCall(
+                ast::QualifiedName::single(ast::Name::from_string("json_each")),
+                vec![Box::new(arg_json)],
+                Some(ast::As::Elided(ast::Name::from_string("element"))),
+            );
+            let element = |column: &str| {
+                ast::Expr::Qualified(
+                    ast::Name::from_string("element"),
+                    ast::Name::from_string(column),
+                )
+            };
+            (
+                json_type_or_raise(
+                    element("type"),
+                    element("value"),
+                    "object",
+                    &[],
+                    &format!("argument of {func_name} must be an array of objects"),
+                ),
+                vec![ast::JoinedSelectTable {
+                    operator: ast::JoinOperator::Comma,
+                    table: Box::new(json_each),
+                    constraint: None,
+                }],
+            )
+        } else {
+            (arg_json, vec![])
+        };
+        let columns = range_func
+            .coldeflist
+            .iter()
+            .map(|node| {
+                let Some(pg_query::protobuf::node::Node::ColumnDef(col_def)) = &node.node else {
+                    return Err(ParseError::ParseError(
+                        "invalid column definition list".into(),
+                    ));
+                };
+                let type_name = col_def.type_name.as_ref().ok_or_else(|| {
+                    ParseError::ParseError(format!("column {} missing type", col_def.colname))
+                })?;
+                let is_json = matches!(
+                    extract_type_name_from_typename(type_name)?
+                        .to_lowercase()
+                        .as_str(),
+                    "json" | "jsonb"
+                );
+                let cast_type = pg_type_name_to_ast_type(type_name);
+                let path = Box::new(ast::Expr::Literal(ast::Literal::String(format!(
+                    "'$.\"{}\"'",
+                    col_def
+                        .colname
+                        .replace('\\', "\\\\")
+                        .replace('"', "\\\"")
+                        .replace('\'', "''")
+                ))));
+                let extract =
+                    |operator| ast::Expr::Binary(Box::new(source.clone()), operator, path.clone());
+                let reads_json_text =
+                    is_json || cast_type.as_ref().is_some_and(|t| t.name == "TEXT");
+                let value = if reads_json_text {
+                    let mut when_then_pairs = vec![(
+                        Box::new(ast::Expr::Literal(ast::Literal::String("'null'".into()))),
+                        Box::new(ast::Expr::Literal(ast::Literal::Null)),
+                    )];
+                    if !is_json {
+                        when_then_pairs.push((
+                            Box::new(ast::Expr::Literal(ast::Literal::String("'text'".into()))),
+                            Box::new(extract(ast::Operator::ArrowRightShift)),
+                        ));
+                    }
+                    ast::Expr::Case {
+                        base: Some(Box::new(json_type(vec![
+                            Box::new(source.clone()),
+                            path.clone(),
+                        ]))),
+                        when_then_pairs,
+                        else_expr: Some(Box::new(extract(ast::Operator::ArrowRight))),
+                    }
+                } else {
+                    extract(ast::Operator::ArrowRightShift)
+                };
+                let cast = ast::Expr::Cast {
+                    expr: Box::new(value),
+                    type_name: cast_type,
+                };
+                Ok(ast::ResultColumn::Expr(
+                    Box::new(cast),
+                    Some(ast::As::Elided(ast::Name::from_string(
+                        col_def.colname.clone(),
+                    ))),
+                ))
+            })
+            .collect::<Result<Vec<_>, ParseError>>()?;
+        Ok(ast::SelectTable::Select {
+            select: ast::Select {
+                with: None,
+                body: ast::SelectBody {
+                    select: ast::OneSelect::Select {
+                        distinctness: None,
+                        columns,
+                        from: Some(ast::FromClause {
+                            select: Box::new(arg_subquery),
+                            joins,
+                        }),
+                        where_clause: None,
+                        group_by: None,
+                        window_clause: vec![],
+                    },
+                    compounds: vec![],
+                },
+                order_by: vec![],
+                limit: None,
+            },
+            alias: Some(
+                alias.unwrap_or_else(|| ast::As::Elided(ast::Name::from_string(func_name))),
+            ),
+            lateral: true,
+        })
     }
 
     fn translate_join_expr(
@@ -1960,6 +2340,9 @@ impl PostgreSQLTranslator {
                 Some(pg_query::protobuf::node::Node::RangeSubselect(range_sub)) => {
                     self.translate_range_subselect(range_sub)?
                 }
+                Some(pg_query::protobuf::node::Node::RangeFunction(range_func)) => {
+                    self.translate_range_function(range_func)?
+                }
                 _ => {
                     return Err(ParseError::ParseError(format!(
                         "Unsupported left side of JOIN: {:?}",
@@ -1980,16 +2363,13 @@ impl PostgreSQLTranslator {
                     self.translate_range_var(range_var)?
                 }
                 Some(pg_query::protobuf::node::Node::JoinExpr(nested_join)) => {
-                    // Nested join on the right side: wrap as a subquery-like structure
-                    // For now, flatten it too (handles chained joins)
-                    let mut right_joins = Vec::new();
-                    let right_primary = self.flatten_join_tree(nested_join, &mut right_joins)?;
-                    // Add the right-side joins first, then the right primary becomes a joined table
-                    joins.extend(right_joins);
-                    right_primary
+                    ast::SelectTable::Sub(self.translate_join_expr(nested_join)?, None)
                 }
                 Some(pg_query::protobuf::node::Node::RangeSubselect(range_sub)) => {
                     self.translate_range_subselect(range_sub)?
+                }
+                Some(pg_query::protobuf::node::Node::RangeFunction(range_func)) => {
+                    self.translate_range_function(range_func)?
                 }
                 _ => {
                     return Err(ParseError::ParseError(format!(
@@ -2096,8 +2476,12 @@ impl PostgreSQLTranslator {
                         } else {
                             let expr = self.translate_expr(val)?;
                             let alias: Option<ast::As> = if res_target.name.is_empty() {
-                                derived_column_name(val)
-                                    .map(|name| ast::As::Elided(ast::Name::from_string(name)))
+                                Some(match derived_column_name(val) {
+                                    Some(name) => ast::As::Elided(ast::Name::from_string(name)),
+                                    None => ast::As::ImplicitColumnName(ast::Name::from_string(
+                                        "?column?",
+                                    )),
+                                })
                             } else {
                                 Some(ast::As::Elided(ast::Name::from_string(&res_target.name)))
                             };
@@ -2138,9 +2522,10 @@ impl PostgreSQLTranslator {
                                 }
                                 match parts.len() {
                                     3 => {
-                                        // schema.table.column
+                                        // schema.table.column. The table name is not mapped:
+                                        // FROM aliases a renamed table with its original name.
                                         Ok(ast::Expr::DoublyQualified(
-                                            ast::Name::from_string(parts[0].clone()),
+                                            ast::Name::from_string(map_schema_name(&parts[0])),
                                             ast::Name::from_string(parts[1].clone()),
                                             ast::Name::from_string(parts[2].clone()),
                                         ))
@@ -2214,7 +2599,7 @@ impl PostgreSQLTranslator {
                     .arg
                     .as_ref()
                     .ok_or_else(|| ParseError::ParseError("NullTest missing arg".to_string()))?;
-                let expr = self.translate_expr(arg)?;
+                let expr = self.translate_operand(arg)?;
                 match null_test.nulltesttype() {
                     NullTestType::IsNotNull => Ok(ast::Expr::NotNull(Box::new(expr))),
                     _ => Ok(ast::Expr::IsNull(Box::new(expr))),
@@ -2233,7 +2618,7 @@ impl PostgreSQLTranslator {
                     .arg
                     .as_ref()
                     .ok_or_else(|| ParseError::ParseError("BooleanTest missing arg".into()))?;
-                let expr = self.translate_expr(arg)?;
+                let expr = self.translate_operand(arg)?;
                 // Map IS TRUE / IS FALSE / IS NOT TRUE / IS NOT FALSE / IS UNKNOWN / IS NOT UNKNOWN
                 match BoolTestType::try_from(bt.booltesttype) {
                     Ok(BoolTestType::IsTrue) => Ok(ast::Expr::Binary(
@@ -2527,14 +2912,7 @@ impl PostgreSQLTranslator {
                 // IN operator
                 self.translate_in_expr(a_expr)
             }
-            AExprKind::AexprLike => {
-                // LIKE/NOT LIKE operator
-                self.translate_like_expr(a_expr)
-            }
-            AExprKind::AexprIlike => {
-                // ILIKE/NOT ILIKE → LOWER(lhs) LIKE LOWER(rhs)
-                self.translate_ilike_expr(a_expr)
-            }
+            AExprKind::AexprLike | AExprKind::AexprIlike => self.translate_like_expr(a_expr),
             AExprKind::AexprOpAny => self.translate_any_all_expr(a_expr, false),
             AExprKind::AexprOpAll => self.translate_any_all_expr(a_expr, true),
             AExprKind::AexprBetween | AExprKind::AexprBetweenSym => {
@@ -2554,9 +2932,9 @@ impl PostgreSQLTranslator {
                     .as_ref()
                     .ok_or_else(|| ParseError::ParseError("DISTINCT FROM: missing rhs".into()))?;
                 Ok(ast::Expr::Binary(
-                    Box::new(self.translate_expr(lhs)?),
+                    Box::new(self.translate_operand(lhs)?),
                     ast::Operator::IsNot,
-                    Box::new(self.translate_expr(rhs)?),
+                    Box::new(self.translate_operand(rhs)?),
                 ))
             }
             AExprKind::AexprNotDistinct => {
@@ -2568,9 +2946,9 @@ impl PostgreSQLTranslator {
                     ParseError::ParseError("NOT DISTINCT FROM: missing rhs".into())
                 })?;
                 Ok(ast::Expr::Binary(
-                    Box::new(self.translate_expr(lhs)?),
+                    Box::new(self.translate_operand(lhs)?),
                     ast::Operator::Is,
-                    Box::new(self.translate_expr(rhs)?),
+                    Box::new(self.translate_operand(rhs)?),
                 ))
             }
             AExprKind::AexprNullif => {
@@ -2627,7 +3005,7 @@ impl PostgreSQLTranslator {
                     _ => rhs_node,
                 };
 
-                let rhs_expr = self.translate_expr(pattern_node)?;
+                let rhs_expr = self.translate_operand(pattern_node)?;
                 let regex_rhs = match rhs_expr {
                     ast::Expr::Literal(ast::Literal::String(ref pat)) => {
                         // String literals in our AST include surrounding quotes
@@ -2643,7 +3021,7 @@ impl PostgreSQLTranslator {
                 };
 
                 Ok(ast::Expr::Like {
-                    lhs: Box::new(self.translate_expr(lhs)?),
+                    lhs: Box::new(self.translate_operand(lhs)?),
                     not,
                     op: ast::LikeOperator::Regexp,
                     rhs: Box::new(regex_rhs),
@@ -2679,7 +3057,7 @@ impl PostgreSQLTranslator {
                 .rexpr
                 .as_ref()
                 .ok_or_else(|| ParseError::ParseError("Missing right expression".into()))?;
-            let operand = self.translate_expr(rhs)?;
+            let operand = self.translate_operand(rhs)?;
             return match op_name {
                 "+" => Ok(ast::Expr::Unary(
                     ast::UnaryOperator::Positive,
@@ -2700,14 +3078,26 @@ impl PostgreSQLTranslator {
         }
 
         // Translate left and right expressions
-        let left = Box::new(self.translate_expr(a_expr.lexpr.as_ref().unwrap())?);
+        let left = Box::new(self.translate_operand(a_expr.lexpr.as_ref().unwrap())?);
 
         let right = if let Some(rexpr) = &a_expr.rexpr {
-            Box::new(self.translate_expr(rexpr)?)
+            Box::new(self.translate_operand(rexpr)?)
         } else {
             return Err(ParseError::ParseError(
                 "Missing right expression".to_string(),
             ));
+        };
+
+        let right = if matches!(op_name, "~*" | "!~*") {
+            Box::new(ast::Expr::Binary(
+                Box::new(ast::Expr::Literal(ast::Literal::String(
+                    "'(?i)'".to_string(),
+                ))),
+                ast::Operator::Concat,
+                right,
+            ))
+        } else {
+            right
         };
 
         // Handle regex operators (~, !~) which map to REGEXP expressions
@@ -2730,8 +3120,6 @@ impl PostgreSQLTranslator {
                     escape: None,
                 });
             }
-            // Case-insensitive regex (~*, !~*) — treat same as case-sensitive
-            // since SQLite REGEXP is case-insensitive by default
             "~*" => {
                 return Ok(ast::Expr::Like {
                     lhs: left,
@@ -2811,7 +3199,7 @@ impl PostgreSQLTranslator {
     ) -> Result<ast::Expr, ParseError> {
         // Get the left expression (the column/expression being tested)
         let lhs = if let Some(lexpr) = &a_expr.lexpr {
-            Box::new(self.translate_expr(lexpr)?)
+            Box::new(self.translate_operand(lexpr)?)
         } else {
             return Err(ParseError::ParseError(
                 "Missing left expression for IN operator".to_string(),
@@ -2891,7 +3279,7 @@ impl PostgreSQLTranslator {
             .rexpr
             .as_ref()
             .ok_or_else(|| ParseError::ParseError(format!("{kw}: missing rhs")))?;
-        let lhs = self.translate_expr(lhs_node)?;
+        let lhs = self.translate_operand(lhs_node)?;
 
         if let Some(pg_query::protobuf::node::Node::AArrayExpr(arr)) = &rhs_node.node {
             let rhs = arr
@@ -2929,64 +3317,6 @@ impl PostgreSQLTranslator {
         &self,
         a_expr: &pg_query::protobuf::AExpr,
     ) -> Result<ast::Expr, ParseError> {
-        // Get the operator name to determine if it's LIKE or NOT LIKE
-        let op_name = if let Some(name) = a_expr.name.first() {
-            match &name.node {
-                Some(pg_query::protobuf::node::Node::String(s)) => &s.sval,
-                _ => {
-                    return Err(ParseError::ParseError(
-                        "Invalid LIKE operator name".to_string(),
-                    ));
-                }
-            }
-        } else {
-            return Err(ParseError::ParseError(
-                "Missing LIKE operator name".to_string(),
-            ));
-        };
-
-        // Determine if it's NOT LIKE
-        let not = match op_name.as_str() {
-            "~~" => false, // LIKE
-            "!~~" => true, // NOT LIKE
-            _ => {
-                return Err(ParseError::ParseError(format!(
-                    "Unsupported LIKE operator: {op_name}"
-                )));
-            }
-        };
-
-        // Get left and right expressions
-        let lhs = if let Some(lexpr) = &a_expr.lexpr {
-            Box::new(self.translate_expr(lexpr)?)
-        } else {
-            return Err(ParseError::ParseError(
-                "Missing left expression for LIKE operator".to_string(),
-            ));
-        };
-
-        let rhs = if let Some(rexpr) = &a_expr.rexpr {
-            Box::new(self.translate_expr(rexpr)?)
-        } else {
-            return Err(ParseError::ParseError(
-                "Missing right expression for LIKE operator".to_string(),
-            ));
-        };
-
-        Ok(ast::Expr::Like {
-            lhs,
-            not,
-            op: ast::LikeOperator::Like,
-            rhs,
-            escape: None,
-        })
-    }
-
-    fn translate_ilike_expr(
-        &self,
-        a_expr: &pg_query::protobuf::AExpr,
-    ) -> Result<ast::Expr, ParseError> {
-        // Get operator name: ~~* = ILIKE, !~~* = NOT ILIKE
         let op_name = a_expr
             .name
             .first()
@@ -2994,65 +3324,75 @@ impl PostgreSQLTranslator {
                 Some(pg_query::protobuf::node::Node::String(s)) => Some(s.sval.as_str()),
                 _ => None,
             })
-            .ok_or_else(|| ParseError::ParseError("Missing ILIKE operator name".to_string()))?;
+            .ok_or_else(|| ParseError::ParseError("Missing LIKE operator name".to_string()))?;
 
-        let not = match op_name {
-            "~~*" => false, // ILIKE
-            "!~~*" => true, // NOT ILIKE
+        let (not, ignore_case) = match op_name {
+            "~~" => (false, false),
+            "!~~" => (true, false),
+            "~~*" => (false, true),
+            "!~~*" => (true, true),
             _ => {
                 return Err(ParseError::ParseError(format!(
-                    "Unsupported ILIKE operator: {op_name}"
+                    "Unsupported LIKE operator: {op_name}"
                 )));
             }
         };
 
-        let lhs = if let Some(lexpr) = &a_expr.lexpr {
-            self.translate_expr(lexpr)?
-        } else {
+        let Some(lexpr) = &a_expr.lexpr else {
             return Err(ParseError::ParseError(
-                "Missing left expression for ILIKE".to_string(),
+                "Missing left expression for LIKE operator".to_string(),
             ));
         };
-
-        let rhs = if let Some(rexpr) = &a_expr.rexpr {
-            self.translate_expr(rexpr)?
-        } else {
+        let Some(rexpr) = &a_expr.rexpr else {
             return Err(ParseError::ParseError(
-                "Missing right expression for ILIKE".to_string(),
+                "Missing right expression for LIKE operator".to_string(),
             ));
         };
-
-        // Wrap both sides in LOWER() to make case-insensitive
-        let lower_lhs = ast::Expr::FunctionCall {
-            name: ast::Name::from_string("lower"),
-            distinctness: None,
-            args: vec![Box::new(lhs)],
-            order_by: vec![],
-            within_group: vec![],
-            filter_over: ast::FunctionTail {
-                filter_clause: None,
-                over_clause: None,
-            },
+        let fold_case = |expr: ast::Expr| {
+            if ignore_case {
+                function_call("lower", vec![expr])
+            } else {
+                expr
+            }
         };
+        let lhs = fold_case(self.translate_operand(lexpr)?);
 
-        let lower_rhs = ast::Expr::FunctionCall {
-            name: ast::Name::from_string("lower"),
-            distinctness: None,
-            args: vec![Box::new(rhs)],
-            order_by: vec![],
-            within_group: vec![],
-            filter_over: ast::FunctionTail {
-                filter_clause: None,
-                over_clause: None,
-            },
-        };
+        // A literal pattern becomes GLOB, a core operator that also works in
+        // index expressions, where frontend functions such as textlike() cannot.
+        if let Some(pg_query::protobuf::node::Node::AConst(pg_query::protobuf::AConst {
+            val: Some(pg_query::protobuf::a_const::Val::Sval(pattern)),
+            ..
+        })) = &rexpr.node
+        {
+            if let Some(glob) = like_pattern_to_glob(&pattern.sval) {
+                return Ok(ast::Expr::Like {
+                    lhs: Box::new(lhs),
+                    not,
+                    op: ast::LikeOperator::Glob,
+                    rhs: Box::new(fold_case(ast::Expr::Literal(ast::Literal::String(
+                        format!("'{}'", glob.replace('\'', "''")),
+                    )))),
+                    escape: None,
+                });
+            }
+        }
 
-        Ok(ast::Expr::Like {
-            lhs: Box::new(lower_lhs),
-            not,
-            op: ast::LikeOperator::Like,
-            rhs: Box::new(lower_rhs),
-            escape: None,
+        if self.translating_index.get() {
+            return Err(ParseError::ParseError(
+                "CREATE INDEX supports LIKE and ILIKE only with a string-literal pattern that does not use ESCAPE or end with the escape character".to_string(),
+            ));
+        }
+
+        // SQLite's LIKE ignores case and has no default escape character, so
+        // other PostgreSQL LIKE patterns run through the frontend's textlike() function.
+        let call = function_call(
+            "textlike",
+            vec![lhs, fold_case(self.translate_operand(rexpr)?)],
+        );
+        Ok(if not {
+            ast::Expr::Unary(ast::UnaryOperator::Not, Box::new(call))
+        } else {
+            call
         })
     }
 
@@ -3066,7 +3406,7 @@ impl PostgreSQLTranslator {
             .lexpr
             .as_ref()
             .ok_or_else(|| ParseError::ParseError("BETWEEN: missing test expression".into()))?;
-        let lhs = self.translate_expr(lhs)?;
+        let lhs = self.translate_operand(lhs)?;
 
         let rexpr = a_expr
             .rexpr
@@ -3085,8 +3425,8 @@ impl PostgreSQLTranslator {
                 "BETWEEN: expected exactly 2 range bounds".into(),
             ));
         }
-        let start = self.translate_expr(&items[0])?;
-        let end = self.translate_expr(&items[1])?;
+        let start = self.translate_operand(&items[0])?;
+        let end = self.translate_operand(&items[1])?;
 
         Ok(ast::Expr::Between {
             lhs: Box::new(lhs),
@@ -3123,7 +3463,7 @@ impl PostgreSQLTranslator {
 
         // Translate OVER clause (window function)
         let over_clause = if let Some(ref window_def) = func_call.over {
-            Some(self.translate_window_def(window_def)?)
+            Some(Box::new(self.translate_window_def(window_def)?))
         } else {
             None
         };
@@ -3196,12 +3536,26 @@ impl PostgreSQLTranslator {
             }
         }
 
+        let translated_order = self.translate_order_by(&func_call.agg_order)?;
+        let (order_by, within_group) = if func_call.agg_within_group {
+            let within_group = translated_order
+                .into_iter()
+                .map(|column| ast::SortedColumn {
+                    nulls: None,
+                    ..column
+                })
+                .collect();
+            (vec![], within_group)
+        } else {
+            (translated_order, vec![])
+        };
+
         Ok(ast::Expr::FunctionCall {
             name: ast::Name::from_string(func_name),
             distinctness,
             args,
-            order_by: vec![],
-            within_group: vec![],
+            order_by,
+            within_group,
             filter_over,
         })
     }
@@ -3456,7 +3810,7 @@ impl PostgreSQLTranslator {
         group_clause: &[pg_query::protobuf::Node],
         having_clause: &Option<Box<pg_query::protobuf::Node>>,
     ) -> Result<Option<GroupBy>, ParseError> {
-        if group_clause.is_empty() {
+        if group_clause.is_empty() && having_clause.is_none() {
             return Ok(None);
         }
 
@@ -3492,17 +3846,18 @@ impl PostgreSQLTranslator {
                 ));
             }
         };
-        let select = self.translate_select(select_stmt)?;
+        let select = Box::new(self.translate_select(select_stmt)?);
 
         match sub_link.sub_link_type() {
             SubLinkType::ExistsSublink => Ok(ast::Expr::Exists(select)),
             SubLinkType::ExprSublink => Ok(ast::Expr::Subquery(select)),
+            SubLinkType::ArraySublink => Ok(Self::translate_array_subquery(*select)),
             SubLinkType::AnySublink => {
                 // ANY/IN subquery: testexpr IN (SELECT ...)
                 let test_node = sub_link.testexpr.as_ref().ok_or_else(|| {
                     ParseError::ParseError("ANY SubLink missing testexpr".to_string())
                 })?;
-                let lhs = self.translate_expr(test_node)?;
+                let lhs = self.translate_operand(test_node)?;
                 Ok(ast::Expr::InSelect {
                     lhs: Box::new(lhs),
                     not: false,
@@ -3513,6 +3868,82 @@ impl PostgreSQLTranslator {
                 "Unsupported SubLink type: {other:?}",
             ))),
         }
+    }
+
+    fn translate_array_subquery(select: ast::Select) -> ast::Expr {
+        // PostgreSQL: ARRAY(SELECT v FROM items ORDER BY v LIMIT 2)
+        // Becomes this scalar subquery in the Turso AST:
+        // (
+        //     WITH _turso_array_rows(_turso_array_value) AS MATERIALIZED (
+        //         SELECT v FROM items ORDER BY v LIMIT 2
+        //     )
+        //     SELECT coalesce(array_agg(_turso_array_value), array())
+        //     FROM _turso_array_rows
+        // )
+        // array() constructs an empty array when the query returns no rows.
+        let query = select.to_string().to_ascii_lowercase();
+        let mut table_name = "_turso_array_rows".to_owned();
+        while query.contains(&table_name) {
+            table_name.push('_');
+        }
+        let table = ast::Name::from_string(table_name);
+        let column = ast::Name::from_string("_turso_array_value");
+        let call = |name: &str, args: Vec<Box<ast::Expr>>| ast::Expr::FunctionCall {
+            name: ast::Name::from_string(name),
+            distinctness: None,
+            args,
+            order_by: vec![],
+            within_group: vec![],
+            filter_over: ast::FunctionTail {
+                filter_clause: None,
+                over_clause: None,
+            },
+        };
+
+        ast::Expr::Subquery(Box::new(ast::Select {
+            with: Some(ast::With {
+                recursive: false,
+                ctes: vec![ast::CommonTableExpr {
+                    tbl_name: table.clone(),
+                    columns: vec![ast::IndexedColumn {
+                        col_name: column.clone(),
+                        collation_name: None,
+                        order: None,
+                    }],
+                    materialized: ast::Materialized::Yes,
+                    select,
+                }],
+            }),
+            body: ast::SelectBody {
+                select: ast::OneSelect::Select {
+                    distinctness: None,
+                    columns: vec![ast::ResultColumn::Expr(
+                        Box::new(call(
+                            "coalesce",
+                            vec![
+                                Box::new(call("array_agg", vec![Box::new(ast::Expr::Id(column))])),
+                                Box::new(call("array", vec![])),
+                            ],
+                        )),
+                        None,
+                    )],
+                    from: Some(ast::FromClause {
+                        select: Box::new(ast::SelectTable::Table(
+                            ast::QualifiedName::single(table),
+                            None,
+                            None,
+                        )),
+                        joins: vec![],
+                    }),
+                    where_clause: None,
+                    group_by: None,
+                    window_clause: vec![],
+                },
+                compounds: vec![],
+            },
+            order_by: vec![],
+            limit: None,
+        }))
     }
 
     fn translate_with_clause(
@@ -3637,11 +4068,25 @@ impl PostgreSQLTranslator {
     fn translate_returning(
         &self,
         returning_list: &[pg_query::protobuf::Node],
+        target: &pg_query::protobuf::RangeVar,
     ) -> Result<Vec<ast::ResultColumn>, ParseError> {
         if returning_list.is_empty() {
             return Ok(vec![]);
         }
-        self.translate_target_list(returning_list)
+        let target_qualifiers: &[&str] = match target.alias.as_ref() {
+            Some(alias) if !alias.aliasname.is_empty() => &[&alias.aliasname],
+            _ if target.schemaname.is_empty() => &[&target.relname],
+            _ => &[&target.relname, &target.schemaname],
+        };
+        let mut columns = Vec::with_capacity(returning_list.len());
+        for node in returning_list {
+            if is_star_qualified_by(node, target_qualifiers) {
+                columns.push(ast::ResultColumn::Star);
+            } else {
+                columns.extend(self.translate_target_list(std::slice::from_ref(node))?);
+            }
+        }
+        Ok(columns)
     }
 
     fn translate_on_conflict(
@@ -3777,7 +4222,10 @@ impl PostgreSQLTranslator {
                             Ok(pg_query::protobuf::SortByNulls::SortbyNullsLast) => {
                                 Some(ast::NullsOrder::Last)
                             }
-                            _ => None,
+                            _ => match order {
+                                Some(ast::SortOrder::Desc) => Some(ast::NullsOrder::First),
+                                _ => Some(ast::NullsOrder::Last),
+                            },
                         };
 
                     sorted_columns.push(ast::SortedColumn { expr, order, nulls });
@@ -3814,7 +4262,7 @@ impl PostgreSQLTranslator {
                         "NOT expression must have exactly 1 argument".to_string(),
                     ));
                 }
-                let operand = Box::new(self.translate_expr(&bool_expr.args[0])?);
+                let operand = Box::new(self.translate_operand(&bool_expr.args[0])?);
                 Ok(ast::Expr::Unary(ast::UnaryOperator::Not, operand))
             }
             BoolExprType::AndExpr => {
@@ -3824,9 +4272,9 @@ impl PostgreSQLTranslator {
                     ));
                 }
                 // Combine all arguments into a binary tree with AND
-                let mut result = self.translate_expr(&bool_expr.args[0])?;
+                let mut result = self.translate_operand(&bool_expr.args[0])?;
                 for arg in &bool_expr.args[1..] {
-                    let right = self.translate_expr(arg)?;
+                    let right = self.translate_operand(arg)?;
                     result =
                         ast::Expr::Binary(Box::new(result), ast::Operator::And, Box::new(right));
                 }
@@ -3839,9 +4287,9 @@ impl PostgreSQLTranslator {
                     ));
                 }
                 // Combine all arguments into a binary tree with OR
-                let mut result = self.translate_expr(&bool_expr.args[0])?;
+                let mut result = self.translate_operand(&bool_expr.args[0])?;
                 for arg in &bool_expr.args[1..] {
-                    let right = self.translate_expr(arg)?;
+                    let right = self.translate_operand(arg)?;
                     result =
                         ast::Expr::Binary(Box::new(result), ast::Operator::Or, Box::new(right));
                 }
@@ -3852,6 +4300,26 @@ impl PostgreSQLTranslator {
                 bool_expr.boolop()
             ))),
         }
+    }
+
+    /// PostgreSQL's parse tree has no nodes for parentheses, so an operand that
+    /// is itself an operator expression gets wrapped here. Without this the
+    /// grouping is lost when the expression is written back as SQL, for example
+    /// `(1+2)*3` in a DEFAULT stored in the table SQL would become `1 + 2 * 3`.
+    fn translate_operand(&self, node: &pg_query::protobuf::Node) -> Result<ast::Expr, ParseError> {
+        let expr = self.translate_expr(node)?;
+        Ok(match expr {
+            ast::Expr::Binary(..)
+            | ast::Expr::Unary(..)
+            | ast::Expr::Between { .. }
+            | ast::Expr::Like { .. }
+            | ast::Expr::IsNull(_)
+            | ast::Expr::NotNull(_)
+            | ast::Expr::InList { .. }
+            | ast::Expr::InSelect { .. }
+            | ast::Expr::InTable { .. } => ast::Expr::Parenthesized(vec![Box::new(expr)]),
+            _ => expr,
+        })
     }
 
     fn translate_create_sequence(
@@ -3870,9 +4338,20 @@ impl PostgreSQLTranslator {
         let mut max_value = None;
         let mut cycle = false;
 
+        let mut as_type = None;
         for opt_node in &seq.options {
             if let Some(pg_query::protobuf::node::Node::DefElem(elem)) = &opt_node.node {
                 match elem.defname.as_str() {
+                    "as" => {
+                        let Some(pg_query::protobuf::node::Node::TypeName(tn)) =
+                            elem.arg.as_ref().and_then(|n| n.node.as_ref())
+                        else {
+                            return Err(ParseError::ParseError(
+                                "CREATE SEQUENCE AS: missing type".into(),
+                            ));
+                        };
+                        as_type = Some(extract_type_name_from_typename(tn)?);
+                    }
                     "start" => {
                         start = extract_def_elem_int(elem);
                     }
@@ -3910,6 +4389,33 @@ impl PostgreSQLTranslator {
                     }
                     _ => {} // ignore other unknown options
                 }
+            }
+        }
+
+        // AS smallint/integer narrows the default bound in the sequence's
+        // direction; bigint is the default range.
+        if let Some(as_type) = as_type {
+            let (type_min, type_max, type_name) = match as_type.to_lowercase().as_str() {
+                "int2" | "smallint" => (i16::MIN as i64, i16::MAX as i64, "smallint"),
+                "int4" | "integer" | "int" => (i32::MIN as i64, i32::MAX as i64, "integer"),
+                "int8" | "bigint" => (i64::MIN, i64::MAX, "bigint"),
+                other => {
+                    return Err(ParseError::ParseError(format!(
+                        "CREATE SEQUENCE AS {other} is not supported"
+                    )))
+                }
+            };
+            for (option, value) in [("MINVALUE", min_value), ("MAXVALUE", max_value)] {
+                if let Some(value) = value.filter(|v| !(type_min..=type_max).contains(v)) {
+                    return Err(ParseError::ParseError(format!(
+                        "{option} ({value}) is out of range for sequence data type {type_name}"
+                    )));
+                }
+            }
+            if increment.unwrap_or(1) > 0 {
+                max_value.get_or_insert(type_max);
+            } else {
+                min_value.get_or_insert(type_min);
             }
         }
 
@@ -4005,24 +4511,292 @@ impl PostgreSQLTranslator {
     }
 }
 
+#[allow(clippy::vec_box)]
+fn single_column_function_select(
+    function: ast::QualifiedName,
+    args: Vec<Box<ast::Expr>>,
+    source_column: &str,
+    column_name: String,
+) -> ast::Select {
+    ast::Select {
+        with: None,
+        body: ast::SelectBody {
+            select: ast::OneSelect::Select {
+                distinctness: None,
+                columns: vec![ast::ResultColumn::Expr(
+                    Box::new(ast::Expr::Id(ast::Name::from_string(source_column))),
+                    Some(ast::As::Elided(ast::Name::from_string(column_name))),
+                )],
+                from: Some(ast::FromClause {
+                    select: Box::new(ast::SelectTable::TableCall(function, args, None)),
+                    joins: vec![],
+                }),
+                where_clause: None,
+                group_by: None,
+                window_clause: vec![],
+            },
+            compounds: vec![],
+        },
+        order_by: vec![],
+        limit: None,
+    }
+}
+
+fn alias_column_names(alias: &pg_query::protobuf::Alias) -> Result<Vec<String>, ParseError> {
+    alias
+        .colnames
+        .iter()
+        .map(|n| match &n.node {
+            Some(pg_query::protobuf::node::Node::String(s)) => Ok(s.sval.clone()),
+            _ => Err(ParseError::ParseError("invalid column alias".into())),
+        })
+        .collect()
+}
+
+fn rename_result_columns(
+    select: &mut ast::Select,
+    alias: &str,
+    mut names: Vec<String>,
+) -> Result<(), ParseError> {
+    if names.is_empty() {
+        return Ok(());
+    }
+    if let Some(columns) = result_column_names(select) {
+        if names.len() > columns.len() {
+            return Err(ParseError::ParseError(format!(
+                "table \"{alias}\" has {} columns available but {} columns specified",
+                columns.len(),
+                names.len()
+            )));
+        }
+        for column in columns.into_iter().skip(names.len()) {
+            names.push(column.ok_or_else(|| {
+                ParseError::ParseError(
+                    "a column alias list shorter than the subquery's unnamed columns is not supported"
+                        .into(),
+                )
+            })?);
+        }
+    }
+    let words: Vec<String> = select
+        .to_string()
+        .split(|c: char| !c.is_alphanumeric() && c != '_')
+        .map(str::to_lowercase)
+        .collect();
+    let cte_name = std::iter::once(alias.to_string())
+        .chain((0..).map(|i| format!("__column_alias_list_{i}")))
+        .find(|name| !words.contains(&name.to_lowercase()))
+        .expect("an unused name exists");
+    let inner = std::mem::replace(
+        select,
+        ast::Select {
+            with: None,
+            body: ast::SelectBody {
+                select: ast::OneSelect::Values(vec![]),
+                compounds: vec![],
+            },
+            order_by: vec![],
+            limit: None,
+        },
+    );
+    *select = ast::Select {
+        with: Some(ast::With {
+            recursive: false,
+            ctes: vec![ast::CommonTableExpr {
+                tbl_name: ast::Name::from_string(&cte_name),
+                columns: names
+                    .iter()
+                    .map(|name| ast::IndexedColumn {
+                        col_name: ast::Name::from_string(name),
+                        collation_name: None,
+                        order: None,
+                    })
+                    .collect(),
+                materialized: ast::Materialized::Any,
+                select: inner,
+            }],
+        }),
+        body: ast::SelectBody {
+            select: ast::OneSelect::Select {
+                distinctness: None,
+                columns: vec![ast::ResultColumn::Star],
+                from: Some(ast::FromClause {
+                    select: Box::new(ast::SelectTable::Table(
+                        ast::QualifiedName::single(ast::Name::from_string(&cte_name)),
+                        None,
+                        None,
+                    )),
+                    joins: vec![],
+                }),
+                where_clause: None,
+                group_by: None,
+                window_clause: vec![],
+            },
+            compounds: vec![],
+        },
+        order_by: vec![],
+        limit: None,
+    };
+    Ok(())
+}
+
+fn result_column_names(select: &ast::Select) -> Option<Vec<Option<String>>> {
+    match &select.body.select {
+        ast::OneSelect::Values(rows) => Some(
+            (1..=rows.first()?.len())
+                .map(|i| Some(format!("column{i}")))
+                .collect(),
+        ),
+        ast::OneSelect::Select { columns, .. } => columns
+            .iter()
+            .map(|column| match column {
+                ast::ResultColumn::Expr(
+                    _,
+                    Some(
+                        ast::As::As(name)
+                        | ast::As::Elided(name)
+                        | ast::As::ImplicitColumnName(name),
+                    ),
+                ) => Some(Some(name.as_str().to_string())),
+                ast::ResultColumn::Expr(expr, None) => Some(match expr.as_ref() {
+                    ast::Expr::Id(name) | ast::Expr::Qualified(_, name) => {
+                        Some(name.as_str().to_string())
+                    }
+                    _ => None,
+                }),
+                _ => None,
+            })
+            .collect(),
+    }
+}
+
+fn join_keeps_unmatched_right_rows(join: &ast::JoinedSelectTable) -> bool {
+    matches!(
+        join.operator,
+        ast::JoinOperator::TypedJoin(Some(join_type)) if join_type.contains(ast::JoinType::RIGHT)
+    )
+}
+
+/// The namespace of the sequences of the serial columns of table `tbl_name`:
+/// the namespace of the table, or main when the table has none.
+fn serial_sequence_namespace(tbl_name: &ast::QualifiedName) -> String {
+    tbl_name
+        .namespace
+        .as_ref()
+        .map(|namespace| namespace.as_str().to_string())
+        .unwrap_or_else(|| "main".to_string())
+}
+
+/// Maps a PostgreSQL schema name to the Turso schema that holds its tables.
+fn map_schema_name(schema: &str) -> &str {
+    match schema.to_ascii_lowercase().as_str() {
+        "pg_catalog" | "public" | "information_schema" => "main",
+        _ => schema,
+    }
+}
+
+pub fn is_catalog_table_name(name: &str) -> bool {
+    matches!(
+        name.to_ascii_lowercase().as_str(),
+        "pg_class"
+            | "pg_namespace"
+            | "pg_attribute"
+            | "pg_roles"
+            | "pg_proc"
+            | "pg_database"
+            | "pg_am"
+            | "pg_type"
+            | "pg_collation"
+            | "pg_attrdef"
+            | "pg_description"
+            | "pg_publication"
+            | "pg_publication_namespace"
+            | "pg_publication_rel"
+            | "pg_sequences"
+            | "pg_constraint"
+            | "pg_index"
+            | "pg_inherits"
+            | "pg_rewrite"
+            | "pg_foreign_table"
+            | "pg_partitioned_table"
+            | "pg_trigger"
+            | "pg_policy"
+            | "pg_input_error_info"
+            | "pg_options_to_table"
+            | "unnest"
+            | "pg_get_tabledef"
+            | "pg_settings"
+            | "pg_extension"
+            | "pg_depend"
+            | "pg_tablespace"
+            | "pg_init_privs"
+            | "pg_cast"
+            | "pg_transform"
+            | "pg_language"
+            | "pg_operator"
+            | "pg_opclass"
+            | "pg_opfamily"
+            | "pg_ts_parser"
+            | "pg_ts_template"
+            | "pg_ts_dict"
+            | "pg_ts_config"
+            | "pg_foreign_data_wrapper"
+            | "pg_foreign_server"
+            | "pg_default_acl"
+            | "pg_conversion"
+            | "pg_range"
+            | "pg_event_trigger"
+            | "pg_subscription"
+            | "pg_largeobject_metadata"
+            | "pg_amop"
+            | "pg_amproc"
+            | "pg_tables"
+            | "pg_indexes"
+    )
+}
+
 /// PostgreSQL derives a name for result columns without an explicit alias
 /// (FigureColname in the server): function calls are named after the function
 /// and SQL value functions after their keyword. Clients read columns by these
 /// names, e.g. knex reads rows[0].version from `select version()`.
+/// Casts, CASE, COLLATE and subscripts pass through the name of the
+/// expression they wrap, and a field selection is named after the field. Only
+/// when the wrapped expression has no name is a cast named after its outermost
+/// target type and a CASE `case`, so `1::int::text` is named `text`.
 fn derived_column_name(node: &pg_query::protobuf::Node) -> Option<String> {
+    expression_name(node).or_else(|| cast_or_case_name(node))
+}
+
+fn expression_name(node: &pg_query::protobuf::Node) -> Option<String> {
     use pg_query::protobuf::node::Node;
-    match &node.node {
-        Some(Node::FuncCall(func_call)) => func_call
-            .funcname
-            .iter()
-            .filter_map(|n| match &n.node {
-                Some(Node::String(s)) => Some(s.sval.clone()),
-                _ => None,
-            })
-            .next_back(),
+    let name = match &node.node {
+        Some(Node::FuncCall(func_call)) => return last_string(&func_call.funcname),
+        Some(Node::ColumnRef(col_ref)) => return last_string(&col_ref.fields),
+        Some(Node::TypeCast(type_cast)) => return expression_name(type_cast.arg.as_deref()?),
+        Some(Node::CaseExpr(case_expr)) => return expression_name(case_expr.defresult.as_deref()?),
+        Some(Node::CollateClause(collate)) => return expression_name(collate.arg.as_deref()?),
+        Some(Node::AIndirection(indirection)) => {
+            return last_string(&indirection.indirection)
+                .or_else(|| expression_name(indirection.arg.as_deref()?))
+        }
+        Some(Node::AArrayExpr(_)) => "array",
+        Some(Node::CoalesceExpr(_)) => "coalesce",
+        Some(Node::MinMaxExpr(min_max)) => {
+            use pg_query::protobuf::MinMaxOp;
+            match MinMaxOp::try_from(min_max.op) {
+                Ok(MinMaxOp::IsGreatest) => "greatest",
+                Ok(MinMaxOp::IsLeast) => "least",
+                _ => return None,
+            }
+        }
+        Some(Node::AExpr(a_expr))
+            if a_expr.kind == pg_query::protobuf::AExprKind::AexprNullif as i32 =>
+        {
+            "nullif"
+        }
         Some(Node::SqlvalueFunction(svf)) => {
             use pg_query::protobuf::SqlValueFunctionOp as Op;
-            let name = match Op::try_from(svf.op) {
+            match Op::try_from(svf.op) {
                 Ok(Op::SvfopCurrentDate) => "current_date",
                 Ok(Op::SvfopCurrentTime | Op::SvfopCurrentTimeN) => "current_time",
                 Ok(Op::SvfopCurrentTimestamp | Op::SvfopCurrentTimestampN) => "current_timestamp",
@@ -4035,11 +4809,57 @@ fn derived_column_name(node: &pg_query::protobuf::Node) -> Option<String> {
                 Ok(Op::SvfopCurrentCatalog) => "current_catalog",
                 Ok(Op::SvfopCurrentSchema) => "current_schema",
                 _ => return None,
-            };
-            Some(name.to_string())
+            }
         }
+        _ => return None,
+    };
+    Some(name.to_string())
+}
+
+fn cast_or_case_name(node: &pg_query::protobuf::Node) -> Option<String> {
+    use pg_query::protobuf::node::Node;
+    match &node.node {
+        Some(Node::TypeCast(type_cast)) => last_string(&type_cast.type_name.as_ref()?.names),
+        Some(Node::CaseExpr(_)) => Some("case".to_string()),
+        Some(Node::CollateClause(collate)) => cast_or_case_name(collate.arg.as_deref()?),
+        Some(Node::AIndirection(indirection)) => cast_or_case_name(indirection.arg.as_deref()?),
         _ => None,
     }
+}
+
+/// Whether `node` is a `qualifier.*` RETURNING target whose qualifier, read
+/// from the table name outwards, is a non-empty prefix of `target_qualifiers`.
+fn is_star_qualified_by(node: &pg_query::protobuf::Node, target_qualifiers: &[&str]) -> bool {
+    use pg_query::protobuf::node::Node;
+    let Some(Node::ResTarget(res_target)) = &node.node else {
+        return false;
+    };
+    let Some(Node::ColumnRef(col_ref)) = res_target.val.as_ref().and_then(|v| v.node.as_ref())
+    else {
+        return false;
+    };
+    let Some((last, qualifier)) = col_ref.fields.split_last() else {
+        return false;
+    };
+    if !matches!(last.node, Some(Node::AStar(_)))
+        || qualifier.is_empty()
+        || qualifier.len() > target_qualifiers.len()
+    {
+        return false;
+    }
+    qualifier.iter().rev().zip(target_qualifiers).all(
+        |(field, expected)| matches!(&field.node, Some(Node::String(s)) if s.sval == *expected),
+    )
+}
+
+fn last_string(names: &[pg_query::protobuf::Node]) -> Option<String> {
+    names
+        .iter()
+        .filter_map(|n| match &n.node {
+            Some(pg_query::protobuf::node::Node::String(s)) => Some(s.sval.clone()),
+            _ => None,
+        })
+        .next_back()
 }
 
 /// Extract a string value from a DefElem's arg.
@@ -4294,8 +5114,51 @@ fn translate_create_enum(
     })
 }
 
+fn json_type_or_raise(
+    json_type: ast::Expr,
+    value: ast::Expr,
+    expected_type: &str,
+    other_type_errors: &[(&str, String)],
+    error: &str,
+) -> ast::Expr {
+    let string = |text: &str| {
+        Box::new(ast::Expr::Literal(ast::Literal::String(format!(
+            "'{text}'"
+        ))))
+    };
+    let raise = |message: &str| {
+        Box::new(ast::Expr::Raise(
+            ast::ResolveType::Abort,
+            Some(string(message)),
+        ))
+    };
+    let expected_type = string(expected_type);
+    ast::Expr::Case {
+        base: Some(Box::new(ast::Expr::FunctionCall {
+            name: ast::Name::from_string("coalesce"),
+            distinctness: None,
+            args: vec![Box::new(json_type), expected_type.clone()],
+            order_by: vec![],
+            within_group: vec![],
+            filter_over: ast::FunctionTail {
+                filter_clause: None,
+                over_clause: None,
+            },
+        })),
+        when_then_pairs: std::iter::once((expected_type, Box::new(value)))
+            .chain(
+                other_type_errors
+                    .iter()
+                    .map(|(json_type, message)| (string(json_type), raise(message))),
+            )
+            .collect(),
+        else_expr: Some(raise(error)),
+    }
+}
+
 /// Convert a pg_query TypeName to a Turso AST Type for use in CAST expressions.
-/// Maps PG types to their base SQLite storage types.
+/// Maps PG types to their base SQLite storage types. Other names are kept as
+/// written so that enums and domains resolve to their custom type.
 fn pg_type_name_to_ast_type(type_name: &pg_query::protobuf::TypeName) -> Option<ast::Type> {
     use pg_query::protobuf::node::Node;
 
@@ -4321,17 +5184,22 @@ fn pg_type_name_to_ast_type(type_name: &pg_query::protobuf::TypeName) -> Option<
         // For CAST expressions, map all text-like PG types to TEXT and
         // boolean to INTEGER for SQLite VDBE compatibility
         "BOOLEAN" | "BOOL" => "INTEGER",
-        "TEXT" | "VARCHAR" | "CHAR" | "BPCHAR" | "NAME" | "UUID" | "DATE" | "TIME" | "TIMETZ"
-        | "TIMESTAMP" | "TIMESTAMPTZ" | "INTERVAL" | "INET" | "JSON" | "JSONB" | "XML" | "CIDR"
-        | "MACADDR" | "BIT" | "VARBIT" | "TSVECTOR" | "TSQUERY" => "TEXT",
+        "DATE" => "date",
+        "TIME" | "TIMETZ" => "time",
+        "TIMESTAMP" => "timestamp",
+        "TIMESTAMPTZ" => "timestamptz",
+        "TEXT" | "VARCHAR" | "CHAR" | "BPCHAR" | "NAME" | "UUID" | "INTERVAL" | "INET" | "JSON"
+        | "JSONB" | "XML" | "CIDR" | "MACADDR" | "BIT" | "VARBIT" | "TSVECTOR" | "TSQUERY" => {
+            "TEXT"
+        }
         "BYTEA" | "BLOB" => "BLOB",
-        _ => return None,
+        _ => &pg_type,
     };
 
     Some(ast::Type {
         name: name.to_string(),
         size: None,
-        array_dimensions: 0,
+        array_dimensions: type_name.array_bounds.len() as u32,
     })
 }
 
@@ -4490,6 +5358,7 @@ fn pg_fk_action_to_string(action: &str) -> Option<String> {
 pub struct PgSetStmt {
     pub name: String,
     pub values: Vec<PgSetValue>,
+    pub is_local: bool,
 }
 
 #[derive(Clone)]
@@ -4588,7 +5457,150 @@ pub fn try_extract_set(parse_result: &ParseResult) -> Option<PgSetStmt> {
     Some(PgSetStmt {
         name: set_stmt.name.clone(),
         values,
+        is_local: set_stmt.is_local,
     })
+}
+
+pub fn is_set_transaction(parse_result: &ParseResult) -> bool {
+    use pg_query::{protobuf::VariableSetKind, NodeRef};
+
+    matches!(
+        parse_result.protobuf.nodes().first().map(|node| &node.0),
+        Some(NodeRef::VariableSetStmt(stmt))
+            if stmt.kind == VariableSetKind::VarSetMulti as i32
+                && stmt.name.eq_ignore_ascii_case("transaction")
+    )
+}
+
+/// The byte offset of the table name in a CREATE TABLE statement that names
+/// its table without a schema. None for temporary tables and for other
+/// statements.
+pub fn unqualified_create_table_name_location(parse_result: &ParseResult) -> Option<usize> {
+    use pg_query::NodeRef;
+
+    let nodes = parse_result.protobuf.nodes();
+    let NodeRef::CreateStmt(create) = &nodes.first()?.0 else {
+        return None;
+    };
+    let relation = create.relation.as_ref()?;
+    if !relation.schemaname.is_empty() || relation.relpersistence == "t" {
+        return None;
+    }
+    Some(relation.location as usize)
+}
+
+/// For a CREATE INDEX statement without an index name, the name PostgreSQL
+/// chooses and the byte offset of the `ON` keyword, where the name goes in
+/// the statement text. The name is `<table>_<columns>_idx`, with a number
+/// after `idx` while `name_is_taken(schema, table, name)` says some relation already
+/// has the name. Expressions are named like result columns, or `expr` when
+/// they have no such name, and a column named twice gets a number after its
+/// second use. None for other statements.
+pub fn unnamed_index_name<E>(
+    sql: &str,
+    parse_result: &ParseResult,
+    mut name_is_taken: impl FnMut(Option<&str>, &str, &str) -> Result<bool, E>,
+) -> Result<Option<(usize, String)>, E> {
+    use pg_query::protobuf::node::Node;
+
+    let Some(Node::IndexStmt(index)) = parse_result
+        .protobuf
+        .stmts
+        .first()
+        .and_then(|raw| raw.stmt.as_ref())
+        .and_then(|stmt| stmt.node.as_ref())
+    else {
+        return Ok(None);
+    };
+    if !index.idxname.is_empty() {
+        return Ok(None);
+    }
+    let Some(relation) = &index.relation else {
+        return Ok(None);
+    };
+    let table = relation.relname.clone();
+    let schema = (!relation.schemaname.is_empty()).then_some(relation.schemaname.as_str());
+
+    let mut column_names: Vec<String> = Vec::new();
+    for param in index
+        .index_params
+        .iter()
+        .chain(&index.index_including_params)
+    {
+        let Some(Node::IndexElem(elem)) = &param.node else {
+            continue;
+        };
+        let name = if elem.name.is_empty() {
+            elem.expr
+                .as_deref()
+                .and_then(derived_column_name)
+                .unwrap_or_else(|| "expr".to_string())
+        } else {
+            elem.name.clone()
+        };
+        let mut unique_name = name.clone();
+        let mut number = 0;
+        while column_names.contains(&unique_name) {
+            number += 1;
+            let suffix = number.to_string();
+            let prefix = char_boundary_prefix(&name, MAX_IDENTIFIER_BYTES - suffix.len());
+            unique_name = format!("{prefix}{suffix}");
+        }
+        column_names.push(unique_name);
+    }
+
+    let columns = column_names.join("_");
+    let mut name = make_object_name(&table, &columns, "idx");
+    let mut number = 0;
+    while name_is_taken(schema, &table, &name)? {
+        number += 1;
+        name = make_object_name(&table, &columns, &format!("idx{number}"));
+    }
+    let on_location = pg_query::scan(sql)
+        .expect("a statement that parses also scans")
+        .tokens
+        .iter()
+        .filter(|token| {
+            token.token == pg_query::protobuf::Token::On as i32 && token.start < relation.location
+        })
+        .next_back()
+        .expect("CREATE INDEX has ON before its table")
+        .start;
+    Ok(Some((on_location as usize, name)))
+}
+
+/// PostgreSQL keeps only the first 63 bytes (NAMEDATALEN - 1) of an
+/// identifier.
+const MAX_IDENTIFIER_BYTES: usize = 63;
+
+/// PostgreSQL's makeObjectName: `<table>_<columns>_<label>`, with the longer
+/// of the table and column parts shortened first until the name fits in
+/// [`MAX_IDENTIFIER_BYTES`], so the name can be referred to again.
+fn make_object_name(table: &str, columns: &str, label: &str) -> String {
+    let available = MAX_IDENTIFIER_BYTES - label.len() - 2;
+    let (mut table_len, mut columns_len) = (table.len(), columns.len());
+    while table_len + columns_len > available {
+        if table_len > columns_len {
+            table_len -= 1;
+        } else {
+            columns_len -= 1;
+        }
+    }
+    format!(
+        "{}_{}_{label}",
+        char_boundary_prefix(table, table_len),
+        char_boundary_prefix(columns, columns_len)
+    )
+}
+
+/// The longest prefix of `s` that has at most `max_len` bytes and does not
+/// split a character.
+fn char_boundary_prefix(s: &str, max_len: usize) -> &str {
+    let mut len = max_len.min(s.len());
+    while !s.is_char_boundary(len) {
+        len -= 1;
+    }
+    &s[..len]
 }
 
 /// Try to extract a SHOW statement from a PG parse result.
@@ -4615,6 +5627,9 @@ pub fn try_extract_show(parse_result: &ParseResult) -> Option<PgShowStmt> {
 pub struct PgCreateSchemaStmt {
     pub name: String,
     pub if_not_exists: bool,
+    /// The statements written after the schema name, with their objects
+    /// placed in the new schema, in the order PostgreSQL runs them.
+    pub elements: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -4625,20 +5640,70 @@ pub struct PgDropSchemaStmt {
 }
 
 /// Try to extract a CREATE SCHEMA statement from pg_query parse output.
-pub fn try_extract_create_schema(parse_result: &ParseResult) -> Option<PgCreateSchemaStmt> {
+pub fn try_extract_create_schema(
+    parse_result: &ParseResult,
+) -> Result<Option<PgCreateSchemaStmt>, ParseError> {
     use pg_query::NodeRef;
 
     let nodes = parse_result.protobuf.nodes();
     if nodes.is_empty() {
-        return None;
+        return Ok(None);
     }
     let NodeRef::CreateSchemaStmt(cs) = &nodes[0].0 else {
-        return None;
+        return Ok(None);
     };
-    Some(PgCreateSchemaStmt {
+    Ok(Some(PgCreateSchemaStmt {
         if_not_exists: cs.if_not_exists,
         name: cs.schemaname.clone(),
-    })
+        elements: create_schema_elements(&cs.schema_elts, &cs.schemaname)?,
+    }))
+}
+
+/// The SQL of each statement embedded in CREATE SCHEMA, like PostgreSQL's
+/// transformCreateSchemaStmtElements(): an object named without a schema
+/// goes to the new schema, an object named with another schema is an error,
+/// and the statements run grouped by kind, so that a view can come before
+/// the table it reads.
+fn create_schema_elements(
+    elements: &[pg_query::protobuf::Node],
+    schema: &str,
+) -> Result<Vec<String>, ParseError> {
+    use pg_query::NodeEnum;
+
+    let mut elements = elements
+        .iter()
+        .map(|element| {
+            let mut element = element
+                .node
+                .clone()
+                .expect("CREATE SCHEMA elements are statements");
+            let (order, relation) = match &mut element {
+                NodeEnum::CreateSeqStmt(stmt) => (0, stmt.sequence.as_mut()),
+                NodeEnum::CreateStmt(stmt) => (1, stmt.relation.as_mut()),
+                NodeEnum::ViewStmt(stmt) => (2, stmt.view.as_mut()),
+                NodeEnum::IndexStmt(stmt) => (3, stmt.relation.as_mut()),
+                NodeEnum::CreateTrigStmt(stmt) => (4, stmt.relation.as_mut()),
+                NodeEnum::GrantStmt(_) => (5, None),
+                other => unreachable!("CREATE SCHEMA cannot contain {other:?}"),
+            };
+            if let Some(relation) = relation {
+                if relation.schemaname.is_empty() {
+                    relation.schemaname = schema.to_string();
+                } else if relation.schemaname != schema {
+                    return Err(ParseError::ParseError(format!(
+                        "CREATE specifies a schema ({}) different from the one being created ({schema})",
+                        relation.schemaname
+                    )));
+                }
+            }
+            let sql = element
+                .deparse()
+                .map_err(|e| ParseError::ParseError(e.to_string()))?;
+            Ok((order, sql))
+        })
+        .collect::<Result<Vec<_>, ParseError>>()?;
+    elements.sort_by_key(|(order, _)| *order);
+    Ok(elements.into_iter().map(|(_, sql)| sql).collect())
 }
 
 /// Try to extract a DROP SCHEMA statement from pg_query parse output.
@@ -4908,14 +5973,73 @@ fn deparse_default_expr(node: &pg_query::protobuf::Node) -> Option<String> {
     }
 }
 
-/// Convert a SQL SIMILAR TO pattern to a POSIX regex anchored with ^...$
-/// `%` → `.*`, `_` → `.`, other regex metacharacters are kept as-is since
-/// SIMILAR TO patterns are already regex-like in SQL standard.
+fn function_call(name: &str, args: Vec<ast::Expr>) -> ast::Expr {
+    ast::Expr::FunctionCall {
+        name: ast::Name::from_string(name),
+        distinctness: None,
+        args: args.into_iter().map(Box::new).collect(),
+        order_by: vec![],
+        within_group: vec![],
+        filter_over: ast::FunctionTail {
+            filter_clause: None,
+            over_clause: None,
+        },
+    }
+}
+
+/// SQLite's default SQLITE_MAX_LIKE_PATTERN_LENGTH, which core enforces on
+/// GLOB patterns.
+const SQLITE_MAX_LIKE_PATTERN_LENGTH: usize = 50000;
+
+/// PostgreSQL's LIKE is case-sensitive like GLOB. `%` and `_` become `*` and
+/// `?`, and a character escaped with `\` or special to GLOB is matched literally.
+/// Returns None when GLOB cannot express the pattern: it ends with the escape
+/// character, which is an error only once matching reaches it, or it grows past
+/// SQLite's pattern length limit because each literal `*`, `?` and `[` takes
+/// three bytes in GLOB.
+fn like_pattern_to_glob(pattern: &str) -> Option<String> {
+    let mut glob = String::with_capacity(pattern.len());
+    let mut chars = pattern.chars();
+    while let Some(c) = chars.next() {
+        let literal = match c {
+            '%' => {
+                glob.push('*');
+                continue;
+            }
+            '_' => {
+                glob.push('?');
+                continue;
+            }
+            '\\' => chars.next()?,
+            c => c,
+        };
+        if matches!(literal, '*' | '?' | '[') {
+            glob.push('[');
+            glob.push(literal);
+            glob.push(']');
+        } else {
+            glob.push(literal);
+        }
+    }
+    (glob.len() <= SQLITE_MAX_LIKE_PATTERN_LENGTH).then_some(glob)
+}
+
+/// Convert a SQL SIMILAR TO pattern to a regex anchored with ^(?:...)$.
+/// `%` → `.*`, `_` → `.`, and `.`, `^`, `$`, which are literals in SIMILAR TO,
+/// are escaped; other regex metacharacters and escapes are kept as-is.
 fn similar_to_regex(pattern: &str) -> String {
-    let mut regex = String::with_capacity(pattern.len() + 2);
-    regex.push('^');
+    let mut regex = String::with_capacity(pattern.len() + 8);
+    regex.push_str("^(?:");
+    let mut in_bracket = false;
     let mut chars = pattern.chars().peekable();
     while let Some(c) = chars.next() {
+        if in_bracket {
+            regex.push(c);
+            if c == ']' {
+                in_bracket = false;
+            }
+            continue;
+        }
         match c {
             '%' => regex.push_str(".*"),
             '_' => regex.push('.'),
@@ -4926,10 +6050,24 @@ fn similar_to_regex(pattern: &str) -> String {
                     regex.push(next);
                 }
             }
+            '.' | '^' | '$' => {
+                regex.push('\\');
+                regex.push(c);
+            }
+            '[' => {
+                in_bracket = true;
+                regex.push(c);
+                if chars.peek() == Some(&'^') {
+                    regex.push(chars.next().unwrap());
+                }
+                if chars.peek() == Some(&']') {
+                    regex.push(chars.next().unwrap());
+                }
+            }
             _ => regex.push(c),
         }
     }
-    regex.push('$');
+    regex.push_str(")$");
     regex
 }
 
@@ -4975,6 +6113,95 @@ fn drop_object_type_name(obj_type: pg_query::protobuf::ObjectType) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn create_sequence_as_type_bounds_the_range() {
+        let bounds = |sql: &str| {
+            let stmt = PostgreSQLTranslator::new()
+                .translate(&crate::parse(sql).unwrap())
+                .unwrap();
+            let ast::Stmt::CreateSequence {
+                min_value,
+                max_value,
+                ..
+            } = stmt
+            else {
+                panic!("expected CREATE SEQUENCE, got {stmt:?}");
+            };
+            (min_value, max_value)
+        };
+        // pg_dump emits AS integer for serial sequences.
+        assert_eq!(
+            bounds("CREATE SEQUENCE s AS integer START WITH 1"),
+            (None, Some(i32::MAX as i64))
+        );
+        assert_eq!(
+            bounds("CREATE SEQUENCE s AS smallint INCREMENT BY -1"),
+            (Some(i16::MIN as i64), None)
+        );
+        assert_eq!(
+            bounds("CREATE SEQUENCE s AS integer MAXVALUE 10"),
+            (None, Some(10))
+        );
+        assert_eq!(
+            bounds("CREATE SEQUENCE s AS bigint"),
+            (None, Some(i64::MAX))
+        );
+        let err = PostgreSQLTranslator::new()
+            .translate(&crate::parse("CREATE SEQUENCE s AS smallint MAXVALUE 100000").unwrap())
+            .unwrap_err()
+            .to_string();
+        assert_eq!(
+            err,
+            "MAXVALUE (100000) is out of range for sequence data type smallint"
+        );
+        let err = PostgreSQLTranslator::new()
+            .translate(&crate::parse("CREATE SEQUENCE s AS numeric").unwrap())
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("AS numeric"), "{err}");
+    }
+
+    #[test]
+    fn from_column_alias_lists_rename_columns() {
+        let translate = |sql: &str| {
+            PostgreSQLTranslator::new()
+                .translate(&crate::parse(sql).unwrap())
+                .map(|stmt| stmt.to_string())
+        };
+        for (sql, expected) in [
+            (
+                "SELECT * FROM (SELECT 1, 2) AS s(p, q)",
+                "SELECT * FROM (WITH s (p, q) AS (SELECT 1, 2) SELECT * FROM s) s",
+            ),
+            (
+                "SELECT * FROM (VALUES (1, 2)) AS v(a)",
+                "SELECT * FROM (WITH v (a, column2) AS (VALUES (1, 2)) SELECT * FROM v) v",
+            ),
+            (
+                "SELECT * FROM (SELECT * FROM v) AS v(a)",
+                "SELECT * FROM (WITH __column_alias_list_0 (a) AS (SELECT * FROM v) SELECT * FROM __column_alias_list_0) v",
+            ),
+            (
+                "SELECT g.n FROM generate_series(1, 3) AS g(n)",
+                "SELECT g.n FROM LATERAL (SELECT value n FROM generate_series (1, 3)) g",
+            ),
+        ] {
+            assert_eq!(translate(sql).unwrap(), expected, "{sql}");
+        }
+        for (sql, error) in [
+            (
+                "SELECT * FROM (SELECT 1) AS s(a, b)",
+                "table \"s\" has 1 columns available but 2 columns specified",
+            ),
+            (
+                "SELECT * FROM generate_series(1, 3) AS g(a, b)",
+                "table \"g\" has 1 columns available but 2 columns specified",
+            ),
+        ] {
+            assert_eq!(translate(sql).unwrap_err().to_string(), error, "{sql}");
+        }
+    }
 
     #[test]
     fn test_type_mapping() {
@@ -5560,92 +6787,59 @@ mod tests {
 
     #[test]
     fn test_like_translation() {
-        let translator = PostgreSQLTranslator::new();
-        let sql = "SELECT * FROM users WHERE name LIKE 'John%'";
-        let parse_result = crate::parse(sql).unwrap();
-        let translated = translator.translate(&parse_result);
-        assert!(translated.is_ok());
-
-        if let Ok(ast::Stmt::Select(select)) = translated {
-            if let ast::OneSelect::Select { where_clause, .. } = &select.body.select {
-                assert!(where_clause.is_some());
-                if let Some(where_expr) = where_clause {
-                    // Should be a Like expression
-                    if let ast::Expr::Like {
-                        lhs,
-                        not,
-                        op,
-                        rhs,
-                        escape,
-                    } = &**where_expr
-                    {
-                        assert!(!not, "Should not be NOT LIKE");
-                        assert!(
-                            matches!(op, ast::LikeOperator::Like),
-                            "Should be LIKE operator"
-                        );
-                        assert!(escape.is_none(), "No ESCAPE clause expected");
-
-                        // Check left and right expressions
-                        assert!(
-                            matches!(**lhs, ast::Expr::Id(_)),
-                            "Left side should be column name"
-                        );
-                        assert!(
-                            matches!(**rhs, ast::Expr::Literal(_)),
-                            "Right side should be literal"
-                        );
-                    } else {
-                        panic!("Expected Like expression but got: {where_expr:?}");
-                    }
-                }
-            }
-        }
+        let where_expr = where_clause_of("SELECT * FROM users WHERE name LIKE 'John%'");
+        let ast::Expr::Like {
+            lhs,
+            not: false,
+            op: ast::LikeOperator::Glob,
+            rhs,
+            escape: None,
+        } = &where_expr
+        else {
+            panic!("Expected GLOB expression but got: {where_expr:?}");
+        };
+        assert!(matches!(**lhs, ast::Expr::Id(_)));
+        assert!(matches!(&**rhs, ast::Expr::Literal(ast::Literal::String(p)) if p == "'John*'"));
     }
 
     #[test]
     fn test_not_like_translation() {
-        let translator = PostgreSQLTranslator::new();
-        let sql = "SELECT * FROM users WHERE name NOT LIKE 'sqlite_%'";
-        let parse_result = crate::parse(sql).unwrap();
-        let translated = translator.translate(&parse_result);
-        assert!(translated.is_ok());
+        let where_expr = where_clause_of("SELECT * FROM users WHERE name NOT LIKE 'sqlite\\_%'");
+        let ast::Expr::Like {
+            not: true,
+            op: ast::LikeOperator::Glob,
+            rhs,
+            ..
+        } = &where_expr
+        else {
+            panic!("Expected NOT GLOB expression but got: {where_expr:?}");
+        };
+        assert!(matches!(&**rhs, ast::Expr::Literal(ast::Literal::String(p)) if p == "'sqlite_*'"));
+    }
 
-        if let Ok(ast::Stmt::Select(select)) = translated {
-            if let ast::OneSelect::Select { where_clause, .. } = &select.body.select {
-                assert!(where_clause.is_some());
-                if let Some(where_expr) = where_clause {
-                    // Should be a Like expression with NOT
-                    if let ast::Expr::Like {
-                        lhs,
-                        not,
-                        op,
-                        rhs,
-                        escape,
-                    } = &**where_expr
-                    {
-                        assert!(*not, "Should be NOT LIKE");
-                        assert!(
-                            matches!(op, ast::LikeOperator::Like),
-                            "Should be LIKE operator"
-                        );
-                        assert!(escape.is_none(), "No ESCAPE clause expected");
+    #[test]
+    fn test_like_with_column_pattern_translation() {
+        let where_expr = where_clause_of("SELECT * FROM users WHERE name NOT LIKE pattern");
+        let ast::Expr::Unary(ast::UnaryOperator::Not, inner) = &where_expr else {
+            panic!("Expected NOT textlike() but got: {where_expr:?}");
+        };
+        assert!(
+            matches!(&**inner, ast::Expr::FunctionCall { name, .. } if name.as_str() == "textlike"),
+            "Expected textlike() call but got: {inner:?}"
+        );
+    }
 
-                        // Check expressions
-                        assert!(
-                            matches!(**lhs, ast::Expr::Id(_)),
-                            "Left side should be column name"
-                        );
-                        assert!(
-                            matches!(**rhs, ast::Expr::Literal(_)),
-                            "Right side should be literal"
-                        );
-                    } else {
-                        panic!("Expected Like expression but got: {where_expr:?}");
-                    }
-                }
-            }
-        }
+    #[test]
+    fn test_like_pattern_too_long_for_glob_uses_textlike() {
+        let sql = format!(
+            "SELECT * FROM users WHERE name LIKE '{}'",
+            "*".repeat(16667)
+        );
+        let where_expr = where_clause_of(&sql);
+        assert!(
+            matches!(&where_expr, ast::Expr::FunctionCall { name, .. } if name.as_str() == "textlike"),
+            "Expected textlike() call but got: {where_expr:?}"
+        );
     }
 
     #[test]
@@ -5677,18 +6871,23 @@ mod tests {
                     if let ast::Expr::Binary(left, op, right) = &**where_expr {
                         assert!(matches!(op, ast::Operator::And), "Top level should be AND");
 
+                        let (ast::Expr::Parenthesized(left), ast::Expr::Parenthesized(right)) =
+                            (&**left, &**right)
+                        else {
+                            panic!("Both sides of AND should be parenthesized");
+                        };
+
                         // Left side should be IN expression
                         assert!(
-                            matches!(**left, ast::Expr::InList { .. }),
+                            matches!(&left[..], [inner] if matches!(**inner, ast::Expr::InList { .. })),
                             "Left side should be IN list"
                         );
 
                         // Right side should be NOT LIKE expression
-                        if let ast::Expr::Like { not, .. } = &**right {
-                            assert!(*not, "Right side should be NOT LIKE");
-                        } else {
-                            panic!("Right side should be LIKE expression");
-                        }
+                        assert!(
+                            matches!(&right[..], [inner] if matches!(**inner, ast::Expr::Like { not: true, .. })),
+                            "Right side should be NOT LIKE"
+                        );
                     } else {
                         panic!("WHERE clause should be Binary expression");
                     }
@@ -6140,6 +7339,70 @@ mod tests {
     }
 
     #[test]
+    fn test_join_after_a_comma_keeps_its_order() {
+        let translator = PostgreSQLTranslator::new();
+        for (sql, expected) in [
+            (
+                "SELECT * FROM a, b JOIN c ON b.y < c.z",
+                "SELECT * FROM a, b INNER JOIN c ON b.y < c.z",
+            ),
+            (
+                "SELECT * FROM a, b CROSS JOIN c",
+                "SELECT * FROM a, b INNER JOIN c",
+            ),
+            (
+                "SELECT * FROM a, b CROSS JOIN LATERAL (SELECT a.x, b.y) s",
+                "SELECT * FROM a, b INNER JOIN LATERAL (SELECT a.x, b.y) s",
+            ),
+        ] {
+            let parsed = crate::parse(sql).unwrap();
+            let translated = translator.translate(&parsed).unwrap();
+            assert_eq!(translated.to_string(), expected);
+        }
+    }
+
+    #[test]
+    fn test_lateral_subquery() {
+        let translator = PostgreSQLTranslator::new();
+        for (sql, expected) in [
+            (
+                "SELECT * FROM t1, LATERAL (SELECT t1.a) s",
+                "SELECT * FROM t1, LATERAL (SELECT t1.a) s",
+            ),
+            (
+                "SELECT * FROM t1 LEFT JOIN LATERAL (SELECT t1.a) s ON true",
+                "SELECT * FROM t1 LEFT OUTER JOIN LATERAL (SELECT t1.a) s ON 1",
+            ),
+            (
+                "SELECT * FROM t1, (SELECT 1) s",
+                "SELECT * FROM t1, (SELECT 1) s",
+            ),
+        ] {
+            let parsed = crate::parse(sql).unwrap();
+            let translated = translator.translate(&parsed).unwrap();
+            assert_eq!(translated.to_string(), expected);
+        }
+    }
+
+    #[test]
+    fn test_right_or_full_join_after_a_comma_is_rejected() {
+        let translator = PostgreSQLTranslator::new();
+        for sql in [
+            "SELECT * FROM a, b RIGHT JOIN c ON true",
+            "SELECT * FROM a, b FULL JOIN c ON true",
+            "SELECT * FROM a, b JOIN c ON true RIGHT JOIN d ON true",
+        ] {
+            let parsed = crate::parse(sql).unwrap();
+            let err = translator.translate(&parsed).unwrap_err();
+            assert_eq!(
+                err.to_string(),
+                "RIGHT and FULL joins after a comma in FROM are not supported",
+                "{sql}"
+            );
+        }
+    }
+
+    #[test]
     fn test_join_subquery() {
         let translator = PostgreSQLTranslator::new();
         let sql = r#"SELECT c.name, sq.cnt FROM cities c LEFT JOIN (SELECT city_id, count(*) as cnt FROM users GROUP BY city_id) sq ON c.id = sq.city_id"#;
@@ -6153,7 +7416,10 @@ mod tests {
                 assert_eq!(from_clause.joins.len(), 1, "Should have one join");
                 let join = &from_clause.joins[0];
                 assert!(
-                    matches!(join.table.as_ref(), ast::SelectTable::Select(_, Some(_))),
+                    matches!(
+                        join.table.as_ref(),
+                        ast::SelectTable::Select { alias: Some(_), .. }
+                    ),
                     "Join RHS should be a subquery with alias"
                 );
             } else {
@@ -6563,6 +7829,76 @@ mod tests {
         } else {
             panic!("Expected CreateView");
         }
+    }
+
+    #[test]
+    fn test_function_within_group_order_is_translated() {
+        let translator = PostgreSQLTranslator::new();
+        let sql = "SELECT percentile_cont(0.5) WITHIN GROUP (ORDER BY x) FROM test";
+        let parsed = crate::parse(sql).unwrap();
+        let translated = translator.translate(&parsed).unwrap();
+
+        let ast::Stmt::Select(select) = translated else {
+            panic!("expected select statement");
+        };
+        let ast::OneSelect::Select { columns, .. } = &select.body.select else {
+            panic!("expected select body");
+        };
+        let ast::ResultColumn::Expr(expr, _) = &columns[0] else {
+            panic!("expected result column");
+        };
+        let ast::Expr::FunctionCall {
+            order_by,
+            within_group,
+            ..
+        } = expr.as_ref()
+        else {
+            panic!("expected function call");
+        };
+        let [sorted_column] = within_group.as_slice() else {
+            panic!("expected single sorted column");
+        };
+        let ast::Expr::Id(name) = sorted_column.expr.as_ref() else {
+            panic!("expected id");
+        };
+
+        assert_eq!(name.as_str(), "x");
+        assert!(order_by.is_empty());
+    }
+
+    #[test]
+    fn test_function_argument_order_is_translated() {
+        let translator = PostgreSQLTranslator::new();
+        let sql = "SELECT array_agg(x ORDER BY y) FROM test";
+        let parsed = crate::parse(sql).unwrap();
+        let translated = translator.translate(&parsed).unwrap();
+
+        let ast::Stmt::Select(select) = translated else {
+            panic!("expected select statement");
+        };
+        let ast::OneSelect::Select { columns, .. } = &select.body.select else {
+            panic!("expected select body");
+        };
+        let ast::ResultColumn::Expr(expr, _) = &columns[0] else {
+            panic!("expected result column");
+        };
+        let ast::Expr::FunctionCall {
+            order_by,
+            within_group,
+            ..
+        } = expr.as_ref()
+        else {
+            panic!("expected function call");
+        };
+        let [sorted_column] = order_by.as_slice() else {
+            panic!("expected single sorted column");
+        };
+        let ast::Expr::Id(name) = sorted_column.expr.as_ref() else {
+            panic!("expected id");
+        };
+
+        assert_eq!(name.as_str(), "y");
+        assert!(within_group.is_empty());
     }
 
     #[test]
@@ -7089,7 +8425,7 @@ mod tests {
                 if let ast::ResultColumn::Expr(expr, _) = &columns[0] {
                     if let ast::Expr::FunctionCall { filter_over, .. } = &**expr {
                         assert!(
-                            matches!(&filter_over.over_clause, Some(ast::Over::Name(n)) if n.as_str() == "w"),
+                            matches!(filter_over.over_clause.as_deref(), Some(ast::Over::Name(n)) if n.as_str() == "w"),
                             "Expected Over::Name(\"w\"), got: {:?}",
                             filter_over.over_clause
                         );
@@ -7110,7 +8446,15 @@ mod tests {
         let translator = PostgreSQLTranslator::new();
 
         let cases = [
-            ("SELECT * FROM t ORDER BY a", None),
+            ("SELECT * FROM t ORDER BY a", Some(ast::NullsOrder::Last)),
+            (
+                "SELECT * FROM t ORDER BY a ASC",
+                Some(ast::NullsOrder::Last),
+            ),
+            (
+                "SELECT * FROM t ORDER BY a DESC",
+                Some(ast::NullsOrder::First),
+            ),
             (
                 "SELECT * FROM t ORDER BY a NULLS FIRST",
                 Some(ast::NullsOrder::First),
@@ -7193,7 +8537,7 @@ mod tests {
         let ast::Expr::FunctionCall { filter_over, .. } = expr.as_ref() else {
             panic!("expected function call expression, got {expr:?}");
         };
-        let Some(ast::Over::Window(window)) = &filter_over.over_clause else {
+        let Some(ast::Over::Window(window)) = filter_over.over_clause.as_deref() else {
             panic!(
                 "expected inline OVER window, got {:?}",
                 filter_over.over_clause
@@ -7392,5 +8736,20 @@ mod tests {
             err.to_string().contains("SEARCH clause"),
             "expected SEARCH clause rejection, got: {err}"
         );
+    }
+
+    #[test]
+    fn with_clause_kept_on_set_operations_and_values() {
+        for sql in [
+            "WITH c AS (SELECT 1 AS x) SELECT x FROM c UNION SELECT 2",
+            "WITH c AS (SELECT 1 AS x) VALUES ((SELECT x FROM c))",
+        ] {
+            let parsed = crate::parse(sql).unwrap();
+            let ast::Stmt::Select(select) = PostgreSQLTranslator::new().translate(&parsed).unwrap()
+            else {
+                panic!("{sql}: expected SELECT");
+            };
+            assert!(select.with.is_some(), "{sql}: WITH clause was dropped");
+        }
     }
 }

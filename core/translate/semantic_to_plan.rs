@@ -367,8 +367,24 @@ impl HirPlan {
         schema: &Schema,
         params: &CostModelParams,
     ) -> Result<Self> {
+        Self::build_with_unnesting_mode(
+            document,
+            schema,
+            params,
+            crate::SubqueryUnnestingMode::Auto,
+        )
+    }
+
+    /// [`Self::build`] with `mode` deciding whether correlated subqueries
+    /// become joins.
+    pub(crate) fn build_with_unnesting_mode(
+        document: Arc<HirDocument>,
+        schema: &Schema,
+        params: &CostModelParams,
+        mode: crate::SubqueryUnnestingMode,
+    ) -> Result<Self> {
         let (document, dropped_parameters) =
-            super::semantic_unnest::unnest_correlated_subqueries(document, schema, params)?;
+            super::semantic_unnest::unnest_correlated_subqueries(document, schema, params, mode)?;
         let mut plan = Self::build_without_unnesting(document, schema, params)?;
         plan.dropped_parameters = dropped_parameters;
         Ok(plan)
@@ -3445,8 +3461,8 @@ fn materialized_view_sources(
         let Some(view) = schema.get_materialized_view(name) else {
             continue;
         };
-        if !schema.has_compatible_dbsp_state_table(name) {
-            use crate::incremental::compiler::DBSP_CIRCUIT_VERSION;
+        if !schema.has_compatible_materialized_view_storage(name) {
+            use crate::incremental::view::DBSP_CIRCUIT_VERSION;
             return Err(LimboError::InternalError(format!(
                 "Materialized view '{name}' has an incompatible version. \n\
                  The current version is {DBSP_CIRCUIT_VERSION}, but the view was created with a different version. \n\

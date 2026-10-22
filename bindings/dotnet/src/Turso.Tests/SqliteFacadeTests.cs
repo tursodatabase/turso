@@ -16,6 +16,9 @@ public class SqliteFacadeTests
         factory.CreateCommand().Should().BeOfType<SqliteCommand>();
         factory.CreateParameter().Should().BeOfType<SqliteParameter>();
         factory.CreateConnectionStringBuilder().Should().BeOfType<SqliteConnectionStringBuilder>();
+        factory.CanCreateBatch.Should().BeTrue();
+        factory.CreateBatch().Should().BeOfType<SqliteBatch>();
+        factory.CreateBatchCommand().Should().BeOfType<SqliteBatchCommand>();
     }
 
     [Test]
@@ -32,6 +35,148 @@ public class SqliteFacadeTests
         builder.BinaryGUID.Should().BeFalse();
         builder.Version.Should().Be(3);
         builder["DataSource"].Should().Be(":memory:");
+    }
+
+    [Test]
+    public void ConnectionStringBuilderRoundTripsManagedConnectionKeywords()
+    {
+        var builder = new SqliteConnectionStringBuilder(
+            "DataSource=libsql://example.turso.io;AuthToken=token;ReplicaPath=replica.db;"
+            + "ReadYourWrites=False;SyncInterval=5;SyncClientName=client;SyncLongPollTimeout=6;"
+            + "BootstrapIfEmpty=False;PartialBootstrapPrefix=7;PartialBootstrapQuery=SELECT 1;"
+            + "PartialSyncSegmentSize=8;PartialSyncPrefetch=True;RemoteEncryptionCipher=aes256gcm;"
+            + "RemoteEncryptionKey=key;PushOperationsThreshold=9;PullBytesThreshold=10;"
+            + "ForceLogicalMvccPull=True;SyncExperimentalFeatures=feature;TLS=True");
+
+        builder.AuthToken.Should().Be("token");
+        builder.ReplicaPath.Should().Be("replica.db");
+        builder.ReadYourWrites.Should().BeFalse();
+        builder.SyncInterval.Should().Be(5);
+        builder.SyncClientName.Should().Be("client");
+        builder.SyncLongPollTimeout.Should().Be(6);
+        builder.BootstrapIfEmpty.Should().BeFalse();
+        builder.PartialBootstrapPrefix.Should().Be(7);
+        builder.PartialBootstrapQuery.Should().Be("SELECT 1");
+        builder.PartialSyncSegmentSize.Should().Be(8);
+        builder.PartialSyncPrefetch.Should().BeTrue();
+        builder.RemoteEncryptionCipher.Should().Be("aes256gcm");
+        builder.RemoteEncryptionKey.Should().Be("key");
+        builder.PushOperationsThreshold.Should().Be(9);
+        builder.PullBytesThreshold.Should().Be(10);
+        builder.ForceLogicalMvccPull.Should().BeTrue();
+        builder.SyncExperimentalFeatures.Should().Be("feature");
+        builder.Tls.Should().BeTrue();
+        builder.IsReplica.Should().BeTrue();
+        builder.IsDirectRemote.Should().BeFalse();
+        builder.IsRemote.Should().BeTrue();
+        builder.IsLocal.Should().BeFalse();
+
+        var roundTripped = new SqliteConnectionStringBuilder(builder.ConnectionString);
+        roundTripped.ConnectionString.Should().Be(builder.ConnectionString);
+        roundTripped.ReplicaPath.Should().Be("replica.db");
+        roundTripped.PartialSyncSegmentSize.Should().Be(8);
+        roundTripped.Tls.Should().BeTrue();
+
+        using var connection = new SqliteConnection(roundTripped.ConnectionString);
+        connection.IsLocal.Should().BeFalse();
+        connection.IsDirectRemote.Should().BeFalse();
+        connection.IsRemote.Should().BeTrue();
+        connection.IsReplica.Should().BeTrue();
+        connection.IsManaged.Should().BeTrue();
+    }
+
+    [TestCase(":memory:", true, false, false)]
+    [TestCase("local.db", true, false, false)]
+    [TestCase("file:local.db", true, false, false)]
+    [TestCase("https://example.turso.io", false, true, false)]
+    [TestCase("libsql://example.turso.io", false, true, false)]
+    public void ConnectionStringBuilderClassifiesDataSource(
+        string dataSource,
+        bool isLocal,
+        bool isDirectRemote,
+        bool isReplica)
+    {
+        var builder = new SqliteConnectionStringBuilder { DataSource = dataSource };
+
+        builder.IsLocal.Should().Be(isLocal);
+        builder.IsDirectRemote.Should().Be(isDirectRemote);
+        builder.IsReplica.Should().Be(isReplica);
+
+        builder.ReplicaPath = isLocal ? "ignored.db" : "replica.db";
+        builder.IsReplica.Should().Be(!isLocal);
+    }
+
+    [Test]
+    public async Task ManagedConnectionDelegatesLifecycleAndState()
+    {
+        await using var connection = new SqliteConnection(
+            "Data Source=https://example.turso.io;Auth Token=token;Default Timeout=7");
+        var transitions = new List<(ConnectionState Original, ConnectionState Current)>();
+        connection.StateChange += (_, args) => transitions.Add((args.OriginalState, args.CurrentState));
+
+        connection.IsLocal.Should().BeFalse();
+        connection.IsDirectRemote.Should().BeTrue();
+        connection.IsRemote.Should().BeTrue();
+        connection.IsReplica.Should().BeFalse();
+        connection.IsManaged.Should().BeTrue();
+        connection.CanCreateBatch.Should().BeTrue();
+        connection.DataSource.Should().Be("https://example.turso.io");
+        connection.DefaultTimeout.Should().Be(7);
+        connection.State.Should().Be(ConnectionState.Closed);
+
+        await connection.OpenAsync();
+        connection.State.Should().Be(ConnectionState.Open);
+        connection.DataSource.Should().Be("https://example.turso.io");
+        connection.SyncDatabase.Should().BeNull();
+        Assert.Throws<NotSupportedException>(connection.Sync);
+        Assert.ThrowsAsync<NotSupportedException>(() => connection.SyncAsync());
+
+        connection.Close();
+        connection.State.Should().Be(ConnectionState.Closed);
+        connection.Open();
+        connection.Close();
+        transitions.Should().Equal(
+            (ConnectionState.Closed, ConnectionState.Open),
+            (ConnectionState.Open, ConnectionState.Closed),
+            (ConnectionState.Closed, ConnectionState.Open),
+            (ConnectionState.Open, ConnectionState.Closed));
+    }
+
+    [Test]
+    public async Task WrappedTursoConnectionHonorsExplicitOwnership()
+    {
+        var borrowed = new TursoConnection("Data Source=https://example.turso.io");
+        borrowed.Open();
+        await using (var wrapper = new SqliteConnection(borrowed, ownsConnection: false))
+        {
+            wrapper.State.Should().Be(ConnectionState.Open);
+            wrapper.IsDirectRemote.Should().BeTrue();
+        }
+
+        borrowed.State.Should().Be(ConnectionState.Open);
+        borrowed.Close();
+
+        var owned = new TursoConnection("Data Source=https://example.turso.io");
+        owned.Open();
+        var owningWrapper = new SqliteConnection(owned, ownsConnection: true);
+        await owningWrapper.DisposeAsync();
+
+        owned.State.Should().Be(ConnectionState.Closed);
+        Assert.Throws<ObjectDisposedException>(owned.Open);
+    }
+
+    [Test]
+    public void ManagedConnectionRejectsLocalOnlyFacadeApis()
+    {
+        using var connection = new SqliteConnection("Data Source=https://example.turso.io");
+
+        Assert.Throws<NotSupportedException>(() => connection.GetSchema());
+        Assert.Throws<NotSupportedException>(() => connection.EnableExtensions());
+        Assert.Throws<NotSupportedException>(() => connection.CreateFunction("custom", () => 1));
+
+        using var local = new SqliteConnection("Data Source=:memory:");
+        local.CanCreateBatch.Should().BeFalse();
+        Assert.Throws<NotSupportedException>(() => local.CreateBatch());
     }
 
     [Test]
@@ -176,6 +321,88 @@ public class SqliteFacadeTests
             INSERT INTO Data VALUES ('blocked');
             """));
         exception!.SqliteErrorCode.Should().Be(8);
+    }
+
+    [Test]
+    public void PooledConnectionsDoNotShareConnectionState()
+    {
+        using var directory = new TemporaryDirectory();
+        var path = Path.Combine(directory.Path, "pooled-state.db");
+        using (var first = new SqliteConnection($"Data Source={path}"))
+        {
+            first.Open();
+            first.ExecuteNonQuery("CREATE TABLE Data(Value INTEGER); PRAGMA foreign_keys = ON;");
+            first.ExecuteScalar<long>("PRAGMA foreign_keys;").Should().Be(1);
+        }
+
+        using var second = new SqliteConnection($"Data Source={path}");
+        second.Open();
+        second.ExecuteScalar<long>("PRAGMA foreign_keys;").Should().Be(0);
+        second.ExecuteScalar<long>("SELECT COUNT(*) FROM Data;").Should().Be(0);
+    }
+
+    [Test]
+    public void ClosingPooledConnectionRollsBackOpenTransaction()
+    {
+        using var directory = new TemporaryDirectory();
+        var path = Path.Combine(directory.Path, "pooled-rollback.db");
+        using (var setup = new SqliteConnection($"Data Source={path}"))
+        {
+            setup.Open();
+            setup.ExecuteNonQuery("CREATE TABLE Data(Value INTEGER);");
+        }
+
+        using (var writer = new SqliteConnection($"Data Source={path}"))
+        {
+            writer.Open();
+            writer.ExecuteNonQuery("BEGIN; INSERT INTO Data VALUES (1);");
+        }
+
+        using var reader = new SqliteConnection($"Data Source={path}");
+        reader.Open();
+        reader.ExecuteScalar<long>("SELECT COUNT(*) FROM Data;").Should().Be(0);
+    }
+
+    [Test]
+    public void ClearPoolReleasesDatabaseFiles()
+    {
+        using var directory = new TemporaryDirectory();
+        var path = Path.Combine(directory.Path, "pooled-clear.db");
+        using (var connection = new SqliteConnection($"Data Source={path}"))
+        {
+            connection.Open();
+            connection.ExecuteNonQuery("CREATE TABLE Data(Value INTEGER); INSERT INTO Data VALUES (1);");
+            connection.Close();
+            SqliteConnection.ClearPool(connection);
+        }
+
+        File.Delete(path);
+        File.Delete(path + "-wal");
+        File.Exists(path).Should().BeFalse();
+
+        using var reopened = new SqliteConnection($"Data Source={path}");
+        reopened.Open();
+        reopened.ExecuteScalar<long>("SELECT COUNT(*) FROM sqlite_master;").Should().Be(0);
+    }
+
+    [Test]
+    public void FailedPooledOpenDoesNotKeepFileOpen()
+    {
+        using var directory = new TemporaryDirectory();
+        var path = Path.Combine(directory.Path, "pooled-not-a-database.db");
+        var garbage = new byte[8192];
+        Array.Fill(garbage, (byte)0x5A);
+        File.WriteAllBytes(path, garbage);
+
+        using (var connection = new SqliteConnection($"Data Source={path}"))
+            Assert.Throws<SqliteException>(() => connection.Open());
+
+        File.Delete(path);
+        File.Exists(path).Should().BeFalse();
+
+        using var reopened = new SqliteConnection($"Data Source={path}");
+        reopened.Open();
+        reopened.ExecuteScalar<long>("SELECT COUNT(*) FROM sqlite_master;").Should().Be(0);
     }
 
     [Test]
@@ -902,6 +1129,77 @@ public class SqliteFacadeTests
     }
 
     [Test]
+    public void GetValueResolvesDeclaredTypesForEachResultSet()
+    {
+        using var connection = new SqliteConnection("Data Source=:memory:");
+        connection.Open();
+        connection.ExecuteNonQuery(
+            """
+            CREATE TABLE GuidIds (Id GUID);
+            CREATE TABLE TextIds (Id TEXT);
+            INSERT INTO GuidIds VALUES ('dc0d7e0e-365d-4948-ab9b-8ca8056bf93a'), ('0e7e0ddc-5d36-4849-ab9b-8ca8056bf93a');
+            INSERT INTO TextIds VALUES ('dc0d7e0e-365d-4948-ab9b-8ca8056bf93a');
+            """);
+
+        using var reader = connection.ExecuteReader("SELECT Id FROM GuidIds; SELECT Id FROM TextIds;");
+        reader.Read().Should().BeTrue();
+        reader.GetValue(0).Should().BeOfType<Guid>();
+        reader.Read().Should().BeTrue();
+        reader.GetValue(0).Should().Be(new Guid("0e7e0ddc-5d36-4849-ab9b-8ca8056bf93a"));
+
+        reader.NextResult().Should().BeTrue();
+        reader.Read().Should().BeTrue();
+        reader.GetValue(0).Should().Be("dc0d7e0e-365d-4948-ab9b-8ca8056bf93a");
+    }
+
+    [Test]
+    public void GetValueResolvesDeclaredTypesThroughAliasesAndJoins()
+    {
+        using var connection = new SqliteConnection("Data Source=:memory:");
+        connection.Open();
+        connection.ExecuteNonQuery(
+            """
+            CREATE TABLE GuidIds (Id GUID);
+            CREATE TABLE TextIds (Id TEXT);
+            INSERT INTO GuidIds VALUES ('dc0d7e0e-365d-4948-ab9b-8ca8056bf93a');
+            INSERT INTO TextIds VALUES ('dc0d7e0e-365d-4948-ab9b-8ca8056bf93a');
+            """);
+
+        using var reader = connection.ExecuteReader("SELECT t.Id AS TextId, g.Id AS GuidId FROM TextIds t JOIN GuidIds g ON g.Id = t.Id");
+        reader.Read().Should().BeTrue();
+        reader.GetDataTypeName(0).Should().Be("TEXT");
+        reader.GetValue(0).Should().Be("dc0d7e0e-365d-4948-ab9b-8ca8056bf93a");
+        reader.GetDataTypeName(1).Should().Be("GUID");
+        reader.GetValue(1).Should().Be(new Guid("dc0d7e0e-365d-4948-ab9b-8ca8056bf93a"));
+        reader.Invoking(r => r.GetDataTypeName(2)).Should().Throw<ArgumentOutOfRangeException>();
+    }
+
+    [Test]
+    public void GetValueUsesStorageTypeWhenNoDeclaredTypeIsAvailable()
+    {
+        using var connection = new SqliteConnection("Data Source=:memory:");
+        connection.Open();
+        connection.ExecuteNonQuery(
+            """
+            CREATE TABLE Items (Id GUID, Untyped);
+            INSERT INTO Items VALUES ('dc0d7e0e-365d-4948-ab9b-8ca8056bf93a', 'dc0d7e0e-365d-4948-ab9b-8ca8056bf93a');
+            """);
+
+        // An expression over a GUID column and a column declared without a type have no declared type,
+        // so values are returned as stored instead of being converted to Guid.
+        using var reader = connection.ExecuteReader("SELECT lower(Id), Untyped, Id || '', 1 + 1 FROM Items");
+        reader.Read().Should().BeTrue();
+        reader.GetDataTypeName(0).Should().Be("TEXT");
+        reader.GetValue(0).Should().Be("dc0d7e0e-365d-4948-ab9b-8ca8056bf93a");
+        reader.GetDataTypeName(1).Should().Be("TEXT");
+        reader.GetValue(1).Should().Be("dc0d7e0e-365d-4948-ab9b-8ca8056bf93a");
+        reader.GetDataTypeName(2).Should().Be("TEXT");
+        reader.GetValue(2).Should().Be("dc0d7e0e-365d-4948-ab9b-8ca8056bf93a");
+        reader.GetDataTypeName(3).Should().Be("INTEGER");
+        reader.GetValue(3).Should().Be(2L);
+    }
+
+    [Test]
     public void GetFieldValueThrowsForNullTypedValues()
     {
         using var connection = new SqliteConnection("Data Source=:memory:");
@@ -1039,6 +1337,7 @@ public class SqliteFacadeTests
 
         public void Dispose()
         {
+            SqliteConnection.ClearAllPools();
             if (Directory.Exists(Path))
                 Directory.Delete(Path, recursive: true);
         }

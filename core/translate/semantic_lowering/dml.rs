@@ -748,6 +748,7 @@ impl<'a> ReturningBuffer<'a> {
         });
         program.emit_insn(Insn::Next {
             cursor_id: self.cursor,
+            is_index: program.cursor_is_index(self.cursor),
             pc_if_next: next,
             fullscan: false,
         });
@@ -1114,14 +1115,14 @@ pub(super) fn emit_row_record(
         }
         let affinities = stored
             .iter()
-            .map(|(_, _, column)| column.affinity_with_strict(table.is_strict).aff_mask())
+            .map(|(_, _, column)| column.affinity().aff_mask())
             .collect::<String>();
         (block, stored.len(), affinities)
     } else {
         let affinities = table
             .columns()
             .iter()
-            .map(|column| column.affinity_with_strict(table.is_strict).aff_mask())
+            .map(|column| column.affinity().aff_mask())
             .collect::<String>();
         (start, table.columns().len(), affinities)
     };

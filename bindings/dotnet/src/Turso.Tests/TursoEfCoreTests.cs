@@ -275,6 +275,8 @@ public class TursoEfCoreTests
         await using var context = CreateContext(database.ConnectionString);
         await context.Database.EnsureCreatedAsync();
         await context.Database.CloseConnectionAsync();
+        // The pool keeps the database (and its WAL) open after the connection closes.
+        SqliteConnection.ClearAllPools();
 
         var walPath = database.Path + "-wal";
         var shmPath = database.Path + "-shm";
@@ -399,6 +401,7 @@ public class TursoEfCoreTests
 
         public void Dispose()
         {
+            SqliteConnection.ClearAllPools();
             if (File.Exists(Path))
                 File.Delete(Path);
             if (File.Exists(Path + "-wal"))

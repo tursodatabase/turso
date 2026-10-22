@@ -259,6 +259,27 @@ expect {
     0|-1|-1
 }
 
+test pragma-temp-page-size-independent-of-main {
+    PRAGMA temp.page_size=1024;
+    CREATE TEMP TABLE pagesize_temp_t(a);
+    PRAGMA temp.page_size;
+    PRAGMA main.page_size;
+}
+expect {
+    1024
+    4096
+}
+
+test pragma-temp-freelist-count-matches-sqlite {
+    CREATE TEMP TABLE t(a);
+    INSERT INTO t SELECT zeroblob(5000) FROM generate_series(1, 10);
+    DELETE FROM t;
+    PRAGMA temp.freelist_count;
+}
+expect {
+    13
+}
+
 @cross-check-integrity
 test temp-store-change-outside-transaction-resets-temp-schema {
     CREATE TEMP TABLE reset_me(v INTEGER);
@@ -332,4 +353,68 @@ test full-txn-rollback-restores-temp-schema {
 expect {
     ft_sentinel
     99
+}
+
+test analyze-temp-schema-by-name {
+    CREATE TEMP TABLE tt(a);
+    CREATE INDEX tt_i ON tt(a);
+    INSERT INTO tt VALUES (1), (2);
+    ANALYZE temp;
+    SELECT tbl, idx, stat FROM temp.sqlite_stat1;
+}
+expect {
+    tt|tt_i|2 1
+}
+
+test analyze-unqualified-temp-table {
+    CREATE TEMP TABLE tt(a);
+    CREATE INDEX tt_i ON tt(a);
+    INSERT INTO tt VALUES (1), (2);
+    ANALYZE tt;
+    SELECT tbl, idx, stat FROM temp.sqlite_stat1;
+}
+expect {
+    tt|tt_i|2 1
+}
+
+test analyze-unqualified-temp-index {
+    CREATE TEMP TABLE tt(a);
+    CREATE INDEX tt_i ON tt(a);
+    INSERT INTO tt VALUES (1), (2);
+    ANALYZE tt_i;
+    SELECT tbl, idx, stat FROM temp.sqlite_stat1;
+}
+expect {
+    tt|tt_i|2 1
+}
+
+test analyze-unqualified-name-prefers-temp-table-over-main-table {
+    CREATE TABLE tt(a);
+    CREATE INDEX main_i ON tt(a);
+    INSERT INTO tt VALUES (1);
+    CREATE TEMP TABLE tt(a);
+    CREATE INDEX temp_i ON tt(a);
+    INSERT INTO temp.tt VALUES (1), (2);
+    ANALYZE tt;
+    SELECT tbl, idx, stat FROM temp.sqlite_stat1;
+    SELECT count(*) FROM sqlite_schema WHERE name = 'sqlite_stat1';
+}
+expect {
+    tt|temp_i|2 1
+    0
+}
+
+test analyze-unqualified-name-prefers-main-index-over-temp-table {
+    CREATE TABLE m(a);
+    CREATE INDEX x ON m(a);
+    INSERT INTO m VALUES (1), (2);
+    CREATE TEMP TABLE x(a);
+    CREATE INDEX temp_i ON x(a);
+    ANALYZE x;
+    SELECT tbl, idx, stat FROM main.sqlite_stat1;
+    SELECT count(*) FROM temp.sqlite_schema WHERE name = 'sqlite_stat1';
+}
+expect {
+    m|x|2 1
+    0
 }

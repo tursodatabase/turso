@@ -294,7 +294,7 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
         let cte_context = context.cte_context();
         match syntax {
             ast::SelectTable::Table(name, alias, indexed) => {
-                if name.db_name.is_none() {
+                if name.namespace.is_none() {
                     if let Some(cte) = self.resolve_cte(name.name.as_str(), cte_context)? {
                         if let Some(ast::Indexed::IndexedBy(index)) = indexed {
                             crate::bail_parse_error!("no such index: {}", index.as_str());
@@ -340,7 +340,14 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
             }
             ast::SelectTable::TableCall(name, arguments, alias) => self
                 .analyze_table_function_source(name, arguments, alias.as_ref(), owner, cte_context),
-            ast::SelectTable::Select(select, alias) => {
+            ast::SelectTable::Select {
+                select,
+                alias,
+                lateral,
+            } => {
+                if *lateral {
+                    crate::bail_parse_error!("LATERAL subqueries are not yet supported");
+                }
                 let id = self.analyze_derived_source(select, alias.as_ref(), context, position)?;
                 Ok(AnalyzedTableSource {
                     id,
@@ -362,7 +369,7 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
         owner: SourceOwner,
         cte_context: CteBindingContext<'_>,
     ) -> Result<AnalyzedTableSource<'ast>> {
-        if name.db_name.is_none() {
+        if name.namespace.is_none() {
             if let Some(cte) = self.resolve_cte(name.name.as_str(), cte_context)? {
                 if !arguments.is_empty() {
                     match cte {
@@ -1199,7 +1206,7 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
                         .clone()
                         .unwrap_or_else(|| format!("column{}", index + 1)),
                     type_fact,
-                    affinity: column.affinity_with_strict(is_strict),
+                    affinity: column.affinity(),
                     has_affinity: true,
                     collation,
                     hidden: column.hidden(),

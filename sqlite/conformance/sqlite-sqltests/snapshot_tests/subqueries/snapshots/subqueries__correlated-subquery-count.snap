@@ -19,82 +19,72 @@ info:
 ---
 QUERY PLAN
 |--SCAN orders AS o
-`--SEARCH scalar_subquery_1 USING INDEX ephemeral_subquery_s2 (correlation_key_0=?) LEFT-JOIN
+`--SEARCH scalar_subquery_t2 USING INDEX ephemeral_subquery_t2 (correlation_key_0=?) LEFT-JOIN
    `--SCAN order_items AS oi USING COVERING INDEX idx_order_items_order
 
 BYTECODE
-addr  opcode               p1  p2  p3  p4                 p5  comment
-   0        Init            0  71   0                      0  Start at 71
-   1        OpenRead        0   4   0  k(4,B,B,B,B)        0  table=orders, root=4, iDb=0
-   2        Once           35   0   0                      0  goto 35
-   3        OpenEphemeral   1   1   0                      0  cursor=1 is_table=true
-   4        Null            0   1   0                      0  r[1]=NULL
-   5        Integer         0  14   0                      0  r[14]=0
-   6        Null            0  15   0                      0  r[15]=NULL
-   7        Gosub          13  32   0                      0
-   8        OpenRead        2  10   0  k(2,B)              0  index=idx_order_items_order, root=10, iDb=0
-   9        Rewind          2  21   0                      0  Rewind index idx_order_items_order
-  10          Column        2   0  16                      0  r[16]=idx_order_items_order.order_id
-  11          Compare      15  16   1  k(1, Binary)        0  r[15..15]==r[16..16]
-  12          Jump         13  16  13                      0
-  13          Gosub        12  23   0                      0
-  14          Move         16  15   1                      0  r[15..15]=r[16..16]
-  15          Gosub        13  32   0                      0
-  16          Integer       1  17   0                      0  r[17]=1
-  17          AggStep       0  17   1  count               0  accum=r[1] step(r[17])
-  18          If           14  19   0                      0  if r[14] goto 19
-  19          Integer       1  14   0                      0  r[14]=1
-  20        Next            2  10   0                      1
-  21        Gosub          12  23   0                      0
-  22        Goto            0  35   0                      0
-  23        IfPos          14  25   0                      0  r[14]>0 -> r[14]-=0, goto 25
-  24      Return           12   0   0                      0
-  25      AggFinal          0   1   0  count               0  accum=r[1]
-  26      Copy              1  18   0                      0  r[18]=r[1]
-  27      Copy             15  19   0                      0  r[19]=r[15]
-  28      MakeRecord       18   2  20                      0  r[20]=mkrec(r[18..19]); for scalar_subquery_1
-  29      NewRowid          1  21   0                      0  r[21]=rowid
-  30      Insert            1  20  21  scalar_subquery_1   4  intkey=r[21] data=r[20]
-  31    Return             12   0   0                      0
-  32    Null                0   1   0                      0  r[1]=NULL
-  33    Integer             0  14   0                      0  r[14]=0
-  34  Return               13   0   0                      0
-  35  Rewind                0  70   0                      0  Rewind table orders
-  36    Integer             0  22   0                      0  r[22]=0
-  37    Once               47   0   0                      0  goto 47
-  38    OpenAutoindex       3   0   0                      0  cursor=3
-  39    Rewind              1  47   0                      0  Rewind table ephemeral(scalar_subquery_1)
-  40      Column            1   1  23                      0  r[23]=ephemeral(scalar_subquery_1).correlation_key_0
-  41      Column            1   0  24                      0  r[24]=ephemeral(scalar_subquery_1).count(*)
-  42      RowId             1  25   0                      0  r[25]=ephemeral(scalar_subquery_1).rowid
-  43      MakeRecord       23   3  26                      0  r[26]=mkrec(r[23..25]); for ephemeral_subquery_s2
-  44      FilterAdd         3  23   1                      0  bloom_filter_add(r[23..24])
-  45      IdxInsert         3  26  23                      0  key=r[26]
-  46    Next                1  40   0                      0
-  47    RowId               0  27   0                      0  r[27]=orders.rowid
-  48    Filter              3  66  27                      1  if !bloom_filter(r[27..28]) goto 66
-  49    SeekGE              3  66  27                      0  key=[27..27]
-  50      IdxGT             3  66  27                      0  key=[27..27]
-  51      Integer           1  22   0                      0  r[22]=1
-  52      Column            3   1  30                      0  r[30]=ephemeral(ephemeral_subquery_s2).count(*)
-  53      Integer           1  29   0                      0  r[29]=1
-  54      IsNull           30  56   0                      0  if (r[30]==NULL) goto 56
-  55      Integer           0  29   0                      0  r[29]=0
-  56      IfNot            29  59   1                      0  if !r[29] goto 59
-  57      Integer           0  28   0                      0  r[28]=0
-  58      Goto              0  60   0                      0
-  59      Column            3   1  28                      0  r[28]=ephemeral(ephemeral_subquery_s2).count(*)
-  60      Lt               28  31  65                      0  if r[28]<r[31] goto 65
-  61      RowId             0  32   0                      0  r[32]=orders.rowid
-  62      ColumnRange       0   2  33  2                   0  r[33..34]=orders.order_date..total_amount
-  63      RealAffinity     34   0   0                      0
-  64      ResultRow        32   3   0                      0  output=r[32..34]
-  65    Next                3  50   0                      0
-  66    IfPos              22  69   0                      0  r[22]>0 -> r[22]-=0, goto 69
-  67    NullRow             3   0   0                      0  Set cursor 3 to a (pseudo) NULL row
-  68    Goto                0  51   0                      0
-  69  Next                  0  36   0                      1
-  70  Halt                  0   0   0                      0
-  71  Transaction           0   1  11                      0  iDb=0 tx_mode=Read
-  72  Integer               3  31   0                      0  r[31]=3
-  73  Goto                  0   1   0                      0
+addr  opcode            p1  p2  p3  p4            p5  comment
+   0  Init               0  60   0                 0  Start at 60
+   1  Once              39   0   0                 0  goto 39
+   2  OpenEphemeral      0   0   0                 0  cursor=0 is_table=false
+   3  Null               0   8   0                 0  r[8]=NULL
+   4  Integer            0   5   0                 0  r[5]=0; clear group by abort flag
+   5  Null               0   6   0                 0  r[6]=NULL; initialize group by comparison registers to NULL
+   6  Gosub             11  36   0                 0  ; go to clear accumulator subroutine
+   7  OpenRead           1  10   0  k(2,B)         0  index=idx_order_items_order, root=10, iDb=0
+   8  Rewind             1  21   0                 0  Rewind index idx_order_items_order
+   9    Column           1   0  10                 0  r[10]=idx_order_items_order.order_id
+  10    Compare          6  10   1  k(1, Binary)   0  r[6..6]==r[10..10]
+  11    Jump            12  16  12                 0  ; start new group if comparison is not equal
+  12    Gosub            3  25   0                 0  ; check if ended group had data, and output if so
+  13    Move            10   6   1                 0  r[6..6]=r[10..10]
+  14    IfPos            5  39   0                 0  r[5]>0 -> r[5]-=0, goto 39; check abort flag
+  15    Gosub           11  36   0                 0  ; goto clear accumulator subroutine
+  16    AggStep          0  12   8  count          0  accum=r[8] step(r[12])
+  17    If               4  19   0                 0  if r[4] goto 19; don't emit group columns if continuing existing group
+  18    Column           1   0   7                 0  r[7]=idx_order_items_order.order_id
+  19    Integer          1   4   0                 0  r[4]=1; indicate data in accumulator
+  20  Next               1   9   0                 1
+  21  Gosub              3  25   0                 0  ; emit row for final group
+  22  Goto               0  39   0                 0  ; group by finished
+  23  Integer            1   5   0                 0  r[5]=1
+  24  Return             3   0   0                 0
+  25  IfPos              4  27   0                 0  r[4]>0 -> r[4]-=0, goto 27; output group by row subroutine start
+  26  Return             3   0   0                 0
+  27  AggFinal           0   8   0  count          0  accum=r[8]
+  28  Copy               8   1   0                 0  r[1]=r[8]
+  29  Copy               7   2   0                 0  r[2]=r[7]
+  30  Copy               2  14   0                 0  r[14]=r[2]
+  31  Copy               1  15   0                 0  r[15]=r[1]
+  32  Sequence           0  16   0                 0
+  33  MakeRecord        14   3  13                 0  r[13]=mkrec(r[14..16]); for ephemeral_subquery_t2
+  34  IdxInsert          0  13   0                 8  key=r[13]
+  35  Return             3   0   0                 0
+  36  Null               0   7   8                 0  r[7..8]=NULL; clear accumulator subroutine start
+  37  Integer            0   4   0                 0  r[4]=0
+  38  Return            11   0   0                 0
+  39  OpenRead           2   4   0  k(4,B,B,B,B)   0  table=orders, root=4, iDb=0
+  40  Rewind             2  59   0                 0  Rewind table orders
+  41    Integer          0  20   0                 0  r[20]=0
+  42    RowId            2  21   0                 0  r[21]=orders.rowid
+  43    SeekGE           0  55  21                 0  key=[21..21]
+  44      IdxGT          0  55  21                 0  key=[21..21]
+  45      Integer        1  20   0                 0  r[20]=1
+  46      Column         0   1  23                 0  r[23]=ephemeral(ephemeral_subquery_t2).count(*)
+  47      NotNull       23  49   0                 0  r[23]!=NULL -> goto 49
+  48      Integer        0  23   0                 0  r[23]=0
+  49      Lt            23  24  54  Binary         0  if r[23]<r[24] goto 54
+  50      RowId          2  17   0                 0  r[17]=orders.rowid
+  51      ColumnRange    2   2  18  2              0  r[18..19]=orders.order_date..total_amount
+  52      RealAffinity  19   0   0                 0
+  53      ResultRow     17   3   0                 0  output=r[17..19]
+  54    Next             0  44   0                 0
+  55    IfPos           20  58   0                 0  r[20]>0 -> r[20]-=0, goto 58
+  56    NullRow          0   0   0                 0  Set cursor 0 to a (pseudo) NULL row
+  57    Goto             0  45   0                 0
+  58  Next               2  41   0                 1
+  59  Halt               0   0   0                 0
+  60  Transaction        0   1  11                 0  iDb=0 tx_mode=Read
+  61  Integer            1  12   0                 0  r[12]=1
+  62  Integer            3  24   0                 0  r[24]=3
+  63  Goto               0   1   0                 0

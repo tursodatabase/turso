@@ -66,3 +66,49 @@ test pragma-index-info-function-syntax {
 expect {
     0|0|a
 }
+
+@skip-if mvcc "WITHOUT ROWID tables are not supported in MVCC mode"
+@cross-check-integrity
+test pragma-index-info-without-rowid-primary-key {
+    CREATE TABLE w(x, PRIMARY KEY(x)) WITHOUT ROWID;
+    CREATE TABLE w2(a, b, c COLLATE NOCASE, d, PRIMARY KEY(c DESC, a)) WITHOUT ROWID;
+    SELECT 'info', * FROM pragma_index_info('sqlite_autoindex_w_1');
+    PRAGMA index_info(sqlite_autoindex_w2_1);
+    PRAGMA index_info(w2);
+}
+expect {
+    info|0|0|x
+    0|2|c
+    1|0|a
+    0|2|c
+    1|0|a
+}
+
+@skip-if mvcc "WITHOUT ROWID tables are not supported in MVCC mode"
+@cross-check-integrity
+test pragma-index-info-without-rowid-primary-key-in-temp {
+    CREATE TEMP TABLE tw(x, y, PRIMARY KEY(y)) WITHOUT ROWID;
+    SELECT 'info', * FROM pragma_index_info('sqlite_autoindex_tw_1');
+    SELECT 'xinfo', * FROM pragma_index_xinfo('tw');
+}
+expect {
+    info|0|1|y
+    xinfo|0|1|y|0|BINARY|1
+    xinfo|1|0|x|0|BINARY|0
+}
+
+@skip-if mvcc "WITHOUT ROWID tables are not supported in MVCC mode"
+@cross-check-integrity
+test pragma-index-info-index-name-wins-over-without-rowid-table-name {
+    CREATE TABLE r(x, y);
+    CREATE INDEX foo ON r(y);
+    CREATE TEMP TABLE foo(z PRIMARY KEY) WITHOUT ROWID;
+    SELECT 'index', * FROM pragma_index_info('foo');
+    SELECT 'pk', * FROM pragma_index_info('sqlite_autoindex_foo_1');
+    PRAGMA temp.index_info(foo);
+}
+expect {
+    index|0|1|y
+    pk|0|0|z
+    0|0|z
+}

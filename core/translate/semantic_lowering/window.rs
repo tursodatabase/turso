@@ -4618,7 +4618,7 @@ mod tests {
                             let has_peers = mode != "ROWS";
                             let after_next = next + 1 + usize::from(eof.is_some() || has_peers);
                             assert!(
-                                matches!(program.insns[next].0, Insn::Next { cursor_id, pc_if_next: BranchOffset::Offset(target), fullscan: false }
+                                matches!(program.insns[next].0, Insn::Next { cursor_id, pc_if_next: BranchOffset::Offset(target), fullscan: false, is_index: _ }
                                 if cursor_id == cursor && target as usize == after_next)
                             );
                             if eof.is_some() || has_peers {

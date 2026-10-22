@@ -49,8 +49,8 @@ info:
 ---
 QUERY PLAN
 |--SCAN custsale
-|  |--SCAN customer
-|  |--SEARCH orders USING COVERING INDEX ephemeral_orders_s2 (O_CUSTKEY=?)
-|  `--SCALAR SUBQUERY 1
-|     `--SCAN customer
+|  |--SCALAR SUBQUERY 1
+|  |  `--SCAN customer
+|  |--HASH JOIN orders
+|  `--SCAN customer
 `--USE SORTER FOR GROUP BY

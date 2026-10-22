@@ -1,3 +1,4 @@
+use crate::schema::RESERVED_TABLE_PREFIXES;
 use crate::translate::schema::{emit_schema_entry, SchemaEntryType, SQLITE_TABLEID};
 use crate::translate::semantic::context::SemanticContext;
 use crate::translate::ProgramBuilder;
@@ -58,7 +59,7 @@ pub(crate) fn create_trigger_to_sql(
     }
 
     sql.push_str(" ON ");
-    if let Some(ref db_name) = tbl_name.db_name {
+    if let Some(ref db_name) = tbl_name.namespace {
         sql.push_str(&db_name.as_ident());
         sql.push('.');
     }
@@ -98,13 +99,22 @@ pub fn translate_create_trigger(
     when_clause: Option<&ast::Expr>,
 ) -> Result<()> {
     let normalized_trigger_name = normalize_ident(trigger_name.name.as_str());
+    if RESERVED_TABLE_PREFIXES
+        .iter()
+        .any(|prefix| normalized_trigger_name.starts_with(prefix))
+    {
+        bail_parse_error!(
+            "Object name reserved for internal use: {}",
+            trigger_name.name.as_str()
+        );
+    }
     let normalized_table_name = normalize_ident(tbl_name.name.as_str());
     let database_id =
         resolve_create_trigger_database_id(catalog, &trigger_name, &tbl_name, temporary)?;
     let target_table_database_id = if temporary {
         // A temp trigger's target table can be in any schema.
         catalog.resolve_existing_table_database_id_qualified(&tbl_name)?
-    } else if tbl_name.db_name.is_some() {
+    } else if tbl_name.namespace.is_some() {
         catalog.resolve_database_id(&tbl_name)?
     } else {
         database_id
@@ -112,7 +122,7 @@ pub fn translate_create_trigger(
     // Temp triggers are allowed to reference tables in other databases.
     if target_table_database_id != database_id && database_id != crate::TEMP_DB_ID {
         let table_db_name = tbl_name
-            .db_name
+            .namespace
             .as_ref()
             .map(|db_name| db_name.as_str().to_string())
             .or_else(|| catalog.database_name_by_index(target_table_database_id))
@@ -157,6 +167,30 @@ pub fn translate_create_trigger(
         );
     }
 
+    if time
+        .as_ref()
+        .is_some_and(|t| *t == ast::TriggerTime::InsteadOf)
+    {
+        bail_parse_error!("INSTEAD OF triggers are not supported yet");
+    }
+
+    // SQLite allows only INSTEAD OF triggers on views (sqlite3BeginTrigger in
+    // trigger.c). A materialized view's storage is registered as a table, so
+    // check for views before the table lookup.
+    if catalog.with_schema(target_table_database_id, |s| {
+        s.get_view(&normalized_table_name).is_some()
+            || s.materialized_view_exists(&normalized_table_name)
+    }) {
+        let time = match time.as_ref() {
+            Some(ast::TriggerTime::After) => "AFTER",
+            _ => "BEFORE",
+        };
+        bail_parse_error!(
+            "cannot create {time} trigger on view: {}",
+            tbl_name.name.as_str()
+        );
+    }
+
     // Verify the table exists (use the table's database, not the trigger's).
     let table = catalog.with_schema(target_table_database_id, |s| {
         s.get_table(&normalized_table_name)
@@ -178,13 +212,6 @@ pub fn translate_create_trigger(
     };
     if table.virtual_table().is_some() {
         bail_parse_error!("cannot create triggers on virtual tables");
-    }
-
-    if time
-        .as_ref()
-        .is_some_and(|t| *t == ast::TriggerTime::InsteadOf)
-    {
-        bail_parse_error!("INSTEAD OF triggers are not supported yet");
     }
 
     let opts = ProgramBuilderOpts::new(1, 30, 1);
@@ -230,7 +257,7 @@ pub fn translate_create_trigger(
         where_clause: Some(format!(
             "name = '{escaped_trigger_name}' AND type = 'trigger'"
         )),
-        trigger_target_database_id: (temporary && tbl_name.db_name.is_none())
+        trigger_target_database_id: (temporary && tbl_name.namespace.is_none())
             .then_some(target_table_database_id),
     });
 
@@ -247,7 +274,7 @@ fn resolve_create_trigger_database_id(
     if temporary {
         return Ok(crate::TEMP_DB_ID);
     }
-    if trigger_name.db_name.is_some() {
+    if trigger_name.namespace.is_some() {
         return catalog.resolve_database_id(trigger_name);
     }
 
@@ -322,7 +349,7 @@ struct CrossDbCheckCtx<'a> {
 
 impl CrossDbCheckCtx<'_> {
     fn check_qname(&self, qn: &QualifiedName) -> Result<()> {
-        if let Some(ref db_name) = qn.db_name {
+        if let Some(ref db_name) = qn.namespace {
             let resolved = self.catalog.resolve_database_id(qn)?;
             if resolved != self.trigger_db_id {
                 bail_parse_error!(
@@ -473,7 +500,7 @@ fn check_select_table_ref(
                 check_expr(arg)?;
             }
         }
-        ast::SelectTable::Select(select, _) => {
+        ast::SelectTable::Select { select, .. } => {
             check_select_table_refs(select, check_qname, check_expr)?;
         }
         ast::SelectTable::Sub(from, _) => {
@@ -586,6 +613,7 @@ pub fn translate_drop_trigger(
         cursor_id: sqlite_schema_cursor_id,
         pc_if_next: search_loop_label,
         fullscan: false,
+        is_index: false,
     });
 
     program.preassign_label_to_next_insn(done_label);

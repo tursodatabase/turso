@@ -274,7 +274,7 @@ pub struct HashBuildData {
 /// them. Most seeks have no such columns, so the empty mask is a null pointer
 /// and only IS-seeks allocate (boxed to keep Insn small).
 ///
-/// Build it from a [`BitSet`] via `From`; that keeps the invariant that the
+/// Build it from a `BitSet` via `From`; that keeps the invariant that the
 /// inner option is `None` exactly when the mask is empty.
 #[derive(Debug, Clone, Default)]
 pub struct NullMatchingMask(Option<Box<BitSet>>);
@@ -305,6 +305,17 @@ pub struct AddColumnData {
     pub column: Column,
     pub check_constraints: Vec<CheckConstraint>,
     pub foreign_keys: Vec<Arc<ForeignKey>>,
+}
+
+/// Data for AlterColumn instruction (boxed to keep Insn small).
+#[derive(Debug, Clone)]
+pub struct AlterColumnData {
+    pub db: usize,
+    pub table: String,
+    pub column_index: usize,
+    pub definition: turso_parser::ast::ColumnDefinition,
+    pub rename: bool,
+    pub rewritten_triggers: Vec<(usize, String, String)>,
 }
 
 /// Data for IntegrityCk instruction (boxed to keep Insn small).
@@ -359,6 +370,63 @@ pub struct AggStepData {
     pub collation: Option<CollationSeq>,
 }
 
+/// Which of SUM, TOTAL, or AVG an `IvmSumFinalize` instruction computes. The
+/// three share one linear state (see `IvmSumData`); only the finalize step
+/// tells them apart.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IvmSumKind {
+    Sum,
+    Total,
+    Avg,
+}
+
+/// Incremental-view state for SUM/TOTAL/AVG (boxed to keep Insn small).
+///
+/// A materialized view must equal a fresh evaluation of its defining SELECT
+/// over the table's current rows, so this state combines by plain addition,
+/// with no sticky flag that survives a retraction it should not. A row is
+/// added `weight` times: its z-set weight, negative for a retraction. See
+/// "Divergences from DBSP" in docs/ivm-vdbe-rewrite-writeup.md.
+///
+/// Fields:
+/// - `int_wrapped`/`int_wrap_count`: the exact sum of every live INTEGER (or
+///   integer-valued TEXT) contribution, stored as `int_wrapped + int_wrap_count
+///   * 2^64` so an i64 overflow is still exactly undone by a later retraction.
+/// - `float_sum`/`float_err`: the Kahan-Babuska-Neumaier running sum of every
+///   live non-integer contribution (REAL, or TEXT/BLOB that sum() treats as
+///   approximate).
+/// - `non_int_count`: count of live non-integer contributions; decides
+///   whether SUM's result is INTEGER or REAL.
+/// - `non_null_count`: count of live non-NULL contributions; decides the
+///   empty-group result and AVG's divisor.
+#[derive(Debug, Clone)]
+pub struct IvmSumData {
+    pub arg_reg: usize,
+    /// The row's z-set weight: an integer, negative for a retraction.
+    pub weight_reg: usize,
+    pub int_wrapped_reg: usize,
+    pub int_wrap_count_reg: usize,
+    pub float_sum_reg: usize,
+    pub float_err_reg: usize,
+    pub non_int_count_reg: usize,
+    pub non_null_count_reg: usize,
+}
+
+/// Data for the `IvmSumFinalize` instruction (boxed to keep Insn small): the
+/// same state fields as `IvmSumData`, minus the row's argument and weight,
+/// plus which function to compute and where to write the result.
+#[derive(Debug, Clone)]
+pub struct IvmSumFinalizeData {
+    pub kind: IvmSumKind,
+    pub int_wrapped_reg: usize,
+    pub int_wrap_count_reg: usize,
+    pub float_sum_reg: usize,
+    pub float_err_reg: usize,
+    pub non_int_count_reg: usize,
+    pub non_null_count_reg: usize,
+    pub dest_reg: usize,
+}
+
 /// Data for ArrayEncode instruction (boxed to keep Insn small).
 #[derive(Debug, Clone)]
 pub struct ArrayEncodeData {
@@ -379,13 +447,167 @@ pub struct HashDistinctData {
     pub target_pc: BranchOffset,
 }
 
-// There are currently 190 opcodes in sqlite
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ClearBtreeCount {
+    Nothing,
+    RowsWritten,
+    ChangesAndRowsWritten,
+}
+
+// The opcodes the dispatch loop matches directly come first.
 #[repr(u8)]
 #[derive(Description, Debug, Clone, EnumDiscriminants)]
 #[strum_discriminants(vis(pub(crate)))]
 #[strum_discriminants(derive(VariantArray, EnumCount, FromRepr))]
 #[strum_discriminants(name(InsnVariants))]
 pub enum Insn {
+    /// Advance the cursor to the next row.
+    Next {
+        cursor_id: CursorID,
+        pc_if_next: BranchOffset,
+        /// True when this step is part of a full table scan (a loop over the
+        /// whole table with no index or rowid constraint). Only these steps
+        /// count toward SQLITE_STMTSTATUS_FULLSCAN_STEP, matching SQLite,
+        /// which tags the opcode with P5 at codegen time.
+        fullscan: bool,
+        is_index: bool,
+    },
+
+    /// Emit a row of results.
+    ResultRow {
+        start_reg: usize, // P1
+        count: usize,     // P2
+    },
+
+    /// Read a column from the current row of the cursor.
+    Column {
+        cursor_id: CursorID,
+        column: usize,
+        dest: usize,
+        default: Option<Value>,
+    },
+
+    /// Read `defaults.len()` consecutive columns starting at `start_column` from the current row
+    /// of the cursor into consecutive registers starting at `dest`.
+    ColumnRange {
+        cursor_id: CursorID,
+        start_column: usize,
+        dest: usize,
+        // this can't be a SmallVec because it would make the enum too large.
+        defaults: Vec<Option<Value>>,
+    },
+
+    /// Read the rowid of the current row.
+    RowId {
+        cursor_id: CursorID,
+        dest: usize,
+    },
+
+    Prev {
+        cursor_id: CursorID,
+        pc_if_prev: BranchOffset,
+        /// See [Insn::Next::fullscan].
+        fullscan: bool,
+        /// See [Insn::Next::is_index].
+        is_index: bool,
+    },
+    /// Compare two registers and jump to the given PC if they are equal.
+    Eq {
+        lhs: usize,
+        rhs: usize,
+        target_pc: BranchOffset,
+        /// CmpInsFlags are nulleq (null = null) or jump_if_null.
+        ///
+        /// jump_if_null jumps if either of the operands is null. Used for "jump when false" logic.
+        /// Eg. "SELECT * FROM users WHERE id = NULL" becomes:
+        /// <JUMP TO NEXT ROW IF id != NULL>
+        /// Without the jump_if_null flag it would not jump because the logical comparison "id != NULL" is never true.
+        /// This flag indicates that if either is null we should still jump.
+        flags: CmpInsFlags,
+        collation: Option<CollationSeq>,
+    },
+    /// Compare two registers and jump to the given PC if they are not equal.
+    Ne {
+        lhs: usize,
+        rhs: usize,
+        target_pc: BranchOffset,
+        /// CmpInsFlags are nulleq (null = null) or jump_if_null.
+        ///
+        /// jump_if_null jumps if either of the operands is null. Used for "jump when false" logic.
+        flags: CmpInsFlags,
+        collation: Option<CollationSeq>,
+    },
+    /// Compare two registers and jump to the given PC if the left-hand side is less than the right-hand side.
+    Lt {
+        lhs: usize,
+        rhs: usize,
+        target_pc: BranchOffset,
+        /// jump_if_null: Jump if either of the operands is null. Used for "jump when false" logic.
+        flags: CmpInsFlags,
+        collation: Option<CollationSeq>,
+    },
+    Le {
+        lhs: usize,
+        rhs: usize,
+        target_pc: BranchOffset,
+        /// jump_if_null: Jump if either of the operands is null. Used for "jump when false" logic.
+        flags: CmpInsFlags,
+        collation: Option<CollationSeq>,
+    },
+    /// Compare two registers and jump to the given PC if the left-hand side is greater than the right-hand side.
+    Gt {
+        lhs: usize,
+        rhs: usize,
+        target_pc: BranchOffset,
+        /// jump_if_null: Jump if either of the operands is null. Used for "jump when false" logic.
+        flags: CmpInsFlags,
+        collation: Option<CollationSeq>,
+    },
+    /// Compare two registers and jump to the given PC if the left-hand side is greater than or equal to the right-hand side.
+    Ge {
+        lhs: usize,
+        rhs: usize,
+        target_pc: BranchOffset,
+        /// jump_if_null: Jump if either of the operands is null. Used for "jump when false" logic.
+        flags: CmpInsFlags,
+        collation: Option<CollationSeq>,
+    },
+    /// Jump to target_pc if r\[reg\] != 0 or (r\[reg\] == NULL && r\[jump_if_null\] != 0)
+    If {
+        reg: usize,              // P1
+        target_pc: BranchOffset, // P2
+        /// P3. If r\[reg\] is null, jump iff r\[jump_if_null\] != 0
+        jump_if_null: bool,
+    },
+    /// Jump to target_pc if r\[reg\] != 0 or (r\[reg\] == NULL && r\[jump_if_null\] != 0)
+    IfNot {
+        reg: usize,              // P1
+        target_pc: BranchOffset, // P2
+        /// P3. If r\[reg\] is null, jump iff r\[jump_if_null\] != 0
+        jump_if_null: bool,
+    },
+    /// Branch to the given PC.
+    Goto {
+        target_pc: BranchOffset,
+    },
+    /// Stores the current program counter into register 'return_reg' then jumps to address target_pc.
+    Gosub {
+        target_pc: BranchOffset,
+        return_reg: usize,
+    },
+    /// Returns to the program counter stored in register 'return_reg'.
+    /// If can_fallthrough is true, fall through to the next instruction
+    /// if return_reg does not contain an integer value. Otherwise raise an error.
+    Return {
+        return_reg: usize,
+        can_fallthrough: bool,
+    },
+    /// Write an integer value into a register.
+    Integer {
+        value: i64,
+        dest: usize,
+    },
+
     /// Initialize the program state and jump to the given PC.
     Init {
         target_pc: BranchOffset,
@@ -404,6 +626,13 @@ pub enum Insn {
     /// Move the cursor P1 to a null row. Any Column operations that occur while the cursor is on the null row will always write a NULL.
     NullRow {
         cursor_id: CursorID,
+    },
+    /// If the cursor is on a null row, write NULL to `dest` and jump.
+    /// This instruction does nothing for an unopened cursor.
+    IfNullRow {
+        cursor_id: CursorID,
+        target_pc: BranchOffset,
+        dest: usize,
     },
     /// Add two registers and store the result in a third register.
     Add {
@@ -498,22 +727,7 @@ pub enum Insn {
         reg: usize,
         target_pc: BranchOffset,
     },
-    /// Compare two registers and jump to the given PC if they are equal.
-    Eq {
-        lhs: usize,
-        rhs: usize,
-        target_pc: BranchOffset,
-        /// CmpInsFlags are nulleq (null = null) or jump_if_null.
-        ///
-        /// jump_if_null jumps if either of the operands is null. Used for "jump when false" logic.
-        /// Eg. "SELECT * FROM users WHERE id = NULL" becomes:
-        /// <JUMP TO NEXT ROW IF id != NULL>
-        /// Without the jump_if_null flag it would not jump because the logical comparison "id != NULL" is never true.
-        /// This flag indicates that if either is null we should still jump.
-        flags: CmpInsFlags,
-        collation: Option<CollationSeq>,
-    },
-    /// Compute a hash on num_keys registers starting with r[key_reg]. Check to see if that hash
+    /// Compute a hash on num_keys registers starting with `r[key_reg]`. Check to see if that hash
     /// is found in the bloom filter associated with the cursor/hash_table. If it is not present
     /// then jump to target_pc. Otherwise fall through.
     /// False negatives are harmless. It is always safe to fall through, even if the value is
@@ -529,74 +743,14 @@ pub enum Insn {
         /// Number of key registers to hash together
         num_keys: usize,
     },
-    /// Compute a hash on num_keys registers starting with r[key_reg] and add that hash to
+    /// Compute a hash on num_keys registers starting with `r[key_reg]` and add that hash to
     /// the bloom filter associated with the cursor/hash_table.
     FilterAdd {
         cursor_id: CursorID,
         key_reg: usize,
         num_keys: usize,
     },
-    /// Compare two registers and jump to the given PC if they are not equal.
-    Ne {
-        lhs: usize,
-        rhs: usize,
-        target_pc: BranchOffset,
-        /// CmpInsFlags are nulleq (null = null) or jump_if_null.
-        ///
-        /// jump_if_null jumps if either of the operands is null. Used for "jump when false" logic.
-        flags: CmpInsFlags,
-        collation: Option<CollationSeq>,
-    },
-    /// Compare two registers and jump to the given PC if the left-hand side is less than the right-hand side.
-    Lt {
-        lhs: usize,
-        rhs: usize,
-        target_pc: BranchOffset,
-        /// jump_if_null: Jump if either of the operands is null. Used for "jump when false" logic.
-        flags: CmpInsFlags,
-        collation: Option<CollationSeq>,
-    },
     // Compare two registers and jump to the given PC if the left-hand side is less than or equal to the right-hand side.
-    Le {
-        lhs: usize,
-        rhs: usize,
-        target_pc: BranchOffset,
-        /// jump_if_null: Jump if either of the operands is null. Used for "jump when false" logic.
-        flags: CmpInsFlags,
-        collation: Option<CollationSeq>,
-    },
-    /// Compare two registers and jump to the given PC if the left-hand side is greater than the right-hand side.
-    Gt {
-        lhs: usize,
-        rhs: usize,
-        target_pc: BranchOffset,
-        /// jump_if_null: Jump if either of the operands is null. Used for "jump when false" logic.
-        flags: CmpInsFlags,
-        collation: Option<CollationSeq>,
-    },
-    /// Compare two registers and jump to the given PC if the left-hand side is greater than or equal to the right-hand side.
-    Ge {
-        lhs: usize,
-        rhs: usize,
-        target_pc: BranchOffset,
-        /// jump_if_null: Jump if either of the operands is null. Used for "jump when false" logic.
-        flags: CmpInsFlags,
-        collation: Option<CollationSeq>,
-    },
-    /// Jump to target_pc if r\[reg\] != 0 or (r\[reg\] == NULL && r\[jump_if_null\] != 0)
-    If {
-        reg: usize,              // P1
-        target_pc: BranchOffset, // P2
-        /// P3. If r\[reg\] is null, jump iff r\[jump_if_null\] != 0
-        jump_if_null: bool,
-    },
-    /// Jump to target_pc if r\[reg\] != 0 or (r\[reg\] == NULL && r\[jump_if_null\] != 0)
-    IfNot {
-        reg: usize,              // P1
-        target_pc: BranchOffset, // P2
-        /// P3. If r\[reg\] is null, jump iff r\[jump_if_null\] != 0
-        jump_if_null: bool,
-    },
     /// Open a cursor for reading.
     OpenRead {
         cursor_id: CursorID,
@@ -684,24 +838,6 @@ pub enum Insn {
         pc_if_empty: BranchOffset,
     },
 
-    /// Read a column from the current row of the cursor.
-    Column {
-        cursor_id: CursorID,
-        column: usize,
-        dest: usize,
-        default: Option<Value>,
-    },
-
-    /// Read `defaults.len()` consecutive columns starting at `start_column` from the current row
-    /// of the cursor into consecutive registers starting at `dest`.
-    ColumnRange {
-        cursor_id: CursorID,
-        start_column: usize,
-        dest: usize,
-        // this can't be a SmallVec because it would make the enum too large.
-        defaults: Vec<Option<Value>>,
-    },
-
     /// Jump to `target_pc` if the cursor's current record contains a field at
     /// the given column index.  Falls through when the record has fewer fields
     /// (a "short record" from before ALTER TABLE ADD COLUMN).
@@ -745,11 +881,17 @@ pub enum Insn {
         target_pc: BranchOffset,
     },
 
+    /// Jump if the register is NULL or has type `value_type`.
+    IsType {
+        reg: usize,
+        target_pc: BranchOffset,
+        value_type: crate::types::ValueType,
+    },
+
     TypeCheck {
         start_reg: usize, // P1
         count: usize,     // P2
-        /// GENERATED ALWAYS AS ... STORED columns are only checked if P3 is zero.
-        /// When P3 is non-zero, no type checking occurs for stored generated columns.
+        /// Check generated columns after their values have been computed.
         check_generated: bool, // P3
         table_reference: Arc<BTreeTable>, // P4
     },
@@ -757,7 +899,7 @@ pub enum Insn {
     /// Parse a JSON text array into a native record-format BLOB, validating
     /// and coercing each element against the declared type using STRICT
     /// type-checking logic (apply_affinity_char + value_type check).
-    /// Input: reg = JSON text like '[1,2,3]'. Output: reg = record-format BLOB.
+    /// Input: reg = JSON text like `'[1,2,3]'`. Output: reg = record-format BLOB.
     /// Raises SQLITE_CONSTRAINT on type mismatch.
     ArrayEncode {
         data: Box<ArrayEncodeData>,
@@ -835,8 +977,10 @@ pub enum Insn {
     },
 
     /// Copy a register value to a dynamically-computed destination.
+    /// ```text
     /// dest = registers[base + registers[offset_reg]]
     /// registers[base + registers[offset_reg]] = registers[src]
+    /// ```
     RegCopyOffset {
         src: usize,
         base: usize,
@@ -917,35 +1061,11 @@ pub enum Insn {
         affinity_str: Option<String>,
     },
 
-    /// Emit a row of results.
-    ResultRow {
-        start_reg: usize, // P1
-        count: usize,     // P2
-    },
-
-    /// Advance the cursor to the next row.
-    Next {
-        cursor_id: CursorID,
-        pc_if_next: BranchOffset,
-        /// True when this step is part of a full table scan (a loop over the
-        /// whole table with no index or rowid constraint). Only these steps
-        /// count toward SQLITE_STMTSTATUS_FULLSCAN_STEP, matching SQLite,
-        /// which tags the opcode with P5 at codegen time.
-        fullscan: bool,
-    },
-
-    Prev {
-        cursor_id: CursorID,
-        pc_if_prev: BranchOffset,
-        /// See [Insn::Next::fullscan].
-        fullscan: bool,
-    },
-
     /// Halt the program.
     Halt {
         err_code: usize,
         description: String,
-        /// Override the program's resolve_type for error handling (used by RAISE).
+        /// Override the program's resolve_type for error handling.
         on_error: Option<ResolveType>,
         /// If set, read the error description from this register instead of
         /// the static `description` field (used by RAISE with expression messages).
@@ -957,6 +1077,8 @@ pub enum Insn {
         target_reg: usize,   // P3
         description: String, // p4
         err_code: usize,     // p1
+        /// Override the program's resolve_type for error handling.
+        on_error: Option<ResolveType>, // p2
     },
 
     /// Start a transaction.
@@ -967,9 +1089,14 @@ pub enum Insn {
     },
 
     /// Set database auto-commit mode and potentially rollback.
+    /// On BEGIN (`auto_commit: false`), `concurrent` records that the
+    /// transaction was started with BEGIN CONCURRENT: like BEGIN DEFERRED
+    /// it opens nothing by itself, and the first statement materializes
+    /// the MVCC transaction in concurrent mode.
     AutoCommit {
         auto_commit: bool,
         rollback: bool,
+        concurrent: bool,
     },
 
     /// Execute a named savepoint operation.
@@ -978,28 +1105,9 @@ pub enum Insn {
         name: String,
     },
 
-    /// Branch to the given PC.
-    Goto {
-        target_pc: BranchOffset,
-    },
-
-    /// Stores the current program counter into register 'return_reg' then jumps to address target_pc.
-    Gosub {
-        target_pc: BranchOffset,
-        return_reg: usize,
-    },
-
-    /// Returns to the program counter stored in register 'return_reg'.
-    /// If can_fallthrough is true, fall through to the next instruction
-    /// if return_reg does not contain an integer value. Otherwise raise an error.
-    Return {
-        return_reg: usize,
-        can_fallthrough: bool,
-    },
-
     /// Invoke a trigger or foreign-key action subprogram.
     ///
-    /// According to SQLite documentation (https://sqlite.org/opcode.html):
+    /// According to SQLite documentation (<https://sqlite.org/opcode.html>):
     /// "The Program opcode invokes the trigger subprogram. The Program instruction
     /// allocates and initializes a fresh register set for each invocation of the
     /// subprogram, so subprograms can be reentrant and recursive. The Param opcode
@@ -1024,12 +1132,6 @@ pub enum Insn {
     /// Emitted at the end of INSERT/UPDATE/DELETE programs when PRAGMA count_changes is on,
     /// followed by a ResultRow that returns the count to the caller.
     ChangeCount {
-        dest: usize,
-    },
-
-    /// Write an integer value into a register.
-    Integer {
-        value: i64,
         dest: usize,
     },
 
@@ -1062,11 +1164,6 @@ pub enum Insn {
         dest: usize,
     },
 
-    /// Read the rowid of the current row.
-    RowId {
-        cursor_id: CursorID,
-        dest: usize,
-    },
     /// Read the rowid of the current row from an index cursor.
     IdxRowId {
         cursor_id: CursorID,
@@ -1088,6 +1185,11 @@ pub enum Insn {
     DeferredSeek {
         index_cursor_id: CursorID,
         table_cursor_id: CursorID,
+    },
+
+    /// Complete a pending DeferredSeek before a write that can use only index values.
+    FinishSeek {
+        cursor_id: CursorID,
     },
 
     /// If cursor_id refers to an SQL table (B-Tree that uses integer keys), use the value in start_reg as the key.
@@ -1226,6 +1328,40 @@ pub enum Insn {
         acc_reg: usize,
         dest_reg: usize,
         func: AccumulatorFunc,
+    },
+
+    /// Materialize an aggregate accumulator register from its persisted state
+    /// payload, read from `agg_payload_width(func)` registers starting at
+    /// `payload_start_reg`. The counterpart of AggContextStore; used by
+    /// materialized view maintenance to resume a group's aggregate state from
+    /// the view's state table.
+    AggContextLoad {
+        acc_reg: usize,
+        payload_start_reg: usize,
+        func: AccumulatorFunc,
+    },
+
+    /// Persist an aggregate accumulator's state payload into
+    /// `agg_payload_width(func)` registers starting at `payload_start_reg`,
+    /// for storage in a materialized view's state table.
+    AggContextStore {
+        acc_reg: usize,
+        payload_start_reg: usize,
+        func: AccumulatorFunc,
+    },
+
+    /// Add `arg_reg`'s row, `weight_reg` times, to a materialized view's
+    /// SUM/TOTAL/AVG state. A negative weight retracts the row. See
+    /// `IvmSumData`.
+    IvmSumStep {
+        data: Box<IvmSumData>,
+    },
+
+    /// Compute SUM, TOTAL, or AVG's current result from the state registers
+    /// `IvmSumStep` maintains, into `dest_reg`. See
+    /// `IvmSumFinalizeData`.
+    IvmSumFinalize {
+        data: Box<IvmSumFinalizeData>,
     },
 
     /// Open a sorter.
@@ -1376,6 +1512,21 @@ pub enum Insn {
         target_pc: Option<BranchOffset>,
     },
 
+    /// Write the subtype of src_reg to dest_reg as an integer.
+    /// Values without a subtype produce zero; JSON text produces 74.
+    GetSubtype {
+        src_reg: usize,
+        dest_reg: usize,
+    },
+
+    /// Read a supported integer subtype from subtype_reg and apply it to the
+    /// text value in dest_reg without changing its contents. Non-text values
+    /// are unchanged. Zero clears the subtype; 74 marks JSON when enabled.
+    SetSubtype {
+        subtype_reg: usize,
+        dest_reg: usize,
+    },
+
     SoftNull {
         reg: usize,
     },
@@ -1461,6 +1612,9 @@ pub enum Insn {
     ClearBtree {
         db: usize,
         root: i64,
+        /// What the removed entries count toward. Whole-table DELETE counts every B-tree's
+        /// entries as written rows and the table's rows as changes. REINDEX counts nothing.
+        count: ClearBtreeCount,
     },
 
     /// Deletes an entire database table or index whose root page in the database file is given by P1.
@@ -1597,28 +1751,28 @@ pub enum Insn {
     /// logic to produce the next value into `out_value_reg`. If
     /// `was_empty_reg` (set by caller via IsNull-style branching) indicates
     /// the backing table is empty, the next value is `start_value`. Returns
-    /// `LimboError::DatabaseFull` on overflow when `cycle` is false.
+    /// `LimboError::SequenceExhausted` on overflow when `cycle` is false.
     SequenceComputeNext {
         db: usize,
-        seq_name_reg: usize,
+        seq_name: String,
         in_value_reg: usize,
         in_is_called_reg: usize,
         was_empty_reg: usize,
         out_value_reg: usize,
     },
-    /// Record this connection's currval for a sequence after a successful
-    /// nextval/setval. Pure synchronous register operation. currval is
-    /// per-connection global (not schema-qualified), so no database id
-    /// is carried — schema-qualified currvals would be a separate feature.
+    /// Record this connection's currval for the sequence `seq_name` of
+    /// database `db` after a successful nextval/setval. Pure synchronous
+    /// register operation.
     SetSequenceCurrval {
-        seq_name_reg: usize,
+        db: usize,
+        seq_name: String,
         value_reg: usize,
     },
     /// Publish sequence allocation metadata for sync watermarks after a
     /// successful sequence RMW commit.
     SequenceTrackAllocation {
         db: usize,
-        seq_name_reg: usize,
+        seq_name: String,
         value_reg: usize,
     },
     /// Register an in-flight sequence allocation against the *outer*
@@ -1630,7 +1784,7 @@ pub enum Insn {
     /// closes.
     SequenceRegisterAllocation {
         db: usize,
-        seq_name_reg: usize,
+        seq_name: String,
         value_reg: usize,
         /// Register holding the encoded saved outer mv_tx (the blob written
         /// by `SequenceBeginInnerTx`). Empty blob means "no outer tx".
@@ -1874,11 +2028,7 @@ pub enum Insn {
         data: Box<AddColumnData>,
     },
     AlterColumn {
-        db: usize,
-        table: String,
-        column_index: usize,
-        definition: Box<turso_parser::ast::ColumnDefinition>,
-        rename: bool,
+        data: Box<AlterColumnData>,
     },
     /// Try to set the maximum page count for database P1 to the value in P3.
     /// Do not let the maximum page count fall below the current page count and
@@ -1972,7 +2122,10 @@ pub enum Insn {
         key_start_reg: u32,
         num_keys: u32,
         dest_reg: u32,
+        /// Jump here when the probe has no matching build row.
         target_pc: BranchOffset,
+        /// Jump here when the probe row is stored for grace processing.
+        deferred_target_pc: BranchOffset,
         /// Starting register to write payload columns from hash entry.
         payload_dest_reg: Option<u32>,
         /// Number of payload columns expected
@@ -2143,6 +2296,7 @@ impl InsnVariants {
             InsnVariants::Null => execute::op_null,
             InsnVariants::BeginSubrtn => execute::op_null,
             InsnVariants::NullRow => execute::op_null_row,
+            InsnVariants::IfNullRow => execute::op_if_null_row,
             InsnVariants::Add => execute::op_add,
             InsnVariants::Subtract => execute::op_subtract,
             InsnVariants::Multiply => execute::op_multiply,
@@ -2158,12 +2312,12 @@ impl InsnVariants {
             InsnVariants::Move => execute::op_move,
             InsnVariants::IfPos => execute::op_if_pos,
             InsnVariants::NotNull => execute::op_not_null,
-            InsnVariants::Eq
-            | InsnVariants::Ne
-            | InsnVariants::Lt
-            | InsnVariants::Le
-            | InsnVariants::Gt
-            | InsnVariants::Ge => execute::op_comparison,
+            InsnVariants::Eq => execute::op_eq,
+            InsnVariants::Ne => execute::op_ne,
+            InsnVariants::Lt => execute::op_lt,
+            InsnVariants::Le => execute::op_le,
+            InsnVariants::Gt => execute::op_gt,
+            InsnVariants::Ge => execute::op_ge,
             InsnVariants::If => execute::op_if,
             InsnVariants::IfNot => execute::op_if_not,
             InsnVariants::OpenRead => execute::op_open_read,
@@ -2180,6 +2334,7 @@ impl InsnVariants {
             InsnVariants::Column => execute::op_column,
             InsnVariants::ColumnRange => execute::op_column_range,
             InsnVariants::ColumnHasField => execute::op_column_has_field,
+            InsnVariants::IsType => execute::op_is_type,
             InsnVariants::TypeCheck => execute::op_type_check,
             InsnVariants::ArrayEncode => execute::op_array_encode,
             InsnVariants::ArrayDecode => execute::op_array_decode,
@@ -2223,6 +2378,7 @@ impl InsnVariants {
             InsnVariants::IdxRowId => execute::op_idx_row_id,
             InsnVariants::SeekRowid => execute::op_seek_rowid,
             InsnVariants::DeferredSeek => execute::op_deferred_seek,
+            InsnVariants::FinishSeek => execute::op_finish_seek,
             InsnVariants::SeekGE
             | InsnVariants::SeekGT
             | InsnVariants::SeekLE
@@ -2236,6 +2392,10 @@ impl InsnVariants {
             InsnVariants::AggStep => execute::op_agg_step,
             InsnVariants::AggInverse => execute::op_agg_inverse,
             InsnVariants::AggFinal | InsnVariants::AggValue => execute::op_agg_final,
+            InsnVariants::AggContextLoad => execute::op_agg_context_load,
+            InsnVariants::AggContextStore => execute::op_agg_context_store,
+            InsnVariants::IvmSumStep => execute::op_ivm_sum_step,
+            InsnVariants::IvmSumFinalize => execute::op_ivm_sum_finalize,
             InsnVariants::SorterOpen => execute::op_sorter_open,
             InsnVariants::SorterInsert => execute::op_sorter_insert,
             InsnVariants::SorterSort => execute::op_sorter_sort,
@@ -2256,6 +2416,8 @@ impl InsnVariants {
             InsnVariants::Delete => execute::op_delete,
             InsnVariants::NewRowid => execute::op_new_rowid,
             InsnVariants::MustBeInt => execute::op_must_be_int,
+            InsnVariants::GetSubtype => execute::op_get_subtype,
+            InsnVariants::SetSubtype => execute::op_set_subtype,
             InsnVariants::SoftNull => execute::op_soft_null,
             InsnVariants::NoConflict => execute::op_no_conflict,
             InsnVariants::NotExists => execute::op_not_exists,
@@ -2427,6 +2589,8 @@ impl Insn {
 // TODO: Add remaining cookies.
 #[derive(Description, Debug, Clone, Copy)]
 pub enum Cookie {
+    /// The number of free pages.
+    FreePageCount = 0,
     /// The schema cookie.
     SchemaVersion = 1,
     /// The schema format number. Supported schema formats are 1, 2, 3, and 4.
@@ -2443,25 +2607,12 @@ pub enum Cookie {
     IncrementalVacuum = 7,
     /// The application ID as set by the application_id pragma.
     ApplicationId = 8,
+    /// The page size, as read by the page_size pragma.
+    PageSize = 9,
 }
 
 #[cfg(test)]
 mod tests {
-    use strum::VariantArray;
-
-    #[test]
-    fn test_make_sure_correct_insn_table() {
-        for variant in super::InsnVariants::VARIANTS {
-            let func1 = variant.to_function();
-            let func2 = variant.to_function_fast();
-            assert_eq!(
-                func1 as usize, func2 as usize,
-                "Variant {:?} does not match in fast table at index {}",
-                variant, *variant as usize
-            );
-        }
-    }
-
     #[test]
     fn test_insn_size_does_not_grow() {
         // Interpreter dispatch is sensitive to instruction size. Widening a
@@ -2472,5 +2623,20 @@ mod tests {
             "Insn grew to {} bytes",
             std::mem::size_of::<super::Insn>()
         );
+    }
+}
+
+#[cfg(test)]
+mod error_size_tests {
+    /// `LimboError` rides in the `Result` of every opcode call and every
+    /// cursor operation, so its size is copied around once per executed
+    /// instruction. A fat new variant (see the boxed `LexerError`) silently
+    /// taxes the whole hot path.
+    #[test]
+    fn limbo_error_stays_small() {
+        assert!(std::mem::size_of::<crate::LimboError>() <= 40);
+        // The niche-packed boxed-error result returns in registers; anything
+        // past 16 bytes goes back through memory on every executed insn.
+        assert!(std::mem::size_of::<super::execute::InsnResult>() <= 16);
     }
 }

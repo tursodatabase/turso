@@ -1,6 +1,6 @@
 use super::{
-    convert_dbtype_to_jsonb, curry_convert_dbtype_to_jsonb, json_path_from_db_value,
-    json_string_to_db_type,
+    convert_dbtype_to_jsonb, curry_convert_dbtype_to_jsonb, json_edit_path,
+    json_path_from_db_value, json_string_to_db_type,
     jsonb::{DeleteOperation, InsertOperation, ReplaceOperation},
     Conv, JsonCacheCell, OutputVariant,
 };
@@ -171,13 +171,11 @@ where
                 "args should have at least 2 elements in loop".to_string(),
             )
         })?;
-        let path = json_path_from_db_value(&first, true)?;
-
         let second = args.next().ok_or_else(|| {
             crate::LimboError::InternalError("args should have second element in loop".to_string())
         })?;
-        let value = convert_dbtype_to_jsonb(&second, Conv::NotStrict)?;
-        if let Some(path) = path {
+        if let Some(path) = json_edit_path(&first, &second)? {
+            let value = convert_dbtype_to_jsonb(&second, Conv::SetValue)?;
             let mut op = ReplaceOperation::new(value);
 
             let _ = json.operate_on_path(&path, &mut op);
@@ -212,13 +210,11 @@ where
                 "args should have at least 2 elements in loop".to_string(),
             )
         })?;
-        let path = json_path_from_db_value(&first, true)?;
-
         let second = args.next().ok_or_else(|| {
             crate::LimboError::InternalError("args should have second element in loop".to_string())
         })?;
-        let value = convert_dbtype_to_jsonb(&second, Conv::NotStrict)?;
-        if let Some(path) = path {
+        if let Some(path) = json_edit_path(&first, &second)? {
+            let value = convert_dbtype_to_jsonb(&second, Conv::SetValue)?;
             let mut op = ReplaceOperation::new(value);
 
             let _ = json.operate_on_path(&path, &mut op);
@@ -254,13 +250,11 @@ where
                 "args should have at least 2 elements in loop".to_string(),
             )
         })?;
-        let path = json_path_from_db_value(&first, true)?;
-
         let second = args.next().ok_or_else(|| {
             crate::LimboError::InternalError("args should have second element in loop".to_string())
         })?;
-        let value = convert_dbtype_to_jsonb(&second, Conv::NotStrict)?;
-        if let Some(path) = path {
+        if let Some(path) = json_edit_path(&first, &second)? {
+            let value = convert_dbtype_to_jsonb(&second, Conv::SetValue)?;
             let mut op = InsertOperation::new(value);
 
             let _ = json.operate_on_path(&path, &mut op);
@@ -296,13 +290,11 @@ where
                 "args should have at least 2 elements in loop".to_string(),
             )
         })?;
-        let path = json_path_from_db_value(&first, true)?;
-
         let second = args.next().ok_or_else(|| {
             crate::LimboError::InternalError("args should have second element in loop".to_string())
         })?;
-        let value = convert_dbtype_to_jsonb(&second, Conv::NotStrict)?;
-        if let Some(path) = path {
+        if let Some(path) = json_edit_path(&first, &second)? {
+            let value = convert_dbtype_to_jsonb(&second, Conv::SetValue)?;
             let mut op = InsertOperation::new(value);
 
             let _ = json.operate_on_path(&path, &mut op);

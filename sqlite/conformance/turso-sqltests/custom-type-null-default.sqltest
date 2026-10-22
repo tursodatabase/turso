@@ -111,3 +111,20 @@ expect {
     2|after_alter||1
     3|with_val|hello|0
 }
+
+test custom-type-default-read-from-index {
+    CREATE TABLE t9(a INTEGER, b INTEGER, c date DEFAULT '2000-01-01') STRICT;
+    INSERT INTO t9 VALUES (1, 2, '2024-05-06');
+    INSERT INTO t9 VALUES (3, 4, NULL);
+    CREATE INDEX ix9 ON t9(c);
+    SELECT a, c FROM t9 NOT INDEXED ORDER BY a;
+    SELECT c IS NULL, c FROM t9 ORDER BY c;
+    SELECT a, c FROM t9 WHERE c = '2024-05-06';
+}
+expect {
+    1|2024-05-06
+    3|
+    1|
+    0|2024-05-06
+    1|2024-05-06
+}

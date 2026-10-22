@@ -128,6 +128,7 @@ fn compile_trigger(
         parent.capture_data_changes_info().clone(),
         ProgramBuilderOpts::new(1, 32, 2),
         handle,
+        session.connection.mvcc_enabled(),
     );
     if let Some(conflict) = conflict_override {
         builder.set_trigger_conflict_override(conflict);

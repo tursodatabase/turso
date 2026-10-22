@@ -1,7 +1,9 @@
 use serde::{Deserialize, Serialize};
 use sql_generation::model::query::{Create, Insert, Select, predicate::Predicate, update::Update};
 
-use crate::model::{CreateSequence, DropSequence, Query, QueryDiscriminants};
+use crate::model::{
+    CreateSequence, DropSequence, Query, QueryDiscriminants, lateral::LateralSelect,
+};
 
 /// Properties are representations of executable specifications
 /// about the database behavior.
@@ -12,13 +14,15 @@ pub enum Property {
     /// Insert-Select is a property in which the inserted row
     /// must be in the resulting rows of a select query that has a
     /// where clause that matches the inserted row.
-    /// The execution of the property is as follows
+    /// The execution of the property is as follows:
+    /// ```sql
     ///     INSERT INTO <t> VALUES (...)
     ///     I_0
     ///     I_1
     ///     ...
     ///     I_n
     ///     SELECT * FROM <t> WHERE <predicate>
+    /// ```
     /// The interactions in the middle has the following constraints;
     /// - There will be no errors in the middle interactions.
     /// - The inserted row will not be deleted.
@@ -39,9 +43,11 @@ pub enum Property {
     /// ReadYourUpdatesBack verifies UPDATE behavior for both success and failure cases.
     ///
     /// Execution:
+    /// ```sql
     ///     SELECT <cols> FROM <t> WHERE <predicate>  -- snapshot before
     ///     UPDATE <t> SET <cols> WHERE <predicate>
     ///     SELECT <cols> FROM <t> WHERE <predicate>  -- snapshot after
+    /// ```
     ///
     /// Assertion:
     /// - If UPDATE succeeded: after rows have updated values
@@ -51,13 +57,24 @@ pub enum Property {
         select_before: Select,
         select_after: Select,
     },
+    /// ReadYourUpdatesBackDeferred is the same as ReadYourUpdatesBack but wraps
+    /// the UPDATE in BEGIN DEFERRED instead of BEGIN IMMEDIATE. This exercises
+    /// the deferred-transaction path where the database snapshot is established
+    /// at the first read/write rather than at BEGIN time.
+    ReadYourUpdatesBackDeferred {
+        update: Update,
+        select_before: Select,
+        select_after: Select,
+    },
     /// TableHasExpectedContent is a property in which the table
     /// must have the expected content, i.e. all the insertions and
     /// updates and deletions should have been persisted in the way
     /// we think they were.
-    /// The execution of the property is as follows
+    /// The execution of the property is as follows:
+    /// ```sql
     ///     SELECT * FROM <t>
     ///     ASSERT <expected_content>
+    /// ```
     TableHasExpectedContent {
         table: String,
     },
@@ -65,22 +82,26 @@ pub enum Property {
     /// must have the expected content, i.e. all the insertions and
     /// updates and deletions should have been persisted in the way
     /// we think they were.
-    /// The execution of the property is as follows
+    /// The execution of the property is as follows:
+    /// ```sql
     ///     SELECT * FROM <t>
     ///     ASSERT <expected_content>
+    /// ```
     /// for each table in the simulator model
     AllTableHaveExpectedContent {
         tables: Vec<String>,
     },
     /// Double Create Failure is a property in which creating
     /// the same table twice leads to an error.
-    /// The execution of the property is as follows
+    /// The execution of the property is as follows:
+    /// ```sql
     ///     CREATE TABLE <t> (...)
     ///     I_0
     ///     I_1
     ///     ...
     ///     I_n
     ///     CREATE TABLE <t> (...) -> Error
+    /// ```
     /// The interactions in the middle has the following constraints;
     /// - There will be no errors in the middle interactions.
     /// - Table `t` will not be renamed or dropped.
@@ -92,8 +113,10 @@ pub enum Property {
     },
     /// Select Limit is a property in which the select query
     /// has a limit clause that is respected by the query.
-    /// The execution of the property is as follows
+    /// The execution of the property is as follows:
+    /// ```sql
     ///     SELECT * FROM <t> WHERE <predicate> LIMIT <n>
+    /// ```
     /// This property is a single-interaction property.
     /// The interaction has the following constraints;
     /// - The select query will respect the limit clause.
@@ -106,13 +129,15 @@ pub enum Property {
     /// where clause that matches the deleted row. In practice, `p1` of
     /// the delete query will be used as the predicate for the select query,
     /// hence the select should return NO ROWS.
-    /// The execution of the property is as follows
+    /// The execution of the property is as follows:
+    /// ```sql
     ///     DELETE FROM <t> WHERE <predicate>
     ///     I_0
     ///     I_1
     ///     ...
     ///     I_n
     ///     SELECT * FROM <t> WHERE <predicate>
+    /// ```
     /// The interactions in the middle has the following constraints;
     /// - There will be no errors in the middle interactions.
     /// - A row that holds for the predicate will not be inserted.
@@ -124,13 +149,15 @@ pub enum Property {
     },
     /// Drop-Select is a property in which selecting from a dropped table
     /// should result in an error.
-    /// The execution of the property is as follows
+    /// The execution of the property is as follows:
+    /// ```sql
     ///     DROP TABLE <t>
     ///     I_0
     ///     I_1
     ///     ...
     ///     I_n
     ///     SELECT * FROM <t> WHERE <predicate> -> Error
+    /// ```
     /// The interactions in the middle has the following constraints;
     /// - There will be no errors in the middle interactions.
     /// - The table `t` will not be created, no table will be renamed to `t`.
@@ -159,8 +186,8 @@ pub enum Property {
         predicate: Predicate,
     },
     /// UNION-ALL-Preserves-Cardinality is a property that tests the UNION ALL operator
-    /// implementation in the database. It relies on the fact that `SELECT * FROM <t
-    /// > WHERE <predicate> UNION ALL SELECT * FROM <t> WHERE <predicate>`
+    /// implementation in the database. It relies on the fact that `SELECT * FROM <t>
+    /// WHERE <predicate> UNION ALL SELECT * FROM <t> WHERE <predicate>`
     /// should return the same number of rows as `SELECT <predicate> FROM <t> WHERE <predicate>`.
     /// > The property is succesfull when the UNION ALL of 2 select queries returns the same number of rows
     /// > as the sum of the two select queries.
@@ -168,13 +195,32 @@ pub enum Property {
         select: Select,
         where_clause: Predicate,
     },
-    /// FsyncNoWait is a property which tests if we do not loose any data after not waiting for fsync.
+    /// Lateral-Matches-Json-Each is a property that tests LATERAL joins by one or more of the
+    /// LATERAL subqueries into an equivalent query using `json_each` and `json_group_array`, and
+    /// asserting that both queries return the same rows. For example:
+    ///
+    /// ```sql
+    ///     SELECT t1.a, sub.x FROM t1
+    ///     LEFT JOIN LATERAL (SELECT t2.x AS x FROM t2 WHERE t2.y < t1.a) AS sub
+    ///
+    ///     SELECT t1.a, sub.value FROM t1
+    ///     LEFT JOIN json_each((SELECT json_group_array(t2.x) FROM t2 WHERE t2.y < t1.a)) AS sub
+    /// ```
+    /// When the LATERAL subquery has DISTINCT, ORDER BY or LIMIT, `json_group_array`
+    /// collects the rows of the unchanged subquery: `FROM (SELECT ... LIMIT 2) AS q`.
+    /// The `json_each` form reads its tables with NOT INDEXED. Thus it uses no index,
+    /// automatic index or hash join, and it cannot share such a bug with the LATERAL form.
+    LateralMatchesJsonEach {
+        select: LateralSelect,
+        json_each_joins: Vec<usize>,
+    },
+    /// FsyncNoWait tests recovery when a query is interrupted at fsync.
     ///
     /// # Interactions
-    /// - Executes the `query` without waiting for fsync
-    /// - Drop all connections and Reopen the database
-    /// - Execute the `query` again
-    /// - Query tables to assert that the values were inserted
+    /// - Execute `query` until the memory backend has a pending fsync
+    /// - Simulate power loss and reopen the database
+    /// - Retry `query`; a query that reaches no fsync is not retried
+    /// - Compare the recovered database with the shadow model
     ///
     FsyncNoWait {
         query: Query,
@@ -252,7 +298,9 @@ impl Property {
             | Property::SelectSelectOptimizer { .. }
             | Property::WhereTrueFalseNull { .. }
             | Property::UnionAllPreservesCardinality { .. }
+            | Property::LateralMatchesJsonEach { .. }
             | Property::ReadYourUpdatesBack { .. }
+            | Property::ReadYourUpdatesBackDeferred { .. }
             | Property::TableHasExpectedContent { .. }
             | Property::AllTableHaveExpectedContent { .. } => None,
         }

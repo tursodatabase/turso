@@ -16,80 +16,67 @@ info:
   database: ':memory:'
 ---
 QUERY PLAN
-|--SCAN purchases AS p
-|--SEARCH c USING COVERING INDEX ephemeral_customers_s0 (id=?)
-`--USE SORTER FOR GROUP BY
+|--SCAN customers AS c
+`--SEARCH p USING COVERING INDEX ephemeral_purchases_t2 (customer_id=?)
 
 BYTECODE
-addr  opcode                  p1  p2  p3  p4            p5  comment
-   0        Init               0  69   0                 0  Start at 69
-   1        Null               0   1   0                 0  r[1]=NULL
-   2        Null               0   2   0                 0  r[2]=NULL
-   3        SorterOpen         0   3   0  k(1,B)         0  cursor=0
-   4        Integer            0  19   0                 0  r[19]=0
-   5        Null               0  20   0                 0  r[20]=NULL
-   6        Gosub             18  64   0                 0
-   7        OpenRead           2   3   0  k(3,B,B,B)     0  table=purchases, root=3, iDb=0
-   8        OpenRead           4   2   0  k(2,B,B)       0  table=customers, root=2, iDb=0
-   9        Rewind             2  33   0                 0  Rewind table purchases
-  10          Once            20   0   0                 0  goto 20
-  11          OpenAutoindex    3   0   0                 0  cursor=3
-  12          Rewind           4  20   0                 0  Rewind table customers
-  13            RowId          4  22   0                 0  r[22]=customers.rowid
-  14            Column         4   1  23                 0  r[23]=customers.name
-  15            RowId          4  24   0                 0  r[24]=customers.rowid
-  16            MakeRecord    22   3  25                 0  r[25]=mkrec(r[22..24]); for ephemeral_customers_s0
-  17            FilterAdd      3  22   1                 0  bloom_filter_add(r[22..23])
-  18            IdxInsert      3  25  22                 0  key=r[25]
-  19          Next             4  13   0                 0
-  20          Column           2   1  26                 0  r[26]=purchases.customer_id
-  21          Affinity        26   1   0                 0  r[26..27] = C
-  22          Filter           3  32  26                 1  if !bloom_filter(r[26..27]) goto 32
-  23          SeekGE           3  32  26                 0  key=[26..26]
-  24            IdxGT          3  32  26                 0  key=[26..26]
-  25            IdxRowId       3  14   0                 0  r[14]=cursor 3.rowid
-  26            Column         2   2  15                 0  r[15]=purchases.amount
-  27            RealAffinity  15   0   0                 0
-  28            Column         3   1  16                 0  r[16]=ephemeral(ephemeral_customers_s0).name
-  29            MakeRecord    14   3  13                 0  r[13]=mkrec(r[14..16])
-  30            SorterInsert   0  13   0  0              0  key=r[13]
-  31          Next             3  24   0                 0
-  32        Next               2  10   0                 1
-  33        OpenPseudo         1  13   3                 0  3 columns in r[13]
-  34        SorterSort         0  53   0                 0
-  35          SorterData       0  13   1                 0  r[13]=data
-  36          Column           1   0  21                 0  r[21]=pseudo.column 0
-  37          Column           1   1   5                 0  r[5]=pseudo.column 1
-  38          Column           1   2  10                 0  r[10]=pseudo.column 2
-  39          Compare         20  21   1  k(1, Binary)   0  r[20..20]==r[21..21]
-  40          Jump            41  44  41                 0
-  41          Gosub           17  55   0                 0
-  42          Move            21  20   1                 0  r[20..20]=r[21..21]
-  43          Gosub           18  64   0                 0
-  44          Integer          1  27   0                 0  r[27]=1
-  45          AggStep          0  27   1  count          0  accum=r[1] step(r[27])
-  46          Copy             5  28   0                 0  r[28]=r[5]
-  47          AggStep          0  28   2  sum            0  accum=r[2] step(r[28])
-  48          If              19  51   0                 0  if r[19] goto 51
-  49          Copy             5   8   0                 0  r[8]=r[5]
-  50          Copy            10  12   0                 0  r[12]=r[10]
-  51          Integer          1  19   0                 0  r[19]=1
-  52        SorterNext         0  35   0                 0
-  53        Gosub             17  55   0                 0
-  54        Goto               0  68   0                 0
-  55        IfPos             19  57   0                 0  r[19]>0 -> r[19]-=0, goto 57
-  56      Return              17   0   0                 0
-  57      AggFinal             0   1   0  count          0  accum=r[1]
-  58      AggFinal             0   2   0  sum            0  accum=r[2]
-  59      Copy                12  29   0                 0  r[29]=r[12]
-  60      Copy                 1  30   0                 0  r[30]=r[1]
-  61      Copy                 2  31   0                 0  r[31]=r[2]
-  62      ResultRow           29   3   0                 0  output=r[29..31]
-  63    Return                17   0   0                 0
-  64    Null                   0   1   0                 0  r[1]=NULL
-  65    Null                   0   2   0                 0  r[2]=NULL
-  66    Integer                0  19   0                 0  r[19]=0
-  67  Return                  18   0   0                 0
-  68  Halt                     0   0   0                 0
-  69  Transaction              0   1   4                 0  iDb=0 tx_mode=Read
-  70  Goto                     0   1   0                 0
+addr  opcode            p1  p2  p3  p4            p5  comment
+   0  Init               0  56   0                 0  Start at 56
+   1  Null               0  10  11                 0  r[10..11]=NULL
+   2  Integer            0   6   0                 0  r[6]=0; clear group by abort flag
+   3  Null               0   7   0                 0  r[7]=NULL; initialize group by comparison registers to NULL
+   4  Gosub             16  52   0                 0  ; go to clear accumulator subroutine
+   5  OpenRead           0   2   0  k(2,B,B)       0  table=customers, root=2, iDb=0
+   6  OpenRead           1   3   0  k(3,B,B,B)     0  table=purchases, root=3, iDb=0
+   7  Rewind             0  39   0                 0  Rewind table customers
+   8    Once            17   0   0                 0  goto 17
+   9    OpenAutoindex    2   0   0                 0  cursor=2
+  10    Rewind           1  17   0                 0  Rewind table purchases
+  11      ColumnRange    1   1  17  2              0  r[17..18]=purchases.customer_id..amount
+  12      RowId          1  19   0                 0  r[19]=purchases.rowid
+  13      MakeRecord    17   3  20                 0  r[20]=mkrec(r[17..19]); for ephemeral_purchases_t2
+  14      FilterAdd      2  17   1                 0  bloom_filter_add(r[17..18])
+  15      IdxInsert      2  20  17                 0  key=r[20]
+  16    Next             1  11   0                 0
+  17    RowId            0  21   0                 0  r[21]=customers.rowid
+  18    Filter           2  38  21                 1  if !bloom_filter(r[21..22]) goto 38
+  19    SeekGE           2  38  21                 0  key=[21..21]
+  20      IdxGT          2  38  21                 0  key=[21..21]
+  21      DeferredSeek   2   1   0                 0
+  22      RowId          0  13   0                 0  r[13]=customers.rowid
+  23      Column         0   1  14                 0  r[14]=customers.name
+  24      Column         2   1  15                 0  r[15]=ephemeral(ephemeral_purchases_t2).amount
+  25      RealAffinity  15   0   0                 0
+  26      Compare        7  13   1  k(1, Binary)   0  r[7..7]==r[13..13]
+  27      Jump          28  32  28                 0  ; start new group if comparison is not equal
+  28      Gosub          4  43   0                 0  ; check if ended group had data, and output if so
+  29      Move          13   7   1                 0  r[7..7]=r[13..13]
+  30      IfPos          6  55   0                 0  r[6]>0 -> r[6]-=0, goto 55; check abort flag
+  31      Gosub         16  52   0                 0  ; goto clear accumulator subroutine
+  32      AggStep        0  22  10  count          0  accum=r[10] step(r[22])
+  33      AggStep        0  15  11  sum            0  accum=r[11] step(r[15])
+  34      If             5  36   0                 0  if r[5] goto 36; don't emit group columns if continuing existing group
+  35      Column         0   1   8                 0  r[8]=customers.name
+  36      Integer        1   5   0                 0  r[5]=1; indicate data in accumulator
+  37    Next             2  20   0                 0
+  38  Next               0   8   0                 1
+  39  Gosub              4  43   0                 0  ; emit row for final group
+  40  Goto               0  55   0                 0  ; group by finished
+  41  Integer            1   6   0                 0  r[6]=1
+  42  Return             4   0   0                 0
+  43  IfPos              5  45   0                 0  r[5]>0 -> r[5]-=0, goto 45; output group by row subroutine start
+  44  Return             4   0   0                 0
+  45  AggFinal           0  10   0  count          0  accum=r[10]
+  46  AggFinal           0  11   0  sum            0  accum=r[11]
+  47  Copy               8   1   0                 0  r[1]=r[8]
+  48  Copy              10   2   0                 0  r[2]=r[10]
+  49  Copy              11   3   0                 0  r[3]=r[11]
+  50  ResultRow          1   3   0                 0  output=r[1..3]
+  51  Return             4   0   0                 0
+  52  Null               0   8  11                 0  r[8..11]=NULL; clear accumulator subroutine start
+  53  Integer            0   5   0                 0  r[5]=0
+  54  Return            16   0   0                 0
+  55  Halt               0   0   0                 0
+  56  Transaction        0   1   4                 0  iDb=0 tx_mode=Read
+  57  Integer            1  22   0                 0  r[22]=1
+  58  Goto               0   1   0                 0

@@ -72,11 +72,7 @@ pub(super) fn copy_with_affinity(
         let affinities = index
             .columns
             .iter()
-            .map(|column| {
-                table.columns()[column.pos_in_table]
-                    .affinity_with_strict(table.is_strict)
-                    .aff_mask()
-            })
+            .map(|column| table.columns()[column.pos_in_table].affinity().aff_mask())
             .collect();
         program.emit_insn(Insn::Affinity {
             start_reg: destination,
@@ -169,6 +165,7 @@ where
     program.preassign_label_to_next_insn(next_row);
     program.emit_insn(Insn::Next {
         cursor_id: cursor,
+        is_index: program.cursor_is_index(cursor),
         pc_if_next: loop_top,
         fullscan: false,
     });
@@ -263,6 +260,7 @@ where
     program.preassign_label_to_next_insn(next_row);
     program.emit_insn(Insn::Next {
         cursor_id: cursor,
+        is_index: program.cursor_is_index(cursor),
         pc_if_next: loop_top,
         fullscan: false,
     });

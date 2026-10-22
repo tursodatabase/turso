@@ -10,8 +10,10 @@
 //!
 //! Usage:
 //!
+//! ```bash
 //!     cargo run -q -p differential-fuzzer --bin differential_probe -- \
 //!         simulator-output/minimized.sql
+//! ```
 //!
 //! With no argument the script is read from stdin. Statements are one per
 //! line; lines starting with `--` are skipped. The exit code is 1 when any
@@ -29,7 +31,7 @@ fn brief(result: &QueryResult) -> String {
         QueryResult::Error(e) => format!("error: {}", e.lines().next().unwrap_or("")),
         QueryResult::Rows(rows) => {
             let mut out = format!("{} row(s): ", rows.len());
-            for (i, row) in rows.iter().take(4).enumerate() {
+            for (i, row) in rows.rows().iter().take(4).enumerate() {
                 if i > 0 {
                     out.push_str(", ");
                 }

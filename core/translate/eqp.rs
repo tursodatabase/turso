@@ -7,7 +7,7 @@ use std::fmt::{self, Display, Formatter, Write as _};
 
 use crate::{
     schema::Index,
-    translate::plan::{JoinInfo, JoinType, SeekDef, SeekKeyComponent},
+    translate::plan::{JoinInfo, JoinType, SeekDef, SeekKeyComponent, TablePlanEstimate},
     types::SeekOp,
     vdbe::{insn::Insn, Program},
 };
@@ -58,19 +58,20 @@ pub enum EqpJoin {
 impl EqpJoin {
     pub fn from_join_info(join_info: Option<&JoinInfo>, in_outer_join_order: bool) -> Option<Self> {
         let info = join_info?;
-        Some(if in_outer_join_order {
-            if info.is_full_outer() {
+        if in_outer_join_order && info.keeps_left_rows() {
+            return Some(if info.is_full_outer() {
                 Self::Full
             } else {
                 Self::Left
-            }
-        } else {
-            match info.join_type {
-                JoinType::Semi => Self::Semi,
-                JoinType::Anti => Self::Anti,
-                _ if info.no_reorder => Self::Cross,
-                _ => Self::Inner,
-            }
+            });
+        }
+        Some(match info.join_type {
+            // SQLite shows the unmatched rows in a separate RIGHT-JOIN row.
+            JoinType::RightOuter => Self::Inner,
+            JoinType::Semi => Self::Semi,
+            JoinType::Anti => Self::Anti,
+            _ if info.no_reorder => Self::Cross,
+            _ => Self::Inner,
         })
     }
 
@@ -211,6 +212,7 @@ pub enum EqpDetail {
         backwards: bool,
         join: Option<EqpJoin>,
         subquery: Option<EqpSubquery>,
+        estimate: Option<TablePlanEstimate>,
     },
     /// Seek into a table or index using key constraints.
     Search {
@@ -223,6 +225,7 @@ pub enum EqpDetail {
         backwards: bool,
         join: Option<EqpJoin>,
         subquery: Option<EqpSubquery>,
+        estimate: Option<TablePlanEstimate>,
     },
     /// Combine rowid sets from several indexes with OR/AND before fetching rows.
     MultiIndex {
@@ -231,20 +234,28 @@ pub enum EqpDetail {
         union: bool,
         /// Index names; "PRIMARY KEY" stands in for the table's rowid index.
         indexes: Vec<String>,
+        estimate: Option<TablePlanEstimate>,
     },
     /// Delegate the access to a pluggable index method.
     IndexMethod {
         method: String,
+        estimate: Option<TablePlanEstimate>,
     },
     /// Probe a hash table built from another table's rows.
     HashJoin {
         table: EqpTable,
         join: Option<EqpJoin>,
         subquery: Option<EqpSubquery>,
+        estimate: Option<TablePlanEstimate>,
+    },
+    /// Scan the right operand again to emit rows that did not match.
+    RightJoin {
+        table: EqpTable,
     },
     /// Materialize the build side of a hash join into an in-memory table.
     HashBuild {
         table: EqpTable,
+        estimate: Option<TablePlanEstimate>,
     },
     /// De-duplicate result rows with an in-memory hash table.
     Distinct,
@@ -288,7 +299,9 @@ impl Display for EqpDetail {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         match self {
             Self::ConstantRow => write!(f, "SCAN CONSTANT ROW"),
-            Self::Scan { table, index, .. } => {
+            Self::Scan {
+                table, index, join, ..
+            } => {
                 write!(f, "SCAN {}", table.name_with_alias())?;
                 if let Some(index) = index {
                     if index.covering {
@@ -296,6 +309,9 @@ impl Display for EqpDetail {
                     } else {
                         write!(f, " USING INDEX {}", index.name)?;
                     }
+                }
+                if join.is_some_and(|join| join.shows_left_join_suffix()) {
+                    write!(f, " LEFT-JOIN")?;
                 }
                 Ok(())
             }
@@ -326,6 +342,7 @@ impl Display for EqpDetail {
                 table,
                 union,
                 indexes,
+                ..
             } => {
                 let op = if *union { "OR" } else { "AND" };
                 write!(
@@ -335,9 +352,10 @@ impl Display for EqpDetail {
                     indexes.join(", ")
                 )
             }
-            Self::IndexMethod { method } => write!(f, "QUERY INDEX METHOD {method}"),
+            Self::IndexMethod { method, .. } => write!(f, "QUERY INDEX METHOD {method}"),
             Self::HashJoin { table, .. } => write!(f, "HASH JOIN {}", table.name_with_alias()),
-            Self::HashBuild { table } => write!(
+            Self::RightJoin { table } => write!(f, "RIGHT-JOIN {}", table.identifier()),
+            Self::HashBuild { table, .. } => write!(
                 f,
                 "MATERIALIZE hash build input for {}",
                 table.name_with_alias()
@@ -477,6 +495,11 @@ impl<'a> JsonBuilder<'a> {
         let _ = write!(self.key(key), "{value}");
     }
 
+    fn float(&mut self, key: &str, value: f64) {
+        assert!(value.is_finite(), "query plan estimate must be finite");
+        let _ = write!(self.key(key), "{value}");
+    }
+
     fn bool(&mut self, key: &str, value: bool) {
         let _ = write!(self.key(key), "{value}");
     }
@@ -543,6 +566,18 @@ impl EqpDetail {
         }
     }
 
+    fn write_estimate(obj: &mut JsonBuilder, estimate: Option<&TablePlanEstimate>) {
+        if let Some(estimate) = estimate {
+            let mut values = JsonBuilder::new(obj.key("estimate"));
+            values.float("input_rows", estimate.input_rows);
+            values.float("rows_per_input", estimate.rows_per_input);
+            values.float("output_rows", estimate.output_rows);
+            values.float("access_cost", estimate.access_cost);
+            values.float("total_cost", estimate.total_cost);
+            values.finish();
+        }
+    }
+
     /// Output the plan in json format for `EXPLAIN QUERY PLAN format=json`.
     fn write_json(&self, out: &mut String) {
         let mut obj = JsonBuilder::new(out);
@@ -555,6 +590,7 @@ impl EqpDetail {
                 backwards,
                 join,
                 subquery,
+                estimate,
             } => {
                 obj.str("type", "scan");
                 Self::write_table_fields(&mut obj, table, *join, subquery.as_ref());
@@ -563,6 +599,7 @@ impl EqpDetail {
                 if *backwards {
                     obj.bool("backwards", true);
                 }
+                Self::write_estimate(&mut obj, estimate.as_ref());
             }
             Self::Search {
                 table,
@@ -572,6 +609,7 @@ impl EqpDetail {
                 backwards,
                 join,
                 subquery,
+                estimate,
             } => {
                 obj.str("type", "search");
                 Self::write_table_fields(&mut obj, table, *join, subquery.as_ref());
@@ -584,32 +622,43 @@ impl EqpDetail {
                 if *backwards {
                     obj.bool("backwards", true);
                 }
+                Self::write_estimate(&mut obj, estimate.as_ref());
             }
             Self::MultiIndex {
                 table,
                 union,
                 indexes,
+                estimate,
             } => {
                 obj.str("type", "multi_index");
                 Self::write_table_fields(&mut obj, table, None, None);
                 obj.str("set_op", if *union { "or" } else { "and" });
                 obj.str_array("indexes", indexes);
+                Self::write_estimate(&mut obj, estimate.as_ref());
             }
-            Self::IndexMethod { method } => {
+            Self::IndexMethod { method, estimate } => {
                 obj.str("type", "index_method");
                 obj.str("method", method);
+                Self::write_estimate(&mut obj, estimate.as_ref());
             }
             Self::HashJoin {
                 table,
                 join,
                 subquery,
+                estimate,
             } => {
                 obj.str("type", "hash_join");
                 Self::write_table_fields(&mut obj, table, *join, subquery.as_ref());
+                Self::write_estimate(&mut obj, estimate.as_ref());
             }
-            Self::HashBuild { table } => {
+            Self::RightJoin { table } => {
+                obj.str("type", "right_join");
+                Self::write_table_fields(&mut obj, table, None, None);
+            }
+            Self::HashBuild { table, estimate } => {
                 obj.str("type", "hash_build");
                 Self::write_table_fields(&mut obj, table, None, None);
+                Self::write_estimate(&mut obj, estimate.as_ref());
             }
             Self::Distinct => obj.str("type", "distinct"),
             Self::DistinctAggregate { function } => {

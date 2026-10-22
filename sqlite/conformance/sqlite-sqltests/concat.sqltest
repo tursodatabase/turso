@@ -61,3 +61,44 @@ test concat-ws-one-arg-error {
 expect error {
     wrong number of arguments to function concat_ws()
 }
+
+# `||` converts each side to text. Only a TEXT value is already in that form;
+# every other type is rendered first, so each one needs its own case.
+test concat-value-types {
+    SELECT quote(1 || 2);
+    SELECT quote(1.5 || 'x');
+    SELECT quote(-0.0 || '');
+    SELECT quote(1e300 || '');
+    SELECT quote('' || 'b');
+    SELECT quote(NULL || 'a');
+    SELECT quote('a' || NULL);
+}
+expect {
+    '12'
+    '1.5x'
+    '0.0'
+    '1.0e+300'
+    'b'
+    NULL
+    NULL
+}
+
+test concat-mixed-blob-and-text {
+    SELECT quote(x'41' || 'b');
+    SELECT quote('b' || x'41');
+    SELECT quote(x'e282ac' || 'x');
+}
+expect {
+    'Ab'
+    'bA'
+    '€x'
+}
+
+test concat-multibyte-text {
+    SELECT quote('héllo' || '—');
+    SELECT length('héllo' || '—');
+}
+expect {
+    'héllo—'
+    6
+}

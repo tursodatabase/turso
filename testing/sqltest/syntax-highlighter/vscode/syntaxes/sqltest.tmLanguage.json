@@ -43,7 +43,8 @@
       "patterns": [
         { "include": "#directive-skip-file" },
         { "include": "#directive-skip-file-if" },
-        { "include": "#directive-requires-file" }
+        { "include": "#directive-requires-file" },
+        { "include": "#directive-verify-materialized-views" }
       ]
     },
     "directive-skip-file": {
@@ -67,7 +68,7 @@
     },
     "directive-skip-file-if": {
       "name": "meta.directive.skip-file-if.sqltest",
-      "begin": "(@skip-file-if)\\s+(mvcc|sqlite)\\s+(\")",
+      "begin": "(@skip-file-if)\\s+(mvcc|sqlite|postgres)\\s+(\")",
       "beginCaptures": {
         "1": { "name": "keyword.control.directive.sqltest" },
         "2": { "name": "constant.language.sqltest" },
@@ -104,6 +105,13 @@
           "match": "\\\\."
         }
       ]
+    },
+    "directive-verify-materialized-views": {
+      "name": "meta.directive.verify-materialized-views.sqltest",
+      "match": "(@verify-materialized-views)\\b",
+      "captures": {
+        "1": { "name": "keyword.control.directive.sqltest" }
+      }
     },
     "setup-block": {
       "name": "meta.setup-block.sqltest",
@@ -160,7 +168,7 @@
     },
     "decorator-skip-if": {
       "name": "meta.decorator.skip-if.sqltest",
-      "begin": "(@skip-if)\\s+(mvcc|sqlite)\\s+(\")",
+      "begin": "(@skip-if)\\s+(mvcc|sqlite|postgres)\\s+(\")",
       "beginCaptures": {
         "1": { "name": "keyword.control.directive.sqltest" },
         "2": { "name": "constant.language.sqltest" },
@@ -180,7 +188,7 @@
     },
     "decorator-backend": {
       "name": "meta.decorator.backend.sqltest",
-      "match": "(@backend)\\s+(rust|cli|js)",
+      "match": "(@backend)\\s+(rust|cli|js|tursopg|postgres)",
       "captures": {
         "1": { "name": "keyword.control.directive.sqltest" },
         "2": { "name": "constant.language.sqltest" }
@@ -242,7 +250,7 @@
     },
     "expect-block": {
       "name": "meta.expect-block.sqltest",
-      "begin": "\\b(expect)(?:\\s+(@)(rust|cli|js))?(?:\\s+(error|pattern|unordered|raw))?\\s*(\\{)",
+      "begin": "\\b(expect)(?:\\s+(@)(rust|cli|js|tursopg|postgres))?(?:\\s+(error|pattern|unordered|raw))?\\s*(\\{)",
       "beginCaptures": {
         "1": { "name": "keyword.control.sqltest" },
         "2": { "name": "keyword.control.directive.sqltest" },

@@ -104,6 +104,59 @@ expect {
 }
 
 @requires strict "uses STRICT tables"
+test date-plus-minus-days {
+    CREATE TABLE t1(id INTEGER PRIMARY KEY, d date) STRICT;
+    INSERT INTO t1 VALUES (1, '2025-01-05'), (2, '2024-03-01'), (3, NULL);
+    SELECT id, d + 1, d - 1, 30 + d FROM t1 ORDER BY id;
+}
+expect {
+    1|2025-01-06|2025-01-04|2025-02-04
+    2|2024-03-02|2024-02-29|2024-03-31
+    3|||
+}
+
+@requires strict "uses STRICT tables"
+test date-plus-minus-expressions {
+    CREATE TABLE t1(id INTEGER PRIMARY KEY, d date, n integer) STRICT;
+    INSERT INTO t1 VALUES (1, '2025-01-05', 3), (2, '2025-01-05', NULL);
+    SELECT id, d + -1, d + (1), d + n, d - n, n + d FROM t1 ORDER BY id;
+}
+expect {
+    1|2025-01-04|2025-01-06|2025-01-08|2025-01-02|2025-01-08
+    2|2025-01-04|2025-01-06|||
+}
+
+@requires strict "uses STRICT tables"
+test date-minus-date {
+    CREATE TABLE t1(id INTEGER PRIMARY KEY, a date, b date) STRICT;
+    INSERT INTO t1 VALUES (1, '2025-01-05', '2025-01-01'), (2, '2024-01-01', '2024-12-31'), (3, NULL, '2024-12-31');
+    SELECT id, a - b, a - '2024-12-31' FROM t1 ORDER BY id;
+}
+expect {
+    1|4|5
+    2|-365|-365
+    3||
+}
+
+@requires strict "uses STRICT tables"
+test date-plus-real-error {
+    CREATE TABLE t1(id INTEGER PRIMARY KEY, d date) STRICT;
+    INSERT INTO t1 VALUES (1, '2025-01-05');
+    SELECT d + 1.5 FROM t1;
+}
+expect error {
+}
+
+@requires strict "uses STRICT tables"
+test integer-minus-date-error {
+    CREATE TABLE t1(id INTEGER PRIMARY KEY, d date) STRICT;
+    INSERT INTO t1 VALUES (1, '2025-01-05');
+    SELECT 1 - d FROM t1;
+}
+expect error {
+}
+
+@requires strict "uses STRICT tables"
 test time-valid {
     CREATE TABLE t1(id INTEGER PRIMARY KEY, t time) STRICT;
     INSERT INTO t1 VALUES (1, '14:30:00');

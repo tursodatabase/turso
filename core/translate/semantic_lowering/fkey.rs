@@ -329,11 +329,7 @@ pub(super) fn emit_insert_parent_repairs(
             foreign_key
                 .parent_positions
                 .iter()
-                .map(|&position| {
-                    parent_table.columns()[position]
-                        .affinity_with_strict(parent_table.is_strict)
-                        .aff_mask()
-                })
+                .map(|&position| parent_table.columns()[position].affinity().aff_mask())
                 .collect()
         };
         if let Some(count) = NonZeroUsize::new(width) {

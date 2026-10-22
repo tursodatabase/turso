@@ -215,6 +215,8 @@ pub struct InsertOpts {
     pub max_rows: NonZeroU32,
     #[garde(range(min = 0.0, max = 1.0))]
     pub upsert_prob: f64,
+    #[garde(skip)]
+    pub allow_implicit_rowids: bool,
 }
 
 impl Default for InsertOpts {
@@ -223,6 +225,7 @@ impl Default for InsertOpts {
             min_rows: NonZero::new(1).unwrap(),
             max_rows: NonZero::new(10).unwrap(),
             upsert_prob: 0.15,
+            allow_implicit_rowids: true,
         }
     }
 }

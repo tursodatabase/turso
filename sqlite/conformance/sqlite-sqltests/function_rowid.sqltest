@@ -1,0 +1,26 @@
+@database :memory:
+
+@cross-check-integrity
+test function-rowid-last-insert-rowid-null-then-explicit {
+    CREATE TABLE test_rowid (id INTEGER PRIMARY KEY, val TEXT);
+    INSERT INTO test_rowid (id, val) VALUES (NULL, 'test1');
+    SELECT last_insert_rowid();
+    INSERT INTO test_rowid (id, val) VALUES (5, 'test2');
+    SELECT last_insert_rowid();
+}
+expect {
+    1
+    5
+}
+
+@cross-check-integrity
+test function-rowid-integer-primary-key-auto-assignment-after-negative {
+    CREATE TABLE test_rowid (id INTEGER PRIMARY KEY);
+    INSERT INTO test_rowid VALUES (-1);
+    INSERT INTO test_rowid VALUES (NULL);
+    SELECT * FROM test_rowid;
+}
+expect {
+    -1
+    0
+}

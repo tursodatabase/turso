@@ -207,3 +207,6 @@ bundle
 *.db-info
 
 __screenshots__
+
+# This package is managed with yarn; npm would create a competing lockfile.
+package-lock.json

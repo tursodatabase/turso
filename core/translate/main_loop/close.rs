@@ -101,6 +101,7 @@ pub(crate) fn emit_autoindex<E>(
         cursor_id: table_cursor_id,
         pc_if_next: label_ephemeral_build_loop_start,
         fullscan: false,
+        is_index: false,
     });
     program.preassign_label_to_next_insn(label_ephemeral_build_end);
     Ok(AutoIndexResult { use_bloom_filter })

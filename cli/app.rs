@@ -8,8 +8,8 @@ use crate::{
     dot_command::tokenize_dot_command,
     helper::LimboHelper,
     input::{
-        get_io, get_writer, ApplyWriter, DbLocation, NoopProgress, OutputMode, ProgressSink,
-        Settings, StderrProgress,
+        get_io, get_writer, open_flags, ApplyWriter, DbLocation, NoopProgress, OutputMode,
+        ProgressSink, Settings, StderrProgress,
     },
     manual,
     opcodes_dictionary::OPCODE_DESCRIPTIONS,
@@ -36,8 +36,8 @@ use std::{
 use tracing_appender::non_blocking::WorkerGuard;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
 use turso_core::{
-    io_error, Connection, Database, EqpFormat, LimboError, Numeric, OpenFlags, QueryMode,
-    SqliteDialect, Statement, Value,
+    io_error, ConnectOpts, Connection, Database, EqpFormat, LimboError, Numeric, OpenFlags,
+    QueryMode, SqliteDialect, Statement, Value,
 };
 
 #[derive(Parser, Debug)]
@@ -85,6 +85,20 @@ pub struct Opts {
         help = "Start sync server instead of interactive shell and listen at given address (e.g. 0.0.0.0:8080)"
     )]
     pub sync_server: Option<String>,
+    #[clap(
+        long,
+        requires = "sync_server",
+        conflicts_with = "database",
+        help = "Serve every database under PATH over the sync server, addressed as /db/{name}"
+    )]
+    pub sync_dir: Option<PathBuf>,
+    #[clap(
+        long,
+        requires = "sync_dir",
+        default_value_t = 256,
+        help = "Most databases held open at once under --sync-dir, one connection each; more may exist on disk"
+    )]
+    pub sync_max_databases: usize,
     #[clap(long, help = "Enable experimental encryption feature")]
     pub experimental_encryption: bool,
     #[clap(long, help = "Enable experimental index method feature")]
@@ -129,7 +143,7 @@ pub struct Limbo {
     pub interrupt_count: Arc<AtomicUsize>,
     input_buff: ManuallyDrop<String>,
     pub(crate) opts: Settings,
-    db_opts: turso_core::DatabaseOpts,
+    pub(crate) db_opts: turso_core::DatabaseOpts,
     read_state: ReadState,
     pub rl: Option<Editor<LimboHelper, DefaultHistory>>,
     config: Option<Config>,
@@ -260,11 +274,7 @@ impl Limbo {
         let (io, conn) = if db_file.starts_with("file:") {
             Connection::from_uri(&db_file, db_opts, Arc::new(SqliteDialect))?
         } else {
-            let flags = if opts.readonly {
-                OpenFlags::default().union(OpenFlags::ReadOnly)
-            } else {
-                OpenFlags::default()
-            };
+            let flags = open_flags(opts.readonly);
             let (io, db) = Database::open_new(
                 &db_file,
                 opts.vfs.as_ref(),
@@ -273,7 +283,7 @@ impl Limbo {
                 None,
                 Arc::new(SqliteDialect),
             )?;
-            let conn = db.connect()?;
+            let conn = db.connect(ConnectOpts::new())?;
             (io, conn)
         };
         unsafe {
@@ -493,7 +503,7 @@ impl Limbo {
             )
         };
         self.io = io;
-        self.conn = db.connect()?;
+        self.conn = db.connect(ConnectOpts::new())?;
         self.opts.db_file = path.to_string();
         Ok(())
     }
@@ -803,6 +813,7 @@ impl Limbo {
             }
             Ok(cmd) => match cmd.command {
                 Command::Exit(args) => {
+                    let _ = self.close_conn();
                     self.save_history();
                     std::process::exit(args.code);
                 }
@@ -2061,7 +2072,7 @@ impl Limbo {
         }
         let io: Arc<dyn turso_core::IO> = Arc::new(turso_core::PlatformIO::new()?);
         let db = Database::open_file(io.clone(), output_file, Arc::new(SqliteDialect))?;
-        let target = db.connect()?;
+        let target = db.connect(ConnectOpts::new())?;
 
         let mut applier = ApplyWriter::new(&target);
         Self::dump_database_from_conn(false, self.conn.clone(), &mut applier, StderrProgress)?;

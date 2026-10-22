@@ -1,0 +1,33 @@
+@database :memory:
+
+test pragma-synchronous-tvf-schema-qualified {
+    ATTACH ':memory:' AS aux;
+    PRAGMA aux.synchronous=OFF;
+    SELECT * FROM pragma_synchronous('aux');
+    SELECT * FROM pragma_synchronous('main');
+}
+expect {
+    0
+    2
+}
+
+test pragma-synchronous-tvf-schema-hidden-column-reads-back-null {
+    ATTACH ':memory:' AS aux;
+    SELECT schema IS NULL FROM pragma_synchronous('aux');
+}
+expect {
+    1
+}
+
+test pragma-synchronous-tvf-unqualified-defaults-to-main {
+    SELECT * FROM pragma_synchronous;
+}
+expect {
+    2
+}
+
+test pragma-synchronous-tvf-too-many-arguments {
+    SELECT * FROM pragma_synchronous('main', 'extra');
+}
+expect error {
+}

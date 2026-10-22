@@ -104,6 +104,7 @@ impl Parser {
         let mut matrices = Vec::new();
         let mut global_skip = Vec::new();
         let mut global_requires = Vec::new();
+        let mut verify_materialized_views = false;
 
         while !self.is_at_end() {
             self.skip_newlines_and_comments();
@@ -127,6 +128,14 @@ impl Parser {
                 Some(Token::AtRequiresFile) => {
                     global_requires.push(self.parse_global_requires()?);
                 }
+                Some(Token::AtVerifyMaterializedViews) => {
+                    if verify_materialized_views {
+                        return Err(self
+                            .error("duplicate @verify-materialized-views directive".to_string()));
+                    }
+                    self.advance();
+                    verify_materialized_views = true;
+                }
                 Some(Token::Setup) => {
                     let (name, sql) = self.parse_setup()?;
                     if setups.contains_key(&name) {
@@ -141,6 +150,7 @@ impl Parser {
                     | Token::AtRequires
                     | Token::AtBackend
                     | Token::AtCrossCheckIntegrity
+                    | Token::AtSqliteReference
                     | Token::AtVar
                     | Token::Test
                     | Token::Snapshot
@@ -164,6 +174,7 @@ impl Parser {
 
         let test_file = TestFile {
             databases,
+            verify_materialized_views,
             setups,
             tests,
             snapshots,
@@ -273,6 +284,7 @@ impl Parser {
         let mut backend = None;
         let mut requires = Vec::new();
         let mut cross_check_integrity = false;
+        let mut sqlite_reference = false;
         let mut matrix_vars: Vec<MatrixVar> = Vec::new();
 
         // Parse decorators
@@ -341,6 +353,11 @@ impl Parser {
                     cross_check_integrity = true;
                     self.skip_newlines_and_comments();
                 }
+                Some(Token::AtSqliteReference) => {
+                    self.advance();
+                    sqlite_reference = true;
+                    self.skip_newlines_and_comments();
+                }
                 _ => break,
             }
         }
@@ -351,6 +368,9 @@ impl Parser {
         }
         match self.peek() {
             Some(Token::Matrix) => {
+                if sqlite_reference {
+                    return Err(self.error("@sqlite-reference requires a snapshot".to_string()));
+                }
                 self.advance();
                 let (name, name_span) = self.expect_identifier_with_span()?;
                 let sql_template = self.expect_block_content()?.trim().to_string();
@@ -395,6 +415,7 @@ impl Parser {
                     name_span,
                     sql,
                     eqp_only,
+                    sqlite_reference,
                     modifiers: CaseModifiers {
                         setups: test_setups,
                         skip,
@@ -405,6 +426,9 @@ impl Parser {
                 }))
             }
             Some(Token::Test) => {
+                if sqlite_reference {
+                    return Err(self.error("@sqlite-reference requires a snapshot".to_string()));
+                }
                 // Parse test as before
                 self.expect_token(Token::Test)?;
                 let (name, name_span) = self.expect_identifier_with_span()?;
@@ -543,8 +567,12 @@ impl Parser {
                 self.advance();
                 Ok(ast::SkipCondition::Sqlite)
             }
+            Some(Token::Identifier(name)) if name == "postgres" => {
+                self.advance();
+                Ok(ast::SkipCondition::Postgres)
+            }
             Some(token) => Err(self.error(format!(
-                "expected skip condition (mvcc, sqlite), got {token}"
+                "expected skip condition (mvcc, sqlite, postgres), got {token}"
             ))),
             None => Err(self.error("expected skip condition, got EOF".to_string())),
         }
@@ -990,6 +1018,47 @@ expect {
     }
 
     #[test]
+    fn test_parse_materialized_view_verification_directive() {
+        let input = r#"
+@database :memory:
+@verify-materialized-views
+
+test select-1 {
+    SELECT 1;
+}
+expect {
+    1
+}
+"#;
+
+        let file = parse(input).unwrap();
+        assert!(file.verify_materialized_views);
+    }
+
+    #[test]
+    fn test_reject_duplicate_materialized_view_verification_directive() {
+        let input = r#"
+@database :memory:
+@verify-materialized-views
+@verify-materialized-views
+
+test select-1 {
+    SELECT 1;
+}
+expect {
+    1
+}
+"#;
+
+        let error = parse(input).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("duplicate @verify-materialized-views directive")
+        );
+    }
+
+    #[test]
     fn test_parse_with_setup() {
         let input = r#"
 @database :memory:
@@ -1173,6 +1242,69 @@ expect {
                 condition: Some(ast::SkipCondition::Sqlite),
             }]
         );
+    }
+
+    #[test]
+    fn test_parse_skip_if_postgres() {
+        let input = r#"
+@database :memory:
+
+@skip-if postgres "EXPLAIN shows the Turso query plan"
+test explain-select {
+    EXPLAIN SELECT 1;
+}
+expect {
+    0|0|0|SCAN CONSTANT ROW
+}
+"#;
+
+        let file = parse(input).unwrap();
+        assert_eq!(
+            file.tests[0].modifiers.skip,
+            vec![ast::Skip {
+                reason: "EXPLAIN shows the Turso query plan".to_string(),
+                condition: Some(ast::SkipCondition::Postgres),
+            }]
+        );
+    }
+
+    #[test]
+    fn test_parse_postgres_is_still_an_identifier() {
+        let input = r#"
+@database :memory:
+
+setup postgres {
+    CREATE TABLE t (x int);
+}
+
+@setup postgres
+@backend postgres
+test postgres {
+    SELECT 1;
+}
+expect {
+    1
+}
+expect @tursopg {
+    2
+}
+"#;
+
+        let file = parse(input).unwrap();
+        assert!(file.setups.contains_key("postgres"));
+        assert_eq!(file.tests[0].name, "postgres");
+        assert_eq!(
+            file.tests[0].modifiers.backend,
+            Some(ast::Backend::Postgres)
+        );
+        assert!(matches!(
+            file.tests[0].expectations.for_backend(ast::Backend::Tursopg),
+            Expectation::Exact(rows) if rows == &vec!["2".to_string()]
+        ));
+        assert!(matches!(
+            file.tests[0].expectations.for_backend(ast::Backend::Postgres),
+            Expectation::Exact(rows) if rows == &vec!["1".to_string()]
+        ));
     }
 
     #[test]
@@ -1375,6 +1507,52 @@ expect {
     }
 
     #[test]
+    fn test_parse_global_skip_if_postgres() {
+        let input = r#"
+@database :memory:
+@skip-file-if postgres "EXPLAIN shows the Turso query plan"
+
+test select-1 {
+    SELECT 1;
+}
+expect {
+    1
+}
+"#;
+
+        let file = parse(input).unwrap();
+        assert_eq!(
+            file.global_skip,
+            vec![ast::Skip {
+                reason: "EXPLAIN shows the Turso query plan".to_string(),
+                condition: Some(ast::SkipCondition::Postgres),
+            }]
+        );
+    }
+
+    #[test]
+    fn test_parse_skip_if_unknown_condition() {
+        let input = r#"
+@database :memory:
+
+@skip-if mysql "not a skip condition"
+test select-1 {
+    SELECT 1;
+}
+expect {
+    1
+}
+"#;
+
+        let err = parse(input).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("expected skip condition (mvcc, sqlite, postgres), got mysql"),
+            "{err}"
+        );
+    }
+
+    #[test]
     fn test_parse_backend_specific_expectations() {
         let input = r#"
 @database :memory:
@@ -1461,6 +1639,31 @@ expect @invalid {
 
         let result = parse(input);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_parse_tursopg_backend() {
+        let input = r#"
+@database :memory:
+
+@backend tursopg
+test select-1 {
+    SELECT 1;
+}
+expect {
+    1
+}
+expect @tursopg {
+    2
+}
+"#;
+
+        let file = parse(input).unwrap();
+        assert_eq!(file.tests[0].modifiers.backend, Some(ast::Backend::Tursopg));
+        assert!(matches!(
+            file.tests[0].expectations.for_backend(ast::Backend::Tursopg),
+            Expectation::Exact(rows) if rows == &vec!["2".to_string()]
+        ));
     }
 
     #[test]
@@ -1712,6 +1915,22 @@ snapshot query-plan {
         assert_eq!(file.snapshots[0].sql, "SELECT * FROM users WHERE id = 1;");
         assert!(file.snapshots[0].modifiers.setups.is_empty());
         assert!(file.snapshots[0].modifiers.skip.is_empty());
+    }
+
+    #[test]
+    fn sqlite_reference_applies_only_to_snapshots() {
+        let snapshot =
+            parse("@database :memory:\n@sqlite-reference\nsnapshot plan { SELECT 1; }\n").unwrap();
+        assert!(snapshot.snapshots[0].sqlite_reference);
+
+        let test = parse(
+            "@database :memory:\n@sqlite-reference\ntest result { SELECT 1; }\nexpect { 1 }\n",
+        )
+        .unwrap_err();
+        assert!(
+            test.to_string()
+                .contains("@sqlite-reference requires a snapshot")
+        );
     }
 
     #[test]

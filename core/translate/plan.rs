@@ -14,7 +14,7 @@ use crate::{
     Result,
 };
 use std::{marker::PhantomData, ops::Range, sync::Arc};
-use turso_parser::ast::{self, Expr};
+use turso_parser::ast::{self};
 
 /// The most sources one FROM clause may join: a join bitmask fits in 64 bits.
 pub(crate) const MAX_JOINED_TABLES: usize = 63;
@@ -393,6 +393,7 @@ pub enum IterationDirection {
 pub enum JoinType {
     Inner,
     LeftOuter,
+    RightOuter,
     FullOuter,
     /// Semi-join: keep outer row if inner match found (EXISTS).
     Semi,
@@ -412,10 +413,177 @@ pub struct JoinInfo<N = ast::Name> {
     pub no_reorder: bool,
 }
 
+impl JoinType {
+    pub fn from_join_operator(operator: &ast::JoinOperator) -> Self {
+        let ast::JoinOperator::TypedJoin(Some(join_type)) = operator else {
+            return Self::Inner;
+        };
+        let has_left = join_type.contains(ast::JoinType::LEFT);
+        let has_right = join_type.contains(ast::JoinType::RIGHT);
+        if has_left && has_right {
+            Self::FullOuter
+        } else if has_right {
+            Self::RightOuter
+        } else if has_left {
+            Self::LeftOuter
+        } else {
+            Self::Inner
+        }
+    }
+
+    /// Whether the join keeps the rows of its right side that match no row
+    /// of the left side.
+    pub fn keeps_right_rows(self) -> bool {
+        matches!(self, Self::RightOuter | Self::FullOuter)
+    }
+}
+
+impl JoinInfo {
+    /// Whether `column_name` is one of the join's USING columns.
+    pub fn merges_column(&self, column_name: &str) -> bool {
+        self.using
+            .iter()
+            .any(|name| name.as_str().eq_ignore_ascii_case(column_name))
+    }
+}
+
+/// Return true when SQLite resolves a qualified star column as an unqualified name.
+///
+/// A later USING clause and a later RIGHT or FULL JOIN are both required.
+/// They can belong to different joins.
+pub fn star_column_uses_merged_value<'a>(
+    later_joins: impl Iterator<Item = &'a JoinInfo>,
+    column_name: &str,
+) -> bool {
+    let mut has_later_using = false;
+    let mut has_later_right_or_full_join = false;
+    for join_info in later_joins {
+        has_later_using |= join_info.merges_column(column_name);
+        has_later_right_or_full_join |= join_info.keeps_right_rows();
+    }
+    has_later_using && has_later_right_or_full_join
+}
+
+/// The FROM sources that supply an unqualified column.
+pub struct UnqualifiedColumnSources {
+    /// `(source index, column index)` pairs, first source first. Empty when no
+    /// source has the column.
+    pub sources: smallvec::SmallVec<[(usize, usize); 4]>,
+}
+
+/// The result of looking up an unqualified column name in one FROM source.
+pub enum ColumnLookup {
+    Found(usize),
+    Missing,
+}
+
+/// Find the FROM sources that supply an unqualified column, from left to right.
+///
+/// INNER and LEFT JOIN USING keep the copy found so far. RIGHT JOIN USING
+/// replaces it, because the left copy is NULL in an unmatched right row. FULL
+/// JOIN USING adds a fallback, because either copy can be NULL.
+///
+/// View metadata uses this to name a view's columns the way the query
+/// binder resolves them.
+pub fn unqualified_column_sources<'a, S>(
+    sources: &'a [S],
+    column_name: &str,
+    join_info: impl Fn(&'a S) -> Option<&'a JoinInfo>,
+    lookup: impl Fn(&'a S) -> ColumnLookup,
+) -> UnqualifiedColumnSources {
+    let mut found = smallvec::SmallVec::new();
+    for (source_index, source) in sources.iter().enumerate() {
+        let already_found = !found.is_empty();
+        let using_join_type = join_info(source)
+            .filter(|join_info| join_info.merges_column(column_name))
+            .map(|join_info| join_info.join_type);
+        if already_found && matches!(using_join_type, Some(JoinType::Inner | JoinType::LeftOuter)) {
+            continue;
+        }
+        let column_index = match lookup(source) {
+            ColumnLookup::Found(column_index) => column_index,
+            ColumnLookup::Missing => continue,
+        };
+
+        if !already_found {
+            found.push((source_index, column_index));
+            continue;
+        }
+
+        match using_join_type {
+            Some(JoinType::RightOuter) => {
+                found.clear();
+                found.push((source_index, column_index));
+            }
+            Some(JoinType::FullOuter) => found.push((source_index, column_index)),
+            // A repeated name that no USING merged is ambiguous; the binder
+            // reports that, this only lists the copies in order.
+            None
+            | Some(JoinType::Inner | JoinType::LeftOuter | JoinType::Semi | JoinType::Anti) => {}
+        }
+    }
+    UnqualifiedColumnSources { sources: found }
+}
+
+/// Find the earlier FROM sources that a USING or NATURAL join compares with.
+///
+/// Returns `(source index, column index)` pairs; an empty list means no
+/// earlier source has the column. Without a RIGHT or FULL JOIN in the FROM
+/// list, SQLite compares only the first copy. With one, every copy after the
+/// first must have been merged by an earlier USING, as in
+/// `sqlite3ProcessJoin` (select.c):
+///
+/// ```sql
+/// SELECT * FROM t1 JOIN t2 USING(a) JOIN t3 USING(a) RIGHT JOIN t4 ON 1;  -- ok
+/// SELECT * FROM t1 JOIN t2 ON 1 JOIN t3 USING(a) RIGHT JOIN t4 ON 1;
+/// -- ambiguous reference to a in USING()
+/// ```
+///
+/// The planner and view metadata both use this, so they report the same errors.
+pub fn left_using_column_sources<'a, S>(
+    sources: &'a [S],
+    column_name: &str,
+    has_right_or_full_join: bool,
+    join_info: impl Fn(&'a S) -> Option<&'a JoinInfo>,
+    column_index: impl Fn(&'a S) -> Option<usize>,
+) -> Result<smallvec::SmallVec<[(usize, usize); 4]>> {
+    let mut found = smallvec::SmallVec::<[(usize, usize); 4]>::new();
+    for (source_index, source) in sources.iter().enumerate() {
+        let Some(column_index) = column_index(source) else {
+            continue;
+        };
+        if !found.is_empty() && !has_right_or_full_join {
+            break;
+        }
+        if !found.is_empty()
+            && !join_info(source).is_some_and(|join_info| join_info.merges_column(column_name))
+        {
+            crate::bail_parse_error!("ambiguous reference to {} in USING()", column_name);
+        }
+        found.push((source_index, column_index));
+    }
+    Ok(found)
+}
+
 impl<N> JoinInfo<N> {
     /// Whether this is an OUTER JOIN (LEFT OUTER or FULL OUTER).
     pub fn is_outer(&self) -> bool {
+        matches!(
+            self.join_type,
+            JoinType::LeftOuter | JoinType::RightOuter | JoinType::FullOuter
+        )
+    }
+
+    /// Whether the join keeps the rows of its left side that match no row
+    /// of the right side.
+    pub fn keeps_left_rows(&self) -> bool {
         matches!(self.join_type, JoinType::LeftOuter | JoinType::FullOuter)
+    }
+
+    /// Whether the join keeps the rows of its right side that match no row
+    /// of the left side.
+    pub fn keeps_right_rows(&self) -> bool {
+        self.join_type.keeps_right_rows()
     }
 
     /// Whether this is a FULL OUTER JOIN.
@@ -1408,6 +1576,29 @@ pub enum HashJoinType {
     FullOuter,
 }
 
+impl HashJoinType {
+    /// Whether the build rows that no probe row matched are emitted after
+    /// the probe loop.
+    pub fn keeps_unmatched_build_rows(self) -> bool {
+        matches!(self, Self::LeftOuter | Self::FullOuter)
+    }
+}
+
+/// The planner's estimate for one table access, shown in JSON query plans.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct TablePlanEstimate {
+    /// Rows from the join prefix before this table access.
+    pub input_rows: f64,
+    /// Rows that this access returns for each input row.
+    pub rows_per_input: f64,
+    /// Rows from the join prefix after this table access.
+    pub output_rows: f64,
+    /// Cost of this table access for all input rows.
+    pub access_cost: f64,
+    /// Cost of the join prefix through this table access.
+    pub total_cost: f64,
+}
+
 /// A definition of a rowid/index search.
 ///
 /// [SeekKey] is the condition that is used to seek to a specific row in a table/index.
@@ -1565,16 +1756,6 @@ pub struct SeekKey<E = ast::Expr> {
     pub affinity: Affinity,
 }
 
-/// One bound of a window function's effective frame.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum FrameBoundary {
-    UnboundedPreceding,
-    Preceding(Box<Expr>),
-    CurrentRow,
-    Following(Box<Expr>),
-    UnboundedFollowing,
-}
-
 /// A window function's effective frame. The bounds are interpreted per `mode`:
 /// `Rows` counts physical rows, `Range` and `Groups` work over peer groups of
 /// the window's ORDER BY values.
@@ -1583,8 +1764,8 @@ pub enum FrameBoundary {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Frame {
     pub mode: ast::FrameMode,
-    pub start: FrameBoundary,
-    pub end: FrameBoundary,
+    pub start: ast::FrameBound,
+    pub end: ast::FrameBound,
     /// The EXCLUDE clause the user wrote, or `None` if they wrote none.
     ///
     /// `Some(NoOthers)` (an explicit `EXCLUDE NO OTHERS`) excludes
@@ -1600,8 +1781,8 @@ impl Default for Frame {
     fn default() -> Self {
         Self {
             mode: ast::FrameMode::Range,
-            start: FrameBoundary::UnboundedPreceding,
-            end: FrameBoundary::CurrentRow,
+            start: ast::FrameBound::UnboundedPreceding,
+            end: ast::FrameBound::CurrentRow,
             exclude: None,
         }
     }

@@ -1,0 +1,86 @@
+# Schemas created with CREATE SCHEMA and the objects in them.
+
+@database :memory:
+
+test create-schema-rejects-names-that-start-with-pg {
+    CREATE SCHEMA pg_app;
+}
+expect error {
+    unacceptable schema name "pg_app"
+}
+
+test drop-schema-with-objects-errors {
+    CREATE SCHEMA IF NOT EXISTS drop_needs_cascade;
+    DROP SCHEMA drop_needs_cascade CASCADE;
+    CREATE SCHEMA drop_needs_cascade;
+    CREATE TABLE drop_needs_cascade.t (x int);
+    DROP SCHEMA drop_needs_cascade;
+}
+expect error {
+    because other objects depend on it
+}
+
+test drop-schema-public-with-only-views-errors {
+    CREATE VIEW v AS SELECT 1 AS x;
+    DROP SCHEMA public;
+}
+expect error {
+    because other objects depend on it
+}
+
+test drop-schema-cascade-drops-its-objects {
+    CREATE SCHEMA IF NOT EXISTS drop_cascade;
+    DROP SCHEMA drop_cascade CASCADE;
+    CREATE SCHEMA drop_cascade;
+    CREATE TABLE drop_cascade.t (x int);
+    CREATE VIEW drop_cascade.v AS SELECT x FROM drop_cascade.t;
+    CREATE SEQUENCE drop_cascade.s;
+    DROP SCHEMA drop_cascade CASCADE;
+    CREATE SCHEMA drop_cascade;
+    CREATE TABLE drop_cascade.t (x int);
+    CREATE VIEW drop_cascade.v AS SELECT x FROM drop_cascade.t;
+    CREATE SEQUENCE drop_cascade.s;
+    SELECT count(*) FROM drop_cascade.v;
+}
+expect {
+    0
+}
+
+test drop-schema-public-cascade-drops-its-objects {
+    CREATE TABLE t (x int);
+    CREATE VIEW v AS SELECT x FROM t;
+    CREATE SEQUENCE s;
+    DROP SCHEMA public CASCADE;
+    CREATE SCHEMA IF NOT EXISTS public;
+    CREATE TABLE t (x int);
+    CREATE VIEW v AS SELECT x FROM t;
+    CREATE SEQUENCE s;
+    SELECT count(*) FROM v;
+}
+expect {
+    0
+}
+
+test create-schema-creates-its-elements-in-the-new-schema {
+    CREATE SCHEMA IF NOT EXISTS create_elements;
+    DROP SCHEMA create_elements CASCADE;
+    CREATE SCHEMA create_elements
+        CREATE VIEW v AS SELECT a FROM t
+        CREATE TABLE t (a int)
+        CREATE INDEX t_a ON t (a)
+        CREATE SEQUENCE seq;
+    INSERT INTO create_elements.t VALUES (nextval('create_elements.seq') + 41);
+    SELECT a FROM create_elements.v;
+    SHOW search_path;
+}
+expect {
+    42
+    "$user", public
+}
+
+test create-schema-rejects-elements-in-another-schema {
+    CREATE SCHEMA create_elsewhere CREATE TABLE public.t (a int);
+}
+expect error {
+    different from the one being created
+}

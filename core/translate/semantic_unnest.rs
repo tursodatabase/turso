@@ -40,7 +40,11 @@ pub(crate) fn unnest_correlated_subqueries(
     document: Arc<HirDocument>,
     schema: &Schema,
     params: &CostModelParams,
+    mode: crate::SubqueryUnnestingMode,
 ) -> Result<(Arc<HirDocument>, Vec<hir::Parameter>)> {
+    if mode == crate::SubqueryUnnestingMode::Disabled {
+        return Ok((document, Vec::new()));
+    }
     let candidates = queries_innermost_first(&document)
         .into_iter()
         .flat_map(|query| {
@@ -87,7 +91,8 @@ pub(crate) fn unnest_correlated_subqueries(
         // Equal work is better without one subquery call per outer row,
         // and a block with a FULL join whose correlated
         // subqueries all became joins always keeps that form.
-        if complete_full_join_rewrite(&rewritten, block)
+        if mode == crate::SubqueryUnnestingMode::Forced
+            || complete_full_join_rewrite(&rewritten, block)
             || matches!(
                 (original_cost, rewritten_cost),
                 (Some(original), Some(rewritten)) if rewritten <= original

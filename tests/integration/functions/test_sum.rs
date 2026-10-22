@@ -1,4 +1,5 @@
 use crate::common::{limbo_exec_rows_fallible, sqlite_exec_rows, ExecRows, TempDatabase};
+use asserting::prelude::*;
 use turso_core::LimboError;
 
 #[turso_macros::test(mvcc)]
@@ -22,13 +23,7 @@ fn sum_errors_on_integer_overflow(tmp_db: TempDatabase) {
         vec![(9223372036854775807i64,)],
         "limbo mismatch"
     );
-    assert_eq!(
-        sqlite_before_overflow,
-        vec![vec![rusqlite::types::Value::Integer(
-            9223372036854775807i64
-        )]],
-        "sqlite mismatch"
-    );
+    assert_that!(sqlite_before_overflow).is_equal_to(vec![row![9223372036854775807i64]]);
 
     conn.execute("INSERT INTO t VALUES (1)").unwrap();
     sqlite_exec_rows(&sqlite_conn, "INSERT INTO t VALUES (1)");

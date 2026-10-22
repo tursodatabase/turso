@@ -16,6 +16,9 @@ pub struct GeneratedStatement {
     pub mutates_data: bool,
     pub has_unordered_limit: bool,
     pub unordered_limit_reason: Option<String>,
+    /// The generator added an outer-column dependency to a subquery, so the
+    /// forced-rewrite and disabled-rewrite plans should return the same result.
+    pub check_unnesting_invariant: bool,
 }
 
 impl std::fmt::Display for GeneratedStatement {
@@ -34,10 +37,9 @@ pub enum GeneratorKind {
     SqlGenProp,
 }
 
-/// A named mix of top-level statement weights. Each profile stresses a
-/// different part of the engine so CI can cover several statement mixes
-/// instead of the single default distribution. Profiles are static, so a
-/// failing run reproduces from its seed once the same profile is selected.
+/// A named workload mix. Each profile stresses a different part of the engine
+/// by changing statement weights and, when needed, SELECT generation. Profiles
+/// are static, so a failing run reproduces from its seed and profile.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, clap::ValueEnum)]
 pub enum WeightProfile {
     /// The general-purpose mix: mostly reads and writes, a little DDL.
@@ -49,6 +51,10 @@ pub enum WeightProfile {
     Triggers,
     /// Heavy insert/update/delete to stress constraint and conflict paths.
     Writes,
+    /// SELECT-heavy workload with every supported correlated subquery rewrite.
+    CorrelatedSubqueries,
+    /// SELECT-heavy workload with chained joins of every join type.
+    Joins,
 }
 
 impl WeightProfile {
@@ -89,6 +95,63 @@ impl WeightProfile {
             WeightProfile::Ddl => base(15, 20, 10, 10, 20, 12, 20, 15, 10, 5, 5, 3),
             WeightProfile::Triggers => base(10, 25, 25, 20, 8, 3, 3, 5, 2, 2, 30, 10),
             WeightProfile::Writes => base(10, 35, 30, 20, 5, 2, 3, 5, 2, 1, 5, 3),
+            WeightProfile::CorrelatedSubqueries => base(80, 8, 8, 4, 2, 1, 1, 1, 1, 1, 1, 1),
+            // Keep this profile on reads, inserts, and schema creation. Unrelated
+            // UPDATE or DELETE failures must not stop a fixed JOIN campaign.
+            // Use fewer inserts because each row can multiply a chained join.
+            WeightProfile::Joins => base(80, 4, 0, 0, 3, 0, 0, 2, 0, 0, 0, 0),
+        }
+    }
+
+    fn configure_policy(self, policy: &mut Policy) {
+        policy.select_config.join_config.join_probability = 0.25;
+
+        if self == WeightProfile::CorrelatedSubqueries {
+            let config = &mut policy.select_config;
+            config.subquery_correlation_probability = 1.0;
+            config.subquery_aggregate_probability = 1.0;
+            config.subquery_group_by_probability = 0.0;
+            config.subquery_order_by_probability = 0.0;
+            config.subquery_distinct_probability = 0.0;
+            config.cte_probability = 0.0;
+            config.compound_probability = 0.0;
+            config.expression_count_range = 1..=2;
+
+            policy.max_expr_depth = 2;
+            policy.max_subquery_depth = 1;
+            policy.max_case_branches = 1;
+            policy.max_in_list_size = 3;
+            policy.max_order_by_items = 2;
+            policy.max_group_by_items = 2;
+            policy.expr_weights.case_expr = 0;
+            policy.expr_weights.subquery = 20;
+            policy.expr_weights.in_subquery = 20;
+            policy.expr_weights.exists = 20;
+            policy.expr_config.in_subquery_negation_probability = 0.0;
+            policy.expr_config.exists_negation_probability = 0.5;
+            policy.literal_config.string_max_len = 20;
+            policy.literal_config.blob_max_size = 16;
+        }
+
+        if self == WeightProfile::Joins {
+            // Multi-table joins multiply their input rows. Keep each insert
+            // small so one large result does not stop the join campaign.
+            policy.insert_config.max_rows = 1;
+            policy.max_tables = 4;
+            let config = &mut policy.select_config;
+            config.join_config.join_probability = 1.0;
+            config.join_config.max_joins = 3;
+            config.join_config.join_type_weights.inner = 25;
+            config.join_config.join_type_weights.left = 25;
+            config.join_config.join_type_weights.right = 25;
+            config.join_config.join_type_weights.full = 25;
+            config.join_config.join_type_weights.cross = 5;
+            config.join_config.natural_join_probability = 0.2;
+            config.join_config.join_constraint_probability = 0.85;
+            config.join_config.using_probability = 0.35;
+            config.join_config.equi_join_probability = 0.5;
+            config.join_config.self_join_probability = 0.25;
+            config.join_config.parenthesized_group_probability = 0.3;
         }
     }
 }
@@ -148,15 +211,35 @@ impl SqlGenBackend {
         window_function_probability: f64,
         profile: WeightProfile,
     ) -> Self {
+        Self::new_with_options(seed, window_function_probability, profile, false)
+    }
+
+    pub fn new_with_options(
+        seed: u64,
+        window_function_probability: f64,
+        profile: WeightProfile,
+        ivm: bool,
+    ) -> Self {
         let ctx = sql_gen::Context::new_with_seed(seed);
-        let stmt_weights = profile.stmt_weights();
+        let mut stmt_weights = profile.stmt_weights();
+        if ivm {
+            // Schema changes under a table with dependent materialized views
+            // diverge from SQLite by design: Turso rejects ALTER TABLE
+            // outright, and DROP TABLE would orphan the view. Disable both so
+            // IVM runs exercise maintenance, not that asymmetry.
+            stmt_weights.drop_table = 0;
+            stmt_weights.alter_table = 0;
+        }
         tracing::info!("Statement weight profile {profile:?}: {stmt_weights:?}");
         let mut policy = Policy::default()
             .with_stmt_weights(stmt_weights)
             .with_function_config(
-                sql_gen::FunctionConfig::deterministic().disable(&["LIKELY", "UNLIKELY"]),
+                sql_gen::FunctionConfig::deterministic()
+                    .disable(&["LIKELY", "UNLIKELY"])
+                    .without_order_dependent_aggregates(),
             );
         policy.select_config.require_order_by_with_limit = true;
+        profile.configure_policy(&mut policy);
         policy.select_config.window_function_probability = window_function_probability;
         if window_function_probability > 0.0 {
             policy.select_config.window_frame_policy = WindowFramePolicy::Exclude;
@@ -227,12 +310,14 @@ impl SqlGenerator for SqlGenBackend {
             .unordered_limit_reason()
             .or_else(|| stmt.non_unique_order_by_reason(schema))
             .map(str::to_string);
+        let check_unnesting_invariant = self.ctx.take_generated_correlated_subquery();
         Ok(GeneratedStatement {
             sql,
             is_ddl,
             mutates_data,
             has_unordered_limit,
             unordered_limit_reason,
+            check_unnesting_invariant,
         })
     }
 
@@ -250,6 +335,10 @@ pub struct PropTestBackend {
 
 impl PropTestBackend {
     pub fn new(seed_bytes: [u8; 32], recursive_cte_focus: bool) -> Self {
+        Self::new_with_options(seed_bytes, recursive_cte_focus, false)
+    }
+
+    pub fn new_with_options(seed_bytes: [u8; 32], recursive_cte_focus: bool, ivm: bool) -> Self {
         let test_runner = TestRunner::new_with_rng(
             proptest::test_runner::Config::default(),
             proptest::test_runner::TestRng::from_seed(
@@ -263,6 +352,12 @@ impl PropTestBackend {
             .expression
             .base
             .order_by_allow_integer_positions = false;
+        profile
+            .generation
+            .expression
+            .base
+            .function_profile
+            .allow_order_dependent_aggregates = false;
         if recursive_cte_focus {
             profile = profile.read_only();
             profile.generation.expression = profile.generation.expression.clone().simple();
@@ -273,6 +368,12 @@ impl PropTestBackend {
             cte.cte_count_range = 1..=3;
             cte.recursive_weight = 100;
             cte.non_recursive_weight = 0;
+        }
+        if ivm {
+            // See SqlGenBackend::new_with_options: DROP/ALTER TABLE on base tables of
+            // materialized views diverge from SQLite by design.
+            profile.drop_table_weight = 0;
+            profile.alter_table = sql_gen_prop::WeightedProfile::new(0);
         }
         Self {
             test_runner,
@@ -327,6 +428,7 @@ impl SqlGenerator for PropTestBackend {
             mutates_data,
             has_unordered_limit,
             unordered_limit_reason: None,
+            check_unnesting_invariant: false,
         })
     }
 }
@@ -417,6 +519,28 @@ mod tests {
     }
 
     #[test]
+    fn aggregates_that_depend_on_input_order_are_disabled() {
+        let sql_gen = SqlGenBackend::new(1);
+        assert!(
+            !sql_gen
+                .policy
+                .function_config
+                .allow_order_dependent_aggregates
+        );
+
+        let prop = PropTestBackend::new([1; 32], false);
+        assert!(
+            !prop
+                .profile
+                .generation
+                .expression
+                .base
+                .function_profile
+                .allow_order_dependent_aggregates
+        );
+    }
+
+    #[test]
     fn disabling_alter_actions_leaves_add_column_enabled() {
         let mut policy = Policy::default();
         disable_alter_actions_that_revalidate_schema(&mut policy);
@@ -459,18 +583,32 @@ mod tests {
     }
 
     #[test]
-    fn every_profile_can_read_and_write() {
-        // A profile that never selects, inserts, updates, or deletes would
-        // generate an empty or read-only workload and quietly cover nothing.
+    fn every_profile_can_select_and_insert() {
+        // SELECT exercises each theme. INSERT gives SELECT statements rows to read.
         for profile in [
             WeightProfile::Balanced,
             WeightProfile::Ddl,
             WeightProfile::Triggers,
             WeightProfile::Writes,
+            WeightProfile::CorrelatedSubqueries,
+            WeightProfile::Joins,
         ] {
             let w = profile.stmt_weights();
             assert!(w.select > 0, "{profile:?} never selects");
             assert!(w.insert > 0, "{profile:?} never inserts");
+        }
+    }
+
+    #[test]
+    fn general_profiles_can_update_and_delete() {
+        for profile in [
+            WeightProfile::Balanced,
+            WeightProfile::Ddl,
+            WeightProfile::Triggers,
+            WeightProfile::Writes,
+            WeightProfile::CorrelatedSubqueries,
+        ] {
+            let w = profile.stmt_weights();
             assert!(w.update > 0, "{profile:?} never updates");
             assert!(w.delete > 0, "{profile:?} never deletes");
         }
@@ -487,6 +625,47 @@ mod tests {
         assert!(
             triggers.create_trigger > WeightProfile::Balanced.stmt_weights().create_trigger,
             "triggers profile should create triggers more often than balanced"
+        );
+
+        let mut balanced = Policy::default();
+        WeightProfile::Balanced.configure_policy(&mut balanced);
+        let mut joins = Policy::default();
+        WeightProfile::Joins.configure_policy(&mut joins);
+        let balanced_join_weights = &balanced.select_config.join_config.join_type_weights;
+        assert!(
+            balanced.select_config.join_config.join_probability > 0.0,
+            "balanced profile should generate joins"
+        );
+        assert!(
+            balanced_join_weights.right > 0 && balanced_join_weights.full > 0,
+            "balanced profile should generate right and full joins"
+        );
+        assert!(
+            joins.select_config.join_config.join_probability
+                > balanced.select_config.join_config.join_probability,
+            "joins profile should generate joins more often than balanced"
+        );
+    }
+
+    #[test]
+    fn join_profile_disables_order_dependent_aggregates() {
+        let generator = SqlGenBackend::new_with_window_weight(1, 0.0, WeightProfile::Joins);
+        assert!(
+            !generator
+                .policy
+                .function_config
+                .allow_order_dependent_aggregates
+        );
+    }
+
+    #[test]
+    fn join_profile_limits_table_growth() {
+        let generator = SqlGenBackend::new_with_window_weight(1, 0.0, WeightProfile::Joins);
+
+        assert_eq!(generator.policy.insert_config.max_rows, 1);
+        assert!(
+            WeightProfile::Joins.stmt_weights().insert
+                < WeightProfile::Balanced.stmt_weights().insert
         );
     }
 }

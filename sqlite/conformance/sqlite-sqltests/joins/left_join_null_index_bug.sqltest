@@ -25,6 +25,28 @@ expect {
 2||
 }
 
+# The first LEFT JOIN can replace a declared NOT NULL value with NULL. The
+# second join must not start an index range with that synthetic NULL value.
+@cross-check-integrity
+test left-join-range-seek-stops-on-null-extended-key {
+    CREATE TABLE range_left(seed INTEGER);
+    INSERT INTO range_left VALUES(1);
+    CREATE TABLE range_middle(key INTEGER NOT NULL);
+    CREATE TABLE range_right(value INTEGER);
+    CREATE INDEX range_right_value ON range_right(value);
+    INSERT INTO range_right VALUES(1);
+
+    SELECT quote(range_left.seed), quote(range_middle.key),
+           quote(range_right.value)
+      FROM range_left
+      LEFT JOIN range_middle ON true
+      LEFT JOIN range_right INDEXED BY range_right_value
+        ON range_middle.key<=range_right.value;
+}
+expect {
+    1|NULL|NULL
+}
+
 setup left-join-null-index-bug-composite-index-schema {
     CREATE TABLE a(id INTEGER PRIMARY KEY);
     CREATE TABLE b(id INTEGER PRIMARY KEY, a_id INTEGER);
@@ -48,4 +70,109 @@ test left-join-null-index-bug-composite-key {
 expect {
 1|1|
 2||
+}
+
+# The matrices below compare against SQLite. Row seed=3 has no match in m or p,
+# so every key from m or p is NULL for it, even when the column is NOT NULL,
+# a rowid alias, or an implicit rowid.
+setup null_extended_range_keys {
+    CREATE TABLE l(seed INT);
+    CREATE TABLE m(id INTEGER PRIMARY KEY, k INTEGER NOT NULL, u INTEGER NOT NULL UNIQUE, seed INT);
+    CREATE TABLE p(seed INT, w INT);
+    CREATE TABLE r(value INTEGER, tag TEXT);
+    CREATE INDEX r_value ON r(value);
+    CREATE TABLE rk(id INTEGER PRIMARY KEY, tag TEXT);
+    INSERT INTO l VALUES (1), (2), (3);
+    INSERT INTO m VALUES (1, 2, 20, 1), (2, 4, 40, 2);
+    INSERT INTO p VALUES (1, 5), (2, 7);
+    INSERT INTO r VALUES (NULL, 'n'), (0, 'a'), (2, 'b'), (4, 'c'), (6, 'd'), (40, 'e');
+    INSERT INTO rk VALUES (1, 'a'), (2, 'b'), (4, 'c'), (20, 'd'), (40, 'e');
+}
+
+@setup null_extended_range_keys
+@var key { m.k | m.id | m.rowid | m.u | p.rowid | p.w }
+@var op { < | <= | > | >= | = | IS }
+@var join { LEFT JOIN | JOIN }
+matrix index-range-seek-on-null-extended-key {
+    SELECT l.seed, quote(m.k), quote(p.w), r.tag
+      FROM l LEFT JOIN m ON m.seed = l.seed LEFT JOIN p ON p.seed = l.seed
+      $join r INDEXED BY r_value ON $key $op r.value
+     ORDER BY 1, 2, 3, 4;
+}
+
+@setup null_extended_range_keys
+@var key { m.k | m.id | m.rowid | m.u | p.rowid | p.w }
+@var op { < | <= | > | >= | = | IS }
+@var join { LEFT JOIN | JOIN }
+matrix rowid-range-seek-on-null-extended-key {
+    SELECT l.seed, quote(m.k), quote(p.w), rk.tag
+      FROM l LEFT JOIN m ON m.seed = l.seed LEFT JOIN p ON p.seed = l.seed
+      $join rk ON $key $op rk.id
+     ORDER BY 1, 2, 3, 4;
+}
+
+@setup null_extended_range_keys
+@var cond {
+    r.value BETWEEN m.k AND m.k + 10 | r.value BETWEEN 0 AND m.k |
+    r.value IN (m.k, m.u) | r.value > m.k AND r.value < m.u |
+    r.value >= coalesce(m.k, 0) | r.value <= m.id + 1 |
+    r.value > p.rowid AND r.value <= p.w | r.value >= m.k OR r.value IS NULL
+}
+@var join { LEFT JOIN | JOIN }
+matrix compound-range-on-null-extended-key {
+    SELECT l.seed, quote(m.k), r.tag
+      FROM l LEFT JOIN m ON m.seed = l.seed LEFT JOIN p ON p.seed = l.seed
+      $join r INDEXED BY r_value ON $cond
+     ORDER BY 1, 2, 3;
+}
+
+@setup null_extended_range_keys
+@var sub {
+    SELECT count(*) FROM r INDEXED BY r_value WHERE r.value >= m.k |
+    SELECT count(*) FROM r INDEXED BY r_value WHERE r.value <= m.id |
+    SELECT count(*) FROM r INDEXED BY r_value WHERE r.value > m.rowid |
+    SELECT count(*) FROM r INDEXED BY r_value WHERE r.value < p.rowid |
+    SELECT min(r.tag) FROM r INDEXED BY r_value WHERE r.value BETWEEN m.k AND m.u |
+    SELECT count(*) FROM r INDEXED BY r_value WHERE r.value = m.k |
+    SELECT count(*) FROM rk WHERE rk.id >= m.k |
+    SELECT max(rk.tag) FROM rk WHERE rk.id < p.rowid |
+    SELECT (SELECT count(*) FROM r INDEXED BY r_value WHERE r.value > m.k)
+}
+matrix correlated-range-seek-on-null-extended-outer-key {
+    SELECT l.seed, ($sub)
+      FROM l LEFT JOIN m ON m.seed = l.seed LEFT JOIN p ON p.seed = l.seed
+     ORDER BY 1;
+}
+
+@setup null_extended_range_keys
+@var pred {
+    EXISTS (SELECT 1 FROM r INDEXED BY r_value WHERE r.value >= m.k) |
+    NOT EXISTS (SELECT 1 FROM r INDEXED BY r_value WHERE r.value >= m.k) |
+    EXISTS (SELECT 1 FROM rk WHERE rk.id > m.id) |
+    NOT EXISTS (SELECT 1 FROM rk WHERE rk.id <= p.rowid) |
+    l.seed IN (SELECT r.value FROM r INDEXED BY r_value WHERE r.value < m.u)
+}
+matrix correlated-range-seek-in-where {
+    SELECT l.seed
+      FROM l LEFT JOIN m ON m.seed = l.seed LEFT JOIN p ON p.seed = l.seed
+     WHERE $pred
+     ORDER BY 1;
+}
+
+@setup null_extended_range_keys
+@var from {
+    l LEFT JOIN m ON m.seed = l.seed |
+    m RIGHT JOIN l ON m.seed = l.seed |
+    l LEFT JOIN (m JOIN p USING(seed)) ON m.seed = l.seed |
+    l LEFT JOIN m ON m.seed = l.seed AND m.k > 3 |
+    l LEFT JOIN m ON 0
+}
+@var seek {
+    LEFT JOIN r INDEXED BY r_value ON m.k <= r.value |
+    LEFT JOIN r INDEXED BY r_value ON r.value BETWEEN m.id AND m.u |
+    LEFT JOIN rk ON rk.id > m.rowid |
+    JOIN r INDEXED BY r_value ON m.u >= r.value
+}
+matrix range-seek-after-each-null-extension {
+    SELECT l.seed, quote(m.k), quote(r.tag) FROM $from $seek ORDER BY 1, 2, 3;
 }

@@ -77,59 +77,54 @@ info:
   database: ':memory:'
 ---
 QUERY PLAN
-|--SCAN run_lengths
-|  |--SCAN run_ids
-|  |  `--SCAN run_boundaries
-|  |     `--SCAN prior_days
-|  |        |--SCAN (subquery-0)
-|  |        |  |--COMPOUND QUERY
-|  |        |  |  |--LEFT-MOST SUBQUERY
-|  |        |  |  |  `--SCAN user_messages
-|  |        |  |  |--UNION ALL
-|  |        |  |  |  `--SCAN session_starts
-|  |        |  |  |--UNION ALL
-|  |        |  |  |  `--SCAN observed_items
-|  |        |  |  |--UNION ALL
-|  |        |  |  |  `--SCAN observed_items
-|  |        |  |  |--UNION ALL
-|  |        |  |  |  `--SCAN observed_items
-|  |        |  |  `--UNION ALL
-|  |        |  |     `--SCAN journal_entries
-|  |        |  |--COMPOUND QUERY
-|  |        |  |  |--LEFT-MOST SUBQUERY
-|  |        |  |  |--UNION ALL
-|  |        |  |  |--UNION ALL
-|  |        |  |  |--UNION ALL
-|  |        |  |  |--UNION ALL
-|  |        |  |  `--UNION ALL
-|  |        |  |--COMPOUND QUERY
-|  |        |  |  |--LEFT-MOST SUBQUERY
-|  |        |  |  |--UNION ALL
-|  |        |  |  |--UNION ALL
-|  |        |  |  |--UNION ALL
-|  |        |  |  |--UNION ALL
-|  |        |  |  `--UNION ALL
-|  |        |  `--COMPOUND QUERY
-|  |        |     |--LEFT-MOST SUBQUERY
-|  |        |     |--UNION ALL
-|  |        |     |--UNION ALL
-|  |        |     |--UNION ALL
-|  |        |     |--UNION ALL
-|  |        |     `--UNION ALL
-|  |        |--USE HASH TABLE FOR DISTINCT
-|  |        |--USE SORTER FOR ORDER BY
-|  |        |--SCAN signal_days AS d1
-|  |        |--CORRELATED SCALAR SUBQUERY 1
-|  |        |  `--SEARCH d2 USING INDEX ephemeral_subquery_s8 (signal_day<?)
-|  |        |     |--USE HASH TABLE FOR DISTINCT
-|  |        |     |--USE SORTER FOR ORDER BY
-|  |        |     |--USE HASH TABLE FOR DISTINCT
-|  |        |     `--USE SORTER FOR ORDER BY
-|  |        `--CORRELATED SCALAR SUBQUERY 3
-|  `--USE SORTER FOR GROUP BY
-`--SCALAR SUBQUERY 2
+|--SCALAR SUBQUERY 1
+|  |--SCALAR SUBQUERY 2
+|  |  `--SCAN signal_days
+|  |     |--SCAN (subquery-0)
+|  |     |  `--COMPOUND QUERY
+|  |     |     |--LEFT-MOST SUBQUERY
+|  |     |     |  `--SCAN user_messages
+|  |     |     |--UNION ALL
+|  |     |     |  `--SCAN session_starts
+|  |     |     |--UNION ALL
+|  |     |     |  `--SCAN observed_items
+|  |     |     |--UNION ALL
+|  |     |     |  `--SCAN observed_items
+|  |     |     |--UNION ALL
+|  |     |     |  `--SCAN observed_items
+|  |     |     `--UNION ALL
+|  |     |        `--SCAN journal_entries
+|  |     |--USE HASH TABLE FOR DISTINCT
+|  |     `--USE SORTER FOR ORDER BY
+|  |--SCAN (subquery-0)
+|  |  `--COMPOUND QUERY
+|  |     |--LEFT-MOST SUBQUERY
+|  |     |  `--SCAN user_messages
+|  |     |--UNION ALL
+|  |     |  `--SCAN session_starts
+|  |     |--UNION ALL
+|  |     |  `--SCAN observed_items
+|  |     |--UNION ALL
+|  |     |  `--SCAN observed_items
+|  |     |--UNION ALL
+|  |     |  `--SCAN observed_items
+|  |     `--UNION ALL
+|  |        `--SCAN journal_entries
+|  |--USE HASH TABLE FOR DISTINCT
+|  |--USE SORTER FOR ORDER BY
+|  `--SCAN run_ids
+|     `--SCAN window_subquery_0
+|        `--SCAN run_boundaries
+|           `--SCAN prior_days
+|              |--SCAN signal_days AS d1
+|              `--CORRELATED SCALAR SUBQUERY 3
+|                 `--SEARCH d2 USING INDEX ephemeral_subquery_t88 (signal_day<?)
+`--SCAN run_lengths
    |--SCAN run_ids
-   `--SCALAR SUBQUERY 4
-      `--SCAN signal_days
-         |--USE HASH TABLE FOR DISTINCT
-         `--USE SORTER FOR ORDER BY
+   |  `--SCAN window_subquery_0
+   |     `--SCAN run_boundaries
+   |        `--SCAN prior_days
+   |           |--SCAN signal_days AS d1
+   |           `--CORRELATED SCALAR SUBQUERY 4
+   |              `--SEARCH d2 USING INDEX ephemeral_subquery_t62 (signal_day<?)
+   `--USE SORTER FOR GROUP BY

@@ -16,7 +16,7 @@ use crate::translate::{
     semantic_lowering::{format_unique_violation_desc, PlannedSelect, ScanValue},
 };
 use crate::vdbe::builder::ProgramBuilderOpts;
-use crate::vdbe::insn::{to_u32, CmpInsFlags, Cookie};
+use crate::vdbe::insn::{to_u32, ClearBtreeCount, CmpInsFlags, Cookie};
 use crate::{bail_parse_error, CaptureDataChangesExt, LimboError, MAIN_DB_ID, TEMP_DB_ID};
 use crate::{
     schema::{
@@ -44,7 +44,7 @@ fn canonical_create_index_sql(stmt: &ast::Stmt) -> String {
     // Strip that qualifier before storing SQL in sqlite_schema so the schema text remains valid
     // when the same database is reopened or attached under a different alias.
     // e.g. CREATE INDEX aux.idx1 ON t1 (name) -> CREATE INDEX idx1 ON t1 (name)
-    idx_name.db_name = None;
+    idx_name.namespace = None;
     canonical_stmt.to_string()
 }
 
@@ -102,7 +102,7 @@ pub fn translate_create_index(
 
     let original_idx_name = idx_name;
     let original_tbl_name = tbl_name;
-    let database_id = if original_idx_name.db_name.is_some() {
+    let database_id = if original_idx_name.namespace.is_some() {
         catalog.resolve_database_id(&original_idx_name)?
     } else {
         catalog.resolve_existing_table_database_id(original_tbl_name.as_str())?
@@ -134,17 +134,21 @@ pub fn translate_create_index(
         }
         crate::bail_parse_error!("index {} already exists", original_idx_name.name.as_str());
     }
+    // A materialized view stores its rows in a table btree, so the table
+    // lookup below would find it; its maintenance writes know nothing of
+    // secondary indexes, so an index on it would go stale. Reject it like a
+    // plain view, before the lookup.
+    if catalog.with_schema(database_id, |s| {
+        s.get_view(&tbl_name).is_some() || s.is_materialized_view(&tbl_name)
+    }) {
+        crate::bail_parse_error!("views may not be indexed");
+    }
     let table = catalog.with_schema(database_id, |s| s.get_table(&tbl_name));
     let Some(table) = table else {
-        if catalog.with_schema(database_id, |s| {
-            s.get_view(&tbl_name).is_some() || s.is_materialized_view(&tbl_name)
-        }) {
-            crate::bail_parse_error!("views may not be indexed");
-        }
         // The index's target table always lives in the index's own database,
         // so SQLite qualifies the missing table with that database name.
         let db_name = catalog
-            .database_name_by_index(database_id)
+            .namespace_name(database_id)
             .unwrap_or_else(|| "main".to_string());
         crate::bail_parse_error!("no such table: {}.{}", db_name, original_tbl_name.as_str());
     };
@@ -265,7 +269,12 @@ pub fn translate_create_index(
         root_page: RegisterOrLiteral::Literal(sqlite_table.root_page),
         db: database_id,
     });
-    let cdc_table = prepare_cdc_if_necessary(program, catalog.main_schema(), Some(SQLITE_TABLEID))?;
+    let cdc_table = prepare_cdc_if_necessary(
+        program,
+        catalog.main_schema(),
+        database_id,
+        Some(SQLITE_TABLEID),
+    )?;
     emit_schema_entry(
         program,
         catalog,
@@ -323,7 +332,8 @@ fn hir_refill_select(
     idx: &Index,
 ) -> crate::Result<PlannedSelect> {
     let database = connection
-        .get_database_name_by_index(database_id)
+        .namespaces()
+        .name(database_id)
         .ok_or_else(|| LimboError::InternalError(format!("no database with id {database_id}")))?;
     let column = |position: usize| -> crate::Result<Expr> {
         let name = tbl.columns()[position].name.as_deref().ok_or_else(|| {
@@ -372,7 +382,7 @@ fn hir_refill_select(
 /// records have been collected and sorted. Statement journaling is therefore required
 /// around REINDEX callers so any later refill error restores the original index b-tree.
 #[allow(clippy::too_many_arguments)]
-fn emit_refill_index(
+pub(crate) fn emit_refill_index(
     program: &mut ProgramBuilder,
     connection: &Arc<crate::Connection>,
     catalog: &SemanticContext<'_>,
@@ -463,6 +473,7 @@ fn emit_refill_index(
             program.emit_insn(Insn::ClearBtree {
                 db: database_id,
                 root,
+                count: ClearBtreeCount::Nothing,
             });
         }
         program.emit_insn(Insn::OpenWrite {
@@ -613,17 +624,22 @@ fn resolve_reindex_targets(
     };
 
     let normalized_name = normalize_ident(name.name.as_str());
-    if name.db_name.is_none() {
-        if let Ok(collation) = CollationSeq::new(&normalized_name) {
-            return Ok(collect_reindex_targets_by_collation(
-                catalog, connection, collation,
-            ));
+    if name.namespace.is_none() {
+        let collation = CollationSeq::new(&normalized_name).ok();
+        if let Some(collation) = collation {
+            let targets = collect_reindex_targets_by_collation(catalog, connection, collation);
+            if !targets.is_empty() || !matches!(collation, CollationSeq::Locale(_)) {
+                return Ok(targets);
+            }
         }
         if let Some(targets) = find_reindex_table(&normalized_name, catalog, connection) {
             return Ok(targets);
         }
         if let Some(target) = find_reindex_index(&normalized_name, catalog, connection) {
             return Ok(vec![target]);
+        }
+        if collation.is_some() {
+            return Ok(Vec::new());
         }
         bail_parse_error!("unable to identify the object to be reindexed");
     }
@@ -1037,18 +1053,9 @@ pub fn resolve_index_method_parameters(
                 },
                 ast::Literal::Null => crate::Value::Null,
                 ast::Literal::String(s) => crate::Value::Text(s.into()),
-                ast::Literal::Blob(b) => crate::Value::Blob(
-                    ast::blob_literal_hex(&b)
-                        .as_bytes()
-                        .chunks_exact(2)
-                        .map(|pair| {
-                            // We assume that sqlite3-parser has already validated that
-                            // the input is valid hex string, thus unwrap is safe.
-                            let hex_byte = std::str::from_utf8(pair).unwrap();
-                            u8::from_str_radix(hex_byte, 16).unwrap()
-                        })
-                        .try_collect()?,
-                ),
+                ast::Literal::Blob(b) => {
+                    crate::Value::Blob(ast::blob_literal_bytes(&b).try_collect()?)
+                }
                 _ => bail_parse_error!("parameters must be constant literals"),
             },
             _ => bail_parse_error!("parameters must be constant literals"),
@@ -1064,11 +1071,22 @@ pub fn translate_drop_index(
     if_exists: bool,
     program: &mut ProgramBuilder,
 ) -> crate::Result<()> {
-    let database_id = catalog.resolve_existing_index_database_id(qualified_name)?;
     let idx_name = normalize_ident(qualified_name.name.as_str());
     let opts = ProgramBuilderOpts::new(5, 40, 5);
     program.extend(&opts);
 
+    // With no such index in any database the name can name, IF EXISTS
+    // does nothing.
+    let database_id = match catalog.resolve_existing_index_database_id(qualified_name) {
+        Ok(database_id) => database_id,
+        Err(_) if if_exists => return Ok(()),
+        Err(_) => {
+            return Err(crate::error::LimboError::InvalidArgument(format!(
+                "No such index: {}",
+                &idx_name
+            )))
+        }
+    };
     let schema_cookie = catalog.with_schema(database_id, |s| s.schema_version);
     program.begin_write_on_database(database_id, schema_cookie)?;
 
@@ -1112,7 +1130,12 @@ pub fn translate_drop_index(
         }
     }
 
-    let cdc_table = prepare_cdc_if_necessary(program, catalog.main_schema(), Some(SQLITE_TABLEID))?;
+    let cdc_table = prepare_cdc_if_necessary(
+        program,
+        catalog.main_schema(),
+        database_id,
+        Some(SQLITE_TABLEID),
+    )?;
 
     // According to sqlite should emit Null instruction
     // but why?
@@ -1162,7 +1185,7 @@ pub fn translate_drop_index(
         rhs: dest_reg,
         target_pc: next_label,
         flags: CmpInsFlags::default(),
-        collation: program.curr_collation(),
+        collation: Some(CollationSeq::NoCase),
     });
 
     // read type of table
@@ -1195,7 +1218,6 @@ pub fn translate_drop_index(
                 sqlite_table.columns(),
                 sqlite_schema_cursor_id,
                 row_id_reg,
-                sqlite_table.is_strict,
             ))
         } else {
             None
@@ -1224,11 +1246,12 @@ pub fn translate_drop_index(
         cursor_id: sqlite_schema_cursor_id,
         pc_if_next: loop_start_label,
         fullscan: false,
+        is_index: false,
     });
 
     program.preassign_label_to_next_insn(loop_end_label);
     if let Some((cdc_cursor_id, _)) = cdc_table {
-        emit_cdc_autocommit_commit(program, catalog, cdc_cursor_id)?;
+        emit_cdc_autocommit_commit(program, catalog, Some(cdc_cursor_id))?;
     }
 
     let current_schema_version = catalog.with_schema(database_id, |s| s.schema_version);
@@ -1370,7 +1393,7 @@ mod tests {
         };
         assert_eq!(
             idx_name
-                .db_name
+                .namespace
                 .as_ref()
                 .map(ToString::to_string)
                 .as_deref(),

@@ -167,3 +167,151 @@ test table-select-into-nested-rejected {
     SELECT * FROM (SELECT 1 INTO dst) sub;
 }
 expect error {}
+
+test table-date-arithmetic {
+    CREATE TABLE dates (a date, b date);
+    INSERT INTO dates VALUES ('2025-01-05', '2025-01-01');
+    SELECT a + 1, a - 1, a - b FROM dates;
+}
+expect {
+    2025-01-06|2025-01-04|4
+}
+
+test table-indexed-date-column-with-default {
+    CREATE TABLE dates (a int, b int, c date DEFAULT '2000-01-01');
+    INSERT INTO dates VALUES (1, 2, '2024-05-06');
+    CREATE INDEX dates_c ON dates (c);
+    SELECT c FROM dates;
+    SELECT a, c FROM dates WHERE c = '2024-05-06';
+}
+expect {
+    2024-05-06
+    1|2024-05-06
+}
+
+test table-cast-timestamp-column-to-date-and-time {
+    CREATE TABLE events (ts timestamp);
+    INSERT INTO events VALUES ('2024-01-15 10:30:00');
+    SELECT ts::date, ts::time FROM events;
+}
+expect {
+    2024-01-15|10:30:00
+}
+
+test table-check-on-smallint-column {
+    CREATE TABLE t (n smallint DEFAULT 0 CHECK (n >= 0 AND n <= 2));
+    INSERT INTO t VALUES (1) RETURNING n;
+}
+expect {
+    1
+}
+
+test table-check-on-smallint-column-rejects-value-out-of-range {
+    CREATE TABLE t (n smallint DEFAULT 0 CHECK (n >= 0 AND n <= 2));
+    INSERT INTO t VALUES (3);
+}
+expect error {}
+
+test table-check-compares-integer-types-of-different-sizes {
+    CREATE TABLE t (a smallint, b integer, c bigint, CHECK (a < b AND b < c AND c > 0));
+    INSERT INTO t VALUES (1, 2, 3);
+    SELECT a, b, c FROM t;
+}
+expect {
+    1|2|3
+}
+
+test table-delete-row-with-numeric-expression-index {
+    CREATE TABLE prices (id int PRIMARY KEY, val numeric(10,2));
+    CREATE INDEX prices_doubled ON prices ((val * 2));
+    INSERT INTO prices VALUES (1, 1.50);
+    DELETE FROM prices WHERE id = 1;
+    SELECT count(*) FROM prices;
+}
+expect {
+    0
+}
+
+test table-uuid-column-omitted-from-insert-is-null {
+    CREATE TABLE t (id int PRIMARY KEY, u uuid);
+    INSERT INTO t (id) VALUES (1);
+    SELECT count(*) FROM t WHERE u IS NULL;
+}
+expect {
+    1
+}
+
+test table-uuid-column-with-explicit-default-generates-uuid {
+    CREATE TABLE t (id int PRIMARY KEY, u uuid DEFAULT gen_random_uuid());
+    INSERT INTO t (id) VALUES (1);
+    SELECT count(*) FROM t WHERE u IS NOT NULL;
+}
+expect {
+    1
+}
+
+@setup users
+test table-insert-returning-table-star {
+    INSERT INTO users VALUES (4, 'dave', 40, false) RETURNING users.*;
+}
+expect {
+    4|dave|40|f
+}
+
+@setup users
+test table-update-returning-table-star {
+    UPDATE users SET age = age + 1 WHERE name = 'bob' RETURNING users.*;
+}
+expect {
+    2|bob|26|f
+}
+
+@setup users
+test table-delete-returning-table-star {
+    DELETE FROM users WHERE name = 'carol' RETURNING users.*;
+}
+expect {
+    3|carol|35|t
+}
+
+@setup users
+test table-returning-alias-star {
+    INSERT INTO users AS u VALUES (5, 'eve', 20, true) RETURNING u.*;
+    UPDATE users AS u SET age = 50 WHERE id = 1 RETURNING u.*;
+    DELETE FROM users u WHERE id = 5 RETURNING id, u.*;
+}
+expect {
+    5|eve|20|t
+    1|alice|50|t
+    5|5|eve|20|t
+}
+
+@setup users
+test table-returning-schema-qualified-star {
+    INSERT INTO public.users VALUES (4, 'dave', 40, false) RETURNING public.users.*;
+    UPDATE public.users SET age = 50 WHERE id = 1 RETURNING public.users.*, users.*;
+    DELETE FROM public.users WHERE id = 4 RETURNING public.users.*;
+}
+expect {
+    4|dave|40|f
+    1|alice|50|t|1|alice|50|t
+    4|dave|40|f
+}
+
+@setup users
+test table-returning-star-with-unknown-middle-name-rejected {
+    INSERT INTO users VALUES (4, 'dave', 40, false) RETURNING users.zz.*;
+}
+expect error {}
+
+@setup users
+test table-returning-star-with-other-schema-rejected {
+    INSERT INTO public.users VALUES (4, 'dave', 40, false) RETURNING pg_catalog.users.*;
+}
+expect error {}
+
+@setup users
+test table-returning-table-name-star-after-alias-rejected {
+    INSERT INTO users AS u VALUES (4, 'dave', 40, false) RETURNING users.*;
+}
+expect error {}

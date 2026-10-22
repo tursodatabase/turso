@@ -16,7 +16,10 @@ use proptest::prelude::*;
 use std::fmt;
 use strum::IntoEnumIterator;
 
-use crate::function::{FunctionCategory, FunctionDef, FunctionProfile, FunctionRegistry};
+use crate::function::{
+    FunctionCategory, FunctionDef, FunctionProfile, FunctionRegistry,
+    aggregate_result_depends_on_input_order,
+};
 use crate::generator::SqlGeneratorKind;
 use crate::profile::StatementProfile;
 use crate::schema::{ColumnDef, DataType};
@@ -1161,6 +1164,11 @@ fn function_call_expression_strategy(ctx: &ExpressionContext) -> BoxedStrategy<E
                 })
                 .filter(|f| ctx.allow_aggregates || !f.is_aggregate)
                 .filter(|f| f.is_deterministic)
+                .filter(|f| {
+                    profile.allow_order_dependent_aggregates
+                        || !f.is_aggregate
+                        || !aggregate_result_depends_on_input_order(f.name)
+                })
                 .cloned()
                 .collect();
 
@@ -1776,6 +1784,34 @@ mod tests {
             found_function,
             "Expected to generate at least one function call in 100 attempts"
         );
+    }
+
+    #[test]
+    fn function_generation_can_exclude_results_that_depend_on_input_order() {
+        use crate::schema::Schema;
+        use proptest::strategy::Strategy;
+        use proptest::test_runner::TestRunner;
+
+        let registry = FunctionRegistry::new().register_all(crate::function::aggregate_functions());
+        let function_profile = FunctionProfile {
+            allow_order_dependent_aggregates: false,
+            ..FunctionProfile::default()
+        };
+        let profile = ExpressionProfile::default().with_function_profile(function_profile);
+        let ctx = ExpressionContext::new(registry, Schema::default())
+            .with_max_depth(1)
+            .with_aggregates(true)
+            .with_profile(profile);
+        let strategy = function_call_expression_strategy(&ctx);
+        let mut runner = TestRunner::deterministic();
+
+        for _ in 0..100 {
+            let expr = strategy.new_tree(&mut runner).unwrap().current();
+            let Expression::FunctionCall { name, .. } = expr else {
+                unreachable!("function generation must return a function call");
+            };
+            assert!(!aggregate_result_depends_on_input_order(&name), "{name}");
+        }
     }
 
     #[test]

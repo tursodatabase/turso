@@ -233,7 +233,7 @@ fn process_payload(payload_group: Group) -> String {
             _ => {}
         }
     }
-    format!("{{ {variable_name_list} }}").to_string()
+    format!("{{ {variable_name_list} }}")
 }
 /// Generates the `get_description` implementation for the processed enum.
 fn generate_get_description(
@@ -310,20 +310,18 @@ pub fn register_extension(input: TokenStream) -> TokenStream {
 /// use turso_ext::{scalar, Value};
 /// #[scalar(name = "double", alias = "twice")] // you can provide an <optional> alias
 /// fn double(args: &[Value]) -> Value {
-///       let arg = args.get(0).unwrap();
-///       match arg.value_type() {
-///           ValueType::Float => {
-///               let val = arg.to_float().unwrap();
-///               Value::from_float(val * 2.0)
-///           }
-///           ValueType::Integer => {
-///               let val = arg.to_integer().unwrap();
-///               Value::from_integer(val * 2)
-///           }
-///       }
-///   } else {
-///       Value::null()
-///   }
+///     let arg = args.get(0).unwrap();
+///     match arg.value_type() {
+///         ValueType::Float => {
+///             let val = arg.to_float().unwrap();
+///             Value::from_float(val * 2.0)
+///         }
+///         ValueType::Integer => {
+///             let val = arg.to_integer().unwrap();
+///             Value::from_integer(val * 2)
+///         }
+///         _ => Value::null(),
+///     }
 /// }
 /// ```
 #[proc_macro_attribute]
@@ -523,6 +521,7 @@ pub fn derive_vtab_module(input: TokenStream) -> TokenStream {
 ///
 /// struct ExampleFile {
 ///    file: std::fs::File,
+/// }
 ///
 ///
 /// impl VfsExtension for ExampleFS {
@@ -562,6 +561,7 @@ pub fn derive_vtab_module(input: TokenStream) -> TokenStream {
 ///    // (optional) method to generate random number. Used for testing
 ///        chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string()
 ///    }
+/// }
 ///
 ///
 /// impl VfsFile for ExampleFile {
@@ -597,8 +597,7 @@ pub fn derive_vtab_module(input: TokenStream) -> TokenStream {
 ///    fn size(&self) -> i64 {
 ///      self.file.metadata().map(|m| m.len() as i64).unwrap_or(-1)
 ///   }
-///}
-///
+/// }
 ///```
 #[proc_macro_derive(VfsDerive)]
 pub fn derive_vfs_module(input: TokenStream) -> TokenStream {
@@ -763,11 +762,14 @@ fn emit_condition_assert(
     let details = details_json(&input.details);
 
     let fmt_args = details_format_args(&msg, &input.details);
+    // Without the antithesis cfg, a debug assertion must not evaluate its
+    // condition in release builds: `debug_assert!` keeps the expression
+    // inside the `if cfg!(debug_assertions)` block, so the compiler can drop
+    // it together with the check. Binding it to `__turso_cond` first would
+    // keep every condition with a fallible or non-trivial callee alive.
     let assert_call = match kind {
-        ConditionAssertKind::Assert => quote! { assert!(__turso_cond, #fmt_args); },
-        ConditionAssertKind::DebugAssert => {
-            quote! { debug_assert!(__turso_cond, #fmt_args); }
-        }
+        ConditionAssertKind::Assert => quote! { assert!(#cond, #fmt_args); },
+        ConditionAssertKind::DebugAssert => quote! { debug_assert!(#cond, #fmt_args); },
     };
     let exit_msg = quote! {
         eprint!("[antithesis] assertion failed: ");
@@ -778,9 +780,9 @@ fn emit_condition_assert(
     let env_check = antithesis_env_check();
     quote! {
         {
-            let __turso_cond = #cond;
             #[cfg(antithesis)]
             {
+                let __turso_cond = #cond;
                 #env_check
                 antithesis_sdk::assert_always_or_unreachable!(__turso_cond, #prefixed, #details);
                 if !__turso_cond {
