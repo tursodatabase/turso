@@ -162,6 +162,8 @@ Closes the database connection.
 
 # class Statement
 
+Each execution must supply every positional or named parameter. Omitting a parameter throws `RangeError: Too few parameter values were provided` instead of reusing a value from an earlier execution. Statements explicitly bound with `bind(...)` may be executed without repeating their bound arguments.
+
 ## Methods
 
 ### run([...bindParameters]) ⇒ object
