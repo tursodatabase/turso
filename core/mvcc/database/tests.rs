@@ -21048,6 +21048,7 @@ fn logical_log_offset_advances_only_after_on_log_write_complete() {
         arm: AtomicBool,
         pending: Mutex<Option<Completion>>,
         advances: AtomicU64,
+        discards: AtomicU64,
     }
     impl DeferredOnLogWriteCompleteStorage {
         fn new(inner: Arc<dyn DurableStorage>) -> Arc<Self> {
@@ -21056,7 +21057,11 @@ fn logical_log_offset_advances_only_after_on_log_write_complete() {
                 arm: AtomicBool::new(false),
                 pending: Mutex::new(None),
                 advances: AtomicU64::new(0),
+                discards: AtomicU64::new(0),
             })
+        }
+        fn discard_count(&self) -> u64 {
+            self.discards.load(Ordering::Acquire)
         }
         fn arm(&self) {
             self.arm.store(true, Ordering::Release);
@@ -21144,6 +21149,7 @@ fn logical_log_offset_advances_only_after_on_log_write_complete() {
             self.inner.advance_logical_log_offset_after_success(b)
         }
         fn discard_pending_log_write(&self) -> Result<()> {
+            self.discards.fetch_add(1, Ordering::AcqRel);
             self.inner.discard_pending_log_write()
         }
         fn restore_logical_log_state_after_recovery(&self, o: u64, c: u32) {
@@ -21291,6 +21297,46 @@ fn logical_log_offset_advances_only_after_on_log_write_complete() {
     assert_eq!(
         get_rows(&conn, "SELECT id FROM t ORDER BY id"),
         vec![vec![Value::from_i64(1)], vec![Value::from_i64(2)]]
+    );
+
+    drop(retry);
+    let advances_before = storage.advance_count();
+    let mut insert = conn
+        .prepare("INSERT INTO t VALUES (3, 'c'), (4, 'd') RETURNING id")
+        .unwrap();
+    loop {
+        match insert.step().unwrap() {
+            StepResult::Row => break,
+            StepResult::IO | StepResult::Yield => io.step().unwrap(),
+            other => panic!("unexpected step: {other:?}"),
+        }
+    }
+    let discards_before = storage.discard_count();
+    storage.arm();
+    let reset = insert.reset();
+    let pending = storage
+        .take_pending()
+        .expect("the commit inside reset() must reach on_log_write_complete");
+    assert!(!pending.finished());
+    assert_eq!(
+        storage.advance_count(),
+        advances_before,
+        "reset() must not advance the offset while on_log_write_complete is pending"
+    );
+    assert!(
+        reset.is_err(),
+        "reset() must report that it abandoned the commit"
+    );
+    assert_eq!(
+        storage.discard_count(),
+        discards_before + 1,
+        "abandoning the commit must discard its pending log write"
+    );
+    drop(insert);
+    assert_eq!(
+        get_rows(&conn, "SELECT id FROM t ORDER BY id"),
+        vec![vec![Value::from_i64(1)], vec![Value::from_i64(2)]],
+        "a commit abandoned by reset() must not publish its rows"
     );
 }
 
