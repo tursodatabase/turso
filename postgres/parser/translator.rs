@@ -5833,6 +5833,11 @@ fn reject_constraint_attributes(
     {
         return Err(not_supported("DEFERRABLE / INITIALLY DEFERRED constraints"));
     }
+    if !constraint.fk_del_set_cols.is_empty() {
+        return Err(not_supported(
+            "ON DELETE SET NULL / SET DEFAULT with a column list",
+        ));
+    }
     // An empty match type is the default, and "s" is an explicit MATCH SIMPLE.
     if !matches!(constraint.fk_matchtype.as_str(), "" | "s") {
         return Err(not_supported("MATCH FULL / MATCH PARTIAL foreign keys"));
@@ -8527,5 +8532,16 @@ mod tests {
             "MATCH FULL",
         );
         assert_translates("CREATE TABLE c (a int REFERENCES p(x) MATCH SIMPLE)");
+    }
+
+    #[test]
+    fn fail_closed_fk_delete_set_columns() {
+        assert_not_supported(
+            "CREATE TABLE c (t int, a int, FOREIGN KEY (t, a) REFERENCES p(t, a) ON DELETE SET NULL (a))",
+            "column list",
+        );
+        assert_translates(
+            "CREATE TABLE c (t int, a int, FOREIGN KEY (t, a) REFERENCES p(t, a) ON DELETE SET NULL)",
+        );
     }
 }
