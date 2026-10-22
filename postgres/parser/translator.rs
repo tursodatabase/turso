@@ -1280,6 +1280,17 @@ impl PostgreSQLTranslator {
         if view.replace {
             return Err(not_supported("CREATE OR REPLACE VIEW"));
         }
+        reject_temporary(relation, "CREATE TEMPORARY VIEW")?;
+        if !view.options.is_empty() {
+            return Err(not_supported("CREATE VIEW ... WITH (options)"));
+        }
+        if matches!(
+            pg_query::protobuf::ViewCheckOption::try_from(view.with_check_option),
+            Ok(pg_query::protobuf::ViewCheckOption::LocalCheckOption
+                | pg_query::protobuf::ViewCheckOption::CascadedCheckOption)
+        ) {
+            return Err(not_supported("CREATE VIEW ... WITH CHECK OPTION"));
+        }
 
         // Translate column aliases
         let columns: Vec<ast::IndexedColumn> = view
@@ -9166,6 +9177,23 @@ mod tests {
         assert_not_supported(
             "CREATE OR REPLACE VIEW v AS SELECT 1",
             "CREATE OR REPLACE VIEW",
+        );
+    }
+
+    #[test]
+    fn fail_closed_create_view_clauses() {
+        assert_not_supported("CREATE TEMP VIEW v AS SELECT 1", "TEMPORARY VIEW");
+        assert_not_supported(
+            "CREATE VIEW v WITH (security_barrier = true) AS SELECT 1",
+            "WITH (options)",
+        );
+        assert_not_supported(
+            "CREATE VIEW v AS SELECT a FROM t WHERE a > 0 WITH CHECK OPTION",
+            "CHECK OPTION",
+        );
+        assert_not_supported(
+            "CREATE VIEW v AS SELECT a FROM t WHERE a > 0 WITH LOCAL CHECK OPTION",
+            "CHECK OPTION",
         );
     }
 }
