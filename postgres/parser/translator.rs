@@ -755,7 +755,8 @@ impl PostgreSQLTranslator {
                         ));
                     }
                 };
-                let col = self.translate_column_def(col_def)?;
+                let mut col = self.translate_column_def(col_def)?;
+                col.col_name = ast::Name::from_string(&cmd.name);
                 ast::AlterTableBody::AlterColumn {
                     old: ast::Name::from_string(&cmd.name),
                     new: col,

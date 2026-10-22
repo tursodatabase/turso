@@ -659,6 +659,36 @@ fn test_postgres_alter_table_add_column(db: TempDatabase) {
     assert_eq!(name.value, "alice");
 }
 
+#[turso_macros::test]
+fn test_postgres_alter_column_type_preserves_name_after_reopen(db: TempDatabase) {
+    let conn = db.connect_postgres();
+    conn.execute("CREATE TABLE a (x int)").unwrap();
+    conn.execute("ALTER TABLE a ALTER COLUMN x TYPE bigint")
+        .unwrap();
+    conn.execute("INSERT INTO a VALUES (1)").unwrap();
+
+    let path = db.path.clone();
+    let io = db.io.clone();
+    drop(conn);
+    drop(db);
+
+    let db = turso_pg::open_database_with_io(
+        io,
+        path.to_str().unwrap(),
+        turso_core::OpenFlags::default(),
+        turso_core::DatabaseOpts::new(),
+    )
+    .unwrap();
+    let conn = turso_pg::Connection::connect(&db).unwrap();
+    assert_eq!(
+        conn.prepare("SELECT x FROM a")
+            .unwrap()
+            .run_collect_rows()
+            .unwrap(),
+        vec![vec![Value::from_i64(1)]]
+    );
+}
+
 #[turso_macros::test(mvcc)]
 fn test_postgres_alter_table_drop_column(db: TempDatabase) {
     let conn = db.connect_postgres();
