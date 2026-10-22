@@ -2210,6 +2210,19 @@ impl PostgreSQLTranslator {
 
         let func_name = function_name(&func_call.funcname)?;
         let func_name = func_name.as_str();
+        // Only the name and plain arguments of a function in FROM are used.
+        if func_call.func_variadic
+            || func_call.agg_star
+            || func_call.agg_distinct
+            || func_call.agg_filter.is_some()
+            || !func_call.agg_order.is_empty()
+            || func_call.agg_within_group
+            || func_call.over.is_some()
+        {
+            return Err(not_supported(
+                "VARIADIC, *, DISTINCT, ORDER BY, FILTER or OVER on a function in FROM",
+            ));
+        }
 
         // Translate arguments
         let args: Vec<Box<ast::Expr>> = func_call
@@ -9595,5 +9608,14 @@ mod tests {
     #[test]
     fn fail_closed_variadic() {
         assert_not_supported("SELECT concat(VARIADIC ARRAY['a', 'b'])", "VARIADIC");
+    }
+
+    #[test]
+    fn fail_closed_from_function_call_clauses() {
+        assert_not_supported("SELECT * FROM f(VARIADIC ARRAY[1])", "function in FROM");
+        assert_not_supported(
+            "SELECT * FROM generate_series(DISTINCT 1, 3)",
+            "function in FROM",
+        );
     }
 }
