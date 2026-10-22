@@ -2389,6 +2389,15 @@ impl PostgreSQLTranslator {
                 "a column definition list is required for functions returning \"record\"".into(),
             ));
         }
+        if range_func.coldeflist.iter().any(|col| {
+            matches!(
+                &col.node,
+                Some(pg_query::protobuf::node::Node::ColumnDef(def))
+                    if def.type_name.as_ref().is_some_and(|t| !t.typmods.is_empty())
+            )
+        }) {
+            return Err(not_supported("a type modifier in a column definition list"));
+        }
         let is_recordset = func_name.ends_with("recordset");
         let (arg_type, other_type_errors, scalar_error) = match func_name {
             "json_to_recordset" => (
@@ -10306,6 +10315,15 @@ mod tests {
         assert_translates("SELECT x.a FROM t AS x");
         assert_translates("SELECT s.p FROM (SELECT 1, 2) AS s(p, q)");
         assert_translates("SELECT g.n FROM generate_series(1, 3) AS g(n)");
+    }
+
+    #[test]
+    fn fail_closed_record_column_typmods() {
+        assert_not_supported(
+            "SELECT * FROM jsonb_to_record('{\"a\":\"abc\"}') AS r(a varchar(1))",
+            "type modifier in a column definition list",
+        );
+        assert_translates("SELECT * FROM jsonb_to_record('{\"a\":\"abc\"}') AS r(a text)");
     }
 
     #[test]
