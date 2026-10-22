@@ -1878,6 +1878,7 @@ impl PostgreSQLTranslator {
             Option<ast::CompoundOperator>,
             &pg_query::protobuf::SelectStmt,
         )> = Vec::new();
+        reject_set_operation_branch_clauses(select)?;
         Self::flatten_set_operation(select, &mut parts)?;
 
         if parts.is_empty() {
@@ -6242,6 +6243,27 @@ fn reject_into_clause(
     Ok(())
 }
 
+/// Rejects ORDER BY, LIMIT, OFFSET and WITH on the branches of a set
+/// operation. Only the outermost node's clauses are translated, so a
+/// parenthesized branch carrying its own would silently lose them.
+fn reject_set_operation_branch_clauses(
+    stmt: &pg_query::protobuf::SelectStmt,
+) -> Result<(), ParseError> {
+    for branch in [&stmt.larg, &stmt.rarg].into_iter().flatten() {
+        if !branch.sort_clause.is_empty()
+            || branch.limit_count.is_some()
+            || branch.limit_offset.is_some()
+            || branch.with_clause.is_some()
+        {
+            return Err(not_supported(
+                "ORDER BY, LIMIT, OFFSET or WITH on a parenthesized set operation branch",
+            ));
+        }
+        reject_set_operation_branch_clauses(branch)?;
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -9381,5 +9403,22 @@ mod tests {
     fn fail_closed_intersect_except_all() {
         assert_not_supported("SELECT 1 INTERSECT ALL SELECT 1", "INTERSECT ALL");
         assert_not_supported("SELECT 1 EXCEPT ALL SELECT 1", "EXCEPT ALL");
+    }
+
+    #[test]
+    fn fail_closed_set_operation_branch_clauses() {
+        assert_not_supported(
+            "(SELECT a FROM t ORDER BY a LIMIT 1) UNION ALL (SELECT a FROM u ORDER BY a LIMIT 1)",
+            "parenthesized set operation branch",
+        );
+        assert_not_supported(
+            "((SELECT 1 UNION SELECT 2) LIMIT 1) UNION SELECT 3",
+            "parenthesized set operation branch",
+        );
+        assert_not_supported(
+            "(WITH c AS (SELECT 1) SELECT * FROM c) UNION SELECT 2",
+            "parenthesized set operation branch",
+        );
+        assert_translates("SELECT a FROM t UNION SELECT a FROM u ORDER BY 1 LIMIT 2");
     }
 }
