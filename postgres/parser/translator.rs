@@ -6138,6 +6138,9 @@ fn reject_constraint_attributes(
     {
         return Err(not_supported("DEFERRABLE / INITIALLY DEFERRED constraints"));
     }
+    if constraint.is_no_inherit {
+        return Err(not_supported("NO INHERIT constraints"));
+    }
     if constraint.skip_validation {
         return Err(not_supported("NOT VALID constraints"));
     }
@@ -8836,6 +8839,18 @@ mod tests {
         assert_not_supported(
             "CREATE TABLE c (a int, CHECK (a > 0) NOT VALID)",
             "NOT VALID",
+        );
+    }
+
+    #[test]
+    fn fail_closed_no_inherit_constraints() {
+        assert_not_supported(
+            "CREATE TABLE c (a int CHECK (a > 0) NO INHERIT)",
+            "NO INHERIT",
+        );
+        assert_not_supported(
+            "CREATE TABLE c (a int, CHECK (a > 0) NO INHERIT)",
+            "NO INHERIT",
         );
     }
 }
