@@ -4338,9 +4338,20 @@ impl PostgreSQLTranslator {
         let mut max_value = None;
         let mut cycle = false;
 
+        let mut as_type = None;
         for opt_node in &seq.options {
             if let Some(pg_query::protobuf::node::Node::DefElem(elem)) = &opt_node.node {
                 match elem.defname.as_str() {
+                    "as" => {
+                        let Some(pg_query::protobuf::node::Node::TypeName(tn)) =
+                            elem.arg.as_ref().and_then(|n| n.node.as_ref())
+                        else {
+                            return Err(ParseError::ParseError(
+                                "CREATE SEQUENCE AS: missing type".into(),
+                            ));
+                        };
+                        as_type = Some(extract_type_name_from_typename(tn)?);
+                    }
                     "start" => {
                         start = extract_def_elem_int(elem);
                     }
@@ -4378,6 +4389,33 @@ impl PostgreSQLTranslator {
                     }
                     _ => {} // ignore other unknown options
                 }
+            }
+        }
+
+        // AS smallint/integer narrows the default bound in the sequence's
+        // direction; bigint is the default range.
+        if let Some(as_type) = as_type {
+            let (type_min, type_max, type_name) = match as_type.to_lowercase().as_str() {
+                "int2" | "smallint" => (i16::MIN as i64, i16::MAX as i64, "smallint"),
+                "int4" | "integer" | "int" => (i32::MIN as i64, i32::MAX as i64, "integer"),
+                "int8" | "bigint" => (i64::MIN, i64::MAX, "bigint"),
+                other => {
+                    return Err(ParseError::ParseError(format!(
+                        "CREATE SEQUENCE AS {other} is not supported"
+                    )))
+                }
+            };
+            for (option, value) in [("MINVALUE", min_value), ("MAXVALUE", max_value)] {
+                if let Some(value) = value.filter(|v| !(type_min..=type_max).contains(v)) {
+                    return Err(ParseError::ParseError(format!(
+                        "{option} ({value}) is out of range for sequence data type {type_name}"
+                    )));
+                }
+            }
+            if increment.unwrap_or(1) > 0 {
+                max_value.get_or_insert(type_max);
+            } else {
+                min_value.get_or_insert(type_min);
             }
         }
 
@@ -6075,6 +6113,54 @@ fn drop_object_type_name(obj_type: pg_query::protobuf::ObjectType) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn create_sequence_as_type_bounds_the_range() {
+        let bounds = |sql: &str| {
+            let stmt = PostgreSQLTranslator::new()
+                .translate(&crate::parse(sql).unwrap())
+                .unwrap();
+            let ast::Stmt::CreateSequence {
+                min_value,
+                max_value,
+                ..
+            } = stmt
+            else {
+                panic!("expected CREATE SEQUENCE, got {stmt:?}");
+            };
+            (min_value, max_value)
+        };
+        // pg_dump emits AS integer for serial sequences.
+        assert_eq!(
+            bounds("CREATE SEQUENCE s AS integer START WITH 1"),
+            (None, Some(i32::MAX as i64))
+        );
+        assert_eq!(
+            bounds("CREATE SEQUENCE s AS smallint INCREMENT BY -1"),
+            (Some(i16::MIN as i64), None)
+        );
+        assert_eq!(
+            bounds("CREATE SEQUENCE s AS integer MAXVALUE 10"),
+            (None, Some(10))
+        );
+        assert_eq!(
+            bounds("CREATE SEQUENCE s AS bigint"),
+            (None, Some(i64::MAX))
+        );
+        let err = PostgreSQLTranslator::new()
+            .translate(&crate::parse("CREATE SEQUENCE s AS smallint MAXVALUE 100000").unwrap())
+            .unwrap_err()
+            .to_string();
+        assert_eq!(
+            err,
+            "MAXVALUE (100000) is out of range for sequence data type smallint"
+        );
+        let err = PostgreSQLTranslator::new()
+            .translate(&crate::parse("CREATE SEQUENCE s AS numeric").unwrap())
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("AS numeric"), "{err}");
+    }
 
     #[test]
     fn from_column_alias_lists_rename_columns() {
