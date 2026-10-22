@@ -5621,24 +5621,56 @@ fn like_pattern_to_glob(pattern: &str) -> Option<String> {
 /// `%` → `.*`, `_` → `.`, other regex metacharacters are kept as-is since
 /// SIMILAR TO patterns are already regex-like in SQL standard.
 fn similar_to_regex(pattern: &str) -> String {
-    let mut regex = String::with_capacity(pattern.len() + 2);
-    regex.push('^');
+    // The whole pattern must match, and `^`/`$` must bind around every
+    // alternative of a top-level `|`, so wrap it in a non-capturing group.
+    let mut regex = String::with_capacity(pattern.len() + 8);
+    regex.push_str("^(?:");
+    let mut in_bracket = false;
     let mut chars = pattern.chars().peekable();
     while let Some(c) = chars.next() {
+        if in_bracket {
+            // Bracket expressions are passed through as written.
+            regex.push(c);
+            if c == ']' {
+                in_bracket = false;
+            }
+            continue;
+        }
         match c {
             '%' => regex.push_str(".*"),
             '_' => regex.push('.'),
             '\\' => {
-                // Escaped character: pass through literally
+                // Escaped character: match it literally.
                 if let Some(next) = chars.next() {
-                    regex.push('\\');
-                    regex.push(next);
+                    if next.is_ascii_alphanumeric() {
+                        regex.push(next);
+                    } else {
+                        regex.push('\\');
+                        regex.push(next);
+                    }
+                }
+            }
+            // Not metacharacters in SIMILAR TO, unlike POSIX regex.
+            '.' | '^' | '$' => {
+                regex.push('\\');
+                regex.push(c);
+            }
+            '[' => {
+                in_bracket = true;
+                regex.push(c);
+                // A leading `^` negates and a leading `]` is literal; both
+                // belong to the bracket, not to its end.
+                if chars.peek() == Some(&'^') {
+                    regex.push(chars.next().unwrap());
+                }
+                if chars.peek() == Some(&']') {
+                    regex.push(chars.next().unwrap());
                 }
             }
             _ => regex.push(c),
         }
     }
-    regex.push('$');
+    regex.push_str(")$");
     regex
 }
 
