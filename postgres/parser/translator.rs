@@ -5849,6 +5849,13 @@ pub fn try_extract_set_transaction(
     }
 }
 
+pub fn is_lock(parse_result: &ParseResult) -> bool {
+    matches!(
+        parse_result.protobuf.nodes().first().map(|node| &node.0),
+        Some(pg_query::NodeRef::LockStmt(_))
+    )
+}
+
 pub fn is_begin_read_only(parse_result: &ParseResult) -> bool {
     use pg_query::{protobuf::TransactionStmtKind, NodeRef};
 

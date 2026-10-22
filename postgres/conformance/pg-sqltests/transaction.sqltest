@@ -253,3 +253,17 @@ test txn-drop-table-rollback-restores {
 expect {
     0
 }
+
+@setup counter
+test txn-lock-table-before-read-write {
+    BEGIN;
+    SET TRANSACTION READ ONLY;
+    LOCK TABLE counter IN ACCESS SHARE MODE;
+    SET TRANSACTION READ WRITE;
+    UPDATE counter SET n = 9;
+    COMMIT;
+    SELECT n FROM counter;
+}
+expect {
+    9
+}

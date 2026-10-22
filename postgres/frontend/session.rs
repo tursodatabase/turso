@@ -10,7 +10,7 @@ use crate::functions::ConfigParameter;
 use turso_core::{Connection, LimboError, Result, Statement, Value};
 use turso_parser::ast::{self};
 use turso_pg_parser::translator::{
-    is_begin_read_only, is_comment_on, is_refresh_matview, try_extract_copy_from,
+    is_begin_read_only, is_comment_on, is_lock, is_refresh_matview, try_extract_copy_from,
     try_extract_create_schema, try_extract_drop_schema, try_extract_set,
     try_extract_set_transaction, try_extract_show, unnamed_index_name,
     unqualified_create_table_name_location, PgCopyFromStmt, PgCreateSchemaStmt, PgDropSchemaStmt,
@@ -279,6 +279,7 @@ fn record_transaction_statement(
         }
         ast::Stmt::Savepoint { .. } => transaction.savepoint = true,
         stmt if is_transaction_control(stmt) => {}
+        _ if is_lock(parse_result) => {}
         _ => {
             if !conn.get_auto_commit() {
                 transaction.queried = true;
