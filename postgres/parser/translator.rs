@@ -6024,6 +6024,9 @@ fn like_pattern_to_glob(pattern: &str) -> Option<String> {
     (glob.len() <= SQLITE_MAX_LIKE_PATTERN_LENGTH).then_some(glob)
 }
 
+/// Convert a SQL SIMILAR TO pattern to a regex anchored with ^(?:...)$.
+/// `%` → `.*`, `_` → `.`, and `.`, `^`, `$`, which are literals in SIMILAR TO,
+/// are escaped; other regex metacharacters and escapes are kept as-is.
 fn similar_to_regex(pattern: &str) -> Result<String, ParseError> {
     const POSIX_CLASSES: &[&str] = &[
         "[:alnum:]",
