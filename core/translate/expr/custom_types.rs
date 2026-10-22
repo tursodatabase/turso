@@ -399,6 +399,11 @@ pub(crate) fn emit_user_facing_column_value(
             extra_amount: 0,
         });
     }
+    // A virtual generated value is already the result of its SQL expression;
+    // only stored custom-type values have passed through ENCODE.
+    if column.is_virtual_generated() {
+        return Ok(());
+    }
     // Array columns: pass through raw record blob. ArrayDecode is emitted
     // at display time (ResultRow) so that functions/subscripts see raw blobs.
     if column.is_array() {
