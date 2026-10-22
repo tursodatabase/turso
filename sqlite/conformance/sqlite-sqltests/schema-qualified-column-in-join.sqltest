@@ -1,0 +1,38 @@
+@database :memory:
+
+# A schema.table.column reference must read the same value as table.column.
+# In a hash join, Turso returned NULL for the 3-part form.
+
+setup two-tables {
+    CREATE TABLE mt(id, b);
+    CREATE TABLE mu(id);
+    INSERT INTO mt VALUES (1, 'y'), (2, 'z');
+    INSERT INTO mu VALUES (1), (2);
+}
+
+@setup two-tables
+test schema-qualified-column-in-hash-join {
+    SELECT main.mt.b FROM mt JOIN mu ON mt.id = mu.id ORDER BY 1;
+}
+expect {
+    y
+    z
+}
+
+@setup two-tables
+test schema-qualified-rowid-in-hash-join {
+    SELECT main.mt.rowid FROM mt JOIN mu ON mt.id = mu.id ORDER BY 1;
+}
+expect {
+    1
+    2
+}
+
+@setup two-tables
+test schema-qualified-column-in-join-grouped-by-table-column {
+    SELECT main.mt.b, count(*) FROM mt JOIN mu ON mt.id = mu.id GROUP BY mt.b ORDER BY 1;
+}
+expect {
+    y|1
+    z|1
+}

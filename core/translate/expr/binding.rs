@@ -314,7 +314,7 @@ pub fn bind_and_rewrite_expr<'a>(
                     }
                     match qualified_match {
                         QualifiedNameMatch::Found(table_id, column) => {
-                            bind_qualified_name(expr, referenced_tables, None, table_id, column)
+                            bind_qualified_name(expr, referenced_tables, table_id, column)
                         }
                         QualifiedNameMatch::Ambiguous => crate::bail_parse_error!(
                             "ambiguous column name: {}.{}",
@@ -374,13 +374,7 @@ pub fn bind_and_rewrite_expr<'a>(
                             &normalized_col_name,
                         )? {
                             QualifiedNameMatch::Found(table_id, column) => {
-                                bind_qualified_name(
-                                    expr,
-                                    referenced_tables,
-                                    Some(*database_id),
-                                    table_id,
-                                    column,
-                                );
+                                bind_qualified_name(expr, referenced_tables, table_id, column);
                                 return Ok(WalkControl::Continue);
                             }
                             QualifiedNameMatch::NoColumn => crate::bail_parse_error!(
@@ -423,7 +417,7 @@ pub fn bind_and_rewrite_expr<'a>(
 
                                 if let Some((tbl_id, _)) = matching_tbl {
                                     *expr = Expr::Column {
-                                        database: Some(database_id),
+                                        database: None,
                                         table: tbl_id,
                                         column: col_idx,
                                         is_rowid_alias,
@@ -918,7 +912,6 @@ fn pick_parenthesized_join_column<'a>(
 fn bind_qualified_name(
     expr: &mut Expr,
     table_references: &mut TableReferences,
-    database_id: Option<usize>,
     table_id: TableInternalId,
     column: QualifiedMatch,
 ) {
@@ -928,7 +921,7 @@ fn bind_qualified_name(
             is_rowid_alias,
         } => {
             *expr = Expr::Column {
-                database: database_id,
+                database: None,
                 table: table_id,
                 column: col_idx,
                 is_rowid_alias,
@@ -938,7 +931,7 @@ fn bind_qualified_name(
         }
         QualifiedMatch::RowId => {
             *expr = Expr::RowId {
-                database: database_id,
+                database: None,
                 table: table_id,
             };
             tracing::debug!("rewritten to rowid");
