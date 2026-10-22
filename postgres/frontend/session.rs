@@ -33,6 +33,9 @@ struct SessionState {
     /// The time of BEGIN, which `now()` returns until the transaction block
     /// ends.
     transaction_start: Option<String>,
+    /// The variables of the PL/pgSQL functions that run on the connection,
+    /// by key. The compiler gives each variable of each trigger its own key.
+    plpgsql_values: std::collections::HashMap<String, Value>,
 }
 
 type PgSessionState = Mutex<SessionState>;
@@ -285,6 +288,27 @@ pub(crate) fn transaction_block_start(conn: &Connection, statement_time: &str) -
 
 pub(crate) fn end_transaction_block(conn: &Connection) {
     session_state(conn).lock().unwrap().transaction_start = None;
+}
+
+/// `__pl_set(key, value)`: keep the value of a PL/pgSQL variable.
+pub(crate) fn set_plpgsql_value(conn: &Connection, key: &str, value: Value) {
+    session_state(conn)
+        .lock()
+        .unwrap()
+        .plpgsql_values
+        .insert(key.to_string(), value);
+}
+
+/// `__pl_get(key)`: the value of a PL/pgSQL variable, NULL when nothing set
+/// it.
+pub(crate) fn plpgsql_value(conn: &Connection, key: &str) -> Value {
+    session_state(conn)
+        .lock()
+        .unwrap()
+        .plpgsql_values
+        .get(key)
+        .cloned()
+        .unwrap_or(Value::Null)
 }
 
 fn session_state(conn: &Connection) -> &PgSessionState {

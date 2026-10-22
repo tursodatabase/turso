@@ -1,0 +1,317 @@
+# IF, CASE, RAISE and PERFORM in PL/pgSQL trigger functions. Turso
+# evaluates each condition one time into a variable of the connection, and
+# the statements of a branch run only when the variable is true.
+
+@database :memory:
+
+setup orders {
+    CREATE TABLE orders (id int PRIMARY KEY, qty int, price int, status text, note text);
+    CREATE TABLE audit (seq serial, event text);
+}
+
+@setup orders
+test raise-exception-in-a-branch-stops-the-statement {
+    CREATE FUNCTION check_order() RETURNS trigger LANGUAGE plpgsql AS $$
+    BEGIN
+      IF NEW.qty <= 0 THEN
+        RAISE EXCEPTION 'quantity % of order % is not positive', NEW.qty, NEW.id;
+      END IF;
+      RETURN NEW;
+    END;
+    $$;
+    CREATE TRIGGER check_orders BEFORE INSERT OR UPDATE ON orders FOR EACH ROW EXECUTE FUNCTION check_order();
+    INSERT INTO orders (id, qty) VALUES (1, 2);
+    INSERT INTO orders (id, qty) VALUES (2, 0);
+}
+expect error {
+    quantity 0 of order 2 is not positive
+}
+
+@setup orders
+test raise-notice-does-nothing {
+    CREATE FUNCTION note_order() RETURNS trigger LANGUAGE plpgsql AS $$
+    BEGIN
+      RAISE NOTICE 'order %', NEW.id;
+      RAISE WARNING 'order %', NEW.id;
+      RETURN NEW;
+    END;
+    $$;
+    CREATE TRIGGER note_orders BEFORE INSERT ON orders FOR EACH ROW EXECUTE FUNCTION note_order();
+    INSERT INTO orders (id, qty) VALUES (1, 2);
+    SELECT id, qty FROM orders;
+}
+expect {
+    1|2
+}
+
+@setup orders
+test raise-message-shows-null-parameters {
+    CREATE FUNCTION check_order() RETURNS trigger LANGUAGE plpgsql AS $$
+    BEGIN
+      RAISE EXCEPTION 'status is % (100%% sure)', NEW.status;
+    END;
+    $$;
+    CREATE TRIGGER check_orders BEFORE INSERT ON orders FOR EACH ROW EXECUTE FUNCTION check_order();
+    INSERT INTO orders (id, qty) VALUES (1, 2);
+}
+expect error {
+    status is <NULL> \(100% sure\)
+}
+
+@setup orders
+test if-elsif-else-assign-the-row {
+    CREATE FUNCTION set_status() RETURNS trigger LANGUAGE plpgsql AS $$
+    BEGIN
+      IF NEW.qty >= 100 THEN
+        NEW.status := 'bulk';
+      ELSIF NEW.qty >= 10 THEN
+        NEW.status := 'box';
+      ELSE
+        NEW.status := 'single';
+      END IF;
+      RETURN NEW;
+    END;
+    $$;
+    CREATE TRIGGER set_statuses BEFORE INSERT OR UPDATE ON orders FOR EACH ROW EXECUTE FUNCTION set_status();
+    INSERT INTO orders (id, qty) VALUES (1, 100), (2, 10), (3, 1), (4, NULL);
+    UPDATE orders SET qty = 50 WHERE id = 3;
+    SELECT id, status FROM orders ORDER BY id;
+}
+expect {
+    1|bulk
+    2|box
+    3|box
+    4|single
+}
+
+@setup orders
+test only-the-statements-of-the-taken-branch-run {
+    CREATE FUNCTION audit_order() RETURNS trigger LANGUAGE plpgsql AS $$
+    BEGIN
+      IF NEW.qty > 1 THEN
+        INSERT INTO audit (event) VALUES ('many ' || NEW.id);
+        UPDATE orders SET note = 'checked' WHERE id < NEW.id;
+      ELSE
+        INSERT INTO audit (event) SELECT 'one ' || NEW.id;
+        DELETE FROM audit WHERE event LIKE 'many%';
+      END IF;
+      RETURN NEW;
+    END;
+    $$;
+    CREATE TRIGGER audit_orders AFTER INSERT ON orders FOR EACH ROW EXECUTE FUNCTION audit_order();
+    INSERT INTO orders (id, qty) VALUES (1, 5);
+    INSERT INTO orders (id, qty) VALUES (2, 5);
+    INSERT INTO orders (id, qty) VALUES (3, 1);
+    SELECT event FROM audit ORDER BY seq;
+    SELECT id, note FROM orders ORDER BY id;
+}
+expect {
+    one 3
+    1|checked
+    2|
+    3|
+}
+
+@setup orders
+test early-return-null-skips-the-row-and-the-statements-after-it {
+    CREATE FUNCTION drop_zero() RETURNS trigger LANGUAGE plpgsql AS $$
+    BEGIN
+      IF NEW.qty = 0 THEN
+        RETURN NULL;
+      END IF;
+      NEW.note := 'kept';
+      INSERT INTO audit (event) VALUES ('insert ' || NEW.id);
+      RETURN NEW;
+    END;
+    $$;
+    CREATE TRIGGER drop_zeros BEFORE INSERT ON orders FOR EACH ROW EXECUTE FUNCTION drop_zero();
+    INSERT INTO orders (id, qty) VALUES (1, 0), (2, 3), (3, 0), (4, 1);
+    SELECT id, note FROM orders ORDER BY id;
+    SELECT event FROM audit ORDER BY seq;
+}
+expect {
+    2|kept
+    4|kept
+    insert 2
+    insert 4
+}
+
+@setup orders
+test early-return-old-keeps-the-old-row {
+    CREATE FUNCTION keep_paid() RETURNS trigger LANGUAGE plpgsql AS $$
+    BEGIN
+      IF OLD.status = 'paid' THEN
+        RETURN OLD;
+      END IF;
+      RETURN NEW;
+    END;
+    $$;
+    CREATE TRIGGER keep_paids BEFORE UPDATE ON orders FOR EACH ROW EXECUTE FUNCTION keep_paid();
+    INSERT INTO orders (id, qty, status) VALUES (1, 1, 'paid'), (2, 1, 'open');
+    UPDATE orders SET qty = 9;
+    SELECT id, qty FROM orders ORDER BY id;
+}
+expect {
+    1|1
+    2|9
+}
+
+@setup orders
+test a-condition-is-evaluated-once-at-its-place {
+    CREATE FUNCTION count_audit() RETURNS trigger LANGUAGE plpgsql AS $$
+    BEGIN
+      IF (SELECT count(*) FROM audit) = 0 THEN
+        INSERT INTO audit (event) VALUES ('first');
+        INSERT INTO audit (event) VALUES ('second');
+      END IF;
+      NEW.note := (SELECT count(*) FROM audit);
+      INSERT INTO audit (event) VALUES ('third');
+      RETURN NEW;
+    END;
+    $$;
+    CREATE TRIGGER count_audits BEFORE INSERT ON orders FOR EACH ROW EXECUTE FUNCTION count_audit();
+    INSERT INTO orders (id, qty) VALUES (1, 1);
+    SELECT id, note FROM orders;
+    SELECT event FROM audit ORDER BY seq;
+}
+expect {
+    1|2
+    first
+    second
+    third
+}
+
+@setup orders
+test nested-if-and-a-branch-that-always-returns {
+    CREATE FUNCTION grade_order() RETURNS trigger LANGUAGE plpgsql AS $$
+    BEGIN
+      IF NEW.qty > 1 THEN
+        IF NEW.price > 10 THEN
+          NEW.note := 'many expensive';
+        ELSE
+          NEW.note := 'many cheap';
+        END IF;
+        RETURN NEW;
+      ELSE
+        NEW.note := 'one';
+        RETURN NEW;
+      END IF;
+    END;
+    $$;
+    CREATE TRIGGER grade_orders BEFORE INSERT ON orders FOR EACH ROW EXECUTE FUNCTION grade_order();
+    INSERT INTO orders (id, qty, price) VALUES (1, 2, 20), (2, 2, 5), (3, 1, 20);
+    SELECT id, note FROM orders ORDER BY id;
+}
+expect {
+    1|many expensive
+    2|many cheap
+    3|one
+}
+
+@setup orders
+test a-body-that-reaches-its-end-is-an-error-only-on-that-path {
+    CREATE FUNCTION half_return() RETURNS trigger LANGUAGE plpgsql AS $$
+    BEGIN
+      IF NEW.qty > 1 THEN
+        RETURN NEW;
+      END IF;
+    END;
+    $$;
+    CREATE TRIGGER half_returns BEFORE INSERT ON orders FOR EACH ROW EXECUTE FUNCTION half_return();
+    INSERT INTO orders (id, qty) VALUES (1, 2);
+    INSERT INTO orders (id, qty) VALUES (2, 1);
+}
+expect error {
+    control reached end of trigger procedure without RETURN
+}
+
+@setup orders
+test case-statement-over-a-value {
+    CREATE FUNCTION name_status() RETURNS trigger LANGUAGE plpgsql AS $$
+    BEGIN
+      CASE NEW.qty
+        WHEN 1, 2 THEN NEW.status := 'few';
+        WHEN 3 THEN NEW.status := 'three';
+        ELSE NEW.status := 'more';
+      END CASE;
+      CASE
+        WHEN NEW.price IS NULL THEN NEW.price := 0;
+        WHEN NEW.price < 0 THEN RAISE EXCEPTION 'negative price';
+      END CASE;
+      RETURN NEW;
+    END;
+    $$;
+    CREATE TRIGGER name_statuses BEFORE INSERT ON orders FOR EACH ROW EXECUTE FUNCTION name_status();
+    INSERT INTO orders (id, qty, price) VALUES (1, 2, NULL), (2, 3, NULL), (3, 9, NULL);
+    SELECT id, status, price FROM orders ORDER BY id;
+}
+expect {
+    1|few|0
+    2|three|0
+    3|more|0
+}
+
+@setup orders
+test case-without-a-match-and-without-else-is-an-error {
+    CREATE FUNCTION check_price() RETURNS trigger LANGUAGE plpgsql AS $$
+    BEGIN
+      CASE
+        WHEN NEW.price IS NULL THEN NEW.price := 0;
+        WHEN NEW.price < 0 THEN RAISE EXCEPTION 'negative price';
+      END CASE;
+      RETURN NEW;
+    END;
+    $$;
+    CREATE TRIGGER check_prices BEFORE INSERT ON orders FOR EACH ROW EXECUTE FUNCTION check_price();
+    INSERT INTO orders (id, qty, price) VALUES (1, 1, NULL);
+    INSERT INTO orders (id, qty, price) VALUES (2, 1, 5);
+}
+expect error {
+    case not found
+}
+
+@setup orders
+test perform-runs-a-query-for-its-effect {
+    CREATE SEQUENCE big_orders;
+    CREATE FUNCTION count_big() RETURNS trigger LANGUAGE plpgsql AS $$
+    BEGIN
+      IF NEW.qty > 1 THEN
+        PERFORM nextval('big_orders');
+      END IF;
+      RETURN NEW;
+    END;
+    $$;
+    CREATE TRIGGER count_bigs AFTER INSERT ON orders FOR EACH ROW EXECUTE FUNCTION count_big();
+    INSERT INTO orders (id, qty) VALUES (1, 2), (2, 1), (3, 3);
+    SELECT nextval('big_orders');
+}
+expect {
+    3
+}
+
+@setup orders
+test handle-times-sets-created-at-only-on-insert {
+    CREATE TABLE docs (id int PRIMARY KEY, title text, created_at timestamptz, updated_at timestamptz);
+    CREATE FUNCTION handle_times() RETURNS trigger LANGUAGE plpgsql AS $$
+    BEGIN
+      IF (TG_OP = 'INSERT') THEN
+        NEW.created_at := now();
+      END IF;
+      NEW.updated_at := now();
+      RETURN NEW;
+    END;
+    $$;
+    CREATE TRIGGER docs_times BEFORE INSERT OR UPDATE ON docs FOR EACH ROW EXECUTE FUNCTION handle_times();
+    BEGIN;
+    INSERT INTO docs (id, title) VALUES (1, 'a');
+    SELECT count(*) FROM docs WHERE created_at = now() AND updated_at = now();
+    COMMIT;
+    BEGIN;
+    UPDATE docs SET title = 'b' WHERE id = 1;
+    SELECT count(*) FROM docs WHERE created_at <> now() AND updated_at = now();
+    COMMIT;
+}
+expect {
+    1
+    1
+}

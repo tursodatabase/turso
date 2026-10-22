@@ -283,14 +283,14 @@ expect error {
     statement-level triggers
 }
 
-@skip-if postgres "PostgreSQL supports IF in PL/pgSQL"
+@skip-if postgres "PostgreSQL supports loops in PL/pgSQL"
 @setup users_audit
 test unsupported-plpgsql-gives-an-error-when-the-trigger-is-used {
     CREATE FUNCTION check_user() RETURNS trigger LANGUAGE plpgsql AS $$
     BEGIN
-      IF NEW.id < 0 THEN
-        RAISE EXCEPTION 'negative id';
-      END IF;
+      WHILE NEW.id < 0 LOOP
+        NEW.id := NEW.id + 1;
+      END LOOP;
       RETURN NEW;
     END;
     $$;
@@ -298,7 +298,7 @@ test unsupported-plpgsql-gives-an-error-when-the-trigger-is-used {
     INSERT INTO users VALUES (1, 'ann');
 }
 expect error {
-    IF is not supported yet in trigger functions
+    a loop is not supported in trigger functions
 }
 
 # BEFORE triggers: the row the function returns is the row the statement
