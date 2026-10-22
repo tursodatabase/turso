@@ -1803,14 +1803,23 @@ fn translate_function_call_expr(
                         );
                     }
 
-                    if let ast::Expr::Literal(ast::Literal::Numeric(ref value)) = args[1].as_ref() {
+                    let mut probability_arg = args[1].as_ref();
+                    loop {
+                        match probability_arg {
+                            ast::Expr::Parenthesized(exprs) if exprs.len() == 1 => {
+                                probability_arg = exprs[0].as_ref();
+                            }
+                            _ => break,
+                        }
+                    }
+                    if let ast::Expr::Literal(ast::Literal::Numeric(ref value)) = probability_arg {
                         if let Ok(probability) = value.parse::<f64>() {
                             if !(0.0..=1.0).contains(&probability) {
                                 crate::bail_parse_error!(
                                             "second argument to likelihood() must be a constant between 0.0 and 1.0",
                                         );
                             }
-                            if !value.contains('.') {
+                            if !value.contains(['.', 'e', 'E']) {
                                 crate::bail_parse_error!(
                                             "second argument to likelihood() must be a floating point number with decimal point",
                                         );
