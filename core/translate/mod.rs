@@ -202,12 +202,12 @@ pub fn translate_inner(
     );
     let is_vacuum = matches!(stmt, ast::Stmt::Vacuum { .. });
 
-    if is_vacuum && connection.get_query_only() {
-        bail_parse_error!("Cannot execute VACUUM in query_only mode")
+    if (is_vacuum || is_write) && connection.get_query_only() {
+        return Err(crate::LimboError::ReadOnly);
     }
 
-    if is_write && connection.get_query_only() {
-        bail_parse_error!("Cannot execute write statement in query_only mode")
+    if is_write && connection.is_tx_read_only() {
+        return Err(crate::LimboError::ReadOnly);
     }
 
     let is_select = matches!(stmt, ast::Stmt::Select { .. });
@@ -248,7 +248,12 @@ pub fn translate_inner(
                 connection.clone(),
             )?;
         }
-        ast::Stmt::Begin { typ, name } => translate_tx_begin(typ, name, resolver, program)?,
+        ast::Stmt::Begin {
+            typ,
+            name,
+            access_mode,
+            isolation_level: _,
+        } => translate_tx_begin(typ, name, access_mode, resolver, program)?,
         ast::Stmt::Commit { name } => {
             translate_tx_commit(name, resolver.schema(), resolver, program)?
         }

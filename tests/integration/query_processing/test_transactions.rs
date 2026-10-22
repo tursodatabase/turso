@@ -387,6 +387,34 @@ fn test_constraint_error_aborts_only_stmt_not_entire_transaction(tmp_db: TempDat
 }
 
 #[turso_macros::test]
+/// A failed read statement must not roll back the open transaction. SQLite
+/// keeps the transaction and its savepoints after a runtime error, so
+/// ROLLBACK TO can recover and COMMIT can persist the surviving writes.
+fn test_read_error_keeps_transaction_and_savepoints(tmp_db: TempDatabase) {
+    let conn = tmp_db.connect_limbo();
+
+    conn.execute("CREATE TABLE t (a INTEGER)").unwrap();
+    conn.execute("BEGIN").unwrap();
+    conn.execute("INSERT INTO t VALUES (1)").unwrap();
+    conn.execute("SAVEPOINT s").unwrap();
+    conn.execute("INSERT INTO t VALUES (2)").unwrap();
+
+    let result = conn.execute("SELECT abs(-9223372036854775808)");
+    assert!(matches!(result, Err(LimboError::IntegerOverflow)));
+    assert!(
+        !conn.get_auto_commit(),
+        "a failed read statement must leave the transaction open"
+    );
+
+    conn.execute("ROLLBACK TO s").unwrap();
+    conn.execute("COMMIT").unwrap();
+
+    let stmt = conn.query("SELECT a FROM t").unwrap().unwrap();
+    let rows = helper_read_all_rows(stmt);
+    assert_eq!(rows, vec![vec![Value::from_i64(1)]]);
+}
+
+#[turso_macros::test]
 /// Regression test for https://github.com/tursodatabase/turso/issues/3784 where dirty pages
 /// were flushed to WAL _before_ deferred FK violations were checked. This resulted in the
 /// violations being persisted to the database, even though the transaction was aborted.

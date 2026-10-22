@@ -2296,6 +2296,7 @@ pub fn insn_to_row(
                 auto_commit,
                 rollback,
                 concurrent,
+                read_only: _,
             } => (
                 "AutoCommit",
                 *auto_commit as i64,

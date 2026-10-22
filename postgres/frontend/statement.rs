@@ -1,4 +1,5 @@
 use std::num::NonZero;
+use std::sync::Arc;
 use std::task::Waker;
 use std::time::Duration;
 
@@ -8,21 +9,58 @@ use turso_core::{
 
 use crate::Result;
 
+/// Called after every successful (or specially handled) execution of a
+/// transaction-control statement to apply connection state changes that must
+/// happen at execute time, not at prepare time.
+type PostRunFn = Arc<dyn Fn(Result<()>) -> Result<()> + Send + Sync>;
+
 pub struct Statement {
     inner: turso_core::Statement,
+    /// Applied by all run/step methods after the core statement completes. Used
+    /// for BEGIN/COMMIT/ROLLBACK and SET TRANSACTION prepared via the public
+    /// prepare() API so that connection state changes (set_tx_read_only,
+    /// set_tx_has_started) and benign error suppression ("no transaction is
+    /// active", "cannot start a transaction within a transaction") happen at
+    /// execute time rather than when the statement is compiled.
+    post_run: Option<PostRunFn>,
 }
 
 impl Statement {
     pub(crate) fn new(inner: turso_core::Statement) -> Self {
-        Self { inner }
+        Self {
+            inner,
+            post_run: None,
+        }
+    }
+
+    pub(crate) fn new_with_post_run(inner: turso_core::Statement, post_run: PostRunFn) -> Self {
+        Self {
+            inner,
+            post_run: Some(post_run),
+        }
+    }
+
+    fn apply_post_run(&self, result: Result<()>) -> Result<()> {
+        match &self.post_run {
+            Some(f) => f(result),
+            None => result,
+        }
     }
 
     pub fn step(&mut self) -> Result<StepResult> {
-        self.inner.step().map_err(Into::into)
+        match self.inner.step().map_err(Into::into) {
+            Ok(StepResult::Done) => self.apply_post_run(Ok(())).map(|()| StepResult::Done),
+            Err(e) => self.apply_post_run(Err(e)).map(|()| StepResult::Done),
+            other => other,
+        }
     }
 
     pub fn step_with_waker(&mut self, waker: &Waker) -> Result<StepResult> {
-        self.inner.step_with_waker(waker).map_err(Into::into)
+        match self.inner.step_with_waker(waker).map_err(Into::into) {
+            Ok(StepResult::Done) => self.apply_post_run(Ok(())).map(|()| StepResult::Done),
+            Err(e) => self.apply_post_run(Err(e)).map(|()| StepResult::Done),
+            other => other,
+        }
     }
 
     pub fn reset(&mut self) -> Result<()> {
@@ -38,11 +76,16 @@ impl Statement {
     }
 
     pub fn run_ignore_rows(&mut self) -> Result<()> {
-        self.inner.run_ignore_rows().map_err(Into::into)
+        let result = self.inner.run_ignore_rows().map_err(Into::into);
+        self.apply_post_run(result)
     }
 
     pub fn run_collect_rows(&mut self) -> Result<Vec<Vec<Value>>> {
-        self.inner.run_collect_rows().map_err(Into::into)
+        let result = self.inner.run_collect_rows().map_err(Into::into);
+        match result {
+            Ok(rows) => self.apply_post_run(Ok(())).map(|()| rows),
+            Err(e) => self.apply_post_run(Err(e)).map(|()| vec![]),
+        }
     }
 
     pub fn run_with_row_callback(
@@ -63,9 +106,15 @@ impl Statement {
     }
 
     pub fn run_ignore_rows_nonblock(&mut self) -> Result<IOResult<()>> {
-        self.inner
+        let result = self
+            .inner
             .run_ignore_rows_nonblock()
-            .map_err(|error| (*error).into())
+            .map_err(|error| (*error).into());
+        match result {
+            Ok(IOResult::Done(())) => self.apply_post_run(Ok(())).map(|()| IOResult::Done(())),
+            Err(e) => self.apply_post_run(Err(e)).map(|()| IOResult::Done(())),
+            other => other,
+        }
     }
 
     pub fn run_with_row_callback_nonblock(
