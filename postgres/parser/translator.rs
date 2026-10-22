@@ -2859,7 +2859,11 @@ impl PostgreSQLTranslator {
                 self.translate_case_expr(case_expr)
             }
             Some(pg_query::protobuf::node::Node::CollateClause(collate)) => {
-                // Strip COLLATE clause, just translate the inner expression
+                // Text already compares byte-wise, so a binary collation can
+                // be dropped; any other would silently change comparisons.
+                if !is_binary_collation(&collate.collname) {
+                    return Err(not_supported("a non-binary COLLATE in an expression"));
+                }
                 if let Some(arg) = &collate.arg {
                     self.translate_expr(arg)
                 } else {
@@ -9987,5 +9991,20 @@ mod tests {
         assert_not_supported("SELECT text(a) OVER () FROM t", "text()");
         assert_not_supported("SELECT float8(a ORDER BY b) FROM t", "float8()");
         assert_translates("SELECT int4(a) FROM t");
+    }
+
+    #[test]
+    fn fail_closed_expression_collate() {
+        assert_not_supported(
+            "SELECT * FROM t ORDER BY name COLLATE \"en_US\"",
+            "non-binary COLLATE",
+        );
+        assert_not_supported(
+            "SELECT 'a' < 'B' COLLATE \"de-x-icu\"",
+            "non-binary COLLATE",
+        );
+        // psql's catalog queries use these.
+        assert_translates("SELECT relname COLLATE pg_catalog.default FROM pg_class");
+        assert_translates("SELECT * FROM t ORDER BY name COLLATE \"C\"");
     }
 }
