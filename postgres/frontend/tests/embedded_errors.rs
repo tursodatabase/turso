@@ -10,6 +10,12 @@ fn pg_connection() -> (Arc<dyn turso_core::IO>, Connection) {
     (io, conn)
 }
 
+fn pg_connection_with_fk() -> (Arc<dyn turso_core::IO>, Connection) {
+    let (io, conn) = pg_connection();
+    conn.inner().set_foreign_keys_enabled(true);
+    (io, conn)
+}
+
 fn exec_err(conn: &Connection, sql: &str) -> Error {
     conn.execute(sql)
         .expect_err(&format!("statement must fail: {sql}"))
@@ -176,8 +182,8 @@ fn unnamed_unique_violation_reports_generated_constraint_name() {
 }
 
 #[test]
-fn foreign_key_violation_reports_structured_fields_with_fk_on_by_default() {
-    let (_io, conn) = pg_connection();
+fn foreign_key_violation_reports_structured_fields() {
+    let (_io, conn) = pg_connection_with_fk();
     conn.execute("CREATE TABLE t_parent (id INT PRIMARY KEY)")
         .unwrap();
     conn.execute("CREATE TABLE t_child (id INT PRIMARY KEY, pid INT REFERENCES t_parent(id))")
@@ -371,7 +377,7 @@ fn text_primary_key_reports_pkey_name() {
 
 #[test]
 fn named_foreign_key_reports_declared_name() {
-    let (_io, conn) = pg_connection();
+    let (_io, conn) = pg_connection_with_fk();
     conn.execute("CREATE TABLE parent (id INT PRIMARY KEY)")
         .unwrap();
     conn.execute("CREATE TABLE child (pid INT CONSTRAINT custom_fk REFERENCES parent(id))")
@@ -397,7 +403,7 @@ fn unnamed_check_reports_generated_name() {
 
 #[test]
 fn table_constraints_report_declared_names() {
-    let (_io, conn) = pg_connection();
+    let (_io, conn) = pg_connection_with_fk();
     conn.execute("CREATE TABLE parent (id INT PRIMARY KEY)")
         .unwrap();
     conn.execute("CREATE TABLE t (id INT, pid INT, x INT, CONSTRAINT named_pk PRIMARY KEY (id), CONSTRAINT named_fk FOREIGN KEY (pid) REFERENCES parent(id), CONSTRAINT named_check CHECK (x > 0))").unwrap();
@@ -445,7 +451,7 @@ fn unnamed_check_with_multiple_columns_reports_table_name() {
 
 #[test]
 fn foreign_key_update_keeps_key_values_when_later_rows_reuse_registers() {
-    let (_io, conn) = pg_connection();
+    let (_io, conn) = pg_connection_with_fk();
     conn.execute("CREATE TABLE parent (a INT, b TEXT, PRIMARY KEY (a, b))")
         .unwrap();
     conn.execute("CREATE TABLE child (id INT PRIMARY KEY, a INT, b TEXT, CONSTRAINT child_fk FOREIGN KEY (a, b) REFERENCES parent(a, b))").unwrap();
@@ -469,7 +475,7 @@ fn foreign_key_update_keeps_key_values_when_later_rows_reuse_registers() {
 
 #[test]
 fn foreign_key_update_reports_structured_fields() {
-    let (_io, conn) = pg_connection();
+    let (_io, conn) = pg_connection_with_fk();
     conn.execute("CREATE TABLE parent (id INT PRIMARY KEY)")
         .unwrap();
     conn.execute("CREATE TABLE child (id INT PRIMARY KEY, pid INT REFERENCES parent(id))")
@@ -526,7 +532,7 @@ fn structured_foreign_key_errors_preserve_sqlite_transaction_behavior() {
         "INSERT OR ROLLBACK INTO child VALUES (2, 99)",
         "INSERT OR FAIL INTO child VALUES (2, 1), (3, 99)",
     ] {
-        let (_pg_io, pg) = pg_connection();
+        let (_pg_io, pg) = pg_connection_with_fk();
         let (_sqlite_io, sqlite) = sqlite_connection();
         let mut outcomes = Vec::new();
         for (dialect, conn) in [("sqlite", &sqlite), ("postgres", pg.inner())] {

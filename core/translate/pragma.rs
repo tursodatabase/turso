@@ -1909,7 +1909,7 @@ fn without_rowid_primary_key_index(table: &BTreeTable) -> Result<Option<Index>> 
         table.primary_key_columns.len(),
         primary_key.and_then(|us| us.conflict_clause),
         primary_key.map_or(&[], |us| us.columns.as_slice()),
-        None,
+        primary_key.and_then(|us| us.constraint_name.clone()),
     )?;
     Ok(Some(index))
 }
