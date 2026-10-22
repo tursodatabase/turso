@@ -25,10 +25,9 @@ use crate::{
         plan::QueryDestination,
         semantic::{
             analyze_root,
-            catalog::SemanticCatalog,
-            context::DoubleQuotedDml,
+            context::SemanticContext,
             hir::{self, HirDocument, HirRoot, OutputNameKind},
-            SemanticOptions, SemanticRootInput,
+            SemanticRootInput,
         },
         semantic_to_plan::{HirPlan, HirRootPlan},
     },
@@ -45,12 +44,11 @@ use dml::Subprograms;
 /// it without the legacy binder, planner, or emitter.
 pub(crate) fn translate_select(
     statement: &ast::Stmt,
-    schema: &Arc<Schema>,
-    settings: &HirSettings<'_>,
+    context: &SemanticContext<'_>,
     program: &mut ProgramBuilder,
     connection: &Arc<Connection>,
 ) -> Result<()> {
-    let plan = analyze_and_plan(statement, schema, settings, connection)?;
+    let plan = analyze_and_plan(statement, context, connection)?;
     let HirRoot::Query(root) = &plan.document.root else {
         return Err(LimboError::InternalError(
             "HIR SELECT analysis did not produce a query root".into(),
@@ -88,11 +86,10 @@ pub(crate) enum ScanValue {
 impl PlannedSelect {
     pub(crate) fn new(
         select: ast::Select,
-        schema: &Arc<Schema>,
-        settings: &HirSettings<'_>,
+        context: &SemanticContext<'_>,
         connection: &Arc<Connection>,
     ) -> Result<Self> {
-        let plan = analyze_and_plan(&ast::Stmt::Select(select), schema, settings, connection)?;
+        let plan = analyze_and_plan(&ast::Stmt::Select(select), context, connection)?;
         let HirRoot::Query(root) = &plan.document.root else {
             return Err(LimboError::InternalError(
                 "HIR CTAS analysis did not produce a query root".into(),
@@ -110,12 +107,11 @@ impl PlannedSelect {
     /// expressions that read no table, such as the arguments of ATTACH.
     pub(crate) fn values(
         values: Vec<ast::Expr>,
-        schema: &Arc<Schema>,
-        settings: &HirSettings<'_>,
+        context: &SemanticContext<'_>,
         connection: &Arc<Connection>,
     ) -> Result<Self> {
         let select = Self::select(values, None, None);
-        Self::new(select, schema, settings, connection)
+        Self::new(select, context, connection)
     }
 
     /// `SELECT <values> FROM <database>.<table> NOT INDEXED [WHERE <filter>]`:
@@ -126,8 +122,7 @@ impl PlannedSelect {
         database: String,
         table: String,
         filter: Option<Box<ast::Expr>>,
-        schema: &Arc<Schema>,
-        settings: &HirSettings<'_>,
+        context: &SemanticContext<'_>,
         connection: &Arc<Connection>,
     ) -> Result<Self> {
         let mut stored_outputs = Vec::new();
@@ -162,7 +157,7 @@ impl PlannedSelect {
             joins: vec![],
         };
         let select = Self::select(columns, Some(from), filter);
-        let plan = HirSession::new(schema, settings, connection)?.plan_with(
+        let plan = HirSession::new(context, connection).plan_with(
             SemanticRootInput::Statement(&ast::Stmt::Select(select)),
             |document| rewrite_rowid_outputs(document, &rowid_outputs),
         )?;
@@ -339,8 +334,7 @@ impl PlannedSelect {
 pub(crate) fn translate_drop_table_delete(
     database: &str,
     table: &str,
-    schema: &Arc<Schema>,
-    settings: &HirSettings<'_>,
+    context: &SemanticContext<'_>,
     program: &mut ProgramBuilder,
     connection: &Arc<Connection>,
 ) -> Result<()> {
@@ -355,7 +349,7 @@ pub(crate) fn translate_drop_table_delete(
         where_clause: None,
         returning: Vec::new(),
     };
-    let session = HirSession::new(schema, settings, connection)?;
+    let session = HirSession::new(context, connection);
     let plan = session.plan(SemanticRootInput::Statement(&statement))?;
     let (HirRoot::Delete(delete), HirRootPlan::Delete(access)) = (&plan.document.root, &plan.root)
     else {
@@ -375,8 +369,7 @@ pub(crate) fn translate_drop_table_delete(
 /// Prepare a top-level DELETE through semantic HIR.
 pub(crate) fn translate_delete(
     statement: &ast::Stmt,
-    schema: &Arc<Schema>,
-    settings: &HirSettings<'_>,
+    context: &SemanticContext<'_>,
     program: &mut ProgramBuilder,
     connection: &Arc<Connection>,
 ) -> Result<()> {
@@ -385,8 +378,13 @@ pub(crate) fn translate_delete(
             "HIR DELETE got another statement".into(),
         ));
     };
-    check_target(schema, connection, tbl_name, "DELETE from table")?;
-    let session = HirSession::new(schema, settings, connection)?;
+    check_target(
+        context.main_schema(),
+        connection,
+        tbl_name,
+        "DELETE from table",
+    )?;
+    let session = HirSession::new(context, connection);
     let plan = session.plan(SemanticRootInput::Statement(statement))?;
     let (HirRoot::Delete(delete), HirRootPlan::Delete(access)) = (&plan.document.root, &plan.root)
     else {
@@ -411,12 +409,11 @@ pub(crate) fn translate_delete(
 /// Prepare a top-level UPDATE through semantic HIR.
 pub(crate) fn translate_update(
     statement: &ast::Stmt,
-    schema: &Arc<Schema>,
-    settings: &HirSettings<'_>,
+    context: &SemanticContext<'_>,
     program: &mut ProgramBuilder,
     connection: &Arc<Connection>,
 ) -> Result<()> {
-    translate_update_with(statement, schema, settings, program, connection, None)
+    translate_update_with(statement, context, program, connection, None)
 }
 
 /// Prepare the UPDATE of the schema table that ALTER TABLE generates. Like
@@ -424,19 +421,17 @@ pub(crate) fn translate_update(
 /// `ddl`, the ALTER statement, as the new `sql` value.
 pub(crate) fn translate_schema_update(
     statement: &ast::Stmt,
-    schema: &Arc<Schema>,
-    settings: &HirSettings<'_>,
+    context: &SemanticContext<'_>,
     program: &mut ProgramBuilder,
     connection: &Arc<Connection>,
     ddl: &str,
 ) -> Result<()> {
-    translate_update_with(statement, schema, settings, program, connection, Some(ddl))
+    translate_update_with(statement, context, program, connection, Some(ddl))
 }
 
 fn translate_update_with(
     statement: &ast::Stmt,
-    schema: &Arc<Schema>,
-    settings: &HirSettings<'_>,
+    context: &SemanticContext<'_>,
     program: &mut ProgramBuilder,
     connection: &Arc<Connection>,
     schema_change: Option<&str>,
@@ -447,9 +442,14 @@ fn translate_update_with(
         ));
     };
     if schema_change.is_none() {
-        check_target(schema, connection, &syntax.tbl_name, "UPDATE table")?;
+        check_target(
+            context.main_schema(),
+            connection,
+            &syntax.tbl_name,
+            "UPDATE table",
+        )?;
     }
-    let session = HirSession::new(schema, settings, connection)?;
+    let session = HirSession::new(context, connection);
     let plan = session.plan(SemanticRootInput::Statement(statement))?;
     let (update, access) = update::update_root(&plan)?;
     if let Some(table) = dml::virtual_target(&plan.document, update.target)? {
@@ -479,8 +479,7 @@ fn translate_update_with(
 /// Prepare a top-level INSERT through semantic HIR.
 pub(crate) fn translate_insert(
     statement: &ast::Stmt,
-    schema: &Arc<Schema>,
-    settings: &HirSettings<'_>,
+    context: &SemanticContext<'_>,
     program: &mut ProgramBuilder,
     connection: &Arc<Connection>,
 ) -> Result<()> {
@@ -489,8 +488,13 @@ pub(crate) fn translate_insert(
             "HIR INSERT got another statement".into(),
         ));
     };
-    check_target(schema, connection, tbl_name, "INSERT into table")?;
-    let session = HirSession::new(schema, settings, connection)?;
+    check_target(
+        context.main_schema(),
+        connection,
+        tbl_name,
+        "INSERT into table",
+    )?;
+    let session = HirSession::new(context, connection);
     let plan = session.plan(SemanticRootInput::Statement(statement))?;
     let insert = insert::insert_root(&plan)?;
     if let Some(table) = dml::virtual_target(&plan.document, insert.target)? {
@@ -572,75 +576,19 @@ fn check_target(
 /// What every HIR document of one statement is analyzed and planned with:
 /// the statement itself and each trigger it fires.
 pub(super) struct HirSession<'a> {
-    pub(super) schema: &'a Arc<Schema>,
+    pub(super) context: &'a SemanticContext<'a>,
     pub(super) connection: &'a Arc<Connection>,
-    catalog: SemanticCatalog,
-    symbols: &'a crate::SymbolTable,
-    dialect: Arc<dyn crate::dialect::Dialect>,
-    custom_types_enabled: bool,
-    dqs_dml: DoubleQuotedDml,
     /// The foreign-key actions being compiled.
     actions: fkey_action::ActionStack,
 }
 
-/// The settings a statement is analyzed with, taken from the connection
-/// and the prepare call rather than from legacy's resolver.
-pub(crate) struct HirSettings<'a> {
-    symbols: &'a crate::SymbolTable,
-    dialect: Arc<dyn crate::dialect::Dialect>,
-    custom_types_enabled: bool,
-    dqs_dml: DoubleQuotedDml,
-    /// The databases an unqualified name is looked up in, when the prepare
-    /// call sets them.
-    search_path: Option<&'a [String]>,
-}
-
-impl<'a> HirSettings<'a> {
-    pub(crate) fn new(
-        connection: &Connection,
-        symbols: &'a crate::SymbolTable,
-        dialect: Arc<dyn crate::dialect::Dialect>,
-        search_path: Option<&'a [String]>,
-    ) -> Self {
-        Self {
-            symbols,
-            dialect,
-            custom_types_enabled: connection.experimental_custom_types_enabled(),
-            dqs_dml: if connection.get_dqs_dml() {
-                DoubleQuotedDml::Enabled
-            } else {
-                DoubleQuotedDml::Disabled
-            },
-            search_path,
-        }
-    }
-}
-
 impl<'a> HirSession<'a> {
-    fn new(
-        schema: &'a Arc<Schema>,
-        settings: &HirSettings<'a>,
-        connection: &'a Arc<Connection>,
-    ) -> Result<Self> {
-        let catalog = SemanticCatalog::capture(
-            schema.clone(),
-            connection.database_schemas(),
-            &connection.temp.database,
-            connection.attached_databases(),
-            settings.custom_types_enabled,
-            settings.dialect.as_ref(),
-            settings.search_path,
-        )?;
-        Ok(Self {
-            schema,
+    fn new(context: &'a SemanticContext<'a>, connection: &'a Arc<Connection>) -> Self {
+        Self {
+            context,
             connection,
-            catalog,
-            symbols: settings.symbols,
-            dialect: settings.dialect.clone(),
-            custom_types_enabled: settings.custom_types_enabled,
-            dqs_dml: settings.dqs_dml,
             actions: fkey_action::ActionStack::default(),
-        })
+        }
     }
 
     /// Analyze `input` into HIR and choose its access paths.
@@ -659,31 +607,14 @@ impl<'a> HirSession<'a> {
         rewrite(&mut document)?;
         Ok(Arc::new(HirPlan::build(
             Arc::new(document),
-            self.schema,
+            self.context.main_schema(),
             cost_model_params(),
         )?))
     }
 
     /// Analyze `input` into HIR without choosing access paths.
     fn analyze(&self, input: SemanticRootInput<'_>) -> Result<HirDocument> {
-        analyze_root(
-            &self.catalog,
-            self.symbols,
-            SemanticOptions {
-                dialect: self.dialect.clone(),
-                custom_types_enabled: self.custom_types_enabled,
-                dqs_dml: self.dqs_dml,
-                foreign_keys_enabled: self.connection.foreign_keys_enabled(),
-                capture_changes_table: self
-                    .connection
-                    .get_capture_data_changes_info()
-                    .as_ref()
-                    .map(|info| info.table.clone()),
-                long_column_names: self.connection.get_full_column_names()
-                    && !self.connection.get_short_column_names(),
-            },
-            input,
-        )
+        analyze_root(self.context, input)
     }
 }
 
@@ -695,16 +626,20 @@ pub(crate) fn translate_register_expression(
     expression: &ast::Expr,
     inputs: &[String],
     schema: &Arc<Schema>,
-    settings: &HirSettings<'_>,
+    symbols: &crate::SymbolTable,
     connection: &Arc<Connection>,
     target: usize,
 ) -> Result<()> {
-    let document = HirSession::new(schema, settings, connection)?.analyze(
-        SemanticRootInput::RegisterExpressions {
+    // The expression is SQLite text over the main schema, whatever the
+    // database's dialect or the prepare call's search path.
+    let dialect: Arc<dyn crate::dialect::Dialect> = Arc::new(crate::dialect::SqliteDialect);
+    let catalog = crate::translate::capture_catalog(schema, connection, dialect.as_ref(), None)?;
+    let context = crate::translate::semantic_context(&catalog, symbols, connection, dialect)?;
+    let document =
+        HirSession::new(&context, connection).analyze(SemanticRootInput::RegisterExpressions {
             inputs,
             expressions: std::slice::from_ref(expression),
-        },
-    )?;
+        })?;
     let HirRoot::SchemaExpressions(root) = &document.root else {
         return Err(LimboError::InternalError(
             "register expression analysis did not produce an expression root".into(),
@@ -761,11 +696,10 @@ fn rewrite_rowid_outputs(document: &mut HirDocument, positions: &[usize]) -> Res
 /// Analyze one statement into HIR and choose its access paths.
 fn analyze_and_plan(
     statement: &ast::Stmt,
-    schema: &Arc<Schema>,
-    settings: &HirSettings<'_>,
+    context: &SemanticContext<'_>,
     connection: &Arc<Connection>,
 ) -> Result<Arc<HirPlan>> {
-    HirSession::new(schema, settings, connection)?.plan(SemanticRootInput::Statement(statement))
+    HirSession::new(context, connection).plan(SemanticRootInput::Statement(statement))
 }
 
 /// Result-column metadata for a statement prepared from resolved HIR. It

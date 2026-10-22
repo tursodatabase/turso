@@ -84,7 +84,6 @@ pub fn translate_create_index(
     connection: &Arc<crate::Connection>,
     catalog: &SemanticContext<'_>,
     stmt: ast::Stmt,
-    hir: HirContext<'_>,
 ) -> crate::Result<()> {
     let sql = canonical_create_index_sql(&stmt);
     let ast::Stmt::CreateIndex {
@@ -282,7 +281,7 @@ pub fn translate_create_index(
     emit_refill_index(
         program,
         connection,
-        hir,
+        catalog,
         database_id,
         &tbl,
         &idx,
@@ -314,20 +313,15 @@ pub fn translate_create_index(
     Ok(())
 }
 
-/// The HIR settings a schema statement plans its SELECTs with, when HIR is on.
-use crate::translate::HirContext;
-
-/// Plan the rows that fill `idx` through HIR. Returns `None` when the table
-/// stores values a SELECT would decode, or when every rowid name is taken by
-/// a real column; legacy fills the index then.
+/// Plan the rows that fill `idx`: each index column as DML writes it, then
+/// the rowid.
 fn hir_refill_select(
     connection: &Arc<crate::Connection>,
-    hir: HirContext<'_>,
+    catalog: &SemanticContext<'_>,
     database_id: usize,
     tbl: &BTreeTable,
     idx: &Index,
 ) -> crate::Result<PlannedSelect> {
-    let (schema, settings) = hir;
     let database = connection
         .get_database_name_by_index(database_id)
         .ok_or_else(|| LimboError::InternalError(format!("no database with id {database_id}")))?;
@@ -366,8 +360,7 @@ fn hir_refill_select(
         database,
         tbl.name.clone(),
         idx.where_clause.clone(),
-        schema,
-        settings,
+        catalog,
         connection,
     )
 }
@@ -382,7 +375,7 @@ fn hir_refill_select(
 fn emit_refill_index(
     program: &mut ProgramBuilder,
     connection: &Arc<crate::Connection>,
-    hir: HirContext<'_>,
+    catalog: &SemanticContext<'_>,
     database_id: usize,
     tbl: &Arc<BTreeTable>,
     idx: &Arc<Index>,
@@ -390,7 +383,7 @@ fn emit_refill_index(
     index_root_page: RegisterOrLiteral<i64>,
     clear_existing_root: Option<i64>,
 ) -> crate::Result<()> {
-    let rows = hir_refill_select(connection, hir, database_id, tbl, idx)?;
+    let rows = hir_refill_select(connection, catalog, database_id, tbl, idx)?;
     let columns = &idx.columns;
     let tbl_name = normalize_ident(tbl.name.as_str());
     let mut cursors = vec![index_cursor_id];
@@ -551,7 +544,6 @@ pub fn translate_reindex(
     catalog: &SemanticContext<'_>,
     program: &mut ProgramBuilder,
     connection: &Arc<crate::Connection>,
-    hir: HirContext<'_>,
 ) -> crate::Result<()> {
     if connection.mvcc_enabled() {
         bail_parse_error!("REINDEX is not supported in MVCC mode");
@@ -594,7 +586,7 @@ pub fn translate_reindex(
         emit_refill_index(
             program,
             connection,
-            hir,
+            catalog,
             database_id,
             &table,
             &index,

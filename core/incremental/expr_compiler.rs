@@ -6,7 +6,7 @@ use crate::numeric::Numeric;
 use crate::schema::Schema;
 use crate::storage::pager::Pager;
 use crate::sync::Arc;
-use crate::translate::semantic_lowering::{translate_register_expression, HirSettings};
+use crate::translate::semantic_lowering::translate_register_expression;
 use crate::types::Text;
 use crate::vdbe::builder::{ProgramBuilder, ProgramBuilderOpts};
 use crate::vdbe::insn::Insn;
@@ -319,18 +319,12 @@ impl CompiledExpression {
         let transformed_expr = transform_expr_for_dbsp(expr, input_column_names);
 
         // Translate the transformed expression to bytecode
-        let settings = HirSettings::new(
-            &connection,
-            syms,
-            std::sync::Arc::new(crate::dialect::SqliteDialect),
-            None,
-        );
         translate_register_expression(
             &mut builder,
             &transformed_expr,
             input_column_names,
             schema,
-            &settings,
+            syms,
             &connection,
             temp_result_register,
         )?;

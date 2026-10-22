@@ -907,12 +907,10 @@ fn derive_ctas_schema(
     select: ast::Select,
     table_name: &str,
     connection: &Arc<Connection>,
-    hir: crate::translate::HirContext<'_>,
+    catalog: &SemanticContext<'_>,
 ) -> Result<(CtasInfo, Vec<ColumnDefinition>)> {
-    let (schema, settings) = hir;
-    let select = crate::translate::semantic_lowering::PlannedSelect::new(
-        select, schema, settings, connection,
-    )?;
+    let select =
+        crate::translate::semantic_lowering::PlannedSelect::new(select, catalog, connection)?;
     let columns = select.columns()?;
     Ok(ctas_schema(select, table_name, columns))
 }
@@ -1075,14 +1073,13 @@ pub fn translate_create_table(
     program: &mut ProgramBuilder,
     connection: &Arc<Connection>,
     input: &str,
-    hir: crate::translate::HirContext<'_>,
 ) -> Result<()> {
     // For CTAS, extract the SELECT, determine column info, and convert to a
     // regular ColumnsAndConstraints body + separate SELECT for data insertion.
     let (body, ctas_info) = match body {
         ast::CreateTableBody::AsSelect(select) => {
             let (info, col_defs) =
-                derive_ctas_schema(select, &tbl_name.name.as_ident(), connection, hir)?;
+                derive_ctas_schema(select, &tbl_name.name.as_ident(), connection, catalog)?;
             let body = ast::CreateTableBody::ColumnsAndConstraints {
                 columns: col_defs,
                 constraints: vec![],
@@ -1791,7 +1788,6 @@ pub fn translate_drop_table(
     if_exists: bool,
     program: &mut ProgramBuilder,
     connection: &Arc<Connection>,
-    hir: crate::translate::HirContext<'_>,
 ) -> Result<()> {
     let database_id = catalog.resolve_existing_table_database_id_qualified(&tbl_name)?;
     let name = tbl_name.name.as_str();
@@ -1823,9 +1819,8 @@ pub fn translate_drop_table(
             .ok_or_else(|| {
                 crate::LimboError::InternalError(format!("no database with id {database_id}"))
             })?;
-        let (schema, settings) = hir;
         crate::translate::semantic_lowering::translate_drop_table_delete(
-            &database, name, schema, settings, program, connection,
+            &database, name, catalog, program, connection,
         )?;
         let no_violations = program.allocate_label();
         program.emit_insn(Insn::FkIfZero {

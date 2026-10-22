@@ -21,7 +21,7 @@ struct IntegrityIndex {
     unique_nullable: Vec<bool>,
 }
 
-use crate::translate::HirContext;
+use crate::translate::semantic::context::SemanticContext;
 
 /// Translate PRAGMA integrity_check.
 pub fn translate_integrity_check(
@@ -30,7 +30,7 @@ pub fn translate_integrity_check(
     database_id: usize,
     max_errors: usize,
     connection: &std::sync::Arc<crate::Connection>,
-    hir: HirContext<'_>,
+    catalog: &SemanticContext<'_>,
 ) -> crate::Result<()> {
     translate_integrity_check_impl(
         schema,
@@ -39,7 +39,7 @@ pub fn translate_integrity_check(
         max_errors,
         false,
         connection,
-        hir,
+        catalog,
     )
 }
 
@@ -50,7 +50,7 @@ pub fn translate_quick_check(
     database_id: usize,
     max_errors: usize,
     connection: &std::sync::Arc<crate::Connection>,
-    hir: HirContext<'_>,
+    catalog: &SemanticContext<'_>,
 ) -> crate::Result<()> {
     translate_integrity_check_impl(
         schema,
@@ -59,7 +59,7 @@ pub fn translate_quick_check(
         max_errors,
         true,
         connection,
-        hir,
+        catalog,
     )
 }
 
@@ -125,7 +125,7 @@ fn translate_integrity_check_impl(
     max_errors: usize,
     quick: bool,
     connection: &std::sync::Arc<crate::Connection>,
-    hir: HirContext<'_>,
+    catalog: &SemanticContext<'_>,
 ) -> crate::Result<()> {
     // 1) Run low-level btree/freelist/overflow verification first. This mirrors
     // SQLite's OP_IntegrityCk front-pass and can already emit corruption errors
@@ -240,7 +240,13 @@ fn translate_integrity_check_impl(
             .filter(|index| index.root_page > 0)
             .cloned()
             .collect();
-        let rows = hir_table_rows(connection, hir, database_id, btree_table, &table_indexes)?;
+        let rows = hir_table_rows(
+            connection,
+            catalog,
+            database_id,
+            btree_table,
+            &table_indexes,
+        )?;
 
         let mut indexes = Vec::with_capacity(table_indexes.len());
         for index in table_indexes {
@@ -551,12 +557,11 @@ struct HirIndexOffsets {
 /// the index is not run on them.
 fn hir_table_rows(
     connection: &std::sync::Arc<crate::Connection>,
-    hir: HirContext<'_>,
+    catalog: &SemanticContext<'_>,
     database_id: usize,
     table: &BTreeTable,
     indexes: &[crate::sync::Arc<Index>],
 ) -> crate::Result<TableRows> {
-    let (schema, settings) = hir;
     let database = connection
         .get_database_name_by_index(database_id)
         .ok_or_else(|| {
@@ -636,8 +641,7 @@ fn hir_table_rows(
         database,
         table.name.clone(),
         None,
-        schema,
-        settings,
+        catalog,
         connection,
     )?;
     Ok(TableRows::Hir(

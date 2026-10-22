@@ -13,6 +13,7 @@ use crate::{
     LimboError, Result, SymbolTable, MAIN_DB_ID, TEMP_DB_ID,
 };
 
+use super::catalog::SemanticCatalog;
 use super::hir::{CatalogSnapshot, DatabaseId, DatabaseSnapshot};
 
 static NEXT_SNAPSHOT_ID: AtomicU64 = AtomicU64::new(1);
@@ -48,6 +49,8 @@ impl DoubleQuotedDml {
 
 /// Catalog inputs available while converting parser AST into resolved HIR.
 pub(crate) struct SemanticContext<'catalog> {
+    /// The captured catalog this context reads, when it was built from one.
+    catalog: Option<&'catalog SemanticCatalog>,
     main_schema: &'catalog Schema,
     database_schemas: HashMap<DatabaseId, &'catalog Schema>,
     symbols: &'catalog SymbolTable,
@@ -90,11 +93,50 @@ impl<'catalog> SemanticContext<'catalog> {
         )
         .map(|context| {
             context
+                .with_catalog(catalog)
                 .with_dqs_dml(dqs_dml)
                 .with_foreign_keys(foreign_keys_enabled)
                 .with_temp_database(catalog.has_temp_database)
                 .with_search_path_configured(catalog.search_path_configured)
         })
+    }
+
+    /// A context with this one's settings over `catalog` instead.
+    pub(crate) fn for_other_catalog<'other>(
+        &self,
+        catalog: &'other SemanticCatalog,
+    ) -> Result<SemanticContext<'other>>
+    where
+        'catalog: 'other,
+    {
+        SemanticContext::for_catalog(
+            catalog,
+            self.symbols,
+            self.custom_types_enabled,
+            self.dialect.clone(),
+            self.dqs_dml,
+            self.foreign_keys_enabled,
+        )
+        .map(|context| {
+            context
+                .with_capture_changes(self.capture_changes_table.clone())
+                .with_long_column_names(self.long_column_names)
+        })
+    }
+
+    /// The captured catalog with the main database's schema replaced by
+    /// `schema`, for a statement that must read the latest shared schema.
+    pub(crate) fn catalog_with_main_schema(&self, schema: Arc<Schema>) -> Result<SemanticCatalog> {
+        self.catalog
+            .map(|catalog| catalog.with_main_schema(schema))
+            .ok_or_else(|| {
+                LimboError::InternalError("semantic context has no captured catalog".to_string())
+            })
+    }
+
+    fn with_catalog(mut self, catalog: &'catalog SemanticCatalog) -> Self {
+        self.catalog = Some(catalog);
+        self
     }
 
     #[cfg(test)]
@@ -160,6 +202,7 @@ impl<'catalog> SemanticContext<'catalog> {
             }
         }
         Ok(Self {
+            catalog: None,
             main_schema,
             database_schemas,
             symbols,

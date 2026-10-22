@@ -15,13 +15,12 @@ pub fn translate_update_for_schema_change(
     program: &mut ProgramBuilder,
     connection: &Arc<crate::Connection>,
     ddl_query: &str,
-    hir: crate::translate::HirContext<'_>,
+    catalog: &SemanticContext<'_>,
     after: impl FnOnce(&mut ProgramBuilder),
 ) -> crate::Result<()> {
-    let (schema, settings) = hir;
     let statement = ast::Stmt::Update(body);
     super::semantic_lowering::translate_schema_update(
-        &statement, schema, settings, program, connection, ddl_query,
+        &statement, catalog, program, connection, ddl_query,
     )?;
     after(program);
     Ok(())

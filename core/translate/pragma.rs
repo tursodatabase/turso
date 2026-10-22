@@ -217,7 +217,6 @@ pub fn translate_pragma(
     pager: Arc<Pager>,
     connection: Arc<crate::Connection>,
     program: &mut ProgramBuilder,
-    hir: crate::translate::HirContext<'_>,
 ) -> crate::Result<()> {
     let opts = ProgramBuilderOpts::new(0, 20, 0);
     program.extend(&opts);
@@ -245,7 +244,6 @@ pub fn translate_pragma(
             database_id,
             schema_was_explicit,
             program,
-            hir,
         )?,
         Some(ast::PragmaBody::Equals(value) | ast::PragmaBody::Call(value)) => match pragma {
             // These pragmas take a parameter but are queries, not setters
@@ -267,7 +265,6 @@ pub fn translate_pragma(
                 database_id,
                 schema_was_explicit,
                 program,
-                hir,
             )?,
             _ => update_pragma(
                 pragma,
@@ -278,7 +275,6 @@ pub fn translate_pragma(
                 database_id,
                 schema_was_explicit,
                 program,
-                hir,
             )?,
         },
     };
@@ -312,7 +308,6 @@ fn update_pragma(
     database_id: usize,
     schema_was_explicit: bool,
     program: &mut ProgramBuilder,
-    hir: crate::translate::HirContext<'_>,
 ) -> crate::Result<TransactionMode> {
     let parse_pragma_enabled = |expr: &ast::Expr| -> bool {
         if let Expr::Literal(Literal::Numeric(n)) = expr {
@@ -415,7 +410,6 @@ fn update_pragma(
                 database_id,
                 schema_was_explicit,
                 program,
-                hir,
             )
         }
         PragmaName::FullColumnNames => {
@@ -440,7 +434,6 @@ fn update_pragma(
             database_id,
             schema_was_explicit,
             program,
-            hir,
         ),
         PragmaName::ModuleList => Ok(TransactionMode::None),
         PragmaName::PageCount => query_pragma(
@@ -452,7 +445,6 @@ fn update_pragma(
             database_id,
             schema_was_explicit,
             program,
-            hir,
         ),
         PragmaName::MaxPageCount => {
             let data = parse_signed_number(&value)?;
@@ -630,7 +622,6 @@ fn update_pragma(
             database_id,
             schema_was_explicit,
             program,
-            hir,
         ),
         PragmaName::FreelistCount => query_pragma(
             PragmaName::FreelistCount,
@@ -641,7 +632,6 @@ fn update_pragma(
             database_id,
             schema_was_explicit,
             program,
-            hir,
         ),
         PragmaName::EncryptionKey => {
             let value = parse_string(&value)?;
@@ -797,7 +787,6 @@ fn update_pragma(
             database_id,
             schema_was_explicit,
             program,
-            hir,
         ),
     }
 }
@@ -812,7 +801,6 @@ fn query_pragma(
     database_id: usize,
     schema_was_explicit: bool,
     program: &mut ProgramBuilder,
-    hir: crate::translate::HirContext<'_>,
 ) -> crate::Result<TransactionMode> {
     let schema = catalog.main_schema();
     let register = program.alloc_register();
@@ -1490,10 +1478,25 @@ fn query_pragma(
             let main_schema = (database_id == 0 && connection.mvcc_enabled())
                 .then(|| connection.db.schema.lock().clone());
             let schema = main_schema.as_deref().unwrap_or(schema);
-            // HIR plans against this connection's schema, so it reads rows
-            // only when the check uses that schema.
-            let hir = (main_schema.as_ref().unwrap_or(hir.0), hir.1);
-            translate_integrity_check(schema, program, database_id, max_errors, &connection, hir)?;
+            // The rows are read through a catalog over the same schema the
+            // check uses.
+            let latest = main_schema
+                .as_ref()
+                .map(|schema| catalog.catalog_with_main_schema(schema.clone()))
+                .transpose()?;
+            let latest_catalog = latest
+                .as_ref()
+                .map(|latest| catalog.for_other_catalog(latest))
+                .transpose()?;
+            let catalog = latest_catalog.as_ref().unwrap_or(catalog);
+            translate_integrity_check(
+                schema,
+                program,
+                database_id,
+                max_errors,
+                &connection,
+                catalog,
+            )?;
             Ok(TransactionMode::Read)
         }
         PragmaName::QuickCheck => {
@@ -1501,8 +1504,23 @@ fn query_pragma(
             let main_schema = (database_id == 0 && connection.mvcc_enabled())
                 .then(|| connection.db.schema.lock().clone());
             let schema = main_schema.as_deref().unwrap_or(schema);
-            let hir = (main_schema.as_ref().unwrap_or(hir.0), hir.1);
-            translate_quick_check(schema, program, database_id, max_errors, &connection, hir)?;
+            let latest = main_schema
+                .as_ref()
+                .map(|schema| catalog.catalog_with_main_schema(schema.clone()))
+                .transpose()?;
+            let latest_catalog = latest
+                .as_ref()
+                .map(|latest| catalog.for_other_catalog(latest))
+                .transpose()?;
+            let catalog = latest_catalog.as_ref().unwrap_or(catalog);
+            translate_quick_check(
+                schema,
+                program,
+                database_id,
+                max_errors,
+                &connection,
+                catalog,
+            )?;
             Ok(TransactionMode::Read)
         }
         PragmaName::CaptureDataChangesConn | PragmaName::UnstableCaptureDataChangesConn => {

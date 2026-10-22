@@ -1722,7 +1722,7 @@ mod tests {
         let turso_parser::ast::Cmd::Stmt(statement) = command else {
             panic!("SQL contains a statement command");
         };
-        crate::translate::semantic::analyze_root(
+        crate::translate::semantic::analyze_root_with_options(
             &catalog,
             &SymbolTable::new(),
             SemanticOptions {

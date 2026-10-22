@@ -58,9 +58,54 @@ use tracing::{instrument, Level};
 use transaction::{translate_tx_begin, translate_tx_commit};
 use turso_parser::ast;
 
-/// What a statement is analyzed and lowered with: the schema it was
-/// prepared against and the HIR settings of its connection.
-pub(crate) type HirContext<'a> = (&'a Arc<Schema>, &'a semantic_lowering::HirSettings<'a>);
+/// Snapshot every database a statement prepared against `schema` can name.
+pub(crate) fn capture_catalog(
+    schema: &Arc<Schema>,
+    connection: &Connection,
+    dialect: &dyn crate::dialect::Dialect,
+    search_path: Option<&[String]>,
+) -> Result<semantic::catalog::SemanticCatalog> {
+    semantic::catalog::SemanticCatalog::capture(
+        schema.clone(),
+        connection.database_schemas(),
+        &connection.temp.database,
+        connection.attached_databases(),
+        connection.experimental_custom_types_enabled(),
+        dialect,
+        search_path,
+    )
+}
+
+/// The context a statement is analyzed, planned and lowered with: the
+/// captured catalog and the connection's settings.
+pub(crate) fn semantic_context<'a>(
+    catalog: &'a semantic::catalog::SemanticCatalog,
+    syms: &'a SymbolTable,
+    connection: &Connection,
+    dialect: Arc<dyn crate::dialect::Dialect>,
+) -> Result<SemanticContext<'a>> {
+    Ok(SemanticContext::for_catalog(
+        catalog,
+        syms,
+        connection.experimental_custom_types_enabled(),
+        dialect,
+        if connection.get_dqs_dml() {
+            semantic::context::DoubleQuotedDml::Enabled
+        } else {
+            semantic::context::DoubleQuotedDml::Disabled
+        },
+        connection.foreign_keys_enabled(),
+    )?
+    .with_capture_changes(
+        connection
+            .get_capture_data_changes_info()
+            .as_ref()
+            .map(|info| info.table.clone()),
+    )
+    .with_long_column_names(
+        connection.get_full_column_names() && !connection.get_short_column_names(),
+    ))
+}
 
 #[instrument(skip_all, level = Level::DEBUG)]
 #[allow(clippy::too_many_arguments)]
@@ -109,35 +154,14 @@ pub fn translate(
     } else {
         connection.dialect()
     };
-    let hir_settings = semantic_lowering::HirSettings::new(
+    let captured = capture_catalog(
+        schema,
         &connection,
-        syms,
-        dialect.clone(),
-        prepare_options.unqualified_database_search_path.as_deref(),
-    );
-    let captured = semantic::catalog::SemanticCatalog::capture(
-        schema.clone(),
-        connection.database_schemas(),
-        &connection.temp.database,
-        connection.attached_databases(),
-        connection.experimental_custom_types_enabled(),
         dialect.as_ref(),
         prepare_options.unqualified_database_search_path.as_deref(),
     )?;
-    let catalog = SemanticContext::for_catalog(
-        &captured,
-        syms,
-        connection.experimental_custom_types_enabled(),
-        dialect,
-        if connection.get_dqs_dml() {
-            semantic::context::DoubleQuotedDml::Enabled
-        } else {
-            semantic::context::DoubleQuotedDml::Disabled
-        },
-        connection.foreign_keys_enabled(),
-    )?;
+    let catalog = semantic_context(&captured, syms, &connection, dialect)?;
 
-    let hir = (schema, &hir_settings);
     match stmt {
         // There can be no nesting with pragma, so lift it up here
         ast::Stmt::Pragma { name, body } => {
@@ -148,10 +172,9 @@ pub fn translate(
                 pager,
                 connection.clone(),
                 &mut program,
-                hir,
             )?;
         }
-        stmt => translate_statement(stmt, &catalog, &mut program, &connection, input, hir)?,
+        stmt => translate_statement(stmt, &catalog, &mut program, &connection, input)?,
     };
 
     program.epilogue(schema);
@@ -169,7 +192,6 @@ fn translate_statement(
     program: &mut ProgramBuilder,
     connection: &Arc<Connection>,
     input: &str,
-    hir: HirContext<'_>,
 ) -> Result<()> {
     let is_write = matches!(
         stmt,
@@ -227,10 +249,9 @@ fn translate_statement(
         None
     };
 
-    let (schema, settings) = hir;
     match stmt {
         ast::Stmt::Select(_) => {
-            semantic_lowering::translate_select(&stmt, schema, settings, program, connection)?
+            semantic_lowering::translate_select(&stmt, catalog, program, connection)?
         }
         ast::Stmt::Delete { .. } => {
             if let ast::Stmt::Delete {
@@ -243,7 +264,7 @@ fn translate_statement(
                     );
                 }
             }
-            semantic_lowering::translate_delete(&stmt, schema, settings, program, connection)?
+            semantic_lowering::translate_delete(&stmt, catalog, program, connection)?
         }
         ast::Stmt::Update(ref update) => {
             if update.where_clause.is_none() && connection.get_dml_require_where() {
@@ -251,24 +272,24 @@ fn translate_statement(
                     "UPDATE without a WHERE clause is not allowed when require_where (or i_am_a_dummy) is enabled"
                 );
             }
-            semantic_lowering::translate_update(&stmt, schema, settings, program, connection)?
+            semantic_lowering::translate_update(&stmt, catalog, program, connection)?
         }
         ast::Stmt::Insert { .. } => {
-            semantic_lowering::translate_insert(&stmt, schema, settings, program, connection)?
+            semantic_lowering::translate_insert(&stmt, catalog, program, connection)?
         }
         ast::Stmt::AlterTable(alter) => {
-            translate_alter_table(alter, catalog, program, connection, input, hir)?;
+            translate_alter_table(alter, catalog, program, connection, input)?;
         }
         ast::Stmt::Analyze { name } => translate_analyze(name, catalog, program)?,
         ast::Stmt::Attach { expr, db_name, key } => {
-            attach::translate_attach(&expr, &db_name, &key, program, connection.clone(), hir)?;
+            attach::translate_attach(&expr, &db_name, &key, program, connection.clone(), catalog)?;
         }
         ast::Stmt::Begin { typ, name } => translate_tx_begin(typ, name, catalog, program)?,
         ast::Stmt::Commit { name } => {
             translate_tx_commit(name, catalog.main_schema(), catalog, program)?
         }
         ast::Stmt::CreateIndex { .. } => {
-            translate_create_index(program, connection, catalog, stmt, hir)?;
+            translate_create_index(program, connection, catalog, stmt)?;
         }
         ast::Stmt::CreateTable {
             temporary,
@@ -284,7 +305,6 @@ fn translate_statement(
             program,
             connection,
             input,
-            hir,
         )?,
         ast::Stmt::CreateTrigger {
             temporary,
@@ -354,7 +374,7 @@ fn translate_statement(
             translate_create_virtual_table(vtab, catalog, program, connection)?
         }
         ast::Stmt::Detach { name } => {
-            attach::translate_detach(&name, program, connection.clone(), hir)?
+            attach::translate_detach(&name, program, connection.clone(), catalog)?
         }
         ast::Stmt::DropIndex {
             if_exists,
@@ -363,7 +383,7 @@ fn translate_statement(
         ast::Stmt::DropTable {
             if_exists,
             tbl_name,
-        } => translate_drop_table(tbl_name, catalog, if_exists, program, connection, hir)?,
+        } => translate_drop_table(tbl_name, catalog, if_exists, program, connection)?,
         ast::Stmt::DropTrigger {
             if_exists,
             trigger_name,
@@ -425,7 +445,7 @@ fn translate_statement(
         ast::Stmt::Pragma { .. } => {
             bail_parse_error!("PRAGMA statement cannot be evaluated in a nested context")
         }
-        ast::Stmt::Reindex { name } => translate_reindex(name, catalog, program, connection, hir)?,
+        ast::Stmt::Reindex { name } => translate_reindex(name, catalog, program, connection)?,
         ast::Stmt::Optimize { idx_name } => {
             translate_optimize(idx_name, catalog, program, connection)?
         }

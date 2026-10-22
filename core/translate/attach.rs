@@ -7,9 +7,7 @@ use crate::vdbe::insn::Insn;
 use crate::{sync::Arc, Connection, Result};
 use turso_parser::ast::{Expr, Literal};
 
-/// The HIR settings ATTACH and DETACH evaluate their arguments with, when
-/// HIR is on.
-use crate::translate::HirContext;
+use crate::translate::semantic::context::SemanticContext;
 
 /// How an ATTACH or DETACH argument gets its value.
 enum Argument<'a> {
@@ -38,7 +36,7 @@ impl<'a> Argument<'a> {
 fn emit_arguments(
     program: &mut ProgramBuilder,
     connection: &Arc<Connection>,
-    hir: HirContext<'_>,
+    catalog: &SemanticContext<'_>,
     arguments: &[Argument<'_>],
     start: usize,
 ) -> Result<()> {
@@ -52,8 +50,7 @@ fn emit_arguments(
     let mut hir_values = if values.is_empty() {
         None
     } else {
-        let (schema, settings) = hir;
-        let select = PlannedSelect::values(values, schema, settings, connection)?;
+        let select = PlannedSelect::values(values, catalog, connection)?;
         Some(select.emit_values(program)?)
     };
     for (i, argument) in arguments.iter().enumerate() {
@@ -98,7 +95,7 @@ pub fn translate_attach(
     key: &Option<Box<Expr>>,
     program: &mut ProgramBuilder,
     connection: Arc<Connection>,
-    hir: HirContext<'_>,
+    catalog: &SemanticContext<'_>,
 ) -> Result<()> {
     if !connection.experimental_attach_enabled() {
         return Err(crate::LimboError::ParseError(
@@ -122,7 +119,7 @@ pub fn translate_attach(
     emit_arguments(
         program,
         &connection,
-        hir,
+        catalog,
         &[Argument::new(expr), Argument::new(db_name), key],
         arg_reg,
     )?;
@@ -146,7 +143,7 @@ pub fn translate_detach(
     expr: &Expr,
     program: &mut ProgramBuilder,
     connection: Arc<Connection>,
-    hir: HirContext<'_>,
+    catalog: &SemanticContext<'_>,
 ) -> Result<()> {
     if !connection.experimental_attach_enabled() {
         return Err(crate::LimboError::ParseError(
@@ -158,7 +155,13 @@ pub fn translate_detach(
 
     let arg_reg = program.alloc_registers(2); // 1 for arg + 1 for result
 
-    emit_arguments(program, &connection, hir, &[Argument::new(expr)], arg_reg)?;
+    emit_arguments(
+        program,
+        &connection,
+        catalog,
+        &[Argument::new(expr)],
+        arg_reg,
+    )?;
 
     // Call sqlite_detach function
     program.emit_insn(Insn::Function {

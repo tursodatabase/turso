@@ -193,7 +193,7 @@ fn compile_action<'a>(
             ))
         }
     }
-    builder.epilogue(session.schema);
+    builder.epilogue(session.context.main_schema());
     let built = builder.build(connection.clone(), true, "fk action")?;
     let prepared = built.prepared().clone();
     slot.set(Arc::downgrade(&prepared))

@@ -15,6 +15,7 @@ mod scope;
 mod trigger;
 mod update;
 
+#[cfg(test)]
 pub(crate) struct SemanticOptions {
     pub(crate) dialect: crate::sync::Arc<dyn crate::dialect::Dialect>,
     pub(crate) custom_types_enabled: bool,
@@ -51,7 +52,8 @@ pub(crate) enum SemanticRootInput<'ast> {
     },
 }
 
-pub(crate) fn analyze_root(
+#[cfg(test)]
+pub(crate) fn analyze_root_with_options(
     catalog: &catalog::SemanticCatalog,
     symbols: &crate::SymbolTable,
     options: SemanticOptions,
@@ -67,6 +69,14 @@ pub(crate) fn analyze_root(
     )?
     .with_capture_changes(options.capture_changes_table)
     .with_long_column_names(options.long_column_names);
+    analyze_root(&context, input)
+}
+
+/// Analyze `input` against `context` into validated HIR.
+pub(crate) fn analyze_root(
+    context: &context::SemanticContext<'_>,
+    input: SemanticRootInput<'_>,
+) -> crate::Result<hir::HirDocument> {
     let input = match input {
         SemanticRootInput::Statement(statement) => AnalyzeInput::Statement(statement),
         SemanticRootInput::TriggerProgram {
@@ -107,7 +117,7 @@ pub(crate) fn analyze_root(
             expressions,
         },
     };
-    analyze::analyze(&context, input)
+    analyze::analyze(context, input)
 }
 
 pub(crate) enum AnalyzeInput<'ast> {
@@ -243,7 +253,7 @@ mod tests {
             capture_changes_table: None,
             long_column_names: false,
         };
-        let document = analyze_root(
+        let document = analyze_root_with_options(
             &catalog,
             &symbols,
             options(),
@@ -275,7 +285,7 @@ mod tests {
         else {
             panic!("SQL contains CREATE TRIGGER");
         };
-        let document = analyze_root(
+        let document = analyze_root_with_options(
             &catalog,
             &symbols,
             options(),
@@ -300,7 +310,7 @@ mod tests {
         assert!(program.predicate.is_some());
         assert_eq!(program.commands.len(), 1);
 
-        let error = analyze_root(
+        let error = analyze_root_with_options(
             &catalog,
             &symbols,
             options(),

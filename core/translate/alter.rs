@@ -572,7 +572,7 @@ fn emit_add_virtual_column_validation(
     column: &Column,
     constraints: &[ast::NamedColumnConstraint],
     connection: &Arc<crate::Connection>,
-    hir: crate::translate::HirContext<'_>,
+    catalog: &SemanticContext<'_>,
     database_id: usize,
 ) -> Result<()> {
     let has_notnull = column.notnull();
@@ -651,7 +651,6 @@ fn emit_add_virtual_column_validation(
             ast::Expr::clone(generated),
         ));
     }
-    let (schema, settings) = hir;
     let database = connection
         .get_database_name_by_index(database_id)
         .ok_or_else(|| LimboError::InternalError(format!("no database with id {database_id}")))?;
@@ -660,8 +659,7 @@ fn emit_add_virtual_column_validation(
         database,
         table.name.clone(),
         None,
-        schema,
-        settings,
+        catalog,
         connection,
     )?;
     select.emit_each_row(program, |program, values| {
@@ -744,7 +742,6 @@ fn emit_add_column_check_validation(
     constraints: &[ast::NamedColumnConstraint],
     catalog: &SemanticContext<'_>,
     connection: &Arc<crate::Connection>,
-    hir: crate::translate::HirContext<'_>,
     database_id: usize,
 ) -> Result<()> {
     // Determine the effective default value. If no DEFAULT, existing rows get NULL,
@@ -841,7 +838,6 @@ fn emit_add_column_check_validation(
     // Every existing row is checked, with its other columns read from the
     // row, as SQLite's check of the altered table does. Like DML, a CHECK
     // constraint reads custom-typed columns as stored.
-    let (schema, settings) = hir;
     let database = connection
         .get_database_name_by_index(database_id)
         .ok_or_else(|| {
@@ -855,8 +851,7 @@ fn emit_add_column_check_validation(
         database,
         original_btree.name.clone(),
         None,
-        schema,
-        settings,
+        catalog,
         connection,
     )?;
     select.emit_each_row(program, |program, values| {
@@ -873,7 +868,6 @@ pub fn translate_alter_table(
     program: &mut ProgramBuilder,
     connection: &Arc<crate::Connection>,
     input: &str,
-    hir: crate::translate::HirContext<'_>,
 ) -> Result<()> {
     let ast::AlterTable {
         name: qualified_name,
@@ -1175,7 +1169,7 @@ pub fn translate_alter_table(
                 program,
                 connection,
                 input,
-                hir,
+                catalog,
                 |program| {
                     if let Some((source_column_by_schema_idx, layout)) = &rewrite_rows {
                         emit_rewrite_table_rows(
@@ -1431,7 +1425,7 @@ pub fn translate_alter_table(
                     &column,
                     &constraints,
                     connection,
-                    hir,
+                    catalog,
                     database_id,
                 )?;
             } else {
@@ -1501,7 +1495,6 @@ pub fn translate_alter_table(
                     &constraints,
                     catalog,
                     connection,
-                    hir,
                     database_id,
                 )?;
             }
@@ -1512,7 +1505,7 @@ pub fn translate_alter_table(
                 program,
                 connection,
                 input,
-                hir,
+                catalog,
                 |program| {
                     program.emit_insn(Insn::SetCookie {
                         db: database_id,
@@ -1745,7 +1738,7 @@ pub fn translate_alter_table(
                     program,
                     connection,
                     input,
-                    hir,
+                    catalog,
                     |_program| {},
                 )?;
             }
@@ -2159,7 +2152,7 @@ pub fn translate_alter_table(
                     program,
                     connection,
                     input,
-                    hir,
+                    catalog,
                     |_program| {},
                 )?;
             }
@@ -2194,7 +2187,7 @@ pub fn translate_alter_table(
                     program,
                     connection,
                     input,
-                    hir,
+                    catalog,
                     |_program| {},
                 )?;
             }
@@ -2215,7 +2208,7 @@ pub fn translate_alter_table(
                     &rewritten_table.columns()[column_index],
                     &definition.constraints,
                     connection,
-                    hir,
+                    catalog,
                     database_id,
                 )?;
 

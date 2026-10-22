@@ -249,7 +249,7 @@ fn compile_trigger(
         }
     }
     builder.preassign_label_to_next_insn(done);
-    builder.epilogue(session.schema);
+    builder.epilogue(session.context.main_schema());
     let built = builder.build(connection.clone(), true, "trigger subprogram")?;
     let prepared = built.prepared().clone();
     let mut databases = Vec::new();
