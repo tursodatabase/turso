@@ -131,8 +131,6 @@ fn test_postgres_rejects_unsupported_transaction_commands(db: TempDatabase) {
 #[turso_macros::test(mvcc)]
 fn test_postgres_rejects_unsupported_set_and_show(db: TempDatabase) {
     let conn = db.connect_postgres();
-    // Neither an unknown PostgreSQL parameter nor a SQLite pragma name may be
-    // silently accepted through SET / SHOW.
     for sql in [
         "SET statement_timeout = 1000",
         "SET foreign_keys = off",
@@ -149,8 +147,6 @@ fn test_postgres_rejects_unsupported_set_and_show(db: TempDatabase) {
     conn.prepare("SET search_path TO public").unwrap();
     conn.prepare("SHOW search_path").unwrap();
 
-    // Values that match existing behaviour are accepted: pg_dump sends these
-    // when it connects, and dump scripts begin with them.
     for sql in [
         "SET DATESTYLE = ISO",
         "SET INTERVALSTYLE = POSTGRES",
@@ -171,7 +167,6 @@ fn test_postgres_rejects_unsupported_set_and_show(db: TempDatabase) {
     ] {
         conn.execute(sql).unwrap_or_else(|e| panic!("{sql}: {e}"));
     }
-    // Other values of the same parameters are still rejected.
     for sql in [
         "SET DATESTYLE = SQL",
         "SET extra_float_digits = 0",

@@ -36,7 +36,6 @@ impl PostgreSQLTranslator {
         &self,
         range_var: &pg_query::protobuf::RangeVar,
     ) -> Result<ast::QualifiedName, ParseError> {
-        // db.schema.table: the database part would be dropped.
         if !range_var.catalogname.is_empty() {
             return Err(not_supported("a cross-database reference"));
         }
@@ -276,8 +275,6 @@ impl PostgreSQLTranslator {
         let tbl_name = self.qualified_name_from_range_var(relation)?;
 
         reject_temporary(relation, "CREATE TEMPORARY TABLE")?;
-        // PARTITION OF also records the parent in inh_relations, so check
-        // partitioning first for the more accurate message.
         if create.partbound.is_some() || create.partspec.is_some() {
             return Err(not_supported("table partitioning"));
         }
@@ -292,8 +289,6 @@ impl PostgreSQLTranslator {
             &create.tablespacename,
             &create.access_method,
         )?;
-        // ON COMMIT is only valid on temporary tables, which are rejected
-        // above, but check it directly rather than rely on that.
         if matches!(
             pg_query::protobuf::OnCommitAction::try_from(create.oncommit),
             Ok(pg_query::protobuf::OnCommitAction::OncommitDeleteRows
@@ -544,7 +539,6 @@ impl PostgreSQLTranslator {
                     }
                     foreign_key = Some(extract_foreign_key(constraint)?);
                 }
-                // NULL, NOT DEFERRABLE and INITIALLY IMMEDIATE restate the defaults.
                 ConstrType::ConstrNull
                 | ConstrType::ConstrAttrNotDeferrable
                 | ConstrType::ConstrAttrImmediate => {}
@@ -771,7 +765,6 @@ impl PostgreSQLTranslator {
             .ok_or_else(|| ParseError::ParseError("ALTER TABLE missing table name".into()))?;
         let name = self.qualified_name_from_range_var(relation)?;
 
-        // ALTER INDEX/VIEW/SEQUENCE/... share AlterTableStmt with ALTER TABLE.
         if alter.objtype != pg_query::protobuf::ObjectType::ObjectTable as i32 {
             return Err(not_supported(format!(
                 "ALTER {}",
@@ -856,14 +849,9 @@ impl PostgreSQLTranslator {
                         ));
                     }
                 };
-                // The USING conversion expression is stored as the raw default.
                 if col_def.raw_default.is_some() {
                     return Err(not_supported("ALTER COLUMN TYPE ... USING"));
                 }
-                // Validate the new definition so the specific errors above
-                // win, then reject: the engine cannot keep the column's name
-                // through ALTER COLUMN, and it does not convert existing
-                // values to the new type the way PostgreSQL does.
                 self.translate_column_def(col_def, &relation.schemaname)?;
                 return Err(not_supported("ALTER TABLE ... ALTER COLUMN ... TYPE"));
             }
@@ -916,8 +904,6 @@ impl PostgreSQLTranslator {
         if rename.missing_ok {
             return Err(not_supported("ALTER ... IF EXISTS ... RENAME"));
         }
-        // RENAME COLUMN records the kind of relation separately; only tables
-        // are handled here.
         if rename_type == ObjectType::ObjectColumn
             && rename.relation_type != ObjectType::ObjectTable as i32
         {
@@ -964,8 +950,6 @@ impl PostgreSQLTranslator {
         reject_column_def_clauses(col_def)?;
 
         let pg_type = extract_type_name(col_def)?;
-        // Serial columns need the implicit sequence that only CREATE TABLE
-        // generates.
         if is_serial_type(&pg_type) {
             return Err(not_supported(format!("{pg_type} in ALTER TABLE")));
         }
@@ -1178,15 +1162,9 @@ impl PostgreSQLTranslator {
             Some(Node::String(s)) => {
                 ast::QualifiedName::single(ast::Name::from_string(s.sval.clone()))
             }
-            Some(Node::TypeName(tn)) => {
-                // DROP TYPE/DOMAIN use TypeName nodes. Types live in a single
-                // namespace, so only an unqualified or public name is accepted.
-                ast::QualifiedName::single(ast::Name::from_string(object_name(
-                    &tn.names,
-                    is_default_schema,
-                    "type",
-                )?))
-            }
+            Some(Node::TypeName(tn)) => ast::QualifiedName::single(ast::Name::from_string(
+                object_name(&tn.names, is_default_schema, "type")?,
+            )),
             _ => {
                 return Err(ParseError::ParseError(
                     "DROP: unexpected object format".into(),
@@ -1230,7 +1208,6 @@ impl PostgreSQLTranslator {
         &self,
         truncate: &pg_query::protobuf::TruncateStmt,
     ) -> Result<ast::Stmt, ParseError> {
-        // TRUNCATE TABLE t → DELETE FROM t
         if truncate.relations.len() > 1 {
             return Err(not_supported("TRUNCATE of several tables"));
         }
@@ -1314,8 +1291,6 @@ impl PostgreSQLTranslator {
             }
         };
         let select = self.translate_select(select_stmt)?;
-        // The engine requires the column list to name every select-list
-        // column, and cannot count the columns of a *.
         if !columns.is_empty() {
             let ast::OneSelect::Select {
                 columns: result_columns,
@@ -1392,8 +1367,6 @@ impl PostgreSQLTranslator {
         })?;
         let view_name = self.qualified_name_from_range_var(relation)?;
         reject_into_clause(into_clause, relation, "CREATE MATERIALIZED VIEW")?;
-        // Materialized views here are maintained incrementally and always
-        // populated, so there is no unpopulated state to create.
         if into_clause.skip_data {
             return Err(not_supported("CREATE MATERIALIZED VIEW ... WITH NO DATA"));
         }
@@ -1424,7 +1397,6 @@ impl PostgreSQLTranslator {
 
     /// Translate CREATE TABLE AS / SELECT INTO into Turso's
     /// `CREATE TABLE ... AS SELECT`. The new table's schema is derived from
-    /// the SELECT by the engine.
     fn translate_ctas_table(
         &self,
         into_clause: &pg_query::protobuf::IntoClause,
@@ -1540,8 +1512,6 @@ impl PostgreSQLTranslator {
         let upsert = self.translate_on_conflict(&insert.on_conflict_clause)?;
 
         let (body, columns) = if !select_stmt.values_lists.is_empty() {
-            // The VALUES rows are rebuilt below without the statement's other
-            // clauses, so they must not have any.
             if !select_stmt.sort_clause.is_empty()
                 || select_stmt.limit_count.is_some()
                 || select_stmt.limit_offset.is_some()
@@ -1553,8 +1523,6 @@ impl PostgreSQLTranslator {
             }
             // VALUES clause — compute which columns are DEFAULT in ALL rows.
             let (rows, default_mask) = self.translate_values(&select_stmt.values_lists)?;
-            // Without a column list, removing an all-DEFAULT position shifts
-            // every later value one column to the left.
             if !has_explicit_columns && default_mask.iter().any(|d| *d) {
                 return Err(not_supported(
                     "DEFAULT in INSERT ... VALUES without a column list",
@@ -1617,7 +1585,6 @@ impl PostgreSQLTranslator {
     /// which column positions contain DEFAULT in every row. These positions should
     /// be stripped from the INSERT column list since SQLite doesn't support DEFAULT
     /// in VALUES — omitting the column achieves the same effect.
-    /// Columns with DEFAULT in only some rows keep the DEFAULT expression.
     // The Box<Expr> is required by ast::OneSelect::Values(Vec<Vec<Box<Expr>>>)
     #[allow(clippy::vec_box, clippy::type_complexity)]
     fn translate_values(
@@ -1739,8 +1706,6 @@ impl PostgreSQLTranslator {
             None
         };
 
-        // PostgreSQL's * also covers the FROM tables; the engine's covers only
-        // the target.
         if !update.from_clause.is_empty() && update.returning_list.iter().any(is_bare_star) {
             return Err(not_supported("RETURNING * on UPDATE ... FROM"));
         }
@@ -1808,8 +1773,6 @@ impl PostgreSQLTranslator {
             ));
         }
 
-        // Row locks are not taken, so FOR UPDATE / FOR SHARE (and their
-        // NOWAIT / SKIP LOCKED variants) cannot be honoured.
         if !select.locking_clause.is_empty() {
             return Err(not_supported("SELECT ... FOR UPDATE / FOR SHARE"));
         }
@@ -1989,10 +1952,6 @@ impl PostgreSQLTranslator {
             Self::flatten_set_operation(larg, parts)?;
         }
         if let Some(rarg) = &stmt.rarg {
-            // The flattened list is evaluated left to right, which matches the
-            // tree only while it is left-deep. A set operation on the right,
-            // from INTERSECT's higher precedence (`A UNION B INTERSECT C`) or
-            // from parentheses (`A EXCEPT (B UNION C)`), would be regrouped.
             let same_associative_operation = matches!(
                 set_op,
                 SetOperation::SetopUnion | SetOperation::SetopIntersect
@@ -2229,8 +2188,6 @@ impl PostgreSQLTranslator {
                     .items
                     .first()
                     .ok_or_else(|| ParseError::ParseError("RangeFunction list is empty".into()))?;
-                // The second element is the per-function column definition
-                // list of ROWS FROM (f() AS (a int)).
                 if list.items.get(1).is_some_and(|n| n.node.is_some()) {
                     return Err(not_supported("a column definition list inside ROWS FROM"));
                 }
@@ -2254,7 +2211,6 @@ impl PostgreSQLTranslator {
 
         let func_name = object_name(&func_call.funcname, is_pg_catalog, "function")?;
         let func_name = func_name.as_str();
-        // Only the name and plain arguments of a function in FROM are used.
         if func_call.func_variadic
             || func_call.agg_star
             || func_call.agg_distinct
@@ -2636,8 +2592,6 @@ impl PostgreSQLTranslator {
         join_expr: &pg_query::protobuf::JoinExpr,
         joins: &mut Vec<ast::JoinedSelectTable>,
     ) -> Result<ast::SelectTable, ParseError> {
-        // Joins are flattened into one list, so there is no node left to
-        // carry an alias for the join's combined columns.
         if join_expr.alias.is_some() {
             return Err(not_supported("an alias on a parenthesized JOIN"));
         }
@@ -2768,8 +2722,6 @@ impl PostgreSQLTranslator {
                                         // SELECT *
                                         result_columns.push(ast::ResultColumn::Star);
                                     } else {
-                                        // SELECT table.* or alias.*. A schema-qualified
-                                        // s.t.* would otherwise expand the wrong name.
                                         let [table, _] = col_ref.fields.as_slice() else {
                                             return Err(not_supported(
                                                 "schema.table.* in a select list",
@@ -2841,9 +2793,6 @@ impl PostgreSQLTranslator {
                                     let Some(pg_query::protobuf::node::Node::String(s)) =
                                         &field.node
                                     else {
-                                        // t.* inside an expression, e.g. count(t.*) or
-                                        // row_to_json(t.*): dropping the star would
-                                        // reference a column named t instead.
                                         return Err(not_supported("table.* inside an expression"));
                                     };
                                     parts.push(s.sval.clone());
@@ -2896,8 +2845,6 @@ impl PostgreSQLTranslator {
                 self.translate_case_expr(case_expr)
             }
             Some(pg_query::protobuf::node::Node::CollateClause(collate)) => {
-                // Text already compares byte-wise, so a binary collation can
-                // be dropped; any other would silently change comparisons.
                 if !is_binary_collation(&collate.collname) {
                     return Err(not_supported("a non-binary COLLATE in an expression"));
                 }
@@ -2918,8 +2865,6 @@ impl PostgreSQLTranslator {
                     .type_name
                     .as_ref()
                     .ok_or_else(|| ParseError::ParseError("TypeCast missing type name".into()))?;
-                // The cast target carries no size, so varchar(3) would not
-                // truncate and numeric(5,2) would not round.
                 if !pg_type_name.typmods.is_empty() {
                     return Err(not_supported("a type modifier in a cast"));
                 }
@@ -3031,8 +2976,6 @@ impl PostgreSQLTranslator {
             }
             Some(pg_query::protobuf::node::Node::SqlvalueFunction(svf)) => {
                 use pg_query::protobuf::SqlValueFunctionOp;
-                // CURRENT_TIMESTAMP(p) and friends: the engine produces
-                // whole seconds, which only matches a requested precision of 0.
                 if matches!(
                     SqlValueFunctionOp::try_from(svf.op),
                     Ok(SqlValueFunctionOp::SvfopCurrentTimeN
@@ -3351,8 +3294,6 @@ impl PostgreSQLTranslator {
 
                 let pattern_node = match &rhs_node.node {
                     Some(pg_query::protobuf::node::Node::FuncCall(fc)) => {
-                        // similar_to_escape(pattern, escape) carries an ESCAPE
-                        // character that the regex conversion does not honour.
                         if fc.args.len() > 1 {
                             return Err(not_supported("SIMILAR TO ... ESCAPE"));
                         }
@@ -3374,8 +3315,6 @@ impl PostgreSQLTranslator {
                         // Re-wrap with quotes for the AST
                         ast::Expr::Literal(ast::Literal::String(format!("'{regex}'")))
                     }
-                    // Only a literal pattern can be rewritten to a regular
-                    // expression; anything else would be matched as POSIX regex.
                     _ => return Err(not_supported("SIMILAR TO with a non-literal pattern")),
                 };
 
@@ -3398,8 +3337,6 @@ impl PostgreSQLTranslator {
         &self,
         a_expr: &pg_query::protobuf::AExpr,
     ) -> Result<ast::Expr, ParseError> {
-        // OPERATOR(pg_catalog.~) names a built-in operator; any other schema
-        // would name a user-defined one that does not exist here.
         let names = extract_key_columns(&a_expr.name)?;
         if names.is_empty() {
             return Err(ParseError::ParseError("Missing operator name".to_string()));
@@ -3804,9 +3741,6 @@ impl PostgreSQLTranslator {
         func_call: &pg_query::protobuf::FuncCall,
     ) -> Result<ast::Expr, ParseError> {
         let func_name = object_name(&func_call.funcname, is_pg_catalog, "function")?;
-        // substring(s FROM 'regex') and substring(s SIMILAR p ESCAPE e) pick
-        // PostgreSQL's pattern overloads by their text second argument; the
-        // engine's substring only takes numeric positions.
         if func_name.eq_ignore_ascii_case("substring")
             && func_call.args.get(1).is_some_and(|arg| {
                 matches!(
@@ -3893,7 +3827,6 @@ impl PostgreSQLTranslator {
         };
         if let Some(type_name) = cast_type {
             if args.len() == 1 {
-                // A cast has nowhere to put aggregate or window clauses.
                 if distinctness.is_some()
                     || filter_over.filter_clause.is_some()
                     || filter_over.over_clause.is_some()
@@ -4231,8 +4164,6 @@ impl PostgreSQLTranslator {
             SubLinkType::ExprSublink => Ok(ast::Expr::Subquery(select)),
             SubLinkType::ArraySublink => Ok(Self::translate_array_subquery(*select)),
             SubLinkType::AnySublink => {
-                // Only `= ANY` (which is also how IN is parsed) maps to IN;
-                // `x > ANY (SELECT ...)` and friends would become IN.
                 let op = extract_key_columns(&sub_link.oper_name)?;
                 let is_equality =
                     op.is_empty() || unqualified_name(&op, is_pg_catalog).is_some_and(|o| o == "=");
@@ -4424,8 +4355,6 @@ impl PostgreSQLTranslator {
         }))
     }
 
-    /// Translates a SELECT's LIMIT/OFFSET, rejecting `FETCH ... WITH TIES`,
-    /// which would otherwise become a plain LIMIT.
     fn translate_select_limit(
         &self,
         select: &pg_query::protobuf::SelectStmt,
@@ -4561,7 +4490,6 @@ impl PostgreSQLTranslator {
 
         // Translate conflict target (the columns in ON CONFLICT (col1, col2))
         let index = if let Some(infer) = &clause.infer {
-            // Without a column list the clause would match any constraint.
             if !infer.conname.is_empty() {
                 return Err(not_supported("ON CONFLICT ON CONSTRAINT"));
             }
@@ -4768,9 +4696,6 @@ impl PostgreSQLTranslator {
         let mut as_type = None;
         for opt_node in &seq.options {
             if let Some(pg_query::protobuf::node::Node::DefElem(elem)) = &opt_node.node {
-                // NO MINVALUE / NO MAXVALUE carry no argument; any other
-                // numeric option whose value does not fit an i64 must not
-                // fall back to the default.
                 if matches!(
                     elem.defname.as_str(),
                     "start" | "increment" | "minvalue" | "maxvalue"
@@ -4901,8 +4826,6 @@ impl PostgreSQLTranslator {
             .as_ref()
             .ok_or_else(|| ParseError::ParseError("CREATE DOMAIN missing base type".into()))?;
         let pg_type = extract_type_name_from_typename(type_name_node)?;
-        // The domain stores only a base type name, so modifiers such as the
-        // length in varchar(5) would be lost.
         if !type_name_node.array_bounds.is_empty() {
             return Err(not_supported("CREATE DOMAIN over an array type"));
         }
@@ -5737,8 +5660,6 @@ fn extract_integer_typmods(
         .collect()
 }
 
-/// Maps a column's PG type, rejecting type modifiers the mapping would drop
-/// (e.g. the precision in `timestamp(3)`).
 fn map_column_type(pg_type: &str, typmods: &[i64]) -> Result<PgTypeMapping, ParseError> {
     let mapping = map_pg_type(pg_type, typmods)
         .ok_or_else(|| ParseError::ParseError(format!("unsupported PostgreSQL type: {pg_type}")))?;
@@ -5791,7 +5712,6 @@ fn pg_fk_action_to_string(action: &str) -> Result<Option<String>, ParseError> {
         "n" => Some("SET NULL".into()),
         "d" => Some("SET DEFAULT".into()),
         "r" => Some("RESTRICT".into()),
-        // 'a' (NO ACTION) is the default, no need to emit
         "" | "a" => None,
         other => {
             return Err(ParseError::ParseError(format!(
@@ -5908,21 +5828,14 @@ pub fn try_extract_set(parse_result: &ParseResult) -> Option<PgSetStmt> {
     })
 }
 
-/// Checks BEGIN / SET TRANSACTION options against what Turso provides.
 fn check_transaction_options(
     options: &[pg_query::protobuf::Node],
     read_only_allowed: bool,
 ) -> Result<(), ParseError> {
-    // Turso has no isolation levels: every transaction reads one snapshot
-    // taken at its start. That is PostgreSQL's REPEATABLE READ. It is not
-    // SERIALIZABLE (MVCC allows write skew), and it is not READ COMMITTED
-    // (no per-statement snapshots), so only REPEATABLE READ is accepted.
-    // DEFERRABLE and READ ONLY are restrictions that are not enforced.
     for opt in options {
         let Some(pg_query::protobuf::node::Node::DefElem(def)) = &opt.node else {
             return Err(not_supported("transaction option"));
         };
-        // pg_query encodes NOT DEFERRABLE and READ WRITE as integer 0.
         let arg_is_zero = matches!(
             def.arg.as_ref().and_then(|n| n.node.as_ref()),
             Some(pg_query::protobuf::node::Node::AConst(pg_query::protobuf::AConst {
@@ -5960,8 +5873,6 @@ fn check_transaction_options(
     Ok(())
 }
 
-/// Whether the statement is `SET TRANSACTION ...`, after rejecting options
-/// Turso cannot honour. READ ONLY is accepted because pg_dump sends it.
 pub fn check_set_transaction(parse_result: &ParseResult) -> Result<bool, ParseError> {
     use pg_query::{protobuf::VariableSetKind, NodeRef};
 
@@ -6231,7 +6142,6 @@ pub fn try_extract_drop_schema(parse_result: &ParseResult) -> Option<PgDropSchem
         return None;
     }
 
-    // Several schemas fall through to translate_drop, which rejects them.
     if drop.objects.len() != 1 {
         return None;
     }
@@ -6254,7 +6164,6 @@ pub fn try_extract_drop_schema(parse_result: &ParseResult) -> Option<PgDropSchem
 
 /// Returns true if the parse result is a REFRESH MATERIALIZED VIEW statement.
 /// Turso materialized views are live (auto-updating), so REFRESH is a no-op.
-/// WITH NO DATA asks for an unpopulated view, which live views cannot be.
 pub fn is_refresh_matview(parse_result: &ParseResult) -> Result<bool, ParseError> {
     use pg_query::NodeRef;
 
@@ -6297,9 +6206,6 @@ pub struct PgCopyFromStmt {
 
 /// Try to extract a COPY FROM file statement from pg_query parse output.
 /// Returns None if the statement is not a COPY FROM with a filename.
-///
-/// Returns `Ok(None)` for statements that are not a file COPY FROM, and an
-/// error for a COPY FROM using an option this frontend does not implement.
 pub fn try_extract_copy_from(
     parse_result: &ParseResult,
 ) -> Result<Option<PgCopyFromStmt>, ParseError> {
@@ -6368,9 +6274,6 @@ pub fn try_extract_copy_from(
                 }
                 delimiter = Some(val);
             }
-            // A bare HEADER means true. HEADER MATCH (check the header
-            // against the column names) is not implemented, and must not be
-            // read as false.
             "header" => {
                 use pg_query::protobuf::node::Node;
                 header = match def.arg.as_ref().and_then(|n| n.node.as_ref()) {
@@ -6427,8 +6330,6 @@ pub fn try_extract_copy_from(
     }))
 }
 
-/// The string argument of a COPY option; any other kind of argument is an
-/// error rather than being ignored.
 fn copy_string_option(def: &pg_query::protobuf::DefElem) -> Result<String, ParseError> {
     def_elem_string_val(def).ok_or_else(|| {
         ParseError::ParseError(format!(
@@ -6697,9 +6598,6 @@ fn not_supported(what: impl std::fmt::Display) -> ParseError {
     ParseError::ParseError(format!("{what} is not supported"))
 }
 
-/// Rejects constraint clauses that have no Turso equivalent. The parser
-/// accepts the full PostgreSQL grammar, so a clause that is not translated
-/// must fail here instead of being dropped.
 fn reject_constraint_attributes(
     constraint: &pg_query::protobuf::Constraint,
     table_schema: &str,
@@ -6707,8 +6605,6 @@ fn reject_constraint_attributes(
     use pg_query::protobuf::ConstrType;
 
     let contype = ConstrType::try_from(constraint.contype).unwrap_or(ConstrType::Undefined);
-    // Table-level constraints carry deferral as flags; column-level ones get
-    // separate attribute nodes after the constraint they modify.
     if constraint.deferrable
         || constraint.initdeferred
         || matches!(
@@ -6720,8 +6616,6 @@ fn reject_constraint_attributes(
             "a DEFERRABLE / INITIALLY DEFERRED constraint",
         ));
     }
-    // A foreign key can only reference a table in the referencing table's own
-    // schema, because the translated clause carries no schema.
     if let Some(pktable) = &constraint.pktable {
         let schema_of =
             |s: &str| map_schema_name(if s.is_empty() { "public" } else { s }).to_string();
@@ -6753,7 +6647,6 @@ fn reject_constraint_attributes(
             "ON DELETE SET NULL / SET DEFAULT with a column list",
         ));
     }
-    // An empty match type is the default, and "s" is an explicit MATCH SIMPLE.
     if !matches!(constraint.fk_matchtype.as_str(), "" | "s") {
         return Err(not_supported("a MATCH FULL / MATCH PARTIAL foreign key"));
     }
@@ -6785,8 +6678,6 @@ fn constr_type_name(contype: pg_query::protobuf::ConstrType) -> String {
     }
 }
 
-/// Rejects `TEMP`/`TEMPORARY` relations: the translator would otherwise
-/// create a permanent, globally visible object.
 fn reject_temporary(relation: &pg_query::protobuf::RangeVar, what: &str) -> Result<(), ParseError> {
     if relation.relpersistence == "t" {
         return Err(not_supported(what));
@@ -6837,8 +6728,6 @@ fn reject_index_elem_clauses(
     Ok(())
 }
 
-/// Rejects the clauses of a CREATE TABLE AS / SELECT INTO / CREATE
-/// MATERIALIZED VIEW target that are not translated.
 fn reject_into_clause(
     into_clause: &pg_query::protobuf::IntoClause,
     relation: &pg_query::protobuf::RangeVar,
@@ -6860,9 +6749,6 @@ fn reject_into_clause(
     Ok(())
 }
 
-/// Rejects ORDER BY, LIMIT, OFFSET and WITH on the branches of a set
-/// operation. Only the outermost node's clauses are translated, so a
-/// parenthesized branch carrying its own would silently lose them.
 fn reject_set_operation_branch_clauses(
     stmt: &pg_query::protobuf::SelectStmt,
 ) -> Result<(), ParseError> {
@@ -6881,8 +6767,6 @@ fn reject_set_operation_branch_clauses(
     Ok(())
 }
 
-/// Plain DISTINCT is a distinct_clause holding one empty node; DISTINCT ON
-/// lists its expressions instead, and is not supported.
 fn translate_distinct_clause(
     distinct_clause: &[pg_query::protobuf::Node],
 ) -> Result<Option<ast::Distinctness>, ParseError> {
@@ -6895,8 +6779,6 @@ fn translate_distinct_clause(
     Ok(Some(ast::Distinctness::Distinct))
 }
 
-/// Rejects a column alias list (`AS x(a, b)`) on a FROM item whose
-/// translation cannot rename the item's columns.
 fn reject_column_aliases(
     alias: &Option<pg_query::protobuf::Alias>,
     what: &str,
@@ -6939,8 +6821,6 @@ fn object_name(
         .ok_or_else(|| not_supported(format!("a schema-qualified {kind} name")))
 }
 
-/// The last part of a name that is unqualified or qualified with a schema
-/// `allowed_schema` accepts.
 fn unqualified_name(names: &[String], allowed_schema: fn(&str) -> bool) -> Option<&String> {
     match names {
         [name] => Some(name),
@@ -6957,9 +6837,6 @@ fn is_default_schema(schema: &str) -> bool {
     map_schema_name(schema) == "main"
 }
 
-/// Whether a collation name means plain byte-wise comparison. Turso always
-/// compares text that way, so these collations are honoured as written;
-/// any other collation would silently become binary.
 fn is_binary_collation(collname: &[pg_query::protobuf::Node]) -> bool {
     let Ok(names) = extract_key_columns(collname) else {
         return false;
@@ -6992,7 +6869,6 @@ mod tests {
             };
             (min_value, max_value)
         };
-        // pg_dump emits AS integer for serial sequences.
         assert_eq!(
             bounds("CREATE SEQUENCE s AS integer START WITH 1"),
             (None, Some(i32::MAX as i64))
@@ -8880,8 +8756,6 @@ mod tests {
 
     #[test]
     fn test_alter_table_alter_column_type() {
-        // Translated, this renamed the column to "" (the ColumnDef carries
-        // no name); the engine cannot do a same-name type change yet.
         assert_not_supported(
             "ALTER TABLE users ALTER COLUMN age TYPE bigint",
             "ALTER COLUMN ... TYPE",
@@ -9707,9 +9581,6 @@ mod tests {
         }
     }
 
-    /// Asserts that `sql` is rejected with a "not supported" error that
-    /// mentions `needle`, instead of being translated with part of its
-    /// meaning silently dropped.
     fn assert_not_supported(sql: &str, needle: &str) {
         let parsed = crate::parse(sql).unwrap();
         let err = PostgreSQLTranslator::new()
@@ -9740,7 +9611,6 @@ mod tests {
         ] {
             assert_not_supported(sql, "DEFERRABLE");
         }
-        // Restating the defaults is fine.
         assert_translates(
             "CREATE TABLE c (pid int REFERENCES p(id) NOT DEFERRABLE INITIALLY IMMEDIATE)",
         );
@@ -9836,7 +9706,6 @@ mod tests {
             "ALTER TABLE c ADD COLUMN a int REFERENCES other.p(id)",
             "another schema",
         );
-        // pg_dump qualifies everything with public; same-schema references are fine.
         assert_translates("CREATE TABLE public.c (a int REFERENCES public.p(id))");
         assert_translates("CREATE TABLE c (a int REFERENCES public.p(id))");
         assert_translates("CREATE TABLE s.c (a int REFERENCES s.p(id))");
@@ -9889,7 +9758,6 @@ mod tests {
     fn fail_closed_temporary_table() {
         assert_not_supported("CREATE TEMP TABLE t (a int)", "TEMPORARY");
         assert_not_supported("CREATE TEMPORARY TABLE t (a int)", "TEMPORARY");
-        // UNLOGGED only weakens durability, so a logged table is a safe substitute.
         assert_translates("CREATE UNLOGGED TABLE t (a int)");
     }
 
@@ -9934,7 +9802,6 @@ mod tests {
             "ALTER TABLE t ALTER COLUMN a TYPE text COLLATE \"en_US\"",
             "COLLATE",
         );
-        // Binary collations match how Turso compares text, so they are kept.
         assert_translates(
             "CREATE TABLE t (a text COLLATE \"C\", b text COLLATE pg_catalog.\"default\")",
         );
@@ -9961,7 +9828,6 @@ mod tests {
             "CREATE TABLE t (a mytype('x'))",
             "non-integer type modifier",
         );
-        // char(n) arrives as bpchar, which maps to unbounded TEXT.
         assert_not_supported("CREATE TABLE t (a char(2))", "a type modifier on bpchar");
         assert_translates("CREATE TABLE t (a varchar(3), b numeric(10, 2), c text, d int[])");
     }
@@ -10302,7 +10168,6 @@ mod tests {
             "SELECT 1 EXCEPT (SELECT 1 UNION SELECT 2)",
             "nested on the right",
         );
-        // Left-deep chains keep their meaning when evaluated left to right.
         assert_translates("SELECT 1 UNION SELECT 2 UNION ALL SELECT 3 EXCEPT SELECT 4");
         assert_translates("SELECT 1 INTERSECT SELECT 2 UNION SELECT 3");
         assert_translates("(SELECT 1 UNION SELECT 2) INTERSECT SELECT 3");
@@ -10503,7 +10368,6 @@ mod tests {
             "SELECT 'a' < 'B' COLLATE \"de-x-icu\"",
             "non-binary COLLATE",
         );
-        // psql's catalog queries use these.
         assert_translates("SELECT relname COLLATE pg_catalog.default FROM pg_class");
         assert_translates("SELECT * FROM t ORDER BY name COLLATE \"C\"");
     }
@@ -10629,7 +10493,6 @@ mod tests {
         );
         assert_translates("CREATE SEQUENCE s OWNED BY NONE NO MINVALUE NO MAXVALUE CACHE 1");
 
-        // pg_dump emits AS integer for serial sequences; it bounds the range.
         let parsed = crate::parse("CREATE SEQUENCE s AS integer START WITH 1").unwrap();
         let stmt = PostgreSQLTranslator::new().translate(&parsed).unwrap();
         let ast::Stmt::CreateSequence {

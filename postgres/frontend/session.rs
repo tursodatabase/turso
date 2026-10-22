@@ -441,10 +441,6 @@ fn handle_pg_set(pg_conn: &Arc<PgConnectionInner>, set_stmt: &PgSetStmt) -> Resu
     )))
 }
 
-/// Whether `SET name = values` asks for behaviour Turso already has, so the
-/// statement can succeed without changing anything. pg_dump issues these
-/// when it connects and dump scripts start with them; any other value of
-/// these parameters, and every other parameter, is rejected.
 fn set_value_already_in_effect(name: &str, values: &[PgSetValue]) -> bool {
     let Some(values) = values
         .iter()
@@ -463,27 +459,20 @@ fn set_value_already_in_effect(name: &str, values: &[PgSetValue]) -> bool {
     let is_on = matches!(value.as_str(), "on" | "true" | "1");
     let is_off = matches!(value.as_str(), "off" | "false" | "0");
     match name.to_ascii_lowercase().as_str() {
-        // No timeouts are enforced, which is what 0 requests.
         "statement_timeout" | "lock_timeout" | "idle_in_transaction_session_timeout" => {
             value == "0"
         }
-        // Dates are written in ISO form, intervals in postgres style, text is UTF-8.
         "datestyle" => matches!(value.as_str(), "iso" | "iso, mdy" | "iso, ymd" | "iso, dmy"),
         "intervalstyle" => value == "postgres",
         "client_encoding" => matches!(value.as_str(), "utf8" | "utf-8" | "unicode"),
-        // Floats are sent in shortest round-trip form, PostgreSQL's output for
-        // any positive extra_float_digits.
         "extra_float_digits" => matches!(value.as_str(), "1" | "2" | "3"),
         "standard_conforming_strings" => is_on,
-        // There is no row-level security, no function body checking, no
-        // synchronized scans and no quote_all_identifiers.
         "row_security" | "quote_all_identifiers" => is_off,
         "check_function_bodies" | "synchronize_seqscans" => is_on || is_off,
         "default_tablespace" => value.is_empty(),
         "default_table_access_method" => value == "heap",
         "transaction_timeout" => value == "0",
         "xmloption" => value == "content",
-        // These only label the session or filter notices.
         "application_name" => true,
         "client_min_messages" => matches!(
             value.as_str(),
