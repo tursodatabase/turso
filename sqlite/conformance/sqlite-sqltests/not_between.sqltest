@@ -45,6 +45,82 @@ test between-self-ref-group-by {
 expect {
 }
 
+@backend cli
+@skip-if sqlite "uses the Turso test-only counter"
+test between-subquery-lhs-once {
+    CREATE TABLE t(a);
+    INSERT INTO t VALUES (1), (2), (3), (4);
+    SELECT COUNT(*) FROM t
+    WHERE (SELECT test_nondet_counter() % 2 + t.a * 0) BETWEEN 0 AND 0;
+}
+expect {
+    2
+}
+
+@backend cli
+@skip-if sqlite "uses the Turso test-only counter"
+test not-between-subquery-lhs-once {
+    CREATE TABLE t(a);
+    INSERT INTO t VALUES (1), (2), (3), (4);
+    SELECT COUNT(*) FROM t
+    WHERE (SELECT test_nondet_counter() % 2 + t.a * 0) NOT BETWEEN 0 AND 0;
+}
+expect {
+    2
+}
+
+@backend cli
+@skip-if sqlite "uses the Turso test-only counter"
+test between-subquery-lhs-in-function {
+    CREATE TABLE t(a);
+    INSERT INTO t VALUES (1), (2), (3), (4);
+    SELECT COUNT(*) FROM t
+    WHERE abs((SELECT test_nondet_counter() % 2 + t.a * 0)) BETWEEN 0 AND 0;
+}
+expect {
+    2
+}
+
+@backend cli
+@skip-if sqlite "uses the Turso test-only counter"
+test between-subquery-lhs-and-bounds {
+    CREATE TABLE t(a);
+    INSERT INTO t VALUES (1), (2), (3), (4);
+    SELECT COUNT(*) FROM t
+    WHERE (SELECT test_nondet_counter() % 2 + t.a * 0)
+        BETWEEN (SELECT test_nondet_counter() % 2 + t.a * 0)
+        AND (SELECT test_nondet_counter() % 2 + t.a * 0);
+}
+expect {
+    0
+}
+
+@backend cli
+@skip-if sqlite "uses the Turso test-only counter"
+test between-subquery-lhs-delete {
+    CREATE TABLE t(a);
+    INSERT INTO t VALUES (1), (2), (3), (4);
+    DELETE FROM t
+    WHERE (SELECT test_nondet_counter() % 2 + t.a * 0) BETWEEN 0 AND 0;
+    SELECT COUNT(*) FROM t;
+}
+expect {
+    2
+}
+
+@backend cli
+@skip-if sqlite "uses the Turso test-only counter"
+test between-subquery-lhs-update {
+    CREATE TABLE t(a, b);
+    INSERT INTO t VALUES (1, 0), (2, 0), (3, 0), (4, 0);
+    UPDATE t SET b = 1
+    WHERE (SELECT test_nondet_counter() % 2 + t.a * 0) BETWEEN 0 AND 0;
+    SELECT SUM(b) FROM t;
+}
+expect {
+    2
+}
+
 # Regression test: multi-index OR must not be used when NOT BETWEEN bounds depend
 # on scalar subquery results. The predicate below should evaluate to NULL for every
 # row (thus filter all rows), even with ORDER BY + LIMIT/OFFSET.

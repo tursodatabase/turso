@@ -2627,6 +2627,28 @@ pub fn rewrite_between_exprs(expr: &mut Expr) -> Result<()> {
             end,
         } = e
         {
+            if matches!(start.as_ref(), Expr::Literal(_))
+                && matches!(end.as_ref(), Expr::Literal(_))
+            {
+                let mut lhs_has_subquery = false;
+                walk_expr(lhs, &mut |expr| {
+                    if matches!(
+                        expr,
+                        Expr::Subquery(_)
+                            | Expr::Exists(_)
+                            | Expr::InSelect { .. }
+                            | Expr::SubqueryResult { .. }
+                    ) {
+                        lhs_has_subquery = true;
+                        return Ok(WalkControl::SkipChildren);
+                    }
+                    Ok(WalkControl::Continue)
+                })?;
+                if lhs_has_subquery {
+                    return Ok(WalkControl::Continue);
+                }
+            }
+
             let lhs_expr = std::mem::take(lhs.as_mut());
             let start_expr = std::mem::take(start.as_mut());
             let end_expr = std::mem::take(end.as_mut());
