@@ -753,6 +753,9 @@ impl PostgreSQLTranslator {
             .ok_or_else(|| ParseError::ParseError("ALTER TABLE missing table name".into()))?;
         let name = self.qualified_name_from_range_var(relation);
 
+        if alter.cmds.len() > 1 {
+            return Err(not_supported("ALTER TABLE with multiple subcommands"));
+        }
         let cmd_node = alter
             .cmds
             .first()
@@ -8880,6 +8883,14 @@ mod tests {
         assert_not_supported(
             "ALTER TABLE t ALTER COLUMN id TYPE bigserial",
             "bigserial in ALTER TABLE",
+        );
+    }
+
+    #[test]
+    fn fail_closed_alter_table_multiple_subcommands() {
+        assert_not_supported(
+            "ALTER TABLE t ADD COLUMN a int, ADD COLUMN b int",
+            "multiple subcommands",
         );
     }
 }
