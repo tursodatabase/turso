@@ -5,6 +5,7 @@ use crate::common::{
 use crate::common::{compare_string, do_flush, TempDatabase};
 use asserting::prelude::*;
 use log::debug;
+use rusqlite::types::Value as RValue;
 use std::io::{Read, Seek, Write};
 use std::sync::Arc;
 use turso_core::vdbe::StepResult;
@@ -588,6 +589,34 @@ fn test_rollback_on_foreign_key_constraint_violation(tmp_db: TempDatabase) -> an
     let db_size = std::fs::metadata(&tmp_db.path).unwrap().len();
     assert_eq!(db_size, 21 * 4096);
 
+    Ok(())
+}
+
+#[turso_macros::test]
+fn test_delete_collects_rowids_first_only_when_foreign_keys_are_on(
+    tmp_db: TempDatabase,
+) -> anyhow::Result<()> {
+    let conn = tmp_db.connect_limbo();
+    conn.execute("CREATE TABLE parent(id INTEGER PRIMARY KEY)")?;
+    conn.execute(
+        "CREATE TABLE child(id INTEGER PRIMARY KEY, pid INTEGER REFERENCES parent(id) ON DELETE CASCADE)",
+    )?;
+    conn.execute("CREATE TABLE plain_parent(id INTEGER PRIMARY KEY)")?;
+    conn.execute(
+        "CREATE TABLE plain_child(id INTEGER PRIMARY KEY, \
+         a INTEGER REFERENCES plain_parent(id) ON DELETE NO ACTION, \
+         b INTEGER REFERENCES plain_parent(id) ON DELETE RESTRICT)",
+    )?;
+    let delete_uses_rowset = |conn: &Arc<Connection>, table: &str| {
+        limbo_exec_rows(conn, &format!("EXPLAIN DELETE FROM {table} WHERE id > 5"))
+            .iter()
+            .any(|row| row[1] == RValue::Text("RowSetAdd".to_string()))
+    };
+
+    assert!(!delete_uses_rowset(&conn, "parent"));
+    conn.execute("PRAGMA foreign_keys = ON")?;
+    assert!(delete_uses_rowset(&conn, "parent"));
+    assert!(!delete_uses_rowset(&conn, "plain_parent"));
     Ok(())
 }
 
