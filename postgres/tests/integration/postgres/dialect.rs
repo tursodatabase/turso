@@ -445,6 +445,79 @@ fn test_postgres_create_schema_public_error(db: TempDatabase) {
 }
 
 #[turso_macros::test]
+fn test_postgres_create_schema_with_failing_element_creates_nothing(db: TempDatabase) {
+    let conn = db.connect_postgres();
+
+    let err = conn
+        .execute("CREATE SCHEMA s CREATE TABLE t (a int) CREATE TABLE t (b int)")
+        .unwrap_err();
+    assert!(err.to_string().contains("already exists"), "{err}");
+    assert!(conn.execute("SELECT * FROM s.t").is_err());
+
+    conn.execute("CREATE SCHEMA s CREATE TABLE t (a int)")
+        .unwrap();
+    conn.execute("INSERT INTO s.t VALUES (1)").unwrap();
+    let rows = conn
+        .prepare("SELECT a FROM s.t")
+        .unwrap()
+        .run_collect_rows()
+        .unwrap();
+    assert_eq!(rows, vec![vec![Value::from_i64(1)]]);
+    let rows = conn
+        .prepare("SHOW search_path")
+        .unwrap()
+        .run_collect_rows()
+        .unwrap();
+    assert_eq!(rows, vec![vec![Value::build_text("\"$user\", public")]]);
+}
+
+#[turso_macros::test]
+fn test_postgres_create_schema_with_empty_search_path(db: TempDatabase) {
+    let conn = db.connect_postgres();
+    for setting in ["", "  "] {
+        conn.execute(format!(
+            "SELECT set_config('search_path', '{setting}', false)"
+        ))
+        .unwrap();
+        conn.execute("DROP SCHEMA IF EXISTS s CASCADE").unwrap();
+        conn.execute("CREATE SCHEMA s CREATE TABLE t (a int) CREATE VIEW v AS SELECT a FROM t")
+            .unwrap();
+        conn.execute("INSERT INTO s.t VALUES (1)").unwrap();
+        let rows = conn
+            .prepare("SELECT a FROM s.v")
+            .unwrap()
+            .run_collect_rows()
+            .unwrap();
+        assert_eq!(rows, vec![vec![Value::from_i64(1)]]);
+        let rows = conn
+            .prepare("SHOW search_path")
+            .unwrap()
+            .run_collect_rows()
+            .unwrap();
+        assert_eq!(rows, vec![vec![Value::build_text(setting)]]);
+    }
+}
+
+#[turso_macros::test]
+fn test_postgres_create_schema_with_elements_in_transaction_errors(db: TempDatabase) {
+    let conn = db.connect_postgres();
+    conn.execute("BEGIN").unwrap();
+    let err = conn
+        .execute("CREATE SCHEMA s CREATE TABLE t (a int) CREATE TABLE t (b int)")
+        .unwrap_err();
+    assert!(
+        err.to_string()
+            .contains("cannot run inside a transaction block"),
+        "{err}"
+    );
+    conn.execute("ROLLBACK").unwrap();
+
+    conn.execute("CREATE SCHEMA s CREATE TABLE t (a int)")
+        .unwrap();
+    conn.execute("INSERT INTO s.t VALUES (1)").unwrap();
+}
+
+#[turso_macros::test]
 fn test_postgres_drop_schema(db: TempDatabase) {
     let conn = db.connect_postgres();
 

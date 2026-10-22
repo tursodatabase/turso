@@ -5303,6 +5303,9 @@ pub fn try_extract_show(parse_result: &ParseResult) -> Option<PgShowStmt> {
 pub struct PgCreateSchemaStmt {
     pub name: String,
     pub if_not_exists: bool,
+    /// The statements written after the schema name, with their objects
+    /// placed in the new schema, in the order PostgreSQL runs them.
+    pub elements: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -5313,20 +5316,70 @@ pub struct PgDropSchemaStmt {
 }
 
 /// Try to extract a CREATE SCHEMA statement from pg_query parse output.
-pub fn try_extract_create_schema(parse_result: &ParseResult) -> Option<PgCreateSchemaStmt> {
+pub fn try_extract_create_schema(
+    parse_result: &ParseResult,
+) -> Result<Option<PgCreateSchemaStmt>, ParseError> {
     use pg_query::NodeRef;
 
     let nodes = parse_result.protobuf.nodes();
     if nodes.is_empty() {
-        return None;
+        return Ok(None);
     }
     let NodeRef::CreateSchemaStmt(cs) = &nodes[0].0 else {
-        return None;
+        return Ok(None);
     };
-    Some(PgCreateSchemaStmt {
+    Ok(Some(PgCreateSchemaStmt {
         if_not_exists: cs.if_not_exists,
         name: cs.schemaname.clone(),
-    })
+        elements: create_schema_elements(&cs.schema_elts, &cs.schemaname)?,
+    }))
+}
+
+/// The SQL of each statement embedded in CREATE SCHEMA, like PostgreSQL's
+/// transformCreateSchemaStmtElements(): an object named without a schema
+/// goes to the new schema, an object named with another schema is an error,
+/// and the statements run grouped by kind, so that a view can come before
+/// the table it reads.
+fn create_schema_elements(
+    elements: &[pg_query::protobuf::Node],
+    schema: &str,
+) -> Result<Vec<String>, ParseError> {
+    use pg_query::NodeEnum;
+
+    let mut elements = elements
+        .iter()
+        .map(|element| {
+            let mut element = element
+                .node
+                .clone()
+                .expect("CREATE SCHEMA elements are statements");
+            let (order, relation) = match &mut element {
+                NodeEnum::CreateSeqStmt(stmt) => (0, stmt.sequence.as_mut()),
+                NodeEnum::CreateStmt(stmt) => (1, stmt.relation.as_mut()),
+                NodeEnum::ViewStmt(stmt) => (2, stmt.view.as_mut()),
+                NodeEnum::IndexStmt(stmt) => (3, stmt.relation.as_mut()),
+                NodeEnum::CreateTrigStmt(stmt) => (4, stmt.relation.as_mut()),
+                NodeEnum::GrantStmt(_) => (5, None),
+                other => unreachable!("CREATE SCHEMA cannot contain {other:?}"),
+            };
+            if let Some(relation) = relation {
+                if relation.schemaname.is_empty() {
+                    relation.schemaname = schema.to_string();
+                } else if relation.schemaname != schema {
+                    return Err(ParseError::ParseError(format!(
+                        "CREATE specifies a schema ({}) different from the one being created ({schema})",
+                        relation.schemaname
+                    )));
+                }
+            }
+            let sql = element
+                .deparse()
+                .map_err(|e| ParseError::ParseError(e.to_string()))?;
+            Ok((order, sql))
+        })
+        .collect::<Result<Vec<_>, ParseError>>()?;
+    elements.sort_by_key(|(order, _)| *order);
+    Ok(elements.into_iter().map(|(_, sql)| sql).collect())
 }
 
 /// Try to extract a DROP SCHEMA statement from pg_query parse output.

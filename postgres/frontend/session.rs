@@ -298,8 +298,10 @@ fn try_prepare_special(pg_conn: &Arc<PgConnectionInner>, sql: &str) -> Result<Op
         return Ok(Some(handle_pg_show(pg_conn, &show_stmt)?));
     }
 
-    if let Some(stmt) = try_extract_create_schema(&parse_result) {
-        handle_pg_create_schema(&pg_conn.conn, &stmt)?;
+    if let Some(stmt) = try_extract_create_schema(&parse_result)
+        .map_err(|e| LimboError::ParseError(e.to_string()))?
+    {
+        handle_pg_create_schema(pg_conn, &stmt)?;
         return Ok(Some(noop_statement(&pg_conn.conn)?));
     }
 
@@ -434,7 +436,11 @@ fn search_path_parser<'src>() -> impl Parser<'src, &'src str, Vec<String>, extra
         .padded_by(whitespace)
 }
 
-fn handle_pg_create_schema(conn: &Arc<Connection>, stmt: &PgCreateSchemaStmt) -> Result<()> {
+fn handle_pg_create_schema(
+    pg_conn: &Arc<PgConnectionInner>,
+    stmt: &PgCreateSchemaStmt,
+) -> Result<()> {
+    let conn = &pg_conn.conn;
     let name = stmt.name.to_lowercase();
     if name == "public" {
         if stmt.if_not_exists {
@@ -459,11 +465,45 @@ fn handle_pg_create_schema(conn: &Arc<Connection>, stmt: &PgCreateSchemaStmt) ->
         )));
     }
 
+    // A failed element is undone by dropping the schema, and DETACH cannot
+    // run inside a transaction.
+    if !stmt.elements.is_empty() && !conn.get_auto_commit() {
+        return Err(LimboError::ParseError(
+            "CREATE SCHEMA with schema elements cannot run inside a transaction block".to_string(),
+        ));
+    }
+
     let path = schema_file_path(conn, &name);
     execute_sqlite(
         conn,
         format!("ATTACH '{}' AS \"{}\"", path.replace('\'', "''"), name),
     )?;
+    if stmt.elements.is_empty() {
+        return Ok(());
+    }
+    let setting = search_path_setting(conn);
+    let mut search_path = turso_pg_parser::quote_identifier(&name);
+    let rest = setting.as_deref().unwrap_or(DEFAULT_SEARCH_PATH).trim();
+    if !rest.is_empty() {
+        search_path = format!("{search_path}, {rest}");
+    }
+    set_search_path(conn, Some(&search_path))?;
+    let result = stmt
+        .elements
+        .iter()
+        .try_for_each(|sql| prepare_statement(pg_conn, sql)?.run_ignore_rows());
+    set_search_path(conn, setting.as_deref())?;
+    if let Err(err) = result {
+        handle_pg_drop_schema(
+            conn,
+            &PgDropSchemaStmt {
+                name,
+                if_exists: false,
+                cascade: true,
+            },
+        )?;
+        return Err(err);
+    }
     Ok(())
 }
 
