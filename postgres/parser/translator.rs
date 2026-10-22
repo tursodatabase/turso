@@ -1185,38 +1185,31 @@ impl PostgreSQLTranslator {
 
         let qualified_name = match &obj_node.node {
             Some(Node::List(list)) => {
-                let names: Vec<String> = list
-                    .items
-                    .iter()
-                    .filter_map(|item| match &item.node {
-                        Some(Node::String(s)) => Some(s.sval.clone()),
-                        _ => None,
-                    })
-                    .collect();
-                match names.len() {
-                    0 => return Err(ParseError::ParseError("DROP: empty name list".into())),
-                    1 => ast::QualifiedName::single(ast::Name::from_string(names[0].clone())),
-                    _ => ast::QualifiedName::fullname(
-                        ast::Name::from_string(names[0].clone()),
-                        ast::Name::from_string(names[1].clone()),
+                let names = extract_key_columns(&list.items)?;
+                match names.as_slice() {
+                    [] => return Err(ParseError::ParseError("DROP: empty name list".into())),
+                    [name] => ast::QualifiedName::single(ast::Name::from_string(name.clone())),
+                    [schema, name] => ast::QualifiedName::fullname(
+                        ast::Name::from_string(map_schema_name(schema)),
+                        ast::Name::from_string(name.clone()),
                     ),
+                    _ => return Err(not_supported("cross-database references")),
                 }
             }
             Some(Node::String(s)) => {
                 ast::QualifiedName::single(ast::Name::from_string(s.sval.clone()))
             }
             Some(Node::TypeName(tn)) => {
-                // DROP TYPE uses TypeName nodes; extract the last name component
-                let type_name = tn
-                    .names
-                    .iter()
-                    .filter_map(|n| match &n.node {
-                        Some(Node::String(s)) => Some(s.sval.clone()),
-                        _ => None,
-                    })
-                    .next_back()
-                    .ok_or_else(|| ParseError::ParseError("DROP TYPE: empty type name".into()))?;
-                ast::QualifiedName::single(ast::Name::from_string(type_name))
+                // DROP TYPE/DOMAIN use TypeName nodes. Types live in a single
+                // namespace, so only an unqualified or public name is accepted.
+                let names = extract_key_columns(&tn.names)?;
+                let type_name = match names.as_slice() {
+                    [name] => name,
+                    [schema, name] if map_schema_name(schema) == "main" => name,
+                    [] => return Err(ParseError::ParseError("DROP TYPE: empty type name".into())),
+                    _ => return Err(not_supported("schema-qualified type names")),
+                };
+                ast::QualifiedName::single(ast::Name::from_string(type_name.clone()))
             }
             _ => {
                 return Err(ParseError::ParseError(
@@ -9467,5 +9460,14 @@ mod tests {
         assert_not_supported("DROP TABLE t CASCADE", "CASCADE");
         assert_not_supported("DROP TYPE mood CASCADE", "CASCADE");
         assert_translates("DROP TABLE t RESTRICT");
+    }
+
+    #[test]
+    fn fail_closed_drop_names() {
+        assert_not_supported("DROP TABLE db.s.t", "cross-database");
+        assert_not_supported("DROP TYPE other.mood", "schema-qualified type");
+        assert_not_supported("DROP DOMAIN other.d", "schema-qualified type");
+        assert_translates("DROP TYPE public.mood");
+        assert_translates("DROP TABLE public.t");
     }
 }
