@@ -6076,6 +6076,9 @@ pub fn try_extract_create_schema(
     let NodeRef::CreateSchemaStmt(cs) = &nodes[0].0 else {
         return Ok(None);
     };
+    if cs.authrole.is_some() {
+        return Err(not_supported("CREATE SCHEMA ... AUTHORIZATION"));
+    }
     Ok(Some(PgCreateSchemaStmt {
         if_not_exists: cs.if_not_exists,
         name: cs.schemaname.clone(),
@@ -6147,6 +6150,10 @@ pub fn try_extract_drop_schema(parse_result: &ParseResult) -> Option<PgDropSchem
         return None;
     }
 
+    // Several schemas fall through to translate_drop, which rejects them.
+    if drop.objects.len() != 1 {
+        return None;
+    }
     // Extract schema name from first object (String node)
     let obj = drop.objects.first()?;
     let obj_node = obj.node.as_ref()?;
@@ -9382,6 +9389,28 @@ mod tests {
         assert!(err
             .to_string()
             .contains("COPY is handled at the postgres frontend layer"));
+    }
+
+    #[test]
+    fn fail_closed_schema_statements() {
+        for (sql, needle) in [
+            ("CREATE SCHEMA AUTHORIZATION bob", "AUTHORIZATION"),
+            ("CREATE SCHEMA s AUTHORIZATION bob", "AUTHORIZATION"),
+        ] {
+            let parsed = crate::parse(sql).unwrap();
+            let err = try_extract_create_schema(&parsed)
+                .expect_err(sql)
+                .to_string();
+            assert!(
+                err.contains("not supported") && err.contains(needle),
+                "{sql}: {err}"
+            );
+        }
+        let parsed = crate::parse("DROP SCHEMA a, b").unwrap();
+        assert!(try_extract_drop_schema(&parsed).is_none());
+        assert_not_supported("DROP SCHEMA a, b", "several objects");
+        let parsed = crate::parse("CREATE SCHEMA IF NOT EXISTS s").unwrap();
+        assert!(try_extract_create_schema(&parsed).unwrap().is_some());
     }
 
     #[test]
