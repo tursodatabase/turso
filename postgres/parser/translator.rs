@@ -4538,23 +4538,25 @@ impl PostgreSQLTranslator {
                 let targets: Vec<ast::SortedColumn> = infer
                     .index_elems
                     .iter()
-                    .filter_map(|elem| match &elem.node {
+                    .map(|elem| match &elem.node {
                         Some(Node::IndexElem(idx_elem)) => {
-                            if !idx_elem.name.is_empty() {
-                                Some(ast::SortedColumn {
-                                    expr: Box::new(ast::Expr::Id(ast::Name::from_string(
-                                        &idx_elem.name,
-                                    ))),
-                                    order: None,
-                                    nulls: None,
-                                })
-                            } else {
-                                None
+                            reject_index_elem_clauses(idx_elem, "an ON CONFLICT target")?;
+                            if idx_elem.name.is_empty() {
+                                return Err(not_supported("expressions in an ON CONFLICT target"));
                             }
+                            Ok(ast::SortedColumn {
+                                expr: Box::new(ast::Expr::Id(ast::Name::from_string(
+                                    &idx_elem.name,
+                                ))),
+                                order: None,
+                                nulls: None,
+                            })
                         }
-                        _ => None,
+                        _ => Err(ParseError::ParseError(
+                            "ON CONFLICT: unexpected conflict target".into(),
+                        )),
                     })
-                    .collect();
+                    .collect::<Result<_, _>>()?;
 
                 let where_clause = if let Some(wc) = &infer.where_clause {
                     Some(Box::new(self.translate_expr(wc)?))
@@ -9833,5 +9835,22 @@ mod tests {
             "INSERT INTO t VALUES (1) ON CONFLICT ON CONSTRAINT t_pkey DO NOTHING",
             "ON CONSTRAINT",
         );
+    }
+
+    #[test]
+    fn fail_closed_on_conflict_targets() {
+        assert_not_supported(
+            "INSERT INTO t VALUES ('a') ON CONFLICT ((lower(a))) DO NOTHING",
+            "expressions in an ON CONFLICT target",
+        );
+        assert_not_supported(
+            "INSERT INTO t VALUES ('a') ON CONFLICT (a COLLATE \"en_US\") DO NOTHING",
+            "COLLATE in an ON CONFLICT target",
+        );
+        assert_not_supported(
+            "INSERT INTO t VALUES ('a') ON CONFLICT (a text_pattern_ops) DO NOTHING",
+            "operator classes in an ON CONFLICT target",
+        );
+        assert_translates("INSERT INTO t VALUES ('a') ON CONFLICT (a) WHERE a > 'a' DO NOTHING");
     }
 }
