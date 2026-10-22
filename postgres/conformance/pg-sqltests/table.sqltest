@@ -315,3 +315,127 @@ test table-returning-table-name-star-after-alias-rejected {
     INSERT INTO users AS u VALUES (4, 'dave', 40, false) RETURNING users.*;
 }
 expect error {}
+
+test temp-table-shadows-permanent-table {
+    CREATE TABLE items (v int);
+    INSERT INTO items VALUES (1);
+    CREATE TEMP TABLE items (v int);
+    INSERT INTO items VALUES (2);
+    SELECT v FROM items;
+    SELECT v FROM public.items;
+    SELECT v FROM pg_temp.items;
+    DROP TABLE items;
+    SELECT v FROM items;
+}
+expect {
+    2
+    1
+    2
+    1
+}
+
+test temp-table-forms-are-not-public {
+    CREATE TEMPORARY TABLE t1 AS SELECT 1 AS a;
+    SELECT 2 AS b INTO TEMP t2;
+    CREATE TABLE pg_temp.t3 (c int) ON COMMIT PRESERVE ROWS;
+    INSERT INTO t3 VALUES (3);
+    CREATE INDEX t3_c ON t3 (c);
+    SELECT a, b, c FROM t1, t2, pg_temp.t3 WHERE c = 3;
+    SELECT count(*) FROM pg_tables WHERE schemaname = 'public' AND tablename IN ('t1', 't2', 't3');
+}
+expect {
+    1|2|3
+    0
+}
+
+test temp-table-ignores-search-path-schema {
+    CREATE SCHEMA IF NOT EXISTS temp_search_path;
+    SET search_path = temp_search_path;
+    CREATE TEMP TABLE tt (a int);
+    INSERT INTO tt VALUES (4);
+    SELECT a FROM pg_temp.tt;
+}
+expect {
+    4
+}
+
+test temp-table-from-pg-temp-in-search-path {
+    SET search_path = pg_temp, public;
+    CREATE TABLE tt (a int);
+    INSERT INTO tt VALUES (5);
+    SET search_path = public;
+    SELECT a FROM pg_temp.tt;
+    SELECT count(*) FROM pg_tables WHERE schemaname = 'public' AND tablename = 'tt';
+}
+expect {
+    5
+    0
+}
+
+test temp-view {
+    CREATE TABLE t (a int);
+    INSERT INTO t VALUES (6);
+    CREATE TEMP VIEW tv AS SELECT a FROM t;
+    SELECT a FROM pg_temp.tv;
+}
+expect {
+    6
+}
+
+test view-of-temp-table-is-temporary {
+    CREATE TEMP TABLE tt (a int);
+    INSERT INTO tt VALUES (7);
+    CREATE VIEW v AS SELECT a FROM tt;
+    SELECT a FROM pg_temp.v;
+}
+expect {
+    7
+}
+
+test view-of-temp-table-in-schema-rejected {
+    CREATE SCHEMA IF NOT EXISTS temp_view_schema;
+    CREATE TEMP TABLE tt (a int);
+    CREATE VIEW temp_view_schema.v AS SELECT a FROM tt;
+}
+expect error {}
+
+test temp-table-schema-qualified-rejected {
+    CREATE TEMP TABLE public.tt (a int);
+}
+expect error {}
+
+test temp-table-foreign-key-to-permanent-table-rejected {
+    CREATE TABLE p (id int PRIMARY KEY);
+    CREATE TEMP TABLE c (pid int REFERENCES p (id));
+}
+expect error {}
+
+test permanent-table-foreign-key-to-temp-table-rejected {
+    CREATE TEMP TABLE p (id int PRIMARY KEY);
+    CREATE TABLE c (pid int REFERENCES p (id));
+}
+expect error {}
+
+test temp-table-foreign-key-to-temp-table {
+    CREATE TEMP TABLE p (id int PRIMARY KEY);
+    CREATE TEMP TABLE c (pid int REFERENCES p (id));
+    INSERT INTO p VALUES (8);
+    INSERT INTO c VALUES (8);
+    SELECT pid FROM c;
+}
+expect {
+    8
+}
+
+test temp-table-does-not-capture-public-references {
+    CREATE TABLE items (v int);
+    CREATE TEMP TABLE items (w int);
+    CREATE INDEX items_v ON public.items (v);
+    INSERT INTO public.items VALUES (1);
+    SELECT count(*) FROM pg_indexes WHERE schemaname = 'public' AND indexname = 'items_v';
+    SELECT v FROM public.items;
+}
+expect {
+    1
+    1
+}

@@ -3874,11 +3874,9 @@ mod tests {
                 .execute(format!("PRAGMA temp_store = {temp_store}"))
                 .unwrap();
             temp_conn.execute("BEGIN").unwrap();
-            // Temporary tables are rejected rather than created as permanent
-            // ones; the failed statement must leave the temp catalog intact.
-            assert!(temp_conn
+            temp_conn
                 .execute("CREATE TEMP TABLE temp_data (v INT)")
-                .is_err());
+                .unwrap();
             temp_conn.execute("ROLLBACK").unwrap();
             assert_eq!(
                 temp_conn

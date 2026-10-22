@@ -47,10 +47,10 @@ Basics not enumerated by the official feature matrix.
 | UPDATE (incl. FROM clause) | ✅ Supported | Multi-column `SET (a,b) = (...)` not supported; duplicate assignments and array-element/field targets rejected |
 | DELETE | 🟡 Partial | `USING` clause rejected |
 | CREATE TABLE | ✅ Supported | PK, NOT NULL, UNIQUE, DEFAULT, CHECK, FK (with ON DELETE/UPDATE actions); IF NOT EXISTS; tables are created STRICT |
-| CREATE TABLE AS / SELECT INTO | ✅ Supported | Schema derived from the SELECT; WITH NO DATA supported (lowered to LIMIT 0, so errors in an overridden LIMIT go unreported); explicit column list rejected; INTO on the first leaf of a compound SELECT (legal in PG) rejected; TEMP, WITH (...), TABLESPACE, USING and ON COMMIT rejected; completes with `SELECT n` like PostgreSQL, though an IF NOT EXISTS skip tags `SELECT 0` instead of `CREATE TABLE AS` |
+| CREATE TABLE AS / SELECT INTO | ✅ Supported | Schema derived from the SELECT; WITH NO DATA supported (lowered to LIMIT 0, so errors in an overridden LIMIT go unreported); explicit column list rejected; INTO on the first leaf of a compound SELECT (legal in PG) rejected; TEMP creates a temporary table (see Temporary tables); WITH (...), TABLESPACE, USING and ON COMMIT DELETE ROWS / DROP rejected; completes with `SELECT n` like PostgreSQL, though an IF NOT EXISTS skip tags `SELECT 0` instead of `CREATE TABLE AS` |
 | ALTER TABLE | 🟡 Partial | ADD/DROP COLUMN, RENAME TABLE/COLUMN work; one subcommand per statement; ALTER COLUMN TYPE, IF [NOT] EXISTS and CASCADE rejected; SET/DROP DEFAULT, SET/DROP NOT NULL, ADD CONSTRAINT rejected |
 | CREATE INDEX | ✅ Supported | UNIQUE, multi-column, partial (WHERE), expression indexes, IF NOT EXISTS |
-| CREATE VIEW | ✅ Supported | Column aliases supported when they name every select-list column; TEMP, UNLOGGED, OR REPLACE, WITH (options) and WITH CHECK OPTION rejected |
+| CREATE VIEW | ✅ Supported | Column aliases supported when they name every select-list column; TEMP supported (see Temporary VIEWs); UNLOGGED, OR REPLACE, WITH (options) and WITH CHECK OPTION rejected |
 | COMMENT ON | 🟡 Partial | Accepted but discarded; comments are not persisted in `pg_description` |
 | CREATE SCHEMA / DROP SCHEMA | ✅ Supported | Schemas are ATTACHed databases; DROP ... CASCADE; `public` is special-cased; AUTHORIZATION and embedded schema elements rejected; CREATE TABLE without a schema creates the table in the first schema of `search_path` that exists |
 | CREATE SEQUENCE / nextval / currval / setval | ✅ Supported | START, INCREMENT, MIN/MAXVALUE, CYCLE; AS smallint/integer/bigint bounds the range; CACHE accepted (no-op); OWNED BY a column, TEMP and other options rejected; pg_sequences view; a sequence named without a schema is looked up through `search_path`, then in `public` |
@@ -221,11 +221,11 @@ INTEGER. Unknown type names pass through as custom types.
 | CREATE ACCESS METHOD | ❌ Not supported | |
 | CREATE TABLE ... (LIKE) with foreign tables, views and composite types | ❌ Not supported | LIKE rejected |
 | DROP object IF EXISTS | ✅ Supported | TABLE, INDEX, VIEW, MATERIALIZED VIEW, TYPE, DOMAIN, SEQUENCE, SCHEMA |
-| ON COMMIT clause for CREATE TEMPORARY TABLE | ❌ Not supported | Rejected, like TEMP itself |
+| ON COMMIT clause for CREATE TEMPORARY TABLE | 🟡 Partial | PRESERVE ROWS (the default) is accepted; DELETE ROWS and DROP are rejected |
 | REINDEX CONCURRENTLY | ❌ Not supported | REINDEX not supported at all |
 | Stored generated columns | ❌ Not supported | GENERATED ... AS rejected |
 | Temporal constraints | ❌ Not supported | |
-| Temporary tables (CREATE TEMP TABLE) | ❌ Not supported | Rejected (UNLOGGED is accepted and creates an ordinary table) |
+| Temporary tables (CREATE TEMP TABLE) | 🟡 Partial | Created in the connection's own temporary schema, which `pg_temp.` names and which a table named without a schema is looked up in first; dropped when the connection closes and invisible to other connections. `CREATE TABLE pg_temp.t` and `pg_temp` first in `search_path` also create one. Serial columns, foreign keys between temporary and permanent tables and ON COMMIT DELETE ROWS / DROP are rejected. Temporary objects are not listed in the catalogs (pg_class, pg_tables, `\d`), and `pg_temp` listed after other schemas in `search_path` is still searched first. UNLOGGED is accepted and creates an ordinary table |
 | Typed tables | ❌ Not supported | |
 | Virtual generated columns | ❌ Not supported | GENERATED ... AS rejected |
 
@@ -328,7 +328,7 @@ INTEGER. Unknown type names pass through as custom types.
 | Materialized views | ✅ Supported | Incrementally maintained (live, DBSP-based) — always fresh, unlike PostgreSQL snapshots; REFRESH MATERIALIZED VIEW is accepted as a no-op; WITH NO DATA (on CREATE or REFRESH) is rejected |
 | Materialized views with concurrent refresh | 🟡 Partial | Moot: views are always fresh; REFRESH (CONCURRENTLY) is a no-op |
 | SECURITY INVOKER views | ❌ Not supported | |
-| Temporary VIEWs | ❌ Not supported | Rejected |
+| Temporary VIEWs | ✅ Supported | Like temporary tables. A view whose query reads a temporary table or view is created temporary, like PostgreSQL; a materialized view cannot read one |
 | Updatable views | ❌ Not supported | |
 | WITH CHECK clause | ❌ Not supported | |
 

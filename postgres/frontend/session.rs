@@ -1,5 +1,6 @@
 use chumsky::{error::EmptyErr, prelude::*};
 use std::borrow::Cow;
+use std::collections::HashSet;
 use std::num::NonZero;
 use std::str;
 use std::sync::{Arc, Mutex};
@@ -10,9 +11,9 @@ use turso_core::{Connection, LimboError, PrepareOptions, Result, Statement, Valu
 use turso_parser::ast::{self};
 use turso_pg_parser::translator::{
     is_comment_on, is_refresh_matview, is_set_transaction, try_extract_copy_from,
-    try_extract_create_schema, try_extract_drop_schema, try_extract_set, try_extract_show,
-    unqualified_create_table_name_location, PgCopyFromStmt, PgCreateSchemaStmt, PgDropSchemaStmt,
-    PgSetStmt, PgSetValue, PgShowStmt, PostgreSQLTranslator,
+    try_extract_create_schema, try_extract_create_view, try_extract_drop_schema, try_extract_set,
+    try_extract_show, unqualified_create_table_name_location, PgCopyFromStmt, PgCreateSchemaStmt,
+    PgDropSchemaStmt, PgRelationReference, PgSetStmt, PgSetValue, PgShowStmt, PostgreSQLTranslator,
 };
 
 use crate::copy::parse_copy_text_format;
@@ -188,21 +189,27 @@ fn prepare_statement(pg_conn: &Arc<PgConnectionInner>, sql: &str) -> Result<Stat
         .clone();
     let parse_result =
         turso_pg_parser::parse(sql).map_err(|e| LimboError::ParseError(e.to_string()))?;
-    let (sql, parse_result) =
+    let qualification =
         match create_table_schema_from_search_path(pg_conn, &parse_result, &search_path)? {
-            Some((location, schema)) => {
-                let sql = turso_pg_parser::qualify_create_table_name(sql, location, &schema);
-                let parse_result = turso_pg_parser::parse(&sql)
-                    .map_err(|e| LimboError::ParseError(e.to_string()))?;
-                (Cow::Owned(sql), parse_result)
-            }
-            None => (Cow::Borrowed(sql), parse_result),
+            Some(qualification) => Some(qualification),
+            None => implicitly_temporary_view_name_location(&pg_conn.conn, &parse_result)?
+                .map(|location| (location, "pg_temp".to_owned())),
         };
+    let (sql, parse_result) = match qualification {
+        Some((location, schema)) => {
+            let sql = turso_pg_parser::qualify_create_table_name(sql, location, &schema);
+            let parse_result =
+                turso_pg_parser::parse(&sql).map_err(|e| LimboError::ParseError(e.to_string()))?;
+            (Cow::Owned(sql), parse_result)
+        }
+        None => (Cow::Borrowed(sql), parse_result),
+    };
     let translator = PostgreSQLTranslator::new();
     let translated = translator
         .translate_with_prereqs(&parse_result)
         .map_err(|e| LimboError::ParseError(e.to_string()))?;
     reject_catalog_dml(translated.cmd.stmt())?;
+    reject_foreign_keys_across_temporary_tables(&pg_conn.conn, translated.cmd.stmt())?;
 
     let options = PrepareOptions {
         unqualified_database_search_path: search_path,
@@ -245,10 +252,147 @@ fn create_table_schema_from_search_path(
     Ok(Some((location, schema)))
 }
 
+/// The byte offset of the name of a view that PostgreSQL creates as a
+/// temporary view although it is not declared TEMPORARY, because its query
+/// reads a temporary relation. Qualifying the name with pg_temp makes it
+/// temporary, also when the statement is prepared again.
+fn implicitly_temporary_view_name_location(
+    conn: &Arc<Connection>,
+    parse_result: &turso_pg_parser::ParseResult,
+) -> Result<Option<usize>> {
+    let Some(view) = try_extract_create_view(parse_result) else {
+        return Ok(None);
+    };
+    if view.temporary || !reads_temporary_relation(conn, &view.references)? {
+        return Ok(None);
+    }
+    if view.materialized {
+        return Err(LimboError::ParseError(
+            "materialized views must not use temporary tables or views".to_string(),
+        ));
+    }
+    if view.schema.is_some() {
+        return Err(LimboError::ParseError(
+            "cannot create temporary relation in non-temporary schema".to_string(),
+        ));
+    }
+    Ok(Some(view.name_location))
+}
+
+/// Whether any of `references` is a temporary relation. A name without a
+/// schema is looked up in the temporary schema first, like PostgreSQL.
+fn reads_temporary_relation(
+    conn: &Arc<Connection>,
+    references: &[PgRelationReference],
+) -> Result<bool> {
+    if references
+        .iter()
+        .any(|reference| reference.schema.as_deref() == Some("pg_temp"))
+    {
+        return Ok(true);
+    }
+    if references
+        .iter()
+        .all(|reference| reference.schema.is_some())
+    {
+        return Ok(false);
+    }
+    let temporary = temporary_relation_names(conn)?;
+    let mut reads_temporary = false;
+    for reference in references {
+        if reference.schema.is_some() || !temporary.contains(&reference.name.to_lowercase()) {
+            continue;
+        }
+        if reference.is_cte_name {
+            return Err(LimboError::ParseError(format!(
+                "a view whose WITH query is named like temporary relation \"{}\" is not supported",
+                reference.name
+            )));
+        }
+        reads_temporary = true;
+    }
+    Ok(reads_temporary)
+}
+
+/// Rejects foreign keys between temporary and permanent tables, which
+/// PostgreSQL does not allow. Core looks the referenced table up in the
+/// referencing table's own schema, so such a key would name a different
+/// table, or none, in Turso.
+fn reject_foreign_keys_across_temporary_tables(
+    conn: &Arc<Connection>,
+    stmt: &ast::Stmt,
+) -> Result<()> {
+    let ast::Stmt::CreateTable {
+        temporary,
+        tbl_name,
+        body:
+            ast::CreateTableBody::ColumnsAndConstraints {
+                columns,
+                constraints,
+                ..
+            },
+        ..
+    } = stmt
+    else {
+        return Ok(());
+    };
+    let referenced: Vec<&ast::Name> = columns
+        .iter()
+        .flat_map(|column| &column.constraints)
+        .filter_map(|constraint| match &constraint.constraint {
+            ast::ColumnConstraint::ForeignKey { clause, .. } => Some(&clause.tbl_name),
+            _ => None,
+        })
+        .chain(
+            constraints
+                .iter()
+                .filter_map(|constraint| match &constraint.constraint {
+                    ast::TableConstraint::ForeignKey { clause, .. } => Some(&clause.tbl_name),
+                    _ => None,
+                }),
+        )
+        .collect();
+    if referenced.is_empty() {
+        return Ok(());
+    }
+    let temporary_names = temporary_relation_names(conn)?;
+    for name in referenced {
+        let references_temporary = temporary_names.contains(&name.as_str().to_lowercase())
+            || (*temporary && name.as_str().eq_ignore_ascii_case(tbl_name.name.as_str()));
+        if *temporary && !references_temporary {
+            return Err(LimboError::ParseError(
+                "constraints on temporary tables may reference only temporary tables".to_string(),
+            ));
+        }
+        if !*temporary && references_temporary {
+            return Err(LimboError::ParseError(
+                "constraints on permanent tables may reference only permanent tables".to_string(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// The lowercased names of the tables and views of the connection's
+/// temporary schema.
+fn temporary_relation_names(conn: &Arc<Connection>) -> Result<HashSet<String>> {
+    let mut stmt =
+        conn.prepare_sqlite("SELECT name FROM temp.sqlite_schema WHERE type IN ('table', 'view')")?;
+    Ok(stmt
+        .run_collect_rows()?
+        .into_iter()
+        .filter_map(|row| match row.first() {
+            Some(Value::Text(name)) => Some(name.as_str().to_lowercase()),
+            _ => None,
+        })
+        .collect())
+}
+
 /// The first schema of `search_path` that exists, which is what PostgreSQL's
 /// current_schema() returns. None when no schema of `search_path` exists.
 /// The default search_path, "$user", public, gives public, since there is no
-/// schema named after a user.
+/// schema named after a user. pg_temp, the connection's temporary schema,
+/// always exists.
 pub(crate) fn current_schema(conn: &Connection) -> Option<String> {
     let Some(search_path) = conn
         .context::<PgSessionState>()
@@ -257,9 +401,9 @@ pub(crate) fn current_schema(conn: &Connection) -> Option<String> {
         return Some("public".to_owned());
     };
     let attached = conn.attached_database_names();
-    search_path
-        .into_iter()
-        .find(|schema| schema.eq_ignore_ascii_case("public") || attached.contains(schema))
+    search_path.into_iter().find(|schema| {
+        schema.eq_ignore_ascii_case("public") || schema == "pg_temp" || attached.contains(schema)
+    })
 }
 
 fn reject_catalog_dml(stmt: &ast::Stmt) -> Result<()> {

@@ -316,3 +316,46 @@ fn test_postgres_select_into_compound_rejected(db: TempDatabase) {
         "expected nested INTO rejection, got: {err}"
     );
 }
+
+#[turso_macros::test(mvcc)]
+fn test_postgres_temporary_tables_are_private_to_their_connection(db: TempDatabase) {
+    let rows = |conn: &turso_pg::PgConnection, sql: &str| {
+        conn.prepare(sql).unwrap().run_collect_rows().unwrap()
+    };
+    let conn = db.connect_postgres();
+    let other = db.connect_postgres();
+    conn.execute("CREATE TABLE items (v INTEGER)").unwrap();
+    conn.execute("INSERT INTO items VALUES (1)").unwrap();
+    conn.execute("CREATE TEMP TABLE items (v INTEGER)").unwrap();
+    conn.execute("INSERT INTO items VALUES (2)").unwrap();
+    conn.execute("CREATE VIEW item_view AS SELECT v FROM items")
+        .unwrap();
+
+    assert_eq!(
+        rows(&conn, "SELECT v FROM items"),
+        vec![vec![Value::from_i64(2)]]
+    );
+    assert_eq!(
+        rows(&conn, "SELECT v FROM pg_temp.item_view"),
+        vec![vec![Value::from_i64(2)]]
+    );
+    assert_eq!(
+        rows(&conn, "SELECT v FROM public.items"),
+        vec![vec![Value::from_i64(1)]]
+    );
+    assert_eq!(
+        rows(&other, "SELECT v FROM items"),
+        vec![vec![Value::from_i64(1)]]
+    );
+    assert!(other.prepare("SELECT v FROM pg_temp.items").is_err());
+    assert!(other.prepare("SELECT v FROM item_view").is_err());
+
+    conn.close().unwrap();
+    let conn = db.connect_postgres();
+    assert_eq!(
+        rows(&conn, "SELECT v FROM items"),
+        vec![vec![Value::from_i64(1)]]
+    );
+    assert!(conn.prepare("SELECT v FROM pg_temp.items").is_err());
+    assert!(conn.prepare("SELECT v FROM item_view").is_err());
+}

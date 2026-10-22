@@ -40,6 +40,7 @@ impl PostgreSQLTranslator {
         if !range_var.catalogname.is_empty() {
             return Err(not_supported("cross-database references"));
         }
+        reject_temp_schema_name(&range_var.schemaname)?;
         let is_schemata = range_var
             .schemaname
             .eq_ignore_ascii_case("information_schema")
@@ -274,8 +275,8 @@ impl PostgreSQLTranslator {
             .ok_or_else(|| ParseError::ParseError("CREATE TABLE missing table name".into()))?;
 
         let tbl_name = self.qualified_name_from_range_var(relation)?;
+        let temporary = is_temporary_relation(relation, create.oncommit)?;
 
-        reject_temporary(relation, "CREATE TEMPORARY TABLE")?;
         // PARTITION OF also records the parent in inh_relations, so check
         // partitioning first for the more accurate message.
         if create.partbound.is_some() || create.partspec.is_some() {
@@ -292,16 +293,6 @@ impl PostgreSQLTranslator {
             &create.tablespacename,
             &create.access_method,
         )?;
-        // ON COMMIT is only valid on temporary tables, which are rejected
-        // above, but check it directly rather than rely on that.
-        if matches!(
-            pg_query::protobuf::OnCommitAction::try_from(create.oncommit),
-            Ok(pg_query::protobuf::OnCommitAction::OncommitDeleteRows
-                | pg_query::protobuf::OnCommitAction::OncommitDrop)
-        ) {
-            return Err(not_supported("ON COMMIT DELETE ROWS / DROP"));
-        }
-
         if create.table_elts.is_empty() {
             return Err(ParseError::ParseError(
                 "CREATE TABLE with no columns is not yet supported".into(),
@@ -425,8 +416,14 @@ impl PostgreSQLTranslator {
             }
         }
 
+        // Serial columns get their sequences from CREATE SEQUENCE
+        // prerequisites, which would create permanent sequences.
+        if temporary && !serial_sequences.is_empty() {
+            return Err(not_supported("serial columns in temporary tables"));
+        }
+
         let stmt = ast::Stmt::CreateTable {
-            temporary: false,
+            temporary,
             if_not_exists: create.if_not_exists,
             tbl_name,
             body: ast::CreateTableBody::ColumnsAndConstraints {
@@ -1116,7 +1113,17 @@ impl PostgreSQLTranslator {
         if !relation.catalogname.is_empty() {
             return Err(not_supported("cross-database references"));
         }
-        let idx_name = ast::QualifiedName::single(ast::Name::from_string(&idx.idxname));
+        // The index goes to the schema of its table. Core takes that from the
+        // index name and looks the table up in it.
+        reject_temp_schema_name(&relation.schemaname)?;
+        let idx_name = if relation.schemaname.is_empty() {
+            ast::QualifiedName::single(ast::Name::from_string(&idx.idxname))
+        } else {
+            ast::QualifiedName::fullname(
+                ast::Name::from_string(map_schema_name(&relation.schemaname)),
+                ast::Name::from_string(&idx.idxname),
+            )
+        };
 
         self.translating_index.set(true);
         let index_parts = self.translate_index_parts(idx);
@@ -1215,10 +1222,13 @@ impl PostgreSQLTranslator {
                 match names.as_slice() {
                     [] => return Err(ParseError::ParseError("DROP: empty name list".into())),
                     [name] => ast::QualifiedName::single(ast::Name::from_string(name.clone())),
-                    [schema, name] => ast::QualifiedName::fullname(
-                        ast::Name::from_string(map_schema_name(schema)),
-                        ast::Name::from_string(name.clone()),
-                    ),
+                    [schema, name] => {
+                        reject_temp_schema_name(schema)?;
+                        ast::QualifiedName::fullname(
+                            ast::Name::from_string(map_schema_name(schema)),
+                            ast::Name::from_string(name.clone()),
+                        )
+                    }
                     _ => return Err(not_supported("cross-database references")),
                 }
             }
@@ -1321,7 +1331,10 @@ impl PostgreSQLTranslator {
         if view.replace {
             return Err(not_supported("CREATE OR REPLACE VIEW"));
         }
-        reject_temporary(relation, "CREATE TEMPORARY VIEW")?;
+        let temporary = is_temporary_relation(
+            relation,
+            pg_query::protobuf::OnCommitAction::OncommitNoop as i32,
+        )?;
         if relation.relpersistence == "u" {
             return Err(not_supported("CREATE UNLOGGED VIEW"));
         }
@@ -1386,7 +1399,7 @@ impl PostgreSQLTranslator {
         }
 
         Ok(ast::Stmt::CreateView {
-            temporary: false,
+            temporary,
             if_not_exists: false,
             view_name,
             columns,
@@ -1441,7 +1454,10 @@ impl PostgreSQLTranslator {
             ParseError::ParseError("CREATE MATERIALIZED VIEW: missing view name".into())
         })?;
         let view_name = self.qualified_name_from_range_var(relation)?;
-        reject_into_clause(into_clause, relation, "CREATE MATERIALIZED VIEW")?;
+        if is_temporary_relation(relation, into_clause.on_commit)? {
+            return Err(not_supported("temporary materialized views"));
+        }
+        reject_into_clause(into_clause)?;
         // Materialized views here are maintained incrementally and always
         // populated, so there is no unpopulated state to create.
         if into_clause.skip_data {
@@ -1486,7 +1502,8 @@ impl PostgreSQLTranslator {
             .as_ref()
             .ok_or_else(|| ParseError::ParseError("CREATE TABLE AS: missing table name".into()))?;
         let tbl_name = self.qualified_name_from_range_var(relation)?;
-        reject_into_clause(into_clause, relation, "CREATE TABLE AS")?;
+        let temporary = is_temporary_relation(relation, into_clause.on_commit)?;
+        reject_into_clause(into_clause)?;
 
         // The engine names the new table's columns after the SELECT's output
         // columns and has no way to override them, so reject an explicit
@@ -1510,7 +1527,7 @@ impl PostgreSQLTranslator {
         }
 
         Ok(ast::Stmt::CreateTable {
-            temporary: false,
+            temporary,
             if_not_exists,
             tbl_name,
             body: ast::CreateTableBody::AsSelect(select),
@@ -5138,8 +5155,21 @@ fn join_keeps_unmatched_right_rows(join: &ast::JoinedSelectTable) -> bool {
 fn map_schema_name(schema: &str) -> &str {
     match schema.to_ascii_lowercase().as_str() {
         "pg_catalog" | "public" | "information_schema" => "main",
+        // The session's temporary schema, which core calls temp.
+        "pg_temp" => "temp",
         _ => schema,
     }
+}
+
+/// Rejects a schema named temp. It is not special in PostgreSQL, but core
+/// would resolve it to the session's temporary schema.
+fn reject_temp_schema_name(schema: &str) -> Result<(), ParseError> {
+    if schema.eq_ignore_ascii_case("temp") {
+        return Err(ParseError::ParseError(format!(
+            "schema \"{schema}\" does not exist"
+        )));
+    }
+    Ok(())
 }
 
 pub fn is_catalog_table_name(name: &str) -> bool {
@@ -5947,6 +5977,72 @@ pub fn unqualified_create_table_name_location(parse_result: &ParseResult) -> Opt
     Some(relation.location as usize)
 }
 
+/// Extracted CREATE VIEW or CREATE MATERIALIZED VIEW statement: the view
+/// and the relations that its query names.
+pub struct PgCreateViewStmt {
+    pub materialized: bool,
+    /// Declared TEMPORARY, or created in pg_temp.
+    pub temporary: bool,
+    pub schema: Option<String>,
+    /// The byte offset of the view name.
+    pub name_location: usize,
+    pub references: Vec<PgRelationReference>,
+}
+
+/// A relation that the query of a CREATE VIEW or CREATE MATERIALIZED VIEW
+/// statement names.
+pub struct PgRelationReference {
+    pub schema: Option<String>,
+    pub name: String,
+    /// The name is also the name of a WITH query of the statement, which may
+    /// be what it refers to.
+    pub is_cte_name: bool,
+}
+
+/// Try to extract a CREATE VIEW or CREATE MATERIALIZED VIEW statement from
+/// a PG parse result. Returns None for other statements.
+pub fn try_extract_create_view(parse_result: &ParseResult) -> Option<PgCreateViewStmt> {
+    use pg_query::{protobuf::ObjectType, NodeRef};
+
+    let nodes = parse_result.protobuf.nodes();
+    let (view, materialized) = match &nodes.first()?.0 {
+        NodeRef::ViewStmt(view) => (view.view.as_ref()?, false),
+        NodeRef::CreateTableAsStmt(ctas) if ctas.objtype == ObjectType::ObjectMatview as i32 => {
+            (ctas.into.as_ref()?.rel.as_ref()?, true)
+        }
+        _ => return None,
+    };
+    let cte_names: std::collections::HashSet<&str> = nodes
+        .iter()
+        .filter_map(|(node, ..)| match node {
+            NodeRef::CommonTableExpr(cte) => Some(cte.ctename.as_str()),
+            _ => None,
+        })
+        .collect();
+    let references = nodes
+        .iter()
+        .filter_map(|(node, ..)| match node {
+            NodeRef::RangeVar(range_var) if range_var.location != view.location => {
+                Some(PgRelationReference {
+                    schema: (!range_var.schemaname.is_empty())
+                        .then(|| range_var.schemaname.clone()),
+                    name: range_var.relname.clone(),
+                    is_cte_name: range_var.schemaname.is_empty()
+                        && cte_names.contains(range_var.relname.as_str()),
+                })
+            }
+            _ => None,
+        })
+        .collect();
+    Some(PgCreateViewStmt {
+        materialized,
+        temporary: view.relpersistence == "t" || view.schemaname == "pg_temp",
+        schema: (!view.schemaname.is_empty()).then(|| view.schemaname.clone()),
+        name_location: view.location as usize,
+        references,
+    })
+}
+
 /// Try to extract a SHOW statement from a PG parse result.
 /// Returns None if the statement is not a SHOW.
 pub fn try_extract_show(parse_result: &ParseResult) -> Option<PgShowStmt> {
@@ -6117,15 +6213,11 @@ pub fn try_extract_copy_from(
         return Ok(None);
     };
     let table_name = relation.relname.clone();
-    let schema_name = if relation.schemaname.is_empty()
-        || matches!(
-            relation.schemaname.to_lowercase().as_str(),
-            "public" | "pg_catalog"
-        ) {
-        None
-    } else {
-        Some(relation.schemaname.clone())
-    };
+    // An unqualified name finds a temporary table first, so public must stay
+    // qualified, as main.
+    reject_temp_schema_name(&relation.schemaname)?;
+    let schema_name = (!relation.schemaname.is_empty())
+        .then(|| map_schema_name(&relation.schemaname).to_string());
 
     let columns = if copy.attlist.is_empty() {
         None
@@ -6531,13 +6623,41 @@ fn constr_type_name(contype: pg_query::protobuf::ConstrType) -> String {
     }
 }
 
-/// Rejects `TEMP`/`TEMPORARY` relations: the translator would otherwise
-/// create a permanent, globally visible object.
+/// Rejects `TEMP`/`TEMPORARY` relations and relations in pg_temp, for
+/// objects that cannot be temporary.
 fn reject_temporary(relation: &pg_query::protobuf::RangeVar, what: &str) -> Result<(), ParseError> {
-    if relation.relpersistence == "t" {
+    if relation.relpersistence == "t" || relation.schemaname == "pg_temp" {
         return Err(not_supported(what));
     }
     Ok(())
+}
+
+/// Whether a relation being created is temporary: declared TEMP /
+/// TEMPORARY, or created in pg_temp, like PostgreSQL. Temporary relations
+/// go to core's per-connection temp schema. `on_commit` is the ON COMMIT
+/// action of a table; only the default, PRESERVE ROWS, is supported.
+fn is_temporary_relation(
+    relation: &pg_query::protobuf::RangeVar,
+    on_commit: i32,
+) -> Result<bool, ParseError> {
+    use pg_query::protobuf::OnCommitAction;
+
+    let in_pg_temp = relation.schemaname == "pg_temp";
+    if relation.relpersistence == "t" && !relation.schemaname.is_empty() && !in_pg_temp {
+        return Err(ParseError::ParseError(
+            "cannot create temporary relation in non-temporary schema".into(),
+        ));
+    }
+    let temporary = relation.relpersistence == "t" || in_pg_temp;
+    match OnCommitAction::try_from(on_commit) {
+        Ok(OnCommitAction::OncommitDeleteRows | OnCommitAction::OncommitDrop) => {
+            Err(not_supported("ON COMMIT DELETE ROWS / DROP"))
+        }
+        Ok(OnCommitAction::OncommitPreserveRows) if !temporary => Err(ParseError::ParseError(
+            "ON COMMIT can only be used on temporary tables".into(),
+        )),
+        _ => Ok(temporary),
+    }
 }
 
 /// Rejects the physical-storage clauses of CREATE TABLE and its relatives.
@@ -6588,25 +6708,12 @@ fn reject_index_elem_clauses(
 
 /// Rejects the clauses of a CREATE TABLE AS / SELECT INTO / CREATE
 /// MATERIALIZED VIEW target that are not translated.
-fn reject_into_clause(
-    into_clause: &pg_query::protobuf::IntoClause,
-    relation: &pg_query::protobuf::RangeVar,
-    label: &str,
-) -> Result<(), ParseError> {
-    reject_temporary(relation, &format!("{label} with a temporary table"))?;
+fn reject_into_clause(into_clause: &pg_query::protobuf::IntoClause) -> Result<(), ParseError> {
     reject_table_storage_clauses(
         &into_clause.options,
         &into_clause.table_space_name,
         &into_clause.access_method,
-    )?;
-    if matches!(
-        pg_query::protobuf::OnCommitAction::try_from(into_clause.on_commit),
-        Ok(pg_query::protobuf::OnCommitAction::OncommitDeleteRows
-            | pg_query::protobuf::OnCommitAction::OncommitDrop)
-    ) {
-        return Err(not_supported("ON COMMIT DELETE ROWS / DROP"));
-    }
-    Ok(())
+    )
 }
 
 /// Rejects ORDER BY, LIMIT, OFFSET and WITH on the branches of a set
@@ -9268,6 +9375,18 @@ mod tests {
         assert!(!copy.header);
         assert!(copy.delimiter.is_none());
         assert!(copy.null_string.is_none());
+        for (sql, schema) in [
+            ("COPY public.users FROM '/tmp/data.tsv'", "main"),
+            ("COPY pg_temp.users FROM '/tmp/data.tsv'", "temp"),
+        ] {
+            let copy = try_extract_copy_from(&crate::parse(sql).unwrap())
+                .unwrap()
+                .unwrap();
+            assert_eq!(copy.schema_name.as_deref(), Some(schema), "{sql}");
+        }
+        assert!(
+            try_extract_copy_from(&crate::parse("COPY temp.users FROM '/tmp/x'").unwrap()).is_err()
+        );
     }
 
     #[test]
@@ -9557,12 +9676,137 @@ mod tests {
         assert_not_supported("CREATE TABLE t (a int, LIKE other INCLUDING ALL)", "LIKE");
     }
 
+    fn translate_stmt(sql: &str) -> ast::Stmt {
+        PostgreSQLTranslator::new()
+            .translate(&crate::parse(sql).unwrap())
+            .unwrap_or_else(|err| panic!("{sql}: {err}"))
+    }
+
+    fn assert_parse_error(sql: &str, needle: &str) {
+        let err = PostgreSQLTranslator::new()
+            .translate_with_prereqs(&crate::parse(sql).unwrap())
+            .expect_err(sql)
+            .to_string();
+        assert!(
+            err.contains(needle),
+            "{sql}: expected {needle:?}, got: {err}"
+        );
+    }
+
     #[test]
-    fn fail_closed_temporary_table() {
-        assert_not_supported("CREATE TEMP TABLE t (a int)", "TEMPORARY");
-        assert_not_supported("CREATE TEMPORARY TABLE t (a int)", "TEMPORARY");
+    fn temporary_relations() {
+        for sql in [
+            "CREATE TEMP TABLE t (a int)",
+            "CREATE TEMPORARY TABLE t (a int)",
+            "CREATE LOCAL TEMP TABLE t (a int)",
+            "CREATE TEMP TABLE t (a int) ON COMMIT PRESERVE ROWS",
+            "CREATE TABLE pg_temp.t (a int)",
+            "CREATE TEMP TABLE t AS SELECT 1 AS a",
+            "SELECT 1 AS a INTO TEMP t",
+        ] {
+            let ast::Stmt::CreateTable { temporary, .. } = translate_stmt(sql) else {
+                panic!("{sql}: expected CREATE TABLE");
+            };
+            assert!(temporary, "{sql}");
+        }
+        for sql in ["CREATE TABLE t (a int)", "CREATE TABLE t AS SELECT 1 AS a"] {
+            let ast::Stmt::CreateTable { temporary, .. } = translate_stmt(sql) else {
+                panic!("{sql}: expected CREATE TABLE");
+            };
+            assert!(!temporary, "{sql}");
+        }
+        for sql in [
+            "CREATE TEMP VIEW v AS SELECT 1",
+            "CREATE VIEW pg_temp.v AS SELECT 1",
+        ] {
+            let ast::Stmt::CreateView { temporary, .. } = translate_stmt(sql) else {
+                panic!("{sql}: expected CREATE VIEW");
+            };
+            assert!(temporary, "{sql}");
+        }
+        let ast::Stmt::Select(select) = translate_stmt("SELECT a FROM pg_temp.t") else {
+            panic!("expected SELECT");
+        };
+        assert!(select.to_string().contains("\"temp\".t"), "{select}");
+        assert_translates("DROP TABLE pg_temp.t");
         // UNLOGGED only weakens durability, so a logged table is a safe substitute.
         assert_translates("CREATE UNLOGGED TABLE t (a int)");
+    }
+
+    #[test]
+    fn fail_closed_temporary_relations() {
+        assert_not_supported("CREATE TEMP TABLE t (id serial)", "serial");
+        assert_not_supported("CREATE TABLE pg_temp.t (id bigserial)", "serial");
+        assert_not_supported("CREATE TEMP SEQUENCE s", "TEMPORARY SEQUENCE");
+        assert_not_supported("CREATE SEQUENCE pg_temp.s", "TEMPORARY SEQUENCE");
+        assert_not_supported(
+            "CREATE MATERIALIZED VIEW pg_temp.mv AS SELECT 1",
+            "temporary materialized views",
+        );
+        assert_parse_error(
+            "CREATE TEMP TABLE public.t (a int)",
+            "cannot create temporary relation in non-temporary schema",
+        );
+        assert_parse_error(
+            "CREATE TEMP VIEW s.v AS SELECT 1",
+            "cannot create temporary relation in non-temporary schema",
+        );
+        assert_parse_error(
+            "CREATE TABLE t (a int) ON COMMIT PRESERVE ROWS",
+            "ON COMMIT can only be used on temporary tables",
+        );
+        // Core would resolve a schema named temp to the temporary schema.
+        for sql in [
+            "CREATE TABLE temp.t (a int)",
+            "SELECT * FROM temp.t",
+            "DROP TABLE temp.t",
+        ] {
+            assert_parse_error(sql, "schema \"temp\" does not exist");
+        }
+    }
+
+    #[test]
+    fn create_view_relation_references() {
+        let view = try_extract_create_view(
+            &crate::parse(
+                "CREATE VIEW v AS WITH c AS (SELECT 1 AS a) \
+                 SELECT * FROM c, t, pg_temp.u WHERE a IN (SELECT a FROM w)",
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert!(!view.materialized && !view.temporary && view.schema.is_none());
+        assert_eq!(view.name_location, "CREATE VIEW ".len());
+        let mut references: Vec<_> = view
+            .references
+            .iter()
+            .map(|r| (r.schema.as_deref(), r.name.as_str(), r.is_cte_name))
+            .collect();
+        references.sort();
+        assert_eq!(
+            references,
+            vec![
+                (None, "c", true),
+                (None, "t", false),
+                (None, "w", false),
+                (Some("pg_temp"), "u", false),
+            ]
+        );
+
+        let view = try_extract_create_view(
+            &crate::parse("CREATE MATERIALIZED VIEW s.mv AS SELECT * FROM t").unwrap(),
+        )
+        .unwrap();
+        assert!(view.materialized && !view.temporary);
+        assert_eq!(view.schema.as_deref(), Some("s"));
+        assert!(
+            try_extract_create_view(&crate::parse("CREATE TEMP VIEW v AS SELECT 1").unwrap())
+                .unwrap()
+                .temporary
+        );
+        assert!(
+            try_extract_create_view(&crate::parse("CREATE TABLE t (a int)").unwrap()).is_none()
+        );
     }
 
     #[test]
@@ -9592,7 +9836,15 @@ mod tests {
 
     #[test]
     fn fail_closed_on_commit() {
-        assert_not_supported("CREATE TEMP TABLE t (a int) ON COMMIT DROP", "TEMPORARY");
+        assert_not_supported("CREATE TEMP TABLE t (a int) ON COMMIT DROP", "ON COMMIT");
+        assert_not_supported(
+            "CREATE TEMP TABLE t (a int) ON COMMIT DELETE ROWS",
+            "ON COMMIT",
+        );
+        assert_not_supported(
+            "CREATE TEMP TABLE t ON COMMIT DROP AS SELECT 1 AS a",
+            "ON COMMIT",
+        );
     }
 
     #[test]
@@ -9822,7 +10074,6 @@ mod tests {
 
     #[test]
     fn fail_closed_create_view_clauses() {
-        assert_not_supported("CREATE TEMP VIEW v AS SELECT 1", "TEMPORARY VIEW");
         assert_not_supported(
             "CREATE VIEW v WITH (security_barrier = true) AS SELECT 1",
             "WITH (options)",
@@ -9839,8 +10090,6 @@ mod tests {
 
     #[test]
     fn fail_closed_into_clause() {
-        assert_not_supported("CREATE TEMP TABLE t AS SELECT 1 AS a", "temporary table");
-        assert_not_supported("SELECT 1 AS a INTO TEMP t", "temporary table");
         assert_not_supported(
             "CREATE TABLE t WITH (fillfactor = 70) AS SELECT 1 AS a",
             "storage parameters",
