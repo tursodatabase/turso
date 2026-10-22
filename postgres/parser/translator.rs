@@ -3717,6 +3717,9 @@ impl PostgreSQLTranslator {
         func_call: &pg_query::protobuf::FuncCall,
     ) -> Result<ast::Expr, ParseError> {
         let func_name = function_name(&func_call.funcname)?;
+        if func_call.func_variadic {
+            return Err(not_supported("VARIADIC function arguments"));
+        }
 
         // Translate FILTER clause
         let filter_clause = if let Some(ref filter) = func_call.agg_filter {
@@ -9910,5 +9913,10 @@ mod tests {
         );
         assert_translates("SELECT pg_catalog.lower('A')");
         assert_translates("SELECT * FROM pg_catalog.generate_series(1, 3)");
+    }
+
+    #[test]
+    fn fail_closed_variadic() {
+        assert_not_supported("SELECT concat(VARIADIC ARRAY['a', 'b'])", "VARIADIC");
     }
 }
