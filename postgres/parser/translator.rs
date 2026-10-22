@@ -838,6 +838,10 @@ impl PostgreSQLTranslator {
                         ));
                     }
                 };
+                // The USING conversion expression is stored as the raw default.
+                if col_def.raw_default.is_some() {
+                    return Err(not_supported("ALTER COLUMN TYPE ... USING"));
+                }
                 let col = self.translate_column_def(col_def, &relation.schemaname)?;
                 ast::AlterTableBody::AlterColumn {
                     old: ast::Name::from_string(&cmd.name),
@@ -8942,5 +8946,14 @@ mod tests {
             "ALTER MATERIALIZED VIEW m ALTER COLUMN a SET STATISTICS 1",
             "ALTER MATVIEW",
         );
+    }
+
+    #[test]
+    fn fail_closed_alter_column_type_using() {
+        assert_not_supported(
+            "ALTER TABLE t ALTER COLUMN a TYPE int USING a::int * 10",
+            "USING",
+        );
+        assert_translates("ALTER TABLE t ALTER COLUMN a TYPE bigint");
     }
 }
