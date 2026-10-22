@@ -56,6 +56,14 @@ expect {
     0
 }
 
+@skip-if postgres "Turso transactions are snapshot isolation, so only REPEATABLE READ is accepted"
+test txn-set-transaction-serializable-rejected {
+    BEGIN;
+    SET TRANSACTION ISOLATION LEVEL SERIALIZABLE, NOT DEFERRABLE;
+}
+expect error {
+}
+
 @setup counter
 test txn-set-transaction-read-write-keeps-earlier-changes {
     BEGIN;

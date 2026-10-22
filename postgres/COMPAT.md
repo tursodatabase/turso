@@ -57,7 +57,7 @@ Basics not enumerated by the official feature matrix.
 | CREATE DOMAIN | ✅ Supported | Base type + DEFAULT, NOT NULL, CHECK constraints enforced; array base types, type modifiers and non-binary COLLATE rejected |
 | CREATE TYPE ... AS ENUM | ✅ Supported | Values validated on write; other CREATE TYPE forms unsupported |
 | TRUNCATE | 🟡 Partial | Lowered to DELETE of one table; several tables, CASCADE and RESTART IDENTITY rejected |
-| BEGIN / COMMIT / ROLLBACK | ✅ Supported | Isolation levels and DEFERRABLE accepted (transactions are always serializable); READ ONLY and AND CHAIN rejected |
+| BEGIN / COMMIT / ROLLBACK | ✅ Supported | Every transaction is snapshot isolation, i.e. REPEATABLE READ; `ISOLATION LEVEL REPEATABLE READ` is accepted, every other level, DEFERRABLE, READ ONLY and AND CHAIN are rejected |
 | LOCK TABLE | 🟡 Partial | ACCESS SHARE without NOWAIT is accepted as a no-op inside a transaction for pg_dump compatibility; table names are not checked, no locks are acquired, and no read snapshot is started; other modes are rejected |
 | Casts (`expr::type`, CAST) | ✅ Supported | Also `int4(x)`-style cast functions |
 | Parameters (`$1`, `$2`, ...) | 🟡 Partial | Work through the extended wire protocol; text-format values only |
@@ -412,7 +412,7 @@ Upgrade is not supported.
 |---------|--------|-------|
 | Cursors | ❌ Not supported | DECLARE/FETCH/MOVE not translated |
 | Savepoints | ✅ Supported | SAVEPOINT, RELEASE, ROLLBACK TO |
-| Serializable Snapshot Isolation | ❌ Not supported | BEGIN ISOLATION LEVEL ... accepted but the level is ignored |
+| Serializable Snapshot Isolation | ❌ Not supported | BEGIN ISOLATION LEVEL SERIALIZABLE is rejected |
 | Two-phase commit | ❌ Not supported | PREPARE TRANSACTION rejected |
 | Updatable cursors | ❌ Not supported | |
 
