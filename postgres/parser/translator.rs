@@ -35,7 +35,11 @@ impl PostgreSQLTranslator {
     fn qualified_name_from_range_var(
         &self,
         range_var: &pg_query::protobuf::RangeVar,
-    ) -> ast::QualifiedName {
+    ) -> Result<ast::QualifiedName, ParseError> {
+        // db.schema.table: the database part would be dropped.
+        if !range_var.catalogname.is_empty() {
+            return Err(not_supported("cross-database references"));
+        }
         let is_schemata = range_var
             .schemaname
             .eq_ignore_ascii_case("information_schema")
@@ -61,7 +65,7 @@ impl PostgreSQLTranslator {
             None => ast::QualifiedName::single(name),
         };
         qn.alias = alias;
-        qn
+        Ok(qn)
     }
 
     /// Maps PostgreSQL system table names to their Turso equivalents.
@@ -269,7 +273,7 @@ impl PostgreSQLTranslator {
             .as_ref()
             .ok_or_else(|| ParseError::ParseError("CREATE TABLE missing table name".into()))?;
 
-        let tbl_name = self.qualified_name_from_range_var(relation);
+        let tbl_name = self.qualified_name_from_range_var(relation)?;
 
         reject_temporary(relation, "CREATE TEMPORARY TABLE")?;
         // PARTITION OF also records the parent in inh_relations, so check
@@ -781,7 +785,7 @@ impl PostgreSQLTranslator {
             .relation
             .as_ref()
             .ok_or_else(|| ParseError::ParseError("ALTER TABLE missing table name".into()))?;
-        let name = self.qualified_name_from_range_var(relation);
+        let name = self.qualified_name_from_range_var(relation)?;
 
         // ALTER INDEX/VIEW/SEQUENCE/... share AlterTableStmt with ALTER TABLE.
         if alter.objtype != pg_query::protobuf::ObjectType::ObjectTable as i32 {
@@ -922,7 +926,7 @@ impl PostgreSQLTranslator {
             .relation
             .as_ref()
             .ok_or_else(|| ParseError::ParseError("RENAME missing relation".into()))?;
-        let name = self.qualified_name_from_range_var(relation);
+        let name = self.qualified_name_from_range_var(relation)?;
 
         if rename.missing_ok {
             return Err(not_supported("ALTER ... IF EXISTS ... RENAME"));
@@ -1075,6 +1079,9 @@ impl PostgreSQLTranslator {
             return Err(not_supported("NULLS NOT DISTINCT"));
         }
         reject_table_storage_clauses(&idx.options, &idx.table_space, "")?;
+        if !relation.catalogname.is_empty() {
+            return Err(not_supported("cross-database references"));
+        }
         let idx_name = ast::QualifiedName::single(ast::Name::from_string(&idx.idxname));
 
         self.translating_index.set(true);
@@ -1257,7 +1264,7 @@ impl PostgreSQLTranslator {
                 _ => None,
             })
             .ok_or_else(|| ParseError::ParseError("TRUNCATE: missing table name".into()))?;
-        let tbl_name = self.qualified_name_from_range_var(relation);
+        let tbl_name = self.qualified_name_from_range_var(relation)?;
         Ok(ast::Stmt::Delete {
             with: None,
             tbl_name,
@@ -1275,7 +1282,7 @@ impl PostgreSQLTranslator {
             .view
             .as_ref()
             .ok_or_else(|| ParseError::ParseError("CREATE VIEW: missing view name".into()))?;
-        let view_name = self.qualified_name_from_range_var(relation);
+        let view_name = self.qualified_name_from_range_var(relation)?;
 
         if view.replace {
             return Err(not_supported("CREATE OR REPLACE VIEW"));
@@ -1376,7 +1383,7 @@ impl PostgreSQLTranslator {
         let relation = into_clause.rel.as_ref().ok_or_else(|| {
             ParseError::ParseError("CREATE MATERIALIZED VIEW: missing view name".into())
         })?;
-        let view_name = self.qualified_name_from_range_var(relation);
+        let view_name = self.qualified_name_from_range_var(relation)?;
         reject_into_clause(into_clause, relation, "CREATE MATERIALIZED VIEW")?;
         // Materialized views here are maintained incrementally and always
         // populated, so there is no unpopulated state to create.
@@ -1421,7 +1428,7 @@ impl PostgreSQLTranslator {
             .rel
             .as_ref()
             .ok_or_else(|| ParseError::ParseError("CREATE TABLE AS: missing table name".into()))?;
-        let tbl_name = self.qualified_name_from_range_var(relation);
+        let tbl_name = self.qualified_name_from_range_var(relation)?;
         reject_into_clause(into_clause, relation, "CREATE TABLE AS")?;
 
         // The engine names the new table's columns after the SELECT's output
@@ -1479,7 +1486,7 @@ impl PostgreSQLTranslator {
             .relation
             .as_ref()
             .ok_or_else(|| ParseError::ParseError("INSERT missing target table".into()))?;
-        let tbl_name = self.qualified_name_from_range_var(relation);
+        let tbl_name = self.qualified_name_from_range_var(relation)?;
 
         // Extract column names (empty means "all columns" in positional INSERT)
         let columns: Vec<ast::Name> = insert
@@ -1660,7 +1667,7 @@ impl PostgreSQLTranslator {
             .relation
             .as_ref()
             .ok_or_else(|| ParseError::ParseError("UPDATE missing target table".into()))?;
-        let tbl_name = self.qualified_name_from_range_var(relation);
+        let tbl_name = self.qualified_name_from_range_var(relation)?;
 
         // Extract SET assignments from target_list
         // Each ResTarget has name (column) and val (expression)
@@ -1732,7 +1739,7 @@ impl PostgreSQLTranslator {
             .relation
             .as_ref()
             .ok_or_else(|| ParseError::ParseError("DELETE missing target table".into()))?;
-        let tbl_name = self.qualified_name_from_range_var(relation);
+        let tbl_name = self.qualified_name_from_range_var(relation)?;
 
         if !delete.using_clause.is_empty() {
             return Err(not_supported("DELETE ... USING"));
@@ -2117,7 +2124,7 @@ impl PostgreSQLTranslator {
         range_var: &pg_query::protobuf::RangeVar,
     ) -> Result<ast::SelectTable, ParseError> {
         reject_column_aliases(&range_var.alias, "a table")?;
-        let qualified_name = self.qualified_name_from_range_var(range_var);
+        let qualified_name = self.qualified_name_from_range_var(range_var)?;
         let alias = match &range_var.alias {
             Some(a) => Some(a.aliasname.clone()),
             None if qualified_name.name.as_str() != range_var.relname => {
@@ -4732,7 +4739,7 @@ impl PostgreSQLTranslator {
             .sequence
             .as_ref()
             .ok_or_else(|| ParseError::ParseError("CREATE SEQUENCE missing name".into()))?;
-        let seq_name = self.qualified_name_from_range_var(relation);
+        let seq_name = self.qualified_name_from_range_var(relation)?;
         reject_temporary(relation, "CREATE TEMPORARY SEQUENCE")?;
 
         let mut start = None;
@@ -9974,5 +9981,13 @@ mod tests {
         assert_not_supported("CREATE DOMAIN d AS text COLLATE \"en_US\"", "COLLATE");
         assert_translates("CREATE DOMAIN d AS int NULL DEFAULT 1 CHECK (VALUE > 0)");
         assert_translates("CREATE DOMAIN d AS text COLLATE \"C\"");
+    }
+
+    #[test]
+    fn fail_closed_cross_database_references() {
+        assert_not_supported("SELECT * FROM otherdb.public.t", "cross-database");
+        assert_not_supported("INSERT INTO otherdb.public.t VALUES (1)", "cross-database");
+        assert_not_supported("CREATE TABLE otherdb.public.t (a int)", "cross-database");
+        assert_not_supported("CREATE INDEX i ON otherdb.public.t (a)", "cross-database");
     }
 }
