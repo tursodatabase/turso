@@ -2,6 +2,7 @@ use crate::schema::{BTreeCharacteristics, BTreeTable, SchemaObjectType, RESERVED
 use crate::storage::pager::CreateBTreeFlags;
 use crate::sync::Arc;
 use crate::translate::sequence::bind_sequence_names_in_select;
+use crate::translate::trigger_exec::rewrite_select_expressions;
 use crate::translate::{
     emitter::Resolver,
     schema::{emit_schema_entry, SchemaEntryType, SQLITE_TABLEID},
@@ -91,6 +92,11 @@ pub fn translate_create_materialized_view(
     // Check for cross-database table references first
     crate::util::validate_select_for_views(select_stmt, resolver, database_id)?;
 
+    let mut select_stmt = select_stmt.clone();
+    if resolver.dialect.binds_names_at_create() {
+        bind_table_names_in_select(&mut select_stmt, resolver)?;
+    }
+    let select_stmt = &select_stmt;
     let mut view_column_schema =
         resolver.with_schema(database_id, |s| extract_view_columns(select_stmt, s))?;
     // The parser checks the column count when it can count the SELECT's
@@ -405,6 +411,7 @@ pub fn translate_create_view(
 
     let mut select_stmt = select_stmt.clone();
     if resolver.dialect.binds_names_at_create() {
+        bind_table_names_in_select(&mut select_stmt, resolver)?;
         bind_sequence_names_in_select(&mut select_stmt, resolver)?;
     }
     let sql = create_view_to_str("VIEW", &view_name_in_sql.as_ident(), columns, &select_stmt);
@@ -447,6 +454,118 @@ pub fn translate_create_view(
         p5: 0,
     });
 
+    Ok(())
+}
+
+/// Replaces each table name of the view body with the name the table is
+/// stored under, qualified with its database, so that the view reads the
+/// tables it was created over whatever the search path is later. A table
+/// that is not found is left as written, and so is a table of temp. A
+/// renamed table keeps its written name as alias for the column references
+/// of the body.
+pub(crate) fn bind_table_names_in_select(
+    select: &mut ast::Select,
+    resolver: &Resolver,
+) -> Result<()> {
+    bind_table_names(select, resolver, &mut Vec::new())
+}
+
+fn bind_table_names(
+    select: &mut ast::Select,
+    resolver: &Resolver,
+    cte_names: &mut Vec<String>,
+) -> Result<()> {
+    let outer_cte_count = cte_names.len();
+    if let Some(with) = &mut select.with {
+        for cte in &mut with.ctes {
+            if with.recursive {
+                cte_names.push(normalize_ident(cte.tbl_name.as_str()));
+            }
+            bind_table_names(&mut cte.select, resolver, cte_names)?;
+            if !with.recursive {
+                cte_names.push(normalize_ident(cte.tbl_name.as_str()));
+            }
+        }
+    }
+    bind_table_names_in_one_select(&mut select.body.select, resolver, cte_names)?;
+    for compound in &mut select.body.compounds {
+        bind_table_names_in_one_select(&mut compound.select, resolver, cte_names)?;
+    }
+    rewrite_select_expressions(select, &mut |expr| match expr {
+        ast::Expr::Subquery(select) | ast::Expr::Exists(select) => {
+            bind_table_names(select, resolver, cte_names)
+        }
+        ast::Expr::InSelect { rhs, .. } => bind_table_names(rhs, resolver, cte_names),
+        _ => Ok(()),
+    })?;
+    cte_names.truncate(outer_cte_count);
+    Ok(())
+}
+
+fn bind_table_names_in_one_select(
+    one_select: &mut ast::OneSelect,
+    resolver: &Resolver,
+    cte_names: &mut Vec<String>,
+) -> Result<()> {
+    if let ast::OneSelect::Select {
+        from: Some(from), ..
+    } = one_select
+    {
+        bind_table_names_in_from(from, resolver, cte_names)?;
+    }
+    Ok(())
+}
+
+fn bind_table_names_in_from(
+    from: &mut ast::FromClause,
+    resolver: &Resolver,
+    cte_names: &mut Vec<String>,
+) -> Result<()> {
+    bind_table_name_in_source(&mut from.select, resolver, cte_names)?;
+    for join in &mut from.joins {
+        bind_table_name_in_source(&mut join.table, resolver, cte_names)?;
+    }
+    Ok(())
+}
+
+fn bind_table_name_in_source(
+    source: &mut ast::SelectTable,
+    resolver: &Resolver,
+    cte_names: &mut Vec<String>,
+) -> Result<()> {
+    match source {
+        ast::SelectTable::Table(name, alias, _) => {
+            bind_table_name(name, alias, resolver, cte_names)
+        }
+        ast::SelectTable::TableCall(..) => Ok(()),
+        ast::SelectTable::Select { select, .. } => bind_table_names(select, resolver, cte_names),
+        ast::SelectTable::Sub(from, _) => bind_table_names_in_from(from, resolver, cte_names),
+    }
+}
+
+fn bind_table_name(
+    name: &mut ast::QualifiedName,
+    alias: &mut Option<ast::As>,
+    resolver: &Resolver,
+    cte_names: &[String],
+) -> Result<()> {
+    let written = normalize_ident(name.name.as_str());
+    if name.namespace.is_none() && cte_names.contains(&written) {
+        return Ok(());
+    }
+    let Some(resolved) = resolver.find_existing_table(name)? else {
+        return Ok(());
+    };
+    if resolved.database_id() == crate::TEMP_DB_ID || !resolver.has_table_like_object(&resolved) {
+        return Ok(());
+    }
+    if alias.is_none() && written != resolved.stored_name {
+        *alias = Some(ast::As::As(name.name.clone()));
+    }
+    *name = ast::QualifiedName::fullname(
+        ast::Name::exact(resolver.namespace_of_database(resolved.database_id()).name),
+        ast::Name::exact(resolved.stored_name),
+    );
     Ok(())
 }
 

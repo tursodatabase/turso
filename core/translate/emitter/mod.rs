@@ -885,6 +885,12 @@ impl<'a> Resolver<'a> {
         })
     }
 
+    pub(crate) fn has_table_like_object(&self, resolved: &ResolvedName) -> bool {
+        self.with_schema(resolved.database_id(), |schema| {
+            Self::schema_has_table_like_object(schema, &resolved.stored_name)
+        })
+    }
+
     pub(crate) fn resolve_existing_table_named(&self, table_name: &str) -> Result<ResolvedName> {
         self.find_existing_table_named(table_name)
             .ok_or_else(|| LimboError::ParseError(format!("no such object: {table_name}")))

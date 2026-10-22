@@ -253,11 +253,11 @@ fn build_plan_for_connection(
         None,
     );
     // Re-planning for maintenance must resolve the view's unqualified table
-    // names the same way CREATE did: within the view's own database, never
+    // names the same way CREATE did: within the view's own namespace, never
     // through a TEMP table that happens to share a source table's name
-    // (#9456). Materialized views always live in main.
+    // (#9456). Materialized views always live in the main database.
     resolver.with_view_scope(
-        resolver.namespace_of_database(crate::MAIN_DB_ID),
+        resolver.namespace_of_stored_name(crate::MAIN_DB_ID, view_name),
         view_name.to_string(),
         || plan_view(view_name, select, &resolver, connection),
     )

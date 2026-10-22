@@ -305,3 +305,40 @@ expect {
     3
     3
 }
+
+test materialized-view-created-in-the-search-path-schema-reads-its-tables {
+    CREATE SCHEMA app;
+    CREATE TABLE app.t (x int);
+    CREATE TABLE t (x int);
+    INSERT INTO app.t VALUES (1);
+    INSERT INTO t VALUES (100);
+    SET search_path TO app;
+    CREATE MATERIALIZED VIEW mv AS SELECT sum(x) AS s FROM t;
+    SELECT * FROM mv;
+    INSERT INTO t VALUES (2);
+    INSERT INTO public.t VALUES (200);
+    SELECT * FROM mv;
+    REFRESH MATERIALIZED VIEW mv;
+    SELECT * FROM mv;
+}
+expect {
+    1
+    3
+    3
+}
+
+test view-in-schema-binds-a-public-table-through-search-path {
+    CREATE SCHEMA app;
+    CREATE TABLE t (x int);
+    INSERT INTO t VALUES (1);
+    CREATE VIEW app.v AS SELECT x FROM t;
+    CREATE TABLE app.t (x int);
+    INSERT INTO app.t VALUES (2);
+    SELECT * FROM app.v;
+    SET search_path TO app;
+    SELECT * FROM app.v;
+}
+expect {
+    1
+    1
+}
