@@ -2828,11 +2828,15 @@ impl PostgreSQLTranslator {
                                 // Qualified column reference (table.column)
                                 let mut parts = vec![];
                                 for field in &col_ref.fields {
-                                    if let Some(pg_query::protobuf::node::Node::String(s)) =
+                                    let Some(pg_query::protobuf::node::Node::String(s)) =
                                         &field.node
-                                    {
-                                        parts.push(s.sval.clone());
-                                    }
+                                    else {
+                                        // t.* inside an expression, e.g. count(t.*) or
+                                        // row_to_json(t.*): dropping the star would
+                                        // reference a column named t instead.
+                                        return Err(not_supported("table.* inside an expression"));
+                                    };
+                                    parts.push(s.sval.clone());
                                 }
                                 match parts.len() {
                                     3 => {
@@ -2851,9 +2855,7 @@ impl PostgreSQLTranslator {
                                             ast::Name::from_string(parts[1].clone()),
                                         ))
                                     }
-                                    _ => {
-                                        Ok(ast::Expr::Id(ast::Name::from_string(parts[0].clone())))
-                                    }
+                                    _ => Err(not_supported("cross-database references")),
                                 }
                             }
                         }
@@ -9757,5 +9759,16 @@ mod tests {
         assert_not_supported("SELECT 'a%' SIMILAR TO 'a#%' ESCAPE '#'", "ESCAPE");
         assert_not_supported("SELECT a SIMILAR TO b FROM t", "non-literal pattern");
         assert_translates("SELECT 'abc' SIMILAR TO 'a%'");
+    }
+
+    #[test]
+    fn fail_closed_column_references() {
+        assert_not_supported("SELECT count(t.*) FROM t", "table.* inside an expression");
+        assert_not_supported(
+            "SELECT row_to_json(s.t.*) FROM s.t",
+            "table.* inside an expression",
+        );
+        assert_not_supported("SELECT db.s.t.a FROM s.t", "cross-database");
+        assert_translates("SELECT s.t.a, t.a, a FROM s.t");
     }
 }
