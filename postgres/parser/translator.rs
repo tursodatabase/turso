@@ -1955,7 +1955,11 @@ impl PostgreSQLTranslator {
                 }
             }
             let name = if res_target.name.is_empty() {
-                derived_column_name(val).unwrap_or_else(|| "?column?".to_string())
+                match derived_column_name(val) {
+                    Some(name) => name,
+                    None if matches!(val.node, Some(Node::AConst(_))) => "?column?".to_string(),
+                    None => return false,
+                }
             } else {
                 res_target.name.clone()
             };
@@ -10271,6 +10275,10 @@ mod tests {
         );
         assert_not_supported(
             "(WITH c AS (SELECT 1 AS a, 2 AS a) SELECT * FROM c LIMIT 1) UNION SELECT 3, 4",
+            "without distinct column names",
+        );
+        assert_not_supported(
+            "(SELECT b COLLATE \"C\", b FROM t LIMIT 1) UNION SELECT 'q', 'r'",
             "without distinct column names",
         );
         assert_translates("SELECT 1, 2 UNION (SELECT 3, 4 LIMIT 1)");
