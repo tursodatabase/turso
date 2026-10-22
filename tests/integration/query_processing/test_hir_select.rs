@@ -442,6 +442,9 @@ fn hir_right_and_full_joins_match_sqlite_rows() {
         // Legacy emits extra rows when a comma join comes before FULL JOIN.
         "SELECT i.id, j.id, t.tag FROM items i, items j FULL JOIN tags t ON t.item_id = j.id \
          WHERE i.id = 1 ORDER BY 1, 2, 3",
+        "SELECT a.id, b.id, t.tag FROM items a FULL JOIN items b ON a.id = b.id \
+         FULL JOIN tags t ON t.item_id = b.id ORDER BY 1, 2, 3",
+        "SELECT a.id, a.value, b.value FROM items a FULL JOIN items b USING (id) ORDER BY 1, 2, 3",
     ] {
         let mut stmt = sqlite.prepare(sql).unwrap();
         let columns = stmt.column_count();
@@ -457,20 +460,6 @@ fn hir_right_and_full_joins_match_sqlite_rows() {
             expected,
             "rows differ for {sql}"
         );
-    }
-
-    for (sql, message) in [
-        (
-            "SELECT * FROM items a FULL JOIN items b ON a.id = b.id FULL JOIN tags t ON t.item_id = b.id",
-            "FULL OUTER JOIN chaining is not yet supported",
-        ),
-        (
-            "SELECT * FROM items a FULL JOIN items b USING (id)",
-            "FULL OUTER JOIN requires an equality condition in the ON clause",
-        ),
-    ] {
-        let error = hir.prepare(sql).expect_err("FULL JOIN shape fails");
-        assert!(error.to_string().contains(message), "{error}");
     }
 }
 
@@ -699,13 +688,14 @@ fn hir_errors_name_what_is_wrong() {
         let hir_error = hir.prepare(sql).expect_err("HIR rejects").to_string();
         assert_eq!(hir_error, message, "{sql}");
     }
-    // Legacy says "no such table: x" here; HIR names the column as SQLite
-    // does.
+    // A qualifier that names no table or CTE of the query is reported as
+    // the missing table, as main's planner did and as the lateral-errors
+    // sqltests expect (SQLite reports the column instead).
     let error = hir
         .prepare("SELECT x.y FROM items")
         .expect_err("HIR rejects")
         .to_string();
-    assert_eq!(error, "Parse error: no such column: x.y");
+    assert_eq!(error, "Parse error: no such table: x");
 }
 
 #[test]
@@ -949,16 +939,14 @@ fn hir_between_on_a_column_seeks_an_index_range() {
     let db = setup();
     let (sqlite, hir) = connections(&db);
     // Like legacy and SQLite, each bound of BETWEEN can drive the seek.
-    let sql = "SELECT id FROM items WHERE value BETWEEN 15 AND 35 ORDER BY id";
-    let plan = limbo_exec_rows(&hir, &format!("EXPLAIN QUERY PLAN {sql}"));
-    assert!(
-        plan.iter().any(|row| matches!(
-            row.get(3),
-            Some(rusqlite::types::Value::Text(detail))
-                if detail == "SEARCH items USING COVERING INDEX items_value (value>=? AND value<=?)"
-        )),
-        "{plan:?}"
+    assert_eq!(
+        query_plan(&hir, "SELECT id FROM items WHERE value BETWEEN 15 AND 35"),
+        ["SEARCH items USING COVERING INDEX items_value (value>=? AND value<=?)"]
     );
+    // Without statistics the planner counts a million rows, and a scan in
+    // rowid order then costs less than the seek plus a sort of its rows.
+    let sql = "SELECT id FROM items WHERE value BETWEEN 15 AND 35 ORDER BY id";
+    assert_eq!(query_plan(&hir, sql), ["SCAN items"]);
     for sql in [
         sql,
         "SELECT id FROM items WHERE value NOT BETWEEN 15 AND 35 ORDER BY id",
@@ -1202,10 +1190,13 @@ fn hir_in_subquery_reading_the_outer_row_through_a_from_subquery_matches_sqlite(
 
 /// Like legacy, an equality join on columns no index covers may build a hash
 /// table from the earlier table and scan the later one, probing it; a LEFT
-/// or FULL join also scans the build rows nothing matched. HIR hashes the
-/// same joins as legacy. The tables are large enough that a debug build's
-/// hash table spills to disk, so the lookups that wait for spilled rows run
-/// too, and every row still matches SQLite.
+/// join also scans the build rows nothing matched. A build table read with
+/// a constraint is stored first, as a build input. A FULL JOIN never
+/// hashes. The tables are large enough that a debug build's hash table
+/// spills to disk, so the lookups that wait for spilled rows run too, and
+/// every row still matches SQLite. The row counts come from ANALYZE: without
+/// them the planner counts a million rows per table, and a build input of
+/// that size is too large to store.
 #[test]
 fn hir_equality_joins_without_an_index_use_a_hash_table() {
     const SCHEMA: &str = "
@@ -1223,11 +1214,12 @@ fn hir_equality_joins_without_an_index_use_a_hash_table() {
     for statement in SCHEMA.split(';').filter(|sql| !sql.trim().is_empty()) {
         hir.execute(statement).unwrap();
     }
+    hir.execute("ANALYZE").unwrap();
     let sqlite = rusqlite::Connection::open_in_memory().unwrap();
     sqlite.execute_batch(SCHEMA).unwrap();
-    // A LEFT or FULL JOIN row without a match, including one whose lookup
-    // waited for a partition on disk, reads NULL. Like legacy, a subquery
-    // that runs again probes the same hash table again.
+    // A LEFT JOIN row without a match, including one whose lookup waited
+    // for a partition on disk, reads NULL. Like legacy, a subquery that
+    // runs again probes the same hash table again.
     for (sql, hashes) in [
         (
             "SELECT count(*), sum(a.id), sum(b.id), max(a.pad || b.pad) FROM a JOIN b ON b.k = a.k",
@@ -1266,12 +1258,12 @@ fn hir_equality_joins_without_an_index_use_a_hash_table() {
         ),
         (
             "SELECT count(*), count(a.id), count(b.id), sum(b.v) FROM a FULL JOIN b ON b.k = a.k",
-            true,
+            false,
         ),
         (
             "SELECT count(*), count(a.id), count(b.id) FROM a FULL JOIN b ON b.k = a.k \
              WHERE a.id IS NULL OR b.v > 10",
-            true,
+            false,
         ),
         (
             "SELECT sum((SELECT count(b.id) FROM a a2 JOIN b ON b.k = a2.k WHERE a2.id = a.id)) \
@@ -1435,7 +1427,9 @@ fn hir_group_by_uses_an_index_when_the_query_also_has_order_by() {
 /// Like legacy, `x IS NULL` seeks an index on x, also through an expression
 /// index, but not on a table a LEFT JOIN may NULL-extend, where `IS NULL`
 /// is true on the added row. HIR also seeks for the `x ISNULL` spelling,
-/// which SQLite treats the same and legacy does not recognize.
+/// which SQLite treats the same and legacy does not recognize. With
+/// ORDER BY id and no statistics, a scan in rowid order costs less than a
+/// seek plus a sort of the million rows the planner counts.
 #[test]
 fn hir_is_null_seeks_an_index() {
     let db = setup();
@@ -1728,14 +1722,16 @@ fn hir_window_uses_the_loop_order() {
     }
 }
 
-/// Like legacy, a FULL JOIN on an equality hashes its left table and scans
-/// its right table, then the left rows nothing matched. A FULL JOIN that
-/// cannot hash, here because two tables are on its left, runs as nested
-/// loops plus a pass for the right table's unmatched rows, like SQLite; like
-/// a RIGHT JOIN, its right side seeks a temporary index on the join key
-/// instead of being scanned again for every left row.
+/// Like SQLite, a FULL JOIN runs as nested loops plus a pass over the right
+/// table's rows nothing matched, which lists after the loops under a
+/// `RIGHT-JOIN` row. It is never a hash join: a hash join does not record
+/// which right rows matched. The right table is scanned, not read through
+/// a temporary index, since the unmatched pass reads the table again. A
+/// WHERE term that is false on the rows the join adds on the right, here
+/// `a.id = 1` on a table left of the join, makes it a LEFT JOIN, which
+/// hashes.
 #[test]
-fn hir_full_join_hashes_its_left_table() {
+fn hir_full_join_runs_as_nested_loops_with_an_unmatched_pass() {
     const SCHEMA: &str = "
         CREATE TABLE l(id INTEGER PRIMARY KEY, k TEXT, v INT);
         CREATE TABLE r(id INTEGER PRIMARY KEY, k TEXT, w INT);
@@ -1752,14 +1748,28 @@ fn hir_full_join_hashes_its_left_table() {
     let sql = "SELECT l.id, r.id FROM l FULL JOIN r ON l.k = r.k ORDER BY 1, 2";
     let plan = query_plan(&hir, sql);
     assert_eq!(plan, expected_plan(sql));
-    assert_eq!(plan, ["HASH JOIN r", "SCAN l", "USE SORTER FOR ORDER BY"]);
+    assert_eq!(
+        plan,
+        [
+            "SCAN l",
+            "SCAN r LEFT-JOIN",
+            "RIGHT-JOIN r",
+            "SCAN r",
+            "USE SORTER FOR ORDER BY",
+        ]
+    );
     let nested_sql = "SELECT a.id, l.id, r.id FROM l AS a, l FULL JOIN r ON l.k = r.k \
                       WHERE a.id = 1 ORDER BY 1, 2, 3";
     let plan = query_plan(&hir, nested_sql);
-    assert!(
-        plan.iter()
-            .any(|row| row.starts_with("SEARCH r USING COVERING INDEX ephemeral_")),
-        "{plan:?}"
+    assert_eq!(plan, expected_plan(nested_sql));
+    assert_eq!(
+        plan,
+        [
+            "SEARCH a USING INTEGER PRIMARY KEY (rowid=?)",
+            "HASH JOIN r",
+            "SCAN l",
+            "USE SORTER FOR ORDER BY",
+        ]
     );
     for sql in [
         sql,
@@ -1848,9 +1858,9 @@ fn hir_correlated_subqueries_open_their_cursors_once() {
     let db = setup();
     let (sqlite, hir) = connections(&db);
     for sql in [
-        // A link that is not `=` keeps NOT EXISTS a subquery.
+        // A term that reads only the outer table keeps NOT EXISTS a subquery.
         "SELECT count(*) FROM items i WHERE NOT EXISTS \
-         (SELECT 1 FROM tags t WHERE t.item_id >= i.id AND t.item_id <= i.id)",
+         (SELECT 1 FROM tags t WHERE t.item_id = i.id AND i.value = 20)",
         "SELECT i.id, (SELECT count(*) FROM tags t WHERE t.item_id >= i.id AND t.item_id <= i.id) \
          FROM items i ORDER BY 1",
     ] {
@@ -2128,7 +2138,11 @@ fn hir_equally_cheap_join_orders_keep_the_from_order() {
 
 /// Like legacy's `optimizer/unnest.rs`, a correlated EXISTS or IN becomes a
 /// semi-join and a correlated NOT EXISTS an anti-join, when that costs no
-/// more than running the subquery for every outer row.
+/// more than running the subquery for every outer row. An anti-join whose
+/// inner table has no index on the link column hashes the outer table and
+/// scans the inner one, marking the outer rows that match; the others come
+/// out after the scan. A semi-join seeks a temporary index instead, since
+/// it stops at the first match.
 #[test]
 fn hir_correlated_exists_and_in_become_semi_and_anti_joins() {
     let db = setup();
@@ -2181,15 +2195,17 @@ fn hir_correlated_exists_and_in_become_semi_and_anti_joins() {
         ),
         (
             "SELECT o.id FROM o WHERE NOT EXISTS (SELECT 1 FROM i WHERE i.k1 = o.k1)",
-            &["SCAN o", "SEARCH i USING COVERING INDEX ephemeral_i (k1=?)"],
+            &["HASH JOIN i", "SCAN o"],
         ),
+        // The second anti-join cannot hash: its build table would be the
+        // first anti-join's inner table.
         (
             "SELECT o.id FROM o WHERE NOT EXISTS (SELECT 1 FROM i WHERE i.k1 = o.k1) \
              AND NOT EXISTS (SELECT 1 FROM j WHERE j.k2 = o.k2)",
             &[
-                "SCAN o",
-                "SEARCH i USING COVERING INDEX ephemeral_i (k1=?)",
+                "HASH JOIN i",
                 "SEARCH j USING COVERING INDEX ephemeral_j (k2=?)",
+                "SCAN o",
             ],
         ),
         (
@@ -2214,19 +2230,24 @@ fn hir_correlated_exists_and_in_become_semi_and_anti_joins() {
              GROUP BY o.id",
             &["SCAN o", "SEARCH i USING COVERING INDEX ephemeral_i (k1=?)"],
         ),
+        // A link that is not `=` also moves into the join, where it drives
+        // a range seek.
+        (
+            "SELECT o.id FROM o WHERE EXISTS (SELECT 1 FROM i WHERE i.k1 < o.k1)",
+            &["SCAN o", "SEARCH i USING COVERING INDEX ephemeral_i (k1<?)"],
+        ),
     ] {
         assert_eq!(plan(query_plan(&hir, sql)), expected, "{sql}");
         assert_same_rows(&hir, &sqlite, sql);
     }
     // These stay subqueries, as in legacy: a link to the NULL row of a LEFT
-    // JOIN, NOT IN, an OR, a term that is not an `=` with the outer row, and
-    // a NOT EXISTS term that does not read the inner table.
+    // JOIN, NOT IN, an OR, and a NOT EXISTS term that does not read the
+    // inner table.
     for sql in [
         "SELECT o.id, p.id FROM o LEFT JOIN p ON p.k = o.k1 \
          WHERE EXISTS (SELECT 1 FROM i WHERE i.k1 = p.id)",
         "SELECT o.id FROM o WHERE o.k2 NOT IN (SELECT j.k2 FROM j WHERE j.k2 = o.k1)",
         "SELECT o.id FROM o WHERE o.k1 = 2 OR EXISTS (SELECT 1 FROM i WHERE i.k1 = o.k1)",
-        "SELECT o.id FROM o WHERE EXISTS (SELECT 1 FROM i WHERE i.k1 < o.k1)",
         "SELECT o.id FROM o WHERE NOT EXISTS (SELECT 1 FROM i WHERE i.k1 = o.k1 AND o.k2 = 1)",
     ] {
         let hir_plan = plan(query_plan(&hir, sql));
@@ -2406,8 +2427,8 @@ fn hir_correlated_aggregates_join_first_and_share_grouped_tables() {
 
 /// Like legacy's hash join, HIR builds the hash table from the table joined
 /// before and scans the next one, probing it, so both plans hash and scan
-/// the same tables. A LEFT or FULL join builds from its left table and then
-/// emits the left rows nothing matched.
+/// the same tables. A LEFT join builds from its left table and then emits
+/// the left rows nothing matched.
 #[test]
 fn hir_hash_joins_build_and_probe() {
     let db = setup();
@@ -2442,12 +2463,16 @@ fn hir_hash_joins_build_and_probe() {
                 "USE SORTER FOR ORDER BY",
             ],
         ),
+        // A FULL JOIN never hashes: its right rows nothing matched come
+        // from a pass over the right table after the loops.
         (
             "SELECT h.order_id, i.item_id FROM h_orders h \
              FULL JOIN h_items i ON h.customer_name = i.order_name ORDER BY 1, 2",
             &[
-                "HASH JOIN h_items AS i",
                 "SCAN h_orders AS h",
+                "SCAN h_items AS i LEFT-JOIN",
+                "RIGHT-JOIN i",
+                "SCAN h_items AS i",
                 "USE SORTER FOR ORDER BY",
             ],
         ),
@@ -2598,8 +2623,9 @@ fn hir_semi_and_anti_joins_cover_outer_joins_parameters_and_table_functions() {
         }
     }
 
-    // Like legacy, the table built into a hash table is listed after the
-    // semi-join's loop. Temporary index names end in different ids.
+    // The semi-join's loop runs inside the FULL JOIN's loops, and again in
+    // the pass over the right rows nothing matched. Temporary index names
+    // end in different ids.
     let sql = "SELECT o.id, p.id FROM o FULL JOIN p ON p.k = o.k \
                WHERE EXISTS (SELECT 1 FROM i WHERE i.k = o.k) ORDER BY 1, 2";
     let plan = plan_without_ids(query_plan(&hir, sql));
@@ -2607,9 +2633,11 @@ fn hir_semi_and_anti_joins_cover_outer_joins_parameters_and_table_functions() {
     assert_eq!(
         plan,
         [
-            "HASH JOIN p",
-            "SEARCH i USING COVERING INDEX ephemeral_i (k=?)",
             "SCAN o",
+            "SCAN p LEFT-JOIN",
+            "SEARCH i USING COVERING INDEX ephemeral_i (k=?)",
+            "RIGHT-JOIN p",
+            "SCAN p",
             "USE SORTER FOR ORDER BY",
         ],
         "{sql}"
@@ -2669,17 +2697,20 @@ fn hir_outer_hash_joins_record_many_matched_rows() {
     ] {
         hir.execute(statement).unwrap();
     }
-    for (sql, expected) in [
+    for (sql, plan, expected) in [
         (
             "SELECT count(*), sum(b.id), sum(c.id) FROM b LEFT JOIN c ON b.k = c.k",
+            ["HASH JOIN c", "SCAN b"].as_slice(),
             (11496, 17079801, 16257256),
         ),
+        // A FULL JOIN never hashes.
         (
             "SELECT count(*), sum(b.id), sum(c.id) FROM b FULL JOIN c ON b.k = c.k",
+            &["SCAN b", "SCAN c LEFT-JOIN", "RIGHT-JOIN c", "SCAN c"],
             (12465, 17079801, 17820541),
         ),
     ] {
-        assert_eq!(query_plan(&hir, sql), ["HASH JOIN c", "SCAN b"], "{sql}");
+        assert_eq!(query_plan(&hir, sql), plan, "{sql}");
         let rows = limbo_exec_rows(&hir, sql);
         assert_eq!(rows, sqlite.rows(sql), "{sql}");
         assert_eq!(
@@ -2699,8 +2730,9 @@ fn hir_outer_hash_joins_record_many_matched_rows() {
 /// own rows, including the rows that waited for a part of the table on
 /// disk. A LEFT hash join starts each pass with no build row matched and
 /// ends it with the build rows nothing matched, next to the earlier loops'
-/// rows. A FULL join under earlier loops keeps its nested loops, since the
-/// probe rows it adds must come out once (legacy repeats them).
+/// rows. A FULL join never hashes. The statistics count one row in `a`, so
+/// the probe scan under its loop is priced as running once and the hash
+/// join wins; the loop really runs three times.
 #[test]
 fn hir_hash_joins_run_under_earlier_loops() {
     const SCHEMA: &str = "
@@ -2719,6 +2751,15 @@ fn hir_hash_joins_run_under_earlier_loops() {
     let db = TempDatabase::new_empty();
     let (_, hir) = connections(&db);
     for statement in SCHEMA.split(';').filter(|sql| !sql.trim().is_empty()) {
+        hir.execute(statement).unwrap();
+    }
+    for statement in [
+        "ANALYZE",
+        "DELETE FROM sqlite_stat1",
+        "INSERT INTO sqlite_stat1(tbl, idx, stat) VALUES ('a', NULL, '1'), \
+         ('b', NULL, '3000'), ('c', NULL, '3000'), ('d', NULL, '2000')",
+        "ANALYZE sqlite_schema",
+    ] {
         hir.execute(statement).unwrap();
     }
     let sqlite = rusqlite::Connection::open_in_memory().unwrap();
@@ -2811,6 +2852,18 @@ fn hir_hash_joins_build_from_the_loops_before_the_probe() {
     for statement in SCHEMA.split(';').filter(|sql| !sql.trim().is_empty()) {
         hir.execute(statement).unwrap();
     }
+    // A build input is stored only when the loops before the probe leave
+    // few rows, and beats a temporary index on the probe when the probe is
+    // large.
+    for statement in [
+        "ANALYZE",
+        "DELETE FROM sqlite_stat1",
+        "INSERT INTO sqlite_stat1(tbl, idx, stat) VALUES ('b', NULL, '100'), \
+         ('c', NULL, '3000'), ('d', NULL, '1000000'), ('e', NULL, '3000')",
+        "ANALYZE sqlite_schema",
+    ] {
+        hir.execute(statement).unwrap();
+    }
     let sqlite = rusqlite::Connection::open_in_memory().unwrap();
     sqlite.execute_batch(SCHEMA).unwrap();
     // (query, whether the chain's middle table gets a build input; the
@@ -2833,7 +2886,7 @@ fn hir_hash_joins_build_from_the_loops_before_the_probe() {
         (
             "SELECT count(*), sum(b.id), sum(c.id), sum(d.id) FROM b \
              JOIN c ON b.k = c.k JOIN d ON d.k = c.k WHERE d.id > b.id + c.id",
-            true,
+            false,
         ),
         (
             "SELECT b.id, c.id, d.id FROM b JOIN c ON b.k = c.k JOIN d ON d.k = c.k \
@@ -2843,7 +2896,7 @@ fn hir_hash_joins_build_from_the_loops_before_the_probe() {
         (
             "SELECT count(*) FROM b JOIN c ON b.k = c.k JOIN d ON d.k = c.k \
              WHERE EXISTS (SELECT 1 FROM e WHERE e.id = d.id AND e.v > b.id)",
-            false,
+            true,
         ),
         (
             "SELECT count(*), sum(b.id), sum(c.id), sum(d.id) FROM b \
@@ -2881,11 +2934,11 @@ fn hir_hash_joins_build_from_the_loops_before_the_probe() {
              JOIN c ON b.k = c.k JOIN d ON d.k = c.k LEFT JOIN e ON e.id = b.id + d.id",
             true,
         ),
-        // A FULL JOIN probe.
+        // A FULL JOIN never hashes.
         (
             "SELECT count(*), count(b.id), count(d.id), sum(b.id), sum(c.id), sum(d.id) \
              FROM b JOIN c ON b.k = c.k FULL JOIN d ON d.k = c.k",
-            true,
+            false,
         ),
     ] {
         let hir_plan = plan_without_ids(query_plan(&hir, sql));
@@ -3103,11 +3156,11 @@ const EXPECTED_PLANS: &[(&str, &[&str])] = &[
     ),
     (
         "SELECT o.id FROM o WHERE NOT EXISTS (SELECT 1 FROM i WHERE i.k1 = o.k1)",
-        &["SCAN o", "SEARCH i USING COVERING INDEX ephemeral_i_s1 (k1=?)"],
+        &["HASH JOIN i", "SCAN o"],
     ),
     (
         "SELECT o.id FROM o WHERE NOT EXISTS (SELECT 1 FROM i WHERE i.k1 = o.k1) AND NOT EXISTS (SELECT 1 FROM j WHERE j.k2 = o.k2)",
-        &["SCAN o", "SEARCH i USING COVERING INDEX ephemeral_i_s1 (k1=?)", "SEARCH j USING COVERING INDEX ephemeral_j_s2 (k2=?)"],
+        &["HASH JOIN i", "SEARCH j USING COVERING INDEX ephemeral_j_s2 (k2=?)", "SCAN o"],
     ),
     (
         "SELECT o.id FROM o WHERE EXISTS (SELECT 1 FROM i WHERE i.k1 = o.k1) AND NOT EXISTS (SELECT 1 FROM j WHERE j.k2 = o.k2)",
@@ -3139,7 +3192,7 @@ const EXPECTED_PLANS: &[(&str, &[&str])] = &[
     ),
     (
         "SELECT o.id FROM o WHERE EXISTS (SELECT 1 FROM i WHERE i.k1 < o.k1)",
-        &["SCAN o", "SCAN i"],
+        &["SCAN o", "SEARCH i USING COVERING INDEX ephemeral_i_s1 (k1<?)"],
     ),
     (
         "SELECT o.id FROM o WHERE NOT EXISTS (SELECT 1 FROM i WHERE i.k1 = o.k1 AND o.k2 = 1)",
@@ -3155,7 +3208,7 @@ const EXPECTED_PLANS: &[(&str, &[&str])] = &[
     ),
     (
         "SELECT a.id, b.id FROM a JOIN b ON b.k = a.k WHERE a.id < 30 ORDER BY a.id, b.id",
-        &["HASH JOIN b", "SEARCH a USING INTEGER PRIMARY KEY (rowid=?)", "USE SORTER FOR ORDER BY"],
+        &["MATERIALIZE hash build input for a", "SEARCH a USING INTEGER PRIMARY KEY (rowid=?)", "HASH JOIN b", "USE SORTER FOR ORDER BY"],
     ),
     (
         "SELECT count(*), count(b.id), sum(b.v) FROM a LEFT JOIN b ON b.k = a.k",
@@ -3171,7 +3224,7 @@ const EXPECTED_PLANS: &[(&str, &[&str])] = &[
     ),
     (
         "SELECT a.id, b.id FROM a LEFT JOIN b ON b.k = a.k + 45 WHERE a.id < 20 ORDER BY a.id, b.id",
-        &["HASH JOIN b", "SEARCH a USING INTEGER PRIMARY KEY (rowid=?)", "USE SORTER FOR ORDER BY"],
+        &["MATERIALIZE hash build input for a", "SEARCH a USING INTEGER PRIMARY KEY (rowid=?)", "HASH JOIN b", "USE SORTER FOR ORDER BY"],
     ),
     (
         "SELECT count(*), count(b.id) FROM a LEFT JOIN b ON b.v = a.k + 100",
@@ -3179,19 +3232,19 @@ const EXPECTED_PLANS: &[(&str, &[&str])] = &[
     ),
     (
         "SELECT count(*), count(a.id), count(b.id), sum(b.v) FROM a FULL JOIN b ON b.k = a.k",
-        &["HASH JOIN b", "SCAN a"],
+        &["SCAN a", "SCAN b LEFT-JOIN", "RIGHT-JOIN b", "SCAN b"],
     ),
     (
         "SELECT count(*), count(a.id), count(b.id) FROM a FULL JOIN b ON b.k = a.k WHERE a.id IS NULL OR b.v > 10",
-        &["HASH JOIN b", "SCAN a"],
+        &["SCAN a", "SCAN b LEFT-JOIN", "RIGHT-JOIN b", "SCAN b"],
     ),
     (
         "SELECT sum((SELECT count(b.id) FROM a a2 JOIN b ON b.k = a2.k WHERE a2.id = a.id)) FROM a WHERE a.id < 300",
-        &["SEARCH a USING INTEGER PRIMARY KEY (rowid=?)", "SEARCH scalar_subquery_1 USING INDEX ephemeral_subquery_s3 (correlation_key_0=?) LEFT-JOIN", "HASH JOIN a AS a2", "SCAN b", "USE SORTER FOR GROUP BY"],
+        &["SEARCH a USING INTEGER PRIMARY KEY (rowid=?)", "SEARCH scalar_subquery_1 USING INDEX ephemeral_subquery_s3 (correlation_key_0=?) LEFT-JOIN", "HASH JOIN b", "SCAN a AS a2", "USE SORTER FOR GROUP BY"],
     ),
     (
         "SELECT count(*), sum(s.n) FROM a, (SELECT a2.id AS i, b.id AS n FROM a a2 JOIN b ON b.k = a2.k WHERE a2.id < 40) s WHERE a.id < 4 AND s.i = a.id + 3",
-        &["SEARCH a USING INTEGER PRIMARY KEY (rowid=?)", "SEARCH s USING INDEX ephemeral_subquery_s3 (i=?)", "HASH JOIN b", "SEARCH a2 USING INTEGER PRIMARY KEY (rowid=?)"],
+        &["SEARCH a USING INTEGER PRIMARY KEY (rowid=?)", "SEARCH s USING INDEX ephemeral_subquery_s3 (i=?)", "MATERIALIZE hash build input for a AS a2", "SEARCH a2 USING INTEGER PRIMARY KEY (rowid=?)", "HASH JOIN b"],
     ),
     (
         "SELECT c.name, o.order_id, p.name, oi.quantity FROM customers c JOIN orders o ON c.customer_id = o.customer_id JOIN order_items oi ON o.order_id = oi.order_id JOIN products p ON oi.product_id = p.product_id",
@@ -3211,7 +3264,7 @@ const EXPECTED_PLANS: &[(&str, &[&str])] = &[
     ),
     (
         "SELECT a.id, l.id, r.id FROM l AS a, l FULL JOIN r ON l.k = r.k WHERE a.id = 1 ORDER BY 1, 2, 3",
-        &["SCAN l AS a", "SCAN l", "SEARCH r USING COVERING INDEX ephemeral_r_s2 (k=?) LEFT-JOIN", "USE SORTER FOR ORDER BY"],
+        &["SEARCH a USING INTEGER PRIMARY KEY (rowid=?)", "HASH JOIN r", "SCAN l", "USE SORTER FOR ORDER BY"],
     ),
     (
         "SELECT extra, value, count(*) FROM items GROUP BY extra, value ORDER BY extra, value",
@@ -3243,7 +3296,7 @@ const EXPECTED_PLANS: &[(&str, &[&str])] = &[
     ),
     (
         "SELECT h.order_id, i.item_id FROM h_orders h FULL JOIN h_items i ON h.customer_name = i.order_name ORDER BY 1, 2",
-        &["HASH JOIN h_items AS i", "SCAN h_orders AS h", "USE SORTER FOR ORDER BY"],
+        &["SCAN h_orders AS h", "SCAN h_items AS i LEFT-JOIN", "RIGHT-JOIN i", "SCAN h_items AS i", "USE SORTER FOR ORDER BY"],
     ),
     (
         "SELECT h.customer_name, count(i.item_id) FROM h_orders h LEFT JOIN h_items i ON h.customer_name = i.order_name GROUP BY h.customer_name ORDER BY 1",
@@ -3263,23 +3316,23 @@ const EXPECTED_PLANS: &[(&str, &[&str])] = &[
     ),
     (
         "SELECT count(*), sum(b.id), sum(c.id), sum(d.id) FROM b JOIN c ON b.k = c.k JOIN d ON d.k = c.k WHERE d.id > b.id + c.id",
-        &["MATERIALIZE hash build input for c", "HASH JOIN c", "SCAN d", "HASH JOIN b"],
+        &["SCAN d", "SEARCH c USING COVERING INDEX ephemeral_c_s1 (k=?)", "SEARCH b USING COVERING INDEX ephemeral_b_s0 (k=?)"],
     ),
     (
         "SELECT b.id, c.id, d.id FROM b JOIN c ON b.k = c.k JOIN d ON d.k = c.k WHERE b.id < 20 ORDER BY 1, 2, 3",
-        &["MATERIALIZE hash build input for c", "HASH JOIN c", "SEARCH b USING INTEGER PRIMARY KEY (rowid=?)", "HASH JOIN d", "USE SORTER FOR ORDER BY"],
+        &["MATERIALIZE hash build input for c", "HASH JOIN c", "SCAN b", "HASH JOIN d", "USE SORTER FOR ORDER BY"],
     ),
     (
         "SELECT count(*) FROM b JOIN c ON b.k = c.k JOIN d ON d.k = c.k WHERE EXISTS (SELECT 1 FROM e WHERE e.id = d.id AND e.v > b.id)",
-        &["SCAN b", "SEARCH c USING COVERING INDEX ephemeral_c_s1 (k=?)", "SEARCH d USING COVERING INDEX ephemeral_d_s2 (k=?)", "SEARCH e USING INTEGER PRIMARY KEY (rowid=?)"],
+        &["MATERIALIZE hash build input for c", "HASH JOIN c", "SCAN b", "HASH JOIN d", "SEARCH e USING INTEGER PRIMARY KEY (rowid=?)"],
     ),
     (
         "SELECT count(*), sum(b.id), sum(c.id), sum(d.id) FROM b JOIN c ON b.k = c.k JOIN d ON d.k = c.k AND d.id > b.id",
-        &["SCAN d", "SEARCH b USING INTEGER PRIMARY KEY (rowid=?)", "SEARCH c USING COVERING INDEX ephemeral_c_s1 (k=?)"],
+        &["SCAN b", "SEARCH d USING INTEGER PRIMARY KEY (rowid=?)", "SEARCH c USING COVERING INDEX ephemeral_c_s1 (k=?)"],
     ),
     (
         "SELECT count(*), sum(e.v) FROM b JOIN c ON b.k = c.k JOIN d ON d.k = c.k JOIN e ON e.id = b.id + d.id",
-        &["SCAN d", "SCAN b", "SEARCH e USING INTEGER PRIMARY KEY (rowid=?)", "SEARCH c USING COVERING INDEX ephemeral_c_s1 (k=?)"],
+        &["SCAN b", "SCAN d", "SEARCH e USING INTEGER PRIMARY KEY (rowid=?)", "SEARCH c USING COVERING INDEX ephemeral_c_s1 (k=?)"],
     ),
     (
         "SELECT count(*), sum(b.id), count(e.id), sum(c.id), sum(d.id) FROM b LEFT JOIN e ON e.id = b.id * 7, c JOIN d ON d.k = c.k WHERE c.id % 5 = coalesce(e.v, 0) % 5 AND b.id % 3 = c.id % 3",
@@ -3299,7 +3352,7 @@ const EXPECTED_PLANS: &[(&str, &[&str])] = &[
     ),
     (
         "SELECT count(*), count(b.id), count(d.id), sum(b.id), sum(c.id), sum(d.id) FROM b JOIN c ON b.k = c.k FULL JOIN d ON d.k = c.k",
-        &["MATERIALIZE hash build input for c", "HASH JOIN c", "SCAN b", "HASH JOIN d"],
+        &["SCAN b", "SCAN c", "SCAN d LEFT-JOIN", "RIGHT-JOIN d", "SCAN d"],
     ),
     (
         "SELECT count(*), sum(a.id), sum(b.id), sum(c.id) FROM a, b LEFT JOIN c ON b.k = c.k",
@@ -3327,7 +3380,7 @@ const EXPECTED_PLANS: &[(&str, &[&str])] = &[
     ),
     (
         "SELECT id FROM items WHERE extra IS NULL AND value > 10 ORDER BY id",
-        &["SEARCH items USING COVERING INDEX items_extra_id (extra=? AND value>?)", "USE SORTER FOR ORDER BY"],
+        &["SCAN items"],
     ),
     (
         "SELECT id FROM items WHERE lower(extra) IS NULL ORDER BY id",
@@ -3395,11 +3448,11 @@ const EXPECTED_PLANS: &[(&str, &[&str])] = &[
     ),
     (
         "SELECT count(*), sum(b.id), sum(c.id) FROM b FULL JOIN c ON b.k = c.k",
-        &["HASH JOIN c", "SCAN b"],
+        &["SCAN b", "SCAN c LEFT-JOIN", "RIGHT-JOIN c", "SCAN c"],
     ),
     (
         "SELECT o.id, p.id FROM o FULL JOIN p ON p.k = o.k WHERE NOT EXISTS (SELECT 1 FROM i WHERE i.k = p.k) ORDER BY 1, 2",
-        &["HASH JOIN p", "SEARCH i USING COVERING INDEX ephemeral_i_s2 (k=?)", "SCAN o", "USE SORTER FOR ORDER BY"],
+        &["SCAN o", "SCAN p LEFT-JOIN", "SEARCH i USING COVERING INDEX ephemeral_i_s2 (k=?)", "RIGHT-JOIN p", "SCAN p", "USE SORTER FOR ORDER BY"],
     ),
     (
         "SELECT o.id, p.id FROM o RIGHT JOIN p ON p.k = o.k WHERE NOT EXISTS (SELECT 1 FROM i WHERE i.k = p.k) ORDER BY 1, 2",
@@ -3423,7 +3476,7 @@ const EXPECTED_PLANS: &[(&str, &[&str])] = &[
     ),
     (
         "SELECT o.id, p.id FROM o FULL JOIN p ON p.k = o.k WHERE EXISTS (SELECT 1 FROM i WHERE i.k = o.k) ORDER BY 1, 2",
-        &["HASH JOIN p", "SEARCH i USING COVERING INDEX ephemeral_i_s2 (k=?)", "SCAN o", "USE SORTER FOR ORDER BY"],
+        &["SCAN o", "SCAN p LEFT-JOIN", "SEARCH i USING COVERING INDEX ephemeral_i_s2 (k=?)", "RIGHT-JOIN p", "SCAN p", "USE SORTER FOR ORDER BY"],
     ),
     (
         "SELECT o.id FROM o WHERE EXISTS (SELECT ?1 FROM i WHERE i.k = o.k) AND o.v > ?2 ORDER BY 1",

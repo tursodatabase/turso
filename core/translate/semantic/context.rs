@@ -720,6 +720,27 @@ impl<'catalog> SemanticContext<'catalog> {
         }
     }
 
+    /// Whether `name` is a materialized view whose stored state was written
+    /// by a Turso version with a different DBSP circuit version. The view
+    /// stays in the schema so it can be dropped, but no statement reads it.
+    pub(crate) fn is_incompatible_view(&self, name: &turso_parser::ast::QualifiedName) -> bool {
+        let view_name = normalize_ident(name.name.as_str());
+        let incompatible = |database: &DatabaseId| {
+            self.database_schemas
+                .get(database)
+                .is_some_and(|schema| schema.incompatible_views.contains(&view_name))
+        };
+        match &name.namespace {
+            Some(database) => self
+                .database(database.as_str())
+                .is_some_and(|database| incompatible(&database)),
+            None => self
+                .unqualified_database_search_path
+                .iter()
+                .any(incompatible),
+        }
+    }
+
     pub(crate) fn resolve_index(
         &self,
         database: DatabaseId,

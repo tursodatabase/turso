@@ -1436,7 +1436,13 @@ impl InsertRow<'_> {
             // columns are computed again from them.
             for (position, (column, value)) in table.columns().iter().zip(&values).enumerate() {
                 if value.is_none() && !column.is_rowid_alias() && !column.is_virtual_generated() {
-                    program.emit_column_or_rowid(self.table_cursor, position, new_row + position);
+                    super::dml::emit_stored_column(
+                        program,
+                        self.table_cursor,
+                        column,
+                        position,
+                        new_row + position,
+                    );
                 }
             }
             super::dml::emit_virtual_columns(program, document, new_source.id, table, new_row)?;

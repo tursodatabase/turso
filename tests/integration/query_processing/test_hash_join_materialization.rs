@@ -367,10 +367,19 @@ LEFT JOIN t3 ON t2.c = t3.c \
 JOIN t4 ON {predicate}"
             );
 
-            assert_that!(limbo_exec_rows(&conn, &format!("EXPLAIN {query}")))
-                .named(format!("opcodes of the join on `{predicate}`"))
-                .column(1)
-                .contains(Cell::from("HashScanUnmatched"));
+            // The LEFT JOIN runs as a hash join that keeps its unmatched
+            // build rows, so those rows reach the predicate.
+            let plan = limbo_exec_rows(&conn, &format!("EXPLAIN QUERY PLAN FORMAT=JSON {query}"));
+            let Value::Text(plan) = &plan[0][0] else {
+                panic!("query plan must be text");
+            };
+            let plan: serde_json::Value = serde_json::from_str(plan).unwrap();
+            let left_hash_join = plan["nodes"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|node| node["detail"] == "HASH JOIN t3" && node["op"]["join"] == "left");
+            assert!(left_hash_join, "plan of the join on `{predicate}`: {plan}");
 
             let sqlite_rows = sqlite_exec_rows(&sqlite_conn, &query);
             assert_that!(limbo_exec_rows(&conn, &query))

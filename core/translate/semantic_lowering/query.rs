@@ -5983,6 +5983,16 @@ fn emit_hir_block_explain(
     block: &hir::QueryBlock,
     block_plan: &HirQueryBlockPlan,
 ) -> Result<()> {
+    if tracing::enabled!(tracing::Level::DEBUG)
+        && !matches!(
+            program.get_query_mode(),
+            crate::vdbe::builder::QueryMode::ExplainQueryPlan { .. }
+        )
+    {
+        if let Some(from) = &block.from {
+            log_hir_loops_plan(document, from, &block_plan.inner_joins, &block_plan.loops)?;
+        }
+    }
     if !program.start_block_explain(block.id) {
         return Ok(());
     }
@@ -5997,6 +6007,29 @@ fn emit_hir_block_explain(
         &block_plan.inner_joins,
         &block_plan.loops,
     )
+}
+
+/// Log the read planned for each loop, in loop order, as EXPLAIN QUERY
+/// PLAN would show it. A statement that is not EXPLAIN QUERY PLAN emits no
+/// plan rows, so this is how a debug trace shows its plan.
+fn log_hir_loops_plan(
+    document: &HirDocument,
+    from: &hir::From,
+    inner_joins: &[SourceId],
+    loops: &[HirPlannedLoop],
+) -> Result<()> {
+    for planned_loop in loops {
+        if let HirSourceAccess::Hash(HirHashLookup {
+            build_input: Some(input),
+            ..
+        }) = &planned_loop.access
+        {
+            log_hir_loops_plan(document, from, inner_joins, &input.loops)?;
+        }
+        let detail = hir_loop_explain(document, Some(from), inner_joins, planned_loop)?;
+        tracing::debug!(plan = %detail);
+    }
+    Ok(())
 }
 
 /// The rows of `loops` in loop order. A hash join reads as `HASH JOIN`
@@ -7360,6 +7393,11 @@ fn prepare_hir_virtual_loop<'a>(
             source.id
         )));
     };
+    // The statement owns the read transaction a virtual table's helper
+    // statement (such as the PRAGMA behind pragma_table_info) would
+    // otherwise start as a nested statement; a transaction a nested
+    // statement starts is never finished at this statement's Halt.
+    program.begin_read_operation()?;
     let cursor = program.alloc_cursor_id(CursorType::VirtualTable(table.clone()));
     program.emit_insn(Insn::VOpen { cursor_id: cursor });
     program.bind_source(source.id, SourceBinding::Virtual { cursor });

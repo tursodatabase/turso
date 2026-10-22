@@ -45,13 +45,39 @@ const MAX_MATERIALIZED_BUILD_ROWS: f64 = 200_000.0;
 /// Estimate how much the remaining `WHERE` terms cut the row count.
 ///
 /// Some callers skip a term because they need the count before that term runs.
-fn constraint_output_multipliers<E>(
-    rhs_constraints: &TableConstraints<E>,
+#[allow(clippy::too_many_arguments)]
+fn constraint_output_multipliers(
+    rhs_constraints: &HirTableConstraints,
     lhs_mask: &TableMask,
     rhs_self_mask: TableMask,
     consumed_where_terms: &BitSet<usize>,
     skipped_where_terms: &BitSet<usize>,
+    where_clause: &[HirWhereTerm],
     params: &CostModelParams,
+) -> f64 {
+    constraint_output_multipliers_for(
+        rhs_constraints,
+        lhs_mask,
+        rhs_self_mask,
+        consumed_where_terms,
+        skipped_where_terms,
+        where_clause,
+        params,
+        |_| true,
+    )
+}
+
+/// [constraint_output_multipliers] over the constraints `include` keeps.
+#[allow(clippy::too_many_arguments)]
+fn constraint_output_multipliers_for(
+    rhs_constraints: &HirTableConstraints,
+    lhs_mask: &TableMask,
+    rhs_self_mask: TableMask,
+    consumed_where_terms: &BitSet<usize>,
+    skipped_where_terms: &BitSet<usize>,
+    where_clause: &[HirWhereTerm],
+    params: &CostModelParams,
+    include: impl Fn(&super::constraints::HirConstraint) -> bool,
 ) -> f64 {
     let mut multiplier = 1.0;
     let mut bounds: SmallVec<[(Option<usize>, bool, bool); 4]> = SmallVec::new();
@@ -77,6 +103,8 @@ fn constraint_output_multipliers<E>(
             || constraint.lhs_mask.is_empty())
             && !consumed_where_terms.get(constraint.where_clause_pos.0)
             && !skipped_where_terms.get(constraint.where_clause_pos.0)
+            && !where_clause[constraint.where_clause_pos.0].consumed
+            && include(constraint)
     }) {
         multiplier *= constraint.selectivity;
 
@@ -102,27 +130,105 @@ fn constraint_output_multipliers<E>(
 }
 
 /// Return the row count after one table and its ready filters.
-fn rows_after_join<E>(
+#[allow(clippy::too_many_arguments)]
+fn rows_after_join(
     input_cardinality: f64,
     method: &AccessMethod,
-    rhs_constraints: &TableConstraints<E>,
+    rhs_constraints: &HirTableConstraints,
     lhs_mask: &TableMask,
     rhs_mask: TableMask,
-    is_semi_or_anti: bool,
+    sources: &[HirPlanSource],
+    rhs_position: usize,
+    where_clause: &[HirWhereTerm],
     params: &CostModelParams,
 ) -> f64 {
-    if is_semi_or_anti {
+    use crate::translate::semantic::hir::JoinKind;
+    let rhs = &sources[rhs_position];
+    let join_kind = rhs.join_info().map(|join| join.kind);
+    if matches!(join_kind, Some(JoinKind::Semi | JoinKind::Anti)) {
         return input_cardinality;
     }
-    let remaining_filter_selectivity = constraint_output_multipliers(
+    if !matches!(
+        join_kind,
+        Some(JoinKind::Left | JoinKind::Right | JoinKind::Full)
+    ) {
+        let remaining_filter_selectivity = constraint_output_multipliers(
+            rhs_constraints,
+            lhs_mask,
+            rhs_mask,
+            &method.consumed_where_terms,
+            &Default::default(),
+            where_clause,
+            params,
+        );
+        return input_cardinality
+            * method.estimated_rows_per_outer_row
+            * remaining_filter_selectivity;
+    }
+
+    let is_on_term = |constraint: &super::constraints::HirConstraint| {
+        where_clause[constraint.where_clause_pos.0].from_outer_join == Some(rhs.source())
+    };
+    let on_selectivity = constraint_output_multipliers_for(
+        rhs_constraints,
+        lhs_mask,
+        rhs_mask.clone(),
+        &method.consumed_where_terms,
+        &Default::default(),
+        where_clause,
+        params,
+        is_on_term,
+    );
+    let matching_rows_per_input = method.estimated_rows_per_outer_row * on_selectivity;
+    // Statistics give an average match count, but not its distribution.
+    // A Poisson model estimates the chance that an input row has no match.
+    let unmatched_probability = (-matching_rows_per_input).exp();
+    let outer_join_rows_per_input = matching_rows_per_input + unmatched_probability;
+
+    // `column IS NULL` in WHERE on a column of the null-extended side that
+    // is never NULL in a stored row keeps only the rows the join added.
+    let selects_unmatched_rows = |constraint: &super::constraints::HirConstraint| {
+        if is_on_term(constraint)
+            || !matches!(constraint.operator.as_ast_operator(), Some(Operator::Is))
+        {
+            return false;
+        }
+        let (_, constraining_expr, _) = constraint.get_hir_constraining_expr(where_clause);
+        matches!(
+            constraining_expr,
+            hir::Expr::Literal(turso_parser::ast::Literal::Null)
+        ) && constraint.table_col_pos.is_some_and(|column_pos| {
+            rhs.btree().is_some_and(|source| {
+                source
+                    .table
+                    .columns()
+                    .get(column_pos)
+                    .is_some_and(|column| column.is_rowid_alias() || column.notnull())
+            })
+        })
+    };
+    let selects_only_unmatched_rows = rhs_constraints.constraints.iter().any(|constraint| {
+        !method
+            .consumed_where_terms
+            .get(constraint.where_clause_pos.0)
+            && selects_unmatched_rows(constraint)
+    });
+    let where_selectivity = constraint_output_multipliers_for(
         rhs_constraints,
         lhs_mask,
         rhs_mask,
         &method.consumed_where_terms,
         &Default::default(),
+        where_clause,
         params,
+        |constraint| !is_on_term(constraint) && !selects_unmatched_rows(constraint),
     );
-    input_cardinality * method.estimated_rows_per_outer_row * remaining_filter_selectivity
+    let rows_per_input = if selects_only_unmatched_rows {
+        unmatched_probability
+    } else {
+        outer_join_rows_per_input
+    };
+    input_cardinality * rows_per_input * where_selectivity
 }
 
 /// How many times each correlated subquery of a HIR block runs under a
@@ -142,10 +248,11 @@ pub(crate) fn hir_subquery_calls_for_plan(
     constraints: &[HirTableConstraints],
     sources: &[HirPlanSource],
     subqueries: &[(hir::QueryId, TableMask, Option<usize>, bool)],
-    predicate_count: usize,
+    where_clause: &[HirWhereTerm],
     initial_input_cardinality: f64,
     params: &CostModelParams,
 ) -> Result<Vec<(hir::QueryId, f64, Option<usize>)>> {
+    let predicate_count = where_clause.len();
     let mut calls = Vec::new();
     if subqueries.is_empty() {
         return Ok(calls);
@@ -176,6 +283,7 @@ pub(crate) fn hir_subquery_calls_for_plan(
                 source_mask.clone(),
                 &method.consumed_where_terms,
                 &skipped,
+                where_clause,
                 params,
             );
             let mut subquery_calls = (rows_before_filters * multiplier).max(1.0);
@@ -199,7 +307,9 @@ pub(crate) fn hir_subquery_calls_for_plan(
             &constraints[*source_position],
             &prior_sources,
             source_mask,
-            hir_is_semi_or_anti(sources, *source_position),
+            sources,
+            *source_position,
+            where_clause,
             params,
         );
         prior_sources.set(*source_position)?;
@@ -660,7 +770,9 @@ pub(crate) fn compute_hir_join_order(
             source_constraints,
             &empty,
             mask.try_clone()?,
-            false,
+            sources,
+            position,
+            where_clause,
             params,
         );
         let cost = first.access_method.cost;
@@ -706,7 +818,9 @@ pub(crate) fn compute_hir_join_order(
             &constraints[rhs],
             lhs_mask,
             rhs_mask,
-            hir_is_semi_or_anti(sources, rhs),
+            sources,
+            rhs,
+            where_clause,
             params,
         );
         let mut steps = lhs
@@ -968,7 +1082,9 @@ pub(crate) fn compute_hir_greedy_join_order(
         &constraints[first_position],
         &joined_mask,
         first_mask,
-        false,
+        sources,
+        first_position,
+        where_clause,
         params,
     );
     let mut cost = first.access_method.cost;
@@ -1064,7 +1180,9 @@ pub(crate) fn compute_hir_greedy_join_order(
                 &constraints[position],
                 &joined_mask,
                 rhs_mask,
-                hir_is_semi_or_anti(sources, position),
+                sources,
+                position,
+                where_clause,
                 params,
             );
             if best

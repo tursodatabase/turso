@@ -357,9 +357,13 @@ fn emit_index_key_values(
                     program, document, expression, register,
                 )?;
             }
-            (None, Some(_)) => {
-                program.emit_column_or_rowid(table_cursor, column.pos_in_table, register)
-            }
+            (None, Some(table_column)) => emit_stored_column(
+                program,
+                table_cursor,
+                table_column,
+                column.pos_in_table,
+                register,
+            ),
             (None, None) => {
                 return Err(LimboError::InternalError(format!(
                     "HIR index {} has an expression column without an expression",
@@ -942,6 +946,22 @@ pub(super) fn emit_strict_generated_check(
         check_generated: true,
         table_reference: Arc::new(checked),
     });
+}
+
+/// Read a stored column of a DML row from the table. SQLite stores a REAL
+/// value that is a whole number as an integer, so a REAL column gives its
+/// value back as REAL, as a query reads it.
+pub(super) fn emit_stored_column(
+    program: &mut ProgramBuilder,
+    table_cursor: usize,
+    column: &crate::schema::Column,
+    position: usize,
+    register: usize,
+) {
+    program.emit_column_or_rowid(table_cursor, position, register);
+    if column.ty() == crate::schema::Type::Real {
+        program.emit_insn(Insn::RealAffinity { register });
+    }
 }
 
 /// The custom type of `column` of `source`: its definitions from the

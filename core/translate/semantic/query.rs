@@ -650,6 +650,14 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
                         crate::bail_parse_error!("no such index: {}", index.as_str());
                     }
                     self.analyze_view_source(database, view, alias, context)?
+                } else if self.context().is_incompatible_view(name) {
+                    crate::bail_parse_error!(
+                        "Materialized view '{}' has an incompatible version. \n\
+                         The view was created with a different DBSP version than the current version ({}). \n\
+                         Please DROP and recreate the view to use it.",
+                        crate::util::normalize_ident(name.name.as_str()),
+                        crate::incremental::view::DBSP_CIRCUIT_VERSION
+                    );
                 } else if self.context().is_broken_view(name) {
                     crate::bail_parse_error!(
                         "view '{}' could not be loaded: its SQL in sqlite_schema does not parse. \n\
@@ -1623,6 +1631,12 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
             None => hir::IndexHint::None,
             Some(ast::Indexed::NotIndexed) => hir::IndexHint::NotIndexed,
             Some(ast::Indexed::IndexedBy(name)) => {
+                if table.value().btree().is_some_and(|btree| !btree.has_rowid) {
+                    crate::bail_parse_error!(
+                        "INDEXED BY is not supported on WITHOUT ROWID tables: {}",
+                        name.as_str()
+                    );
+                }
                 let index_name = crate::util::normalize_ident(name.as_str());
                 let index = self
                     .context()
@@ -1665,9 +1679,12 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
                 index_method_patterns: Vec::new(),
             },
         )?;
+        // Every index of a WITHOUT ROWID table also stores the table's
+        // primary key columns, which Turso's Index does not model, so a
+        // query never reads such a table through an index.
         if matches!(source_kind, CatalogSourceKind::Table)
             && matches!(owner, SourceOwner::QueryBlock(_))
-            && table.value().btree().is_some()
+            && table.value().btree().is_some_and(|btree| btree.has_rowid)
         {
             let scope = {
                 let definition = self.source(source).ok_or_else(|| {

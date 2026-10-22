@@ -430,6 +430,9 @@ impl TableSequenceState<'_> {
             pc_if_empty: done,
         });
         program.preassign_label_to_next_insn(next);
+        // SQLite writes the row with the table name as declared, so the
+        // name is matched without case, and the stored spelling is kept
+        // for the write, so SQLite finds the row afterwards.
         let name = program.alloc_register();
         program.emit_column_or_rowid(self.cursor, 0, name);
         program.emit_insn(Insn::Ne {
@@ -437,7 +440,12 @@ impl TableSequenceState<'_> {
             rhs: name,
             target_pc: other,
             flags: Default::default(),
-            collation: None,
+            collation: Some(crate::translate::collate::CollationSeq::NoCase),
+        });
+        program.emit_insn(Insn::Copy {
+            src_reg: name,
+            dst_reg: self.name,
+            extra_amount: 0,
         });
         program.emit_column_or_rowid(self.cursor, 1, self.value);
         // Like SQLite, the stored value is used as an integer.

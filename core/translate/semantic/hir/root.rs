@@ -283,6 +283,10 @@ pub struct DmlForeignKeys {
     pub outgoing: Vec<ResolvedForeignKey>,
     /// Constraints declared by other tables, where the target is the parent.
     pub incoming: Vec<ResolvedForeignKey>,
+    /// Whether, with foreign keys on, the target declares a FOREIGN KEY or
+    /// another table's FOREIGN KEY points at it, even when this statement
+    /// checks none of them. Such a statement opens a statement journal.
+    pub table_has_foreign_keys: bool,
 }
 
 #[derive(Clone, Debug)]

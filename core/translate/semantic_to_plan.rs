@@ -3910,7 +3910,7 @@ impl<'a> HirPlanContext<'a> {
                 constraints,
                 &input.sources,
                 &subqueries,
-                input.predicates.len(),
+                &input.predicates,
                 initial_cardinality,
                 params,
             )?

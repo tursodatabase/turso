@@ -121,10 +121,11 @@ impl<'ast> Analyzer<'_, '_, 'ast> {
         let database = target.database().ok_or_else(|| {
             LimboError::InternalError("DML target has no owning database".to_string())
         })?;
-        let (outgoing, incoming) = {
+        let (outgoing, incoming, table_has_foreign_keys) = {
             let schema = self.context().schema(database)?;
             let name = target.value().get_name();
             let incoming = schema.resolved_fks_referencing(name)?;
+            let table_has_foreign_keys = schema.has_child_fks(name) || !incoming.is_empty();
             // Like SQLite, an UPDATE resolves the constraints the table
             // declares only when it changes a key: one of their child keys,
             // or a parent key another table points at. `updated` covers the
@@ -151,7 +152,7 @@ impl<'ast> Analyzer<'_, '_, 'ast> {
                 }
                 None => schema.resolved_fks_for_child(name, None)?,
             };
-            (outgoing, incoming)
+            (outgoing, incoming, table_has_foreign_keys)
         };
 
         let mut resolved_outgoing = Vec::with_capacity(outgoing.len());
@@ -204,6 +205,7 @@ impl<'ast> Analyzer<'_, '_, 'ast> {
         Ok(hir::DmlForeignKeys {
             outgoing: resolved_outgoing,
             incoming: resolved_incoming,
+            table_has_foreign_keys,
         })
     }
 

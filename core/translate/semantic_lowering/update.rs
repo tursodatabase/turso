@@ -245,8 +245,9 @@ pub(super) fn emit_update(
         changed_indexes.push((old, new));
     }
 
-    // Whether the statement needs a statement journal.
-    let has_foreign_keys = !foreign_keys.incoming.is_empty() || !foreign_keys.outgoing.is_empty();
+    // Whether the statement needs a statement journal. A table with any
+    // foreign key counts, even one this UPDATE leaves alone.
+    let has_foreign_keys = foreign_keys.table_has_foreign_keys;
     let replaces = any_effective_replace(
         has_statement_conflict,
         or_conflict,
@@ -262,11 +263,20 @@ pub(super) fn emit_update(
     {
         program.set_multi_write(false);
     }
-    let has_notnull = values
+    // Every column the UPDATE affects counts: a NOT NULL generated column
+    // computed from a SET column can fail the statement too. A new rowid
+    // must be an integer that no other row has, so setting the rowid or
+    // the INTEGER PRIMARY KEY can fail like a UNIQUE constraint.
+    let affected = table.columns_affected_by_update(assigned_positions(table, &assigned))?;
+    let has_notnull = table
+        .columns()
         .iter()
-        .zip(table.columns())
-        .any(|(value, column)| value.is_some() && column.notnull() && !column.is_rowid_alias());
-    let has_unique = !table.unique_sets.is_empty()
+        .enumerate()
+        .any(|(position, column)| {
+            affected.get(position) && column.notnull() && !column.is_rowid_alias()
+        });
+    let has_unique = rowid_value.is_some()
+        || !table.unique_sets.is_empty()
         || changed_indexes
             .iter()
             .any(|(old, _)| old.index.value().unique);
@@ -1504,8 +1514,10 @@ impl UpdateRow<'_, '_> {
             for (position, (column, value)) in table.columns().iter().zip(layout.values).enumerate()
             {
                 if value.is_none() && !column.is_rowid_alias() && !column.is_virtual_generated() {
-                    program.emit_column_or_rowid(
+                    super::dml::emit_stored_column(
+                        program,
                         self.table_cursor,
+                        column,
                         position,
                         self.start() + position,
                     );
@@ -1829,7 +1841,13 @@ impl UpdateRow<'_, '_> {
                 None if column.is_rowid_alias() || column.is_virtual_generated() => {
                     program.emit_null(register, None)
                 }
-                None => program.emit_column_or_rowid(self.table_cursor, position, register),
+                None => super::dml::emit_stored_column(
+                    program,
+                    self.table_cursor,
+                    column,
+                    position,
+                    register,
+                ),
             }
         }
         // The changed columns record their new values before affinity is

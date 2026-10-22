@@ -1301,6 +1301,7 @@ impl ProgramBuilder {
     /// once. Rows emitted later for the source, like the body of its
     /// subquery, go under it through [Self::with_source_explain_parent].
     pub(crate) fn emit_source_explain(&mut self, source: SourceId, detail: EqpDetail) {
+        tracing::debug!(plan = %detail);
         if !self.mode.is_explain_query_plan() || self.source_explain_rows.contains_key(&source) {
             return;
         }

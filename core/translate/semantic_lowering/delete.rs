@@ -125,6 +125,11 @@ pub(super) fn emit_delete(
     };
     let target = DmlTarget::new(program, document, delete.target, "DELETE")?
         .with_capture(program, capture_changes.as_ref())?;
+    // Whether the statement needs a statement journal: without triggers or
+    // foreign keys a DELETE cannot abort, and a point lookup writes at most
+    // one row. A DELETE that collects rowids first is treated as a scan.
+    let has_foreign_keys = !foreign_keys.incoming.is_empty() || !foreign_keys.outgoing.is_empty();
+    program.set_may_abort(!triggers.is_empty() || has_foreign_keys);
     if subprograms.may_clear_btrees
         && delete.predicate.is_none()
         && delete.returning.is_none()
@@ -146,14 +151,9 @@ pub(super) fn emit_delete(
     // its rowids, since they can change the table.
     let uses_rowset =
         uses_rowset(delete) || !triggers.is_empty() || !actions.is_empty() || operation.is_none();
-    // Whether the statement needs a statement journal: without triggers or
-    // foreign keys a DELETE cannot abort, and a point lookup writes at most
-    // one row. A DELETE that collects rowids first is treated as a scan.
-    let has_foreign_keys = !foreign_keys.incoming.is_empty() || !foreign_keys.outgoing.is_empty();
     if !uses_rowset && !has_foreign_keys && operation.is_some_and(touches_at_most_one_row) {
         program.set_multi_write(false);
     }
-    program.set_may_abort(!triggers.is_empty() || has_foreign_keys);
 
     program.emit_source_explain(
         target.source.id,
@@ -532,7 +532,13 @@ fn emit_delete_row(
                 if column.is_virtual_generated() {
                     program.emit_null(start + position, None);
                 } else {
-                    program.emit_column_or_rowid(table_cursor, position, start + position);
+                    super::dml::emit_stored_column(
+                        program,
+                        table_cursor,
+                        column,
+                        position,
+                        start + position,
+                    );
                 }
             }
             start

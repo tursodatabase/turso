@@ -18,6 +18,7 @@ mod window;
 use turso_parser::ast;
 
 use crate::{
+    function::{Func, ScalarFunc},
     schema::{Schema, Type},
     sync::Arc,
     translate::{
@@ -766,11 +767,6 @@ fn resolved_output_columns(
 /// INTEGER; `||` gives TEXT; anything else reports its affinity.
 fn expression_primitive(document: &HirDocument, expression: &hir::Expr) -> Option<&'static str> {
     use ast::{Operator, UnaryOperator};
-    let arithmetic = |lhs: Option<&'static str>, rhs: Option<&'static str>| match (lhs, rhs) {
-        (Some("INTEGER"), Some("INTEGER")) => "INTEGER",
-        (Some("INTEGER" | "REAL"), Some("INTEGER" | "REAL")) => "REAL",
-        _ => "NUMERIC",
-    };
     match expression {
         hir::Expr::Literal(literal) => {
             match crate::translate::alter::literal_default_value(literal)
@@ -786,7 +782,7 @@ fn expression_primitive(document: &HirDocument, expression: &hir::Expr) -> Optio
         hir::Expr::Collate { expr, .. } => expression_primitive(document, expr),
         hir::Expr::Unary { operator, expr } => match operator {
             UnaryOperator::Not | UnaryOperator::BitwiseNot => Some("INTEGER"),
-            UnaryOperator::Negative => Some(arithmetic(
+            UnaryOperator::Negative => Some(arithmetic_primitive(
                 Some("INTEGER"),
                 expression_primitive(document, expr),
             )),
@@ -799,7 +795,7 @@ fn expression_primitive(document: &HirDocument, expression: &hir::Expr) -> Optio
             | Operator::Subtract
             | Operator::Multiply
             | Operator::Divide
-            | Operator::Modulus => Some(arithmetic(
+            | Operator::Modulus => Some(arithmetic_primitive(
                 expression_primitive(document, lhs),
                 expression_primitive(document, rhs),
             )),
@@ -824,6 +820,33 @@ fn expression_primitive(document: &HirDocument, expression: &hir::Expr) -> Optio
             Operator::ArrowRight | Operator::ArrowRightShift => None,
         },
         hir::Expr::RowId(_) => Some("INTEGER"),
+        hir::Expr::Case {
+            when_then,
+            else_expr,
+            ..
+        } => common_primitive(
+            document,
+            when_then
+                .iter()
+                .map(|(_, then)| then)
+                .chain(else_expr.as_deref()),
+        ),
+        hir::Expr::Function(call) => {
+            let hir::FunctionArguments::Expressions { values, .. } = &call.arguments else {
+                return None;
+            };
+            match call.function.value() {
+                Func::Scalar(
+                    ScalarFunc::Coalesce | ScalarFunc::IfNull | ScalarFunc::Max | ScalarFunc::Min,
+                ) => common_primitive(document, values.iter()),
+                Func::Scalar(ScalarFunc::Nullif) => expression_primitive(document, values.first()?),
+                Func::Scalar(ScalarFunc::Abs) => Some(arithmetic_primitive(
+                    Some("INTEGER"),
+                    expression_primitive(document, values.first()?),
+                )),
+                _ => None,
+            }
+        }
         _ => match expression_affinity(document, expression) {
             Affinity::Integer => Some("INTEGER"),
             Affinity::Real => Some("REAL"),
@@ -831,6 +854,41 @@ fn expression_primitive(document: &HirDocument, expression: &hir::Expr) -> Optio
             Affinity::Numeric => Some("NUMERIC"),
             Affinity::Blob | Affinity::None => None,
         },
+    }
+}
+
+/// The type every non-NULL expression converts to, as PostgreSQL types
+/// CASE branches and COALESCE arguments: mixed numeric types widen the way
+/// arithmetic does, and any other mix has no common type.
+fn common_primitive<'a>(
+    document: &HirDocument,
+    expressions: impl Iterator<Item = &'a hir::Expr>,
+) -> Option<&'static str> {
+    let is_numeric = |primitive| matches!(primitive, "INTEGER" | "REAL" | "NUMERIC");
+    let mut common = None;
+    for expression in expressions
+        .filter(|expression| !matches!(expression, hir::Expr::Literal(ast::Literal::Null)))
+    {
+        let primitive = expression_primitive(document, expression)?;
+        common = match common {
+            None => Some(primitive),
+            Some(common) if common == primitive => Some(common),
+            Some(common) if is_numeric(common) && is_numeric(primitive) => {
+                Some(arithmetic_primitive(Some(common), Some(primitive)))
+            }
+            Some(_) => return None,
+        };
+    }
+    common
+}
+
+/// The type of arithmetic over two operands: INTEGER over two INTEGERs,
+/// REAL over INTEGERs and REALs, and NUMERIC otherwise.
+fn arithmetic_primitive(lhs: Option<&'static str>, rhs: Option<&'static str>) -> &'static str {
+    match (lhs, rhs) {
+        (Some("INTEGER"), Some("INTEGER")) => "INTEGER",
+        (Some("INTEGER" | "REAL"), Some("INTEGER" | "REAL")) => "REAL",
+        _ => "NUMERIC",
     }
 }
 
