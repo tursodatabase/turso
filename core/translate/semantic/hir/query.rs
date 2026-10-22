@@ -217,7 +217,7 @@ pub enum JoinKind {
     Full,
     /// Keeps a row of the sources on its left when at least one row of its
     /// right source matches. Never written in SQL: the planner makes it from
-    /// a correlated `EXISTS` or `IN`, like legacy's `optimizer/unnest.rs`.
+    /// a correlated `EXISTS` or `IN` in `semantic_unnest.rs`.
     /// Its right source comes after every other source of the FROM clause.
     Semi,
     /// Keeps a row of the sources on its left when no row of its right

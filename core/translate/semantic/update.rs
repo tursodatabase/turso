@@ -165,8 +165,8 @@ impl<'ast> Analyzer<'_, '_, 'ast> {
         })
     }
 
-    /// Like legacy and SQLite, UPDATE ... FROM rejects up front a FROM
-    /// clause that names a table twice, or where a column that NATURAL or
+    /// Like SQLite, UPDATE ... FROM rejects up front a FROM clause that
+    /// names a table twice, or where a column that NATURAL or
     /// USING merges is also exposed, unmerged, by two other tables, even if
     /// no expression reads it.
     fn check_update_from_ambiguity(&self, from: &hir::From) -> Result<()> {
@@ -331,7 +331,7 @@ impl<'ast> Analyzer<'_, '_, 'ast> {
                 }
             }
 
-            // Like legacy, `((x, y))` assigns the same values as `(x, y)`.
+            // `((x, y))` assigns the same values as `(x, y)`.
             let mut expression = set.expr.as_ref();
             while let ast::Expr::Parenthesized(expressions) = expression {
                 let [inner] = expressions.as_slice() else {

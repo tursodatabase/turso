@@ -1,8 +1,8 @@
 //! Foreign-key actions compiled from HIR: ON DELETE and ON UPDATE CASCADE,
 //! SET NULL and SET DEFAULT.
 //!
-//! Like legacy, an action is the SQL statement it stands for, on the child
-//! table, matching the child key against the old parent key:
+//! An action is the SQL statement it stands for, on the child table,
+//! matching the child key against the old parent key:
 //!
 //! - CASCADE on delete: `DELETE FROM child WHERE c1 = ?1 AND ...`
 //! - CASCADE on update: `UPDATE child SET c1 = ?n+1, ... WHERE c1 = ?1 ...`
@@ -86,7 +86,8 @@ pub(super) fn has_action(foreign_key: &hir::ResolvedForeignKey, change: ParentCh
 
 /// Compile the actions of the foreign keys whose parent is the target, for
 /// `change`. For an UPDATE, only keys among the columns at `assigned` count.
-/// `None` means an action needs legacy, so the whole statement must use it.
+/// A key whose action for `change` is NO ACTION or RESTRICT is skipped: it
+/// is checked by `fkey`, not compiled here.
 pub(super) fn compile_actions<'a>(
     session: &HirSession<'_>,
     parent: &ProgramBuilder,
@@ -314,7 +315,7 @@ fn database_index(foreign_key: &hir::ResolvedForeignKey) -> Result<usize> {
         .ok_or_else(|| LimboError::InternalError("HIR foreign key has no database".into()))
 }
 
-/// The statement an action stands for, as legacy builds it.
+/// The statement an action stands for.
 fn action_statement(
     session: &HirSession<'_>,
     foreign_key: &hir::ResolvedForeignKey,

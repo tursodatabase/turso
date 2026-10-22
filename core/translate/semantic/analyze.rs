@@ -1031,9 +1031,9 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
             })
             .transpose()?;
         let aggregate_query = grouping.is_some() || self.aggregate_count(functions.block()) > 0;
-        // Like legacy, an aggregate that appears only in ORDER BY is a misuse
-        // when the block reads a FROM clause; without one it makes the block
-        // an aggregate query of one row.
+        // An aggregate that appears only in ORDER BY is a misuse when the
+        // block reads a FROM clause; without one it makes the block an
+        // aggregate query of one row.
         let order_by_allows_aggregates = aggregate_query || from.is_none();
         let output_windows = functions.window_function_count() > 0;
         let dropped_order = if self.aggregate_count(functions.block()) > 0
@@ -1205,7 +1205,7 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
             None => None,
         };
         // Aggregates that appear only in ORDER BY are analyzed later and do
-        // not count, as in legacy planning.
+        // not count.
         if syntax.exprs.is_empty()
             && having.is_some()
             && self.aggregate_count(functions.block()) == 0
@@ -1437,9 +1437,9 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
             .collect()
     }
 
-    /// Like legacy and SQLite, an ORDER BY term of a compound SELECT that is
-    /// not a position or a name is resolved in each arm's FROM clause and
-    /// matches the arm's output with the same expression: `ORDER BY t1.b`
+    /// Like SQLite, an ORDER BY term of a compound SELECT that is not a
+    /// position or a name is resolved in each arm's FROM clause and matches
+    /// the arm's output with the same expression: `ORDER BY t1.b`
     /// matches `SELECT t1.b FROM t1`. A term that does not resolve in the arm
     /// does not match it.
     pub(super) fn compound_order_by_arm_match(
@@ -1581,8 +1581,8 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
         expanded: Vec<ExpandedColumn>,
         scope: &Scope,
     ) -> Result<()> {
-        // Like legacy and SQLite, with full_column_names on and
-        // short_column_names off the column is named after its source.
+        // Like SQLite, with full_column_names on and short_column_names off
+        // the column is named after its source.
         let long_names = self.context().long_column_names();
         for column in expanded {
             let resolved = self.resolve_atomic_expr(column.resolved.expr, scope)?;
@@ -4875,8 +4875,8 @@ mod tests {
 
     #[test]
     fn long_cte_chains_bind_without_deep_recursion() {
-        // Legacy planning handles this chain on a 2 MiB stack. Lazy binding
-        // used to recurse once per link and overflow there.
+        // This chain must bind on a 2 MiB stack. Lazy binding used to
+        // recurse once per link and overflow there.
         const LINKS: usize = 90;
         let mut sql = String::from("WITH c0 AS (SELECT 1 AS v)");
         for index in 1..LINKS {
@@ -10423,7 +10423,7 @@ mod tests {
     }
 
     #[test]
-    fn equivalent_windows_share_one_block_window_like_legacy() {
+    fn equivalent_windows_share_one_block_window() {
         let schema = schema_with_items();
         for (sql, expected) in [
             // Same inline definition and frame.
@@ -10431,7 +10431,7 @@ mod tests {
                 "SELECT sum(score) OVER (ORDER BY id), avg(score) OVER (ORDER BY id) FROM items",
                 1,
             ),
-            // lag and lead coerce different frames, as in legacy.
+            // lag and lead coerce different frames.
             (
                 "SELECT lag(score) OVER (ORDER BY id), lead(score) OVER (ORDER BY id) FROM items",
                 2,
@@ -10442,7 +10442,7 @@ mod tests {
                  WINDOW w AS (ORDER BY id)",
                 1,
             ),
-            // Named windows merge only by name, as in legacy.
+            // Named windows merge only by name.
             (
                 "SELECT sum(score) OVER a, sum(score) OVER b FROM items \
                  WINDOW a AS (ORDER BY id), b AS (ORDER BY id)",

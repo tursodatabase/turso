@@ -632,8 +632,8 @@ impl SeekExpressionLowering<hir::Expr> for HirSeekExpressionLowering<'_> {
     }
 
     fn affinity(&self, affinity: Affinity, expression: &hir::Expr) -> Affinity {
-        // Like legacy, skip the affinity a key value already has: a number
-        // under numeric affinity, text under TEXT, any blob, and a rowid.
+        // Skip the affinity a key value already has: a number under numeric
+        // affinity, text under TEXT, any blob, and a rowid.
         let unchanged = match expression {
             hir::Expr::Literal(Literal::Numeric(_)) => affinity.is_numeric(),
             hir::Expr::Literal(Literal::String(_)) => affinity == Affinity::Text,
@@ -713,7 +713,7 @@ impl SeekExpressionLowering<hir::Expr> for HirSeekExpressionLowering<'_> {
     }
 }
 
-/// Allocate the legacy query destination from facts already frozen in HIR.
+/// Allocate the query destination from facts already frozen in HIR.
 ///
 /// The matching expression binding is installed at the same time so query
 /// emission and expression lowering cannot choose different storage.
@@ -1115,7 +1115,7 @@ pub(crate) fn emit_in_probe_subquery(
         },
         correlated: true,
     };
-    // Legacy lists it as the list subquery it was written as.
+    // EXPLAIN lists it as the list subquery it was written as.
     let explain_id = program.next_subquery_eqp_id();
     crate::emit_explain!(
         program,
@@ -1295,8 +1295,8 @@ pub(crate) fn emit_planned_query_body(
     materialize_hir_shared_ctes(program, plan, &planned_query.blocks[0].loops)?;
     emit_hir_block_explain(program, document, block, &planned_query.blocks[0])?;
     let done = program.allocate_label();
-    // EXISTS only checks whether a row comes out, so like legacy and SQLite
-    // its subquery drops DISTINCT and never evaluates ORDER BY. LIMIT and
+    // EXISTS only checks whether a row comes out, so like SQLite its
+    // subquery drops DISTINCT and never evaluates ORDER BY. LIMIT and
     // OFFSET stay and count plain rows.
     let exists = matches!(destination, QueryDestination::ExistsSubqueryResult { .. });
     let distinct = if exists {
@@ -1344,8 +1344,8 @@ pub(crate) fn emit_planned_query_body(
     Ok(())
 }
 
-/// Whether grouped rows already leave in ORDER BY order, as legacy and
-/// SQLite find: when every ORDER BY term is a GROUP BY key, the GROUP BY
+/// Whether grouped rows already leave in ORDER BY order, as SQLite finds:
+/// when every ORDER BY term is a GROUP BY key, the GROUP BY
 /// sorter orders groups by those keys first, in ORDER BY order and with each
 /// term's direction, so no second sorter is needed. When the loops already
 /// return rows in that order, the planner skips both sorts.
@@ -1377,7 +1377,7 @@ fn hir_group_key_order(
 
 /// Whether rows leave the block's windows already in ORDER BY order. The
 /// outermost window layer returns rows sorted by its PARTITION BY and then
-/// its ORDER BY, so like legacy and SQLite, an ORDER BY that starts those
+/// its ORDER BY, so like SQLite, an ORDER BY that starts those
 /// keys needs no sorter, and LIMIT can stop before later rows are computed.
 fn hir_window_rows_follow_order_by(
     document: &HirDocument,
@@ -1601,7 +1601,7 @@ fn emit_hir_ungrouped_aggregate(
     emit_hir_aggregate_result(program, &plan.document, block, output, block_done, &state)
 }
 
-/// `SELECT count(*) FROM t`: like legacy and SQLite, count the entries of
+/// `SELECT count(*) FROM t`: like SQLite, count the entries of
 /// the table, or of the index the planner chose to scan, without a loop.
 /// Returns false, having emitted nothing, for a materialized view, whose
 /// rows are not a plain B-tree.
@@ -1704,7 +1704,7 @@ fn emit_hir_grouped_aggregate<'a>(
     emit_hir_group_result(program, &plan.document, query, block, output, &runtime)
 }
 
-/// The direction to sort each GROUP BY key in, like legacy and SQLite, so
+/// The direction to sort each GROUP BY key in, like SQLite, so
 /// ORDER BY ties come out in the same order. When every ORDER BY term is an
 /// aggregate or a constant, all keys follow the first term's direction.
 /// Otherwise a key follows the ORDER BY term equal to it, or sorts
@@ -1965,7 +1965,7 @@ fn initialize_hir_group_runtime<'a>(
 }
 
 /// The columns a grouped row keeps: those read after the rows are grouped.
-/// Like legacy, a column only WHERE or a join reads is not kept. A part of
+/// A column only WHERE or a join reads is not kept. A part of
 /// an output, HAVING, ORDER BY or window expression equal to a GROUP BY key
 /// is read from the key's register, so its columns are not kept for it; an
 /// aggregate's arguments are read from each grouped row, so all of theirs
@@ -2311,7 +2311,7 @@ fn emit_hir_group_row(
 }
 
 /// Read every group-output expression equal to a GROUP BY key from the key's
-/// register, as legacy and SQLite do. Re-evaluating it would need columns the
+/// register, as SQLite does. Re-evaluating it would need columns the
 /// group row does not keep, such as the inputs of a virtual generated column
 /// or the outer values of a correlated subquery.
 fn bind_hir_group_key_registers(
@@ -2508,8 +2508,7 @@ fn emit_hir_compound_query(
             collection_done,
         )?;
         program.preassign_label_to_next_insn(collection_done);
-        // Like legacy, the sort of the collected rows is not part of the
-        // compound's row.
+        // The sort of the collected rows is not part of the compound's row.
         program.pop_current_parent_explain();
         emit_hir_compound_order_by(
             program,
@@ -3089,7 +3088,7 @@ pub(super) struct PreparedHirRegistersLoop<'a> {
 
 /// A FROM subquery or CTE that runs as a coroutine: the loop resumes it for
 /// each row instead of reading a materialized table, so an outer LIMIT can
-/// stop it early, as in legacy.
+/// stop it early.
 pub(super) struct PreparedHirCoroutineLoop {
     yield_reg: usize,
     start: BranchOffset,
@@ -3177,8 +3176,8 @@ pub(super) struct PreparedHirHashLoop<'a> {
     /// join before this loop emits the loops after it again, and that copy
     /// must not build the table a second time.
     built: usize,
-    /// Legacy's materialized build input, when the hash table is built from
-    /// the joined rows of earlier loops rather than from the whole table.
+    /// The materialized build input, when the hash table is built from the
+    /// joined rows of earlier loops rather than from the whole table.
     build_input: Option<PreparedHirHashBuildInput<'a>>,
 }
 
@@ -3275,7 +3274,7 @@ struct HirNullRegisters {
 /// A RIGHT or FULL join. Its right source records each row that matched a
 /// left row; after the loops finish, a second pass emits the right rows no
 /// left row matched, with the left side NULL. This is SQLite's nested-loop
-/// RIGHT JOIN, and keeps legacy's order: matched rows first, then the rest.
+/// RIGHT JOIN: matched rows come first, then the rest.
 struct HirRightOuterJoin {
     source: SourceId,
     /// The source whose ON terms decide a match: `source` itself, or the
@@ -3292,8 +3291,8 @@ struct HirRightOuterJoin {
     /// row's temporary-table rowid in.
     matched_rowid: Option<usize>,
     /// The probe loop of an outer hash join that runs under earlier loops.
-    /// Like legacy, each pass of the probe loop starts with an empty
-    /// matched set and ends with its own unmatched pass, which NULL-fills
+    /// Each pass of the probe loop starts with an empty matched set and
+    /// ends with its own unmatched pass, which NULL-fills
     /// only the probe table and keeps the rows of the earlier loops.
     probe_pass: Option<usize>,
 }
@@ -4363,8 +4362,8 @@ fn emit_join_loops(
 ) -> Result<()> {
     let document = &plan.document;
     let mut joins = HirOuterJoins::default();
-    // Like legacy's outer hash join, `b LEFT JOIN p` (or FULL) built from b
-    // and probed by p runs like `p RIGHT JOIN b` in loop order: the ON
+    // An outer hash join `b LEFT JOIN p` (or FULL) built from b and probed
+    // by p runs like `p RIGHT JOIN b` in loop order: the ON
     // terms of p run after each lookup into b, the b rows they match are
     // recorded, and after the loops the other b rows run with p NULL. A
     // FULL join also gives each p row without a match a NULL b row.
@@ -4434,8 +4433,7 @@ fn emit_join_loops(
             prepare_hir_loop(program, plan, planned_loop, streams)
         })
         .collect::<Result<Vec<_>>>()?;
-    // Like legacy, the build inputs of hash lookups are filled before the
-    // loops.
+    // The build inputs of hash lookups are filled before the loops.
     for prepared in &prepared_loops {
         let PreparedHirLoop::Hash(prepared) = prepared else {
             continue;
@@ -4479,8 +4477,8 @@ fn emit_join_loops(
             })
         })
         .collect::<Vec<_>>();
-    // Like legacy, a semi-join or anti-join loop comes after every other
-    // loop: it only checks whether the rows before it have a match.
+    // A semi-join or anti-join loop comes after every other loop: it only
+    // checks whether the rows before it have a match.
     if let Some(first) = semi_anti.iter().position(Option::is_some) {
         if first == 0 || semi_anti[first..].iter().any(Option::is_none) {
             return Err(LimboError::InternalError(
@@ -4576,9 +4574,9 @@ impl HirLoopNest<'_, '_> {
             self.left_joins
         };
         let mut loops = Vec::with_capacity(self.prepared_loops.len() - first);
-        // Like legacy's `SemiAntiJoinMetadata`: where a semi-join or
-        // anti-join loop goes to try the next row of the loops before it,
-        // and where an anti-join loop that found no match continues.
+        // Where a semi-join or anti-join loop goes to try the next row of
+        // the loops before it, and where an anti-join loop that found no
+        // match continues.
         let semi_anti_labels = (first..self.prepared_loops.len())
             .map(|loop_index| {
                 self.semi_anti[loop_index].map(|_| HirSemiAntiLabels {
@@ -4594,7 +4592,7 @@ impl HirLoopNest<'_, '_> {
         };
         for loop_index in first..self.prepared_loops.len() {
             // An anti-join loop before this one found no match: it goes on
-            // here, as legacy chains its anti-joins.
+            // here.
             if let Some(labels) = loop_index
                 .checked_sub(1)
                 .filter(|previous| *previous >= first)
@@ -5239,8 +5237,9 @@ fn supported_btree_from(
     true
 }
 
-/// Legacy runs FULL joins as hash joins and reports these shapes, which have
-/// no hash plan, as errors. Keep the same errors.
+/// FULL joins run as hash joins, and these shapes have no hash plan: a FULL
+/// join chained with another outer join, one over a recursive reference,
+/// and one joined with USING or NATURAL instead of an ON equality.
 fn check_hir_full_join_shape(
     document: &HirDocument,
     from: &hir::From,
@@ -5430,8 +5429,8 @@ fn hir_loop_shares_cte(planned_loop: &HirPlannedLoop) -> bool {
     )
 }
 
-/// Like legacy, fill each shared CTE the loops read into its table before
-/// the block's loops open. EXPLAIN then lists the CTE's body on its own,
+/// Fill each shared CTE the loops read into its table before the block's
+/// loops open. EXPLAIN then lists the CTE's body on its own,
 /// under `cte_materializations`, and every reader points at that one fill.
 fn materialize_hir_shared_ctes(
     program: &mut ProgramBuilder,
@@ -5482,9 +5481,9 @@ fn materialize_hir_shared_ctes(
     Ok(())
 }
 
-/// Emit the EXPLAIN QUERY PLAN rows of a block's loops in loop order, as
-/// legacy does before it opens any cursor. A block without FROM reads one
-/// constant row.
+/// Emit the EXPLAIN QUERY PLAN rows of a block's loops in loop order,
+/// before any cursor is opened. A block without FROM reads one constant
+/// row.
 fn emit_hir_block_explain(
     program: &mut ProgramBuilder,
     document: &HirDocument,
@@ -5507,8 +5506,8 @@ fn emit_hir_block_explain(
     )
 }
 
-/// The rows of `loops` in loop order. Like legacy, a hash join reads as
-/// `HASH JOIN` with the table it scans, and the tables built into hash
+/// The rows of `loops` in loop order. A hash join reads as `HASH JOIN`
+/// with the table it scans, and the tables built into hash
 /// tables come after every loop; the loops that fill a materialized build
 /// input come first, under its `MATERIALIZE` row.
 fn emit_hir_loops_explain(
@@ -5568,13 +5567,12 @@ fn emit_hir_loops_explain(
     Ok(())
 }
 
-/// The EXPLAIN QUERY PLAN row of one planned loop, worded like legacy's.
-/// A DML target loop has no FROM clause.
+/// The EXPLAIN QUERY PLAN row of one planned loop. A DML target loop has
+/// no FROM clause.
 pub(super) fn hir_loop_explain(
     document: &HirDocument,
     from: Option<&hir::From>,
-    // LEFT JOINs the plan runs as inner joins, which legacy reports as
-    // inner joins.
+    // LEFT JOINs the plan runs as inner joins, reported as inner joins.
     inner_joins: &[SourceId],
     planned_loop: &HirPlannedLoop,
 ) -> Result<EqpDetail> {
@@ -5595,7 +5593,7 @@ pub(super) fn hir_loop_explain(
             }
         });
     // A shared CTE is filled once, before the loops, and every reader reads
-    // that one fill, which legacy reports as a reuse.
+    // that one fill, reported as a reuse.
     let shared = hir_loop_shares_cte(planned_loop);
     let exec = if shared {
         EqpSubqueryExec::MaterializedReuse
@@ -5616,8 +5614,8 @@ pub(super) fn hir_loop_explain(
             recursive,
         }),
     };
-    // Like legacy, a subquery read through a temporary index over its stored
-    // rows is a SEARCH of that index, with the subquery under it.
+    // A subquery read through a temporary index over its stored rows is a
+    // SEARCH of that index, with the subquery under it.
     let materialized_search = |cte: Option<hir::CteId>, operation: &HirBtreeOperation| {
         let HirBtreeOperation::Seek {
             index: Some(index),
@@ -5789,8 +5787,8 @@ pub(super) fn hir_loop_explain(
 }
 
 /// How a source joins the sources before it, for EXPLAIN QUERY PLAN.
-/// How EXPLAIN QUERY PLAN names a source, as legacy does: a FROM subquery
-/// by its alias, a table by its name and alias.
+/// How EXPLAIN QUERY PLAN names a source: a FROM subquery by its alias, a
+/// table by its name and alias.
 fn hir_eqp_table(document: &HirDocument, source: SourceId) -> Result<EqpTable> {
     let source = document.source(source).ok_or_else(|| {
         LimboError::InternalError(format!("HIR loop references missing source {source}"))
@@ -5855,8 +5853,8 @@ fn prepare_hir_loop<'a>(
     })
 }
 
-/// Whether a FROM subquery or CTE runs as a coroutine, as in legacy, so the
-/// outer loop pulls its rows on demand. It is materialized instead when
+/// Whether a FROM subquery or CTE runs as a coroutine, so the outer loop
+/// pulls its rows on demand. It is materialized instead when
 /// several references share it, when it is hinted MATERIALIZED, and in a
 /// block with an outer join, whose NULL rows and unmatched-row pass need a
 /// table.
@@ -7477,8 +7475,8 @@ fn prepare_hir_materialized_loop<'a>(
 
 /// The loop of a stored FROM subquery or CTE: a scan of its table, or with
 /// `seek`, a seek of a temporary index built from that table when the loop
-/// first starts, like legacy's materialized-subquery seek. The index holds
-/// every column, so the loop reads only the index.
+/// first starts. The index holds every column, so the loop reads only the
+/// index.
 fn with_hir_materialized_seek<'a>(
     program: &mut ProgramBuilder,
     materialized: PreparedHirMaterializedLoop<'a>,
@@ -7620,7 +7618,7 @@ pub(super) fn prepare_hir_btree_loop<'a>(
         ))
     })?;
     program.begin_read_on_database(database.index(), database_snapshot.schema_version)?;
-    // Like legacy, a materialized view's table cursor also sees the current
+    // A materialized view's table cursor also sees the current
     // transaction's changes.
     let table_cursor_type = || match plan.materialized_view(source.id) {
         Some(view) => CursorType::MaterializedView(table.clone(), view.clone()),
@@ -7658,8 +7656,8 @@ pub(super) fn prepare_hir_btree_loop<'a>(
         },
     );
     // A correlated subquery's loop is emitted inside the loops that run it,
-    // so like legacy it opens its cursors on the first run only; each run
-    // positions them again.
+    // so it opens its cursors on the first run only; each run positions
+    // them again.
     let opened = program.is_nested().then(|| {
         let opened = program.allocate_label();
         program.emit_insn(Insn::Once {
@@ -8822,7 +8820,7 @@ fn emit_query_row_with_inputs<'expr>(
         )));
     }
     // Without DISTINCT, which hashes the outputs side by side, a sorted row
-    // computes each output straight into its sorter column, as legacy does.
+    // computes each output straight into its sorter column.
     let sorter_in_place = match output.target {
         HirRowTarget::Sorter(sorter) if output.distinct.is_none() => Some(sorter),
         _ => None,
@@ -8938,8 +8936,8 @@ enum HirWindowConsumer<'p, 'a> {
 
 /// Runtime state for one window over a query block's rows.
 ///
-/// A block with several windows lowers one layer per window, nested like the
-/// legacy window source subqueries: the first window is the outermost layer.
+/// A block with several windows lowers one layer per window, nested: the
+/// first window is the outermost layer.
 /// The block's rows feed the innermost layer, and every other layer is fed by
 /// the finished rows of the layer inside it. Each layer sorts its input by
 /// PARTITION BY and ORDER BY, or streams it when the window has neither, then
@@ -9006,8 +9004,8 @@ impl<'a> HirWindowLayer<'a> {
             start: program.alloc_registers(plan.columns.len()),
             count: plan.columns.len(),
         };
-        // Like the legacy source subquery's ORDER BY, grouped rows carry a
-        // sequence number so equal keys keep their group order.
+        // Grouped rows carry a sequence number so equal keys keep their
+        // group order.
         // Rows that already arrive in key order go straight to the window.
         let sorter = (!keys.is_empty() && !sorted_input)
             .then(|| open_hir_window_input_sorter(program, &plan, &keys, grouped_rows));
@@ -9220,8 +9218,8 @@ impl<'a> HirWindowLayer<'a> {
 /// Semantic analysis owns the custom-type feature check.
 const HIR_CUSTOM_TYPES_CHECKED: bool = true;
 
-/// Legacy sorts window keys through the source subquery's ORDER BY, which
-/// rejects a custom-type column that decodes values but cannot be compared.
+/// A window key is sorted like an ORDER BY term, which rejects a
+/// custom-type column that decodes values but does not declare `<`.
 fn check_hir_window_key_is_orderable(
     document: &HirDocument,
     key: &super::window::HirWindowInputKey<'_>,
@@ -9347,8 +9345,8 @@ fn emit_hir_window_block(
     let innermost = layers.last().ok_or_else(|| {
         LimboError::InternalError(format!("HIR query block {:?} has no windows", block.id))
     })?;
-    // Like legacy's window source subqueries, each window that sorts its
-    // input shows the sort, innermost window first.
+    // Each window that sorts its input shows the sort, innermost window
+    // first.
     for layer in layers.iter().rev() {
         if layer.sorter.is_some() {
             emit_explain!(
@@ -9439,8 +9437,8 @@ pub(super) fn emit_array_results(
             reg: register,
             target_pc: skip,
         });
-        // Like legacy, an array column of a custom type has its elements
-        // decoded for display.
+        // An array column of a custom type has its elements decoded for
+        // display.
         if let Some(decode) = array_column_decode(document, &output.expr) {
             super::expr::translate_schema_calls_on_elements(program, document, decode, register)?;
         }
@@ -9471,8 +9469,8 @@ fn array_column_decode<'a>(
         .filter(|decode| !decode.is_empty())
 }
 
-/// Like legacy, an expression that can pass an array value through is
-/// decoded for display too: COALESCE, IFNULL, scalar MIN and MAX, IIF,
+/// An expression that can pass an array value through is decoded for
+/// display too: COALESCE, IFNULL, scalar MIN and MAX, IIF,
 /// NULLIF, CASE and `||` over array operands, and array functions.
 fn hir_expr_passes_array(document: &HirDocument, expression: &hir::Expr) -> bool {
     let is_array = |expression| hir_expr_passes_array(document, expression);
@@ -10212,8 +10210,8 @@ pub(super) mod tests {
         assert!(!emits_sorter("SELECT value FROM items ORDER BY value DESC"));
         // The index has no `extra`.
         assert!(emits_sorter("SELECT value FROM items ORDER BY extra"));
-        // Like legacy, reading the index backwards gives the groups in
-        // ORDER BY order, so neither GROUP BY nor ORDER BY sorts.
+        // Reading the index backwards gives the groups in ORDER BY order,
+        // so neither GROUP BY nor ORDER BY sorts.
         assert!(!emits_sorter(
             "SELECT value, count(*) FROM items GROUP BY value ORDER BY value DESC"
         ));
@@ -11227,7 +11225,7 @@ pub(super) mod tests {
     }
 
     #[test]
-    fn subquery_wrapper_keeps_legacy_initialization_and_body_order() {
+    fn subquery_wrapper_runs_once_and_clears_results_before_the_body() {
         for sql in [
             "SELECT (1, 2) = (SELECT 3, 4)",
             "SELECT EXISTS (SELECT 1)",
@@ -11386,7 +11384,7 @@ pub(super) mod tests {
                 })
                 .collect::<Vec<_>>()
         };
-        // Like legacy, the loop rows come first, so their ids are stable.
+        // The loop rows come first, so their ids are stable.
         assert_eq!(
             rows("SELECT value FROM items ORDER BY value"),
             [(0, "SCAN items USING COVERING INDEX items_value".to_string())]
@@ -11488,7 +11486,7 @@ pub(super) mod tests {
     }
 
     #[test]
-    fn scalar_and_in_subqueries_emit_the_legacy_number_of_rows() {
+    fn scalar_subquery_stops_after_one_row_and_in_subquery_inserts_every_row() {
         let scalar = analyze_sql(Schema::new(), "SELECT (VALUES (1), (2))");
         let mut scalar_program = program();
         let scalar_prepared =
@@ -12570,7 +12568,7 @@ pub(super) mod tests {
 
     #[test]
     fn planned_inner_join_looks_rows_up_in_a_hash_table() {
-        // Like legacy, a join with an index hint never hashes.
+        // A join with an index hint never hashes.
         let mut schema = automatic_join_schema();
         schema
             .analyze_stats

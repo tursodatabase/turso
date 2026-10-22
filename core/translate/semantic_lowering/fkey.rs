@@ -1,9 +1,8 @@
 //! Foreign-key checks for DML lowered from HIR.
 //!
-//! The checks follow legacy's bytecode (`translate/fkeys.rs`), but read key
-//! values through HIR sources instead of the resolver. Only NO ACTION and
-//! RESTRICT are lowered here: a statement whose parent-side action is
-//! CASCADE, SET NULL or SET DEFAULT still goes to legacy.
+//! The checks read key values through HIR sources. Only NO ACTION and
+//! RESTRICT are lowered here: a parent-side CASCADE, SET NULL or SET DEFAULT
+//! changes the child rows instead, through `fkey_action`.
 //!
 //! Violations of an immediate constraint add to the statement's counter,
 //! checked when the statement ends; deferred ones add to the connection's
@@ -61,8 +60,8 @@ fn child_key_changes(foreign_key: &hir::ResolvedForeignKey, assigned: &[usize]) 
 /// row that pointed at a missing parent takes back the violation it added.
 ///
 /// `replacement` is a row that REPLACE writes in place of this one, bound to
-/// its registers. Like legacy, an immediate NO ACTION constraint whose key
-/// it keeps is not checked.
+/// its registers. An immediate NO ACTION constraint whose key it keeps is
+/// not checked.
 pub(super) fn emit_delete_checks(
     program: &mut ProgramBuilder,
     document: &HirDocument,
@@ -128,8 +127,8 @@ fn emit_children_still_point_here(
             emit_fk_violation(program, &declaration)
         }
     };
-    // Like legacy, a self-reference scans the table so that the row being
-    // deleted does not count as its own child.
+    // A self-reference scans the table so that the row being deleted does
+    // not count as its own child.
     match foreign_key.child_index.as_ref().filter(|_| !self_reference) {
         Some(index) => {
             let cursor = open_read_index(program, &index.handle(), database);
@@ -301,8 +300,7 @@ pub(super) fn emit_insert_child_checks(
 /// violation. `target` must be bound to the row's registers.
 ///
 /// Under REPLACE (`replaced`), a deleted conflicting row may have counted
-/// children of any constraint, so every constraint is repaired, as legacy
-/// does.
+/// children of any constraint, so every constraint is repaired.
 pub(super) fn emit_insert_parent_repairs(
     program: &mut ProgramBuilder,
     document: &HirDocument,
@@ -379,7 +377,7 @@ pub(super) fn emit_insert_parent_repairs(
 /// row's registers, and `rowid` must hold the rowid; `assigned` lists the
 /// columns the UPDATE sets.
 ///
-/// Like legacy, where the target is the parent and the parent key changes,
+/// Where the target is the parent and the parent key changes,
 /// children of the old key become violations (RESTRICT stops at once) and
 /// children of the new key take back deferred violations. Where the target
 /// is the child and the child key changes, the old key takes back its
@@ -586,7 +584,7 @@ pub(super) struct PendingRepair<'a> {
 }
 
 /// After the row is written, children of a new deferred parent key take
-/// back their violations, as legacy does under REPLACE.
+/// back their violations.
 pub(super) fn emit_update_repairs(
     program: &mut ProgramBuilder,
     pending: &[PendingRepair<'_>],
@@ -637,8 +635,7 @@ fn emit_new_parent_key_repairs(
     )
 }
 
-/// Jump to `same` when the two keys are equal, NULLs included, as legacy's
-/// parent-key change test does.
+/// Jump to `same` when the two keys are equal, NULLs included.
 pub(super) fn emit_skip_if_same_key(
     program: &mut ProgramBuilder,
     old_key: usize,
@@ -669,9 +666,9 @@ pub(super) fn emit_skip_if_same_key(
 }
 
 /// Run `on_match` for child rows that point at the parent key in `key`,
-/// skipping the child row `exclude` and keys with a NULL. Like legacy, an
-/// index that lists exactly the child key is probed, and otherwise the child
-/// table is scanned.
+/// skipping the child row `exclude` and keys with a NULL. An index that
+/// lists exactly the child key is probed, and otherwise the child table is
+/// scanned.
 fn emit_child_probe(
     program: &mut ProgramBuilder,
     foreign_key: &hir::ResolvedForeignKey,
@@ -710,8 +707,8 @@ fn emit_child_probe(
 
 /// Jump to `ok` when the child key in `child_key` equals the parent key of
 /// the same row `row`, compared as stored and with BINARY: once written, the
-/// row is its own parent. Like legacy and SQLite, the parent's affinity is
-/// not applied here.
+/// row is its own parent. Like SQLite, the parent's affinity is not applied
+/// here.
 fn emit_own_parent_check(
     program: &mut ProgramBuilder,
     document: &HirDocument,
@@ -765,8 +762,8 @@ pub(super) fn emit_parent_key(
     Ok(start)
 }
 
-/// Like [`emit_parent_key`], with custom-typed columns as stored: like
-/// legacy, the checks compare stored keys.
+/// Like [`emit_parent_key`], with custom-typed columns as stored: the
+/// checks compare stored keys.
 fn emit_stored_parent_key(
     program: &mut ProgramBuilder,
     document: &HirDocument,

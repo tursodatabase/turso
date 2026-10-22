@@ -101,8 +101,8 @@ pub(super) struct HirWindowFunction<'a> {
 
 /// HIR-owned input layout for one effective window.
 ///
-/// Columns are ordered like the legacy source subquery: PARTITION BY and
-/// ORDER BY values first, followed by function arguments and FILTER values.
+/// Columns are ordered as PARTITION BY and ORDER BY values first, followed
+/// by function arguments and FILTER values.
 /// Equivalent partition/order and late-evaluation leaves share one slot.
 #[cfg_attr(not(test), allow(dead_code))]
 #[derive(Debug)]
@@ -609,8 +609,8 @@ pub(super) struct HirWindowInputKey<'a> {
 }
 
 impl<'a> HirWindowInputKey<'a> {
-    /// Custom types with a decode program sort by their stored value, like
-    /// legacy ORDER BY keys, so the key cannot reuse the decoded buffer value.
+    /// Custom types with a decode program sort by their stored value, so the
+    /// key cannot reuse the decoded buffer value.
     pub(super) fn is_encoded(&self) -> bool {
         self.type_fact
             .declared
@@ -647,8 +647,7 @@ impl<'a> HirWindowBufferPlan<'a> {
     }
 
     /// Source-row ordering for this window: PARTITION BY terms ascending, then
-    /// ORDER BY terms, skipping any term equivalent to an earlier key. This is
-    /// the ORDER BY of the legacy window source subquery.
+    /// ORDER BY terms, skipping any term equivalent to an earlier key.
     pub(super) fn input_sort_keys(&self) -> Vec<HirWindowInputKey<'a>> {
         let window = self.window;
         let partition =
@@ -1015,8 +1014,8 @@ pub(super) fn emit_hir_window_frame_offset(
 /// Evaluate the bounded frame offsets at the start of one partition.
 ///
 /// The runtime decrements these registers while walking the partition, so
-/// they must be rebuilt for each partition. Keep start before end to match
-/// the legacy window loop.
+/// they must be rebuilt for each partition. The start offset is evaluated
+/// before the end offset.
 #[cfg_attr(not(test), allow(dead_code))]
 pub(super) fn emit_hir_window_frame_offsets(
     program: &mut ProgramBuilder,
@@ -1061,7 +1060,8 @@ pub(super) fn emit_hir_window_frame_offsets(
     Ok(())
 }
 
-/// Choose deletion from HIR literals without converting expressions to legacy AST.
+/// Choose which buffered rows the window loop deletes, from the frame shape
+/// and whether each bound is a positive numeric literal.
 #[cfg_attr(not(test), allow(dead_code))]
 fn hir_window_delete_op(
     plan: &HirWindowBufferPlan<'_>,
@@ -1263,7 +1263,7 @@ pub(super) fn emit_hir_window_buffer_step<'a>(
     )
 }
 
-/// Finish a HIR partition through the same frame loops as legacy lowering.
+/// Finish a partition through the frame loops.
 /// The caller emits the outer SELECT output subroutine at the supplied phase.
 #[cfg_attr(not(test), allow(dead_code))]
 #[allow(clippy::too_many_arguments)]
@@ -1445,7 +1445,8 @@ pub(super) fn emit_hir_window_range_cursor_guards(
     );
 }
 
-/// Keep operation countdowns and RANGE retry labels shared with legacy lowering.
+/// Gate one window operation on its countdown or RANGE offset test, using
+/// the ORDER BY key frozen in HIR for the RANGE comparison.
 #[cfg_attr(not(test), allow(dead_code))]
 pub(super) fn emit_hir_window_offset_gate(
     program: &mut ProgramBuilder,
@@ -1531,7 +1532,8 @@ pub(super) fn emit_hir_window_subsequent_row(
     )
 }
 
-/// Initialize each partition in legacy order before its first buffered row.
+/// Initialize each partition before its first buffered row: seed the peer
+/// keys, reset the accumulators, then run the first-row frame sequence.
 #[cfg_attr(not(test), allow(dead_code))]
 #[allow(clippy::too_many_arguments)]
 pub(super) fn emit_hir_window_first_row(
@@ -1928,7 +1930,7 @@ mod tests {
     }
 
     #[test]
-    fn hir_window_peer_state_uses_legacy_frame_gates_and_seed() {
+    fn hir_window_peer_state_allocates_range_peer_registers_and_seeds_them() {
         let document = analyze_sql(
             "SELECT sum(value) OVER (\
                  ORDER BY sort_key \
@@ -2297,7 +2299,7 @@ mod tests {
     }
 
     #[test]
-    fn hir_window_buffer_uses_planned_width_and_legacy_cursor_rules() {
+    fn hir_window_buffer_uses_planned_width_and_opens_cursors_the_frame_needs() {
         assert_hir_buffer("SELECT row_number() OVER () FROM items", 0, false, false);
         assert_hir_buffer(
             "SELECT sum(value) OVER (ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) FROM items",
@@ -3178,7 +3180,7 @@ mod tests {
     }
 
     #[test]
-    fn hir_window_first_row_initializes_each_partition_in_legacy_order() {
+    fn hir_window_first_row_seeds_peers_then_resets_then_rebuilds_offsets() {
         for function in ["min(value)", "first_value(value)"] {
             let document = analyze_sql(&format!(
                 "SELECT {function} OVER (ORDER BY sort_key \
@@ -3281,7 +3283,7 @@ mod tests {
     }
 
     #[test]
-    fn hir_window_first_row_preserves_legacy_sequence() {
+    fn hir_window_first_row_buffers_the_row_then_guards_and_rewinds() {
         for (frame, guard, delay, start_cursor) in [
             (
                 "ROWS BETWEEN 1 FOLLOWING AND 2 FOLLOWING",
@@ -3482,7 +3484,7 @@ mod tests {
         .expect("empty-frame guard emits");
 
         let [branch, aggregate, rewind, row, reset, null, jump] = program.insns.as_slice() else {
-            panic!("empty-frame guard preserves the seven legacy operations");
+            panic!("empty-frame guard emits branch, aggregate, rewind, row, reset, null, jump");
         };
         assert!(matches!(branch.0, Insn::Ge { .. }));
         assert!(matches!(
@@ -3579,7 +3581,7 @@ mod tests {
     }
 
     #[test]
-    fn hir_window_frame_offsets_keep_legacy_constant_rules() {
+    fn hir_window_frame_offsets_treat_literals_and_parameters_as_constant() {
         fn constant(offset: &str) -> bool {
             let sql = format!(
                 "SELECT sum(value) OVER (\
@@ -3642,7 +3644,7 @@ mod tests {
     }
 
     #[test]
-    fn hir_window_frame_offsets_are_rebuilt_in_legacy_order() {
+    fn hir_window_frame_offsets_evaluate_start_before_end() {
         let document = analyze_sql(
             "SELECT sum(value) OVER (\
                  ROWS BETWEEN 2 PRECEDING AND 3 FOLLOWING\

@@ -78,11 +78,8 @@ pub struct Constraint<E = ast::Expr> {
     /// not yet plumb per-column affinity into the index-selection path, so
     /// such constraints fall through to scans).
     pub comparison_affinity: Option<Affinity>,
-    /// Comparison collation already chosen by semantic analysis.
-    ///
-    /// HIR constraints carry this directly. Legacy AST constraints leave it
-    /// empty and keep their current expression lookup until that path is
-    /// removed.
+    /// Comparison collation already chosen by semantic analysis. Empty for a
+    /// constraint that has no comparison, such as an `IS NULL` seek.
     pub comparison_collation: Option<CollationSeq>,
     /// Whether this constraint's seek key can be NULL and still match rows.
     /// True only for `IS` whose constraining value is not known to be
@@ -506,13 +503,12 @@ fn hir_binary_constraints_for_term(
     Ok(constraints)
 }
 
-/// `x IS NULL` as a seek on `x`, like legacy's `x IS NULL` constraint. HIR
-/// analysis turns both `x IS NULL` and `x ISNULL` into [`hir::Expr::IsNull`],
-/// which has no NULL operand of its own, so the constraint carries the NULL
-/// it seeks. `IS NULL` is true on a row an outer join adds, so like `IS` it
-/// cannot seek a table an outer join may NULL-extend, except in that join's
-/// own ON clause. A rowid is never NULL, so `rowid IS NULL` is left to the
-/// filter.
+/// `x IS NULL` as a seek on `x`. HIR analysis turns both `x IS NULL` and
+/// `x ISNULL` into [`hir::Expr::IsNull`], which has no NULL operand of its
+/// own, so the constraint carries the NULL it seeks. `IS NULL` is true on a
+/// row an outer join adds, so like `IS` it cannot seek a table an outer join
+/// may NULL-extend, except in that join's own ON clause. A rowid is never
+/// NULL, so `rowid IS NULL` is left to the filter.
 #[allow(clippy::too_many_arguments)]
 fn hir_is_null_constraint_for_term(
     document: &hir::HirDocument,

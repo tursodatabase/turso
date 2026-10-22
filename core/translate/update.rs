@@ -6,8 +6,8 @@ use crate::vdbe::builder::ProgramBuilder;
 use turso_parser::ast;
 
 /// Prepare the UPDATE of the schema table that ALTER TABLE generates, then
-/// run `after` on the program. Like legacy, it may write the schema table,
-/// and change data capture records `ddl_query`, the ALTER statement, as the
+/// run `after` on the program. It may write the schema table, and change
+/// data capture records `ddl_query`, the ALTER statement, as the
 /// new `sql` value.
 pub fn translate_update_for_schema_change(
     body: ast::Update,

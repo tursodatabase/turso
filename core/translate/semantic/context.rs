@@ -605,7 +605,7 @@ impl<'catalog> SemanticContext<'catalog> {
     }
 }
 
-/// Legacy's message, which keeps the schema name the statement used.
+/// The error message keeps the schema name the statement used.
 fn no_such_table(name: &turso_parser::ast::QualifiedName) -> LimboError {
     LimboError::ParseError(format!(
         "no such table: {}",
@@ -613,8 +613,8 @@ fn no_such_table(name: &turso_parser::ast::QualifiedName) -> LimboError {
     ))
 }
 
-/// Like legacy and SQLite, an unqualified `sqlite_schema` or `sqlite_master`
-/// is main's schema table even when a temp schema exists, and
+/// Like SQLite, an unqualified `sqlite_schema` or `sqlite_master` is main's
+/// schema table even when a temp schema exists, and
 /// `sqlite_temp_schema` or `sqlite_temp_master` is temp's.
 fn schema_table_database(table_name: &str) -> Option<DatabaseId> {
     use crate::schema::{

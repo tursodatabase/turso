@@ -891,7 +891,6 @@ fn validate(
     Ok(())
 }
 
-/// How a CTAS SELECT runs: planned by legacy, or through HIR.
 /// The SELECT of a CTAS table, planned through HIR.
 type CtasPlan = crate::translate::semantic_lowering::PlannedSelect;
 

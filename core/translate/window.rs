@@ -61,8 +61,8 @@ pub(crate) struct WindowFunctionRuntime<E> {
 
 /// Resolved inputs needed to create window function state.
 ///
-/// Legacy and HIR adapters resolve their own expression metadata before this
-/// representation-neutral boundary.
+/// The caller resolves the expression metadata before building this value,
+/// so nothing here depends on how expressions are represented.
 pub(crate) struct WindowFunctionRuntimeSpec<E> {
     pub(crate) function: AccumulatorFunc,
     pub(crate) arguments: Vec<BufferedWindowValue<E>>,
@@ -539,7 +539,8 @@ pub(crate) struct WindowFirstRowFrame<'a> {
     pub step_end: BranchOffset,
 }
 
-/// Keep first-row insertion and frame positioning identical for HIR and legacy callers.
+/// Insert the first row of a partition into the window buffer, apply the
+/// empty-frame guard, and position the frame cursors on that row.
 pub(crate) fn emit_window_first_row_frame(
     program: &mut ProgramBuilder,
     state: WindowFirstRowFrame<'_>,
@@ -847,8 +848,8 @@ pub(crate) fn emit_window_frame_cursor_rewind(
 
 /// Open cursors that share one ephemeral window buffer.
 ///
-/// Legacy and HIR lowering decide independently which rows and expressions
-/// the table stores. The cursor roles and their opening order are shared.
+/// The caller decides which rows and expressions the table stores. The
+/// cursor roles and their opening order are fixed here.
 #[derive(Debug)]
 pub(crate) struct WindowBufferRuntime {
     pub(crate) table: Arc<BTreeTable>,
@@ -1247,7 +1248,8 @@ pub(crate) enum WindowStreamPhase {
     },
 }
 
-/// Buffer one input row and run frame operations in legacy order.
+/// Buffer one input row and run the frame operations in the order the
+/// frame's bounds call for.
 pub(crate) fn emit_window_buffer_step(
     program: &mut ProgramBuilder,
     frame: WindowFrameShape,
@@ -1539,7 +1541,9 @@ pub(crate) fn window_delete_op_for_frame(
     }
 }
 
-/// Match legacy integer truncation when deciding whether an offset permits deletion.
+/// Whether a numeric frame offset is greater than zero. A real offset is
+/// truncated to an integer first, so `0.5` counts as zero. Used to decide
+/// whether buffered rows may ever be deleted.
 pub(crate) fn window_numeric_offset_gt_zero(value: &str) -> bool {
     if let Ok(n) = value.parse::<i64>() {
         return n > 0;
@@ -2157,7 +2161,7 @@ pub(crate) fn emit_window_offset_gate(
     Ok(range_loop_start)
 }
 
-/// Work supplied by the legacy or HIR adapter at each operation phase.
+/// The phase of a window operation the caller emits code for.
 #[derive(Clone, Copy, Debug)]
 pub(crate) enum WindowOperationPhase {
     ReadAggregateResults,
@@ -2853,7 +2857,7 @@ pub(crate) fn emit_window_row_results(
     Ok(())
 }
 
-/// Work supplied by the legacy or HIR adapter during partition flush.
+/// The phase of a partition flush the caller emits code for.
 pub(crate) enum WindowFlushPhase {
     Operation {
         op: WindowOp,

@@ -1086,9 +1086,10 @@ impl Statement {
         )
     }
 
-    /// Column naming for a statement prepared from semantic HIR, following
-    /// the same alias, `full_column_names`, and `short_column_names` rules as
-    /// the legacy result columns.
+    /// Column naming for a statement prepared from semantic HIR. An alias
+    /// wins. Otherwise a table column is named `table.column` with
+    /// `full_column_names` on, by its column name with `short_column_names`
+    /// on, and by its resolved name with both off.
     fn resolved_column_name<'a>(&self, column: &'a ResolvedResultColumn) -> Cow<'a, str> {
         if column.name_is_alias {
             return Cow::Borrowed(&column.name);
@@ -1110,9 +1111,10 @@ impl Statement {
         }
     }
 
-    /// Type information for a statement prepared from semantic HIR. Table
-    /// columns use the same schema rules as legacy; expressions report their
-    /// resolved affinity.
+    /// Type information for a statement prepared from semantic HIR. A table
+    /// column reports its declared type, resolved against the schema's
+    /// custom types; an expression reports its primitive type, when it has
+    /// one.
     fn resolved_column_type_info(&self, column: &ResolvedResultColumn) -> Option<ColumnTypeInfo> {
         let ResolvedResultValue::Column(source) = &column.value else {
             return column.primitive.map(|name| ColumnTypeInfo {

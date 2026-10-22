@@ -855,9 +855,9 @@ pub(super) fn choose_single_btree_access_method<E, I, O>(
             ..
         } if constraint_refs.is_empty()
     );
-    // Like legacy, a temporary index is only built for a table joined after
-    // another one. A correlated subquery's first table is scanned on each
-    // run; legacy speeds those up by turning the subquery into a join.
+    // A temporary index is only built for a table joined after another one.
+    // A correlated subquery's first table is scanned on each run; the
+    // subquery-to-join rewrite in `semantic_unnest` speeds those up.
     if source.allows_alternative_access()
         && uses_full_table_scan
         && !lhs_mask.is_empty()
@@ -1132,21 +1132,20 @@ pub fn estimate_hash_join_cost(
     Cost(build_cost + probe_cost + spill_cost)
 }
 
-/// Legacy's `find_best_access_method_for_subquery` for a HIR FROM subquery
-/// or CTE: scan its rows, or store them once in a temporary index keyed by
-/// the columns earlier loops constrain and seek that index for each outer
-/// row, whichever costs less. The rows are stored in a table first and the
+/// The access method of a HIR FROM subquery or CTE: scan its rows, or store
+/// them once in a temporary index keyed by the columns earlier loops
+/// constrain and seek that index for each outer row, whichever costs less.
+/// The rows are stored in a table first and the
 /// index is built from it, so setup always costs two passes, except for a
 /// CTE that is already stored as a table. A subquery that reads an outer
 /// row runs again for each one, so it is only scanned, and so is the right
 /// side of a RIGHT or FULL JOIN (`may_seek` false), whose unmatched rows a
 /// second pass finds by scanning the stored table.
 ///
-/// Without seek constraints, like legacy's `intrinsic_subquery_scan_direction`,
-/// the scan reads a stored CTE backwards when that gives `order_target`.
+/// Without seek constraints, the scan reads a stored CTE backwards when
+/// that gives `order_target`.
 ///
-/// Not ported yet: legacy also uses the order of the temporary index to
-/// skip an outer sort.
+/// The order of the temporary index is not used to skip an outer sort.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn find_best_hir_access_method_for_subquery(
     document: &hir::HirDocument,
@@ -1230,8 +1229,8 @@ pub(crate) fn find_best_hir_access_method_for_subquery(
                 })
         })
         .collect();
-    // Like legacy: a MIN or MAX whose seek constraints are all on its own
-    // column can walk the subquery's own order from one end.
+    // A MIN or MAX whose seek constraints are all on its own column can
+    // walk the subquery's own order from one end.
     let extremum_constraints_compatible = order_target.is_some_and(|target| {
         target.is_extremum()
             && matches!(
@@ -1242,9 +1241,8 @@ pub(crate) fn find_best_hir_access_method_for_subquery(
             )
     });
     if extremum_constraints_compatible || usable.is_empty() {
-        // Legacy's `intrinsic_subquery_scan_direction`: reading forwards
-        // gives the subquery's own order; only a stored CTE can be read
-        // backwards for the opposite one.
+        // Reading forwards gives the subquery's own order; only a stored
+        // CTE can be read backwards for the opposite one.
         let direction = order_target.and_then(|target| {
             let consumed = |direction| {
                 super::order::hir_subquery_intrinsic_order_consumed(
@@ -1369,9 +1367,9 @@ pub(crate) fn find_best_hir_access_method_for_subquery(
     })
 }
 
-/// Legacy's `materialized_subquery_ephemeral_index` for a HIR source: the
-/// key columns first, then every other column, so the index holds the whole
-/// row and the loop never reads the stored table.
+/// The temporary index of a stored HIR subquery: the key columns first, then
+/// every other column, so the index holds the whole row and the loop never
+/// reads the stored table.
 fn hir_materialized_subquery_ephemeral_index(
     source: &hir::Source,
     key_col_positions: &[usize],
@@ -1411,8 +1409,8 @@ fn hir_materialized_subquery_ephemeral_index(
     }))
 }
 
-/// Legacy's `grouped_subquery_lookup_is_unique`: a grouped query has at most
-/// one row for one full group key.
+/// A grouped query has at most one row for one full group key, so a seek
+/// on every key column finds at most one row.
 fn hir_grouped_subquery_lookup_is_unique(
     document: &hir::HirDocument,
     query: hir::QueryId,

@@ -698,8 +698,8 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
         Ok(source)
     }
 
-    /// Expand a view like legacy planning: its stored SELECT becomes a
-    /// derived source named after the view, with the view's column names.
+    /// Expand a view: its stored SELECT becomes a derived source named after
+    /// the view, with the view's column names.
     /// The SELECT resolves against the catalog only, so the statement's CTEs
     /// are hidden while it is analyzed, and it cannot read outer columns.
     fn analyze_view_source(
@@ -810,7 +810,7 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
     }
 
     /// The affinity of column `position` of a compound subquery, combined
-    /// across its arms like legacy and SQLite's `sqlite3SubqueryColumnTypes`:
+    /// across its arms like SQLite's `sqlite3SubqueryColumnTypes`:
     /// the first arm with an affinity sets it, and a later arm that can give
     /// a value of the other class (text against numeric) removes it, so the
     /// column compares by storage class.

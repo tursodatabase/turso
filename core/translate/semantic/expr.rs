@@ -392,8 +392,8 @@ impl QueryFunctionState {
         std::mem::take(&mut self.windows)
     }
 
-    /// Return the block window for one call, sharing an earlier window the
-    /// way legacy planning does: a call with an inline OVER clause reuses any
+    /// Return the block window for one call, sharing an earlier window when
+    /// it can: a call with an inline OVER clause reuses any
     /// window with the same frame, PARTITION BY, and ORDER BY; a call naming
     /// its window reuses the latest window with that name and frame.
     fn allocate_resolved_window(
@@ -2262,7 +2262,7 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
         {
             crate::bail_parse_error!("row value misused");
         }
-        // Like legacy, BETWEEN on a custom type is `x >= a AND x <= b` with
+        // BETWEEN on a custom type is `x >= a AND x <= b` with
         // the type's own comparison operators.
         if expr.components.len() == 1 {
             let (tested, low, high) = (
@@ -3264,7 +3264,7 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
                     &arguments[1],
                     "struct_extract() second argument must be a string literal",
                 )?;
-                // Legacy reports an unknown type and an unknown field alike.
+                // An unknown type and an unknown field report the same error.
                 let unresolved = || {
                     LimboError::ParseError(format!(
                         "cannot resolve struct field '{field_name}' for struct_extract"
@@ -4646,7 +4646,7 @@ fn comparison_component(
     lhs: &ResolvedScopeExpr,
     rhs: &ResolvedScopeExpr,
 ) -> hir::ComparisonComponent {
-    // Like legacy and SQLite's sqlite3CompareAffinity, a numeric affinity on
+    // Like SQLite's sqlite3CompareAffinity, a numeric affinity on
     // either side compares as NUMERIC, even alone: REAL affinity would turn a
     // large integer into a float and lose its exact value.
     let lone = |affinity: Affinity| {

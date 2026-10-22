@@ -10,7 +10,7 @@ use crate::{
     },
     LimboError, Result,
 };
-use turso_parser::ast::{self, SortOrder, TableInternalId};
+use turso_parser::ast::{self, SortOrder};
 
 use super::{
     access_method::AccessMethod,
@@ -20,7 +20,7 @@ use super::{
 
 /// Target component in an ORDER BY/GROUP BY that may be a plain column or an expression.
 #[derive(Debug, PartialEq, Clone)]
-pub enum ColumnTarget<E = *const ast::Expr> {
+pub enum ColumnTarget<E> {
     Column(usize),
     RowId,
     Expr(E),
@@ -28,7 +28,7 @@ pub enum ColumnTarget<E = *const ast::Expr> {
 
 /// A convenience struct for representing a (table_no, column_target, [SortOrder]) tuple.
 #[derive(Debug, PartialEq, Clone)]
-pub struct ColumnOrder<I = TableInternalId, E = *const ast::Expr> {
+pub struct ColumnOrder<I, E> {
     pub source: I,
     pub target: ColumnTarget<E>,
     pub order: SortOrder,
@@ -76,7 +76,7 @@ pub enum OrderTargetPurpose {
 /// An [OrderTarget] is considered in join optimization and index selection,
 /// so that if a given join ordering and its access methods satisfy the [OrderTarget],
 /// then the join ordering and its access methods are preferred, all other things being equal.
-pub struct OrderTarget<I = TableInternalId, E = *const ast::Expr> {
+pub struct OrderTarget<I, E> {
     pub columns: Vec<ColumnOrder<I, E>>,
     pub purpose: OrderTargetPurpose,
 }
@@ -116,8 +116,8 @@ pub(crate) fn hir_plan_satisfies_order_target(
     schema: &Schema,
 ) -> Result<bool> {
     // A hash join scans its probe table first and looks the build table up,
-    // so its loops do not run in the plan's join order; legacy never keeps a
-    // hash join's order either.
+    // so its loops do not run in the plan's join order, and the order of a
+    // hash join is never kept.
     if plan.data.iter().any(|(_, method)| {
         matches!(
             access_methods.get(*method).map(|method| &method.params),
@@ -144,7 +144,7 @@ pub(crate) fn hir_plan_satisfies_order_target(
     let columns = order_target.columns.len();
     let mut consumed_columns = 0;
     for (loop_position, (source_position, access_method_position)) in plan.data.iter().enumerate() {
-        // Like legacy: a LEFT JOIN adds a NULL row after its scan or seek, so
+        // A LEFT JOIN adds a NULL row after its scan or seek, so
         // its order cannot give the terms that read its own columns. The
         // terms before them keep the order of the loops before it.
         if join_kind(*source_position) == Some(hir::JoinKind::Left)
@@ -160,8 +160,8 @@ pub(crate) fn hir_plan_satisfies_order_target(
         }
         let source = match sources.get(*source_position) {
             Some(HirPlanSource::BTree(source)) => source,
-            // Like legacy, a FROM subquery or CTE that is scanned returns its
-            // rows in its own order.
+            // A FROM subquery or CTE that is scanned returns its rows in its
+            // own order.
             Some(
                 HirPlanSource::Derived {
                     source: subquery_source,
@@ -249,7 +249,7 @@ pub(crate) fn hir_plan_satisfies_order_target(
         if consumed_columns == columns {
             return Ok(true);
         }
-        // Like legacy: a later loop can supply the next ORDER BY term only
+        // A later loop can supply the next ORDER BY term only
         // if this loop never repeats the values ordered so far, or the inner
         // loop would restart its order for each repeat.
         let next_comes_from_later_loop =
@@ -338,9 +338,8 @@ pub(crate) struct HirOutputOrder {
 }
 
 /// How many leading `target` columns a HIR FROM subquery or CTE returns its
-/// rows in when read in `iter_dir`, as legacy's
-/// [subquery_intrinsic_order_consumed] finds it. `output_order` is the order
-/// the subquery's plan returns its rows in; see `HirPlannedQuery`.
+/// rows in when read in `iter_dir`. `output_order` is the order the
+/// subquery's plan returns its rows in; see `HirPlannedQuery`.
 pub(crate) fn hir_subquery_intrinsic_order_consumed(
     source: hir::SourceId,
     output_order: &[HirOutputOrder],

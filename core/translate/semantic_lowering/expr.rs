@@ -272,7 +272,7 @@ impl LoweringContext {
     }
 }
 
-/// A constant operand computed once, as legacy computes it.
+/// A constant operand computed once.
 #[derive(Clone, Copy)]
 enum Hoisted {
     /// An operand without a function call, moved before the loops by this
@@ -527,8 +527,8 @@ impl<'expr> ExprLowerer<'_, 'expr, '_> {
         if let hir::ColumnReadExpression::Planned(expression) = generated {
             // A virtual column is computed from the decoded columns it reads
             // and never stored, so its value is neither decoded nor given a
-            // default. Legacy decodes it once more and reads 0 for
-            // `cents AS (a * 2)`, while its index holds 4.
+            // default: decoding it once more would read 0 for
+            // `cents AS (a * 2)` while its index holds 4.
             return (index == 0).then_some(ColumnChild::Generated(expression));
         }
 
@@ -1772,7 +1772,7 @@ impl<'expr> hir::ExprVisitor<'expr> for ExprLowerer<'_, 'expr, '_> {
 }
 
 impl<'expr> ExprLowerer<'_, 'expr, '_> {
-    /// Like legacy, an operand with the same value on every row, such as
+    /// An operand with the same value on every row, such as
     /// the `1` of `a + 1` or the `upper('x')` of `upper('x') || b`, is not
     /// computed again for each row. Without a function call or a CAST to a
     /// custom type it cannot fail, so it moves before the loops. A function
@@ -4697,9 +4697,9 @@ impl<'expr> hir::ExprVisitor<'expr> for ConditionLowerer<'_, 'expr> {
     }
 }
 
-/// Lower a value a condition tests into its own register. Like legacy, a
-/// value that is the same on every row, such as the `5` of `x = 5`, is
-/// computed once before the loops.
+/// Lower a value a condition tests into its own register. A value that is
+/// the same on every row, such as the `5` of `x = 5`, is computed once
+/// before the loops.
 fn translate_condition_operand(
     program: &mut ProgramBuilder,
     document: &hir::HirDocument,
@@ -4753,7 +4753,7 @@ fn hir_expr_is_constant(program: &ProgramBuilder, expression: &hir::Expr) -> boo
 }
 
 impl ConditionLowerer<'_, '_> {
-    /// Like legacy, a scalar comparison jumps on its own result instead of
+    /// A scalar comparison jumps on its own result instead of
     /// computing a truth value first: `WHERE x = 1` becomes one `Ne` that
     /// skips the row. As with a computed value, NULL counts as false. Returns
     /// false, having emitted nothing, for other expressions.
@@ -4918,11 +4918,10 @@ pub(crate) fn translate_expr_with_inputs_no_constant_opt<'expr>(
     result
 }
 
-/// Apply bound schema calls to a value already stored in `target`.
-/// Like legacy's per-element loop for arrays of a custom type: apply
-/// `calls` to each element of the array blob in `register`, then rebuild it.
-/// As in legacy, an array with more elements than the loop's register block
-/// fails the statement.
+/// Apply bound schema calls to a value already stored in `target`: apply
+/// `calls` to each element of the array blob in `register`, then rebuild
+/// it. An array with more elements than the loop's register block fails the
+/// statement.
 pub(crate) fn translate_schema_calls_on_elements(
     program: &mut ProgramBuilder,
     document: &hir::HirDocument,
@@ -5593,7 +5592,7 @@ mod tests {
     }
 
     #[test]
-    fn in_subquery_uses_the_bound_index_and_legacy_null_scan() {
+    fn in_subquery_uses_the_bound_index_and_branches_on_null_components() {
         let document = analyze_sql(
             crate::schema::Schema::new(),
             "SELECT (1, 2) IN (SELECT 3, 4)",
@@ -5617,8 +5616,8 @@ mod tests {
         super::translate_expr(&mut program, &document, expression, target)
             .expect("bound IN subquery lowers");
 
-        // Keep the legacy row evaluation order: after each component is
-        // evaluated, branch before evaluating the next component if it is NULL.
+        // After each component is evaluated, branch before evaluating the
+        // next component if it is NULL.
         assert!(matches!(
             program.insns.as_slice(),
             [
@@ -7319,7 +7318,7 @@ mod tests {
     }
 
     #[test]
-    fn like_uses_legacy_argument_order_and_resolved_function() {
+    fn like_passes_pattern_then_text_to_the_resolved_function() {
         let expression = hir::Expr::Like {
             lhs: Box::new(hir::Expr::Literal(Literal::String("'value'".to_string()))),
             negated: false,
@@ -9037,7 +9036,7 @@ mod tests {
     }
 
     #[test]
-    fn zero_argument_dialect_function_keeps_legacy_start_register() {
+    fn zero_argument_dialect_function_reserves_a_start_register() {
         let expression =
             ordinary_scalar_call(Func::Dialect("catalog_value".to_string()), Vec::new());
         let mut program = program();
@@ -9058,7 +9057,7 @@ mod tests {
     }
 
     #[test]
-    fn math_functions_keep_legacy_argument_registers() {
+    fn math_functions_read_arguments_from_consecutive_registers() {
         use crate::function::MathFunc;
 
         let cases = [
@@ -9191,7 +9190,7 @@ mod tests {
     }
 
     #[test]
-    fn plain_builtin_functions_use_legacy_argument_registers() {
+    fn plain_builtin_functions_read_arguments_from_consecutive_registers() {
         let mut empty_program = program();
         let expression = ordinary_scalar_call(Func::Scalar(ScalarFunc::Char), Vec::new());
 
@@ -9266,7 +9265,7 @@ mod tests {
     }
 
     #[test]
-    fn struct_pack_uses_legacy_make_array_register_shape() {
+    fn struct_pack_builds_its_array_from_consecutive_registers() {
         let mut empty_program = program();
         let empty = ordinary_scalar_call(Func::Scalar(ScalarFunc::StructPack), Vec::new());
 
@@ -9397,7 +9396,7 @@ mod tests {
     }
 
     #[test]
-    fn direct_like_functions_use_plain_legacy_argument_registers() {
+    fn direct_like_functions_read_plain_argument_registers() {
         for function in [ScalarFunc::Like, ScalarFunc::Glob] {
             for argument_count in [2, 3] {
                 let arguments = (0..argument_count)
@@ -9460,7 +9459,7 @@ mod tests {
     }
 
     #[test]
-    fn concat_ws_keeps_legacy_result_and_argument_registers() {
+    fn concat_ws_writes_its_result_after_the_argument_registers() {
         for argument_count in [2, 3] {
             let arguments = (0..argument_count)
                 .map(|value| hir::Expr::Literal(Literal::Numeric(value.to_string())))
@@ -9501,7 +9500,7 @@ mod tests {
     }
 
     #[test]
-    fn ifnull_keeps_legacy_short_circuit_register_and_opcode_shape() {
+    fn ifnull_short_circuits_on_the_first_non_null_argument() {
         let expression = ordinary_scalar_call(
             Func::Scalar(ScalarFunc::IfNull),
             vec![
@@ -9532,7 +9531,7 @@ mod tests {
     }
 
     #[test]
-    fn iif_keeps_legacy_branch_register_and_opcode_shapes() {
+    fn iif_branches_on_its_condition_register() {
         for (argument_count, expected_shape) in [
             (2, "condition if-not value goto null"),
             (
@@ -9577,7 +9576,7 @@ mod tests {
     }
 
     #[test]
-    fn coalesce_keeps_legacy_target_register_and_opcode_shape() {
+    fn coalesce_writes_the_first_non_null_argument_to_the_target() {
         for argument_count in [2, 3] {
             let arguments = (0..argument_count)
                 .map(|value| hir::Expr::Literal(Literal::Numeric(value.to_string())))
@@ -9599,7 +9598,7 @@ mod tests {
     }
 
     #[test]
-    fn last_insert_rowid_keeps_legacy_ignored_argument_behavior() {
+    fn last_insert_rowid_ignores_its_arguments() {
         for argument_count in [0, 2] {
             let arguments = (0..argument_count)
                 .map(|value| hir::Expr::Literal(Literal::Numeric(value.to_string())))
@@ -9629,7 +9628,7 @@ mod tests {
     }
 
     #[test]
-    fn version_functions_keep_legacy_output_register_and_copy_shape() {
+    fn version_functions_copy_their_constant_into_the_target() {
         for function in [
             ScalarFunc::SqliteVersion,
             ScalarFunc::TursoVersion,
@@ -9669,7 +9668,7 @@ mod tests {
     }
 
     #[test]
-    fn substring_functions_always_reserve_three_legacy_argument_registers() {
+    fn substring_functions_always_reserve_three_argument_registers() {
         for function in [ScalarFunc::Substr, ScalarFunc::Substring] {
             for argument_count in [2, 3] {
                 let arguments = (0..argument_count)
@@ -9702,7 +9701,7 @@ mod tests {
     }
 
     #[test]
-    fn empty_plain_functions_reserve_the_legacy_start_register() {
+    fn empty_plain_functions_reserve_a_start_register() {
         for function in [
             ScalarFunc::Changes,
             ScalarFunc::TotalChanges,

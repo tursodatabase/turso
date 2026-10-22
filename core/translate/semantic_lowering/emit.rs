@@ -1,8 +1,8 @@
 //! Small bytecode helpers for HIR DML lowering: foreign-key probes, cursor
 //! opening, constraint error text and statement journal flags.
 //!
-//! They are copies of legacy helpers, so HIR lowering does not depend on the
-//! legacy translate modules that will be deleted.
+//! They are shared by the INSERT, UPDATE and DELETE lowering and by the
+//! foreign-key and trigger modules.
 
 use std::num::NonZeroUsize;
 

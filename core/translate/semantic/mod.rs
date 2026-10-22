@@ -23,8 +23,8 @@ pub(crate) struct SemanticOptions {
     pub(crate) foreign_keys_enabled: bool,
     /// The table change data capture writes to, when it is on.
     pub(crate) capture_changes_table: Option<String>,
-    /// `full_column_names` on and `short_column_names` off: like legacy
-    /// and SQLite, `SELECT *` then names each column `source.column`.
+    /// `full_column_names` on and `short_column_names` off: like SQLite,
+    /// `SELECT *` then names each column `source.column`.
     pub(crate) long_column_names: bool,
 }
 

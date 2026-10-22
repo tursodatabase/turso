@@ -41,7 +41,7 @@ use crate::{
 use dml::Subprograms;
 
 /// Prepare a top-level SELECT through semantic HIR: analyze, plan, and lower
-/// it without the legacy binder, planner, or emitter.
+/// it.
 pub(crate) fn translate_select(
     statement: &ast::Stmt,
     context: &SemanticContext<'_>,
@@ -267,7 +267,7 @@ impl PlannedSelect {
     }
 
     /// Each column of the new table: the SELECT's output name, and the type
-    /// SQLite derives from the output's affinity, as legacy does.
+    /// SQLite derives from the output's affinity.
     pub(crate) fn columns(&self) -> Result<Vec<(String, &'static str)>> {
         let document = &self.plan.document;
         let query = document
@@ -282,8 +282,8 @@ impl PlannedSelect {
                 let output = document.output(*output).ok_or_else(|| {
                     LimboError::InternalError("HIR CTAS output is missing".into())
                 })?;
-                // Like legacy, a column read keeps its own name, without the
-                // table that qualifies it, unless it has an alias.
+                // A column read keeps its own name, without the table that
+                // qualifies it, unless it has an alias.
                 let name = match column.value {
                     ResolvedResultValue::Column(source) if !column.name_is_alias => {
                         source.column_name
@@ -416,9 +416,9 @@ pub(crate) fn translate_update(
     translate_update_with(statement, context, program, connection, None)
 }
 
-/// Prepare the UPDATE of the schema table that ALTER TABLE generates. Like
-/// legacy, it may write the schema table, and change data capture records
-/// `ddl`, the ALTER statement, as the new `sql` value.
+/// Prepare the UPDATE of the schema table that ALTER TABLE generates. It
+/// may write the schema table, and change data capture records `ddl`, the
+/// ALTER statement, as the new `sql` value.
 pub(crate) fn translate_schema_update(
     statement: &ast::Stmt,
     context: &SemanticContext<'_>,
@@ -537,8 +537,8 @@ fn check_target(
     statement: &str,
 ) -> Result<()> {
     let table_name = crate::util::normalize_ident(name.name.as_str());
-    // Like legacy, the statements the engine runs itself, such as VACUUM's,
-    // may write its internal tables.
+    // The statements the engine runs itself, such as VACUUM's, may write
+    // its internal tables.
     if !connection.is_nested_stmt()
         && !connection.is_mvcc_bootstrap_connection()
         && !crate::schema::allow_user_dml(&table_name)
@@ -558,7 +558,7 @@ fn check_target(
         crate::bail_parse_error!("materialized views on WITHOUT ROWID tables are not supported");
     }
     // The VM keeps dependent materialized views up to date as rows are
-    // written; like legacy, views built by another DBSP version are an error.
+    // written; views built by another DBSP version are an error.
     schema.with_incompatible_dependent_views(&table_name, |views| {
         if views.is_empty() {
             return Ok(());
@@ -703,7 +703,7 @@ fn analyze_and_plan(
 }
 
 /// Result-column metadata for a statement prepared from resolved HIR. It
-/// answers the same column-name and type questions as the legacy plan's
+/// answers the column-name and type questions `Statement` asks about its
 /// result columns, without parser expressions or table references.
 #[derive(Debug, Clone)]
 pub(crate) struct ResolvedResultColumn {
@@ -714,7 +714,7 @@ pub(crate) struct ResolvedResultColumn {
     pub(crate) value: ResolvedResultValue,
     pub(crate) affinity: Affinity,
     /// The type name `Statement::get_column_type_info` reports for a
-    /// computed value, inferred as legacy does.
+    /// computed value, inferred by [`expression_primitive`].
     pub(crate) primitive: Option<&'static str>,
 }
 
@@ -779,7 +779,7 @@ fn resolved_output_columns(
         .collect()
 }
 
-/// The type name of a computed value, by legacy's rules: a literal has its
+/// The type name of a computed value: a literal has its
 /// own type; arithmetic over two INTEGERs is INTEGER, over INTEGERs and REALs
 /// REAL, and NUMERIC otherwise; comparisons, logic and bitwise operators give
 /// INTEGER; `||` gives TEXT; anything else reports its affinity.
@@ -853,8 +853,8 @@ fn expression_primitive(document: &HirDocument, expression: &hir::Expr) -> Optio
     }
 }
 
-/// The affinity legacy gives an operand: a column's or CAST's own, and
-/// none for other expressions.
+/// The affinity of an operand: a column's or CAST's own, and none for other
+/// expressions.
 fn expression_affinity(document: &HirDocument, expression: &hir::Expr) -> Affinity {
     match expression {
         hir::Expr::Column(reference) => document
@@ -904,8 +904,7 @@ fn resolved_result_value(
                 ))
             })?;
             let declared = column.type_fact.declared.as_ref();
-            // Like legacy, a subquery column that reads a rowid is declared
-            // INTEGER.
+            // A subquery column that reads a rowid is declared INTEGER.
             let reads_rowid = declared.is_none()
                 && matches!(
                     &source.kind,
@@ -930,8 +929,8 @@ fn resolved_result_value(
                 )
             };
             Ok(ResolvedResultValue::Column(ResolvedResultSourceColumn {
-                // Legacy reports a FROM subquery by its alias and a CTE by
-                // its name.
+                // A FROM subquery is reported by its alias and a CTE by its
+                // name.
                 table_name: match (&source.kind, &source.alias) {
                     (hir::SourceKind::Derived(_), Some(alias)) => alias.clone(),
                     _ => source.name.clone(),

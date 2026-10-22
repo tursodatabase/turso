@@ -1,7 +1,7 @@
 //! Row triggers compiled from HIR.
 //!
 //! Each trigger is analyzed into its own HIR document and lowered into its
-//! own subprogram, like legacy's. The subprogram reads the OLD and NEW rows
+//! own subprogram. The subprogram reads the OLD and NEW rows
 //! from its parameters into registers and binds the trigger's OLD and NEW
 //! sources to them; nothing in the trigger body is rewritten. The firing
 //! statement passes the registers holding its rows with `Insn::Program`.
@@ -62,7 +62,7 @@ pub(super) struct TriggerRow {
 
 /// Compile `triggers`, the triggers on `table` in `database` that the
 /// statement fires. A trigger that is already being compiled further up is
-/// left out, as legacy does.
+/// left out.
 pub(super) fn compile_triggers(
     session: &HirSession<'_>,
     parent: &ProgramBuilder,
@@ -288,8 +288,8 @@ fn compile_trigger(
 }
 
 /// Compile the triggers an INSERT fires.
-/// Like legacy, an INSERT's conflict clause other than ABORT also applies
-/// inside its triggers.
+/// An INSERT's conflict clause other than ABORT also applies inside its
+/// triggers.
 pub(super) fn insert_triggers(
     session: &HirSession<'_>,
     parent: &ProgramBuilder,
@@ -314,9 +314,8 @@ pub(super) fn insert_triggers(
     )
 }
 
-/// Compile the UPDATE triggers an UPSERT's DO UPDATE fires. Like legacy, an
-/// OR IGNORE or OR REPLACE inside them does not hide an error: they run with
-/// ABORT.
+/// Compile the UPDATE triggers an UPSERT's DO UPDATE fires. An OR IGNORE or
+/// OR REPLACE inside them does not hide an error: they run with ABORT.
 pub(super) fn upsert_update_triggers(
     session: &HirSession<'_>,
     parent: &ProgramBuilder,
@@ -378,7 +377,7 @@ pub(super) fn delete_triggers(
         plan,
         delete.target,
         triggers,
-        // Like SQLite and legacy, a DELETE fires its triggers with the
+        // Like SQLite, a DELETE fires its triggers with the
         // default conflict policy, even inside a trigger fired by an OR
         // REPLACE statement.
         None,

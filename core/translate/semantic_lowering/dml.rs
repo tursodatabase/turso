@@ -30,7 +30,8 @@ use super::{HirPlan, HirSession};
 use crate::translate::semantic_to_plan::HirPlannedLoop;
 
 /// The subprograms a DML statement fires. They are compiled before anything
-/// is emitted, so one that needs legacy leaves the whole statement to it.
+/// is emitted, so one that fails to compile fails the whole statement before
+/// any bytecode is emitted.
 #[derive(Default)]
 pub(super) struct Subprograms<'a> {
     /// The statement's row triggers.
@@ -212,7 +213,7 @@ impl<'a> DmlTarget<'a> {
                 continue;
             }
             // An index method without a B-tree of its own (such as FTS) gets
-            // its own kind of cursor, as in legacy.
+            // its own kind of cursor.
             let cursor = program.alloc_cursor_index(None, &expressions.index.handle())?;
             program.emit_insn(Insn::OpenWrite {
                 cursor_id: cursor,
@@ -280,8 +281,8 @@ pub(super) fn emit_access_predicates(
 }
 
 /// Read one index's key for the current row, followed by the rowid. Values
-/// come from the table row, like legacy's old-image reads: plain columns are
-/// read as stored, and generated columns and expressions are computed.
+/// come from the table row: plain columns are read as stored, and generated
+/// columns and expressions are computed.
 pub(super) fn emit_index_key(
     program: &mut ProgramBuilder,
     document: &HirDocument,
@@ -352,10 +353,10 @@ fn emit_index_key_values(
     Ok((start, count))
 }
 
-/// REPLACE: delete the row whose rowid is in `conflict`, as legacy does:
-/// the foreign-key checks of deleting it, its entry in each of `indexes`,
-/// then the row. No DELETE trigger fires. The target is left bound to
-/// `table_cursor`, which no longer sits on any row.
+/// REPLACE: delete the row whose rowid is in `conflict`: the foreign-key
+/// checks of deleting it, its entry in each of `indexes`, then the row. No
+/// DELETE trigger fires. The target is left bound to `table_cursor`, which
+/// no longer sits on any row.
 ///
 /// `replacement` is the row an UPDATE writes in its place: an immediate NO
 /// ACTION parent key it keeps cannot leave a child without its parent.
@@ -400,8 +401,7 @@ pub(super) fn emit_replace_delete(
         database,
         replacement,
     )?;
-    // Like legacy, the ON DELETE actions of the deleted row run once it is
-    // gone.
+    // The ON DELETE actions of the deleted row run once it is gone.
     let action_keys = actions
         .iter()
         .map(|action| {
@@ -469,8 +469,6 @@ pub(super) fn operation_index(operation: &HirBtreeOperation) -> Option<&Arc<crat
     }
 }
 
-/// Legacy's single-row test for a DML access path: a rowid lookup, or a
-/// seek where every column of a unique index (or the rowid) is fixed by `=`.
 /// Run the statement's loop with read cursors and collect the rowid of each
 /// row it finds into a row set, then close those cursors. The loop reads the
 /// table, an index, or one seek per branch of an OR term. Returns the row
@@ -512,6 +510,8 @@ pub(super) fn collect_target_rowids(
     Ok(rowset)
 }
 
+/// Whether a DML access path finds at most one row: a rowid lookup, or a
+/// seek where every column of a unique index (or the rowid) is fixed by `=`.
 pub(super) fn touches_at_most_one_row(operation: &HirBtreeOperation) -> bool {
     use crate::translate::plan::SeekKeyComponent;
     match operation {
@@ -573,7 +573,7 @@ pub(super) fn virtual_target(
     })
 }
 
-/// Like legacy, `sqlite_dbpage` may be written only by a cli_only build
+/// `sqlite_dbpage` may be written only by a cli_only build
 /// opened with unsafe testing on; every other read-only virtual table
 /// rejects writes.
 pub(super) fn dbpage_write_allowed(
@@ -591,9 +591,9 @@ pub(super) fn dbpage_write_allowed(
     }
 }
 
-/// Open a virtual table for writing, as legacy does: the rows a statement
-/// writes are handed to the table with `VUpdate` through this cursor, inside
-/// the table's own transaction.
+/// Open a virtual table for writing: the rows a statement writes are handed
+/// to the table with `VUpdate` through this cursor, inside the table's own
+/// transaction.
 pub(super) fn open_virtual_for_write(
     program: &mut ProgramBuilder,
     table: &Arc<crate::vtab::VirtualTable>,
@@ -604,8 +604,8 @@ pub(super) fn open_virtual_for_write(
     cursor
 }
 
-/// RETURNING rows of a DML statement. Like legacy, they wait in an
-/// ephemeral table until every row is written, then are returned.
+/// RETURNING rows of a DML statement. They wait in an ephemeral table
+/// until every row is written, then are returned.
 #[derive(Clone, Copy)]
 pub(super) struct ReturningBuffer<'a> {
     cursor: CursorID,
@@ -723,7 +723,7 @@ impl<'a> ReturningBuffer<'a> {
 
     /// After the last row is written: return the buffered rows.
     pub(super) fn emit_rows(&self, program: &mut ProgramBuilder) {
-        // Legacy checks foreign keys before returning any row.
+        // Foreign keys are checked before any row is returned.
         program.emit_insn(Insn::FkCheck { deferred: false });
         let done = program.allocate_label();
         let next = program.allocate_label();
@@ -755,12 +755,8 @@ impl<'a> ReturningBuffer<'a> {
     }
 }
 
-/// Check each CHECK constraint against the new row, which the constraint's
-/// source must be bound to. Like SQLite, a NULL result passes. A failure
-/// skips the row under IGNORE and stops the statement otherwise; REPLACE
-/// does not apply to CHECK.
-/// Run `emit` reading custom-typed columns as stored, not decoded. Like
-/// legacy, CHECK constraints compare stored values.
+/// Run `emit` reading custom-typed columns as stored, not decoded. CHECK
+/// constraints compare stored values.
 pub(super) fn with_stored_values<T>(
     program: &mut ProgramBuilder,
     emit: impl FnOnce(&mut ProgramBuilder) -> Result<T>,
@@ -772,6 +768,10 @@ pub(super) fn with_stored_values<T>(
     result
 }
 
+/// Check each CHECK constraint against the new row, which the constraint's
+/// source must be bound to. Like SQLite, a NULL result passes. A failure
+/// skips the row under IGNORE and stops the statement otherwise; REPLACE
+/// does not apply to CHECK.
 pub(super) fn emit_check_constraints<'c>(
     program: &mut ProgramBuilder,
     document: &HirDocument,
@@ -864,8 +864,8 @@ pub(super) fn check_strict_types(table: &BTreeTable, source: &hir::Source) -> Re
 }
 
 /// STRICT: check each value of the row in `start..` against its column's
-/// type, converting it where SQLite allows and failing otherwise, as legacy
-/// does. A STRICT table gets this instead of column affinity.
+/// type, converting it where SQLite allows and failing otherwise. A STRICT
+/// table gets this instead of column affinity.
 pub(super) fn emit_strict_type_check(
     program: &mut ProgramBuilder,
     table: &Arc<BTreeTable>,
@@ -911,10 +911,10 @@ pub(super) fn has_custom_types(source: &hir::Source) -> bool {
             .any(|column| column.type_fact.is_array())
 }
 
-/// STRICT with custom types, as legacy does it: check each value in
-/// `start..` against the type its column accepts as input, encode it, then
-/// check the encoded value against the column's base type. Only the columns
-/// at `only` are checked as input and encoded; `None` means all of them.
+/// STRICT with custom types: check each value in `start..` against the type
+/// its column accepts as input, encode it, then check the encoded value
+/// against the column's base type. Only the columns at `only` are checked as
+/// input and encoded; `None` means all of them.
 pub(super) fn emit_custom_type_writes(
     program: &mut ProgramBuilder,
     document: &HirDocument,
@@ -934,8 +934,8 @@ pub(super) fn emit_custom_type_writes(
                 }
                 continue;
             }
-            // Like legacy, an array is given as text or a blob, and is
-            // stored as a record blob.
+            // An array is given as text or a blob, and is stored as a
+            // record blob.
             if column.is_array() {
                 column.ty_str = if input { "ANY" } else { "BLOB" }.to_string();
                 column.override_affinity(crate::vdbe::affinity::Affinity::Blob);
@@ -960,8 +960,8 @@ pub(super) fn emit_custom_type_writes(
         check_generated: true,
         table_reference: check_table(true),
     });
-    // Like legacy, an array is parsed and its elements checked against the
-    // element type, then stored as a record blob. Only the outer array of a
+    // An array is parsed and its elements checked against the element
+    // type, then stored as a record blob. Only the outer array of a
     // multi-dimensional one checks nothing but that its elements are arrays.
     for (position, column) in table.columns().iter().enumerate() {
         if !column.is_array() || column.is_virtual_generated() || !written(position) {
@@ -974,10 +974,10 @@ pub(super) fn emit_custom_type_writes(
             target_pc: skip,
         });
         let any = column.ty_str.eq_ignore_ascii_case("ANY") || column.array_dimensions() > 1;
-        // Like legacy, the elements of an array of a custom type are
-        // encoded one by one: the text or blob is first parsed as an array
-        // of anything, each element encoded, then the array checked against
-        // the element type like any other.
+        // The elements of an array of a custom type are encoded one by
+        // one: the text or blob is first parsed as an array of anything,
+        // each element encoded, then the array checked against the element
+        // type like any other.
         if let Some(programs) = source
             .column_type_programs
             .get(position)
@@ -1055,10 +1055,10 @@ pub(super) fn emit_custom_type_writes(
 }
 
 /// Compute each virtual generated column of the row in registers
-/// `start + column` into its register, in dependency order, as legacy does.
-/// `source` must be bound to those registers. Reads of the row through
-/// `source` compute virtual columns anyway; this fills the registers that
-/// are copied directly, such as index keys, NOT NULL checks and triggers.
+/// `start + column` into its register, in dependency order. `source` must be
+/// bound to those registers. Reads of the row through `source` compute
+/// virtual columns anyway; this fills the registers that are copied
+/// directly, such as index keys, NOT NULL checks and triggers.
 pub(super) fn emit_virtual_columns(
     program: &mut ProgramBuilder,
     document: &HirDocument,

@@ -24,10 +24,10 @@ impl<'ast> Analyzer<'_, '_, 'ast> {
         hir::CatalogObject::new(id, self.context().snapshot(), Some(database), trigger)
     }
 
-    /// The triggers on `table` that `selected` accepts, frozen. Like legacy,
-    /// these are the table's own database's triggers, then temp triggers for
-    /// it: those that name the table's database, or name no database while
-    /// temp has no table of that name.
+    /// The triggers on `table` that `selected` accepts, frozen. These are
+    /// the table's own database's triggers, then temp triggers for it: those
+    /// that name the table's database, or name no database while temp has
+    /// no table of that name.
     pub(super) fn table_triggers(
         &mut self,
         table: &hir::ResolvedTable,
@@ -48,7 +48,7 @@ impl<'ast> Analyzer<'_, '_, 'ast> {
         let temp = hir::DatabaseId::new(crate::TEMP_DB_ID);
         if database != temp {
             if let Ok(temp_schema) = self.context().schema(temp) {
-                // Like legacy and SQLite, temp triggers fire first. Each one
+                // Like SQLite, temp triggers fire first. Each one
                 // found is put in front, so they end up in the reverse of
                 // the order the temp schema lists them.
                 let mut temp_triggers = temp_schema
@@ -75,8 +75,8 @@ impl<'ast> Analyzer<'_, '_, 'ast> {
     }
 
     /// The table change data capture writes the target's row changes to.
-    /// Like legacy, changes to the capture table itself and to its version
-    /// table are not captured.
+    /// Changes to the capture table itself and to its version table are not
+    /// captured.
     pub(super) fn analyze_capture_changes(
         &mut self,
         target: &hir::ResolvedTable,
@@ -222,7 +222,7 @@ impl<'ast> Analyzer<'_, '_, 'ast> {
                     let expanded = scope.expand_star()?;
                     self.append_returning_star_outputs(&mut outputs, expanded, &scope)?;
                 }
-                // Like SQLite and legacy, only a bare `*` expands here.
+                // Like SQLite, only a bare `*` expands here.
                 ast::ResultColumn::TableStar(_) => {
                     crate::bail_parse_error!("RETURNING may not use \"TABLE.*\" wildcards");
                 }
@@ -285,8 +285,8 @@ impl<'ast> Analyzer<'_, '_, 'ast> {
         let parent_unique_index = foreign_key
             .parent_unique_index
             .map(|index| self.freeze_foreign_key_index(database, index));
-        // Like legacy, the child index must list exactly the child columns,
-        // in the same order.
+        // The child index must list exactly the child columns, in the same
+        // order.
         let child_index = self
             .context()
             .schema(database)?

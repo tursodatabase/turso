@@ -9,7 +9,7 @@ use crate::{
     LimboError, Result,
 };
 
-/// Emit the runtime range check shared by legacy and HIR percentile lowering.
+/// Emit the runtime range check for a percentile fraction argument.
 /// NULL is accepted here and propagated by aggregate finalization.
 pub(crate) fn emit_percentile_fraction_range_check(program: &mut ProgramBuilder, fraction: usize) {
     // NULL skips the range check and propagates to a NULL result in finalize.
@@ -261,7 +261,7 @@ pub(crate) fn translate_hir_aggregation_step(
     distinct: Option<&HirAggregateDistinct>,
     fraction_reg: Option<usize>,
 ) -> Result<usize> {
-    // Like legacy.
+    // Only ordered-set aggregates may carry an ORDER BY on their arguments.
     if !call.arguments.order_terms().is_empty()
         && !matches!(call.arguments, hir::FunctionArguments::OrderedSet { .. })
     {

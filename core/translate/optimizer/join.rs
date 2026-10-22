@@ -124,8 +124,8 @@ fn rows_after_join<E>(
     input_cardinality * method.estimated_rows_per_outer_row * remaining_filter_selectivity
 }
 
-/// Legacy's [count_subquery_calls_for_plan] for a HIR block: how many times
-/// each correlated subquery runs, counted from the rows that reach the join
+/// How many times each correlated subquery of a HIR block runs under a
+/// join plan, counted from the rows that reach the join
 /// step where the last block source it reads is joined. Each subquery comes
 /// with the block sources it reads, as positions, and the position of the
 /// first predicate it appears in: that predicate and the ones after it run
@@ -421,7 +421,7 @@ fn join_ordering_restrictions<T>(
     })
 }
 
-/// Build HIR restrictions with the same code used by the legacy join planner.
+/// The join-ordering restrictions of HIR sources, read from their join kinds.
 pub(crate) fn hir_join_ordering_restrictions(
     sources: &[HirPlanSource],
 ) -> Result<JoinOrderingRestrictions> {
@@ -538,7 +538,7 @@ struct HirPartialJoin {
     cost: Cost,
 }
 
-/// Choose an HIR join order. Like legacy, small joins try every order,
+/// Choose an HIR join order. Small joins try every order,
 /// building the cheapest plan for each set of sources and last source from
 /// the plans of its subsets, and keep both the cheapest plan and the
 /// cheapest one that returns rows in the order target's order. Larger joins
@@ -663,8 +663,8 @@ pub(crate) fn compute_hir_join_order(
             return Ok(None);
         };
         let mut method = next.access_method;
-        // Like legacy, a table nothing joins to the tables before it pays for
-        // the cross product.
+        // A table nothing joins to the tables before it pays for the cross
+        // product.
         let connected = predicate_work
             .iter()
             .any(|work| work.table_mask.get(rhs) && work.table_mask.intersects(lhs_mask));
@@ -701,8 +701,8 @@ pub(crate) fn compute_hir_join_order(
         }))
     };
 
-    // Like legacy, the plan that joins the tables in FROM order goes first and
-    // only a strictly cheaper plan replaces it.
+    // The plan that joins the tables in FROM order goes first and only a
+    // strictly cheaper plan replaces it.
     let mut from_order: Option<HirPartialJoin> = memo
         .get(&{
             let mut mask = TableMask::default();
@@ -762,8 +762,9 @@ pub(crate) fn compute_hir_join_order(
                 }
             }
             if subset_size == sources.len() {
-                // Visit the finished plans in the same map order as legacy so
-                // that equally cheap plans resolve the same way.
+                // Visit the finished plans in the map's order, which is the
+                // same on every run, so equally cheap plans resolve the same
+                // way.
                 complete.extend(best_by_last.into_values());
             } else if !best_by_last.is_empty() {
                 memo.insert(mask, best_by_last);
@@ -849,7 +850,7 @@ pub(crate) fn compute_hir_join_order(
 /// Build a left-deep HIR join plan using the existing greedy rules.
 ///
 /// HIR supports B-tree, virtual-table, derived, and CTE scans. Hash joins and
-/// multi-index scans remain optional legacy optimizations.
+/// OR-by-union seeks are tried only when `hash` and `or_union` allow them.
 #[allow(clippy::too_many_arguments)]
 #[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn compute_hir_greedy_join_order(
@@ -1130,10 +1131,10 @@ fn hir_join_step(
                     params,
                 )?;
                 // A scan may later become one seek per branch of an OR term,
-                // so the join order weighs that union's cost, as legacy
-                // weighs its multi-index OR. When the union beats a scan or
-                // a temporary index, the step is a scan at the union's cost,
-                // which access planning then turns into the union.
+                // so the join order weighs that union's cost. When the union
+                // beats a scan or a temporary index, the step is a scan at
+                // the union's cost, which access planning then turns into
+                // the union.
                 let scans_or_builds = matches!(
                     &method.params,
                     AccessMethodParams::BTreeTable {
@@ -1165,8 +1166,8 @@ fn hir_join_step(
                                 constraint_refs: Vec::new(),
                             },
                         };
-                        // Like legacy, both sides count the WHERE terms the
-                        // rows they return still have to pass.
+                        // Both sides count the WHERE terms the rows they
+                        // return still have to pass.
                         let with_where = |method: &AccessMethod| {
                             super::access_method::cost_with_where_work(
                                 method,
@@ -1307,18 +1308,18 @@ fn hir_join_step(
     }))
 }
 
-/// Whether and how a HIR block may use legacy's hash joins.
+/// Whether and how a HIR block may use hash joins.
 pub(crate) struct HirHashJoins<'a> {
     /// Whether the block may hash at all. A block that may run again, such as
     /// a subquery, does not: a hash table that moved rows to disk cannot be
     /// probed again after its waiting lookups ran.
     pub(crate) allowed: bool,
     /// Whether a hash table may be built from the joined rows of the loops
-    /// before the probe, legacy's materialized build input
+    /// before the probe, a build input
     /// ([crate::translate::semantic_to_plan::HirHashBuildInput]).
     pub(crate) materialize: bool,
-    /// The sources a correlated subquery of the block reads. Like legacy, a
-    /// hash join never reads them.
+    /// The sources a correlated subquery of the block reads. A hash join
+    /// never reads them.
     pub(crate) subquery_reads: &'a [hir::SourceId],
 }
 
@@ -1405,8 +1406,8 @@ fn hir_plain_rowid_table(document: &HirDocument, source: &HirPlanSource, schema:
             .all(|column| !column.type_fact.is_array())
 }
 
-/// Port of legacy's `try_hash_join_access_method` for HIR sources: a hash
-/// join that builds a hash table from `build` and scans `probe`.
+/// A hash join of HIR sources that builds a hash table from `build` and
+/// scans `probe`, if the two may be hashed together.
 #[allow(clippy::too_many_arguments)]
 fn hir_try_hash_join_access_method(
     document: &HirDocument,
@@ -1458,7 +1459,7 @@ fn hir_try_hash_join_access_method(
     else {
         return None;
     };
-    // FULL OUTER has no nested-loop form in legacy, so it hashes even then.
+    // Two reads of one table are not hashed, except for a FULL OUTER join.
     if build_table.root_page == probe_table.root_page && hash_join_type != HashJoinType::FullOuter {
         return None;
     }
@@ -1484,8 +1485,8 @@ fn hir_try_hash_join_access_method(
 
     // Port of `find_hash_join_keys`: `=` terms whose sides each read one of
     // the two tables. An outer join condition belongs to that join only.
-    // Unlike legacy, an outer hash join takes its keys from its own ON terms
-    // only: a WHERE term used as a key would never be checked on the rows
+    // An outer hash join takes its keys from its own ON terms only: a WHERE
+    // term used as a key would never be checked on the rows
     // the join NULL-fills, which it must reject (`... FULL JOIN u ON t.x =
     // u.x WHERE t.x = u.x` returns the matched rows only).
     let mut join_keys: SmallVec<[HashJoinKey; 2]> = SmallVec::new();
@@ -1521,8 +1522,8 @@ fn hir_try_hash_join_access_method(
             build_side,
         });
     }
-    // HIR's hash table needs at least one key; legacy hashes a FULL JOIN
-    // without one into a single bucket, which HIR runs as a nested loop.
+    // The hash table needs at least one key; a FULL JOIN without one runs
+    // as a nested loop.
     if join_keys.is_empty() {
         return None;
     }
@@ -1660,8 +1661,8 @@ fn hir_try_hash_join_access_method(
     })
 }
 
-/// Port of the hash-join part of legacy's `join_lhs_and_rhs`: when the
-/// sources before `rhs` end with a table read by a plain scan, a hash join
+/// The hash-join candidate of a join step: when the sources before `rhs`
+/// end with a table read by a plain scan, a hash join
 /// may build a hash table from that table and scan `rhs`, probing it. It is
 /// chosen when it costs less than `nested_loop`, the best way to read `rhs`
 /// in a nested loop.
@@ -1859,8 +1860,8 @@ fn hir_hash_join_candidate(
     // after each pass of the probe loop, with the earlier loops' rows. That
     // is right for LEFT, whose build rows pair with those rows, but not for
     // the probe rows FULL adds, which no row of the earlier loops may match
-    // and must come out once (legacy repeats them). A build input folds the
-    // earlier loops into the hash table, so the probe loop runs once.
+    // and must come out once. A build input folds the earlier loops into
+    // the hash table, so the probe loop runs once.
     if lhs_steps.len() > 1
         && !should_materialize
         && sources[rhs]
@@ -1873,10 +1874,10 @@ fn hir_hash_join_candidate(
         if !hash.materialize {
             return Ok(None);
         }
-        // Like legacy: the hash table is built from the rows of the loops
-        // before the probe, stored once, so it holds the rows those loops
-        // keep and the probe scan runs once. Between such plans, legacy
-        // prefers the one whose build is filtered by earlier tables.
+        // The hash table is built from the rows of the loops before the
+        // probe, stored once, so it holds the rows those loops keep and the
+        // probe scan runs once. Between such plans, the tie-breaker prefers
+        // the one whose build includes earlier tables.
         let tie_breaker = prior_mask.iter().min().unwrap_or(0) as f64 * 1.0e-6;
         method.cost = estimate_hash_join_cost(
             estimated_filtered_rows,
@@ -2258,7 +2259,7 @@ fn generate_join_bitmasks(table_number_max_exclusive: usize, how_many: usize) ->
 mod tests {
     use std::sync::Arc;
 
-    use turso_parser::ast::{self, Expr, Operator, TableInternalId};
+    use turso_parser::ast::{self, Expr, Operator};
 
     use super::*;
     use crate::alloc::TursoSliceExt;
@@ -2859,16 +2860,6 @@ mod tests {
         assert!(restrictions.allows_order(&[0, 1])?);
         assert!(!restrictions.allows_order(&[1, 0])?);
         Ok(())
-    }
-
-    /// Creates a column expression
-    fn _create_column_expr(table: TableInternalId, column: usize, is_rowid_alias: bool) -> Expr {
-        Expr::Column {
-            database: None,
-            table,
-            column,
-            is_rowid_alias,
-        }
     }
 
     /// Creates a numeric literal expression

@@ -16,8 +16,6 @@ use crate::{
 use std::{marker::PhantomData, ops::Range, sync::Arc};
 use turso_parser::ast::{self, Expr};
 
-use turso_parser::ast::TableInternalId;
-
 /// The most sources one FROM clause may join: a join bitmask fits in 64 bits.
 pub(crate) const MAX_JOINED_TABLES: usize = 63;
 
@@ -135,8 +133,8 @@ impl PredicateExpr for crate::translate::semantic::hir::Expr {
     }
 }
 
-/// The conjuncts of an HIR predicate for planning, rewritten like legacy so
-/// that each can drive an index seek and be consumed on its own:
+/// The conjuncts of an HIR predicate for planning, rewritten so that each
+/// can drive an index seek and be consumed on its own:
 ///
 /// - `x BETWEEN a AND b` on a column becomes `x >= a` and `x <= b`, as
 ///   SQLite also does;
@@ -382,16 +380,6 @@ pub struct RecursiveCteQueueKey {
     /// `None` when the index sort order already puts NULLs in the requested
     /// position.
     pub nulls_override: Option<ast::NullsOrder>,
-}
-
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
-pub struct JoinOrderMember {
-    /// The internal ID of the source.
-    pub table_id: TableInternalId,
-    /// The position of the source in the FROM clause.
-    pub original_idx: usize,
-    /// Whether this member is the right side of an OUTER JOIN
-    pub is_outer: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -2537,6 +2525,7 @@ mod tests {
 
     #[test]
     fn test_bitset_with_table_internal_id() -> TestResult {
+        use turso_parser::ast::TableInternalId;
         let a = TableInternalId::from(3);
         let b = TableInternalId::from(70); // exercises overflow path
         let c = TableInternalId::from(200);

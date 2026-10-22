@@ -34,8 +34,9 @@ pub fn sequence_backing_table_name(seq_name: &str) -> String {
     String::from(SEQ_BACKING_TABLE_PREFIX) + seq_name
 }
 
-/// Legacy catalog lookup kept outside sequence bytecode emission. Resolved HIR
-/// callers already own this table and bypass this helper.
+/// Look up the backing table of a sequence in the catalog. Only the change
+/// data capture change-id emitter needs this; HIR sequence operations carry
+/// this table directly.
 pub(crate) fn resolve_sequence_backing_table(
     catalog: &SemanticContext<'_>,
     database_id: usize,
@@ -53,8 +54,9 @@ pub(crate) fn resolve_sequence_backing_table(
         })
 }
 
-/// Legacy catalog lookup for the optional SQLite compatibility table. HIR
-/// sequence operations carry this object directly.
+/// Look up the optional `sqlite_sequence` compatibility table of an
+/// AUTOINCREMENT sequence in the catalog. HIR sequence operations carry this
+/// table directly.
 pub(crate) fn resolve_autoincrement_sqlite_sequence(
     catalog: &SemanticContext<'_>,
     database_id: usize,
@@ -731,11 +733,10 @@ pub fn emit_disk_advance_past(
 /// time nextval / advance_past inserts a new watermark row, so the
 /// backing table stays at exactly one row across the run.
 ///
-/// Replaces the legacy commit-time compaction that ran via
-/// `prepare_internal()` from inside a vdbe handler. Keeping the loop
-/// here (in bytecode emitted at prepare time) preserves the vdbe async
-/// contract — every page read is a normal `StepResult::IO` yield, not
-/// a synchronous `pager.io.step()` drive.
+/// The loop is bytecode emitted at prepare time, not a statement run from
+/// inside a vdbe handler at commit time, which preserves the vdbe async
+/// contract — every page read is a normal `StepResult::IO` yield, not a
+/// synchronous `pager.io.step()` drive.
 pub(crate) fn emit_backing_table_compaction(
     program: &mut ProgramBuilder,
     cursor_id: usize,

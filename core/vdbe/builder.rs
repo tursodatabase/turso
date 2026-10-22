@@ -3,7 +3,7 @@ use crate::{alloc, turso_assert, turso_assert_eq, Result, Value, ValueRef};
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 use std::ops::Range;
 use tracing::{instrument, Level};
-use turso_parser::ast::{self, ResolveType, SortOrder, TableInternalId};
+use turso_parser::ast::{self, ResolveType, SortOrder};
 
 use crate::{
     index_method::IndexMethodAttachment,
@@ -33,8 +33,6 @@ use std::num::NonZeroUsize;
 /// The resolved source that owns a cursor.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CursorOwner {
-    /// Parser-AST identity used by the legacy translator.
-    TableReference(TableInternalId),
     /// Document-local identity used by HIR lowering.
     Source(SourceId),
 }
@@ -94,32 +92,6 @@ pub struct CursorKey {
 }
 
 impl CursorKey {
-    pub fn table(table_reference_id: TableInternalId) -> Self {
-        Self {
-            owner: CursorOwner::TableReference(table_reference_id),
-            index: None,
-            is_build: false,
-        }
-    }
-
-    pub fn index(table_reference_id: TableInternalId, index: Arc<Index>) -> Self {
-        Self {
-            owner: CursorOwner::TableReference(table_reference_id),
-            index: Some(index),
-            is_build: false,
-        }
-    }
-
-    /// Create a cursor key for hash join build operations.
-    /// This creates a separate cursor from the regular table cursor.
-    pub fn hash_build(table_reference_id: TableInternalId) -> Self {
-        Self {
-            owner: CursorOwner::TableReference(table_reference_id),
-            index: None,
-            is_build: true,
-        }
-    }
-
     pub fn source(source: SourceId) -> Self {
         Self {
             owner: CursorOwner::Source(source),
@@ -211,7 +183,7 @@ pub struct ProgramBuilder {
         Vec<crate::translate::semantic_lowering::ResolvedResultColumn>,
     /// Instruction, the function to execute it with, and its original index in the vector.
     pub insns: Vec<(Insn, usize)>,
-    /// Registry of materialized CTEs, keyed by legacy or HIR identity.
+    /// Registry of materialized CTEs, keyed by HIR CTE identity.
     /// Used to share materialized data across multiple CTE references via OpenDup.
     materialized_ctes: HashMap<MaterializedCteKey, MaterializedCteInfo>,
     /// If this ProgramBuilder is building trigger subprogram, a ref to the trigger is stored here.

@@ -399,13 +399,13 @@ pub(crate) struct HirOrUnion {
     pub(crate) term: usize,
     /// Every condition of every branch is applied by that branch's seek, so
     /// the rows the seeks find are exactly the rows the OR term accepts.
-    /// Then, like legacy, the term is not checked again on each row, and a
-    /// subquery in it is not run a second time.
+    /// Then the term is not checked again on each row, and a subquery in it
+    /// is not run a second time.
     pub(crate) covers_term: bool,
 }
 
-/// Like legacy's OR-by-union: plan `source` as one seek per branch of one of
-/// its OR terms, when every branch can seek an index or the rowid and the
+/// OR-by-union: plan `source` as one seek per branch of one of its OR
+/// terms, when every branch can seek an index or the rowid and the
 /// seeks together cost less than scanning the table. Unless the seeks apply
 /// every condition of the term ([`HirOrUnion::covers_term`]), the term is
 /// left in WHERE and checked again on each row read.
@@ -571,8 +571,8 @@ pub(crate) fn hir_or_union_with_cost(
                 prior_sources,
                 source_position,
             )?);
-            // Like legacy, a branch whose leftover condition runs a subquery
-            // keeps the table scanned.
+            // A branch whose leftover condition runs a subquery keeps the
+            // table scanned.
             let leftover_runs_subquery = terms.iter().any(|term| {
                 let mut runs = false;
                 if !term.consumed {
@@ -640,10 +640,9 @@ pub(crate) fn apply_hir_selected_btree_access(
 
 /// The seek of a FROM subquery or CTE that
 /// [`access_method::find_best_hir_access_method_for_subquery`] chose to read
-/// through a temporary index over its stored rows, as legacy applies its
-/// `MaterializedSubquery` access: the seek's constraints are consumed and
-/// its key is built like any index seek. `None` when the subquery is
-/// scanned.
+/// through a temporary index over its stored rows: the seek's constraints
+/// are consumed and its key is built like any index seek. `None` when the
+/// subquery is scanned.
 pub(crate) fn apply_hir_materialized_subquery_access(
     constraints: &constraints::HirTableConstraints,
     predicates: &mut [HirWhereTerm],

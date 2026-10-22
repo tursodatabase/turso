@@ -1,7 +1,7 @@
 //! Change data capture for HIR INSERT, UPDATE and DELETE.
 //!
 //! When `PRAGMA capture_data_changes_conn` is on, each changed row is
-//! written to the capture table as legacy writes it: an INSERT or DELETE
+//! written to the capture table: an INSERT or DELETE
 //! row with the after or before image, an UPDATE row with both images and,
 //! in `full` mode, which columns changed. A statement in autocommit mode
 //! then writes a COMMIT row. Semantic analysis resolves the capture table
@@ -56,8 +56,7 @@ impl<'a> Capture<'a> {
             root_page: RegisterOrLiteral::Literal(table.root_page),
             db: crate::MAIN_DB_ID,
         });
-        // Like legacy, change ids come from the capture table's sequence
-        // under MVCC.
+        // Under MVCC, change ids come from the capture table's sequence.
         let change_ids = if program.is_mvcc_enabled() {
             let operation = capture.change_ids.as_ref().ok_or_else(|| {
                 LimboError::InternalError(format!(
@@ -108,7 +107,7 @@ impl<'a> Capture<'a> {
 
     /// The after image of the row in registers `start + column`, whose
     /// rowid is in `rowid`, when the mode keeps it. The INTEGER PRIMARY KEY
-    /// holds the rowid in the image, as in legacy.
+    /// holds the rowid in the image.
     pub(super) fn after_record(
         &self,
         program: &mut ProgramBuilder,
