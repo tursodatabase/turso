@@ -122,6 +122,51 @@ pub fn parse_table_sql_ast(sql: &str) -> crate::Result<turso_parser::ast::Stmt> 
     }
 }
 
+/// Parse a `sqlite_schema` trigger row's SQLite text: one `CREATE TRIGGER`.
+pub fn parse_trigger_sql(sql: &str) -> crate::Result<Vec<turso_parser::ast::Stmt>> {
+    let (cmd, _) = parse(sql)?;
+    match cmd {
+        Some(turso_parser::ast::Cmd::Stmt(
+            stmt @ turso_parser::ast::Stmt::CreateTrigger { .. },
+        )) => Ok(vec![stmt]),
+        _ => Err(crate::LimboError::ParseError(format!(
+            "invalid trigger sql: {sql}"
+        ))),
+    }
+}
+
+/// The canonical SQLite text of a `CREATE TRIGGER` AST, which the engine
+/// stores in `sqlite_schema`.
+pub fn format_trigger_sql(stmt: &turso_parser::ast::Stmt) -> crate::Result<String> {
+    let turso_parser::ast::Stmt::CreateTrigger {
+        temporary,
+        if_not_exists,
+        trigger_name,
+        time,
+        event,
+        tbl_name,
+        for_each_row,
+        when_clause,
+        commands,
+    } = stmt
+    else {
+        return Err(crate::LimboError::InternalError(
+            "format_trigger_sql requires CREATE TRIGGER".to_string(),
+        ));
+    };
+    Ok(crate::translate::trigger::create_trigger_to_sql(
+        *temporary,
+        *if_not_exists,
+        trigger_name,
+        *time,
+        event,
+        tbl_name,
+        *for_each_row,
+        when_clause.as_deref(),
+        commands,
+    ))
+}
+
 /// Recover persisted SQLite table SQL for schema replay.
 ///
 /// SQLite text without a database qualifier can be replayed unchanged. A

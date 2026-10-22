@@ -135,6 +135,7 @@ pub const TEMP_SCHEMA_TABLE_NAME: &str = "sqlite_temp_schema";
 pub const TEMP_SCHEMA_TABLE_NAME_ALT: &str = "sqlite_temp_master";
 pub const SQLITE_SEQUENCE_TABLE_NAME: &str = "sqlite_sequence";
 pub const TURSO_TYPES_TABLE_NAME: &str = "__turso_internal_types";
+pub const TURSO_FUNCTIONS_TABLE_NAME: &str = "__turso_internal_functions";
 pub const DBSP_TABLE_PREFIX: &str = "__turso_internal_dbsp_state_v";
 /// Hidden per-view value-multiset table backing MIN/MAX and DISTINCT
 /// aggregates.
@@ -759,6 +760,16 @@ pub enum SchemaObjectType {
     Index,
 }
 
+/// A function that `CREATE FUNCTION` created. The engine stores its text as
+/// written and does not read it: the dialect of the database parses the text
+/// when a statement calls the function.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UserFunction {
+    pub name: String,
+    pub arg_count: usize,
+    pub sql: String,
+}
+
 #[derive(Debug)]
 pub struct Schema {
     pub tables: HashMap<String, Arc<Table>>,
@@ -811,6 +822,9 @@ pub struct Schema {
     pub generated_columns_enabled: bool,
     /// Named sequences (CREATE SEQUENCE)
     pub sequences: HashMap<String, Arc<Sequence>>,
+    /// Functions that `CREATE FUNCTION` created, by lowercase name. A name
+    /// can have one function for each number of parameters.
+    pub user_functions: HashMap<String, Vec<Arc<UserFunction>>>,
 }
 
 impl Default for Schema {
@@ -955,6 +969,7 @@ impl Schema {
             type_registry,
             generated_columns_enabled: false,
             sequences: HashMap::default(),
+            user_functions: HashMap::default(),
         };
         dialect.register_catalog(&mut schema, enable_custom_types)?;
         Ok(schema)
@@ -1059,6 +1074,50 @@ impl Schema {
 
     pub fn remove_type(&mut self, type_name: &str) {
         self.type_registry.remove(&type_registry_key(type_name));
+    }
+
+    /// Register a function that `CREATE FUNCTION` created. A function with
+    /// the same name and number of parameters is replaced.
+    pub fn add_user_function(&mut self, function: UserFunction) {
+        let functions = self
+            .user_functions
+            .entry(normalize_ident(&function.name))
+            .or_insert_with(|| vec![]);
+        functions.retain(|existing| existing.arg_count != function.arg_count);
+        functions.push(Arc::new(function));
+    }
+
+    pub fn remove_user_function(&mut self, name: &str, arg_count: usize) {
+        let name = normalize_ident(name);
+        if let Some(functions) = self.user_functions.get_mut(&name) {
+            functions.retain(|function| function.arg_count != arg_count);
+            if functions.is_empty() {
+                self.user_functions.remove(&name);
+            }
+        }
+    }
+
+    pub fn get_user_function(&self, name: &str, arg_count: usize) -> Option<&Arc<UserFunction>> {
+        self.user_functions_named(name)
+            .iter()
+            .find(|function| function.arg_count == arg_count)
+    }
+
+    /// The functions with this name, one for each number of parameters.
+    pub fn user_functions_named(&self, name: &str) -> &[Arc<UserFunction>] {
+        self.user_functions
+            .get(&normalize_ident(name))
+            .map(Vec::as_slice)
+            .unwrap_or_default()
+    }
+
+    /// Register the functions read from the internal functions table. This is
+    /// the shared entry point of the initial database open and the schema
+    /// reparse.
+    pub fn load_user_functions(&mut self, functions: impl IntoIterator<Item = UserFunction>) {
+        for function in functions {
+            self.add_user_function(function);
+        }
     }
 
     /// Chase the base type chain: domain_a → domain_b → integer
@@ -1451,20 +1510,17 @@ impl Schema {
         Ok(())
     }
 
+    /// Remove every trigger with this name: a dialect can load several
+    /// triggers of one name from one `sqlite_schema` row.
     pub fn remove_trigger(&mut self, name: &str) -> Result<()> {
         let name = normalize_ident(name);
 
         let mut removed = false;
         for triggers_list in self.triggers.values_mut() {
-            for i in 0..triggers_list.len() {
-                let trigger = &triggers_list[i];
-                if normalize_ident(&trigger.name) == name {
-                    removed = true;
-                    triggers_list.remove(i);
-                    break;
-                }
-            }
-            if removed {
+            let before = triggers_list.len();
+            triggers_list.retain(|trigger| normalize_ident(&trigger.name) != name);
+            if triggers_list.len() != before {
+                removed = true;
                 break;
             }
         }
@@ -2739,74 +2795,103 @@ impl Schema {
                 }
             }
             "trigger" => {
-                use turso_parser::ast::{Cmd, Stmt};
-                use turso_parser::parser::Parser;
+                use turso_parser::ast::Stmt;
 
                 let sql = maybe_sql.expect("sql should be present for trigger");
                 let trigger_name = name.to_string();
 
-                let mut parser = Parser::new(sql.as_bytes());
-                let Ok(Some(Cmd::Stmt(Stmt::CreateTrigger {
-                    temporary,
-                    if_not_exists: _,
-                    trigger_name: _,
-                    time,
-                    event,
-                    tbl_name,
-                    for_each_row,
-                    when_clause,
-                    commands,
-                }))) = parser.next_cmd()
-                else {
-                    return Err(crate::LimboError::ParseError(format!(
-                        "invalid trigger sql: {sql}"
-                    )));
-                };
-                // Resolve the target database from the SQL qualifier:
-                // CREATE TEMP TRIGGER ... ON main.tbl → target is MAIN_DB_ID
-                // CREATE TEMP TRIGGER ... ON tbl     → target is None (unqualified)
-                // CREATE TEMP TRIGGER ... ON aux.tbl → resolve `aux` via the
-                //     attached catalog; if the name is unknown to this
-                //     connection use `INVALID_DB_ID` so the trigger never
-                //     fires on a mismatched db. Using `None` (the old
-                //     behaviour) would treat an unresolved attached name
-                //     the same as an unqualified reference, causing the
-                //     trigger to fire on every table with a matching name.
-                let target_database_id = tbl_name.namespace.as_ref().map(|db_name| {
-                    let db = db_name.as_str();
-                    if db.eq_ignore_ascii_case("main") {
-                        crate::MAIN_DB_ID
-                    } else if db.eq_ignore_ascii_case("temp") {
-                        crate::TEMP_DB_ID
-                    } else {
-                        resolve_attached_db(db).unwrap_or(crate::INVALID_DB_ID)
-                    }
-                });
-                self.add_trigger(
-                    Trigger::new(
-                        trigger_name,
-                        sql.to_string(),
-                        // Store the bare (unquoted) table name. `Name::to_string()`
-                        // renders the quoted form (`"t1"`), which then fails every
-                        // schema lookup since `normalize_ident` does not strip quotes.
-                        // This must match the bucket key used in `add_trigger` below.
-                        tbl_name.name.as_str().to_string(),
+                for stmt in dialect.parse_trigger_sql(sql)? {
+                    let Stmt::CreateTrigger {
+                        temporary,
+                        if_not_exists: _,
+                        trigger_name: _,
                         time,
                         event,
+                        tbl_name,
                         for_each_row,
-                        when_clause.map(|e| *e),
+                        when_clause,
                         commands,
+                    } = stmt
+                    else {
+                        return Err(crate::LimboError::ParseError(format!(
+                            "invalid trigger sql: {sql}"
+                        )));
+                    };
+                    self.add_loaded_trigger(
+                        trigger_name.clone(),
+                        sql,
                         temporary,
-                        target_database_id,
-                    ),
-                    tbl_name.name.as_str(),
-                )?;
+                        time,
+                        event,
+                        tbl_name,
+                        for_each_row,
+                        when_clause,
+                        commands,
+                        resolve_attached_db,
+                    )?;
+                }
             }
             // Types are stored in sqlite_turso_types, not sqlite_schema
             _ => {}
         };
 
         Ok(())
+    }
+
+    /// Register one trigger that a `sqlite_schema` row holds.
+    #[allow(clippy::too_many_arguments)]
+    fn add_loaded_trigger(
+        &mut self,
+        trigger_name: String,
+        sql: &str,
+        temporary: bool,
+        time: Option<turso_parser::ast::TriggerTime>,
+        event: turso_parser::ast::TriggerEvent,
+        tbl_name: turso_parser::ast::QualifiedName,
+        for_each_row: bool,
+        when_clause: Option<Box<Expr>>,
+        commands: std::vec::Vec<turso_parser::ast::TriggerCmd>,
+        resolve_attached_db: &dyn Fn(&str) -> Option<usize>,
+    ) -> Result<()> {
+        // Resolve the target database from the SQL qualifier:
+        // CREATE TEMP TRIGGER ... ON main.tbl → target is MAIN_DB_ID
+        // CREATE TEMP TRIGGER ... ON tbl     → target is None (unqualified)
+        // CREATE TEMP TRIGGER ... ON aux.tbl → resolve `aux` via the
+        //     attached catalog; if the name is unknown to this
+        //     connection use `INVALID_DB_ID` so the trigger never
+        //     fires on a mismatched db. Using `None` (the old
+        //     behaviour) would treat an unresolved attached name
+        //     the same as an unqualified reference, causing the
+        //     trigger to fire on every table with a matching name.
+        let target_database_id = tbl_name.namespace.as_ref().map(|db_name| {
+            let db = db_name.as_str();
+            if db.eq_ignore_ascii_case("main") {
+                crate::MAIN_DB_ID
+            } else if db.eq_ignore_ascii_case("temp") {
+                crate::TEMP_DB_ID
+            } else {
+                resolve_attached_db(db).unwrap_or(crate::INVALID_DB_ID)
+            }
+        });
+        self.add_trigger(
+            Trigger::new(
+                trigger_name,
+                sql.to_string(),
+                // Store the bare (unquoted) table name. `Name::to_string()`
+                // renders the quoted form (`"t1"`), which then fails every
+                // schema lookup since `normalize_ident` does not strip quotes.
+                // This must match the bucket key used in `add_trigger` below.
+                tbl_name.name.as_str().to_string(),
+                time,
+                event,
+                for_each_row,
+                when_clause.map(|e| *e),
+                commands,
+                temporary,
+                target_database_id,
+            ),
+            tbl_name.name.as_str(),
+        )
     }
 
     /// Compute all resolved FKs *referencing* `table_name` (arg: `table_name` is the parent).
@@ -3296,6 +3381,7 @@ impl TryClone for Schema {
             type_registry: self.type_registry.try_clone()?,
             generated_columns_enabled: self.generated_columns_enabled,
             sequences: self.sequences.try_clone()?,
+            user_functions: self.user_functions.clone(),
         })
     }
 }

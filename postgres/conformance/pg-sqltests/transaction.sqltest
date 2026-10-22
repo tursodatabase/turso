@@ -93,3 +93,32 @@ expect {
     29
     0
 }
+
+setup times {
+    CREATE TABLE times (a timestamptz, b timestamptz);
+}
+
+@setup times
+test now-is-the-same-for-every-row-of-a-statement {
+    INSERT INTO times SELECT now(), now() FROM (VALUES (1), (2), (3)) AS v;
+    SELECT count(*) FROM times WHERE a = b;
+    SELECT count(DISTINCT a) FROM times;
+}
+expect {
+    3
+    1
+}
+
+@setup times
+test now-is-the-start-of-the-transaction-block {
+    BEGIN;
+    INSERT INTO times VALUES (now(), transaction_timestamp());
+    INSERT INTO times VALUES (now(), now());
+    SELECT count(*) FROM times WHERE a = now() AND b = now();
+    COMMIT;
+    SELECT count(DISTINCT a) FROM times;
+}
+expect {
+    2
+    1
+}

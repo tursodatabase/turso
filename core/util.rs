@@ -1760,6 +1760,8 @@ where
         | ast::Stmt::DropView { .. }
         | ast::Stmt::DropType { .. }
         | ast::Stmt::DropDomain { .. }
+        | ast::Stmt::CreateFunction(_)
+        | ast::Stmt::DropFunction { .. }
         | ast::Stmt::Reindex { .. }
         | ast::Stmt::Release { .. }
         | ast::Stmt::Rollback { .. }
@@ -1957,6 +1959,284 @@ where
                 }
                 ast::Expr::InSelect { rhs, .. } => {
                     walk_select_expressions_inner(rhs, func)?;
+                }
+                _ => {}
+            }
+        }
+        Ok(control)
+    })?;
+    Ok(())
+}
+
+/// Walk all expressions in a statement, including subqueries, and let `func`
+/// change them. The mutable twin of [`walk_stmt_expressions`].
+pub fn walk_stmt_expressions_mut<F>(stmt: &mut ast::Stmt, func: &mut F) -> Result<()>
+where
+    F: FnMut(&mut ast::Expr) -> Result<WalkControl>,
+{
+    match stmt {
+        ast::Stmt::Select(select) => walk_select_expressions_mut(select, func)?,
+        ast::Stmt::Insert {
+            with,
+            body,
+            returning,
+            ..
+        } => {
+            walk_with_expressions_mut(with.as_mut(), func)?;
+            if let ast::InsertBody::Select(select, upsert) = body {
+                walk_select_expressions_mut(select, func)?;
+                let mut upsert = upsert.as_deref_mut();
+                while let Some(clause) = upsert {
+                    if let Some(index) = &mut clause.index {
+                        for target in &mut index.targets {
+                            walk_expr_with_subqueries_mut(&mut target.expr, func)?;
+                        }
+                        if let Some(where_clause) = &mut index.where_clause {
+                            walk_expr_with_subqueries_mut(where_clause, func)?;
+                        }
+                    }
+                    if let ast::UpsertDo::Set { sets, where_clause } = &mut clause.do_clause {
+                        for set in sets {
+                            walk_expr_with_subqueries_mut(&mut set.expr, func)?;
+                        }
+                        if let Some(where_clause) = where_clause {
+                            walk_expr_with_subqueries_mut(where_clause, func)?;
+                        }
+                    }
+                    upsert = clause.next.as_deref_mut();
+                }
+            }
+            walk_result_column_expressions_mut(returning, func)?;
+        }
+        ast::Stmt::Update(update) => {
+            walk_with_expressions_mut(update.with.as_mut(), func)?;
+            for set in &mut update.sets {
+                walk_expr_with_subqueries_mut(&mut set.expr, func)?;
+            }
+            if let Some(from_clause) = &mut update.from {
+                walk_from_clause_expressions_mut(from_clause, func)?;
+            }
+            if let Some(where_clause) = &mut update.where_clause {
+                walk_expr_with_subqueries_mut(where_clause, func)?;
+            }
+            walk_result_column_expressions_mut(&mut update.returning, func)?;
+        }
+        ast::Stmt::Delete {
+            with,
+            where_clause,
+            returning,
+            ..
+        } => {
+            walk_with_expressions_mut(with.as_mut(), func)?;
+            if let Some(where_clause) = where_clause {
+                walk_expr_with_subqueries_mut(where_clause, func)?;
+            }
+            walk_result_column_expressions_mut(returning, func)?;
+        }
+        ast::Stmt::CreateTable {
+            body: ast::CreateTableBody::AsSelect(select),
+            ..
+        } => walk_select_expressions_mut(select, func)?,
+        _ => {}
+    }
+    Ok(())
+}
+
+fn walk_with_expressions_mut<F>(with: Option<&mut ast::With>, func: &mut F) -> Result<()>
+where
+    F: FnMut(&mut ast::Expr) -> Result<WalkControl>,
+{
+    for cte in with.into_iter().flat_map(|with| &mut with.ctes) {
+        walk_select_expressions_mut(&mut cte.select, func)?;
+    }
+    Ok(())
+}
+
+fn walk_result_column_expressions_mut<F>(
+    columns: &mut [ast::ResultColumn],
+    func: &mut F,
+) -> Result<()>
+where
+    F: FnMut(&mut ast::Expr) -> Result<WalkControl>,
+{
+    for column in columns {
+        if let ast::ResultColumn::Expr(expr, _) = column {
+            walk_expr_with_subqueries_mut(expr, func)?;
+        }
+    }
+    Ok(())
+}
+
+/// Walk all expressions in a SELECT statement, including subqueries, and let
+/// `func` change them.
+pub fn walk_select_expressions_mut<F>(select: &mut ast::Select, func: &mut F) -> Result<()>
+where
+    F: FnMut(&mut ast::Expr) -> Result<WalkControl>,
+{
+    walk_with_expressions_mut(select.with.as_mut(), func)?;
+
+    walk_one_select_expressions_mut(&mut select.body.select, func)?;
+    for compound in &mut select.body.compounds {
+        walk_one_select_expressions_mut(&mut compound.select, func)?;
+    }
+
+    for sorted_col in &mut select.order_by {
+        walk_expr_with_subqueries_mut(&mut sorted_col.expr, func)?;
+    }
+
+    if let Some(limit) = &mut select.limit {
+        walk_expr_with_subqueries_mut(&mut limit.expr, func)?;
+        if let Some(offset) = &mut limit.offset {
+            walk_expr_with_subqueries_mut(offset, func)?;
+        }
+    }
+
+    Ok(())
+}
+
+fn walk_one_select_expressions_mut<F>(one_select: &mut ast::OneSelect, func: &mut F) -> Result<()>
+where
+    F: FnMut(&mut ast::Expr) -> Result<WalkControl>,
+{
+    match one_select {
+        ast::OneSelect::Select {
+            columns,
+            from,
+            where_clause,
+            group_by,
+            window_clause,
+            ..
+        } => {
+            walk_result_column_expressions_mut(columns, func)?;
+
+            if let Some(from_clause) = from {
+                walk_from_clause_expressions_mut(from_clause, func)?;
+            }
+
+            if let Some(where_expr) = where_clause {
+                walk_expr_with_subqueries_mut(where_expr, func)?;
+            }
+
+            if let Some(group_by) = group_by {
+                for expr in &mut group_by.exprs {
+                    walk_expr_with_subqueries_mut(expr, func)?;
+                }
+                if let Some(having_expr) = &mut group_by.having {
+                    walk_expr_with_subqueries_mut(having_expr, func)?;
+                }
+            }
+
+            for window_def in window_clause {
+                walk_window_expressions_mut(&mut window_def.window, func)?;
+            }
+        }
+        ast::OneSelect::Values(values) => {
+            for row in values {
+                for expr in row {
+                    walk_expr_with_subqueries_mut(expr, func)?;
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn walk_from_clause_expressions_mut<F>(
+    from_clause: &mut ast::FromClause,
+    func: &mut F,
+) -> Result<()>
+where
+    F: FnMut(&mut ast::Expr) -> Result<WalkControl>,
+{
+    walk_select_table_expressions_mut(&mut from_clause.select, func)?;
+
+    for join in &mut from_clause.joins {
+        walk_select_table_expressions_mut(&mut join.table, func)?;
+
+        if let Some(ast::JoinConstraint::On(expr)) = &mut join.constraint {
+            walk_expr_with_subqueries_mut(expr, func)?;
+        }
+    }
+
+    Ok(())
+}
+
+fn walk_select_table_expressions_mut<F>(
+    select_table: &mut ast::SelectTable,
+    func: &mut F,
+) -> Result<()>
+where
+    F: FnMut(&mut ast::Expr) -> Result<WalkControl>,
+{
+    match select_table {
+        ast::SelectTable::Select { select, .. } => walk_select_expressions_mut(select, func),
+        ast::SelectTable::Sub(from_clause, _) => {
+            walk_from_clause_expressions_mut(from_clause, func)
+        }
+        ast::SelectTable::TableCall(_, args, _) => {
+            for arg in args {
+                walk_expr_with_subqueries_mut(arg, func)?;
+            }
+            Ok(())
+        }
+        ast::SelectTable::Table(_, _, _) => Ok(()),
+    }
+}
+
+fn walk_window_expressions_mut<F>(window: &mut ast::Window, func: &mut F) -> Result<()>
+where
+    F: FnMut(&mut ast::Expr) -> Result<WalkControl>,
+{
+    for expr in &mut window.partition_by {
+        walk_expr_with_subqueries_mut(expr, func)?;
+    }
+
+    for sorted_col in &mut window.order_by {
+        walk_expr_with_subqueries_mut(&mut sorted_col.expr, func)?;
+    }
+
+    if let Some(frame_clause) = &mut window.frame_clause {
+        walk_frame_bound_expressions_mut(&mut frame_clause.start, func)?;
+        if let Some(end_bound) = &mut frame_clause.end {
+            walk_frame_bound_expressions_mut(end_bound, func)?;
+        }
+    }
+
+    Ok(())
+}
+
+fn walk_frame_bound_expressions_mut<F>(bound: &mut ast::FrameBound, func: &mut F) -> Result<()>
+where
+    F: FnMut(&mut ast::Expr) -> Result<WalkControl>,
+{
+    match bound {
+        ast::FrameBound::Following(expr) | ast::FrameBound::Preceding(expr) => {
+            walk_expr_with_subqueries_mut(expr, func)
+        }
+        ast::FrameBound::CurrentRow
+        | ast::FrameBound::UnboundedFollowing
+        | ast::FrameBound::UnboundedPreceding => Ok(()),
+    }
+}
+
+/// Walk an expression and the subqueries in it, and let `func` change them.
+/// `func` sees each expression before its children; when it returns
+/// `SkipChildren`, the children, and the subqueries, of that expression are
+/// not walked.
+pub fn walk_expr_with_subqueries_mut<F>(expr: &mut ast::Expr, func: &mut F) -> Result<()>
+where
+    F: FnMut(&mut ast::Expr) -> Result<WalkControl>,
+{
+    walk_expr_mut(expr, &mut |e| {
+        let control = func(e)?;
+        if matches!(control, WalkControl::Continue) {
+            match e {
+                ast::Expr::Subquery(select) | ast::Expr::Exists(select) => {
+                    walk_select_expressions_mut(select, func)?;
+                }
+                ast::Expr::InSelect { rhs, .. } => {
+                    walk_select_expressions_mut(rhs, func)?;
                 }
                 _ => {}
             }
@@ -3981,6 +4261,7 @@ pub fn rewrite_trigger_cmd_table_refs(cmd: &mut ast::TriggerCmd, old_tbl: &str, 
         ast::TriggerCmd::Select(select) => {
             rewrite_select_table_refs(select, old_tbl, new_tbl);
         }
+        ast::TriggerCmd::ExecuteFunction { .. } => {}
     }
 }
 

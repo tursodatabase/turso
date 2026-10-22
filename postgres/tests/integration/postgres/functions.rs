@@ -439,7 +439,10 @@ fn test_pg_native_function_signatures_and_catalogs(db: TempDatabase) {
             Value::build_text("x + 7"),
         ),
         ("SELECT pg_get_expr('x + 7', NULL, 1)", Value::Null),
-        ("SELECT length(now(1, 2, 3))", Value::from_i64(23)),
+        (
+            "SELECT length(now(1, 2, 3)) BETWEEN 19 AND 23",
+            Value::from_i64(1),
+        ),
     ] {
         assert_eq!(
             conn.prepare(sql).unwrap().run_collect_rows().unwrap(),
@@ -534,18 +537,25 @@ fn test_pg_native_timestamps_are_registered_before_connection_wrapping(db: TempD
         let Value::Text(timestamp) = &rows[0][0] else {
             panic!("expected timestamp text for {name}")
         };
-        assert_eq!(timestamp.as_str().len(), 23);
-        for (index, separator) in [
-            (4, b'-'),
-            (7, b'-'),
-            (10, b' '),
-            (13, b':'),
-            (16, b':'),
-            (19, b'.'),
-        ] {
-            assert_eq!(timestamp.as_str().as_bytes()[index], separator, "{name}");
-        }
+        assert_timestamp_text_without_trailing_zeros(timestamp.as_str(), name);
     }
+}
+
+fn assert_timestamp_text_without_trailing_zeros(timestamp: &str, name: &str) {
+    assert!(timestamp.len() >= 19, "{name}: {timestamp}");
+    let (clock, fraction) = timestamp.split_at(19);
+    for (index, separator) in [(4, b'-'), (7, b'-'), (10, b' '), (13, b':'), (16, b':')] {
+        assert_eq!(clock.as_bytes()[index], separator, "{name}: {timestamp}");
+    }
+    let fraction_is_milliseconds_without_trailing_zeros = fraction.is_empty()
+        || (fraction.starts_with('.')
+            && (2..=4).contains(&fraction.len())
+            && fraction[1..].bytes().all(|b| b.is_ascii_digit())
+            && !fraction.ends_with('0'));
+    assert!(
+        fraction_is_milliseconds_without_trailing_zeros,
+        "{name}: {timestamp}"
+    );
 }
 
 #[turso_macros::test(mvcc)]

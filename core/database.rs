@@ -1712,6 +1712,20 @@ impl Database {
                             db.with_schema_mut(|schema| schema.load_type_definitions(&type_sqls))?;
                         }
                     }
+                    // Load the functions that CREATE FUNCTION created, which
+                    // the hidden functions table stores like the types.
+                    conn.maybe_update_schema();
+                    let functions = conn.query_stored_user_functions()?;
+                    if !functions.is_empty() {
+                        let db = state
+                            .db
+                            .as_ref()
+                            .expect("db must be initialized in Init phase");
+                        db.with_schema_mut(|schema| {
+                            schema.load_user_functions(functions);
+                            Ok(())
+                        })?;
+                    }
 
                     state.phase = OpenDbAsyncPhase::BootstrapMvStore;
                 }

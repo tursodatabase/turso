@@ -88,6 +88,8 @@ impl StmtClass {
             | Stmt::DropView { .. }
             | Stmt::DropType { .. }
             | Stmt::DropDomain { .. }
+            | Stmt::CreateFunction(_)
+            | Stmt::DropFunction { .. }
             | Stmt::DropSequence { .. } => Some(Self::Schema),
             Stmt::Analyze { .. }
             | Stmt::Attach { .. }

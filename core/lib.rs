@@ -165,7 +165,7 @@ pub use storage::{
     pager::{Page, PageRef, Pager},
     wal::{CheckpointMode, CheckpointResult, Wal, WalAutoActions, WalFile, WalFileShared},
 };
-pub use translate::expr::{walk_expr_mut, WalkControl};
+pub use translate::expr::{walk_expr, walk_expr_mut, WalkControl};
 pub use turso_ext::ContextDestructor;
 pub use turso_macros::{
     turso_assert, turso_assert_all, turso_assert_eq, turso_assert_greater_than,
@@ -178,6 +178,9 @@ pub use turso_macros::{
 pub use turso_parser::ast::EqpFormat;
 pub use types::{IOResult, Value, ValueBlob, ValueRef};
 pub use util::IOExt;
+pub use util::{
+    walk_expr_with_subqueries_mut, walk_select_expressions_mut, walk_stmt_expressions_mut,
+};
 pub use vdbe::array::array_values_from_any;
 pub use vdbe::{
     builder::QueryMode, explain::EXPLAIN_COLUMNS, explain::EXPLAIN_QUERY_PLAN_COLUMNS,

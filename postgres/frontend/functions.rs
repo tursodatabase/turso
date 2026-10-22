@@ -33,7 +33,12 @@ macro_rules! scalar_functions {
 
         impl PgScalarFunction {
             fn name(&self) -> &str {
-                self.as_ref()
+                match self {
+                    Self::PlSet => "__pl_set",
+                    Self::PlSetOne => "__pl_set_one",
+                    Self::PlGet => "__pl_get",
+                    _ => self.as_ref(),
+                }
             }
 
             fn arity(&self) -> FunctionArity {
@@ -81,7 +86,11 @@ scalar_functions! {
     PgBackendPid(FunctionArity::Exact(0), true),
     PgIsInRecovery(FunctionArity::Exact(0), false),
     PgLockAccessShare(FunctionArity::Exact(0), false),
-    Now | ClockTimestamp | TransactionTimestamp | StatementTimestamp(FunctionArity::Variadic, false),
+    Now | TransactionTimestamp | StatementTimestamp(FunctionArity::Variadic, false),
+    ClockTimestamp(FunctionArity::Variadic, false),
+    PlSet(FunctionArity::Exact(2), false),
+    PlSetOne(FunctionArity::Exact(2), false),
+    PlGet(FunctionArity::Exact(1), false),
 }
 
 impl ScalarFunction for PgScalarFunction {
@@ -146,15 +155,62 @@ impl ScalarCall for PgScalarFunction {
                 }
                 Value::from_i64(0)
             }
-            Self::Now
-            | Self::ClockTimestamp
-            | Self::TransactionTimestamp
-            | Self::StatementTimestamp => {
-                Value::build_text(Utc::now().format("%Y-%m-%d %H:%M:%S%.3f").to_string())
+            Self::Now | Self::TransactionTimestamp => exec_transaction_time(connection, args),
+            Self::PlSet => {
+                let value = args[1].get_value().clone();
+                crate::session::set_plpgsql_value(connection, &text_arg(args, 0), value.clone());
+                value
             }
+            Self::PlSetOne => {
+                let value = args[1].get_value().clone();
+                crate::session::set_plpgsql_value_once(
+                    connection,
+                    &text_arg(args, 0),
+                    value.clone(),
+                )?;
+                value
+            }
+            Self::PlGet => crate::session::plpgsql_value(connection, &text_arg(args, 0)),
+            Self::StatementTimestamp => statement_time(args),
+            Self::ClockTimestamp => Value::build_text(clock_time()),
         };
         Ok(IOResult::Done(value))
     }
+}
+
+/// The clock, in the text form of the `timestamptz` type: milliseconds
+/// without trailing zeros.
+pub(crate) fn clock_time() -> String {
+    let time = Utc::now().format("%Y-%m-%d %H:%M:%S%.3f").to_string();
+    time.trim_end_matches('0').trim_end_matches('.').to_string()
+}
+
+/// The time the statement started, which the translator passes as the
+/// argument of the time functions. A call that did not come through the
+/// translator gets the clock.
+fn statement_time(args: &[Register]) -> Value {
+    match args.first().map(Register::get_value) {
+        Some(Value::Text(time)) => Value::build_text(time.as_str().to_owned()),
+        _ => Value::build_text(clock_time()),
+    }
+}
+
+/// `now()` and `transaction_timestamp()`: the time the transaction started.
+/// In a transaction block that is the time of BEGIN, else the time of the
+/// statement.
+fn exec_transaction_time(connection: &Arc<Connection>, args: &[Register]) -> Value {
+    let statement_time = statement_time(args);
+    if connection.get_auto_commit() {
+        crate::session::end_transaction_block(connection);
+        return statement_time;
+    }
+    let Value::Text(statement_time) = statement_time else {
+        unreachable!("statement_time returns text");
+    };
+    Value::build_text(crate::session::transaction_block_start(
+        connection,
+        statement_time.as_str(),
+    ))
 }
 
 fn exec_acl_default(args: &[Register]) -> Result<Value> {

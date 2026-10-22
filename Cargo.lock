@@ -7278,6 +7278,7 @@ dependencies = [
  "chumsky",
  "parking_lot",
  "rustc-hash 2.1.1",
+ "serde_json",
  "strum",
  "tempfile",
  "turso_core",
@@ -7300,6 +7301,7 @@ dependencies = [
  "criterion",
  "miette",
  "pg_query",
+ "serde_json",
  "thiserror 2.0.16",
  "turso_parser",
 ]

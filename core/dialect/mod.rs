@@ -18,6 +18,46 @@ pub use sqlite::SqliteDialect;
 /// stores in `sqlite_schema`.
 pub const POSTGRES_TABLE_SQL_PREFIX: &str = "/* turso_frontend:postgres */ ";
 
+/// A trigger body that executes a function of the dialect, with what the
+/// dialect needs to compile the function for this trigger.
+pub struct TriggerFunctionCall<'a> {
+    pub trigger: &'a crate::schema::Trigger,
+    /// The table the trigger is on.
+    pub table: &'a crate::schema::BTreeTable,
+    /// The attached database of the table, or `None` for the main database.
+    pub database_name: Option<&'a str>,
+    pub function: &'a turso_parser::ast::QualifiedName,
+    pub args: &'a [String],
+}
+
+/// A trigger function compiled for one trigger: the engine runs the
+/// commands, then applies the returned row.
+#[derive(Debug)]
+pub struct TriggerFunctionBody {
+    pub commands: Vec<turso_parser::ast::TriggerCmd>,
+    pub returned_row: TriggerReturn,
+}
+
+/// The row a trigger function returns. The engine writes the row that a
+/// BEFORE trigger returns in place of the row of the statement. The row
+/// that an AFTER trigger returns means nothing, so such a trigger returns
+/// `Unchanged`.
+#[derive(Debug)]
+pub enum TriggerReturn {
+    /// Write the row of the statement as it is.
+    Unchanged,
+    /// Do not write the row of the statement.
+    Skip,
+    /// Write the row with these column values. The engine evaluates the
+    /// expressions after the commands ran, all at the same time, with
+    /// `NEW.x` and `OLD.x` as the trigger sees them. `None` keeps the value
+    /// of the column. When `skip_when` is true, the row is not written.
+    Row {
+        skip_when: Option<turso_parser::ast::Expr>,
+        columns: Vec<Option<turso_parser::ast::Expr>>,
+    },
+}
+
 /// SQL dialect layered on top of the engine.
 ///
 /// Every [`crate::Database`] carries a dialect, supplied explicitly by
@@ -92,6 +132,50 @@ pub trait Dialect: Send + Sync + 'static {
         body: &turso_parser::ast::CreateTableBody,
     ) -> crate::Result<String>;
 
+    /// Parse a `sqlite_schema` `type='trigger'` row's SQL into the triggers
+    /// it holds, one `CREATE TRIGGER` statement for each. A dialect can keep
+    /// one row for several engine triggers of the same name, one for each
+    /// event the row names, so the engine fires each event on its own.
+    fn parse_trigger_sql(&self, sql: &str) -> crate::Result<Vec<turso_parser::ast::Stmt>> {
+        sqlite::parse_trigger_sql(sql)
+    }
+
+    /// Produce the SQL text to store in `sqlite_schema` for a `CREATE
+    /// TRIGGER`. `input` is the original statement text as the user wrote
+    /// it, in the frontend's dialect; `stmt` is the translated AST. The
+    /// SQLite dialect formats canonical SQLite text from the AST; a frontend
+    /// dialect typically stores `input` with a marker it can recognize in
+    /// [`Dialect::parse_trigger_sql`].
+    fn format_trigger_sql(
+        &self,
+        input: &str,
+        stmt: &turso_parser::ast::Stmt,
+    ) -> crate::Result<String> {
+        let _ = input;
+        sqlite::format_trigger_sql(stmt)
+    }
+
+    /// The body of a trigger whose own body is `EXECUTE FUNCTION`: the
+    /// dialect compiles the function for this trigger. The engine calls
+    /// this each time it compiles a statement that fires the trigger, so a
+    /// change of the function text is seen on the next compilation.
+    fn expand_trigger_function(
+        &self,
+        _schema: &crate::schema::Schema,
+        call: &TriggerFunctionCall<'_>,
+    ) -> crate::Result<TriggerFunctionBody> {
+        Err(crate::LimboError::ParseError(format!(
+            "no such function: {}",
+            call.function.name.as_str()
+        )))
+    }
+
+    /// Whether the triggers of one table, event and time fire in the order
+    /// of their names. SQLite fires them in the order of creation.
+    fn triggers_fire_in_name_order(&self) -> bool {
+        false
+    }
+
     /// Produce stored SQL after the engine rewrites a `CREATE TABLE` AST.
     ///
     /// Schema rewrites cannot reuse the original frontend text because it no
@@ -162,6 +246,21 @@ pub trait Dialect: Send + Sync + 'static {
         Err(crate::LimboError::ParseError(format!(
             "no such function: {name}"
         )))
+    }
+
+    /// Replace a call to a function that `CREATE FUNCTION` created with the
+    /// expression that computes it. The engine calls this before it plans a
+    /// statement, for each function call whose name is in
+    /// [`crate::schema::Schema::user_functions`]. `Ok(None)` means the call
+    /// is not to such a function, so the engine resolves the name as usual.
+    /// `Err` means the function exists but the dialect cannot execute it.
+    fn expand_function_call(
+        &self,
+        _schema: &crate::schema::Schema,
+        _name: &str,
+        _args: &[turso_parser::ast::Expr],
+    ) -> crate::Result<Option<turso_parser::ast::Expr>> {
+        Ok(None)
     }
 
     /// Whether this dialect needs the custom-type machinery (DECODE/ENCODE,
@@ -272,6 +371,182 @@ mod tests {
             Ok(crate::Value::Numeric(crate::numeric::Numeric::Integer(
                 v + 1,
             )))
+        }
+
+        /// A trigger that executes a function is stored as
+        /// `test-trigger: <name> <time> <event>[,<event>] ON <table> EXECUTE <function> [WHEN <expr>]`,
+        /// one row for every event, like a frontend dialect would store its
+        /// own text.
+        fn parse_trigger_sql(&self, sql: &str) -> crate::Result<Vec<turso_parser::ast::Stmt>> {
+            let Some(text) = sql.strip_prefix("test-trigger: ") else {
+                return sqlite::parse_trigger_sql(sql);
+            };
+            let (text, when_clause) = match text.split_once(" WHEN ") {
+                Some((text, when)) => (text, Some(Box::new(parse_test_expr(when)?))),
+                None => (text, None),
+            };
+            let words: Vec<&str> = text.split_whitespace().collect();
+            let [name, time, events, "ON", table, "EXECUTE", function] = words.as_slice() else {
+                return Err(crate::LimboError::ParseError(format!(
+                    "invalid test trigger: {sql}"
+                )));
+            };
+            let time = match *time {
+                "BEFORE" => turso_parser::ast::TriggerTime::Before,
+                _ => turso_parser::ast::TriggerTime::After,
+            };
+            events
+                .split(',')
+                .map(|event| {
+                    let event = match event {
+                        "INSERT" => turso_parser::ast::TriggerEvent::Insert,
+                        "UPDATE" => turso_parser::ast::TriggerEvent::Update,
+                        _ => turso_parser::ast::TriggerEvent::Delete,
+                    };
+                    Ok(turso_parser::ast::Stmt::CreateTrigger {
+                        temporary: false,
+                        if_not_exists: false,
+                        trigger_name: turso_parser::ast::QualifiedName::single(
+                            turso_parser::ast::Name::exact(name.to_string()),
+                        ),
+                        time: Some(time),
+                        event,
+                        tbl_name: turso_parser::ast::QualifiedName::single(
+                            turso_parser::ast::Name::exact(table.to_string()),
+                        ),
+                        for_each_row: true,
+                        when_clause: when_clause.clone(),
+                        commands: vec![turso_parser::ast::TriggerCmd::ExecuteFunction {
+                            name: turso_parser::ast::QualifiedName::single(
+                                turso_parser::ast::Name::exact(function.to_string()),
+                            ),
+                            args: vec![],
+                        }],
+                    })
+                })
+                .collect()
+        }
+
+        fn format_trigger_sql(
+            &self,
+            input: &str,
+            stmt: &turso_parser::ast::Stmt,
+        ) -> crate::Result<String> {
+            if input.starts_with("test-trigger: ") {
+                return Ok(input.to_string());
+            }
+            sqlite::format_trigger_sql(stmt)
+        }
+
+        /// The stored text of a trigger function is a statement list in
+        /// which `{event}` stands for the event that fires the trigger. The
+        /// list can end with what the function returns: `RETURN NULL` skips
+        /// the row, `RETURN NULL WHEN <expr>` skips the row when the
+        /// expression is true, and `RETURN <column> = <expr>, ...` changes
+        /// these columns of the row.
+        fn expand_trigger_function(
+            &self,
+            schema: &crate::schema::Schema,
+            call: &TriggerFunctionCall<'_>,
+        ) -> crate::Result<TriggerFunctionBody> {
+            use turso_parser::ast::{Cmd, Stmt, TriggerCmd, TriggerEvent};
+            use turso_parser::parser::Parser;
+
+            let name = call.function.name.as_str();
+            let Some(function) = schema.get_user_function(name, 0) else {
+                return Err(crate::LimboError::ParseError(format!(
+                    "no such function: {name}"
+                )));
+            };
+            let event = match call.trigger.event {
+                TriggerEvent::Insert => "insert",
+                TriggerEvent::Update | TriggerEvent::UpdateOf(_) => "update",
+                TriggerEvent::Delete => "delete",
+            };
+            let body = function.sql.replace("{event}", event);
+            let (body, returned_row) = match body.split_once("RETURN ") {
+                Some((body, returned)) => (
+                    body.to_string(),
+                    test_trigger_return(returned, call.table.columns())?,
+                ),
+                None => (body, TriggerReturn::Unchanged),
+            };
+            let mut parser = Parser::new(body.as_bytes());
+            let mut commands = Vec::new();
+            while let Some(Cmd::Stmt(stmt)) = parser.next_cmd()? {
+                commands.push(match stmt {
+                    Stmt::Insert {
+                        tbl_name,
+                        columns,
+                        body: turso_parser::ast::InsertBody::Select(select, upsert),
+                        ..
+                    } => TriggerCmd::Insert {
+                        or_conflict: None,
+                        tbl_name: tbl_name.name,
+                        col_names: columns,
+                        select,
+                        upsert,
+                        returning: vec![],
+                    },
+                    Stmt::Select(select) => TriggerCmd::Select(select),
+                    other => {
+                        return Err(crate::LimboError::ParseError(format!(
+                            "unsupported trigger function statement: {other}"
+                        )))
+                    }
+                });
+            }
+            Ok(TriggerFunctionBody {
+                commands,
+                returned_row,
+            })
+        }
+
+        fn triggers_fire_in_name_order(&self) -> bool {
+            true
+        }
+
+        /// The stored text of a function is an expression over the parameter
+        /// `x`, such as `x * 2`.
+        fn expand_function_call(
+            &self,
+            schema: &crate::schema::Schema,
+            name: &str,
+            args: &[turso_parser::ast::Expr],
+        ) -> crate::Result<Option<turso_parser::ast::Expr>> {
+            use turso_parser::ast::{Cmd, Expr, OneSelect, ResultColumn, Stmt};
+            use turso_parser::parser::Parser;
+
+            let Some(function) = schema.get_user_function(name, args.len()) else {
+                if schema.user_functions_named(name).is_empty() {
+                    return Ok(None);
+                }
+                return Err(crate::LimboError::ParseError(format!(
+                    "function {name} does not take {} arguments",
+                    args.len()
+                )));
+            };
+            let Ok(Some(Cmd::Stmt(Stmt::Select(select)))) =
+                Parser::new(format!("SELECT {}", function.sql).as_bytes()).next_cmd()
+            else {
+                return Err(crate::LimboError::ParseError(format!(
+                    "function {name} has an invalid body"
+                )));
+            };
+            let OneSelect::Select { columns, .. } = select.body.select else {
+                unreachable!("SELECT without VALUES");
+            };
+            let Some(ResultColumn::Expr(mut body, _)) = columns.into_iter().next() else {
+                unreachable!("SELECT with one column");
+            };
+            crate::translate::expr::walk_expr_mut(&mut body, &mut |expr| {
+                if matches!(expr, Expr::Id(id) if id.as_str() == "x") {
+                    *expr = args[0].clone();
+                    return Ok(crate::translate::expr::WalkControl::SkipChildren);
+                }
+                Ok(crate::translate::expr::WalkControl::Continue)
+            })?;
+            Ok(Some(*body))
         }
 
         fn register_catalog(
@@ -518,6 +793,61 @@ mod tests {
         }
     }
 
+    fn parse_test_expr(sql: &str) -> crate::Result<turso_parser::ast::Expr> {
+        let select = format!("SELECT {sql}");
+        let mut parser = turso_parser::parser::Parser::new(select.as_bytes());
+        let Some(turso_parser::ast::Cmd::Stmt(turso_parser::ast::Stmt::Select(select))) =
+            parser.next_cmd()?
+        else {
+            return Err(crate::LimboError::ParseError(format!(
+                "invalid test expression: {sql}"
+            )));
+        };
+        let turso_parser::ast::OneSelect::Select { columns, .. } = select.body.select else {
+            unreachable!("SELECT {sql} is a simple select");
+        };
+        let turso_parser::ast::ResultColumn::Expr(expr, _) = columns.into_iter().next().unwrap()
+        else {
+            unreachable!("SELECT {sql} has an expression column");
+        };
+        Ok(*expr)
+    }
+
+    fn test_trigger_return(
+        returned: &str,
+        columns: &[crate::schema::Column],
+    ) -> crate::Result<TriggerReturn> {
+        let returned = returned.trim();
+        if returned == "NULL" {
+            return Ok(TriggerReturn::Skip);
+        }
+        if let Some(condition) = returned.strip_prefix("NULL WHEN ") {
+            return Ok(TriggerReturn::Row {
+                skip_when: Some(parse_test_expr(condition)?),
+                columns: vec![None; columns.len()],
+            });
+        }
+        let mut values = vec![None; columns.len()];
+        for assignment in returned.split(", ") {
+            let Some((column, value)) = assignment.split_once(" = ") else {
+                return Err(crate::LimboError::ParseError(format!(
+                    "invalid test trigger return: {returned}"
+                )));
+            };
+            let index = columns
+                .iter()
+                .position(|c| c.name.as_deref() == Some(column))
+                .ok_or_else(|| {
+                    crate::LimboError::ParseError(format!("no such column: {column}"))
+                })?;
+            values[index] = Some(parse_test_expr(value)?);
+        }
+        Ok(TriggerReturn::Row {
+            skip_when: None,
+            columns: values,
+        })
+    }
+
     fn open_db(
         io: &Arc<dyn IO>,
         path: &str,
@@ -579,6 +909,557 @@ mod tests {
         );
         assert_eq!(dialect.statement_parse_calls.load(Ordering::SeqCst), 2);
         conn.close().unwrap();
+    }
+
+    /// `CREATE FUNCTION` as a frontend dialect translates it: the engine
+    /// gets the name, the number of parameters and the text to store.
+    fn create_function_cmd(
+        name: &str,
+        arg_count: usize,
+        sql: &str,
+        or_replace: bool,
+    ) -> turso_parser::ast::Cmd {
+        turso_parser::ast::Cmd::Stmt(turso_parser::ast::Stmt::CreateFunction(
+            turso_parser::ast::CreateFunction {
+                or_replace,
+                name: turso_parser::ast::Name::exact(name.to_string()),
+                arg_count,
+                sql: sql.to_string(),
+            },
+        ))
+    }
+
+    fn drop_function_cmd(name: &str, arg_types: Option<Vec<&str>>) -> turso_parser::ast::Cmd {
+        turso_parser::ast::Cmd::Stmt(turso_parser::ast::Stmt::DropFunction {
+            if_exists: false,
+            name: turso_parser::ast::Name::exact(name.to_string()),
+            arg_types: arg_types.map(|types| types.into_iter().map(str::to_string).collect()),
+        })
+    }
+
+    fn run_cmd(conn: &Arc<crate::Connection>, cmd: turso_parser::ast::Cmd) -> crate::Result<()> {
+        let input = cmd.to_string();
+        conn.prepare_translated_cmd(cmd, &input)?.run_ignore_rows()
+    }
+
+    fn stored_function_sqls(conn: &Arc<crate::Connection>, name: &str) -> Vec<(usize, String)> {
+        let mut functions: Vec<(usize, String)> = conn
+            .current_schema()
+            .user_functions_named(name)
+            .iter()
+            .map(|function| (function.arg_count, function.sql.clone()))
+            .collect();
+        functions.sort();
+        functions
+    }
+
+    #[test]
+    fn create_function_stores_the_text_for_the_dialect() {
+        let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+        let db = open_db(
+            &io,
+            "dialect-functions.db",
+            Arc::new(TestDialect::default()),
+        )
+        .unwrap();
+        let conn = db.connect(ConnectOpts::new()).unwrap();
+        let other = db.connect(ConnectOpts::new()).unwrap();
+
+        let one_param = "CREATE FUNCTION add_tax(price) RETURN price * 1.2";
+        run_cmd(&conn, create_function_cmd("add_tax", 1, one_param, false)).unwrap();
+        // The same name with another number of parameters is another function.
+        let two_params = "CREATE FUNCTION add_tax(price, rate) RETURN price * rate";
+        run_cmd(&conn, create_function_cmd("add_tax", 2, two_params, false)).unwrap();
+        assert_eq!(
+            stored_function_sqls(&conn, "add_tax"),
+            vec![(1, one_param.to_string()), (2, two_params.to_string())]
+        );
+
+        // The second definition needs OR REPLACE.
+        let err = run_cmd(&conn, create_function_cmd("add_tax", 1, one_param, false)).unwrap_err();
+        assert!(err.to_string().contains("already exists"), "{err}");
+        let replaced = "CREATE FUNCTION add_tax(price) RETURN price * 1.3";
+        run_cmd(&conn, create_function_cmd("ADD_TAX", 1, replaced, true)).unwrap();
+        assert_eq!(
+            stored_function_sqls(&conn, "add_tax"),
+            vec![(1, replaced.to_string()), (2, two_params.to_string())]
+        );
+
+        // The other connection loads the functions with the changed schema.
+        other.execute("SELECT 1").unwrap();
+        assert_eq!(
+            stored_function_sqls(&other, "add_tax"),
+            vec![(1, replaced.to_string()), (2, two_params.to_string())]
+        );
+
+        // DROP FUNCTION without parameter types needs one function of the name.
+        let err = run_cmd(&conn, drop_function_cmd("add_tax", None)).unwrap_err();
+        assert!(err.to_string().contains("is not unique"), "{err}");
+        run_cmd(
+            &conn,
+            drop_function_cmd("add_tax", Some(vec!["real", "real"])),
+        )
+        .unwrap();
+        run_cmd(&conn, drop_function_cmd("add_tax", None)).unwrap();
+        assert!(stored_function_sqls(&conn, "add_tax").is_empty());
+        let err = run_cmd(&conn, drop_function_cmd("add_tax", Some(vec!["real"]))).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "Parse error: function add_tax(real) does not exist"
+        );
+
+        run_cmd(
+            &conn,
+            create_function_cmd("kept", 0, "CREATE FUNCTION kept() RETURN 1", false),
+        )
+        .unwrap();
+        conn.close().unwrap();
+        other.close().unwrap();
+        drop(db);
+
+        // The functions are read from the database file at open.
+        let db = open_db(
+            &io,
+            "dialect-functions.db",
+            Arc::new(TestDialect::default()),
+        )
+        .unwrap();
+        let conn = db.connect(ConnectOpts::new()).unwrap();
+        assert_eq!(
+            stored_function_sqls(&conn, "kept"),
+            vec![(0, "CREATE FUNCTION kept() RETURN 1".to_string())]
+        );
+        assert!(stored_function_sqls(&conn, "add_tax").is_empty());
+        conn.close().unwrap();
+    }
+
+    #[test]
+    fn dialect_expands_calls_to_stored_functions() {
+        let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+        let db = open_db(&io, "dialect-expand.db", Arc::new(TestDialect::default())).unwrap();
+        let conn = db.connect(ConnectOpts::new()).unwrap();
+        conn.execute("CREATE TABLE t (v INTEGER)").unwrap();
+        conn.execute("INSERT INTO t VALUES (1), (5), (20)").unwrap();
+
+        // Without a stored function of that name, the call is an unknown function.
+        let err = conn.prepare("SELECT twice(21)").unwrap_err();
+        assert!(err.to_string().contains("no such function"), "{err}");
+
+        run_cmd(&conn, create_function_cmd("twice", 1, "x * 2", false)).unwrap();
+        run_cmd(&conn, create_function_cmd("half", 1, "x / 2", false)).unwrap();
+        let query = |sql: &str| {
+            conn.prepare(sql)
+                .unwrap()
+                .run_collect_rows()
+                .unwrap()
+                .into_iter()
+                .map(|row| row[0].clone())
+                .collect::<Vec<_>>()
+        };
+        let ints = |values: &[i64]| {
+            values
+                .iter()
+                .map(|v| crate::Value::from_i64(*v))
+                .collect::<Vec<_>>()
+        };
+
+        assert_eq!(query("SELECT twice(21)"), ints(&[42]));
+        // A call inside a call, and calls in every clause of a statement.
+        assert_eq!(query("SELECT twice(twice(half(21)))"), ints(&[40]));
+        assert_eq!(
+            query("SELECT twice(v) FROM t WHERE twice(v) > 5 ORDER BY half(twice(v)) DESC"),
+            ints(&[40, 10])
+        );
+        assert_eq!(
+            query("SELECT (SELECT max(twice(v)) FROM t WHERE twice(v) < twice(10))"),
+            ints(&[10])
+        );
+        assert_eq!(
+            query("SELECT count(*) FROM t WHERE v IN (SELECT half(v) FROM t)"),
+            ints(&[0])
+        );
+        conn.execute("UPDATE t SET v = twice(v) WHERE half(v) = 10")
+            .unwrap();
+        conn.execute("INSERT INTO t VALUES (twice(50))").unwrap();
+        conn.execute("DELETE FROM t WHERE twice(v) = 2").unwrap();
+        assert_eq!(query("SELECT v FROM t ORDER BY v"), ints(&[5, 40, 100]));
+
+        // A name with the wrong number of arguments is an error from the dialect.
+        let err = conn.prepare("SELECT twice(1, 2)").unwrap_err();
+        assert!(
+            err.to_string().contains("does not take 2 arguments"),
+            "{err}"
+        );
+        // Built-in functions keep their meaning.
+        assert_eq!(query("SELECT abs(-3)"), ints(&[3]));
+
+        run_cmd(&conn, drop_function_cmd("twice", None)).unwrap();
+        let err = conn.prepare("SELECT twice(21)").unwrap_err();
+        assert!(err.to_string().contains("no such function"), "{err}");
+        conn.close().unwrap();
+    }
+
+    #[test]
+    fn dialect_triggers_execute_stored_functions() {
+        use turso_parser::ast::{Cmd, Name, QualifiedName, Stmt, TriggerCmd, TriggerEvent};
+
+        let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+        let db = open_db(&io, "dialect-triggers.db", Arc::new(TestDialect::default())).unwrap();
+        let conn = db.connect(ConnectOpts::new()).unwrap();
+        conn.execute("CREATE TABLE t (v INTEGER)").unwrap();
+        conn.execute("CREATE TABLE log (event TEXT, v INTEGER)")
+            .unwrap();
+        run_cmd(
+            &conn,
+            create_function_cmd(
+                "log_change",
+                0,
+                "INSERT INTO log VALUES ('{event}', NEW.v)",
+                false,
+            ),
+        )
+        .unwrap();
+
+        // The dialect translates its CREATE TRIGGER to one engine trigger, the
+        // first event, and stores its own text, which holds every event.
+        let input = "test-trigger: trg AFTER INSERT,UPDATE ON t EXECUTE log_change";
+        let create_trigger = Cmd::Stmt(Stmt::CreateTrigger {
+            temporary: false,
+            if_not_exists: false,
+            trigger_name: QualifiedName::single(Name::exact("trg".to_string())),
+            time: Some(turso_parser::ast::TriggerTime::After),
+            event: TriggerEvent::Insert,
+            tbl_name: QualifiedName::single(Name::exact("t".to_string())),
+            for_each_row: true,
+            when_clause: None,
+            commands: vec![TriggerCmd::ExecuteFunction {
+                name: QualifiedName::single(Name::exact("log_change".to_string())),
+                args: vec![],
+            }],
+        });
+        conn.prepare_translated_cmd(create_trigger, input)
+            .unwrap()
+            .run_ignore_rows()
+            .unwrap();
+        let stored = conn
+            .prepare("SELECT sql FROM sqlite_schema WHERE type = 'trigger'")
+            .unwrap()
+            .run_collect_rows()
+            .unwrap();
+        assert_eq!(stored, vec![vec![crate::Value::build_text(input)]]);
+        let events = |conn: &Arc<crate::Connection>| {
+            let mut events: Vec<TriggerEvent> = conn
+                .current_schema()
+                .get_triggers_for_table("t")
+                .map(|trigger| trigger.event.clone())
+                .collect();
+            events.sort_by_key(|event| format!("{event:?}"));
+            events
+        };
+        assert_eq!(
+            events(&conn),
+            vec![TriggerEvent::Insert, TriggerEvent::Update]
+        );
+
+        let query = |sql: &str| {
+            conn.prepare(sql)
+                .unwrap()
+                .run_collect_rows()
+                .unwrap()
+                .into_iter()
+                .map(|row| {
+                    row.iter()
+                        .map(|value| value.to_string())
+                        .collect::<Vec<_>>()
+                        .join("|")
+                })
+                .collect::<Vec<_>>()
+        };
+        conn.execute("INSERT INTO t VALUES (1), (2)").unwrap();
+        conn.execute("UPDATE t SET v = 3 WHERE v = 2").unwrap();
+        conn.execute("DELETE FROM t WHERE v = 1").unwrap();
+        assert_eq!(
+            query("SELECT event, v FROM log ORDER BY rowid"),
+            vec!["insert|1", "insert|2", "update|3"]
+        );
+
+        // The next compilation of a statement uses the new function text.
+        run_cmd(
+            &conn,
+            create_function_cmd(
+                "log_change",
+                0,
+                "INSERT INTO log VALUES ('{event}!', NEW.v)",
+                true,
+            ),
+        )
+        .unwrap();
+        conn.execute("INSERT INTO t VALUES (4)").unwrap();
+        assert_eq!(
+            query("SELECT event, v FROM log WHERE v = 4"),
+            vec!["insert!|4"]
+        );
+
+        // The triggers are loaded again from the stored text at open.
+        conn.close().unwrap();
+        drop(db);
+        let db = open_db(&io, "dialect-triggers.db", Arc::new(TestDialect::default())).unwrap();
+        let conn = db.connect(ConnectOpts::new()).unwrap();
+        assert_eq!(
+            events(&conn),
+            vec![TriggerEvent::Insert, TriggerEvent::Update]
+        );
+
+        // DROP TRIGGER removes both triggers of the name.
+        conn.execute("DROP TRIGGER trg").unwrap();
+        assert!(events(&conn).is_empty());
+        conn.execute("INSERT INTO t VALUES (5)").unwrap();
+        assert_eq!(
+            conn.prepare("SELECT count(*) FROM log")
+                .unwrap()
+                .run_collect_rows()
+                .unwrap(),
+            vec![vec![crate::Value::from_i64(4)]]
+        );
+        conn.close().unwrap();
+    }
+
+    fn create_test_trigger(conn: &Arc<crate::Connection>, input: &str) {
+        use turso_parser::ast::{Cmd, Name, QualifiedName, Stmt, TriggerCmd, TriggerEvent};
+        let (text, when_clause) = match input.split_once(" WHEN ") {
+            Some((text, when)) => (text, Some(Box::new(parse_test_expr(when).unwrap()))),
+            None => (input, None),
+        };
+        let words: Vec<&str> = text.split_whitespace().collect();
+        let create_trigger = Cmd::Stmt(Stmt::CreateTrigger {
+            temporary: false,
+            if_not_exists: false,
+            trigger_name: QualifiedName::single(Name::exact(words[1].to_string())),
+            time: Some(match words[2] {
+                "BEFORE" => turso_parser::ast::TriggerTime::Before,
+                _ => turso_parser::ast::TriggerTime::After,
+            }),
+            event: match words[3].split(',').next().unwrap() {
+                "INSERT" => TriggerEvent::Insert,
+                "UPDATE" => TriggerEvent::Update,
+                _ => TriggerEvent::Delete,
+            },
+            tbl_name: QualifiedName::single(Name::exact(words[5].to_string())),
+            for_each_row: true,
+            when_clause,
+            commands: vec![TriggerCmd::ExecuteFunction {
+                name: QualifiedName::single(Name::exact(words[7].to_string())),
+                args: vec![],
+            }],
+        });
+        conn.prepare_translated_cmd(create_trigger, input)
+            .unwrap()
+            .run_ignore_rows()
+            .unwrap();
+    }
+
+    fn query_text(conn: &Arc<crate::Connection>, sql: &str) -> Vec<String> {
+        conn.prepare(sql)
+            .unwrap()
+            .run_collect_rows()
+            .unwrap()
+            .into_iter()
+            .map(|row| {
+                row.iter()
+                    .map(|value| value.to_string())
+                    .collect::<Vec<_>>()
+                    .join("|")
+            })
+            .collect()
+    }
+
+    #[test]
+    fn before_trigger_function_returns_the_row_to_write() {
+        let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+        let db = open_db(&io, "returned-row.db", Arc::new(TestDialect::default())).unwrap();
+        let conn = db.connect(ConnectOpts::new()).unwrap();
+        conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER, w TEXT)")
+            .unwrap();
+        conn.execute("CREATE INDEX t_w ON t (w)").unwrap();
+        conn.execute("CREATE TABLE log (v INTEGER)").unwrap();
+        run_cmd(
+            &conn,
+            create_function_cmd(
+                "set_w",
+                0,
+                "INSERT INTO log VALUES (NEW.v); RETURN w = 'v' || NEW.v",
+                false,
+            ),
+        )
+        .unwrap();
+        run_cmd(
+            &conn,
+            create_function_cmd("double_v", 0, "RETURN v = NEW.v * 2", false),
+        )
+        .unwrap();
+        // Created in the opposite order of their names: the triggers fire in
+        // name order, so `set_w` sees the value before `double_v` changes it.
+        create_test_trigger(
+            &conn,
+            "test-trigger: b_trg BEFORE INSERT,UPDATE ON t EXECUTE double_v",
+        );
+        create_test_trigger(
+            &conn,
+            "test-trigger: a_trg BEFORE INSERT,UPDATE ON t EXECUTE set_w",
+        );
+
+        conn.execute("INSERT INTO t (v) VALUES (1), (2)").unwrap();
+        assert_eq!(
+            query_text(&conn, "SELECT id, v, w FROM t ORDER BY id"),
+            vec!["1|2|v1", "2|4|v2"]
+        );
+        assert_eq!(
+            query_text(&conn, "SELECT v FROM log ORDER BY rowid"),
+            vec!["1", "2"]
+        );
+
+        // The index over the column the trigger changed is maintained, also
+        // when the SET clauses do not name the column.
+        conn.execute("UPDATE t SET v = 3 WHERE id = 2").unwrap();
+        assert_eq!(
+            query_text(&conn, "SELECT id, v, w FROM t ORDER BY id"),
+            vec!["1|2|v1", "2|6|v3"]
+        );
+        assert_eq!(
+            query_text(&conn, "SELECT id FROM t WHERE w = 'v3'"),
+            vec!["2"]
+        );
+        assert!(query_text(&conn, "SELECT id FROM t WHERE w = 'v2'").is_empty());
+        // The BEFORE INSERT triggers change the row before the conflict is
+        // found, so `excluded.v` is 10, and the BEFORE UPDATE triggers change
+        // the row again.
+        conn.execute(
+            "INSERT INTO t (id, v) VALUES (1, 5) ON CONFLICT (id) DO UPDATE SET v = excluded.v",
+        )
+        .unwrap();
+        assert_eq!(
+            query_text(&conn, "SELECT id, v, w FROM t ORDER BY id"),
+            vec!["1|20|v10", "2|6|v3"]
+        );
+        assert_eq!(
+            query_text(&conn, "SELECT id FROM t WHERE w = 'v10'"),
+            vec!["1"]
+        );
+        assert_eq!(query_text(&conn, "PRAGMA integrity_check"), vec!["ok"]);
+
+        // A BEFORE INSERT trigger can set the INTEGER PRIMARY KEY column.
+        run_cmd(
+            &conn,
+            create_function_cmd("set_id", 0, "RETURN id = NEW.v + 40", false),
+        )
+        .unwrap();
+        create_test_trigger(
+            &conn,
+            "test-trigger: c_trg BEFORE INSERT ON t EXECUTE set_id",
+        );
+        conn.execute("INSERT INTO t (v) VALUES (7)").unwrap();
+        conn.execute("INSERT INTO t (id, v) VALUES (100, 8)")
+            .unwrap();
+        assert_eq!(
+            query_text(&conn, "SELECT id, v, w FROM t WHERE id > 40 ORDER BY id"),
+            vec!["54|14|v7", "56|16|v8"]
+        );
+        conn.execute("DROP TRIGGER c_trg").unwrap();
+
+        // When the trigger does not fire, the key is generated, also for the
+        // rows after a row whose key the trigger set.
+        create_test_trigger(
+            &conn,
+            "test-trigger: e_trg BEFORE INSERT ON t EXECUTE set_id WHEN NEW.v > 100",
+        );
+        conn.execute("INSERT INTO t (v) VALUES (1), (200), (3)")
+            .unwrap();
+        assert_eq!(
+            query_text(&conn, "SELECT id, v, w FROM t WHERE id > 56 ORDER BY id"),
+            vec!["57|2|v1", "440|400|v200", "441|6|v3"]
+        );
+        conn.execute("DROP TRIGGER e_trg").unwrap();
+
+        // A BEFORE UPDATE trigger cannot change the INTEGER PRIMARY KEY column.
+        create_test_trigger(
+            &conn,
+            "test-trigger: d_trg BEFORE UPDATE ON t EXECUTE set_id",
+        );
+        let err = conn.execute("UPDATE t SET v = 1 WHERE id = 1").unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("BEFORE UPDATE trigger cannot change the INTEGER PRIMARY KEY column id"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn returned_row_does_not_change_the_constant_set_values_of_the_next_row() {
+        let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+        let db = open_db(&io, "constant-set.db", Arc::new(TestDialect::default())).unwrap();
+        let conn = db.connect(ConnectOpts::new()).unwrap();
+        conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER, w TEXT)")
+            .unwrap();
+        run_cmd(
+            &conn,
+            create_function_cmd(
+                "keep_v",
+                0,
+                "RETURN v = CASE WHEN OLD.w = 'keep' THEN OLD.v ELSE NEW.v END",
+                false,
+            ),
+        )
+        .unwrap();
+        create_test_trigger(
+            &conn,
+            "test-trigger: keep BEFORE UPDATE ON t EXECUTE keep_v",
+        );
+        conn.execute(
+            "INSERT INTO t VALUES (1, 1, 'keep'), (2, 1, 'x'), (3, 1, 'keep'), (4, 1, 'x')",
+        )
+        .unwrap();
+        conn.execute("UPDATE t SET v = 8").unwrap();
+        assert_eq!(
+            query_text(&conn, "SELECT id, v FROM t ORDER BY id"),
+            vec!["1|1", "2|8", "3|1", "4|8"]
+        );
+    }
+
+    #[test]
+    fn before_trigger_function_skips_the_row() {
+        let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+        let db = open_db(&io, "skipped-row.db", Arc::new(TestDialect::default())).unwrap();
+        let conn = db.connect(ConnectOpts::new()).unwrap();
+        conn.execute("CREATE TABLE t (v INTEGER)").unwrap();
+        run_cmd(
+            &conn,
+            create_function_cmd("skip_odd", 0, "RETURN NULL WHEN NEW.v % 2 = 1", false),
+        )
+        .unwrap();
+        run_cmd(
+            &conn,
+            create_function_cmd("keep_row", 0, "RETURN NULL", false),
+        )
+        .unwrap();
+        create_test_trigger(
+            &conn,
+            "test-trigger: skip BEFORE INSERT,UPDATE ON t EXECUTE skip_odd",
+        );
+        create_test_trigger(
+            &conn,
+            "test-trigger: keep BEFORE DELETE ON t EXECUTE keep_row",
+        );
+
+        conn.execute("INSERT INTO t VALUES (1), (2), (3)").unwrap();
+        assert_eq!(query_text(&conn, "SELECT changes()"), vec!["1"]);
+        assert_eq!(query_text(&conn, "SELECT v FROM t"), vec!["2"]);
+        conn.execute("UPDATE t SET v = 5").unwrap();
+        assert_eq!(query_text(&conn, "SELECT v FROM t"), vec!["2"]);
+        conn.execute("UPDATE t SET v = 4").unwrap();
+        assert_eq!(query_text(&conn, "SELECT v FROM t"), vec!["4"]);
+        conn.execute("DELETE FROM t").unwrap();
+        assert_eq!(query_text(&conn, "SELECT changes()"), vec!["0"]);
+        assert_eq!(query_text(&conn, "SELECT v FROM t"), vec!["4"]);
     }
 
     #[test]

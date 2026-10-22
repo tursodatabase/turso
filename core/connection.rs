@@ -258,6 +258,12 @@ enum ReparsePhase {
         stmt: Box<Statement>,
         type_rows: Vec<String>,
     },
+    /// Loading the functions that CREATE FUNCTION created from the internal
+    /// functions table.
+    LoadFunctions {
+        stmt: Box<Statement>,
+        functions: Vec<crate::schema::UserFunction>,
+    },
     /// Best-effort ANALYZE-stats refresh before finalizing.
     RefreshStats {
         stats: crate::stats::RefreshAnalyzeStatsState,
@@ -1631,9 +1637,7 @@ impl Connection {
                             type_rows: Vec::new(),
                         };
                     } else {
-                        inner.phase = ReparsePhase::RefreshStats {
-                            stats: Default::default(),
-                        };
+                        inner.phase = self.reparse_phase_after_types(&inner.fresh)?;
                     }
                 }
                 ReparsePhase::LoadTypes { stmt, type_rows } => {
@@ -1643,6 +1647,14 @@ impl Connection {
                     }));
                     let type_rows = std::mem::take(type_rows);
                     inner.fresh.load_type_definitions(&type_rows)?;
+                    inner.phase = self.reparse_phase_after_types(&inner.fresh)?;
+                }
+                ReparsePhase::LoadFunctions { stmt, functions } => {
+                    crate::return_if_io!(stmt.run_with_row_callback_nonblock(|row| {
+                        functions.push(user_function_from_row(row)?);
+                        Ok(())
+                    }));
+                    inner.fresh.load_user_functions(std::mem::take(functions));
                     inner.phase = ReparsePhase::RefreshStats {
                         stats: Default::default(),
                     };
@@ -1974,6 +1986,54 @@ impl Connection {
             Ok(())
         })?;
         Ok(type_rows)
+    }
+
+    /// The phase after the types are loaded: load the functions that CREATE
+    /// FUNCTION created when the internal functions table exists, else refresh
+    /// the statistics.
+    fn reparse_phase_after_types(self: &Arc<Connection>, fresh: &Schema) -> Result<ReparsePhase> {
+        if !fresh
+            .tables
+            .contains_key(crate::schema::TURSO_FUNCTIONS_TABLE_NAME)
+        {
+            return Ok(ReparsePhase::RefreshStats {
+                stats: Default::default(),
+            });
+        }
+        // Temporarily install the schema so we can query against it.
+        self.with_schema_mut(|schema| {
+            *schema = fresh.try_clone()?;
+            Ok::<_, crate::alloc::TryReserveError>(())
+        })??;
+        let stmt = self.prepare_internal(stored_user_functions_query())?;
+        Ok(ReparsePhase::LoadFunctions {
+            stmt: Box::new(stmt),
+            functions: Vec::new(),
+        })
+    }
+
+    /// Query the functions stored in __turso_internal_functions. The
+    /// connection's schema must already contain the table definitions so that
+    /// `prepare` can resolve the table name. Returns an empty Vec if the
+    /// functions table does not exist.
+    pub(crate) fn query_stored_user_functions(
+        self: &Arc<Connection>,
+    ) -> Result<Vec<crate::schema::UserFunction>> {
+        let has_functions_table = {
+            let s = self.schema.read();
+            s.tables
+                .contains_key(crate::schema::TURSO_FUNCTIONS_TABLE_NAME)
+        };
+        if !has_functions_table {
+            return Ok(Vec::new());
+        }
+        let mut stmt = self.prepare_internal(stored_user_functions_query())?;
+        let mut functions = Vec::new();
+        stmt.run_with_row_callback(|row| {
+            functions.push(user_function_from_row(row)?);
+            Ok(())
+        })?;
+        Ok(functions)
     }
 
     pub fn maybe_update_schema(&self) {
@@ -4966,6 +5026,26 @@ impl std::fmt::Debug for SymbolTable {
             .field("collations", &self.collations)
             .finish()
     }
+}
+
+fn stored_user_functions_query() -> String {
+    format!(
+        "SELECT name, nargs, sql FROM {}",
+        crate::schema::TURSO_FUNCTIONS_TABLE_NAME
+    )
+}
+
+fn user_function_from_row(row: &crate::vdbe::Row) -> Result<crate::schema::UserFunction> {
+    let arg_count = row.get::<i64>(1)?;
+    Ok(crate::schema::UserFunction {
+        name: row.get::<&str>(0)?.to_string(),
+        arg_count: usize::try_from(arg_count).map_err(|_| {
+            LimboError::Corrupt(format!(
+                "malformed database schema - function has {arg_count} parameters"
+            ))
+        })?,
+        sql: row.get::<&str>(2)?.to_string(),
+    })
 }
 
 fn is_shared_library(path: &std::path::Path) -> bool {

@@ -18,7 +18,8 @@ use crate::translate::insert::{format_unique_violation_desc, InsertEmitCtx};
 use crate::translate::plan::ColumnMask;
 use crate::translate::planner::ROWID_STRS;
 use crate::translate::trigger_exec::{
-    fire_trigger, get_triggers_including_temp, has_triggers_including_temp, TriggerContext,
+    columns_changed_by_triggers, fire_trigger, get_triggers_including_temp,
+    has_triggers_including_temp, TriggerContext,
 };
 use crate::translate::update::rowid_name_column_index;
 use crate::vdbe::insn::{to_u32, CmpInsFlags};
@@ -826,7 +827,7 @@ pub fn emit_upsert(
         )?;
     }
 
-    let (directly_changed_cols, rowid_changed) = collect_changed_cols(table, set_pairs);
+    let (mut directly_changed_cols, rowid_changed) = collect_changed_cols(table, set_pairs);
 
     // Fire BEFORE UPDATE triggers
     let upsert_database_id = ctx.database_id;
@@ -835,6 +836,29 @@ pub fn emit_upsert(
         .map(|(col_idx, _)| *col_idx)
         .try_collect()?;
     let table_btree = table.btree();
+    let relevant_before_update_triggers = match table_btree.as_deref() {
+        Some(btree_table) => get_triggers_including_temp(
+            resolver,
+            upsert_database_id,
+            TriggerEvent::Update,
+            TriggerTime::Before,
+            Some(set_column_names),
+            btree_table,
+        ),
+        None => Vec::new(),
+    };
+    // The columns that the rows returned by the BEFORE triggers change get
+    // their indexes maintained like the columns of the SET clauses.
+    let columns_changed_by_triggers = match table_btree.as_deref() {
+        Some(btree_table) => columns_changed_by_triggers(
+            resolver,
+            &relevant_before_update_triggers,
+            btree_table,
+            upsert_database_id,
+        )?,
+        None => ColumnMask::default(),
+    };
+    directly_changed_cols.union_with(&columns_changed_by_triggers)?;
     let affected_parent_fks = match (connection.foreign_keys_enabled(), table_btree.as_deref()) {
         (true, Some(table)) => {
             affected_parent_fks_for_update(resolver, table, &updated_positions, upsert_database_id)?
@@ -854,14 +878,6 @@ pub fn emit_upsert(
         )
     });
     let preserved_old_registers: Option<Vec<usize>> = if let Some(btree_table) = table_btree {
-        let relevant_before_update_triggers = get_triggers_including_temp(
-            resolver,
-            upsert_database_id,
-            TriggerEvent::Update,
-            TriggerTime::Before,
-            Some(set_column_names),
-            &btree_table,
-        );
         // OLD row values are in current_start registers
         let old_registers: Vec<usize> = (0..num_cols)
             .map(|i| layout.to_register(current_start, i))
@@ -886,7 +902,6 @@ pub fn emit_upsert(
                 Some(old_registers.clone()),
                 ast::ResolveType::Abort,
             );
-
             for trigger in relevant_before_update_triggers {
                 fire_trigger(
                     program,
@@ -897,6 +912,18 @@ pub fn emit_upsert(
                     upsert_database_id,
                     ctx.loop_labels.row_done,
                 )?;
+            }
+            // The values of the columns that the triggers changed, saved
+            // across the second read of the row: (column index, register).
+            let mut trigger_written_values = Vec::new();
+            for column in columns_changed_by_triggers.iter() {
+                let saved_reg = program.alloc_register();
+                program.emit_insn(Insn::Copy {
+                    src_reg: layout.to_register(new_start, column),
+                    dst_reg: saved_reg,
+                    extra_amount: 0,
+                });
+                trigger_written_values.push((column, saved_reg));
             }
 
             // BEFORE UPDATE triggers may have altered the btree, need to re-seek
@@ -943,6 +970,28 @@ pub fn emit_upsert(
                     resolver,
                 )?;
             }
+            // The rows the triggers returned win over the row on disk. Their
+            // values are user-facing, so they get the same conversions and
+            // checks as the row of the statement got before the triggers.
+            for (column, saved_reg) in &trigger_written_values {
+                program.emit_insn(Insn::Copy {
+                    src_reg: *saved_reg,
+                    dst_reg: layout.to_register(new_start, *column),
+                    extra_amount: 0,
+                });
+            }
+            if btree_table.is_strict && !trigger_written_values.is_empty() {
+                program.emit_insn(Insn::TypeCheck {
+                    start_reg: new_start,
+                    count: layout.num_non_virtual_cols(),
+                    check_generated: false,
+                    table_reference: BTreeTable::input_type_check_table_ref(
+                        &btree_table,
+                        resolver.schema(),
+                        Some(&columns_changed_by_triggers),
+                    )?,
+                });
+            }
             compute_new_row_virtual_columns(
                 program,
                 ctx,
@@ -951,6 +1000,63 @@ pub fn emit_upsert(
                 &layout,
                 resolver,
             )?;
+            if !trigger_written_values.is_empty() {
+                if btree_table.is_strict {
+                    crate::translate::expr::emit_custom_type_encode_columns(
+                        program,
+                        resolver,
+                        btree_table.columns(),
+                        new_start,
+                        Some(&columns_changed_by_triggers),
+                        &btree_table.name,
+                        &layout,
+                    )?;
+                    program.emit_insn(Insn::TypeCheck {
+                        start_reg: new_start,
+                        count: btree_table.columns().len(),
+                        check_generated: true,
+                        table_reference: BTreeTable::type_check_table_ref(
+                            &btree_table,
+                            resolver.schema(),
+                        ),
+                    });
+                } else {
+                    let affinity = btree_table
+                        .columns()
+                        .iter()
+                        .filter(|c| !c.is_virtual_generated())
+                        .map(|c| c.affinity());
+                    if affinity.clone().any(|a| a != Affinity::Blob) {
+                        if let Ok(count) = NonZeroUsize::try_from(layout.num_non_virtual_cols()) {
+                            program.emit_insn(Insn::Affinity {
+                                start_reg: new_start,
+                                count,
+                                affinities: affinity.map(|a| a.aff_mask()).collect(),
+                            });
+                        }
+                    }
+                }
+                emit_check_constraints(
+                    program,
+                    &btree_table.check_constraints,
+                    resolver,
+                    &btree_table.name,
+                    new_rowid_reg.unwrap_or(ctx.conflict_rowid_reg),
+                    btree_table
+                        .columns()
+                        .iter()
+                        .enumerate()
+                        .filter_map(|(idx, col)| {
+                            col.name
+                                .as_deref()
+                                .map(|n| (n, layout.to_register(new_start, idx)))
+                        }),
+                    connection,
+                    ast::ResolveType::Abort,
+                    ctx.loop_labels.row_done,
+                    Some(table_references),
+                )?;
+            }
 
             let has_relevant_after_triggers = has_triggers_including_temp(
                 resolver,

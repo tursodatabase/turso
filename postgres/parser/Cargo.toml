@@ -16,6 +16,7 @@ path = "lib.rs"
 
 [dependencies]
 pg_query = "6.1"
+serde_json = { workspace = true }
 miette = { workspace = true }
 thiserror = { workspace = true }
 turso_parser = { workspace = true }

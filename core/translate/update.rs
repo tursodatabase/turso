@@ -7,6 +7,7 @@ use crate::translate::expr::{bind_and_rewrite_expr, BindingBehavior};
 use crate::translate::expression_index::expression_index_column_usage;
 use crate::translate::plan::{ColumnMask, Operation};
 use crate::translate::planner::ROWID_STRS;
+use crate::translate::trigger_exec::{columns_changed_by_triggers, get_triggers_including_temp};
 use crate::{
     bail_parse_error,
     schema::Table,
@@ -436,12 +437,31 @@ fn prepare_update_plan(
         resolver,
     )?;
 
+    let columns_changed_by_triggers = match table.btree() {
+        Some(btree_table) => {
+            let updated_column_names: Vec<ast::Name> = set_clauses
+                .iter()
+                .flat_map(|set_clause| set_clause.column_names.iter().cloned())
+                .collect();
+            let before_triggers = get_triggers_including_temp(
+                resolver,
+                database_id,
+                ast::TriggerEvent::Update,
+                ast::TriggerTime::Before,
+                Some(&updated_column_names),
+                &btree_table,
+            );
+            columns_changed_by_triggers(resolver, &before_triggers, &btree_table, database_id)?
+        }
+        None => ColumnMask::default(),
+    };
     let indexes_to_update = collect_indexes_to_update(
         &table,
         table_name,
         database_id,
         columns,
         &set_clauses,
+        &columns_changed_by_triggers,
         &mut read_scope_tables,
         resolver,
     )?;
@@ -558,12 +578,16 @@ fn compose_update_set_clause(existing: &mut UpdateSetClause, expr: Box<Expr>) {
     existing.expr = expr;
 }
 
+/// The indexes that the UPDATE must maintain: those over a column of the
+/// SET clauses or a column that the BEFORE triggers change.
+#[allow(clippy::too_many_arguments)]
 fn collect_indexes_to_update(
     table: &Table,
     table_name: &str,
     database_id: usize,
     columns: &[crate::schema::Column],
     set_clauses: &[UpdateSetClause],
+    columns_changed_by_triggers: &ColumnMask,
     read_scope_tables: &mut TableReferences,
     resolver: &Resolver,
 ) -> crate::Result<Vec<Arc<crate::schema::Index>>> {
@@ -580,7 +604,14 @@ fn collect_indexes_to_update(
         set.column_index == ROWID_SENTINEL || columns[set.column_index].is_rowid_alias()
     });
     let updated_cols: Option<ColumnMask> = (!rowid_alias_used)
-        .then(|| set_clauses.iter().map(|set| set.column_index).try_collect())
+        .then(|| -> crate::Result<ColumnMask> {
+            let mut updated: ColumnMask = set_clauses
+                .iter()
+                .map(|set| set.column_index)
+                .try_collect()?;
+            updated.union_with(columns_changed_by_triggers)?;
+            Ok(updated)
+        })
         .transpose()?;
     let affected_cols = match (table.btree(), updated_cols.as_ref()) {
         (Some(bt), Some(updated)) => Some(bt.columns_affected_by_update(updated)?),

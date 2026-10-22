@@ -79,7 +79,10 @@ plus `pg_input_error_info`. Present but always empty: `pg_policy`,
 stored SQL; relation oid and pretty printing do not change the output),
 `pg_get_userbyid`, `pg_*_is_visible`, `pg_encoding_to_char`,
 `pg_input_is_valid`, `to_char` (numeric), `now`/`clock_timestamp`/
-`transaction_timestamp`/`statement_timestamp`.
+`transaction_timestamp`/`statement_timestamp` (`now()` and
+`transaction_timestamp()` give the time of `BEGIN` in a transaction block and
+the time the statement started outside one; `statement_timestamp()` gives the
+time the statement started; the time is text with milliseconds, without trailing zeros, and without a time zone, like a stored `timestamptz`).
 Session information functions: `version()`, `current_database()` /
 `current_catalog`, `current_schema` (call, bare-keyword, and FROM-position
 forms; the first schema of `search_path` that exists), `pg_backend_pid()`, `quote_ident()`, `quote_literal()`;
@@ -255,7 +258,7 @@ INTEGER. Unknown type names pass through as custom types.
 | Incremental sort for SELECT DISTINCT | ❌ Not supported | |
 | Incremental sort for window functions | ❌ Not supported | |
 | Inlined WITH queries (Common Table Expressions) | ❌ Not supported | |
-| Inlining of SQL functions | ❌ Not supported | |
+| Inlining of SQL functions | 🟡 Partial | A SQL function whose body is one expression without FROM is inlined into the calling statement, with the STRICT null test and a cast to the return type; this is the only way Turso executes a function |
 | Just-in-Time (JIT) compilation for expression evaluation and tuple deforming | ❌ Not supported | |
 | Load balancing for libpq / psql | ❌ Not supported | |
 | LZ4 compression for TOAST tables | ❌ Not supported | |
@@ -453,9 +456,9 @@ Upgrade is not supported.
 | ALTER TABLE / ENABLE REPLICA TRIGGER/RULE | ❌ Not supported | |
 | BEGIN ATOMIC function bodies | ❌ Not supported | |
 | CALL syntax for executing procedures | ❌ Not supported | |
-| CREATE FUNCTION | ❌ Not supported | Rejected with an error |
-| Column level triggers | ❌ Not supported | |
-| CREATE PROCEDURE syntax for SQL stored procedures | ❌ Not supported | |
+| CREATE FUNCTION | 🟡 Partial | `CREATE [OR REPLACE] FUNCTION` and `DROP FUNCTION` keep the function in the catalog (`pg_proc`, `pg_language`); functions are resolved by name and number of parameters, so overloads by parameter type are rejected; `SECURITY DEFINER` and `SET` options are accepted and ignored; a call to a SQL function with a body of one expression is inlined (see Inlining of SQL functions); a call to any other function gives an error |
+| Column level triggers | ✅ Supported | `UPDATE OF column` |
+| CREATE PROCEDURE syntax for SQL stored procedures | ❌ Not supported | Rejected with an error |
 | Event triggers | ❌ Not supported | |
 | FILTER clause for aggregate functions | ✅ Supported | |
 | ORDER BY support within aggregates | ❌ Not supported | Silently dropped |
@@ -463,23 +466,23 @@ Upgrade is not supported.
 | Per function statistics | ❌ Not supported | |
 | RETURN QUERY EXECUTE | ❌ Not supported | |
 | RETURNS TABLE | ❌ Not supported | |
-| Statement level triggers | ❌ Not supported | CREATE TRIGGER not translated |
+| Statement level triggers | ❌ Not supported | `FOR EACH ROW` triggers work (see Procedural Languages); `FOR EACH STATEMENT` is rejected |
 | Statement level TRUNCATE triggers | ❌ Not supported | |
 | Triggers on views | ❌ Not supported | |
 | Variadic functions | ❌ Not supported | |
-| WHEN clause for CREATE TRIGGER | ❌ Not supported | |
+| WHEN clause for CREATE TRIGGER | ✅ Supported | |
 
 ## Procedural Languages
 
 | Feature | Status | Notes |
 |---------|--------|-------|
-| Procedural languages (PL/pgSQL, PL/Python, ...) | ❌ Not supported | CREATE FUNCTION and DO are rejected with an error |
-| CASE in pl/pgsql | ❌ Not supported | |
+| Procedural languages (PL/pgSQL, PL/Python, ...) | 🟡 Partial | PL/pgSQL trigger functions: `CREATE TRIGGER ... FOR EACH ROW [WHEN (...)] EXECUTE FUNCTION f(args)` compiles the function for each trigger and each event when a statement that fires the trigger is prepared; the body can hold `INSERT`, `UPDATE`, `DELETE` with `NEW`, `OLD` and the `TG_*` variables, assignments `NEW.column := expression`, and `RETURN NEW`, `RETURN OLD` or `RETURN NULL`; a `BEFORE` trigger that returns `NEW` writes the row with the assigned columns, `RETURN NULL` skips the row, and the triggers of one event fire in the order of their names; a `BEFORE UPDATE` trigger cannot change the `INTEGER PRIMARY KEY` column and a trigger cannot change a generated column; an assigned value gets the cast of the translator for `int`, `real` and `text` columns (`3.7` into an `int` column gives `3`, PostgreSQL gives `4`) and the conversion of the custom type for the other columns; `IF`, `ELSIF`, `ELSE` and `CASE` run their statements under a condition that is evaluated one time into a variable of the connection (`__pl_set`, `__pl_get`), so a condition after `ELSIF` is also evaluated when an earlier branch ran; `RAISE EXCEPTION` stops the statement with its message (`%` takes the text of a parameter, there is no SQLSTATE), and `RAISE NOTICE`, `WARNING`, `INFO`, `LOG` and `DEBUG` do nothing; `PERFORM` runs its query; a `RETURN` in a branch stops the statements after it; the variables of `DECLARE` get their default at the start of each firing and their values with the same variable functions (`%TYPE` and `record` variables are rejected); `SELECT ... INTO` reads the first row of the query into variables or columns of `NEW` and sets `FOUND` (`STRICT` is rejected, and `FOUND` is set only by `SELECT INTO` and `RETURNING INTO`); `INSERT ... RETURNING ... INTO` reads the one row that the statement returns, and gives an error for a second row (`UPDATE` and `DELETE ... RETURNING ... INTO` are rejected); a name that is both a variable and a column of a table of the statement gives the PostgreSQL error when the statement runs; loops, cursors, `EXCEPTION`, `EXECUTE` and `GET DIAGNOSTICS` give an error when the trigger is used; `ALTER TABLE ... RENAME` of a table with such a trigger is rejected; the function cannot be called directly; DO is rejected with an error |
+| CASE in pl/pgsql | ✅ Supported | In trigger functions; see Procedural languages |
 | CONTINUE statement for PL/pgSQL | ❌ Not supported | |
 | CREATE TRANSFORM | ❌ Not supported | |
 | DO statement for pl/perl | ❌ Not supported | |
 | DO statement for pl/pgsql | ❌ Not supported | |
-| EXCEPTION support in PL/pgSQL | ❌ Not supported | |
+| EXCEPTION support in PL/pgSQL | ❌ Not supported | Gives an error when the trigger is used |
 | EXECUTE USING in PL/pgSQL | ❌ Not supported | |
 | FOREACH IN ARRAY in pl/pgsql | ❌ Not supported | |
 | IN/OUT/INOUT parameters for pl/pgsql and PL/SQL | ❌ Not supported | |

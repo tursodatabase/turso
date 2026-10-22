@@ -12113,6 +12113,15 @@ pub fn op_function(
                                 mut when_clause,
                                 mut commands,
                             } => {
+                                // The body of such a trigger is in its function,
+                                // and the translator refused a rename of its own
+                                // table, so the row stays as the dialect wrote it.
+                                if commands
+                                    .iter()
+                                    .any(|c| matches!(c, ast::TriggerCmd::ExecuteFunction { .. }))
+                                {
+                                    break 'sql None;
+                                }
                                 let trigger_tbl = normalize_ident(trigger_tbl_name.name.as_str());
 
                                 // Rewrite ON table name if it matches the renamed table
@@ -15136,6 +15145,41 @@ pub fn op_add_type(
     load_insn!(AddType { db, sql }, insn);
     let conn = program.connection.clone();
     conn.with_database_schema_mut(*db, |schema| schema.add_type_from_sql(sql))??;
+    state.pc += 1;
+    Ok(InsnFunctionStepResult::Step)
+}
+
+pub fn op_add_function(
+    program: &Program,
+    state: &mut ProgramState,
+    insn: &Insn,
+    _pager: &Arc<Pager>,
+) -> InsnResult {
+    load_insn!(AddFunction { db, function }, insn);
+    let conn = program.connection.clone();
+    conn.with_database_schema_mut(*db, |schema| {
+        schema.add_user_function(function.as_ref().clone())
+    })?;
+    state.pc += 1;
+    Ok(InsnFunctionStepResult::Step)
+}
+
+pub fn op_drop_function(
+    program: &Program,
+    state: &mut ProgramState,
+    insn: &Insn,
+    _pager: &Arc<Pager>,
+) -> InsnResult {
+    load_insn!(
+        DropFunction {
+            db,
+            name,
+            arg_count
+        },
+        insn
+    );
+    let conn = program.connection.clone();
+    conn.with_database_schema_mut(*db, |schema| schema.remove_user_function(name, *arg_count))?;
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
 }

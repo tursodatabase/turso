@@ -1,10 +1,12 @@
 mod catalog;
 mod copy;
+mod create_function;
 mod dialect;
 mod domain;
 mod functions;
 mod parse_edge_cases;
 mod sequence;
 mod table;
+mod trigger;
 mod type_aliases;
 mod update_from;

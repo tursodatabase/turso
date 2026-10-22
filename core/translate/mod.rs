@@ -163,12 +163,18 @@ pub fn translate(
 /// Translate SQL statement into bytecode program.
 #[turso_macros::trace_stack(detail = stmt_kind(&stmt))]
 pub fn translate_inner(
-    stmt: ast::Stmt,
+    mut stmt: ast::Stmt,
     resolver: &mut Resolver,
     program: &mut ProgramBuilder,
     connection: &Arc<Connection>,
     input: &str,
 ) -> Result<()> {
+    if expand_dialect_function_calls(&mut stmt, resolver)? {
+        // The statement now depends on the function text, which a change of
+        // the schema can replace. A read of the main database checks the
+        // schema cookie, so the statement is prepared again after a change.
+        program.begin_read_operation()?;
+    }
     let is_write = matches!(
         stmt,
         ast::Stmt::AlterTable { .. }
@@ -181,6 +187,8 @@ pub fn translate_inner(
             | ast::Stmt::CreateVirtualTable(..)
             | ast::Stmt::CreateType { .. }
             | ast::Stmt::CreateDomain { .. }
+            | ast::Stmt::CreateFunction(_)
+            | ast::Stmt::DropFunction { .. }
             | ast::Stmt::Delete { .. }
             | ast::Stmt::DropIndex { .. }
             | ast::Stmt::DropTable { .. }
@@ -264,29 +272,22 @@ pub fn translate_inner(
             connection,
             input,
         )?,
-        ast::Stmt::CreateTrigger {
-            temporary,
-            if_not_exists,
-            trigger_name,
-            time,
-            event,
-            tbl_name,
-            for_each_row,
-            when_clause,
-            commands,
-        } => {
-            // Reconstruct SQL for storage
-            let sql = trigger::create_trigger_to_sql(
+        stmt @ ast::Stmt::CreateTrigger { .. } => {
+            let sql = resolver.dialect.format_trigger_sql(input, &stmt)?;
+            let ast::Stmt::CreateTrigger {
                 temporary,
                 if_not_exists,
-                &trigger_name,
+                trigger_name,
                 time,
-                &event,
-                &tbl_name,
-                for_each_row,
-                when_clause.as_deref(),
-                &commands,
-            );
+                event: _,
+                tbl_name,
+                for_each_row: _,
+                when_clause,
+                commands,
+            } = stmt
+            else {
+                unreachable!("matched CREATE TRIGGER above");
+            };
             trigger::translate_create_trigger(
                 trigger_name,
                 resolver,
@@ -427,6 +428,20 @@ pub fn translate_inner(
             }
             schema::translate_drop_type(&domain_name, if_exists, true, resolver, program)?
         }
+        ast::Stmt::CreateFunction(function) => {
+            schema::translate_create_function(&function, resolver, program)?
+        }
+        ast::Stmt::DropFunction {
+            if_exists,
+            name,
+            arg_types,
+        } => schema::translate_drop_function(
+            if_exists,
+            &name,
+            arg_types.as_deref(),
+            resolver,
+            program,
+        )?,
         ast::Stmt::Pragma { .. } => {
             bail_parse_error!("PRAGMA statement cannot be evaluated in a nested context")
         }
@@ -538,6 +553,71 @@ pub fn translate_inner(
     Ok(())
 }
 
+/// Replace each call to a function that CREATE FUNCTION created with the
+/// expression the dialect gives for it, so the planner sees only expressions
+/// it can compile. A replacement can call another such function, so it is
+/// expanded too, up to a depth that stops a function that calls itself.
+/// Returns whether a call was replaced.
+fn expand_dialect_function_calls(stmt: &mut ast::Stmt, resolver: &Resolver) -> Result<bool> {
+    const MAX_EXPANSION_DEPTH: usize = 32;
+
+    fn expand_call(
+        expr: &mut ast::Expr,
+        schema: &Schema,
+        dialect: &dyn crate::dialect::Dialect,
+        depth: usize,
+        expanded: &mut bool,
+    ) -> Result<WalkControl> {
+        let ast::Expr::FunctionCall {
+            name,
+            distinctness: None,
+            args,
+            order_by,
+            within_group,
+            filter_over,
+        } = expr
+        else {
+            return Ok(WalkControl::Continue);
+        };
+        if !order_by.is_empty()
+            || !within_group.is_empty()
+            || filter_over.filter_clause.is_some()
+            || filter_over.over_clause.is_some()
+            || schema.user_functions_named(name.as_str()).is_empty()
+        {
+            return Ok(WalkControl::Continue);
+        }
+        let args: Vec<ast::Expr> = args.iter().map(|arg| (**arg).clone()).collect();
+        let Some(mut replacement) = dialect.expand_function_call(schema, name.as_str(), &args)?
+        else {
+            return Ok(WalkControl::Continue);
+        };
+        if depth >= MAX_EXPANSION_DEPTH {
+            bail_parse_error!(
+                "function {} is expanded too deeply: a function calls itself",
+                name.as_str()
+            );
+        }
+        crate::util::walk_expr_with_subqueries_mut(&mut replacement, &mut |expr| {
+            expand_call(expr, schema, dialect, depth + 1, expanded)
+        })?;
+        *expr = replacement;
+        *expanded = true;
+        Ok(WalkControl::SkipChildren)
+    }
+
+    let schema = resolver.schema();
+    if schema.user_functions.is_empty() {
+        return Ok(false);
+    }
+    let dialect = resolver.dialect.clone();
+    let mut expanded = false;
+    crate::util::walk_stmt_expressions_mut(stmt, &mut |expr| {
+        expand_call(expr, schema, dialect.as_ref(), 0, &mut expanded)
+    })?;
+    Ok(expanded)
+}
+
 fn stmt_kind(stmt: &ast::Stmt) -> &'static str {
     match stmt {
         ast::Stmt::AlterTable(_) => "alter_table",
@@ -559,6 +639,8 @@ fn stmt_kind(stmt: &ast::Stmt) -> &'static str {
         ast::Stmt::DropTable { .. } => "drop_table",
         ast::Stmt::DropType { .. } => "drop_type",
         ast::Stmt::DropDomain { .. } => "drop_domain",
+        ast::Stmt::CreateFunction(_) => "create_function",
+        ast::Stmt::DropFunction { .. } => "drop_function",
         ast::Stmt::DropTrigger { .. } => "drop_trigger",
         ast::Stmt::DropView { .. } => "drop_view",
         ast::Stmt::Insert { .. } => "insert",

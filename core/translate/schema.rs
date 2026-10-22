@@ -6,8 +6,9 @@ use crate::ext::VTabImpl;
 use crate::function::{Deterministic, Func, MathFunc, ScalarFunc};
 use crate::schema::{
     create_table, translate_ident_to_string_literal, type_registry_key, BTreeCharacteristics,
-    BTreeTable, ColDef, Column, SchemaObjectType, Table, Type, RESERVED_TABLE_PREFIXES,
-    SQLITE_SEQUENCE_TABLE_NAME, TURSO_TYPES_TABLE_NAME,
+    BTreeTable, ColDef, Column, SchemaObjectType, Table, Type, UserFunction,
+    RESERVED_TABLE_PREFIXES, SQLITE_SEQUENCE_TABLE_NAME, TURSO_FUNCTIONS_TABLE_NAME,
+    TURSO_TYPES_TABLE_NAME,
 };
 use crate::stats::STATS_TABLE;
 use crate::storage::pager::CreateBTreeFlags;
@@ -2633,63 +2634,12 @@ fn persist_type_definition(
     resolver: &Resolver,
     program: &mut ProgramBuilder,
 ) -> Result<()> {
-    // Ensure sqlite_turso_types table exists (lazy creation)
-    let types_table: Arc<BTreeTable>;
-    let types_root_page: RegisterOrLiteral<i64>;
-
-    if let Some(existing) = resolver.schema().get_btree_table(TURSO_TYPES_TABLE_NAME) {
-        types_table = existing.clone();
-        types_root_page = RegisterOrLiteral::Literal(existing.root_page);
-    } else {
-        // Create the sqlite_turso_types btree
-        let table_root_reg = program.alloc_register();
-        program.emit_insn(Insn::CreateBtree {
-            db: MAIN_DB_ID,
-            root: table_root_reg,
-            flags: CreateBTreeFlags::new_table(),
-        });
-        let create_sql =
-            format!("CREATE TABLE {TURSO_TYPES_TABLE_NAME}(name TEXT PRIMARY KEY, sql TEXT)");
-        types_table = Arc::new(BTreeTable::from_sql(&create_sql, 0)?);
-        types_root_page = RegisterOrLiteral::Register(table_root_reg);
-
-        // Register it in sqlite_schema so it persists
-        let schema_table = resolver.schema().get_btree_table(SQLITE_TABLEID).unwrap();
-        let schema_cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(schema_table));
-        program.emit_insn(Insn::OpenWrite {
-            cursor_id: schema_cursor_id,
-            root_page: 1i64.into(),
-            db: MAIN_DB_ID,
-        });
-        emit_schema_entry(
-            program,
-            resolver,
-            schema_cursor_id,
-            None,
-            SchemaEntryType::Table,
-            TURSO_TYPES_TABLE_NAME,
-            TURSO_TYPES_TABLE_NAME,
-            table_root_reg,
-            Some(create_sql),
-        )?;
-
-        // Parse schema to register the new table in-memory
-        program.emit_insn(Insn::ParseSchema {
-            db: schema_cursor_id,
-            where_clause: Some(format!(
-                "tbl_name = '{TURSO_TYPES_TABLE_NAME}' AND type != 'trigger'"
-            )),
-            trigger_target_database_id: None,
-        });
-    }
-
-    // Open sqlite_turso_types for writing
-    let types_cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(types_table));
-    program.emit_insn(Insn::OpenWrite {
-        cursor_id: types_cursor_id,
-        root_page: types_root_page,
-        db: MAIN_DB_ID,
-    });
+    let types_cursor_id = open_internal_table_for_write(
+        TURSO_TYPES_TABLE_NAME,
+        format!("CREATE TABLE {TURSO_TYPES_TABLE_NAME}(name TEXT PRIMARY KEY, sql TEXT)"),
+        resolver,
+        program,
+    )?;
 
     // Insert (name, sql) record
     let rowid_reg = program.alloc_register();
@@ -2730,6 +2680,68 @@ fn persist_type_definition(
     });
 
     Ok(())
+}
+
+/// Open a write cursor on an internal table of the main database. The table
+/// is created with `create_sql` and registered in sqlite_schema when it does
+/// not exist yet.
+fn open_internal_table_for_write(
+    table_name: &str,
+    create_sql: String,
+    resolver: &Resolver,
+    program: &mut ProgramBuilder,
+) -> Result<usize> {
+    let table: Arc<BTreeTable>;
+    let root_page: RegisterOrLiteral<i64>;
+
+    if let Some(existing) = resolver.schema().get_btree_table(table_name) {
+        table = existing.clone();
+        root_page = RegisterOrLiteral::Literal(existing.root_page);
+    } else {
+        let table_root_reg = program.alloc_register();
+        program.emit_insn(Insn::CreateBtree {
+            db: MAIN_DB_ID,
+            root: table_root_reg,
+            flags: CreateBTreeFlags::new_table(),
+        });
+        table = Arc::new(BTreeTable::from_sql(&create_sql, 0)?);
+        root_page = RegisterOrLiteral::Register(table_root_reg);
+
+        // Register it in sqlite_schema so it persists
+        let schema_table = resolver.schema().get_btree_table(SQLITE_TABLEID).unwrap();
+        let schema_cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(schema_table));
+        program.emit_insn(Insn::OpenWrite {
+            cursor_id: schema_cursor_id,
+            root_page: 1i64.into(),
+            db: MAIN_DB_ID,
+        });
+        emit_schema_entry(
+            program,
+            resolver,
+            schema_cursor_id,
+            None,
+            SchemaEntryType::Table,
+            table_name,
+            table_name,
+            table_root_reg,
+            Some(create_sql),
+        )?;
+
+        // Parse schema to register the new table in-memory
+        program.emit_insn(Insn::ParseSchema {
+            db: schema_cursor_id,
+            where_clause: Some(format!("tbl_name = '{table_name}' AND type != 'trigger'")),
+            trigger_target_database_id: None,
+        });
+    }
+
+    let cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(table));
+    program.emit_insn(Insn::OpenWrite {
+        cursor_id,
+        root_page,
+        db: MAIN_DB_ID,
+    });
+    Ok(cursor_id)
 }
 
 pub fn translate_create_type(
@@ -3113,4 +3125,190 @@ pub fn translate_drop_type(
     });
 
     Ok(())
+}
+
+/// Persists the function text into __turso_internal_functions and registers
+/// the function in memory. The engine does not read the text: the dialect
+/// that created the function parses it when a statement calls the function.
+pub fn translate_create_function(
+    function: &ast::CreateFunction,
+    resolver: &Resolver,
+    program: &mut ProgramBuilder,
+) -> Result<()> {
+    let name = normalize_ident(function.name.as_str());
+    let exists = resolver
+        .schema()
+        .get_user_function(&name, function.arg_count)
+        .is_some();
+    if exists && !function.or_replace {
+        bail_parse_error!("function \"{name}\" already exists with same argument types");
+    }
+
+    let cursor_id = open_internal_table_for_write(
+        TURSO_FUNCTIONS_TABLE_NAME,
+        format!("CREATE TABLE {TURSO_FUNCTIONS_TABLE_NAME}(name TEXT, nargs INTEGER, sql TEXT)"),
+        resolver,
+        program,
+    )?;
+    if exists {
+        emit_delete_user_function_rows(program, cursor_id, &name, function.arg_count);
+    }
+
+    let rowid_reg = program.alloc_register();
+    program.emit_insn(Insn::NewRowid {
+        cursor: cursor_id,
+        rowid_reg,
+        prev_largest_reg: 0,
+    });
+    let name_reg = program.emit_string8_new_reg(name.clone());
+    let arg_count_reg = program.alloc_register();
+    program.emit_int(function.arg_count as i64, arg_count_reg);
+    program.emit_string8_new_reg(function.sql.clone());
+    let record_reg = program.alloc_register();
+    program.emit_insn(Insn::MakeRecord {
+        start_reg: to_u32(name_reg),
+        count: to_u32(3),
+        dest_reg: to_u32(record_reg),
+        index_name: None,
+        affinity_str: None,
+    });
+    program.emit_insn(Insn::Insert {
+        cursor: cursor_id,
+        key_reg: rowid_reg,
+        record_reg,
+        flag: InsertFlags::new(),
+        table_name: TURSO_FUNCTIONS_TABLE_NAME.to_string(),
+    });
+
+    program.emit_insn(Insn::AddFunction {
+        db: MAIN_DB_ID,
+        function: Box::new(UserFunction {
+            name,
+            arg_count: function.arg_count,
+            sql: function.sql.clone(),
+        }),
+    });
+
+    program.emit_insn(Insn::SetCookie {
+        db: MAIN_DB_ID,
+        cookie: Cookie::SchemaVersion,
+        value: (resolver.schema().schema_version + 1) as i32,
+        p5: 0,
+    });
+
+    Ok(())
+}
+
+pub fn translate_drop_function(
+    if_exists: bool,
+    name: &ast::Name,
+    arg_types: Option<&[String]>,
+    resolver: &Resolver,
+    program: &mut ProgramBuilder,
+) -> Result<()> {
+    let normalized_name = normalize_ident(name.as_str());
+    let candidates = resolver.schema().user_functions_named(&normalized_name);
+    let function = match arg_types {
+        Some(arg_types) => candidates
+            .iter()
+            .find(|function| function.arg_count == arg_types.len()),
+        None => match candidates {
+            [] => None,
+            [function] => Some(function),
+            _ => bail_parse_error!("function name \"{}\" is not unique", name.as_str()),
+        },
+    };
+    let Some(function) = function else {
+        if if_exists {
+            return Ok(());
+        }
+        match arg_types {
+            Some(arg_types) => bail_parse_error!(
+                "function {}({}) does not exist",
+                name.as_str(),
+                arg_types.join(", ")
+            ),
+            None => bail_parse_error!("could not find a function named \"{}\"", name.as_str()),
+        }
+    };
+    let arg_count = function.arg_count;
+
+    let cursor_id = open_internal_table_for_write(
+        TURSO_FUNCTIONS_TABLE_NAME,
+        format!("CREATE TABLE {TURSO_FUNCTIONS_TABLE_NAME}(name TEXT, nargs INTEGER, sql TEXT)"),
+        resolver,
+        program,
+    )?;
+    emit_delete_user_function_rows(program, cursor_id, &normalized_name, arg_count);
+
+    program.emit_insn(Insn::DropFunction {
+        db: MAIN_DB_ID,
+        name: normalized_name,
+        arg_count,
+    });
+
+    program.emit_insn(Insn::SetCookie {
+        db: MAIN_DB_ID,
+        cookie: Cookie::SchemaVersion,
+        value: (resolver.schema().schema_version + 1) as i32,
+        p5: 0,
+    });
+
+    Ok(())
+}
+
+/// Delete the rows of the function with this name and number of parameters
+/// from the internal functions table, which `cursor_id` has open for writing.
+fn emit_delete_user_function_rows(
+    program: &mut ProgramBuilder,
+    cursor_id: usize,
+    name: &str,
+    arg_count: usize,
+) {
+    let name_reg = program.emit_string8_new_reg(name.to_string());
+    let arg_count_reg = program.alloc_register();
+    program.emit_int(arg_count as i64, arg_count_reg);
+
+    let end_loop_label = program.allocate_label();
+    let loop_start_label = program.allocate_label();
+    let skip_delete_label = program.allocate_label();
+
+    program.emit_insn(Insn::Rewind {
+        cursor_id,
+        pc_if_empty: end_loop_label,
+    });
+    program.preassign_label_to_next_insn(loop_start_label);
+
+    let row_name_reg = program.alloc_register();
+    program.emit_column_or_rowid(cursor_id, 0, row_name_reg);
+    program.emit_insn(Insn::Ne {
+        lhs: row_name_reg,
+        rhs: name_reg,
+        target_pc: skip_delete_label,
+        flags: CmpInsFlags::default(),
+        collation: program.curr_collation(),
+    });
+    let row_arg_count_reg = program.alloc_register();
+    program.emit_column_or_rowid(cursor_id, 1, row_arg_count_reg);
+    program.emit_insn(Insn::Ne {
+        lhs: row_arg_count_reg,
+        rhs: arg_count_reg,
+        target_pc: skip_delete_label,
+        flags: CmpInsFlags::default(),
+        collation: program.curr_collation(),
+    });
+    program.emit_insn(Insn::Delete {
+        cursor_id,
+        table_name: TURSO_FUNCTIONS_TABLE_NAME.to_string(),
+        is_part_of_update: false,
+    });
+
+    program.preassign_label_to_next_insn(skip_delete_label);
+    program.emit_insn(Insn::Next {
+        cursor_id,
+        pc_if_next: loop_start_label,
+        fullscan: false,
+        is_index: false,
+    });
+    program.preassign_label_to_next_insn(end_loop_label);
 }

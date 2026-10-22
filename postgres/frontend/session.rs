@@ -30,6 +30,12 @@ struct PgConnectionInner {
 struct SessionState {
     search_path: Option<Vec<String>>,
     search_path_setting: Option<String>,
+    /// The time of BEGIN, which `now()` returns until the transaction block
+    /// ends.
+    transaction_start: Option<String>,
+    /// The variables of the PL/pgSQL functions that run on the connection,
+    /// by key. The compiler gives each variable of each trigger its own key.
+    plpgsql_values: std::collections::HashMap<String, Value>,
 }
 
 type PgSessionState = Mutex<SessionState>;
@@ -200,9 +206,11 @@ fn prepare_statement(pg_conn: &Arc<PgConnectionInner>, sql: &str) -> Result<Stat
         };
     let translator = PostgreSQLTranslator::new();
     let translated = translator
-        .translate_with_prereqs(&parse_result)
+        .translate_with_prereqs(&parse_result, Some(&sql))
         .map_err(|e| LimboError::ParseError(e.to_string()))?;
     reject_catalog_dml(translated.cmd.stmt())?;
+    check_trigger_function(&pg_conn.conn, translated.cmd.stmt())?;
+    note_transaction_block(&pg_conn.conn, translated.cmd.stmt());
 
     let options = PrepareOptions {
         unqualified_database_search_path: search_path,
@@ -249,6 +257,94 @@ fn create_table_schema_from_search_path(
 /// current_schema() returns. None when no schema of `search_path` exists.
 /// The default search_path, "$user", public, gives public, since there is no
 /// schema named after a user.
+/// Keep the time BEGIN starts a transaction block, so `now()` returns it
+/// until COMMIT or ROLLBACK ends the block.
+fn note_transaction_block(conn: &Connection, stmt: &ast::Stmt) {
+    match stmt {
+        ast::Stmt::Begin { .. } if conn.get_auto_commit() => {
+            session_state(conn).lock().unwrap().transaction_start =
+                Some(crate::functions::clock_time());
+        }
+        ast::Stmt::Commit { .. }
+        | ast::Stmt::Rollback {
+            savepoint_name: None,
+            ..
+        } => end_transaction_block(conn),
+        _ => {}
+    }
+}
+
+/// The time the transaction block started: the time of BEGIN, or the time
+/// of the first statement that asked when BEGIN did not go through the
+/// session. A connection without PostgreSQL session state gets the time of
+/// the statement.
+pub(crate) fn transaction_block_start(conn: &Connection, statement_time: &str) -> String {
+    let Some(state) = conn.context::<PgSessionState>() else {
+        return statement_time.to_string();
+    };
+    state
+        .lock()
+        .unwrap()
+        .transaction_start
+        .get_or_insert_with(|| statement_time.to_string())
+        .clone()
+}
+
+pub(crate) fn end_transaction_block(conn: &Connection) {
+    if let Some(state) = conn.context::<PgSessionState>() {
+        state.lock().unwrap().transaction_start = None;
+    }
+}
+
+/// `__pl_set(key, value)`: keep the value of a PL/pgSQL variable.
+pub(crate) fn set_plpgsql_value(conn: &Connection, key: &str, value: Value) {
+    session_state(conn)
+        .lock()
+        .unwrap()
+        .plpgsql_values
+        .insert(key.to_string(), value);
+}
+
+/// `__pl_set_one(key, value)`: keep the value of the one row that
+/// `RETURNING ... INTO` expects. The rows of the statement are counted in
+/// the key with the suffix `.rows`, which the compiler sets to 0 before the
+/// statement, so a second row is an error.
+pub(crate) fn set_plpgsql_value_once(conn: &Connection, key: &str, value: Value) -> Result<()> {
+    let mut state = session_state(conn).lock().unwrap();
+    let rows_key = format!("{key}.rows");
+    let rows = state
+        .plpgsql_values
+        .get(&rows_key)
+        .and_then(Value::as_int)
+        .unwrap_or(0)
+        + 1;
+    if rows > 1 {
+        return Err(LimboError::InvalidArgument(
+            "query returned more than one row".to_string(),
+        ));
+    }
+    state.plpgsql_values.insert(rows_key, Value::from_i64(rows));
+    state.plpgsql_values.insert(key.to_string(), value);
+    Ok(())
+}
+
+/// `__pl_get(key)`: the value of a PL/pgSQL variable, NULL when nothing set
+/// it.
+pub(crate) fn plpgsql_value(conn: &Connection, key: &str) -> Value {
+    session_state(conn)
+        .lock()
+        .unwrap()
+        .plpgsql_values
+        .get(key)
+        .cloned()
+        .unwrap_or(Value::Null)
+}
+
+fn session_state(conn: &Connection) -> &PgSessionState {
+    conn.context::<PgSessionState>()
+        .expect("PostgreSQL connections have session state")
+}
+
 pub(crate) fn current_schema(conn: &Connection) -> Option<String> {
     let Some(search_path) = conn
         .context::<PgSessionState>()
@@ -260,6 +356,34 @@ pub(crate) fn current_schema(conn: &Connection) -> Option<String> {
     search_path
         .into_iter()
         .find(|schema| schema.eq_ignore_ascii_case("public") || attached.contains(schema))
+}
+
+/// PostgreSQL checks the function of a trigger when the trigger is created:
+/// it must exist and return `trigger`.
+fn check_trigger_function(conn: &Connection, stmt: &ast::Stmt) -> Result<()> {
+    let ast::Stmt::CreateTrigger { commands, .. } = stmt else {
+        return Ok(());
+    };
+    for command in commands {
+        let ast::TriggerCmd::ExecuteFunction { name, .. } = command else {
+            continue;
+        };
+        let function_name = name.name.as_str();
+        let schema = conn.current_schema();
+        let Some(stored) = schema.get_user_function(function_name, 0) else {
+            return Err(LimboError::ParseError(format!(
+                "function {function_name}() does not exist"
+            )));
+        };
+        let function = turso_pg_parser::function::PgFunction::parse(&stored.sql)
+            .map_err(|e| LimboError::ParseError(e.to_string()))?;
+        if !function.is_trigger() {
+            return Err(LimboError::ParseError(format!(
+                "function {function_name} must return type trigger"
+            )));
+        }
+    }
+    Ok(())
 }
 
 fn reject_catalog_dml(stmt: &ast::Stmt) -> Result<()> {

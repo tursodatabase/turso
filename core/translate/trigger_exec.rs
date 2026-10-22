@@ -1,3 +1,4 @@
+use crate::dialect::TriggerReturn;
 use crate::schema::{BTreeTable, Trigger};
 use crate::sync::Arc;
 use crate::translate::expr::WalkControl;
@@ -7,6 +8,7 @@ use crate::translate::subquery::{
 use crate::translate::{
     emitter::Resolver,
     expr::{self, translate_expr, walk_expr_mut},
+    plan::ColumnMask,
     planner::ROWID_STRS,
     translate_inner, ProgramBuilder, ProgramBuilderOpts,
 };
@@ -391,6 +393,12 @@ fn trigger_cmd_to_stmt_for_subprogram(
             rewrite_expressions_in_select_for_subprogram(&mut select_clone, subprogram_ctx)?;
             Ok(ast::Stmt::Select(select_clone))
         }
+        ast::TriggerCmd::ExecuteFunction { name, .. } => {
+            Err(crate::LimboError::InternalError(format!(
+                "trigger function {} was not expanded before compilation",
+                name.name.as_str()
+            )))
+        }
     }
 }
 
@@ -517,14 +525,17 @@ fn rewrite_trigger_expr_single_for_subprogram(
     Ok(())
 }
 
-/// Execute trigger commands by compiling them as a subprogram and emitting Program instruction
-/// Returns true if there are triggers that will fire.
+/// Execute the body of a trigger: its commands run as a subprogram, then
+/// the row its function returns is written over the row of the statement
+/// in `row_registers`. Returns true if the trigger fires.
 #[turso_macros::trace_stack(detail = trigger_event_kind(&trigger.event))]
+#[allow(clippy::too_many_arguments)]
 fn execute_trigger_commands(
     program: &mut ProgramBuilder,
     resolver: &mut Resolver,
     trigger: &Arc<Trigger>,
     ctx: &TriggerContext,
+    row_registers: Option<&[usize]>,
     connection: &Arc<crate::Connection>,
     database_id: usize,
     ignore_jump_target: BranchOffset,
@@ -548,6 +559,44 @@ fn execute_trigger_commands(
         connection: connection.clone(),
     };
 
+    let body = trigger_body(resolver, trigger, &ctx.table, database_id)?;
+    if !body.commands.is_empty() {
+        emit_trigger_subprogram(
+            program,
+            resolver,
+            trigger,
+            ctx,
+            &body.commands,
+            connection,
+            database_id,
+            ignore_jump_target,
+        )?;
+    }
+    emit_returned_row(
+        program,
+        resolver,
+        ctx,
+        row_registers,
+        &body.returned_row,
+        connection,
+        ignore_jump_target,
+    )?;
+    Ok(true)
+}
+
+/// Compile the commands of a trigger as a subprogram and emit the Program
+/// instruction that runs it.
+#[allow(clippy::too_many_arguments)]
+fn emit_trigger_subprogram(
+    program: &mut ProgramBuilder,
+    resolver: &mut Resolver,
+    trigger: &Arc<Trigger>,
+    ctx: &TriggerContext,
+    commands: &[ast::TriggerCmd],
+    connection: &Arc<crate::Connection>,
+    database_id: usize,
+    ignore_jump_target: BranchOffset,
+) -> Result<()> {
     let has_new = ctx.new_registers.is_some();
     let has_old = ctx.old_registers.is_some();
     let num_cols = ctx.table.columns().len();
@@ -597,7 +646,7 @@ fn execute_trigger_commands(
     // `resolver` as a parameter rather than capturing the outer binding -
     // see `Resolver::with_database_scope_mut`.
     resolver.with_trigger_scope(trigger_database_id, trigger.name.clone(), |resolver| {
-        for command in trigger.commands.iter() {
+        for command in commands.iter() {
             let stmt = trigger_cmd_to_stmt_for_subprogram(command, &subprogram_ctx)?;
             subprogram_builder.prologue();
             translate_inner(
@@ -680,7 +729,179 @@ fn execute_trigger_commands(
         ignore_jump_target,
     });
 
-    Ok(true)
+    Ok(())
+}
+
+/// Write the row that the trigger function returns over the row of the
+/// statement, or skip the row.
+fn emit_returned_row(
+    program: &mut ProgramBuilder,
+    resolver: &mut Resolver,
+    ctx: &TriggerContext,
+    row_registers: Option<&[usize]>,
+    returned_row: &TriggerReturn,
+    connection: &Arc<crate::Connection>,
+    ignore_jump_target: BranchOffset,
+) -> Result<()> {
+    let (skip_when, columns) = match returned_row {
+        TriggerReturn::Unchanged => return Ok(()),
+        TriggerReturn::Skip => {
+            program.emit_insn(Insn::Goto {
+                target_pc: ignore_jump_target,
+            });
+            return Ok(());
+        }
+        TriggerReturn::Row { skip_when, columns } => (skip_when, columns),
+    };
+    if let Some(skip_when) = skip_when {
+        let reg = emit_trigger_expr(program, resolver, ctx, skip_when.clone(), connection)?;
+        program.emit_insn(Insn::If {
+            reg,
+            target_pc: ignore_jump_target,
+            jump_if_null: false,
+        });
+    }
+    if columns.iter().all(Option::is_none) {
+        return Ok(());
+    }
+    let Some(row_registers) = row_registers else {
+        return Err(crate::LimboError::InternalError(
+            "a trigger without a NEW row cannot return a row".to_string(),
+        ));
+    };
+    let rowid_register = *row_registers
+        .last()
+        .expect("the row registers end with the rowid");
+    let mut values = Vec::new();
+    for (column, expr) in columns.iter().enumerate() {
+        let Some(expr) = expr else {
+            continue;
+        };
+        let column_def = &ctx.table.columns()[column];
+        let column_name = column_def.name.as_deref().unwrap_or_default();
+        if column_def.is_virtual_generated() {
+            bail_parse_error!("a trigger cannot change the generated column {column_name}");
+        }
+        if column_def.is_rowid_alias() && row_registers[column] != rowid_register {
+            bail_parse_error!(
+                "a BEFORE UPDATE trigger cannot change the INTEGER PRIMARY KEY column {column_name}"
+            );
+        }
+        let reg = emit_trigger_expr(program, resolver, ctx, expr.clone(), connection)?;
+        values.push((row_registers[column], reg));
+    }
+    for (dst_reg, src_reg) in values {
+        program.emit_insn(Insn::Copy {
+            src_reg,
+            dst_reg,
+            extra_amount: 0,
+        });
+    }
+    Ok(())
+}
+
+/// Evaluate an expression of a trigger in the statement that fires it:
+/// `NEW.x` and `OLD.x` read the registers of the trigger context. Returns
+/// the register with the value.
+fn emit_trigger_expr(
+    program: &mut ProgramBuilder,
+    resolver: &mut Resolver,
+    ctx: &TriggerContext,
+    mut expr: Expr,
+    connection: &Arc<crate::Connection>,
+) -> Result<usize> {
+    rewrite_trigger_expr_for_when_clause(&mut expr, &ctx.table, ctx)?;
+
+    // Plan and emit any subqueries (e.g. IN (SELECT ...), EXISTS, scalar subqueries).
+    // This transforms InSelect/Exists/Subquery nodes into SubqueryResult nodes that translate_expr can handle.
+    let mut subqueries = Vec::new();
+    plan_subqueries_from_trigger_when_clause(
+        program,
+        &mut subqueries,
+        &mut expr,
+        resolver,
+        connection,
+    )?;
+    // Always treat these as correlated (no `Once` caching) because the expression is evaluated
+    // per-row, and trigger bodies may modify the tables referenced by the subquery between evaluations.
+    for subquery in &mut subqueries {
+        let plan = subquery.consume_plan(crate::translate::plan::EvalAt::BeforeLoop);
+        emit_non_from_clause_subquery(
+            program,
+            resolver,
+            *plan,
+            &subquery.query_type,
+            true, // always re-evaluate: the trigger expression is checked per-row
+        )?;
+    }
+
+    let reg = program.alloc_register();
+    translate_expr(program, None, &expr, reg, resolver)?;
+    Ok(reg)
+}
+
+/// The body of a trigger. A body that executes a function of the dialect
+/// comes from the dialect, which compiles the function for this trigger.
+struct TriggerBody<'a> {
+    commands: std::borrow::Cow<'a, [ast::TriggerCmd]>,
+    returned_row: TriggerReturn,
+}
+
+fn trigger_body<'a>(
+    resolver: &Resolver,
+    trigger: &'a Trigger,
+    table: &BTreeTable,
+    database_id: usize,
+) -> Result<TriggerBody<'a>> {
+    let [ast::TriggerCmd::ExecuteFunction { name, args }] = trigger.commands.as_slice() else {
+        return Ok(TriggerBody {
+            commands: std::borrow::Cow::Borrowed(&trigger.commands),
+            returned_row: TriggerReturn::Unchanged,
+        });
+    };
+    let database_name = if database_id == crate::MAIN_DB_ID {
+        None
+    } else {
+        resolver.get_database_name_by_index(database_id)
+    };
+    let call = crate::dialect::TriggerFunctionCall {
+        trigger,
+        table,
+        database_name: database_name.as_deref(),
+        function: name,
+        args,
+    };
+    let body = resolver
+        .dialect
+        .expand_trigger_function(resolver.schema(), &call)?;
+    Ok(TriggerBody {
+        commands: std::borrow::Cow::Owned(body.commands),
+        returned_row: body.returned_row,
+    })
+}
+
+/// The columns that the rows returned by the functions of `triggers` can
+/// change.
+pub fn columns_changed_by_triggers(
+    resolver: &Resolver,
+    triggers: &[Arc<Trigger>],
+    table: &BTreeTable,
+    database_id: usize,
+) -> Result<ColumnMask> {
+    let mut changed = ColumnMask::default();
+    for trigger in triggers {
+        let TriggerReturn::Row { columns, .. } =
+            trigger_body(resolver, trigger, table, database_id)?.returned_row
+        else {
+            continue;
+        };
+        for (column, expr) in columns.iter().enumerate() {
+            if expr.is_some() {
+                changed.set(column)?;
+            }
+        }
+    }
+    Ok(changed)
 }
 
 /// Check if there are any triggers for a given event (regardless of time).
@@ -814,6 +1035,9 @@ pub fn get_triggers_including_temp(
         }
         triggers = list.into();
     }
+    if resolver.dialect.triggers_fire_in_name_order() {
+        triggers.sort_by(|a, b| a.name.cmp(&b.name));
+    }
     triggers
 }
 
@@ -866,6 +1090,7 @@ pub fn fire_trigger(
     // - Non-STRICT tables: INSERT/UPDATE emit Insn::Affinity before any trigger fires
     // - STRICT tables: no column affinity needed (apply_new_column_affinity was a no-op)
     // So we can use the decoded registers directly, skipping N Copy + 1 Affinity per fire.
+    let row_registers = ctx.new_registers.clone();
     let ctx = &decode_trigger_registers(program, resolver, ctx)?;
 
     let saved_register_affinities = std::mem::take(&mut resolver.register_affinities);
@@ -886,37 +1111,9 @@ pub fn fire_trigger(
         });
 
         // Evaluate WHEN clause if present
-        if let Some(mut when_expr) = trigger.when_clause.clone() {
+        if let Some(when_expr) = trigger.when_clause.clone() {
             crate::stack::trace_stack!("when_clause");
-            // Rewrite NEW/OLD references in WHEN clause to use registers
-            rewrite_trigger_expr_for_when_clause(&mut when_expr, &ctx.table, ctx)?;
-
-            // Plan and emit any subqueries in the WHEN clause (e.g. IN (SELECT ...), EXISTS, scalar subqueries).
-            // This transforms InSelect/Exists/Subquery nodes into SubqueryResult nodes that translate_expr can handle.
-            let mut subqueries = Vec::new();
-            plan_subqueries_from_trigger_when_clause(
-                program,
-                &mut subqueries,
-                &mut when_expr,
-                resolver,
-                connection,
-            )?;
-            // Emit the planned subqueries so their results are available when we evaluate the WHEN expression.
-            // Always treat these as correlated (no `Once` caching) because the WHEN clause is evaluated
-            // per-row, and trigger bodies may modify the tables referenced by the subquery between evaluations.
-            for subquery in &mut subqueries {
-                let plan = subquery.consume_plan(crate::translate::plan::EvalAt::BeforeLoop);
-                emit_non_from_clause_subquery(
-                    program,
-                    resolver,
-                    *plan,
-                    &subquery.query_type,
-                    true, // always re-evaluate: trigger WHEN is checked per-row
-                )?;
-            }
-
-            let when_reg = program.alloc_register();
-            translate_expr(program, None, &when_expr, when_reg, resolver)?;
+            let when_reg = emit_trigger_expr(program, resolver, ctx, when_expr, connection)?;
 
             let skip_label = program.allocate_label();
             program.emit_insn(Insn::IfNot {
@@ -931,6 +1128,7 @@ pub fn fire_trigger(
                 resolver,
                 &trigger,
                 ctx,
+                row_registers.as_deref(),
                 connection,
                 database_id,
                 ignore_jump_target,
@@ -944,6 +1142,7 @@ pub fn fire_trigger(
                 resolver,
                 &trigger,
                 ctx,
+                row_registers.as_deref(),
                 connection,
                 database_id,
                 ignore_jump_target,
@@ -974,6 +1173,7 @@ fn trigger_command_kind(command: &ast::TriggerCmd) -> &'static str {
         ast::TriggerCmd::Update { .. } => "update",
         ast::TriggerCmd::Delete { .. } => "delete",
         ast::TriggerCmd::Select(_) => "select",
+        ast::TriggerCmd::ExecuteFunction { .. } => "execute_function",
     }
 }
 
