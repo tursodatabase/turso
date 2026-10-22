@@ -1869,10 +1869,6 @@ impl PostgreSQLTranslator {
         &self,
         select: &pg_query::protobuf::SelectStmt,
     ) -> Result<ast::Select, ParseError> {
-        // SQLite compounds group strictly left to right, so only the left
-        // spine of pg_query's op/larg/rarg tree becomes the compound chain.
-        // Any other set operation, and any operand with its own ORDER BY,
-        // LIMIT, OFFSET or WITH, becomes a subquery member.
         let mut right_operands = Vec::new();
         let mut leftmost = select;
         loop {
@@ -1882,15 +1878,25 @@ impl PostgreSQLTranslator {
                     "set operation is missing an operand".to_string(),
                 ));
             };
-            right_operands.push((operator, rarg.as_ref()));
+            let mut leaves = Vec::new();
+            if matches!(
+                leftmost.op(),
+                pg_query::protobuf::SetOperation::SetopUnion
+                    | pg_query::protobuf::SetOperation::SetopIntersect
+            ) && same_operator_leaves(rarg, leftmost.op(), leftmost.all, &mut leaves)
+            {
+                for leaf in leaves.into_iter().rev() {
+                    right_operands.push((operator, leaf));
+                }
+            } else {
+                right_operands.push((operator, rarg.as_ref()));
+            }
             leftmost = larg;
             if !is_set_operation(leftmost) || has_own_select_clauses(leftmost) {
                 break;
             }
         }
 
-        // The leftmost operand names the result columns. Selecting * from it
-        // as a subquery would rename duplicate names (`a`, `a:1`).
         if (is_set_operation(leftmost) || has_own_select_clauses(leftmost))
             && !self.has_distinct_output_names(leftmost)
         {
@@ -6774,14 +6780,34 @@ fn is_set_operation(stmt: &pg_query::protobuf::SelectStmt) -> bool {
     !matches!(stmt.op(), SetOperation::SetopNone | SetOperation::Undefined)
 }
 
-/// Clauses that a parenthesized compound operand applies to itself before
-/// the set operation combines it with its sibling.
 fn has_own_select_clauses(stmt: &pg_query::protobuf::SelectStmt) -> bool {
     !stmt.sort_clause.is_empty()
         || stmt.limit_count.is_some()
         || stmt.limit_offset.is_some()
         || stmt.with_clause.is_some()
         || !stmt.locking_clause.is_empty()
+}
+
+fn same_operator_leaves<'a>(
+    stmt: &'a pg_query::protobuf::SelectStmt,
+    op: pg_query::protobuf::SetOperation,
+    all: bool,
+    leaves: &mut Vec<&'a pg_query::protobuf::SelectStmt>,
+) -> bool {
+    if !is_set_operation(stmt) {
+        leaves.push(stmt);
+        return true;
+    }
+    if stmt.op() != op || stmt.all != all || has_own_select_clauses(stmt) {
+        return false;
+    }
+    match (&stmt.larg, &stmt.rarg) {
+        (Some(larg), Some(rarg)) => {
+            same_operator_leaves(larg, op, all, leaves)
+                && same_operator_leaves(rarg, op, all, leaves)
+        }
+        _ => false,
+    }
 }
 
 fn compound_operator(
@@ -10260,7 +10286,6 @@ mod tests {
             translate_to_sql("SELECT a FROM t UNION SELECT a FROM u ORDER BY 1 LIMIT 2"),
             "SELECT a FROM t UNION SELECT a FROM u ORDER BY 1 NULLS LAST LIMIT 2"
         );
-        // Selecting * from the leading operand would rename duplicate columns.
         assert_not_supported(
             "(SELECT 1, 2 LIMIT 1) UNION SELECT 3, 4",
             "without distinct column names",
