@@ -703,6 +703,11 @@ fn handle_pg_create_schema(
             "unacceptable schema name \"{name}\": the prefix \"pg_\" is reserved for system schemas"
         )));
     }
+    if is_core_database_name(&name) {
+        return Err(LimboError::ParseError(format!(
+            "unacceptable schema name \"{name}\": the name is reserved for a database"
+        )));
+    }
     let prefix = stored_name_prefix(&name);
     if let Some(object) = object_names(&conn.current_schema())
         .into_iter()

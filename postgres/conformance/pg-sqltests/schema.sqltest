@@ -400,3 +400,11 @@ test materialized-view-named-like-a-schema-marker-errors {
 expect error {
     reserved for schema markers
 }
+
+@skip-if postgres "main and temp name databases in Turso, so they cannot name schemas"
+test create-schema-rejects-the-names-of-the-databases {
+    CREATE SCHEMA temp;
+}
+expect error {
+    unacceptable schema name "temp"
+}
