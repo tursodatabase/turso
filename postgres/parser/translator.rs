@@ -1062,6 +1062,12 @@ impl PostgreSQLTranslator {
         if idx.idxname.is_empty() {
             return Err(not_supported("CREATE INDEX without an index name"));
         }
+        if !idx.access_method.is_empty() && !idx.access_method.eq_ignore_ascii_case("btree") {
+            return Err(not_supported(format!(
+                "CREATE INDEX ... USING {}",
+                idx.access_method
+            )));
+        }
         let idx_name = ast::QualifiedName::single(ast::Name::from_string(&idx.idxname));
 
         self.translating_index.set(true);
@@ -9039,5 +9045,12 @@ mod tests {
     fn fail_closed_unnamed_index() {
         assert_not_supported("CREATE INDEX ON t (a)", "without an index name");
         assert_translates("CREATE INDEX t_a ON t (a)");
+    }
+
+    #[test]
+    fn fail_closed_index_access_method() {
+        assert_not_supported("CREATE INDEX i ON t USING gin (a)", "USING gin");
+        assert_not_supported("CREATE INDEX i ON t USING hash (a)", "USING hash");
+        assert_translates("CREATE INDEX i ON t USING btree (a)");
     }
 }
