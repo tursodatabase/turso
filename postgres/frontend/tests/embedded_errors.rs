@@ -264,11 +264,13 @@ fn errors_report_postgres_sqlstates() {
 }
 
 #[test]
-fn nested_begin_reports_active_sql_transaction() {
+fn nested_begin_keeps_the_open_transaction() {
+    // PostgreSQL warns "there is already a transaction in progress" for BEGIN
+    // inside a transaction block and keeps the transaction.
     let (_io, conn) = pg_connection();
     conn.execute("BEGIN").unwrap();
-    let e = exec_err(&conn, "BEGIN");
-    assert_eq!(e.sqlstate, "25001");
+    conn.execute("BEGIN").unwrap();
+    assert!(!conn.inner().get_auto_commit());
     conn.execute("ROLLBACK").unwrap();
 }
 

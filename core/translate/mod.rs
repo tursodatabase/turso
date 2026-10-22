@@ -276,7 +276,11 @@ fn translate_statement(
                 connection.clone(),
             )?;
         }
-        ast::Stmt::Begin { typ, name } => translate_tx_begin(typ, name, resolver, program)?,
+        ast::Stmt::Begin {
+            typ,
+            name,
+            access_mode,
+        } => translate_tx_begin(typ, name, access_mode, resolver, program)?,
         ast::Stmt::Commit { name } => {
             translate_tx_commit(name, resolver.schema(), resolver, program)?
         }
@@ -575,6 +579,16 @@ fn translate_statement(
             &program.table_references,
             resolver,
         );
+    }
+
+    // After translation so that name resolution errors come first, as in
+    // PostgreSQL, which rejects read-only violations when the command starts
+    // executing.
+    if is_write
+        && connection.is_tx_read_only()
+        && matches!(program.get_query_mode(), QueryMode::Normal)
+    {
+        return Err(crate::LimboError::ReadOnly);
     }
 
     Ok(())

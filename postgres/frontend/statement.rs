@@ -28,7 +28,9 @@ pub(crate) enum TxRole {
     /// Rejected with 25P02 while the transaction block is aborted; an
     /// execution error inside a transaction block aborts the block.
     Other,
-    /// BEGIN; errors never abort the surrounding block.
+    /// A nested BEGIN is replaced by success in its post_run, like
+    /// PostgreSQL's warning; an error that survives, like a rejected
+    /// access-mode change, aborts the block like any other error.
     Begin,
     /// Ends an aborted block by rolling back; reports the ROLLBACK tag.
     Commit,
@@ -38,17 +40,108 @@ pub(crate) enum TxRole {
     RollbackToSavepoint,
 }
 
+/// Per-session transaction state that PostgreSQL keeps and Turso's core
+/// does not: the aborted-block flag, whether the current transaction has
+/// run its first query, and the access mode saved by each savepoint.
+#[derive(Default)]
+pub struct PgTxState {
+    aborted: AtomicBool,
+    query_started: AtomicBool,
+    /// Access mode in force when each live savepoint was created, oldest
+    /// first. PostgreSQL restores the saved mode when the subtransaction
+    /// ends, through RELEASE or ROLLBACK TO.
+    savepoint_modes: std::sync::Mutex<Vec<(String, bool)>>,
+}
+
+impl PgTxState {
+    pub(crate) fn abort(&self) {
+        self.aborted.store(true, Ordering::Relaxed);
+    }
+
+    pub(crate) fn is_aborted(&self) -> bool {
+        self.aborted.load(Ordering::Relaxed)
+    }
+
+    pub(crate) fn query_started(&self) -> bool {
+        self.query_started.load(Ordering::Relaxed)
+    }
+
+    pub(crate) fn mark_query_started(&self) {
+        self.query_started.store(true, Ordering::Relaxed);
+    }
+
+    pub(crate) fn inside_savepoint(&self) -> bool {
+        !self.savepoint_modes.lock().unwrap().is_empty()
+    }
+
+    pub(crate) fn transaction_began(&self) {
+        self.query_started.store(false, Ordering::Relaxed);
+        self.savepoint_modes.lock().unwrap().clear();
+    }
+
+    pub(crate) fn transaction_ended(&self) {
+        self.aborted.store(false, Ordering::Relaxed);
+        self.transaction_began();
+    }
+
+    pub(crate) fn savepoint_created(&self, conn: &Connection, name: &str) {
+        if conn.get_auto_commit() {
+            return;
+        }
+        self.savepoint_modes
+            .lock()
+            .unwrap()
+            .push((name.to_string(), conn.is_tx_read_only()));
+    }
+
+    /// ROLLBACK TO keeps the savepoint alive, so entries up to and
+    /// including it stay.
+    pub(crate) fn savepoint_rolled_back(&self, conn: &Connection, name: &str) {
+        let mut modes = self.savepoint_modes.lock().unwrap();
+        if let Some(i) = modes.iter().rposition(|(n, _)| n == name) {
+            conn.set_tx_read_only(modes[i].1);
+            modes.truncate(i + 1);
+        }
+    }
+
+    pub(crate) fn savepoint_released(&self, conn: &Connection, name: &str) {
+        let mut modes = self.savepoint_modes.lock().unwrap();
+        if let Some(i) = modes.iter().rposition(|(n, _)| n == name) {
+            conn.set_tx_read_only(modes[i].1);
+            modes.truncate(i);
+        }
+    }
+}
+
 struct TxTracking {
     conn: Arc<Connection>,
-    tx_aborted: Arc<AtomicBool>,
+    tx: Arc<PgTxState>,
     role: TxRole,
 }
+
+/// Called after every execution of a statement to apply connection state
+/// changes that must happen at execute time, not at prepare time, and to
+/// replace errors whose PostgreSQL outcome depends on execute-time
+/// transaction state.
+pub(crate) type PostRunFn = Arc<dyn Fn(Result<()>) -> Result<()> + Send + Sync>;
 
 pub struct Statement {
     inner: turso_core::Statement,
     deferred: Option<DeferredState>,
     tx_tracking: Option<TxTracking>,
     commit_became_rollback: bool,
+    /// Applied by all run/step methods after the core statement completes. Used
+    /// for BEGIN/COMMIT/ROLLBACK, SAVEPOINT, and SET TRANSACTION so that
+    /// connection state changes (access mode, savepoint modes) and benign
+    /// error suppression ("no transaction is active", "cannot start a
+    /// transaction within a transaction") happen at execute time rather
+    /// than when the statement is compiled.
+    post_run: Option<PostRunFn>,
+    /// Whether running this statement counts as the transaction's first
+    /// query, which blocks a later switch to READ WRITE. PostgreSQL takes
+    /// the snapshot when the query starts, so a partially consumed or
+    /// abandoned statement counts too.
+    marks_query_start: bool,
 }
 
 impl Statement {
@@ -58,32 +151,60 @@ impl Statement {
             deferred: None,
             tx_tracking: None,
             commit_became_rollback: false,
+            post_run: None,
+            marks_query_start: false,
+        }
+    }
+
+    pub(crate) fn new_with_post_run(inner: turso_core::Statement, post_run: PostRunFn) -> Self {
+        Self::new(inner).with_post_run(post_run)
+    }
+
+    pub(crate) fn with_post_run(mut self, post_run: PostRunFn) -> Self {
+        self.post_run = Some(post_run);
+        self
+    }
+
+    pub(crate) fn with_query_start_marking(mut self, marks: bool) -> Self {
+        self.marks_query_start = marks;
+        self
+    }
+
+    fn mark_query_start(&self) {
+        if !self.marks_query_start {
+            return;
+        }
+        let Some(t) = &self.tx_tracking else {
+            return;
+        };
+        if !t.conn.get_auto_commit() {
+            t.tx.query_started.store(true, Ordering::Relaxed);
+        }
+    }
+
+    fn apply_post_run(&self, result: Result<()>) -> Result<()> {
+        match &self.post_run {
+            Some(f) => f(result),
+            None => result,
         }
     }
 
     pub(crate) fn with_deferred(inner: turso_core::Statement, exec: DeferredExec) -> Self {
-        Self {
-            inner,
-            deferred: Some(DeferredState {
-                exec,
-                completed: false,
-            }),
-            tx_tracking: None,
-            commit_became_rollback: false,
-        }
+        let mut stmt = Self::new(inner);
+        stmt.deferred = Some(DeferredState {
+            exec,
+            completed: false,
+        });
+        stmt
     }
 
     pub(crate) fn with_tx_tracking(
         mut self,
         conn: Arc<Connection>,
-        tx_aborted: Arc<AtomicBool>,
+        tx: Arc<PgTxState>,
         role: TxRole,
     ) -> Self {
-        self.tx_tracking = Some(TxTracking {
-            conn,
-            tx_aborted,
-            role,
-        });
+        self.tx_tracking = Some(TxTracking { conn, tx, role });
         self
     }
 
@@ -106,7 +227,7 @@ impl Statement {
         let Some(t) = &self.tx_tracking else {
             return Ok(Some(false));
         };
-        if t.tx_aborted.load(Ordering::Relaxed) {
+        if t.tx.is_aborted() {
             match t.role {
                 TxRole::Other | TxRole::Begin => {
                     return Err(in_failed_sql_transaction_error().into());
@@ -118,7 +239,7 @@ impl Statement {
                     // the transaction is still open would let a later
                     // COMMIT persist the aborted block's writes.
                     rollback_aborted_block(&t.conn)?;
-                    t.tx_aborted.store(false, Ordering::Relaxed);
+                    t.tx.transaction_ended();
                     if t.role == TxRole::Commit {
                         self.commit_became_rollback = true;
                     }
@@ -142,13 +263,16 @@ impl Statement {
             // state to report.
             TxRole::Commit | TxRole::Rollback => {
                 if !t.conn.get_auto_commit() && rollback_aborted_block(&t.conn).is_err() {
-                    t.tx_aborted.store(true, Ordering::Relaxed);
+                    t.tx.abort();
                 }
             }
-            TxRole::Begin => {}
-            TxRole::Other | TxRole::RollbackToSavepoint => {
+            // A nested BEGIN is a warning in PostgreSQL and post_run already
+            // replaced it with success before this runs; a BEGIN error that
+            // survives post_run, like a rejected access-mode change, aborts
+            // the block like any other error.
+            TxRole::Begin | TxRole::Other | TxRole::RollbackToSavepoint => {
                 if was_in_tx {
-                    t.tx_aborted.store(true, Ordering::Relaxed);
+                    t.tx.abort();
                 }
             }
         }
@@ -158,8 +282,10 @@ impl Statement {
         let Some(t) = &self.tx_tracking else {
             return;
         };
-        if t.role == TxRole::RollbackToSavepoint {
-            t.tx_aborted.store(false, Ordering::Relaxed);
+        match t.role {
+            TxRole::RollbackToSavepoint => t.tx.aborted.store(false, Ordering::Relaxed),
+            TxRole::Commit | TxRole::Rollback => t.tx.transaction_ended(),
+            TxRole::Begin | TxRole::Other => {}
         }
     }
 
@@ -182,38 +308,52 @@ impl Statement {
         let Some(was_in_tx) = self.tx_gate()? else {
             return Ok(StepResult::Done);
         };
+        self.mark_query_start();
         if self.deferred.is_some() {
             self.execute_deferred(was_in_tx)?;
             return Ok(StepResult::Done);
         }
         let result = self.inner.step().map_err(Into::into);
-        self.note_step_outcome(&result, was_in_tx);
-        result
+        self.finish_step(result, was_in_tx)
     }
 
     pub fn step_with_waker(&mut self, waker: &Waker) -> Result<StepResult> {
         let Some(was_in_tx) = self.tx_gate()? else {
             return Ok(StepResult::Done);
         };
+        self.mark_query_start();
         if self.deferred.is_some() {
             self.execute_deferred(was_in_tx)?;
             return Ok(StepResult::Done);
         }
         let result = self.inner.step_with_waker(waker).map_err(Into::into);
-        self.note_step_outcome(&result, was_in_tx);
-        result
+        self.finish_step(result, was_in_tx)
     }
 
-    fn note_step_outcome(&self, result: &Result<StepResult>, was_in_tx: bool) {
+    fn finish_step(&mut self, result: Result<StepResult>, was_in_tx: bool) -> Result<StepResult> {
         match result {
-            Ok(StepResult::Done) => self.note_execution_done(),
+            Ok(StepResult::Done) => self.finish(Ok(()), was_in_tx).map(|()| StepResult::Done),
+            Err(e) => self.finish(Err(e), was_in_tx).map(|()| StepResult::Done),
             // The core reports interruption and lock contention as results
             // rather than errors, but PostgreSQL treats query cancellation
             // and lock timeouts as ordinary errors that abort the block.
-            Ok(StepResult::Interrupt | StepResult::Busy) => self.note_execution_error(was_in_tx),
-            Err(_) => self.note_execution_error(was_in_tx),
-            _ => {}
+            Ok(result @ (StepResult::Interrupt | StepResult::Busy)) => {
+                self.note_execution_error(was_in_tx);
+                Ok(result)
+            }
+            other => other,
         }
+    }
+
+    /// Applies post_run to the completed statement's outcome and records
+    /// the final outcome in the transaction state.
+    fn finish(&mut self, result: Result<()>, was_in_tx: bool) -> Result<()> {
+        let ret = self.apply_post_run(result);
+        match &ret {
+            Ok(()) => self.note_execution_done(),
+            Err(_) => self.note_execution_error(was_in_tx),
+        }
+        ret
     }
 
     pub fn reset(&mut self) -> Result<()> {
@@ -249,31 +389,28 @@ impl Statement {
         let Some(was_in_tx) = self.tx_gate()? else {
             return Ok(());
         };
+        self.mark_query_start();
         if self.deferred.is_some() {
             return self.execute_deferred(was_in_tx);
         }
         let result = self.inner.run_ignore_rows().map_err(Into::into);
-        match &result {
-            Ok(()) => self.note_execution_done(),
-            Err(_) => self.note_execution_error(was_in_tx),
-        }
-        result
+        self.finish(result, was_in_tx)
     }
 
     pub fn run_collect_rows(&mut self) -> Result<Vec<Vec<Value>>> {
         let Some(was_in_tx) = self.tx_gate()? else {
             return Ok(Vec::new());
         };
+        self.mark_query_start();
         if self.deferred.is_some() {
             self.execute_deferred(was_in_tx)?;
             return Ok(Vec::new());
         }
         let result = self.inner.run_collect_rows().map_err(Into::into);
-        match &result {
-            Ok(_) => self.note_execution_done(),
-            Err(_) => self.note_execution_error(was_in_tx),
+        match result {
+            Ok(rows) => self.finish(Ok(()), was_in_tx).map(|()| rows),
+            Err(e) => self.finish(Err(e), was_in_tx).map(|()| Vec::new()),
         }
-        result
     }
 
     pub fn run_with_row_callback(
@@ -297,20 +434,20 @@ impl Statement {
         let Some(was_in_tx) = self.tx_gate()? else {
             return Ok(IOResult::Done(()));
         };
+        self.mark_query_start();
         if self.deferred.is_some() {
             self.execute_deferred(was_in_tx)?;
             return Ok(IOResult::Done(()));
         }
-        let result = self
+        match self
             .inner
             .run_ignore_rows_nonblock()
-            .map_err(|error| (*error).into());
-        match &result {
-            Ok(IOResult::Done(())) => self.note_execution_done(),
-            Err(_) => self.note_execution_error(was_in_tx),
-            _ => {}
+            .map_err(|error| (*error).into())
+        {
+            Ok(IOResult::Done(())) => self.finish(Ok(()), was_in_tx).map(|()| IOResult::Done(())),
+            Err(e) => self.finish(Err(e), was_in_tx).map(|()| IOResult::Done(())),
+            other => other,
         }
-        result
     }
 
     pub fn run_with_row_callback_nonblock(
@@ -450,16 +587,15 @@ fn is_boolean_type(name: &str) -> bool {
 }
 
 /// Roll back the connection's transaction so a block can end. A transaction
-/// that is already gone — some errors make the core roll it back on its own,
-/// which ROLLBACK reports as a transaction error — counts as ended. Every
-/// other failure means the transaction is still open and must reach the
-/// caller.
+/// that is already gone — some errors make the core roll it back on its own —
+/// counts as ended. Every other failure means the transaction is still open
+/// and must reach the caller.
 fn rollback_aborted_block(conn: &Arc<Connection>) -> Result<()> {
     let run = conn
         .prepare_sqlite("ROLLBACK")
         .and_then(|mut rollback| rollback.run_ignore_rows());
     match run {
-        Ok(()) | Err(LimboError::TxError(_)) => Ok(()),
+        Ok(()) | Err(LimboError::NoActiveTransaction { .. }) => Ok(()),
         Err(err) => Err(err.into()),
     }
 }

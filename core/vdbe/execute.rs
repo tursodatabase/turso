@@ -5150,6 +5150,7 @@ pub fn op_transaction_inner(
                             "write statement started with view changes left by an earlier statement"
                         );
                         state.is_active_write = true;
+                        state.tx_read_only_at_start = program.connection.is_tx_read_only();
                         if is_main_db {
                             state.write_baseline = WriteBaseline::capture(
                                 mv_store.as_deref(),
@@ -5223,7 +5224,8 @@ pub fn op_auto_commit(
         AutoCommit {
             auto_commit,
             rollback,
-            concurrent
+            concurrent,
+            read_only
         },
         insn
     );
@@ -5329,6 +5331,7 @@ pub fn op_auto_commit(
                 }
                 conn.set_tx_state(TransactionState::None);
                 conn.auto_commit.store(true, Ordering::SeqCst);
+                conn.set_tx_read_only(false);
                 conn.set_cdc_transaction_id(-1);
             }
             TxOp::Commit => {
@@ -5349,6 +5352,7 @@ pub fn op_auto_commit(
                 check_deferred_fk_on_commit(&conn)?;
                 vtab_commit_all(&conn)?;
                 conn.auto_commit.store(true, Ordering::SeqCst);
+                conn.set_tx_read_only(false);
                 state.auto_txn_cleanup = TxnCleanup::RollbackTxn;
             }
             TxOp::Begin => {
@@ -5382,23 +5386,15 @@ pub fn op_auto_commit(
                 // Read: a SELECT in autocommit mode is still open; leave as-is — the
                 //       next write inside the explicit transaction will upgrade to Write.
                 conn.auto_commit.store(false, Ordering::SeqCst);
+                conn.set_tx_read_only(*read_only);
                 return Ok(InsnFunctionStepResult::Done);
             }
         }
     } else {
         return match &tx_op {
-            TxOp::Begin => Err(LimboError::TxError(
-                "cannot start a transaction within a transaction".to_string(),
-            )
-            .into()),
-            TxOp::Commit => Err(LimboError::TxError(
-                "cannot commit - no transaction is active".to_string(),
-            )
-            .into()),
-            TxOp::Rollback => Err(LimboError::TxError(
-                "cannot rollback - no transaction is active".to_string(),
-            )
-            .into()),
+            TxOp::Begin => Err(LimboError::TransactionAlreadyActive.into()),
+            TxOp::Commit => Err(LimboError::NoActiveTransaction { op: "commit" }.into()),
+            TxOp::Rollback => Err(LimboError::NoActiveTransaction { op: "rollback" }.into()),
         };
     }
 
@@ -5743,6 +5739,7 @@ fn release_commit_insn() -> Insn {
         auto_commit: true,
         rollback: false,
         concurrent: false,
+        read_only: false,
     }
 }
 
@@ -10469,6 +10466,9 @@ pub fn op_function(
                 }
             }
             ScalarFunc::SetVal => {
+                if program.connection.is_tx_read_only() {
+                    return Err(LimboError::ReadOnly.into());
+                }
                 // Pre-write validation: argument type + range check. The
                 // translator emits this Function call before the inline
                 // DELETE-all + INSERT bytecode, so any error returned here
@@ -12816,6 +12816,35 @@ fn normalize_table_change_record(
     Ok(values)
 }
 
+/// The backstop behind the read-only transaction checks: the compile-time
+/// check rejects write statements and the sequence opcodes reject evaluated
+/// nextval/setval, but every database write must pass through a write opcode,
+/// so a write path that misses those checks fails here instead of writing.
+/// Ephemeral B-trees (sorters, materialized subqueries) are not database
+/// writes. Uses the mode captured when the statement started writing, so a
+/// statement already in flight when the transaction turns read-only keeps
+/// its mode, like a resumed portal in PostgreSQL.
+fn check_db_write_allowed(
+    program: &Program,
+    state: &ProgramState,
+    cursor_id: Option<usize>,
+) -> Result<(), Box<LimboError>> {
+    if !state.tx_read_only_at_start {
+        return Ok(());
+    }
+    if let Some(cursor_id) = cursor_id {
+        if program
+            .prepared()
+            .explain
+            .ephemeral_cursors
+            .contains(&cursor_id)
+        {
+            return Ok(());
+        }
+    }
+    Err(Box::new(LimboError::ReadOnly))
+}
+
 pub fn op_insert(
     program: &Program,
     state: &mut ProgramState,
@@ -12832,6 +12861,7 @@ pub fn op_insert(
         },
         insn
     );
+    check_db_write_allowed(program, state, Some(*cursor_id))?;
 
     loop {
         match state.active_op_state.insert().sub_state {
@@ -13295,6 +13325,7 @@ pub fn op_delete(
         },
         insn
     );
+    check_db_write_allowed(program, state, Some(*cursor_id))?;
 
     loop {
         match state.active_op_state.delete().sub_state {
@@ -13442,6 +13473,7 @@ pub fn op_idx_delete(
         },
         insn
     );
+    check_db_write_allowed(program, state, Some(*cursor_id))?;
 
     if let Some(Cursor::IndexMethod(cursor)) = &mut state.cursors[*cursor_id] {
         return_if_io!(
@@ -13566,6 +13598,7 @@ pub fn op_idx_insert(
         },
         *insn
     );
+    check_db_write_allowed(program, state, Some(cursor_id))?;
 
     if let Some(Cursor::IndexMethod(cursor)) = &mut state.cursors[cursor_id] {
         let Some(start) = unpacked_start else {
@@ -14515,6 +14548,7 @@ pub fn op_create_btree(
 ) -> InsnResult {
     load_insn!(CreateBtree { db, root, flags }, insn);
 
+    check_db_write_allowed(program, state, None)?;
     if program.connection.is_readonly(*db) {
         return Err(LimboError::ReadOnly.into());
     }
@@ -14696,6 +14730,7 @@ pub fn op_destroy(
         },
         insn
     );
+    check_db_write_allowed(program, state, None)?;
     let mv_store = program.connection.mv_store_for_db(*db);
     if mv_store.is_some() {
         // MVCC only does pager operations in checkpoint
@@ -14743,6 +14778,7 @@ pub fn op_clear_btree(
     insn: &Insn,
     pager: &Arc<Pager>,
 ) -> InsnResult {
+    check_db_write_allowed(program, state, None)?;
     match op_clear_btree_inner(program, state, insn, pager) {
         Ok(result) => Ok(result),
         Err(err) => {
@@ -15446,6 +15482,9 @@ pub fn op_sequence_begin_inner_tx(
     );
 
     let conn = program.connection.clone();
+    if conn.is_tx_read_only() {
+        return Err(LimboError::ReadOnly.into());
+    }
     let Some(mv_store) = conn.mv_store_for_db(*db) else {
         // WAL mode: no inner tx needed. The WAL single-writer lock
         // already serializes writes across processes.
@@ -16433,6 +16472,7 @@ pub fn op_set_cookie(
         },
         insn
     );
+    check_db_write_allowed(program, state, None)?;
     let pager = program.get_pager_from_database_index(db)?;
     let mv_store = program.connection.mv_store_for_db(*db);
     if let Some(mv_store) = mv_store.as_ref() {

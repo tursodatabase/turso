@@ -101,12 +101,14 @@ pub enum Stmt {
         /// password
         key: Option<Box<Expr>>,
     },
-    /// `BEGIN`: tx type, tx name
+    /// `BEGIN`: tx type, tx name, access mode
     Begin {
         // transaction type
         typ: Option<TransactionType>,
         // transaction name
         name: Option<Name>,
+        // READ ONLY or READ WRITE (None = use connection default, i.e. READ WRITE)
+        access_mode: Option<AccessMode>,
     },
     /// `COMMIT`/`END`: tx name
     Commit {
@@ -2260,6 +2262,14 @@ pub enum TransactionType {
     Exclusive,
     /// `CONCURRENT`,
     Concurrent,
+}
+
+/// Transaction access mode (orthogonal to locking type).
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub enum AccessMode {
+    ReadOnly,
+    ReadWrite,
 }
 
 /// Upsert clause

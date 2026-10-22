@@ -1174,6 +1174,9 @@ pub enum Insn {
         auto_commit: bool,
         rollback: bool,
         concurrent: bool,
+        /// True when this AutoCommit starts a READ ONLY transaction (auto_commit=false).
+        /// Ignored for commit/rollback (auto_commit=true).
+        read_only: bool,
     },
 
     /// Execute a named savepoint operation.

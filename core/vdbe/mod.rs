@@ -1222,6 +1222,12 @@ pub struct ProgramState {
     /// active write; abort() compares against it to tell whether the
     /// statement wrote anything before failing.
     pub(crate) write_baseline: WriteBaseline,
+    /// Whether the transaction was READ ONLY when this statement started
+    /// writing. The write opcodes reject database writes under it, the
+    /// backstop behind the compile-time and sequence read-only checks. A
+    /// statement already writing when the transaction turns read-only keeps
+    /// its mode, as in PostgreSQL, which checks when a command starts.
+    pub(crate) tx_read_only_at_start: bool,
     /// Whether begin_statement was called (savepoint + FK bookkeeping active).
     has_stmt_transaction: bool,
     pub n_change: AtomicI64,
@@ -1323,6 +1329,7 @@ impl ProgramState {
             ephemeral_temp_files: HashMap::default(),
             uses_subjournal: false,
             is_active_write: false,
+            tx_read_only_at_start: false,
             write_baseline: WriteBaseline::None,
             has_stmt_transaction: false,
             attached_savepoint_pagers: Vec::new(),
@@ -1496,6 +1503,7 @@ impl ProgramState {
         }
         self.uses_subjournal = false;
         self.is_active_write = false;
+        self.tx_read_only_at_start = false;
         self.write_baseline = WriteBaseline::None;
         self.has_stmt_transaction = false;
         self.distinct_key_values.clear();
