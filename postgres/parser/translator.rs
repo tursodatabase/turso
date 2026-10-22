@@ -4496,6 +4496,11 @@ impl PostgreSQLTranslator {
                 for target_node in &clause.target_list {
                     match &target_node.node {
                         Some(Node::ResTarget(res_target)) => {
+                            if !res_target.indirection.is_empty() {
+                                return Err(not_supported(
+                                    "ON CONFLICT DO UPDATE of an array element or composite field",
+                                ));
+                            }
                             let col_name = ast::Name::from_string(&res_target.name);
                             let expr = if let Some(val) = &res_target.val {
                                 Box::new(self.translate_expr(val)?)
@@ -4525,7 +4530,11 @@ impl PostgreSQLTranslator {
 
                 ast::UpsertDo::Set { sets, where_clause }
             }
-            _ => return Ok(None),
+            other => {
+                return Err(ParseError::ParseError(format!(
+                    "Unsupported ON CONFLICT action: {other:?}"
+                )))
+            }
         };
 
         // Translate conflict target (the columns in ON CONFLICT (col1, col2))
@@ -9852,5 +9861,14 @@ mod tests {
             "operator classes in an ON CONFLICT target",
         );
         assert_translates("INSERT INTO t VALUES ('a') ON CONFLICT (a) WHERE a > 'a' DO NOTHING");
+    }
+
+    #[test]
+    fn fail_closed_on_conflict_set_indirection() {
+        assert_not_supported(
+            "INSERT INTO t VALUES (1) ON CONFLICT (id) DO UPDATE SET a[1] = 5",
+            "array element",
+        );
+        assert_translates("INSERT INTO t VALUES (1) ON CONFLICT (id) DO UPDATE SET a = excluded.a");
     }
 }
