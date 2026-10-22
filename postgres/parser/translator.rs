@@ -4395,16 +4395,23 @@ impl PostgreSQLTranslator {
         // AS smallint/integer narrows the default bound in the sequence's
         // direction; bigint is the default range.
         if let Some(as_type) = as_type {
-            let (type_min, type_max) = match as_type.to_lowercase().as_str() {
-                "int2" | "smallint" => (i16::MIN as i64, i16::MAX as i64),
-                "int4" | "integer" | "int" => (i32::MIN as i64, i32::MAX as i64),
-                "int8" | "bigint" => (i64::MIN, i64::MAX),
+            let (type_min, type_max, type_name) = match as_type.to_lowercase().as_str() {
+                "int2" | "smallint" => (i16::MIN as i64, i16::MAX as i64, "smallint"),
+                "int4" | "integer" | "int" => (i32::MIN as i64, i32::MAX as i64, "integer"),
+                "int8" | "bigint" => (i64::MIN, i64::MAX, "bigint"),
                 other => {
                     return Err(ParseError::ParseError(format!(
                         "CREATE SEQUENCE AS {other} is not supported"
                     )))
                 }
             };
+            for (option, value) in [("MINVALUE", min_value), ("MAXVALUE", max_value)] {
+                if let Some(value) = value.filter(|v| !(type_min..=type_max).contains(v)) {
+                    return Err(ParseError::ParseError(format!(
+                        "{option} ({value}) is out of range for sequence data type {type_name}"
+                    )));
+                }
+            }
             if increment.unwrap_or(1) > 0 {
                 max_value.get_or_insert(type_max);
             } else {
@@ -6139,6 +6146,14 @@ mod tests {
         assert_eq!(
             bounds("CREATE SEQUENCE s AS bigint"),
             (None, Some(i64::MAX))
+        );
+        let err = PostgreSQLTranslator::new()
+            .translate(&crate::parse("CREATE SEQUENCE s AS smallint MAXVALUE 100000").unwrap())
+            .unwrap_err()
+            .to_string();
+        assert_eq!(
+            err,
+            "MAXVALUE (100000) is out of range for sequence data type smallint"
         );
         let err = PostgreSQLTranslator::new()
             .translate(&crate::parse("CREATE SEQUENCE s AS numeric").unwrap())
