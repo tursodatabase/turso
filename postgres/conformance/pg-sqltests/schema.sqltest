@@ -288,3 +288,20 @@ expect {
     1|2
     2|1
 }
+
+test view-reads-a-table-of-another-schema {
+    CREATE SCHEMA app;
+    CREATE TABLE app.t (x int);
+    INSERT INTO app.t VALUES (3);
+    CREATE VIEW v AS SELECT x FROM app.t;
+    CREATE MATERIALIZED VIEW mv AS SELECT x FROM app.t;
+    CREATE VIEW app.v AS SELECT x FROM public.v;
+    SELECT * FROM v;
+    SELECT * FROM mv;
+    SELECT * FROM app.v;
+}
+expect {
+    3
+    3
+    3
+}
