@@ -990,6 +990,46 @@ fn test_fts_order_by_and_limit(tmp_db: TempDatabase) {
 
 #[cfg(all(feature = "fts", not(target_family = "wasm")))]
 #[turso_macros::test]
+fn test_fts_match_with_order_by_column_and_limit(tmp_db: TempDatabase) {
+    let _ = env_logger::try_init();
+    let conn = tmp_db.connect_limbo();
+
+    conn.execute("CREATE TABLE notes(id INTEGER PRIMARY KEY, body TEXT, created_at INTEGER)")
+        .unwrap();
+    conn.execute("CREATE INDEX fts_notes ON notes USING fts (body)")
+        .unwrap();
+    conn.execute(
+        "INSERT INTO notes VALUES
+            (1, 'use the cache for lookups', 500),
+            (2, 'invalidate the cache after sync', 900),
+            (3, 'keep the cache bounded', 100),
+            (4, 'prefer streaming over buffering', 1000),
+            (5, 'warm the cache on startup', 700),
+            (6, 'cache eviction is lru', 300),
+            (7, 'never cache read errors', 800)",
+    )
+    .unwrap();
+
+    let rows = limbo_exec_rows(
+        &conn,
+        "SELECT id FROM notes WHERE fts_match(body, 'cache') ORDER BY created_at DESC LIMIT 2",
+    );
+    assert_that!(rows)
+        .column(0)
+        .contains_exactly([Cell::from(2), Cell::from(7)]);
+
+    let rows = limbo_exec_rows(
+        &conn,
+        "SELECT id, fts_score(body, 'cache') AS score FROM notes WHERE fts_match(body, 'cache') ORDER BY created_at LIMIT 1",
+    );
+    assert_that!(rows)
+        .column(0)
+        .single_element()
+        .is_equal_to(Cell::from(3));
+}
+
+#[cfg(all(feature = "fts", not(target_family = "wasm")))]
+#[turso_macros::test]
 fn test_fts_limit_zero_and_negative(tmp_db: TempDatabase) {
     let _ = env_logger::try_init();
     let conn = tmp_db.connect_limbo();
