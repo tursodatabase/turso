@@ -3214,10 +3214,10 @@ mod tests {
                 SQLITE_OK
             );
             assert_eq!(sqlite3_step(stmt), SQLITE_ROW);
-            assert_eq!(DESTROYED.load(Ordering::SeqCst), 2);
             assert_eq!(sqlite3_column_type(stmt, 0), SQLITE_BLOB);
             assert_eq!(sqlite3_column_blob(stmt, 0).cast::<u8>().read(), b'b');
             assert_eq!(sqlite3_finalize(stmt), SQLITE_OK);
+            assert_eq!(DESTROYED.load(Ordering::SeqCst), 2);
             assert_eq!(sqlite3_close(db), SQLITE_OK);
         }
     }
