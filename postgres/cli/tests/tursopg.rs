@@ -1289,6 +1289,25 @@ fn wire_copy_from_returns_copy_n() {
 }
 
 #[test]
+fn wire_create_function_returns_create_function_tag() {
+    let (mut server, port) = start_tursopg_server();
+    let mut client = PgTestClient::connect(port);
+
+    let tags =
+        client.query_command_tags("CREATE FUNCTION two() RETURNS int LANGUAGE sql AS 'SELECT 2'");
+    assert_eq!(tags, vec!["CREATE FUNCTION"]);
+    let tags = client.query_command_tags(
+        "CREATE OR REPLACE FUNCTION two() RETURNS int LANGUAGE sql AS 'SELECT 2'",
+    );
+    assert_eq!(tags, vec!["CREATE FUNCTION"]);
+    let tags = client.query_command_tags("DROP FUNCTION two()");
+    assert_eq!(tags, vec!["DROP FUNCTION"]);
+
+    server.kill().ok();
+    server.wait().ok();
+}
+
+#[test]
 fn repl_load_extension_still_attempts_to_open_the_file() {
     let output = run_tursopg(b"SELECT load_extension('/nonexistent/turso-audit-ext');\n");
     let combined = format!(

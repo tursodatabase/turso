@@ -1,0 +1,139 @@
+# CREATE FUNCTION and DROP FUNCTION through the PostgreSQL frontend.
+#
+# Turso stores each function and shows it in pg_proc. The tests here cover
+# the catalog. Which functions Turso can execute is covered elsewhere.
+
+@database :memory:
+
+test create-function-appears-in-pg-proc {
+    CREATE FUNCTION add_tax(price numeric) RETURNS numeric LANGUAGE sql AS 'SELECT price * 1.2';
+    SELECT proname, pronargs, proisstrict, provolatile, prosrc, lanname
+    FROM pg_proc JOIN pg_language ON pg_proc.prolang = pg_language.oid
+    WHERE proname = 'add_tax';
+}
+expect {
+    add_tax|1|f|v|SELECT price * 1.2|sql
+}
+
+test create-function-keeps-strict-and-immutable {
+    CREATE FUNCTION add_tax(price numeric) RETURNS numeric LANGUAGE sql IMMUTABLE STRICT AS 'SELECT price * 1.2';
+    SELECT proisstrict, provolatile FROM pg_proc WHERE proname = 'add_tax';
+}
+expect {
+    t|i
+}
+
+test create-function-keeps-security-definer {
+    CREATE FUNCTION secure() RETURNS int LANGUAGE sql SECURITY DEFINER SET search_path = '' AS 'SELECT 1';
+    SELECT prosecdef FROM pg_proc WHERE proname = 'secure';
+}
+expect {
+    t
+}
+
+test plpgsql-trigger-function-is-stored {
+    CREATE FUNCTION set_updated_at() RETURNS trigger LANGUAGE plpgsql AS $$
+    BEGIN
+      NEW.updated_at := now();
+      RETURN NEW;
+    END;
+    $$;
+    SELECT proname, pronargs, lanname
+    FROM pg_proc JOIN pg_language ON pg_proc.prolang = pg_language.oid
+    WHERE proname = 'set_updated_at';
+}
+expect {
+    set_updated_at|0|plpgsql
+}
+
+test create-or-replace-function-replaces-the-body {
+    CREATE FUNCTION two() RETURNS int LANGUAGE sql AS 'SELECT 1';
+    CREATE OR REPLACE FUNCTION two() RETURNS int LANGUAGE sql AS 'SELECT 2';
+    SELECT prosrc FROM pg_proc WHERE proname = 'two';
+}
+expect {
+    SELECT 2
+}
+
+test create-function-twice-is-an-error {
+    CREATE FUNCTION one() RETURNS int LANGUAGE sql AS 'SELECT 1';
+    CREATE FUNCTION one() RETURNS int LANGUAGE sql AS 'SELECT 1';
+}
+expect error {
+    function "one" already exists with same argument types
+}
+
+test functions-with-different-parameter-counts-coexist {
+    CREATE FUNCTION f() RETURNS int LANGUAGE sql AS 'SELECT 1';
+    CREATE FUNCTION f(a int) RETURNS int LANGUAGE sql AS 'SELECT a';
+    SELECT pronargs FROM pg_proc WHERE proname = 'f' ORDER BY pronargs;
+}
+expect {
+    0
+    1
+}
+
+test drop-function-removes-it-from-pg-proc {
+    CREATE FUNCTION gone(a int) RETURNS int LANGUAGE sql AS 'SELECT a';
+    DROP FUNCTION gone(int);
+    SELECT count(*) FROM pg_proc WHERE proname = 'gone';
+}
+expect {
+    0
+}
+
+test drop-function-without-parameter-types {
+    CREATE FUNCTION gone(a int) RETURNS int LANGUAGE sql AS 'SELECT a';
+    DROP FUNCTION gone;
+    SELECT count(*) FROM pg_proc WHERE proname = 'gone';
+}
+expect {
+    0
+}
+
+test drop-function-with-two-definitions-needs-parameter-types {
+    CREATE FUNCTION g() RETURNS int LANGUAGE sql AS 'SELECT 1';
+    CREATE FUNCTION g(a int) RETURNS int LANGUAGE sql AS 'SELECT a';
+    DROP FUNCTION g;
+}
+expect error {
+    function name "g" is not unique
+}
+
+test drop-missing-function-is-an-error {
+    DROP FUNCTION nope(int);
+}
+expect error {
+    function nope\(integer\) does not exist
+}
+
+test drop-missing-function-without-parameter-types-is-an-error {
+    DROP FUNCTION nope;
+}
+expect error {
+    could not find a function named "nope"
+}
+
+test drop-missing-function-if-exists-does-nothing {
+    DROP FUNCTION IF EXISTS nope(int);
+    SELECT 1;
+}
+expect {
+    1
+}
+
+test create-procedure-is-not-supported {
+    CREATE PROCEDURE p() LANGUAGE sql AS 'SELECT 1';
+}
+expect error {
+    CREATE PROCEDURE is not supported
+}
+
+@skip-if postgres "PostgreSQL executes the function"
+test calling-a-function-turso-cannot-execute-is-an-error {
+    CREATE FUNCTION pg_class_count() RETURNS bigint LANGUAGE sql AS 'SELECT count(*) FROM pg_class';
+    SELECT pg_class_count();
+}
+expect error {
+    pg_class_count
+}

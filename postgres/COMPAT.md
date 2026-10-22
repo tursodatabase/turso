@@ -453,9 +453,9 @@ Upgrade is not supported.
 | ALTER TABLE / ENABLE REPLICA TRIGGER/RULE | ❌ Not supported | |
 | BEGIN ATOMIC function bodies | ❌ Not supported | |
 | CALL syntax for executing procedures | ❌ Not supported | |
-| CREATE FUNCTION | ❌ Not supported | Rejected with an error |
+| CREATE FUNCTION | 🟡 Partial | `CREATE [OR REPLACE] FUNCTION` and `DROP FUNCTION` keep the function in the catalog (`pg_proc`, `pg_language`); functions are resolved by name and number of parameters, so overloads by parameter type are rejected; `SECURITY DEFINER` and `SET` options are accepted and ignored; a call to a function gives an error |
 | Column level triggers | ❌ Not supported | |
-| CREATE PROCEDURE syntax for SQL stored procedures | ❌ Not supported | |
+| CREATE PROCEDURE syntax for SQL stored procedures | ❌ Not supported | Rejected with an error |
 | Event triggers | ❌ Not supported | |
 | FILTER clause for aggregate functions | ✅ Supported | |
 | ORDER BY support within aggregates | ❌ Not supported | Silently dropped |
@@ -473,7 +473,7 @@ Upgrade is not supported.
 
 | Feature | Status | Notes |
 |---------|--------|-------|
-| Procedural languages (PL/pgSQL, PL/Python, ...) | ❌ Not supported | CREATE FUNCTION and DO are rejected with an error |
+| Procedural languages (PL/pgSQL, PL/Python, ...) | 🟡 Partial | `CREATE FUNCTION ... LANGUAGE plpgsql` is stored in the catalog; the function cannot be called yet; DO is rejected with an error |
 | CASE in pl/pgsql | ❌ Not supported | |
 | CONTINUE statement for PL/pgSQL | ❌ Not supported | |
 | CREATE TRANSFORM | ❌ Not supported | |

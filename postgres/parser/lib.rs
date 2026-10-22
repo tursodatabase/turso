@@ -1,6 +1,7 @@
 pub use pg_query::ParseResult;
 use thiserror::Error;
 
+pub mod function;
 pub mod translator;
 
 #[derive(Debug, Error)]

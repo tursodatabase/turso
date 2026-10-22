@@ -3,6 +3,7 @@
 // This module translates pg_query's PostgreSQL AST into Turso's SQL AST
 // representation, handling the semantic differences between PostgreSQL and SQLite.
 
+use crate::function::{display_type_name, PgFunction};
 use crate::ParseError;
 use pg_query::protobuf::JoinType as PgJoinType;
 use pg_query::{NodeRef, ParseResult};
@@ -110,7 +111,17 @@ impl PostgreSQLTranslator {
     /// For statements that may generate prerequisites (e.g., serial columns),
     /// use `translate_with_prereqs` instead.
     pub fn translate(&self, parse_result: &ParseResult) -> Result<ast::Stmt, ParseError> {
-        let translated = self.translate_with_prereqs(parse_result)?;
+        self.translate_statement(parse_result, None)
+    }
+
+    /// Translate a PostgreSQL parse result whose statement text is `source`.
+    /// CREATE FUNCTION keeps the text, so it needs `source`.
+    pub fn translate_statement(
+        &self,
+        parse_result: &ParseResult,
+        source: Option<&str>,
+    ) -> Result<ast::Stmt, ParseError> {
+        let translated = self.translate_with_prereqs(parse_result, source)?;
         let ast::Cmd::Stmt(stmt) = translated.cmd else {
             return Err(ParseError::ParseError(
                 "expected a PostgreSQL statement".to_string(),
@@ -121,9 +132,11 @@ impl PostgreSQLTranslator {
 
     /// Translate a PostgreSQL parse result, returning both the main command
     /// and any prerequisite statements (e.g., implicit CREATE SEQUENCE for serial columns).
+    /// `source` is the statement text, which CREATE FUNCTION keeps.
     pub fn translate_with_prereqs(
         &self,
         parse_result: &ParseResult,
+        source: Option<&str>,
     ) -> Result<TranslateResult, ParseError> {
         if parse_result.protobuf.nodes().is_empty() {
             return Err(ParseError::ParseError("No statements found".to_string()));
@@ -142,7 +155,7 @@ impl PostgreSQLTranslator {
 
         let cmd = match node.0 {
             NodeRef::ExplainStmt(explain) => self.translate_explain(explain)?,
-            node => ast::Cmd::Stmt(self.translate_node(node)?),
+            node => ast::Cmd::Stmt(self.translate_node(node, source)?),
         };
 
         Ok(TranslateResult {
@@ -151,7 +164,11 @@ impl PostgreSQLTranslator {
         })
     }
 
-    fn translate_node(&self, node: NodeRef<'_>) -> Result<ast::Stmt, ParseError> {
+    fn translate_node(
+        &self,
+        node: NodeRef<'_>,
+        source: Option<&str>,
+    ) -> Result<ast::Stmt, ParseError> {
         Ok(match node {
             NodeRef::SelectStmt(select) => {
                 // Top-level SELECT ... INTO is PG's legacy spelling of
@@ -183,6 +200,7 @@ impl PostgreSQLTranslator {
                 ))
             }
             NodeRef::CreateSeqStmt(seq) => self.translate_create_sequence(seq)?,
+            NodeRef::CreateFunctionStmt(function) => translate_create_function(function, source)?,
             _ => {
                 return Err(ParseError::ParseError(format!(
                     "{} is not supported",
@@ -207,7 +225,7 @@ impl PostgreSQLTranslator {
             .and_then(|query| query.node.as_ref())
             .ok_or_else(|| ParseError::ParseError("EXPLAIN missing statement".to_string()))?;
         Ok(ast::Cmd::ExplainQueryPlan {
-            stmt: self.translate_node(query.to_ref())?,
+            stmt: self.translate_node(query.to_ref(), None)?,
             format: ast::EqpFormat::Text,
         })
     }
@@ -982,6 +1000,10 @@ impl PostgreSQLTranslator {
 
         let remove_type = ObjectType::try_from(drop.remove_type)
             .map_err(|_| ParseError::ParseError("Invalid object type in DROP".into()))?;
+
+        if remove_type == ObjectType::ObjectFunction {
+            return translate_drop_function(drop);
+        }
 
         // Extract the first qualified name from drop.objects
         let obj_node = drop
@@ -4787,6 +4809,67 @@ struct PgForeignKey {
     on_update: Option<String>,
 }
 
+/// Translate `CREATE FUNCTION`. The engine stores the statement text, so the
+/// text must be known.
+fn translate_create_function(
+    stmt: &pg_query::protobuf::CreateFunctionStmt,
+    source: Option<&str>,
+) -> Result<ast::Stmt, ParseError> {
+    let function = PgFunction::from_stmt(stmt)?;
+    let Some(source) = source else {
+        return Err(ParseError::ParseError(
+            "CREATE FUNCTION needs the statement text".to_string(),
+        ));
+    };
+    Ok(ast::Stmt::CreateFunction(ast::CreateFunction {
+        or_replace: function.or_replace,
+        name: ast::Name::exact(function.name),
+        arg_count: function.params.len(),
+        sql: source.trim().trim_end_matches(';').trim_end().to_string(),
+    }))
+}
+
+/// Translate `DROP FUNCTION [IF EXISTS] name[(types)]`.
+fn translate_drop_function(drop: &pg_query::protobuf::DropStmt) -> Result<ast::Stmt, ParseError> {
+    use pg_query::protobuf::node::Node;
+
+    let [object] = drop.objects.as_slice() else {
+        return Err(ParseError::ParseError(
+            "DROP FUNCTION with more than one function is not supported".into(),
+        ));
+    };
+    let Some(Node::ObjectWithArgs(object)) = &object.node else {
+        return Err(ParseError::ParseError(
+            "DROP FUNCTION: unexpected object format".into(),
+        ));
+    };
+    let name = last_string(&object.objname)
+        .ok_or_else(|| ParseError::ParseError("DROP FUNCTION missing function name".into()))?;
+    let arg_types = if object.args_unspecified {
+        None
+    } else {
+        Some(
+            object
+                .objargs
+                .iter()
+                .map(|arg| match &arg.node {
+                    Some(Node::TypeName(type_name)) => Ok(display_type_name(
+                        &extract_type_name_from_typename(type_name)?,
+                    )),
+                    _ => Err(ParseError::ParseError(
+                        "DROP FUNCTION: unexpected argument type".into(),
+                    )),
+                })
+                .collect::<Result<Vec<_>, ParseError>>()?,
+        )
+    };
+    Ok(ast::Stmt::DropFunction {
+        if_exists: drop.missing_ok,
+        name: ast::Name::exact(name),
+        arg_types,
+    })
+}
+
 /// Translate `CREATE TYPE <name> AS ENUM (...)` to a Turso `CREATE TYPE` with
 /// an ENCODE expression that validates values against the enum labels.
 fn translate_create_enum(
@@ -4963,7 +5046,7 @@ fn pg_type_name_to_ast_type(type_name: &pg_query::protobuf::TypeName) -> Option<
     })
 }
 
-fn extract_type_name_from_typename(
+pub(crate) fn extract_type_name_from_typename(
     type_name: &pg_query::protobuf::TypeName,
 ) -> Result<String, ParseError> {
     use pg_query::protobuf::node::Node;
@@ -7671,7 +7754,7 @@ mod tests {
     fn test_simple_explain_translates_to_query_plan() {
         let translator = PostgreSQLTranslator::new();
         let parsed = crate::parse("EXPLAIN SELECT 1").unwrap();
-        let translated = translator.translate_with_prereqs(&parsed).unwrap();
+        let translated = translator.translate_with_prereqs(&parsed, None).unwrap();
         assert!(translated.prereqs.is_empty());
         assert!(matches!(translated.cmd, ast::Cmd::ExplainQueryPlan { .. }));
     }
@@ -7685,7 +7768,9 @@ mod tests {
             "EXPLAIN (COSTS OFF) SELECT 1",
         ] {
             let parsed = crate::parse(sql).unwrap();
-            let err = translator.translate_with_prereqs(&parsed).unwrap_err();
+            let err = translator
+                .translate_with_prereqs(&parsed, None)
+                .unwrap_err();
             assert!(
                 err.to_string().contains("EXPLAIN options"),
                 "expected EXPLAIN option error for {sql}, got: {err}"

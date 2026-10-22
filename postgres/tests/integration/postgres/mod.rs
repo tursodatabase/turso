@@ -1,5 +1,6 @@
 mod catalog;
 mod copy;
+mod create_function;
 mod dialect;
 mod domain;
 mod functions;

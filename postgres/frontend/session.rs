@@ -200,7 +200,7 @@ fn prepare_statement(pg_conn: &Arc<PgConnectionInner>, sql: &str) -> Result<Stat
         };
     let translator = PostgreSQLTranslator::new();
     let translated = translator
-        .translate_with_prereqs(&parse_result)
+        .translate_with_prereqs(&parse_result, Some(&sql))
         .map_err(|e| LimboError::ParseError(e.to_string()))?;
     reject_catalog_dml(translated.cmd.stmt())?;
 

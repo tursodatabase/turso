@@ -663,6 +663,10 @@ fn command_tag(query: &str, affected_rows: usize) -> Tag {
         Tag::new("CREATE INDEX")
     } else if upper.starts_with("CREATE SCHEMA") {
         Tag::new("CREATE SCHEMA")
+    } else if is_create_of(&upper, "FUNCTION") {
+        Tag::new("CREATE FUNCTION")
+    } else if is_create_of(&upper, "TRIGGER") {
+        Tag::new("CREATE TRIGGER")
     } else if is_create_table_as(&upper) {
         // PostgreSQL reports CREATE TABLE AS completion as `SELECT n` (the
         // rows inserted), except WITH NO DATA which skips the insert and
@@ -680,6 +684,10 @@ fn command_tag(query: &str, affected_rows: usize) -> Tag {
         Tag::new("DROP INDEX")
     } else if upper.starts_with("DROP SCHEMA") {
         Tag::new("DROP SCHEMA")
+    } else if upper.starts_with("DROP FUNCTION") {
+        Tag::new("DROP FUNCTION")
+    } else if upper.starts_with("DROP TRIGGER") {
+        Tag::new("DROP TRIGGER")
     } else if upper.starts_with("DROP") {
         Tag::new("DROP TABLE")
     } else if upper.starts_with("ALTER") {
@@ -711,6 +719,22 @@ fn command_tag(query: &str, affected_rows: usize) -> Tag {
     } else {
         Tag::new("OK")
     }
+}
+
+/// Whether the statement is `CREATE [OR REPLACE] <object> ...`.
+fn is_create_of(upper: &str, object: &str) -> bool {
+    let mut tokens = upper.split_whitespace();
+    if tokens.next() != Some("CREATE") {
+        return false;
+    }
+    let mut token = tokens.next();
+    if token == Some("OR") {
+        if tokens.next() != Some("REPLACE") {
+            return false;
+        }
+        token = tokens.next();
+    }
+    token == Some(object)
 }
 
 /// Whether the statement ends with `WITH NO DATA`, token-wise (ignoring
@@ -848,6 +872,34 @@ mod tests {
         ));
         assert!(is_pg_non_query("  lock\ntable items in access share mode"));
         assert!(!is_pg_non_query("SELECT 'LOCK TABLE items'"));
+    }
+
+    #[test]
+    fn function_and_trigger_command_tags() {
+        for (sql, tag) in [
+            (
+                "CREATE FUNCTION f() RETURNS int LANGUAGE sql AS 'SELECT 1'",
+                "CREATE FUNCTION",
+            ),
+            (
+                "create or replace function f() returns int language sql as 'SELECT 1'",
+                "CREATE FUNCTION",
+            ),
+            (
+                "CREATE TRIGGER t AFTER INSERT ON x FOR EACH ROW EXECUTE FUNCTION f()",
+                "CREATE TRIGGER",
+            ),
+            (
+                "CREATE OR REPLACE TRIGGER t AFTER INSERT ON x EXECUTE FUNCTION f()",
+                "CREATE TRIGGER",
+            ),
+            ("DROP FUNCTION f()", "DROP FUNCTION"),
+            ("DROP TRIGGER t ON x", "DROP TRIGGER"),
+            ("CREATE TABLE t (x INT)", "CREATE TABLE"),
+            ("CREATE OR REPLACE VIEW v AS SELECT 1", "CREATE TABLE"),
+        ] {
+            assert_eq!(command_tag(sql, 0), Tag::new(tag), "{sql}");
+        }
     }
 
     #[test]

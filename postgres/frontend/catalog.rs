@@ -12,6 +12,7 @@ use turso_core::{
 use turso_ext::{ConstraintInfo, IndexInfo, OrderByInfo, ResultCode, VTabKind};
 use turso_parser::ast::RefAct;
 
+use turso_pg_parser::function::{PgFunction, Volatility};
 pub use turso_pg_parser::translator::is_catalog_table_name;
 
 /// PostgreSQL uses OID zero when no object is referenced.
@@ -23,6 +24,20 @@ const CATALOG_BOOLEAN_TRUE: i64 = 1;
 
 /// Starting OID for user tables (matches PostgreSQL convention)
 const USER_TABLE_OID_START: i64 = 16384;
+/// Starting OID for the functions that CREATE FUNCTION created, above the
+/// range of the user tables.
+const USER_FUNCTION_OID_START: i64 = 24576;
+/// Fixed PostgreSQL OID of the public schema.
+const PUBLIC_NAMESPACE_OID: i64 = 2200;
+/// The pg_language rows: (oid, name, is procedural language). The OIDs of
+/// internal, c and sql are fixed in PostgreSQL. plpgsql gets its OID when it
+/// is installed, so its OID is one of a PostgreSQL 16 installation.
+const FUNCTION_LANGUAGES: &[(i64, &str, bool)] = &[
+    (12, "internal", false),
+    (13, "c", false),
+    (14, "sql", false),
+    (13575, "plpgsql", true),
+];
 const PRIMARY_KEY_AUTOMATIC_INDEX_NAME_PREFIX: &str = "sqlite_autoindex_";
 
 #[derive(Debug)]
@@ -52,8 +67,15 @@ impl Dialect for PostgresDialect {
             Some(next) => next.stmt_location as usize,
             None => sql.len(),
         };
+        let statement_start = stmts[0].stmt_location as usize;
+        let statement_end = match stmts[0].stmt_len {
+            0 => sql.len(),
+            len => statement_start + len as usize,
+        };
         let translator = turso_pg_parser::translator::PostgreSQLTranslator::new();
-        match translator.translate(&parse_result) {
+        match translator
+            .translate_statement(&parse_result, Some(&sql[statement_start..statement_end]))
+        {
             Ok(stmt) => Ok((Some(turso_parser::ast::Cmd::Stmt(stmt)), consumed)),
             Err(_) => turso_core::dialect::sqlite::parse(sql),
         }
@@ -753,6 +775,8 @@ impl SnapshotRows for PgProcTable {
             oid += 1;
         }
 
+        rows.extend(user_function_rows(&conn.current_schema()));
+
         // Extension functions
         for (name, is_agg, argc, deterministic) in conn.get_syms_functions() {
             let prokind = if is_agg { "a" } else { "f" };
@@ -792,6 +816,113 @@ impl SnapshotRows for PgProcTable {
             oid += 1;
         }
         rows
+    }
+}
+
+/// One pg_proc row for each function that CREATE FUNCTION created, in name
+/// order. A function whose text no longer parses has no row.
+fn user_function_rows(schema: &Schema) -> Vec<Vec<Value>> {
+    let mut functions: Vec<&Arc<turso_core::schema::UserFunction>> =
+        schema.user_functions.values().flatten().collect();
+    functions.sort_by(|a, b| (&a.name, a.arg_count).cmp(&(&b.name, b.arg_count)));
+    functions
+        .into_iter()
+        .enumerate()
+        .filter_map(|(i, function)| {
+            let parsed = PgFunction::parse(&function.sql).ok()?;
+            Some(user_function_row(
+                USER_FUNCTION_OID_START + i as i64,
+                &parsed,
+            ))
+        })
+        .collect()
+}
+
+fn user_function_row(oid: i64, function: &PgFunction) -> Vec<Value> {
+    let provolatile = match function.volatility {
+        Volatility::Immutable => "i",
+        Volatility::Stable => "s",
+        Volatility::Volatile => "v",
+    };
+    let argument_types = function
+        .params
+        .iter()
+        .map(|param| pg_type_oid(&param.type_name).to_string())
+        .collect::<Vec<_>>()
+        .join(" ");
+    let argument_names = function
+        .params
+        .iter()
+        .any(|param| param.name.is_some())
+        .then(|| {
+            format!(
+                "{{{}}}",
+                function
+                    .params
+                    .iter()
+                    .map(|param| param.name.clone().unwrap_or_default())
+                    .collect::<Vec<_>>()
+                    .join(",")
+            )
+        });
+    vec![
+        Value::from_i64(oid),                                                    // oid
+        Value::build_text(function.name.clone()),                                // proname
+        Value::from_i64(PUBLIC_NAMESPACE_OID),                                   // pronamespace
+        Value::from_i64(10),                                                     // proowner
+        Value::from_i64(language_oid(&function.language)),                       // prolang
+        Value::from_f64(100.0),                                                  // procost
+        Value::from_f64(if function.returns_set { 1000.0 } else { 0.0 }),        // prorows
+        Value::from_i64(0),                                                      // provariadic
+        Value::build_text("f"),                                                  // prokind
+        Value::from_i64(function.security_definer as i64),                       // prosecdef
+        Value::from_i64(0),                                                      // proleakproof
+        Value::from_i64(function.strict as i64),                                 // proisstrict
+        Value::from_i64(function.returns_set as i64),                            // proretset
+        Value::build_text(provolatile),                                          // provolatile
+        Value::build_text("u"),                                                  // proparallel
+        Value::from_i64(function.params.len() as i64),                           // pronargs
+        Value::from_i64(0),                                                      // pronargdefaults
+        Value::from_i64(function.return_type.as_deref().map_or(0, pg_type_oid)), // prorettype
+        Value::build_text(argument_types),                                       // proargtypes
+        Value::Null,                                                             // proallargtypes
+        Value::Null,                                                             // proargmodes
+        argument_names.map_or(Value::Null, Value::build_text),                   // proargnames
+        Value::Null,                                                             // proargdefaults
+        Value::Null,                                                             // protrftypes
+        function.body.clone().map_or(Value::Null, Value::build_text),            // prosrc
+        Value::Null,                                                             // probin
+        Value::Null,                                                             // prosqlbody
+        Value::Null,                                                             // proconfig
+        Value::Null,                                                             // proacl
+    ]
+}
+
+/// The pg_language OID of a function language, or zero for an unknown one.
+fn language_oid(language: &str) -> i64 {
+    FUNCTION_LANGUAGES
+        .iter()
+        .find(|(_, name, _)| *name == language)
+        .map_or(0, |(oid, _, _)| *oid)
+}
+
+/// The pg_type OID of a type name as PostgreSQL spells it, or zero when the
+/// type is not a built-in type.
+fn pg_type_oid(type_name: &str) -> i64 {
+    let (base, is_array) = match type_name.strip_suffix("[]") {
+        Some(base) => (base, true),
+        None => (type_name, false),
+    };
+    let Some(info) = PG_BASE_TYPES
+        .iter()
+        .find(|info| info.name.eq_ignore_ascii_case(base))
+    else {
+        return 0;
+    };
+    if is_array {
+        info.typarray
+    } else {
+        info.oid
     }
 }
 
@@ -2394,18 +2525,18 @@ impl SnapshotRows for PgLanguageTable {
     )";
     const TABLE_OID: Option<i64> = Some(2612);
     const ESTIMATED_COST: f64 = 1.0;
-    const ESTIMATED_ROWS: u32 = 2;
+    const ESTIMATED_ROWS: u32 = 4;
 
     fn load_rows(_conn: &Connection) -> Vec<Vec<Value>> {
-        [(12, "internal"), (13, "c")]
-            .into_iter()
-            .map(|(oid, name)| {
+        FUNCTION_LANGUAGES
+            .iter()
+            .map(|(oid, name, is_procedural)| {
                 vec![
-                    Value::from_i64(oid),
-                    Value::build_text(name),
+                    Value::from_i64(*oid),
+                    Value::build_text(*name),
                     Value::from_i64(10),
-                    Value::from_i64(0),
-                    Value::from_i64(0),
+                    Value::from_i64(*is_procedural as i64),
+                    Value::from_i64(*is_procedural as i64),
                     Value::from_i64(0),
                     Value::from_i64(0),
                     Value::from_i64(0),
