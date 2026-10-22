@@ -84,6 +84,28 @@ expect {
     3
 }
 
+test values-subquery-column-alias-list {
+    SELECT v.b, v.a FROM (VALUES (1, 2), (3, 4)) AS v(a, b) ORDER BY v.a;
+}
+expect {
+    2|1
+    4|3
+}
+
+test star-subquery-column-alias-list {
+    SELECT s.y FROM (SELECT * FROM (VALUES (1, 2)) AS t(a, b)) AS s(x, y);
+}
+expect {
+    2
+}
+
+test subquery-column-alias-list-keeps-inner-order-by {
+    SELECT s.b FROM (SELECT a, b FROM (VALUES (1, 9), (2, 3)) AS t(a, b) ORDER BY b LIMIT 1) AS s(b, a);
+}
+expect {
+    2
+}
+
 test generate-series-column-alias-list-renames-column {
     SELECT sum(g.n) FROM generate_series(1, 3) AS g(n);
 }

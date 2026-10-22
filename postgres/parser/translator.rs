@@ -2103,7 +2103,14 @@ impl PostgreSQLTranslator {
         // alias list renames it through a wrapping subselect, as for unnest.
         if func_name == "generate_series" {
             if let Some(range_alias) = &range_func.alias {
-                if let [column_name] = alias_column_names(range_alias)?.as_slice() {
+                let names = alias_column_names(range_alias)?;
+                if names.len() > 1 {
+                    return Err(ParseError::ParseError(format!(
+                        "table function generate_series has 1 column available but {} columns specified",
+                        names.len()
+                    )));
+                }
+                if let [column_name] = names.as_slice() {
                     let mut select = ast::Select {
                         with: None,
                         body: ast::SelectBody {
@@ -4524,54 +4531,64 @@ fn alias_column_names(alias: &pg_query::protobuf::Alias) -> Result<Vec<String>, 
         .collect()
 }
 
-/// Applies a FROM-item column alias list (`AS s(a, b)`) by renaming the
-/// leading result columns of `select`. SQLite names a compound's columns
-/// after its first SELECT, so only that one is renamed.
+/// Applies a FROM-item column alias list (`AS s(a, b)`) by wrapping `select`
+/// in a CTE with that column list: `WITH t(a, b) AS (select) SELECT * FROM t`.
+/// The inner ORDER BY / GROUP BY keep referring to the original names.
 fn rename_result_columns(select: &mut ast::Select, names: &[String]) -> Result<(), ParseError> {
     if names.is_empty() {
         return Ok(());
     }
-    if !select.order_by.is_empty() {
-        return Err(ParseError::ParseError(
-            "a column alias list on a subquery with ORDER BY is not supported".into(),
-        ));
-    }
-    let ast::OneSelect::Select {
-        columns, group_by, ..
-    } = &mut select.body.select
-    else {
-        return Err(ParseError::ParseError(
-            "a column alias list on a VALUES subquery is not supported".into(),
-        ));
+    const CTE_NAME: &str = "__column_alias_list";
+    let inner = std::mem::replace(
+        select,
+        ast::Select {
+            with: None,
+            body: ast::SelectBody {
+                select: ast::OneSelect::Values(vec![]),
+                compounds: vec![],
+            },
+            order_by: vec![],
+            limit: None,
+        },
+    );
+    *select = ast::Select {
+        with: Some(ast::With {
+            recursive: false,
+            ctes: vec![ast::CommonTableExpr {
+                tbl_name: ast::Name::from_string(CTE_NAME),
+                columns: names
+                    .iter()
+                    .map(|name| ast::IndexedColumn {
+                        col_name: ast::Name::from_string(name),
+                        collation_name: None,
+                        order: None,
+                    })
+                    .collect(),
+                materialized: ast::Materialized::Any,
+                select: inner,
+            }],
+        }),
+        body: ast::SelectBody {
+            select: ast::OneSelect::Select {
+                distinctness: None,
+                columns: vec![ast::ResultColumn::Star],
+                from: Some(ast::FromClause {
+                    select: Box::new(ast::SelectTable::Table(
+                        ast::QualifiedName::single(ast::Name::from_string(CTE_NAME)),
+                        None,
+                        None,
+                    )),
+                    joins: vec![],
+                }),
+                where_clause: None,
+                group_by: None,
+                window_clause: vec![],
+            },
+            compounds: vec![],
+        },
+        order_by: vec![],
+        limit: None,
     };
-    if group_by.is_some() {
-        return Err(ParseError::ParseError(
-            "a column alias list on a subquery with GROUP BY is not supported".into(),
-        ));
-    }
-    // A * expands to an unknown number of columns, so positions after it
-    // cannot be matched to names.
-    if columns
-        .iter()
-        .take(names.len())
-        .any(|c| !matches!(c, ast::ResultColumn::Expr(..)))
-    {
-        return Err(ParseError::ParseError(
-            "a column alias list on a subquery that selects * is not supported".into(),
-        ));
-    }
-    if names.len() > columns.len() {
-        return Err(ParseError::ParseError(format!(
-            "table has {} columns available but {} columns specified",
-            columns.len(),
-            names.len()
-        )));
-    }
-    for (column, name) in columns.iter_mut().zip(names) {
-        if let ast::ResultColumn::Expr(_, alias) = column {
-            *alias = Some(ast::As::Elided(ast::Name::from_string(name)));
-        }
-    }
     Ok(())
 }
 
@@ -5903,36 +5920,25 @@ mod tests {
                 .translate(&crate::parse(sql).unwrap())
                 .map(|stmt| stmt.to_string())
         };
-        let sql = translate("SELECT s.p, s.q FROM (SELECT 1, 2) AS s(p, q)").unwrap();
-        assert!(sql.contains("1 p") && sql.contains("2 q"), "{sql}");
-        let sql = translate("SELECT g.n FROM generate_series(1, 3) AS g(n)").unwrap();
-        assert!(sql.contains("value n"), "{sql}");
-        for (sql, needle) in [
-            ("SELECT * FROM (SELECT * FROM t) AS s(a, b)", "selects *"),
-            (
-                "SELECT * FROM (VALUES (1, 2)) AS v(a, b)",
-                "VALUES subquery",
-            ),
-            (
-                "SELECT * FROM (SELECT 1) AS s(a, b)",
-                "1 columns available but 2",
-            ),
-            (
-                "SELECT * FROM (SELECT b AS a FROM t ORDER BY a LIMIT 1) AS s(x)",
-                "with ORDER BY",
-            ),
-            (
-                "SELECT * FROM (SELECT a AS k, count(*) FROM t GROUP BY k) AS s(x, y)",
-                "with GROUP BY",
-            ),
-            (
-                "SELECT * FROM (SELECT a AS k FROM t UNION SELECT 9 ORDER BY k DESC LIMIT 1) AS s(x)",
-                "with ORDER BY",
-            ),
+        for sql in [
+            "SELECT * FROM (SELECT 1, 2) AS s(p, q)",
+            "SELECT * FROM (VALUES (1, 2)) AS v(a, b)",
+            "SELECT * FROM (SELECT * FROM t) AS s(a, b)",
+            "SELECT * FROM (SELECT b AS a FROM t ORDER BY a LIMIT 1) AS s(x)",
+            "SELECT * FROM (SELECT a AS k, count(*) FROM t GROUP BY k) AS s(x, y)",
         ] {
-            let err = translate(sql).unwrap_err().to_string();
-            assert!(err.contains(needle), "{sql}: {err}");
+            let sql = translate(sql).unwrap();
+            assert!(sql.contains("__column_alias_list"), "{sql}");
         }
+        let sql = translate("SELECT g.n FROM generate_series(1, 3) AS g(n)").unwrap();
+        assert!(
+            sql.contains("value n") || sql.contains("__column_alias_list"),
+            "{sql}"
+        );
+        let err = translate("SELECT * FROM generate_series(1, 3) AS g(a, b)")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("generate_series"), "{err}");
     }
 
     #[test]
