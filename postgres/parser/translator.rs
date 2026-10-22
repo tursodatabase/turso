@@ -1532,6 +1532,13 @@ impl PostgreSQLTranslator {
             }
             // VALUES clause — compute which columns are DEFAULT in ALL rows.
             let (rows, default_mask) = self.translate_values(&select_stmt.values_lists)?;
+            // Without a column list, removing an all-DEFAULT position shifts
+            // every later value one column to the left.
+            if !has_explicit_columns && default_mask.iter().any(|d| *d) {
+                return Err(not_supported(
+                    "DEFAULT in INSERT ... VALUES without a column list",
+                ));
+            }
             // Strip columns that use DEFAULT in every row
             let filtered_columns: Vec<ast::Name> = columns
                 .into_iter()
@@ -1543,6 +1550,12 @@ impl PostgreSQLTranslator {
             // But only when the INSERT had explicit column names — an empty
             // column list means "all columns" (positional VALUES), not defaults.
             if filtered_columns.is_empty() && has_explicit_columns {
+                // DEFAULT VALUES has no place for an upsert clause.
+                if upsert.is_some() {
+                    return Err(not_supported(
+                        "ON CONFLICT on an INSERT whose values are all DEFAULT",
+                    ));
+                }
                 (ast::InsertBody::DefaultValues, filtered_columns)
             } else {
                 let select = ast::Select {
@@ -1579,7 +1592,7 @@ impl PostgreSQLTranslator {
     /// which column positions contain DEFAULT in every row. These positions should
     /// be stripped from the INSERT column list since SQLite doesn't support DEFAULT
     /// in VALUES — omitting the column achieves the same effect.
-    /// Columns with DEFAULT in only SOME rows keep the DEFAULT as NULL.
+    /// Columns with DEFAULT in only some rows keep the DEFAULT expression.
     // The Box<Expr> is required by ast::OneSelect::Values(Vec<Vec<Box<Expr>>>)
     #[allow(clippy::vec_box, clippy::type_complexity)]
     fn translate_values(
@@ -9317,5 +9330,17 @@ mod tests {
             "INSERT ... VALUES",
         );
         assert_translates("WITH c AS (SELECT 1) INSERT INTO t VALUES (1)");
+    }
+
+    #[test]
+    fn fail_closed_insert_defaults() {
+        assert_not_supported("INSERT INTO t VALUES (DEFAULT, 5)", "without a column list");
+        assert_not_supported(
+            "INSERT INTO t (a) VALUES (DEFAULT) ON CONFLICT DO NOTHING",
+            "ON CONFLICT",
+        );
+        assert_translates("INSERT INTO t (a, b) VALUES (DEFAULT, 5)");
+        assert_translates("INSERT INTO t (a, b) VALUES (DEFAULT, 1), (5, 2)");
+        assert_translates("INSERT INTO t (a) VALUES (DEFAULT)");
     }
 }
