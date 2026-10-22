@@ -338,7 +338,9 @@ fn try_prepare_special(pg_conn: &Arc<PgConnectionInner>, sql: &str) -> Result<Op
         return Ok(Some(noop_statement(&pg_conn.conn)?));
     }
 
-    if let Some(stmt) = try_extract_copy_from(&parse_result) {
+    if let Some(stmt) =
+        try_extract_copy_from(&parse_result).map_err(|e| LimboError::ParseError(e.to_string()))?
+    {
         let rows_inserted = handle_pg_copy_from(&pg_conn.conn, &stmt)?;
         let stmt = noop_statement(&pg_conn.conn)?;
         stmt.set_n_change(rows_inserted as i64);
