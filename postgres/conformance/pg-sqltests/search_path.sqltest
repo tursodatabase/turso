@@ -482,3 +482,36 @@ test quoted-uppercase-search-path-does-not-match-a-lowercase-schema {
 }
 expect {
 }
+
+test alter-table-if-exists-checks-the-table-of-the-search-path {
+    CREATE SCHEMA IF NOT EXISTS sp_alter;
+    DROP TABLE IF EXISTS sp_alter.t;
+    DROP TABLE IF EXISTS public.t;
+    CREATE TABLE public.t (a int, b int);
+    CREATE TABLE sp_alter.t (c int);
+    SET search_path TO sp_alter;
+    ALTER TABLE t ADD COLUMN IF NOT EXISTS a int;
+    ALTER TABLE t DROP COLUMN IF EXISTS b;
+    ALTER TABLE t DROP COLUMN IF EXISTS c;
+    INSERT INTO t VALUES (1);
+    SELECT a FROM sp_alter.t;
+}
+expect {
+    1
+}
+
+test alter-table-if-exists-finds-a-table-in-a-quoted-uppercase-schema {
+    CREATE SCHEMA IF NOT EXISTS "SP_Upper_Alter";
+    DROP TABLE IF EXISTS "SP_Upper_Alter".u;
+    DROP TABLE IF EXISTS "SP_Upper_Alter".t;
+    CREATE TABLE "SP_Upper_Alter".t (a int);
+    ALTER TABLE IF EXISTS "SP_Upper_Alter".t ADD COLUMN b int;
+    ALTER TABLE "SP_Upper_Alter".t ADD COLUMN IF NOT EXISTS a int;
+    ALTER TABLE "SP_Upper_Alter".t DROP COLUMN IF EXISTS zz;
+    ALTER TABLE IF EXISTS "SP_Upper_Alter".t RENAME TO u;
+    INSERT INTO "SP_Upper_Alter".u VALUES (1, 2);
+    SELECT a, b FROM "SP_Upper_Alter".u;
+}
+expect {
+    1|2
+}

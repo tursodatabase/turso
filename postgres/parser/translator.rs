@@ -6161,6 +6161,104 @@ pub fn try_extract_drop_schema(parse_result: &ParseResult) -> Option<PgDropSchem
     })
 }
 
+/// The checks that the IF [NOT] EXISTS clauses of an ALTER TABLE statement
+/// ask for. PostgreSQL skips the statement when one of them fails.
+#[derive(Debug, Clone)]
+pub struct PgAlterTableIfExists {
+    pub schema_name: Option<String>,
+    pub table_name: String,
+    /// ALTER TABLE IF EXISTS: skip when the table does not exist.
+    pub table_if_exists: bool,
+    pub column: Option<PgAlterColumnIfExists>,
+}
+
+#[derive(Debug, Clone)]
+pub enum PgAlterColumnIfExists {
+    /// ADD COLUMN IF NOT EXISTS: skip when the column exists.
+    AddIfNotExists(String),
+    /// DROP COLUMN IF EXISTS: skip when the column does not exist.
+    DropIfExists(String),
+}
+
+/// Remove the IF [NOT] EXISTS clauses from an ALTER TABLE statement and
+/// return the checks they ask for, so that the caller can run them against
+/// the catalog before translating the statement. None when the statement
+/// has no such clause, or has one that is not removed here, which the
+/// translator then rejects.
+pub fn take_alter_table_if_exists(parse_result: &mut ParseResult) -> Option<PgAlterTableIfExists> {
+    use pg_query::protobuf::node::Node;
+    use pg_query::protobuf::{AlterTableType, ObjectType};
+
+    let node = parse_result
+        .protobuf
+        .stmts
+        .first_mut()?
+        .stmt
+        .as_mut()?
+        .node
+        .as_mut()?;
+    let (relation, table_if_exists, column) = match node {
+        Node::AlterTableStmt(alter) => {
+            if alter.objtype != ObjectType::ObjectTable as i32 || alter.cmds.len() != 1 {
+                return None;
+            }
+            let Some(Node::AlterTableCmd(cmd)) = &mut alter.cmds[0].node else {
+                return None;
+            };
+            let column = if cmd.missing_ok {
+                Some(match AlterTableType::try_from(cmd.subtype).ok()? {
+                    AlterTableType::AtAddColumn => {
+                        let Some(Node::ColumnDef(col_def)) =
+                            cmd.def.as_ref().and_then(|def| def.node.as_ref())
+                        else {
+                            return None;
+                        };
+                        PgAlterColumnIfExists::AddIfNotExists(col_def.colname.clone())
+                    }
+                    AlterTableType::AtDropColumn => {
+                        PgAlterColumnIfExists::DropIfExists(cmd.name.clone())
+                    }
+                    _ => return None,
+                })
+            } else {
+                None
+            };
+            cmd.missing_ok = false;
+            (
+                alter.relation.as_ref()?,
+                std::mem::take(&mut alter.missing_ok),
+                column,
+            )
+        }
+        Node::RenameStmt(rename) => {
+            let is_table_rename = match ObjectType::try_from(rename.rename_type).ok()? {
+                ObjectType::ObjectTable => true,
+                ObjectType::ObjectColumn => rename.relation_type == ObjectType::ObjectTable as i32,
+                _ => false,
+            };
+            if !is_table_rename {
+                return None;
+            }
+            (
+                rename.relation.as_ref()?,
+                std::mem::take(&mut rename.missing_ok),
+                None,
+            )
+        }
+        _ => return None,
+    };
+    if (!table_if_exists && column.is_none()) || !relation.catalogname.is_empty() {
+        return None;
+    }
+    Some(PgAlterTableIfExists {
+        schema_name: (!relation.schemaname.is_empty())
+            .then(|| map_schema_name(&relation.schemaname).to_string()),
+        table_name: relation.relname.clone(),
+        table_if_exists,
+        column,
+    })
+}
+
 /// Returns true if the parse result is a REFRESH MATERIALIZED VIEW statement.
 /// Turso materialized views are live (auto-updating), so REFRESH is a no-op.
 pub fn is_refresh_matview(parse_result: &ParseResult) -> Result<bool, ParseError> {

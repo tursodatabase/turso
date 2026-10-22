@@ -196,7 +196,7 @@ impl SimpleQueryHandler for TursoPgHandler {
             if stmt.num_columns() == 0 || is_pg_non_query(sql) {
                 responses.push(execute_non_query(&mut stmt, sql)?);
             } else {
-                let header = Arc::new(build_field_info(&stmt, &Format::UnifiedText));
+                let header = Arc::new(build_field_info(&stmt, sql, &Format::UnifiedText));
                 responses.push(execute_query(&mut stmt, header)?);
             }
         }
@@ -240,7 +240,7 @@ impl ExtendedQueryHandler for TursoPgHandler {
             return execute_non_query(&mut stmt, query);
         }
 
-        let header = Arc::new(build_field_info(&stmt, &portal.result_column_format));
+        let header = Arc::new(build_field_info(&stmt, query, &portal.result_column_format));
         execute_query(&mut stmt, header)
     }
 
@@ -263,7 +263,7 @@ impl ExtendedQueryHandler for TursoPgHandler {
             .map(|t| t.clone().unwrap_or(Type::TEXT))
             .collect();
 
-        let fields = build_field_info(&stmt, &Format::UnifiedText);
+        let fields = build_field_info(&stmt, &target.statement, &Format::UnifiedText);
         Ok(DescribeStatementResponse::new(param_types, fields))
     }
 
@@ -280,14 +280,21 @@ impl ExtendedQueryHandler for TursoPgHandler {
             .prepare(&portal.statement.statement)
             .map_err(|e| PgWireError::UserError(Box::new(error_info(&e.to_string()))))?;
 
-        let fields = build_field_info(&stmt, &portal.result_column_format);
+        let fields = build_field_info(
+            &stmt,
+            &portal.statement.statement,
+            &portal.result_column_format,
+        );
         Ok(DescribePortalResponse::new(fields))
     }
 }
 
 /// Build FieldInfo metadata from a prepared statement's column information.
-fn build_field_info(stmt: &turso_core::Statement, format: &Format) -> Vec<FieldInfo> {
-    if is_pg_non_query(stmt.get_sql()) {
+/// `sql` is the statement the client sent: for statements the frontend
+/// answers with a dummy SELECT, the prepared statement's own SQL is that
+/// SELECT.
+fn build_field_info(stmt: &turso_core::Statement, sql: &str, format: &Format) -> Vec<FieldInfo> {
+    if is_pg_non_query(sql) {
         return vec![];
     }
     (0..stmt.num_columns())
@@ -647,6 +654,7 @@ fn is_pg_non_query(sql: &str) -> bool {
         || upper.starts_with("DROP SCHEMA")
         || upper.starts_with("REFRESH MATERIALIZED VIEW")
         || upper.starts_with("COMMENT")
+        || upper.starts_with("ALTER")
 }
 
 fn command_tag(query: &str, affected_rows: usize) -> Tag {
@@ -788,7 +796,7 @@ mod tests {
         ] {
             for format in [Format::UnifiedText, Format::UnifiedBinary] {
                 let mut stmt = conn.prepare(sql).unwrap();
-                let fields = Arc::new(build_field_info(&stmt, &format));
+                let fields = Arc::new(build_field_info(&stmt, sql, &format));
                 assert_eq!(*fields[0].datatype(), Type::TEXT, "{sql}");
                 let rows = stmt.run_collect_rows().unwrap();
                 assert_eq!(rows.len(), 1);
@@ -799,8 +807,9 @@ mod tests {
                 assert_eq!(&row.data[..], b"\0\0\0\x01t");
             }
         }
-        let stmt = conn.prepare("SELECT 7 AS pg_is_in_recovery").unwrap();
-        let fields = build_field_info(&stmt, &Format::UnifiedText);
+        let sql = "SELECT 7 AS pg_is_in_recovery";
+        let stmt = conn.prepare(sql).unwrap();
+        let fields = build_field_info(&stmt, sql, &Format::UnifiedText);
         assert_eq!(*fields[0].datatype(), Type::INT4);
     }
 
@@ -825,7 +834,7 @@ mod tests {
             "SELECT coalesce(x, 2) FROM t",
         ] {
             let stmt = conn.prepare(sql).unwrap();
-            let fields = build_field_info(&stmt, &Format::UnifiedText);
+            let fields = build_field_info(&stmt, sql, &Format::UnifiedText);
             assert_eq!(*fields[0].datatype(), Type::INT4, "{sql}");
         }
     }
@@ -869,14 +878,40 @@ mod tests {
         .unwrap();
         let conn = turso_pg::PgConnection::connect(&db).unwrap();
         conn.execute("CREATE TABLE items (v INTEGER)").unwrap();
-        let stmt = conn
-            .prepare("LOCK TABLE items IN ACCESS SHARE MODE")
-            .unwrap();
+        let sql = "LOCK TABLE items IN ACCESS SHARE MODE";
+        let stmt = conn.prepare(sql).unwrap();
         for format in [Format::UnifiedText, Format::UnifiedBinary] {
-            assert!(build_field_info(&stmt, &format).is_empty());
+            assert!(build_field_info(&stmt, sql, &format).is_empty());
         }
-        let query = conn.prepare("SELECT 'LOCK TABLE items'").unwrap();
-        assert_eq!(build_field_info(&query, &Format::UnifiedText).len(), 1);
+        let sql = "SELECT 'LOCK TABLE items'";
+        let query = conn.prepare(sql).unwrap();
+        assert_eq!(build_field_info(&query, sql, &Format::UnifiedText).len(), 1);
+    }
+
+    #[test]
+    fn test_skipped_alter_table_is_a_command_without_result_fields() {
+        let (_io, db) = turso_pg::open_database(
+            ":memory:",
+            None,
+            turso_pg::OpenFlags::default(),
+            turso_pg::DatabaseOpts::new(),
+        )
+        .unwrap();
+        let conn = turso_pg::PgConnection::connect(&db).unwrap();
+        conn.execute("CREATE TABLE items (v INTEGER)").unwrap();
+        for sql in [
+            "ALTER TABLE IF EXISTS missing ADD COLUMN a int",
+            "ALTER TABLE items ADD COLUMN IF NOT EXISTS v int",
+            "ALTER TABLE items DROP COLUMN IF EXISTS a",
+            "ALTER TABLE IF EXISTS missing RENAME TO other",
+        ] {
+            let stmt = conn.prepare(sql).unwrap();
+            assert!(is_pg_non_query(sql), "{sql}");
+            for format in [Format::UnifiedText, Format::UnifiedBinary] {
+                assert!(build_field_info(&stmt, sql, &format).is_empty(), "{sql}");
+            }
+            assert_eq!(command_tag(sql, 0), Tag::new("ALTER TABLE"), "{sql}");
+        }
     }
 
     #[test]

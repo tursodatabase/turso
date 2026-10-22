@@ -10,9 +10,10 @@ use crate::functions::ConfigParameter;
 use turso_core::{Connection, LimboError, Result, Statement, Value};
 use turso_parser::ast::{self};
 use turso_pg_parser::translator::{
-    check_set_transaction, is_comment_on, is_refresh_matview, try_extract_copy_from,
-    try_extract_create_schema, try_extract_drop_schema, try_extract_set, try_extract_show,
-    unnamed_index_name, unqualified_create_table_name_location, PgCopyFromStmt, PgCreateSchemaStmt,
+    check_set_transaction, is_comment_on, is_refresh_matview, take_alter_table_if_exists,
+    try_extract_copy_from, try_extract_create_schema, try_extract_drop_schema, try_extract_set,
+    try_extract_show, unnamed_index_name, unqualified_create_table_name_location,
+    PgAlterColumnIfExists, PgAlterTableIfExists, PgCopyFromStmt, PgCreateSchemaStmt,
     PgDropSchemaStmt, PgSetStmt, PgSetValue, PgShowStmt, PostgreSQLTranslator,
 };
 
@@ -181,8 +182,13 @@ fn prepare_statement(pg_conn: &Arc<PgConnectionInner>, sql: &str) -> Result<Stat
         return Ok(stmt);
     }
 
-    let parse_result =
+    let mut parse_result =
         turso_pg_parser::parse(sql).map_err(|e| LimboError::ParseError(e.to_string()))?;
+    if let Some(alter) = take_alter_table_if_exists(&mut parse_result) {
+        if alter_table_is_skipped(&pg_conn.conn, &alter)? {
+            return noop_statement(&pg_conn.conn);
+        }
+    }
     let rewritten_sql = if let Some((location, schema)) =
         create_table_schema_from_search_path(pg_conn, &parse_result)?
     {
@@ -218,6 +224,31 @@ fn prepare_statement(pg_conn: &Arc<PgConnectionInner>, sql: &str) -> Result<Stat
     pg_conn.conn.prepare_translated_cmd(translated.cmd, &sql)
 }
 
+/// Whether PostgreSQL skips an ALTER TABLE statement because of its IF
+/// [NOT] EXISTS clauses: the table or the column to drop does not exist, or
+/// the column to add already does.
+fn alter_table_is_skipped(conn: &Arc<Connection>, alter: &PgAlterTableIfExists) -> Result<bool> {
+    let Some((database, kind)) =
+        find_relation(conn, alter.schema_name.as_deref(), &alter.table_name)?
+    else {
+        return Ok(alter.table_if_exists);
+    };
+    if kind != "table" {
+        return Ok(false);
+    }
+    let columns = get_table_columns(conn, &alter.table_name, Some(&database))?;
+    let has_column = |name: &str| {
+        columns
+            .iter()
+            .any(|column| column.eq_ignore_ascii_case(name))
+    };
+    Ok(match &alter.column {
+        Some(PgAlterColumnIfExists::AddIfNotExists(name)) => has_column(name),
+        Some(PgAlterColumnIfExists::DropIfExists(name)) => !has_column(name),
+        None => false,
+    })
+}
+
 /// The schema that a CREATE TABLE statement naming its table without a
 /// schema creates the table in, with the byte offset of the table name: the
 /// first schema of `search_path` that exists, like PostgreSQL. None when the
@@ -241,37 +272,17 @@ fn create_table_schema_from_search_path(
 
 /// Whether the schema of table `table` already has a table, index, view or
 /// sequence named `name`, which makes PostgreSQL choose another name for a
-/// new index on the table. A table named with a schema is in that schema.
-/// Otherwise the table is looked up in the same order as core does: temp
-/// first, then the databases of the search path. Main when no database has
-/// the table.
+/// new index on the table. Main when no database has the table.
 fn relation_name_is_taken(
     conn: &Arc<Connection>,
     schema: Option<&str>,
     table: &str,
     name: &str,
 ) -> Result<bool> {
-    let database_names: HashMap<usize, String> = conn
-        .list_all_databases()
-        .into_iter()
-        .map(|(id, database, _)| (id, database))
-        .collect();
-    let databases: Vec<String> = match schema {
-        Some(schema) if schema.eq_ignore_ascii_case("public") => vec!["main".to_string()],
-        Some(schema) => database_names
-            .values()
-            .filter(|database| database.eq_ignore_ascii_case(schema))
-            .cloned()
-            .collect(),
-        None => database_names
-            .contains_key(&turso_core::TEMP_DB_ID)
-            .then_some(turso_core::TEMP_DB_ID)
-            .into_iter()
-            .chain(conn.search_order())
-            .chain(std::iter::once(turso_core::MAIN_DB_ID))
-            .map(|id| database_names[&id].clone())
-            .collect(),
-    };
+    let mut databases = lookup_databases(conn, schema);
+    if schema.is_none() {
+        databases.push("main".to_string());
+    }
     let mut taken = false;
     for database in databases {
         let mut stmt = conn.prepare_sqlite(format!(
@@ -297,6 +308,59 @@ fn relation_name_is_taken(
         }
     }
     Ok(taken)
+}
+
+/// The database and the kind (table, index, view or sequence) of the
+/// relation named `name`, found where PostgreSQL looks it up. None when no
+/// such relation exists.
+fn find_relation(
+    conn: &Arc<Connection>,
+    schema: Option<&str>,
+    name: &str,
+) -> Result<Option<(String, String)>> {
+    for database in lookup_databases(conn, schema) {
+        let mut stmt = conn.prepare_sqlite(format!(
+            "SELECT type FROM \"{database}\".sqlite_schema \
+             WHERE type IN ('table', 'index', 'view') AND name COLLATE NOCASE = ?1 \
+             UNION ALL \
+             SELECT 'sequence' FROM \"{database}\".sqlite_schema \
+             WHERE type = 'table' AND name COLLATE NOCASE = '{SEQUENCE_TABLE_PREFIX}' || ?1"
+        ))?;
+        stmt.bind_at(
+            NonZero::new(1).unwrap(),
+            Value::build_text(name.to_string()),
+        )?;
+        if let Some(row) = stmt.run_collect_rows()?.first() {
+            return Ok(Some((database, row[0].to_string())));
+        }
+    }
+    Ok(None)
+}
+
+/// The databases that a relation is looked up in, in the same order as
+/// core does. A relation named with a schema is in that schema. Otherwise
+/// temp comes first, then the databases of the search path.
+fn lookup_databases(conn: &Arc<Connection>, schema: Option<&str>) -> Vec<String> {
+    let database_names: HashMap<usize, String> = conn
+        .list_all_databases()
+        .into_iter()
+        .map(|(id, database, _)| (id, database))
+        .collect();
+    match schema {
+        Some(schema) if schema.eq_ignore_ascii_case("public") => vec!["main".to_string()],
+        Some(schema) => database_names
+            .values()
+            .filter(|database| database.eq_ignore_ascii_case(schema))
+            .cloned()
+            .collect(),
+        None => database_names
+            .contains_key(&turso_core::TEMP_DB_ID)
+            .then_some(turso_core::TEMP_DB_ID)
+            .into_iter()
+            .chain(conn.search_order())
+            .map(|id| database_names[&id].clone())
+            .collect(),
+    }
 }
 
 /// The first schema of `search_path` that exists, which is what PostgreSQL's
@@ -833,8 +897,12 @@ fn get_table_columns(
     table_name: &str,
     schema_name: Option<&str>,
 ) -> Result<Vec<String>> {
+    let table_name = table_name.replace('\'', "''");
     let sql = match schema_name {
-        Some(schema) => format!("PRAGMA \"{schema}\".table_info('{table_name}')"),
+        Some(schema) => format!(
+            "PRAGMA \"{}\".table_info('{table_name}')",
+            schema.replace('"', "\"\"")
+        ),
         None => format!("PRAGMA table_info('{table_name}')"),
     };
     let mut stmt = conn.prepare_internal(&sql)?;

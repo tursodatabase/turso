@@ -315,3 +315,87 @@ test table-returning-table-name-star-after-alias-rejected {
     INSERT INTO users AS u VALUES (4, 'dave', 40, false) RETURNING users.*;
 }
 expect error {}
+
+test table-alter-table-if-exists-skips-a-missing-table {
+    ALTER TABLE IF EXISTS missing ADD COLUMN a int;
+    ALTER TABLE IF EXISTS missing DROP COLUMN IF EXISTS a;
+    ALTER TABLE IF EXISTS missing RENAME COLUMN a TO b;
+    ALTER TABLE IF EXISTS missing RENAME TO other;
+    ALTER TABLE IF EXISTS no_such_schema.missing ADD COLUMN a int;
+    SELECT count(*) FROM pg_class WHERE relname IN ('missing', 'other');
+}
+expect {
+    0
+}
+
+test table-alter-table-if-exists-alters-an-existing-table {
+    CREATE TABLE t (x int);
+    ALTER TABLE IF EXISTS t ADD COLUMN a int;
+    ALTER TABLE IF EXISTS t RENAME COLUMN a TO b;
+    ALTER TABLE IF EXISTS public.t RENAME TO u;
+    INSERT INTO u VALUES (1, 2);
+    SELECT x, b FROM u;
+}
+expect {
+    1|2
+}
+
+test table-add-column-if-not-exists-skips-an-existing-column {
+    CREATE TABLE t (x int, a text);
+    ALTER TABLE t ADD COLUMN IF NOT EXISTS a int;
+    ALTER TABLE t ADD COLUMN IF NOT EXISTS A int;
+    ALTER TABLE t ADD COLUMN IF NOT EXISTS b int;
+    INSERT INTO t VALUES (1, 'one', 2);
+    SELECT * FROM t;
+}
+expect {
+    1|one|2
+}
+
+test table-drop-column-if-exists-skips-a-missing-column {
+    CREATE TABLE t (x int, a int);
+    ALTER TABLE t DROP COLUMN IF EXISTS b;
+    ALTER TABLE t DROP COLUMN IF EXISTS a;
+    ALTER TABLE t DROP COLUMN IF EXISTS a;
+    INSERT INTO t VALUES (1);
+    SELECT * FROM t;
+}
+expect {
+    1
+}
+
+test table-add-column-if-not-exists-to-a-quoted-table-name {
+    CREATE TABLE "it's" (x int);
+    ALTER TABLE IF EXISTS "it's" ADD COLUMN IF NOT EXISTS a int;
+    INSERT INTO "it's" VALUES (1, 2);
+    SELECT * FROM "it's";
+}
+expect {
+    1|2
+}
+
+test table-add-column-if-not-exists-to-a-missing-table-rejected {
+    ALTER TABLE missing ADD COLUMN IF NOT EXISTS a int;
+}
+expect error {}
+
+test table-alter-table-if-exists-on-an-index-is-not-skipped {
+    CREATE TABLE t (a int);
+    CREATE INDEX i ON t (a);
+    ALTER TABLE IF EXISTS i ADD COLUMN b int;
+}
+expect error {}
+
+test table-add-column-if-not-exists-on-a-view-is-not-skipped {
+    CREATE TABLE t (a int);
+    CREATE VIEW v AS SELECT a FROM t;
+    ALTER TABLE v ADD COLUMN IF NOT EXISTS a int;
+}
+expect error {}
+
+test table-drop-column-if-exists-on-an-index-is-not-skipped {
+    CREATE TABLE t (a int);
+    CREATE INDEX i ON t (a);
+    ALTER TABLE i DROP COLUMN IF EXISTS zz;
+}
+expect error {}
