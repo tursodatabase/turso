@@ -4708,6 +4708,28 @@ impl PostgreSQLTranslator {
         })))
     }
 
+    /// `USING <` is ascending and `USING >` descending, optionally written as
+    /// `OPERATOR(pg_catalog.<)`. Other operators depend on a user-defined
+    /// btree ordering that cannot be expressed as ASC/DESC.
+    fn sort_order_for_using(
+        use_op: &[pg_query::protobuf::Node],
+    ) -> Result<ast::SortOrder, ParseError> {
+        let names: Vec<&str> = use_op
+            .iter()
+            .filter_map(|n| match &n.node {
+                Some(pg_query::protobuf::node::Node::String(s)) => Some(s.sval.as_str()),
+                _ => None,
+            })
+            .collect();
+        match names.as_slice() {
+            ["<"] | ["pg_catalog", "<"] => Ok(ast::SortOrder::Asc),
+            [">"] | ["pg_catalog", ">"] => Ok(ast::SortOrder::Desc),
+            _ => Err(not_supported(
+                "ORDER BY ... USING operator other than < or >",
+            )),
+        }
+    }
+
     fn translate_order_by(
         &self,
         sort_clause: &[pg_query::protobuf::Node],
@@ -4728,7 +4750,7 @@ impl PostgreSQLTranslator {
                         Ok(pg_query::protobuf::SortByDir::SortbyAsc) => Some(ast::SortOrder::Asc),
                         Ok(pg_query::protobuf::SortByDir::SortbyDesc) => Some(ast::SortOrder::Desc),
                         Ok(pg_query::protobuf::SortByDir::SortbyUsing) => {
-                            return Err(not_supported("ORDER BY ... USING operator"))
+                            Some(Self::sort_order_for_using(&sort_by.use_op)?)
                         }
                         _ => None, // Default or undefined
                     };
@@ -10212,10 +10234,16 @@ mod tests {
     }
 
     #[test]
-    fn fail_closed_order_by_using() {
-        assert_not_supported("SELECT a FROM t ORDER BY a USING >", "USING operator");
+    fn order_by_using() {
+        assert_translates("SELECT a FROM t ORDER BY a USING >");
+        assert_translates("SELECT a FROM t ORDER BY a USING < NULLS FIRST");
+        assert_translates("SELECT a FROM t ORDER BY a USING OPERATOR(pg_catalog.<)");
+        assert_translates("SELECT string_agg(a, ',' ORDER BY a USING >) FROM t");
+        assert_translates("SELECT row_number() OVER (ORDER BY a USING >) FROM t");
+        assert_not_supported("SELECT a FROM t ORDER BY a USING <=", "USING operator");
+        assert_not_supported("SELECT a FROM t ORDER BY a USING ~<~", "USING operator");
         assert_not_supported(
-            "SELECT string_agg(a, ',' ORDER BY a USING <) FROM t",
+            "SELECT a FROM t ORDER BY a USING OPERATOR(myschema.<)",
             "USING operator",
         );
     }

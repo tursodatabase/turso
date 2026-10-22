@@ -848,3 +848,55 @@ expect {
     6
     7
 }
+
+# ORDER BY ... USING < / > is ASC / DESC with the matching default NULLS placement.
+
+test order-by-using-01 {
+    SELECT coalesce(a::text,'n') FROM (SELECT column1 AS a FROM (VALUES (3),(NULL),(1),(2)) AS v) AS s ORDER BY a USING >;
+}
+expect {
+    n
+    3
+    2
+    1
+}
+
+test order-by-using-02 {
+    SELECT coalesce(a::text,'n') FROM (SELECT column1 AS a FROM (VALUES (3),(NULL),(1),(2)) AS v) AS s ORDER BY a USING <;
+}
+expect {
+    1
+    2
+    3
+    n
+}
+
+test order-by-using-03 {
+    SELECT coalesce(a::text,'n'), row_number() OVER (ORDER BY a USING >) FROM (SELECT column1 AS a FROM (VALUES (3),(NULL),(1),(2)) AS v) AS s ORDER BY 2;
+}
+expect {
+    n|1
+    3|2
+    2|3
+    1|4
+}
+
+test order-by-using-04 {
+    SELECT coalesce(a::text,'n') FROM (SELECT column1 AS a FROM (VALUES (3),(NULL),(1),(2)) AS v) AS s ORDER BY a USING > NULLS LAST;
+}
+expect {
+    3
+    2
+    1
+    n
+}
+
+test order-by-using-05 {
+    SELECT coalesce(a::text,'n') FROM (SELECT column1 AS a FROM (VALUES (3),(NULL),(1),(2)) AS v) AS s ORDER BY a USING OPERATOR(pg_catalog.<) NULLS FIRST;
+}
+expect {
+    n
+    1
+    2
+    3
+}
