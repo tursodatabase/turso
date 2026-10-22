@@ -29,15 +29,13 @@ const USER_TABLE_OID_START: i64 = 16384;
 const USER_FUNCTION_OID_START: i64 = 24576;
 /// Fixed PostgreSQL OID of the public schema.
 const PUBLIC_NAMESPACE_OID: i64 = 2200;
-/// The pg_language rows: (oid, name, is procedural language). The OIDs of
-/// internal, c and sql are fixed in PostgreSQL. plpgsql gets its OID when it
-/// is installed, so its OID is one of a PostgreSQL 16 installation.
-const FUNCTION_LANGUAGES: &[(i64, &str, bool)] = &[
-    (12, "internal", false),
-    (13, "c", false),
-    (14, "sql", false),
-    (13575, "plpgsql", true),
-];
+/// The pg_language rows: (oid, name). The OIDs of internal, c and sql are
+/// fixed in PostgreSQL. plpgsql gets its OID when it is installed, so its
+/// OID is one of a PostgreSQL 16 installation. No row is a procedural
+/// language (lanispl), so pg_dump does not dump a CREATE LANGUAGE for
+/// plpgsql, which PostgreSQL installs by default.
+const FUNCTION_LANGUAGES: &[(i64, &str)] =
+    &[(12, "internal"), (13, "c"), (14, "sql"), (13575, "plpgsql")];
 const PRIMARY_KEY_AUTOMATIC_INDEX_NAME_PREFIX: &str = "sqlite_autoindex_";
 
 #[derive(Debug)]
@@ -911,8 +909,8 @@ fn user_function_row(oid: i64, function: &PgFunction) -> Vec<Value> {
 fn language_oid(language: &str) -> i64 {
     FUNCTION_LANGUAGES
         .iter()
-        .find(|(_, name, _)| *name == language)
-        .map_or(0, |(oid, _, _)| *oid)
+        .find(|(_, name)| *name == language)
+        .map_or(0, |(oid, _)| *oid)
 }
 
 /// The pg_type OID of a type name as PostgreSQL spells it, or zero when the
@@ -2539,13 +2537,13 @@ impl SnapshotRows for PgLanguageTable {
     fn load_rows(_conn: &Connection) -> Vec<Vec<Value>> {
         FUNCTION_LANGUAGES
             .iter()
-            .map(|(oid, name, is_procedural)| {
+            .map(|(oid, name)| {
                 vec![
                     Value::from_i64(*oid),
                     Value::build_text(*name),
                     Value::from_i64(10),
-                    Value::from_i64(*is_procedural as i64),
-                    Value::from_i64(*is_procedural as i64),
+                    Value::from_i64(0),
+                    Value::from_i64(0),
                     Value::from_i64(0),
                     Value::from_i64(0),
                     Value::from_i64(0),
