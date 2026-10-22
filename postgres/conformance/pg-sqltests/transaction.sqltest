@@ -64,6 +64,85 @@ expect error {
 }
 
 @setup counter
+test txn-set-transaction-read-only-rejects-writes {
+    BEGIN;
+    SET TRANSACTION READ ONLY;
+    UPDATE counter SET n = 1;
+}
+expect error {}
+
+@setup counter
+test txn-begin-read-only-rejects-writes {
+    BEGIN READ ONLY;
+    SELECT n FROM counter;
+    INSERT INTO counter VALUES (1);
+}
+expect error {}
+
+@setup counter
+test txn-start-transaction-read-only-rejects-ddl {
+    START TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY;
+    CREATE TABLE t2 (a int);
+}
+expect error {}
+
+test txn-read-only-rejects-nextval {
+    CREATE SEQUENCE s;
+    BEGIN READ ONLY;
+    SELECT nextval('s');
+}
+expect error {}
+
+@setup counter
+test txn-read-write-after-query-rejected {
+    BEGIN READ ONLY;
+    SELECT n FROM counter;
+    SET TRANSACTION READ WRITE;
+}
+expect error {}
+
+@setup counter
+test txn-begin-read-only-then-read-write {
+    BEGIN READ ONLY;
+    SET TRANSACTION READ WRITE;
+    UPDATE counter SET n = 7;
+    COMMIT;
+    SELECT n FROM counter;
+}
+expect {
+    7
+}
+
+@setup counter
+test txn-read-only-ends-with-transaction {
+    BEGIN READ ONLY;
+    SELECT n FROM counter;
+    COMMIT;
+    UPDATE counter SET n = 5;
+    BEGIN;
+    SET TRANSACTION READ ONLY;
+    ROLLBACK;
+    BEGIN;
+    UPDATE counter SET n = n + 1;
+    COMMIT;
+    SELECT n FROM counter;
+}
+expect {
+    0
+    6
+}
+
+@setup counter
+test txn-set-transaction-read-only-outside-block-has-no-effect {
+    SET TRANSACTION READ ONLY;
+    UPDATE counter SET n = 3;
+    SELECT n FROM counter;
+}
+expect {
+    3
+}
+
+@setup counter
 test txn-set-transaction-read-write-keeps-earlier-changes {
     BEGIN;
     UPDATE counter SET n = 29;
