@@ -997,16 +997,10 @@ impl PostgreSQLTranslator {
             reject_constraint_attributes(constraint, table_schema)?;
             let contype = ConstrType::try_from(constraint.contype).unwrap_or(ConstrType::Undefined);
             let constraint_ast = match contype {
-                ConstrType::ConstrPrimary => Some(ast::ColumnConstraint::PrimaryKey {
-                    order: None,
-                    conflict_clause: None,
-                    auto_increment: false,
-                }),
                 ConstrType::ConstrNotnull => Some(ast::ColumnConstraint::NotNull {
                     nullable: false,
                     conflict_clause: None,
                 }),
-                ConstrType::ConstrUnique => Some(ast::ColumnConstraint::Unique(None)),
                 ConstrType::ConstrDefault => {
                     let raw_expr = constraint.raw_expr.as_ref().ok_or_else(|| {
                         ParseError::ParseError("DEFAULT missing expression".into())
@@ -6796,6 +6790,7 @@ fn constr_type_name(contype: pg_query::protobuf::ConstrType) -> String {
         ConstrType::ConstrExclusion => "EXCLUDE".into(),
         ConstrType::ConstrCheck => "CHECK".into(),
         ConstrType::ConstrForeign => "REFERENCES".into(),
+        ConstrType::ConstrPrimary => "PRIMARY KEY".into(),
         other => {
             let debug = format!("{other:?}");
             debug
@@ -9738,7 +9733,7 @@ mod tests {
             "CREATE TABLE c (pid int REFERENCES p(id) DEFERRABLE)",
             "CREATE TABLE c (pid int, FOREIGN KEY (pid) REFERENCES p(id) DEFERRABLE INITIALLY DEFERRED)",
             "CREATE TABLE c (id int, UNIQUE (id) DEFERRABLE)",
-            "ALTER TABLE c ADD COLUMN pid int UNIQUE DEFERRABLE",
+            "CREATE TABLE c (pid int UNIQUE DEFERRABLE)",
         ] {
             assert_not_supported(sql, "DEFERRABLE");
         }
@@ -9872,6 +9867,8 @@ mod tests {
             "ALTER TABLE t ADD COLUMN a int GENERATED ALWAYS AS IDENTITY",
             "AS IDENTITY",
         );
+        assert_not_supported("ALTER TABLE t ADD COLUMN v int UNIQUE", "UNIQUE");
+        assert_not_supported("ALTER TABLE t ADD COLUMN v text PRIMARY KEY", "PRIMARY KEY");
         assert_translates("ALTER TABLE t ADD COLUMN a int NOT NULL DEFAULT 0");
     }
 
