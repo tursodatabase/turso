@@ -1754,6 +1754,11 @@ impl PostgreSQLTranslator {
             None
         };
 
+        // PostgreSQL's * also covers the FROM tables; the engine's covers only
+        // the target.
+        if !update.from_clause.is_empty() && update.returning_list.iter().any(is_bare_star) {
+            return Err(not_supported("RETURNING * on UPDATE ... FROM"));
+        }
         let returning = self.translate_returning(&update.returning_list, relation)?;
         let with = self.translate_with_clause(&update.with_clause)?;
 
@@ -5310,6 +5315,21 @@ fn cast_or_case_name(node: &pg_query::protobuf::Node) -> Option<String> {
 
 /// Whether `node` is a `qualifier.*` RETURNING target whose qualifier, read
 /// from the table name outwards, is a non-empty prefix of `target_qualifiers`.
+/// Whether a target-list entry is an unqualified `*`.
+fn is_bare_star(node: &pg_query::protobuf::Node) -> bool {
+    use pg_query::protobuf::node::Node;
+    let Some(Node::ResTarget(res_target)) = &node.node else {
+        return false;
+    };
+    match res_target.val.as_ref().and_then(|v| v.node.as_ref()) {
+        Some(Node::AStar(_)) => true,
+        Some(Node::ColumnRef(col_ref)) => {
+            matches!(col_ref.fields.as_slice(), [f] if matches!(f.node, Some(Node::AStar(_))))
+        }
+        _ => false,
+    }
+}
+
 fn is_star_qualified_by(node: &pg_query::protobuf::Node, target_qualifiers: &[&str]) -> bool {
     use pg_query::protobuf::node::Node;
     let Some(Node::ResTarget(res_target)) = &node.node else {
@@ -10113,6 +10133,16 @@ mod tests {
     fn fail_closed_update_set_indirection() {
         assert_not_supported("UPDATE t SET a[1] = 5", "array element");
         assert_not_supported("UPDATE t SET c.f = 5", "array element");
+    }
+
+    #[test]
+    fn fail_closed_update_from_returning_star() {
+        assert_not_supported(
+            "UPDATE t SET a = u.a FROM u WHERE t.id = u.id RETURNING *",
+            "RETURNING * on UPDATE ... FROM",
+        );
+        assert_translates("UPDATE t SET a = u.a FROM u WHERE t.id = u.id RETURNING t.*, a");
+        assert_translates("UPDATE t SET a = 1 RETURNING *");
     }
 
     #[test]
