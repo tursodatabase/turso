@@ -1529,6 +1529,7 @@ impl PostgreSQLTranslator {
                 )),
             })
             .collect::<Result<_, _>>()?;
+        reject_duplicate_columns(columns.iter().map(|c| c.as_str()), "INSERT")?;
         let has_explicit_columns = !columns.is_empty();
 
         // Translate body (VALUES or SELECT)
@@ -1725,6 +1726,12 @@ impl PostgreSQLTranslator {
                 }
             }
         }
+
+        reject_duplicate_columns(
+            sets.iter()
+                .flat_map(|s| s.col_names.iter().map(|n| n.as_str())),
+            "UPDATE",
+        )?;
 
         // Translate WHERE clause
         let where_clause = if let Some(where_node) = &update.where_clause {
@@ -4577,6 +4584,11 @@ impl PostgreSQLTranslator {
                     }
                 }
 
+                reject_duplicate_columns(
+                    sets.iter()
+                        .flat_map(|s| s.col_names.iter().map(|n| n.as_str())),
+                    "ON CONFLICT DO UPDATE",
+                )?;
                 let where_clause = if let Some(wc) = &clause.where_clause {
                     Some(Box::new(self.translate_expr(wc)?))
                 } else {
@@ -5205,6 +5217,22 @@ fn cast_or_case_name(node: &pg_query::protobuf::Node) -> Option<String> {
 
 /// Whether `node` is a `qualifier.*` RETURNING target whose qualifier, read
 /// from the table name outwards, is a non-empty prefix of `target_qualifiers`.
+/// Rejects a column named twice in an INSERT column list or a SET list.
+fn reject_duplicate_columns<'a>(
+    names: impl IntoIterator<Item = &'a str>,
+    what: &str,
+) -> Result<(), ParseError> {
+    let mut seen = std::collections::HashSet::new();
+    for name in names {
+        if !seen.insert(name.to_lowercase()) {
+            return Err(ParseError::ParseError(format!(
+                "column \"{name}\" specified more than once in {what}"
+            )));
+        }
+    }
+    Ok(())
+}
+
 /// Whether a target-list entry is an unqualified `*`.
 fn is_bare_star(node: &pg_query::protobuf::Node) -> bool {
     use pg_query::protobuf::node::Node;
@@ -9820,6 +9848,23 @@ mod tests {
         );
         assert_translates("UPDATE t SET a = u.a FROM u WHERE t.id = u.id RETURNING t.*, a");
         assert_translates("UPDATE t SET a = 1 RETURNING *");
+    }
+
+    #[test]
+    fn fail_closed_duplicate_target_columns() {
+        for sql in [
+            "INSERT INTO p (id, id) VALUES (7, 8)",
+            "INSERT INTO p (id, ID) VALUES (7, 8)",
+            "UPDATE p SET v = 1, v = 2",
+            "INSERT INTO p VALUES (1) ON CONFLICT (id) DO UPDATE SET v = 1, v = 2",
+        ] {
+            let parsed = crate::parse(sql).unwrap();
+            let err = PostgreSQLTranslator::new()
+                .translate(&parsed)
+                .expect_err(sql)
+                .to_string();
+            assert!(err.contains("specified more than once"), "{sql}: {err}");
+        }
     }
 
     #[test]
