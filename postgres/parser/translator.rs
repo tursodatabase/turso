@@ -2132,6 +2132,7 @@ impl PostgreSQLTranslator {
         &self,
         range_var: &pg_query::protobuf::RangeVar,
     ) -> Result<ast::SelectTable, ParseError> {
+        reject_column_aliases(&range_var.alias, "a table")?;
         let qualified_name = self.qualified_name_from_range_var(range_var);
         let alias = match &range_var.alias {
             Some(a) => Some(a.aliasname.clone()),
@@ -2243,6 +2244,7 @@ impl PostgreSQLTranslator {
         // column comes back as bytea.
         if args.is_empty() && matches!(func_name, "current_schema" | "current_database" | "version")
         {
+            reject_column_aliases(&range_func.alias, "a function")?;
             let column_name = match &alias {
                 Some(ast::As::As(name) | ast::As::Elided(name)) => name.clone(),
                 _ => ast::Name::from_string(func_name),
@@ -2356,6 +2358,7 @@ impl PostgreSQLTranslator {
                 }
             }
         }
+        reject_column_aliases(&range_func.alias, "a function")?;
         Ok(ast::SelectTable::TableCall(qualified_name, args, alias))
     }
 
@@ -6599,6 +6602,18 @@ fn translate_distinct_clause(
     Ok(Some(ast::Distinctness::Distinct))
 }
 
+/// Rejects a column alias list (`AS x(a, b)`) on a FROM item whose
+/// translation cannot rename the item's columns.
+fn reject_column_aliases(
+    alias: &Option<pg_query::protobuf::Alias>,
+    what: &str,
+) -> Result<(), ParseError> {
+    if alias.as_ref().is_some_and(|a| !a.colnames.is_empty()) {
+        return Err(not_supported(format!("a column alias list on {what}")));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -9840,5 +9855,25 @@ mod tests {
             "USING (...) AS alias",
         );
         assert_translates("SELECT * FROM a JOIN b USING (id)");
+    }
+
+    #[test]
+    fn fail_closed_from_column_aliases() {
+        assert_not_supported(
+            "SELECT x.a FROM t AS x(a, b)",
+            "column alias list on a table",
+        );
+        assert_not_supported(
+            "SELECT * FROM json_each('[]') AS j(k, v)",
+            "column alias list on a function",
+        );
+        assert_not_supported(
+            "SELECT * FROM current_schema() AS s(x)",
+            "column alias list on a function",
+        );
+        assert_translates("SELECT u.x FROM unnest(ARRAY[1, 2]) AS u(x)");
+        assert_translates("SELECT x.a FROM t AS x");
+        assert_translates("SELECT s.p FROM (SELECT 1, 2) AS s(p, q)");
+        assert_translates("SELECT g.n FROM generate_series(1, 3) AS g(n)");
     }
 }
