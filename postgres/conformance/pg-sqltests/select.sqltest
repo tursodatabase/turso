@@ -841,3 +841,13 @@ test similar-to-anchors-alternation-and-treats-dot-caret-dollar-literally {
 expect {
     0|1|0|1|1|1|1|1|1|1|1|0|1
 }
+
+test with-clause-on-set-operation-and-values {
+    WITH c AS (SELECT 1 AS x) SELECT x FROM c UNION SELECT 2 ORDER BY 1;
+    WITH c AS (SELECT 3 AS x) VALUES ((SELECT x FROM c));
+}
+expect {
+    1
+    2
+    3
+}
