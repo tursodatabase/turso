@@ -2877,6 +2877,9 @@ impl PostgreSQLTranslator {
                 if !pg_type_name.typmods.is_empty() {
                     return Err(not_supported("a type modifier in a cast"));
                 }
+                if extract_type_name_from_typename(pg_type_name)?.eq_ignore_ascii_case("int8") {
+                    check_int8_literal_range(arg)?;
+                }
                 let type_name = pg_type_name_to_ast_type(pg_type_name)?;
                 Ok(ast::Expr::Cast {
                     expr,
@@ -3834,6 +3837,9 @@ impl PostgreSQLTranslator {
                     return Err(not_supported(format!(
                         "DISTINCT, ORDER BY, FILTER or OVER on {func_name}()"
                     )));
+                }
+                if func_name.eq_ignore_ascii_case("int8") {
+                    check_int8_literal_range(&func_call.args[0])?;
                 }
                 return Ok(ast::Expr::Cast {
                     expr: args.into_iter().next().unwrap(),
@@ -5557,6 +5563,83 @@ fn json_type_or_raise(
             .collect(),
         else_expr: Some(raise(error)),
     }
+}
+
+fn check_int8_literal_range(node: &pg_query::protobuf::Node) -> Result<(), ParseError> {
+    use pg_query::protobuf::{a_const::Val, node::Node, AConst};
+    if let Some(Node::AConst(AConst {
+        val: Some(Val::Fval(f)),
+        ..
+    })) = &node.node
+    {
+        if numeric_literal_exceeds_int8(&f.fval) {
+            return Err(ParseError::ParseError("bigint out of range".into()));
+        }
+    }
+    Ok(())
+}
+
+/// Rounds half away from zero before the range check, like PostgreSQL's
+/// numeric to int8 cast.
+fn numeric_literal_exceeds_int8(literal: &str) -> bool {
+    let literal = literal.replace('_', "");
+    let (negative, unsigned) = match literal.strip_prefix('-') {
+        Some(rest) => (true, rest),
+        None => (false, literal.as_str()),
+    };
+    let limit = if negative {
+        i64::MIN.unsigned_abs() as u128
+    } else {
+        i64::MAX as u128
+    };
+    let radix = match unsigned.get(..2) {
+        Some("0x" | "0X") => Some(16),
+        Some("0o" | "0O") => Some(8),
+        Some("0b" | "0B") => Some(2),
+        _ => None,
+    };
+    if let Some(radix) = radix {
+        return u128::from_str_radix(&unsigned[2..], radix).map_or(true, |m| m > limit);
+    }
+    let (mantissa, exponent) = match unsigned.split_once(['e', 'E']) {
+        Some((mantissa, exponent)) => match exponent.parse::<i64>() {
+            Ok(exponent) => (mantissa, exponent),
+            Err(_) => return false,
+        },
+        None => (unsigned, 0),
+    };
+    let (int_part, frac_part) = mantissa.split_once('.').unwrap_or((mantissa, ""));
+    if !int_part
+        .bytes()
+        .chain(frac_part.bytes())
+        .all(|b| b.is_ascii_digit())
+    {
+        return false;
+    }
+    let all_digits = format!("{int_part}{frac_part}");
+    let digits = all_digits.trim_start_matches('0').as_bytes();
+    if digits.is_empty() {
+        return false;
+    }
+    let int_len = (digits.len() as i64)
+        .saturating_sub(frac_part.len() as i64)
+        .saturating_add(exponent);
+    if int_len > 19 {
+        return true;
+    }
+    if int_len < 0 {
+        return false;
+    }
+    let int_len = int_len as usize;
+    let mut magnitude: u128 = 0;
+    for i in 0..int_len {
+        let digit = digits.get(i).map_or(0, |d| d - b'0');
+        magnitude = magnitude * 10 + digit as u128;
+    }
+    if digits.get(int_len).is_some_and(|&d| d >= b'5') {
+        magnitude += 1;
+    }
+    magnitude > limit
 }
 
 /// Convert a pg_query TypeName to a Turso AST Type for use in CAST expressions.
