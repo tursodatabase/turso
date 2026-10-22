@@ -6138,6 +6138,10 @@ fn reject_constraint_attributes(
     {
         return Err(not_supported("DEFERRABLE / INITIALLY DEFERRED constraints"));
     }
+    // An empty match type is the default, and "s" is an explicit MATCH SIMPLE.
+    if !matches!(constraint.fk_matchtype.as_str(), "" | "s") {
+        return Err(not_supported("MATCH FULL / MATCH PARTIAL foreign keys"));
+    }
     if constraint.is_no_inherit {
         return Err(not_supported("NO INHERIT constraints"));
     }
@@ -8852,5 +8856,18 @@ mod tests {
             "CREATE TABLE c (a int, CHECK (a > 0) NO INHERIT)",
             "NO INHERIT",
         );
+    }
+
+    #[test]
+    fn fail_closed_fk_match_type() {
+        assert_not_supported(
+            "CREATE TABLE c (a int, b int, FOREIGN KEY (a, b) REFERENCES p(x, y) MATCH FULL)",
+            "MATCH FULL",
+        );
+        assert_not_supported(
+            "CREATE TABLE c (a int REFERENCES p(x) MATCH FULL)",
+            "MATCH FULL",
+        );
+        assert_translates("CREATE TABLE c (a int REFERENCES p(x) MATCH SIMPLE)");
     }
 }
