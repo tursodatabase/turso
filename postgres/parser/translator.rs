@@ -1071,6 +1071,9 @@ impl PostgreSQLTranslator {
         if !idx.index_including_params.is_empty() {
             return Err(not_supported("CREATE INDEX ... INCLUDE"));
         }
+        if idx.nulls_not_distinct {
+            return Err(not_supported("NULLS NOT DISTINCT"));
+        }
         let idx_name = ast::QualifiedName::single(ast::Name::from_string(&idx.idxname));
 
         self.translating_index.set(true);
@@ -9060,5 +9063,13 @@ mod tests {
     #[test]
     fn fail_closed_index_include() {
         assert_not_supported("CREATE INDEX i ON t (a) INCLUDE (b)", "INCLUDE");
+    }
+
+    #[test]
+    fn fail_closed_index_nulls_not_distinct() {
+        assert_not_supported(
+            "CREATE UNIQUE INDEX i ON t (a) NULLS NOT DISTINCT",
+            "NULLS NOT DISTINCT",
+        );
     }
 }
