@@ -485,7 +485,20 @@ fn set_value_already_in_effect(name: &str, values: &[PgSetValue]) -> bool {
         "default_tablespace" => value.is_empty(),
         "default_table_access_method" => value == "heap",
         // These only label the session or filter notices.
-        "application_name" | "client_min_messages" => true,
+        "application_name" => true,
+        "client_min_messages" => matches!(
+            value.as_str(),
+            "debug5"
+                | "debug4"
+                | "debug3"
+                | "debug2"
+                | "debug1"
+                | "debug"
+                | "log"
+                | "notice"
+                | "warning"
+                | "error"
+        ),
         _ => false,
     }
 }
