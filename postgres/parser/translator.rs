@@ -4863,20 +4863,7 @@ impl PostgreSQLTranslator {
         use pg_query::protobuf::node::Node;
         use pg_query::protobuf::ConstrType;
 
-        // Extract domain name (skip schema qualifiers like "pg_catalog")
-        let mut domain_name = String::new();
-        for name_node in &domain.domainname {
-            if let Some(Node::String(s)) = &name_node.node {
-                if s.sval != "pg_catalog" {
-                    domain_name.clone_from(&s.sval);
-                }
-            }
-        }
-        if domain_name.is_empty() {
-            return Err(ParseError::ParseError(
-                "CREATE DOMAIN missing domain name".into(),
-            ));
-        }
+        let domain_name = created_type_name(&domain.domainname)?;
 
         // Extract base type from type_name and map PG type names to Turso names
         let type_name_node = domain
@@ -5333,20 +5320,7 @@ fn translate_create_enum(
 ) -> Result<ast::Stmt, ParseError> {
     use pg_query::protobuf::node::Node;
 
-    // Extract type name (skip "pg_catalog" or schema qualifiers)
-    let mut type_name = String::new();
-    for name_node in &enum_stmt.type_name {
-        if let Some(Node::String(s)) = &name_node.node {
-            if s.sval != "pg_catalog" {
-                type_name.clone_from(&s.sval);
-            }
-        }
-    }
-    if type_name.is_empty() {
-        return Err(ParseError::ParseError(
-            "CREATE TYPE AS ENUM missing type name".into(),
-        ));
-    }
+    let type_name = created_type_name(&enum_stmt.type_name)?;
 
     // Extract enum labels
     let mut labels = Vec::new();
@@ -6475,6 +6449,18 @@ fn is_binary_collation(collname: &[pg_query::protobuf::Node]) -> bool {
         name.to_ascii_lowercase().as_str(),
         "c" | "posix" | "default" | "ucs_basic"
     )
+}
+
+/// The name of a type being created. Types live in a single namespace, so
+/// only an unqualified, `public.` or `pg_catalog.` name is accepted; any
+/// other schema would be dropped.
+fn created_type_name(names: &[pg_query::protobuf::Node]) -> Result<String, ParseError> {
+    match extract_key_columns(names)?.as_slice() {
+        [name] => Ok(name.clone()),
+        [schema, name] if map_schema_name(schema) == "main" => Ok(name.clone()),
+        [] => Err(ParseError::ParseError("missing type name".into())),
+        _ => Err(not_supported("schema-qualified type names")),
+    }
 }
 
 #[cfg(test)]
@@ -9939,5 +9925,13 @@ mod tests {
         };
         assert_eq!(min_value, Some(i16::MIN as i64));
         assert_eq!(max_value, None);
+    }
+
+    #[test]
+    fn fail_closed_schema_qualified_created_types() {
+        assert_not_supported("CREATE DOMAIN s.d AS int", "schema-qualified type");
+        assert_not_supported("CREATE TYPE s.mood AS ENUM ('a')", "schema-qualified type");
+        assert_translates("CREATE DOMAIN public.d AS int");
+        assert_translates("CREATE TYPE public.mood AS ENUM ('a')");
     }
 }
