@@ -1080,6 +1080,7 @@ impl PostgreSQLTranslator {
         if idx.nulls_not_distinct {
             return Err(not_supported("NULLS NOT DISTINCT"));
         }
+        reject_table_storage_clauses(&idx.options, &idx.table_space, "")?;
         // SQLite names the database on the index, not on the table, and
         // looks the table up there.
         let idx_name = if relation.schemaname.is_empty() {
@@ -9402,5 +9403,14 @@ mod tests {
             "CREATE UNIQUE INDEX i ON t (a) NULLS NOT DISTINCT",
             "NULLS NOT DISTINCT",
         );
+    }
+
+    #[test]
+    fn fail_closed_index_storage_clauses() {
+        assert_not_supported(
+            "CREATE INDEX i ON t (a) WITH (fillfactor = 70)",
+            "storage parameters",
+        );
+        assert_not_supported("CREATE INDEX i ON t (a) TABLESPACE ts", "TABLESPACE");
     }
 }
