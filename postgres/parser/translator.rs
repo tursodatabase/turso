@@ -375,10 +375,23 @@ impl PostgreSQLTranslator {
                                 });
                             }
                         }
-                        _ => {}
+                        other => {
+                            return Err(not_supported(format!(
+                                "table constraint {}",
+                                constr_type_name(other)
+                            )))
+                        }
                     }
                 }
-                _ => {}
+                Node::TableLikeClause(_) => {
+                    return Err(not_supported("CREATE TABLE ... (LIKE ...)"))
+                }
+                other => {
+                    return Err(not_supported(format!(
+                        "CREATE TABLE element {}",
+                        node_ref_name(&other.to_ref())
+                    )))
+                }
             }
         }
 
@@ -8689,5 +8702,15 @@ mod tests {
             "AS IDENTITY",
         );
         assert_translates("ALTER TABLE t ADD COLUMN a int NOT NULL DEFAULT 0");
+    }
+
+    #[test]
+    fn fail_closed_create_table_elements() {
+        assert_not_supported(
+            "CREATE TABLE t (a int, EXCLUDE USING gist (a WITH =))",
+            "EXCLUDE",
+        );
+        assert_not_supported("CREATE TABLE t (LIKE other)", "LIKE");
+        assert_not_supported("CREATE TABLE t (a int, LIKE other INCLUDING ALL)", "LIKE");
     }
 }
