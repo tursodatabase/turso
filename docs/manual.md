@@ -904,9 +904,12 @@ uses `bindings/javascript/Cargo.toml`, which enables `turso_core/fts`. This desc
 the repository's build configuration; it does not establish whether a particular published npm version
 contains FTS. Check the release version you use.
 
-When the module is absent, preparing `CREATE INDEX ... USING fts` fails at module lookup
-with an unknown-module-name error. A WebAssembly build has the same limitation even
-when the `fts` Cargo feature is requested.
+FTS indexes are also an experimental index method, so the connection must enable index
+methods (`--experimental-index-method` in the `tursodb` CLI). Without it, `CREATE INDEX
+... USING fts` fails with `index method is an experimental feature`. With index methods
+enabled but the module absent, it fails at module lookup with an unknown-module-name
+error. A WebAssembly build has the same limitation even when the `fts` Cargo feature is
+requested.
 
 ### Creating an FTS Index
 

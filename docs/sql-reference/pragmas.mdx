@@ -225,14 +225,15 @@ order.
 
 ```sql
 PRAGMA module_list;
+-- completion
 -- generate_series
 ```
 
-A freshly opened database reports only the built-in `generate_series` module, which is
-compiled in through the default `series` feature. Extensions that register their own
-modules through the C API `sqlite3_create_module()` show up here as well. The pragma
-takes no arguments: a write form such as `PRAGMA module_list = 1;` is accepted and does
-nothing.
+A freshly opened database reports the built-in `generate_series` module, which is
+compiled in through the default `series` feature. The `tursodb` shell also registers a
+`completion` module for tab completion, so it shows up when you run the pragma there.
+Virtual table modules registered by loaded extensions show up here as well. The pragma takes no arguments: a write form such as
+`PRAGMA module_list = 1;` is accepted and does nothing.
 
 ### pragma_list
 
@@ -282,6 +283,8 @@ Auto-vacuum is experimental: setting a mode other than `none` fails with
 `Autovacuum is not enabled. Use --experimental-autovacuum flag to enable it.`
 unless the database was opened with the `--experimental-autovacuum` flag. Writing
 `none` is always allowed, and unrecognized names or numbers are treated as `none`.
+The `incremental` mode can be set but is not supported yet: the next write fails with
+`Incremental auto-vacuum is not supported`.
 
 Like SQLite, the mode is fixed once page 1 of the database file exists: setting the
 pragma after the database has been initialized is silently ignored. Opening a database
@@ -360,21 +363,23 @@ PRAGMA query_only = 0;    -- disable read-only mode
 
 ### full_column_names / short_column_names
 
-Legacy SQLite naming pragmas, kept for compatibility. Each is a per-connection boolean,
-off by default; the read form returns `0` or `1`. A write enables the flag for `ON`,
-`TRUE`, `YES`, `1` (case-insensitively) or any nonzero number, and disables it for
-anything else.
+Legacy SQLite naming pragmas, kept for compatibility. Each is a per-connection boolean.
+As in SQLite, `full_column_names` is off by default and `short_column_names` is on by
+default. The read form returns `0` or `1`. A write enables the flag for `ON`, `TRUE`,
+`YES` (case-insensitively) or any positive number, and disables it for anything else.
 
 ```sql
-PRAGMA full_column_names;     -- 0
+PRAGMA full_column_names;      -- 0
+PRAGMA short_column_names;     -- 1
 PRAGMA full_column_names = 1;
-PRAGMA short_column_names = 1;
+PRAGMA short_column_names = 0;
 ```
 
 They only affect the names reported for result columns, never the data:
 
 - With `full_column_names` on, a column reference is named `TABLE.COLUMN` instead of the
-  default expression-text name, and `SELECT *` expands to those prefixed names.
+  default expression-text name. `SELECT *` expands to those prefixed names only when
+  `short_column_names` is also off.
 - With `short_column_names` on (and `full_column_names` off), a column reference is
   named with just its column name.
 - An explicit `AS` alias always wins over both.
@@ -504,7 +509,7 @@ SQLite's default value `NORMAL` is rejected:
 
 ```sql
 PRAGMA locking_mode = normal;
--- Error: locking_mode must be EXCLUSIVE
+-- Parse error: locking_mode must be EXCLUSIVE
 ```
 
 Writing the pragma does not change how Turso locks the database file. It only checks the
