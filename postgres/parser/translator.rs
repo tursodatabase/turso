@@ -1074,6 +1074,9 @@ impl PostgreSQLTranslator {
                 idx.access_method
             )));
         }
+        if !idx.index_including_params.is_empty() {
+            return Err(not_supported("CREATE INDEX ... INCLUDE"));
+        }
         // SQLite names the database on the index, not on the table, and
         // looks the table up there.
         let idx_name = if relation.schemaname.is_empty() {
@@ -9383,5 +9386,10 @@ mod tests {
         assert_not_supported("CREATE INDEX i ON t USING gin (a)", "USING gin");
         assert_not_supported("CREATE INDEX i ON t USING hash (a)", "USING hash");
         assert_translates("CREATE INDEX i ON t USING btree (a)");
+    }
+
+    #[test]
+    fn fail_closed_index_include() {
+        assert_not_supported("CREATE INDEX i ON t (a) INCLUDE (b)", "INCLUDE");
     }
 }

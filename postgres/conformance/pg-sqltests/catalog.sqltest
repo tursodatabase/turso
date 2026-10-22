@@ -53,7 +53,6 @@ test pg-indexes-lists-names-chosen-for-unnamed-indexes {
     CREATE INDEX ON t (a, b);
     CREATE UNIQUE INDEX ON t (a, b);
     CREATE INDEX ON t (a, a);
-    CREATE INDEX ON t (a) INCLUDE (b);
     CREATE INDEX ON t ((a + b));
     CREATE INDEX ON t (lower(c));
     CREATE INDEX ON t ((c::text));
@@ -81,7 +80,6 @@ expect {
     t|t_a_a1_idx
     t|t_a_b_idx
     t|t_a_b_idx1
-    t|t_a_b_idx2
     t|t_a_idx
     t|t_a_idx1
     t|t_a_idx2
