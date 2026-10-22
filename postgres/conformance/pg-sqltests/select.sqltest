@@ -851,3 +851,32 @@ expect {
     2
     3
 }
+
+test insert-with-and-values-with-clause {
+    CREATE TABLE ins_with2 (a int);
+    WITH d AS (SELECT 6 AS y) INSERT INTO ins_with2 WITH c AS (SELECT 7 AS x) VALUES ((SELECT y FROM d)), ((SELECT x FROM c));
+    SELECT a FROM ins_with2 ORDER BY a;
+}
+expect {
+    6
+    7
+}
+
+test insert-values-with-clause-not-visible-in-returning {
+    CREATE TABLE ins_u (x int);
+    INSERT INTO ins_u VALUES (3);
+    CREATE TABLE ins_with3 (a int);
+    INSERT INTO ins_with3 WITH ins_u AS (SELECT 7 AS x) VALUES ((SELECT x FROM ins_u)) RETURNING (SELECT x FROM ins_u);
+}
+expect {
+    3
+}
+
+test insert-values-with-clause {
+    CREATE TABLE ins_with (a int);
+    INSERT INTO ins_with WITH c AS (SELECT 5 AS x) VALUES ((SELECT x FROM c));
+    SELECT a FROM ins_with;
+}
+expect {
+    5
+}

@@ -1345,7 +1345,7 @@ impl PostgreSQLTranslator {
                 (ast::InsertBody::DefaultValues, filtered_columns)
             } else {
                 let select = ast::Select {
-                    with: None,
+                    with: self.translate_with_clause(&select_stmt.with_clause)?,
                     body: ast::SelectBody {
                         select: ast::OneSelect::Values(rows),
                         compounds: vec![],
