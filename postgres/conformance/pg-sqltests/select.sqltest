@@ -293,6 +293,13 @@ expect error {
     bigint out of range
 }
 
+test select-cast-int8-out-of-range-literal-in-branch-that-never-runs {
+    SELECT coalesce(CASE WHEN false THEN 9223372036854775808::int8 END, 7);
+}
+expect {
+    7
+}
+
 test select-case-expression {
     SELECT CASE WHEN 1 < 2 THEN 'lt' ELSE 'ge' END;
 }

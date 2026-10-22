@@ -2877,8 +2877,10 @@ impl PostgreSQLTranslator {
                 if !pg_type_name.typmods.is_empty() {
                     return Err(not_supported("a type modifier in a cast"));
                 }
-                if extract_type_name_from_typename(pg_type_name)?.eq_ignore_ascii_case("int8") {
-                    check_int8_literal_range(arg)?;
+                if extract_type_name_from_typename(pg_type_name)?.eq_ignore_ascii_case("int8")
+                    && literal_exceeds_int8(arg)
+                {
+                    return Ok(raise_bigint_out_of_range());
                 }
                 let type_name = pg_type_name_to_ast_type(pg_type_name)?;
                 Ok(ast::Expr::Cast {
@@ -3838,8 +3840,10 @@ impl PostgreSQLTranslator {
                         "DISTINCT, ORDER BY, FILTER or OVER on {func_name}()"
                     )));
                 }
-                if func_name.eq_ignore_ascii_case("int8") {
-                    check_int8_literal_range(&func_call.args[0])?;
+                if func_name.eq_ignore_ascii_case("int8")
+                    && literal_exceeds_int8(&func_call.args[0])
+                {
+                    return Ok(raise_bigint_out_of_range());
                 }
                 return Ok(ast::Expr::Cast {
                     expr: args.into_iter().next().unwrap(),
@@ -5565,18 +5569,24 @@ fn json_type_or_raise(
     }
 }
 
-fn check_int8_literal_range(node: &pg_query::protobuf::Node) -> Result<(), ParseError> {
+fn literal_exceeds_int8(node: &pg_query::protobuf::Node) -> bool {
     use pg_query::protobuf::{a_const::Val, node::Node, AConst};
-    if let Some(Node::AConst(AConst {
-        val: Some(Val::Fval(f)),
-        ..
-    })) = &node.node
-    {
-        if numeric_literal_exceeds_int8(&f.fval) {
-            return Err(ParseError::ParseError("bigint out of range".into()));
-        }
+    match &node.node {
+        Some(Node::AConst(AConst {
+            val: Some(Val::Fval(f)),
+            ..
+        })) => numeric_literal_exceeds_int8(&f.fval),
+        _ => false,
     }
-    Ok(())
+}
+
+fn raise_bigint_out_of_range() -> ast::Expr {
+    ast::Expr::Raise(
+        ast::ResolveType::Abort,
+        Some(Box::new(ast::Expr::Literal(ast::Literal::String(
+            "'bigint out of range'".into(),
+        )))),
+    )
 }
 
 /// Rounds half away from zero before the range check, like PostgreSQL's
