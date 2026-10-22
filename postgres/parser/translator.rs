@@ -1709,6 +1709,10 @@ impl PostgreSQLTranslator {
             .ok_or_else(|| ParseError::ParseError("DELETE missing target table".into()))?;
         let tbl_name = self.qualified_name_from_range_var(relation);
 
+        if !delete.using_clause.is_empty() {
+            return Err(not_supported("DELETE ... USING"));
+        }
+
         // Translate WHERE clause
         let where_clause = if let Some(where_node) = &delete.where_clause {
             Some(Box::new(self.translate_expr(where_node)?))
@@ -9280,5 +9284,13 @@ mod tests {
     fn fail_closed_update_set_indirection() {
         assert_not_supported("UPDATE t SET a[1] = 5", "array element");
         assert_not_supported("UPDATE t SET c.f = 5", "array element");
+    }
+
+    #[test]
+    fn fail_closed_delete_using() {
+        assert_not_supported(
+            "DELETE FROM t USING u WHERE t.id = u.id",
+            "DELETE ... USING",
+        );
     }
 }
