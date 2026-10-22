@@ -288,6 +288,15 @@ impl PostgreSQLTranslator {
             &create.tablespacename,
             &create.access_method,
         )?;
+        // ON COMMIT is only valid on temporary tables, which are rejected
+        // above, but check it directly rather than rely on that.
+        if matches!(
+            pg_query::protobuf::OnCommitAction::try_from(create.oncommit),
+            Ok(pg_query::protobuf::OnCommitAction::OncommitDeleteRows
+                | pg_query::protobuf::OnCommitAction::OncommitDrop)
+        ) {
+            return Err(not_supported("ON COMMIT DELETE ROWS / DROP"));
+        }
 
         if create.table_elts.is_empty() {
             return Err(ParseError::ParseError(
@@ -8792,5 +8801,10 @@ mod tests {
         assert_not_supported("CREATE TABLE t (a int) TABLESPACE ts", "TABLESPACE");
         assert_not_supported("CREATE TABLE t (a int) USING columnar", "access method");
         assert_translates("CREATE TABLE t (a int) USING heap");
+    }
+
+    #[test]
+    fn fail_closed_on_commit() {
+        assert_not_supported("CREATE TEMP TABLE t (a int) ON COMMIT DROP", "TEMPORARY");
     }
 }
