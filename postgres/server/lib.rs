@@ -645,6 +645,7 @@ fn is_pg_non_query(sql: &str) -> bool {
         || upper.starts_with("LOCK")
         || upper.starts_with("CREATE SCHEMA")
         || upper.starts_with("DROP SCHEMA")
+        || upper.starts_with("DROP FUNCTION")
         || upper.starts_with("REFRESH MATERIALIZED VIEW")
         || upper.starts_with("COMMENT")
 }
@@ -663,6 +664,10 @@ fn command_tag(query: &str, affected_rows: usize) -> Tag {
         Tag::new("CREATE INDEX")
     } else if upper.starts_with("CREATE SCHEMA") {
         Tag::new("CREATE SCHEMA")
+    } else if upper.starts_with("CREATE FUNCTION")
+        || upper.starts_with("CREATE OR REPLACE FUNCTION")
+    {
+        Tag::new("CREATE FUNCTION")
     } else if is_create_table_as(&upper) {
         // PostgreSQL reports CREATE TABLE AS completion as `SELECT n` (the
         // rows inserted), except WITH NO DATA which skips the insert and
@@ -680,6 +685,8 @@ fn command_tag(query: &str, affected_rows: usize) -> Tag {
         Tag::new("DROP INDEX")
     } else if upper.starts_with("DROP SCHEMA") {
         Tag::new("DROP SCHEMA")
+    } else if upper.starts_with("DROP FUNCTION") {
+        Tag::new("DROP FUNCTION")
     } else if upper.starts_with("DROP") {
         Tag::new("DROP TABLE")
     } else if upper.starts_with("ALTER") {
@@ -856,6 +863,35 @@ mod tests {
             command_tag("LOCK TABLE items IN ACCESS SHARE MODE", 0),
             Tag::new("LOCK TABLE")
         );
+    }
+
+    #[test]
+    fn test_function_command_tags() {
+        assert_eq!(
+            command_tag(
+                "CREATE FUNCTION f() RETURNS int LANGUAGE sql AS 'SELECT 1'",
+                0
+            ),
+            Tag::new("CREATE FUNCTION")
+        );
+        assert_eq!(
+            command_tag(
+                "create or replace function f() returns int language sql as 'select 1'",
+                0
+            ),
+            Tag::new("CREATE FUNCTION")
+        );
+        assert_eq!(
+            command_tag("DROP FUNCTION IF EXISTS f", 0),
+            Tag::new("DROP FUNCTION")
+        );
+    }
+
+    #[test]
+    fn test_drop_function_is_non_query() {
+        assert!(is_pg_non_query("DROP FUNCTION IF EXISTS f"));
+        assert!(is_pg_non_query("  drop function f(integer)"));
+        assert!(!is_pg_non_query("SELECT 'DROP FUNCTION f'"));
     }
 
     #[test]
