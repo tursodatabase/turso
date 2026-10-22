@@ -2690,6 +2690,11 @@ pub fn op_column_has_field(
                 }
             }
         }
+        CursorType::ViewDelta { .. } => match state.get_cursor(*cursor_id) {
+            Cursor::NullRow => true,
+            Cursor::Delta(delta) => delta.has_field(*column),
+            _ => unreachable!("ViewDelta cursor must hold a Delta cursor"),
+        },
         // Non-btree cursors always "have" all fields
         _ => true,
     };
@@ -12749,7 +12754,7 @@ pub struct OpInsertState {
     /// re-acquiring the schema read lock and re-walking the dependent-view
     /// list on every sub-state transition.
     pub(crate) route: Option<ChangeLogRoute>,
-    pub old_record: Option<(i64, crate::alloc::Vec<Value>)>,
+    pub old_record: Option<(i64, crate::alloc::Vec<Value>, usize)>,
     /// Set by the NoopCheck sub-state to indicate the row already has the exact
     /// same payload, so the physical write can be skipped.
     pub is_noop_update: bool,
@@ -13041,6 +13046,7 @@ pub fn op_insert(
                             let maybe_record = return_if_io!(state, cursor.record());
                             if let Some(record) = maybe_record {
                                 let values = record.get_values_owned()?;
+                                let physical_width = values.len();
                                 let route =
                                     state.active_op_state.insert().route.as_ref().ok_or_else(
                                         || {
@@ -13054,7 +13060,7 @@ pub fn op_insert(
                                 } else {
                                     normalize_table_change_record(&route.table, key, values)?
                                 };
-                                Some((key, values))
+                                Some((key, values, physical_width))
                             } else {
                                 None
                             }
@@ -13225,7 +13231,9 @@ pub fn op_insert(
                     state.active_op_state.insert().old_record = None;
                     break;
                 }
-                let Some((key, values)) = state.active_op_state.insert().old_record.take() else {
+                let Some((key, values, physical_width)) =
+                    state.active_op_state.insert().old_record.take()
+                else {
                     state.active_op_state.insert().sub_state = OpInsertSubState::ApplyInsertion;
                     continue;
                 };
@@ -13253,13 +13261,17 @@ pub fn op_insert(
                         program.connection.get_temp_store(),
                     )?
                 } else {
-                    program.connection.transaction_changes.delete(
-                        &route.table,
-                        &route.dependent_views,
-                        key,
-                        values,
-                        program.connection.get_temp_store(),
-                    )?
+                    program
+                        .connection
+                        .transaction_changes
+                        .delete_with_physical_width(
+                            &route.table,
+                            &route.dependent_views,
+                            key,
+                            values,
+                            physical_width,
+                            program.connection.get_temp_store(),
+                        )?
                 };
                 state.active_op_state.insert().sub_state = if spill_started {
                     OpInsertSubState::WaitForRetractionSpill
@@ -13282,7 +13294,7 @@ pub fn op_insert(
                 })?;
                 assert!(!route.dependent_views.is_empty());
 
-                let (key, values) = {
+                let (key, values, physical_width) = {
                     let key = match &state.registers[*key_reg].get_value() {
                         Value::Numeric(Numeric::Integer(i)) => *i,
                         _ => unreachable!("expected integer key"),
@@ -13302,13 +13314,14 @@ pub fn op_insert(
 
                     // Add insertion of new row to view deltas
                     let new_values = record.get_values_owned()?;
+                    let physical_width = new_values.len();
                     let new_values = if route.is_materialized_view {
                         new_values
                     } else {
                         normalize_table_change_record(&route.table, key, new_values)?
                     };
 
-                    (key, new_values)
+                    (key, new_values, physical_width)
                 };
 
                 let spill_started = if route.is_materialized_view {
@@ -13327,13 +13340,17 @@ pub fn op_insert(
                         program.connection.get_temp_store(),
                     )?
                 } else {
-                    program.connection.transaction_changes.insert(
-                        &route.table,
-                        &route.dependent_views,
-                        key,
-                        values,
-                        program.connection.get_temp_store(),
-                    )?
+                    program
+                        .connection
+                        .transaction_changes
+                        .insert_with_physical_width(
+                            &route.table,
+                            &route.dependent_views,
+                            key,
+                            values,
+                            physical_width,
+                            program.connection.get_temp_store(),
+                        )?
                 };
                 if spill_started {
                     state.active_op_state.insert().sub_state =
@@ -13381,7 +13398,7 @@ pub struct OpDeleteState {
     /// re-acquiring the schema read lock and re-walking the dependent-view
     /// list on every sub-state transition.
     pub(crate) route: Option<ChangeLogRoute>,
-    pub deleted_record: Option<(i64, crate::alloc::Vec<Value>)>,
+    pub deleted_record: Option<(i64, crate::alloc::Vec<Value>, usize)>,
 }
 
 #[derive(Clone, Copy)]
@@ -13442,12 +13459,13 @@ pub fn op_delete(
                     let maybe_record = return_if_io!(state, cursor.record());
                     if let Some(record) = maybe_record {
                         let values = record.get_values_owned()?;
+                        let physical_width = values.len();
                         let values = if route.is_materialized_view {
                             values
                         } else {
                             normalize_table_change_record(&route.table, key, values)?
                         };
-                        Some((key, values))
+                        Some((key, values, physical_width))
                     } else {
                         None
                     }
@@ -13478,7 +13496,8 @@ pub fn op_delete(
                 continue;
             }
             OpDeleteSubState::ApplyViewChange => {
-                let Some((key, values)) = state.active_op_state.delete().deleted_record.take()
+                let Some((key, values, physical_width)) =
+                    state.active_op_state.delete().deleted_record.take()
                 else {
                     // No record existed at the delete position; nothing to publish.
                     break;
@@ -13506,13 +13525,17 @@ pub fn op_delete(
                         program.connection.get_temp_store(),
                     )?
                 } else {
-                    program.connection.transaction_changes.delete(
-                        &route.table,
-                        &route.dependent_views,
-                        key,
-                        values,
-                        program.connection.get_temp_store(),
-                    )?
+                    program
+                        .connection
+                        .transaction_changes
+                        .delete_with_physical_width(
+                            &route.table,
+                            &route.dependent_views,
+                            key,
+                            values,
+                            physical_width,
+                            program.connection.get_temp_store(),
+                        )?
                 };
                 if spill_started {
                     state.active_op_state.delete().sub_state = OpDeleteSubState::WaitForSpill;

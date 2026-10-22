@@ -99,6 +99,7 @@ pub(super) fn seed_ephemeral_stream_cache<'a>(
     remap: &BindingRemap,
     table_references: &TableReferences,
     resolver: &mut Resolver<'a>,
+    decode_custom_type_columns: bool,
 ) -> Result<()> {
     resolver.enable_expr_to_reg_cache();
     for (column, stream_expr) in channel.schema.columns.iter().enumerate() {
@@ -113,7 +114,13 @@ pub(super) fn seed_ephemeral_stream_cache<'a>(
             default: None,
         });
         let bound = remap_bound_expr(expr, remap)?;
-        cache_stream_expr_reg(resolver, bound, value_reg, table_references)?;
+        cache_stream_expr_reg(
+            resolver,
+            bound,
+            value_reg,
+            table_references,
+            decode_custom_type_columns,
+        )?;
     }
     turso_assert!(
         channel.binding_rowid_columns.len() == channel.schema.bindings.len(),
@@ -164,6 +171,7 @@ pub(super) fn cache_stream_expr_reg<'a>(
     expr: ast::Expr,
     value_reg: usize,
     table_references: &TableReferences,
+    decode_custom_type_columns: bool,
 ) -> Result<()> {
     fn carries_collation(expr: &ast::Expr) -> bool {
         match expr {
@@ -176,15 +184,16 @@ pub(super) fn cache_stream_expr_reg<'a>(
         }
     }
 
+    let needs_decode = decode_custom_type_columns && matches!(&expr, ast::Expr::Column { .. });
     if carries_collation(&expr) {
         resolver.cache_scalar_expr_reg(
             std::borrow::Cow::Owned(expr),
             value_reg,
-            false,
+            needs_decode,
             table_references,
         )
     } else {
-        resolver.cache_expr_reg(std::borrow::Cow::Owned(expr), value_reg, false, None);
+        resolver.cache_expr_reg(std::borrow::Cow::Owned(expr), value_reg, needs_decode, None);
         Ok(())
     }
 }

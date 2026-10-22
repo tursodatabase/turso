@@ -2326,7 +2326,9 @@ impl ProgramBuilder {
     ) {
         let (_, cursor_type) = self.cursor_ref.get(cursor_id).expect("cursor_id is valid");
         let physical_column = match cursor_type {
-            CursorType::BTreeTable(btree) => btree.logical_to_physical_column(column),
+            CursorType::BTreeTable(btree) | CursorType::ViewDelta { table: btree, .. } => {
+                btree.logical_to_physical_column(column)
+            }
             _ => column,
         };
         self.emit_insn(Insn::ColumnHasField {
