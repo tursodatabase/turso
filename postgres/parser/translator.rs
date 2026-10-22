@@ -3785,6 +3785,26 @@ impl PostgreSQLTranslator {
         func_call: &pg_query::protobuf::FuncCall,
     ) -> Result<ast::Expr, ParseError> {
         let func_name = function_name(&func_call.funcname)?;
+        // substring(s FROM 'regex') and substring(s SIMILAR p ESCAPE e) pick
+        // PostgreSQL's pattern overloads by their text second argument; the
+        // engine's substring only takes numeric positions.
+        if func_name.eq_ignore_ascii_case("substring")
+            && func_call.args.get(1).is_some_and(|arg| {
+                matches!(
+                    &arg.node,
+                    Some(pg_query::protobuf::node::Node::AConst(
+                        pg_query::protobuf::AConst {
+                            val: Some(pg_query::protobuf::a_const::Val::Sval(_)),
+                            ..
+                        }
+                    ))
+                )
+            })
+        {
+            return Err(not_supported(
+                "substring() with a regular expression or SIMILAR pattern",
+            ));
+        }
         if func_call.func_variadic {
             return Err(not_supported("VARIADIC function arguments"));
         }
@@ -10232,6 +10252,16 @@ mod tests {
         );
         assert_translates("SELECT pg_catalog.lower('A')");
         assert_translates("SELECT * FROM pg_catalog.generate_series(1, 3)");
+    }
+
+    #[test]
+    fn fail_closed_substring_pattern() {
+        assert_not_supported("SELECT substring('foobar' from 'o+')", "regular expression");
+        assert_not_supported(
+            "SELECT substring('foobar' similar '%#\"o_b#\"%' escape '#')",
+            "SIMILAR pattern",
+        );
+        assert_translates("SELECT substring('foobar' from 2 for 3), substring('foobar', 2)");
     }
 
     #[test]
