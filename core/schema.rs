@@ -2742,7 +2742,7 @@ impl Schema {
                                 column_names
                                     .iter()
                                     .map(|column| column.col_name.as_str().to_string())
-                                    .collect(),
+                                    .try_collect()?,
                             );
                             self.add_view(view)?;
                         }
