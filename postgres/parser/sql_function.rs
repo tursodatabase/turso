@@ -1,10 +1,16 @@
 use crate::ParseError;
 use pg_query::protobuf::{
-    self, node::Node, CreateFunctionStmt, DefElem, FunctionParameterMode, ResTarget, ScanToken,
-    SelectStmt, SetOperation, Token, TypeName,
+    self, node::Node, CoercionForm, CreateFunctionStmt, DefElem, FunctionParameterMode,
+    KeywordKind, ResTarget, ScanToken, SelectStmt, SetOperation, Token, TypeName,
 };
 use pg_query::ParseResult;
 use serde_json::Value;
+use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
+
+const EXPRESSION_PREFIX: &str = "SELECT ";
+const MAX_INLINING_DEPTH: usize = 64;
+const MAX_INLINED_SQL_LENGTH: usize = 16 * 1024 * 1024;
 
 const SUPPORTED_TYPES: &[&str] = &[
     "bool",
@@ -27,6 +33,8 @@ const SUPPORTED_TYPES: &[&str] = &[
     "bytea",
 ];
 
+pub type FunctionLookup = Result<Option<Arc<SqlFunction>>, ParseError>;
+
 #[derive(Debug)]
 pub struct CreateFunction {
     pub replace: bool,
@@ -39,7 +47,7 @@ pub struct SqlFunction {
     pub name: String,
     pub parameters: Vec<Parameter>,
     pub return_type: SqlType,
-    body: Vec<BodyPart>,
+    body: Body,
 }
 
 #[derive(Debug, Clone)]
@@ -52,6 +60,12 @@ pub struct Parameter {
 pub struct SqlType {
     name: String,
     array_dimensions: usize,
+}
+
+#[derive(Debug, Clone)]
+struct Body {
+    parts: Vec<BodyPart>,
+    calls_functions: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -233,11 +247,7 @@ fn unsupported_type_error(name: &str) -> ParseError {
     ))
 }
 
-fn body_template(
-    body: &str,
-    function: &str,
-    parameters: &[Parameter],
-) -> Result<Vec<BodyPart>, ParseError> {
+fn body_template(body: &str, function: &str, parameters: &[Parameter]) -> Result<Body, ParseError> {
     let parse_result = crate::parse(body)?;
     let target = single_select_target(&parse_result, function)?;
     let expression = target
@@ -263,7 +273,10 @@ fn body_template(
         cursor = reference.end;
     }
     push_text(&mut parts, &body[cursor..tokens.expression_end(target)]);
-    Ok(parts)
+    Ok(Body {
+        parts,
+        calls_functions: contains_node(&expression, "FuncCall"),
+    })
 }
 
 fn single_select_target<'a>(
@@ -419,8 +432,210 @@ fn push_text(parts: &mut Vec<BodyPart>, text: &str) {
     }
 }
 
+pub fn inline_calls(
+    sql: &str,
+    parse_result: &ParseResult,
+    lookup: &mut dyn FnMut(&str) -> FunctionLookup,
+) -> Result<Option<String>, ParseError> {
+    let Some(statement) = first_statement(parse_result) else {
+        return Ok(None);
+    };
+    let mut inliner = Inliner {
+        lookup,
+        functions: HashMap::new(),
+        calling: Vec::new(),
+    };
+    if !inliner.calls_known_function(sql)? {
+        return Ok(None);
+    }
+    let calls = inliner.resolve_calls(statement, None)?;
+    let Some(call) = calls.first() else {
+        return Ok(None);
+    };
+    if !matches!(
+        statement,
+        Node::SelectStmt(_)
+            | Node::InsertStmt(_)
+            | Node::UpdateStmt(_)
+            | Node::DeleteStmt(_)
+            | Node::ExplainStmt(_)
+    ) {
+        return Err(error(format!(
+            "SQL function \"{}\" can be called only in SELECT, INSERT, UPDATE, DELETE, and EXPLAIN statements",
+            call.function.name
+        )));
+    }
+    inliner.splice(sql, &calls).map(Some)
+}
+
+struct Inliner<'a> {
+    lookup: &'a mut dyn FnMut(&str) -> FunctionLookup,
+    functions: HashMap<String, Option<Arc<SqlFunction>>>,
+    calling: Vec<String>,
+}
+
+struct ResolvedCall {
+    location: usize,
+    function: Arc<SqlFunction>,
+    is_select_item: bool,
+}
+
+impl Inliner<'_> {
+    fn calls_known_function(&mut self, sql: &str) -> Result<bool, ParseError> {
+        for name in Tokens::scan(sql)?.called_names(sql) {
+            if self.function_named(&name)?.is_some() {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    fn resolve_calls(
+        &mut self,
+        statement: &Node,
+        wrapper_location: Option<usize>,
+    ) -> Result<Vec<ResolvedCall>, ParseError> {
+        let statement = serde_json::to_value(statement).expect("parse trees serialize to JSON");
+        let mut sites = CallSites::default();
+        sites.collect(&statement);
+        let mut calls = Vec::new();
+        for site in &sites.calls {
+            let Some(function) = self.function(site)? else {
+                continue;
+            };
+            if let Some(syntax) = site.unsupported_syntax {
+                return Err(error(format!(
+                    "{syntax} is not supported in calls of SQL function \"{}\"",
+                    function.name
+                )));
+            }
+            if sites.from_clause_calls.contains(&site.location) {
+                return Err(error(format!(
+                    "SQL function \"{}\" cannot be called in FROM yet",
+                    function.name
+                )));
+            }
+            calls.push(ResolvedCall {
+                location: site.location,
+                is_select_item: sites.select_items.contains(&site.location)
+                    && Some(site.location) != wrapper_location,
+                function,
+            });
+        }
+        calls.sort_by_key(|call| call.location);
+        Ok(calls)
+    }
+
+    fn function(&mut self, site: &CallSite) -> Result<Option<Arc<SqlFunction>>, ParseError> {
+        let name = match site.names.as_slice() {
+            [name] => name,
+            [schema, name] if schema == "public" => name,
+            _ => return Ok(None),
+        };
+        if !site.is_explicit_call {
+            return Ok(None);
+        }
+        let function = self.function_named(name)?;
+        Ok(function.filter(|function| function.parameters.len() == site.argument_count))
+    }
+
+    fn function_named(&mut self, name: &str) -> FunctionLookup {
+        if let Some(function) = self.functions.get(name) {
+            return Ok(function.clone());
+        }
+        let function = (self.lookup)(name)?;
+        self.functions.insert(name.to_string(), function.clone());
+        Ok(function)
+    }
+
+    fn splice(&mut self, sql: &str, calls: &[ResolvedCall]) -> Result<String, ParseError> {
+        let tokens = Tokens::scan(sql)?;
+        let mut inlined = String::with_capacity(sql.len());
+        let mut cursor = 0;
+        for call in calls {
+            let span = tokens.call_span(call.location);
+            if span.start < cursor {
+                continue;
+            }
+            inlined.push_str(&sql[cursor..span.start]);
+            let arguments = span
+                .arguments
+                .iter()
+                .map(|&(start, end)| &sql[start..end])
+                .collect();
+            inlined.push_str(&self.expand(&call.function, arguments)?);
+            if call.is_select_item {
+                inlined.push_str(" AS ");
+                inlined.push_str(&crate::quote_identifier(&call.function.name));
+            }
+            cursor = span.end;
+        }
+        inlined.push_str(&sql[cursor..]);
+        if inlined.len() > MAX_INLINED_SQL_LENGTH {
+            return Err(error(format!(
+                "inlining SQL functions makes the statement longer than {MAX_INLINED_SQL_LENGTH} bytes"
+            )));
+        }
+        Ok(inlined)
+    }
+
+    fn expand(
+        &mut self,
+        function: &SqlFunction,
+        arguments: Vec<&str>,
+    ) -> Result<String, ParseError> {
+        if self.calling.contains(&function.name) {
+            return Err(error(format!(
+                "cannot inline recursive SQL function \"{}\"",
+                function.name
+            )));
+        }
+        if self.calling.len() == MAX_INLINING_DEPTH {
+            return Err(error(format!(
+                "SQL functions are nested more than {MAX_INLINING_DEPTH} levels deep"
+            )));
+        }
+        let arguments = arguments
+            .into_iter()
+            .map(|argument| self.rewrite_expression(argument))
+            .collect::<Result<Vec<_>, _>>()?;
+        for (index, argument) in arguments.iter().enumerate() {
+            if function.parameter_uses(index) > 1 && !can_be_repeated(argument)? {
+                return Err(error(format!(
+                    "cannot inline SQL function \"{}\": argument {} is used more than once, so it cannot contain function calls or subqueries",
+                    function.name,
+                    index + 1
+                )));
+            }
+        }
+        let body = function.instantiate(&arguments);
+        if !function.body.calls_functions {
+            return Ok(body);
+        }
+        self.calling.push(function.name.clone());
+        let body = self.rewrite_expression(&body);
+        self.calling.pop();
+        body
+    }
+
+    fn rewrite_expression(&mut self, expression: &str) -> Result<String, ParseError> {
+        if !self.calls_known_function(expression)? {
+            return Ok(expression.to_string());
+        }
+        let select = format!("{EXPRESSION_PREFIX}{expression}");
+        let parse_result = crate::parse(&select)?;
+        let statement = first_statement(&parse_result).expect("a SELECT is a statement");
+        let calls = self.resolve_calls(statement, Some(EXPRESSION_PREFIX.len()))?;
+        if calls.is_empty() {
+            return Ok(expression.to_string());
+        }
+        let select = self.splice(&select, &calls)?;
+        Ok(select[EXPRESSION_PREFIX.len()..].to_string())
+    }
+}
+
 impl SqlFunction {
-    pub fn instantiate(&self, arguments: &[String]) -> String {
+    fn instantiate(&self, arguments: &[String]) -> String {
         assert_eq!(
             arguments.len(),
             self.parameters.len(),
@@ -428,7 +643,7 @@ impl SqlFunction {
             self.name
         );
         let mut body = String::new();
-        for part in &self.body {
+        for part in &self.body.parts {
             match part {
                 BodyPart::Text(text) => body.push_str(text),
                 BodyPart::Parameter(index) => body.push_str(&format!(
@@ -440,6 +655,14 @@ impl SqlFunction {
         }
         format!("(CAST(({body}) AS {}))", self.return_type.to_sql())
     }
+
+    fn parameter_uses(&self, index: usize) -> usize {
+        self.body
+            .parts
+            .iter()
+            .filter(|part| **part == BodyPart::Parameter(index))
+            .count()
+    }
 }
 
 impl SqlType {
@@ -450,6 +673,120 @@ impl SqlType {
             "[]".repeat(self.array_dimensions)
         )
     }
+}
+
+fn can_be_repeated(expression: &str) -> Result<bool, ParseError> {
+    let parse_result = crate::parse(&format!("{EXPRESSION_PREFIX}{expression}"))?;
+    let statement = serde_json::to_value(first_statement(&parse_result))
+        .expect("parse trees serialize to JSON");
+    Ok(!contains_node(&statement, "FuncCall") && !contains_node(&statement, "SubLink"))
+}
+
+#[derive(Default)]
+struct CallSites {
+    calls: Vec<CallSite>,
+    from_clause_calls: HashSet<usize>,
+    select_items: HashSet<usize>,
+}
+
+struct CallSite {
+    names: Vec<String>,
+    location: usize,
+    argument_count: usize,
+    is_explicit_call: bool,
+    unsupported_syntax: Option<&'static str>,
+}
+
+impl CallSites {
+    fn collect(&mut self, value: &Value) {
+        match value {
+            Value::Object(fields) => {
+                if let Some(call) = fields.get("FuncCall") {
+                    self.calls.push(CallSite::new(call));
+                }
+                if let Some(range_function) = fields.get("RangeFunction") {
+                    let functions = range_function["functions"]
+                        .as_array()
+                        .expect("RangeFunction has functions");
+                    self.from_clause_calls.extend(
+                        functions
+                            .iter()
+                            .filter_map(|function| {
+                                function.pointer("/node/List/items/0/node/FuncCall")
+                            })
+                            .map(json_location),
+                    );
+                }
+                if let Some(target) = fields.get("ResTarget") {
+                    if target["name"] == ""
+                        && target.pointer("/val/node/FuncCall/location")
+                            == Some(&target["location"])
+                    {
+                        self.select_items.insert(json_location(target));
+                    }
+                }
+                for child in fields.values() {
+                    self.collect(child);
+                }
+            }
+            Value::Array(items) => {
+                for item in items {
+                    self.collect(item);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+impl CallSite {
+    fn new(call: &Value) -> Self {
+        let arguments = call["args"].as_array().expect("FuncCall has arguments");
+        let unsupported_syntax = if call["agg_star"] == true {
+            Some("*")
+        } else if call["agg_distinct"] == true {
+            Some("DISTINCT")
+        } else if call["agg_within_group"] == true {
+            Some("WITHIN GROUP")
+        } else if call["agg_order"]
+            .as_array()
+            .is_some_and(|order| !order.is_empty())
+        {
+            Some("ORDER BY")
+        } else if !call["agg_filter"].is_null() {
+            Some("FILTER")
+        } else if !call["over"].is_null() {
+            Some("OVER")
+        } else if call["func_variadic"] == true {
+            Some("VARIADIC")
+        } else if arguments
+            .iter()
+            .any(|argument| argument.pointer("/node/NamedArgExpr").is_some())
+        {
+            Some("Named argument notation")
+        } else {
+            None
+        };
+        Self {
+            names: call["funcname"]
+                .as_array()
+                .expect("FuncCall has a name")
+                .iter()
+                .filter_map(|name| name.pointer("/node/String/sval").and_then(Value::as_str))
+                .map(str::to_string)
+                .collect(),
+            location: json_location(call),
+            argument_count: arguments.len(),
+            is_explicit_call: call["funcformat"] == CoercionForm::CoerceExplicitCall as i32,
+            unsupported_syntax,
+        }
+    }
+}
+
+struct CallSpan {
+    start: usize,
+    end: usize,
+    arguments: Vec<(usize, usize)>,
 }
 
 struct Tokens(Vec<ScanToken>);
@@ -482,6 +819,58 @@ impl Tokens {
     fn span(&self, start: usize, token_count: usize) -> (usize, usize) {
         let first = self.index_at(start);
         (start, byte_offset(self.0[first + token_count - 1].end))
+    }
+
+    fn call_span(&self, start: usize) -> CallSpan {
+        let open = (self.index_at(start)..self.0.len())
+            .find(|&index| self.0[index].token() == Token::Ascii40)
+            .expect("a call has an opening parenthesis");
+        let mut depth = 0usize;
+        let mut arguments = Vec::new();
+        let mut argument_start = None;
+        for index in open + 1..self.0.len() {
+            let token = self.0[index].token();
+            if depth == 0 && matches!(token, Token::Ascii41 | Token::Ascii44) {
+                if let Some(argument_start) = argument_start.take() {
+                    arguments.push((argument_start, byte_offset(self.0[index - 1].end)));
+                }
+                if token == Token::Ascii41 {
+                    return CallSpan {
+                        start,
+                        end: byte_offset(self.0[index].end),
+                        arguments,
+                    };
+                }
+                continue;
+            }
+            match token {
+                Token::Ascii40 | Token::Ascii91 => depth += 1,
+                Token::Ascii41 | Token::Ascii93 => depth -= 1,
+                _ => {}
+            }
+            argument_start.get_or_insert(byte_offset(self.0[index].start));
+        }
+        unreachable!("a call has a closing parenthesis")
+    }
+
+    fn called_names(&self, sql: &str) -> Vec<String> {
+        self.0
+            .windows(2)
+            .filter(|pair| pair[1].token() == Token::Ascii40)
+            .filter(|pair| {
+                pair[0].token() == Token::Ident || pair[0].keyword_kind() != KeywordKind::NoKeyword
+            })
+            .map(|pair| {
+                let name = &sql[byte_offset(pair[0].start)..byte_offset(pair[0].end)];
+                match name
+                    .strip_prefix('"')
+                    .and_then(|name| name.strip_suffix('"'))
+                {
+                    Some(quoted) => quoted.replace("\"\"", "\""),
+                    None => name.to_ascii_lowercase(),
+                }
+            })
+            .collect()
     }
 
     fn index_at(&self, start: usize) -> usize {
@@ -750,5 +1139,222 @@ mod tests {
             };
             assert!(e.contains(message), "{sql}: expected {message}, got {e}");
         }
+    }
+
+    const ADD_ONE: &str =
+        "CREATE FUNCTION add_one(a integer) RETURNS integer LANGUAGE sql AS 'SELECT a + 1'";
+
+    fn inline(sql: &str, definitions: &[&str]) -> Result<Option<String>, ParseError> {
+        let functions: Vec<SqlFunction> = definitions
+            .iter()
+            .map(|definition| parse(definition).function)
+            .collect();
+        let parse_result = crate::parse(sql)?;
+        inline_calls(sql, &parse_result, &mut |name| {
+            Ok(functions
+                .iter()
+                .find(|function| function.name == name)
+                .cloned()
+                .map(Arc::new))
+        })
+    }
+
+    fn inlined(sql: &str, definitions: &[&str]) -> String {
+        inline(sql, definitions)
+            .unwrap_or_else(|e| panic!("{sql}: {e}"))
+            .unwrap_or_else(|| panic!("{sql} has no calls to inline"))
+    }
+
+    fn inline_error(sql: &str, definitions: &[&str]) -> String {
+        match inline(sql, definitions) {
+            Err(ParseError::ParseError(e)) => e,
+            Ok(result) => panic!("{sql} must be rejected, got {result:?}"),
+        }
+    }
+
+    fn add_one(argument: &str) -> String {
+        format!("(CAST(((CAST(({argument}) AS pg_catalog.int4)) + 1) AS pg_catalog.int4))")
+    }
+
+    #[test]
+    fn statements_without_calls_of_sql_functions_are_not_changed() {
+        assert_eq!(
+            inline(
+                "SELECT lower('A'), add_one(1, 2), other.add_one(1)",
+                &[ADD_ONE]
+            )
+            .unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn select_item_call_is_replaced_and_keeps_the_function_name() {
+        assert_eq!(
+            inlined("SELECT add_one(41)", &[ADD_ONE]),
+            format!("SELECT {} AS add_one", add_one("41"))
+        );
+        assert_eq!(
+            inlined("SELECT add_one(41) AS answer", &[ADD_ONE]),
+            format!("SELECT {} AS answer", add_one("41"))
+        );
+    }
+
+    #[test]
+    fn calls_are_replaced_in_every_clause() {
+        assert_eq!(
+            inlined(
+                "SELECT x FROM t WHERE public.add_one(x) > 2 ORDER BY add_one(x)",
+                &[ADD_ONE]
+            ),
+            format!(
+                "SELECT x FROM t WHERE {} > 2 ORDER BY {}",
+                add_one("x"),
+                add_one("x")
+            )
+        );
+    }
+
+    #[test]
+    fn calls_are_replaced_in_data_changes() {
+        assert_eq!(
+            inlined("INSERT INTO t VALUES (add_one(1))", &[ADD_ONE]),
+            format!("INSERT INTO t VALUES ({})", add_one("1"))
+        );
+        assert_eq!(
+            inlined(
+                "UPDATE t SET x = add_one(x) RETURNING add_one(x)",
+                &[ADD_ONE]
+            ),
+            format!(
+                "UPDATE t SET x = {} RETURNING {} AS add_one",
+                add_one("x"),
+                add_one("x")
+            )
+        );
+        assert_eq!(
+            inlined("DELETE FROM t WHERE add_one($1) = x", &[ADD_ONE]),
+            format!("DELETE FROM t WHERE {} = x", add_one("$1"))
+        );
+    }
+
+    #[test]
+    fn calls_in_arguments_and_bodies_are_replaced() {
+        assert_eq!(
+            inlined("SELECT add_one(add_one(1))", &[ADD_ONE]),
+            format!("SELECT {} AS add_one", add_one(&add_one("1")))
+        );
+        let add_two = "CREATE FUNCTION add_two(a integer) RETURNS integer LANGUAGE sql \
+                       AS 'SELECT add_one(add_one(a))'";
+        let argument = "(CAST((1) AS pg_catalog.int4))";
+        assert_eq!(
+            inlined("SELECT add_two(1) AS v", &[ADD_ONE, add_two]),
+            format!(
+                "SELECT (CAST(({}) AS pg_catalog.int4)) AS v",
+                add_one(&add_one(argument))
+            )
+        );
+    }
+
+    #[test]
+    fn calls_are_found_in_any_letter_case_and_with_keyword_names() {
+        let first = "CREATE FUNCTION first(a integer) RETURNS integer LANGUAGE sql AS 'SELECT a'";
+        assert_eq!(
+            inlined("SELECT ADD_ONE(1), First(2) AS f", &[ADD_ONE, first]),
+            format!(
+                "SELECT {} AS add_one, (CAST(((CAST((2) AS pg_catalog.int4))) AS pg_catalog.int4)) AS f",
+                add_one("1")
+            )
+        );
+    }
+
+    #[test]
+    fn quoted_function_names_are_quoted_in_the_alias() {
+        let five = "CREATE FUNCTION \"Five\"() RETURNS integer LANGUAGE sql AS 'SELECT 5'";
+        assert_eq!(
+            inlined("SELECT \"Five\"()", &[five]),
+            "SELECT (CAST((5) AS pg_catalog.int4)) AS \"Five\""
+        );
+    }
+
+    #[test]
+    fn repeated_arguments_cannot_contain_calls_or_subqueries() {
+        let square =
+            "CREATE FUNCTION square(a float8) RETURNS float8 LANGUAGE sql AS 'SELECT a * a'";
+        assert!(inline("SELECT square(x + 1) FROM t", &[square]).is_ok());
+        for sql in ["SELECT square(random())", "SELECT square((SELECT 2))"] {
+            let e = inline_error(sql, &[square]);
+            assert!(
+                e.contains("argument 1 is used more than once"),
+                "{sql}: {e}"
+            );
+        }
+    }
+
+    #[test]
+    fn calls_that_cannot_be_inlined_are_rejected() {
+        let f = "CREATE FUNCTION f(a integer) RETURNS integer LANGUAGE sql AS 'SELECT g(a)'";
+        let g = "CREATE FUNCTION g(a integer) RETURNS integer LANGUAGE sql AS 'SELECT f(a)'";
+        for (sql, definitions, message) in [
+            (
+                "SELECT f(1)",
+                &[f, g][..],
+                "cannot inline recursive SQL function \"f\"",
+            ),
+            (
+                "SELECT * FROM add_one(1)",
+                &[ADD_ONE],
+                "cannot be called in FROM yet",
+            ),
+            (
+                "SELECT add_one(DISTINCT x) FROM t",
+                &[ADD_ONE],
+                "DISTINCT is not supported",
+            ),
+            (
+                "SELECT add_one(x) OVER () FROM t",
+                &[ADD_ONE],
+                "OVER is not supported",
+            ),
+            (
+                "SELECT add_one(a => 1)",
+                &[ADD_ONE],
+                "Named argument notation is not supported",
+            ),
+            (
+                "CREATE VIEW v AS SELECT add_one(1)",
+                &[ADD_ONE],
+                "can be called only in SELECT",
+            ),
+            (
+                "CREATE TABLE t (x integer DEFAULT add_one(1))",
+                &[ADD_ONE],
+                "can be called only in SELECT",
+            ),
+        ] {
+            let e = inline_error(sql, definitions);
+            assert!(e.contains(message), "{sql}: expected {message}, got {e}");
+        }
+    }
+
+    #[test]
+    fn deeply_nested_functions_are_rejected() {
+        let definitions: Vec<String> = (0..=MAX_INLINING_DEPTH)
+            .map(|level| match level {
+                0 => "CREATE FUNCTION f0() RETURNS integer LANGUAGE sql AS 'SELECT 1'".to_string(),
+                level => format!(
+                    "CREATE FUNCTION f{level}() RETURNS integer LANGUAGE sql AS 'SELECT f{}()'",
+                    level - 1
+                ),
+            })
+            .collect();
+        let definitions: Vec<&str> = definitions.iter().map(String::as_str).collect();
+        assert!(inline(
+            &format!("SELECT f{}()", MAX_INLINING_DEPTH - 1),
+            &definitions
+        )
+        .is_ok());
+        let e = inline_error(&format!("SELECT f{MAX_INLINING_DEPTH}()"), &definitions);
+        assert!(e.contains("nested more than 64 levels deep"), "{e}");
     }
 }
