@@ -753,6 +753,9 @@ impl PostgreSQLTranslator {
             .ok_or_else(|| ParseError::ParseError("ALTER TABLE missing table name".into()))?;
         let name = self.qualified_name_from_range_var(relation);
 
+        if alter.missing_ok {
+            return Err(not_supported("ALTER TABLE IF EXISTS"));
+        }
         if alter.cmds.len() > 1 {
             return Err(not_supported("ALTER TABLE with multiple subcommands"));
         }
@@ -771,6 +774,18 @@ impl PostgreSQLTranslator {
 
         let subtype = AlterTableType::try_from(cmd.subtype)
             .map_err(|_| ParseError::ParseError("ALTER TABLE: invalid subtype".into()))?;
+        if cmd.missing_ok {
+            return Err(not_supported(format!(
+                "ALTER TABLE {} IF [NOT] EXISTS",
+                alter_subtype_name(subtype)
+            )));
+        }
+        if cmd.behavior == pg_query::protobuf::DropBehavior::DropCascade as i32 {
+            return Err(not_supported(format!(
+                "ALTER TABLE {} CASCADE",
+                alter_subtype_name(subtype)
+            )));
+        }
 
         let body = match subtype {
             AlterTableType::AtAddColumn => {
@@ -8892,5 +8907,17 @@ mod tests {
             "ALTER TABLE t ADD COLUMN a int, ADD COLUMN b int",
             "multiple subcommands",
         );
+    }
+
+    #[test]
+    fn fail_closed_alter_table_if_exists_and_cascade() {
+        assert_not_supported("ALTER TABLE IF EXISTS t ADD COLUMN a int", "IF EXISTS");
+        assert_not_supported(
+            "ALTER TABLE t ADD COLUMN IF NOT EXISTS a int",
+            "IF [NOT] EXISTS",
+        );
+        assert_not_supported("ALTER TABLE t DROP COLUMN IF EXISTS a", "IF [NOT] EXISTS");
+        assert_not_supported("ALTER TABLE t DROP COLUMN a CASCADE", "CASCADE");
+        assert_translates("ALTER TABLE t DROP COLUMN a RESTRICT");
     }
 }
