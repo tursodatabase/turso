@@ -1567,6 +1567,11 @@ impl PostgreSQLTranslator {
             // But only when the INSERT had explicit column names — an empty
             // column list means "all columns" (positional VALUES), not defaults.
             if filtered_columns.is_empty() && has_explicit_columns {
+                if select_stmt.values_lists.len() > 1 {
+                    return Err(not_supported(
+                        "INSERT of several rows whose values are all DEFAULT",
+                    ));
+                }
                 if upsert.is_some() {
                     return Err(not_supported(
                         "ON CONFLICT on an INSERT whose values are all DEFAULT",
@@ -10107,6 +10112,16 @@ mod tests {
         assert_not_supported("DROP DOMAIN other.d", "schema-qualified type");
         assert_translates("DROP TYPE public.mood");
         assert_translates("DROP TABLE public.t");
+    }
+
+    #[test]
+    fn fail_closed_insert_several_all_default_rows() {
+        assert_not_supported(
+            "INSERT INTO t (a) VALUES (DEFAULT), (DEFAULT)",
+            "several rows whose values are all DEFAULT",
+        );
+        assert_translates("INSERT INTO t (a) VALUES (DEFAULT)");
+        assert_translates("INSERT INTO t (a, b) VALUES (DEFAULT, 1), (DEFAULT, 2)");
     }
 
     #[test]
