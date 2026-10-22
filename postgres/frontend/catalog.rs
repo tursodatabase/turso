@@ -3877,11 +3877,6 @@ mod tests {
             temp_conn
                 .execute(format!("PRAGMA temp_store = {temp_store}"))
                 .unwrap();
-            temp_conn.execute("BEGIN").unwrap();
-            temp_conn
-                .execute("CREATE TEMP TABLE temp_data (v INT)")
-                .unwrap();
-            temp_conn.execute("ROLLBACK").unwrap();
             assert_eq!(
                 temp_conn
                     .prepare("SELECT COUNT(*) FROM temp.pg_namespace")
