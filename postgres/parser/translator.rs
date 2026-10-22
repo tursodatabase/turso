@@ -1292,6 +1292,10 @@ impl PostgreSQLTranslator {
             .ok_or_else(|| ParseError::ParseError("CREATE VIEW: missing view name".into()))?;
         let view_name = self.qualified_name_from_range_var(relation);
 
+        if view.replace {
+            return Err(not_supported("CREATE OR REPLACE VIEW"));
+        }
+
         // Translate column aliases
         let columns: Vec<ast::IndexedColumn> = view
             .aliases
@@ -9486,5 +9490,13 @@ mod tests {
         assert_not_supported("TRUNCATE t RESTART IDENTITY", "RESTART IDENTITY");
         assert_not_supported("TRUNCATE t CASCADE", "CASCADE");
         assert_translates("TRUNCATE TABLE t CONTINUE IDENTITY RESTRICT");
+    }
+
+    #[test]
+    fn fail_closed_create_or_replace_view() {
+        assert_not_supported(
+            "CREATE OR REPLACE VIEW v AS SELECT 1",
+            "CREATE OR REPLACE VIEW",
+        );
     }
 }
