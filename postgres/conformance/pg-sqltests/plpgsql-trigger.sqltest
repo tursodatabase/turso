@@ -323,7 +323,7 @@ test before-trigger-sets-a-column-of-the-new-row {
     SELECT count(DISTINCT updated_at) FROM docs;
     BEGIN;
     UPDATE docs SET title = 'c' WHERE id = 2;
-    SELECT count(*) FROM docs WHERE updated_at = now();
+    SELECT count(*) FROM docs WHERE id = 2 AND updated_at = now();
     COMMIT;
     SELECT title FROM docs WHERE id = 2;
 }

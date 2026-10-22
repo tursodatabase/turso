@@ -306,9 +306,10 @@ test handle-times-sets-created-at-only-on-insert {
     INSERT INTO docs (id, title) VALUES (1, 'a');
     SELECT count(*) FROM docs WHERE created_at = now() AND updated_at = now();
     COMMIT;
+    UPDATE docs SET created_at = '2000-01-01 00:00:00' WHERE id = 1;
     BEGIN;
     UPDATE docs SET title = 'b' WHERE id = 1;
-    SELECT count(*) FROM docs WHERE created_at <> now() AND updated_at = now();
+    SELECT count(*) FROM docs WHERE created_at = '2000-01-01 00:00:00' AND updated_at = now();
     COMMIT;
 }
 expect {
