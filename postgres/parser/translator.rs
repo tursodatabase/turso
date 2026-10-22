@@ -1643,6 +1643,11 @@ impl PostgreSQLTranslator {
         for target_node in &update.target_list {
             match &target_node.node {
                 Some(Node::ResTarget(res_target)) => {
+                    if !res_target.indirection.is_empty() {
+                        return Err(not_supported(
+                            "UPDATE of an array element or composite field",
+                        ));
+                    }
                     let col_name = ast::Name::from_string(&res_target.name);
                     let expr = if let Some(val) = &res_target.val {
                         Box::new(self.translate_expr(val)?)
@@ -9269,5 +9274,11 @@ mod tests {
     fn fail_closed_insert_column_indirection() {
         assert_not_supported("INSERT INTO t (a[1]) VALUES (5)", "array element");
         assert_not_supported("INSERT INTO t (c.f) VALUES (5)", "array element");
+    }
+
+    #[test]
+    fn fail_closed_update_set_indirection() {
+        assert_not_supported("UPDATE t SET a[1] = 5", "array element");
+        assert_not_supported("UPDATE t SET c.f = 5", "array element");
     }
 }
