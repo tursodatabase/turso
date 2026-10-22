@@ -2208,16 +2208,8 @@ impl PostgreSQLTranslator {
             }
         };
 
-        // Extract function name (use last component to strip schema qualifiers)
-        let func_name = func_call
-            .funcname
-            .iter()
-            .filter_map(|node| match &node.node {
-                Some(pg_query::protobuf::node::Node::String(s)) => Some(s.sval.as_str()),
-                _ => None,
-            })
-            .next_back()
-            .ok_or_else(|| ParseError::ParseError("RangeFunction: missing function name".into()))?;
+        let func_name = function_name(&func_call.funcname)?;
+        let func_name = func_name.as_str();
 
         // Translate arguments
         let args: Vec<Box<ast::Expr>> = func_call
@@ -3749,19 +3741,7 @@ impl PostgreSQLTranslator {
         &self,
         func_call: &pg_query::protobuf::FuncCall,
     ) -> Result<ast::Expr, ParseError> {
-        // Extract function name
-        let func_name = func_call
-            .funcname
-            .iter()
-            .filter_map(|node| {
-                if let Some(pg_query::protobuf::node::Node::String(s)) = &node.node {
-                    Some(s.sval.clone())
-                } else {
-                    None
-                }
-            })
-            .next_back()
-            .ok_or_else(|| ParseError::ParseError("Missing function name".to_string()))?;
+        let func_name = function_name(&func_call.funcname)?;
 
         // Translate FILTER clause
         let filter_clause = if let Some(ref filter) = func_call.agg_filter {
@@ -3802,12 +3782,6 @@ impl PostgreSQLTranslator {
         } else {
             None
         };
-
-        // Strip pg_catalog. schema prefix from function names
-        let func_name = func_name
-            .strip_prefix("pg_catalog.")
-            .unwrap_or(&func_name)
-            .to_string();
 
         // Rewrite PG-specific function-name spellings to their core-native
         // equivalents so the core resolver doesn't need to carry aliases
@@ -6329,6 +6303,18 @@ fn reject_column_aliases(
         return Err(not_supported(format!("a column alias list on {what}")));
     }
     Ok(())
+}
+
+/// The name of a called function. Only an unqualified or `pg_catalog.`
+/// name is accepted: user functions live in no schema, so any other
+/// qualifier would be dropped and resolve to a built-in of the same name.
+fn function_name(funcname: &[pg_query::protobuf::Node]) -> Result<String, ParseError> {
+    match extract_key_columns(funcname)?.as_slice() {
+        [name] => Ok(name.clone()),
+        [schema, name] if schema == "pg_catalog" => Ok(name.clone()),
+        [] => Err(ParseError::ParseError("Missing function name".to_string())),
+        _ => Err(not_supported("schema-qualified function names")),
+    }
 }
 
 #[cfg(test)]
@@ -9590,5 +9576,16 @@ mod tests {
         );
         assert_translates("SELECT * FROM generate_series(1, 3)");
         assert_translates("SELECT * FROM ROWS FROM (generate_series(1, 3))");
+    }
+
+    #[test]
+    fn fail_closed_schema_qualified_functions() {
+        assert_not_supported("SELECT myschema.f(1)", "schema-qualified function");
+        assert_not_supported(
+            "SELECT * FROM myschema.generate_series(1, 3)",
+            "schema-qualified function",
+        );
+        assert_translates("SELECT pg_catalog.lower('A')");
+        assert_translates("SELECT * FROM pg_catalog.generate_series(1, 3)");
     }
 }
