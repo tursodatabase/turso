@@ -272,6 +272,17 @@ impl PostgreSQLTranslator {
         let tbl_name = self.qualified_name_from_range_var(relation);
 
         reject_temporary(relation, "CREATE TEMPORARY TABLE")?;
+        // PARTITION OF also records the parent in inh_relations, so check
+        // partitioning first for the more accurate message.
+        if create.partbound.is_some() || create.partspec.is_some() {
+            return Err(not_supported("table partitioning"));
+        }
+        if !create.inh_relations.is_empty() {
+            return Err(not_supported("CREATE TABLE ... INHERITS"));
+        }
+        if create.of_typename.is_some() {
+            return Err(not_supported("CREATE TABLE ... OF type"));
+        }
 
         if create.table_elts.is_empty() {
             return Err(ParseError::ParseError(
@@ -9073,5 +9084,19 @@ mod tests {
         assert_not_supported("CREATE TEMPORARY TABLE t (a int)", "TEMPORARY");
         // UNLOGGED only weakens durability, so a logged table is a safe substitute.
         assert_translates("CREATE UNLOGGED TABLE t (a int)");
+    }
+
+    #[test]
+    fn fail_closed_inheritance_and_partitioning() {
+        assert_not_supported("CREATE TABLE c (b int) INHERITS (p)", "INHERITS");
+        assert_not_supported(
+            "CREATE TABLE t (a int) PARTITION BY RANGE (a)",
+            "partitioning",
+        );
+        assert_not_supported(
+            "CREATE TABLE t1 PARTITION OF t FOR VALUES FROM (1) TO (10)",
+            "partitioning",
+        );
+        assert_not_supported("CREATE TABLE t OF mytype", "OF type");
     }
 }
