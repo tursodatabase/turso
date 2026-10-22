@@ -5196,20 +5196,6 @@ fn def_elem_string_val(def: &pg_query::protobuf::DefElem) -> Option<String> {
     }
 }
 
-/// Extract a boolean value from a DefElem's arg.
-/// If arg is None (bare keyword like HEADER), returns None (caller defaults to true).
-fn def_elem_bool_val(def: &pg_query::protobuf::DefElem) -> Option<bool> {
-    let arg = def.arg.as_deref()?;
-    match &arg.node {
-        Some(pg_query::protobuf::node::Node::Integer(i)) => Some(i.ival != 0),
-        Some(pg_query::protobuf::node::Node::String(s)) => Some(matches!(
-            s.sval.to_lowercase().as_str(),
-            "true" | "on" | "1"
-        )),
-        _ => None,
-    }
-}
-
 /// Result of mapping a PostgreSQL type: the Turso type name, array dimensions,
 /// and type parameters (e.g. `[4]` for `varchar(4)`, `[10, 2]` for `numeric(10, 2)`).
 #[derive(Debug, Clone, PartialEq)]
@@ -5996,15 +5982,38 @@ pub fn try_extract_copy_from(
         match def.defname.as_str() {
             "format" => {
                 // Only support text format for now
-                if let Some(val) = def_elem_string_val(def) {
-                    if val.to_lowercase() != "text" {
-                        return Err(not_supported(format!("COPY FORMAT {val}")));
-                    }
+                let val = copy_string_option(def)?;
+                if val.to_lowercase() != "text" {
+                    return Err(not_supported(format!("COPY FORMAT {val}")));
                 }
             }
-            "delimiter" => delimiter = def_elem_string_val(def),
-            "header" => header = def_elem_bool_val(def).unwrap_or(true),
-            "null" => null_string = def_elem_string_val(def),
+            "delimiter" => {
+                let val = copy_string_option(def)?;
+                if val.chars().count() != 1 {
+                    return Err(ParseError::ParseError(
+                        "COPY delimiter must be a single one-byte character".into(),
+                    ));
+                }
+                delimiter = Some(val);
+            }
+            // A bare HEADER means true. HEADER MATCH (check the header
+            // against the column names) is not implemented, and must not be
+            // read as false.
+            "header" => {
+                use pg_query::protobuf::node::Node;
+                header = match def.arg.as_ref().and_then(|n| n.node.as_ref()) {
+                    None => true,
+                    Some(Node::Boolean(b)) => b.boolval,
+                    Some(Node::Integer(i)) if matches!(i.ival, 0 | 1) => i.ival == 1,
+                    Some(Node::String(s)) => match s.sval.to_lowercase().as_str() {
+                        "true" | "on" | "1" => true,
+                        "false" | "off" | "0" => false,
+                        _ => return Err(not_supported("this COPY HEADER value")),
+                    },
+                    _ => return Err(not_supported("this COPY HEADER value")),
+                };
+            }
+            "null" => null_string = Some(copy_string_option(def)?),
             other => {
                 return Err(not_supported(format!(
                     "COPY option {}",
@@ -6023,6 +6032,17 @@ pub fn try_extract_copy_from(
         header,
         null_string,
     }))
+}
+
+/// The string argument of a COPY option; any other kind of argument is an
+/// error rather than being ignored.
+fn copy_string_option(def: &pg_query::protobuf::DefElem) -> Result<String, ParseError> {
+    def_elem_string_val(def).ok_or_else(|| {
+        ParseError::ParseError(format!(
+            "COPY {} requires a string argument",
+            def.defname.to_uppercase()
+        ))
+    })
 }
 
 /// Parse a SQL referential action string to an AST RefAct.
@@ -9084,6 +9104,33 @@ mod tests {
                 err.contains("not supported") && err.contains(needle),
                 "{sql}: {err}"
             );
+        }
+    }
+
+    #[test]
+    fn fail_closed_copy_from_arguments() {
+        for (sql, needle) in [
+            ("COPY t FROM '/tmp/d' WITH (HEADER MATCH)", "HEADER value"),
+            (
+                "COPY t FROM '/tmp/d' WITH (DELIMITER '::')",
+                "single one-byte",
+            ),
+            (
+                "COPY t FROM '/tmp/d' WITH (DELIMITER '')",
+                "single one-byte",
+            ),
+        ] {
+            let parsed = crate::parse(sql).unwrap();
+            let err = try_extract_copy_from(&parsed).expect_err(sql).to_string();
+            assert!(err.contains(needle), "{sql}: {err}");
+        }
+        for sql in [
+            "COPY t FROM '/tmp/d' WITH (HEADER)",
+            "COPY t FROM '/tmp/d' WITH (HEADER true, DELIMITER ',', NULL '')",
+            "COPY t FROM '/tmp/d' WITH (HEADER off, FORMAT text)",
+        ] {
+            let parsed = crate::parse(sql).unwrap();
+            assert!(try_extract_copy_from(&parsed).unwrap().is_some(), "{sql}");
         }
     }
 
