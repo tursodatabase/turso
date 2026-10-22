@@ -2167,6 +2167,12 @@ impl PostgreSQLTranslator {
     ) -> Result<ast::SelectTable, ParseError> {
         // RangeFunction.functions is a list of function-call items.
         // Each item is a List node whose first element is the FuncCall.
+        if range_func.functions.len() > 1 {
+            return Err(not_supported("ROWS FROM with several functions"));
+        }
+        if range_func.ordinality {
+            return Err(not_supported("WITH ORDINALITY"));
+        }
         let func_item = range_func
             .functions
             .first()
@@ -2179,6 +2185,11 @@ impl PostgreSQLTranslator {
                     .items
                     .first()
                     .ok_or_else(|| ParseError::ParseError("RangeFunction list is empty".into()))?;
+                // The second element is the per-function column definition
+                // list of ROWS FROM (f() AS (a int)).
+                if list.items.get(1).is_some_and(|n| n.node.is_some()) {
+                    return Err(not_supported("a column definition list inside ROWS FROM"));
+                }
                 match &first.node {
                     Some(pg_query::protobuf::node::Node::FuncCall(fc)) => fc,
                     _ => {
@@ -2382,6 +2393,11 @@ impl PostgreSQLTranslator {
                     });
                 }
             }
+        }
+        if !range_func.coldeflist.is_empty() {
+            return Err(not_supported(format!(
+                "a column definition list on {func_name}()"
+            )));
         }
         reject_column_aliases(&range_func.alias, "a function")?;
         Ok(ast::SelectTable::TableCall(qualified_name, args, alias))
@@ -9552,5 +9568,27 @@ mod tests {
         assert_translates("SELECT x.a FROM t AS x");
         assert_translates("SELECT s.p FROM (SELECT 1, 2) AS s(p, q)");
         assert_translates("SELECT g.n FROM generate_series(1, 3) AS g(n)");
+    }
+
+    #[test]
+    fn fail_closed_range_function_clauses() {
+        assert_not_supported(
+            "SELECT * FROM ROWS FROM (generate_series(1, 3), generate_series(1, 5))",
+            "several functions",
+        );
+        assert_not_supported(
+            "SELECT * FROM generate_series(1, 3) WITH ORDINALITY",
+            "WITH ORDINALITY",
+        );
+        assert_not_supported(
+            "SELECT * FROM ROWS FROM (f() AS (a int, b text))",
+            "inside ROWS FROM",
+        );
+        assert_not_supported(
+            "SELECT * FROM f() AS t(a int, b text)",
+            "column definition list on f()",
+        );
+        assert_translates("SELECT * FROM generate_series(1, 3)");
+        assert_translates("SELECT * FROM ROWS FROM (generate_series(1, 3))");
     }
 }
