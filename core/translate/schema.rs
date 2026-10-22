@@ -80,8 +80,16 @@ pub(crate) fn validate_check_expr(
                 name,
                 args,
                 filter_over,
+                order_by,
                 ..
             } => {
+                super::expr::validate_function_tail(
+                    name.as_str(),
+                    args.len(),
+                    filter_over,
+                    !order_by.is_empty(),
+                    resolver,
+                )?;
                 if filter_over.over_clause.is_some() {
                     bail_parse_error!("misuse of window function {}()", name.as_str());
                 }

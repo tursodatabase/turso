@@ -93,3 +93,84 @@ test ordered-window-error-names-function {
 expect error {
     ORDER BY may not be used with non-aggregate group_concat()
 }
+
+test scalar-order-by-where {
+    CREATE TABLE t(a,b);
+    INSERT INTO t VALUES(-1,2);
+    SELECT 1 FROM t WHERE abs(a ORDER BY b)=1;
+}
+expect error {
+    ORDER BY may not be used with non-aggregate abs()
+}
+
+test scalar-order-by-group-by {
+    CREATE TABLE t(a,b);
+    INSERT INTO t VALUES(-1,2);
+    SELECT count(*) FROM t GROUP BY abs(a ORDER BY b);
+}
+expect error {
+    ORDER BY may not be used with non-aggregate abs()
+}
+
+test scalar-order-by-update-set {
+    CREATE TABLE t(a,b);
+    INSERT INTO t VALUES(-1,2);
+    UPDATE t SET a=abs(a ORDER BY b);
+}
+expect error {
+    ORDER BY may not be used with non-aggregate abs()
+}
+
+test scalar-order-by-update-where {
+    CREATE TABLE t(a,b);
+    INSERT INTO t VALUES(-1,2);
+    UPDATE t SET a=1 WHERE abs(a ORDER BY b)=1;
+}
+expect error {
+    ORDER BY may not be used with non-aggregate abs()
+}
+
+test scalar-order-by-delete {
+    CREATE TABLE t(a,b);
+    INSERT INTO t VALUES(-1,2);
+    DELETE FROM t WHERE abs(a ORDER BY b)=1;
+}
+expect error {
+    ORDER BY may not be used with non-aggregate abs()
+}
+
+test scalar-order-by-insert {
+    CREATE TABLE t(a,b);
+    INSERT INTO t VALUES(-1,2);
+    INSERT INTO t VALUES(abs(-1 ORDER BY 1),2);
+}
+expect error {
+    ORDER BY may not be used with non-aggregate abs()
+}
+
+test scalar-order-by-returning {
+    CREATE TABLE t(a,b);
+    INSERT INTO t VALUES(-1,2);
+    DELETE FROM t RETURNING abs(a ORDER BY b);
+}
+expect error {
+    ORDER BY may not be used with non-aggregate abs()
+}
+
+test scalar-order-by-check {
+    CREATE TABLE t(a,b);
+    INSERT INTO t VALUES(-1,2);
+    CREATE TABLE checked(a,b,CHECK(abs(a ORDER BY b)=1));
+}
+expect error {
+    ORDER BY may not be used with non-aggregate abs()
+}
+
+test scalar-order-by-index {
+    CREATE TABLE t(a,b);
+    INSERT INTO t VALUES(-1,2);
+    CREATE INDEX bad ON t(abs(a ORDER BY b));
+}
+expect error {
+    ORDER BY may not be used with non-aggregate abs()
+}
