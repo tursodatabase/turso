@@ -1993,7 +1993,13 @@ impl PostgreSQLTranslator {
             // tree only while it is left-deep. A set operation on the right,
             // from INTERSECT's higher precedence (`A UNION B INTERSECT C`) or
             // from parentheses (`A EXCEPT (B UNION C)`), would be regrouped.
-            if !matches!(rarg.op(), SetOperation::SetopNone | SetOperation::Undefined) {
+            let same_associative_operation = matches!(
+                set_op,
+                SetOperation::SetopUnion | SetOperation::SetopIntersect
+            ) && uses_only_set_operation(rarg, set_op, stmt.all);
+            if !matches!(rarg.op(), SetOperation::SetopNone | SetOperation::Undefined)
+                && !same_associative_operation
+            {
                 return Err(not_supported(
                     "a set operation nested on the right of another (from parentheses or INTERSECT precedence)",
                 ));
@@ -6932,6 +6938,24 @@ fn reject_column_aliases(
     Ok(())
 }
 
+fn uses_only_set_operation(
+    stmt: &pg_query::protobuf::SelectStmt,
+    op: pg_query::protobuf::SetOperation,
+    all: bool,
+) -> bool {
+    use pg_query::protobuf::SetOperation;
+    match stmt.op() {
+        SetOperation::SetopNone | SetOperation::Undefined => true,
+        stmt_op if stmt_op == op && stmt.all == all => {
+            [&stmt.larg, &stmt.rarg].into_iter().all(|arg| {
+                arg.as_deref()
+                    .is_some_and(|arg| uses_only_set_operation(arg, op, all))
+            })
+        }
+        _ => false,
+    }
+}
+
 fn object_name(
     names: &[pg_query::protobuf::Node],
     allowed_schema: fn(&str) -> bool,
@@ -10290,6 +10314,26 @@ mod tests {
         assert_translates("SELECT 1 UNION SELECT 2 UNION ALL SELECT 3 EXCEPT SELECT 4");
         assert_translates("SELECT 1 INTERSECT SELECT 2 UNION SELECT 3");
         assert_translates("(SELECT 1 UNION SELECT 2) INTERSECT SELECT 3");
+        assert_translates("SELECT 1 UNION ALL (SELECT 2 UNION ALL SELECT 3)");
+        assert_translates("SELECT 1 UNION (SELECT 2 UNION SELECT 3)");
+        assert_translates("SELECT 1 INTERSECT (SELECT 1 INTERSECT SELECT 2)");
+        assert_not_supported(
+            "SELECT 1 UNION (SELECT 1 UNION ALL SELECT 1)",
+            "nested on the right",
+        );
+        assert_not_supported(
+            "SELECT 1 EXCEPT (SELECT 1 EXCEPT SELECT 1)",
+            "nested on the right",
+        );
+        assert_not_supported(
+            "SELECT 1 UNION ((SELECT 2 EXCEPT SELECT 1) UNION SELECT 3)",
+            "nested on the right",
+        );
+        assert_not_supported(
+            "SELECT 1 UNION (SELECT 2 UNION (SELECT 3 UNION ALL SELECT 3))",
+            "nested on the right",
+        );
+        assert_translates("SELECT 1 UNION ((SELECT 2 UNION SELECT 1) UNION SELECT 3)");
     }
 
     #[test]
