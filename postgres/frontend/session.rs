@@ -382,7 +382,7 @@ fn try_prepare_special(pg_conn: &Arc<PgConnectionInner>, sql: &str) -> Result<Op
         return Ok(Some(noop_statement(&pg_conn.conn)?));
     }
 
-    if is_refresh_matview(&parse_result) {
+    if is_refresh_matview(&parse_result).map_err(|e| LimboError::ParseError(e.to_string()))? {
         return Ok(Some(noop_statement(&pg_conn.conn)?));
     }
 

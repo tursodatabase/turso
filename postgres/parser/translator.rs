@@ -6173,14 +6173,21 @@ pub fn try_extract_drop_schema(parse_result: &ParseResult) -> Option<PgDropSchem
 
 /// Returns true if the parse result is a REFRESH MATERIALIZED VIEW statement.
 /// Turso materialized views are live (auto-updating), so REFRESH is a no-op.
-pub fn is_refresh_matview(parse_result: &ParseResult) -> bool {
+/// WITH NO DATA asks for an unpopulated view, which live views cannot be.
+pub fn is_refresh_matview(parse_result: &ParseResult) -> Result<bool, ParseError> {
     use pg_query::NodeRef;
 
     let nodes = parse_result.protobuf.nodes();
     if nodes.is_empty() {
-        return false;
+        return Ok(false);
     }
-    matches!(&nodes[0].0, NodeRef::RefreshMatViewStmt(_))
+    let NodeRef::RefreshMatViewStmt(refresh) = &nodes[0].0 else {
+        return Ok(false);
+    };
+    if refresh.skip_data {
+        return Err(not_supported("REFRESH MATERIALIZED VIEW ... WITH NO DATA"));
+    }
+    Ok(true)
 }
 
 /// Returns true if the parse result is a COMMENT ON statement.
@@ -9411,6 +9418,22 @@ mod tests {
         assert_not_supported("DROP SCHEMA a, b", "several objects");
         let parsed = crate::parse("CREATE SCHEMA IF NOT EXISTS s").unwrap();
         assert!(try_extract_create_schema(&parsed).unwrap().is_some());
+    }
+
+    #[test]
+    fn fail_closed_refresh_with_no_data() {
+        let parsed = crate::parse("REFRESH MATERIALIZED VIEW m WITH NO DATA").unwrap();
+        let err = is_refresh_matview(&parsed).unwrap_err().to_string();
+        assert!(err.contains("WITH NO DATA"), "{err}");
+        for sql in [
+            "REFRESH MATERIALIZED VIEW m",
+            "REFRESH MATERIALIZED VIEW CONCURRENTLY m WITH DATA",
+        ] {
+            assert!(
+                is_refresh_matview(&crate::parse(sql).unwrap()).unwrap(),
+                "{sql}"
+            );
+        }
     }
 
     #[test]
