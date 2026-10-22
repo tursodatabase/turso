@@ -1485,11 +1485,18 @@ impl PostgreSQLTranslator {
         let columns: Vec<ast::Name> = insert
             .cols
             .iter()
-            .filter_map(|col_node| match &col_node.node {
-                Some(Node::ResTarget(res_target)) => Some(ast::Name::from_string(&res_target.name)),
-                _ => None,
+            .map(|col_node| match &col_node.node {
+                Some(Node::ResTarget(res_target)) if res_target.indirection.is_empty() => {
+                    Ok(ast::Name::from_string(&res_target.name))
+                }
+                Some(Node::ResTarget(_)) => Err(not_supported(
+                    "INSERT into an array element or composite field",
+                )),
+                _ => Err(ParseError::ParseError(
+                    "INSERT: unexpected column list item".into(),
+                )),
             })
-            .collect();
+            .collect::<Result<_, _>>()?;
         let has_explicit_columns = !columns.is_empty();
 
         // Translate body (VALUES or SELECT)
@@ -9256,5 +9263,11 @@ mod tests {
             "WITH NO DATA",
         );
         assert_translates("CREATE TABLE t AS SELECT 1 AS a WITH NO DATA");
+    }
+
+    #[test]
+    fn fail_closed_insert_column_indirection() {
+        assert_not_supported("INSERT INTO t (a[1]) VALUES (5)", "array element");
+        assert_not_supported("INSERT INTO t (c.f) VALUES (5)", "array element");
     }
 }
