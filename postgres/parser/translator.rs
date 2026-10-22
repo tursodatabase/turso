@@ -1883,7 +1883,10 @@ impl PostgreSQLTranslator {
                 ));
             }
         };
-        let select = self.translate_select(select_stmt)?;
+        let mut select = self.translate_select(select_stmt)?;
+        if let Some(alias) = &range_sub.alias {
+            rename_result_columns(&mut select, &alias_column_names(alias)?)?;
+        }
         let alias = range_sub
             .alias
             .as_ref()
@@ -2075,6 +2078,46 @@ impl PostgreSQLTranslator {
             "json_to_record" | "json_to_recordset" | "jsonb_to_record" | "jsonb_to_recordset"
         ) {
             return self.translate_json_to_record(func_name, range_func, &args, alias);
+        }
+        // generate_series has a single output column, `value`, so a one-name
+        // alias list renames it through a wrapping subselect, as for unnest.
+        if func_name == "generate_series" {
+            if let Some(range_alias) = &range_func.alias {
+                if let [column_name] = alias_column_names(range_alias)?.as_slice() {
+                    let mut select = ast::Select {
+                        with: None,
+                        body: ast::SelectBody {
+                            select: ast::OneSelect::Select {
+                                distinctness: None,
+                                columns: vec![ast::ResultColumn::Expr(
+                                    Box::new(ast::Expr::Id(ast::Name::from_string("value"))),
+                                    None,
+                                )],
+                                from: Some(ast::FromClause {
+                                    select: Box::new(ast::SelectTable::TableCall(
+                                        qualified_name,
+                                        args,
+                                        None,
+                                    )),
+                                    joins: vec![],
+                                }),
+                                where_clause: None,
+                                group_by: None,
+                                window_clause: vec![],
+                            },
+                            compounds: vec![],
+                        },
+                        order_by: vec![],
+                        limit: None,
+                    };
+                    rename_result_columns(&mut select, std::slice::from_ref(column_name))?;
+                    return Ok(ast::SelectTable::Select {
+                        select,
+                        alias,
+                        lateral: true,
+                    });
+                }
+            }
         }
         Ok(ast::SelectTable::TableCall(qualified_name, args, alias))
     }
@@ -4449,6 +4492,56 @@ impl PostgreSQLTranslator {
     }
 }
 
+/// The names of a FROM-item column alias list (`AS s(a, b)`).
+fn alias_column_names(alias: &pg_query::protobuf::Alias) -> Result<Vec<String>, ParseError> {
+    alias
+        .colnames
+        .iter()
+        .map(|n| match &n.node {
+            Some(pg_query::protobuf::node::Node::String(s)) => Ok(s.sval.clone()),
+            _ => Err(ParseError::ParseError("invalid column alias".into())),
+        })
+        .collect()
+}
+
+/// Applies a FROM-item column alias list (`AS s(a, b)`) by renaming the
+/// leading result columns of `select`. SQLite names a compound's columns
+/// after its first SELECT, so only that one is renamed.
+fn rename_result_columns(select: &mut ast::Select, names: &[String]) -> Result<(), ParseError> {
+    if names.is_empty() {
+        return Ok(());
+    }
+    let ast::OneSelect::Select { columns, .. } = &mut select.body.select else {
+        return Err(ParseError::ParseError(
+            "a column alias list on a VALUES subquery is not supported".into(),
+        ));
+    };
+    // A * expands to an unknown number of columns, so positions after it
+    // cannot be matched to names.
+    if columns
+        .iter()
+        .take(names.len())
+        .any(|c| !matches!(c, ast::ResultColumn::Expr(..)))
+    {
+        return Err(ParseError::ParseError(
+            "a column alias list on a subquery that selects * is not supported".into(),
+        ));
+    }
+    if names.len() > columns.len() {
+        return Err(ParseError::ParseError(format!(
+            "table has {} columns available but {} columns specified",
+            columns.len(),
+            names.len()
+        )));
+    }
+    for (column, name) in columns.iter_mut().zip(names) {
+        if let ast::ResultColumn::Expr(_, alias) = column {
+            *alias = Some(ast::As::Elided(ast::Name::from_string(name)));
+        }
+    }
+    Ok(())
+}
+
 fn join_keeps_unmatched_right_rows(join: &ast::JoinedSelectTable) -> bool {
     matches!(
         join.operator,
@@ -5684,6 +5777,33 @@ fn drop_object_type_name(obj_type: pg_query::protobuf::ObjectType) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn from_column_alias_lists_rename_columns() {
+        let translate = |sql: &str| {
+            PostgreSQLTranslator::new()
+                .translate(&crate::parse(sql).unwrap())
+                .map(|stmt| stmt.to_string())
+        };
+        let sql = translate("SELECT s.p, s.q FROM (SELECT 1, 2) AS s(p, q)").unwrap();
+        assert!(sql.contains("1 p") && sql.contains("2 q"), "{sql}");
+        let sql = translate("SELECT g.n FROM generate_series(1, 3) AS g(n)").unwrap();
+        assert!(sql.contains("value n"), "{sql}");
+        for (sql, needle) in [
+            ("SELECT * FROM (SELECT * FROM t) AS s(a, b)", "selects *"),
+            (
+                "SELECT * FROM (VALUES (1, 2)) AS v(a, b)",
+                "VALUES subquery",
+            ),
+            (
+                "SELECT * FROM (SELECT 1) AS s(a, b)",
+                "1 columns available but 2",
+            ),
+        ] {
+            let err = translate(sql).unwrap_err().to_string();
+            assert!(err.contains(needle), "{sql}: {err}");
+        }
+    }
 
     #[test]
     fn test_type_mapping() {
