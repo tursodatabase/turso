@@ -220,6 +220,7 @@ fn prepare_statement(pg_conn: &Arc<PgConnectionInner>, sql: &str) -> Result<Stat
         .translate_with_prereqs(&parse_result)
         .map_err(|e| LimboError::ParseError(e.to_string()))?;
     reject_catalog_dml(translated.cmd.stmt())?;
+    reject_schema_marker_names(translated.cmd.stmt())?;
 
     for prereq in translated.prereqs {
         let input = prereq.to_string();
@@ -365,6 +366,42 @@ fn reject_catalog_dml(stmt: &ast::Stmt) -> Result<()> {
     Err(LimboError::ParseError(format!(
         "cannot {verb} pg_catalog table \"{table_name}\""
     )))
+}
+
+/// A table of public named like a schema marker would be taken for one, so
+/// no statement may create, rename into or drop such a table.
+fn reject_schema_marker_names(stmt: &ast::Stmt) -> Result<()> {
+    let (verb, table_name) = match stmt {
+        ast::Stmt::CreateTable { tbl_name, .. } => ("create", tbl_name),
+        ast::Stmt::DropTable { tbl_name, .. } => ("drop", tbl_name),
+        ast::Stmt::AlterTable(alter) => match &alter.body {
+            ast::AlterTableBody::RenameTo(new_name) => {
+                let new_name = ast::QualifiedName {
+                    namespace: alter.name.namespace.clone(),
+                    name: new_name.clone(),
+                    alias: None,
+                };
+                return reject_schema_marker_name("rename a table to", &new_name);
+            }
+            _ => return Ok(()),
+        },
+        _ => return Ok(()),
+    };
+    reject_schema_marker_name(verb, table_name)
+}
+
+fn reject_schema_marker_name(verb: &str, table_name: &ast::QualifiedName) -> Result<()> {
+    let in_public = table_name
+        .namespace
+        .as_ref()
+        .is_none_or(|namespace| namespace.as_str().eq_ignore_ascii_case("main"));
+    let name = table_name.name.as_str();
+    if in_public && name.to_ascii_lowercase().starts_with(SCHEMA_MARKER_PREFIX) {
+        return Err(LimboError::ParseError(format!(
+            "cannot {verb} \"{name}\": the prefix \"{SCHEMA_MARKER_PREFIX}\" is reserved for schema markers"
+        )));
+    }
+    Ok(())
 }
 
 fn reject_sqlite_catalog_access(sql: &str) -> Result<()> {

@@ -248,3 +248,29 @@ expect {
     1
     0
 }
+
+@skip-if postgres "Turso marks each schema with a table named pg_turso_schema_<schema>; PostgreSQL has no such tables"
+test table-named-like-a-schema-marker-errors {
+    CREATE TABLE pg_turso_schema_foo (x int);
+}
+expect error {
+    reserved for schema markers
+}
+
+@skip-if postgres "Turso marks each schema with a table named pg_turso_schema_<schema>; PostgreSQL has no such tables"
+test rename-to-a-schema-marker-name-errors {
+    CREATE TABLE t (x int);
+    ALTER TABLE t RENAME TO pg_turso_schema_foo;
+}
+expect error {
+    reserved for schema markers
+}
+
+@skip-if postgres "Turso marks each schema with a table named pg_turso_schema_<schema>; PostgreSQL has no such tables"
+test drop-of-a-schema-marker-table-errors {
+    CREATE SCHEMA app;
+    DROP TABLE pg_turso_schema_app;
+}
+expect error {
+    reserved for schema markers
+}
