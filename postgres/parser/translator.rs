@@ -1830,6 +1830,17 @@ impl PostgreSQLTranslator {
             return Err(not_supported("SELECT ... FOR UPDATE / FOR SHARE"));
         }
 
+        // Only a plain SELECT carries its WITH clause through translation; a
+        // set operation or bare VALUES would silently drop it.
+        if select.with_clause.is_some()
+            && (!matches!(
+                select.op(),
+                SetOperation::SetopNone | SetOperation::Undefined
+            ) || (!select.values_lists.is_empty() && select.target_list.is_empty()))
+        {
+            return Err(not_supported("WITH on a set operation or VALUES"));
+        }
+
         // Check if this is a UNION/INTERSECT/EXCEPT (set operation)
         let set_op = select.op();
         if set_op != SetOperation::SetopNone && set_op != SetOperation::Undefined {
@@ -10291,5 +10302,18 @@ mod tests {
         assert_not_supported("INSERT INTO otherdb.public.t VALUES (1)", "cross-database");
         assert_not_supported("CREATE TABLE otherdb.public.t (a int)", "cross-database");
         assert_not_supported("CREATE INDEX i ON otherdb.public.t (a)", "cross-database");
+    }
+
+    #[test]
+    fn fail_closed_with_on_set_operations() {
+        assert_not_supported(
+            "WITH c AS (SELECT 1 AS x) SELECT x FROM c UNION SELECT 2",
+            "WITH on a set operation or VALUES",
+        );
+        assert_not_supported(
+            "WITH c AS (SELECT 1 AS x) VALUES ((SELECT x FROM c))",
+            "WITH on a set operation or VALUES",
+        );
+        assert_translates("WITH c AS (SELECT 1 AS x) SELECT x FROM c");
     }
 }
