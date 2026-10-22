@@ -345,3 +345,14 @@ test fk-drop-child-then-parent {
 expect {
     1
 }
+
+test fk-self-referencing-drop-and-delete {
+    CREATE TABLE fks_t (id int PRIMARY KEY, parent int REFERENCES fks_t (id));
+    INSERT INTO fks_t VALUES (1, NULL), (2, 1), (3, 2);
+    DELETE FROM fks_t;
+    SELECT count(*) FROM fks_t;
+    DROP TABLE fks_t;
+}
+expect {
+    0
+}
