@@ -3021,6 +3021,20 @@ impl PostgreSQLTranslator {
             }
             Some(pg_query::protobuf::node::Node::SqlvalueFunction(svf)) => {
                 use pg_query::protobuf::SqlValueFunctionOp;
+                // CURRENT_TIMESTAMP(p) and friends: the engine produces
+                // whole seconds, which only matches a requested precision of 0.
+                if matches!(
+                    SqlValueFunctionOp::try_from(svf.op),
+                    Ok(SqlValueFunctionOp::SvfopCurrentTimeN
+                        | SqlValueFunctionOp::SvfopCurrentTimestampN
+                        | SqlValueFunctionOp::SvfopLocaltimeN
+                        | SqlValueFunctionOp::SvfopLocaltimestampN)
+                ) && svf.typmod != 0
+                {
+                    return Err(not_supported(
+                        "a fractional-second precision on CURRENT_TIME/CURRENT_TIMESTAMP/LOCALTIME/LOCALTIMESTAMP",
+                    ));
+                }
                 match SqlValueFunctionOp::try_from(svf.op) {
                     Ok(SqlValueFunctionOp::SvfopCurrentDate) => {
                         Ok(ast::Expr::Literal(ast::Literal::CurrentDate))
@@ -9705,5 +9719,12 @@ mod tests {
         );
         assert_not_supported("SELECT now()::timestamp(0)", "type modifiers in a cast");
         assert_translates("SELECT '1.5'::numeric, 'a'::varchar, 1::int[]");
+    }
+
+    #[test]
+    fn fail_closed_current_timestamp_precision() {
+        assert_not_supported("SELECT CURRENT_TIMESTAMP(3)", "fractional-second precision");
+        assert_not_supported("SELECT LOCALTIME(6)", "fractional-second precision");
+        assert_translates("SELECT CURRENT_TIMESTAMP(0), CURRENT_TIMESTAMP, LOCALTIMESTAMP");
     }
 }
