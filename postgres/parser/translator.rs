@@ -385,23 +385,22 @@ impl PostgreSQLTranslator {
                             });
                         }
                         ConstrType::ConstrForeign => {
-                            if let Some(fk) = extract_foreign_key(constraint) {
-                                table_constraints.push(
-                                    self.pg_fk_to_table_constraint(&fk, &constraint.fk_attrs),
-                                );
-                            }
+                            let fk = extract_foreign_key(constraint)?;
+                            table_constraints
+                                .push(self.pg_fk_to_table_constraint(&fk, &constraint.fk_attrs)?);
                         }
                         ConstrType::ConstrCheck => {
-                            if let Some(ref raw_expr) = constraint.raw_expr {
-                                let expr = self.translate_expr(raw_expr)?;
-                                table_constraints.push(ast::NamedTableConstraint {
-                                    name: None,
-                                    constraint: ast::TableConstraint::Check {
-                                        expr: Box::new(expr),
-                                        source: None,
-                                    },
-                                });
-                            }
+                            let raw_expr = constraint.raw_expr.as_ref().ok_or_else(|| {
+                                ParseError::ParseError("CHECK constraint missing expression".into())
+                            })?;
+                            let expr = self.translate_expr(raw_expr)?;
+                            table_constraints.push(ast::NamedTableConstraint {
+                                name: None,
+                                constraint: ast::TableConstraint::Check {
+                                    expr: Box::new(expr),
+                                    source: None,
+                                },
+                            });
                         }
                         other => {
                             return Err(not_supported(format!(
@@ -507,7 +506,9 @@ impl PostgreSQLTranslator {
 
         for constraint_node in &col_def.constraints {
             let Some(Node::Constraint(constraint)) = &constraint_node.node else {
-                continue;
+                return Err(ParseError::ParseError(
+                    "unexpected column constraint node".into(),
+                ));
             };
             reject_constraint_attributes(constraint, table_schema)?;
             let contype = ConstrType::try_from(constraint.contype).unwrap_or(ConstrType::Undefined);
@@ -516,30 +517,32 @@ impl PostgreSQLTranslator {
                 ConstrType::ConstrNotnull => is_not_null = true,
                 ConstrType::ConstrUnique => is_unique = true,
                 ConstrType::ConstrDefault => {
-                    if let Some(ref raw_expr) = constraint.raw_expr {
-                        default_expr = Some(self.translate_expr(raw_expr)?);
-                    }
+                    let raw_expr = constraint.raw_expr.as_ref().ok_or_else(|| {
+                        ParseError::ParseError("DEFAULT missing expression".into())
+                    })?;
+                    default_expr = Some(self.translate_expr(raw_expr)?);
                 }
                 ConstrType::ConstrCheck => {
-                    if let Some(ref raw_expr) = constraint.raw_expr {
-                        check_constraints.push(ast::NamedColumnConstraint {
-                            name: if constraint.conname.is_empty() {
-                                None
-                            } else {
-                                Some(ast::Name::from_string(constraint.conname.clone()))
-                            },
-                            constraint: ast::ColumnConstraint::Check {
-                                expr: Box::new(self.translate_expr(raw_expr)?),
-                                source: None,
-                            },
-                        });
-                    }
+                    let raw_expr = constraint.raw_expr.as_ref().ok_or_else(|| {
+                        ParseError::ParseError("CHECK constraint missing expression".into())
+                    })?;
+                    check_constraints.push(ast::NamedColumnConstraint {
+                        name: if constraint.conname.is_empty() {
+                            None
+                        } else {
+                            Some(ast::Name::from_string(constraint.conname.clone()))
+                        },
+                        constraint: ast::ColumnConstraint::Check {
+                            expr: Box::new(self.translate_expr(raw_expr)?),
+                            source: None,
+                        },
+                    });
                 }
                 ConstrType::ConstrForeign => {
                     if foreign_key.is_some() {
                         return Err(not_supported("multiple REFERENCES on one column"));
                     }
-                    foreign_key = extract_foreign_key(constraint);
+                    foreign_key = Some(extract_foreign_key(constraint)?);
                 }
                 // NULL, NOT DEFERRABLE and INITIALLY IMMEDIATE restate the defaults.
                 ConstrType::ConstrNull
@@ -695,29 +698,24 @@ impl PostgreSQLTranslator {
         &self,
         fk: &PgForeignKey,
         fk_attr_nodes: &[pg_query::protobuf::Node],
-    ) -> ast::NamedTableConstraint {
-        use pg_query::protobuf::node::Node;
-
-        let columns: Vec<ast::IndexedColumn> = fk_attr_nodes
-            .iter()
-            .filter_map(|n| match &n.node {
-                Some(Node::String(s)) => Some(ast::IndexedColumn {
-                    col_name: ast::Name::from_string(s.sval.clone()),
-                    collation_name: None,
-                    order: None,
-                }),
-                _ => None,
+    ) -> Result<ast::NamedTableConstraint, ParseError> {
+        let columns = extract_key_columns(fk_attr_nodes)?
+            .into_iter()
+            .map(|c| ast::IndexedColumn {
+                col_name: ast::Name::from_string(c),
+                collation_name: None,
+                order: None,
             })
             .collect();
 
-        ast::NamedTableConstraint {
+        Ok(ast::NamedTableConstraint {
             name: None,
             constraint: ast::TableConstraint::ForeignKey {
                 columns,
                 clause: self.pg_fk_to_fk_clause(fk),
                 defer_clause: None,
             },
-        }
+        })
     }
 
     fn translate_transaction(
@@ -1016,7 +1014,9 @@ impl PostgreSQLTranslator {
         let mut constraints = Vec::new();
         for constraint_node in &col_def.constraints {
             let Some(Node::Constraint(constraint)) = &constraint_node.node else {
-                continue;
+                return Err(ParseError::ParseError(
+                    "unexpected column constraint node".into(),
+                ));
             };
             reject_constraint_attributes(constraint, table_schema)?;
             let contype = ConstrType::try_from(constraint.contype).unwrap_or(ConstrType::Undefined);
@@ -1031,12 +1031,14 @@ impl PostgreSQLTranslator {
                     conflict_clause: None,
                 }),
                 ConstrType::ConstrUnique => Some(ast::ColumnConstraint::Unique(None)),
-                ConstrType::ConstrDefault => match constraint.raw_expr.as_ref() {
-                    Some(raw_expr) => Some(ast::ColumnConstraint::Default(Box::new(
+                ConstrType::ConstrDefault => {
+                    let raw_expr = constraint.raw_expr.as_ref().ok_or_else(|| {
+                        ParseError::ParseError("DEFAULT missing expression".into())
+                    })?;
+                    Some(ast::ColumnConstraint::Default(Box::new(
                         self.translate_expr(raw_expr)?,
-                    ))),
-                    None => None,
-                },
+                    )))
+                }
                 ConstrType::ConstrNull
                 | ConstrType::ConstrAttrNotDeferrable
                 | ConstrType::ConstrAttrImmediate => None,
@@ -2689,7 +2691,11 @@ impl PostgreSQLTranslator {
             PgJoinType::JoinFull => {
                 ast::JoinType::LEFT | ast::JoinType::RIGHT | ast::JoinType::OUTER
             }
-            _ => ast::JoinType::empty(),
+            other => {
+                return Err(ParseError::ParseError(format!(
+                    "Unsupported join type: {other:?}"
+                )))
+            }
         };
         if join_expr.is_natural {
             jt |= ast::JoinType::NATURAL;
@@ -2702,15 +2708,9 @@ impl PostgreSQLTranslator {
                 self.translate_expr(quals)?,
             )))
         } else if !join_expr.using_clause.is_empty() {
-            let names = join_expr
-                .using_clause
-                .iter()
-                .filter_map(|node| match &node.node {
-                    Some(pg_query::protobuf::node::Node::String(s)) => {
-                        Some(ast::Name::from_string(&s.sval))
-                    }
-                    _ => None,
-                })
+            let names = extract_key_columns(&join_expr.using_clause)?
+                .into_iter()
+                .map(ast::Name::from_string)
                 .collect();
             Some(ast::JoinConstraint::Using(names))
         } else {
@@ -5744,32 +5744,29 @@ fn extract_key_columns(keys: &[pg_query::protobuf::Node]) -> Result<Vec<String>,
 
     let mut cols = Vec::new();
     for key_node in keys {
-        if let Some(Node::String(s)) = &key_node.node {
-            cols.push(s.sval.clone());
-        }
+        let Some(Node::String(s)) = &key_node.node else {
+            return Err(ParseError::ParseError("expected a name".into()));
+        };
+        cols.push(s.sval.clone());
     }
     Ok(cols)
 }
 
 /// Extract a foreign key constraint from a PG Constraint node.
-fn extract_foreign_key(constraint: &pg_query::protobuf::Constraint) -> Option<PgForeignKey> {
-    use pg_query::protobuf::node::Node;
+fn extract_foreign_key(
+    constraint: &pg_query::protobuf::Constraint,
+) -> Result<PgForeignKey, ParseError> {
+    let ref_table = constraint
+        .pktable
+        .as_ref()
+        .ok_or_else(|| ParseError::ParseError("REFERENCES missing table name".into()))?
+        .relname
+        .clone();
+    let ref_columns = extract_key_columns(&constraint.pk_attrs)?;
+    let on_delete = pg_fk_action_to_string(&constraint.fk_del_action)?;
+    let on_update = pg_fk_action_to_string(&constraint.fk_upd_action)?;
 
-    let ref_table = constraint.pktable.as_ref()?.relname.clone();
-
-    let ref_columns: Vec<String> = constraint
-        .pk_attrs
-        .iter()
-        .filter_map(|n| match &n.node {
-            Some(Node::String(s)) => Some(s.sval.clone()),
-            _ => None,
-        })
-        .collect();
-
-    let on_delete = pg_fk_action_to_string(&constraint.fk_del_action);
-    let on_update = pg_fk_action_to_string(&constraint.fk_upd_action);
-
-    Some(PgForeignKey {
+    Ok(PgForeignKey {
         ref_table,
         ref_columns,
         on_delete,
@@ -5779,14 +5776,20 @@ fn extract_foreign_key(constraint: &pg_query::protobuf::Constraint) -> Option<Pg
 
 /// Convert a PG FK action character to a SQL string.
 /// PG uses: 'a' = NO ACTION, 'r' = RESTRICT, 'c' = CASCADE, 'n' = SET NULL, 'd' = SET DEFAULT
-fn pg_fk_action_to_string(action: &str) -> Option<String> {
-    match action {
+fn pg_fk_action_to_string(action: &str) -> Result<Option<String>, ParseError> {
+    Ok(match action {
         "c" => Some("CASCADE".into()),
         "n" => Some("SET NULL".into()),
         "d" => Some("SET DEFAULT".into()),
         "r" => Some("RESTRICT".into()),
-        _ => None, // 'a' (NO ACTION) is default, no need to emit
-    }
+        // 'a' (NO ACTION) is the default, no need to emit
+        "" | "a" => None,
+        other => {
+            return Err(ParseError::ParseError(format!(
+                "unknown foreign key action: {other}"
+            )))
+        }
+    })
 }
 
 /// Represents a parsed SET statement from the PostgreSQL protocol.
