@@ -910,8 +910,6 @@ impl PostgreSQLTranslator {
             .ok_or_else(|| ParseError::ParseError("CREATE INDEX missing table name".into()))?;
         let tbl_name = ast::Name::from_string(self.map_table_name(&relation.relname));
 
-        // SQLite places the index in the schema named on the index, and looks
-        // the table up in that same schema, so carry the table's schema over.
         let idx_name = if relation.schemaname.is_empty() {
             ast::QualifiedName::single(ast::Name::from_string(&idx.idxname))
         } else {

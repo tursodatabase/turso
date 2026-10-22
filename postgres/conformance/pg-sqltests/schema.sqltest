@@ -75,3 +75,15 @@ test create-index-on-schema-qualified-table-indexes-that-table {
 expect {
     2
 }
+
+test create-index-on-schema-qualified-table-constrains-that-table {
+    CREATE SCHEMA IF NOT EXISTS idx_s2;
+    DROP TABLE IF EXISTS idx_s2.t;
+    DROP TABLE IF EXISTS t;
+    CREATE TABLE t (x int);
+    CREATE TABLE idx_s2.t (x int);
+    CREATE UNIQUE INDEX idx_s2_t_x ON idx_s2.t (x);
+    INSERT INTO idx_s2.t VALUES (1);
+    INSERT INTO idx_s2.t VALUES (1);
+}
+expect error {}
