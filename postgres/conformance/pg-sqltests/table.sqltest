@@ -315,3 +315,33 @@ test table-returning-table-name-star-after-alias-rejected {
     INSERT INTO users AS u VALUES (4, 'dave', 40, false) RETURNING users.*;
 }
 expect error {}
+
+test fk-drop-referenced-parent-rejected {
+    CREATE TABLE fkd_p (id int PRIMARY KEY);
+    CREATE TABLE fkd_c (pid int REFERENCES fkd_p (id) ON DELETE CASCADE);
+    DROP TABLE fkd_p;
+}
+expect error {
+}
+
+test fk-truncate-referenced-parent-rejected {
+    CREATE TABLE fkt_p (id int PRIMARY KEY);
+    CREATE TABLE fkt_c (pid int REFERENCES fkt_p (id) ON DELETE CASCADE);
+    TRUNCATE fkt_p;
+}
+expect error {
+}
+
+test fk-drop-child-then-parent {
+    CREATE TABLE fkdc_p (id int PRIMARY KEY);
+    CREATE TABLE fkdc_c (pid int REFERENCES fkdc_p (id));
+    INSERT INTO fkdc_p VALUES (1);
+    INSERT INTO fkdc_c VALUES (1);
+    TRUNCATE fkdc_c;
+    DROP TABLE fkdc_c;
+    DROP TABLE fkdc_p;
+    SELECT 1;
+}
+expect {
+    1
+}
