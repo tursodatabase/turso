@@ -5827,15 +5827,10 @@ pub fn try_extract_set(parse_result: &ParseResult) -> Option<PgSetStmt> {
     })
 }
 
-/// Extracted SET TRANSACTION statement. `read_only` is the access mode it
-/// sets, None when it sets none.
 pub struct PgSetTransactionStmt {
     pub read_only: Option<bool>,
 }
 
-/// Try to extract a SET TRANSACTION statement from a PG parse result.
-/// Returns None if the statement is not a SET TRANSACTION, and an error if
-/// it sets a mode that Turso does not have.
 pub fn try_extract_set_transaction(
     parse_result: &ParseResult,
 ) -> Result<Option<PgSetTransactionStmt>, ParseError> {
@@ -5854,8 +5849,6 @@ pub fn try_extract_set_transaction(
     }
 }
 
-/// Whether the statement is BEGIN or START TRANSACTION with READ ONLY as its
-/// final access mode.
 pub fn is_begin_read_only(parse_result: &ParseResult) -> bool {
     use pg_query::{protobuf::TransactionStmtKind, NodeRef};
 
@@ -5870,15 +5863,6 @@ pub fn is_begin_read_only(parse_result: &ParseResult) -> bool {
     }
 }
 
-/// The access mode that the transaction modes of BEGIN, START TRANSACTION
-/// or SET TRANSACTION set: Some(true) for READ ONLY, Some(false) for READ
-/// WRITE, None when they set none. The last one wins, like PostgreSQL.
-///
-/// Turso has no isolation levels: every transaction reads one snapshot
-/// taken at its start. That is PostgreSQL's REPEATABLE READ. It is not
-/// SERIALIZABLE (MVCC allows write skew), and it is not READ COMMITTED
-/// (no per-statement snapshots), so only REPEATABLE READ is accepted.
-/// DEFERRABLE only applies to SERIALIZABLE, so it is rejected with it.
 fn transaction_read_only(options: &[pg_query::protobuf::Node]) -> Result<Option<bool>, ParseError> {
     use pg_query::protobuf::{a_const::Val, node::Node, AConst};
 
@@ -5905,7 +5889,6 @@ fn transaction_read_only(options: &[pg_query::protobuf::Node]) -> Result<Option<
                     )));
                 }
             }
-            // pg_query encodes NOT DEFERRABLE as integer 0.
             "transaction_deferrable" => match arg {
                 Some(Node::AConst(AConst {
                     val: Some(Val::Ival(i)),
@@ -5913,7 +5896,6 @@ fn transaction_read_only(options: &[pg_query::protobuf::Node]) -> Result<Option<
                 })) if i.ival == 0 => {}
                 _ => return Err(not_supported("a DEFERRABLE transaction")),
             },
-            // pg_query encodes READ WRITE as integer 0 and READ ONLY as 1.
             "transaction_read_only" => match arg {
                 Some(Node::AConst(AConst {
                     val: Some(Val::Ival(i)),

@@ -36,21 +36,10 @@ struct SessionState {
     transaction: TransactionState,
 }
 
-/// What the current transaction block has done that PostgreSQL's
-/// transaction access mode rules depend on. Reset before each statement that
-/// is prepared while the connection is in autocommit mode, so it never
-/// outlives the transaction, however that ends.
 #[derive(Default, PartialEq)]
 struct TransactionState {
-    /// READ ONLY: mirrored into the connection's query_only flag, which
-    /// makes core reject writes when it prepares them.
     read_only: bool,
-    /// A statement other than transaction control and SET has run. READ
-    /// WRITE must come before that.
     queried: bool,
-    /// A SAVEPOINT has run. PostgreSQL undoes an access mode set inside a
-    /// savepoint when the savepoint is released or rolled back to, which is
-    /// not tracked, so the access mode cannot change after a SAVEPOINT.
     savepoint: bool,
 }
 
@@ -240,8 +229,6 @@ fn prepare_statement(pg_conn: &Arc<PgConnectionInner>, sql: &str) -> Result<Stat
 
     let is_transaction_control = is_transaction_control(translated.cmd.stmt());
     let stmt = pg_conn.conn.prepare_translated_cmd(translated.cmd, &sql)?;
-    // query_only only covers statements that core classifies as writes by
-    // their kind. A SELECT can write too, e.g. SELECT nextval('s').
     if read_only
         && !is_transaction_control
         && (&stmt.get_program().prepared().write_databases)
@@ -277,11 +264,6 @@ fn set_read_only(conn: &Connection, transaction: &mut TransactionState, read_onl
     }
 }
 
-/// Records what `stmt`, which is about to be prepared, does to the state of
-/// the transaction block, and returns whether the transaction is read-only.
-/// BEGIN READ ONLY makes it read-only right away: the next statement is
-/// prepared after BEGIN has run, and if BEGIN never runs, the connection is
-/// still in autocommit mode then, which resets the state.
 fn record_transaction_statement(
     conn: &Connection,
     parse_result: &turso_pg_parser::ParseResult,
@@ -317,11 +299,7 @@ fn is_transaction_control(stmt: &ast::Stmt) -> bool {
     )
 }
 
-/// Runs SET TRANSACTION READ ONLY or READ WRITE, which is a call to
-/// pg_set_transaction_read_only so that it takes effect when it runs, not
-/// when it is prepared.
 pub(crate) fn set_transaction_read_only(conn: &Connection, read_only: bool) -> Result<Value> {
-    // PostgreSQL only warns about SET TRANSACTION outside a transaction block.
     if conn.get_auto_commit() {
         return Ok(Value::from_i64(0));
     }
