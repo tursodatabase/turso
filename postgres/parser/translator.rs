@@ -271,6 +271,8 @@ impl PostgreSQLTranslator {
 
         let tbl_name = self.qualified_name_from_range_var(relation);
 
+        reject_temporary(relation, "CREATE TEMPORARY TABLE")?;
+
         if create.table_elts.is_empty() {
             return Err(ParseError::ParseError(
                 "CREATE TABLE with no columns is not yet supported".into(),
@@ -5931,6 +5933,15 @@ fn constr_type_name(contype: pg_query::protobuf::ConstrType) -> String {
     }
 }
 
+/// Rejects `TEMP`/`TEMPORARY` relations: the translator would otherwise
+/// create a permanent, globally visible object.
+fn reject_temporary(relation: &pg_query::protobuf::RangeVar, what: &str) -> Result<(), ParseError> {
+    if relation.relpersistence == "t" {
+        return Err(not_supported(what));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -8712,5 +8723,13 @@ mod tests {
         );
         assert_not_supported("CREATE TABLE t (LIKE other)", "LIKE");
         assert_not_supported("CREATE TABLE t (a int, LIKE other INCLUDING ALL)", "LIKE");
+    }
+
+    #[test]
+    fn fail_closed_temporary_table() {
+        assert_not_supported("CREATE TEMP TABLE t (a int)", "TEMPORARY");
+        assert_not_supported("CREATE TEMPORARY TABLE t (a int)", "TEMPORARY");
+        // UNLOGGED only weakens durability, so a logged table is a safe substitute.
+        assert_translates("CREATE UNLOGGED TABLE t (a int)");
     }
 }
