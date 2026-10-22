@@ -77,6 +77,57 @@ expect {
     1|2
 }
 
+test subquery-column-alias-list-renames-columns {
+    SELECT s.p + s.q FROM (SELECT 1 AS a, 2 AS b) AS s(p, q);
+}
+expect {
+    3
+}
+
+test values-subquery-column-alias-list {
+    SELECT v.b, v.a FROM (VALUES (1, 2), (3, 4)) AS v(a, b) ORDER BY v.a;
+}
+expect {
+    2|1
+    4|3
+}
+
+test star-subquery-column-alias-list {
+    SELECT s.y FROM (SELECT * FROM (VALUES (1, 2)) AS t(a, b)) AS s(x, y);
+}
+expect {
+    2
+}
+
+test subquery-column-alias-list-keeps-inner-order-by {
+    SELECT s.b FROM (SELECT a, b FROM (VALUES (1, 9), (2, 3)) AS t(a, b) ORDER BY b LIMIT 1) AS s(b, a);
+}
+expect {
+    2
+}
+
+test partial-column-alias-list-keeps-remaining-names {
+    SELECT s.x, s.b FROM (SELECT 1 AS a, 2 AS b) AS s(x);
+    SELECT v.x, v.column2 FROM (VALUES (3, 4)) AS v(x);
+}
+expect {
+    1|2
+    3|4
+}
+
+test column-alias-list-longer-than-subquery-errors {
+    SELECT * FROM (SELECT 1, 2) AS s(a, b, c);
+}
+expect error {
+}
+
+test generate-series-column-alias-list-renames-column {
+    SELECT sum(g.n) FROM generate_series(1, 3) AS g(n);
+}
+expect {
+    6
+}
+
 test select-null-renders-empty {
     SELECT NULL;
 }

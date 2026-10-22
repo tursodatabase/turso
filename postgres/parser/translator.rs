@@ -1905,7 +1905,10 @@ impl PostgreSQLTranslator {
                 ));
             }
         };
-        let select = self.translate_select(select_stmt)?;
+        let mut select = self.translate_select(select_stmt)?;
+        if let Some(alias) = &range_sub.alias {
+            rename_result_columns(&mut select, &alias.aliasname, alias_column_names(alias)?)?;
+        }
         let alias = range_sub
             .alias
             .as_ref()
@@ -2062,32 +2065,7 @@ impl PostgreSQLTranslator {
                 None => "unnest".into(),
             };
             return Ok(ast::SelectTable::Select {
-                select: ast::Select {
-                    with: None,
-                    body: ast::SelectBody {
-                        select: ast::OneSelect::Select {
-                            distinctness: None,
-                            columns: vec![ast::ResultColumn::Expr(
-                                Box::new(ast::Expr::Id(ast::Name::from_string("unnest"))),
-                                Some(ast::As::Elided(ast::Name::from_string(column_name))),
-                            )],
-                            from: Some(ast::FromClause {
-                                select: Box::new(ast::SelectTable::TableCall(
-                                    qualified_name,
-                                    args,
-                                    None,
-                                )),
-                                joins: vec![],
-                            }),
-                            where_clause: None,
-                            group_by: None,
-                            window_clause: vec![],
-                        },
-                        compounds: vec![],
-                    },
-                    order_by: vec![],
-                    limit: None,
-                },
+                select: single_column_function_select(qualified_name, args, "unnest", column_name),
                 alias,
                 lateral: true,
             });
@@ -2097,6 +2075,30 @@ impl PostgreSQLTranslator {
             "json_to_record" | "json_to_recordset" | "jsonb_to_record" | "jsonb_to_recordset"
         ) {
             return self.translate_json_to_record(func_name, range_func, &args, alias);
+        }
+        if func_name == "generate_series" {
+            if let Some(range_alias) = &range_func.alias {
+                let names = alias_column_names(range_alias)?;
+                if names.len() > 1 {
+                    return Err(ParseError::ParseError(format!(
+                        "table \"{}\" has 1 columns available but {} columns specified",
+                        range_alias.aliasname,
+                        names.len()
+                    )));
+                }
+                if let Some(column_name) = names.into_iter().next() {
+                    return Ok(ast::SelectTable::Select {
+                        select: single_column_function_select(
+                            qualified_name,
+                            args,
+                            "value",
+                            column_name,
+                        ),
+                        alias,
+                        lateral: true,
+                    });
+                }
+            }
         }
         Ok(ast::SelectTable::TableCall(qualified_name, args, alias))
     }
@@ -4471,6 +4473,165 @@ impl PostgreSQLTranslator {
     }
 }
 
+#[allow(clippy::vec_box)]
+fn single_column_function_select(
+    function: ast::QualifiedName,
+    args: Vec<Box<ast::Expr>>,
+    source_column: &str,
+    column_name: String,
+) -> ast::Select {
+    ast::Select {
+        with: None,
+        body: ast::SelectBody {
+            select: ast::OneSelect::Select {
+                distinctness: None,
+                columns: vec![ast::ResultColumn::Expr(
+                    Box::new(ast::Expr::Id(ast::Name::from_string(source_column))),
+                    Some(ast::As::Elided(ast::Name::from_string(column_name))),
+                )],
+                from: Some(ast::FromClause {
+                    select: Box::new(ast::SelectTable::TableCall(function, args, None)),
+                    joins: vec![],
+                }),
+                where_clause: None,
+                group_by: None,
+                window_clause: vec![],
+            },
+            compounds: vec![],
+        },
+        order_by: vec![],
+        limit: None,
+    }
+}
+
+fn alias_column_names(alias: &pg_query::protobuf::Alias) -> Result<Vec<String>, ParseError> {
+    alias
+        .colnames
+        .iter()
+        .map(|n| match &n.node {
+            Some(pg_query::protobuf::node::Node::String(s)) => Ok(s.sval.clone()),
+            _ => Err(ParseError::ParseError("invalid column alias".into())),
+        })
+        .collect()
+}
+
+fn rename_result_columns(
+    select: &mut ast::Select,
+    alias: &str,
+    mut names: Vec<String>,
+) -> Result<(), ParseError> {
+    if names.is_empty() {
+        return Ok(());
+    }
+    if let Some(columns) = result_column_names(select) {
+        if names.len() > columns.len() {
+            return Err(ParseError::ParseError(format!(
+                "table \"{alias}\" has {} columns available but {} columns specified",
+                columns.len(),
+                names.len()
+            )));
+        }
+        for column in columns.into_iter().skip(names.len()) {
+            names.push(column.ok_or_else(|| {
+                ParseError::ParseError(
+                    "a column alias list shorter than the subquery's unnamed columns is not supported"
+                        .into(),
+                )
+            })?);
+        }
+    }
+    let words: Vec<String> = select
+        .to_string()
+        .split(|c: char| !c.is_alphanumeric() && c != '_')
+        .map(str::to_lowercase)
+        .collect();
+    let cte_name = std::iter::once(alias.to_string())
+        .chain((0..).map(|i| format!("__column_alias_list_{i}")))
+        .find(|name| !words.contains(&name.to_lowercase()))
+        .expect("an unused name exists");
+    let inner = std::mem::replace(
+        select,
+        ast::Select {
+            with: None,
+            body: ast::SelectBody {
+                select: ast::OneSelect::Values(vec![]),
+                compounds: vec![],
+            },
+            order_by: vec![],
+            limit: None,
+        },
+    );
+    *select = ast::Select {
+        with: Some(ast::With {
+            recursive: false,
+            ctes: vec![ast::CommonTableExpr {
+                tbl_name: ast::Name::from_string(&cte_name),
+                columns: names
+                    .iter()
+                    .map(|name| ast::IndexedColumn {
+                        col_name: ast::Name::from_string(name),
+                        collation_name: None,
+                        order: None,
+                    })
+                    .collect(),
+                materialized: ast::Materialized::Any,
+                select: inner,
+            }],
+        }),
+        body: ast::SelectBody {
+            select: ast::OneSelect::Select {
+                distinctness: None,
+                columns: vec![ast::ResultColumn::Star],
+                from: Some(ast::FromClause {
+                    select: Box::new(ast::SelectTable::Table(
+                        ast::QualifiedName::single(ast::Name::from_string(&cte_name)),
+                        None,
+                        None,
+                    )),
+                    joins: vec![],
+                }),
+                where_clause: None,
+                group_by: None,
+                window_clause: vec![],
+            },
+            compounds: vec![],
+        },
+        order_by: vec![],
+        limit: None,
+    };
+    Ok(())
+}
+
+fn result_column_names(select: &ast::Select) -> Option<Vec<Option<String>>> {
+    match &select.body.select {
+        ast::OneSelect::Values(rows) => Some(
+            (1..=rows.first()?.len())
+                .map(|i| Some(format!("column{i}")))
+                .collect(),
+        ),
+        ast::OneSelect::Select { columns, .. } => columns
+            .iter()
+            .map(|column| match column {
+                ast::ResultColumn::Expr(
+                    _,
+                    Some(
+                        ast::As::As(name)
+                        | ast::As::Elided(name)
+                        | ast::As::ImplicitColumnName(name),
+                    ),
+                ) => Some(Some(name.as_str().to_string())),
+                ast::ResultColumn::Expr(expr, None) => Some(match expr.as_ref() {
+                    ast::Expr::Id(name) | ast::Expr::Qualified(_, name) => {
+                        Some(name.as_str().to_string())
+                    }
+                    _ => None,
+                }),
+                _ => None,
+            })
+            .collect(),
+    }
+}
+
 fn join_keeps_unmatched_right_rows(join: &ast::JoinedSelectTable) -> bool {
     matches!(
         join.operator,
@@ -5914,6 +6075,47 @@ fn drop_object_type_name(obj_type: pg_query::protobuf::ObjectType) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn from_column_alias_lists_rename_columns() {
+        let translate = |sql: &str| {
+            PostgreSQLTranslator::new()
+                .translate(&crate::parse(sql).unwrap())
+                .map(|stmt| stmt.to_string())
+        };
+        for (sql, expected) in [
+            (
+                "SELECT * FROM (SELECT 1, 2) AS s(p, q)",
+                "SELECT * FROM (WITH s (p, q) AS (SELECT 1, 2) SELECT * FROM s) s",
+            ),
+            (
+                "SELECT * FROM (VALUES (1, 2)) AS v(a)",
+                "SELECT * FROM (WITH v (a, column2) AS (VALUES (1, 2)) SELECT * FROM v) v",
+            ),
+            (
+                "SELECT * FROM (SELECT * FROM v) AS v(a)",
+                "SELECT * FROM (WITH __column_alias_list_0 (a) AS (SELECT * FROM v) SELECT * FROM __column_alias_list_0) v",
+            ),
+            (
+                "SELECT g.n FROM generate_series(1, 3) AS g(n)",
+                "SELECT g.n FROM LATERAL (SELECT value n FROM generate_series (1, 3)) g",
+            ),
+        ] {
+            assert_eq!(translate(sql).unwrap(), expected, "{sql}");
+        }
+        for (sql, error) in [
+            (
+                "SELECT * FROM (SELECT 1) AS s(a, b)",
+                "table \"s\" has 1 columns available but 2 columns specified",
+            ),
+            (
+                "SELECT * FROM generate_series(1, 3) AS g(a, b)",
+                "table \"g\" has 1 columns available but 2 columns specified",
+            ),
+        ] {
+            assert_eq!(translate(sql).unwrap_err().to_string(), error, "{sql}");
+        }
+    }
 
     #[test]
     fn test_type_mapping() {
