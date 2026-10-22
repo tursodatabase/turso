@@ -71,7 +71,7 @@ fn create_table_then_select() {
 #[test]
 fn repl_reports_errors_like_psql() {
     let output = run_tursopg(
-        b"CREATE TABLE t (id INT PRIMARY KEY);\nINSERT INTO t VALUES (1);\nINSERT INTO t VALUES (1);\n",
+        b"CREATE TABLE t (id INT PRIMARY KEY);\nINSERT INTO t VALUES (1);\nINSERT INTO t VALUES (1);\nSELECT 1/0;\n",
     );
     let out = stdout(&output);
     assert!(
@@ -81,6 +81,10 @@ fn repl_reports_errors_like_psql() {
     assert!(
         out.contains("DETAIL:  Key (id)=(1) already exists."),
         "expected DETAIL line, got: {out}"
+    );
+    assert!(
+        out.contains("ERROR:  division by zero"),
+        "expected psql-style division by zero, got: {out}"
     );
 }
 
@@ -2158,6 +2162,32 @@ fn wire_error_nested_begin() {
             "SQLSTATE must be 25001 for nested BEGIN, got: {fields:?}"
         );
         c.query_command_tags("ROLLBACK");
+    });
+}
+
+/// PostgreSQL raises SQLSTATE 22012 (division_by_zero) for `SELECT 1/0`.
+/// Turso's postgres mode matches this behavior.
+#[test]
+fn wire_error_division_by_zero() {
+    with_pg_client(|c| {
+        let fields = c.query_error_fields("SELECT 1/0");
+        assert_eq!(
+            fields.get(&b'C').map(String::as_str),
+            Some("22012"),
+            "division by zero must be SQLSTATE 22012, got: {fields:?}"
+        );
+    });
+}
+
+/// `SELECT NULL / 0` returns NULL (not an error) in both PostgreSQL and Turso.
+#[test]
+fn null_divided_by_zero_is_null() {
+    with_pg_client(|c| {
+        let fields = c.query_error_fields("SELECT NULL / 0");
+        assert!(
+            fields.is_empty(),
+            "NULL / 0 should return NULL (no error), got: {fields:?}"
+        );
     });
 }
 

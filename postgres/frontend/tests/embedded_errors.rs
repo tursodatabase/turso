@@ -264,6 +264,63 @@ fn nested_begin_reports_active_sql_transaction() {
 }
 
 #[test]
+fn division_by_zero_raises_22012() {
+    let (_io, conn) = pg_connection();
+    for sql in [
+        "SELECT 1/0",
+        "SELECT 1 % 0",
+        "SELECT 1/0.0",
+        "SELECT 1.5/0",
+        "SELECT mod(1, 0)",
+        "SELECT mod(1.5, 0.0)",
+    ] {
+        let e = exec_err(&conn, sql);
+        assert!(
+            matches!(e.core_error(), LimboError::DivisionByZero),
+            "expected DivisionByZero for {sql}, got: {e:?}"
+        );
+        assert_eq!(e.sqlstate, "22012");
+        assert_eq!(e.message, "division by zero");
+    }
+}
+
+#[test]
+fn null_divided_by_zero_returns_null() {
+    let (_io, conn) = pg_connection();
+    let mut stmt = conn.prepare("SELECT NULL/0").unwrap();
+    let rows = stmt.run_collect_rows().unwrap();
+    assert_eq!(rows.len(), 1);
+    assert!(matches!(rows[0][0], Value::Null), "got: {:?}", rows[0][0]);
+}
+
+#[test]
+fn quoted_zero_divisors_raise_22012() {
+    let (_io, conn) = pg_connection();
+    for sql in ["SELECT 1 / '0'", "SELECT 1 % '0'", "SELECT 1.5 / '0.0'"] {
+        let e = exec_err(&conn, sql);
+        assert_eq!(e.sqlstate, "22012", "{sql}: {e:?}");
+    }
+}
+
+#[test]
+fn non_numeric_string_divisor_raises_22p02() {
+    let (_io, conn) = pg_connection();
+    for sql in [
+        "SELECT 1 / 'abc'",
+        "SELECT 1 % 'abc'",
+        "SELECT 1 / ''",
+        "SELECT mod(1, 'abc')",
+    ] {
+        let e = exec_err(&conn, sql);
+        assert!(
+            matches!(e.core_error(), LimboError::InvalidTextRepresentation(_)),
+            "expected InvalidTextRepresentation for {sql}, got: {e:?}"
+        );
+        assert_eq!(e.sqlstate, "22P02", "{sql}: {e:?}");
+    }
+}
+
+#[test]
 fn primary_key_update_reports_structured_fields() {
     let (_io, conn) = pg_connection();
     conn.execute("CREATE TABLE t (id INT PRIMARY KEY)").unwrap();
@@ -437,6 +494,29 @@ fn foreign_key_update_reports_structured_fields() {
         stmt.run_collect_rows().unwrap(),
         vec![vec![Value::from_i64(1)]]
     );
+}
+
+#[test]
+fn zero_divisors_raise_postgres_errors() {
+    let (_pg_io, pg) = pg_connection();
+    for sql in [
+        "SELECT 1 / 0",
+        "SELECT 1 % 0",
+        "SELECT 1 / 0.0",
+        "SELECT 1.5 / 0",
+        "SELECT 1 / '0'",
+    ] {
+        let error = exec_err(&pg, sql);
+        assert_eq!(error.sqlstate, "22012", "{sql}");
+    }
+    for sql in ["SELECT NULL / 0", "SELECT NULL % 0"] {
+        let mut stmt = pg.prepare(sql).unwrap();
+        assert_eq!(
+            stmt.run_collect_rows().unwrap(),
+            vec![vec![Value::Null]],
+            "{sql}"
+        );
+    }
 }
 
 #[test]

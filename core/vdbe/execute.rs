@@ -569,7 +569,7 @@ fn integer_operands(state: &ProgramState, lhs: usize, rhs: usize) -> Option<(i64
 }
 
 pub fn op_divide(
-    _program: &Program,
+    program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
     _pager: &Arc<Pager>,
@@ -582,6 +582,7 @@ pub fn op_divide(
         state.pc += 1;
         return Ok(InsnFunctionStepResult::Step);
     }
+    check_divisor(program, state, *lhs, *rhs)?;
     op_arithmetic_slow(state, *lhs, *rhs, *dest, Value::exec_divide)
 }
 
@@ -608,7 +609,7 @@ pub fn op_drop_index(
 }
 
 pub fn op_remainder(
-    _program: &Program,
+    program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
     _pager: &Arc<Pager>,
@@ -621,7 +622,33 @@ pub fn op_remainder(
         state.pc += 1;
         return Ok(InsnFunctionStepResult::Step);
     }
+    check_divisor(program, state, *lhs, *rhs)?;
     op_arithmetic_slow(state, *lhs, *rhs, *dest, Value::exec_remainder)
+}
+
+fn check_divisor(
+    program: &Program,
+    state: &ProgramState,
+    lhs: usize,
+    rhs: usize,
+) -> Result<(), Box<LimboError>> {
+    if !program.connection.db.opts.errors_on_zero_divisor {
+        return Ok(());
+    }
+    if matches!(state.registers[lhs].get_value(), Value::Null) {
+        return Ok(());
+    }
+    let rhs_val = state.registers[rhs].get_value();
+    if let Value::Text(t) = rhs_val {
+        match Numeric::from_value_strict(rhs_val) {
+            None => return Err(LimboError::InvalidTextRepresentation(t.as_str().to_owned()).into()),
+            Some(n) if !n.to_bool() => return Err(LimboError::DivisionByZero.into()),
+            _ => {}
+        }
+    } else if Numeric::from_value(rhs_val).is_some_and(|n| !n.to_bool()) {
+        return Err(LimboError::DivisionByZero.into());
+    }
+    Ok(())
 }
 
 pub fn op_bit_and(
@@ -11854,7 +11881,11 @@ pub fn op_function(
             MathFuncArity::Binary => {
                 let lhs = &state.registers[*start_reg];
                 let rhs = &state.registers[*start_reg + 1];
-                let result = lhs.get_value().exec_math_binary(rhs.get_value(), math_func);
+                let result = lhs.get_value().exec_math_binary(
+                    rhs.get_value(),
+                    math_func,
+                    program.connection.db.opts.errors_on_zero_divisor,
+                )?;
                 state.registers[*dest].set_value(result);
             }
 

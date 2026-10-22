@@ -70,7 +70,7 @@ pub fn open_database_with_io(
         turso_core::OpenOptions::new(Arc::new(PostgresDialect))
             .storage(db_file)
             .flags(flags)
-            .db_opts(opts.with_mvcc(true)),
+            .db_opts(opts.with_mvcc(true).with_errors_on_zero_divisor(true)),
     )
     .map_err(Into::into)
 }

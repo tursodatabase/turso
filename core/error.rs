@@ -110,6 +110,10 @@ pub enum LimboError {
     ExtensionError(String),
     #[error("integer overflow")]
     IntegerOverflow,
+    #[error("division by zero")]
+    DivisionByZero,
+    #[error("invalid input syntax for type numeric: \"{0}\"")]
+    InvalidTextRepresentation(String),
     #[error("string or blob too big")]
     TooBig,
     #[error("database table is locked")]

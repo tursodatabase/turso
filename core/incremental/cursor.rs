@@ -286,6 +286,7 @@ mod tests {
                 enable_mvcc: false,
                 enable_experimental_mvcc_passive_checkpoint: false,
                 unsafe_testing: false,
+                errors_on_zero_divisor: false,
             },
             None,
             Arc::new(SqliteDialect),

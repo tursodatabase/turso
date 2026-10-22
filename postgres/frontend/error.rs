@@ -197,6 +197,7 @@ const SQLSTATE_STRING_DATA_RIGHT_TRUNCATION: &str = "22001";
 const SQLSTATE_NUMERIC_VALUE_OUT_OF_RANGE: &str = "22003";
 const SQLSTATE_NULL_VALUE_NOT_ALLOWED: &str = "22004";
 const SQLSTATE_INVALID_DATETIME_FORMAT: &str = "22007";
+const SQLSTATE_DIVISION_BY_ZERO: &str = "22012";
 const SQLSTATE_INVALID_TEXT_REPRESENTATION: &str = "22P02";
 const SQLSTATE_SEQUENCE_LIMIT_EXCEEDED: &str = "2200H";
 const SQLSTATE_INVALID_TRANSACTION_STATE: &str = "25000";
@@ -230,6 +231,8 @@ fn sqlstate(error: &LimboError) -> &'static str {
         LimboError::SqlError(_) | LimboError::PlanningError(_) => {
             SQLSTATE_SYNTAX_OR_ACCESS_VIOLATION
         }
+        LimboError::DivisionByZero => SQLSTATE_DIVISION_BY_ZERO,
+        LimboError::InvalidTextRepresentation(_) => SQLSTATE_INVALID_TEXT_REPRESENTATION,
         LimboError::IntegerOverflow => SQLSTATE_NUMERIC_VALUE_OUT_OF_RANGE,
         LimboError::TooBig => SQLSTATE_STRING_DATA_RIGHT_TRUNCATION,
         LimboError::InvalidDate(_)
@@ -325,6 +328,7 @@ mod tests {
                 LimboError::InternalError("x".to_string()),
                 SQLSTATE_INTERNAL_ERROR,
             ),
+            (LimboError::DivisionByZero, SQLSTATE_DIVISION_BY_ZERO),
             (
                 LimboError::IntegerOverflow,
                 SQLSTATE_NUMERIC_VALUE_OUT_OF_RANGE,

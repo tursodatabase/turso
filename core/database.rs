@@ -87,6 +87,7 @@ pub struct DatabaseOpts {
     pub enable_experimental_mvcc_passive_checkpoint: bool,
     pub unsafe_testing: bool,
     pub(crate) enable_load_extension: bool,
+    pub errors_on_zero_divisor: bool,
 }
 
 impl DatabaseOpts {
@@ -152,6 +153,11 @@ impl DatabaseOpts {
 
     pub fn with_multiprocess_wal(mut self, enable: bool) -> Self {
         self.enable_multiprocess_wal = enable;
+        self
+    }
+
+    pub fn with_errors_on_zero_divisor(mut self, enable: bool) -> Self {
+        self.errors_on_zero_divisor = enable;
         self
     }
 

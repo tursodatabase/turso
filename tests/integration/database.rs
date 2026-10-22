@@ -458,3 +458,41 @@ fn test_do_open_skips_registry() {
         "open() must still return the registered instance; do_open must not replace it"
     );
 }
+
+/// `DatabaseOpts::with_errors_on_zero_divisor` is plain core behavior, not
+/// tied to any dialect: with the flag a zero divisor raises
+/// `LimboError::DivisionByZero`; without it the SQLite default of returning
+/// NULL is kept. A NULL dividend returns NULL in both modes, matching
+/// PostgreSQL.
+#[test]
+fn test_errors_on_zero_divisor_opt() {
+    use crate::common::TempDatabase;
+    use turso_core::LimboError;
+
+    let raising = TempDatabase::builder()
+        .with_opts(turso_core::DatabaseOpts::new().with_errors_on_zero_divisor(true))
+        .build();
+    let conn = raising.connect_limbo();
+    for sql in ["SELECT 1/0", "SELECT 1 % 0", "SELECT 1/0.0"] {
+        let err = conn.execute(sql).expect_err(sql);
+        assert!(
+            matches!(err, LimboError::DivisionByZero),
+            "{sql}: expected DivisionByZero, got {err:?}"
+        );
+    }
+    let mut stmt = conn.prepare("SELECT NULL/0").unwrap();
+    let rows = stmt.run_collect_rows().unwrap();
+    assert!(matches!(rows[0][0], turso_core::Value::Null));
+
+    let defaulted = TempDatabase::builder().build();
+    let conn = defaulted.connect_limbo();
+    for sql in ["SELECT 1/0", "SELECT 1 % 0", "SELECT 1/0.0"] {
+        let mut stmt = conn.prepare(sql).unwrap();
+        let rows = stmt.run_collect_rows().unwrap();
+        assert!(
+            matches!(rows[0][0], turso_core::Value::Null),
+            "{sql}: default must return NULL, got {:?}",
+            rows[0][0]
+        );
+    }
+}
