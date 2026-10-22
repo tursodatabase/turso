@@ -4733,6 +4733,7 @@ impl PostgreSQLTranslator {
             .as_ref()
             .ok_or_else(|| ParseError::ParseError("CREATE SEQUENCE missing name".into()))?;
         let seq_name = self.qualified_name_from_range_var(relation);
+        reject_temporary(relation, "CREATE TEMPORARY SEQUENCE")?;
 
         let mut start = None;
         let mut increment = None;
@@ -4743,6 +4744,20 @@ impl PostgreSQLTranslator {
         let mut as_type = None;
         for opt_node in &seq.options {
             if let Some(pg_query::protobuf::node::Node::DefElem(elem)) = &opt_node.node {
+                // NO MINVALUE / NO MAXVALUE carry no argument; any other
+                // numeric option whose value does not fit an i64 must not
+                // fall back to the default.
+                if matches!(
+                    elem.defname.as_str(),
+                    "start" | "increment" | "minvalue" | "maxvalue"
+                ) && elem.arg.is_some()
+                    && extract_def_elem_int(elem).is_none()
+                {
+                    return Err(not_supported(format!(
+                        "this {} value in CREATE SEQUENCE",
+                        elem.defname.to_uppercase()
+                    )));
+                }
                 match elem.defname.as_str() {
                     "as" => {
                         let Some(pg_query::protobuf::node::Node::TypeName(tn)) =
@@ -4789,8 +4804,24 @@ impl PostgreSQLTranslator {
                             }
                         }
                     }
-                    _ => {} // ignore other unknown options
+                    // OWNED BY NONE is the default.
+                    "owned_by"
+                        if matches!(
+                            elem.arg.as_ref().and_then(|n| n.node.as_ref()),
+                            Some(pg_query::protobuf::node::Node::List(l))
+                                if extract_key_columns(&l.items).is_ok_and(|n| n == ["none"])
+                        ) => {}
+                    other => {
+                        return Err(not_supported(format!(
+                            "CREATE SEQUENCE option {}",
+                            other.to_uppercase().replace('_', " ")
+                        )))
+                    }
                 }
+            } else {
+                return Err(ParseError::ParseError(
+                    "CREATE SEQUENCE: unexpected option node".into(),
+                ));
             }
         }
 
@@ -9870,5 +9901,43 @@ mod tests {
             "array element",
         );
         assert_translates("INSERT INTO t VALUES (1) ON CONFLICT (id) DO UPDATE SET a = excluded.a");
+    }
+
+    #[test]
+    fn fail_closed_create_sequence_options() {
+        assert_not_supported("CREATE TEMP SEQUENCE s", "TEMPORARY SEQUENCE");
+        assert_not_supported("CREATE SEQUENCE s OWNED BY t.id", "OWNED BY");
+        assert_not_supported("CREATE SEQUENCE s AS numeric", "AS numeric");
+        assert_not_supported(
+            "CREATE SEQUENCE s MAXVALUE 99999999999999999999",
+            "MAXVALUE value",
+        );
+        assert_translates("CREATE SEQUENCE s OWNED BY NONE NO MINVALUE NO MAXVALUE CACHE 1");
+
+        // pg_dump emits AS integer for serial sequences; it bounds the range.
+        let parsed = crate::parse("CREATE SEQUENCE s AS integer START WITH 1").unwrap();
+        let stmt = PostgreSQLTranslator::new().translate(&parsed).unwrap();
+        let ast::Stmt::CreateSequence {
+            max_value,
+            min_value,
+            ..
+        } = stmt
+        else {
+            panic!("expected CREATE SEQUENCE, got {stmt:?}");
+        };
+        assert_eq!(max_value, Some(i32::MAX as i64));
+        assert_eq!(min_value, None);
+        let parsed = crate::parse("CREATE SEQUENCE s AS smallint INCREMENT BY -1").unwrap();
+        let stmt = PostgreSQLTranslator::new().translate(&parsed).unwrap();
+        let ast::Stmt::CreateSequence {
+            max_value,
+            min_value,
+            ..
+        } = stmt
+        else {
+            panic!("expected CREATE SEQUENCE, got {stmt:?}");
+        };
+        assert_eq!(min_value, Some(i16::MIN as i64));
+        assert_eq!(max_value, None);
     }
 }
