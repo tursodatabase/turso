@@ -1318,6 +1318,39 @@ fn test_fts_tokenizer_configuration(tmp_db: TempDatabase) {
     assert!(!rows.is_empty());
 }
 
+#[cfg(all(feature = "fts", not(target_family = "wasm")))]
+#[turso_macros::test]
+fn test_fts_en_stem_tokenizer_matches_word_forms(tmp_db: TempDatabase) {
+    let _ = env_logger::try_init();
+    let conn = tmp_db.connect_limbo();
+
+    conn.execute("CREATE TABLE docs(id INTEGER PRIMARY KEY, content TEXT)")
+        .unwrap();
+    conn.execute("CREATE INDEX fts_docs ON docs USING fts (content) WITH (tokenizer = 'en_stem')")
+        .unwrap();
+    conn.execute(
+        "INSERT INTO docs VALUES
+            (1, 'She Runs every morning'),
+            (2, 'running late again'),
+            (3, 'a quiet walk')",
+    )
+    .unwrap();
+
+    let rows = limbo_exec_rows(&conn, "SELECT id FROM docs WHERE fts_match(content, 'run')");
+    assert_that!(rows)
+        .column(0)
+        .contains_exactly_in_any_order([Cell::from(1), Cell::from(2)]);
+
+    let rows = limbo_exec_rows(
+        &conn,
+        "SELECT id FROM docs WHERE fts_match(content, 'walking')",
+    );
+    assert_that!(rows)
+        .column(0)
+        .single_element()
+        .is_equal_to(Cell::from(3));
+}
+
 /// Test that invalid tokenizer names are rejected
 #[cfg(all(feature = "fts", not(target_family = "wasm")))]
 #[turso_macros::test]

@@ -49,6 +49,7 @@ CREATE INDEX idx_tags ON tags USING fts (tag) WITH (tokenizer = 'raw');
 | `simple` | Splits on whitespace and punctuation without lowercasing | Simple text without case-insensitive needs |
 | `whitespace` | Splits on whitespace only | Whitespace-delimited tokens |
 | `ngram` | Generates 2-3 character n-grams from the text | Autocomplete, substring matching |
+| `en_stem` | Like `default`, then reduces English words to their stem (`running` and `runs` both become `run`) | English text where different forms of a word should match |
 
 **Tokenizer examples:**
 
@@ -145,6 +146,8 @@ fts_highlight(column1, column2, ..., open_tag, close_tag, query)
 **Returns:** TEXT -- the input text with matching terms wrapped in the specified tags. Returns the original text if no matches are found. Returns NULL if the query, open_tag, or close_tag is NULL.
 
 When multiple columns are provided, their text is concatenated with spaces.
+
+`fts_highlight` does not use the FTS index. It always splits text on whitespace and punctuation and ignores case, whatever tokenizer the index uses. With `en_stem`, it highlights only words that exactly match a query word, not other forms of the same word.
 
 ```sql
 SELECT fts_highlight(title, '<b>', '</b>', 'database') AS highlighted
@@ -329,7 +332,7 @@ DELETE FROM articles WHERE id = 5;
 | Phrase search | `"exact phrase"` | `"exact phrase"` |
 | Prefix search | `word*` | `word*` |
 | Column filter | `col:term` | `col:term` |
-| Tokenizers | unicode61, ascii, porter | default, raw, simple, whitespace, ngram |
+| Tokenizers | unicode61, ascii, porter | default, raw, simple, whitespace, ngram, en_stem |
 | Segment management | Automatic | Manual via `OPTIMIZE INDEX` |
 | Transaction visibility | Immediate | After COMMIT |
 

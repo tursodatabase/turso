@@ -588,6 +588,7 @@ pub const SUPPORTED_TOKENIZERS: &[&str] = &[
     "simple",     // Basic whitespace/punctuation split
     "whitespace", // Split on whitespace only
     "ngram",      // N-gram tokenizer (2-3 chars by default)
+    "en_stem",    // Tantivy default + English stemming
 ];
 
 /// Supported keys in the WITH clause of an FTS index
