@@ -3601,17 +3601,17 @@ impl Connection {
             })
             .map(|sequence| (namespace.database_id, sequence))
         };
-        if let Some((namespace, seq)) = name.split_once('.') {
+        let (namespace, seq_name) = crate::util::split_qualified_name(name);
+        let seq_name = crate::util::normalize_ident(&seq_name);
+        if let Some(namespace) = namespace {
             let namespace = self
                 .namespaces
-                .get(&crate::util::normalize_ident(namespace))
+                .get(&crate::util::normalize_ident(&namespace))
                 .ok_or_else(|| {
                     LimboError::InvalidArgument(format!("no such database: {namespace}"))
                 })?;
-            let seq_name = crate::util::normalize_ident(seq);
             return get(&namespace, &seq_name).ok_or_else(|| not_found(&seq_name));
         }
-        let seq_name = crate::util::normalize_ident(name);
         let mut namespaces = Vec::new();
         if self.temp.database.read().is_some() {
             namespaces.extend(self.namespaces.of_database(TEMP_DB_ID));

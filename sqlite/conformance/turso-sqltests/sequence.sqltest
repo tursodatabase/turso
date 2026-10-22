@@ -335,3 +335,18 @@ expect {
     21
     21
 }
+
+test sequence-function-reads-a-quoted-namespace-and-name {
+    CREATE SEQUENCE "a.b.s" START WITH 5;
+    CREATE SEQUENCE "q""s";
+    SELECT nextval('"a.b.s"');
+    SELECT nextval('main."a.b.s"');
+    SELECT currval('"main"."a.b.s"');
+    SELECT nextval('"q""s"');
+}
+expect {
+    5
+    6
+    6
+    1
+}

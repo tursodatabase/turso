@@ -364,13 +364,10 @@ pub(crate) fn qualify_sequence_argument(
 /// The name of a sequence as a sequence function names it: `name` or
 /// `namespace.name`.
 fn sequence_qualified_name(name: &str) -> ast::QualifiedName {
-    let (namespace, name) = match name.split_once('.') {
-        Some((namespace, name)) => (Some(ast::Name::exact(namespace.to_string())), name),
-        None => (None, name),
-    };
+    let (namespace, name) = crate::util::split_qualified_name(name);
     ast::QualifiedName {
-        namespace,
-        name: ast::Name::exact(name.to_string()),
+        namespace: namespace.map(ast::Name::exact),
+        name: ast::Name::exact(name),
         alias: None,
     }
 }

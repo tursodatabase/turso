@@ -991,7 +991,11 @@ impl<'a> Resolver<'a> {
     /// The name of `sequence` qualified with its namespace, for the opcodes
     /// that look a sequence up again by its name when the statement runs.
     pub(crate) fn runtime_sequence_name(&self, sequence: &ResolvedName) -> String {
-        format!("{}.{}", sequence.namespace.name, sequence.name)
+        format!(
+            "{}.{}",
+            ast::Name::exact(sequence.namespace.name.clone()).as_ident(),
+            ast::Name::exact(sequence.name.clone()).as_ident()
+        )
     }
 
     /// The object that `qualified_name` names in the namespace it names, or
