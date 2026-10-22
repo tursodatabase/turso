@@ -103,6 +103,8 @@ var name = await command.ExecuteScalarAsync();
 
 Remote mode uses the Hrana HTTP `/v2/pipeline` protocol. `libsql://` URLs default to HTTPS; `Tls=False` maps them to HTTP for local development. `ws://` and `wss://` URLs are accepted and mapped to the equivalent HTTP pipeline endpoint. `Auth Token` requires HTTPS unless the host is `localhost` or loopback.
 
+For local databases, `CommandTimeout` is applied to each native statement and is separate from lock-wait timeout. Async command and reader methods pass their `CancellationToken` to native execution, including CPU-bound queries. Cancellation returns a canceled task when the token requested it; an independent native deadline remains a database error. The provider retains the native connection for the active execution so cancellation remains safe if connection disposal starts concurrently.
+
 Add `Replica Path` to use the same provider surface with a local embedded replica:
 
 ```C#

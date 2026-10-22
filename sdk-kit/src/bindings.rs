@@ -430,6 +430,18 @@ unsafe extern "C" {
     pub fn turso_connection_set_busy_timeout_ms(self_: *const turso_connection_t, timeout_ms: i64);
 }
 unsafe extern "C" {
+    #[doc = " Interrupt statements currently executing on the connection. Safe to call from another thread while self remains valid."]
+    pub fn turso_connection_interrupt(self_: *const turso_connection_t);
+}
+unsafe extern "C" {
+    #[doc = " Set the maximum duration of each statement started on the connection. Zero disables the timeout."]
+    pub fn turso_connection_set_query_timeout_ms(self_: *const turso_connection_t, timeout_ms: u64);
+}
+unsafe extern "C" {
+    #[doc = " Get the current per-statement query timeout in milliseconds."]
+    pub fn turso_connection_get_query_timeout_ms(self_: *const turso_connection_t) -> u64;
+}
+unsafe extern "C" {
     #[doc = " Get autocommit state of the connection"]
     pub fn turso_connection_get_autocommit(self_: *const turso_connection_t) -> bool;
 }
@@ -543,6 +555,10 @@ unsafe extern "C" {
         rows_changes: *mut u64,
         error_opt_out: *mut *const ::std::os::raw::c_char,
     ) -> turso_status_code_t;
+}
+unsafe extern "C" {
+    #[doc = " Set the timeout for this statement execution. Zero disables the timeout."]
+    pub fn turso_statement_set_query_timeout_ms(self_: *const turso_statement_t, timeout_ms: u64);
 }
 unsafe extern "C" {
     #[doc = " Step statement execution once\n Returns TURSO_DONE if execution finished\n Returns TURSO_ROW if execution generated the row (row values can be inspected with corresponding statement methods)\n Returns TURSO_IO if async_io was set and statement needs to execute IO to make progress"]

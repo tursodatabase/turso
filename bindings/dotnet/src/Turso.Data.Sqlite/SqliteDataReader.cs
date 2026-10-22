@@ -30,13 +30,26 @@ public class SqliteDataReader : DbDataReader
     private bool _currentStatementRowsAffectedCounted;
     private int _managedResultIndex;
     private int _managedRowIndex = -1;
+    private readonly CancellationToken _executionCancellationToken;
+    private TursoInterruptHandle? _interruptHandle;
+    private CancellationTokenRegistration _cancellationRegistration;
 
     // Declared types resolved for the current result set, so GetValue does not cross into
     // native code for them on every cell.
     private TursoStatementHandle? _declaredTypeStatement;
     private string?[] _declaredTypeNames = [];
 
-    internal SqliteDataReader(SqliteCommand command, TursoStatementHandle statement, string currentSql, List<string> remainingSql, int recordsAffected, CommandBehavior behavior, Action closeCallback)
+    internal SqliteDataReader(
+        SqliteCommand command,
+        TursoStatementHandle statement,
+        string currentSql,
+        List<string> remainingSql,
+        int recordsAffected,
+        CommandBehavior behavior,
+        Action closeCallback,
+        CancellationToken cancellationToken,
+        TursoInterruptHandle interruptHandle,
+        CancellationTokenRegistration cancellationRegistration)
     {
         _command = command;
         _statement = statement;
@@ -46,6 +59,9 @@ public class SqliteDataReader : DbDataReader
         _recordsAffected = recordsAffected;
         _behavior = behavior;
         _closeCallback = closeCallback;
+        _executionCancellationToken = cancellationToken;
+        _interruptHandle = interruptHandle;
+        _cancellationRegistration = cancellationRegistration;
     }
 
     internal SqliteDataReader(SqliteCommand command, int recordsAffected, CommandBehavior behavior, Action closeCallback)
@@ -738,20 +754,21 @@ public class SqliteDataReader : DbDataReader
 
         if (_statement is null)
             return false;
-        while (TursoBindings.Read(_statement))
-        {
-        }
-
-        CountCurrentStatementRowsAffected();
-
-        _hasCurrentRow = false;
-        _hasPrefetchedRow = false;
-        _statement.Dispose();
-        _statement = null;
-        _currentStatementRowsAffectedCounted = false;
 
         try
         {
+            while (TursoBindings.Read(_statement))
+            {
+            }
+
+            CountCurrentStatementRowsAffected();
+
+            _hasCurrentRow = false;
+            _hasPrefetchedRow = false;
+            _statement.Dispose();
+            _statement = null;
+            _currentStatementRowsAffectedCounted = false;
+
             while (_remainingSql.Count > 0)
             {
                 var sql = _remainingSql[0];
@@ -778,6 +795,8 @@ public class SqliteDataReader : DbDataReader
                     _recordsAffected += TursoBindings.RowsAffected(statement);
                 statement.Dispose();
             }
+
+            CompleteNativeExecution();
         }
         catch (TursoException ex)
         {
@@ -785,6 +804,16 @@ public class SqliteDataReader : DbDataReader
             _statement = null;
             _hasPrefetchedRow = false;
             _remainingSql.Clear();
+            CompleteNativeExecution();
+            _command.CompleteTransactionAfterInterrupt(ex);
+            if (ex.IsInterrupt && _executionCancellationToken.IsCancellationRequested)
+            {
+                throw new OperationCanceledException(
+                    "The query was canceled.",
+                    ex,
+                    _executionCancellationToken);
+            }
+
             throw SqliteCommand.ToSqliteException(ex);
         }
 
@@ -794,6 +823,7 @@ public class SqliteDataReader : DbDataReader
     public override bool Read()
     {
         EnsureOpen();
+        ThrowIfCancellationRequested(_executionCancellationToken);
         if (_managedExecution is not null)
         {
             if (_managedExecution.Results.Count == 0
@@ -821,25 +851,73 @@ public class SqliteDataReader : DbDataReader
         {
             _hasCurrentRow = TursoBindings.Read(_statement);
             if (!_hasCurrentRow)
+            {
                 CountCurrentStatementRowsAffected();
+                if (_remainingSql.Count == 0)
+                    CompleteNativeExecution();
+            }
             return _hasCurrentRow;
         }
         catch (TursoException ex)
         {
+            CompleteNativeExecution();
+            _command.CompleteTransactionAfterInterrupt(ex);
+            if (ex.IsInterrupt && _executionCancellationToken.IsCancellationRequested)
+            {
+                throw new OperationCanceledException(
+                    "The query was canceled.",
+                    ex,
+                    _executionCancellationToken);
+            }
+
             throw SqliteCommand.ToSqliteException(ex);
         }
     }
 
-    public override Task<bool> ReadAsync(CancellationToken cancellationToken)
+    public override async Task<bool> ReadAsync(CancellationToken cancellationToken)
     {
-        cancellationToken.ThrowIfCancellationRequested();
-        return Task.FromResult(Read());
+        ThrowIfCancellationRequested(cancellationToken);
+        var interruptHandle = _interruptHandle;
+        using var registration = cancellationToken.CanBeCanceled && interruptHandle is not null
+            ? cancellationToken.UnsafeRegister(
+                static state => ((TursoInterruptHandle)state!).TryInterrupt(),
+                interruptHandle)
+            : default;
+        try
+        {
+            return await Task.FromResult(Read()).ConfigureAwait(false);
+        }
+        catch (SqliteException exception) when (
+            exception.SqliteErrorCode == 9 && cancellationToken.IsCancellationRequested)
+        {
+            throw new OperationCanceledException(
+                "The query was canceled.",
+                exception,
+                cancellationToken);
+        }
     }
 
-    public override Task<bool> NextResultAsync(CancellationToken cancellationToken)
+    public override async Task<bool> NextResultAsync(CancellationToken cancellationToken)
     {
-        cancellationToken.ThrowIfCancellationRequested();
-        return Task.FromResult(NextResult());
+        ThrowIfCancellationRequested(cancellationToken);
+        var interruptHandle = _interruptHandle;
+        using var registration = cancellationToken.CanBeCanceled && interruptHandle is not null
+            ? cancellationToken.UnsafeRegister(
+                static state => ((TursoInterruptHandle)state!).TryInterrupt(),
+                interruptHandle)
+            : default;
+        try
+        {
+            return await Task.FromResult(NextResult()).ConfigureAwait(false);
+        }
+        catch (SqliteException exception) when (
+            exception.SqliteErrorCode == 9 && cancellationToken.IsCancellationRequested)
+        {
+            throw new OperationCanceledException(
+                "The query was canceled.",
+                exception,
+                cancellationToken);
+        }
     }
 
     public override Task<bool> IsDBNullAsync(int ordinal, CancellationToken cancellationToken)
@@ -899,6 +977,7 @@ public class SqliteDataReader : DbDataReader
             _statement = null;
             _remainingSql.Clear();
             FinishClose();
+            _command.CompleteTransactionAfterInterrupt(ex);
             if (throwOnError)
                 throw SqliteCommand.ToSqliteException(ex);
             return;
@@ -922,11 +1001,35 @@ public class SqliteDataReader : DbDataReader
         if (_isClosed)
             return;
 
+        CompleteNativeExecution();
         _closeCallback();
         if ((_behavior & CommandBehavior.CloseConnection) == CommandBehavior.CloseConnection)
             _command.Connection?.Close();
 
         _isClosed = true;
+    }
+
+    private void CompleteNativeExecution()
+    {
+        _cancellationRegistration.Dispose();
+        if (_interruptHandle is not { } interruptHandle)
+            return;
+
+        _command.CompleteNativeExecution(interruptHandle);
+        interruptHandle.Dispose();
+        _interruptHandle = null;
+    }
+
+    private void ThrowIfCancellationRequested(CancellationToken cancellationToken)
+    {
+        if (!cancellationToken.IsCancellationRequested)
+            return;
+
+        _statement?.Dispose();
+        _statement = null;
+        _remainingSql.Clear();
+        CompleteNativeExecution();
+        cancellationToken.ThrowIfCancellationRequested();
     }
 
     private void EnsureOpen([CallerMemberName] string operation = "")

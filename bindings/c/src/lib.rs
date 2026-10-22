@@ -892,7 +892,7 @@ pub unsafe extern "C" fn sqlite3_progress_handler(
             let cb = c_callback;
             inner.conn.set_progress_handler(
                 n as u64,
-                Some(Box::new(move || unsafe {
+                Some(Arc::new(move || unsafe {
                     cb(ctx as *mut ffi::c_void) != 0
                 })),
             );
@@ -1217,8 +1217,14 @@ pub unsafe extern "C" fn sqlite3_step(stmt: *mut sqlite3_stmt) -> ffi::c_int {
             stmt.clear_text_cache();
             SQLITE_DONE
         }
-        Err(LimboError::Busy) => SQLITE_BUSY,
-        Err(LimboError::Interrupt) => SQLITE_INTERRUPT,
+        Err(LimboError::Busy) => {
+            let mut db_inner = db.inner.lock().unwrap();
+            set_db_err(&mut db_inner, LimboError::Busy)
+        }
+        Err(LimboError::Interrupt) => {
+            let mut db_inner = db.inner.lock().unwrap();
+            set_db_err(&mut db_inner, LimboError::Interrupt)
+        }
         Err(err) => {
             let mut db_inner = db.inner.lock().unwrap();
             set_db_err(&mut db_inner, err)
@@ -1272,8 +1278,11 @@ pub unsafe extern "C" fn sqlite3_exec(
         let is_dql = is_query_statement(trimmed);
         if !is_dql {
             // For DML/DDL, use normal execute path
-            let db_inner = db_ref.inner.lock().unwrap();
-            match db_inner.conn.execute(trimmed) {
+            let conn = {
+                let db_inner = db_ref.inner.lock().unwrap();
+                Arc::clone(&db_inner.conn)
+            };
+            match conn.execute(trimmed) {
                 Ok(_) => continue,
                 Err(e) => {
                     return handle_limbo_err(e, err);
@@ -1692,6 +1701,25 @@ pub unsafe extern "C" fn sqlite3_interrupt(db: *mut sqlite3) {
         Err(_) => return,
     };
     inner.conn.interrupt();
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn turso_set_query_timeout(
+    db: *mut sqlite3,
+    milliseconds: u64,
+) -> ffi::c_int {
+    if db.is_null() {
+        return SQLITE_MISUSE;
+    }
+    let db_ref = &*db;
+    let inner = match db_ref.inner.lock() {
+        Ok(guard) => guard,
+        Err(_) => return SQLITE_MISUSE,
+    };
+    inner
+        .conn
+        .set_query_timeout(std::time::Duration::from_millis(milliseconds));
+    SQLITE_OK
 }
 
 extern "C" {
@@ -3847,6 +3875,7 @@ fn limbo_err_code(err: &LimboError) -> i32 {
         LimboError::TableLocked => SQLITE_LOCKED,
         LimboError::ReadOnly => SQLITE_READONLY,
         LimboError::Busy => SQLITE_BUSY,
+        LimboError::Interrupt => SQLITE_INTERRUPT,
         // SQLite reports operations on an expired blob handle (its row's table was
         // written after sqlite3_blob_open) as SQLITE_ABORT.
         LimboError::BlobHandleExpired => SQLITE_ABORT,
