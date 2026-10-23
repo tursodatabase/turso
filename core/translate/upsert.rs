@@ -6,7 +6,7 @@ use turso_parser::ast::{self, TriggerEvent, TriggerTime, Upsert};
 
 use super::emitter::gencol::compute_virtual_columns;
 use crate::alloc::TursoIteratorExt;
-use crate::error::SQLITE_CONSTRAINT_PRIMARYKEY;
+use crate::error::{SQLITE_CONSTRAINT_PRIMARYKEY, SQLITE_ERROR};
 use crate::schema::{BTreeTable, ColumnLayout, IndexColumn, EXPR_INDEX_SENTINEL, ROWID_SENTINEL};
 use crate::translate::emitter::{emit_check_constraints, emit_make_record, UpdateRowSource};
 use crate::translate::expr::{walk_expr, WalkControl};
@@ -14,7 +14,9 @@ use crate::translate::fkeys::{
     affected_parent_fks_for_update, emit_fk_child_update_counters, emit_fk_update_parent_actions,
     fire_fk_update_actions, ParentKeyNewProbeMode,
 };
-use crate::translate::insert::{format_unique_violation_desc, InsertEmitCtx};
+use crate::translate::insert::{
+    emit_remember_written_rowid, format_unique_violation_desc, InsertEmitCtx,
+};
 use crate::translate::plan::ColumnMask;
 use crate::translate::planner::ROWID_STRS;
 use crate::translate::trigger_exec::{
@@ -497,6 +499,22 @@ pub fn emit_upsert(
         src_reg: ctx.conflict_rowid_reg,
         target_pc: ctx.loop_labels.row_done,
     });
+    if let Some(written_rowids_cursor_id) = ctx.written_rowids_cursor_id {
+        let row_not_written = program.allocate_label();
+        program.emit_insn(Insn::NotExists {
+            cursor: written_rowids_cursor_id,
+            rowid_reg: ctx.conflict_rowid_reg,
+            target_pc: row_not_written,
+        });
+        program.emit_insn(Insn::Halt {
+            err_code: SQLITE_ERROR,
+            description: "ON CONFLICT DO UPDATE command cannot affect row a second time"
+                .to_string(),
+            on_error: None,
+            description_reg: None,
+        });
+        program.preassign_label_to_next_insn(row_not_written);
+    }
     let num_cols = ctx.table.columns().len();
     let layout = ctx.table.column_layout()?;
 
@@ -1446,6 +1464,11 @@ pub fn emit_upsert(
         });
         cdc_before_rec
     };
+    emit_remember_written_rowid(
+        program,
+        ctx,
+        new_rowid_reg.unwrap_or(ctx.conflict_rowid_reg),
+    );
 
     // CDC must capture the row right after the write above, before any FK action or AFTER
     // trigger this UPSERT fires can write further CDC rows of their own.
