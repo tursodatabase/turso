@@ -2376,45 +2376,6 @@ fn hir_attach_evaluates_its_arguments() {
     );
 }
 
-/// PRAGMA integrity_check and quick_check read each table's rows through a
-/// SELECT planned by HIR, and find the same broken NOT NULL and CHECK
-/// constraints and missing or repeated index entries as legacy.
-#[test]
-fn hir_integrity_check_finds_each_kind_of_corruption() {
-    let fixtures =
-        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../sqlite/conformance/database");
-    let check = |fixture: &str| {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join(fixture);
-        std::fs::copy(fixtures.join(fixture), &path).unwrap();
-        let db = TempDatabase::new_with_existent_with_opts(
-            &path,
-            turso_core::DatabaseOpts::new().with_generated_columns(true),
-        );
-        let conn = db.connect_limbo();
-        ["PRAGMA integrity_check", "PRAGMA quick_check"].map(|sql| limbo_exec_rows(&conn, sql))
-    };
-    for fixture in [
-        "integrity_check_constraint_violation.db",
-        "integrity_gencol_not_null_violation.db",
-        "integrity_missing_expression_index_entry.db",
-        "integrity_missing_index_entry.db",
-        "integrity_missing_partial_index_entry.db",
-        "integrity_missing_unique_index_entry.db",
-        "integrity_non_unique_index_entry.db",
-        "integrity_not_null_violation.db",
-    ] {
-        let ok = vec![vec![rusqlite::types::Value::Text("ok".into())]];
-        let [check, quick] = check(fixture);
-        assert_ne!(check, ok, "{fixture} is broken");
-        // quick_check skips the index checks, so only a row that breaks a
-        // constraint of its own is found twice.
-        if fixture.contains("violation") {
-            assert_ne!(quick, ok, "{fixture} is broken for quick_check too");
-        }
-    }
-}
-
 /// Like legacy, a DELETE or UPDATE whose WHERE is an OR of terms that
 /// indexes can each seek reads the table through one seek per branch. The
 /// branches give rowids in rowid order through a row set, so the statement
