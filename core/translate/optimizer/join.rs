@@ -752,6 +752,21 @@ pub(crate) fn compute_hir_join_order(
                 .required_lhs(position)
                 .is_none_or(|required| lhs_mask.contains_all_set_bits_of(required))
     };
+    // Like the legacy planner, a table that no predicate joins to the
+    // tables before it is tried only when no table that one does could go
+    // there instead: the cross product comes last.
+    let connected = |position: usize, lhs_mask: &TableMask| {
+        predicate_work
+            .iter()
+            .any(|work| work.table_mask.get(position) && work.table_mask.intersects(lhs_mask))
+    };
+    let has_connected_candidate = |lhs_mask: &TableMask| {
+        (0..sources.len()).any(|candidate| {
+            !lhs_mask.get(candidate)
+                && allowed(candidate, lhs_mask)
+                && connected(candidate, lhs_mask)
+        })
+    };
 
     let mut memo: HashMap<TableMask, HashMap<usize, HirPartialJoin>> = HashMap::default();
     let empty = TableMask::default();
@@ -798,10 +813,7 @@ pub(crate) fn compute_hir_join_order(
         let mut method = next.access_method;
         // A table nothing joins to the tables before it pays for the cross
         // product.
-        let connected = predicate_work
-            .iter()
-            .any(|work| work.table_mask.get(rhs) && work.table_mask.intersects(lhs_mask));
-        if !connected {
+        if !connected(rhs, lhs_mask) {
             let base_rows = base_table_rows
                 .get(rhs)
                 .copied()
@@ -867,6 +879,14 @@ pub(crate) fn compute_hir_join_order(
         from_order_mask.set(rhs)?;
     }
 
+    // Without an order target, a plan is kept only while it is cheaper than
+    // the cheapest complete plan found so far; a partial plan that already
+    // costs as much cannot end up cheaper. With one, a costlier plan may
+    // still be the cheapest that returns rows in order.
+    let mut cost_bound = from_order
+        .as_ref()
+        .filter(|_| order_target.is_none())
+        .map(|plan| plan.cost);
     let mut complete: Vec<HirPartialJoin> = Vec::new();
     complete.extend(from_order);
     for subset_size in 2..=sources.len() {
@@ -882,6 +902,9 @@ pub(crate) fn compute_hir_join_order(
                 if !allowed(rhs, &lhs_mask) {
                     continue;
                 }
+                if !connected(rhs, &lhs_mask) && has_connected_candidate(&lhs_mask) {
+                    continue;
+                }
                 let Some(lhs_plans) = memo.get(&lhs_mask) else {
                     continue;
                 };
@@ -891,6 +914,9 @@ pub(crate) fn compute_hir_join_order(
                     let Some(plan) = extend(&lhs_plans[&last], &lhs_mask, rhs)? else {
                         continue;
                     };
+                    if cost_bound.is_some_and(|bound| plan.cost.0 >= bound.0) {
+                        continue;
+                    }
                     if best_by_last
                         .get(&rhs)
                         .is_some_and(|existing| existing.cost.0 <= plan.cost.0)
@@ -904,7 +930,12 @@ pub(crate) fn compute_hir_join_order(
                 // Visit the finished plans in the map's order, which is the
                 // same on every run, so equally cheap plans resolve the same
                 // way.
-                complete.extend(best_by_last.into_values());
+                for plan in best_by_last.into_values() {
+                    if let Some(bound) = &mut cost_bound {
+                        bound.0 = bound.0.min(plan.cost.0);
+                    }
+                    complete.push(plan);
+                }
             } else if !best_by_last.is_empty() {
                 memo.insert(mask, best_by_last);
             }
@@ -1241,6 +1272,8 @@ fn hir_join_step(
     or_union: bool,
     hash: &HirHashJoins<'_>,
 ) -> Result<Option<HirJoinStep>> {
+    #[cfg(test)]
+    tests::JOIN_STEPS.with(|steps| steps.set(steps.get() + 1));
     let source = &sources[source_position];
     let mut joined_mask = lhs_mask.try_clone()?;
     joined_mask.set(source_position)?;
@@ -2871,6 +2904,101 @@ mod tests {
                 ..
             }
         )));
+        Ok(())
+    }
+
+    thread_local! {
+        /// How many join steps the planner tried on this thread.
+        pub(super) static JOIN_STEPS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    }
+
+    #[test]
+    fn exhaustive_hir_join_order_of_a_chain_tries_few_orders() -> Result<()> {
+        let names = [
+            "first", "second", "third", "fourth", "fifth", "sixth", "seventh", "eighth",
+        ];
+        let ids = (0..names.len()).map(SourceId::new).collect::<Vec<_>>();
+        let sources = names
+            .iter()
+            .zip(&ids)
+            .enumerate()
+            .map(|(position, (name, id))| {
+                let mut source = _create_hir_source(
+                    _create_btree_table(name, _create_column_list(&["value"], Type::Integer)),
+                    (position > 0).then_some(JoinKind::Inner),
+                    *id,
+                );
+                source.col_used_mask.set(0)?;
+                Ok(HirPlanSource::BTree(source))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let document = HirDocument {
+            snapshot: hir::CatalogSnapshot::from_id(0),
+            databases: Vec::new(),
+            root: hir::HirRoot::SchemaExpressions(hir::SchemaExpressionRoot {
+                source: ids[0],
+                expressions: Vec::new(),
+            }),
+            queries: Vec::new(),
+            sources: names
+                .iter()
+                .zip(&ids)
+                .map(|(name, id)| _create_hir_definition(name, *id))
+                .collect(),
+            ctes: Vec::new(),
+            schema_programs: Vec::new(),
+            cdc: None,
+        };
+        // Each table joins the one before it, so an order that puts a
+        // table before the one it joins to pays for a cross product.
+        let where_clause = (1..names.len())
+            .map(|position| {
+                HirWhereTerm::from(hir::Expr::Binary {
+                    lhs: Box::new(hir::Expr::column(ids[position], 0)),
+                    operator: Operator::Equals,
+                    rhs: Box::new(hir::Expr::column(ids[position - 1], 0)),
+                    array_concat: false,
+                    custom: None,
+                    comparison: None,
+                })
+            })
+            .collect::<Vec<_>>();
+        let constraints = std::iter::once(Ok(_hir_empty_constraints()))
+            .chain(
+                (1..names.len())
+                    .map(|position| _hir_auto_index_constraints(position - 1, position - 1)),
+            )
+            .collect::<Result<Vec<_>>>()?;
+        let rows = vec![RowCountEstimate::AnalyzeStats(1_000.0); names.len()];
+        let mut access_methods = Vec::new();
+        JOIN_STEPS.with(|steps| steps.set(0));
+        let result = compute_hir_join_order(
+            &document,
+            &sources,
+            &[],
+            &constraints,
+            &where_clause,
+            &rows,
+            &vec![Cost(0.0); names.len()],
+            None,
+            1.0,
+            &mut access_methods,
+            &Schema::new(),
+            &AnalyzeStats::default(),
+            &DEFAULT_PARAMS,
+            false,
+            &HirHashJoins::NONE,
+        )?
+        .expect("eight HIR sources produce a join plan");
+        let steps = JOIN_STEPS.with(|steps| steps.get());
+
+        assert_eq!(
+            result.best_plan.table_numbers().collect::<Vec<_>>(),
+            (0..names.len()).collect::<Vec<_>>()
+        );
+        // Without pruning, the search tries every order of the chain:
+        // thousands of steps.
+        assert!(steps < 200, "the planner tried {steps} join steps");
         Ok(())
     }
 
