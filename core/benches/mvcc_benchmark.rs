@@ -15,7 +15,7 @@ use codspeed_criterion_compat::{
 
 use turso_core::alloc::DynAllocator;
 use turso_core::mvcc::clock::MvccClock;
-use turso_core::mvcc::database::{MvStore, Row, RowID, RowKey};
+use turso_core::mvcc::database::{MvStore, Row, RowID, RowKey, SuccessorTx};
 use turso_core::types::{IOResult, ImmutableRecord, Text};
 use turso_core::{ConnectOpts, Connection, Database, MemoryIO, Statement, StepResult, Value};
 
@@ -49,8 +49,13 @@ fn bench(c: &mut Criterion) {
         b.to_async(FuturesExecutor).iter(|| async {
             let conn = db.conn.clone();
             let tx_id = db.mvcc_store.begin_tx(conn.get_pager()).unwrap();
-            db.mvcc_store
-                .rollback_tx(tx_id, conn.get_pager(), &conn, turso_core::MAIN_DB_ID);
+            db.mvcc_store.rollback_tx(
+                tx_id,
+                conn.get_pager(),
+                &conn,
+                turso_core::MAIN_DB_ID,
+                SuccessorTx::NotNeeded,
+            );
         })
     });
 
@@ -61,7 +66,7 @@ fn bench(c: &mut Criterion) {
             let tx_id = db.mvcc_store.begin_tx(conn.get_pager()).unwrap();
             let mv_store = &db.mvcc_store;
             let mut sm = mv_store
-                .commit_tx(tx_id, conn, turso_core::MAIN_DB_ID)
+                .commit_tx(tx_id, conn, turso_core::MAIN_DB_ID, SuccessorTx::NotNeeded)
                 .unwrap();
             // TODO: sync IO hack
             loop {
@@ -90,7 +95,7 @@ fn bench(c: &mut Criterion) {
                 .unwrap();
             let mv_store = &db.mvcc_store;
             let mut sm = mv_store
-                .commit_tx(tx_id, conn, turso_core::MAIN_DB_ID)
+                .commit_tx(tx_id, conn, turso_core::MAIN_DB_ID, SuccessorTx::NotNeeded)
                 .unwrap();
             // TODO: sync IO hack
             loop {
@@ -119,7 +124,7 @@ fn bench(c: &mut Criterion) {
                 .unwrap();
             let mv_store = &db.mvcc_store;
             let mut sm = mv_store
-                .commit_tx(tx_id, conn, turso_core::MAIN_DB_ID)
+                .commit_tx(tx_id, conn, turso_core::MAIN_DB_ID, SuccessorTx::NotNeeded)
                 .unwrap();
             // TODO: sync IO hack
             loop {

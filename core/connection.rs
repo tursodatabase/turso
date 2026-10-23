@@ -1,5 +1,6 @@
 use crate::alloc::TryClone;
 use crate::error::io_error;
+use crate::mvcc::database::SuccessorTx;
 #[cfg(any(test, injected_yields))]
 use crate::mvcc::yield_points::{FailureInjector, YieldInjector};
 use crate::state_machine::StateMachine;
@@ -519,6 +520,13 @@ pub struct Connection {
     /// handles; a handle re-positions on its next blob operation after the
     /// checkpoint's cache clear).
     pub(crate) n_active_blob_statements: AtomicI32,
+    /// Bumped when the main MVCC transaction ends under running statements;
+    /// their cursors then move to the successor transaction
+    /// (`MvccLazyCursor::follow_connection_tx`).
+    pub(crate) mv_tx_successor_generation: Arc<AtomicU64>,
+    /// Why the last COMMIT or ROLLBACK could not start a successor
+    /// transaction for the statements still running.
+    pub(crate) mv_tx_successor_failure: Mutex<Option<LimboError>>,
     /// Prevents root statements and explicit checkpoints from overlapping on this connection.
     pub(crate) statement_activity: Arc<Mutex<StatementActivity>>,
     /// Whether pragma ignore_check_constraints=ON for this connection
@@ -573,7 +581,13 @@ impl Drop for Connection {
                 if let Some(tx_id) = self.get_mv_tx_id() {
                     let pager = self.pager.load();
                     if mv_store.is_tx_rollbackable(tx_id) {
-                        mv_store.rollback_tx(tx_id, pager.clone(), self, MAIN_DB_ID);
+                        mv_store.rollback_tx(
+                            tx_id,
+                            pager.clone(),
+                            self,
+                            MAIN_DB_ID,
+                            SuccessorTx::NotNeeded,
+                        );
                     } else {
                         self.set_mv_tx(None);
                     }
@@ -1335,7 +1349,13 @@ impl Connection {
         };
         if let Some(mv_store) = self.mv_store().as_ref() {
             if mv_store.is_tx_rollbackable(tx_id) {
-                mv_store.rollback_tx(tx_id, pager.clone(), self, MAIN_DB_ID);
+                mv_store.rollback_tx(
+                    tx_id,
+                    pager.clone(),
+                    self,
+                    MAIN_DB_ID,
+                    SuccessorTx::NotNeeded,
+                );
             } else {
                 self.set_mv_tx(None);
             }
@@ -2275,7 +2295,13 @@ impl Connection {
                 // remove all non-commited changes in case if WAL session left some suffix without commit frame
                 if let Some(mv_store) = self.mv_store().as_ref() {
                     if let Some(tx_id) = self.get_mv_tx_id() {
-                        mv_store.rollback_tx(tx_id, pager.clone(), self, MAIN_DB_ID);
+                        mv_store.rollback_tx(
+                            tx_id,
+                            pager.clone(),
+                            self,
+                            MAIN_DB_ID,
+                            SuccessorTx::NotNeeded,
+                        );
                     }
                 }
                 pager.rollback(false, self, true);
@@ -2373,7 +2399,13 @@ impl Connection {
                 if self.mvcc_enabled() {
                     if let Some(mv_store) = self.mv_store().as_ref() {
                         if let Some(tx_id) = self.get_mv_tx_id() {
-                            mv_store.rollback_tx(tx_id, pager.clone(), self, MAIN_DB_ID);
+                            mv_store.rollback_tx(
+                                tx_id,
+                                pager.clone(),
+                                self,
+                                MAIN_DB_ID,
+                                SuccessorTx::NotNeeded,
+                            );
                         }
                     }
                     pager.end_read_tx();
@@ -2477,7 +2509,13 @@ impl Connection {
             return;
         };
         let pager = self.pager.load();
-        mv_store.rollback_tx(tx_id, pager.clone(), self, MAIN_DB_ID);
+        mv_store.rollback_tx(
+            tx_id,
+            pager.clone(),
+            self,
+            MAIN_DB_ID,
+            SuccessorTx::NotNeeded,
+        );
     }
 
     /// Discard the main-db MVCC transaction left by a sync raw-WAL session
@@ -2506,7 +2544,8 @@ impl Connection {
             return Ok(());
         };
 
-        let mut state_machine = mv_store.commit_tx(tx_id, self, MAIN_DB_ID)?;
+        let mut state_machine =
+            mv_store.commit_tx(tx_id, self, MAIN_DB_ID, SuccessorTx::NotNeeded)?;
         while let crate::types::IOResult::IO(io) = state_machine.step(mv_store)? {
             io.wait(self.db.io.as_ref())?;
         }
@@ -3997,7 +4036,8 @@ impl Connection {
                         let tx_id = self
                             .get_mv_tx_id()
                             .expect("the watermark sync statements run in an MVCC transaction");
-                        let state_machine = mv_store.commit_tx(tx_id, self, MAIN_DB_ID)?;
+                        let state_machine =
+                            mv_store.commit_tx(tx_id, self, MAIN_DB_ID, SuccessorTx::NotNeeded)?;
                         *state = SyncAutoincrementState::Commit {
                             mv_store,
                             state_machine,
@@ -4576,6 +4616,26 @@ impl Connection {
         }
     }
 
+    /// After the main MVCC transaction ended: a successor transaction for
+    /// statements that are still running keeps the pager read lock, otherwise
+    /// release it.
+    pub(crate) fn finish_main_mvcc_tx(&self, pager: &Pager) {
+        if self.main_mv_tx_is_closed_by_last_statement() {
+            self.set_tx_state(TransactionState::Read);
+        } else {
+            self.end_committed_main_mvcc_tx(pager);
+        }
+    }
+
+    pub(crate) fn main_mv_tx_is_closed_by_last_statement(&self) -> bool {
+        let Some(tx_id) = self.get_mv_tx_id() else {
+            return false;
+        };
+        self.mv_store()
+            .as_ref()
+            .is_some_and(|mv_store| mv_store.tx_is_closed_by_last_statement(tx_id))
+    }
+
     /// Rollback MVCC transactions on all attached databases and clear the
     /// attached transaction list.  When `clear_schemas` is true the
     /// connection-local schema cache for each attached DB is also removed so
@@ -4593,7 +4653,13 @@ impl Connection {
                     .get_pager_from_database_index(&db_id)
                     .expect("attached MVCC transaction should always have a pager");
                 if attached_mv_store.is_tx_rollbackable(tx_id) {
-                    attached_mv_store.rollback_tx(tx_id, attached_pager.clone(), self, db_id);
+                    attached_mv_store.rollback_tx(
+                        tx_id,
+                        attached_pager.clone(),
+                        self,
+                        db_id,
+                        SuccessorTx::NotNeeded,
+                    );
                 } else {
                     self.set_mv_tx_for_db(db_id, None);
                 }
@@ -4818,17 +4884,17 @@ impl Connection {
         &self,
         pager: &Arc<Pager>,
         clear_attached_schemas: bool,
+        successor: SuccessorTx,
     ) {
         if let Some(mv_store) = self.mv_store().as_ref() {
             if let Some(tx_id) = self.get_mv_tx_id() {
                 self.auto_commit.store(true, Ordering::SeqCst);
                 if mv_store.is_tx_rollbackable(tx_id) {
-                    mv_store.rollback_tx(tx_id, pager.clone(), self, crate::MAIN_DB_ID);
+                    mv_store.rollback_tx(tx_id, pager.clone(), self, crate::MAIN_DB_ID, successor);
                 } else {
                     self.set_mv_tx(None);
                 }
             }
-            pager.end_read_tx();
             self.rollback_attached_mvcc_txs(clear_attached_schemas);
         } else {
             pager.rollback_tx(self);
@@ -4836,7 +4902,11 @@ impl Connection {
         }
         self.rollback_attached_wal_txns();
         self.index_methods_on_transaction_rolled_back();
-        self.set_tx_state(TransactionState::None);
+        if self.mv_store().is_some() {
+            self.finish_main_mvcc_tx(pager);
+        } else {
+            self.set_tx_state(TransactionState::None);
+        }
         self.clear_tx_poison();
         // The entire transaction is being rolled back, so every materialized
         // view delta captured within it is void. Leaving them behind would
@@ -4861,7 +4931,13 @@ impl Connection {
             || pager.holds_write_lock();
 
         if main_has_implicit_state {
-            self.rollback_current_txn_state(pager, clear_attached_schemas);
+            self.rollback_current_txn_state(
+                pager,
+                clear_attached_schemas,
+                SuccessorTx::ForOtherStatements {
+                    caller_counted: true,
+                },
+            );
         } else {
             if self.next_attached_mv_tx().is_some() {
                 self.rollback_attached_mvcc_txs(clear_attached_schemas);

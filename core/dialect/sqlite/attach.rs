@@ -4,6 +4,7 @@
 use crate::function::{Func, ScalarFunc};
 #[cfg(feature = "fs")]
 use crate::io::{MemoryIO, IO};
+use crate::mvcc::database::SuccessorTx;
 #[cfg(feature = "fs")]
 use crate::storage::journal_mode;
 #[cfg(feature = "fs")]
@@ -660,7 +661,13 @@ impl Connection {
 
         if let Some((tx_id, _mode)) = self.get_mv_tx_for_db(database_id) {
             if let Some(mv_store) = self.mv_store_for_db(database_id) {
-                mv_store.rollback_tx(tx_id, pager.clone(), self, database_id);
+                mv_store.rollback_tx(
+                    tx_id,
+                    pager.clone(),
+                    self,
+                    database_id,
+                    SuccessorTx::NotNeeded,
+                );
                 pager.end_read_tx();
             }
             self.set_mv_tx_for_db(database_id, None);

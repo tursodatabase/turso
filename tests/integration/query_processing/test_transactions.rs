@@ -2416,3 +2416,43 @@ fn test_begin_immediate_lazily_created_temp_follows_transaction(tmp_db: TempData
     let rows: Vec<(i64,)> = conn.exec_rows("SELECT x FROM tt");
     assert_eq!(rows, vec![(1,)]);
 }
+
+// A read that is still running when its connection commits keeps returning
+// rows afterwards, also when another connection holds an uncommitted row in
+// the same table. In MVCC mode that row used to panic the read (#9619).
+#[turso_macros::test(mvcc)]
+fn test_read_in_progress_continues_after_commit(tmp_db: TempDatabase) {
+    let conn = tmp_db.connect_limbo();
+    let writer = tmp_db.connect_limbo();
+    conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)")
+        .unwrap();
+    conn.execute("INSERT INTO t VALUES (1, 'a'), (2, 'b'), (3, 'c')")
+        .unwrap();
+    writer.execute("BEGIN").unwrap();
+    writer.execute("INSERT INTO t VALUES (4, 'd')").unwrap();
+
+    conn.execute("BEGIN").unwrap();
+    let mut reader = conn.prepare("SELECT id FROM t").unwrap();
+    let mut ids = Vec::new();
+    loop {
+        match reader.step().unwrap() {
+            StepResult::Row => {
+                ids.push(reader.row().unwrap().get::<i64>(0).unwrap());
+                break;
+            }
+            StepResult::IO | StepResult::Yield => tmp_db.io.step().unwrap(),
+            other => panic!("reader did not return its first row: {other:?}"),
+        }
+    }
+    conn.execute("COMMIT").unwrap();
+    loop {
+        match reader.step().unwrap() {
+            StepResult::Row => ids.push(reader.row().unwrap().get::<i64>(0).unwrap()),
+            StepResult::IO | StepResult::Yield => tmp_db.io.step().unwrap(),
+            StepResult::Done => break,
+            other => panic!("reader failed after COMMIT: {other:?}"),
+        }
+    }
+    assert_eq!(ids, vec![1, 2, 3]);
+    writer.execute("ROLLBACK").unwrap();
+}
