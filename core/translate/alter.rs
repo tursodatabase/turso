@@ -20,7 +20,9 @@ use crate::{
         RESERVED_TABLE_PREFIXES,
     },
     translate::{
-        emitter::{emit_check_constraints, gencol::compute_virtual_columns, Resolver},
+        emitter::{
+            emit_check_constraints, gencol::compute_virtual_columns, ResolvedName, Resolver,
+        },
         expr::{emit_stored_column, walk_expr, walk_expr_mut, WalkControl},
         plan::{
             ColumnMask, ColumnUsedMask, JoinedTable, Operation, OuterQueryReference,
@@ -663,7 +665,7 @@ fn emit_column_constraints_validation(
                 op: Operation::default_scan_for(&table),
                 unmatched_right_rows_plan: None,
                 table,
-                identifier: resolved_table.name.clone(),
+                identifier: resolver.name_in_namespace(database_id, &resolved_table.name),
                 internal_id: program.table_reference_counter.next(),
                 join_info: None,
                 col_used_mask: ColumnUsedMask::default(),
@@ -736,16 +738,17 @@ pub fn translate_alter_table(
         name: qualified_name,
         body: alter_table,
     } = alter;
-    let database_id = resolver.resolve_existing_table_database_id_qualified(&qualified_name)?;
+    let resolved = resolver.resolve_existing_table(&qualified_name)?;
+    let database_id = resolved.database_id();
     let schema_cookie = resolver.with_schema(database_id, |s| s.schema_version);
     program.begin_write_on_database(database_id, schema_cookie)?;
     program.begin_write_operation()?;
-    let table_name = qualified_name.name.as_str();
+    let table_name = resolved.stored_name.as_str();
     // For attached databases, qualify sqlite_schema with the database name
     // so that the UPDATE targets the correct database's schema table.
     let qualified_schema_table = schema_table_name_for_db(resolver, database_id);
     let schema_version = resolver.with_schema(database_id, |s| s.schema_version);
-    validate(&alter_table, table_name)?;
+    validate(&alter_table, &resolved.name)?;
     reject_alter_of_view(&alter_table, table_name, resolver, database_id)?;
 
     let table_indexes = resolver.with_schema(database_id, |s| {
@@ -868,6 +871,7 @@ pub fn translate_alter_table(
                             identifier: table_name.to_string(),
                             internal_id: TableInternalId::from(0),
                             table: Table::BTree(Arc::new(btree.clone())),
+                            database_id,
                             join_info: None,
                             col_used_mask: ColumnUsedMask::default(),
                             cte_select: None,
@@ -1291,7 +1295,7 @@ pub fn translate_alter_table(
                             .iter()
                             .filter_map(|c| c.name.as_deref())
                             .collect();
-                        validate_check_expr(expr, &btree.name, &column_names, resolver)?;
+                        validate_check_expr(expr, &resolved.name, &column_names, resolver)?;
                         btree.check_constraints.push(CheckConstraint::new(
                             constraint.name.as_ref(),
                             expr,
@@ -1430,7 +1434,12 @@ pub fn translate_alter_table(
             )?
         }
         ast::AlterTableBody::RenameTo(new_name) => {
-            let new_name = new_name.as_str();
+            resolver.check_name_is_not_under_another_prefix(&ResolvedName::in_namespace(
+                resolved.namespace.clone(),
+                &normalize_ident(new_name.as_str()),
+            ))?;
+            let new_name_in_sql = resolved.namespace.name_in_sql(&new_name);
+            let new_name = new_name_in_sql.as_str();
             let normalized_old_name = normalize_ident(table_name);
             let normalized_new_name = normalize_ident(new_name);
             let mut temp_triggers_to_rewrite: Vec<(String, String, bool)> = Vec::new();
@@ -1840,7 +1849,7 @@ pub fn translate_alter_table(
                     .collect();
                 for constraint in &definition.constraints {
                     if let ast::ColumnConstraint::Check { expr, .. } = &constraint.constraint {
-                        validate_check_expr(expr, &table.name, &column_names, resolver)?;
+                        validate_check_expr(expr, &resolved.name, &column_names, resolver)?;
                     }
                 }
                 Some(table)

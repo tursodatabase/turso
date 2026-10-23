@@ -381,3 +381,20 @@ expect {
     1|1|0
     2|2|1
 }
+
+test table-name-that-starts-with-a-quote {
+    CREATE TABLE """x" (a int);
+    INSERT INTO """x" VALUES (1);
+    SELECT a FROM """x";
+    SELECT """x".a FROM """x";
+    CREATE INDEX """i" ON """x" (a);
+    ALTER TABLE """x" RENAME TO """y";
+    SELECT a FROM """y";
+    DROP INDEX """i";
+    DROP TABLE """y";
+}
+expect {
+    1
+    1
+    1
+}

@@ -1238,6 +1238,7 @@ fn plan_cte(
                 identifier: referenced_cte_table.identifier.clone(),
                 internal_id: referenced_cte_table.internal_id,
                 table: referenced_cte_table.table.clone(),
+                database_id: referenced_cte_table.database_id,
                 join_info: None,
                 col_used_mask: ColumnUsedMask::default(),
                 cte_select: None,
@@ -1440,6 +1441,7 @@ fn prepare_recursive_cte_plan(
         identifier: cte_definition.name.clone(),
         internal_id: input_table.internal_id,
         table: input_table.table,
+        database_id: input_table.database_id,
         join_info: None,
         col_used_mask: ColumnUsedMask::default(),
         cte_select: None,
@@ -1636,6 +1638,7 @@ fn parse_from_clause_table(
                     identifier: cte_definition.name.clone(),
                     internal_id: cte_table.internal_id,
                     table: cte_table.table,
+                    database_id: cte_table.database_id,
                     join_info: None,
                     col_used_mask: ColumnUsedMask::default(),
                     cte_select: (!cte_definition.references_itself)
@@ -1758,7 +1761,7 @@ fn parse_from_clause_table(
                 .joined_tables_mut()
                 .last_mut()
                 .expect("the nested SELECT added one table");
-            keep_parenthesized_join_columns(table)
+            keep_parenthesized_join_columns(table, resolver)
         }
     }
 }
@@ -1767,7 +1770,7 @@ fn parse_from_clause_table(
 ///
 /// A normal `SELECT *` removes duplicate `USING` columns and all rowids.
 /// SQLite keeps those values because an outer query can use qualified names.
-fn keep_parenthesized_join_columns(table: &mut JoinedTable) -> Result<()> {
+fn keep_parenthesized_join_columns(table: &mut JoinedTable, resolver: &Resolver) -> Result<()> {
     let Table::FromClauseSubquery(subquery) = &mut table.table else {
         unreachable!("a parenthesized join must produce a subquery table");
     };
@@ -1814,8 +1817,13 @@ fn keep_parenthesized_join_columns(table: &mut JoinedTable) -> Result<()> {
                     .any(|name| name.as_str().eq_ignore_ascii_case(column_name))
         };
 
-        let database_id = matches!(source_table.table, Table::BTree(_) | Table::Virtual(_))
-            .then_some(source_table.database_id);
+        let namespace =
+            matches!(source_table.table, Table::BTree(_) | Table::Virtual(_)).then(|| {
+                resolver.namespace_of_stored_name(
+                    source_table.database_id,
+                    source_table.table.get_name(),
+                )
+            });
         let source_join_columns = source_table.table.parenthesized_join_columns();
         for (column_index, column) in source_table.columns().iter().enumerate() {
             let Some(column_name) = column.name.as_deref() else {
@@ -1828,7 +1836,7 @@ fn keep_parenthesized_join_columns(table: &mut JoinedTable) -> Result<()> {
                 None if column.hidden() => continue,
                 None => ParenthesizedJoinColumn {
                     source: ParenthesizedJoinColumnSource::Table {
-                        database_id,
+                        namespace: namespace.clone(),
                         table_name: source_table.identifier.clone(),
                         column_name: column_name.to_string(),
                     },
@@ -1873,7 +1881,7 @@ fn keep_parenthesized_join_columns(table: &mut JoinedTable) -> Result<()> {
             ));
             join_columns.push(ParenthesizedJoinColumn {
                 source: ParenthesizedJoinColumnSource::RowId {
-                    database_id,
+                    namespace: namespace.clone(),
                     table_name: source_table.identifier.clone(),
                 },
                 visibility: ParenthesizedJoinColumnVisibility::Visible,
@@ -2119,8 +2127,10 @@ fn parse_table(
     }
 
     // Resolve table using connection's with_schema method
-    let database_id = resolver.resolve_existing_table_database_id_qualified(qualified_name)?;
-    let table = resolver.with_schema(database_id, |schema| schema.get_table(table_name.as_str()));
+    let resolved = resolver.resolve_existing_table(qualified_name)?;
+    let database_id = resolved.database_id();
+    let stored_name = resolved.stored_name.as_str();
+    let table = resolver.with_schema(database_id, |schema| schema.get_table(stored_name));
 
     if let Some(table) = table {
         let alias = maybe_alias.map(|a| normalize_ident(a.name().as_str()));
@@ -2155,8 +2165,7 @@ fn parse_table(
         return Ok(());
     };
 
-    let regular_view =
-        resolver.with_schema(database_id, |schema| schema.get_view(table_name.as_str()));
+    let regular_view = resolver.with_schema(database_id, |schema| schema.get_view(stored_name));
     if let Some(view) = regular_view {
         // Views are essentially query aliases, so just Expand the view as a subquery.
         let view_alias = maybe_alias
@@ -2170,18 +2179,19 @@ fn parse_table(
         // sqlite3FixSelect/sqlite3FixSrcList): a view's unqualified names are
         // fixed to the database it was created in, not resolved TEMP-first
         // like an ordinary top-level query.
-        let view_plan = resolver.with_view_scope(database_id, view.name.clone(), || {
-            program.with_view_expansion(database_id, &view.name, |program| {
-                prepare_select_plan(
-                    view.select_stmt.clone(),
-                    resolver,
-                    program,
-                    table_references.outer_query_refs(),
-                    QueryDestination::placeholder_for_subquery(),
-                    connection,
-                )
-            })
-        })?;
+        let view_plan =
+            resolver.with_view_scope(resolved.namespace.clone(), view.name.clone(), || {
+                program.with_view_expansion(database_id, &view.name, |program| {
+                    prepare_select_plan(
+                        view.select_stmt.clone(),
+                        resolver,
+                        program,
+                        table_references.outer_query_refs(),
+                        QueryDestination::placeholder_for_subquery(),
+                        connection,
+                    )
+                })
+            })?;
         table_references.add_joined_table(JoinedTable::new_subquery_from_plan(
             view_alias,
             view_plan,
@@ -2195,13 +2205,13 @@ fn parse_table(
     }
 
     let view = resolver.with_schema(database_id, |schema| {
-        schema.get_materialized_view(table_name.as_str())
+        schema.get_materialized_view(stored_name)
     });
     if let Some(view) = view {
         // Every materialized view carries an explicit storage-version marker,
         // including circuits with no stateful operators.
         let has_compatible_storage = resolver.with_schema(database_id, |schema| {
-            schema.has_compatible_materialized_view_storage(table_name.as_str())
+            schema.has_compatible_materialized_view_storage(stored_name)
         });
 
         if !has_compatible_storage {
@@ -2292,9 +2302,7 @@ fn parse_table(
 
     // Check if this is an incompatible view
     let is_incompatible = resolver.with_schema(database_id, |schema| {
-        schema
-            .incompatible_views
-            .contains(&normalized_qualified_name)
+        schema.incompatible_views.contains(stored_name)
     });
 
     if is_incompatible {
@@ -2310,7 +2318,7 @@ fn parse_table(
 
     // A view row whose stored SQL failed to parse at schema load
     let is_broken_view = resolver.with_schema(database_id, |schema| {
-        schema.broken_views.contains(&normalized_qualified_name)
+        schema.broken_views.contains(stored_name)
     });
 
     if is_broken_view {
@@ -2502,6 +2510,7 @@ fn add_ctes_read_by_subqueries_as_outer_refs(
             identifier: cte_definition.name.clone(),
             internal_id: joined_table.internal_id,
             table: joined_table.table,
+            database_id: joined_table.database_id,
             join_info: None,
             col_used_mask: ColumnUsedMask::default(),
             cte_select: (!cte_definition.references_itself).then(|| cte_definition.select.clone()),

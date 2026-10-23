@@ -2939,9 +2939,9 @@ impl Connection {
 
     pub fn attached_database_names(&self) -> Vec<String> {
         self.namespaces
-            .others()
+            .attached_databases()
             .into_iter()
-            .map(|(_, name)| name)
+            .map(|namespace| namespace.name)
             .collect()
     }
 
@@ -3208,9 +3208,9 @@ impl Connection {
 
     pub(crate) fn is_attached(&self, alias: &str) -> bool {
         self.namespaces
-            .others()
+            .attached_databases()
             .iter()
-            .any(|(_, name)| name == alias)
+            .any(|namespace| namespace.name == alias)
     }
 
     /// List all attached database aliases
@@ -3308,14 +3308,12 @@ impl Connection {
         &self.attached_databases
     }
 
-    pub(crate) fn namespaces(&self) -> &crate::Namespaces {
+    pub fn namespaces(&self) -> &crate::Namespaces {
         &self.namespaces
     }
 
-    /// Adds namespace `name`, which refers to database `database_id`, so
-    /// that `name.t` names the objects of that database.
-    pub fn add_namespace(&self, name: &str, database_id: usize) {
-        self.namespaces.add(name, database_id);
+    pub fn add_namespace(&self, namespace: crate::Namespace) {
+        self.namespaces.add(namespace);
         self.bump_prepare_context_generation();
     }
 
@@ -3326,9 +3324,10 @@ impl Connection {
         database_id
     }
 
-    /// The name of the namespace that refers to database `database_id`.
     pub fn namespace_name(&self, database_id: usize) -> Option<String> {
-        self.namespaces.name(database_id)
+        self.namespaces
+            .of_database(database_id)
+            .map(|namespace| namespace.name)
     }
 
     /// Sets the namespace names that a name without a namespace is looked
@@ -3346,10 +3345,10 @@ impl Connection {
         self.search_path.read().clone()
     }
 
-    /// The databases that a name without a namespace is looked up in, in
+    /// The namespaces that a name without a namespace is looked up in, in
     /// order. The first one is where CREATE puts an object whose name has
     /// no namespace.
-    pub fn search_order(&self) -> Vec<usize> {
+    pub fn search_order(&self) -> Vec<crate::Namespace> {
         self.namespaces
             .search_order(self.search_path.read().as_deref())
     }
@@ -3416,13 +3415,14 @@ impl Connection {
 
         // Add attached databases
         let attached_dbs = self.attached_databases.read();
-        for (seq_number, alias) in self.namespaces.others() {
+        for namespace in self.namespaces.attached_databases() {
+            let seq_number = namespace.database_id;
             let file_path = if let Some(entry) = attached_dbs.index_to_data.get(&seq_number) {
                 Self::get_canonical_path_for_database(&entry.db)
             } else {
                 String::new()
             };
-            databases.push((seq_number, alias, file_path));
+            databases.push((seq_number, namespace.name, file_path));
         }
 
         // Sort by sequence number to ensure consistent ordering
@@ -3577,26 +3577,32 @@ impl Connection {
         let not_found = |seq_name: &str| {
             LimboError::ParseError(format!("sequence \"{seq_name}\" does not exist"))
         };
-        let get = |db_id: usize, seq_name: &str| {
-            self.with_schema(db_id, |schema| {
-                schema.get_sequence(seq_name).map(Arc::clone)
+        let get = |namespace: &crate::Namespace, seq_name: &str| {
+            let stored_name = namespace.stored_name(seq_name);
+            self.with_schema(namespace.database_id, |schema| {
+                schema.get_sequence(&stored_name).map(Arc::clone)
             })
-            .map(|sequence| (db_id, sequence))
+            .map(|sequence| (namespace.database_id, sequence))
         };
-        if let Some((schema, seq)) = name.split_once('.') {
-            let db_id = self.get_database_id_by_name(schema)?;
-            let seq_name = crate::util::normalize_ident(seq);
-            return get(db_id, &seq_name).ok_or_else(|| not_found(&seq_name));
+        let (namespace, seq_name) = crate::util::split_qualified_name(name);
+        let seq_name = crate::util::normalize_ident(&seq_name);
+        if let Some(namespace) = namespace {
+            let namespace = self
+                .namespaces
+                .get(&crate::util::normalize_ident(&namespace))
+                .ok_or_else(|| {
+                    LimboError::InvalidArgument(format!("no such database: {namespace}"))
+                })?;
+            return get(&namespace, &seq_name).ok_or_else(|| not_found(&seq_name));
         }
-        let seq_name = crate::util::normalize_ident(name);
-        let mut databases = Vec::new();
+        let mut namespaces = Vec::new();
         if self.temp.database.read().is_some() {
-            databases.push(TEMP_DB_ID);
+            namespaces.extend(self.namespaces.of_database(TEMP_DB_ID));
         }
-        databases.extend(self.search_order());
-        databases
-            .into_iter()
-            .find_map(|db_id| get(db_id, &seq_name))
+        namespaces.extend(self.search_order());
+        namespaces
+            .iter()
+            .find_map(|namespace| get(namespace, &seq_name))
             .ok_or_else(|| not_found(&seq_name))
     }
 
@@ -5084,6 +5090,14 @@ mod tests {
     use tempfile::TempDir;
 
     fn open_connection_with_opts(path: &std::path::Path, opts: DatabaseOpts) -> Arc<Connection> {
+        open_connection_with_dialect(path, opts, Arc::new(SqliteDialect))
+    }
+
+    fn open_connection_with_dialect(
+        path: &std::path::Path,
+        opts: DatabaseOpts,
+        dialect: Arc<dyn crate::Dialect>,
+    ) -> Arc<Connection> {
         let io: Arc<dyn IO> = Arc::new(crate::PlatformIO::new().unwrap());
         let db = Database::open_file_with_flags(
             io,
@@ -5091,10 +5105,61 @@ mod tests {
             OpenFlags::default(),
             opts,
             None,
-            Arc::new(SqliteDialect),
+            dialect,
         )
         .unwrap();
         db.connect(ConnectOpts::new()).unwrap()
+    }
+
+    /// The SQLite dialect, except that it binds the names in a view or a
+    /// column default when the view or table is created, like PostgreSQL.
+    struct BindingDialect;
+
+    impl crate::Dialect for BindingDialect {
+        fn name(&self) -> &'static str {
+            "binding"
+        }
+
+        fn parse(&self, sql: &str) -> Result<(Option<turso_parser::ast::Cmd>, usize)> {
+            SqliteDialect.parse(sql)
+        }
+
+        fn parse_table_sql(&self, sql: &str, root_page: i64) -> Result<crate::schema::BTreeTable> {
+            SqliteDialect.parse_table_sql(sql, root_page)
+        }
+
+        fn parse_table_sql_ast(&self, sql: &str) -> Result<turso_parser::ast::Stmt> {
+            SqliteDialect.parse_table_sql_ast(sql)
+        }
+
+        fn table_sql_for_replay(&self, sql: &str) -> Result<String> {
+            SqliteDialect.table_sql_for_replay(sql)
+        }
+
+        fn format_table_sql(
+            &self,
+            input: &str,
+            tbl_name: &turso_parser::ast::QualifiedName,
+            body: &turso_parser::ast::CreateTableBody,
+        ) -> Result<String> {
+            SqliteDialect.format_table_sql(input, tbl_name, body)
+        }
+
+        fn register_catalog(
+            &self,
+            schema: &mut crate::schema::Schema,
+            enable_custom_types: bool,
+        ) -> Result<()> {
+            SqliteDialect.register_catalog(schema, enable_custom_types)
+        }
+
+        fn resolve_function(&self, name: &str, arg_count: usize) -> Result<Option<crate::Func>> {
+            SqliteDialect.resolve_function(name, arg_count)
+        }
+
+        fn binds_names_at_create(&self) -> bool {
+            true
+        }
     }
 
     fn open_connection(path: &std::path::Path) -> Arc<Connection> {
@@ -5132,6 +5197,18 @@ mod tests {
             StepResult::Row => stmt.row().unwrap().get::<i64>(0).unwrap(),
             other => panic!("expected a row, got {other:?}"),
         }
+    }
+
+    /// Like `query_single_i64`, but runs the statement to its end so that
+    /// what it wrote is committed.
+    fn run_single_i64(conn: &Arc<Connection>, sql: &str) -> i64 {
+        let mut stmt = conn.prepare(sql).unwrap();
+        let value = match stmt.step().unwrap() {
+            StepResult::Row => stmt.row().unwrap().get::<i64>(0).unwrap(),
+            other => panic!("expected a row, got {other:?}"),
+        };
+        while !matches!(stmt.step().unwrap(), StepResult::Done) {}
+        value
     }
 
     fn text_value(value: &Value) -> &str {
@@ -5246,6 +5323,401 @@ mod tests {
         assert_eq!(query_single_i64(&conn, "SELECT x FROM t"), 5);
         conn.execute("CREATE TABLE v(z INTEGER)").unwrap();
         assert_eq!(query_single_i64(&conn, "SELECT count(*) FROM main.v"), 0);
+    }
+
+    #[test]
+    fn test_a_namespace_with_a_prefix_names_the_objects_stored_under_the_prefix() {
+        let temp_dir = TempDir::new().unwrap();
+        let conn = open_connection_with_opts(&temp_dir.path().join("main.db"), DatabaseOpts::new());
+        conn.execute("CREATE TABLE \"app.t\"(x INTEGER); INSERT INTO \"app.t\" VALUES(5)")
+            .unwrap();
+        conn.execute("CREATE TABLE t(x INTEGER); INSERT INTO t VALUES(1)")
+            .unwrap();
+        conn.add_namespace(crate::Namespace {
+            name: "app".to_string(),
+            database_id: MAIN_DB_ID,
+            prefix: "app.".to_string(),
+        });
+
+        assert_eq!(query_single_i64(&conn, "SELECT x FROM app.t"), 5);
+        assert_eq!(query_single_i64(&conn, "SELECT x FROM t"), 1);
+        conn.execute("INSERT INTO app.t VALUES(6)").unwrap();
+        conn.execute("UPDATE app.t SET x = x + 10 WHERE x = 6")
+            .unwrap();
+        assert_eq!(query_single_i64(&conn, "SELECT sum(x) FROM app.t"), 21);
+        conn.execute("DELETE FROM app.t WHERE x = 16").unwrap();
+        assert_eq!(query_single_i64(&conn, "SELECT count(*) FROM app.t"), 1);
+        assert_eq!(query_single_i64(&conn, "SELECT count(*) FROM t"), 1);
+
+        conn.execute("DROP TABLE app.t").unwrap();
+        assert!(conn.prepare("SELECT x FROM app.t").is_err());
+        assert!(conn.prepare("SELECT x FROM \"app.t\"").is_err());
+        assert_eq!(query_single_i64(&conn, "SELECT x FROM t"), 1);
+    }
+
+    #[test]
+    fn test_an_object_of_main_cannot_take_a_name_under_the_prefix_of_a_namespace() {
+        let temp_dir = TempDir::new().unwrap();
+        let conn = open_connection_with_opts(&temp_dir.path().join("main.db"), DatabaseOpts::new());
+        conn.execute("CREATE TABLE t(x INTEGER)").unwrap();
+        conn.add_namespace(crate::Namespace {
+            name: "app".to_string(),
+            database_id: MAIN_DB_ID,
+            prefix: "app.".to_string(),
+        });
+
+        for sql in [
+            "CREATE TABLE \"app.u\"(x INTEGER)",
+            "CREATE TABLE main.\"app.u\"(x INTEGER)",
+            "CREATE VIEW \"app.v\" AS SELECT 1",
+            "CREATE SEQUENCE \"app.s\"",
+            "CREATE INDEX \"app.i\" ON t(x)",
+            "CREATE TRIGGER \"app.tr\" AFTER INSERT ON t BEGIN SELECT 1; END",
+            "ALTER TABLE t RENAME TO \"app.u\"",
+        ] {
+            let err = conn.execute(sql).unwrap_err().to_string();
+            assert!(err.contains("the prefix of app"), "{sql}: {err}");
+        }
+        conn.execute("CREATE TABLE app.u(x INTEGER); INSERT INTO app.u VALUES(2)")
+            .unwrap();
+        assert_eq!(query_single_i64(&conn, "SELECT x FROM app.u"), 2);
+    }
+
+    #[test]
+    fn test_the_search_path_finds_objects_through_a_namespace_with_a_prefix() {
+        let temp_dir = TempDir::new().unwrap();
+        let conn = open_connection_with_opts(&temp_dir.path().join("main.db"), DatabaseOpts::new());
+        conn.execute("CREATE TABLE \"app.t\"(x INTEGER); INSERT INTO \"app.t\" VALUES(5)")
+            .unwrap();
+        conn.execute("CREATE TABLE t(x INTEGER); INSERT INTO t VALUES(1)")
+            .unwrap();
+        conn.execute("CREATE SEQUENCE \"app.s\" START WITH 100")
+            .unwrap();
+        conn.execute("CREATE SEQUENCE s START WITH 1").unwrap();
+        conn.add_namespace(crate::Namespace {
+            name: "app".to_string(),
+            database_id: MAIN_DB_ID,
+            prefix: "app.".to_string(),
+        });
+
+        conn.set_search_path(Some(vec!["app".to_string()]));
+        assert_eq!(query_single_i64(&conn, "SELECT x FROM t"), 5);
+        assert_eq!(run_single_i64(&conn, "SELECT nextval('s')"), 100);
+        assert_eq!(query_single_i64(&conn, "SELECT currval('s')"), 100);
+        assert_eq!(run_single_i64(&conn, "SELECT nextval('app.s')"), 101);
+        assert_eq!(run_single_i64(&conn, "SELECT nextval('main.s')"), 1);
+        assert_eq!(conn.search_order()[0].name, "app");
+
+        conn.set_search_path(Some(vec!["main".to_string(), "app".to_string()]));
+        assert_eq!(query_single_i64(&conn, "SELECT x FROM t"), 1);
+        assert_eq!(run_single_i64(&conn, "SELECT nextval('s')"), 2);
+        conn.execute("DROP TABLE t").unwrap();
+        assert_eq!(query_single_i64(&conn, "SELECT x FROM t"), 5);
+
+        conn.set_search_path(Some(vec!["app".to_string(), "main".to_string()]));
+        conn.execute("DROP SEQUENCE s").unwrap();
+        assert!(conn.prepare("SELECT nextval('app.s')").is_err());
+        assert_eq!(run_single_i64(&conn, "SELECT nextval('s')"), 3);
+    }
+
+    #[test]
+    fn test_a_column_named_with_its_namespace_reads_the_table_of_that_namespace() {
+        let temp_dir = TempDir::new().unwrap();
+        let conn = open_connection_with_opts(&temp_dir.path().join("main.db"), DatabaseOpts::new());
+        conn.execute("CREATE TABLE \"app.t\"(x INTEGER); INSERT INTO \"app.t\" VALUES(1)")
+            .unwrap();
+        conn.execute("CREATE TABLE t(x INTEGER); INSERT INTO t VALUES(2)")
+            .unwrap();
+        conn.add_namespace(crate::Namespace {
+            name: "app".to_string(),
+            database_id: MAIN_DB_ID,
+            prefix: "app.".to_string(),
+        });
+
+        for (sql, expected) in [
+            ("SELECT app.t.x FROM app.t JOIN main.t", 1),
+            ("SELECT main.t.x FROM app.t JOIN main.t", 2),
+            ("SELECT app.t.x FROM (app.t JOIN main.t)", 1),
+            ("SELECT main.t.x FROM (app.t JOIN main.t)", 2),
+            ("SELECT (SELECT app.t.x FROM main.t) FROM app.t", 1),
+            ("SELECT (SELECT main.t.x FROM app.t) FROM main.t", 2),
+        ] {
+            assert_eq!(query_single_i64(&conn, sql), expected, "{sql}");
+        }
+    }
+
+    #[test]
+    fn test_a_view_may_read_a_table_of_another_namespace_of_its_database() {
+        let temp_dir = TempDir::new().unwrap();
+        let conn = open_connection_with_opts(
+            &temp_dir.path().join("main.db"),
+            DatabaseOpts::new().with_views(true).with_attach(true),
+        );
+        conn.execute("CREATE TABLE \"app.t\"(x INTEGER); INSERT INTO \"app.t\" VALUES(3)")
+            .unwrap();
+        conn.add_namespace(crate::Namespace {
+            name: "app".to_string(),
+            database_id: MAIN_DB_ID,
+            prefix: "app.".to_string(),
+        });
+        conn.execute("ATTACH ':memory:aux' AS aux; CREATE TABLE aux.t(x INTEGER)")
+            .unwrap();
+
+        conn.execute("CREATE VIEW v AS SELECT x FROM app.t")
+            .unwrap();
+        assert_eq!(query_single_i64(&conn, "SELECT x FROM v"), 3);
+        conn.execute("CREATE MATERIALIZED VIEW mv AS SELECT x FROM app.t")
+            .unwrap();
+        assert_eq!(query_single_i64(&conn, "SELECT x FROM mv"), 3);
+        conn.execute("CREATE VIEW app.v AS SELECT x FROM main.\"app.t\"")
+            .unwrap();
+        assert_eq!(query_single_i64(&conn, "SELECT x FROM app.v"), 3);
+
+        let err = conn
+            .prepare("CREATE VIEW w AS SELECT x FROM aux.t")
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(
+            err.contains("view cannot reference table in attached database"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn test_a_materialized_view_in_a_namespace_follows_the_tables_of_its_namespace() {
+        let temp_dir = TempDir::new().unwrap();
+        let conn = open_connection_with_dialect(
+            &temp_dir.path().join("main.db"),
+            DatabaseOpts::new().with_views(true),
+            Arc::new(BindingDialect),
+        );
+        conn.execute("CREATE TABLE \"app.t\"(x INTEGER); INSERT INTO \"app.t\" VALUES(5)")
+            .unwrap();
+        conn.execute("CREATE TABLE t(x INTEGER); INSERT INTO t VALUES(100)")
+            .unwrap();
+        conn.add_namespace(crate::Namespace {
+            name: "app".to_string(),
+            database_id: MAIN_DB_ID,
+            prefix: "app.".to_string(),
+        });
+        conn.set_search_path(Some(vec!["app".to_string(), "main".to_string()]));
+        conn.execute("CREATE MATERIALIZED VIEW mv AS SELECT sum(x) AS s FROM t")
+            .unwrap();
+        conn.set_search_path(Some(vec!["main".to_string()]));
+        assert_eq!(query_single_i64(&conn, "SELECT s FROM app.mv"), 5);
+
+        conn.execute("INSERT INTO app.t VALUES(6)").unwrap();
+        assert_eq!(query_single_i64(&conn, "SELECT s FROM app.mv"), 11);
+        conn.execute("INSERT INTO t VALUES(200)").unwrap();
+        assert_eq!(query_single_i64(&conn, "SELECT s FROM app.mv"), 11);
+    }
+
+    #[test]
+    fn test_a_view_binds_its_tables_through_the_search_path_when_created() {
+        let temp_dir = TempDir::new().unwrap();
+        let conn = open_connection_with_dialect(
+            &temp_dir.path().join("main.db"),
+            DatabaseOpts::new().with_views(true),
+            Arc::new(BindingDialect),
+        );
+        conn.execute("CREATE TABLE t(x INTEGER); INSERT INTO t VALUES(1)")
+            .unwrap();
+        conn.add_namespace(crate::Namespace {
+            name: "app".to_string(),
+            database_id: MAIN_DB_ID,
+            prefix: "app.".to_string(),
+        });
+        conn.set_search_path(Some(vec!["app".to_string(), "main".to_string()]));
+        conn.execute("CREATE VIEW v AS SELECT t.x FROM t").unwrap();
+        conn.execute("CREATE VIEW w AS WITH c AS (SELECT x FROM t) SELECT x FROM c WHERE x IN (SELECT x FROM t)")
+            .unwrap();
+        conn.execute("CREATE TABLE c(x INTEGER); INSERT INTO c VALUES(1), (2), (3)")
+            .unwrap();
+        conn.execute(
+            "CREATE VIEW n AS SELECT * FROM (WITH c AS (SELECT 1 AS x) SELECT (SELECT count(*) FROM c) AS k) s",
+        )
+        .unwrap();
+        conn.execute(
+            "CREATE VIEW u AS SELECT x FROM c UNION ALL SELECT (WITH c AS (SELECT 5 AS x) SELECT x FROM c)",
+        )
+        .unwrap();
+        conn.execute(
+            "CREATE VIEW r AS WITH RECURSIVE a AS (SELECT x FROM c), c AS (SELECT 7 AS x) SELECT x FROM a",
+        )
+        .unwrap();
+        conn.execute("CREATE TABLE t(x INTEGER); INSERT INTO t VALUES(2)")
+            .unwrap();
+
+        assert_eq!(query_single_i64(&conn, "SELECT x FROM t"), 2);
+        assert_eq!(query_single_i64(&conn, "SELECT x FROM app.v"), 1);
+        assert_eq!(query_single_i64(&conn, "SELECT x FROM app.w"), 1);
+        assert_eq!(query_single_i64(&conn, "SELECT k FROM app.n"), 1);
+        assert_eq!(query_single_i64(&conn, "SELECT sum(x) FROM app.u"), 11);
+        assert_eq!(query_single_i64(&conn, "SELECT x FROM app.r"), 7);
+        conn.set_search_path(Some(vec!["main".to_string()]));
+        assert_eq!(query_single_i64(&conn, "SELECT x FROM app.v"), 1);
+    }
+
+    #[test]
+    fn test_a_column_named_with_its_namespace_binds_in_returning_and_upsert() {
+        let temp_dir = TempDir::new().unwrap();
+        let conn = open_connection_with_opts(&temp_dir.path().join("main.db"), DatabaseOpts::new());
+        conn.execute("CREATE TABLE \"app.t\"(id INTEGER PRIMARY KEY, x INTEGER)")
+            .unwrap();
+        conn.execute("INSERT INTO \"app.t\" VALUES(1, 5)").unwrap();
+        conn.add_namespace(crate::Namespace {
+            name: "app".to_string(),
+            database_id: MAIN_DB_ID,
+            prefix: "app.".to_string(),
+        });
+
+        assert_eq!(
+            run_single_i64(&conn, "UPDATE app.t SET x = 6 RETURNING app.t.x"),
+            6
+        );
+        conn.execute(
+            "INSERT INTO app.t VALUES(1, 0) ON CONFLICT(id) DO UPDATE SET x = app.t.x + 1 WHERE app.t.x > 0",
+        )
+        .unwrap();
+        assert_eq!(query_single_i64(&conn, "SELECT x FROM app.t"), 7);
+    }
+
+    #[test]
+    fn test_a_namespace_whose_prefix_is_reserved_holds_objects() {
+        let temp_dir = TempDir::new().unwrap();
+        let conn = open_connection_with_opts(
+            &temp_dir.path().join("main.db"),
+            DatabaseOpts::new().with_views(true),
+        );
+        conn.add_namespace(crate::Namespace {
+            name: "sqlite_x".to_string(),
+            database_id: MAIN_DB_ID,
+            prefix: "sqlite_x.".to_string(),
+        });
+
+        conn.execute("CREATE TABLE sqlite_x.t(x INTEGER); INSERT INTO sqlite_x.t VALUES(1)")
+            .unwrap();
+        conn.execute("CREATE INDEX sqlite_x.i ON t(x)").unwrap();
+        conn.execute("CREATE VIEW sqlite_x.v AS SELECT x FROM t")
+            .unwrap();
+        conn.execute("CREATE MATERIALIZED VIEW sqlite_x.mv AS SELECT x FROM t")
+            .unwrap();
+        assert_eq!(query_single_i64(&conn, "SELECT x FROM sqlite_x.v"), 1);
+        assert_eq!(query_single_i64(&conn, "SELECT x FROM sqlite_x.mv"), 1);
+        conn.execute("ALTER TABLE sqlite_x.t ADD COLUMN y INTEGER")
+            .unwrap();
+        conn.execute("CREATE TRIGGER sqlite_x.tr AFTER INSERT ON t BEGIN SELECT 1; END")
+            .unwrap();
+        conn.execute("DROP VIEW sqlite_x.mv; DROP VIEW sqlite_x.v; DROP TABLE sqlite_x.t")
+            .unwrap();
+        assert!(conn.prepare("SELECT x FROM sqlite_x.t").is_err());
+
+        assert!(conn.execute("CREATE TABLE sqlite_y(x INTEGER)").is_err());
+        assert!(conn
+            .execute("CREATE INDEX sqlite_x.sqlite_j ON t(x)")
+            .is_err());
+    }
+
+    #[test]
+    fn test_a_stored_name_under_the_prefix_of_a_namespace_is_not_seen_through_another() {
+        let temp_dir = TempDir::new().unwrap();
+        let conn = open_connection_with_opts(&temp_dir.path().join("main.db"), DatabaseOpts::new());
+        conn.execute("CREATE TABLE \"app.t\"(x INTEGER); INSERT INTO \"app.t\" VALUES(1)")
+            .unwrap();
+        conn.execute("CREATE SEQUENCE \"app.s\"").unwrap();
+        conn.add_namespace(crate::Namespace {
+            name: "app".to_string(),
+            database_id: MAIN_DB_ID,
+            prefix: "app.".to_string(),
+        });
+        conn.add_namespace(crate::Namespace::database("public", MAIN_DB_ID));
+        conn.set_search_path(Some(vec!["public".to_string()]));
+
+        assert!(conn.prepare("SELECT x FROM \"app.t\"").is_err());
+        assert!(conn.prepare("SELECT x FROM public.\"app.t\"").is_err());
+        assert!(conn.prepare("DROP TABLE public.\"app.t\"").is_err());
+        assert!(conn.prepare("SELECT nextval('\"app.s\"')").is_err());
+        conn.execute("DROP TABLE IF EXISTS \"app.t\"").unwrap();
+        conn.execute("DROP TABLE IF EXISTS public.\"app.t\"")
+            .unwrap();
+        assert_eq!(query_single_i64(&conn, "SELECT x FROM app.t"), 1);
+        assert_eq!(query_single_i64(&conn, "SELECT x FROM main.\"app.t\""), 1);
+    }
+
+    #[test]
+    fn test_the_expressions_of_a_table_name_it_by_its_name_in_the_namespace() {
+        let temp_dir = TempDir::new().unwrap();
+        let conn = open_connection_with_dialect(
+            &temp_dir.path().join("main.db"),
+            DatabaseOpts::new(),
+            Arc::new(BindingDialect),
+        );
+        conn.add_namespace(crate::Namespace {
+            name: "app".to_string(),
+            database_id: MAIN_DB_ID,
+            prefix: "app.".to_string(),
+        });
+        conn.execute("CREATE TABLE app.t(x INTEGER CHECK (t.x > 0))")
+            .unwrap();
+        conn.execute("ALTER TABLE app.t ADD COLUMN y INTEGER CHECK (t.y <> 7)")
+            .unwrap();
+        conn.execute("CREATE UNIQUE INDEX app.u ON t (x) WHERE t.x > 10")
+            .unwrap();
+        conn.execute("CREATE INDEX app.j ON t ((t.x + 1))").unwrap();
+        conn.execute("INSERT INTO app.t VALUES(1, 1), (11, 2)")
+            .unwrap();
+        conn.execute("INSERT INTO app.t VALUES(11, 3) ON CONFLICT(x) WHERE t.x > 10 DO NOTHING")
+            .unwrap();
+        assert!(conn.execute("INSERT INTO app.t VALUES(-1, 1)").is_err());
+        assert!(conn.execute("INSERT INTO app.t VALUES(2, 7)").is_err());
+        assert_eq!(query_single_i64(&conn, "SELECT count(*) FROM app.t"), 2);
+        assert_eq!(
+            query_single_i64(&conn, "SELECT count(*) FROM app.t WHERE x + 1 = 12"),
+            1
+        );
+
+        conn.execute("CREATE TABLE t(x INTEGER); INSERT INTO t VALUES(5)")
+            .unwrap();
+        assert!(conn.prepare("SELECT main.t.x FROM app.t").is_err());
+        assert!(conn.prepare("SELECT app.t.x FROM main.t").is_err());
+    }
+
+    #[test]
+    fn test_a_foreign_key_action_reaches_a_child_table_of_a_namespace() {
+        let temp_dir = TempDir::new().unwrap();
+        let conn = open_connection_with_opts(&temp_dir.path().join("main.db"), DatabaseOpts::new());
+        conn.add_namespace(crate::Namespace {
+            name: "app".to_string(),
+            database_id: MAIN_DB_ID,
+            prefix: "app.".to_string(),
+        });
+        conn.execute("PRAGMA foreign_keys = ON").unwrap();
+        conn.execute("CREATE TABLE app.p(id INTEGER PRIMARY KEY)")
+            .unwrap();
+        conn.execute("CREATE TABLE app.c(pid INTEGER REFERENCES \"app.p\"(id) ON DELETE CASCADE ON UPDATE CASCADE)")
+            .unwrap();
+        conn.execute("CREATE TABLE app.n(pid INTEGER REFERENCES \"app.p\"(id) ON DELETE SET NULL)")
+            .unwrap();
+        conn.execute("INSERT INTO app.p VALUES(1), (2); INSERT INTO app.c VALUES(1), (2); INSERT INTO app.n VALUES(1)")
+            .unwrap();
+        conn.add_namespace(crate::Namespace::database("public", MAIN_DB_ID));
+        conn.set_search_path(Some(vec!["public".to_string()]));
+
+        conn.execute("UPDATE app.p SET id = 3 WHERE id = 2")
+            .unwrap();
+        assert_eq!(
+            query_single_i64(&conn, "SELECT pid FROM app.c WHERE pid = 3"),
+            3
+        );
+        conn.execute("DELETE FROM app.p WHERE id = 1").unwrap();
+        assert_eq!(query_single_i64(&conn, "SELECT count(*) FROM app.c"), 1);
+        assert_eq!(
+            query_single_i64(&conn, "SELECT count(*) FROM app.n WHERE pid IS NULL"),
+            1
+        );
+        conn.execute("DROP TABLE app.p").unwrap();
+        assert_eq!(query_single_i64(&conn, "SELECT count(*) FROM app.c"), 0);
     }
 
     #[test]

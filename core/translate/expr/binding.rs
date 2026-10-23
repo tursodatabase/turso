@@ -3,6 +3,7 @@ use crate::translate::plan::{
     merge_columns, resolve_unqualified_column, unqualified_column_sources, ColumnLookup,
     OuterQueryReference, ResolvedColumn,
 };
+use crate::Namespace;
 
 /// The precedence of binding identifiers to columns.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -363,13 +364,13 @@ pub fn bind_and_rewrite_expr<'a>(
                         name: tbl_name_clone,
                         alias: None,
                     };
-                    let db_resolution = resolver.resolve_database_id(&qualified_name);
+                    let db_resolution = resolver.resolve_namespace(&qualified_name);
 
-                    if let Ok(database_id) = db_resolution.as_ref() {
+                    if let Ok(namespace) = db_resolution.as_ref() {
                         match resolve_qualified_name(
                             referenced_tables,
                             resolver,
-                            Some(*database_id),
+                            Some(namespace),
                             &tbl_name_str,
                             &normalized_col_name,
                         )? {
@@ -397,9 +398,10 @@ pub fn bind_and_rewrite_expr<'a>(
                     // the table+column exist, use that. Otherwise fall through to
                     // table.column.field for struct/union field access.
                     let mut resolved_as_db_table_col = false;
-                    if let Ok(database_id) = db_resolution {
-                        let table = resolver
-                            .with_schema(database_id, |schema| schema.get_table(&tbl_name_str));
+                    if let Ok(namespace) = db_resolution {
+                        let table = resolver.with_schema(namespace.database_id, |schema| {
+                            schema.get_table(&namespace.stored_name(&tbl_name_str))
+                        });
 
                         if let Some(table) = table {
                             let col_idx = table.columns().iter().position(|c| {
@@ -413,9 +415,50 @@ pub fn bind_and_rewrite_expr<'a>(
                                 let is_rowid_alias = col.is_rowid_alias();
                                 let normalized_tbl_name = normalize_ident(&tbl_name_str);
                                 let matching_tbl = referenced_tables
-                                    .find_table_and_internal_id_by_identifier(&normalized_tbl_name);
+                                    .joined_tables()
+                                    .iter()
+                                    .find(|joined| joined.identifier == normalized_tbl_name)
+                                    .map(|joined| {
+                                        (
+                                            joined.internal_id,
+                                            table_is_in_namespace(
+                                                resolver,
+                                                &joined.table,
+                                                joined.database_id,
+                                                &namespace,
+                                            ),
+                                        )
+                                    })
+                                    .or_else(|| {
+                                        referenced_tables
+                                            .outer_query_refs()
+                                            .iter()
+                                            .find(|outer| {
+                                                outer.identifier == normalized_tbl_name
+                                                    && !outer.cte_definition_only
+                                            })
+                                            .map(|outer| {
+                                                (
+                                                    outer.internal_id,
+                                                    table_is_in_namespace(
+                                                        resolver,
+                                                        &outer.table,
+                                                        outer.database_id,
+                                                        &namespace,
+                                                    ),
+                                                )
+                                            })
+                                    });
 
-                                if let Some((tbl_id, _)) = matching_tbl {
+                                if let Some((_, false)) = matching_tbl {
+                                    crate::bail_parse_error!(
+                                        "no such column: {}.{}.{}",
+                                        db_name_str,
+                                        tbl_name_str,
+                                        col_name_str
+                                    );
+                                }
+                                if let Some((tbl_id, true)) = matching_tbl {
                                     *expr = Expr::Column {
                                         database: None,
                                         table: tbl_id,
@@ -723,7 +766,7 @@ pub(in crate::translate) fn lookup_unqualified_column(
 fn resolve_qualified_name(
     table_references: &TableReferences,
     resolver: &Resolver<'_>,
-    database_id: Option<usize>,
+    namespace: Option<&Namespace>,
     table_name: &str,
     column_name: &str,
 ) -> Result<QualifiedNameMatch> {
@@ -735,13 +778,14 @@ fn resolve_qualified_name(
             &joined_table.table,
             joined_table.internal_id,
             &joined_table.identifier,
-            if database_id == Some(joined_table.database_id)
-                && matches!(joined_table.table, Table::BTree(_) | Table::Virtual(_))
-            {
-                None
-            } else {
-                database_id
-            },
+            namespace.filter(|namespace| {
+                !table_is_in_namespace(
+                    resolver,
+                    &joined_table.table,
+                    joined_table.database_id,
+                    namespace,
+                )
+            }),
             table_name,
             column_name,
         )?;
@@ -786,7 +830,9 @@ fn resolve_qualified_name(
             &outer_ref.table,
             outer_ref.internal_id,
             &outer_ref.identifier,
-            database_id,
+            namespace.filter(|namespace| {
+                !table_is_in_namespace(resolver, &outer_ref.table, outer_ref.database_id, namespace)
+            }),
             table_name,
             column_name,
         )?;
@@ -830,6 +876,19 @@ fn resolve_qualified_name(
     }
 }
 
+fn table_is_in_namespace(
+    resolver: &Resolver<'_>,
+    table: &Table,
+    database_id: usize,
+    namespace: &Namespace,
+) -> bool {
+    matches!(table, Table::BTree(_) | Table::Virtual(_))
+        && database_id == namespace.database_id
+        && resolver
+            .namespace_of_stored_name(database_id, table.get_name())
+            .holds_the_same_objects_as(namespace)
+}
+
 /// Whether the join that added this outer table merged the column with USING.
 fn outer_ref_merges_column(outer_ref: &OuterQueryReference, column_index: usize) -> bool {
     let Some(join_info) = outer_ref.join_info.as_ref() else {
@@ -849,7 +908,7 @@ fn match_qualified_name_in_table(
     table: &Table,
     table_id: TableInternalId,
     table_reference_name: &str,
-    database_id: Option<usize>,
+    namespace: Option<&Namespace>,
     table_name: &str,
     column_name: &str,
 ) -> Result<QualifiedTableMatch> {
@@ -857,7 +916,10 @@ fn match_qualified_name_in_table(
         let mut table_columns = join_columns
             .iter()
             .enumerate()
-            .filter(|(_, join_column)| join_column.source.matches_table(database_id, table_name))
+            .filter(|(_, join_column)| {
+                join_column.source.matches_table(None, table_name)
+                    && namespace.is_none_or(|namespace| join_column.source.in_namespace(namespace))
+            })
             .peekable();
         let table_found = table_columns.peek().is_some();
         let candidates = table_columns
@@ -876,7 +938,7 @@ fn match_qualified_name_in_table(
         }
     }
 
-    if database_id.is_some() || !table_reference_name.eq_ignore_ascii_case(table_name) {
+    if namespace.is_some() || !table_reference_name.eq_ignore_ascii_case(table_name) {
         return Ok(QualifiedTableMatch::NoTable);
     }
     Ok(

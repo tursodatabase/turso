@@ -654,6 +654,8 @@ pub fn emit_upsert(
         .register_affinities
         .insert(ctx.conflict_rowid_reg, Affinity::Integer);
 
+    let table_name = table_references.joined_tables()[0].identifier.clone();
+
     // WHERE on target row
     if let Some(pred) = where_clause.as_mut() {
         rewrite_expr_to_registers(
@@ -661,7 +663,7 @@ pub fn emit_upsert(
             table,
             expr_current_start,
             ctx.conflict_rowid_reg,
-            Some(table.get_name()),
+            Some(&table_name),
             table_alias,
             Some(insertion),
             true,
@@ -685,7 +687,7 @@ pub fn emit_upsert(
             table,
             expr_current_start,
             ctx.conflict_rowid_reg,
-            Some(table.get_name()),
+            Some(&table_name),
             table_alias,
             Some(insertion),
             true,

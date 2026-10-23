@@ -1,7 +1,7 @@
 use crate::alloc::TursoIteratorExt;
 use crate::numeric::StrToF64;
 use crate::schema::{ColDef, FromDefinitionFlags};
-use crate::translate::emitter::TransactionMode;
+use crate::translate::emitter::{Resolver, TransactionMode};
 use crate::translate::expr::{walk_expr, walk_expr_mut, WalkControl};
 use crate::translate::plan::{
     left_using_column_sources, star_column_uses_merged_value, unqualified_column_sources, BitSet,
@@ -128,6 +128,52 @@ pub fn normalize_ident(identifier: &str) -> String {
     // quotes normalization already happened in the parser layer (see Name ast node implementation)
     // so, we only need to apply SQLite's ASCII-only identifier case folding.
     identifier.to_ascii_lowercase()
+}
+
+/// Splits a name written in a string, like the argument of nextval, into
+/// its namespace and its name. A part written in double quotes may contain
+/// dots and doubled quotes; an unquoted namespace ends at the first dot
+/// and an unquoted name runs to the end. The parts keep their case.
+pub fn split_qualified_name(name: &str) -> (Option<String>, String) {
+    fn quoted_part(name: &str) -> Option<(String, &str)> {
+        let mut part = String::new();
+        let mut chars = name.strip_prefix('"')?.char_indices();
+        while let Some((_, c)) = chars.next() {
+            if c != '"' {
+                part.push(c);
+                continue;
+            }
+            match chars.next() {
+                Some((_, '"')) => part.push('"'),
+                Some((next, _)) => return Some((part, &name[1 + next..])),
+                None => return Some((part, "")),
+            }
+        }
+        None
+    }
+
+    match quoted_part(name) {
+        Some((namespace, rest)) => match rest.strip_prefix('.') {
+            Some(rest) => (Some(namespace), unquoted(rest)),
+            None if rest.is_empty() => (None, namespace),
+            None => (None, name.to_string()),
+        },
+        None => match name.split_once('.') {
+            Some((namespace, rest)) => (Some(namespace.to_string()), unquoted(rest)),
+            None => (None, name.to_string()),
+        },
+    }
+}
+
+fn unquoted(name: &str) -> String {
+    let stripped = name
+        .strip_prefix('"')
+        .and_then(|inner| inner.strip_suffix('"'))
+        .filter(|inner| !inner.is_empty());
+    match stripped {
+        Some(inner) => inner.replace("\"\"", "\""),
+        None => name.to_string(),
+    }
 }
 
 /// Escape a SQL string literal payload for safe interpolation inside single quotes.
@@ -1968,18 +2014,18 @@ where
 
 fn validate_no_cross_db_references(
     select_stmt: &ast::Select,
-    view_db_name: Option<&ast::Name>,
+    in_view_database: &dyn Fn(&ast::Name) -> bool,
 ) -> Result<()> {
     if let Some(with_clause) = &select_stmt.with {
         for cte in &with_clause.ctes {
-            validate_no_cross_db_references(&cte.select, view_db_name)?;
+            validate_no_cross_db_references(&cte.select, in_view_database)?;
         }
     }
 
-    validate_one_select_no_cross_db(&select_stmt.body.select, view_db_name)?;
+    validate_one_select_no_cross_db(&select_stmt.body.select, in_view_database)?;
 
     for compound in &select_stmt.body.compounds {
-        validate_one_select_no_cross_db(&compound.select, view_db_name)?;
+        validate_one_select_no_cross_db(&compound.select, in_view_database)?;
     }
 
     Ok(())
@@ -1987,12 +2033,12 @@ fn validate_no_cross_db_references(
 
 fn validate_one_select_no_cross_db(
     one_select: &ast::OneSelect,
-    view_db_name: Option<&ast::Name>,
+    in_view_database: &dyn Fn(&ast::Name) -> bool,
 ) -> Result<()> {
     match one_select {
         ast::OneSelect::Select { from, .. } => {
             if let Some(from_clause) = from {
-                validate_from_clause_no_cross_db(from_clause, view_db_name)?;
+                validate_from_clause_no_cross_db(from_clause, in_view_database)?;
             }
         }
         ast::OneSelect::Values(_) => {}
@@ -2002,27 +2048,21 @@ fn validate_one_select_no_cross_db(
 
 fn validate_from_clause_no_cross_db(
     from_clause: &ast::FromClause,
-    view_db_name: Option<&ast::Name>,
+    in_view_database: &dyn Fn(&ast::Name) -> bool,
 ) -> Result<()> {
-    validate_select_table_no_cross_db(&from_clause.select, view_db_name)?;
+    validate_select_table_no_cross_db(&from_clause.select, in_view_database)?;
     for join in &from_clause.joins {
-        validate_select_table_no_cross_db(&join.table, view_db_name)?;
+        validate_select_table_no_cross_db(&join.table, in_view_database)?;
     }
     Ok(())
 }
 
 fn reject_cross_db_qualified_name(
     qualified_name: &ast::QualifiedName,
-    view_db_name: Option<&ast::Name>,
+    in_view_database: &dyn Fn(&ast::Name) -> bool,
 ) -> Result<()> {
     if let Some(table_db_name) = &qualified_name.namespace {
-        let is_cross_db = match view_db_name {
-            Some(view_db) => !view_db
-                .as_str()
-                .eq_ignore_ascii_case(table_db_name.as_str()),
-            None => !table_db_name.as_str().eq_ignore_ascii_case("main"),
-        };
-        if is_cross_db {
+        if !in_view_database(table_db_name) {
             return Err(crate::LimboError::ParseError(format!(
                 "view cannot reference table in attached database: {qualified_name}"
             )));
@@ -2033,17 +2073,17 @@ fn reject_cross_db_qualified_name(
 
 fn validate_select_table_no_cross_db(
     select_table: &ast::SelectTable,
-    view_db_name: Option<&ast::Name>,
+    in_view_database: &dyn Fn(&ast::Name) -> bool,
 ) -> Result<()> {
     match select_table {
         ast::SelectTable::Table(name, _, _) | ast::SelectTable::TableCall(name, _, _) => {
-            reject_cross_db_qualified_name(name, view_db_name)?;
+            reject_cross_db_qualified_name(name, in_view_database)?;
         }
         ast::SelectTable::Select { select, .. } => {
-            validate_no_cross_db_references(select, view_db_name)?;
+            validate_no_cross_db_references(select, in_view_database)?;
         }
         ast::SelectTable::Sub(from_clause, _) => {
-            validate_from_clause_no_cross_db(from_clause, view_db_name)?;
+            validate_from_clause_no_cross_db(from_clause, in_view_database)?;
         }
     }
     Ok(())
@@ -2064,19 +2104,26 @@ pub fn validate_select_for_unsupported_features(select_stmt: &ast::Select) -> Re
 
 pub fn validate_select_for_views(
     select_stmt: &ast::Select,
-    view_db_name: Option<&ast::Name>,
+    resolver: &Resolver,
+    view_database_id: usize,
 ) -> Result<()> {
     validate_select_for_unsupported_features(select_stmt)?;
 
-    validate_no_cross_db_references(select_stmt, view_db_name)?;
+    if view_database_id == crate::TEMP_DB_ID {
+        return Ok(());
+    }
+    let in_view_database = |name: &ast::Name| {
+        resolver.namespace_database_id(&normalize_ident(name.as_str())) == Some(view_database_id)
+    };
+    validate_no_cross_db_references(select_stmt, &in_view_database)?;
 
     walk_select_expressions(select_stmt, &mut |expr| {
         match expr {
             ast::Expr::Subquery(subquery_select) | ast::Expr::Exists(subquery_select) => {
-                validate_no_cross_db_references(subquery_select, view_db_name)?;
+                validate_no_cross_db_references(subquery_select, &in_view_database)?;
             }
             ast::Expr::InSelect { rhs, .. } => {
-                validate_no_cross_db_references(rhs, view_db_name)?;
+                validate_no_cross_db_references(rhs, &in_view_database)?;
             }
             _ => {}
         }

@@ -1795,11 +1795,13 @@ fn emit_fk_action_subprogram(
     Ok(())
 }
 
-/// Build a QualifiedName with db_name set for non-main databases.
+/// Build a QualifiedName for a table by its stored name, qualified with
+/// the name of its database so that it resolves there and not through the
+/// search path.
 fn qualified_table_name(table_name: &str, db_name: Option<&str>) -> QualifiedName {
     QualifiedName {
-        namespace: db_name.map(Name::from_string),
-        name: Name::from_string(table_name),
+        namespace: db_name.map(|name| Name::exact(name.to_string())),
+        name: Name::exact(table_name.to_string()),
         alias: None,
     }
 }
@@ -1967,11 +1969,7 @@ fn fire_fk_cascade_delete(
     ctx: &FkActionContext,
     database_id: usize,
 ) -> Result<()> {
-    let db_name = if database_id != crate::MAIN_DB_ID {
-        resolver.namespace_name(database_id)
-    } else {
-        None
-    };
+    let db_name = resolver.namespace_name(database_id);
     let child_cols = &fk_ref.fk.child_columns;
     let subprog_ctx = FkSubprogramContext::new(child_cols.len(), false);
     let stmt = generate_cascade_delete_stmt(
@@ -2001,11 +1999,7 @@ fn fire_fk_set_null(
     ctx: &FkActionContext,
     database_id: usize,
 ) -> Result<()> {
-    let db_name = if database_id != crate::MAIN_DB_ID {
-        resolver.namespace_name(database_id)
-    } else {
-        None
-    };
+    let db_name = resolver.namespace_name(database_id);
     let child_cols = &fk_ref.fk.child_columns;
     let subprog_ctx = FkSubprogramContext::new(child_cols.len(), false);
     let stmt = generate_set_null_stmt(
@@ -2035,11 +2029,7 @@ fn fire_fk_set_default(
     ctx: &FkActionContext,
     database_id: usize,
 ) -> Result<()> {
-    let db_name = if database_id != crate::MAIN_DB_ID {
-        resolver.namespace_name(database_id)
-    } else {
-        None
-    };
+    let db_name = resolver.namespace_name(database_id);
     let child_cols = &fk_ref.fk.child_columns;
     let subprog_ctx = FkSubprogramContext::new(child_cols.len(), false);
     let stmt = generate_set_default_stmt(
@@ -2069,11 +2059,7 @@ fn fire_fk_cascade_update(
     ctx: &FkActionContext,
     database_id: usize,
 ) -> Result<()> {
-    let db_name = if database_id != crate::MAIN_DB_ID {
-        resolver.namespace_name(database_id)
-    } else {
-        None
-    };
+    let db_name = resolver.namespace_name(database_id);
     let child_cols = &fk_ref.fk.child_columns;
     // CASCADE UPDATE needs new params for the SET clause
     let subprog_ctx = FkSubprogramContext::new(child_cols.len(), true);

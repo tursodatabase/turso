@@ -192,19 +192,9 @@ pub(super) fn translate_sequence_function(
     let is_nextval = matches!(&func_ctx.func, Func::Scalar(ScalarFunc::NextVal));
 
     let seq_name_raw = extract_string_literal(&args[0])?;
-    let (database_id, normalized_name) = if let Some((schema, name)) = seq_name_raw.split_once('.')
-    {
-        let schema_norm = normalize_ident(schema);
-        let db_id = resolver
-            .namespace_database_id(&schema_norm)
-            .ok_or_else(|| {
-                LimboError::InvalidArgument(format!("no such database: {schema_norm}"))
-            })?;
-        (db_id, normalize_ident(name))
-    } else {
-        let name = normalize_ident(&seq_name_raw);
-        (resolver.resolve_existing_sequence_database_id(&name)?, name)
-    };
+    let sequence = resolver.resolve_existing_sequence(&sequence_qualified_name(&seq_name_raw))?;
+    let database_id = sequence.database_id();
+    let normalized_name = sequence.stored_name;
     let runtime_args = qualify_sequence_argument(args, resolver);
     let args = runtime_args.as_deref().unwrap_or(args);
 
@@ -359,16 +349,23 @@ pub(crate) fn qualify_sequence_argument(
     resolver: &Resolver,
 ) -> Option<Box<[Box<ast::Expr>]>> {
     let seq_name_raw = extract_string_literal(args.first()?).ok()?;
-    if seq_name_raw.contains('.') {
-        return None;
-    }
-    let name = normalize_ident(&seq_name_raw);
-    let database_id = resolver.find_existing_sequence_database_id(&name)?;
-    let runtime_name = resolver.runtime_sequence_name(database_id, &name);
+    let sequence = resolver
+        .find_existing_sequence(&sequence_qualified_name(&seq_name_raw))
+        .ok()??;
+    let runtime_name = resolver.runtime_sequence_name(&sequence);
     let mut args = args.to_vec();
     args[0] = Box::new(ast::Expr::Literal(ast::Literal::String(format!(
         "'{}'",
         runtime_name.replace('\'', "''")
     ))));
     Some(args.into_boxed_slice())
+}
+
+fn sequence_qualified_name(name: &str) -> ast::QualifiedName {
+    let (namespace, name) = crate::util::split_qualified_name(name);
+    ast::QualifiedName {
+        namespace: namespace.map(ast::Name::exact),
+        name: ast::Name::exact(name),
+        alias: None,
+    }
 }

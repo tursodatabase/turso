@@ -84,3 +84,567 @@ test create-schema-rejects-elements-in-another-schema {
 expect error {
     different from the one being created
 }
+
+test tables-of-two-schemas-with-the-same-name {
+    CREATE SCHEMA a;
+    CREATE SCHEMA b;
+    CREATE TABLE a.t (v text);
+    CREATE TABLE b.t (v text);
+    CREATE TABLE t (v text);
+    INSERT INTO a.t VALUES ('a');
+    INSERT INTO b.t VALUES ('b');
+    INSERT INTO t VALUES ('public');
+    SELECT v FROM a.t UNION ALL SELECT v FROM b.t UNION ALL SELECT v FROM public.t;
+}
+expect {
+    a
+    b
+    public
+}
+
+test schema-and-table-qualified-columns {
+    CREATE SCHEMA app;
+    CREATE TABLE app.items (id int, label text);
+    INSERT INTO app.items VALUES (1, 'a'), (2, 'b');
+    SELECT app.items.label, items.id FROM app.items ORDER BY id;
+}
+expect {
+    a|1
+    b|2
+}
+
+test update-and-delete-with-table-qualified-columns {
+    CREATE SCHEMA app;
+    CREATE TABLE app.t (x int);
+    INSERT INTO app.t VALUES (1), (2);
+    UPDATE app.t SET x = t.x * 10 WHERE t.x = 1;
+    DELETE FROM app.t WHERE t.x = 2;
+    SELECT x FROM app.t;
+}
+expect {
+    10
+}
+
+test create-table-in-missing-schema-errors {
+    CREATE TABLE missing_schema.t (x int);
+}
+expect error {
+    schema "missing_schema" does not exist
+}
+
+test index-names-are-per-schema {
+    CREATE SCHEMA app;
+    CREATE TABLE t (x int);
+    CREATE TABLE app.t (x int);
+    CREATE INDEX t_x ON t (x);
+    CREATE INDEX t_x ON app.t (x);
+    DROP INDEX app.t_x;
+    DROP INDEX t_x;
+    SELECT 1;
+}
+expect {
+    1
+}
+
+test rename-table-in-schema {
+    CREATE SCHEMA app;
+    CREATE TABLE app.t (x int);
+    INSERT INTO app.t VALUES (1);
+    ALTER TABLE app.t RENAME TO u;
+    SELECT x FROM app.u;
+}
+expect {
+    1
+}
+
+test sequence-in-schema {
+    CREATE SCHEMA app;
+    CREATE SEQUENCE app.s;
+    CREATE SEQUENCE s START 10;
+    SELECT nextval('app.s');
+    SELECT nextval('app.s');
+    SELECT nextval('s');
+    SELECT currval('app.s');
+}
+expect {
+    1
+    2
+    10
+    2
+}
+
+test catalogs-report-schema-of-objects {
+    CREATE SCHEMA app;
+    CREATE TABLE app.t (x int);
+    CREATE INDEX t_x ON app.t (x);
+    CREATE SEQUENCE app.s;
+    SELECT n.nspname, c.relname FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace WHERE c.relname IN ('t', 't_x') ORDER BY c.relname;
+    SELECT schemaname, tablename FROM pg_tables WHERE tablename = 't';
+    SELECT schemaname, tablename, indexname FROM pg_indexes WHERE indexname = 't_x';
+    SELECT schemaname, sequencename FROM pg_sequences WHERE sequencename = 's';
+}
+expect {
+    app|t
+    app|t_x
+    app|t
+    app|t|t_x
+    app|s
+}
+
+test serial-columns-in-schema-and-public {
+    CREATE SCHEMA app;
+    CREATE TABLE app.t (id serial, label text);
+    CREATE TABLE t (id serial, label text);
+    INSERT INTO app.t (label) VALUES ('a'), ('b');
+    INSERT INTO t (label) VALUES ('c');
+    SELECT id, label FROM app.t UNION ALL SELECT id, label FROM t ORDER BY label;
+}
+expect {
+    1|a
+    2|b
+    1|c
+}
+
+test view-in-schema-finds-its-tables-without-a-schema-name {
+    CREATE SCHEMA app;
+    SET search_path TO app;
+    CREATE TABLE t (a int);
+    INSERT INTO t VALUES (1);
+    CREATE VIEW v AS SELECT a FROM t;
+    SET search_path TO public;
+    SELECT a FROM app.v;
+}
+expect {
+    1
+}
+
+@skip-if postgres "PostgreSQL keeps a public table named app.u apart from the table u of schema app; Turso stores both under the same name"
+test public-object-named-under-a-schema-prefix-errors {
+    CREATE SCHEMA app;
+    CREATE TABLE app.t (x int);
+    CREATE TABLE "app.u" (y int);
+}
+expect error {
+    the prefix of app
+}
+
+test schema-named-with-a-dot-keeps-its-tables-apart {
+    CREATE SCHEMA a;
+    CREATE SCHEMA "a.b";
+    CREATE TABLE "a.b".t (x int);
+    CREATE TABLE a."b.t" (x int);
+    INSERT INTO "a.b".t VALUES (1);
+    INSERT INTO a."b.t" VALUES (2);
+    SELECT schemaname, tablename FROM pg_tables WHERE tablename IN ('t', 'b.t') ORDER BY schemaname;
+    SELECT x FROM a."b.t";
+    DROP SCHEMA a CASCADE;
+    SELECT x FROM "a.b".t;
+    SELECT count(*) FROM pg_tables WHERE tablename = 'b.t';
+}
+expect {
+    a|b.t
+    a.b|t
+    2
+    1
+    0
+}
+
+@skip-if postgres "Turso marks each schema with a table named pg_turso_schema_<schema>; PostgreSQL has no such tables"
+test table-named-like-a-schema-marker-errors {
+    CREATE TABLE pg_turso_schema_foo (x int);
+}
+expect error {
+    reserved for schema markers
+}
+
+@skip-if postgres "Turso marks each schema with a table named pg_turso_schema_<schema>; PostgreSQL has no such tables"
+test rename-to-a-schema-marker-name-errors {
+    CREATE TABLE t (x int);
+    ALTER TABLE t RENAME TO pg_turso_schema_foo;
+}
+expect error {
+    reserved for schema markers
+}
+
+test drop-of-a-schema-marker-table-errors {
+    CREATE SCHEMA app;
+    DROP TABLE pg_turso_schema_app;
+}
+expect error {
+    does not exist
+}
+
+test schema-marker-table-cannot-be-read {
+    CREATE SCHEMA app;
+    SELECT * FROM pg_turso_schema_app;
+}
+expect error {
+    does not exist
+}
+
+test schema-marker-table-cannot-be-written {
+    CREATE SCHEMA app;
+    INSERT INTO public.pg_turso_schema_app VALUES ('x');
+}
+expect error {
+    does not exist
+}
+
+test schema-marker-table-cannot-be-renamed {
+    CREATE SCHEMA app;
+    CREATE TABLE app.t (x int);
+    ALTER TABLE pg_turso_schema_app RENAME TO zz;
+}
+expect error {
+    does not exist
+}
+
+test column-named-with-its-schema-reads-the-table-of-that-schema {
+    CREATE SCHEMA app;
+    CREATE TABLE app.t (x int);
+    CREATE TABLE t (x int);
+    INSERT INTO app.t VALUES (1);
+    INSERT INTO t VALUES (2);
+    SELECT app.t.x, public.t.x FROM app.t JOIN public.t ON true;
+    SELECT public.t.x, app.t.x FROM (app.t JOIN public.t ON true);
+}
+expect {
+    1|2
+    2|1
+}
+
+test view-reads-a-table-of-another-schema {
+    CREATE SCHEMA app;
+    CREATE TABLE app.t (x int);
+    INSERT INTO app.t VALUES (3);
+    CREATE VIEW v AS SELECT x FROM app.t;
+    CREATE VIEW app.v AS SELECT x FROM public.v;
+    SELECT * FROM v;
+    SELECT * FROM app.v;
+}
+expect {
+    3
+    3
+}
+
+test view-created-in-the-search-path-schema-reads-its-tables {
+    CREATE SCHEMA app;
+    CREATE TABLE app.t (x int);
+    CREATE TABLE t (x int);
+    INSERT INTO app.t VALUES (1);
+    INSERT INTO t VALUES (100);
+    SET search_path TO app;
+    CREATE VIEW v AS SELECT sum(x) AS s FROM t;
+    SELECT * FROM v;
+    INSERT INTO t VALUES (2);
+    INSERT INTO public.t VALUES (200);
+    SET search_path TO public;
+    SELECT * FROM app.v;
+}
+expect {
+    1
+    3
+}
+
+test view-in-schema-binds-a-public-table-through-search-path {
+    CREATE SCHEMA app;
+    CREATE TABLE t (x int);
+    INSERT INTO t VALUES (1);
+    CREATE VIEW app.v AS SELECT x FROM t;
+    CREATE TABLE app.t (x int);
+    INSERT INTO app.t VALUES (2);
+    SELECT * FROM app.v;
+    SET search_path TO app;
+    SELECT * FROM app.v;
+}
+expect {
+    1
+    1
+}
+
+@skip-if postgres "PostgreSQL keeps a public index named app.i apart from the index i of schema app; Turso stores both under the same name"
+test create-schema-errors-when-a-public-index-is-named-under-its-prefix {
+    CREATE TABLE t (x int);
+    CREATE INDEX "app.i" ON t (x);
+    CREATE SCHEMA app;
+}
+expect error {
+    cannot create schema "app"
+}
+
+test drop-schema-cascade-drops-the-tables-of-a-schema-named-with-a-dot {
+    CREATE SCHEMA "a.b";
+    CREATE TABLE "a.b".t (x int);
+    CREATE INDEX i ON "a.b".t (x);
+    DROP SCHEMA "a.b" CASCADE;
+    SELECT count(*) FROM pg_tables WHERE tablename = 't';
+}
+expect {
+    0
+}
+
+test sequence-in-a-schema-named-with-a-dot {
+    CREATE SCHEMA "a.b";
+    CREATE SEQUENCE "a.b".s START WITH 5;
+    SELECT nextval('"a.b".s');
+    CREATE TABLE "a.b".t (id serial, v int);
+    INSERT INTO "a.b".t (v) VALUES (7);
+    INSERT INTO "a.b".t (v) VALUES (8);
+    SELECT id, v FROM "a.b".t ORDER BY id;
+    SELECT schemaname, sequencename FROM pg_sequences WHERE schemaname = 'a.b' ORDER BY sequencename;
+    DROP SCHEMA "a.b" CASCADE;
+    SELECT count(*) FROM pg_sequences WHERE schemaname = 'a.b';
+}
+expect {
+    5
+    1|7
+    2|8
+    a.b|s
+    a.b|t_id_seq
+    0
+}
+
+@skip-if postgres "PostgreSQL keeps a public table named s.t apart from the table t of schema s; Turso stores both under the same name"
+test public-object-named-with-public-under-a-schema-prefix-errors {
+    CREATE SCHEMA s;
+    CREATE TABLE public."s.t" (x int);
+}
+expect error {
+    cannot create "s.t" in public
+}
+
+@skip-if postgres "Turso marks each schema with a table named pg_turso_schema_<schema>; PostgreSQL has no such tables"
+test materialized-view-named-like-a-schema-marker-errors {
+    CREATE TABLE src (a int);
+    CREATE MATERIALIZED VIEW pg_turso_schema_foo AS SELECT a FROM src;
+}
+expect error {
+    reserved for schema markers
+}
+
+@skip-if postgres "main and temp name databases in Turso, so they cannot name schemas"
+test create-schema-rejects-the-names-of-the-databases {
+    CREATE SCHEMA temp;
+}
+expect error {
+    unacceptable schema name "temp"
+}
+
+test column-named-with-its-schema-binds-in-returning-and-upsert {
+    CREATE SCHEMA app;
+    CREATE TABLE app.t (id int PRIMARY KEY, x int);
+    INSERT INTO app.t VALUES (1, 5);
+    UPDATE app.t SET x = 6 RETURNING app.t.x;
+    INSERT INTO app.t VALUES (1, 0) ON CONFLICT (id) DO UPDATE SET x = app.t.x + 1 WHERE app.t.x > 0;
+    SELECT x FROM app.t;
+}
+expect {
+    6
+    7
+}
+
+test schema-named-with-a-reserved-prefix-holds-objects {
+    CREATE SCHEMA sqlite_x;
+    CREATE TABLE sqlite_x.t (x int);
+    INSERT INTO sqlite_x.t VALUES (1);
+    CREATE INDEX i ON sqlite_x.t (x);
+    ALTER TABLE sqlite_x.t ADD COLUMN y int;
+    CREATE VIEW sqlite_x.v AS SELECT x FROM sqlite_x.t;
+    SELECT * FROM sqlite_x.v;
+    DROP SCHEMA sqlite_x CASCADE;
+    SELECT count(*) FROM pg_tables WHERE schemaname = 'sqlite_x';
+}
+expect {
+    1
+    0
+}
+
+@skip-if postgres "Turso keeps the names that start with __turso_internal_ for its own tables"
+test create-schema-rejects-the-internal-table-prefix {
+    CREATE SCHEMA __turso_internal_y;
+}
+expect error {
+    unacceptable schema name "__turso_internal_y"
+}
+
+test view-keeps-a-cte-declared-in-a-nested-select {
+    CREATE TABLE c (x int);
+    INSERT INTO c VALUES (100), (200), (300);
+    CREATE VIEW v2 AS SELECT * FROM (WITH c AS (SELECT 1 AS x) SELECT (SELECT count(*) FROM c) AS n) s;
+    SELECT * FROM v2;
+}
+expect {
+    1
+}
+
+test public-name-under-a-schema-prefix-does-not-reach-the-schema {
+    CREATE SCHEMA app;
+    CREATE TABLE app.t (x int);
+    INSERT INTO app.t VALUES (1);
+    DROP TABLE IF EXISTS "app.t";
+    DROP TABLE IF EXISTS public."app.t";
+    SELECT count(*) FROM app.t;
+}
+expect {
+    1
+}
+
+test public-name-under-a-schema-prefix-does-not-exist {
+    CREATE SCHEMA app;
+    CREATE TABLE app.t (x int);
+    SELECT count(*) FROM "app.t";
+}
+expect error {
+}
+
+test view-binds-a-table-named-like-a-cte-of-another-part-of-its-body {
+    CREATE SCHEMA app;
+    CREATE TABLE t (x int);
+    INSERT INTO t VALUES (1);
+    CREATE VIEW app.v AS SELECT x FROM t UNION ALL SELECT (WITH t AS (SELECT 5 AS x) SELECT x FROM t);
+    SELECT x FROM app.v ORDER BY 1;
+}
+expect {
+    1
+    5
+}
+
+test catalogs-place-the-constraints-and-indexes-of-a-table-in-its-schema {
+    CREATE SCHEMA app;
+    CREATE TABLE app.t (x int PRIMARY KEY, y int UNIQUE);
+    SELECT conname FROM pg_constraint WHERE conrelid IN (SELECT oid FROM pg_class WHERE relname = 't') ORDER BY 1;
+    SELECT DISTINCT n.nspname FROM pg_constraint k JOIN pg_namespace n ON n.oid = k.connamespace WHERE k.conrelid IN (SELECT oid FROM pg_class WHERE relname = 't');
+    SELECT DISTINCT n.nspname FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace WHERE c.relkind = 'i' AND n.nspname NOT IN ('pg_catalog', 'pg_toast', 'information_schema');
+}
+expect {
+    t_pkey
+    t_y_key
+    app
+    app
+}
+
+test catalogs-list-the-objects-of-a-schema-named-with-a-system-prefix {
+    CREATE SCHEMA json_app;
+    CREATE TABLE json_app.t (x int PRIMARY KEY);
+    SELECT schemaname, tablename FROM pg_tables WHERE schemaname = 'json_app';
+    SELECT count(*) FROM pg_class WHERE relname = 't';
+    SELECT conname FROM pg_constraint WHERE conrelid IN (SELECT oid FROM pg_class WHERE relname = 't');
+}
+expect {
+    json_app|t
+    1
+    t_pkey
+}
+
+test schema-keeps-its-oid-when-another-schema-is-created {
+    CREATE SCHEMA b;
+    CREATE TABLE o (id bigint);
+    INSERT INTO o SELECT oid FROM pg_namespace WHERE nspname = 'b';
+    CREATE SCHEMA a;
+    SELECT n.nspname FROM pg_namespace n JOIN o ON n.oid = o.id;
+}
+expect {
+    b
+}
+
+test create-table-with-a-comment-in-its-qualified-name-goes-to-its-schema {
+    CREATE SCHEMA app;
+    CREATE TABLE app/*c*/.t (x int);
+    SELECT schemaname, tablename FROM pg_tables WHERE tablename = 't';
+    INSERT INTO app.t VALUES (1);
+    CREATE TABLE t (y int);
+    SELECT count(*) FROM app.t;
+}
+expect {
+    app|t
+    1
+}
+
+test schema-keeps-its-oid-across-a-checkpoint {
+    CREATE SCHEMA app;
+    CREATE TABLE ids (id bigint);
+    INSERT INTO ids SELECT oid FROM pg_namespace WHERE nspname = 'app';
+    CREATE TABLE big (s text);
+    INSERT INTO big SELECT repeat('x', 1000) FROM generate_series(1, 6000);
+    SELECT count(*) FROM pg_namespace n JOIN ids ON n.oid = ids.id;
+}
+expect {
+    1
+}
+
+test index-definition-names-the-schema-of-its-table {
+    CREATE SCHEMA app;
+    CREATE TABLE app.t (x int);
+    CREATE INDEX i ON app.t (x);
+    SELECT pg_get_indexdef(oid) FROM pg_class WHERE relname = 'i';
+}
+expect {
+    CREATE INDEX i ON app.t USING btree (x)
+}
+
+test column-named-with-its-schema-reads-the-outer-table-in-a-subquery {
+    CREATE SCHEMA app;
+    CREATE TABLE app.t (x int);
+    CREATE TABLE t (x int);
+    INSERT INTO app.t VALUES (1);
+    INSERT INTO t VALUES (2);
+    SELECT (SELECT app.t.x FROM public.t) FROM app.t;
+    SELECT (SELECT public.t.x FROM app.t) FROM public.t;
+}
+expect {
+    1
+    2
+}
+
+test view-keeps-every-cte-of-a-recursive-with-in-scope {
+    CREATE TABLE b (n int);
+    INSERT INTO b VALUES (100);
+    CREATE VIEW v AS WITH RECURSIVE a AS (SELECT n FROM b), b AS (SELECT 1 AS n) SELECT n FROM a;
+    SELECT * FROM v;
+}
+expect {
+    1
+}
+
+test check-constraint-names-the-table-by-its-name-in-the-schema {
+    CREATE SCHEMA app;
+    CREATE TABLE app.t (x int CHECK (t.x > 0), y int);
+    INSERT INTO app.t VALUES (1, 1);
+    SELECT x, y FROM app.t;
+}
+expect {
+    1|1
+}
+
+test check-constraint-naming-the-table-by-its-name-in-the-schema-rejects-a-row {
+    CREATE SCHEMA app;
+    CREATE TABLE app.t (x int CHECK (t.x > 0));
+    INSERT INTO app.t VALUES (1);
+    INSERT INTO app.t VALUES (-1);
+}
+expect error {
+}
+
+test indexes-name-the-table-by-its-name-in-the-schema {
+    CREATE SCHEMA app;
+    CREATE TABLE app.t (x int, y int);
+    CREATE UNIQUE INDEX u ON app.t (x) WHERE t.x > 10;
+    CREATE INDEX j ON app.t ((t.x + 1));
+    INSERT INTO app.t VALUES (1, 1), (11, 2);
+    INSERT INTO app.t VALUES (11, 3) ON CONFLICT (x) WHERE t.x > 10 DO NOTHING;
+    SELECT count(*) FROM app.t;
+    SELECT count(*) FROM app.t WHERE x + 1 = 12;
+}
+expect {
+    2
+    1
+}
+
+test column-named-with-a-schema-whose-table-is-not-in-from-errors {
+    CREATE SCHEMA app;
+    CREATE TABLE app.t (x int);
+    CREATE TABLE t (x int);
+    SELECT public.t.x FROM app.t;
+}
+expect error {
+}

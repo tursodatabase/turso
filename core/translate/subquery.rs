@@ -638,6 +638,7 @@ pub(crate) fn outer_query_refs_for_correlated_subquery(
             };
             let outer_ref = OuterQueryReference {
                 table: t.table.clone(),
+                database_id: t.database_id,
                 identifier: t.identifier.clone(),
                 internal_id: t.internal_id,
                 join_info: t.join_info.clone(),
@@ -656,6 +657,7 @@ pub(crate) fn outer_query_refs_for_correlated_subquery(
         .chain(referenced_tables.outer_query_refs().iter().map(|t| {
             Ok(OuterQueryReference {
                 table: t.table.clone(),
+                database_id: t.database_id,
                 identifier: t.identifier.clone(),
                 internal_id: t.internal_id,
                 join_info: t.join_info.clone(),

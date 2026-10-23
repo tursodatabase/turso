@@ -247,9 +247,10 @@ fn prepare_update_plan(
     connection: &Arc<crate::Connection>,
     is_internal_schema_change: bool,
 ) -> crate::Result<UpdatePlan> {
-    let database_id = resolver.resolve_existing_table_database_id_qualified(&body.tbl_name)?;
-    let target_name = &body.tbl_name.name;
-    let table = match resolver.with_schema(database_id, |s| s.get_table(target_name.as_str())) {
+    let resolved = resolver.resolve_existing_table(&body.tbl_name)?;
+    let database_id = resolved.database_id();
+    let target_name = resolved.stored_name.as_str();
+    let table = match resolver.with_schema(database_id, |s| s.get_table(target_name)) {
         Some(table) => table,
         None => bail_parse_error!(
             "no such table: {}",
@@ -270,7 +271,7 @@ fn prepare_update_plan(
     validate_update(
         resolver,
         database_id,
-        target_name.as_str(),
+        target_name,
         is_internal_schema_change,
         connection,
     )?;
@@ -335,7 +336,7 @@ fn prepare_update_plan(
         || normalize_ident(body.tbl_name.name.as_str()),
         |alias| normalize_ident(alias.as_str()),
     );
-    let target_table_name = normalize_ident(body.tbl_name.name.as_str());
+    let target_table_name = target_name;
     let mut non_from_clause_subqueries = vec![];
     // Reject fairly specific cases like UPDATE t SET x=5 FROM t.
     let illegal_target_reference = from_tables.joined_tables().iter().any(|joined| {
@@ -397,7 +398,7 @@ fn prepare_update_plan(
         // base table name, not the UPDATE alias. Keep the target table in scope, but
         // under its schema name so `RETURNING t.col` works while `RETURNING alias.col`
         // still fails.
-        returning_target.identifier = table_name.to_string();
+        returning_target.identifier = normalize_ident(body.tbl_name.name.as_str());
         let mut returning_table_references = TableReferences::new(
             vec![returning_target],
             read_scope_tables.outer_query_refs().to_vec(),

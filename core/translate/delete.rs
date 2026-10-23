@@ -15,7 +15,6 @@ use crate::translate::subquery::{
     plan_subqueries_from_where_clause,
 };
 use crate::translate::trigger_exec::has_triggers_including_temp;
-use crate::util::normalize_ident;
 use crate::vdbe::builder::{ProgramBuilder, ProgramBuilderOpts};
 use crate::Result;
 use turso_parser::ast::{Expr, QualifiedName, RefAct, ResultColumn, TriggerEvent, With};
@@ -89,8 +88,9 @@ pub fn translate_delete(
     program: &mut ProgramBuilder,
     connection: &Arc<crate::Connection>,
 ) -> Result<()> {
-    let database_id = resolver.resolve_existing_table_database_id_qualified(tbl_name)?;
-    let normalized_table_name = normalize_ident(tbl_name.name.as_str());
+    let resolved = resolver.resolve_existing_table(tbl_name)?;
+    let database_id = resolved.database_id();
+    let normalized_table_name = resolved.stored_name;
     let table = validate_delete(
         resolver,
         &normalized_table_name,

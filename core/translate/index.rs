@@ -13,7 +13,7 @@ use crate::translate::{
     },
     expr::{
         bind_and_rewrite_expr, emit_stored_column, translate_condition_expr, translate_expr,
-        unwrap_parens, walk_expr, BindingBehavior, ConditionMetadata, WalkControl,
+        unwrap_parens, walk_expr, walk_expr_mut, BindingBehavior, ConditionMetadata, WalkControl,
     },
     insert::format_unique_violation_desc,
     plan::{ColumnUsedMask, IterationDirection, JoinedTable, Operation, Scan, TableReferences},
@@ -38,9 +38,12 @@ use turso_parser::ast::{self, Expr, QualifiedName, SortOrder, SortedColumn};
 
 use super::schema::{emit_schema_entry, SchemaEntryType, SQLITE_TABLEID};
 
-fn canonical_create_index_sql(stmt: &ast::Stmt) -> String {
+fn canonical_create_index_sql(stmt: &ast::Stmt, namespace: &crate::Namespace) -> String {
     let mut canonical_stmt = stmt.clone();
-    let ast::Stmt::CreateIndex { idx_name, .. } = &mut canonical_stmt else {
+    let ast::Stmt::CreateIndex {
+        idx_name, tbl_name, ..
+    } = &mut canonical_stmt
+    else {
         unreachable!("canonical_create_index_sql requires a CREATE INDEX statement");
     };
     // Attached db's index names may have a connection-local schema alias like `aux.idx1`.
@@ -48,13 +51,15 @@ fn canonical_create_index_sql(stmt: &ast::Stmt) -> String {
     // when the same database is reopened or attached under a different alias.
     // e.g. CREATE INDEX aux.idx1 ON t1 (name) -> CREATE INDEX idx1 ON t1 (name)
     idx_name.namespace = None;
+    idx_name.name = namespace.name_in_sql(&idx_name.name);
+    *tbl_name = namespace.name_in_sql(tbl_name);
     canonical_stmt.to_string()
 }
 
 fn validate(
     tbl_name: &str,
-    idx_name: &str,
     original_idx_name: &QualifiedName,
+    original_tbl_name: &ast::Name,
     using: &Option<ast::Name>,
     with_clause: &[(ast::Name, Box<Expr>)],
     connection: &Arc<crate::Connection>,
@@ -69,9 +74,11 @@ fn validate(
     if tbl_name.eq_ignore_ascii_case("sqlite_sequence") {
         crate::bail_parse_error!("table sqlite_sequence may not be indexed");
     }
+    let written_idx_name = normalize_ident(original_idx_name.name.as_str());
+    let written_tbl_name = normalize_ident(original_tbl_name.as_str());
     if RESERVED_TABLE_PREFIXES
         .iter()
-        .any(|prefix| idx_name.starts_with(prefix) || tbl_name.starts_with(prefix))
+        .any(|prefix| written_idx_name.starts_with(prefix) || written_tbl_name.starts_with(prefix))
         && !connection.is_nested_stmt()
     {
         bail_parse_error!(
@@ -88,7 +95,7 @@ pub fn translate_create_index(
     resolver: &Resolver,
     stmt: ast::Stmt,
 ) -> crate::Result<()> {
-    let sql = canonical_create_index_sql(&stmt);
+    let written_stmt = stmt.clone();
     let ast::Stmt::CreateIndex {
         unique,
         if_not_exists,
@@ -105,18 +112,47 @@ pub fn translate_create_index(
 
     let original_idx_name = idx_name;
     let original_tbl_name = tbl_name;
-    let database_id = if original_idx_name.namespace.is_some() {
-        resolver.resolve_database_id(&original_idx_name)?
+    let (mut columns, mut where_clause) = (columns, where_clause);
+    if resolver.dialect.binds_names_at_create() {
+        let table_identifier = normalize_ident(original_tbl_name.as_str());
+        for column in &mut columns {
+            drop_qualifier_of_own_columns(&mut column.expr, &table_identifier)?;
+        }
+        if let Some(where_clause) = &mut where_clause {
+            drop_qualifier_of_own_columns(where_clause, &table_identifier)?;
+        }
+    }
+    let mut written_stmt = written_stmt;
+    if let ast::Stmt::CreateIndex {
+        columns: written_columns,
+        where_clause: written_where_clause,
+        ..
+    } = &mut written_stmt
+    {
+        written_columns.clone_from(&columns);
+        written_where_clause.clone_from(&where_clause);
+    }
+    let namespace = if original_idx_name.namespace.is_some() {
+        resolver.resolve_object(&original_idx_name)?.namespace
     } else {
-        resolver.resolve_existing_table_database_id(original_tbl_name.as_str())?
+        resolver
+            .resolve_existing_table_named(original_tbl_name.as_str())?
+            .namespace
     };
-    let idx_name = normalize_ident(original_idx_name.name.as_str());
-    let tbl_name = normalize_ident(original_tbl_name.as_str());
+    let database_id = namespace.database_id;
+    let sql = canonical_create_index_sql(&written_stmt, &namespace);
+    let resolved_idx_name = crate::translate::emitter::ResolvedName::in_namespace(
+        namespace.clone(),
+        &normalize_ident(original_idx_name.name.as_str()),
+    );
+    resolver.check_name_is_not_under_another_prefix(&resolved_idx_name)?;
+    let idx_name = resolved_idx_name.stored_name;
+    let tbl_name = namespace.stored_name(&normalize_ident(original_tbl_name.as_str()));
 
     validate(
         &tbl_name,
-        &idx_name,
         &original_idx_name,
+        &original_tbl_name,
         &using,
         &with_clause,
         connection,
@@ -322,6 +358,25 @@ pub fn translate_create_index(
         cursor_id: sqlite_schema_cursor_id,
     });
 
+    Ok(())
+}
+
+/// Writes a column of the index's own table that the index names with the
+/// table name, like t.x, as the bare column, like x, so that the stored
+/// text of the index names no table: the table is stored under another
+/// name than the one it was written with.
+pub(crate) fn drop_qualifier_of_own_columns(
+    expr: &mut Expr,
+    table_identifier: &str,
+) -> crate::Result<()> {
+    walk_expr_mut(expr, &mut |expr: &mut Expr| {
+        if let Expr::Qualified(table, column) | Expr::DoublyQualified(_, table, column) = expr {
+            if normalize_ident(table.as_str()) == table_identifier {
+                *expr = Expr::Id(column.clone());
+            }
+        }
+        Ok(WalkControl::Continue)
+    })?;
     Ok(())
 }
 
@@ -737,11 +792,12 @@ fn resolve_reindex_targets(
         bail_parse_error!("unable to identify the object to be reindexed");
     }
 
-    let database_id = resolver.resolve_database_id(name)?;
-    if let Some(targets) = find_reindex_table_in_db(&normalized_name, database_id, resolver) {
+    let resolved = resolver.resolve_object(name)?;
+    let database_id = resolved.database_id();
+    if let Some(targets) = find_reindex_table_in_db(&resolved.stored_name, database_id, resolver) {
         return Ok(targets);
     }
-    if let Some(target) = find_reindex_index_in_db(&normalized_name, database_id, resolver) {
+    if let Some(target) = find_reindex_index_in_db(&resolved.stored_name, database_id, resolver) {
         return Ok(vec![target]);
     }
     bail_parse_error!("unable to identify the object to be reindexed");
@@ -1223,19 +1279,20 @@ pub fn translate_drop_index(
     if_exists: bool,
     program: &mut ProgramBuilder,
 ) -> crate::Result<()> {
-    let idx_name = normalize_ident(qualified_name.name.as_str());
     let opts = ProgramBuilderOpts::new(5, 40, 5);
     program.extend(&opts);
 
-    let Some(database_id) = resolver.find_existing_index_database_id(qualified_name)? else {
+    let Some(resolved) = resolver.find_existing_index(qualified_name)? else {
         if if_exists {
             return Ok(());
         }
         return Err(crate::error::LimboError::InvalidArgument(format!(
             "No such index: {}",
-            &idx_name
+            normalize_ident(qualified_name.name.as_str())
         )));
     };
+    let database_id = resolved.database_id();
+    let idx_name = resolved.stored_name;
     let schema_cookie = resolver.with_schema(database_id, |s| s.schema_version);
     program.begin_write_on_database(database_id, schema_cookie)?;
 
@@ -1457,8 +1514,9 @@ pub fn translate_optimize(
 
     if let Some(name) = idx_name {
         // Optimize a specific index
-        let idx_name = normalize_ident(name.name.as_str());
-        let database_id = resolver.resolve_existing_index_database_id(&name)?;
+        let resolved = resolver.resolve_existing_index(&name)?;
+        let database_id = resolved.database_id();
+        let idx_name = resolved.stored_name;
         let mut found = false;
 
         resolver.with_schema(database_id, |schema| {
@@ -1547,7 +1605,10 @@ mod tests {
             Some("aux")
         );
 
-        let canonical_sql = canonical_create_index_sql(&stmt);
+        let canonical_sql = canonical_create_index_sql(
+            &stmt,
+            &crate::Namespace::database("main", crate::MAIN_DB_ID),
+        );
         assert_eq!(canonical_sql, "CREATE INDEX idx1 ON t1 (name)");
     }
 }

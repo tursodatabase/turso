@@ -1,6 +1,7 @@
 use crate::schema::{BTreeCharacteristics, BTreeTable, SchemaObjectType, RESERVED_TABLE_PREFIXES};
 use crate::storage::pager::CreateBTreeFlags;
 use crate::sync::Arc;
+use crate::translate::expr::{walk_expr_mut, WalkControl};
 use crate::translate::sequence::bind_sequence_names_in_select;
 use crate::translate::{
     emitter::Resolver,
@@ -19,6 +20,7 @@ fn validate_materialized(
     connection: &Arc<crate::Connection>,
     database_id: usize,
     resolver: &Resolver,
+    view_name: &ast::Name,
     normalized_view_name: &str,
 ) -> Result<()> {
     // Check if experimental views are enabled
@@ -34,11 +36,12 @@ fn validate_materialized(
     if database_id != crate::MAIN_DB_ID {
         crate::bail_parse_error!("materialized views are not supported on attached databases");
     }
+    let written_name = normalize_ident(view_name.as_str());
     if RESERVED_TABLE_PREFIXES
         .iter()
-        .any(|prefix| normalized_view_name.starts_with(prefix))
+        .any(|prefix| written_name.starts_with(prefix))
     {
-        bail_parse_error!("Object name reserved for internal use: {normalized_view_name}",);
+        bail_parse_error!("Object name reserved for internal use: {written_name}",);
     }
 
     // Check if view already exists (including broken sqlite_schema rows,
@@ -66,10 +69,12 @@ pub fn translate_create_materialized_view(
     if connection.mvcc_enabled() {
         bail_parse_error!("Materialized views are not supported in MVCC mode");
     }
-    let database_id = resolver.resolve_database_id_for_create(view_name)?;
+    let resolved = resolver.resolve_for_create(view_name, false)?;
+    let database_id = resolved.database_id();
     let schema_cookie = resolver.with_schema(database_id, |s| s.schema_version);
     program.begin_write_on_database(database_id, schema_cookie)?;
-    let normalized_view_name = normalize_ident(view_name.name.as_str());
+    let view_name_in_sql = resolved.namespace.name_in_sql(&view_name.name);
+    let normalized_view_name = resolved.stored_name;
 
     if if_not_exists
         && resolver.with_schema(database_id, |s| {
@@ -84,11 +89,22 @@ pub fn translate_create_materialized_view(
     // Validate the view can be created and extract its columns
     // This validation happens before updating sqlite_master to prevent
     // storing invalid view definitions
-    validate_materialized(&connection, database_id, resolver, &normalized_view_name)?;
+    validate_materialized(
+        &connection,
+        database_id,
+        resolver,
+        &view_name.name,
+        &normalized_view_name,
+    )?;
 
     // Check for cross-database table references first
-    crate::util::validate_select_for_views(select_stmt, view_name.namespace.as_ref())?;
+    crate::util::validate_select_for_views(select_stmt, resolver, database_id)?;
 
+    let mut select_stmt = select_stmt.clone();
+    if resolver.dialect.binds_names_at_create() {
+        bind_table_names_in_select(&mut select_stmt, resolver)?;
+    }
+    let select_stmt = &select_stmt;
     let mut view_column_schema =
         resolver.with_schema(database_id, |s| extract_view_columns(select_stmt, s))?;
     // The parser checks the column count when it can count the SELECT's
@@ -114,7 +130,7 @@ pub fn translate_create_materialized_view(
     // first (#9456): a TEMP table that happens to share a source table's
     // name must not shadow it here.
     let maintenance_plan =
-        resolver.with_view_scope(database_id, normalized_view_name.clone(), || {
+        resolver.with_view_scope(resolved.namespace, normalized_view_name.clone(), || {
             resolver.with_schema(database_id, |_| {
                 crate::incremental::vdbe_maintenance::plan_view(
                     &normalized_view_name,
@@ -139,7 +155,7 @@ pub fn translate_create_materialized_view(
     // Reconstruct the SQL string for storage
     let sql = create_view_to_str(
         "MATERIALIZED VIEW",
-        &view_name.name.as_ident(),
+        &view_name_in_sql.as_ident(),
         columns,
         select_stmt,
     );
@@ -328,11 +344,12 @@ fn validate_create_view(
             crate::util::identifier_token_for_error(view_name)
         )));
     }
+    let written_name = normalize_ident(view_name.as_str());
     if RESERVED_TABLE_PREFIXES
         .iter()
-        .any(|prefix| normalized_view_name.starts_with(prefix))
+        .any(|prefix| written_name.starts_with(prefix))
     {
-        bail_parse_error!("Object name reserved for internal use: {normalized_view_name}",);
+        bail_parse_error!("Object name reserved for internal use: {written_name}",);
     }
     Ok(())
 }
@@ -348,14 +365,12 @@ pub fn translate_create_view(
 ) -> Result<()> {
     // TEMP views always live in the temp schema. The parser rejects
     // CREATE TEMP VIEW with a database name other than "temp".
-    let database_id = if temporary {
-        crate::TEMP_DB_ID
-    } else {
-        resolver.resolve_database_id_for_create(view_name)?
-    };
+    let resolved = resolver.resolve_for_create(view_name, temporary)?;
+    let database_id = resolved.database_id();
     let schema_cookie = resolver.with_schema(database_id, |s| s.schema_version);
     program.begin_write_on_database(database_id, schema_cookie)?;
-    let normalized_view_name = normalize_ident(view_name.name.as_str());
+    let view_name_in_sql = resolved.namespace.name_in_sql(&view_name.name);
+    let normalized_view_name = resolved.stored_name;
 
     if if_not_exists
         && resolver.with_schema(database_id, |s| {
@@ -401,13 +416,14 @@ pub fn translate_create_view(
         }));
     }
 
-    crate::util::validate_select_for_views(select_stmt, view_name.namespace.as_ref())?;
+    crate::util::validate_select_for_views(select_stmt, resolver, database_id)?;
 
     let mut select_stmt = select_stmt.clone();
     if resolver.dialect.binds_names_at_create() {
+        bind_table_names_in_select(&mut select_stmt, resolver)?;
         bind_sequence_names_in_select(&mut select_stmt, resolver)?;
     }
-    let sql = create_view_to_str("VIEW", &view_name.name.as_ident(), columns, &select_stmt);
+    let sql = create_view_to_str("VIEW", &view_name_in_sql.as_ident(), columns, &select_stmt);
 
     // Open cursor to sqlite_schema table
     let table = resolver.schema().get_btree_table(SQLITE_TABLEID).unwrap();
@@ -450,6 +466,218 @@ pub fn translate_create_view(
     Ok(())
 }
 
+/// Replaces each table name of the view body with the name the table is
+/// stored under, qualified with its database, so that the view reads the
+/// tables it was created over whatever the search path is later. A table
+/// that is not found is left as written, and so is a table of temp. A
+/// renamed table keeps its written name as alias for the column references
+/// of the body.
+pub(crate) fn bind_table_names_in_select(
+    select: &mut ast::Select,
+    resolver: &Resolver,
+) -> Result<()> {
+    bind_table_names(select, resolver, &mut Vec::new())
+}
+
+/// Binds the tables of `select` with the CTEs in scope in `cte_names`: those
+/// of the enclosing SELECTs, plus the ones this SELECT declares. A CTE is in
+/// scope in the CTEs declared after it; when the WITH is RECURSIVE, every
+/// CTE of the WITH is in scope in every body. The subqueries in the
+/// expressions of this SELECT are bound with the same scope; a nested
+/// SELECT in FROM is bound with its own.
+fn bind_table_names(
+    select: &mut ast::Select,
+    resolver: &Resolver,
+    cte_names: &mut Vec<String>,
+) -> Result<()> {
+    let outer_cte_count = cte_names.len();
+    if let Some(with) = &mut select.with {
+        if with.recursive {
+            cte_names.extend(
+                with.ctes
+                    .iter()
+                    .map(|cte| normalize_ident(cte.tbl_name.as_str())),
+            );
+        }
+        for cte in &mut with.ctes {
+            bind_table_names(&mut cte.select, resolver, cte_names)?;
+            if !with.recursive {
+                cte_names.push(normalize_ident(cte.tbl_name.as_str()));
+            }
+        }
+    }
+    for one_select in std::iter::once(&mut select.body.select)
+        .chain(select.body.compounds.iter_mut().map(|c| &mut c.select))
+    {
+        bind_table_names_in_one_select(one_select, resolver, cte_names)?;
+    }
+    for sorted_column in &mut select.order_by {
+        bind_table_names_in_expr(&mut sorted_column.expr, resolver, cte_names)?;
+    }
+    if let Some(limit) = &mut select.limit {
+        bind_table_names_in_expr(&mut limit.expr, resolver, cte_names)?;
+        if let Some(offset) = &mut limit.offset {
+            bind_table_names_in_expr(offset, resolver, cte_names)?;
+        }
+    }
+    cte_names.truncate(outer_cte_count);
+    Ok(())
+}
+
+fn bind_table_names_in_one_select(
+    one_select: &mut ast::OneSelect,
+    resolver: &Resolver,
+    cte_names: &mut Vec<String>,
+) -> Result<()> {
+    match one_select {
+        ast::OneSelect::Select {
+            columns,
+            from,
+            where_clause,
+            group_by,
+            window_clause,
+            ..
+        } => {
+            if let Some(from) = from {
+                bind_table_names_in_from(from, resolver, cte_names)?;
+            }
+            for column in columns {
+                if let ast::ResultColumn::Expr(expr, _) = column {
+                    bind_table_names_in_expr(expr, resolver, cte_names)?;
+                }
+            }
+            if let Some(where_clause) = where_clause {
+                bind_table_names_in_expr(where_clause, resolver, cte_names)?;
+            }
+            if let Some(group_by) = group_by {
+                for expr in &mut group_by.exprs {
+                    bind_table_names_in_expr(expr, resolver, cte_names)?;
+                }
+                if let Some(having) = &mut group_by.having {
+                    bind_table_names_in_expr(having, resolver, cte_names)?;
+                }
+            }
+            for window_def in window_clause {
+                bind_table_names_in_window(&mut window_def.window, resolver, cte_names)?;
+            }
+        }
+        ast::OneSelect::Values(rows) => {
+            for row in rows {
+                for expr in row {
+                    bind_table_names_in_expr(expr, resolver, cte_names)?;
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn bind_table_names_in_from(
+    from: &mut ast::FromClause,
+    resolver: &Resolver,
+    cte_names: &mut Vec<String>,
+) -> Result<()> {
+    bind_table_name_in_source(&mut from.select, resolver, cte_names)?;
+    for join in &mut from.joins {
+        bind_table_name_in_source(&mut join.table, resolver, cte_names)?;
+        if let Some(ast::JoinConstraint::On(expr)) = &mut join.constraint {
+            bind_table_names_in_expr(expr, resolver, cte_names)?;
+        }
+    }
+    Ok(())
+}
+
+fn bind_table_name_in_source(
+    source: &mut ast::SelectTable,
+    resolver: &Resolver,
+    cte_names: &mut Vec<String>,
+) -> Result<()> {
+    match source {
+        ast::SelectTable::Table(name, alias, _) => {
+            bind_table_name(name, alias, resolver, cte_names)
+        }
+        ast::SelectTable::TableCall(_, args, _) => {
+            for arg in args {
+                bind_table_names_in_expr(arg, resolver, cte_names)?;
+            }
+            Ok(())
+        }
+        ast::SelectTable::Select { select, .. } => bind_table_names(select, resolver, cte_names),
+        ast::SelectTable::Sub(from, _) => bind_table_names_in_from(from, resolver, cte_names),
+    }
+}
+
+fn bind_table_names_in_window(
+    window: &mut ast::Window,
+    resolver: &Resolver,
+    cte_names: &mut Vec<String>,
+) -> Result<()> {
+    for expr in &mut window.partition_by {
+        bind_table_names_in_expr(expr, resolver, cte_names)?;
+    }
+    for sorted_column in &mut window.order_by {
+        bind_table_names_in_expr(&mut sorted_column.expr, resolver, cte_names)?;
+    }
+    if let Some(frame) = &mut window.frame_clause {
+        for bound in std::iter::once(&mut frame.start).chain(frame.end.as_mut()) {
+            if let ast::FrameBound::Following(expr) | ast::FrameBound::Preceding(expr) = bound {
+                bind_table_names_in_expr(expr, resolver, cte_names)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Binds the tables of the subqueries in `expr`. The expression walker
+/// stops at a subquery, so each one is bound as a SELECT of its own, with
+/// the CTEs in scope where the expression is.
+fn bind_table_names_in_expr(
+    expr: &mut ast::Expr,
+    resolver: &Resolver,
+    cte_names: &mut Vec<String>,
+) -> Result<()> {
+    walk_expr_mut(expr, &mut |expr: &mut ast::Expr| {
+        match expr {
+            ast::Expr::Subquery(select) | ast::Expr::Exists(select) => {
+                bind_table_names(select, resolver, cte_names)?;
+            }
+            ast::Expr::InSelect { rhs, .. } => bind_table_names(rhs, resolver, cte_names)?,
+            _ => {}
+        }
+        Ok(WalkControl::Continue)
+    })?;
+    Ok(())
+}
+
+fn bind_table_name(
+    name: &mut ast::QualifiedName,
+    alias: &mut Option<ast::As>,
+    resolver: &Resolver,
+    cte_names: &[String],
+) -> Result<()> {
+    let written = normalize_ident(name.name.as_str());
+    if name.namespace.is_none() && cte_names.contains(&written) {
+        return Ok(());
+    }
+    let Some(resolved) = resolver.find_existing_table(name)? else {
+        return Ok(());
+    };
+    let has_table = resolver.with_schema(resolved.database_id(), |schema| {
+        Resolver::schema_has_table_like_object(schema, &resolved.stored_name)
+    });
+    if resolved.database_id() == crate::TEMP_DB_ID || !has_table {
+        return Ok(());
+    }
+    if alias.is_none() && written != resolved.stored_name {
+        *alias = Some(ast::As::As(name.name.clone()));
+    }
+    *name = ast::QualifiedName::fullname(
+        ast::Name::exact(resolver.namespace_of_database(resolved.database_id()).name),
+        ast::Name::exact(resolved.stored_name),
+    );
+    Ok(())
+}
+
 fn create_view_to_str(
     view_kind: &str,
     view_name: &str,
@@ -475,15 +703,17 @@ pub fn translate_drop_view(
 ) -> Result<()> {
     // Unqualified names search the temp schema first, then main, then
     // attached databases, so DROP VIEW finds temp views like SQLite does.
-    let normalized_view_name = normalize_ident(view_name.name.as_str());
-    let Some(database_id) = resolver.find_existing_table_database_id_qualified(view_name)? else {
+    let Some(resolved) = resolver.find_existing_table(view_name)? else {
         if if_exists {
             return Ok(());
         }
         return Err(crate::LimboError::ParseError(format!(
-            "no such view: {normalized_view_name}"
+            "no such view: {}",
+            normalize_ident(view_name.name.as_str())
         )));
     };
+    let database_id = resolved.database_id();
+    let normalized_view_name = resolved.stored_name;
     let schema_cookie = resolver.with_schema(database_id, |s| s.schema_version);
     program.begin_write_on_database(database_id, schema_cookie)?;
 

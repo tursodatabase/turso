@@ -67,6 +67,24 @@ fn test_copy_from_basic(db: TempDatabase) {
 }
 
 #[turso_macros::test(mvcc)]
+fn copy_from_finds_the_table_through_search_path(db: TempDatabase) {
+    let conn = db.connect_postgres();
+    conn.execute("CREATE SCHEMA app").unwrap();
+    conn.execute("CREATE TABLE app.t (x INTEGER, y TEXT)")
+        .unwrap();
+    conn.execute("SET search_path TO app").unwrap();
+
+    let tsv = write_temp_file("1\ta\n2\tb\n");
+    conn.execute(format!("COPY t FROM '{}'", tsv.path().display()))
+        .unwrap();
+
+    let rows = query_all(&conn, "SELECT x, y FROM app.t ORDER BY x");
+    assert_eq!(rows.len(), 2);
+    assert_int(&rows[1][0], 2);
+    assert_text(&rows[1][1], "b");
+}
+
+#[turso_macros::test(mvcc)]
 fn test_copy_from_null_values(db: TempDatabase) {
     let conn = db.connect_postgres();
 
