@@ -331,6 +331,8 @@ impl Scope {
     }
 
     pub(crate) fn add_source(&mut self, source: &hir::Source, unqualified: bool) {
+        #[cfg(test)]
+        tests::SOURCES_ADDED.with(|added| added.set(added.get() + 1));
         let columns: Vec<_> = source
             .columns
             .iter()
@@ -1405,7 +1407,12 @@ fn is_rowid_name(name: &str) -> bool {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
+    thread_local! {
+        /// How many sources were added to scopes on this thread.
+        pub(crate) static SOURCES_ADDED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    }
+
     use super::*;
     use crate::translate::collate::CollationSeq;
     use crate::translate::semantic::hir::{

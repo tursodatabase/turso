@@ -2626,6 +2626,35 @@ mod tests {
         schema
     }
 
+    #[test]
+    fn plain_table_reference_adds_its_columns_to_one_scope() {
+        let symbols = SymbolTable::new();
+        let scope_count = |index_sql: &str| {
+            let mut schema = Schema::new();
+            let table = Arc::new(
+                BTreeTable::from_sql("CREATE TABLE t(a INTEGER, b INTEGER)", 2)
+                    .expect("table schema parses"),
+            );
+            schema
+                .add_btree_table(table.clone())
+                .expect("table name is unique");
+            let index = Index::from_sql(&symbols, index_sql, 3, &table).expect("index parses");
+            schema
+                .add_index(Arc::new(index))
+                .expect("index name is unique");
+            crate::translate::semantic::scope::tests::SOURCES_ADDED.with(|added| added.set(0));
+            analyze_sql_with_schema(&schema, "SELECT a FROM t WHERE b = 1")
+                .expect("SELECT analyzes");
+            crate::translate::semantic::scope::tests::SOURCES_ADDED.with(|added| added.get())
+        };
+
+        // The FROM clause adds the table once; a plain index reads no column.
+        assert_eq!(scope_count("CREATE INDEX i ON t(a)"), 1);
+        // An index expression is analyzed in a scope of the table's columns.
+        assert_eq!(scope_count("CREATE INDEX i ON t(a + b)"), 2);
+        assert_eq!(scope_count("CREATE INDEX i ON t(a) WHERE b > 0"), 2);
+    }
+
     fn schema_with_custom_columns() -> Schema {
         let mut schema = Schema::new();
         for sql in [
