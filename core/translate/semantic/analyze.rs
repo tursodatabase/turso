@@ -2728,6 +2728,40 @@ mod tests {
         );
     }
 
+    #[test]
+    fn planning_without_expression_indexes_searches_no_expressions() {
+        let symbols = SymbolTable::new();
+        let walks = |index_sql: &str| {
+            let mut schema = Schema::new();
+            let table = Arc::new(
+                BTreeTable::from_sql("CREATE TABLE t(a INTEGER, b INTEGER)", 2)
+                    .expect("table schema parses"),
+            );
+            schema
+                .add_btree_table(table.clone())
+                .expect("table name is unique");
+            let index = Index::from_sql(&symbols, index_sql, 3, &table).expect("index parses");
+            schema
+                .add_index(Arc::new(index))
+                .expect("index name is unique");
+            let document = analyze_sql_with_schema(&schema, "SELECT a FROM t WHERE b IN (1, 2, 3)")
+                .expect("SELECT analyzes");
+            crate::translate::semantic_to_plan::tests::EXPRESSION_INDEX_WALKS
+                .with(|walks| walks.set(0));
+            crate::translate::semantic_to_plan::HirPlan::build(
+                Arc::new(document),
+                &schema,
+                &crate::translate::optimizer::CostModelParams::default(),
+            )
+            .expect("SELECT plans");
+            crate::translate::semantic_to_plan::tests::EXPRESSION_INDEX_WALKS
+                .with(|walks| walks.get())
+        };
+
+        assert_eq!(walks("CREATE INDEX i ON t(a)"), 0);
+        assert!(walks("CREATE INDEX i ON t(a + b)") > 0);
+    }
+
     fn schema_with_custom_columns() -> Schema {
         let mut schema = Schema::new();
         for sql in [
