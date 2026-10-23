@@ -1,12 +1,12 @@
-use rand::{RngCore, SeedableRng, rng};
+use rand::{rng, RngCore, SeedableRng};
 use rand_chacha::ChaCha8Rng;
 use rusqlite::params;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use tempfile::TempDir;
-use tracing_subscriber::{EnvFilter, layer::SubscriberExt, util::SubscriberInitExt};
+use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
 use turso_core::{
-    Clock, ConnectOpts, Connection, Database, Dialect, FromValueRow, IO, Row, SqliteDialect,
+    Clock, ConnectOpts, Connection, Database, Dialect, FromValueRow, Row, SqliteDialect, IO,
 };
 
 /// Temp directories holding test databases, deleted when the test process exits.
@@ -117,6 +117,12 @@ impl IO for TestIo {
     }
     fn yield_now(&self) {
         self.io.yield_now();
+    }
+}
+
+impl Default for TempDatabaseBuilder {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -708,9 +714,9 @@ mod tests {
     use std::{sync::Arc, vec};
     use tempfile::TempDir;
     use turso_core::SqliteDialect;
-    use turso_core::{ConnectOpts, Database, IO, StepResult};
+    use turso_core::{ConnectOpts, Database, StepResult, IO};
 
-    use crate::common::{ExecRows, do_flush};
+    use crate::common::{do_flush, ExecRows};
 
     use super::TempDatabase;
 
@@ -1488,7 +1494,7 @@ mod tests {
             conn1.execute("BEGIN CONCURRENT")?;
             let rows: Vec<(i64,)> = conn1.exec_rows("SELECT nextval('s')");
             assert_eq!(rows, vec![(51,)]); // sees setval'd value
-            // conn1 closes without commit; the nextval is still durable
+                                           // conn1 closes without commit; the nextval is still durable
 
             conn1.close()?;
             conn2.close()?;
@@ -2114,8 +2120,8 @@ mod tests {
     /// No panics, no errors that escape the opcode's retry loop.
     #[test]
     fn test_stress_nextval_setval_mixed_mvcc() -> anyhow::Result<()> {
-        use std::sync::Mutex;
         use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Mutex;
         use std::thread;
         use std::time::Duration;
         const NEXTVAL_THREADS: usize = 4;

@@ -10,10 +10,10 @@ use crate::functions::ConfigParameter;
 use turso_core::{Connection, LimboError, Result, Statement, Value};
 use turso_parser::ast::{self};
 use turso_pg_parser::translator::{
-    PgCopyFromStmt, PgCreateSchemaStmt, PgDropSchemaStmt, PgSetStmt, PgSetValue, PgShowStmt,
-    PostgreSQLTranslator, check_set_transaction, is_comment_on, is_refresh_matview,
-    try_extract_copy_from, try_extract_create_schema, try_extract_drop_schema, try_extract_set,
-    try_extract_show, unnamed_index_name, unqualified_create_table_name_location,
+    check_set_transaction, is_comment_on, is_refresh_matview, try_extract_copy_from,
+    try_extract_create_schema, try_extract_drop_schema, try_extract_set, try_extract_show,
+    unnamed_index_name, unqualified_create_table_name_location, PgCopyFromStmt, PgCreateSchemaStmt,
+    PgDropSchemaStmt, PgSetStmt, PgSetValue, PgShowStmt, PostgreSQLTranslator,
 };
 
 use crate::copy::parse_copy_text_format;
@@ -868,7 +868,7 @@ fn schema_exists(conn: &Arc<Connection>, schema_name: &str) -> Result<bool> {
 
 #[cfg(test)]
 mod tests {
-    use super::{PgSessionState, SessionState, search_path_parser};
+    use super::{search_path_parser, PgSessionState, SessionState};
     use chumsky::Parser;
     use std::any::Any;
     use std::sync::{Arc, Mutex};

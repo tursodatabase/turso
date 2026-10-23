@@ -213,7 +213,7 @@ mod tests {
     use crate::schema::BTreeTable;
     use crate::storage::database::DatabaseFile;
     use crate::sync::atomic::{AtomicUsize, Ordering};
-    use crate::{ConnectOpts, Database, DatabaseOpts, IO, MemoryIO, OpenFlags};
+    use crate::{ConnectOpts, Database, DatabaseOpts, MemoryIO, OpenFlags, IO};
     use std::sync::Arc;
 
     /// A dialect that counts schema-row parses and strips a `/* test */ `
