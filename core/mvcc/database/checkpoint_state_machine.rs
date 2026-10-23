@@ -3280,6 +3280,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
                         &self.connection,
                         self.sync_mode,
                         self.update_transaction_state,
+                        false,
                     )? {
                         IOResult::Done(_) => {
                             self.pager_commit_done = true;
