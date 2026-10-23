@@ -2363,6 +2363,7 @@ fn has_left_view_using_column(
         sources,
         column_name,
         has_right_or_full_join,
+        false,
         |source| source.join_info.as_ref(),
         |source| {
             // NATURAL ignores hidden columns, but an explicit USING clause can name one.

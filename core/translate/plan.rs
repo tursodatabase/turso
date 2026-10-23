@@ -1653,11 +1653,13 @@ pub fn unqualified_column_sources<'a, S>(
 /// -- ambiguous reference to a in USING()
 /// ```
 ///
+/// PostgreSQL-marked joins apply the all-copies check even without RIGHT/FULL JOIN.
 /// The planner and view metadata both use this, so they report the same errors.
 pub fn left_using_column_sources<'a, S>(
     sources: &'a [S],
     column_name: &str,
     has_right_or_full_join: bool,
+    postgres_compat: bool,
     join_info: impl Fn(&'a S) -> Option<&'a JoinInfo>,
     column_index: impl Fn(&'a S) -> Option<usize>,
 ) -> Result<SmallVec<[(usize, usize); 4]>> {
@@ -1666,12 +1668,18 @@ pub fn left_using_column_sources<'a, S>(
         let Some(column_index) = column_index(source) else {
             continue;
         };
-        if !found.is_empty() && !has_right_or_full_join {
+        if !found.is_empty() && !has_right_or_full_join && !postgres_compat {
             break;
         }
         if !found.is_empty()
             && !join_info(source).is_some_and(|join_info| join_info.merges_column(column_name))
         {
+            if postgres_compat {
+                crate::bail_parse_error!(
+                    "common column name \"{}\" appears more than once in left table",
+                    column_name
+                );
+            }
             crate::bail_parse_error!("ambiguous reference to {} in USING()", column_name);
         }
         found.push((source_index, column_index));

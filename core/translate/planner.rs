@@ -2961,6 +2961,11 @@ fn parse_join(
     let lateral_reference = left_table_read_by_rightmost_table(table_references).map(str::to_owned);
 
     let is_cross = matches!(join_operator, ast::JoinOperator::TypedJoin(Some(jt)) if jt.contains(JoinType::CROSS));
+    let postgres_compat = matches!(
+        join_operator,
+        ast::JoinOperator::TypedJoin(Some(jt))
+            if jt.contains(ast::JoinType::POSTGRES_COMPAT)
+    );
 
     let plan_join_type = PlanJoinType::from_join_operator(&join_operator);
     if let Some(table) = lateral_reference
@@ -3013,10 +3018,30 @@ fn parse_join(
                         .zip(right_col.name.as_deref())
                         .is_some_and(|(l, r)| l.eq_ignore_ascii_case(r))
                     {
+                        let right_name = right_col.name.as_deref().expect("column name is None");
+                        if postgres_compat {
+                            let left_tables = &table_references.joined_tables()
+                                [..table_references.joined_tables().len() - 1];
+                            let _ = find_left_using_column(
+                                left_tables,
+                                right_name,
+                                true,
+                                has_right_or_full_join,
+                                postgres_compat,
+                            )?;
+                            if has_duplicate_visible_common_column(
+                                rightmost_table,
+                                right_name,
+                                true,
+                            ) {
+                                crate::bail_parse_error!(
+                                    "common column name \"{}\" appears more than once in right table",
+                                    right_name
+                                );
+                            }
+                        }
                         // SQLite keeps the right column's spelling in the generated USING list.
-                        distinct_names.push(ast::Name::exact(
-                            right_col.name.clone().expect("column name is None"),
-                        ));
+                        distinct_names.push(ast::Name::exact(right_name.to_string()));
                         found_match = true;
                         break;
                     }
@@ -3075,12 +3100,25 @@ fn parse_join(
                             distinct_name.as_str()
                         );
                     };
-                    // SQLite compares the new table with all earlier copies merged by USING.
+                    if postgres_compat
+                        && has_duplicate_visible_common_column(
+                            right_table,
+                            distinct_name.as_str(),
+                            natural,
+                        )
+                    {
+                        crate::bail_parse_error!(
+                            "common column name \"{}\" appears more than once in right table",
+                            distinct_name.as_str()
+                        );
+                    }
+                    // Compare the new table with all earlier copies merged by USING.
                     let Some(left_column) = find_left_using_column(
                         left_tables,
                         distinct_name.as_str(),
                         natural,
                         has_right_or_full_join,
+                        postgres_compat,
                     )?
                     else {
                         crate::bail_parse_error!(
@@ -3134,20 +3172,65 @@ fn parse_join(
     Ok(())
 }
 
+/// Check whether one source exposes multiple visible matches for a common name.
+///
+/// Parenthesized joins retain original names separately from their output labels,
+/// so inspect that metadata when available.
+fn has_duplicate_visible_common_column(
+    table: &JoinedTable,
+    column_name: &str,
+    ignore_hidden_columns: bool,
+) -> bool {
+    let columns = table.columns();
+    if let Some(join_columns) = table.table.parenthesized_join_columns() {
+        let mut matches = join_columns
+            .iter()
+            .enumerate()
+            .filter(|(index, join_column)| {
+                (!ignore_hidden_columns || !columns[*index].hidden())
+                    && join_column.source.matches_column_name(column_name)
+                    && join_column.visibility != ParenthesizedJoinColumnVisibility::QualifiedOnly
+            });
+        matches.next().is_some() && matches.next().is_some()
+    } else {
+        let mut matches = columns.iter().filter(|column| {
+            (!ignore_hidden_columns || !column.hidden())
+                && column
+                    .name
+                    .as_deref()
+                    .is_some_and(|name| name.eq_ignore_ascii_case(column_name))
+        });
+        matches.next().is_some() && matches.next().is_some()
+    }
+}
+
 /// Find the left operand for one USING equality term.
 ///
 /// SQLite merges all earlier copies when a RIGHT or FULL JOIN exists anywhere
-/// in the FROM list. It also rejects an unmerged duplicate in that mode.
+/// in the FROM list. PostgreSQL-marked joins also check every visible copy and
+/// report duplicate common names with PostgreSQL's error wording.
 fn find_left_using_column(
     tables: &[JoinedTable],
     column_name: &str,
     ignore_hidden_columns: bool,
     has_right_or_full_join: bool,
+    postgres_compat: bool,
 ) -> Result<Option<ResolvedColumn>> {
+    if postgres_compat
+        && tables.iter().any(|table| {
+            has_duplicate_visible_common_column(table, column_name, ignore_hidden_columns)
+        })
+    {
+        crate::bail_parse_error!(
+            "common column name \"{}\" appears more than once in left table",
+            column_name
+        );
+    }
     let matches = left_using_column_sources(
         tables,
         column_name,
         has_right_or_full_join,
+        postgres_compat,
         |table| table.join_info.as_ref(),
         |table| {
             // NATURAL ignores hidden columns. An explicit USING clause can name one.
