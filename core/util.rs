@@ -2014,19 +2014,18 @@ where
 
 fn validate_no_cross_db_references(
     select_stmt: &ast::Select,
-    resolver: &Resolver,
-    view_database_id: usize,
+    in_view_database: &dyn Fn(&ast::Name) -> bool,
 ) -> Result<()> {
     if let Some(with_clause) = &select_stmt.with {
         for cte in &with_clause.ctes {
-            validate_no_cross_db_references(&cte.select, resolver, view_database_id)?;
+            validate_no_cross_db_references(&cte.select, in_view_database)?;
         }
     }
 
-    validate_one_select_no_cross_db(&select_stmt.body.select, resolver, view_database_id)?;
+    validate_one_select_no_cross_db(&select_stmt.body.select, in_view_database)?;
 
     for compound in &select_stmt.body.compounds {
-        validate_one_select_no_cross_db(&compound.select, resolver, view_database_id)?;
+        validate_one_select_no_cross_db(&compound.select, in_view_database)?;
     }
 
     Ok(())
@@ -2034,13 +2033,12 @@ fn validate_no_cross_db_references(
 
 fn validate_one_select_no_cross_db(
     one_select: &ast::OneSelect,
-    resolver: &Resolver,
-    view_database_id: usize,
+    in_view_database: &dyn Fn(&ast::Name) -> bool,
 ) -> Result<()> {
     match one_select {
         ast::OneSelect::Select { from, .. } => {
             if let Some(from_clause) = from {
-                validate_from_clause_no_cross_db(from_clause, resolver, view_database_id)?;
+                validate_from_clause_no_cross_db(from_clause, in_view_database)?;
             }
         }
         ast::OneSelect::Values(_) => {}
@@ -2050,25 +2048,21 @@ fn validate_one_select_no_cross_db(
 
 fn validate_from_clause_no_cross_db(
     from_clause: &ast::FromClause,
-    resolver: &Resolver,
-    view_database_id: usize,
+    in_view_database: &dyn Fn(&ast::Name) -> bool,
 ) -> Result<()> {
-    validate_select_table_no_cross_db(&from_clause.select, resolver, view_database_id)?;
+    validate_select_table_no_cross_db(&from_clause.select, in_view_database)?;
     for join in &from_clause.joins {
-        validate_select_table_no_cross_db(&join.table, resolver, view_database_id)?;
+        validate_select_table_no_cross_db(&join.table, in_view_database)?;
     }
     Ok(())
 }
 
 fn reject_cross_db_qualified_name(
     qualified_name: &ast::QualifiedName,
-    resolver: &Resolver,
-    view_database_id: usize,
+    in_view_database: &dyn Fn(&ast::Name) -> bool,
 ) -> Result<()> {
     if let Some(table_db_name) = &qualified_name.namespace {
-        let is_cross_db = resolver.namespace_database_id(&normalize_ident(table_db_name.as_str()))
-            != Some(view_database_id);
-        if is_cross_db {
+        if !in_view_database(table_db_name) {
             return Err(crate::LimboError::ParseError(format!(
                 "view cannot reference table in attached database: {qualified_name}"
             )));
@@ -2079,18 +2073,17 @@ fn reject_cross_db_qualified_name(
 
 fn validate_select_table_no_cross_db(
     select_table: &ast::SelectTable,
-    resolver: &Resolver,
-    view_database_id: usize,
+    in_view_database: &dyn Fn(&ast::Name) -> bool,
 ) -> Result<()> {
     match select_table {
         ast::SelectTable::Table(name, _, _) | ast::SelectTable::TableCall(name, _, _) => {
-            reject_cross_db_qualified_name(name, resolver, view_database_id)?;
+            reject_cross_db_qualified_name(name, in_view_database)?;
         }
         ast::SelectTable::Select { select, .. } => {
-            validate_no_cross_db_references(select, resolver, view_database_id)?;
+            validate_no_cross_db_references(select, in_view_database)?;
         }
         ast::SelectTable::Sub(from_clause, _) => {
-            validate_from_clause_no_cross_db(from_clause, resolver, view_database_id)?;
+            validate_from_clause_no_cross_db(from_clause, in_view_database)?;
         }
     }
     Ok(())
@@ -2119,15 +2112,18 @@ pub fn validate_select_for_views(
     if view_database_id == crate::TEMP_DB_ID {
         return Ok(());
     }
-    validate_no_cross_db_references(select_stmt, resolver, view_database_id)?;
+    let in_view_database = |name: &ast::Name| {
+        resolver.namespace_database_id(&normalize_ident(name.as_str())) == Some(view_database_id)
+    };
+    validate_no_cross_db_references(select_stmt, &in_view_database)?;
 
     walk_select_expressions(select_stmt, &mut |expr| {
         match expr {
             ast::Expr::Subquery(subquery_select) | ast::Expr::Exists(subquery_select) => {
-                validate_no_cross_db_references(subquery_select, resolver, view_database_id)?;
+                validate_no_cross_db_references(subquery_select, &in_view_database)?;
             }
             ast::Expr::InSelect { rhs, .. } => {
-                validate_no_cross_db_references(rhs, resolver, view_database_id)?;
+                validate_no_cross_db_references(rhs, &in_view_database)?;
             }
             _ => {}
         }
