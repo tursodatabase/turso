@@ -1725,6 +1725,7 @@ fn parse_from_clause_table(
                     table_references.joined_tables().len()
                 )))
             });
+            let lateral = from_clause_contains_lateral(&from_clause);
             let join_select = ast::Select {
                 with: None,
                 body: ast::SelectBody {
@@ -1745,7 +1746,7 @@ fn parse_from_clause_table(
                 ast::SelectTable::Select {
                     select: join_select,
                     alias: Some(alias),
-                    lateral: false,
+                    lateral,
                 },
                 resolver,
                 program,
@@ -1761,6 +1762,23 @@ fn parse_from_clause_table(
             keep_parenthesized_join_columns(table)
         }
     }
+}
+
+/// A parenthesized join planned as a subquery must inherit its inner LATERAL scope.
+fn from_clause_contains_lateral(from_clause: &ast::FromClause) -> bool {
+    fn table_contains_lateral(table: &ast::SelectTable) -> bool {
+        match table {
+            ast::SelectTable::Select { lateral, .. } => *lateral,
+            ast::SelectTable::Sub(from_clause, _) => from_clause_contains_lateral(from_clause),
+            ast::SelectTable::Table(..) | ast::SelectTable::TableCall(..) => false,
+        }
+    }
+
+    table_contains_lateral(&from_clause.select)
+        || from_clause
+            .joins
+            .iter()
+            .any(|join| table_contains_lateral(&join.table))
 }
 
 /// Keep the source columns that SQLite stores for a parenthesized join.
