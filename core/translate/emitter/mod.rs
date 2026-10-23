@@ -839,7 +839,7 @@ impl<'a> Resolver<'a> {
             .filter(|resolved| self.is_visible(resolved))
     }
 
-    fn schema_has_table_like_object(schema: &Schema, table_name: &str) -> bool {
+    pub(crate) fn schema_has_table_like_object(schema: &Schema, table_name: &str) -> bool {
         schema.get_table(table_name).is_some()
             || schema.get_view(table_name).is_some()
             || schema.get_materialized_view(table_name).is_some()
@@ -879,12 +879,6 @@ impl<'a> Resolver<'a> {
     ) -> Result<ResolvedName> {
         self.find_existing_table(qualified_name)?.ok_or_else(|| {
             LimboError::ParseError(format!("no such object: {}", qualified_name.name.as_str()))
-        })
-    }
-
-    pub(crate) fn has_table_like_object(&self, resolved: &ResolvedName) -> bool {
-        self.with_schema(resolved.database_id(), |schema| {
-            Self::schema_has_table_like_object(schema, &resolved.stored_name)
         })
     }
 
@@ -1120,13 +1114,10 @@ impl<'a> Resolver<'a> {
         resolved: &ResolvedName,
     ) -> Result<()> {
         let own = &resolved.namespace;
-        let Some(other) = self.namespaces.others().into_iter().find(|other| {
-            other.database_id == own.database_id
-                && other.prefix.len() > own.prefix.len()
-                && resolved.stored_name.starts_with(&other.prefix)
-        }) else {
+        let other = self.namespace_of_stored_name(own.database_id, &resolved.stored_name);
+        if other.prefix.len() <= own.prefix.len() {
             return Ok(());
-        };
+        }
         Err(LimboError::ParseError(format!(
             "cannot create \"{}\" in {}: the name starts with \"{}\", the prefix of {}",
             resolved.name, own.name, other.prefix, other.name

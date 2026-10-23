@@ -657,7 +657,10 @@ fn bind_table_name(
     let Some(resolved) = resolver.find_existing_table(name)? else {
         return Ok(());
     };
-    if resolved.database_id() == crate::TEMP_DB_ID || !resolver.has_table_like_object(&resolved) {
+    let has_table = resolver.with_schema(resolved.database_id(), |schema| {
+        Resolver::schema_has_table_like_object(schema, &resolved.stored_name)
+    });
+    if resolved.database_id() == crate::TEMP_DB_ID || !has_table {
         return Ok(());
     }
     if alias.is_none() && written != resolved.stored_name {
