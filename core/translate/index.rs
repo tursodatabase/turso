@@ -1071,7 +1071,7 @@ fn resolve_sorted_columns_with_catalog(
                 .unwrap_or_else(|| column.collation());
             let expr = match column.generated_type() {
                 GeneratedType::Virtual { expr, .. } => Some(expr.clone()),
-                GeneratedType::NotGenerated => None,
+                GeneratedType::Stored { .. } | GeneratedType::NotGenerated => None,
             };
             IndexColumn {
                 name: column_name,

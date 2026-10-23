@@ -286,6 +286,38 @@ pub trait Dialect: Send + Sync + 'static {
     fn constraint_errors_show_values(&self) -> bool {
         false
     }
+
+    /// Whether an INSERT without a column list writes the first columns, generated or not.
+    fn positional_insert_includes_generated_columns(&self) -> bool {
+        false
+    }
+
+    /// Whether a generated column can be part of the PRIMARY KEY.
+    fn allows_generated_columns_in_primary_key(&self) -> bool {
+        false
+    }
+
+    /// Whether `ALTER TABLE ADD COLUMN` can add a stored generated column.
+    fn add_column_allows_stored_generated_columns(&self) -> bool {
+        false
+    }
+
+    /// Whether `UPDATE ... SET col = DEFAULT` on a generated column is accepted and computes it.
+    fn update_set_default_computes_generated_columns(&self) -> bool {
+        false
+    }
+
+    /// The error for an INSERT that gives `values` values for `columns` target columns.
+    fn insert_value_count_error(
+        &self,
+        table_name: &str,
+        columns: usize,
+        values: usize,
+    ) -> crate::LimboError {
+        crate::LimboError::ParseError(format!(
+            "table {table_name} has {columns} columns but {values} values were supplied"
+        ))
+    }
 }
 
 #[cfg(test)]

@@ -21,11 +21,15 @@ use crate::{
     function::{AlterTableFunc, Func},
     schema::{
         collect_column_dependencies_of_expr, BTreeTable, CheckConstraint, Column, ColumnLayout,
-        ForeignKey, FromDefinitionFlags, Index, Schema, Table, EXPR_INDEX_SENTINEL,
+        ForeignKey, FromDefinitionFlags, GeneratedType, Index, Schema, Table, EXPR_INDEX_SENTINEL,
     },
     translate::{
         collate::key_collation,
-        emitter::{emit_check_constraints, gencol::compute_virtual_columns, Resolver},
+        emitter::{
+            emit_check_constraints,
+            gencol::{compute_virtual_columns, translate_gencol_expr_from_registers},
+            Resolver,
+        },
         expr::{
             emit_stored_column, translate_expr_no_constant_opt, walk_expr, walk_expr_mut,
             NoConstantOptReason, WalkControl,
@@ -687,13 +691,7 @@ fn emit_column_constraints_validation(
         layout,
         DmlRowForm::Stored,
     );
-    compute_virtual_columns(
-        program,
-        &resolved_table.columns_topo_sort()?,
-        &dml_ctx,
-        resolver,
-        &resolved_table_arc,
-    )?;
+    compute_virtual_columns(program, &dml_ctx, resolver, &resolved_table_arc)?;
     let result_reg = dml_ctx.to_column_reg(new_column_idx);
 
     if let Some(value_type) = strict_virtual_type {
@@ -1030,11 +1028,10 @@ pub fn translate_alter_table(
                 }
             }
 
-            // Check if any virtual column depends on the dropped column
             {
                 let affected = btree.columns_affected_by_update([dropped_index])?;
                 for idx in &affected {
-                    if idx != dropped_index && btree.columns()[idx].is_virtual_generated() {
+                    if idx != dropped_index && btree.columns()[idx].is_generated() {
                         return Err(LimboError::ParseError(format!(
                             "error in table {table_name} after drop column: no such column: {column_name}"
                         )));
@@ -1194,16 +1191,29 @@ pub fn translate_alter_table(
                     }
                 )
             });
-            if is_stored {
+            if is_stored
+                && !connection
+                    .dialect()
+                    .add_column_allows_stored_generated_columns()
+            {
                 return Err(LimboError::ParseError(
                     "cannot add a STORED column".to_string(),
                 ));
             }
             if is_generated {
                 for c in &col_def.constraints {
-                    if let ast::ColumnConstraint::Generated { expr, .. } = &c.constraint {
-                        crate::schema::validate_generated_expr(expr)?;
-                        validate_generated_function_calls(expr, &resolver.catalog)?;
+                    match &c.constraint {
+                        ast::ColumnConstraint::Generated { expr, .. } => {
+                            crate::schema::validate_generated_expr(expr)?;
+                            validate_generated_function_calls(expr, &resolver.catalog)?;
+                        }
+                        ast::ColumnConstraint::Default(_) => {
+                            return Err(LimboError::ParseError(format!(
+                                "generated column \"{}\" cannot have a DEFAULT value",
+                                col_def.col_name
+                            )));
+                        }
+                        _ => {}
                     }
                 }
             }
@@ -1497,7 +1507,9 @@ pub fn translate_alter_table(
                 }
             }
 
-            if computes_default_for_existing_rows {
+            if computes_default_for_existing_rows || is_stored {
+                let mut rewritten_table = btree.clone();
+                rewritten_table.prepare_generated_columns()?;
                 let added_column = btree.columns().len() - 1;
                 let source_column_by_schema_idx: Vec<Option<usize>> = btree
                     .columns()
@@ -1510,9 +1522,9 @@ pub fn translate_alter_table(
                 emit_rewrite_table_rows(
                     program,
                     original_btree.clone(),
-                    &btree,
+                    &rewritten_table,
                     &source_column_by_schema_idx,
-                    &btree.column_layout()?,
+                    &rewritten_table.column_layout()?,
                     Some(added_column),
                     resolver,
                     connection,
@@ -1844,7 +1856,7 @@ pub fn translate_alter_table(
                 )));
             };
 
-            if btree.get_column(col_name).is_some() {
+            if !col_name.eq_ignore_ascii_case(from) && btree.get_column(col_name).is_some() {
                 return Err(LimboError::ParseError(format!(
                     "duplicate column name: \"{col_name}\""
                 )));
@@ -2832,18 +2844,35 @@ fn emit_rewrite_table_rows(
             // each row its own value. Not hoisted because the encode below
             // rewrites the register in place.
             if source_column_by_schema_idx[column_index].is_none() {
-                let default = rewritten_table.columns()[column_index]
-                    .default
-                    .as_deref()
-                    .expect("a rewritten column without a source value must have a default");
-                translate_expr_no_constant_opt(
-                    program,
-                    None,
-                    default,
-                    layout.to_register(base_dest_reg, column_index),
-                    resolver,
-                    NoConstantOptReason::CustomTypeEncode,
-                )?;
+                let column = &rewritten_table.columns()[column_index];
+                let target_reg = layout.to_register(base_dest_reg, column_index);
+                if let GeneratedType::Stored { expr, .. } = column.generated_type() {
+                    translate_gencol_expr_from_registers(
+                        program,
+                        expr,
+                        target_reg,
+                        base_dest_reg,
+                        rewritten_table.columns(),
+                        resolver,
+                        rowid,
+                        layout,
+                        &Arc::new(rewritten_table.clone()),
+                    )?;
+                    program.emit_column_affinity(target_reg, column.affinity());
+                } else {
+                    let default = column
+                        .default
+                        .as_deref()
+                        .expect("a rewritten column without a source value must have a default");
+                    translate_expr_no_constant_opt(
+                        program,
+                        None,
+                        default,
+                        target_reg,
+                        resolver,
+                        NoConstantOptReason::CustomTypeEncode,
+                    )?;
+                }
             }
             if rewritten_table.is_strict {
                 emit_strict_column_conversion(

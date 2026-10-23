@@ -394,7 +394,14 @@ fn prepare_update_plan(
         connection,
     )?;
 
-    let set_clauses = collect_update_set_clauses(&mut body.sets, &table, table_name)?;
+    let set_clauses = collect_update_set_clauses(
+        &mut body.sets,
+        &table,
+        table_name,
+        connection
+            .dialect()
+            .update_set_default_computes_generated_columns(),
+    )?;
 
     let result_columns = if !body.returning.is_empty() {
         // Plan subqueries in RETURNING expressions before processing
@@ -479,6 +486,7 @@ fn collect_update_set_clauses(
     sets: &mut [ast::Set],
     table: &Table,
     table_name: &str,
+    set_default_computes_generated_columns: bool,
 ) -> crate::Result<Vec<UpdateSetClause>> {
     let column_lookup: HashMap<String, usize> = table
         .columns()
@@ -497,6 +505,13 @@ fn collect_update_set_clauses(
             let ident = normalize_ident(col_name.as_str());
 
             let col_index = match column_lookup.get(&ident) {
+                Some(idx)
+                    if set_default_computes_generated_columns
+                        && table.columns()[*idx].is_generated()
+                        && matches!(*expr, Expr::Default) =>
+                {
+                    continue;
+                }
                 Some(idx) => {
                     table.columns()[*idx].ensure_not_generated("UPDATE", col_name.as_str())?;
                     *idx
