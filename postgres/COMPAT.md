@@ -77,7 +77,8 @@ plus `pg_input_error_info`. Present but always empty: `pg_policy`,
 `pg_trigger`, `pg_statistic_ext`, `pg_inherits`, `pg_rewrite`,
 `pg_foreign_table`, `pg_partitioned_table`, `pg_collation`, `pg_description`,
 `pg_publication*`. `pg_statistic_ext` exposes the hidden system column
-`tableoid` for pg_dump discovery. Catalog introspection functions: `format_type`,
+`tableoid` for pg_dump discovery. `pg_trigger` exposes `tgparentid` for
+parent-trigger lookup during dump discovery. Catalog introspection functions: `format_type`,
 `pg_get_constraintdef`, `pg_get_indexdef`, `pg_get_expr` (returns TursoPG's
 stored SQL; relation oid and pretty printing do not change the output),
 `pg_get_userbyid`, `pg_*_is_visible`, `pg_encoding_to_char`,
