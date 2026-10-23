@@ -155,7 +155,7 @@ addr  opcode                       p1   p2   p3  p4                             
   87      Affinity                 78    2    0                                                     0  r[78..80] = C, C
   88      ColumnRange               7    2   63  3                                                  0  r[63..65]=ephemeral(hash_build_input).payload_0..payload_2
   89      Column                    7    7   68                                                     0  r[68]=ephemeral(hash_build_input).payload_5
-  90      HashBuild                 7   78    2  r=[1073741824] budget=32768 payload=r[63]..r[68]   0
+  90      HashBuild                 7   78    2  r=[1073741824] budget=67108864 payload=r[63]..r[68]   0
   91    Next                        7   86    0                                                     1
   92    HashBuildFinalize  1073741824    0    0                                                     0
   93    Integer                     1   84    0                                                     0  r[84]=1

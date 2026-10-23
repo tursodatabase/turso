@@ -36,7 +36,7 @@ addr  opcode                       p1  p2  p3  p4                               
   13      Affinity                  5   1   0                                                   0  r[5..6] = A
   14      RowId                     1   1   0                                                   0  r[1]=h_orders.rowid
   15      Column                    1   1   2                                                   0  r[2]=h_orders.customer_name
-  16      HashBuild                 1   5   1  r=[1073741824] budget=32768 payload=r[1]..r[3]   0
+  16      HashBuild                 1   5   1  r=[1073741824] budget=67108864 payload=r[1]..r[3]   0
   17    Next                        1  12   0                                                   1
   18    HashBuildFinalize  1073741824   0   0                                                   0
   19    Integer                     1   9   0                                                   0  r[9]=1

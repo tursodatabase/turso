@@ -92,7 +92,7 @@ expect {
 
 @setup result-cache-schema
 test correlated-aggregate-total-by-blob-column {
-    SELECT id, (SELECT total(x) FROM i WHERE i.b = o.k) FROM o ORDER BY id;
+    SELECT id, quote((SELECT total(x) FROM i WHERE i.b = o.k)) FROM o ORDER BY id;
 }
 expect {
     1|0.0

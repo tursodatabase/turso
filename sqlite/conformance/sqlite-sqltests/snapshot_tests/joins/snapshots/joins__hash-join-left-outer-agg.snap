@@ -43,7 +43,7 @@ addr  opcode                       p1  p2  p3  p4                               
   17      Column                    3   1  28                                                     0  r[28]=h_orders.customer_name
   18      Affinity                 28   1   0                                                     0  r[28..29] = A
   19      Column                    3   1  25                                                     0  r[25]=h_orders.customer_name
-  20      HashBuild                 3  28   1  r=[1073741824] budget=32768 payload=r[24]..r[26]   0
+  20      HashBuild                 3  28   1  r=[1073741824] budget=67108864 payload=r[24]..r[26]   0
   21    Next                        3  17   0                                                     1
   22    HashBuildFinalize  1073741824   0   0                                                     0
   23    Integer                     1  32   0                                                     0  r[32]=1

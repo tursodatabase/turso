@@ -76,7 +76,7 @@ addr  opcode                       p1   p2   p3  p4                             
   22      Affinity                 85    1    0                                                       0  r[85..86] = C
   23      RowId                     7   80    0                                                       0  r[80]=nation.rowid
   24      Column                    7    1   81                                                       0  r[81]=nation.N_NAME
-  25      HashBuild                 7   85    1  r=[1073741825] budget=32768 payload=r[80]..r[83]     0
+  25      HashBuild                 7   85    1  r=[1073741825] budget=67108864 payload=r[80]..r[83]     0
   26    Next                        7   21    0                                                       1
   27    HashBuildFinalize  1073741825    0    0                                                       0
   28    Integer                     1   89    0                                                       0  r[89]=1
@@ -124,7 +124,7 @@ addr  opcode                       p1   p2   p3  p4                             
   70      Column                    4    4   50                                                       0  r[50]=ephemeral(hash_build_input).payload_3
   71      ColumnRange               4    8   54  3                                                    0  r[54..56]=ephemeral(hash_build_input).payload_7..payload_9
   72      Column                    4   13   59                                                       0  r[59]=ephemeral(hash_build_input).payload_12
-  73      HashBuild                 4   75    1  r=[1073741824] budget=32768 payload=r[47]..r[59]     0
+  73      HashBuild                 4   75    1  r=[1073741824] budget=67108864 payload=r[47]..r[59]     0
   74    Next                        4   67    0                                                       1
   75    HashBuildFinalize  1073741824    0    0                                                       0
   76    Integer                     1   79    0                                                       0  r[79]=1
@@ -208,7 +208,7 @@ addr  opcode                       p1   p2   p3  p4                             
  154      Affinity                143    1    0                                                       0  r[143..144] = C
  155      RowId                    12  138    0                                                       0  r[138]=nation.rowid
  156      Column                   12    1  139                                                       0  r[139]=nation.N_NAME
- 157      HashBuild                12  143    1  r=[1073741827] budget=32768 payload=r[138]..r[141]   0
+ 157      HashBuild                12  143    1  r=[1073741827] budget=67108864 payload=r[138]..r[141]   0
  158    Next                       12  153    0                                                       1
  159    HashBuildFinalize  1073741827    0    0                                                       0
  160    Integer                     1  147    0                                                       0  r[147]=1
@@ -257,7 +257,7 @@ addr  opcode                       p1   p2   p3  p4                             
  203      Column                    9    4  108                                                       0  r[108]=ephemeral(hash_build_input).payload_3
  204      ColumnRange               9    8  112  3                                                    0  r[112..114]=ephemeral(hash_build_input).payload_7..payload_9
  205      Column                    9   13  117                                                       0  r[117]=ephemeral(hash_build_input).payload_12
- 206      HashBuild                 9  133    1  r=[1073741826] budget=32768 payload=r[105]..r[117]   0
+ 206      HashBuild                 9  133    1  r=[1073741826] budget=67108864 payload=r[105]..r[117]   0
  207    Next                        9  200    0                                                       1
  208    HashBuildFinalize  1073741826    0    0                                                       0
  209    Integer                     1  137    0                                                       0  r[137]=1

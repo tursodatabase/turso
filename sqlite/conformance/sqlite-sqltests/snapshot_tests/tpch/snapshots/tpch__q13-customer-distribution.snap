@@ -68,7 +68,7 @@ addr  opcode                       p1   p2   p3  p4                             
   24      RowId                     6   71    0                                                     0  r[71]=customer.rowid
   25      Affinity                 71    1    0                                                     0  r[71..72] = C
   26      RowId                     6   62    0                                                     0  r[62]=customer.rowid
-  27      HashBuild                 6   71    1  r=[1073741824] budget=32768 payload=r[62]..r[69]   0
+  27      HashBuild                 6   71    1  r=[1073741824] budget=67108864 payload=r[62]..r[69]   0
   28    Next                        6   24    0                                                     1
   29    HashBuildFinalize  1073741824    0    0                                                     0
   30    Integer                     1   75    0                                                     0  r[75]=1

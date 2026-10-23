@@ -100,7 +100,7 @@ addr  opcode                       p1   p2   p3  p4                             
   62      RowId                     1    2    0                                                    0  r[2]=part.rowid
   63      Column                    1    3    5                                                    0  r[5]=part.P_BRAND
   64      Column                    1    6    8                                                    0  r[8]=part.P_CONTAINER
-  65      HashBuild                 1   12    1  r=[1073741824] budget=32768 payload=r[2]..r[10]   0
+  65      HashBuild                 1   12    1  r=[1073741824] budget=67108864 payload=r[2]..r[10]   0
   66    Next                        1   60    0                                                    1
   67    HashBuildFinalize  1073741824    0    0                                                    0
   68    Integer                     1   16    0                                                    0  r[16]=1
