@@ -977,11 +977,15 @@ fn handle_pg_copy_from(conn: &Arc<Connection>, stmt: &PgCopyFromStmt) -> Result<
         LimboError::ParseError(format!("COPY FROM: cannot read '{}': {}", stmt.filename, e))
     })?;
 
-    let table_name = match &stmt.schema_name {
+    let schema_name = match &stmt.schema_name {
+        Some(schema) => Some(schema.clone()),
+        None => schema_of_table_in_search_path(conn, &stmt.table_name),
+    };
+    let table_name = match &schema_name {
         Some(schema) => format!("\"{schema}\".\"{}\"", stmt.table_name),
         None => format!("\"{}\"", stmt.table_name),
     };
-    let column_names = get_table_columns(conn, &stmt.table_name, stmt.schema_name.as_deref())?;
+    let column_names = get_table_columns(conn, &stmt.table_name, schema_name.as_deref())?;
     if column_names.is_empty() {
         return Err(LimboError::ParseError(format!(
             "COPY FROM: table '{}' not found or has no columns",
@@ -1044,6 +1048,22 @@ fn handle_pg_copy_from(conn: &Arc<Connection>, stmt: &PgCopyFromStmt) -> Result<
     }
 
     result
+}
+
+/// The first schema of `search_path` that has table `table_name`, the one
+/// a statement that names the table without a schema reads. None when no
+/// schema has it, so that the statement fails on the table name.
+fn schema_of_table_in_search_path(conn: &Connection, table_name: &str) -> Option<String> {
+    let schema = conn.current_schema();
+    conn.search_order()
+        .into_iter()
+        .filter(|namespace| namespace.database_id == turso_core::MAIN_DB_ID)
+        .find(|namespace| {
+            schema
+                .get_table(&namespace.stored_name(&table_name.to_lowercase()))
+                .is_some()
+        })
+        .map(|namespace| namespace.name)
 }
 
 fn get_table_columns(
