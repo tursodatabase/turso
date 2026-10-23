@@ -7758,31 +7758,7 @@ fn update_agg_payload(
             *ovrfl_i = sum_state.ovrfl as i64;
         }
         AggFunc::Min | AggFunc::Max => {
-            if matches!(arg, Value::Null) {
-                return Ok(());
-            }
-            if matches!(payload[0], Value::Null) {
-                payload[0].try_clone_from(arg)?;
-                return Ok(());
-            }
-            use std::cmp::Ordering;
-            let comparator = comparator()?;
-            // Use custom type comparator if available, otherwise fall back to collation
-            let cmp = if let Some(ref cmp_fn) = comparator {
-                let arg_ref = arg.as_ref();
-                let payload_ref = payload[0].as_ref();
-                cmp_fn(&arg_ref, &payload_ref)?
-            } else {
-                compare_with_collation(arg, &payload[0], Some(collation), &comparator)?
-            };
-            let should_update = match func {
-                AggFunc::Max => cmp == Ordering::Greater,
-                AggFunc::Min => cmp == Ordering::Less,
-                _ => false,
-            };
-            if should_update {
-                payload[0].try_clone_from(arg)?;
-            }
+            update_minmax_payload(func, arg, payload, collation, comparator)?;
         }
         AggFunc::GroupConcat | AggFunc::StringAgg => {
             if matches!(arg, Value::Null) {
@@ -9518,6 +9494,9 @@ pub fn op_agg_step(
                             };
                             if better {
                                 *best = arg;
+                                if let Some(reg) = data.skip_bare_columns_reg {
+                                    state.registers[reg].set_int(0);
+                                }
                             }
                             state.pc += 1;
                             return Ok(InsnFunctionStepResult::Step);
@@ -9534,6 +9513,7 @@ pub fn op_agg_step(
 #[inline(never)]
 fn op_agg_step_slow(program: &Program, state: &mut ProgramState, data: &AggStepData) -> InsnResult {
     let AggStepData {
+        skip_bare_columns_reg,
         acc_reg,
         col,
         delimiter,
@@ -9640,19 +9620,65 @@ fn op_agg_step_slow(program: &Program, state: &mut ProgramState, data: &AggStepD
                 .into());
             };
             let payload = agg.payload_vec_mut();
-            update_agg_payload(
-                func,
-                arg,
-                maybe_arg2.as_ref(),
-                payload,
-                current_collation,
-                comparator_factory,
-            )?;
+            if matches!(func, AggFunc::Min | AggFunc::Max) {
+                let changed = update_minmax_payload(
+                    func,
+                    arg,
+                    payload,
+                    current_collation,
+                    comparator_factory,
+                )?;
+                if changed {
+                    if let Some(reg) = skip_bare_columns_reg {
+                        state.registers[*reg].set_int(0);
+                    }
+                }
+            } else {
+                update_agg_payload(
+                    func,
+                    arg,
+                    maybe_arg2.as_ref(),
+                    payload,
+                    current_collation,
+                    comparator_factory,
+                )?;
+            }
         }
     };
 
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
+}
+
+fn update_minmax_payload(
+    func: &AggFunc,
+    arg: &Value,
+    payload: &mut [Value],
+    collation: CollationSeq,
+    comparator: impl FnOnce() -> Result<Option<crate::vdbe::sorter::SortComparator>>,
+) -> Result<bool> {
+    if matches!(payload[0], Value::Null) {
+        payload[0].try_clone_from(arg)?;
+        return Ok(true);
+    }
+    if matches!(arg, Value::Null) {
+        return Ok(false);
+    }
+    let comparator = comparator()?;
+    let cmp = if let Some(ref cmp_fn) = comparator {
+        cmp_fn(&arg.as_ref(), &payload[0].as_ref())?
+    } else {
+        compare_with_collation(arg, &payload[0], Some(collation), &comparator)?
+    };
+    let changed = match func {
+        AggFunc::Max => cmp == std::cmp::Ordering::Greater,
+        AggFunc::Min => cmp == std::cmp::Ordering::Less,
+        _ => unreachable!("expected min or max"),
+    };
+    if changed {
+        payload[0].try_clone_from(arg)?;
+    }
+    Ok(changed)
 }
 
 /// Adds `value` to a float total and its error term like [apply_kbn_step], or
