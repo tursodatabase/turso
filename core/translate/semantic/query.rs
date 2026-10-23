@@ -58,7 +58,7 @@ pub(crate) fn compound_column_affinity<'a>(
         affinity => affinity.is_numeric() && data_types.has_text(),
     };
     if conflicts {
-        (Affinity::Blob, false)
+        (Affinity::Blob, true)
     } else {
         (affinity, true)
     }
@@ -310,7 +310,7 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
                 analyzed.id
             ))
         })?;
-        let mut scope = Scope::new(Some(outer_scope.clone()));
+        let mut scope = self.new_scope(Some(outer_scope.clone()));
         scope.add_source(source, true);
         let expanded = scope.expand_star()?;
         let mut outputs = Vec::with_capacity(expanded.len());
@@ -371,7 +371,7 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
             first_syntax = &inner.select;
             syntax_joins.splice(0..0, inner.joins.iter());
         }
-        let mut scope = Scope::new(context.outer_scope().cloned());
+        let mut scope = self.new_scope(context.outer_scope().cloned());
         scope.set_database_names(
             (0..)
                 .map_while(|index| self.context().database_name_by_index(index))
@@ -988,9 +988,20 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
                 has_affinity: false,
                 ..argument
             };
-            let predicate = self
-                .build_scalar_binary_expr(hidden, ast::Operator::Equals, argument)?
+            let mut predicate = self
+                .build_binary_expr_of_operands(hidden, ast::Operator::Equals, argument)?
                 .expr;
+            // The table receives the argument's value as is, so an array
+            // argument is not compared element by element.
+            if let hir::Expr::Binary {
+                comparison: Some(comparison),
+                ..
+            } = &mut predicate
+            {
+                for component in &mut comparison.components {
+                    component.array = false;
+                }
+            }
             argument_predicates.push(predicate);
         }
         let source = self.source_mut(source).ok_or_else(|| {

@@ -334,15 +334,6 @@ impl<'catalog> SemanticContext<'catalog> {
             .map(str::to_string)
     }
 
-    /// The number of the attached database called `name`, if there is one.
-    /// Main and temp are not attached databases.
-    pub(crate) fn attached_database_id(&self, name: &str) -> Option<usize> {
-        self.database_names
-            .get(&normalize_ident(name))
-            .map(|database| database.index())
-            .filter(|&database| database != MAIN_DB_ID && database != TEMP_DB_ID)
-    }
-
     /// The database a schema statement names: the qualifier when there is
     /// one, else main.
     pub(crate) fn resolve_database_id(
@@ -353,13 +344,9 @@ impl<'catalog> SemanticContext<'catalog> {
             return Ok(MAIN_DB_ID);
         };
         let db_name = normalize_ident(db_name.as_str());
-        match db_name.as_str() {
-            "main" => Ok(MAIN_DB_ID),
-            "temp" => Ok(TEMP_DB_ID),
-            _ => self
-                .attached_database_id(&db_name)
-                .ok_or_else(|| LimboError::InvalidArgument(format!("no such database: {db_name}"))),
-        }
+        self.database(&db_name)
+            .map(|database| database.index())
+            .ok_or_else(|| LimboError::InvalidArgument(format!("no such database: {db_name}")))
     }
 
     /// The database a CREATE puts an object whose name has no qualifier
@@ -752,6 +739,11 @@ impl<'catalog> SemanticContext<'catalog> {
             .get_index(table_name, &normalized_name)
             .cloned()
             .ok_or_else(|| LimboError::ParseError(format!("no such index: {index_name}")))
+    }
+
+    /// PostgreSQL rule: `t.c` reads the nearest source named `t` only.
+    pub(crate) fn qualified_column_uses_nearest_table_only(&self) -> bool {
+        self.dialect.qualified_column_uses_nearest_table_only()
     }
 
     pub(crate) const fn dqs_dml(&self) -> DoubleQuotedDml {

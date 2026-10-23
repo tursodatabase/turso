@@ -290,6 +290,10 @@ pub(crate) struct Scope {
     outputs: Vec<ScopeOutput>,
     outer: Option<Arc<Scope>>,
     outer_resolution_blocked: bool,
+    /// PostgreSQL rule: `t.c` reads the nearest source named `t`, and is an
+    /// error when that source has no column `c`, even when an outer query
+    /// has a `t` with one.
+    qualified_uses_nearest_table_only: bool,
     /// The names of the attached databases by index, for error messages
     /// that name a column with its database.
     database_names: Vec<String>,
@@ -298,9 +302,17 @@ pub(crate) struct Scope {
 impl Scope {
     pub(crate) fn new(outer: Option<Scope>) -> Self {
         Self {
+            qualified_uses_nearest_table_only: outer
+                .as_ref()
+                .is_some_and(|outer| outer.qualified_uses_nearest_table_only),
             outer: outer.map(Arc::new),
             ..Self::default()
         }
+    }
+
+    pub(crate) fn with_qualified_uses_nearest_table_only(mut self, enabled: bool) -> Self {
+        self.qualified_uses_nearest_table_only = enabled;
+        self
     }
 
     pub(crate) fn set_database_names(&mut self, names: Vec<String>) {
@@ -671,8 +683,8 @@ impl Scope {
             QualifiedLookup::Found(resolved) => Ok(Some(*resolved)),
             QualifiedLookup::NoSuchColumn => {
                 // A source of that name without the column does not hide an
-                // outer source that has it.
-                if self.outer_resolution_blocked {
+                // outer source that has it, except under PostgreSQL's rule.
+                if self.outer_resolution_blocked || self.qualified_uses_nearest_table_only {
                     crate::bail_parse_error!("no such column: {qualifier}.{column}");
                 }
                 match self.outer.as_deref() {
@@ -867,7 +879,7 @@ impl Scope {
         match lookup {
             QualifiedLookup::Found(resolved) => Ok(Some(*resolved)),
             QualifiedLookup::NoSuchColumn => {
-                if self.outer_resolution_blocked {
+                if self.outer_resolution_blocked || self.qualified_uses_nearest_table_only {
                     crate::bail_parse_error!("no such column: {}", written());
                 }
                 match self.outer.as_deref() {
@@ -1055,9 +1067,16 @@ impl Scope {
                 } else {
                     column.resolved()
                 };
+                // SQLite names a column of a join group after the group,
+                // which it treats as a subquery, unless the group is the
+                // one source of the FROM clause.
                 expanded.push(ExpandedColumn {
                     name: column.display_name.clone(),
-                    qualifier: normalized.clone(),
+                    qualifier: if bare {
+                        normalized.clone()
+                    } else {
+                        source.qualifier.clone()
+                    },
                     resolved,
                 });
             }

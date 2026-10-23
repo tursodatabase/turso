@@ -888,7 +888,7 @@ impl<'ast> Analyzer<'_, '_, 'ast> {
                 })?,
                 false,
             );
-            let mut scope = Scope::new(Some(excluded_scope));
+            let mut scope = self.new_scope(Some(excluded_scope));
             scope.add_source(
                 self.source(target).ok_or_else(|| {
                     LimboError::InternalError(format!("missing INSERT target source {target}"))

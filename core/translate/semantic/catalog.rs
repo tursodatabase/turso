@@ -40,10 +40,11 @@ impl SemanticCatalog {
     ) -> Result<Self> {
         let (has_temp_schema, temp_schema) = match temp_database.read().as_ref() {
             Some(temp) => (true, temp.db.schema.lock().clone()),
-            None => (
-                false,
-                Arc::new(Schema::with_options(custom_types_enabled, dialect)?),
-            ),
+            None => {
+                let mut schema = Schema::with_options(custom_types_enabled, dialect)?;
+                schema.copy_table_valued_functions(&main_schema);
+                (false, Arc::new(schema))
+            }
         };
 
         let mut attached = {

@@ -327,6 +327,13 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
         self.context
     }
 
+    /// A scope that resolves names by this dialect's rules.
+    pub(super) fn new_scope(&self, outer: Option<Scope>) -> Scope {
+        Scope::new(outer).with_qualified_uses_nearest_table_only(
+            self.context().qualified_column_uses_nearest_table_only(),
+        )
+    }
+
     pub(super) fn allocate_aggregate(&mut self, block: QueryBlockId) -> super::hir::AggregateId {
         let count = self.aggregate_counts.entry(block).or_default();
         let id = super::hir::AggregateId::new(block, *count);
@@ -1026,7 +1033,7 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
                     expected_outputs,
                     policies,
                 )
-                .map(|block| (block, Vec::new(), Scope::new(outer_scope.cloned())))
+                .map(|block| (block, Vec::new(), self.new_scope(outer_scope.cloned())))
             }
         }
     }
@@ -1068,7 +1075,7 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
                 )?;
                 (Some(from), scope)
             }
-            None => (None, Scope::new(outer_scope.cloned())),
+            None => (None, self.new_scope(outer_scope.cloned())),
         };
         let mut functions = QueryFunctionState::new(block_id);
         self.analyze_named_windows(window_clause, &mut functions)?;
@@ -1190,7 +1197,7 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
         policies: ExprPolicies,
     ) -> Result<QueryBlock> {
         let block = QueryBlockId::new(query, index);
-        let scope = Scope::new(outer_scope.cloned());
+        let scope = self.new_scope(outer_scope.cloned());
         let policy = policies.select();
         let mut functions = QueryFunctionState::new(block);
         let mut resolved_rows = Vec::with_capacity(rows.len());

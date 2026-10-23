@@ -2257,6 +2257,18 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
         } else {
             (lhs, rhs)
         };
+        self.build_binary_expr_of_operands(lhs, operator, rhs)
+    }
+
+    /// Like [`Self::build_scalar_binary_expr`], but a scalar operand compared
+    /// with an array is not read as an array. A table function's hidden
+    /// argument column receives the argument's value as is.
+    pub(super) fn build_binary_expr_of_operands(
+        &mut self,
+        lhs: ResolvedScopeExpr,
+        operator: ast::Operator,
+        rhs: ResolvedScopeExpr,
+    ) -> Result<ResolvedScopeExpr> {
         let custom = self.resolve_custom_binary_operator(operator, &lhs, &rhs)?;
         let type_fact = binary_type_fact(operator, &lhs.type_fact, &rhs.type_fact);
         let array_concat = operator == ast::Operator::Concat
@@ -3039,9 +3051,9 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
             _ => {
                 let Some(function) = self
                     .context()
-                    .resolve_function(&function_name, parsed_argument_count)?
+                    .resolve_function(name.as_str(), parsed_argument_count)?
                 else {
-                    crate::bail_parse_error!("no such function: {function_name}");
+                    crate::bail_parse_error!("no such function: {}", name.as_str());
                 };
                 function
             }
