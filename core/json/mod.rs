@@ -10,11 +10,11 @@ pub use crate::json::ops::{
     json_insert, json_patch, json_remove, json_replace, jsonb_insert, jsonb_patch, jsonb_remove,
     jsonb_replace,
 };
-use crate::json::path::{json_path, JsonPath, PathElement};
-use crate::numeric::{str_to_i64, Numeric};
+use crate::json::path::{json_path, quote_path, JsonPath, PathElement};
+use crate::numeric::{format_float, str_to_i64, Numeric};
 use crate::types::{AsValueRef, Text, TextSubtype, Value, ValueType};
 use crate::vdbe::value::{first_nul, sqlite_text_prefix};
-use crate::{bail_constraint_error, LimboError, ValueRef};
+use crate::{bail_constraint_error, bail_parse_error, LimboError, ValueRef};
 pub use cache::JsonCacheCell;
 use jsonb::{
     jsonb_error_position, unescape_string, validate_jsonb, ElementType, Jsonb, JsonbHeader,
@@ -779,6 +779,46 @@ pub fn json_type(value: impl AsValueRef, path: Option<impl AsValueRef>) -> crate
     }
 }
 
+/// SQLite's `jsonPathFromDbValue()` takes an operand of `->`/`->>` that starts
+/// with `[`, ends with `]` and is at least three bytes long as the abbreviated
+/// form of the same text with a leading `$`.
+fn is_json_path_shorthand(text: &str) -> bool {
+    text.len() >= 3 && text.starts_with('[') && text.ends_with(']')
+}
+
+fn json_path_from_shorthand(text: &str) -> crate::Result<JsonPath<'static>> {
+    let expanded = format!("${text}");
+    let path = match json_path(&expanded) {
+        Ok(path) => path,
+        // The operand is what the user wrote, so that is what the message names.
+        Err(_) => bail_parse_error!("bad JSON path: '{}'", quote_path(text)),
+    };
+    // The keys were read out of `expanded`, which does not outlive the call.
+    Ok(path.into_owned())
+}
+
+/// Classify the text operand of `->`/`->>` the way SQLite's
+/// `jsonPathFromDbValue()` does.
+fn json_path_from_operand(text: &str) -> crate::Result<JsonPath<'_>> {
+    if text.starts_with("$") {
+        json_path(text)
+    } else if text.is_empty() {
+        // SQLite classifies an all-alphabetic operand as the label "$.text",
+        // which the empty text qualifies for, and "$." is not a path. Turning
+        // it into a key directly would accept what SQLite rejects.
+        bail_parse_error!("bad JSON path: '{}'", quote_path(text))
+    } else if is_json_path_shorthand(text) {
+        json_path_from_shorthand(text)
+    } else {
+        Ok(JsonPath {
+            elements: vec![
+                PathElement::Root(),
+                PathElement::Key(Cow::Borrowed(text), true),
+            ],
+        })
+    }
+}
+
 fn json_path_from_db_value<'a>(
     path: &'a (impl AsValueRef + 'a),
     strict: bool,
@@ -795,7 +835,12 @@ fn json_path_from_db_value<'a>(
                 return Ok(Some(JsonPath {
                     elements: vec![
                         PathElement::Root(),
-                        PathElement::ArrayLocator(Some(i as i32)),
+                        // SQLite renders the operand into "$[N]" text and its path
+                        // parser clamps an index that does not fit. Truncating here
+                        // instead lets 4294967296 name the first element.
+                        PathElement::ArrayLocator(Some(
+                            i.clamp(i32::MIN as i64, i32::MAX as i64) as i32
+                        )),
                     ],
                 }));
             }
@@ -803,7 +848,9 @@ fn json_path_from_db_value<'a>(
                 return Ok(Some(JsonPath {
                     elements: vec![
                         PathElement::Root(),
-                        PathElement::Key(Cow::Owned(f64::from(f).to_string()), false),
+                        // A REAL operand becomes its text form first, the way a CAST
+                        // renders it, so 1.0 names the key "1.0" rather than "1".
+                        PathElement::Key(Cow::Owned(format_float(f64::from(f))), false),
                     ],
                 }));
             }
@@ -825,15 +872,10 @@ pub(crate) fn json_path_text(path: ValueRef<'_>) -> Option<Cow<'_, str>> {
 }
 
 fn json_path_from_text(text: &str, strict: bool) -> crate::Result<JsonPath<'_>> {
-    if strict || text.starts_with('$') {
+    if strict {
         return json_path(text);
     }
-    Ok(JsonPath {
-        elements: vec![
-            PathElement::Root(),
-            PathElement::Key(Cow::Borrowed(text), true),
-        ],
-    })
+    json_path_from_operand(text)
 }
 
 /// Parses the path of a json_set, json_insert or json_replace path/value pair.
@@ -1888,6 +1930,106 @@ mod tests {
         match &result.elements[..] {
             [PathElement::Root(), PathElement::Key(field, false)] if *field == "1.23" => {}
             _ => panic!("Expected root and field"),
+        }
+    }
+
+    #[test]
+    fn test_json_arrow_operands_match_sqlite() {
+        // The right operand of -> and ->> is classified the way SQLite's
+        // jsonPathFromDbValue() classifies it: "[...]" is an abbreviated path,
+        // a BLOB or REAL is turned into its text form, an integer index that
+        // does not fit is out of range rather than truncated, and the operand
+        // ends at an embedded NUL.
+        let cases: &[(&str, Value, &str)] = &[
+            (r#"["a","b",["c","d"]]"#, Value::build_text("[0]"), "a"),
+            (r#"["a","b",["c","d"]]"#, Value::build_text("[2][1]"), "d"),
+            (
+                r#"["a","b",["c","d"]]"#,
+                Value::build_text("[#-1]"),
+                r#"["c","d"]"#,
+            ),
+            // Only an operand that both starts with '[' and ends with ']' is
+            // the abbreviated form; "[0].a" is a key.
+            (r#"[{"a":1}]"#, Value::build_text("[0].a"), "<NULL>"),
+            (r#"[{"a":1}]"#, Value::build_text("$[0].a"), "1"),
+            (r#"{"[0]":5}"#, Value::build_text("[0]"), "<NULL>"),
+            (r#"{"[]":3}"#, Value::build_text("[]"), "3"),
+            (r#"{"a":1}"#, Value::build_text("a"), "1"),
+            (r#"{"a b":7}"#, Value::build_text("a b"), "7"),
+            (
+                r#"{"a":1}"#,
+                Value::Blob(
+                    crate::types::value_blob_from_slice(b"a").expect("test blob allocation"),
+                ),
+                "1",
+            ),
+            (
+                r#"{"a":1}"#,
+                Value::Blob(
+                    crate::types::value_blob_from_slice(b"A").expect("test blob allocation"),
+                ),
+                "<NULL>",
+            ),
+            (
+                r#"[1,2]"#,
+                Value::Blob(
+                    crate::types::value_blob_from_slice(b"[0]").expect("test blob allocation"),
+                ),
+                "1",
+            ),
+            // The bytes of a BLOB operand are read as UTF-8 text, not byte by
+            // byte, so this is the key "euro sign" and not three latin-1 keys.
+            (
+                r#"{"€":2}"#,
+                Value::Blob(
+                    crate::types::value_blob_from_slice(b"\xe2\x82\xac")
+                        .expect("test blob allocation"),
+                ),
+                "2",
+            ),
+            (r#"{"1.0":8}"#, Value::from_f64(1.0), "8"),
+            (r#"{"1.5":8}"#, Value::from_f64(1.5), "8"),
+            (r#"[1,2]"#, Value::from_i64(1), "2"),
+            (r#"[1,2]"#, Value::from_i64(-1), "2"),
+            (r#"[1,2]"#, Value::from_i64(4294967296), "<NULL>"),
+            (r#"[1,2]"#, Value::from_i64(-4294967295), "<NULL>"),
+            (r#"{"a":1}"#, Value::build_text("a\0b"), "1"),
+        ];
+        let cache = JsonCacheCell::new();
+        for (doc, operand, expected) in cases {
+            let document = Value::build_text(*doc);
+            let shift = json_arrow_shift_extract(&document, operand.clone(), &cache).unwrap();
+            let got = match &shift {
+                Value::Null => "<NULL>".to_string(),
+                other => other.to_string(),
+            };
+            assert_eq!(got, *expected, "{doc:?} ->> {operand:?}");
+            let arrow = json_arrow_extract(&document, operand.clone(), &cache).unwrap();
+            if *expected == "<NULL>" {
+                assert!(matches!(arrow, Value::Null), "{doc:?} -> {operand:?}");
+            } else {
+                assert!(!matches!(arrow, Value::Null), "{doc:?} -> {operand:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn test_json_arrow_operand_errors_match_sqlite() {
+        // An empty operand is the label "$.", which is not a path, and so is a
+        // bracket operand that does not hold a path.
+        let cases = ["", "[ 0 ]", "[abc]"];
+        let cache = JsonCacheCell::new();
+        for operand in cases {
+            let document = Value::build_text(r#"{"a":1}"#);
+            let operand = Value::build_text(operand);
+            assert!(
+                json_arrow_shift_extract(&document, &operand, &cache).is_err(),
+                "->> {operand:?}"
+            );
+            assert!(
+                json_arrow_extract(&document, &operand, &cache).is_err(),
+                "-> {operand:?}"
+            );
         }
     }
 
