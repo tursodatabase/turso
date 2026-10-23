@@ -2073,7 +2073,10 @@ impl<'a> Parser<'a> {
                         // passes can descend into: the arguments plus the
                         // ORDER BY / WITHIN GROUP / FILTER / OVER clauses.
                         let mut clause_height = self.last_expr_height;
-                        let order_by = self.parse_order_by()?;
+                        let mut order_by = self.parse_order_by()?;
+                        if exprs.is_empty() {
+                            order_by.clear();
+                        }
                         clause_height = clause_height.max(self.last_expr_height);
                         eat_expect!(self, TK_RP);
                         let within_group = self.parse_within_group()?;
