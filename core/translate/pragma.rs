@@ -616,6 +616,7 @@ fn update_pragma(
                 jump_if_null: false,
             });
             program.emit_insn(Insn::Halt {
+                constraint_info: None,
                 err_code: 0,
                 description: "Early halt because auto vacuum mode is not enabled".to_string(),
                 on_error: None,
@@ -1908,6 +1909,7 @@ fn without_rowid_primary_key_index(table: &BTreeTable) -> Result<Option<Index>> 
         table.primary_key_columns.len(),
         primary_key.and_then(|us| us.conflict_clause),
         primary_key.map_or(&[], |us| us.columns.as_slice()),
+        primary_key.and_then(|us| us.constraint_name.clone()),
     )?;
     Ok(Some(index))
 }

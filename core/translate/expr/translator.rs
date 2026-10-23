@@ -3118,6 +3118,7 @@ fn translate_raise_expr(
             }
             // RAISE(IGNORE): halt the trigger subprogram and skip the triggering row
             program.emit_insn(Insn::Halt {
+                constraint_info: None,
                 err_code: 0,
                 description: String::new(),
                 on_error: Some(ResolveType::Ignore),
@@ -3137,6 +3138,7 @@ fn translate_raise_expr(
                 Some(e) => match e.as_ref() {
                     ast::Expr::Literal(ast::Literal::String(s)) => {
                         program.emit_insn(Insn::Halt {
+                            constraint_info: None,
                             err_code,
                             description: sanitize_string(s),
                             on_error: Some(*resolve_type),
@@ -3148,6 +3150,7 @@ fn translate_raise_expr(
                         let reg = program.alloc_register();
                         translate_expr(program, referenced_tables, e, reg, resolver)?;
                         program.emit_insn(Insn::Halt {
+                            constraint_info: None,
                             err_code,
                             description: String::new(),
                             on_error: Some(*resolve_type),

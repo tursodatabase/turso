@@ -24,8 +24,8 @@ use crate::{
         },
         fkeys::{
             build_index_affinity_string, emit_fk_restrict_halt, emit_fk_violation,
-            emit_guarded_fk_decrement, emit_skip_if_any_null, index_probe, index_scan_match_any,
-            open_read_index, open_read_table, ForeignKeyActions,
+            emit_guarded_fk_decrement, emit_skip_if_any_null, fk_constraint_info, index_probe,
+            index_scan_match_any, open_read_index, open_read_table, ForeignKeyActions,
         },
         plan::{
             ColumnUsedMask, EvalAt, JoinedTable, Operation, QueryDestination, ResultSetColumn,
@@ -50,7 +50,10 @@ use crate::{
     vdbe::{
         affinity::Affinity,
         builder::{CursorKey, CursorType, DmlColumnContext, ProgramBuilder, ProgramBuilderOpts},
-        insn::{to_u32, CmpInsFlags, IdxInsertFlags, InsertFlags, Insn, RegisterOrLiteral},
+        insn::{
+            to_u32, CmpInsFlags, ConstraintInfo, IdxInsertFlags, InsertFlags, Insn,
+            RegisterOrLiteral,
+        },
         BranchOffset,
     },
     CaptureDataChangesExt, Connection, LimboError, Result, VirtualTable,
@@ -1574,6 +1577,7 @@ fn emit_rowid_generation(
         });
 
         program.emit_insn(Insn::Halt {
+            constraint_info: None,
             err_code: crate::error::SQLITE_FULL,
             description: "database or disk is full".to_string(),
             on_error: None,
@@ -1908,7 +1912,41 @@ fn emit_notnulls(
                 target_pc: ctx.loop_labels.row_done,
             });
         } else {
+            let all_regs: Vec<usize> = insertion
+                .col_mappings
+                .iter()
+                .filter(|m| !m.column.is_virtual_generated())
+                .map(|m| {
+                    if m.column.is_rowid_alias() {
+                        insertion.key_register()
+                    } else {
+                        m.register
+                    }
+                })
+                .collect();
+            let all_names: Vec<String> = insertion
+                .col_mappings
+                .iter()
+                .filter(|m| !m.column.is_virtual_generated())
+                .filter_map(|m| m.column.name.clone())
+                .collect();
+            let col_name = column_mapping
+                .column
+                .name
+                .as_deref()
+                .unwrap_or("")
+                .to_string();
             program.emit_insn(Insn::HaltIfNull {
+                constraint_info: Some(Box::new(ConstraintInfo {
+                    kind: crate::ConstraintKind::NotNull,
+                    constraint_name: None,
+                    index_name: None,
+                    table_name: ctx.table.name.as_str().to_string(),
+                    column_names: vec![col_name],
+                    violation_regs: all_regs,
+                    row_col_names: all_names,
+                    parent_table: None,
+                })),
                 target_reg: check_reg,
                 err_code: SQLITE_CONSTRAINT_NOTNULL,
                 description: {
@@ -2949,6 +2987,18 @@ fn emit_pk_uniqueness_check(
                 .collect::<Vec<_>>()
                 .join(", ");
             program.emit_insn(Insn::Halt {
+                constraint_info: Some(Box::new(ConstraintInfo::primary_key(
+                    ctx.table.name.as_str(),
+                    ctx.table.primary_key_constraint_name.clone(),
+                    ctx.table
+                        .primary_key_columns
+                        .iter()
+                        .map(|(n, _)| n.clone())
+                        .collect(),
+                    (0..ctx.table.primary_key_columns.len())
+                        .map(|i| pk_regs + i)
+                        .collect(),
+                ))),
                 err_code: SQLITE_CONSTRAINT_PRIMARYKEY,
                 description: raw_desc,
                 on_error: program.constraint_halt_on_error(preflight.effective_on_conflict),
@@ -3011,6 +3061,12 @@ fn emit_pk_uniqueness_check(
         }
         let raw_desc = format!("{}.{}", ctx.table.name, rowid_column_name);
         program.emit_insn(Insn::Halt {
+            constraint_info: Some(Box::new(ConstraintInfo::primary_key(
+                ctx.table.name.as_str(),
+                ctx.table.primary_key_constraint_name.clone(),
+                vec![rowid_column_name.to_string()],
+                vec![insertion.key_register()],
+            ))),
             err_code: SQLITE_CONSTRAINT_PRIMARYKEY,
             description: raw_desc,
             on_error: program.constraint_halt_on_error(preflight.effective_on_conflict),
@@ -3175,6 +3231,11 @@ fn emit_unique_index_check(
         // (if conflict clause matched - VM will jump to later instructions and skip halt)
         let raw_desc = format_unique_violation_desc(ctx.table.name.as_str(), index);
         program.emit_insn(Insn::Halt {
+            constraint_info: Some(Box::new(ConstraintInfo::unique_index(
+                ctx.table.name.as_str(),
+                index,
+                (0..num_cols).map(|i| idx_start_reg + i).collect(),
+            ))),
             err_code: SQLITE_CONSTRAINT_UNIQUE,
             description: raw_desc,
             on_error: program.constraint_halt_on_error(preflight.effective_on_conflict),
@@ -3215,6 +3276,11 @@ fn emit_unique_index_check(
             // ABORT/FAIL/ROLLBACK: halt on conflict.
             let raw_desc = format_unique_violation_desc(ctx.table.name.as_str(), index);
             program.emit_insn(Insn::Halt {
+                constraint_info: Some(Box::new(ConstraintInfo::unique_index(
+                    ctx.table.name.as_str(),
+                    index,
+                    (0..num_cols).map(|i| idx_start_reg + i).collect(),
+                ))),
                 err_code: SQLITE_CONSTRAINT_UNIQUE,
                 description: raw_desc,
                 on_error: program.constraint_halt_on_error(preflight.effective_on_conflict),
@@ -3926,9 +3992,29 @@ pub fn emit_fk_child_insert_checks(
             program.preassign_label_to_next_insn(violation);
             program.emit_insn(Insn::Close { cursor_id: pcur });
             if fk_ref.fk.deferred || inserting_multiple_rows {
-                emit_fk_violation(program, &fk_ref.fk)?;
+                emit_fk_violation(program, &fk_ref.fk, None)?;
             } else {
-                emit_fk_restrict_halt(program)?;
+                let fk_col_regs: Vec<usize> = fk_ref
+                    .fk
+                    .child_columns
+                    .iter()
+                    .map(|col_name| {
+                        let (i, col) = child_tbl.get_column(col_name).unwrap();
+                        if col.is_rowid_alias() {
+                            new_rowid_reg
+                        } else {
+                            layout.to_register(new_start_reg, i)
+                        }
+                    })
+                    .collect();
+                emit_fk_restrict_halt(
+                    program,
+                    Some(Box::new(fk_constraint_info(
+                        child_tbl.name.as_str(),
+                        &fk_ref.fk,
+                        fk_col_regs,
+                    ))),
+                )?;
             }
             program.preassign_label_to_next_insn(fk_ok);
         } else {
@@ -4026,9 +4112,29 @@ pub fn emit_fk_child_insert_checks(
                 // on_not_found: counted for a deferred FK or a multi-row insert, otherwise Halt
                 |p| {
                     if fk_ref.fk.deferred || inserting_multiple_rows {
-                        emit_fk_violation(p, &fk_ref.fk)?;
+                        emit_fk_violation(p, &fk_ref.fk, None)?;
                     } else {
-                        emit_fk_restrict_halt(p)?;
+                        let fk_col_regs: Vec<usize> = fk_ref
+                            .fk
+                            .child_columns
+                            .iter()
+                            .map(|col_name| {
+                                let (i, col) = child_tbl.get_column(col_name).unwrap();
+                                if col.is_rowid_alias() {
+                                    new_rowid_reg
+                                } else {
+                                    layout.to_register(new_start_reg, i)
+                                }
+                            })
+                            .collect();
+                        emit_fk_restrict_halt(
+                            p,
+                            Some(Box::new(fk_constraint_info(
+                                child_tbl.name.as_str(),
+                                &fk_ref.fk,
+                                fk_col_regs,
+                            ))),
+                        )?;
                     }
                     Ok(())
                 },

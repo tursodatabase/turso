@@ -138,7 +138,8 @@ Before opening a PR, read the "PR Workflow" document linked above.
 8. **Driver API parity** Embedded (`bindings/rust`) and serverless (`serverless/rust`) drivers expose the same public API; add features to both in the same change. Spec: `serverless/conformance/differential/README.md`.
 9. **Backward compatibility** No breaking changes. New versions of Turso must work with databases and sidecar files that were created from previous versions.  
 10. **Keep user docs current.** If a change adds, removes, or changes user-visible SQL behavior (syntax, functions, pragmas, data types, CLI commands, errors), update the matching page in `docs/sql-reference/` in the same change. For example, a new `JOIN` type goes in `docs/sql-reference/statements/select.mdx`.
-11. **No PostgreSQL-specific code in `core/`.** PostgreSQL behavior and state go in `postgres/`. Unsure what to do? Ask.
+11. **Dialect-specific behavior belongs on the `Dialect` trait.** If a behavior differs between the SQLite and PostgreSQL frontends (error handling, type semantics, name resolution, etc.), add a method to `core/dialect/mod.rs` with a default that matches SQLite and override it in `PostgresDialect`. Do not put it in `DatabaseOpts` (that is client-public API and clients should not set dialect behavior) and do not put it in CLI flags or wire-protocol fields (those do not apply to embedded databases).
+12. **No PostgreSQL-specific code in `core/`.** PostgreSQL behavior and state go in `postgres/`. Unsure what to do? Ask.
 
 ## Always use plain language instead of complex jargon
 

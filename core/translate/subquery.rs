@@ -1044,6 +1044,7 @@ fn get_subquery_parser<'a>(
                     where_clause: None,
                     index_method: None,
                     on_conflict: None,
+                    constraint_name: None,
                 });
 
                 let cursor_id =

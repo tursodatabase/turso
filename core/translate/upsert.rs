@@ -6,7 +6,7 @@ use turso_parser::ast::{self, TriggerEvent, TriggerTime, Upsert};
 
 use super::emitter::gencol::compute_virtual_columns;
 use crate::alloc::TursoIteratorExt;
-use crate::error::{SQLITE_CONSTRAINT_PRIMARYKEY, SQLITE_ERROR};
+use crate::error::{SQLITE_CONSTRAINT_PRIMARYKEY, SQLITE_CONSTRAINT_UNIQUE, SQLITE_ERROR};
 use crate::schema::{BTreeTable, ColumnLayout, IndexColumn, EXPR_INDEX_SENTINEL, ROWID_SENTINEL};
 use crate::translate::emitter::{emit_check_constraints, emit_make_record, UpdateRowSource};
 use crate::translate::expr::{walk_expr, WalkControl};
@@ -23,7 +23,7 @@ use crate::translate::trigger_exec::{
     fire_trigger, get_triggers_including_temp, has_triggers_including_temp, TriggerContext,
 };
 use crate::translate::update::rowid_name_column_index;
-use crate::vdbe::insn::{to_u32, CmpInsFlags};
+use crate::vdbe::insn::{to_u32, CmpInsFlags, ConstraintInfo};
 use crate::{
     bail_parse_error,
     error::SQLITE_CONSTRAINT_NOTNULL,
@@ -507,6 +507,7 @@ pub fn emit_upsert(
             target_pc: row_not_written,
         });
         program.emit_insn(Insn::Halt {
+            constraint_info: None,
             err_code: SQLITE_ERROR,
             description: "ON CONFLICT DO UPDATE command cannot affect row a second time"
                 .to_string(),
@@ -731,6 +732,7 @@ pub fn emit_upsert(
         translate_result?;
         if col.notnull() && !col.is_rowid_alias() {
             program.emit_insn(Insn::HaltIfNull {
+                constraint_info: None,
                 target_reg: layout.to_register(new_start, *col_idx),
                 err_code: SQLITE_CONSTRAINT_NOTNULL,
                 description: String::from(table.get_name()) + "." + col.name.as_ref().unwrap(),
@@ -1107,6 +1109,7 @@ pub fn emit_upsert(
             target_pc: ok,
         });
         program.emit_insn(Insn::Halt {
+            constraint_info: None,
             err_code: SQLITE_CONSTRAINT_PRIMARYKEY,
             description: format!(
                 "{}.{}",
@@ -1259,8 +1262,45 @@ pub fn emit_upsert(
                     collation: program.curr_collation(),
                 });
                 let description = format_unique_violation_desc(table.get_name(), &idx_meta);
+                let regs: Vec<usize> = (0..k).map(|i| ins + i).collect();
+                let idx_col_names: Vec<&str> =
+                    idx_meta.columns.iter().map(|c| c.name.as_str()).collect();
+                let (pk_col_names, pk_constraint_name) = table
+                    .btree()
+                    .map(|bt| {
+                        let cols: Vec<String> = bt
+                            .primary_key_columns
+                            .iter()
+                            .map(|(n, _)| n.clone())
+                            .collect();
+                        (cols, bt.primary_key_constraint_name.clone())
+                    })
+                    .unwrap_or_default();
+                let is_pk = !pk_col_names.is_empty()
+                    && idx_col_names == pk_col_names.iter().map(String::as_str).collect::<Vec<_>>();
+                let (constraint_info, err_code) = if is_pk {
+                    (
+                        Some(Box::new(ConstraintInfo::primary_key(
+                            table.get_name(),
+                            pk_constraint_name,
+                            pk_col_names,
+                            regs,
+                        ))),
+                        SQLITE_CONSTRAINT_PRIMARYKEY,
+                    )
+                } else {
+                    (
+                        Some(Box::new(ConstraintInfo::unique_index(
+                            table.get_name(),
+                            &idx_meta,
+                            regs,
+                        ))),
+                        SQLITE_CONSTRAINT_UNIQUE,
+                    )
+                };
                 program.emit_insn(Insn::Halt {
-                    err_code: SQLITE_CONSTRAINT_PRIMARYKEY,
+                    constraint_info,
+                    err_code,
                     description,
                     on_error: None,
                     description_reg: None,

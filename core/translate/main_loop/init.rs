@@ -622,6 +622,7 @@ fn right_join_metadata(
         where_clause: None,
         index_method: None,
         on_conflict: None,
+        constraint_name: None,
     });
     Ok(RightJoinMetadata {
         matched_rows_cursor_id: program.alloc_cursor_id(CursorType::BTreeIndex(matched_rows_index)),
@@ -705,6 +706,7 @@ fn emit_percentile_fraction_check(
     });
     program.preassign_label_to_next_insn(bad);
     program.emit_insn(Insn::Halt {
+        constraint_info: None,
         err_code: crate::error::SQLITE_ERROR,
         description: "percentile value is not between 0 and 1".to_string(),
         on_error: None,
