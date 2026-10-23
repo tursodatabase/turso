@@ -353,14 +353,13 @@ impl PostgreSQLTranslator {
                         col_def,
                         has_table_pk,
                         &tbl_name,
-                        &relation.schemaname,
                         &mut serial_sequences,
                         &mut check_names,
                     )?;
                     columns.push(col);
                 }
                 Node::Constraint(constraint) => {
-                    reject_constraint_attributes(constraint, &relation.schemaname)?;
+                    reject_constraint_attributes(constraint)?;
                     let contype =
                         ConstrType::try_from(constraint.contype).unwrap_or(ConstrType::Undefined);
                     match contype {
@@ -511,7 +510,6 @@ impl PostgreSQLTranslator {
         col_def: &pg_query::protobuf::ColumnDef,
         has_table_pk: bool,
         tbl_name: &ast::QualifiedName,
-        table_schema: &str,
         serial_sequences: &mut Vec<String>,
         check_names: &mut std::collections::HashSet<String>,
     ) -> Result<ast::ColumnDefinition, ParseError> {
@@ -543,7 +541,7 @@ impl PostgreSQLTranslator {
                     "unexpected column constraint node".into(),
                 ));
             };
-            reject_constraint_attributes(constraint, table_schema)?;
+            reject_constraint_attributes(constraint)?;
             let contype = ConstrType::try_from(constraint.contype).unwrap_or(ConstrType::Undefined);
             match contype {
                 ConstrType::ConstrPrimary => {
@@ -874,7 +872,7 @@ impl PostgreSQLTranslator {
                         ));
                     }
                 };
-                let col = self.translate_column_def(col_def, &relation.schemaname)?;
+                let col = self.translate_column_def(col_def)?;
                 ast::AlterTableBody::AddColumn(col)
             }
             AlterTableType::AtDropColumn => {
@@ -901,7 +899,7 @@ impl PostgreSQLTranslator {
                 if col_def.raw_default.is_some() {
                     return Err(not_supported("ALTER COLUMN TYPE ... USING"));
                 }
-                self.translate_column_def(col_def, &relation.schemaname)?;
+                self.translate_column_def(col_def)?;
                 return Err(not_supported("ALTER TABLE ... ALTER COLUMN ... TYPE"));
             }
             AlterTableType::AtColumnDefault => {
@@ -990,7 +988,6 @@ impl PostgreSQLTranslator {
     fn translate_column_def(
         &self,
         col_def: &pg_query::protobuf::ColumnDef,
-        table_schema: &str,
     ) -> Result<ast::ColumnDefinition, ParseError> {
         use pg_query::protobuf::node::Node;
         use pg_query::protobuf::ConstrType;
@@ -1027,7 +1024,7 @@ impl PostgreSQLTranslator {
                     "unexpected column constraint node".into(),
                 ));
             };
-            reject_constraint_attributes(constraint, table_schema)?;
+            reject_constraint_attributes(constraint)?;
             let contype = ConstrType::try_from(constraint.contype).unwrap_or(ConstrType::Undefined);
             let constraint_ast = match contype {
                 ConstrType::ConstrNotnull => Some(ast::ColumnConstraint::NotNull {
@@ -4971,7 +4968,7 @@ impl PostgreSQLTranslator {
                     "CREATE DOMAIN: unexpected constraint node".into(),
                 ));
             };
-            reject_constraint_attributes(constraint, "")?;
+            reject_constraint_attributes(constraint)?;
             let contype = ConstrType::try_from(constraint.contype).unwrap_or(ConstrType::Undefined);
             match contype {
                 ConstrType::ConstrDefault => {
@@ -5839,12 +5836,16 @@ fn extract_key_columns(keys: &[pg_query::protobuf::Node]) -> Result<Vec<String>,
 fn extract_foreign_key(
     constraint: &pg_query::protobuf::Constraint,
 ) -> Result<PgForeignKey, ParseError> {
-    let ref_table = constraint
+    let pktable = constraint
         .pktable
         .as_ref()
-        .ok_or_else(|| ParseError::ParseError("REFERENCES missing table name".into()))?
-        .relname
-        .clone();
+        .ok_or_else(|| ParseError::ParseError("REFERENCES missing table name".into()))?;
+    if !pktable.schemaname.is_empty() && map_schema_name(&pktable.schemaname) != "main" {
+        return Err(not_supported(
+            "a foreign key naming a table of a schema that was not replaced by its stored name",
+        ));
+    }
+    let ref_table = pktable.relname.clone();
     let ref_columns = extract_key_columns(&constraint.pk_attrs)?;
     let on_delete = pg_fk_action_to_string(&constraint.fk_del_action)?;
     let on_update = pg_fk_action_to_string(&constraint.fk_upd_action)?;
@@ -6754,7 +6755,6 @@ fn not_supported(what: impl std::fmt::Display) -> ParseError {
 
 fn reject_constraint_attributes(
     constraint: &pg_query::protobuf::Constraint,
-    table_schema: &str,
 ) -> Result<(), ParseError> {
     use pg_query::protobuf::ConstrType;
 
@@ -6770,17 +6770,14 @@ fn reject_constraint_attributes(
             "a DEFERRABLE / INITIALLY DEFERRED constraint",
         ));
     }
-    if let Some(pktable) = &constraint.pktable {
-        let schema_of =
-            |s: &str| map_schema_name(if s.is_empty() { "public" } else { s }).to_string();
-        if !pktable.catalogname.is_empty()
-            || (!pktable.schemaname.is_empty()
-                && schema_of(&pktable.schemaname) != schema_of(table_schema))
-        {
-            return Err(not_supported(
-                "foreign key referencing a table in another schema",
-            ));
-        }
+    if constraint
+        .pktable
+        .as_ref()
+        .is_some_and(|pktable| !pktable.catalogname.is_empty())
+    {
+        return Err(not_supported(
+            "foreign key referencing a table in another database",
+        ));
     }
     if !constraint.including.is_empty() {
         return Err(not_supported("INCLUDE on a constraint"));
@@ -9892,22 +9889,25 @@ mod tests {
     }
 
     #[test]
-    fn fail_closed_fk_other_schema() {
+    fn fail_closed_fk_other_database() {
+        assert_not_supported(
+            "CREATE TABLE c (a int REFERENCES db.other.p(id))",
+            "another database",
+        );
+        assert_not_supported(
+            "ALTER TABLE c ADD COLUMN a int REFERENCES db.other.p(id)",
+            "another database",
+        );
         assert_not_supported(
             "CREATE TABLE c (a int REFERENCES other.p(id))",
-            "another schema",
+            "replaced by its stored name",
         );
         assert_not_supported(
             "CREATE TABLE s.c (a int, FOREIGN KEY (a) REFERENCES p2.p(id))",
-            "another schema",
-        );
-        assert_not_supported(
-            "ALTER TABLE c ADD COLUMN a int REFERENCES other.p(id)",
-            "another schema",
+            "replaced by its stored name",
         );
         assert_translates("CREATE TABLE public.c (a int REFERENCES public.p(id))");
-        assert_translates("CREATE TABLE c (a int REFERENCES public.p(id))");
-        assert_translates("CREATE TABLE s.c (a int REFERENCES s.p(id))");
+        assert_translates("CREATE TABLE s.c (a int REFERENCES __turso_ns1_p(id))");
     }
 
     #[test]

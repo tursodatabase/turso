@@ -144,10 +144,14 @@ impl Dialect for PostgresDialect {
     fn format_table_sql(
         &self,
         input: &str,
-        _tbl_name: &turso_parser::ast::QualifiedName,
+        tbl_name: &turso_parser::ast::QualifiedName,
         _body: &turso_parser::ast::CreateTableBody,
     ) -> Result<String> {
-        Ok(encode_pg_schema_sql(input))
+        // Engine-generated statements are SQLite text, which the PostgreSQL
+        // parser may not read; they name their table as it is stored.
+        let sql = turso_pg_parser::name_create_table(input, tbl_name.name.as_str())
+            .unwrap_or_else(|_| input.to_string());
+        Ok(encode_pg_schema_sql(&sql))
     }
 
     fn format_rewritten_table_sql(&self, stmt: &turso_parser::ast::Stmt) -> Result<String> {
@@ -330,7 +334,7 @@ impl SnapshotRows for PgClassTable {
     const ESTIMATED_COST: f64 = 1000.0;
     const ESTIMATED_ROWS: u32 = 100;
 
-    fn load_rows(conn: &Connection) -> Vec<Vec<Value>> {
+    fn load_rows(conn: &Connection, schemas: &[UserSchema]) -> Vec<Vec<Value>> {
         let schema = conn.current_schema();
         let mut rows = Vec::new();
 
@@ -351,41 +355,43 @@ impl SnapshotRows for PgClassTable {
                 0
             };
             let relchecks = btree.check_constraints.len() as i64;
+            let placement = Placement::of(table_name, schemas);
+            let relname = placement.name.to_string();
 
             rows.push(vec![
-                Value::from_i64(table_oid),                // oid
-                Value::Text((*table_name).clone().into()), // relname
-                Value::from_i64(2200),                     // relnamespace (public schema)
-                Value::from_i64(0),                        // reltype
-                Value::from_i64(0),                        // reloftype
-                Value::from_i64(10),                       // relowner
-                Value::from_i64(2),                        // relam (heap)
-                Value::from_i64(0),                        // relfilenode
-                Value::from_i64(0),                        // reltablespace
-                Value::from_i64(1),                        // relpages
-                Value::from_f64(0.0),                      // reltuples
-                Value::from_i64(0),                        // relallvisible
-                Value::from_i64(0),                        // reltoastrelid
-                Value::from_i64(relhasindex),              // relhasindex
-                Value::from_i64(0),                        // relisshared
-                Value::Text("p".into()),                   // relpersistence (permanent)
-                Value::build_text(relkind),                // relkind (regular table)
-                Value::from_i64(relnatts),                 // relnatts
-                Value::from_i64(relchecks),                // relchecks
-                Value::from_i64(0),                        // relhasrules
-                Value::from_i64(0),                        // relhastriggers
-                Value::from_i64(0),                        // relhassubclass
-                Value::from_i64(0),                        // relrowsecurity
-                Value::from_i64(0),                        // relforcerowsecurity
-                Value::from_i64(1),                        // relispopulated
-                Value::Text("d".into()),                   // relreplident
-                Value::from_i64(0),                        // relispartition
-                Value::from_i64(0),                        // relrewrite
-                Value::from_i64(0),                        // relfrozenxid
-                Value::from_i64(0),                        // relminmxid
-                Value::Null,                               // relacl
-                Value::Null,                               // reloptions
-                Value::Null,                               // relpartbound
+                Value::from_i64(table_oid),               // oid
+                Value::build_text(relname),               // relname
+                Value::from_i64(placement.namespace_oid), // relnamespace
+                Value::from_i64(0),                       // reltype
+                Value::from_i64(0),                       // reloftype
+                Value::from_i64(10),                      // relowner
+                Value::from_i64(2),                       // relam (heap)
+                Value::from_i64(0),                       // relfilenode
+                Value::from_i64(0),                       // reltablespace
+                Value::from_i64(1),                       // relpages
+                Value::from_f64(0.0),                     // reltuples
+                Value::from_i64(0),                       // relallvisible
+                Value::from_i64(0),                       // reltoastrelid
+                Value::from_i64(relhasindex),             // relhasindex
+                Value::from_i64(0),                       // relisshared
+                Value::Text("p".into()),                  // relpersistence (permanent)
+                Value::build_text(relkind),               // relkind (regular table)
+                Value::from_i64(relnatts),                // relnatts
+                Value::from_i64(relchecks),               // relchecks
+                Value::from_i64(0),                       // relhasrules
+                Value::from_i64(0),                       // relhastriggers
+                Value::from_i64(0),                       // relhassubclass
+                Value::from_i64(0),                       // relrowsecurity
+                Value::from_i64(0),                       // relforcerowsecurity
+                Value::from_i64(1),                       // relispopulated
+                Value::Text("d".into()),                  // relreplident
+                Value::from_i64(0),                       // relispartition
+                Value::from_i64(0),                       // relrewrite
+                Value::from_i64(0),                       // relfrozenxid
+                Value::from_i64(0),                       // relminmxid
+                Value::Null,                              // relacl
+                Value::Null,                              // reloptions
+                Value::Null,                              // relpartbound
             ]);
         }
 
@@ -398,40 +404,42 @@ impl SnapshotRows for PgClassTable {
                     continue;
                 }
                 let indnatts = idx.columns.len() as i64;
+                let placement = Placement::of(&idx.name, schemas);
+                let relname = placement.name.to_string();
                 rows.push(vec![
-                    Value::from_i64(index_oid),           // oid
-                    Value::Text(idx.name.clone().into()), // relname
-                    Value::from_i64(2200),                // relnamespace (public)
-                    Value::from_i64(0),                   // reltype
-                    Value::from_i64(0),                   // reloftype
-                    Value::from_i64(10),                  // relowner
-                    Value::from_i64(403),                 // relam (btree)
-                    Value::from_i64(0),                   // relfilenode
-                    Value::from_i64(0),                   // reltablespace
-                    Value::from_i64(1),                   // relpages
-                    Value::from_f64(0.0),                 // reltuples
-                    Value::from_i64(0),                   // relallvisible
-                    Value::from_i64(0),                   // reltoastrelid
-                    Value::from_i64(0),                   // relhasindex
-                    Value::from_i64(0),                   // relisshared
-                    Value::Text("p".into()),              // relpersistence
-                    Value::build_text(relkind),           // relkind (index)
-                    Value::from_i64(indnatts),            // relnatts
-                    Value::from_i64(0),                   // relchecks
-                    Value::from_i64(0),                   // relhasrules
-                    Value::from_i64(0),                   // relhastriggers
-                    Value::from_i64(0),                   // relhassubclass
-                    Value::from_i64(0),                   // relrowsecurity
-                    Value::from_i64(0),                   // relforcerowsecurity
-                    Value::from_i64(1),                   // relispopulated
-                    Value::Text("d".into()),              // relreplident
-                    Value::from_i64(0),                   // relispartition
-                    Value::from_i64(0),                   // relrewrite
-                    Value::from_i64(0),                   // relfrozenxid
-                    Value::from_i64(0),                   // relminmxid
-                    Value::Null,                          // relacl
-                    Value::Null,                          // reloptions
-                    Value::Null,                          // relpartbound
+                    Value::from_i64(index_oid),               // oid
+                    Value::build_text(relname),               // relname
+                    Value::from_i64(placement.namespace_oid), // relnamespace
+                    Value::from_i64(0),                       // reltype
+                    Value::from_i64(0),                       // reloftype
+                    Value::from_i64(10),                      // relowner
+                    Value::from_i64(403),                     // relam (btree)
+                    Value::from_i64(0),                       // relfilenode
+                    Value::from_i64(0),                       // reltablespace
+                    Value::from_i64(1),                       // relpages
+                    Value::from_f64(0.0),                     // reltuples
+                    Value::from_i64(0),                       // relallvisible
+                    Value::from_i64(0),                       // reltoastrelid
+                    Value::from_i64(0),                       // relhasindex
+                    Value::from_i64(0),                       // relisshared
+                    Value::Text("p".into()),                  // relpersistence
+                    Value::build_text(relkind),               // relkind (index)
+                    Value::from_i64(indnatts),                // relnatts
+                    Value::from_i64(0),                       // relchecks
+                    Value::from_i64(0),                       // relhasrules
+                    Value::from_i64(0),                       // relhastriggers
+                    Value::from_i64(0),                       // relhassubclass
+                    Value::from_i64(0),                       // relrowsecurity
+                    Value::from_i64(0),                       // relforcerowsecurity
+                    Value::from_i64(1),                       // relispopulated
+                    Value::Text("d".into()),                  // relreplident
+                    Value::from_i64(0),                       // relispartition
+                    Value::from_i64(0),                       // relrewrite
+                    Value::from_i64(0),                       // relfrozenxid
+                    Value::from_i64(0),                       // relminmxid
+                    Value::Null,                              // relacl
+                    Value::Null,                              // reloptions
+                    Value::Null,                              // relpartbound
                 ]);
                 index_oid += 1;
             }
@@ -460,7 +468,7 @@ impl SnapshotRows for PgNamespaceTable {
     const ESTIMATED_COST: f64 = 10.0;
     const ESTIMATED_ROWS: u32 = 5;
 
-    fn load_rows(conn: &Connection) -> Vec<Vec<Value>> {
+    fn load_rows(_conn: &Connection, schemas: &[UserSchema]) -> Vec<Vec<Value>> {
         // PostgreSQL standard namespaces
         let mut rows = vec![
             vec![
@@ -483,17 +491,13 @@ impl SnapshotRows for PgNamespaceTable {
             ],
         ];
 
-        // Add attached schemas (CREATE SCHEMA creates attached databases)
-        let schema_names = conn.attached_database_names();
-        let mut oid = 16384i64;
-        for name in schema_names {
+        for namespace in schemas {
             rows.push(vec![
-                Value::from_i64(oid),
-                Value::build_text(name),
+                Value::from_i64(namespace.oid),
+                Value::build_text(namespace.name.clone()),
                 Value::from_i64(10), // nspowner (bootstrap superuser)
                 Value::Null,         // nspacl
             ]);
-            oid += 1;
         }
         rows
     }
@@ -517,9 +521,9 @@ impl SnapshotRows for SchemataTable {
     const ESTIMATED_COST: f64 = 10.0;
     const ESTIMATED_ROWS: u32 = 5;
 
-    fn load_rows(conn: &Connection) -> Vec<Vec<Value>> {
+    fn load_rows(conn: &Connection, schemas: &[UserSchema]) -> Vec<Vec<Value>> {
         let db_name = db_name_from_path(conn.db_file_path());
-        PgNamespaceTable::load_rows(conn)
+        PgNamespaceTable::load_rows(conn, schemas)
             .into_iter()
             .map(|namespace| {
                 vec![
@@ -575,7 +579,7 @@ impl SnapshotRows for PgAttributeTable {
     const ESTIMATED_COST: f64 = 1000.0;
     const ESTIMATED_ROWS: u32 = 1000;
 
-    fn load_rows(conn: &Connection) -> Vec<Vec<Value>> {
+    fn load_rows(conn: &Connection, _schemas: &[UserSchema]) -> Vec<Vec<Value>> {
         let schema = conn.current_schema();
         let mut rows = Vec::new();
 
@@ -659,7 +663,7 @@ impl SnapshotRows for PgRolesTable {
 
     /// Stub: returns a single default superuser role.
     /// Replace this method with real role lookup when auth is implemented.
-    fn load_rows(_conn: &Connection) -> Vec<Vec<Value>> {
+    fn load_rows(_conn: &Connection, _schemas: &[UserSchema]) -> Vec<Vec<Value>> {
         vec![vec![
             Value::from_i64(10),        // oid
             Value::build_text("turso"), // rolname
@@ -720,7 +724,7 @@ impl SnapshotRows for PgProcTable {
     const ESTIMATED_COST: f64 = 100.0;
     const ESTIMATED_ROWS: u32 = 100;
 
-    fn load_rows(conn: &Connection) -> Vec<Vec<Value>> {
+    fn load_rows(conn: &Connection, _schemas: &[UserSchema]) -> Vec<Vec<Value>> {
         use crate::Func;
 
         let mut rows = Vec::new();
@@ -840,7 +844,7 @@ impl SnapshotRows for PgDatabaseTable {
     const ESTIMATED_COST: f64 = 10.0;
     const ESTIMATED_ROWS: u32 = 1;
 
-    fn load_rows(conn: &Connection) -> Vec<Vec<Value>> {
+    fn load_rows(conn: &Connection, _schemas: &[UserSchema]) -> Vec<Vec<Value>> {
         let db_name = db_name_from_path(conn.db_file_path());
         vec![vec![
             Value::from_i64(16384),           // oid
@@ -892,7 +896,7 @@ impl SnapshotRows for PgAmTable {
     const ESTIMATED_COST: f64 = 10.0;
     const ESTIMATED_ROWS: u32 = 2;
 
-    fn load_rows(_conn: &Connection) -> Vec<Vec<Value>> {
+    fn load_rows(_conn: &Connection, _schemas: &[UserSchema]) -> Vec<Vec<Value>> {
         vec![
             vec![
                 Value::from_i64(2),                        // oid
@@ -1005,20 +1009,21 @@ impl SnapshotRows for PgTablesTable {
     const ESTIMATED_COST: f64 = 1000.0;
     const ESTIMATED_ROWS: u32 = 100;
 
-    fn load_rows(conn: &Connection) -> Vec<Vec<Value>> {
+    fn load_rows(conn: &Connection, schemas: &[UserSchema]) -> Vec<Vec<Value>> {
         let schema = conn.current_schema();
         let mut rows = Vec::new();
 
         for (table_name, _) in user_tables_sorted(&schema) {
+            let placement = Placement::of(table_name, schemas);
             rows.push(vec![
-                Value::Text("public".into()),           // schemaname
-                Value::Text(table_name.clone().into()), // tablename
-                Value::Text("turso".into()),            // tableowner
-                Value::Null,                            // tablespace
-                Value::from_i64(0),                     // hasindexes
-                Value::from_i64(0),                     // hasrules
-                Value::from_i64(0),                     // hastriggers
-                Value::from_i64(0),                     // rowsecurity
+                Value::build_text(placement.schema.to_string()), // schemaname
+                Value::build_text(placement.name.to_string()),   // tablename
+                Value::Text("turso".into()),                     // tableowner
+                Value::Null,                                     // tablespace
+                Value::from_i64(0),                              // hasindexes
+                Value::from_i64(0),                              // hasrules
+                Value::from_i64(0),                              // hastriggers
+                Value::from_i64(0),                              // rowsecurity
             ]);
         }
 
@@ -1041,7 +1046,7 @@ impl SnapshotRows for PgIndexesTable {
     const ESTIMATED_COST: f64 = 100.0;
     const ESTIMATED_ROWS: u32 = 50;
 
-    fn load_rows(conn: &Connection) -> Vec<Vec<Value>> {
+    fn load_rows(conn: &Connection, schemas: &[UserSchema]) -> Vec<Vec<Value>> {
         let schema = conn.current_schema();
         let mut rows = Vec::new();
 
@@ -1050,12 +1055,14 @@ impl SnapshotRows for PgIndexesTable {
                 if idx.ephemeral {
                     continue;
                 }
+                let table = Placement::of(table_name, schemas);
+                let index = Placement::of(&idx.name, schemas);
                 rows.push(vec![
-                    Value::Text("public".into()),
-                    Value::Text(table_name.clone().into()),
-                    Value::Text(idx.name.clone().into()),
+                    Value::build_text(table.schema.to_string()),
+                    Value::build_text(table.name.to_string()),
+                    Value::build_text(index.name.to_string()),
                     Value::Null,
-                    Value::build_text(index_definition("public", table_name, &idx.name, idx)),
+                    Value::build_text(index_definition(table.schema, table.name, index.name, idx)),
                 ]);
             }
         }
@@ -1373,7 +1380,7 @@ impl SnapshotRows for PgTypeTable {
     const ESTIMATED_COST: f64 = 100.0;
     const ESTIMATED_ROWS: u32 = 50;
 
-    fn load_rows(conn: &Connection) -> Vec<Vec<Value>> {
+    fn load_rows(conn: &Connection, _schemas: &[UserSchema]) -> Vec<Vec<Value>> {
         let mut rows = Vec::new();
 
         // Static base types
@@ -1516,7 +1523,7 @@ impl SnapshotRows for PgIndexTable {
     const ESTIMATED_COST: f64 = 100.0;
     const ESTIMATED_ROWS: u32 = 50;
 
-    fn load_rows(conn: &Connection) -> Vec<Vec<Value>> {
+    fn load_rows(conn: &Connection, _schemas: &[UserSchema]) -> Vec<Vec<Value>> {
         let schema = conn.current_schema();
         let mut rows = Vec::new();
 
@@ -1630,7 +1637,7 @@ impl SnapshotRows for PgConstraintTable {
     const ESTIMATED_COST: f64 = 100.0;
     const ESTIMATED_ROWS: u32 = 50;
 
-    fn load_rows(conn: &Connection) -> Vec<Vec<Value>> {
+    fn load_rows(conn: &Connection, _schemas: &[UserSchema]) -> Vec<Vec<Value>> {
         let schema = conn.current_schema();
         let mut rows = Vec::new();
 
@@ -1923,7 +1930,7 @@ impl SnapshotRows for PgAttrdefTable {
     const ESTIMATED_COST: f64 = 100.0;
     const ESTIMATED_ROWS: u32 = 50;
 
-    fn load_rows(conn: &Connection) -> Vec<Vec<Value>> {
+    fn load_rows(conn: &Connection, _schemas: &[UserSchema]) -> Vec<Vec<Value>> {
         let schema = conn.current_schema();
         let mut rows = Vec::new();
 
@@ -1980,29 +1987,29 @@ impl SnapshotRows for PgSequencesTable {
     const ESTIMATED_COST: f64 = 100.0;
     const ESTIMATED_ROWS: u32 = 10;
 
-    fn load_rows(conn: &Connection) -> Vec<Vec<Value>> {
+    fn load_rows(conn: &Connection, schemas: &[UserSchema]) -> Vec<Vec<Value>> {
         let mut rows = Vec::new();
         let schema = conn.current_schema();
         let mut names: Vec<_> = schema.sequences.keys().cloned().collect();
         names.sort();
         for name in names {
             if let Some(seq) = schema.sequences.get(&name) {
-                let seq_name = seq.name.clone();
+                let placement = Placement::of(&seq.name, schemas);
                 // currval is per-connection; expose this connection's last
                 // value via the connection currval map, falling back to start.
                 let last_val = conn
-                    .get_sequence_currval(turso_core::MAIN_DB_ID, &seq_name)
+                    .get_sequence_currval(turso_core::MAIN_DB_ID, &seq.name)
                     .unwrap_or(seq.start_value);
                 rows.push(vec![
-                    Value::build_text("public"),           // schemaname
-                    Value::build_text(seq_name),           // sequencename
-                    Value::build_text("turso"),            // sequenceowner
-                    Value::build_text("bigint"),           // data_type
-                    Value::from_i64(seq.start_value),      // start_value
-                    Value::from_i64(seq.min_value),        // min_value
-                    Value::from_i64(seq.max_value),        // max_value
-                    Value::from_i64(seq.increment_by),     // increment_by
-                    Value::from_i64(i64::from(seq.cycle)), // cycle
+                    Value::build_text(placement.schema.to_string()), // schemaname
+                    Value::build_text(placement.name.to_string()),   // sequencename
+                    Value::build_text("turso"),                      // sequenceowner
+                    Value::build_text("bigint"),                     // data_type
+                    Value::from_i64(seq.start_value),                // start_value
+                    Value::from_i64(seq.min_value),                  // min_value
+                    Value::from_i64(seq.max_value),                  // max_value
+                    Value::from_i64(seq.increment_by),               // increment_by
+                    Value::from_i64(i64::from(seq.cycle)),           // cycle
                     Value::from_i64(1), // cache_size (PG default; Turso doesn't cache)
                     Value::from_i64(last_val), // last_value
                 ]);
@@ -2411,7 +2418,7 @@ impl SnapshotRows for PgLanguageTable {
     const ESTIMATED_COST: f64 = 1.0;
     const ESTIMATED_ROWS: u32 = 2;
 
-    fn load_rows(_conn: &Connection) -> Vec<Vec<Value>> {
+    fn load_rows(_conn: &Connection, _schemas: &[UserSchema]) -> Vec<Vec<Value>> {
         [(12, "internal"), (13, "c")]
             .into_iter()
             .map(|(oid, name)| {
@@ -2458,7 +2465,7 @@ impl SnapshotRows for PgSettingsTable {
     const ESTIMATED_COST: f64 = 1.0;
     const ESTIMATED_ROWS: u32 = 1;
 
-    fn load_rows(conn: &Connection) -> Vec<Vec<Value>> {
+    fn load_rows(conn: &Connection, _schemas: &[UserSchema]) -> Vec<Vec<Value>> {
         use crate::session::{search_path_setting, DEFAULT_SEARCH_PATH};
 
         let setting = search_path_setting(conn);
@@ -2552,16 +2559,16 @@ impl SnapshotRows for PgDependTable {
     const ESTIMATED_COST: f64 = 1000.0;
     const ESTIMATED_ROWS: u32 = 100;
 
-    fn load_rows(conn: &Connection) -> Vec<Vec<Value>> {
+    fn load_rows(conn: &Connection, schemas: &[UserSchema]) -> Vec<Vec<Value>> {
         let mut rows = Vec::new();
-        let constraint_rows = PgConstraintTable::load_rows(conn);
+        let constraint_rows = PgConstraintTable::load_rows(conn, schemas);
         let constraints = constraint_rows
             .iter()
             .map(Vec::as_slice)
             .map(ConstraintRow::from_row);
-        let index_rows = PgIndexTable::load_rows(conn);
+        let index_rows = PgIndexTable::load_rows(conn, schemas);
         let indexes = index_rows.iter().map(Vec::as_slice).map(IndexRow::from_row);
-        let relation_rows = PgClassTable::load_rows(conn);
+        let relation_rows = PgClassTable::load_rows(conn, schemas);
         let relations = relation_rows
             .iter()
             .map(Vec::as_slice)
@@ -2661,7 +2668,7 @@ impl SnapshotRows for PgDependTable {
             }
         }
 
-        let default_rows = PgAttrdefTable::load_rows(conn);
+        let default_rows = PgAttrdefTable::load_rows(conn, schemas);
         let defaults = default_rows
             .iter()
             .map(Vec::as_slice)
@@ -2853,7 +2860,69 @@ trait SnapshotRows: Debug + Send + Sync + 'static {
     const ESTIMATED_COST: f64;
     const ESTIMATED_ROWS: u32;
 
-    fn load_rows(conn: &Connection) -> Vec<Vec<Value>>;
+    fn load_rows(conn: &Connection, schemas: &[UserSchema]) -> Vec<Vec<Value>>;
+}
+
+/// A schema other than public, with the OID the catalogs give it.
+#[derive(Debug)]
+pub(crate) struct UserSchema {
+    oid: i64,
+    name: String,
+    prefix: String,
+}
+
+/// OID of the public schema.
+const PUBLIC_NAMESPACE_OID: i64 = 2200;
+
+/// What is added to the id of a schema other than public to get its OID.
+const FIRST_USER_SCHEMA_OID: i64 = 16384;
+
+/// The schemas other than public: the namespaces stored in the main
+/// database, in name order. A schema's OID comes from its id, so it stays
+/// the same while the schema exists.
+fn user_schemas(conn: &Connection) -> Vec<UserSchema> {
+    conn.other_namespaces()
+        .into_iter()
+        .filter_map(|namespace| {
+            let id = namespace.id?;
+            Some(UserSchema {
+                oid: FIRST_USER_SCHEMA_OID + i64::from(id),
+                prefix: namespace.prefix(),
+                name: namespace.name,
+            })
+        })
+        .collect()
+}
+
+/// Where an object of the main database is in PostgreSQL: its schema, its
+/// name in the schema, and the OID of the schema.
+struct Placement<'a> {
+    schema: &'a str,
+    name: &'a str,
+    namespace_oid: i64,
+}
+
+impl<'a> Placement<'a> {
+    /// The placement of the object that the main database stores as
+    /// `stored`: the schema whose prefix the stored name starts with, else
+    /// public.
+    fn of(stored: &'a str, schemas: &'a [UserSchema]) -> Self {
+        match schemas
+            .iter()
+            .find(|schema| stored.starts_with(&schema.prefix))
+        {
+            Some(schema) => Self {
+                schema: &schema.name,
+                name: &stored[schema.prefix.len()..],
+                namespace_oid: schema.oid,
+            },
+            None => Self {
+                schema: "public",
+                name: stored,
+                namespace_oid: PUBLIC_NAMESPACE_OID,
+            },
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -2882,6 +2951,7 @@ impl<T: SnapshotRows> VirtualTable for SnapshotCatalog<T> {
         Ok(SnapshotCursor {
             conn,
             load_rows: T::load_rows,
+            schemas: Vec::new(),
             table_oid: T::TABLE_OID,
             rows: Vec::new(),
             current_row: 0,
@@ -2914,7 +2984,8 @@ impl<T: SnapshotRows> VirtualTable for SnapshotCatalog<T> {
 
 struct SnapshotCursor {
     conn: Arc<Connection>,
-    load_rows: fn(&Connection) -> Vec<Vec<Value>>,
+    load_rows: fn(&Connection, &[UserSchema]) -> Vec<Vec<Value>>,
+    schemas: Vec<UserSchema>,
     table_oid: Option<i64>,
     rows: Vec<Vec<Value>>,
     current_row: usize,
@@ -2950,8 +3021,9 @@ impl VirtualTableCursor for SnapshotCursor {
         _idx_str: Option<&str>,
         _idx_num: i32,
     ) -> turso_core::types::IOResultOr<bool> {
+        self.schemas = user_schemas(&self.conn);
         self.current_row = 0;
-        self.rows = (self.load_rows)(&self.conn);
+        self.rows = (self.load_rows)(&self.conn, &self.schemas);
         Ok(IOResult::Done(!self.rows.is_empty()))
     }
 }
@@ -3735,11 +3807,10 @@ mod tests {
     #[test]
     fn catalogs_available_in_secondary_databases() {
         let dir = tempdir().unwrap();
-        let attached_path = dir.path().join("attached.db");
+        let second_path = dir.path().join("second.db");
         let output_path = dir.path().join("vacuum.db");
         let io = Arc::new(PlatformIO::new().unwrap());
         let opts = crate::DatabaseOpts::new()
-            .with_attach(true)
             .with_vacuum(true)
             .with_views(true);
         let db = crate::session::open_database_with_io(
@@ -3750,35 +3821,15 @@ mod tests {
         )
         .unwrap();
         let conn = db.connect(ConnectOpts::new()).unwrap();
-        conn.execute(format!("ATTACH '{}' AS aux", attached_path.display()))
-            .unwrap();
-        conn.execute("CREATE TABLE aux.data (v INT)").unwrap();
-        conn.execute("CREATE TABLE aux.counts (n INT)").unwrap();
-        assert_eq!(
-            conn.prepare("SELECT COUNT(*) FROM aux.pg_namespace")
-                .unwrap()
-                .run_collect_rows()
-                .unwrap(),
-            vec![vec![Value::from_i64(4)]]
-        );
-        conn.execute("CREATE TRIGGER aux.catalog_check AFTER INSERT ON data BEGIN INSERT INTO counts SELECT COUNT(*) FROM pg_namespace; END").unwrap();
-        conn.execute("INSERT INTO aux.data VALUES (5)").unwrap();
-        assert_eq!(
-            conn.prepare("SELECT n FROM aux.counts")
-                .unwrap()
-                .run_collect_rows()
-                .unwrap(),
-            vec![vec![Value::from_i64(4)]]
-        );
-        let attached = crate::session::open_database_with_io(
+        let second = crate::session::open_database_with_io(
             io.clone(),
-            attached_path.to_str().unwrap(),
+            second_path.to_str().unwrap(),
             crate::OpenFlags::default(),
             opts,
         )
         .unwrap();
         assert_eq!(
-            attached
+            second
                 .connect(ConnectOpts::new())
                 .unwrap()
                 .prepare("SELECT COUNT(*) FROM pg_namespace")
