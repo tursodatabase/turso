@@ -97,3 +97,47 @@ test alter-column-from-domain-drops-domain-check {
 expect {
     1|-1
 }
+
+test alter-add-domain-default-uses-base-affinity {
+    CREATE DOMAIN dm AS text DEFAULT abs(-2);
+    CREATE TABLE t(a INTEGER) STRICT;
+    ALTER TABLE t ADD COLUMN b dm;
+    INSERT INTO t(a) VALUES (0);
+    SELECT a, typeof(b), quote(b) FROM t;
+}
+expect {
+    0|text|'2'
+}
+
+test alter-add-domain-explicit-value-uses-base-affinity {
+    CREATE DOMAIN dm AS text;
+    CREATE TABLE t(a INTEGER) STRICT;
+    ALTER TABLE t ADD COLUMN b dm;
+    INSERT INTO t VALUES (0, abs(-2));
+    SELECT a, typeof(b), quote(b) FROM t;
+}
+expect {
+    0|text|'2'
+}
+
+test alter-add-chained-domain-default-uses-base-affinity {
+    CREATE DOMAIN dm AS text DEFAULT abs(-2);
+    CREATE DOMAIN child AS dm;
+    CREATE TABLE t(a INTEGER) STRICT;
+    ALTER TABLE t ADD COLUMN b child;
+    INSERT INTO t(a) VALUES (0);
+    SELECT a, typeof(b), quote(b) FROM t;
+}
+expect {
+    0|text|'2'
+}
+
+test alter-add-builtin-text-default-affinity-control {
+    CREATE TABLE t(a INTEGER) STRICT;
+    ALTER TABLE t ADD COLUMN b TEXT DEFAULT (abs(-2));
+    INSERT INTO t(a) VALUES (0);
+    SELECT a, typeof(b), quote(b) FROM t;
+}
+expect {
+    0|text|'2'
+}
