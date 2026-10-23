@@ -1970,7 +1970,18 @@ fn emit_columns_for_table_info(
         program.emit_string8(column.name.clone().unwrap_or_default(), base_reg + 1);
 
         // type
-        program.emit_string8(column.ty_str.clone(), base_reg + 2);
+        let mut declared_type = column.ty_str.clone();
+        if !column.ty_params.is_empty() {
+            declared_type.push('(');
+            for (i, param) in column.ty_params.iter().enumerate() {
+                if i > 0 {
+                    declared_type.push(',');
+                }
+                declared_type.push_str(&param.to_string());
+            }
+            declared_type.push(')');
+        }
+        program.emit_string8(declared_type, base_reg + 2);
 
         // notnull
         program.emit_bool(column.notnull(), base_reg + 3);
