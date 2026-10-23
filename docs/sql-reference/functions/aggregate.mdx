@@ -334,6 +334,8 @@ SELECT group_concat(DISTINCT product) FROM sales;
 
 `ORDER BY` inside a scalar function call, such as `abs(x ORDER BY y)`, is rejected in every expression context.
 
+An aggregate cannot contain another aggregate directly in its arguments, `FILTER`, or input `ORDER BY`, even when the inner call refers to an outer query. A separate scalar subquery can compute its own aggregate.
+
 Place `ORDER BY` inside an aggregate call, after its arguments, to control the order in which it processes rows. This affects functions such as `group_concat` and `json_group_array`. An outer `ORDER BY` sorts the result rows and does not set the aggregate input order.
 
 ```sql

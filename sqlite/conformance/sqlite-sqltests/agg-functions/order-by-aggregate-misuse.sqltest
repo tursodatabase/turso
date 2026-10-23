@@ -174,3 +174,50 @@ test scalar-order-by-index {
 expect error {
     ORDER BY may not be used with non-aggregate abs()
 }
+
+test correlated-nested-aggregate-order-misuse {
+    CREATE TABLE nested_order_t(g,a);
+    INSERT INTO nested_order_t VALUES(1,3),(1,1),(2,2);
+    CREATE TABLE nested_order_u(g,x);
+    INSERT INTO nested_order_u VALUES(1,'p'),(5,'q');
+    SELECT g, (SELECT group_concat(x ORDER BY sum(t.a)) FROM nested_order_u)
+    FROM nested_order_t AS t;
+}
+expect error {
+    misuse of aggregate function sum()
+}
+
+test correlated-nested-aggregate-argument-misuse {
+    CREATE TABLE nested_arg_t(g,a);
+    INSERT INTO nested_arg_t VALUES(1,3),(1,1),(2,2);
+    CREATE TABLE nested_arg_u(g,x);
+    INSERT INTO nested_arg_u VALUES(1,'p'),(5,'q');
+    SELECT g, (SELECT group_concat(x, sum(t.a)) FROM nested_arg_u)
+    FROM nested_arg_t AS t;
+}
+expect error {
+    misuse of aggregate function sum()
+}
+
+test correlated-nested-aggregate-filter-misuse {
+    CREATE TABLE nested_filter_t(g,a);
+    INSERT INTO nested_filter_t VALUES(1,3),(1,1),(2,2);
+    CREATE TABLE nested_filter_u(g,x);
+    INSERT INTO nested_filter_u VALUES(1,'p'),(5,'q');
+    SELECT g, (SELECT group_concat(x) FILTER (WHERE sum(t.a)>0) FROM nested_filter_u)
+    FROM nested_filter_t AS t;
+}
+expect error {
+    misuse of aggregate function sum()
+}
+
+test aggregate-input-subquery-allows-separate-aggregate {
+    CREATE TABLE separate_agg_t(a);
+    INSERT INTO separate_agg_t VALUES(1),(2);
+    CREATE TABLE separate_agg_u(x);
+    INSERT INTO separate_agg_u VALUES(3),(4);
+    SELECT sum(a + (SELECT sum(x) FROM separate_agg_u)) FROM separate_agg_t;
+}
+expect {
+    17
+}
