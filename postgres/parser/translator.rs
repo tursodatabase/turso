@@ -6161,6 +6161,14 @@ pub fn try_extract_drop_schema(parse_result: &ParseResult) -> Option<PgDropSchem
     })
 }
 
+/// Whether the statement is TRUNCATE.
+pub fn is_truncate(parse_result: &ParseResult) -> bool {
+    matches!(
+        parse_result.protobuf.nodes().first().map(|node| &node.0),
+        Some(pg_query::NodeRef::TruncateStmt(_))
+    )
+}
+
 /// Returns true if the parse result is a REFRESH MATERIALIZED VIEW statement.
 /// Turso materialized views are live (auto-updating), so REFRESH is a no-op.
 pub fn is_refresh_matview(parse_result: &ParseResult) -> Result<bool, ParseError> {

@@ -315,3 +315,65 @@ test table-returning-table-name-star-after-alias-rejected {
     INSERT INTO users AS u VALUES (4, 'dave', 40, false) RETURNING users.*;
 }
 expect error {}
+
+test fk-drop-referenced-parent-rejected {
+    CREATE TABLE fkd_p (id int PRIMARY KEY);
+    CREATE TABLE fkd_c (pid int REFERENCES fkd_p (id) ON DELETE CASCADE);
+    DROP TABLE fkd_p;
+}
+expect error {
+}
+
+test fk-truncate-referenced-parent-rejected {
+    CREATE TABLE fkt_p (id int PRIMARY KEY);
+    CREATE TABLE fkt_c (pid int REFERENCES fkt_p (id) ON DELETE CASCADE);
+    TRUNCATE fkt_p;
+}
+expect error {
+}
+
+test fk-drop-child-then-parent {
+    CREATE TABLE fkdc_p (id int PRIMARY KEY);
+    CREATE TABLE fkdc_c (pid int REFERENCES fkdc_p (id));
+    INSERT INTO fkdc_p VALUES (1);
+    INSERT INTO fkdc_c VALUES (1);
+    TRUNCATE fkdc_c;
+    DROP TABLE fkdc_c;
+    DROP TABLE fkdc_p;
+    SELECT 1;
+}
+expect {
+    1
+}
+
+test fk-self-referencing-drop-and-delete {
+    CREATE TABLE fks_t (id int PRIMARY KEY, parent int REFERENCES fks_t (id));
+    INSERT INTO fks_t VALUES (1, NULL), (2, 1), (3, 2);
+    DELETE FROM fks_t;
+    SELECT count(*) FROM fks_t;
+    DROP TABLE fks_t;
+}
+expect {
+    0
+}
+
+test fk-self-referencing-update-key-and-reference {
+    CREATE TABLE fku_t (id int PRIMARY KEY, parent int REFERENCES fku_t (id));
+    INSERT INTO fku_t VALUES (1, NULL), (2, 1);
+    UPDATE fku_t SET id = id + 10, parent = parent + 10;
+    SELECT id, CASE WHEN parent IS NULL THEN 0 ELSE parent END FROM fku_t ORDER BY id;
+}
+expect {
+    11|0
+    12|11
+}
+
+test fk-drop-self-referencing-table-with-rows {
+    CREATE TABLE fkr_t (id int PRIMARY KEY, parent int REFERENCES fkr_t (id));
+    INSERT INTO fkr_t VALUES (1, NULL), (2, 1);
+    DROP TABLE fkr_t;
+    SELECT count(*) FROM pg_tables WHERE tablename = 'fkr_t';
+}
+expect {
+    0
+}

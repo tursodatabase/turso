@@ -10,7 +10,7 @@ use crate::functions::ConfigParameter;
 use turso_core::{Connection, LimboError, Result, Statement, Value};
 use turso_parser::ast::{self};
 use turso_pg_parser::translator::{
-    check_set_transaction, is_comment_on, is_refresh_matview, try_extract_copy_from,
+    check_set_transaction, is_comment_on, is_refresh_matview, is_truncate, try_extract_copy_from,
     try_extract_create_schema, try_extract_drop_schema, try_extract_set, try_extract_show,
     unnamed_index_name, unqualified_create_table_name_location, PgCopyFromStmt, PgCreateSchemaStmt,
     PgDropSchemaStmt, PgSetStmt, PgSetValue, PgShowStmt, PostgreSQLTranslator,
@@ -80,6 +80,7 @@ impl PgConnection {
         let conn = db.connect_with_context(context)?;
         conn.add_namespace("public", turso_core::MAIN_DB_ID);
         set_search_path(&conn, None)?;
+        conn.set_foreign_keys_enabled(true);
         Ok(Self {
             inner: Arc::new(PgConnectionInner { conn }),
         })
@@ -208,6 +209,7 @@ fn prepare_statement(pg_conn: &Arc<PgConnectionInner>, sql: &str) -> Result<Stat
         .translate_with_prereqs(&parse_result)
         .map_err(|e| LimboError::ParseError(e.to_string()))?;
     reject_catalog_dml(translated.cmd.stmt())?;
+    reject_drop_of_referenced_table(&pg_conn.conn, &parse_result, translated.cmd.stmt())?;
 
     for prereq in translated.prereqs {
         let input = prereq.to_string();
@@ -215,7 +217,88 @@ fn prepare_statement(pg_conn: &Arc<PgConnectionInner>, sql: &str) -> Result<Stat
         stmt.run_ignore_rows()?;
     }
 
+    if matches!(translated.cmd.stmt(), ast::Stmt::DropTable { .. }) {
+        without_foreign_keys(&pg_conn.conn, || {
+            pg_conn
+                .conn
+                .prepare_translated_cmd(translated.cmd, &sql)?
+                .run_ignore_rows()
+        })?;
+        return noop_statement(&pg_conn.conn);
+    }
     pg_conn.conn.prepare_translated_cmd(translated.cmd, &sql)
+}
+
+/// Rejects DROP TABLE and TRUNCATE of a table that another table references
+/// with a foreign key, like PostgreSQL. SQLite would delete the rows first,
+/// running the ON DELETE actions of the referencing tables.
+fn reject_drop_of_referenced_table(
+    conn: &Arc<Connection>,
+    parse_result: &turso_pg_parser::ParseResult,
+    stmt: &ast::Stmt,
+) -> Result<()> {
+    let (tbl_name, truncate) = match stmt {
+        ast::Stmt::DropTable { tbl_name, .. } => (tbl_name, false),
+        ast::Stmt::Delete { tbl_name, .. } if is_truncate(parse_result) => (tbl_name, true),
+        _ => return Ok(()),
+    };
+    let table = tbl_name.name.as_str();
+    let databases = match &tbl_name.namespace {
+        Some(namespace) => vec![namespace.as_str().to_string()],
+        None => conn
+            .search_order()
+            .into_iter()
+            .filter_map(|id| {
+                if id == turso_core::MAIN_DB_ID {
+                    Some("main".to_string())
+                } else {
+                    conn.namespace_name(id)
+                }
+            })
+            .collect(),
+    };
+    for database in databases {
+        if !schema_has_table(conn, &database, table)? {
+            continue;
+        }
+        let referenced = schema_objects(conn, &database)?
+            .into_iter()
+            .filter_map(|object| match object {
+                SchemaObject::Table(child) if !child.eq_ignore_ascii_case(table) => Some(child),
+                _ => None,
+            })
+            .map(|child| {
+                let mut fks = conn.prepare_sqlite(format!(
+                    "PRAGMA \"{database}\".foreign_key_list(\"{}\")",
+                    child.replace('"', "\"\"")
+                ))?;
+                Ok(fks.run_collect_rows()?.iter().any(|row| {
+                    matches!(row.get(2), Some(Value::Text(parent)) if parent.as_str().eq_ignore_ascii_case(table))
+                }))
+            })
+            .collect::<Result<Vec<bool>>>()?
+            .contains(&true);
+        if !referenced {
+            return Ok(());
+        }
+        return Err(LimboError::ParseError(if truncate {
+            "cannot truncate a table referenced in a foreign key constraint".to_string()
+        } else {
+            format!("cannot drop table {tbl_name} because other objects depend on it")
+        }));
+    }
+    Ok(())
+}
+
+fn schema_has_table(conn: &Arc<Connection>, database: &str, table: &str) -> Result<bool> {
+    if database != "main" && !schema_exists(conn, database)? {
+        return Ok(false);
+    }
+    let mut stmt = conn.prepare_sqlite(format!(
+        "SELECT 1 FROM \"{database}\".sqlite_schema WHERE type = 'table' AND name = '{}' COLLATE NOCASE",
+        table.replace('\'', "''")
+    ))?;
+    Ok(!stmt.run_collect_rows()?.is_empty())
 }
 
 /// The schema that a CREATE TABLE statement naming its table without a

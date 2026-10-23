@@ -1058,7 +1058,7 @@ fn build_parent_key(
 
 /// Child-side FK maintenance for UPDATE/UPSERT:
 /// If any FK columns of this child row changed:
-///  Pass 1 (OLD tuple): if OLD is non-NULL and parent is missing: decrement deferred counter (guarded).
+///  Pass 1 (OLD tuple): if OLD is non-NULL and parent is missing: decrement the FK counter (guarded).
 ///  Pass 2 (NEW tuple): if NEW is non-NULL and parent is missing: immediate error or deferred(+1).
 #[allow(clippy::too_many_arguments)]
 pub fn emit_fk_child_update_counters(
@@ -1130,8 +1130,8 @@ pub fn emit_fk_child_update_counters(
 
         let ncols = fk_ref.fk.child_columns.len();
 
-        // Pass 1: OLD tuple handling only for deferred FKs
-        if fk_ref.fk.deferred {
+        // Pass 1: OLD tuple handling, for the FKs whose parent-side check counted this row
+        if fk_ref.fk.deferred || fk_ref.fk.on_update == RefAct::NoAction {
             if let Some((dml_ctx, fk_col_positions, null_skip)) =
                 load_old_fk_values(program, &fk_ref.fk.child_columns)?
             {

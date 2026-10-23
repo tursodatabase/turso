@@ -180,6 +180,34 @@ fn test_postgres_rejects_unsupported_set_and_show(db: TempDatabase) {
 }
 
 #[turso_macros::test(mvcc)]
+fn test_postgres_enforces_foreign_keys(db: TempDatabase) {
+    let conn = db.connect_postgres();
+    conn.execute("CREATE TABLE fk_parent (id int PRIMARY KEY)")
+        .unwrap();
+    conn.execute("CREATE TABLE fk_child (pid int REFERENCES fk_parent (id) ON DELETE CASCADE)")
+        .unwrap();
+    conn.execute("INSERT INTO fk_parent VALUES (1)").unwrap();
+    conn.execute("INSERT INTO fk_child VALUES (1)").unwrap();
+    assert!(
+        conn.execute("INSERT INTO fk_child VALUES (2)").is_err(),
+        "an orphan child row was accepted"
+    );
+    conn.execute("DELETE FROM fk_parent WHERE id = 1").unwrap();
+    let mut rows = conn
+        .query("SELECT count(*) FROM fk_child")
+        .unwrap()
+        .unwrap();
+    let StepResult::Row = rows.step().unwrap() else {
+        panic!("expected row");
+    };
+    assert_eq!(
+        rows.row().unwrap().get_value(0),
+        &Value::from_i64(0),
+        "ON DELETE CASCADE did not delete the child row"
+    );
+}
+
+#[turso_macros::test(mvcc)]
 fn test_postgres_frontend_rejects_pragma(db: TempDatabase) {
     let conn = db.connect_postgres();
 
