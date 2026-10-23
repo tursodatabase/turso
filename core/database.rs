@@ -1712,16 +1712,16 @@ impl Database {
                         .conn
                         .as_ref()
                         .expect("conn must be initialized in Init phase");
-                    if conn.experimental_custom_types_enabled() {
+                    let db = state
+                        .db
+                        .as_ref()
+                        .expect("db must be initialized in Init phase");
+                    if conn.experimental_custom_types_enabled() && db.get_mv_store().is_none() {
                         // Sync the connection's schema from the database so it
                         // can query __turso_internal_types.
                         conn.maybe_update_schema();
                         let type_sqls = conn.query_stored_type_definitions()?;
                         if !type_sqls.is_empty() {
-                            let db = state
-                                .db
-                                .as_ref()
-                                .expect("db must be initialized in Init phase");
                             db.with_schema_mut(|schema| schema.load_type_definitions(&type_sqls))?;
                         }
                     }
