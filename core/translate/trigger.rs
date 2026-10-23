@@ -133,6 +133,7 @@ pub fn translate_create_trigger(
         when_clause,
         commands,
     );
+    let written_table_name = target_table.name;
     let normalized_table_name = target_table.stored_name;
     // Temp triggers are allowed to reference tables in other databases.
     if target_table_database_id != database_id && database_id != crate::TEMP_DB_ID {
@@ -165,7 +166,7 @@ pub fn translate_create_trigger(
         )?;
     }
 
-    if crate::schema::is_system_table(&normalized_table_name) {
+    if crate::schema::is_system_table(&written_table_name) {
         bail_parse_error!("cannot create trigger on system table");
     }
 

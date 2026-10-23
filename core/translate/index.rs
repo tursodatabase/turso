@@ -58,8 +58,8 @@ fn canonical_create_index_sql(stmt: &ast::Stmt, namespace: &crate::Namespace) ->
 
 fn validate(
     tbl_name: &str,
-    idx_name: &str,
     original_idx_name: &QualifiedName,
+    original_tbl_name: &ast::Name,
     using: &Option<ast::Name>,
     with_clause: &[(ast::Name, Box<Expr>)],
     connection: &Arc<crate::Connection>,
@@ -74,9 +74,11 @@ fn validate(
     if tbl_name.eq_ignore_ascii_case("sqlite_sequence") {
         crate::bail_parse_error!("table sqlite_sequence may not be indexed");
     }
+    let written_idx_name = normalize_ident(original_idx_name.name.as_str());
+    let written_tbl_name = normalize_ident(original_tbl_name.as_str());
     if RESERVED_TABLE_PREFIXES
         .iter()
-        .any(|prefix| idx_name.starts_with(prefix) || tbl_name.starts_with(prefix))
+        .any(|prefix| written_idx_name.starts_with(prefix) || written_tbl_name.starts_with(prefix))
         && !connection.is_nested_stmt()
     {
         bail_parse_error!(
@@ -129,8 +131,8 @@ pub fn translate_create_index(
 
     validate(
         &tbl_name,
-        &idx_name,
         &original_idx_name,
+        &original_tbl_name,
         &using,
         &with_clause,
         connection,

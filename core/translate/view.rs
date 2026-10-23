@@ -20,6 +20,7 @@ fn validate_materialized(
     connection: &Arc<crate::Connection>,
     database_id: usize,
     resolver: &Resolver,
+    view_name: &ast::Name,
     normalized_view_name: &str,
 ) -> Result<()> {
     // Check if experimental views are enabled
@@ -35,11 +36,12 @@ fn validate_materialized(
     if database_id != crate::MAIN_DB_ID {
         crate::bail_parse_error!("materialized views are not supported on attached databases");
     }
+    let written_name = normalize_ident(view_name.as_str());
     if RESERVED_TABLE_PREFIXES
         .iter()
-        .any(|prefix| normalized_view_name.starts_with(prefix))
+        .any(|prefix| written_name.starts_with(prefix))
     {
-        bail_parse_error!("Object name reserved for internal use: {normalized_view_name}",);
+        bail_parse_error!("Object name reserved for internal use: {written_name}",);
     }
 
     // Check if view already exists (including broken sqlite_schema rows,
@@ -87,7 +89,13 @@ pub fn translate_create_materialized_view(
     // Validate the view can be created and extract its columns
     // This validation happens before updating sqlite_master to prevent
     // storing invalid view definitions
-    validate_materialized(&connection, database_id, resolver, &normalized_view_name)?;
+    validate_materialized(
+        &connection,
+        database_id,
+        resolver,
+        &view_name.name,
+        &normalized_view_name,
+    )?;
 
     // Check for cross-database table references first
     crate::util::validate_select_for_views(select_stmt, resolver, database_id)?;
@@ -336,11 +344,12 @@ fn validate_create_view(
             crate::util::identifier_token_for_error(view_name)
         )));
     }
+    let written_name = normalize_ident(view_name.as_str());
     if RESERVED_TABLE_PREFIXES
         .iter()
-        .any(|prefix| normalized_view_name.starts_with(prefix))
+        .any(|prefix| written_name.starts_with(prefix))
     {
-        bail_parse_error!("Object name reserved for internal use: {normalized_view_name}",);
+        bail_parse_error!("Object name reserved for internal use: {written_name}",);
     }
     Ok(())
 }

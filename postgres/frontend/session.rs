@@ -6,7 +6,7 @@ use std::sync::{Arc, Mutex};
 
 use crate::catalog::{self, PostgresDialect};
 use crate::functions::ConfigParameter;
-use turso_core::schema::SEQ_BACKING_TABLE_PREFIX;
+use turso_core::schema::{SEQ_BACKING_TABLE_PREFIX, TURSO_INTERNAL_PREFIX};
 use turso_core::{Connection, LimboError, Namespace, Result, Statement, Value};
 use turso_parser::ast::{self};
 use turso_pg_parser::translator::{
@@ -708,6 +708,11 @@ fn handle_pg_create_schema(
             "unacceptable schema name \"{name}\": the name is reserved for a database"
         )));
     }
+    if name.starts_with(TURSO_INTERNAL_PREFIX) {
+        return Err(LimboError::ParseError(format!(
+            "unacceptable schema name \"{name}\": the prefix \"{TURSO_INTERNAL_PREFIX}\" is reserved for internal tables"
+        )));
+    }
     let prefix = stored_name_prefix(&name);
     if let Some(object) = object_names(&conn.current_schema())
         .into_iter()
@@ -812,30 +817,22 @@ fn without_foreign_keys(conn: &Arc<Connection>, f: impl FnOnce() -> Result<()>) 
     result
 }
 
-enum SchemaObject {
-    View(String),
-    Table(String),
-    Sequence(String),
+struct SchemaObject {
+    kind: &'static str,
+    schema: String,
+    name: String,
 }
 
 impl SchemaObject {
-    /// The statement that drops the object. The stored name is qualified
-    /// with main so that the search path does not change what it names.
+    /// The statement that drops the object. The name is qualified with its
+    /// schema so that the search path does not change what it names.
     fn drop_sql(&self) -> String {
-        let kind = match self {
-            SchemaObject::View(_) => "VIEW",
-            SchemaObject::Table(_) => "TABLE",
-            SchemaObject::Sequence(_) => "SEQUENCE",
-        };
-        format!("DROP {kind} main.\"{}\"", self.name().replace('"', "\"\""))
-    }
-
-    fn name(&self) -> &str {
-        match self {
-            SchemaObject::View(name) | SchemaObject::Table(name) | SchemaObject::Sequence(name) => {
-                name
-            }
-        }
+        format!(
+            "DROP {} \"{}\".\"{}\"",
+            self.kind,
+            self.schema.replace('"', "\"\""),
+            self.name.replace('"', "\"\"")
+        )
     }
 }
 
@@ -849,48 +846,47 @@ fn schema_objects(conn: &Arc<Connection>, schema: &str) -> Vec<SchemaObject> {
         .iter()
         .map(|name| stored_name_prefix(name))
         .collect();
-    let in_schema = |stored: &str| {
-        let in_this_schema = if schema == "public" {
-            !prefixes.iter().any(|prefix| stored.starts_with(prefix))
+    let name_in_schema = |stored: &str| -> Option<String> {
+        let name = if schema == "public" {
+            (!prefixes.iter().any(|prefix| stored.starts_with(prefix))).then_some(stored)
         } else {
-            stored.starts_with(&stored_name_prefix(schema))
-        };
-        in_this_schema
-            && !stored.starts_with("sqlite_")
-            && !stored.starts_with("__turso_internal_")
-            && !stored.starts_with(SCHEMA_MARKER_PREFIX)
+            stored.strip_prefix(&stored_name_prefix(schema))
+        }?;
+        let is_internal = name.starts_with("sqlite_")
+            || name.starts_with("__turso_internal_")
+            || name.starts_with(SCHEMA_MARKER_PREFIX);
+        (!is_internal).then(|| name.to_string())
     };
-    let mut views: Vec<String> = current
+    let objects = |kind: &'static str, stored_names: Vec<&String>| {
+        let mut names: Vec<String> = stored_names
+            .into_iter()
+            .filter_map(|stored| name_in_schema(stored))
+            .collect();
+        names.sort();
+        names.into_iter().map(move |name| SchemaObject {
+            kind,
+            schema: schema.to_string(),
+            name,
+        })
+    };
+    let views = current
         .views
         .keys()
         .chain(current.materialized_view_names.iter())
-        .filter(|name| in_schema(name))
-        .cloned()
         .collect();
-    let mut tables: Vec<String> = current
+    let tables = current
         .tables
         .iter()
         .filter(|(name, table)| {
-            in_schema(name)
-                && matches!(table.as_ref(), turso_core::schema::Table::BTree(_))
+            matches!(table.as_ref(), turso_core::schema::Table::BTree(_))
                 && !current.materialized_view_names.contains(*name)
         })
-        .map(|(name, _)| name.clone())
+        .map(|(name, _)| name)
         .collect();
-    let mut sequences: Vec<String> = current
-        .sequences
-        .keys()
-        .filter(|name| in_schema(name))
-        .cloned()
-        .collect();
-    views.sort();
-    tables.sort();
-    sequences.sort();
-    views
-        .into_iter()
-        .map(SchemaObject::View)
-        .chain(tables.into_iter().map(SchemaObject::Table))
-        .chain(sequences.into_iter().map(SchemaObject::Sequence))
+    let sequences = current.sequences.keys().collect();
+    objects("VIEW", views)
+        .chain(objects("TABLE", tables))
+        .chain(objects("SEQUENCE", sequences))
         .collect()
 }
 

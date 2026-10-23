@@ -5573,6 +5573,42 @@ mod tests {
     }
 
     #[test]
+    fn test_a_namespace_whose_prefix_is_reserved_holds_objects() {
+        let temp_dir = TempDir::new().unwrap();
+        let conn = open_connection_with_opts(
+            &temp_dir.path().join("main.db"),
+            DatabaseOpts::new().with_views(true),
+        );
+        conn.add_namespace(crate::Namespace {
+            name: "sqlite_x".to_string(),
+            database_id: MAIN_DB_ID,
+            prefix: "sqlite_x.".to_string(),
+        });
+
+        conn.execute("CREATE TABLE sqlite_x.t(x INTEGER); INSERT INTO sqlite_x.t VALUES(1)")
+            .unwrap();
+        conn.execute("CREATE INDEX sqlite_x.i ON t(x)").unwrap();
+        conn.execute("CREATE VIEW sqlite_x.v AS SELECT x FROM t")
+            .unwrap();
+        conn.execute("CREATE MATERIALIZED VIEW sqlite_x.mv AS SELECT x FROM t")
+            .unwrap();
+        assert_eq!(query_single_i64(&conn, "SELECT x FROM sqlite_x.v"), 1);
+        assert_eq!(query_single_i64(&conn, "SELECT x FROM sqlite_x.mv"), 1);
+        conn.execute("ALTER TABLE sqlite_x.t ADD COLUMN y INTEGER")
+            .unwrap();
+        conn.execute("CREATE TRIGGER sqlite_x.tr AFTER INSERT ON t BEGIN SELECT 1; END")
+            .unwrap();
+        conn.execute("DROP VIEW sqlite_x.mv; DROP VIEW sqlite_x.v; DROP TABLE sqlite_x.t")
+            .unwrap();
+        assert!(conn.prepare("SELECT x FROM sqlite_x.t").is_err());
+
+        assert!(conn.execute("CREATE TABLE sqlite_y(x INTEGER)").is_err());
+        assert!(conn
+            .execute("CREATE INDEX sqlite_x.sqlite_j ON t(x)")
+            .is_err());
+    }
+
+    #[test]
     fn test_named_memory_parent_can_attach_real_file_database() {
         let temp_dir = TempDir::new().unwrap();
         let aux_path = temp_dir.path().join("aux.db");

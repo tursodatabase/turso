@@ -421,3 +421,30 @@ expect {
     6
     7
 }
+
+test schema-named-with-a-reserved-prefix-holds-objects {
+    CREATE SCHEMA sqlite_x;
+    CREATE TABLE sqlite_x.t (x int);
+    INSERT INTO sqlite_x.t VALUES (1);
+    CREATE INDEX i ON sqlite_x.t (x);
+    ALTER TABLE sqlite_x.t ADD COLUMN y int;
+    CREATE VIEW sqlite_x.v AS SELECT x FROM sqlite_x.t;
+    CREATE MATERIALIZED VIEW sqlite_x.mv AS SELECT x FROM sqlite_x.t;
+    SELECT * FROM sqlite_x.v;
+    SELECT * FROM sqlite_x.mv;
+    DROP SCHEMA sqlite_x CASCADE;
+    SELECT count(*) FROM pg_tables WHERE schemaname = 'sqlite_x';
+}
+expect {
+    1
+    1
+    0
+}
+
+@skip-if postgres "Turso keeps the names that start with __turso_internal_ for its own tables"
+test create-schema-rejects-the-internal-table-prefix {
+    CREATE SCHEMA __turso_internal_y;
+}
+expect error {
+    unacceptable schema name "__turso_internal_y"
+}

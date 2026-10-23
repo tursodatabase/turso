@@ -1197,7 +1197,7 @@ pub fn translate_create_table(
     if !connection.is_mvcc_bootstrap_connection()
         && RESERVED_TABLE_PREFIXES
             .iter()
-            .any(|prefix| normalized_tbl_name.starts_with(prefix))
+            .any(|prefix| normalize_ident(tbl_name.name.as_str()).starts_with(prefix))
         && !connection.is_nested_stmt()
     {
         bail_parse_error!(
@@ -1881,11 +1881,12 @@ pub fn translate_create_virtual_table(
 fn validate_drop_table(
     resolver: &Resolver,
     database_id: usize,
+    written_name: &str,
     tbl_name: &str,
     connection: &Arc<Connection>,
 ) -> Result<()> {
     if !connection.is_nested_stmt()
-        && crate::schema::is_system_table(tbl_name)
+        && crate::schema::is_system_table(written_name)
         // special case, allow dropping `sqlite_stat1`
         && !tbl_name.eq_ignore_ascii_case(STATS_TABLE)
     {
@@ -1943,7 +1944,7 @@ pub fn translate_drop_table(
             crate::util::table_name_for_error(&tbl_name)
         );
     };
-    validate_drop_table(resolver, database_id, name, connection)?;
+    validate_drop_table(resolver, database_id, &resolved.name, name, connection)?;
     // Check if foreign keys are enabled and if this table is referenced by foreign keys
     // Fire FK actions (CASCADE, SET NULL, SET DEFAULT) or check for violations (RESTRICT, NO ACTION)
     if connection.foreign_keys_enabled()

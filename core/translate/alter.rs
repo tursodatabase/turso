@@ -748,7 +748,7 @@ pub fn translate_alter_table(
     // so that the UPDATE targets the correct database's schema table.
     let qualified_schema_table = schema_table_name_for_db(resolver, database_id);
     let schema_version = resolver.with_schema(database_id, |s| s.schema_version);
-    validate(&alter_table, table_name)?;
+    validate(&alter_table, &resolved.name)?;
     reject_alter_of_view(&alter_table, table_name, resolver, database_id)?;
 
     let table_indexes = resolver.with_schema(database_id, |s| {
