@@ -438,8 +438,12 @@ impl Statement {
         self.state.query_deadline = Some(self.pager.io.current_time_monotonic() + timeout);
     }
 
-    fn release_active_root_if_counted(&mut self) {
+    fn release_active_root_if_counted(&mut self, statement_failed: bool) {
         if self.counted_as_active_root {
+            let conn = &self.program.connection;
+            if let Some(hooks) = conn.hooks() {
+                hooks.root_statement_ended(conn, statement_failed);
+            }
             // Blob count drops before the root count so a concurrent
             // checkpoint-guard read never sees fewer non-blob statements
             // than are really active (a stale-high read only causes a
@@ -562,7 +566,7 @@ impl Statement {
                 .matches_connection(&self.program.connection)
             {
                 if let Err(err) = self.reprepare() {
-                    self.release_active_root_if_counted();
+                    self.release_active_root_if_counted(true);
                     return Err(err);
                 }
             }
@@ -619,7 +623,7 @@ impl Statement {
                 .rollback_autocommit_txn()
                 .and_then(|()| self.reprepare())
             {
-                self.release_active_root_if_counted();
+                self.release_active_root_if_counted(true);
                 return Err(err);
             }
             res = self
@@ -641,7 +645,7 @@ impl Statement {
                 // The stats refresh runs a SELECT on this same connection. At
                 // this point ANALYZE is already Done, so it must not count as a
                 // sibling root statement for that internal SELECT.
-                self.release_active_root_if_counted();
+                self.release_active_root_if_counted(false);
                 // Drive the refresh as a state machine instead of pumping
                 // `io.step()` here: its `sqlite_stat1` scan can have to wait
                 // for another transaction, and only the caller's scheduler can
@@ -687,7 +691,7 @@ impl Statement {
         if self.counted_as_active_root
             && (matches!(res, Ok(StepResult::Done | StepResult::Interrupt)) || res.is_err())
         {
-            self.release_active_root_if_counted();
+            self.release_active_root_if_counted(!matches!(res, Ok(StepResult::Done)));
         }
 
         // If the bytecode aborted between SequenceBeginInnerTx and
@@ -1476,6 +1480,7 @@ impl Statement {
             }
         }
 
+        let mut statement_failed = false;
         if self.state.execution_state.is_running() {
             if self.query_mode == QueryMode::Normal
                 && self.program.change_cnt_on
@@ -1536,6 +1541,7 @@ impl Statement {
                     }
                 }
 
+                statement_failed = !halt_completed;
                 if !halt_completed {
                     if let Err(abort_err) = self.program.abort(
                         &self.pager,
@@ -1555,6 +1561,7 @@ impl Statement {
                 // yielded a Row (DML still in progress or hit Busy/error), or a
                 // write statement without RETURNING. Rollback to avoid committing
                 // partial DML or silently retrying after transient errors (Busy).
+                statement_failed = self.state.is_active_write;
                 if let Err(abort_err) = self.program.abort(
                     &self.pager,
                     None,
@@ -1599,7 +1606,7 @@ impl Statement {
             self.state.is_active_write = false;
         }
         if self.counted_as_active_root && !preserve_active_root_count {
-            self.release_active_root_if_counted();
+            self.release_active_root_if_counted(statement_failed);
         }
         self.cleanup_orphaned_seq_inner_tx();
         self.state.reset(max_registers, max_cursors);

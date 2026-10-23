@@ -3,6 +3,7 @@
 //! keeps a single `Database` per file, and the per-connection catalog of
 //! attached databases.
 
+use crate::connection_hooks::{ConnectionContext, ConnectionHooks};
 use crate::types::IOResultOr;
 use crate::util::IOExt;
 #[cfg(feature = "io_memory_yield")]
@@ -1623,7 +1624,7 @@ impl Database {
                         Some(pager.clone()),
                         state.encryption_key.clone(),
                         page_codec.clone(),
-                        None,
+                        ConnectionContext::default(),
                         StatsRefresh::Blocking,
                     )?;
 
@@ -1773,7 +1774,7 @@ impl Database {
                                 Some(pager.clone()),
                                 state.encryption_key.clone(),
                                 page_codec.clone(),
-                                None,
+                                ConnectionContext::default(),
                                 StatsRefresh::Blocking,
                             )?);
                         }
@@ -2437,8 +2438,14 @@ impl Database {
                 self.experimental_mvcc_passive_checkpoint_enabled(),
             )?;
             self.mv_store.store(Some(mv_store.clone()));
-            let mvcc_bootstrap_conn =
-                self._connect(true, None, None, None, None, StatsRefresh::Blocking)?;
+            let mvcc_bootstrap_conn = self._connect(
+                true,
+                None,
+                None,
+                None,
+                ConnectionContext::default(),
+                StatsRefresh::Blocking,
+            )?;
             match mv_store.bootstrap(mvcc_bootstrap_conn.clone()) {
                 Ok(()) => {}
                 Err(LimboError::SchemaUpdated) => {
@@ -2460,7 +2467,7 @@ impl Database {
             None,
             opts.encryption_key,
             opts.page_codec,
-            None,
+            ConnectionContext::default(),
             StatsRefresh::Blocking,
         )
     }
@@ -2475,7 +2482,27 @@ impl Database {
             None,
             None,
             None,
-            Some(context),
+            ConnectionContext {
+                value: Some(context),
+                hooks: None,
+            },
+            StatsRefresh::Blocking,
+        )
+    }
+
+    pub fn connect_with_hooks<C: ConnectionHooks + Any>(
+        self: &Arc<Database>,
+        context: Arc<C>,
+    ) -> Result<Arc<Connection>> {
+        self._connect(
+            false,
+            None,
+            None,
+            None,
+            ConnectionContext {
+                value: Some(context.clone()),
+                hooks: Some(context),
+            },
             StatsRefresh::Blocking,
         )
     }
@@ -2515,7 +2542,7 @@ impl Database {
                     None,
                     opts.encryption_key,
                     opts.page_codec,
-                    None,
+                    ConnectionContext::default(),
                     StatsRefresh::Deferred,
                 )?;
                 state.conn = Some(conn.clone());
@@ -2540,7 +2567,7 @@ impl Database {
         pager: Option<Arc<Pager>>,
         encryption_key: Option<EncryptionKey>,
         page_codec: Option<Arc<dyn PageCodec>>,
-        context: Option<Arc<dyn Any + Send + Sync>>,
+        context: ConnectionContext,
         stats: StatsRefresh,
     ) -> Result<Arc<Connection>> {
         if self.page_codec_id.is_some() && page_codec.is_none() {
@@ -2597,7 +2624,7 @@ impl Database {
             pager,
             encryption_key,
             default_cache_size,
-            None,
+            ConnectionContext::default(),
         )?;
         refresh_analyze_stats(&conn);
         Ok(conn)
@@ -2611,12 +2638,13 @@ impl Database {
         pager: Arc<Pager>,
         encryption_key: Option<EncryptionKey>,
         default_cache_size: i32,
-        context: Option<Arc<dyn Any + Send + Sync>>,
+        context: ConnectionContext,
     ) -> Result<Arc<Connection>> {
         let encryption_cipher = self.encryption_cipher_mode.get();
         let conn = Arc::new(Connection {
             db: self.clone(),
-            context,
+            context: context.value,
+            hooks: context.hooks,
             pager: ArcSwap::new(pager),
             schema: RwLock::new(self.schema.lock().clone()),
             database_schemas: RwLock::new(HashMap::default()),

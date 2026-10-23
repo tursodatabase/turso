@@ -1,4 +1,5 @@
 use crate::alloc::TryClone;
+use crate::connection_hooks::{ConnectionHooks, SavepointMemo};
 use crate::error::io_error;
 #[cfg(any(test, injected_yields))]
 use crate::mvcc::yield_points::{FailureInjector, YieldInjector};
@@ -177,6 +178,7 @@ pub(crate) struct NamedSavepointFrame {
     /// SAVEPOINT begin. Cheap — values are `Arc`. Used by ROLLBACK TO
     /// to restore staged DDL on attached databases.
     pub(crate) staged_schema_snapshot: HashMap<usize, Arc<Schema>>,
+    pub(crate) hooks_memo: Option<SavepointMemo>,
 }
 
 /// Info returned by `rollback_named_savepoint_frame` so callers can
@@ -185,6 +187,7 @@ pub(crate) struct RollbackFrameInfo {
     pub(crate) main_schema_snapshot: Arc<Schema>,
     pub(crate) temp_schema_snapshot: Option<Arc<Schema>>,
     pub(crate) staged_schema_snapshot: HashMap<usize, Arc<Schema>>,
+    pub(crate) hooks_memo: Option<SavepointMemo>,
 }
 
 struct SchemaReparseGuard {
@@ -375,6 +378,7 @@ impl Drop for ExplicitCheckpointGuard {
 pub struct Connection {
     pub(crate) db: Arc<Database>,
     pub(super) context: Option<Arc<dyn Any + Send + Sync>>,
+    pub(super) hooks: Option<Arc<dyn ConnectionHooks>>,
     pub(crate) pager: ArcSwap<Pager>,
     pub(crate) schema: RwLock<Arc<Schema>>,
     /// Per-database schema cache (database_index -> schema)
@@ -636,6 +640,14 @@ impl Drop for Connection {
 impl Connection {
     pub fn context<C: Any>(&self) -> Option<&C> {
         self.context.as_deref()?.downcast_ref()
+    }
+
+    pub fn has_active_root_statement(&self) -> bool {
+        self.n_active_root_statements.load(Ordering::SeqCst) > 0
+    }
+
+    pub(crate) fn hooks(&self) -> Option<&dyn ConnectionHooks> {
+        self.hooks.as_deref()
     }
 
     fn schema_reparse_guard(self: &Arc<Connection>) -> SchemaReparseGuard {
@@ -4725,6 +4737,7 @@ impl Connection {
             main_schema_snapshot: frame.main_schema_snapshot.clone(),
             temp_schema_snapshot: frame.temp_schema_snapshot.clone(),
             staged_schema_snapshot: frame.staged_schema_snapshot.clone(),
+            hooks_memo: frame.hooks_memo.clone(),
         };
         // ROLLBACK TO keeps the target savepoint itself on the stack;
         // only nested savepoints above it are discarded.

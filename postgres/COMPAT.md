@@ -76,7 +76,9 @@ The pg_catalog tables emulated (live, reflecting real schema): `pg_class`,
 plus `pg_input_error_info`. Present but always empty: `pg_policy`,
 `pg_trigger`, `pg_statistic_ext`, `pg_inherits`, `pg_rewrite`,
 `pg_foreign_table`, `pg_partitioned_table`, `pg_collation`, `pg_description`,
-`pg_publication*`. Catalog introspection functions: `format_type`,
+`pg_publication*`. `pg_statistic_ext` exposes the hidden system column
+`tableoid` for pg_dump discovery. `pg_trigger` exposes `tgparentid` for
+parent-trigger lookup during dump discovery. Catalog introspection functions: `format_type`,
 `pg_get_constraintdef`, `pg_get_indexdef`, `pg_get_expr` (returns TursoPG's
 stored SQL; relation oid and pretty printing do not change the output),
 `pg_get_userbyid`, `pg_*_is_visible`, `pg_encoding_to_char`,
@@ -89,7 +91,12 @@ forms; the first schema of `search_path` that exists), `pg_backend_pid()`, `quot
 is not persisted. DML against pg_catalog is rejected. `pg_typeof` is not
 implemented.
 Configuration settings functions: `set_config()` and `current_setting()`,
-for `search_path` only.
+for `search_path` and for custom parameters (see Configuration Management).
+Setting changes follow the transaction as in PostgreSQL: a value that
+`set_config()` sets with `is_local = true` ends with the transaction,
+ROLLBACK undoes the setting changes of the transaction, ROLLBACK TO
+SAVEPOINT undoes the changes after the savepoint, and a statement that
+fails undoes its own changes.
 
 | Feature | Status | Notes |
 |---------|--------|-------|
@@ -360,6 +367,7 @@ Upgrade is not supported.
 | Feature | Status | Notes |
 |---------|--------|-------|
 | SET / SHOW configuration parameters | 🟡 Partial | Only search_path; other parameters are rejected, except SET to a value matching existing behaviour (see SET / SHOW above) |
+| Custom configuration parameters (`app.user_id`) | 🟡 Partial | `set_config()` and `current_setting()` only, not SET or SHOW; in server mode, all clients share the values |
 | ALTER SYSTEM | ❌ Not supported | |
 | Fractional input for "integer" values | ❌ Not supported | |
 | Include directives for pg_hba.conf and pg_ident.conf | ❌ Not supported | |

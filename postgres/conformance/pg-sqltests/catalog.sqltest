@@ -925,3 +925,23 @@ expect {
     pg_catalog
     public
 }
+
+test pg-statistic-ext-dump-discovery-is-empty {
+    SET search_path TO '';
+    SELECT tableoid, oid, stxname, stxnamespace, stxowner, stxrelid, stxstattarget
+    FROM pg_catalog.pg_statistic_ext;
+}
+expect {}
+
+test pg-trigger-parent-discovery-is-empty {
+    SET search_path TO '';
+    SELECT t.tgrelid, t.tgname, t.tgenabled, t.oid,
+           t.tgparentid <> 0 AS tgispartition
+    FROM unnest('{}'::pg_catalog.oid[]) AS src(tbloid)
+    JOIN pg_catalog.pg_trigger t ON src.tbloid = t.tgrelid
+    LEFT JOIN pg_catalog.pg_trigger u ON u.oid = t.tgparentid
+    WHERE (NOT t.tgisinternal AND t.tgparentid = 0)
+       OR t.tgenabled != u.tgenabled
+    ORDER BY t.tgrelid, t.tgname;
+}
+expect {}

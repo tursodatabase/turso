@@ -595,6 +595,16 @@ ORDER BY p.price DESC
 LIMIT 20;
 ```
 
+## PostgreSQL Catalog Queries
+
+Through the PostgreSQL frontend, `pg_catalog.pg_statistic_ext` exposes the
+system column `tableoid` for queries such as those sent by `pg_dump`.
+The catalog currently returns no rows. Select `tableoid` explicitly; it is
+not included in `SELECT *`.
+
+`pg_catalog.pg_trigger` exposes `tgparentid` for parent-trigger lookup during
+`pg_dump` discovery. This catalog currently returns no rows.
+
 ## See Also
 
 - [INSERT](/docs/sql-reference/statements/insert) for adding rows to a table
