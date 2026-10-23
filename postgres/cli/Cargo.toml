@@ -56,6 +56,7 @@ windows-sys = { workspace = true, features = [
 default = ["io_uring", "mimalloc"]
 io_uring = ["turso_core/io_uring"]
 mimalloc = ["dep:mimalloc"]
+test_helper = ["turso_pg/test_helper"]
 
 [build-dependencies]
 syntect = { version = "5.3.0", default-features = false, features = ["default-fancy"] }
