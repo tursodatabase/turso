@@ -1018,6 +1018,16 @@ struct ExprFrame<'a> {
     expected_type: Option<Arc<TypeDef>>,
     next_child: usize,
     resolved_children: FrameChildren,
+    /// For an IN list: the operand the next child is in, and the child's
+    /// position in it. Finding the child by counting operand widths from
+    /// the start would read the whole list for every child.
+    in_list: OperandCursor,
+}
+
+#[derive(Default)]
+struct OperandCursor {
+    operand: usize,
+    component: usize,
 }
 
 struct ExprChild<'a> {
@@ -1033,6 +1043,7 @@ impl<'a> ExprFrame<'a> {
             expected_type,
             next_child: 0,
             resolved_children: SmallVec::new(),
+            in_list: OperandCursor::default(),
         })
     }
 
@@ -1064,10 +1075,9 @@ impl<'a> ExprFrame<'a> {
                 [lhs.as_ref(), start.as_ref(), end.as_ref()],
                 self.next_child,
             ),
-            ast::Expr::InList { lhs, rhs, .. } => expression_operand_child(
-                std::iter::once(lhs.as_ref()).chain(rhs.iter().map(Box::as_ref)),
-                self.next_child,
-            ),
+            ast::Expr::InList { lhs, rhs, .. } => {
+                in_list_operand_child(lhs, rhs, &mut self.in_list)
+            }
             ast::Expr::InSelect { lhs, .. } | ast::Expr::InTable { lhs, .. } => {
                 expression_operand_child([lhs.as_ref()], self.next_child)
             }
@@ -1225,6 +1235,8 @@ impl<'a> ExprFrame<'a> {
 }
 
 fn expression_operand_width(syntax: &ast::Expr) -> usize {
+    #[cfg(test)]
+    tests::OPERAND_WIDTH_CALLS.with(|calls| calls.set(calls.get() + 1));
     match syntax {
         ast::Expr::Parenthesized(expressions) if expressions.len() == 1 => {
             expression_operand_width(&expressions[0])
@@ -1241,6 +1253,33 @@ fn expression_operand_component(syntax: &ast::Expr, index: usize) -> Option<&ast
         }
         ast::Expr::Parenthesized(expressions) => expressions.get(index).map(Box::as_ref),
         _ => (index == 0).then_some(syntax),
+    }
+}
+
+/// The child at `cursor` among `lhs` and the elements of `rhs`, moving
+/// the cursor past it: the children of each operand in turn.
+fn in_list_operand_child<'a>(
+    lhs: &'a ast::Expr,
+    rhs: &'a [Box<ast::Expr>],
+    cursor: &mut OperandCursor,
+) -> Option<&'a ast::Expr> {
+    loop {
+        let syntax = match cursor.operand {
+            0 => lhs,
+            position => rhs.get(position - 1)?.as_ref(),
+        };
+        let width = expression_operand_width(syntax);
+        if cursor.component < width {
+            let child = expression_operand_component(syntax, cursor.component);
+            cursor.component += 1;
+            if cursor.component == width {
+                cursor.operand += 1;
+                cursor.component = 0;
+            }
+            return child;
+        }
+        cursor.operand += 1;
+        cursor.component = 0;
     }
 }
 
@@ -4999,6 +5038,42 @@ mod tests {
         SymbolTable, MAIN_DB_ID,
     };
     use turso_parser::parser::Parser;
+
+    thread_local! {
+        /// How many operand widths were computed on this thread.
+        pub(super) static OPERAND_WIDTH_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    }
+
+    #[test]
+    fn in_list_frame_finds_each_child_without_reading_the_whole_list() {
+        let literal =
+            |value: usize| Box::new(ast::Expr::Literal(ast::Literal::Numeric(value.to_string())));
+        let elements = 1_000_usize;
+        let syntax = ast::Expr::InList {
+            lhs: literal(0),
+            not: false,
+            rhs: (1..=elements).map(literal).collect(),
+        };
+        let schema = Schema::new();
+        let mut frame = ExprFrame::new(&syntax, None).expect("IN list frame");
+        OPERAND_WIDTH_CALLS.with(|calls| calls.set(0));
+        let mut children = Vec::new();
+        while let Some(child) = frame.next_child(&schema).expect("IN list children") {
+            children.push(child.syntax.to_string());
+        }
+        let width_calls = OPERAND_WIDTH_CALLS.with(|calls| calls.get());
+
+        assert_eq!(children.len(), elements + 1);
+        assert_eq!(children[0], "0");
+        assert_eq!(children[elements], elements.to_string());
+        // Each child costs a bounded amount of work, not a walk of the list
+        // from its start.
+        assert!(
+            width_calls <= 4 * (elements + 1),
+            "finding {} children computed {width_calls} operand widths",
+            elements + 1
+        );
+    }
 
     fn expression(sql: &str) -> ast::Expr {
         let ast::Cmd::Stmt(ast::Stmt::Select(select)) = Parser::new(sql.as_bytes())
