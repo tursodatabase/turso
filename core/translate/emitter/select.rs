@@ -117,13 +117,17 @@ pub fn emit_query<'a>(
     // It also tells whether any row reached the aggregate, which a correlated
     // subquery in the result columns needs even when every column contains an
     // aggregate: if no row did, the subquery runs again against the NULL row.
-    let has_ungrouped_nonagg_cols = !plan.aggregates.is_empty()
-        && plan.group_by.is_none()
-        && (plan.result_columns.iter().any(|c| !c.contains_aggregates)
-            || plan
-                .non_from_clause_subqueries
-                .iter()
-                .any(|s| s.correlated && s.origin == SubqueryOrigin::SelectList));
+    let has_implicit_having_group = plan.has_implicit_having_group();
+    let has_ungrouped_nonagg_cols = (has_implicit_having_group
+        && plan.result_columns.iter().any(|c| !c.contains_aggregates))
+        || (!plan.aggregates.is_empty()
+            && plan.group_by.is_none()
+            && (plan.result_columns.iter().any(|c| !c.contains_aggregates)
+                || plan
+                    .non_from_clause_subqueries
+                    .iter()
+                    .any(|s| s.correlated && s.origin == SubqueryOrigin::SelectList)));
+    let has_ungrouped_aggregation = !plan.aggregates.is_empty() || has_implicit_having_group;
 
     if has_ungrouped_nonagg_cols {
         let flag = program.alloc_register();
@@ -180,11 +184,13 @@ pub fn emit_query<'a>(
                 &plan.order_by,
             )?;
         }
-    } else if !plan.aggregates.is_empty() {
-        // Handle aggregation without GROUP BY (or HAVING without GROUP BY)
+    } else if has_ungrouped_aggregation {
+        // A HAVING-only implicit group has no aggregate registers, but still uses the
+        // ungrouped-aggregation output path. Reserve one scratch register for its context.
+        let register_count = plan.aggregates.len().max(1);
         // Aggregate registers need to be NULLed at the start because the same registers might be reused on another invocation of a subquery,
         // and if they are not NULLed, the 2nd invocation of the same subquery will have values left over from the first invocation.
-        t_ctx.reg_agg_start = Some(program.alloc_registers_and_init_w_null(plan.aggregates.len()));
+        t_ctx.reg_agg_start = Some(program.alloc_registers_and_init_w_null(register_count));
     } else if let Some(window) = &plan.window {
         EmitWindow::init(
             program,
@@ -303,8 +309,8 @@ pub fn emit_query<'a>(
             group_by_agg_phase(program, t_ctx, plan)?;
         }
         group_by_emit_row_phase(program, t_ctx, plan, &mut grouped_output_subqueries)?;
-    } else if !plan.aggregates.is_empty() {
-        // Handle aggregation without GROUP BY (or HAVING without GROUP BY)
+    } else if has_ungrouped_aggregation {
+        // Handle aggregation without GROUP BY and HAVING-only implicit groups.
         emit_ungrouped_aggregation(program, t_ctx, plan, &mut grouped_output_subqueries)?;
     } else if plan.window.is_some() {
         emit_window_flush(program, t_ctx, plan)?;
