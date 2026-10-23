@@ -6,6 +6,7 @@ mod fts;
 mod logging;
 mod opts;
 mod progress;
+mod sequence;
 mod sql_logging;
 
 use clap::Parser;
@@ -440,6 +441,10 @@ pub fn load_schema(
     let table_names: Vec<String> = stmt
         .query_map([], |row| row.get(0))?
         .collect::<Result<_, _>>()?;
+    let table_names = table_names
+        .into_iter()
+        .filter(|name| !name.starts_with("__turso_internal_"))
+        .filter(|name| !sequence::TABLES.contains(&name.as_str()));
 
     let mut tables = Vec::new();
 
@@ -593,7 +598,9 @@ async fn async_main(opts: Opts) -> Result<(), Box<dyn std::error::Error + Send +
     let ddl_statements = if opts.fts {
         fts::schema(opts.tables.unwrap_or(1))
     } else {
-        schema.to_sql()
+        let mut ddl = schema.to_sql();
+        ddl.extend(sequence::schema());
+        ddl
     };
     let schema = Arc::new(schema);
 
@@ -708,6 +715,7 @@ async fn async_main(opts: Opts) -> Result<(), Box<dyn std::error::Error + Send +
 
             let handle = turso_stress::future::spawn(async move {
                 let mut conn = StressDb::connect(&db, thread.clone(), opts.busy_timeout).await?;
+                let checker = StressDb::connect(&db, thread.clone(), opts.busy_timeout).await?;
                 let mut rng = ThreadRng::new(
                     global_seed
                         .wrapping_add(thread_idx as u64)
@@ -790,9 +798,29 @@ async fn async_main(opts: Opts) -> Result<(), Box<dyn std::error::Error + Send +
                         let _ = conn.execute(&release_sql, ()).await;
                     }
 
+                    let key_to_check = if tx.is_some() && !opts.fts && rng.random_ratio(1, 2) {
+                        sequence::insert_then_advance_sequence(
+                            &conn,
+                            &mut rng,
+                            &sql_logger,
+                            &thread,
+                            thread_idx,
+                            batch_idx,
+                            interaction_idx,
+                        )
+                        .await
+                    } else {
+                        None
+                    };
+
                     if tx.is_some() {
                         let end_tx = *rng.choose(&["COMMIT;", "ROLLBACK;"]);
-                        let _ = conn.execute(end_tx, ()).await;
+                        let committed =
+                            conn.execute(end_tx, ()).await.is_ok() && end_tx == "COMMIT;";
+                        if let Some(key) = key_to_check.filter(|_| committed) {
+                            sequence::check_row_committed(&checker, &key, &sql_logger, &thread)
+                                .await?;
+                        }
                     }
 
                     // Occasionally checkpoint the WAL so backfills, full
