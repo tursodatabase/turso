@@ -3533,7 +3533,9 @@ impl PostgreSQLTranslator {
         }
 
         if func_name == "substring" && (args.len() == 2 || args.len() == 3) {
-            return Ok(Self::translate_pg_substring(args));
+            return Ok(Self::translate_pg_substring(
+                args.into_iter().map(|a| *a).collect(),
+            ));
         }
 
         let translated_order = self.translate_order_by(&func_call.agg_order)?;
@@ -3560,9 +3562,9 @@ impl PostgreSQLTranslator {
         })
     }
 
-    fn translate_pg_substring(mut args: Vec<Box<ast::Expr>>) -> ast::Expr {
-        let value = *args.remove(0);
-        let start = *args.remove(0);
+    fn translate_pg_substring(mut args: Vec<ast::Expr>) -> ast::Expr {
+        let value = args.remove(0);
+        let start = args.remove(0);
         let one = ast::Expr::Literal(ast::Literal::Numeric("1".into()));
         let zero = ast::Expr::Literal(ast::Literal::Numeric("0".into()));
         let substr = |args| function_call("substr", args);
@@ -3578,7 +3580,6 @@ impl PostgreSQLTranslator {
                 else_expr: Some(Box::new(substr(vec![value, start]))),
             },
             Some(length) => {
-                let length = *length;
                 let negative_length = binary(
                     length.clone(),
                     ast::Operator::Less,
