@@ -303,18 +303,14 @@ pub(super) fn emit_update(
             ),
     );
 
-    match single_loop {
-        Some((planned_loop, _)) => program.emit_source_explain(
-            target.source.id,
-            hir_loop_explain(document, None, &[], planned_loop)?,
-        ),
-        None => {
-            for planned_loop in &access.loops {
-                program.emit_source_explain(
-                    planned_loop.source,
-                    hir_loop_explain(document, update.from.as_ref(), &[], planned_loop)?,
-                );
-            }
+    // A single loop's plan node follows the opening of the table it
+    // writes, as on the legacy path.
+    if single_loop.is_none() {
+        for planned_loop in &access.loops {
+            program.emit_source_explain(
+                planned_loop.source,
+                hir_loop_explain(document, update.from.as_ref(), &[], planned_loop)?,
+            );
         }
     }
     let returning = ReturningBuffer::open(program, table, update.returning.as_ref());
@@ -470,7 +466,13 @@ pub(super) fn emit_update(
         {
             emit_scan_update(program, &target, access, operation, &row_layout, row, done)?
         }
-        Some(_) => emit_rowset_update(program, plan, &target, access, &row_layout, row, done)?,
+        Some((planned_loop, _)) => {
+            program.emit_source_explain(
+                target.source.id,
+                hir_loop_explain(document, None, &[], planned_loop)?,
+            );
+            emit_rowset_update(program, plan, &target, access, &row_layout, row, done)?
+        }
     }
     program.preassign_label_to_next_insn(done);
     target.emit_capture_commit(program)?;
@@ -802,6 +804,12 @@ fn emit_scan_update(
     // changes, all for writing.
     let iteration_index = operation_index(operation);
     let table_cursor = target.open_table_for_write(program);
+    if let [planned_loop] = access.loops.as_slice() {
+        program.emit_source_explain(
+            target.source.id,
+            hir_loop_explain(document, None, &[], planned_loop)?,
+        );
+    }
     let iteration_cursor = iteration_index.map(|index| {
         let cursor = program.alloc_cursor_id(CursorType::BTreeIndex(index.clone()));
         program.emit_insn(Insn::OpenWrite {
@@ -1847,12 +1855,18 @@ impl UpdateRow<'_, '_> {
                             });
                         }
                         None => {
+                            let translate: Translate =
+                                if super::dml::column_encodes(self.target.source, position) {
+                                    super::expr::translate_expr_no_constant_opt
+                                } else {
+                                    super::expr::translate_expr
+                                };
                             value.emit(
                                 program,
                                 self.target.document,
                                 register,
                                 &mut rows,
-                                super::expr::translate_expr,
+                                translate,
                             )?;
                         }
                     }
@@ -2639,5 +2653,39 @@ mod tests {
         assert_eq!(checks.len(), 2);
         assert_eq!(encodes.len(), 1);
         assert!(checks[0] < encodes[0] && encodes[0] < checks[1]);
+    }
+
+    #[test]
+    fn update_computes_an_encoded_constant_on_every_row() {
+        let mut schema = schema();
+        schema
+            .add_type_from_sql(
+                "CREATE TYPE cents BASE integer ENCODE value * 100 DECODE value / 100",
+            )
+            .unwrap();
+        schema
+            .add_btree_table(Arc::new(
+                BTreeTable::from_sql(
+                    "CREATE TABLE priced(id INTEGER PRIMARY KEY, amount cents) STRICT",
+                    140,
+                )
+                .unwrap(),
+            ))
+            .unwrap();
+        let program = emit_with(schema, "UPDATE priced SET amount = 99");
+        // The encode multiplies the register the constant is loaded into,
+        // so the load must run on every row: after the loop starts, not
+        // once before it.
+        let position = |matches: fn(&Insn) -> bool| {
+            program
+                .insns
+                .iter()
+                .position(|(insn, _)| matches(insn))
+                .unwrap()
+        };
+        let rewind = position(|insn| matches!(insn, Insn::Rewind { .. }));
+        let load = position(|insn| matches!(insn, Insn::Integer { value: 99, .. }));
+        let encode = position(|insn| matches!(insn, Insn::Multiply { .. }));
+        assert!(rewind < load && load < encode);
     }
 }

@@ -633,7 +633,9 @@ pub(super) fn open_virtual_for_write(
 ) -> CursorID {
     let cursor = program.alloc_cursor_id(CursorType::VirtualTable(table.clone()));
     program.emit_insn(Insn::VOpen { cursor_id: cursor });
-    program.emit_insn(Insn::VBegin { cursor_id: cursor });
+    if !program.dbpage_writable() {
+        program.emit_insn(Insn::VBegin { cursor_id: cursor });
+    }
     cursor
 }
 
@@ -959,6 +961,15 @@ fn custom_chain(source: &hir::Source, column: usize) -> Option<&[hir::ResolvedTy
         .as_ref()
         .map(|declared| declared.custom_chain.as_slice())
         .filter(|chain| !chain.is_empty())
+}
+
+/// Whether writing the column runs an ENCODE expression on its value.
+pub(super) fn column_encodes(source: &hir::Source, column: usize) -> bool {
+    custom_chain(source, column).is_some_and(|chain| {
+        chain
+            .iter()
+            .any(|definition| definition.value().encode().is_some())
+    })
 }
 
 /// Whether a column of the target has a custom type.

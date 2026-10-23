@@ -155,13 +155,13 @@ pub(super) fn emit_delete(
         program.set_multi_write(false);
     }
 
-    program.emit_source_explain(
-        target.source.id,
-        hir_loop_explain(document, None, &[], planned_loop)?,
-    );
     let returning = ReturningBuffer::open(program, target.table, delete.returning.as_ref());
     let done = program.allocate_label();
     if uses_rowset {
+        program.emit_source_explain(
+            target.source.id,
+            hir_loop_explain(document, None, &[], planned_loop)?,
+        );
         emit_rowset_delete(
             program,
             plan,
@@ -234,6 +234,13 @@ fn emit_scan_delete(
     // index, all for writing.
     let iteration_index = operation_index(operation);
     let table_cursor = target.open_table_for_write(program);
+    // The plan node follows the opening of the table, as on the legacy path.
+    if let [planned_loop] = access.loops.as_slice() {
+        program.emit_source_explain(
+            target.source.id,
+            hir_loop_explain(document, None, &[], planned_loop)?,
+        );
+    }
     let iteration = iteration_index
         .map(|index| -> Result<_> {
             let cursor = program.alloc_cursor_id(CursorType::BTreeIndex(index.clone()));

@@ -9315,35 +9315,52 @@ mod tests {
     fn direct_fts_functions_use_consecutive_argument_registers() {
         use crate::function::FtsFunc;
 
-        for (function, argument_count) in [
-            (FtsFunc::Score, 2),
-            (FtsFunc::Match, 3),
-            (FtsFunc::Highlight, 4),
-        ] {
-            let arguments = (0..argument_count)
+        let literal_arguments = |count: usize| {
+            (0..count)
                 .map(|value| hir::Expr::Literal(Literal::Numeric(value.to_string())))
-                .collect();
-            let expression = ordinary_scalar_call(Func::Fts(function.clone()), arguments);
-            let mut program = program();
+                .collect::<Vec<_>>()
+        };
+        let argument_count = 4;
+        let expression = ordinary_scalar_call(
+            Func::Fts(FtsFunc::Highlight),
+            literal_arguments(argument_count),
+        );
+        let mut program = program();
 
-            translate_expr(&mut program, &expression, 8).unwrap();
-            assert!(program.insns[..argument_count].iter().enumerate().all(
-                |(index, (instruction, _))| {
-                    matches!(instruction, Insn::Integer { dest, .. } if *dest == index + 1)
-                }
-            ));
-            assert!(matches!(
-                program.insns.last().map(|(instruction, _)| instruction),
-                Some(Insn::Function {
-                    constant_mask: 0,
-                    start_reg: 1,
-                    dest: 8,
-                    func: FuncCtx {
-                        func: Func::Fts(emitted),
-                        arg_count,
-                    },
-                }) if *emitted == function && *arg_count == argument_count
-            ));
+        translate_expr(&mut program, &expression, 8).unwrap();
+        assert!(program.insns[..argument_count].iter().enumerate().all(
+            |(index, (instruction, _))| {
+                matches!(instruction, Insn::Integer { dest, .. } if *dest == index + 1)
+            }
+        ));
+        assert!(matches!(
+            program.insns.last().map(|(instruction, _)| instruction),
+            Some(Insn::Function {
+                constant_mask: 0,
+                start_reg: 1,
+                dest: 8,
+                func: FuncCtx {
+                    func: Func::Fts(FtsFunc::Highlight),
+                    arg_count,
+                },
+            }) if *arg_count == argument_count
+        ));
+
+        // A search or score reads the FTS index the planner selected; with
+        // no index it is an error, as on the legacy path.
+        for (function, argument_count, message) in [
+            (
+                FtsFunc::Score,
+                2,
+                "fts_score requires columns and query from the selected FTS index",
+            ),
+            (FtsFunc::Match, 3, "fts_match requires an FTS index query"),
+        ] {
+            let expression =
+                ordinary_scalar_call(Func::Fts(function), literal_arguments(argument_count));
+            let mut without_index = self::program();
+            let error = translate_expr(&mut without_index, &expression, 8).unwrap_err();
+            assert_eq!(error.to_string(), format!("Parse error: {message}"));
         }
     }
 
