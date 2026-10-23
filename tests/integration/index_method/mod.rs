@@ -1383,6 +1383,30 @@ fn test_fts_ngram_tokenizer(tmp_db: TempDatabase) {
     assert!(!rows.is_empty());
 }
 
+#[cfg(all(feature = "fts", not(target_family = "wasm")))]
+#[turso_macros::test]
+fn test_fts_en_stem_tokenizer_matches_other_forms_of_a_word(tmp_db: TempDatabase) {
+    let conn = tmp_db.connect_limbo();
+
+    conn.execute("CREATE TABLE notes(id INTEGER PRIMARY KEY, body TEXT)")
+        .unwrap();
+    conn.execute("INSERT INTO notes VALUES (1, 'She runs daily'), (2, 'walking home')")
+        .unwrap();
+    conn.execute("CREATE INDEX notes_stem ON notes USING fts (body) WITH (tokenizer = 'en_stem')")
+        .unwrap();
+
+    for (query, expected_id) in [("running", 1), ("RUN", 1), ("walks", 2)] {
+        let rows = limbo_exec_rows(
+            &conn,
+            &format!("SELECT id FROM notes WHERE fts_match(body, '{query}')"),
+        );
+        assert_that!(rows)
+            .column(0)
+            .single_element()
+            .is_equal_to(Cell::from(expected_id));
+    }
+}
+
 /// A one-character typo in a WITH clause key must be an error, not a
 /// silently different index (issue #8169).
 #[cfg(all(feature = "fts", not(target_family = "wasm")))]
