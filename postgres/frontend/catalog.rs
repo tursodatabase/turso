@@ -173,6 +173,10 @@ impl Dialect for PostgresDialect {
     fn binds_names_at_create(&self) -> bool {
         true
     }
+
+    fn upsert_rejects_row_written_by_same_statement(&self) -> bool {
+        true
+    }
 }
 
 pub fn encode_pg_schema_sql(sql: &str) -> String {

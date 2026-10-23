@@ -167,6 +167,10 @@ pub struct InsertEmitCtx<'a> {
     /// When present, RETURNING rows are buffered into an ephemeral table during the DML loop,
     /// then scanned back and yielded to the caller after all DML is complete.
     pub returning_buffer: Option<ReturningBufferCtx>,
+    /// Ephemeral table of the rowids this statement inserted or updated, used
+    /// when a DO UPDATE must fail on such a row (see
+    /// [crate::Dialect::upsert_rejects_row_written_by_same_statement]).
+    pub written_rowids_cursor_id: Option<usize>,
 }
 
 impl<'a> InsertEmitCtx<'a> {
@@ -220,6 +224,7 @@ impl<'a> InsertEmitCtx<'a> {
             autoincrement_meta: None,
             database_id,
             returning_buffer: None,
+            written_rowids_cursor_id: None,
         })
     }
 }
@@ -448,6 +453,21 @@ pub fn translate_insert(
             cursor_id: ret_cursor_id,
             num_columns: result_columns.len(),
         });
+    }
+
+    if resolver
+        .dialect
+        .upsert_rejects_row_written_by_same_statement()
+        && upsert_actions
+            .iter()
+            .any(|(_, _, upsert)| matches!(upsert.do_clause, UpsertDo::Set { .. }))
+    {
+        let cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(btree_table.clone()));
+        program.emit_insn(Insn::OpenEphemeral {
+            cursor_id,
+            is_table: true,
+        });
+        ctx.written_rowids_cursor_id = Some(cursor_id);
     }
 
     if ctx.table.has_autoincrement && !is_mvcc {
@@ -934,6 +954,7 @@ pub fn translate_insert(
         // not the SQL token spelling (`"t"`, `[t]`, aliases, case, ...).
         table_name: btree_table.name.clone(),
     });
+    emit_remember_written_rowid(program, &ctx, insertion.key_register());
 
     // CDC must capture the row right after the INSERT updated the table, before any AFTER
     // trigger or FK action this INSERT fires can write further CDC rows of their own.
@@ -1140,6 +1161,31 @@ pub fn translate_insert(
     program.result_columns = result_columns;
     program.table_references.extend(table_references);
     Ok(())
+}
+
+pub(crate) fn emit_remember_written_rowid(
+    program: &mut ProgramBuilder,
+    ctx: &InsertEmitCtx,
+    rowid_reg: usize,
+) {
+    let Some(cursor_id) = ctx.written_rowids_cursor_id else {
+        return;
+    };
+    let empty_record_reg = program.alloc_register();
+    program.emit_insn(Insn::MakeRecord {
+        start_reg: to_u32(rowid_reg),
+        count: 0,
+        dest_reg: to_u32(empty_record_reg),
+        index_name: None,
+        affinity_str: None,
+    });
+    program.emit_insn(Insn::Insert {
+        cursor: cursor_id,
+        key_reg: rowid_reg,
+        record_reg: empty_record_reg,
+        flag: InsertFlags::new().is_ephemeral_table_insert(),
+        table_name: ctx.table.name.clone(),
+    });
 }
 
 /// If the user provided an explicit rowid for this insert, we must validate that it is an Integer and non-null
