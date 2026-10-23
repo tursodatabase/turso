@@ -5684,6 +5684,43 @@ mod tests {
     }
 
     #[test]
+    fn test_a_foreign_key_action_reaches_a_child_table_of_a_namespace() {
+        let temp_dir = TempDir::new().unwrap();
+        let conn = open_connection_with_opts(&temp_dir.path().join("main.db"), DatabaseOpts::new());
+        conn.add_namespace(crate::Namespace {
+            name: "app".to_string(),
+            database_id: MAIN_DB_ID,
+            prefix: "app.".to_string(),
+        });
+        conn.execute("PRAGMA foreign_keys = ON").unwrap();
+        conn.execute("CREATE TABLE app.p(id INTEGER PRIMARY KEY)")
+            .unwrap();
+        conn.execute("CREATE TABLE app.c(pid INTEGER REFERENCES \"app.p\"(id) ON DELETE CASCADE ON UPDATE CASCADE)")
+            .unwrap();
+        conn.execute("CREATE TABLE app.n(pid INTEGER REFERENCES \"app.p\"(id) ON DELETE SET NULL)")
+            .unwrap();
+        conn.execute("INSERT INTO app.p VALUES(1), (2); INSERT INTO app.c VALUES(1), (2); INSERT INTO app.n VALUES(1)")
+            .unwrap();
+        conn.add_namespace(crate::Namespace::database("public", MAIN_DB_ID));
+        conn.set_search_path(Some(vec!["public".to_string()]));
+
+        conn.execute("UPDATE app.p SET id = 3 WHERE id = 2")
+            .unwrap();
+        assert_eq!(
+            query_single_i64(&conn, "SELECT pid FROM app.c WHERE pid = 3"),
+            3
+        );
+        conn.execute("DELETE FROM app.p WHERE id = 1").unwrap();
+        assert_eq!(query_single_i64(&conn, "SELECT count(*) FROM app.c"), 1);
+        assert_eq!(
+            query_single_i64(&conn, "SELECT count(*) FROM app.n WHERE pid IS NULL"),
+            1
+        );
+        conn.execute("DROP TABLE app.p").unwrap();
+        assert_eq!(query_single_i64(&conn, "SELECT count(*) FROM app.c"), 0);
+    }
+
+    #[test]
     fn test_named_memory_parent_can_attach_real_file_database() {
         let temp_dir = TempDir::new().unwrap();
         let aux_path = temp_dir.path().join("aux.db");

@@ -739,6 +739,38 @@ fn foreign_key_references_table_of_schema(db: TempDatabase) {
 }
 
 #[turso_macros::test]
+fn foreign_key_actions_reach_a_child_table_of_a_schema(db: TempDatabase) {
+    let conn = db.connect_postgres();
+    conn.pragma_update("foreign_keys", "ON").unwrap();
+    conn.execute("CREATE SCHEMA app").unwrap();
+    conn.execute("CREATE TABLE app.p (id int PRIMARY KEY)")
+        .unwrap();
+    conn.execute("CREATE TABLE app.c (pid int REFERENCES app.p (id) ON DELETE CASCADE)")
+        .unwrap();
+    conn.execute("CREATE TABLE app.n (pid int REFERENCES app.p (id) ON DELETE SET NULL)")
+        .unwrap();
+    conn.execute("INSERT INTO app.p VALUES (1), (2)").unwrap();
+    conn.execute("INSERT INTO app.c VALUES (1), (2)").unwrap();
+    conn.execute("INSERT INTO app.n VALUES (1)").unwrap();
+
+    conn.execute("DELETE FROM app.p WHERE id = 1").unwrap();
+    let count = |sql: &str| {
+        let mut rows = conn.query(sql).unwrap().unwrap();
+        let StepResult::Row = rows.step().unwrap() else {
+            panic!("expected row");
+        };
+        let Value::Numeric(Numeric::Integer(n)) = rows.row().unwrap().get_value(0) else {
+            panic!("expected integer");
+        };
+        *n
+    };
+    assert_eq!(count("SELECT count(*) FROM app.c"), 1);
+    assert_eq!(count("SELECT count(*) FROM app.n WHERE pid IS NULL"), 1);
+    conn.execute("DROP TABLE app.p").unwrap();
+    assert_eq!(count("SELECT count(*) FROM app.c"), 0);
+}
+
+#[turso_macros::test]
 fn foreign_key_references_table_through_search_path(db: TempDatabase) {
     let conn = db.connect_postgres();
     conn.pragma_update("foreign_keys", "ON").unwrap();
