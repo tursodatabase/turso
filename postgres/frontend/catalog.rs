@@ -396,42 +396,42 @@ impl SnapshotRows for PgClassTable {
                     continue;
                 }
                 let indnatts = idx.columns.len() as i64;
-                let placement = Placement::of(&idx.name, schemas);
-                let relname = placement.name.to_string();
+                let relname = Placement::of(&idx.name, schemas).name.to_string();
+                let table_placement = Placement::of(table_name, schemas);
                 rows.push(vec![
-                    Value::from_i64(index_oid),               // oid
-                    Value::build_text(relname),               // relname
-                    Value::from_i64(placement.namespace_oid), // relnamespace
-                    Value::from_i64(0),                       // reltype
-                    Value::from_i64(0),                       // reloftype
-                    Value::from_i64(10),                      // relowner
-                    Value::from_i64(403),                     // relam (btree)
-                    Value::from_i64(0),                       // relfilenode
-                    Value::from_i64(0),                       // reltablespace
-                    Value::from_i64(1),                       // relpages
-                    Value::from_f64(0.0),                     // reltuples
-                    Value::from_i64(0),                       // relallvisible
-                    Value::from_i64(0),                       // reltoastrelid
-                    Value::from_i64(0),                       // relhasindex
-                    Value::from_i64(0),                       // relisshared
-                    Value::Text("p".into()),                  // relpersistence
-                    Value::build_text(relkind),               // relkind (index)
-                    Value::from_i64(indnatts),                // relnatts
-                    Value::from_i64(0),                       // relchecks
-                    Value::from_i64(0),                       // relhasrules
-                    Value::from_i64(0),                       // relhastriggers
-                    Value::from_i64(0),                       // relhassubclass
-                    Value::from_i64(0),                       // relrowsecurity
-                    Value::from_i64(0),                       // relforcerowsecurity
-                    Value::from_i64(1),                       // relispopulated
-                    Value::Text("d".into()),                  // relreplident
-                    Value::from_i64(0),                       // relispartition
-                    Value::from_i64(0),                       // relrewrite
-                    Value::from_i64(0),                       // relfrozenxid
-                    Value::from_i64(0),                       // relminmxid
-                    Value::Null,                              // relacl
-                    Value::Null,                              // reloptions
-                    Value::Null,                              // relpartbound
+                    Value::from_i64(index_oid),                     // oid
+                    Value::build_text(relname),                     // relname
+                    Value::from_i64(table_placement.namespace_oid), // relnamespace
+                    Value::from_i64(0),                             // reltype
+                    Value::from_i64(0),                             // reloftype
+                    Value::from_i64(10),                            // relowner
+                    Value::from_i64(403),                           // relam (btree)
+                    Value::from_i64(0),                             // relfilenode
+                    Value::from_i64(0),                             // reltablespace
+                    Value::from_i64(1),                             // relpages
+                    Value::from_f64(0.0),                           // reltuples
+                    Value::from_i64(0),                             // relallvisible
+                    Value::from_i64(0),                             // reltoastrelid
+                    Value::from_i64(0),                             // relhasindex
+                    Value::from_i64(0),                             // relisshared
+                    Value::Text("p".into()),                        // relpersistence
+                    Value::build_text(relkind),                     // relkind (index)
+                    Value::from_i64(indnatts),                      // relnatts
+                    Value::from_i64(0),                             // relchecks
+                    Value::from_i64(0),                             // relhasrules
+                    Value::from_i64(0),                             // relhastriggers
+                    Value::from_i64(0),                             // relhassubclass
+                    Value::from_i64(0),                             // relrowsecurity
+                    Value::from_i64(0),                             // relforcerowsecurity
+                    Value::from_i64(1),                             // relispopulated
+                    Value::Text("d".into()),                        // relreplident
+                    Value::from_i64(0),                             // relispartition
+                    Value::from_i64(0),                             // relrewrite
+                    Value::from_i64(0),                             // relfrozenxid
+                    Value::from_i64(0),                             // relminmxid
+                    Value::Null,                                    // relacl
+                    Value::Null,                                    // reloptions
+                    Value::Null,                                    // relpartbound
                 ]);
                 index_oid += 1;
             }
@@ -1629,7 +1629,7 @@ impl SnapshotRows for PgConstraintTable {
     const ESTIMATED_COST: f64 = 100.0;
     const ESTIMATED_ROWS: u32 = 50;
 
-    fn load_rows(conn: &Connection, _schemas: &[UserSchema]) -> Vec<Vec<Value>> {
+    fn load_rows(conn: &Connection, schemas: &[UserSchema]) -> Vec<Vec<Value>> {
         let schema = conn.current_schema();
         let mut rows = Vec::new();
 
@@ -1658,11 +1658,13 @@ impl SnapshotRows for PgConstraintTable {
                 _ => continue,
             };
             let table_oid = tbl_oid_map.get(*table_name).copied().unwrap_or(0);
+            let placement = Placement::of(table_name, schemas);
+            let table_name_in_schema = placement.name;
 
             // Synthesize PK constraint for rowid-alias tables when unique_sets has no PK
             let has_pk_in_unique_sets = btree.unique_sets.iter().any(|us| us.is_primary_key);
             if !has_pk_in_unique_sets && !btree.primary_key_columns.is_empty() {
-                let conname = format!("{table_name}_pkey");
+                let conname = format!("{table_name_in_schema}_pkey");
                 let conkey: String = btree
                     .primary_key_columns
                     .iter()
@@ -1678,7 +1680,7 @@ impl SnapshotRows for PgConstraintTable {
                 rows.push(vec![
                     Value::from_i64(constraint_oid),
                     Value::build_text(conname),
-                    Value::from_i64(2200),
+                    Value::from_i64(placement.namespace_oid),
                     Value::build_text(contype),
                     Value::from_i64(0),
                     Value::from_i64(0),
@@ -1714,10 +1716,10 @@ impl SnapshotRows for PgConstraintTable {
                 };
                 let col_names: Vec<&str> = us.columns.iter().map(|c| c.name.as_str()).collect();
                 let conname = if us.is_primary_key {
-                    format!("{table_name}_pkey")
+                    format!("{table_name_in_schema}_pkey")
                 } else {
                     let cols_str = col_names.join("_");
-                    format!("{table_name}_{cols_str}_key")
+                    format!("{table_name_in_schema}_{cols_str}_key")
                 };
 
                 // Build conkey: space-separated 1-based attnums
@@ -1754,31 +1756,31 @@ impl SnapshotRows for PgConstraintTable {
 
                 let contype: &'static str = contype.into();
                 rows.push(vec![
-                    Value::from_i64(constraint_oid), // oid
-                    Value::build_text(conname),      // conname
-                    Value::from_i64(2200),           // connamespace (public)
-                    Value::build_text(contype),      // contype
-                    Value::from_i64(0),              // condeferrable
-                    Value::from_i64(0),              // condeferred
-                    Value::from_i64(1),              // convalidated
-                    Value::from_i64(table_oid),      // conrelid
-                    Value::from_i64(0),              // contypid
-                    Value::from_i64(conindid),       // conindid
-                    Value::from_i64(0),              // conparentid
-                    Value::from_i64(0),              // confrelid
-                    Value::Null,                     // confupdtype
-                    Value::Null,                     // confdeltype
-                    Value::Null,                     // confmatchtype
-                    Value::from_i64(1),              // conislocal
-                    Value::from_i64(0),              // coninhcount
-                    Value::from_i64(0),              // connoinherit
-                    Value::build_text(conkey),       // conkey
-                    Value::Null,                     // confkey
-                    Value::Null,                     // conpfeqop
-                    Value::Null,                     // conppeqop
-                    Value::Null,                     // conffeqop
-                    Value::Null,                     // conexclop
-                    Value::Null,                     // conbin
+                    Value::from_i64(constraint_oid),          // oid
+                    Value::build_text(conname),               // conname
+                    Value::from_i64(placement.namespace_oid), // connamespace
+                    Value::build_text(contype),               // contype
+                    Value::from_i64(0),                       // condeferrable
+                    Value::from_i64(0),                       // condeferred
+                    Value::from_i64(1),                       // convalidated
+                    Value::from_i64(table_oid),               // conrelid
+                    Value::from_i64(0),                       // contypid
+                    Value::from_i64(conindid),                // conindid
+                    Value::from_i64(0),                       // conparentid
+                    Value::from_i64(0),                       // confrelid
+                    Value::Null,                              // confupdtype
+                    Value::Null,                              // confdeltype
+                    Value::Null,                              // confmatchtype
+                    Value::from_i64(1),                       // conislocal
+                    Value::from_i64(0),                       // coninhcount
+                    Value::from_i64(0),                       // connoinherit
+                    Value::build_text(conkey),                // conkey
+                    Value::Null,                              // confkey
+                    Value::Null,                              // conpfeqop
+                    Value::Null,                              // conppeqop
+                    Value::Null,                              // conffeqop
+                    Value::Null,                              // conexclop
+                    Value::Null,                              // conbin
                 ]);
                 constraint_oid += 1;
             }
@@ -1786,7 +1788,7 @@ impl SnapshotRows for PgConstraintTable {
             // FK constraints from foreign_keys
             for fk in &btree.foreign_keys {
                 let child_cols = fk.child_columns.join("_");
-                let conname = format!("{table_name}_{child_cols}_fkey");
+                let conname = format!("{table_name_in_schema}_{child_cols}_fkey");
 
                 let conkey: String = fk
                     .child_columns
@@ -1822,7 +1824,7 @@ impl SnapshotRows for PgConstraintTable {
                 rows.push(vec![
                     Value::from_i64(constraint_oid),                   // oid
                     Value::build_text(conname),                        // conname
-                    Value::from_i64(2200),                             // connamespace
+                    Value::from_i64(placement.namespace_oid),          // connamespace
                     Value::build_text(contype),                        // contype
                     Value::from_i64(i64::from(fk.deferred)),           // condeferrable
                     Value::from_i64(i64::from(fk.deferred)),           // condeferred
@@ -1854,7 +1856,7 @@ impl SnapshotRows for PgConstraintTable {
                 let conname = chk
                     .name
                     .clone()
-                    .unwrap_or_else(|| format!("{table_name}_check"));
+                    .unwrap_or_else(|| format!("{table_name_in_schema}_check"));
 
                 let conkey = chk
                     .column
@@ -1868,35 +1870,35 @@ impl SnapshotRows for PgConstraintTable {
 
                 let contype: &'static str = ConstraintKind::Check.into();
                 rows.push(vec![
-                    Value::from_i64(constraint_oid), // oid
-                    Value::build_text(conname),      // conname
-                    Value::from_i64(2200),           // connamespace
-                    Value::build_text(contype),      // contype
-                    Value::from_i64(0),              // condeferrable
-                    Value::from_i64(0),              // condeferred
-                    Value::from_i64(1),              // convalidated
-                    Value::from_i64(table_oid),      // conrelid
-                    Value::from_i64(0),              // contypid
-                    Value::from_i64(0),              // conindid
-                    Value::from_i64(0),              // conparentid
-                    Value::from_i64(0),              // confrelid
-                    Value::Null,                     // confupdtype
-                    Value::Null,                     // confdeltype
-                    Value::Null,                     // confmatchtype
-                    Value::from_i64(1),              // conislocal
-                    Value::from_i64(0),              // coninhcount
-                    Value::from_i64(0),              // connoinherit
+                    Value::from_i64(constraint_oid),          // oid
+                    Value::build_text(conname),               // conname
+                    Value::from_i64(placement.namespace_oid), // connamespace
+                    Value::build_text(contype),               // contype
+                    Value::from_i64(0),                       // condeferrable
+                    Value::from_i64(0),                       // condeferred
+                    Value::from_i64(1),                       // convalidated
+                    Value::from_i64(table_oid),               // conrelid
+                    Value::from_i64(0),                       // contypid
+                    Value::from_i64(0),                       // conindid
+                    Value::from_i64(0),                       // conparentid
+                    Value::from_i64(0),                       // confrelid
+                    Value::Null,                              // confupdtype
+                    Value::Null,                              // confdeltype
+                    Value::Null,                              // confmatchtype
+                    Value::from_i64(1),                       // conislocal
+                    Value::from_i64(0),                       // coninhcount
+                    Value::from_i64(0),                       // connoinherit
                     if conkey.is_empty() {
                         Value::Null
                     } else {
                         Value::build_text(conkey)
                     }, // conkey
-                    Value::Null,                     // confkey
-                    Value::Null,                     // conpfeqop
-                    Value::Null,                     // conppeqop
-                    Value::Null,                     // conffeqop
-                    Value::Null,                     // conexclop
-                    Value::build_text(chk.expr.to_string()), // conbin
+                    Value::Null,                              // confkey
+                    Value::Null,                              // conpfeqop
+                    Value::Null,                              // conppeqop
+                    Value::Null,                              // conffeqop
+                    Value::Null,                              // conexclop
+                    Value::build_text(chk.expr.to_string()),  // conbin
                 ]);
                 constraint_oid += 1;
             }

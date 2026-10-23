@@ -484,3 +484,17 @@ expect {
     1
     5
 }
+
+test catalogs-place-the-constraints-and-indexes-of-a-table-in-its-schema {
+    CREATE SCHEMA app;
+    CREATE TABLE app.t (x int PRIMARY KEY, y int UNIQUE);
+    SELECT conname FROM pg_constraint WHERE conrelid IN (SELECT oid FROM pg_class WHERE relname = 't') ORDER BY 1;
+    SELECT DISTINCT n.nspname FROM pg_constraint k JOIN pg_namespace n ON n.oid = k.connamespace WHERE k.conrelid IN (SELECT oid FROM pg_class WHERE relname = 't');
+    SELECT DISTINCT n.nspname FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace WHERE c.relkind = 'i' AND n.nspname NOT IN ('pg_catalog', 'pg_toast', 'information_schema');
+}
+expect {
+    t_pkey
+    t_y_key
+    app
+    app
+}
