@@ -3,6 +3,7 @@ use crate::translate::plan::SimpleAggregate;
 use crate::translate::{
     aggregation::agg_arg_collation,
     order_by::{custom_type_comparator, EmitOrderBy},
+    planner::determine_where_to_eval_term,
     window::EmitWindow,
 };
 use crate::vdbe::insn::AggStepData;
@@ -616,6 +617,15 @@ pub(super) fn emit_unmatched_row_conditions_and_loop<'a>(
         .filter(|(_, condition)| !condition.consumed && !condition.origin.is_outer_join())
     {
         if prefiltered_terms.contains(&condition_idx) {
+            continue;
+        }
+        let checked_before_the_probe_loop = determine_where_to_eval_term(
+            condition,
+            &plan.join_order,
+            &plan.non_from_clause_subqueries,
+            Some(&plan.table_references),
+        )? < EvalAt::Loop(probe_join_index);
+        if checked_before_the_probe_loop {
             continue;
         }
         if join_type == HashJoinType::LeftAnti
