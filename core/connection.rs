@@ -2708,6 +2708,13 @@ impl Connection {
         }
     }
 
+    /// Check whether a database attached to this connection is read-only.
+    /// Returns `None` when `name` does not identify a database on the connection.
+    pub fn database_is_readonly(&self, name: &str) -> Option<bool> {
+        let index = self.get_database_id_by_name(name).ok()?;
+        Some(self.is_readonly(index))
+    }
+
     /// Reset the page size for the current connection.
     ///
     /// Specifying a new page size does not change the page size immediately.
