@@ -5,6 +5,7 @@ mod domain;
 mod functions;
 mod parse_edge_cases;
 mod sequence;
+mod sql_function;
 mod table;
 mod type_aliases;
 mod update_from;
