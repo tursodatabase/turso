@@ -934,6 +934,39 @@ fn emit_update_column_values<'a>(
                             };
                             program.target_union_type = prev_union;
                             translate_result?;
+                            // Array column reads retain their stored element values.
+                            // Decode the source before the destination's encode pass,
+                            // which may use a different custom element type.
+                            if table_column.is_array() {
+                                if let ast::Expr::Column { table, column, .. } = expr {
+                                    if let Some(source_col) = table_references
+                                        .find_table_by_internal_id(*table)
+                                        .map(|(_, table)| table)
+                                        .and_then(|table| table.get_column_at(*column))
+                                        .filter(|col| {
+                                            col.is_array()
+                                                && t_ctx
+                                                    .resolver
+                                                    .schema()
+                                                    .get_type_def_unchecked(&col.ty_str)
+                                                    .is_some_and(|td| td.decode().is_some())
+                                        })
+                                    {
+                                        let skip = program.allocate_label();
+                                        program.emit_insn(Insn::IsNull {
+                                            reg: target_reg,
+                                            target_pc: skip,
+                                        });
+                                        crate::translate::expr::emit_array_decode(
+                                            program,
+                                            target_reg,
+                                            source_col,
+                                            &t_ctx.resolver,
+                                        )?;
+                                        program.preassign_label_to_next_insn(skip);
+                                    }
+                                }
+                            }
                             if table_column.notnull() && !skip_notnull_checks {
                                 let notnull_conflict = if program.flags.has_statement_conflict() {
                                     or_conflict
