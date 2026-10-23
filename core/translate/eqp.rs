@@ -303,6 +303,10 @@ pub enum EqpDetail {
     RecursiveSetup,
     /// The recursive part of a recursive CTE.
     RecursiveStep,
+    /// A CTE evaluated once into an in-memory table before the main query runs.
+    CteMaterialize {
+        name: String,
+    },
 }
 
 /// Prints the exact string needed for the step in an `EXPLAIN QUERY PLAN`.
@@ -398,6 +402,7 @@ impl Display for EqpDetail {
             }
             Self::RecursiveSetup => write!(f, "SETUP"),
             Self::RecursiveStep => write!(f, "RECURSIVE STEP"),
+            Self::CteMaterialize { name } => write!(f, "MATERIALIZE {name}"),
         }
     }
 }
@@ -488,7 +493,7 @@ pub(crate) fn eqp_detail_for_table_op(
         Operation::Search(search) => {
             let (kind, index, constraints, backwards) = match search {
                 Search::RowidEq { .. } => {
-                    return eqp_detail_for_rowid_search(table, join, subquery)
+                    return eqp_detail_for_rowid_search(table, join, subquery);
                 }
                 Search::Seek { index, seek_def } => (
                     EqpSearchKind::Seek,
@@ -846,6 +851,10 @@ impl EqpDetail {
             }
             Self::RecursiveSetup => obj.str("type", "recursive_setup"),
             Self::RecursiveStep => obj.str("type", "recursive_step"),
+            Self::CteMaterialize { name } => {
+                obj.str("type", "cte_materialize");
+                obj.str("name", name);
+            }
         }
         obj.finish();
     }

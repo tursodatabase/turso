@@ -21,7 +21,8 @@ info:
   database: ':memory:'
 ---
 QUERY PLAN
-|--SCAN products USING COVERING INDEX idx_products_price
+|--MATERIALIZE prices
+|  `--SCAN products USING COVERING INDEX idx_products_price
 |--SCAN prices AS p1
 `--CORRELATED SCALAR SUBQUERY 1
    `--SCAN prices AS p2
