@@ -2,6 +2,7 @@ use crate::alloc::TryClone;
 use crate::error::io_error;
 #[cfg(any(test, injected_yields))]
 use crate::mvcc::yield_points::{FailureInjector, YieldInjector};
+use crate::settings::{ConnectionSettings, SettingScope, SettingValues};
 use crate::state_machine::StateMachine;
 use crate::statement::StatementOrigin;
 use crate::storage::{checksum::CHECKSUM_REQUIRED_RESERVED_BYTES, pager::SavepointResult};
@@ -161,6 +162,7 @@ pub(crate) struct NamedSavepointFrame {
     /// SAVEPOINT begin. Cheap — values are `Arc`. Used by ROLLBACK TO
     /// to restore staged DDL on attached databases.
     pub(crate) staged_schema_snapshot: HashMap<usize, Arc<Schema>>,
+    pub(crate) settings: SettingValues,
 }
 
 /// Info returned by `rollback_named_savepoint_frame` so callers can
@@ -169,6 +171,7 @@ pub(crate) struct RollbackFrameInfo {
     pub(crate) main_schema_snapshot: Arc<Schema>,
     pub(crate) temp_schema_snapshot: Option<Arc<Schema>>,
     pub(crate) staged_schema_snapshot: HashMap<usize, Arc<Schema>>,
+    pub(crate) settings: SettingValues,
 }
 
 struct SchemaReparseGuard {
@@ -409,8 +412,9 @@ pub struct Connection {
     /// database.
     pub(super) namespaces: crate::Namespaces,
     /// The namespace names that a name without a namespace is looked up
-    /// through, in order. None means main, then the other databases by id.
-    pub(super) search_path: RwLock<Option<Vec<String>>>,
+    /// through, in order, and the other settings of the connection.
+    pub(super) settings: RwLock<ConnectionSettings>,
+    pub(super) settings_have_changes_to_end: AtomicBool,
     /// Set before the first temp or attached database is installed and
     /// never cleared, so the statement paths that visit the non-main pagers
     /// can skip the catalog locks while no such pager can exist.
@@ -3336,14 +3340,14 @@ impl Connection {
     /// databases by id. Names that do not exist are skipped when a name is
     /// looked up. Prepared statements compile again with the new search
     /// path when they next run.
-    pub fn set_search_path(&self, search_path: Option<Vec<String>>) {
-        *self.search_path.write() = search_path;
+    pub fn set_search_path(&self, search_path: Option<Vec<String>>, scope: SettingScope) {
+        self.change_settings(|settings| settings.set_search_path(search_path, scope));
         self.bump_prepare_context_generation();
     }
 
     /// The search path set with [`Connection::set_search_path`].
     pub fn search_path(&self) -> Option<Vec<String>> {
-        self.search_path.read().clone()
+        self.settings.read().search_path().map(<[String]>::to_vec)
     }
 
     /// The databases that a name without a namespace is looked up in, in
@@ -3351,7 +3355,65 @@ impl Connection {
     /// no namespace.
     pub fn search_order(&self) -> Vec<usize> {
         self.namespaces
-            .search_order(self.search_path.read().as_deref())
+            .search_order(self.settings.read().search_path())
+    }
+
+    pub fn set_setting(&self, name: &str, value: Option<String>, scope: SettingScope) {
+        self.change_settings(|settings| settings.set(name, value, scope));
+    }
+
+    pub fn setting(&self, name: &str) -> Option<String> {
+        self.settings.read().get(name).map(str::to_owned)
+    }
+
+    pub fn has_setting(&self, name: &str) -> bool {
+        self.settings.read().contains(name)
+    }
+
+    fn change_settings(&self, change: impl FnOnce(&mut ConnectionSettings)) {
+        let statement_running = self.n_active_root_statements.load(Ordering::SeqCst) > 0;
+        let in_transaction = !self.get_auto_commit();
+        let mut settings = self.settings.write();
+        settings.save_values_before_change(statement_running, in_transaction);
+        change(&mut settings);
+        self.settings_have_changes_to_end
+            .store(settings.has_changes_to_end(), Ordering::SeqCst);
+    }
+
+    pub(crate) fn end_statement_settings(&self, statement_failed: bool) {
+        if !self.settings_have_changes_to_end.load(Ordering::SeqCst) {
+            return;
+        }
+        let transaction_ended = self.get_auto_commit();
+        self.update_settings(|settings| {
+            settings.end_statement(statement_failed, transaction_ended)
+        });
+    }
+
+    pub(crate) fn rollback_settings(&self) {
+        if !self.settings_have_changes_to_end.load(Ordering::SeqCst) {
+            return;
+        }
+        self.update_settings(ConnectionSettings::rollback_transaction);
+    }
+
+    pub(crate) fn setting_values(&self) -> SettingValues {
+        self.settings.read().values().clone()
+    }
+
+    pub(crate) fn rollback_settings_to_savepoint(&self, saved: SettingValues) {
+        self.update_settings(|settings| settings.rollback_to_savepoint(saved));
+    }
+
+    fn update_settings(&self, update: impl FnOnce(&mut ConnectionSettings) -> bool) {
+        let mut settings = self.settings.write();
+        let search_path_changed = update(&mut settings);
+        self.settings_have_changes_to_end
+            .store(settings.has_changes_to_end(), Ordering::SeqCst);
+        drop(settings);
+        if search_path_changed {
+            self.bump_prepare_context_generation();
+        }
     }
 
     /// Access schema for a database using a closure pattern to avoid cloning
@@ -4701,6 +4763,7 @@ impl Connection {
             main_schema_snapshot: frame.main_schema_snapshot.clone(),
             temp_schema_snapshot: frame.temp_schema_snapshot.clone(),
             staged_schema_snapshot: frame.staged_schema_snapshot.clone(),
+            settings: frame.settings.clone(),
         };
         // ROLLBACK TO keeps the target savepoint itself on the stack;
         // only nested savepoints above it are discarded.
@@ -5225,27 +5288,68 @@ mod tests {
             .unwrap();
         assert_eq!(query_single_i64(&conn, "SELECT x FROM t"), 5);
 
-        conn.set_search_path(Some(vec!["main".to_string()]));
+        conn.set_search_path(Some(vec!["main".to_string()]), SettingScope::Session);
         assert!(conn.prepare("SELECT x FROM t").is_err());
         conn.execute("DROP TABLE IF EXISTS t").unwrap();
         assert_eq!(query_single_i64(&conn, "SELECT x FROM aux.t"), 5);
 
-        conn.set_search_path(Some(vec!["missing".to_string(), "aux".to_string()]));
+        conn.set_search_path(
+            Some(vec!["missing".to_string(), "aux".to_string()]),
+            SettingScope::Session,
+        );
         assert_eq!(query_single_i64(&conn, "SELECT x FROM t"), 5);
         conn.execute("CREATE TABLE u(y INTEGER)").unwrap();
         assert_eq!(query_single_i64(&conn, "SELECT count(*) FROM aux.u"), 0);
 
-        conn.set_search_path(Some(vec!["missing".to_string()]));
+        conn.set_search_path(Some(vec!["missing".to_string()]), SettingScope::Session);
         let Err(LimboError::ParseError(message)) = conn.execute("CREATE TABLE v(z INTEGER)") else {
             panic!("CREATE without a namespace needs a database in the search path");
         };
         assert_eq!(message, "no schema has been selected to create in");
         conn.execute("DROP TABLE IF EXISTS t").unwrap();
 
-        conn.set_search_path(None);
+        conn.set_search_path(None, SettingScope::Session);
         assert_eq!(query_single_i64(&conn, "SELECT x FROM t"), 5);
         conn.execute("CREATE TABLE v(z INTEGER)").unwrap();
         assert_eq!(query_single_i64(&conn, "SELECT count(*) FROM main.v"), 0);
+    }
+
+    #[test]
+    fn test_search_path_follows_rollback_and_the_end_of_a_transaction() {
+        let temp_dir = TempDir::new().unwrap();
+        let main_path = temp_dir.path().join("main.db");
+        let conn = open_connection_with_opts(&main_path, DatabaseOpts::new().with_attach(true));
+        conn.execute("ATTACH ':memory:aux' AS aux").unwrap();
+        conn.execute("CREATE TABLE t(x INTEGER); INSERT INTO t VALUES(1)")
+            .unwrap();
+        conn.execute("CREATE TABLE aux.t(x INTEGER); INSERT INTO aux.t VALUES(2)")
+            .unwrap();
+        let aux = Some(vec!["aux".to_string()]);
+
+        conn.execute("BEGIN").unwrap();
+        conn.set_search_path(aux.clone(), SettingScope::Session);
+        assert_eq!(query_single_i64(&conn, "SELECT x FROM t"), 2);
+        conn.execute("ROLLBACK").unwrap();
+        assert_eq!(conn.search_path(), None);
+        assert_eq!(query_single_i64(&conn, "SELECT x FROM t"), 1);
+
+        conn.execute("BEGIN").unwrap();
+        conn.set_search_path(aux.clone(), SettingScope::Transaction);
+        let mut prepared_in_transaction = conn.prepare("SELECT x FROM t").unwrap();
+        assert_eq!(query_single_i64(&conn, "SELECT x FROM t"), 2);
+        conn.execute("COMMIT").unwrap();
+        assert_eq!(conn.search_path(), None);
+        let rows = prepared_in_transaction.run_collect_rows().unwrap();
+        assert_eq!(rows, vec![vec![Value::from_i64(1)]]);
+
+        conn.set_search_path(aux, SettingScope::Session);
+        conn.execute("BEGIN").unwrap();
+        conn.execute("SAVEPOINT s").unwrap();
+        conn.set_search_path(None, SettingScope::Transaction);
+        assert_eq!(query_single_i64(&conn, "SELECT x FROM t"), 1);
+        conn.execute("ROLLBACK TO SAVEPOINT s").unwrap();
+        assert_eq!(query_single_i64(&conn, "SELECT x FROM t"), 2);
+        conn.execute("COMMIT").unwrap();
     }
 
     #[test]

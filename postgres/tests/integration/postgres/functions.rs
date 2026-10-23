@@ -260,6 +260,50 @@ fn test_pg_current_setting_reports_default_without_session_state(db: TempDatabas
 }
 
 #[turso_macros::test(mvcc)]
+fn test_pg_failed_statement_undoes_its_setting_changes(db: TempDatabase) {
+    let conn = db.connect_postgres();
+    conn.execute("CREATE TABLE unique_values (v TEXT PRIMARY KEY)")
+        .unwrap();
+    conn.execute("INSERT INTO unique_values VALUES ('missing')")
+        .unwrap();
+    let failing_change =
+        "INSERT INTO unique_values VALUES (set_config('search_path', 'missing', false))";
+    assert!(conn.execute(failing_change).is_err());
+    assert_eq!(
+        query_text(&conn, "SELECT current_setting('search_path')"),
+        ["\"$user\", public"]
+    );
+
+    conn.execute("BEGIN").unwrap();
+    conn.execute("SELECT set_config('search_path', 'public', false)")
+        .unwrap();
+    assert!(conn.execute(failing_change).is_err());
+    assert_eq!(
+        query_text(&conn, "SELECT current_setting('search_path')"),
+        ["public"]
+    );
+    conn.execute("COMMIT").unwrap();
+    assert_eq!(
+        query_text(&conn, "SELECT current_setting('search_path')"),
+        ["public"]
+    );
+}
+
+#[turso_macros::test(mvcc)]
+fn test_pg_setting_change_stays_when_its_statement_is_reset_after_a_row(db: TempDatabase) {
+    let conn = db.connect_postgres();
+    let mut stmt = conn
+        .prepare("SELECT set_config('search_path', 'public', false)")
+        .unwrap();
+    assert!(matches!(stmt.step().unwrap(), StepResult::Row));
+    stmt.reset().unwrap();
+    assert_eq!(
+        query_text(&conn, "SELECT current_setting('search_path')"),
+        ["public"]
+    );
+}
+
+#[turso_macros::test(mvcc)]
 fn test_pg_is_in_recovery_returns_temporary_true_text(db: TempDatabase) {
     let conn = db.connect_postgres();
     assert_eq!(

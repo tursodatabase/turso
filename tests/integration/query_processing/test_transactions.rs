@@ -2,7 +2,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use tempfile::TempDir;
-use turso_core::{Connection, LimboError, Result, Statement, StepResult, Value};
+use turso_core::{Connection, LimboError, Result, SettingScope, Statement, StepResult, Value};
 
 use crate::common::{assert_checkpoint_preserves_content, ExecRows, TempDatabase};
 
@@ -2415,4 +2415,70 @@ fn test_begin_immediate_lazily_created_temp_follows_transaction(tmp_db: TempData
     conn.execute("ROLLBACK").unwrap();
     let rows: Vec<(i64,)> = conn.exec_rows("SELECT x FROM tt");
     assert_eq!(rows, vec![(1,)]);
+}
+
+#[turso_macros::test(mvcc)]
+fn test_rollback_undoes_the_setting_changes_of_the_transaction(tmp_db: TempDatabase) {
+    let conn = tmp_db.connect_limbo();
+    set_text_setting(&conn, "app.mode", "before", SettingScope::Session);
+
+    conn.execute("BEGIN").unwrap();
+    set_text_setting(&conn, "app.mode", "changed", SettingScope::Session);
+    set_text_setting(&conn, "app.created", "new", SettingScope::Session);
+    conn.execute("SELECT 1").unwrap();
+    assert_eq!(conn.setting("app.mode").as_deref(), Some("changed"));
+    conn.execute("ROLLBACK").unwrap();
+    assert_eq!(conn.setting("app.mode").as_deref(), Some("before"));
+    assert!(conn.has_setting("app.created"));
+    assert_eq!(conn.setting("app.created"), None);
+
+    conn.execute("BEGIN").unwrap();
+    set_text_setting(&conn, "app.mode", "committed", SettingScope::Session);
+    conn.execute("COMMIT").unwrap();
+    assert_eq!(conn.setting("app.mode").as_deref(), Some("committed"));
+    assert!(!conn.has_setting("app.unknown"));
+}
+
+#[turso_macros::test(mvcc)]
+fn test_transaction_setting_ends_with_the_transaction(tmp_db: TempDatabase) {
+    let conn = tmp_db.connect_limbo();
+    set_text_setting(&conn, "app.mode", "session", SettingScope::Session);
+    for end in ["COMMIT", "ROLLBACK"] {
+        conn.execute("BEGIN").unwrap();
+        set_text_setting(&conn, "app.mode", "local", SettingScope::Transaction);
+        conn.execute("SELECT 1").unwrap();
+        assert_eq!(conn.setting("app.mode").as_deref(), Some("local"));
+        conn.execute(end).unwrap();
+        assert_eq!(conn.setting("app.mode").as_deref(), Some("session"));
+    }
+}
+
+#[turso_macros::test(mvcc)]
+fn test_rollback_to_savepoint_undoes_the_setting_changes_after_the_savepoint(tmp_db: TempDatabase) {
+    let conn = tmp_db.connect_limbo();
+    conn.execute("BEGIN").unwrap();
+    set_text_setting(&conn, "app.mode", "before savepoint", SettingScope::Session);
+    conn.execute("SAVEPOINT s").unwrap();
+    set_text_setting(&conn, "app.mode", "after savepoint", SettingScope::Session);
+    set_text_setting(&conn, "app.local", "local", SettingScope::Transaction);
+    conn.execute("ROLLBACK TO SAVEPOINT s").unwrap();
+    assert_eq!(
+        conn.setting("app.mode").as_deref(),
+        Some("before savepoint")
+    );
+    assert_eq!(conn.setting("app.local"), None);
+
+    set_text_setting(&conn, "app.local", "released", SettingScope::Transaction);
+    conn.execute("RELEASE SAVEPOINT s").unwrap();
+    assert_eq!(conn.setting("app.local").as_deref(), Some("released"));
+    conn.execute("COMMIT").unwrap();
+    assert_eq!(
+        conn.setting("app.mode").as_deref(),
+        Some("before savepoint")
+    );
+    assert_eq!(conn.setting("app.local"), None);
+}
+
+fn set_text_setting(conn: &Arc<Connection>, name: &str, value: &str, scope: SettingScope) {
+    conn.set_setting(name, Some(value.to_string()), scope);
 }

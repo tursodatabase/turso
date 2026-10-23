@@ -3,6 +3,7 @@
 //! keeps a single `Database` per file, and the per-connection catalog of
 //! attached databases.
 
+use crate::settings::ConnectionSettings;
 use crate::types::IOResultOr;
 use crate::util::IOExt;
 #[cfg(feature = "io_memory_yield")]
@@ -2641,7 +2642,8 @@ impl Database {
             temp: crate::connection::TempDbContext::new(),
             attached_databases: RwLock::new(DatabaseCatalog::new()),
             namespaces: crate::Namespaces::default(),
-            search_path: RwLock::new(None),
+            settings: RwLock::new(ConnectionSettings::default()),
+            settings_have_changes_to_end: AtomicBool::new(false),
             has_non_main_pagers: AtomicBool::new(false),
             query_only: AtomicBool::new(false),
             vdbe_trace: AtomicBool::new(false),
