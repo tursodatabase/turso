@@ -1,0 +1,64 @@
+# Matrix cases for scalar expressions, NULL handling, aggregates and ORDER BY.
+#
+# Matrix cases have no expected output: with --postgres-dsn, every expansion
+# runs on tursopg and on a real PostgreSQL server, and both must return the
+# same rows or both must fail. Comparisons are wrapped in CASE so the result
+# is text: tursopg sends booleans as 0/1 (#9202).
+
+@database :memory:
+
+@var a { 7 | -8 | 0 | NULL::int4 }
+@var b { 2 | -3 | NULL::int4 }
+matrix integer-arithmetic {
+    SELECT $a + $b, $a - $b, $a * $b, $a / $b, $a % $b, -($a), abs($a);
+}
+
+@var a { 1 | 2 | NULL::int4 }
+@var b { 1 | 2 | NULL::int4 }
+matrix integer-comparison {
+    SELECT
+        CASE WHEN $a < $b THEN 'lt' WHEN $a = $b THEN 'eq' WHEN $a > $b THEN 'gt' ELSE 'unknown' END,
+        CASE WHEN $a <> $b THEN 'ne' WHEN NOT ($a <> $b) THEN 'not-ne' ELSE 'unknown' END,
+        CASE WHEN $a IS DISTINCT FROM $b THEN 'distinct' ELSE 'not-distinct' END;
+}
+
+@var s { 'abc' | 'Hello World' | '' | NULL::text | '  padded  ' }
+matrix text-functions {
+    SELECT upper($s), lower($s), length($s), reverse($s), btrim($s), ltrim($s), rtrim($s),
+        $s || '!', concat($s, '?'), substr($s, 2, 3), replace($s, 'l', 'L'), position('l' IN $s);
+}
+
+@var s { 'abc' | 'ABCD' | 'xaby' | NULL::text }
+@var p { 'a%' | '%B%' | '_bc' | 'abc' }
+matrix like {
+    SELECT
+        CASE WHEN $s LIKE $p THEN 'yes' WHEN NOT ($s LIKE $p) THEN 'no' ELSE 'unknown' END,
+        CASE WHEN $s ILIKE $p THEN 'yes' WHEN NOT ($s ILIKE $p) THEN 'no' ELSE 'unknown' END;
+}
+
+@var a { 1 | NULL::int4 }
+@var b { 2 | NULL::int4 }
+@var c { 3 | NULL::int4 }
+matrix null-handling {
+    SELECT coalesce($a, $b, $c), nullif($a, $b), nullif($a, 1),
+        CASE WHEN $a IS NULL THEN $b ELSE $c END;
+}
+
+setup numbers {
+    CREATE TABLE numbers(g int4, x int4);
+    INSERT INTO numbers VALUES (1, 10), (1, 20), (2, 5), (2, NULL), (3, NULL);
+}
+
+@setup numbers
+@var agg { count | sum | min | max }
+@var arg { x | DISTINCT x }
+matrix aggregates {
+    SELECT g, $agg($arg) FROM numbers GROUP BY g ORDER BY g;
+}
+
+@setup numbers
+@var dir { ASC | DESC }
+@var nulls { NULLS FIRST | NULLS LAST | }
+matrix order-by-nulls {
+    SELECT x FROM numbers ORDER BY x $dir $nulls;
+}

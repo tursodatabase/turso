@@ -16,7 +16,10 @@ Three things keep that work honest:
 - **[`conformance/pg-sqltests/`](conformance/pg-sqltests/)** — `.sqltest` tests
   that CI runs against the front-end and against a real PostgreSQL server
   (`make -C postgres/conformance run-postgres`). Tests of Turso-specific
-  behavior have `@skip-if postgres "reason"`.
+  behavior have `@skip-if postgres "reason"`. Matrix cases in these files have
+  no expected output: `make -C postgres/conformance run-matrix` runs every
+  expansion on the front-end and on a real PostgreSQL server and compares
+  the results.
 
 ## Verification workflow
 

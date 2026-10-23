@@ -1,6 +1,6 @@
 use crate::backends::{BackendError, QueryResult, SqlBackend};
 use crate::comparison::{ComparisonResult, compare};
-use crate::matrix_oracle::{OracleOutcome, run_oracle};
+use crate::matrix_oracle::{MatrixOracle, OracleOutcome, run_oracle};
 use crate::parser::ast::{
     Backend, Capability, CaseModifiers, DatabaseConfig, DatabaseLocation, Expectation, Requirement,
     SetupRef, Skip, SkipCondition, SnapshotCase, TestCase, TestFile,
@@ -258,14 +258,15 @@ impl Runnable for SnapshotCase {
 }
 
 /// One expansion of a `matrix` block. Runs like a test whose expectation is
-/// produced at run time by the bundled-SQLite oracle: Turso and SQLite must
-/// return the same rows in the same order, or both must reject the
-/// statement.
+/// produced at run time by the oracle: Turso and the oracle must return the
+/// same rows in the same order, or both must reject the statement.
 #[derive(Clone)]
 struct MatrixRunCase {
     name: String,
     sql: String,
     modifiers: CaseModifiers,
+    /// `None` when the backend needs an oracle that the run did not get.
+    oracle: Option<MatrixOracle>,
 }
 
 #[async_trait]
@@ -283,6 +284,9 @@ impl Runnable for MatrixRunCase {
     }
 
     fn check_skip_conditions(&self, options: &RunOptions) -> Option<String> {
+        if self.oracle.is_none() {
+            return Some("matrix cases on tursopg need --postgres-dsn".to_string());
+        }
         for req in options
             .global_requires
             .iter()
@@ -307,37 +311,43 @@ impl Runnable for MatrixRunCase {
         assert!(results.len() == 1);
         let turso = results.first().unwrap();
 
-        // Run the same setups + statement against the bundled SQLite. The
-        // setup names were validated at parse time, so lookups can't miss.
+        // Run the same setups + statement against the oracle. The setup
+        // names were validated at parse time, so lookups can't miss.
+        let oracle = self
+            .oracle
+            .as_ref()
+            .expect("matrix cases without an oracle are skipped");
         let setups: Vec<String> = self
             .modifiers
             .setups
             .iter()
             .map(|s| options.setups[&s.name].clone())
             .collect();
-        let oracle = match run_oracle(&setups, &self.sql) {
+        let outcome = match oracle.run(&options.db_config, &setups, &self.sql).await {
             Ok(outcome) => outcome,
             Err(message) => return TestOutcome::Error { message },
         };
+        let oracle_name = oracle.name();
+        let oracle_label = oracle_name.to_lowercase();
 
-        match (turso.error.as_ref(), oracle) {
+        match (turso.error.as_ref(), outcome) {
             (Some(_), OracleOutcome::Error(_)) => TestOutcome::Passed,
             (Some(turso_err), OracleOutcome::Rows(rows)) => TestOutcome::Failed {
                 reason: format!(
-                    "Turso errored but SQLite returned {} row(s):\n  turso error: {}",
+                    "Turso errored but {oracle_name} returned {} row(s):\n  turso error: {}",
                     rows.len(),
                     turso_err
                 ),
             },
-            (None, OracleOutcome::Error(sqlite_err)) => TestOutcome::Failed {
+            (None, OracleOutcome::Error(oracle_err)) => TestOutcome::Failed {
                 reason: format!(
-                    "SQLite errored but Turso returned {} row(s):\n  sqlite error: {}",
+                    "{oracle_name} errored but Turso returned {} row(s):\n  {oracle_label} error: {}",
                     turso.rows.len(),
-                    sqlite_err
+                    oracle_err
                 ),
             },
-            (None, OracleOutcome::Rows(sqlite_rows)) => {
-                if turso.rows == sqlite_rows {
+            (None, OracleOutcome::Rows(oracle_rows)) => {
+                if turso.rows == oracle_rows {
                     return TestOutcome::Passed;
                 }
                 let join = |rows: &[Vec<String>]| {
@@ -346,10 +356,10 @@ impl Runnable for MatrixRunCase {
                         .collect::<Vec<_>>()
                         .join("\n")
                 };
-                let sqlite_str = join(&sqlite_rows);
+                let oracle_str = join(&oracle_rows);
                 let turso_str = join(&turso.rows);
-                let diff = similar::TextDiff::from_lines(&sqlite_str, &turso_str);
-                let mut reason = String::from("--- sqlite (oracle)\n+++ turso\n");
+                let diff = similar::TextDiff::from_lines(&oracle_str, &turso_str);
+                let mut reason = format!("--- {oracle_label} (oracle)\n+++ turso\n");
                 for change in diff.iter_all_changes() {
                     let sign = match change.tag() {
                         similar::ChangeTag::Delete => "-",
@@ -900,6 +910,9 @@ pub struct RunnerConfig {
     /// Path to binary for cross-checking integrity (None = disabled).
     /// Used by tests annotated with `@cross-check-integrity`.
     pub cross_check_binary: Option<PathBuf>,
+    /// Oracle for matrix cases on the tursopg backend. Without it they are
+    /// skipped. The Rust backend always uses the bundled SQLite.
+    pub tursopg_matrix_oracle: Option<MatrixOracle>,
 }
 
 impl Default for RunnerConfig {
@@ -911,6 +924,7 @@ impl Default for RunnerConfig {
             snapshot_update_mode: SnapshotUpdateMode::Auto,
             snapshot_filter: None,
             cross_check_binary: None,
+            tursopg_matrix_oracle: None,
         }
     }
 }
@@ -943,6 +957,11 @@ impl RunnerConfig {
 
     pub fn with_cross_check_binary(mut self, binary: PathBuf) -> Self {
         self.cross_check_binary = Some(binary);
+        self
+    }
+
+    pub fn with_tursopg_matrix_oracle(mut self, oracle: MatrixOracle) -> Self {
+        self.tursopg_matrix_oracle = Some(oracle);
         self
     }
 }
@@ -1109,8 +1128,9 @@ impl<B: SqlBackend + 'static> TestRunner<B> {
     }
 
     /// Spawn all matrix expansions for a parsed file, returning futures.
-    /// Matrix cases run only on the Rust backend: the oracle comparison
-    /// renders both engines' values through that backend's formatting.
+    /// Matrix cases run on the Rust backend against the bundled SQLite, and
+    /// on the tursopg backend against PostgreSQL: in both pairs the two
+    /// engines' values reach the comparison through the same formatting.
     fn spawn_matrix_tests(
         &self,
         path: &Path,
@@ -1118,9 +1138,11 @@ impl<B: SqlBackend + 'static> TestRunner<B> {
     ) -> FuturesUnordered<tokio::task::JoinHandle<TestResult>> {
         let futures = FuturesUnordered::new();
         let backend_type = self.backend.backend_type();
-        if backend_type != Backend::Rust {
-            return futures;
-        }
+        let oracle = match backend_type {
+            Backend::Rust => Some(MatrixOracle::Sqlite),
+            Backend::Tursopg => self.config.tursopg_matrix_oracle.clone(),
+            Backend::Cli | Backend::Js | Backend::Postgres => return futures,
+        };
         let backend_capabilities = self.backend.capabilities();
 
         // Like snapshots, matrices use the first database configuration.
@@ -1139,6 +1161,7 @@ impl<B: SqlBackend + 'static> TestRunner<B> {
                         name: expansion.name,
                         sql: expansion.sql,
                         modifiers: matrix.modifiers.clone(),
+                        oracle: oracle.clone(),
                     };
 
                     let options = RunOptions {
@@ -1533,6 +1556,42 @@ expect {
                     result.outcome
                 ),
             }
+        }
+    }
+
+    #[tokio::test]
+    async fn matrix_cases_on_tursopg_are_skipped_without_a_postgres_oracle() {
+        let file = crate::parser::parse(
+            r#"
+@database :memory:
+
+@var v { 1 | 2 }
+matrix select-value {
+    SELECT $v;
+}
+"#,
+        )
+        .unwrap();
+        let runner = TestRunner::new(OneRowBackend {
+            backend_type: Backend::Tursopg,
+        });
+
+        let result = runner
+            .run_file(Path::new("matrix.sqltest"), &file)
+            .await
+            .unwrap();
+
+        assert_eq!(result.results.len(), 2);
+        for test in &result.results {
+            assert!(
+                matches!(
+                    &test.outcome,
+                    TestOutcome::Skipped { reason } if reason == "matrix cases on tursopg need --postgres-dsn"
+                ),
+                "{}: {:?}",
+                test.name,
+                test.outcome
+            );
         }
     }
 

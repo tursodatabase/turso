@@ -36,7 +36,7 @@ sqltest run <PATHS>... [OPTIONS]
 | `--jobs <N>` | `-j` | CPU count | Maximum concurrent test jobs |
 | `--output <FORMAT>` | `-o` | `pretty` | Output format: `pretty` or `json` |
 | `--timeout <SECS>` | | `30` | Timeout per query in seconds |
-| `--postgres-dsn <URL>` | | | With `--backend postgres`: the URL of the PostgreSQL server, for example `postgres://sqltest@127.0.0.1:5432/postgres` |
+| `--postgres-dsn <URL>` | | | The URL of a PostgreSQL server, for example `postgres://sqltest@127.0.0.1:5432/postgres`. With `--backend postgres`, the tests run on this server. With `--backend tursopg`, [matrix cases](dsl-spec.md#matrix-cases) are checked against this server. |
 
 #### Backends
 
