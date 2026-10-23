@@ -2968,16 +2968,15 @@ fn open_hir_compound_index(
         )));
     }
     let mut columns = crate::alloc::vec![];
-    for (position, (left, right)) in left.outputs.iter().zip(&right.outputs).enumerate() {
+    for (position, left) in left.outputs.iter().enumerate() {
         columns.push(IndexColumn {
             name: left.name.clone(),
             order: SortOrder::Asc,
             nulls_order: None,
             pos_in_table: position,
-            collation: left
-                .collation
-                .as_ref()
-                .or(right.collation.as_ref())
+            collation: query.blocks[..=right_block]
+                .iter()
+                .find_map(|block| block.outputs[position].collation.as_ref())
                 .map(|collation| *collation.value()),
             default: None,
             expr: None,

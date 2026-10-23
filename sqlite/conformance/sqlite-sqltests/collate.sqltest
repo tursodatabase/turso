@@ -1704,3 +1704,16 @@ test compound-chain-leftmost-collation {
 expect {
     0
 }
+
+test compound-chain-intersect-uses-first-arm-collation {
+    CREATE TABLE first_arm(x TEXT COLLATE NOCASE);
+    CREATE TABLE second_arm(y TEXT);
+    CREATE TABLE third_arm(z TEXT);
+    INSERT INTO first_arm VALUES ('b');
+    INSERT INTO second_arm VALUES ('q');
+    INSERT INTO third_arm VALUES ('B');
+    SELECT x FROM first_arm EXCEPT SELECT y FROM second_arm INTERSECT SELECT z FROM third_arm;
+}
+expect {
+    b
+}
