@@ -4,7 +4,8 @@ name: Nightly cfg
 # crate::alloc aliases become real allocator-parametric collections
 # (Vec<T, TursoAllocator>) instead of std type aliases. Stable builds
 # cannot catch mixups between std and allocator collections because the
-# types are identical there.
+# types are identical there. Also checks the FTS build on a recent nightly
+# so changes to compiler intrinsics used by dependencies are covered.
 
 on:
   workflow_dispatch:
@@ -42,3 +43,8 @@ jobs:
         # The explicit toolchain bypasses the rust-toolchain.toml stable pin.
         # --all-targets so cfg(test) code is covered too.
         run: cargo +nightly-2025-12-17 check -p turso_core --all-targets --locked
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: nightly-2026-10-20
+      - name: Check FTS with recent nightly
+        run: cargo +nightly-2026-10-20 check --locked -p turso_core --features fts --lib
