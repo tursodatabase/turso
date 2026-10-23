@@ -645,6 +645,14 @@ fn prepare_one_select_plan(
 
             plan.aggregates = aggregate_expressions;
 
+            for aggregate in &plan.aggregates {
+                for input in aggregate.input_exprs() {
+                    if let Some(name) = first_aggregate_without_over_clause(input, resolver)? {
+                        crate::bail_parse_error!("misuse of aggregate function {}()", name);
+                    }
+                }
+            }
+
             // An aggregate whose argument columns belong to the enclosing query
             // is computed by that query, not by this subquery (SQLite binds an
             // aggregate to the nearest query that supplies a referenced column).
