@@ -604,6 +604,8 @@ impl Scope {
     }
 
     pub(crate) fn set_outputs(&mut self, outputs: &[hir::Output]) {
+        #[cfg(test)]
+        tests::OUTPUT_LISTS_SET.with(|set| set.set(set.get() + 1));
         self.outputs = outputs
             .iter()
             .map(|output| ScopeOutput {
@@ -1436,6 +1438,8 @@ pub(crate) mod tests {
         pub(crate) static SOURCES_ADDED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
         /// How many column bindings were copied on this thread.
         pub(crate) static COLUMN_BINDINGS_COPIED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+        /// How many times a scope was given a block's outputs on this thread.
+        pub(crate) static OUTPUT_LISTS_SET: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     }
 
     use super::*;

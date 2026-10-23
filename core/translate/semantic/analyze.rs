@@ -874,7 +874,8 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
 
         let query_id = self.reserve_query();
         let mut blocks = Vec::with_capacity(compounds.len() + 1);
-        let ordinary_order_by = compounds.is_empty().then_some(order_by_syntax);
+        let ordinary_order_by =
+            (compounds.is_empty() && !order_by_syntax.is_empty()).then_some(order_by_syntax);
         let (first_block, mut order_by, first_scope) = self.analyze_select_block(
             first_select,
             query_id,
@@ -2703,6 +2704,28 @@ mod tests {
             .with(|copied| copied.get());
 
         assert_eq!(copied, 0);
+    }
+
+    #[test]
+    fn select_without_order_by_gives_its_outputs_to_one_clause_scope() {
+        let mut schema = Schema::new();
+        let table = BTreeTable::from_sql("CREATE TABLE t(id INTEGER PRIMARY KEY, a INTEGER)", 2)
+            .expect("table schema parses");
+        schema
+            .add_btree_table(Arc::new(table))
+            .expect("table name is unique");
+        let output_lists_set = |sql: &str| {
+            crate::translate::semantic::scope::tests::OUTPUT_LISTS_SET.with(|set| set.set(0));
+            analyze_sql_with_schema(&schema, sql).expect("SELECT analyzes");
+            crate::translate::semantic::scope::tests::OUTPUT_LISTS_SET.with(|set| set.get())
+        };
+
+        // The WHERE clause can name an output alias.
+        assert_eq!(output_lists_set("SELECT * FROM t WHERE id = 1"), 1);
+        assert_eq!(
+            output_lists_set("SELECT * FROM t WHERE id = 1 ORDER BY a"),
+            2
+        );
     }
 
     fn schema_with_custom_columns() -> Schema {
