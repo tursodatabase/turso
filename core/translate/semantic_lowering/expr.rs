@@ -5140,7 +5140,8 @@ pub(crate) fn translate_schema_calls_on_elements(
         value: 0,
         dest: offset,
     });
-    let next = program.offset();
+    let next = program.allocate_label();
+    program.preassign_label_to_next_insn(next);
     let done = program.allocate_label();
     program.emit_insn(Insn::Gt {
         lhs: index,
