@@ -128,10 +128,10 @@ jobs:
 
     steps:
       - name: Checkout code
-        uses: actions/checkout@v6
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
 
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
         with:
           targets: ${{ matrix.target }}
       
@@ -143,7 +143,7 @@ jobs:
         uses: "./.github/shared/setup-msvc"
 
       - name: Rust cache
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           prefix-key: "v1-rust-dotnet-publish"
           cache-on-failure: true
@@ -151,7 +151,7 @@ jobs:
 
       - name: Set up Android SDK
         if: contains(matrix.target, 'linux-android')
-        uses: android-actions/setup-android@v4
+        uses: android-actions/setup-android@be39fa834029ff78f1a44aa3bb0819b8fc2bd8fd # v4.0.4
         with:
           packages: ''
 
@@ -262,7 +262,7 @@ jobs:
       # the native build job rather than in the Linux pack/publish job.
       - name: Azure login (OIDC) for code signing
         if: ${{ contains(matrix.target, 'pc-windows-msvc') && vars.AZURE_SIGNING_ENABLED == 'true' && (github.ref == 'refs/heads/main' || github.event_name == 'workflow_dispatch') }}
-        uses: azure/login@v2
+        uses: azure/login@7184910d9eb2b1c5e48f7073824a90609bb9b6d6 # v2.3.1
         with:
           client-id: ${{ secrets.AZURE_CLIENT_ID }}
           tenant-id: ${{ secrets.AZURE_TENANT_ID }}
@@ -270,7 +270,7 @@ jobs:
 
       - name: Code sign Windows native library
         if: ${{ contains(matrix.target, 'pc-windows-msvc') && vars.AZURE_SIGNING_ENABLED == 'true' && (github.ref == 'refs/heads/main' || github.event_name == 'workflow_dispatch') }}
-        uses: azure/trusted-signing-action@v0
+        uses: azure/trusted-signing-action@1d365fec12862c4aa68fcac418143d73f0cea293 # v0.5.11
         with:
           endpoint: ${{ vars.AZURE_SIGNING_ENDPOINT }}
           trusted-signing-account-name: ${{ vars.AZURE_SIGNING_ACCOUNT }}
@@ -281,7 +281,7 @@ jobs:
           timestamp-digest: SHA256
 
       - name: Upload rust native library
-        uses: actions/upload-artifact@v6
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
         with:
           name: ${{ matrix.artifact-name }}
           path: |
@@ -306,10 +306,10 @@ jobs:
 
     steps:
       - name: Checkout code
-        uses: actions/checkout@v6
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
 
       - name: Download iOS native libraries
-        uses: actions/download-artifact@v7
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
         with:
           pattern: native-ios*
           path: ${{ env.working-directory }}/rs_compiled
@@ -319,7 +319,7 @@ jobs:
         run: make package-rust-iosframework RUST_PROFILE_DIR=release-official
 
       - name: Upload iOS XCFramework
-        uses: actions/upload-artifact@v6
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
         with:
           name: native-ios-universal
           path: ${{ env.working-directory }}/rs_compiled/**/libturso_sdk_kit.xcframework/**
@@ -339,10 +339,10 @@ jobs:
 
     steps:
       - name: Checkout code
-        uses: actions/checkout@v6
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
       
       - name: Install dotnet SDKs
-        uses: actions/setup-dotnet@v5
+        uses: actions/setup-dotnet@26b0ec14cb23fa6904739307f278c14f94c95bf1 # v5.4.0
         with:
           dotnet-version: |
             8.0.x
@@ -350,7 +350,7 @@ jobs:
             10.0.x
 
       - name: Download all native libraries
-        uses: actions/download-artifact@v7
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
         with:
           pattern: native-*
           path: ${{ env.working-directory }}/rs_compiled
@@ -532,7 +532,7 @@ jobs:
           cp "${files[@]}" artifacts/nuget-packages/
 
       - name: Upload NuGet packages to artifacts
-        uses: actions/upload-artifact@v6
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
         with:
           name: nuget-packages
           path: ${{ env.working-directory }}/artifacts/nuget-packages/*.nupkg
@@ -575,10 +575,10 @@ jobs:
 
     steps:
       - name: Checkout code
-        uses: actions/checkout@v6
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
 
       - name: Install dotnet SDK
-        uses: actions/setup-dotnet@v5
+        uses: actions/setup-dotnet@26b0ec14cb23fa6904739307f278c14f94c95bf1 # v5.4.0
         with:
           dotnet-version: 10.0.x
 
@@ -593,7 +593,7 @@ jobs:
           fi
 
       - name: Download NuGet packages
-        uses: actions/download-artifact@v7
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
         with:
           name: nuget-packages
           path: ${{ env.working-directory }}/artifacts/nuget-packages
@@ -682,15 +682,15 @@ jobs:
 
     steps:
       - name: Checkout code
-        uses: actions/checkout@v6
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
 
       - name: Install dotnet SDK
-        uses: actions/setup-dotnet@v5
+        uses: actions/setup-dotnet@26b0ec14cb23fa6904739307f278c14f94c95bf1 # v5.4.0
         with:
           dotnet-version: 10.0.x
 
       - name: Set up Android SDK
-        uses: android-actions/setup-android@v4
+        uses: android-actions/setup-android@be39fa834029ff78f1a44aa3bb0819b8fc2bd8fd # v4.0.4
         with:
           packages: ''
 
@@ -704,7 +704,7 @@ jobs:
           echo "ANDROID_NDK_ROOT=$ANDROID_HOME/ndk/27.2.12479018" >> "$GITHUB_ENV"
 
       - name: Download NuGet packages
-        uses: actions/download-artifact@v7
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
         with:
           name: nuget-packages
           path: ${{ env.working-directory }}/artifacts/nuget-packages
@@ -786,10 +786,10 @@ jobs:
 
     steps:
       - name: Checkout code
-        uses: actions/checkout@v6
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
 
       - name: Install dotnet SDK
-        uses: actions/setup-dotnet@v5
+        uses: actions/setup-dotnet@26b0ec14cb23fa6904739307f278c14f94c95bf1 # v5.4.0
         with:
           dotnet-version: 10.0.x
 
@@ -800,7 +800,7 @@ jobs:
         run: dotnet workload install ios --version 10.0.401
 
       - name: Download NuGet packages
-        uses: actions/download-artifact@v7
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
         with:
           name: nuget-packages
           path: ${{ env.working-directory }}/artifacts/nuget-packages
@@ -880,12 +880,12 @@ jobs:
 
     steps:
       - name: Install dotnet SDK
-        uses: actions/setup-dotnet@v5
+        uses: actions/setup-dotnet@26b0ec14cb23fa6904739307f278c14f94c95bf1 # v5.4.0
         with:
           dotnet-version: 9.0.x
 
       - name: Download NuGet packages
-        uses: actions/download-artifact@v7
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
         with:
           name: nuget-packages
           path: nuget-packages
@@ -894,7 +894,7 @@ jobs:
       # is only valid for an hour, so this must stay directly before the push.
       # https://learn.microsoft.com/en-us/nuget/nuget-org/trusted-publishing
       - name: NuGet login
-        uses: NuGet/login@v1
+        uses: NuGet/login@8d196754b4036150537f80ac539e15c2f1028841 # v1.2.0
         id: nuget-login
         with:
           # The individual nuget.org account the policy is registered under, not

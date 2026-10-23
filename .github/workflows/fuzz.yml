@@ -33,22 +33,22 @@ jobs:
         partition: [1, 2]
 
     steps:
-    - uses: actions/checkout@v4
-    - uses: dtolnay/rust-toolchain@stable
+    - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+    - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
     - name: Setup mold linker
-      uses: rui314/setup-mold@v1
+      uses: rui314/setup-mold@339e96b4ff1f3bd865856ba4cbbe8818a7acb038 # v1
     # run-fuzz-tests and run-long-fuzz-tests build the same things, so they
     # share one cache entry. Only part 1 of this job saves it.
-    - uses: Swatinem/rust-cache@v2
+    - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       with:
         prefix-key: "v1-rust"
         shared-key: "fuzz-all-features"
         cache-on-failure: true
         save-if: ${{ github.ref == 'refs/heads/main' && matrix.partition == 1 }}
     - name: Install cargo-nextest
-      uses: taiki-e/install-action@nextest
+      uses: taiki-e/install-action@9252097d36d2d3618ad98f5d873696a962b6897c # nextest
     - name: Set up Python 3.10
-      uses: useblacksmith/setup-python@v6
+      uses: useblacksmith/setup-python@943b05a7c4ca70c2360391137527a37bee33fb1d # v6
       with:
         python-version: "3.10"
     # Needed: nextest compiles every workspace package's test binaries
@@ -67,19 +67,19 @@ jobs:
     timeout-minutes: 30
 
     steps:
-    - uses: actions/checkout@v4
-    - uses: dtolnay/rust-toolchain@stable
+    - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+    - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
     - name: Setup mold linker
-      uses: rui314/setup-mold@v1
-    - uses: Swatinem/rust-cache@v2
+      uses: rui314/setup-mold@339e96b4ff1f3bd865856ba4cbbe8818a7acb038 # v1
+    - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       with:
         prefix-key: "v1-rust"
         shared-key: "fuzz-all-features"
         save-if: false
     - name: Install cargo-nextest
-      uses: taiki-e/install-action@nextest
+      uses: taiki-e/install-action@9252097d36d2d3618ad98f5d873696a962b6897c # nextest
     - name: Set up Python 3.10
-      uses: useblacksmith/setup-python@v6
+      uses: useblacksmith/setup-python@943b05a7c4ca70c2360391137527a37bee33fb1d # v6
       with:
         python-version: "3.10"
     # Needed for the same reason as in run-fuzz-tests.
@@ -95,18 +95,18 @@ jobs:
     runs-on: blacksmith-4vcpu-ubuntu-2404
     timeout-minutes: 30
     steps:
-    - uses: actions/checkout@v4
-    - uses: dtolnay/rust-toolchain@stable
+    - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+    - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
     - name: Setup mold linker
-      uses: rui314/setup-mold@v1
+      uses: rui314/setup-mold@339e96b4ff1f3bd865856ba4cbbe8818a7acb038 # v1
     # Builds with --cfg shuttle, so it can't reuse the other jobs' cache.
-    - uses: Swatinem/rust-cache@v2
+    - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       with:
         prefix-key: "v1-rust"
         cache-on-failure: true
         save-if: ${{ github.ref == 'refs/heads/main' }}
     - name: Set up Python 3.10
-      uses: useblacksmith/setup-python@v6
+      uses: useblacksmith/setup-python@943b05a7c4ca70c2360391137527a37bee33fb1d # v6
       with:
         python-version: "3.10"
     - name: Run ignored long tests
@@ -132,11 +132,11 @@ jobs:
           - mode: mvcc
             tx-mode: concurrent
     steps:
-    - uses: actions/checkout@v4
-    - uses: dtolnay/rust-toolchain@stable
+    - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+    - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
     - name: Setup mold linker
-      uses: rui314/setup-mold@v1
-    - uses: Swatinem/rust-cache@v2
+      uses: rui314/setup-mold@339e96b4ff1f3bd865856ba4cbbe8818a7acb038 # v1
+    - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       with:
         prefix-key: "v1-rust"
         cache-on-failure: true
@@ -158,11 +158,11 @@ jobs:
     env:
       CARGO_PROFILE_DEV_OPT_LEVEL: "2"
     steps:
-    - uses: actions/checkout@v4
-    - uses: dtolnay/rust-toolchain@stable
+    - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+    - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
     - name: Setup mold linker
-      uses: rui314/setup-mold@v1
-    - uses: Swatinem/rust-cache@v2
+      uses: rui314/setup-mold@339e96b4ff1f3bd865856ba4cbbe8818a7acb038 # v1
+    - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       with:
         prefix-key: "v1-rust-shuttle"
         cache-on-failure: true
@@ -187,16 +187,16 @@ jobs:
     runs-on: blacksmith-4vcpu-ubuntu-2404
     timeout-minutes: 15
     steps:
-    - uses: actions/checkout@v4
-    - uses: dtolnay/rust-toolchain@master
+    - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+    - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
       with:
         # Pinned so upstream nightly regressions can't break this job
         # independently of our changes; bump deliberately when needed.
         # Keep in sync with nightly-cfg.yml.
         toolchain: nightly-2025-12-17
     - name: Setup mold linker
-      uses: rui314/setup-mold@v1
-    - uses: Swatinem/rust-cache@v2
+      uses: rui314/setup-mold@339e96b4ff1f3bd865856ba4cbbe8818a7acb038 # v1
+    - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       with:
         prefix-key: "v1-rust-fuzz"
         cache-on-failure: true

@@ -41,7 +41,7 @@ jobs:
       benchmarks: ${{ steps.benchmarks.outputs.benchmarks }}
       shards: ${{ steps.benchmarks.outputs.shards }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
       - name: Setup Rust toolchain
         uses: ./.github/actions/setup-rust-toolchain
@@ -115,7 +115,7 @@ jobs:
       TOOLCHAIN_VERSION: "1.88.0"
       TOOLCHAIN_RUSTFLAGS: ""
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
       - name: Setup Rust toolchain
         uses: ./.github/actions/setup-rust-toolchain
@@ -123,9 +123,9 @@ jobs:
           toolchain: ${{ env.TOOLCHAIN_VERSION }}
 
       - name: Setup mold linker
-        uses: rui314/setup-mold@v1
+        uses: rui314/setup-mold@339e96b4ff1f3bd865856ba4cbbe8818a7acb038 # v1
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           prefix-key: "v1-rust-codspeed-${{ env.TOOLCHAIN_LABEL }}"
           cache-on-failure: true
@@ -133,7 +133,7 @@ jobs:
 
 
       - name: Install cargo-codspeed
-        uses: taiki-e/install-action@v2
+        uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2.87.29
         with:
           tool: cargo-codspeed
 
@@ -165,7 +165,7 @@ jobs:
       - name: Upload benchmark binaries
         id: upload_artifact
         if: steps.build_benchmarks.outcome == 'success'
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: codspeed-benchmarks-${{ env.TOOLCHAIN_LABEL }}
           path: codspeed-benchmarks.tar.zst
@@ -194,7 +194,7 @@ jobs:
       TOOLCHAIN_VERSION: "nightly-2025-12-17"
       TOOLCHAIN_RUSTFLAGS: "--cfg nightly"
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
       - name: Setup Rust toolchain
         uses: ./.github/actions/setup-rust-toolchain
@@ -202,9 +202,9 @@ jobs:
           toolchain: ${{ env.TOOLCHAIN_VERSION }}
 
       - name: Setup mold linker
-        uses: rui314/setup-mold@v1
+        uses: rui314/setup-mold@339e96b4ff1f3bd865856ba4cbbe8818a7acb038 # v1
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           prefix-key: "v1-rust-codspeed-${{ env.TOOLCHAIN_LABEL }}"
           cache-on-failure: true
@@ -212,7 +212,7 @@ jobs:
 
 
       - name: Install cargo-codspeed
-        uses: taiki-e/install-action@v2
+        uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2.87.29
         with:
           tool: cargo-codspeed
 
@@ -244,7 +244,7 @@ jobs:
       - name: Upload benchmark binaries
         id: upload_artifact
         if: steps.build_benchmarks.outcome == 'success'
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: codspeed-benchmarks-${{ env.TOOLCHAIN_LABEL }}
           path: codspeed-benchmarks.tar.zst
@@ -277,7 +277,7 @@ jobs:
       matrix:
         shard: ${{ fromJson(needs.discover.outputs.shards) }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
       - name: Setup Rust toolchain
         uses: ./.github/actions/setup-rust-toolchain
@@ -285,12 +285,12 @@ jobs:
           toolchain: ${{ env.TOOLCHAIN_VERSION }}
 
       - name: Install cargo-codspeed
-        uses: taiki-e/install-action@v2
+        uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2.87.29
         with:
           tool: cargo-codspeed
 
       - name: Download benchmark binaries
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           name: codspeed-benchmarks-${{ env.TOOLCHAIN_LABEL }}
 
@@ -309,7 +309,7 @@ jobs:
           sqlite3 perf/graph-queries/graph-queries-analyzed.db "ANALYZE;"
 
       - name: Run benchmarks (excluding TPC-H)
-        uses: CodSpeedHQ/action@v4.17.0
+        uses: CodSpeedHQ/action@9d332c4d90b43981c3e55ae8e38e68709996240f # v4.17.0
         env:
           RUSTFLAGS: ${{ env.TOOLCHAIN_RUSTFLAGS }}
         with:
@@ -337,7 +337,7 @@ jobs:
       matrix:
         shard: ${{ fromJson(needs.discover.outputs.shards) }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
       - name: Setup Rust toolchain
         uses: ./.github/actions/setup-rust-toolchain
@@ -345,12 +345,12 @@ jobs:
           toolchain: ${{ env.TOOLCHAIN_VERSION }}
 
       - name: Install cargo-codspeed
-        uses: taiki-e/install-action@v2
+        uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2.87.29
         with:
           tool: cargo-codspeed
 
       - name: Download benchmark binaries
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           name: codspeed-benchmarks-${{ env.TOOLCHAIN_LABEL }}
 
@@ -369,7 +369,7 @@ jobs:
           sqlite3 perf/graph-queries/graph-queries-analyzed.db "ANALYZE;"
 
       - name: Run benchmarks (excluding TPC-H)
-        uses: CodSpeedHQ/action@v4.17.0
+        uses: CodSpeedHQ/action@9d332c4d90b43981c3e55ae8e38e68709996240f # v4.17.0
         env:
           RUSTFLAGS: ${{ env.TOOLCHAIN_RUSTFLAGS }}
         with:
@@ -384,27 +384,27 @@ jobs:
   #   env:
   #     DB_FILE: "perf/tpc-h/TPC-H.db"
   #   steps:
-  #     - uses: actions/checkout@v4
+  #     - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
   #     - name: Setup Rust toolchain
-  #       uses: dtolnay/rust-toolchain@stable
+  #       uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
 
   #     - name: Setup mold linker
-  #       uses: rui314/setup-mold@v1
+  #       uses: rui314/setup-mold@339e96b4ff1f3bd865856ba4cbbe8818a7acb038 # v1
 
-  #     - uses: Swatinem/rust-cache@v2
+  #     - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
   #       with:
   #         prefix-key: "v1-rust-codspeed"
   #         cache-on-failure: true
 
   #     - name: Install cargo-codspeed
-  #       uses: taiki-e/install-action@v2
+  #       uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2.87.29
   #       with:
   #         tool: cargo-codspeed
 
   #     - name: Cache TPC-H
   #       id: cache-tpch
-  #       uses: actions/cache@v4
+  #       uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
   #       with:
   #         path: ${{ env.DB_FILE }}
   #         key: tpc-h
@@ -419,7 +419,7 @@ jobs:
   #       run: cargo codspeed build --features codspeed --bench tpc_h_benchmark
 
   #     - name: Run TPC-H benchmark
-  #       uses: CodSpeedHQ/action@v4.17.0
+  #       uses: CodSpeedHQ/action@9d332c4d90b43981c3e55ae8e38e68709996240f # v4.17.0
   #       with:
   #         mode: simulation
   #         run: cargo codspeed run --bench tpc_h_benchmark

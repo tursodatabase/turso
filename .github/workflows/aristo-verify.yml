@@ -25,8 +25,8 @@ jobs:
       # The per-repo conductor instance; managed via the ARETTA_API_URL repo Variable.
       ARETTA_API_URL: ${{ vars.ARETTA_API_URL }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: aretta-ai/aristo-action@v1
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: aretta-ai/aristo-action@42faaa3abb91cfa329df7bfb74f92e5ca17760a2 # v1.1.0
         with:
           checks: verify
           aretta-token: ${{ secrets.ARETTA_TOKEN }}
