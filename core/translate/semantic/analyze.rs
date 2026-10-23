@@ -547,7 +547,7 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
     fn finish_column_reads(&mut self, root: &HirRoot) -> Result<()> {
         let mut pending = Vec::new();
         for query in self.queries.iter().flatten() {
-            pending.extend(query.direct_column_reads(|source| self.source(source)));
+            query.direct_column_reads(|source| self.source(source), &mut pending);
         }
         // An index expression can read a generated column, which then needs
         // its generation expression when the index is used.
