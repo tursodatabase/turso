@@ -5542,6 +5542,10 @@ mod tests {
             "CREATE VIEW u AS SELECT x FROM c UNION ALL SELECT (WITH c AS (SELECT 5 AS x) SELECT x FROM c)",
         )
         .unwrap();
+        conn.execute(
+            "CREATE VIEW r AS WITH RECURSIVE a AS (SELECT x FROM c), c AS (SELECT 7 AS x) SELECT x FROM a",
+        )
+        .unwrap();
         conn.execute("CREATE TABLE t(x INTEGER); INSERT INTO t VALUES(2)")
             .unwrap();
 
@@ -5550,6 +5554,7 @@ mod tests {
         assert_eq!(query_single_i64(&conn, "SELECT x FROM app.w"), 1);
         assert_eq!(query_single_i64(&conn, "SELECT k FROM app.n"), 1);
         assert_eq!(query_single_i64(&conn, "SELECT sum(x) FROM app.u"), 11);
+        assert_eq!(query_single_i64(&conn, "SELECT x FROM app.r"), 7);
         conn.set_search_path(Some(vec!["main".to_string()]));
         assert_eq!(query_single_i64(&conn, "SELECT x FROM app.v"), 1);
     }

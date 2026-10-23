@@ -481,9 +481,10 @@ pub(crate) fn bind_table_names_in_select(
 
 /// Binds the tables of `select` with the CTEs in scope in `cte_names`: those
 /// of the enclosing SELECTs, plus the ones this SELECT declares. A CTE is in
-/// scope in the CTEs declared after it, and in its own body when the WITH
-/// is RECURSIVE. The subqueries in the expressions of this SELECT are bound
-/// with the same scope; a nested SELECT in FROM is bound with its own.
+/// scope in the CTEs declared after it; when the WITH is RECURSIVE, every
+/// CTE of the WITH is in scope in every body. The subqueries in the
+/// expressions of this SELECT are bound with the same scope; a nested
+/// SELECT in FROM is bound with its own.
 fn bind_table_names(
     select: &mut ast::Select,
     resolver: &Resolver,
@@ -491,10 +492,14 @@ fn bind_table_names(
 ) -> Result<()> {
     let outer_cte_count = cte_names.len();
     if let Some(with) = &mut select.with {
+        if with.recursive {
+            cte_names.extend(
+                with.ctes
+                    .iter()
+                    .map(|cte| normalize_ident(cte.tbl_name.as_str())),
+            );
+        }
         for cte in &mut with.ctes {
-            if with.recursive {
-                cte_names.push(normalize_ident(cte.tbl_name.as_str()));
-            }
             bind_table_names(&mut cte.select, resolver, cte_names)?;
             if !with.recursive {
                 cte_names.push(normalize_ident(cte.tbl_name.as_str()));

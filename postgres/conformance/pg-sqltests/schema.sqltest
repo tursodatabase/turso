@@ -571,3 +571,13 @@ expect {
     1
     2
 }
+
+test view-keeps-every-cte-of-a-recursive-with-in-scope {
+    CREATE TABLE b (n int);
+    INSERT INTO b VALUES (100);
+    CREATE VIEW v AS WITH RECURSIVE a AS (SELECT n FROM b), b AS (SELECT 1 AS n) SELECT n FROM a;
+    SELECT * FROM v;
+}
+expect {
+    1
+}
