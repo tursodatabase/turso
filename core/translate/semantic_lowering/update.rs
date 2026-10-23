@@ -1442,12 +1442,15 @@ impl UpdateRow<'_, '_> {
             },
         );
         // Change data capture in `full` mode records which columns changed:
-        // a flag per column, then the new value of each changed one.
+        // a flag per stored column, then the new value of each changed one.
+        // A virtual column has no entry.
+        let stored_offsets = stored_column_offsets(table);
+        let stored = stored_offsets.iter().flatten().count();
         let updates = self
             .target
             .capture_rows()
             .filter(|_| super::cdc::Rows::records_updates(program))
-            .map(|_| program.alloc_registers(2 * columns));
+            .map(|_| program.alloc_registers(2 * stored));
         // A BEFORE trigger runs before NOT NULL is checked.
         let read_old_column = self.emit_new_values(program, layout, !has_before, updates)?;
         // STRICT: the values the UPDATE sets are checked, and converted
@@ -1459,21 +1462,11 @@ impl UpdateRow<'_, '_> {
         }
         self.emit_virtual_columns(program, layout, !has_before)?;
         if let (Some(updates), Some((position, ddl))) = (updates, layout.schema_change) {
-            program.emit_insn(Insn::String8 {
-                value: ddl.to_string(),
-                dest: updates + columns + position,
-            });
-        }
-        if let Some(updates) = updates {
-            // A changed virtual column records its value.
-            for &position in layout.assigned {
-                if table.columns()[position].is_virtual_generated() {
-                    program.emit_insn(Insn::Copy {
-                        src_reg: self.start() + position,
-                        dst_reg: updates + columns + position,
-                        extra_amount: 0,
-                    });
-                }
+            if let Some(offset) = stored_offsets[position] {
+                program.emit_insn(Insn::String8 {
+                    value: ddl.to_string(),
+                    dest: updates + stored + offset,
+                });
             }
         }
         let new_row = TriggerRow {
@@ -1733,7 +1726,7 @@ impl UpdateRow<'_, '_> {
                     let record = program.alloc_register();
                     program.emit_insn(Insn::MakeRecord {
                         start_reg: to_u32(updates),
-                        count: to_u32(2 * columns),
+                        count: to_u32(2 * stored),
                         dest_reg: to_u32(record),
                         index_name: None,
                         affinity_str: None,
@@ -1893,17 +1886,21 @@ impl UpdateRow<'_, '_> {
         // The changed columns record their new values before affinity is
         // applied; a changed INTEGER PRIMARY KEY records NULL.
         if let Some(updates) = updates {
-            let columns = table.columns().len();
+            let stored_offsets = stored_column_offsets(table);
+            let stored = stored_offsets.iter().flatten().count();
             for (position, value) in layout.values.iter().enumerate() {
+                let Some(offset) = stored_offsets[position] else {
+                    continue;
+                };
                 let changed = layout.assigned.contains(&position);
-                program.emit_bool(changed, updates + position);
+                program.emit_bool(changed, updates + offset);
                 match value {
                     Some(_) if changed => program.emit_insn(Insn::Copy {
                         src_reg: self.start() + position,
-                        dst_reg: updates + columns + position,
+                        dst_reg: updates + stored + offset,
                         extra_amount: 0,
                     }),
-                    _ => program.emit_null(updates + columns + position, None),
+                    _ => program.emit_null(updates + stored + offset, None),
                 }
             }
         }
@@ -2296,6 +2293,25 @@ impl UpdateRow<'_, '_> {
         program.preassign_label_to_next_insn(unique);
         Ok(())
     }
+}
+
+/// The position of each table column in a record that leaves out virtual
+/// columns, such as the change data capture `updates` record. A virtual
+/// column has none.
+fn stored_column_offsets(table: &crate::schema::BTreeTable) -> Vec<Option<usize>> {
+    let mut next = 0;
+    table
+        .columns()
+        .iter()
+        .map(|column| {
+            if column.is_virtual_generated() {
+                None
+            } else {
+                next += 1;
+                Some(next - 1)
+            }
+        })
+        .collect()
 }
 
 #[cfg(test)]
