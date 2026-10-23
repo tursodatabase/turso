@@ -472,3 +472,15 @@ test public-name-under-a-schema-prefix-does-not-exist {
 }
 expect error {
 }
+
+test view-binds-a-table-named-like-a-cte-of-another-part-of-its-body {
+    CREATE SCHEMA app;
+    CREATE TABLE t (x int);
+    INSERT INTO t VALUES (1);
+    CREATE VIEW app.v AS SELECT x FROM t UNION ALL SELECT (WITH t AS (SELECT 5 AS x) SELECT x FROM t);
+    SELECT x FROM app.v ORDER BY 1;
+}
+expect {
+    1
+    5
+}

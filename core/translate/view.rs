@@ -1,8 +1,8 @@
 use crate::schema::{BTreeCharacteristics, BTreeTable, SchemaObjectType, RESERVED_TABLE_PREFIXES};
 use crate::storage::pager::CreateBTreeFlags;
 use crate::sync::Arc;
+use crate::translate::expr::{walk_expr_mut, WalkControl};
 use crate::translate::sequence::bind_sequence_names_in_select;
-use crate::translate::trigger_exec::rewrite_select_expressions;
 use crate::translate::{
     emitter::Resolver,
     schema::{emit_schema_entry, SchemaEntryType, SQLITE_TABLEID},
@@ -476,88 +476,93 @@ pub(crate) fn bind_table_names_in_select(
     select: &mut ast::Select,
     resolver: &Resolver,
 ) -> Result<()> {
-    let mut cte_names = Vec::new();
-    collect_cte_names(select, &mut cte_names)?;
-    bind_table_names(select, resolver, &cte_names)
+    bind_table_names(select, resolver, &mut Vec::new())
 }
 
-/// The names of the CTEs anywhere in the body, so that none of them is
-/// bound as a table wherever it is used.
-fn collect_cte_names(select: &mut ast::Select, cte_names: &mut Vec<String>) -> Result<()> {
+/// Binds the tables of `select` with the CTEs in scope in `cte_names`: those
+/// of the enclosing SELECTs, plus the ones this SELECT declares. A CTE is in
+/// scope in the CTEs declared after it, and in its own body when the WITH
+/// is RECURSIVE. The subqueries in the expressions of this SELECT are bound
+/// with the same scope; a nested SELECT in FROM is bound with its own.
+fn bind_table_names(
+    select: &mut ast::Select,
+    resolver: &Resolver,
+    cte_names: &mut Vec<String>,
+) -> Result<()> {
+    let outer_cte_count = cte_names.len();
     if let Some(with) = &mut select.with {
         for cte in &mut with.ctes {
-            cte_names.push(normalize_ident(cte.tbl_name.as_str()));
-            collect_cte_names(&mut cte.select, cte_names)?;
+            if with.recursive {
+                cte_names.push(normalize_ident(cte.tbl_name.as_str()));
+            }
+            bind_table_names(&mut cte.select, resolver, cte_names)?;
+            if !with.recursive {
+                cte_names.push(normalize_ident(cte.tbl_name.as_str()));
+            }
         }
     }
     for one_select in std::iter::once(&mut select.body.select)
         .chain(select.body.compounds.iter_mut().map(|c| &mut c.select))
     {
-        if let ast::OneSelect::Select {
-            from: Some(from), ..
-        } = one_select
-        {
-            collect_cte_names_in_from(from, cte_names)?;
+        bind_table_names_in_one_select(one_select, resolver, cte_names)?;
+    }
+    for sorted_column in &mut select.order_by {
+        bind_table_names_in_expr(&mut sorted_column.expr, resolver, cte_names)?;
+    }
+    if let Some(limit) = &mut select.limit {
+        bind_table_names_in_expr(&mut limit.expr, resolver, cte_names)?;
+        if let Some(offset) = &mut limit.offset {
+            bind_table_names_in_expr(offset, resolver, cte_names)?;
         }
     }
-    rewrite_select_expressions(select, &mut |expr| match expr {
-        ast::Expr::Subquery(select) | ast::Expr::Exists(select) => {
-            collect_cte_names(select, cte_names)
-        }
-        ast::Expr::InSelect { rhs, .. } => collect_cte_names(rhs, cte_names),
-        _ => Ok(()),
-    })
-}
-
-fn collect_cte_names_in_from(
-    from: &mut ast::FromClause,
-    cte_names: &mut Vec<String>,
-) -> Result<()> {
-    for source in
-        std::iter::once(&mut from.select).chain(from.joins.iter_mut().map(|j| &mut j.table))
-    {
-        match source.as_mut() {
-            ast::SelectTable::Select { select, .. } => collect_cte_names(select, cte_names)?,
-            ast::SelectTable::Sub(from, _) => collect_cte_names_in_from(from, cte_names)?,
-            ast::SelectTable::Table(..) | ast::SelectTable::TableCall(..) => {}
-        }
-    }
+    cte_names.truncate(outer_cte_count);
     Ok(())
-}
-
-fn bind_table_names(
-    select: &mut ast::Select,
-    resolver: &Resolver,
-    cte_names: &[String],
-) -> Result<()> {
-    if let Some(with) = &mut select.with {
-        for cte in &mut with.ctes {
-            bind_table_names(&mut cte.select, resolver, cte_names)?;
-        }
-    }
-    bind_table_names_in_one_select(&mut select.body.select, resolver, cte_names)?;
-    for compound in &mut select.body.compounds {
-        bind_table_names_in_one_select(&mut compound.select, resolver, cte_names)?;
-    }
-    rewrite_select_expressions(select, &mut |expr| match expr {
-        ast::Expr::Subquery(select) | ast::Expr::Exists(select) => {
-            bind_table_names(select, resolver, cte_names)
-        }
-        ast::Expr::InSelect { rhs, .. } => bind_table_names(rhs, resolver, cte_names),
-        _ => Ok(()),
-    })
 }
 
 fn bind_table_names_in_one_select(
     one_select: &mut ast::OneSelect,
     resolver: &Resolver,
-    cte_names: &[String],
+    cte_names: &mut Vec<String>,
 ) -> Result<()> {
-    if let ast::OneSelect::Select {
-        from: Some(from), ..
-    } = one_select
-    {
-        bind_table_names_in_from(from, resolver, cte_names)?;
+    match one_select {
+        ast::OneSelect::Select {
+            columns,
+            from,
+            where_clause,
+            group_by,
+            window_clause,
+            ..
+        } => {
+            if let Some(from) = from {
+                bind_table_names_in_from(from, resolver, cte_names)?;
+            }
+            for column in columns {
+                if let ast::ResultColumn::Expr(expr, _) = column {
+                    bind_table_names_in_expr(expr, resolver, cte_names)?;
+                }
+            }
+            if let Some(where_clause) = where_clause {
+                bind_table_names_in_expr(where_clause, resolver, cte_names)?;
+            }
+            if let Some(group_by) = group_by {
+                for expr in &mut group_by.exprs {
+                    bind_table_names_in_expr(expr, resolver, cte_names)?;
+                }
+                if let Some(having) = &mut group_by.having {
+                    bind_table_names_in_expr(having, resolver, cte_names)?;
+                }
+            }
+            for window_def in window_clause {
+                bind_table_names_in_window(&mut window_def.window, resolver, cte_names)?;
+            }
+        }
+        ast::OneSelect::Values(rows) => {
+            for row in rows {
+                for expr in row {
+                    bind_table_names_in_expr(expr, resolver, cte_names)?;
+                }
+            }
+        }
     }
     Ok(())
 }
@@ -565,11 +570,14 @@ fn bind_table_names_in_one_select(
 fn bind_table_names_in_from(
     from: &mut ast::FromClause,
     resolver: &Resolver,
-    cte_names: &[String],
+    cte_names: &mut Vec<String>,
 ) -> Result<()> {
     bind_table_name_in_source(&mut from.select, resolver, cte_names)?;
     for join in &mut from.joins {
         bind_table_name_in_source(&mut join.table, resolver, cte_names)?;
+        if let Some(ast::JoinConstraint::On(expr)) = &mut join.constraint {
+            bind_table_names_in_expr(expr, resolver, cte_names)?;
+        }
     }
     Ok(())
 }
@@ -577,16 +585,63 @@ fn bind_table_names_in_from(
 fn bind_table_name_in_source(
     source: &mut ast::SelectTable,
     resolver: &Resolver,
-    cte_names: &[String],
+    cte_names: &mut Vec<String>,
 ) -> Result<()> {
     match source {
         ast::SelectTable::Table(name, alias, _) => {
             bind_table_name(name, alias, resolver, cte_names)
         }
-        ast::SelectTable::TableCall(..) => Ok(()),
+        ast::SelectTable::TableCall(_, args, _) => {
+            for arg in args {
+                bind_table_names_in_expr(arg, resolver, cte_names)?;
+            }
+            Ok(())
+        }
         ast::SelectTable::Select { select, .. } => bind_table_names(select, resolver, cte_names),
         ast::SelectTable::Sub(from, _) => bind_table_names_in_from(from, resolver, cte_names),
     }
+}
+
+fn bind_table_names_in_window(
+    window: &mut ast::Window,
+    resolver: &Resolver,
+    cte_names: &mut Vec<String>,
+) -> Result<()> {
+    for expr in &mut window.partition_by {
+        bind_table_names_in_expr(expr, resolver, cte_names)?;
+    }
+    for sorted_column in &mut window.order_by {
+        bind_table_names_in_expr(&mut sorted_column.expr, resolver, cte_names)?;
+    }
+    if let Some(frame) = &mut window.frame_clause {
+        for bound in std::iter::once(&mut frame.start).chain(frame.end.as_mut()) {
+            if let ast::FrameBound::Following(expr) | ast::FrameBound::Preceding(expr) = bound {
+                bind_table_names_in_expr(expr, resolver, cte_names)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Binds the tables of the subqueries in `expr`. The expression walker
+/// stops at a subquery, so each one is bound as a SELECT of its own, with
+/// the CTEs in scope where the expression is.
+fn bind_table_names_in_expr(
+    expr: &mut ast::Expr,
+    resolver: &Resolver,
+    cte_names: &mut Vec<String>,
+) -> Result<()> {
+    walk_expr_mut(expr, &mut |expr: &mut ast::Expr| {
+        match expr {
+            ast::Expr::Subquery(select) | ast::Expr::Exists(select) => {
+                bind_table_names(select, resolver, cte_names)?;
+            }
+            ast::Expr::InSelect { rhs, .. } => bind_table_names(rhs, resolver, cte_names)?,
+            _ => {}
+        }
+        Ok(WalkControl::Continue)
+    })?;
+    Ok(())
 }
 
 fn bind_table_name(
