@@ -3339,6 +3339,8 @@ pub(super) struct PreparedHirVirtualLoop<'a> {
 pub(super) struct PreparedHirOrUnionLoop<'a> {
     table_cursor: CursorID,
     branches: Vec<PreparedHirBtreeLoop<'a>>,
+    /// For each branch, the conditions checked before its seek.
+    branch_filters: &'a [Vec<hir::Expr>],
 }
 
 /// A scan through a query pattern of an index method, such as FTS: the
@@ -7687,6 +7689,7 @@ fn prepare_hir_or_union_loop<'a>(
     Ok(PreparedHirOrUnionLoop {
         table_cursor,
         branches,
+        branch_filters: &union.branch_filters,
     })
 }
 
@@ -7701,7 +7704,23 @@ fn start_hir_or_union_loop(
     let rows = program.alloc_register();
     program.emit_null(rows, None);
     let rowid = program.alloc_register();
-    for branch in &prepared.branches {
+    for (branch, filters) in prepared.branches.iter().zip(prepared.branch_filters) {
+        // An outer row the branch's own conditions reject seeks nothing.
+        let branch_done = program.allocate_label();
+        for filter in filters {
+            let passed = program.allocate_label();
+            super::expr::translate_condition_expr(
+                program,
+                document,
+                filter,
+                ConditionMetadata {
+                    jump_if_condition_is_true: false,
+                    jump_target_when_true: passed,
+                    jump_target_when_false: branch_done,
+                },
+            )?;
+            program.preassign_label_to_next_insn(passed);
+        }
         let branch_loop = start_hir_btree_loop(program, document, branch, None)?;
         match branch.index {
             Some(_) => program.emit_insn(Insn::IdxRowId {
@@ -7718,6 +7737,7 @@ fn start_hir_or_union_loop(
             value_reg: rowid,
         });
         close_hir_btree_loop(program, &branch_loop, &[]);
+        program.preassign_label_to_next_insn(branch_done);
     }
     let loop_start = program.allocate_label();
     let next = program.allocate_label();
