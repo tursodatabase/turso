@@ -882,14 +882,17 @@ pub fn translate_insert(
 
     if has_fks {
         // Child-side FK check must run before any writes (IdxInsert / Insert).
-        // For immediate FKs this emits a direct Halt, so no index entry is written
-        // when the parent is missing — matching SQLite's bytecode order.
+        // A single-row insert of an immediate FK halts here, so no index entry is
+        // written when the parent is missing — matching SQLite's bytecode order.
+        // A multi-row insert counts the violation instead, because a later row may
+        // insert the parent; the count is checked when the statement ends.
         let fk_layout = btree_table.column_layout()?;
         emit_fk_child_insert_checks(
             program,
             &btree_table,
             insertion.first_col_register(),
             insertion.key_register(),
+            inserting_multiple_rows,
             resolver,
             database_id,
             &fk_layout,
@@ -3793,14 +3796,16 @@ fn emit_replace_delete_conflicting_row(
     Ok(())
 }
 
-/// Child-side FK checks for INSERT of a single row:
+/// Child-side FK checks for one inserted row:
 /// For each outgoing FK on `child_tbl`, if the NEW tuple's FK columns are all non-NULL,
 /// verify that the referenced parent key exists.
+#[allow(clippy::too_many_arguments)]
 pub fn emit_fk_child_insert_checks(
     program: &mut ProgramBuilder,
     child_tbl: &BTreeTable,
     new_start_reg: usize,
     new_rowid_reg: usize,
+    inserting_multiple_rows: bool,
     resolver: &Resolver,
     database_id: usize,
     layout: &ColumnLayout,
@@ -3871,10 +3876,10 @@ pub fn emit_fk_child_insert_checks(
             program.emit_insn(Insn::Close { cursor_id: pcur });
             program.emit_insn(Insn::Goto { target_pc: fk_ok });
 
-            // Missing parent: immediate → Halt before Insert; deferred → counter
+            // Missing parent: counted for a deferred FK or a multi-row insert, otherwise Halt before Insert
             program.preassign_label_to_next_insn(violation);
             program.emit_insn(Insn::Close { cursor_id: pcur });
-            if fk_ref.fk.deferred {
+            if fk_ref.fk.deferred || inserting_multiple_rows {
                 emit_fk_violation(program, &fk_ref.fk)?;
             } else {
                 emit_fk_restrict_halt(program)?;
@@ -3972,9 +3977,9 @@ pub fn emit_fk_child_insert_checks(
                 ncols,
                 // on_found: parent exists, FK satisfied
                 |_p| Ok(()),
-                // on_not_found: immediate → Halt; deferred → counter
+                // on_not_found: counted for a deferred FK or a multi-row insert, otherwise Halt
                 |p| {
-                    if fk_ref.fk.deferred {
+                    if fk_ref.fk.deferred || inserting_multiple_rows {
                         emit_fk_violation(p, &fk_ref.fk)?;
                     } else {
                         emit_fk_restrict_halt(p)?;
