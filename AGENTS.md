@@ -137,6 +137,7 @@ Before opening a PR, read the "PR Workflow" document linked above.
 8. **Driver API parity** Embedded (`bindings/rust`) and serverless (`serverless/rust`) drivers expose the same public API; add features to both in the same change. Spec: `serverless/conformance/differential/README.md`.
 9. **Backward compatibility** No breaking changes. New versions of Turso must work with databases and sidecar files that were created from previous versions.  
 10. **Keep user docs current.** If a change adds, removes, or changes user-visible SQL behavior (syntax, functions, pragmas, data types, CLI commands, errors), update the matching page in `docs/sql-reference/` in the same change. For example, a new `JOIN` type goes in `docs/sql-reference/statements/select.mdx`.
+11. **No PostgreSQL-specific code in `core/`.** PostgreSQL behavior and state go in `postgres/`. Unsure what to do? Ask.
 
 ## Always use plain language instead of complex jargon
 
