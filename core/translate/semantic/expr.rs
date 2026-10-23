@@ -2243,7 +2243,16 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
         }
         let lhs = take_scalar_operand(lhs)?;
         let rhs = take_scalar_operand(rhs)?;
-        self.build_scalar_binary_expr(lhs, operator, rhs)
+        let written_literals = [
+            matches!(lhs_syntax, ast::Expr::Literal(_)),
+            matches!(rhs_syntax, ast::Expr::Literal(_)),
+        ];
+        let (lhs, rhs) = if operator.is_comparison() {
+            read_other_side_as_array(lhs, rhs)
+        } else {
+            (lhs, rhs)
+        };
+        self.build_binary_expr_of_written_operands(lhs, operator, rhs, written_literals)
     }
 
     pub(super) fn build_scalar_binary_expr(
@@ -2269,7 +2278,20 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
         operator: ast::Operator,
         rhs: ResolvedScopeExpr,
     ) -> Result<ResolvedScopeExpr> {
-        let custom = self.resolve_custom_binary_operator(operator, &lhs, &rhs)?;
+        self.build_binary_expr_of_written_operands(lhs, operator, rhs, [true, true])
+    }
+
+    /// `written_literals` says whether each operand is written as a literal.
+    /// A custom type's operator encodes such an operand with the type; a
+    /// literal in parentheses or a computed value is passed as is.
+    fn build_binary_expr_of_written_operands(
+        &mut self,
+        lhs: ResolvedScopeExpr,
+        operator: ast::Operator,
+        rhs: ResolvedScopeExpr,
+        written_literals: [bool; 2],
+    ) -> Result<ResolvedScopeExpr> {
+        let custom = self.resolve_custom_binary_operator(operator, &lhs, &rhs, written_literals)?;
         let type_fact = binary_type_fact(operator, &lhs.type_fact, &rhs.type_fact);
         let array_concat = operator == ast::Operator::Concat
             && (lhs.type_fact.is_array() || rhs.type_fact.is_array());
@@ -2322,10 +2344,20 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
                 &end.components[0],
             );
             let custom = self
-                .resolve_custom_binary_operator(ast::Operator::GreaterEquals, tested, low)?
+                .resolve_custom_binary_operator(
+                    ast::Operator::GreaterEquals,
+                    tested,
+                    low,
+                    [true, true],
+                )?
                 .is_some()
                 || self
-                    .resolve_custom_binary_operator(ast::Operator::LessEquals, tested, high)?
+                    .resolve_custom_binary_operator(
+                        ast::Operator::LessEquals,
+                        tested,
+                        high,
+                        [true, true],
+                    )?
                     .is_some();
             if custom {
                 let lower = self.build_scalar_binary_expr(
@@ -3463,6 +3495,7 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
         operator: ast::Operator,
         lhs: &ResolvedScopeExpr,
         rhs: &ResolvedScopeExpr,
+        written_literals: [bool; 2],
     ) -> Result<Option<hir::CustomBinaryOperator>> {
         if self.standard_operators_only || custom_operator_symbol(operator).is_none() {
             return Ok(None);
@@ -3479,7 +3512,12 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
         let one_custom_column = |column: &CustomOperatorColumn,
                                  other: &ResolvedScopeExpr,
                                  operand: hir::BinaryOperand| {
-            let encode_other = literal_matches_custom_type(other, column.definition.value());
+            let other_is_written_literal = match operand {
+                hir::BinaryOperand::Left => written_literals[0],
+                hir::BinaryOperand::Right => written_literals[1],
+            };
+            let encode_other = other_is_written_literal
+                && literal_matches_custom_type(other, column.definition.value());
             let pass_other_as_is = !operator.is_comparison()
                 && column.definition.value().decode_returns_value_unchanged();
             if !encode_other && !pass_other_as_is {
