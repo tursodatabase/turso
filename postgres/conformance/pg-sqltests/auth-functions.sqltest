@@ -1,0 +1,431 @@
+# The functions auth.uid(), auth.email() and auth.jwt().
+# tursopg has them only when it is built with the test_helper feature.
+
+@database :memory:
+@skip-file-if postgres "PostgreSQL has these functions only after CREATE FUNCTION creates them"
+
+test auth-functions-without-claims-return-null {
+    SELECT coalesce(auth.uid()::text, '<null>'), coalesce(auth.email(), '<null>'), coalesce(auth.jwt()::text, '<null>');
+}
+expect {
+    <null>|<null>|<null>
+}
+
+test auth-functions-read-request-jwt-claims {
+    SELECT set_config('request.jwt.claims', '{"sub": "a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11", "email": "user@example.com"}', false);
+    SELECT auth.uid(), auth.email(), auth.jwt();
+}
+expect {
+    {"sub": "a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11", "email": "user@example.com"}
+    a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11|user@example.com|{"sub": "a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11", "email": "user@example.com"}
+}
+
+test auth-functions-read-the-claim-settings-before-request-jwt-claims {
+    SELECT set_config('request.jwt.claims', '{"sub": "11111111-1111-1111-1111-111111111111", "email": "claims@example.com"}', false);
+    SELECT set_config('request.jwt.claim.sub', '22222222-2222-2222-2222-222222222222', false);
+    SELECT set_config('request.jwt.claim.email', 'claim@example.com', false);
+    SELECT auth.uid(), auth.email();
+}
+expect {
+    {"sub": "11111111-1111-1111-1111-111111111111", "email": "claims@example.com"}
+    22222222-2222-2222-2222-222222222222
+    claim@example.com
+    22222222-2222-2222-2222-222222222222|claim@example.com
+}
+
+test auth-functions-skip-empty-claim-settings {
+    SELECT quote_literal(set_config('request.jwt.claim.sub', '', false));
+    SELECT quote_literal(set_config('request.jwt.claim.email', '', false));
+    SELECT quote_literal(set_config('request.jwt.claim', '', false));
+    SELECT set_config('request.jwt.claims', '{"sub": "11111111-1111-1111-1111-111111111111", "email": "claims@example.com"}', false);
+    SELECT auth.uid(), auth.email(), auth.jwt();
+}
+expect {
+    ''
+    ''
+    ''
+    {"sub": "11111111-1111-1111-1111-111111111111", "email": "claims@example.com"}
+    11111111-1111-1111-1111-111111111111|claims@example.com|{"sub": "11111111-1111-1111-1111-111111111111", "email": "claims@example.com"}
+}
+
+test auth-functions-with-empty-request-jwt-claims-return-null {
+    SELECT quote_literal(set_config('request.jwt.claims', '', false));
+    SELECT coalesce(auth.uid()::text, '<null>'), coalesce(auth.email(), '<null>'), coalesce(auth.jwt()::text, '<null>');
+}
+expect {
+    ''
+    <null>|<null>|<null>
+}
+
+test auth-jwt-reads-request-jwt-claim-before-request-jwt-claims {
+    SELECT set_config('request.jwt.claim', '{"role": "first"}', false);
+    SELECT set_config('request.jwt.claims', '{"role": "second"}', false);
+    SELECT auth.jwt();
+    SELECT quote_literal(set_config('request.jwt.claim', '', false));
+    SELECT auth.jwt();
+}
+expect {
+    {"role": "first"}
+    {"role": "second"}
+    {"role": "first"}
+    ''
+    {"role": "second"}
+}
+
+test auth-jwt-claims-can-be-read-with-json-operators {
+    SELECT set_config('request.jwt.claims', '{"role": "authenticated", "app_metadata": {"provider": "email"}}', false);
+    SELECT auth.jwt() ->> 'role', auth.jwt() -> 'app_metadata' ->> 'provider', auth.jwt() -> 'role';
+}
+expect {
+    {"role": "authenticated", "app_metadata": {"provider": "email"}}
+    authenticated|email|"authenticated"
+}
+
+test auth-uid-prints-the-uuid-in-lowercase {
+    SELECT set_config('request.jwt.claim.sub', 'A0EEBC99-9C0B-4EF8-BB6D-6BB9BD380A11', false);
+    SELECT auth.uid();
+}
+expect {
+    A0EEBC99-9C0B-4EF8-BB6D-6BB9BD380A11
+    a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11
+}
+
+test auth-uid-accepts-the-uuid-input-forms-of-postgresql {
+    SELECT set_config('request.jwt.claim.sub', '{a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11}', false);
+    SELECT auth.uid();
+    SELECT set_config('request.jwt.claim.sub', 'a0eebc999c0b4ef8bb6d6bb9bd380a11', false);
+    SELECT auth.uid();
+    SELECT set_config('request.jwt.claim.sub', 'a0ee-bc99-9c0b-4ef8-bb6d-6bb9-bd38-0a11', false);
+    SELECT auth.uid();
+    SELECT set_config('request.jwt.claim.sub', '{a0eebc999c0b4ef8bb6d6bb9bd380a11}', false);
+    SELECT auth.uid();
+}
+expect {
+    {a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11}
+    a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11
+    a0eebc999c0b4ef8bb6d6bb9bd380a11
+    a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11
+    a0ee-bc99-9c0b-4ef8-bb6d-6bb9-bd38-0a11
+    a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11
+    {a0eebc999c0b4ef8bb6d6bb9bd380a11}
+    a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11
+}
+
+test auth-uid-of-text-that-is-not-a-uuid-errors {
+    SELECT set_config('request.jwt.claim.sub', 'not-a-uuid', false);
+    SELECT auth.uid();
+}
+expect error {
+    invalid input syntax for type uuid: "not-a-uuid"
+}
+
+test auth-uid-of-a-uuid-with-a-leading-space-errors {
+    SELECT set_config('request.jwt.claim.sub', ' a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11', false);
+    SELECT auth.uid();
+}
+expect error {
+    invalid input syntax for type uuid: " a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11"
+}
+
+test auth-uid-of-a-uuid-with-a-trailing-hyphen-errors {
+    SELECT set_config('request.jwt.claim.sub', 'a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11-', false);
+    SELECT auth.uid();
+}
+expect error {
+    invalid input syntax for type uuid: "a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11-"
+}
+
+test auth-uid-of-a-uuid-with-two-hyphens-in-a-row-errors {
+    SELECT set_config('request.jwt.claim.sub', 'a0eebc99--9c0b-4ef8-bb6d-6bb9bd380a11', false);
+    SELECT auth.uid();
+}
+expect error {
+    invalid input syntax for type uuid: "a0eebc99--9c0b-4ef8-bb6d-6bb9bd380a11"
+}
+
+test auth-uid-of-a-uuid-with-one-brace-errors {
+    SELECT set_config('request.jwt.claim.sub', 'a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11\}', false);
+    SELECT auth.uid();
+}
+expect error {
+    invalid input syntax for type uuid: "a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11
+}
+
+test auth-uid-of-a-short-uuid-errors {
+    SELECT set_config('request.jwt.claims', '{"sub": "a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a1"}', false);
+    SELECT auth.uid();
+}
+expect error {
+    invalid input syntax for type uuid: "a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a1"
+}
+
+test auth-uid-of-a-sub-claim-that-is-a-number-errors {
+    SELECT set_config('request.jwt.claims', '{"sub": 123}', false);
+    SELECT auth.uid();
+}
+expect error {
+    invalid input syntax for type uuid: "123"
+}
+
+test auth-functions-of-null-claims-return-null {
+    SELECT set_config('request.jwt.claims', '{"sub": null, "email": null}', false);
+    SELECT coalesce(auth.uid()::text, '<null>'), coalesce(auth.email(), '<null>');
+}
+expect {
+    {"sub": null, "email": null}
+    <null>|<null>
+}
+
+test auth-functions-of-missing-claims-return-null {
+    SELECT set_config('request.jwt.claims', '{"role": "anon"}', false);
+    SELECT coalesce(auth.uid()::text, '<null>'), coalesce(auth.email(), '<null>');
+}
+expect {
+    {"role": "anon"}
+    <null>|<null>
+}
+
+test auth-functions-of-claims-that-are-not-an-object-return-null {
+    SELECT set_config('request.jwt.claims', '[1, 2]', false);
+    SELECT coalesce(auth.uid()::text, '<null>'), coalesce(auth.email(), '<null>'), auth.jwt();
+}
+expect {
+    [1, 2]
+    <null>|<null>|[1, 2]
+}
+
+test auth-email-of-claims-that-are-not-text {
+    SELECT set_config('request.jwt.claims', '{"email": 123}', false);
+    SELECT auth.email();
+    SELECT set_config('request.jwt.claims', '{"email": true}', false);
+    SELECT auth.email();
+}
+expect {
+    {"email": 123}
+    123
+    {"email": true}
+    true
+}
+
+test auth-email-uses-the-last-of-two-claims-with-the-same-name {
+    SELECT set_config('request.jwt.claims', '{"email": "first@example.com", "email": "last@example.com"}', false);
+    SELECT auth.email();
+}
+expect {
+    {"email": "first@example.com", "email": "last@example.com"}
+    last@example.com
+}
+
+test auth-email-decodes-escapes {
+    SELECT set_config('request.jwt.claims', '{"email": "caf\u00e9 \"q\" \/"}', false);
+    SELECT auth.email();
+}
+expect {
+    {"email": "caf\u00e9 \"q\" \/"}
+    café "q" /
+}
+
+test auth-email-claim-name-is-case-sensitive {
+    SELECT set_config('request.jwt.claims', '{"Email": "user@example.com"}', false);
+    SELECT coalesce(auth.email(), '<null>');
+}
+expect {
+    {"Email": "user@example.com"}
+    <null>
+}
+
+test auth-email-ignores-white-space-in-claims {
+    SELECT quote_literal(set_config('request.jwt.claims', '  {"email" : "user@example.com"}  ', false));
+    SELECT auth.email();
+}
+expect {
+    '  {"email" : "user@example.com"}  '
+    user@example.com
+}
+
+test auth-email-of-claims-that-are-not-json-errors {
+    SELECT set_config('request.jwt.claims', 'not json', false);
+    SELECT auth.email();
+}
+expect error {
+    invalid input syntax for type json
+}
+
+test auth-uid-of-claims-that-are-not-json-errors {
+    SELECT set_config('request.jwt.claims', '\{"sub": "a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11"', false);
+    SELECT auth.uid();
+}
+expect error {
+    invalid input syntax for type json
+}
+
+test auth-jwt-of-claims-that-are-not-json-errors {
+    SELECT set_config('request.jwt.claims', 'not json', false);
+    SELECT auth.jwt();
+}
+expect error {
+    invalid input syntax for type json
+}
+
+test auth-email-of-claims-in-json5-errors {
+    SELECT set_config('request.jwt.claims', '{''email'': "user@example.com"}', false);
+    SELECT auth.email();
+}
+expect error {
+    invalid input syntax for type json
+}
+
+test auth-email-of-claims-with-a-trailing-comma-errors {
+    SELECT set_config('request.jwt.claims', '{"email": "user@example.com",}', false);
+    SELECT auth.email();
+}
+expect error {
+    invalid input syntax for type json
+}
+
+test auth-email-of-claims-with-a-nul-escape-errors {
+    SELECT set_config('request.jwt.claims', '{"role": "a\u0000b", "email": "user@example.com"}', false);
+    SELECT auth.email();
+}
+expect error {
+    unsupported Unicode escape sequence
+}
+
+test auth-functions-do-not-read-the-claims-when-the-claim-settings-are-set {
+    SELECT set_config('request.jwt.claims', 'not json', false);
+    SELECT set_config('request.jwt.claim.sub', 'a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11', false);
+    SELECT set_config('request.jwt.claim.email', 'user@example.com', false);
+    SELECT set_config('request.jwt.claim', '{"role": "authenticated"}', false);
+    SELECT auth.uid(), auth.email(), auth.jwt();
+}
+expect {
+    not json
+    a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11
+    user@example.com
+    {"role": "authenticated"}
+    a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11|user@example.com|{"role": "authenticated"}
+}
+
+test auth-functions-read-claims-that-are-set-earlier-in-the-same-select {
+    SELECT set_config('request.jwt.claims', '{"sub": "a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11", "email": "user@example.com"}', false), auth.uid(), auth.email(), auth.jwt() ->> 'email';
+}
+expect {
+    {"sub": "a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11", "email": "user@example.com"}|a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11|user@example.com|user@example.com
+}
+
+test auth-uid-reads-claims-that-are-set-for-the-transaction {
+    BEGIN;
+    SELECT set_config('request.jwt.claims', '{"sub": "a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11"}', true);
+    SELECT auth.uid();
+    COMMIT;
+    SELECT coalesce(auth.uid()::text, '<null>');
+}
+expect {
+    {"sub": "a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11"}
+    a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11
+    <null>
+}
+
+test auth-uid-forgets-claims-that-are-rolled-back {
+    SELECT set_config('request.jwt.claim.sub', '11111111-1111-1111-1111-111111111111', false);
+    BEGIN;
+    SELECT set_config('request.jwt.claim.sub', '22222222-2222-2222-2222-222222222222', false);
+    SELECT auth.uid();
+    ROLLBACK;
+    SELECT auth.uid();
+}
+expect {
+    11111111-1111-1111-1111-111111111111
+    22222222-2222-2222-2222-222222222222
+    22222222-2222-2222-2222-222222222222
+    11111111-1111-1111-1111-111111111111
+}
+
+test auth-uid-finds-the-rows-of-the-user {
+    CREATE TABLE todos (id int, user_id uuid, task text);
+    INSERT INTO todos VALUES (1, 'a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11', 'mine'), (2, '11111111-1111-1111-1111-111111111111', 'theirs');
+    SELECT set_config('request.jwt.claim.sub', 'A0EEBC99-9C0B-4EF8-BB6D-6BB9BD380A11', false);
+    SELECT task FROM todos WHERE user_id = auth.uid();
+    SELECT task FROM todos WHERE user_id = (SELECT auth.uid());
+}
+expect {
+    A0EEBC99-9C0B-4EF8-BB6D-6BB9BD380A11
+    mine
+    mine
+}
+
+test auth-uid-in-a-column-default {
+    SELECT set_config('request.jwt.claim.sub', 'a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11', false);
+    CREATE TABLE notes (owner uuid DEFAULT auth.uid(), body text);
+    INSERT INTO notes (body) VALUES ('hello');
+    SELECT owner, body FROM notes;
+}
+expect {
+    a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11
+    a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11|hello
+}
+
+test auth-uid-in-a-view {
+    CREATE TABLE todos (user_id uuid, task text);
+    INSERT INTO todos VALUES ('a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11', 'mine'), ('11111111-1111-1111-1111-111111111111', 'theirs');
+    CREATE VIEW my_todos AS SELECT task FROM todos WHERE user_id = auth.uid();
+    SELECT set_config('request.jwt.claim.sub', '11111111-1111-1111-1111-111111111111', false);
+    SELECT task FROM my_todos;
+}
+expect {
+    11111111-1111-1111-1111-111111111111
+    theirs
+}
+
+test auth-uid-finds-the-user-in-a-table-of-the-auth-schema {
+    CREATE SCHEMA IF NOT EXISTS auth;
+    DROP TABLE IF EXISTS auth.users;
+    CREATE TABLE auth.users (id uuid, email text);
+    INSERT INTO auth.users VALUES ('a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11', 'user@example.com'), ('11111111-1111-1111-1111-111111111111', 'other@example.com');
+    SELECT set_config('request.jwt.claims', '{"sub": "a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11"}', false);
+    SELECT email FROM auth.users WHERE id = auth.uid();
+}
+expect {
+    {"sub": "a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11"}
+    user@example.com
+}
+
+test auth-uid-in-an-index-expression-errors {
+    CREATE TABLE notes (owner uuid);
+    CREATE INDEX notes_owner ON notes ((auth.uid()));
+}
+expect error {
+    index
+}
+
+test auth-uid-in-a-partial-index-predicate-errors {
+    CREATE TABLE notes (owner uuid);
+    CREATE INDEX notes_owner ON notes (owner) WHERE owner = auth.uid();
+}
+expect error {
+    index
+}
+
+test auth-function-that-does-not-exist-errors {
+    SELECT auth.no_such_function();
+}
+expect error {
+    auth\.no_such_function
+}
+
+test auth-uid-with-an-argument-errors {
+    SELECT auth.uid(1);
+}
+expect error {
+    auth\.uid
+}
+
+@skip-if postgres "PostgreSQL prints a jsonb value with its own key order and spacing"
+test auth-jwt-returns-the-claims-as-they-were-set {
+    SELECT set_config('request.jwt.claims', '{"sub":"a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11","email":"user@example.com"}', false);
+    SELECT auth.jwt();
+}
+expect {
+    {"sub":"a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11","email":"user@example.com"}
+    {"sub":"a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11","email":"user@example.com"}
+}
