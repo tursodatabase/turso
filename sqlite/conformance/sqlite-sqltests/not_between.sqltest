@@ -82,3 +82,14 @@ test not-between-subquery-bound-orderby-offset {
 expect {
     0
 }
+
+test between-text-bound-does-not-change-the-value-for-the-other-bound {
+    CREATE TABLE t3 (a INTEGER PRIMARY KEY, p INTEGER);
+    INSERT INTO t3 VALUES (1, -349777);
+    SELECT 124799 BETWEEN CAST(p AS TEXT) AND 424040,
+           124799 NOT BETWEEN CAST(p AS TEXT) AND 424040
+    FROM t3;
+}
+expect {
+    1|0
+}
