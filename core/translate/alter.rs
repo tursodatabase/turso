@@ -665,7 +665,7 @@ fn emit_column_constraints_validation(
                 op: Operation::default_scan_for(&table),
                 unmatched_right_rows_plan: None,
                 table,
-                identifier: resolved_table.name.clone(),
+                identifier: resolver.name_in_namespace(database_id, &resolved_table.name),
                 internal_id: program.table_reference_counter.next(),
                 join_info: None,
                 col_used_mask: ColumnUsedMask::default(),
@@ -1295,7 +1295,7 @@ pub fn translate_alter_table(
                             .iter()
                             .filter_map(|c| c.name.as_deref())
                             .collect();
-                        validate_check_expr(expr, &btree.name, &column_names, resolver)?;
+                        validate_check_expr(expr, &resolved.name, &column_names, resolver)?;
                         btree.check_constraints.push(CheckConstraint::new(
                             constraint.name.as_ref(),
                             expr,
@@ -1849,7 +1849,7 @@ pub fn translate_alter_table(
                     .collect();
                 for constraint in &definition.constraints {
                     if let ast::ColumnConstraint::Check { expr, .. } = &constraint.constraint {
-                        validate_check_expr(expr, &table.name, &column_names, resolver)?;
+                        validate_check_expr(expr, &resolved.name, &column_names, resolver)?;
                     }
                 }
                 Some(table)

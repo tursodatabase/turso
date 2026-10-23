@@ -1134,6 +1134,13 @@ impl<'a> Resolver<'a> {
             .expect("a database has a namespace")
     }
 
+    /// The name an object stored as `stored_name` has in its namespace:
+    /// the stored name without the prefix of that namespace.
+    pub(crate) fn name_in_namespace(&self, database_id: usize, stored_name: &str) -> String {
+        let namespace = self.namespace_of_stored_name(database_id, stored_name);
+        stored_name[namespace.prefix.len()..].to_string()
+    }
+
     pub(crate) fn namespace_of_stored_name(
         &self,
         database_id: usize,
@@ -2613,7 +2620,8 @@ fn emit_check_constraint_bytecode(
             if let Some(joined_table) = binding_tables.joined_tables_mut().first_mut() {
                 // CHECK expressions come from schema SQL and may use the base table name
                 // even when the query references the table through an alias.
-                joined_table.identifier = table_name.to_string();
+                joined_table.identifier =
+                    resolver.name_in_namespace(joined_table.database_id, table_name);
             }
             bind_and_rewrite_expr(
                 &mut rewritten_expr,

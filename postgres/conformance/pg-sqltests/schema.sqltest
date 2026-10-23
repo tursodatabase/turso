@@ -605,3 +605,46 @@ test view-keeps-every-cte-of-a-recursive-with-in-scope {
 expect {
     1
 }
+
+test check-constraint-names-the-table-by-its-name-in-the-schema {
+    CREATE SCHEMA app;
+    CREATE TABLE app.t (x int CHECK (t.x > 0), y int);
+    INSERT INTO app.t VALUES (1, 1);
+    SELECT x, y FROM app.t;
+}
+expect {
+    1|1
+}
+
+test check-constraint-naming-the-table-by-its-name-in-the-schema-rejects-a-row {
+    CREATE SCHEMA app;
+    CREATE TABLE app.t (x int CHECK (t.x > 0));
+    INSERT INTO app.t VALUES (1);
+    INSERT INTO app.t VALUES (-1);
+}
+expect error {
+}
+
+test indexes-name-the-table-by-its-name-in-the-schema {
+    CREATE SCHEMA app;
+    CREATE TABLE app.t (x int, y int);
+    CREATE UNIQUE INDEX u ON app.t (x) WHERE t.x > 10;
+    CREATE INDEX j ON app.t ((t.x + 1));
+    INSERT INTO app.t VALUES (1, 1), (11, 2);
+    INSERT INTO app.t VALUES (11, 3) ON CONFLICT (x) WHERE t.x > 10 DO NOTHING;
+    SELECT count(*) FROM app.t;
+    SELECT count(*) FROM app.t WHERE x + 1 = 12;
+}
+expect {
+    2
+    1
+}
+
+test column-named-with-a-schema-whose-table-is-not-in-from-errors {
+    CREATE SCHEMA app;
+    CREATE TABLE app.t (x int);
+    CREATE TABLE t (x int);
+    SELECT public.t.x FROM app.t;
+}
+expect error {
+}

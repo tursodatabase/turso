@@ -415,9 +415,50 @@ pub fn bind_and_rewrite_expr<'a>(
                                 let is_rowid_alias = col.is_rowid_alias();
                                 let normalized_tbl_name = normalize_ident(&tbl_name_str);
                                 let matching_tbl = referenced_tables
-                                    .find_table_and_internal_id_by_identifier(&normalized_tbl_name);
+                                    .joined_tables()
+                                    .iter()
+                                    .find(|joined| joined.identifier == normalized_tbl_name)
+                                    .map(|joined| {
+                                        (
+                                            joined.internal_id,
+                                            table_is_in_namespace(
+                                                resolver,
+                                                &joined.table,
+                                                joined.database_id,
+                                                &namespace,
+                                            ),
+                                        )
+                                    })
+                                    .or_else(|| {
+                                        referenced_tables
+                                            .outer_query_refs()
+                                            .iter()
+                                            .find(|outer| {
+                                                outer.identifier == normalized_tbl_name
+                                                    && !outer.cte_definition_only
+                                            })
+                                            .map(|outer| {
+                                                (
+                                                    outer.internal_id,
+                                                    table_is_in_namespace(
+                                                        resolver,
+                                                        &outer.table,
+                                                        outer.database_id,
+                                                        &namespace,
+                                                    ),
+                                                )
+                                            })
+                                    });
 
-                                if let Some((tbl_id, _)) = matching_tbl {
+                                if let Some((_, false)) = matching_tbl {
+                                    crate::bail_parse_error!(
+                                        "no such column: {}.{}.{}",
+                                        db_name_str,
+                                        tbl_name_str,
+                                        col_name_str
+                                    );
+                                }
+                                if let Some((tbl_id, true)) = matching_tbl {
                                     *expr = Expr::Column {
                                         database: None,
                                         table: tbl_id,

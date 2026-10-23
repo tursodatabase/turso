@@ -27,6 +27,7 @@ use crate::{
             emit_guarded_fk_decrement, emit_skip_if_any_null, index_probe, index_scan_match_any,
             open_read_index, open_read_table, ForeignKeyActions,
         },
+        index::drop_qualifier_of_own_columns,
         plan::{
             ColumnUsedMask, EvalAt, JoinedTable, Operation, QueryDestination, ResultSetColumn,
             TableReferences,
@@ -2131,6 +2132,16 @@ fn bind_insert(
                     resolver,
                     BindingBehavior::AllowUnboundIdentifiers,
                 )?;
+            }
+        }
+        if resolver.dialect.binds_names_at_create() {
+            if let Some(where_clause) = upsert_opt
+                .index
+                .as_mut()
+                .and_then(|target| target.where_clause.as_mut())
+            {
+                let table_identifier = resolver.name_in_namespace(database_id, table.get_name());
+                drop_qualifier_of_own_columns(where_clause, &table_identifier)?;
             }
         }
         let next = upsert_opt.next.take();

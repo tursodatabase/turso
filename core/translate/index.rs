@@ -13,7 +13,7 @@ use crate::translate::{
     },
     expr::{
         bind_and_rewrite_expr, emit_stored_column, translate_condition_expr, translate_expr,
-        unwrap_parens, walk_expr, BindingBehavior, ConditionMetadata, WalkControl,
+        unwrap_parens, walk_expr, walk_expr_mut, BindingBehavior, ConditionMetadata, WalkControl,
     },
     insert::format_unique_violation_desc,
     plan::{ColumnUsedMask, IterationDirection, JoinedTable, Operation, Scan, TableReferences},
@@ -112,6 +112,26 @@ pub fn translate_create_index(
 
     let original_idx_name = idx_name;
     let original_tbl_name = tbl_name;
+    let (mut columns, mut where_clause) = (columns, where_clause);
+    if resolver.dialect.binds_names_at_create() {
+        let table_identifier = normalize_ident(original_tbl_name.as_str());
+        for column in &mut columns {
+            drop_qualifier_of_own_columns(&mut column.expr, &table_identifier)?;
+        }
+        if let Some(where_clause) = &mut where_clause {
+            drop_qualifier_of_own_columns(where_clause, &table_identifier)?;
+        }
+    }
+    let mut written_stmt = written_stmt;
+    if let ast::Stmt::CreateIndex {
+        columns: written_columns,
+        where_clause: written_where_clause,
+        ..
+    } = &mut written_stmt
+    {
+        written_columns.clone_from(&columns);
+        written_where_clause.clone_from(&where_clause);
+    }
     let namespace = if original_idx_name.namespace.is_some() {
         resolver.resolve_object(&original_idx_name)?.namespace
     } else {
@@ -338,6 +358,25 @@ pub fn translate_create_index(
         cursor_id: sqlite_schema_cursor_id,
     });
 
+    Ok(())
+}
+
+/// Writes a column of the index's own table that the index names with the
+/// table name, like t.x, as the bare column, like x, so that the stored
+/// text of the index names no table: the table is stored under another
+/// name than the one it was written with.
+pub(crate) fn drop_qualifier_of_own_columns(
+    expr: &mut Expr,
+    table_identifier: &str,
+) -> crate::Result<()> {
+    walk_expr_mut(expr, &mut |expr: &mut Expr| {
+        if let Expr::Qualified(table, column) | Expr::DoublyQualified(_, table, column) = expr {
+            if normalize_ident(table.as_str()) == table_identifier {
+                *expr = Expr::Id(column.clone());
+            }
+        }
+        Ok(WalkControl::Continue)
+    })?;
     Ok(())
 }
 

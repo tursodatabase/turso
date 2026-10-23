@@ -5646,6 +5646,44 @@ mod tests {
     }
 
     #[test]
+    fn test_the_expressions_of_a_table_name_it_by_its_name_in_the_namespace() {
+        let temp_dir = TempDir::new().unwrap();
+        let conn = open_connection_with_dialect(
+            &temp_dir.path().join("main.db"),
+            DatabaseOpts::new(),
+            Arc::new(BindingDialect),
+        );
+        conn.add_namespace(crate::Namespace {
+            name: "app".to_string(),
+            database_id: MAIN_DB_ID,
+            prefix: "app.".to_string(),
+        });
+        conn.execute("CREATE TABLE app.t(x INTEGER CHECK (t.x > 0))")
+            .unwrap();
+        conn.execute("ALTER TABLE app.t ADD COLUMN y INTEGER CHECK (t.y <> 7)")
+            .unwrap();
+        conn.execute("CREATE UNIQUE INDEX app.u ON t (x) WHERE t.x > 10")
+            .unwrap();
+        conn.execute("CREATE INDEX app.j ON t ((t.x + 1))").unwrap();
+        conn.execute("INSERT INTO app.t VALUES(1, 1), (11, 2)")
+            .unwrap();
+        conn.execute("INSERT INTO app.t VALUES(11, 3) ON CONFLICT(x) WHERE t.x > 10 DO NOTHING")
+            .unwrap();
+        assert!(conn.execute("INSERT INTO app.t VALUES(-1, 1)").is_err());
+        assert!(conn.execute("INSERT INTO app.t VALUES(2, 7)").is_err());
+        assert_eq!(query_single_i64(&conn, "SELECT count(*) FROM app.t"), 2);
+        assert_eq!(
+            query_single_i64(&conn, "SELECT count(*) FROM app.t WHERE x + 1 = 12"),
+            1
+        );
+
+        conn.execute("CREATE TABLE t(x INTEGER); INSERT INTO t VALUES(5)")
+            .unwrap();
+        assert!(conn.prepare("SELECT main.t.x FROM app.t").is_err());
+        assert!(conn.prepare("SELECT app.t.x FROM main.t").is_err());
+    }
+
+    #[test]
     fn test_named_memory_parent_can_attach_real_file_database() {
         let temp_dir = TempDir::new().unwrap();
         let aux_path = temp_dir.path().join("aux.db");

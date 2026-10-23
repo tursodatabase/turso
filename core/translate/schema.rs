@@ -736,6 +736,7 @@ fn validate_check_types_in_expr(
 fn validate(
     body: &ast::CreateTableBody,
     table_name: &str,
+    written_table_name: &str,
     resolver: &Resolver,
     conn: &Connection,
 ) -> Result<()> {
@@ -756,7 +757,7 @@ fn validate(
             for constraint in &col_i.constraints {
                 match &constraint.constraint {
                     ast::ColumnConstraint::Check { expr, .. } => {
-                        validate_check_expr(expr, table_name, &column_names, resolver)?;
+                        validate_check_expr(expr, written_table_name, &column_names, resolver)?;
                     }
                     ast::ColumnConstraint::Generated { .. }
                         if !conn.experimental_generated_columns_enabled() =>
@@ -793,7 +794,7 @@ fn validate(
         }
         for constraint in constraints {
             if let ast::TableConstraint::Check { ref expr, .. } = constraint.constraint {
-                validate_check_expr(expr, table_name, &column_names, resolver)?;
+                validate_check_expr(expr, written_table_name, &column_names, resolver)?;
             }
         }
 
@@ -1163,8 +1164,15 @@ pub fn translate_create_table(
     program.begin_write_on_database(database_id, schema_cookie)?;
     let tbl_name_in_sql =
         ast::QualifiedName::single(resolved.namespace.name_in_sql(&tbl_name.name));
+    let written_tbl_name = resolved.name;
     let normalized_tbl_name = resolved.stored_name;
-    validate(&body, &normalized_tbl_name, resolver, connection)?;
+    validate(
+        &body,
+        &normalized_tbl_name,
+        &written_tbl_name,
+        resolver,
+        connection,
+    )?;
     let bound_sequence_names = resolver.dialect.binds_names_at_create()
         && bind_default_sequence_names(&mut body, resolver)?;
 
