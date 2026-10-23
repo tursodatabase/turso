@@ -3308,7 +3308,7 @@ impl Connection {
         &self.attached_databases
     }
 
-    pub(crate) fn namespaces(&self) -> &crate::Namespaces {
+    pub fn namespaces(&self) -> &crate::Namespaces {
         &self.namespaces
     }
 
@@ -3328,14 +3328,6 @@ impl Connection {
         self.namespaces
             .of_database(database_id)
             .map(|namespace| namespace.name)
-    }
-
-    pub fn namespace(&self, name: &str) -> Option<crate::Namespace> {
-        self.namespaces.get(name)
-    }
-
-    pub fn other_namespaces(&self) -> Vec<crate::Namespace> {
-        self.namespaces.others()
     }
 
     /// Sets the namespace names that a name without a namespace is looked

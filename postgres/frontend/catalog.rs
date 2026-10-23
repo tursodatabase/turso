@@ -2868,7 +2868,8 @@ const PUBLIC_NAMESPACE_OID: i64 = 2200;
 const FIRST_USER_SCHEMA_OID: i64 = 16384;
 
 fn user_schemas(conn: &Connection) -> Vec<UserSchema> {
-    conn.other_namespaces()
+    conn.namespaces()
+        .others()
         .into_iter()
         .filter(|namespace| {
             namespace.database_id == turso_core::MAIN_DB_ID && !namespace.prefix.is_empty()

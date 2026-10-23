@@ -327,7 +327,11 @@ fn relation_name_is_taken(
     name: &str,
 ) -> Result<bool> {
     let namespaces: Vec<Namespace> = match schema {
-        Some(schema) => conn.namespace(&schema.to_lowercase()).into_iter().collect(),
+        Some(schema) => conn
+            .namespaces()
+            .get(&schema.to_lowercase())
+            .into_iter()
+            .collect(),
         None => {
             let has_temp = conn
                 .list_all_databases()
@@ -944,7 +948,8 @@ pub(crate) fn sync_namespaces(conn: &Connection) {
     conn.maybe_update_schema();
     let wanted = schema_names(conn);
     let current: Vec<String> = conn
-        .other_namespaces()
+        .namespaces()
+        .others()
         .into_iter()
         .filter(|namespace| {
             namespace.database_id == turso_core::MAIN_DB_ID && !namespace.prefix.is_empty()
