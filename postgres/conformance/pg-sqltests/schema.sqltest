@@ -498,3 +498,16 @@ expect {
     app
     app
 }
+
+test catalogs-list-the-objects-of-a-schema-named-with-a-system-prefix {
+    CREATE SCHEMA json_app;
+    CREATE TABLE json_app.t (x int PRIMARY KEY);
+    SELECT schemaname, tablename FROM pg_tables WHERE schemaname = 'json_app';
+    SELECT count(*) FROM pg_class WHERE relname = 't';
+    SELECT conname FROM pg_constraint WHERE conrelid IN (SELECT oid FROM pg_class WHERE relname = 't');
+}
+expect {
+    json_app|t
+    1
+    t_pkey
+}

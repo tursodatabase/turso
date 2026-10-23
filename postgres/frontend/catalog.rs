@@ -11,6 +11,7 @@ use turso_core::{
 };
 use turso_ext::{ConstraintInfo, IndexInfo, OrderByInfo, ResultCode, VTabKind};
 use turso_parser::ast::RefAct;
+use turso_pg_parser::translator::stored_name_prefix;
 
 pub use turso_pg_parser::translator::is_catalog_table_name;
 
@@ -194,20 +195,43 @@ pub fn decode_stored_pg_schema_sql(sql: &str) -> Option<&str> {
 /// Returns an iterator of (table_name, table_ref) for user tables in deterministic order.
 /// Both pg_class and pg_attribute must use this function to ensure consistent OID assignment.
 fn user_tables_sorted(schema: &Schema) -> Vec<(&String, &Arc<Table>)> {
+    let prefixes = schema_prefixes(schema);
     let mut tables: Vec<_> = schema
         .tables
         .iter()
         .filter(|(name, table)| {
             // Skip virtual tables and subqueries
-            !is_system_table_name(name) && matches!(table.as_ref(), Table::BTree(_))
+            !is_system_table_name(name_in_schema(name, &prefixes))
+                && matches!(table.as_ref(), Table::BTree(_))
         })
         .collect();
     tables.sort_by_key(|(name, _)| *name);
     tables
 }
 
-/// Whether `name` is a table that the engine or this frontend owns, rather
-/// than the user.
+/// The stored name prefixes of the schemas of the main database, read
+/// from their marker tables.
+fn schema_prefixes(schema: &Schema) -> Vec<String> {
+    schema
+        .tables
+        .keys()
+        .filter_map(|table| table.strip_prefix(crate::session::SCHEMA_MARKER_PREFIX))
+        .map(stored_name_prefix)
+        .collect()
+}
+
+/// The name an object has in its schema: its stored name without the
+/// longest schema prefix it starts with.
+fn name_in_schema<'a>(stored: &'a str, prefixes: &[String]) -> &'a str {
+    prefixes
+        .iter()
+        .filter(|prefix| stored.starts_with(prefix.as_str()))
+        .max_by_key(|prefix| prefix.len())
+        .map_or(stored, |prefix| &stored[prefix.len()..])
+}
+
+/// Whether `name`, the name an object has in its schema, is one the engine
+/// or this frontend owns, rather than the user.
 fn is_system_table_name(name: &str) -> bool {
     ["sqlite_", "pg_", "pragma_", "json_", "__turso_internal_"]
         .iter()
@@ -3248,8 +3272,9 @@ impl PgGetTableDefCursor {
         let schema = self.conn.current_schema();
         self.rows.clear();
 
+        let prefixes = schema_prefixes(&schema);
         for (table_name, table) in &schema.tables {
-            if is_system_table_name(table_name) {
+            if is_system_table_name(name_in_schema(table_name, &prefixes)) {
                 continue;
             }
 

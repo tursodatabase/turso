@@ -44,7 +44,7 @@ pub(crate) const DEFAULT_SEARCH_PATH: &str = "\"$user\", public";
 /// empty schema has no table, so each schema has a marker table. The
 /// marker is a row of the schema, so the schemas are rebuilt from the
 /// schema whenever it reloads.
-const SCHEMA_MARKER_PREFIX: &str = "pg_turso_schema_";
+pub(crate) const SCHEMA_MARKER_PREFIX: &str = "pg_turso_schema_";
 
 /// Open a database with the PostgreSQL schema dialect, resolving the IO
 /// backend from `vfs` or the path like [`turso_core::Database::open_new`].
