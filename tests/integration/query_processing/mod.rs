@@ -7,6 +7,7 @@ mod test_in_seek;
 mod test_is_seek;
 mod test_materialized_view_commit;
 mod test_multi_index_scan;
+mod test_predicate_normalization;
 mod test_read_path;
 mod test_vacuum;
 mod test_vacuum_into_mvcc;

@@ -20,6 +20,22 @@ The optimizer processes a query in this order:
 8. It includes sort work when an order can remove a later sort.
 9. It writes the selected order, methods, costs, and row estimates into the plan.
 
+## Conditions
+
+The planner splits each `WHERE`, `ON`, and `HAVING` predicate into conditions.
+It converts the predicate to conjunctive normal form first: an AND of ORs.
+The optimizer reads index constraints from one condition at a time.
+
+Each NOT moves inwards.
+Thus `NOT (a > 5 OR b > 5)` gives the two conditions `a <= 5` and `b <= 5`.
+Each condition can drive an index seek.
+
+ORs distribute over ANDs only when the clauses stay the same size or get smaller.
+Thus `(a AND b) OR (a AND c)` gives the conditions `a` and `b OR c`.
+`(a AND b) OR (c AND d)` keeps its shape, because the optimizer can read one index per OR branch.
+
+See `break_predicate_at_and_boundaries` in `core/translate/planner.rs`.
+
 ## Equality classes
 
 An equality class links columns that must have equal values.
