@@ -12,7 +12,10 @@ use turso_parser::ast::{ResolveType, TriggerTime};
 
 use super::emit::{any_effective_replace, constraint_may_abort, format_unique_violation_desc};
 use crate::{
-    error::{SQLITE_CONSTRAINT_NOTNULL, SQLITE_CONSTRAINT_PRIMARYKEY, SQLITE_CONSTRAINT_UNIQUE},
+    error::{
+        SQLITE_CONSTRAINT_NOTNULL, SQLITE_CONSTRAINT_PRIMARYKEY, SQLITE_CONSTRAINT_UNIQUE,
+        SQLITE_ERROR,
+    },
     schema::{Column, EXPR_INDEX_SENTINEL},
     translate::{
         plan::QueryDestination,
@@ -100,6 +103,7 @@ pub(super) fn emit_insert(
     subprograms: &Subprograms<'_>,
     mvcc: bool,
     enforce_checks: bool,
+    upsert_rejects_rewritten_row: bool,
 ) -> Result<()> {
     let triggers = &subprograms.triggers[..];
     if subprograms.upsert_actions.len() != insert.upserts.len() {
@@ -215,9 +219,21 @@ pub(super) fn emit_insert(
     let table_cursor = target.open_table_for_write(program);
     let index_cursors = target.open_indexes_for_write(program, None)?;
     let sequence = sequence.as_ref().map(|sequence| sequence.begin(program));
+    // PostgreSQL: a DO UPDATE of a row this statement already inserted or
+    // updated fails, so the result does not depend on the order of the
+    // rows. The rowids written so far are kept in an ephemeral table.
+    let written_rowids = (upsert_rejects_rewritten_row && has_do_update).then(|| {
+        let cursor = program.alloc_cursor_id(CursorType::BTreeTable(table.clone()));
+        program.emit_insn(Insn::OpenEphemeral {
+            cursor_id: cursor,
+            is_table: true,
+        });
+        cursor
+    });
     let row = InsertRow {
         target: &target,
         table_cursor,
+        written_rowids,
         rowid: program.alloc_register(),
         columns: program.alloc_registers(table.columns().len()),
         or_conflict,
@@ -754,6 +770,9 @@ struct InsertRow<'a> {
     upsert_new: Option<hir::SourceId>,
     /// The rowid of the row an UPSERT conflicts with.
     conflict_rowid: usize,
+    /// The rowids the statement wrote so far, when a DO UPDATE of one of
+    /// them fails.
+    written_rowids: Option<CursorID>,
     /// False under `PRAGMA ignore_check_constraints`.
     enforce_checks: bool,
     /// AUTOINCREMENT: the target's sequence.
@@ -1116,6 +1135,7 @@ impl InsertRow<'_> {
             flag,
             table_name: table.name.clone(),
         });
+        self.emit_remember_written_rowid(program, self.rowid);
         // The change is captured as soon as the row is written, before an
         // AFTER trigger it fires captures rows of its own: a consumer
         // replays the rows in change id order.
@@ -1238,6 +1258,22 @@ impl InsertRow<'_> {
                 rowid: Some(self.rowid),
             },
         );
+        if let Some(written_rowids) = self.written_rowids {
+            let not_written = program.allocate_label();
+            program.emit_insn(Insn::NotExists {
+                cursor: written_rowids,
+                rowid_reg: conflict,
+                target_pc: not_written,
+            });
+            program.emit_insn(Insn::Halt {
+                err_code: SQLITE_ERROR,
+                description: "ON CONFLICT DO UPDATE command cannot affect row a second time"
+                    .to_string(),
+                on_error: None,
+                description_reg: None,
+            });
+            program.preassign_label_to_next_insn(not_written);
+        }
         if let Some(predicate) = predicate {
             let register = program.alloc_register();
             super::expr::translate_expr_no_constant_opt(program, document, predicate, register)?;
@@ -1774,6 +1810,7 @@ impl InsertRow<'_> {
             flag,
             table_name: table.name.clone(),
         });
+        self.emit_remember_written_rowid(program, written);
         // Like UPDATE, the change is captured as soon as the row is written,
         // before a foreign-key action or an AFTER trigger it fires captures
         // rows of its own. A moved row is captured as deleted and inserted.
@@ -1850,6 +1887,29 @@ impl InsertRow<'_> {
             target_pc: row_done,
         });
         Ok(())
+    }
+
+    /// Keep the rowid of a row the statement wrote, when a DO UPDATE of it
+    /// fails.
+    fn emit_remember_written_rowid(&self, program: &mut ProgramBuilder, rowid: usize) {
+        let Some(written_rowids) = self.written_rowids else {
+            return;
+        };
+        let record = program.alloc_register();
+        program.emit_insn(Insn::MakeRecord {
+            start_reg: to_u32(rowid),
+            count: 0,
+            dest_reg: to_u32(record),
+            index_name: None,
+            affinity_str: None,
+        });
+        program.emit_insn(Insn::Insert {
+            cursor: written_rowids,
+            key_reg: rowid,
+            record_reg: record,
+            flag: InsertFlags::new().is_ephemeral_table_insert(),
+            table_name: self.target.table.name.clone(),
+        });
     }
 
     /// The first UPSERT whose conflict target names `constraint`.
@@ -2406,7 +2466,16 @@ mod tests {
         let mut program = program();
         program.set_hir_plan(plan.clone());
         let subprograms = Subprograms::default();
-        emit_insert(&mut program, &plan, insert, &subprograms, false, true).unwrap();
+        emit_insert(
+            &mut program,
+            &plan,
+            insert,
+            &subprograms,
+            false,
+            true,
+            false,
+        )
+        .unwrap();
         let checked = program
             .insns
             .iter()
@@ -2478,7 +2547,16 @@ mod tests {
             upsert_actions: insert.upserts.iter().map(|_| Vec::new()).collect(),
             ..Subprograms::default()
         };
-        emit_insert(&mut program, &plan, insert, &subprograms, false, true).unwrap();
+        emit_insert(
+            &mut program,
+            &plan,
+            insert,
+            &subprograms,
+            false,
+            true,
+            false,
+        )
+        .unwrap();
         program
     }
 
@@ -2565,7 +2643,7 @@ mod tests {
             for mvcc in [false, true] {
                 let mut program = program();
                 program.set_hir_plan(plan.clone());
-                emit_insert(&mut program, &plan, insert, &subprograms, mvcc, true).unwrap();
+                emit_insert(&mut program, &plan, insert, &subprograms, mvcc, true, false).unwrap();
                 let sequence_writes = count(&program, |insn| {
                     matches!(insn, Insn::SequenceBeginInnerTx { .. })
                 });
@@ -2614,7 +2692,16 @@ mod tests {
             upsert_actions: insert.upserts.iter().map(|_| Vec::new()).collect(),
             ..Subprograms::default()
         };
-        emit_insert(&mut program, &plan, insert, &subprograms, false, true).unwrap();
+        emit_insert(
+            &mut program,
+            &plan,
+            insert,
+            &subprograms,
+            false,
+            true,
+            false,
+        )
+        .unwrap();
         program
     }
 
@@ -2781,6 +2868,7 @@ mod tests {
             &Subprograms::default(),
             false,
             true,
+            false,
         )
         .unwrap();
         // Each array is parsed and stored as a record blob; only the outer

@@ -221,6 +221,9 @@ fn compile_trigger(
                     subprograms,
                     super::uses_mvcc(connection, &plan.document, insert.target),
                     !connection.check_constraints_ignored(),
+                    connection
+                        .dialect()
+                        .upsert_rejects_row_written_by_same_statement(),
                 )?;
                 builder.emit_insn(Insn::ResetCount);
             }

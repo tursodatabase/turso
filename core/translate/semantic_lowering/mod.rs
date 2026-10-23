@@ -594,6 +594,9 @@ pub(crate) fn translate_insert(
         &subprograms,
         uses_mvcc(connection, &plan.document, insert.target),
         !connection.check_constraints_ignored(),
+        connection
+            .dialect()
+            .upsert_rejects_row_written_by_same_statement(),
     )?;
     if let Some(returning) = &insert.returning {
         program.resolved_result_columns =

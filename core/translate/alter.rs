@@ -17,8 +17,7 @@ use crate::{
     function::{AlterTableFunc, Func},
     schema::{
         collect_column_dependencies_of_expr, CheckConstraint, Column, ColumnLayout, ForeignKey,
-        FromDefinitionFlags, GeneratedType, Index, Schema, EXPR_INDEX_SENTINEL,
-        RESERVED_TABLE_PREFIXES,
+        FromDefinitionFlags, Index, Schema, EXPR_INDEX_SENTINEL, RESERVED_TABLE_PREFIXES,
     },
     translate::{
         expr::{walk_expr, walk_expr_mut, WalkControl},
@@ -561,10 +560,11 @@ fn emit_add_column_default_type_validation(
 
 /// Check NOT NULL and the CHECK constraints of a new or altered column
 /// against every existing row, as SQLite does. The rows are read through a
-/// planned HIR SELECT of the table as it is before the change: a virtual
-/// generated column's value is its expression, and each CHECK has the
-/// column's name replaced by that expression; any other column is read as
-/// stored. Like DML, a CHECK reads custom-typed columns as stored.
+/// planned HIR SELECT of the table as it will be, which `catalog` must
+/// hold: a new column reads its DEFAULT with the column's affinity, a
+/// virtual generated column computes its expression, and any other column
+/// is read as stored. Like DML, a CHECK reads custom-typed columns as
+/// stored. A STRICT table also checks the column's domain.
 fn emit_column_constraints_validation(
     program: &mut ProgramBuilder,
     table: &BTreeTable,
@@ -575,7 +575,7 @@ fn emit_column_constraints_validation(
     database_id: usize,
 ) -> Result<()> {
     let has_notnull = column.notnull();
-    let check_constraints: Vec<CheckConstraint> = constraints
+    let mut check_constraints: Vec<CheckConstraint> = constraints
         .iter()
         .filter_map(|c| {
             if let ast::ColumnConstraint::Check { expr, source } = &c.constraint {
@@ -590,6 +590,12 @@ fn emit_column_constraints_validation(
             }
         })
         .collect();
+    if table.is_strict {
+        let (_, domain_checks) = catalog.with_schema(database_id, |schema| {
+            schema.column_domain_constraints(column)
+        })?;
+        check_constraints.extend(domain_checks);
+    }
 
     if !has_notnull && check_constraints.is_empty() {
         return Ok(());
@@ -598,53 +604,15 @@ fn emit_column_constraints_validation(
         .name
         .as_deref()
         .ok_or_else(|| LimboError::ParseError("column name is missing".to_string()))?;
-    let generated = match column.generated_type() {
-        GeneratedType::Virtual {
-            expr: generated, ..
-        } => {
-            // A table whose generated columns were prepared holds the
-            // expression with its columns resolved to positions; the planned
-            // SELECT needs their names.
-            let mut generated = ast::Expr::clone(generated);
-            name_self_table_columns(&mut generated, table.columns());
-            generated
-        }
-        _ => ast::Expr::Id(ast::Name::exact(column_name.to_string())),
-    };
-    let generated = &generated;
-    let table_name = &table.name;
-    let col_name_lower = normalize_ident(column_name);
-    // A CHECK that names the new column reads its expression instead.
-    let substitute = |check: &ast::Expr| -> ast::Expr {
-        let mut substituted = check.clone();
-        let _ = walk_expr_mut(
-            &mut substituted,
-            &mut |e: &mut ast::Expr| -> Result<WalkControl> {
-                match e {
-                    ast::Expr::Id(name) if normalize_ident(name.as_str()) == col_name_lower => {
-                        *e = ast::Expr::clone(generated);
-                        Ok(WalkControl::SkipChildren)
-                    }
-                    ast::Expr::Qualified(tbl, col)
-                        if normalize_ident(tbl.as_str()) == normalize_ident(table_name)
-                            && normalize_ident(col.as_str()) == col_name_lower =>
-                    {
-                        *e = ast::Expr::clone(generated);
-                        Ok(WalkControl::SkipChildren)
-                    }
-                    _ => Ok(WalkControl::Continue),
-                }
-            },
-        );
-        substituted
-    };
 
     let mut values = Vec::with_capacity(check_constraints.len() + 1);
     for check in &check_constraints {
-        values.push(ScanValue::Stored(substitute(&check.expr)));
+        values.push(ScanValue::Stored(ast::Expr::clone(&check.expr)));
     }
     if has_notnull {
-        values.push(ScanValue::Expr(ast::Expr::clone(generated)));
+        values.push(ScanValue::Expr(ast::Expr::Id(ast::Name::exact(
+            column_name.to_string(),
+        ))));
     }
     let database = connection
         .namespaces()
@@ -682,22 +650,6 @@ fn emit_column_constraints_validation(
     })
 }
 
-/// Replace each column of the table itself that was resolved to a position
-/// by its name, so the expression can be analyzed again.
-fn name_self_table_columns(expr: &mut ast::Expr, columns: &[Column]) {
-    // The closure is infallible, so walk_expr_mut cannot fail.
-    let _ = walk_expr_mut(expr, &mut |e: &mut ast::Expr| -> Result<WalkControl> {
-        if let ast::Expr::Column { table, column, .. } = e {
-            if table.is_self_table() {
-                if let Some(name) = columns.get(*column).and_then(|c| c.name.as_deref()) {
-                    *e = ast::Expr::Id(ast::Name::exact(name.to_string()));
-                }
-            }
-        }
-        Ok(WalkControl::Continue)
-    });
-}
-
 /// Halt with a CHECK constraint error unless `result_reg` holds NULL or a
 /// true value, as SQLite passes a CHECK whose result is unknown.
 fn emit_check_result(program: &mut ProgramBuilder, result_reg: usize, description: &str) {
@@ -718,139 +670,6 @@ fn emit_check_result(program: &mut ProgramBuilder, result_reg: usize, descriptio
         description_reg: None,
     });
     program.preassign_label_to_next_insn(check_passed_label);
-}
-
-/// Validate CHECK constraints on a newly added column against the column's DEFAULT value.
-///
-/// When a table has existing rows, the new column gets the DEFAULT value (or NULL).
-/// If that value would violate a CHECK constraint, the ALTER TABLE must be rejected.
-/// This emits bytecode that:
-/// 1. Checks if the table has any rows (Rewind)
-/// 2. Evaluates the CHECK expression with the column reference substituted by the DEFAULT
-/// 3. Halts with a CHECK constraint error if the result is false
-#[allow(clippy::too_many_arguments)]
-fn emit_add_column_check_validation(
-    program: &mut ProgramBuilder,
-    btree: &BTreeTable,
-    original_btree: &Arc<BTreeTable>,
-    new_column_name: &str,
-    column: &Column,
-    constraints: &[ast::NamedColumnConstraint],
-    catalog: &SemanticContext<'_>,
-    connection: &Arc<crate::Connection>,
-    database_id: usize,
-) -> Result<()> {
-    // Determine the effective default value. If no DEFAULT, existing rows get NULL,
-    // which always passes CHECK per SQL standard (NULL is not false).
-    let default_expr = match &column.default {
-        Some(expr) if !crate::util::expr_contains_null(expr) => *expr.clone(),
-        _ => return Ok(()),
-    };
-
-    // Collect CHECK constraints from column-level constraints + domain CHECKs.
-    // Domain CHECKs use `value` as placeholder which must be rewritten to the column name.
-    let mut all_checks: Vec<(Option<String>, Option<String>, Box<ast::Expr>)> = constraints
-        .iter()
-        .filter_map(|c| {
-            if let ast::ColumnConstraint::Check { expr, source } = &c.constraint {
-                Some((
-                    c.name.as_ref().map(|n| n.as_str().to_string()),
-                    source.clone(),
-                    expr.clone(),
-                ))
-            } else {
-                None
-            }
-        })
-        .collect();
-
-    if let Ok(Some(resolved)) = catalog
-        .main_schema()
-        .resolve_type(&column.ty_str, btree.is_strict)
-    {
-        if resolved.is_domain() {
-            for td in &resolved.chain {
-                for dc in &td.domain_checks {
-                    let rewritten =
-                        crate::schema::rewrite_value_to_column(&dc.check, new_column_name);
-                    all_checks.push((dc.name.clone(), None, rewritten));
-                }
-            }
-        }
-    }
-
-    if all_checks.is_empty() {
-        return Ok(());
-    }
-
-    let table_name = &btree.name;
-    let col_name_lower = normalize_ident(new_column_name);
-
-    // Each CHECK with references to the new column replaced by the default.
-    let substituted: Vec<ast::Expr> = all_checks
-        .iter()
-        .map(|(_, _, check_expr)| {
-            let mut substituted = *check_expr.clone();
-            let _ = walk_expr_mut(
-                &mut substituted,
-                &mut |e: &mut ast::Expr| -> Result<WalkControl> {
-                    match e {
-                        ast::Expr::Id(name) if normalize_ident(name.as_str()) == col_name_lower => {
-                            *e = default_expr.clone();
-                            Ok(WalkControl::SkipChildren)
-                        }
-                        ast::Expr::Qualified(tbl, col)
-                            if normalize_ident(tbl.as_str()) == normalize_ident(table_name)
-                                && normalize_ident(col.as_str()) == col_name_lower =>
-                        {
-                            *e = default_expr.clone();
-                            Ok(WalkControl::SkipChildren)
-                        }
-                        _ => Ok(WalkControl::Continue),
-                    }
-                },
-            );
-            substituted
-        })
-        .collect();
-
-    // SQLite reports the constraint name, or the expression's source text as
-    // written.
-    let emit_check = |program: &mut ProgramBuilder,
-                      result_reg: usize,
-                      (constraint_name, check_source, check_expr): &(
-        Option<String>,
-        Option<String>,
-        Box<ast::Expr>,
-    )| {
-        let name = match (constraint_name, check_source) {
-            (Some(name), _) => name.clone(),
-            (None, Some(source)) => crate::util::dequote(source),
-            (None, None) => format!("{check_expr}"),
-        };
-        emit_check_result(program, result_reg, &name);
-    };
-
-    // Every existing row is checked, with its other columns read from the
-    // row, as SQLite's check of the altered table does. Like DML, a CHECK
-    // constraint reads custom-typed columns as stored.
-    let database = connection.namespaces().name(database_id).ok_or_else(|| {
-        crate::LimboError::InternalError(format!("no database with id {database_id}"))
-    })?;
-    let select = PlannedSelect::scan(
-        substituted.into_iter().map(ScanValue::Stored).collect(),
-        database,
-        original_btree.name.clone(),
-        None,
-        catalog,
-        connection,
-    )?;
-    select.emit_each_row(program, |program, values| {
-        for (i, check) in all_checks.iter().enumerate() {
-            emit_check(program, values + i, check);
-        }
-        Ok(())
-    })
 }
 
 pub fn translate_alter_table(
@@ -1421,17 +1240,13 @@ pub fn translate_alter_table(
                 ));
             };
 
-            if is_generated {
-                emit_column_constraints_validation(
-                    program,
-                    &btree,
-                    &column,
-                    &constraints,
-                    connection,
-                    catalog,
-                    database_id,
-                )?;
-            } else {
+            // The constraints read the table with the new column.
+            let added_catalog = catalog.with_altered_table(
+                crate::translate::semantic::hir::DatabaseId::new(database_id),
+                Arc::new(crate::schema::Table::BTree(Arc::new(btree.clone()))),
+                table_indexes,
+            );
+            if !is_generated {
                 // Check if we need to verify the table is empty at runtime.
                 let type_default = catalog
                     .main_schema()
@@ -1488,19 +1303,16 @@ pub fn translate_alter_table(
                 if default_type_mismatch {
                     emit_add_column_default_type_validation(program, &original_btree, database_id)?;
                 }
-
-                emit_add_column_check_validation(
-                    program,
-                    &btree,
-                    &original_btree,
-                    &new_column_name,
-                    &column,
-                    &constraints,
-                    catalog,
-                    connection,
-                    database_id,
-                )?;
             }
+            emit_column_constraints_validation(
+                program,
+                &btree,
+                &column,
+                &constraints,
+                connection,
+                &added_catalog,
+                database_id,
+            )?;
 
             translate_update_for_schema_change(
                 update,
