@@ -227,12 +227,12 @@ mod tests {
                 .expect("table name is unique");
             let main_schema = Arc::new(main_schema);
             let database_schemas = RwLock::new(HashMap::default());
-            let temp_database = RwLock::new(None);
+            let temp = crate::connection::TempDbContext::new();
             let attached_databases = RwLock::new(DatabaseCatalog::new());
             catalog::SemanticCatalog::capture(
                 main_schema,
                 &database_schemas,
-                &temp_database,
+                &temp,
                 &attached_databases,
                 &crate::Namespaces::default(),
                 true,

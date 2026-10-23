@@ -1,8 +1,11 @@
 use rustc_hash::FxHashMap as HashMap;
 
 use crate::{
-    connection::TempDatabase, dialect::Dialect, schema::Schema, sync::Arc, DatabaseCatalog, Result,
-    RwLock, MAIN_DB_ID, TEMP_DB_ID,
+    connection::{PlaceholderTempSchema, TempDbContext},
+    dialect::Dialect,
+    schema::Schema,
+    sync::Arc,
+    DatabaseCatalog, Result, RwLock, MAIN_DB_ID, TEMP_DB_ID,
 };
 
 use super::hir::DatabaseId;
@@ -31,20 +34,22 @@ impl SemanticCatalog {
     pub(crate) fn capture(
         main_schema: Arc<Schema>,
         database_schemas: &RwLock<HashMap<usize, Arc<Schema>>>,
-        temp_database: &RwLock<Option<TempDatabase>>,
+        temp: &TempDbContext,
         attached_databases: &RwLock<DatabaseCatalog>,
         namespaces: &crate::Namespaces,
         custom_types_enabled: bool,
         dialect: &dyn Dialect,
         configured_search_path: Option<&[String]>,
     ) -> Result<Self> {
-        let (has_temp_schema, temp_schema) = match temp_database.read().as_ref() {
-            Some(temp) => (true, temp.db.schema.lock().clone()),
-            None => {
-                let mut schema = Schema::with_options(custom_types_enabled, dialect)?;
-                schema.copy_table_valued_functions(&main_schema);
-                (false, Arc::new(schema))
-            }
+        let temp_schema = temp
+            .database
+            .read()
+            .as_ref()
+            .map(|temp| temp.db.schema.lock().clone());
+        let has_temp_schema = temp_schema.is_some();
+        let temp_schema = match temp_schema {
+            Some(schema) => schema,
+            None => placeholder_temp_schema(temp, &main_schema, custom_types_enabled, dialect)?,
         };
 
         let mut attached = {
@@ -126,6 +131,34 @@ impl SemanticCatalog {
     }
 }
 
+/// The schema a statement reads as `temp` while the connection has no
+/// temp database: empty, with the main schema's table-valued functions.
+/// The connection keeps the one built last, and a statement prepared
+/// against the same main schema reads it again.
+fn placeholder_temp_schema(
+    temp: &TempDbContext,
+    main_schema: &Arc<Schema>,
+    custom_types_enabled: bool,
+    dialect: &dyn Dialect,
+) -> Result<Arc<Schema>> {
+    if let Some(placeholder) = temp.placeholder_schema.read().as_ref() {
+        if Arc::ptr_eq(&placeholder.main, main_schema)
+            && placeholder.custom_types_enabled == custom_types_enabled
+        {
+            return Ok(placeholder.schema.clone());
+        }
+    }
+    let mut schema = Schema::with_options(custom_types_enabled, dialect)?;
+    schema.copy_table_valued_functions(main_schema);
+    let schema = Arc::new(schema);
+    *temp.placeholder_schema.write() = Some(PlaceholderTempSchema {
+        main: main_schema.clone(),
+        custom_types_enabled,
+        schema: schema.clone(),
+    });
+    Ok(schema)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -135,13 +168,13 @@ mod tests {
     fn captured_catalog_owns_schema_arcs_and_lookup_order() {
         let main_schema = Arc::new(Schema::new());
         let database_schemas = RwLock::new(HashMap::default());
-        let temp_database = RwLock::new(None);
+        let temp = TempDbContext::new();
         let attached_databases = RwLock::new(DatabaseCatalog::new());
 
         let catalog = SemanticCatalog::capture(
             main_schema.clone(),
             &database_schemas,
-            &temp_database,
+            &temp,
             &attached_databases,
             &crate::Namespaces::default(),
             true,
@@ -151,7 +184,7 @@ mod tests {
         .expect("catalog capture succeeds");
         drop(main_schema);
         drop(database_schemas);
-        drop(temp_database);
+        drop(temp);
         drop(attached_databases);
 
         assert_eq!(
@@ -167,5 +200,38 @@ mod tests {
             [DatabaseId::new(MAIN_DB_ID)]
         );
         assert_eq!(catalog.databases[0].schema.schema_version, 0);
+    }
+
+    #[test]
+    fn statements_without_a_temp_database_share_one_placeholder_temp_schema() {
+        let main_schema = Arc::new(Schema::new());
+        let database_schemas = RwLock::new(HashMap::default());
+        let temp = TempDbContext::new();
+        let attached_databases = RwLock::new(DatabaseCatalog::new());
+        let capture = |main_schema: &Arc<Schema>| {
+            SemanticCatalog::capture(
+                main_schema.clone(),
+                &database_schemas,
+                &temp,
+                &attached_databases,
+                &crate::Namespaces::default(),
+                true,
+                &SqliteDialect,
+                None,
+            )
+            .expect("catalog capture succeeds")
+            .databases[TEMP_DB_ID]
+                .schema
+                .clone()
+        };
+
+        let first = capture(&main_schema);
+        let second = capture(&main_schema);
+        assert!(Arc::ptr_eq(&first, &second));
+
+        let changed_main_schema = Arc::new(Schema::new());
+        let third = capture(&changed_main_schema);
+        assert!(!Arc::ptr_eq(&first, &third));
+        assert!(Arc::ptr_eq(&third, &capture(&changed_main_schema)));
     }
 }
