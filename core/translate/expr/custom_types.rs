@@ -589,6 +589,20 @@ pub(crate) fn emit_trigger_decode_registers(
                         is_strict,
                         resolver,
                     )?;
+                    if col.is_array() {
+                        let skip = program.allocate_label();
+                        program.emit_insn(Insn::IsNull {
+                            reg: decoded_reg,
+                            target_pc: skip,
+                        });
+                        super::arrays::emit_array_element_decode(
+                            program,
+                            decoded_reg,
+                            col,
+                            resolver,
+                        )?;
+                        program.preassign_label_to_next_insn(skip);
+                    }
                     return Ok(decoded_reg);
                 }
             }

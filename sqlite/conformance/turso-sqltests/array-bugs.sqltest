@@ -184,3 +184,47 @@ test array-custom-type-decode-next-to-literal {
 expect {
     l|{1,2,3}
 }
+
+test array-custom-type-trigger-new {
+    CREATE TYPE trigger_cents BASE integer ENCODE value*100 DECODE value/100;
+    CREATE TABLE source (id INTEGER PRIMARY KEY, xs trigger_cents[]) STRICT;
+    CREATE TABLE copied (id INTEGER PRIMARY KEY, xs trigger_cents[], second INTEGER, len INTEGER) STRICT;
+    CREATE TRIGGER copied_new AFTER INSERT ON source BEGIN
+        INSERT INTO copied VALUES (NEW.id, NEW.xs, NEW.xs[2], array_length(NEW.xs));
+    END;
+    INSERT INTO source VALUES (1,'{1,2,3}');
+    SELECT source.xs, copied.xs, copied.second, copied.len FROM source JOIN copied USING(id);
+}
+expect {
+    {1,2,3}|{1,2,3}|2|3
+}
+
+test array-custom-type-trigger-old {
+    CREATE TYPE trigger_old_cents BASE integer ENCODE value*100 DECODE value/100;
+    CREATE TABLE source (id INTEGER PRIMARY KEY, xs trigger_old_cents[]) STRICT;
+    CREATE TABLE deleted (id INTEGER PRIMARY KEY, xs trigger_old_cents[]) STRICT;
+    CREATE TRIGGER copied_old AFTER DELETE ON source BEGIN
+        INSERT INTO deleted VALUES (OLD.id, OLD.xs);
+    END;
+    INSERT INTO source VALUES (1,'{1,2,3}');
+    DELETE FROM source;
+    SELECT xs FROM deleted;
+}
+expect {
+    {1,2,3}
+}
+
+test array-custom-type-trigger-null-empty {
+    CREATE TYPE trigger_null_cents BASE integer ENCODE value*100 DECODE value/100;
+    CREATE TABLE source (id INTEGER PRIMARY KEY, xs trigger_null_cents[]) STRICT;
+    CREATE TABLE copied (id INTEGER PRIMARY KEY, xs trigger_null_cents[]) STRICT;
+    CREATE TRIGGER copied_new AFTER INSERT ON source BEGIN
+        INSERT INTO copied VALUES (NEW.id, NEW.xs);
+    END;
+    INSERT INTO source VALUES (1,NULL), (2,'{}');
+    SELECT id, xs FROM copied ORDER BY id;
+}
+expect {
+    1|
+    2|{}
+}
