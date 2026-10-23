@@ -1704,3 +1704,52 @@ test compound-chain-leftmost-collation {
 expect {
     0
 }
+
+# `a = b` and `b = a` are different expressions when the operands have
+# different collations, because the left operand's collation is used.
+setup swapped_equals {
+    CREATE TABLE swapped_equals(a TEXT COLLATE NOCASE, b TEXT COLLATE BINARY);
+    INSERT INTO swapped_equals VALUES ('x', 'X'), ('y', 'y');
+}
+
+@setup swapped_equals
+test swapped-equals-group-by-does-not-match-result-column {
+    SELECT b = a, count(*) FROM swapped_equals GROUP BY a = b;
+}
+expect {
+    0|2
+}
+
+@setup swapped_equals
+test swapped-equals-in-function-group-by-does-not-match-result-column {
+    SELECT abs(b = a), count(*) FROM swapped_equals GROUP BY abs(a = b);
+}
+expect {
+    0|2
+}
+
+@setup swapped_equals
+test swapped-equals-does-not-use-expression-index {
+    CREATE INDEX swapped_equals_idx ON swapped_equals(a = b);
+    SELECT a FROM swapped_equals WHERE (b = a) = 1;
+}
+expect {
+    y
+}
+
+@setup swapped_equals
+test swapped-equals-in-function-does-not-use-expression-index {
+    CREATE INDEX swapped_equals_abs_idx ON swapped_equals(abs(a = b));
+    SELECT a FROM swapped_equals WHERE abs(b = a) = 1;
+}
+expect {
+    y
+}
+
+@setup swapped_equals
+test swapped-equals-compound-order-by-does-not-match-result-column {
+    SELECT a = b FROM swapped_equals UNION ALL SELECT 5 ORDER BY b = a;
+}
+expect error {
+    1st ORDER BY term does not match any column in the result set
+}

@@ -865,12 +865,12 @@ pub fn exprs_are_equivalent(expr1: &Expr, expr2: &Expr) -> bool {
                 else_expr: else2,
             },
         ) => {
-            base1 == base2
+            optional_exprs_are_equivalent(base1, base2)
                 && pairs1.len() == pairs2.len()
                 && pairs1.iter().zip(pairs2).all(|((w1, t1), (w2, t2))| {
                     exprs_are_equivalent(w1, w2) && exprs_are_equivalent(t1, t2)
                 })
-                && else1 == else2
+                && optional_exprs_are_equivalent(else1, else2)
         }
         (
             Expr::Cast {
@@ -915,7 +915,11 @@ pub fn exprs_are_equivalent(expr1: &Expr, expr2: &Expr) -> bool {
         ) => {
             name1.as_str().eq_ignore_ascii_case(name2.as_str())
                 && distinct1 == distinct2
-                && args1 == args2
+                && args1.len() == args2.len()
+                && args1
+                    .iter()
+                    .zip(args2)
+                    .all(|(a1, a2)| exprs_are_equivalent(a1, a2))
                 && order1 == order2
                 && within1 == within2
                 && filter1 == filter2
@@ -931,15 +935,18 @@ pub fn exprs_are_equivalent(expr1: &Expr, expr2: &Expr) -> bool {
             },
         ) => {
             name1.as_str().eq_ignore_ascii_case(name2.as_str())
-                && match (&filter1.filter_clause, &filter2.filter_clause) {
-                    (Some(expr1), Some(expr2)) => exprs_are_equivalent(expr1, expr2),
-                    (None, None) => true,
-                    _ => false,
-                }
+                && optional_exprs_are_equivalent(&filter1.filter_clause, &filter2.filter_clause)
                 && filter1.over_clause == filter2.over_clause
         }
         (Expr::NotNull(expr1), Expr::NotNull(expr2)) => exprs_are_equivalent(expr1, expr2),
         (Expr::IsNull(expr1), Expr::IsNull(expr2)) => exprs_are_equivalent(expr1, expr2),
+        (Expr::IsNull(operand), Expr::Binary(lhs, ast::Operator::Is, rhs))
+        | (Expr::Binary(lhs, ast::Operator::Is, rhs), Expr::IsNull(operand))
+        | (Expr::NotNull(operand), Expr::Binary(lhs, ast::Operator::IsNot, rhs))
+        | (Expr::Binary(lhs, ast::Operator::IsNot, rhs), Expr::NotNull(operand)) => {
+            exprs_are_equivalent(operand, lhs)
+                && exprs_are_equivalent(rhs, &Expr::Literal(Literal::Null))
+        }
         (Expr::Literal(lit1), Expr::Literal(lit2)) => check_literal_equivalency(lit1, lit2),
         (Expr::Id(id1), Expr::Id(id2)) => check_ident_equivalency(id1.as_str(), id2.as_str()),
         (Expr::Unary(op1, expr1), Expr::Unary(op2, expr2)) => {
@@ -1001,6 +1008,14 @@ pub fn exprs_are_equivalent(expr1: &Expr, expr2: &Expr) -> bool {
         ) => tbl_1 == tbl_2 && col_1 == col_2 && db1 == db2 && r1 == r2,
         // fall back to naive equality check
         _ => expr1 == expr2,
+    }
+}
+
+fn optional_exprs_are_equivalent(expr1: &Option<Box<Expr>>, expr2: &Option<Box<Expr>>) -> bool {
+    match (expr1, expr2) {
+        (Some(expr1), Some(expr2)) => exprs_are_equivalent(expr1, expr2),
+        (None, None) => true,
+        _ => false,
     }
 }
 
