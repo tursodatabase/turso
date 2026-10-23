@@ -476,24 +476,63 @@ pub(crate) fn bind_table_names_in_select(
     select: &mut ast::Select,
     resolver: &Resolver,
 ) -> Result<()> {
-    bind_table_names(select, resolver, &mut Vec::new())
+    let mut cte_names = Vec::new();
+    collect_cte_names(select, &mut cte_names)?;
+    bind_table_names(select, resolver, &cte_names)
+}
+
+/// The names of the CTEs anywhere in the body, so that none of them is
+/// bound as a table wherever it is used.
+fn collect_cte_names(select: &mut ast::Select, cte_names: &mut Vec<String>) -> Result<()> {
+    if let Some(with) = &mut select.with {
+        for cte in &mut with.ctes {
+            cte_names.push(normalize_ident(cte.tbl_name.as_str()));
+            collect_cte_names(&mut cte.select, cte_names)?;
+        }
+    }
+    for one_select in std::iter::once(&mut select.body.select)
+        .chain(select.body.compounds.iter_mut().map(|c| &mut c.select))
+    {
+        if let ast::OneSelect::Select {
+            from: Some(from), ..
+        } = one_select
+        {
+            collect_cte_names_in_from(from, cte_names)?;
+        }
+    }
+    rewrite_select_expressions(select, &mut |expr| match expr {
+        ast::Expr::Subquery(select) | ast::Expr::Exists(select) => {
+            collect_cte_names(select, cte_names)
+        }
+        ast::Expr::InSelect { rhs, .. } => collect_cte_names(rhs, cte_names),
+        _ => Ok(()),
+    })
+}
+
+fn collect_cte_names_in_from(
+    from: &mut ast::FromClause,
+    cte_names: &mut Vec<String>,
+) -> Result<()> {
+    for source in
+        std::iter::once(&mut from.select).chain(from.joins.iter_mut().map(|j| &mut j.table))
+    {
+        match source.as_mut() {
+            ast::SelectTable::Select { select, .. } => collect_cte_names(select, cte_names)?,
+            ast::SelectTable::Sub(from, _) => collect_cte_names_in_from(from, cte_names)?,
+            ast::SelectTable::Table(..) | ast::SelectTable::TableCall(..) => {}
+        }
+    }
+    Ok(())
 }
 
 fn bind_table_names(
     select: &mut ast::Select,
     resolver: &Resolver,
-    cte_names: &mut Vec<String>,
+    cte_names: &[String],
 ) -> Result<()> {
-    let outer_cte_count = cte_names.len();
     if let Some(with) = &mut select.with {
         for cte in &mut with.ctes {
-            if with.recursive {
-                cte_names.push(normalize_ident(cte.tbl_name.as_str()));
-            }
             bind_table_names(&mut cte.select, resolver, cte_names)?;
-            if !with.recursive {
-                cte_names.push(normalize_ident(cte.tbl_name.as_str()));
-            }
         }
     }
     bind_table_names_in_one_select(&mut select.body.select, resolver, cte_names)?;
@@ -506,15 +545,13 @@ fn bind_table_names(
         }
         ast::Expr::InSelect { rhs, .. } => bind_table_names(rhs, resolver, cte_names),
         _ => Ok(()),
-    })?;
-    cte_names.truncate(outer_cte_count);
-    Ok(())
+    })
 }
 
 fn bind_table_names_in_one_select(
     one_select: &mut ast::OneSelect,
     resolver: &Resolver,
-    cte_names: &mut Vec<String>,
+    cte_names: &[String],
 ) -> Result<()> {
     if let ast::OneSelect::Select {
         from: Some(from), ..
@@ -528,7 +565,7 @@ fn bind_table_names_in_one_select(
 fn bind_table_names_in_from(
     from: &mut ast::FromClause,
     resolver: &Resolver,
-    cte_names: &mut Vec<String>,
+    cte_names: &[String],
 ) -> Result<()> {
     bind_table_name_in_source(&mut from.select, resolver, cte_names)?;
     for join in &mut from.joins {
@@ -540,7 +577,7 @@ fn bind_table_names_in_from(
 fn bind_table_name_in_source(
     source: &mut ast::SelectTable,
     resolver: &Resolver,
-    cte_names: &mut Vec<String>,
+    cte_names: &[String],
 ) -> Result<()> {
     match source {
         ast::SelectTable::Table(name, alias, _) => {

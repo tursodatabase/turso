@@ -448,3 +448,13 @@ test create-schema-rejects-the-internal-table-prefix {
 expect error {
     unacceptable schema name "__turso_internal_y"
 }
+
+test view-keeps-a-cte-declared-in-a-nested-select {
+    CREATE TABLE c (x int);
+    INSERT INTO c VALUES (100), (200), (300);
+    CREATE VIEW v2 AS SELECT * FROM (WITH c AS (SELECT 1 AS x) SELECT (SELECT count(*) FROM c) AS n) s;
+    SELECT * FROM v2;
+}
+expect {
+    1
+}

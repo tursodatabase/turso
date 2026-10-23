@@ -5538,12 +5538,19 @@ mod tests {
         conn.execute("CREATE VIEW v AS SELECT t.x FROM t").unwrap();
         conn.execute("CREATE VIEW w AS WITH c AS (SELECT x FROM t) SELECT x FROM c WHERE x IN (SELECT x FROM t)")
             .unwrap();
+        conn.execute("CREATE TABLE c(x INTEGER); INSERT INTO c VALUES(1), (2), (3)")
+            .unwrap();
+        conn.execute(
+            "CREATE VIEW n AS SELECT * FROM (WITH c AS (SELECT 1 AS x) SELECT (SELECT count(*) FROM c) AS k) s",
+        )
+        .unwrap();
         conn.execute("CREATE TABLE t(x INTEGER); INSERT INTO t VALUES(2)")
             .unwrap();
 
         assert_eq!(query_single_i64(&conn, "SELECT x FROM t"), 2);
         assert_eq!(query_single_i64(&conn, "SELECT x FROM app.v"), 1);
         assert_eq!(query_single_i64(&conn, "SELECT x FROM app.w"), 1);
+        assert_eq!(query_single_i64(&conn, "SELECT k FROM app.n"), 1);
         conn.set_search_path(Some(vec!["main".to_string()]));
         assert_eq!(query_single_i64(&conn, "SELECT x FROM app.v"), 1);
     }
