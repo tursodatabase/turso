@@ -1,0 +1,40 @@
+@database :memory:
+
+test zero-argument-window-ignores-call-order {
+    CREATE TABLE zero_window_t(a);
+    INSERT INTO zero_window_t VALUES(3),(1),(2);
+    SELECT a, row_number(ORDER BY missing) OVER (ORDER BY a) FROM zero_window_t;
+}
+expect {
+    1|1
+    2|2
+    3|3
+}
+
+test zero-argument-aggregate-ignores-call-order {
+    CREATE TABLE zero_count_t(a);
+    INSERT INTO zero_count_t VALUES(1),(2),(3);
+    SELECT count(ORDER BY missing) FROM zero_count_t;
+}
+expect {
+    3
+}
+
+test zero-argument-scalar-ignores-call-order {
+    SELECT random(ORDER BY missing) IS NOT NULL;
+}
+expect {
+    1
+}
+
+test zero-argument-window-view-ignores-call-order {
+    CREATE TABLE zero_view_t(a);
+    INSERT INTO zero_view_t VALUES(3),(1),(2);
+    CREATE VIEW zero_window_v AS SELECT a, row_number(ORDER BY missing) OVER (ORDER BY a) AS rn FROM zero_view_t;
+    SELECT * FROM zero_window_v;
+}
+expect {
+    1|1
+    2|2
+    3|3
+}

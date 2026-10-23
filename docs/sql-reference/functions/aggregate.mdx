@@ -354,7 +354,9 @@ Single-argument aggregates can combine `DISTINCT` with ordering:
 SELECT group_concat(DISTINCT product ORDER BY product) FROM sales;
 ```
 
-`min` and `max` ignore aggregate-local ordering. Aggregate-local ordering is not supported in calls with `OVER` or in materialized views. `CREATE VIEW` rejects calls combining aggregate-local ordering with `OVER`, including inside subqueries and CTEs. Invalid calls identify the function in the error, for example `ORDER BY may not be used with non-aggregate abs()`.
+For SQLite compatibility, a call with no arguments ignores its input `ORDER BY`, including column references in that clause. For example, `row_number(ORDER BY missing) OVER ()` behaves like `row_number() OVER ()`, and `count(ORDER BY missing)` behaves like `count()`.
+
+`min` and `max` ignore aggregate-local ordering. Calls with arguments cannot combine aggregate-local ordering with `OVER`; `CREATE VIEW` rejects these calls too, including inside subqueries and CTEs. Aggregate-local ordering is not supported in materialized views. Invalid calls identify the function in the error, for example `ORDER BY may not be used with non-aggregate abs()`.
 
 ## Aggregates as Window Functions
 
