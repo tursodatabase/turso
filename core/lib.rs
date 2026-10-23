@@ -51,6 +51,7 @@ pub(crate) mod thread;
 
 mod assert;
 mod connection;
+mod connection_hooks;
 mod database;
 pub mod dialect;
 mod error;
@@ -124,6 +125,7 @@ pub use cdc::{
 pub use connection::SubqueryUnnestingMode;
 pub use connection::{resolve_ext_path, Connection, Row, StepResult, SymbolTable};
 pub(crate) use connection::{AtomicTransactionState, TransactionState};
+pub use connection_hooks::{ConnectionHooks, SavepointMemo};
 #[cfg(feature = "simulator")]
 pub use database::{clear_database_registry, SharedWalTestingSnapshot};
 pub(crate) use database::{is_memory_like, DatabaseCatalog, InitState};

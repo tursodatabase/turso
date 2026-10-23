@@ -4,6 +4,7 @@ mod error;
 mod functions;
 mod options;
 mod session;
+mod settings;
 mod statement;
 mod unnest;
 

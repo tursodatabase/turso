@@ -90,6 +90,128 @@ test search-path-empty-does-not-find-stored-tables {
 }
 expect error {}
 
+setup local_search_path_commit {
+    CREATE TABLE demo (label text);
+    INSERT INTO demo VALUES ('from public');
+    CREATE SCHEMA IF NOT EXISTS sp_lc_a;
+    DROP TABLE IF EXISTS sp_lc_a.demo;
+    CREATE TABLE sp_lc_a.demo (label text);
+    INSERT INTO sp_lc_a.demo VALUES ('from a');
+}
+
+@setup local_search_path_commit
+test search-path-set-local-ends-at-commit {
+    BEGIN;
+    SET LOCAL search_path TO sp_lc_a;
+    SELECT current_setting('search_path');
+    SELECT label FROM demo;
+    COMMIT;
+    SELECT current_setting('search_path');
+    SELECT label FROM demo;
+}
+expect {
+    sp_lc_a
+    from a
+    "$user", public
+    from public
+}
+
+setup local_search_path_outside_transaction {
+    CREATE TABLE demo (label text);
+    INSERT INTO demo VALUES ('from public');
+    CREATE SCHEMA IF NOT EXISTS sp_lo_a;
+    DROP TABLE IF EXISTS sp_lo_a.demo;
+    CREATE TABLE sp_lo_a.demo (label text);
+    INSERT INTO sp_lo_a.demo VALUES ('from a');
+}
+
+@setup local_search_path_outside_transaction
+test search-path-set-local-outside-a-transaction-ends-with-its-statement {
+    SET LOCAL search_path TO sp_lo_a;
+    SHOW search_path;
+    SELECT label FROM demo;
+}
+expect {
+    "$user", public
+    from public
+}
+
+setup local_search_path_rollback {
+    CREATE TABLE demo (label text);
+    INSERT INTO demo VALUES ('from public');
+    CREATE SCHEMA IF NOT EXISTS sp_lr_a;
+    DROP TABLE IF EXISTS sp_lr_a.demo;
+    CREATE TABLE sp_lr_a.demo (label text);
+    INSERT INTO sp_lr_a.demo VALUES ('from a');
+}
+
+@setup local_search_path_rollback
+test search-path-local-set-config-ends-at-rollback {
+    BEGIN;
+    SELECT set_config('search_path', 'sp_lr_a', true);
+    SELECT label FROM demo;
+    ROLLBACK;
+    SELECT label FROM demo;
+}
+expect {
+    sp_lr_a
+    from a
+    from public
+}
+
+setup rollback_search_path {
+    CREATE TABLE demo (label text);
+    INSERT INTO demo VALUES ('from public');
+    CREATE SCHEMA IF NOT EXISTS sp_rb_a;
+    DROP TABLE IF EXISTS sp_rb_a.demo;
+    CREATE TABLE sp_rb_a.demo (label text);
+    INSERT INTO sp_rb_a.demo VALUES ('from a');
+}
+
+@setup rollback_search_path
+test search-path-set-is-undone-by-rollback {
+    BEGIN;
+    SET search_path TO sp_rb_a;
+    SELECT label FROM demo;
+    ROLLBACK;
+    SELECT current_setting('search_path');
+    SELECT label FROM demo;
+}
+expect {
+    from a
+    "$user", public
+    from public
+}
+
+setup savepoint_search_path {
+    CREATE TABLE demo (label text);
+    INSERT INTO demo VALUES ('from public');
+    CREATE SCHEMA IF NOT EXISTS sp_sv_a;
+    DROP TABLE IF EXISTS sp_sv_a.demo;
+    CREATE TABLE sp_sv_a.demo (label text);
+    INSERT INTO sp_sv_a.demo VALUES ('from a');
+}
+
+@setup savepoint_search_path
+test search-path-rollback-to-savepoint-restores-it {
+    BEGIN;
+    SET search_path TO sp_sv_a;
+    SAVEPOINT s;
+    SET LOCAL search_path TO public;
+    SELECT label FROM demo;
+    ROLLBACK TO SAVEPOINT s;
+    SELECT current_setting('search_path');
+    SELECT label FROM demo;
+    COMMIT;
+    SELECT label FROM demo;
+}
+expect {
+    from public
+    sp_sv_a
+    from a
+    from a
+}
+
 test public-schema-qualified-column-reference {
     DROP TABLE IF EXISTS demo;
     CREATE TABLE demo (id int, label text);
