@@ -4429,7 +4429,22 @@ impl PostgreSQLTranslator {
         clause: &str,
         when_null: &str,
     ) -> Result<Option<Box<ast::Expr>>, ParseError> {
-        let value = self.translate_expr(node)?;
+        let value_type = limit_value_type(node);
+        let value = match value_type {
+            LimitValueType::Boolean => {
+                return Err(ParseError::ParseError(format!(
+                    "argument of {clause} must be type bigint, not type boolean"
+                )));
+            }
+            LimitValueType::NumericLiteral(literal) => ast::Expr::Literal(ast::Literal::Numeric(
+                round_numeric_literal(literal)?.to_string(),
+            )),
+            LimitValueType::Float | LimitValueType::Other => self.translate_expr(node)?,
+        };
+        let rounding = match value_type {
+            LimitValueType::Float => "float8",
+            _ => "numeric",
+        };
         match &value {
             ast::Expr::Literal(ast::Literal::Null) => return Ok(None),
             ast::Expr::Literal(ast::Literal::Numeric(n))
@@ -4444,6 +4459,7 @@ impl PostgreSQLTranslator {
             vec![
                 value,
                 ast::Expr::Literal(ast::Literal::String(format!("'{clause}'"))),
+                ast::Expr::Literal(ast::Literal::String(format!("'{rounding}'"))),
             ],
         );
         let no_limit = ast::Expr::Literal(ast::Literal::Numeric(when_null.into()));
@@ -6880,6 +6896,144 @@ fn reject_column_aliases(
         return Err(not_supported(format!("a column alias list on {what}")));
     }
     Ok(())
+}
+
+enum LimitValueType<'a> {
+    Boolean,
+    Float,
+    NumericLiteral(&'a str),
+    Other,
+}
+
+fn limit_value_type(node: &pg_query::protobuf::Node) -> LimitValueType<'_> {
+    use pg_query::protobuf::node::Node;
+    use pg_query::protobuf::{a_const::Val, AExprKind, SubLinkType};
+    match &node.node {
+        Some(Node::AConst(pg_query::protobuf::AConst {
+            val: Some(Val::Boolval(_)),
+            ..
+        })) => LimitValueType::Boolean,
+        Some(Node::AConst(pg_query::protobuf::AConst {
+            val: Some(Val::Fval(f)),
+            ..
+        })) => LimitValueType::NumericLiteral(&f.fval),
+        Some(Node::TypeCast(cast)) => {
+            let Some(type_name) = cast.type_name.as_ref() else {
+                return LimitValueType::Other;
+            };
+            match object_name(&type_name.names, is_default_schema, "type").as_deref() {
+                Ok("bool" | "boolean") => LimitValueType::Boolean,
+                Ok("float4" | "float8" | "real") => LimitValueType::Float,
+                Ok("numeric" | "decimal") => match cast.arg.as_deref().map(limit_value_type) {
+                    Some(LimitValueType::NumericLiteral(literal)) => {
+                        LimitValueType::NumericLiteral(literal)
+                    }
+                    _ => LimitValueType::Other,
+                },
+                _ => LimitValueType::Other,
+            }
+        }
+        Some(Node::BoolExpr(_) | Node::NullTest(_) | Node::BooleanTest(_)) => {
+            LimitValueType::Boolean
+        }
+        Some(Node::AExpr(expr)) => match expr.kind() {
+            AExprKind::AexprOp => match last_string(&expr.name).as_deref() {
+                Some("=" | "<>" | "!=" | "<" | ">" | "<=" | ">=") => LimitValueType::Boolean,
+                Some("+" | "-" | "*" | "/")
+                    if [&expr.lexpr, &expr.rexpr].into_iter().any(|operand| {
+                        operand.as_deref().is_some_and(|operand| {
+                            matches!(limit_value_type(operand), LimitValueType::Float)
+                        })
+                    }) =>
+                {
+                    LimitValueType::Float
+                }
+                _ => LimitValueType::Other,
+            },
+            AExprKind::AexprNullif | AExprKind::Undefined => LimitValueType::Other,
+            _ => LimitValueType::Boolean,
+        },
+        Some(Node::SubLink(sub_link)) if sub_link.sub_link_type() == SubLinkType::ExprSublink => {
+            match sub_link
+                .subselect
+                .as_deref()
+                .map(|subselect| &subselect.node)
+            {
+                Some(Some(Node::SelectStmt(select)))
+                    if !is_set_operation(select) && select.target_list.len() == 1 =>
+                {
+                    let value = match &select.target_list[0].node {
+                        Some(Node::ResTarget(target)) => target.val.as_deref(),
+                        _ => None,
+                    };
+                    match value.map(limit_value_type) {
+                        Some(LimitValueType::Boolean) => LimitValueType::Boolean,
+                        Some(LimitValueType::Float) => LimitValueType::Float,
+                        _ => LimitValueType::Other,
+                    }
+                }
+                _ => LimitValueType::Other,
+            }
+        }
+        Some(Node::SubLink(sub_link))
+            if matches!(
+                sub_link.sub_link_type(),
+                SubLinkType::ExistsSublink
+                    | SubLinkType::AnySublink
+                    | SubLinkType::AllSublink
+                    | SubLinkType::RowcompareSublink
+            ) =>
+        {
+            LimitValueType::Boolean
+        }
+        _ => LimitValueType::Other,
+    }
+}
+
+fn round_numeric_literal(literal: &str) -> Result<i64, ParseError> {
+    let out_of_range = || ParseError::ParseError("bigint out of range".to_string());
+    let literal = literal.to_ascii_lowercase();
+    let (mantissa, exponent) = match literal.split_once('e') {
+        Some((mantissa, exponent)) => (
+            mantissa,
+            exponent.parse::<i64>().map_err(|_| out_of_range())?,
+        ),
+        None => (literal.as_str(), 0),
+    };
+    let (negative, mantissa) = match mantissa.strip_prefix('-') {
+        Some(mantissa) => (true, mantissa),
+        None => (false, mantissa.strip_prefix('+').unwrap_or(mantissa)),
+    };
+    let (integer_digits, fraction_digits) = mantissa.split_once('.').unwrap_or((mantissa, ""));
+    let digits = format!("{integer_digits}{fraction_digits}");
+    let digits = digits.trim_start_matches('0');
+    if digits.is_empty() {
+        return Ok(0);
+    }
+    let leading_zeros = integer_digits.len() + fraction_digits.len() - digits.len();
+    let point = (integer_digits.len() as i64)
+        .checked_sub(leading_zeros as i64)
+        .and_then(|point| point.checked_add(exponent))
+        .ok_or_else(out_of_range)?;
+    if point > 19 {
+        return Err(out_of_range());
+    }
+    let integer_part: i128 = match usize::try_from(point) {
+        Ok(0) | Err(_) => 0,
+        Ok(point) if point >= digits.len() => {
+            digits.parse::<i128>().map_err(|_| out_of_range())?
+                * 10i128.pow((point - digits.len()) as u32)
+        }
+        Ok(point) => digits[..point].parse().map_err(|_| out_of_range())?,
+    };
+    let rounds_up = usize::try_from(point).is_ok_and(|point| {
+        digits
+            .as_bytes()
+            .get(point)
+            .is_some_and(|digit| *digit >= b'5')
+    });
+    let magnitude = integer_part + i128::from(rounds_up);
+    i64::try_from(if negative { -magnitude } else { magnitude }).map_err(|_| out_of_range())
 }
 
 fn is_text_pattern(node: &pg_query::protobuf::Node) -> bool {

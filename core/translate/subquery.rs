@@ -371,34 +371,17 @@ pub fn plan_subqueries_from_select_plan(
         )?;
     }
 
-    // LIMIT and OFFSET cannot reference columns from the outer query
-    let get_outer_query_refs = |_: &TableReferences| Ok(crate::alloc::try_vec![]?);
-    {
-        let mut subquery_parser = get_subquery_parser(
-            program,
-            &mut plan.non_from_clause_subqueries,
-            &mut plan.table_references,
-            resolver,
-            connection,
-            get_outer_query_refs,
-            SubqueryPosition::LimitOffset,
-            SubqueryOrigin::SelectLimitOffset,
-            false,
-            &mut cse_map,
-            &mut same_query_map,
-            &[],
-        );
-        // Limit
-        if let Some(limit) = &mut plan.limit {
-            crate::stack::trace_stack!("select_limit");
-            walk_expr_mut(limit, &mut subquery_parser)?;
-        }
-        // Offset
-        if let Some(offset) = &mut plan.offset {
-            crate::stack::trace_stack!("select_offset");
-            walk_expr_mut(offset, &mut subquery_parser)?;
-        }
-    }
+    plan_subqueries_from_limit_offset(
+        program,
+        &mut plan.non_from_clause_subqueries,
+        &mut plan.table_references,
+        plan.limit.as_deref_mut(),
+        plan.offset.as_deref_mut(),
+        resolver,
+        connection,
+        &mut cse_map,
+        &mut same_query_map,
+    )?;
 
     // Recollect aggregates after all subquery planning.
     // This is necessary because:
@@ -422,6 +405,70 @@ pub fn plan_subqueries_from_select_plan(
         &mut plan.table_references,
         &mut plan.non_from_clause_subqueries,
     )?;
+    Ok(())
+}
+
+pub fn plan_subqueries_from_compound_limit_offset(
+    program: &mut ProgramBuilder,
+    right_most: &mut SelectPlan,
+    limit: Option<&mut ast::Expr>,
+    offset: Option<&mut ast::Expr>,
+    resolver: &Resolver,
+    connection: &Arc<Connection>,
+) -> Result<()> {
+    plan_subqueries_from_limit_offset(
+        program,
+        &mut right_most.non_from_clause_subqueries,
+        &mut right_most.table_references,
+        limit,
+        offset,
+        resolver,
+        connection,
+        &mut Vec::new(),
+        &mut Vec::new(),
+    )?;
+    update_column_used_masks(
+        &mut right_most.table_references,
+        &mut right_most.non_from_clause_subqueries,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn plan_subqueries_from_limit_offset(
+    program: &mut ProgramBuilder,
+    out_subqueries: &mut Vec<NonFromClauseSubquery>,
+    referenced_tables: &mut TableReferences,
+    limit: Option<&mut ast::Expr>,
+    offset: Option<&mut ast::Expr>,
+    resolver: &Resolver,
+    connection: &Arc<Connection>,
+    cse_map: &mut Vec<(ast::Expr, ast::Expr)>,
+    same_query_map: &mut Vec<(ast::Expr, TableInternalId, SubqueryOrigin)>,
+) -> Result<()> {
+    // LIMIT and OFFSET cannot reference columns from the outer query
+    let get_outer_query_refs = |_: &TableReferences| Ok(crate::alloc::try_vec![]?);
+    let mut subquery_parser = get_subquery_parser(
+        program,
+        out_subqueries,
+        referenced_tables,
+        resolver,
+        connection,
+        get_outer_query_refs,
+        SubqueryPosition::LimitOffset,
+        SubqueryOrigin::SelectLimitOffset,
+        false,
+        cse_map,
+        same_query_map,
+        &[],
+    );
+    if let Some(limit) = limit {
+        crate::stack::trace_stack!("select_limit");
+        walk_expr_mut(limit, &mut subquery_parser)?;
+    }
+    if let Some(offset) = offset {
+        crate::stack::trace_stack!("select_offset");
+        walk_expr_mut(offset, &mut subquery_parser)?;
+    }
     Ok(())
 }
 
