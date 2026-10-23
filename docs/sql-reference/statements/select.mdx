@@ -607,6 +607,10 @@ not included in `SELECT *`.
 must be selected explicitly and is not included in `SELECT *`. This catalog
 currently returns no rows.
 
+`pg_get_triggerdef(oid)` and `pg_get_triggerdef(oid, pretty)` return NULL for
+missing trigger OIDs and NULL arguments. PostgreSQL triggers are not currently
+supported, so no trigger definitions are available.
+
 ## See Also
 
 - [INSERT](/docs/sql-reference/statements/insert) for adding rows to a table
