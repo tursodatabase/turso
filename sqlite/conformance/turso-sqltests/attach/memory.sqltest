@@ -68,3 +68,27 @@ test database-list-with-arg {
 expect {
     0|main|
 }
+
+# Two same-named tables in different databases are two FROM entries, so
+# `main.t.c` and `aux.t.c` stay separate columns in SELECT, WHERE and GROUP BY.
+test same-named-tables-in-two-databases-keep-separate-columns {
+    ATTACH DATABASE ':memory:' AS aux;
+    CREATE TABLE t (k TEXT, v INTEGER);
+    CREATE TABLE aux.t (k TEXT, v INTEGER);
+    INSERT INTO t VALUES ('a', 1), ('b', 2);
+    INSERT INTO aux.t VALUES ('a', 10), ('a', 20);
+    SELECT main.t.k, aux.t.k, main.t.v, aux.t.v
+        FROM main.t JOIN aux.t ON main.t.k = aux.t.k
+        ORDER BY 1, 4;
+    SELECT main.t.k, aux.t.v, count(*)
+        FROM main.t JOIN aux.t ON main.t.k = aux.t.k
+        WHERE main.t.v < aux.t.v
+        GROUP BY main.t.k, aux.t.v
+        ORDER BY 1, 2;
+}
+expect {
+    a|a|1|10
+    a|a|1|20
+    a|10|1
+    a|20|1
+}

@@ -2795,3 +2795,73 @@ test matview-untyped-column-compares-without-affinity {
 expect {
     Y|1
 }
+
+# `main.t.c` names the same column as `t.c`, so a materialized view must accept
+# it and keep it maintained.
+test matview-schema-qualified-column {
+    CREATE TABLE msg (id INTEGER PRIMARY KEY, body TEXT);
+    INSERT INTO msg VALUES (1,'a'),(2,'b');
+    CREATE MATERIALIZED VIEW v AS SELECT main.msg.id AS id FROM main.msg;
+    SELECT id FROM v ORDER BY 1;
+    INSERT INTO msg VALUES (3,'c');
+    DELETE FROM msg WHERE id = 1;
+    SELECT id FROM v ORDER BY 1;
+}
+expect {
+    1
+    2
+    2
+    3
+}
+
+test matview-schema-qualified-column-in-where-and-group-by {
+    CREATE TABLE msg (id INTEGER PRIMARY KEY, body TEXT);
+    INSERT INTO msg VALUES (1,'a'),(2,'b'),(3,'a');
+    CREATE MATERIALIZED VIEW v AS
+        SELECT main.msg.body AS body, count(*) AS n
+        FROM msg WHERE MAIN.MSG.ID > 1 GROUP BY main.msg.body;
+    SELECT body, n FROM v ORDER BY 1;
+}
+expect {
+    a|1
+    b|1
+}
+
+# `main.t.rowid` names the same rowid as `t.rowid`, in a result column and in a
+# filter.
+test matview-schema-qualified-rowid {
+    CREATE TABLE a (id INTEGER PRIMARY KEY, k TEXT, n INTEGER);
+    INSERT INTO a VALUES (1,'x',10),(2,'y',20);
+    CREATE MATERIALIZED VIEW v AS SELECT main.a.rowid AS r, main.a.n AS n FROM main.a;
+    SELECT r, n FROM v ORDER BY 1;
+    INSERT INTO a VALUES (3,'z',30);
+    DELETE FROM a WHERE id = 1;
+    SELECT r, n FROM v ORDER BY 1;
+}
+expect {
+    1|10
+    2|20
+    2|20
+    3|30
+}
+
+test matview-schema-qualified-rowid-only {
+    CREATE TABLE a (id INTEGER PRIMARY KEY, k TEXT, n INTEGER);
+    INSERT INTO a VALUES (1,'x',10),(2,'y',20);
+    CREATE MATERIALIZED VIEW v AS SELECT main.a.rowid AS r FROM main.a;
+    SELECT r FROM v ORDER BY 1;
+}
+expect {
+    1
+    2
+}
+
+test matview-schema-qualified-rowid-in-where {
+    CREATE TABLE a (id INTEGER PRIMARY KEY, k TEXT, n INTEGER);
+    INSERT INTO a VALUES (1,'x',10),(2,'y',20);
+    CREATE MATERIALIZED VIEW v AS SELECT main.a.n AS n FROM main.a WHERE main.a.rowid > 1;
+    SELECT n FROM v ORDER BY 1;
+}
+expect {
+    20
+}

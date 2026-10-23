@@ -985,20 +985,25 @@ pub fn exprs_are_equivalent(expr1: &Expr, expr2: &Expr) -> bool {
                     .zip(rhs2.iter())
                     .all(|(a, b)| exprs_are_equivalent(a, b))
         }
+        // The table id names one FROM-clause entry, which determines the
+        // database. `database` only records whether the user wrote the
+        // database name, so `main.t.c` and `t.c` are the same column and
+        // `main.t.rowid` and `t.rowid` are the same rowid.
         (
             Expr::Column {
-                database: db1,
                 is_rowid_alias: r1,
                 table: tbl_1,
                 column: col_1,
+                ..
             },
             Expr::Column {
-                database: db2,
                 is_rowid_alias: r2,
                 table: tbl_2,
                 column: col_2,
+                ..
             },
-        ) => tbl_1 == tbl_2 && col_1 == col_2 && db1 == db2 && r1 == r2,
+        ) => tbl_1 == tbl_2 && col_1 == col_2 && r1 == r2,
+        (Expr::RowId { table: tbl_1, .. }, Expr::RowId { table: tbl_2, .. }) => tbl_1 == tbl_2,
         // fall back to naive equality check
         _ => expr1 == expr2,
     }
