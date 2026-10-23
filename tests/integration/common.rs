@@ -1,11 +1,13 @@
-use rand::{rng, RngCore, SeedableRng};
+use rand::{RngCore, SeedableRng, rng};
 use rand_chacha::ChaCha8Rng;
 use rusqlite::params;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use tempfile::TempDir;
-use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
-use turso_core::{Clock, ConnectOpts, Connection, Database, FromValueRow, Row, SqliteDialect, IO};
+use tracing_subscriber::{EnvFilter, layer::SubscriberExt, util::SubscriberInitExt};
+use turso_core::{
+    Clock, ConnectOpts, Connection, Database, Dialect, FromValueRow, IO, Row, SqliteDialect,
+};
 
 /// Temp directories holding test databases, deleted when the test process exits.
 ///
@@ -39,7 +41,7 @@ pub struct TempDatabase {
 }
 unsafe impl Send for TempDatabase {}
 
-#[derive(Debug, Default, Clone)]
+#[derive(Clone)]
 pub struct TempDatabaseBuilder {
     db_name: Option<String>,
     db_path: Option<PathBuf>,
@@ -49,6 +51,7 @@ pub struct TempDatabaseBuilder {
     enable_mvcc: bool,
     io_uring: bool,
     enable_views: bool,
+    dialect: Option<Arc<dyn Dialect>>,
 }
 
 struct TestIo {
@@ -118,7 +121,7 @@ impl IO for TestIo {
 }
 
 impl TempDatabaseBuilder {
-    pub const fn new() -> Self {
+    pub fn new() -> Self {
         Self {
             db_name: None,
             db_path: None,
@@ -128,6 +131,7 @@ impl TempDatabaseBuilder {
             enable_mvcc: false,
             io_uring: false,
             enable_views: false,
+            dialect: None,
         }
     }
 
@@ -184,6 +188,11 @@ impl TempDatabaseBuilder {
         self
     }
 
+    pub fn with_dialect(mut self, dialect: Arc<dyn Dialect>) -> Self {
+        self.dialect = Some(dialect);
+        self
+    }
+
     pub fn build(self) -> TempDatabase {
         let mut opts = self
             .opts
@@ -233,13 +242,14 @@ impl TempDatabaseBuilder {
                 })
             }
         };
+        let dialect = self.dialect.unwrap_or_else(|| Arc::new(SqliteDialect));
         let db = Database::open_file_with_flags(
             io.clone(),
             db_path.to_str().unwrap(),
             flags,
             opts,
             None,
-            Arc::new(SqliteDialect),
+            dialect,
         )
         .unwrap();
 
@@ -264,7 +274,7 @@ impl TempDatabaseBuilder {
 
 #[allow(clippy::arc_with_non_send_sync)]
 impl TempDatabase {
-    pub const fn builder() -> TempDatabaseBuilder {
+    pub fn builder() -> TempDatabaseBuilder {
         TempDatabaseBuilder::new()
     }
 
@@ -698,9 +708,9 @@ mod tests {
     use std::{sync::Arc, vec};
     use tempfile::TempDir;
     use turso_core::SqliteDialect;
-    use turso_core::{ConnectOpts, Database, StepResult, IO};
+    use turso_core::{ConnectOpts, Database, IO, StepResult};
 
-    use crate::common::{do_flush, ExecRows};
+    use crate::common::{ExecRows, do_flush};
 
     use super::TempDatabase;
 
@@ -1478,7 +1488,7 @@ mod tests {
             conn1.execute("BEGIN CONCURRENT")?;
             let rows: Vec<(i64,)> = conn1.exec_rows("SELECT nextval('s')");
             assert_eq!(rows, vec![(51,)]); // sees setval'd value
-                                           // conn1 closes without commit; the nextval is still durable
+            // conn1 closes without commit; the nextval is still durable
 
             conn1.close()?;
             conn2.close()?;
@@ -2104,8 +2114,8 @@ mod tests {
     /// No panics, no errors that escape the opcode's retry loop.
     #[test]
     fn test_stress_nextval_setval_mixed_mvcc() -> anyhow::Result<()> {
-        use std::sync::atomic::{AtomicBool, Ordering};
         use std::sync::Mutex;
+        use std::sync::atomic::{AtomicBool, Ordering};
         use std::thread;
         use std::time::Duration;
         const NEXTVAL_THREADS: usize = 4;

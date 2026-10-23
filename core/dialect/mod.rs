@@ -198,6 +198,13 @@ pub trait Dialect: Send + Sync + 'static {
     fn upsert_rejects_row_written_by_same_statement(&self) -> bool {
         false
     }
+
+    /// Whether integer division by zero raises an error.
+    ///
+    /// PostgreSQL raises SQLSTATE 22012. SQLite returns NULL.
+    fn errors_on_zero_divisor(&self) -> bool {
+        false
+    }
 }
 
 #[cfg(test)]
@@ -206,7 +213,7 @@ mod tests {
     use crate::schema::BTreeTable;
     use crate::storage::database::DatabaseFile;
     use crate::sync::atomic::{AtomicUsize, Ordering};
-    use crate::{ConnectOpts, Database, DatabaseOpts, MemoryIO, OpenFlags, IO};
+    use crate::{ConnectOpts, Database, DatabaseOpts, IO, MemoryIO, OpenFlags};
     use std::sync::Arc;
 
     /// A dialect that counts schema-row parses and strips a `/* test */ `

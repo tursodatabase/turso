@@ -4,10 +4,10 @@ use std::fmt::Debug;
 use std::marker::PhantomData;
 use std::sync::Arc;
 use turso_core::{
+    Connection, Dialect, Func, IOResult, LimboError, OpenOptions, Result, Statement, Value,
     dialect::POSTGRES_TABLE_SQL_PREFIX,
     native_ext::{VirtualTable, VirtualTableCursor, VirtualTableModule},
     schema::{BTreeTable, Index, Schema, Table},
-    Connection, Dialect, Func, IOResult, LimboError, OpenOptions, Result, Statement, Value,
 };
 use turso_ext::{ConstraintInfo, IndexInfo, OrderByInfo, ResultCode, VTabKind};
 use turso_parser::ast::RefAct;
@@ -179,6 +179,10 @@ impl Dialect for PostgresDialect {
     }
 
     fn upsert_rejects_row_written_by_same_statement(&self) -> bool {
+        true
+    }
+
+    fn errors_on_zero_divisor(&self) -> bool {
         true
     }
 }
@@ -1906,8 +1910,7 @@ impl SnapshotRows for PgConstraintTable {
 // pg_attrdef
 // ──────────────────────────────────────────────────────────────────────
 
-const PG_ATTRDEF_SQL: &str =
-    "CREATE TABLE pg_attrdef (oid INTEGER, adrelid INTEGER, adnum INTEGER, adbin TEXT, tableoid INTEGER HIDDEN)";
+const PG_ATTRDEF_SQL: &str = "CREATE TABLE pg_attrdef (oid INTEGER, adrelid INTEGER, adnum INTEGER, adbin TEXT, tableoid INTEGER HIDDEN)";
 
 #[derive(Debug)]
 struct PgAttrdefTable;
@@ -2456,7 +2459,7 @@ impl SnapshotRows for PgSettingsTable {
     const ESTIMATED_ROWS: u32 = 1;
 
     fn load_rows(conn: &Connection) -> Vec<Vec<Value>> {
-        use crate::session::{search_path_setting, DEFAULT_SEARCH_PATH};
+        use crate::session::{DEFAULT_SEARCH_PATH, search_path_setting};
 
         let setting = search_path_setting(conn);
         let source = if setting.is_some() {

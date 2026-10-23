@@ -6,61 +6,65 @@ use crate::cdc::TURSO_CDC_VERSION_TABLE_NAME;
 use crate::error::SQLITE_CONSTRAINT_UNIQUE;
 use crate::function::{AccumulatorFunc, AlterTableFunc, WindowFunc};
 use crate::io::TempFile;
+use crate::mvcc::MvccClock;
 use crate::mvcc::cursor::{MvccCursorType, NextRowidResult};
 use crate::mvcc::database::{
     BootstrapState, CheckpointReadLockState, CheckpointStateMachine, TxID,
 };
-use crate::mvcc::MvccClock;
 use crate::numeric::Numeric;
 use crate::schema::{
-    render_gencol_expr_sql_with_new_names, FromDefinitionFlags, Schema, Table, EXPR_INDEX_SENTINEL,
-    SCHEMA_TABLE_NAME,
+    EXPR_INDEX_SENTINEL, FromDefinitionFlags, SCHEMA_TABLE_NAME, Schema, Table,
+    render_gencol_expr_sql_with_new_names,
 };
 use crate::state_machine::StateMachine;
 use crate::storage::btree::{
-    integrity_check, CursorStep, CursorTrait, IntegrityCheckError, IntegrityCheckState, KeptRead,
-    PageCategory,
+    CursorStep, CursorTrait, IntegrityCheckError, IntegrityCheckState, KeptRead, PageCategory,
+    integrity_check,
 };
 use crate::storage::database::DatabaseFile;
 use crate::storage::journal_mode;
 use crate::storage::page_cache::PageCache;
 use crate::storage::pager::{
-    default_page1, CreateBTreeFlags, PageRef, SavepointResult, SharedPagerState,
+    CreateBTreeFlags, PageRef, SavepointResult, SharedPagerState, default_page1,
 };
 use crate::storage::sqlite3_ondisk::{DatabaseHeader, PageSize, RawVersion};
 use crate::translate::collate::CollationSeq;
 use crate::types::IOResultOr;
 use crate::types::{
-    compare_immutable, compare_immutable_single, compare_record, AsValueRef, Extendable,
-    IOCompletions, IOResult, ImmutableRecord, IndexInfo, SeekResult, Text, ValueIterator,
+    AsValueRef, Extendable, IOCompletions, IOResult, ImmutableRecord, IndexInfo, SeekResult, Text,
+    ValueIterator, compare_immutable, compare_immutable_single, compare_record,
 };
 use crate::util::{
-    escape_sql_string_literal, normalize_ident, rename_identifiers, rewrite_check_expr_table_refs,
-    rewrite_column_level_fk_parent_columns_if_needed, rewrite_column_references_if_needed,
-    rewrite_fk_parent_cols_if_self_ref, rewrite_fk_parent_table_if_needed,
-    rewrite_inline_col_fk_target_if_needed, rewrite_trigger_cmd_table_refs,
-    rewrite_view_sql_for_column_rename, trim_ascii_whitespace, RewrittenView,
+    RewrittenView, escape_sql_string_literal, normalize_ident, rename_identifiers,
+    rewrite_check_expr_table_refs, rewrite_column_level_fk_parent_columns_if_needed,
+    rewrite_column_references_if_needed, rewrite_fk_parent_cols_if_self_ref,
+    rewrite_fk_parent_table_if_needed, rewrite_inline_col_fk_target_if_needed,
+    rewrite_trigger_cmd_table_refs, rewrite_view_sql_for_column_rename, trim_ascii_whitespace,
 };
+use crate::vdbe::ValueIteratorExt;
 use crate::vdbe::affinity::{
-    apply_numeric_affinity, real_to_i64, try_for_float, Affinity, NumericParseResult, ParsedNumber,
+    Affinity, NumericParseResult, ParsedNumber, apply_numeric_affinity, real_to_i64, try_for_float,
 };
 use crate::vdbe::hash_table::{
-    HashEntry, HashInsertResult, HashTable, HashTableConfig, PendingHashInsert, DEFAULT_MEM_BUDGET,
+    DEFAULT_MEM_BUDGET, HashEntry, HashInsertResult, HashTable, HashTableConfig, PendingHashInsert,
 };
 use crate::vdbe::insn::{AlterColumnData, ConstraintInfo, InsertFlags};
 use crate::vdbe::metrics::HashJoinMetrics;
 use crate::vdbe::vacuum::VacuumInPlaceOpContext;
 use crate::vdbe::value::ComparisonOp;
-use crate::vdbe::ValueIteratorExt;
 use crate::vdbe::{
-    decode_serial_type_into_register, registers_to_ref_values, DeferredSeekState, EndStatement,
-    OpHashBuildState, OpHashProbeState, StepResult, TxnCleanup, VacuumOpState,
+    DeferredSeekState, EndStatement, OpHashBuildState, OpHashProbeState, StepResult, TxnCleanup,
+    VacuumOpState, decode_serial_type_into_register, registers_to_ref_values,
 };
 use crate::vector::{
-    vector1bit, vector32, vector32_sparse, vector64, vector8, vector_concat, vector_distance_cos,
-    vector_distance_dot, vector_distance_jaccard, vector_distance_l2, vector_extract, vector_slice,
+    vector_concat, vector_distance_cos, vector_distance_dot, vector_distance_jaccard,
+    vector_distance_l2, vector_extract, vector_slice, vector1bit, vector8, vector32,
+    vector32_sparse, vector64,
 };
 use crate::{
+    CaptureDataChangesInfo, CdcVersion, CheckpointMode, Clock, Completion, ConnectOpts, Connection,
+    Database, DatabaseStorage, IOExt, MAIN_DB_ID, MonotonicInstant, MvCursor, NonNan, OpenFlags,
+    QueryMode, Statement, TEMP_DB_ID, TransactionState, ValueRef, WalAutoActions, WallClockInstant,
     connection::Row,
     get_cursor, info, is_attached_db,
     storage::wal::CheckpointResult,
@@ -71,10 +75,6 @@ use crate::{
         builder::CursorType,
         insn::{IdxInsertFlags, Insn, SavepointOp},
     },
-    CaptureDataChangesInfo, CdcVersion, CheckpointMode, Clock, Completion, ConnectOpts, Connection,
-    Database, DatabaseStorage, IOExt, MonotonicInstant, MvCursor, NonNan, OpenFlags, QueryMode,
-    Statement, TransactionState, ValueRef, WalAutoActions, WallClockInstant, MAIN_DB_ID,
-    TEMP_DB_ID,
 };
 use crate::{
     error::{
@@ -102,7 +102,7 @@ use std::{
     borrow::BorrowMut,
     cell::Cell,
     num::NonZero,
-    sync::{atomic::Ordering, Arc},
+    sync::{Arc, atomic::Ordering},
 };
 use turso_macros::turso_debug_assert;
 
@@ -150,6 +150,7 @@ impl OpenedBTree {
 }
 
 use super::{
+    CommitState,
     array::{
         array_values_from_blob, compare_arrays, compute_array_length, compute_array_length_at_dim,
         exec_array_append, exec_array_cat, exec_array_contains, exec_array_contains_all,
@@ -161,7 +162,6 @@ use super::{
         AddSequenceData, AggStepData, ArrayEncodeData, ClearBtreeCount, Cookie, IntegrityCkData,
         IvmSumKind, RegisterOrLiteral, SortComparatorType, SorterOpenData,
     },
-    CommitState,
 };
 use crate::sync::RwLock;
 use turso_parser::ast::{self, ForeignKeyClause, Name, QualifiedName, ResolveType};
@@ -169,21 +169,21 @@ use turso_parser::parser::Parser;
 
 use super::sorter::Sorter;
 use crate::vdbe::vacuum::{
-    capture_custom_types, mirror_symbols, reject_unsupported_vacuum_auto_vacuum_mode,
-    vacuum_target_build_step, vacuum_target_opts_from_source, VacuumDbHeaderMeta,
-    VacuumTargetBuildConfig, VacuumTargetBuildContext,
+    VacuumDbHeaderMeta, VacuumTargetBuildConfig, VacuumTargetBuildContext, capture_custom_types,
+    mirror_symbols, reject_unsupported_vacuum_auto_vacuum_mode, vacuum_target_build_step,
+    vacuum_target_opts_from_source,
 };
 
 #[cfg(feature = "json")]
 use crate::{
-    function::JsonFunc, json, json::convert_dbtype_to_raw_jsonb, json::ensure_blob_arg_is_jsonb,
-    json::get_json, json::is_json_valid, json::json_array, json::json_array_length,
-    json::json_arrow_extract, json::json_arrow_shift_extract, json::json_error_position,
-    json::json_extract, json::json_from_raw_bytes_agg, json::json_insert, json::json_object,
-    json::json_patch, json::json_quote, json::json_remove, json::json_replace, json::json_set,
-    json::json_type, json::jsonb, json::jsonb_array, json::jsonb_extract, json::jsonb_insert,
-    json::jsonb_object, json::jsonb_patch, json::jsonb_remove, json::jsonb_replace,
-    json::jsonb_set, json::raw_jsonb_element_len, json::Conv,
+    function::JsonFunc, json, json::Conv, json::convert_dbtype_to_raw_jsonb,
+    json::ensure_blob_arg_is_jsonb, json::get_json, json::is_json_valid, json::json_array,
+    json::json_array_length, json::json_arrow_extract, json::json_arrow_shift_extract,
+    json::json_error_position, json::json_extract, json::json_from_raw_bytes_agg,
+    json::json_insert, json::json_object, json::json_patch, json::json_quote, json::json_remove,
+    json::json_replace, json::json_set, json::json_type, json::jsonb, json::jsonb_array,
+    json::jsonb_extract, json::jsonb_insert, json::jsonb_object, json::jsonb_patch,
+    json::jsonb_remove, json::jsonb_replace, json::jsonb_set, json::raw_jsonb_element_len,
 };
 
 use super::{Program, ProgramState, Register};
@@ -191,7 +191,7 @@ use super::{Program, ProgramState, Register};
 #[cfg(feature = "fs")]
 use crate::connection::resolve_ext_path;
 use crate::vdbe::builder::CursorTypeExt;
-use crate::{bail_constraint_error, must_be_btree_cursor, MvStore, Pager, Result};
+use crate::{MvStore, Pager, Result, bail_constraint_error, must_be_btree_cursor};
 
 type MvccCheckpointStateMachine = CheckpointStateMachine<MvccClock, DynAllocator>;
 
@@ -632,7 +632,7 @@ fn check_divisor(
     lhs: usize,
     rhs: usize,
 ) -> Result<(), Box<LimboError>> {
-    if !program.connection.db.opts.errors_on_zero_divisor {
+    if !program.connection.dialect().errors_on_zero_divisor() {
         return Ok(());
     }
     if matches!(state.registers[lhs].get_value(), Value::Null) {
@@ -3604,7 +3604,7 @@ pub fn op_blob_read(
         Ok(IOResult::Done(())) => {}
         Ok(IOResult::IO(io)) => return Ok(state.suspend_on_io(io)),
         Err(err) if matches!(*err, LimboError::BlobHandleExpired) => {
-            return Ok(blob_expired_ack(state, *dest))
+            return Ok(blob_expired_ack(state, *dest));
         }
         Err(err) => return Err(err),
     }
@@ -3673,7 +3673,7 @@ pub fn op_blob_write(
         Ok(IOResult::Done(())) => {}
         Ok(IOResult::IO(io)) => return Ok(state.suspend_on_io(io)),
         Err(err) if matches!(*err, LimboError::BlobHandleExpired) => {
-            return Ok(blob_expired_ack(state, *dest))
+            return Ok(blob_expired_ack(state, *dest));
         }
         Err(err) => return Err(err),
     }
@@ -7781,8 +7781,13 @@ fn update_agg_payload(
             if matches!(arg, Value::Null) {
                 return Ok(());
             }
-            let [acc, count_slot, first_separator_len_slot, separator_lengths_slot, ..] =
-                payload.as_mut_slice()
+            let [
+                acc,
+                count_slot,
+                first_separator_len_slot,
+                separator_lengths_slot,
+                ..,
+            ] = payload.as_mut_slice()
             else {
                 unreachable!("GroupConcat payload is initialized with four slots");
             };
@@ -9266,7 +9271,13 @@ fn inverse_agg_payload(func: &AggFunc, arg: Value, payload: &mut [Value]) -> Res
             if matches!(arg, Value::Null) {
                 return Ok(());
             }
-            let [acc, count_slot, first_separator_len_slot, separator_lengths_slot, ..] = payload
+            let [
+                acc,
+                count_slot,
+                first_separator_len_slot,
+                separator_lengths_slot,
+                ..,
+            ] = payload
             else {
                 unreachable!("GroupConcat payload is initialized with four slots");
             };
@@ -9402,7 +9413,14 @@ pub fn op_agg_step(
                         match (arg, payload.as_mut_slice()) {
                             (
                                 Numeric::Integer(arg),
-                                [Value::Numeric(Numeric::Integer(acc)), _, Value::Numeric(Numeric::Integer(0)), _, Value::Numeric(Numeric::Integer(count)), ..],
+                                [
+                                    Value::Numeric(Numeric::Integer(acc)),
+                                    _,
+                                    Value::Numeric(Numeric::Integer(0)),
+                                    _,
+                                    Value::Numeric(Numeric::Integer(count)),
+                                    ..,
+                                ],
                             ) => {
                                 if let (Some(sum), Some(rows)) =
                                     (acc.checked_add(arg), count.checked_add(1))
@@ -9415,7 +9433,14 @@ pub fn op_agg_step(
                             }
                             (
                                 Numeric::Float(arg),
-                                [Value::Numeric(Numeric::Float(acc)), Value::Numeric(Numeric::Float(r_err)), Value::Numeric(Numeric::Integer(1)), Value::Numeric(Numeric::Integer(ovrfl)), Value::Numeric(Numeric::Integer(count)), ..],
+                                [
+                                    Value::Numeric(Numeric::Float(acc)),
+                                    Value::Numeric(Numeric::Float(r_err)),
+                                    Value::Numeric(Numeric::Integer(1)),
+                                    Value::Numeric(Numeric::Integer(ovrfl)),
+                                    Value::Numeric(Numeric::Integer(count)),
+                                    ..,
+                                ],
                             ) => {
                                 if let (Some((sum, err)), Some(rows)) = (
                                     kbn_step_finite(*acc, *r_err, f64::from(arg)),
@@ -9431,7 +9456,14 @@ pub fn op_agg_step(
                             }
                             (
                                 Numeric::Integer(arg),
-                                [Value::Numeric(Numeric::Float(acc)), Value::Numeric(Numeric::Float(r_err)), _, _, Value::Numeric(Numeric::Integer(count)), ..],
+                                [
+                                    Value::Numeric(Numeric::Float(acc)),
+                                    Value::Numeric(Numeric::Float(r_err)),
+                                    _,
+                                    _,
+                                    Value::Numeric(Numeric::Integer(count)),
+                                    ..,
+                                ],
                             ) if arg.unsigned_abs() < KBN_EXACT_INTEGER_LIMIT => {
                                 if let (Some((sum, err)), Some(rows)) = (
                                     kbn_step_finite(*acc, *r_err, arg as f64),
@@ -9461,8 +9493,12 @@ pub fn op_agg_step(
                     if let (Some(arg), Register::Aggregate(AggContext::Builtin(payload))) =
                         (arg, &mut state.registers[data.acc_reg])
                     {
-                        if let [Value::Numeric(Numeric::Float(acc)), Value::Numeric(Numeric::Float(r_err)), Value::Numeric(Numeric::Integer(count)), ..] =
-                            payload.as_mut_slice()
+                        if let [
+                            Value::Numeric(Numeric::Float(acc)),
+                            Value::Numeric(Numeric::Float(r_err)),
+                            Value::Numeric(Numeric::Integer(count)),
+                            ..,
+                        ] = payload.as_mut_slice()
                         {
                             if let (Some((sum, err)), Some(rows)) =
                                 (kbn_step_finite(*acc, *r_err, arg), count.checked_add(1))
@@ -9614,16 +9650,14 @@ fn op_agg_step_slow(program: &Program, state: &mut ProgramState, data: &AggStepD
                 _ => None,
             };
 
-            let [arg_reg, acc_slot] =
-                state
-                    .registers
-                    .get_disjoint_mut([*col, *acc_reg])
-                    .map_err(|_| {
-                        LimboError::InternalError(format!(
+            let [arg_reg, acc_slot] = state.registers.get_disjoint_mut([*col, *acc_reg]).map_err(
+                |_| {
+                    LimboError::InternalError(format!(
                         "AggStep: input register {} and accumulator register {} must be distinct",
                         *col, *acc_reg
                     ))
-                    })?;
+                },
+            )?;
             let arg = arg_reg.get_value();
             let Register::Aggregate(agg) = acc_slot else {
                 return Err(LimboError::InternalError(format!(
@@ -11884,7 +11918,7 @@ pub fn op_function(
                 let result = lhs.get_value().exec_math_binary(
                     rhs.get_value(),
                     math_func,
-                    program.connection.db.opts.errors_on_zero_divisor,
+                    program.connection.dialect().errors_on_zero_divisor(),
                 )?;
                 state.registers[*dest].set_value(result);
             }
@@ -13127,8 +13161,8 @@ pub fn op_insert(
                                     state.active_op_state.insert().route.as_ref().ok_or_else(
                                         || {
                                             LimboError::InternalError(format!(
-                                        "changed btree for {table_name} missing from schema"
-                                    ))
+                                                "changed btree for {table_name} missing from schema"
+                                            ))
                                         },
                                     )?;
                                 let values = if route.is_materialized_view {
@@ -16787,11 +16821,7 @@ pub fn op_is_true(
         // For non-NULL, optionally invert the boolean result
         Some(is_truthy) => {
             let result = if is_truthy { 1 } else { 0 };
-            if *invert {
-                1 - result
-            } else {
-                result
-            }
+            if *invert { 1 - result } else { result }
         }
     };
     state.registers[*dest].set_int(final_result);
@@ -20620,11 +20650,11 @@ fn maybe_transform_root_page_to_positive(mvcc_store: Option<&Arc<MvStore>>, root
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::SqliteDialect;
     use crate::alloc::vec;
     use crate::translate::collate::CollationSeq;
     use crate::vdbe::BranchOffset;
-    use crate::SqliteDialect;
-    use crate::{ConnectOpts, Database, DatabaseOpts, MemoryIO, IO};
+    use crate::{ConnectOpts, Database, DatabaseOpts, IO, MemoryIO};
 
     /// A weighted step must leave the same exact total as the weighted sum
     /// computed in 128-bit arithmetic, including when the i64 part wraps.

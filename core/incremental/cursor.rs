@@ -6,9 +6,8 @@ use crate::storage::btree::{BTreeKey, CursorStep, CursorTrait, SavePositionResul
 use crate::sync::Arc;
 use crate::types::{IOResultOr, ImmutableRecord, IndexInfo};
 use crate::{
-    return_if_io,
+    LimboError, Pager, Register, return_if_io,
     types::{IOResult, SeekKey, SeekOp, SeekResult, Value},
-    LimboError, Pager, Register,
 };
 
 /// Read cursor for a transactionally maintained materialized-view btree.
@@ -286,7 +285,6 @@ mod tests {
                 enable_mvcc: false,
                 enable_experimental_mvcc_passive_checkpoint: false,
                 unsafe_testing: false,
-                errors_on_zero_divisor: false,
             },
             None,
             Arc::new(SqliteDialect),
@@ -1797,10 +1795,10 @@ mod tests {
 
     mod io_resumption_tests {
         use super::*;
+        use crate::Register;
         use crate::io::Completion;
         use crate::storage::btree::{BTreeKey, CursorStep, CursorTrait};
         use crate::types::{IOCompletions, ImmutableRecord, IndexInfo};
-        use crate::Register;
         use std::sync::atomic::{AtomicUsize, Ordering};
 
         /// Mock btree cursor that tracks calls and can simulate IO pending states.

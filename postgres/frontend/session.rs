@@ -10,10 +10,10 @@ use crate::functions::ConfigParameter;
 use turso_core::{Connection, LimboError, Result, Statement, Value};
 use turso_parser::ast::{self};
 use turso_pg_parser::translator::{
-    check_set_transaction, is_comment_on, is_refresh_matview, try_extract_copy_from,
-    try_extract_create_schema, try_extract_drop_schema, try_extract_set, try_extract_show,
-    unnamed_index_name, unqualified_create_table_name_location, PgCopyFromStmt, PgCreateSchemaStmt,
-    PgDropSchemaStmt, PgSetStmt, PgSetValue, PgShowStmt, PostgreSQLTranslator,
+    PgCopyFromStmt, PgCreateSchemaStmt, PgDropSchemaStmt, PgSetStmt, PgSetValue, PgShowStmt,
+    PostgreSQLTranslator, check_set_transaction, is_comment_on, is_refresh_matview,
+    try_extract_copy_from, try_extract_create_schema, try_extract_drop_schema, try_extract_set,
+    try_extract_show, unnamed_index_name, unqualified_create_table_name_location,
 };
 
 use crate::copy::parse_copy_text_format;
@@ -70,7 +70,7 @@ pub fn open_database_with_io(
         turso_core::OpenOptions::new(Arc::new(PostgresDialect))
             .storage(db_file)
             .flags(flags)
-            .db_opts(opts.with_mvcc(true).with_errors_on_zero_divisor(true)),
+            .db_opts(opts.with_mvcc(true)),
     )
     .map_err(Into::into)
 }
@@ -868,7 +868,7 @@ fn schema_exists(conn: &Arc<Connection>, schema_name: &str) -> Result<bool> {
 
 #[cfg(test)]
 mod tests {
-    use super::{search_path_parser, PgSessionState, SessionState};
+    use super::{PgSessionState, SessionState, search_path_parser};
     use chumsky::Parser;
     use std::any::Any;
     use std::sync::{Arc, Mutex};

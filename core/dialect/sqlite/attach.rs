@@ -3,12 +3,12 @@
 
 use crate::function::{Func, ScalarFunc};
 #[cfg(feature = "fs")]
-use crate::io::{MemoryIO, IO};
+use crate::io::{IO, MemoryIO};
 #[cfg(feature = "fs")]
 use crate::storage::journal_mode;
+use crate::sync::Arc;
 #[cfg(feature = "fs")]
 use crate::sync::atomic::Ordering;
-use crate::sync::Arc;
 use crate::translate::{
     emitter::Resolver,
     expr::{sanitize_string, translate_expr},
@@ -17,11 +17,11 @@ use crate::types::IOResultOr;
 use crate::util::normalize_ident;
 use crate::vdbe::builder::{ProgramBuilder, ProgramBuilderOpts};
 use crate::vdbe::insn::Insn;
-#[cfg(feature = "fs")]
-use crate::{is_memory_like, DatabaseOpts, EncryptionKey, IOResult};
 use crate::{
-    turso_assert, Connection, Database, LimboError, Pager, Result, MAIN_DB_ID, TEMP_DB_ID,
+    Connection, Database, LimboError, MAIN_DB_ID, Pager, Result, TEMP_DB_ID, turso_assert,
 };
+#[cfg(feature = "fs")]
+use crate::{DatabaseOpts, EncryptionKey, IOResult, is_memory_like};
 use turso_parser::ast::{Expr, Literal};
 
 /// Translate ATTACH statement
@@ -584,13 +584,15 @@ impl Connection {
                         )
                         .into());
                     };
-                    crate::return_if_io!(mv_store.bootstrap_nonblock(
-                        bootstrap
-                            .bootstrap_conn
-                            .as_ref()
-                            .expect("bootstrap connection initialized above"),
-                        &mut bootstrap.bootstrap_st,
-                    ));
+                    crate::return_if_io!(
+                        mv_store.bootstrap_nonblock(
+                            bootstrap
+                                .bootstrap_conn
+                                .as_ref()
+                                .expect("bootstrap connection initialized above"),
+                            &mut bootstrap.bootstrap_st,
+                        )
+                    );
 
                     *state = AttachDatabaseState::Publish {
                         alias: bootstrap.alias.clone(),

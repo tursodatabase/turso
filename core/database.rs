@@ -3,8 +3,6 @@
 //! keeps a single `Database` per file, and the per-connection catalog of
 //! attached databases.
 
-use crate::types::IOResultOr;
-use crate::util::IOExt;
 #[cfg(feature = "io_memory_yield")]
 use crate::MemoryYieldIO;
 #[cfg(all(feature = "fs", target_os = "linux", feature = "io_uring", not(miri)))]
@@ -16,8 +14,15 @@ use crate::UringIO;
     not(miri)
 ))]
 use crate::WindowsIOCP;
+use crate::types::IOResultOr;
+use crate::util::IOExt;
 use crate::{
-    alloc, bail_corrupt_error,
+    AtomicSyncMode, AtomicTempStore, AtomicTransactionState, Buffer, BufferPool, CipherMode,
+    Completion, CompletionError, Connection, DatabaseStorage, Dialect, EncryptionKey, IO, IOResult,
+    InternalVirtualTable, LimboError, MemoryIO, MvStore, OpenFlags, PageCodec, PageCodecId,
+    PageRef, Pager, PlatformIO, Result, SymbolTable, SyncMode, SyscallIO, TempStore,
+    TransactionState, VirtualTable, Wal, WalAutoActions, WalFile, WalFileShared, alloc,
+    bail_corrupt_error,
     busy::BusyHandler,
     ext,
     incremental::view::TransactionChanges,
@@ -25,7 +30,7 @@ use crate::{
     progress::ProgressHandler,
     return_if_io,
     schema::{self, Schema},
-    stats::{refresh_analyze_stats, refresh_analyze_stats_nonblock, RefreshAnalyzeStatsState},
+    stats::{RefreshAnalyzeStatsState, refresh_analyze_stats, refresh_analyze_stats_nonblock},
     storage::{
         self,
         checksum::CHECKSUM_REQUIRED_RESERVED_BYTES,
@@ -37,21 +42,15 @@ use crate::{
         sqlite3_ondisk::{DatabaseHeader, PageSize, RawVersion, TextEncoding, Version},
     },
     sync::{
-        self,
+        self, Arc, LazyLock, Mutex, RwLock, Weak,
         atomic::{
-            AtomicBool, AtomicI32, AtomicI64, AtomicIsize, AtomicU32, AtomicU64, AtomicU8,
+            AtomicBool, AtomicI32, AtomicI64, AtomicIsize, AtomicU8, AtomicU32, AtomicU64,
             AtomicUsize, Ordering,
         },
-        Arc, LazyLock, Mutex, RwLock, Weak,
     },
     turso_assert, turso_assert_greater_than_or_equal,
     types::{self, IOCompletions},
     vdbe::metrics::ConnectionMetrics,
-    AtomicSyncMode, AtomicTempStore, AtomicTransactionState, Buffer, BufferPool, CipherMode,
-    Completion, CompletionError, Connection, DatabaseStorage, Dialect, EncryptionKey, IOResult,
-    InternalVirtualTable, LimboError, MemoryIO, MvStore, OpenFlags, PageCodec, PageCodecId,
-    PageRef, Pager, PlatformIO, Result, SymbolTable, SyncMode, SyscallIO, TempStore,
-    TransactionState, VirtualTable, Wal, WalAutoActions, WalFile, WalFileShared, IO,
 };
 use arc_swap::{ArcSwap, ArcSwapOption};
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
@@ -65,7 +64,7 @@ use std::{fmt, ops::Deref};
 use storage::database::DatabaseFile;
 #[cfg(host_shared_wal)]
 use storage::shared_wal_coordination::MappedSharedWalCoordination;
-use tracing::{instrument, Level};
+use tracing::{Level, instrument};
 
 /// Configuration for database features
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -87,7 +86,6 @@ pub struct DatabaseOpts {
     pub enable_experimental_mvcc_passive_checkpoint: bool,
     pub unsafe_testing: bool,
     pub(crate) enable_load_extension: bool,
-    pub errors_on_zero_divisor: bool,
 }
 
 impl DatabaseOpts {
@@ -153,11 +151,6 @@ impl DatabaseOpts {
 
     pub fn with_multiprocess_wal(mut self, enable: bool) -> Self {
         self.enable_multiprocess_wal = enable;
-        self
-    }
-
-    pub fn with_errors_on_zero_divisor(mut self, enable: bool) -> Self {
-        self.errors_on_zero_divisor = enable;
         self
     }
 
@@ -1910,22 +1903,22 @@ impl Database {
                                         let decoded_page_size = header.page_size.get() as usize;
                                         if decoded_page_size != bootstrap_page_size {
                                             return Err(LimboError::InvalidArgument(format!(
-                                            "page codec bootstrap page size {bootstrap_page_size} does not match decoded page-1 size {decoded_page_size}"
-                                        )));
+                                                "page codec bootstrap page size {bootstrap_page_size} does not match decoded page-1 size {decoded_page_size}"
+                                            )));
                                         }
                                         if header.reserved_space != bootstrap_reserved_space {
                                             return Err(LimboError::InvalidArgument(format!(
-                                            "page codec bootstrap reserved space {bootstrap_reserved_space} does not match decoded page-1 reserved space {}",
-                                            header.reserved_space
-                                        )));
+                                                "page codec bootstrap reserved space {bootstrap_reserved_space} does not match decoded page-1 reserved space {}",
+                                                header.reserved_space
+                                            )));
                                         }
                                         let required_reserved_space =
                                             codec.required_reserved_bytes();
                                         if header.reserved_space != required_reserved_space {
                                             return Err(LimboError::InvalidArgument(format!(
-                                            "page codec requires exactly {required_reserved_space} reserved bytes, but decoded page 1 provides {}",
-                                            header.reserved_space
-                                        )));
+                                                "page codec requires exactly {required_reserved_space} reserved bytes, but decoded page 1 provides {}",
+                                                header.reserved_space
+                                            )));
                                         }
                                     }
                                 }
@@ -3637,20 +3630,20 @@ impl DatabaseCatalog {
 #[cfg(test)]
 mod database_tests {
     use std::sync::{
-        atomic::{AtomicBool, AtomicUsize, Ordering},
         Arc,
+        atomic::{AtomicBool, AtomicUsize, Ordering},
     };
 
-    use super::{is_memory_like, Database, InitState};
+    use super::{Database, InitState, is_memory_like};
     use crate::storage::encryption::EncryptionKey;
     use crate::storage::page_transform::{
         PageCodec, PageCodecContext, PageCodecHeaderInfo, PageCodecId, PageLocation,
     };
     use crate::storage::sqlite3_ondisk::DatabaseHeader;
     use crate::{
-        storage::database::DatabaseFile, CompletionError, ConnectOpts, Connection, DatabaseOpts,
-        DatabaseStorage, EncryptionOpts, IOResult, LimboError, OpenDbAsyncState, OpenFlags,
-        OpenOptions, PlatformIO, SqliteDialect, IO,
+        CompletionError, ConnectOpts, Connection, DatabaseOpts, DatabaseStorage, EncryptionOpts,
+        IO, IOResult, LimboError, OpenDbAsyncState, OpenFlags, OpenOptions, PlatformIO,
+        SqliteDialect, storage::database::DatabaseFile,
     };
 
     #[test]
@@ -4370,14 +4363,16 @@ mod database_tests {
             Ok(_) => panic!("a cached codec-backed database must reject a different codec"),
             Err(err) => err,
         };
-        assert!(err
-            .to_string()
-            .contains("page codec identity does not match the existing database"));
+        assert!(
+            err.to_string()
+                .contains("page codec identity does not match the existing database")
+        );
 
         let err = open_with_page_codec_result(io, path, different_codec).unwrap_err();
-        assert!(err
-            .to_string()
-            .contains("page codec identity does not match the existing database"));
+        assert!(
+            err.to_string()
+                .contains("page codec identity does not match the existing database")
+        );
     }
 
     #[cfg(feature = "fs")]
@@ -4402,9 +4397,10 @@ mod database_tests {
                 .page_codec(codec),
         )
         .unwrap_err();
-        assert!(err
-            .to_string()
-            .contains("built-in encryption cannot be combined with an external page codec"));
+        assert!(
+            err.to_string()
+                .contains("built-in encryption cannot be combined with an external page codec")
+        );
     }
 
     #[cfg(feature = "fs")]
@@ -4929,9 +4925,10 @@ mod database_tests {
         }
 
         let err = open_with_page_codec_result(io, path, codec).unwrap_err();
-        assert!(err
-            .to_string()
-            .contains("page codec reported invalid page size"));
+        assert!(
+            err.to_string()
+                .contains("page codec reported invalid page size")
+        );
     }
 
     #[cfg(feature = "fs")]
@@ -4948,9 +4945,10 @@ mod database_tests {
             .unwrap();
 
         let err = conn.execute("PRAGMA journal_mode = 'mvcc'").unwrap_err();
-        assert!(err
-            .to_string()
-            .contains("external page codecs are not supported with MVCC"));
+        assert!(
+            err.to_string()
+                .contains("external page codecs are not supported with MVCC")
+        );
     }
 
     #[cfg(feature = "fs")]
@@ -4975,9 +4973,10 @@ mod database_tests {
             Ok(_) => panic!("plaintext databases must reject external page codecs"),
             Err(err) => err,
         };
-        assert!(err
-            .to_string()
-            .contains("database was opened without an external page codec"));
+        assert!(
+            err.to_string()
+                .contains("database was opened without an external page codec")
+        );
     }
 
     #[cfg(feature = "fs")]
@@ -4993,9 +4992,10 @@ mod database_tests {
             Ok(_) => panic!("codec-backed databases must reject codec-less connections"),
             Err(err) => err,
         };
-        assert!(err
-            .to_string()
-            .contains("database requires an external page codec"));
+        assert!(
+            err.to_string()
+                .contains("database requires an external page codec")
+        );
     }
 
     #[cfg(feature = "fs")]
@@ -5107,9 +5107,10 @@ mod database_tests {
             Ok(_) => panic!("encryption and an external page codec must not share a pager"),
             Err(err) => err,
         };
-        assert!(err
-            .to_string()
-            .contains("built-in encryption cannot be combined with an external page codec"));
+        assert!(
+            err.to_string()
+                .contains("built-in encryption cannot be combined with an external page codec")
+        );
     }
 
     #[cfg(feature = "fs")]
@@ -5582,9 +5583,10 @@ mod database_tests {
         let err = conn
             .execute(format!("ATTACH '{aux_path}' AS aux"))
             .unwrap_err();
-        assert!(err
-            .to_string()
-            .contains("ATTACH is unsupported for connections using an external page codec"));
+        assert!(
+            err.to_string()
+                .contains("ATTACH is unsupported for connections using an external page codec")
+        );
         assert!(!std::path::Path::new(aux_path).exists());
     }
 
@@ -5605,9 +5607,10 @@ mod database_tests {
             .unwrap();
 
         let err = conn.set_reserved_bytes(0).unwrap_err();
-        assert!(err
-            .to_string()
-            .contains("page codec requires exactly 1 reserved bytes"));
+        assert!(
+            err.to_string()
+                .contains("page codec requires exactly 1 reserved bytes")
+        );
         assert_eq!(conn.get_reserved_bytes(), Some(1));
     }
 
