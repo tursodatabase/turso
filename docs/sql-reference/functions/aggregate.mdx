@@ -315,7 +315,7 @@ HAVING sum(amount) > 400;
 
 ## Aggregates with DISTINCT
 
-The `DISTINCT` keyword causes the aggregate to consider only unique non-NULL values.
+The `DISTINCT` keyword causes the aggregate to consider only unique non-NULL values. Duplicate comparisons use the argument expression’s collation. A plain column keeps its declared collation, including through parentheses, unary `+`, or `CAST`. Expressions such as `column || ''` use `BINARY` unless an explicit `COLLATE` is present.
 
 ```sql
 SELECT count(product) FROM sales;
