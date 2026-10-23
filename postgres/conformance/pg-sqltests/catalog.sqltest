@@ -925,3 +925,10 @@ expect {
     pg_catalog
     public
 }
+
+test pg-statistic-ext-dump-discovery-is-empty {
+    SET search_path TO '';
+    SELECT tableoid, oid, stxname, stxnamespace, stxowner, stxrelid, stxstattarget
+    FROM pg_catalog.pg_statistic_ext;
+}
+expect {}
