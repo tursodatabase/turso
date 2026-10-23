@@ -1,0 +1,31 @@
+@database :memory:
+
+setup order_index_created_first {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, a INT, b INT);
+    CREATE INDEX tb ON t(b);
+    CREATE INDEX ta ON t(a);
+}
+
+setup seek_index_created_first {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, a INT, b INT);
+    CREATE INDEX ta ON t(a);
+    CREATE INDEX tb ON t(b);
+}
+
+@setup order_index_created_first
+test selective-seek-beats-order-index-created-first {
+    EXPLAIN QUERY PLAN SELECT * FROM t WHERE a = 5 ORDER BY b;
+}
+expect {
+    1|0|0|SEARCH t USING INDEX ta (a=?)
+    15|0|0|USE SORTER FOR ORDER BY
+}
+
+@setup seek_index_created_first
+test selective-seek-plan-is-stable-when-created-first {
+    EXPLAIN QUERY PLAN SELECT * FROM t WHERE a = 5 ORDER BY b;
+}
+expect {
+    1|0|0|SEARCH t USING INDEX ta (a=?)
+    15|0|0|USE SORTER FOR ORDER BY
+}

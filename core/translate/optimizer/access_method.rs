@@ -288,57 +288,54 @@ pub(super) fn choose_best_btree_candidate(
             }),
         };
 
-        let (iter_dir, is_index_ordered, order_satisfiability_bonus) =
-            if let Some(order_target) = maybe_order_target {
-                // Reuse the same index-vs-order matching logic as final plan
-                // validation, but allow any equality-constrained seek prefix to
-                // be skipped here. Candidate scoring only needs to know whether
-                // this specific access path can emit rows ordered after its seek
-                // key; final global ORDER BY validation is stricter and only
-                // skips globally constant prefixes.
-                let all_same_direction = btree_access_order_consumed(
-                    rhs_table,
-                    IterationDirection::Forwards,
-                    candidate.index.as_deref(),
-                    &usable_constraint_refs,
-                    order_target,
-                    0,
-                    schema,
-                    EqualityPrefixScope::AnyEquality,
-                )
-                .consumed
-                    == order_target.columns.len();
-                let all_opposite_direction = btree_access_order_consumed(
-                    rhs_table,
-                    IterationDirection::Backwards,
-                    candidate.index.as_deref(),
-                    &usable_constraint_refs,
-                    order_target,
-                    0,
-                    schema,
-                    EqualityPrefixScope::AnyEquality,
-                )
-                .consumed
-                    == order_target.columns.len();
+        let (iter_dir, is_index_ordered) = if let Some(order_target) = maybe_order_target {
+            // Reuse the same index-vs-order matching logic as final plan
+            // validation, but allow any equality-constrained seek prefix to
+            // be skipped here. Candidate scoring only needs to know whether
+            // this specific access path can emit rows ordered after its seek
+            // key; final global ORDER BY validation is stricter and only
+            // skips globally constant prefixes.
+            let all_same_direction = btree_access_order_consumed(
+                rhs_table,
+                IterationDirection::Forwards,
+                candidate.index.as_deref(),
+                &usable_constraint_refs,
+                order_target,
+                0,
+                schema,
+                EqualityPrefixScope::AnyEquality,
+            )
+            .consumed
+                == order_target.columns.len();
+            let all_opposite_direction = btree_access_order_consumed(
+                rhs_table,
+                IterationDirection::Backwards,
+                candidate.index.as_deref(),
+                &usable_constraint_refs,
+                order_target,
+                0,
+                schema,
+                EqualityPrefixScope::AnyEquality,
+            )
+            .consumed
+                == order_target.columns.len();
 
-                let satisfies_order = all_same_direction || all_opposite_direction;
-                if satisfies_order {
-                    let sort_cost_saved = estimate_sort_cpu_cost(*base_row_count, params);
-                    (
-                        if all_same_direction {
-                            IterationDirection::Forwards
-                        } else {
-                            IterationDirection::Backwards
-                        },
-                        true,
-                        sort_cost_saved,
-                    )
-                } else {
-                    (IterationDirection::Forwards, false, Cost(0.0))
-                }
+            let satisfies_order = all_same_direction || all_opposite_direction;
+            if satisfies_order {
+                (
+                    if all_same_direction {
+                        IterationDirection::Forwards
+                    } else {
+                        IterationDirection::Backwards
+                    },
+                    true,
+                )
             } else {
-                (IterationDirection::Forwards, false, Cost(0.0))
-            };
+                (IterationDirection::Forwards, false)
+            }
+        } else {
+            (IterationDirection::Forwards, false)
+        };
 
         if index_info.is_none() && !is_index_ordered {
             continue;
@@ -381,7 +378,6 @@ pub(super) fn choose_best_btree_candidate(
             params,
             Some(&analyze_ctx),
         );
-
         // Residual filter output adjustment (mirrors SQLite's whereLoopOutputAdjust).
         //
         // When two indexes have the same seek cost, the one whose seek
@@ -453,8 +449,25 @@ pub(super) fn choose_best_btree_candidate(
             .map(|(_, c)| c.selectivity)
             .product();
 
-        // Adjusted output: lower means the loop delivers fewer rows downstream.
-        let adjusted_output = residual_selectivity;
+        // Estimate rows after both the access-path constraints and residual
+        // filters. ORDER BY savings apply to those result rows, not the full table.
+        let estimated_rows_per_outer_row = index_info.map_or(*candidate_base_row_count, |info| {
+            estimate_rows_per_seek(
+                info,
+                &rhs_constraints.constraints,
+                &usable_constraint_refs,
+                candidate_base_row_count,
+                Some(&analyze_ctx),
+            )
+        });
+        // Estimated output: lower means the loop delivers fewer rows downstream.
+        let adjusted_output =
+            input_cardinality * estimated_rows_per_outer_row * residual_selectivity;
+        let order_satisfiability_bonus = if is_index_ordered {
+            estimate_sort_cpu_cost(adjusted_output, params)
+        } else {
+            Cost(0.0)
+        };
 
         // Only apply the order bonus when this candidate satisfies order but
         // the current best does not. When both satisfy order, switching saves
