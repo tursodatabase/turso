@@ -1260,6 +1260,9 @@ fn emit_query_block_without_from(
         }
         hir::QueryBlockBody::Values { rows } => {
             let start = query_output_registers(program, &block.outputs, output.needs_values())?;
+            // Every row writes the same registers, so a row's constants are
+            // computed where the row is, not once before the loops.
+            let first_span = program.constant_spans_next_idx();
             for row in rows {
                 let next_row = program.allocate_label();
                 emit_query_row(
@@ -1271,6 +1274,7 @@ fn emit_query_block_without_from(
                     start,
                     next_row,
                 )?;
+                program.constant_spans_invalidate_after(first_span);
                 program.preassign_label_to_next_insn(next_row);
                 if let HirRowTarget::Direct {
                     destination, limit, ..
@@ -9552,7 +9556,7 @@ fn emit_limit_value(
             _ => unreachable!("numeric parser returns a numeric value"),
         },
         _ => {
-            super::expr::translate_expr(program, document, expression, target)?;
+            super::expr::translate_expr_no_constant_opt(program, document, expression, target)?;
             program.emit_insn(Insn::MustBeInt {
                 reg: target,
                 target_pc: None,
@@ -9580,7 +9584,7 @@ fn emit_first_row_limit_value(
             return Ok(());
         }
     }
-    super::expr::translate_expr(program, document, expression, target)?;
+    super::expr::translate_expr_no_constant_opt(program, document, expression, target)?;
     let zero = program.alloc_register();
     program.emit_insn(Insn::Integer {
         value: 0,
@@ -9641,7 +9645,7 @@ fn emit_offset_value(
             _ => unreachable!("numeric parser returns a numeric value"),
         },
         _ => {
-            super::expr::translate_expr(program, document, expression, target)?;
+            super::expr::translate_expr_no_constant_opt(program, document, expression, target)?;
         }
     }
     Ok(())
@@ -9767,17 +9771,19 @@ fn emit_query_row_with_inputs<'expr>(
     // A row written to an ephemeral index or table, yielded from a
     // coroutine, or queued for a recursive CTE keeps its constants in
     // place: another arm of a compound SELECT or a later run writes the
-    // same registers.
-    let constants_in_place = matches!(
-        output.target,
-        HirRowTarget::Direct {
-            destination: QueryDestination::EphemeralIndex { .. }
-                | QueryDestination::CoroutineYield { .. }
-                | QueryDestination::EphemeralTable { .. }
-                | QueryDestination::RecursiveCteQueue { .. },
-            ..
-        }
-    );
+    // same registers. So does a row built from buffered values, which a
+    // sorter or window output subroutine computes per buffered row.
+    let constants_in_place = !inputs.values.is_empty()
+        || matches!(
+            output.target,
+            HirRowTarget::Direct {
+                destination: QueryDestination::EphemeralIndex { .. }
+                    | QueryDestination::CoroutineYield { .. }
+                    | QueryDestination::EphemeralTable { .. }
+                    | QueryDestination::RecursiveCteQueue { .. },
+                ..
+            }
+        );
     if !output.needs_values() {
         for expression in expressions {
             super::expr::register_parameters(program, expression);

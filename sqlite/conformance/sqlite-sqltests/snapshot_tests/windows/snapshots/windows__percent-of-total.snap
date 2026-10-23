@@ -22,7 +22,7 @@ QUERY PLAN
 
 BYTECODE
 addr  opcode          p1   p2  p3  p4                    p5  comment
-   0  Init             0  137   0                         0  Start at 137
+   0  Init             0  139   0                         0  Start at 139
    1  OpenEphemeral    0    1   0                         0  cursor=0 is_table=true
    2  OpenDup          1    0   0                         0  new_cursor=1, original_cursor=0
    3  OpenDup          2    0   0                         0  new_cursor=2, original_cursor=0
@@ -141,25 +141,25 @@ addr  opcode          p1   p2  p3  p4                    p5  comment
  116  Goto             0  107   0                         0
  117  ResetSorter      0    0   0                         0  cursor=0
  118  Return           9    0   1                         0
- 119  Goto             0  136   0                         0
+ 119  Goto             0  138   0                         0
  120  Copy             3   38   0                         0  r[38]=r[3]
  121  Copy             4   39   0                         0  r[39]=r[4]
  122  Copy             5   40   0                         0  r[40]=r[5]
  123  Copy             6   41   0                         0  r[41]=r[6]
  124  Copy             6   46   0                         0  r[46]=r[6]
  125  Cast            46    0   0                         0  affinity(r[46]=Real)
- 126  Multiply        46   47  44                         0  r[44]=r[46]*r[47]
- 127  Copy             2   45   0                         0  r[45]=r[2]
- 128  Divide          44   45  42                         0  r[42]=r[44]/r[45]
- 129  Copy             6   50   0                         0  r[50]=r[6]
- 130  Cast            50    0   0                         0  affinity(r[50]=Real)
- 131  Multiply        50   51  48                         0  r[48]=r[50]*r[51]
- 132  Copy             7   49   0                         0  r[49]=r[7]
- 133  Divide          48   49  43                         0  r[43]=r[48]/r[49]
- 134  ResultRow       38    6   0                         0  output=r[38..43]
- 135  Return          10    0   0                         0
- 136  Halt             0    0   0                         0
- 137  Transaction      0    1   7                         0  iDb=0 tx_mode=Read
- 138  Real             0   47   0  100.0                  0  r[47]=100
- 139  Real             0   51   0  100.0                  0  r[51]=100
+ 126  Real             0   47   0  100.0                  0  r[47]=100
+ 127  Multiply        46   47  44                         0  r[44]=r[46]*r[47]
+ 128  Copy             2   45   0                         0  r[45]=r[2]
+ 129  Divide          44   45  42                         0  r[42]=r[44]/r[45]
+ 130  Copy             6   50   0                         0  r[50]=r[6]
+ 131  Cast            50    0   0                         0  affinity(r[50]=Real)
+ 132  Real             0   51   0  100.0                  0  r[51]=100
+ 133  Multiply        50   51  48                         0  r[48]=r[50]*r[51]
+ 134  Copy             7   49   0                         0  r[49]=r[7]
+ 135  Divide          48   49  43                         0  r[43]=r[48]/r[49]
+ 136  ResultRow       38    6   0                         0  output=r[38..43]
+ 137  Return          10    0   0                         0
+ 138  Halt             0    0   0                         0
+ 139  Transaction      0    1   7                         0  iDb=0 tx_mode=Read
  140  Goto             0    1   0                         0

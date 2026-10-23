@@ -14,46 +14,46 @@ QUERY PLAN
 
 BYTECODE
 addr  opcode            p1  p2  p3  p4          p5  comment
-   0  Init               0  39   0               0  Start at 39
+   0  Init               0  38   0               0  Start at 38
    1  Null               0   1   0               0  r[1]=NULL
    2  OpenRead           0   2   0  k(3,B,B,B)   0  table=parent, root=2, iDb=0
-   3    Integer          1   2   0               0  r[2]=1
-   4    SeekRowid        0   2   7               0  if (r[2]!=cursor 0.rowid) goto 7
-   5    RowId            0   3   0               0  r[3]=parent.rowid
-   6    RowSetAdd        1   3   0               0
-   7    Close            0   0   0               0
-   8    OpenWrite        1   2   0               0  root=2; iDb=0
-   9    OpenWrite        2   3   0               0  root=3; iDb=0
-  10      RowSetRead     1  38   4               0
-  11      NotExists      1  10   4               0
-  12      Null           0   5   0               0  r[5]=NULL
-  13      Column         1   1   8               0  r[8]=parent.k
-  14      Add            8   9   6               0  r[6]=r[8]+r[9]
-  15      Column         1   2   7               0  r[7]=parent.v
-  16      Affinity       5   3   0               0  r[5..8] = D, D, D
-  17      Copy           6  10   0               0  r[10]=r[6]
-  18      Copy           4  11   0               0  r[11]=r[4]
-  19      Affinity      10   1   0               0  r[10..11] = D
-  20      MakeRecord    10   2  12               0  r[12]=mkrec(r[10..11]); for sqlite_autoindex_parent_1
-  21      NoConflict     2  25  10  1            0  key=r[10..10]
-  22      IdxRowId       2  13   0               0  r[13]=cursor 2.rowid
-  23      Eq             4  13  25               0  if r[4]==r[13] goto 25
-  24      Halt        2067   0   0  parent.k     0
-  25      Column         1   1  14               0  r[14]=parent.k
-  26      Column         1   1  15               0  r[15]=parent.k
-  27      RowId          1  16   0               0  r[16]=parent.rowid
-  28      IdxDelete      2  15   2               1
-  29      IdxInsert      2  12  10               2  key=r[12]
-  30      MakeRecord     5   3  17               0  r[17]=mkrec(r[5..7])
-  31      Insert         1  17   4  parent       8  intkey=r[4] data=r[17]
-  32      Copy           6  18   0               0  r[18]=r[6]
-  33      Eq            14  18  36               0  if r[14]==r[18] goto 36
-  34      Goto           0  35   0               0
-  35      Program       14  36   2  fk action    0  subprogram=fk action
-  36      SeekRowid      1   4  37               0  if (r[4]!=cursor 1.rowid) goto 37
-  37    Goto             0  10   0               0
-  38    Halt             0   0   0               0
-  39    Transaction      0   2   2               0  iDb=0 tx_mode=Write
+   3    SeekRowid        0   2   6               0  if (r[2]!=cursor 0.rowid) goto 6
+   4    RowId            0   3   0               0  r[3]=parent.rowid
+   5    RowSetAdd        1   3   0               0
+   6    Close            0   0   0               0
+   7    OpenWrite        1   2   0               0  root=2; iDb=0
+   8    OpenWrite        2   3   0               0  root=3; iDb=0
+   9      RowSetRead     1  37   4               0
+  10      NotExists      1   9   4               0
+  11      Null           0   5   0               0  r[5]=NULL
+  12      Column         1   1   8               0  r[8]=parent.k
+  13      Add            8   9   6               0  r[6]=r[8]+r[9]
+  14      Column         1   2   7               0  r[7]=parent.v
+  15      Affinity       5   3   0               0  r[5..8] = D, D, D
+  16      Copy           6  10   0               0  r[10]=r[6]
+  17      Copy           4  11   0               0  r[11]=r[4]
+  18      Affinity      10   1   0               0  r[10..11] = D
+  19      MakeRecord    10   2  12               0  r[12]=mkrec(r[10..11]); for sqlite_autoindex_parent_1
+  20      NoConflict     2  24  10  1            0  key=r[10..10]
+  21      IdxRowId       2  13   0               0  r[13]=cursor 2.rowid
+  22      Eq             4  13  24               0  if r[4]==r[13] goto 24
+  23      Halt        2067   0   0  parent.k     0
+  24      Column         1   1  14               0  r[14]=parent.k
+  25      Column         1   1  15               0  r[15]=parent.k
+  26      RowId          1  16   0               0  r[16]=parent.rowid
+  27      IdxDelete      2  15   2               1
+  28      IdxInsert      2  12  10               2  key=r[12]
+  29      MakeRecord     5   3  17               0  r[17]=mkrec(r[5..7])
+  30      Insert         1  17   4  parent       8  intkey=r[4] data=r[17]
+  31      Copy           6  18   0               0  r[18]=r[6]
+  32      Eq            14  18  35               0  if r[14]==r[18] goto 35
+  33      Goto           0  34   0               0
+  34      Program       14  35   2  fk action    0  subprogram=fk action
+  35      SeekRowid      1   4  36               0  if (r[4]!=cursor 1.rowid) goto 36
+  36    Goto             0   9   0               0
+  37    Halt             0   0   0               0
+  38    Transaction      0   2   2               0  iDb=0 tx_mode=Write
+  39    Integer          1   2   0               0  r[2]=1
   40    Integer          1   9   0               0  r[9]=1
   41    Goto             0   1   0               0
    0    Init             0   1   0               0  Start at 1
