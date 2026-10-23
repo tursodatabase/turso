@@ -3228,6 +3228,58 @@ fn test_bootstrap_recovers_committed_wal_without_log_file() {
     assert_eq!(rows[0][1].to_string(), "x");
 }
 
+/// A TRUNCATE checkpoint truncates the logical log (step 8) before it truncates the WAL
+/// (step 10). A process killed between the two leaves a committed WAL and a 0-byte log.
+/// Every frame the log held is at or below the boundary committed to the WAL, so recovery
+/// must complete the checkpoint, not fail closed with "logical log header is missing"
+/// (#7480). Passive checkpoints stay OFF here: this is the default-mode crash window.
+#[test]
+fn test_bootstrap_recovers_truncate_checkpoint_killed_before_wal_truncate() {
+    let db = MvccTestDbNoConn::new_with_random_db();
+    let db_path = db.path.as_ref().unwrap().clone();
+    {
+        let conn = db.connect();
+        conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)")
+            .unwrap();
+        for i in 0..50 {
+            conn.execute(format!("INSERT INTO t VALUES ({i}, 'v{i}')"))
+                .unwrap();
+        }
+        let mvcc_store = db.get_mvcc_store();
+        // Stop right after the pager commit: the WAL holds the committed frames.
+        advance_checkpoint_until_wal_has_commit_frame(mvcc_store.clone(), &conn);
+        // The crash window: logical log already truncated to 0, WAL not yet truncated.
+        let log_file = mvcc_store.get_logical_log_file();
+        let c = log_file.truncate(0, Completion::new_trunc(|_| {})).unwrap();
+        conn.db.io.wait_for_completion(c).unwrap();
+    }
+    let wal_path = wal_path_for_db(&db_path);
+    assert!(wal_path.metadata().map(|m| m.len()).unwrap_or(0) > 0);
+
+    {
+        let mut manager = DATABASE_MANAGER.lock();
+        manager.clear();
+    }
+    let io = Arc::new(PlatformIO::new().unwrap());
+    let db2 = Database::open_file(io, &db_path, Arc::new(SqliteDialect))
+        .expect("a TRUNCATE checkpoint killed before its WAL truncate must stay openable");
+    let conn2 = db2
+        .connect()
+        .expect("connect should complete the checkpoint");
+    let rows = get_rows(&conn2, "SELECT count(*), min(id), max(id) FROM t");
+    assert_eq!(rows[0][0].as_int().unwrap(), 50);
+    assert_eq!(rows[0][1].as_int().unwrap(), 0);
+    assert_eq!(rows[0][2].as_int().unwrap(), 49);
+    assert_eq!(wal_path.metadata().map(|m| m.len()).unwrap_or(0), 0);
+    let ic = get_rows(&conn2, "PRAGMA integrity_check");
+    assert_eq!(ic[0][0].to_string(), "ok");
+    conn2
+        .execute("INSERT INTO t VALUES (100, 'after')")
+        .unwrap();
+    let rows = get_rows(&conn2, "SELECT count(*) FROM t");
+    assert_eq!(rows[0][0].as_int().unwrap(), 51);
+}
+
 /// MVCC supports only Passive and Truncate, so a requested FULL checkpoint maps to
 /// Truncate (resets the WAL). The reopen then recovers cleanly. Regression for whopper
 /// `--enable-mvcc` (no passive flag) hitting "WAL has committed frames but logical log
