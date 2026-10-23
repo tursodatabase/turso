@@ -2681,6 +2681,30 @@ mod tests {
         assert_eq!(copied, 65);
     }
 
+    #[test]
+    fn select_star_does_not_copy_declared_types() {
+        let mut schema = Schema::new();
+        let columns: Vec<String> = (0..64).map(|column| format!("c{column} INTEGER")).collect();
+        let table = BTreeTable::from_sql(
+            &format!(
+                "CREATE TABLE wide(id INTEGER PRIMARY KEY, {})",
+                columns.join(", ")
+            ),
+            2,
+        )
+        .expect("table schema parses");
+        schema
+            .add_btree_table(Arc::new(table))
+            .expect("table name is unique");
+        crate::translate::semantic::hir::tests::DECLARED_TYPES_COPIED.with(|copied| copied.set(0));
+        analyze_sql_with_schema(&schema, "SELECT * FROM wide WHERE id = 1")
+            .expect("SELECT analyzes");
+        let copied = crate::translate::semantic::hir::tests::DECLARED_TYPES_COPIED
+            .with(|copied| copied.get());
+
+        assert_eq!(copied, 0);
+    }
+
     fn schema_with_custom_columns() -> Schema {
         let mut schema = Schema::new();
         for sql in [

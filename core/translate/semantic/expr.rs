@@ -3347,7 +3347,7 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
                 let union_type = result_type
                     .declared
                     .as_ref()
-                    .and_then(hir::DeclaredType::custom)
+                    .and_then(|declared| declared.custom())
                     .cloned()
                     .ok_or_else(|| {
                         LimboError::InternalError(format!(
@@ -3996,7 +3996,7 @@ fn read_other_side_as_array(
     lhs: ResolvedScopeExpr,
     rhs: ResolvedScopeExpr,
 ) -> (ResolvedScopeExpr, ResolvedScopeExpr) {
-    fn declared_array(operand: &ResolvedScopeExpr) -> Option<hir::DeclaredType> {
+    fn declared_array(operand: &ResolvedScopeExpr) -> Option<Arc<hir::DeclaredType>> {
         operand
             .type_fact
             .declared
