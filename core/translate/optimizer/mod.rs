@@ -429,6 +429,7 @@ pub(crate) fn plan_hir_or_union(
     base_row_count: RowCountEstimate,
     schema: &Schema,
     params: &cost_params::CostModelParams,
+    query_rows: &dyn Fn(hir::QueryId) -> Option<f64>,
 ) -> Result<Option<HirOrUnion>> {
     Ok(hir_or_union_with_cost(
         document,
@@ -440,6 +441,7 @@ pub(crate) fn plan_hir_or_union(
         base_row_count,
         schema,
         params,
+        query_rows,
     )?
     .map(|(union, _, _)| union))
 }
@@ -458,6 +460,7 @@ pub(crate) fn hir_or_union_with_cost(
     base_row_count: RowCountEstimate,
     schema: &Schema,
     params: &cost_params::CostModelParams,
+    query_rows: &dyn Fn(hir::QueryId) -> Option<f64>,
 ) -> Result<Option<(HirOrUnion, Cost, f64)>> {
     // An outer join's right side has rows the seeks would not produce.
     if source.join_info.as_ref().is_some_and(|join| {
@@ -543,7 +546,7 @@ pub(crate) fn hir_or_union_with_cost(
                 constraints::HirConstraintSource::BTree(source),
                 schema,
                 params,
-                &|_| None,
+                query_rows,
             )?;
             let mut access = access_method::choose_single_btree_access_method(
                 &access_method::HirAccessSource::new(source, definition),
