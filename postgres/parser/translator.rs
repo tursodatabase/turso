@@ -4162,7 +4162,11 @@ impl PostgreSQLTranslator {
             None
         };
 
-        Ok(Some(GroupBy { exprs, having }))
+        Ok(Some(GroupBy {
+            exprs,
+            having,
+            allow_having_without_aggregate: true,
+        }))
     }
 
     fn translate_sublink(

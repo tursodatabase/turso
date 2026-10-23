@@ -2789,7 +2789,11 @@ impl<'a> Parser<'a> {
         };
 
         if !exprs.is_empty() || having.is_some() {
-            Ok(Some(GroupBy { exprs, having }))
+            Ok(Some(GroupBy {
+                exprs,
+                having,
+                allow_having_without_aggregate: false,
+            }))
         } else {
             Ok(None)
         }
@@ -10513,6 +10517,7 @@ mod tests {
                                     )),
                                 ],
                                 having: None,
+                                allow_having_without_aggregate: false,
                             }),
                             window_clause: vec![],
                         },
@@ -10555,6 +10560,7 @@ mod tests {
                                     Operator::Equals,
                                     Box::new(Expr::Literal(Literal::Numeric("1".to_owned()))),
                                 ))),
+                                allow_having_without_aggregate: false,
                             }),
                             window_clause: vec![],
                         },
@@ -10597,6 +10603,7 @@ mod tests {
                                     Operator::Equals,
                                     Box::new(Expr::Literal(Literal::Numeric("1".to_owned()))),
                                 ))),
+                                allow_having_without_aggregate: false,
                             }),
                             window_clause: vec![],
                         },
@@ -10643,6 +10650,7 @@ mod tests {
                                     Operator::Equals,
                                     Box::new(Expr::Literal(Literal::Numeric("15".to_owned()))),
                                 ))),
+                                allow_having_without_aggregate: false,
                             }),
                             window_clause: vec![],
                         },

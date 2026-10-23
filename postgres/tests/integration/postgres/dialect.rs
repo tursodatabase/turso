@@ -2625,6 +2625,54 @@ fn test_postgres_natural_join(db: TempDatabase) {
     assert_eq!(results, vec!["10,100"]);
 }
 
+#[turso_macros::test(mvcc)]
+fn test_postgres_having_without_local_aggregate(db: TempDatabase) {
+    let conn = db.connect_postgres();
+    conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, x INTEGER, y INTEGER)")
+        .unwrap();
+    conn.execute("INSERT INTO t VALUES (1, 1, 100), (2, 2, 200)")
+        .unwrap();
+    conn.execute("CREATE TABLE empty_t (x INTEGER)").unwrap();
+
+    assert_eq!(
+        conn.prepare("SELECT 1 HAVING 1 = 1")
+            .unwrap()
+            .run_collect_rows()
+            .unwrap(),
+        vec![vec![Value::from_i64(1)]]
+    );
+    assert_eq!(
+        conn.prepare("SELECT 1 FROM t HAVING 1 = 1")
+            .unwrap()
+            .run_collect_rows()
+            .unwrap(),
+        vec![vec![Value::from_i64(1)]]
+    );
+    assert_eq!(
+        conn.prepare("SELECT 1 FROM empty_t HAVING 1 = 1")
+            .unwrap()
+            .run_collect_rows()
+            .unwrap(),
+        vec![vec![Value::from_i64(1)]]
+    );
+    assert_eq!(
+        conn.prepare("SELECT 1 FROM t HAVING 1 = 0")
+            .unwrap()
+            .run_collect_rows()
+            .unwrap(),
+        Vec::<Vec<Value>>::new()
+    );
+    assert_eq!(
+        conn.prepare(
+            "SELECT (SELECT max(t1.y) FROM t AS t2 HAVING max(t1.y) > 0 LIMIT 1) FROM t AS t1"
+        )
+        .unwrap()
+        .run_collect_rows()
+        .unwrap(),
+        vec![vec![Value::from_i64(200)]]
+    );
+}
+
 #[turso_macros::test]
 fn test_postgres_compound_order_by(db: TempDatabase) {
     let conn = db.connect_postgres();
