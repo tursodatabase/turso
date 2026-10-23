@@ -42,7 +42,7 @@ addr  opcode       p1  p2  p3  p4                  p5  comment
   27  Copy         10  13   0                       0  r[13]=r[10]
   28  MakeRecord   11   3  14                       0  r[14]=mkrec(r[11..13])
   29  NewRowid      0  15   0                       0  r[15]=rowid
-  30  Insert        0  14  15  sqlite_stat1         0  intkey=r[15] data=r[14]
+  30  Insert        0  14  15  sqlite_stat1        40  intkey=r[15] data=r[14]
   31  OpenRead      3   3   0  k(2,B)               0  =idx_items_name, root=3, iDb=0
   32  Integer       1  17   0                       0  r[17]=1
   33  Function      0  17  16  stat_init            0  r[16]=func(r[17])
@@ -62,7 +62,7 @@ addr  opcode       p1  p2  p3  p4                  p5  comment
   47  Copy         20  23   0                       0  r[23]=r[20]
   48  MakeRecord   21   3  24                       0  r[24]=mkrec(r[21..23])
   49  NewRowid      0  25   0                       0  r[25]=rowid
-  50  Insert        0  24  25  sqlite_stat1         0  intkey=r[25] data=r[24]
+  50  Insert        0  24  25  sqlite_stat1        40  intkey=r[25] data=r[24]
   51  Halt          0   0   0                       0
   52  Transaction   0   2   4                       0  iDb=0 tx_mode=Write
   53  String8       0   3   0  items                0  r[3]='items'

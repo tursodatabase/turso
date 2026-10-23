@@ -13,7 +13,7 @@ use crate::{
     vdbe::{
         affinity::Affinity,
         builder::{CursorType, ProgramBuilder},
-        insn::{to_u32, CmpInsFlags, Cookie, Insn, RegisterOrLiteral},
+        insn::{to_u32, CmpInsFlags, Cookie, InsertFlags, Insn, RegisterOrLiteral},
     },
     Result,
 };
@@ -435,7 +435,9 @@ pub fn translate_analyze(
                 cursor: stat_cursor,
                 key_reg: rowid_reg,
                 record_reg,
-                flag: Default::default(),
+                flag: InsertFlags::new()
+                    .skip_last_rowid()
+                    .skip_all_change_counts(),
                 table_name: "sqlite_stat1".to_string(),
             });
             program.preassign_label_to_next_insn(after_insert);
@@ -654,7 +656,9 @@ fn emit_index_stats(
         cursor: stat_cursor,
         key_reg: idx_rowid_reg,
         record_reg: idx_record_reg,
-        flag: Default::default(),
+        flag: InsertFlags::new()
+            .skip_last_rowid()
+            .skip_all_change_counts(),
         table_name: "sqlite_stat1".to_string(),
     });
 
