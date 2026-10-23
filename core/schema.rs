@@ -31,15 +31,23 @@ pub struct View {
     pub sql: String,
     pub select_stmt: ast::Select,
     pub columns: Vec<Column>,
+    pub explicit_columns: Vec<String>,
 }
 
 impl View {
-    fn new(name: String, sql: String, select_stmt: ast::Select, columns: Vec<Column>) -> Self {
+    fn new(
+        name: String,
+        sql: String,
+        select_stmt: ast::Select,
+        columns: Vec<Column>,
+        explicit_columns: Vec<String>,
+    ) -> Self {
         Self {
             name,
             sql,
             select_stmt,
             columns,
+            explicit_columns,
         }
     }
 }
@@ -2731,6 +2739,10 @@ impl Schema {
                                 sql.to_string(),
                                 select,
                                 view_column_schema.flat_columns()?,
+                                column_names
+                                    .iter()
+                                    .map(|column| column.col_name.as_str().to_string())
+                                    .try_collect()?,
                             );
                             self.add_view(view)?;
                         }
@@ -3113,6 +3125,7 @@ impl TryClone for View {
             sql: self.sql.clone(),
             select_stmt: self.select_stmt.clone(),
             columns: self.columns.try_clone()?,
+            explicit_columns: self.explicit_columns.try_clone()?,
         })
     }
 }
