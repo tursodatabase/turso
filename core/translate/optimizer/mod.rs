@@ -4862,7 +4862,6 @@ fn build_seek_def(
 #[cfg(test)]
 mod tests {
     use super::{where_term_rejects_null_row, Optimizable};
-    use crate::dialect::sqlite::attach::AttachedNamespaces;
     use crate::translate::emitter::{DoubleQuotedDml, Resolver};
     use crate::{schema::Schema, DatabaseCatalog, RwLock, SymbolTable};
     use rustc_hash::FxHashMap as HashMap;
@@ -4873,7 +4872,7 @@ mod tests {
         database_schemas: &'a RwLock<HashMap<usize, crate::sync::Arc<Schema>>>,
         temp_database: &'a RwLock<Option<crate::connection::TempDatabase>>,
         attached_databases: &'a RwLock<DatabaseCatalog>,
-        namespaces: &'a AttachedNamespaces,
+        namespaces: &'a crate::Namespaces,
         syms: &'a SymbolTable,
     ) -> Resolver<'a> {
         Resolver::new(
@@ -4886,7 +4885,7 @@ mod tests {
             true,
             DoubleQuotedDml::Enabled,
             crate::sync::Arc::new(crate::dialect::SqliteDialect),
-            &None,
+            None,
         )
     }
 
@@ -4914,7 +4913,7 @@ mod tests {
         let syms = SymbolTable::new();
         let database_schemas = RwLock::new(HashMap::default());
         let attached_databases = RwLock::new(DatabaseCatalog::new());
-        let namespaces = AttachedNamespaces::default();
+        let namespaces = crate::Namespaces::default();
         let temp_database = RwLock::new(None);
         let resolver = empty_resolver(
             &schema,
@@ -4952,7 +4951,7 @@ mod tests {
         let syms = SymbolTable::new();
         let database_schemas = RwLock::new(HashMap::default());
         let attached_databases = RwLock::new(DatabaseCatalog::new());
-        let namespaces = AttachedNamespaces::default();
+        let namespaces = crate::Namespaces::default();
         let temp_database = RwLock::new(None);
         let resolver = empty_resolver(
             &schema,

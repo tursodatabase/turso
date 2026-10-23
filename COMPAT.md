@@ -229,7 +229,7 @@ avoid this window.
 | PRAGMA checkpoint_fullfsync      | ❌ No         |                                              |
 | PRAGMA collation_list            | ❌ No         |                                              |
 | PRAGMA compile_options           | ❌ No         |                                              |
-| PRAGMA count_changes             | Not Needed | deprecated in SQLite                         |
+| PRAGMA count_changes             | ✅ Yes         |                                              |
 | PRAGMA data_store_directory      | Not Needed | deprecated in SQLite                         |
 | PRAGMA data_version              | ❌ No         |                                              |
 | PRAGMA database_list             | ✅ Yes        |                                              |
@@ -241,7 +241,7 @@ avoid this window.
 | PRAGMA foreign_key_list          | ✅ Yes        |                                              |
 | PRAGMA foreign_keys              | ✅ Yes         |                                              |
 | PRAGMA freelist_count            | ✅ Yes        |                                              |
-| PRAGMA full_column_names         | Not Needed | deprecated in SQLite                         |
+| PRAGMA full_column_names         | ✅ Yes      | deprecated in SQLite                         |
 | PRAGMA fullfsync                 | 🚧 Partial    | Apple platforms only; ignored elsewhere      |
 | PRAGMA function_list             | ✅ Yes        |                                              |
 | PRAGMA hard_heap_limit           | ❌ No         |                                              |
@@ -271,11 +271,11 @@ avoid this window.
 | PRAGMA reverse_unordered_selects | ❌ No         |                                              |
 | PRAGMA schema_version            | ✅ Yes        | For writes, emulate defensive mode (always noop)|
 | PRAGMA secure_delete             | ❌ No         |                                              |
-| PRAGMA short_column_names        | Not Needed | deprecated in SQLite                         |
+| PRAGMA short_column_names        | ✅ Yes      | deprecated in SQLite                         |
 | PRAGMA shrink_memory             | ❌ No         |                                              |
 | PRAGMA soft_heap_limit           | ❌ No         |                                              |
 | PRAGMA stats                     | ❌ No         | Used for testing in SQLite                   |
-| PRAGMA synchronous               | 🚧 Partial    | `OFF` and `FULL` supported                   |
+| PRAGMA synchronous               | 🚧 Partial    | `OFF`, `NORMAL`, `FULL` supported; no `EXTRA` |
 | PRAGMA table_info                | ✅ Yes        |                                              |
 | PRAGMA table_list                | ✅ Yes        |                                              |
 | PRAGMA table_xinfo               | ✅ Yes        |                                              |

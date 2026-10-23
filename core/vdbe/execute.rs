@@ -4794,13 +4794,15 @@ pub fn op_transaction_inner(
                             true,
                         ),
                         (TransactionState::Read, false) => (TransactionState::Read, false),
-                        (TransactionState::None, true) => (
+                        (TransactionState::None | TransactionState::Pending { .. }, true) => (
                             TransactionState::Write {
                                 schema_did_change: false,
                             },
                             true,
                         ),
-                        (TransactionState::None, false) => (TransactionState::Read, true),
+                        (TransactionState::None | TransactionState::Pending { .. }, false) => {
+                            (TransactionState::Read, true)
+                        }
                     }
                 };
 
@@ -4814,26 +4816,20 @@ pub fn op_transaction_inner(
 
                         let current_mv_tx = conn.get_mv_tx_for_db(*db);
                         if current_mv_tx.is_none() {
-                            // Reject CONCURRENT on an attached DB if the main
-                            // DB already started with BEGIN DEFERRED.
-                            let conn_has_executed_begin_deferred =
-                                !conn.auto_commit.load(Ordering::SeqCst)
-                                    && conn.get_mv_tx().is_none();
-                            if conn_has_executed_begin_deferred
-                                && *tx_mode == TransactionMode::Concurrent
-                            {
-                                mark_unlikely();
-                                return Err(LimboError::TxError(
-                                    "Cannot start CONCURRENT transaction after BEGIN DEFERRED"
-                                        .to_string(),
-                                )
-                                .into());
-                            }
                             // Use the same tx_mode as the main DB's active
                             // transaction when available, so BEGIN CONCURRENT
-                            // applies to all databases uniformly.
+                            // applies to all databases uniformly — including
+                            // when the main DB has not materialized its
+                            // transaction yet and only the BEGIN CONCURRENT
+                            // flag records the intent.
                             let effective_mode =
-                                conn.get_mv_tx().map(|(_, mode)| mode).unwrap_or(*tx_mode);
+                                conn.get_mv_tx().map(|(_, mode)| mode).unwrap_or_else(|| {
+                                    if conn.begin_concurrent_is_pending() {
+                                        TransactionMode::Concurrent
+                                    } else {
+                                        *tx_mode
+                                    }
+                                });
                             #[cfg(any(test, injected_yields))]
                             {
                                 if let Some(IOResult::IO(io)) =
@@ -4885,8 +4881,7 @@ pub fn op_transaction_inner(
                         }
                     } else {
                         // Main database MVCC path (unchanged logic)
-                        let started_read_tx =
-                            updated && matches!(current_state, TransactionState::None);
+                        let started_read_tx = updated && current_state.no_btree_tx_open();
                         if started_read_tx {
                             turso_assert!(
                                 !conn.is_nested_stmt(),
@@ -4903,23 +4898,6 @@ pub fn op_transaction_inner(
                             pager.mvcc_refresh_if_db_changed();
                         }
 
-                        let conn_has_executed_begin_deferred = !has_existing_mv_tx
-                            && !program.connection.auto_commit.load(Ordering::SeqCst);
-                        if conn_has_executed_begin_deferred
-                            && *tx_mode == TransactionMode::Concurrent
-                        {
-                            mark_unlikely();
-                            if started_read_tx {
-                                conn.set_tx_state(TransactionState::None);
-                                state.auto_txn_cleanup = TxnCleanup::None;
-                            }
-                            return Err(LimboError::TxError(
-                                "Cannot start CONCURRENT transaction after BEGIN DEFERRED"
-                                    .to_string(),
-                            )
-                            .into());
-                        }
-
                         if !has_existing_mv_tx {
                             // Gate the begin on the connection's prepared schema generation,
                             // captured here (atomically with the connection.schema == db.schema
@@ -4934,7 +4912,7 @@ pub fn op_transaction_inner(
                                     Ok(generation) => generation,
                                     Err(err) => {
                                         if started_read_tx {
-                                            conn.set_tx_state(TransactionState::None);
+                                            conn.set_tx_state(current_state);
                                             state.auto_txn_cleanup = TxnCleanup::None;
                                         }
                                         return Err(err.into());
@@ -4953,24 +4931,41 @@ pub fn op_transaction_inner(
                                     return Ok(state.suspend_on_io(io));
                                 }
                             }
+                            // An explicit transaction started with BEGIN
+                            // CONCURRENT materializes here, on its first
+                            // statement, in concurrent mode. A plain BEGIN
+                            // keeps the statement's mode and with it the
+                            // SQLite-style exclusive upgrade on first write.
+                            let fresh_mode = if conn.begin_concurrent_is_pending() {
+                                TransactionMode::Concurrent
+                            } else {
+                                *tx_mode
+                            };
                             match begin_fresh_mvcc_tx(
                                 mv_store,
                                 &pager,
-                                tx_mode,
+                                &fresh_mode,
                                 &conn,
                                 expected_schema_generation,
                             ) {
                                 Ok(tx_id) => {
                                     program
                                         .connection
-                                        .set_mv_tx_for_db(*db, Some((tx_id, *tx_mode)));
+                                        .set_mv_tx_for_db(*db, Some((tx_id, fresh_mode)));
                                     if started_read_tx && conn.get_auto_commit() {
                                         state.auto_txn_cleanup = TxnCleanup::RollbackTxn;
+                                    }
+                                    if matches!(current_state, TransactionState::Pending { .. }) {
+                                        let concurrent = matches!(
+                                            current_state,
+                                            TransactionState::Pending { concurrent: true }
+                                        );
+                                        state.pending_fresh_tx = Some((*db, concurrent));
                                     }
                                 }
                                 Err(err) => {
                                     if started_read_tx {
-                                        conn.set_tx_state(TransactionState::None);
+                                        conn.set_tx_state(current_state);
                                         state.auto_txn_cleanup = TxnCleanup::None;
                                     }
                                     return Err(err.into());
@@ -4999,7 +4994,7 @@ pub fn op_transaction_inner(
                                 ) {
                                     if started_read_tx {
                                         pager.end_read_tx();
-                                        conn.set_tx_state(TransactionState::None);
+                                        conn.set_tx_state(current_state);
                                         state.auto_txn_cleanup = TxnCleanup::None;
                                     }
                                     return Err(err.into());
@@ -5053,7 +5048,7 @@ pub fn op_transaction_inner(
                             }
                             continue;
                         }
-                    } else if updated && matches!(current_state, TransactionState::None) {
+                    } else if updated && current_state.no_btree_tx_open() {
                         turso_assert!(
                             !conn.is_nested_stmt(),
                             "nested stmt should not begin a new read transaction"
@@ -5089,6 +5084,11 @@ pub fn op_transaction_inner(
                                 } => {
                                     pager.end_read_tx();
                                     conn.set_tx_state(TransactionState::None);
+                                    state.auto_txn_cleanup = TxnCleanup::None;
+                                }
+                                TransactionState::Pending { concurrent } => {
+                                    pager.end_read_tx();
+                                    conn.set_tx_state(TransactionState::Pending { concurrent });
                                     state.auto_txn_cleanup = TxnCleanup::None;
                                 }
                                 TransactionState::Read
@@ -5314,7 +5314,8 @@ pub fn op_auto_commit(
     load_insn!(
         AutoCommit {
             auto_commit,
-            rollback
+            rollback,
+            concurrent
         },
         insn
     );
@@ -5444,6 +5445,31 @@ pub fn op_auto_commit(
                     !conn.tx_is_poisoned(),
                     "rollback-only marker leaked outside an explicit transaction"
                 );
+                if *concurrent && mv_store.is_none() {
+                    return Err(LimboError::TxError(
+                        "Concurrent transaction mode is only supported when MVCC is enabled"
+                            .to_string(),
+                    )
+                    .into());
+                }
+                // BEGIN IMMEDIATE/EXCLUSIVE: Insn::Transaction runs before us and
+                // already advanced the state to Write; leave it alone. For BEGIN
+                // DEFERRED and BEGIN CONCURRENT no Transaction instruction precedes
+                // AutoCommit, so state is None here unless a SELECT is still active
+                // (state = Read) from a prior autocommit query on the same connection.
+                //
+                // Only move to Pending in MVCC mode. In WAL-only mode a deferred
+                // BEGIN has no snapshot to defer; keeping the state at None
+                // preserves the pre-existing behavior and lets schema-reload
+                // checks that gate on None continue to work.
+                if conn.get_tx_state() == TransactionState::None && mv_store.is_some() {
+                    conn.set_tx_state(TransactionState::Pending {
+                        concurrent: *concurrent,
+                    });
+                }
+                // Write: set by Transaction opcode for BEGIN IMMEDIATE/EXCLUSIVE; leave as-is.
+                // Read: a SELECT in autocommit mode is still open; leave as-is — the
+                //       next write inside the explicit transaction will upgrade to Write.
                 conn.auto_commit.store(false, Ordering::SeqCst);
                 return Ok(InsnFunctionStepResult::Done);
             }
@@ -5585,15 +5611,19 @@ pub fn op_savepoint(
                         let tx_id = if let Some(tx_id) = conn.get_mv_tx_id() {
                             tx_id
                         } else {
-                            let tx_id = begin_fresh_mvcc_tx(
-                                mv_store,
-                                pager,
-                                &TransactionMode::Read,
-                                &conn,
-                                None,
-                            )?;
-                            conn.set_mv_tx(Some((tx_id, TransactionMode::Read)));
-                            if matches!(conn.get_tx_state(), TransactionState::None) {
+                            // Inside BEGIN CONCURRENT, SAVEPOINT is the first
+                            // statement to materialize the transaction, so it
+                            // must materialize it in concurrent mode — Read
+                            // would make the first write upgrade to exclusive.
+                            let fresh_mode = if conn.begin_concurrent_is_pending() {
+                                TransactionMode::Concurrent
+                            } else {
+                                TransactionMode::Read
+                            };
+                            let tx_id =
+                                begin_fresh_mvcc_tx(mv_store, pager, &fresh_mode, &conn, None)?;
+                            conn.set_mv_tx(Some((tx_id, fresh_mode)));
+                            if conn.get_tx_state().no_btree_tx_open() {
                                 conn.set_tx_state(TransactionState::Read);
                             }
                             tx_id
@@ -5616,7 +5646,7 @@ pub fn op_savepoint(
                         if !pager.holds_read_lock() {
                             pager.begin_read_tx()?;
                         }
-                        if matches!(conn.get_tx_state(), TransactionState::None) {
+                        if conn.get_tx_state().no_btree_tx_open() {
                             conn.set_tx_state(TransactionState::Read);
                         }
                         pager.open_subjournal()?;
@@ -5797,6 +5827,7 @@ fn release_commit_insn() -> Insn {
     Insn::AutoCommit {
         auto_commit: true,
         rollback: false,
+        concurrent: false,
     }
 }
 
@@ -6019,7 +6050,6 @@ pub fn op_program(
                             0,
                             crate::statement::StatementOrigin::Subprogram,
                             false,
-                            crate::connection::PrepareOptions::default(),
                         ))
                     };
 
@@ -10551,14 +10581,18 @@ pub fn op_function(
                 // to the schema). Resolve the sequence first so currval
                 // on a dropped sequence reports "does not exist" rather
                 // than silently returning the stale per-session value.
-                program.connection.find_sequence(&seq_name)?;
-                match program.connection.get_sequence_currval(&seq_name) {
+                let (database_id, sequence) = program.connection.find_sequence(&seq_name)?;
+                match program
+                    .connection
+                    .get_sequence_currval(database_id, &sequence.name)
+                {
                     Some(val) => {
                         state.registers[*dest].set_value(Value::from_i64(val));
                     }
                     None => {
                         return Err(crate::LimboError::ParseError(format!(
-                            "currval of sequence \"{seq_name}\" is not yet defined in this session",
+                            "currval of sequence \"{}\" is not yet defined in this session",
+                            sequence.name
                         ))
                         .into());
                     }
@@ -10608,7 +10642,7 @@ pub fn op_function(
                     )
                     .into());
                 }
-                let seq = program.connection.find_sequence(&seq_name)?;
+                let (_, seq) = program.connection.find_sequence(&seq_name)?;
                 if value < seq.min_value || value > seq.max_value {
                     return Err(crate::LimboError::ParseError(format!(
                         "setval: value {} is out of bounds for sequence \"{}\" ({}..{})",
@@ -11186,20 +11220,11 @@ pub fn op_function(
                         .into());
                     }
                 };
-                let (db_id, sequence_key) =
-                    if let Some((schema_name, sequence_name)) = sequence_name.split_once('.') {
-                        (
-                            program.connection.get_database_id_by_name(schema_name)?,
-                            crate::util::normalize_ident(sequence_name),
-                        )
-                    } else {
-                        (MAIN_DB_ID, crate::util::normalize_ident(sequence_name))
-                    };
-                program.connection.find_sequence(sequence_name)?;
+                let (db_id, sequence) = program.connection.find_sequence(sequence_name)?;
                 let watermark = program
                     .connection
                     .mv_store_for_db(db_id)
-                    .and_then(|mv_store| mv_store.sequence_watermark(&sequence_key));
+                    .and_then(|mv_store| mv_store.sequence_watermark(&sequence.name));
                 match watermark {
                     Some(watermark) => state.registers[*dest].set_int(watermark),
                     None => state.registers[*dest].set_value(Value::Null),
@@ -14113,6 +14138,45 @@ pub fn op_must_be_int(
     Ok(InsnFunctionStepResult::Step)
 }
 
+pub fn op_get_subtype(
+    _program: &Program,
+    state: &mut ProgramState,
+    insn: &Insn,
+    _pager: &Arc<Pager>,
+) -> InsnResult {
+    load_insn!(GetSubtype { src_reg, dest_reg }, insn);
+    let subtype = state.registers[*src_reg].get_value().exec_subtype();
+    state.registers[*dest_reg] = Register::Value(subtype);
+    state.pc += 1;
+    Ok(InsnFunctionStepResult::Step)
+}
+
+pub fn op_set_subtype(
+    _program: &Program,
+    state: &mut ProgramState,
+    insn: &Insn,
+    _pager: &Arc<Pager>,
+) -> InsnResult {
+    load_insn!(
+        SetSubtype {
+            subtype_reg,
+            dest_reg
+        },
+        insn
+    );
+    let subtype = state.registers[*subtype_reg]
+        .get_value()
+        .as_int()
+        .ok_or_else(|| LimboError::InternalError("stored subtype must be an integer".into()))?;
+    let subtype = crate::types::TextSubtype::try_from(subtype)
+        .map_err(|value| LimboError::InternalError(format!("unknown stored subtype: {value}")))?;
+    if let Register::Value(Value::Text(text)) = &mut state.registers[*dest_reg] {
+        text.subtype = subtype;
+    }
+    state.pc += 1;
+    Ok(InsnFunctionStepResult::Step)
+}
+
 pub fn op_soft_null(
     _program: &Program,
     state: &mut ProgramState,
@@ -15052,7 +15116,7 @@ pub fn op_drop_sequence(
     // "not yet defined in this session" — covered by the regression
     // test `currval-after-drop-then-recreate-uses-new-sequence-currval`
     // in `sequence_adversarial.sqltest`.
-    conn.clear_sequence_currval(seq_name);
+    conn.clear_sequence_currval(*db, seq_name);
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
 }
@@ -15187,21 +15251,13 @@ pub fn op_set_sequence_currval(
 ) -> InsnResult {
     load_insn!(
         SetSequenceCurrval {
-            seq_name_reg,
+            db,
+            seq_name,
             value_reg,
         },
         insn
     );
 
-    let seq_name = match state.registers[*seq_name_reg].get_value() {
-        Value::Text(t) => t.as_str().to_string(),
-        _ => {
-            return Err(crate::LimboError::ParseError(
-                "SetSequenceCurrval: seq_name_reg must be text".to_string(),
-            )
-            .into());
-        }
-    };
     let value = state.registers[*value_reg]
         .get_value()
         .as_int()
@@ -15211,7 +15267,9 @@ pub fn op_set_sequence_currval(
             )
         })?;
 
-    program.connection.set_sequence_currval(&seq_name, value);
+    program
+        .connection
+        .set_sequence_currval(*db, seq_name, value);
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
 }
@@ -15770,7 +15828,7 @@ pub fn op_parse_schema(
     // For attached databases, qualify the sqlite_schema table with the database name
     let schema_table = if *db != crate::MAIN_DB_ID {
         let db_name = conn
-            .get_database_name_by_index(*db)
+            .namespace_name(*db)
             .unwrap_or_else(|| "main".to_string());
         format!("{db_name}.sqlite_schema")
     } else {
@@ -16298,7 +16356,6 @@ pub fn op_populate_materialized_views(
                 0,
                 crate::statement::StatementOrigin::Subprogram,
                 false,
-                crate::connection::PrepareOptions::default(),
             )));
         }
 
@@ -16447,6 +16504,9 @@ pub fn op_set_cookie(
                         ),
                         TransactionState::None => unreachable!(
                             "invalid transaction state for SetCookie: TransactionState::None, should be write"
+                        ),
+                        TransactionState::Pending { .. } => unreachable!(
+                            "invalid transaction state for SetCookie: TransactionState::Pending, should be write"
                         ),
                         TransactionState::PendingUpgrade { .. } => unreachable!(
                             "invalid transaction state for SetCookie: TransactionState::PendingUpgrade, should be write"
@@ -17812,7 +17872,7 @@ pub fn op_drop_column(
 
     conn.with_schema(*db, |schema| -> crate::Result<()> {
         for (view_name, view) in schema.views.iter() {
-            let view_select_sql = format!("SELECT * FROM {view_name}");
+            let view_select_sql = select_from_view_sql(&conn, *db, view_name);
             let _ = conn.prepare(view_select_sql.as_str()).map_err(|e| {
                 LimboError::ParseError(format!(
                     "cannot drop column \"{}\": referenced in VIEW {view_name}: {}. {e}",
@@ -17825,6 +17885,19 @@ pub fn op_drop_column(
 
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
+}
+
+/// SQL that selects from the view `view_name` of database `db`, named with
+/// its database so the lookup does not go through the search path.
+fn select_from_view_sql(conn: &Connection, db: usize, view_name: &str) -> String {
+    let database_name = conn
+        .namespace_name(db)
+        .expect("the database of a view has a name");
+    format!(
+        "SELECT * FROM \"{}\".\"{}\"",
+        database_name.replace('"', "\"\""),
+        view_name.replace('"', "\"\"")
+    )
 }
 
 pub fn op_add_column(
@@ -17913,7 +17986,7 @@ pub fn op_alter_column(
     };
 
     let view_rewrites: Vec<(usize, String, RewrittenView)> = if *rename {
-        let target_db_name = conn.get_database_name_by_index(*db).ok_or_else(|| {
+        let target_db_name = conn.namespace_name(*db).ok_or_else(|| {
             LimboError::InternalError(format!("unknown database id {} during ALTER TABLE", *db))
         })?;
         let mut all_rewrites = conn.with_schema(
@@ -18165,7 +18238,7 @@ pub fn op_alter_column(
                     .get_column_at(*column_index)
                     .expect("column being ALTERed should be in schema");
                 for (view_name, view) in schema.views.iter() {
-                    let view_select_sql = format!("SELECT * FROM {view_name}");
+                    let view_select_sql = select_from_view_sql(&conn, *db, view_name);
                     let _ = conn.prepare(view_select_sql.as_str()).map_err(|e| {
                         LimboError::ParseError(format!(
                             "cannot rename column \"{}\": referenced in VIEW {view_name}: {}. {e}",
@@ -20125,12 +20198,31 @@ fn op_vacuum_into_inner(program: &Program, state: &mut ProgramState, insn: &Insn
                     .into());
                 }
 
-                // we always vacuum into a new file, so check if it exists
-                if std::path::Path::new(dest_path).exists() {
-                    return Err(LimboError::ParseError(format!(
-                        "output file already exists: {dest_path}"
-                    ))
+                let target = crate::util::OpenOptions::parse(dest_path)?;
+                if target.cipher.is_some() || target.hexkey.is_some() {
+                    return Err(LimboError::InvalidArgument(
+                        "VACUUM INTO does not support the cipher and hexkey URI parameters"
+                            .to_string(),
+                    )
                     .into());
+                }
+                let output_in_memory = target.path.is_empty()
+                    || target.path == crate::util::MEMORY_PATH
+                    || target.mode == crate::util::OpenMode::Memory;
+                if !output_in_memory {
+                    if target.mode != crate::util::OpenMode::ReadWriteCreate {
+                        return Err(LimboError::InvalidArgument(format!(
+                            "unable to open database: {dest_path}"
+                        ))
+                        .into());
+                    }
+                    if std::path::Path::new(&target.path).exists() {
+                        return Err(LimboError::ParseError(format!(
+                            "output file already exists: {}",
+                            target.path
+                        ))
+                        .into());
+                    }
                 }
 
                 // Pin source metadata before building the output database. The
@@ -20188,14 +20280,24 @@ fn op_vacuum_into_inner(program: &Program, state: &mut ProgramState, insn: &Insn
                 // can resolve custom types, generated columns, vtab modules, etc.
                 let output_opts = vacuum_target_opts_from_source(&source_db);
 
-                // Always use PlatformIO for the output file, even if source
-                // is in-memory. This ensures VACUUM INTO writes to disk.
-                let io: Arc<dyn crate::IO> = Arc::new(crate::io::PlatformIO::new()?);
+                let (io, dest_path): (Arc<dyn crate::IO>, String) = if output_in_memory {
+                    (
+                        Arc::new(crate::MemoryIO::new()),
+                        crate::util::MEMORY_PATH.to_string(),
+                    )
+                } else if crate::is_memory_like(&target.path) {
+                    (
+                        Arc::new(crate::io::PlatformIO::new()?),
+                        format!("./{}", target.path),
+                    )
+                } else {
+                    (Arc::new(crate::io::PlatformIO::new()?), target.path)
+                };
                 let page_codec = source_pager.page_codec_external();
                 let output_db = match &page_codec {
                     Some(codec) => crate::Database::open(
                         io,
-                        dest_path,
+                        &dest_path,
                         crate::OpenOptions::new(source_db.dialect())
                             .flags(OpenFlags::Create)
                             .db_opts(output_opts)
@@ -20203,7 +20305,7 @@ fn op_vacuum_into_inner(program: &Program, state: &mut ProgramState, insn: &Insn
                     )?,
                     None => crate::Database::open_file_with_flags(
                         io,
-                        dest_path,
+                        &dest_path,
                         OpenFlags::Create,
                         output_opts,
                         None,

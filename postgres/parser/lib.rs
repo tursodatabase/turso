@@ -71,6 +71,14 @@ pub fn qualify_create_table_name(sql: &str, location: usize, schema: &str) -> St
     sql
 }
 
+/// `sql` with the index name `name` before the `ON` keyword of a CREATE
+/// INDEX statement, which starts at byte offset `location`.
+pub fn name_create_index(sql: &str, location: usize, name: &str) -> String {
+    let mut sql = sql.to_string();
+    sql.insert_str(location, &format!("{} ", quote_identifier(name)));
+    sql
+}
+
 /// pg_query's scanner is the same lexer the PostgreSQL server uses, so its
 /// keyword classification matches server-side quote_identifier().
 fn keyword_requires_quoting(ident: &str) -> bool {

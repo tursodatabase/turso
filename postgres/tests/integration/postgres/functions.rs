@@ -359,7 +359,9 @@ fn test_pg_derived_result_column_names(db: TempDatabase) {
     // PostgreSQL names unaliased function-call and keyword columns after the
     // function, casts after the cast expression or else the target type,
     // coalesce/greatest/least/nullif after the keyword, CASE after its ELSE
-    // expression or else `case`, and other unaliased expressions `?column?`
+    // expression or else `case`, ARRAY[] after the keyword, COLLATE and
+    // subscripts after the expression they wrap, and other unaliased
+    // expressions `?column?`
     for (sql, expected) in [
         ("SELECT version()", "version"),
         ("SELECT pg_catalog.version()", "version"),
@@ -383,7 +385,7 @@ fn test_pg_derived_result_column_names(db: TempDatabase) {
         ("SELECT 1::int", "int4"),
         ("SELECT CAST(1 AS integer)", "int4"),
         ("SELECT int '5'", "int4"),
-        ("SELECT '2'::varchar(3)", "varchar"),
+        ("SELECT '2'::varchar", "varchar"),
         ("SELECT 1::int::text", "text"),
         ("SELECT (1 + 1)::int", "int4"),
         ("SELECT * FROM (SELECT 1::bigint) AS s", "int8"),
@@ -403,6 +405,12 @@ fn test_pg_derived_result_column_names(db: TempDatabase) {
             "SELECT CASE WHEN true THEN 1 ELSE CASE WHEN true THEN 1 ELSE abs(1) END END",
             "abs",
         ),
+        ("SELECT ARRAY[1]", "array"),
+        ("SELECT (ARRAY[1])[1]", "array"),
+        ("SELECT (ARRAY[1]::int[])[1]", "array"),
+        ("SELECT lower('a') COLLATE \"C\"", "lower"),
+        ("SELECT 'a'::text COLLATE \"C\"", "text"),
+        ("SELECT 'a' COLLATE \"C\"", "?column?"),
     ] {
         let stmt = conn.prepare(sql).unwrap();
         assert_eq!(stmt.get_column_name(0), expected, "{sql}");

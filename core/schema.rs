@@ -31,15 +31,23 @@ pub struct View {
     pub sql: String,
     pub select_stmt: ast::Select,
     pub columns: Vec<Column>,
+    pub explicit_columns: Vec<String>,
 }
 
 impl View {
-    fn new(name: String, sql: String, select_stmt: ast::Select, columns: Vec<Column>) -> Self {
+    fn new(
+        name: String,
+        sql: String,
+        select_stmt: ast::Select,
+        columns: Vec<Column>,
+        explicit_columns: Vec<String>,
+    ) -> Self {
         Self {
             name,
             sql,
             select_stmt,
             columns,
+            explicit_columns,
         }
     }
 }
@@ -2731,6 +2739,10 @@ impl Schema {
                                 sql.to_string(),
                                 select,
                                 view_column_schema.flat_columns()?,
+                                column_names
+                                    .iter()
+                                    .map(|column| column.col_name.as_str().to_string())
+                                    .try_collect()?,
                             );
                             self.add_view(view)?;
                         }
@@ -2841,7 +2853,11 @@ impl Schema {
     /// Compute all resolved FKs *declared by* `child_table`.
     /// Unlike `resolved_fks_referencing`, this requires every non-rowid parent key
     /// to be backed by a non-partial UNIQUE index on exactly those columns.
-    pub fn resolved_fks_for_child(&self, child_table: &str) -> crate::Result<Vec<ResolvedFkRef>> {
+    pub fn resolved_fks_for_child(
+        &self,
+        child_table: &str,
+        updated_cols: Option<&ColumnMask>,
+    ) -> crate::Result<Vec<ResolvedFkRef>> {
         let child_name = normalize_ident(child_table);
         let child = self
             .get_btree_table(&child_name)
@@ -2849,6 +2865,12 @@ impl Schema {
 
         let mut out = Vec::try_with_capacity_ext(child.foreign_keys.len())?;
         for fk in &child.foreign_keys {
+            if let Some(updated_cols) = updated_cols {
+                let is_self_ref = fk.parent_table.eq_ignore_ascii_case(&child.name);
+                if !is_self_ref && !fk.child_key_assigned(&child, updated_cols) {
+                    continue;
+                }
+            }
             let parent_name = normalize_ident(&fk.parent_table);
             let parent_tbl = self
                 .get_btree_table(&parent_name)
@@ -3103,6 +3125,7 @@ impl TryClone for View {
             sql: self.sql.clone(),
             select_stmt: self.select_stmt.clone(),
             columns: self.columns.try_clone()?,
+            explicit_columns: self.explicit_columns.try_clone()?,
         })
     }
 }
@@ -5056,6 +5079,8 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
                         let (expr, collation) = constraint_column_collation(column.expr.as_ref())?;
                         let col_name = match expr {
                             Expr::Id(id) => normalize_ident(id.as_str()),
+                            Expr::Literal(Literal::True) => "true".to_owned(),
+                            Expr::Literal(Literal::False) => "false".to_owned(),
                             Expr::Literal(Literal::String(value)) => {
                                 value.trim_matches('\'').to_owned()
                             }
@@ -5087,6 +5112,8 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
                         let (expr, collation) = constraint_column_collation(column.expr.as_ref())?;
                         let col_name = match expr {
                             Expr::Id(id) => id.as_str().to_string(),
+                            Expr::Literal(Literal::True) => "true".to_owned(),
+                            Expr::Literal(Literal::False) => "false".to_owned(),
                             Expr::Literal(Literal::String(value)) => {
                                 value.trim_matches('\'').to_owned()
                             }
@@ -5677,6 +5704,14 @@ fn fk_mismatch_err(child: &str, parent: &str) -> crate::LimboError {
 }
 
 impl ForeignKey {
+    pub fn child_key_assigned(&self, child: &BTreeTable, updated_cols: &ColumnMask) -> bool {
+        self.child_columns.iter().any(|cname| {
+            child
+                .get_column(cname)
+                .is_some_and(|(pos, _)| updated_cols.get(pos))
+        })
+    }
+
     fn validate(&self) -> Result<()> {
         if self
             .parent_columns

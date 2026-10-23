@@ -352,7 +352,7 @@ fn emit_compound_select(
                     } if !index.has_rowid => (*cursor_id, index.clone()),
                     _ => {
                         new_dedupe_index = true;
-                        create_dedupe_index(program, plan, right_most)?
+                        create_dedupe_index(program, left, plan, right_most)?
                     }
                 };
                 plan.query_destination = QueryDestination::EphemeralIndex {
@@ -412,7 +412,8 @@ fn emit_compound_select(
                 // this BEFORE we overwrite it with our own indexes for the intersection.
                 let intersect_destination = right_most.query_destination.clone();
 
-                let (left_cursor_id, left_index) = create_dedupe_index(program, plan, right_most)?;
+                let (left_cursor_id, left_index) =
+                    create_dedupe_index(program, left, plan, right_most)?;
                 plan.query_destination = QueryDestination::EphemeralIndex {
                     cursor_id: left_cursor_id,
                     index: left_index.clone(),
@@ -421,7 +422,7 @@ fn emit_compound_select(
                 };
 
                 let (right_cursor_id, right_index) =
-                    create_dedupe_index(program, plan, right_most)?;
+                    create_dedupe_index(program, left, plan, right_most)?;
                 right_most.query_destination = QueryDestination::EphemeralIndex {
                     cursor_id: right_cursor_id,
                     index: right_index,
@@ -472,7 +473,7 @@ fn emit_compound_select(
                     } if !index.has_rowid => (*cursor_id, index.clone()),
                     _ => {
                         new_index = true;
-                        create_dedupe_index(program, plan, right_most)?
+                        create_dedupe_index(program, left, plan, right_most)?
                     }
                 };
                 plan.query_destination = QueryDestination::EphemeralIndex {
@@ -556,6 +557,7 @@ fn emit_compound_select(
 // Creates an ephemeral index that will be used to deduplicate the results of any sub-selects
 fn create_dedupe_index(
     program: &mut ProgramBuilder,
+    preceding: &[(SelectPlan, CompoundOperator)],
     left_select: &SelectPlan,
     right_select: &SelectPlan,
 ) -> crate::Result<(usize, Arc<Index>)> {
@@ -573,21 +575,18 @@ fn create_dedupe_index(
         })
         .try_collect::<crate::alloc::Vec<_>>()?;
     for (i, column) in dedupe_columns.iter_mut().enumerate() {
-        let left_collation = get_collseq_from_expr(
-            &left_select.result_columns[i].expr,
-            &left_select.table_references,
-        )?;
-        let right_collation = get_collseq_from_expr(
-            &right_select.result_columns[i].expr,
-            &right_select.table_references,
-        )?;
-        // Left precedence
-        let collation = match (left_collation, right_collation) {
-            (None, None) => None,
-            (Some(coll), None) | (None, Some(coll)) => Some(coll),
-            (Some(coll), Some(_)) => Some(coll),
-        };
-        column.collation = collation;
+        for select in preceding
+            .iter()
+            .map(|(select, _)| select)
+            .chain([left_select, right_select])
+        {
+            if let Some(collation) =
+                get_collseq_from_expr(&select.result_columns[i].expr, &select.table_references)?
+            {
+                column.collation = Some(collation);
+                break;
+            }
+        }
     }
 
     let dedupe_index = Arc::new(Index {

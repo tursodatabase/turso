@@ -558,9 +558,7 @@ fn execute_trigger_commands(
     let db_name = if database_id == crate::MAIN_DB_ID || database_id == crate::TEMP_DB_ID {
         None
     } else {
-        resolver
-            .get_database_name_by_index(database_id)
-            .map(ast::Name::exact)
+        resolver.namespace_name(database_id).map(ast::Name::exact)
     };
     // Parameter indices are allocated on demand during the AST rewrite.
     // Only columns actually referenced in the trigger body get a parameter,
@@ -1100,7 +1098,10 @@ fn rewrite_expressions_in_select_for_when_clause(
 
 /// Rewrite all expressions in a SELECT tree, including CTEs, compounds, ORDER BY,
 /// LIMIT/OFFSET, FROM/JOIN subqueries, and window clauses.
-fn rewrite_select_expressions<F>(select: &mut ast::Select, rewrite_expr: &mut F) -> Result<()>
+pub(crate) fn rewrite_select_expressions<F>(
+    select: &mut ast::Select,
+    rewrite_expr: &mut F,
+) -> Result<()>
 where
     F: FnMut(&mut ast::Expr) -> Result<()>,
 {

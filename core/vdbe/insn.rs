@@ -1089,9 +1089,14 @@ pub enum Insn {
     },
 
     /// Set database auto-commit mode and potentially rollback.
+    /// On BEGIN (`auto_commit: false`), `concurrent` records that the
+    /// transaction was started with BEGIN CONCURRENT: like BEGIN DEFERRED
+    /// it opens nothing by itself, and the first statement materializes
+    /// the MVCC transaction in concurrent mode.
     AutoCommit {
         auto_commit: bool,
         rollback: bool,
+        concurrent: bool,
     },
 
     /// Execute a named savepoint operation.
@@ -1507,6 +1512,21 @@ pub enum Insn {
         target_pc: Option<BranchOffset>,
     },
 
+    /// Write the subtype of src_reg to dest_reg as an integer.
+    /// Values without a subtype produce zero; JSON text produces 74.
+    GetSubtype {
+        src_reg: usize,
+        dest_reg: usize,
+    },
+
+    /// Read a supported integer subtype from subtype_reg and apply it to the
+    /// text value in dest_reg without changing its contents. Non-text values
+    /// are unchanged. Zero clears the subtype; 74 marks JSON when enabled.
+    SetSubtype {
+        subtype_reg: usize,
+        dest_reg: usize,
+    },
+
     SoftNull {
         reg: usize,
     },
@@ -1740,12 +1760,12 @@ pub enum Insn {
         was_empty_reg: usize,
         out_value_reg: usize,
     },
-    /// Record this connection's currval for a sequence after a successful
-    /// nextval/setval. Pure synchronous register operation. currval is
-    /// per-connection global (not schema-qualified), so no database id
-    /// is carried — schema-qualified currvals would be a separate feature.
+    /// Record this connection's currval for the sequence `seq_name` of
+    /// database `db` after a successful nextval/setval. Pure synchronous
+    /// register operation.
     SetSequenceCurrval {
-        seq_name_reg: usize,
+        db: usize,
+        seq_name: String,
         value_reg: usize,
     },
     /// Publish sequence allocation metadata for sync watermarks after a
@@ -2396,6 +2416,8 @@ impl InsnVariants {
             InsnVariants::Delete => execute::op_delete,
             InsnVariants::NewRowid => execute::op_new_rowid,
             InsnVariants::MustBeInt => execute::op_must_be_int,
+            InsnVariants::GetSubtype => execute::op_get_subtype,
+            InsnVariants::SetSubtype => execute::op_set_subtype,
             InsnVariants::SoftNull => execute::op_soft_null,
             InsnVariants::NoConflict => execute::op_no_conflict,
             InsnVariants::NotExists => execute::op_not_exists,

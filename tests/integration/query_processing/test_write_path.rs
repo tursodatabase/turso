@@ -594,6 +594,34 @@ fn test_rollback_on_foreign_key_constraint_violation(tmp_db: TempDatabase) -> an
     Ok(())
 }
 
+#[turso_macros::test]
+fn test_delete_collects_rowids_first_only_when_foreign_keys_are_on(
+    tmp_db: TempDatabase,
+) -> anyhow::Result<()> {
+    let conn = tmp_db.connect_limbo();
+    conn.execute("CREATE TABLE parent(id INTEGER PRIMARY KEY)")?;
+    conn.execute(
+        "CREATE TABLE child(id INTEGER PRIMARY KEY, pid INTEGER REFERENCES parent(id) ON DELETE CASCADE)",
+    )?;
+    conn.execute("CREATE TABLE plain_parent(id INTEGER PRIMARY KEY)")?;
+    conn.execute(
+        "CREATE TABLE plain_child(id INTEGER PRIMARY KEY, \
+         a INTEGER REFERENCES plain_parent(id) ON DELETE NO ACTION, \
+         b INTEGER REFERENCES plain_parent(id) ON DELETE RESTRICT)",
+    )?;
+    let delete_uses_rowset = |conn: &Arc<Connection>, table: &str| {
+        limbo_exec_rows(conn, &format!("EXPLAIN DELETE FROM {table} WHERE id > 5"))
+            .iter()
+            .any(|row| row[1] == RValue::Text("RowSetAdd".to_string()))
+    };
+
+    assert!(!delete_uses_rowset(&conn, "parent"));
+    conn.execute("PRAGMA foreign_keys = ON")?;
+    assert!(delete_uses_rowset(&conn, "parent"));
+    assert!(!delete_uses_rowset(&conn, "plain_parent"));
+    Ok(())
+}
+
 #[turso_macros::test(init_sql = "CREATE TABLE t (x)")]
 fn test_multiple_statements(tmp_db: TempDatabase) -> anyhow::Result<()> {
     let _ = env_logger::try_init();

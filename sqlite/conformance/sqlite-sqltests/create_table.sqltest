@@ -21,6 +21,18 @@ test create_table_unique_contained_in_primary_keys {
 expect {
 }
 
+@cross-check-integrity
+test create_table_boolean_named_columns_in_table_constraints {
+    CREATE TABLE t (true INTEGER, false INTEGER, b INTEGER, PRIMARY KEY (true, b), UNIQUE (false, b));
+    INSERT INTO t VALUES (1, 2, 3);
+    INSERT OR IGNORE INTO t VALUES (1, 4, 3);
+    INSERT OR IGNORE INTO t VALUES (5, 2, 3);
+    SELECT count(*) FROM t;
+}
+expect {
+    1
+}
+
 # https://github.com/tursodatabase/turso/issues/3187
 @skip-if mvcc "AUTOINCREMENT is not supported in MVCC mode"
 @cross-check-integrity

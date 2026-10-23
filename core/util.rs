@@ -1190,7 +1190,10 @@ impl<'a> OpenOptions<'a> {
 
         // handle authority + path separately
         if let Some(after_slashes) = without_query.strip_prefix("//") {
-            let (authority, path) = after_slashes.split_once('/').unwrap_or((after_slashes, ""));
+            let (authority, path) = match after_slashes.split_once('/') {
+                Some((authority, path)) => (authority, Some(path)),
+                None => (after_slashes, None),
+            };
 
             // sqlite allows only `localhost` or empty authority.
             if !(authority.is_empty() || authority == "localhost") {
@@ -1204,13 +1207,13 @@ impl<'a> OpenOptions<'a> {
                 Some(authority)
             };
 
-            if is_windows_path(path) {
-                opts.path = normalize_windows_path(&decode_percent(path));
-            } else if !path.is_empty() {
-                opts.path = format!("/{}", decode_percent(path));
-            } else {
-                opts.path = String::new();
-            }
+            opts.path = match path {
+                Some(path) if is_windows_path(path) => {
+                    normalize_windows_path(&decode_percent(path))
+                }
+                Some(path) => format!("/{}", decode_percent(path)),
+                None => String::new(),
+            };
         } else {
             // no authority, must be a normal absolute or relative path.
             opts.path = decode_percent(without_query);
@@ -4976,6 +4979,14 @@ pub mod tests {
         let opts = OpenOptions::parse(uri).unwrap();
         assert_eq!(opts.path, "");
         assert_eq!(opts.authority, Some("localhost"));
+    }
+
+    #[test]
+    fn test_uri_with_authority_and_only_a_slash_names_the_root_directory() {
+        for uri in ["file:///", "file://localhost/"] {
+            let opts = OpenOptions::parse(uri).unwrap();
+            assert_eq!(opts.path, "/", "{uri}");
+        }
     }
 
     #[test]

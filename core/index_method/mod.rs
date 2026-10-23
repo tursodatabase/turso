@@ -331,7 +331,7 @@ impl IndexMethodContext {
             database: IndexMethodDatabaseIdentity {
                 id: database_id,
                 name: connection
-                    .get_database_name_by_index(database_id)
+                    .namespace_name(database_id)
                     .unwrap_or_else(|| format!("database-{database_id}")),
                 incarnation: database_incarnation,
             },

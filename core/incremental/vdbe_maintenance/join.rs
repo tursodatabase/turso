@@ -538,7 +538,7 @@ pub(super) fn emit_inner_join(
         connection.experimental_custom_types_enabled(),
         connection.get_dqs_dml().into(),
         Arc::new(crate::dialect::SqliteDialect),
-        &None,
+        None,
     );
 
     let emit_eph_insert = |program: &mut ProgramBuilder| {
@@ -786,7 +786,7 @@ pub(super) fn emit_semi_or_anti_join(
         connection.experimental_custom_types_enabled(),
         connection.get_dqs_dml().into(),
         Arc::new(crate::dialect::SqliteDialect),
-        &None,
+        None,
     );
 
     let state_cursor = program.alloc_cursor_id(CursorType::BTreeTable(state_table.clone()));

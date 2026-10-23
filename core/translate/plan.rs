@@ -923,10 +923,6 @@ pub enum DmlSafetyReason {
     /// The index method cursor does not materialize results up front,
     /// so writes could invalidate the live iterator.
     IndexMethodNotMaterialized,
-    /// The UPDATE changes a column referenced by an FK with a cascading
-    /// action (CASCADE / SET NULL / SET DEFAULT). The cascade can fire
-    /// triggers on referencing tables that write back to the target,
-    /// which would invalidate the live scan iterator.
     FkCascade,
 }
 
@@ -1151,7 +1147,7 @@ pub(super) fn expand_star(
             {
                 if matches!(&table.table, Table::BTree(_) | Table::Virtual(_)) {
                     let database_name = resolver
-                        .get_database_name_by_index(table.database_id)
+                        .namespace_name(table.database_id)
                         .expect("the table database must exist while compiling a query");
                     crate::bail_parse_error!(
                         "ambiguous column name: {}.{}.{}",
@@ -3901,6 +3897,23 @@ impl Aggregate {
             filter_expr,
             fraction_reg: None,
         }
+    }
+
+    pub fn order_by(&self) -> &[ast::SortedColumn] {
+        if matches!(self.func, AggFunc::Min | AggFunc::Max) {
+            return &[];
+        }
+        match &self.original_expr {
+            ast::Expr::FunctionCall { order_by, .. } => order_by,
+            _ => &[],
+        }
+    }
+
+    pub fn input_exprs(&self) -> impl Iterator<Item = &ast::Expr> {
+        self.args
+            .iter()
+            .chain(self.filter_expr.iter())
+            .chain(self.order_by().iter().map(|term| term.expr.as_ref()))
     }
 
     pub fn is_distinct(&self) -> bool {

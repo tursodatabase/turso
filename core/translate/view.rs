@@ -1,6 +1,7 @@
 use crate::schema::{BTreeCharacteristics, BTreeTable, SchemaObjectType, RESERVED_TABLE_PREFIXES};
 use crate::storage::pager::CreateBTreeFlags;
 use crate::sync::Arc;
+use crate::translate::sequence::bind_sequence_names_in_select;
 use crate::translate::{
     emitter::Resolver,
     schema::{emit_schema_entry, SchemaEntryType, SQLITE_TABLEID},
@@ -402,8 +403,11 @@ pub fn translate_create_view(
 
     crate::util::validate_select_for_views(select_stmt, view_name.namespace.as_ref())?;
 
-    // Reconstruct the SQL string
-    let sql = create_view_to_str("VIEW", &view_name.name.as_ident(), columns, select_stmt);
+    let mut select_stmt = select_stmt.clone();
+    if resolver.dialect.binds_names_at_create() {
+        bind_sequence_names_in_select(&mut select_stmt, resolver)?;
+    }
+    let sql = create_view_to_str("VIEW", &view_name.name.as_ident(), columns, &select_stmt);
 
     // Open cursor to sqlite_schema table
     let table = resolver.schema().get_btree_table(SQLITE_TABLEID).unwrap();

@@ -1737,6 +1737,14 @@ pub fn insn_to_row(
                 0,
                 "".to_string(),
             ),
+            Insn::GetSubtype { src_reg, dest_reg } => (
+                "GetSubtype", *src_reg as i64, *dest_reg as i64, 0,
+                Value::build_text(""), 0, "".to_string(),
+            ),
+            Insn::SetSubtype { subtype_reg, dest_reg } => (
+                "SetSubtype", *subtype_reg as i64, *dest_reg as i64, 0,
+                Value::build_text(""), 0, "".to_string(),
+            ),
             Insn::SoftNull { reg } => (
                 "SoftNull",
                 *reg as i64,
@@ -1973,16 +1981,17 @@ pub fn insn_to_row(
                 ),
             ),
             Insn::SetSequenceCurrval {
-                seq_name_reg,
+                db,
+                seq_name,
                 value_reg,
             } => (
                 "SetSequenceCurrval",
-                0,
-                *seq_name_reg as i64,
+                *db as i64,
                 *value_reg as i64,
-                Value::Null,
                 0,
-                format!("currval(r[{seq_name_reg}]) = r[{value_reg}]"),
+                Value::build_text(seq_name.clone()),
+                0,
+                format!("currval({seq_name}) = r[{value_reg}]"),
             ),
             Insn::SequenceTrackAllocation {
                 db,
@@ -2284,14 +2293,19 @@ pub fn insn_to_row(
             Insn::AutoCommit {
                 auto_commit,
                 rollback,
+                concurrent,
             } => (
                 "AutoCommit",
                 *auto_commit as i64,
                 *rollback as i64,
-                0,
+                *concurrent as i64,
                 Value::build_text(""),
                 0,
-                format!("auto_commit={auto_commit}, rollback={rollback}"),
+                if *concurrent {
+                    format!("auto_commit={auto_commit}, rollback={rollback}, concurrent=true")
+                } else {
+                    format!("auto_commit={auto_commit}, rollback={rollback}")
+                },
             ),
             Insn::Savepoint { op, name } => (
                 "Savepoint",

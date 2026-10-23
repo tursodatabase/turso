@@ -2217,6 +2217,7 @@ fn emit_update_insns<'a>(
                     start,
                     effective_rowid_reg,
                     &affected_columns,
+                    !affected_parent_fks.is_empty(),
                     update_database_id,
                     &t_ctx.resolver,
                     &layout,

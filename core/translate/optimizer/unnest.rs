@@ -1001,7 +1001,7 @@ fn aggregate_can_run_for_unused_rows(plan: &SelectPlan) -> bool {
     let aggregate_expressions = plan
         .aggregates
         .iter()
-        .flat_map(|aggregate| aggregate.args.iter().chain(aggregate.filter_expr.iter()));
+        .flat_map(|aggregate| aggregate.input_exprs());
     let filter_expressions = plan.where_clause.iter().map(|term| &term.expr);
     !aggregate_expressions
         .chain(filter_expressions)

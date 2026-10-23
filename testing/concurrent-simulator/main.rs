@@ -520,6 +520,8 @@ fn build_workloads_and_properties(args: &Args) -> BuildArtifacts {
             Box::new(SequenceCorrectnessProperty::new()),
             Box::new(AutoincWatermarkMonotonicity::new()),
             Box::new(FtsResultComparisonProperty),
+            Box::new(SnapshotStabilityProperty::new()),
+            Box::new(RolledBackInsertsNotVisible::new()),
         ];
 
         (w, p, fts_sim_schema(), vec![])

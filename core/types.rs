@@ -64,9 +64,28 @@ impl Display for ValueType {
 #[derive(Debug, Clone, Copy, PartialEq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum TextSubtype {
-    Text,
+    Text = 0,
     #[cfg(feature = "json")]
-    Json,
+    Json = 74,
+}
+
+impl From<TextSubtype> for i64 {
+    fn from(subtype: TextSubtype) -> Self {
+        subtype as Self
+    }
+}
+
+impl TryFrom<i64> for TextSubtype {
+    type Error = i64;
+
+    fn try_from(value: i64) -> std::result::Result<Self, Self::Error> {
+        match value {
+            value if value == i64::from(Self::Text) => Ok(Self::Text),
+            #[cfg(feature = "json")]
+            value if value == i64::from(Self::Json) => Ok(Self::Json),
+            _ => Err(value),
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -1672,6 +1691,10 @@ mod immutable_record {
     impl RecordBuf {
         pub fn alloc() -> Self {
             Self(crate::alloc::vec![])
+        }
+
+        pub fn capacity(&self) -> usize {
+            self.0.capacity()
         }
     }
 

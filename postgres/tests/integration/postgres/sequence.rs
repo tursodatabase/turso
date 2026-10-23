@@ -779,11 +779,11 @@ fn test_pg_sequences_multiple(db: TempDatabase) {
 }
 
 // ============================================================
-// SQLite Compatibility — integrity_check
+// Integrity check
 // ============================================================
 
 #[turso_macros::test]
-fn test_sequence_passes_sqlite_integrity_check(db: TempDatabase) {
+fn test_sequence_passes_integrity_check(db: TempDatabase) {
     let conn = db.connect_postgres();
 
     // Create a sequence and advance it
@@ -794,15 +794,23 @@ fn test_sequence_passes_sqlite_integrity_check(db: TempDatabase) {
     pg_query_int(&conn, "SELECT nextval('integ_seq')");
     pg_query_int(&conn, "SELECT nextval('integ_seq')");
 
-    // Drop connection to flush everything
+    // Drop connection to flush everything, then reopen and verify integrity.
     let path = db.path.clone();
     drop(conn);
     drop(db);
 
-    // Open with rusqlite (real SQLite) and run integrity check
-    let sqlite_conn = rusqlite::Connection::open(&path).unwrap();
-    let result: String = sqlite_conn
-        .query_row("PRAGMA integrity_check", [], |r| r.get(0))
+    let db2 = TempDatabase::builder()
+        .with_db_name(path.to_str().unwrap())
+        .build();
+    let conn2 = db2.connect_limbo();
+    let rows = conn2
+        .prepare("PRAGMA integrity_check")
+        .unwrap()
+        .run_collect_rows()
         .unwrap();
-    assert_eq!(result, "ok", "SQLite integrity check failed: {result}");
+    let result = match rows.first().and_then(|r| r.first()) {
+        Some(Value::Text(t)) => t.as_str().to_string(),
+        other => panic!("unexpected integrity_check result: {other:?}"),
+    };
+    assert_eq!(result, "ok", "integrity check failed: {result}");
 }

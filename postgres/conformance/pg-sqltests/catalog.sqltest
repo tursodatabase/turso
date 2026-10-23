@@ -44,6 +44,59 @@ expect {
     orders|orders_item_idx
 }
 
+test pg-indexes-lists-names-chosen-for-unnamed-indexes {
+    CREATE TABLE t (a int, b int, c text);
+    CREATE INDEX ON t (a);
+    CREATE INDEX ON t (b);
+    CREATE INDEX ON t (a);
+    CREATE INDEX ON t (a) WHERE b > 0;
+    CREATE INDEX ON t (a, b);
+    CREATE UNIQUE INDEX ON t (a, b);
+    CREATE INDEX ON t (a, a);
+    CREATE INDEX ON t ((a + b));
+    CREATE INDEX ON t (lower(c));
+    CREATE INDEX ON t ((c::text));
+    CREATE TABLE u_b_idx (x int);
+    CREATE SEQUENCE u_b_idx1;
+    CREATE TABLE u (b int);
+    CREATE INDEX ON u (b);
+    CREATE TABLE v (c text, arr int[]);
+    CREATE INDEX ON v ((lower(c) COLLATE "C"));
+    CREATE INDEX ON v ((c::text COLLATE "C"));
+    CREATE INDEX ON v (((c || 'x') COLLATE "C"));
+    CREATE INDEX ON v ((arr[1]));
+    CREATE INDEX ON v ((ARRAY[c]));
+    CREATE TABLE w (abcdefghijabcdefghijabcdefghijabcdefghij int, klmnopqrstklmnopqrstklmnopqrstklmnopqrst int);
+    CREATE INDEX ON w (abcdefghijabcdefghijabcdefghijabcdefghij, klmnopqrstklmnopqrstklmnopqrstklmnopqrst);
+    CREATE INDEX ON w (abcdefghijabcdefghijabcdefghijabcdefghij, klmnopqrstklmnopqrstklmnopqrstklmnopqrst);
+    DROP INDEX w_abcdefghijabcdefghijabcdefghijabcdefghij_klmnopqrstklmnop_idx;
+    CREATE INDEX ON w (abcdefghijabcdefghijabcdefghijabcdefghij, klmnopqrstklmnopqrstklmnopqrstklmnopqrst);
+    SELECT tablename, indexname
+    FROM pg_indexes
+    WHERE schemaname = 'public'
+    ORDER BY tablename, indexname;
+}
+expect {
+    t|t_a_a1_idx
+    t|t_a_b_idx
+    t|t_a_b_idx1
+    t|t_a_idx
+    t|t_a_idx1
+    t|t_a_idx2
+    t|t_b_idx
+    t|t_c_idx
+    t|t_expr_idx
+    t|t_lower_idx
+    u|u_b_idx2
+    v|v_arr_idx
+    v|v_array_idx
+    v|v_c_idx
+    v|v_expr_idx
+    v|v_lower_idx
+    w|w_abcdefghijabcdefghijabcdefghijabcdefghij_klmnopqrstklmno_idx1
+    w|w_abcdefghijabcdefghijabcdefghijabcdefghij_klmnopqrstklmnop_idx
+}
+
 test catalog-pg-type-enum-and-domain {
     CREATE TYPE catalog_mood AS ENUM ('sad', 'happy');
     CREATE DOMAIN catalog_posint AS integer;

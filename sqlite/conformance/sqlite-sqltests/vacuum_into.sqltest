@@ -1,11 +1,38 @@
 @database :memory:
 
-@backend rust
-test vacuum-into-empty-path-rejected {
+test vacuum-into-memory-targets {
+    CREATE TABLE t(a);
+    INSERT INTO t VALUES (1);
+    VACUUM INTO ':memory:';
+    VACUUM INTO ':memory:';
     VACUUM INTO '';
+    VACUUM INTO '';
+    VACUUM INTO 'file::memory:';
+    VACUUM INTO 'file::memory:';
+    VACUUM INTO 'file::memory:?cache=shared';
+    VACUUM INTO 'file:';
+    VACUUM INTO 'file://';
+    VACUUM INTO 'file://localhost';
+    VACUUM INTO 'file:vacuum_into_memory_mode.db?mode=memory';
+    VACUUM INTO 'file:vacuum_into_memory_mode.db?mode=memory';
+    SELECT count(*) FROM t;
+}
+expect {
+    1
+}
+
+test vacuum-into-uri-root-directory-empty-authority {
+    CREATE TABLE t(a);
+    VACUUM INTO 'file:///';
 }
 expect error {
-    VACUUM INTO path cannot be empty
+}
+
+test vacuum-into-uri-root-directory-localhost {
+    CREATE TABLE t(a);
+    VACUUM INTO 'file://localhost/';
+}
+expect error {
 }
 
 @backend rust

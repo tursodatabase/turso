@@ -1,18 +1,19 @@
 use chumsky::{error::EmptyErr, prelude::*};
 use std::borrow::Cow;
+use std::collections::HashMap;
 use std::num::NonZero;
 use std::str;
 use std::sync::{Arc, Mutex};
 
 use crate::catalog::{self, PostgresDialect};
 use crate::functions::ConfigParameter;
-use turso_core::{Connection, LimboError, PrepareOptions, Result, Statement, Value};
+use turso_core::{Connection, LimboError, Result, Statement, Value};
 use turso_parser::ast::{self};
 use turso_pg_parser::translator::{
-    is_comment_on, is_refresh_matview, is_set_transaction, try_extract_copy_from,
+    check_set_transaction, is_comment_on, is_refresh_matview, try_extract_copy_from,
     try_extract_create_schema, try_extract_drop_schema, try_extract_set, try_extract_show,
-    unqualified_create_table_name_location, PgCopyFromStmt, PgCreateSchemaStmt, PgDropSchemaStmt,
-    PgSetStmt, PgShowStmt, PostgreSQLTranslator,
+    unnamed_index_name, unqualified_create_table_name_location, PgCopyFromStmt, PgCreateSchemaStmt,
+    PgDropSchemaStmt, PgSetStmt, PgSetValue, PgShowStmt, PostgreSQLTranslator,
 };
 
 use crate::copy::parse_copy_text_format;
@@ -26,9 +27,10 @@ struct PgConnectionInner {
     conn: Arc<Connection>,
 }
 
+/// The text that `search_path` was set to, for SHOW. The search path itself
+/// is on the connection.
 #[derive(Default)]
 struct SessionState {
-    search_path: Option<Vec<String>>,
     search_path_setting: Option<String>,
 }
 
@@ -68,7 +70,7 @@ pub fn open_database_with_io(
         turso_core::OpenOptions::new(Arc::new(PostgresDialect))
             .storage(db_file)
             .flags(flags)
-            .db_opts(opts),
+            .db_opts(opts.with_mvcc(true)),
     )
 }
 
@@ -76,6 +78,8 @@ impl PgConnection {
     pub fn connect(db: &Arc<turso_core::Database>) -> Result<Self> {
         let context = Arc::new(PgSessionState::default());
         let conn = db.connect_with_context(context)?;
+        conn.add_namespace("public", turso_core::MAIN_DB_ID);
+        set_search_path(&conn, None)?;
         Ok(Self {
             inner: Arc::new(PgConnectionInner { conn }),
         })
@@ -111,9 +115,8 @@ impl PgConnection {
     }
 
     pub fn pragma_update(&self, name: &str, value: impl std::fmt::Display) -> Result<()> {
-        let sql = format!("PRAGMA {name} = {value}");
-        let mut stmt = self.inner.conn.prepare_internal(sql)?;
-        stmt.run_ignore_rows()
+        self.inner.conn.pragma_update(name, value)?;
+        Ok(())
     }
 
     pub fn query_runner<'a>(&'a self, sql: &'a [u8]) -> PgQueryRunner<'a> {
@@ -178,64 +181,55 @@ fn prepare_statement(pg_conn: &Arc<PgConnectionInner>, sql: &str) -> Result<Stat
         return Ok(stmt);
     }
 
-    let search_path = pg_conn
-        .conn
-        .context::<PgSessionState>()
-        .expect("PostgreSQL connections have session state")
-        .lock()
-        .unwrap()
-        .search_path
-        .clone();
     let parse_result =
         turso_pg_parser::parse(sql).map_err(|e| LimboError::ParseError(e.to_string()))?;
-    let (sql, parse_result) =
-        match create_table_schema_from_search_path(pg_conn, &parse_result, &search_path)? {
-            Some((location, schema)) => {
-                let sql = turso_pg_parser::qualify_create_table_name(sql, location, &schema);
-                let parse_result = turso_pg_parser::parse(&sql)
-                    .map_err(|e| LimboError::ParseError(e.to_string()))?;
-                (Cow::Owned(sql), parse_result)
-            }
-            None => (Cow::Borrowed(sql), parse_result),
-        };
+    let rewritten_sql = if let Some((location, schema)) =
+        create_table_schema_from_search_path(pg_conn, &parse_result)?
+    {
+        Some(turso_pg_parser::qualify_create_table_name(
+            sql, location, &schema,
+        ))
+    } else {
+        unnamed_index_name(sql, &parse_result, |schema, table, name| {
+            relation_name_is_taken(&pg_conn.conn, schema, table, name)
+        })?
+        .map(|(location, name)| turso_pg_parser::name_create_index(sql, location, &name))
+    };
+    let (sql, parse_result) = match rewritten_sql {
+        Some(sql) => {
+            let parse_result =
+                turso_pg_parser::parse(&sql).map_err(|e| LimboError::ParseError(e.to_string()))?;
+            (Cow::Owned(sql), parse_result)
+        }
+        None => (Cow::Borrowed(sql), parse_result),
+    };
     let translator = PostgreSQLTranslator::new();
     let translated = translator
         .translate_with_prereqs(&parse_result)
         .map_err(|e| LimboError::ParseError(e.to_string()))?;
     reject_catalog_dml(translated.cmd.stmt())?;
 
-    let options = PrepareOptions {
-        unqualified_database_search_path: search_path,
-    };
     for prereq in translated.prereqs {
         let input = prereq.to_string();
-        let mut stmt = pg_conn
-            .conn
-            .prepare_translated_stmt_with_options(prereq, &input, &options)?;
+        let mut stmt = pg_conn.conn.prepare_translated_stmt(prereq, &input)?;
         stmt.run_ignore_rows()?;
     }
 
-    pg_conn
-        .conn
-        .prepare_translated_cmd_with_options(translated.cmd, &sql, &options)
+    pg_conn.conn.prepare_translated_cmd(translated.cmd, &sql)
 }
 
 /// The schema that a CREATE TABLE statement naming its table without a
 /// schema creates the table in, with the byte offset of the table name: the
 /// first schema of `search_path` that exists, like PostgreSQL. None when the
-/// statement is not such a CREATE TABLE, when `search_path` is not set, or
-/// when the table goes to public, which is where core puts it anyway.
+/// statement is not such a CREATE TABLE or when the table goes to public,
+/// which is where core puts it anyway.
 fn create_table_schema_from_search_path(
     pg_conn: &Arc<PgConnectionInner>,
     parse_result: &turso_pg_parser::ParseResult,
-    search_path: &Option<Vec<String>>,
 ) -> Result<Option<(usize, String)>> {
     let Some(location) = unqualified_create_table_name_location(parse_result) else {
         return Ok(None);
     };
-    if search_path.is_none() {
-        return Ok(None);
-    }
     let schema = current_schema(&pg_conn.conn).ok_or_else(|| {
         LimboError::ParseError("no schema has been selected to create in".to_string())
     })?;
@@ -245,21 +239,76 @@ fn create_table_schema_from_search_path(
     Ok(Some((location, schema)))
 }
 
+/// Whether the schema of table `table` already has a table, index, view or
+/// sequence named `name`, which makes PostgreSQL choose another name for a
+/// new index on the table. A table named with a schema is in that schema.
+/// Otherwise the table is looked up in the same order as core does: temp
+/// first, then the databases of the search path. Main when no database has
+/// the table.
+fn relation_name_is_taken(
+    conn: &Arc<Connection>,
+    schema: Option<&str>,
+    table: &str,
+    name: &str,
+) -> Result<bool> {
+    let database_names: HashMap<usize, String> = conn
+        .list_all_databases()
+        .into_iter()
+        .map(|(id, database, _)| (id, database))
+        .collect();
+    let databases: Vec<String> = match schema {
+        Some(schema) if schema.eq_ignore_ascii_case("public") => vec!["main".to_string()],
+        Some(schema) => database_names
+            .values()
+            .filter(|database| database.eq_ignore_ascii_case(schema))
+            .cloned()
+            .collect(),
+        None => database_names
+            .contains_key(&turso_core::TEMP_DB_ID)
+            .then_some(turso_core::TEMP_DB_ID)
+            .into_iter()
+            .chain(conn.search_order())
+            .chain(std::iter::once(turso_core::MAIN_DB_ID))
+            .map(|id| database_names[&id].clone())
+            .collect(),
+    };
+    let mut taken = false;
+    for database in databases {
+        let mut stmt = conn.prepare_sqlite(format!(
+            "SELECT \
+             EXISTS (SELECT 1 FROM \"{database}\".sqlite_schema \
+                     WHERE type = 'table' AND name COLLATE NOCASE = ?1), \
+             EXISTS (SELECT 1 FROM \"{database}\".sqlite_schema \
+                     WHERE type IN ('table', 'index', 'view') \
+                     AND name COLLATE NOCASE IN (?2, '{SEQUENCE_TABLE_PREFIX}' || ?2))"
+        ))?;
+        stmt.bind_at(
+            NonZero::new(1).unwrap(),
+            Value::build_text(table.to_string()),
+        )?;
+        stmt.bind_at(
+            NonZero::new(2).unwrap(),
+            Value::build_text(name.to_string()),
+        )?;
+        let row = &stmt.run_collect_rows()?[0];
+        taken = row[1] == Value::from_i64(1);
+        if row[0] == Value::from_i64(1) {
+            break;
+        }
+    }
+    Ok(taken)
+}
+
 /// The first schema of `search_path` that exists, which is what PostgreSQL's
 /// current_schema() returns. None when no schema of `search_path` exists.
 /// The default search_path, "$user", public, gives public, since there is no
 /// schema named after a user.
 pub(crate) fn current_schema(conn: &Connection) -> Option<String> {
-    let Some(search_path) = conn
-        .context::<PgSessionState>()
-        .and_then(|state| state.lock().unwrap().search_path.clone())
-    else {
+    let database_id = *conn.search_order().first()?;
+    if database_id == turso_core::MAIN_DB_ID {
         return Some("public".to_owned());
-    };
-    let attached = conn.attached_database_names();
-    search_path
-        .into_iter()
-        .find(|schema| schema.eq_ignore_ascii_case("public") || attached.contains(schema))
+    }
+    conn.namespace_name(database_id)
 }
 
 fn reject_catalog_dml(stmt: &ast::Stmt) -> Result<()> {
@@ -312,7 +361,7 @@ fn try_prepare_special(pg_conn: &Arc<PgConnectionInner>, sql: &str) -> Result<Op
         return Ok(Some(stmt));
     }
 
-    if is_set_transaction(&parse_result) {
+    if check_set_transaction(&parse_result).map_err(|e| LimboError::ParseError(e.to_string()))? {
         return Ok(Some(noop_statement(&pg_conn.conn)?));
     }
 
@@ -320,8 +369,10 @@ fn try_prepare_special(pg_conn: &Arc<PgConnectionInner>, sql: &str) -> Result<Op
         return Ok(Some(handle_pg_show(pg_conn, &show_stmt)?));
     }
 
-    if let Some(stmt) = try_extract_create_schema(&parse_result) {
-        handle_pg_create_schema(&pg_conn.conn, &stmt)?;
+    if let Some(stmt) = try_extract_create_schema(&parse_result)
+        .map_err(|e| LimboError::ParseError(e.to_string()))?
+    {
+        handle_pg_create_schema(pg_conn, &stmt)?;
         return Ok(Some(noop_statement(&pg_conn.conn)?));
     }
 
@@ -330,7 +381,7 @@ fn try_prepare_special(pg_conn: &Arc<PgConnectionInner>, sql: &str) -> Result<Op
         return Ok(Some(noop_statement(&pg_conn.conn)?));
     }
 
-    if is_refresh_matview(&parse_result) {
+    if is_refresh_matview(&parse_result).map_err(|e| LimboError::ParseError(e.to_string()))? {
         return Ok(Some(noop_statement(&pg_conn.conn)?));
     }
 
@@ -338,7 +389,9 @@ fn try_prepare_special(pg_conn: &Arc<PgConnectionInner>, sql: &str) -> Result<Op
         return Ok(Some(noop_statement(&pg_conn.conn)?));
     }
 
-    if let Some(stmt) = try_extract_copy_from(&parse_result) {
+    if let Some(stmt) =
+        try_extract_copy_from(&parse_result).map_err(|e| LimboError::ParseError(e.to_string()))?
+    {
         let rows_inserted = handle_pg_copy_from(&pg_conn.conn, &stmt)?;
         let stmt = noop_statement(&pg_conn.conn)?;
         stmt.set_n_change(rows_inserted as i64);
@@ -378,11 +431,63 @@ fn handle_pg_set(pg_conn: &Arc<PgConnectionInner>, set_stmt: &PgSetStmt) -> Resu
             set_stmt.is_local
         ));
     }
-    let value = set_stmt.values.first().ok_or_else(|| {
-        LimboError::ParseError(format!("SET {}: no value provided", set_stmt.name))
-    })?;
-    let pragma_sql = format!("PRAGMA {} = {}", set_stmt.name, value.to_sql_string());
-    pg_conn.conn.prepare(&pragma_sql)
+    if set_value_already_in_effect(&set_stmt.name, &set_stmt.values) {
+        return noop_statement(&pg_conn.conn);
+    }
+    Err(LimboError::ParseError(format!(
+        "SET {} is not supported",
+        set_stmt.name
+    )))
+}
+
+fn set_value_already_in_effect(name: &str, values: &[PgSetValue]) -> bool {
+    let Some(values) = values
+        .iter()
+        .map(|value| match value {
+            PgSetValue::Identifier(s) | PgSetValue::StringLiteral(s) | PgSetValue::Number(s) => {
+                Some(s.to_ascii_lowercase())
+            }
+            PgSetValue::Bool(b) => Some(if *b { "on" } else { "off" }.to_string()),
+            _ => None,
+        })
+        .collect::<Option<Vec<_>>>()
+    else {
+        return false;
+    };
+    let value = values.join(", ");
+    let is_on = matches!(value.as_str(), "on" | "true" | "1");
+    let is_off = matches!(value.as_str(), "off" | "false" | "0");
+    match name.to_ascii_lowercase().as_str() {
+        "statement_timeout" | "lock_timeout" | "idle_in_transaction_session_timeout" => {
+            value == "0"
+        }
+        "datestyle" => matches!(value.as_str(), "iso" | "iso, mdy" | "iso, ymd" | "iso, dmy"),
+        "intervalstyle" => value == "postgres",
+        "client_encoding" => matches!(value.as_str(), "utf8" | "utf-8" | "unicode"),
+        "extra_float_digits" => matches!(value.as_str(), "1" | "2" | "3"),
+        "standard_conforming_strings" => is_on,
+        "row_security" | "quote_all_identifiers" => is_off,
+        "check_function_bodies" | "synchronize_seqscans" => is_on || is_off,
+        "default_tablespace" => value.is_empty(),
+        "default_table_access_method" => value == "heap",
+        "transaction_timeout" => value == "0",
+        "xmloption" => value == "content",
+        "application_name" => true,
+        "client_min_messages" => matches!(
+            value.as_str(),
+            "debug5"
+                | "debug4"
+                | "debug3"
+                | "debug2"
+                | "debug1"
+                | "debug"
+                | "log"
+                | "notice"
+                | "warning"
+                | "error"
+        ),
+        _ => false,
+    }
 }
 
 fn handle_pg_show(pg_conn: &Arc<PgConnectionInner>, show_stmt: &PgShowStmt) -> Result<Statement> {
@@ -390,21 +495,32 @@ fn handle_pg_show(pg_conn: &Arc<PgConnectionInner>, show_stmt: &PgShowStmt) -> R
         Ok(ConfigParameter::SearchPath) => pg_conn
             .conn
             .prepare("SELECT current_setting('search_path') AS search_path"),
-        Err(_) => pg_conn.conn.prepare(format!("PRAGMA {}", show_stmt.name)),
+        Err(_) => Err(LimboError::ParseError(format!(
+            "SHOW {} is not supported",
+            show_stmt.name
+        ))),
     }
 }
 
+/// `$user` stands for a schema named after the session user, which does
+/// not exist, so it is not a name that core looks up.
 pub(crate) fn set_search_path(conn: &Connection, value: Option<&str>) -> Result<Value> {
-    let path = value.map(parse_search_path).transpose()?;
+    let mut path = parse_search_path(value.unwrap_or(DEFAULT_SEARCH_PATH))?;
+    path.retain(|name| name != "$user" && !is_core_database_name(name));
     let state = conn.context::<PgSessionState>().ok_or_else(|| {
         LimboError::InvalidArgument("PostgreSQL session state is not initialized".to_string())
     })?;
-    let mut state = state.lock().unwrap();
-    state.search_path = path;
-    state.search_path_setting = value.map(str::to_owned);
+    state.lock().unwrap().search_path_setting = value.map(str::to_owned);
+    conn.set_search_path(Some(path));
     Ok(Value::build_text(
         value.unwrap_or(DEFAULT_SEARCH_PATH).to_owned(),
     ))
+}
+
+/// `main` and `temp` name databases in core, not PostgreSQL schemas, so a
+/// search_path that lists them finds nothing there, as in PostgreSQL.
+fn is_core_database_name(name: &str) -> bool {
+    name.eq_ignore_ascii_case("main") || name.eq_ignore_ascii_case("temp")
 }
 
 pub(crate) fn search_path_setting(conn: &Connection) -> Option<String> {
@@ -448,7 +564,11 @@ fn search_path_parser<'src>() -> impl Parser<'src, &'src str, Vec<String>, extra
         .padded_by(whitespace)
 }
 
-fn handle_pg_create_schema(conn: &Arc<Connection>, stmt: &PgCreateSchemaStmt) -> Result<()> {
+fn handle_pg_create_schema(
+    pg_conn: &Arc<PgConnectionInner>,
+    stmt: &PgCreateSchemaStmt,
+) -> Result<()> {
+    let conn = &pg_conn.conn;
     let name = stmt.name.to_lowercase();
     if name == "public" {
         if stmt.if_not_exists {
@@ -473,11 +593,45 @@ fn handle_pg_create_schema(conn: &Arc<Connection>, stmt: &PgCreateSchemaStmt) ->
         )));
     }
 
+    // A failed element is undone by dropping the schema, and DETACH cannot
+    // run inside a transaction.
+    if !stmt.elements.is_empty() && !conn.get_auto_commit() {
+        return Err(LimboError::ParseError(
+            "CREATE SCHEMA with schema elements cannot run inside a transaction block".to_string(),
+        ));
+    }
+
     let path = schema_file_path(conn, &name);
     execute_sqlite(
         conn,
         format!("ATTACH '{}' AS \"{}\"", path.replace('\'', "''"), name),
     )?;
+    if stmt.elements.is_empty() {
+        return Ok(());
+    }
+    let setting = search_path_setting(conn);
+    let mut search_path = turso_pg_parser::quote_identifier(&name);
+    let rest = setting.as_deref().unwrap_or(DEFAULT_SEARCH_PATH).trim();
+    if !rest.is_empty() {
+        search_path = format!("{search_path}, {rest}");
+    }
+    set_search_path(conn, Some(&search_path))?;
+    let result = stmt
+        .elements
+        .iter()
+        .try_for_each(|sql| prepare_statement(pg_conn, sql)?.run_ignore_rows());
+    set_search_path(conn, setting.as_deref())?;
+    if let Err(err) = result {
+        handle_pg_drop_schema(
+            conn,
+            &PgDropSchemaStmt {
+                name,
+                if_exists: false,
+                cascade: true,
+            },
+        )?;
+        return Err(err);
+    }
     Ok(())
 }
 
@@ -639,13 +793,10 @@ fn handle_pg_copy_from(conn: &Arc<Connection>, stmt: &PgCopyFromStmt) -> Result<
         .unwrap_or('\t');
     let null_string = stmt.null_string.as_deref().unwrap_or("\\N");
 
-    let mut rows = parse_copy_text_format(&data, delimiter, null_string, num_columns)?;
-    if stmt.header && !rows.is_empty() {
-        rows.remove(0);
-    }
+    let rows = parse_copy_text_format(&data, delimiter, null_string, num_columns, stmt.header)?;
 
     let rows_inserted = rows.len();
-    let mut begin = conn.prepare_sqlite("BEGIN")?;
+    let mut begin = conn.prepare_sqlite("BEGIN CONCURRENT")?;
     begin.run_ignore_rows()?;
 
     let result = (|| {
