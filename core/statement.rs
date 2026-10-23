@@ -806,7 +806,6 @@ impl Statement {
                 .with_metrics(|metrics| connection.metrics.write().record_statement(metrics));
             self.busy = false;
             self.busy_handler_state = None; // Reset busy state on completion
-            self.conflict_retry_state = None;
             self.state.query_deadline = None;
 
             // After ANALYZE completes, refresh in-memory stats so planners can use them.
@@ -861,9 +860,8 @@ impl Statement {
             self.has_returned_row = true;
         }
 
-        if self.counted_as_active_root
-            && (matches!(res, Ok(StepResult::Done | StepResult::Interrupt)) || res.is_err())
-        {
+        if matches!(res, Ok(StepResult::Done | StepResult::Interrupt)) || res.is_err() {
+            self.stop_waiting_to_retry();
             self.release_active_root_if_counted(!matches!(res, Ok(StepResult::Done)));
         }
 
@@ -943,8 +941,7 @@ impl Statement {
 
         let now = self.pager.io.current_time_monotonic();
         let mut retry_state = self
-            .conflict_retry_state
-            .take()
+            .stop_waiting_to_retry()
             .unwrap_or_else(|| BusyHandlerState::new(now));
         if !retry_state.invoke(&handler, now) {
             return Ok(None);
@@ -955,11 +952,32 @@ impl Statement {
         self.state.parameters = parameters;
 
         let delay = retry_state.get_delay(now);
-        self.conflict_retry_state = Some(retry_state);
+        self.start_waiting_to_retry(retry_state);
         if let Some(waker) = waker {
             waker.wake_by_ref();
         }
         Ok(Some(StepResult::Sleep { duration: delay }))
+    }
+
+    fn start_waiting_to_retry(&mut self, retry_state: BusyHandlerState) {
+        assert!(
+            self.conflict_retry_state.is_none(),
+            "a statement must stop waiting before it waits again"
+        );
+        self.program
+            .connection
+            .n_statements_waiting_to_retry
+            .fetch_add(1, Ordering::SeqCst);
+        self.conflict_retry_state = Some(retry_state);
+    }
+
+    fn stop_waiting_to_retry(&mut self) -> Option<BusyHandlerState> {
+        let retry_state = self.conflict_retry_state.take()?;
+        self.program
+            .connection
+            .n_statements_waiting_to_retry
+            .fetch_sub(1, Ordering::SeqCst);
+        Some(retry_state)
     }
 
     fn shares_connection_with_another_open_statement(&self) -> bool {
@@ -1925,7 +1943,7 @@ impl Statement {
         self.state.reset(max_registers, max_cursors);
         self.busy = false;
         self.busy_handler_state = None;
-        self.conflict_retry_state = None;
+        self.stop_waiting_to_retry();
         self.query_timeout_override = None;
         self.has_returned_row = false;
 

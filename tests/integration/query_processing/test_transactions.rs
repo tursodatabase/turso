@@ -936,6 +936,74 @@ fn test_mvcc_statement_run_while_an_update_waits_is_committed_on_its_own() {
 }
 
 #[test]
+fn test_mvcc_checkpoint_is_rejected_while_an_update_waits_to_be_retried() {
+    let tmp_db = TempDatabase::new_with_mvcc("test_mvcc_checkpoint_during_retry_wait.db");
+    let conn1 = tmp_db.connect_limbo();
+    let conn2 = tmp_db.connect_limbo();
+
+    conn1
+        .execute("CREATE TABLE test (id INTEGER PRIMARY KEY, value TEXT)")
+        .unwrap();
+    conn1
+        .execute("INSERT INTO test (id, value) VALUES (1, 'first')")
+        .unwrap();
+    conn2.set_busy_timeout(Duration::from_secs(5));
+
+    let checkpoint = |conn: &Arc<Connection>| {
+        conn.checkpoint(turso_core::CheckpointMode::Truncate {
+            upper_bound_inclusive: None,
+        })
+    };
+    let step_until_sleep = |stmt: &mut Statement| loop {
+        match stmt.step().unwrap() {
+            StepResult::IO | StepResult::Yield => tmp_db.io.step().unwrap(),
+            StepResult::Sleep { .. } => break,
+            result => panic!("expected Sleep after a write-write conflict, got {result:?}"),
+        }
+    };
+
+    conn1.execute("BEGIN CONCURRENT").unwrap();
+    conn1
+        .execute("UPDATE test SET value = 'second' WHERE id = 1")
+        .unwrap();
+    let mut stmt = conn2
+        .prepare("UPDATE test SET value = 'third' WHERE id = 1")
+        .unwrap();
+    step_until_sleep(&mut stmt);
+    conn1.execute("COMMIT").unwrap();
+    assert!(matches!(
+        checkpoint(&conn2),
+        Err(LimboError::StatementsInProgress(_))
+    ));
+
+    loop {
+        match stmt.step().unwrap() {
+            StepResult::IO | StepResult::Yield => tmp_db.io.step().unwrap(),
+            StepResult::Sleep { duration } => std::thread::sleep(duration),
+            StepResult::Done => break,
+            result => panic!("expected the update to finish, got {result:?}"),
+        }
+    }
+    drop(stmt);
+    checkpoint(&conn2).expect("no statement is left on the connection");
+
+    conn1.execute("BEGIN CONCURRENT").unwrap();
+    conn1
+        .execute("UPDATE test SET value = 'fourth' WHERE id = 1")
+        .unwrap();
+    let mut abandoned = conn2
+        .prepare("UPDATE test SET value = 'fifth' WHERE id = 1")
+        .unwrap();
+    step_until_sleep(&mut abandoned);
+    drop(abandoned);
+    conn1.execute("COMMIT").unwrap();
+    checkpoint(&conn2).expect("an abandoned statement no longer waits");
+
+    let rows: Vec<(String,)> = conn1.exec_rows("SELECT value FROM test WHERE id = 1");
+    assert_eq!(rows, vec![("fourth".to_string(),)]);
+}
+
+#[test]
 fn test_mvcc_autocommit_returning_rows_come_only_from_the_successful_attempt() {
     let tmp_db = TempDatabase::new_with_mvcc("test_mvcc_autocommit_returning_after_retry.db");
     let conn1 = tmp_db.connect_limbo();
