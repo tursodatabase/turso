@@ -121,29 +121,28 @@ impl<'document> HirValidator<'document> {
                 self.document.root,
                 HirRoot::Insert(_) | HirRoot::Update(_) | HirRoot::Delete(_)
             ),
-            "CDC metadata is only valid for a DML root",
+            || "CDC metadata is only valid for a DML root",
         )?;
         self.visit_catalog_object(&cdc.table, "CDC table")?;
         self.require(
             cdc.table.database().map(DatabaseId::index) == Some(crate::MAIN_DB_ID),
-            "CDC table must belong to the main database",
+            || "CDC table must belong to the main database",
         )?;
-        self.require(
-            cdc.table.value().btree().is_some(),
-            "CDC target is not a B-tree table",
-        )?;
+        self.require(cdc.table.value().btree().is_some(), || {
+            "CDC target is not a B-tree table"
+        })?;
         self.require(
             cdc.table
                 .value()
                 .get_name()
                 .eq_ignore_ascii_case(&cdc.info.table),
-            "CDC table identity does not match the configured table name",
+            || "CDC table identity does not match the configured table name",
         )?;
         if let Some(sequence) = &cdc.sequence {
             self.visit_sequence_operation(sequence)?;
             self.require(
                 sequence.sequence.database().map(DatabaseId::index) == Some(crate::MAIN_DB_ID),
-                "CDC sequence must belong to the main database",
+                || "CDC sequence must belong to the main database",
             )?;
         }
         Ok(())
@@ -153,10 +152,9 @@ impl<'document> HirValidator<'document> {
         let mut previous = None;
         for snapshot in &self.document.databases {
             if let Some(previous) = previous {
-                self.require(
-                    previous < snapshot.database.index(),
-                    "database snapshots must be unique and sorted by database id",
-                )?;
+                self.require(previous < snapshot.database.index(), || {
+                    "database snapshots must be unique and sorted by database id"
+                })?;
             }
             previous = Some(snapshot.database.index());
         }
@@ -166,45 +164,39 @@ impl<'document> HirValidator<'document> {
     fn validate_arena_identities(&self) -> ValidationResult {
         for (index, query) in self.document.queries.iter().enumerate() {
             let expected = QueryId::new(index);
-            self.require(
-                query.id == expected,
-                format!("query arena slot {index} contains {}", query.id),
-            )?;
+            self.require(query.id == expected, || {
+                format!("query arena slot {index} contains {}", query.id)
+            })?;
             if let Some(parent) = query.parent {
-                self.require(
-                    parent != query.id,
-                    format!("query {} is its own lexical parent", query.id),
-                )?;
+                self.require(parent != query.id, || {
+                    format!("query {} is its own lexical parent", query.id)
+                })?;
                 self.query(parent)?;
-                self.require(
-                    self.query_parent_chain_is_acyclic(query.id)?,
-                    format!("query {} has a cyclic lexical parent chain", query.id),
-                )?;
+                self.require(self.query_parent_chain_is_acyclic(query.id)?, || {
+                    format!("query {} has a cyclic lexical parent chain", query.id)
+                })?;
             }
             for (block_index, block) in query.blocks.iter().enumerate() {
                 let expected = QueryBlockId::new(expected, block_index);
-                self.require(
-                    block.id == expected,
+                self.require(block.id == expected, || {
                     format!(
                         "query block arena slot {expected:?} contains {:?}",
                         block.id
-                    ),
-                )?;
+                    )
+                })?;
             }
         }
         for (index, source) in self.document.sources.iter().enumerate() {
             let expected = SourceId::new(index);
-            self.require(
-                source.id == expected,
-                format!("source arena slot {index} contains {}", source.id),
-            )?;
+            self.require(source.id == expected, || {
+                format!("source arena slot {index} contains {}", source.id)
+            })?;
         }
         for (index, cte) in self.document.ctes.iter().enumerate() {
             let expected = CteId::new(index);
-            self.require(
-                cte.id == expected,
-                format!("CTE arena slot {index} contains {}", cte.id),
-            )?;
+            self.require(cte.id == expected, || {
+                format!("CTE arena slot {index} contains {}", cte.id)
+            })?;
         }
         Ok(())
     }
@@ -213,7 +205,7 @@ impl<'document> HirValidator<'document> {
         for (index, visited) in self.visited_queries.iter().enumerate() {
             self.require(
                 visited.get() || self.document.queries[index].is_detached(),
-                format!("query q{index} is unreachable"),
+                || format!("query q{index} is unreachable"),
             )?;
         }
         for (index, visited) in self.visited_sources.iter().enumerate() {
@@ -222,19 +214,17 @@ impl<'document> HirValidator<'document> {
                 self.document.sources[index].owner,
                 SourceOwner::QueryBlock(block) if self.document.queries[block.query.index()].is_detached()
             );
-            self.require(
-                visited.get() || detached,
-                format!("source s{index} is unreachable"),
-            )?;
+            self.require(visited.get() || detached, || {
+                format!("source s{index} is unreachable")
+            })?;
         }
         for (index, visited) in self.visited_ctes.iter().enumerate() {
-            self.require(visited.get(), format!("CTE c{index} is unreachable"))?;
+            self.require(visited.get(), || format!("CTE c{index} is unreachable"))?;
         }
         for (index, state) in self.schema_program_states.iter().enumerate() {
-            self.require(
-                state.get() == 2,
-                format!("schema program schema_program{index} is unreachable or unfinished"),
-            )?;
+            self.require(state.get() == 2, || {
+                format!("schema program schema_program{index} is unreachable or unfinished")
+            })?;
         }
         Ok(())
     }
@@ -303,10 +293,9 @@ impl<'document> HirValidator<'document> {
                 capture_changes,
             } => {
                 self.validate_capture_changes(target_table, capture_changes.as_ref())?;
-                self.require(
-                    target_table.value().btree().is_some(),
-                    "B-tree INSERT metadata belongs to a non-B-tree target",
-                )?;
+                self.require(target_table.value().btree().is_some(), || {
+                    "B-tree INSERT metadata belongs to a non-B-tree target"
+                })?;
                 self.require_complete_row_image(insert.target)?;
                 self.require_complete_index_metadata(insert.target)?;
                 self.visit_dml_triggers(
@@ -339,27 +328,24 @@ impl<'document> HirValidator<'document> {
                 }
             }
             InsertTargetKind::Virtual => {
-                self.require(
-                    target_table.value().virtual_table().is_some(),
-                    "virtual INSERT metadata belongs to a non-virtual target",
-                )?;
+                self.require(target_table.value().virtual_table().is_some(), || {
+                    "virtual INSERT metadata belongs to a non-virtual target"
+                })?;
                 self.require(
                     target.check_constraints.is_none()
                         && matches!(target.index_coverage, IndexCoverage::Selective),
-                    "virtual-table INSERT target carries B-tree constraint metadata",
+                    || "virtual-table INSERT target carries B-tree constraint metadata",
                 )?;
                 self.require(
                     insert.upserts.is_empty() && insert.excluded_source.is_none(),
-                    "virtual-table INSERT carries UPSERT metadata",
+                    || "virtual-table INSERT carries UPSERT metadata",
                 )?;
-                self.require(
-                    !matches!(insert.source, InsertSource::Query(_)),
-                    "virtual-table INSERT carries a query source",
-                )?;
-                self.require(
-                    !trigger_command,
-                    "trigger command writes an unsafe virtual-table target",
-                )?;
+                self.require(!matches!(insert.source, InsertSource::Query(_)), || {
+                    "virtual-table INSERT carries a query source"
+                })?;
+                self.require(!trigger_command, || {
+                    "trigger command writes an unsafe virtual-table target"
+                })?;
             }
         }
         for target in &insert.columns {
@@ -369,27 +355,25 @@ impl<'document> HirValidator<'document> {
             InsertSource::DefaultValues => {}
             InsertSource::Values(rows) => {
                 for row in rows {
-                    self.require(
-                        row.len() == insert.columns.len(),
+                    self.require(row.len() == insert.columns.len(), || {
                         format!(
                             "INSERT row has {} values for {} target columns",
                             row.len(),
                             insert.columns.len()
-                        ),
-                    )?;
+                        )
+                    })?;
                     self.visit_exprs(row)?;
                 }
             }
             InsertSource::Query(query) => {
                 self.visit_query(*query)?;
                 let width = self.query(*query)?.output.len();
-                self.require(
-                    width == insert.columns.len(),
+                self.require(width == insert.columns.len(), || {
                     format!(
                         "INSERT query has {width} outputs for {} target columns",
                         insert.columns.len()
-                    ),
-                )?;
+                    )
+                })?;
             }
         }
         for upsert in &insert.upserts {
@@ -430,7 +414,7 @@ impl<'document> HirValidator<'document> {
                     .upserts
                     .iter()
                     .any(|upsert| matches!(upsert.action, UpsertAction::Update { .. })),
-                "INSERT has an UPSERT NEW row without a DO UPDATE",
+                || "INSERT has an UPSERT NEW row without a DO UPDATE",
             )?;
         }
         self.visit_optional_returning(insert.returning.as_ref())
@@ -445,10 +429,9 @@ impl<'document> HirValidator<'document> {
         };
         self.require_pseudo_source(update.new_source, PseudoSource::New)?;
         self.require_pseudo_table(update.new_source, target_table)?;
-        self.require(
-            update.target != update.new_source,
-            "UPDATE OLD and NEW rows must have distinct source identities",
-        )?;
+        self.require(update.target != update.new_source, || {
+            "UPDATE OLD and NEW rows must have distinct source identities"
+        })?;
         match &update.target_kind {
             UpdateTargetKind::BTree {
                 defaults,
@@ -458,10 +441,9 @@ impl<'document> HirValidator<'document> {
                 capture_changes,
             } => {
                 self.validate_capture_changes(target_table, capture_changes.as_ref())?;
-                self.require(
-                    target_table.value().btree().is_some(),
-                    "B-tree UPDATE metadata belongs to a non-B-tree target",
-                )?;
+                self.require(target_table.value().btree().is_some(), || {
+                    "B-tree UPDATE metadata belongs to a non-B-tree target"
+                })?;
                 self.require_complete_row_image(update.target)?;
                 self.require_complete_row_image(update.new_source)?;
                 self.require_complete_index_metadata(update.target)?;
@@ -480,22 +462,20 @@ impl<'document> HirValidator<'document> {
                 }
             }
             UpdateTargetKind::Virtual => {
-                self.require(
-                    target_table.value().virtual_table().is_some(),
-                    "virtual UPDATE metadata belongs to a non-virtual target",
-                )?;
+                self.require(target_table.value().virtual_table().is_some(), || {
+                    "virtual UPDATE metadata belongs to a non-virtual target"
+                })?;
                 for source in [update.target, update.new_source] {
                     let source = self.source(source)?;
                     self.require(
                         source.check_constraints.is_none()
                             && matches!(source.index_coverage, IndexCoverage::Selective),
-                        "virtual-table UPDATE row carries B-tree constraint metadata",
+                        || "virtual-table UPDATE row carries B-tree constraint metadata",
                     )?;
                 }
-                self.require(
-                    !trigger_command,
-                    "trigger command writes an unsafe virtual-table target",
-                )?;
+                self.require(!trigger_command, || {
+                    "trigger command writes an unsafe virtual-table target"
+                })?;
             }
         }
         if let Some(from) = &update.from {
@@ -521,10 +501,9 @@ impl<'document> HirValidator<'document> {
                 capture_changes,
             } => {
                 self.validate_capture_changes(target_table, capture_changes.as_ref())?;
-                self.require(
-                    target_table.value().btree().is_some(),
-                    "B-tree DELETE metadata belongs to a non-B-tree target",
-                )?;
+                self.require(target_table.value().btree().is_some(), || {
+                    "B-tree DELETE metadata belongs to a non-B-tree target"
+                })?;
                 self.require_complete_row_image(delete.target)?;
                 self.require_complete_index_metadata(delete.target)?;
                 self.visit_dml_triggers(
@@ -536,20 +515,18 @@ impl<'document> HirValidator<'document> {
                 self.visit_dml_foreign_keys(delete.target, delete.target, foreign_keys)?;
             }
             DeleteTargetKind::Virtual => {
-                self.require(
-                    target_table.value().virtual_table().is_some(),
-                    "virtual DELETE metadata belongs to a non-virtual target",
-                )?;
+                self.require(target_table.value().virtual_table().is_some(), || {
+                    "virtual DELETE metadata belongs to a non-virtual target"
+                })?;
                 let source = self.source(delete.target)?;
                 self.require(
                     source.check_constraints.is_none()
                         && matches!(source.index_coverage, IndexCoverage::Selective),
-                    "virtual-table DELETE row carries B-tree constraint metadata",
+                    || "virtual-table DELETE row carries B-tree constraint metadata",
                 )?;
-                self.require(
-                    !trigger_command,
-                    "trigger command writes an unsafe virtual-table target",
-                )?;
+                self.require(!trigger_command, || {
+                    "trigger command writes an unsafe virtual-table target"
+                })?;
             }
         }
         self.visit_optional_expr(delete.predicate.as_ref())?;
@@ -565,13 +542,12 @@ impl<'document> HirValidator<'document> {
             }
             self.visit_expr(&assignment.value)?;
             let value_width = self.expression_width(&assignment.value)?;
-            self.require(
-                assignment.columns.len() == value_width,
+            self.require(assignment.columns.len() == value_width, || {
                 format!(
                     "assignment has {} target columns but value width {value_width}",
                     assignment.columns.len()
-                ),
-            )?;
+                )
+            })?;
         }
         Ok(())
     }
@@ -581,10 +557,9 @@ impl<'document> HirValidator<'document> {
             TargetColumn::Column(position) => self.validate_column_position(target, position),
             TargetColumn::RowId => {
                 let source = self.source(target)?;
-                self.require(
-                    source.rowid_available,
-                    format!("source {target} has no rowid target"),
-                )
+                self.require(source.rowid_available, || {
+                    format!("source {target} has no rowid target")
+                })
             }
         }
     }
@@ -644,22 +619,24 @@ impl<'document> HirValidator<'document> {
             self.visit_catalog_object(trigger, "DML trigger")?;
             self.require(
                 identities.insert((trigger.database(), trigger.id())),
-                format!("DML source {target} carries a duplicate trigger"),
+                || format!("DML source {target} carries a duplicate trigger"),
             )?;
             self.require(
                 trigger
                     .value()
                     .table_name
                     .eq_ignore_ascii_case(target_table.value().get_name()),
-                format!("DML trigger {} targets another table", trigger.value().name),
+                || format!("DML trigger {} targets another table", trigger.value().name),
             )?;
             if let Some(database) = trigger.value().target_database_id {
                 self.require(
                     target_table.database().map(DatabaseId::index) == Some(database),
-                    format!(
-                        "DML trigger {} targets another database",
-                        trigger.value().name
-                    ),
+                    || {
+                        format!(
+                            "DML trigger {} targets another database",
+                            trigger.value().name
+                        )
+                    },
                 )?;
             }
             let event_matches = match (&trigger.value().event, &event) {
@@ -683,13 +660,12 @@ impl<'document> HirValidator<'document> {
                 }),
                 _ => false,
             };
-            self.require(
-                event_matches,
+            self.require(event_matches, || {
                 format!(
                     "DML trigger {} does not match the write event",
                     trigger.value().name
-                ),
-            )?;
+                )
+            })?;
         }
         Ok(())
     }
@@ -704,20 +680,18 @@ impl<'document> HirValidator<'document> {
         let SourceKind::Table(target_table) = &target_source.kind else {
             return self.require(
                 foreign_keys.outgoing.is_empty() && foreign_keys.incoming.is_empty(),
-                format!("non-table DML source {target} carries foreign-key metadata"),
+                || format!("non-table DML source {target} carries foreign-key metadata"),
             );
         };
 
         let mut outgoing_identities = HashSet::with_capacity(foreign_keys.outgoing.len());
         for foreign_key in &foreign_keys.outgoing {
-            self.require(
-                &foreign_key.child_table == target_table,
-                format!("outgoing foreign key belongs to another DML target than {target}"),
-            )?;
-            self.require(
-                foreign_key.child_source == outgoing_child_source,
-                "outgoing foreign key uses the wrong DML row source",
-            )?;
+            self.require(&foreign_key.child_table == target_table, || {
+                format!("outgoing foreign key belongs to another DML target than {target}")
+            })?;
+            self.require(foreign_key.child_source == outgoing_child_source, || {
+                "outgoing foreign key uses the wrong DML row source"
+            })?;
             self.visit_resolved_foreign_key(foreign_key, true, outgoing_child_source != target)?;
             self.require(
                 outgoing_identities.insert((
@@ -725,15 +699,14 @@ impl<'document> HirValidator<'document> {
                     foreign_key.child_table.id(),
                     foreign_key.declaration.decl_order,
                 )),
-                format!("DML source {target} carries a duplicate foreign key"),
+                || format!("DML source {target} carries a duplicate foreign key"),
             )?;
         }
         let mut incoming_identities = HashSet::with_capacity(foreign_keys.incoming.len());
         for foreign_key in &foreign_keys.incoming {
-            self.require(
-                &foreign_key.parent_table == target_table,
-                format!("incoming foreign key belongs to another DML target than {target}"),
-            )?;
+            self.require(&foreign_key.parent_table == target_table, || {
+                format!("incoming foreign key belongs to another DML target than {target}")
+            })?;
             self.visit_resolved_foreign_key(foreign_key, false, false)?;
             self.require(
                 incoming_identities.insert((
@@ -741,7 +714,7 @@ impl<'document> HirValidator<'document> {
                     foreign_key.child_table.id(),
                     foreign_key.declaration.decl_order,
                 )),
-                format!("DML source {target} carries a duplicate foreign key"),
+                || format!("DML source {target} carries a duplicate foreign key"),
             )?;
         }
         Ok(())
@@ -768,13 +741,12 @@ impl<'document> HirValidator<'document> {
             } => allow_new_child_source && table == &foreign_key.child_table,
             _ => false,
         };
-        self.require(
-            child_source_matches,
-            "foreign-key child source belongs to another table or row identity",
-        )?;
+        self.require(child_source_matches, || {
+            "foreign-key child source belongs to another table or row identity"
+        })?;
         self.require(
             foreign_key.child_table.database() == foreign_key.parent_table.database(),
-            "foreign-key child and parent tables belong to different databases",
+            || "foreign-key child and parent tables belong to different databases",
         )?;
 
         let Some(child_table) = foreign_key.child_table.value().btree() else {
@@ -788,29 +760,33 @@ impl<'document> HirValidator<'document> {
                 .foreign_keys
                 .iter()
                 .any(|declaration| Arc::ptr_eq(declaration, &foreign_key.declaration)),
-            format!(
-                "foreign key is not declared by child table {}",
-                child_table.name
-            ),
+            || {
+                format!(
+                    "foreign key is not declared by child table {}",
+                    child_table.name
+                )
+            },
         )?;
         self.require(
             foreign_key
                 .declaration
                 .parent_table
                 .eq_ignore_ascii_case(&parent_table.name),
-            format!(
-                "foreign key declared for parent {} was resolved to {}",
-                foreign_key.declaration.parent_table, parent_table.name
-            ),
+            || {
+                format!(
+                    "foreign key declared for parent {} was resolved to {}",
+                    foreign_key.declaration.parent_table, parent_table.name
+                )
+            },
         )?;
 
         let width = foreign_key.declaration.child_columns.len();
-        self.require(width > 0, "foreign key has no child columns")?;
+        self.require(width > 0, || "foreign key has no child columns")?;
         self.require(
             foreign_key.parent_columns.len() == width
                 && foreign_key.child_positions.len() == width
                 && foreign_key.parent_positions.len() == width,
-            "foreign-key names and positions have different widths",
+            || "foreign-key names and positions have different widths",
         )?;
         if !foreign_key.declaration.parent_columns.is_empty() {
             self.require(
@@ -820,7 +796,7 @@ impl<'document> HirValidator<'document> {
                     .iter()
                     .zip(foreign_key.parent_columns.iter())
                     .all(|(declared, resolved)| declared.eq_ignore_ascii_case(resolved)),
-                "foreign-key resolved parent columns differ from its declaration",
+                || "foreign-key resolved parent columns differ from its declaration",
             )?;
         }
 
@@ -846,7 +822,11 @@ impl<'document> HirValidator<'document> {
                     .name
                     .as_deref()
                     .is_some_and(|name| name.eq_ignore_ascii_case(child_name)),
-                format!("foreign-key child position {child_position} does not name {child_name}"),
+                || {
+                    format!(
+                        "foreign-key child position {child_position} does not name {child_name}"
+                    )
+                },
             )?;
             let parent_column = parent_table.columns().get(parent_position).ok_or_else(|| {
                 HirValidationError::new(format!(
@@ -858,9 +838,11 @@ impl<'document> HirValidator<'document> {
                     .name
                     .as_deref()
                     .is_some_and(|name| name.eq_ignore_ascii_case(parent_name)),
-                format!(
-                    "foreign-key parent position {parent_position} does not name {parent_name}"
-                ),
+                || {
+                    format!(
+                        "foreign-key parent position {parent_position} does not name {parent_name}"
+                    )
+                },
             )?;
         }
 
@@ -869,14 +851,13 @@ impl<'document> HirValidator<'document> {
                 .columns()
                 .get(foreign_key.parent_positions[0])
                 .is_some_and(crate::schema::Column::is_rowid_alias);
-        self.require(
-            foreign_key.parent_uses_rowid == parent_uses_rowid,
-            "foreign-key rowid lookup fact does not match the parent column",
-        )?;
+        self.require(foreign_key.parent_uses_rowid == parent_uses_rowid, || {
+            "foreign-key rowid lookup fact does not match the parent column"
+        })?;
         self.require(
             !foreign_key.parent_action_guarantees_new_parent
                 || foreign_key.declaration.on_update == turso_parser::ast::RefAct::Cascade,
-            "only an UPDATE CASCADE action can guarantee the new parent",
+            || "only an UPDATE CASCADE action can guarantee the new parent",
         )?;
 
         if let Some(index) = &foreign_key.child_index {
@@ -894,7 +875,7 @@ impl<'document> HirValidator<'document> {
                         .iter()
                         .zip(foreign_key.child_positions.iter())
                         .all(|(column, position)| column.pos_in_table == *position),
-                "foreign-key child index does not list exactly the child key",
+                || "foreign-key child index does not list exactly the child key",
             )?;
         }
 
@@ -903,12 +884,11 @@ impl<'document> HirValidator<'document> {
                 self.visit_catalog_object(index, "foreign-key parent index")?;
                 self.require(
                     index.database() == foreign_key.parent_table.database(),
-                    "foreign-key parent index belongs to another database",
+                    || "foreign-key parent index belongs to another database",
                 )?;
-                self.require(
-                    !foreign_key.parent_uses_rowid,
-                    "rowid foreign key carries a parent index",
-                )?;
+                self.require(!foreign_key.parent_uses_rowid, || {
+                    "rowid foreign key carries a parent index"
+                })?;
                 self.require(
                     index
                         .value()
@@ -916,7 +896,7 @@ impl<'document> HirValidator<'document> {
                         .eq_ignore_ascii_case(&parent_table.name)
                         && index.value().unique
                         && index.value().where_clause.is_none(),
-                    "foreign-key parent index is not a full UNIQUE index on the parent table",
+                    || "foreign-key parent index is not a full UNIQUE index on the parent table",
                 )?;
                 self.require(
                     index.value().columns.len() == foreign_key.parent_columns.len()
@@ -934,12 +914,12 @@ impl<'document> HirValidator<'document> {
                                 index_column.name.eq_ignore_ascii_case(name)
                                     && index_column.pos_in_table == *position
                             }),
-                    "foreign-key parent index does not match the resolved parent key",
+                    || "foreign-key parent index does not match the resolved parent key",
                 )?;
             }
             None => self.require(
                 foreign_key.parent_uses_rowid || !require_parent_index,
-                "outgoing non-rowid foreign key has no parent UNIQUE index",
+                || "outgoing non-rowid foreign key has no parent UNIQUE index",
             )?,
         }
         Ok(())
@@ -949,7 +929,7 @@ impl<'document> HirValidator<'document> {
         let definition = self.source(source)?;
         self.require(
             matches!(definition.kind, SourceKind::Pseudo { kind, .. } if kind == expected),
-            format!("source {source} is not the expected {expected:?} pseudo-source"),
+            || format!("source {source} is not the expected {expected:?} pseudo-source"),
         )
     }
 
@@ -958,10 +938,9 @@ impl<'document> HirValidator<'document> {
         let SourceKind::Pseudo { table, .. } = &definition.kind else {
             return self.invalid(format!("source {source} is not a pseudo-source"));
         };
-        self.require(
-            table == expected,
-            format!("pseudo-source {source} belongs to a different table"),
-        )
+        self.require(table == expected, || {
+            format!("pseudo-source {source} belongs to a different table")
+        })
     }
 
     fn visit_query(&self, id: QueryId) -> ValidationResult {
@@ -969,45 +948,39 @@ impl<'document> HirValidator<'document> {
         if self.visited_queries[id.index()].replace(true) {
             return Ok(());
         }
-        self.require(
-            !query.blocks.is_empty(),
-            format!("query {id} has no blocks"),
-        )?;
-        self.require(
-            query.first == query.blocks[0].id,
-            format!("query {id} first block is not block zero"),
-        )?;
-        self.require(
-            query.compounds.len() + 1 == query.blocks.len(),
+        self.require(!query.blocks.is_empty(), || {
+            format!("query {id} has no blocks")
+        })?;
+        self.require(query.first == query.blocks[0].id, || {
+            format!("query {id} first block is not block zero")
+        })?;
+        self.require(query.compounds.len() + 1 == query.blocks.len(), || {
             format!(
                 "query {id} has {} blocks but {} compound arms",
                 query.blocks.len(),
                 query.compounds.len()
-            ),
-        )?;
+            )
+        })?;
         let expected_captures = self.document.direct_query_captures(id);
-        self.require(
-            query.captures == expected_captures,
-            format!("query {id} has an incorrect external source capture summary"),
-        )?;
+        self.require(query.captures == expected_captures, || {
+            format!("query {id} has an incorrect external source capture summary")
+        })?;
         for source in &query.captures {
             self.validate_capture(id, *source)?;
         }
 
         for (index, block) in query.blocks.iter().enumerate() {
             let expected = QueryBlockId::new(id, index);
-            self.require(
-                block.id == expected,
-                format!("query {id} block {index} has identity {:?}", block.id),
-            )?;
+            self.require(block.id == expected, || {
+                format!("query {id} block {index} has identity {:?}", block.id)
+            })?;
             self.visit_query_block(block)?;
         }
         for (index, arm) in query.compounds.iter().enumerate() {
             let expected = query.blocks[index + 1].id;
-            self.require(
-                arm.block == expected,
-                format!("query {id} compound arm {index} points to {:?}", arm.block),
-            )?;
+            self.require(arm.block == expected, || {
+                format!("query {id} compound arm {index} points to {:?}", arm.block)
+            })?;
         }
 
         let first = self.query_block(query.first)?;
@@ -1016,27 +989,24 @@ impl<'document> HirValidator<'document> {
             .iter()
             .map(|output| output.id)
             .collect::<Vec<_>>();
-        self.require(
-            query.output == expected_outputs,
-            format!("query {id} output list does not match its first block"),
-        )?;
+        self.require(query.output == expected_outputs, || {
+            format!("query {id} output list does not match its first block")
+        })?;
         for block in query.blocks.iter().skip(1) {
-            self.require(
-                block.outputs.len() == first.outputs.len(),
+            self.require(block.outputs.len() == first.outputs.len(), || {
                 format!(
                     "query {id} compound block {:?} has width {}, expected {}",
                     block.id,
                     block.outputs.len(),
                     first.outputs.len()
-                ),
-            )?;
+                )
+            })?;
         }
 
         let expected_ctes = self.direct_query_ctes(query)?;
-        self.require(
-            query.reachable_ctes == expected_ctes,
-            format!("query {id} has an incorrect reachable CTE summary"),
-        )?;
+        self.require(query.reachable_ctes == expected_ctes, || {
+            format!("query {id} has an incorrect reachable CTE summary")
+        })?;
         for cte in &query.reachable_ctes {
             self.visit_cte(*cte)?;
         }
@@ -1091,14 +1061,12 @@ impl<'document> HirValidator<'document> {
                 self.visit_optional_expr(filter.as_ref())?;
                 if let Some(grouping) = grouping {
                     self.visit_exprs(&grouping.keys)?;
-                    self.require(
-                        grouping.key_type_facts.len() == grouping.keys.len(),
-                        format!("GROUP BY key type facts do not match block {:?}", block.id),
-                    )?;
-                    self.require(
-                        grouping.key_collations.len() == grouping.keys.len(),
-                        format!("GROUP BY key collations do not match block {:?}", block.id),
-                    )?;
+                    self.require(grouping.key_type_facts.len() == grouping.keys.len(), || {
+                        format!("GROUP BY key type facts do not match block {:?}", block.id)
+                    })?;
+                    self.require(grouping.key_collations.len() == grouping.keys.len(), || {
+                        format!("GROUP BY key collations do not match block {:?}", block.id)
+                    })?;
                     for type_fact in &grouping.key_type_facts {
                         self.visit_type_fact(type_fact)?;
                     }
@@ -1113,24 +1081,22 @@ impl<'document> HirValidator<'document> {
             }
             QueryBlockBody::Values { rows } => {
                 for row in rows {
-                    self.require(
-                        row.len() == block.outputs.len(),
+                    self.require(row.len() == block.outputs.len(), || {
                         format!(
                             "VALUES row in {:?} has width {}, expected {}",
                             block.id,
                             row.len(),
                             block.outputs.len()
-                        ),
-                    )?;
+                        )
+                    })?;
                     self.visit_exprs(row)?;
                 }
             }
         }
         for (index, window) in block.windows.iter().enumerate() {
-            self.require(
-                window.id == WindowId::new(block.id, index),
-                format!("window {:?} is stored at the wrong block index", window.id),
-            )?;
+            self.require(window.id == WindowId::new(block.id, index), || {
+                format!("window {:?} is stored at the wrong block index", window.id)
+            })?;
             self.visit_resolved_window(window)?;
         }
         Ok(())
@@ -1155,20 +1121,18 @@ impl<'document> HirValidator<'document> {
                         | JoinKind::Anti => MergedColumnValue::Left,
                     };
                     for column in columns {
-                        self.require(
-                            column.value == expected_value,
+                        self.require(column.value == expected_value, || {
                             format!(
                                 "join source {} has {:?} merged value for {:?} join",
                                 join.right, column.value, join.kind
-                            ),
-                        )?;
-                        self.require(
-                            column.right.source == join.right,
+                            )
+                        })?;
+                        self.require(column.right.source == join.right, || {
                             format!(
                                 "join source {} has USING right column from {}",
                                 join.right, column.right.source
-                            ),
-                        )?;
+                            )
+                        })?;
                         self.visit_expr(&column.left)?;
                         self.visit_column_ref(column.right)?;
                         self.visit_type_fact(&column.type_fact)?;
@@ -1191,13 +1155,12 @@ impl<'document> HirValidator<'document> {
     fn visit_source(&self, id: SourceId, expected_owner: Option<SourceOwner>) -> ValidationResult {
         let source = self.source(id)?;
         if let Some(expected_owner) = expected_owner {
-            self.require(
-                source.owner == expected_owner,
+            self.require(source.owner == expected_owner, || {
                 format!(
                     "source {id} is owned by {:?}, expected {expected_owner:?}",
                     source.owner
-                ),
-            )?;
+                )
+            })?;
         }
         if self.visited_sources[id.index()].replace(true) {
             return Ok(());
@@ -1207,18 +1170,15 @@ impl<'document> HirValidator<'document> {
             self.require_database(database)?;
         }
         let width = source.columns.len();
-        self.require(
-            source.generated_expressions.len() == width,
-            format!("source {id} generated-expression width does not match its columns"),
-        )?;
-        self.require(
-            source.default_expressions.len() == width,
-            format!("source {id} default-expression width does not match its columns"),
-        )?;
-        self.require(
-            source.column_type_programs.len() == width,
-            format!("source {id} type-program width does not match its columns"),
-        )?;
+        self.require(source.generated_expressions.len() == width, || {
+            format!("source {id} generated-expression width does not match its columns")
+        })?;
+        self.require(source.default_expressions.len() == width, || {
+            format!("source {id} default-expression width does not match its columns")
+        })?;
+        self.require(source.column_type_programs.len() == width, || {
+            format!("source {id} type-program width does not match its columns")
+        })?;
 
         match &source.kind {
             SourceKind::SchemaExpression => {}
@@ -1229,51 +1189,46 @@ impl<'document> HirValidator<'document> {
                 argument_predicates,
             } => {
                 self.visit_source_table(source, table, false)?;
-                self.require(
-                    table.value().virtual_table().is_some(),
-                    format!("table-function source {id} does not resolve to a virtual table"),
-                )?;
+                self.require(table.value().virtual_table().is_some(), || {
+                    format!("table-function source {id} does not resolve to a virtual table")
+                })?;
                 let maximum = table
                     .value()
                     .columns()
                     .iter()
                     .filter(|column| column.hidden())
                     .count();
-                self.require(
-                    argument_predicates.len() <= maximum,
+                self.require(argument_predicates.len() <= maximum, || {
                     format!(
                         "table-function source {id} has {} arguments but accepts at most {maximum}",
                         argument_predicates.len()
-                    ),
-                )?;
+                    )
+                })?;
                 self.visit_exprs(argument_predicates)?;
             }
             SourceKind::Cte(cte) | SourceKind::RecursiveInput(cte) => {
                 self.visit_cte(*cte)?;
                 let cte = self.cte(*cte)?;
-                self.require(
-                    source.columns.len() == cte.columns.len(),
-                    format!("source {id} width does not match CTE {}", cte.id),
-                )?;
+                self.require(source.columns.len() == cte.columns.len(), || {
+                    format!("source {id} width does not match CTE {}", cte.id)
+                })?;
             }
             SourceKind::Derived(query) => {
                 self.visit_query(*query)?;
                 let query = self.query(*query)?;
-                self.require(
-                    source.columns.len() == query.output.len(),
+                self.require(source.columns.len() == query.output.len(), || {
                     format!(
                         "source {id} width does not match derived query {}",
                         query.id
-                    ),
-                )?;
+                    )
+                })?;
             }
             SourceKind::FromGroup(group) => {
-                self.require(
-                    group.columns.len() == width,
+                self.require(group.columns.len() == width, || {
                     format!(
                         "FROM group source {id} column mapping width does not match its columns"
-                    ),
-                )?;
+                    )
+                })?;
                 self.visit_from(&group.from, source.owner)?;
                 self.visit_exprs(&group.columns)?;
             }
@@ -1287,14 +1242,12 @@ impl<'document> HirValidator<'document> {
             IndexHint::None | IndexHint::NotIndexed => {}
             IndexHint::Indexed(index) => {
                 self.visit_catalog_object(index, "index hint")?;
-                self.require(
-                    index.database() == source.database,
-                    format!("source {id} index hint belongs to a different database"),
-                )?;
-                self.require(
-                    index.value().table_name == source.name,
-                    format!("source {id} index hint belongs to a different table"),
-                )?;
+                self.require(index.database() == source.database, || {
+                    format!("source {id} index hint belongs to a different database")
+                })?;
+                self.require(index.value().table_name == source.name, || {
+                    format!("source {id} index hint belongs to a different table")
+                })?;
             }
         }
 
@@ -1322,7 +1275,7 @@ impl<'document> HirValidator<'document> {
             self.visit_catalog_object(&expressions.index, "index expression")?;
             self.require(
                 index_ids.insert((expressions.index.database(), expressions.index.id())),
-                format!("source {id} contains duplicate index metadata"),
+                || format!("source {id} contains duplicate index metadata"),
             )?;
             resolved_index_ids.push(expressions.index.id());
             let table = source_table.ok_or_else(|| {
@@ -1335,11 +1288,11 @@ impl<'document> HirValidator<'document> {
                         .value()
                         .table_name
                         .eq_ignore_ascii_case(table.value().get_name()),
-                format!("source {id} contains metadata for another table's index"),
+                || format!("source {id} contains metadata for another table's index"),
             )?;
             self.require(
                 expressions.columns.len() == expressions.index.value().columns.len(),
-                format!("source {id} index-expression width does not match its index"),
+                || format!("source {id} index-expression width does not match its index"),
             )?;
             for (position, (expression, column)) in expressions
                 .columns
@@ -1352,16 +1305,15 @@ impl<'document> HirValidator<'document> {
                 let complete = expression.is_some() == column.expr.is_some()
                     && (column.pos_in_table != crate::schema::EXPR_INDEX_SENTINEL
                         || expression.is_some());
-                self.require(
-                    complete,
+                self.require(complete, || {
                     format!(
                         "source {id} index column {position} has incomplete expression metadata"
-                    ),
-                )?;
+                    )
+                })?;
             }
             self.require(
                 expressions.predicate.is_some() == expressions.index.value().where_clause.is_some(),
-                format!("source {id} has incomplete partial-index metadata"),
+                || format!("source {id} has incomplete partial-index metadata"),
             )?;
             for expression in expressions.columns.iter().flatten() {
                 self.visit_expr(expression)?;
@@ -1369,34 +1321,30 @@ impl<'document> HirValidator<'document> {
             self.visit_optional_expr(expressions.predicate.as_ref())?;
         }
         if let IndexCoverage::Complete { indexes } = &source.index_coverage {
-            self.require(
-                indexes == &resolved_index_ids,
-                format!("source {id} has an incorrect complete-index summary"),
-            )?;
+            self.require(indexes == &resolved_index_ids, || {
+                format!("source {id} has an incorrect complete-index summary")
+            })?;
         }
         let mut pattern_ids = HashSet::with_capacity(source.index_method_patterns.len());
         for pattern in &source.index_method_patterns {
             self.visit_catalog_object(&pattern.index, "index-method pattern")?;
-            self.require(
-                pattern.id.source == id,
-                format!("source {id} contains index-method pattern {:?}", pattern.id),
-            )?;
-            self.require(
-                pattern.id.index == pattern.index.id(),
+            self.require(pattern.id.source == id, || {
+                format!("source {id} contains index-method pattern {:?}", pattern.id)
+            })?;
+            self.require(pattern.id.index == pattern.index.id(), || {
                 format!(
                     "index-method pattern {:?} names index {:?} but contains index {:?}",
                     pattern.id,
                     pattern.id.index,
                     pattern.index.id()
-                ),
-            )?;
-            self.require(
-                pattern_ids.insert(pattern.id),
+                )
+            })?;
+            self.require(pattern_ids.insert(pattern.id), || {
                 format!(
                     "source {id} contains duplicate index-method pattern {:?}",
                     pattern.id
-                ),
-            )?;
+                )
+            })?;
             for (output_index, output) in pattern.outputs.iter().enumerate() {
                 self.visit_output(
                     output,
@@ -1424,13 +1372,14 @@ impl<'document> HirValidator<'document> {
         let source = self.source(source)?;
         match source.owner {
             SourceOwner::Root => Ok(()),
-            SourceOwner::QueryBlock(block) => self.require(
-                self.is_query_ancestor(block.query, query)?,
-                format!(
-                    "query {query} captures source {} from non-ancestor query {}",
-                    source.id, block.query
-                ),
-            ),
+            SourceOwner::QueryBlock(block) => {
+                self.require(self.is_query_ancestor(block.query, query)?, || {
+                    format!(
+                        "query {query} captures source {} from non-ancestor query {}",
+                        source.id, block.query
+                    )
+                })
+            }
         }
     }
 
@@ -1496,12 +1445,12 @@ impl<'document> HirValidator<'document> {
                     let definition = self.source(*source)?;
                     self.require(
                         matches!(definition.kind, SourceKind::RecursiveInput(source_cte) if source_cte == id),
-                        format!("recursive CTE {id} lists non-recursive source {source}"),
+                        || format!("recursive CTE {id} lists non-recursive source {source}"),
                     )?;
                 }
                 self.require(
                     recursive.comparison_collations.len() == cte.columns.len(),
-                    format!("recursive CTE {id} comparison width does not match its columns"),
+                    || format!("recursive CTE {id} comparison width does not match its columns"),
                 )?;
                 for collation in &recursive.comparison_collations {
                     self.visit_optional_catalog_object(
@@ -1510,13 +1459,12 @@ impl<'document> HirValidator<'document> {
                     )?;
                 }
                 for term in &recursive.queue_order {
-                    self.require(
-                        term.output < cte.columns.len(),
+                    self.require(term.output < cte.columns.len(), || {
                         format!(
                             "recursive CTE {id} queue output {} is out of range",
                             term.output
-                        ),
-                    )?;
+                        )
+                    })?;
                     self.visit_optional_catalog_object(
                         term.explicit_collation.as_ref(),
                         "recursive CTE order collation",
@@ -1534,21 +1482,19 @@ impl<'document> HirValidator<'document> {
 
     fn require_query_width(&self, query: QueryId, width: usize, context: &str) -> ValidationResult {
         let actual = self.query(query)?.output.len();
-        self.require(
-            actual == width,
-            format!("{context} query {query} has width {actual}, expected {width}"),
-        )
+        self.require(actual == width, || {
+            format!("{context} query {query} has width {actual}, expected {width}")
+        })
     }
 
     fn visit_output(&self, output: &Output, expected: OutputId) -> ValidationResult {
-        self.require(
-            output.id == expected,
-            format!("output {expected:?} contains identity {:?}", output.id),
-        )?;
+        self.require(output.id == expected, || {
+            format!("output {expected:?} contains identity {:?}", output.id)
+        })?;
         self.visit_type_fact(&output.type_fact)?;
         self.require(
             !output.collation_is_explicit || output.collation.is_some(),
-            format!("output {expected:?} marks an absent collation as explicit"),
+            || format!("output {expected:?} marks an absent collation as explicit"),
         )?;
         self.visit_optional_catalog_object(output.collation.as_ref(), "output collation")?;
         self.visit_expr(&output.expr)
@@ -1583,7 +1529,7 @@ impl<'document> HirValidator<'document> {
                 self.source(program.input_source)?.kind,
                 SourceKind::SchemaExpression
             ),
-            format!("schema program {id} input is not a schema-expression source"),
+            || format!("schema program {id} input is not a schema-expression source"),
         )?;
         self.visit_expr(&program.body)?;
         state.set(2);
@@ -1635,10 +1581,9 @@ impl<'document> HirValidator<'document> {
             }
             Expr::RowId(source) => {
                 self.visit_source(*source, None)?;
-                self.require(
-                    self.source(*source)?.rowid_available,
-                    format!("rowid expression refers to WITHOUT ROWID source {source}"),
-                )
+                self.require(self.source(*source)?.rowid_available, || {
+                    format!("rowid expression refers to WITHOUT ROWID source {source}")
+                })
             }
             Expr::Output(output) => self.visit_output_reference(*output),
             Expr::Unary { .. } | Expr::IsNull(_) | Expr::NotNull(_) | Expr::TruthTest { .. } => {
@@ -1652,13 +1597,12 @@ impl<'document> HirValidator<'document> {
                 custom,
                 comparison,
             } => {
-                self.require(
-                    operator.is_comparison() == comparison.is_some(),
-                    "binary expression has incorrect comparison metadata",
-                )?;
+                self.require(operator.is_comparison() == comparison.is_some(), || {
+                    "binary expression has incorrect comparison metadata"
+                })?;
                 self.require(
                     !*array_concat || *operator == turso_parser::ast::Operator::Concat,
-                    "non-concatenation expression is marked as array concatenation",
+                    || "non-concatenation expression is marked as array concatenation",
                 )?;
                 if let Some(comparison) = comparison {
                     self.visit_expression_comparison(comparison, lhs, rhs, "binary comparison")?;
@@ -1679,17 +1623,16 @@ impl<'document> HirValidator<'document> {
                                 | turso_parser::ast::Operator::Equals
                                 | turso_parser::ast::Operator::NotEquals
                         ),
-                        "unsupported binary expression has custom operator metadata",
+                        || "unsupported binary expression has custom operator metadata",
                     )?;
                     if let Some(encoding) = &custom.literal_encoding {
                         let literal = match encoding.operand {
                             BinaryOperand::Left => lhs,
                             BinaryOperand::Right => rhs,
                         };
-                        self.require(
-                            matches!(literal.as_ref(), Expr::Literal(_)),
-                            "custom operator literal encoding refers to a non-literal operand",
-                        )?;
+                        self.require(matches!(literal.as_ref(), Expr::Literal(_)), || {
+                            "custom operator literal encoding refers to a non-literal operand"
+                        })?;
                         if let Some(encoder) = &encoding.encoder {
                             self.visit_schema_program(encoder.program)?;
                         }
@@ -1725,15 +1668,13 @@ impl<'document> HirValidator<'document> {
                 base_comparisons,
                 ..
             } => match base.as_deref() {
-                None => self.require(
-                    base_comparisons.is_empty(),
-                    "searched CASE contains base-comparison metadata",
-                ),
+                None => self.require(base_comparisons.is_empty(), || {
+                    "searched CASE contains base-comparison metadata"
+                }),
                 Some(base) => {
-                    self.require(
-                        base_comparisons.len() == when_then.len(),
-                        "simple CASE comparison count does not match its WHEN count",
-                    )?;
+                    self.require(base_comparisons.len() == when_then.len(), || {
+                        "simple CASE comparison count does not match its WHEN count"
+                    })?;
                     for ((when, _), comparison) in when_then.iter().zip(base_comparisons) {
                         self.visit_expression_comparison(
                             comparison,
@@ -1773,10 +1714,9 @@ impl<'document> HirValidator<'document> {
                 comparisons,
                 ..
             } => {
-                self.require(
-                    comparisons.len() == values.len(),
-                    "IN-list comparison count does not match its value count",
-                )?;
+                self.require(comparisons.len() == values.len(), || {
+                    "IN-list comparison count does not match its value count"
+                })?;
                 for (value, comparison) in values.iter().zip(comparisons) {
                     self.visit_expression_comparison(comparison, lhs, value, "IN-list comparison")?;
                 }
@@ -1795,15 +1735,15 @@ impl<'document> HirValidator<'document> {
                 let lhs_width = self.expression_width(lhs)?;
                 self.require(
                     lhs_width == 1 || *operator == turso_parser::ast::LikeOperator::Match,
-                    "only MATCH accepts a row-valued left expression",
+                    || "only MATCH accepts a row-valued left expression",
                 )?;
                 self.require(
                     escape.is_none() || *operator == turso_parser::ast::LikeOperator::Like,
-                    "only LIKE accepts an ESCAPE expression",
+                    || "only LIKE accepts an ESCAPE expression",
                 )?;
                 self.require(
                     *argument_count == lhs_width + 1 + usize::from(escape.is_some()),
-                    "LIKE-family argument count does not match its expressions",
+                    || "LIKE-family argument count does not match its expressions",
                 )?;
                 Ok(())
             }
@@ -1828,21 +1768,20 @@ impl<'document> HirValidator<'document> {
         // `row_number(*)` is accepted like `row_number()`.
         self.require(
             !matches!(&call.arguments, FunctionArguments::Star) || aggregate || window_function,
-            "star function arguments belong to a non-aggregate call",
+            || "star function arguments belong to a non-aggregate call",
         )?;
         self.require(
             call.arguments.distinctness().is_none() || (aggregate && !window_evaluation),
-            "DISTINCT belongs to a non-aggregate call",
+            || "DISTINCT belongs to a non-aggregate call",
         )?;
         self.require(
             call.arguments.order_terms().is_empty() || (aggregate && !window_evaluation),
-            "argument ORDER BY belongs to a non-aggregate call",
+            || "argument ORDER BY belongs to a non-aggregate call",
         )?;
         if let FunctionArguments::Expressions { values, facts, .. } = &call.arguments {
-            self.require(
-                values.len() == facts.len(),
-                "function argument facts do not match argument count",
-            )?;
+            self.require(values.len() == facts.len(), || {
+                "function argument facts do not match argument count"
+            })?;
             for facts in facts {
                 self.visit_type_fact(&facts.type_fact)?;
                 if let Some(collation) = &facts.collation {
@@ -1852,38 +1791,32 @@ impl<'document> HirValidator<'document> {
         }
         self.visit_ordered_set_arguments(call)?;
         match &call.evaluation {
-            FunctionEvaluation::Scalar => self.require(
-                !aggregate && !window_function,
-                "aggregate or window function has scalar evaluation identity",
-            ),
+            FunctionEvaluation::Scalar => self.require(!aggregate && !window_function, || {
+                "aggregate or window function has scalar evaluation identity"
+            }),
             FunctionEvaluation::Aggregate { id, .. } => {
                 let block = self.query_block(id.block)?;
-                self.require(
-                    aggregate && !window_function,
-                    format!("aggregate identity {id:?} belongs to a non-aggregate call"),
-                )?;
-                self.require(
-                    id.index < block.aggregate_count,
-                    format!("aggregate identity {id:?} is outside its block"),
-                )
+                self.require(aggregate && !window_function, || {
+                    format!("aggregate identity {id:?} belongs to a non-aggregate call")
+                })?;
+                self.require(id.index < block.aggregate_count, || {
+                    format!("aggregate identity {id:?} is outside its block")
+                })
             }
             FunctionEvaluation::Window { id, window, filter } => {
                 let block = self.query_block(id.block)?;
-                self.require(
-                    aggregate || window_function,
-                    format!("window identity {id:?} belongs to a non-window call"),
-                )?;
-                self.require(
-                    filter.is_none() || aggregate,
-                    "FILTER belongs to a non-aggregate window function",
-                )?;
-                self.require(
-                    id.index < block.window_function_count,
-                    format!("window identity {id:?} is outside its block"),
-                )?;
+                self.require(aggregate || window_function, || {
+                    format!("window identity {id:?} belongs to a non-window call")
+                })?;
+                self.require(filter.is_none() || aggregate, || {
+                    "FILTER belongs to a non-aggregate window function"
+                })?;
+                self.require(id.index < block.window_function_count, || {
+                    format!("window identity {id:?} is outside its block")
+                })?;
                 self.require(
                     window.block == id.block && window.index < block.windows.len(),
-                    format!("resolved window {window:?} is outside its block"),
+                    || format!("resolved window {window:?} is outside its block"),
                 )
             }
         }
@@ -1895,7 +1828,7 @@ impl<'document> HirValidator<'document> {
         };
         self.require(
             !matches!(call.evaluation, FunctionEvaluation::Window { .. }),
-            "ordered-set arguments belong to a window call",
+            || "ordered-set arguments belong to a window call",
         )?;
         let expected_direct = match call.function.value() {
             crate::function::Func::Agg(crate::function::AggFunc::Mode) => 0,
@@ -1904,13 +1837,12 @@ impl<'document> HirValidator<'document> {
             ) => 1,
             _ => return self.invalid("ordered-set arguments belong to an unsupported function"),
         };
-        self.require(
-            direct.len() == expected_direct,
-            "ordered-set direct argument count does not match its function",
-        )?;
+        self.require(direct.len() == expected_direct, || {
+            "ordered-set direct argument count does not match its function"
+        })?;
         self.require(
             order_by.order == turso_parser::ast::SortOrder::Asc && order_by.nulls.is_none(),
-            "ordered-set ordering uses unsupported direction or NULLS placement",
+            || "ordered-set ordering uses unsupported direction or NULLS placement",
         )
     }
 
@@ -1919,18 +1851,16 @@ impl<'document> HirValidator<'document> {
             SubqueryExpr::Scalar { query, output } => {
                 self.visit_query(*query)?;
                 let width = self.query(*query)?.output.len();
-                self.require(
-                    *output < width,
-                    format!("scalar subquery {query} output {output} is out of range"),
-                )
+                self.require(*output < width, || {
+                    format!("scalar subquery {query} output {output} is out of range")
+                })
             }
             SubqueryExpr::Row { query } => {
                 self.visit_query(*query)?;
                 let width = self.query(*query)?.output.len();
-                self.require(
-                    width > 1,
-                    format!("row subquery {query} has scalar width {width}"),
-                )
+                self.require(width > 1, || {
+                    format!("row subquery {query} has scalar width {width}")
+                })
             }
             SubqueryExpr::Exists(query) => self.visit_query(*query),
             SubqueryExpr::In {
@@ -1942,10 +1872,9 @@ impl<'document> HirValidator<'document> {
                 self.visit_query(*query)?;
                 let lhs_width = self.expression_width(lhs)?;
                 let output_width = self.query(*query)?.output.len();
-                self.require(
-                    output_width == lhs_width,
-                    format!("IN subquery {query} has {output_width} outputs, expected {lhs_width}"),
-                )?;
+                self.require(output_width == lhs_width, || {
+                    format!("IN subquery {query} has {output_width} outputs, expected {lhs_width}")
+                })?;
                 self.visit_comparison(comparison, lhs_width, "IN-subquery comparison")
             }
         }
@@ -1960,10 +1889,9 @@ impl<'document> HirValidator<'document> {
     ) -> ValidationResult {
         let lhs_width = self.expression_width(lhs)?;
         let rhs_width = self.expression_width(rhs)?;
-        self.require(
-            lhs_width == rhs_width,
-            format!("{context} compares widths {lhs_width} and {rhs_width}"),
-        )?;
+        self.require(lhs_width == rhs_width, || {
+            format!("{context} compares widths {lhs_width} and {rhs_width}")
+        })?;
         self.visit_comparison(comparison, lhs_width, context)
     }
 
@@ -1981,13 +1909,12 @@ impl<'document> HirValidator<'document> {
         expected_width: usize,
         context: &str,
     ) -> ValidationResult {
-        self.require(
-            comparison.components.len() == expected_width,
+        self.require(comparison.components.len() == expected_width, || {
             format!(
                 "{context} has {} components, expected {expected_width}",
                 comparison.components.len()
-            ),
-        )?;
+            )
+        })?;
         for component in &comparison.components {
             self.visit_optional_catalog_object(
                 component.collation.as_ref(),
@@ -2068,16 +1995,15 @@ impl<'document> HirValidator<'document> {
         validate_stored_programs: bool,
     ) -> ValidationResult {
         self.visit_catalog_object(table, "source table")?;
-        self.require(
-            source.database == table.database(),
+        self.require(source.database == table.database(), || {
             format!(
                 "source {} and its table disagree on database identity",
                 source.id
-            ),
-        )?;
+            )
+        })?;
         self.require(
             source.columns.len() == table.value().columns().len(),
-            format!("source {} width differs from its catalog table", source.id),
+            || format!("source {} width differs from its catalog table", source.id),
         )?;
         if !validate_stored_programs {
             return Ok(());
@@ -2087,7 +2013,7 @@ impl<'document> HirValidator<'document> {
             self.require(
                 matches!(generated, ColumnReadExpression::Absent)
                     == catalog_column.generated_expr().is_none(),
-                format!(
+                || format!(
                     "source {} generated-expression slot {position} disagrees with its catalog table",
                     source.id
                 ),
@@ -2097,18 +2023,19 @@ impl<'document> HirValidator<'document> {
             let reads_default = table.value().btree().is_some() && catalog_column.default.is_some();
             self.require(
                 matches!(default, ColumnReadExpression::Absent) != reads_default,
-                format!(
+                || {
+                    format!(
                     "source {} default-expression slot {position} disagrees with its catalog table",
                     source.id
-                ),
+                )
+                },
             )?;
         }
         if let Some(constraints) = &source.check_constraints {
             let Some(table) = table.value().btree() else {
-                return self.require(
-                    constraints.is_empty(),
-                    format!("non-B-tree source {} carries CHECK metadata", source.id),
-                );
+                return self.require(constraints.is_empty(), || {
+                    format!("non-B-tree source {} carries CHECK metadata", source.id)
+                });
             };
             let require_complete = matches!(
                 &self.document.root,
@@ -2124,34 +2051,36 @@ impl<'document> HirValidator<'document> {
                     }) if insert.target == source.id
                 );
             if require_complete {
-                self.require(
-                    constraints.len() == table.check_constraints.len(),
-                    format!("source {} has incomplete INSERT CHECK metadata", source.id),
-                )?;
+                self.require(constraints.len() == table.check_constraints.len(), || {
+                    format!("source {} has incomplete INSERT CHECK metadata", source.id)
+                })?;
             }
             let mut previous = None;
             for constraint in constraints {
                 self.require(
                     constraint.catalog_position < table.check_constraints.len(),
-                    format!(
-                        "source {} CHECK position is outside its catalog table",
-                        source.id
-                    ),
+                    || {
+                        format!(
+                            "source {} CHECK position is outside its catalog table",
+                            source.id
+                        )
+                    },
                 )?;
                 self.require(
                     previous.is_none_or(|position| position < constraint.catalog_position),
-                    format!(
-                        "source {} CHECK positions are not unique and ordered",
-                        source.id
-                    ),
+                    || {
+                        format!(
+                            "source {} CHECK positions are not unique and ordered",
+                            source.id
+                        )
+                    },
                 )?;
                 previous = Some(constraint.catalog_position);
                 let catalog = &table.check_constraints[constraint.catalog_position];
                 let expected = catalog.error_description();
-                self.require(
-                    constraint.description == expected,
-                    format!("source {} CHECK descriptions are out of order", source.id),
-                )?;
+                self.require(constraint.description == expected, || {
+                    format!("source {} CHECK descriptions are out of order", source.id)
+                })?;
             }
         }
         Ok(())
@@ -2184,13 +2113,12 @@ impl<'document> HirValidator<'document> {
                         call.function.value(),
                         crate::function::Func::Scalar(crate::function::ScalarFunc::UnionValueFunc)
                     ),
-                    "union-value operation belongs to the wrong function",
+                    || "union-value operation belongs to the wrong function",
                 )?;
                 let union = union_type.value().union_def();
-                self.require(
-                    union.is_some(),
-                    "union-value operation names a non-union type",
-                )?;
+                self.require(union.is_some(), || {
+                    "union-value operation names a non-union type"
+                })?;
                 self.require(
                     union.is_some_and(|union| {
                         union
@@ -2198,12 +2126,12 @@ impl<'document> HirValidator<'document> {
                             .iter()
                             .any(|variant| variant.tag_index == *tag_index)
                     }),
-                    "union-value operation has an unknown tag index",
+                    || "union-value operation has an unknown tag index",
                 )?;
                 self.require(
                     result_name
                         .is_some_and(|name| name.eq_ignore_ascii_case(&union_type.value().name)),
-                    "union-value result type disagrees with its union",
+                    || "union-value result type disagrees with its union",
                 )
             }
             CustomTypeOperation::UnionTag {
@@ -2215,20 +2143,19 @@ impl<'document> HirValidator<'document> {
                         call.function.value(),
                         crate::function::Func::Scalar(crate::function::ScalarFunc::UnionTagFunc)
                     ),
-                    "union-tag operation belongs to the wrong function",
+                    || "union-tag operation belongs to the wrong function",
                 )?;
                 let union = union_type.value().union_def();
-                self.require(
-                    union.is_some(),
-                    "union-tag operation names a non-union type",
-                )?;
+                self.require(union.is_some(), || {
+                    "union-tag operation names a non-union type"
+                })?;
                 self.require(
                     union.is_some_and(|union| union.tag_names.as_ref() == tag_names.as_ref()),
-                    "union-tag names disagree with its union",
+                    || "union-tag names disagree with its union",
                 )?;
                 self.require(
                     call.result_type == TypeFact::known(crate::schema::Type::Text),
-                    "union-tag result is not TEXT",
+                    || "union-tag result is not TEXT",
                 )
             }
             CustomTypeOperation::UnionExtract {
@@ -2242,7 +2169,7 @@ impl<'document> HirValidator<'document> {
                             crate::function::ScalarFunc::UnionExtractFunc
                         )
                     ),
-                    "union-extract operation belongs to the wrong function",
+                    || "union-extract operation belongs to the wrong function",
                 )?;
                 let variant = union_type.value().union_def().and_then(|union| {
                     union
@@ -2250,16 +2177,15 @@ impl<'document> HirValidator<'document> {
                         .iter()
                         .find(|variant| variant.tag_index == *tag_index)
                 });
-                self.require(
-                    variant.is_some(),
-                    "union-extract operation has an unknown tag index",
-                )?;
+                self.require(variant.is_some(), || {
+                    "union-extract operation has an unknown tag index"
+                })?;
                 self.require(
                     variant.is_some_and(|variant| {
                         result_name
                             .is_some_and(|name| name.eq_ignore_ascii_case(&variant.type_name))
                     }),
-                    "union-extract result type disagrees with its variant",
+                    || "union-extract result type disagrees with its variant",
                 )
             }
             CustomTypeOperation::StructExtract {
@@ -2273,21 +2199,20 @@ impl<'document> HirValidator<'document> {
                             crate::function::ScalarFunc::StructExtractFunc
                         )
                     ),
-                    "struct-extract operation belongs to the wrong function",
+                    || "struct-extract operation belongs to the wrong function",
                 )?;
                 let field = struct_type
                     .value()
                     .struct_def()
                     .and_then(|structure| structure.fields.get(*field_index));
-                self.require(
-                    field.is_some(),
-                    "struct-extract operation has an unknown field index",
-                )?;
+                self.require(field.is_some(), || {
+                    "struct-extract operation has an unknown field index"
+                })?;
                 self.require(
                     field.is_some_and(|field| {
                         result_name.is_some_and(|name| name.eq_ignore_ascii_case(&field.type_name))
                     }),
-                    "struct-extract result type disagrees with its field",
+                    || "struct-extract result type disagrees with its field",
                 )
             }
         }
@@ -2306,14 +2231,16 @@ impl<'document> HirValidator<'document> {
                     .value()
                     .struct_def()
                     .and_then(|structure| structure.fields.get(field_index));
-                self.require(field.is_some(), "field access has an unknown struct field")?;
+                self.require(field.is_some(), || {
+                    "field access has an unknown struct field"
+                })?;
                 self.require(
                     field.is_some_and(|field| {
                         field.name.eq_ignore_ascii_case(&access.field_name)
                             && result_name
                                 .is_some_and(|name| name.eq_ignore_ascii_case(&field.type_name))
                     }),
-                    "field access disagrees with its struct field",
+                    || "field access disagrees with its struct field",
                 )
             }
             FieldAccessKind::Union { tag_index } => {
@@ -2323,17 +2250,16 @@ impl<'document> HirValidator<'document> {
                         .iter()
                         .find(|variant| variant.tag_index == tag_index)
                 });
-                self.require(
-                    variant.is_some(),
-                    "field access has an unknown union variant",
-                )?;
+                self.require(variant.is_some(), || {
+                    "field access has an unknown union variant"
+                })?;
                 self.require(
                     variant.is_some_and(|variant| {
                         variant.tag_name.eq_ignore_ascii_case(&access.field_name)
                             && result_name
                                 .is_some_and(|name| name.eq_ignore_ascii_case(&variant.type_name))
                     }),
-                    "field access disagrees with its union variant",
+                    || "field access disagrees with its union variant",
                 )
             }
         }
@@ -2354,11 +2280,11 @@ impl<'document> HirValidator<'document> {
         self.require(
             capture_changes.table.database() == Some(DatabaseId::new(crate::MAIN_DB_ID))
                 && capture_changes.table.value().btree().is_some(),
-            "change capture table is not a table of the main database",
+            || "change capture table is not a table of the main database",
         )?;
         self.require(
             !capture_changes.target_rows || capture_changes.table != *target_table,
-            "a DML target captures its own changes",
+            || "a DML target captures its own changes",
         )?;
         if let Some(sequence) = &capture_changes.change_ids {
             self.visit_sequence_operation(sequence)?;
@@ -2378,10 +2304,9 @@ impl<'document> HirValidator<'document> {
             .value()
             .btree()
             .is_some_and(|table| table.has_autoincrement);
-        self.require(
-            target_has_autoincrement == autoincrement.is_some(),
-            "AUTOINCREMENT metadata disagrees with its target",
-        )?;
+        self.require(target_has_autoincrement == autoincrement.is_some(), || {
+            "AUTOINCREMENT metadata disagrees with its target"
+        })?;
         let Some(autoincrement) = autoincrement else {
             return Ok(());
         };
@@ -2391,7 +2316,7 @@ impl<'document> HirValidator<'document> {
         )?;
         self.require(
             autoincrement.sqlite_sequence.database() == target_table.database(),
-            "DML target and sqlite_sequence belong to different databases",
+            || "DML target and sqlite_sequence belong to different databases",
         )?;
         self.require(
             autoincrement
@@ -2399,13 +2324,13 @@ impl<'document> HirValidator<'document> {
                 .value()
                 .get_name()
                 .eq_ignore_ascii_case(crate::schema::SQLITE_SEQUENCE_TABLE_NAME),
-            "AUTOINCREMENT metadata carries the wrong sqlite_sequence table",
+            || "AUTOINCREMENT metadata carries the wrong sqlite_sequence table",
         )?;
         if let Some(sequence) = &autoincrement.mvcc_sequence {
             self.visit_sequence_operation(sequence)?;
             self.require(
                 sequence.sqlite_sequence.as_ref() == Some(&autoincrement.sqlite_sequence),
-                "MVCC AUTOINCREMENT sequence disagrees with sqlite_sequence",
+                || "MVCC AUTOINCREMENT sequence disagrees with sqlite_sequence",
             )?;
         }
         Ok(())
@@ -2419,30 +2344,29 @@ impl<'document> HirValidator<'document> {
                 operation.backing_table.value(),
                 crate::schema::Table::BTree(_)
             ),
-            "sequence backing table is not a B-tree table",
+            || "sequence backing table is not a B-tree table",
         )?;
         if let Some(sqlite_sequence) = &operation.sqlite_sequence {
             self.visit_catalog_object(sqlite_sequence, "sqlite_sequence table")?;
             self.require(
                 matches!(sqlite_sequence.value(), crate::schema::Table::BTree(_)),
-                "sqlite_sequence is not a B-tree table",
+                || "sqlite_sequence is not a B-tree table",
             )?;
         }
         let database = operation
             .sequence
             .database()
             .ok_or_else(|| HirValidationError::new("sequence has no owning database"))?;
-        self.require(
-            operation.backing_table.database() == Some(database),
-            "sequence and backing table belong to different databases",
-        )?;
+        self.require(operation.backing_table.database() == Some(database), || {
+            "sequence and backing table belong to different databases"
+        })?;
         self.require(
             operation
                 .sequence
                 .value()
                 .name
                 .eq_ignore_ascii_case(&operation.normalized_name),
-            "sequence descriptor name disagrees with resolved name",
+            || "sequence descriptor name disagrees with resolved name",
         )?;
         let expected_backing =
             crate::translate::sequence::sequence_backing_table_name(&operation.normalized_name);
@@ -2452,19 +2376,18 @@ impl<'document> HirValidator<'document> {
                 .value()
                 .get_name()
                 .eq_ignore_ascii_case(&expected_backing),
-            "sequence backing table name disagrees with resolved name",
+            || "sequence backing table name disagrees with resolved name",
         )?;
         if let Some(sqlite_sequence) = &operation.sqlite_sequence {
-            self.require(
-                sqlite_sequence.database() == Some(database),
-                "sequence and sqlite_sequence belong to different databases",
-            )?;
+            self.require(sqlite_sequence.database() == Some(database), || {
+                "sequence and sqlite_sequence belong to different databases"
+            })?;
             self.require(
                 sqlite_sequence
                     .value()
                     .get_name()
                     .eq_ignore_ascii_case(crate::schema::SQLITE_SEQUENCE_TABLE_NAME),
-                "sequence operation carries the wrong sqlite_sequence table",
+                || "sequence operation carries the wrong sqlite_sequence table",
             )?;
         }
         Ok(())
@@ -2485,35 +2408,32 @@ impl<'document> HirValidator<'document> {
                 call.function.value(),
                 crate::function::Func::Scalar(function) if function == &expected
             ),
-            "sequence operation belongs to the wrong function",
+            || "sequence operation belongs to the wrong function",
         )?;
         self.require(
             matches!(call.evaluation, FunctionEvaluation::Scalar),
-            "sequence operation is not scalar",
+            || "sequence operation is not scalar",
         )?;
         self.require(
             call.result_type == TypeFact::known(crate::schema::Type::Integer),
-            "sequence function result is not INTEGER",
+            || "sequence function result is not INTEGER",
         )
     }
 
     fn visit_type_fact(&self, fact: &TypeFact) -> ValidationResult {
         if fact.array_dimensions > 0 {
-            self.require(
-                fact.storage == Some(crate::schema::Type::Blob),
-                "array type fact does not use BLOB runtime storage",
-            )?;
+            self.require(fact.storage == Some(crate::schema::Type::Blob), || {
+                "array type fact does not use BLOB runtime storage"
+            })?;
         }
         if let Some(declared) = &fact.declared {
-            self.require(
-                declared.array_dimensions == fact.array_dimensions,
-                "declared type rank disagrees with its type fact",
-            )?;
+            self.require(declared.array_dimensions == fact.array_dimensions, || {
+                "declared type rank disagrees with its type fact"
+            })?;
             if fact.array_dimensions == 0 {
-                self.require(
-                    fact.storage == Some(declared.storage),
-                    "declared scalar storage disagrees with its type fact",
-                )?;
+                self.require(fact.storage == Some(declared.storage), || {
+                    "declared scalar storage disagrees with its type fact"
+                })?;
             }
             for resolved_type in &declared.custom_chain {
                 self.visit_catalog_object(resolved_type, "declared type")?;
@@ -2527,10 +2447,9 @@ impl<'document> HirValidator<'document> {
         object: &CatalogObject<T>,
         description: &str,
     ) -> ValidationResult {
-        self.require(
-            object.snapshot() == self.document.snapshot,
-            format!("{description} belongs to a different catalog snapshot"),
-        )?;
+        self.require(object.snapshot() == self.document.snapshot, || {
+            format!("{description} belongs to a different catalog snapshot")
+        })?;
         if let Some(database) = object.database() {
             self.require_database(database)?;
         }
@@ -2553,10 +2472,12 @@ impl<'document> HirValidator<'document> {
                 .databases
                 .iter()
                 .any(|snapshot| snapshot.database == database),
-            format!(
-                "database {} is absent from the catalog snapshot",
-                database.index()
-            ),
+            || {
+                format!(
+                    "database {} is absent from the catalog snapshot",
+                    database.index()
+                )
+            },
         )
     }
 
@@ -2580,7 +2501,7 @@ impl<'document> HirValidator<'document> {
                 &self.source(source)?.index_coverage,
                 IndexCoverage::Complete { .. }
             ),
-            format!("DML source {source} does not carry complete index metadata"),
+            || format!("DML source {source} does not carry complete index metadata"),
         )
     }
 
@@ -2599,7 +2520,7 @@ impl<'document> HirValidator<'document> {
         ] {
             self.require(
                 !matches!(expression, ColumnReadExpression::NotRequired),
-                format!("source {source} column {column} requires an unplanned {description}"),
+                || format!("source {source} column {column} requires an unplanned {description}"),
             )?;
         }
         let type_fact = &source_definition.columns[column].type_fact;
@@ -2621,10 +2542,9 @@ impl<'document> HirValidator<'document> {
             SourceKind::Pseudo { .. } => !has_type_programs || has_custom_type(type_fact),
             _ => has_type_programs == needs_type_programs,
         };
-        self.require(
-            complete,
-            format!("source {source} column {column} has incomplete type programs"),
-        )?;
+        self.require(complete, || {
+            format!("source {source} column {column} has incomplete type programs")
+        })?;
         if let Some(programs) = &source_definition.column_type_programs[column] {
             let chain = type_fact
                 .declared
@@ -2636,7 +2556,7 @@ impl<'document> HirValidator<'document> {
                         .iter()
                         .filter(|definition| definition.value().encode().is_some())
                         .count(),
-                format!("source {source} column {column} has incomplete ENCODE programs"),
+                || format!("source {source} column {column} has incomplete ENCODE programs"),
             )?;
             self.require(
                 programs.decode.len()
@@ -2644,24 +2564,22 @@ impl<'document> HirValidator<'document> {
                         .iter()
                         .filter(|definition| definition.value().decode().is_some())
                         .count(),
-                format!("source {source} column {column} has incomplete DECODE programs"),
+                || format!("source {source} column {column} has incomplete DECODE programs"),
             )?;
             let expected_encode_nulls = type_fact.array_dimensions == 0
                 && chain.iter().any(|definition| definition.value().not_null);
-            self.require(
-                programs.encode_nulls == expected_encode_nulls,
-                format!("source {source} column {column} has incorrect NULL encoding metadata"),
-            )?;
+            self.require(programs.encode_nulls == expected_encode_nulls, || {
+                format!("source {source} column {column} has incorrect NULL encoding metadata")
+            })?;
         }
         Ok(())
     }
 
     fn validate_column_position(&self, source: SourceId, position: usize) -> ValidationResult {
         let width = self.source(source)?.columns.len();
-        self.require(
-            position < width,
-            format!("source {source} column {position} is out of range for width {width}"),
-        )
+        self.require(position < width, || {
+            format!("source {source} column {position} is out of range for width {width}")
+        })
     }
 
     fn query(&self, id: QueryId) -> ValidationResult<&Query> {
@@ -2688,11 +2606,17 @@ impl<'document> HirValidator<'document> {
             .ok_or_else(|| HirValidationError::new(format!("CTE {id} does not exist")))
     }
 
-    fn require(&self, condition: bool, message: impl Into<String>) -> ValidationResult {
+    /// `message` is built only when the check fails: validation runs on
+    /// every prepared statement, and nearly every check passes.
+    fn require<M: Into<String>>(
+        &self,
+        condition: bool,
+        message: impl FnOnce() -> M,
+    ) -> ValidationResult {
         if condition {
             Ok(())
         } else {
-            Err(HirValidationError::new(message))
+            Err(HirValidationError::new(message()))
         }
     }
 
@@ -2718,6 +2642,23 @@ mod tests {
             schema_programs: Vec::new(),
             cdc: None,
         }
+    }
+
+    #[test]
+    fn passing_check_does_not_build_its_message() {
+        let document = empty_document(Vec::new());
+        let validator = HirValidator::new(&document);
+
+        validator
+            .require(true, || -> String {
+                panic!("message built for a passing check")
+            })
+            .expect("a passing check validates");
+
+        let error = validator
+            .require(false, || format!("check {} failed", 7))
+            .expect_err("a failing check does not validate");
+        assert_eq!(error.to_string(), "check 7 failed");
     }
 
     #[test]
