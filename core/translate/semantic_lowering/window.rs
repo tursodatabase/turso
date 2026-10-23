@@ -1,5 +1,6 @@
 //! Window-buffer planning from resolved HIR.
 
+use crate::alloc::TursoIteratorExt;
 use std::ops::ControlFlow;
 
 use smallvec::SmallVec;
@@ -790,19 +791,19 @@ fn hir_window_buffer_table(window: hir::WindowId, column_count: usize) -> Arc<BT
                 ColDef::default(),
             )
         })
-        .collect();
+        .collect_vec();
     Arc::new(BTreeTable::new(
         0,
         format!(
             "window_buffer_{}_{}_{}",
             window.block.query, window.block.index, window.index
         ),
-        Vec::new(),
+        crate::alloc::vec![],
         columns,
         BTreeCharacteristics::HAS_ROWID,
-        Vec::new(),
-        Vec::new(),
-        Vec::new(),
+        crate::alloc::vec![],
+        crate::alloc::vec![],
+        crate::alloc::vec![],
         None,
     ))
 }

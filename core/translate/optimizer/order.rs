@@ -866,8 +866,8 @@ mod tests {
         let table = Table::BTree(Arc::new(BTreeTable::new(
             2,
             "items".to_string(),
-            vec![],
-            vec![Column::new(
+            crate::alloc::vec![],
+            crate::alloc::vec![Column::new(
                 Some("value".to_string()),
                 "INTEGER".to_string(),
                 None,
@@ -877,9 +877,9 @@ mod tests {
                 ColDef::default(),
             )],
             BTreeCharacteristics::HAS_ROWID,
-            vec![],
-            vec![],
-            vec![],
+            crate::alloc::vec![],
+            crate::alloc::vec![],
+            crate::alloc::vec![],
             None,
         )));
         let resolved_table = CatalogObject::new(
@@ -904,7 +904,7 @@ mod tests {
                 name: "items_plus_one".to_string(),
                 table_name: "items".to_string(),
                 root_page: 3,
-                columns: vec![IndexColumn::new("value + 1", 0)],
+                columns: crate::alloc::vec![IndexColumn::new("value + 1", 0)],
                 unique: false,
                 ephemeral: false,
                 has_rowid: true,

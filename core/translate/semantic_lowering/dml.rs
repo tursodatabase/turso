@@ -1,5 +1,6 @@
 //! Lowering shared by HIR DELETE and UPDATE.
 
+use crate::alloc::TursoIteratorExt;
 use turso_parser::ast;
 
 use crate::{
@@ -654,7 +655,7 @@ impl<'a> ReturningBuffer<'a> {
         let table = Arc::new(BTreeTable::new(
             0,
             "returning_scratch".to_string(),
-            Vec::new(),
+            crate::alloc::vec![],
             (0..returning.outputs.len())
                 .map(|column| {
                     crate::schema::Column::new(
@@ -667,11 +668,11 @@ impl<'a> ReturningBuffer<'a> {
                         crate::schema::ColDef::default(),
                     )
                 })
-                .collect(),
+                .collect_vec(),
             crate::schema::BTreeCharacteristics::HAS_ROWID,
-            Vec::new(),
-            Vec::new(),
-            Vec::new(),
+            crate::alloc::vec![],
+            crate::alloc::vec![],
+            crate::alloc::vec![],
             None,
         ));
         Self::open(program, &table, Some(returning))
@@ -882,7 +883,7 @@ fn type_check_table(
     for (position, column) in checked.columns_mut().iter_mut().enumerate() {
         edit(position, column);
     }
-    checked.logical_to_physical_map = (0..table.columns().len()).collect();
+    checked.logical_to_physical_map = (0..table.columns().len()).collect_vec();
     Arc::new(checked)
 }
 

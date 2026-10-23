@@ -65,7 +65,7 @@ pub(crate) struct PlannedSelect {
     plan: Arc<HirPlan>,
     query: hir::QueryId,
     /// Outputs computed with custom-typed columns read as stored.
-    stored_outputs: Vec<usize>,
+    stored_outputs: crate::alloc::Vec<usize>,
 }
 
 /// One value a schema statement reads from each row of a table.
@@ -97,7 +97,7 @@ impl PlannedSelect {
         Ok(Self {
             plan,
             query,
-            stored_outputs: Vec::new(),
+            stored_outputs: crate::alloc::vec![],
         })
     }
 
@@ -123,7 +123,7 @@ impl PlannedSelect {
         context: &SemanticContext<'_>,
         connection: &Arc<Connection>,
     ) -> Result<Self> {
-        let mut stored_outputs = Vec::new();
+        let mut stored_outputs = crate::alloc::vec![];
         let mut rowid_outputs = Vec::new();
         let columns = values
             .into_iter()

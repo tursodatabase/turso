@@ -151,7 +151,7 @@ impl<'ast> Analyzer<'_, '_, 'ast> {
                     if child_key_changed || parent_key_changed {
                         schema.resolved_fks_for_child(name, Some(updated))?
                     } else {
-                        Vec::new()
+                        crate::alloc::vec![]
                     }
                 }
                 None => schema.resolved_fks_for_child(name, None)?,

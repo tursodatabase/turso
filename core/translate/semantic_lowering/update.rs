@@ -7,6 +7,7 @@
 //! FROM clause, collects its rows first. An UPDATE of a virtual table hands
 //! each row to the table with `VUpdate`.
 
+use crate::alloc::TursoIteratorExt;
 use std::num::NonZeroUsize;
 
 use turso_parser::ast::{ResolveType, TriggerTime};
@@ -371,7 +372,7 @@ pub(super) fn emit_update(
             let table = crate::sync::Arc::new(crate::schema::BTreeTable::new(
                 0,
                 "update_from_scratch".to_string(),
-                Vec::new(),
+                crate::alloc::vec![],
                 (0..width)
                     // BLOB affinity keeps the values as computed; the
                     // column's affinity is applied when the row is built.
@@ -386,11 +387,11 @@ pub(super) fn emit_update(
                             crate::schema::ColDef::default(),
                         )
                     })
-                    .collect(),
+                    .collect_vec(),
                 crate::schema::BTreeCharacteristics::HAS_ROWID,
-                Vec::new(),
-                Vec::new(),
-                Vec::new(),
+                crate::alloc::vec![],
+                crate::alloc::vec![],
+                crate::alloc::vec![],
                 None,
             ));
             Ok(program.alloc_cursor_id(CursorType::BTreeTable(table)))
@@ -530,7 +531,7 @@ fn emit_virtual_update(
         let table = crate::sync::Arc::new(crate::schema::BTreeTable::new(
             0,
             "update_from_scratch".to_string(),
-            Vec::new(),
+            crate::alloc::vec![],
             (0..columns + 2)
                 .map(|column| {
                     crate::schema::Column::new(
@@ -543,11 +544,11 @@ fn emit_virtual_update(
                         crate::schema::ColDef::default(),
                     )
                 })
-                .collect(),
+                .collect_vec(),
             crate::schema::BTreeCharacteristics::HAS_ROWID,
-            Vec::new(),
-            Vec::new(),
-            Vec::new(),
+            crate::alloc::vec![],
+            crate::alloc::vec![],
+            crate::alloc::vec![],
             None,
         ));
         let cursor = program.alloc_cursor_id(CursorType::BTreeTable(table));
@@ -2302,7 +2303,7 @@ mod tests {
                 name: "items_value".to_string(),
                 table_name: "items".to_string(),
                 root_page: 3,
-                columns: vec![IndexColumn {
+                columns: crate::alloc::vec![IndexColumn {
                     name: "value".to_string(),
                     order: SortOrder::Asc,
                     nulls_order: None,

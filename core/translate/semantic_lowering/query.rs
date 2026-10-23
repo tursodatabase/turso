@@ -1,5 +1,6 @@
 //! Runtime destination preparation for resolved HIR queries.
 
+use crate::alloc::TursoIteratorExt;
 use std::ops::ControlFlow;
 use turso_parser::ast::{CompoundOperator, Distinctness, Literal, NullsOrder, SortOrder};
 
@@ -811,7 +812,9 @@ pub(crate) fn prepare_subquery(
                         expr: None,
                     })
                 })
-                .collect::<Result<Vec<_>>>()?;
+                .collect::<Result<Vec<_>>>()?
+                .into_iter()
+                .collect_vec();
             let affinity_str = comparison
                 .components
                 .iter()
@@ -1020,7 +1023,7 @@ fn emit_cached_subquery(
             default: None,
             expr: None,
         })
-        .collect();
+        .collect_vec();
     let index = Arc::new(Index {
         columns,
         name: format!("ephemeral_subquery_cache_{}", prepared.query.index()),
@@ -1932,11 +1935,11 @@ fn initialize_hir_group_runtime<'a>(
                     nulls,
                 )
             })
-            .collect();
+            .collect_vec();
         let comparators = key_order
             .iter()
             .map(|key| custom_type_comparator_from_type_fact(&grouping.key_type_facts[*key]))
-            .collect();
+            .collect_vec();
         let cursor = program.alloc_cursor_id(CursorType::Sorter);
         program.emit_insn(Insn::SorterOpen {
             data: Box::new(SorterOpenData {
@@ -2777,7 +2780,7 @@ fn open_hir_compound_index(
             left.id, right.id
         )));
     }
-    let mut columns = Vec::with_capacity(left.outputs.len());
+    let mut columns = crate::alloc::vec![];
     for (position, (left, right)) in left.outputs.iter().zip(&right.outputs).enumerate() {
         columns.push(IndexColumn {
             name: left.name.clone(),
@@ -2930,8 +2933,8 @@ fn emit_hir_compound_order_by(
 ) -> Result<()> {
     let output_count = query.blocks[0].outputs.len();
     let mut order_positions = Vec::with_capacity(query.order_by.len());
-    let mut order_collations_nulls = Vec::with_capacity(query.order_by.len() + 1);
-    let mut comparators = Vec::with_capacity(query.order_by.len() + 1);
+    let mut order_collations_nulls = crate::alloc::vec![];
+    let mut comparators = crate::alloc::vec![];
     for term in &query.order_by {
         let position = hir_compound_order_position(query, &term.expr)?;
         order_positions.push(position);
@@ -4041,7 +4044,7 @@ fn open_hir_ordered_arguments(
                 term.collation.as_ref().map(|collation| *collation.value()),
             )
         })
-        .collect::<Vec<_>>();
+        .collect_vec();
     for position in order_by.len()..order_by.len() + 1 + values {
         columns.push(column(position, SortOrder::Asc, None, None));
     }
@@ -5547,8 +5550,8 @@ fn hir_matched_rows_table(source: &hir::Source) -> Arc<BTreeTable> {
     Arc::new(BTreeTable::new(
         0,
         format!("{}_matched_rows", source.name),
-        Vec::new(),
-        vec![Column::new(
+        crate::alloc::vec![],
+        crate::alloc::vec![Column::new(
             Some("matched".to_string()),
             "BLOB".to_string(),
             None,
@@ -5558,9 +5561,9 @@ fn hir_matched_rows_table(source: &hir::Source) -> Arc<BTreeTable> {
             ColDef::default(),
         )],
         BTreeCharacteristics::HAS_ROWID,
-        Vec::new(),
-        Vec::new(),
-        Vec::new(),
+        crate::alloc::vec![],
+        crate::alloc::vec![],
+        crate::alloc::vec![],
         None,
     ))
 }
@@ -5572,7 +5575,7 @@ fn open_hir_primary_key_matched_set(
     table: &BTreeTable,
 ) -> Result<(CursorID, HirMatchedKey)> {
     let mut positions = Vec::with_capacity(table.primary_key_columns.len());
-    let mut columns = Vec::with_capacity(table.primary_key_columns.len());
+    let mut columns = crate::alloc::vec![];
     for (name, order) in &table.primary_key_columns {
         let (position, column) = table.get_column(name).ok_or_else(|| {
             LimboError::InternalError(format!(
@@ -6538,7 +6541,7 @@ fn prepare_hir_coroutine_loop<'a>(
     program.preassign_label_to_next_insn(start);
     let destination = QueryDestination::CoroutineYield {
         yield_reg,
-        stored_outputs: Vec::new(),
+        stored_outputs: crate::alloc::vec![],
     };
     let row = match &planned_loop.access {
         HirSourceAccess::Derived { query, .. } | HirSourceAccess::Cte { query, .. } => {
@@ -6840,16 +6843,16 @@ fn prepare_hir_hash_build_input<'a>(
         .map(|key| format!("key_{key}"))
         .chain((0..width).map(|slot| format!("payload_{slot}")))
         .map(|name| Column::new_default_text(Some(name), "BLOB".to_string(), None))
-        .collect();
+        .collect_vec();
     let table = Arc::new(BTreeTable::new(
         0,
         "hash_build_input".to_string(),
-        Vec::new(),
+        crate::alloc::vec![],
         columns,
         BTreeCharacteristics::HAS_ROWID,
-        Vec::new(),
-        Vec::new(),
-        Vec::new(),
+        crate::alloc::vec![],
+        crate::alloc::vec![],
+        crate::alloc::vec![],
         None,
     ));
     Ok((
@@ -8367,16 +8370,16 @@ fn hir_materialized_table(source: &hir::Source) -> Arc<BTreeTable> {
                 },
             )
         })
-        .collect();
+        .collect_vec();
     Arc::new(BTreeTable::new(
         0,
         source.name.clone(),
-        Vec::new(),
+        crate::alloc::vec![],
         columns,
         BTreeCharacteristics::HAS_ROWID,
-        Vec::new(),
-        Vec::new(),
-        Vec::new(),
+        crate::alloc::vec![],
+        crate::alloc::vec![],
+        crate::alloc::vec![],
         None,
     ))
 }
@@ -9187,8 +9190,8 @@ fn initialize_hir_sorter<'a>(
     }
 
     let mut key_sources = Vec::with_capacity(query.order_by.len());
-    let mut order_collations_nulls = Vec::with_capacity(query.order_by.len());
-    let mut comparators = Vec::with_capacity(query.order_by.len());
+    let mut order_collations_nulls = crate::alloc::vec![];
+    let mut comparators = crate::alloc::vec![];
     for term in &query.order_by {
         let output = hir_order_output_position(block, &term.expr);
         let custom = term
@@ -10200,11 +10203,11 @@ fn open_hir_window_input_sorter(
     let mut order_collations_nulls = keys
         .iter()
         .map(|key| (key.order, key.collation, key.nulls))
-        .collect::<Vec<_>>();
+        .collect_vec();
     let mut comparators = keys
         .iter()
         .map(|key| custom_type_comparator_from_type_fact(key.type_fact))
-        .collect::<Vec<_>>();
+        .collect_vec();
     if sequence {
         order_collations_nulls.push((SortOrder::Asc, Some(CollationSeq::default()), None));
         comparators.push(None);
@@ -10566,7 +10569,7 @@ pub(super) mod tests {
                 name: "items_value".to_string(),
                 table_name: "items".to_string(),
                 root_page: 3,
-                columns: vec![IndexColumn {
+                columns: crate::alloc::vec![IndexColumn {
                     name: "value".to_string(),
                     order: SortOrder::Asc,
                     nulls_order: None,
@@ -10633,7 +10636,7 @@ pub(super) mod tests {
                 name: "right_items_value".to_string(),
                 table_name: "right_items".to_string(),
                 root_page: 4,
-                columns: vec![IndexColumn {
+                columns: crate::alloc::vec![IndexColumn {
                     name: "value".to_string(),
                     order: SortOrder::Asc,
                     nulls_order: None,

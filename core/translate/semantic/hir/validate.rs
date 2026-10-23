@@ -2766,7 +2766,7 @@ mod tests {
                 Arc::new(crate::schema::Table::RecursiveCteInput(Arc::new(
                     crate::schema::RecursiveCteInput {
                         name: name.to_string(),
-                        columns: Vec::new(),
+                        columns: crate::alloc::vec![],
                     },
                 ))),
             )

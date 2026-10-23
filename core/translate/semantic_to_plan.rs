@@ -4363,7 +4363,7 @@ mod tests {
     use turso_parser::ast::{CompoundOperator, Materialized, NullsOrder, Operator, SortOrder};
 
     fn resolved_table(name: &str) -> hir::ResolvedTable {
-        let columns = vec![
+        let columns = crate::alloc::vec![
             Column::new(
                 Some("first".to_string()),
                 "INTEGER".to_string(),
@@ -4386,12 +4386,12 @@ mod tests {
         let table = Table::BTree(Arc::new(BTreeTable::new(
             2,
             name.to_string(),
-            vec![],
+            crate::alloc::vec![],
             columns,
             BTreeCharacteristics::HAS_ROWID,
-            vec![],
-            vec![],
-            vec![],
+            crate::alloc::vec![],
+            crate::alloc::vec![],
+            crate::alloc::vec![],
             None,
         )));
         CatalogObject::new(
@@ -4681,7 +4681,7 @@ mod tests {
             name: "items_second".to_string(),
             table_name: "items".to_string(),
             root_page: 3,
-            columns: Vec::new(),
+            columns: crate::alloc::vec![],
             unique: false,
             ephemeral: false,
             has_rowid: true,
@@ -4719,7 +4719,7 @@ mod tests {
                 name: "items_sum".to_string(),
                 table_name: "items".to_string(),
                 root_page: 3,
-                columns: Vec::new(),
+                columns: crate::alloc::vec![],
                 unique: false,
                 ephemeral: false,
                 has_rowid: true,

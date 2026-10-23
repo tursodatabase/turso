@@ -6441,7 +6441,7 @@ mod tests {
             name: "items_value".to_string(),
             table_name: "items".to_string(),
             root_page: 3,
-            columns: vec![IndexColumn {
+            columns: crate::alloc::vec![IndexColumn {
                 name: "value".to_string(),
                 order: SortOrder::Asc,
                 nulls_order: None,
@@ -6629,11 +6629,13 @@ mod tests {
 
         let union_type =
             resolved_type(crate::schema::TypeDefKind::Union(crate::schema::UnionDef {
-                variants: Vec::new(),
+                variants: crate::alloc::vec![],
                 tag_names: crate::sync::Arc::from(Vec::<String>::new()),
             }));
         let struct_type = resolved_type(crate::schema::TypeDefKind::Struct(
-            crate::schema::StructDef { fields: Vec::new() },
+            crate::schema::StructDef {
+                fields: crate::alloc::vec![],
+            },
         ));
         let runtime_value = || hir::Expr::Literal(Literal::Numeric("7".to_string()));
         let semantic_name = || hir::Expr::Literal(Literal::String("'ignored'".to_string()));
@@ -7792,13 +7794,15 @@ mod tests {
             (
                 hir::FieldAccessKind::Struct { field_index: 7 },
                 resolved_type(crate::schema::TypeDefKind::Struct(
-                    crate::schema::StructDef { fields: Vec::new() },
+                    crate::schema::StructDef {
+                        fields: crate::alloc::vec![],
+                    },
                 )),
             ),
             (
                 hir::FieldAccessKind::Union { tag_index: 3 },
                 resolved_type(crate::schema::TypeDefKind::Union(crate::schema::UnionDef {
-                    variants: Vec::new(),
+                    variants: crate::alloc::vec![],
                     tag_names: crate::sync::Arc::from(Vec::<String>::new()),
                 })),
             ),
@@ -7841,11 +7845,13 @@ mod tests {
     #[test]
     fn nested_field_access_writes_each_result_into_its_parent_register() {
         let struct_type = resolved_type(crate::schema::TypeDefKind::Struct(
-            crate::schema::StructDef { fields: Vec::new() },
+            crate::schema::StructDef {
+                fields: crate::alloc::vec![],
+            },
         ));
         let union_type =
             resolved_type(crate::schema::TypeDefKind::Union(crate::schema::UnionDef {
-                variants: Vec::new(),
+                variants: crate::alloc::vec![],
                 tag_names: crate::sync::Arc::from(Vec::<String>::new()),
             }));
         let expression = hir::Expr::FieldAccess(hir::FieldAccess {
@@ -7891,7 +7897,9 @@ mod tests {
     #[test]
     fn nested_field_access_lowering_does_not_use_the_call_stack() {
         let container_type = resolved_type(crate::schema::TypeDefKind::Struct(
-            crate::schema::StructDef { fields: Vec::new() },
+            crate::schema::StructDef {
+                fields: crate::alloc::vec![],
+            },
         ));
         let mut expression = hir::Expr::Literal(Literal::Numeric("1".to_string()));
         for _ in 0..10_000 {

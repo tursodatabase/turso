@@ -1919,6 +1919,7 @@ fn hir_expr_needs_no_affinity_change(affinity: Affinity, expression: &hir::Expr)
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::alloc::TursoIteratorExt;
     use crate::schema::Table;
 
     fn empty_hir_document(source: hir::SourceId) -> hir::HirDocument {
@@ -2046,12 +2047,12 @@ mod tests {
         crate::schema::Table::BTree(Arc::new(crate::schema::BTreeTable::new(
             1,
             "items".into(),
-            Vec::new(),
-            columns,
+            crate::alloc::vec![],
+            columns.into_iter().collect_vec(),
             crate::schema::BTreeCharacteristics::HAS_ROWID,
-            Vec::new(),
-            Vec::new(),
-            Vec::new(),
+            crate::alloc::vec![],
+            crate::alloc::vec![],
+            crate::alloc::vec![],
             None,
         )))
     }
@@ -2798,7 +2799,7 @@ mod tests {
             name: "items_a".into(),
             table_name: "items".into(),
             root_page: 2,
-            columns: vec![crate::schema::IndexColumn::new("a", 0)],
+            columns: crate::alloc::vec![crate::schema::IndexColumn::new("a", 0)],
             unique: false,
             ephemeral: false,
             has_rowid: true,
@@ -2867,7 +2868,7 @@ mod tests {
             name: "items_sum".into(),
             table_name: "items".into(),
             root_page: 2,
-            columns: vec![crate::schema::IndexColumn {
+            columns: crate::alloc::vec![crate::schema::IndexColumn {
                 name: "a + b".into(),
                 order: SortOrder::Asc,
                 nulls_order: None,
@@ -3026,7 +3027,7 @@ mod tests {
             name: "items_a_partial".into(),
             table_name: "items".into(),
             root_page: 2,
-            columns: vec![crate::schema::IndexColumn::new("a", 0)],
+            columns: crate::alloc::vec![crate::schema::IndexColumn::new("a", 0)],
             unique: false,
             ephemeral: false,
             has_rowid: true,

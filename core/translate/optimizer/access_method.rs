@@ -1561,7 +1561,7 @@ fn hir_materialized_subquery_ephemeral_index(
         .copied()
         .chain((0..source.columns.len()).filter(|position| !key_col_positions.contains(position)))
         .map(index_column)
-        .collect();
+        .try_collect()?;
     Ok(Arc::new(Index {
         name: format!("ephemeral_subquery_{}", source.id),
         columns,
