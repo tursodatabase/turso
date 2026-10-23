@@ -2717,6 +2717,18 @@ pub fn determine_where_to_eval_term(
     Ok(eval_at)
 }
 
+pub fn on_term_of_outer_join_outside_plan(
+    term: &WhereTerm,
+    join_order: &[JoinOrderMember],
+    table_references: Option<&TableReferences>,
+) -> bool {
+    term.origin.join_origin().is_some_and(|origin| {
+        origin.is_outer()
+            && loop_index_for_table_row(origin.right_table(), join_order, table_references)
+                .is_none()
+    })
+}
+
 /// A bitmask representing a set of tables in a query plan.
 /// Tables are numbered by their index in [SelectPlan::joined_tables].
 /// In the bitmask, the first bit is unused so that a mask with all zeros
