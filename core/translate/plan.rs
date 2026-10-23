@@ -3870,6 +3870,7 @@ pub struct IndexMethodQuery {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Aggregate {
+    pub order_cursor: Option<usize>,
     pub func: AggFunc,
     pub args: Vec<ast::Expr>,
     pub original_expr: ast::Expr,
@@ -3890,6 +3891,7 @@ impl Aggregate {
         filter_expr: Option<ast::Expr>,
     ) -> Self {
         Aggregate {
+            order_cursor: None,
             func,
             args: args.iter().map(|arg| *arg.clone()).collect(),
             original_expr: expr.clone(),
@@ -3907,6 +3909,13 @@ impl Aggregate {
             ast::Expr::FunctionCall { order_by, .. } => order_by,
             _ => &[],
         }
+    }
+
+    pub fn distinct_uses_order_key(&self) -> bool {
+        self.is_distinct()
+            && self.args.len() == 1
+            && self.order_by().len() == 1
+            && exprs_are_equivalent(&self.args[0], &self.order_by()[0].expr)
     }
 
     pub fn input_exprs(&self) -> impl Iterator<Item = &ast::Expr> {

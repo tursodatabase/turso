@@ -499,7 +499,7 @@ pub fn bind_and_rewrite_expr<'a>(
                     }
                 }
                 Expr::FunctionCallStar { name, filter_over } => {
-                    validate_function_tail(name.as_str(), 0, filter_over, resolver)?;
+                    validate_function_tail(name.as_str(), 0, filter_over, false, resolver)?;
                     // For functions that need star expansion (json_object, jsonb_object),
                     // expand the * to all columns from the referenced tables as key-value pairs
                     // This needs to happen during bind/rewrite so WHERE clauses can use these functions
@@ -574,9 +574,16 @@ pub fn bind_and_rewrite_expr<'a>(
                     name,
                     args,
                     filter_over,
+                    order_by,
                     ..
                 } => {
-                    validate_function_tail(name.as_str(), args.len(), filter_over, resolver)?;
+                    validate_function_tail(
+                        name.as_str(),
+                        args.len(),
+                        filter_over,
+                        !order_by.is_empty(),
+                        resolver,
+                    )?;
                     validate_custom_type_function_call(name.as_str(), args, resolver)?;
                 }
                 _ => {}
@@ -587,18 +594,22 @@ pub fn bind_and_rewrite_expr<'a>(
     Ok(())
 }
 
-fn validate_function_tail(
+pub(crate) fn validate_function_tail(
     name: &str,
     arg_count: usize,
     filter_over: &ast::FunctionTail,
+    has_order_by: bool,
     resolver: &Resolver,
 ) -> Result<()> {
-    if filter_over.filter_clause.is_none() && filter_over.over_clause.is_none() {
+    if !has_order_by && filter_over.filter_clause.is_none() && filter_over.over_clause.is_none() {
         return Ok(());
     }
     match resolver.resolve_function(name, arg_count)? {
         Some(Func::Agg(_) | Func::Window(_)) | None => Ok(()),
         Some(Func::External(func)) if func.func.is_aggregate() => Ok(()),
+        _ if has_order_by => {
+            crate::bail_parse_error!("ORDER BY may not be used with non-aggregate {}()", name)
+        }
         _ if filter_over.over_clause.is_some() => {
             crate::bail_parse_error!("{} may not be used as a window function", name)
         }

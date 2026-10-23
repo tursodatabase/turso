@@ -871,6 +871,7 @@ fn detect_simple_aggregate(plan: &SelectPlan) -> Option<SimpleAggregate> {
         || plan.group_by.is_some()
         || plan.contains_constant_false_condition
         || plan.aggregates.first().unwrap().filter_expr.is_some()
+        || !plan.aggregates.first().unwrap().order_by().is_empty()
     {
         return None;
     }

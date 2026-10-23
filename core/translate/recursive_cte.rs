@@ -162,6 +162,7 @@ pub(crate) fn emit_recursive_cte(
         &mut output_limit_context,
         &recursive_cte.limit,
         &recursive_cte.offset,
+        recursive_cte_end,
     )?;
 
     emit_explain!(program, true, EqpDetail::RecursiveSetup);
