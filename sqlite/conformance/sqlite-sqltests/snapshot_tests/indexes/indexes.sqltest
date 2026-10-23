@@ -889,3 +889,18 @@ snapshot or-branch-outer-condition-checked-before-seek {
     WHERE n.type = 'course'
     ORDER BY n.id;
 }
+
+setup orders_for_new_index {
+    CREATE TABLE orders (
+        id INTEGER PRIMARY KEY,
+        user_id INTEGER NOT NULL,
+        status TEXT NOT NULL,
+        placed_at TEXT
+    );
+}
+
+# An index of stored columns reads them from the table, with no SELECT.
+@setup orders_for_new_index
+snapshot create-index-reads-stored-columns-from-the-table {
+    CREATE INDEX orders_user_status_placed ON orders(user_id, status, placed_at, id);
+}
