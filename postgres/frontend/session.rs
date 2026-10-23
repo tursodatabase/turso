@@ -10,9 +10,9 @@ use turso_core::schema::{SEQ_BACKING_TABLE_PREFIX, TURSO_INTERNAL_PREFIX};
 use turso_core::{Connection, LimboError, Namespace, Result, Statement, Value};
 use turso_parser::ast::{self};
 use turso_pg_parser::translator::{
-    check_set_transaction, is_comment_on, is_refresh_matview, stored_name_prefix,
-    try_extract_copy_from, try_extract_create_schema, try_extract_drop_schema, try_extract_set,
-    try_extract_show, unnamed_index_name, unqualified_create_table_name_location,
+    check_set_transaction, is_comment_on, is_refresh_matview, reserved_relation_named,
+    stored_name_prefix, try_extract_copy_from, try_extract_create_schema, try_extract_drop_schema,
+    try_extract_set, try_extract_show, unnamed_index_name, unqualified_create_table_name_location,
     unqualified_foreign_key_targets, PgCopyFromStmt, PgCreateSchemaStmt, PgDropSchemaStmt,
     PgSetStmt, PgSetValue, PgShowStmt, PostgreSQLTranslator,
 };
@@ -196,6 +196,7 @@ fn prepare_statement(pg_conn: &Arc<PgConnectionInner>, sql: &str) -> Result<Stat
 
     let parse_result =
         turso_pg_parser::parse(sql).map_err(|e| LimboError::ParseError(e.to_string()))?;
+    reject_schema_marker_references(&parse_result)?;
     let table_schema = create_table_schema_from_search_path(pg_conn, &parse_result)?;
     let mut qualified_names: Vec<(usize, String)> = table_schema.iter().cloned().collect();
     qualified_names.extend(foreign_key_target_schemas(
@@ -416,13 +417,27 @@ fn reject_catalog_dml(stmt: &ast::Stmt) -> Result<()> {
     )))
 }
 
+/// The marker tables are the frontend's: to a statement, a relation named
+/// like one does not exist, as in PostgreSQL, which has no such relation.
+fn reject_schema_marker_references(parse_result: &turso_pg_parser::ParseResult) -> Result<()> {
+    match reserved_relation_named(parse_result, is_schema_marker_name) {
+        Some(name) => Err(LimboError::ParseError(format!(
+            "relation \"{name}\" does not exist"
+        ))),
+        None => Ok(()),
+    }
+}
+
+fn is_schema_marker_name(name: &str) -> bool {
+    name.to_ascii_lowercase().starts_with(SCHEMA_MARKER_PREFIX)
+}
+
 /// A table of public named like a schema marker would be taken for one, so
-/// no statement may create, rename into or drop such a table.
+/// no statement may create or rename into such a table.
 fn reject_schema_marker_names(stmt: &ast::Stmt) -> Result<()> {
     let (verb, table_name) = match stmt {
         ast::Stmt::CreateTable { tbl_name, .. } => ("create", tbl_name),
         ast::Stmt::CreateMaterializedView { view_name, .. } => ("create", view_name),
-        ast::Stmt::DropTable { tbl_name, .. } => ("drop", tbl_name),
         ast::Stmt::AlterTable(alter) => match &alter.body {
             ast::AlterTableBody::RenameTo(new_name) => {
                 let new_name = ast::QualifiedName {
@@ -445,7 +460,7 @@ fn reject_schema_marker_name(verb: &str, table_name: &ast::QualifiedName) -> Res
             || namespace.as_str().eq_ignore_ascii_case("public")
     });
     let name = table_name.name.as_str();
-    if in_public && name.to_ascii_lowercase().starts_with(SCHEMA_MARKER_PREFIX) {
+    if in_public && is_schema_marker_name(name) {
         return Err(LimboError::ParseError(format!(
             "cannot {verb} \"{name}\": the prefix \"{SCHEMA_MARKER_PREFIX}\" is reserved for schema markers"
         )));
@@ -988,6 +1003,12 @@ pub(crate) fn sync_namespaces(conn: &Connection) {
 }
 
 fn handle_pg_copy_from(conn: &Arc<Connection>, stmt: &PgCopyFromStmt) -> Result<usize> {
+    if stmt.schema_name.is_none() && is_schema_marker_name(&stmt.table_name) {
+        return Err(LimboError::ParseError(format!(
+            "relation \"{}\" does not exist",
+            stmt.table_name
+        )));
+    }
     let data = std::fs::read_to_string(&stmt.filename).map_err(|e| {
         LimboError::ParseError(format!("COPY FROM: cannot read '{}': {}", stmt.filename, e))
     })?;

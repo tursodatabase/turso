@@ -5987,6 +5987,59 @@ pub fn unqualified_foreign_key_targets(
     })
 }
 
+/// The first relation that the statement reads, writes, alters or drops
+/// whose name `is_reserved` says is taken, named without a schema or with
+/// public. The relations the statement creates are not among them.
+pub fn reserved_relation_named(
+    parse_result: &ParseResult,
+    is_reserved: impl Fn(&str) -> bool,
+) -> Option<String> {
+    use pg_query::NodeRef;
+
+    let nodes = parse_result.protobuf.nodes();
+    let created: Vec<i32> = nodes
+        .iter()
+        .filter_map(|(node, ..)| match node {
+            NodeRef::CreateStmt(stmt) => stmt.relation.as_ref().map(|r| r.location),
+            NodeRef::CreateTableAsStmt(stmt) => stmt
+                .into
+                .as_ref()
+                .and_then(|into| into.rel.as_ref())
+                .map(|r| r.location),
+            NodeRef::ViewStmt(stmt) => stmt.view.as_ref().map(|r| r.location),
+            NodeRef::CreateSeqStmt(stmt) => stmt.sequence.as_ref().map(|r| r.location),
+            _ => None,
+        })
+        .collect();
+    let reserved = |schema: &str, name: &str| {
+        let in_public = schema.is_empty() || is_default_schema(schema);
+        (in_public && is_reserved(name)).then(|| name.to_string())
+    };
+    let reserved_relation = |relation: &pg_query::protobuf::RangeVar| {
+        if created.contains(&relation.location) {
+            return None;
+        }
+        reserved(&relation.schemaname, &relation.relname)
+    };
+    nodes.iter().find_map(|(node, ..)| match node {
+        NodeRef::RangeVar(relation) => reserved_relation(relation),
+        NodeRef::RenameStmt(stmt) => stmt.relation.as_ref().and_then(reserved_relation),
+        NodeRef::AlterTableStmt(stmt) => stmt.relation.as_ref().and_then(reserved_relation),
+        NodeRef::DropStmt(stmt) => stmt.objects.iter().find_map(|object| {
+            let pg_query::protobuf::node::Node::List(list) = object.node.as_ref()? else {
+                return None;
+            };
+            let names = extract_key_columns(&list.items).ok()?;
+            match names.as_slice() {
+                [name] => reserved("", name),
+                [schema, name] => reserved(schema, name),
+                _ => None,
+            }
+        }),
+        _ => None,
+    })
+}
+
 /// For a CREATE INDEX statement without an index name, the name PostgreSQL
 /// chooses and the byte offset of the `ON` keyword, where the name goes in
 /// the statement text. The name is `<table>_<columns>_idx`, with a number
@@ -6974,6 +7027,30 @@ fn is_binary_collation(collname: &[pg_query::protobuf::Node]) -> bool {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn reserved_relation_named_finds_the_relations_a_statement_uses_but_not_the_one_it_creates() {
+        let is_marker = |name: &str| name.starts_with("pg_turso_schema_");
+        let named = |sql: &str| reserved_relation_named(&crate::parse(sql).unwrap(), is_marker);
+        assert_eq!(
+            named("SELECT * FROM pg_turso_schema_app"),
+            Some("pg_turso_schema_app".to_string())
+        );
+        assert_eq!(
+            named("DROP TABLE public.pg_turso_schema_app"),
+            Some("pg_turso_schema_app".to_string())
+        );
+        assert_eq!(
+            named("ALTER TABLE pg_turso_schema_app RENAME TO zz"),
+            Some("pg_turso_schema_app".to_string())
+        );
+        assert_eq!(
+            named("ALTER TABLE pg_turso_schema_app ADD COLUMN y int"),
+            Some("pg_turso_schema_app".to_string())
+        );
+        assert_eq!(named("CREATE TABLE pg_turso_schema_app (x int)"), None);
+        assert_eq!(named("SELECT * FROM app.pg_turso_schema_app"), None);
+    }
+
     #[test]
     fn stored_name_prefix_quotes_a_schema_name_with_a_dot_or_a_quote() {
         assert_eq!(stored_name_prefix("public"), "");

@@ -266,13 +266,37 @@ expect error {
     reserved for schema markers
 }
 
-@skip-if postgres "Turso marks each schema with a table named pg_turso_schema_<schema>; PostgreSQL has no such tables"
 test drop-of-a-schema-marker-table-errors {
     CREATE SCHEMA app;
     DROP TABLE pg_turso_schema_app;
 }
 expect error {
-    reserved for schema markers
+    does not exist
+}
+
+test schema-marker-table-cannot-be-read {
+    CREATE SCHEMA app;
+    SELECT * FROM pg_turso_schema_app;
+}
+expect error {
+    does not exist
+}
+
+test schema-marker-table-cannot-be-written {
+    CREATE SCHEMA app;
+    INSERT INTO public.pg_turso_schema_app VALUES ('x');
+}
+expect error {
+    does not exist
+}
+
+test schema-marker-table-cannot-be-renamed {
+    CREATE SCHEMA app;
+    CREATE TABLE app.t (x int);
+    ALTER TABLE pg_turso_schema_app RENAME TO zz;
+}
+expect error {
+    does not exist
 }
 
 test column-named-with-its-schema-reads-the-table-of-that-schema {
