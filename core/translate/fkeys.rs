@@ -1759,6 +1759,7 @@ fn emit_fk_action_subprogram(
             FK_SUBPROGRAM_OPTS,
             program.is_mvcc_enabled(),
         );
+        subprogram_builder.set_mvcc_enabled(program.is_mvcc_enabled());
         let entry = compile_stack.push(foreign_key, parent_change);
         subprogram_builder.prologue();
         translate_inner(
