@@ -1607,6 +1607,7 @@ expect {
                 backend_is_sqlite: false,
                 snapshot_update_mode: SnapshotUpdateMode::No,
                 cross_check_binary: None,
+                normalize_plans: false,
                 verify_materialized_views: false,
             };
             let backend = Arc::new(SetupFailsBackend { backend_type });
