@@ -7,7 +7,9 @@ use turso_core::{
     dialect::POSTGRES_TABLE_SQL_PREFIX,
     namespace::mangle_name,
     native_ext::{VirtualTable, VirtualTableCursor, VirtualTableModule},
-    schema::{BTreeTable, Schema, Sequence, Table, UniqueSet, AUTOINCREMENT_SEQ_PREFIX},
+    schema::{
+        BTreeTable, GeneratedType, Schema, Sequence, Table, UniqueSet, AUTOINCREMENT_SEQ_PREFIX,
+    },
     security::roles::{Role, RoleCatalog, RoleId},
     walk_expr_mut, Connection, Dialect, Func, IOResult, LimboError, NamespaceId, OpenOptions,
     Result, Statement, Value, WalkControl,
@@ -243,6 +245,36 @@ impl Dialect for PostgresDialect {
 
     fn casts_nonzero_integer_to_true(&self) -> bool {
         true
+    }
+
+    fn positional_insert_includes_generated_columns(&self) -> bool {
+        true
+    }
+
+    fn allows_generated_columns_in_primary_key(&self) -> bool {
+        true
+    }
+
+    fn add_column_allows_stored_generated_columns(&self) -> bool {
+        true
+    }
+
+    fn update_set_default_computes_generated_columns(&self) -> bool {
+        true
+    }
+
+    fn insert_value_count_error(
+        &self,
+        _table_name: &str,
+        columns: usize,
+        values: usize,
+    ) -> LimboError {
+        let message = if values > columns {
+            "INSERT has more expressions than target columns"
+        } else {
+            "INSERT has more target columns than expressions"
+        };
+        crate::error::sqlstate_error(turso_pg_parser::sqlstate::SQLSTATE_SYNTAX_ERROR, message)
     }
 }
 
@@ -759,7 +791,8 @@ impl SnapshotRows for PgAttributeTable {
                 };
                 let attnum = (i + 1) as i64; // 1-based
                 let notnull = i64::from(col.notnull());
-                let has_def = if col.default.is_some() { 1i64 } else { 0i64 };
+                let has_def = i64::from(col.default.is_some() || col.is_stored_generated());
+                let generated = if col.is_stored_generated() { "s" } else { "" };
 
                 rows.push(vec![
                     Value::from_i64(table_oid),   // attrelid
@@ -775,19 +808,19 @@ impl SnapshotRows for PgAttributeTable {
                     Value::build_text(storage),   // attstorage
                     Value::Text("i".into()),      // attalign (int)
                     Value::Text("".into()),
-                    Value::from_i64(notnull), // attnotnull
-                    Value::from_i64(has_def), // atthasdef
-                    Value::from_i64(0),       // atthasmissing
-                    Value::Text("".into()),   // attidentity
-                    Value::Text("".into()),   // attgenerated
-                    Value::from_i64(0),       // attisdropped
-                    Value::from_i64(1),       // attislocal
-                    Value::from_i64(0),       // attinhcount
-                    Value::from_i64(0),       // attcollation
-                    Value::Null,              // attacl
-                    Value::Null,              // attoptions
-                    Value::Null,              // attfdwoptions
-                    Value::Null,              // attmissingval
+                    Value::from_i64(notnull),      // attnotnull
+                    Value::from_i64(has_def),      // atthasdef
+                    Value::from_i64(0),            // atthasmissing
+                    Value::Text("".into()),        // attidentity
+                    Value::Text(generated.into()), // attgenerated
+                    Value::from_i64(0),            // attisdropped
+                    Value::from_i64(1),            // attislocal
+                    Value::from_i64(0),            // attinhcount
+                    Value::from_i64(0),            // attcollation
+                    Value::Null,                   // attacl
+                    Value::Null,                   // attoptions
+                    Value::Null,                   // attfdwoptions
+                    Value::Null,                   // attmissingval
                 ]);
             }
         }
@@ -2179,19 +2212,310 @@ impl SnapshotRows for PgAttrdefTable {
                 .unwrap_or(0);
 
             for (col_idx, col) in btree.columns().iter().enumerate() {
-                if let Some(default_expr) = &col.default {
-                    rows.push(vec![
-                        Value::from_i64(attrdef_oid),                 // oid
-                        Value::from_i64(table_oid),                   // adrelid
-                        Value::from_i64(col_idx as i64 + 1),          // adnum (1-based)
-                        Value::build_text(render_expr(default_expr)), // adbin
-                    ]);
-                    attrdef_oid += 1;
-                }
+                let adbin = match (&col.default, col.generated_type()) {
+                    (Some(default_expr), _) => render_expr(default_expr),
+                    (None, GeneratedType::Stored { expr, .. }) => {
+                        generation_expression_text(expr, btree)
+                    }
+                    (None, _) => continue,
+                };
+                rows.push(vec![
+                    Value::from_i64(attrdef_oid),        // oid
+                    Value::from_i64(table_oid),          // adrelid
+                    Value::from_i64(col_idx as i64 + 1), // adnum (1-based)
+                    Value::build_text(adbin),            // adbin
+                ]);
+                attrdef_oid += 1;
             }
         }
         rows
     }
+}
+
+/// A generation expression as `pg_get_expr` prints it.
+fn generation_expression_text(expr: &turso_parser::ast::Expr, table: &BTreeTable) -> String {
+    use turso_parser::ast::{Expr, LikeOperator, Literal, Operator, UnaryOperator};
+
+    let text = |expr: &Expr| generation_expression_text(expr, table);
+    match expr {
+        Expr::Column { column, .. } => quote_identifier(
+            table.columns()[*column]
+                .name
+                .as_deref()
+                .expect("table columns have names"),
+        ),
+        Expr::Id(name) => quote_identifier(name.as_str()),
+        Expr::Literal(Literal::Null) => "NULL".to_string(),
+        Expr::Literal(Literal::True) => "true".to_string(),
+        Expr::Literal(Literal::False) => "false".to_string(),
+        Expr::Literal(Literal::String(quoted)) => format!("{quoted}::text"),
+        Expr::Literal(Literal::Numeric(number)) => numeric_literal_text(number),
+        Expr::Parenthesized(exprs) if exprs.len() == 1 => text(&exprs[0]),
+        Expr::Cast {
+            expr: operand,
+            type_name: Some(type_name),
+        } => match (operand.as_ref(), type_name.name.as_str()) {
+            (Expr::Literal(Literal::Numeric(n)), "boolean") if n == "1" => "true".to_string(),
+            (Expr::Literal(Literal::Numeric(n)), "boolean") if n == "0" => "false".to_string(),
+            (Expr::Literal(Literal::String(quoted)), _) => {
+                format!("{quoted}::{}", cast_type_text(type_name))
+            }
+            _ => format!("({})::{}", text(operand), cast_type_text(type_name)),
+        },
+        Expr::Binary(lhs, Operator::Is, rhs) => {
+            format!("(NOT ({} IS DISTINCT FROM {}))", text(lhs), text(rhs))
+        }
+        Expr::Binary(lhs, Operator::IsNot, rhs) => {
+            format!("({} IS DISTINCT FROM {})", text(lhs), text(rhs))
+        }
+        Expr::Binary(lhs, op, rhs) => {
+            let op = match op {
+                Operator::Equals => "=".to_string(),
+                Operator::NotEquals => "<>".to_string(),
+                Operator::And => "AND".to_string(),
+                Operator::Or => "OR".to_string(),
+                op => op.to_string(),
+            };
+            format!("({} {op} {})", text(lhs), text(rhs))
+        }
+        Expr::Unary(UnaryOperator::Not, operand) => match operand.as_ref() {
+            Expr::FunctionCall { name, args, .. }
+                if name.as_str() == "textlike" && args.len() == 2 =>
+            {
+                like_text(&args[0], true, &args[1], table)
+            }
+            _ => format!("(NOT {})", text(operand)),
+        },
+        Expr::Unary(op, operand) => {
+            let op = match op {
+                UnaryOperator::Negative => "-",
+                UnaryOperator::Positive => "+",
+                UnaryOperator::Not => "NOT",
+                UnaryOperator::BitwiseNot => "~",
+            };
+            format!("({op} {})", text(operand))
+        }
+        Expr::IsNull(operand) => format!("({} IS NULL)", text(operand)),
+        Expr::NotNull(operand) => format!("({} IS NOT NULL)", text(operand)),
+        Expr::Between {
+            lhs,
+            not,
+            start,
+            end,
+        } => {
+            let (lhs, start, end) = (text(lhs), text(start), text(end));
+            if *not {
+                format!("(({lhs} < {start}) OR ({lhs} > {end}))")
+            } else {
+                format!("(({lhs} >= {start}) AND ({lhs} <= {end}))")
+            }
+        }
+        Expr::InList { lhs, not, rhs } if !rhs.is_empty() => {
+            let elements: Vec<String> = rhs.iter().map(|e| text(e)).collect();
+            let comparison = if *not { "<> ALL" } else { "= ANY" };
+            format!(
+                "({} {comparison} (ARRAY[{}]))",
+                text(lhs),
+                elements.join(", ")
+            )
+        }
+        Expr::Like {
+            lhs,
+            not,
+            op: LikeOperator::Glob,
+            rhs,
+            escape: None,
+        } => {
+            if let Some(text) = glob_like_text(lhs, *not, rhs, table) {
+                text
+            } else {
+                fallback_expression_text(expr, table)
+            }
+        }
+        Expr::Like {
+            lhs,
+            not,
+            op: LikeOperator::Regexp,
+            rhs,
+            escape: None,
+        } => {
+            let (op, pattern) = match rhs.as_ref() {
+                Expr::Binary(prefix, Operator::Concat, pattern) if matches!(prefix.as_ref(), Expr::Literal(Literal::String(p)) if p == "'(?i)'") => {
+                    ("~*", pattern)
+                }
+                _ => ("~", rhs),
+            };
+            let not = if *not { "!" } else { "" };
+            format!("({} {not}{op} {})", text(lhs), text(pattern))
+        }
+        Expr::FunctionCall {
+            name,
+            distinctness: None,
+            args,
+            order_by,
+            within_group,
+            filter_over,
+        } if order_by.is_empty()
+            && within_group.is_empty()
+            && filter_over.filter_clause.is_none()
+            && filter_over.over_clause.is_none() =>
+        {
+            let name = name.as_str().to_lowercase();
+            if name == "textlike" && args.len() == 2 {
+                return like_text(&args[0], false, &args[1], table);
+            }
+            let args: Vec<String> = args.iter().map(|arg| text(arg)).collect();
+            if name == "array" {
+                return format!("ARRAY[{}]", args.join(", "));
+            }
+            let name = match name.as_str() {
+                "coalesce" | "nullif" | "greatest" | "least" => name.to_uppercase(),
+                _ => quote_identifier(&name),
+            };
+            format!("{name}({})", args.join(", "))
+        }
+        Expr::Case {
+            base,
+            when_then_pairs,
+            else_expr,
+        } => {
+            let mut sql = "CASE".to_string();
+            if let Some(base) = base {
+                sql.push(' ');
+                sql.push_str(&text(base));
+            }
+            for (when, then) in when_then_pairs {
+                sql.push_str(&format!("\n    WHEN {} THEN {}", text(when), text(then)));
+            }
+            if let Some(else_expr) = else_expr {
+                sql.push_str(&format!("\n    ELSE {}", text(else_expr)));
+            }
+            sql.push_str("\nEND");
+            sql
+        }
+        _ => fallback_expression_text(expr, table),
+    }
+}
+
+/// A numeric literal as PostgreSQL prints a constant: a negative or non-`integer` whole number
+/// is quoted and labeled with its type.
+fn numeric_literal_text(number: &str) -> String {
+    let is_whole = !number.contains(['.', 'e', 'E']);
+    match number.parse::<i64>() {
+        Ok(n) if is_whole && i32::try_from(n).is_ok_and(|n| n >= 0) => number.to_string(),
+        Ok(n) if is_whole && i32::try_from(n).is_ok() => format!("'{number}'::integer"),
+        Ok(_) if is_whole => format!("'{number}'::bigint"),
+        _ if is_whole || number.starts_with('-') => format!("'{number}'::numeric"),
+        _ => number.to_string(),
+    }
+}
+
+fn cast_type_text(type_name: &turso_parser::ast::Type) -> String {
+    let name = crate::functions::format_type(sqlite_type_to_pg_oid(&type_name.name), -1);
+    format!("{name}{}", "[]".repeat(type_name.array_dimensions as usize))
+}
+
+/// `[NOT] LIKE` or `[NOT] ILIKE` with a literal pattern, which is stored as a GLOB.
+fn glob_like_text(
+    lhs: &turso_parser::ast::Expr,
+    not: bool,
+    rhs: &turso_parser::ast::Expr,
+    table: &BTreeTable,
+) -> Option<String> {
+    use turso_parser::ast::{Expr, Literal};
+
+    let lower_argument = |expr: &Expr| match expr {
+        Expr::FunctionCall { name, args, .. }
+            if name.as_str().eq_ignore_ascii_case("lower") && args.len() == 1 =>
+        {
+            Some(args[0].as_ref().clone())
+        }
+        _ => None,
+    };
+    let (lhs, rhs, ignore_case) = match (lower_argument(lhs), lower_argument(rhs)) {
+        (Some(lhs), Some(rhs)) => (lhs, rhs, true),
+        _ => (lhs.clone(), rhs.clone(), false),
+    };
+    let Expr::Literal(Literal::String(glob)) = &rhs else {
+        return None;
+    };
+    let glob = glob.strip_prefix('\'')?.strip_suffix('\'')?;
+    let op = match (not, ignore_case) {
+        (false, false) => "~~",
+        (true, false) => "!~~",
+        (false, true) => "~~*",
+        (true, true) => "!~~*",
+    };
+    Some(format!(
+        "({} {op} '{}'::text)",
+        generation_expression_text(&lhs, table),
+        glob_pattern_to_like(glob)?
+    ))
+}
+
+/// The LIKE pattern that matches what `glob` matches, for a GLOB made from a LIKE pattern.
+fn glob_pattern_to_like(glob: &str) -> Option<String> {
+    let mut like = String::with_capacity(glob.len());
+    let mut chars = glob.chars();
+    while let Some(c) = chars.next() {
+        let literal = match c {
+            '*' => {
+                like.push('%');
+                continue;
+            }
+            '?' => {
+                like.push('_');
+                continue;
+            }
+            '[' => {
+                let literal = chars.next()?;
+                if chars.next()? != ']' {
+                    return None;
+                }
+                literal
+            }
+            c => c,
+        };
+        if matches!(literal, '%' | '_' | '\\') {
+            like.push('\\');
+        }
+        like.push(literal);
+    }
+    Some(like)
+}
+
+/// `[NOT] LIKE` with a pattern that is not a literal, which is stored as a textlike() call.
+fn like_text(
+    lhs: &turso_parser::ast::Expr,
+    not: bool,
+    rhs: &turso_parser::ast::Expr,
+    table: &BTreeTable,
+) -> String {
+    let op = if not { "!~~" } else { "~~" };
+    format!(
+        "({} {op} {})",
+        generation_expression_text(lhs, table),
+        generation_expression_text(rhs, table)
+    )
+}
+
+/// The stored SQL of an expression that has no PostgreSQL form here, with its columns named.
+fn fallback_expression_text(expr: &turso_parser::ast::Expr, table: &BTreeTable) -> String {
+    use turso_parser::ast::{Expr, Name};
+
+    let mut expr = expr.clone();
+    turso_core::walk_expr_mut(&mut expr, &mut |e: &mut Expr| {
+        if let Expr::Column { column, .. } = e {
+            let name = table.columns()[*column]
+                .name
+                .as_deref()
+                .expect("table columns have names");
+            *e = Expr::Id(Name::from_string(quote_identifier(name)));
+        }
+        Ok(turso_core::WalkControl::Continue)
+    })
+    .expect("naming the columns of an expression does not fail");
+    expr.to_string()
 }
 
 #[derive(Debug)]
@@ -4094,6 +4418,26 @@ mod tests {
                 "{cmd:?}"
             );
         }
+    }
+
+    #[test]
+    fn generation_expression_text_names_columns_in_expressions_it_cannot_print() {
+        use turso_parser::ast::{Expr, Name, TableInternalId};
+
+        let table = BTreeTable::from_sql("CREATE TABLE t (a INTEGER, \"Mixed\" TEXT)", 2).unwrap();
+        let expr = Expr::Collate(
+            Box::new(Expr::Column {
+                database: None,
+                table: TableInternalId::SELF_TABLE,
+                column: 1,
+                is_rowid_alias: false,
+            }),
+            Name::exact("BINARY".to_string()),
+        );
+        assert_eq!(
+            generation_expression_text(&expr, &table),
+            "\"Mixed\" COLLATE BINARY"
+        );
     }
 
     #[test]

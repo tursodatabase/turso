@@ -43,12 +43,12 @@ Basics not enumerated by the official feature matrix.
 | JOINs (INNER, LEFT, RIGHT, FULL, CROSS, NATURAL, USING) | ✅ Supported | |
 | UNION / UNION ALL / INTERSECT / EXCEPT | 🟡 Partial | Including ORDER BY/LIMIT on compounds; INTERSECT ALL / EXCEPT ALL, a set operation nested on the right (`A UNION B INTERSECT C`, `A EXCEPT (B UNION C)`) and ORDER BY/LIMIT/WITH on a parenthesized branch are rejected |
 | Subqueries (FROM, IN, EXISTS, scalar) | ✅ Supported | `= ANY(array)` and `<> ALL(array)` work, including bound text-array parameters; other ANY/ALL array operators are rejected; `ALL`/row comparison subqueries error; an EXISTS subquery may select no columns (`EXISTS (SELECT FROM t)`), but a SELECT with no columns anywhere else is rejected |
-| INSERT (column lists, multi-row VALUES, DEFAULT, INSERT ... SELECT) | ✅ Supported | Duplicate target columns, DEFAULT without a column list, array-element/field targets and OVERRIDING are rejected |
+| INSERT (column lists, multi-row VALUES, DEFAULT, DEFAULT VALUES, INSERT ... SELECT) | ✅ Supported | Without a column list, `INSERT ... SELECT *` must give a value for every column that is not generated; duplicate target columns, array-element/field targets, OVERRIDING and ON CONFLICT with DEFAULT VALUES are rejected |
 | UPDATE (incl. FROM clause) | ✅ Supported | Multi-column `SET (a,b) = (...)` not supported; duplicate assignments and array-element/field targets rejected |
 | DELETE | 🟡 Partial | `USING` clause rejected |
 | CREATE TABLE | ✅ Supported | PK, NOT NULL, UNIQUE, DEFAULT, CHECK, FK (with ON DELETE/UPDATE actions); IF NOT EXISTS; tables are created STRICT |
 | CREATE TABLE AS / SELECT INTO | ✅ Supported | Schema derived from the SELECT; WITH NO DATA supported (lowered to LIMIT 0, so errors in an overridden LIMIT go unreported); explicit column list rejected; INTO on the first leaf of a compound SELECT (legal in PG) rejected; TEMP, WITH (...), TABLESPACE, USING and ON COMMIT rejected; completes with `SELECT n` like PostgreSQL, though an IF NOT EXISTS skip tags `SELECT 0` instead of `CREATE TABLE AS` |
-| ALTER TABLE | 🟡 Partial | ADD/DROP COLUMN, RENAME TABLE/COLUMN work; one subcommand per statement; ALTER COLUMN TYPE, IF [NOT] EXISTS and CASCADE rejected; SET/DROP DEFAULT, SET/DROP NOT NULL, ADD CONSTRAINT rejected |
+| ALTER TABLE | 🟡 Partial | ADD/DROP COLUMN, RENAME TABLE/COLUMN, ALTER COLUMN DROP EXPRESSION [IF EXISTS] work; one subcommand per statement; ALTER COLUMN TYPE, other IF [NOT] EXISTS forms and CASCADE rejected; SET/DROP DEFAULT, SET/DROP NOT NULL, ADD CONSTRAINT rejected; DROP EXPRESSION on a PRIMARY KEY column rejected |
 | CREATE INDEX | ✅ Supported | UNIQUE, multi-column, partial (WHERE), expression indexes, IF NOT EXISTS |
 | CREATE VIEW | ✅ Supported | Column aliases supported when they name every select-list column; TEMP, UNLOGGED, OR REPLACE, WITH (options) and WITH CHECK OPTION rejected |
 | COMMENT ON | 🟡 Partial | Accepted but discarded; comments are not persisted in `pg_description` |
@@ -92,7 +92,8 @@ exposes it for policy discovery. `pg_publication`, `pg_publication_rel`, and
 PostgreSQL triggers are not supported and `pg_trigger` is empty.
 Catalog introspection functions: `format_type`,
 `pg_get_constraintdef`, `pg_get_indexdef`, `pg_get_expr` (returns TursoPG's
-stored SQL; relation oid and pretty printing do not change the output),
+stored SQL, and for a stored generated column an approximation of PostgreSQL's
+output that omits implicit casts; relation oid and pretty printing do not change the output),
 `pg_get_userbyid`, `pg_*_is_visible`, `pg_encoding_to_char`,
 `pg_input_is_valid`, `to_char` (numeric), `now`/`clock_timestamp`/
 `transaction_timestamp`/`statement_timestamp`, `age(timestamp[, timestamp])`
@@ -239,7 +240,7 @@ INTEGER. Unknown type names pass through as custom types.
 
 | Feature | Status | Notes |
 |---------|--------|-------|
-| ALTER object IF EXISTS | 🟡 Partial | ALTER TABLE IF EXISTS works when the table exists, but a missing table still errors instead of being skipped |
+| ALTER object IF EXISTS | 🟡 Partial | ALTER TABLE IF EXISTS works only with ALTER COLUMN ... DROP EXPRESSION, where a missing table is skipped; other ALTER TABLE IF EXISTS forms are rejected |
 | ALTER TABLE ... ADD UNIQUE/PRIMARY KEY USING INDEX | ❌ Not supported | ADD CONSTRAINT is rejected |
 | ALTER TABLE ... SET ACCESS METHOD | ❌ Not supported | |
 | ALTER TABLE ... SET LOGGED / UNLOGGED | ❌ Not supported | |
@@ -249,7 +250,7 @@ INTEGER. Unknown type names pass through as custom types.
 | DROP object IF EXISTS | ✅ Supported | TABLE, INDEX, VIEW, MATERIALIZED VIEW, TYPE, DOMAIN, SEQUENCE, SCHEMA |
 | ON COMMIT clause for CREATE TEMPORARY TABLE | ❌ Not supported | Rejected, like TEMP itself |
 | REINDEX CONCURRENTLY | ❌ Not supported | REINDEX not supported at all |
-| Stored generated columns | ❌ Not supported | GENERATED ... AS rejected |
+| Stored generated columns | 🟡 Partial | GENERATED ALWAYS AS (...) STORED, including ADD COLUMN and DROP EXPRESSION; the type of the expression is not checked against the column type at CREATE, so a mismatch fails at INSERT instead; immutability is checked against a list of known non-immutable functions, and date/time casts and functions are checked using the declared types of the columns they read; `extract`, `date_part` and `date_trunc` are not implemented |
 | Temporal constraints | ❌ Not supported | |
 | Temporary tables (CREATE TEMP TABLE) | ❌ Not supported | Rejected (UNLOGGED is accepted and creates an ordinary table) |
 | Typed tables | ❌ Not supported | |
