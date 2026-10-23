@@ -3,7 +3,7 @@ use std::{fmt, sync::Arc};
 use turso_core::native_ext::{FunctionArity, ScalarCall, ScalarFunction};
 use turso_core::types::IOResultOr;
 use turso_core::{
-    Connection, ExternalFunc, IOResult, LimboError, OpenOptions, Register, Result, Value,
+    Connection, ExternalFunc, IOResult, LimboError, Numeric, OpenOptions, Register, Result, Value,
 };
 
 pub(crate) fn register_functions(mut options: OpenOptions) -> OpenOptions {
@@ -81,6 +81,7 @@ scalar_functions! {
     PgBackendPid(FunctionArity::Exact(0), true),
     PgIsInRecovery(FunctionArity::Exact(0), false),
     PgLockAccessShare(FunctionArity::Exact(0), false),
+    PgLimitValue(FunctionArity::Exact(2), true),
     Now | ClockTimestamp | TransactionTimestamp | StatementTimestamp(FunctionArity::Variadic, false),
 }
 
@@ -146,6 +147,7 @@ impl ScalarCall for PgScalarFunction {
                 }
                 Value::from_i64(0)
             }
+            Self::PgLimitValue => exec_pg_limit_value(args)?,
             Self::Now
             | Self::ClockTimestamp
             | Self::TransactionTimestamp
@@ -419,6 +421,38 @@ fn exec_current_setting(conn: &Connection, args: &[Register]) -> Result<Value> {
             "unrecognized configuration parameter \"{name}\""
         ))),
     }
+}
+
+/// Converts a LIMIT or OFFSET value to bigint the way PostgreSQL does, rounding
+/// fractions half away from zero, and rejects negative values.
+fn exec_pg_limit_value(args: &[Register]) -> Result<Value> {
+    let value = match args[0].get_value() {
+        Value::Null => return Ok(Value::Null),
+        Value::Numeric(Numeric::Integer(value)) => *value,
+        Value::Numeric(Numeric::Float(value)) => {
+            let rounded = f64::from(*value).round();
+            if !(i64::MIN as f64..i64::MAX as f64).contains(&rounded) {
+                return Err(LimboError::InvalidArgument(
+                    "bigint out of range".to_string(),
+                ));
+            }
+            rounded as i64
+        }
+        Value::Text(text) => text.as_str().trim().parse().map_err(|_| {
+            LimboError::InvalidArgument(format!(
+                "invalid input syntax for type bigint: \"{}\"",
+                text.as_str()
+            ))
+        })?,
+        Value::Blob(_) => return Err(LimboError::InvalidArgument("datatype mismatch".to_string())),
+    };
+    if value < 0 {
+        return Err(LimboError::InvalidArgument(format!(
+            "{} must not be negative",
+            text_arg(args, 1)
+        )));
+    }
+    Ok(Value::from_i64(value))
 }
 
 fn exec_pg_get_user_by_id(_oid: i64) -> Value {
