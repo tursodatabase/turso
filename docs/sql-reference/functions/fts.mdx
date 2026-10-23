@@ -57,6 +57,26 @@ CREATE INDEX idx_tags ON tags USING fts (tag) WITH (tokenizer = 'raw');
 | `Hello World` | `hello`, `world` | `Hello World` | `He`, `Hel`, `el`, `ell`, `ll`, `llo`, ... |
 | `user-123` | `user`, `123` | `user-123` | `us`, `use`, `se`, `ser`, ... |
 
+### JSON Fields
+
+Index JSON object columns with `json_fields` to use native Tantivy path queries:
+
+```sql
+CREATE INDEX docs_fts ON docs USING fts(title, body, properties)
+WITH (json_fields = 'properties', json_tokenizer = 'raw');
+
+SELECT id FROM docs
+WHERE fts_match(title, body, properties, 'properties.person:PERSON-1');
+```
+
+`json_fields` lists indexed SQL columns, separated by commas. Column names are case-insensitive; empty entries, duplicates and unknown columns are rejected.
+
+`json_tokenizer` uses the same tokenizer names as `tokenizer` and defaults to its value. It applies to all strings in the selected JSON columns. Tantivy's `raw` tokenizer emits each string as one unchanged token, preserving case, whitespace and punctuation. Use `raw` for exact identifiers and `default` for word searches. Other indexed columns keep their `tokenizer` setting.
+
+JSON columns accept object text, SQL `NULL` and JSON `null`. Nested objects, array values, numbers and booleans are searchable. Invalid JSON, root arrays/scalars and non-text SQL values, including JSONB blobs, are rejected.
+
+Escape literal dots in keys: `properties.person\.name:Ann` addresses the key `person.name`; `properties.person.name:Ann` addresses a nested path. Tantivy 0.26.2 has a known range-query bug for literal dotted keys; exact queries work.
+
 ### Field Weights
 
 You can assign relative weights to indexed columns to influence the BM25 relevance score.
