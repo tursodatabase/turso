@@ -371,8 +371,8 @@ fn try_match_index_method_pattern(
     let pattern_has_order_by = !pattern.order_by.is_empty();
     let pattern_has_limit = pattern.limit.is_some();
 
-    // If pattern has ORDER BY, it must match exactly
-    if pattern_has_order_by && order_by.len() != pattern.order_by.len() {
+    // If pattern has ORDER BY or LIMIT, ORDER BY must match exactly
+    if (pattern_has_order_by || pattern_has_limit) && order_by.len() != pattern.order_by.len() {
         return None;
     }
 
