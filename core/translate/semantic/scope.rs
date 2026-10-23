@@ -302,7 +302,7 @@ impl<'a> ColumnView<'a> {
 #[derive(Clone, Debug)]
 enum VisibleColumn {
     AllOfSource(usize),
-    Binding(ColumnBinding),
+    Binding(Box<ColumnBinding>),
 }
 
 #[derive(Clone, Debug)]
@@ -548,7 +548,7 @@ impl Scope {
                     visible.hidden = true;
                 }
             }
-            Arc::make_mut(&mut self.visible).push(VisibleColumn::Binding(visible));
+            Arc::make_mut(&mut self.visible).push(VisibleColumn::Binding(Box::new(visible)));
         }
         added.saved = Some(saved);
     }
@@ -1215,9 +1215,9 @@ impl Scope {
                             Some(database) => self.resolve_database_qualified(
                                 database,
                                 qualifier,
-                                &column.display_name(),
+                                column.display_name(),
                             )?,
-                            None => self.resolve_qualified(qualifier, &column.display_name())?,
+                            None => self.resolve_qualified(qualifier, column.display_name())?,
                         }
                         .unwrap_or_else(|| column.resolved())
                     };
@@ -1244,7 +1244,7 @@ impl Scope {
                     };
                     resolved
                 } else if source.star_merged.contains(&saved_name) {
-                    self.merged_star_column_named(&saved_name, &column.display_name())?
+                    self.merged_star_column_named(&saved_name, column.display_name())?
                 } else {
                     column.resolved()
                 };
@@ -1545,7 +1545,9 @@ impl Scope {
         self.visible.iter().flat_map(|visible| {
             let (source, binding) = match visible {
                 VisibleColumn::AllOfSource(source) => (Some(&self.sources[*source]), None),
-                VisibleColumn::Binding(binding) => (None, Some(ColumnView::Binding(binding))),
+                VisibleColumn::Binding(binding) => {
+                    (None, Some(ColumnView::Binding(binding.as_ref())))
+                }
             };
             source
                 .into_iter()
@@ -1562,7 +1564,7 @@ impl Scope {
         {
             let owned = self
                 .visible_columns()
-                .map(|column| VisibleColumn::Binding(column.to_binding()))
+                .map(|column| VisibleColumn::Binding(Box::new(column.to_binding())))
                 .collect();
             self.visible = Arc::new(owned);
         }
