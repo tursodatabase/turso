@@ -2031,11 +2031,7 @@ fn hir_group_row_columns(
             hir::Expr::Function(hir::FunctionCall {
                 evaluation: hir::FunctionEvaluation::Aggregate { .. },
                 ..
-            }) => expression.for_each(&mut |expression| {
-                if let hir::Expr::Column(reference) = expression {
-                    add(columns, *reference);
-                }
-            }),
+            }) => add_row_columns(document, expression, columns),
             hir::Expr::Output(output) => {
                 if let Some(output) = document.output(*output) {
                     visit(document, keys, &output.expr, columns);
@@ -2049,6 +2045,21 @@ fn hir_group_row_columns(
                 }
             }
         }
+    }
+    fn add_row_columns(
+        document: &HirDocument,
+        expression: &hir::Expr,
+        columns: &mut Vec<hir::ColumnRef>,
+    ) {
+        expression.for_each(&mut |expression| match expression {
+            hir::Expr::Column(reference) => add(columns, *reference),
+            hir::Expr::Output(output) => {
+                if let Some(output) = document.output(*output) {
+                    add_row_columns(document, &output.expr, columns);
+                }
+            }
+            _ => {}
+        });
     }
     let mut columns = Vec::new();
     for output in &block.outputs {

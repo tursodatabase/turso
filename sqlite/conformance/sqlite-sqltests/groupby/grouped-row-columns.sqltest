@@ -188,3 +188,18 @@ expect {
     3|v
 }
 
+
+# A HAVING aggregate over an output alias reads the columns of that output.
+test grouped-having-aggregate-of-alias {
+    CREATE TABLE g(c);
+    INSERT INTO g VALUES (1), (1), (-2), (3);
+    SELECT c FROM g GROUP BY c HAVING sum(c) < 1;
+    SELECT c FROM g GROUP BY 1, 1, c HAVING avg(c) > 0 ORDER BY c;
+    SELECT c AS k FROM g GROUP BY k HAVING count(k) > 1;
+}
+expect {
+    -2
+    1
+    3
+    1
+}
