@@ -1044,6 +1044,11 @@ impl Expr {
         root_context: V::Context,
         visitor: &mut V,
     ) -> Result<V::Output, V::Error> {
+        if visitor.child(self, 0).is_none() {
+            return visitor.post_order(self, root_context, &[]);
+        }
+        #[cfg(test)]
+        tests::FRAME_STACKS_CREATED.with(|created| created.set(created.get() + 1));
         let mut frames = vec![ExprFrame::new(self, root_context)];
         loop {
             let frame = frames.last_mut().expect("root expression frame exists");
@@ -1314,7 +1319,35 @@ fn child_from_schema_calls<'expr>(
 
 #[cfg(test)]
 mod tests {
+    thread_local! {
+        /// How many expression walks on this thread allocated a stack of frames.
+        pub(super) static FRAME_STACKS_CREATED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    }
+
     use super::*;
+
+    #[test]
+    fn walking_an_expression_without_children_creates_no_frame_stack() {
+        let leaf = Expr::column(SourceId::new(0), 3);
+        let binary = Expr::Binary {
+            lhs: Box::new(Expr::column(SourceId::new(0), 1)),
+            operator: Operator::Add,
+            rhs: Box::new(Expr::column(SourceId::new(0), 2)),
+            array_concat: false,
+            custom: None,
+            comparison: None,
+        };
+        FRAME_STACKS_CREATED.with(|created| created.set(0));
+
+        let mut visited = 0;
+        leaf.for_each(&mut |_| visited += 1);
+        assert_eq!(visited, 1);
+        assert_eq!(FRAME_STACKS_CREATED.with(|created| created.get()), 0);
+
+        binary.for_each(&mut |_| visited += 1);
+        assert_eq!(visited, 4);
+        assert_eq!(FRAME_STACKS_CREATED.with(|created| created.get()), 1);
+    }
 
     #[test]
     fn expression_frames_preserve_child_order_for_walk_and_fold() {
