@@ -35,7 +35,7 @@ QUERY PLAN
 
 BYTECODE
 addr  opcode                       p1   p2   p3  p4                                               p5  comment
-   0  Init                          0  120    0                                                    0  Start at 120
+   0  Init                          0  119    0                                                    0  Start at 119
    1  Null                          0    1    0                                                    0  r[1]=NULL
    2  OpenRead                      0   10    0  k(17,B,B,B,B,B,B,B,B,B,B,B,B,B,B,B,B)             0  table=lineitem, root=10, iDb=0
    3  Integer                       0   16    0                                                    0  r[16]=0
@@ -151,11 +151,11 @@ addr  opcode                       p1   p2   p3  p4                             
  113  Integer                       0   15    0                                                    0  r[15]=0
  114  AggFinal                      0    1    0  sum                                               0  accum=r[1]
  115  Copy                          1   80    0                                                    0  r[80]=r[1]
- 116  Real                          0   81    0  7.0                                               0  r[81]=7
- 117  Divide                       80   81   79                                                    0  r[79]=r[80]/r[81]
- 118  ResultRow                    79    1    0                                                    0  output=r[79]
- 119  Halt                          0    0    0                                                    0
- 120  Transaction                   0    1    8                                                    0  iDb=0 tx_mode=Read
- 121  String8                       0   68    0  Brand#52                                          0  r[68]='Brand#52'
- 122  String8                       0   70    0  LG CAN                                            0  r[70]='LG CAN'
+ 116  Divide                       80   81   79                                                    0  r[79]=r[80]/r[81]
+ 117  ResultRow                    79    1    0                                                    0  output=r[79]
+ 118  Halt                          0    0    0                                                    0
+ 119  Transaction                   0    1    8                                                    0  iDb=0 tx_mode=Read
+ 120  String8                       0   68    0  Brand#52                                          0  r[68]='Brand#52'
+ 121  String8                       0   70    0  LG CAN                                            0  r[70]='LG CAN'
+ 122  Real                          0   81    0  7.0                                               0  r[81]=7
  123  Goto                          0    1    0                                                    0

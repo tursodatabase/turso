@@ -51,14 +51,14 @@ QUERY PLAN
 
 BYTECODE
 addr  opcode                       p1   p2   p3  p4                                                  p5  comment
-   0  Init                          0  261    0                                                       0  Start at 261
+   0  Init                          0  260    0                                                       0  Start at 260
    1  SorterOpen                    0    1    0  k(1,-B)                                              0  cursor=0
    2  Null                          0    4    0                                                       0  r[4]=NULL
    3  Null                          0    5    0                                                       0  r[5]=NULL
    4  SorterOpen                    1    3    0  k(1,-B)                                              0  cursor=1
    5  Integer                       0   44    0                                                       0  r[44]=0
    6  Null                          0   45    0                                                       0  r[45]=NULL
-   7  Gosub                        43  249    0                                                       0
+   7  Gosub                        43  248    0                                                       0
    8  OpenRead                      3    6    0  k(6,B,B,B,B,B)                                       0  table=partsupp, root=6, iDb=0
    9  Integer                       0   79    0                                                       0  r[79]=0
   10  Once                         62    0    0                                                       0  goto 62
@@ -164,7 +164,7 @@ addr  opcode                       p1   p2   p3  p4                             
  110    Jump                      111  114  111                                                       0
  111    Gosub                      42  129    0                                                       0
  112    Move                       46   45    1                                                       0  r[45..45]=r[46..46]
- 113    Gosub                      43  249    0                                                       0
+ 113    Gosub                      43  248    0                                                       0
  114    Copy                        9   95    0                                                       0  r[95]=r[9]
  115    Copy                        8   96    0                                                       0  r[96]=r[8]
  116    Multiply                   95   96   94                                                       0  r[94]=r[95]*r[96]
@@ -179,13 +179,13 @@ addr  opcode                       p1   p2   p3  p4                             
  125    Integer                     1   44    0                                                       0  r[44]=1
  126  SorterNext                    1  105    0                                                       0
  127  Gosub                        42  129    0                                                       0
- 128  Goto                          0  253    0                                                       0
+ 128  Goto                          0  252    0                                                       0
  129  IfPos                        44  131    0                                                       0  r[44]>0 -> r[44]-=0, goto 131
  130  Return                       42    0    0                                                       0
  131  AggFinal                      0    4    0  sum                                                  0  accum=r[4]
  132  AggFinal                      0    5    0  sum                                                  0  accum=r[5]
  133  Copy                          5  100    0                                                       0  r[100]=r[5]
- 134  Once                        242    0    0                                                       0  goto 242
+ 134  Once                        241    0    0                                                       0  goto 241
  135  BeginSubrtn                 103    0    0                                                       0  r[103]=NULL
  136  Null                          0  102    0                                                       0  r[102]=NULL
  137  Null                          0  104    0                                                       0  r[104]=NULL
@@ -288,31 +288,31 @@ addr  opcode                       p1   p2   p3  p4                             
  234  Integer                       0  136    0                                                       0  r[136]=0
  235  AggFinal                      0  104    0  sum                                                  0  accum=r[104]
  236  Copy                        104  157    0                                                       0  r[157]=r[104]
- 237  Real                          0  158    0  0.0001                                               0  r[158]=0.0001
- 238  Multiply                    157  158  156                                                       0  r[156]=r[157]*r[158]
- 239  Copy                        156  102    0                                                       0  r[102]=r[156]
- 240  Goto                          0  241    0                                                       0
- 241  Return                      103    0    1                                                       0
- 242  Copy                        102  101    0                                                       0  r[101]=r[102]
- 243  Le                          100  101  130                                                       0  if r[100]<=r[101] goto 130
- 244  Copy                         45    3    0                                                       0  r[3]=r[45]
- 245  Copy                          4    2    0                                                       0  r[2]=r[4]
- 246  MakeRecord                    2    2    1                                                       0  r[1]=mkrec(r[2..3])
- 247  SorterInsert                  0    1    0  0                                                    0  key=r[1]
- 248  Return                       42    0    0                                                       0
- 249  Null                          0    4    0                                                       0  r[4]=NULL
- 250  Null                          0    5    0                                                       0  r[5]=NULL
- 251  Integer                       0   44    0                                                       0  r[44]=0
- 252  Return                       43    0    0                                                       0
- 253  OpenPseudo                   13    1    2                                                       0  2 columns in r[1]
- 254  SorterSort                    0  260    0                                                       0
- 255    SorterData                  0    1   13                                                       0  r[1]=data
- 256    Column                     13    1  161                                                       0  r[161]=pseudo.column 1
- 257    Column                     13    0  162                                                       0  r[162]=pseudo.column 0
- 258    ResultRow                 161    2    0                                                       0  output=r[161..162]
- 259  SorterNext                    0  255    0                                                       0
- 260  Halt                          0    0    0                                                       0
- 261  Transaction                   0    1    8                                                       0  iDb=0 tx_mode=Read
- 262  String8                       0   91    0  ARGENTINA                                            0  r[91]='ARGENTINA'
- 263  String8                       0  149    0  ARGENTINA                                            0  r[149]='ARGENTINA'
+ 237  Multiply                    157  158  156                                                       0  r[156]=r[157]*r[158]
+ 238  Copy                        156  102    0                                                       0  r[102]=r[156]
+ 239  Goto                          0  240    0                                                       0
+ 240  Return                      103    0    1                                                       0
+ 241  Copy                        102  101    0                                                       0  r[101]=r[102]
+ 242  Le                          100  101  130                                                       0  if r[100]<=r[101] goto 130
+ 243  Copy                         45    3    0                                                       0  r[3]=r[45]
+ 244  Copy                          4    2    0                                                       0  r[2]=r[4]
+ 245  MakeRecord                    2    2    1                                                       0  r[1]=mkrec(r[2..3])
+ 246  SorterInsert                  0    1    0  0                                                    0  key=r[1]
+ 247  Return                       42    0    0                                                       0
+ 248  Null                          0    4    0                                                       0  r[4]=NULL
+ 249  Null                          0    5    0                                                       0  r[5]=NULL
+ 250  Integer                       0   44    0                                                       0  r[44]=0
+ 251  Return                       43    0    0                                                       0
+ 252  OpenPseudo                   13    1    2                                                       0  2 columns in r[1]
+ 253  SorterSort                    0  259    0                                                       0
+ 254    SorterData                  0    1   13                                                       0  r[1]=data
+ 255    Column                     13    1  161                                                       0  r[161]=pseudo.column 1
+ 256    Column                     13    0  162                                                       0  r[162]=pseudo.column 0
+ 257    ResultRow                 161    2    0                                                       0  output=r[161..162]
+ 258  SorterNext                    0  254    0                                                       0
+ 259  Halt                          0    0    0                                                       0
+ 260  Transaction                   0    1    8                                                       0  iDb=0 tx_mode=Read
+ 261  String8                       0   91    0  ARGENTINA                                            0  r[91]='ARGENTINA'
+ 262  String8                       0  149    0  ARGENTINA                                            0  r[149]='ARGENTINA'
+ 263  Real                          0  158    0  0.0001                                               0  r[158]=0.0001
  264  Goto                          0    1    0                                                       0

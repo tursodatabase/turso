@@ -405,7 +405,7 @@ test orderby_other_index_keeps_rowid_eq_seek {
 }
 expect {
     1|0|0|SEARCH t USING INTEGER PRIMARY KEY (rowid=?)
-    11|0|0|USE SORTER FOR ORDER BY
+    10|0|0|USE SORTER FOR ORDER BY
 }
 
 @setup seek_or_ordered_scan
@@ -436,5 +436,5 @@ test orderby_other_index_keeps_join_rowid_eq_seek {
 expect {
     1|0|0|SEARCH u USING INTEGER PRIMARY KEY (rowid=?)
     2|0|0|SEARCH t USING INTEGER PRIMARY KEY (rowid=?)
-    17|0|0|USE SORTER FOR ORDER BY
+    16|0|0|USE SORTER FOR ORDER BY
 }

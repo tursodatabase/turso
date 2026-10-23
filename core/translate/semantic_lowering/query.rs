@@ -9764,6 +9764,20 @@ fn emit_query_row_with_inputs<'expr>(
         } => stored_outputs,
         _ => &[],
     };
+    // A row written to an ephemeral index or table, yielded from a
+    // coroutine, or queued for a recursive CTE keeps its constants in
+    // place: another arm of a compound SELECT or a later run writes the
+    // same registers.
+    let constants_in_place = matches!(
+        output.target,
+        HirRowTarget::Direct {
+            destination: QueryDestination::EphemeralIndex { .. }
+                | QueryDestination::CoroutineYield { .. }
+                | QueryDestination::EphemeralTable { .. }
+                | QueryDestination::RecursiveCteQueue { .. },
+            ..
+        }
+    );
     if !output.needs_values() {
         for expression in expressions {
             super::expr::register_parameters(program, expression);
@@ -9775,13 +9789,23 @@ fn emit_query_row_with_inputs<'expr>(
                 None => start + position,
             };
             let translate = |program: &mut ProgramBuilder| {
-                super::expr::translate_expr_with_inputs_no_constant_opt(
-                    program,
-                    document,
-                    expression,
-                    register,
-                    inputs.values,
-                )
+                if constants_in_place {
+                    super::expr::translate_expr_with_inputs_no_constant_opt(
+                        program,
+                        document,
+                        expression,
+                        register,
+                        inputs.values,
+                    )
+                } else {
+                    super::expr::translate_expr_with_inputs(
+                        program,
+                        document,
+                        expression,
+                        register,
+                        inputs.values,
+                    )
+                }
             };
             if stored_outputs.contains(&position) {
                 super::dml::with_stored_values(program, translate)?;

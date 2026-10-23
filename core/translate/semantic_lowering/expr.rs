@@ -4675,17 +4675,21 @@ pub(crate) fn translate_expr_with_inputs<'expr>(
         document,
         inputs,
     };
-    // Like SQLite, a whole expression that calls a function with the same
-    // value on every row, such as `unixepoch()` or `abs(-5)` as a result
-    // column, is computed the first time it is reached and copied from its
-    // own register after that. The register is its own because the target
-    // may be written by others, as a subquery resets its result to NULL on
-    // each run. A literal alone is loaded on every row, as SQLite loads it.
-    if !inputs.is_empty()
-        || !lowerer.is_hoisted_constant(expression)
-        || !constant_may_fail(expression)
-    {
+    // A whole expression with the same value on every row is computed
+    // once. One that cannot fail, such as `1` or `'x' || 'y'` as a result
+    // column, moves before the loops. One that calls a function, such as
+    // `unixepoch()` or `abs(-5)`, might fail, so like SQLite it is computed
+    // the first time it is reached and copied from its own register after
+    // that. The register is its own because the target may be written by
+    // others, as a subquery resets its result to NULL on each run.
+    if !inputs.is_empty() || !lowerer.is_hoisted_constant(expression) {
         return expression.walk(LoweringContext::new(target), &mut lowerer);
+    }
+    if !constant_may_fail(expression) {
+        let span = lowerer.program.constant_span_start();
+        let result = expression.walk(LoweringContext::new(target), &mut lowerer);
+        lowerer.program.constant_span_end(span);
+        return result;
     }
     let done = lowerer.begin_once();
     let own = lowerer.program.alloc_register();

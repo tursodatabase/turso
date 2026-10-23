@@ -34,9 +34,9 @@ QUERY PLAN
 
 BYTECODE
 addr  opcode             p1  p2  p3  p4        p5  comment
-   0  Init                0  94   0             0  Start at 94
+   0  Init                0  93   0             0  Start at 93
    1  OpenRead            0   2   0  k(2,B)     0  table=nested_correlated_outer, root=2, iDb=0
-   2  Rewind              0  93   0             0  Rewind table nested_correlated_outer
+   2  Rewind              0  92   0             0  Rewind table nested_correlated_outer
    3    Once              5   0   0             0  goto 5
    4    OpenEphemeral     1   0   0             0  cursor=1 is_table=false
    5    Column            0   0   3             0  r[3]=nested_correlated_outer.id
@@ -44,7 +44,7 @@ addr  opcode             p1  p2  p3  p4        p5  comment
    7    SeekGE            1  11   3             0  key=[3..4]
    8    IdxGT             1  11   3             0  key=[3..4]
    9    Column            1   2   2             0  r[2]=ephemeral(ephemeral_subquery_cache_1).c2
-  10    Goto              0  90   0             0
+  10    Goto              0  89   0             0
   11    BeginSubrtn       6   0   0             0  r[6]=NULL
   12    Null              0   2   0             0  r[2]=NULL
   13    Null              0   7   0             0  r[7]=NULL
@@ -98,35 +98,35 @@ addr  opcode             p1  p2  p3  p4        p5  comment
   61    OpenEphemeral     8   1   0             0  cursor=8 is_table=true
   62    Null              0  34   0             0  r[34]=NULL
   63    MakeRecord       34   1  35             0  r[35]=mkrec(r[34..34])
-  64    Rewind            2  74   0             0  Rewind table nested_correlated_anchor
-  65      Rewind          3  73   0             0  Rewind table ephemeral((join-1))
-  66        Integer       1  36   0             0  r[36]=1
-  67        IfNot        36  72   1             0  if !r[36] goto 72
-  68        RowId         3  37   0             0  r[37]=ephemeral((join-1)).rowid
-  69        Insert        8  35  37             6  intkey=r[37] data=r[35]
-  70        Integer       1  38   0             0  r[38]=1
-  71        AggStep       0  38   7  count      0  accum=r[7] step(r[38])
-  72      Next            3  66   0             1
-  73    Next              2  65   0             1
-  74    NullRow           2   0   0             0  Set cursor 2 to a (pseudo) NULL row
-  75    Rewind            3  82   0             0  Rewind table ephemeral((join-1))
-  76      RowId           3  39   0             0  r[39]=ephemeral((join-1)).rowid
-  77      NotExists       8  79  39             0
-  78      Goto            0  81   0             0
-  79      Integer         1  41   0             0  r[41]=1
-  80      AggStep         0  41   7  count      0  accum=r[7] step(r[41])
-  81    Next              3  76   0             1
-  82    AggFinal          0   7   0  count      0  accum=r[7]
-  83    Copy              7  42   0             0  r[42]=r[7]
-  84    Copy             42   2   0             0  r[2]=r[42]
-  85    Goto              0  86   0             0
-  86    Return            6   0   1             0
-  87    Copy              2   5   0             0  r[5]=r[2]
-  88    MakeRecord        3   3  43             0  r[43]=mkrec(r[3..5])
-  89    IdxInsert         1  43   3             0  key=r[43]
-  90    Copy              2   1   0             0  r[1]=r[2]
-  91    ResultRow         1   1   0             0  output=r[1]
-  92  Next                0   3   0             1
-  93  Halt                0   0   0             0
-  94  Transaction         0   1   4             0  iDb=0 tx_mode=Read
+  64    Rewind            2  73   0             0  Rewind table nested_correlated_anchor
+  65      Rewind          3  72   0             0  Rewind table ephemeral((join-1))
+  66        IfNot        36  71   1             0  if !r[36] goto 71
+  67        RowId         3  37   0             0  r[37]=ephemeral((join-1)).rowid
+  68        Insert        8  35  37             6  intkey=r[37] data=r[35]
+  69        Integer       1  38   0             0  r[38]=1
+  70        AggStep       0  38   7  count      0  accum=r[7] step(r[38])
+  71      Next            3  66   0             1
+  72    Next              2  65   0             1
+  73    NullRow           2   0   0             0  Set cursor 2 to a (pseudo) NULL row
+  74    Rewind            3  81   0             0  Rewind table ephemeral((join-1))
+  75      RowId           3  39   0             0  r[39]=ephemeral((join-1)).rowid
+  76      NotExists       8  78  39             0
+  77      Goto            0  80   0             0
+  78      Integer         1  41   0             0  r[41]=1
+  79      AggStep         0  41   7  count      0  accum=r[7] step(r[41])
+  80    Next              3  75   0             1
+  81    AggFinal          0   7   0  count      0  accum=r[7]
+  82    Copy              7  42   0             0  r[42]=r[7]
+  83    Copy             42   2   0             0  r[2]=r[42]
+  84    Goto              0  85   0             0
+  85    Return            6   0   1             0
+  86    Copy              2   5   0             0  r[5]=r[2]
+  87    MakeRecord        3   3  43             0  r[43]=mkrec(r[3..5])
+  88    IdxInsert         1  43   3             0  key=r[43]
+  89    Copy              2   1   0             0  r[1]=r[2]
+  90    ResultRow         1   1   0             0  output=r[1]
+  91  Next                0   3   0             1
+  92  Halt                0   0   0             0
+  93  Transaction         0   1   4             0  iDb=0 tx_mode=Read
+  94  Integer             1  36   0             0  r[36]=1
   95  Goto                0   1   0             0

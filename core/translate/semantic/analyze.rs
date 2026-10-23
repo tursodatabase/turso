@@ -404,6 +404,15 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
         self.sources.get(id.index())?.as_ref()
     }
 
+    pub(super) fn source_count(&self) -> usize {
+        self.sources.len()
+    }
+
+    /// The sources added since there were `first` of them.
+    pub(super) fn sources_from(&self, first: usize) -> impl Iterator<Item = &Source> {
+        self.sources[first..].iter().flatten()
+    }
+
     pub(super) fn source_mut(&mut self, id: SourceId) -> Option<&mut Source> {
         self.sources.get_mut(id.index())?.as_mut()
     }
@@ -638,12 +647,15 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
             }
         }
         let mut finished = HashSet::default();
+        // A column's generated or default expression names columns of its
+        // own table, so every column of one source shares one scope.
+        let mut scopes: HashMap<SourceId, Scope> = HashMap::default();
 
         while let Some(reference) = pending.pop() {
             if !finished.insert(reference) {
                 continue;
             }
-            let (scope, generated_syntax, default_syntax) = {
+            let (generated_syntax, default_syntax) = {
                 let source = self.source(reference.source).ok_or_else(|| {
                     LimboError::InternalError(format!(
                         "missing source {} while planning stored column expressions",
@@ -701,24 +713,31 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
                     ),
                     ColumnReadExpression::Absent | ColumnReadExpression::Planned(_) => None,
                 };
-                let mut scope = Scope::default();
-                scope.add_schema_source(source);
-                (scope, generated_syntax, default_syntax)
+                if generated_syntax.is_none() && default_syntax.is_none() {
+                    continue;
+                }
+                scopes.entry(reference.source).or_insert_with(|| {
+                    let mut scope = Scope::default();
+                    scope.add_schema_source(source);
+                    scope
+                });
+                (generated_syntax, default_syntax)
             };
+            let scope = &scopes[&reference.source];
 
             let policy = ExprPolicy::schema_expression().with_self_source(reference.source);
             let generated = generated_syntax
                 .as_ref()
                 .map(|syntax| {
                     let was_standard = std::mem::replace(&mut self.standard_operators_only, true);
-                    let generated = self.analyze_expr(syntax, &scope, policy);
+                    let generated = self.analyze_expr(syntax, scope, policy);
                     self.standard_operators_only = was_standard;
                     generated
                 })
                 .transpose()?;
             let default = default_syntax
                 .as_ref()
-                .map(|syntax| self.analyze_expr(syntax, &scope, policy))
+                .map(|syntax| self.analyze_expr(syntax, scope, policy))
                 .transpose()?;
 
             for expression in generated.iter().chain(default.iter()) {

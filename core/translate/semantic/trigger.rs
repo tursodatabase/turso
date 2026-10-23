@@ -167,8 +167,30 @@ impl<'ast> Analyzer<'_, '_, 'ast> {
         select: &'ast ast::Select,
     ) -> Result<hir::TriggerCommand> {
         let policies = ExprPolicies::trigger(self.context().dqs_dml(), environment);
+        let first_source = self.source_count();
         let query = self.analyze_subquery(select, None, scope, policies)?;
+        self.reject_unsafe_virtual_table_reads(first_source)?;
         Ok(hir::TriggerCommand::Select(query))
+    }
+
+    /// Like SQLite, a trigger may only read a virtual table whose module
+    /// marks it innocuous. The sources the SELECT added, including those of
+    /// its subqueries, start at `first_source`.
+    fn reject_unsafe_virtual_table_reads(&self, first_source: usize) -> Result<()> {
+        for source in self.sources_from(first_source) {
+            let table = match &source.kind {
+                hir::SourceKind::Table(table) | hir::SourceKind::TableFunction { table, .. } => {
+                    table
+                }
+                _ => continue,
+            };
+            if let Some(virtual_table) = table.value().virtual_table() {
+                if !virtual_table.innocuous {
+                    crate::bail_parse_error!("unsafe use of virtual table \"{}\"", source.name);
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Resolve the table an INSERT, UPDATE or DELETE inside a trigger writes.
@@ -179,17 +201,27 @@ impl<'ast> Analyzer<'_, '_, 'ast> {
         table: &ast::Name,
         database: Option<hir::DatabaseId>,
     ) -> Result<hir::SourceId> {
-        match database {
+        let source = match database {
             Some(database) => {
-                self.analyze_base_table_source_in_database(table, database, SourceOwner::Root)
+                self.analyze_base_table_source_in_database(table, database, SourceOwner::Root)?
             }
             None => self.analyze_base_table_source(
                 &ast::QualifiedName::single(table.clone()),
                 None,
                 None,
                 SourceOwner::Root,
-            ),
+            )?,
+        };
+        // Like SQLite, a trigger never writes a virtual table.
+        let target = self.source(source).ok_or_else(|| {
+            LimboError::InternalError(format!("trigger target source {source} is missing"))
+        })?;
+        if let hir::SourceKind::Table(table) = &target.kind {
+            if table.value().virtual_table().is_some() {
+                crate::bail_parse_error!("unsafe use of virtual table \"{}\"", target.name);
+            }
         }
+        Ok(source)
     }
 
     fn analyze_trigger_insert_in(

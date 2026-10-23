@@ -931,9 +931,7 @@ pub(crate) fn compute_hir_join_order(
             best
         }
     }) else {
-        return Err(LimboError::PlanningError(
-            "No valid HIR join order found".to_string(),
-        ));
+        return Err(LimboError::PlanningError("no query solution".to_string()));
     };
     // The cheapest plan whose loops already follow the order target, which
     // the caller may prefer to skip a sort.
