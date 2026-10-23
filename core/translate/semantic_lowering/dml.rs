@@ -366,11 +366,13 @@ fn emit_index_key_values(
             }
             (None, Some(table_column)) => emit_stored_column(
                 program,
+                document,
+                source,
                 table_cursor,
                 table_column,
                 column.pos_in_table,
                 register,
-            ),
+            )?,
             (None, None) => {
                 return Err(LimboError::InternalError(format!(
                     "HIR index {} has an expression column without an expression",
@@ -471,7 +473,8 @@ pub(super) fn emit_replace_delete(
         }
     }
     if let Some(capture) = target.capture_rows() {
-        let before = capture.before_record(program, table, table_cursor, conflict);
+        let before =
+            capture.before_record(program, document, source, table, table_cursor, conflict)?;
         capture.emit_row(
             program,
             crate::translate::emitter::OperationMode::DELETE,
@@ -938,18 +941,50 @@ pub(super) fn emit_strict_generated_check(
 
 /// Read a stored column of a DML row from the table. SQLite stores a REAL
 /// value that is a whole number as an integer, so a REAL column gives its
-/// value back as REAL, as a query reads it.
+/// value back as REAL, as a query reads it. A row written before the
+/// column was added holds ENCODE(DEFAULT) for a column of an encoding
+/// custom type, as a query reads it.
 pub(super) fn emit_stored_column(
     program: &mut ProgramBuilder,
+    document: &HirDocument,
+    source: &hir::Source,
     table_cursor: usize,
     column: &crate::schema::Column,
     position: usize,
     register: usize,
-) {
-    program.emit_column_or_rowid(table_cursor, position, register);
+) -> Result<()> {
+    let encoded_default = match (
+        source.default_expressions.get(position),
+        source.column_type_programs.get(position),
+    ) {
+        (Some(hir::ColumnReadExpression::Planned(default)), Some(Some(programs)))
+            if !programs.encode.is_empty() =>
+        {
+            Some((default, programs))
+        }
+        _ => None,
+    };
+    match encoded_default {
+        Some((default, programs)) => {
+            program.flags.set_suppress_column_default(true);
+            program.emit_column_or_rowid(table_cursor, position, register);
+            let has_field = program.allocate_label();
+            program.emit_column_has_field(table_cursor, position, has_field);
+            super::expr::translate_expr_no_constant_opt(program, document, default, register)?;
+            super::expr::translate_schema_calls_in_place(
+                program,
+                document,
+                &programs.encode,
+                register,
+            )?;
+            program.preassign_label_to_next_insn(has_field);
+        }
+        None => program.emit_column_or_rowid(table_cursor, position, register),
+    }
     if column.ty() == crate::schema::Type::Real {
         program.emit_insn(Insn::RealAffinity { register });
     }
+    Ok(())
 }
 
 /// The custom type of `column` of `source`: its definitions from the

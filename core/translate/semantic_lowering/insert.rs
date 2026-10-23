@@ -1439,11 +1439,13 @@ impl InsertRow<'_> {
                 if value.is_none() && !column.is_rowid_alias() && !column.is_virtual_generated() {
                     super::dml::emit_stored_column(
                         program,
+                        document,
+                        new_source,
                         self.table_cursor,
                         column,
                         position,
                         new_row + position,
-                    );
+                    )?;
                 }
             }
             super::dml::emit_virtual_columns(program, document, new_source.id, table, new_row)?;
@@ -1528,7 +1530,18 @@ impl InsertRow<'_> {
         let capture_before = self
             .target
             .capture_rows()
-            .and_then(|capture| capture.before_record(program, table, self.table_cursor, conflict));
+            .map(|capture| {
+                capture.before_record(
+                    program,
+                    document,
+                    source,
+                    table,
+                    self.table_cursor,
+                    conflict,
+                )
+            })
+            .transpose()?
+            .flatten();
 
         // Every UNIQUE constraint is checked against the new row before
         // any index changes.

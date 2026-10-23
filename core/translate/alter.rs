@@ -2,6 +2,7 @@ use crate::alloc::TursoIteratorExt;
 use crate::sync::Arc;
 use crate::translate::plan::ColumnMask;
 use crate::translate::semantic::context::SemanticContext;
+use crate::translate::semantic_lowering::{PlannedSelect, ScanValue};
 use crate::{bail_parse_error, schema::BTreeTable, turso_assert_eq, turso_assert_ne};
 use turso_parser::{ast, parser::Parser};
 
@@ -640,20 +641,16 @@ fn emit_column_constraints_validation(
 
     let mut values = Vec::with_capacity(check_constraints.len() + 1);
     for check in &check_constraints {
-        values.push(crate::translate::semantic_lowering::ScanValue::Stored(
-            substitute(&check.expr),
-        ));
+        values.push(ScanValue::Stored(substitute(&check.expr)));
     }
     if has_notnull {
-        values.push(crate::translate::semantic_lowering::ScanValue::Expr(
-            ast::Expr::clone(generated),
-        ));
+        values.push(ScanValue::Expr(ast::Expr::clone(generated)));
     }
     let database = connection
         .namespaces()
         .name(database_id)
         .ok_or_else(|| LimboError::InternalError(format!("no database with id {database_id}")))?;
-    let select = crate::translate::semantic_lowering::PlannedSelect::scan(
+    let select = PlannedSelect::scan(
         values,
         database,
         table.name.clone(),
@@ -840,11 +837,8 @@ fn emit_add_column_check_validation(
     let database = connection.namespaces().name(database_id).ok_or_else(|| {
         crate::LimboError::InternalError(format!("no database with id {database_id}"))
     })?;
-    let select = crate::translate::semantic_lowering::PlannedSelect::scan(
-        substituted
-            .into_iter()
-            .map(crate::translate::semantic_lowering::ScanValue::Stored)
-            .collect(),
+    let select = PlannedSelect::scan(
+        substituted.into_iter().map(ScanValue::Stored).collect(),
         database,
         original_btree.name.clone(),
         None,
@@ -1178,6 +1172,7 @@ pub fn translate_alter_table(
                             source_column_by_schema_idx,
                             layout,
                             None,
+                            catalog,
                             catalog,
                             connection,
                             database_id,
@@ -2278,6 +2273,7 @@ pub fn translate_alter_table(
                     Arc::new(crate::schema::Table::BTree(altered_table.clone())),
                     altered_indexes,
                 );
+                let original_catalog = catalog;
                 let catalog = &altered_catalog;
                 emit_column_constraints_validation(
                     program,
@@ -2326,6 +2322,7 @@ pub fn translate_alter_table(
                         &source_column_by_schema_idx,
                         &layout,
                         converted_column,
+                        original_catalog,
                         catalog,
                         connection,
                         database_id,
@@ -2621,8 +2618,15 @@ fn emit_rewrite_table_indexes(
 /// Rewrite every row in `original_btree` into the physical layout of `rewritten_table`.
 ///
 /// `source_column_by_schema_idx` is indexed by the rewritten table's schema order. Each
-/// entry is either the physical column index to read from the old row image or `None`
-/// for virtual generated columns, which are omitted from the stored record entirely.
+/// entry is either the column index to read from the old row or `None` for a column
+/// without a value on the old row: a virtual generated column, which is omitted from
+/// the stored record entirely, or a column that becomes stored, which is NULL.
+///
+/// The old row is read as DML reads its target: as stored, with a column added with
+/// a DEFAULT filled with its encoded default. The column `converted_column` is read
+/// decoded, as a query reads it, and converted to its new type the same way INSERT
+/// converts a new value: checked against the type it accepts, encoded with its new
+/// custom type (if any), and checked against the storage type.
 #[allow(clippy::too_many_arguments)]
 fn emit_rewrite_table_rows(
     program: &mut ProgramBuilder,
@@ -2631,6 +2635,7 @@ fn emit_rewrite_table_rows(
     source_column_by_schema_idx: &[Option<usize>],
     layout: &ColumnLayout,
     converted_column: Option<usize>,
+    original_catalog: &SemanticContext<'_>,
     catalog: &SemanticContext<'_>,
     connection: &Arc<crate::Connection>,
     database_id: usize,
@@ -2640,10 +2645,60 @@ fn emit_rewrite_table_rows(
         rewritten_table.columns().len()
     );
 
+    let column_count = rewritten_table.columns().len();
     let non_virtual_column_count = layout.num_non_virtual_cols();
     let root_page = rewritten_table.root_page;
     let table_name = rewritten_table.name.clone();
     let affinity_str = non_virtual_affinity_str(rewritten_table);
+    let database = connection
+        .namespaces()
+        .name(database_id)
+        .ok_or_else(|| LimboError::InternalError(format!("no database with id {database_id}")))?;
+    let column_name = |column: &Column| -> Result<ast::Expr> {
+        let name = column.name.clone().ok_or_else(|| {
+            LimboError::InternalError(format!("unnamed column in table {table_name}"))
+        })?;
+        Ok(ast::Expr::Id(ast::Name::exact(name)))
+    };
+    let values = source_column_by_schema_idx
+        .iter()
+        .enumerate()
+        .map(|(schema_idx, source_column_idx)| {
+            let Some(source_column_idx) = source_column_idx else {
+                return Ok(ScanValue::Expr(ast::Expr::Literal(ast::Literal::Null)));
+            };
+            let column = column_name(&original_btree.columns()[*source_column_idx])?;
+            Ok(if converted_column == Some(schema_idx) {
+                ScanValue::Expr(column)
+            } else {
+                ScanValue::Stored(column)
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let reads = PlannedSelect::scan(
+        values,
+        database.clone(),
+        original_btree.name.clone(),
+        None,
+        original_catalog,
+        connection,
+    )?;
+    let conversion = converted_column
+        .filter(|_| rewritten_table.is_strict)
+        .map(|column_index| {
+            let column = column_name(&rewritten_table.columns()[column_index])?;
+            let select = PlannedSelect::scan(
+                vec![ScanValue::Expr(column)],
+                database,
+                rewritten_table.name.clone(),
+                None,
+                catalog,
+                connection,
+            )?;
+            Ok::<_, LimboError>((select, column_index))
+        })
+        .transpose()?;
+    let rewritten_table = Arc::new(rewritten_table.clone());
     let cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(original_btree));
 
     program.emit_insn(Insn::OpenWrite {
@@ -2653,38 +2708,32 @@ fn emit_rewrite_table_rows(
     });
 
     program.cursor_loop(cursor_id, |program, rowid| -> Result<()> {
-        // Initialize all destination slots to NULL so that columns without a
-        // source value (e.g. when a virtual generated column becomes stored,
-        // there is no pre-existing value on the old row image) default to NULL.
-        let base_dest_reg = program.alloc_registers_and_init_w_null(non_virtual_column_count);
-        for (schema_idx, source_column_idx) in source_column_by_schema_idx.iter().enumerate() {
-            let Some(source_column_idx) = source_column_idx else {
-                continue;
-            };
-
-            program.emit_column_or_rowid(
-                cursor_id,
-                *source_column_idx,
-                layout.to_register(base_dest_reg, schema_idx),
-            );
+        let row = program.alloc_registers(column_count);
+        reads.emit_values_from_cursor(program, cursor_id, row)?;
+        if let Some((conversion, column_index)) = &conversion {
+            conversion.emit_custom_type_writes(program, &rewritten_table, row, &[*column_index])?;
         }
-
-        if let Some(column_index) = converted_column {
-            if rewritten_table.is_strict {
-                emit_strict_column_conversion(
-                    program,
-                    catalog,
-                    column_index,
-                    rewritten_table,
-                    base_dest_reg,
-                    layout,
-                )?;
+        let stored = match layout {
+            ColumnLayout::Identity { .. } => row,
+            ColumnLayout::Mapped { .. } => {
+                let stored = program.alloc_registers(non_virtual_column_count);
+                for (schema_idx, column) in rewritten_table.columns().iter().enumerate() {
+                    if column.is_virtual_generated() {
+                        continue;
+                    }
+                    program.emit_insn(Insn::Copy {
+                        src_reg: row + schema_idx,
+                        dst_reg: layout.to_register(stored, schema_idx),
+                        extra_amount: 0,
+                    });
+                }
+                stored
             }
-        }
+        };
 
         let record = program.alloc_register();
         program.emit_insn(Insn::MakeRecord {
-            start_reg: to_u32(base_dest_reg),
+            start_reg: to_u32(stored),
             count: to_u32(non_virtual_column_count),
             dest_reg: to_u32(record),
             index_name: None,
@@ -2708,40 +2757,6 @@ fn emit_rewrite_table_rows(
         });
         Ok(())
     })
-}
-
-/// Convert the stored value of the altered column the same way INSERT
-/// converts a new value: decode it with the old custom type (if any), check it
-/// against the new type, encode it with the new custom type (if any), and check
-/// the encoded value against the storage type.
-fn emit_strict_column_conversion(
-    program: &mut ProgramBuilder,
-    catalog: &SemanticContext<'_>,
-    column_index: usize,
-    rewritten_table: &BTreeTable,
-    start_reg: usize,
-    layout: &ColumnLayout,
-) -> Result<()> {
-    let mut column_mask = ColumnMask::default();
-    column_mask.set(column_index)?;
-    let rewritten_table = Arc::new(rewritten_table.clone());
-    program.emit_insn(Insn::TypeCheck {
-        start_reg,
-        count: layout.num_non_virtual_cols(),
-        check_generated: false,
-        table_reference: BTreeTable::input_type_check_table_ref(
-            &rewritten_table,
-            catalog.main_schema(),
-            Some(&column_mask),
-        )?,
-    });
-    program.emit_insn(Insn::TypeCheck {
-        start_reg,
-        count: layout.num_non_virtual_cols(),
-        check_generated: false,
-        table_reference: BTreeTable::type_check_table_ref(&rewritten_table, catalog.main_schema()),
-    });
-    Ok(())
 }
 
 fn non_virtual_affinity_str(table: &BTreeTable) -> String {

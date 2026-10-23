@@ -32,7 +32,11 @@ use crate::{
         },
         semantic_to_plan::{HirPlan, HirRootPlan},
     },
-    vdbe::{affinity::Affinity, builder::ProgramBuilder},
+    vdbe::{
+        affinity::Affinity,
+        builder::{ProgramBuilder, SourceBinding},
+        CursorID,
+    },
     Connection, LimboError, Result,
 };
 
@@ -330,6 +334,79 @@ impl PlannedSelect {
             )
         })?;
         Ok(values)
+    }
+
+    /// Compute the SELECT's values for the row `cursor` is on, into the
+    /// registers `start + column`, one per value. The SELECT reads one
+    /// table, which `cursor` is open on, and has no WHERE clause.
+    pub(crate) fn emit_values_from_cursor(
+        &self,
+        program: &mut ProgramBuilder,
+        cursor: CursorID,
+        start: usize,
+    ) -> Result<()> {
+        let source = self.table_source()?;
+        let document = &self.plan.document;
+        let query = document
+            .query(self.query)
+            .ok_or_else(|| LimboError::InternalError("HIR scan query is missing".into()))?;
+        program.bind_source(
+            source,
+            SourceBinding::BTree {
+                scan_cursor: cursor,
+                table_cursor: None,
+            },
+        );
+        program.set_hir_plan(self.plan.clone());
+        for (position, output) in query.output.iter().enumerate() {
+            let output = document
+                .output(*output)
+                .ok_or_else(|| LimboError::InternalError("HIR scan output is missing".into()))?;
+            let target = start + position;
+            if self.stored_outputs.contains(&position) {
+                dml::with_stored_values(program, |program| {
+                    expr::translate_expr_no_constant_opt(program, document, &output.expr, target)
+                })?;
+            } else {
+                expr::translate_expr_no_constant_opt(program, document, &output.expr, target)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// STRICT: check the values at `start + column` of the columns `only`
+    /// of the table the SELECT reads against the types they accept, encode
+    /// them with their custom types, then check the encoded values against
+    /// the columns' base types, as INSERT does with new values.
+    pub(crate) fn emit_custom_type_writes(
+        &self,
+        program: &mut ProgramBuilder,
+        table: &Arc<crate::schema::BTreeTable>,
+        start: usize,
+        only: &[usize],
+    ) -> Result<()> {
+        let document = &self.plan.document;
+        let source = document
+            .source(self.table_source()?)
+            .ok_or_else(|| LimboError::InternalError("HIR scan source is missing".into()))?;
+        dml::emit_custom_type_writes(program, document, source, table, start, Some(only))
+    }
+
+    /// The one table the SELECT reads.
+    fn table_source(&self) -> Result<hir::SourceId> {
+        let document = &self.plan.document;
+        let query = document
+            .query(self.query)
+            .ok_or_else(|| LimboError::InternalError("HIR scan query is missing".into()))?;
+        let block = document
+            .query_block(query.first)
+            .ok_or_else(|| LimboError::InternalError("HIR scan block is missing".into()))?;
+        match &block.from {
+            Some(from) if from.joins.is_empty() && query.blocks.len() == 1 => Ok(from.first),
+            _ => Err(LimboError::InternalError(
+                "HIR scan does not read exactly one table".into(),
+            )),
+        }
     }
 }
 

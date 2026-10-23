@@ -16,14 +16,13 @@ use crate::{
     sync::Arc,
     translate::{
         emitter::{
-            emit_cdc_full_record, emit_cdc_row, emit_cdc_statement_commit, CdcChangeIds,
-            CdcCommitCursor, OperationMode,
+            emit_cdc_row, emit_cdc_statement_commit, CdcChangeIds, CdcCommitCursor, OperationMode,
         },
-        semantic::hir,
+        semantic::hir::{self, HirDocument},
     },
     vdbe::{
         builder::{CursorType, ProgramBuilder},
-        insn::{Insn, RegisterOrLiteral},
+        insn::{to_u32, Insn, RegisterOrLiteral},
         CursorID,
     },
     CaptureDataChangesExt, LimboError, Result,
@@ -153,14 +152,55 @@ impl Rows<'_, '_> {
     pub(super) fn before_record(
         &self,
         program: &mut ProgramBuilder,
+        document: &HirDocument,
+        source: &hir::Source,
         table: &BTreeTable,
         table_cursor: CursorID,
         rowid: usize,
-    ) -> Option<usize> {
-        program
-            .capture_data_changes_info()
-            .has_before()
-            .then(|| emit_cdc_full_record(program, table.columns(), table_cursor, rowid))
+    ) -> Result<Option<usize>> {
+        if !program.capture_data_changes_info().has_before() {
+            return Ok(None);
+        }
+        let columns = table.columns();
+        let stored = columns.iter().filter(|c| !c.is_virtual_generated()).count();
+        let record = program.alloc_registers(stored + 1);
+        let mut slot = 0;
+        for (position, column) in columns.iter().enumerate() {
+            if column.is_virtual_generated() {
+                continue;
+            }
+            if column.is_rowid_alias() {
+                program.emit_insn(Insn::Copy {
+                    src_reg: rowid,
+                    dst_reg: record + 1 + slot,
+                    extra_amount: 0,
+                });
+            } else {
+                super::dml::emit_stored_column(
+                    program,
+                    document,
+                    source,
+                    table_cursor,
+                    column,
+                    position,
+                    record + 1 + slot,
+                )?;
+            }
+            slot += 1;
+        }
+        let affinity_str = columns
+            .iter()
+            .filter(|column| !column.is_virtual_generated())
+            .map(|column| column.affinity().aff_mask())
+            .collect::<String>();
+        program.emit_insn(Insn::MakeRecord {
+            start_reg: to_u32(record + 1),
+            count: to_u32(stored),
+            dest_reg: to_u32(record),
+            index_name: None,
+            affinity_str: Some(affinity_str),
+        });
+        Ok(Some(record))
     }
 
     /// The after image of the row in registers `start + column`, whose

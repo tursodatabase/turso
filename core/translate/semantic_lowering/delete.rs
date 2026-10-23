@@ -537,7 +537,7 @@ fn emit_delete_row(
                 .iter()
                 .any(|output| has_subquery(&output.expr))
         })
-        .map(|_| {
+        .map(|_| -> Result<usize> {
             // A virtual column is not stored; reading it through the copy
             // computes it from the other columns.
             let start = program.alloc_registers(table.columns().len());
@@ -547,15 +547,18 @@ fn emit_delete_row(
                 } else {
                     super::dml::emit_stored_column(
                         program,
+                        document,
+                        source,
                         table_cursor,
                         column,
                         position,
                         start + position,
-                    );
+                    )?;
                 }
             }
-            start
-        });
+            Ok(start)
+        })
+        .transpose()?;
     let returning_row = returning
         .filter(|_| copy.is_none())
         .map(|returning| returning.emit_values(program, document, target.resolved_table()?))
@@ -591,7 +594,8 @@ fn emit_delete_row(
     }
     // The captured change reads the row before it is deleted.
     if let Some(capture) = target.capture_rows() {
-        let before = capture.before_record(program, table, table_cursor, row.rowid);
+        let before =
+            capture.before_record(program, document, source, table, table_cursor, row.rowid)?;
         capture.emit_row(
             program,
             OperationMode::DELETE,

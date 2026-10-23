@@ -1526,11 +1526,13 @@ impl UpdateRow<'_, '_> {
                 if value.is_none() && !column.is_rowid_alias() && !column.is_virtual_generated() {
                     super::dml::emit_stored_column(
                         program,
+                        document,
+                        source,
                         self.table_cursor,
                         column,
                         position,
                         self.start() + position,
-                    );
+                    )?;
                 }
             }
             for (position, (column, value)) in table.columns().iter().zip(layout.values).enumerate()
@@ -1613,9 +1615,21 @@ impl UpdateRow<'_, '_> {
             })
             .collect::<Result<Vec<_>>>()?;
         // The row before the change, for change data capture.
-        let capture_before = self.target.capture_rows().and_then(|capture| {
-            capture.before_record(program, table, self.table_cursor, self.rowid)
-        });
+        let capture_before = self
+            .target
+            .capture_rows()
+            .map(|capture| {
+                capture.before_record(
+                    program,
+                    document,
+                    source,
+                    table,
+                    self.table_cursor,
+                    self.rowid,
+                )
+            })
+            .transpose()?
+            .flatten();
         for ((old, _), (cursor, key)) in layout
             .changed_indexes
             .iter()
@@ -1874,11 +1888,13 @@ impl UpdateRow<'_, '_> {
                 None => {
                     super::dml::emit_stored_column(
                         program,
+                        self.target.document,
+                        self.target.source,
                         self.table_cursor,
                         column,
                         position,
                         register,
-                    );
+                    )?;
                     read_old_column = true;
                 }
             }

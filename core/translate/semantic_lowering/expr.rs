@@ -537,40 +537,41 @@ impl<'expr> ExprLowerer<'_, 'expr, '_> {
             .column_type_programs
             .get(reference.column)?
             .as_ref()?;
-        if !self.program.flags.suppress_custom_type_decode() {
-            if let hir::ColumnReadExpression::Planned(default) =
-                source.default_expressions.get(reference.column)?
-            {
-                if !programs.encode.is_empty() {
-                    if index == 0 {
-                        return Some(ColumnChild::Default(default));
-                    }
-                    index -= 1;
-                    let encode_children: usize = programs
-                        .encode
-                        .iter()
-                        .map(|call| call.arguments.len() + 1)
-                        .sum();
-                    if index < encode_children {
-                        return self
-                            .schema_call_child(&programs.encode, index)
-                            .map(|child| ColumnChild::Program {
-                                phase: ColumnProgram::Encode,
-                                child,
-                            });
-                    }
-                    index -= encode_children;
+        // A row that misses the column holds ENCODE(DEFAULT), whether the
+        // value is decoded or read as stored.
+        if let hir::ColumnReadExpression::Planned(default) =
+            source.default_expressions.get(reference.column)?
+        {
+            if !programs.encode.is_empty() {
+                if index == 0 {
+                    return Some(ColumnChild::Default(default));
                 }
+                index -= 1;
+                let encode_children: usize = programs
+                    .encode
+                    .iter()
+                    .map(|call| call.arguments.len() + 1)
+                    .sum();
+                if index < encode_children {
+                    return self
+                        .schema_call_child(&programs.encode, index)
+                        .map(|child| ColumnChild::Program {
+                            phase: ColumnProgram::Encode,
+                            child,
+                        });
+                }
+                index -= encode_children;
             }
-
-            if column.type_fact.array_dimensions == 0 {
-                return self
-                    .schema_call_child(&programs.decode, index)
-                    .map(|child| ColumnChild::Program {
-                        phase: ColumnProgram::Decode,
-                        child,
-                    });
-            }
+        }
+        if !self.program.flags.suppress_custom_type_decode()
+            && column.type_fact.array_dimensions == 0
+        {
+            return self
+                .schema_call_child(&programs.decode, index)
+                .map(|child| ColumnChild::Program {
+                    phase: ColumnProgram::Decode,
+                    child,
+                });
         }
         None
     }
@@ -3221,7 +3222,7 @@ impl ExprLowerer<'_, '_, '_> {
                         .sum()
                 })
             };
-        let encode_default_children = if encoded_default && !suppress_custom_type_decode {
+        let encode_default_children = if encoded_default {
             1 + type_program.as_ref().map_or(0, |programs| {
                 programs
                     .encode
@@ -6100,18 +6101,25 @@ mod tests {
         );
         super::translate_expr(&mut suppressed, &document, expression, 3)
             .expect("encoded custom column lowers without decode");
-        assert!(matches!(
-            suppressed.insns.as_slice(),
-            [(
+        let steps = suppressed
+            .insns
+            .iter()
+            .filter_map(|(instruction, _)| match instruction {
                 Insn::Column {
                     cursor_id,
                     dest: 3,
                     default: None,
                     ..
-                },
-                _
-            )] if *cursor_id == suppressed_cursor
-        ));
+                } if *cursor_id == suppressed_cursor => Some("column"),
+                Insn::ColumnHasField { .. } => Some("has field"),
+                Insn::Integer { value: 3, dest: 3 } => Some("default"),
+                Insn::Multiply { dest: 3, .. } => Some("encode"),
+                Insn::IsNull { reg: 3, .. } => Some("null guard"),
+                Insn::Divide { dest: 3, .. } => Some("decode"),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(steps, ["column", "has field", "default", "encode"]);
     }
 
     #[test]
