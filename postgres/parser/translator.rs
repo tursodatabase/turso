@@ -1762,8 +1762,6 @@ impl PostgreSQLTranslator {
         &self,
         select: &pg_query::protobuf::SelectStmt,
     ) -> Result<ast::Select, ParseError> {
-        use pg_query::protobuf::SetOperation;
-
         // Top-level SELECT INTO is intercepted (and its IntoClause stripped)
         // before translation, so an INTO seen here is in a nested position,
         // which PG rejects during parse analysis.
@@ -1777,9 +1775,7 @@ impl PostgreSQLTranslator {
             return Err(not_supported("SELECT ... FOR UPDATE / FOR SHARE"));
         }
 
-        // Check if this is a UNION/INTERSECT/EXCEPT (set operation)
-        let set_op = select.op();
-        if set_op != SetOperation::SetopNone && set_op != SetOperation::Undefined {
+        if is_set_operation(select) {
             return self.translate_set_operation(select);
         }
 
@@ -1873,34 +1869,52 @@ impl PostgreSQLTranslator {
         &self,
         select: &pg_query::protobuf::SelectStmt,
     ) -> Result<ast::Select, ParseError> {
-        // Flatten the left-deep tree of set operations into a list.
-        // pg_query represents A UNION B UNION C as:
-        //   SetOp(SetOp(A, B), C)
-        let mut parts: Vec<(
-            Option<ast::CompoundOperator>,
-            &pg_query::protobuf::SelectStmt,
-        )> = Vec::new();
-        reject_set_operation_branch_clauses(select)?;
-        Self::flatten_set_operation(select, &mut parts)?;
-
-        if parts.is_empty() {
-            return Err(ParseError::ParseError("Empty set operation".to_string()));
+        let mut right_operands = Vec::new();
+        let mut leftmost = select;
+        loop {
+            let operator = compound_operator(leftmost)?;
+            let (Some(larg), Some(rarg)) = (&leftmost.larg, &leftmost.rarg) else {
+                return Err(ParseError::ParseError(
+                    "set operation is missing an operand".to_string(),
+                ));
+            };
+            let mut leaves = Vec::new();
+            if matches!(
+                leftmost.op(),
+                pg_query::protobuf::SetOperation::SetopUnion
+                    | pg_query::protobuf::SetOperation::SetopIntersect
+            ) && same_operator_leaves(rarg, leftmost.op(), leftmost.all, &mut leaves)
+            {
+                for leaf in leaves.into_iter().rev() {
+                    right_operands.push((operator, leaf));
+                }
+            } else {
+                right_operands.push((operator, rarg.as_ref()));
+            }
+            leftmost = larg;
+            if !is_set_operation(leftmost) || has_own_select_clauses(leftmost) {
+                break;
+            }
         }
 
-        // First part becomes the primary select
-        let (_, first_stmt) = &parts[0];
-        let first_select = self.translate_one_select(first_stmt)?;
-
-        // Remaining parts become compounds
-        let mut compounds = Vec::new();
-        for (op, stmt) in parts.iter().skip(1) {
-            let operator =
-                op.ok_or_else(|| ParseError::ParseError("Missing compound operator".to_string()))?;
-            compounds.push(ast::CompoundSelect {
-                operator,
-                select: self.translate_one_select(stmt)?,
-            });
+        if (is_set_operation(leftmost) || has_own_select_clauses(leftmost))
+            && !self.has_distinct_output_names(leftmost)
+        {
+            return Err(not_supported(
+                "a parenthesized leading set operation operand without distinct column names",
+            ));
         }
+        let first_select = self.translate_compound_operand(leftmost)?;
+        let compounds = right_operands
+            .into_iter()
+            .rev()
+            .map(|(operator, rarg)| {
+                Ok(ast::CompoundSelect {
+                    operator,
+                    select: self.translate_compound_operand(rarg)?,
+                })
+            })
+            .collect::<Result<Vec<_>, ParseError>>()?;
 
         let order_by = self.translate_order_by(&select.sort_clause)?;
         let limit = self.translate_select_limit(select)?;
@@ -1917,60 +1931,73 @@ impl PostgreSQLTranslator {
         })
     }
 
-    fn flatten_set_operation<'a>(
-        stmt: &'a pg_query::protobuf::SelectStmt,
-        parts: &mut Vec<(
-            Option<ast::CompoundOperator>,
-            &'a pg_query::protobuf::SelectStmt,
-        )>,
-    ) -> Result<(), ParseError> {
-        use pg_query::protobuf::SetOperation;
-
-        let set_op = stmt.op();
-        if set_op == SetOperation::SetopNone || set_op == SetOperation::Undefined {
-            // Leaf select
-            parts.push((None, stmt));
-            return Ok(());
+    fn has_distinct_output_names(&self, stmt: &pg_query::protobuf::SelectStmt) -> bool {
+        use pg_query::protobuf::node::Node;
+        let mut leaf = stmt;
+        while is_set_operation(leaf) {
+            let Some(larg) = &leaf.larg else {
+                return false;
+            };
+            leaf = larg;
         }
-
-        let operator = match (set_op, stmt.all) {
-            (SetOperation::SetopUnion, true) => ast::CompoundOperator::UnionAll,
-            (SetOperation::SetopUnion, false) => ast::CompoundOperator::Union,
-            (SetOperation::SetopIntersect, false) => ast::CompoundOperator::Intersect,
-            (SetOperation::SetopExcept, false) => ast::CompoundOperator::Except,
-            (SetOperation::SetopIntersect | SetOperation::SetopExcept, true) => {
-                return Err(not_supported("INTERSECT ALL / EXCEPT ALL"))
-            }
-            (other, _) => {
-                return Err(ParseError::ParseError(format!(
-                    "Unsupported set operation: {other:?}"
-                )))
-            }
-        };
-
-        if let Some(larg) = &stmt.larg {
-            Self::flatten_set_operation(larg, parts)?;
+        if leaf.target_list.is_empty() {
+            return !leaf.values_lists.is_empty();
         }
-        if let Some(rarg) = &stmt.rarg {
-            let same_associative_operation = matches!(
-                set_op,
-                SetOperation::SetopUnion | SetOperation::SetopIntersect
-            ) && uses_only_set_operation(rarg, set_op, stmt.all);
-            if !matches!(rarg.op(), SetOperation::SetopNone | SetOperation::Undefined)
-                && !same_associative_operation
-            {
-                return Err(not_supported(
-                    "a set operation nested on the right of another (from parentheses or INTERSECT precedence)",
-                ));
+        let mut names = std::collections::HashSet::new();
+        for target in &leaf.target_list {
+            let Some(Node::ResTarget(res_target)) = &target.node else {
+                return false;
+            };
+            let Some(val) = res_target.val.as_deref() else {
+                return false;
+            };
+            if let Some(Node::ColumnRef(col_ref)) = &val.node {
+                if col_ref
+                    .fields
+                    .last()
+                    .is_some_and(|f| matches!(f.node, Some(Node::AStar(_))))
+                {
+                    return false;
+                }
             }
-            // The first element pushed from rarg gets the operator
-            let prev_len = parts.len();
-            Self::flatten_set_operation(rarg, parts)?;
-            if parts.len() > prev_len {
-                parts[prev_len].0 = Some(operator);
+            let name = if res_target.name.is_empty() {
+                match derived_column_name(val) {
+                    Some(name) => name,
+                    None if matches!(val.node, Some(Node::AConst(_))) => "?column?".to_string(),
+                    None => return false,
+                }
+            } else {
+                res_target.name.clone()
+            };
+            if !names.insert(name.to_lowercase()) {
+                return false;
             }
         }
-        Ok(())
+        true
+    }
+
+    fn translate_compound_operand(
+        &self,
+        stmt: &pg_query::protobuf::SelectStmt,
+    ) -> Result<ast::OneSelect, ParseError> {
+        if !is_set_operation(stmt) && !has_own_select_clauses(stmt) {
+            return self.translate_one_select(stmt);
+        }
+        Ok(ast::OneSelect::Select {
+            distinctness: None,
+            columns: vec![ast::ResultColumn::Star],
+            from: Some(ast::FromClause {
+                select: Box::new(ast::SelectTable::Select {
+                    select: self.translate_select(stmt)?,
+                    alias: None,
+                    lateral: false,
+                }),
+                joins: vec![],
+            }),
+            where_clause: None,
+            group_by: None,
+            window_clause: vec![],
+        })
     }
 
     /// Translate a single leaf SELECT (no set operations) into a OneSelect.
@@ -6748,22 +6775,57 @@ fn reject_into_clause(
     Ok(())
 }
 
-fn reject_set_operation_branch_clauses(
-    stmt: &pg_query::protobuf::SelectStmt,
-) -> Result<(), ParseError> {
-    for branch in [&stmt.larg, &stmt.rarg].into_iter().flatten() {
-        if !branch.sort_clause.is_empty()
-            || branch.limit_count.is_some()
-            || branch.limit_offset.is_some()
-            || branch.with_clause.is_some()
-        {
-            return Err(not_supported(
-                "ORDER BY, LIMIT, OFFSET or WITH on a parenthesized set operation branch",
-            ));
-        }
-        reject_set_operation_branch_clauses(branch)?;
+fn is_set_operation(stmt: &pg_query::protobuf::SelectStmt) -> bool {
+    use pg_query::protobuf::SetOperation;
+    !matches!(stmt.op(), SetOperation::SetopNone | SetOperation::Undefined)
+}
+
+fn has_own_select_clauses(stmt: &pg_query::protobuf::SelectStmt) -> bool {
+    !stmt.sort_clause.is_empty()
+        || stmt.limit_count.is_some()
+        || stmt.limit_offset.is_some()
+        || stmt.with_clause.is_some()
+        || !stmt.locking_clause.is_empty()
+}
+
+fn same_operator_leaves<'a>(
+    stmt: &'a pg_query::protobuf::SelectStmt,
+    op: pg_query::protobuf::SetOperation,
+    all: bool,
+    leaves: &mut Vec<&'a pg_query::protobuf::SelectStmt>,
+) -> bool {
+    if !is_set_operation(stmt) {
+        leaves.push(stmt);
+        return true;
     }
-    Ok(())
+    if stmt.op() != op || stmt.all != all || has_own_select_clauses(stmt) {
+        return false;
+    }
+    match (&stmt.larg, &stmt.rarg) {
+        (Some(larg), Some(rarg)) => {
+            same_operator_leaves(larg, op, all, leaves)
+                && same_operator_leaves(rarg, op, all, leaves)
+        }
+        _ => false,
+    }
+}
+
+fn compound_operator(
+    stmt: &pg_query::protobuf::SelectStmt,
+) -> Result<ast::CompoundOperator, ParseError> {
+    use pg_query::protobuf::SetOperation;
+    match (stmt.op(), stmt.all) {
+        (SetOperation::SetopUnion, true) => Ok(ast::CompoundOperator::UnionAll),
+        (SetOperation::SetopUnion, false) => Ok(ast::CompoundOperator::Union),
+        (SetOperation::SetopIntersect, false) => Ok(ast::CompoundOperator::Intersect),
+        (SetOperation::SetopExcept, false) => Ok(ast::CompoundOperator::Except),
+        (SetOperation::SetopIntersect | SetOperation::SetopExcept, true) => {
+            Err(not_supported("INTERSECT ALL / EXCEPT ALL"))
+        }
+        (other, _) => Err(ParseError::ParseError(format!(
+            "Unsupported set operation: {other:?}"
+        ))),
+    }
 }
 
 fn translate_distinct_clause(
@@ -6786,24 +6848,6 @@ fn reject_column_aliases(
         return Err(not_supported(format!("a column alias list on {what}")));
     }
     Ok(())
-}
-
-fn uses_only_set_operation(
-    stmt: &pg_query::protobuf::SelectStmt,
-    op: pg_query::protobuf::SetOperation,
-    all: bool,
-) -> bool {
-    use pg_query::protobuf::SetOperation;
-    match stmt.op() {
-        SetOperation::SetopNone | SetOperation::Undefined => true,
-        stmt_op if stmt_op == op && stmt.all == all => {
-            [&stmt.larg, &stmt.rarg].into_iter().all(|arg| {
-                arg.as_deref()
-                    .is_some_and(|arg| uses_only_set_operation(arg, op, all))
-            })
-        }
-        _ => false,
-    }
 }
 
 fn is_text_pattern(node: &pg_query::protobuf::Node) -> bool {
@@ -10175,6 +10219,14 @@ mod tests {
         assert_translates("INSERT INTO t (a) VALUES (DEFAULT)");
     }
 
+    fn translate_to_sql(sql: &str) -> String {
+        let parsed = crate::parse(sql).unwrap();
+        PostgreSQLTranslator::new()
+            .translate(&parsed)
+            .unwrap_or_else(|err| panic!("{sql}: {err}"))
+            .to_string()
+    }
+
     #[test]
     fn fail_closed_schema_qualified_type_names() {
         assert_not_supported("SELECT '5'::foo.int4", "schema-qualified type name");
@@ -10186,38 +10238,29 @@ mod tests {
     }
 
     #[test]
-    fn fail_closed_right_nested_set_operations() {
-        assert_not_supported(
-            "SELECT 1 UNION SELECT 2 INTERSECT SELECT 3",
-            "nested on the right",
+    fn right_nested_set_operations_become_subquery_members() {
+        assert_eq!(
+            translate_to_sql("SELECT 1 UNION SELECT 2 INTERSECT SELECT 3"),
+            "SELECT 1 UNION SELECT * FROM (SELECT 2 INTERSECT SELECT 3)"
+        );
+        assert_eq!(
+            translate_to_sql("SELECT 1 EXCEPT (SELECT 1 UNION SELECT 2)"),
+            "SELECT 1 EXCEPT SELECT * FROM (SELECT 1 UNION SELECT 2)"
+        );
+        assert_eq!(
+            translate_to_sql("SELECT 1 UNION SELECT 2 UNION ALL SELECT 3 EXCEPT SELECT 4"),
+            "SELECT 1 UNION SELECT 2 UNION ALL SELECT 3 EXCEPT SELECT 4"
+        );
+        assert_eq!(
+            translate_to_sql("(SELECT 1 UNION SELECT 2) INTERSECT SELECT 3"),
+            "SELECT 1 UNION SELECT 2 INTERSECT SELECT 3"
         );
         assert_not_supported(
-            "SELECT 1 EXCEPT (SELECT 1 UNION SELECT 2)",
-            "nested on the right",
+            "SELECT 1 UNION (SELECT 1 EXCEPT ALL SELECT 1)",
+            "EXCEPT ALL",
         );
-        assert_translates("SELECT 1 UNION SELECT 2 UNION ALL SELECT 3 EXCEPT SELECT 4");
-        assert_translates("SELECT 1 INTERSECT SELECT 2 UNION SELECT 3");
-        assert_translates("(SELECT 1 UNION SELECT 2) INTERSECT SELECT 3");
-        assert_translates("SELECT 1 UNION ALL (SELECT 2 UNION ALL SELECT 3)");
-        assert_translates("SELECT 1 UNION (SELECT 2 UNION SELECT 3)");
-        assert_translates("SELECT 1 INTERSECT (SELECT 1 INTERSECT SELECT 2)");
-        assert_not_supported(
-            "SELECT 1 UNION (SELECT 1 UNION ALL SELECT 1)",
-            "nested on the right",
-        );
-        assert_not_supported(
-            "SELECT 1 EXCEPT (SELECT 1 EXCEPT SELECT 1)",
-            "nested on the right",
-        );
-        assert_not_supported(
-            "SELECT 1 UNION ((SELECT 2 EXCEPT SELECT 1) UNION SELECT 3)",
-            "nested on the right",
-        );
-        assert_not_supported(
-            "SELECT 1 UNION (SELECT 2 UNION (SELECT 3 UNION ALL SELECT 3))",
-            "nested on the right",
-        );
-        assert_translates("SELECT 1 UNION ((SELECT 2 UNION SELECT 1) UNION SELECT 3)");
+        assert_translates("SELECT 1 UNION ((SELECT 2 EXCEPT SELECT 1) UNION SELECT 3)");
+        assert_translates("SELECT 1 UNION (SELECT 2 UNION (SELECT 3 UNION ALL SELECT 3))");
     }
 
     #[test]
@@ -10227,20 +10270,46 @@ mod tests {
     }
 
     #[test]
-    fn fail_closed_set_operation_branch_clauses() {
-        assert_not_supported(
-            "(SELECT a FROM t ORDER BY a LIMIT 1) UNION ALL (SELECT a FROM u ORDER BY a LIMIT 1)",
-            "parenthesized set operation branch",
+    fn set_operation_operands_with_own_clauses_become_subqueries() {
+        assert_eq!(
+            translate_to_sql(
+                "(SELECT a FROM t ORDER BY a LIMIT 1) UNION ALL (SELECT a FROM u ORDER BY a LIMIT 1)"
+            ),
+            "SELECT * FROM (SELECT a FROM t ORDER BY a NULLS LAST LIMIT 1) UNION ALL SELECT * FROM (SELECT a FROM u ORDER BY a NULLS LAST LIMIT 1)"
+        );
+        assert_eq!(
+            translate_to_sql("((SELECT 1 UNION SELECT 2) LIMIT 1) UNION SELECT 3"),
+            "SELECT * FROM (SELECT 1 UNION SELECT 2 LIMIT 1) UNION SELECT 3"
+        );
+        assert_eq!(
+            translate_to_sql("(WITH c AS (SELECT 1 AS x) SELECT x FROM c) UNION SELECT 2"),
+            "SELECT * FROM (WITH c AS (SELECT 1 x) SELECT x FROM c) UNION SELECT 2"
+        );
+        assert_eq!(
+            translate_to_sql("SELECT a FROM t UNION SELECT a FROM u ORDER BY 1 LIMIT 2"),
+            "SELECT a FROM t UNION SELECT a FROM u ORDER BY 1 NULLS LAST LIMIT 2"
         );
         assert_not_supported(
-            "((SELECT 1 UNION SELECT 2) LIMIT 1) UNION SELECT 3",
-            "parenthesized set operation branch",
+            "(SELECT 1, 2 LIMIT 1) UNION SELECT 3, 4",
+            "without distinct column names",
         );
         assert_not_supported(
-            "(WITH c AS (SELECT 1) SELECT * FROM c) UNION SELECT 2",
-            "parenthesized set operation branch",
+            "(SELECT a, a FROM t LIMIT 1) UNION SELECT 3, 4",
+            "without distinct column names",
         );
-        assert_translates("SELECT a FROM t UNION SELECT a FROM u ORDER BY 1 LIMIT 2");
+        assert_not_supported(
+            "(SELECT * FROM t, u LIMIT 1) UNION SELECT 1, 2",
+            "without distinct column names",
+        );
+        assert_not_supported(
+            "(WITH c AS (SELECT 1 AS a, 2 AS a) SELECT * FROM c LIMIT 1) UNION SELECT 3, 4",
+            "without distinct column names",
+        );
+        assert_not_supported(
+            "(SELECT b COLLATE \"C\", b FROM t LIMIT 1) UNION SELECT 'q', 'r'",
+            "without distinct column names",
+        );
+        assert_translates("SELECT 1, 2 UNION (SELECT 3, 4 LIMIT 1)");
     }
 
     #[test]

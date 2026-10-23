@@ -185,6 +185,15 @@ pub trait Dialect: Send + Sync + 'static {
     fn binds_names_at_create(&self) -> bool {
         false
     }
+
+    /// Whether `INSERT ... ON CONFLICT DO UPDATE` fails when the conflicting
+    /// row was already inserted or updated by the same statement.
+    ///
+    /// PostgreSQL raises an error so that the result does not depend on the
+    /// order of the proposed rows. SQLite updates the row again.
+    fn upsert_rejects_row_written_by_same_statement(&self) -> bool {
+        false
+    }
 }
 
 #[cfg(test)]

@@ -698,6 +698,19 @@ expect {
     {"x":1}|{"x":1}|0
 }
 
+# JSON5 whitespace directly after an unquoted key ends the key.
+test json5_unquoted_key_ends_at_json5_whitespace {
+    SELECT json('{a' || char(0x2028) || ':1}'), json('{a' || char(0xa0) || ':1}'),
+           json('{a' || char(0xfeff) || ':1}'), json('{a' || char(0x2029) || ':1}'),
+           json('{a' || char(0x3000) || ':1}'), json('{a' || char(0x1680) || ':1}'),
+           json('{a' || char(0x205f) || ':1}'), json('{a' || char(0x2000) || ':1}'),
+           json('{a' || char(0x202f) || ':1}'), json('{a' || char(11) || ':1}'),
+           json('{a' || char(12) || ':1}'), json('{ab' || char(0xa0) || ':1}');
+}
+expect {
+    {"a":1}|{"a":1}|{"a":1}|{"a":1}|{"a":1}|{"a":1}|{"a":1}|{"a":1}|{"a":1}|{"a":1}|{"a":1}|{"ab":1}
+}
+
 # Array locators counting from the end: leading zeros in [#-n] keep the
 # sign, and [#-0] addresses the same one-past-the-end position as [#].
 
