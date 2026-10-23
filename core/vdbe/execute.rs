@@ -98,6 +98,7 @@ use either::Either;
 use smallvec::SmallVec;
 use std::any::Any;
 use std::str::FromStr;
+use std::task::Poll;
 use std::{
     borrow::BorrowMut,
     cell::Cell,
@@ -105,6 +106,8 @@ use std::{
     sync::{atomic::Ordering, Arc},
 };
 use turso_macros::turso_debug_assert;
+
+use crate::coro::{BoxedResumable, Co, Runner, StepContext, YieldSlot};
 
 use crate::pseudo::PseudoCursor;
 
@@ -2007,13 +2010,6 @@ pub fn op_last(
     Ok(InsnFunctionStepResult::Step)
 }
 
-#[derive(Debug, Clone, Copy)]
-pub enum OpColumnState {
-    Start,
-    Seek { rowid: i64, table_cursor_id: usize },
-    GetColumn,
-}
-
 #[cfg_attr(not(test), inline(always))]
 pub fn op_column(
     program: &Program,
@@ -2037,14 +2033,12 @@ pub fn op_column(
         }
         return Ok(result);
     }
-    op_column_deferred(
+    step_async_insn(
         program,
         state,
-        *cursor_id,
-        ColumnFetch::Single {
-            column: *column,
-            dest: *dest,
-            default,
+        insn,
+        AsyncOp::ColumnDeferred {
+            cursor_id: *cursor_id,
         },
     )
 }
@@ -2076,14 +2070,12 @@ pub fn op_column_range(
         }
         return Ok(result);
     }
-    op_column_deferred(
+    step_async_insn(
         program,
         state,
-        *cursor_id,
-        ColumnFetch::Range {
-            start_column: *start_column,
-            dest: *dest,
-            defaults,
+        insn,
+        AsyncOp::ColumnDeferred {
+            cursor_id: *cursor_id,
         },
     )
 }
@@ -2135,55 +2127,194 @@ impl ColumnFetch<'_> {
     }
 }
 
-/// Column when a deferred seek is pending or the fetch was suspended for
-/// IO inside the seek: drives the op-state machine to completion.
+/// Starts the async operation of the instruction at `pc`, or resumes it
+/// when it paused for I/O, and turns its outcome into an instruction
+/// result.
 #[inline(never)]
-fn op_column_deferred(
+fn step_async_insn(
     program: &Program,
     state: &mut ProgramState,
-    cursor_id: usize,
-    fetch: ColumnFetch<'_>,
+    insn: &Insn,
+    op: AsyncOp,
 ) -> InsnResult {
-    'outer: loop {
-        match *state.active_op_state.column() {
-            OpColumnState::Start => {
-                // SQLite gives a null row priority over a pending deferred seek.
-                // A later outer join can leave both states set on one cursor.
-                if state.get_cursor(cursor_id).get_null_flag() {
-                    fetch.write_null_regs(state);
-                    break 'outer;
-                } else if let Some(deferred) = state.deferred_seeks[cursor_id].take() {
-                    *state.active_op_state.column() = OpColumnState::Seek {
-                        rowid: deferred.rowid,
-                        table_cursor_id: deferred.table_cursor_id,
-                    };
-                } else {
-                    *state.active_op_state.column() = OpColumnState::GetColumn;
-                }
-            }
-            OpColumnState::Seek {
-                rowid,
-                table_cursor_id,
-            } => {
-                return_if_io!(state, seek_deferred_row(state, table_cursor_id, rowid));
-                count_deferred_seek(state);
-                *state.active_op_state.column() = OpColumnState::GetColumn;
-            }
-            OpColumnState::GetColumn => {
-                let result = fetch.fetch(program, state, cursor_id)?;
-                if !matches!(result, InsnFunctionStepResult::Step) {
-                    // IO yield: the slot stays at GetColumn so the resume
-                    // re-enters this arm.
-                    return Ok(result);
-                }
-                break 'outer;
-            }
+    let (mut runner, active) = state.active_op_state.take_async_insn();
+    let mut ctx = VdbeCtx {
+        program,
+        state,
+        insn,
+    };
+    let polled = if active {
+        runner.resume(&mut ctx)
+    } else {
+        runner.start(&mut ctx, op)
+    };
+    state
+        .active_op_state
+        .put_async_insn(runner, polled.is_pending());
+    match polled {
+        Poll::Ready(Ok(())) => {
+            state.pc += 1;
+            Ok(InsnFunctionStepResult::Step)
         }
+        Poll::Ready(Err(err)) => Err(err),
+        Poll::Pending => Ok(InsnFunctionStepResult::IO),
+    }
+}
+
+/// Runs one async instruction at a time. The box holds the future and is
+/// allocated once per program state.
+pub(crate) struct AsyncInsnRunner(BoxedResumable<VdbeStep, AsyncOp, Result<(), Box<LimboError>>>);
+
+impl AsyncInsnRunner {
+    pub(crate) fn new() -> Self {
+        Self(Runner::boxed(run_async_insn))
     }
 
-    state.active_op_state.clear();
-    state.pc += 1;
-    Ok(InsnFunctionStepResult::Step)
+    /// Starts `op` and runs it until it pauses for I/O or finishes.
+    fn start(&mut self, ctx: &mut VdbeCtx<'_>, op: AsyncOp) -> Poll<Result<(), Box<LimboError>>> {
+        self.0.start(ctx, op)
+    }
+
+    /// Continues the paused instruction until it pauses again or finishes.
+    fn resume(&mut self, ctx: &mut VdbeCtx<'_>) -> Poll<Result<(), Box<LimboError>>> {
+        self.0.resume(ctx)
+    }
+
+    pub(crate) fn cancel(&mut self) {
+        self.0.cancel();
+    }
+}
+
+impl std::fmt::Debug for AsyncInsnRunner {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("AsyncInsnRunner")
+    }
+}
+
+/// Names [`VdbeCtx`] as the context type of the async instructions.
+pub(crate) struct VdbeStep;
+
+impl StepContext for VdbeStep {
+    type Ctx<'a> = VdbeCtx<'a>;
+}
+
+/// The context of one step of an async instruction. The instruction gets
+/// it back on every step, so it never keeps a reference across a pause.
+pub(crate) struct VdbeCtx<'a> {
+    program: &'a Program,
+    state: &'a mut ProgramState,
+    insn: &'a Insn,
+}
+
+impl YieldSlot for VdbeCtx<'_> {
+    fn park_io(&mut self, io: IOCompletions) {
+        self.state.suspend_on_io(io);
+    }
+}
+
+/// Runs one async instruction to completion and gives the handle back.
+async fn run_async_insn(
+    mut co: Co<VdbeStep>,
+    op: AsyncOp,
+) -> (Co<VdbeStep>, Result<(), Box<LimboError>>) {
+    let result = match op {
+        AsyncOp::ColumnDeferred { cursor_id } => op_column_deferred(&mut co, cursor_id).await,
+    };
+    (co, result)
+}
+
+/// An instruction that continues as an async operation, with the arguments
+/// the operation needs.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum AsyncOp {
+    ColumnDeferred { cursor_id: usize },
+}
+
+/// Column when a deferred seek is pending or the fetch paused for I/O:
+/// finishes the seek, then fetches the columns.
+async fn op_column_deferred(
+    co: &mut Co<VdbeStep>,
+    cursor_id: usize,
+) -> Result<(), Box<LimboError>> {
+    let start = co.with(|ctx| {
+        if ctx.state.get_cursor(cursor_id).get_null_flag() {
+            column_fetch_of(ctx.insn).write_null_regs(ctx.state);
+            ColumnStart::NullRow
+        } else {
+            match ctx.state.deferred_seeks[cursor_id].take() {
+                Some(deferred) => ColumnStart::Seek(deferred),
+                None => ColumnStart::Fetch,
+            }
+        }
+    });
+    match start {
+        ColumnStart::NullRow => return Ok(()),
+        ColumnStart::Seek(deferred) => {
+            co.io(|ctx| seek_deferred_row(ctx.state, deferred.table_cursor_id, deferred.rowid))
+                .await?;
+            co.with(|ctx| count_deferred_seek(ctx.state));
+        }
+        ColumnStart::Fetch => {}
+    }
+    co.io(|ctx| fetch_columns(ctx.program, ctx.state, ctx.insn, cursor_id))
+        .await
+}
+
+/// What a Column finds when it starts: a null row, which SQLite gives
+/// priority over a pending deferred seek, the seek to finish, or a row to
+/// fetch.
+enum ColumnStart {
+    NullRow,
+    Seek(DeferredSeekState),
+    Fetch,
+}
+
+/// Runs the fetch of a Column-family instruction. A fetch parks its
+/// completion in the program state, so this takes it out again for the yield.
+#[inline(always)]
+fn fetch_columns(
+    program: &Program,
+    state: &mut ProgramState,
+    insn: &Insn,
+    cursor_id: usize,
+) -> IOResultOr<()> {
+    match column_fetch_of(insn).fetch(program, state, cursor_id)? {
+        InsnFunctionStepResult::IO => {
+            let io = state
+                .io_completions
+                .take()
+                .expect("an IO step parks a completion");
+            Ok(IOResult::IO(io))
+        }
+        _ => Ok(IOResult::Done(())),
+    }
+}
+
+#[inline(always)]
+fn column_fetch_of(insn: &Insn) -> ColumnFetch<'_> {
+    match insn {
+        Insn::Column {
+            column,
+            dest,
+            default,
+            ..
+        } => ColumnFetch::Single {
+            column: *column,
+            dest: *dest,
+            default,
+        },
+        Insn::ColumnRange {
+            start_column,
+            dest,
+            defaults,
+            ..
+        } => ColumnFetch::Range {
+            start_column: *start_column,
+            dest: *dest,
+            defaults,
+        },
+        _ => unreachable!("column_deferred runs only for Column and ColumnRange"),
+    }
 }
 
 /// Fetches one column of the cursor's current row into a register.
