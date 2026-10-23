@@ -197,7 +197,7 @@ set test_files {
   descidx3             pass
   diskfull             fail
   distinct             fail
-  distinct2            fail
+  distinct2            pass
   distinctagg          fail
   e_blobbytes          pass
   e_blobclose          fail

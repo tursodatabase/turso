@@ -34,128 +34,128 @@ QUERY PLAN
 `--SCAN part
 
 BYTECODE
-addr  opcode                       p1   p2   p3  p4                                               p5  comment
-   0  Init                          0  119    0                                                    0  Start at 119
-   1  Null                          0    1    0                                                    0  r[1]=NULL
-   2  OpenRead                      0   10    0  k(17,B,B,B,B,B,B,B,B,B,B,B,B,B,B,B,B)             0  table=lineitem, root=10, iDb=0
-   3  Integer                       0   16    0                                                    0  r[16]=0
-   4  Gosub                        17    6    0                                                    0
-   5  Goto                          0   53    0                                                    0
-   6  Once                         52    0    0                                                    0  goto 52
-   7  OpenEphemeral                 2    1    0                                                    0  cursor=2 is_table=true
-   8  Null                          0   18    0                                                    0  r[18]=NULL
-   9  SorterOpen                    3    2    0  k(1,B)                                            0  cursor=3
-  10  Integer                       0   56    0                                                    0  r[56]=0
-  11  Null                          0   57    0                                                    0  r[57]=NULL
-  12  Gosub                        55   49    0                                                    0
-  13  OpenRead                      5   10    0  k(17,B,B,B,B,B,B,B,B,B,B,B,B,B,B,B,B)             0  table=lineitem, root=10, iDb=0
-  14  Rewind                        5   20    0                                                    0  Rewind table lineitem
-  15    Column                      5    1   52                                                    0  r[52]=lineitem.L_PARTKEY
-  16    Column                      5    4   53                                                    0  r[53]=lineitem.L_QUANTITY
-  17    MakeRecord                 52    2   51                                                    0  r[51]=mkrec(r[52..53])
-  18    SorterInsert                3   51    0  0                                                 0  key=r[51]
-  19  Next                          5   15    0                                                    1
-  20  OpenPseudo                    4   51    2                                                    0  2 columns in r[51]
-  21  SorterSort                    3   36    0                                                    0
-  22    SorterData                  3   51    4                                                    0  r[51]=data
-  23    Column                      4    0   58                                                    0  r[58]=pseudo.column 0
-  24    Column                      4    1   23                                                    0  r[23]=pseudo.column 1
-  25    Compare                    57   58    1  k(1, Binary)                                      0  r[57..57]==r[58..58]
-  26    Jump                       27   30   27                                                    0
-  27    Gosub                      54   38    0                                                    0
-  28    Move                       58   57    1                                                    0  r[57..57]=r[58..58]
-  29    Gosub                      55   49    0                                                    0
-  30    Copy                       23   59    0                                                    0  r[59]=r[23]
-  31    AggStep                     0   59   18  avg                                               0  accum=r[18] step(r[59])
-  32    If                         56   34    0                                                    0  if r[56] goto 34
-  33    Copy                       23   39    0                                                    0  r[39]=r[23]
-  34    Integer                     1   56    0                                                    0  r[56]=1
-  35  SorterNext                    3   22    0                                                    0
-  36  Gosub                        54   38    0                                                    0
-  37  Goto                          0   52    0                                                    0
-  38  IfPos                        56   40    0                                                    0  r[56]>0 -> r[56]-=0, goto 40
-  39  Return                       54    0    0                                                    0
-  40  AggFinal                      0   18    0  avg                                               0  accum=r[18]
-  41  Real                          0   62    0  0.2                                               0  r[62]=0.2
-  42  Copy                         18   63    0                                                    0  r[63]=r[18]
-  43  Multiply                     62   63   60                                                    0  r[60]=r[62]*r[63]
-  44  Copy                         57   61    0                                                    0  r[61]=r[57]
-  45  MakeRecord                   60    2   64                                                    0  r[64]=mkrec(r[60..61]); for scalar_subquery_1
-  46  NewRowid                      2   65    0                                                    0  r[65]=rowid
-  47  Insert                        2   64   65  scalar_subquery_1                                 4  intkey=r[65] data=r[64]
-  48  Return                       54    0    0                                                    0
-  49  Null                          0   18    0                                                    0  r[18]=NULL
-  50  Integer                       0   56    0                                                    0  r[56]=0
-  51  Return                       55    0    0                                                    0
-  52  Return                       17    0    0                                                    0
-  53  Integer                       0   66    0                                                    0  r[66]=0
-  54  Rewind                        0  102    0                                                    0  Rewind table lineitem
-  55    IfPos                      16   69    0                                                    0  r[16]>0 -> r[16]-=0, goto 69
-  56    Once                       69    0    0                                                    0  goto 69
-  57    OpenRead                    1    4    0  k(9,B,B,B,B,B,B,B,B,B)                            0  table=part, root=4, iDb=0
-  58    Null                        0    2   10                                                    0  r[2..10]=NULL
-  59    Rewind                      1   67    0                                                    0  Rewind table part
-  60      RowId                     1   12    0                                                    0  r[12]=part.rowid
-  61      Affinity                 12    1    0                                                    0  r[12..13] = C
-  62      RowId                     1    2    0                                                    0  r[2]=part.rowid
-  63      Column                    1    3    5                                                    0  r[5]=part.P_BRAND
-  64      Column                    1    6    8                                                    0  r[8]=part.P_CONTAINER
+addr  opcode                       p1   p2   p3  p4                                                  p5  comment
+   0  Init                          0  119    0                                                       0  Start at 119
+   1  Null                          0    1    0                                                       0  r[1]=NULL
+   2  OpenRead                      0   10    0  k(17,B,B,B,B,B,B,B,B,B,B,B,B,B,B,B,B)                0  table=lineitem, root=10, iDb=0
+   3  Integer                       0   16    0                                                       0  r[16]=0
+   4  Gosub                        17    6    0                                                       0
+   5  Goto                          0   53    0                                                       0
+   6  Once                         52    0    0                                                       0  goto 52
+   7  OpenEphemeral                 2    1    0                                                       0  cursor=2 is_table=true
+   8  Null                          0   18    0                                                       0  r[18]=NULL
+   9  SorterOpen                    3    2    0  k(1,B)                                               0  cursor=3
+  10  Integer                       0   56    0                                                       0  r[56]=0
+  11  Null                          0   57    0                                                       0  r[57]=NULL
+  12  Gosub                        55   49    0                                                       0
+  13  OpenRead                      5   10    0  k(17,B,B,B,B,B,B,B,B,B,B,B,B,B,B,B,B)                0  table=lineitem, root=10, iDb=0
+  14  Rewind                        5   20    0                                                       0  Rewind table lineitem
+  15    Column                      5    1   52                                                       0  r[52]=lineitem.L_PARTKEY
+  16    Column                      5    4   53                                                       0  r[53]=lineitem.L_QUANTITY
+  17    MakeRecord                 52    2   51                                                       0  r[51]=mkrec(r[52..53])
+  18    SorterInsert                3   51    0  0                                                    0  key=r[51]
+  19  Next                          5   15    0                                                       1
+  20  OpenPseudo                    4   51    2                                                       0  2 columns in r[51]
+  21  SorterSort                    3   36    0                                                       0
+  22    SorterData                  3   51    4                                                       0  r[51]=data
+  23    Column                      4    0   58                                                       0  r[58]=pseudo.column 0
+  24    Column                      4    1   23                                                       0  r[23]=pseudo.column 1
+  25    Compare                    57   58    1  k(1, Binary)                                         0  r[57..57]==r[58..58]
+  26    Jump                       27   30   27                                                       0
+  27    Gosub                      54   38    0                                                       0
+  28    Move                       58   57    1                                                       0  r[57..57]=r[58..58]
+  29    Gosub                      55   49    0                                                       0
+  30    Copy                       23   59    0                                                       0  r[59]=r[23]
+  31    AggStep                     0   59   18  avg                                                  0  accum=r[18] step(r[59])
+  32    If                         56   34    0                                                       0  if r[56] goto 34
+  33    Copy                       23   39    0                                                       0  r[39]=r[23]
+  34    Integer                     1   56    0                                                       0  r[56]=1
+  35  SorterNext                    3   22    0                                                       0
+  36  Gosub                        54   38    0                                                       0
+  37  Goto                          0   52    0                                                       0
+  38  IfPos                        56   40    0                                                       0  r[56]>0 -> r[56]-=0, goto 40
+  39  Return                       54    0    0                                                       0
+  40  AggFinal                      0   18    0  avg                                                  0  accum=r[18]
+  41  Real                          0   62    0  0.2                                                  0  r[62]=0.2
+  42  Copy                         18   63    0                                                       0  r[63]=r[18]
+  43  Multiply                     62   63   60                                                       0  r[60]=r[62]*r[63]
+  44  Copy                         57   61    0                                                       0  r[61]=r[57]
+  45  MakeRecord                   60    2   64                                                       0  r[64]=mkrec(r[60..61]); for scalar_subquery_1
+  46  NewRowid                      2   65    0                                                       0  r[65]=rowid
+  47  Insert                        2   64   65  scalar_subquery_1                                    4  intkey=r[65] data=r[64]
+  48  Return                       54    0    0                                                       0
+  49  Null                          0   18    0                                                       0  r[18]=NULL
+  50  Integer                       0   56    0                                                       0  r[56]=0
+  51  Return                       55    0    0                                                       0
+  52  Return                       17    0    0                                                       0
+  53  Integer                       0   66    0                                                       0  r[66]=0
+  54  Rewind                        0  102    0                                                       0  Rewind table lineitem
+  55    IfPos                      16   69    0                                                       0  r[16]>0 -> r[16]-=0, goto 69
+  56    Once                       69    0    0                                                       0  goto 69
+  57    OpenRead                    1    4    0  k(9,B,B,B,B,B,B,B,B,B)                               0  table=part, root=4, iDb=0
+  58    Null                        0    2   10                                                       0  r[2..10]=NULL
+  59    Rewind                      1   67    0                                                       0  Rewind table part
+  60      RowId                     1   12    0                                                       0  r[12]=part.rowid
+  61      Affinity                 12    1    0                                                       0  r[12..13] = C
+  62      RowId                     1    2    0                                                       0  r[2]=part.rowid
+  63      Column                    1    3    5                                                       0  r[5]=part.P_BRAND
+  64      Column                    1    6    8                                                       0  r[8]=part.P_CONTAINER
   65      HashBuild                 1   12    1  r=[1073741824] budget=67108864 payload=r[2]..r[10]   0
-  66    Next                        1   60    0                                                    1
-  67    HashBuildFinalize  1073741824    0    0                                                    0
-  68    Integer                     1   16    0                                                    0  r[16]=1
-  69    Column                      0    1   13                                                    0  r[13]=lineitem.L_PARTKEY
-  70    Affinity                   13    1    0                                                    0  r[13..14] = C
-  71    RowId                       0   14    0                                                    0  r[14]=lineitem.rowid
-  72    Integer                     0   15    0                                                    0  r[15]=0
-  73    HashProbe          1073741824   13    1  r[11]=101 payload=r[2]..r[10]                     0
-  74    Copy                        5   67    0                                                    0  r[67]=r[5]
-  75    Ne                         67   68   98  Binary                                            0  if r[67]!=r[68] goto 98
-  76    Copy                        8   69    0                                                    0  r[69]=r[8]
-  77    Ne                         69   70   98  Binary                                            0  if r[69]!=r[70] goto 98
-  78    Once                       88    0    0                                                    0  goto 88
-  79    OpenAutoindex               6    0    0                                                    0  cursor=6
-  80    Rewind                      2   88    0                                                    0  Rewind table ephemeral(scalar_subquery_1)
-  81      Column                    2    1   71                                                    0  r[71]=ephemeral(scalar_subquery_1).correlation_key_0
-  82      Column                    2    0   72                                                    0  r[72]=ephemeral(scalar_subquery_1).0.2 * avg(l_quantity)
-  83      RowId                     2   73    0                                                    0  r[73]=ephemeral(scalar_subquery_1).rowid
-  84      MakeRecord               71    3   74                                                    0  r[74]=mkrec(r[71..73]); for ephemeral_subquery_s3
-  85      FilterAdd                 6   71    1                                                    0  bloom_filter_add(r[71..72])
-  86      IdxInsert                 6   74   71                                                    0  key=r[74]
-  87    Next                        2   81    0                                                    0
-  88    Copy                       11   75    0                                                    0  r[75]=r[11]
-  89    Filter                      6   98   75                                                    1  if !bloom_filter(r[75..76]) goto 98
-  90    SeekGE                      6   98   75                                                    0  key=[75..75]
-  91      IdxGT                     6   98   75                                                    0  key=[75..75]
-  92      Column                    0    4   76                                                    0  r[76]=lineitem.L_QUANTITY
-  93      Column                    6    1   77                                                    0  r[77]=ephemeral(ephemeral_subquery_s3).0.2 * avg(l_quantity)
-  94      Ge                       76   77   97  Binary                                            0  if r[76]>=r[77] goto 97
-  95      Column                    0    5   78                                                    0  r[78]=lineitem.L_EXTENDEDPRICE
-  96      AggStep                   0   78    1  sum                                               0  accum=r[1] step(r[78])
-  97    Next                        6   91    0                                                    0
-  98    IfPos                      15  109    0                                                    0  r[15]>0 -> r[15]-=0, goto 109
-  99    HashNext           1073741824   11  101   payload=r[2]..r[10]                              0
- 100    Goto                        0   74    0                                                    0
- 101  Next                          0   55    0                                                    1
- 102  HashGraceInit        1073741824    0  114                                                    0  hash_table_id=1073741824
- 103  Integer                       1   15    0                                                    0  r[15]=1
- 104  HashGraceLoadPart    1073741824    0  113                                                    0  hash_table_id=1073741824
- 105  HashGraceNextProbe   1073741824   13  111                                                    0  hash_table_id=1073741824 keys=r[13]..r[13] probe_rowid_dest=r[14]
- 106  SeekRowid                     0   14  105                                                    0  if (r[14]!=cursor 0.rowid) goto 105
- 107  HashProbe            1073741824   13    1  r[11]=105 payload=r[2]..r[10]                     0
- 108  Goto                          0   74    0                                                    0
- 109  HashNext             1073741824   11  105   payload=r[2]..r[10]                              0
- 110  Goto                          0   74    0                                                    0
- 111  HashGraceAdvPart     1073741824    0  113                                                    0  hash_table_id=1073741824
- 112  Goto                          0  104    0                                                    0
- 113  Integer                       0   15    0                                                    0  r[15]=0
- 114  AggFinal                      0    1    0  sum                                               0  accum=r[1]
- 115  Copy                          1   80    0                                                    0  r[80]=r[1]
- 116  Divide                       80   81   79                                                    0  r[79]=r[80]/r[81]
- 117  ResultRow                    79    1    0                                                    0  output=r[79]
- 118  Halt                          0    0    0                                                    0
- 119  Transaction                   0    1    8                                                    0  iDb=0 tx_mode=Read
- 120  String8                       0   68    0  Brand#52                                          0  r[68]='Brand#52'
- 121  String8                       0   70    0  LG CAN                                            0  r[70]='LG CAN'
- 122  Real                          0   81    0  7.0                                               0  r[81]=7
- 123  Goto                          0    1    0                                                    0
+  66    Next                        1   60    0                                                       1
+  67    HashBuildFinalize  1073741824    0    0                                                       0
+  68    Integer                     1   16    0                                                       0  r[16]=1
+  69    Column                      0    1   13                                                       0  r[13]=lineitem.L_PARTKEY
+  70    Affinity                   13    1    0                                                       0  r[13..14] = C
+  71    RowId                       0   14    0                                                       0  r[14]=lineitem.rowid
+  72    Integer                     0   15    0                                                       0  r[15]=0
+  73    HashProbe          1073741824   13    1  r[11]=101 payload=r[2]..r[10]                        0
+  74    Copy                        5   67    0                                                       0  r[67]=r[5]
+  75    Ne                         67   68   98  Binary                                               0  if r[67]!=r[68] goto 98
+  76    Copy                        8   69    0                                                       0  r[69]=r[8]
+  77    Ne                         69   70   98  Binary                                               0  if r[69]!=r[70] goto 98
+  78    Once                       88    0    0                                                       0  goto 88
+  79    OpenAutoindex               6    0    0                                                       0  cursor=6
+  80    Rewind                      2   88    0                                                       0  Rewind table ephemeral(scalar_subquery_1)
+  81      Column                    2    1   71                                                       0  r[71]=ephemeral(scalar_subquery_1).correlation_key_0
+  82      Column                    2    0   72                                                       0  r[72]=ephemeral(scalar_subquery_1).0.2 * avg(l_quantity)
+  83      RowId                     2   73    0                                                       0  r[73]=ephemeral(scalar_subquery_1).rowid
+  84      MakeRecord               71    3   74                                                       0  r[74]=mkrec(r[71..73]); for ephemeral_subquery_s3
+  85      FilterAdd                 6   71    1                                                       0  bloom_filter_add(r[71..72])
+  86      IdxInsert                 6   74   71                                                       0  key=r[74]
+  87    Next                        2   81    0                                                       0
+  88    Copy                       11   75    0                                                       0  r[75]=r[11]
+  89    Filter                      6   98   75                                                       1  if !bloom_filter(r[75..76]) goto 98
+  90    SeekGE                      6   98   75                                                       0  key=[75..75]
+  91      IdxGT                     6   98   75                                                       0  key=[75..75]
+  92      Column                    0    4   76                                                       0  r[76]=lineitem.L_QUANTITY
+  93      Column                    6    1   77                                                       0  r[77]=ephemeral(ephemeral_subquery_s3).0.2 * avg(l_quantity)
+  94      Ge                       76   77   97  Binary                                               0  if r[76]>=r[77] goto 97
+  95      Column                    0    5   78                                                       0  r[78]=lineitem.L_EXTENDEDPRICE
+  96      AggStep                   0   78    1  sum                                                  0  accum=r[1] step(r[78])
+  97    Next                        6   91    0                                                       0
+  98    IfPos                      15  109    0                                                       0  r[15]>0 -> r[15]-=0, goto 109
+  99    HashNext           1073741824   11  101   payload=r[2]..r[10]                                 0
+ 100    Goto                        0   74    0                                                       0
+ 101  Next                          0   55    0                                                       1
+ 102  HashGraceInit        1073741824    0  114                                                       0  hash_table_id=1073741824
+ 103  Integer                       1   15    0                                                       0  r[15]=1
+ 104  HashGraceLoadPart    1073741824    0  113                                                       0  hash_table_id=1073741824
+ 105  HashGraceNextProbe   1073741824   13  111                                                       0  hash_table_id=1073741824 keys=r[13]..r[13] probe_rowid_dest=r[14]
+ 106  SeekRowid                     0   14  105                                                       0  if (r[14]!=cursor 0.rowid) goto 105
+ 107  HashProbe            1073741824   13    1  r[11]=105 payload=r[2]..r[10]                        0
+ 108  Goto                          0   74    0                                                       0
+ 109  HashNext             1073741824   11  105   payload=r[2]..r[10]                                 0
+ 110  Goto                          0   74    0                                                       0
+ 111  HashGraceAdvPart     1073741824    0  113                                                       0  hash_table_id=1073741824
+ 112  Goto                          0  104    0                                                       0
+ 113  Integer                       0   15    0                                                       0  r[15]=0
+ 114  AggFinal                      0    1    0  sum                                                  0  accum=r[1]
+ 115  Copy                          1   80    0                                                       0  r[80]=r[1]
+ 116  Divide                       80   81   79                                                       0  r[79]=r[80]/r[81]
+ 117  ResultRow                    79    1    0                                                       0  output=r[79]
+ 118  Halt                          0    0    0                                                       0
+ 119  Transaction                   0    1    8                                                       0  iDb=0 tx_mode=Read
+ 120  String8                       0   68    0  Brand#52                                             0  r[68]='Brand#52'
+ 121  String8                       0   70    0  LG CAN                                               0  r[70]='LG CAN'
+ 122  Real                          0   81    0  7.0                                                  0  r[81]=7
+ 123  Goto                          0    1    0                                                       0
