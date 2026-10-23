@@ -132,7 +132,7 @@ pub struct TestFile {
     /// successful test statement on backends that preserve typed results.
     pub verify_materialized_views: bool,
     /// Named setup blocks that can be composed
-    pub setups: HashMap<String, String>,
+    pub setups: HashMap<String, Setup>,
     /// Test cases
     pub tests: Vec<TestCase>,
     /// Snapshot test cases (for EXPLAIN output)
@@ -143,6 +143,18 @@ pub struct TestFile {
     pub global_skip: Vec<Skip>,
     /// Global capability requirements that apply to all tests in the file
     pub global_requires: Vec<Requirement>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct Setup {
+    pub sql: String,
+    pub backend: Option<Backend>,
+}
+
+impl Setup {
+    pub fn runs_on(&self, backend: Backend) -> bool {
+        self.backend.is_none_or(|only| only == backend)
+    }
 }
 
 /// A setup reference with its span in the source

@@ -15,6 +15,7 @@ enum TestOrSnapshot {
     Test(TestCase),
     Snapshot(SnapshotCase),
     Matrix(MatrixCase),
+    Setup(String, Setup),
 }
 
 /// Parse a `.sqltest` file from source
@@ -137,11 +138,8 @@ impl Parser {
                     verify_materialized_views = true;
                 }
                 Some(Token::Setup) => {
-                    let (name, sql) = self.parse_setup()?;
-                    if setups.contains_key(&name) {
-                        return Err(self.error(format!("duplicate setup name: {name}")));
-                    }
-                    setups.insert(name, sql);
+                    let (name, setup) = self.parse_setup(None)?;
+                    self.add_setup(&mut setups, name, setup)?;
                 }
                 Some(
                     Token::AtSetup
@@ -163,6 +161,9 @@ impl Parser {
                         TestOrSnapshot::Test(t) => tests.push(t),
                         TestOrSnapshot::Snapshot(s) => snapshots.push(s),
                         TestOrSnapshot::Matrix(m) => matrices.push(m),
+                        TestOrSnapshot::Setup(name, setup) => {
+                            self.add_setup(&mut setups, name, setup)?
+                        }
                     }
                 }
                 Some(token) => {
@@ -269,13 +270,26 @@ impl Parser {
         Ok(ast::Requirement { capability, reason })
     }
 
-    fn parse_setup(&mut self) -> Result<(String, String), ParseError> {
+    fn add_setup(
+        &self,
+        setups: &mut HashMap<String, Setup>,
+        name: String,
+        setup: Setup,
+    ) -> Result<(), ParseError> {
+        if setups.contains_key(&name) {
+            return Err(self.error(format!("duplicate setup name: {name}")));
+        }
+        setups.insert(name, setup);
+        Ok(())
+    }
+
+    fn parse_setup(&mut self, backend: Option<Backend>) -> Result<(String, Setup), ParseError> {
         self.expect_token(Token::Setup)?;
 
         let name = self.expect_identifier()?;
-        let content = self.expect_block_content()?.trim().to_string();
+        let sql = self.expect_block_content()?.trim().to_string();
 
-        Ok((name, content))
+        Ok((name, Setup { sql, backend }))
     }
 
     fn parse_test_or_snapshot(&mut self) -> Result<TestOrSnapshot, ParseError> {
@@ -367,6 +381,20 @@ impl Parser {
             return Err(self.error("@var decorators are only valid before a matrix".to_string()));
         }
         match self.peek() {
+            Some(Token::Setup) => {
+                if !test_setups.is_empty()
+                    || !skip.is_empty()
+                    || !requires.is_empty()
+                    || cross_check_integrity
+                    || sqlite_reference
+                {
+                    return Err(
+                        self.error("only @backend can come before a setup block".to_string())
+                    );
+                }
+                let (name, setup) = self.parse_setup(backend)?;
+                Ok(TestOrSnapshot::Setup(name, setup))
+            }
             Some(Token::Matrix) => {
                 if sqlite_reference {
                     return Err(self.error("@sqlite-reference requires a snapshot".to_string()));
@@ -1080,6 +1108,25 @@ expect {
         assert!(file.setups.contains_key("users"));
         assert_eq!(file.tests[0].modifiers.setups.len(), 1);
         assert_eq!(file.tests[0].modifiers.setups[0].name, "users");
+    }
+
+    #[test]
+    fn test_parse_setup_accepts_only_backend_as_decorator() {
+        let input = r#"
+@database :memory:
+
+@skip "a setup cannot be skipped"
+setup users {
+    CREATE TABLE users (id INTEGER);
+}
+"#;
+
+        let err = parse(input).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("only @backend can come before a setup block"),
+            "{err}"
+        );
     }
 
     #[test]
