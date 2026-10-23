@@ -845,9 +845,8 @@ fn emit_scan_update(
         has_statement_conflict: settings.has_statement_conflict,
         defaults: layout.defaults,
         skip_row: hir_loop.next,
+        seek_pending: iteration_cursor.is_some(),
     };
-    // RowId on the table cursor also finishes a deferred seek from the
-    // index, so the table cursor sits on the row before it is rewritten.
     program.emit_insn(Insn::RowId {
         cursor_id: table_cursor,
         dest: row.rowid,
@@ -893,6 +892,7 @@ fn emit_rowset_update(
         has_statement_conflict: settings.has_statement_conflict,
         defaults: layout.defaults,
         skip_row: next,
+        seek_pending: false,
     };
     program.preassign_label_to_next_insn(next);
     program.emit_insn(Insn::RowSetRead {
@@ -998,6 +998,7 @@ fn emit_from_update(
         has_statement_conflict: settings.has_statement_conflict,
         defaults: layout.defaults,
         skip_row: next,
+        seek_pending: false,
     };
     let empty = program.allocate_label();
     program.emit_insn(Insn::Rewind {
@@ -1269,6 +1270,9 @@ struct UpdateRow<'a, 'b> {
     defaults: &'a [hir::ResolvedDefault],
     /// Where `OR IGNORE` goes to leave the row unchanged.
     skip_row: BranchOffset,
+    /// The loop reads an index, so the table cursor's seek to the row is
+    /// pending until a column is read from it.
+    seek_pending: bool,
 }
 
 /// A new index key built before any index changes.
@@ -1437,7 +1441,7 @@ impl UpdateRow<'_, '_> {
             .filter(|_| super::cdc::Rows::records_updates(program))
             .map(|_| program.alloc_registers(2 * columns));
         // A BEFORE trigger runs before NOT NULL is checked.
-        self.emit_new_values(program, layout, !has_before, updates)?;
+        let read_old_column = self.emit_new_values(program, layout, !has_before, updates)?;
         // STRICT: the values the UPDATE sets are checked, and converted
         // where SQLite allows, before the generated columns read them and
         // before any conflict is resolved. Custom-typed values are checked
@@ -1660,6 +1664,15 @@ impl UpdateRow<'_, '_> {
         }
 
         let record = super::dml::emit_row_record(program, table, self.start());
+        // Reading an unchanged column moved the table cursor to the row.
+        // Other reads, such as the old value for a partial index, sit in a
+        // branch some rows skip, so they do not count. Without such a read
+        // the cursor is moved here, before the row is rewritten.
+        if self.seek_pending && !read_old_column {
+            program.emit_insn(Insn::FinishSeek {
+                cursor_id: self.table_cursor,
+            });
+        }
         // MVCC keeps every version of a row, so the old one is deleted and
         // the new one inserted. A row with a new rowid moves the same way.
         if layout.mvcc || self.new_rowid.is_some() {
@@ -1779,16 +1792,18 @@ impl UpdateRow<'_, '_> {
 
     /// Fill the new-row registers: assigned columns get their value, the
     /// others are read from the old row, and an INTEGER PRIMARY KEY column
-    /// is NULL, as it is in the stored record.
+    /// is NULL, as it is in the stored record. Returns whether a column was
+    /// read from the old row.
     fn emit_new_values(
         &self,
         program: &mut ProgramBuilder,
         layout: &UpdateRowLayout<'_>,
         check_notnull: bool,
         updates: Option<usize>,
-    ) -> Result<()> {
+    ) -> Result<bool> {
         let table = self.target.table;
         let mut rows = RowValues::default();
+        let mut read_old_column = false;
         if let (Some(value), Some(new_rowid)) = (layout.rowid_value, self.new_rowid) {
             match layout.scratch {
                 // UPDATE ... FROM computed it during the join, after the
@@ -1849,13 +1864,16 @@ impl UpdateRow<'_, '_> {
                 None if column.is_rowid_alias() || column.is_virtual_generated() => {
                     program.emit_null(register, None)
                 }
-                None => super::dml::emit_stored_column(
-                    program,
-                    self.table_cursor,
-                    column,
-                    position,
-                    register,
-                ),
+                None => {
+                    super::dml::emit_stored_column(
+                        program,
+                        self.table_cursor,
+                        column,
+                        position,
+                        register,
+                    );
+                    read_old_column = true;
+                }
             }
         }
         // The changed columns record their new values before affinity is
@@ -1898,7 +1916,7 @@ impl UpdateRow<'_, '_> {
                 });
             }
         }
-        Ok(())
+        Ok(read_old_column)
     }
 
     fn emit_notnull_check(

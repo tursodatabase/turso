@@ -270,8 +270,14 @@ fn emit_scan_delete(
     let hir_loop = start_hir_btree_loop(program, document, &prepared, None)?;
     emit_access_predicates(program, document, access, Some(0), hir_loop.next)?;
 
-    // RowId on the table cursor also finishes a deferred seek from the
-    // index, so the table cursor sits on the row before it is deleted.
+    // An index loop leaves the table cursor's seek pending until a column
+    // is read. RowId reads the rowid without seeking, so the table cursor
+    // is moved to the row here before it is deleted.
+    if iteration.is_some() {
+        program.emit_insn(Insn::FinishSeek {
+            cursor_id: table_cursor,
+        });
+    }
     let rowid = program.alloc_register();
     program.emit_insn(Insn::RowId {
         cursor_id: table_cursor,
