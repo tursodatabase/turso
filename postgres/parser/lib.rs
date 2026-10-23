@@ -104,10 +104,14 @@ pub fn name_create_table(sql: &str, name: &str) -> Result<String, ParseError> {
     };
     let start = relation.location as usize;
     let scan = pg_query::scan(sql).map_err(|e| ParseError::ParseError(e.to_string()))?;
+    let is_comment = |token: &&pg_query::protobuf::ScanToken| {
+        token.token == Token::SqlComment as i32 || token.token == Token::CComment as i32
+    };
     let mut tokens = scan
         .tokens
         .iter()
-        .skip_while(|token| (token.start as usize) < start);
+        .skip_while(|token| (token.start as usize) < start)
+        .filter(|token| !is_comment(token));
     let first = tokens
         .next()
         .ok_or_else(|| ParseError::ParseError("CREATE TABLE names no table".to_string()))?;
@@ -166,6 +170,14 @@ mod tests {
         assert_eq!(
             name_create_table("CREATE TABLE t (x int)", "t").unwrap(),
             "CREATE TABLE t (x int)"
+        );
+        assert_eq!(
+            name_create_table("CREATE TABLE app/*c*/.t (x int)", "app.t").unwrap(),
+            "CREATE TABLE \"app.t\" (x int)"
+        );
+        assert_eq!(
+            name_create_table("CREATE TABLE app -- c\n.t (x int)", "app.t").unwrap(),
+            "CREATE TABLE \"app.t\" (x int)"
         );
         assert_eq!(name_create_table("SELECT 1", "t").unwrap(), "SELECT 1");
     }

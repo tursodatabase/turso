@@ -522,3 +522,16 @@ test schema-keeps-its-oid-when-another-schema-is-created {
 expect {
     b
 }
+
+test create-table-with-a-comment-in-its-qualified-name-goes-to-its-schema {
+    CREATE SCHEMA app;
+    CREATE TABLE app/*c*/.t (x int);
+    SELECT schemaname, tablename FROM pg_tables WHERE tablename = 't';
+    INSERT INTO app.t VALUES (1);
+    CREATE TABLE t (y int);
+    SELECT count(*) FROM app.t;
+}
+expect {
+    app|t
+    1
+}
