@@ -367,14 +367,19 @@ fn finalize_vacuum_target_header(
     if let Some(mv_store) = target_conn.mv_store_for_db(crate::MAIN_DB_ID) {
         let tx_id = target_conn.get_mv_tx_id_for_db(crate::MAIN_DB_ID);
         mv_store.with_header_mut(|header| header_meta.apply_to(header), tx_id.as_ref())?;
-        set_mvcc_schema_version_from_header_cookie(target_conn, header_meta.schema_cookie)?;
-        return Ok(crate::IOResult::Done(()));
+    } else {
+        let pager = target_conn.pager.load();
+        if let crate::IOResult::IO(io) =
+            pager.with_header_mut(|header| header_meta.apply_to(header))?
+        {
+            return Ok(crate::IOResult::IO(io));
+        }
     }
-    let pager = target_conn.pager.load();
-    pager.with_header_mut(|header| header_meta.apply_to(header))
+    set_schema_version_from_header_cookie(target_conn, header_meta.schema_cookie)?;
+    Ok(crate::IOResult::Done(()))
 }
 
-fn set_mvcc_schema_version_from_header_cookie(
+fn set_schema_version_from_header_cookie(
     target_conn: &Arc<Connection>,
     schema_cookie: u32,
 ) -> Result<()> {
@@ -1088,6 +1093,7 @@ pub(crate) fn vacuum_target_build_step(
             VacuumTargetBuildPhase::Done => {
                 // Commit the target transaction started in Init phase.
                 state.target_conn.execute("COMMIT")?;
+                state.target_conn.publish_schema_if_newer();
                 return Ok(crate::IOResult::Done(()));
             }
         }
