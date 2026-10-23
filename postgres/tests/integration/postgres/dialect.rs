@@ -4160,7 +4160,7 @@ fn stored_create_table_text_names_the_table_without_its_database(db: TempDatabas
         [
             (
                 "pg_turso_schema_app".to_string(),
-                "/* turso_frontend:postgres */ CREATE TABLE pg_turso_schema_app (schema_name TEXT)"
+                "/* turso_frontend:postgres */ CREATE TABLE pg_turso_schema_app (schema_name TEXT, oid INTEGER DEFAULT 1048577)"
                     .to_string()
             ),
             (

@@ -2893,11 +2893,12 @@ const PUBLIC_NAMESPACE_OID: i64 = 2200;
 
 /// The OIDs of the schemas start here, above the range the tables and
 /// indexes are numbered in.
-const USER_SCHEMA_OID_BASE: i64 = 1 << 20;
+pub(crate) const USER_SCHEMA_OID_BASE: i64 = 1 << 20;
 
 /// The schemas of the main database. A schema keeps its OID while it
-/// exists: the OID comes from the root page of its marker table, not from
-/// its place in the list of schemas, which a new schema would shift.
+/// exists: CREATE SCHEMA writes it into the marker table as the default
+/// of its oid column, so it does not depend on the place of the schema
+/// in the list of schemas or on where the marker table is stored.
 fn user_schemas(conn: &Connection) -> Vec<UserSchema> {
     let schema = conn.current_schema();
     conn.namespaces()
@@ -2908,18 +2909,34 @@ fn user_schemas(conn: &Connection) -> Vec<UserSchema> {
         })
         .map(|namespace| {
             let marker = format!("{}{}", crate::session::SCHEMA_MARKER_PREFIX, namespace.name);
-            let root_page = schema
+            let oid = schema
                 .tables
                 .get(&marker)
-                .and_then(|table| table.btree())
-                .map_or(0, |table| table.root_page);
+                .and_then(|table| schema_marker_oid(table))
+                .unwrap_or(USER_SCHEMA_OID_BASE);
             UserSchema {
-                oid: USER_SCHEMA_OID_BASE + root_page,
+                oid,
                 name: namespace.name,
                 prefix: namespace.prefix,
             }
         })
         .collect()
+}
+
+/// The OID that the marker table of a schema records as the default of
+/// its oid column.
+pub(crate) fn schema_marker_oid(table: &Table) -> Option<i64> {
+    use turso_parser::ast::{Expr, Literal};
+
+    let btree = table.btree()?;
+    let column = btree
+        .columns()
+        .iter()
+        .find(|column| column.name.as_deref() == Some("oid"))?;
+    match column.default.as_deref()? {
+        Expr::Literal(Literal::Numeric(oid)) => oid.parse().ok(),
+        _ => None,
+    }
 }
 
 struct Placement<'a> {

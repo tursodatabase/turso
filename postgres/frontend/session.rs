@@ -736,8 +736,9 @@ fn handle_pg_create_schema(
     execute_sqlite(
         conn,
         format!(
-            "CREATE TABLE main.\"{}\" (schema_name TEXT)",
-            schema_marker_table(&name).replace('"', "\"\"")
+            "CREATE TABLE main.\"{}\" (schema_name TEXT, oid INTEGER DEFAULT {})",
+            schema_marker_table(&name).replace('"', "\"\""),
+            next_schema_oid(&conn.current_schema())
         ),
     )?;
     sync_namespaces(conn);
@@ -934,6 +935,20 @@ fn schema_names(conn: &Connection) -> Vec<String> {
 
 fn schema_exists(conn: &Connection, schema_name: &str) -> bool {
     schema_names(conn).iter().any(|name| name == schema_name)
+}
+
+/// The OID of the next schema: one above the highest OID a schema has,
+/// so that a schema never takes the OID of one that was dropped before
+/// it in the same database.
+fn next_schema_oid(schema: &turso_core::schema::Schema) -> i64 {
+    schema
+        .tables
+        .iter()
+        .filter(|(name, _)| name.starts_with(SCHEMA_MARKER_PREFIX))
+        .filter_map(|(_, table)| catalog::schema_marker_oid(table))
+        .max()
+        .unwrap_or(catalog::USER_SCHEMA_OID_BASE)
+        + 1
 }
 
 fn schema_marker_table(name: &str) -> String {

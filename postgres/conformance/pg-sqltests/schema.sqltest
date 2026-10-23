@@ -535,3 +535,15 @@ expect {
     app|t
     1
 }
+
+test schema-keeps-its-oid-across-a-checkpoint {
+    CREATE SCHEMA app;
+    CREATE TABLE ids (id bigint);
+    INSERT INTO ids SELECT oid FROM pg_namespace WHERE nspname = 'app';
+    CREATE TABLE big (s text);
+    INSERT INTO big SELECT repeat('x', 1000) FROM generate_series(1, 6000);
+    SELECT count(*) FROM pg_namespace n JOIN ids ON n.oid = ids.id;
+}
+expect {
+    1
+}
