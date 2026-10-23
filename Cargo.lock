@@ -6110,6 +6110,7 @@ dependencies = [
  "miette",
  "num_cpus",
  "owo-colors 4.2.3",
+ "pg_query",
  "pretty_assertions",
  "query-result-oracle",
  "rand 0.9.4",
