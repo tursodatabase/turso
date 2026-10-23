@@ -706,6 +706,7 @@ impl DatabaseReplaySession {
                     } else {
                         self.conn.execute(replay_info.query.as_str())?;
                     }
+                    self.clear_cached_statements();
                 } else {
                     match change.change {
                         DatabaseTapeRowChangeType::Delete {
@@ -2605,6 +2606,140 @@ mod tests {
                         ],
                     ]
                 );
+                crate::Result::Ok(())
+            }
+        });
+        loop {
+            match gen.resume_with(Ok(())) {
+                genawaiter::GeneratorState::Yielded(..) => io.step().unwrap(),
+                genawaiter::GeneratorState::Complete(result) => {
+                    result.unwrap();
+                    break;
+                }
+            }
+        }
+    }
+
+    /// RENAME TO and RENAME COLUMN on a table with an index, a trigger and a view are replayed
+    /// exactly once on an empty target, and inserts before and after each rename (including
+    /// into a new table that reuses the old name) use the right table and columns. CDC does not
+    /// capture triggers and views, so only the tables and the index reach the target.
+    #[test]
+    pub fn test_database_tape_replay_alter_table_rename() {
+        let temp_file1 = NamedTempFile::new().unwrap();
+        let db_path1 = temp_file1.path().to_str().unwrap();
+        let temp_file2 = NamedTempFile::new().unwrap();
+        let db_path2 = temp_file2.path().to_str().unwrap();
+
+        let io: Arc<dyn turso_core::IO> = Arc::new(turso_core::PlatformIO::new().unwrap());
+
+        let db1 =
+            turso_core::Database::open_file(io.clone(), db_path1, Arc::new(SqliteDialect)).unwrap();
+        let db1 = Arc::new(DatabaseTape::new(db1));
+
+        let db2 =
+            turso_core::Database::open_file(io.clone(), db_path2, Arc::new(SqliteDialect)).unwrap();
+        let db2 = Arc::new(DatabaseTape::new(db2));
+
+        let mut gen = genawaiter::sync::Gen::new({
+            |coro| async move {
+                let coro: Coro<()> = coro.into();
+                let conn1 = db1.connect(&coro).await.unwrap();
+                conn1
+                    .execute("CREATE TABLE t(x TEXT PRIMARY KEY, y TEXT)")
+                    .unwrap();
+                conn1.execute("CREATE INDEX t_y ON t(y)").unwrap();
+                conn1
+                    .execute("CREATE TRIGGER t_ins AFTER INSERT ON t BEGIN SELECT new.y; END")
+                    .unwrap();
+                conn1.execute("CREATE VIEW v AS SELECT y FROM t").unwrap();
+                conn1
+                    .execute("INSERT INTO t VALUES ('a', 'alpha')")
+                    .unwrap();
+                conn1.execute("ALTER TABLE t RENAME TO t2").unwrap();
+                conn1
+                    .execute("INSERT INTO t2 VALUES ('c', 'gamma')")
+                    .unwrap();
+                conn1
+                    .execute("CREATE TABLE t(p TEXT PRIMARY KEY, q TEXT)")
+                    .unwrap();
+                conn1
+                    .execute("INSERT INTO t VALUES ('d', 'delta')")
+                    .unwrap();
+                conn1
+                    .execute("ALTER TABLE t2 RENAME COLUMN y TO w")
+                    .unwrap();
+                conn1
+                    .execute("INSERT INTO t2 VALUES ('b', 'beta')")
+                    .unwrap();
+
+                let conn2 = db2.connect(&coro).await.unwrap();
+                {
+                    let opts = DatabaseReplaySessionOpts {
+                        use_implicit_rowid: false,
+                    };
+                    let mut session = db2.start_replay_session(&coro, opts).await.unwrap();
+
+                    let opts = DatabaseChangesIteratorOpts {
+                        ignore_schema_changes: false,
+                        ..Default::default()
+                    };
+                    let mut iterator = db1.iterate_changes(opts).unwrap();
+                    while let Some(operation) = iterator.next(&coro).await.unwrap() {
+                        session.replay(&coro, operation).await.unwrap();
+                    }
+                }
+
+                let mut rows = Vec::new();
+                let mut stmt = conn2
+                    .prepare("SELECT type, name, sql FROM sqlite_schema WHERE name IN ('t', 't2', 't_y') ORDER BY name")
+                    .unwrap();
+                while let Some(row) = run_stmt_once(&coro, &mut stmt).await.unwrap() {
+                    rows.push(row.get_values().cloned().collect::<Vec<_>>());
+                }
+                let text =
+                    |s: &'static str| turso_core::Value::Text(turso_core::types::Text::new(s));
+                assert_eq!(
+                    rows,
+                    vec![
+                        vec![
+                            text("table"),
+                            text("t"),
+                            text("CREATE TABLE t (p TEXT PRIMARY KEY, q TEXT)"),
+                        ],
+                        vec![
+                            text("table"),
+                            text("t2"),
+                            text("CREATE TABLE t2 (x TEXT PRIMARY KEY, w TEXT)"),
+                        ],
+                        vec![
+                            text("index"),
+                            text("t_y"),
+                            text("CREATE INDEX t_y ON t2 (w)")
+                        ],
+                    ]
+                );
+
+                let mut rows = Vec::new();
+                let mut stmt = conn2.prepare("SELECT x, w FROM t2 ORDER BY x").unwrap();
+                while let Some(row) = run_stmt_once(&coro, &mut stmt).await.unwrap() {
+                    rows.push(row.get_values().cloned().collect::<Vec<_>>());
+                }
+                assert_eq!(
+                    rows,
+                    vec![
+                        vec![text("a"), text("alpha")],
+                        vec![text("b"), text("beta")],
+                        vec![text("c"), text("gamma")],
+                    ]
+                );
+
+                let mut rows = Vec::new();
+                let mut stmt = conn2.prepare("SELECT p, q FROM t").unwrap();
+                while let Some(row) = run_stmt_once(&coro, &mut stmt).await.unwrap() {
+                    rows.push(row.get_values().cloned().collect::<Vec<_>>());
+                }
+                assert_eq!(rows, vec![vec![text("d"), text("delta")]]);
                 crate::Result::Ok(())
             }
         });
