@@ -652,8 +652,20 @@ fn plan_hir_unmatched_btree_read(
     let access = match union {
         Some(union) => HirSourceAccess::OrUnion(union),
         None => {
+            // The main loop of a table an outer join can NULL-extend
+            // computes an indexed expression from its columns, and a
+            // grouped query keeps those columns in the group row, so this
+            // read supplies the columns too.
+            let null_extended =
+                hir_source_may_be_null_extended(&input.sources, &input.groups, source_position);
             let table_lookup = selected_btree_index(&operation)
-                .filter(|index| !source.index_is_covering(definition, index))
+                .filter(|index| {
+                    if null_extended {
+                        !source.index_covers_columns_without_expressions(index)
+                    } else {
+                        !source.index_is_covering(definition, index)
+                    }
+                })
                 .map_or(BtreeTableLookup::ScanOnly, |_| {
                     BtreeTableLookup::TableRequired
                 });
@@ -2519,18 +2531,11 @@ impl<'a> HirPlanContext<'a> {
         }
         self.add_implied_in_terms(&mut input);
 
-        // GROUP BY and window lowering copy every column the block reads into
-        // a sorter or buffer, so an expression index cannot stand in for the
-        // columns its expressions read.
-        let copies_columns = !block.windows.is_empty()
-            || matches!(
-                &block.body,
-                hir::QueryBlockBody::Select {
-                    grouping: Some(grouping),
-                    ..
-                } if !grouping.keys.is_empty()
-            );
-        if copies_columns {
+        // Window lowering copies every column the block reads into a buffer,
+        // so an expression index cannot stand in for the columns its
+        // expressions read. GROUP BY keeps the index's stored value in the
+        // group row instead.
+        if !block.windows.is_empty() {
             return Ok(input);
         }
         for output in &block.outputs {

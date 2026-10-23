@@ -2086,6 +2086,26 @@ expect {
     having|2
 }
 
+# A materialized CTE inside a WHERE subquery is filled once, by the first
+# copy of the subquery. The unmatched-rows pass copies the subquery, and its
+# copy must fill the CTE too, because the first copy never runs when the
+# left table is empty.
+@cross-check-integrity
+test right-join-unmatched-pass-fills-a-materialized-cte-of-a-subquery {
+    CREATE TABLE cte_left(x INTEGER);
+    CREATE TABLE cte_right(x INTEGER);
+    INSERT INTO cte_right VALUES (1), (2);
+
+    SELECT 'right', cte_right.x FROM cte_left RIGHT JOIN cte_right ON false
+     WHERE cte_right.x = (WITH c(v) AS MATERIALIZED (SELECT 1 UNION ALL SELECT 2) SELECT count(v) FROM c);
+    SELECT 'full', cte_right.x FROM cte_left FULL JOIN cte_right ON false
+     WHERE cte_right.x = (WITH c(v) AS MATERIALIZED (SELECT 1 UNION ALL SELECT 2) SELECT count(v) FROM c);
+}
+expect {
+    right|2
+    full|2
+}
+
 # SQLite keeps this correlated query in the shared FULL JOIN body. Rewriting
 # it as a later anti-join would remove the unmatched right row.
 @cross-check-integrity

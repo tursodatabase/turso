@@ -203,3 +203,19 @@ expect {
     3
     1
 }
+
+# GROUP BY an alias of a correlated subquery reads the output from the
+# group key instead of running the subquery again after the rows are
+# grouped. Running it again would read the materialized CTE of the last
+# scanned row.
+test grouped-alias-of-correlated-subquery-with-materialized-cte {
+    CREATE TABLE items(v INTEGER, group_id INTEGER);
+    INSERT INTO items VALUES (9, 1), (17, 1), (NULL, 1), (9, 1), (2, 2);
+    SELECT (WITH c(v) AS MATERIALIZED (SELECT v FROM items i WHERE i.group_id = g.group_id ORDER BY v NULLS LAST)
+            SELECT coalesce(group_concat(v), '') FROM c) AS vals, count(*)
+      FROM items g GROUP BY vals ORDER BY count(*);
+}
+expect {
+    2|1
+    9,9,17|4
+}

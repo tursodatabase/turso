@@ -735,7 +735,7 @@ fn resolved_result_columns(
     let block = query.blocks.first().ok_or_else(|| {
         LimboError::InternalError(format!("HIR query {} has no blocks", query.id))
     })?;
-    resolved_output_columns(document, &block.outputs)
+    resolved_output_columns_from(document, &block.outputs, block.from.as_ref())
 }
 
 /// Result-column metadata for a list of outputs, such as a SELECT block's
@@ -744,21 +744,78 @@ fn resolved_output_columns(
     document: &HirDocument,
     outputs: &[hir::Output],
 ) -> Result<Vec<ResolvedResultColumn>> {
+    resolved_output_columns_from(document, outputs, None)
+}
+
+fn resolved_output_columns_from(
+    document: &HirDocument,
+    outputs: &[hir::Output],
+    from: Option<&hir::From>,
+) -> Result<Vec<ResolvedResultColumn>> {
     outputs
         .iter()
         .map(|output| {
+            let value = match group_column_of(document, from, &output.expr) {
+                Some(column) => resolved_result_value(document, &column)?,
+                None => resolved_result_value(document, &output.expr)?,
+            };
             Ok(ResolvedResultColumn {
                 name: output.name.clone(),
                 name_is_alias: matches!(
                     output.name_kind,
                     OutputNameKind::ExplicitAlias | OutputNameKind::StarExpansion
                 ),
-                value: resolved_result_value(document, &output.expr)?,
+                value,
                 affinity: output.affinity,
                 primitive: expression_primitive(document, &output.expr),
             })
         })
         .collect()
+}
+
+/// SQLite reads a parenthesized join as a subquery, and names a column
+/// read through it after that subquery: `(join-1).id:1`, or the group's
+/// alias. The one source of a FROM clause that is a group is read without
+/// the subquery. Returns the group column the expression reads, through
+/// every group it is inside.
+fn group_column_of(
+    document: &HirDocument,
+    from: Option<&hir::From>,
+    expression: &hir::Expr,
+) -> Option<hir::Expr> {
+    let bare = |group: &hir::Source| {
+        from.is_some_and(|from| from.first == group.id && from.joins.is_empty())
+    };
+    let mut found = None;
+    let mut expression = match expression {
+        hir::Expr::Column(_) | hir::Expr::MergedColumn(_) => expression.clone(),
+        _ => return None,
+    };
+    loop {
+        let outer = document.sources.iter().find_map(|source| {
+            let hir::SourceKind::FromGroup(group) = &source.kind else {
+                return None;
+            };
+            if bare(source) {
+                return None;
+            }
+            let column = group
+                .columns
+                .iter()
+                .position(|value| value.equivalent(&expression))?;
+            Some(hir::Expr::Column(hir::ColumnRef {
+                source: source.id,
+                column,
+            }))
+        });
+        match outer {
+            Some(outer) => {
+                expression = outer.clone();
+                found = Some(outer);
+            }
+            None => return found,
+        }
+    }
 }
 
 /// The type name of a computed value: a literal has its
@@ -920,6 +977,8 @@ fn resolved_result_value(
         })
     };
     match expression {
+        // SQLite names a USING column after the left table's column.
+        hir::Expr::MergedColumn(merged) => resolved_result_value(document, &merged.left),
         hir::Expr::Column(reference) => {
             let source = source_of(reference.source)?;
             if let Some(table) = catalog_table(source) {
@@ -971,7 +1030,9 @@ fn resolved_result_value(
                 // A FROM subquery is reported by its alias and a CTE by its
                 // name.
                 table_name: match (&source.kind, &source.alias) {
-                    (hir::SourceKind::Derived(_), Some(alias)) => alias.clone(),
+                    (hir::SourceKind::Derived(_) | hir::SourceKind::FromGroup(_), Some(alias)) => {
+                        alias.clone()
+                    }
                     _ => source.name.clone(),
                 },
                 column_name: column.name.clone(),

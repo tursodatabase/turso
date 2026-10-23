@@ -174,3 +174,33 @@ expect {
     1|{"x":2}|-1
     2|{"x":1}|22
 }
+
+# The index stores b->>'x', which two aggregates read. The group row keeps
+# the stored value once and both aggregates read it from there.
+@cross-check-integrity
+test group-by-aggregates-share-one-stored-index-expression {
+    CREATE TABLE shared_input(a INTEGER, b TEXT, c INTEGER, d INTEGER);
+    CREATE INDEX shared_input_idx ON shared_input(d, a, b->>'x', c);
+    INSERT INTO shared_input VALUES
+        (1, '{"x":1}', 12, 3),
+        (1, '{"x":2}', 4, 5),
+        (1, '{"x":1}', 6, 11),
+        (2, '{"x":1}', 22, 3),
+        (2, '{"x":2}', 4, 5),
+        (3, '{"x":1}', 6, 7);
+
+    SELECT a,
+           sum(1),
+           sum(CASE WHEN b->>'x'=1 THEN 1 END),
+           sum(c),
+           sum(CASE WHEN b->>'x'=1 THEN c END)
+      FROM shared_input INDEXED BY shared_input_idx
+     WHERE d BETWEEN 0 AND 10
+     GROUP BY a
+     ORDER BY a;
+}
+expect {
+    1|2|1|16|12
+    2|2|1|26|22
+    3|1|1|6|6
+}

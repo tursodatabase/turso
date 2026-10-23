@@ -31,7 +31,7 @@ QUERY PLAN
 
 BYTECODE
 addr  opcode             p1   p2   p3  p4              p5  comment
-   0  Init                0  125    0                   0  Start at 125
+   0  Init                0  126    0                   0  Start at 126
    1  Gosub               1    3    0                   0
    2  Goto                0   42    0                   0
    3  Once               41    0    0                   0  goto 41
@@ -74,88 +74,89 @@ addr  opcode             p1   p2   p3  p4              p5  comment
   40  Return             14    0    0                   0
   41  Return              1    0    0                   0
   42  OpenRead            3    2    0  k(5,B,B,B,B,B)   0  table=products, root=2, iDb=0
-  43  Rewind              3  124    0                   0  Rewind table products
-  44    Column            3    3   23                   0  r[23]=products.price
-  45    RealAffinity     23    0    0                   0
-  46    Once             99    0    0                   0  goto 99
-  47    BeginSubrtn      28    0    0                   0  r[28]=NULL
-  48    Null              0   27    0                   0  r[27]=NULL
-  49    Null              0   29    0                   0  r[29]=NULL
-  50    InitCoroutine    30   88   51                   0
-  51    Null              0   33    0                   0  r[33]=NULL
-  52    Integer           0   46    0                   0  r[46]=0
-  53    Null              0   47    0                   0  r[47]=NULL
-  54    Gosub            45   84    0                   0
-  55    Once             58    0    0                   0  goto 58
-  56    OpenRead          5    8    0  k(2,B)           0  index=idx_products_category, root=8, iDb=0
-  57    OpenRead          6    2    0  k(5,B,B,B,B,B)   0  table=products, root=2, iDb=0
-  58    Rewind            5   74    0                   0  Rewind index idx_products_category
-  59      DeferredSeek    5    6    0                   0
-  60      Column          5    0   48                   0  r[48]=idx_products_category.category_id
-  61      Column          6    3   37                   0  r[37]=products.price
-  62      RealAffinity   37    0    0                   0
-  63      Compare        47   48    1  k(1, Binary)     0  r[47..47]==r[48..48]
-  64      Jump           65   68   65                   0
-  65      Gosub          44   76    0                   0
-  66      Move           48   47    1                   0  r[47..47]=r[48..48]
-  67      Gosub          45   84    0                   0
-  68      Copy           37   49    0                   0  r[49]=r[37]
-  69      AggStep         0   49   33  avg              0  accum=r[33] step(r[49])
-  70      If             46   72    0                   0  if r[46] goto 72
-  71      Copy           37   42    0                   0  r[42]=r[37]
-  72      Integer         1   46    0                   0  r[46]=1
-  73    Next              5   59    0                   1
-  74    Gosub            44   76    0                   0
-  75    Goto              0   87    0                   0
-  76    IfPos            46   78    0                   0  r[46]>0 -> r[46]-=0, goto 78
-  77    Return           44    0    0                   0
-  78    AggFinal          0   33    0  avg              0  accum=r[33]
-  79    Copy             47   50    0                   0  r[50]=r[47]
-  80    Copy             33   51    0                   0  r[51]=r[33]
-  81    Copy             50   31    1                   0  r[31]=r[50]
-  82    Yield            30    0    0                   0
-  83    Return           44    0    0                   0
-  84    Null              0   33    0                   0  r[33]=NULL
-  85    Integer           0   46    0                   0  r[46]=0
-  86    Return           45    0    0                   0
-  87    EndCoroutine     30    0    0                   0
-  88    Integer           0   52    0                   0  r[52]=0
-  89    InitCoroutine    30    0   51                   0
-  90      Yield          30   94    0                   0
-  91      Copy           32   53    0                   0  r[53]=r[32]
-  92      AggStep         0   53   29  max(Binary)      0  accum=r[29] step(r[53])
-  93    Goto              0   90    0                   0
-  94    AggFinal          0   29    0  max              0  accum=r[29]
-  95    Copy             29   54    0                   0  r[54]=r[29]
-  96    Copy             54   27    0                   0  r[27]=r[54]
-  97    Goto              0   98    0                   0
-  98    Return           28    0    1                   0
-  99    Copy             27   25    0                   0  r[25]=r[27]
- 100    Multiply         25   26   24                   0  r[24]=r[25]*r[26]
- 101    Le               23   24  123  Binary           0  if r[23]<=r[24] goto 123
- 102    Once            111    0    0                   0  goto 111
- 103    OpenAutoindex     4    0    0                   0  cursor=4
- 104    Rewind            0  111    0                   0  Rewind table ephemeral(category_avg)
- 105      ColumnRange     0    0   55  2                0  r[55..56]=ephemeral(category_avg).category_id..avg_price
- 106      RowId           0   57    0                   0  r[57]=ephemeral(category_avg).rowid
- 107      MakeRecord     55    3   58                   0  r[58]=mkrec(r[55..57]); for ephemeral_subquery_s2
- 108      FilterAdd       4   55    1                   0  bloom_filter_add(r[55..56])
- 109      IdxInsert       4   58   55                   0  key=r[58]
- 110    Next              0  105    0                   0
- 111    Column            3    2   59                   0  r[59]=products.category_id
- 112    IsNull           59  123    0                   0  if (r[59]==NULL) goto 123
- 113    Affinity         59    1    0                   0  r[59..60] = C
- 114    Filter            4  123   59                   1  if !bloom_filter(r[59..60]) goto 123
- 115    SeekGE            4  123   59                   0  key=[59..59]
- 116      IdxGT           4  123   59                   0  key=[59..59]
- 117      Column          3    1   60                   0  r[60]=products.name
- 118      Column          3    3   61                   0  r[61]=products.price
- 119      RealAffinity   61    0    0                   0
- 120      Column          4    1   62                   0  r[62]=ephemeral(ephemeral_subquery_s2).avg_price
- 121      ResultRow      60    3    0                   0  output=r[60..62]
- 122    Next              4  116    0                   0
- 123  Next                3   44    0                   1
- 124  Halt                0    0    0                   0
- 125  Transaction         0    1   11                   0  iDb=0 tx_mode=Read
- 126  Real                0   26    0  0.8              0  r[26]=0.8
- 127  Goto                0    1    0                   0
+  43  Gosub               1    3    0                   0
+  44  Rewind              3  125    0                   0  Rewind table products
+  45    Column            3    3   23                   0  r[23]=products.price
+  46    RealAffinity     23    0    0                   0
+  47    Once            100    0    0                   0  goto 100
+  48    BeginSubrtn      28    0    0                   0  r[28]=NULL
+  49    Null              0   27    0                   0  r[27]=NULL
+  50    Null              0   29    0                   0  r[29]=NULL
+  51    InitCoroutine    30   89   52                   0
+  52    Null              0   33    0                   0  r[33]=NULL
+  53    Integer           0   46    0                   0  r[46]=0
+  54    Null              0   47    0                   0  r[47]=NULL
+  55    Gosub            45   85    0                   0
+  56    Once             59    0    0                   0  goto 59
+  57    OpenRead          5    8    0  k(2,B)           0  index=idx_products_category, root=8, iDb=0
+  58    OpenRead          6    2    0  k(5,B,B,B,B,B)   0  table=products, root=2, iDb=0
+  59    Rewind            5   75    0                   0  Rewind index idx_products_category
+  60      DeferredSeek    5    6    0                   0
+  61      Column          5    0   48                   0  r[48]=idx_products_category.category_id
+  62      Column          6    3   37                   0  r[37]=products.price
+  63      RealAffinity   37    0    0                   0
+  64      Compare        47   48    1  k(1, Binary)     0  r[47..47]==r[48..48]
+  65      Jump           66   69   66                   0
+  66      Gosub          44   77    0                   0
+  67      Move           48   47    1                   0  r[47..47]=r[48..48]
+  68      Gosub          45   85    0                   0
+  69      Copy           37   49    0                   0  r[49]=r[37]
+  70      AggStep         0   49   33  avg              0  accum=r[33] step(r[49])
+  71      If             46   73    0                   0  if r[46] goto 73
+  72      Copy           37   42    0                   0  r[42]=r[37]
+  73      Integer         1   46    0                   0  r[46]=1
+  74    Next              5   60    0                   1
+  75    Gosub            44   77    0                   0
+  76    Goto              0   88    0                   0
+  77    IfPos            46   79    0                   0  r[46]>0 -> r[46]-=0, goto 79
+  78    Return           44    0    0                   0
+  79    AggFinal          0   33    0  avg              0  accum=r[33]
+  80    Copy             47   50    0                   0  r[50]=r[47]
+  81    Copy             33   51    0                   0  r[51]=r[33]
+  82    Copy             50   31    1                   0  r[31]=r[50]
+  83    Yield            30    0    0                   0
+  84    Return           44    0    0                   0
+  85    Null              0   33    0                   0  r[33]=NULL
+  86    Integer           0   46    0                   0  r[46]=0
+  87    Return           45    0    0                   0
+  88    EndCoroutine     30    0    0                   0
+  89    Integer           0   52    0                   0  r[52]=0
+  90    InitCoroutine    30    0   52                   0
+  91      Yield          30   95    0                   0
+  92      Copy           32   53    0                   0  r[53]=r[32]
+  93      AggStep         0   53   29  max(Binary)      0  accum=r[29] step(r[53])
+  94    Goto              0   91    0                   0
+  95    AggFinal          0   29    0  max              0  accum=r[29]
+  96    Copy             29   54    0                   0  r[54]=r[29]
+  97    Copy             54   27    0                   0  r[27]=r[54]
+  98    Goto              0   99    0                   0
+  99    Return           28    0    1                   0
+ 100    Copy             27   25    0                   0  r[25]=r[27]
+ 101    Multiply         25   26   24                   0  r[24]=r[25]*r[26]
+ 102    Le               23   24  124  Binary           0  if r[23]<=r[24] goto 124
+ 103    Once            112    0    0                   0  goto 112
+ 104    OpenAutoindex     4    0    0                   0  cursor=4
+ 105    Rewind            0  112    0                   0  Rewind table ephemeral(category_avg)
+ 106      ColumnRange     0    0   55  2                0  r[55..56]=ephemeral(category_avg).category_id..avg_price
+ 107      RowId           0   57    0                   0  r[57]=ephemeral(category_avg).rowid
+ 108      MakeRecord     55    3   58                   0  r[58]=mkrec(r[55..57]); for ephemeral_subquery_s2
+ 109      FilterAdd       4   55    1                   0  bloom_filter_add(r[55..56])
+ 110      IdxInsert       4   58   55                   0  key=r[58]
+ 111    Next              0  106    0                   0
+ 112    Column            3    2   59                   0  r[59]=products.category_id
+ 113    IsNull           59  124    0                   0  if (r[59]==NULL) goto 124
+ 114    Affinity         59    1    0                   0  r[59..60] = C
+ 115    Filter            4  124   59                   1  if !bloom_filter(r[59..60]) goto 124
+ 116    SeekGE            4  124   59                   0  key=[59..59]
+ 117      IdxGT           4  124   59                   0  key=[59..59]
+ 118      Column          3    1   60                   0  r[60]=products.name
+ 119      Column          3    3   61                   0  r[61]=products.price
+ 120      RealAffinity   61    0    0                   0
+ 121      Column          4    1   62                   0  r[62]=ephemeral(ephemeral_subquery_s2).avg_price
+ 122      ResultRow      60    3    0                   0  output=r[60..62]
+ 123    Next              4  117    0                   0
+ 124  Next                3   45    0                   1
+ 125  Halt                0    0    0                   0
+ 126  Transaction         0    1   11                   0  iDb=0 tx_mode=Read
+ 127  Real                0   26    0  0.8              0  r[26]=0.8
+ 128  Goto                0    1    0                   0

@@ -450,7 +450,7 @@ struct HirGroupRuntime<'a> {
     grouping: &'a hir::Grouping,
     aggregates: HirAggregateState<'a>,
     rows: HirGroupRows,
-    inputs: Vec<HirGroupInput>,
+    inputs: Vec<HirGroupInput<'a>>,
     sources: Vec<HirGroupSource>,
     state: HirGroupState,
 }
@@ -480,7 +480,7 @@ struct HirGroupState {
     current_keys: usize,
 }
 
-enum HirGroupInput {
+enum HirGroupInput<'a> {
     Key(usize),
     Column {
         reference: hir::ColumnRef,
@@ -489,6 +489,15 @@ enum HirGroupInput {
     },
     RowId {
         source: SourceId,
+        row_register: usize,
+        group_register: usize,
+    },
+    /// An expression the loop's index stores, such as `b->>'x'` for an
+    /// index on `t(b->>'x')`, with every place the block reads it. The group
+    /// row keeps the stored value once, as SQLite does, instead of the
+    /// columns the expression reads.
+    Expression {
+        expressions: Vec<&'a hir::Expr>,
         row_register: usize,
         group_register: usize,
     },
@@ -577,8 +586,8 @@ fn open_hir_in_seek_source_cursor(
     }
 }
 
-/// Whether no outer join can give `source` a NULL row: it sits directly in
-/// its block's FROM, not inside parentheses, and no LEFT, RIGHT or FULL JOIN
+/// Whether no outer join can give `source` a NULL row: no LEFT, RIGHT or
+/// FULL JOIN in its block's FROM, or in a parenthesized group holding it,
 /// can NULL-extend it.
 fn source_is_never_null_extended(document: &HirDocument, source: SourceId) -> bool {
     let Some(hir::SourceOwner::QueryBlock(block)) =
@@ -593,7 +602,33 @@ fn source_is_never_null_extended(document: &HirDocument, source: SourceId) -> bo
     else {
         return false;
     };
-    from.source_position(source).is_some() && !from.outer_join_may_null_extend(source)
+    from_never_null_extends(document, from, source) == Some(true)
+}
+
+/// Whether `from` holds `source`, directly or inside a parenthesized group,
+/// and no outer join in it can NULL-extend `source`. None when `from` does
+/// not hold `source`.
+fn from_never_null_extends(
+    document: &HirDocument,
+    from: &hir::From,
+    source: SourceId,
+) -> Option<bool> {
+    let members = std::iter::once(from.first).chain(from.joins.iter().map(|join| join.right));
+    for member in members {
+        let never_null_here = !from.outer_join_may_null_extend(member);
+        if member == source {
+            return Some(never_null_here);
+        }
+        let Some(hir::SourceKind::FromGroup(group)) =
+            document.source(member).map(|member| &member.kind)
+        else {
+            continue;
+        };
+        if let Some(never_null_inside) = from_never_null_extends(document, &group.from, source) {
+            return Some(never_null_here && never_null_inside);
+        }
+    }
+    None
 }
 
 struct HirSeekExpressionLowering<'a> {
@@ -1744,6 +1779,39 @@ fn emit_hir_grouped_aggregate<'a>(
     emit_hir_group_result(program, &plan.document, query, block, output, &runtime)
 }
 
+/// The expressions a grouped loop's index stores that the block reads from
+/// it. Each is kept in the group row as the index stores it.
+fn hir_group_loop_index_expressions<'a>(
+    plan: &'a HirPlan,
+    planned_loop: &HirPlannedLoop,
+) -> Result<Vec<(SourceId, &'a hir::Expr, usize)>> {
+    let HirSourceAccess::BTree { operation, .. } = &planned_loop.access else {
+        return Ok(Vec::new());
+    };
+    let index = match operation {
+        HirBtreeOperation::Scan { index, .. }
+        | HirBtreeOperation::Seek { index, .. }
+        | HirBtreeOperation::InSeek { index, .. } => index.as_ref(),
+        HirBtreeOperation::RowidEq { .. } => None,
+    };
+    let Some(index) = index else {
+        return Ok(Vec::new());
+    };
+    let source = plan.document.source(planned_loop.source).ok_or_else(|| {
+        LimboError::InternalError(format!(
+            "HIR grouped loop references missing source {}",
+            planned_loop.source
+        ))
+    })?;
+    if !source_is_never_null_extended(&plan.document, source.id) {
+        return Ok(Vec::new());
+    }
+    Ok(hir_index_key_expressions(plan, source, index)?
+        .into_iter()
+        .map(|(expression, column)| (source.id, expression, column))
+        .collect())
+}
+
 /// The direction to sort each GROUP BY key in, like SQLite, so
 /// ORDER BY ties come out in the same order. When every ORDER BY term is an
 /// aggregate or a constant, all keys follow the first term's direction.
@@ -1830,7 +1898,11 @@ fn initialize_hir_group_runtime<'a>(
         )));
     }
     let aggregates = initialize_hir_aggregates(program, &plan.document, query, block)?;
-    let mut usage = hir_group_row_columns(&plan.document, query, block, grouping);
+    let mut covered = Vec::new();
+    for planned_loop in &block_plan.loops {
+        covered.extend(hir_group_loop_index_expressions(plan, planned_loop)?);
+    }
+    let mut usage = hir_group_row_columns(&plan.document, query, block, grouping, &covered);
     for reference in hir_nested_outer_column_reads(&plan.document, query) {
         if !usage.contains(&reference) {
             usage.push(reference);
@@ -1916,6 +1988,25 @@ fn initialize_hir_group_runtime<'a>(
                 group_register,
             }
         });
+        let mut stored_columns: Vec<usize> = Vec::new();
+        for (covered_source, _, column) in &covered {
+            if *covered_source != source.id || stored_columns.contains(column) {
+                continue;
+            }
+            stored_columns.push(*column);
+            let expressions = covered
+                .iter()
+                .filter(|(other_source, _, other_column)| {
+                    other_source == covered_source && other_column == column
+                })
+                .map(|(_, expression, _)| *expression)
+                .collect();
+            inputs.push(HirGroupInput::Expression {
+                expressions,
+                row_register: program.alloc_register(),
+                group_register: program.alloc_register(),
+            });
+        }
         sources.push(HirGroupSource {
             source: source.id,
             row_start,
@@ -2015,80 +2106,127 @@ fn hir_group_row_columns(
     query: &hir::Query,
     block: &hir::QueryBlock,
     grouping: &hir::Grouping,
+    covered: &[(SourceId, &hir::Expr, usize)],
 ) -> Vec<hir::ColumnRef> {
-    fn add(columns: &mut Vec<hir::ColumnRef>, reference: hir::ColumnRef) {
-        if !columns.contains(&reference) {
-            columns.push(reference);
-        }
+    struct Visitor<'a> {
+        document: &'a HirDocument,
+        keys: &'a [hir::Expr],
+        covered: &'a [(SourceId, &'a hir::Expr, usize)],
+        columns: Vec<hir::ColumnRef>,
     }
-    fn visit(
-        document: &HirDocument,
-        keys: &[hir::Expr],
-        expression: &hir::Expr,
-        columns: &mut Vec<hir::ColumnRef>,
-    ) {
-        if hir_group_key_is_reused(keys, expression) {
-            return;
-        }
-        match expression {
-            hir::Expr::Column(reference) => add(columns, *reference),
-            hir::Expr::Function(hir::FunctionCall {
-                evaluation: hir::FunctionEvaluation::Aggregate { .. },
-                ..
-            }) => add_row_columns(document, expression, columns),
-            hir::Expr::Output(output) => {
-                if let Some(output) = document.output(*output) {
-                    visit(document, keys, &output.expr, columns);
-                }
-            }
-            _ => {
-                let mut index = 0;
-                while let Some(child) = expression.child(index) {
-                    visit(document, keys, child, columns);
-                    index += 1;
-                }
+    impl Visitor<'_> {
+        fn add(&mut self, reference: hir::ColumnRef) {
+            if !self.columns.contains(&reference) {
+                self.columns.push(reference);
             }
         }
-    }
-    fn add_row_columns(
-        document: &HirDocument,
-        expression: &hir::Expr,
-        columns: &mut Vec<hir::ColumnRef>,
-    ) {
-        expression.for_each(&mut |expression| match expression {
-            hir::Expr::Column(reference) => add(columns, *reference),
-            hir::Expr::Output(output) => {
-                if let Some(output) = document.output(*output) {
-                    add_row_columns(document, &output.expr, columns);
+        fn is_covered(&self, expression: &hir::Expr) -> bool {
+            self.covered
+                .iter()
+                .any(|(_, covered, _)| std::ptr::eq(*covered, expression))
+        }
+        fn visit(&mut self, expression: &hir::Expr) {
+            if hir_group_key_is_reused(self.document, self.keys, expression)
+                || self.is_covered(expression)
+            {
+                return;
+            }
+            match expression {
+                hir::Expr::Column(reference) => self.add(*reference),
+                hir::Expr::Function(hir::FunctionCall {
+                    evaluation: hir::FunctionEvaluation::Aggregate { .. },
+                    ..
+                }) => self.add_row_columns(expression),
+                hir::Expr::Output(output) => {
+                    if let Some(output) = self.document.output(*output) {
+                        self.visit(&output.expr);
+                    }
+                }
+                _ => {
+                    let mut index = 0;
+                    while let Some(child) = expression.child(index) {
+                        self.visit(child);
+                        index += 1;
+                    }
                 }
             }
-            _ => {}
-        });
+        }
+        fn add_row_columns(&mut self, expression: &hir::Expr) {
+            if self.is_covered(expression) {
+                return;
+            }
+            match expression {
+                hir::Expr::Column(reference) => self.add(*reference),
+                hir::Expr::Output(output) => {
+                    if let Some(output) = self.document.output(*output) {
+                        self.add_row_columns(&output.expr);
+                    }
+                }
+                _ => {
+                    let mut index = 0;
+                    while let Some(child) = expression.child(index) {
+                        self.add_row_columns(child);
+                        index += 1;
+                    }
+                }
+            }
+        }
     }
-    let mut columns = Vec::new();
+    let mut visitor = Visitor {
+        document,
+        keys: &grouping.keys,
+        covered,
+        columns: Vec::new(),
+    };
     for output in &block.outputs {
-        visit(document, &grouping.keys, &output.expr, &mut columns);
+        visitor.visit(&output.expr);
     }
     if let Some(having) = &grouping.having {
-        visit(document, &grouping.keys, having, &mut columns);
+        visitor.visit(having);
     }
     for term in &query.order_by {
-        visit(document, &grouping.keys, &term.expr, &mut columns);
+        visitor.visit(&term.expr);
     }
     for window in &block.windows {
         for expression in hir_window_expressions(window) {
-            visit(document, &grouping.keys, expression, &mut columns);
+            visitor.visit(expression);
         }
     }
-    columns
+    visitor.columns
 }
 
 /// Whether `expression` is a GROUP BY key whose stored value the group's
 /// outputs, HAVING and ORDER BY read instead of computing it again. A value
 /// read back from the group sorter has lost its JSON subtype, so a key that
 /// can carry one is computed again from its columns.
-fn hir_group_key_is_reused(keys: &[hir::Expr], expression: &hir::Expr) -> bool {
-    keys.iter().any(|key| key.equivalent(expression)) && !hir_expr_can_return_json(expression)
+fn hir_group_key_is_reused(
+    document: &HirDocument,
+    keys: &[hir::Expr],
+    expression: &hir::Expr,
+) -> bool {
+    hir_group_key_position(document, keys, expression).is_some()
+        && !hir_expr_can_return_json(expression)
+}
+
+/// The GROUP BY key equal to `expression`. `GROUP BY alias` names an output
+/// through an [`hir::Expr::Output`] reference, and that output's expression
+/// is the key.
+fn hir_group_key_position(
+    document: &HirDocument,
+    keys: &[hir::Expr],
+    expression: &hir::Expr,
+) -> Option<usize> {
+    keys.iter().position(|key| {
+        if key.equivalent(expression) {
+            return true;
+        }
+        let hir::Expr::Output(output) = key else {
+            return false;
+        };
+        document
+            .output(*output)
+            .is_some_and(|output| output.expr.equivalent(expression))
+    })
 }
 
 /// Whether `expression` can produce a value with the JSON subtype.
@@ -2186,6 +2324,11 @@ fn emit_hir_group_input(
                     &hir::Expr::RowId(*source),
                     *row_register,
                 )?,
+                HirGroupInput::Expression {
+                    expressions,
+                    row_register,
+                    ..
+                } => super::expr::translate_expr(program, document, expressions[0], *row_register)?,
             };
         }
         return emit_hir_group_row(program, document, runtime);
@@ -2209,6 +2352,7 @@ fn emit_hir_group_input(
                 super::expr::translate_expr(program, document, &hir::Expr::RowId(*source), target)?;
                 continue;
             }
+            HirGroupInput::Expression { expressions, .. } => expressions[0],
         };
         super::expr::translate_expr(program, document, expression, target)?;
     }
@@ -2224,10 +2368,10 @@ fn emit_hir_group_input(
 
 fn bind_hir_group_sources(
     program: &mut ProgramBuilder,
-    sources: &[HirGroupSource],
+    runtime: &HirGroupRuntime<'_>,
     values: HirGroupSourceValues,
 ) {
-    for source in sources {
+    for source in &runtime.sources {
         let (start, rowid) = match values {
             HirGroupSourceValues::Row => (
                 source.row_start,
@@ -2239,6 +2383,24 @@ fn bind_hir_group_sources(
             ),
         };
         program.bind_source(source.source, SourceBinding::Registers { start, rowid });
+    }
+    for input in &runtime.inputs {
+        let HirGroupInput::Expression {
+            expressions,
+            row_register,
+            group_register,
+        } = input
+        else {
+            continue;
+        };
+        let register = match values {
+            HirGroupSourceValues::Row => *row_register,
+            HirGroupSourceValues::Group => *group_register,
+        };
+        for expression in expressions {
+            program.unbind_expression_register(expression);
+            program.bind_expression_register(expression, register);
+        }
     }
 }
 
@@ -2292,7 +2454,8 @@ fn emit_hir_group_sorter_rows(
         let target = match input {
             HirGroupInput::Key(index) => runtime.state.current_keys + index,
             HirGroupInput::Column { row_register, .. }
-            | HirGroupInput::RowId { row_register, .. } => *row_register,
+            | HirGroupInput::RowId { row_register, .. }
+            | HirGroupInput::Expression { row_register, .. } => *row_register,
         };
         program.emit_column_or_rowid(sorter.pseudo_cursor, position, target);
     }
@@ -2353,7 +2516,7 @@ fn emit_hir_group_row(
     });
 
     program.preassign_label_to_next_insn(aggregate_step);
-    bind_hir_group_sources(program, &runtime.sources, HirGroupSourceValues::Row);
+    bind_hir_group_sources(program, runtime, HirGroupSourceValues::Row);
     emit_hir_aggregate_steps(program, document, &runtime.aggregates)?;
     emit_hir_bare_row_test(
         program,
@@ -2370,6 +2533,11 @@ fn emit_hir_group_row(
                 ..
             }
             | HirGroupInput::RowId {
+                row_register,
+                group_register,
+                ..
+            }
+            | HirGroupInput::Expression {
                 row_register,
                 group_register,
                 ..
@@ -2394,6 +2562,7 @@ fn emit_hir_group_row(
 /// or the outer values of a correlated subquery.
 fn bind_hir_group_key_registers(
     program: &mut ProgramBuilder,
+    document: &HirDocument,
     query: &hir::Query,
     block: &hir::QueryBlock,
     runtime: &HirGroupRuntime<'_>,
@@ -2401,10 +2570,10 @@ fn bind_hir_group_key_registers(
     let keys = &runtime.grouping.keys;
     let mut bind = |root: &hir::Expr| {
         root.for_each(&mut |expression| {
-            if !hir_group_key_is_reused(keys, expression) {
+            if !hir_group_key_is_reused(document, keys, expression) {
                 return;
             }
-            if let Some(key) = keys.iter().position(|key| key.equivalent(expression)) {
+            if let Some(key) = hir_group_key_position(document, keys, expression) {
                 program.bind_expression_register(expression, runtime.state.previous_keys + key);
             }
         });
@@ -2455,8 +2624,8 @@ fn emit_hir_group_result(
 
     program.preassign_label_to_next_insn(runtime.state.finalize_group);
     finalize_hir_aggregates(program, document, &runtime.aggregates)?;
-    bind_hir_group_sources(program, &runtime.sources, HirGroupSourceValues::Group);
-    bind_hir_group_key_registers(program, query, block, runtime);
+    bind_hir_group_sources(program, runtime, HirGroupSourceValues::Group);
+    bind_hir_group_key_registers(program, document, query, block, runtime);
     if let Some(having) = &runtime.grouping.having {
         let emit_row = program.allocate_label();
         super::expr::translate_condition_expr(
@@ -3143,8 +3312,8 @@ pub(super) struct PreparedHirBtreeLoop<'a> {
     pub(super) table_cursor: Option<CursorID>,
     pub(super) autoindex_source_cursor: Option<CursorID>,
     pub(super) table_has_rowid: bool,
-    /// Expressions of the query block an index without a table cursor
-    /// supplies, each with the index column holding it.
+    /// Expressions of the query block the index supplies, each with the
+    /// index column holding it.
     pub(super) index_keys: Vec<(&'a hir::Expr, usize)>,
 }
 
@@ -6985,6 +7154,9 @@ fn emit_hir_hash_build_input(
         });
         Ok(())
     };
+    // The build loops read the hash rows once. An expression their index
+    // supplied is computed again from the stored row when a probe reads it.
+    let bound_before_build = program.expression_register_count();
     emit_join_loops(
         program,
         plan,
@@ -7001,6 +7173,7 @@ fn emit_hir_hash_build_input(
         },
         HirLoopBody::Dml(&store),
     )?;
+    program.truncate_expression_registers(bound_before_build);
     program.preassign_label_to_next_insn(filled);
     // The loops bound the sources to their own cursors.
     for source in &input.sources {
@@ -7927,6 +8100,15 @@ fn prepare_hir_shared_cte_loop<'a>(
             Some(SourceBinding::BTree { scan_cursor, .. }) if *scan_cursor == shared.cursor_id
         );
         let cursor = if filled_here {
+            // This reader is being emitted again, such as by the pass that
+            // reads the unmatched rows of a RIGHT JOIN: its first copy may
+            // never run, so fill the table from here too.
+            if let Some(fill_subroutine) = shared.fill_subroutine {
+                program.emit_insn(Insn::Gosub {
+                    target_pc: fill_subroutine.label,
+                    return_reg: fill_subroutine.return_reg,
+                });
+            }
             shared.cursor_id
         } else {
             // The reader that filled the table may sit in a loop that never
@@ -8524,24 +8706,14 @@ pub(super) fn prepare_hir_btree_loop<'a>(
         program.preassign_label_to_next_insn(opened);
     }
 
-    // An index read without its table supplies the expressions it keys,
-    // such as `a + b` for an index on `t(a + b)`.
+    // An index supplies the expressions it keys, such as `a + b` for an
+    // index on `t(a + b)`, as SQLite does. They are read once when the loop
+    // positions the index, so a loop an outer join can NULL-extend computes
+    // them from its NULL columns instead: `coalesce(v, -1)` is -1 on that
+    // row, not the stored key.
     let index_keys = match index {
-        Some(index) if table_cursor.is_none() && !index.ephemeral => {
-            match source
-                .index_expressions
-                .iter()
-                .find(|expressions| expressions.index.value().name == index.name)
-            {
-                Some(expressions) if expressions.columns.iter().any(Option::is_some) => {
-                    find_block_subexpressions(plan, source, |expression| {
-                        expressions.columns.iter().position(|key| {
-                            key.as_ref().is_some_and(|key| key.equivalent(expression))
-                        })
-                    })?
-                }
-                _ => Vec::new(),
-            }
+        Some(index) if source_is_never_null_extended(document, source.id) => {
+            hir_index_key_expressions(plan, source, index)?
         }
         _ => Vec::new(),
     };
@@ -8555,6 +8727,33 @@ pub(super) fn prepare_hir_btree_loop<'a>(
         table_has_rowid: table.has_rowid,
         index_keys,
     })
+}
+
+/// The block's subexpressions `index` stores, with the index column each is
+/// read from. An automatic index stores no expressions.
+fn hir_index_key_expressions<'a>(
+    plan: &'a HirPlan,
+    source: &hir::Source,
+    index: &Index,
+) -> Result<Vec<(&'a hir::Expr, usize)>> {
+    if index.ephemeral {
+        return Ok(Vec::new());
+    }
+    let expressions = source
+        .index_expressions
+        .iter()
+        .find(|expressions| expressions.index.value().name == index.name);
+    match expressions {
+        Some(expressions) if expressions.columns.iter().any(Option::is_some) => {
+            find_block_subexpressions(plan, source, |expression| {
+                expressions
+                    .columns
+                    .iter()
+                    .position(|key| key.as_ref().is_some_and(|key| key.equivalent(expression)))
+            })
+        }
+        _ => Ok(Vec::new()),
+    }
 }
 
 fn build_hir_autoindex(
@@ -8621,6 +8820,14 @@ fn build_hir_autoindex(
                     super::expr::translate_expr_no_constant_opt(
                         program, document, expression, target,
                     )?;
+                    // The index stores the value the column gives, which
+                    // has the column's affinity, as a read of the column
+                    // does.
+                    if let Some(definition) = prepared.source.columns.get(column) {
+                        if definition.has_affinity {
+                            program.emit_column_affinity(target, definition.affinity);
+                        }
+                    }
                     Ok(())
                 }
                 hir::ColumnReadExpression::NotRequired => Err(LimboError::InternalError(format!(
@@ -8889,9 +9096,20 @@ pub(super) fn start_hir_btree_loop(
             });
         }
     }
+    let mut index_key_registers: Vec<(usize, usize)> = Vec::new();
     for (expression, column) in &prepared.index_keys {
-        let register = program.alloc_register();
-        program.emit_column_or_rowid(prepared.cursor, *column, register);
+        let register = match index_key_registers
+            .iter()
+            .find(|(read_column, _)| read_column == column)
+        {
+            Some((_, register)) => *register,
+            None => {
+                let register = program.alloc_register();
+                program.emit_column_or_rowid(prepared.cursor, *column, register);
+                index_key_registers.push((*column, register));
+                register
+            }
+        };
         program.bind_expression_register(expression, register);
     }
     Ok(HirBtreeLoop {
@@ -14691,5 +14909,137 @@ pub(super) mod tests {
             .insns
             .iter()
             .any(|(insn, _)| matches!(insn, Insn::Le { .. })));
+    }
+
+    fn expression_index_schema() -> Schema {
+        let mut schema = Schema::new();
+        let table = Arc::new(
+            BTreeTable::from_sql(
+                "CREATE TABLE items(a INTEGER, b TEXT, c INTEGER, d INTEGER)",
+                2,
+            )
+            .expect("items table schema parses"),
+        );
+        schema
+            .add_btree_table(table.clone())
+            .expect("items table name is unique");
+        schema
+            .add_index(Arc::new(
+                Index::from_sql(
+                    &SymbolTable::new(),
+                    "CREATE INDEX items_idx ON items(d, a, lower(b), c)",
+                    3,
+                    &table,
+                )
+                .expect("expression index parses"),
+            ))
+            .expect("items index name is unique");
+        schema
+    }
+
+    #[test]
+    fn grouped_aggregates_read_the_stored_index_expression_once() {
+        let plan = analyze_plan(
+            expression_index_schema(),
+            "SELECT a, \
+                    sum(CASE WHEN lower(b) = 'x' THEN 1 END), \
+                    sum(CASE WHEN lower(b) = 'x' THEN c END) \
+             FROM items WHERE d BETWEEN 0 AND 10 GROUP BY a",
+        );
+        let query = root_query(&plan.document);
+        let mut program = program();
+
+        emit_planned_query_body(&mut program, &plan, query, &QueryDestination::ResultRows)
+            .expect("grouped expression-index query emits");
+
+        let index_cursor = program
+            .cursor_ref
+            .iter()
+            .position(|(_, cursor)| {
+                matches!(cursor, CursorType::BTreeIndex(index) if index.name == "items_idx")
+            })
+            .expect("the query reads the expression index");
+        assert!(!program
+            .insns
+            .iter()
+            .any(|(insn, _)| matches!(insn, Insn::Function { .. })));
+        let stored_expression_reads = program
+            .insns
+            .iter()
+            .filter(|(insn, _)| {
+                matches!(
+                    insn,
+                    Insn::Column {
+                        cursor_id,
+                        column: 2,
+                        ..
+                    } if *cursor_id == index_cursor
+                )
+            })
+            .count();
+        assert_eq!(stored_expression_reads, 1);
+    }
+
+    #[test]
+    fn left_join_null_row_computes_the_indexed_expression_from_its_columns() {
+        let mut schema = Schema::new();
+        schema
+            .add_btree_table(Arc::new(
+                BTreeTable::from_sql("CREATE TABLE left_items(value INTEGER)", 2)
+                    .expect("left table schema parses"),
+            ))
+            .expect("left table name is unique");
+        let right = Arc::new(
+            BTreeTable::from_sql("CREATE TABLE right_items(k INTEGER, v INTEGER)", 3)
+                .expect("right table schema parses"),
+        );
+        schema
+            .add_btree_table(right.clone())
+            .expect("right table name is unique");
+        schema
+            .add_index(Arc::new(
+                Index::from_sql(
+                    &SymbolTable::new(),
+                    "CREATE INDEX right_items_idx ON right_items(k, v, coalesce(v, -1))",
+                    4,
+                    &right,
+                )
+                .expect("expression index parses"),
+            ))
+            .expect("right index name is unique");
+        let plan = analyze_plan(
+            schema,
+            "SELECT l.value, coalesce(r.v, -1) \
+             FROM left_items AS l \
+             LEFT JOIN right_items AS r INDEXED BY right_items_idx ON r.k = l.value",
+        );
+        let query = root_query(&plan.document);
+        let block_plan = &plan
+            .planned_query(query)
+            .expect("root query is planned")
+            .blocks[0];
+        let mut program = program();
+
+        emit_planned_query_body(&mut program, &plan, query, &QueryDestination::ResultRows)
+            .expect("LEFT JOIN over an expression index emits");
+
+        let SourceBinding::BTree { scan_cursor, .. } = program
+            .source_binding(block_plan.loops[1].source)
+            .copied()
+            .expect("right source is bound")
+        else {
+            panic!("right source uses a B-tree cursor");
+        };
+        assert!(program.insns.iter().any(
+            |(insn, _)| matches!(insn, Insn::NullRow { cursor_id } if *cursor_id == scan_cursor)
+        ));
+        assert!(!program.insns.iter().any(|(insn, _)| matches!(
+            insn,
+            Insn::Column {
+                cursor_id,
+                column: 2,
+                ..
+            } if *cursor_id == scan_cursor
+        )));
     }
 }
