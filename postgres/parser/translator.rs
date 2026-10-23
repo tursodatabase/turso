@@ -3532,6 +3532,10 @@ impl PostgreSQLTranslator {
             }
         }
 
+        if func_name == "substring" && (args.len() == 2 || args.len() == 3) {
+            return Ok(Self::translate_pg_substring(args));
+        }
+
         let translated_order = self.translate_order_by(&func_call.agg_order)?;
         let (order_by, within_group) = if func_call.agg_within_group {
             let within_group = translated_order
@@ -3554,6 +3558,64 @@ impl PostgreSQLTranslator {
             within_group,
             filter_over,
         })
+    }
+
+    fn translate_pg_substring(mut args: Vec<Box<ast::Expr>>) -> ast::Expr {
+        let value = *args.remove(0);
+        let start = *args.remove(0);
+        let one = ast::Expr::Literal(ast::Literal::Numeric("1".into()));
+        let zero = ast::Expr::Literal(ast::Literal::Numeric("0".into()));
+        let substr = |args| function_call("substr", args);
+        let binary = |lhs, op, rhs| ast::Expr::Binary(Box::new(lhs), op, Box::new(rhs));
+
+        match args.pop() {
+            None => ast::Expr::Case {
+                base: None,
+                when_then_pairs: vec![(
+                    Box::new(binary(start.clone(), ast::Operator::Less, one.clone())),
+                    Box::new(substr(vec![value.clone(), one])),
+                )],
+                else_expr: Some(Box::new(substr(vec![value, start]))),
+            },
+            Some(length) => {
+                let length = *length;
+                let negative_length = binary(
+                    length.clone(),
+                    ast::Operator::Less,
+                    ast::Expr::Literal(ast::Literal::Numeric("0".into())),
+                );
+                let adjusted_length = function_call(
+                    "max",
+                    vec![
+                        zero,
+                        binary(
+                            binary(length.clone(), ast::Operator::Add, start.clone()),
+                            ast::Operator::Subtract,
+                            one.clone(),
+                        ),
+                    ],
+                );
+                let negative_start = binary(start.clone(), ast::Operator::Less, one.clone());
+                let error = ast::Expr::Raise(
+                    ast::ResolveType::Abort,
+                    Some(Box::new(ast::Expr::Literal(ast::Literal::String(
+                        "'negative substring length not allowed'".into(),
+                    )))),
+                );
+
+                ast::Expr::Case {
+                    base: None,
+                    when_then_pairs: vec![
+                        (Box::new(negative_length), Box::new(error)),
+                        (
+                            Box::new(negative_start),
+                            Box::new(substr(vec![value.clone(), one, adjusted_length])),
+                        ),
+                    ],
+                    else_expr: Some(Box::new(substr(vec![value, start, length]))),
+                }
+            }
+        }
     }
 
     /// Translate the WINDOW clause (named window definitions) from a SELECT statement.
