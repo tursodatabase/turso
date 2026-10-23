@@ -20062,6 +20062,138 @@ fn test_schema_row_insert_does_not_count_as_statement_change() {
 }
 
 #[test]
+fn test_open_with_mvcc_option_converts_fresh_database() {
+    let temp_dir = tempfile::TempDir::new().unwrap();
+    let path = temp_dir.path().join("fresh.db");
+    let io = Arc::new(PlatformIO::new().unwrap());
+    let db = Database::open_file_with_flags(
+        io.clone(),
+        path.to_str().unwrap(),
+        OpenFlags::default(),
+        DatabaseOpts::new().with_mvcc(true),
+        None,
+        Arc::new(SqliteDialect),
+    )
+    .unwrap();
+    assert!(
+        db.mvcc_enabled(),
+        "open must leave the database in MVCC mode"
+    );
+    {
+        let conn = db.connect(ConnectOpts::new()).unwrap();
+        conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY)")
+            .unwrap();
+        conn.execute("BEGIN CONCURRENT").unwrap();
+        conn.execute("INSERT INTO t VALUES (1)").unwrap();
+        conn.execute("COMMIT").unwrap();
+        conn.close().unwrap();
+    }
+    drop(db);
+
+    // A later open without the flag still comes up in MVCC mode: the journal
+    // mode is a property of the database, not of the open.
+    let db = Database::open_file_with_flags(
+        io,
+        path.to_str().unwrap(),
+        OpenFlags::default(),
+        DatabaseOpts::new(),
+        None,
+        Arc::new(SqliteDialect),
+    )
+    .unwrap();
+    assert!(db.mvcc_enabled());
+    let conn = db.connect(ConnectOpts::new()).unwrap();
+    let rows = get_rows(&conn, "SELECT id FROM t");
+    assert_eq!(rows.len(), 1);
+}
+
+#[test]
+fn test_open_with_mvcc_option_converts_existing_wal_database() {
+    let temp_dir = tempfile::TempDir::new().unwrap();
+    let path = temp_dir.path().join("wal.db");
+    let io = Arc::new(PlatformIO::new().unwrap());
+    let db = Database::open_file_with_flags(
+        io.clone(),
+        path.to_str().unwrap(),
+        OpenFlags::default(),
+        DatabaseOpts::new(),
+        None,
+        Arc::new(SqliteDialect),
+    )
+    .unwrap();
+    assert!(!db.mvcc_enabled());
+    {
+        let conn = db.connect(ConnectOpts::new()).unwrap();
+        conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, c TEXT)")
+            .unwrap();
+        conn.execute("INSERT INTO t VALUES (1, 'wal-era')").unwrap();
+        conn.close().unwrap();
+    }
+    drop(db);
+
+    let db = Database::open_file_with_flags(
+        io,
+        path.to_str().unwrap(),
+        OpenFlags::default(),
+        DatabaseOpts::new().with_mvcc(true),
+        None,
+        Arc::new(SqliteDialect),
+    )
+    .unwrap();
+    assert!(db.mvcc_enabled(), "open must convert the WAL database");
+    let conn = db.connect(ConnectOpts::new()).unwrap();
+    let rows = get_rows(&conn, "SELECT c FROM t");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0][0].to_string(), "wal-era");
+    conn.execute("BEGIN CONCURRENT").unwrap();
+    conn.execute("INSERT INTO t VALUES (2, 'mvcc-era')")
+        .unwrap();
+    conn.execute("COMMIT").unwrap();
+    let rows = get_rows(&conn, "SELECT c FROM t ORDER BY id");
+    assert_eq!(rows.len(), 2);
+}
+
+#[test]
+fn test_open_with_mvcc_option_readonly_keeps_current_mode() {
+    let temp_dir = tempfile::TempDir::new().unwrap();
+    let path = temp_dir.path().join("ro.db");
+    let io = Arc::new(PlatformIO::new().unwrap());
+    let db = Database::open_file_with_flags(
+        io.clone(),
+        path.to_str().unwrap(),
+        OpenFlags::default(),
+        DatabaseOpts::new(),
+        None,
+        Arc::new(SqliteDialect),
+    )
+    .unwrap();
+    {
+        let conn = db.connect(ConnectOpts::new()).unwrap();
+        conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY)")
+            .unwrap();
+        conn.close().unwrap();
+    }
+    drop(db);
+
+    let db = Database::open_file_with_flags(
+        io,
+        path.to_str().unwrap(),
+        OpenFlags::default() | OpenFlags::ReadOnly,
+        DatabaseOpts::new().with_mvcc(true),
+        None,
+        Arc::new(SqliteDialect),
+    )
+    .unwrap();
+    assert!(
+        !db.mvcc_enabled(),
+        "a read-only open cannot write the conversion"
+    );
+    let conn = db.connect(ConnectOpts::new()).unwrap();
+    let rows = get_rows(&conn, "SELECT count(*) FROM t");
+    assert_eq!(rows[0][0].as_int().unwrap(), 0);
+}
+
+#[test]
 fn test_exclusive_update_conflicts_with_concurrent_delete_without_replacing_marker() {
     let db = MvccTestDbNoConn::new_with_random_db();
     let setup = db.connect();

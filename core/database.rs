@@ -80,6 +80,10 @@ pub struct DatabaseOpts {
     pub enable_generated_columns: bool,
     pub enable_multiprocess_wal: bool,
     pub enable_without_rowid: bool,
+    /// Open the database in MVCC mode. A database that is not in MVCC mode
+    /// yet has its journal mode switched during open; read-only opens cannot
+    /// write the conversion and keep the current mode.
+    pub enable_mvcc: bool,
     pub enable_experimental_mvcc_passive_checkpoint: bool,
     pub unsafe_testing: bool,
     pub(crate) enable_load_extension: bool,
@@ -123,6 +127,11 @@ impl DatabaseOpts {
 
     pub fn with_vacuum(mut self, enable: bool) -> Self {
         self.enable_vacuum = enable;
+        self
+    }
+
+    pub fn with_mvcc(mut self, enable: bool) -> Self {
+        self.enable_mvcc = enable;
         self
     }
 
@@ -561,6 +570,9 @@ pub struct OpenDbAsyncState {
     /// Sub state machine for `MvStore::bootstrap_nonblock`, driven in
     /// `BootstrapMvStore`.
     mvcc_bootstrap_state: mvcc::database::BootstrapState,
+    /// The `PRAGMA journal_mode = 'mvcc'` statement that converts the database
+    /// when `DatabaseOpts::with_mvcc` is set, held across yields.
+    mvcc_convert_stmt: Option<crate::Statement>,
 }
 
 impl Default for OpenDbAsyncState {
@@ -584,6 +596,7 @@ impl OpenDbAsyncState {
             header_validation_state: HeaderValidationState::default(),
             mvcc_bootstrap_conn: None,
             mvcc_bootstrap_state: mvcc::database::BootstrapState::default(),
+            mvcc_convert_stmt: None,
         }
     }
 }
@@ -1726,7 +1739,31 @@ impl Database {
                         .as_ref()
                         .expect("pager must be initialized in Init phase");
 
-                    if let Some(mv_store) = db.get_mv_store().as_ref() {
+                    // DatabaseOpts::with_mvcc on a database that is not in MVCC
+                    // mode yet: switch the journal mode as part of the open. A
+                    // read-only open cannot write the conversion, so it keeps
+                    // the current mode. The pragma performs the full MVCC
+                    // bootstrap itself, so the bootstrap arm below is skipped.
+                    // The in-flight statement gates re-entry: the pragma sets
+                    // the MvStore before it finishes, so `get_mv_store()` alone
+                    // would route a resumed open into the bootstrap arm.
+                    if state.mvcc_convert_stmt.is_some()
+                        || (db.opts.enable_mvcc
+                            && db.get_mv_store().is_none()
+                            && !db.open_flags.contains(OpenFlags::ReadOnly))
+                    {
+                        if state.mvcc_convert_stmt.is_none() {
+                            let conn = state
+                                .conn
+                                .as_ref()
+                                .expect("conn must be initialized in Init phase");
+                            state.mvcc_convert_stmt =
+                                Some(conn.prepare("PRAGMA journal_mode = 'mvcc'")?);
+                        }
+                        let stmt = state.mvcc_convert_stmt.as_mut().expect("created above");
+                        return_if_io!(stmt.run_ignore_rows_nonblock());
+                        state.mvcc_convert_stmt = None;
+                    } else if let Some(mv_store) = db.get_mv_store().as_ref() {
                         // Create the dedicated bootstrap connection once and
                         // hold it across yields. Re-entry reuses the existing
                         // connection and the persisted `BootstrapState`.

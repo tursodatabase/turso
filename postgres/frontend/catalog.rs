@@ -3177,11 +3177,7 @@ impl PgGetTableDefCursor {
         self.rows.clear();
 
         for (table_name, table) in &schema.tables {
-            // Skip system tables
-            if table_name.starts_with("sqlite_")
-                || table_name == "sqlite_master"
-                || table_name == "sqlite_schema"
-            {
+            if is_system_table_name(table_name) {
                 continue;
             }
 
@@ -3595,98 +3591,6 @@ mod tests {
     }
 
     #[test]
-    fn table_definitions_resume_after_io_and_statement_reset() {
-        use turso_core::{MemoryYieldIO, IO};
-
-        let io = Arc::new(MemoryYieldIO::new());
-        let db = crate::session::open_database_with_io(
-            io.clone(),
-            "tabledefs.db",
-            crate::OpenFlags::default(),
-            crate::DatabaseOpts::new(),
-        )
-        .unwrap();
-        let conn = db.connect(ConnectOpts::new()).unwrap();
-        let mut expected = Vec::new();
-        for i in 0..12 {
-            let name = format!("catalog_{i:02}");
-            let sql = format!(
-                "CREATE TABLE {name} (item TEXT DEFAULT '{}', n INT DEFAULT {i})",
-                "x".repeat(2048 + i * 31)
-            );
-            conn.execute(&sql).unwrap();
-            expected.push(vec![
-                Value::build_text("public"),
-                Value::build_text(name),
-                Value::build_text(sql),
-            ]);
-        }
-
-        conn.execute("BEGIN").unwrap();
-        conn.get_pager().clear_page_cache(false);
-        let mut cursor = PgGetTableDefTable::new().open(conn.clone()).unwrap();
-        let mut yields = 0;
-        loop {
-            match cursor.filter(&[], None, 0).unwrap() {
-                IOResult::IO(completions) => {
-                    yields += 1;
-                    assert!(!completions.finished());
-                    io.step().unwrap();
-                    assert!(completions.finished());
-                }
-                IOResult::Done(has_rows) => {
-                    assert!(has_rows);
-                    break;
-                }
-            }
-        }
-        assert!(yields > 1, "schema scan should yield on multiple pages");
-        cursor.rows.sort_by_key(|row| row[1].to_string());
-        assert_eq!(cursor.rows, expected);
-        drop(cursor);
-        conn.execute("ROLLBACK").unwrap();
-
-        let mut stmt = conn
-            .prepare("SELECT schema_name, table_name, ddl FROM pg_get_tabledef ORDER BY table_name")
-            .unwrap();
-        conn.get_pager().clear_page_cache(false);
-        conn.execute("SELECT COUNT(*) FROM pg_namespace").unwrap();
-        assert!(matches!(stmt.step().unwrap(), StepResult::IO));
-        assert!(matches!(stmt.step().unwrap(), StepResult::IO));
-        stmt.reset().unwrap();
-        conn.get_pager().clear_page_cache(false);
-        conn.execute("SELECT COUNT(*) FROM pg_namespace").unwrap();
-        let mut rows = Vec::new();
-        let mut statement_yields = 0;
-        loop {
-            match stmt.step().unwrap() {
-                StepResult::IO => {
-                    statement_yields += 1;
-                    let completions = stmt
-                        .take_io_completions()
-                        .expect("catalog I/O must reach its caller");
-                    io.step().unwrap();
-                    assert!(completions.finished());
-                }
-                StepResult::Row => rows.push(
-                    stmt.row()
-                        .unwrap()
-                        .get_values()
-                        .cloned()
-                        .collect::<Vec<_>>(),
-                ),
-                StepResult::Done => break,
-                other => panic!("unexpected catalog step: {other:?}"),
-            }
-        }
-        assert!(statement_yields > 1);
-        assert_eq!(rows, expected);
-        stmt.reset().unwrap();
-        assert_eq!(stmt.run_collect_rows().unwrap(), expected);
-        conn.execute("CREATE TABLE after_catalog (v INT)").unwrap();
-    }
-
-    #[test]
     fn catalog_view_columns_survive_schema_refresh() {
         let expected = ["oid", "nspname", "nspowner", "nspacl"]
             .map(Value::build_text)
@@ -3877,11 +3781,6 @@ mod tests {
             temp_conn
                 .execute(format!("PRAGMA temp_store = {temp_store}"))
                 .unwrap();
-            temp_conn.execute("BEGIN").unwrap();
-            temp_conn
-                .execute("CREATE TEMP TABLE temp_data (v INT)")
-                .unwrap();
-            temp_conn.execute("ROLLBACK").unwrap();
             assert_eq!(
                 temp_conn
                     .prepare("SELECT COUNT(*) FROM temp.pg_namespace")

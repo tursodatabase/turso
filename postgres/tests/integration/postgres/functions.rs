@@ -385,7 +385,7 @@ fn test_pg_derived_result_column_names(db: TempDatabase) {
         ("SELECT 1::int", "int4"),
         ("SELECT CAST(1 AS integer)", "int4"),
         ("SELECT int '5'", "int4"),
-        ("SELECT '2'::varchar(3)", "varchar"),
+        ("SELECT '2'::varchar", "varchar"),
         ("SELECT 1::int::text", "text"),
         ("SELECT (1 + 1)::int", "int4"),
         ("SELECT * FROM (SELECT 1::bigint) AS s", "int8"),

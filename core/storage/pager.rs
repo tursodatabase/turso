@@ -2010,8 +2010,11 @@ impl Pager {
     }
 
     /// Keep a retired record buffer for the next cursor on this pager. Extra
-    /// buffers beyond the pool size are freed.
+    /// buffers beyond the pool size or larger than the largest page are freed.
     pub(crate) fn recycle_record_buf(&self, buf: crate::types::RecordBuf) {
+        if buf.capacity() > PageSize::MAX as usize {
+            return;
+        }
         let mut pool = self.record_pool.lock();
         if pool.len() < RECORD_POOL_SIZE {
             pool.push(buf);
@@ -6555,6 +6558,32 @@ mod tests {
         default_page1, CacheFlushState, CollectingState, Page, PageRef, Pager, SharedPagerState,
     };
     use crate::{Buffer, Completion, CompletionError, LimboError};
+
+    #[test]
+    fn record_pool_frees_buffers_of_rows_larger_than_a_page() {
+        let io = Arc::new(MemoryIO::new());
+        let db =
+            crate::Database::open_file(io, ":memory:", Arc::new(crate::SqliteDialect)).unwrap();
+        let conn = db.connect(crate::ConnectOpts::new()).unwrap();
+        conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, body TEXT NOT NULL, tag TEXT)")
+            .unwrap();
+        conn.execute("INSERT INTO t VALUES (1, CAST(zeroblob(6 * 1024 * 1024) AS TEXT), 'big')")
+            .unwrap();
+        conn.execute("INSERT INTO t VALUES (2, CAST(zeroblob(5000) AS TEXT), 'small')")
+            .unwrap();
+        conn.execute("SELECT body FROM t WHERE id = 1").unwrap();
+        conn.execute("UPDATE t SET tag = 'updated' WHERE id = 1")
+            .unwrap();
+        conn.execute("UPDATE t SET tag = 'updated' WHERE id = 2")
+            .unwrap();
+
+        let pager = conn.get_pager();
+        let pool = pager.record_pool.lock();
+        assert!(!pool.is_empty());
+        for buf in pool.iter() {
+            assert!(buf.capacity() <= super::PageSize::MAX as usize);
+        }
+    }
 
     #[test]
     fn checkpoint_reset_does_not_reuse_failed_header_read() {
