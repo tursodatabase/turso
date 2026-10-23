@@ -385,10 +385,17 @@ pub(super) fn count_subquery_calls_for_plan(
                     .enumerate()
                     .skip(loop_index + 1)
                 {
+                    let later_table = &joined_tables[plan.data[later_loop].0];
+                    let unmatched_right_rows_run_this_loop_again = later_table
+                        .join_info
+                        .as_ref()
+                        .is_some_and(JoinInfo::keeps_right_rows);
+                    if unmatched_right_rows_run_this_loop_again {
+                        break;
+                    }
                     // A semi/anti join loop cannot host the filter: inside an
                     // anti join loop, a failed filter looks like a missing
                     // match, which emits the outer row instead of rejecting it.
-                    let later_table = &joined_tables[plan.data[later_loop].0];
                     if later_table
                         .join_info
                         .as_ref()
