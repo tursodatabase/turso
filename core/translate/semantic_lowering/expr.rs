@@ -5313,6 +5313,7 @@ mod tests {
                 schema: Arc::new(schema),
             }],
             unqualified_database_search_path: vec![hir::DatabaseId::new(MAIN_DB_ID)],
+            empty_temp_schema: None,
             has_temp_database: false,
             search_path_configured: false,
         };

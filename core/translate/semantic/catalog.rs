@@ -1,10 +1,10 @@
 use rustc_hash::FxHashMap as HashMap;
 
 use crate::{
-    connection::{PlaceholderTempSchema, TempDbContext},
+    connection::TempDbContext,
     dialect::Dialect,
     schema::Schema,
-    sync::Arc,
+    sync::{Arc, OnceLock},
     DatabaseCatalog, Result, RwLock, MAIN_DB_ID, TEMP_DB_ID,
 };
 
@@ -22,6 +22,8 @@ pub(crate) struct SemanticCatalogDatabase {
 pub(crate) struct SemanticCatalog {
     pub(crate) databases: Vec<SemanticCatalogDatabase>,
     pub(crate) unqualified_database_search_path: Vec<DatabaseId>,
+    /// The schema `temp` names while the connection has no TEMP database.
+    pub(crate) empty_temp_schema: Option<EmptyTempSchema>,
     /// Whether the connection has a TEMP database with objects of its own.
     pub(crate) has_temp_database: bool,
     /// Whether the prepare call set the search path, in which case an
@@ -38,7 +40,6 @@ impl SemanticCatalog {
         attached_databases: &RwLock<DatabaseCatalog>,
         namespaces: &crate::Namespaces,
         custom_types_enabled: bool,
-        dialect: &dyn Dialect,
         configured_search_path: Option<&[String]>,
     ) -> Result<Self> {
         let temp_schema = temp
@@ -47,10 +48,11 @@ impl SemanticCatalog {
             .as_ref()
             .map(|temp| temp.db.schema.lock().clone());
         let has_temp_schema = temp_schema.is_some();
-        let temp_schema = match temp_schema {
-            Some(schema) => schema,
-            None => placeholder_temp_schema(temp, &main_schema, custom_types_enabled, dialect)?,
-        };
+        let empty_temp_schema = (!has_temp_schema).then(|| EmptyTempSchema {
+            main: main_schema.clone(),
+            custom_types_enabled,
+            schema: OnceLock::new(),
+        });
 
         let mut attached = {
             let catalog = attached_databases.read();
@@ -71,18 +73,18 @@ impl SemanticCatalog {
         // reading shared attached schemas.
         let staged_schemas = database_schemas.read().clone();
 
-        let mut databases = vec![
-            SemanticCatalogDatabase {
-                id: DatabaseId::new(MAIN_DB_ID),
-                name: "main".to_string(),
-                schema: main_schema,
-            },
-            SemanticCatalogDatabase {
+        let mut databases = vec![SemanticCatalogDatabase {
+            id: DatabaseId::new(MAIN_DB_ID),
+            name: "main".to_string(),
+            schema: main_schema,
+        }];
+        if let Some(temp_schema) = temp_schema {
+            databases.push(SemanticCatalogDatabase {
                 id: DatabaseId::new(TEMP_DB_ID),
                 name: "temp".to_string(),
                 schema: temp_schema,
-            },
-        ];
+            });
+        }
         for (database, name, database_handle) in &attached {
             let schema = staged_schemas
                 .get(database)
@@ -125,44 +127,75 @@ impl SemanticCatalog {
         Ok(Self {
             databases,
             unqualified_database_search_path,
+            empty_temp_schema,
             has_temp_database: has_temp_schema,
             search_path_configured: configured_search_path.is_some(),
         })
     }
 }
 
-/// The schema a statement reads as `temp` while the connection has no
-/// temp database: empty, with the main schema's table-valued functions.
-/// The connection keeps the one built last, and a statement prepared
-/// against the same main schema reads it again.
-fn placeholder_temp_schema(
-    temp: &TempDbContext,
-    main_schema: &Arc<Schema>,
+/// An empty schema with the main schema's table-valued functions, built
+/// the first time a statement reads `temp`.
+pub(crate) struct EmptyTempSchema {
+    main: Arc<Schema>,
     custom_types_enabled: bool,
-    dialect: &dyn Dialect,
-) -> Result<Arc<Schema>> {
-    if let Some(placeholder) = temp.placeholder_schema.read().as_ref() {
-        if Arc::ptr_eq(&placeholder.main, main_schema)
-            && placeholder.custom_types_enabled == custom_types_enabled
-        {
-            return Ok(placeholder.schema.clone());
-        }
+    schema: OnceLock<Arc<Schema>>,
+}
+
+impl EmptyTempSchema {
+    pub(crate) fn schema(&self, dialect: &dyn Dialect) -> &Schema {
+        self.schema.get_or_init(|| {
+            #[cfg(test)]
+            tests::EMPTY_TEMP_SCHEMAS_BUILT.with(|built| built.set(built.get() + 1));
+            let mut schema = Schema::with_options(self.custom_types_enabled, dialect)
+                .expect("built-in type definitions are malformed");
+            schema.copy_table_valued_functions(&self.main);
+            Arc::new(schema)
+        })
     }
-    let mut schema = Schema::with_options(custom_types_enabled, dialect)?;
-    schema.copy_table_valued_functions(main_schema);
-    let schema = Arc::new(schema);
-    *temp.placeholder_schema.write() = Some(PlaceholderTempSchema {
-        main: main_schema.clone(),
-        custom_types_enabled,
-        schema: schema.clone(),
-    });
-    Ok(schema)
+
+    /// The version of the schema, which an empty schema that was never
+    /// built has as 0.
+    pub(crate) fn schema_version(&self) -> u32 {
+        self.schema.get().map_or(0, |schema| schema.schema_version)
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::dialect::SqliteDialect;
+    use std::cell::Cell;
+
+    thread_local! {
+        pub(super) static EMPTY_TEMP_SCHEMAS_BUILT: Cell<usize> = const { Cell::new(0) };
+    }
+
+    #[test]
+    fn only_a_statement_that_reads_temp_builds_the_empty_temp_schema() {
+        let io = Arc::new(crate::MemoryIO::new());
+        let db = crate::Database::open_file(io, ":memory:", Arc::new(SqliteDialect))
+            .expect("database opens");
+        let conn = db
+            .connect(crate::ConnectOpts::new())
+            .expect("connection opens");
+        conn.execute("CREATE TABLE t(a)").expect("table is created");
+        EMPTY_TEMP_SCHEMAS_BUILT.with(|built| built.set(0));
+
+        for sql in [
+            "SELECT a FROM t",
+            "INSERT INTO t VALUES (1)",
+            "UPDATE t SET a = 2",
+            "DELETE FROM t",
+        ] {
+            conn.prepare(sql).expect("statement prepares");
+        }
+        assert_eq!(EMPTY_TEMP_SCHEMAS_BUILT.with(Cell::get), 0);
+
+        conn.prepare("SELECT name FROM temp.sqlite_temp_master")
+            .expect("SELECT from temp prepares");
+        assert_eq!(EMPTY_TEMP_SCHEMAS_BUILT.with(Cell::get), 1);
+    }
 
     #[test]
     fn captured_catalog_owns_schema_arcs_and_lookup_order() {
@@ -178,7 +211,6 @@ mod tests {
             &attached_databases,
             &crate::Namespaces::default(),
             true,
-            &SqliteDialect,
             None,
         )
         .expect("catalog capture succeeds");
@@ -193,45 +225,16 @@ mod tests {
                 .iter()
                 .map(|database| (database.id.index(), database.name.as_str()))
                 .collect::<Vec<_>>(),
-            [(MAIN_DB_ID, "main"), (TEMP_DB_ID, "temp")]
+            [(MAIN_DB_ID, "main")]
         );
+        assert!(catalog
+            .empty_temp_schema
+            .as_ref()
+            .is_some_and(|empty_temp| empty_temp.schema.get().is_none()));
         assert_eq!(
             catalog.unqualified_database_search_path,
             [DatabaseId::new(MAIN_DB_ID)]
         );
         assert_eq!(catalog.databases[0].schema.schema_version, 0);
-    }
-
-    #[test]
-    fn statements_without_a_temp_database_share_one_placeholder_temp_schema() {
-        let main_schema = Arc::new(Schema::new());
-        let database_schemas = RwLock::new(HashMap::default());
-        let temp = TempDbContext::new();
-        let attached_databases = RwLock::new(DatabaseCatalog::new());
-        let capture = |main_schema: &Arc<Schema>| {
-            SemanticCatalog::capture(
-                main_schema.clone(),
-                &database_schemas,
-                &temp,
-                &attached_databases,
-                &crate::Namespaces::default(),
-                true,
-                &SqliteDialect,
-                None,
-            )
-            .expect("catalog capture succeeds")
-            .databases[TEMP_DB_ID]
-                .schema
-                .clone()
-        };
-
-        let first = capture(&main_schema);
-        let second = capture(&main_schema);
-        assert!(Arc::ptr_eq(&first, &second));
-
-        let changed_main_schema = Arc::new(Schema::new());
-        let third = capture(&changed_main_schema);
-        assert!(!Arc::ptr_eq(&first, &third));
-        assert!(Arc::ptr_eq(&third, &capture(&changed_main_schema)));
     }
 }

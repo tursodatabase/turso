@@ -240,10 +240,14 @@ fn build_plan_for_connection(
     schema: &Arc<Schema>,
     connection: &Arc<Connection>,
 ) -> Result<MaintenancePlan> {
-    let dialect = crate::dialect::SqliteDialect;
-    let catalog = capture_catalog(schema, connection, &dialect, None)?;
+    let catalog = capture_catalog(schema, connection, None)?;
     let syms = connection.syms.read();
-    let context = semantic_context(&catalog, &syms, connection, Arc::new(dialect))?;
+    let context = semantic_context(
+        &catalog,
+        &syms,
+        connection,
+        Arc::new(crate::dialect::SqliteDialect),
+    )?;
     plan_view(view_name, select, &context)
 }
 

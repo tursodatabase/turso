@@ -125,11 +125,6 @@ pub(crate) struct TempDbContext {
     /// end. Mirrors the `schema_did_change` field inside
     /// `TransactionState::Write` for the main DB.
     pub(crate) schema_did_change: AtomicBool,
-    /// The schema a statement reads as `temp` while `database` is `None`,
-    /// kept for the main schema it was built from. Building one registers
-    /// the built-in catalog, which costs more than preparing most
-    /// statements.
-    pub(crate) placeholder_schema: RwLock<Option<PlaceholderTempSchema>>,
 }
 
 impl TempDbContext {
@@ -138,19 +133,8 @@ impl TempDbContext {
             database: RwLock::new(None),
             committed_schema: RwLock::new(None),
             schema_did_change: AtomicBool::new(false),
-            placeholder_schema: RwLock::new(None),
         }
     }
-}
-
-/// An empty `temp` schema with the table-valued functions of the main
-/// schema it was built from. Holding `main` keeps a later change to the
-/// main schema from editing that schema in place, so a changed main schema
-/// is a different handle.
-pub(crate) struct PlaceholderTempSchema {
-    pub(crate) main: Arc<Schema>,
-    pub(crate) custom_types_enabled: bool,
-    pub(crate) schema: Arc<Schema>,
 }
 
 #[derive(Debug, Clone)]

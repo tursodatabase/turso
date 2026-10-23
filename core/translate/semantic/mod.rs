@@ -236,7 +236,6 @@ mod tests {
                 &attached_databases,
                 &crate::Namespaces::default(),
                 true,
-                &SqliteDialect,
                 None,
             )
             .expect("catalog capture succeeds")

@@ -46,27 +46,26 @@ impl<'ast> Analyzer<'_, '_, 'ast> {
             .map(|trigger| (database, trigger))
             .collect::<Vec<_>>();
         let temp = hir::DatabaseId::new(crate::TEMP_DB_ID);
-        if database != temp {
-            if let Ok(temp_schema) = self.context().schema(temp) {
-                // Like SQLite, temp triggers fire first. Each one
-                // found is put in front, so they end up in the reverse of
-                // the order the temp schema lists them.
-                let mut temp_triggers = temp_schema
-                    .get_triggers_for_table(name)
-                    .filter(|trigger| {
-                        selected(trigger)
-                            && match trigger.target_database_id {
-                                Some(target) => target == database.index(),
-                                None => temp_schema.get_table(&trigger.table_name).is_none(),
-                            }
-                    })
-                    .cloned()
-                    .map(|trigger| (temp, trigger))
-                    .collect::<Vec<_>>();
-                temp_triggers.reverse();
-                temp_triggers.append(&mut triggers);
-                triggers = temp_triggers;
-            }
+        if database != temp && self.context().has_temp_database() {
+            let temp_schema = self.context().schema(temp)?;
+            // Like SQLite, temp triggers fire first. Each one
+            // found is put in front, so they end up in the reverse of
+            // the order the temp schema lists them.
+            let mut temp_triggers = temp_schema
+                .get_triggers_for_table(name)
+                .filter(|trigger| {
+                    selected(trigger)
+                        && match trigger.target_database_id {
+                            Some(target) => target == database.index(),
+                            None => temp_schema.get_table(&trigger.table_name).is_none(),
+                        }
+                })
+                .cloned()
+                .map(|trigger| (temp, trigger))
+                .collect::<Vec<_>>();
+            temp_triggers.reverse();
+            temp_triggers.append(&mut triggers);
+            triggers = temp_triggers;
         }
         Ok(triggers
             .into_iter()
