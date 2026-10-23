@@ -1,0 +1,54 @@
+@database :memory:
+
+setup base {
+    CREATE TABLE t(id int PRIMARY KEY, x int, y int);
+    INSERT INTO t VALUES (1,1,100),(2,2,200);
+}
+
+@setup base
+test bare-max-with-having {
+    SELECT x, max(y) FROM t HAVING max(y) > 0;
+}
+expect {
+    2|200
+}
+
+@setup base
+test bare-column-only-in-having {
+    SELECT max(y) FROM t HAVING x = 2;
+}
+expect {
+    200
+}
+
+@setup base
+test bare-max-without-having {
+    SELECT x, max(y) FROM t;
+}
+expect {
+    2|200
+}
+
+@setup base
+test bare-min-with-having {
+    SELECT x, min(y) FROM t HAVING x = 1;
+}
+expect {
+    1|100
+}
+
+@setup base
+test bare-sum-with-having {
+    SELECT x, sum(y) FROM t HAVING x = 1;
+}
+expect {
+    1|300
+}
+
+@setup base
+test aggregate-having-control {
+    SELECT max(y) FROM t HAVING max(y) > 100;
+}
+expect {
+    200
+}

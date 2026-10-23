@@ -118,8 +118,9 @@ pub fn emit_query<'a>(
     // subquery in the result columns needs even when every column contains an
     // aggregate: if no row did, the subquery runs again against the NULL row.
     let has_ungrouped_nonagg_cols = !plan.aggregates.is_empty()
-        && plan.group_by.is_none()
-        && (plan.result_columns.iter().any(|c| !c.contains_aggregates)
+        && plan.group_by.as_ref().is_none_or(|gb| gb.exprs.is_empty())
+        && (plan.group_by.as_ref().is_some_and(|gb| gb.having.is_some())
+            || plan.result_columns.iter().any(|c| !c.contains_aggregates)
             || plan
                 .non_from_clause_subqueries
                 .iter()
