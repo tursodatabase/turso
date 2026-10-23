@@ -458,3 +458,23 @@ test view-keeps-a-cte-declared-in-a-nested-select {
 expect {
     1
 }
+
+test public-name-under-a-schema-prefix-does-not-reach-the-schema {
+    CREATE SCHEMA app;
+    CREATE TABLE app.t (x int);
+    INSERT INTO app.t VALUES (1);
+    DROP TABLE IF EXISTS "app.t";
+    DROP TABLE IF EXISTS public."app.t";
+    SELECT count(*) FROM app.t;
+}
+expect {
+    1
+}
+
+test public-name-under-a-schema-prefix-does-not-exist {
+    CREATE SCHEMA app;
+    CREATE TABLE app.t (x int);
+    SELECT count(*) FROM "app.t";
+}
+expect error {
+}

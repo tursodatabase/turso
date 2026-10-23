@@ -5616,6 +5616,32 @@ mod tests {
     }
 
     #[test]
+    fn test_a_stored_name_under_the_prefix_of_a_namespace_is_not_seen_through_another() {
+        let temp_dir = TempDir::new().unwrap();
+        let conn = open_connection_with_opts(&temp_dir.path().join("main.db"), DatabaseOpts::new());
+        conn.execute("CREATE TABLE \"app.t\"(x INTEGER); INSERT INTO \"app.t\" VALUES(1)")
+            .unwrap();
+        conn.execute("CREATE SEQUENCE \"app.s\"").unwrap();
+        conn.add_namespace(crate::Namespace {
+            name: "app".to_string(),
+            database_id: MAIN_DB_ID,
+            prefix: "app.".to_string(),
+        });
+        conn.add_namespace(crate::Namespace::database("public", MAIN_DB_ID));
+        conn.set_search_path(Some(vec!["public".to_string()]));
+
+        assert!(conn.prepare("SELECT x FROM \"app.t\"").is_err());
+        assert!(conn.prepare("SELECT x FROM public.\"app.t\"").is_err());
+        assert!(conn.prepare("DROP TABLE public.\"app.t\"").is_err());
+        assert!(conn.prepare("SELECT nextval('\"app.s\"')").is_err());
+        conn.execute("DROP TABLE IF EXISTS \"app.t\"").unwrap();
+        conn.execute("DROP TABLE IF EXISTS public.\"app.t\"")
+            .unwrap();
+        assert_eq!(query_single_i64(&conn, "SELECT x FROM app.t"), 1);
+        assert_eq!(query_single_i64(&conn, "SELECT x FROM main.\"app.t\""), 1);
+    }
+
+    #[test]
     fn test_named_memory_parent_can_attach_real_file_database() {
         let temp_dir = TempDir::new().unwrap();
         let aux_path = temp_dir.path().join("aux.db");

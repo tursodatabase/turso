@@ -817,9 +817,11 @@ impl<'a> Resolver<'a> {
     {
         let object_name = normalize_ident(object_name);
         let has_object = |namespace: &Namespace| {
-            self.with_schema(namespace.database_id, |schema| {
-                schema_contains_object(schema, &namespace.stored_name(&object_name))
-            })
+            let resolved = ResolvedName::in_namespace(namespace.clone(), &object_name);
+            self.is_visible(&resolved)
+                && self.with_schema(namespace.database_id, |schema| {
+                    schema_contains_object(schema, &resolved.stored_name)
+                })
         };
         // Only check the temp schema when a temp database actually exists.
         // This avoids expensive schema construction/lookup on every table
@@ -834,6 +836,7 @@ impl<'a> Resolver<'a> {
             .find(|namespace| has_object(namespace))
             .or_else(|| self.search_order.first())
             .map(|namespace| ResolvedName::in_namespace(namespace.clone(), &object_name))
+            .filter(|resolved| self.is_visible(resolved))
     }
 
     fn schema_has_table_like_object(schema: &Schema, table_name: &str) -> bool {
@@ -895,7 +898,8 @@ impl<'a> Resolver<'a> {
         qualified_name: &ast::QualifiedName,
     ) -> Result<Option<ResolvedName>> {
         if qualified_name.namespace.is_some() {
-            return self.resolve_object(qualified_name).map(Some);
+            let resolved = self.resolve_object(qualified_name)?;
+            return Ok(self.is_visible(&resolved).then_some(resolved));
         }
         Ok(self.find_existing_table_named(qualified_name.name.as_str()))
     }
@@ -941,7 +945,8 @@ impl<'a> Resolver<'a> {
         qualified_name: &ast::QualifiedName,
     ) -> Result<Option<ResolvedName>> {
         if qualified_name.namespace.is_some() {
-            return self.resolve_object(qualified_name).map(Some);
+            let resolved = self.resolve_object(qualified_name)?;
+            return Ok(self.is_visible(&resolved).then_some(resolved));
         }
         Ok(self.find_unqualified_existing(qualified_name.name.as_str(), Self::schema_has_index))
     }
@@ -974,16 +979,30 @@ impl<'a> Resolver<'a> {
     ) -> Result<Option<ResolvedName>> {
         if let Some(namespace) = &qualified_name.namespace {
             let namespace = self.namespace_named(namespace)?;
-            return Ok(Some(ResolvedName::in_namespace(
+            let resolved = ResolvedName::in_namespace(
                 namespace,
                 &normalize_ident(qualified_name.name.as_str()),
-            )));
+            );
+            return Ok(self.is_visible(&resolved).then_some(resolved));
         }
         Ok(
             self.find_unqualified_existing(qualified_name.name.as_str(), |schema, seq_name| {
                 schema.get_sequence(seq_name).is_some()
             }),
         )
+    }
+
+    /// Whether `resolved` names the object it is stored as. A name whose
+    /// stored name starts with the prefix of another namespace of the same
+    /// database, like "app.t" in public next to a namespace app, belongs to
+    /// that namespace and is not seen through this one. The namespace of
+    /// the whole database, like main, sees every stored name.
+    pub(crate) fn is_visible(&self, resolved: &ResolvedName) -> bool {
+        let database_id = resolved.database_id();
+        resolved.namespace.name == self.namespace_of_database(database_id).name
+            || self
+                .namespace_of_stored_name(database_id, &resolved.stored_name)
+                .holds_the_same_objects_as(&resolved.namespace)
     }
 
     /// The name of `sequence` qualified with its namespace, for the opcodes
