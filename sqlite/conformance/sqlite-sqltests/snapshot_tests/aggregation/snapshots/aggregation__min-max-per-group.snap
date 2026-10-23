@@ -23,47 +23,47 @@ QUERY PLAN
 `--SCAN sales USING INDEX idx_sales_category
 
 BYTECODE
-addr  opcode                p1  p2  p3  p4                  p5  comment
-   0        Init             0  41   0                       0  Start at 41
-   1        Null             0   1   0                       0  r[1]=NULL
-   2        Null             0   2   0                       0  r[2]=NULL
-   3        Integer          0  19   0                       0  r[19]=0
-   4        Null             0  20   0                       0  r[20]=NULL
-   5        Gosub           18  36   0                       0
-   6        OpenRead         0   4   0  k(2,B)               0  index=idx_sales_category, root=4, iDb=0
-   7        OpenRead         1   2   0  k(7,B,B,B,B,B,B,B)   0  table=sales, root=2, iDb=0
-   8        Rewind           0  25   0                       0  Rewind index idx_sales_category
-   9          DeferredSeek   0   1   0                       0
-  10          Column         0   0  21                       0  r[21]=idx_sales_category.category
-  11          Column         1   4   7                       0  r[7]=sales.amount
-  12          Compare       20  21   1  k(1, Binary)         0  r[20..20]==r[21..21]
-  13          Jump          14  17  14                       0
-  14          Gosub         17  27   0                       0
-  15          Move          21  20   1                       0  r[20..20]=r[21..21]
-  16          Gosub         18  36   0                       0
-  17          Copy           7  22   0                       0  r[22]=r[7]
-  18          AggStep        0  22   1  min(Binary)          0  accum=r[1] step(r[22])
-  19          Copy           7  23   0                       0  r[23]=r[7]
-  20          AggStep        0  23   2  max(Binary)          0  accum=r[2] step(r[23])
-  21          If            19  23   0                       0  if r[19] goto 23
-  22          Copy           7  14   0                       0  r[14]=r[7]
-  23          Integer        1  19   0                       0  r[19]=1
-  24        Next             0   9   0                       1
-  25        Gosub           17  27   0                       0
-  26        Goto             0  40   0                       0
-  27        IfPos           19  29   0                       0  r[19]>0 -> r[19]-=0, goto 29
-  28      Return            17   0   0                       0
-  29      AggFinal           0   1   0  min                  0  accum=r[1]
-  30      AggFinal           0   2   0  max                  0  accum=r[2]
-  31      Copy              20  24   0                       0  r[24]=r[20]
-  32      Copy               1  25   0                       0  r[25]=r[1]
-  33      Copy               2  26   0                       0  r[26]=r[2]
-  34      ResultRow         24   3   0                       0  output=r[24..26]
-  35    Return              17   0   0                       0
-  36    Null                 0   1   0                       0  r[1]=NULL
-  37    Null                 0   2   0                       0  r[2]=NULL
-  38    Integer              0  19   0                       0  r[19]=0
-  39  Return                18   0   0                       0
-  40  Halt                   0   0   0                       0
-  41  Transaction            0   1   8                       0  iDb=0 tx_mode=Read
-  42  Goto                   0   1   0                       0
+addr  opcode          p1  p2  p3  p4                  p5  comment
+   0  Init             0  41   0                       0  Start at 41
+   1  Null             0   1   0                       0  r[1]=NULL
+   2  Null             0   2   0                       0  r[2]=NULL
+   3  Integer          0  19   0                       0  r[19]=0
+   4  Null             0  20   0                       0  r[20]=NULL
+   5  Gosub           18  36   0                       0
+   6  OpenRead         0   4   0  k(2,B)               0  index=idx_sales_category, root=4, iDb=0
+   7  OpenRead         1   2   0  k(7,B,B,B,B,B,B,B)   0  table=sales, root=2, iDb=0
+   8  Rewind           0  25   0                       0  Rewind index idx_sales_category
+   9    DeferredSeek   0   1   0                       0
+  10    Column         0   0  21                       0  r[21]=idx_sales_category.category
+  11    Column         1   4   7                       0  r[7]=sales.amount
+  12    Compare       20  21   1  k(1, Binary)         0  r[20..20]==r[21..21]
+  13    Jump          14  17  14                       0
+  14    Gosub         17  27   0                       0
+  15    Move          21  20   1                       0  r[20..20]=r[21..21]
+  16    Gosub         18  36   0                       0
+  17    Copy           7  22   0                       0  r[22]=r[7]
+  18    AggStep        0  22   1  min(Binary)          0  accum=r[1] step(r[22])
+  19    Copy           7  23   0                       0  r[23]=r[7]
+  20    AggStep        0  23   2  max(Binary)          0  accum=r[2] step(r[23])
+  21    If            19  23   0                       0  if r[19] goto 23
+  22    Copy           7  14   0                       0  r[14]=r[7]
+  23    Integer        1  19   0                       0  r[19]=1
+  24  Next             0   9   0                       1
+  25  Gosub           17  27   0                       0
+  26  Goto             0  40   0                       0
+  27  IfPos           19  29   0                       0  r[19]>0 -> r[19]-=0, goto 29
+  28  Return          17   0   0                       0
+  29  AggFinal         0   1   0  min                  0  accum=r[1]
+  30  AggFinal         0   2   0  max                  0  accum=r[2]
+  31  Copy            20  24   0                       0  r[24]=r[20]
+  32  Copy             1  25   0                       0  r[25]=r[1]
+  33  Copy             2  26   0                       0  r[26]=r[2]
+  34  ResultRow       24   3   0                       0  output=r[24..26]
+  35  Return          17   0   0                       0
+  36  Null             0   1   0                       0  r[1]=NULL
+  37  Null             0   2   0                       0  r[2]=NULL
+  38  Integer          0  19   0                       0  r[19]=0
+  39  Return          18   0   0                       0
+  40  Halt             0   0   0                       0
+  41  Transaction      0   1   8                       0  iDb=0 tx_mode=Read
+  42  Goto             0   1   0                       0

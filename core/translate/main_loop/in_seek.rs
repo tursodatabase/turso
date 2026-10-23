@@ -9,17 +9,22 @@ pub(crate) struct InSeekLoop {
 }
 
 /// Materialize IN values into the unique ephemeral index used by an IN seek.
+/// With `once`, the values are constant for the whole program and the index
+/// is filled the first time only.
 pub(crate) fn open_in_seek_values_cursor<E>(
     program: &mut ProgramBuilder,
     index: Option<&Arc<Index>>,
     values: &[E],
     affinity: Affinity,
+    once: bool,
     mut emit_value: impl FnMut(&mut ProgramBuilder, &E, usize) -> Result<()>,
 ) -> Result<CursorID> {
     let once_done = program.allocate_label();
-    program.emit_insn(Insn::Once {
-        target_pc_when_reentered: once_done,
-    });
+    if once {
+        program.emit_insn(Insn::Once {
+            target_pc_when_reentered: once_done,
+        });
+    }
     let collation = index
         .as_ref()
         .and_then(|index| index.columns.first())
@@ -164,6 +169,7 @@ pub(crate) fn emit_in_seek_advance(
             cursor_id: scan_cursor,
             pc_if_next: loop_start,
             fullscan: false,
+            is_index: false,
         });
     }
     program.preassign_label_to_next_insn(state.next_value);
@@ -171,5 +177,6 @@ pub(crate) fn emit_in_seek_advance(
         cursor_id: state.source_cursor,
         pc_if_next: state.outer_loop_start,
         fullscan: false,
+        is_index: false,
     });
 }

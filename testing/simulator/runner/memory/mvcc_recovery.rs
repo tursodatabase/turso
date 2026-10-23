@@ -3,7 +3,7 @@ use std::sync::Arc;
 use turso_core::SqliteDialect;
 
 use anyhow::Result;
-use turso_core::{Connection, Database, DatabaseOpts, IO, OpenFlags, StepResult};
+use turso_core::{ConnectOpts, Connection, Database, DatabaseOpts, IO, OpenFlags, StepResult};
 
 use crate::runner::SimIO;
 use crate::runner::memory::io::MemorySimIO;
@@ -21,7 +21,7 @@ fn open_conn(io: Arc<MemorySimIO>, path: &str) -> Result<Arc<Connection>> {
         None,
         Arc::new(SqliteDialect),
     )?;
-    let conn = db.connect()?;
+    let conn = db.connect(ConnectOpts::new())?;
     Ok(conn)
 }
 
@@ -34,8 +34,8 @@ fn open_two_conns(io: Arc<MemorySimIO>, path: &str) -> Result<(Arc<Connection>, 
         None,
         Arc::new(SqliteDialect),
     )?;
-    let conn1 = db.connect()?;
-    let conn2 = db.connect()?;
+    let conn1 = db.connect(ConnectOpts::new())?;
+    let conn2 = db.connect(ConnectOpts::new())?;
     Ok((conn1, conn2))
 }
 
@@ -102,7 +102,12 @@ fn mutate_file_by_suffix(io: &MemorySimIO, suffix: &str, mutator: impl FnOnce(&m
     let file = files
         .get(&path)
         .unwrap_or_else(|| panic!("missing file for path {path}"));
-    mutator(&mut file.buffer.borrow_mut());
+    let mut state = file.state.borrow_mut();
+    let mut bytes = vec![0; state.buffer.len];
+    state.buffer.read(0, &mut bytes);
+    mutator(&mut bytes);
+    state.resize(bytes.len());
+    state.write(0, &bytes);
 }
 
 fn remove_file_by_suffix(io: &MemorySimIO, suffix: &str) -> Result<()> {

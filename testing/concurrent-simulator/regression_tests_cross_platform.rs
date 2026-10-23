@@ -1,7 +1,7 @@
 use rand_chacha::ChaCha8Rng;
 use rand_chacha::rand_core::SeedableRng;
 use std::sync::Arc;
-use turso_core::{Database, DatabaseOpts, IO, OpenFlags, SqliteDialect, Statement};
+use turso_core::{ConnectOpts, Database, DatabaseOpts, IO, OpenFlags, SqliteDialect, Statement};
 use turso_whopper::{IOFaultConfig, SimulatorIO};
 
 fn run_to_done(stmt: &mut Statement, io: &SimulatorIO) {
@@ -42,7 +42,7 @@ fn test_concurrent_commit_no_yield_spin() {
     )
     .expect("open db");
 
-    let setup = db.connect().expect("setup conn");
+    let setup = db.connect(ConnectOpts::new()).expect("setup conn");
     setup
         .execute("PRAGMA journal_mode = 'mvcc'")
         .expect("enable mvcc");
@@ -51,8 +51,8 @@ fn test_concurrent_commit_no_yield_spin() {
         .expect("create table");
     setup.close().expect("close setup");
 
-    let conn1 = db.connect().expect("conn1");
-    let conn2 = db.connect().expect("conn2");
+    let conn1 = db.connect(ConnectOpts::new()).expect("conn1");
+    let conn2 = db.connect(ConnectOpts::new()).expect("conn2");
 
     let mut stmt = conn1.prepare("BEGIN CONCURRENT").expect("prepare");
     run_to_done(&mut stmt, &io);
@@ -107,7 +107,7 @@ fn test_concurrent_commit_no_yield_spin() {
     assert!(done1, "commit1 should have completed");
     assert!(done2, "commit2 should have completed");
 
-    let verify = db.connect().expect("verify conn");
+    let verify = db.connect(ConnectOpts::new()).expect("verify conn");
     let mut stmt = verify.prepare("SELECT COUNT(*) FROM t").expect("prepare");
     let mut count = 0i64;
     loop {
@@ -238,4 +238,263 @@ fn test_dropped_failed_statement_keeps_suspended_sibling_commit_intact() {
             Err(e) => panic!("statement teardown must not clobber a suspended commit: {e}"),
         }
     }
+}
+
+/// FTS workloads must use the index rather than scan the table.
+/// Two runs with the same seed must produce the same database file bytes.
+/// The simulator uses the seed to generate segment and index IDs.
+/// Before the fix, two runs with the same seed had different MVCC log paths
+/// for every `fts2/chunk/<uuid>` entry.
+#[test]
+fn test_fts_workloads_use_the_index_and_replay_with_the_seed() {
+    use turso_whopper::operations::Operation;
+    use turso_whopper::properties::{
+        FtsResultComparisonProperty, IntegrityCheckProperty, Property,
+    };
+    use turso_whopper::workloads::{
+        BeginWorkload, CommitWorkload, FtsDeleteWorkload, FtsInsertWorkload, FtsMatchWorkload,
+        FtsOptimizeWorkload, FtsUpdateWorkload, RollbackWorkload, Workload, fts_sim_schema,
+    };
+    use turso_whopper::{Stats, Whopper, WhopperOpts};
+
+    fn run(seed: u64) -> (Stats, Vec<(String, Vec<u8>)>) {
+        let workloads: Vec<(u32, Box<dyn Workload>)> = vec![
+            (20, Box::new(FtsInsertWorkload)),
+            (8, Box::new(FtsUpdateWorkload)),
+            (6, Box::new(FtsDeleteWorkload)),
+            (12, Box::new(FtsMatchWorkload)),
+            (2, Box::new(FtsOptimizeWorkload)),
+            (10, Box::new(BeginWorkload)),
+            (8, Box::new(CommitWorkload)),
+            (3, Box::new(RollbackWorkload)),
+        ];
+        let properties: Vec<Box<dyn Property>> = vec![
+            Box::new(IntegrityCheckProperty),
+            Box::new(FtsResultComparisonProperty),
+        ];
+        let opts = WhopperOpts {
+            seed: Some(seed),
+            max_connections: 3,
+            max_steps: 4_000,
+            enable_mvcc: true,
+            elle_tables: fts_sim_schema(),
+            workloads,
+            properties,
+            ..WhopperOpts::default()
+        };
+        let mut whopper = Whopper::new(opts).expect("create whopper");
+        whopper
+            .run()
+            .expect("FTS workloads failed a result comparison");
+        (whopper.stats.clone(), whopper.db_file_bytes())
+    }
+
+    let (first_stats, first_files) = run(0xF75);
+    assert!(
+        first_stats.fts_checks > 0,
+        "no FTS result comparison completed"
+    );
+
+    let (second_stats, second_files) = run(0xF75);
+    assert_eq!(first_stats.fts_checks, second_stats.fts_checks);
+    assert!(!first_files.is_empty());
+    assert_eq!(first_files.len(), second_files.len());
+    for ((name, first), (other_name, second)) in first_files.iter().zip(&second_files) {
+        assert_eq!(name, other_name);
+        assert!(
+            first == second,
+            "{name} differs between two runs with the same seed. \
+             FTS segment and index IDs must come from the simulator's seeded random generator"
+        );
+    }
+
+    // The FTS search must use the index. Otherwise, both queries scan the table.
+    let io = Arc::new(SimulatorIO::new(
+        false,
+        ChaCha8Rng::seed_from_u64(7),
+        IOFaultConfig {
+            cosmic_ray_probability: 0.0,
+        },
+    ));
+    let db_path = format!("test-fts-plan-{}.db", std::process::id());
+    let db = Database::open_file_with_flags(
+        io.clone(),
+        &db_path,
+        OpenFlags::default(),
+        DatabaseOpts::new().with_index_method(true),
+        None,
+        Arc::new(SqliteDialect),
+    )
+    .expect("open db");
+    let conn = db.connect(ConnectOpts::new()).expect("connect");
+    for (_, sql) in fts_sim_schema() {
+        conn.execute(&sql).expect("create the FTS table and index");
+    }
+    let comparison_sql = Operation::CompareFtsResults {
+        word: "alpha".to_string(),
+    }
+    .sql();
+    let mut stmt = conn
+        .prepare(format!("EXPLAIN {comparison_sql}"))
+        .expect("prepare explain");
+    let mut opcodes = Vec::new();
+    loop {
+        match stmt.step().expect("step explain") {
+            turso_core::StepResult::Row => {
+                let row = stmt.row().expect("explain row");
+                opcodes.push(row.get::<&str>(1).expect("opcode column").to_string());
+            }
+            turso_core::StepResult::IO => io.step().expect("io step"),
+            turso_core::StepResult::Done => break,
+            other => panic!("unexpected step result {other:?}"),
+        }
+    }
+    assert!(
+        opcodes.iter().any(|opcode| opcode == "IndexMethodQuery"),
+        "the FTS search does not use the index: {opcodes:?}"
+    );
+}
+
+/// Seed 7705886949262960907 with allocation faults off reads k6 as [] after
+/// append 19 already committed. Elle reports G-single-item and incompatible-order.
+#[test]
+fn test_elle_passive_seed_keeps_committed_text_pk_on_unique_lookup() {
+    use rand::Rng;
+    use std::sync::atomic::AtomicI64;
+    use turso_whopper::chaotic_elle::{ChaoticElleProfile, ChaoticWorkloadProfile, ElleModelKind};
+    use turso_whopper::properties::ElleHistoryRecorder;
+    use turso_whopper::workloads::{
+        BeginWorkload, CommitWorkload, ElleAppendWorkload, ElleReadWorkload, RollbackWorkload,
+        Workload,
+    };
+    use turso_whopper::{StepResult, Whopper, WhopperOpts};
+
+    let history_path = std::env::temp_dir().join(format!(
+        "elle-passive-unique-miss-{}.edn",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_file(&history_path);
+    let elle_counter = Arc::new(AtomicI64::new(1));
+    let workloads: Vec<(u32, Box<dyn Workload>)> = vec![
+        (
+            40,
+            Box::new(ElleAppendWorkload::with_counter(elle_counter.clone())),
+        ),
+        (30, Box::new(ElleReadWorkload)),
+        (30, Box::new(BeginWorkload)),
+        (15, Box::new(CommitWorkload)),
+        (5, Box::new(RollbackWorkload)),
+    ];
+    let chaotic: Vec<(f64, &'static str, Box<dyn ChaoticWorkloadProfile>)> = vec![(
+        0.3,
+        "chaotic-elle",
+        Box::new(ChaoticElleProfile::new(
+            "elle_lists".to_string(),
+            ElleModelKind::ListAppend,
+            elle_counter,
+            true,
+        )),
+    )];
+    let opts = WhopperOpts::fast()
+        .with_seed(7705886949262960907)
+        .with_max_steps(100_000)
+        .with_max_connections(4)
+        .with_enable_mvcc(true)
+        .with_experimental_mvcc_passive_checkpoint(true)
+        .with_mvcc_checkpoint_threshold(Some(1024))
+        .with_allocation_fault_probability(0.0)
+        .with_elle_tables(vec![(
+            "elle_lists".to_string(),
+            "CREATE TABLE IF NOT EXISTS elle_lists (key TEXT PRIMARY KEY, vals TEXT DEFAULT '')"
+                .to_string(),
+        )])
+        .with_workloads(workloads)
+        .with_properties(vec![Box::new(ElleHistoryRecorder::new(
+            history_path.clone(),
+        ))])
+        .with_chaotic_profiles(chaotic);
+    let mut whopper = Whopper::new(opts).expect("create whopper");
+    while !whopper.is_done() {
+        let _ = whopper.rng.random_bool(0.0);
+        match whopper.step() {
+            Ok(StepResult::Ok) => {}
+            Ok(StepResult::WalSizeLimitExceeded) => break,
+            Err(e) => panic!("elle passive seed must keep running: {e}"),
+        }
+    }
+    whopper.finalize_properties().expect("export elle history");
+    let history = std::fs::read_to_string(&history_path).expect("read elle history");
+    let _ = std::fs::remove_file(&history_path);
+    if let Some((key, index, created_at)) = first_empty_read_of_committed_key(&history) {
+        panic!("unique lookup missed committed {key} at event {index} (created at {created_at})");
+    }
+}
+
+fn first_empty_read_of_committed_key(history: &str) -> Option<(String, u64, u64)> {
+    let mut created: std::collections::HashMap<String, u64> = std::collections::HashMap::new();
+    let mut invoke_time: std::collections::HashMap<u64, u64> = std::collections::HashMap::new();
+    for line in history.lines() {
+        let process = edn_field_u64(line, ":process")?;
+        let time = edn_field_u64(line, ":time")?;
+        let index = edn_field_u64(line, ":index")?;
+        if line.contains(":type :invoke") {
+            invoke_time.insert(process, time);
+            continue;
+        }
+        if !line.contains(":type :ok") {
+            if line.contains(":type :fail") || line.contains(":type :info") {
+                invoke_time.remove(&process);
+            }
+            continue;
+        }
+        let snapshot = invoke_time.remove(&process).unwrap_or(time);
+        let mut rest = line;
+        while let Some(at) = rest.find("[:") {
+            let slice = &rest[at..];
+            if let Some((key, value)) = parse_edn_append(slice) {
+                created.entry(key).or_insert(time);
+                rest = value;
+                continue;
+            }
+            if let Some((key, empty, next)) = parse_edn_read(slice) {
+                if empty {
+                    if let Some(&created_at) = created.get(&key) {
+                        if snapshot > created_at {
+                            return Some((key, index, created_at));
+                        }
+                    }
+                }
+                rest = next;
+                continue;
+            }
+            rest = &slice[2..];
+        }
+    }
+    None
+}
+
+fn edn_field_u64(line: &str, field: &str) -> Option<u64> {
+    let after = line.split_once(field)?.1;
+    let digits = after
+        .trim_start_matches(|c: char| !c.is_ascii_digit())
+        .chars()
+        .take_while(|c| c.is_ascii_digit())
+        .collect::<String>();
+    digits.parse().ok()
+}
+
+fn parse_edn_append(slice: &str) -> Option<(String, &str)> {
+    let rest = slice.strip_prefix("[:append \"")?;
+    let (key, rest) = rest.split_once('"')?;
+    Some((key.to_string(), rest))
+}
+
+fn parse_edn_read(slice: &str) -> Option<(String, bool, &str)> {
+    let rest = slice.strip_prefix("[:r \"")?;
+    let (key, rest) = rest.split_once('"')?;
+    let rest = rest.trim_start();
+    if rest.starts_with("[]") {
+        return Some((key.to_string(), true, rest));
+    }
+    Some((key.to_string(), false, rest))
 }

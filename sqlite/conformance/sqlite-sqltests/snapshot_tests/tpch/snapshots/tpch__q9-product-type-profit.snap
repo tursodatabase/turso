@@ -43,10 +43,10 @@ info:
 ---
 QUERY PLAN
 |--SCAN profit
-|  |--SCAN lineitem
+|  |--HASH JOIN lineitem
 |  |--SEARCH supplier USING INTEGER PRIMARY KEY (rowid=?)
 |  |--SEARCH nation USING INTEGER PRIMARY KEY (rowid=?)
 |  |--SEARCH orders USING INTEGER PRIMARY KEY (rowid=?)
-|  |--SEARCH partsupp USING INDEX sqlite_autoindex_partsupp_1 (ps_partkey=? AND ps_suppkey=?)
-|  `--SEARCH part USING INTEGER PRIMARY KEY (rowid=?)
+|  |--SEARCH part USING INTEGER PRIMARY KEY (rowid=?)
+|  `--SCAN partsupp
 `--USE SORTER FOR GROUP BY

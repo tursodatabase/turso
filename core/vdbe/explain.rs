@@ -1,9 +1,9 @@
 use crate::vdbe::{
     builder::CursorType,
-    insn::{IntegrityCkData, RegisterOrLiteral, SorterOpenData},
+    insn::{ClearBtreeCount, IntegrityCkData, RegisterOrLiteral, SorterOpenData},
 };
 use crate::HashSet;
-use turso_parser::ast::{ResolveType, SortOrder};
+use turso_parser::ast::SortOrder;
 
 use super::{Insn, InsnReference, PreparedProgram, Value};
 use crate::function::{Func, ScalarFunc};
@@ -79,6 +79,7 @@ pub fn insn_to_row(
             CursorType::Pseudo(_) => "pseudo",
             CursorType::VirtualTable(virtual_table) => virtual_table.name.as_str(),
             CursorType::MaterializedView(table, _) => table.name.as_str(),
+            CursorType::ViewDelta { view_name, .. } => view_name.as_str(),
             CursorType::Sorter => "sorter",
         };
         if ephemeral_cursors.contains(&cursor_id) {
@@ -212,6 +213,22 @@ pub fn insn_to_row(
                 Value::build_text(""),
                 0,
                 format!("Set cursor {cursor_id} to a (pseudo) NULL row"),
+            ),
+            Insn::IfNullRow {
+                cursor_id,
+                target_pc,
+                dest,
+            } => (
+                "IfNullRow",
+                *cursor_id as i64,
+                target_pc.as_debug_int() as i64,
+                *dest as i64,
+                Value::build_text(""),
+                0,
+                format!(
+                    "if {cursor_id}.nullRow then r[{dest}]=NULL, goto {}",
+                    target_pc.as_debug_int()
+                ),
             ),
             Insn::NotNull { reg, target_pc } => (
                 "NotNull",
@@ -609,6 +626,10 @@ pub fn insn_to_row(
                         let name = table.columns().get(*column).and_then(|v| v.name.as_ref());
                         name
                     }
+                    CursorType::ViewDelta { table, .. } => {
+                        // The trailing weight column has no schema entry.
+                        table.columns().get(*column).and_then(|v| v.name.as_ref())
+                    }
                     CursorType::Pseudo(_) => None,
                     CursorType::Sorter => None,
                     CursorType::IndexMethod(..) => None,
@@ -684,6 +705,15 @@ pub fn insn_to_row(
                     "if cursor {} record has field {} goto {}",
                     cursor_id, column, target_pc.as_debug_int()
                 ),
+            ),
+            Insn::IsType { reg, target_pc, value_type } => (
+                "IsType",
+                *reg as i64,
+                target_pc.as_debug_int() as i64,
+                0,
+                Value::build_text(value_type.to_string()),
+                0,
+                String::new(),
             ),
             Insn::TypeCheck {
                 start_reg,
@@ -958,6 +988,7 @@ pub fn insn_to_row(
                 cursor_id,
                 pc_if_next,
                 fullscan,
+                ..
             } => (
                 "Next",
                 *cursor_id as i64,
@@ -975,19 +1006,11 @@ pub fn insn_to_row(
                 on_error,
                 description_reg,
             } => {
-                let p2 = match on_error {
-                    Some(ResolveType::Rollback) => 1,
-                    Some(ResolveType::Abort) => 2,
-                    Some(ResolveType::Fail) => 3,
-                    Some(ResolveType::Ignore) => 4,
-                    Some(ResolveType::Replace) => 5,
-                    None => 0,
-                };
                 let p3 = description_reg.unwrap_or(0) as i64;
                 (
                     "Halt",
                     *err_code as i64,
-                    p2,
+                    on_error.map_or(0, |rt| rt.bit_value() as i64),
                     p3,
                     Value::build_text(description.clone()),
                     0,
@@ -998,10 +1021,11 @@ pub fn insn_to_row(
                 err_code,
                 target_reg,
                 description,
+                on_error,
             } => (
                 "HaltIfNull",
                 *err_code as i64,
-                0,
+                on_error.map_or(0, |rt| rt.bit_value() as i64),
                 *target_reg as i64,
                 Value::build_text(description.clone()),
                 0,
@@ -1211,6 +1235,15 @@ pub fn insn_to_row(
                 0,
                 "".to_string(),
             ),
+            Insn::FinishSeek { cursor_id } => (
+                "FinishSeek",
+                *cursor_id as i64,
+                0,
+                0,
+                Value::build_text(""),
+                0,
+                "".to_string(),
+            ),
             Insn::SeekGT {
                 is_index: _,
                 cursor_id,
@@ -1374,6 +1407,52 @@ pub fn insn_to_row(
                 Value::build_text(func.as_str()),
                 0,
                 format!("accum=r[{}] dest=r[{}]", *acc_reg, *dest_reg),
+            ),
+            Insn::AggContextLoad {
+                acc_reg,
+                payload_start_reg,
+                func,
+            } => (
+                "AggContextLoad",
+                *acc_reg as i64,
+                *payload_start_reg as i64,
+                0,
+                Value::build_text(func.as_str()),
+                0,
+                format!("accum=r[{}] state=r[{}..]", *acc_reg, *payload_start_reg),
+            ),
+            Insn::AggContextStore { acc_reg, payload_start_reg, func } => (
+                "AggContextStore",
+                *acc_reg as i64,
+                *payload_start_reg as i64,
+                0,
+                Value::build_text(func.as_str()),
+                0,
+                format!("accum=r[{}] state=r[{}..]", *acc_reg, *payload_start_reg),
+            ),
+            Insn::IvmSumStep { data } => (
+                "IvmSumStep",
+                data.arg_reg as i64,
+                data.weight_reg as i64,
+                data.int_wrapped_reg as i64,
+                Value::build_text(""),
+                0,
+                format!(
+                    "state=r[{}..] += r[{}] * r[{}]",
+                    data.int_wrapped_reg, data.arg_reg, data.weight_reg
+                ),
+            ),
+            Insn::IvmSumFinalize { data } => (
+                "IvmSumFinalize",
+                data.kind as i64,
+                data.int_wrapped_reg as i64,
+                data.dest_reg as i64,
+                Value::build_text(""),
+                0,
+                format!(
+                    "{:?} state=r[{}..] dest=r[{}]",
+                    data.kind, data.int_wrapped_reg, data.dest_reg
+                ),
             ),
             Insn::SorterOpen { data } => {
                 let SorterOpenData {
@@ -1643,6 +1722,14 @@ pub fn insn_to_row(
                 0,
                 "".to_string(),
             ),
+            Insn::GetSubtype { src_reg, dest_reg } => (
+                "GetSubtype", *src_reg as i64, *dest_reg as i64, 0,
+                Value::build_text(""), 0, "".to_string(),
+            ),
+            Insn::SetSubtype { subtype_reg, dest_reg } => (
+                "SetSubtype", *subtype_reg as i64, *dest_reg as i64, 0,
+                Value::build_text(""), 0, "".to_string(),
+            ),
             Insn::SoftNull { reg } => (
                 "SoftNull",
                 *reg as i64,
@@ -1776,11 +1863,11 @@ pub fn insn_to_row(
                 0,
                 "".to_string()
             ),
-            Insn::ClearBtree { db, root } => (
+            Insn::ClearBtree { db, root, count } => (
                 "ClearBtree",
                 *root,
                 *db as i64,
-                0,
+                i64::from(*count == ClearBtreeCount::ChangesAndRowsWritten),
                 Value::build_text(""),
                 0,
                 format!("root={root} iDb={db}"),
@@ -1862,7 +1949,7 @@ pub fn insn_to_row(
             ),
             Insn::SequenceComputeNext {
                 db,
-                seq_name_reg,
+                seq_name,
                 in_value_reg,
                 in_is_called_reg,
                 was_empty_reg,
@@ -1870,53 +1957,54 @@ pub fn insn_to_row(
             } => (
                 "SequenceComputeNext",
                 *db as i64,
-                *seq_name_reg as i64,
+                0,
                 *out_value_reg as i64,
-                Value::Null,
+                Value::build_text(seq_name.clone()),
                 0,
                 format!(
                     "r[{out_value_reg}] = next(r[{in_value_reg}], is_called=r[{in_is_called_reg}], empty=r[{was_empty_reg}])"
                 ),
             ),
             Insn::SetSequenceCurrval {
-                seq_name_reg,
+                db,
+                seq_name,
                 value_reg,
             } => (
                 "SetSequenceCurrval",
-                0,
-                *seq_name_reg as i64,
+                *db as i64,
                 *value_reg as i64,
-                Value::Null,
                 0,
-                format!("currval(r[{seq_name_reg}]) = r[{value_reg}]"),
+                Value::build_text(seq_name.clone()),
+                0,
+                format!("currval({seq_name}) = r[{value_reg}]"),
             ),
             Insn::SequenceTrackAllocation {
                 db,
-                seq_name_reg,
+                seq_name,
                 value_reg,
             } => (
                 "SequenceTrackAllocation",
                 *db as i64,
-                *seq_name_reg as i64,
-                *value_reg as i64,
-                Value::Null,
                 0,
-                format!("track sequence allocation r[{seq_name_reg}] = r[{value_reg}]"),
+                *value_reg as i64,
+                Value::build_text(seq_name.clone()),
+                0,
+                format!("track sequence allocation {seq_name} = r[{value_reg}]"),
             ),
             Insn::SequenceRegisterAllocation {
                 db,
-                seq_name_reg,
+                seq_name,
                 value_reg,
                 saved_outer_reg,
             } => (
                 "SequenceRegisterAllocation",
                 *db as i64,
-                *seq_name_reg as i64,
+                0,
                 *value_reg as i64,
-                Value::Null,
+                Value::build_text(seq_name.clone()),
                 0,
                 format!(
-                    "register allocation r[{seq_name_reg}] = r[{value_reg}] \
+                    "register allocation {seq_name} = r[{value_reg}] \
                      against outer mv_tx r[{saved_outer_reg}]"
                 ),
             ),
@@ -2032,6 +2120,7 @@ pub fn insn_to_row(
                 cursor_id,
                 pc_if_prev,
                 fullscan,
+                ..
             } => (
                 "Prev",
                 *cursor_id as i64,
@@ -2189,14 +2278,19 @@ pub fn insn_to_row(
             Insn::AutoCommit {
                 auto_commit,
                 rollback,
+                concurrent,
             } => (
                 "AutoCommit",
                 *auto_commit as i64,
                 *rollback as i64,
-                0,
+                *concurrent as i64,
                 Value::build_text(""),
                 0,
-                format!("auto_commit={auto_commit}, rollback={rollback}"),
+                if *concurrent {
+                    format!("auto_commit={auto_commit}, rollback={rollback}, concurrent=true")
+                } else {
+                    format!("auto_commit={auto_commit}, rollback={rollback}")
+                },
             ),
             Insn::Savepoint { op, name } => (
                 "Savepoint",
@@ -2416,14 +2510,17 @@ pub fn insn_to_row(
                 0,
                 format!("add_column({}, {:?})", data.table, data.column),
             ),
-            Insn::AlterColumn { db: _, table, column_index, definition: column, rename } => (
+            Insn::AlterColumn { data } => (
                 "AlterColumn",
                 0,
                 0,
                 0,
                 Value::build_text(""),
                 0,
-                format!("alter_column({table}, {column_index}, {column:?}, {rename:?})"),
+                format!(
+                    "alter_column({}, {}, {:?}, {:?})",
+                    data.table, data.column_index, data.definition, data.rename
+                ),
             ),
             Insn::MaxPgcnt { db, dest, new_max } => (
                 "MaxPgcnt",
@@ -2541,7 +2638,7 @@ pub fn insn_to_row(
             0,
             String::new(),
         ),
-        Insn::HashProbe{hash_table_id: hash_table_reg, key_start_reg, num_keys, dest_reg, target_pc, payload_dest_reg, num_payload, probe_rowid_reg: _} => {
+        Insn::HashProbe{hash_table_id: hash_table_reg, key_start_reg, num_keys, dest_reg, target_pc, deferred_target_pc: _, payload_dest_reg, num_payload, probe_rowid_reg: _} => {
             let payload_info = if let Some(p_reg) = payload_dest_reg {
                 format!(" payload=r[{}]..r[{}]", p_reg, p_reg + num_payload - 1)
             } else {

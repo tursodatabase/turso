@@ -1122,11 +1122,19 @@ fn function_calls_match<'expr>(
     right: &'expr FunctionCall,
     pending: &mut Vec<(&'expr Expr, &'expr Expr)>,
 ) -> bool {
+    // Two calls of one aggregate (the same `AggregateId`) are the same
+    // value; calls of different aggregates never are, even when they look
+    // alike, because each is evaluated on its own.
+    let same_evaluation = match (&left.evaluation, &right.evaluation) {
+        (FunctionEvaluation::Scalar, FunctionEvaluation::Scalar) => true,
+        (
+            FunctionEvaluation::Aggregate { id: left_id, .. },
+            FunctionEvaluation::Aggregate { id: right_id, .. },
+        ) => left_id == right_id,
+        _ => false,
+    };
     left.function == right.function
-        && matches!(
-            (&left.evaluation, &right.evaluation),
-            (FunctionEvaluation::Scalar, FunctionEvaluation::Scalar)
-        )
+        && same_evaluation
         && left.result_type == right.result_type
         && function_operations_match(&left.operation, &right.operation)
         && function_arguments_match(&left.arguments, &right.arguments, pending)

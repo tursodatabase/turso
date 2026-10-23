@@ -4,7 +4,7 @@ Turso supports a comprehensive testing system to ensure correctness, performance
 
 ## 1. Compatibility Tests
 
-The `make test` target is the main entry point.
+The `make test` target is the main entry point. It needs [uv](../CONTRIBUTING.md#prerequisites) to be installed, because it uses `uv sync` and `uv run` to install and run the Python test packages. You can install uv with `brew install uv` or `pipx install uv`.
 
 Most compatibility tests live in the testing/ directory and are written in SQLite’s TCL test format. These tests ensure that Turso matches SQLite’s behavior exactly. The database used during these tests is located at testing/testing.db, which includes the following schema:
 

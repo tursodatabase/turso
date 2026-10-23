@@ -1,0 +1,105 @@
+---
+source: joins.sqltest
+expression: |-
+  SELECT id
+        FROM nested_prune_outer
+        RIGHT JOIN (nested_prune_left FULL JOIN nested_prune_right USING(id)) USING(id);
+info:
+  statement_type: SELECT
+  tables:
+  - nested_prune_outer
+  - nested_prune_right
+  setup_blocks:
+  - parenthesized_full_join_snapshot_schema
+  database: ':memory:'
+---
+QUERY PLAN
+|--SCAN nested_prune_outer
+|--SCAN (join-1)
+|  |--SCAN nested_prune_left
+|  |--SCAN nested_prune_right LEFT-JOIN
+|  `--RIGHT-JOIN nested_prune_right
+|     `--SCAN nested_prune_right
+`--RIGHT-JOIN (join-1)
+   `--SCAN (join-1)
+
+BYTECODE
+addr  opcode           p1  p2  p3  p4        p5  comment
+   0  Init              0  76   0             0  Start at 76
+   1  OpenRead          0   2   0  k(3,B,B)   0  table=nested_prune_outer, root=2, iDb=0
+   2  Gosub             1   4   0             0
+   3  Goto              0  53   0             0
+   4  Once             52   0   0             0  goto 52
+   5  OpenEphemeral     1   1   0             0  cursor=1 is_table=true
+   6  OpenRead          2   3   0  k(3,B,B)   0  table=nested_prune_left, root=3, iDb=0
+   7  OpenRead          3   4   0  k(3,B,B)   0  table=nested_prune_right, root=4, iDb=0
+   8  OpenEphemeral     4   1   0             0  cursor=4 is_table=true
+   9  Null              0   3   0             0  r[3]=NULL
+  10  MakeRecord        3   1   4             0  r[4]=mkrec(r[3..3])
+  11  Rewind            2  35   0             0  Rewind table nested_prune_left
+  12    Integer         0   2   0             0  r[2]=0
+  13    Rewind          3  31   0             0  Rewind table nested_prune_right
+  14      Column        2   0   5             0  r[5]=nested_prune_left.id
+  15      Column        3   0   6             0  r[6]=nested_prune_right.id
+  16      Ne            5   6  30  Binary     0  if r[5]!=r[6] goto 30
+  17      RowId         3   7   0             0  r[7]=nested_prune_right.rowid
+  18      Insert        4   4   7             6  intkey=r[7] data=r[4]
+  19      Integer       1   2   0             0  r[2]=1
+  20      Column        2   0   8             0  r[8]=nested_prune_left.id
+  21      NotNull       8  23   0             0  r[8]!=NULL -> goto 23
+  22      Column        3   0   8             0  r[8]=nested_prune_right.id
+  23      ColumnRange   2   0   9  2          0  r[9..10]=nested_prune_left.id..value
+  24      RowId         2  11   0             0  r[11]=nested_prune_left.rowid
+  25      ColumnRange   3   0  12  2          0  r[12..13]=nested_prune_right.id..value
+  26      RowId         3  14   0             0  r[14]=nested_prune_right.rowid
+  27      MakeRecord    8   7  15             0  r[15]=mkrec(r[8..14]); for (join-1)
+  28      NewRowid      1  16   0             0  r[16]=rowid
+  29      Insert        1  15  16  (join-1)   4  intkey=r[16] data=r[15]
+  30    Next            3  14   0             1
+  31    IfPos           2  34   0             0  r[2]>0 -> r[2]-=0, goto 34
+  32    NullRow         3   0   0             0  Set cursor 3 to a (pseudo) NULL row
+  33    Goto            0  19   0             0
+  34  Next              2  12   0             1
+  35  NullRow           2   0   0             0  Set cursor 2 to a (pseudo) NULL row
+  36  OpenRead          5   4   0  k(3,B,B)   0  table=nested_prune_right, root=4, iDb=0
+  37  Rewind            5  52   0             0  Rewind table nested_prune_right
+  38    RowId           5  17   0             0  r[17]=nested_prune_right.rowid
+  39    NotExists       4  41  17             0
+  40    Goto            0  51   0             0
+  41    Column          2   0  19             0  r[19]=nested_prune_left.id
+  42    NotNull        19  44   0             0  r[19]!=NULL -> goto 44
+  43    Column          5   0  19             0  r[19]=nested_prune_right.id
+  44    ColumnRange     2   0  20  2          0  r[20..21]=nested_prune_left.id..value
+  45    RowId           2  22   0             0  r[22]=nested_prune_left.rowid
+  46    ColumnRange     5   0  23  2          0  r[23..24]=nested_prune_right.id..value
+  47    RowId           5  25   0             0  r[25]=nested_prune_right.rowid
+  48    MakeRecord     19   7  26             0  r[26]=mkrec(r[19..25]); for (join-1)
+  49    NewRowid        1  27   0             0  r[27]=rowid
+  50    Insert          1  26  27  (join-1)   4  intkey=r[27] data=r[26]
+  51  Next              5  38   0             1
+  52  Return            1   0   0             0
+  53  OpenEphemeral     6   1   0             0  cursor=6 is_table=true
+  54  Null              0  29   0             0  r[29]=NULL
+  55  MakeRecord       29   1  30             0  r[30]=mkrec(r[29..29])
+  56  Rewind            0  67   0             0  Rewind table nested_prune_outer
+  57    Rewind          1  66   0             0  Rewind table ephemeral((join-1))
+  58      Column        0   0  31             0  r[31]=nested_prune_outer.id
+  59      Column        1   0  32             0  r[32]=ephemeral((join-1)).id
+  60      Ne           31  32  65  Binary     0  if r[31]!=r[32] goto 65
+  61      RowId         1  33   0             0  r[33]=ephemeral((join-1)).rowid
+  62      Insert        6  30  33             6  intkey=r[33] data=r[30]
+  63      Column        1   0  34             0  r[34]=ephemeral((join-1)).id
+  64      ResultRow    34   1   0             0  output=r[34]
+  65    Next            1  58   0             1
+  66  Next              0  57   0             1
+  67  NullRow           0   0   0             0  Set cursor 0 to a (pseudo) NULL row
+  68  Rewind            1  75   0             0  Rewind table ephemeral((join-1))
+  69    RowId           1  35   0             0  r[35]=ephemeral((join-1)).rowid
+  70    NotExists       6  72  35             0
+  71    Goto            0  74   0             0
+  72    Column          1   0  37             0  r[37]=ephemeral((join-1)).id
+  73    ResultRow      37   1   0             0  output=r[37]
+  74  Next              1  69   0             1
+  75  Halt              0   0   0             0
+  76  Transaction       0   1   3             0  iDb=0 tx_mode=Read
+  77  Goto              0   1   0             0

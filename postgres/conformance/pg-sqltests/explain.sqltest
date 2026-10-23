@@ -3,6 +3,8 @@
 # Simple EXPLAIN is intentionally mapped to SQLite's EXPLAIN QUERY PLAN.
 # PostgreSQL EXPLAIN options are rejected until their output semantics exist.
 
+@skip-file-if postgres "EXPLAIN shows the Turso query plan, and Turso rejects EXPLAIN options that PostgreSQL accepts"
+
 @database :memory:
 
 setup explain_table {
@@ -88,3 +90,18 @@ test explain-format-json-errors {
     EXPLAIN (FORMAT JSON) SELECT 1;
 }
 expect error {}
+
+test explain-order-by-primary-key-uses-index {
+    CREATE TABLE k (code text PRIMARY KEY, n int);
+    CREATE TABLE k2 (code text, n int, PRIMARY KEY (code));
+    CREATE TABLE k3 (code text NOT NULL, n int);
+    CREATE INDEX k3_code ON k3 (code);
+    EXPLAIN SELECT code FROM k ORDER BY code LIMIT 3;
+    EXPLAIN SELECT code FROM k2 ORDER BY code DESC LIMIT 3;
+    EXPLAIN SELECT code FROM k3 ORDER BY code LIMIT 3;
+}
+expect {
+    1|0|0|SCAN k USING COVERING INDEX sqlite_autoindex_k_1
+    1|0|0|SCAN k2 USING COVERING INDEX sqlite_autoindex_k2_1
+    1|0|0|SCAN k3 USING COVERING INDEX k3_code
+}

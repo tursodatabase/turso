@@ -53,6 +53,18 @@ pub fn encode_value(value: &Value) -> Result<ProtoValue> {
     })
 }
 
+/// Like [`decode_value`], but consumes the protocol value so text is moved
+/// rather than cloned. Preferred when the response is owned.
+pub fn decode_value_owned(value: ProtoValue) -> Result<Value> {
+    Ok(match value {
+        ProtoValue::Text { value } => Value::Text(value),
+        ProtoValue::Blob { .. } | ProtoValue::Null | ProtoValue::Integer { .. } => {
+            decode_value(&value)?
+        }
+        ProtoValue::Float { value } => Value::Real(value.unwrap_or(f64::NAN)),
+    })
+}
+
 pub fn decode_value(value: &ProtoValue) -> Result<Value> {
     Ok(match value {
         ProtoValue::Null => Value::Null,
@@ -181,6 +193,12 @@ pub struct StmtResult {
     pub affected_row_count: u64,
     #[serde(default)]
     pub last_insert_rowid: Option<String>,
+    #[serde(default)]
+    pub rows_read: Option<u64>,
+    #[serde(default)]
+    pub rows_written: Option<u64>,
+    #[serde(default)]
+    pub query_duration_ms: Option<f64>,
 }
 
 /// A batch result (section 6.2).

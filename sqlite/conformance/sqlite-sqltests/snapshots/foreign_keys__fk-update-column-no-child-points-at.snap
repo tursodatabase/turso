@@ -1,0 +1,33 @@
+---
+source: foreign_keys.sqltest
+expression: UPDATE parent SET v = v + 1 WHERE id = 1;
+info:
+  statement_type: UPDATE
+  tables:
+  - parent
+  setup_blocks:
+  - fk_bytecode_no_action_child
+  database: ':memory:'
+---
+QUERY PLAN
+`--SEARCH parent USING INTEGER PRIMARY KEY (rowid=?)
+
+BYTECODE
+addr  opcode       p1  p2  p3  p4      p5  comment
+   0  Init          0  13   0           0  Start at 13
+   1  OpenWrite     0   2   0           0  root=2; iDb=0
+   2  SeekRowid     0   1  12           0  if (r[1]!=cursor 0.rowid) goto 12
+   3  RowId         0   2   0           0  r[2]=parent.rowid
+   4  IsNull        2  12   0           0  if (r[2]==NULL) goto 12
+   5  Null          0   3   0           0  r[3]=NULL
+   6  Column        0   1   4           0  r[4]=parent.k
+   7  Column        0   2   6           0  r[6]=parent.v
+   8  Add           6   7   5           0  r[5]=r[6]+r[7]
+   9  Affinity      3   3   0           0  r[3..6] = D, D, D
+  10  MakeRecord    3   3   8           0  r[8]=mkrec(r[3..5])
+  11  Insert        0   8   2  parent   8  intkey=r[2] data=r[8]
+  12  Halt          0   0   0           0
+  13  Transaction   0   2   2           0  iDb=0 tx_mode=Write
+  14  Integer       1   1   0           0  r[1]=1
+  15  Integer       1   7   0           0  r[7]=1
+  16  Goto          0   1   0           0

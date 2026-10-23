@@ -835,6 +835,118 @@ impl Workload for AutoincDeleteWorkload {
     }
 }
 
+// ============================================================================
+// FTS Workloads
+// ============================================================================
+
+/// Only FTS workloads change this table.
+/// Other workloads use the generated tables.
+pub const FTS_SIM_TABLE: &str = "fts_docs";
+pub const FTS_SIM_INDEX: &str = "fts_docs_fts";
+
+/// SQL statements that create the FTS table and its index.
+pub fn fts_sim_schema() -> Vec<(String, String)> {
+    vec![
+        (
+            FTS_SIM_TABLE.to_string(),
+            format!(
+                "CREATE TABLE IF NOT EXISTS {FTS_SIM_TABLE} (id INTEGER PRIMARY KEY, body TEXT)"
+            ),
+        ),
+        (
+            FTS_SIM_INDEX.to_string(),
+            format!(
+                "CREATE INDEX IF NOT EXISTS {FTS_SIM_INDEX} ON {FTS_SIM_TABLE} USING fts(body)"
+            ),
+        ),
+    ]
+}
+
+/// Fixed test words let the table scan match whole words with LIKE.
+/// Documents share words because the list is short.
+pub(crate) const FTS_SIM_WORDS: &[&str] = &[
+    "alpha", "bravo", "charlie", "delta", "echo", "foxtrot", "golf", "hotel",
+];
+
+/// A small range of row IDs makes connections change the same rows.
+const FTS_SIM_MAX_ID: i64 = 400;
+
+fn fts_sim_body(rng: &mut ChaCha8Rng) -> String {
+    let count = rng.random_range(1..=4);
+    FTS_SIM_WORDS
+        .choose_multiple(rng, count)
+        .copied()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn fts_sim_id(rng: &mut ChaCha8Rng) -> i64 {
+    rng.random_range(0..FTS_SIM_MAX_ID)
+}
+
+/// Insert or replace one document in the table with the FTS index.
+pub struct FtsInsertWorkload;
+
+impl Workload for FtsInsertWorkload {
+    fn generate(&self, _ctx: &WorkloadContext, rng: &mut ChaCha8Rng) -> Option<Operation> {
+        let id = fts_sim_id(rng);
+        let body = fts_sim_body(rng);
+        Some(Operation::Execute {
+            sql: format!(
+                "INSERT OR REPLACE INTO {FTS_SIM_TABLE}(id, body) VALUES ({id}, '{body}')"
+            ),
+        })
+    }
+}
+
+/// Update one document and its FTS index entries.
+pub struct FtsUpdateWorkload;
+
+impl Workload for FtsUpdateWorkload {
+    fn generate(&self, _ctx: &WorkloadContext, rng: &mut ChaCha8Rng) -> Option<Operation> {
+        let id = fts_sim_id(rng);
+        let body = fts_sim_body(rng);
+        Some(Operation::Execute {
+            sql: format!("UPDATE {FTS_SIM_TABLE} SET body = '{body}' WHERE id = {id}"),
+        })
+    }
+}
+
+/// Delete one document and its FTS index entries.
+pub struct FtsDeleteWorkload;
+
+impl Workload for FtsDeleteWorkload {
+    fn generate(&self, _ctx: &WorkloadContext, rng: &mut ChaCha8Rng) -> Option<Operation> {
+        let id = fts_sim_id(rng);
+        Some(Operation::Execute {
+            sql: format!("DELETE FROM {FTS_SIM_TABLE} WHERE id = {id}"),
+        })
+    }
+}
+
+/// Request a merge of the FTS index parts visible to this connection.
+pub struct FtsOptimizeWorkload;
+
+impl Workload for FtsOptimizeWorkload {
+    fn generate(&self, _ctx: &WorkloadContext, _rng: &mut ChaCha8Rng) -> Option<Operation> {
+        Some(Operation::Execute {
+            sql: format!("OPTIMIZE INDEX {FTS_SIM_INDEX}"),
+        })
+    }
+}
+
+/// Compare FTS results with a table scan using [`Operation::CompareFtsResults`].
+pub struct FtsMatchWorkload;
+
+impl Workload for FtsMatchWorkload {
+    fn generate(&self, _ctx: &WorkloadContext, rng: &mut ChaCha8Rng) -> Option<Operation> {
+        let word = FTS_SIM_WORDS.choose(rng).expect("test words are not empty");
+        Some(Operation::CompareFtsResults {
+            word: word.to_string(),
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
@@ -844,7 +956,7 @@ mod tests {
         generation::Opts,
         model::table::{Column, ColumnType, Table},
     };
-    use turso_core::{Database, MemoryIO, SqliteDialect};
+    use turso_core::{ConnectOpts, Database, MemoryIO, SqliteDialect};
 
     use super::*;
 
@@ -934,7 +1046,7 @@ mod tests {
     fn json_workload_variants_execute() {
         let io = Arc::new(MemoryIO::new());
         let database = Database::open_file(io, ":memory:", Arc::new(SqliteDialect)).unwrap();
-        let connection = database.connect().unwrap();
+        let connection = database.connect(ConnectOpts::new()).unwrap();
         let document =
             r#"{"id":1,"meta":{"active":true},"items":[1,2,{"value":3}],"nullable":null}"#;
         let patch = r#"{"patched":true}"#;

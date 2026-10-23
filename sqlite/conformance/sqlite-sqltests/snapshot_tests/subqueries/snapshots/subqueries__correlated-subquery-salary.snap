@@ -23,80 +23,83 @@ QUERY PLAN
    `--USE SORTER FOR GROUP BY
 
 BYTECODE
-addr  opcode                p1  p2  p3  p4                 p5  comment
-   0        Init             0  74   0                      0  Start at 74
-   1        OpenRead         0   7   0  k(5,B,B,B,B,B)      0  table=employees, root=7, iDb=0
-   2        Once            46   0   0                      0  goto 46
-   3        OpenEphemeral    1   1   0                      0  cursor=1 is_table=true
-   4        Null             0   1   0                      0  r[1]=NULL
-   5        SorterOpen       2   2   0  k(1,B)              0  cursor=2
-   6        Integer          0  17   0                      0  r[17]=0
-   7        Null             0  18   0                      0  r[18]=NULL
-   8        Gosub           16  43   0                      0
-   9        OpenRead         4   7   0  k(5,B,B,B,B,B)      0  table=employees, root=7, iDb=0
-  10        Rewind           4  16   0                      0  Rewind table employees
-  11          ColumnRange    4   3  13  2                   0  r[13..14]=employees.department..salary
-  12          RealAffinity  14   0   0                      0
-  13          MakeRecord    13   2  12                      0  r[12]=mkrec(r[13..14])
-  14          SorterInsert   2  12   0  0                   0  key=r[12]
-  15        Next             4  11   0                      1
-  16        OpenPseudo       3  12   2                      0  2 columns in r[12]
-  17        SorterSort       2  32   0                      0
-  18          SorterData     2  12   3                      0  r[12]=data
-  19          Column         3   0  19                      0  r[19]=pseudo.column 0
-  20          Column         3   1   6                      0  r[6]=pseudo.column 1
-  21          Compare       18  19   1  k(1, Binary)        0  r[18..18]==r[19..19]
-  22          Jump          23  26  23                      0
-  23          Gosub         15  34   0                      0
-  24          Move          19  18   1                      0  r[18..18]=r[19..19]
-  25          Gosub         16  43   0                      0
-  26          Copy           6  20   0                      0  r[20]=r[6]
-  27          AggStep        0  20   1  avg                 0  accum=r[1] step(r[20])
-  28          If            17  30   0                      0  if r[17] goto 30
-  29          Copy           6  11   0                      0  r[11]=r[6]
-  30          Integer        1  17   0                      0  r[17]=1
-  31        SorterNext       2  18   0                      0
-  32        Gosub           15  34   0                      0
-  33        Goto             0  46   0                      0
-  34        IfPos           17  36   0                      0  r[17]>0 -> r[17]-=0, goto 36
-  35      Return            15   0   0                      0
-  36      AggFinal           0   1   0  avg                 0  accum=r[1]
-  37      Copy               1  21   0                      0  r[21]=r[1]
-  38      Copy              18  22   0                      0  r[22]=r[18]
-  39      MakeRecord        21   2  23                      0  r[23]=mkrec(r[21..22]); for scalar_subquery_1
-  40      NewRowid           1  24   0                      0  r[24]=rowid
-  41      Insert             1  23  24  scalar_subquery_1   4  intkey=r[24] data=r[23]
-  42    Return              15   0   0                      0
-  43    Null                 0   1   0                      0  r[1]=NULL
-  44    Integer              0  17   0                      0  r[17]=0
-  45  Return                16   0   0                      0
-  46  Rewind                 0  73   0                      0  Rewind table employees
-  47    Once                57   0   0                      0  goto 57
-  48    OpenAutoindex        5   0   0                      0  cursor=5
-  49    Rewind               1  57   0                      0  Rewind table ephemeral(scalar_subquery_1)
-  50      Column             1   1  25                      0  r[25]=ephemeral(scalar_subquery_1).correlation_key_0
-  51      Column             1   0  26                      0  r[26]=ephemeral(scalar_subquery_1).avg(e2.salary)
-  52      RowId              1  27   0                      0  r[27]=ephemeral(scalar_subquery_1).rowid
-  53      MakeRecord        25   3  28                      0  r[28]=mkrec(r[25..27]); for ephemeral_subquery_s2
-  54      FilterAdd          5  25   1                      0  bloom_filter_add(r[25..26])
-  55      IdxInsert          5  28  25                      0  key=r[28]
-  56    Next                 1  50   0                      0
-  57    Column               0   3  29                      0  r[29]=employees.department
-  58    IsNull              29  72   0                      0  if (r[29]==NULL) goto 72
-  59    Filter               5  72  29                      1  if !bloom_filter(r[29..30]) goto 72
-  60    SeekGE               5  72  29                      0  key=[29..29]
-  61      IdxGT              5  72  29                      0  key=[29..29]
-  62      Column             0   4  30                      0  r[30]=employees.salary
-  63      RealAffinity      30   0   0                      0
-  64      Column             5   1  31                      0  r[31]=ephemeral(ephemeral_subquery_s2).avg(e2.salary)
-  65      Le                30  31  71                      0  if r[30]<=r[31] goto 71
-  66      RowId              0  32   0                      0  r[32]=employees.rowid
-  67      Column             0   1  33                      0  r[33]=employees.name
-  68      ColumnRange        0   3  34  2                   0  r[34..35]=employees.department..salary
-  69      RealAffinity      35   0   0                      0
-  70      ResultRow         32   4   0                      0  output=r[32..35]
-  71    Next                 5  61   0                      0
-  72  Next                   0  47   0                      1
-  73  Halt                   0   0   0                      0
-  74  Transaction            0   1  11                      0  iDb=0 tx_mode=Read
-  75  Goto                   0   1   0                      0
+addr  opcode            p1  p2  p3  p4                 p5  comment
+   0  Init               0  77   0                      0  Start at 77
+   1  OpenRead           0   7   0  k(5,B,B,B,B,B)      0  table=employees, root=7, iDb=0
+   2  Gosub              1   4   0                      0
+   3  Goto               0  49   0                      0
+   4  Once              48   0   0                      0  goto 48
+   5  OpenEphemeral      1   1   0                      0  cursor=1 is_table=true
+   6  Null               0   2   0                      0  r[2]=NULL
+   7  SorterOpen         2   2   0  k(1,B)              0  cursor=2
+   8  Integer            0  18   0                      0  r[18]=0
+   9  Null               0  19   0                      0  r[19]=NULL
+  10  Gosub             17  45   0                      0
+  11  OpenRead           4   7   0  k(5,B,B,B,B,B)      0  table=employees, root=7, iDb=0
+  12  Rewind             4  18   0                      0  Rewind table employees
+  13    ColumnRange      4   3  14  2                   0  r[14..15]=employees.department..salary
+  14    RealAffinity    15   0   0                      0
+  15    MakeRecord      14   2  13                      0  r[13]=mkrec(r[14..15])
+  16    SorterInsert     2  13   0  0                   0  key=r[13]
+  17  Next               4  13   0                      1
+  18  OpenPseudo         3  13   2                      0  2 columns in r[13]
+  19  SorterSort         2  34   0                      0
+  20    SorterData       2  13   3                      0  r[13]=data
+  21    Column           3   0  20                      0  r[20]=pseudo.column 0
+  22    Column           3   1   7                      0  r[7]=pseudo.column 1
+  23    Compare         19  20   1  k(1, Binary)        0  r[19..19]==r[20..20]
+  24    Jump            25  28  25                      0
+  25    Gosub           16  36   0                      0
+  26    Move            20  19   1                      0  r[19..19]=r[20..20]
+  27    Gosub           17  45   0                      0
+  28    Copy             7  21   0                      0  r[21]=r[7]
+  29    AggStep          0  21   2  avg                 0  accum=r[2] step(r[21])
+  30    If              18  32   0                      0  if r[18] goto 32
+  31    Copy             7  12   0                      0  r[12]=r[7]
+  32    Integer          1  18   0                      0  r[18]=1
+  33  SorterNext         2  20   0                      0
+  34  Gosub             16  36   0                      0
+  35  Goto               0  48   0                      0
+  36  IfPos             18  38   0                      0  r[18]>0 -> r[18]-=0, goto 38
+  37  Return            16   0   0                      0
+  38  AggFinal           0   2   0  avg                 0  accum=r[2]
+  39  Copy               2  22   0                      0  r[22]=r[2]
+  40  Copy              19  23   0                      0  r[23]=r[19]
+  41  MakeRecord        22   2  24                      0  r[24]=mkrec(r[22..23]); for scalar_subquery_1
+  42  NewRowid           1  25   0                      0  r[25]=rowid
+  43  Insert             1  24  25  scalar_subquery_1   4  intkey=r[25] data=r[24]
+  44  Return            16   0   0                      0
+  45  Null               0   2   0                      0  r[2]=NULL
+  46  Integer            0  18   0                      0  r[18]=0
+  47  Return            17   0   0                      0
+  48  Return             1   0   0                      0
+  49  Rewind             0  76   0                      0  Rewind table employees
+  50    Once            60   0   0                      0  goto 60
+  51    OpenAutoindex    5   0   0                      0  cursor=5
+  52    Rewind           1  60   0                      0  Rewind table ephemeral(scalar_subquery_1)
+  53      Column         1   1  26                      0  r[26]=ephemeral(scalar_subquery_1).correlation_key_0
+  54      Column         1   0  27                      0  r[27]=ephemeral(scalar_subquery_1).avg(e2.salary)
+  55      RowId          1  28   0                      0  r[28]=ephemeral(scalar_subquery_1).rowid
+  56      MakeRecord    26   3  29                      0  r[29]=mkrec(r[26..28]); for ephemeral_subquery_s2
+  57      FilterAdd      5  26   1                      0  bloom_filter_add(r[26..27])
+  58      IdxInsert      5  29  26                      0  key=r[29]
+  59    Next             1  53   0                      0
+  60    Column           0   3  30                      0  r[30]=employees.department
+  61    IsNull          30  75   0                      0  if (r[30]==NULL) goto 75
+  62    Filter           5  75  30                      1  if !bloom_filter(r[30..31]) goto 75
+  63    SeekGE           5  75  30                      0  key=[30..30]
+  64      IdxGT          5  75  30                      0  key=[30..30]
+  65      Column         0   4  31                      0  r[31]=employees.salary
+  66      RealAffinity  31   0   0                      0
+  67      Column         5   1  32                      0  r[32]=ephemeral(ephemeral_subquery_s2).avg(e2.salary)
+  68      Le            31  32  74  Binary              0  if r[31]<=r[32] goto 74
+  69      RowId          0  33   0                      0  r[33]=employees.rowid
+  70      Column         0   1  34                      0  r[34]=employees.name
+  71      ColumnRange    0   3  35  2                   0  r[35..36]=employees.department..salary
+  72      RealAffinity  36   0   0                      0
+  73      ResultRow     33   4   0                      0  output=r[33..36]
+  74    Next             5  64   0                      0
+  75  Next               0  50   0                      1
+  76  Halt               0   0   0                      0
+  77  Transaction        0   1  11                      0  iDb=0 tx_mode=Read
+  78  Goto               0   1   0                      0

@@ -16,7 +16,7 @@ use crate::{
     },
     vdbe::{
         builder::{CursorType, ProgramBuilder, SourceBinding},
-        insn::{Insn, RegisterOrLiteral},
+        insn::{ClearBtreeCount, Insn, RegisterOrLiteral},
         BranchOffset, CursorID,
     },
     LimboError, Result,
@@ -125,26 +125,43 @@ pub(super) fn emit_delete(
     };
     let target = DmlTarget::new(program, document, delete.target, "DELETE")?
         .with_capture(program, capture_changes.as_ref())?;
-    // A DELETE that fires triggers or foreign-key actions first collects
-    // its rowids, since they can change the table.
-    let uses_rowset =
-        uses_rowset(delete) || !triggers.is_empty() || !actions.is_empty() || operation.is_none();
     // Whether the statement needs a statement journal: without triggers or
     // foreign keys a DELETE cannot abort, and a point lookup writes at most
     // one row. A DELETE that collects rowids first is treated as a scan.
     let has_foreign_keys = !foreign_keys.incoming.is_empty() || !foreign_keys.outgoing.is_empty();
+    program.set_may_abort(!triggers.is_empty() || has_foreign_keys);
+    if subprograms.may_clear_btrees
+        && delete.predicate.is_none()
+        && delete.returning.is_none()
+        && triggers.is_empty()
+        && actions.is_empty()
+        && target.capture_rows().is_none()
+        && foreign_keys.incoming.is_empty()
+        && foreign_keys.outgoing.is_empty()
+        && target
+            .source
+            .index_expressions
+            .iter()
+            .all(|expressions| expressions.index.value().index_method.is_none())
+    {
+        emit_clear_btrees(program, &target);
+        return Ok(());
+    }
+    // A DELETE that fires triggers or foreign-key actions first collects
+    // its rowids, since they can change the table.
+    let uses_rowset =
+        uses_rowset(delete) || !triggers.is_empty() || !actions.is_empty() || operation.is_none();
     if !uses_rowset && !has_foreign_keys && operation.is_some_and(touches_at_most_one_row) {
         program.set_multi_write(false);
     }
-    program.set_may_abort(!triggers.is_empty() || has_foreign_keys);
 
-    program.emit_source_explain(
-        target.source.id,
-        hir_loop_explain(document, None, &[], planned_loop)?,
-    );
     let returning = ReturningBuffer::open(program, target.table, delete.returning.as_ref());
     let done = program.allocate_label();
     if uses_rowset {
+        program.emit_source_explain(
+            target.source.id,
+            hir_loop_explain(document, None, &[], planned_loop)?,
+        );
         emit_rowset_delete(
             program,
             plan,
@@ -176,6 +193,25 @@ pub(super) fn emit_delete(
     Ok(())
 }
 
+/// Delete every row of the table at once by clearing each index B-tree and
+/// then the table B-tree, like SQLite's truncate optimization. Only the
+/// table's clear counts the deleted rows as changes; every clear counts the
+/// entries it removes as rows written.
+fn emit_clear_btrees(program: &mut ProgramBuilder, target: &DmlTarget<'_>) {
+    for expressions in &target.source.index_expressions {
+        program.emit_insn(Insn::ClearBtree {
+            db: target.database,
+            root: expressions.index.value().root_page,
+            count: ClearBtreeCount::RowsWritten,
+        });
+    }
+    program.emit_insn(Insn::ClearBtree {
+        db: target.database,
+        root: target.table.root_page,
+        count: ClearBtreeCount::ChangesAndRowsWritten,
+    });
+}
+
 /// Whether the DELETE first collects the rowids of the rows to delete, then
 /// deletes them. A WHERE clause with a subquery does this, so the subquery
 /// never reads a table that is changing under it.
@@ -198,6 +234,13 @@ fn emit_scan_delete(
     // index, all for writing.
     let iteration_index = operation_index(operation);
     let table_cursor = target.open_table_for_write(program);
+    // The plan node follows the opening of the table, as on the legacy path.
+    if let [planned_loop] = access.loops.as_slice() {
+        program.emit_source_explain(
+            target.source.id,
+            hir_loop_explain(document, None, &[], planned_loop)?,
+        );
+    }
     let iteration = iteration_index
         .map(|index| -> Result<_> {
             let cursor = program.alloc_cursor_id(CursorType::BTreeIndex(index.clone()));
@@ -234,8 +277,14 @@ fn emit_scan_delete(
     let hir_loop = start_hir_btree_loop(program, document, &prepared, None)?;
     emit_access_predicates(program, document, access, Some(0), hir_loop.next)?;
 
-    // RowId on the table cursor also finishes a deferred seek from the
-    // index, so the table cursor sits on the row before it is deleted.
+    // An index loop leaves the table cursor's seek pending until a column
+    // is read. RowId reads the rowid without seeking, so the table cursor
+    // is moved to the row here before it is deleted.
+    if iteration.is_some() {
+        program.emit_insn(Insn::FinishSeek {
+            cursor_id: table_cursor,
+        });
+    }
     let rowid = program.alloc_register();
     program.emit_insn(Insn::RowId {
         cursor_id: table_cursor,
@@ -474,7 +523,7 @@ fn emit_delete_row(
         .map(|(cursor, expressions)| -> Result<_> {
             let (start, count) =
                 emit_index_key(program, document, source, table, table_cursor, expressions)?;
-            Ok((cursor, start, count, expressions))
+            Ok((cursor, start, count))
         })
         .transpose()?;
     // RETURNING reads the row before it is deleted. A subquery in
@@ -488,7 +537,7 @@ fn emit_delete_row(
                 .iter()
                 .any(|output| has_subquery(&output.expr))
         })
-        .map(|_| {
+        .map(|_| -> Result<usize> {
             // A virtual column is not stored; reading it through the copy
             // computes it from the other columns.
             let start = program.alloc_registers(table.columns().len());
@@ -496,11 +545,20 @@ fn emit_delete_row(
                 if column.is_virtual_generated() {
                     program.emit_null(start + position, None);
                 } else {
-                    program.emit_column_or_rowid(table_cursor, position, start + position);
+                    super::dml::emit_stored_column(
+                        program,
+                        document,
+                        source,
+                        table_cursor,
+                        column,
+                        position,
+                        start + position,
+                    )?;
                 }
             }
-            start
-        });
+            Ok(start)
+        })
+        .transpose()?;
     let returning_row = returning
         .filter(|_| copy.is_none())
         .map(|returning| returning.emit_values(program, document, target.resolved_table()?))
@@ -528,15 +586,16 @@ fn emit_delete_row(
             start_reg: start,
             num_regs: count,
             cursor_id: *cursor,
-            raise_error_if_no_matching_entry: expressions.index.value().where_clause.is_none(),
+            raise_error_if_no_matching_entry: true,
         });
         if let Some(skip) = skip {
             program.preassign_label_to_next_insn(skip);
         }
     }
     // The captured change reads the row before it is deleted.
-    if let Some(capture) = &target.capture {
-        let before = capture.before_record(program, table, table_cursor, row.rowid);
+    if let Some(capture) = target.capture_rows() {
+        let before =
+            capture.before_record(program, document, source, table, table_cursor, row.rowid)?;
         capture.emit_row(
             program,
             OperationMode::DELETE,
@@ -554,12 +613,12 @@ fn emit_delete_row(
     if let (Some(returning), Some(start)) = (returning, returning_row) {
         returning.emit_buffer(program, start);
     }
-    if let Some((cursor, start, count, expressions)) = iteration_key {
+    if let Some((cursor, start, count)) = iteration_key {
         program.emit_insn(Insn::IdxDelete {
             start_reg: start,
             num_regs: count,
             cursor_id: cursor,
-            raise_error_if_no_matching_entry: expressions.index.value().where_clause.is_none(),
+            raise_error_if_no_matching_entry: true,
         });
     }
     if let (Some(returning), Some(start)) = (returning, copy) {

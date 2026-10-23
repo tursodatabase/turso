@@ -18,7 +18,7 @@ addr  opcode         p1  p2  p3  p4          p5  comment
    1  OpenRead        0   2   0  k(3,B,B,B)   0  table=items, root=2, iDb=0
    2  Rewind          0   9   0               0  Rewind table items
    3    Column        0   1   1               0  r[1]=items.category
-   4    Ne            1   2   8               0  if r[1]!=r[2] goto 8
+   4    Ne            1   2   8  Binary       0  if r[1]!=r[2] goto 8
    5    RowId         0   3   0               0  r[3]=items.rowid
    6    ColumnRange   0   1   4  2            0  r[4..5]=items.category..subcategory
    7    ResultRow     3   3   0               0  output=r[3..5]

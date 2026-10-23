@@ -1,0 +1,154 @@
+---
+source: joins.sqltest
+expression: |-
+  SELECT (
+          SELECT grouped_left.value
+            FROM nested_prune_right AS scalar_anchor
+            JOIN (nested_prune_left AS grouped_left
+                  JOIN nested_prune_right AS grouped_right
+                    ON grouped_left.id=outer_row.id)
+      )
+        FROM nested_prune_outer AS outer_row;
+info:
+  statement_type: SELECT
+  tables:
+  - grouped_left.id
+  - nested_prune_outer
+  - nested_prune_right
+  setup_blocks:
+  - parenthesized_join_snapshot_schema
+  database: ':memory:'
+---
+QUERY PLAN
+|--SCAN nested_prune_outer AS outer_row
+`--CORRELATED SCALAR SUBQUERY 1
+   |--SCAN nested_prune_right AS scalar_anchor
+   |--SCAN nested_prune_right AS grouped_right
+   `--SEARCH grouped_left USING COVERING INDEX ephemeral_nested_prune_left_s3 (id=?)
+
+BYTECODE
+addr  opcode               p1  p2  p3  p4        p5  comment
+   0  Init                  0  39   0             0  Start at 39
+   1  OpenRead              0   2   0  k(3,B,B)   0  table=nested_prune_outer, root=2, iDb=0
+   2  Rewind                0  38   0             0  Rewind table nested_prune_outer
+   3    BeginSubrtn         3   0   0             0  r[3]=NULL
+   4    Null                0   2   0             0  r[2]=NULL
+   5    Once                7   0   0             0  goto 7
+   6    OpenRead            1   4   0  k(3,B,B)   0  table=nested_prune_right, root=4, iDb=0
+   7    Once                9   0   0             0  goto 9
+   8    OpenRead            2   4   0  k(3,B,B)   0  table=nested_prune_right, root=4, iDb=0
+   9    Once               11   0   0             0  goto 11
+  10    OpenRead            4   3   0  k(3,B,B)   0  table=nested_prune_left, root=3, iDb=0
+  11    Rewind              1  34   0             0  Rewind table nested_prune_right
+  12      Rewind            2  33   0             0  Rewind table nested_prune_right
+  13        Once           22   0   0             0  goto 22
+  14        OpenAutoindex   3   0   0             0  cursor=3
+  15        Rewind          4  22   0             0  Rewind table nested_prune_left
+  16          ColumnRange   4   0   4  2          0  r[4..5]=nested_prune_left.id..value
+  17          RowId         4   6   0             0  r[6]=nested_prune_left.rowid
+  18          MakeRecord    4   3   7             0  r[7]=mkrec(r[4..6]); for ephemeral_nested_prune_left_s3
+  19          FilterAdd     3   4   1             0  bloom_filter_add(r[4..5])
+  20          IdxInsert     3   7   4             0  key=r[7]
+  21        Next            4  16   0             0
+  22        Column          0   0   8             0  r[8]=nested_prune_outer.id
+  23        IsNull          8  32   0             0  if (r[8]==NULL) goto 32
+  24        Affinity        8   1   0             0  r[8..9] = C
+  25        Filter          3  32   8             1  if !bloom_filter(r[8..9]) goto 32
+  26        SeekGE          3  32   8             0  key=[8..8]
+  27          IdxGT         3  32   8             0  key=[8..8]
+  28          Column        3   1   9             0  r[9]=ephemeral(ephemeral_nested_prune_left_s3).value
+  29          Copy          9   2   0             0  r[2]=r[9]
+  30          Goto          0  34   0             0
+  31        Next            3  27   0             0
+  32      Next              2  13   0             1
+  33    Next                1  12   0             1
+  34    Return              3   0   1             0
+  35    Copy                2   1   0             0  r[1]=r[2]
+  36    ResultRow           1   1   0             0  output=r[1]
+  37  Next                  0   3   0             1
+  38  Halt                  0   0   0             0
+  39  Transaction           0   1   3             0  iDb=0 tx_mode=Read
+  40  Goto                  0   1   0             0
+
+SQLITE REFERENCE
+QUERY PLAN
+|--SCAN outer_row
+`--CORRELATED SCALAR SUBQUERY 2
+   |--SCAN scalar_anchor
+   |--SCAN grouped_right
+   |--BLOOM FILTER ON grouped_left (id=?)
+   `--SEARCH grouped_left USING AUTOMATIC COVERING INDEX (id=?)
+
+BYTECODE
+addr  opcode                     p1  p2  p3  p4                                   p5  comment
+   0  Init                        0  39   0                                        0
+   1  OpenRead                    0   2   0  1                                     0
+   2  Rewind                      0  38   0                                        0
+   3    BeginSubrtn               0   2   0                                        0
+   4      Null                    0   3   3                                        0
+   5      Integer                 1   4   0                                        0
+   6      OpenRead                1   4   0  0                                     0
+   7      OpenRead                4   4   0  0                                     0
+   8      OpenRead                3   3   0  2                                     0
+   9      Rewind                  1  34   0                                        0
+  10        Rewind                4  34   0                                        0
+  11          Once                0  23   0                                        0
+  12          OpenAutoindex       5   3   0  k(3,B,,)                              0
+  13          Explain            13   0   0  BLOOM FILTER ON grouped_left (id=?)   0
+  14          Blob            10000   5   0                                        0
+  15          Rewind              3  23   0                                        0
+  16            Column            3   0   7                                        0
+  17            Column            3   1   8                                        0
+  18            Rowid             3   9   0                                        0
+  19            MakeRecord        7   3   6                                        0
+  20            FilterAdd         5   0   7  1                                     0
+  21            IdxInsert         5   6   0                                       16
+  22          Next                3  16   0                                        3
+  23          Column              0   0  10                                        0
+  24          IsNull             10  32   0                                        0
+  25          Affinity           10   1   0  C                                     0
+  26          Filter              5  32  10  1                                     0
+  27          SeekGE              5  32  10  1                                     0
+  28            IdxGT             5  32  10  1                                     0
+  29            Column            5   1   3                                        0
+  30            DecrJumpZero      4  34   0                                        0
+  31          Next                5  28   0                                        0
+  32        Next                  4  11   0                                        1
+  33      Next                    1  10   0                                        1
+  34    Return                    2   4   1                                        0
+  35    Copy                      3   1   0                                        0
+  36    ResultRow                 1   1   0                                        0
+  37  Next                        0   3   0                                        1
+  38  Halt                        0   0   0                                        0
+  39  Transaction                 0   0   3  0                                     1
+  40  Goto                        0   1   0                                        0
+
+OPCODE DIFF
+--- sqlite opcodes
++++ turso opcodes
+@@ -5,5 +5,7 @@
+ Null
+-Integer
++Once
+ OpenRead
++Once
+ OpenRead
++Once
+ OpenRead
+@@ -13,8 +15,5 @@
+ OpenAutoindex
+-Explain
+-Blob
+ Rewind
+-Column
+-Column
+-Rowid
++ColumnRange
++RowId
+ MakeRecord
+@@ -30,3 +29,4 @@
+ Column
+-DecrJumpZero
++Copy
++Goto
+ Next

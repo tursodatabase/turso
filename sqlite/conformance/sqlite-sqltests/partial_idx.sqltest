@@ -60,6 +60,86 @@ expect error {
 }
 
 @cross-check-integrity
+test partial-index-where-nocase-column-refuses-duplicate {
+    CREATE TABLE t (s TEXT COLLATE NOCASE);
+    CREATE UNIQUE INDEX i ON t(s) WHERE s = 'a';
+    INSERT INTO t VALUES ('A');
+    INSERT INTO t VALUES ('a');
+}
+expect error {
+    UNIQUE constraint failed: t.s
+}
+
+@cross-check-integrity
+test partial-index-where-rtrim-column-refuses-duplicate {
+    CREATE TABLE t (s TEXT COLLATE RTRIM);
+    CREATE UNIQUE INDEX i ON t(s) WHERE s = 'a';
+    INSERT INTO t VALUES ('a  ');
+    INSERT INTO t VALUES ('a');
+}
+expect error {
+    UNIQUE constraint failed: t.s
+}
+
+@cross-check-integrity
+test partial-index-where-nocase-column-other-than-indexed {
+    CREATE TABLE t (k INTEGER, s TEXT COLLATE NOCASE);
+    CREATE UNIQUE INDEX i ON t(k) WHERE s = 'a';
+    INSERT INTO t VALUES (1, 'A');
+    INSERT INTO t VALUES (1, 'a');
+}
+expect error {
+    UNIQUE constraint failed: t.k
+}
+
+@cross-check-integrity
+test partial-index-where-nocase-column-update-into-predicate {
+    CREATE TABLE t (s TEXT COLLATE NOCASE);
+    CREATE UNIQUE INDEX i ON t(s) WHERE s = 'a';
+    INSERT INTO t VALUES ('z');
+    UPDATE t SET s = 'A';
+    SELECT s FROM t WHERE s = 'a';
+}
+expect {
+    A
+}
+
+@cross-check-integrity
+test partial-index-where-binary-column-keeps-binary {
+    CREATE TABLE t (s TEXT);
+    CREATE UNIQUE INDEX i ON t(s) WHERE s = 'a';
+    INSERT INTO t VALUES ('A');
+    INSERT INTO t VALUES ('a');
+    SELECT count(*) FROM t;
+}
+expect {
+    2
+}
+
+@cross-check-integrity
+test partial-index-where-explicit-collate-beats-column {
+    CREATE TABLE t (s TEXT COLLATE NOCASE);
+    CREATE UNIQUE INDEX i ON t(s) WHERE s = 'a' COLLATE BINARY;
+    INSERT INTO t VALUES ('A');
+    INSERT INTO t VALUES ('a');
+    SELECT count(*) FROM t;
+}
+expect {
+    2
+}
+
+@cross-check-integrity
+test expression-index-nocase-column-refuses-duplicate {
+    CREATE TABLE t (s TEXT COLLATE NOCASE);
+    CREATE UNIQUE INDEX i ON t(s = 'a');
+    INSERT INTO t VALUES ('A');
+    INSERT INTO t VALUES ('a');
+}
+expect error {
+    UNIQUE constraint failed
+}
+
+@cross-check-integrity
 test partial-index-expensive-violation-update {
     CREATE TABLE products (id INTEGER PRIMARY KEY, sku TEXT, price INTEGER);
     CREATE UNIQUE INDEX idx_expensive ON products(sku) WHERE price > 100;
@@ -1207,6 +1287,64 @@ expect {
     1|0|0|SCAN samples USING INDEX samples_user_processed_idx
 }
 
+# Use the partial index when one side of its OR also constrains the index key.
+@skip-if sqlite "query plan explanation output is different in sqlite"
+test partial-index-or-term-with-equality-search {
+    CREATE TABLE t (a, b);
+    CREATE INDEX idx ON t(a) WHERE b < 5 OR a > 5;
+    INSERT INTO t VALUES (-1, 1), (-3, 3), (-5, 5), (-8, 8), (10, 8);
+    EXPLAIN QUERY PLAN SELECT a FROM t WHERE b < 5 AND a = -3;
+    SELECT a FROM t WHERE b < 5 AND a = -3;
+}
+expect {
+    1|0|0|SEARCH t USING INDEX idx (a=?)
+    -3
+}
+
+# Use the partial index when it provides the requested order.
+@skip-if sqlite "query plan explanation output is different in sqlite"
+test partial-index-or-term-with-order {
+    CREATE TABLE t (a, b);
+    CREATE INDEX idx ON t(a) WHERE b < 5 OR a > 5;
+    INSERT INTO t VALUES (-1, 1), (-3, 3), (-5, 5), (-8, 8), (10, 8);
+    EXPLAIN QUERY PLAN SELECT a FROM t WHERE b < 5 ORDER BY a;
+    SELECT a FROM t WHERE b < 5 ORDER BY a;
+}
+expect {
+    1|0|0|SCAN t USING INDEX idx
+    -3
+    -1
+}
+
+# Use the partial index without table lookups when it contains the filtered column.
+@skip-if sqlite "query plan explanation output is different in sqlite"
+test partial-index-or-term-with-covering-scan {
+    CREATE TABLE t (a, b);
+    CREATE INDEX idx ON t(a, b) WHERE b < 5 OR a > 5;
+    INSERT INTO t VALUES (-1, 1), (-3, 3), (-5, 5), (-8, 8), (10, 8);
+    EXPLAIN QUERY PLAN SELECT a FROM t WHERE b < 5;
+    SELECT a FROM t WHERE b < 5 ORDER BY a;
+}
+expect {
+    1|0|0|SCAN t USING COVERING INDEX idx
+    -3
+    -1
+}
+
+# Use either side of the partial index OR to prove that the index is safe.
+@skip-if sqlite "query plan explanation output is different in sqlite"
+test partial-index-or-right-term-with-range-search {
+    CREATE TABLE t (a, b);
+    CREATE INDEX idx ON t(a) WHERE b < 5 OR a > 5;
+    INSERT INTO t VALUES (-1, 1), (-3, 3), (-5, 5), (-8, 8), (10, 8);
+    EXPLAIN QUERY PLAN SELECT a FROM t WHERE a > 5;
+    SELECT a FROM t WHERE a > 5 ORDER BY a;
+}
+expect {
+    1|0|0|SEARCH t USING COVERING INDEX idx (a>?)
+    10
+}
+
 # Partial index must NOT be used when the query only satisfies a subset of the
 # index WHERE conjuncts — the partial index would skip rows the query needs.
 @skip-if sqlite "query plan explanation output is different in sqlite"
@@ -1596,4 +1734,122 @@ test eqp-use-partial-idx-predicate-with-residual-predicate-for-covering-index-sc
 }
 expect {
     1|0|0|SEARCH t USING COVERING INDEX idx (a=?)
+}
+
+# An outer join condition does not filter rows from its left table.
+@cross-check-integrity
+test outer-join-condition-does-not-enable-left-table-partial-index {
+    CREATE TABLE items(name TEXT, group_name TEXT);
+    INSERT INTO items VALUES ('one', 'keep'), ('two', 'keep');
+    CREATE INDEX only_missing ON items(name, group_name)
+        WHERE name = 'missing';
+    CREATE TABLE optional(name TEXT);
+
+    SELECT items.name
+    FROM items
+    LEFT JOIN optional
+      ON optional.name = items.name AND items.name = 'missing'
+    WHERE items.group_name = 'keep'
+    ORDER BY items.name;
+}
+expect {
+    one
+    two
+}
+
+# UPDATE OR REPLACE deletes the conflicting row 1. Row 1 is not in the
+# partial index p, so there is no p entry to delete.
+@cross-check-integrity
+test partial-index-update-or-replace-conflicting-row-not-in-index {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, k TEXT UNIQUE, c0 INT);
+    CREATE INDEX p ON t(c0) WHERE c0 > 5;
+    INSERT INTO t VALUES (1, 'a', 1), (2, 'b', 9);
+    UPDATE OR REPLACE t SET k = 'a' WHERE id = 2;
+    SELECT id, k, c0 FROM t;
+    PRAGMA integrity_check;
+}
+expect {
+    2|a|9
+    ok
+}
+
+# UPDATE OR REPLACE deletes the conflicting row 1. Row 1 is in the partial
+# index p and the updated row 2 is not, so the p entry of row 1 must go.
+@cross-check-integrity
+test partial-index-update-or-replace-conflicting-row-in-index {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, k TEXT UNIQUE, c0 INT);
+    CREATE INDEX p ON t(c0) WHERE c0 > 5;
+    INSERT INTO t VALUES (1, 'a', 9), (2, 'b', 1);
+    UPDATE OR REPLACE t SET k = 'a' WHERE id = 2;
+    SELECT id, k, c0 FROM t;
+    SELECT count(*) FROM t WHERE c0 > 5;
+    PRAGMA integrity_check;
+}
+expect {
+    2|a|1
+    0
+    ok
+}
+
+# The query BETWEEN implies the index WHERE through its lower bound, but its
+# upper bound still reads column a, so the index cannot cover the query.
+test partial-index-between-implies-where-still-reads-column {
+    CREATE TABLE t(a INT, b);
+    CREATE INDEX i ON t(b) WHERE a >= 2;
+    INSERT INTO t VALUES (3, 'x'), (1, 'y'), (5, 'z');
+    SELECT count(*) FROM t WHERE a BETWEEN 2 AND 4;
+    SELECT b FROM t WHERE a BETWEEN 2 AND 4;
+    SELECT count(*) FROM t WHERE a BETWEEN 2 AND NULL;
+}
+expect {
+    1
+    x
+    0
+}
+
+# The hash join build side reads t from the partial index, so the term
+# b > 1 must be skipped there too: the index does not store column b.
+test partial-index-hash-join-build-skips-index-where-term {
+    CREATE TABLE t(a, b);
+    CREATE TABLE u(x);
+    CREATE INDEX i ON t(a) WHERE b > 1;
+    INSERT INTO t VALUES (2, 3), (2, 0), (2, 5), (3, 9);
+    INSERT INTO u VALUES (2), (3), (2);
+    SELECT count(*) FROM t JOIN u ON u.x = t.a WHERE a = 2 AND b > 1;
+    SELECT count(*) FROM t LEFT JOIN u ON u.x = t.a WHERE a = 2 AND b > 1;
+    SELECT count(*) FROM t JOIN u ON u.x = t.a + 0 WHERE a = 2 AND b > 1;
+    SELECT count(*) FROM t JOIN u ON u.x = t.a WHERE a > 0 AND b > 1;
+}
+expect {
+    4
+    4
+    4
+    5
+}
+
+@cross-check-integrity
+test partial-index-rowid-where-update-through-covering-index {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, a, b);
+    CREATE INDEX ia ON t(a);
+    CREATE INDEX ib ON t(b) WHERE id > 10;
+    INSERT INTO t VALUES (1, 1, 0);
+    UPDATE t SET b = 2 WHERE a = 1;
+    SELECT * FROM t;
+}
+expect {
+    1|1|2
+}
+
+@cross-check-integrity
+test partial-index-rowid-where-update-through-covering-index-after-earlier-row {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, a, b);
+    CREATE INDEX ia ON t(a);
+    CREATE INDEX ib ON t(b) WHERE id > 1;
+    INSERT INTO t VALUES (2, 1, 0), (1, 2, 0);
+    UPDATE t SET b = 9 WHERE a > 0;
+    SELECT * FROM t;
+}
+expect {
+    1|2|9
+    2|1|9
 }

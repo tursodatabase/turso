@@ -1,3 +1,4 @@
+use crate::types::IOResultOr;
 use rustc_hash::FxHashMap;
 use std::sync::{atomic::Ordering, Arc};
 
@@ -13,7 +14,8 @@ use crate::util::IOExt;
 use crate::vdbe::Row;
 use crate::Result;
 use crate::{
-    Connection, Database, DatabaseOpts, EncryptionKey, EncryptionOpts, MvStore, OpenFlags, SyncMode,
+    ConnectOpts, Connection, Database, DatabaseOpts, EncryptionKey, EncryptionOpts, MvStore,
+    OpenFlags, SyncMode,
 };
 use turso_macros::{turso_assert, turso_assert_eq};
 
@@ -102,6 +104,14 @@ impl SchemaEntry {
         };
         seq_name.starts_with(crate::schema::AUTOINCREMENT_SEQ_PREFIX)
     }
+
+    /// True for the internal tables that store a materialized view's state.
+    /// VACUUM neither creates nor copies them: replaying the view's
+    /// `CREATE MATERIALIZED VIEW` creates them again and fills them, and
+    /// the view itself, from the base tables that were already copied.
+    pub fn is_materialized_view_state_table(&self) -> bool {
+        crate::schema::is_materialized_view_state_table(&self.name)
+    }
 }
 
 /// Split rowid-ordered schema entries into the replay phases used by VACUUM.
@@ -114,9 +124,11 @@ pub(crate) fn classify_schema_entries(
     let mut tables_to_copy: Vec<usize> = Vec::new();
     let mut indexes_to_create: Vec<usize> = Vec::new();
     let mut post_data_entries: Vec<usize> = Vec::new();
+    let mut counter_tables_to_copy: Vec<usize> = Vec::new();
 
     for (idx, entry) in entries.iter().enumerate() {
         match entry.entry_type {
+            SchemaEntryType::Table if entry.is_materialized_view_state_table() => {}
             SchemaEntryType::Table if entry.is_storage_backed() => {
                 // Skip sqlite_sequence and AUTOINCREMENT implicit sequence
                 // backing tables in the schema creation phase: both are
@@ -131,14 +143,19 @@ pub(crate) fn classify_schema_entries(
                 // creates it in the target. Excluding them used to abort
                 // VACUUM with `no such table: "__turso_internal_seq_foo"`
                 // during the copy phase.
-                if !entry.is_sqlite_sequence() && !entry.is_autoinc_sequence_backing_table() {
-                    tables_to_create.push(idx);
-                }
+                //
                 // All storage-backed tables get their data copied, including
                 // sqlite_stat1 and other internal storage-backed tables.
-                // sqlite_sequence data copy is handled specially by the caller
-                // (only if the target materialized it).
-                tables_to_copy.push(idx);
+                // The AUTOINCREMENT counters are copied after every other
+                // table, because copying rows with explicit rowids advances
+                // the target's counters to max(rowid) and the source values
+                // must replace those.
+                if entry.is_sqlite_sequence() || entry.is_autoinc_sequence_backing_table() {
+                    counter_tables_to_copy.push(idx);
+                } else {
+                    tables_to_create.push(idx);
+                    tables_to_copy.push(idx);
+                }
             }
             SchemaEntryType::Index if entry.is_storage_backed() => {
                 // Storage-backed index (rootpage != 0). Includes both normal
@@ -171,6 +188,8 @@ pub(crate) fn classify_schema_entries(
             }
         }
     }
+
+    tables_to_copy.extend(counter_tables_to_copy);
 
     (
         tables_to_create,
@@ -313,10 +332,10 @@ pub(crate) fn open_vacuum_temp_db(
         )?,
     };
     let conn = match page_codec {
-        Some(codec) => db.connect_with_page_codec(codec)?,
-        None => db.connect_with_encryption(encryption_key)?,
+        Some(codec) => db.connect(ConnectOpts::new().with_page_codec(codec))?,
+        None => db.connect(ConnectOpts::new().with_encryption_key(encryption_key))?,
     };
-    conn.reset_page_size(page_size)?;
+    conn.reset_page_size(crate::MAIN_DB_ID, page_size)?;
     conn.set_reserved_bytes(reserved_space)?;
     conn.wal_auto_actions_disable();
 
@@ -344,15 +363,22 @@ pub(crate) fn open_vacuum_temp_db(
 fn finalize_vacuum_target_header(
     target_conn: &Arc<Connection>,
     header_meta: &VacuumDbHeaderMeta,
-) -> Result<crate::IOResult<()>> {
+) -> crate::types::IOResultOr<()> {
     if let Some(mv_store) = target_conn.mv_store_for_db(crate::MAIN_DB_ID) {
         let tx_id = target_conn.get_mv_tx_id_for_db(crate::MAIN_DB_ID);
-        return mv_store
-            .with_header_mut(|header| header_meta.apply_to(header), tx_id.as_ref())
-            .map(crate::IOResult::Done);
+        mv_store.with_header_mut(|header| header_meta.apply_to(header), tx_id.as_ref())?;
+        set_mvcc_schema_version_from_header_cookie(target_conn, header_meta.schema_cookie)?;
+        return Ok(crate::IOResult::Done(()));
     }
     let pager = target_conn.pager.load();
     pager.with_header_mut(|header| header_meta.apply_to(header))
+}
+
+fn set_mvcc_schema_version_from_header_cookie(
+    target_conn: &Arc<Connection>,
+    schema_cookie: u32,
+) -> Result<()> {
+    target_conn.with_schema_mut(|schema| schema.schema_version = schema_cookie)
 }
 
 /// Finish a VACUUM INTO output database with durable on-disk state.
@@ -493,6 +519,14 @@ pub(crate) enum VacuumTargetBuildPhase {
     },
     /// Start copying a table's data
     StartCopyTable { table_idx: usize },
+    /// Delete the rows that the earlier table copies wrote into an
+    /// AUTOINCREMENT counter table on the target.
+    ClearCounterTable {
+        delete_stmt: Box<crate::Statement>,
+        table_idx: usize,
+    },
+    /// Prepare the SELECT on the source and the INSERT on the target.
+    PrepareCopyRows { table_idx: usize },
     /// Select rows from source table and insert into the target.
     CopyRows {
         select_stmt: Box<crate::Statement>,
@@ -537,7 +571,8 @@ pub(crate) enum VacuumTargetBuildPhase {
 /// 3. Creates storage-backed tables (rootpage != 0) in the target, excluding
 ///    sqlite_sequence (auto-created when AUTOINCREMENT tables are created)
 /// 4. Copies data for all storage-backed tables, including sqlite_stat1 and other
-///    internal storage-backed tables
+///    internal storage-backed tables. sqlite_sequence and the AUTOINCREMENT
+///    sequence tables are cleared and copied last.
 /// 5. Creates user-defined secondary indexes after data copy for performance
 ///    (backing-btree indexes for custom index methods are excluded here)
 /// 6. Creates triggers, views, and rootpage = 0 objects last (after data copy).
@@ -547,7 +582,7 @@ pub(crate) enum VacuumTargetBuildPhase {
 pub(crate) fn vacuum_target_build_step(
     config: &VacuumTargetBuildConfig,
     state: &mut VacuumTargetBuildContext,
-) -> Result<crate::IOResult<()>> {
+) -> crate::types::IOResultOr<()> {
     loop {
         let current_phase = std::mem::take(&mut state.phase);
 
@@ -670,7 +705,7 @@ pub(crate) fn vacuum_target_build_step(
                         return Ok(crate::IOResult::IO(io));
                     }
                     crate::StepResult::Busy | crate::StepResult::Interrupt => {
-                        return Err(LimboError::Busy);
+                        return Err(LimboError::Busy.into());
                     }
                 }
             }
@@ -736,7 +771,7 @@ pub(crate) fn vacuum_target_build_step(
                     return Ok(crate::IOResult::IO(io));
                 }
                 crate::StepResult::Busy | crate::StepResult::Interrupt => {
-                    return Err(LimboError::Busy);
+                    return Err(LimboError::Busy.into());
                 }
             },
 
@@ -759,9 +794,7 @@ pub(crate) fn vacuum_target_build_step(
                 // sqlite_sequence: only copy data if the target has it
                 // (auto-created when an AUTOINCREMENT table was created in
                 // phase 1). If not present, skip — no AUTOINCREMENT tables
-                // means no counters to preserve. The explicit copy is needed
-                // because inserting rows with the `rowid` pseudo-column does
-                // not update sqlite_sequence counters automatically.
+                // means no counters to preserve.
                 if entry.is_sqlite_sequence() {
                     let target_has_sequence = state
                         .target_conn
@@ -777,6 +810,57 @@ pub(crate) fn vacuum_target_build_step(
                     }
                 }
 
+                // The table copies may have advanced the target's counters
+                // to max(rowid). Delete those rows so the target ends up with
+                // exactly the source's counter rows.
+                if entry.is_sqlite_sequence() || entry.is_autoinc_sequence_backing_table() {
+                    let escaped_table_name = table_name.replace('"', "\"\"");
+                    let delete_sql = format!("DELETE FROM \"{escaped_table_name}\"");
+                    let delete_stmt =
+                        prepare_on_target(&state.target_conn, table_name, &delete_sql)?;
+                    state.phase = VacuumTargetBuildPhase::ClearCounterTable {
+                        delete_stmt: Box::new(delete_stmt),
+                        table_idx,
+                    };
+                    continue;
+                }
+
+                state.phase = VacuumTargetBuildPhase::PrepareCopyRows { table_idx };
+                continue;
+            }
+
+            VacuumTargetBuildPhase::ClearCounterTable {
+                mut delete_stmt,
+                table_idx,
+            } => match delete_stmt.step()? {
+                crate::StepResult::Row => {
+                    unreachable!("DELETE statement unexpectedly returned a row");
+                }
+                crate::StepResult::Done => {
+                    state.phase = VacuumTargetBuildPhase::PrepareCopyRows { table_idx };
+                    continue;
+                }
+                crate::StepResult::IO
+                | crate::StepResult::Yield
+                | crate::StepResult::Sleep { .. } => {
+                    let io = delete_stmt
+                        .take_io_completions()
+                        .unwrap_or_else(|| IOCompletions(Completion::new_yield()));
+                    state.phase = VacuumTargetBuildPhase::ClearCounterTable {
+                        delete_stmt,
+                        table_idx,
+                    };
+                    return Ok(crate::IOResult::IO(io));
+                }
+                crate::StepResult::Busy | crate::StepResult::Interrupt => {
+                    return Err(LimboError::Busy.into());
+                }
+            },
+
+            VacuumTargetBuildPhase::PrepareCopyRows { table_idx } => {
+                let entry_ordinal = state.tables_to_copy[table_idx];
+                let entry = &state.schema_entries[entry_ordinal];
+                let table_name = &entry.name;
                 let escaped_table_name = table_name.replace('"', "\"\"");
                 // Derive copy-column list from BTreeTable.columns in schema,
                 // filtering out virtual generated columns so the SELECT and
@@ -787,37 +871,17 @@ pub(crate) fn vacuum_target_build_step(
                         schema.get_btree_table(table_name)
                     });
 
-                // sqlite_sequence and AUTOINCREMENT implicit backing tables
-                // may already have rows from the AUTOINCREMENT tracking that
-                // ran during the table data copy. Use INSERT OR REPLACE so
-                // the source counter values overwrite any stale auto-
-                // generated ones (matches SQLite vacuum.c behavior). User-
-                // created sequence backing tables get a fresh CREATE TABLE
-                // replay (no auto-populated rows), so plain INSERT is fine.
-                // todo: sqlite disables AUTOINCREMENT during vacuum, but we don't have such a way yet
                 let (select_sql, insert_sql) = build_copy_sql(
                     &config.escaped_schema_name,
                     &escaped_table_name,
                     source_btree_table.as_deref(),
-                    entry.is_sqlite_sequence() || entry.is_autoinc_sequence_backing_table(),
                 )?;
 
                 // SELECT from source, INSERT into the target.
                 let select_stmt = config.source_conn.prepare_internal(&select_sql)?;
 
-                // System tables need nested mode during prepare() to bypass
-                // "may not be modified" checks. Can't use prepare_internal()
-                // because the nested guard must not persist into step() - the
-                // Transaction opcode needs to run for page-level write setup.
-                let is_system = crate::schema::is_system_table(table_name);
-                if is_system {
-                    state.target_conn.start_nested();
-                }
-                let target_insert_stmt = state.target_conn.prepare(&insert_sql);
-                if is_system {
-                    state.target_conn.end_nested();
-                }
-                let target_insert_stmt = target_insert_stmt?;
+                let target_insert_stmt =
+                    prepare_on_target(&state.target_conn, table_name, &insert_sql)?;
 
                 state.phase = VacuumTargetBuildPhase::CopyRows {
                     select_stmt: Box::new(select_stmt),
@@ -873,7 +937,7 @@ pub(crate) fn vacuum_target_build_step(
                     return Ok(crate::IOResult::IO(io));
                 }
                 crate::StepResult::Busy | crate::StepResult::Interrupt => {
-                    return Err(LimboError::Busy);
+                    return Err(LimboError::Busy.into());
                 }
             },
 
@@ -908,7 +972,7 @@ pub(crate) fn vacuum_target_build_step(
                     return Ok(crate::IOResult::IO(io));
                 }
                 crate::StepResult::Busy | crate::StepResult::Interrupt => {
-                    return Err(LimboError::Busy);
+                    return Err(LimboError::Busy.into());
                 }
             },
 
@@ -958,7 +1022,7 @@ pub(crate) fn vacuum_target_build_step(
                     return Ok(crate::IOResult::IO(io));
                 }
                 crate::StepResult::Busy | crate::StepResult::Interrupt => {
-                    return Err(LimboError::Busy);
+                    return Err(LimboError::Busy.into());
                 }
             },
 
@@ -1004,7 +1068,7 @@ pub(crate) fn vacuum_target_build_step(
                     return Ok(crate::IOResult::IO(io));
                 }
                 crate::StepResult::Busy | crate::StepResult::Interrupt => {
-                    return Err(LimboError::Busy);
+                    return Err(LimboError::Busy.into());
                 }
             },
 
@@ -1028,6 +1092,28 @@ pub(crate) fn vacuum_target_build_step(
             }
         }
     }
+}
+
+/// System tables (sqlite_stat1, sqlite_sequence, __turso_internal_*, etc.)
+/// have reserved names that user SQL may not create or modify. Mark the target
+/// connection as nested during prepare() so those checks are bypassed at
+/// compile time. Can't use prepare_internal() because the nested guard must
+/// not persist into step(): a nested statement's Transaction opcode skips
+/// write setup.
+fn prepare_on_target(
+    target_conn: &Arc<Connection>,
+    table_name: &str,
+    sql: &str,
+) -> Result<crate::Statement> {
+    let is_system = crate::schema::is_system_table(table_name);
+    if is_system {
+        target_conn.start_nested();
+    }
+    let stmt = target_conn.prepare(sql);
+    if is_system {
+        target_conn.end_nested();
+    }
+    stmt
 }
 
 fn table_sql_for_vacuum_replay(target_conn: &Arc<Connection>, sql: &str) -> Result<String> {
@@ -1056,7 +1142,6 @@ pub(crate) fn build_copy_sql(
     escaped_schema_name: &str,
     escaped_table_name: &str,
     source_btree_table: Option<&BTreeTable>,
-    or_replace: bool,
 ) -> Result<(String, String)> {
     let Some(btree) = source_btree_table else {
         // Storage-backed tables must have schema metadata. If we get here,
@@ -1169,13 +1254,8 @@ pub(crate) fn build_copy_sql(
 
     let select_sql =
         format!("SELECT {select_cols} FROM \"{escaped_schema_name}\".\"{escaped_table_name}\"");
-    let insert_prefix = if or_replace {
-        "INSERT OR REPLACE INTO"
-    } else {
-        "INSERT INTO"
-    };
     let insert_sql =
-        format!("{insert_prefix} \"{escaped_table_name}\" ({insert_cols}) VALUES ({placeholders})");
+        format!("INSERT INTO \"{escaped_table_name}\" ({insert_cols}) VALUES ({placeholders})");
 
     Ok((select_sql, insert_sql))
 }
@@ -1369,7 +1449,7 @@ impl VacuumInPlaceOpContext {
         }
     }
 
-    pub(crate) fn step(&mut self, connection: &Arc<Connection>) -> Result<IOResult<()>> {
+    pub(crate) fn step(&mut self, connection: &Arc<Connection>) -> IOResultOr<()> {
         vacuum_in_place_step(
             connection,
             self.db,
@@ -1560,13 +1640,13 @@ fn start_temp_batch_reads(
         } else {
             None
         };
-        let c = wal.read_frames_batch(
+        let _c = wal.read_frames_batch(
             *start_frame,
             run_pages,
             temp_pager.buffer_pool.clone(),
             run_scratch,
+            Some(&mut group),
         )?;
-        group.add(&c);
     }
     let combined = group.build();
 
@@ -1703,7 +1783,7 @@ fn vacuum_in_place_step(
     temp_db: &mut Option<Box<VacuumTempDb>>,
     committed_image: &mut Option<VacuumCommittedImageMeta>,
     cleanup_state: &mut VacuumInPlaceCleanupState,
-) -> Result<IOResult<()>> {
+) -> IOResultOr<()> {
     let source_pager = connection.get_pager_from_database_index(&db)?;
 
     loop {
@@ -1713,17 +1793,19 @@ fn vacuum_in_place_step(
                 if !connection.auto_commit.load(Ordering::SeqCst) {
                     return Err(LimboError::TxError(
                         "cannot VACUUM from within a transaction".to_string(),
-                    ));
+                    )
+                    .into());
                 }
                 // 2. No other active root statements on this connection.
                 if connection.n_active_root_statements.load(Ordering::SeqCst) != 1 {
                     return Err(LimboError::TxError(
                         "cannot VACUUM - SQL statements in progress".to_string(),
-                    ));
+                    )
+                    .into());
                 }
                 // 3. Reject readonly database, well you cannot edit a readonly db ^_^
                 if connection.is_readonly(db) {
-                    return Err(LimboError::ReadOnly);
+                    return Err(LimboError::ReadOnly.into());
                 }
                 // 4. Resolve source database mode.
                 let source_db = connection.get_source_database(db);
@@ -1732,7 +1814,8 @@ fn vacuum_in_place_step(
                 if source_db.is_in_memory_db() {
                     return Err(LimboError::InternalError(
                         "cannot VACUUM an in-memory database".to_string(),
-                    ));
+                    )
+                    .into());
                 }
                 reject_unsupported_vacuum_auto_vacuum_mode(source_pager.get_auto_vacuum_mode())?;
                 // 6. Reject non-WAL pagers.
@@ -1754,7 +1837,7 @@ fn vacuum_in_place_step(
                     if mv_store.has_uncheckpointed_log()? {
                         return Err(LimboError::TxError(
                             "cannot VACUUM an MVCC database with uncheckpointed changes; run PRAGMA wal_checkpoint(TRUNCATE) first".to_string(),
-                        ));
+                        ).into());
                     }
                     if connection.get_mv_tx_id_for_db(db).is_some() {
                         turso_assert!(
@@ -1764,7 +1847,7 @@ fn vacuum_in_place_step(
                         return Err(LimboError::InternalError(
                             "VACUUM acquired MVCC gate while this connection has an MVCC transaction"
                                 .to_string(),
-                        ));
+                        ).into());
                     }
                     guard.demote_connection();
                     // After demotion this connection stops reading schema-cookie state from the
@@ -1977,7 +2060,7 @@ fn vacuum_in_place_step(
                     return Ok(IOResult::IO(IOCompletions(completion.clone())));
                 }
                 if !completion.succeeded() {
-                    return Err(vacuum_completion_error(completion, "WAL header init"));
+                    return Err(vacuum_completion_error(completion, "WAL header init").into());
                 }
 
                 if !*fsync_phase {
@@ -2044,7 +2127,7 @@ fn vacuum_in_place_step(
                     return Ok(IOResult::IO(IOCompletions(read_completion.clone())));
                 }
                 if !read_completion.succeeded() {
-                    return Err(vacuum_completion_error(read_completion, "temp batch read"));
+                    return Err(vacuum_completion_error(read_completion, "temp batch read").into());
                 }
 
                 // All pages in this batch are loaded. Prepare WAL frames.
@@ -2052,12 +2135,12 @@ fn vacuum_in_place_step(
                     turso_assert!(
                         page.is_loaded(),
                         "VACUUM read batch page must be loaded before WAL prepare",
-                        { "page_id": page.get().id }
+                        { "page_id": page.get().id() }
                     );
                     turso_assert!(
                         !page.is_locked(),
                         "VACUUM read batch page lock leaked before WAL prepare",
-                        { "page_id": page.get().id }
+                        { "page_id": page.get().id() }
                     );
                 }
                 let all_read = *next_page > *total_pages;
@@ -2080,7 +2163,7 @@ fn vacuum_in_place_step(
                 let wal_file = wal.wal_file()?;
                 let mut batch = IOWriteBatch::new(wal_file);
                 batch.writev(prepared.offset, &prepared.bufs);
-                let completions = batch.submit()?;
+                let completions = batch.submit(None)?;
 
                 *phase = VacuumInPlacePhase::WriteWalBatch {
                     total_pages: *total_pages,
@@ -2123,7 +2206,7 @@ fn vacuum_in_place_step(
                 // Check for write errors.
                 for c in completions.iter() {
                     if !c.succeeded() {
-                        return Err(vacuum_completion_error(c, "WAL write"));
+                        return Err(vacuum_completion_error(c, "WAL write").into());
                     }
                 }
 
@@ -2196,7 +2279,7 @@ fn vacuum_in_place_step(
                     return Ok(IOResult::IO(IOCompletions(sync_completion.clone())));
                 }
                 if !sync_completion.succeeded() {
-                    return Err(vacuum_completion_error(sync_completion, "WAL fsync"));
+                    return Err(vacuum_completion_error(sync_completion, "WAL fsync").into());
                 }
                 *phase = VacuumInPlacePhase::PublishWalCommit;
                 continue;
@@ -2415,8 +2498,8 @@ mod tests {
     use crate::vdbe::execute::TransactionYieldPoint;
     use crate::SqliteDialect;
     use crate::{
-        Buffer, Clock, Completion, DatabaseOpts, File, MemoryIO, MonotonicInstant, OpenFlags,
-        WallClockInstant, IO,
+        Buffer, Clock, Completion, ConnectOpts, DatabaseOpts, File, MemoryIO, MonotonicInstant,
+        OpenFlags, WallClockInstant, IO,
     };
     use std::sync::atomic::{AtomicUsize, Ordering as StdOrdering};
 
@@ -2588,7 +2671,7 @@ mod tests {
         assert_eq!(runs.len(), 1);
         assert_eq!(runs[0].0, 42);
         assert_eq!(runs[0].1.len(), 1);
-        assert_eq!(runs[0].1[0].get().id, 1);
+        assert_eq!(runs[0].1[0].get().id(), 1);
     }
 
     #[test]
@@ -2607,12 +2690,12 @@ mod tests {
         assert_eq!(runs[0].0, 10);
         assert_eq!(runs[0].1.len(), 3);
         assert_eq!(
-            runs[0].1.iter().map(|p| p.get().id).collect::<Vec<_>>(),
+            runs[0].1.iter().map(|p| p.get().id()).collect::<Vec<_>>(),
             vec![1, 2, 3]
         );
         assert_eq!(runs[1].0, 14);
         assert_eq!(runs[1].1.len(), 1);
-        assert_eq!(runs[1].1[0].get().id, 4);
+        assert_eq!(runs[1].1[0].get().id(), 4);
     }
 
     #[test]
@@ -2668,7 +2751,7 @@ mod tests {
         assert_eq!(runs.len(), 1);
         assert_eq!(runs[0].0, 10);
         assert_eq!(
-            runs[0].1.iter().map(|p| p.get().id).collect::<Vec<_>>(),
+            runs[0].1.iter().map(|p| p.get().id()).collect::<Vec<_>>(),
             vec![2, 3, 1, 4]
         );
     }
@@ -2755,7 +2838,7 @@ mod tests {
     fn install_committed_vacuum_image_updates_connection_and_shared_schema() -> Result<()> {
         let io: Arc<dyn crate::IO> = Arc::new(crate::MemoryIO::new());
         let db = Database::open_file(io, ":memory:", Arc::new(SqliteDialect))?;
-        let conn = db.connect()?;
+        let conn = db.connect(ConnectOpts::new())?;
 
         conn.with_schema_mut(|schema| {
             schema.schema_version = 1;
@@ -2791,7 +2874,7 @@ mod tests {
     fn cleanup_after_published_vacuum_installs_committed_image() -> Result<()> {
         let io: Arc<dyn crate::IO> = Arc::new(crate::MemoryIO::new());
         let db = Database::open_file(io, ":memory:", Arc::new(SqliteDialect))?;
-        let conn = db.connect()?;
+        let conn = db.connect(ConnectOpts::new())?;
 
         conn.with_schema_mut(|schema| {
             schema.schema_version = 1;
@@ -2845,7 +2928,7 @@ mod tests {
             None,
             Arc::new(SqliteDialect),
         )?;
-        let source_conn = source_db.connect()?;
+        let source_conn = source_db.connect(ConnectOpts::new())?;
         // Source is uninitialized so its header reserved_space isn't usable.
         // Derive from the IOContext to keep reserved_space and the auto-
         // installed checksum context consistent under `feature = "checksum"`.
@@ -2916,7 +2999,7 @@ mod tests {
             None,
             Arc::new(SqliteDialect),
         )?;
-        let conn = db.connect()?;
+        let conn = db.connect(ConnectOpts::new())?;
         conn.set_sync_mode(crate::SyncMode::Off);
         conn.wal_auto_actions_disable();
 
@@ -2964,7 +3047,7 @@ mod tests {
             None,
             Arc::new(SqliteDialect),
         )?;
-        let source_conn = source_db.connect()?;
+        let source_conn = source_db.connect(ConnectOpts::new())?;
         source_conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, payload TEXT)")?;
         source_conn.execute("CREATE INDEX idx_t_payload ON t(payload)")?;
         for id in 1..=8 {
@@ -2986,7 +3069,7 @@ mod tests {
             None,
             Arc::new(SqliteDialect),
         )?;
-        let target_conn = target_db.connect()?;
+        let target_conn = target_db.connect(ConnectOpts::new())?;
         mirror_symbols(&source_conn, &target_conn);
 
         let config = VacuumTargetBuildConfig {
@@ -3049,7 +3132,7 @@ mod tests {
             None,
             Arc::new(SqliteDialect),
         )?;
-        let conn = db.connect()?;
+        let conn = db.connect(ConnectOpts::new())?;
         conn.set_sync_mode(crate::SyncMode::Off);
 
         conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)")?;
@@ -3095,7 +3178,7 @@ mod tests {
             None,
             Arc::new(SqliteDialect),
         )?;
-        let conn = db.connect()?;
+        let conn = db.connect(ConnectOpts::new())?;
         conn.set_sync_mode(crate::SyncMode::Off);
         conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)")?;
         conn.execute("INSERT INTO t VALUES (1, 'x')")?;
@@ -3138,7 +3221,7 @@ mod tests {
             None,
             Arc::new(SqliteDialect),
         )?;
-        let source_conn = source_db.connect()?;
+        let source_conn = source_db.connect(ConnectOpts::new())?;
         let temp = open_vacuum_temp_db(&source_conn, &source_db, 4096, 0)?;
 
         let mut source_header = DatabaseHeader::default();
@@ -3179,6 +3262,62 @@ mod tests {
 
     #[cfg(not(target_family = "wasm"))]
     #[test]
+    fn vacuum_db_header_meta_schema_cookie_survives_mvcc_target_checkpoint() -> Result<()> {
+        let io: Arc<dyn crate::IO> = Arc::new(crate::io::PlatformIO::new()?);
+        let target_dir = tempfile::tempdir().unwrap();
+        let target_path = target_dir.path().join("target.db");
+        let target_path = target_path.to_str().unwrap();
+        let target_db = Database::open_file_with_flags(
+            io,
+            target_path,
+            OpenFlags::Create,
+            DatabaseOpts::new(),
+            None,
+            Arc::new(SqliteDialect),
+        )?;
+        let target_conn = target_db.connect(ConnectOpts::new())?;
+        target_conn.execute("PRAGMA journal_mode = 'mvcc'")?;
+        target_conn.wal_auto_actions_disable();
+
+        target_conn.execute("BEGIN IMMEDIATE")?;
+        target_conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)")?;
+        target_conn.execute("INSERT INTO t VALUES (1, 'x')")?;
+
+        let mut source_header = DatabaseHeader::default();
+        source_header.schema_cookie = 41.into();
+        source_header.user_version = 17.into();
+        source_header.application_id = 29.into();
+        let header_meta = VacuumDbHeaderMeta::from_source_header(&source_header);
+
+        match finalize_vacuum_target_header(&target_conn, &header_meta)? {
+            crate::IOResult::Done(()) => {}
+            crate::IOResult::IO(_) => panic!("MVCC header update should not need async I/O"),
+        }
+        target_conn.execute("COMMIT")?;
+        target_conn.checkpoint(crate::CheckpointMode::Truncate {
+            upper_bound_inclusive: None,
+        })?;
+
+        let pager = target_conn.pager.load();
+        let on_disk = pager.io.block(|| {
+            pager.with_header(|header| {
+                (
+                    header.schema_cookie.get(),
+                    header.user_version.get(),
+                    header.application_id.get(),
+                )
+            })
+        })?;
+        assert_eq!(on_disk, (42, 17, 29));
+
+        let schema_version = target_conn.pragma_query("schema_version")?;
+        assert_eq!(schema_version, vec![vec![crate::Value::from_i64(42)]]);
+
+        Ok(())
+    }
+
+    #[cfg(not(target_family = "wasm"))]
+    #[test]
     fn internal_vacuum_temp_db_uses_source_runtime_and_disables_auto_checkpoint() -> Result<()> {
         let io: Arc<dyn crate::IO> = Arc::new(crate::io::PlatformIO::new()?);
         let source_dir = tempfile::tempdir().unwrap();
@@ -3192,7 +3331,7 @@ mod tests {
             None,
             Arc::new(SqliteDialect),
         )?;
-        let source_conn = source_db.connect()?;
+        let source_conn = source_db.connect(ConnectOpts::new())?;
 
         let temp = open_vacuum_temp_db(&source_conn, &source_db, 4096, 0)?;
 
@@ -3228,7 +3367,7 @@ mod tests {
             }),
             Arc::new(SqliteDialect),
         )?;
-        let source_conn = source_db.connect_with_encryption(Some(key))?;
+        let source_conn = source_db.connect(ConnectOpts::new().with_encryption_key(Some(key)))?;
         let reserved_space = source_conn
             .get_reserved_bytes()
             .expect("encrypted source should have reserved bytes");
@@ -3261,7 +3400,7 @@ mod tests {
             None,
             Arc::new(SqliteDialect),
         )?;
-        let target_conn = target_db.connect()?;
+        let target_conn = target_db.connect(ConnectOpts::new())?;
         target_conn.execute("CREATE TABLE seed(x)")?;
 
         let mut context = VacuumTargetBuildContext::new(target_conn.clone());

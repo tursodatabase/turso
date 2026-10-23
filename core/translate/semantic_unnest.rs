@@ -40,7 +40,11 @@ pub(crate) fn unnest_correlated_subqueries(
     document: Arc<HirDocument>,
     schema: &Schema,
     params: &CostModelParams,
+    mode: crate::SubqueryUnnestingMode,
 ) -> Result<(Arc<HirDocument>, Vec<hir::Parameter>)> {
+    if mode == crate::SubqueryUnnestingMode::Disabled {
+        return Ok((document, Vec::new()));
+    }
     let candidates = queries_innermost_first(&document)
         .into_iter()
         .flat_map(|query| {
@@ -87,7 +91,8 @@ pub(crate) fn unnest_correlated_subqueries(
         // Equal work is better without one subquery call per outer row,
         // and a block with a FULL join whose correlated
         // subqueries all became joins always keeps that form.
-        if complete_full_join_rewrite(&rewritten, block)
+        if mode == crate::SubqueryUnnestingMode::Forced
+            || complete_full_join_rewrite(&rewritten, block)
             || matches!(
                 (original_cost, rewritten_cost),
                 (Some(original), Some(rewritten)) if rewritten <= original
@@ -937,6 +942,11 @@ fn try_semi_or_anti_join(
             {
                 return false;
             }
+            // A join can skip an inner row the subquery tests, and so hide
+            // an error that row's WHERE terms would raise.
+            if terms.iter().any(|term| hir_expr_can_fail(document, term)) {
+                return false;
+            }
         }
         Candidate::In {
             lhs, comparison, ..
@@ -974,9 +984,9 @@ fn try_semi_or_anti_join(
         }
         let sources = expression_sources(term);
         let reads_outer = sources.iter().any(|source| *source != inner_source);
-        // A term that reads the outer row must be an `=` between the inner
-        // source and outer sources.
-        if reads_outer && !is_inner_outer_equality(term, inner_source) {
+        // A term that reads the outer row must be a comparison between
+        // the inner source and outer sources.
+        if reads_outer && !is_inner_outer_comparison(term, inner_source) {
             return false;
         }
         // Every NOT EXISTS term must read the inner source. Moving a
@@ -1041,12 +1051,12 @@ fn push_join_before_semi_anti(from: &mut hir::From, join: hir::Join) {
     from.joins.insert(first_semi_anti, join);
 }
 
-/// Whether one side of an `=` reads only the inner source and the other
-/// only outer sources.
-fn is_inner_outer_equality(expression: &hir::Expr, inner_source: SourceId) -> bool {
+/// Whether one side of a comparison reads only the inner source and the
+/// other only outer sources.
+fn is_inner_outer_comparison(expression: &hir::Expr, inner_source: SourceId) -> bool {
     let hir::Expr::Binary {
         lhs,
-        operator: Operator::Equals,
+        operator,
         rhs,
         custom: None,
         ..
@@ -1054,6 +1064,9 @@ fn is_inner_outer_equality(expression: &hir::Expr, inner_source: SourceId) -> bo
     else {
         return false;
     };
+    if !operator.is_comparison() {
+        return false;
+    }
     let side = |expression: &hir::Expr| {
         let sources = expression_sources(expression);
         if sources.is_empty() {

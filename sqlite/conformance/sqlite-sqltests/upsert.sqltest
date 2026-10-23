@@ -654,6 +654,104 @@ test upsert-unique-update-rowid-change-preserves-unique {
 expect error {
 }
 
+@cross-check-integrity
+test upsert-set-rowid-name-on-rowid-alias-table {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, k UNIQUE, v);
+    INSERT INTO t VALUES (1, 'a', 1);
+    INSERT INTO t VALUES (2, 'a', 2) ON CONFLICT(k) DO UPDATE SET rowid = 10, v = excluded.v;
+    INSERT INTO t VALUES (3, 'a', 3) ON CONFLICT(k) DO UPDATE SET oid = 20;
+    INSERT INTO t VALUES (4, 'a', 4) ON CONFLICT(k) DO UPDATE SET _rowid_ = 7;
+    SELECT * FROM t;
+}
+expect {
+    7|a|2
+}
+
+@cross-check-integrity
+test upsert-set-rowid-name-without-rowid-alias {
+    CREATE TABLE t(k UNIQUE, v);
+    CREATE INDEX t_v ON t(v);
+    INSERT INTO t VALUES ('a', 1), ('b', 2);
+    INSERT INTO t VALUES ('a', 3) ON CONFLICT(k) DO UPDATE SET rowid = 10, v = excluded.v;
+    INSERT INTO t VALUES ('b', 4) ON CONFLICT(k) DO UPDATE SET oid = oid + 20;
+    INSERT INTO t VALUES ('a', 5) ON CONFLICT(k) DO UPDATE SET (_rowid_, v) = (30, 6);
+    SELECT rowid, * FROM t ORDER BY rowid;
+    SELECT rowid, v FROM t WHERE v > 0 ORDER BY v;
+}
+expect {
+    22|b|2
+    30|a|6
+    22|2
+    30|6
+}
+
+@cross-check-integrity
+test upsert-set-rowid-without-rowid-alias-to-existing-rowid {
+    CREATE TABLE t(k UNIQUE, v);
+    INSERT INTO t VALUES ('a', 1), ('b', 2);
+    INSERT INTO t VALUES ('a', 3) ON CONFLICT(k) DO UPDATE SET rowid = 2;
+}
+expect error {
+    UNIQUE constraint failed: t.rowid
+}
+
+@cross-check-integrity
+test upsert-set-rowid-without-rowid-alias-must-be-integer {
+    CREATE TABLE t(k UNIQUE, v);
+    INSERT INTO t VALUES ('a', 1);
+    INSERT INTO t VALUES ('a', 3) ON CONFLICT(k) DO UPDATE SET rowid = 'x';
+}
+expect error {
+    datatype mismatch
+}
+
+@cross-check-integrity
+test upsert-set-rowid-fires-update-of-rowid-triggers {
+    CREATE TABLE t(k UNIQUE, v);
+    CREATE TABLE log(x);
+    CREATE TRIGGER tb BEFORE UPDATE OF rowid ON t BEGIN
+        INSERT INTO log VALUES ('before ' || old.rowid || '->' || new.rowid);
+    END;
+    CREATE TRIGGER ta AFTER UPDATE OF rowid ON t BEGIN
+        INSERT INTO log VALUES ('after ' || old.rowid || '->' || new.rowid);
+    END;
+    CREATE TRIGGER tv AFTER UPDATE OF v ON t BEGIN
+        INSERT INTO log VALUES ('v changed');
+    END;
+    INSERT INTO t VALUES ('a', 1);
+    INSERT INTO t VALUES ('a', 2) ON CONFLICT(k) DO UPDATE SET rowid = 8;
+    SELECT x FROM log ORDER BY rowid;
+    SELECT rowid, * FROM t;
+}
+expect {
+    before 1->8
+    after 1->8
+    8|a|1
+}
+
+@cross-check-integrity
+test upsert-set-rowid-fires-update-of-rowid-triggers-with-rowid-alias {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, k UNIQUE, v);
+    CREATE TABLE log(x);
+    CREATE TRIGGER tr AFTER UPDATE OF rowid ON t BEGIN
+        INSERT INTO log VALUES ('rowid ' || old.rowid || '->' || new.rowid);
+    END;
+    CREATE TRIGGER tr_id AFTER UPDATE OF id ON t BEGIN
+        INSERT INTO log VALUES ('id ' || old.id || '->' || new.id);
+    END;
+    INSERT INTO t VALUES (1, 'a', 1);
+    INSERT INTO t VALUES (2, 'a', 2) ON CONFLICT(k) DO UPDATE SET rowid = 5;
+    INSERT INTO t VALUES (3, 'a', 3) ON CONFLICT(k) DO UPDATE SET id = 6;
+    INSERT INTO t VALUES (4, 'a', 4) ON CONFLICT(k) DO UPDATE SET oid = 7;
+    SELECT x FROM log ORDER BY rowid;
+    SELECT * FROM t;
+}
+expect {
+    rowid 1->5
+    id 5->6
+    7|a|1
+}
+
 # Referencing a table other than the target or EXCLUDED in UPSERT DO UPDATE
 # should produce a graceful error, not a panic.
 # https://github.com/tursodatabase/turso/issues/5281
@@ -885,4 +983,47 @@ test upsert-conflict-target-nulls-first-rejected {
 }
 expect error {
     NULLS
+}
+
+@cross-check-integrity
+test upsert-before-update-trigger-index-delete {
+    CREATE TABLE t(a INTEGER PRIMARY KEY, c INTEGER);
+    CREATE INDEX i ON t(c);
+    INSERT INTO t VALUES(1,1);
+    CREATE TRIGGER tg BEFORE UPDATE ON t BEGIN
+        UPDATE t SET c=c+1 WHERE a=NEW.a;
+    END;
+    INSERT INTO t VALUES(1,9) ON CONFLICT(a) DO UPDATE SET c=c+5;
+    SELECT count(*), group_concat(c) FROM (SELECT c FROM t WHERE c>0 ORDER BY c);
+    PRAGMA integrity_check;
+    DELETE FROM t WHERE a=1;
+    SELECT count(*) FROM t WHERE c>0;
+    PRAGMA integrity_check;
+}
+expect {
+    1|6
+    ok
+    0
+    ok
+}
+
+@cross-check-integrity
+test upsert-before-update-trigger-changes-non-set-column {
+    -- The trigger changes c, which is not in the SET list. The final row
+    -- must keep the trigger's c value; only b gets the SET value.
+    CREATE TABLE t(a INTEGER PRIMARY KEY, b INTEGER, c INTEGER);
+    CREATE INDEX i ON t(c);
+    INSERT INTO t VALUES(1,1,1);
+    CREATE TRIGGER tg BEFORE UPDATE ON t BEGIN
+        UPDATE t SET c=c+10 WHERE a=NEW.a;
+    END;
+    INSERT INTO t VALUES(1,9,9) ON CONFLICT(a) DO UPDATE SET b=b+5;
+    SELECT a, b, c FROM t;
+    SELECT c FROM t WHERE c>0 ORDER BY c;
+    PRAGMA integrity_check;
+}
+expect {
+    1|6|11
+    11
+    ok
 }

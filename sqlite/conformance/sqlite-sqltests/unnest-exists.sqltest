@@ -981,3 +981,27 @@ expect {
     2|20
     3|30
 }
+
+test not-exists-equalities-do-not-imply-an-outer-equality {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, f TEXT UNIQUE);
+    INSERT INTO t VALUES (1, 'a'), (2, 'b');
+
+    SELECT a.id, c.id
+      FROM t AS a
+      JOIN t AS b ON a.f = b.f
+      JOIN t AS c
+     WHERE NOT EXISTS (SELECT 1 FROM t AS d WHERE d.f = a.f AND d.f = c.f)
+     ORDER BY 1, 2;
+    SELECT a.id, c.id
+      FROM t AS a
+      JOIN t AS b ON a.f = b.f
+      JOIN t AS c
+     WHERE EXISTS (SELECT 1 FROM t AS d WHERE d.f = a.f AND d.f = c.f)
+     ORDER BY 1, 2;
+}
+expect {
+    1|2
+    2|1
+    1|1
+    2|2
+}

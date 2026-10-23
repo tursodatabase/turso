@@ -17,54 +17,54 @@ QUERY PLAN
 `--USE SORTER FOR GROUP BY
 
 BYTECODE
-addr  opcode                p1  p2  p3  p4                p5  comment
-   0        Init             0  48   0                     0  Start at 48
-   1        Null             0   1   0                     0  r[1]=NULL
-   2        Null             0   2   0                     0  r[2]=NULL
-   3        SorterOpen       0   2   0  k(1,B)             0  cursor=0
-   4        Integer          0  20   0                     0  r[20]=0
-   5        Null             0  21   0                     0  r[21]=NULL
-   6        Gosub           19  43   0                     0
-   7        OpenRead         2   2   0  k(6,B,B,B,B,B,B)   0  table=products, root=2, iDb=0
-   8        Rewind           2  14   0                     0  Rewind table products
-   9          ColumnRange    2   3  16  2                  0  r[16..17]=products.category..price
-  10          RealAffinity  17   0   0                     0
-  11          MakeRecord    16   2  15                     0  r[15]=mkrec(r[16..17])
-  12          SorterInsert   0  15   0  0                  0  key=r[15]
-  13        Next             2   9   0                     1
-  14        OpenPseudo       1  15   2                     0  2 columns in r[15]
-  15        SorterSort       0  32   0                     0
-  16          SorterData     0  15   1                     0  r[15]=data
-  17          Column         1   0  22                     0  r[22]=pseudo.column 0
-  18          Column         1   1   7                     0  r[7]=pseudo.column 1
-  19          Compare       21  22   1  k(1, Binary)       0  r[21..21]==r[22..22]
-  20          Jump          21  24  21                     0
-  21          Gosub         18  34   0                     0
-  22          Move          22  21   1                     0  r[21..21]=r[22..22]
-  23          Gosub         19  43   0                     0
-  24          Integer        1  23   0                     0  r[23]=1
-  25          AggStep        0  23   1  count              0  accum=r[1] step(r[23])
-  26          Copy           7  24   0                     0  r[24]=r[7]
-  27          AggStep        0  24   2  avg                0  accum=r[2] step(r[24])
-  28          If            20  30   0                     0  if r[20] goto 30
-  29          Copy           7  13   0                     0  r[13]=r[7]
-  30          Integer        1  20   0                     0  r[20]=1
-  31        SorterNext       0  16   0                     0
-  32        Gosub           18  34   0                     0
-  33        Goto             0  47   0                     0
-  34        IfPos           20  36   0                     0  r[20]>0 -> r[20]-=0, goto 36
-  35      Return            18   0   0                     0
-  36      AggFinal           0   1   0  count              0  accum=r[1]
-  37      AggFinal           0   2   0  avg                0  accum=r[2]
-  38      Copy              21  25   0                     0  r[25]=r[21]
-  39      Copy               1  26   0                     0  r[26]=r[1]
-  40      Copy               2  27   0                     0  r[27]=r[2]
-  41      ResultRow         25   3   0                     0  output=r[25..27]
-  42    Return              18   0   0                     0
-  43    Null                 0   1   0                     0  r[1]=NULL
-  44    Null                 0   2   0                     0  r[2]=NULL
-  45    Integer              0  20   0                     0  r[20]=0
-  46  Return                19   0   0                     0
-  47  Halt                   0   0   0                     0
-  48  Transaction            0   1   5                     0  iDb=0 tx_mode=Read
-  49  Goto                   0   1   0                     0
+addr  opcode          p1  p2  p3  p4                p5  comment
+   0  Init             0  48   0                     0  Start at 48
+   1  Null             0   1   0                     0  r[1]=NULL
+   2  Null             0   2   0                     0  r[2]=NULL
+   3  SorterOpen       0   2   0  k(1,B)             0  cursor=0
+   4  Integer          0  20   0                     0  r[20]=0
+   5  Null             0  21   0                     0  r[21]=NULL
+   6  Gosub           19  43   0                     0
+   7  OpenRead         2   2   0  k(6,B,B,B,B,B,B)   0  table=products, root=2, iDb=0
+   8  Rewind           2  14   0                     0  Rewind table products
+   9    ColumnRange    2   3  16  2                  0  r[16..17]=products.category..price
+  10    RealAffinity  17   0   0                     0
+  11    MakeRecord    16   2  15                     0  r[15]=mkrec(r[16..17])
+  12    SorterInsert   0  15   0  0                  0  key=r[15]
+  13  Next             2   9   0                     1
+  14  OpenPseudo       1  15   2                     0  2 columns in r[15]
+  15  SorterSort       0  32   0                     0
+  16    SorterData     0  15   1                     0  r[15]=data
+  17    Column         1   0  22                     0  r[22]=pseudo.column 0
+  18    Column         1   1   7                     0  r[7]=pseudo.column 1
+  19    Compare       21  22   1  k(1, Binary)       0  r[21..21]==r[22..22]
+  20    Jump          21  24  21                     0
+  21    Gosub         18  34   0                     0
+  22    Move          22  21   1                     0  r[21..21]=r[22..22]
+  23    Gosub         19  43   0                     0
+  24    Integer        1  23   0                     0  r[23]=1
+  25    AggStep        0  23   1  count              0  accum=r[1] step(r[23])
+  26    Copy           7  24   0                     0  r[24]=r[7]
+  27    AggStep        0  24   2  avg                0  accum=r[2] step(r[24])
+  28    If            20  30   0                     0  if r[20] goto 30
+  29    Copy           7  13   0                     0  r[13]=r[7]
+  30    Integer        1  20   0                     0  r[20]=1
+  31  SorterNext       0  16   0                     0
+  32  Gosub           18  34   0                     0
+  33  Goto             0  47   0                     0
+  34  IfPos           20  36   0                     0  r[20]>0 -> r[20]-=0, goto 36
+  35  Return          18   0   0                     0
+  36  AggFinal         0   1   0  count              0  accum=r[1]
+  37  AggFinal         0   2   0  avg                0  accum=r[2]
+  38  Copy            21  25   0                     0  r[25]=r[21]
+  39  Copy             1  26   0                     0  r[26]=r[1]
+  40  Copy             2  27   0                     0  r[27]=r[2]
+  41  ResultRow       25   3   0                     0  output=r[25..27]
+  42  Return          18   0   0                     0
+  43  Null             0   1   0                     0  r[1]=NULL
+  44  Null             0   2   0                     0  r[2]=NULL
+  45  Integer          0  20   0                     0  r[20]=0
+  46  Return          19   0   0                     0
+  47  Halt             0   0   0                     0
+  48  Transaction      0   1   5                     0  iDb=0 tx_mode=Read
+  49  Goto             0   1   0                     0

@@ -2,33 +2,33 @@
 
 # Things that do work:
 test empty-table {
-    CREATE TABLE temp (a integer);
-    ANALYZE temp;
+    CREATE TABLE tbl (a integer);
+    ANALYZE tbl;
     SELECT * FROM sqlite_stat1;
 }
 expect {
 }
 
 test one-row-table {
-    CREATE TABLE temp (a integer);
-    INSERT INTO temp VALUES (1);
-    ANALYZE temp;
+    CREATE TABLE tbl (a integer);
+    INSERT INTO tbl VALUES (1);
+    ANALYZE tbl;
     SELECT * FROM sqlite_stat1;
 }
 expect {
-    temp||1
+    tbl||1
 }
 
 test analyze-overwrites {
-    CREATE TABLE temp (a integer);
-    INSERT INTO temp VALUES (1);
-    ANALYZE temp;
-    INSERT INTO temp VALUES (2);
-    ANALYZE temp;
+    CREATE TABLE tbl (a integer);
+    INSERT INTO tbl VALUES (1);
+    ANALYZE tbl;
+    INSERT INTO tbl VALUES (2);
+    ANALYZE tbl;
     SELECT * FROM sqlite_stat1;
 }
 expect {
-    temp||2
+    tbl||2
 }
 
 test analyze-all {
@@ -42,13 +42,13 @@ expect {
 }
 
 test analyze-table-with-pk {
-    CREATE TABLE temp (a integer primary key);
-    INSERT INTO temp VALUES (1);
-    ANALYZE temp;
+    CREATE TABLE tbl (a integer primary key);
+    INSERT INTO tbl VALUES (1);
+    ANALYZE tbl;
     SELECT * FROM sqlite_stat1;
 }
 expect {
-    temp||1
+    tbl||1
 }
 
 test analyze-one-database {
@@ -128,8 +128,8 @@ expect {
 
 # Things that don't work:
 test analyze-table-without-rowid-fails {
-    CREATE TABLE temp (a integer primary key) WITHOUT ROWID;
-    ANALYZE temp;
+    CREATE TABLE tbl (a integer primary key) WITHOUT ROWID;
+    ANALYZE tbl;
 }
 expect error {
     Parse error: ANALYZE on tables without rowid is not supported

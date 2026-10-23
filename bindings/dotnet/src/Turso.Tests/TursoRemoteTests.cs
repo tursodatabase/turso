@@ -1,3 +1,5 @@
+using System.Data;
+using System.Data.Common;
 using System.Net;
 using System.Net.Sockets;
 using System.Text;
@@ -27,14 +29,13 @@ public class TursoRemoteTests
     }
 
     [Test]
-    public void TestRemoteReplicaFailsBeforeNetworkAccess()
+    public void TestRemoteReplicaConnectionStringIsRecognized()
     {
-        using var connection = new TursoConnection(
+        var options = TursoConnectionOptions.Parse(
             "Data Source=libsql://example.turso.io;Auth Token=secret;Replica Path=replica.db");
 
-        connection.Invoking(x => x.Open())
-            .Should().Throw<NotSupportedException>()
-            .WithMessage("Embedded replica connections are not supported yet by the .NET provider.*");
+        options.IsReplica.Should().BeTrue();
+        options.ReplicaPath.Should().Be("replica.db");
     }
 
     [Test]
@@ -76,13 +77,13 @@ public class TursoRemoteTests
     }
 
     [Test]
-    public void TestCanCreateBatchIsRemoteOnly()
+    public void TestCanCreateBatchRejectsLocalConnections()
     {
         using var localConnection = new TursoConnection("Data Source=:memory:");
         localConnection.CanCreateBatch.Should().BeFalse();
         localConnection.Invoking(x => x.CreateBatch())
             .Should().Throw<NotSupportedException>()
-            .WithMessage("Turso batch execution is currently supported only for remote connections.");
+            .WithMessage("Turso batch execution requires a direct remote or embedded replica connection.");
 
         using var remoteConnection = new TursoConnection("Data Source=https://example.com");
         remoteConnection.CanCreateBatch.Should().BeTrue();
@@ -143,8 +144,12 @@ public class TursoRemoteTests
         connection.Open();
 
         using var command = (TursoCommand)connection.CreateCommand();
-        command.CommandText = "SELECT ?, :name";
+        var guid = Guid.Parse("00112233-4455-6677-8899-aabbccddeeff");
+        command.CommandText = "SELECT ?, ?, ?, ?, :name";
         command.Parameters.Add(42);
+        command.Parameters.Add(guid);
+        command.Parameters.Add(DBNull.Value);
+        command.Parameters.Add(new byte[] { 1, 2, 3 });
         command.Parameters.AddWithValue(":name", "alice");
 
         using var reader = command.ExecuteReader();
@@ -161,9 +166,21 @@ public class TursoRemoteTests
         var requests = document.RootElement.GetProperty("requests");
         requests.GetArrayLength().Should().Be(2);
         requests[0].GetProperty("type").GetString().Should().Be("execute");
-        requests[0].GetProperty("stmt").GetProperty("sql").GetString().Should().Be("SELECT ?, :name");
-        requests[0].GetProperty("stmt").GetProperty("args")[0].GetProperty("value").GetString().Should().Be("42");
-        requests[0].GetProperty("stmt").GetProperty("named_args")[0].GetProperty("name").GetString().Should().Be(":name");
+        var statement = requests[0].GetProperty("stmt");
+        statement.GetProperty("sql").GetString().Should().Be("SELECT ?, ?, ?, ?, :name");
+        var args = statement.GetProperty("args");
+        args[0].GetProperty("value").GetString().Should().Be("42");
+        args[0].TryGetProperty("base64", out _).Should().BeFalse();
+        args[1].GetProperty("type").GetString().Should().Be("text");
+        args[1].GetProperty("value").GetString().Should().Be(guid.ToString());
+        args[1].TryGetProperty("base64", out _).Should().BeFalse();
+        args[2].GetProperty("type").GetString().Should().Be("null");
+        args[2].TryGetProperty("value", out _).Should().BeFalse();
+        args[2].TryGetProperty("base64", out _).Should().BeFalse();
+        args[3].GetProperty("type").GetString().Should().Be("blob");
+        args[3].GetProperty("base64").GetString().Should().Be("AQID");
+        args[3].TryGetProperty("value", out _).Should().BeFalse();
+        statement.GetProperty("named_args")[0].GetProperty("name").GetString().Should().Be(":name");
         requests[1].GetProperty("type").GetString().Should().Be("close");
     }
 
@@ -260,7 +277,7 @@ public class TursoRemoteTests
         reader.GetFieldType(0).Should().Be(typeof(string));
         reader.Read().Should().BeTrue();
         reader.IsDBNull(0).Should().BeTrue();
-        reader.GetFieldType(0).Should().Be(typeof(DBNull));
+        reader.GetFieldType(0).Should().Be(typeof(string));
         reader.GetValue(0).Should().Be(DBNull.Value);
         reader.Invoking(x => x.GetString(0))
             .Should().Throw<InvalidCastException>()
@@ -268,6 +285,101 @@ public class TursoRemoteTests
         reader.Invoking(x => x.GetDateTime(0))
             .Should().Throw<InvalidCastException>()
             .WithMessage("Cannot convert remote null value to DateTime.");
+    }
+
+    [Test]
+    public void TestRemoteReaderExposesStableSchemaGuidsAndRawValues()
+    {
+        var guid = Guid.Parse("00112233-4455-6677-8899-aabbccddeeff");
+        var binaryGuid = Convert.ToBase64String(guid.ToByteArray());
+        var utf8Guid = Convert.ToBase64String(Encoding.UTF8.GetBytes(guid.ToString()));
+        var responseJson = $$"""
+            {
+              "results": [
+                {
+                  "type": "ok",
+                  "response": {
+                    "type": "execute",
+                    "result": {
+                      "cols": [
+                        { "name": "id", "decltype": "INTEGER" },
+                        { "name": "name" },
+                        { "name": "guid_text", "decltype": "GUID" },
+                        { "name": "guid_binary", "decltype": "GUID" },
+                        { "name": "guid_utf8", "decltype": "GUID" }
+                      ],
+                      "rows": [
+                        [
+                          { "type": "null" },
+                          { "type": "null" },
+                          { "type": "null" },
+                          { "type": "null" },
+                          { "type": "null" }
+                        ],
+                        [
+                          { "type": "integer", "value": "42" },
+                          { "type": "text", "value": "alice" },
+                          { "type": "text", "value": "{{guid}}" },
+                          { "type": "blob", "base64": "{{binaryGuid}}" },
+                          { "type": "blob", "base64": "{{utf8Guid}}" }
+                        ]
+                      ],
+                      "affected_row_count": 0
+                    }
+                  }
+                },
+                {
+                  "type": "ok",
+                  "response": { "type": "close" }
+                }
+              ]
+            }
+            """;
+
+        using var server = new TestRemoteServer(responseJson, responseJson);
+        using var connection = new TursoConnection($"Data Source={server.Url};Read Your Writes=False");
+        connection.Open();
+
+        using (var command = new TursoCommand(connection, "SELECT id, name, guid_text, guid_binary, guid_utf8 FROM values_table"))
+        using (var reader = command.ExecuteReader())
+        {
+            reader.GetFieldType(0).Should().Be(typeof(long));
+            reader.GetFieldType(1).Should().Be(typeof(string));
+            reader.GetFieldType(2).Should().Be(typeof(string));
+            reader.GetFieldType(3).Should().Be(typeof(byte[]));
+            reader.GetDataTypeName(1).Should().Be("TEXT");
+            reader.GetDataTypeName(2).Should().Be("GUID");
+
+            var schema = reader.GetSchemaTable();
+            schema!.Rows[0][SchemaTableColumn.DataType].Should().Be(typeof(long));
+            schema.Rows[0][SchemaTableColumn.ProviderType].Should().Be((int)DbType.Int64);
+            schema.Rows[3][SchemaTableColumn.DataType].Should().Be(typeof(byte[]));
+
+            reader.Read().Should().BeTrue();
+            reader.GetFieldType(1).Should().Be(typeof(string));
+            reader.GetValue(0).Should().Be(DBNull.Value);
+            reader.GetValue(1).Should().Be(DBNull.Value);
+
+            reader.Read().Should().BeTrue();
+            reader.GetValue(0).Should().BeOfType<long>().Which.Should().Be(42);
+            reader.GetValue(1).Should().BeOfType<string>().Which.Should().Be("alice");
+            reader.GetValue(2).Should().BeOfType<string>().Which.Should().Be(guid.ToString());
+            reader.GetValue(3).Should().BeOfType<byte[]>();
+            reader.GetValue(4).Should().BeOfType<byte[]>();
+            reader.GetGuid(2).Should().Be(guid);
+            reader.GetGuid(3).Should().Be(guid);
+            reader.GetGuid(4).Should().Be(guid);
+        }
+
+        using var loadCommand = new TursoCommand(connection, "SELECT id, name, guid_text, guid_binary, guid_utf8 FROM values_table");
+        using var loadReader = loadCommand.ExecuteReader();
+        var table = new DataTable();
+        table.Load(loadReader);
+        table.Rows.Count.Should().Be(2);
+        table.Columns["id"]!.DataType.Should().Be(typeof(long));
+        table.Columns["name"]!.DataType.Should().Be(typeof(string));
+        table.Columns["guid_text"]!.DataType.Should().Be(typeof(string));
+        table.Columns["guid_binary"]!.DataType.Should().Be(typeof(byte[]));
     }
 
     [Test]
@@ -1169,6 +1281,131 @@ public class TursoRemoteTests
         batch.Invoking(x => x.ExecuteNonQuery())
             .Should().Throw<TursoException>()
             .WithMessage("Remote batch returned an unexpected result shape: 1 results, 0 errors, expected 1.");
+    }
+
+    [Test]
+    public async Task TestPartiallyEvaluatedExpiredBatchIsNotRetried()
+    {
+        const string expiredBatchJson = """
+            {
+              "baton": "stale",
+              "results": [{
+                "type": "ok",
+                "response": {
+                  "type": "batch",
+                  "result": {
+                    "step_results": [
+                      { "cols": [], "rows": [], "affected_row_count": 1 },
+                      null
+                    ],
+                    "step_errors": [
+                      null,
+                      { "message": "stream expired", "code": "STREAM_EXPIRED" }
+                    ]
+                  }
+                }
+              }]
+            }
+            """;
+        const string executeJson = """
+            {
+              "baton": "fresh",
+              "results": [{
+                "type": "ok",
+                "response": {
+                  "type": "execute",
+                  "result": {
+                    "cols": [{ "name": "value", "decltype": "INTEGER" }],
+                    "rows": [[{ "type": "integer", "value": "2" }]],
+                    "affected_row_count": 0
+                  }
+                }
+              }]
+            }
+            """;
+        const string closeJson = """
+            {
+              "results": [{
+                "type": "ok",
+                "response": { "type": "close" }
+              }]
+            }
+            """;
+
+        using var server = new TestRemoteServer(expiredBatchJson, executeJson, closeJson);
+        using var connection = new TursoConnection($"Data Source={server.Url};Read Your Writes=True");
+        connection.Open();
+        await using var batch = (TursoBatch)connection.CreateBatch();
+        batch.BatchCommands.Add(new TursoBatchCommand("INSERT INTO items VALUES (1)"));
+        batch.BatchCommands.Add(new TursoBatchCommand("INSERT INTO items VALUES (2)"));
+
+        var batchAction = async () => await batch.ExecuteNonQueryAsync(CancellationToken.None);
+
+        await batchAction.Should().ThrowAsync<TursoException>()
+            .WithMessage("Remote SQL execution failed: stream expired (STREAM_EXPIRED)");
+        using var command = new TursoCommand(connection, "SELECT 2");
+        (await command.ExecuteScalarAsync()).Should().Be(2L);
+        server.RequestBodies.Should().HaveCount(2);
+        using var nextRequest = JsonDocument.Parse(server.RequestBodies[1]);
+        nextRequest.RootElement.TryGetProperty("baton", out _).Should().BeFalse();
+    }
+
+    [Test]
+    public async Task TestExpiredBatchClosesAnActiveRemoteTransaction()
+    {
+        const string beginJson = """
+            {
+              "baton": "transaction",
+              "results": [{
+                "type": "ok",
+                "response": {
+                  "type": "execute",
+                  "result": {
+                    "cols": [],
+                    "rows": [],
+                    "affected_row_count": 0
+                  }
+                }
+              }]
+            }
+            """;
+        const string expiredBatchJson = """
+            {
+              "baton": "stale",
+              "results": [{
+                "type": "ok",
+                "response": {
+                  "type": "batch",
+                  "result": {
+                    "step_results": [
+                      { "cols": [], "rows": [], "affected_row_count": 1 },
+                      null
+                    ],
+                    "step_errors": [
+                      null,
+                      { "message": "stream expired", "code": "STREAM_EXPIRED" }
+                    ]
+                  }
+                }
+              }]
+            }
+            """;
+
+        using var server = new TestRemoteServer(beginJson, expiredBatchJson);
+        using var connection = new TursoConnection($"Data Source={server.Url};Read Your Writes=True");
+        connection.Open();
+        using var transaction = connection.BeginTransaction();
+        await using var batch = (TursoBatch)connection.CreateBatch();
+        batch.Transaction = transaction;
+        batch.BatchCommands.Add(new TursoBatchCommand("INSERT INTO items VALUES (1)"));
+        batch.BatchCommands.Add(new TursoBatchCommand("INSERT INTO items VALUES (2)"));
+
+        var batchAction = async () => await batch.ExecuteNonQueryAsync(CancellationToken.None);
+
+        await batchAction.Should().ThrowAsync<TursoException>()
+            .WithMessage("Remote SQL execution failed: stream expired (STREAM_EXPIRED)");
+        connection.State.Should().Be(System.Data.ConnectionState.Closed);
+        server.RequestBodies.Should().HaveCount(2);
     }
 
     [Test]

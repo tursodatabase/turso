@@ -7,11 +7,12 @@
 //! FROM clause, collects its rows first. An UPDATE of a virtual table hands
 //! each row to the table with `VUpdate`.
 
+use crate::alloc::TursoIteratorExt;
 use std::num::NonZeroUsize;
 
 use turso_parser::ast::{ResolveType, TriggerTime};
 
-use super::emit::{any_effective_replace, constraint_may_abort, halt_desc_and_on_error};
+use super::emit::{any_effective_replace, constraint_may_abort};
 use crate::{
     error::{SQLITE_CONSTRAINT_NOTNULL, SQLITE_CONSTRAINT_PRIMARYKEY, SQLITE_CONSTRAINT_UNIQUE},
     schema::{Column, EXPR_INDEX_SENTINEL},
@@ -68,12 +69,11 @@ pub(super) fn check(plan: &HirPlan, update: &hir::Update, access: &HirAccessPlan
             "HIR UPDATE target is not a table".into(),
         ));
     };
-    let Some(table) = table.value().btree() else {
+    if table.value().btree().is_none() {
         return Err(LimboError::InternalError(
             "HIR UPDATE target has no B-tree".into(),
         ));
-    };
-    super::dml::check_strict_types(&table, source)?;
+    }
     if update.from.is_some() {
         // UPDATE ... FROM fills a scratch table during the join, so no loop
         // reads a table it changes. RETURNING reads only the updated row.
@@ -245,8 +245,13 @@ pub(super) fn emit_update(
         changed_indexes.push((old, new));
     }
 
-    // Whether the statement needs a statement journal.
-    let has_foreign_keys = !foreign_keys.incoming.is_empty() || !foreign_keys.outgoing.is_empty();
+    // Whether the statement needs a statement journal. A table with any
+    // foreign key counts, even one this UPDATE leaves alone. The UPDATE of
+    // the schema table that ALTER TABLE generates is one part of a DDL
+    // program that goes on after it, writes the header and stops early
+    // when another transaction holds the schema; that program keeps its
+    // journal, so an abandoned one rolls back only itself.
+    let has_foreign_keys = foreign_keys.table_has_foreign_keys;
     let replaces = any_effective_replace(
         has_statement_conflict,
         or_conflict,
@@ -255,23 +260,34 @@ pub(super) fn emit_update(
             .iter()
             .map(|(old, _)| old.index.value().on_conflict),
     );
-    if triggers.is_empty()
+    if schema_change.is_none()
+        && triggers.is_empty()
         && !has_foreign_keys
         && !replaces
         && single_loop.is_some_and(|(_, operation)| operation.is_some_and(touches_at_most_one_row))
     {
         program.set_multi_write(false);
     }
-    let has_notnull = values
+    // Every column the UPDATE affects counts: a NOT NULL generated column
+    // computed from a SET column can fail the statement too. A new rowid
+    // must be an integer that no other row has, so setting the rowid or
+    // the INTEGER PRIMARY KEY can fail like a UNIQUE constraint.
+    let affected = table.columns_affected_by_update(assigned_positions(table, &assigned))?;
+    let has_notnull = table
+        .columns()
         .iter()
-        .zip(table.columns())
-        .any(|(value, column)| value.is_some() && column.notnull() && !column.is_rowid_alias());
-    let has_unique = !table.unique_sets.is_empty()
+        .enumerate()
+        .any(|(position, column)| {
+            affected.get(position) && column.notnull() && !column.is_rowid_alias()
+        });
+    let has_unique = rowid_value.is_some()
+        || !table.unique_sets.is_empty()
         || changed_indexes
             .iter()
             .any(|(old, _)| old.index.value().unique);
     program.set_may_abort(
-        !triggers.is_empty()
+        schema_change.is_some()
+            || !triggers.is_empty()
             || has_foreign_keys
             || constraint_may_abort(
                 has_statement_conflict,
@@ -287,18 +303,14 @@ pub(super) fn emit_update(
             ),
     );
 
-    match single_loop {
-        Some((planned_loop, _)) => program.emit_source_explain(
-            target.source.id,
-            hir_loop_explain(document, None, &[], planned_loop)?,
-        ),
-        None => {
-            for planned_loop in &access.loops {
-                program.emit_source_explain(
-                    planned_loop.source,
-                    hir_loop_explain(document, update.from.as_ref(), &[], planned_loop)?,
-                );
-            }
+    // A single loop's plan node follows the opening of the table it
+    // writes, as on the legacy path.
+    if single_loop.is_none() {
+        for planned_loop in &access.loops {
+            program.emit_source_explain(
+                planned_loop.source,
+                hir_loop_explain(document, update.from.as_ref(), &[], planned_loop)?,
+            );
         }
     }
     let returning = ReturningBuffer::open(program, table, update.returning.as_ref());
@@ -356,7 +368,7 @@ pub(super) fn emit_update(
             let table = crate::sync::Arc::new(crate::schema::BTreeTable::new(
                 0,
                 "update_from_scratch".to_string(),
-                Vec::new(),
+                crate::alloc::vec![],
                 (0..width)
                     // BLOB affinity keeps the values as computed; the
                     // column's affinity is applied when the row is built.
@@ -371,11 +383,11 @@ pub(super) fn emit_update(
                             crate::schema::ColDef::default(),
                         )
                     })
-                    .collect(),
+                    .collect_vec(),
                 crate::schema::BTreeCharacteristics::HAS_ROWID,
-                Vec::new(),
-                Vec::new(),
-                Vec::new(),
+                crate::alloc::vec![],
+                crate::alloc::vec![],
+                crate::alloc::vec![],
                 None,
             ));
             Ok(program.alloc_cursor_id(CursorType::BTreeTable(table)))
@@ -454,7 +466,13 @@ pub(super) fn emit_update(
         {
             emit_scan_update(program, &target, access, operation, &row_layout, row, done)?
         }
-        Some(_) => emit_rowset_update(program, plan, &target, access, &row_layout, row, done)?,
+        Some((planned_loop, _)) => {
+            program.emit_source_explain(
+                target.source.id,
+                hir_loop_explain(document, None, &[], planned_loop)?,
+            );
+            emit_rowset_update(program, plan, &target, access, &row_layout, row, done)?
+        }
     }
     program.preassign_label_to_next_insn(done);
     target.emit_capture_commit(program)?;
@@ -515,7 +533,7 @@ fn emit_virtual_update(
         let table = crate::sync::Arc::new(crate::schema::BTreeTable::new(
             0,
             "update_from_scratch".to_string(),
-            Vec::new(),
+            crate::alloc::vec![],
             (0..columns + 2)
                 .map(|column| {
                     crate::schema::Column::new(
@@ -528,11 +546,11 @@ fn emit_virtual_update(
                         crate::schema::ColDef::default(),
                     )
                 })
-                .collect(),
+                .collect_vec(),
             crate::schema::BTreeCharacteristics::HAS_ROWID,
-            Vec::new(),
-            Vec::new(),
-            Vec::new(),
+            crate::alloc::vec![],
+            crate::alloc::vec![],
+            crate::alloc::vec![],
             None,
         ));
         let cursor = program.alloc_cursor_id(CursorType::BTreeTable(table));
@@ -659,6 +677,7 @@ fn emit_virtual_update(
     });
     program.emit_insn(Insn::Next {
         cursor_id: scratch,
+        is_index: program.cursor_is_index(scratch),
         pc_if_next: next,
         fullscan: false,
     });
@@ -785,6 +804,12 @@ fn emit_scan_update(
     // changes, all for writing.
     let iteration_index = operation_index(operation);
     let table_cursor = target.open_table_for_write(program);
+    if let [planned_loop] = access.loops.as_slice() {
+        program.emit_source_explain(
+            target.source.id,
+            hir_loop_explain(document, None, &[], planned_loop)?,
+        );
+    }
     let iteration_cursor = iteration_index.map(|index| {
         let cursor = program.alloc_cursor_id(CursorType::BTreeIndex(index.clone()));
         program.emit_insn(Insn::OpenWrite {
@@ -828,9 +853,8 @@ fn emit_scan_update(
         has_statement_conflict: settings.has_statement_conflict,
         defaults: layout.defaults,
         skip_row: hir_loop.next,
+        seek_pending: iteration_cursor.is_some(),
     };
-    // RowId on the table cursor also finishes a deferred seek from the
-    // index, so the table cursor sits on the row before it is rewritten.
     program.emit_insn(Insn::RowId {
         cursor_id: table_cursor,
         dest: row.rowid,
@@ -876,6 +900,7 @@ fn emit_rowset_update(
         has_statement_conflict: settings.has_statement_conflict,
         defaults: layout.defaults,
         skip_row: next,
+        seek_pending: false,
     };
     program.preassign_label_to_next_insn(next);
     program.emit_insn(Insn::RowSetRead {
@@ -981,6 +1006,7 @@ fn emit_from_update(
         has_statement_conflict: settings.has_statement_conflict,
         defaults: layout.defaults,
         skip_row: next,
+        seek_pending: false,
     };
     let empty = program.allocate_label();
     program.emit_insn(Insn::Rewind {
@@ -1002,6 +1028,7 @@ fn emit_from_update(
     program.preassign_label_to_next_insn(next);
     program.emit_insn(Insn::Next {
         cursor_id: scratch,
+        is_index: program.cursor_is_index(scratch),
         pc_if_next: top,
         fullscan: false,
     });
@@ -1251,6 +1278,9 @@ struct UpdateRow<'a, 'b> {
     defaults: &'a [hir::ResolvedDefault],
     /// Where `OR IGNORE` goes to leave the row unchanged.
     skip_row: BranchOffset,
+    /// The loop reads an index, so the table cursor's seek to the row is
+    /// pending until a column is read from it.
+    seek_pending: bool,
 }
 
 /// A new index key built before any index changes.
@@ -1412,32 +1442,31 @@ impl UpdateRow<'_, '_> {
             },
         );
         // Change data capture in `full` mode records which columns changed:
-        // a flag per column, then the new value of each changed one.
+        // a flag per stored column, then the new value of each changed one.
+        // A virtual column has no entry.
+        let stored_offsets = stored_column_offsets(table);
+        let stored = stored_offsets.iter().flatten().count();
         let updates = self
             .target
-            .capture
-            .as_ref()
-            .filter(|_| super::cdc::Capture::records_updates(program))
-            .map(|_| program.alloc_registers(2 * columns));
+            .capture_rows()
+            .filter(|_| super::cdc::Rows::records_updates(program))
+            .map(|_| program.alloc_registers(2 * stored));
         // A BEFORE trigger runs before NOT NULL is checked.
-        self.emit_new_values(program, layout, !has_before, updates)?;
+        let read_old_column = self.emit_new_values(program, layout, !has_before, updates)?;
+        // STRICT: the values the UPDATE sets are checked, and converted
+        // where SQLite allows, before the generated columns read them and
+        // before any conflict is resolved. Custom-typed values are checked
+        // when they are encoded.
+        if table.is_strict && !super::dml::has_custom_types(source) {
+            super::dml::emit_strict_type_check(program, table, self.start());
+        }
         self.emit_virtual_columns(program, layout, !has_before)?;
         if let (Some(updates), Some((position, ddl))) = (updates, layout.schema_change) {
-            program.emit_insn(Insn::String8 {
-                value: ddl.to_string(),
-                dest: updates + columns + position,
-            });
-        }
-        if let Some(updates) = updates {
-            // A changed virtual column records its value.
-            for &position in layout.assigned {
-                if table.columns()[position].is_virtual_generated() {
-                    program.emit_insn(Insn::Copy {
-                        src_reg: self.start() + position,
-                        dst_reg: updates + columns + position,
-                        extra_amount: 0,
-                    });
-                }
+            if let Some(offset) = stored_offsets[position] {
+                program.emit_insn(Insn::String8 {
+                    value: ddl.to_string(),
+                    dest: updates + stored + offset,
+                });
             }
         }
         let new_row = TriggerRow {
@@ -1495,11 +1524,15 @@ impl UpdateRow<'_, '_> {
             for (position, (column, value)) in table.columns().iter().zip(layout.values).enumerate()
             {
                 if value.is_none() && !column.is_rowid_alias() && !column.is_virtual_generated() {
-                    program.emit_column_or_rowid(
+                    super::dml::emit_stored_column(
+                        program,
+                        document,
+                        source,
                         self.table_cursor,
+                        column,
                         position,
                         self.start() + position,
-                    );
+                    )?;
                 }
             }
             for (position, (column, value)) in table.columns().iter().zip(layout.values).enumerate()
@@ -1537,9 +1570,8 @@ impl UpdateRow<'_, '_> {
                 self.start(),
                 Some(&set),
             )?;
-        } else if table.is_strict {
-            super::dml::emit_strict_type_check(program, table, self.start());
         }
+        super::dml::emit_strict_generated_check(program, table, self.start());
         super::dml::emit_check_constraints(
             program,
             document,
@@ -1583,9 +1615,21 @@ impl UpdateRow<'_, '_> {
             })
             .collect::<Result<Vec<_>>>()?;
         // The row before the change, for change data capture.
-        let capture_before = self.target.capture.as_ref().and_then(|capture| {
-            capture.before_record(program, table, self.table_cursor, self.rowid)
-        });
+        let capture_before = self
+            .target
+            .capture_rows()
+            .map(|capture| {
+                capture.before_record(
+                    program,
+                    document,
+                    source,
+                    table,
+                    self.table_cursor,
+                    self.rowid,
+                )
+            })
+            .transpose()?
+            .flatten();
         for ((old, _), (cursor, key)) in layout
             .changed_indexes
             .iter()
@@ -1635,6 +1679,15 @@ impl UpdateRow<'_, '_> {
         }
 
         let record = super::dml::emit_row_record(program, table, self.start());
+        // Reading an unchanged column moved the table cursor to the row.
+        // Other reads, such as the old value for a partial index, sit in a
+        // branch some rows skip, so they do not count. Without such a read
+        // the cursor is moved here, before the row is rewritten.
+        if self.seek_pending && !read_old_column {
+            program.emit_insn(Insn::FinishSeek {
+                cursor_id: self.table_cursor,
+            });
+        }
         // MVCC keeps every version of a row, so the old one is deleted and
         // the new one inserted. A row with a new rowid moves the same way.
         if layout.mvcc || self.new_rowid.is_some() {
@@ -1659,6 +1712,51 @@ impl UpdateRow<'_, '_> {
             flag,
             table_name: table.name.clone(),
         });
+        // The change is captured as soon as the row is written, before a
+        // foreign-key action or an AFTER trigger it fires captures rows of
+        // its own: a consumer replays the rows in change id order. A moved
+        // row is captured as deleted and inserted.
+        if let Some(capture) = self.target.capture_rows() {
+            let after = capture.after_record(program, table, self.start(), self.written_rowid());
+            if self.new_rowid.is_some() {
+                capture.emit_row(
+                    program,
+                    OperationMode::DELETE,
+                    self.rowid,
+                    capture_before,
+                    None,
+                    None,
+                )?;
+                capture.emit_row(
+                    program,
+                    OperationMode::INSERT,
+                    self.written_rowid(),
+                    None,
+                    after,
+                    None,
+                )?;
+            } else {
+                let updates = updates.map(|updates| {
+                    let record = program.alloc_register();
+                    program.emit_insn(Insn::MakeRecord {
+                        start_reg: to_u32(updates),
+                        count: to_u32(2 * stored),
+                        dest_reg: to_u32(record),
+                        index_name: None,
+                        affinity_str: None,
+                    });
+                    record
+                });
+                capture.emit_row(
+                    program,
+                    OperationMode::UPDATE(crate::translate::emitter::UpdateRowSource::Normal),
+                    self.rowid,
+                    capture_before,
+                    after,
+                    updates,
+                )?;
+            }
+        }
         super::fkey::emit_update_repairs(program, &pending_repairs, self.target.database)?;
         if let (Some(sequence), Some(_)) = (layout.sequence, self.new_rowid) {
             sequence.emit_moved_row(program, self.written_rowid())?;
@@ -1693,48 +1791,6 @@ impl UpdateRow<'_, '_> {
             });
             program.preassign_label_to_next_insn(back);
         }
-        // A moved row is captured as deleted and inserted.
-        if let Some(capture) = &self.target.capture {
-            let after = capture.after_record(program, table, self.start(), self.written_rowid());
-            if self.new_rowid.is_some() {
-                capture.emit_row(
-                    program,
-                    OperationMode::DELETE,
-                    self.rowid,
-                    capture_before,
-                    None,
-                    None,
-                )?;
-                capture.emit_row(
-                    program,
-                    OperationMode::INSERT,
-                    self.written_rowid(),
-                    None,
-                    after,
-                    None,
-                )?;
-            } else {
-                let updates = updates.map(|updates| {
-                    let record = program.alloc_register();
-                    program.emit_insn(Insn::MakeRecord {
-                        start_reg: to_u32(updates),
-                        count: to_u32(2 * columns),
-                        dest_reg: to_u32(record),
-                        index_name: None,
-                        affinity_str: None,
-                    });
-                    record
-                });
-                capture.emit_row(
-                    program,
-                    OperationMode::UPDATE(crate::translate::emitter::UpdateRowSource::Normal),
-                    self.rowid,
-                    capture_before,
-                    after,
-                    updates,
-                )?;
-            }
-        }
         if let Some(returning) = layout.returning {
             let start = returning.emit_values(program, document, self.target.resolved_table()?)?;
             returning.emit_buffer(program, start);
@@ -1751,16 +1807,18 @@ impl UpdateRow<'_, '_> {
 
     /// Fill the new-row registers: assigned columns get their value, the
     /// others are read from the old row, and an INTEGER PRIMARY KEY column
-    /// is NULL, as it is in the stored record.
+    /// is NULL, as it is in the stored record. Returns whether a column was
+    /// read from the old row.
     fn emit_new_values(
         &self,
         program: &mut ProgramBuilder,
         layout: &UpdateRowLayout<'_>,
         check_notnull: bool,
         updates: Option<usize>,
-    ) -> Result<()> {
+    ) -> Result<bool> {
         let table = self.target.table;
         let mut rows = RowValues::default();
+        let mut read_old_column = false;
         if let (Some(value), Some(new_rowid)) = (layout.rowid_value, self.new_rowid) {
             match layout.scratch {
                 // UPDATE ... FROM computed it during the join, after the
@@ -1804,12 +1862,18 @@ impl UpdateRow<'_, '_> {
                             });
                         }
                         None => {
+                            let translate: Translate =
+                                if super::dml::column_encodes(self.target.source, position) {
+                                    super::expr::translate_expr_no_constant_opt
+                                } else {
+                                    super::expr::translate_expr
+                                };
                             value.emit(
                                 program,
                                 self.target.document,
                                 register,
                                 &mut rows,
-                                super::expr::translate_expr,
+                                translate,
                             )?;
                         }
                     }
@@ -1821,23 +1885,38 @@ impl UpdateRow<'_, '_> {
                 None if column.is_rowid_alias() || column.is_virtual_generated() => {
                     program.emit_null(register, None)
                 }
-                None => program.emit_column_or_rowid(self.table_cursor, position, register),
+                None => {
+                    super::dml::emit_stored_column(
+                        program,
+                        self.target.document,
+                        self.target.source,
+                        self.table_cursor,
+                        column,
+                        position,
+                        register,
+                    )?;
+                    read_old_column = true;
+                }
             }
         }
         // The changed columns record their new values before affinity is
         // applied; a changed INTEGER PRIMARY KEY records NULL.
         if let Some(updates) = updates {
-            let columns = table.columns().len();
+            let stored_offsets = stored_column_offsets(table);
+            let stored = stored_offsets.iter().flatten().count();
             for (position, value) in layout.values.iter().enumerate() {
+                let Some(offset) = stored_offsets[position] else {
+                    continue;
+                };
                 let changed = layout.assigned.contains(&position);
-                program.emit_bool(changed, updates + position);
+                program.emit_bool(changed, updates + offset);
                 match value {
                     Some(_) if changed => program.emit_insn(Insn::Copy {
                         src_reg: self.start() + position,
-                        dst_reg: updates + columns + position,
+                        dst_reg: updates + stored + offset,
                         extra_amount: 0,
                     }),
-                    _ => program.emit_null(updates + columns + position, None),
+                    _ => program.emit_null(updates + stored + offset, None),
                 }
             }
         }
@@ -1864,7 +1943,7 @@ impl UpdateRow<'_, '_> {
                 });
             }
         }
-        Ok(())
+        Ok(read_old_column)
     }
 
     fn emit_notnull_check(
@@ -1909,6 +1988,7 @@ impl UpdateRow<'_, '_> {
             _ => program.emit_insn(Insn::HaltIfNull {
                 target_reg: register,
                 err_code: SQLITE_CONSTRAINT_NOTNULL,
+                on_error: program.constraint_halt_on_error(conflict),
                 description: format!(
                     "{}.{}",
                     self.target.table.name,
@@ -2005,9 +2085,7 @@ impl UpdateRow<'_, '_> {
                         if column.pos_in_table == EXPR_INDEX_SENTINEL {
                             Affinity::Blob.aff_mask()
                         } else {
-                            table.columns()[column.pos_in_table]
-                                .affinity_with_strict(table.is_strict)
-                                .aff_mask()
+                            table.columns()[column.pos_in_table].affinity().aff_mask()
                         }
                     })
                     .collect(),
@@ -2084,15 +2162,10 @@ impl UpdateRow<'_, '_> {
                     .find(|column| column.is_rowid_alias())
                     .and_then(|column| column.name.as_deref())
                     .unwrap_or("rowid");
-                let (description, on_error) = halt_desc_and_on_error(
-                    &format!("{}.{column}", table.name),
-                    conflict,
-                    self.has_statement_conflict,
-                );
                 program.emit_insn(Insn::Halt {
                     err_code: SQLITE_CONSTRAINT_PRIMARYKEY,
-                    description,
-                    on_error,
+                    description: format!("{}.{column}", table.name),
+                    on_error: program.constraint_halt_on_error(conflict),
                     description_reg: None,
                 });
             }
@@ -2225,12 +2298,10 @@ impl UpdateRow<'_, '_> {
                     .map(|column| format!("{table_name}.{}", column.name))
                     .collect::<Vec<_>>()
                     .join(", ");
-                let (description, on_error) =
-                    halt_desc_and_on_error(&columns, conflict, self.has_statement_conflict);
                 program.emit_insn(Insn::Halt {
                     err_code: SQLITE_CONSTRAINT_UNIQUE,
-                    description,
-                    on_error,
+                    description: columns,
+                    on_error: program.constraint_halt_on_error(conflict),
                     description_reg: None,
                 });
             }
@@ -2238,6 +2309,25 @@ impl UpdateRow<'_, '_> {
         program.preassign_label_to_next_insn(unique);
         Ok(())
     }
+}
+
+/// The position of each table column in a record that leaves out virtual
+/// columns, such as the change data capture `updates` record. A virtual
+/// column has none.
+fn stored_column_offsets(table: &crate::schema::BTreeTable) -> Vec<Option<usize>> {
+    let mut next = 0;
+    table
+        .columns()
+        .iter()
+        .map(|column| {
+            if column.is_virtual_generated() {
+                None
+            } else {
+                next += 1;
+                Some(next - 1)
+            }
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -2277,7 +2367,7 @@ mod tests {
                 name: "items_value".to_string(),
                 table_name: "items".to_string(),
                 root_page: 3,
-                columns: vec![IndexColumn {
+                columns: crate::alloc::vec![IndexColumn {
                     name: "value".to_string(),
                     order: SortOrder::Asc,
                     nulls_order: None,
@@ -2595,5 +2685,39 @@ mod tests {
         assert_eq!(checks.len(), 2);
         assert_eq!(encodes.len(), 1);
         assert!(checks[0] < encodes[0] && encodes[0] < checks[1]);
+    }
+
+    #[test]
+    fn update_computes_an_encoded_constant_on_every_row() {
+        let mut schema = schema();
+        schema
+            .add_type_from_sql(
+                "CREATE TYPE cents BASE integer ENCODE value * 100 DECODE value / 100",
+            )
+            .unwrap();
+        schema
+            .add_btree_table(Arc::new(
+                BTreeTable::from_sql(
+                    "CREATE TABLE priced(id INTEGER PRIMARY KEY, amount cents) STRICT",
+                    140,
+                )
+                .unwrap(),
+            ))
+            .unwrap();
+        let program = emit_with(schema, "UPDATE priced SET amount = 99");
+        // The encode multiplies the register the constant is loaded into,
+        // so the load must run on every row: after the loop starts, not
+        // once before it.
+        let position = |matches: fn(&Insn) -> bool| {
+            program
+                .insns
+                .iter()
+                .position(|(insn, _)| matches(insn))
+                .unwrap()
+        };
+        let rewind = position(|insn| matches!(insn, Insn::Rewind { .. }));
+        let load = position(|insn| matches!(insn, Insn::Integer { value: 99, .. }));
+        let encode = position(|insn| matches!(insn, Insn::Multiply { .. }));
+        assert!(rewind < load && load < encode);
     }
 }

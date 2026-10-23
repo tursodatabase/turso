@@ -128,6 +128,7 @@ fn compile_trigger(
         parent.capture_data_changes_info().clone(),
         ProgramBuilderOpts::new(1, 32, 2),
         handle,
+        session.connection.mvcc_enabled(),
     );
     if let Some(conflict) = conflict_override {
         builder.set_trigger_conflict_override(conflict);
@@ -220,6 +221,9 @@ fn compile_trigger(
                     subprograms,
                     super::uses_mvcc(connection, &plan.document, insert.target),
                     !connection.check_constraints_ignored(),
+                    connection
+                        .dialect()
+                        .upsert_rejects_row_written_by_same_statement(),
                 )?;
                 builder.emit_insn(Insn::ResetCount);
             }
@@ -288,8 +292,8 @@ fn compile_trigger(
 }
 
 /// Compile the triggers an INSERT fires.
-/// An INSERT's conflict clause other than ABORT also applies inside its
-/// triggers.
+/// Like SQLite, an INSERT's own OR clause, ABORT included, also applies
+/// inside its triggers; without one, each trigger step keeps its own.
 pub(super) fn insert_triggers(
     session: &HirSession<'_>,
     parent: &ProgramBuilder,
@@ -299,11 +303,7 @@ pub(super) fn insert_triggers(
     let hir::InsertTargetKind::BTree { triggers, .. } = &insert.target_kind else {
         return Ok(Vec::new());
     };
-    let conflict_override = parent.trigger_conflict_override.or_else(|| {
-        insert
-            .conflict
-            .filter(|conflict| *conflict != ResolveType::Abort)
-    });
+    let conflict_override = parent.trigger_conflict_override.or(insert.conflict);
     target_triggers(
         session,
         parent,
@@ -346,11 +346,7 @@ pub(super) fn update_triggers(
     let hir::UpdateTargetKind::BTree { triggers, .. } = &update.target_kind else {
         return Ok(Vec::new());
     };
-    let conflict_override = parent.trigger_conflict_override.or_else(|| {
-        update
-            .conflict
-            .filter(|conflict| *conflict != ResolveType::Abort)
-    });
+    let conflict_override = parent.trigger_conflict_override.or(update.conflict);
     target_triggers(
         session,
         parent,

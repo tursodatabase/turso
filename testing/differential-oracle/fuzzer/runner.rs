@@ -13,6 +13,7 @@ use std::io::Write;
 use std::panic::RefUnwindSafe;
 use std::path::PathBuf;
 use std::sync::Arc;
+use turso_core::ConnectOpts;
 use turso_core::SqliteDialect;
 
 use anyhow::{Context, Result, bail};
@@ -22,12 +23,16 @@ use rand::{RngCore, SeedableRng};
 use rand_chacha::ChaCha8Rng;
 use turso_core::Database;
 
-use crate::generate::{GeneratorKind, PropTestBackend, SqlGenBackend, SqlGenerator, WeightProfile};
+use crate::generate::{
+    GeneratedStatement, GeneratorKind, PropTestBackend, SqlGenBackend, SqlGenerator, WeightProfile,
+};
+use crate::ivm::{IvmCreateOutcome, IvmState, collation_probe_bootstrap_sql};
 use crate::memory::{MemorySimIO, SimIO};
-use crate::oracle::{DifferentialOracle, OracleResult, QueryResult, check_differential};
+use crate::oracle::{
+    DifferentialOracle, OracleResult, QueryResult, QueryValue, check_differential,
+};
 use crate::schema::SchemaIntrospector;
 pub use sql_gen::TreeMode;
-use sql_gen_prop::SqlValue;
 
 const MAX_GENERATED_SQL_BYTES: usize = 64 * 1024;
 
@@ -202,6 +207,10 @@ pub struct SimConfig {
     pub recursive_cte_focus: bool,
     /// Named statement-weight mix to generate with.
     pub weight_profile: WeightProfile,
+    /// Whether to enable IVM mode: create materialized views (Turso-only) and
+    /// verify after every statement that each view equals a fresh evaluation
+    /// of its defining query.
+    pub ivm: bool,
 }
 
 impl Default for SimConfig {
@@ -220,6 +229,7 @@ impl Default for SimConfig {
             window_function_probability: 0.0,
             recursive_cte_focus: false,
             weight_profile: WeightProfile::default(),
+            ivm: false,
         }
     }
 }
@@ -237,6 +247,8 @@ pub struct SimStats {
     pub oracle_failures: usize,
     /// Number of errors encountered.
     pub errors: usize,
+    /// Correlated SELECTs checked with unnesting forced and disabled.
+    pub unnesting_invariants_checked: usize,
 }
 
 impl SimStats {
@@ -314,6 +326,10 @@ impl SimStats {
             Cell::new(self.errors).fg(Color::Green)
         };
         table.add_row(vec![Cell::new("Errors").fg(Color::Red), errors_cell]);
+        table.add_row(vec![
+            Cell::new("Unnesting invariants").fg(Color::Blue),
+            Cell::new(self.unnesting_invariants_checked).fg(Color::Blue),
+        ]);
 
         table
     }
@@ -354,9 +370,17 @@ impl Fuzzer {
             std::fs::create_dir_all(&out_dir)?;
         }
 
+        if config.ivm && config.mvcc {
+            bail!(
+                "IVM mode is incompatible with MVCC (materialized views are not supported in MVCC mode)"
+            );
+        }
+
         // Create Turso in-memory database using MemorySimIO
         let io = Arc::new(MemorySimIO::new(config.seed));
-        let opts = turso_core::DatabaseOpts::new().with_attach(true);
+        let opts = turso_core::DatabaseOpts::new()
+            .with_attach(true)
+            .with_views(config.ivm);
 
         let turso_db = Database::open_file_with_flags(
             io.clone(),
@@ -366,7 +390,7 @@ impl Fuzzer {
             None,
             Arc::new(SqliteDialect),
         )?;
-        let turso_conn = turso_db.connect()?;
+        let turso_conn = turso_db.connect(ConnectOpts::new())?;
 
         // Create SQLite in-memory database
         let sqlite_conn = if config.keep_files {
@@ -538,6 +562,51 @@ impl Fuzzer {
         }
     }
 
+    /// Run one statement the IVM mode adds on its own (not drawn from the
+    /// generator) on both engines, then check every materialized view.
+    fn run_ivm_statement(
+        &self,
+        ivm: &IvmState,
+        schema: &sql_gen::Schema,
+        sql: &str,
+        label: &str,
+        stats: &mut SimStats,
+        executed_sql: &mut Vec<String>,
+    ) -> Result<()> {
+        let stmt = GeneratedStatement {
+            sql: sql.to_string(),
+            is_ddl: false,
+            mutates_data: true,
+            has_unordered_limit: false,
+            unordered_limit_reason: None,
+            check_unnesting_invariant: false,
+        };
+        match check_differential(&self.turso_conn, &self.sqlite_conn, schema, &stmt) {
+            OracleResult::Fail(reason) => {
+                stats.oracle_failures += 1;
+                executed_sql.push(format!("-- {label} FAILED: {sql}"));
+                return Err(anyhow::anyhow!("{label} failed: {sql}\n{reason}"));
+            }
+            OracleResult::Skipped(reason) => {
+                executed_sql.push(format!("-- {label} SKIPPED ({reason}): {sql}"));
+                return Ok(());
+            }
+            OracleResult::Pass
+            | OracleResult::PassWithUnnestingInvariant
+            | OracleResult::Warning(_) => {}
+        }
+        executed_sql.push(format!("-- {label}"));
+        executed_sql.push(sql.to_string());
+        if let OracleResult::Fail(reason) = ivm.check_views(&self.turso_conn) {
+            stats.oracle_failures += 1;
+            executed_sql.push(format!("-- IVM FAILED after {label}: {sql}"));
+            return Err(anyhow::anyhow!(
+                "IVM invariant failed after {label}: {sql}\n{reason}"
+            ));
+        }
+        Ok(())
+    }
+
     fn run_inner(
         &self,
         stats: &mut SimStats,
@@ -555,10 +624,11 @@ impl Fuzzer {
         let mut generator: Box<dyn SqlGenerator> = match self.config.generator {
             GeneratorKind::SqlGen => {
                 let seed: u64 = self.rng.borrow_mut().next_u64();
-                Box::new(SqlGenBackend::new_with_window_weight(
+                Box::new(SqlGenBackend::new_with_options(
                     seed,
                     self.config.window_function_probability,
                     self.config.weight_profile,
+                    self.config.ivm,
                 ))
             }
             GeneratorKind::SqlGenProp => {
@@ -567,16 +637,151 @@ impl Fuzzer {
                     self.rng.borrow_mut().fill_bytes(&mut bytes);
                     bytes
                 };
-                Box::new(PropTestBackend::new(
+                Box::new(PropTestBackend::new_with_options(
                     seed_bytes,
                     self.config.recursive_cte_focus,
+                    self.config.ivm,
                 ))
             }
         };
 
         let mut schema = self.introspect_and_verify_schemas()?;
+        let mut ivm_state = self.config.ivm.then(IvmState::new);
+
+        // Bootstrap the collation/mixed-type probe table on both engines, up
+        // front, so it is an ordinary tracked table (read and written by the
+        // regular generator too, not just the IVM-specific view generation)
+        // for the rest of the run. See `ivm::collation_probe_bootstrap_sql`.
+        if let Some(ivm) = ivm_state.as_mut() {
+            let (create_sql, insert_sql) = collation_probe_bootstrap_sql();
+            for sql in &create_sql {
+                self.run_ivm_statement(
+                    ivm,
+                    &schema,
+                    sql,
+                    "IVM collation-probe setup",
+                    stats,
+                    executed_sql,
+                )?;
+            }
+            schema = self.introspect_and_verify_schemas()?;
+            for sql in &insert_sql {
+                self.run_ivm_statement(
+                    ivm,
+                    &schema,
+                    sql,
+                    "IVM collation-probe setup",
+                    stats,
+                    executed_sql,
+                )?;
+            }
+        }
 
         for i in 0..self.config.num_statements {
+            // In IVM mode, periodically create a materialized view over the
+            // current schema. Turso-only: SQLite has no materialized views.
+            // Only in autocommit, so a generated ROLLBACK can never undo a
+            // view we keep checking for the rest of the run.
+            if let Some(ivm) = ivm_state.as_mut() {
+                if ivm.wants_view(i) && self.turso_conn.get_auto_commit() {
+                    let outcome = {
+                        let mut rng = self.rng.borrow_mut();
+                        ivm.try_create_view(&self.turso_conn, &schema, &mut rng)
+                    };
+                    match outcome {
+                        Some(IvmCreateOutcome::Created {
+                            sql,
+                            leaf_probes,
+                            extra_setup,
+                        }) => {
+                            tracing::info!("IVM: created view: {sql}");
+                            executed_sql.push("-- IVM (turso-only)".to_string());
+                            for extra in &extra_setup {
+                                executed_sql.push(extra.clone());
+                            }
+                            executed_sql.push(sql.clone());
+                            // Check immediately so an initial-population bug is
+                            // attributed to the creation, not to the next statement.
+                            if let OracleResult::Fail(reason) = ivm.check_views(&self.turso_conn) {
+                                stats.oracle_failures += 1;
+                                executed_sql
+                                    .push(format!("-- IVM FAILED (initial population): {sql}"));
+                                tracing::error!("IVM initial population failure: {reason}");
+                                return Err(anyhow::anyhow!(
+                                    "IVM initial population failure after: {sql}\n{reason}"
+                                ));
+                            }
+                            // Drive every possible base-table leaf through the
+                            // maintenance graph at least once. A no-op UPDATE
+                            // still captures a delete/insert pair for each row,
+                            // exercising identity, arrangement, and
+                            // cancellation paths without perturbing the
+                            // generator's data distribution.
+                            for probe_sql in &leaf_probes {
+                                self.run_ivm_statement(
+                                    ivm,
+                                    &schema,
+                                    probe_sql,
+                                    "IVM leaf mutation probe",
+                                    stats,
+                                    executed_sql,
+                                )?;
+                            }
+                        }
+                        Some(IvmCreateOutcome::Rejected {
+                            sql,
+                            error,
+                            must_create,
+                        }) => {
+                            tracing::warn!("IVM: view creation rejected: {sql}: {error}");
+                            executed_sql.push(format!("-- IVM view rejected ({error}): {sql}"));
+                            if must_create {
+                                stats.oracle_failures += 1;
+                                return Err(anyhow::anyhow!(
+                                    "IVM composition unexpectedly rejected: {sql}\n{error}"
+                                ));
+                            }
+                        }
+                        None => {}
+                    }
+                }
+                // Statements that fail in FAIL mode keep the rows written
+                // before the error; drive them, with a savepoint, through an
+                // explicit transaction. Only from autocommit, so the script
+                // owns the whole transaction.
+                if ivm.wants_fail_mode_transaction(i) && self.turso_conn.get_auto_commit() {
+                    let script = {
+                        let mut rng = self.rng.borrow_mut();
+                        ivm.fail_mode_transaction(&self.turso_conn, &schema, &mut rng)
+                    };
+                    for sql in script.iter().flatten() {
+                        self.run_ivm_statement(
+                            ivm,
+                            &schema,
+                            sql,
+                            "IVM FAIL-mode transaction",
+                            stats,
+                            executed_sql,
+                        )?;
+                    }
+                }
+                // Move the collation/mixed-type probe table's rows between
+                // equal-but-not-identical classes, so the view's displayed
+                // member keeps changing. Only from autocommit for the same
+                // reason as the other IVM-driven statements above.
+                if ivm.wants_collation_mutation(i) && self.turso_conn.get_auto_commit() {
+                    let sql = ivm.next_collation_mutation();
+                    self.run_ivm_statement(
+                        ivm,
+                        &schema,
+                        &sql,
+                        "IVM collation-probe mutation",
+                        stats,
+                        executed_sql,
+                    )?;
+                }
+            }
+
             let stmt = generator.generate(&schema)?;
 
             // A generated expression can branch into several subqueries at
@@ -611,8 +816,23 @@ impl Fuzzer {
                 *ctx.lock() = Some(format!("{info}\n{bt}"));
             }));
 
+            let ivm_ref = ivm_state.as_ref();
             let oracle_result = std::panic::catch_unwind(|| {
-                check_differential(&self.turso_conn, &self.sqlite_conn, &schema, &stmt)
+                let result =
+                    check_differential(&self.turso_conn, &self.sqlite_conn, &schema, &stmt);
+                if result.is_fail() {
+                    return result;
+                }
+                // The IVM invariant is checked after every statement: view
+                // maintenance runs at commit, but mid-transaction reads must
+                // also agree with the defining query (same uncommitted snapshot).
+                if let Some(ivm) = ivm_ref {
+                    let ivm_result = ivm.check_views(&self.turso_conn);
+                    if ivm_result.is_fail() {
+                        return ivm_result;
+                    }
+                }
+                result
             });
 
             std::panic::set_hook(prev_hook);
@@ -641,6 +861,11 @@ impl Fuzzer {
             match oracle_result {
                 OracleResult::Pass => {
                     stats.statements_executed += 1;
+                    executed_sql.push(stmt.sql.clone());
+                }
+                OracleResult::PassWithUnnestingInvariant => {
+                    stats.statements_executed += 1;
+                    stats.unnesting_invariants_checked += 1;
                     executed_sql.push(stmt.sql.clone());
                 }
                 OracleResult::Skipped(reason) => {
@@ -712,8 +937,8 @@ impl Fuzzer {
 
         let check_ok = |result: &QueryResult, db_name: &str| -> Result<()> {
             match result {
-                QueryResult::Rows(rows) if rows.len() == 1 && rows[0].0.len() == 1 => {
-                    if let SqlValue::Text(ref text) = rows[0].0[0] {
+                QueryResult::Rows(rows) if rows.len() == 1 && rows.rows()[0].0.len() == 1 => {
+                    if let QueryValue::Text(ref text) = rows.rows()[0].0[0] {
                         if text == "ok" {
                             return Ok(());
                         }
@@ -933,6 +1158,7 @@ mod tests {
             window_function_probability: 0.0,
             recursive_cte_focus: false,
             weight_profile: WeightProfile::default(),
+            ivm: false,
         };
         let sim = Fuzzer::new(config);
         assert!(sim.is_ok());

@@ -162,14 +162,14 @@ PRAGMA journal_mode = mvcc;
 
 ### How It Works
 
-A concurrent transaction operates on a snapshot of the database taken at the time of BEGIN CONCURRENT. Each connection reads from its own snapshot and writes independently.
+Like BEGIN DEFERRED, BEGIN CONCURRENT itself opens nothing: the snapshot is taken when the transaction's first statement runs. Each connection reads from its own snapshot and writes independently. A commit that lands between BEGIN CONCURRENT and the transaction's first statement is visible to it.
 
 When COMMIT is issued, Turso checks whether any other transaction has modified the same rows since the snapshot was taken:
 
 - If there is no conflict, the transaction commits successfully.
 - If a write-write conflict is detected, the COMMIT fails and the transaction must be rolled back and retried.
 
-This provides **snapshot isolation**: each transaction sees a consistent view of the database as of its start time, without blocking other writers.
+This provides **snapshot isolation**: each transaction sees a consistent view of the database as of its first statement, without blocking other writers.
 
 ### Example
 

@@ -1,6 +1,7 @@
 use crate::{
     schema::{BTreeTable, Index, Schema, Table, EXPR_INDEX_SENTINEL},
     translate::semantic_lowering::{PlannedSelect, ScanValue},
+    types::ValueType,
     vdbe::{
         builder::ProgramBuilder,
         insn::{CmpInsFlags, Insn, IntegrityCkData},
@@ -25,42 +26,69 @@ use crate::translate::semantic::context::SemanticContext;
 
 /// Translate PRAGMA integrity_check.
 pub fn translate_integrity_check(
-    schema: &Schema,
     program: &mut ProgramBuilder,
     database_id: usize,
     max_errors: usize,
     connection: &std::sync::Arc<crate::Connection>,
     catalog: &SemanticContext<'_>,
 ) -> crate::Result<()> {
-    translate_integrity_check_impl(
-        schema,
-        program,
-        database_id,
-        max_errors,
-        false,
-        connection,
-        catalog,
-    )
+    translate_integrity_check_impl(program, database_id, max_errors, false, connection, catalog)
 }
 
 /// Translate PRAGMA quick_check.
 pub fn translate_quick_check(
-    schema: &Schema,
     program: &mut ProgramBuilder,
     database_id: usize,
     max_errors: usize,
     connection: &std::sync::Arc<crate::Connection>,
     catalog: &SemanticContext<'_>,
 ) -> crate::Result<()> {
-    translate_integrity_check_impl(
-        schema,
-        program,
-        database_id,
-        max_errors,
-        true,
-        connection,
-        catalog,
-    )
+    translate_integrity_check_impl(program, database_id, max_errors, true, connection, catalog)
+}
+
+fn translate_integrity_check_impl(
+    program: &mut ProgramBuilder,
+    database_id: usize,
+    max_errors: usize,
+    quick: bool,
+    connection: &std::sync::Arc<crate::Connection>,
+    catalog: &SemanticContext<'_>,
+) -> crate::Result<()> {
+    match connection.mv_store_for_db(database_id) {
+        Some(mv_store) => {
+            // Integrity checks read the target's physical file. Its root pages match the
+            // shared MVCC schema, not a connection's potentially older transaction snapshot.
+            // Row checks read through the transaction, so they only cover the objects that
+            // this transaction can still see.
+            let file_schema = connection.clone_shared_schema(database_id);
+            catalog.with_schema(database_id, |connection_schema| {
+                translate_integrity_check_for_schema(
+                    &file_schema,
+                    connection_schema,
+                    program,
+                    database_id,
+                    max_errors,
+                    quick,
+                    connection,
+                    catalog,
+                    Some(mv_store.as_ref()),
+                )
+            })
+        }
+        None => catalog.with_schema(database_id, |schema| {
+            translate_integrity_check_for_schema(
+                schema,
+                schema,
+                program,
+                database_id,
+                max_errors,
+                quick,
+                connection,
+                catalog,
+                None,
+            )
+        }),
+    }
 }
 
 fn emit_integrity_result_row(
@@ -117,54 +145,31 @@ fn emit_row_missing_from_index_error(
     emit_integrity_result_row(program, remaining_errors_reg, message_reg, had_error_reg);
 }
 
+/// Check the pages of `schema`, the physical file's schema, and the rows of
+/// every table of it that `connection_schema`, the connection's snapshot,
+/// still sees.
 #[allow(clippy::too_many_arguments)]
-fn translate_integrity_check_impl(
+fn translate_integrity_check_for_schema(
     schema: &Schema,
+    connection_schema: &Schema,
     program: &mut ProgramBuilder,
     database_id: usize,
     max_errors: usize,
     quick: bool,
     connection: &std::sync::Arc<crate::Connection>,
     catalog: &SemanticContext<'_>,
+    mv_store: Option<&crate::MvStore>,
 ) -> crate::Result<()> {
     // 1) Run low-level btree/freelist/overflow verification first. This mirrors
     // SQLite's OP_IntegrityCk front-pass and can already emit corruption errors
     // before any row-by-row semantic checks run.
-    let mut root_pages = Vec::with_capacity(schema.tables.len() + schema.indexes.len());
-    let mut live_root_pages = HashSet::default();
+    let mut root_pages = resolved_root_pages(schema, mv_store);
+    let live_root_pages: HashSet<i64> = root_pages.iter().copied().collect();
+    let connection_root_pages: HashSet<i64> = resolved_root_pages(connection_schema, mv_store)
+        .into_iter()
+        .collect();
 
-    // integrity_check verifies the physical file, so a placeholder (negative) root for an
-    // object a passive checkpoint has since materialized must be resolved to its real page.
-    let mv_store_guard = connection.db.get_mv_store();
-    let resolve_root = |root_page: i64| -> i64 {
-        match mv_store_guard.as_ref() {
-            Some(mv) => mv.resolve_root_page(root_page),
-            None => root_page,
-        }
-    };
-
-    for table in schema.tables.values() {
-        if let Table::BTree(btree_table) = table.as_ref() {
-            let table_root = resolve_root(btree_table.root_page);
-            if table_root < 0 {
-                continue;
-            }
-            root_pages.push(table_root);
-            live_root_pages.insert(table_root);
-            if let Some(indexes) = schema.indexes.get(btree_table.name.as_str()) {
-                for index in indexes {
-                    let index_root = resolve_root(index.root_page);
-                    if index_root > 0 {
-                        root_pages.push(index_root);
-                        live_root_pages.insert(index_root);
-                    }
-                }
-            }
-        }
-    }
-
-    let passive =
-        mv_store_guard.is_some() && connection.experimental_mvcc_passive_checkpoint_enabled();
+    let passive = mv_store.is_some_and(|mv_store| mv_store.uses_passive_checkpoint());
     let mut dropped_roots = Vec::new();
     for &dropped_root in &schema.dropped_root_pages {
         if live_root_pages.contains(&dropped_root) {
@@ -202,7 +207,13 @@ fn translate_integrity_check_impl(
         target_pc: no_structural_error_label,
     });
 
-    program.emit_string8("*** in database main ***\n".to_string(), scratch_reg);
+    let database_name = connection
+        .namespace_name(database_id)
+        .expect("resolved integrity-check database must still exist");
+    program.emit_string8(
+        format!("*** in database {database_name} ***\n"),
+        scratch_reg,
+    );
     program.emit_insn(Insn::Concat {
         lhs: scratch_reg,
         rhs: message_reg,
@@ -220,15 +231,18 @@ fn translate_integrity_check_impl(
 
     // 2) For each ordinary btree table, scan every row and validate:
     //    - NOT NULL constraints
+    //    - the declared types of a STRICT table's columns
     //    - CHECK constraints
     //    - index membership/uniqueness (integrity_check only)
     //    - index cardinality cross-checks
+    //    Tables and indexes the connection no longer sees (dropped in its
+    //    transaction) are skipped: their pages were checked above.
     for table in schema.tables.values() {
         let Table::BTree(btree_table) = table.as_ref() else {
             continue;
         };
 
-        if btree_table.root_page <= 0 {
+        if btree_table.root_page <= 0 || !connection_root_pages.contains(&btree_table.root_page) {
             continue;
         }
 
@@ -237,12 +251,13 @@ fn translate_integrity_check_impl(
             .get(btree_table.name.as_str())
             .into_iter()
             .flatten()
-            .filter(|index| index.root_page > 0)
+            .filter(|index| index.root_page > 0 && connection_root_pages.contains(&index.root_page))
             .cloned()
             .collect();
         let rows = hir_table_rows(
             connection,
             catalog,
+            schema,
             database_id,
             btree_table,
             &table_indexes,
@@ -284,10 +299,21 @@ fn translate_integrity_check_impl(
                         register: row_number_reg,
                         value: 1,
                     });
-                    for (i, col_name) in layout.not_null.iter().enumerate() {
-                        reporter.not_null(program, values + i, &btree_table.name, col_name);
+                    for (i, column) in layout.columns.iter().enumerate() {
+                        if let Some(value_type) = column.strict_type {
+                            reporter.strict_type(
+                                program,
+                                values + i,
+                                &btree_table.name,
+                                column,
+                                value_type,
+                            );
+                        }
+                        if column.not_null {
+                            reporter.not_null(program, values + i, &btree_table.name, &column.name);
+                        }
                     }
-                    let checks = values + layout.not_null.len();
+                    let checks = values + layout.columns.len();
                     reporter.checks(
                         program,
                         checks,
@@ -416,6 +442,34 @@ impl Reporter {
         program.preassign_label_to_next_insn(not_null_ok);
     }
 
+    /// Report a value in `value_reg` that is not of the declared type of
+    /// `column`, a column of the STRICT table `table`.
+    fn strict_type(
+        &self,
+        program: &mut ProgramBuilder,
+        value_reg: usize,
+        table: &str,
+        column: &CheckedColumn,
+        value_type: ValueType,
+    ) {
+        let type_ok = program.allocate_label();
+        program.emit_insn(Insn::IsType {
+            reg: value_reg,
+            target_pc: type_ok,
+            value_type,
+        });
+        program.emit_string8(
+            format!(
+                "non-{} value in {table}.{}",
+                column.type_name.to_ascii_uppercase(),
+                column.name
+            ),
+            self.message_reg,
+        );
+        self.report(program);
+        program.preassign_label_to_next_insn(type_ok);
+    }
+
     /// Report the row's CHECK constraints, whose values are in `count`
     /// registers from `first_reg`. A constraint passes when its value is
     /// TRUE or NULL; only FALSE is a violation. Like SQLite, a row is
@@ -498,6 +552,7 @@ impl Reporter {
             let next_exists = program.allocate_label();
             program.emit_insn(Insn::Next {
                 cursor_id: index.cursor_id,
+                is_index: program.cursor_is_index(index.cursor_id),
                 pc_if_next: next_exists,
                 fullscan: false,
             });
@@ -534,10 +589,21 @@ enum TableRows {
 /// Where each value of a row sits among the columns of the HIR SELECT that
 /// reads the table for an integrity check.
 struct HirRowLayout {
-    /// The name of each NOT NULL column, whose values come first.
-    not_null: Vec<String>,
+    /// The checked columns, whose values come first: every NOT NULL column,
+    /// and every column of a STRICT table.
+    columns: Vec<CheckedColumn>,
     /// For each index, in order.
     indexes: Vec<HirIndexOffsets>,
+}
+
+/// A column whose value the integrity check reads from every row.
+struct CheckedColumn {
+    name: String,
+    /// The declared type, as written, for the STRICT violation message.
+    type_name: String,
+    not_null: bool,
+    /// The type every value must have, in a STRICT table.
+    strict_type: Option<ValueType>,
 }
 
 struct HirIndexOffsets {
@@ -548,7 +614,7 @@ struct HirIndexOffsets {
 }
 
 /// Plan the SELECT that reads each row of `table` for an integrity check:
-/// the NOT NULL columns, the CHECK constraints, then for each index its
+/// the checked columns, the CHECK constraints, then for each index its
 /// partial condition, its key columns and the rowid. Values are read the
 /// way DML writes them: a plain column as stored, an expression or a
 /// generated column computed from decoded values, and a CHECK constraint
@@ -558,15 +624,14 @@ struct HirIndexOffsets {
 fn hir_table_rows(
     connection: &std::sync::Arc<crate::Connection>,
     catalog: &SemanticContext<'_>,
+    schema: &Schema,
     database_id: usize,
-    table: &BTreeTable,
+    table: &crate::sync::Arc<BTreeTable>,
     indexes: &[crate::sync::Arc<Index>],
 ) -> crate::Result<TableRows> {
-    let database = connection
-        .get_database_name_by_index(database_id)
-        .ok_or_else(|| {
-            crate::LimboError::InternalError(format!("no database with id {database_id}"))
-        })?;
+    let database = connection.namespaces().name(database_id).ok_or_else(|| {
+        crate::LimboError::InternalError(format!("no database with id {database_id}"))
+    })?;
     let column = |position: usize| -> crate::Result<ast::Expr> {
         let name = table.columns()[position].name.as_deref().ok_or_else(|| {
             crate::LimboError::InternalError(format!(
@@ -580,10 +645,14 @@ fn hir_table_rows(
         ))
     };
 
+    // A custom type column's declared type is checked through its storage
+    // type, as DML checks it.
+    let type_check_table = BTreeTable::type_check_table_ref(table, schema);
     let mut values = Vec::new();
-    let mut not_null = Vec::new();
+    let mut columns = Vec::new();
     for (i, col) in table.columns().iter().enumerate() {
-        if !col.notnull() || col.is_rowid_alias() {
+        // Nothing to check on the rowid alias.
+        if col.is_rowid_alias() || !(col.notnull() || table.is_strict) {
             continue;
         }
         values.push(if col.is_virtual_generated() {
@@ -591,7 +660,17 @@ fn hir_table_rows(
         } else {
             ScanValue::Stored(column(i)?)
         });
-        not_null.push(col.name.clone().unwrap_or_else(|| format!("column{i}")));
+        let type_check_col = &type_check_table.columns()[i];
+        columns.push(CheckedColumn {
+            name: col.name.clone().unwrap_or_else(|| format!("column{i}")),
+            type_name: type_check_col.ty_str.clone(),
+            not_null: col.notnull(),
+            strict_type: if table.is_strict {
+                type_check_col.strict_value_type()
+            } else {
+                None
+            },
+        });
     }
     for check in &table.check_constraints {
         values.push(ScanValue::Stored(check.expr.clone()));
@@ -647,8 +726,56 @@ fn hir_table_rows(
     Ok(TableRows::Hir(
         select,
         HirRowLayout {
-            not_null,
+            columns,
             indexes: offsets,
         },
     ))
+}
+
+/// The root pages of every table and index of `schema`, and of every
+/// materialized view this build cannot read.
+fn resolved_root_pages(schema: &Schema, mv_store: Option<&crate::MvStore>) -> Vec<i64> {
+    let mut root_pages = Vec::with_capacity(schema.tables.len() + schema.indexes.len());
+
+    // integrity_check verifies the physical file, so a placeholder (negative) root for an
+    // object a passive checkpoint has since materialized must be resolved to its real page.
+    let resolve_root = |root_page: i64| -> i64 {
+        match mv_store {
+            Some(mv) => mv.resolve_root_page(root_page),
+            None => root_page,
+        }
+    };
+
+    for table in schema.tables.values() {
+        if let Table::BTree(btree_table) = table.as_ref() {
+            let table_root = resolve_root(btree_table.root_page);
+            if table_root < 0 {
+                continue;
+            }
+            root_pages.push(table_root);
+            if let Some(indexes) = schema.indexes.get(btree_table.name.as_str()) {
+                for index in indexes {
+                    let index_root = resolve_root(index.root_page);
+                    if index_root > 0 {
+                        root_pages.push(index_root);
+                    }
+                }
+            }
+        }
+    }
+
+    // A materialized view created by an incompatible (older) storage version
+    // has no `Table::BTree` entry above: it is deliberately kept out of
+    // `schema.tables` so reads and writes still fail with the "DROP and
+    // recreate" error instead of touching storage this build cannot
+    // interpret. Its btree still owns a real page, though, so it must be
+    // counted here or the structural pass below reports it as orphaned.
+    for &root_page in schema.incompatible_materialized_view_roots.values() {
+        let view_root = resolve_root(root_page);
+        if view_root > 0 {
+            root_pages.push(view_root);
+        }
+    }
+
+    root_pages
 }

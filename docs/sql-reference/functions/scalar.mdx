@@ -348,7 +348,7 @@ SELECT quote(x'CAFE');       -- 'X''CAFE'''
 
 ### random() and randomblob(N)
 
-`random` returns a pseudo-random 64-bit signed integer. `randomblob` returns a blob of N pseudo-random bytes.
+`random` returns a pseudo-random 64-bit signed integer. Each call is evaluated independently, including multiple calls in the same expression. `randomblob` returns a blob of N pseudo-random bytes.
 
 ```sql
 SELECT random();           -- e.g., -4520312828827489743

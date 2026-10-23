@@ -18,6 +18,11 @@ pub(crate) enum ExprCollation {
     Absent,
     Explicit(hir::ResolvedCollation),
     Inherited(hir::ResolvedCollation),
+    /// A column that declares no collation. It compares as BINARY, and as
+    /// a comparison operand it takes precedence over the other side's
+    /// column collation, as any column does. The value itself carries no
+    /// collation.
+    InheritedBinary(hir::ResolvedCollation),
 }
 
 impl ExprCollation {
@@ -28,16 +33,40 @@ impl ExprCollation {
         }
     }
 
+    /// The collation a table column supplies: its declared one, or `binary`.
+    pub(crate) fn column(
+        collation: Option<hir::ResolvedCollation>,
+        binary: &hir::ResolvedCollation,
+    ) -> Self {
+        match collation {
+            Some(collation) => Self::Inherited(collation),
+            None => Self::InheritedBinary(binary.clone()),
+        }
+    }
+
+    /// The collation the value carries, if any.
     pub(crate) fn value(&self) -> Option<&hir::ResolvedCollation> {
         match self {
-            Self::Absent => None,
+            Self::Absent | Self::InheritedBinary(_) => None,
             Self::Explicit(collation) | Self::Inherited(collation) => Some(collation),
+        }
+    }
+
+    /// The collation a comparison decided by this operand uses: BINARY for
+    /// a column without a declared collation, so that the planner does not
+    /// take the collation of an index on the other side instead.
+    pub(crate) fn comparison_value(&self) -> Option<&hir::ResolvedCollation> {
+        match self {
+            Self::Absent => None,
+            Self::Explicit(collation)
+            | Self::Inherited(collation)
+            | Self::InheritedBinary(collation) => Some(collation),
         }
     }
 
     pub(crate) fn into_output(self) -> (Option<hir::ResolvedCollation>, bool) {
         match self {
-            Self::Absent => (None, false),
+            Self::Absent | Self::InheritedBinary(_) => (None, false),
             Self::Explicit(collation) => (Some(collation), true),
             Self::Inherited(collation) => (Some(collation), false),
         }
@@ -70,12 +99,6 @@ pub(crate) struct ExpandedColumn {
     pub(crate) resolved: ResolvedScopeExpr,
 }
 
-pub(crate) struct GroupColumn {
-    pub(crate) name: String,
-    pub(crate) resolved: ResolvedScopeExpr,
-    pub(crate) hidden: bool,
-}
-
 #[derive(Clone, Debug)]
 struct ColumnBinding {
     source: SourceId,
@@ -83,6 +106,13 @@ struct ColumnBinding {
     lookup_name: String,
     resolved: ResolvedScopeExpr,
     hidden: bool,
+    /// The implicit rowid a parenthesized join group saved for one of its
+    /// tables: a bare `rowid`, `oid` or `_rowid_` finds it.
+    rowid_names: bool,
+    /// The name a USING or NATURAL join compares: the column's own name,
+    /// or for a column of a join group the unique name the group gave it,
+    /// since SQLite looks the group's subquery up by column name.
+    using_name: String,
 }
 
 impl ColumnBinding {
@@ -106,6 +136,8 @@ impl ColumnBinding {
                 collation: ExprCollation::inherited(column.collation.clone()),
             },
             hidden: column.hidden,
+            rowid_names: false,
+            using_name: crate::util::normalize_ident(&column.name),
         }
     }
 
@@ -139,6 +171,103 @@ struct ScopeSource {
     columns: Vec<ColumnBinding>,
     rowid_available: bool,
     unqualified: bool,
+    /// Lookup names of this source's columns that `table.*` reads as the
+    /// merged USING value instead of the source's own column: a later USING
+    /// merges the name and a later RIGHT or FULL JOIN can leave the source's
+    /// own copy NULL. SQLite expands such a column as an unqualified name.
+    star_merged: Vec<String>,
+    /// For a parenthesized join group: what each column came from, and how
+    /// a name can reach it. Index-aligned with `columns`.
+    saved: Option<Vec<SavedGroupColumn>>,
+    /// Columns of this source that the USING or NATURAL join it is the
+    /// right side of merged, with how the merged value is formed. A
+    /// qualified name finds the copy on the left instead, unless the join
+    /// is a RIGHT JOIN.
+    using_merged: Vec<(String, hir::MergedColumnValue)>,
+}
+
+/// How a name of the outer query can reach a column of a parenthesized
+/// join group, as SQLite keeps it for the subquery it makes of the group.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum GroupColumnVisibility {
+    /// Bare names, qualified names and `*` find the column.
+    Visible,
+    /// Only a qualified name finds the column: a copy a USING merged.
+    QualifiedOnly,
+    /// Bare and qualified names find the column, but `*` omits it: a later
+    /// column whose name repeats a merged USING column's.
+    HiddenFromStar,
+}
+
+/// Where a column of a parenthesized join group came from. Names are
+/// normalized.
+#[derive(Clone, Debug)]
+pub(crate) enum SavedGroupColumnKind {
+    /// The one value of a USING column, placed before the sources it merges.
+    Using { name: String },
+    /// A column of a source inside the group, found through that source's
+    /// own name.
+    Table {
+        table: String,
+        database: Option<hir::DatabaseId>,
+        name: String,
+    },
+    /// The implicit rowid of a source inside the group, found through that
+    /// source's name with any rowid name.
+    RowId {
+        table: String,
+        database: Option<hir::DatabaseId>,
+    },
+}
+
+impl SavedGroupColumnKind {
+    fn matches_table(&self, table: &str, database: Option<hir::DatabaseId>) -> bool {
+        match self {
+            Self::Using { .. } => false,
+            Self::Table {
+                table: saved_table,
+                database: saved_database,
+                ..
+            }
+            | Self::RowId {
+                table: saved_table,
+                database: saved_database,
+            } => {
+                saved_table == table
+                    && database.is_none_or(|database| *saved_database == Some(database))
+            }
+        }
+    }
+
+    fn matches_column(&self, name: &str) -> bool {
+        match self {
+            Self::Using { name: saved } | Self::Table { name: saved, .. } => saved == name,
+            Self::RowId { .. } => is_rowid_name(name),
+        }
+    }
+}
+
+/// What a qualified name found among one scope's own sources.
+enum QualifiedLookup {
+    Found(Box<ResolvedScopeExpr>),
+    /// A source of that name exists here, but none has the column.
+    NoSuchColumn,
+    /// No source of that name exists here.
+    NoSuchTable,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct SavedGroupColumn {
+    pub(crate) kind: SavedGroupColumnKind,
+    pub(crate) visibility: GroupColumnVisibility,
+}
+
+/// One column a parenthesized join group exposes to the query around it.
+pub(crate) struct GroupColumnDef {
+    /// The column's name in the group, unique among the group's columns.
+    pub(crate) name: String,
+    pub(crate) value: ResolvedScopeExpr,
+    pub(crate) saved: SavedGroupColumn,
 }
 
 #[derive(Clone, Debug)]
@@ -161,14 +290,39 @@ pub(crate) struct Scope {
     outputs: Vec<ScopeOutput>,
     outer: Option<Arc<Scope>>,
     outer_resolution_blocked: bool,
+    /// PostgreSQL rule: `t.c` reads the nearest source named `t`, and is an
+    /// error when that source has no column `c`, even when an outer query
+    /// has a `t` with one.
+    qualified_uses_nearest_table_only: bool,
+    /// The names of the attached databases by index, for error messages
+    /// that name a column with its database.
+    database_names: Vec<String>,
 }
 
 impl Scope {
     pub(crate) fn new(outer: Option<Scope>) -> Self {
         Self {
+            qualified_uses_nearest_table_only: outer
+                .as_ref()
+                .is_some_and(|outer| outer.qualified_uses_nearest_table_only),
             outer: outer.map(Arc::new),
             ..Self::default()
         }
+    }
+
+    pub(crate) fn with_qualified_uses_nearest_table_only(mut self, enabled: bool) -> Self {
+        self.qualified_uses_nearest_table_only = enabled;
+        self
+    }
+
+    pub(crate) fn set_database_names(&mut self, names: Vec<String>) {
+        self.database_names = names;
+    }
+
+    fn database_name(&self, database: Option<hir::DatabaseId>) -> Option<&str> {
+        self.database_names
+            .get(database?.index())
+            .map(String::as_str)
     }
 
     pub(crate) fn without_outer_resolution(mut self) -> Self {
@@ -197,7 +351,192 @@ impl Scope {
             columns,
             rowid_available: source.rowid_available,
             unqualified,
+            star_merged: Vec::new(),
+            saved: None,
+            using_merged: Vec::new(),
         });
+    }
+
+    /// Add a parenthesized join group of several sources. A bare name finds
+    /// a column by the name it had in the group, not by the unique name the
+    /// group gave it; a column a USING merged is found through a qualified
+    /// name only.
+    pub(crate) fn add_group_source(&mut self, source: &hir::Source, saved: Vec<SavedGroupColumn>) {
+        assert_eq!(
+            source.columns.len(),
+            saved.len(),
+            "every column of a join group has a saved origin"
+        );
+        self.add_source(source, false);
+        let added = self.sources.last_mut().expect("source was just added");
+        added.unqualified = true;
+        for (column, saved) in added.columns.iter().zip(&saved) {
+            if saved.visibility == GroupColumnVisibility::QualifiedOnly {
+                continue;
+            }
+            let mut visible = column.clone();
+            visible.hidden = saved.visibility == GroupColumnVisibility::HiddenFromStar;
+            match &saved.kind {
+                SavedGroupColumnKind::Using { name } | SavedGroupColumnKind::Table { name, .. } => {
+                    visible.lookup_name.clone_from(name);
+                }
+                // `*` never lists a saved rowid.
+                SavedGroupColumnKind::RowId { .. } => {
+                    visible.rowid_names = true;
+                    visible.hidden = true;
+                }
+            }
+            self.visible_columns.push(visible);
+        }
+        added.saved = Some(saved);
+    }
+
+    /// The columns a parenthesized join group of these sources exposes, as
+    /// SQLite's `selectExpander` lists them for the subquery it makes of
+    /// the group: for each source, the one value of each USING column of
+    /// the next join, then the source's own columns, then its implicit
+    /// rowid. Names repeated within the group get `:N` suffixes.
+    pub(crate) fn saved_group_columns(&self, from: &hir::From) -> Result<Vec<GroupColumnDef>> {
+        if self.sources.len() != from.joins.len() + 1 {
+            return Err(crate::LimboError::InternalError(
+                "join group scope does not match its FROM clause".to_string(),
+            ));
+        }
+        let using_names = |join: Option<&hir::Join>| -> Vec<String> {
+            match join.map(|join| &join.constraint) {
+                Some(
+                    hir::JoinConstraint::Using(columns) | hir::JoinConstraint::Natural(columns),
+                ) => columns
+                    .iter()
+                    .map(|column| crate::util::normalize_ident(&column.name))
+                    .collect(),
+                Some(hir::JoinConstraint::On(_) | hir::JoinConstraint::None) | None => Vec::new(),
+            }
+        };
+        let mut defs = Vec::new();
+        for (position, source) in self.sources.iter().enumerate() {
+            let next_using = using_names(from.joins.get(position));
+            let own_using = using_names(position.checked_sub(1).map(|join| &from.joins[join]));
+            for name in &next_using {
+                // The group's subquery reads the USING column as a bare
+                // name: the merged value the joins left visible. Another
+                // unmerged copy makes that name ambiguous, whether or not
+                // the outer query reads it.
+                let Some(value) = self.resolve_source_column(name)? else {
+                    return Err(crate::LimboError::InternalError(format!(
+                        "USING column {name} of a join group is not visible"
+                    )));
+                };
+                defs.push(GroupColumnDef {
+                    name: name.clone(),
+                    value,
+                    saved: SavedGroupColumn {
+                        kind: SavedGroupColumnKind::Using { name: name.clone() },
+                        visibility: GroupColumnVisibility::Visible,
+                    },
+                });
+            }
+            for (index, column) in source.columns.iter().enumerate() {
+                let mut saved = match &source.saved {
+                    // A rowid entry is not copied through a second group.
+                    Some(saved)
+                        if matches!(saved[index].kind, SavedGroupColumnKind::RowId { .. }) =>
+                    {
+                        continue
+                    }
+                    Some(saved) => saved[index].clone(),
+                    None if column.hidden => continue,
+                    None => SavedGroupColumn {
+                        kind: SavedGroupColumnKind::Table {
+                            table: source.qualifier.clone(),
+                            database: source.database,
+                            name: column.lookup_name.clone(),
+                        },
+                        visibility: GroupColumnVisibility::Visible,
+                    },
+                };
+                if own_using.contains(&column.lookup_name)
+                    || next_using.contains(&column.lookup_name)
+                {
+                    saved.visibility = GroupColumnVisibility::QualifiedOnly;
+                }
+                defs.push(GroupColumnDef {
+                    name: column.display_name.clone(),
+                    value: column.resolved(),
+                    saved,
+                });
+            }
+            if source.rowid_available && source.saved.is_none() {
+                // The first rowid name that is not a declared column.
+                if let Some(name) = ["_ROWID_", "ROWID", "OID"].into_iter().find(|name| {
+                    !source
+                        .columns
+                        .iter()
+                        .any(|column| column.lookup_name.eq_ignore_ascii_case(name))
+                }) {
+                    defs.push(GroupColumnDef {
+                        name: name.to_string(),
+                        value: resolved_rowid(source.id),
+                        saved: SavedGroupColumn {
+                            kind: SavedGroupColumnKind::RowId {
+                                table: source.qualifier.clone(),
+                                database: source.database,
+                            },
+                            visibility: GroupColumnVisibility::Visible,
+                        },
+                    });
+                }
+            }
+        }
+        // Repeated names get `:N` suffixes. A later copy of a merged USING
+        // value is found by a qualified name only; an unrelated column that
+        // repeats a USING name stays findable but leaves `*`.
+        for index in 0..defs.len() {
+            let original = defs[index].name.clone();
+            let base = match original.rfind(':') {
+                Some(colon)
+                    if colon > 0 && original[colon + 1..].chars().all(|c| c.is_ascii_digit()) =>
+                {
+                    original[..colon].to_string()
+                }
+                _ => original.clone(),
+            };
+            let mut candidate = original;
+            let mut suffix = 0;
+            while let Some(previous) = defs[..index]
+                .iter()
+                .position(|def| def.name.eq_ignore_ascii_case(&candidate))
+            {
+                if matches!(
+                    defs[previous].saved.kind,
+                    SavedGroupColumnKind::Using { .. }
+                ) {
+                    let current = &mut defs[index].saved;
+                    if matches!(current.kind, SavedGroupColumnKind::Using { .. }) {
+                        current.visibility = GroupColumnVisibility::QualifiedOnly;
+                    } else if current.visibility != GroupColumnVisibility::QualifiedOnly {
+                        current.visibility = GroupColumnVisibility::HiddenFromStar;
+                    }
+                }
+                suffix += 1;
+                candidate = format!("{base}:{suffix}");
+            }
+            defs[index].name = candidate;
+        }
+        Ok(defs)
+    }
+
+    /// Record the columns of `source` that `table.*` reads as merged USING
+    /// values. `names` are the USING column names of the joins after the
+    /// source; they apply only when a RIGHT or FULL JOIN also follows it.
+    pub(crate) fn mark_star_merged_columns(&mut self, source: SourceId, names: &[String]) {
+        let Some(scope_source) = self.sources.iter_mut().find(|entry| entry.id == source) else {
+            return;
+        };
+        scope_source.star_merged = names
+            .iter()
+            .map(|name| crate::util::normalize_ident(name))
+            .collect();
     }
 
     /// Add a table the way its schema text sees it: under the table's own
@@ -232,26 +571,6 @@ impl Scope {
     pub(crate) fn set_outer(&mut self, outer: Option<&Self>) {
         assert!(self.outer.is_none(), "scope already has an outer scope");
         self.outer = outer.cloned().map(Arc::new);
-    }
-
-    /// Add only another scope's qualified table namespaces. Group columns
-    /// provide unqualified visibility; inner sources remain available for
-    /// `table.column` lookup when the group has no alias.
-    pub(crate) fn append_qualified_sources(&mut self, other: Self) {
-        assert!(self.outputs.is_empty(), "destination scope has outputs");
-        assert!(other.outputs.is_empty(), "appended scope has outputs");
-        self.sources.extend(other.sources);
-    }
-
-    pub(crate) fn group_columns(&self) -> Vec<GroupColumn> {
-        self.visible_columns
-            .iter()
-            .map(|column| GroupColumn {
-                name: column.display_name.clone(),
-                resolved: column.resolved(),
-                hidden: column.hidden,
-            })
-            .collect()
     }
 
     pub(crate) fn has_sources(&self) -> bool {
@@ -356,52 +675,187 @@ impl Scope {
     ) -> Result<Option<ResolvedScopeExpr>> {
         let normalized_qualifier = crate::util::normalize_ident(qualifier);
         let normalized_column = crate::util::normalize_ident(column);
-        let matching_sources: Vec<_> = self
-            .sources
-            .iter()
-            .filter(|source| source.qualifier == normalized_qualifier)
-            .collect();
-
-        if matching_sources.is_empty() {
-            if self.outer_resolution_blocked {
-                if self
-                    .outer
-                    .as_deref()
-                    .is_some_and(|outer| outer.has_qualifier(&normalized_qualifier))
-                {
+        let lookup =
+            self.qualified_lookup(&normalized_qualifier, None, &normalized_column, || {
+                format!("{qualifier}.{column}")
+            })?;
+        match lookup {
+            QualifiedLookup::Found(resolved) => Ok(Some(*resolved)),
+            QualifiedLookup::NoSuchColumn => {
+                // A source of that name without the column does not hide an
+                // outer source that has it, except under PostgreSQL's rule.
+                if self.outer_resolution_blocked || self.qualified_uses_nearest_table_only {
                     crate::bail_parse_error!("no such column: {qualifier}.{column}");
                 }
-                return Ok(None);
+                match self.outer.as_deref() {
+                    Some(outer) => match outer.resolve_qualified(qualifier, column) {
+                        Ok(Some(resolved)) => Ok(Some(resolved)),
+                        Ok(None) | Err(_) => {
+                            crate::bail_parse_error!("no such column: {qualifier}.{column}")
+                        }
+                    },
+                    None => crate::bail_parse_error!("no such column: {qualifier}.{column}"),
+                }
             }
-            return self
-                .outer
-                .as_deref()
-                .map_or(Ok(None), |outer| outer.resolve_qualified(qualifier, column));
+            QualifiedLookup::NoSuchTable => {
+                if self.outer_resolution_blocked {
+                    if self
+                        .outer
+                        .as_deref()
+                        .is_some_and(|outer| outer.has_qualifier(&normalized_qualifier))
+                    {
+                        crate::bail_parse_error!("no such column: {qualifier}.{column}");
+                    }
+                    return Ok(None);
+                }
+                self.outer
+                    .as_deref()
+                    .map_or(Ok(None), |outer| outer.resolve_qualified(qualifier, column))
+            }
         }
+    }
 
-        let mut found = None;
-        for source in matching_sources {
-            let resolved = source
+    /// Look `table.column` up among this scope's own sources: the sources
+    /// of that name, and the sources of that name inside parenthesized
+    /// join groups. A group named `table` is looked up by the names it
+    /// gave its columns only when no source inside it is named `table`.
+    /// The copy of a USING column on the join's right side gives way to
+    /// the copy on the left, except under a RIGHT JOIN, as SQLite's
+    /// `lookupName` resolves it.
+    fn qualified_lookup(
+        &self,
+        table: &str,
+        database: Option<hir::DatabaseId>,
+        column: &str,
+        written: impl Fn() -> String,
+    ) -> Result<QualifiedLookup> {
+        let mut found: Option<ResolvedScopeExpr> = None;
+        let mut table_seen = false;
+        // Like SQLite's `lookupName`: of the copies of a USING column that
+        // the name matches, a LEFT or inner join reads the left one, a
+        // RIGHT JOIN the right one, and a FULL JOIN the coalesced value.
+        let mut add =
+            |candidate: ResolvedScopeExpr, merged: Option<hir::MergedColumnValue>| -> Result<()> {
+                match (merged, &found) {
+                    (Some(hir::MergedColumnValue::Right), _) | (_, None) => found = Some(candidate),
+                    (Some(hir::MergedColumnValue::Coalesce), Some(_)) => {
+                        found = Some(self.merged_star_column_named(column, &written())?);
+                    }
+                    (Some(hir::MergedColumnValue::Left), Some(_)) => {}
+                    (None, Some(_)) => {
+                        crate::bail_parse_error!("ambiguous column name: {}", written());
+                    }
+                }
+                Ok(())
+            };
+        let merged_value = |source: &ScopeSource, name: &str| {
+            source
+                .using_merged
+                .iter()
+                .find(|(merged, _)| merged == name)
+                .map(|(_, value)| *value)
+        };
+        for source in &self.sources {
+            if let Some(saved) = &source.saved {
+                let inner: Vec<usize> = saved
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, saved)| saved.kind.matches_table(table, database))
+                    .map(|(index, _)| index)
+                    .collect();
+                if !inner.is_empty() {
+                    table_seen = true;
+                    // A declared column wins over the table's implicit rowid.
+                    let declared: Vec<usize> = inner
+                        .iter()
+                        .copied()
+                        .filter(|index| {
+                            matches!(&saved[*index].kind, SavedGroupColumnKind::Table { name, .. } if name == column)
+                        })
+                        .collect();
+                    let matches: Vec<usize> = if declared.is_empty() {
+                        inner
+                            .iter()
+                            .copied()
+                            .filter(|index| saved[*index].kind.matches_column(column))
+                            .collect()
+                    } else {
+                        declared
+                    };
+                    // A source inside the group without the column leaves
+                    // the group's own name to be checked.
+                    if matches.is_empty() && database.is_none() && source.qualifier == table {
+                        if let Some(candidate) = source
+                            .columns
+                            .iter()
+                            .find(|candidate| candidate.lookup_name == column)
+                        {
+                            add(candidate.resolved(), None)?;
+                        }
+                        continue;
+                    }
+                    for index in matches {
+                        let name = match &saved[index].kind {
+                            SavedGroupColumnKind::Using { name }
+                            | SavedGroupColumnKind::Table { name, .. } => name.as_str(),
+                            SavedGroupColumnKind::RowId { .. } => column,
+                        };
+                        add(
+                            source.columns[index].resolved(),
+                            merged_value(source, &source.columns[index].using_name)
+                                .or_else(|| merged_value(source, name)),
+                        )?;
+                    }
+                    continue;
+                }
+            }
+            // SQLite checks the database against the table's and the
+            // name against the alias: `main.a.id` finds `main.t AS a`.
+            let named = match database {
+                Some(database) => source.database == Some(database) && source.qualifier == table,
+                None => source.qualifier == table,
+            };
+            if !named {
+                continue;
+            }
+            table_seen = true;
+            let declared = source
                 .columns
                 .iter()
-                .find(|candidate| candidate.lookup_name == normalized_column)
-                .map(ColumnBinding::resolved)
-                .or_else(|| {
-                    (source.rowid_available && is_rowid_name(&normalized_column))
-                        .then(|| resolved_rowid(source.id))
-                });
-            if resolved.is_some() && found.is_some() {
-                crate::bail_parse_error!("ambiguous column name: {}.{}", qualifier, column);
-            }
-            if resolved.is_some() {
-                found = resolved;
+                .find(|candidate| candidate.lookup_name == column);
+            match declared {
+                Some(candidate) => add(candidate.resolved(), merged_value(source, column))?,
+                None if source.rowid_available && is_rowid_name(column) => {
+                    add(resolved_rowid(source.id), None)?
+                }
+                None => {}
             }
         }
+        Ok(match found {
+            Some(found) => QualifiedLookup::Found(Box::new(found)),
+            None if table_seen => QualifiedLookup::NoSuchColumn,
+            None => QualifiedLookup::NoSuchTable,
+        })
+    }
 
-        let Some(found) = found else {
-            crate::bail_parse_error!("no such column: {}.{}", qualifier, column);
-        };
-        Ok(Some(found))
+    /// The columns of parenthesized join groups that came from a source
+    /// named `table`, with the group they are in.
+    fn saved_group_matches(
+        &self,
+        table: &str,
+        database: Option<hir::DatabaseId>,
+    ) -> Vec<(&ScopeSource, usize)> {
+        self.sources
+            .iter()
+            .filter_map(|source| source.saved.as_ref().map(|saved| (source, saved)))
+            .flat_map(|(source, saved)| {
+                saved
+                    .iter()
+                    .enumerate()
+                    .filter(move |(_, saved)| saved.kind.matches_table(table, database))
+                    .map(move |(index, _)| (source, index))
+            })
+            .collect()
     }
 
     pub(crate) fn resolve_database_qualified(
@@ -412,48 +866,43 @@ impl Scope {
     ) -> Result<Option<ResolvedScopeExpr>> {
         let normalized_table = crate::util::normalize_ident(table);
         let normalized_column = crate::util::normalize_ident(column);
-        let matching_sources: Vec<_> = self
-            .sources
-            .iter()
-            .filter(|source| {
-                source.database_qualified
-                    && source.database == Some(database)
-                    && source.table_name == normalized_table
-            })
-            .collect();
-
-        if matching_sources.is_empty() {
-            if self.outer_resolution_blocked {
-                return Ok(None);
-            }
-            return self.outer.as_deref().map_or(Ok(None), |outer| {
-                outer.resolve_database_qualified(database, table, column)
-            });
-        }
-
-        let mut found = None;
-        for source in matching_sources {
-            let resolved = source
-                .columns
-                .iter()
-                .find(|candidate| candidate.lookup_name == normalized_column)
-                .map(ColumnBinding::resolved)
-                .or_else(|| {
-                    (source.rowid_available && is_rowid_name(&normalized_column))
-                        .then(|| resolved_rowid(source.id))
-                });
-            if resolved.is_some() && found.is_some() {
-                crate::bail_parse_error!("ambiguous column name: {}.{}", table, column);
-            }
-            if resolved.is_some() {
-                found = resolved;
-            }
-        }
-
-        let Some(found) = found else {
-            crate::bail_parse_error!("no such column: {}.{}", table, column);
+        let written = || {
+            let database = self.database_name(Some(database)).unwrap_or("main");
+            format!("{database}.{table}.{column}")
         };
-        Ok(Some(found))
+        let lookup = self.qualified_lookup(
+            &normalized_table,
+            Some(database),
+            &normalized_column,
+            written,
+        )?;
+        match lookup {
+            QualifiedLookup::Found(resolved) => Ok(Some(*resolved)),
+            QualifiedLookup::NoSuchColumn => {
+                if self.outer_resolution_blocked || self.qualified_uses_nearest_table_only {
+                    crate::bail_parse_error!("no such column: {}", written());
+                }
+                match self.outer.as_deref() {
+                    Some(outer) => {
+                        match outer.resolve_database_qualified(database, table, column) {
+                            Ok(Some(resolved)) => Ok(Some(resolved)),
+                            Ok(None) | Err(_) => {
+                                crate::bail_parse_error!("no such column: {}", written())
+                            }
+                        }
+                    }
+                    None => crate::bail_parse_error!("no such column: {}", written()),
+                }
+            }
+            QualifiedLookup::NoSuchTable => {
+                if self.outer_resolution_blocked {
+                    return Ok(None);
+                }
+                self.outer.as_deref().map_or(Ok(None), |outer| {
+                    outer.resolve_database_qualified(database, table, column)
+                })
+            }
+        }
     }
 
     pub(crate) fn expand_star(&self) -> Result<Vec<ExpandedColumn>> {
@@ -484,10 +933,46 @@ impl Scope {
             }
         }
 
+        // The one source of a FROM clause that is a join group expands as
+        // bare names, which the group's repeated names make ambiguous.
+        let bare_group = matches!(self.sources.as_slice(), [source] if source.saved.is_some());
+        // With several sources, a column of a direct source expands as
+        // `database.table.column`, which a source of the same name inside a
+        // join group can make ambiguous.
+        let several = self.sources.len() > 1;
         self.visible_columns
             .iter()
             .filter(|column| !column.hidden)
             .map(|column| {
+                if bare_group {
+                    self.resolve_source_column(&column.lookup_name)?;
+                }
+                let source = self
+                    .sources
+                    .iter()
+                    .find(|source| source.id == column.source);
+                if let Some(source) = source.filter(|source| several && source.saved.is_none()) {
+                    let collides = self
+                        .saved_group_matches(&source.qualifier, source.database)
+                        .into_iter()
+                        .any(|(group, index)| {
+                            let saved = group.saved.as_ref().expect("group");
+                            matches!(&saved[index].kind, SavedGroupColumnKind::Table { name, .. } if *name == column.lookup_name)
+                                && !group
+                                    .using_merged
+                                    .iter()
+                                    .any(|(merged, _)| *merged == column.lookup_name)
+                        });
+                    if collides {
+                        let written = match self.database_name(source.database) {
+                            Some(database) => {
+                                format!("{database}.{}.{}", source.qualifier, column.display_name)
+                            }
+                            None => format!("{}.{}", source.qualifier, column.display_name),
+                        };
+                        crate::bail_parse_error!("ambiguous column name: {written}");
+                    }
+                }
                 let qualifier = self
                     .sources
                     .iter()
@@ -510,55 +995,198 @@ impl Scope {
 
     pub(crate) fn expand_table_star(&self, qualifier: &str) -> Result<Vec<ExpandedColumn>> {
         let normalized = crate::util::normalize_ident(qualifier);
+        // The name of a join group does not qualify `*`; the names of the
+        // sources inside it do.
         let matching: Vec<_> = self
             .sources
             .iter()
-            .filter(|source| source.qualifier == normalized)
+            .filter(|source| source.qualifier == normalized && source.saved.is_none())
             .collect();
-        if matching.is_empty() {
+        let saved_matches: Vec<_> = self
+            .saved_group_matches(&normalized, None)
+            .into_iter()
+            .filter(|(source, index)| {
+                !matches!(
+                    source.saved.as_ref().expect("group")[*index].kind,
+                    SavedGroupColumnKind::RowId { .. }
+                )
+            })
+            .collect();
+        if matching.is_empty() && saved_matches.is_empty() {
             crate::bail_parse_error!("no such table: {}", qualifier);
         }
         if matching.len() > 1 {
             crate::bail_parse_error!("ambiguous table name: {}", qualifier);
         }
-        Ok(matching[0]
+        if !saved_matches.is_empty() {
+            // The group's subquery expands these as names qualified by the
+            // source, so a direct source of the same name with the same
+            // column makes them ambiguous. The one source of a FROM
+            // clause expands as bare names instead.
+            let bare = self.sources.len() == 1;
+            let mut expanded = Vec::new();
+            for source in &matching {
+                for column in source.columns.iter().filter(|column| !column.hidden) {
+                    // With several sources, the column expands as
+                    // `database.table.column`, which a source of the same
+                    // name in another database does not make ambiguous.
+                    let resolved = if source.star_merged.contains(&column.lookup_name) {
+                        self.merged_star_column(column)?
+                    } else {
+                        match source.database {
+                            Some(database) => self.resolve_database_qualified(
+                                database,
+                                qualifier,
+                                &column.display_name,
+                            )?,
+                            None => self.resolve_qualified(qualifier, &column.display_name)?,
+                        }
+                        .unwrap_or_else(|| column.resolved())
+                    };
+                    expanded.push(ExpandedColumn {
+                        name: column.display_name.clone(),
+                        qualifier: source.qualifier.clone(),
+                        resolved,
+                    });
+                }
+            }
+            for (source, index) in saved_matches {
+                let column = &source.columns[index];
+                let saved_name = self.saved_column_name(column);
+                // The group's subquery expands these under the group's
+                // own name, so a direct source cannot make them ambiguous.
+                // The one source of a FROM clause expands them as bare
+                // names, by the unique names the group gave them.
+                let resolved = if bare {
+                    let Some(resolved) = self.resolve_source_column(&column.using_name)? else {
+                        crate::bail_parse_error!("no such column: {}", column.display_name);
+                    };
+                    resolved
+                } else if source.star_merged.contains(&saved_name) {
+                    self.merged_star_column_named(&saved_name, &column.display_name)?
+                } else {
+                    column.resolved()
+                };
+                // SQLite names a column of a join group after the group,
+                // which it treats as a subquery, unless the group is the
+                // one source of the FROM clause.
+                expanded.push(ExpandedColumn {
+                    name: column.display_name.clone(),
+                    qualifier: if bare {
+                        normalized.clone()
+                    } else {
+                        source.qualifier.clone()
+                    },
+                    resolved,
+                });
+            }
+            return Ok(expanded);
+        }
+        let source = matching[0];
+        source
             .columns
             .iter()
             .filter(|column| !column.hidden)
-            .map(|column| ExpandedColumn {
-                name: column.display_name.clone(),
-                qualifier: matching[0].qualifier.clone(),
-                resolved: column.resolved(),
+            .map(|column| {
+                let resolved = if source.star_merged.contains(&column.lookup_name) {
+                    self.merged_star_column(column)?
+                } else {
+                    column.resolved()
+                };
+                Ok(ExpandedColumn {
+                    name: column.display_name.clone(),
+                    qualifier: source.qualifier.clone(),
+                    resolved,
+                })
             })
-            .collect())
+            .collect()
     }
 
-    pub(crate) fn resolve_using_left(&self, name: &str) -> Result<ResolvedScopeExpr> {
-        let normalized = crate::util::normalize_ident(name);
-        self.visible_columns
+    /// The name a column had before its join group made it unique.
+    fn saved_column_name(&self, column: &ColumnBinding) -> String {
+        self.sources
             .iter()
-            .find(|column| column.lookup_name == normalized)
-            .map(ColumnBinding::resolved)
-            .ok_or_else(|| {
-                crate::LimboError::ParseError(format!(
-                    "cannot join using column {name} - column not present in both tables"
-                ))
+            .find(|source| source.id == column.source)
+            .and_then(|source| {
+                let saved = source.saved.as_ref()?;
+                let index = source
+                    .columns
+                    .iter()
+                    .position(|candidate| candidate.display_name == column.display_name)?;
+                match &saved[index].kind {
+                    SavedGroupColumnKind::Using { name }
+                    | SavedGroupColumnKind::Table { name, .. } => Some(name.clone()),
+                    SavedGroupColumnKind::RowId { .. } => None,
+                }
             })
+            .unwrap_or_else(|| column.lookup_name.clone())
     }
 
-    pub(crate) fn resolve_natural_left(&self, name: &str) -> Result<ResolvedScopeExpr> {
-        let normalized = crate::util::normalize_ident(name);
+    /// The value `table.*` reads for a column a later USING merged: the one
+    /// visible column of that name, as an unqualified reference would find.
+    fn merged_star_column(&self, column: &ColumnBinding) -> Result<ResolvedScopeExpr> {
+        self.merged_star_column_named(&column.lookup_name, &column.display_name)
+    }
+
+    fn merged_star_column_named(
+        &self,
+        lookup_name: &str,
+        display_name: &str,
+    ) -> Result<ResolvedScopeExpr> {
         let mut matches = self
             .visible_columns
             .iter()
-            .filter(|column| !column.hidden && column.lookup_name == normalized);
-        let Some(column) = matches.next() else {
-            return Err(crate::LimboError::InternalError(format!(
-                "NATURAL join column {name} disappeared from the visible scope"
-            )));
+            .filter(|visible| visible.lookup_name == lookup_name);
+        let Some(first) = matches.next() else {
+            crate::bail_parse_error!("no such column: {display_name}");
         };
         if matches.next().is_some() {
-            crate::bail_parse_error!("ambiguous column name: {name}");
+            crate::bail_parse_error!("ambiguous column name: {display_name}");
+        }
+        Ok(first.resolved())
+    }
+
+    /// The earlier column a USING or NATURAL join compares with. Copies an
+    /// earlier USING already merged are no longer visible, so the visible
+    /// copies are the unmerged ones. Without a RIGHT or FULL JOIN in the
+    /// FROM list, SQLite compares only the first copy. With one, a second
+    /// unmerged copy is an error, as in `sqlite3ProcessJoin` (select.c):
+    ///
+    /// ```sql
+    /// SELECT * FROM t1 JOIN t2 USING(a) JOIN t3 USING(a) RIGHT JOIN t4 ON 1;  -- ok
+    /// SELECT * FROM t1 JOIN t2 ON 1 JOIN t3 USING(a) RIGHT JOIN t4 ON 1;
+    /// -- ambiguous reference to a in USING()
+    /// ```
+    ///
+    /// A NATURAL join ignores hidden columns; a USING clause does not.
+    pub(crate) fn resolve_using_left(
+        &self,
+        name: &str,
+        natural: bool,
+        has_right_or_full_join: bool,
+    ) -> Result<ResolvedScopeExpr> {
+        let normalized = crate::util::normalize_ident(name);
+        // One copy per source: a join group is one source with one column
+        // of each name.
+        let mut matches = self.sources.iter().filter_map(|source| {
+            self.visible_columns.iter().find(|column| {
+                column.source == source.id
+                    && (!natural || !column.hidden)
+                    && column.using_name == normalized
+            })
+        });
+        let Some(column) = matches.next() else {
+            if natural {
+                return Err(crate::LimboError::InternalError(format!(
+                    "NATURAL join column {name} disappeared from the visible scope"
+                )));
+            }
+            crate::bail_parse_error!(
+                "cannot join using column {name} - column not present in both tables"
+            );
+        };
+        if has_right_or_full_join && matches.next().is_some() {
+            crate::bail_parse_error!("ambiguous reference to {name} in USING()");
         }
         Ok(column.resolved())
     }
@@ -572,8 +1200,8 @@ impl Scope {
                 let lookup = crate::util::normalize_ident(&right_column.name);
                 self.visible_columns
                     .iter()
-                    .find(|left_column| !left_column.hidden && left_column.lookup_name == lookup)
-                    .map(|left_column| left_column.display_name.clone())
+                    .find(|left_column| !left_column.hidden && left_column.using_name == lookup)
+                    .map(|_| right_column.name.clone())
             })
             .collect()
     }
@@ -593,13 +1221,22 @@ impl Scope {
                 )));
             };
             let lookup_name = crate::util::normalize_ident(&using.name);
+            if let Some(right_source) = self
+                .sources
+                .iter_mut()
+                .find(|source| source.id == using.right.source)
+            {
+                right_source
+                    .using_merged
+                    .push((lookup_name.clone(), using.value));
+            }
             let left_position = self
                 .visible_columns
                 .iter()
                 .enumerate()
                 .find(|(position, column)| {
                     *position != right_position
-                        && column.lookup_name == lookup_name
+                        && column.using_name == lookup_name
                         && same_join_column(&column.resolved.expr, &using.left)
                 })
                 .map(|(position, _)| position);
@@ -628,7 +1265,27 @@ impl Scope {
                 has_affinity: using.has_affinity,
                 collation: ExprCollation::inherited(using.collation.clone()),
             };
+            let left_source = left.source;
+            let merged_expr = left.resolved.expr.clone();
             self.visible_columns.remove(right_position);
+            // Every column of the right source with the merged name gives
+            // way to the merged value: a join group can hold several
+            // columns the name finds. Under a RIGHT JOIN the merged value
+            // also replaces every other copy on the left, as SQLite's
+            // `lookupName` lets the right-most table win.
+            let right_join = using.value == hir::MergedColumnValue::Right;
+            self.visible_columns.retain(|column| {
+                if column.lookup_name != lookup_name {
+                    return true;
+                }
+                if same_join_column(&column.resolved.expr, &merged_expr) {
+                    return true;
+                }
+                if right_join {
+                    return false;
+                }
+                column.source == left_source || column.source != using.right.source
+            });
         }
         Ok(())
     }
@@ -638,7 +1295,7 @@ impl Scope {
         for column in self
             .visible_columns
             .iter()
-            .filter(|column| column.lookup_name == name)
+            .filter(|column| !column.rowid_names && column.lookup_name == name)
         {
             if found.is_some() {
                 crate::bail_parse_error!("ambiguous column name: {}", name);
@@ -649,8 +1306,20 @@ impl Scope {
             return Ok(found);
         }
 
+        // A declared column of any name wins over every implicit rowid,
+        // including the rowids parenthesized join groups saved.
         if !is_rowid_name(name) {
             return Ok(None);
+        }
+        for column in self
+            .visible_columns
+            .iter()
+            .filter(|column| column.rowid_names)
+        {
+            if found.is_some() {
+                crate::bail_parse_error!("ambiguous column name: {}", name);
+            }
+            found = Some(column.resolved());
         }
         for source in self
             .sources
@@ -679,10 +1348,13 @@ impl Scope {
         self.outputs.iter().find(|output| output.id == id)
     }
 
-    fn has_qualifier(&self, qualifier: &str) -> bool {
+    /// Whether a source of this scope or an enclosing one is named
+    /// `qualifier` (normalized), whatever this scope may resolve.
+    pub(crate) fn has_qualifier(&self, qualifier: &str) -> bool {
         self.sources
             .iter()
             .any(|source| source.qualifier == qualifier)
+            || !self.saved_group_matches(qualifier, None).is_empty()
             || self
                 .outer
                 .as_deref()
@@ -984,7 +1656,7 @@ mod tests {
     }
 
     #[test]
-    fn matched_local_qualifier_blocks_outer_fallback() {
+    fn local_qualifier_without_the_column_falls_back_to_the_outer_source() {
         let outer_items = source(
             0,
             "outer_items",
@@ -1005,11 +1677,13 @@ mod tests {
         let mut inner = Scope::new(Some(outer));
         inner.add_source(&inner_items, true);
 
-        let error = inner
+        // A local source of that name without the column does not hide
+        // the outer source that has it.
+        let resolved = inner
             .resolve_qualified("chosen", "id")
-            .expect_err("local qualifier prevents outer-column fallback");
-
-        assert!(error.to_string().contains("no such column: chosen.id"));
+            .expect("outer column resolves")
+            .expect("outer column is found");
+        expect_column(resolved, outer_items.id, 0);
     }
 
     #[test]
@@ -1078,13 +1752,16 @@ mod tests {
             .resolve_database_qualified(DatabaseId::new(0), "items", "id")
             .expect_err("duplicate database-qualified columns are ambiguous");
 
-        assert!(error
-            .to_string()
-            .contains("ambiguous column name: items.id"));
+        assert!(
+            error
+                .to_string()
+                .contains("ambiguous column name: main.items.id"),
+            "{error}"
+        );
     }
 
     #[test]
-    fn matched_local_database_table_blocks_outer_fallback() {
+    fn local_database_table_without_the_column_falls_back_to_the_outer_source() {
         let outer_items = in_database(
             source(0, "items", None, vec![column("id", false)], false),
             0,
@@ -1099,11 +1776,11 @@ mod tests {
         let mut inner = Scope::new(Some(outer));
         inner.add_source(&inner_items, true);
 
-        let error = inner
+        let resolved = inner
             .resolve_database_qualified(DatabaseId::new(0), "items", "id")
-            .expect_err("local database table prevents outer-column fallback");
-
-        assert!(error.to_string().contains("no such column: items.id"));
+            .expect("outer column resolves")
+            .expect("outer column is found");
+        expect_column(resolved, outer_items.id, 0);
     }
 
     #[test]
@@ -1237,15 +1914,29 @@ mod tests {
         let mut scope = Scope::default();
         scope.add_source(&left, true);
 
-        assert_eq!(scope.natural_common_columns(&right), vec!["ID"]);
+        assert_eq!(scope.natural_common_columns(&right), vec!["id"]);
         let resolved = scope
-            .resolve_natural_left("id")
+            .resolve_using_left("id", true, false)
             .expect("visible NATURAL column resolves");
         expect_column(resolved, left.id, 0);
     }
 
     #[test]
-    fn natural_join_rejects_ambiguous_left_column() {
+    fn natural_join_compares_the_first_left_copy_without_a_right_or_full_join() {
+        let first = source(0, "first", None, vec![column("id", false)], false);
+        let second = source(1, "second", None, vec![column("id", false)], false);
+        let mut scope = Scope::default();
+        scope.add_source(&first, true);
+        scope.add_source(&second, true);
+
+        let resolved = scope
+            .resolve_using_left("id", true, false)
+            .expect("the first copy is compared");
+        expect_column(resolved, first.id, 0);
+    }
+
+    #[test]
+    fn natural_join_rejects_a_second_unmerged_left_copy_with_a_right_or_full_join() {
         let first = source(0, "first", None, vec![column("id", false)], false);
         let second = source(1, "second", None, vec![column("id", false)], false);
         let mut scope = Scope::default();
@@ -1253,10 +1944,12 @@ mod tests {
         scope.add_source(&second, true);
 
         let error = scope
-            .resolve_natural_left("id")
-            .expect_err("NATURAL left column must be unique");
+            .resolve_using_left("id", true, true)
+            .expect_err("a RIGHT or FULL JOIN makes the second copy an error");
 
-        assert!(error.to_string().contains("ambiguous column name: id"));
+        assert!(error
+            .to_string()
+            .contains("ambiguous reference to id in USING()"));
     }
 
     #[test]
@@ -1292,7 +1985,7 @@ mod tests {
         let scope = Scope::default();
 
         let error = scope
-            .resolve_using_left("missing")
+            .resolve_using_left("missing", false, false)
             .expect_err("USING requires a visible left column");
 
         assert!(error

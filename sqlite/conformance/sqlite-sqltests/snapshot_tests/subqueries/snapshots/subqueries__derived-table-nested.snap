@@ -31,87 +31,90 @@ QUERY PLAN
 `--USE SORTER FOR ORDER BY
 
 BYTECODE
-addr  opcode                  p1  p2  p3  p4            p5  comment
-   0        Init               0  80   0                 0  Start at 80
-   1        SorterOpen         0   1   0  k(1,-B)        0  cursor=0
-   2        InitCoroutine      4  63   3                 0
-   3        OpenRead           1   6   0  k(4,B,B,B,B)   0  table=customers, root=6, iDb=0
-   4        Once              42   0   0                 0  goto 42
-   5        OpenEphemeral      2   1   0                 0  cursor=2 is_table=true
-   6        Null               0   7   0                 0  r[7]=NULL
-   7        Integer            0  18   0                 0  r[18]=0
-   8        Null               0  19   0                 0  r[19]=NULL
-   9        Gosub             17  39   0                 0
-  10        OpenRead           3   9   0  k(2,B)         0  index=idx_orders_customer, root=9, iDb=0
-  11        OpenRead           4   4   0  k(4,B,B,B,B)   0  table=orders, root=4, iDb=0
-  12        Rewind             3  28   0                 0  Rewind index idx_orders_customer
-  13          DeferredSeek     3   4   0                 0
-  14          Column           3   0  20                 0  r[20]=idx_orders_customer.customer_id
-  15          Column           4   3  11                 0  r[11]=orders.total_amount
-  16          RealAffinity    11   0   0                 0
-  17          Compare         19  20   1  k(1, Binary)   0  r[19..19]==r[20..20]
-  18          Jump            19  22  19                 0
-  19          Gosub           16  30   0                 0
-  20          Move            20  19   1                 0  r[19..19]=r[20..20]
-  21          Gosub           17  39   0                 0
-  22          Copy            11  21   0                 0  r[21]=r[11]
-  23          AggStep          0  21   7  sum            0  accum=r[7] step(r[21])
-  24          If              18  26   0                 0  if r[18] goto 26
-  25          Copy            11  15   0                 0  r[15]=r[11]
-  26          Integer          1  18   0                 0  r[18]=1
-  27        Next               3  13   0                 1
-  28        Gosub             16  30   0                 0
-  29        Goto               0  42   0                 0
-  30        IfPos             18  32   0                 0  r[18]>0 -> r[18]-=0, goto 32
-  31      Return              16   0   0                 0
-  32      AggFinal             0   7   0  sum            0  accum=r[7]
-  33      Copy                19  22   0                 0  r[22]=r[19]
-  34      Copy                 7  23   0                 0  r[23]=r[7]
-  35      MakeRecord          22   2  24                 0  r[24]=mkrec(r[22..23]); for (subquery-1)
-  36      NewRowid             2  25   0                 0  r[25]=rowid
-  37      Insert               2  24  25  (subquery-1)   4  intkey=r[25] data=r[24]
-  38    Return                16   0   0                 0
-  39    Null                   0   7   0                 0  r[7]=NULL
-  40    Integer                0  18   0                 0  r[18]=0
-  41  Return                  17   0   0                 0
-  42  Rewind                   1  62   0                 0  Rewind table customers
-  43    Once                  52   0   0                 0  goto 52
-  44    OpenAutoindex          5   0   0                 0  cursor=5
-  45    Rewind                 2  52   0                 0  Rewind table ephemeral((subquery-1))
-  46      ColumnRange          2   0  26  2              0  r[26..27]=ephemeral((subquery-1)).customer_id..total_spent
-  47      RowId                2  28   0                 0  r[28]=ephemeral((subquery-1)).rowid
-  48      MakeRecord          26   3  29                 0  r[29]=mkrec(r[26..28]); for ephemeral_subquery_s2
-  49      FilterAdd            5  26   1                 0  bloom_filter_add(r[26..27])
-  50      IdxInsert            5  29  26                 0  key=r[29]
-  51    Next                   2  46   0                 0
-  52    RowId                  1  30   0                 0  r[30]=customers.rowid
-  53    Filter                 5  61  30                 1  if !bloom_filter(r[30..31]) goto 61
-  54    SeekGE                 5  61  30                 0  key=[30..30]
-  55      IdxGT                5  61  30                 0  key=[30..30]
-  56      Column               1   1  31                 0  r[31]=customers.name
-  57      Column               5   1  32                 0  r[32]=ephemeral(ephemeral_subquery_s2).total_spent
-  58      Copy                31   5   1                 0  r[5]=r[31]
-  59      Yield                4   0   0                 0
-  60    Next                   5  55   0                 0
-  61  Next                     1  43   0                 1
-  62  EndCoroutine             4   0   0                 0
-  63  InitCoroutine            4   0   3                 0
-  64    Yield                  4  72   0                 0
-  65    Copy                   6  33   0                 0  r[33]=r[6]
-  66    Le                    33  34  71                 0  if r[33]<=r[34] goto 71
-  67    Copy                   5   3   0                 0  r[3]=r[5]
-  68    Copy                   6   2   0                 0  r[2]=r[6]
-  69    MakeRecord             2   2   1                 0  r[1]=mkrec(r[2..3])
-  70    SorterInsert           0   1   0  0              0  key=r[1]
-  71  Goto                     0  64   0                 0
-  72  OpenPseudo               6   1   2                 0  2 columns in r[1]
-  73  SorterSort               0  79   0                 0
-  74    SorterData             0   1   6                 0  r[1]=data
-  75    Column                 6   1  37                 0  r[37]=pseudo.column 1
-  76    Column                 6   0  38                 0  r[38]=pseudo.column 0
-  77    ResultRow             37   2   0                 0  output=r[37..38]
-  78  SorterNext               0  74   0                 0
-  79  Halt                     0   0   0                 0
-  80  Transaction              0   1  11                 0  iDb=0 tx_mode=Read
-  81  Integer               1000  34   0                 0  r[34]=1000
-  82  Goto                     0   1   0                 0
+addr  opcode             p1  p2  p3  p4            p5  comment
+   0  Init                0  83   0                 0  Start at 83
+   1  SorterOpen          0   1   0  k(1,-B)        0  cursor=0
+   2  InitCoroutine       4  66   3                 0
+   3  OpenRead            1   6   0  k(4,B,B,B,B)   0  table=customers, root=6, iDb=0
+   4  Gosub               7   6   0                 0
+   5  Goto                0  45   0                 0
+   6  Once               44   0   0                 0  goto 44
+   7  OpenEphemeral       2   1   0                 0  cursor=2 is_table=true
+   8  Null                0   8   0                 0  r[8]=NULL
+   9  Integer             0  19   0                 0  r[19]=0
+  10  Null                0  20   0                 0  r[20]=NULL
+  11  Gosub              18  41   0                 0
+  12  OpenRead            3   9   0  k(2,B)         0  index=idx_orders_customer, root=9, iDb=0
+  13  OpenRead            4   4   0  k(4,B,B,B,B)   0  table=orders, root=4, iDb=0
+  14  Rewind              3  30   0                 0  Rewind index idx_orders_customer
+  15    DeferredSeek      3   4   0                 0
+  16    Column            3   0  21                 0  r[21]=idx_orders_customer.customer_id
+  17    Column            4   3  12                 0  r[12]=orders.total_amount
+  18    RealAffinity     12   0   0                 0
+  19    Compare          20  21   1  k(1, Binary)   0  r[20..20]==r[21..21]
+  20    Jump             21  24  21                 0
+  21    Gosub            17  32   0                 0
+  22    Move             21  20   1                 0  r[20..20]=r[21..21]
+  23    Gosub            18  41   0                 0
+  24    Copy             12  22   0                 0  r[22]=r[12]
+  25    AggStep           0  22   8  sum            0  accum=r[8] step(r[22])
+  26    If               19  28   0                 0  if r[19] goto 28
+  27    Copy             12  16   0                 0  r[16]=r[12]
+  28    Integer           1  19   0                 0  r[19]=1
+  29  Next                3  15   0                 1
+  30  Gosub              17  32   0                 0
+  31  Goto                0  44   0                 0
+  32  IfPos              19  34   0                 0  r[19]>0 -> r[19]-=0, goto 34
+  33  Return             17   0   0                 0
+  34  AggFinal            0   8   0  sum            0  accum=r[8]
+  35  Copy               20  23   0                 0  r[23]=r[20]
+  36  Copy                8  24   0                 0  r[24]=r[8]
+  37  MakeRecord         23   2  25                 0  r[25]=mkrec(r[23..24]); for (subquery-1)
+  38  NewRowid            2  26   0                 0  r[26]=rowid
+  39  Insert              2  25  26  (subquery-1)   4  intkey=r[26] data=r[25]
+  40  Return             17   0   0                 0
+  41  Null                0   8   0                 0  r[8]=NULL
+  42  Integer             0  19   0                 0  r[19]=0
+  43  Return             18   0   0                 0
+  44  Return              7   0   0                 0
+  45  Rewind              1  65   0                 0  Rewind table customers
+  46    Once             55   0   0                 0  goto 55
+  47    OpenAutoindex     5   0   0                 0  cursor=5
+  48    Rewind            2  55   0                 0  Rewind table ephemeral((subquery-1))
+  49      ColumnRange     2   0  27  2              0  r[27..28]=ephemeral((subquery-1)).customer_id..total_spent
+  50      RowId           2  29   0                 0  r[29]=ephemeral((subquery-1)).rowid
+  51      MakeRecord     27   3  30                 0  r[30]=mkrec(r[27..29]); for ephemeral_subquery_s2
+  52      FilterAdd       5  27   1                 0  bloom_filter_add(r[27..28])
+  53      IdxInsert       5  30  27                 0  key=r[30]
+  54    Next              2  49   0                 0
+  55    RowId             1  31   0                 0  r[31]=customers.rowid
+  56    Filter            5  64  31                 1  if !bloom_filter(r[31..32]) goto 64
+  57    SeekGE            5  64  31                 0  key=[31..31]
+  58      IdxGT           5  64  31                 0  key=[31..31]
+  59      Column          1   1  32                 0  r[32]=customers.name
+  60      Column          5   1  33                 0  r[33]=ephemeral(ephemeral_subquery_s2).total_spent
+  61      Copy           32   5   1                 0  r[5]=r[32]
+  62      Yield           4   0   0                 0
+  63    Next              5  58   0                 0
+  64  Next                1  46   0                 1
+  65  EndCoroutine        4   0   0                 0
+  66  InitCoroutine       4   0   3                 0
+  67    Yield             4  75   0                 0
+  68    Copy              6  34   0                 0  r[34]=r[6]
+  69    Le               34  35  74  Binary         0  if r[34]<=r[35] goto 74
+  70    Copy              5   3   0                 0  r[3]=r[5]
+  71    Copy              6   2   0                 0  r[2]=r[6]
+  72    MakeRecord        2   2   1                 0  r[1]=mkrec(r[2..3])
+  73    SorterInsert      0   1   0  0              0  key=r[1]
+  74  Goto                0  67   0                 0
+  75  OpenPseudo          6   1   2                 0  2 columns in r[1]
+  76  SorterSort          0  82   0                 0
+  77    SorterData        0   1   6                 0  r[1]=data
+  78    Column            6   1  38                 0  r[38]=pseudo.column 1
+  79    Column            6   0  39                 0  r[39]=pseudo.column 0
+  80    ResultRow        38   2   0                 0  output=r[38..39]
+  81  SorterNext          0  77   0                 0
+  82  Halt                0   0   0                 0
+  83  Transaction         0   1  11                 0  iDb=0 tx_mode=Read
+  84  Integer          1000  35   0                 0  r[35]=1000
+  85  Goto                0   1   0                 0

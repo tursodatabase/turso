@@ -30,7 +30,7 @@ addr  opcode         p1  p2  p3  p4            p5  comment
    6  OpenRead        2   3   0  k(4,B,B,B,B)   0  table=users, root=3, iDb=0
    7  Rewind          2  14   0                 0  Rewind table users
    8    Column        2   3   2  active         0  r[2]=users.status
-   9    Ne            2   3  13                 0  if r[2]!=r[3] goto 13
+   9    Ne            2   3  13  Binary         0  if r[2]!=r[3] goto 13
   10    RowId         2   4   0                 0  r[4]=users.rowid
   11    MakeRecord    4   1   5                 0  r[5]=mkrec(r[4..4]); for ephemeral_index_hir_sub_0
   12    IdxInsert     1   5   0                 8  key=r[5]

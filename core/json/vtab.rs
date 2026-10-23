@@ -1,4 +1,5 @@
 use crate::sync::{Arc, RwLock};
+use std::borrow::Cow;
 use std::iter::successors;
 use std::result::Result;
 
@@ -6,12 +7,13 @@ use turso_ext::{ConstraintOp, ConstraintUsage, ResultCode};
 
 use crate::{
     json::{
-        convert_dbtype_to_jsonb, json_path_from_db_value,
+        convert_dbtype_to_jsonb, json_path_from_db_value, json_path_text,
         jsonb::{IteratorState, Jsonb, SearchOperation},
         path::{json_path, JsonPath, PathElement},
         vtab::columns::{Columns, Key},
         Conv,
     },
+    types::AsValueRef,
     vtab::{InternalVirtualTable, InternalVirtualTableCursor},
     Connection, LimboError, Value,
 };
@@ -165,16 +167,16 @@ impl InternalVirtualTable for JsonVirtualTable {
 
     fn sql(&self) -> String {
         "CREATE TABLE x(
-            key ANY,             -- key for current element relative to its parent
-            value ANY,           -- value for the current element
-            type TEXT,           -- 'object','array','string','integer', etc.
-            atom ANY,            -- value for primitive types, null for array & object
-            id INTEGER,          -- integer ID for this element
-            parent INTEGER,      -- integer ID for the parent of this element
-            fullkey TEXT,        -- full path describing the current element
-            path TEXT,           -- path to the container of the current row
-            json JSON HIDDEN,    -- 1st input parameter: the raw JSON
-            root TEXT HIDDEN     -- 2nd input parameter: the PATH at which to start
+            key,                 -- key for current element relative to its parent
+            value,               -- value for the current element
+            type,                -- 'object','array','string','integer', etc.
+            atom,                -- value for primitive types, null for array & object
+            id,                  -- integer ID for this element
+            parent,              -- integer ID for the parent of this element
+            fullkey,             -- full path describing the current element
+            path,                -- path to the container of the current row
+            json HIDDEN,         -- 1st input parameter: the raw JSON
+            root HIDDEN          -- 2nd input parameter: the PATH at which to start
         );"
         .to_owned()
     }
@@ -253,48 +255,36 @@ impl InternalVirtualTableCursor for JsonEachCursor {
         self.traversal_states.clear();
         self.rowid = 0;
 
-        if args.is_empty() {
+        if args.is_empty() || args[0] == Value::Null {
             return Ok(false);
         }
-        if args.len() == 2 && matches!(self.traversal_mode, JsonTraversalMode::Tree) {
-            if let Value::Text(ref text) = args[1] {
-                if !text.value.is_empty()
-                    && text
-                        .value
-                        .as_bytes()
-                        .windows(3)
-                        .any(|chars| chars == b"[#-")
-                {
-                    return Err(LimboError::InvalidArgument(
-                        "Json paths with negative indices in json_tree are not supported yet"
-                            .to_owned(),
-                    ));
-                }
-            }
+        let root_path = match args.get(1) {
+            None => Cow::Borrowed("$"),
+            Some(path) => json_path_text(path.as_value_ref()).ok_or_else(|| {
+                LimboError::InvalidArgument("root path should be text".to_owned())
+            })?,
+        };
+        if matches!(self.traversal_mode, JsonTraversalMode::Tree)
+            && root_path.as_bytes().windows(3).any(|chars| chars == b"[#-")
+        {
+            return Err(LimboError::InvalidArgument(
+                "Json paths with negative indices in json_tree are not supported yet".to_owned(),
+            ));
         }
 
         let mut jsonb = convert_dbtype_to_jsonb(&args[0], Conv::Strict)?;
 
-        let (path, root_json) = if args.len() == 1 {
-            let path = "$";
-            (path, jsonb)
+        let root_json = if args.len() == 1 {
+            jsonb
+        } else if let Some(json) = navigate_to_path(&mut jsonb, &args[1])? {
+            json
         } else {
-            let Value::Text(path) = &args[1] else {
-                return Err(LimboError::InvalidArgument(
-                    "root path should be text".to_owned(),
-                ));
-            };
-            let root_json = if let Some(json) = navigate_to_path(&mut jsonb, &args[1])? {
-                json
-            } else {
-                return Ok(false);
-            };
-            (path.as_str(), root_json)
+            return Ok(false);
         };
 
         self.json = root_json;
         self.path_to_current_value =
-            InPlaceJsonPath::from_json_path(path.to_owned(), json_path(path)?);
+            InPlaceJsonPath::from_json_path(root_path.to_string(), json_path(&root_path)?);
         let iterator_state = json_iterator_from(&self.json)?;
         let innermost_container_path = if matches!(self.traversal_mode, JsonTraversalMode::Tree)
             && matches!(iterator_state, IteratorState::Primitive(_))
@@ -597,22 +587,20 @@ mod columns {
                 jsonb::ElementType::NULL => Ok(Value::Null),
                 jsonb::ElementType::TRUE => Ok(Value::from_i64(1)),
                 jsonb::ElementType::FALSE => Ok(Value::from_i64(0)),
-                jsonb::ElementType::INT | jsonb::ElementType::INT5 => Self::jsonb_to_integer(value),
+                jsonb::ElementType::INT | jsonb::ElementType::INT5 => {
+                    json_string_to_db_type(value.clone(), element_type, OutputVariant::ElementType)
+                }
                 jsonb::ElementType::FLOAT | jsonb::ElementType::FLOAT5 => {
                     Self::jsonb_to_float(value)
                 }
                 jsonb::ElementType::TEXT
                 | jsonb::ElementType::TEXTJ
                 | jsonb::ElementType::TEXT5
-                | jsonb::ElementType::TEXTRAW => {
-                    let s = value.to_string()?;
-                    // Text values must be properly quoted
-                    let unquoted = s
-                        .strip_prefix('"')
-                        .and_then(|s| s.strip_suffix('"'))
-                        .ok_or_else(|| LimboError::ParseError("malformed JSON".to_string()))?;
-                    Ok(Value::Text(Text::new(unquoted.to_string())))
-                }
+                | jsonb::ElementType::TEXTRAW => json_string_to_db_type(
+                    value.clone(),
+                    element_type,
+                    OutputVariant::ElementTypePlain,
+                ),
                 jsonb::ElementType::ARRAY => Ok(Value::Null),
                 jsonb::ElementType::OBJECT => Ok(Value::Null),
                 jsonb::ElementType::RESERVED1 => Ok(Value::Null),
@@ -621,13 +609,6 @@ mod columns {
             };
 
             string
-        }
-
-        fn jsonb_to_integer(value: &Jsonb) -> Result<Value, LimboError> {
-            let string = value.to_string()?;
-            let int = string.parse::<i64>()?;
-
-            Ok(Value::from_i64(int))
         }
 
         fn jsonb_to_float(value: &Jsonb) -> Result<Value, LimboError> {
@@ -715,14 +696,14 @@ impl InPlaceJsonPath {
             .and_then(|s| s.strip_suffix('"'))
             .ok_or_else(|| crate::LimboError::ParseError("malformed JSON".to_string()))?;
 
-        let unquoted_if_necessary = if inner
-            .chars()
-            .any(|c| c == '.' || c == ' ' || c == '"' || c == '_')
-        {
-            key
-        } else {
-            inner
+        let mut chars = inner.chars();
+        let needs_quotes = match chars.next() {
+            None => true,
+            Some(first) => {
+                !first.is_ascii_alphabetic() || chars.any(|c| !c.is_ascii_alphanumeric())
+            }
         };
+        let unquoted_if_necessary = if needs_quotes { key } else { inner };
         self.last_element = Key::String(inner.to_owned());
         self.push(format!(".{unquoted_if_necessary}"));
         Ok(())

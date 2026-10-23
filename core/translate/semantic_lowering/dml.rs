@@ -1,5 +1,6 @@
 //! Lowering shared by HIR DELETE and UPDATE.
 
+use crate::alloc::TursoIteratorExt;
 use turso_parser::ast;
 
 use crate::{
@@ -7,7 +8,6 @@ use crate::{
     schema::{BTreeTable, Table, EXPR_INDEX_SENTINEL},
     sync::Arc,
     translate::{
-        expr::ConditionMetadata,
         optimizer::HirBtreeOperation,
         semantic::hir::{self, HirDocument, SourceId},
         semantic_to_plan::HirAccessPlan,
@@ -22,7 +22,7 @@ use crate::{
 
 use super::fkey_action::CompiledAction;
 use super::query::{
-    close_hir_btree_loop, emit_array_results, predicate_loop, prepare_hir_loop_unexplained,
+    close_hir_btree_loop, emit_array_results, predicate_ready_loop, prepare_hir_loop_unexplained,
     start_hir_loop,
 };
 use super::trigger::CompiledTrigger;
@@ -46,6 +46,11 @@ pub(super) struct Subprograms<'a> {
     /// INSERT: the ON UPDATE actions of each UPSERT clause's DO UPDATE, in
     /// clause order.
     pub(super) upsert_actions: Vec<Vec<CompiledAction<'a>>>,
+    /// DELETE: whether a DELETE of every row may clear the table's B-trees
+    /// instead of deleting row by row. False when MVCC holds the rows or a
+    /// materialized view depends on the table, since both need to see each
+    /// deleted row.
+    pub(super) may_clear_btrees: bool,
 }
 
 impl<'a> Subprograms<'a> {
@@ -59,6 +64,7 @@ impl<'a> Subprograms<'a> {
         Ok(Self {
             triggers: super::trigger::delete_triggers(session, parent, plan, delete)?,
             actions: super::fkey_action::delete_actions(session, parent, delete)?,
+            may_clear_btrees: may_clear_btrees(session, &plan.document, delete.target),
             ..Self::default()
         })
     }
@@ -91,8 +97,29 @@ impl<'a> Subprograms<'a> {
             replace_actions: super::insert::replace_actions(session, parent, plan, insert)?,
             upsert_triggers: super::trigger::upsert_update_triggers(session, parent, plan, insert)?,
             upsert_actions: super::fkey_action::upsert_actions(session, parent, plan, insert)?,
+            may_clear_btrees: false,
         })
     }
+}
+
+/// Whether a DELETE of every row of `target` may clear its B-trees instead
+/// of deleting row by row. See [`Subprograms::may_clear_btrees`].
+fn may_clear_btrees(session: &HirSession<'_>, document: &HirDocument, target: SourceId) -> bool {
+    if super::uses_mvcc(session.connection, document, target) {
+        return false;
+    }
+    let Some(source) = document.source(target) else {
+        return false;
+    };
+    let (hir::SourceKind::Table(table), Some(database)) = (&source.kind, source.database) else {
+        return false;
+    };
+    let table_name = table.value().get_name();
+    session.context.with_schema(database.index(), |schema| {
+        schema
+            .get_dependent_materialized_views(table_name)
+            .is_empty()
+    })
 }
 
 /// The B-tree table a DELETE or UPDATE writes, with what HIR resolved for it.
@@ -161,6 +188,12 @@ impl<'a> DmlTarget<'a> {
     ) -> Result<Self> {
         self.capture = super::cdc::Capture::open(program, capture, self.table)?;
         Ok(self)
+    }
+
+    /// The capture table, open for the target's row changes, when they are
+    /// captured.
+    pub(super) fn capture_rows(&self) -> Option<super::cdc::Rows<'_, 'a>> {
+        self.capture.as_ref().and_then(super::cdc::Capture::rows)
     }
 
     /// At the end of the statement: the COMMIT row of change data capture.
@@ -251,31 +284,29 @@ pub(super) fn emit_access_predicates(
     loop_index: Option<usize>,
     fail: BranchOffset,
 ) -> Result<()> {
-    for predicate in access
+    for (index, predicate) in access
         .predicates
         .iter()
-        .filter(|predicate| !predicate.consumed)
+        .enumerate()
+        .filter(|(_, predicate)| !predicate.consumed)
     {
         if predicate.from_outer_join.is_some() {
             return Err(LimboError::InternalError(
                 "HIR DML predicate belongs to an outer join".into(),
             ));
         }
-        if predicate_loop(program, document, &predicate.expr, &access.loops)? != loop_index {
-            continue;
-        }
-        let passed = program.allocate_label();
-        super::expr::translate_condition_expr(
+        let ready_at = predicate_ready_loop(
             program,
             document,
-            &predicate.expr,
-            ConditionMetadata {
-                jump_if_condition_is_true: false,
-                jump_target_when_true: passed,
-                jump_target_when_false: fail,
-            },
+            &access.loops,
+            &access.deferred_predicates,
+            &access.predicates,
+            index,
         )?;
-        program.preassign_label_to_next_insn(passed);
+        if ready_at != loop_index {
+            continue;
+        }
+        super::query::emit_hir_predicate(program, document, predicate, fail)?;
     }
     Ok(())
 }
@@ -312,19 +343,11 @@ fn emit_index_key_values(
             .then(|| table.columns().get(column.pos_in_table))
             .flatten();
         match (expression, table_column) {
-            (Some(expression), _) => {
-                super::expr::translate_expr_no_constant_opt(
-                    program, document, expression, register,
-                )?;
-                // An indexed virtual generated column keeps its declared
-                // affinity.
-                if let Some(table_column) =
-                    table_column.filter(|table_column| table_column.is_virtual_generated())
-                {
-                    program.emit_column_affinity(register, table_column.affinity());
-                }
-            }
-            (None, Some(table_column)) if table_column.is_virtual_generated() => {
+            // An index on a virtual generated column stores the column's
+            // value: the generated expression computed with the standard
+            // operators, even over custom-typed columns, so the key is read
+            // as the column, never as the index's copy of its expression.
+            (_, Some(table_column)) if table_column.is_virtual_generated() => {
                 super::expr::translate_expr_no_constant_opt(
                     program,
                     document,
@@ -334,10 +357,22 @@ fn emit_index_key_values(
                     }),
                     register,
                 )?;
+                program.emit_column_affinity(register, table_column.affinity());
             }
-            (None, Some(_)) => {
-                program.emit_column_or_rowid(table_cursor, column.pos_in_table, register)
+            (Some(expression), _) => {
+                super::expr::translate_expr_no_constant_opt(
+                    program, document, expression, register,
+                )?;
             }
+            (None, Some(table_column)) => emit_stored_column(
+                program,
+                document,
+                source,
+                table_cursor,
+                table_column,
+                column.pos_in_table,
+                register,
+            )?,
             (None, None) => {
                 return Err(LimboError::InternalError(format!(
                     "HIR index {} has an expression column without an expression",
@@ -431,14 +466,15 @@ pub(super) fn emit_replace_delete(
             start_reg: start,
             num_regs: count,
             cursor_id: *cursor,
-            raise_error_if_no_matching_entry: expressions.index.value().where_clause.is_none(),
+            raise_error_if_no_matching_entry: true,
         });
         if let Some(skip) = skip {
             program.preassign_label_to_next_insn(skip);
         }
     }
-    if let Some(capture) = &target.capture {
-        let before = capture.before_record(program, table, table_cursor, conflict);
+    if let Some(capture) = target.capture_rows() {
+        let before =
+            capture.before_record(program, document, source, table, table_cursor, conflict)?;
         capture.emit_row(
             program,
             crate::translate::emitter::OperationMode::DELETE,
@@ -600,7 +636,9 @@ pub(super) fn open_virtual_for_write(
 ) -> CursorID {
     let cursor = program.alloc_cursor_id(CursorType::VirtualTable(table.clone()));
     program.emit_insn(Insn::VOpen { cursor_id: cursor });
-    program.emit_insn(Insn::VBegin { cursor_id: cursor });
+    if !program.dbpage_writable() {
+        program.emit_insn(Insn::VBegin { cursor_id: cursor });
+    }
     cursor
 }
 
@@ -622,7 +660,7 @@ impl<'a> ReturningBuffer<'a> {
         let table = Arc::new(BTreeTable::new(
             0,
             "returning_scratch".to_string(),
-            Vec::new(),
+            crate::alloc::vec![],
             (0..returning.outputs.len())
                 .map(|column| {
                     crate::schema::Column::new(
@@ -635,11 +673,11 @@ impl<'a> ReturningBuffer<'a> {
                         crate::schema::ColDef::default(),
                     )
                 })
-                .collect(),
+                .collect_vec(),
             crate::schema::BTreeCharacteristics::HAS_ROWID,
-            Vec::new(),
-            Vec::new(),
-            Vec::new(),
+            crate::alloc::vec![],
+            crate::alloc::vec![],
+            crate::alloc::vec![],
             None,
         ));
         Self::open(program, &table, Some(returning))
@@ -748,6 +786,7 @@ impl<'a> ReturningBuffer<'a> {
         });
         program.emit_insn(Insn::Next {
             cursor_id: self.cursor,
+            is_index: program.cursor_is_index(self.cursor),
             pc_if_next: next,
             fullscan: false,
         });
@@ -817,7 +856,7 @@ fn emit_check_constraint_list<'c>(
             program.emit_insn(Insn::Halt {
                 err_code: SQLITE_CONSTRAINT_CHECK,
                 description: constraint.description.clone(),
-                on_error: None,
+                on_error: program.constraint_halt_on_error(or_conflict),
                 description_reg: None,
             });
         }
@@ -836,59 +875,116 @@ pub(super) fn subquery_query(subquery: &hir::SubqueryExpr) -> hir::QueryId {
     }
 }
 
-/// A STRICT table's column types are built in or custom; CREATE TABLE
-/// rejects any other, so one here is a schema this build does not know.
-pub(super) fn check_strict_types(table: &BTreeTable, source: &hir::Source) -> Result<()> {
-    let builtin = |name: &str| {
-        ["ANY", "INTEGER", "INT", "REAL", "BLOB", "TEXT"]
-            .iter()
-            .any(|builtin| name.eq_ignore_ascii_case(builtin))
-    };
-    if !table.is_strict {
-        return Ok(());
+/// `table` with its columns changed by `edit`, for a type check of a row
+/// held in registers `start + column` for every column, virtual ones
+/// included: the check reads each column at its logical position, not at
+/// its position in the stored record. The position map is set last because
+/// editing the columns rebuilds it from the stored record's layout.
+fn type_check_table(
+    table: &BTreeTable,
+    mut edit: impl FnMut(usize, &mut crate::schema::Column),
+) -> Arc<BTreeTable> {
+    let mut checked = table.clone();
+    for (position, column) in checked.columns_mut().iter_mut().enumerate() {
+        edit(position, column);
     }
-    for (position, column) in table.columns().iter().enumerate() {
-        if !column.is_array()
-            && custom_chain(source, position).is_none()
-            && !builtin(&column.ty_str)
-        {
-            crate::bail_parse_error!(
-                "unknown datatype for {}.{}: \"{}\"",
-                table.name,
-                column.name.as_deref().unwrap_or(""),
-                column.ty_str
-            );
-        }
-    }
-    Ok(())
+    checked.logical_to_physical_map = (0..table.columns().len()).collect_vec();
+    Arc::new(checked)
 }
 
-/// STRICT: check each value of the row in `start..` against its column's
-/// type, converting it where SQLite allows and failing otherwise. A STRICT
-/// table gets this instead of column affinity.
+/// STRICT: check each stored value of the row in `start..` against its
+/// column's type, converting it where SQLite allows and failing otherwise.
+/// A STRICT table gets this instead of column affinity. A virtual column
+/// is not computed yet, so it is checked as ANY; see
+/// [`emit_strict_generated_check`].
 pub(super) fn emit_strict_type_check(
     program: &mut ProgramBuilder,
     table: &Arc<BTreeTable>,
     start: usize,
 ) {
-    // Like SQLite, a virtual column is not checked: it is checked as ANY.
-    let table_reference = if table.has_virtual_columns() {
-        let mut checked = (**table).clone();
-        for column in checked.columns_mut().iter_mut() {
-            if column.is_virtual_generated() {
-                column.ty_str = "ANY".to_string();
-            }
+    let checked = type_check_table(table, |_, column| {
+        if column.is_virtual_generated() {
+            column.ty_str = "ANY".to_string();
         }
-        Arc::new(checked)
-    } else {
-        table.clone()
-    };
+    });
     program.emit_insn(Insn::TypeCheck {
         start_reg: start,
         count: table.columns().len(),
         check_generated: true,
-        table_reference,
+        table_reference: checked,
     });
+}
+
+/// STRICT: check each computed virtual generated column of the row in
+/// `start..` against its declared type, like SQLite 3.51. The stored
+/// columns were checked before the virtual ones were computed.
+pub(super) fn emit_strict_generated_check(
+    program: &mut ProgramBuilder,
+    table: &Arc<BTreeTable>,
+    start: usize,
+) {
+    if !table.is_strict || !table.has_virtual_columns() {
+        return;
+    }
+    let checked = type_check_table(table, |_, column| {
+        if !column.is_virtual_generated() {
+            column.ty_str = "ANY".to_string();
+        }
+    });
+    program.emit_insn(Insn::TypeCheck {
+        start_reg: start,
+        count: table.columns().len(),
+        check_generated: true,
+        table_reference: checked,
+    });
+}
+
+/// Read a stored column of a DML row from the table. SQLite stores a REAL
+/// value that is a whole number as an integer, so a REAL column gives its
+/// value back as REAL, as a query reads it. A row written before the
+/// column was added holds ENCODE(DEFAULT) for a column of an encoding
+/// custom type, as a query reads it.
+pub(super) fn emit_stored_column(
+    program: &mut ProgramBuilder,
+    document: &HirDocument,
+    source: &hir::Source,
+    table_cursor: usize,
+    column: &crate::schema::Column,
+    position: usize,
+    register: usize,
+) -> Result<()> {
+    let encoded_default = match (
+        source.default_expressions.get(position),
+        source.column_type_programs.get(position),
+    ) {
+        (Some(hir::ColumnReadExpression::Planned(default)), Some(Some(programs)))
+            if !programs.encode.is_empty() =>
+        {
+            Some((default, programs))
+        }
+        _ => None,
+    };
+    match encoded_default {
+        Some((default, programs)) => {
+            program.flags.set_suppress_column_default(true);
+            program.emit_column_or_rowid(table_cursor, position, register);
+            let has_field = program.allocate_label();
+            program.emit_column_has_field(table_cursor, position, has_field);
+            super::expr::translate_expr_no_constant_opt(program, document, default, register)?;
+            super::expr::translate_schema_calls_in_place(
+                program,
+                document,
+                &programs.encode,
+                register,
+            )?;
+            program.preassign_label_to_next_insn(has_field);
+        }
+        None => program.emit_column_or_rowid(table_cursor, position, register),
+    }
+    if column.ty() == crate::schema::Type::Real {
+        program.emit_insn(Insn::RealAffinity { register });
+    }
+    Ok(())
 }
 
 /// The custom type of `column` of `source`: its definitions from the
@@ -900,6 +996,15 @@ fn custom_chain(source: &hir::Source, column: usize) -> Option<&[hir::ResolvedTy
         .as_ref()
         .map(|declared| declared.custom_chain.as_slice())
         .filter(|chain| !chain.is_empty())
+}
+
+/// Whether writing the column runs an ENCODE expression on its value.
+pub(super) fn column_encodes(source: &hir::Source, column: usize) -> bool {
+    custom_chain(source, column).is_some_and(|chain| {
+        chain
+            .iter()
+            .any(|definition| definition.value().encode().is_some())
+    })
 }
 
 /// Whether a column of the target has a custom type.
@@ -925,24 +1030,23 @@ pub(super) fn emit_custom_type_writes(
 ) -> Result<()> {
     let written = |column: usize| only.is_none_or(|only| only.contains(&column));
     let check_table = |input: bool| {
-        let mut checked = (**table).clone();
-        for (position, column) in checked.columns_mut().iter_mut().enumerate() {
+        type_check_table(table, |position, column| {
             if column.is_virtual_generated() || (input && !written(position)) {
                 column.ty_str = "ANY".to_string();
                 if input {
                     column.override_affinity(crate::vdbe::affinity::Affinity::Blob);
                 }
-                continue;
+                return;
             }
             // An array is given as text or a blob, and is stored as a
             // record blob.
             if column.is_array() {
                 column.ty_str = if input { "ANY" } else { "BLOB" }.to_string();
                 column.override_affinity(crate::vdbe::affinity::Affinity::Blob);
-                continue;
+                return;
             }
             let Some(chain) = custom_chain(source, position) else {
-                continue;
+                return;
             };
             if input {
                 column.ty_str = chain[0].value().value_input_type().to_uppercase();
@@ -951,8 +1055,7 @@ pub(super) fn emit_custom_type_writes(
                 column.ty_str = base.value().base().to_uppercase();
                 column.override_affinity(crate::vdbe::affinity::Affinity::None);
             }
-        }
-        Arc::new(checked)
+        })
     };
     program.emit_insn(Insn::TypeCheck {
         start_reg: start,
@@ -1114,14 +1217,14 @@ pub(super) fn emit_row_record(
         }
         let affinities = stored
             .iter()
-            .map(|(_, _, column)| column.affinity_with_strict(table.is_strict).aff_mask())
+            .map(|(_, _, column)| column.affinity().aff_mask())
             .collect::<String>();
         (block, stored.len(), affinities)
     } else {
         let affinities = table
             .columns()
             .iter()
-            .map(|column| column.affinity_with_strict(table.is_strict).aff_mask())
+            .map(|column| column.affinity().aff_mask())
             .collect::<String>();
         (start, table.columns().len(), affinities)
     };

@@ -124,6 +124,11 @@ pub struct CaptureChanges {
     /// The capture table's hidden AUTOINCREMENT sequence, which hands out
     /// change ids under MVCC.
     pub change_ids: Option<super::SequenceOperation>,
+    /// Whether the target's own row changes are written. A TEMP table's
+    /// never are, nor the capture table's own; a trigger or foreign-key
+    /// action the statement fires may still write rows of another table,
+    /// and the statement then writes only the COMMIT row for them.
+    pub target_rows: bool,
 }
 
 /// Trigger identities selected for an INSERT and its possible UPSERT update.
@@ -142,6 +147,10 @@ pub struct ResolvedAutoincrement {
     /// allocation. Present only when the target database exposes that
     /// sequence in the semantic snapshot.
     pub mvcc_sequence: Option<super::SequenceOperation>,
+    /// Whether a trigger in the schema inserts into the target: such an
+    /// INSERT reads `sqlite_sequence` from disk, so the rowids a statement
+    /// used are written before its triggers run.
+    pub triggers_insert_into_table: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -200,6 +209,11 @@ pub enum UpsertAction {
 #[derive(Clone, Debug)]
 pub struct Assignment {
     pub columns: Vec<TargetColumn>,
+    /// The name each column was written with in the SET list, normalized.
+    /// `UPDATE OF` triggers match these names, as in SQLite, so a rowid
+    /// written as `rowid` fires a trigger on `rowid` and not one on the
+    /// INTEGER PRIMARY KEY column, and the other way round.
+    pub names: Vec<String>,
     pub value: Expr,
 }
 
@@ -274,6 +288,10 @@ pub struct DmlForeignKeys {
     pub outgoing: Vec<ResolvedForeignKey>,
     /// Constraints declared by other tables, where the target is the parent.
     pub incoming: Vec<ResolvedForeignKey>,
+    /// Whether, with foreign keys on, the target declares a FOREIGN KEY or
+    /// another table's FOREIGN KEY points at it, even when this statement
+    /// checks none of them. Such a statement opens a statement journal.
+    pub table_has_foreign_keys: bool,
 }
 
 #[derive(Clone, Debug)]

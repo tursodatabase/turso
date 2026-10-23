@@ -43,110 +43,110 @@ QUERY PLAN
 `--USE SORTER FOR GROUP BY
 
 BYTECODE
-addr  opcode                p1  p2  p3  p4                                     p5  comment
-   0        Init             0  98   0                                          0  Start at 98
-   1        Null             0   1   0                                          0  r[1]=NULL
-   2        Null             0   2   0                                          0  r[2]=NULL
-   3        SorterOpen       0   2   0  k(1,B)                                  0  cursor=0
-   4        Integer          0  58   0                                          0  r[58]=0
-   5        Null             0  59   0                                          0  r[59]=NULL
-   6        Gosub           57  93   0                                          0
-   7        OpenRead         2  10   0  k(17,B,B,B,B,B,B,B,B,B,B,B,B,B,B,B,B)   0  table=lineitem, root=10, iDb=0
-   8        OpenRead         3   9   0  k(9,B,B,B,B,B,B,B,B,B)                  0  table=orders, root=9, iDb=0
-   9        Rewind           2  40   0                                          0  Rewind table lineitem
-  10          Null           0  62   0                                          0  r[62]=NULL
-  11          Column         2  14  63                                          0  r[63]=lineitem.L_SHIPMODE
-  12          BitAnd        63  63  64                                          0  r[64]=r[63]&r[63]
-  13          String8        0  65   0  FOB                                     0  r[65]='FOB'
-  14          BitAnd        64  65  64                                          0  r[64]=r[64]&r[65]
-  15          Eq            63  65  21                                          0  if r[63]==r[65] goto 21
-  16          String8        0  66   0  SHIP                                    0  r[66]='SHIP'
-  17          BitAnd        64  66  64                                          0  r[64]=r[64]&r[66]
-  18          Eq            63  66  21                                          0  if r[63]==r[66] goto 21
-  19          IsNull        64  23   0                                          0  if (r[64]==NULL) goto 23
-  20          Goto           0  22   0                                          0
-  21          Integer        1  62   0                                          0  r[62]=1
-  22          AddImm        62   0   0                                          0  r[62]=r[62]+0
-  23          Copy          62  61   0                                          0  r[61]=r[62]
-  24          IfNot         61  39   1                                          0  if !r[61] goto 39
-  25          ColumnRange    2  11  67  2                                       0  r[67..68]=lineitem.L_COMMITDATE..L_RECEIPTDATE
-  26          Ge            67  68  39                                          0  if r[67]>=r[68] goto 39
-  27          ColumnRange    2  10  69  2                                       0  r[69..70]=lineitem.L_SHIPDATE..L_COMMITDATE
-  28          Ge            69  70  39                                          0  if r[69]>=r[70] goto 39
-  29          Column         2  12  71                                          0  r[71]=lineitem.L_RECEIPTDATE
-  30          Lt            71  72  39                                          0  if r[71]<r[72] goto 39
-  31          Column         2  12  73                                          0  r[73]=lineitem.L_RECEIPTDATE
-  32          Ge            73  74  39                                          0  if r[73]>=r[74] goto 39
-  33          Column         2   0  75                                          0  r[75]=lineitem.L_ORDERKEY
-  34          SeekRowid      3  75  39                                          0  if (r[75]!=cursor 3.rowid) goto 39
-  35          Column         2  14  54                                          0  r[54]=lineitem.L_SHIPMODE
-  36          Column         3   5  55                                          0  r[55]=orders.O_ORDERPRIORITY
-  37          MakeRecord    54   2  53                                          0  r[53]=mkrec(r[54..55])
-  38          SorterInsert   0  53   0  0                                       0  key=r[53]
-  39        Next             2  10   0                                          1
-  40        OpenPseudo       1  53   2                                          0  2 columns in r[53]
-  41        SorterSort       0  82   0                                          0
-  42          SorterData     0  53   1                                          0  r[53]=data
-  43          Column         1   0  60                                          0  r[60]=pseudo.column 0
-  44          Column         1   1  40                                          0  r[40]=pseudo.column 1
-  45          Compare       59  60   1  k(1, Binary)                            0  r[59..59]==r[60..60]
-  46          Jump          47  50  47                                          0
-  47          Gosub         56  84   0                                          0
-  48          Move          60  59   1                                          0  r[59..59]=r[60..60]
-  49          Gosub         57  93   0                                          0
-  50          Copy          40  80   0                                          0  r[80]=r[40]
-  51          Integer        1  78   0                                          0  r[78]=1
-  52          Eq            80  81  54                                          0  if r[80]==r[81] goto 54
-  53          ZeroOrNull    80  78  81                                          0  ((r[80]=NULL)|(r[81]=NULL)) ? r[78]=NULL : r[78]=0
-  54          Copy          40  82   0                                          0  r[82]=r[40]
-  55          Integer        1  79   0                                          0  r[79]=1
-  56          Eq            82  83  58                                          0  if r[82]==r[83] goto 58
-  57          ZeroOrNull    82  79  83                                          0  ((r[82]=NULL)|(r[83]=NULL)) ? r[79]=NULL : r[79]=0
-  58          Or            79  78  77                                          0  r[77]=(r[78] || r[79])
-  59          IfNot         77  62   1                                          0  if !r[77] goto 62
-  60          Integer        1  76   0                                          0  r[76]=1
-  61          Goto           0  63   0                                          0
-  62          Integer        0  76   0                                          0  r[76]=0
-  63          AggStep        0  76   1  sum                                     0  accum=r[1] step(r[76])
-  64          Copy          40  88   0                                          0  r[88]=r[40]
-  65          Integer        1  86   0                                          0  r[86]=1
-  66          Ne            88  89  68                                          0  if r[88]!=r[89] goto 68
-  67          ZeroOrNull    88  86  89                                          0  ((r[88]=NULL)|(r[89]=NULL)) ? r[86]=NULL : r[86]=0
-  68          Copy          40  90   0                                          0  r[90]=r[40]
-  69          Integer        1  87   0                                          0  r[87]=1
-  70          Ne            90  91  72                                          0  if r[90]!=r[91] goto 72
-  71          ZeroOrNull    90  87  91                                          0  ((r[90]=NULL)|(r[91]=NULL)) ? r[87]=NULL : r[87]=0
-  72          And           87  86  85                                          0  r[85]=(r[86] && r[87])
-  73          IfNot         85  76   1                                          0  if !r[85] goto 76
-  74          Integer        1  84   0                                          0  r[84]=1
-  75          Goto           0  77   0                                          0
-  76          Integer        0  84   0                                          0  r[84]=0
-  77          AggStep        0  84   2  sum                                     0  accum=r[2] step(r[84])
-  78          If            58  80   0                                          0  if r[58] goto 80
-  79          Copy          40  49   0                                          0  r[49]=r[40]
-  80          Integer        1  58   0                                          0  r[58]=1
-  81        SorterNext       0  42   0                                          0
-  82        Gosub           56  84   0                                          0
-  83        Goto             0  97   0                                          0
-  84        IfPos           58  86   0                                          0  r[58]>0 -> r[58]-=0, goto 86
-  85      Return            56   0   0                                          0
-  86      AggFinal           0   1   0  sum                                     0  accum=r[1]
-  87      AggFinal           0   2   0  sum                                     0  accum=r[2]
-  88      Copy              59  92   0                                          0  r[92]=r[59]
-  89      Copy               1  93   0                                          0  r[93]=r[1]
-  90      Copy               2  94   0                                          0  r[94]=r[2]
-  91      ResultRow         92   3   0                                          0  output=r[92..94]
-  92    Return              56   0   0                                          0
-  93    Null                 0   1   0                                          0  r[1]=NULL
-  94    Null                 0   2   0                                          0  r[2]=NULL
-  95    Integer              0  58   0                                          0  r[58]=0
-  96  Return                57   0   0                                          0
-  97  Halt                   0   0   0                                          0
-  98  Transaction            0   1   8                                          0  iDb=0 tx_mode=Read
-  99  String8                0  72   0  1994-01-01                              0  r[72]='1994-01-01'
- 100  String8                0  74   0  1995-01-01                              0  r[74]='1995-01-01'
- 101  String8                0  81   0  1-URGENT                                0  r[81]='1-URGENT'
- 102  String8                0  83   0  2-HIGH                                  0  r[83]='2-HIGH'
- 103  String8                0  89   0  1-URGENT                                0  r[89]='1-URGENT'
- 104  String8                0  91   0  2-HIGH                                  0  r[91]='2-HIGH'
- 105  Goto                   0   1   0                                          0
+addr  opcode          p1  p2  p3  p4                                     p5  comment
+   0  Init             0  98   0                                          0  Start at 98
+   1  Null             0   1   0                                          0  r[1]=NULL
+   2  Null             0   2   0                                          0  r[2]=NULL
+   3  SorterOpen       0   2   0  k(1,B)                                  0  cursor=0
+   4  Integer          0  58   0                                          0  r[58]=0
+   5  Null             0  59   0                                          0  r[59]=NULL
+   6  Gosub           57  93   0                                          0
+   7  OpenRead         2  10   0  k(17,B,B,B,B,B,B,B,B,B,B,B,B,B,B,B,B)   0  table=lineitem, root=10, iDb=0
+   8  OpenRead         3   9   0  k(9,B,B,B,B,B,B,B,B,B)                  0  table=orders, root=9, iDb=0
+   9  Rewind           2  40   0                                          0  Rewind table lineitem
+  10    Null           0  62   0                                          0  r[62]=NULL
+  11    Column         2  14  63                                          0  r[63]=lineitem.L_SHIPMODE
+  12    BitAnd        63  63  64                                          0  r[64]=r[63]&r[63]
+  13    String8        0  65   0  FOB                                     0  r[65]='FOB'
+  14    BitAnd        64  65  64                                          0  r[64]=r[64]&r[65]
+  15    Eq            63  65  21  Binary                                  0  if r[63]==r[65] goto 21
+  16    String8        0  66   0  SHIP                                    0  r[66]='SHIP'
+  17    BitAnd        64  66  64                                          0  r[64]=r[64]&r[66]
+  18    Eq            63  66  21  Binary                                  0  if r[63]==r[66] goto 21
+  19    IsNull        64  23   0                                          0  if (r[64]==NULL) goto 23
+  20    Goto           0  22   0                                          0
+  21    Integer        1  62   0                                          0  r[62]=1
+  22    AddImm        62   0   0                                          0  r[62]=r[62]+0
+  23    Copy          62  61   0                                          0  r[61]=r[62]
+  24    IfNot         61  39   1                                          0  if !r[61] goto 39
+  25    ColumnRange    2  11  67  2                                       0  r[67..68]=lineitem.L_COMMITDATE..L_RECEIPTDATE
+  26    Ge            67  68  39  Binary                                  0  if r[67]>=r[68] goto 39
+  27    ColumnRange    2  10  69  2                                       0  r[69..70]=lineitem.L_SHIPDATE..L_COMMITDATE
+  28    Ge            69  70  39  Binary                                  0  if r[69]>=r[70] goto 39
+  29    Column         2  12  71                                          0  r[71]=lineitem.L_RECEIPTDATE
+  30    Lt            71  72  39  Binary                                  0  if r[71]<r[72] goto 39
+  31    Column         2  12  73                                          0  r[73]=lineitem.L_RECEIPTDATE
+  32    Ge            73  74  39  Binary                                  0  if r[73]>=r[74] goto 39
+  33    Column         2   0  75                                          0  r[75]=lineitem.L_ORDERKEY
+  34    SeekRowid      3  75  39                                          0  if (r[75]!=cursor 3.rowid) goto 39
+  35    Column         2  14  54                                          0  r[54]=lineitem.L_SHIPMODE
+  36    Column         3   5  55                                          0  r[55]=orders.O_ORDERPRIORITY
+  37    MakeRecord    54   2  53                                          0  r[53]=mkrec(r[54..55])
+  38    SorterInsert   0  53   0  0                                       0  key=r[53]
+  39  Next             2  10   0                                          1
+  40  OpenPseudo       1  53   2                                          0  2 columns in r[53]
+  41  SorterSort       0  82   0                                          0
+  42    SorterData     0  53   1                                          0  r[53]=data
+  43    Column         1   0  60                                          0  r[60]=pseudo.column 0
+  44    Column         1   1  40                                          0  r[40]=pseudo.column 1
+  45    Compare       59  60   1  k(1, Binary)                            0  r[59..59]==r[60..60]
+  46    Jump          47  50  47                                          0
+  47    Gosub         56  84   0                                          0
+  48    Move          60  59   1                                          0  r[59..59]=r[60..60]
+  49    Gosub         57  93   0                                          0
+  50    Copy          40  80   0                                          0  r[80]=r[40]
+  51    Integer        1  78   0                                          0  r[78]=1
+  52    Eq            80  81  54  Binary                                  0  if r[80]==r[81] goto 54
+  53    ZeroOrNull    80  78  81                                          0  ((r[80]=NULL)|(r[81]=NULL)) ? r[78]=NULL : r[78]=0
+  54    Copy          40  82   0                                          0  r[82]=r[40]
+  55    Integer        1  79   0                                          0  r[79]=1
+  56    Eq            82  83  58  Binary                                  0  if r[82]==r[83] goto 58
+  57    ZeroOrNull    82  79  83                                          0  ((r[82]=NULL)|(r[83]=NULL)) ? r[79]=NULL : r[79]=0
+  58    Or            79  78  77                                          0  r[77]=(r[78] || r[79])
+  59    IfNot         77  62   1                                          0  if !r[77] goto 62
+  60    Integer        1  76   0                                          0  r[76]=1
+  61    Goto           0  63   0                                          0
+  62    Integer        0  76   0                                          0  r[76]=0
+  63    AggStep        0  76   1  sum                                     0  accum=r[1] step(r[76])
+  64    Copy          40  88   0                                          0  r[88]=r[40]
+  65    Integer        1  86   0                                          0  r[86]=1
+  66    Ne            88  89  68  Binary                                  0  if r[88]!=r[89] goto 68
+  67    ZeroOrNull    88  86  89                                          0  ((r[88]=NULL)|(r[89]=NULL)) ? r[86]=NULL : r[86]=0
+  68    Copy          40  90   0                                          0  r[90]=r[40]
+  69    Integer        1  87   0                                          0  r[87]=1
+  70    Ne            90  91  72  Binary                                  0  if r[90]!=r[91] goto 72
+  71    ZeroOrNull    90  87  91                                          0  ((r[90]=NULL)|(r[91]=NULL)) ? r[87]=NULL : r[87]=0
+  72    And           87  86  85                                          0  r[85]=(r[86] && r[87])
+  73    IfNot         85  76   1                                          0  if !r[85] goto 76
+  74    Integer        1  84   0                                          0  r[84]=1
+  75    Goto           0  77   0                                          0
+  76    Integer        0  84   0                                          0  r[84]=0
+  77    AggStep        0  84   2  sum                                     0  accum=r[2] step(r[84])
+  78    If            58  80   0                                          0  if r[58] goto 80
+  79    Copy          40  49   0                                          0  r[49]=r[40]
+  80    Integer        1  58   0                                          0  r[58]=1
+  81  SorterNext       0  42   0                                          0
+  82  Gosub           56  84   0                                          0
+  83  Goto             0  97   0                                          0
+  84  IfPos           58  86   0                                          0  r[58]>0 -> r[58]-=0, goto 86
+  85  Return          56   0   0                                          0
+  86  AggFinal         0   1   0  sum                                     0  accum=r[1]
+  87  AggFinal         0   2   0  sum                                     0  accum=r[2]
+  88  Copy            59  92   0                                          0  r[92]=r[59]
+  89  Copy             1  93   0                                          0  r[93]=r[1]
+  90  Copy             2  94   0                                          0  r[94]=r[2]
+  91  ResultRow       92   3   0                                          0  output=r[92..94]
+  92  Return          56   0   0                                          0
+  93  Null             0   1   0                                          0  r[1]=NULL
+  94  Null             0   2   0                                          0  r[2]=NULL
+  95  Integer          0  58   0                                          0  r[58]=0
+  96  Return          57   0   0                                          0
+  97  Halt             0   0   0                                          0
+  98  Transaction      0   1   8                                          0  iDb=0 tx_mode=Read
+  99  String8          0  72   0  1994-01-01                              0  r[72]='1994-01-01'
+ 100  String8          0  74   0  1995-01-01                              0  r[74]='1995-01-01'
+ 101  String8          0  81   0  1-URGENT                                0  r[81]='1-URGENT'
+ 102  String8          0  83   0  2-HIGH                                  0  r[83]='2-HIGH'
+ 103  String8          0  89   0  1-URGENT                                0  r[89]='1-URGENT'
+ 104  String8          0  91   0  2-HIGH                                  0  r[91]='2-HIGH'
+ 105  Goto             0   1   0                                          0

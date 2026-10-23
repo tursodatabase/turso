@@ -537,40 +537,41 @@ impl<'expr> ExprLowerer<'_, 'expr, '_> {
             .column_type_programs
             .get(reference.column)?
             .as_ref()?;
-        if !self.program.flags.suppress_custom_type_decode() {
-            if let hir::ColumnReadExpression::Planned(default) =
-                source.default_expressions.get(reference.column)?
-            {
-                if !programs.encode.is_empty() {
-                    if index == 0 {
-                        return Some(ColumnChild::Default(default));
-                    }
-                    index -= 1;
-                    let encode_children: usize = programs
-                        .encode
-                        .iter()
-                        .map(|call| call.arguments.len() + 1)
-                        .sum();
-                    if index < encode_children {
-                        return self
-                            .schema_call_child(&programs.encode, index)
-                            .map(|child| ColumnChild::Program {
-                                phase: ColumnProgram::Encode,
-                                child,
-                            });
-                    }
-                    index -= encode_children;
+        // A row that misses the column holds ENCODE(DEFAULT), whether the
+        // value is decoded or read as stored.
+        if let hir::ColumnReadExpression::Planned(default) =
+            source.default_expressions.get(reference.column)?
+        {
+            if !programs.encode.is_empty() {
+                if index == 0 {
+                    return Some(ColumnChild::Default(default));
                 }
+                index -= 1;
+                let encode_children: usize = programs
+                    .encode
+                    .iter()
+                    .map(|call| call.arguments.len() + 1)
+                    .sum();
+                if index < encode_children {
+                    return self
+                        .schema_call_child(&programs.encode, index)
+                        .map(|child| ColumnChild::Program {
+                            phase: ColumnProgram::Encode,
+                            child,
+                        });
+                }
+                index -= encode_children;
             }
-
-            if column.type_fact.array_dimensions == 0 {
-                return self
-                    .schema_call_child(&programs.decode, index)
-                    .map(|child| ColumnChild::Program {
-                        phase: ColumnProgram::Decode,
-                        child,
-                    });
-            }
+        }
+        if !self.program.flags.suppress_custom_type_decode()
+            && column.type_fact.array_dimensions == 0
+        {
+            return self
+                .schema_call_child(&programs.decode, index)
+                .map(|child| ColumnChild::Program {
+                    phase: ColumnProgram::Decode,
+                    child,
+                });
         }
         None
     }
@@ -903,7 +904,7 @@ impl<'expr> hir::ExprVisitor<'expr> for ExprLowerer<'_, 'expr, '_> {
                         let width = comparison
                             .as_ref()
                             .map_or(1, |comparison| comparison.components.len());
-                        let operands = if lhs.equivalent(rhs) {
+                        let operands = if lhs.equivalent(rhs) && expression_is_deterministic(lhs) {
                             BinaryOperands::Shared(self.program.alloc_registers(width))
                         } else {
                             let lhs = self.program.alloc_registers(width * 2);
@@ -1186,11 +1187,22 @@ impl<'expr> hir::ExprVisitor<'expr> for ExprLowerer<'_, 'expr, '_> {
                     0 => registers.lhs,
                     value_child => {
                         if value_child == 1 {
-                            self.program.emit_insn(Insn::BitAnd {
-                                lhs: registers.lhs,
-                                rhs: registers.lhs,
-                                dest: registers.null_flag,
-                            });
+                            if registers.width == 1 {
+                                self.program.emit_insn(Insn::BitAnd {
+                                    lhs: registers.lhs,
+                                    rhs: registers.lhs,
+                                    dest: registers.null_flag,
+                                });
+                            } else {
+                                // Row values set this flag only when a value
+                                // whose other components all match has a
+                                // NULL component, so (NULL,1) IN ((2,2)) is
+                                // false and (NULL,2) IN ((2,2)) is NULL.
+                                self.program.emit_insn(Insn::Integer {
+                                    value: 0,
+                                    dest: registers.null_flag,
+                                });
+                            }
                         } else {
                             self.finish_in_list_value(registers, &comparisons[value_child - 2])?;
                         }
@@ -1771,6 +1783,25 @@ impl<'expr> hir::ExprVisitor<'expr> for ExprLowerer<'_, 'expr, '_> {
     }
 }
 
+/// Whether a constant expression can fail: it calls a function, as
+/// `abs(-9223372036854775808)` fails, or CASTs to a custom type, which runs
+/// the type's encoder and domain checks.
+fn constant_may_fail(expression: &hir::Expr) -> bool {
+    let mut may_fail = false;
+    expression.for_each(&mut |expression| {
+        may_fail |= match expression {
+            hir::Expr::Function(_) => true,
+            hir::Expr::Cast { target, .. } => {
+                !target.programs.encode.is_empty()
+                    || target.programs.domain.is_some()
+                    || target.array_dimensions > 0
+            }
+            _ => false,
+        };
+    });
+    may_fail
+}
+
 impl<'expr> ExprLowerer<'_, 'expr, '_> {
     /// An operand with the same value on every row, such as
     /// the `1` of `a + 1` or the `upper('x')` of `upper('x') || b`, is not
@@ -1779,34 +1810,31 @@ impl<'expr> ExprLowerer<'_, 'expr, '_> {
     /// might fail, as `abs(-9223372036854775808)` does, so an operand that
     /// calls one still runs only where it is first reached, as SQLite's does.
     fn begin_hoisted_constant(&mut self, operand: &hir::Expr) -> Option<Hoisted> {
-        if self.program.constant_span_is_open()
-            || matches!(operand, hir::Expr::Parameter(_))
-            || !hir_expr_is_constant(self.program, operand)
-        {
+        if !self.is_hoisted_constant(operand) {
             return None;
         }
-        // A CAST to a custom type runs its encoder and domain checks, which
-        // may fail like a function.
-        let mut may_fail = false;
-        operand.for_each(&mut |expression| {
-            may_fail |= match expression {
-                hir::Expr::Function(_) => true,
-                hir::Expr::Cast { target, .. } => {
-                    !target.programs.encode.is_empty()
-                        || target.programs.domain.is_some()
-                        || target.array_dimensions > 0
-                }
-                _ => false,
-            };
-        });
-        if !may_fail {
+        if !constant_may_fail(operand) {
             return Some(Hoisted::Span(self.program.constant_span_start()));
         }
+        Some(Hoisted::Once(self.begin_once()))
+    }
+
+    /// Whether `expression` has the same value on every row and is not
+    /// already computed once by an enclosing constant.
+    fn is_hoisted_constant(&self, expression: &hir::Expr) -> bool {
+        !self.program.constant_span_is_open()
+            && !matches!(expression, hir::Expr::Parameter(_))
+            && hir_expr_is_constant(self.program, expression)
+    }
+
+    /// Start a block that runs the first time it is reached and is skipped
+    /// after that. Returns the label the block ends at.
+    fn begin_once(&mut self) -> BranchOffset {
         let done = self.program.allocate_label();
         self.program.emit_insn(Insn::Once {
             target_pc_when_reentered: done,
         });
-        Some(Hoisted::Once(done))
+        done
     }
 
     fn post_order_value(
@@ -1826,6 +1854,27 @@ impl<'expr> ExprLowerer<'_, 'expr, '_> {
                 });
             }
             return Ok(target);
+        }
+        // An FTS search or score has a value only through the FTS index
+        // the planner selected for it, which binds it to a register above.
+        match expression {
+            #[cfg(all(feature = "fts", not(target_family = "wasm")))]
+            hir::Expr::Function(call) => match call.function.value() {
+                Func::Fts(crate::function::FtsFunc::Match) => {
+                    crate::bail_parse_error!("fts_match requires an FTS index query")
+                }
+                Func::Fts(crate::function::FtsFunc::Score) => {
+                    crate::bail_parse_error!(
+                        "fts_score requires columns and query from the selected FTS index"
+                    )
+                }
+                _ => {}
+            },
+            hir::Expr::Like {
+                operator: turso_parser::ast::LikeOperator::Match,
+                ..
+            } => crate::bail_parse_error!("MATCH requires an FTS index query"),
+            _ => {}
         }
         match expression {
             hir::Expr::Literal(literal) => emit_literal(self.program, literal, target),
@@ -2180,10 +2229,18 @@ impl<'expr> ExprLowerer<'_, 'expr, '_> {
                     &registers,
                     comparisons.last().expect("non-empty IN has a comparison"),
                 )?;
-                self.program.emit_insn(Insn::IsNull {
-                    reg: registers.null_flag,
-                    target_pc: registers.null_label,
-                });
+                if registers.width == 1 {
+                    self.program.emit_insn(Insn::IsNull {
+                        reg: registers.null_flag,
+                        target_pc: registers.null_label,
+                    });
+                } else {
+                    self.program.emit_insn(Insn::If {
+                        reg: registers.null_flag,
+                        target_pc: registers.null_label,
+                        jump_if_null: false,
+                    });
+                }
                 self.program.emit_insn(Insn::Goto {
                     target_pc: registers.false_label,
                 });
@@ -2548,7 +2605,6 @@ impl<'expr> ExprLowerer<'_, 'expr, '_> {
                             &operation.normalized_name,
                             operation.sequence.value(),
                             target,
-                            Some(start_reg),
                         )?;
                     }
                     hir::SequenceOperationKind::SetValue => {
@@ -2973,6 +3029,7 @@ impl ExprLowerer<'_, '_, '_> {
             self.program.emit_insn(Insn::HaltIfNull {
                 target_reg: value,
                 err_code: SQLITE_CONSTRAINT_NOTNULL,
+                on_error: None,
                 description: description.clone(),
             });
         }
@@ -3165,7 +3222,7 @@ impl ExprLowerer<'_, '_, '_> {
                         .sum()
                 })
             };
-        let encode_default_children = if encoded_default && !suppress_custom_type_decode {
+        let encode_default_children = if encoded_default {
             1 + type_program.as_ref().map_or(0, |programs| {
                 programs
                     .encode
@@ -3278,8 +3335,20 @@ impl ExprLowerer<'_, '_, '_> {
         self.program
             .emit_column_or_rowid(read.cursor, read.column, context.target);
         let stored_value = self.program.allocate_label();
-        self.program
-            .emit_column_has_field(read.cursor, reference.column, stored_value);
+        if matches!(
+            self.program.get_cursor_type(read.cursor),
+            Some(CursorType::BTreeIndex(_))
+        ) {
+            // An index entry holds the value as stored, NULL included: a
+            // missing table field has no entry to read, so the DEFAULT is
+            // never applied to a value read from an index.
+            self.program.emit_insn(Insn::Goto {
+                target_pc: stored_value,
+            });
+        } else {
+            self.program
+                .emit_column_has_field(read.cursor, reference.column, stored_value);
+        }
         context.registers = ExprRegisters::ColumnPrograms(ColumnProgramRegisters {
             call: None,
             arguments_start: 0,
@@ -3563,14 +3632,14 @@ impl ExprLowerer<'_, '_, '_> {
                 "HIR IN comparison width changed between values".to_string(),
             ));
         }
-        self.program.emit_insn(Insn::BitAnd {
-            lhs: registers.null_flag,
-            rhs: registers.rhs,
-            dest: registers.null_flag,
-        });
         match comparison.components.as_slice() {
             [] => unreachable!("IN comparison width was checked"),
             [component] => {
+                self.program.emit_insn(Insn::BitAnd {
+                    lhs: registers.null_flag,
+                    rhs: registers.rhs,
+                    dest: registers.null_flag,
+                });
                 self.program.emit_insn(Insn::Eq {
                     lhs: registers.lhs,
                     rhs: registers.rhs,
@@ -3580,26 +3649,40 @@ impl ExprLowerer<'_, '_, '_> {
                 });
             }
             components => {
+                // A component that is not equal (NULL compares as not jumping)
+                // skips this value. Once every component is equal or NULL, a
+                // NULL on either side makes the result NULL unless a later
+                // value matches; otherwise this value matches.
                 let skip_label = self.program.allocate_label();
+                let set_null_flag_label = self.program.allocate_label();
                 for (index, component) in components.iter().enumerate() {
-                    if index + 1 == components.len() {
-                        self.program.emit_insn(Insn::Eq {
-                            lhs: registers.lhs + index,
-                            rhs: registers.rhs + index,
-                            target_pc: registers.match_label,
-                            flags: comparison_flags(component),
-                            collation: comparison_collation(component),
-                        });
-                    } else {
-                        self.program.emit_insn(Insn::Ne {
-                            lhs: registers.lhs + index,
-                            rhs: registers.rhs + index,
-                            target_pc: skip_label,
-                            flags: comparison_flags(component),
-                            collation: comparison_collation(component),
-                        });
-                    }
+                    self.program.emit_insn(Insn::Ne {
+                        lhs: registers.lhs + index,
+                        rhs: registers.rhs + index,
+                        target_pc: skip_label,
+                        flags: comparison_flags(component),
+                        collation: comparison_collation(component),
+                    });
                 }
+                for index in 0..components.len() {
+                    self.program.emit_insn(Insn::IsNull {
+                        reg: registers.lhs + index,
+                        target_pc: set_null_flag_label,
+                    });
+                    self.program.emit_insn(Insn::IsNull {
+                        reg: registers.rhs + index,
+                        target_pc: set_null_flag_label,
+                    });
+                }
+                self.program.emit_insn(Insn::Goto {
+                    target_pc: registers.match_label,
+                });
+                self.program
+                    .preassign_label_to_next_insn(set_null_flag_label);
+                self.program.emit_insn(Insn::Integer {
+                    value: 1,
+                    dest: registers.null_flag,
+                });
                 self.program.preassign_label_to_next_insn(skip_label);
             }
         }
@@ -3763,6 +3846,7 @@ impl ExprLowerer<'_, '_, '_> {
             self.program.preassign_label_to_next_insn(null_next_label);
             self.program.emit_insn(Insn::Next {
                 cursor_id: cursor,
+                is_index: self.program.cursor_is_index(cursor),
                 pc_if_next: null_loop_label,
                 fullscan: false,
             });
@@ -4587,14 +4671,39 @@ pub(crate) fn translate_expr_with_inputs<'expr>(
     target: usize,
     inputs: &[ExprRegisterInput<'expr>],
 ) -> Result<usize> {
-    expression.walk(
-        LoweringContext::new(target),
-        &mut ExprLowerer {
-            program,
-            document,
-            inputs,
-        },
-    )
+    let mut lowerer = ExprLowerer {
+        program,
+        document,
+        inputs,
+    };
+    // A whole expression with the same value on every row is computed
+    // once. One that cannot fail, such as `1` or `'x' || 'y'` as a result
+    // column, moves before the loops. One that calls a function, such as
+    // `unixepoch()` or `abs(-5)`, might fail, so like SQLite it is computed
+    // the first time it is reached and copied from its own register after
+    // that. The register is its own because the target may be written by
+    // others, as a subquery resets its result to NULL on each run.
+    if !inputs.is_empty() || !lowerer.is_hoisted_constant(expression) {
+        return expression.walk(LoweringContext::new(target), &mut lowerer);
+    }
+    if !constant_may_fail(expression) {
+        let span = lowerer.program.constant_span_start();
+        let result = expression.walk(LoweringContext::new(target), &mut lowerer);
+        lowerer.program.constant_span_end(span);
+        return result;
+    }
+    let done = lowerer.begin_once();
+    let own = lowerer.program.alloc_register();
+    let mut context = LoweringContext::new(own);
+    context.in_hoisted = true;
+    expression.walk(context, &mut lowerer)?;
+    lowerer.program.preassign_label_to_next_insn(done);
+    lowerer.program.emit_insn(Insn::Copy {
+        src_reg: own,
+        dst_reg: target,
+        extra_amount: 0,
+    });
+    Ok(target)
 }
 
 #[derive(Clone, Copy)]
@@ -4625,6 +4734,11 @@ impl<'expr> hir::ExprVisitor<'expr> for ConditionLowerer<'_, 'expr> {
     type Error = LimboError;
 
     fn child(&mut self, expression: &'expr hir::Expr, index: usize) -> Option<&'expr hir::Expr> {
+        // A condition whose value a register already holds, such as a GROUP
+        // BY key the HAVING clause repeats, is tested from that register.
+        if self.program.expression_register(expression).is_some() {
+            return None;
+        }
         let hir::Expr::Binary {
             lhs,
             operator: Operator::And | Operator::Or,
@@ -4705,17 +4819,20 @@ impl<'expr> hir::ExprVisitor<'expr> for ConditionLowerer<'_, 'expr> {
         context: ConditionContext,
         _children: &[()],
     ) -> Result<()> {
-        if matches!(
-            expression,
-            hir::Expr::Binary {
-                operator: Operator::And | Operator::Or,
-                custom: None,
-                ..
-            }
-        ) {
+        let stored = self.program.expression_register(expression).is_some();
+        if !stored
+            && matches!(
+                expression,
+                hir::Expr::Binary {
+                    operator: Operator::And | Operator::Or,
+                    custom: None,
+                    ..
+                }
+            )
+        {
             return Ok(());
         }
-        if self.emit_comparison_jump(expression, context.metadata())? {
+        if !stored && self.emit_comparison_jump(expression, context.metadata())? {
             return Ok(());
         }
         let register = self.program.alloc_register();
@@ -4741,6 +4858,22 @@ fn translate_condition_operand(
         program.constant_span_end(span);
     }
     result
+}
+
+/// Whether every function `expression` calls gives the same value for the
+/// same arguments, so two equal copies of it may share one evaluation.
+fn expression_is_deterministic(expression: &hir::Expr) -> bool {
+    let mut deterministic = true;
+    expression.for_each(&mut |expression| match expression {
+        hir::Expr::Function(call) => {
+            if !crate::function::Deterministic::is_deterministic(call.function.value()) {
+                deterministic = false;
+            }
+        }
+        hir::Expr::Subquery(_) => deterministic = false,
+        _ => {}
+    });
+    deterministic
 }
 
 /// Whether an expression has the same value on every row. An expression
@@ -4771,8 +4904,19 @@ fn hir_expr_is_constant(program: &ProgramBuilder, expression: &hir::Expr) -> boo
             | hir::Expr::Row(_) => true,
             hir::Expr::Binary { custom, .. } => custom.is_none(),
             hir::Expr::Function(call) => {
+                // Like SQLite's SQLITE_FUNC_SLOCHNG functions, the date and
+                // time functions return the same value for the whole
+                // statement, so a call with constant arguments is computed
+                // once instead of on every row.
+                let function = call.function.value();
+                let same_for_whole_statement =
+                    crate::function::Deterministic::is_deterministic(function)
+                        || matches!(
+                            function,
+                            crate::function::Func::Scalar(scalar) if scalar.is_date_time_function()
+                        );
                 matches!(call.evaluation, hir::FunctionEvaluation::Scalar)
-                    && crate::function::Deterministic::is_deterministic(call.function.value())
+                    && same_for_whole_statement
             }
             _ => false,
         };
@@ -4997,7 +5141,8 @@ pub(crate) fn translate_schema_calls_on_elements(
         value: 0,
         dest: offset,
     });
-    let next = program.offset();
+    let next = program.allocate_label();
+    program.preassign_label_to_next_insn(next);
     let done = program.allocate_label();
     program.emit_insn(Insn::Gt {
         lhs: index,
@@ -5304,7 +5449,23 @@ mod tests {
         expression: &hir::Expr,
         target: usize,
     ) -> Result<usize> {
-        super::translate_expr(program, &document(Vec::new()), expression, target)
+        translate_expr_in(program, &document(Vec::new()), expression, target)
+    }
+
+    /// Lower `expression` as a caller that computes the whole expression
+    /// once does, such as a condition's operand: the tests check the shape
+    /// of the expression's own instructions, and most expressions here are
+    /// constant.
+    fn translate_expr_in(
+        program: &mut ProgramBuilder,
+        document: &hir::HirDocument,
+        expression: &hir::Expr,
+        target: usize,
+    ) -> Result<usize> {
+        let span = program.constant_span_start();
+        let result = super::translate_expr(program, document, expression, target);
+        program.constant_span_end(span);
+        result
     }
 
     fn resolved_function(function: Func) -> hir::ResolvedFunction {
@@ -5940,18 +6101,25 @@ mod tests {
         );
         super::translate_expr(&mut suppressed, &document, expression, 3)
             .expect("encoded custom column lowers without decode");
-        assert!(matches!(
-            suppressed.insns.as_slice(),
-            [(
+        let steps = suppressed
+            .insns
+            .iter()
+            .filter_map(|(instruction, _)| match instruction {
                 Insn::Column {
                     cursor_id,
                     dest: 3,
                     default: None,
                     ..
-                },
-                _
-            )] if *cursor_id == suppressed_cursor
-        ));
+                } if *cursor_id == suppressed_cursor => Some("column"),
+                Insn::ColumnHasField { .. } => Some("has field"),
+                Insn::Integer { value: 3, dest: 3 } => Some("default"),
+                Insn::Multiply { dest: 3, .. } => Some("encode"),
+                Insn::IsNull { reg: 3, .. } => Some("null guard"),
+                Insn::Divide { dest: 3, .. } => Some("decode"),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(steps, ["column", "has field", "default", "encode"]);
     }
 
     #[test]
@@ -6286,7 +6454,7 @@ mod tests {
             name: "items_value".to_string(),
             table_name: "items".to_string(),
             root_page: 3,
-            columns: vec![IndexColumn {
+            columns: crate::alloc::vec![IndexColumn {
                 name: "value".to_string(),
                 order: SortOrder::Asc,
                 nulls_order: None,
@@ -6474,11 +6642,13 @@ mod tests {
 
         let union_type =
             resolved_type(crate::schema::TypeDefKind::Union(crate::schema::UnionDef {
-                variants: Vec::new(),
+                variants: crate::alloc::vec![],
                 tag_names: crate::sync::Arc::from(Vec::<String>::new()),
             }));
         let struct_type = resolved_type(crate::schema::TypeDefKind::Struct(
-            crate::schema::StructDef { fields: Vec::new() },
+            crate::schema::StructDef {
+                fields: crate::alloc::vec![],
+            },
         ));
         let runtime_value = || hir::Expr::Literal(Literal::Numeric("7".to_string()));
         let semantic_name = || hir::Expr::Literal(Literal::String("'ignored'".to_string()));
@@ -6926,7 +7096,7 @@ mod tests {
         let expression = root_output(&document);
         let mut program = program();
 
-        super::translate_expr(&mut program, &document, expression, 8)
+        translate_expr_in(&mut program, &document, expression, 8)
             .expect("parameterized custom CAST lowers");
 
         let parameter = program
@@ -6969,7 +7139,7 @@ mod tests {
         let expression = root_output(&document);
         let mut program = program();
 
-        super::translate_expr(&mut program, &document, expression, 8)
+        translate_expr_in(&mut program, &document, expression, 8)
             .expect("custom domain CAST lowers");
 
         let instruction = |predicate: fn(&Insn) -> bool| {
@@ -7316,7 +7486,19 @@ mod tests {
                 _ => None,
             })
             .collect::<Vec<_>>();
-        assert_eq!(comparisons, vec![("ne", 2, 5), ("eq", 3, 6)]);
+        // Every component is compared with Ne so a mismatch skips the value,
+        // and a NULL on either side only makes the result NULL once all other
+        // components are equal, like SQLite's row-value IN.
+        assert_eq!(comparisons, vec![("ne", 2, 5), ("ne", 3, 6)]);
+        let null_checks = program
+            .insns
+            .iter()
+            .filter_map(|(instruction, _)| match instruction {
+                Insn::IsNull { reg, .. } => Some(*reg),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(null_checks, vec![2, 5, 3, 6]);
     }
 
     #[test]
@@ -7445,8 +7627,10 @@ mod tests {
         ));
     }
 
+    /// MATCH has a value only through an FTS index search, which binds it
+    /// to a register before lowering reaches it.
     #[test]
-    fn match_places_row_columns_before_the_query() {
+    fn match_without_an_index_query_is_an_error() {
         let expression = hir::Expr::Like {
             lhs: Box::new(hir::Expr::Row(vec![
                 hir::Expr::Literal(Literal::String("'one'".to_string())),
@@ -7461,24 +7645,11 @@ mod tests {
         };
         let mut program = program();
 
-        translate_expr(&mut program, &expression, 8).unwrap();
-        assert!(matches!(
-            program.insns.as_slice(),
-            [
-                (Insn::String8 { dest: 1, .. }, _),
-                (Insn::String8 { dest: 2, .. }, _),
-                (Insn::String8 { dest: 3, .. }, _),
-                (
-                    Insn::Function {
-                        constant_mask: 0,
-                        start_reg: 1,
-                        dest: 8,
-                        func: FuncCtx { arg_count: 3, .. },
-                    },
-                    _,
-                ),
-            ]
-        ));
+        let error = translate_expr(&mut program, &expression, 8).unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "Parse error: MATCH requires an FTS index query"
+        );
     }
 
     #[test]
@@ -7636,13 +7807,15 @@ mod tests {
             (
                 hir::FieldAccessKind::Struct { field_index: 7 },
                 resolved_type(crate::schema::TypeDefKind::Struct(
-                    crate::schema::StructDef { fields: Vec::new() },
+                    crate::schema::StructDef {
+                        fields: crate::alloc::vec![],
+                    },
                 )),
             ),
             (
                 hir::FieldAccessKind::Union { tag_index: 3 },
                 resolved_type(crate::schema::TypeDefKind::Union(crate::schema::UnionDef {
-                    variants: Vec::new(),
+                    variants: crate::alloc::vec![],
                     tag_names: crate::sync::Arc::from(Vec::<String>::new()),
                 })),
             ),
@@ -7685,11 +7858,13 @@ mod tests {
     #[test]
     fn nested_field_access_writes_each_result_into_its_parent_register() {
         let struct_type = resolved_type(crate::schema::TypeDefKind::Struct(
-            crate::schema::StructDef { fields: Vec::new() },
+            crate::schema::StructDef {
+                fields: crate::alloc::vec![],
+            },
         ));
         let union_type =
             resolved_type(crate::schema::TypeDefKind::Union(crate::schema::UnionDef {
-                variants: Vec::new(),
+                variants: crate::alloc::vec![],
                 tag_names: crate::sync::Arc::from(Vec::<String>::new()),
             }));
         let expression = hir::Expr::FieldAccess(hir::FieldAccess {
@@ -7735,7 +7910,9 @@ mod tests {
     #[test]
     fn nested_field_access_lowering_does_not_use_the_call_stack() {
         let container_type = resolved_type(crate::schema::TypeDefKind::Struct(
-            crate::schema::StructDef { fields: Vec::new() },
+            crate::schema::StructDef {
+                fields: crate::alloc::vec![],
+            },
         ));
         let mut expression = hir::Expr::Literal(Literal::Numeric("1".to_string()));
         for _ in 0..10_000 {
@@ -9147,35 +9324,52 @@ mod tests {
     fn direct_fts_functions_use_consecutive_argument_registers() {
         use crate::function::FtsFunc;
 
-        for (function, argument_count) in [
-            (FtsFunc::Score, 2),
-            (FtsFunc::Match, 3),
-            (FtsFunc::Highlight, 4),
-        ] {
-            let arguments = (0..argument_count)
+        let literal_arguments = |count: usize| {
+            (0..count)
                 .map(|value| hir::Expr::Literal(Literal::Numeric(value.to_string())))
-                .collect();
-            let expression = ordinary_scalar_call(Func::Fts(function.clone()), arguments);
-            let mut program = program();
+                .collect::<Vec<_>>()
+        };
+        let argument_count = 4;
+        let expression = ordinary_scalar_call(
+            Func::Fts(FtsFunc::Highlight),
+            literal_arguments(argument_count),
+        );
+        let mut program = program();
 
-            translate_expr(&mut program, &expression, 8).unwrap();
-            assert!(program.insns[..argument_count].iter().enumerate().all(
-                |(index, (instruction, _))| {
-                    matches!(instruction, Insn::Integer { dest, .. } if *dest == index + 1)
-                }
-            ));
-            assert!(matches!(
-                program.insns.last().map(|(instruction, _)| instruction),
-                Some(Insn::Function {
-                    constant_mask: 0,
-                    start_reg: 1,
-                    dest: 8,
-                    func: FuncCtx {
-                        func: Func::Fts(emitted),
-                        arg_count,
-                    },
-                }) if *emitted == function && *arg_count == argument_count
-            ));
+        translate_expr(&mut program, &expression, 8).unwrap();
+        assert!(program.insns[..argument_count].iter().enumerate().all(
+            |(index, (instruction, _))| {
+                matches!(instruction, Insn::Integer { dest, .. } if *dest == index + 1)
+            }
+        ));
+        assert!(matches!(
+            program.insns.last().map(|(instruction, _)| instruction),
+            Some(Insn::Function {
+                constant_mask: 0,
+                start_reg: 1,
+                dest: 8,
+                func: FuncCtx {
+                    func: Func::Fts(FtsFunc::Highlight),
+                    arg_count,
+                },
+            }) if *arg_count == argument_count
+        ));
+
+        // A search or score reads the FTS index the planner selected; with
+        // no index it is an error, as on the legacy path.
+        for (function, argument_count, message) in [
+            (
+                FtsFunc::Score,
+                2,
+                "fts_score requires columns and query from the selected FTS index",
+            ),
+            (FtsFunc::Match, 3, "fts_match requires an FTS index query"),
+        ] {
+            let expression =
+                ordinary_scalar_call(Func::Fts(function), literal_arguments(argument_count));
+            let mut without_index = self::program();
+            let error = translate_expr(&mut without_index, &expression, 8).unwrap_err();
+            assert_eq!(error.to_string(), format!("Parse error: {message}"));
         }
     }
 

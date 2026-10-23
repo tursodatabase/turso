@@ -31,7 +31,7 @@ addr  opcode           p1  p2  p3  p4              p5  comment
    2  OpenRead          2   3   0  k(5,B,B,B,B,B)   0  table=products, root=3, iDb=0
    3  Rewind            0  26   0                   0  Rewind table customers
    4    Column          0   3   1                   0  r[1]=customers.city
-   5    Ne              1   2  25                   0  if r[1]!=r[2] goto 25
+   5    Ne              1   2  25  Binary           0  if r[1]!=r[2] goto 25
    6    Once           17   0   0                   0  goto 17
    7    OpenAutoindex   1   0   0                   0  cursor=1
    8    Rewind          2  17   0                   0  Rewind table products

@@ -2,6 +2,24 @@ use crate::common::TempDatabase;
 use turso_core::{Numeric, StepResult, Value};
 use turso_pg::PgConnection;
 
+#[turso_macros::test(mvcc)]
+fn test_pg_array_subquery_rebind_and_reset(db: TempDatabase) {
+    let conn = db.connect_postgres();
+    let mut stmt = conn
+        .prepare("SELECT ARRAY(SELECT 17 AS v UNION ALL SELECT 2 ORDER BY v LIMIT $1)")
+        .unwrap();
+
+    for (limit, expected) in [(1, "{2}"), (0, "{}"), (2, "{2,17}"), (1, "{2}")] {
+        stmt.bind_at(std::num::NonZero::new(1).unwrap(), Value::from_i64(limit))
+            .unwrap();
+        assert_eq!(
+            stmt.run_collect_rows().unwrap(),
+            vec![vec![Value::build_text(expected)]]
+        );
+        stmt.reset().unwrap();
+    }
+}
+
 fn query_text(conn: &PgConnection, sql: &str) -> Vec<String> {
     let mut rows = conn.query(sql).unwrap().unwrap();
     let mut result = Vec::new();
@@ -39,6 +57,234 @@ fn query_integer(conn: &PgConnection, sql: &str) -> Vec<i64> {
         }
     }
     result
+}
+
+#[turso_macros::test(mvcc)]
+fn test_pg_set_config_shares_connection_state(db: TempDatabase) {
+    let conn = db.connect_postgres();
+    let other = db.connect_postgres();
+    conn.execute("CREATE TABLE config_items (v INT)").unwrap();
+    conn.execute("INSERT INTO config_items VALUES (17)")
+        .unwrap();
+    assert_eq!(
+        query_text(&conn, "SELECT set_config('search_path', 'missing', false)"),
+        ["missing"]
+    );
+    assert!(conn.prepare("SELECT v FROM config_items").is_err());
+    assert_eq!(query_integer(&other, "SELECT v FROM config_items"), [17]);
+
+    let clone = conn.clone();
+    clone.execute("SET search_path TO public").unwrap();
+    assert_eq!(query_integer(&conn, "SELECT v FROM config_items"), [17]);
+    assert_eq!(
+        conn.inner()
+            .prepare("SELECT set_config('search_path', 'missing', false)")
+            .unwrap()
+            .run_collect_rows()
+            .unwrap(),
+        vec![vec![Value::build_text("missing")]]
+    );
+    assert!(clone.prepare("SELECT v FROM config_items").is_err());
+    assert_eq!(query_integer(&other, "SELECT v FROM config_items"), [17]);
+}
+
+#[turso_macros::test(mvcc)]
+fn test_pg_set_config_empty_and_quoted_search_paths(db: TempDatabase) {
+    let conn = db.connect_postgres();
+    conn.execute("CREATE TABLE config_items (v INT)").unwrap();
+    conn.execute("INSERT INTO config_items VALUES (17)")
+        .unwrap();
+    assert_eq!(
+        query_text(
+            &conn,
+            "SELECT set_config('search_path', ' \"missing, public\", PUBLIC ', false)"
+        ),
+        [" \"missing, public\", PUBLIC "]
+    );
+    assert_eq!(query_integer(&conn, "SELECT v FROM config_items"), [17]);
+    assert_eq!(
+        query_text(
+            &conn,
+            "SELECT set_config('search_path', '\"public, missing\"', false)"
+        ),
+        ["\"public, missing\""]
+    );
+    assert!(conn.prepare("SELECT v FROM config_items").is_err());
+    assert_eq!(
+        query_text(
+            &conn,
+            "SELECT pg_catalog.set_config('search_path', '', false)"
+        ),
+        [""]
+    );
+    assert!(conn.prepare("SELECT v FROM config_items").is_err());
+    assert_eq!(
+        query_integer(&conn, "SELECT v FROM public.config_items"),
+        [17]
+    );
+    assert_eq!(
+        query_integer(&conn, "SELECT COUNT(*) FROM pg_catalog.pg_namespace"),
+        [3]
+    );
+    assert_eq!(
+        query_integer(&conn, "SELECT COUNT(*) FROM pg_namespace"),
+        [3]
+    );
+    conn.execute("SET search_path TO public").unwrap();
+    assert_eq!(query_integer(&conn, "SELECT v FROM config_items"), [17]);
+}
+
+#[turso_macros::test(mvcc)]
+fn test_pg_set_config_changes_settings_only_when_executed(db: TempDatabase) {
+    let conn = db.connect_postgres();
+    conn.execute("CREATE TABLE config_items (v INT)").unwrap();
+    conn.execute("INSERT INTO config_items VALUES (17)")
+        .unwrap();
+    let mut setter = conn
+        .prepare("SELECT set_config('search_path', '', false)")
+        .unwrap();
+    assert_eq!(query_integer(&conn, "SELECT v FROM config_items"), [17]);
+    assert_eq!(
+        setter.run_collect_rows().unwrap(),
+        vec![vec![Value::build_text("")]]
+    );
+    assert!(conn.prepare("SELECT v FROM config_items").is_err());
+    conn.execute("SET search_path TO public").unwrap();
+    setter.reset().unwrap();
+    setter.run_ignore_rows().unwrap();
+    assert!(conn.prepare("SELECT v FROM config_items").is_err());
+    let mut setter = conn.prepare("SET search_path TO public").unwrap();
+    assert!(conn.prepare("SELECT v FROM config_items").is_err());
+    setter.run_ignore_rows().unwrap();
+    assert_eq!(query_integer(&conn, "SELECT v FROM config_items"), [17]);
+}
+
+#[turso_macros::test(mvcc)]
+fn test_pg_set_config_validates_arguments(db: TempDatabase) {
+    let conn = db.connect_postgres();
+    conn.execute("CREATE TABLE config_items (v INT)").unwrap();
+    conn.execute("INSERT INTO config_items VALUES (17)")
+        .unwrap();
+    for (sql, message) in [
+        (
+            "SELECT set_config('statement_timeout', '100', false)",
+            "unrecognized configuration parameter",
+        ),
+        (
+            "SELECT set_config(NULL, 'public', false)",
+            "SET requires parameter name",
+        ),
+        (
+            "SELECT set_config('search_path', 5, false)",
+            "set_config requires a text value",
+        ),
+        (
+            "SELECT set_config('search_path', '', 2)",
+            "set_config requires a boolean",
+        ),
+        (
+            "SELECT set_config('search_path', '', true)",
+            "transaction-local settings are not supported",
+        ),
+        (
+            "SET LOCAL search_path TO missing",
+            "transaction-local settings are not supported",
+        ),
+        (
+            "SELECT set_config('search_path', 'public,', false)",
+            "invalid value for parameter",
+        ),
+        (
+            "SELECT set_config('search_path', '\"unclosed', false)",
+            "invalid value for parameter",
+        ),
+        (
+            "SELECT set_config('search_path', 'one two', false)",
+            "invalid value for parameter",
+        ),
+    ] {
+        let error = conn.execute(sql).unwrap_err().to_string();
+        assert!(error.contains(message), "{sql}: {error}");
+        assert_eq!(query_integer(&conn, "SELECT v FROM config_items"), [17]);
+    }
+    for sql in [
+        "SELECT set_config('search_path', '')",
+        "SELECT set_config('search_path', '', false, false)",
+    ] {
+        assert!(conn.prepare(sql).is_err(), "{sql}");
+    }
+    assert_eq!(
+        query_text(&conn, "SELECT set_config('SEARCH_PATH', '', NULL)"),
+        [""]
+    );
+    assert_eq!(
+        query_text(&conn, "SELECT set_config('search_path', NULL, false)"),
+        ["\"$user\", public"]
+    );
+    assert_eq!(query_integer(&conn, "SELECT v FROM config_items"), [17]);
+}
+
+#[turso_macros::test(mvcc)]
+fn test_pg_current_setting_reads_connection_settings_when_executed(db: TempDatabase) {
+    let conn = db.connect_postgres();
+    let other = db.connect_postgres();
+    let mut reader = conn
+        .prepare("SELECT current_setting('search_path')")
+        .unwrap();
+    assert_eq!(
+        reader.run_collect_rows().unwrap(),
+        vec![vec![Value::build_text("\"$user\", public")]]
+    );
+    conn.execute("SET search_path TO public").unwrap();
+    reader.reset().unwrap();
+    assert_eq!(
+        reader.run_collect_rows().unwrap(),
+        vec![vec![Value::build_text("public")]]
+    );
+    assert_eq!(
+        query_text(&other, "SELECT current_setting('search_path')"),
+        ["\"$user\", public"]
+    );
+}
+
+#[turso_macros::test(mvcc)]
+fn test_pg_current_setting_reports_default_without_session_state(db: TempDatabase) {
+    let conn = db.connect_limbo();
+    assert_eq!(
+        conn.prepare("SELECT current_setting('search_path')")
+            .unwrap()
+            .run_collect_rows()
+            .unwrap(),
+        vec![vec![Value::build_text("\"$user\", public")]]
+    );
+}
+
+#[turso_macros::test(mvcc)]
+fn test_pg_is_in_recovery_returns_temporary_true_text(db: TempDatabase) {
+    let conn = db.connect_postgres();
+    assert_eq!(
+        query_text(
+            &conn,
+            "SELECT pg_catalog.set_config('search_path', '', false)"
+        ),
+        [""]
+    );
+    for sql in [
+        "SELECT pg_catalog.pg_is_in_recovery()",
+        "SELECT pg_is_in_recovery() AS recovery",
+    ] {
+        assert_eq!(query_text(&conn, sql), ["t"]);
+    }
+    assert!(conn.prepare("SELECT pg_is_in_recovery(1)").is_err());
+
+    let raw = db.connect_limbo();
+    assert_eq!(
+        raw.prepare("SELECT pg_is_in_recovery()")
+            .unwrap()
+            .run_collect_rows()
+            .unwrap(),
+        vec![vec![Value::build_text("t")]]
+    );
 }
 
 #[turso_macros::test(mvcc)]
@@ -108,9 +354,14 @@ fn test_pg_current_schema_all_syntactic_forms(db: TempDatabase) {
 #[turso_macros::test(mvcc)]
 fn test_pg_derived_result_column_names(db: TempDatabase) {
     let conn = db.connect_postgres();
+    conn.execute("CREATE TABLE t (a integer)").unwrap();
 
     // PostgreSQL names unaliased function-call and keyword columns after the
-    // function
+    // function, casts after the cast expression or else the target type,
+    // coalesce/greatest/least/nullif after the keyword, CASE after its ELSE
+    // expression or else `case`, ARRAY[] after the keyword, COLLATE and
+    // subscripts after the expression they wrap, and other unaliased
+    // expressions `?column?`
     for (sql, expected) in [
         ("SELECT version()", "version"),
         ("SELECT pg_catalog.version()", "version"),
@@ -123,6 +374,43 @@ fn test_pg_derived_result_column_names(db: TempDatabase) {
         ("SELECT * FROM current_schema() AS cs", "cs"),
         ("SELECT count(*) FROM pg_catalog.pg_database", "count"),
         ("SELECT version() AS v", "v"),
+        ("SELECT 1", "?column?"),
+        ("SELECT * FROM (SELECT 1 + 1) AS s", "?column?"),
+        ("SELECT a::int FROM t", "a"),
+        ("SELECT CAST(a AS text) FROM t", "a"),
+        ("SELECT t.a::bigint FROM t", "a"),
+        ("SELECT a::int::text FROM t", "a"),
+        ("SELECT version()::text", "version"),
+        ("SELECT current_user::text", "current_user"),
+        ("SELECT 1::int", "int4"),
+        ("SELECT CAST(1 AS integer)", "int4"),
+        ("SELECT int '5'", "int4"),
+        ("SELECT '2'::varchar", "varchar"),
+        ("SELECT 1::int::text", "text"),
+        ("SELECT (1 + 1)::int", "int4"),
+        ("SELECT * FROM (SELECT 1::bigint) AS s", "int8"),
+        ("SELECT coalesce(1, 2)", "coalesce"),
+        ("SELECT greatest(1, 2)", "greatest"),
+        ("SELECT least(1, 2)", "least"),
+        ("SELECT nullif(1, 2)", "nullif"),
+        ("SELECT coalesce(1, 2)::text", "coalesce"),
+        ("SELECT CASE WHEN true THEN 1 END", "case"),
+        ("SELECT CASE WHEN true THEN 1 ELSE abs(1) END", "abs"),
+        ("SELECT CASE WHEN true THEN 1 ELSE abs(1)::int END", "abs"),
+        ("SELECT CASE WHEN true THEN 1 ELSE 1::int END", "case"),
+        ("SELECT CASE WHEN true THEN 1 END::text", "text"),
+        ("SELECT CASE WHEN true THEN 1 ELSE 1::int END::text", "text"),
+        ("SELECT CASE WHEN true THEN 1 ELSE now() END::text", "now"),
+        (
+            "SELECT CASE WHEN true THEN 1 ELSE CASE WHEN true THEN 1 ELSE abs(1) END END",
+            "abs",
+        ),
+        ("SELECT ARRAY[1]", "array"),
+        ("SELECT (ARRAY[1])[1]", "array"),
+        ("SELECT (ARRAY[1]::int[])[1]", "array"),
+        ("SELECT lower('a') COLLATE \"C\"", "lower"),
+        ("SELECT 'a'::text COLLATE \"C\"", "text"),
+        ("SELECT 'a' COLLATE \"C\"", "?column?"),
     ] {
         let stmt = conn.prepare(sql).unwrap();
         assert_eq!(stmt.get_column_name(0), expected, "{sql}");
@@ -136,6 +424,136 @@ fn test_pg_backend_pid_is_positive_integer(db: TempDatabase) {
     let pids = query_integer(&conn, "SELECT pg_backend_pid()");
     assert_eq!(pids.len(), 1);
     assert!(pids[0] > 0, "pg_backend_pid() must be a positive pid");
+}
+
+#[turso_macros::test(mvcc)]
+fn test_pg_native_function_signatures_and_catalogs(db: TempDatabase) {
+    let conn = db.connect_limbo();
+    for (sql, expected) in [
+        ("SELECT quote_ident('Foo')", Value::build_text("\"Foo\"")),
+        ("SELECT booleq(1, 0)", Value::from_i64(0)),
+        ("SELECT boolne(1, 0)", Value::from_i64(1)),
+        (
+            "SELECT format_type(1043)",
+            Value::build_text("character varying"),
+        ),
+        (
+            "SELECT format_type(1043, 17)",
+            Value::build_text("character varying(13)"),
+        ),
+        ("SELECT pg_get_expr('x + 7', 1)", Value::build_text("x + 7")),
+        (
+            "SELECT pg_get_expr('x + 7', 1, 1)",
+            Value::build_text("x + 7"),
+        ),
+        ("SELECT pg_get_expr('x + 7', NULL, 1)", Value::Null),
+        ("SELECT length(now(1, 2, 3))", Value::from_i64(23)),
+    ] {
+        assert_eq!(
+            conn.prepare(sql).unwrap().run_collect_rows().unwrap(),
+            vec![vec![expected]],
+            "{sql}"
+        );
+    }
+    for sql in [
+        "SELECT version(1)",
+        "SELECT quote_ident()",
+        "SELECT format_type()",
+        "SELECT format_type(23, -1, 0)",
+        "SELECT pg_get_expr('x')",
+        "SELECT pg_get_expr('x', 1, 1, 1)",
+    ] {
+        assert!(conn.prepare(sql).is_err(), "{sql}");
+    }
+    let rows = conn
+        .prepare_internal(
+            "SELECT name, narg, flags FROM pragma_function_list WHERE name IN \
+         ('format_type', 'pg_get_constraintdef', 'quote_ident', 'now') ORDER BY name, narg",
+        )
+        .unwrap()
+        .run_collect_rows()
+        .unwrap();
+    assert_eq!(
+        rows,
+        [
+            ("format_type", 1, 2048),
+            ("format_type", 2, 2048),
+            ("now", -1, 0),
+            ("pg_get_constraintdef", 1, 0),
+            ("pg_get_constraintdef", 2, 0),
+            ("quote_ident", 1, 2048),
+        ]
+        .into_iter()
+        .map(|(name, count, flags)| vec![
+            Value::build_text(name),
+            Value::from_i64(count),
+            Value::from_i64(flags)
+        ])
+        .collect::<Vec<_>>()
+    );
+    let rows = conn
+        .prepare(
+            "SELECT proname, pronargs, provolatile FROM pg_proc WHERE proname IN \
+         ('format_type', 'pg_get_constraintdef', 'quote_ident', 'now') ORDER BY proname, pronargs",
+        )
+        .unwrap()
+        .run_collect_rows()
+        .unwrap();
+    assert_eq!(
+        rows,
+        [
+            ("format_type", 1, "i"),
+            ("format_type", 2, "i"),
+            ("now", -1, "v"),
+            ("pg_get_constraintdef", 1, "v"),
+            ("pg_get_constraintdef", 2, "v"),
+            ("quote_ident", 1, "i"),
+        ]
+        .into_iter()
+        .map(|(name, count, volatility)| vec![
+            Value::build_text(name),
+            Value::from_i64(count),
+            Value::build_text(volatility)
+        ])
+        .collect::<Vec<_>>()
+    );
+}
+
+#[turso_macros::test(mvcc)]
+fn test_pg_native_timestamps_are_registered_before_connection_wrapping(db: TempDatabase) {
+    let conn = db.connect_limbo();
+    for name in [
+        "now",
+        "clock_timestamp",
+        "transaction_timestamp",
+        "statement_timestamp",
+    ] {
+        assert!(conn.get_syms_functions().iter().any(
+            |(registered, is_agg, argc, deterministic)| registered == name
+                && !is_agg
+                && *argc == -1
+                && !deterministic
+        ));
+        let rows = conn
+            .prepare(format!("SELECT {name}()"))
+            .unwrap()
+            .run_collect_rows()
+            .unwrap();
+        let Value::Text(timestamp) = &rows[0][0] else {
+            panic!("expected timestamp text for {name}")
+        };
+        assert_eq!(timestamp.as_str().len(), 23);
+        for (index, separator) in [
+            (4, b'-'),
+            (7, b'-'),
+            (10, b' '),
+            (13, b':'),
+            (16, b':'),
+            (19, b'.'),
+        ] {
+            assert_eq!(timestamp.as_str().as_bytes()[index], separator, "{name}");
+        }
+    }
 }
 
 #[turso_macros::test(mvcc)]

@@ -52,6 +52,7 @@ mod tests {
     use crate::sync::atomic::AtomicI64;
     use crate::sync::atomic::Ordering;
     use crate::sync::Arc;
+    use crate::ConnectOpts;
     use crate::LimboError;
 
     static IDS: AtomicI64 = AtomicI64::new(1);
@@ -71,7 +72,7 @@ mod tests {
         let th1 = {
             let db = db.clone();
             std::thread::spawn(move || {
-                let conn = db.get_db().connect().unwrap();
+                let conn = db.get_db().connect(ConnectOpts::new()).unwrap();
                 let mvcc_store = db.get_db().get_mv_store().clone().unwrap();
                 for _ in 0..iterations {
                     let tx = loop {
@@ -142,7 +143,7 @@ mod tests {
         };
         let th2 = {
             std::thread::spawn(move || {
-                let conn = db.get_db().connect().unwrap();
+                let conn = db.get_db().connect(ConnectOpts::new()).unwrap();
                 let mvcc_store = db.get_db().get_mv_store().clone().unwrap();
                 for _ in 0..iterations {
                     let tx = loop {
@@ -229,7 +230,7 @@ mod tests {
         let work = |prefix: &'static str| {
             let db = db.clone();
             std::thread::spawn(move || {
-                let conn = db.get_db().connect().unwrap();
+                let conn = db.get_db().connect(ConnectOpts::new()).unwrap();
                 let mvcc_store = db.get_db().get_mv_store().clone().unwrap();
                 let mut failed_upserts = 0;
                 let mut failed_commits = 0;

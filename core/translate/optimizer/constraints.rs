@@ -89,6 +89,11 @@ pub struct Constraint<E = ast::Expr> {
     /// many NULL keys, so such a constraint can match many rows and its cost
     /// and row estimates must not be taken from equality statistics.
     pub null_matching: bool,
+    /// Whether the term may drive this source's loop: an ON term of the
+    /// source's own outer join, or any term on a source no outer join
+    /// NULL-extends. A WHERE term on a NULL-extended source stays a filter
+    /// that also runs on the NULL row, so an IN seek cannot use it.
+    pub outer_join_compatible: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -133,9 +138,8 @@ impl<E> Constraint<E> {
 
     /// Whether this constraint can drive an index seek on its target column.
     /// Composes the `usable`/`table_col_pos` gates with the affinity check
-    /// against the column at `table_col_pos` in `columns` (set `is_strict`
-    /// only for STRICT tables; subqueries pass `false`).
-    pub fn can_drive_index_seek(&self, columns: &[Column], is_strict: bool) -> bool {
+    /// against the column at `table_col_pos` in `columns`.
+    pub fn can_drive_index_seek(&self, columns: &[Column]) -> bool {
         if !self.usable {
             return false;
         }
@@ -145,7 +149,7 @@ impl<E> Constraint<E> {
         let col = columns.get(pos).unwrap_or_else(|| {
             unreachable!("constraint table_col_pos {pos} out of bounds for {columns:?}")
         });
-        self.satisfies_index_affinity(col.affinity_with_strict(is_strict))
+        self.satisfies_index_affinity(col.affinity())
     }
 }
 
@@ -459,9 +463,13 @@ fn hir_binary_constraints_for_term(
                 !from.full_join_may_null_extend(source)
             };
 
+        let rowid_alias_column = constraint_source.rowid_alias_column();
         let (table_col_pos, is_rowid) = match part.target {
-            HirConstraintTarget::Column(column) => (Some(column.column), false),
-            HirConstraintTarget::RowId(_) => (None, true),
+            HirConstraintTarget::Column(column) => (
+                Some(column.column),
+                rowid_alias_column == Some(column.column),
+            ),
+            HirConstraintTarget::RowId(_) => (rowid_alias_column, true),
             HirConstraintTarget::Expression(_) => (None, false),
         };
         let selectivity = match constraint_source {
@@ -498,6 +506,8 @@ fn hir_binary_constraints_for_term(
             comparison_affinity: part.comparison_affinity,
             comparison_collation: part.comparison_collation,
             null_matching,
+            outer_join_compatible: term.from_outer_join == Some(source)
+                || !from.outer_join_may_null_extend(source),
         });
     }
     Ok(constraints)
@@ -581,6 +591,8 @@ fn hir_is_null_constraint_for_term(
         comparison_affinity: None,
         comparison_collation: None,
         null_matching: true,
+        outer_join_compatible: term.from_outer_join == Some(source)
+            || !from.outer_join_may_null_extend(source),
     }))
 }
 
@@ -848,6 +860,27 @@ fn hir_index_expressions<'a>(
     Ok(expressions)
 }
 
+/// Whether a query WHERE term proves an index predicate conjunct: the term
+/// is the conjunct, or the conjunct is an OR with a branch the term proves.
+fn hir_query_term_implies_predicate(query: &hir::Expr, predicate: &hir::Expr) -> bool {
+    if query.equivalent(predicate) {
+        return true;
+    }
+    match predicate {
+        hir::Expr::Binary {
+            lhs,
+            operator: ast::Operator::Or,
+            rhs,
+            custom: None,
+            ..
+        } => {
+            hir_query_term_implies_predicate(query, lhs)
+                || hir_query_term_implies_predicate(query, rhs)
+        }
+        _ => false,
+    }
+}
+
 fn hir_partial_index_predicate_terms(
     from: &impl HirFromScope,
     source: hir::SourceId,
@@ -856,15 +889,25 @@ fn hir_partial_index_predicate_terms(
 ) -> Option<SmallVec<[usize; 4]>> {
     let full_join = from.full_join_may_null_extend(source);
     let outer_join = from.outer_join_may_null_extend(source);
-    let can_use_query_term =
-        |term: &HirWhereTerm| !full_join && (!outer_join || term.from_outer_join == Some(source));
+    // A term from another join's ON clause only holds for rows that pass
+    // that join, so it proves nothing about which rows of this table are
+    // in the index.
+    let can_use_query_term = |term: &HirWhereTerm| {
+        !full_join
+            && match term.from_outer_join {
+                Some(joined) => joined == source,
+                None => !outer_join,
+            }
+    };
     let mut matched_terms = SmallVec::new();
     for index_conjunct in &crate::translate::plan::hir_planning_conjuncts(predicate) {
-        let (term_position, _) = query_where_clause
-            .iter()
-            .enumerate()
-            .find(|(_, term)| can_use_query_term(term) && index_conjunct.equivalent(&term.expr))?;
-        if !matched_terms.contains(&term_position) {
+        let (term_position, term) = query_where_clause.iter().enumerate().find(|(_, term)| {
+            can_use_query_term(term) && hir_query_term_implies_predicate(&term.expr, index_conjunct)
+        })?;
+        // A query term that proves one branch of an OR makes the partial
+        // index usable, but the index also holds rows of the other branch,
+        // so the term stays a filter unless it is the whole conjunct.
+        if index_conjunct.equivalent(&term.expr) && !matched_terms.contains(&term_position) {
             matched_terms.push(term_position);
         }
     }
@@ -1005,12 +1048,15 @@ fn hir_in_list_constraint_for_term(
         comparison_affinity: Some(comparison_affinity),
         comparison_collation,
         null_matching: false,
+        outer_join_compatible: term.from_outer_join == Some(source)
+            || !from.outer_join_may_null_extend(source),
     }))
 }
 
 #[allow(clippy::too_many_arguments)]
 fn hir_in_query_constraint_for_term(
     document: &hir::HirDocument,
+    from: &impl HirFromScope,
     term_position: usize,
     term: &HirWhereTerm,
     constraint_source: HirConstraintSource<'_>,
@@ -1082,6 +1128,8 @@ fn hir_in_query_constraint_for_term(
         comparison_affinity: Some(comparison_affinity),
         comparison_collation,
         null_matching: false,
+        outer_join_compatible: term.from_outer_join == Some(source)
+            || !from.outer_join_may_null_extend(source),
     }))
 }
 
@@ -1123,6 +1171,7 @@ pub(crate) fn hir_constraints_for_source(
         }
         if let Some(constraint) = hir_in_query_constraint_for_term(
             document,
+            from,
             term_position,
             term,
             constraint_source,
@@ -1134,6 +1183,23 @@ pub(crate) fn hir_constraints_for_source(
         }
     }
     let Some(table) = constraint_source.btree() else {
+        // An automatic index on a derived table orders a column by the
+        // collation its query gives it, so a comparison with another
+        // collation cannot seek it.
+        for constraint in &mut constraints {
+            let Some(position) = constraint.table_col_pos else {
+                continue;
+            };
+            let column_collation = source_definition
+                .columns
+                .get(position)
+                .and_then(|column| column.collation.as_ref())
+                .map(|collation| *collation.value())
+                .unwrap_or_default();
+            if constraint.comparison_collation.unwrap_or_default() != column_collation {
+                constraint.usable = false;
+            }
+        }
         return Ok(HirTableConstraints {
             constraints,
             candidates: Vec::new(),
@@ -1210,10 +1276,12 @@ pub(crate) fn hir_constraints_for_source(
         let constrained_column = constraint
             .table_col_pos
             .and_then(|position| table.table.columns().get(position));
-        if matches!(
-            (constraint.comparison_collation, constrained_column),
-            (Some(comparison), Some(column)) if comparison != column.collation()
-        ) {
+        // A comparison without a collation of its own compares as BINARY,
+        // so an index of a column declared with another collation does not
+        // order it.
+        if constrained_column.is_some_and(|column| {
+            constraint.comparison_collation.unwrap_or_default() != column.collation()
+        }) {
             constraint.usable = false;
             continue;
         }
@@ -1281,9 +1349,7 @@ pub(crate) fn hir_constraints_for_source(
                 {
                     continue;
                 }
-                if !constraint.satisfies_index_affinity(
-                    constrained_column.affinity_with_strict(table.table.is_strict()),
-                ) {
+                if !constraint.satisfies_index_affinity(constrained_column.affinity()) {
                     continue;
                 }
             } else if constraint.comparison_collation.unwrap_or_default()
@@ -1306,7 +1372,7 @@ pub(crate) fn hir_constraints_for_source(
             .sort_by_key(|reference| reference.index_col_pos);
     }
     table_constraints.temporary_index_terms =
-        automatic_index_terms(&table.table, &table_constraints)
+        automatic_index_terms(&table.table, &table_constraints, schema)
             .into_iter()
             .filter(|reference| {
                 !matches!(
@@ -1325,13 +1391,27 @@ pub(crate) fn hir_constraints_for_source(
 pub(super) fn automatic_index_terms<E>(
     table: &crate::schema::Table,
     constraints: &TableConstraints<E>,
+    schema: &Schema,
 ) -> SmallVec<[ConstraintRef; 4]> {
     let columns = table.columns();
-    let is_strict = table.is_strict();
+    // A custom type orders its stored values by its own rules, which the
+    // automatic index does not know, so only `=` terms can seek it.
+    let can_use_term = |term: &Constraint<E>| {
+        if !term.can_drive_index_seek(columns) {
+            return false;
+        }
+        let column = &columns[term
+            .table_col_pos
+            .expect("a term that can drive an index seek has a column")];
+        let has_custom_type = schema
+            .get_type_def(&column.ty_str, table.is_strict())
+            .is_some();
+        !has_custom_type || term.operator == ast::Operator::Equals.into()
+    };
     let usable_constraints: SmallVec<[&Constraint<E>; 4]> = constraints
         .constraints
         .iter()
-        .filter(|term| term.can_drive_index_seek(columns, is_strict))
+        .filter(|term| can_use_term(term))
         .collect();
     let index_columns = ordered_ephemeral_key_columns(&usable_constraints);
 
@@ -1339,7 +1419,7 @@ pub(super) fn automatic_index_terms<E>(
         .constraints
         .iter()
         .enumerate()
-        .filter(|(_, term)| term.can_drive_index_seek(columns, is_strict))
+        .filter(|(_, term)| can_use_term(term))
         .filter_map(|(term_index, term)| {
             let table_col_pos = term.table_col_pos?;
             Some(ConstraintRef {
@@ -1626,7 +1706,7 @@ pub fn usable_constraints_for_lhs_mask<E>(
         if other_side_refers_to_self {
             // Self-referential constraints cannot seed a lookup, but if they are
             // on a later index column they also terminate the usable prefix.
-            if cref.index_col_pos != current_required_column_pos {
+            if cref.index_col_pos > current_required_column_pos {
                 break;
             }
             continue;
@@ -1635,7 +1715,7 @@ pub fn usable_constraints_for_lhs_mask<E>(
             // Join-dependent constraints are only usable when every referenced
             // outer table is already on the left side of the join order. As
             // above, a missing earlier prefix column terminates the prefix.
-            if cref.index_col_pos != current_required_column_pos {
+            if cref.index_col_pos > current_required_column_pos {
                 break;
             }
             continue;
@@ -1860,6 +1940,7 @@ fn hir_expr_needs_no_affinity_change(affinity: Affinity, expression: &hir::Expr)
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::alloc::TursoIteratorExt;
     use crate::schema::Table;
 
     fn empty_hir_document(source: hir::SourceId) -> hir::HirDocument {
@@ -1987,12 +2068,12 @@ mod tests {
         crate::schema::Table::BTree(Arc::new(crate::schema::BTreeTable::new(
             1,
             "items".into(),
-            Vec::new(),
-            columns,
+            crate::alloc::vec![],
+            columns.into_iter().collect_vec(),
             crate::schema::BTreeCharacteristics::HAS_ROWID,
-            Vec::new(),
-            Vec::new(),
-            Vec::new(),
+            crate::alloc::vec![],
+            crate::alloc::vec![],
+            crate::alloc::vec![],
             None,
         )))
     }
@@ -2100,6 +2181,7 @@ mod tests {
             lhs_mask: TableMask::default(),
             selectivity: 0.1,
             usable: true,
+            outer_join_compatible: true,
             is_rowid: false,
             comparison_affinity: Some(Affinity::Integer),
             comparison_collation: None,
@@ -2135,6 +2217,7 @@ mod tests {
                 comparison_affinity: Some(Affinity::Integer),
                 comparison_collation: None,
                 null_matching: false,
+                outer_join_compatible: true,
             }],
             candidates: vec![ConstraintUseCandidate {
                 index: None,
@@ -2175,11 +2258,12 @@ mod tests {
                 .collect::<Vec<_>>(),
             [3]
         );
+        // A rowid IN seek compares as NUMERIC, like any numeric column.
         assert!(matches!(
             access_method.params,
             crate::translate::optimizer::access_method::AccessMethodParams::InSeek {
                 index: None,
-                affinity: Affinity::Integer,
+                affinity: Affinity::Numeric,
                 where_term_idx: 3,
             }
         ));
@@ -2204,6 +2288,7 @@ mod tests {
                 comparison_affinity: Some(Affinity::Integer),
                 comparison_collation: None,
                 null_matching: false,
+                outer_join_compatible: true,
             }],
             candidates: vec![ConstraintUseCandidate {
                 index: None,
@@ -2662,6 +2747,7 @@ mod tests {
 
         let fallback = hir_in_query_constraint_for_term(
             &document,
+            &from,
             0,
             &term,
             HirConstraintSource::BTree(&table),
@@ -2681,6 +2767,7 @@ mod tests {
         let correlated = hir_document_with_query(source, query, vec![captured]);
         assert!(hir_in_query_constraint_for_term(
             &correlated,
+            &from,
             0,
             &HirWhereTerm {
                 expr: expression,
@@ -2733,7 +2820,7 @@ mod tests {
             name: "items_a".into(),
             table_name: "items".into(),
             root_page: 2,
-            columns: vec![crate::schema::IndexColumn::new("a", 0)],
+            columns: crate::alloc::vec![crate::schema::IndexColumn::new("a", 0)],
             unique: false,
             ephemeral: false,
             has_rowid: true,
@@ -2802,7 +2889,7 @@ mod tests {
             name: "items_sum".into(),
             table_name: "items".into(),
             root_page: 2,
-            columns: vec![crate::schema::IndexColumn {
+            columns: crate::alloc::vec![crate::schema::IndexColumn {
                 name: "a + b".into(),
                 order: SortOrder::Asc,
                 nulls_order: None,
@@ -2961,7 +3048,7 @@ mod tests {
             name: "items_a_partial".into(),
             table_name: "items".into(),
             root_page: 2,
-            columns: vec![crate::schema::IndexColumn::new("a", 0)],
+            columns: crate::alloc::vec![crate::schema::IndexColumn::new("a", 0)],
             unique: false,
             ephemeral: false,
             has_rowid: true,

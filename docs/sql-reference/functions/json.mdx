@@ -10,6 +10,8 @@ Turso provides a full set of JSON functions compatible with SQLite's JSON1 exten
 
 Most functions come in pairs: a `json_*` variant that returns TEXT and a `jsonb_*` variant that returns BLOB in the internal binary format. The JSONB variants are more efficient when the result will be stored or passed to another JSON function rather than returned to the application.
 
+SQL REAL arguments are converted to JSON numbers with up to 15 significant decimal digits, matching SQLite. Numbers already stored in JSON text retain their original precision.
+
 ## JSON Path Syntax
 
 Many JSON functions accept a **path** argument that identifies a specific element within a JSON document.
@@ -211,7 +213,7 @@ jsonb_extract(json_text, path)
 | `json_text` | TEXT or BLOB | A JSON document |
 | `path` | TEXT | One or more JSON path expressions |
 
-**Returns:** With a single path, returns the extracted value using its natural SQL type (INTEGER, REAL, TEXT, or NULL). JSON objects and arrays are returned as TEXT. With multiple paths, returns a JSON array of the extracted values. `jsonb_extract` returns BLOB.
+**Returns:** With a single path, returns the extracted value using its natural SQL type (INTEGER, REAL, TEXT, or NULL). `json_extract` returns JSON objects and arrays as TEXT, while `jsonb_extract` returns them as a JSONB BLOB. With multiple paths, `json_extract` returns a JSON array of the extracted values as TEXT and `jsonb_extract` returns it as a JSONB BLOB.
 
 ```sql
 SELECT json_extract('{"name":"Alice","age":30}', '$.name');

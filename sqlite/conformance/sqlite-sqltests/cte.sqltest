@@ -1028,10 +1028,144 @@ test cte-unreferenced-qualified-column-orderby-exists {
     CREATE TABLE t(a);
     WITH cte AS (SELECT 1 y)
     SELECT cte.y FROM t
-    ORDER BY EXISTS (SELECT 1);
+    ORDER BY EXISTS (SELECT 1 FROM cte);
 }
 expect error {
     no such column: cte\.y
+}
+
+# A CTE that nothing reads is never resolved, so errors in its body are not
+# reported, even when the statement has subqueries.
+setup cte_unused_with_errors {
+    CREATE TABLE t(a);
+    INSERT INTO t VALUES (1);
+}
+
+@setup cte_unused_with_errors
+test cte-unused-with-errors-scalar-subquery {
+    WITH x AS (SELECT nosuch FROM t) SELECT (SELECT 1);
+}
+expect {
+    1
+}
+
+@setup cte_unused_with_errors
+test cte-unused-with-errors-in-subquery {
+    WITH x AS (SELECT * FROM nosuchtab) SELECT a FROM t WHERE a IN (SELECT 1);
+}
+expect {
+    1
+}
+
+@setup cte_unused_with_errors
+test cte-unused-with-errors-order-by-limit-having-subqueries {
+    WITH x AS (SELECT nosuch FROM t) SELECT a FROM t ORDER BY (SELECT 1);
+    WITH x AS (SELECT nosuch FROM t) SELECT a FROM t LIMIT (SELECT 1);
+    WITH x AS (SELECT nosuch FROM t) SELECT count(*) FROM t HAVING (SELECT 1);
+}
+expect {
+    1
+    1
+    1
+}
+
+@setup cte_unused_with_errors
+test cte-unused-with-errors-from-subquery {
+    WITH x AS (SELECT nosuch FROM t) SELECT * FROM t, (SELECT 2);
+}
+expect {
+    1|2
+}
+
+@setup cte_unused_with_errors
+test cte-unused-with-errors-values-subquery {
+    WITH x AS (SELECT nosuch FROM t) VALUES ((SELECT 3));
+}
+expect {
+    3
+}
+
+@setup cte_unused_with_errors
+test cte-unused-with-errors-nested-with {
+    SELECT (WITH x AS (SELECT nosuch FROM t) SELECT (SELECT 3));
+}
+expect {
+    3
+}
+
+@setup cte_unused_with_errors
+test cte-unused-with-errors-read-only-by-another-unused-cte {
+    WITH x AS (SELECT nosuch FROM t), y AS (SELECT * FROM x) SELECT (SELECT 1);
+}
+expect {
+    1
+}
+
+@setup cte_unused_with_errors
+test cte-unused-with-errors-update {
+    WITH x AS (SELECT nosuch FROM t) UPDATE t SET a = (SELECT 2);
+    WITH x AS (SELECT nosuch FROM t) UPDATE t SET a = a + 1;
+    SELECT a FROM t;
+}
+expect {
+    3
+}
+
+@setup cte_unused_with_errors
+test cte-unused-with-errors-insert {
+    WITH x AS (SELECT nosuch FROM t) INSERT INTO t SELECT (SELECT 5);
+    WITH x AS (SELECT nosuch FROM t) INSERT INTO t VALUES (6);
+    WITH x AS (SELECT nosuch FROM t) INSERT INTO t VALUES (7) RETURNING (SELECT 8);
+    SELECT a FROM t ORDER BY a;
+}
+expect {
+    8
+    1
+    5
+    6
+    7
+}
+
+@setup cte_unused_with_errors
+test cte-unused-with-errors-delete {
+    WITH x AS (SELECT nosuch FROM t) DELETE FROM t WHERE a IN (SELECT 7);
+    WITH x AS (SELECT nosuch FROM t) DELETE FROM t WHERE a = 7;
+    SELECT count(*) FROM t;
+}
+expect {
+    1
+}
+
+@setup cte_unused_with_errors
+test cte-unused-with-errors-view {
+    CREATE VIEW v AS WITH x AS (SELECT nosuch FROM t) SELECT (SELECT 1) AS c;
+    SELECT c FROM v;
+}
+expect {
+    1
+}
+
+@setup cte_unused_with_errors
+test cte-used-with-errors-in-subquery {
+    WITH x AS (SELECT nosuch FROM t) SELECT (SELECT 1 FROM x);
+}
+expect error {
+    no such column: nosuch
+}
+
+# A CTE read through another CTE, a nested WITH, or a WINDOW clause subquery is
+# still visible.
+test cte-read-by-subqueries-through-other-ctes {
+    WITH x AS (SELECT 1 a), y AS (SELECT a FROM x) SELECT (SELECT a FROM y);
+    WITH x AS (SELECT 2 a) SELECT (WITH z AS (SELECT a FROM x) SELECT a FROM z);
+    WITH x AS (SELECT 3 a), y AS (SELECT (WITH z AS (SELECT a FROM x) SELECT a FROM z) b) SELECT * FROM y;
+    WITH x AS (SELECT 4 a) SELECT sum(a) OVER w FROM x WINDOW w AS (ORDER BY (SELECT a FROM x));
+}
+expect {
+    1
+    2
+    3
+    4
 }
 
 @cross-check-integrity
@@ -1505,4 +1639,133 @@ test table-referenced-with-call-arguments-rejected {
 }
 expect error {
     'not_a_function' is not a function
+}
+
+test materialized-cte-in-a-nested-subquery-reads-the-outer-row {
+    CREATE TABLE mc(id INTEGER PRIMARY KEY, x INT);
+    INSERT INTO mc VALUES (1, 10), (2, 20);
+    SELECT *
+    FROM (SELECT mc.id, (WITH c AS MATERIALIZED (SELECT mc.x AS v) SELECT v FROM c) AS w FROM mc) AS q
+    ORDER BY 1;
+}
+expect {
+    1|10
+    2|20
+}
+
+test materialized-cte-with-correlated-subquery-read-from-a-derived-table {
+    CREATE TABLE t0(c0);
+    INSERT INTO t0 VALUES (7);
+    WITH x AS MATERIALIZED (SELECT (SELECT c0) AS c0 FROM t0)
+    SELECT * FROM (SELECT (SELECT c0 FROM x));
+}
+expect {
+    7
+}
+
+test materialized-cte-with-in-subquery-read-from-a-derived-table {
+    CREATE TABLE t0(c0);
+    INSERT INTO t0 VALUES (7);
+    WITH x AS MATERIALIZED (SELECT t0.c0 IN (SELECT c0) AS c0 FROM t0)
+    SELECT * FROM (SELECT (SELECT c0 FROM x));
+}
+expect {
+    1
+}
+
+test materialized-cte-with-exists-subquery-read-from-a-derived-table {
+    CREATE TABLE t0(c0);
+    INSERT INTO t0 VALUES (7);
+    WITH x AS MATERIALIZED (SELECT c0 FROM t0 WHERE EXISTS (SELECT t0.c0))
+    SELECT * FROM (SELECT (SELECT c0 FROM x));
+}
+expect {
+    7
+}
+
+test cte-read-twice-with-correlated-subquery-next-to-a-window-function {
+    CREATE TABLE t0(c0);
+    INSERT INTO t0 VALUES (7);
+    WITH x AS (SELECT (SELECT c0) AS c0 FROM t0)
+    SELECT max(1) OVER (), (SELECT count(*) FROM x AS a, x AS b);
+}
+expect {
+    1|1
+}
+
+# The first reference of x sits in a loop over an empty table, so it never
+# runs. Later references must still fill x before they read it.
+test materialized-cte-first-read-in-a-loop-that-does-not-run {
+    CREATE TABLE t0(c0);
+    WITH x AS MATERIALIZED (SELECT 0 AS a)
+    SELECT a, (SELECT (SELECT a FROM x WHERE a = t0.c0) FROM t0) FROM x;
+}
+expect {
+    0|
+}
+
+test compound-cte-first-read-in-a-loop-that-does-not-run {
+    CREATE TABLE t0(c0);
+    WITH x AS (SELECT 0 AS a UNION SELECT 1)
+    SELECT x.a, (SELECT (SELECT y.a FROM x AS y WHERE y.a = t0.c0) FROM t0) FROM x;
+}
+expect {
+    0|
+    1|
+}
+
+test materialized-cte-first-read-in-having-without-groups {
+    CREATE TABLE t0(c0);
+    WITH x AS MATERIALIZED (SELECT 0)
+    SELECT (SELECT 1 FROM t0 GROUP BY c0 HAVING EXISTS (SELECT * FROM x)) IS NULL FROM x;
+}
+expect {
+    1
+}
+
+test materialized-cte-first-read-in-having-of-where-exists {
+    CREATE TABLE t0(c0);
+    WITH x AS MATERIALIZED (SELECT 0)
+    SELECT count(*) FROM x WHERE EXISTS (SELECT 1 FROM t0 GROUP BY c0 HAVING EXISTS (SELECT * FROM x));
+}
+expect {
+    0
+}
+
+test materialized-cte-first-read-in-a-loop-that-does-not-run-then-read-by-a-subquery {
+    CREATE TABLE t0(c0);
+    WITH x AS MATERIALIZED (SELECT 0 AS a)
+    SELECT (SELECT (SELECT a FROM x WHERE a = t0.c0) FROM t0) IS NULL, (SELECT a FROM x);
+}
+expect {
+    1|0
+}
+
+test materialized-cte-read-by-another-materialized-cte-first-read-in-a-loop-that-does-not-run {
+    CREATE TABLE t0(c0);
+    WITH x AS MATERIALIZED (SELECT 0 AS a), y AS MATERIALIZED (SELECT a FROM x)
+    SELECT a, (SELECT (SELECT a FROM y WHERE a = t0.c0) FROM t0) IS NULL FROM y;
+}
+expect {
+    0|1
+}
+
+test correlated-materialized-cte-first-read-in-a-loop-that-does-not-run {
+    CREATE TABLE t0(c0);
+    CREATE TABLE t1(c);
+    INSERT INTO t1 VALUES (5);
+    SELECT (WITH x AS MATERIALIZED (SELECT t1.c AS a) SELECT quote((SELECT (SELECT a FROM x WHERE a = t0.c0) FROM t0)) || a FROM x) FROM t1;
+}
+expect {
+    NULL5
+}
+
+test correlated-materialized-cte-first-read-in-having-of-where-exists {
+    CREATE TABLE t0(c0);
+    CREATE TABLE t1(c);
+    INSERT INTO t1 VALUES (5);
+    SELECT (WITH x AS MATERIALIZED (SELECT t1.c AS a) SELECT count(*) FROM x WHERE EXISTS (SELECT 1 FROM t0 GROUP BY c0 HAVING EXISTS (SELECT * FROM x))) FROM t1;
+}
+expect {
+    0
 }

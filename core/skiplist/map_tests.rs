@@ -6,6 +6,7 @@ use std::{
 };
 
 use crate::skiplist::SkipMap;
+use crossbeam_epoch as epoch;
 use crossbeam_utils::thread;
 
 #[test]
@@ -272,6 +273,92 @@ fn ordered_iter() {
     assert!(iter.next_back().is_none());
     assert!(iter.next().is_none());
     assert!(iter.next_back().is_none());
+}
+
+#[test]
+fn range_inner_next_back_one_guard_covers_a_batch() {
+    let map: SkipMap<i32, i32> = SkipMap::new();
+    for i in 0..2048 {
+        map.insert(i, i);
+    }
+
+    let guard = epoch::pin();
+    let mut range = map.range(..);
+    let mut first_batch = Vec::new();
+    while let Some(entry) = range.inner.next_back(&guard) {
+        first_batch.push(*entry.key());
+        entry.release(&guard);
+        if first_batch.len() == 1024 {
+            break;
+        }
+    }
+    drop(range);
+    drop(guard);
+
+    assert_eq!(first_batch.len(), 1024);
+    assert_eq!(first_batch[0], 2047);
+    assert_eq!(first_batch[1023], 1024);
+
+    let last = first_batch[1023];
+    let guard = epoch::pin();
+    let mut range = map.range((Bound::Unbounded, Bound::Excluded(last)));
+    let mut second_batch = Vec::new();
+    while let Some(entry) = range.inner.next_back(&guard) {
+        second_batch.push(*entry.key());
+        entry.release(&guard);
+    }
+    drop(range);
+    drop(guard);
+
+    assert_eq!(second_batch.len(), 1024);
+    assert_eq!(second_batch[0], 1023);
+    assert_eq!(second_batch[1023], 0);
+    for key in &first_batch {
+        assert!(!second_batch.contains(key));
+    }
+}
+
+#[test]
+fn range_inner_next_one_guard_covers_a_batch() {
+    let map: SkipMap<i32, i32> = SkipMap::new();
+    for i in 0..2048 {
+        map.insert(i, i);
+    }
+
+    let guard = epoch::pin();
+    let mut range = map.range(..);
+    let mut first_batch = Vec::new();
+    while let Some(entry) = range.inner.next(&guard) {
+        first_batch.push(*entry.key());
+        entry.release(&guard);
+        if first_batch.len() == 1024 {
+            break;
+        }
+    }
+    drop(range);
+    drop(guard);
+
+    assert_eq!(first_batch.len(), 1024);
+    assert_eq!(first_batch[0], 0);
+    assert_eq!(first_batch[1023], 1023);
+
+    let last = first_batch[1023];
+    let guard = epoch::pin();
+    let mut range = map.range((Bound::Excluded(last), Bound::Unbounded));
+    let mut second_batch = Vec::new();
+    while let Some(entry) = range.inner.next(&guard) {
+        second_batch.push(*entry.key());
+        entry.release(&guard);
+    }
+    drop(range);
+    drop(guard);
+
+    assert_eq!(second_batch.len(), 1024);
+    assert_eq!(second_batch[0], 1024);
+    assert_eq!(second_batch[1023], 2047);
+    for key in &first_batch {
+        assert!(!second_batch.contains(key));
+    }
 }
 
 #[test]

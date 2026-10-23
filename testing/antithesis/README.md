@@ -1,5 +1,33 @@
 # Antithesis Test Suite
 
+Each directory here is an Antithesis [test template](https://antithesis.com/docs/test_templates/): executables whose
+filename prefix (`first_`, `parallel_driver_`, `singleton_driver_`, `anytime_`, `eventually_`, `finally_`, ...) tells
+Test Composer when to run them. `Dockerfile.antithesis` copies them to `/opt/antithesis/test/v1/`.
+
+## Running a Template Locally
+
+Use [`thesis`](../../tools/thesis) to run a template on your machine as a single seeded timeline. From the repository
+root:
+
+```sh
+uv run --group antithesis thesis run testing/antithesis/stress-composer --seed 42 --steps 500 --timeout 2m
+```
+
+The `antithesis` dependency group builds `pyturso` from your checkout, so the run tests your local changes (the first
+run takes a few minutes to compile). `thesis` seeds the SDK's `get_random()` and `random_choice()`, so the same seed
+replays the same commands with the same random choices. It also evaluates SDK assertions: a failing `always()` or a
+reached `unreachable()` fails the run, as does a command exiting non-zero. On failure it prints a command to reproduce
+the run up to the failing step, e.g.:
+
+```
+thesis: reproduce with: thesis run .../testing/antithesis/stress-composer --seed 42 --steps 57
+```
+
+Commands run one at a time in a fresh temporary directory, which is kept on failure with each command's output. Other
+useful flags: `--duration 10m` or `--forever` instead of `--steps`, `--strict` to also fail on `sometimes()` and
+`reachable()` assertions that never fired, and `-v` to stream command output. See the
+[`thesis` README](../../tools/thesis/README.md) for details and for what a seed does not make reproducible.
+
 ## How to Dump Artifacts from a Test Run
 
 To dump the stress tool's log and the database from an Antithesis test run, follow these steps. Note that they require
@@ -58,7 +86,7 @@ using [sqlite-viz](https://github.com/LeMikaelF/sqlite-viz). SQLite (and possibl
 can also dump information about certain pages in a human-readable form (see the `dump` command and the `-p` flag for
 pages, or `-t` for trees), so that you can either reason better about them, or pass them to an LLM.
 
-You might also try binary-searching for the time that the corruption occured. The resolution of `rewind()` is
+You might also try binary-searching for the time that the corruption occurred. The resolution of `rewind()` is
 only one millisecond, but that will at least give you an idea:
 
 ```js

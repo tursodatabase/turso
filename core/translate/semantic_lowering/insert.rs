@@ -10,12 +10,12 @@ use std::num::NonZeroUsize;
 
 use turso_parser::ast::{ResolveType, TriggerTime};
 
-use super::emit::{
-    any_effective_replace, constraint_may_abort, format_unique_violation_desc,
-    halt_desc_and_on_error,
-};
+use super::emit::{any_effective_replace, constraint_may_abort, format_unique_violation_desc};
 use crate::{
-    error::{SQLITE_CONSTRAINT_NOTNULL, SQLITE_CONSTRAINT_PRIMARYKEY, SQLITE_CONSTRAINT_UNIQUE},
+    error::{
+        SQLITE_CONSTRAINT_NOTNULL, SQLITE_CONSTRAINT_PRIMARYKEY, SQLITE_CONSTRAINT_UNIQUE,
+        SQLITE_ERROR,
+    },
     schema::{Column, EXPR_INDEX_SENTINEL},
     translate::{
         plan::QueryDestination,
@@ -31,7 +31,7 @@ use crate::{
     CaptureDataChangesExt, LimboError, Result,
 };
 
-use super::autoincrement::Sequence;
+use super::autoincrement::{Sequence, StatementSequence};
 use super::dml::{DmlTarget, ReturningBuffer, Subprograms};
 use super::fkey_action::CompiledAction;
 use super::trigger::{CompiledTrigger, TriggerRow};
@@ -66,7 +66,6 @@ pub(super) fn check(plan: &HirPlan, insert: &hir::Insert, program: &ProgramBuild
     if !table.has_rowid {
         without_rowid_errors(program, insert, source)?;
     }
-    super::dml::check_strict_types(&table, source)?;
     Ok(())
 }
 
@@ -104,6 +103,7 @@ pub(super) fn emit_insert(
     subprograms: &Subprograms<'_>,
     mvcc: bool,
     enforce_checks: bool,
+    upsert_rejects_rewritten_row: bool,
 ) -> Result<()> {
     let triggers = &subprograms.triggers[..];
     if subprograms.upsert_actions.len() != insert.upserts.len() {
@@ -215,17 +215,25 @@ pub(super) fn emit_insert(
         .as_ref()
         .map(|autoincrement| Sequence::new(autoincrement, target.database, table, mvcc))
         .transpose()?;
-    if several_rows {
-        if let Some(sequence) = &sequence {
-            sequence.ensure_row(program);
-        }
-    }
     let returning = ReturningBuffer::open(program, table, insert.returning.as_ref());
     let table_cursor = target.open_table_for_write(program);
     let index_cursors = target.open_indexes_for_write(program, None)?;
+    let sequence = sequence.as_ref().map(|sequence| sequence.begin(program));
+    // PostgreSQL: a DO UPDATE of a row this statement already inserted or
+    // updated fails, so the result does not depend on the order of the
+    // rows. The rowids written so far are kept in an ephemeral table.
+    let written_rowids = (upsert_rejects_rewritten_row && has_do_update).then(|| {
+        let cursor = program.alloc_cursor_id(CursorType::BTreeTable(table.clone()));
+        program.emit_insn(Insn::OpenEphemeral {
+            cursor_id: cursor,
+            is_table: true,
+        });
+        cursor
+    });
     let row = InsertRow {
         target: &target,
         table_cursor,
+        written_rowids,
         rowid: program.alloc_register(),
         columns: program.alloc_registers(table.columns().len()),
         or_conflict,
@@ -332,6 +340,9 @@ pub(super) fn emit_insert(
         }
     }
     program.preassign_label_to_next_insn(done);
+    if let Some(sequence) = &sequence {
+        sequence.emit_end(program);
+    }
     target.emit_capture_commit(program)?;
     if let Some(returning) = returning {
         returning.emit_rows(program);
@@ -392,7 +403,26 @@ fn emit_virtual_insert(
     let conflict_action = insert
         .conflict
         .map_or(0, |conflict| conflict.bit_value() as u16);
-    program.begin_read_operation()?;
+    // The statement is a writer: while one of its native writes is pending,
+    // no other write statement or transaction end may start.
+    match document
+        .source(insert.target)
+        .and_then(|source| source.database)
+    {
+        Some(database) => {
+            let schema_version = document
+                .database(database)
+                .ok_or_else(|| {
+                    LimboError::InternalError(format!(
+                        "HIR INSERT target {} references missing database {database:?}",
+                        insert.target
+                    ))
+                })?
+                .schema_version;
+            program.begin_write_on_database(database.index(), schema_version)?;
+        }
+        None => program.begin_write_operation()?,
+    }
     let returning = ReturningBuffer::open_scratch(program, insert.returning.as_ref());
     let cursor = super::dml::open_virtual_for_write(program, table);
     let resolved_table = match document.source(insert.target).map(|source| &source.kind) {
@@ -573,7 +603,7 @@ fn emit_select_rows(
         query,
         &QueryDestination::CoroutineYield {
             yield_reg,
-            stored_outputs: Vec::new(),
+            stored_outputs: crate::alloc::vec![],
         },
     )?;
     program.emit_insn(Insn::EndCoroutine { yield_reg });
@@ -652,9 +682,9 @@ fn emit_coroutine_rows(
                 .iter()
                 .map(|target| match target.column {
                     hir::TargetColumn::RowId => Affinity::Integer.aff_mask(),
-                    hir::TargetColumn::Column(column) => table.columns()[column]
-                        .affinity_with_strict(table.is_strict)
-                        .aff_mask(),
+                    hir::TargetColumn::Column(column) => {
+                        table.columns()[column].affinity().aff_mask()
+                    }
                 })
                 .collect(),
         ),
@@ -705,6 +735,7 @@ fn emit_coroutine_rows(
     program.preassign_label_to_next_insn(next);
     program.emit_insn(Insn::Next {
         cursor_id: temp,
+        is_index: program.cursor_is_index(temp),
         pc_if_next: top,
         fullscan: false,
     });
@@ -739,10 +770,13 @@ struct InsertRow<'a> {
     upsert_new: Option<hir::SourceId>,
     /// The rowid of the row an UPSERT conflicts with.
     conflict_rowid: usize,
+    /// The rowids the statement wrote so far, when a DO UPDATE of one of
+    /// them fails.
+    written_rowids: Option<CursorID>,
     /// False under `PRAGMA ignore_check_constraints`.
     enforce_checks: bool,
     /// AUTOINCREMENT: the target's sequence.
-    sequence: Option<&'a Sequence>,
+    sequence: Option<&'a StatementSequence<'a>>,
     /// The UPDATE triggers an UPSERT's DO UPDATE fires.
     upsert_triggers: &'a [CompiledTrigger],
     /// The ON UPDATE actions of each UPSERT clause's DO UPDATE.
@@ -765,7 +799,7 @@ impl InsertRow<'_> {
     ) -> Result<()> {
         let document = self.target.document;
         let table = self.target.table;
-        let sequence = self.sequence.map(|sequence| sequence.open(program));
+        let sequence = self.sequence;
         let emit_value = |program: &mut ProgramBuilder, position: usize, register: usize| {
             match values {
                 RowValues::Expressions(values) => {
@@ -937,10 +971,21 @@ impl InsertRow<'_> {
         if let (Some(sequence), Some(_)) = (&sequence, rowid_value) {
             sequence.emit_given_rowid(program, self.rowid)?;
         }
+        if let Some(sequence) = &sequence {
+            sequence.emit_visible_to_triggers(program);
+        }
 
         // CHECK constraints, index expressions, partial-index WHERE terms
         // and RETURNING read the new row.
         self.bind_new_row(program);
+        // NOT NULL of the stored columns comes first: under REPLACE a NULL
+        // becomes the column's DEFAULT, which the generated columns, the
+        // CHECK constraints and the index keys must see.
+        for (position, column) in table.columns().iter().enumerate() {
+            if column.notnull() && !column.is_rowid_alias() && !column.is_virtual_generated() {
+                self.emit_notnull_check(program, position, column, row_done)?;
+            }
+        }
         super::dml::emit_virtual_columns(
             program,
             document,
@@ -948,7 +993,13 @@ impl InsertRow<'_> {
             table,
             self.columns,
         )?;
-        // CHECK constraints run once the rowid is known, before NOT NULL.
+        super::dml::emit_strict_generated_check(program, table, self.columns);
+        for (position, column) in table.columns().iter().enumerate() {
+            if column.notnull() && column.is_virtual_generated() {
+                self.emit_notnull_check(program, position, column, row_done)?;
+            }
+        }
+        // CHECK constraints run after NOT NULL, as in SQLite.
         if self.enforce_checks {
             super::dml::emit_check_constraints(
                 program,
@@ -957,11 +1008,6 @@ impl InsertRow<'_> {
                 self.or_conflict,
                 row_done,
             )?;
-        }
-        for (position, column) in table.columns().iter().enumerate() {
-            if column.notnull() && !column.is_rowid_alias() {
-                self.emit_notnull_check(program, position, column, row_done)?;
-            }
         }
         // The constraints an UPSERT names are checked first, in the
         // UPSERT's order, then the rowid and the indexes.
@@ -1089,6 +1135,21 @@ impl InsertRow<'_> {
             flag,
             table_name: table.name.clone(),
         });
+        self.emit_remember_written_rowid(program, self.rowid);
+        // The change is captured as soon as the row is written, before an
+        // AFTER trigger it fires captures rows of its own: a consumer
+        // replays the rows in change id order.
+        if let Some(capture) = self.target.capture_rows() {
+            let after = capture.after_record(program, table, self.columns, self.rowid);
+            capture.emit_row(
+                program,
+                OperationMode::INSERT,
+                self.rowid,
+                None,
+                after,
+                None,
+            )?;
+        }
         // RAISE(IGNORE) in an AFTER trigger only ends that trigger's body.
         let after_triggers = program.allocate_label();
         for trigger in self
@@ -1113,21 +1174,6 @@ impl InsertRow<'_> {
             self.target.database,
             self.may_replace(),
         )?;
-        if let Some(sequence) = &sequence {
-            sequence.emit_close(program, self.rowid);
-        }
-        // The change is captured after the AFTER triggers ran.
-        if let Some(capture) = &self.target.capture {
-            let after = capture.after_record(program, table, self.columns, self.rowid);
-            capture.emit_row(
-                program,
-                OperationMode::INSERT,
-                self.rowid,
-                None,
-                after,
-                None,
-            )?;
-        }
         if let Some(returning) = returning {
             let start = returning.emit_values(program, document, self.target.resolved_table()?)?;
             returning.emit_buffer(program, start);
@@ -1212,6 +1258,22 @@ impl InsertRow<'_> {
                 rowid: Some(self.rowid),
             },
         );
+        if let Some(written_rowids) = self.written_rowids {
+            let not_written = program.allocate_label();
+            program.emit_insn(Insn::NotExists {
+                cursor: written_rowids,
+                rowid_reg: conflict,
+                target_pc: not_written,
+            });
+            program.emit_insn(Insn::Halt {
+                err_code: SQLITE_ERROR,
+                description: "ON CONFLICT DO UPDATE command cannot affect row a second time"
+                    .to_string(),
+                on_error: None,
+                description_reg: None,
+            });
+            program.preassign_label_to_next_insn(not_written);
+        }
         if let Some(predicate) = predicate {
             let register = program.alloc_register();
             super::expr::translate_expr_no_constant_opt(program, document, predicate, register)?;
@@ -1267,6 +1329,7 @@ impl InsertRow<'_> {
                         program.emit_insn(Insn::HaltIfNull {
                             target_reg: register,
                             err_code: SQLITE_CONSTRAINT_NOTNULL,
+                            on_error: None,
                             description: format!(
                                 "{}.{}",
                                 table.name,
@@ -1325,6 +1388,7 @@ impl InsertRow<'_> {
             },
         );
         super::dml::emit_virtual_columns(program, document, new_source.id, table, new_row)?;
+        super::dml::emit_strict_generated_check(program, table, new_row);
         // Every CHECK constraint is checked with ABORT.
         if self.enforce_checks {
             super::dml::emit_check_constraints(
@@ -1404,6 +1468,23 @@ impl InsertRow<'_> {
                 rowid_reg: conflict,
                 target_pc: row_done,
             });
+            // The trigger may have changed the columns the UPDATE does not
+            // set, so they are read again, as stored, and the generated
+            // columns are computed again from them.
+            for (position, (column, value)) in table.columns().iter().zip(&values).enumerate() {
+                if value.is_none() && !column.is_rowid_alias() && !column.is_virtual_generated() {
+                    super::dml::emit_stored_column(
+                        program,
+                        document,
+                        new_source,
+                        self.table_cursor,
+                        column,
+                        position,
+                        new_row + position,
+                    )?;
+                }
+            }
+            super::dml::emit_virtual_columns(program, document, new_source.id, table, new_row)?;
         }
         // A new rowid must not belong to another row; this is checked with
         // ABORT before the indexes.
@@ -1452,6 +1533,7 @@ impl InsertRow<'_> {
                 program.emit_insn(Insn::HaltIfNull {
                     target_reg: new_row + position,
                     err_code: SQLITE_CONSTRAINT_NOTNULL,
+                    on_error: None,
                     description: format!(
                         "{}.{}",
                         table.name,
@@ -1481,10 +1563,21 @@ impl InsertRow<'_> {
             .collect::<Result<Vec<_>>>()?;
         // The row before the change, for change data capture, read before
         // anything is written.
-        let capture_before =
-            self.target.capture.as_ref().and_then(|capture| {
-                capture.before_record(program, table, self.table_cursor, conflict)
-            });
+        let capture_before = self
+            .target
+            .capture_rows()
+            .map(|capture| {
+                capture.before_record(
+                    program,
+                    document,
+                    source,
+                    table,
+                    self.table_cursor,
+                    conflict,
+                )
+            })
+            .transpose()?
+            .flatten();
 
         // Every UNIQUE constraint is checked against the new row before
         // any index changes.
@@ -1601,9 +1694,7 @@ impl InsertRow<'_> {
                                 if column.pos_in_table == EXPR_INDEX_SENTINEL {
                                     Affinity::Blob.aff_mask()
                                 } else {
-                                    table.columns()[column.pos_in_table]
-                                        .affinity_with_strict(table.is_strict)
-                                        .aff_mask()
+                                    table.columns()[column.pos_in_table].affinity().aff_mask()
                                 }
                             })
                             .collect(),
@@ -1670,7 +1761,7 @@ impl InsertRow<'_> {
                 start_reg: start,
                 num_regs: count,
                 cursor_id: rebuild.cursor,
-                raise_error_if_no_matching_entry: false,
+                raise_error_if_no_matching_entry: true,
             });
             if let Some(skip) = skip_delete {
                 program.preassign_label_to_next_insn(skip);
@@ -1719,28 +1810,11 @@ impl InsertRow<'_> {
             flag,
             table_name: table.name.clone(),
         });
-        super::fkey::emit_update_repairs(program, &pending_repairs, database)?;
-        if let (Some(sequence), Some(_)) = (self.sequence, new_rowid) {
-            sequence.emit_moved_row(program, written)?;
-        }
-        // Like UPDATE, the actions run once the row is written, for a parent
-        // key that changed.
-        for (action, old_key) in actions.iter().zip(action_keys) {
-            let new_key =
-                super::fkey::emit_parent_key(program, document, action.foreign_key, new_source.id)?;
-            let unchanged = program.allocate_label();
-            super::fkey::emit_skip_if_same_key(
-                program,
-                old_key,
-                new_key,
-                action.foreign_key.parent_positions.len(),
-                unchanged,
-            );
-            action.emit_fire(program, old_key, Some(new_key))?;
-            program.preassign_label_to_next_insn(unchanged);
-        }
-        // A moved row is captured as deleted and inserted.
-        if let Some(capture) = &self.target.capture {
+        self.emit_remember_written_rowid(program, written);
+        // Like UPDATE, the change is captured as soon as the row is written,
+        // before a foreign-key action or an AFTER trigger it fires captures
+        // rows of its own. A moved row is captured as deleted and inserted.
+        if let Some(capture) = self.target.capture_rows() {
             let after = capture.after_record(program, table, new_row, written);
             match new_rowid {
                 Some(_) => {
@@ -1763,6 +1837,26 @@ impl InsertRow<'_> {
                     None,
                 )?,
             }
+        }
+        super::fkey::emit_update_repairs(program, &pending_repairs, database)?;
+        if let (Some(sequence), Some(_)) = (self.sequence, new_rowid) {
+            sequence.emit_moved_row(program, written)?;
+        }
+        // Like UPDATE, the actions run once the row is written, for a parent
+        // key that changed.
+        for (action, old_key) in actions.iter().zip(action_keys) {
+            let new_key =
+                super::fkey::emit_parent_key(program, document, action.foreign_key, new_source.id)?;
+            let unchanged = program.allocate_label();
+            super::fkey::emit_skip_if_same_key(
+                program,
+                old_key,
+                new_key,
+                action.foreign_key.parent_positions.len(),
+                unchanged,
+            );
+            action.emit_fire(program, old_key, Some(new_key))?;
+            program.preassign_label_to_next_insn(unchanged);
         }
         // RETURNING reads the row as written.
         program.bind_source(
@@ -1793,6 +1887,29 @@ impl InsertRow<'_> {
             target_pc: row_done,
         });
         Ok(())
+    }
+
+    /// Keep the rowid of a row the statement wrote, when a DO UPDATE of it
+    /// fails.
+    fn emit_remember_written_rowid(&self, program: &mut ProgramBuilder, rowid: usize) {
+        let Some(written_rowids) = self.written_rowids else {
+            return;
+        };
+        let record = program.alloc_register();
+        program.emit_insn(Insn::MakeRecord {
+            start_reg: to_u32(rowid),
+            count: 0,
+            dest_reg: to_u32(record),
+            index_name: None,
+            affinity_str: None,
+        });
+        program.emit_insn(Insn::Insert {
+            cursor: written_rowids,
+            key_reg: rowid,
+            record_reg: record,
+            flag: InsertFlags::new().is_ephemeral_table_insert(),
+            table_name: self.target.table.name.clone(),
+        });
     }
 
     /// The first UPSERT whose conflict target names `constraint`.
@@ -1935,6 +2052,7 @@ impl InsertRow<'_> {
             _ => program.emit_insn(Insn::HaltIfNull {
                 target_reg: register,
                 err_code: SQLITE_CONSTRAINT_NOTNULL,
+                on_error: program.constraint_halt_on_error(conflict),
                 description: format!(
                     "{}.{}",
                     self.target.table.name,
@@ -2037,15 +2155,10 @@ impl InsertRow<'_> {
                     .get_rowid_alias_column()
                     .and_then(|(_, column)| column.name.clone())
                     .unwrap_or_else(|| "rowid".to_string());
-                let (description, on_error) = halt_desc_and_on_error(
-                    &format!("{}.{column}", table.name),
-                    conflict,
-                    self.has_statement_conflict,
-                );
                 program.emit_insn(Insn::Halt {
                     err_code: SQLITE_CONSTRAINT_PRIMARYKEY,
-                    description,
-                    on_error,
+                    description: format!("{}.{column}", table.name),
+                    on_error: program.constraint_halt_on_error(conflict),
                     description_reg: None,
                 });
             }
@@ -2091,11 +2204,7 @@ impl InsertRow<'_> {
                 count,
                 affinities: positions
                     .iter()
-                    .map(|position| {
-                        table.columns()[*position]
-                            .affinity_with_strict(table.is_strict)
-                            .aff_mask()
-                    })
+                    .map(|position| table.columns()[*position].affinity().aff_mask())
                     .collect(),
             });
         }
@@ -2117,12 +2226,10 @@ impl InsertRow<'_> {
                     .map(|(name, _)| format!("{}.{name}", table.name))
                     .collect::<Vec<_>>()
                     .join(", ");
-                let (description, on_error) =
-                    halt_desc_and_on_error(&columns, conflict, self.has_statement_conflict);
                 program.emit_insn(Insn::Halt {
                     err_code: SQLITE_CONSTRAINT_PRIMARYKEY,
-                    description,
-                    on_error,
+                    description: columns,
+                    on_error: program.constraint_halt_on_error(conflict),
                     description_reg: None,
                 });
             }
@@ -2211,9 +2318,7 @@ impl InsertRow<'_> {
                             if column.pos_in_table == EXPR_INDEX_SENTINEL {
                                 Affinity::Blob.aff_mask()
                             } else {
-                                table.columns()[column.pos_in_table]
-                                    .affinity_with_strict(table.is_strict)
-                                    .aff_mask()
+                                table.columns()[column.pos_in_table].affinity().aff_mask()
                             }
                         })
                         .collect(),
@@ -2256,15 +2361,10 @@ impl InsertRow<'_> {
                     self.emit_replace_delete(program, index_cursors, conflicting)?;
                 }
                 conflict => {
-                    let (description, on_error) = halt_desc_and_on_error(
-                        &format_unique_violation_desc(&table.name, index),
-                        conflict,
-                        self.has_statement_conflict,
-                    );
                     program.emit_insn(Insn::Halt {
                         err_code: SQLITE_CONSTRAINT_UNIQUE,
-                        description,
-                        on_error,
+                        description: format_unique_violation_desc(&table.name, index),
+                        on_error: program.constraint_halt_on_error(conflict),
                         description_reg: None,
                     });
                 }
@@ -2366,7 +2466,16 @@ mod tests {
         let mut program = program();
         program.set_hir_plan(plan.clone());
         let subprograms = Subprograms::default();
-        emit_insert(&mut program, &plan, insert, &subprograms, false, true).unwrap();
+        emit_insert(
+            &mut program,
+            &plan,
+            insert,
+            &subprograms,
+            false,
+            true,
+            false,
+        )
+        .unwrap();
         let checked = program
             .insns
             .iter()
@@ -2438,7 +2547,16 @@ mod tests {
             upsert_actions: insert.upserts.iter().map(|_| Vec::new()).collect(),
             ..Subprograms::default()
         };
-        emit_insert(&mut program, &plan, insert, &subprograms, false, true).unwrap();
+        emit_insert(
+            &mut program,
+            &plan,
+            insert,
+            &subprograms,
+            false,
+            true,
+            false,
+        )
+        .unwrap();
         program
     }
 
@@ -2525,7 +2643,7 @@ mod tests {
             for mvcc in [false, true] {
                 let mut program = program();
                 program.set_hir_plan(plan.clone());
-                emit_insert(&mut program, &plan, insert, &subprograms, mvcc, true).unwrap();
+                emit_insert(&mut program, &plan, insert, &subprograms, mvcc, true, false).unwrap();
                 let sequence_writes = count(&program, |insn| {
                     matches!(insn, Insn::SequenceBeginInnerTx { .. })
                 });
@@ -2574,7 +2692,16 @@ mod tests {
             upsert_actions: insert.upserts.iter().map(|_| Vec::new()).collect(),
             ..Subprograms::default()
         };
-        emit_insert(&mut program, &plan, insert, &subprograms, false, true).unwrap();
+        emit_insert(
+            &mut program,
+            &plan,
+            insert,
+            &subprograms,
+            false,
+            true,
+            false,
+        )
+        .unwrap();
         program
     }
 
@@ -2640,9 +2767,14 @@ mod tests {
             1
         );
         assert!(writes_sequence(&program) > 0);
-        // A rowid from the statement raises the sequence too.
+        // A rowid from the statement raises the largest rowid too, and the
+        // sequence is written the same way, when the statement ends.
         let given = emit("INSERT INTO counted VALUES (5, 1)");
-        assert!(writes_sequence(&given) > writes_sequence(&program));
+        assert_eq!(writes_sequence(&given), writes_sequence(&program));
+        assert_eq!(
+            count(&given, |insn| matches!(insn, Insn::MemMax { .. })),
+            count(&program, |insn| matches!(insn, Insn::MemMax { .. })) + 1
+        );
     }
 
     #[test]
@@ -2736,6 +2868,7 @@ mod tests {
             &Subprograms::default(),
             false,
             true,
+            false,
         )
         .unwrap();
         // Each array is parsed and stored as a record blob; only the outer

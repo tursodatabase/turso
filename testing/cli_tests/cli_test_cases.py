@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import os
+import shutil
 import subprocess
 import time
 from pathlib import Path
@@ -272,6 +273,28 @@ def test_import_csv_create_table_from_header():
     shell.quit()
 
 
+def test_import_csv_multi_batch():
+    shell = TestTursoShell()
+    shell.run_test("open-memory", ".open :memory:", "")
+    shell.run_test("create-multi-batch-table", "CREATE TABLE multi_batch_table (id INT, val INT);", "")
+    shell.run_test(
+        "import-csv-multi-batch",
+        ".import --csv -v ./testing/cli_tests/test_files/test_multi_batch.csv multi_batch_table",
+        "Added 2500 rows with 0 errors using 2500 lines of input",
+    )
+    shell.run_test(
+        "verify-multi-batch-count",
+        "select count(*) from multi_batch_table;",
+        "2500",
+    )
+    shell.run_test(
+        "verify-multi-batch-boundaries",
+        "select id, val from multi_batch_table where id in (1, 1000, 1001, 2000, 2001, 2500) order by id;",
+        "1|2\n1000|2000\n1001|2002\n2000|4000\n2001|4002\n2500|5000",
+    )
+    shell.quit()
+
+
 def test_table_patterns():
     shell = TestTursoShell()
     shell.run_test("tables-pattern", ".tables us%", "users")
@@ -310,11 +333,11 @@ def test_uri_readonly():
     turso.run_test("read-only-uri-reads-work", "SELECT COUNT(*) FROM demo;", "5")
     turso.run_test_fn(
         "INSERT INTO demo (id, value) values (6, 'demo');",
-        lambda res: "read-only" in res,
+        lambda res: "readonly database" in res,
         "read-only-uri-writes-fail",
     )
-    turso.run_test_fn("CREATE TABLE t(a);", lambda res: "read-only" in res, "read-only-uri-cant-create-table")
-    turso.run_test_fn("DROP TABLE demo;", lambda res: "read-only" in res, "read-only-uri-cant-drop-table")
+    turso.run_test_fn("CREATE TABLE t(a);", lambda res: "readonly database" in res, "read-only-uri-cant-create-table")
+    turso.run_test_fn("DROP TABLE demo;", lambda res: "readonly database" in res, "read-only-uri-cant-drop-table")
     turso.init_test_db()
     turso.quit()
 
@@ -521,6 +544,30 @@ def test_blob_bytes_are_printed_raw_in_list_mode():
     )
 
 
+def test_exit_checkpoints_wal_into_db_file():
+    exec_name = os.environ.get("SQLITE_EXEC", "./scripts/limbo-sqlite3")
+    db_path = "testing/system/exit.db"
+    copy_path = "testing/system/exit_copy.db"
+    for name, args, open_command, exit_command in [
+        ("exit-with-path-arg", [db_path], "", ".exit"),
+        ("exit-after-open", [], f".open {db_path}\n", ".exit"),
+        ("exit-0-with-path-arg", [db_path], "", ".exit 0"),
+    ]:
+        console.test(f"Running test: {name}")
+        for path in [db_path, db_path + "-wal", copy_path]:
+            if os.path.exists(path):
+                os.remove(path)
+        script = f"{open_command}CREATE TABLE t31(a,b);\nINSERT INTO t31 VALUES(1,4),(2,3);\n{exit_command}\n"
+        result = subprocess.run([exec_name, *args], input=script.encode(), capture_output=True, check=False, timeout=60)
+        assert result.returncode == 0, result.stderr
+        shutil.copyfile(db_path, copy_path)
+        result = subprocess.run(["sqlite3", copy_path, "SELECT count(*) FROM t31;"], capture_output=True, check=False)
+        assert result.stdout == b"2\n", f"database file without its WAL must hold the data; got {result!r}"
+        for path in [db_path, db_path + "-wal", copy_path]:
+            if os.path.exists(path):
+                os.remove(path)
+
+
 def main():
     console.info("Running all turso CLI tests...")
     test_read_command()
@@ -540,6 +587,7 @@ def main():
     test_import_csv_verbose()
     test_import_csv_skip()
     test_import_csv_create_table_from_header()
+    test_import_csv_multi_batch()
     test_table_patterns()
     test_update_delete_reject_limit()
     test_uri_readonly()
@@ -549,6 +597,7 @@ def main():
     test_tables_with_attached_db()
     test_dbtotxt()
     test_blob_bytes_are_printed_raw_in_list_mode()
+    test_exit_checkpoints_wal_into_db_file()
     console.info("All tests have passed")
 
 

@@ -162,6 +162,7 @@ fn compile_action<'a>(
         QueryMode::Normal,
         parent.capture_data_changes_info().clone(),
         ProgramBuilderOpts::new(2, 32, 4),
+        connection.mvcc_enabled(),
     );
     match (&plan.document.root, &plan.root) {
         (hir::HirRoot::Delete(delete), HirRootPlan::Delete(access)) => {
@@ -325,8 +326,8 @@ fn action_statement(
     let child = foreign_key.child_table.value();
     let database = database_index(foreign_key)?;
     let table = ast::QualifiedName {
-        db_name: (database != crate::MAIN_DB_ID)
-            .then(|| session.connection.get_database_name_by_index(database))
+        namespace: (database != crate::MAIN_DB_ID)
+            .then(|| session.connection.namespaces().name(database))
             .flatten()
             .map(Name::from_string),
         name: Name::from_string(child.get_name()),

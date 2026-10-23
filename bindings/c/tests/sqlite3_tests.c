@@ -28,6 +28,8 @@ void test_sqlite3_sql_introspection();
 void test_sqlite3_mprintf();
 void test_sqlite3_exec_null_values();
 void test_sqlite3_prepare_no_statements();
+void test_sqlite3_close_with_unfinalized_stmt();
+void test_sqlite3_open_v2_flags();
 
 int allocated = 0;
 
@@ -55,7 +57,62 @@ int main(void)
     test_sqlite3_mprintf();
     test_sqlite3_exec_null_values();
     test_sqlite3_prepare_no_statements();
+    test_sqlite3_close_with_unfinalized_stmt();
+    test_sqlite3_open_v2_flags();
     return 0;
+}
+
+/* Closing a connection that still has a prepared statement must not free
+ * it out from under the statement: sqlite3_close() refuses with
+ * SQLITE_BUSY, and sqlite3_close_v2() leaves a zombie that keeps serving
+ * the statement, rejects new prepares, and is freed by the last
+ * sqlite3_finalize(). */
+void test_sqlite3_close_with_unfinalized_stmt()
+{
+    sqlite3 *db;
+    sqlite3_stmt *stmt = NULL;
+    sqlite3_stmt *other = NULL;
+    int rc;
+
+    rc = sqlite3_open(":memory:", &db);
+    assert(rc == SQLITE_OK);
+    rc = sqlite3_exec(db, "CREATE TABLE t1(x); INSERT INTO t1 VALUES('one'), ('two');",
+                      NULL, NULL, NULL);
+    assert(rc == SQLITE_OK);
+
+    rc = sqlite3_prepare_v2(db, "SELECT x FROM t1 ORDER BY x DESC", -1, &stmt, NULL);
+    assert(rc == SQLITE_OK);
+    assert(sqlite3_step(stmt) == SQLITE_ROW);
+    assert(strcmp((const char *)sqlite3_column_text(stmt, 0), "two") == 0);
+
+    rc = sqlite3_close(db);
+    assert(rc == SQLITE_BUSY);
+    assert(strcmp(sqlite3_errmsg(db),
+                  "unable to close due to unfinalized statements or unfinished backups") == 0);
+
+    /* The connection is still fully usable after the refused close. */
+    rc = sqlite3_prepare_v2(db, "SELECT 1", -1, &other, NULL);
+    assert(rc == SQLITE_OK);
+    assert(sqlite3_finalize(other) == SQLITE_OK);
+
+    rc = sqlite3_close_v2(db);
+    assert(rc == SQLITE_OK);
+
+    /* Zombie: the outstanding statement still works ... */
+    assert(strcmp((const char *)sqlite3_column_text(stmt, 0), "two") == 0);
+    assert(sqlite3_step(stmt) == SQLITE_ROW);
+    assert(strcmp((const char *)sqlite3_column_text(stmt, 0), "one") == 0);
+    assert(sqlite3_step(stmt) == SQLITE_DONE);
+
+    /* ... but nothing new can be prepared on it. */
+    other = NULL;
+    rc = sqlite3_prepare_v2(db, "SELECT 1", -1, &other, NULL);
+    assert(rc == SQLITE_MISUSE);
+    assert(other == NULL);
+
+    /* The last finalize frees the connection. */
+    assert(sqlite3_finalize(stmt) == SQLITE_OK);
+    printf("test_sqlite3_close_with_unfinalized_stmt test passed\n");
 }
 
 /* SQL with nothing to compile (empty string, whitespace, comments) must
@@ -1190,4 +1247,53 @@ void test_sqlite3_exec_null_values()
 
     sqlite3_close(db);
     printf("test_sqlite3_exec_null_values test passed\n");
+}
+
+void test_sqlite3_open_v2_flags()
+{
+    const char *path = "open_v2_flags_test.db";
+    sqlite3 *db;
+    sqlite3 *reader;
+    sqlite3_stmt *stmt;
+    int rc;
+
+    remove(path);
+    rc = sqlite3_open_v2(path, &db,
+                         SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_NOMUTEX |
+                             SQLITE_OPEN_PRIVATECACHE,
+                         NULL);
+    assert(rc == SQLITE_OK);
+    rc = sqlite3_exec(db, "CREATE TABLE t(x); INSERT INTO t VALUES (1);", NULL, NULL, NULL);
+    assert(rc == SQLITE_OK);
+    rc = sqlite3_create_collation_v2(db, "unused", SQLITE_UTF8, NULL, NULL, NULL);
+    assert(rc == SQLITE_OK);
+    sqlite3_close(db);
+
+    rc = sqlite3_open_v2(path, &db, SQLITE_OPEN_READONLY, NULL);
+    assert(rc == SQLITE_OK);
+    rc = sqlite3_exec(db, "INSERT INTO t VALUES (2);", NULL, NULL, NULL);
+    assert(rc != SQLITE_OK);
+    sqlite3_close(db);
+    remove(path);
+
+    rc = sqlite3_open_v2("file:open_v2_flags?mode=memory&cache=shared", &db,
+                         SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_URI |
+                             SQLITE_OPEN_SHAREDCACHE,
+                         NULL);
+    assert(rc == SQLITE_OK);
+    rc = sqlite3_open_v2("file:open_v2_flags?mode=memory&cache=shared", &reader,
+                         SQLITE_OPEN_READWRITE | SQLITE_OPEN_URI | SQLITE_OPEN_SHAREDCACHE,
+                         NULL);
+    assert(rc == SQLITE_OK);
+    rc = sqlite3_exec(db, "CREATE TABLE t(x); INSERT INTO t VALUES (42);", NULL, NULL, NULL);
+    assert(rc == SQLITE_OK);
+    rc = sqlite3_prepare_v2(reader, "SELECT x FROM t", -1, &stmt, NULL);
+    assert(rc == SQLITE_OK);
+    assert(sqlite3_step(stmt) == SQLITE_ROW);
+    assert(sqlite3_column_int64(stmt, 0) == 42);
+    sqlite3_finalize(stmt);
+    sqlite3_close(reader);
+    sqlite3_close(db);
+
+    printf("test_sqlite3_open_v2_flags test passed\n");
 }

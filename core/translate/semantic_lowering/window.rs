@@ -1,5 +1,6 @@
 //! Window-buffer planning from resolved HIR.
 
+use crate::alloc::TursoIteratorExt;
 use std::ops::ControlFlow;
 
 use smallvec::SmallVec;
@@ -790,19 +791,19 @@ fn hir_window_buffer_table(window: hir::WindowId, column_count: usize) -> Arc<BT
                 ColDef::default(),
             )
         })
-        .collect();
+        .collect_vec();
     Arc::new(BTreeTable::new(
         0,
         format!(
             "window_buffer_{}_{}_{}",
             window.block.query, window.block.index, window.index
         ),
-        Vec::new(),
+        crate::alloc::vec![],
         columns,
         BTreeCharacteristics::HAS_ROWID,
-        Vec::new(),
-        Vec::new(),
-        Vec::new(),
+        crate::alloc::vec![],
+        crate::alloc::vec![],
+        crate::alloc::vec![],
         None,
     ))
 }
@@ -4618,7 +4619,7 @@ mod tests {
                             let has_peers = mode != "ROWS";
                             let after_next = next + 1 + usize::from(eof.is_some() || has_peers);
                             assert!(
-                                matches!(program.insns[next].0, Insn::Next { cursor_id, pc_if_next: BranchOffset::Offset(target), fullscan: false }
+                                matches!(program.insns[next].0, Insn::Next { cursor_id, pc_if_next: BranchOffset::Offset(target), fullscan: false, is_index: _ }
                                 if cursor_id == cursor && target as usize == after_next)
                             );
                             if eof.is_some() || has_peers {

@@ -4,9 +4,10 @@ use owo_colors::OwoColorize;
 use sqltest::{
     DatabaseLocation, DefaultDatabases, Format, GeneratorConfig, INTEGRITY_FIXTURE_RELATIVE_PATHS,
     OutputFormat, ParseError, RunnerConfig, SnapshotUpdateMode, TestRunner,
-    backends::cli::CliBackend, backends::js::JsBackend, backends::pg::PgBackend,
-    backends::rust::RustBackend, create_output, find_all_pending_snapshots, generate_database,
-    generate_integrity_fixture, load_test_files, summarize, tcl_converter,
+    backends::cli::CliBackend, backends::js::JsBackend, backends::postgres::PostgresBackend,
+    backends::rust::RustBackend, backends::tursopg::TursopgBackend, create_output,
+    find_all_pending_snapshots, generate_database, generate_integrity_fixture, load_test_files,
+    summarize, tcl_converter,
 };
 use std::process::ExitCode;
 use std::rc::Rc;
@@ -26,6 +27,7 @@ struct Cli {
 }
 
 #[derive(Subcommand)]
+#[allow(clippy::large_enum_variant)]
 enum Commands {
     /// Run tests
     Run {
@@ -34,7 +36,8 @@ enum Commands {
         paths: Vec<PathBuf>,
 
         /// Backend to use: "rust" (native), "cli" (subprocess), "js" (JavaScript
-        /// bindings), or "pg" (tursopg server over the PostgreSQL wire protocol)
+        /// bindings), "tursopg" (tursopg server over the PostgreSQL wire protocol),
+        /// or "postgres" (the real PostgreSQL server at --postgres-dsn)
         #[arg(long, default_value = "rust")]
         backend: String,
 
@@ -62,7 +65,7 @@ enum Commands {
         #[arg(short, long, default_value = "pretty")]
         output: String,
 
-        /// Timeout per query in seconds (only used with --backend cli or js)
+        /// Timeout per query in seconds (not used with --backend rust)
         #[arg(long, default_value_t = 90)]
         timeout: u64,
 
@@ -94,6 +97,12 @@ enum Commands {
         /// of two planners can be compared.
         #[arg(long)]
         normalize_plans: bool,
+        /// URL of the PostgreSQL server for --backend postgres, for example
+        /// postgres://postgres@127.0.0.1:5432/postgres. Each test gets a new
+        /// database on this server, so the user in the URL must be able to
+        /// create and drop databases.
+        #[arg(long)]
+        postgres_dsn: Option<String>,
     },
 
     /// Validate test file syntax and check for pending snapshots
@@ -164,6 +173,7 @@ async fn main() -> ExitCode {
             snapshot_filter,
             cross_check_binary,
             normalize_plans,
+            postgres_dsn,
         } => {
             run_tests(
                 paths,
@@ -180,6 +190,7 @@ async fn main() -> ExitCode {
                 snapshot_filter,
                 cross_check_binary,
                 normalize_plans,
+                postgres_dsn,
             )
             .await
         }
@@ -237,7 +248,21 @@ async fn run_tests(
     snapshot_filter: Option<String>,
     cross_check_binary: Option<PathBuf>,
     normalize_plans: bool,
+    postgres_dsn: Option<String>,
 ) -> ExitCode {
+    match (&postgres_dsn, backend_type.as_str()) {
+        (None, "postgres") => {
+            eprintln!("Error: --backend postgres needs --postgres-dsn");
+            eprintln!("postgres/conformance/with-postgres.sh starts a server in Docker");
+            return ExitCode::from(2);
+        }
+        (Some(_), backend) if backend != "postgres" => {
+            eprintln!("Error: --postgres-dsn works only with --backend postgres");
+            return ExitCode::from(2);
+        }
+        _ => {}
+    }
+
     // Resolve paths, trying to add .sqltest extension if missing
     let mut resolved_paths = Vec::new();
     let mut missing = Vec::new();
@@ -433,15 +458,16 @@ async fn run_tests(
                 })
                 .await
         }
-        "pg" => {
-            // --binary defaults to tursodb for the cli backend; for pg the
+        "tursopg" => {
+            // --binary defaults to tursodb for the cli backend; for tursopg the
             // server binary is tursopg, so rewrite an untouched default.
             let binary = if binary == PathBuf::from("tursodb") {
                 PathBuf::from("tursopg")
             } else {
                 binary
             };
-            let mut backend = PgBackend::new(&binary).with_timeout(Duration::from_secs(timeout));
+            let mut backend =
+                TursopgBackend::new(&binary).with_timeout(Duration::from_secs(timeout));
             if let Some(resolver) = resolver {
                 backend = backend.with_default_db_resolver(resolver);
             }
@@ -453,8 +479,27 @@ async fn run_tests(
                 })
                 .await
         }
+        "postgres" => {
+            let dsn = postgres_dsn.expect("--postgres-dsn is checked above");
+            let backend = match PostgresBackend::connect(&dsn, Duration::from_secs(timeout)).await {
+                Ok(backend) => backend,
+                Err(e) => {
+                    eprintln!("Error: {e}");
+                    return ExitCode::from(2);
+                }
+            };
+            let runner = TestRunner::new(backend).with_config(config);
+            runner
+                .run_loaded_tests(loaded, |result| {
+                    output.write_test(result);
+                    output.flush();
+                })
+                .await
+        }
         other => {
-            eprintln!("Error: unknown backend '{other}'. Use 'rust', 'cli', 'js', or 'pg'");
+            eprintln!(
+                "Error: unknown backend '{other}'. Use 'rust', 'cli', 'js', 'tursopg', or 'postgres'"
+            );
             return ExitCode::from(2);
         }
     };

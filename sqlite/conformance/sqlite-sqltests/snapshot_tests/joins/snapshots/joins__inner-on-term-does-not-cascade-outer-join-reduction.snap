@@ -1,0 +1,101 @@
+---
+source: joins.sqltest
+expression: |-
+  SELECT *
+      FROM reduction_chain_a
+      LEFT JOIN reduction_chain_b ON reduction_chain_a.id=reduction_chain_b.id
+      JOIN reduction_chain_c ON reduction_chain_b.id=reduction_chain_c.id
+      RIGHT JOIN reduction_chain_d ON true;
+info:
+  statement_type: SELECT
+  tables:
+  - reduction_chain_a
+  - reduction_chain_a.id
+  - reduction_chain_b
+  - reduction_chain_b.id
+  - reduction_chain_c
+  - reduction_chain_d
+  setup_blocks:
+  - right_join_inner_on_schema
+  database: ':memory:'
+---
+QUERY PLAN
+|--SCAN reduction_chain_a
+|--SEARCH reduction_chain_b USING COVERING INDEX ephemeral_reduction_chain_b_s1 (id=?)
+|--SEARCH reduction_chain_c USING COVERING INDEX ephemeral_reduction_chain_c_s2 (id=?)
+|--SCAN reduction_chain_d
+`--RIGHT-JOIN reduction_chain_d
+   `--SCAN reduction_chain_d
+
+BYTECODE
+addr  opcode             p1  p2  p3  p4      p5  comment
+   0  Init                0  67   0           0  Start at 67
+   1  OpenRead            0   2   0  k(2,B)   0  table=reduction_chain_a, root=2, iDb=0
+   2  OpenRead            2   3   0  k(2,B)   0  table=reduction_chain_b, root=3, iDb=0
+   3  OpenRead            4   4   0  k(2,B)   0  table=reduction_chain_c, root=4, iDb=0
+   4  OpenRead            5   5   0  k(2,B)   0  table=reduction_chain_d, root=5, iDb=0
+   5  OpenEphemeral       6   1   0           0  cursor=6 is_table=true
+   6  Null                0   2   0           0  r[2]=NULL
+   7  MakeRecord          2   1   3           0  r[3]=mkrec(r[2..2])
+   8  Rewind              0  52   0           0  Rewind table reduction_chain_a
+   9    Once             18   0   0           0  goto 18
+  10    OpenAutoindex     1   0   0           0  cursor=1
+  11    Rewind            2  18   0           0  Rewind table reduction_chain_b
+  12      Column          2   0   4           0  r[4]=reduction_chain_b.id
+  13      RowId           2   5   0           0  r[5]=reduction_chain_b.rowid
+  14      MakeRecord      4   2   6           0  r[6]=mkrec(r[4..5]); for ephemeral_reduction_chain_b_s1
+  15      FilterAdd       1   4   1           0  bloom_filter_add(r[4..5])
+  16      IdxInsert       1   6   4           0  key=r[6]
+  17    Next              2  12   0           0
+  18    Column            0   0   7           0  r[7]=reduction_chain_a.id
+  19    IsNull            7  51   0           0  if (r[7]==NULL) goto 51
+  20    Affinity          7   1   0           0  r[7..8] = C
+  21    Filter            1  51   7           1  if !bloom_filter(r[7..8]) goto 51
+  22    SeekGE            1  51   7           0  key=[7..7]
+  23      IdxGT           1  51   7           0  key=[7..7]
+  24      Once           33   0   0           0  goto 33
+  25      OpenAutoindex   3   0   0           0  cursor=3
+  26      Rewind          4  33   0           0  Rewind table reduction_chain_c
+  27        Column        4   0   8           0  r[8]=reduction_chain_c.id
+  28        RowId         4   9   0           0  r[9]=reduction_chain_c.rowid
+  29        MakeRecord    8   2  10           0  r[10]=mkrec(r[8..9]); for ephemeral_reduction_chain_c_s2
+  30        FilterAdd     3   8   1           0  bloom_filter_add(r[8..9])
+  31        IdxInsert     3  10   8           0  key=r[10]
+  32      Next            4  27   0           0
+  33      Column          1   0  11           0  r[11]=ephemeral(ephemeral_reduction_chain_b_s1).id
+  34      IsNull         11  50   0           0  if (r[11]==NULL) goto 50
+  35      Affinity       11   1   0           0  r[11..12] = C
+  36      Filter          3  50  11           1  if !bloom_filter(r[11..12]) goto 50
+  37      SeekGE          3  50  11           0  key=[11..11]
+  38        IdxGT         3  50  11           0  key=[11..11]
+  39        Rewind        5  49   0           0  Rewind table reduction_chain_d
+  40          IfNot      12  48   1           0  if !r[12] goto 48
+  41          RowId       5  13   0           0  r[13]=reduction_chain_d.rowid
+  42          Insert      6   3  13           6  intkey=r[13] data=r[3]
+  43          Column      0   0  14           0  r[14]=reduction_chain_a.id
+  44          Column      1   0  15           0  r[15]=ephemeral(ephemeral_reduction_chain_b_s1).id
+  45          Column      3   0  16           0  r[16]=ephemeral(ephemeral_reduction_chain_c_s2).id
+  46          Column      5   0  17           0  r[17]=reduction_chain_d.id
+  47          ResultRow  14   4   0           0  output=r[14..17]
+  48        Next          5  40   0           1
+  49      Next            3  38   0           0
+  50    Next              1  23   0           0
+  51  Next                0   9   0           1
+  52  NullRow             0   0   0           0  Set cursor 0 to a (pseudo) NULL row
+  53  NullRow             1   0   0           0  Set cursor 1 to a (pseudo) NULL row
+  54  NullRow             3   0   0           0  Set cursor 3 to a (pseudo) NULL row
+  55  OpenRead            7   5   0  k(2,B)   0  table=reduction_chain_d, root=5, iDb=0
+  56  Rewind              7  66   0           0  Rewind table reduction_chain_d
+  57    RowId             7  18   0           0  r[18]=reduction_chain_d.rowid
+  58    NotExists         6  60  18           0
+  59    Goto              0  65   0           0
+  60    Column            0   0  20           0  r[20]=reduction_chain_a.id
+  61    Column            1   0  21           0  r[21]=ephemeral(ephemeral_reduction_chain_b_s1).id
+  62    Column            3   0  22           0  r[22]=ephemeral(ephemeral_reduction_chain_c_s2).id
+  63    Column            7   0  23           0  r[23]=reduction_chain_d.id
+  64    ResultRow        20   4   0           0  output=r[20..23]
+  65  Next                7  57   0           1
+  66  Halt                0   0   0           0
+  67  Transaction         0   1   4           0  iDb=0 tx_mode=Read
+  68  Integer             1  12   0           0  r[12]=1
+  69  Goto                0   1   0           0

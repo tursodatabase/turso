@@ -358,6 +358,51 @@ expect {
 }
 
 @cross-check-integrity
+test view-column-list-renames-star {
+    CREATE TABLE t_vs(x INTEGER);
+    INSERT INTO t_vs VALUES (1);
+    CREATE VIEW v_vs(y) AS SELECT * FROM t_vs;
+    SELECT y FROM v_vs;
+}
+expect {
+    1
+}
+
+@cross-check-integrity
+test view-column-list-renames-table-star {
+    CREATE TABLE t_vts1(x INTEGER);
+    CREATE TABLE t_vts2(x INTEGER, z INTEGER);
+    INSERT INTO t_vts1 VALUES (1);
+    INSERT INTO t_vts2 VALUES (2, 3);
+    CREATE VIEW v_vts(a, b, c, d) AS SELECT t_vts1.*, t_vts2.*, 4 FROM t_vts1, t_vts2;
+    SELECT d, c, b, a FROM v_vts WHERE a = 1;
+}
+expect {
+    4|3|2|1
+}
+
+@cross-check-integrity
+test view-column-list-renames-values {
+    CREATE VIEW v_vv(a, b) AS VALUES (1, 2);
+    SELECT b, a FROM v_vv;
+}
+expect {
+    2|1
+}
+
+@cross-check-integrity
+test view-column-list-renames-compound {
+    CREATE TABLE t_vc(x INTEGER);
+    INSERT INTO t_vc VALUES (1);
+    CREATE VIEW v_vc(a) AS SELECT * FROM t_vc UNION ALL SELECT 2;
+    SELECT a FROM v_vc ORDER BY a;
+}
+expect {
+    1
+    2
+}
+
+@cross-check-integrity
 test view-star-using-derives-merged-columns {
     CREATE TABLE view_using_left(x INTEGER, y TEXT);
     CREATE TABLE view_using_right(x INTEGER, z TEXT);
@@ -369,6 +414,30 @@ expect {
     x
     y
     z
+}
+
+@cross-check-integrity
+test view-star-expands-the-columns-of-other-views {
+    CREATE TABLE view_source(x INTEGER, y TEXT);
+    INSERT INTO view_source VALUES (1, 'a');
+    CREATE VIEW view_inner AS SELECT * FROM view_source;
+    CREATE VIEW view_cross AS SELECT * FROM view_inner JOIN view_inner AS w;
+    CREATE VIEW view_natural_views AS SELECT * FROM view_inner NATURAL JOIN view_inner AS w;
+    CREATE VIEW view_using_views AS SELECT * FROM view_inner JOIN view_inner AS w USING (x);
+    CREATE VIEW view_full_using_views AS
+        SELECT * FROM view_inner FULL JOIN view_inner AS w USING (x);
+    SELECT group_concat(name) FROM pragma_table_info('view_cross');
+    SELECT group_concat(name) FROM pragma_table_info('view_natural_views');
+    SELECT group_concat(name) FROM pragma_table_info('view_using_views');
+    SELECT group_concat(name) FROM pragma_table_info('view_full_using_views');
+    SELECT * FROM view_using_views;
+}
+expect {
+    x,y,x:1,y:1
+    x,y
+    x,y,y:1
+    x,y,y:1
+    1|a|a
 }
 
 @cross-check-integrity

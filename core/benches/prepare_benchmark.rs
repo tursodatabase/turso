@@ -18,7 +18,7 @@
 use divan::{black_box, AllocProfiler, Bencher};
 use mimalloc::MiMalloc;
 use std::sync::Arc;
-use turso_core::{Connection, Database, MemoryIO, SqliteDialect, StepResult};
+use turso_core::{ConnectOpts, Connection, Database, MemoryIO, SqliteDialect, StepResult};
 
 #[global_allocator]
 static ALLOC: AllocProfiler<MiMalloc> = AllocProfiler::new(MiMalloc);
@@ -52,7 +52,7 @@ fn open_db() -> (Arc<Database>, Arc<Connection>) {
     #[allow(clippy::arc_with_non_send_sync)]
     let io = Arc::new(MemoryIO::new());
     let db = Database::open_file(io, ":memory:", Arc::new(SqliteDialect)).unwrap();
-    let conn = db.connect().unwrap();
+    let conn = db.connect(ConnectOpts::new()).unwrap();
     (db, conn)
 }
 

@@ -353,16 +353,16 @@ struct ExprOperand {
 }
 
 #[derive(Clone)]
-pub(super) struct QueryFunctionState {
+pub(super) struct QueryFunctionState<'ast> {
     block: hir::QueryBlockId,
     window_function_count: usize,
-    named_windows: Vec<NamedFunctionWindow>,
+    named_windows: Vec<NamedFunctionWindow<'ast>>,
     windows: Vec<hir::ResolvedWindow>,
     /// The `OVER name` of each window in `windows`, if any.
     window_names: Vec<Option<String>>,
 }
 
-impl QueryFunctionState {
+impl<'ast> QueryFunctionState<'ast> {
     pub(super) const fn new(block: hir::QueryBlockId) -> Self {
         Self {
             block,
@@ -468,9 +468,9 @@ fn frames_are_equivalent(left: &hir::WindowFrame, right: &hir::WindowFrame) -> b
         }
 }
 
-enum FunctionContext<'state> {
+enum FunctionContext<'state, 'ast> {
     ScalarOnly,
-    Query(&'state mut QueryFunctionState),
+    Query(&'state mut QueryFunctionState<'ast>),
 }
 
 #[derive(Clone, Copy)]
@@ -533,12 +533,11 @@ struct FunctionWindowFrame {
 /// it, so they may read the block's aggregates, and a definition no
 /// function uses is never analyzed.
 #[derive(Clone)]
-struct NamedFunctionWindow {
+struct NamedFunctionWindow<'ast> {
     name: String,
-    #[allow(clippy::vec_box)]
-    partition_by: Vec<Box<ast::Expr>>,
-    order_by: Vec<ast::SortedColumn>,
-    frame: Option<ast::FrameClause>,
+    partition_by: &'ast [Box<ast::Expr>],
+    order_by: &'ast [ast::SortedColumn],
+    frame: Option<&'ast ast::FrameClause>,
 }
 
 #[allow(clippy::large_enum_variant)]
@@ -1150,7 +1149,7 @@ impl<'a> ExprFrame<'a> {
                     window_child(
                         name,
                         args.len(),
-                        filter_over.over_clause.as_ref(),
+                        filter_over.over_clause.as_deref(),
                         self.next_child - filter_end,
                     )
                 }
@@ -1163,7 +1162,7 @@ impl<'a> ExprFrame<'a> {
                     window_child(
                         name,
                         0,
-                        filter_over.over_clause.as_ref(),
+                        filter_over.over_clause.as_deref(),
                         self.next_child - filter_end,
                     )
                 }
@@ -1316,6 +1315,18 @@ fn take_scalar_operand(mut operand: ExprOperand) -> Result<ResolvedScopeExpr> {
         .components
         .pop()
         .expect("scalar operand contains one value"))
+}
+
+/// The first explicit COLLATE among `facts`, if any: the collation an
+/// operator or call over them carries.
+fn explicit_collation<'a>(facts: impl IntoIterator<Item = &'a ResolvedScopeExpr>) -> ExprCollation {
+    facts
+        .into_iter()
+        .find_map(|fact| match &fact.collation {
+            ExprCollation::Explicit(collation) => Some(ExprCollation::Explicit(collation.clone())),
+            _ => None,
+        })
+        .unwrap_or(ExprCollation::Absent)
 }
 
 fn expression_operands_collation<'a>(
@@ -1540,7 +1551,7 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
         syntax: &'ast ast::Expr,
         scope: &Scope,
         policy: ExprPolicy,
-        functions: &mut QueryFunctionState,
+        functions: &mut QueryFunctionState<'ast>,
     ) -> Result<ResolvedScopeExpr> {
         self.analyze_query_expr_with_expected_type(syntax, scope, policy, functions, None)
     }
@@ -1550,7 +1561,7 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
         syntax: &'ast ast::Expr,
         scope: &Scope,
         policy: ExprPolicy,
-        functions: &mut QueryFunctionState,
+        functions: &mut QueryFunctionState<'ast>,
         expected_type: Option<Arc<TypeDef>>,
     ) -> Result<ResolvedScopeExpr> {
         let owner = ExprOwner::Query(functions.block.query);
@@ -1607,7 +1618,7 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
         scope: &Scope,
         policy: ExprPolicy,
         owner: ExprOwner,
-        functions: &mut FunctionContext<'_>,
+        functions: &mut FunctionContext<'_, 'ast>,
         expected_type: Option<Arc<TypeDef>>,
     ) -> Result<ResolvedScopeExpr> {
         let mut frames = vec![ExprFrame::new(syntax, expected_type)?];
@@ -1664,6 +1675,46 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
                 None => return resolved.into_scalar(),
             }
         }
+    }
+
+    /// Whether an aggregate written in `block` reads columns of other query
+    /// blocks only, so that, as in SQLite, it is an aggregate of the
+    /// enclosing query: a misuse where that query allows no aggregates. An
+    /// aggregate that reads any column of `block`, in its arguments, their
+    /// ORDER BY or its FILTER, belongs to `block`.
+    fn aggregate_reads_outside(
+        &self,
+        block: hir::QueryBlockId,
+        input: &FunctionInput,
+        filter: Option<&ResolvedScopeExpr>,
+    ) -> bool {
+        let mut reads_block = false;
+        let mut reads_outside = false;
+        let mut visit = |expression: &hir::Expr| {
+            expression.for_each(&mut |expression| {
+                let source = match expression {
+                    hir::Expr::Column(column) => column.source,
+                    hir::Expr::RowId(source) => *source,
+                    _ => return,
+                };
+                match self.source(source).map(|source| source.owner) {
+                    Some(hir::SourceOwner::QueryBlock(owner)) if owner == block => {
+                        reads_block = true
+                    }
+                    _ => reads_outside = true,
+                }
+            });
+        };
+        for value in input.facts() {
+            visit(&value.expr);
+        }
+        for term in input.order_terms() {
+            visit(&term.value.expr);
+        }
+        if let Some(filter) = filter {
+            visit(&filter.expr);
+        }
+        reads_outside && !reads_block
     }
 
     /// The block an aggregate call belongs to. Like SQLite, a call in a
@@ -1819,15 +1870,7 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
                 .map(|(lhs, rhs)| comparison_component(lhs, rhs))
                 .collect(),
         };
-        let collation =
-            lhs.iter()
-                .zip(&rhs)
-                .fold(ExprCollation::Absent, |collation, (lhs, rhs)| {
-                    expression_collation(
-                        &expression_collation(&collation, &lhs.collation),
-                        &rhs.collation,
-                    )
-                });
+        let collation = ExprCollation::Absent;
         let lhs = if lhs.len() == 1 {
             lhs.into_iter()
                 .next()
@@ -1906,15 +1949,15 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
     pub(super) fn analyze_named_windows(
         &mut self,
         definitions: &'ast [ast::WindowDef],
-        functions: &mut QueryFunctionState,
+        functions: &mut QueryFunctionState<'ast>,
     ) -> Result<()> {
         for definition in definitions {
             let window = &definition.window;
             let mut named = NamedFunctionWindow {
                 name: normalize_ident(definition.name.as_str()),
-                partition_by: window.partition_by.clone(),
-                order_by: window.order_by.clone(),
-                frame: window.frame_clause.clone(),
+                partition_by: &window.partition_by,
+                order_by: &window.order_by,
+                frame: window.frame_clause.as_ref(),
             };
             if let Some(base) = &window.base {
                 // SQLite ignores the base on the first WINDOW definition.
@@ -1931,9 +1974,9 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
                         inherited.frame.is_some(),
                         &base,
                     )?;
-                    named.partition_by.clone_from(&inherited.partition_by);
+                    named.partition_by = inherited.partition_by;
                     if named.order_by.is_empty() {
-                        named.order_by.clone_from(&inherited.order_by);
+                        named.order_by = inherited.order_by;
                     }
                 }
             }
@@ -1943,14 +1986,15 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
     }
 
     /// The PARTITION BY and ORDER BY of a named window, analyzed where a
-    /// window function uses it.
+    /// window function uses it. They are analyzed as expressions of the
+    /// block's query, so they may hold subqueries.
     fn analyze_named_window(
         &mut self,
         name: &str,
         scope: &Scope,
         policy: ExprPolicy,
-        functions: &mut QueryFunctionState,
-    ) -> Result<(FunctionWindow, NamedFunctionWindow)> {
+        functions: &mut QueryFunctionState<'ast>,
+    ) -> Result<(FunctionWindow, NamedFunctionWindow<'ast>)> {
         let named = functions
             .named_windows
             .iter()
@@ -1958,27 +2002,14 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
             .cloned()
             .ok_or_else(|| LimboError::ParseError(format!("no such window: {name}")))?;
         let policy = policy.without_windows();
-        let mut context = FunctionContext::Query(functions);
         let mut partition_by = ExprChildren::new();
-        for expression in &named.partition_by {
-            partition_by.push(self.analyze_resolved_expr_with_functions(
-                expression,
-                scope,
-                policy,
-                &mut context,
-                None,
-            )?);
+        for expression in named.partition_by {
+            partition_by.push(self.analyze_query_expr(expression, scope, policy, functions)?);
         }
         let mut order_by = Vec::with_capacity(named.order_by.len());
-        for term in &named.order_by {
+        for term in named.order_by {
             order_by.push(FunctionOrderTerm {
-                value: self.analyze_resolved_expr_with_functions(
-                    &term.expr,
-                    scope,
-                    policy,
-                    &mut context,
-                    None,
-                )?,
+                value: self.analyze_query_expr(&term.expr, scope, policy, functions)?,
                 order: term.order.unwrap_or(ast::SortOrder::Asc),
                 nulls: term.nulls,
             });
@@ -2035,7 +2066,7 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
         function: &Func,
         scope: &Scope,
         policy: ExprPolicy,
-        functions: &mut QueryFunctionState,
+        functions: &mut QueryFunctionState<'ast>,
     ) -> Result<FunctionWindow> {
         match over {
             FunctionOver::Named(name) => {
@@ -2045,7 +2076,6 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
                 if !function_ignores_user_frame(function) {
                     window.frame = named
                         .frame
-                        .as_ref()
                         .map(|frame| self.analyze_window_frame(frame, scope, policy))
                         .transpose()?;
                 }
@@ -2068,7 +2098,7 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
         syntax: &ast::Expr,
         scope: &Scope,
         policy: ExprPolicy,
-        functions: &mut FunctionContext<'_>,
+        functions: &mut FunctionContext<'_, 'ast>,
         expected_type: Option<Arc<TypeDef>>,
     ) -> Result<ResolvedScopeExpr> {
         let mut frames = vec![ExprFrame::new(syntax, expected_type)?];
@@ -2121,7 +2151,7 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
         children: FrameChildren,
         scope: &Scope,
         policy: ExprPolicy,
-        functions: &mut FunctionContext<'_>,
+        functions: &mut FunctionContext<'_, 'ast>,
         expected_type: Option<&Arc<TypeDef>>,
     ) -> Result<ResolvedScopeExpr> {
         match syntax {
@@ -2181,7 +2211,7 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
         }
         if matches!(operator, ast::Operator::Is | ast::Operator::IsNot) {
             if let Some(is_true) = truth_test_rhs(rhs_syntax) {
-                let collation = expression_operands_collation([&lhs, &rhs]);
+                let collation = ExprCollation::Absent;
                 return Ok(truth_test_expr(
                     take_scalar_operand(lhs)?,
                     is_true,
@@ -2213,7 +2243,16 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
         }
         let lhs = take_scalar_operand(lhs)?;
         let rhs = take_scalar_operand(rhs)?;
-        self.build_scalar_binary_expr(lhs, operator, rhs)
+        let written_literals = [
+            matches!(lhs_syntax, ast::Expr::Literal(_)),
+            matches!(rhs_syntax, ast::Expr::Literal(_)),
+        ];
+        let (lhs, rhs) = if operator.is_comparison() {
+            read_other_side_as_array(lhs, rhs)
+        } else {
+            (lhs, rhs)
+        };
+        self.build_binary_expr_of_written_operands(lhs, operator, rhs, written_literals)
     }
 
     pub(super) fn build_scalar_binary_expr(
@@ -2227,14 +2266,43 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
         } else {
             (lhs, rhs)
         };
-        let custom = self.resolve_custom_binary_operator(operator, &lhs, &rhs)?;
+        self.build_binary_expr_of_operands(lhs, operator, rhs)
+    }
+
+    /// Like [`Self::build_scalar_binary_expr`], but a scalar operand compared
+    /// with an array is not read as an array. A table function's hidden
+    /// argument column receives the argument's value as is.
+    pub(super) fn build_binary_expr_of_operands(
+        &mut self,
+        lhs: ResolvedScopeExpr,
+        operator: ast::Operator,
+        rhs: ResolvedScopeExpr,
+    ) -> Result<ResolvedScopeExpr> {
+        self.build_binary_expr_of_written_operands(lhs, operator, rhs, [true, true])
+    }
+
+    /// `written_literals` says whether each operand is written as a literal.
+    /// A custom type's operator encodes such an operand with the type; a
+    /// literal in parentheses or a computed value is passed as is.
+    fn build_binary_expr_of_written_operands(
+        &mut self,
+        lhs: ResolvedScopeExpr,
+        operator: ast::Operator,
+        rhs: ResolvedScopeExpr,
+        written_literals: [bool; 2],
+    ) -> Result<ResolvedScopeExpr> {
+        let custom = self.resolve_custom_binary_operator(operator, &lhs, &rhs, written_literals)?;
         let type_fact = binary_type_fact(operator, &lhs.type_fact, &rhs.type_fact);
         let array_concat = operator == ast::Operator::Concat
             && (lhs.type_fact.is_array() || rhs.type_fact.is_array());
         let comparison = operator
             .is_comparison()
             .then(|| comparison_semantics(&lhs, &rhs));
-        let collation = expression_collation(&lhs.collation, &rhs.collation);
+        // The value of an operator keeps an explicit COLLATE of either
+        // operand, as SQLite propagates one through operators, but not an
+        // operand's column collation; a comparison's operands decide the
+        // comparison's own collation above.
+        let collation = explicit_collation([&lhs, &rhs]);
         Ok(computed_expr(
             hir::Expr::Binary {
                 lhs: Box::new(lhs.expr),
@@ -2276,10 +2344,20 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
                 &end.components[0],
             );
             let custom = self
-                .resolve_custom_binary_operator(ast::Operator::GreaterEquals, tested, low)?
+                .resolve_custom_binary_operator(
+                    ast::Operator::GreaterEquals,
+                    tested,
+                    low,
+                    [true, true],
+                )?
                 .is_some()
                 || self
-                    .resolve_custom_binary_operator(ast::Operator::LessEquals, tested, high)?
+                    .resolve_custom_binary_operator(
+                        ast::Operator::LessEquals,
+                        tested,
+                        high,
+                        [true, true],
+                    )?
                     .is_some();
             if custom {
                 let lower = self.build_scalar_binary_expr(
@@ -2308,7 +2386,7 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
         }
         let start_comparison = expression_operand_comparison(&expr.components, &start.components);
         let end_comparison = expression_operand_comparison(&expr.components, &end.components);
-        let collation = expression_operands_collation([&expr, &start, &end]);
+        let collation = ExprCollation::Absent;
         Ok(computed_expr(
             hir::Expr::Between {
                 expr: Box::new(expr.expr),
@@ -2329,7 +2407,7 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
         children: ExprChildren,
         scope: &Scope,
         policy: ExprPolicy,
-        functions: &mut FunctionContext<'_>,
+        functions: &mut FunctionContext<'_, 'ast>,
         expected_type: Option<&Arc<TypeDef>>,
     ) -> Result<ResolvedScopeExpr> {
         match syntax {
@@ -2382,6 +2460,18 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
                     {
                         return self.build_field_access(base, column.as_str());
                     }
+                }
+                // In a query, no visible source named that way means the
+                // table is missing, not the column. A CTE defined for the
+                // query but not in its FROM is a known name, so only its
+                // column is missing. The expressions of a DML statement
+                // outside a query, like an upsert's SET, report the column.
+                let normalized_table = normalize_ident(table.as_str());
+                if matches!(functions, FunctionContext::Query(_))
+                    && !scope.has_qualifier(&normalized_table)
+                    && !self.cte_is_defined(&normalized_table)
+                {
+                    crate::bail_parse_error!("no such table: {normalized_table}");
                 }
                 crate::bail_parse_error!("no such column: {}.{}", table.as_str(), column.as_str());
             }
@@ -2575,8 +2665,7 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
                     .iter()
                     .map(|value| in_operand_comparison(&lhs.components, &value.components))
                     .collect();
-                let collation =
-                    expression_operands_collation(std::iter::once(&lhs).chain(values.iter()));
+                let collation = ExprCollation::Absent;
                 Ok(computed_expr(
                     hir::Expr::InList {
                         lhs: Box::new(lhs.expr),
@@ -2609,11 +2698,8 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
                         children.len()
                     )));
                 }
-                let collation = children
-                    .iter()
-                    .fold(ExprCollation::Absent, |current, child| {
-                        expression_collation(&current, &child.collation)
-                    });
+                // A CASE value carries no collation, whatever its arms read.
+                let collation = ExprCollation::Absent;
                 let mut children = children.into_iter();
                 let base = base_syntax.as_ref().map(|_| {
                     children
@@ -2722,7 +2808,7 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
                     + order_by.len()
                     + within_group.len()
                     + usize::from(filter_over.filter_clause.is_some())
-                    + window_expression_count(name, args.len(), filter_over.over_clause.as_ref());
+                    + window_expression_count(name, args.len(), filter_over.over_clause.as_deref());
                 if children.len() != expected_children {
                     return Err(LimboError::InternalError(format!(
                         "function expression expected {} child values, got {}",
@@ -2758,7 +2844,7 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
                 let window = take_function_window(
                     name,
                     args.len(),
-                    filter_over.over_clause.as_ref(),
+                    filter_over.over_clause.as_deref(),
                     &mut children,
                 )?;
                 let input = match ordered_set {
@@ -2789,7 +2875,7 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
             }
             ast::Expr::FunctionCallStar { name, filter_over } => {
                 let expected_children = usize::from(filter_over.filter_clause.is_some())
-                    + window_expression_count(name, 0, filter_over.over_clause.as_ref());
+                    + window_expression_count(name, 0, filter_over.over_clause.as_deref());
                 if children.len() != expected_children {
                     return Err(LimboError::InternalError(format!(
                         "star function expression expected {expected_children} child values, got {}",
@@ -2802,8 +2888,12 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
                         .next()
                         .expect("star function child count includes FILTER")
                 });
-                let window =
-                    take_function_window(name, 0, filter_over.over_clause.as_ref(), &mut children)?;
+                let window = take_function_window(
+                    name,
+                    0,
+                    filter_over.over_clause.as_deref(),
+                    &mut children,
+                )?;
                 self.build_function_call(
                     name,
                     FunctionInput::Star,
@@ -2983,7 +3073,7 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
         window: Option<FunctionOver>,
         scope: &Scope,
         policy: ExprPolicy,
-        functions: &mut FunctionContext<'_>,
+        functions: &mut FunctionContext<'_, 'ast>,
         expected_type: Option<&Arc<TypeDef>>,
     ) -> Result<ResolvedScopeExpr> {
         let parsed_argument_count = input.argument_count();
@@ -2993,14 +3083,27 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
             _ => {
                 let Some(function) = self
                     .context()
-                    .resolve_function(&function_name, parsed_argument_count)?
+                    .resolve_function(name.as_str(), parsed_argument_count)?
                 else {
-                    crate::bail_parse_error!("no such function: {function_name}");
+                    crate::bail_parse_error!("no such function: {}", name.as_str());
                 };
                 function
             }
         };
-        let binding = bind_function(&function, window.is_some(), name, policy, functions)?;
+        let binding = bind_function(
+            &function,
+            window.is_some(),
+            matches!(input, FunctionInput::Star),
+            name,
+            policy,
+            functions,
+        )?;
+        if matches!(binding, FunctionBinding::Scalar) && filter.is_some() {
+            crate::bail_parse_error!(
+                "FILTER may not be used with non-aggregate {}()",
+                function_name
+            );
+        }
         let aggregate = matches!(binding, FunctionBinding::Aggregate(_));
         let window_evaluation = matches!(binding, FunctionBinding::Window(_));
         let window = match (window_evaluation, window) {
@@ -3101,13 +3204,18 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
         let id = self.catalog_object_id(
             None,
             CatalogObjectKind::Function { argument_count },
-            function_name,
+            function_name.clone(),
         );
         let function =
             hir::CatalogObject::new(id, self.context().snapshot(), None, Arc::new(function));
         let evaluation = match binding {
             FunctionBinding::Scalar => hir::FunctionEvaluation::Scalar,
             FunctionBinding::Aggregate(binding) => {
+                if self.aggregate_hosts.last() == Some(&None)
+                    && self.aggregate_reads_outside(binding.block, &input, filter.as_ref())
+                {
+                    crate::bail_parse_error!("misuse of aggregate: {}()", function_name);
+                }
                 let block = self.aggregate_owner(binding.block, &input, filter.as_ref());
                 hir::FunctionEvaluation::Aggregate {
                     id: self.allocate_aggregate(block),
@@ -3128,6 +3236,9 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
                 filter: filter.map(|filter| Box::new(filter.expr)),
             },
         };
+        // A function's value keeps an explicit COLLATE of an argument, as
+        // SQLite propagates one through calls, but not a column collation.
+        let collation = explicit_collation(input.facts());
         let arguments = input.into_hir();
         Ok(computed_expr(
             hir::Expr::Function(hir::FunctionCall {
@@ -3138,7 +3249,7 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
                 operation,
             }),
             result_type,
-            ExprCollation::Absent,
+            collation,
         ))
     }
 
@@ -3384,13 +3495,39 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
         operator: ast::Operator,
         lhs: &ResolvedScopeExpr,
         rhs: &ResolvedScopeExpr,
+        written_literals: [bool; 2],
     ) -> Result<Option<hir::CustomBinaryOperator>> {
-        if custom_operator_symbol(operator).is_none() {
+        if self.standard_operators_only || custom_operator_symbol(operator).is_none() {
             return Ok(None);
         }
         let lhs_column = self.custom_operator_column(lhs)?;
         let rhs_column = self.custom_operator_column(rhs)?;
 
+        // With one custom column, the other operand is encoded when it is a
+        // literal the type accepts as input. Otherwise an arithmetic operator
+        // of a type whose stored values read back unchanged still gets the
+        // operand as it is, so `date + 1`, `date + int_col` and `date + ?`
+        // add days; the operator function checks the operand's type. A
+        // comparison such as `int_col = '10'` keeps the standard operator.
+        let one_custom_column = |column: &CustomOperatorColumn,
+                                 other: &ResolvedScopeExpr,
+                                 operand: hir::BinaryOperand| {
+            let other_is_written_literal = match operand {
+                hir::BinaryOperand::Left => written_literals[0],
+                hir::BinaryOperand::Right => written_literals[1],
+            };
+            let encode_other = other_is_written_literal
+                && literal_matches_custom_type(other, column.definition.value());
+            let pass_other_as_is = !operator.is_comparison()
+                && column.definition.value().decode_returns_value_unchanged();
+            if !encode_other && !pass_other_as_is {
+                return None;
+            }
+            Some(encode_other.then(|| hir::CustomBinaryLiteralEncoding {
+                operand,
+                encoder: column.encoder.clone(),
+            }))
+        };
         let (column, literal_encoding) = match (&lhs_column, &rhs_column) {
             (Some(lhs), Some(rhs)) => {
                 if !lhs.declared_name.eq_ignore_ascii_case(&rhs.declared_name) {
@@ -3399,28 +3536,16 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
                 (lhs, None)
             }
             (Some(lhs), None) => {
-                if !literal_matches_custom_type(rhs, lhs.definition.value()) {
+                let Some(encoding) = one_custom_column(lhs, rhs, hir::BinaryOperand::Right) else {
                     return Ok(None);
-                }
-                (
-                    lhs,
-                    Some(hir::CustomBinaryLiteralEncoding {
-                        operand: hir::BinaryOperand::Right,
-                        encoder: lhs.encoder.clone(),
-                    }),
-                )
+                };
+                (lhs, encoding)
             }
             (None, Some(rhs)) => {
-                if !literal_matches_custom_type(lhs, rhs.definition.value()) {
+                let Some(encoding) = one_custom_column(rhs, lhs, hir::BinaryOperand::Left) else {
                     return Ok(None);
-                }
-                (
-                    rhs,
-                    Some(hir::CustomBinaryLiteralEncoding {
-                        operand: hir::BinaryOperand::Left,
-                        encoder: rhs.encoder.clone(),
-                    }),
-                )
+                };
+                (rhs, encoding)
             }
             (None, None) => return Ok(None),
         };
@@ -3472,9 +3597,13 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
                 reference.source
             ))
         })?;
+        // The row a write builds (NEW, or the row an UPDATE writes) has the
+        // table's columns, so its custom types keep their operators there.
         if !matches!(
             &source.kind,
-            hir::SourceKind::Table(_) | hir::SourceKind::TableFunction { .. }
+            hir::SourceKind::Table(_)
+                | hir::SourceKind::TableFunction { .. }
+                | hir::SourceKind::Pseudo { .. }
         ) {
             return Ok(None);
         }
@@ -3525,10 +3654,14 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
                 })?;
                 (database, normalize_ident(name))
             }
-            None => (
-                hir::DatabaseId::new(crate::MAIN_DB_ID),
-                normalize_ident(&user_name),
-            ),
+            None => {
+                let name = normalize_ident(&user_name);
+                let database = self
+                    .context()
+                    .resolve_existing_sequence_database_id(&name)
+                    .unwrap_or(crate::MAIN_DB_ID);
+                (hir::DatabaseId::new(database), name)
+            }
         };
         let backing_table_name =
             crate::translate::sequence::sequence_backing_table_name(&normalized_name);
@@ -3641,14 +3774,17 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
                     type_fact: column.type_fact.clone(),
                     affinity: column.affinity,
                     has_affinity: column.has_affinity,
-                    collation: ExprCollation::inherited(column.collation.clone()),
+                    collation: ExprCollation::column(
+                        column.collation.clone(),
+                        &self.binary_collation,
+                    ),
                 })
             }
             hir::Expr::MergedColumn(merged) => Ok(ResolvedScopeExpr {
                 type_fact: merged.type_fact.clone(),
                 affinity: merged.affinity,
                 has_affinity: merged.has_affinity,
-                collation: ExprCollation::inherited(merged.collation.clone()),
+                collation: ExprCollation::column(merged.collation.clone(), &self.binary_collation),
                 expr: hir::Expr::MergedColumn(merged),
             }),
             hir::Expr::RowId(source) => Ok(ResolvedScopeExpr {
@@ -3720,17 +3856,20 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
                 programs: builtin_cast_programs(),
             });
         };
+        // SQLite dequotes the CAST type name before reading its affinity, so
+        // `CAST(x AS "BLOB" INTEGER)` casts to the type named BLOB.
+        let name = crate::util::dequote(&syntax.name);
         if self.context().custom_types_enabled() {
-            if let Some(resolved) = self
-                .context()
-                .main_schema()
-                .resolve_type_unchecked(&syntax.name)?
-            {
+            if let Some(resolved) = self.context().main_schema().resolve_type_unchecked(&name)? {
                 if resolved.leaf().user_params().count() != parameters.len() {
-                    return Ok(builtin_cast_target(syntax, parameter_expressions));
+                    return Ok(builtin_cast_target(
+                        &name,
+                        syntax.array_dimensions,
+                        parameter_expressions,
+                    ));
                 }
                 let (type_fact, affinity) =
-                    self.freeze_type_fact(&syntax.name, resolved, syntax.array_dimensions);
+                    self.freeze_type_fact(&name, resolved, syntax.array_dimensions);
                 let custom_chain = type_fact
                     .declared
                     .as_ref()
@@ -3749,7 +3888,7 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
                     .map(|_| self.bind_domain_constraints(&type_fact, &custom_chain))
                     .transpose()?;
                 return Ok(hir::TypeName {
-                    name: syntax.name.clone(),
+                    name,
                     parameters: parameter_expressions,
                     array_dimensions: syntax.array_dimensions,
                     type_fact,
@@ -3762,7 +3901,11 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
                 });
             }
         }
-        Ok(builtin_cast_target(syntax, parameter_expressions))
+        Ok(builtin_cast_target(
+            &name,
+            syntax.array_dimensions,
+            parameter_expressions,
+        ))
     }
 
     pub(super) fn freeze_type_fact(
@@ -3837,14 +3980,7 @@ fn read_other_side_as_array(
 
 /// `value` cast to the array type `declared` names.
 fn read_as_array(value: ResolvedScopeExpr, declared: &hir::DeclaredType) -> ResolvedScopeExpr {
-    let target = builtin_cast_target(
-        &ast::Type {
-            name: declared.name.clone(),
-            size: None,
-            array_dimensions: declared.array_dimensions,
-        },
-        Vec::new(),
-    );
+    let target = builtin_cast_target(&declared.name, declared.array_dimensions, Vec::new());
     let type_fact = target.type_fact.clone();
     computed_expr(
         hir::Expr::Cast {
@@ -3856,18 +3992,23 @@ fn read_as_array(value: ResolvedScopeExpr, declared: &hir::DeclaredType) -> Reso
     )
 }
 
-fn builtin_cast_target(syntax: &ast::Type, parameters: Vec<hir::Expr>) -> hir::TypeName {
-    let affinity = Affinity::affinity(&syntax.name);
+/// The CAST target for the built-in type `name`, already dequoted.
+fn builtin_cast_target(
+    name: &str,
+    array_dimensions: u32,
+    parameters: Vec<hir::Expr>,
+) -> hir::TypeName {
+    let affinity = Affinity::of_written_type(name);
     let type_fact = hir::TypeFact::declared(hir::DeclaredType {
-        name: syntax.name.clone(),
+        name: name.to_string(),
         storage: affinity.to_type(),
         custom_chain: Vec::new(),
-        array_dimensions: syntax.array_dimensions,
+        array_dimensions,
     });
     hir::TypeName {
-        name: syntax.name.clone(),
+        name: name.to_string(),
         parameters,
-        array_dimensions: syntax.array_dimensions,
+        array_dimensions,
         type_fact,
         affinity,
         programs: builtin_cast_programs(),
@@ -4334,27 +4475,30 @@ fn coerced_window_frame(function: &WindowFunc) -> Option<hir::WindowFrame> {
 fn bind_function(
     function: &Func,
     has_over: bool,
+    star: bool,
     name: &ast::Name,
     policy: ExprPolicy,
-    context: &mut FunctionContext<'_>,
+    context: &mut FunctionContext<'_, '_>,
 ) -> Result<FunctionBinding> {
+    // A call written `count(*)` is named that way in its error.
+    let arguments = if star { "*" } else { "" };
     let aggregate = matches!(function, Func::Agg(_))
         || matches!(function, Func::External(external) if external.func.is_aggregate());
     if aggregate && !has_over {
         match policy.aggregates {
             AggregatePolicy::Allow => {}
             AggregatePolicy::RejectFunction => {
-                crate::bail_parse_error!("misuse of aggregate function {}()", function)
+                crate::bail_parse_error!("misuse of aggregate function {function}({arguments})")
             }
             AggregatePolicy::RejectMisuse => {
-                crate::bail_parse_error!("misuse of aggregate: {}()", function)
+                crate::bail_parse_error!("misuse of aggregate: {function}({arguments})")
             }
         }
     }
     if has_over && !policy.allow_windows {
         match function {
             Func::Agg(_) | Func::Window(_) => {
-                crate::bail_parse_error!("misuse of window function {}()", function)
+                crate::bail_parse_error!("misuse of window function {function}({arguments})")
             }
             Func::External(external) if external.func.is_aggregate() => {
                 crate::bail_parse_error!("misuse of window function {}()", function)
@@ -4369,10 +4513,12 @@ fn bind_function(
         Func::Agg(_) => bind_aggregate(function, context),
         Func::External(external) if external.func.is_aggregate() => {
             if has_over {
-                bind_window(function, context)
-            } else {
-                bind_aggregate(function, context)
+                crate::bail_parse_error!(
+                    "{}() is an extension aggregate and cannot be used as a window function",
+                    name.as_str()
+                )
             }
+            bind_aggregate(function, context)
         }
         Func::Window(_) if has_over => bind_window(function, context),
         Func::Window(window) => {
@@ -4386,7 +4532,7 @@ fn bind_function(
     }
 }
 
-fn bind_window(function: &Func, context: &mut FunctionContext<'_>) -> Result<FunctionBinding> {
+fn bind_window(function: &Func, context: &mut FunctionContext<'_, '_>) -> Result<FunctionBinding> {
     match context {
         FunctionContext::ScalarOnly => {
             crate::bail_parse_error!("misuse of window function {}()", function)
@@ -4397,7 +4543,10 @@ fn bind_window(function: &Func, context: &mut FunctionContext<'_>) -> Result<Fun
     }
 }
 
-fn bind_aggregate(function: &Func, context: &mut FunctionContext<'_>) -> Result<FunctionBinding> {
+fn bind_aggregate(
+    function: &Func,
+    context: &mut FunctionContext<'_, '_>,
+) -> Result<FunctionBinding> {
     match context {
         FunctionContext::ScalarOnly => {
             crate::bail_parse_error!("misuse of aggregate function {}()", function)
@@ -4637,12 +4786,22 @@ fn function_result_type(function: &Func, arguments: &[ResolvedScopeExpr]) -> hir
     }
 }
 
+/// The collation of a comparison of `lhs` with `rhs`: an explicit COLLATE
+/// on either side, the left one first; else the column collation of either
+/// side, the left one first, where a column without a declared collation
+/// counts as BINARY; else none.
 fn expression_collation(lhs: &ExprCollation, rhs: &ExprCollation) -> ExprCollation {
     match (lhs, rhs) {
         (ExprCollation::Explicit(collation), _) => ExprCollation::Explicit(collation.clone()),
         (_, ExprCollation::Explicit(collation)) => ExprCollation::Explicit(collation.clone()),
         (ExprCollation::Inherited(collation), _) => ExprCollation::Inherited(collation.clone()),
+        (ExprCollation::InheritedBinary(binary), _) => {
+            ExprCollation::InheritedBinary(binary.clone())
+        }
         (_, ExprCollation::Inherited(collation)) => ExprCollation::Inherited(collation.clone()),
+        (_, ExprCollation::InheritedBinary(binary)) => {
+            ExprCollation::InheritedBinary(binary.clone())
+        }
         (ExprCollation::Absent, ExprCollation::Absent) => ExprCollation::Absent,
     }
 }
@@ -4730,7 +4889,7 @@ fn comparison_component(
     hir::ComparisonComponent {
         affinity,
         collation: expression_collation(&lhs.collation, &rhs.collation)
-            .value()
+            .comparison_value()
             .cloned(),
         array: lhs.type_fact.is_array() && rhs.type_fact.is_array(),
     }
@@ -4799,7 +4958,7 @@ fn in_operand_comparison(
             .map(|(lhs, rhs)| hir::ComparisonComponent {
                 affinity: lhs.affinity,
                 collation: expression_collation(&lhs.collation, &rhs.collation)
-                    .value()
+                    .comparison_value()
                     .cloned(),
                 array: lhs.type_fact.is_array() && rhs.type_fact.is_array(),
             })

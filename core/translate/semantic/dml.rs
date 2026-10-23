@@ -8,7 +8,7 @@ use super::{
     hir,
     scope::{ExpandedColumn, Scope},
 };
-use crate::{schema::Table, sync::Arc, util::normalize_ident, LimboError, Result};
+use crate::{sync::Arc, util::normalize_ident, LimboError, Result};
 
 impl<'ast> Analyzer<'_, '_, 'ast> {
     pub(super) fn freeze_trigger(
@@ -75,8 +75,8 @@ impl<'ast> Analyzer<'_, '_, 'ast> {
     }
 
     /// The table change data capture writes the target's row changes to.
-    /// Changes to the capture table itself and to its version table are not
-    /// captured.
+    /// Changes to TEMP tables, to the capture table itself and to its
+    /// version table are not captured.
     pub(super) fn analyze_capture_changes(
         &mut self,
         target: &hir::ResolvedTable,
@@ -85,11 +85,9 @@ impl<'ast> Analyzer<'_, '_, 'ast> {
             return Ok(None);
         };
         let target_name = target.value().get_name();
-        if target_name == name
-            || target_name == crate::translate::pragma::TURSO_CDC_VERSION_TABLE_NAME
-        {
-            return Ok(None);
-        }
+        let target_rows = target.database() != Some(hir::DatabaseId::new(crate::TEMP_DB_ID))
+            && target_name != name
+            && target_name != crate::cdc::TURSO_CDC_VERSION_TABLE_NAME;
         let database = hir::DatabaseId::new(crate::MAIN_DB_ID);
         let table = self
             .context()
@@ -104,13 +102,22 @@ impl<'ast> Analyzer<'_, '_, 'ast> {
         let change_ids = self
             .analyze_autoincrement(&table)?
             .and_then(|autoincrement| autoincrement.mvcc_sequence);
-        Ok(Some(hir::CaptureChanges { table, change_ids }))
+        Ok(Some(hir::CaptureChanges {
+            table,
+            change_ids,
+            target_rows,
+        }))
     }
 
+    /// The foreign keys a write to `target` checks. For an UPDATE,
+    /// `updated` is the columns it sets: a constraint whose key it leaves
+    /// alone is not checked, and not even resolved, so a mismatched
+    /// constraint on other columns does not fail the statement.
     pub(super) fn analyze_dml_foreign_keys(
         &mut self,
         target: &hir::ResolvedTable,
         outgoing_child_source: hir::SourceId,
+        updated: Option<&crate::translate::plan::ColumnMask>,
     ) -> Result<hir::DmlForeignKeys> {
         if !self.context().foreign_keys_enabled() {
             return Ok(hir::DmlForeignKeys::default());
@@ -118,12 +125,38 @@ impl<'ast> Analyzer<'_, '_, 'ast> {
         let database = target.database().ok_or_else(|| {
             LimboError::InternalError("DML target has no owning database".to_string())
         })?;
-        let (outgoing, incoming) = {
+        let (outgoing, incoming, table_has_foreign_keys) = {
             let schema = self.context().schema(database)?;
-            (
-                schema.resolved_fks_for_child(target.value().get_name())?,
-                schema.resolved_fks_referencing(target.value().get_name())?,
-            )
+            let name = target.value().get_name();
+            let incoming = schema.resolved_fks_referencing(name)?;
+            let table_has_foreign_keys = schema.has_child_fks(name) || !incoming.is_empty();
+            // Like SQLite, an UPDATE resolves the constraints the table
+            // declares only when it changes a key: one of their child keys,
+            // or a parent key another table points at. `updated` covers the
+            // generated columns the SET columns feed.
+            let outgoing = match updated {
+                Some(updated) => {
+                    let table = target.value().require_btree()?;
+                    let child_key_changed = table
+                        .foreign_keys
+                        .iter()
+                        .any(|foreign_key| foreign_key.child_key_assigned(&table, updated));
+                    let mut parent_key_changed = false;
+                    for foreign_key in &incoming {
+                        if foreign_key.parent_key_may_change(updated, &table)? {
+                            parent_key_changed = true;
+                            break;
+                        }
+                    }
+                    if child_key_changed || parent_key_changed {
+                        schema.resolved_fks_for_child(name, Some(updated))?
+                    } else {
+                        crate::alloc::vec![]
+                    }
+                }
+                None => schema.resolved_fks_for_child(name, None)?,
+            };
+            (outgoing, incoming, table_has_foreign_keys)
         };
 
         let mut resolved_outgoing = Vec::with_capacity(outgoing.len());
@@ -176,6 +209,7 @@ impl<'ast> Analyzer<'_, '_, 'ast> {
         Ok(hir::DmlForeignKeys {
             outgoing: resolved_outgoing,
             incoming: resolved_incoming,
+            table_has_foreign_keys,
         })
     }
 
@@ -289,8 +323,8 @@ impl<'ast> Analyzer<'_, '_, 'ast> {
         // order.
         let child_index = self
             .context()
-            .schema(database)?
-            .get_indices(child_table.value().get_name())
+            .table_indexes(database, child_table.value().get_name())?
+            .into_iter()
             .find(|index| {
                 index.columns.len() == foreign_key.fk.child_columns.len()
                     && index
@@ -298,8 +332,7 @@ impl<'ast> Analyzer<'_, '_, 'ast> {
                         .iter()
                         .zip(foreign_key.fk.child_columns.iter())
                         .all(|(column, child)| column.name.eq_ignore_ascii_case(child))
-            })
-            .cloned();
+            });
         let child_index = child_index.map(|index| self.freeze_foreign_key_index(database, index));
         Ok(hir::ResolvedForeignKey {
             child_table,
@@ -339,17 +372,21 @@ pub(super) fn trigger_targets_database(
         .is_none_or(|target| target == database.index())
 }
 
+/// Whether an UPDATE that sets the columns named `updated_names` (as
+/// written, normalized) fires `trigger`. Like SQLite, an `UPDATE OF`
+/// trigger compares names: `SET rowid = 1` fires a trigger on `rowid`, not
+/// one on the INTEGER PRIMARY KEY column, and the other way round.
 pub(super) fn trigger_matches_update(
     trigger: &crate::schema::Trigger,
-    table: &Table,
-    updated_columns: &[usize],
+    updated_names: &[String],
 ) -> bool {
     match &trigger.event {
         ast::TriggerEvent::Update => true,
         ast::TriggerEvent::UpdateOf(columns) => columns.iter().any(|column| {
-            table
-                .get_column_by_name(&normalize_ident(column.as_str()))
-                .is_some_and(|(position, _)| updated_columns.contains(&position))
+            let column = normalize_ident(column.as_str());
+            updated_names
+                .iter()
+                .any(|updated| updated.eq_ignore_ascii_case(&column))
         }),
         ast::TriggerEvent::Delete | ast::TriggerEvent::Insert => false,
     }

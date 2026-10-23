@@ -4,6 +4,7 @@ use std::hash::{Hash, Hasher};
 
 use crate::numeric::Numeric;
 use crate::types::{Value, ValueRef};
+use crate::vdbe::hash_table::normalized_f64_bits;
 
 /// Default number of expected items for bloom filter sizing.
 /// This is used when the expected count is not known ahead of time.
@@ -177,16 +178,6 @@ fn hash_numeric<H: Hasher>(hasher: &mut H, f: f64) {
     let bits = normalized_f64_bits(f);
     NUMERIC_TAG.hash(hasher);
     bits.hash(hasher);
-}
-
-/// Normalize signed zero so 0.0 and -0.0 hash the same.
-#[inline]
-fn normalized_f64_bits(f: f64) -> u64 {
-    if f == 0.0 {
-        0.0f64.to_bits()
-    } else {
-        f.to_bits()
-    }
 }
 
 #[cfg(test)]

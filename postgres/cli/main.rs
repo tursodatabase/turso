@@ -100,6 +100,7 @@ fn open_database(
     db_path: &str,
     vfs: Option<&String>,
     readonly: bool,
+    enable_load_extension: bool,
 ) -> anyhow::Result<(Arc<dyn turso_core::IO>, Connection)> {
     let db_opts = DatabaseOpts::new()
         .with_views(true)
@@ -109,6 +110,11 @@ fn open_database(
         .with_autovacuum(true)
         .with_attach(true)
         .with_generated_columns(true);
+    let db_opts = if enable_load_extension {
+        db_opts.turso_cli()
+    } else {
+        db_opts
+    };
 
     let flags = if readonly {
         OpenFlags::default().union(OpenFlags::ReadOnly)
@@ -116,9 +122,8 @@ fn open_database(
         OpenFlags::default()
     };
 
-    let (io, db) =
-        turso_pg::open_database(db_path, vfs.map(|v| v.as_str()), flags, db_opts.turso_cli())?;
-    let conn = Connection::new(db.connect()?);
+    let (io, db) = turso_pg::open_database(db_path, vfs.map(|v| v.as_str()), flags, db_opts)?;
+    let conn = Connection::connect(&db)?;
     Ok((io, conn))
 }
 
@@ -942,6 +947,10 @@ impl Repl {
             let prompt = self.prompt().to_string();
             match rl.readline(&prompt) {
                 Ok(line) => {
+                    if self.input_buf.trim().is_empty() && is_exit_command(&line) {
+                        break;
+                    }
+
                     self.interrupt_count.store(0, Ordering::Release);
                     self.read_state.process(&line);
                     self.input_buf.push_str(&line);
@@ -987,6 +996,12 @@ impl Repl {
     }
 }
 
+fn is_exit_command(line: &str) -> bool {
+    let line = line.trim_end();
+    let line = line.strip_suffix(';').unwrap_or(line).trim_end();
+    line.eq_ignore_ascii_case("exit") || line.eq_ignore_ascii_case("quit")
+}
+
 // ---------------------------------------------------------------------------
 // main
 // ---------------------------------------------------------------------------
@@ -1000,7 +1015,12 @@ fn main() -> anyhow::Result<()> {
         .as_ref()
         .map_or(":memory:".to_string(), |p| p.to_string_lossy().to_string());
 
-    let (io, conn) = open_database(&db_file, opts.vfs.as_ref(), opts.readonly)?;
+    let (io, conn) = open_database(
+        &db_file,
+        opts.vfs.as_ref(),
+        opts.readonly,
+        opts.server.is_none(),
+    )?;
 
     let interrupt_count = Arc::new(AtomicUsize::new(0));
     {
@@ -1044,4 +1064,40 @@ fn main() -> anyhow::Result<()> {
         std::process::exit(1);
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_successful_exit_commands() {
+        for command in [
+            "exit", "quit", "EXIT", "QuIt", "exit;", "quit;", "EXIT;", "exit ;  ", "quit ;  ",
+        ] {
+            assert!(
+                is_exit_command(command),
+                "expected {command:?} to be an exit command"
+            );
+        }
+    }
+
+    #[test]
+    fn test_unsuccessful_exit_commands() {
+        for command in [
+            "",
+            " quit ",
+            "exit;;",
+            "exit now",
+            "quitter",
+            "some_exit",
+            "SELECT 'quit';",
+            "quit;;",
+        ] {
+            assert!(
+                !is_exit_command(command),
+                "expected {command:?} not to be an exit command"
+            );
+        }
+    }
 }

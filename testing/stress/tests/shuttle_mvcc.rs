@@ -1,6 +1,6 @@
 #![cfg(shuttle)]
 
-use shuttle::scheduler::{PctScheduler, RandomScheduler};
+use shuttle::scheduler::{PctScheduler, RandomScheduler, Schedule, Scheduler, Task, TaskId};
 use shuttle::sync::Barrier;
 use turso::Builder;
 use turso_stress::sync::atomic::{AtomicBool, AtomicI64, Ordering};
@@ -40,6 +40,103 @@ async fn query_string(conn: &turso::Connection, sql: &str) -> String {
     let mut rows = conn.query(sql, ()).await.unwrap();
     let row = rows.next().await.unwrap().unwrap();
     row.get::<String>(0).unwrap()
+}
+
+#[test]
+fn shuttle_test_concurrent_delete_btree_only_row() {
+    let scheduler = RandomScheduler::new_from_seed(7255923676707559574, 1);
+    let runner = shuttle::Runner::new(scheduler, shuttle_config());
+    runner.run(|| shuttle::future::block_on(concurrent_delete_btree_only_row_scenario(false)));
+}
+
+#[test]
+fn shuttle_test_concurrent_delete_btree_only_index_entry() {
+    let scheduler = RandomScheduler::new(100);
+    let runner = shuttle::Runner::new(scheduler, shuttle_config());
+    runner.run(|| shuttle::future::block_on(concurrent_delete_btree_only_row_scenario(true)));
+}
+
+async fn concurrent_delete_btree_only_row_scenario(indexed: bool) {
+    let (db, dir) = setup_mvcc_db(
+        "CREATE TABLE docs(id INTEGER PRIMARY KEY, value INTEGER);
+         INSERT INTO docs VALUES(7, 42), (19, 42);",
+    )
+    .await;
+    {
+        let conn = db.connect().unwrap();
+        if indexed {
+            conn.execute("CREATE INDEX docs_value ON docs(value)", ())
+                .await
+                .unwrap();
+        }
+        let mut rows = conn
+            .query("PRAGMA wal_checkpoint(TRUNCATE)", ())
+            .await
+            .unwrap();
+        let row = rows.next().await.unwrap().unwrap();
+        assert_eq!(row.get::<i64>(0).unwrap(), 0);
+        assert!(rows.next().await.unwrap().is_none());
+    }
+    drop(db);
+
+    let db = Builder::new_local(dir.path().join("test.db").to_str().unwrap())
+        .build()
+        .await
+        .unwrap();
+    let barrier = Arc::new(Barrier::new(2));
+    let successful_deletes = Arc::new(AtomicI64::new(0));
+    let mut handles = Vec::new();
+    for _ in 0..2 {
+        let conn = db.connect().unwrap();
+        let barrier = barrier.clone();
+        let successful_deletes = successful_deletes.clone();
+        handles.push(turso_stress::future::spawn(async move {
+            conn.execute("BEGIN CONCURRENT", ()).await.unwrap();
+            assert_eq!(
+                query_i64(&conn, "SELECT value FROM docs WHERE id = 7").await,
+                42
+            );
+            barrier.wait();
+            let deleted = match conn.execute("DELETE FROM docs WHERE id = 7", ()).await {
+                Ok(count) => {
+                    assert_eq!(count, 1);
+                    successful_deletes.fetch_add(1, Ordering::SeqCst);
+                    true
+                }
+                Err(turso::Error::Error(message)) if message == "Write-write conflict" => false,
+                Err(error) => panic!("unexpected DELETE error: {error:?}"),
+            };
+            barrier.wait();
+            assert_eq!(
+                successful_deletes.load(Ordering::SeqCst),
+                1,
+                "both DELETE statements acquired the same B-tree-only row before either committed"
+            );
+            if deleted {
+                conn.execute("COMMIT", ()).await.unwrap();
+            }
+        }));
+    }
+    for handle in handles {
+        handle.await.unwrap();
+    }
+
+    let conn = db.connect().unwrap();
+    assert_eq!(
+        query_string(&conn, "SELECT group_concat(id) FROM docs WHERE value = 42").await,
+        "19"
+    );
+    if indexed {
+        assert_eq!(
+            query_string(
+                &conn,
+                "SELECT group_concat(id) FROM docs INDEXED BY docs_value WHERE value = 42"
+            )
+            .await,
+            "19"
+        );
+    }
+    assert_eq!(query_string(&conn, "PRAGMA integrity_check").await, "ok");
 }
 
 async fn lost_updates_scenario(num_workers: usize, rounds: usize) {
@@ -735,5 +832,241 @@ async fn begin_publish_window_gc_scenario(num_readers: usize, rounds: i64) {
     assert!(
         !row_disappeared.load(Ordering::Acquire),
         "Observed a row, and then no row. This violates Snapshot Isolation"
+    );
+}
+
+#[test]
+fn shuttle_test_index_scan_after_concurrent_delete_rollback() {
+    let scheduler = RunUntilYieldScheduler::default();
+    let runner = shuttle::Runner::new(scheduler, shuttle_config());
+    runner
+        .run(|| shuttle::future::block_on(index_scan_after_concurrent_delete_rollback_scenario()));
+}
+
+async fn index_scan_after_concurrent_delete_rollback_scenario() {
+    let (db, dir) = setup_mvcc_db(
+        "CREATE TABLE t(id INTEGER PRIMARY KEY, v INTEGER);
+         CREATE INDEX t_v ON t(v);
+         INSERT INTO t VALUES(1, 10), (2, 20), (3, 30);",
+    )
+    .await;
+    {
+        let conn = db.connect().unwrap();
+        let mut rows = conn
+            .query("PRAGMA wal_checkpoint(TRUNCATE)", ())
+            .await
+            .unwrap();
+        assert_eq!(
+            rows.next().await.unwrap().unwrap().get::<i64>(0).unwrap(),
+            0
+        );
+        assert!(rows.next().await.unwrap().is_none());
+    }
+    drop(db);
+
+    let db = Builder::new_local(dir.path().join("test.db").to_str().unwrap())
+        .build()
+        .await
+        .unwrap();
+    let reader = db.connect().unwrap();
+    let writer = db.connect().unwrap();
+    assert_eq!(
+        query_string(
+            &reader,
+            "SELECT group_concat(v) FROM t INDEXED BY t_v ORDER BY v"
+        )
+        .await,
+        "10,20,30"
+    );
+    reader.execute("BEGIN CONCURRENT", ()).await.unwrap();
+    writer.execute("BEGIN CONCURRENT", ()).await.unwrap();
+    writer.execute("SAVEPOINT s", ()).await.unwrap();
+
+    let mut rows = reader
+        .query("SELECT v FROM t INDEXED BY t_v ORDER BY v", ())
+        .await
+        .unwrap();
+    let start = Arc::new(Barrier::new(2));
+    let writer_done = Arc::new(Barrier::new(2));
+
+    let reader_handle = {
+        let start = start.clone();
+        let writer_done = writer_done.clone();
+        turso_stress::future::spawn(async move {
+            start.wait();
+            assert_eq!(
+                rows.next().await.unwrap().unwrap().get::<i64>(0).unwrap(),
+                10
+            );
+            writer_done.wait();
+            assert_eq!(
+                reader
+                    .execute("DELETE FROM t WHERE id = 3", ())
+                    .await
+                    .unwrap(),
+                1
+            );
+            assert_eq!(
+                rows.next().await.unwrap().unwrap().get::<i64>(0).unwrap(),
+                20
+            );
+            assert!(rows.next().await.unwrap().is_none());
+        })
+    };
+
+    let writer_handle = turso_stress::future::spawn(async move {
+        start.wait();
+        assert_eq!(
+            writer
+                .execute("DELETE FROM t WHERE id = 3", ())
+                .await
+                .unwrap(),
+            1
+        );
+        writer.execute("ROLLBACK TO s", ()).await.unwrap();
+        writer.execute("ROLLBACK", ()).await.unwrap();
+        writer_done.wait();
+    });
+
+    writer_handle.await.unwrap();
+    reader_handle.await.unwrap();
+}
+
+#[derive(Debug, Default)]
+struct RunUntilYieldScheduler {
+    started: bool,
+}
+
+impl Scheduler for RunUntilYieldScheduler {
+    fn new_execution(&mut self) -> Option<Schedule> {
+        if std::mem::replace(&mut self.started, true) {
+            None
+        } else {
+            Some(Schedule::new(0))
+        }
+    }
+
+    fn next_task(
+        &mut self,
+        runnable: &[&Task],
+        current: Option<TaskId>,
+        is_yielding: bool,
+    ) -> Option<TaskId> {
+        if !is_yielding {
+            if let Some(current) = current {
+                if runnable.iter().any(|task| task.id() == current) {
+                    return Some(current);
+                }
+            }
+        }
+        Some(
+            runnable
+                .iter()
+                .find(|task| Some(task.id()) != current)
+                .unwrap_or(&runnable[0])
+                .id(),
+        )
+    }
+
+    fn next_u64(&mut self) -> u64 {
+        0
+    }
+}
+
+#[test]
+fn shuttle_fts_aborted_writer_does_not_report_corruption() {
+    let scheduler = PctScheduler::new_from_seed(2735639250783491977, 3, 50);
+    let runner = shuttle::Runner::new(scheduler, shuttle_config());
+    runner.run(|| shuttle::future::block_on(fts_aborted_writer_scenario()));
+}
+
+async fn fts_aborted_writer_scenario() {
+    use std::future::Future;
+    use std::task::Poll;
+
+    let dir = tempfile::tempdir().unwrap();
+    let db = Builder::new_local(dir.path().join("fts.db").to_str().unwrap())
+        .with_io("memory_yield")
+        .experimental_index_method(true)
+        .build()
+        .await
+        .unwrap();
+    let setup = db.connect().unwrap();
+    let mut rows = setup
+        .query("PRAGMA journal_mode = 'experimental_mvcc'", ())
+        .await
+        .unwrap();
+    while rows.next().await.unwrap().is_some() {}
+    drop(rows);
+    setup
+        .execute_batch(
+            "CREATE TABLE docs(id INTEGER PRIMARY KEY, body TEXT);
+         CREATE INDEX idx ON docs USING fts(body);
+         CREATE TABLE padding(id INTEGER PRIMARY KEY);
+         INSERT INTO docs VALUES (1, 'alpha');
+         PRAGMA mvcc_checkpoint_threshold = -1;",
+        )
+        .await
+        .unwrap();
+
+    let ready = Arc::new(Barrier::new(2));
+    let start = Arc::new(Barrier::new(2));
+    let writer_handle = {
+        let ready = ready.clone();
+        let start = start.clone();
+        let db = db.clone();
+        turso_stress::future::spawn(async move {
+            let writer = db.connect().unwrap();
+            writer.execute("BEGIN CONCURRENT", ()).await.unwrap();
+            let docs = (2..=201)
+                .map(|id| format!("({id}, 'bravo')"))
+                .collect::<Vec<_>>()
+                .join(",");
+            writer
+                .execute(&format!("INSERT INTO docs VALUES {docs}"), ())
+                .await
+                .unwrap();
+            let values = (1..=1025)
+                .map(|id| format!("({id})"))
+                .collect::<Vec<_>>()
+                .join(",");
+            writer
+                .execute(&format!("INSERT INTO padding VALUES {values}"), ())
+                .await
+                .unwrap();
+            let mut statement = writer.prepare("COMMIT").await.unwrap();
+            let mut commit = Box::pin(statement.execute(()));
+            std::future::poll_fn(|cx| match commit.as_mut().poll(cx) {
+                Poll::Pending => Poll::Ready(()),
+                Poll::Ready(result) => {
+                    panic!("commit finished before the reader started: {result:?}")
+                }
+            })
+            .await;
+            ready.wait();
+            start.wait();
+            shuttle::thread::yield_now();
+            drop(commit);
+            drop(statement);
+        })
+    };
+
+    ready.wait();
+    let probe = db.connect().unwrap();
+    probe.execute("BEGIN CONCURRENT", ()).await.unwrap();
+    assert_eq!(
+        query_i64(&probe, "SELECT count(*) FROM docs WHERE id = 2").await,
+        1
+    );
+    drop(probe);
+    let reader = db.connect().unwrap();
+    reader.execute("BEGIN CONCURRENT", ()).await.unwrap();
+    let mut optimize = reader.prepare("OPTIMIZE INDEX idx").await.unwrap();
+    start.wait();
+    let result = optimize.execute(()).await;
+    writer_handle.await.unwrap();
+    assert!(
+        matches!(result, Ok(_) | Err(turso::Error::BusySnapshot(_))),
+        "FTS returned an unexpected error after a writer aborted: {result:?}"
     );
 }

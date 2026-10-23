@@ -68,7 +68,7 @@ impl<'ast> Analyzer<'_, '_, 'ast> {
             self.analyze_btree_delete_metadata(target, &table)?;
             hir::DeleteTargetKind::BTree {
                 triggers: self.analyze_delete_triggers(&table)?,
-                foreign_keys: self.analyze_dml_foreign_keys(&table, target)?,
+                foreign_keys: self.analyze_dml_foreign_keys(&table, target, None)?,
                 capture_changes: self.analyze_capture_changes(&table)?,
             }
         } else if table.value().virtual_table().is_some() {

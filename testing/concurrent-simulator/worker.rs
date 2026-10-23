@@ -11,7 +11,7 @@ use std::time::{Duration, Instant};
 use turso_core::SqliteDialect;
 
 use turso_core::{
-    CheckpointMode, Connection, Database, DatabaseOpts, LimboError, OpenFlags,
+    CheckpointMode, ConnectOpts, Connection, Database, DatabaseOpts, LimboError, OpenFlags,
     SharedWalCoordinationOpenTelemetryMode, SharedWalTestingSnapshot, StepResult, Value,
 };
 
@@ -53,7 +53,9 @@ pub fn run_worker(
         .try_init();
 
     let io = multiprocess_platform_io()?;
-    let db_opts = DatabaseOpts::new().with_multiprocess_wal(true);
+    let db_opts = DatabaseOpts::new()
+        .with_multiprocess_wal(true)
+        .with_index_method(true);
     let db = Database::open_file_with_flags(
         io,
         db_path,
@@ -70,7 +72,7 @@ pub fn run_worker(
     }
 
     let connections = (0..connections_per_process)
-        .map(|_| db.connect())
+        .map(|_| db.connect(ConnectOpts::new()))
         .collect::<turso_core::Result<Vec<_>>>()?;
 
     if enable_mvcc {

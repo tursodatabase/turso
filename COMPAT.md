@@ -77,6 +77,7 @@ ongoing work to pass the full SQLite TCL test suite.
 * ✅ SQLite file format is fully supported
 * 🚧 SQLite query language [[status](#sqlite-query-language)] is partially supported
 * 🚧 SQLite C API [[status](#sqlite-c-api)] is partially supported
+* 🚧 Materialized views are experimental [[IVM status](IVM_COMPAT.md)]
 
 ### Limitations
 
@@ -228,7 +229,7 @@ avoid this window.
 | PRAGMA checkpoint_fullfsync      | ❌ No         |                                              |
 | PRAGMA collation_list            | ❌ No         |                                              |
 | PRAGMA compile_options           | ❌ No         |                                              |
-| PRAGMA count_changes             | Not Needed | deprecated in SQLite                         |
+| PRAGMA count_changes             | ✅ Yes         |                                              |
 | PRAGMA data_store_directory      | Not Needed | deprecated in SQLite                         |
 | PRAGMA data_version              | ❌ No         |                                              |
 | PRAGMA database_list             | ✅ Yes        |                                              |
@@ -240,8 +241,8 @@ avoid this window.
 | PRAGMA foreign_key_list          | ✅ Yes        |                                              |
 | PRAGMA foreign_keys              | ✅ Yes         |                                              |
 | PRAGMA freelist_count            | ✅ Yes        |                                              |
-| PRAGMA full_column_names         | Not Needed | deprecated in SQLite                         |
-| PRAGMA fullfsync                 | ✅ Yes        |                                              |
+| PRAGMA full_column_names         | ✅ Yes      | deprecated in SQLite                         |
+| PRAGMA fullfsync                 | 🚧 Partial    | Apple platforms only; ignored elsewhere      |
 | PRAGMA function_list             | ✅ Yes        |                                              |
 | PRAGMA hard_heap_limit           | ❌ No         |                                              |
 | PRAGMA ignore_check_constraints  | ✅ Yes        |                                              |
@@ -270,11 +271,11 @@ avoid this window.
 | PRAGMA reverse_unordered_selects | ❌ No         |                                              |
 | PRAGMA schema_version            | ✅ Yes        | For writes, emulate defensive mode (always noop)|
 | PRAGMA secure_delete             | ❌ No         |                                              |
-| PRAGMA short_column_names        | Not Needed | deprecated in SQLite                         |
+| PRAGMA short_column_names        | ✅ Yes      | deprecated in SQLite                         |
 | PRAGMA shrink_memory             | ❌ No         |                                              |
 | PRAGMA soft_heap_limit           | ❌ No         |                                              |
 | PRAGMA stats                     | ❌ No         | Used for testing in SQLite                   |
-| PRAGMA synchronous               | 🚧 Partial    | `OFF` and `FULL` supported                   |
+| PRAGMA synchronous               | 🚧 Partial    | `OFF`, `NORMAL`, `FULL` supported; no `EXTRA` |
 | PRAGMA table_info                | ✅ Yes        |                                              |
 | PRAGMA table_list                | ✅ Yes        |                                              |
 | PRAGMA table_xinfo               | ✅ Yes        |                                              |
@@ -287,7 +288,7 @@ avoid this window.
 | PRAGMA vdbe_debug                | ❌ No         |                                              |
 | PRAGMA vdbe_listing              | ❌ No         |                                              |
 | PRAGMA vdbe_trace                | ✅ Yes        |                                              |
-| PRAGMA wal_autocheckpoint        | ❌ No         |                                              |
+| PRAGMA wal_autocheckpoint        | ✅ Yes        |                                              |
 | PRAGMA wal_checkpoint            | 🚧 Partial    | Not Needed calling with param (pragma-value) |
 | PRAGMA writable_schema           | ❌ No         |                                              |
 
@@ -672,7 +673,7 @@ Modifiers:
 | sqlite3_changes        | ✅ Yes     |         |
 | sqlite3_changes64      | ✅ Yes     |         |
 | sqlite3_total_changes  | ✅ Yes     |         |
-| sqlite3_total_changes64| ❌ No      |         |
+| sqlite3_total_changes64| ✅ Yes     |         |
 | sqlite3_last_insert_rowid | ✅ Yes  |         |
 | sqlite3_set_last_insert_rowid | ❌ No |       |
 
@@ -750,8 +751,8 @@ Modifiers:
 | sqlite3_create_collation16  | ❌ No      |         |
 | sqlite3_collation_needed    | ❌ No      |         |
 | sqlite3_collation_needed16  | ❌ No      |         |
-| sqlite3_stricmp             | ❌ No      | Stub    |
-| sqlite3_strnicmp            | ❌ No      |         |
+| sqlite3_stricmp             | ✅ Yes     |         |
+| sqlite3_strnicmp            | ✅ Yes     |         |
 
 ### Backup API
 
@@ -940,6 +941,7 @@ Modifiers:
 | Integer        | ✅ Yes    |         |
 | IntegrityCk    | ✅ Yes    |         |
 | IsNull         | ✅ Yes    |         |
+| IsType         | ✅ Yes    |         |
 | IsUnique       | ❌ No     |         |
 | JournalMode    | ✅ Yes    |         |
 | Jump           | ✅ Yes    |         |

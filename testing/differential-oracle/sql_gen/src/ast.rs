@@ -665,9 +665,14 @@ pub struct FromClause {
 #[derive(Debug, Clone)]
 pub struct JoinClause {
     pub join_type: JoinType,
+    /// SQLite treats NATURAL as a modifier that can combine with LEFT, RIGHT, or FULL.
+    pub natural: bool,
     pub table: String,
     pub alias: Option<String>,
     pub constraint: Option<JoinConstraint>,
+    /// Parenthesized groups that end after this join, innermost first. Each
+    /// group starts before the FROM table. An entry holds the group alias.
+    pub closed_groups: Vec<Option<String>>,
 }
 
 /// The type of JOIN.
@@ -675,14 +680,37 @@ pub struct JoinClause {
 pub enum JoinType {
     Inner,
     Left,
+    Right,
+    Full,
     Cross,
-    Natural,
 }
 
-/// A JOIN constraint (ON condition).
+impl fmt::Display for JoinType {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            JoinType::Inner => write!(f, "JOIN"),
+            JoinType::Left => write!(f, "LEFT JOIN"),
+            JoinType::Right => write!(f, "RIGHT JOIN"),
+            JoinType::Full => write!(f, "FULL JOIN"),
+            JoinType::Cross => write!(f, "CROSS JOIN"),
+        }
+    }
+}
+
+/// An ON or USING clause for a JOIN.
 #[derive(Debug, Clone)]
 pub enum JoinConstraint {
     On(Expr),
+    Using(Vec<String>),
+}
+
+impl fmt::Display for JoinConstraint {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            JoinConstraint::On(expr) => write!(f, "ON {expr}"),
+            JoinConstraint::Using(columns) => write!(f, "USING ({})", columns.join(", ")),
+        }
+    }
 }
 
 /// A compound operator connecting two SELECT arms.
@@ -787,25 +815,24 @@ impl fmt::Display for SelectStmt {
         }
 
         if let Some(from) = &self.from {
-            write!(f, " FROM {}", from.table)?;
+            write!(f, " FROM {}{}", group_starts(&self.joins), from.table)?;
             if let Some(alias) = &from.alias {
                 write!(f, " AS {alias}")?;
             }
         }
 
         for join in &self.joins {
-            match join.join_type {
-                JoinType::Inner => write!(f, " JOIN {}", join.table)?,
-                JoinType::Left => write!(f, " LEFT JOIN {}", join.table)?,
-                JoinType::Cross => write!(f, " CROSS JOIN {}", join.table)?,
-                JoinType::Natural => write!(f, " NATURAL JOIN {}", join.table)?,
+            if join.natural {
+                write!(f, " NATURAL")?;
             }
+            write!(f, " {} {}", join.join_type, join.table)?;
             if let Some(alias) = &join.alias {
                 write!(f, " AS {alias}")?;
             }
-            if let Some(JoinConstraint::On(expr)) = &join.constraint {
-                write!(f, " ON {expr}")?;
+            if let Some(constraint) = &join.constraint {
+                write!(f, " {constraint}")?;
             }
+            write_group_ends(f, join)?;
         }
 
         if let Some(where_clause) = &self.where_clause {
@@ -1048,7 +1075,7 @@ impl fmt::Display for UpdateStmt {
         }
 
         if let Some(from) = &self.from {
-            write!(f, " FROM {}", from.table)?;
+            write!(f, " FROM {}{}", group_starts(&self.joins), from.table)?;
             if let Some(alias) = &from.alias {
                 write!(f, " AS {alias}")?;
             }
@@ -1056,19 +1083,18 @@ impl fmt::Display for UpdateStmt {
         }
 
         for join in &self.joins {
-            match join.join_type {
-                JoinType::Inner => write!(f, " JOIN {}", join.table)?,
-                JoinType::Left => write!(f, " LEFT JOIN {}", join.table)?,
-                JoinType::Cross => write!(f, " CROSS JOIN {}", join.table)?,
-                JoinType::Natural => write!(f, " NATURAL JOIN {}", join.table)?,
+            if join.natural {
+                write!(f, " NATURAL")?;
             }
+            write!(f, " {} {}", join.join_type, join.table)?;
             if let Some(alias) = &join.alias {
                 write!(f, " AS {alias}")?;
             }
             write!(f, "{}", not_indexed(&join.table))?;
-            if let Some(JoinConstraint::On(expr)) = &join.constraint {
-                write!(f, " ON {expr}")?;
+            if let Some(constraint) = &join.constraint {
+                write!(f, " {constraint}")?;
             }
+            write_group_ends(f, join)?;
         }
 
         if let Some(where_clause) = &self.where_clause {
@@ -1087,6 +1113,21 @@ impl fmt::Display for UpdateStmt {
 
         Ok(())
     }
+}
+
+fn group_starts(joins: &[JoinClause]) -> String {
+    let group_count = joins.iter().map(|join| join.closed_groups.len()).sum();
+    "(".repeat(group_count)
+}
+
+fn write_group_ends(f: &mut fmt::Formatter<'_>, join: &JoinClause) -> fmt::Result {
+    for alias in &join.closed_groups {
+        write!(f, ")")?;
+        if let Some(alias) = alias {
+            write!(f, " AS {alias}")?;
+        }
+    }
+    Ok(())
 }
 
 /// A DELETE statement.
@@ -1503,7 +1544,7 @@ pub enum Expr {
     Parenthesized(Box<Expr>),
     /// ARRAY[expr, expr, ...] — array literal constructor
     ArrayLiteral(ArrayLiteralExpr),
-    /// expr[n] — array subscript
+    /// `expr[n]` — array subscript
     ArraySubscript(Box<ArraySubscriptExpr>),
     /// `func(args) OVER (PARTITION BY ... ORDER BY ...)`.
     WindowFunction(Box<WindowFunctionExpr>),
@@ -2263,7 +2304,7 @@ impl fmt::Display for ArrayLiteralExpr {
     }
 }
 
-/// An array subscript expression: expr[index]
+/// An array subscript expression: `expr[index]`
 #[derive(Debug, Clone)]
 pub struct ArraySubscriptExpr {
     pub array: Expr,
@@ -2381,12 +2422,14 @@ mod tests {
             }),
             joins: vec![JoinClause {
                 join_type: JoinType::Inner,
+                natural: false,
                 table: "orders".to_string(),
                 alias: Some("o".to_string()),
                 constraint: Some(JoinConstraint::On(Expr::ColumnRef(ColumnRef {
                     table: Some("u".to_string()),
                     column: "id".to_string(),
                 }))),
+                closed_groups: vec![],
             }],
             where_clause: None,
             group_by: None,
@@ -2399,6 +2442,48 @@ mod tests {
         assert_eq!(
             select.to_string(),
             "SELECT * FROM users AS u JOIN orders AS o ON u.id"
+        );
+    }
+
+    #[test]
+    fn select_displays_right_full_natural_and_using() {
+        let select = SelectStmt {
+            with_clause: None,
+            distinct: false,
+            columns: vec![],
+            from: Some(FromClause {
+                table: "a".to_string(),
+                alias: None,
+            }),
+            joins: vec![
+                JoinClause {
+                    join_type: JoinType::Right,
+                    natural: false,
+                    table: "b".to_string(),
+                    alias: None,
+                    constraint: Some(JoinConstraint::Using(vec!["x".to_string()])),
+                    closed_groups: vec![],
+                },
+                JoinClause {
+                    join_type: JoinType::Full,
+                    natural: true,
+                    table: "c".to_string(),
+                    alias: None,
+                    constraint: None,
+                    closed_groups: vec![],
+                },
+            ],
+            where_clause: None,
+            group_by: None,
+            compounds: vec![],
+            order_by: vec![],
+            limit: None,
+            offset: None,
+        };
+
+        assert_eq!(
+            select.to_string(),
+            "SELECT * FROM a RIGHT JOIN b USING (x) NATURAL FULL JOIN c"
         );
     }
 
@@ -2439,9 +2524,11 @@ mod tests {
             }),
             joins: vec![JoinClause {
                 join_type: JoinType::Inner,
+                natural: false,
                 table: "j".to_string(),
                 alias: None,
                 constraint: None,
+                closed_groups: vec![],
             }],
             where_clause: None,
             conflict: None,

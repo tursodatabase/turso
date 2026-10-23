@@ -1,0 +1,85 @@
+---
+source: joins.sqltest
+expression: |-
+  SELECT right_multi_left.a, right_multi_right.a,
+             right_multi_right.b, right_multi_right.c
+      FROM right_multi_left
+      RIGHT JOIN right_multi_right ON right_multi_left.a=right_multi_right.a
+      WHERE right_multi_right.b=5 OR right_multi_right.c=7;
+info:
+  statement_type: SELECT
+  tables:
+  - right_multi_left
+  - right_multi_left.a
+  - right_multi_right
+  setup_blocks:
+  - right_join_unmatched_multi_index_schema
+  database: ':memory:'
+---
+QUERY PLAN
+|--SCAN right_multi_left
+|--SCAN right_multi_right
+`--RIGHT-JOIN right_multi_right
+   `--MULTI-INDEX OR right_multi_right (right_multi_b, right_multi_c)
+
+BYTECODE
+addr  opcode           p1  p2  p3  p4          p5  comment
+   0  Init              0  53   0               0  Start at 53
+   1  OpenRead          0   2   0  k(2,B)       0  table=right_multi_left, root=2, iDb=0
+   2  OpenRead          1   3   0  k(4,B,B,B)   0  table=right_multi_right, root=3, iDb=0
+   3  OpenEphemeral     2   1   0               0  cursor=2 is_table=true
+   4  Null              0   2   0               0  r[2]=NULL
+   5  MakeRecord        2   1   3               0  r[3]=mkrec(r[2..2])
+   6  Rewind            0  22   0               0  Rewind table right_multi_left
+   7    Rewind          1  21   0               0  Rewind table right_multi_right
+   8      Column        0   0   4               0  r[4]=right_multi_left.a
+   9      Column        1   0   5               0  r[5]=right_multi_right.a
+  10      Ne            4   5  20  Binary       0  if r[4]!=r[5] goto 20
+  11      RowId         1   6   0               0  r[6]=right_multi_right.rowid
+  12      Insert        2   3   6               6  intkey=r[6] data=r[3]
+  13      Column        1   1   7               0  r[7]=right_multi_right.b
+  14      Eq            7   8  17  Binary       0  if r[7]==r[8] goto 17
+  15      Column        1   2   9               0  r[9]=right_multi_right.c
+  16      Ne            9  10  20  Binary       0  if r[9]!=r[10] goto 20
+  17      Column        0   0  11               0  r[11]=right_multi_left.a
+  18      ColumnRange   1   0  12  3            0  r[12..14]=right_multi_right.a..c
+  19      ResultRow    11   4   0               0  output=r[11..14]
+  20    Next            1   8   0               1
+  21  Next              0   7   0               1
+  22  NullRow           0   0   0               0  Set cursor 0 to a (pseudo) NULL row
+  23  OpenRead          3   3   0  k(4,B,B,B)   0  table=right_multi_right, root=3, iDb=0
+  24  OpenRead          4   4   0  k(2,B)       0  index=right_multi_b, root=4, iDb=0
+  25  OpenRead          5   5   0  k(2,B)       0  index=right_multi_c, root=5, iDb=0
+  26  Null              0  15   0               0  r[15]=NULL
+  27  Integer           5  17   0               0  r[17]=5
+  28  SeekGE            4  33  17               0  key=[17..17]
+  29    IdxGT           4  33  17               0  key=[17..17]
+  30    IdxRowId        4  16   0               0  r[16]=cursor 4.rowid
+  31    RowSetAdd      15  16   0               0
+  32  Next              4  29   0               0
+  33  Integer           7  18   0               0  r[18]=7
+  34  SeekGE            5  39  18               0  key=[18..18]
+  35    IdxGT           5  39  18               0  key=[18..18]
+  36    IdxRowId        5  16   0               0  r[16]=cursor 5.rowid
+  37    RowSetAdd      15  16   0               0
+  38  Next              5  35   0               0
+  39    RowSetRead     15  52  16               0
+  40    SeekRowid       3  16  39               0  if (r[16]!=cursor 3.rowid) goto 39
+  41    RowId           3  19   0               0  r[19]=right_multi_right.rowid
+  42    NotExists       2  44  19               0
+  43    Goto            0  51   0               0
+  44    Column          3   1  20               0  r[20]=right_multi_right.b
+  45    Eq             20  21  48  Binary       0  if r[20]==r[21] goto 48
+  46    Column          3   2  22               0  r[22]=right_multi_right.c
+  47    Ne             22  23  51  Binary       0  if r[22]!=r[23] goto 51
+  48    Column          0   0  25               0  r[25]=right_multi_left.a
+  49    ColumnRange     3   0  26  3            0  r[26..28]=right_multi_right.a..c
+  50    ResultRow      25   4   0               0  output=r[25..28]
+  51  Goto              0  39   0               0
+  52  Halt              0   0   0               0
+  53  Transaction       0   1   4               0  iDb=0 tx_mode=Read
+  54  Integer           5   8   0               0  r[8]=5
+  55  Integer           7  10   0               0  r[10]=7
+  56  Integer           5  21   0               0  r[21]=5
+  57  Integer           7  23   0               0  r[23]=7
+  58  Goto              0   1   0               0

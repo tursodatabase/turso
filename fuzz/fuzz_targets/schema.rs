@@ -4,6 +4,7 @@ use std::{error::Error, sync::Arc};
 
 use arbitrary::Arbitrary;
 use libfuzzer_sys::{fuzz_target, Corpus};
+use turso_core::ConnectOpts;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Id(String);
@@ -335,8 +336,12 @@ fn do_fuzz(Ops(ops): Ops) -> Result<Corpus, Box<dyn Error>> {
     let rusqlite_conn = rusqlite::Connection::open_in_memory()?;
 
     let io = Arc::new(turso_core::MemoryIO::new());
-    let db = turso_core::Database::open_file(io.clone(), ":memory:", false)?;
-    let limbo_conn = db.connect()?;
+    let db = turso_core::Database::open_file(
+        io.clone(),
+        ":memory:",
+        Arc::new(turso_core::SqliteDialect),
+    )?;
+    let limbo_conn = db.connect(ConnectOpts::new())?;
 
     for op in ops {
         let sql = op.to_string();

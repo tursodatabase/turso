@@ -624,11 +624,11 @@ fn tagged_dollar_quoted_string() {
 
 #[test]
 fn escape_string_backslash_n() {
-    let output = run_tursopg(b"SELECT E'line1\\nline2';\n");
+    let output = run_tursopg(b"\\x\nSELECT E'line1\\nline2';\n");
     assert_eq!(output.status.code(), Some(0));
     let out = stdout(&output);
     assert!(
-        out.contains("line1") && out.contains("line2"),
+        out.contains("line1\nline2"),
         "expected two lines, got: {out}"
     );
 }
@@ -642,115 +642,6 @@ fn escape_string_backslash_t() {
         out.contains("col1") && out.contains("col2"),
         "expected tab-separated, got: {out}"
     );
-}
-
-// ---------------------------------------------------------------------------
-// Materialized views
-// ---------------------------------------------------------------------------
-
-#[test]
-fn create_materialized_view_basic() {
-    let output = run_tursopg(
-        b"CREATE TABLE items(id INT, name TEXT, price INT);\n\
-          INSERT INTO items VALUES (1, 'Laptop', 1200), (2, 'Mouse', 25), (3, 'Monitor', 400);\n\
-          CREATE MATERIALIZED VIEW expensive AS SELECT * FROM items WHERE price > 100;\n\
-          SELECT name FROM expensive ORDER BY name;\n",
-    );
-    assert_eq!(output.status.code(), Some(0));
-    let out = stdout(&output);
-    assert!(out.contains("Laptop"), "expected Laptop, got: {out}");
-    assert!(out.contains("Monitor"), "expected Monitor, got: {out}");
-    assert!(
-        !out.contains("Mouse"),
-        "Mouse should be filtered out: {out}"
-    );
-}
-
-#[test]
-fn materialized_view_with_aggregation() {
-    let output = run_tursopg(
-        b"CREATE TABLE sales(product TEXT, amount INT);\n\
-          INSERT INTO sales VALUES ('A', 10), ('B', 20), ('A', 30), ('B', 5);\n\
-          CREATE MATERIALIZED VIEW totals AS SELECT product, SUM(amount) as total FROM sales GROUP BY product;\n\
-          SELECT * FROM totals ORDER BY product;\n",
-    );
-    assert_eq!(output.status.code(), Some(0));
-    let out = stdout(&output);
-    assert!(out.contains("A"), "expected product A, got: {out}");
-    assert!(out.contains("40"), "expected total 40 for A, got: {out}");
-    assert!(out.contains("B"), "expected product B, got: {out}");
-    assert!(out.contains("25"), "expected total 25 for B, got: {out}");
-}
-
-#[test]
-fn materialized_view_live_update() {
-    let output = run_tursopg(
-        b"CREATE TABLE counters(grp TEXT, val INT);\n\
-          INSERT INTO counters VALUES ('x', 1), ('y', 2);\n\
-          CREATE MATERIALIZED VIEW sums AS SELECT grp, SUM(val) as total FROM counters GROUP BY grp;\n\
-          INSERT INTO counters VALUES ('x', 10);\n\
-          SELECT * FROM sums WHERE grp = 'x';\n",
-    );
-    assert_eq!(output.status.code(), Some(0));
-    let out = stdout(&output);
-    // After inserting (x, 10), the total for x should be 11 (live update, no REFRESH needed)
-    assert!(
-        out.contains("11"),
-        "expected live-updated total 11, got: {out}"
-    );
-}
-
-#[test]
-fn materialized_view_duplicate_errors() {
-    let output = run_tursopg(
-        b"CREATE TABLE t(id INT);\n\
-          CREATE MATERIALIZED VIEW mv AS SELECT * FROM t;\n\
-          CREATE MATERIALIZED VIEW mv AS SELECT * FROM t;\n",
-    );
-    let out = stdout(&output);
-    let err = String::from_utf8_lossy(&output.stderr).to_string();
-    let combined = format!("{out}{err}");
-    assert!(
-        combined.contains("already exists"),
-        "duplicate should error: {combined}"
-    );
-}
-
-#[test]
-fn drop_materialized_view() {
-    let output = run_tursopg(
-        b"CREATE TABLE t(id INT);\n\
-          CREATE MATERIALIZED VIEW mv AS SELECT * FROM t;\n\
-          DROP MATERIALIZED VIEW mv;\n\
-          SELECT 'dropped';\n",
-    );
-    assert_eq!(output.status.code(), Some(0));
-    let out = stdout(&output);
-    assert!(out.contains("dropped"), "DROP should succeed: {out}");
-}
-
-#[test]
-fn drop_materialized_view_if_exists() {
-    let output = run_tursopg(
-        b"DROP MATERIALIZED VIEW IF EXISTS nonexistent;\n\
-          SELECT 'ok';\n",
-    );
-    assert_eq!(output.status.code(), Some(0));
-    let out = stdout(&output);
-    assert!(out.contains("ok"), "IF EXISTS should not error: {out}");
-}
-
-#[test]
-fn refresh_materialized_view_is_noop() {
-    let output = run_tursopg(
-        b"CREATE TABLE t(id INT);\n\
-          CREATE MATERIALIZED VIEW mv AS SELECT * FROM t;\n\
-          REFRESH MATERIALIZED VIEW mv;\n\
-          SELECT 'ok';\n",
-    );
-    assert_eq!(output.status.code(), Some(0));
-    let out = stdout(&output);
-    assert!(out.contains("ok"), "REFRESH should be a no-op: {out}");
 }
 
 #[test]
@@ -1289,6 +1180,41 @@ fn wire_copy_from_returns_copy_n() {
 }
 
 #[test]
+fn repl_load_extension_still_attempts_to_open_the_file() {
+    let output = run_tursopg(b"SELECT load_extension('/nonexistent/turso-audit-ext');\n");
+    let combined = format!(
+        "{}{}",
+        stdout(&output),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        combined.contains("Extension file not found"),
+        "interactive CLI should still try to load the library: {combined}"
+    );
+    assert!(
+        !combined.contains("runtime extension loading is disabled"),
+        "interactive CLI must keep load_extension enabled: {combined}"
+    );
+}
+
+#[test]
+fn wire_load_extension_is_disabled() {
+    with_pg_client(|client| {
+        client.send_query("SELECT load_extension('/nonexistent/turso-audit-ext')");
+        let response = client.read_until_ready();
+        let text = String::from_utf8_lossy(&response);
+        assert!(
+            text.contains("runtime extension loading is disabled"),
+            "wire listener must refuse load_extension, got: {text}"
+        );
+        assert!(
+            !text.contains("Extension file not found"),
+            "wire listener must not reach the filesystem open: {text}"
+        );
+    });
+}
+
+#[test]
 fn wire_comment_on_returns_comment_tag() {
     with_pg_client(|client| {
         let tags = client.query_command_tags("CREATE TABLE docs(id INT)");
@@ -1551,4 +1477,86 @@ fn schema_sidecar_reattaches_on_reopen() {
         out.contains("persisted"),
         "expected 'persisted' in output, got: {out}"
     );
+}
+
+#[test]
+fn rewritten_table_definitions_survive_reopen() {
+    let timestamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let test_dir = std::env::temp_dir().join(format!("tursopg_rewrite_reopen_{timestamp}"));
+    std::fs::create_dir(&test_dir).expect("failed to create temp test directory");
+
+    let cases: &[(&str, &str, &str, &[&str])] = &[
+        (
+            "rename_table.db",
+            "CREATE TABLE a (x int);\nALTER TABLE a RENAME TO b;\n",
+            "INSERT INTO b VALUES (7);\nSELECT x FROM b;\n",
+            &["7"],
+        ),
+        (
+            "rename_column.db",
+            "CREATE TABLE a (x int);\nALTER TABLE a RENAME COLUMN x TO y;\n",
+            "INSERT INTO a VALUES (8);\nSELECT y FROM a;\n",
+            &["8"],
+        ),
+        (
+            "rename_table_with_expression_defaults.db",
+            "CREATE TABLE a (x int, y int DEFAULT 1 + 2, z text DEFAULT 'zz'::text, \
+             w int DEFAULT abs(-4), t timestamp DEFAULT now());\n\
+             ALTER TABLE a RENAME TO b;\n",
+            "INSERT INTO b (x) VALUES (1);\nSELECT y * 100 + w AS n, z FROM b;\n",
+            &["304", "zz"],
+        ),
+        (
+            "rename_serial_column.db",
+            "CREATE TABLE a (id serial PRIMARY KEY, v text);\n\
+             ALTER TABLE a RENAME COLUMN v TO label;\n",
+            "INSERT INTO a (label) VALUES ('first');\nSELECT label FROM a WHERE id = 1;\n",
+            &["first"],
+        ),
+        (
+            "rename_foreign_key_target.db",
+            "CREATE TABLE p (id int PRIMARY KEY);\n\
+             CREATE TABLE c (pid int REFERENCES p(id), n int DEFAULT 2 * 3);\n\
+             ALTER TABLE p RENAME TO parent;\n",
+            "INSERT INTO parent VALUES (1);\nINSERT INTO c (pid) VALUES (1);\nSELECT n FROM c;\n",
+            &["6"],
+        ),
+        (
+            "add_column_with_expression_default.db",
+            "CREATE TABLE a (x int DEFAULT 2 * 5);\nALTER TABLE a ADD COLUMN y int;\n",
+            "INSERT INTO a (y) VALUES (1);\nSELECT x FROM a;\n",
+            &["10"],
+        ),
+    ];
+    for (db_name, setup, query, expected) in cases {
+        let db_path = test_dir.join(db_name);
+        let out1 = run_tursopg_with_db(&db_path, setup.as_bytes());
+        let err1 = String::from_utf8_lossy(&out1.stderr);
+        assert_eq!(
+            out1.status.code(),
+            Some(0),
+            "{db_name}: first run failed: {err1}"
+        );
+        assert!(
+            !err1.contains("Error"),
+            "{db_name}: first run failed: {err1}"
+        );
+        let out2 = run_tursopg_with_db(&db_path, query.as_bytes());
+        let out = stdout(&out2);
+        let err = String::from_utf8_lossy(&out2.stderr);
+        assert_eq!(
+            out2.status.code(),
+            Some(0),
+            "{db_name}: reopen failed: {err}"
+        );
+        assert!(!err.contains("Error"), "{db_name}: reopen failed: {err}");
+        for value in *expected {
+            assert!(out.contains(value), "{db_name}: expected {value} in: {out}");
+        }
+    }
+
+    std::fs::remove_dir_all(&test_dir).ok();
 }

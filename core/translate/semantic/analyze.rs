@@ -15,11 +15,12 @@ use super::{
     expr::{ExprPolicies, ExprPolicy, QueryFunctionState, RowValueChecks},
     hir::{
         BoundSchemaProgram, CatalogObjectId, ColumnReadExpression, ColumnRef, CompoundArm, Cte,
-        CteId, DatabaseId, Delete, DeleteTargetKind, Expr, FunctionEvaluation, HirDocument,
-        HirRoot, IndexCoverage, IndexHint, Insert, InsertTargetKind, Limit, OrderTerm, Output,
-        OutputId, OutputNameKind, OutputOwner, Query, QueryBlock, QueryBlockBody, QueryBlockId,
-        QueryId, QueryRoot, SchemaExpressionRoot, SchemaProgramId, Source, SourceColumn, SourceId,
-        SourceKind, SourceOwner, TriggerBody, TriggerCommand, TypeFact, Update, UpdateTargetKind,
+        CteId, DatabaseId, Delete, DeleteTargetKind, Expr, FunctionEvaluation, Grouping,
+        HirDocument, HirRoot, IndexCoverage, IndexHint, Insert, InsertTargetKind, Limit, OrderTerm,
+        Output, OutputId, OutputNameKind, OutputOwner, Query, QueryBlock, QueryBlockBody,
+        QueryBlockId, QueryId, QueryRoot, SchemaExpressionRoot, SchemaProgramId, Source,
+        SourceColumn, SourceId, SourceKind, SourceOwner, TriggerBody, TriggerCommand, TypeFact,
+        Update, UpdateTargetKind,
     },
     query::FromContext,
     scope::{ExpandedColumn, ExprCollation, ResolvedScopeExpr, Scope},
@@ -166,6 +167,15 @@ pub(super) struct Analyzer<'context, 'catalog, 'ast> {
     /// The source a `Register(n)` expression reads column `n` of, while
     /// expressions over register inputs are analyzed.
     pub(super) register_source: Option<SourceId>,
+    /// The database of the view whose body is being analyzed: its
+    /// unqualified names resolve there.
+    pub(super) view_database: Option<DatabaseId>,
+    /// The BINARY collation a column without a declared one compares with.
+    pub(super) binary_collation: super::hir::ResolvedCollation,
+    /// Set while a generated column's expression is analyzed: it uses the
+    /// standard operators even on custom-typed columns, so the values an
+    /// index on the column stores are the ones a read computes.
+    pub(super) standard_operators_only: bool,
     /// Stored view SELECTs live in the catalog and are analyzed like the
     /// statement's own AST, so the catalog must outlive the AST borrow.
     _catalog_outlives_ast: std::marker::PhantomData<&'ast &'catalog ()>,
@@ -225,7 +235,8 @@ struct CatalogIdentity {
 
 impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
     pub(super) fn new(context: &'context SemanticContext<'catalog>) -> Self {
-        Self {
+        let binary = crate::translate::collate::CollationSeq::Binary;
+        let mut analyzer = Self {
             context,
             queries: Vec::new(),
             sources: Vec::new(),
@@ -235,11 +246,23 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
             catalog_ids: HashMap::default(),
             cte_scopes: Vec::new(),
             views_in_progress: Vec::new(),
+            standard_operators_only: false,
             aggregate_counts: HashMap::default(),
             aggregate_hosts: Vec::new(),
             register_source: None,
+            view_database: None,
+            binary_collation: super::hir::CatalogObject::new(
+                CatalogObjectId::new(0),
+                context.snapshot(),
+                None,
+                Arc::new(binary),
+            ),
             _catalog_outlives_ast: std::marker::PhantomData,
-        }
+        };
+        let id = analyzer.catalog_object_id(None, CatalogObjectKind::Collation, binary.to_string());
+        analyzer.binary_collation =
+            super::hir::CatalogObject::new(id, context.snapshot(), None, Arc::new(binary));
+        analyzer
     }
 
     /// Analyze `expressions` over `inputs.len()` values that the consumer
@@ -304,11 +327,38 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
         self.context
     }
 
+    /// A scope that resolves names by this dialect's rules.
+    pub(super) fn new_scope(&self, outer: Option<Scope>) -> Scope {
+        Scope::new(outer).with_qualified_uses_nearest_table_only(
+            self.context().qualified_column_uses_nearest_table_only(),
+        )
+    }
+
     pub(super) fn allocate_aggregate(&mut self, block: QueryBlockId) -> super::hir::AggregateId {
         let count = self.aggregate_counts.entry(block).or_default();
         let id = super::hir::AggregateId::new(block, *count);
         *count += 1;
         id
+    }
+
+    /// [`SemanticContext::resolve_table`] as the view being analyzed sees
+    /// names, if any.
+    pub(super) fn resolve_table_in_scope(
+        &self,
+        name: &ast::QualifiedName,
+    ) -> Result<(DatabaseId, Arc<crate::schema::Table>)> {
+        self.context().resolve_table_in(name, self.view_database)
+    }
+
+    pub(super) fn table_exists_in_scope(&self, name: &ast::QualifiedName) -> Result<bool> {
+        self.context().table_exists_in(name, self.view_database)
+    }
+
+    pub(super) fn resolve_view_in_scope(
+        &self,
+        name: &ast::QualifiedName,
+    ) -> Result<Option<(DatabaseId, &'catalog crate::schema::View)>> {
+        self.context().resolve_view_in(name, self.view_database)
     }
 
     pub(super) fn aggregate_count(&self, block: QueryBlockId) -> usize {
@@ -359,6 +409,15 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
 
     pub(super) fn source(&self, id: SourceId) -> Option<&Source> {
         self.sources.get(id.index())?.as_ref()
+    }
+
+    pub(super) fn source_count(&self) -> usize {
+        self.sources.len()
+    }
+
+    /// The sources added since there were `first` of them.
+    pub(super) fn sources_from(&self, first: usize) -> impl Iterator<Item = &Source> {
+        self.sources[first..].iter().flatten()
     }
 
     pub(super) fn source_mut(&mut self, id: SourceId) -> Option<&mut Source> {
@@ -422,6 +481,16 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
             )));
         }
         Self::insert_reserved(&mut self.queries, id.index(), query, "query")
+    }
+
+    /// The queries analyzed so far whose lexical parent is `parent`.
+    pub(super) fn queries_with_parent(&self, parent: QueryId) -> Vec<QueryId> {
+        self.queries
+            .iter()
+            .flatten()
+            .filter(|query| query.parent == Some(parent))
+            .map(|query| query.id)
+            .collect()
     }
 
     pub(super) fn query(&self, id: QueryId) -> Option<&Query> {
@@ -585,12 +654,15 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
             }
         }
         let mut finished = HashSet::default();
+        // A column's generated or default expression names columns of its
+        // own table, so every column of one source shares one scope.
+        let mut scopes: HashMap<SourceId, Scope> = HashMap::default();
 
         while let Some(reference) = pending.pop() {
             if !finished.insert(reference) {
                 continue;
             }
-            let (scope, generated_syntax, default_syntax) = {
+            let (generated_syntax, default_syntax) = {
                 let source = self.source(reference.source).ok_or_else(|| {
                     LimboError::InternalError(format!(
                         "missing source {} while planning stored column expressions",
@@ -648,19 +720,31 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
                     ),
                     ColumnReadExpression::Absent | ColumnReadExpression::Planned(_) => None,
                 };
-                let mut scope = Scope::default();
-                scope.add_schema_source(source);
-                (scope, generated_syntax, default_syntax)
+                if generated_syntax.is_none() && default_syntax.is_none() {
+                    continue;
+                }
+                scopes.entry(reference.source).or_insert_with(|| {
+                    let mut scope = Scope::default();
+                    scope.add_schema_source(source);
+                    scope
+                });
+                (generated_syntax, default_syntax)
             };
+            let scope = &scopes[&reference.source];
 
             let policy = ExprPolicy::schema_expression().with_self_source(reference.source);
             let generated = generated_syntax
                 .as_ref()
-                .map(|syntax| self.analyze_expr(syntax, &scope, policy))
+                .map(|syntax| {
+                    let was_standard = std::mem::replace(&mut self.standard_operators_only, true);
+                    let generated = self.analyze_expr(syntax, scope, policy);
+                    self.standard_operators_only = was_standard;
+                    generated
+                })
                 .transpose()?;
             let default = default_syntax
                 .as_ref()
-                .map(|syntax| self.analyze_expr(syntax, &scope, policy))
+                .map(|syntax| self.analyze_expr(syntax, scope, policy))
                 .transpose()?;
 
             for expression in generated.iter().chain(default.iter()) {
@@ -949,7 +1033,7 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
                     expected_outputs,
                     policies,
                 )
-                .map(|block| (block, Vec::new(), Scope::new(outer_scope.cloned())))
+                .map(|block| (block, Vec::new(), self.new_scope(outer_scope.cloned())))
             }
         }
     }
@@ -991,7 +1075,7 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
                 )?;
                 (Some(from), scope)
             }
-            None => (None, Scope::new(outer_scope.cloned())),
+            None => (None, self.new_scope(outer_scope.cloned())),
         };
         let mut functions = QueryFunctionState::new(block_id);
         self.analyze_named_windows(window_clause, &mut functions)?;
@@ -1018,7 +1102,7 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
             }
             None => None,
         };
-        let grouping = group_by
+        let mut grouping = group_by
             .map(|group_by| {
                 self.analyze_grouping(
                     group_by,
@@ -1030,6 +1114,19 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
                 )
             })
             .transpose()?;
+        // A HAVING term that reads only GROUP BY keys and constants decides
+        // the same for every row of a group, so it runs as a WHERE term and
+        // the rows of the groups it drops are never aggregated, as in
+        // SQLite's havingToWhere(). Aggregate errors of those groups never
+        // happen.
+        let filter = match grouping.as_mut() {
+            Some(grouping) => move_having_terms_to_where(grouping, &outputs, filter),
+            None => filter,
+        };
+        let mut from = from;
+        if let (Some(from), Some(filter)) = (from.as_mut(), filter.as_ref()) {
+            self.reduce_full_joins_rejected_by_where(from, filter);
+        }
         let aggregate_query = grouping.is_some() || self.aggregate_count(functions.block()) > 0;
         // An aggregate that appears only in ORDER BY is a misuse when the
         // block reads a FROM clause; without one it makes the block an
@@ -1100,7 +1197,7 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
         policies: ExprPolicies,
     ) -> Result<QueryBlock> {
         let block = QueryBlockId::new(query, index);
-        let scope = Scope::new(outer_scope.cloned());
+        let scope = self.new_scope(outer_scope.cloned());
         let policy = policies.select();
         let mut functions = QueryFunctionState::new(block);
         let mut resolved_rows = Vec::with_capacity(rows.len());
@@ -1167,7 +1264,7 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
         scope: &Scope,
         outputs: &[Output],
         block: QueryBlockId,
-        functions: &mut QueryFunctionState,
+        functions: &mut QueryFunctionState<'ast>,
         policies: ExprPolicies,
     ) -> Result<super::hir::Grouping> {
         let mut grouping_scope = scope.clone().without_outer_resolution();
@@ -1229,12 +1326,21 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
         block: QueryBlockId,
         aggregate_query: bool,
         dropped: DroppedOrderTerms,
-        functions: &mut QueryFunctionState,
+        functions: &mut QueryFunctionState<'ast>,
         policies: ExprPolicies,
     ) -> Result<Vec<OrderTerm>> {
         let mut order_scope = scope.clone();
         order_scope.set_outputs(outputs);
         let mut terms: Vec<OrderTerm> = Vec::with_capacity(syntax.len());
+        // SQLite drops the terms after the rowid before it looks for
+        // aggregates, so an aggregate in one is not a misuse, unless a
+        // dropped term has a window function: SQLite moves window functions
+        // out of the ORDER BY first, and that pass finds the aggregates.
+        let cut_terms_have_window = matches!(dropped, DroppedOrderTerms::AfterRowidOf(_))
+            && syntax
+                .iter()
+                .skip(1)
+                .any(|term| window_calls(&term.expr).is_ok_and(|calls| !calls.is_empty()));
         for syntax in syntax {
             let checks = match dropped {
                 DroppedOrderTerms::None => RowValueChecks::All,
@@ -1269,7 +1375,7 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
                             &order_scope,
                             policies
                                 .with_row_value_checks(checks)
-                                .order_by(aggregate_query),
+                                .order_by(aggregate_query || !cut_terms_have_window),
                             functions,
                         )
                         .and_then(|resolved| {
@@ -1538,7 +1644,7 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
         block: QueryBlockId,
         columns: &'ast [ast::ResultColumn],
         scope: &Scope,
-        functions: &mut QueryFunctionState,
+        functions: &mut QueryFunctionState<'ast>,
         expected_outputs: Option<&[Option<Arc<TypeDef>>]>,
         policies: ExprPolicies,
     ) -> Result<Vec<Output>> {
@@ -1608,7 +1714,7 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
         index: usize,
         column: &'ast ast::ResultColumn,
         scope: &Scope,
-        functions: &mut QueryFunctionState,
+        functions: &mut QueryFunctionState<'ast>,
         expected_type: Option<Arc<TypeDef>>,
         policies: ExprPolicies,
     ) -> Result<Output> {
@@ -1715,6 +1821,125 @@ fn reject_clause_alias_functions(
         });
     });
     error.map_or(Ok(()), Err)
+}
+
+/// Move the conjuncts of `grouping.having` that read only GROUP BY keys and
+/// constants into `filter`, returning the new filter. As in SQLite, a term
+/// that is literally false stays in HAVING, and a HAVING without GROUP BY
+/// keys is left alone.
+fn move_having_terms_to_where(
+    grouping: &mut Grouping,
+    outputs: &[Output],
+    filter: Option<Expr>,
+) -> Option<Expr> {
+    if grouping.keys.is_empty() {
+        return filter;
+    }
+    let Some(having) = grouping.having.take() else {
+        return filter;
+    };
+    let mut conjuncts = Vec::new();
+    collect_conjuncts(having, &mut conjuncts);
+    let (moved, kept): (Vec<Expr>, Vec<Expr>) = conjuncts.into_iter().partition(|term| {
+        !is_literal_false(term) && reads_only_group_keys(term, grouping, outputs)
+    });
+    grouping.having = kept.into_iter().reduce(and_exprs);
+    moved.into_iter().fold(filter, |filter, term| {
+        Some(match filter {
+            Some(filter) => and_exprs(filter, term),
+            None => term,
+        })
+    })
+}
+
+fn collect_conjuncts(expression: Expr, conjuncts: &mut Vec<Expr>) {
+    match expression {
+        Expr::Binary {
+            lhs,
+            operator: ast::Operator::And,
+            rhs,
+            custom: None,
+            ..
+        } => {
+            collect_conjuncts(*lhs, conjuncts);
+            collect_conjuncts(*rhs, conjuncts);
+        }
+        expression => conjuncts.push(expression),
+    }
+}
+
+fn and_exprs(lhs: Expr, rhs: Expr) -> Expr {
+    Expr::Binary {
+        lhs: Box::new(lhs),
+        operator: ast::Operator::And,
+        rhs: Box::new(rhs),
+        array_concat: false,
+        custom: None,
+        comparison: None,
+    }
+}
+
+/// The terms SQLite keeps in HAVING as always false: `0`, `FALSE` and
+/// `x IN ()`.
+fn is_literal_false(expression: &Expr) -> bool {
+    match expression {
+        Expr::Literal(ast::Literal::Numeric(text)) => {
+            match text.strip_prefix("0x").or_else(|| text.strip_prefix("0X")) {
+                Some(digits) => u64::from_str_radix(digits, 16) == Ok(0),
+                None => text.parse::<i64>() == Ok(0),
+            }
+        }
+        Expr::Literal(ast::Literal::False) => true,
+        Expr::InList {
+            values,
+            negated: false,
+            ..
+        } => values.is_empty(),
+        _ => false,
+    }
+}
+
+/// Whether every value `term` reads is a GROUP BY key, an alias of one, or
+/// a constant: no other column, aggregate, window or subquery. A key counts
+/// only when it groups with BINARY collation: rows another collation puts
+/// in one group can differ under BINARY, so a term over such a key does not
+/// decide the same for every row of the group.
+fn reads_only_group_keys(term: &Expr, grouping: &Grouping, outputs: &[Output]) -> bool {
+    fn is_binary_key(grouping: &Grouping, expression: &Expr) -> bool {
+        grouping.keys.iter().enumerate().any(|(index, key)| {
+            key.equivalent(expression)
+                && grouping.key_collations[index]
+                    .as_ref()
+                    .is_none_or(|collation| {
+                        matches!(
+                            collation.value(),
+                            crate::translate::collate::CollationSeq::Binary
+                        )
+                    })
+        })
+    }
+    fn check(expression: &Expr, grouping: &Grouping, outputs: &[Output]) -> bool {
+        expression.fold(&mut |expression, children: &[bool]| {
+            if is_binary_key(grouping, expression) {
+                return true;
+            }
+            match expression {
+                Expr::Output(id) => outputs
+                    .iter()
+                    .find(|output| output.id == *id)
+                    .is_some_and(|output| check(&output.expr, grouping, outputs)),
+                Expr::Column(_) | Expr::RowId(_) | Expr::MergedColumn(_) | Expr::Subquery(_) => {
+                    false
+                }
+                Expr::Function(call) => {
+                    matches!(call.evaluation, FunctionEvaluation::Scalar)
+                        && children.iter().all(|child| *child)
+                }
+                _ => children.iter().all(|child| *child),
+            }
+        })
+    }
+    check(term, grouping, outputs)
 }
 
 fn reject_aliased_aggregates(having: &Expr, block: QueryBlockId, outputs: &[Output]) -> Result<()> {
@@ -3357,10 +3582,7 @@ mod tests {
              JOIN (SELECT outer_items.id AS captured) AS derived",
         )
         .expect_err("FROM subquery cannot capture the outer source scope");
-        assert_eq!(
-            error.to_string(),
-            "Parse error: no such column: outer_items.id"
-        );
+        assert_eq!(error.to_string(), "Parse error: no such table: outer_items");
     }
 
     #[test]
@@ -5071,10 +5293,7 @@ mod tests {
              ) FROM items AS outer_items",
         )
         .expect_err("CTE cannot see sibling sources from its owning SELECT");
-        assert_eq!(
-            error.to_string(),
-            "Parse error: no such column: local_items.id"
-        );
+        assert_eq!(error.to_string(), "Parse error: no such table: local_items");
     }
 
     #[test]
@@ -5348,7 +5567,7 @@ mod tests {
         let schema = schema_with_join_tables();
         let document = analyze_sql_with_schema(
             &schema,
-            "SELECT grouped.id, grouped.value, grouped.label, grouped.* \
+            "SELECT grouped.id, grouped.value, grouped.label, items.value \
              FROM (items JOIN categories USING (id)) AS grouped",
         )
         .expect("aliased FROM group binds");
@@ -5368,8 +5587,27 @@ mod tests {
         assert_eq!(group_source.alias.as_deref(), Some("grouped"));
         assert_eq!(group.columns.len(), group_source.columns.len());
         assert_eq!(group.from.joins.len(), 1);
+        // The one value of the USING column comes first, then each
+        // source's columns and implicit rowid, as SQLite lists them.
         assert!(matches!(group.columns[0], Expr::MergedColumn(_)));
-        assert_eq!(block.outputs.len(), 7);
+        assert_eq!(
+            group_source
+                .columns
+                .iter()
+                .map(|column| column.name.as_str())
+                .collect::<Vec<_>>(),
+            [
+                "id",
+                "id:1",
+                "value",
+                "score",
+                "_ROWID_",
+                "id:2",
+                "label",
+                "_ROWID_:1"
+            ]
+        );
+        assert_eq!(block.outputs.len(), 4);
         assert!(matches!(block.outputs[0].expr, Expr::MergedColumn(_)));
         for output in &block.outputs {
             output.expr.for_each(&mut |expression| {
@@ -5380,15 +5618,14 @@ mod tests {
             });
         }
 
+        // The sources inside the group keep their names for qualified
+        // lookup; the group's alias does not qualify `*`.
         let error = analyze_sql_with_schema(
             &schema,
-            "SELECT items.value FROM (items JOIN categories USING (id)) AS grouped",
+            "SELECT grouped.* FROM (items JOIN categories USING (id)) AS grouped",
         )
-        .expect_err("group alias hides inner table qualifiers");
-        assert_eq!(
-            error.to_string(),
-            "Parse error: no such column: items.value"
-        );
+        .expect_err("a group alias does not qualify a star");
+        assert_eq!(error.to_string(), "Parse error: no such table: grouped");
     }
 
     #[test]
@@ -5408,13 +5645,16 @@ mod tests {
             panic!("SELECT produces query root");
         };
         let block = &document.query(root.query).expect("query exists").blocks[0];
-        let group_id = block.from.as_ref().expect("query has FROM").first;
-        let group_source = document.source(group_id).expect("group source exists");
-        let SourceKind::FromGroup(group) = &group_source.kind else {
-            panic!("parenthesized FROM becomes a group source");
-        };
-        let items = group.from.first;
-        let categories = group.from.joins[0].right;
+        // A group without an alias at the start of the FROM clause is the
+        // clause itself, as SQLite's parser reads it.
+        let from = block.from.as_ref().expect("query has FROM");
+        let items = from.first;
+        assert_eq!(from.joins.len(), 1);
+        let categories = from.joins[0].right;
+        assert!(matches!(
+            document.source(items).expect("items exists").kind,
+            SourceKind::Table(_)
+        ));
         assert!(matches!(
             block.outputs[0].expr,
             Expr::Column(reference) if reference.source == items && reference.column == 1
@@ -5424,7 +5664,6 @@ mod tests {
             Expr::Column(reference) if reference.source == categories && reference.column == 1
         ));
         assert!(matches!(block.outputs[2].expr, Expr::MergedColumn(_)));
-        assert!(matches!(group.columns[0], Expr::MergedColumn(_)));
     }
 
     #[test]
@@ -5524,11 +5763,18 @@ mod tests {
             };
             assert_eq!(table.value().get_name(), "json_each");
             assert_eq!(argument_predicates.len(), 1);
+            // SQLite wraps every table-function argument in unary plus so the
+            // argument keeps its written value and the planner never folds the
+            // predicate into an index lookup on the outer table.
             assert!(matches!(
                 &argument_predicates[0],
                 Expr::Binary { lhs, operator: ast::Operator::Equals, rhs, comparison: Some(_), .. }
                     if matches!(lhs.as_ref(), Expr::Column(reference) if reference.source == function_id)
-                        && matches!(rhs.as_ref(), Expr::Column(reference) if reference.source == items_id && reference.column == 1)
+                        && matches!(
+                            rhs.as_ref(),
+                            Expr::Unary { operator: ast::UnaryOperator::Positive, expr }
+                                if matches!(expr.as_ref(), Expr::Column(reference) if reference.source == items_id && reference.column == 1)
+                        )
             ));
         }
     }
@@ -5536,6 +5782,9 @@ mod tests {
     #[cfg(feature = "json")]
     #[test]
     fn null_table_function_arguments_become_hidden_column_is_null_predicates() {
+        // SQLite passes a NULL table-function argument as `hidden = +NULL`, so
+        // the argument reaches the virtual table as a NULL constraint value
+        // instead of becoming an IS NULL filter on the hidden column.
         let schema = schema_with_items();
         let document = analyze_sql_with_schema(&schema, "SELECT value FROM json_each(NULL)")
             .expect("NULL table-function argument binds");
@@ -5557,8 +5806,13 @@ mod tests {
         };
         assert!(matches!(
             argument_predicates.as_slice(),
-            [Expr::IsNull(expression)]
-                if matches!(expression.as_ref(), Expr::Column(reference) if reference.source == source)
+            [Expr::Binary { lhs, operator: ast::Operator::Equals, rhs, comparison: Some(_), .. }]
+                if matches!(lhs.as_ref(), Expr::Column(reference) if reference.source == source)
+                    && matches!(
+                        rhs.as_ref(),
+                        Expr::Unary { operator: ast::UnaryOperator::Positive, expr }
+                            if matches!(expr.as_ref(), Expr::Literal(ast::Literal::Null))
+                    )
         ));
 
         let query = root.query;
@@ -5584,14 +5838,14 @@ mod tests {
         else {
             panic!("table function uses virtual-table access");
         };
-        assert!(operation.arguments.is_empty());
+        assert!(matches!(
+            operation.arguments.as_slice(),
+            [Expr::Unary { operator: ast::UnaryOperator::Positive, expr }]
+                if matches!(expr.as_ref(), Expr::Literal(ast::Literal::Null))
+        ));
         assert!(matches!(
             block.predicates.as_slice(),
-            [crate::translate::plan::HirWhereTerm {
-                expr: Expr::IsNull(_),
-                consumed: false,
-                ..
-            }]
+            [crate::translate::plan::HirWhereTerm { consumed: true, .. }]
         ));
     }
 
@@ -5629,7 +5883,8 @@ mod tests {
         };
         assert!(matches!(
             operation.arguments.as_slice(),
-            [Expr::Literal(ast::Literal::String(_))]
+            [Expr::Unary { operator: ast::UnaryOperator::Positive, expr }]
+                if matches!(expr.as_ref(), Expr::Literal(ast::Literal::String(_)))
         ));
         assert!(block.predicates[0].consumed);
     }
@@ -5680,7 +5935,11 @@ mod tests {
         assert!(matches!(
             argument_predicates.as_slice(),
             [Expr::Binary { rhs, comparison: Some(_), .. }]
-                if matches!(rhs.as_ref(), Expr::Column(reference) if reference.source == outer_source && reference.column == 1)
+                if matches!(
+                    rhs.as_ref(),
+                    Expr::Unary { operator: ast::UnaryOperator::Positive, expr }
+                        if matches!(expr.as_ref(), Expr::Column(reference) if reference.source == outer_source && reference.column == 1)
+                )
         ));
     }
 
@@ -5850,14 +6109,22 @@ mod tests {
             "Parse error: a NATURAL join may not have an ON or USING clause"
         );
 
-        let ambiguous = analyze_sql_with_schema(
+        // Without a RIGHT or FULL JOIN, SQLite compares the first copy of a
+        // name repeated on the left; with one, a second unmerged copy is an
+        // error.
+        analyze_sql_with_schema(
             &schema,
             "SELECT * FROM items JOIN categories ON TRUE NATURAL JOIN extras",
         )
-        .expect_err("NATURAL common name must be unique on the left");
+        .expect("NATURAL compares the first left copy");
+        let ambiguous = analyze_sql_with_schema(
+            &schema,
+            "SELECT * FROM items JOIN categories ON TRUE NATURAL RIGHT JOIN extras",
+        )
+        .expect_err("a RIGHT JOIN makes the second unmerged copy an error");
         assert_eq!(
             ambiguous.to_string(),
-            "Parse error: ambiguous column name: id"
+            "Parse error: ambiguous reference to id in USING()"
         );
     }
 
@@ -5916,10 +6183,12 @@ mod tests {
                     assert!(column.collation.is_none());
                 }
                 MergedColumnValue::Coalesce => {
+                    // The merged column of a FULL JOIN keeps the left
+                    // column's affinity and collation, but no declared type.
                     assert!(column.type_fact.storage.is_none());
-                    assert_eq!(column.affinity, crate::vdbe::affinity::Affinity::Blob);
-                    assert!(!column.has_affinity);
-                    assert!(column.collation.is_none());
+                    assert_eq!(column.affinity, crate::vdbe::affinity::Affinity::Text);
+                    assert!(column.has_affinity);
+                    assert!(column.collation.is_some());
                 }
             }
         }
@@ -5945,19 +6214,17 @@ mod tests {
     }
 
     #[test]
-    fn right_join_after_another_join_keeps_existing_error() {
+    fn right_join_after_another_join_is_analyzed() {
         let schema = schema_with_join_tables();
-        let error = analyze_sql_with_schema(
+        let document = analyze_sql_with_schema(
             &schema,
             "SELECT * FROM items JOIN categories ON TRUE \
              RIGHT JOIN extras ON TRUE",
         )
-        .expect_err("chained RIGHT JOIN remains unsupported");
-        assert_eq!(
-            error.to_string(),
-            "Parse error: RIGHT JOIN following another join is not yet supported. \
-             Try rewriting as LEFT JOIN or using a subquery."
-        );
+        .expect("a RIGHT JOIN may follow another join");
+        document
+            .validate()
+            .expect("a chained RIGHT JOIN produces closed HIR");
     }
 
     #[test]
@@ -7359,7 +7626,7 @@ mod tests {
         for (sql, expected) in [
             (
                 "INSERT INTO guarded(id) VALUES ((SELECT guarded.id))",
-                "Parse error: no such column: guarded.id",
+                "Parse error: no such table: guarded",
             ),
             (
                 "INSERT INTO guarded(id) VALUES ((SELECT 1, 2))",
@@ -9639,11 +9906,12 @@ mod tests {
 
     #[test]
     fn scalar_function_modifiers_follow_production_normalization() {
+        // SQLite drops DISTINCT on a scalar call and accepts `random(*)`, but
+        // rejects FILTER on a non-aggregate function.
         let schema = schema_with_items();
         let document = analyze_sql_with_schema(
             &schema,
             "SELECT length(DISTINCT value), \
-                    length(value) FILTER (WHERE id > 0), \
                     random(*) \
              FROM items",
         )
@@ -9657,7 +9925,7 @@ mod tests {
         };
         let block = &document.query(root.query).expect("query exists").blocks[0];
         assert_eq!(block.aggregate_count, 0);
-        for output in &block.outputs[..2] {
+        for output in &block.outputs[..1] {
             let Expr::Function(call) = &output.expr else {
                 panic!("scalar output becomes a function call");
             };
@@ -9672,7 +9940,7 @@ mod tests {
                 } if values.len() == 1 && order_by.is_empty()
             ));
         }
-        let Expr::Function(random) = &block.outputs[2].expr else {
+        let Expr::Function(random) = &block.outputs[1].expr else {
             panic!("random(*) becomes a function call");
         };
         assert!(matches!(
@@ -9695,31 +9963,23 @@ mod tests {
                 "Parse error: wrong number of arguments to function length()",
             ),
             (
+                "SELECT length(value) FILTER (WHERE id > 0) FROM items",
+                "Parse error: FILTER may not be used with non-aggregate length()",
+            ),
+            // The filter expression binds before the call it belongs to, so
+            // an unknown column in it reports first.
+            (
                 "SELECT length(value) FILTER (WHERE missing > 0) FROM items",
                 "Parse error: no such column: missing",
+            ),
+            (
+                "SELECT length(value) FILTER (WHERE sum(id) > 0) FROM items",
+                "Parse error: FILTER may not be used with non-aggregate length()",
             ),
         ] {
             let error = analyze_sql_with_schema(&schema, sql).expect_err("invalid call fails");
             assert_eq!(error.to_string(), expected, "{sql}");
         }
-
-        let document = analyze_sql_with_schema(
-            &schema,
-            "SELECT length(value) FILTER (WHERE sum(id) > 0) FROM items",
-        )
-        .expect("ignored scalar filter still binds its expression");
-        document
-            .validate()
-            .expect("ignored scalar filter leaves a closed document");
-        let HirRoot::Query(root) = &document.root else {
-            panic!("SELECT produces query root");
-        };
-        let block = &document.query(root.query).expect("query exists").blocks[0];
-        assert_eq!(block.aggregate_count, 1);
-        assert!(matches!(
-            block.outputs[0].expr,
-            Expr::Function(ref call) if matches!(call.evaluation, FunctionEvaluation::Scalar)
-        ));
     }
 
     #[cfg(feature = "json")]
@@ -11150,21 +11410,33 @@ mod tests {
             .iter()
             .all(|trigger| trigger.database() == Some(DatabaseId::new(MAIN_DB_ID))));
 
-        let rowid = analyze_sql_with_schema(&schema, "UPDATE writable SET rowid = 9")
-            .expect("rowid-alias UPDATE binds matching triggers");
-        let HirRoot::Update(update) = &rowid.root else {
-            panic!("UPDATE produces UPDATE root");
-        };
-        let hir::UpdateTargetKind::BTree { triggers, .. } = &update.target_kind else {
-            panic!("catalog table UPDATE has B-tree metadata");
-        };
-        assert_eq!(
-            triggers
-                .iter()
-                .map(|trigger| trigger.value().name.as_str())
-                .collect::<Vec<_>>(),
-            ["update_id", "update_all"]
-        );
+        // SQLite matches UPDATE OF column lists against the SET names as
+        // written, so `SET rowid` does not fire a trigger on the alias column
+        // `id`, while `SET id` does.
+        for (sql, expected) in [
+            ("UPDATE writable SET rowid = 9", vec!["update_all"]),
+            (
+                "UPDATE writable SET id = 9",
+                vec!["update_id", "update_all"],
+            ),
+        ] {
+            let update = analyze_sql_with_schema(&schema, sql)
+                .expect("rowid-alias UPDATE binds matching triggers");
+            let HirRoot::Update(update) = &update.root else {
+                panic!("UPDATE produces UPDATE root");
+            };
+            let hir::UpdateTargetKind::BTree { triggers, .. } = &update.target_kind else {
+                panic!("catalog table UPDATE has B-tree metadata");
+            };
+            assert_eq!(
+                triggers
+                    .iter()
+                    .map(|trigger| trigger.value().name.as_str())
+                    .collect::<Vec<_>>(),
+                expected,
+                "{sql}"
+            );
+        }
     }
 
     #[test]

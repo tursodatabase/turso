@@ -631,13 +631,13 @@ impl<'document> HirValidator<'document> {
                 ));
             }
         };
-        let updated_columns = assignments
+        // Like SQLite, an `UPDATE OF` trigger matches the SET column names
+        // as written: `SET rowid = 1` fires a trigger on `rowid`, not one on
+        // the INTEGER PRIMARY KEY column.
+        let updated_names = assignments
             .iter()
-            .flat_map(|assignment| assignment.columns.iter())
-            .filter_map(|column| match column {
-                TargetColumn::Column(position) => Some(*position),
-                TargetColumn::RowId => None,
-            })
+            .flat_map(|assignment| assignment.names.iter())
+            .map(|name| crate::util::normalize_ident(name))
             .collect::<HashSet<_>>();
         let mut identities = HashSet::with_capacity(triggers.len());
         for trigger in triggers {
@@ -679,10 +679,7 @@ impl<'document> HirValidator<'document> {
                     turso_parser::ast::TriggerEvent::UpdateOf(columns),
                     turso_parser::ast::TriggerEvent::Update,
                 ) => columns.iter().any(|column| {
-                    target_table
-                        .value()
-                        .get_column_by_name(&crate::util::normalize_ident(column.as_str()))
-                        .is_some_and(|(position, _)| updated_columns.contains(&position))
+                    updated_names.contains(&crate::util::normalize_ident(column.as_str()))
                 }),
                 _ => false,
             };
@@ -2343,7 +2340,8 @@ impl<'document> HirValidator<'document> {
     }
 
     /// The change capture table of a DML target: a table of the main
-    /// database other than the target itself.
+    /// database, other than the target itself when the target's rows are
+    /// captured.
     fn validate_capture_changes(
         &self,
         target_table: &ResolvedTable,
@@ -2359,7 +2357,7 @@ impl<'document> HirValidator<'document> {
             "change capture table is not a table of the main database",
         )?;
         self.require(
-            capture_changes.table != *target_table,
+            !capture_changes.target_rows || capture_changes.table != *target_table,
             "a DML target captures its own changes",
         )?;
         if let Some(sequence) = &capture_changes.change_ids {
@@ -2768,7 +2766,7 @@ mod tests {
                 Arc::new(crate::schema::Table::RecursiveCteInput(Arc::new(
                     crate::schema::RecursiveCteInput {
                         name: name.to_string(),
-                        columns: Vec::new(),
+                        columns: crate::alloc::vec![],
                     },
                 ))),
             )

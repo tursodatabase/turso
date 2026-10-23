@@ -1,0 +1,927 @@
+# PostgreSQL catalog views queried through the PostgreSQL frontend.
+
+@database :memory:
+
+test pg-collation-pgdump-columns {
+    SELECT tableoid, oid, collname, collnamespace, collowner, collencoding
+    FROM pg_catalog.pg_collation
+    WHERE oid >= 16384;
+}
+expect {}
+
+setup indexed_tables {
+    CREATE TABLE items (id int, name text, price int);
+    CREATE INDEX items_name_idx ON items (name);
+    CREATE UNIQUE INDEX items_price_idx ON items (price);
+    CREATE TABLE orders (id int, item_id int);
+    CREATE INDEX orders_item_idx ON orders (item_id);
+}
+
+@setup indexed_tables
+test pg-indexes-lists-user-indexes {
+    SELECT schemaname, tablename, indexname
+    FROM pg_indexes
+    WHERE schemaname = 'public'
+    ORDER BY indexname;
+}
+expect {
+    public|items|items_name_idx
+    public|items|items_price_idx
+    public|orders|orders_item_idx
+}
+
+@setup indexed_tables
+test pg-indexes-join-pg-namespace {
+    SELECT tablename, indexname
+    FROM pg_indexes
+    JOIN pg_namespace ON (schemaname = nspname)
+    WHERE schemaname = 'public'
+    ORDER BY pg_namespace.oid, indexname;
+}
+expect {
+    items|items_name_idx
+    items|items_price_idx
+    orders|orders_item_idx
+}
+
+test pg-indexes-lists-names-chosen-for-unnamed-indexes {
+    CREATE TABLE t (a int, b int, c text);
+    CREATE INDEX ON t (a);
+    CREATE INDEX ON t (b);
+    CREATE INDEX ON t (a);
+    CREATE INDEX ON t (a) WHERE b > 0;
+    CREATE INDEX ON t (a, b);
+    CREATE UNIQUE INDEX ON t (a, b);
+    CREATE INDEX ON t (a, a);
+    CREATE INDEX ON t ((a + b));
+    CREATE INDEX ON t (lower(c));
+    CREATE INDEX ON t ((c::text));
+    CREATE TABLE u_b_idx (x int);
+    CREATE SEQUENCE u_b_idx1;
+    CREATE TABLE u (b int);
+    CREATE INDEX ON u (b);
+    CREATE TABLE v (c text, arr int[]);
+    CREATE INDEX ON v ((lower(c) COLLATE "C"));
+    CREATE INDEX ON v ((c::text COLLATE "C"));
+    CREATE INDEX ON v (((c || 'x') COLLATE "C"));
+    CREATE INDEX ON v ((arr[1]));
+    CREATE INDEX ON v ((ARRAY[c]));
+    CREATE TABLE w (abcdefghijabcdefghijabcdefghijabcdefghij int, klmnopqrstklmnopqrstklmnopqrstklmnopqrst int);
+    CREATE INDEX ON w (abcdefghijabcdefghijabcdefghijabcdefghij, klmnopqrstklmnopqrstklmnopqrstklmnopqrst);
+    CREATE INDEX ON w (abcdefghijabcdefghijabcdefghijabcdefghij, klmnopqrstklmnopqrstklmnopqrstklmnopqrst);
+    DROP INDEX w_abcdefghijabcdefghijabcdefghijabcdefghij_klmnopqrstklmnop_idx;
+    CREATE INDEX ON w (abcdefghijabcdefghijabcdefghijabcdefghij, klmnopqrstklmnopqrstklmnopqrstklmnopqrst);
+    SELECT tablename, indexname
+    FROM pg_indexes
+    WHERE schemaname = 'public'
+    ORDER BY tablename, indexname;
+}
+expect {
+    t|t_a_a1_idx
+    t|t_a_b_idx
+    t|t_a_b_idx1
+    t|t_a_idx
+    t|t_a_idx1
+    t|t_a_idx2
+    t|t_b_idx
+    t|t_c_idx
+    t|t_expr_idx
+    t|t_lower_idx
+    u|u_b_idx2
+    v|v_arr_idx
+    v|v_array_idx
+    v|v_c_idx
+    v|v_expr_idx
+    v|v_lower_idx
+    w|w_abcdefghijabcdefghijabcdefghijabcdefghij_klmnopqrstklmno_idx1
+    w|w_abcdefghijabcdefghijabcdefghijabcdefghij_klmnopqrstklmnop_idx
+}
+
+test catalog-pg-type-enum-and-domain {
+    CREATE TYPE catalog_mood AS ENUM ('sad', 'happy');
+    CREATE DOMAIN catalog_posint AS integer;
+    SELECT typname, typtype, typbasetype, typnamespace
+    FROM pg_type
+    WHERE typname IN ('catalog_mood', 'catalog_posint')
+    ORDER BY typname;
+}
+expect {
+    catalog_mood|e|0|2200
+    catalog_posint|d|23|2200
+}
+
+test catalog-pg-attribute-enum-and-domain-columns {
+    CREATE TYPE catalog_color AS ENUM ('red', 'blue');
+    CREATE DOMAIN catalog_age AS integer;
+    CREATE TABLE catalog_t (c catalog_color, a catalog_age);
+    SELECT a.attname, ty.typname
+    FROM pg_attribute a
+    JOIN pg_class c ON c.oid = a.attrelid
+    JOIN pg_type ty ON ty.oid = a.atttypid
+    WHERE c.relname = 'catalog_t' AND a.attnum > 0
+    ORDER BY a.attnum;
+}
+expect {
+    c|catalog_color
+    a|catalog_age
+}
+
+test pg-attribute-default-compression {
+    CREATE TABLE compression_columns (id integer NOT NULL, body text, amount integer DEFAULT 7);
+    SELECT a.attname, quote_literal(a.attcompression::text), a.attnotnull, a.atthasdef,
+           a.attidentity, a.attgenerated, a.attisdropped, a.attislocal, a.attinhcount
+    FROM pg_catalog.pg_attribute a
+    JOIN pg_catalog.pg_class c ON c.oid = a.attrelid
+    WHERE c.relname = 'compression_columns' AND a.attnum > 0
+    ORDER BY a.attnum;
+}
+expect {
+    id|''|t|f|||f|t|0
+    body|''|f|f|||f|t|0
+    amount|''|f|t|||f|t|0
+}
+
+test pg-index-nulls-are-distinct {
+    CREATE TABLE nullable_index_columns (a integer, b text);
+    CREATE INDEX nullable_plain_idx ON nullable_index_columns (a);
+    CREATE UNIQUE INDEX nullable_unique_idx ON nullable_index_columns (a, b);
+    INSERT INTO nullable_index_columns VALUES (NULL, 'same'), (NULL, 'same'), (1, NULL), (1, NULL);
+    SELECT c.relname, i.indisunique, i.indnullsnotdistinct, i.indisprimary,
+           i.indimmediate, i.indisvalid, i.indisready, i.indkey
+    FROM pg_catalog.pg_index i
+    JOIN pg_catalog.pg_class c ON c.oid = i.indexrelid
+    WHERE c.relname IN ('nullable_plain_idx', 'nullable_unique_idx')
+    ORDER BY c.relname;
+    SELECT count(*) FROM nullable_index_columns;
+}
+expect {
+    nullable_plain_idx|f|f|f|t|t|t|1
+    nullable_unique_idx|t|f|f|t|t|t|1 2
+    4
+}
+
+test pg-settings-default-search-path {
+    SELECT setting, source, boot_val, reset_val, context, vartype,
+           unit, min_val, max_val, enumvals, sourcefile, sourceline, pending_restart
+    FROM pg_catalog.pg_settings WHERE name = 'search_path';
+}
+expect {
+    "$user", public|default|"$user", public|"$user", public|user|string|||||||f
+}
+
+test pg-settings-search-path-preserves-setting-text {
+    SELECT quote_literal(set_config('search_path', ' "My,Schema", PUBLIC ', false));
+    SELECT quote_literal(setting), source
+    FROM pg_settings WHERE name = 'search_path';
+}
+expect {
+    ' "My,Schema", PUBLIC '
+    ' "My,Schema", PUBLIC '|session
+}
+
+test pg-settings-empty-search-path {
+    SELECT quote_literal(set_config('search_path', '', false));
+    SELECT quote_literal(setting), source
+    FROM pg_settings WHERE name = 'search_path';
+}
+expect {
+    ''
+    ''|session
+}
+
+test pg-settings-set-search-path {
+    SET search_path TO public;
+    SELECT setting, source FROM pg_settings WHERE name = 'search_path';
+}
+expect {
+    public|session
+}
+
+test pg-settings-reset-search-path {
+    SET search_path TO public;
+    SELECT set_config('search_path', NULL, false);
+    SELECT setting, source, reset_val
+    FROM pg_settings WHERE name = 'search_path';
+}
+expect {
+    "$user", public
+    "$user", public|default|"$user", public
+}
+
+test pg-settings-delete-errors {
+    DELETE FROM pg_catalog.pg_settings;
+}
+expect error {}
+
+test information-schema-schemata-lists-schemas {
+    CREATE SCHEMA catalog_schemata_extra;
+    SELECT schema_name
+    FROM information_schema.schemata
+    WHERE schema_name IN ('pg_catalog', 'public', 'information_schema', 'catalog_schemata_extra')
+    ORDER BY schema_name;
+}
+expect {
+    catalog_schemata_extra
+    information_schema
+    pg_catalog
+    public
+}
+
+test information-schema-schemata-qualified-column {
+    SELECT schemata.schema_name
+    FROM information_schema.schemata
+    WHERE schemata.schema_name = 'public';
+}
+expect {
+    public
+}
+
+test user-table-named-schemata-is-not-the-catalog {
+    CREATE TABLE schemata (id int, label text);
+    INSERT INTO schemata VALUES (1, 'mine');
+    UPDATE schemata SET label = 'updated' WHERE id = 1;
+    SELECT id, label FROM schemata;
+}
+expect {
+    1|updated
+}
+
+@skip-if postgres "PostgreSQL fills pg_init_privs and pg_cast"
+test pg-function-support-catalogs-are-empty {
+    SET search_path TO '';
+    SELECT * FROM pg_init_privs;
+    SELECT * FROM pg_catalog.pg_init_privs;
+    SELECT objoid, classoid, objsubid, privtype, initprivs, tableoid FROM pg_init_privs;
+    SELECT objoid, classoid, objsubid, privtype, initprivs, tableoid FROM pg_catalog.pg_init_privs;
+    SELECT * FROM pg_cast;
+    SELECT * FROM pg_catalog.pg_cast;
+    SELECT oid, castsource, casttarget, castfunc, castcontext, castmethod, tableoid FROM pg_cast;
+    SELECT oid, castsource, casttarget, castfunc, castcontext, castmethod, tableoid FROM pg_catalog.pg_cast;
+    SELECT * FROM pg_transform;
+    SELECT * FROM pg_catalog.pg_transform;
+    SELECT oid, trftype, trflang, trffromsql, trftosql, tableoid FROM pg_transform;
+    SELECT oid, trftype, trflang, trffromsql, trftosql, tableoid FROM pg_catalog.pg_transform;
+}
+expect {}
+
+@skip-if postgres "different error message: PostgreSQL reports permission denied for the table"
+test pg-init-privs-is-read-only {
+    DELETE FROM pg_init_privs;
+}
+expect error {cannot delete from pg_catalog table "pg_init_privs"}
+
+@skip-if postgres "different error message: PostgreSQL reports permission denied for the table"
+test pg-cast-is-read-only {
+    DELETE FROM pg_cast;
+}
+expect error {cannot delete from pg_catalog table "pg_cast"}
+
+@skip-if postgres "different error message: PostgreSQL reports permission denied for the table"
+test pg-transform-is-read-only {
+    DELETE FROM pg_transform;
+}
+expect error {cannot delete from pg_catalog table "pg_transform"}
+
+test pg-dump-builtins-belong-to-pg-catalog {
+    SET search_path TO '';
+    SELECT DISTINCT p.proname, n.nspname FROM pg_proc p
+    JOIN pg_namespace n ON p.pronamespace = n.oid
+    WHERE p.proname IN ('abs', 'pg_is_in_recovery') ORDER BY p.proname;
+}
+expect {
+    abs|pg_catalog
+    pg_is_in_recovery|pg_catalog
+}
+
+@skip-if postgres "PostgreSQL also finds the functions of information_schema"
+test pg-dump-function-discovery-excludes-builtins {
+    SET search_path TO '';
+    SELECT p.tableoid, p.oid, p.proname, p.prolang, p.pronargs, p.proargtypes,
+           p.prorettype, p.proacl, acldefault('f', p.proowner) AS acldefault,
+           p.pronamespace, p.proowner
+    FROM pg_proc p LEFT JOIN pg_init_privs pip
+      ON (p.oid = pip.objoid AND pip.classoid = 'pg_proc'::regclass AND pip.objsubid = 0)
+    WHERE p.prokind <> 'a'
+      AND NOT EXISTS (SELECT 1 FROM pg_depend
+          WHERE classid = 'pg_proc'::regclass AND objid = p.oid AND deptype = 'i')
+      AND (pronamespace != (SELECT oid FROM pg_namespace WHERE nspname = 'pg_catalog')
+           OR EXISTS (SELECT 1 FROM pg_cast
+               WHERE pg_cast.oid > 16383 AND p.oid = pg_cast.castfunc)
+           OR EXISTS (SELECT 1 FROM pg_transform
+               WHERE pg_transform.oid > 16383
+                 AND (p.oid = pg_transform.trffromsql OR p.oid = pg_transform.trftosql))
+           OR p.proacl IS DISTINCT FROM pip.initprivs);
+}
+expect {}
+
+@skip-if postgres "PostgreSQL has six abs() functions, and pg_is_in_recovery() has the language internal"
+test pg-object-native-function-languages {
+    SET search_path TO '';
+    SELECT p.proname, l.lanname, CASE WHEN l.lanispl THEN 1 ELSE 0 END, l.tableoid
+    FROM pg_proc p JOIN pg_language l ON l.oid = p.prolang
+    WHERE p.proname IN ('abs', 'pg_is_in_recovery') ORDER BY p.proname;
+}
+expect {
+    abs|internal|0|2612
+    pg_is_in_recovery|c|0|2612
+}
+
+@skip-if postgres "PostgreSQL has the plpgsql language"
+test pg-object-dump-language-discovery-is-empty {
+    SET search_path TO '';
+    SELECT tableoid, oid, lanname, lanpltrusted, lanplcallfoid, laninline,
+           lanvalidator, lanacl, acldefault('l', lanowner) AS acldefault, lanowner
+    FROM pg_language WHERE lanispl ORDER BY oid;
+}
+expect {}
+
+@skip-if postgres "PostgreSQL fills these catalogs, and only a superuser can read pg_subscription"
+test pg-object-unsupported-catalogs-are-empty {
+    SET search_path TO '';
+    SELECT tableoid FROM pg_operator;
+    SELECT tableoid FROM pg_catalog.pg_operator;
+    SELECT tableoid FROM pg_opclass;
+    SELECT tableoid FROM pg_catalog.pg_opclass;
+    SELECT tableoid FROM pg_opfamily;
+    SELECT tableoid FROM pg_catalog.pg_opfamily;
+    SELECT tableoid FROM pg_ts_parser;
+    SELECT tableoid FROM pg_catalog.pg_ts_parser;
+    SELECT tableoid FROM pg_ts_template;
+    SELECT tableoid FROM pg_catalog.pg_ts_template;
+    SELECT tableoid FROM pg_ts_dict;
+    SELECT tableoid FROM pg_catalog.pg_ts_dict;
+    SELECT tableoid FROM pg_ts_config;
+    SELECT tableoid FROM pg_catalog.pg_ts_config;
+    SELECT tableoid FROM pg_foreign_data_wrapper;
+    SELECT tableoid FROM pg_catalog.pg_foreign_data_wrapper;
+    SELECT tableoid FROM pg_foreign_server;
+    SELECT tableoid FROM pg_catalog.pg_foreign_server;
+    SELECT tableoid FROM pg_default_acl;
+    SELECT tableoid FROM pg_catalog.pg_default_acl;
+    SELECT tableoid FROM pg_conversion;
+    SELECT tableoid FROM pg_catalog.pg_conversion;
+    SELECT tableoid FROM pg_range;
+    SELECT tableoid FROM pg_catalog.pg_range;
+    SELECT tableoid FROM pg_event_trigger;
+    SELECT tableoid FROM pg_catalog.pg_event_trigger;
+    SELECT tableoid FROM pg_subscription;
+    SELECT tableoid FROM pg_catalog.pg_subscription;
+    SELECT tableoid FROM pg_largeobject_metadata;
+    SELECT tableoid FROM pg_catalog.pg_largeobject_metadata;
+    SELECT tableoid FROM pg_amop;
+    SELECT tableoid FROM pg_catalog.pg_amop;
+    SELECT tableoid FROM pg_amproc;
+    SELECT tableoid FROM pg_catalog.pg_amproc;
+
+    SELECT tableoid, oid, oprname, oprnamespace, oprowner, oprkind, oprleft,
+           oprright, oprcode::oid AS oprcode FROM pg_operator;
+    SELECT tableoid, oid, opcmethod, opcname, opcnamespace, opcowner FROM pg_opclass;
+    SELECT tableoid, oid, opfmethod, opfname, opfnamespace, opfowner FROM pg_opfamily;
+    SELECT tableoid, oid, prsname, prsnamespace, prsstart::oid, prstoken::oid,
+           prsend::oid, prsheadline::oid, prslextype::oid FROM pg_ts_parser;
+    SELECT tableoid, oid, tmplname, tmplnamespace, tmplinit::oid, tmpllexize::oid
+    FROM pg_ts_template;
+    SELECT tableoid, oid, dictname, dictnamespace, dictowner, dicttemplate,
+           dictinitoption FROM pg_ts_dict;
+    SELECT tableoid, oid, cfgname, cfgnamespace, cfgowner, cfgparser FROM pg_ts_config;
+    SELECT oid, tableoid, defaclrole, defaclnamespace, defaclobjtype, defaclacl,
+           CASE WHEN defaclnamespace = 0 THEN acldefault(
+             CASE WHEN defaclobjtype = 'S' THEN 's'::"char" ELSE defaclobjtype END,
+             defaclrole) ELSE '{}' END AS acldefault FROM pg_default_acl;
+    SELECT tableoid, oid, conname, connamespace, conowner FROM pg_conversion;
+    SELECT tableoid, oid, castsource, casttarget, castfunc, castcontext, castmethod
+    FROM pg_cast c WHERE NOT EXISTS (SELECT 1 FROM pg_range r
+      WHERE c.castsource = r.rngtypid AND c.casttarget = r.rngmultitypid) ORDER BY 3,4;
+    SELECT s.tableoid, s.oid, s.subname, s.subowner, s.subconninfo, s.subslotname,
+           s.subsynccommit, s.subpublications, s.subbinary, s.substream,
+           s.subtwophasestate, s.subdisableonerr, s.subpasswordrequired,
+           s.subrunasowner, s.suborigin
+    FROM pg_subscription s WHERE s.subdbid = (
+      SELECT oid FROM pg_database WHERE datname = current_database());
+    SELECT oid, lomowner, lomacl, acldefault('L', lomowner) AS acldefault
+    FROM pg_largeobject_metadata;
+}
+expect {}
+
+@skip-if postgres "different error message: PostgreSQL reports permission denied for the table"
+test pg-object-operator-is-read-only {
+    DELETE FROM pg_operator;
+}
+expect error {cannot delete from pg_catalog table "pg_operator"}
+
+@skip-if postgres "different error message: PostgreSQL reports permission denied for the table"
+test pg-object-opclass-is-read-only {
+    DELETE FROM pg_opclass;
+}
+expect error {cannot delete from pg_catalog table "pg_opclass"}
+
+@skip-if postgres "different error message: PostgreSQL reports permission denied for the table"
+test pg-object-opfamily-is-read-only {
+    DELETE FROM pg_opfamily;
+}
+expect error {cannot delete from pg_catalog table "pg_opfamily"}
+
+@skip-if postgres "different error message: PostgreSQL reports permission denied for the table"
+test pg-object-ts-parser-is-read-only {
+    DELETE FROM pg_ts_parser;
+}
+expect error {cannot delete from pg_catalog table "pg_ts_parser"}
+
+@skip-if postgres "different error message: PostgreSQL reports permission denied for the table"
+test pg-object-ts-template-is-read-only {
+    DELETE FROM pg_ts_template;
+}
+expect error {cannot delete from pg_catalog table "pg_ts_template"}
+
+@skip-if postgres "different error message: PostgreSQL reports permission denied for the table"
+test pg-object-ts-dict-is-read-only {
+    DELETE FROM pg_ts_dict;
+}
+expect error {cannot delete from pg_catalog table "pg_ts_dict"}
+
+@skip-if postgres "different error message: PostgreSQL reports permission denied for the table"
+test pg-object-ts-config-is-read-only {
+    DELETE FROM pg_ts_config;
+}
+expect error {cannot delete from pg_catalog table "pg_ts_config"}
+
+@skip-if postgres "different error message: PostgreSQL reports permission denied for the table"
+test pg-object-foreign-data-wrapper-is-read-only {
+    DELETE FROM pg_foreign_data_wrapper;
+}
+expect error {cannot delete from pg_catalog table "pg_foreign_data_wrapper"}
+
+@skip-if postgres "different error message: PostgreSQL reports permission denied for the table"
+test pg-object-foreign-server-is-read-only {
+    DELETE FROM pg_foreign_server;
+}
+expect error {cannot delete from pg_catalog table "pg_foreign_server"}
+
+@skip-if postgres "different error message: PostgreSQL reports permission denied for the table"
+test pg-object-default-acl-is-read-only {
+    DELETE FROM pg_default_acl;
+}
+expect error {cannot delete from pg_catalog table "pg_default_acl"}
+
+@skip-if postgres "different error message: PostgreSQL reports permission denied for the table"
+test pg-object-conversion-is-read-only {
+    DELETE FROM pg_conversion;
+}
+expect error {cannot delete from pg_catalog table "pg_conversion"}
+
+@skip-if postgres "different error message: PostgreSQL reports permission denied for the table"
+test pg-object-range-is-read-only {
+    DELETE FROM pg_range;
+}
+expect error {cannot delete from pg_catalog table "pg_range"}
+
+@skip-if postgres "different error message: PostgreSQL reports permission denied for the table"
+test pg-object-event-trigger-is-read-only {
+    DELETE FROM pg_event_trigger;
+}
+expect error {cannot delete from pg_catalog table "pg_event_trigger"}
+
+@skip-if postgres "different error message: PostgreSQL reports permission denied for the table"
+test pg-object-subscription-is-read-only {
+    DELETE FROM pg_subscription;
+}
+expect error {cannot delete from pg_catalog table "pg_subscription"}
+
+@skip-if postgres "different error message: PostgreSQL reports permission denied for the table"
+test pg-object-largeobject-metadata-is-read-only {
+    DELETE FROM pg_largeobject_metadata;
+}
+expect error {cannot delete from pg_catalog table "pg_largeobject_metadata"}
+
+@skip-if postgres "different error message: PostgreSQL reports permission denied for the table"
+test pg-object-amop-is-read-only {
+    DELETE FROM pg_amop;
+}
+expect error {cannot delete from pg_catalog table "pg_amop"}
+
+@skip-if postgres "different error message: PostgreSQL reports permission denied for the table"
+test pg-object-amproc-is-read-only {
+    DELETE FROM pg_amproc;
+}
+expect error {cannot delete from pg_catalog table "pg_amproc"}
+
+test pg-depend-tracks-live-objects {
+    CREATE TABLE dep_parent (id TEXT UNIQUE);
+    CREATE TABLE dep_child (parent_id TEXT REFERENCES dep_parent(id), qty INTEGER DEFAULT 17);
+    CREATE INDEX dep_child_qty ON dep_child(qty);
+    CREATE INDEX dep_parent_id ON dep_parent(id);
+    CREATE UNIQUE INDEX dep_parent_unique_id ON dep_parent(id);
+
+    SELECT c.relname, n.nspname, d.deptype FROM pg_depend d
+    JOIN pg_class c ON d.classid = 1259 AND c.oid = d.objid
+    JOIN pg_namespace n ON d.refclassid = 2615 AND n.oid = d.refobjid
+    WHERE c.relname IN ('dep_parent', 'dep_child') ORDER BY c.relname;
+
+    SELECT r.relname, d.refobjsubid, d.deptype FROM pg_depend d
+    JOIN pg_constraint c ON d.classid = 2606 AND c.oid = d.objid
+    JOIN pg_class r ON d.refclassid = 1259 AND r.oid = d.refobjid
+    WHERE c.conname = 'dep_child_parent_id_fkey' AND r.relkind = 'r'
+    ORDER BY r.relname;
+
+    SELECT r.relname, a.adnum, d.refobjsubid, d.deptype FROM pg_depend d
+    JOIN pg_attrdef a ON d.classid = 2604 AND a.oid = d.objid
+    JOIN pg_class r ON d.refclassid = 1259 AND r.oid = d.refobjid
+    WHERE r.relname = 'dep_child';
+
+    SELECT d.refobjsubid, d.deptype FROM pg_depend d
+    JOIN pg_class i ON d.classid = 1259 AND i.oid = d.objid AND i.relkind = 'i'
+    JOIN pg_class r ON d.refclassid = 1259 AND r.oid = d.refobjid
+    WHERE r.relname = 'dep_child';
+
+    SELECT i.relname, d.refobjsubid, d.deptype FROM pg_depend d
+    JOIN pg_class i ON d.classid = 1259 AND i.oid = d.objid
+    JOIN pg_class r ON d.refclassid = 1259 AND r.oid = d.refobjid
+    WHERE i.relname IN ('dep_parent_id', 'dep_parent_unique_id')
+      AND r.relname = 'dep_parent' ORDER BY i.relname;
+
+    SELECT c.conname, d.deptype FROM pg_depend d
+    JOIN pg_class i ON d.classid = 1259 AND i.oid = d.objid AND i.relkind = 'i'
+    JOIN pg_constraint c ON d.refclassid = 2606 AND c.oid = d.refobjid
+    WHERE c.conname = 'dep_parent_id_key';
+
+    SELECT CASE WHEN EXISTS (SELECT 1 FROM pg_catalog.pg_depend) THEN 1 ELSE 0 END;
+    SET search_path TO '';
+    SELECT tableoid FROM pg_depend LIMIT 1;
+}
+expect {
+    dep_child|public|n
+    dep_parent|public|n
+    dep_child|1|a
+    dep_parent|1|n
+    dep_child|2|2|a
+    2|a
+    dep_parent_id|1|a
+    dep_parent_unique_id|1|a
+    dep_parent_id_key|i
+    1
+    2608
+}
+
+@skip-if postgres "Turso has the ACLs of PostgreSQL 16, without the MAINTAIN privilege (m) of PostgreSQL 17"
+test pg-depend-for-dump-table-query {
+    CREATE TABLE dump_indexed (id INTEGER PRIMARY KEY, value TEXT UNIQUE);
+    CREATE TABLE dump_plain (value TEXT);
+    SET search_path TO '';
+    SELECT tableoid, relname, CASE WHEN relhasindex THEN 1 ELSE 0 END,
+           replace(acldefault::text, pg_get_userbyid(relowner), 'owner'),
+           reltablespace, reloptions, checkoption, amname
+    FROM (
+        SELECT c.tableoid, c.oid, c.relname, c.relnamespace, c.relkind, c.reltype,
+               c.relowner, c.relchecks, c.relhasindex, c.relhasrules, c.relpages,
+               c.relhastriggers, c.relpersistence, c.reloftype, c.relacl,
+               acldefault(CASE WHEN c.relkind = 'S' THEN 's'::"char" ELSE 'r'::"char" END,
+                          c.relowner) AS acldefault,
+               CASE WHEN c.relkind = 'f' THEN (SELECT ftserver FROM pg_catalog.pg_foreign_table
+                    WHERE ftrelid = c.oid) ELSE 0 END AS foreignserver,
+               c.relfrozenxid, tc.relfrozenxid AS tfrozenxid, tc.oid AS toid,
+               tc.relpages AS toastpages, tc.reloptions AS toast_reloptions,
+               d.refobjid AS owning_tab, d.refobjsubid AS owning_col,
+               tsp.spcname AS reltablespace, false AS relhasoids, c.relispopulated,
+               c.relreplident, c.relrowsecurity, c.relforcerowsecurity, c.relminmxid,
+               tc.relminmxid AS tminmxid,
+               array_remove(array_remove(c.reloptions,'check_option=local'),
+                            'check_option=cascaded') AS reloptions,
+               CASE WHEN 'check_option=local' = ANY(c.reloptions) THEN 'LOCAL'::text
+                    WHEN 'check_option=cascaded' = ANY(c.reloptions) THEN 'CASCADED'::text
+                    ELSE NULL END AS checkoption,
+               am.amname, (d.deptype = 'i') IS TRUE AS is_identity_sequence,
+               c.relispartition AS ispartition
+        FROM pg_class c
+        LEFT JOIN pg_depend d ON (c.relkind = 'S' AND d.classid = 'pg_class'::regclass
+            AND d.objid = c.oid AND d.objsubid = 0
+            AND d.refclassid = 'pg_class'::regclass AND d.deptype IN ('a', 'i'))
+        LEFT JOIN pg_tablespace tsp ON (tsp.oid = c.reltablespace)
+        LEFT JOIN pg_am am ON (c.relam = am.oid)
+        LEFT JOIN pg_class tc ON (c.reltoastrelid = tc.oid AND tc.relkind = 't'
+                                 AND c.relkind <> 'p')
+        WHERE c.relkind IN ('r', 'S', 'v', 'c', 'm', 'f', 'p')
+          AND c.relname IN ('dump_indexed', 'dump_plain')
+    ) AS dump
+    ORDER BY relname;
+}
+expect {
+    1259|dump_indexed|1|{owner=arwdDxt/owner}||||heap
+    1259|dump_plain|0|{owner=arwdDxt/owner}||||heap
+}
+
+test physical-catalog-tableoid {
+    CREATE TABLE indexed (id INTEGER PRIMARY KEY, value TEXT UNIQUE DEFAULT 'a');
+    SELECT tableoid FROM pg_catalog.pg_class LIMIT 1;
+    SELECT tableoid FROM pg_catalog.pg_namespace LIMIT 1;
+    SELECT tableoid FROM pg_catalog.pg_attribute LIMIT 1;
+    SELECT tableoid FROM pg_catalog.pg_proc LIMIT 1;
+    SELECT tableoid FROM pg_catalog.pg_database LIMIT 1;
+    SELECT tableoid FROM pg_catalog.pg_am LIMIT 1;
+    SELECT tableoid FROM pg_catalog.pg_type LIMIT 1;
+    SELECT tableoid FROM pg_catalog.pg_index LIMIT 1;
+    SELECT tableoid FROM pg_catalog.pg_constraint LIMIT 1;
+    SELECT tableoid FROM pg_catalog.pg_attrdef LIMIT 1;
+    SELECT tableoid FROM pg_catalog.pg_depend LIMIT 1;
+    CREATE TABLE refresh_schema (value TEXT);
+    SELECT tableoid FROM pg_namespace LIMIT 1;
+}
+expect {
+    1259
+    2615
+    1249
+    1255
+    1262
+    2601
+    1247
+    2610
+    2606
+    2604
+    2608
+    2615
+}
+
+test pg-namespace-builtins {
+    SELECT nspname FROM pg_namespace
+    WHERE nspname IN ('pg_catalog', 'public') ORDER BY nspname;
+}
+expect {
+    pg_catalog
+    public
+}
+
+test pg-class-lists-created-tables {
+    CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT);
+    CREATE TABLE widgets (id INT, label TEXT);
+    SELECT relname, relkind FROM pg_class
+    WHERE relkind = 'r' AND relname IN ('users', 'widgets') ORDER BY relname;
+}
+expect {
+    users|r
+    widgets|r
+}
+
+test pg-attribute-no-user-columns-without-tables {
+    SELECT count(*) FROM pg_attribute a
+    JOIN pg_class c ON c.oid = a.attrelid
+    JOIN pg_namespace n ON n.oid = c.relnamespace
+    WHERE n.nspname = 'public';
+}
+expect {
+    0
+}
+
+test pg-tables-lists-created-tables {
+    CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT);
+    CREATE TABLE orders (id INTEGER PRIMARY KEY, user_id INTEGER);
+    CREATE TABLE items (id INT PRIMARY KEY, name TEXT);
+    SELECT schemaname, tablename FROM pg_tables
+    WHERE schemaname = 'public' ORDER BY tablename;
+}
+expect {
+    public|items
+    public|orders
+    public|users
+}
+
+test pg-tables-no-internal-tables {
+    CREATE TABLE mydata (id INTEGER PRIMARY KEY);
+    SELECT tablename FROM pg_tables WHERE substr(tablename, 1, 7) = 'sqlite_';
+}
+expect {}
+
+test pg-tables-and-pg-class-hide-tables-of-sequences {
+    CREATE SEQUENCE s;
+    CREATE TABLE t (id serial);
+    SELECT tablename FROM pg_tables WHERE schemaname = 'public'
+    UNION ALL
+    SELECT c.relname FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+    WHERE n.nspname = 'public' AND c.relkind = 'r' AND c.relname <> 't';
+}
+expect {
+    t
+}
+
+test pg-type-builtin-oids {
+    SELECT typname, oid FROM pg_type
+    WHERE typname IN ('int4', 'text', 'bool', 'uuid') ORDER BY typname;
+}
+expect {
+    bool|16
+    int4|23
+    text|25
+    uuid|2950
+}
+
+test pg-type-array-elements {
+    SELECT typname, oid, typelem FROM pg_type
+    WHERE typname IN ('_int4', '_text') ORDER BY typname;
+}
+expect {
+    _int4|1007|23
+    _text|1009|25
+}
+
+test pg-indexes-lists-index-definitions {
+    CREATE TABLE items (id INT, name TEXT, price INT);
+    CREATE INDEX items_name_idx ON items (name);
+    CREATE UNIQUE INDEX items_price_idx ON items (price) WHERE price > 0;
+    SELECT schemaname, tablename, indexname, tablespace,
+           replace(replace(indexdef, 'public.', ''),
+                   'WHERE (price > 0)', 'WHERE price > 0')
+    FROM pg_catalog.pg_indexes WHERE schemaname = 'public' ORDER BY indexname;
+}
+expect {
+    public|items|items_name_idx||CREATE INDEX items_name_idx ON items USING btree (name)
+    public|items|items_price_idx||CREATE UNIQUE INDEX items_price_idx ON items USING btree (price) WHERE price > 0
+}
+
+test pg-indexes-and-pg-get-indexdef-name-the-schema-of-the-table {
+    CREATE TABLE items (id int, name text);
+    CREATE INDEX items_name_idx ON items (name);
+    SELECT indexdef FROM pg_indexes WHERE indexname = 'items_name_idx'
+    UNION ALL
+    SELECT pg_get_indexdef(oid) FROM pg_class WHERE relname = 'items_name_idx';
+}
+expect {
+    CREATE INDEX items_name_idx ON public.items USING btree (name)
+    CREATE INDEX items_name_idx ON public.items USING btree (name)
+}
+
+test pg-index-columns {
+    CREATE TABLE items (id INTEGER PRIMARY KEY, name TEXT);
+    CREATE INDEX idx_items_name ON items(name);
+    SELECT c.relname, i.indkey,
+           CASE WHEN i.indisunique THEN 1 ELSE 0 END,
+           CASE WHEN i.indisprimary THEN 1 ELSE 0 END
+    FROM pg_index i JOIN pg_class c ON c.oid = i.indexrelid
+    WHERE c.relname = 'idx_items_name';
+}
+expect {
+    idx_items_name|2|0|0
+}
+
+test pg-index-composite-primary-key {
+    CREATE TABLE pk_test (a TEXT, b TEXT, PRIMARY KEY (a, b));
+    SELECT CASE WHEN i.indisprimary THEN 1 ELSE 0 END,
+           CASE WHEN i.indisunique THEN 1 ELSE 0 END, i.indkey
+    FROM pg_index i JOIN pg_class c ON c.oid = i.indrelid
+    WHERE c.relname = 'pk_test' AND i.indisprimary;
+}
+expect {
+    1|1|1 2
+}
+
+test pg-constraint-primary-and-foreign-keys {
+    CREATE TABLE parent (id INTEGER PRIMARY KEY, name TEXT);
+    CREATE TABLE child (id INTEGER PRIMARY KEY,
+                       parent_id INTEGER REFERENCES parent(id) ON DELETE CASCADE);
+    SELECT conname, contype FROM pg_constraint
+    JOIN pg_class c ON c.oid = conrelid
+    WHERE c.relname = 'parent' AND contype = 'p';
+    SELECT conname, contype, confdeltype FROM pg_constraint
+    JOIN pg_class c ON c.oid = conrelid
+    WHERE c.relname = 'child' AND contype = 'f';
+}
+expect {
+    parent_pkey|p
+    child_parent_id_fkey|f|c
+}
+
+test pg-constraint-check-expression {
+    CREATE TABLE checked (id INTEGER, val INTEGER CHECK(val > 0));
+    SELECT contype,
+           CASE WHEN pg_get_expr(conbin, conrelid) LIKE '%val%'
+                     AND pg_get_expr(conbin, conrelid) LIKE '%0%'
+                THEN 1 ELSE 0 END
+    FROM pg_constraint JOIN pg_class c ON c.oid = conrelid
+    WHERE c.relname = 'checked' AND contype = 'c';
+}
+expect {
+    c|1
+}
+
+test pg-class-includes-indexes {
+    CREATE TABLE indexed (id INTEGER PRIMARY KEY, data TEXT);
+    CREATE INDEX idx_indexed_data ON indexed(data);
+    SELECT relname, relkind, relam FROM pg_class
+    WHERE relname = 'idx_indexed_data' AND relkind = 'i';
+}
+expect {
+    idx_indexed_data|i|403
+}
+
+test pg-catalog-schema-qualified-tables {
+    CREATE TABLE widgets (id INTEGER PRIMARY KEY, label TEXT);
+    SELECT c.relname FROM pg_catalog.pg_class c
+    WHERE c.relkind = 'r' AND c.relname = 'widgets';
+    SELECT nspname FROM pg_catalog.pg_namespace WHERE nspname = 'public';
+    SELECT n.nspname, c.relname FROM pg_catalog.pg_class c
+    LEFT JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+    WHERE c.relkind = 'r' AND c.relname = 'widgets';
+}
+expect {
+    widgets
+    public
+    public|widgets
+}
+
+test public-schema-qualified-tables {
+    CREATE TABLE gadgets (id INTEGER PRIMARY KEY, name TEXT);
+    INSERT INTO gadgets (id, name) VALUES (1, 'phone');
+    SELECT name FROM public.gadgets WHERE id = 1;
+}
+expect {
+    phone
+}
+
+test pg-get-constraintdef {
+    CREATE TABLE parent (id INTEGER PRIMARY KEY, name TEXT UNIQUE);
+    CREATE TABLE child (id INTEGER PRIMARY KEY,
+                       parent_id INTEGER REFERENCES parent(id) ON DELETE CASCADE,
+                       age INTEGER CHECK(age > 0));
+    SELECT c.relname, con.contype,
+           CASE WHEN length(pg_get_constraintdef(con.oid)) > 0 THEN 1 ELSE 0 END,
+           CASE WHEN con.contype = 'p' THEN
+                     CASE WHEN pg_get_constraintdef(con.oid) LIKE 'PRIMARY KEY%'
+                          THEN 1 ELSE 0 END
+                WHEN con.contype = 'f' THEN
+                     CASE WHEN pg_get_constraintdef(con.oid) LIKE '%FOREIGN KEY%REFERENCES%'
+                          THEN 1 ELSE 0 END
+                ELSE 1 END
+    FROM pg_constraint con JOIN pg_class c ON c.oid = con.conrelid
+    WHERE c.relname IN ('parent', 'child') ORDER BY c.relname, con.contype;
+}
+expect {
+    child|c|1|1
+    child|f|1|1
+    child|p|1|1
+    parent|p|1|1
+    parent|u|1|1
+}
+
+test pg-get-indexdef {
+    CREATE TABLE items (id INTEGER PRIMARY KEY, name TEXT, price REAL);
+    CREATE INDEX idx_items_name ON items(name);
+    CREATE UNIQUE INDEX idx_items_price ON items(price);
+    SELECT relname, replace(pg_get_indexdef(oid), 'public.', '')
+    FROM pg_class WHERE relkind = 'i'
+      AND relname IN ('idx_items_name', 'idx_items_price') ORDER BY relname;
+}
+expect {
+    idx_items_name|CREATE INDEX idx_items_name ON items USING btree (name)
+    idx_items_price|CREATE UNIQUE INDEX idx_items_price ON items USING btree (price)
+}
+
+test pg-attrdef-default-columns {
+    CREATE TABLE defaults_test (id INTEGER PRIMARY KEY, name TEXT DEFAULT 'unnamed',
+                               score INTEGER DEFAULT 0);
+    SELECT adnum FROM pg_attrdef JOIN pg_class c ON c.oid = adrelid
+    WHERE c.relname = 'defaults_test' ORDER BY adnum;
+}
+expect {
+    2
+    3
+}
+
+test pg-attribute-created-table-columns {
+    CREATE TABLE products (id INT PRIMARY KEY, name TEXT, price INT);
+    SELECT a.attname, t.typname FROM pg_attribute a
+    JOIN pg_class c ON a.attrelid = c.oid
+    JOIN pg_type t ON a.atttypid = t.oid
+    WHERE c.relname = 'products' AND a.attnum > 0 AND NOT a.attisdropped
+    ORDER BY a.attnum;
+}
+expect {
+    id|int4
+    name|text
+    price|int4
+}
+
+test pg-create-table-insert-and-select {
+    CREATE TABLE kv (k TEXT, v INT);
+    INSERT INTO kv VALUES ('hello', 42);
+    SELECT k, v FROM kv;
+}
+expect {
+    hello|42
+}
+
+test pg-database-is-not-empty {
+    SELECT CASE WHEN EXISTS (SELECT datname FROM pg_database) THEN 1 ELSE 0 END;
+}
+expect {
+    1
+}
+
+test catalog-schema-qualified-column-references {
+    SELECT pg_catalog.pg_namespace.nspname
+    FROM pg_catalog.pg_namespace
+    WHERE pg_catalog.pg_namespace.nspname = 'pg_catalog';
+    SELECT information_schema.schemata.schema_name
+    FROM information_schema.schemata
+    WHERE information_schema.schemata.schema_name = 'public';
+}
+expect {
+    pg_catalog
+    public
+}

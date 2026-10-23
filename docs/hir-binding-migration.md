@@ -67,6 +67,56 @@ from schema translators over the semantic context, and the legacy planner,
 binder, emitter, `TableReferences` and `Resolver` are deleted. The
 sections below record what was audited and how each statement kind runs.
 
+### After the merge of main
+
+Main kept building on the legacy planner after this branch forked. The
+merge keeps the HIR paths and carries main's behavior over them, proven
+by main's own sqltests:
+
+- FROM clauses: SQLite-style RIGHT and FULL JOIN chaining (any number of
+  right-kept joins in a block, unmatched passes in FROM order, planned
+  reads for the unmatched rows, `RIGHT-JOIN t` plan rows), USING and
+  NATURAL with SQLite's first-copy and merged-column rules, parenthesized
+  join groups, and LATERAL subqueries that see the sources on their left
+  and run once per outer row.
+- Materialized views: maintenance is compiled to VDBE over HIR
+  (`core/incremental/vdbe_maintenance`). The operator DAG holds HIR
+  expressions over source identities, delta rows are bound to registers
+  with `SourceBinding::Registers`, and node expressions lower through the
+  shared expression lowering. The DBSP engine is gone; "DBSP version" in
+  error text names the maintenance format version.
+- Hash joins: main's pricing and materialization rules, the deferred probe
+  target for rows waiting on a partition on disk, hash anti-joins for
+  NOT EXISTS, EXPLAIN QUERY PLAN estimates, and correlated EXISTS filters
+  deferred to the cheapest later loop.
+- Planner: partial index predicates proved by one OR branch, `col IN (...)`
+  implied by every OR branch, `count(col)` as `count(*)` on a NOT NULL
+  column, custom-type range terms kept out of automatic index keys, order
+  proofs never from hash builds, and a rewrite that stays a subquery when
+  an inner filter can fail.
+- Semantics and DML: FILTER rejected on scalar functions, row-value IN
+  NULL rules, comparison collation from the left operand with BINARY
+  columns winning, HAVING terms over GROUP BY keys moved to WHERE, STRICT
+  checks of generated columns, UPSERT targets on generated-column indexes,
+  foreign keys checked only when a key changes, UPDATE OF triggers matched
+  by the names written, per-trigger-step conflict modes, ALTER COLUMN
+  conversion, the whole-table DELETE fast path, and sequence names
+  qualified at CREATE.
+- Index methods (FTS): a query names any subset of an index's columns, in
+  any order, and the index receives the chosen columns after the
+  placeholder values; `x MATCH y` matches patterns as `fts_match`; a
+  search whose arguments read the table's own row, or a table that loops
+  later, cannot drive the scan, so the term is checked through the index
+  for each row the loop finds (`emit_hir_predicate`); a search whose
+  arguments read earlier tables loops inside them; `fts_score` over the
+  selected columns and query reads the index's score, and any other
+  `fts_match`, `fts_score` or MATCH fails at prepare time with an error
+  that names the FTS index.
+
+The sqltest expectations that differ from main only in instruction
+addresses or ephemeral index names (`_s<id>` for a HIR source, where the
+legacy planner wrote `_t<id>`) were updated to the HIR output.
+
 ### Remaining binding coverage audit
 
 This audit compared every remaining semantic catch-all with parser AST shapes,
@@ -141,10 +191,9 @@ deleted the same day, once their last callers moved to HIR:
   table, and DROP COLUMN finds a partial index's use of the column by name
   in its WHERE clause.
 - ATTACH and DETACH evaluate their arguments through HIR only.
-- The DBSP expression compiler analyzes an expression over register inputs
-  through `SemanticRootInput::RegisterExpressions`, which gives it a
-  `SchemaExpressions` root whose one positional source the compiler binds
-  to registers.
+- Materialized view maintenance analyzes a view's SELECT through
+  `analyze_root` with subquery unnesting forced, and binds each delta row
+  to registers before lowering node expressions.
 - The planner's unused WHERE, LIMIT and rowid parsers are gone.
 
 What is left of `expr/` is the helpers both HIR and the planner share: AST

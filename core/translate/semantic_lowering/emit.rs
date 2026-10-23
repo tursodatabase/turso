@@ -72,11 +72,7 @@ pub(super) fn copy_with_affinity(
         let affinities = index
             .columns
             .iter()
-            .map(|column| {
-                table.columns()[column.pos_in_table]
-                    .affinity_with_strict(table.is_strict)
-                    .aff_mask()
-            })
+            .map(|column| table.columns()[column.pos_in_table].affinity().aff_mask())
             .collect();
         program.emit_insn(Insn::Affinity {
             start_reg: destination,
@@ -169,6 +165,7 @@ where
     program.preassign_label_to_next_insn(next_row);
     program.emit_insn(Insn::Next {
         cursor_id: cursor,
+        is_index: program.cursor_is_index(cursor),
         pc_if_next: loop_top,
         fullscan: false,
     });
@@ -263,6 +260,7 @@ where
     program.preassign_label_to_next_insn(next_row);
     program.emit_insn(Insn::Next {
         cursor_id: cursor,
+        is_index: program.cursor_is_index(cursor),
         pc_if_next: loop_top,
         fullscan: false,
     });
@@ -326,27 +324,6 @@ pub(crate) fn format_unique_violation_desc(table_name: &str, index: &Index) -> S
                 .join(", ");
             format!("{table_name}.({names})")
         }
-    }
-}
-
-/// The error text and halt mode for a constraint whose own ON CONFLICT is
-/// FAIL or ROLLBACK. The text is formatted here so the VM raises it with
-/// that mode. With a statement-level OR clause, the program's own mode
-/// applies and the text is left as is.
-pub(super) fn halt_desc_and_on_error(
-    description: &str,
-    effective: ResolveType,
-    has_statement_conflict: bool,
-) -> (String, Option<ResolveType>) {
-    if has_statement_conflict {
-        return (description.to_string(), None);
-    }
-    match effective {
-        ResolveType::Fail | ResolveType::Rollback => (
-            format!("UNIQUE constraint failed: {description}"),
-            Some(effective),
-        ),
-        _ => (description.to_string(), None),
     }
 }
 

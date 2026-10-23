@@ -1,0 +1,60 @@
+---
+source: foreign_keys.sqltest
+expression: UPDATE parent SET k = k + 1 WHERE id = 1;
+info:
+  statement_type: UPDATE
+  tables:
+  - parent
+  setup_blocks:
+  - fk_bytecode_no_action_child
+  database: ':memory:'
+---
+QUERY PLAN
+`--SEARCH parent USING INTEGER PRIMARY KEY (rowid=?)
+
+BYTECODE
+addr  opcode         p1  p2  p3  p4        p5  comment
+   0  Init            0  40   0             0  Start at 40
+   1  OpenWrite       0   2   0             0  root=2; iDb=0
+   2  OpenWrite       1   3   0             0  root=3; iDb=0
+   3  SeekRowid       0   1  39             0  if (r[1]!=cursor 0.rowid) goto 39
+   4  RowId           0   2   0             0  r[2]=parent.rowid
+   5  IsNull          2  39   0             0  if (r[2]==NULL) goto 39
+   6  Null            0   3   0             0  r[3]=NULL
+   7  Column          0   1   6             0  r[6]=parent.k
+   8  Add             6   7   4             0  r[4]=r[6]+r[7]
+   9  Column          0   2   5             0  r[5]=parent.v
+  10  Affinity        3   3   0             0  r[3..6] = D, D, D
+  11  Copy            4   8   0             0  r[8]=r[4]
+  12  Copy            2   9   0             0  r[9]=r[2]
+  13  Affinity        8   1   0             0  r[8..9] = D
+  14  MakeRecord      8   2  10             0  r[10]=mkrec(r[8..9]); for sqlite_autoindex_parent_1
+  15  NoConflict      1  19   8  1          0  key=r[8..8]
+  16  IdxRowId        1  11   0             0  r[11]=cursor 1.rowid
+  17  Eq              2  11  19             0  if r[2]==r[11] goto 19
+  18  Halt         2067   0   0  parent.k   0
+  19  Column          0   1  12             0  r[12]=parent.k
+  20  Copy            4  13   0             0  r[13]=r[4]
+  21  Eq             12  13  33             0  if r[12]==r[13] goto 33
+  22  Goto            0  23   0             0
+  23  IsNull         12  33   0             0  if (r[12]==NULL) goto 33
+  24  OpenRead        2   4   0  k(2,B,B)   0  table=child, root=4, iDb=0
+  25  Rewind          2  32   0             0  Rewind table child
+  26    Column        2   1  14             0  r[14]=child.pk
+  27    IsNull       14  31   0             0  if (r[14]==NULL) goto 31
+  28    Eq           14  12  30  Binary     0  if r[14]==r[12] goto 30
+  29    Goto          0  31   0             0
+  30    FkCounter     1   0   0             0
+  31  Next            2  26   0             0
+  32  Close           2   0   0             0
+  33  Column          0   1  15             0  r[15]=parent.k
+  34  RowId           0  16   0             0  r[16]=parent.rowid
+  35  IdxDelete       1  15   2             1
+  36  IdxInsert       1  10   8             2  key=r[10]
+  37  MakeRecord      3   3  17             0  r[17]=mkrec(r[3..5])
+  38  Insert          0  17   2  parent     8  intkey=r[2] data=r[17]
+  39  Halt            0   0   0             0
+  40  Transaction     0   2   2             0  iDb=0 tx_mode=Write
+  41  Integer         1   1   0             0  r[1]=1
+  42  Integer         1   7   0             0  r[7]=1
+  43  Goto            0   1   0             0

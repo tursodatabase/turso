@@ -2,14 +2,15 @@ use std::path::Path;
 use std::sync::Arc;
 use tempfile::TempDir;
 use turso_core::SqliteDialect;
-use turso_core::{Database, DatabaseOpts, OpenFlags};
+use turso_core::{ConnectOpts, Database, DatabaseOpts, OpenFlags};
 
 use crate::common::ExecRows;
+use asserting::prelude::*;
 
 /// Read header version bytes (write_version at offset 18, read_version at offset 19) from database file
 fn read_header_versions(db_path: &Path) -> (u8, u8) {
     let bytes = std::fs::read(db_path).expect("Failed to read database file");
-    assert!(bytes.len() >= 20, "Database file too small");
+    assert_that!(&bytes).has_at_least_length(20);
     // Offset 18 = write_version, Offset 19 = read_version (per SQLite format)
     (bytes[18], bytes[19])
 }
@@ -25,15 +26,7 @@ fn create_legacy_db(db_path: &Path) {
     drop(conn);
 
     // Verify it's Legacy mode (version 1)
-    let (write_ver, read_ver) = read_header_versions(db_path);
-    assert_eq!(
-        write_ver, 1,
-        "Expected Legacy write_version=1, got {write_ver}"
-    );
-    assert_eq!(
-        read_ver, 1,
-        "Expected Legacy read_version=1, got {read_ver}"
-    );
+    assert_that!(read_header_versions(db_path)).is_equal_to((1, 1));
 }
 
 /// Create a WAL mode database using rusqlite
@@ -50,12 +43,7 @@ fn create_wal_db(db_path: &Path) {
     drop(conn);
 
     // Verify it's WAL mode (version 2)
-    let (write_ver, read_ver) = read_header_versions(db_path);
-    assert_eq!(
-        write_ver, 2,
-        "Expected WAL write_version=2, got {write_ver}"
-    );
-    assert_eq!(read_ver, 2, "Expected WAL read_version=2, got {read_ver}");
+    assert_that!(read_header_versions(db_path)).is_equal_to((2, 2));
 }
 
 /// Open database with limbo and close it, then check header versions
@@ -74,7 +62,7 @@ fn open_with_limbo_and_check(db_path: &Path, enable_mvcc: bool) -> (u8, u8) {
     .expect("Failed to open database with limbo");
 
     // Connect to ensure initialization is complete
-    let conn = db.connect().unwrap();
+    let conn = db.connect(ConnectOpts::new()).unwrap();
 
     // Enable MVCC if requested
     if enable_mvcc {
@@ -195,9 +183,7 @@ fn test_mvcc_db_opened_without_mvcc_flag_stays_mvcc() {
     let _ = open_with_limbo_and_check(&db_path, true);
 
     // Verify it's now MVCC
-    let (write_ver, read_ver) = read_header_versions(&db_path);
-    assert_eq!(write_ver, 255, "Should be MVCC after first open");
-    assert_eq!(read_ver, 255, "Should be MVCC after first open");
+    assert_that!(read_header_versions(&db_path)).is_equal_to((255, 255));
 
     // Now open WITHOUT MVCC flag - should auto-enable MVCC and stay at version 255
     let (write_ver, read_ver) = open_with_limbo_and_check(&db_path, false);
@@ -224,9 +210,7 @@ fn test_mvcc_db_opened_with_mvcc_stays_mvcc() {
     let _ = open_with_limbo_and_check(&db_path, true);
 
     // Verify it's now MVCC
-    let (write_ver, read_ver) = read_header_versions(&db_path);
-    assert_eq!(write_ver, 255, "Should be MVCC after first open");
-    assert_eq!(read_ver, 255, "Should be MVCC after first open");
+    assert_that!(read_header_versions(&db_path)).is_equal_to((255, 255));
 
     // Open again with MVCC flag - should stay MVCC
     let (write_ver, read_ver) = open_with_limbo_and_check(&db_path, true);
@@ -286,12 +270,7 @@ fn create_wal_db_with_pending_wal(db_path: &Path) {
     }
 
     // Verify it's WAL mode (version 2)
-    let (write_ver, read_ver) = read_header_versions(db_path);
-    assert_eq!(
-        write_ver, 2,
-        "Expected WAL write_version=2, got {write_ver}"
-    );
-    assert_eq!(read_ver, 2, "Expected WAL read_version=2, got {read_ver}");
+    assert_that!(read_header_versions(db_path)).is_equal_to((2, 2));
 }
 
 /// Test switching from WAL to MVCC mode via PRAGMA when there's a non-empty WAL.
@@ -322,7 +301,7 @@ fn test_pragma_journal_mode_wal_to_mvcc_with_pending_wal() {
         )
         .expect("Failed to open database with limbo (non-MVCC)");
 
-        let conn = db.connect().unwrap();
+        let conn = db.connect(ConnectOpts::new()).unwrap();
 
         // Insert some data to ensure WAL has content
         conn.execute("INSERT INTO t (val) VALUES ('limbo_data')")
@@ -356,7 +335,7 @@ fn test_pragma_journal_mode_wal_to_mvcc_with_pending_wal() {
     )
     .expect("Failed to open database with limbo (MVCC enabled)");
 
-    let conn = db.connect().unwrap();
+    let conn = db.connect(ConnectOpts::new()).unwrap();
 
     // Switch to MVCC mode via PRAGMA
     // This should work even with pending WAL data
@@ -394,15 +373,7 @@ fn test_pragma_journal_mode_wal_to_mvcc_with_pending_wal() {
     drop(db);
 
     // Verify header is now MVCC (version 255)
-    let (write_ver, read_ver) = read_header_versions(&db_path);
-    assert_eq!(
-        write_ver, 255,
-        "After PRAGMA journal_mode switch, write_version should be 255 (MVCC), got {write_ver}"
-    );
-    assert_eq!(
-        read_ver, 255,
-        "After PRAGMA journal_mode switch, read_version should be 255 (MVCC), got {read_ver}"
-    );
+    assert_that!(read_header_versions(&db_path)).is_equal_to((255, 255));
 }
 
 /// Test switching from MVCC to WAL mode via PRAGMA.
@@ -433,7 +404,7 @@ fn test_pragma_journal_mode_mvcc_to_wal() {
         )
         .expect("Failed to open database with limbo");
 
-        let conn = db.connect().unwrap();
+        let conn = db.connect(ConnectOpts::new()).unwrap();
 
         // Switch to MVCC mode via PRAGMA
         conn.pragma_update("journal_mode", "'mvcc'")
@@ -448,9 +419,7 @@ fn test_pragma_journal_mode_mvcc_to_wal() {
     }
 
     // Verify it's now MVCC mode
-    let (write_ver, read_ver) = read_header_versions(&db_path);
-    assert_eq!(write_ver, 255, "Should be MVCC after first open");
-    assert_eq!(read_ver, 255, "Should be MVCC after first open");
+    assert_that!(read_header_versions(&db_path)).is_equal_to((255, 255));
 
     // Step 3: Reopen and switch to WAL mode via PRAGMA
     let io = std::sync::Arc::new(turso_core::PlatformIO::new().unwrap());
@@ -467,7 +436,7 @@ fn test_pragma_journal_mode_mvcc_to_wal() {
     )
     .expect("Failed to open MVCC database with limbo");
 
-    let conn = db.connect().unwrap();
+    let conn = db.connect(ConnectOpts::new()).unwrap();
 
     let result = conn
         .pragma_query("journal_mode")
@@ -510,15 +479,7 @@ fn test_pragma_journal_mode_mvcc_to_wal() {
     drop(db);
 
     // Verify header is now WAL (version 2)
-    let (write_ver, read_ver) = read_header_versions(&db_path);
-    assert_eq!(
-        write_ver, 2,
-        "After PRAGMA journal_mode switch to WAL, write_version should be 2, got {write_ver}"
-    );
-    assert_eq!(
-        read_ver, 2,
-        "After PRAGMA journal_mode switch to WAL, read_version should be 2, got {read_ver}"
-    );
+    assert_that!(read_header_versions(&db_path)).is_equal_to((2, 2));
 }
 
 /// Test switching modes multiple times: WAL -> MVCC -> WAL -> MVCC
@@ -544,7 +505,7 @@ fn test_pragma_journal_mode_multiple_switches() {
     )
     .expect("Failed to open database");
 
-    let conn = db.connect().unwrap();
+    let conn = db.connect(ConnectOpts::new()).unwrap();
 
     // Switch to MVCC
     let result = conn
@@ -553,9 +514,7 @@ fn test_pragma_journal_mode_multiple_switches() {
     assert_eq!(result[0][0].to_string(), "mvcc");
 
     // Verify header is MVCC (version 255)
-    let (write_ver, read_ver) = read_header_versions(&db_path);
-    assert_eq!(write_ver, 255, "mode should be MVCC (write_version=255)");
-    assert_eq!(read_ver, 255, "mode should be MVCC (read_version=255)");
+    assert_that!(read_header_versions(&db_path)).is_equal_to((255, 255));
 
     // Insert data in MVCC mode
     conn.execute("INSERT INTO t (val) VALUES ('after_mvcc_switch')")
@@ -568,9 +527,7 @@ fn test_pragma_journal_mode_multiple_switches() {
     assert_eq!(result[0][0].to_string(), "wal");
 
     // Verify header is MVCC (version 255)
-    let (write_ver, read_ver) = read_header_versions(&db_path);
-    assert_eq!(write_ver, 2, "mode should be WAL (write_version=2)");
-    assert_eq!(read_ver, 2, "mode should be WAL (read_version=2)");
+    assert_that!(read_header_versions(&db_path)).is_equal_to((2, 2));
 
     // Insert data in WAL mode
     conn.execute("INSERT INTO t (val) VALUES ('after_wal_switch')")
@@ -582,9 +539,7 @@ fn test_pragma_journal_mode_multiple_switches() {
         .expect("Switch to MVCC again should work");
     assert_eq!(result[0][0].to_string(), "mvcc");
 
-    let (write_ver, read_ver) = read_header_versions(&db_path);
-    assert_eq!(write_ver, 255, "mode should be MVCC (write_version=255)");
-    assert_eq!(read_ver, 255, "mode should be MVCC (read_version=255)");
+    assert_that!(read_header_versions(&db_path)).is_equal_to((255, 255));
 
     // Insert data in MVCC mode
     conn.execute("INSERT INTO t (val) VALUES ('after_second_mvcc_switch')")
@@ -621,15 +576,7 @@ fn test_pragma_journal_mode_multiple_switches() {
     drop(db);
 
     // Verify final header is MVCC (version 255)
-    let (write_ver, read_ver) = read_header_versions(&db_path);
-    assert_eq!(
-        write_ver, 255,
-        "Final mode should be MVCC (write_version=255)"
-    );
-    assert_eq!(
-        read_ver, 255,
-        "Final mode should be MVCC (read_version=255)"
-    );
+    assert_that!(read_header_versions(&db_path)).is_equal_to((255, 255));
 }
 
 /// Test that PRAGMA journal_mode query returns the current mode correctly
@@ -654,7 +601,7 @@ fn test_pragma_journal_mode_query() {
     )
     .expect("Failed to open database");
 
-    let conn = db.connect().unwrap();
+    let conn = db.connect(ConnectOpts::new()).unwrap();
 
     // Query current journal mode (should be WAL)
     if let Some(mut stmt) = conn.query("PRAGMA journal_mode").unwrap() {
@@ -682,7 +629,7 @@ fn test_pragma_journal_mode_query() {
     )
     .expect("Failed to open database");
 
-    let conn = db.connect().unwrap();
+    let conn = db.connect(ConnectOpts::new()).unwrap();
 
     // Switch to MVCC mode via PRAGMA
     conn.pragma_update("journal_mode", "'mvcc'")
@@ -729,7 +676,7 @@ fn test_pragma_journal_mode_data_persistence_after_switch() {
         )
         .expect("Failed to open database");
 
-        let conn = db.connect().unwrap();
+        let conn = db.connect(ConnectOpts::new()).unwrap();
 
         // Switch to MVCC
         conn.pragma_update("journal_mode", "'mvcc'")
@@ -758,7 +705,7 @@ fn test_pragma_journal_mode_data_persistence_after_switch() {
         )
         .expect("Failed to reopen database");
 
-        let conn = db.connect().unwrap();
+        let conn = db.connect(ConnectOpts::new()).unwrap();
 
         // Verify data persisted
         let mut stmt = conn
@@ -777,6 +724,172 @@ fn test_pragma_journal_mode_data_persistence_after_switch() {
     }
 }
 
+/// Regression for #9504: after switching an existing database with an
+/// AUTOINCREMENT table to MVCC, the sequence must continue instead of reusing
+/// id 1 and replacing that row, both right after the switch and after a reopen.
+/// Reopening without writes must not write to the log.
+#[test]
+fn test_autoincrement_continues_after_switch_to_mvcc_and_reopen() {
+    let tmp_dir = TempDir::new().unwrap();
+    let db_path = tmp_dir.path().join("test.db");
+    let posts = |conn: &Arc<turso_core::Connection>| -> Vec<(i64, String)> {
+        conn.exec_rows("SELECT id, title FROM posts ORDER BY id")
+    };
+    let row = |id: i64, title: &str| (id, title.to_string());
+
+    {
+        let db = open_db(&db_path);
+        let conn = db.connect(ConnectOpts::new()).unwrap();
+        conn.execute("CREATE TABLE posts (id INTEGER PRIMARY KEY AUTOINCREMENT, title TEXT)")
+            .unwrap();
+        conn.execute("INSERT INTO posts (title) VALUES ('a'), ('b')")
+            .unwrap();
+    }
+    {
+        let db = open_db(&db_path);
+        let conn = db.connect(ConnectOpts::new()).unwrap();
+        conn.pragma_update("journal_mode", "'mvcc'").unwrap();
+        let other_conn = db.connect(ConnectOpts::new()).unwrap();
+        other_conn
+            .execute("INSERT INTO posts (title) VALUES ('c')")
+            .unwrap();
+        assert_eq!(
+            posts(&other_conn),
+            vec![row(1, "a"), row(2, "b"), row(3, "c")]
+        );
+    }
+    let log_path = tmp_dir.path().join("test.db-log");
+    let log_size = || std::fs::metadata(&log_path).unwrap().len();
+    let log_size_before_reopen = log_size();
+    for _ in 0..2 {
+        let db = open_db(&db_path);
+        let conn = db.connect(ConnectOpts::new()).unwrap();
+        assert_eq!(posts(&conn).len(), 3);
+    }
+    assert_eq!(log_size(), log_size_before_reopen);
+    {
+        let db = Database::open_file_with_flags(
+            Arc::new(turso_core::PlatformIO::new().unwrap()),
+            db_path.to_str().unwrap(),
+            OpenFlags::ReadOnly,
+            DatabaseOpts::new(),
+            None,
+            Arc::new(SqliteDialect),
+        )
+        .expect("a read-only open must not need to write");
+        let conn = db.connect(ConnectOpts::new()).unwrap();
+        assert_eq!(posts(&conn).len(), 3);
+    }
+    {
+        let db = open_db(&db_path);
+        let conn = db.connect(ConnectOpts::new()).unwrap();
+        conn.execute("INSERT INTO posts (title) VALUES ('d')")
+            .unwrap();
+        assert_eq!(
+            posts(&conn),
+            vec![row(1, "a"), row(2, "b"), row(3, "c"), row(4, "d")]
+        );
+        let sequence: Vec<(String, i64)> = conn.exec_rows("SELECT name, seq FROM sqlite_sequence");
+        assert_eq!(sequence, vec![("posts".to_string(), 4)]);
+    }
+}
+
+/// A database switched to MVCC by a build that did not sync the
+/// AUTOINCREMENT watermarks gets them synced and committed on the next open.
+#[test]
+fn test_autoincrement_watermark_is_committed_when_opening_mvcc_database() {
+    let tmp_dir = TempDir::new().unwrap();
+    let db_path = tmp_dir.path().join("test.db");
+    {
+        let db = open_db(&db_path);
+        let conn = db.connect(ConnectOpts::new()).unwrap();
+        conn.execute("CREATE TABLE posts (id INTEGER PRIMARY KEY AUTOINCREMENT, title TEXT)")
+            .unwrap();
+        conn.execute("INSERT INTO posts (title) VALUES ('a'), ('b')")
+            .unwrap();
+        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+    }
+    mark_header_as_mvcc(&db_path);
+    {
+        let db = open_db(&db_path);
+        let conn = db.connect(ConnectOpts::new()).unwrap();
+        let rows: Vec<(i64,)> = conn.exec_rows("SELECT count(*) FROM posts");
+        assert_eq!(rows, vec![(2,)]);
+    }
+    let db = open_db(&db_path);
+    let conn = db.connect(ConnectOpts::new()).unwrap();
+    conn.execute("INSERT INTO posts (title) VALUES ('c')")
+        .unwrap();
+    let rows: Vec<(i64, String)> = conn.exec_rows("SELECT id, title FROM posts ORDER BY id");
+    assert_eq!(
+        rows,
+        vec![
+            (1, "a".to_string()),
+            (2, "b".to_string()),
+            (3, "c".to_string())
+        ]
+    );
+}
+
+/// Set the header's read and write versions to 255 (MVCC), as a build that
+/// switched to MVCC without syncing the AUTOINCREMENT watermarks left them.
+/// With the `checksum` feature, page 1 ends in an 8-byte checksum of the rest
+/// of the page, so it is written again for the changed header.
+fn mark_header_as_mvcc(db_path: &Path) {
+    let mut bytes = std::fs::read(db_path).unwrap();
+    bytes[18] = 255;
+    bytes[19] = 255;
+    #[cfg(feature = "checksum")]
+    {
+        const PAGE_SIZE: usize = 4096;
+        const CHECKSUM_SIZE: usize = 8;
+        let checksum = twox_hash::XxHash3_64::oneshot(&bytes[..PAGE_SIZE - CHECKSUM_SIZE]);
+        bytes[PAGE_SIZE - CHECKSUM_SIZE..PAGE_SIZE].copy_from_slice(&checksum.to_le_bytes());
+    }
+    std::fs::write(db_path, bytes).unwrap();
+}
+
+/// Switching to MVCC inside a transaction is refused, as in SQLite. Before,
+/// the switch ran, and after COMMIT or ROLLBACK the database could not be
+/// opened again ("Missing MVCC metadata table while logical log state exists").
+#[test]
+fn test_switch_to_mvcc_inside_transaction_is_rejected() {
+    let tmp_dir = TempDir::new().unwrap();
+    let db_path = tmp_dir.path().join("test.db");
+    {
+        let db = open_db(&db_path);
+        let conn = db.connect(ConnectOpts::new()).unwrap();
+        conn.execute("CREATE TABLE posts (id INTEGER PRIMARY KEY AUTOINCREMENT, title TEXT)")
+            .unwrap();
+        conn.execute("INSERT INTO posts (title) VALUES ('a')")
+            .unwrap();
+        conn.execute("BEGIN").unwrap();
+        let result = conn.pragma_update("journal_mode", "'mvcc'");
+        assert!(
+            matches!(result, Err(turso_core::LimboError::TxError(_))),
+            "got: {result:?}"
+        );
+        conn.execute("COMMIT").unwrap();
+    }
+    let db = open_db(&db_path);
+    let conn = db.connect(ConnectOpts::new()).unwrap();
+    let rows: Vec<(i64, String)> = conn.exec_rows("SELECT id, title FROM posts");
+    assert_eq!(rows, vec![(1, "a".to_string())]);
+}
+
+fn open_db(db_path: &Path) -> Arc<Database> {
+    let io = Arc::new(turso_core::PlatformIO::new().unwrap());
+    Database::open_file_with_flags(
+        io,
+        db_path.to_str().unwrap(),
+        OpenFlags::default(),
+        DatabaseOpts::new(),
+        None,
+        Arc::new(SqliteDialect),
+    )
+    .expect("Failed to open database")
+}
+
 /// Open database in readonly mode with limbo and check header versions
 fn open_with_limbo_readonly_and_check(db_path: &Path, enable_mvcc: bool) -> (u8, u8) {
     let io = std::sync::Arc::new(turso_core::PlatformIO::new().unwrap());
@@ -793,7 +906,7 @@ fn open_with_limbo_readonly_and_check(db_path: &Path, enable_mvcc: bool) -> (u8,
     .expect("Failed to open database with limbo in readonly mode");
 
     // Connect to ensure initialization is complete
-    let conn = db.connect().unwrap();
+    let conn = db.connect(ConnectOpts::new()).unwrap();
 
     // Try to enable MVCC if requested (will fail in readonly mode, which is expected)
     if enable_mvcc {
@@ -921,7 +1034,7 @@ fn test_readonly_pragma_journal_mode_cannot_change() {
     )
     .expect("Failed to open database in readonly mode");
 
-    let conn = db.connect().unwrap();
+    let conn = db.connect(ConnectOpts::new()).unwrap();
 
     // Try to switch to MVCC mode via PRAGMA - this should return an error
     // because we cannot change mode on readonly databases
@@ -937,15 +1050,7 @@ fn test_readonly_pragma_journal_mode_cannot_change() {
     drop(db);
 
     // Verify header was NOT modified
-    let (write_ver, read_ver) = read_header_versions(&db_path);
-    assert_eq!(
-        write_ver, 2,
-        "Readonly DB header should NOT be modified (write_version should stay 2), got {write_ver}"
-    );
-    assert_eq!(
-        read_ver, 2,
-        "Readonly DB header should NOT be modified (read_version should stay 2), got {read_ver}"
-    );
+    assert_that!(read_header_versions(&db_path)).is_equal_to((2, 2));
 }
 
 /// Test that readonly MVCC database can still be opened and read
@@ -972,7 +1077,7 @@ fn test_readonly_mvcc_db_can_be_read() {
         )
         .expect("Failed to open database");
 
-        let conn = db.connect().unwrap();
+        let conn = db.connect(ConnectOpts::new()).unwrap();
 
         // Switch to MVCC mode via PRAGMA
         conn.pragma_update("journal_mode", "'mvcc'")
@@ -987,9 +1092,7 @@ fn test_readonly_mvcc_db_can_be_read() {
     }
 
     // Verify it's now MVCC mode
-    let (write_ver, read_ver) = read_header_versions(&db_path);
-    assert_eq!(write_ver, 255, "Should be MVCC after first open");
-    assert_eq!(read_ver, 255, "Should be MVCC after first open");
+    assert_that!(read_header_versions(&db_path)).is_equal_to((255, 255));
 
     // Now open in readonly mode - this should work and we should be able to read data
     let io = std::sync::Arc::new(turso_core::PlatformIO::new().unwrap());
@@ -1005,7 +1108,7 @@ fn test_readonly_mvcc_db_can_be_read() {
     )
     .expect("Failed to open MVCC database in readonly mode");
 
-    let conn = db.connect().unwrap();
+    let conn = db.connect(ConnectOpts::new()).unwrap();
 
     // Verify we can read data
     let mut stmt = conn
@@ -1023,15 +1126,7 @@ fn test_readonly_mvcc_db_can_be_read() {
     drop(db);
 
     // Verify header was NOT modified
-    let (write_ver, read_ver) = read_header_versions(&db_path);
-    assert_eq!(
-        write_ver, 255,
-        "Readonly MVCC DB header should NOT be modified (write_version should stay 255), got {write_ver}"
-    );
-    assert_eq!(
-        read_ver, 255,
-        "Readonly MVCC DB header should NOT be modified (read_version should stay 255), got {read_ver}"
-    );
+    assert_that!(read_header_versions(&db_path)).is_equal_to((255, 255));
 }
 
 fn read_text_encoding(db_path: &Path) -> u32 {

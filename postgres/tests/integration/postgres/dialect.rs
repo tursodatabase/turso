@@ -2,6 +2,184 @@ use crate::common::TempDatabase;
 use turso_core::{Numeric, StepResult, Value};
 
 #[turso_macros::test(mvcc)]
+fn test_postgres_ctes_ignore_search_path(db: TempDatabase) {
+    let conn = db.connect_postgres();
+    conn.execute("CREATE TABLE shadowed_cte (v INTEGER)")
+        .unwrap();
+    conn.execute("INSERT INTO shadowed_cte VALUES (99)")
+        .unwrap();
+    conn.execute("SELECT set_config('search_path', '', false)")
+        .unwrap();
+    for sql in [
+        "WITH shadowed_cte AS (SELECT 17 AS v) SELECT v FROM shadowed_cte",
+        "WITH shadowed_cte AS (SELECT 17 AS v) SELECT (SELECT v FROM shadowed_cte)",
+        "WITH RECURSIVE n(v) AS (SELECT 17 UNION ALL SELECT v + 1 FROM n WHERE v < 19)
+         SELECT v FROM n WHERE v = 17",
+    ] {
+        assert_eq!(
+            conn.prepare(sql).unwrap().run_collect_rows().unwrap(),
+            vec![vec![Value::from_i64(17)]],
+            "{sql}"
+        );
+    }
+    assert!(conn.prepare("SELECT v FROM shadowed_cte").is_err());
+    assert_eq!(
+        conn.prepare("SELECT v FROM public.shadowed_cte")
+            .unwrap()
+            .run_collect_rows()
+            .unwrap(),
+        vec![vec![Value::from_i64(99)]]
+    );
+}
+
+#[turso_macros::test(mvcc)]
+fn test_postgres_access_share_lock_is_noop(db: TempDatabase) {
+    let conn = db.connect_postgres();
+    conn.execute("CREATE TABLE lock_items (v INTEGER)").unwrap();
+    conn.execute("CREATE TABLE lock_other (v INTEGER)").unwrap();
+    conn.execute("INSERT INTO lock_items VALUES (17)").unwrap();
+    let writer = db.connect_postgres();
+    let mut lock = conn
+        .prepare("LOCK TABLE public.lock_items, ONLY public.lock_other IN ACCESS SHARE MODE")
+        .unwrap();
+    conn.execute("BEGIN").unwrap();
+    assert!(lock.run_collect_rows().unwrap().is_empty());
+    drop(lock);
+    assert!(!conn.inner().get_auto_commit());
+    for sql in [
+        "LOCK TABLE lock_items IN ROW EXCLUSIVE MODE",
+        "LOCK TABLE lock_items IN EXCLUSIVE MODE",
+        "LOCK TABLE lock_items IN ACCESS SHARE MODE NOWAIT",
+        "LOCK TABLE lock_items",
+    ] {
+        assert!(conn.prepare(sql).is_err(), "{sql}");
+        assert!(!conn.inner().get_auto_commit());
+    }
+    writer
+        .execute("INSERT INTO lock_items VALUES (29)")
+        .unwrap();
+    assert_eq!(
+        conn.prepare("SELECT v FROM lock_items ORDER BY v")
+            .unwrap()
+            .run_collect_rows()
+            .unwrap(),
+        vec![vec![Value::from_i64(17)], vec![Value::from_i64(29)]]
+    );
+    for sql in [
+        "LOCK TABLE public.lock_items, public.missing_lock_table IN ACCESS SHARE MODE",
+        "LOCK TABLE missing_schema.lock_items IN ACCESS SHARE MODE",
+    ] {
+        assert!(conn
+            .prepare(sql)
+            .unwrap()
+            .run_collect_rows()
+            .unwrap()
+            .is_empty());
+    }
+    writer
+        .execute("INSERT INTO lock_items VALUES (43)")
+        .unwrap();
+    conn.execute("LOCK TABLE lock_items IN ACCESS SHARE MODE")
+        .unwrap();
+    assert_eq!(
+        conn.prepare("SELECT v FROM lock_items ORDER BY v")
+            .unwrap()
+            .run_collect_rows()
+            .unwrap(),
+        vec![vec![Value::from_i64(17)], vec![Value::from_i64(29)]]
+    );
+    conn.execute("ROLLBACK").unwrap();
+    assert!(conn.inner().get_auto_commit());
+    assert_eq!(
+        conn.prepare("SELECT v FROM lock_items ORDER BY v")
+            .unwrap()
+            .run_collect_rows()
+            .unwrap(),
+        vec![
+            vec![Value::from_i64(17)],
+            vec![Value::from_i64(29)],
+            vec![Value::from_i64(43)],
+        ]
+    );
+}
+
+#[turso_macros::test(mvcc)]
+fn test_postgres_access_share_lock_requires_transaction_at_execution(db: TempDatabase) {
+    let conn = db.connect_postgres();
+    conn.execute("CREATE TABLE lock_items (v INTEGER)").unwrap();
+    conn.execute("BEGIN").unwrap();
+    let mut stmt = conn
+        .prepare("LOCK TABLE lock_items IN ACCESS SHARE MODE")
+        .unwrap();
+    conn.execute("ROLLBACK").unwrap();
+    let error = stmt.run_ignore_rows().unwrap_err();
+    assert!(error.to_string().contains("transaction blocks"), "{error}");
+    assert!(conn.inner().get_auto_commit());
+}
+
+#[turso_macros::test(mvcc)]
+fn test_postgres_rejects_unsupported_transaction_commands(db: TempDatabase) {
+    let conn = db.connect_postgres();
+    assert!(conn
+        .prepare("SET TRANSACTION SNAPSHOT '00000003-0000001B-1'")
+        .is_err());
+    assert!(conn
+        .prepare("SET SESSION CHARACTERISTICS AS TRANSACTION READ ONLY")
+        .is_err());
+}
+
+#[turso_macros::test(mvcc)]
+fn test_postgres_rejects_unsupported_set_and_show(db: TempDatabase) {
+    let conn = db.connect_postgres();
+    for sql in [
+        "SET statement_timeout = 1000",
+        "SET foreign_keys = off",
+        "SET LOCAL lock_timeout = '1s'",
+        "SHOW server_version",
+        "SHOW journal_mode",
+    ] {
+        let err = conn
+            .prepare(sql)
+            .err()
+            .unwrap_or_else(|| panic!("{sql} was accepted"));
+        assert!(err.to_string().contains("is not supported"), "{sql}: {err}");
+    }
+    conn.prepare("SET search_path TO public").unwrap();
+    conn.prepare("SHOW search_path").unwrap();
+
+    for sql in [
+        "SET DATESTYLE = ISO",
+        "SET INTERVALSTYLE = POSTGRES",
+        "SET extra_float_digits TO 3",
+        "SET synchronize_seqscans TO off",
+        "SET statement_timeout = 0",
+        "SET lock_timeout = 0",
+        "SET idle_in_transaction_session_timeout = 0",
+        "SET row_security = off",
+        "SET client_encoding = 'UTF8'",
+        "SET standard_conforming_strings = on",
+        "SET check_function_bodies = false",
+        "SET client_min_messages = warning",
+        "SET default_tablespace = ''",
+        "SET default_table_access_method = heap",
+        "SET transaction_timeout = 0",
+        "SET xmloption = content",
+    ] {
+        conn.execute(sql).unwrap_or_else(|e| panic!("{sql}: {e}"));
+    }
+    for sql in [
+        "SET DATESTYLE = SQL",
+        "SET extra_float_digits = 0",
+        "SET row_security = on",
+        "SET client_encoding = 'LATIN1'",
+        "SET standard_conforming_strings = off",
+        "SET client_min_messages = bogus",
+    ] {
+        assert!(conn.prepare(sql).is_err(), "{sql} was accepted");
+    }
+}
+
+#[turso_macros::test(mvcc)]
 fn test_postgres_frontend_rejects_pragma(db: TempDatabase) {
     let conn = db.connect_postgres();
 
@@ -318,6 +496,79 @@ fn test_postgres_create_schema_public_error(db: TempDatabase) {
 }
 
 #[turso_macros::test]
+fn test_postgres_create_schema_with_failing_element_creates_nothing(db: TempDatabase) {
+    let conn = db.connect_postgres();
+
+    let err = conn
+        .execute("CREATE SCHEMA s CREATE TABLE t (a int) CREATE TABLE t (b int)")
+        .unwrap_err();
+    assert!(err.to_string().contains("already exists"), "{err}");
+    assert!(conn.execute("SELECT * FROM s.t").is_err());
+
+    conn.execute("CREATE SCHEMA s CREATE TABLE t (a int)")
+        .unwrap();
+    conn.execute("INSERT INTO s.t VALUES (1)").unwrap();
+    let rows = conn
+        .prepare("SELECT a FROM s.t")
+        .unwrap()
+        .run_collect_rows()
+        .unwrap();
+    assert_eq!(rows, vec![vec![Value::from_i64(1)]]);
+    let rows = conn
+        .prepare("SHOW search_path")
+        .unwrap()
+        .run_collect_rows()
+        .unwrap();
+    assert_eq!(rows, vec![vec![Value::build_text("\"$user\", public")]]);
+}
+
+#[turso_macros::test]
+fn test_postgres_create_schema_with_empty_search_path(db: TempDatabase) {
+    let conn = db.connect_postgres();
+    for setting in ["", "  "] {
+        conn.execute(format!(
+            "SELECT set_config('search_path', '{setting}', false)"
+        ))
+        .unwrap();
+        conn.execute("DROP SCHEMA IF EXISTS s CASCADE").unwrap();
+        conn.execute("CREATE SCHEMA s CREATE TABLE t (a int) CREATE VIEW v AS SELECT a FROM t")
+            .unwrap();
+        conn.execute("INSERT INTO s.t VALUES (1)").unwrap();
+        let rows = conn
+            .prepare("SELECT a FROM s.v")
+            .unwrap()
+            .run_collect_rows()
+            .unwrap();
+        assert_eq!(rows, vec![vec![Value::from_i64(1)]]);
+        let rows = conn
+            .prepare("SHOW search_path")
+            .unwrap()
+            .run_collect_rows()
+            .unwrap();
+        assert_eq!(rows, vec![vec![Value::build_text(setting)]]);
+    }
+}
+
+#[turso_macros::test]
+fn test_postgres_create_schema_with_elements_in_transaction_errors(db: TempDatabase) {
+    let conn = db.connect_postgres();
+    conn.execute("BEGIN").unwrap();
+    let err = conn
+        .execute("CREATE SCHEMA s CREATE TABLE t (a int) CREATE TABLE t (b int)")
+        .unwrap_err();
+    assert!(
+        err.to_string()
+            .contains("cannot run inside a transaction block"),
+        "{err}"
+    );
+    conn.execute("ROLLBACK").unwrap();
+
+    conn.execute("CREATE SCHEMA s CREATE TABLE t (a int)")
+        .unwrap();
+    conn.execute("INSERT INTO s.t VALUES (1)").unwrap();
+}
+
+#[turso_macros::test]
 fn test_postgres_drop_schema(db: TempDatabase) {
     let conn = db.connect_postgres();
 
@@ -361,6 +612,28 @@ fn test_postgres_drop_schema_cascade(db: TempDatabase) {
 }
 
 #[turso_macros::test]
+fn test_postgres_drop_schema_cascade_drops_tables_that_reference_each_other(db: TempDatabase) {
+    let conn = db.connect_postgres();
+    conn.pragma_update("foreign_keys", "ON").unwrap();
+    conn.execute("CREATE SCHEMA app").unwrap();
+    conn.execute("CREATE TABLE app.a (id int PRIMARY KEY)")
+        .unwrap();
+    conn.execute("CREATE TABLE app.z (a_id int REFERENCES app.a (id))")
+        .unwrap();
+    conn.execute("INSERT INTO app.a VALUES (1)").unwrap();
+    conn.execute("INSERT INTO app.z VALUES (1)").unwrap();
+
+    conn.execute("DROP SCHEMA app CASCADE").unwrap();
+
+    conn.execute("CREATE SCHEMA app").unwrap();
+    conn.execute("CREATE TABLE app.a (id int PRIMARY KEY)")
+        .unwrap();
+    conn.execute("CREATE TABLE app.z (a_id int REFERENCES app.a (id))")
+        .unwrap();
+    assert!(conn.execute("INSERT INTO app.z VALUES (1)").is_err());
+}
+
+#[turso_macros::test]
 fn test_postgres_drop_schema_public_cascade(db: TempDatabase) {
     let conn = db.connect_postgres();
 
@@ -389,6 +662,38 @@ fn test_postgres_drop_schema_public_cascade(db: TempDatabase) {
     let StepResult::Row = rows.step().unwrap() else {
         panic!("expected row");
     };
+}
+
+#[test]
+fn test_postgres_drop_schema_public_cascade_drops_autoincrement_table() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("main.db");
+    let path = path.to_str().unwrap();
+    let io = std::sync::Arc::new(turso_core::PlatformIO::new().unwrap());
+    let sqlite_db = turso_core::Database::open_file(
+        io.clone(),
+        path,
+        std::sync::Arc::new(turso_core::SqliteDialect),
+    )
+    .unwrap();
+    sqlite_db
+        .connect(turso_core::ConnectOpts::new())
+        .unwrap()
+        .execute("CREATE TABLE counted (id INTEGER PRIMARY KEY AUTOINCREMENT, v TEXT)")
+        .unwrap();
+    drop(sqlite_db);
+    let db = turso_pg::open_database_with_io(
+        io,
+        path,
+        turso_core::OpenFlags::default(),
+        turso_core::DatabaseOpts::new(),
+    )
+    .unwrap();
+    let conn = turso_pg::PgConnection::connect(&db).unwrap();
+
+    conn.execute("DROP SCHEMA public CASCADE").unwrap();
+
+    assert!(conn.query("SELECT * FROM counted").is_err());
 }
 
 #[turso_macros::test]
@@ -503,6 +808,49 @@ fn test_postgres_alter_table_drop_column(db: TempDatabase) {
         panic!("expected text");
     };
     assert_eq!(name.value, "alice");
+}
+
+#[turso_macros::test]
+fn test_postgres_alter_table_keeps_non_literal_defaults_readable_after_reopen(db: TempDatabase) {
+    let conn = db.connect_postgres();
+    conn.execute(
+        "CREATE TABLE t (id serial PRIMARY KEY, a int, c timestamp DEFAULT now(), \
+         d text DEFAULT lower('X'), e int DEFAULT 1+2, f int DEFAULT 5, \
+         g int DEFAULT (1+2)*3, h int DEFAULT -(1+2), m int DEFAULT 10-(4-1), \
+         i boolean DEFAULT ((true OR false) IS NULL), j boolean DEFAULT ((true OR false) IS FALSE), \
+         k boolean DEFAULT ((true OR false) BETWEEN false AND false))",
+    )
+    .unwrap();
+    conn.execute("ALTER TABLE t ADD COLUMN b int").unwrap();
+    conn.execute("ALTER TABLE t DROP COLUMN a").unwrap();
+
+    let path = db.path.clone();
+    let io = db.io.clone();
+    drop(conn);
+    drop(db);
+
+    let db = turso_pg::open_database_with_io(
+        io,
+        path.to_str().unwrap(),
+        turso_core::OpenFlags::default(),
+        turso_core::DatabaseOpts::new().with_custom_types(true),
+    )
+    .unwrap();
+    let conn = turso_pg::Connection::connect(&db).unwrap();
+    conn.execute("INSERT INTO t (b) VALUES (7)").unwrap();
+    let mut rows = conn
+        .query("SELECT id, d, e, f, g, h, m, i, j, k, b FROM t")
+        .unwrap()
+        .unwrap();
+    let StepResult::Row = rows.step().unwrap() else {
+        panic!("expected row");
+    };
+    let row = rows.row().unwrap();
+    let values: Vec<String> = (0..11).map(|i| row.get_value(i).to_string()).collect();
+    assert_eq!(
+        values,
+        vec!["1", "x", "3", "5", "9", "-3", "7", "0", "0", "0", "7"]
+    );
 }
 
 #[turso_macros::test(mvcc)]
@@ -1992,10 +2340,14 @@ fn test_postgres_order_by_nulls_first_last(db: TempDatabase) {
         results
     };
 
-    // Default ASC ordering treats NULLs as smallest, matching PostgreSQL.
+    // PostgreSQL treats NULLs as largest by default, unlike SQLite.
     assert_eq!(
         run("SELECT v FROM t ORDER BY v"),
-        vec![None, None, Some(5), Some(10), Some(20)]
+        vec![Some(5), Some(10), Some(20), None, None]
+    );
+    assert_eq!(
+        run("SELECT v FROM t ORDER BY v DESC"),
+        vec![None, None, Some(20), Some(10), Some(5)]
     );
     assert_eq!(
         run("SELECT v FROM t ORDER BY v NULLS FIRST"),
@@ -3515,4 +3867,108 @@ fn test_postgres_catalog_conkey_any_matches_no_rows(db: TempDatabase) {
         .unwrap();
     let rows = stmt.run_collect_rows().unwrap();
     assert_eq!(rows, vec![vec![Value::from_i64(0)]]);
+}
+
+#[turso_macros::test(mvcc)]
+fn test_postgres_show_search_path_reads_the_setting_when_executed(db: TempDatabase) {
+    let conn = db.connect_postgres();
+    let mut show = conn.prepare("SHOW search_path").unwrap();
+    assert_eq!(show.num_columns(), 1);
+    assert_eq!(show.get_column_name(0), "search_path");
+    assert_eq!(
+        show.run_collect_rows().unwrap(),
+        vec![vec![Value::build_text("\"$user\", public")]]
+    );
+    conn.execute("SET search_path TO public, pg_catalog")
+        .unwrap();
+    show.reset().unwrap();
+    assert_eq!(
+        show.run_collect_rows().unwrap(),
+        vec![vec![Value::build_text("public, pg_catalog")]]
+    );
+    assert_eq!(
+        conn.prepare("SHOW SEARCH_PATH")
+            .unwrap()
+            .run_collect_rows()
+            .unwrap(),
+        vec![vec![Value::build_text("public, pg_catalog")]]
+    );
+}
+
+#[turso_macros::test]
+fn test_postgres_prepared_statement_keeps_search_path_after_schema_change(db: TempDatabase) {
+    let conn = db.connect_postgres();
+    conn.execute("CREATE TABLE demo (label text)").unwrap();
+    conn.execute("INSERT INTO demo VALUES ('from public')")
+        .unwrap();
+    conn.execute("CREATE SCHEMA sp").unwrap();
+    conn.execute("CREATE TABLE sp.demo (label text)").unwrap();
+    conn.execute("INSERT INTO sp.demo VALUES ('from sp')")
+        .unwrap();
+    conn.execute("SET search_path TO sp").unwrap();
+
+    let mut stmt = conn.prepare("SELECT label FROM demo").unwrap();
+    assert_eq!(
+        stmt.run_collect_rows().unwrap(),
+        vec![vec![Value::build_text("from sp")]]
+    );
+
+    conn.execute("CREATE TABLE sp.other (x int)").unwrap();
+    stmt.reset().unwrap();
+    assert_eq!(
+        stmt.run_collect_rows().unwrap(),
+        vec![vec![Value::build_text("from sp")]]
+    );
+}
+
+#[turso_macros::test]
+fn test_postgres_prepared_statement_follows_search_path_changes(db: TempDatabase) {
+    let conn = db.connect_postgres();
+    conn.execute("CREATE TABLE demo (label text)").unwrap();
+    conn.execute("INSERT INTO demo VALUES ('from public')")
+        .unwrap();
+    conn.execute("CREATE SCHEMA sp").unwrap();
+    conn.execute("CREATE TABLE sp.demo (label text)").unwrap();
+    conn.execute("INSERT INTO sp.demo VALUES ('from sp')")
+        .unwrap();
+    conn.execute("SET search_path TO sp").unwrap();
+
+    let mut stmt = conn.prepare("SELECT label FROM demo").unwrap();
+    assert_eq!(
+        stmt.run_collect_rows().unwrap(),
+        vec![vec![Value::build_text("from sp")]]
+    );
+
+    conn.execute("SET search_path TO public").unwrap();
+    stmt.reset().unwrap();
+    assert_eq!(
+        stmt.run_collect_rows().unwrap(),
+        vec![vec![Value::build_text("from public")]]
+    );
+}
+
+#[turso_macros::test(mvcc)]
+fn test_postgres_unnamed_index_keeps_its_name_after_reprepare(db: TempDatabase) {
+    let conn = db.connect_postgres();
+    conn.execute("CREATE TABLE t (a int, b int)").unwrap();
+
+    let mut first = conn.prepare("CREATE INDEX ON t (a)").unwrap();
+    let mut second = conn.prepare("CREATE INDEX ON t (b)").unwrap();
+    first.run_ignore_rows().unwrap();
+    second.run_ignore_rows().unwrap();
+    assert_eq!(
+        second.stmt_status(turso_core::StatementStatusCounter::Reprepare),
+        1
+    );
+
+    let mut names = conn
+        .prepare("SELECT indexname FROM pg_indexes WHERE tablename = 't' ORDER BY indexname")
+        .unwrap();
+    assert_eq!(
+        names.run_collect_rows().unwrap(),
+        vec![
+            vec![Value::build_text("t_a_idx")],
+            vec![Value::build_text("t_b_idx")],
+        ]
+    );
 }

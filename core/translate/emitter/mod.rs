@@ -37,9 +37,13 @@ pub enum TransactionMode {
     Concurrent,
 }
 
+/// Open the CDC table's cursor when the statement captures changes.
+/// `database_id` is the database of the changed table: changes to temp
+/// tables are not captured.
 pub fn prepare_cdc_if_necessary(
     program: &mut ProgramBuilder,
     schema: &Schema,
+    database_id: usize,
     changed_table_name: Option<&str>,
 ) -> Result<Option<(usize, Arc<BTreeTable>)>> {
     let mode = program.capture_data_changes_info();
@@ -47,12 +51,15 @@ pub fn prepare_cdc_if_necessary(
     let Some(cdc_table) = cdc_table else {
         return Ok(None);
     };
+    if database_id == crate::TEMP_DB_ID {
+        return Ok(None);
+    }
     // Self-exclusion: never capture changes to CDC's own bookkeeping tables. `None` means the
     // caller has no associated table (e.g. a transaction-boundary COMMIT record) and always
     // gets the cursor.
     if let Some(changed_table_name) = changed_table_name {
         if changed_table_name == cdc_table
-            || changed_table_name == crate::translate::pragma::TURSO_CDC_VERSION_TABLE_NAME
+            || changed_table_name == crate::cdc::TURSO_CDC_VERSION_TABLE_NAME
         {
             return Ok(None);
         }
@@ -77,7 +84,6 @@ pub fn emit_cdc_full_record(
     columns: &[Column],
     table_cursor_id: usize,
     rowid_reg: usize,
-    is_strict: bool,
 ) -> usize {
     let storable_count = columns.iter().filter(|c| !c.is_virtual_generated()).count();
     let columns_reg = program.alloc_registers(storable_count + 1);
@@ -100,7 +106,7 @@ pub fn emit_cdc_full_record(
     let affinity_str = columns
         .iter()
         .filter(|col| !col.is_virtual_generated())
-        .map(|col| col.affinity_with_strict(is_strict).aff_mask())
+        .map(|col| col.affinity().aff_mask())
         .collect::<String>();
 
     program.emit_insn(Insn::MakeRecord {
@@ -217,7 +223,6 @@ fn emit_cdc_change_id(
             name,
             sequence,
             dest_reg,
-            None,
         ),
     }
 }
@@ -619,53 +624,100 @@ fn emit_cdc_commit_row(
     Ok(())
 }
 
-/// Emit a CDC COMMIT record at end-of-statement when in autocommit mode (v2 only).
-/// This should be called once per statement, after the main loop, not per-row.
+/// Emit the CDC COMMIT record at the end of a schema statement, once, when in autocommit
+/// mode (v2 only). Only the root statement writes it; a trigger or FK action subprogram
+/// never does.
 pub fn emit_cdc_autocommit_commit(
     program: &mut ProgramBuilder,
     catalog: &SemanticContext<'_>,
     cdc_cursor_id: usize,
 ) -> Result<()> {
+    if program.flags.is_subprogram() {
+        return Ok(());
+    }
+    let cdc_info = program.capture_data_changes_info().as_ref();
+    if !cdc_info.is_some_and(|info| info.cdc_version().has_commit_record()) {
+        return Ok(());
+    }
     with_cdc_change_ids(program, catalog, |program, change_ids| {
-        emit_cdc_statement_commit(program, change_ids, cdc_cursor_id)
+        emit_cdc_statement_commit(program, change_ids, CdcCommitCursor::Open(cdc_cursor_id))
     })
+}
+
+/// The CDC table cursor a statement's COMMIT record is written through.
+pub(crate) enum CdcCommitCursor {
+    /// The cursor the statement captured its own rows through.
+    Open(usize),
+    /// The statement's own table is not captured (a TEMP table). The CDC
+    /// table is opened, and the record written, only when a trigger or FK
+    /// action that ran during the statement captured a row.
+    OpenWhenCaptured(Arc<BTreeTable>),
 }
 
 /// At the end of a statement in autocommit mode, write a CDC COMMIT record
 /// (v2 only).
-pub fn emit_cdc_statement_commit(
+pub(crate) fn emit_cdc_statement_commit(
     program: &mut ProgramBuilder,
     change_ids: &CdcChangeIds<'_>,
-    cdc_cursor_id: usize,
+    cursor: CdcCommitCursor,
 ) -> Result<()> {
-    let cdc_info = program.capture_data_changes_info().as_ref();
-    if cdc_info.is_some_and(|info| info.cdc_version().has_commit_record()) {
-        // Check if we're in autocommit mode; if so, emit a COMMIT record.
-        let is_autocommit_fn_ctx = crate::function::FuncCtx {
-            func: Func::Scalar(crate::function::ScalarFunc::IsAutocommit),
-            arg_count: 0,
-        };
-        let autocommit_reg = program.alloc_register();
-        program.emit_insn(Insn::Function {
-            constant_mask: 0,
-            start_reg: 0,
-            dest: autocommit_reg,
-            func: is_autocommit_fn_ctx,
-        });
+    // Check if we're in autocommit mode; if so, emit a COMMIT record.
+    let is_autocommit_fn_ctx = crate::function::FuncCtx {
+        func: Func::Scalar(crate::function::ScalarFunc::IsAutocommit),
+        arg_count: 0,
+    };
+    let autocommit_reg = program.alloc_register();
+    program.emit_insn(Insn::Function {
+        constant_mask: 0,
+        start_reg: 0,
+        dest: autocommit_reg,
+        func: is_autocommit_fn_ctx,
+    });
 
-        // IfNot jumps when reg == 0 (not autocommit). Skip the COMMIT in that case.
-        let skip_label = program.allocate_label();
-        program.emit_insn(Insn::IfNot {
-            reg: autocommit_reg,
-            target_pc: skip_label,
-            jump_if_null: true,
-        });
+    // IfNot jumps when reg == 0 (not autocommit). Skip the COMMIT in that case.
+    let skip_label = program.allocate_label();
+    program.emit_insn(Insn::IfNot {
+        reg: autocommit_reg,
+        target_pc: skip_label,
+        jump_if_null: true,
+    });
 
-        emit_cdc_commit_row(program, change_ids, cdc_cursor_id)?;
+    let cdc_cursor_id = match cursor {
+        CdcCommitCursor::Open(cdc_cursor_id) => cdc_cursor_id,
+        CdcCommitCursor::OpenWhenCaptured(cdc_table) => {
+            // `conn_txn_id(-1)` is -1 until a row is captured.
+            let minus_one_reg = program.alloc_register();
+            program.emit_int(-1, minus_one_reg);
+            let txn_id_reg = program.alloc_register();
+            program.emit_insn(Insn::Function {
+                constant_mask: 0,
+                start_reg: minus_one_reg,
+                dest: txn_id_reg,
+                func: crate::function::FuncCtx {
+                    func: Func::Scalar(crate::function::ScalarFunc::ConnTxnId),
+                    arg_count: 1,
+                },
+            });
+            program.emit_insn(Insn::Eq {
+                lhs: txn_id_reg,
+                rhs: minus_one_reg,
+                target_pc: skip_label,
+                flags: crate::vdbe::insn::CmpInsFlags::default(),
+                collation: None,
+            });
+            let cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(cdc_table.clone()));
+            program.emit_insn(Insn::OpenWrite {
+                cursor_id,
+                root_page: cdc_table.root_page.into(),
+                db: crate::MAIN_DB_ID,
+            });
+            cursor_id
+        }
+    };
 
-        program.preassign_label_to_next_insn(skip_label);
-    }
+    emit_cdc_commit_row(program, change_ids, cdc_cursor_id)?;
 
+    program.preassign_label_to_next_insn(skip_label);
     Ok(())
 }
 
@@ -723,7 +775,9 @@ pub fn emit_cdc_explicit_commit_insns(
     });
 
     // A COMMIT record has no associated table, so pass `None` (no self-exclusion check).
-    if let Some((cdc_cursor_id, _)) = prepare_cdc_if_necessary(program, schema, None)? {
+    if let Some((cdc_cursor_id, _)) =
+        prepare_cdc_if_necessary(program, schema, crate::MAIN_DB_ID, None)?
+    {
         emit_cdc_commit_insns(program, catalog, cdc_cursor_id)?;
     }
 

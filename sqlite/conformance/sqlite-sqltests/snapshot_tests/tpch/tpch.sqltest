@@ -727,7 +727,7 @@ snapshot q19-discounted-revenue {
 
 # Q20: Potential Part Promotion
 @setup schema
-snapshot-eqp q20-potential-part-promotion {
+snapshot q20-potential-part-promotion {
     select
         s_name,
         s_address
@@ -765,6 +765,27 @@ snapshot-eqp q20-potential-part-promotion {
         and n_name = 'IRAN'
     order by
         s_name;
+}
+
+# A possibly failing bound must not run while the automatic index is built.
+@setup schema
+snapshot q20-function-bound-stays-outside-autoindex-build {
+    select
+        ps_suppkey
+    from
+        partsupp
+    where
+        ps_availqty > (
+            select
+                0.5 * sum(l_quantity)
+            from
+                lineitem
+            where
+                l_partkey = ps_partkey
+                and l_suppkey = ps_suppkey
+                and l_shipdate >= json_extract('"1994-01-01"', '$')
+                and l_shipdate < '1995-01-01'
+        );
 }
 
 # Q21: Suppliers Who Kept Orders Waiting

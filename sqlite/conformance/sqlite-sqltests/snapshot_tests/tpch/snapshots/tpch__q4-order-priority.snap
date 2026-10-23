@@ -37,62 +37,62 @@ QUERY PLAN
 `--USE SORTER FOR GROUP BY
 
 BYTECODE
-addr  opcode                  p1  p2  p3  p4                                     p5  comment
-   0        Init               0  54   0                                          0  Start at 54
-   1        Null               0   1   0                                          0  r[1]=NULL
-   2        SorterOpen         0   1   0  k(1,B)                                  0  cursor=0
-   3        Integer            0  56   0                                          0  r[56]=0
-   4        Null               0  57   0                                          0  r[57]=NULL
-   5        Gosub             55  50   0                                          0
-   6        OpenRead           2   9   0  k(9,B,B,B,B,B,B,B,B,B)                  0  table=orders, root=9, iDb=0
-   7        OpenRead           3  11   0  k(3,B,B)                                0  index=sqlite_autoindex_lineitem_1, root=11, iDb=0
-   8        OpenRead           4  10   0  k(17,B,B,B,B,B,B,B,B,B,B,B,B,B,B,B,B)   0  table=lineitem, root=10, iDb=0
-   9        Rewind             2  27   0                                          0  Rewind table orders
-  10          Column           2   4  59                                          0  r[59]=orders.O_ORDERDATE
-  11          Lt              59  60  26                                          0  if r[59]<r[60] goto 26
-  12          Column           2   4  61                                          0  r[61]=orders.O_ORDERDATE
-  13          Ge              61  62  26                                          0  if r[61]>=r[62] goto 26
-  14          RowId            2  63   0                                          0  r[63]=orders.rowid
-  15          SeekGE           3  25  63                                          0  key=[63..63]
-  16            IdxGT          3  25  63                                          0  key=[63..63]
-  17            DeferredSeek   3   4   0                                          0
-  18            ColumnRange    4  11  64  2                                       0  r[64..65]=lineitem.L_COMMITDATE..L_RECEIPTDATE
-  19            Ge            64  65  24                                          0  if r[64]>=r[65] goto 24
-  20            Column         2   5  53                                          0  r[53]=orders.O_ORDERPRIORITY
-  21            MakeRecord    53   1  52                                          0  r[52]=mkrec(r[53..53])
-  22            SorterInsert   0  52   0  0                                       0  key=r[52]
-  23            Goto           0  26   0                                          0  ; semi-join: early out after first match
-  24          Next             3  16   0                                          0
-  25          Goto             0  26   0                                          0  ; semi-join: no match, skip outer row
-  26        Next               2  10   0                                          1
-  27        OpenPseudo         1  52   1                                          0  1 columns in r[52]
-  28        SorterSort         0  41   0                                          0
-  29          SorterData       0  52   1                                          0  r[52]=data
-  30          Column           1   0  58                                          0  r[58]=pseudo.column 0
-  31          Compare         57  58   1  k(1, Binary)                            0  r[57..57]==r[58..58]
-  32          Jump            33  36  33                                          0
-  33          Gosub           54  43   0                                          0
-  34          Move            58  57   1                                          0  r[57..57]=r[58..58]
-  35          Gosub           55  50   0                                          0
-  36          Integer          1  66   0                                          0  r[66]=1
-  37          AggStep          0  66   1  count                                   0  accum=r[1] step(r[66])
-  38          If              56  39   0                                          0  if r[56] goto 39
-  39          Integer          1  56   0                                          0  r[56]=1
-  40        SorterNext         0  29   0                                          0
-  41        Gosub             54  43   0                                          0
-  42        Goto               0  53   0                                          0
-  43        IfPos             56  45   0                                          0  r[56]>0 -> r[56]-=0, goto 45
-  44      Return              54   0   0                                          0
-  45      AggFinal             0   1   0  count                                   0  accum=r[1]
-  46      Copy                57  67   0                                          0  r[67]=r[57]
-  47      Copy                 1  68   0                                          0  r[68]=r[1]
-  48      ResultRow           67   2   0                                          0  output=r[67..68]
-  49    Return                54   0   0                                          0
-  50    Null                   0   1   0                                          0  r[1]=NULL
-  51    Integer                0  56   0                                          0  r[56]=0
-  52  Return                  55   0   0                                          0
-  53  Halt                     0   0   0                                          0
-  54  Transaction              0   1   8                                          0  iDb=0 tx_mode=Read
-  55  String8                  0  60   0  1997-06-01                              0  r[60]='1997-06-01'
-  56  String8                  0  62   0  1997-09-01                              0  r[62]='1997-09-01'
-  57  Goto                     0   1   0                                          0
+addr  opcode            p1  p2  p3  p4                                     p5  comment
+   0  Init               0  54   0                                          0  Start at 54
+   1  Null               0   1   0                                          0  r[1]=NULL
+   2  SorterOpen         0   1   0  k(1,B)                                  0  cursor=0
+   3  Integer            0  56   0                                          0  r[56]=0
+   4  Null               0  57   0                                          0  r[57]=NULL
+   5  Gosub             55  50   0                                          0
+   6  OpenRead           2   9   0  k(9,B,B,B,B,B,B,B,B,B)                  0  table=orders, root=9, iDb=0
+   7  OpenRead           3  11   0  k(3,B,B)                                0  index=sqlite_autoindex_lineitem_1, root=11, iDb=0
+   8  OpenRead           4  10   0  k(17,B,B,B,B,B,B,B,B,B,B,B,B,B,B,B,B)   0  table=lineitem, root=10, iDb=0
+   9  Rewind             2  27   0                                          0  Rewind table orders
+  10    Column           2   4  59                                          0  r[59]=orders.O_ORDERDATE
+  11    Lt              59  60  26  Binary                                  0  if r[59]<r[60] goto 26
+  12    Column           2   4  61                                          0  r[61]=orders.O_ORDERDATE
+  13    Ge              61  62  26  Binary                                  0  if r[61]>=r[62] goto 26
+  14    RowId            2  63   0                                          0  r[63]=orders.rowid
+  15    SeekGE           3  25  63                                          0  key=[63..63]
+  16      IdxGT          3  25  63                                          0  key=[63..63]
+  17      DeferredSeek   3   4   0                                          0
+  18      ColumnRange    4  11  64  2                                       0  r[64..65]=lineitem.L_COMMITDATE..L_RECEIPTDATE
+  19      Ge            64  65  24  Binary                                  0  if r[64]>=r[65] goto 24
+  20      Column         2   5  53                                          0  r[53]=orders.O_ORDERPRIORITY
+  21      MakeRecord    53   1  52                                          0  r[52]=mkrec(r[53..53])
+  22      SorterInsert   0  52   0  0                                       0  key=r[52]
+  23      Goto           0  26   0                                          0  ; semi-join: early out after first match
+  24    Next             3  16   0                                          0
+  25    Goto             0  26   0                                          0  ; semi-join: no match, skip outer row
+  26  Next               2  10   0                                          1
+  27  OpenPseudo         1  52   1                                          0  1 columns in r[52]
+  28  SorterSort         0  41   0                                          0
+  29    SorterData       0  52   1                                          0  r[52]=data
+  30    Column           1   0  58                                          0  r[58]=pseudo.column 0
+  31    Compare         57  58   1  k(1, Binary)                            0  r[57..57]==r[58..58]
+  32    Jump            33  36  33                                          0
+  33    Gosub           54  43   0                                          0
+  34    Move            58  57   1                                          0  r[57..57]=r[58..58]
+  35    Gosub           55  50   0                                          0
+  36    Integer          1  66   0                                          0  r[66]=1
+  37    AggStep          0  66   1  count                                   0  accum=r[1] step(r[66])
+  38    If              56  39   0                                          0  if r[56] goto 39
+  39    Integer          1  56   0                                          0  r[56]=1
+  40  SorterNext         0  29   0                                          0
+  41  Gosub             54  43   0                                          0
+  42  Goto               0  53   0                                          0
+  43  IfPos             56  45   0                                          0  r[56]>0 -> r[56]-=0, goto 45
+  44  Return            54   0   0                                          0
+  45  AggFinal           0   1   0  count                                   0  accum=r[1]
+  46  Copy              57  67   0                                          0  r[67]=r[57]
+  47  Copy               1  68   0                                          0  r[68]=r[1]
+  48  ResultRow         67   2   0                                          0  output=r[67..68]
+  49  Return            54   0   0                                          0
+  50  Null               0   1   0                                          0  r[1]=NULL
+  51  Integer            0  56   0                                          0  r[56]=0
+  52  Return            55   0   0                                          0
+  53  Halt               0   0   0                                          0
+  54  Transaction        0   1   8                                          0  iDb=0 tx_mode=Read
+  55  String8            0  60   0  1997-06-01                              0  r[60]='1997-06-01'
+  56  String8            0  62   0  1997-09-01                              0  r[62]='1997-09-01'
+  57  Goto               0   1   0                                          0

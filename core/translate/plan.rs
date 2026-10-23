@@ -14,7 +14,7 @@ use crate::{
     Result,
 };
 use std::{marker::PhantomData, ops::Range, sync::Arc};
-use turso_parser::ast::{self, Expr};
+use turso_parser::ast::{self};
 
 /// The most sources one FROM clause may join: a join bitmask fits in 64 bits.
 pub(crate) const MAX_JOINED_TABLES: usize = 63;
@@ -253,6 +253,149 @@ fn lift_or_common_conjuncts(
     ))
 }
 
+/// `col IN (v1, v2, ...)` terms an OR term implies: every branch of the
+/// OR, its ANDs flattened, compares `col` with a literal by `=`. The OR
+/// stays, since the IN only narrows the rows it is checked on, but the IN
+/// can drive an index seek the OR cannot. With several such columns of one
+/// table, only the one that alone starts an index is used, so that two
+/// seeks do not compete for the same table.
+pub(crate) fn hir_implied_in_terms(
+    expression: &crate::translate::semantic::hir::Expr,
+    sole_indexed_column: &dyn Fn(
+        crate::translate::semantic::hir::SourceId,
+        &[usize],
+    ) -> Option<usize>,
+) -> Vec<crate::translate::semantic::hir::Expr> {
+    use crate::translate::semantic::hir::{ColumnRef, Expr};
+    let mut disjuncts = Vec::new();
+    hir_operands(expression, ast::Operator::Or, &mut disjuncts);
+    if disjuncts.len() < 2 {
+        return Vec::new();
+    }
+    let branches = disjuncts
+        .into_iter()
+        .map(|disjunct| {
+            let mut conjuncts = Vec::new();
+            hir_operands(disjunct, ast::Operator::And, &mut conjuncts);
+            conjuncts
+        })
+        .collect::<Vec<_>>();
+    // A filter true for every branch names a column of the first branch.
+    let mut candidates: Vec<ColumnRef> = Vec::new();
+    for term in &branches[0] {
+        if let Some((column, _, _)) = hir_column_literal_equality(term) {
+            if !candidates.contains(&column) {
+                candidates.push(column);
+            }
+        }
+    }
+    let mut filters: Vec<(ColumnRef, Expr)> = Vec::new();
+    'candidates: for column in candidates {
+        let mut values: Vec<Expr> = Vec::new();
+        let mut comparisons = Vec::new();
+        for branch in &branches {
+            let mut found = false;
+            for term in branch {
+                let Some((other, value, comparison)) = hir_column_literal_equality(term) else {
+                    continue;
+                };
+                if other != column {
+                    continue;
+                }
+                found = true;
+                if !values.iter().any(|known| known.equivalent(value)) {
+                    values.push(value.clone());
+                    comparisons.push(comparison.clone());
+                }
+            }
+            if !found {
+                // This branch does not restrict the column, so a filter on
+                // it could reject rows of this branch.
+                continue 'candidates;
+            }
+        }
+        // One value for every branch is a conjunct the OR shares, which
+        // `hir_planning_conjuncts` lifts out of it.
+        if values.len() > 1 {
+            filters.push((
+                column,
+                Expr::InList {
+                    lhs: Box::new(Expr::Column(column)),
+                    negated: false,
+                    values,
+                    comparisons,
+                },
+            ));
+        }
+    }
+    filters
+        .iter()
+        .filter_map(|(column, filter)| {
+            let same_source = filters
+                .iter()
+                .filter(|(other, _)| other.source == column.source)
+                .map(|(other, _)| other.column)
+                .collect::<Vec<_>>();
+            (same_source.len() == 1
+                || sole_indexed_column(column.source, &same_source) == Some(column.column))
+            .then(|| filter.clone())
+        })
+        .collect()
+}
+
+/// The column and literal of `col = literal` or `literal = col`, with the
+/// comparison's semantics.
+fn hir_column_literal_equality(
+    expression: &crate::translate::semantic::hir::Expr,
+) -> Option<(
+    crate::translate::semantic::hir::ColumnRef,
+    &crate::translate::semantic::hir::Expr,
+    &crate::translate::semantic::hir::ComparisonSemantics,
+)> {
+    use crate::translate::semantic::hir::Expr;
+    let Expr::Binary {
+        lhs,
+        operator: ast::Operator::Equals,
+        rhs,
+        custom: None,
+        comparison: Some(comparison),
+        ..
+    } = expression
+    else {
+        return None;
+    };
+    match (lhs.as_ref(), rhs.as_ref()) {
+        (Expr::Column(column), value) if hir_literal_can_be_copied(value) => {
+            Some((*column, value, comparison))
+        }
+        (value, Expr::Column(column)) if hir_literal_can_be_copied(value) => {
+            Some((*column, value, comparison))
+        }
+        _ => None,
+    }
+}
+
+/// A number, string, blob or boolean, possibly signed. NULL never satisfies
+/// `=`, so it is left out.
+fn hir_literal_can_be_copied(expression: &crate::translate::semantic::hir::Expr) -> bool {
+    use crate::translate::semantic::hir::Expr;
+    use turso_parser::ast::{Literal, UnaryOperator};
+    match expression {
+        Expr::Literal(
+            Literal::Numeric(_)
+            | Literal::String(_)
+            | Literal::Blob(_)
+            | Literal::True
+            | Literal::False,
+        ) => true,
+        Expr::Unary {
+            operator: UnaryOperator::Negative | UnaryOperator::Positive,
+            expr,
+        } => matches!(expr.as_ref(), Expr::Literal(Literal::Numeric(_))),
+        _ => false,
+    }
+}
+
 fn split_column_between(
     conjunct: &crate::translate::semantic::hir::Expr,
     conjuncts: &mut Vec<crate::translate::semantic::hir::Expr>,
@@ -393,6 +536,7 @@ pub enum IterationDirection {
 pub enum JoinType {
     Inner,
     LeftOuter,
+    RightOuter,
     FullOuter,
     /// Semi-join: keep outer row if inner match found (EXISTS).
     Semi,
@@ -412,10 +556,177 @@ pub struct JoinInfo<N = ast::Name> {
     pub no_reorder: bool,
 }
 
+impl JoinType {
+    pub fn from_join_operator(operator: &ast::JoinOperator) -> Self {
+        let ast::JoinOperator::TypedJoin(Some(join_type)) = operator else {
+            return Self::Inner;
+        };
+        let has_left = join_type.contains(ast::JoinType::LEFT);
+        let has_right = join_type.contains(ast::JoinType::RIGHT);
+        if has_left && has_right {
+            Self::FullOuter
+        } else if has_right {
+            Self::RightOuter
+        } else if has_left {
+            Self::LeftOuter
+        } else {
+            Self::Inner
+        }
+    }
+
+    /// Whether the join keeps the rows of its right side that match no row
+    /// of the left side.
+    pub fn keeps_right_rows(self) -> bool {
+        matches!(self, Self::RightOuter | Self::FullOuter)
+    }
+}
+
+impl JoinInfo {
+    /// Whether `column_name` is one of the join's USING columns.
+    pub fn merges_column(&self, column_name: &str) -> bool {
+        self.using
+            .iter()
+            .any(|name| name.as_str().eq_ignore_ascii_case(column_name))
+    }
+}
+
+/// Return true when SQLite resolves a qualified star column as an unqualified name.
+///
+/// A later USING clause and a later RIGHT or FULL JOIN are both required.
+/// They can belong to different joins.
+pub fn star_column_uses_merged_value<'a>(
+    later_joins: impl Iterator<Item = &'a JoinInfo>,
+    column_name: &str,
+) -> bool {
+    let mut has_later_using = false;
+    let mut has_later_right_or_full_join = false;
+    for join_info in later_joins {
+        has_later_using |= join_info.merges_column(column_name);
+        has_later_right_or_full_join |= join_info.keeps_right_rows();
+    }
+    has_later_using && has_later_right_or_full_join
+}
+
+/// The FROM sources that supply an unqualified column.
+pub struct UnqualifiedColumnSources {
+    /// `(source index, column index)` pairs, first source first. Empty when no
+    /// source has the column.
+    pub sources: smallvec::SmallVec<[(usize, usize); 4]>,
+}
+
+/// The result of looking up an unqualified column name in one FROM source.
+pub enum ColumnLookup {
+    Found(usize),
+    Missing,
+}
+
+/// Find the FROM sources that supply an unqualified column, from left to right.
+///
+/// INNER and LEFT JOIN USING keep the copy found so far. RIGHT JOIN USING
+/// replaces it, because the left copy is NULL in an unmatched right row. FULL
+/// JOIN USING adds a fallback, because either copy can be NULL.
+///
+/// View metadata uses this to name a view's columns the way the query
+/// binder resolves them.
+pub fn unqualified_column_sources<'a, S>(
+    sources: &'a [S],
+    column_name: &str,
+    join_info: impl Fn(&'a S) -> Option<&'a JoinInfo>,
+    lookup: impl Fn(&'a S) -> ColumnLookup,
+) -> UnqualifiedColumnSources {
+    let mut found = smallvec::SmallVec::new();
+    for (source_index, source) in sources.iter().enumerate() {
+        let already_found = !found.is_empty();
+        let using_join_type = join_info(source)
+            .filter(|join_info| join_info.merges_column(column_name))
+            .map(|join_info| join_info.join_type);
+        if already_found && matches!(using_join_type, Some(JoinType::Inner | JoinType::LeftOuter)) {
+            continue;
+        }
+        let column_index = match lookup(source) {
+            ColumnLookup::Found(column_index) => column_index,
+            ColumnLookup::Missing => continue,
+        };
+
+        if !already_found {
+            found.push((source_index, column_index));
+            continue;
+        }
+
+        match using_join_type {
+            Some(JoinType::RightOuter) => {
+                found.clear();
+                found.push((source_index, column_index));
+            }
+            Some(JoinType::FullOuter) => found.push((source_index, column_index)),
+            // A repeated name that no USING merged is ambiguous; the binder
+            // reports that, this only lists the copies in order.
+            None
+            | Some(JoinType::Inner | JoinType::LeftOuter | JoinType::Semi | JoinType::Anti) => {}
+        }
+    }
+    UnqualifiedColumnSources { sources: found }
+}
+
+/// Find the earlier FROM sources that a USING or NATURAL join compares with.
+///
+/// Returns `(source index, column index)` pairs; an empty list means no
+/// earlier source has the column. Without a RIGHT or FULL JOIN in the FROM
+/// list, SQLite compares only the first copy. With one, every copy after the
+/// first must have been merged by an earlier USING, as in
+/// `sqlite3ProcessJoin` (select.c):
+///
+/// ```sql
+/// SELECT * FROM t1 JOIN t2 USING(a) JOIN t3 USING(a) RIGHT JOIN t4 ON 1;  -- ok
+/// SELECT * FROM t1 JOIN t2 ON 1 JOIN t3 USING(a) RIGHT JOIN t4 ON 1;
+/// -- ambiguous reference to a in USING()
+/// ```
+///
+/// The planner and view metadata both use this, so they report the same errors.
+pub fn left_using_column_sources<'a, S>(
+    sources: &'a [S],
+    column_name: &str,
+    has_right_or_full_join: bool,
+    join_info: impl Fn(&'a S) -> Option<&'a JoinInfo>,
+    column_index: impl Fn(&'a S) -> Option<usize>,
+) -> Result<smallvec::SmallVec<[(usize, usize); 4]>> {
+    let mut found = smallvec::SmallVec::<[(usize, usize); 4]>::new();
+    for (source_index, source) in sources.iter().enumerate() {
+        let Some(column_index) = column_index(source) else {
+            continue;
+        };
+        if !found.is_empty() && !has_right_or_full_join {
+            break;
+        }
+        if !found.is_empty()
+            && !join_info(source).is_some_and(|join_info| join_info.merges_column(column_name))
+        {
+            crate::bail_parse_error!("ambiguous reference to {} in USING()", column_name);
+        }
+        found.push((source_index, column_index));
+    }
+    Ok(found)
+}
+
 impl<N> JoinInfo<N> {
     /// Whether this is an OUTER JOIN (LEFT OUTER or FULL OUTER).
     pub fn is_outer(&self) -> bool {
+        matches!(
+            self.join_type,
+            JoinType::LeftOuter | JoinType::RightOuter | JoinType::FullOuter
+        )
+    }
+
+    /// Whether the join keeps the rows of its left side that match no row
+    /// of the right side.
+    pub fn keeps_left_rows(&self) -> bool {
         matches!(self.join_type, JoinType::LeftOuter | JoinType::FullOuter)
+    }
+
+    /// Whether the join keeps the rows of its right side that match no row
+    /// of the left side.
+    pub fn keeps_right_rows(&self) -> bool {
+        self.join_type.keeps_right_rows()
     }
 
     /// Whether this is a FULL OUTER JOIN.
@@ -637,6 +948,9 @@ pub(crate) enum HirPlanSource {
         join_info: Option<HirJoinInfo>,
         /// The order the subquery's plan returns its rows in.
         output_order: Vec<crate::translate::optimizer::order::HirOutputOrder>,
+        /// A LATERAL subquery that reads sources of the same FROM clause:
+        /// it runs again for each of their rows, after all of them.
+        lateral: bool,
     },
     Cte {
         source: crate::translate::semantic::hir::SourceId,
@@ -668,6 +982,12 @@ impl HirPlanSource {
             | Self::RecursiveCte { source, .. }
             | Self::RecursiveInput { source, .. } => *source,
         }
+    }
+
+    /// Whether this is a LATERAL subquery that reads sources of its own
+    /// FROM clause.
+    pub(crate) fn is_lateral(&self) -> bool {
+        matches!(self, Self::Derived { lateral: true, .. })
     }
 
     pub(crate) fn join_info_mut(&mut self) -> Option<&mut HirJoinInfo> {
@@ -742,6 +1062,24 @@ impl<I, H, E, J> PlannedSource<I, H, E, J> {
             }
             Self::index_covers_columns(index, btree, &required_columns)
         }
+    }
+
+    /// Whether the index holds every column the query reads from the table,
+    /// without counting the expressions it keys. A row the join
+    /// NULL-extends reads NULL from every column, so an expression the index
+    /// supplies must be computed from the NULL columns instead: `coalesce(v,
+    /// -1)` is -1 on that row, not the stored key.
+    pub(crate) fn index_covers_columns_without_expressions(&self, index: &Index) -> bool {
+        let Table::BTree(btree) = &self.table else {
+            return false;
+        };
+        if index.index_method.is_some() {
+            return false;
+        }
+        if self.col_used_mask.is_empty() {
+            return index.where_clause.is_none();
+        }
+        Self::index_covers_columns(index, btree, &self.col_used_mask)
     }
 
     /// Remove columns fully supplied by expression keys in this index.
@@ -862,6 +1200,13 @@ impl
             normalized_expr: Box::new(expression),
             columns_mask,
         });
+    }
+
+    /// Whether the index stores every column the query reads from this
+    /// source as a column. An index storing only an expression of a column
+    /// does not count: a hash build input copies the column itself.
+    pub(crate) fn index_stores_read_columns(&self, index: &Index) -> bool {
+        self.index_is_covering_with(index, |_, _| false)
     }
 
     pub(crate) fn index_is_covering(
@@ -1406,6 +1751,32 @@ pub enum HashJoinType {
     LeftOuter,
     /// Like LeftOuter, plus unmatched probe rows get NULLs for the build side.
     FullOuter,
+    /// Only the build rows no probe row matched appear: the probe side is
+    /// the inner table of a NOT EXISTS.
+    LeftAnti,
+}
+
+impl HashJoinType {
+    /// Whether the build rows that no probe row matched are emitted after
+    /// the probe loop.
+    pub fn keeps_unmatched_build_rows(self) -> bool {
+        matches!(self, Self::LeftOuter | Self::FullOuter | Self::LeftAnti)
+    }
+}
+
+/// The planner's estimate for one table access, shown in JSON query plans.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct TablePlanEstimate {
+    /// Rows from the join prefix before this table access.
+    pub input_rows: f64,
+    /// Rows that this access returns for each input row.
+    pub rows_per_input: f64,
+    /// Rows from the join prefix after this table access.
+    pub output_rows: f64,
+    /// Cost of this table access for all input rows.
+    pub access_cost: f64,
+    /// Cost of the join prefix through this table access.
+    pub total_cost: f64,
 }
 
 /// A definition of a rowid/index search.
@@ -1565,16 +1936,6 @@ pub struct SeekKey<E = ast::Expr> {
     pub affinity: Affinity,
 }
 
-/// One bound of a window function's effective frame.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum FrameBoundary {
-    UnboundedPreceding,
-    Preceding(Box<Expr>),
-    CurrentRow,
-    Following(Box<Expr>),
-    UnboundedFollowing,
-}
-
 /// A window function's effective frame. The bounds are interpreted per `mode`:
 /// `Rows` counts physical rows, `Range` and `Groups` work over peer groups of
 /// the window's ORDER BY values.
@@ -1583,8 +1944,8 @@ pub enum FrameBoundary {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Frame {
     pub mode: ast::FrameMode,
-    pub start: FrameBoundary,
-    pub end: FrameBoundary,
+    pub start: ast::FrameBound,
+    pub end: ast::FrameBound,
     /// The EXCLUDE clause the user wrote, or `None` if they wrote none.
     ///
     /// `Some(NoOthers)` (an explicit `EXCLUDE NO OTHERS`) excludes
@@ -1600,8 +1961,8 @@ impl Default for Frame {
     fn default() -> Self {
         Self {
             mode: ast::FrameMode::Range,
-            start: FrameBoundary::UnboundedPreceding,
-            end: FrameBoundary::CurrentRow,
+            start: ast::FrameBound::UnboundedPreceding,
+            end: ast::FrameBound::CurrentRow,
             exclude: None,
         }
     }
@@ -1740,6 +2101,104 @@ mod tests {
             ctes: Vec::new(),
             schema_programs: Vec::new(),
             cdc: None,
+        }
+    }
+
+    #[test]
+    fn hir_implied_in_terms_need_every_or_branch_to_fix_the_column() {
+        use crate::translate::semantic::hir::Expr;
+        let table = hir::SourceId::new(1);
+        let comparison = hir::ComparisonSemantics {
+            components: vec![hir::ComparisonComponent {
+                affinity: Affinity::Integer,
+                collation: None,
+                array: false,
+            }],
+        };
+        let equals = |column: usize, value: Expr| Expr::Binary {
+            lhs: Box::new(Expr::column(table, column)),
+            operator: ast::Operator::Equals,
+            rhs: Box::new(value),
+            array_concat: false,
+            custom: None,
+            comparison: Some(comparison.clone()),
+        };
+        let or = |lhs: Expr, rhs: Expr| Expr::Binary {
+            lhs: Box::new(lhs),
+            operator: ast::Operator::Or,
+            rhs: Box::new(rhs),
+            array_concat: false,
+            custom: None,
+            comparison: None,
+        };
+        let negative = |value: i64| Expr::Unary {
+            operator: ast::UnaryOperator::Negative,
+            expr: Box::new(hir_integer(value)),
+        };
+        let in_values = |term: &Expr| match term {
+            Expr::InList {
+                lhs,
+                negated: false,
+                values,
+                comparisons,
+            } => {
+                assert_eq!(values.len(), comparisons.len());
+                let Expr::Column(column) = lhs.as_ref() else {
+                    panic!("an implied IN tests a column");
+                };
+                (column.column, values.clone())
+            }
+            _ => panic!("an implied term is an IN list"),
+        };
+
+        // Both columns are fixed by every branch; only the one that starts
+        // an index gets a filter. A repeated value is listed once.
+        let expression = or(
+            or(
+                hir_and(equals(0, hir_integer(1)), equals(1, hir_integer(10))),
+                hir_and(equals(1, hir_integer(20)), equals(0, negative(2))),
+            ),
+            hir_and(equals(0, hir_integer(1)), equals(1, hir_integer(30))),
+        );
+        let starts_index = |_: hir::SourceId, columns: &[usize]| {
+            assert_eq!(columns, [0, 1]);
+            Some(1)
+        };
+        let same_values = |values: &[Expr], expected: &[Expr]| {
+            values.len() == expected.len()
+                && values
+                    .iter()
+                    .zip(expected)
+                    .all(|(value, expected)| value.equivalent(expected))
+        };
+        let implied = hir_implied_in_terms(&expression, &starts_index);
+        assert_eq!(implied.len(), 1);
+        let (column, values) = in_values(&implied[0]);
+        assert_eq!(column, 1);
+        assert!(same_values(
+            &values,
+            &[hir_integer(10), hir_integer(20), hir_integer(30)]
+        ));
+
+        // With one fixed column, no index is needed.
+        let expression = or(equals(0, hir_integer(1)), equals(0, negative(2)));
+        let implied = hir_implied_in_terms(&expression, &|_, _| None);
+        assert_eq!(implied.len(), 1);
+        let (column, values) = in_values(&implied[0]);
+        assert_eq!(column, 0);
+        assert!(same_values(&values, &[hir_integer(1), negative(2)]));
+
+        // A branch that does not fix the column, or fixes it to a non-literal
+        // or to NULL, gives no filter.
+        for expression in [
+            or(equals(0, hir_integer(1)), equals(1, hir_integer(2))),
+            or(equals(0, hir_integer(1)), equals(0, Expr::column(table, 2))),
+            or(
+                equals(0, hir_integer(1)),
+                equals(0, Expr::Literal(ast::Literal::Null)),
+            ),
+        ] {
+            assert!(hir_implied_in_terms(&expression, &|_, _| None).is_empty());
         }
     }
 

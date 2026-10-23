@@ -52,14 +52,17 @@ impl ProgressHandler {
         self.ops() != 0
     }
 
-    /// Returns true when the callback requests interruption at this VM step.
+    /// Returns true when the callback requests interruption for the VM steps
+    /// executed in `(prev_steps, vm_steps]`.
     ///
     /// The cadence is approximate by design, matching SQLite's documentation:
-    /// the callback is consulted only when the current VM-step count crosses a
-    /// configured multiple of `ops`.
-    pub(crate) fn should_interrupt(&self, vm_steps: u64) -> bool {
+    /// the callback is consulted only when the VM-step count crosses a
+    /// configured multiple of `ops`. Callers that consult this once per step
+    /// pass `prev_steps = vm_steps - 1`; callers that batch several steps per
+    /// consultation pass the count from the previous consultation.
+    pub(crate) fn should_interrupt(&self, prev_steps: u64, vm_steps: u64) -> bool {
         let ops = self.ops();
-        if ops == 0 || vm_steps % ops != 0 {
+        if ops == 0 || prev_steps / ops == vm_steps / ops {
             return false;
         }
         let callback = self.callback.read();
@@ -81,7 +84,7 @@ mod tests {
     #[test]
     fn disabled_handler_never_interrupts() {
         let handler = ProgressHandler::new();
-        assert!(!handler.should_interrupt(1));
+        assert!(!handler.should_interrupt(0, 1));
         assert!(!handler.is_enabled());
     }
 
@@ -98,15 +101,15 @@ mod tests {
             })),
         );
 
-        assert!(!handler.should_interrupt(1));
+        assert!(!handler.should_interrupt(0, 1));
         assert_eq!(calls.load(Ordering::SeqCst), 0);
-        assert!(!handler.should_interrupt(2));
+        assert!(!handler.should_interrupt(1, 2));
         assert_eq!(calls.load(Ordering::SeqCst), 0);
-        assert!(!handler.should_interrupt(3));
+        assert!(!handler.should_interrupt(2, 3));
         assert_eq!(calls.load(Ordering::SeqCst), 1);
-        assert!(!handler.should_interrupt(4));
+        assert!(!handler.should_interrupt(3, 4));
         assert_eq!(calls.load(Ordering::SeqCst), 1);
-        assert!(!handler.should_interrupt(6));
+        assert!(!handler.should_interrupt(5, 6));
         assert_eq!(calls.load(Ordering::SeqCst), 2);
     }
 
@@ -115,8 +118,8 @@ mod tests {
         let handler = ProgressHandler::new();
         handler.set(2, Some(Box::new(|| true)));
 
-        assert!(!handler.should_interrupt(1));
-        assert!(handler.should_interrupt(2));
+        assert!(!handler.should_interrupt(0, 1));
+        assert!(handler.should_interrupt(1, 2));
     }
 
     #[test]
@@ -131,11 +134,11 @@ mod tests {
                 true
             })),
         );
-        assert!(handler.should_interrupt(1));
+        assert!(handler.should_interrupt(0, 1));
         assert_eq!(calls.load(Ordering::SeqCst), 1);
 
         handler.set(0, None);
-        assert!(!handler.should_interrupt(2));
+        assert!(!handler.should_interrupt(1, 2));
         assert_eq!(calls.load(Ordering::SeqCst), 1);
     }
 }

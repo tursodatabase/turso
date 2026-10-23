@@ -116,6 +116,9 @@ test.serial("Database.exec() after close()", async (t) => {
 //   - rows is an Array<Row>. By default rows match Statement.all() object
 //     rows; pass { raw: true } to receive arrays.
 //   - rowsAffected is the per-statement change count (0 for SELECT).
+//   - lastInsertRowid is present only on entries whose statement inserted
+//     a row (Turso drivers; the serverless driver also reports rowsRead,
+//     rowsWritten, and queryDurationMs per statement).
 // ==========================================================================
 
 // Assert the ResultSet invariants shared by every batch entry, regardless
@@ -126,7 +129,13 @@ const assertResultSetShape = (t, rs) => {
   t.is(rs.columnTypes.length, rs.columns.length, "columnTypes parallels columns");
   t.true(Array.isArray(rs.rows), "rows is an array");
   t.is(typeof rs.rowsAffected, "number", "rowsAffected is a number");
-  t.false("lastInsertRowid" in rs, "batch ResultSet does not expose lastInsertRowid");
+  if ("lastInsertRowid" in rs) {
+    t.is(
+      typeof rs.lastInsertRowid,
+      "number",
+      "lastInsertRowid, present only for statements that inserted, is a number",
+    );
+  }
   t.is(rs.toJSON, undefined, "batch ResultSet does not expose toJSON");
 };
 
@@ -143,10 +152,14 @@ test.serial("Database.batch() [returns one ResultSet per statement, in order]", 
   t.is(results.length, 3, "one ResultSet per input statement");
   results.forEach((rs) => assertResultSetShape(t, rs));
 
-  // INSERT: no result rows, one row affected.
+  // INSERT: no result rows, one row affected. Turso drivers report the
+  // inserted rowid per statement.
   t.deepEqual(results[0].columns, []);
   t.deepEqual(results[0].rows, []);
   t.is(results[0].rowsAffected, 1);
+  if (process.env.PROVIDER === "turso" || process.env.PROVIDER === "serverless") {
+    t.is(typeof results[0].lastInsertRowid, "number", "INSERT entry reports its rowid");
+  }
 
   // SELECT: rows surfaced, nothing affected.
   t.deepEqual(results[1].columns, ["id", "name"]);
@@ -994,6 +1007,25 @@ test.serial("Statement.all() [statement safe integers]", async (t) => {
     [2n, "Bob", "bob@example.com"],
   ];
   t.deepEqual(await stmt.raw().all(), expected);
+});
+
+test.serial("Statement.all() [column names that are JavaScript object properties]", async (t) => {
+  const db = t.context.db;
+  await db.exec("DROP TABLE IF EXISTS t");
+  await db.exec("CREATE TABLE t (id INTEGER PRIMARY KEY, length INTEGER, map INTEGER, toString INTEGER, hasOwnProperty INTEGER)");
+  await db.exec("INSERT INTO t VALUES (1, 42, 43, 44, 45)");
+
+  const stmt = await db.prepare("SELECT * FROM t");
+  const expected = { id: 1, length: 42, map: 43, toString: 44, hasOwnProperty: 45 };
+  t.deepEqual(await stmt.all(), [expected]);
+  t.deepEqual(await stmt.get(), expected);
+  t.deepEqual(await stmt.raw().all(), [[1, 42, 43, 44, 45]]);
+
+  stmt.raw(false).safeIntegers();
+  const expectedBigInt = { id: 1n, length: 42n, map: 43n, toString: 44n, hasOwnProperty: 45n };
+  t.deepEqual(await stmt.all(), [expectedBigInt]);
+  t.deepEqual(await stmt.get(), expectedBigInt);
+  t.deepEqual(await stmt.raw().all(), [[1n, 42n, 43n, 44n, 45n]]);
 });
 
 // ==========================================================================

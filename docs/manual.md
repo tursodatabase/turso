@@ -43,6 +43,7 @@ Welcome to Turso database manual!
   - [Encryption](#encryption)
   - [Vector search](#vector-search)
   - [Full-Text Search](#full-text-search-experimental)
+    - [Where FTS is available](#where-fts-is-available)
   - [CDC](#cdc-early-preview)
   - [Index Method](#index-method-experimental)
   - [Page Codecs](#page-codecs-experimental)
@@ -109,13 +110,10 @@ For more detailed list of SQLite compatibility, please refer to [COMPAT.md](../C
 
 #### MVCC limitations
 
-The MVCC implementation is experimental and has the following limitations:
+MVCC is a supported journal mode. It has the following limitations:
 
-* Indexes cannot be created and databases with indexes cannot be used.
-* All the data is eagerly loaded from disk to memory on first access so using big databases may take a long time to start, and will consume a lot of memory
-* Only `PRAGMA wal_checkpoint(TRUNCATE)` is supported and it blocks both readers and writers
-* Many features may not work, work incorrectly, and/or cause a panic.
-* Queries may return incorrect results
+* `PRAGMA wal_checkpoint(TRUNCATE)` blocks both readers and writers. Passive checkpointing, which does not block them, is still behind the `--experimental-mvcc-passive-checkpoint` flag.
+* Indexes on `WITHOUT ROWID` tables are not supported.
 * If a database is written to using MVCC and then opened again without MVCC, the changes are not visible unless first checkpointed
 
 ## The SQL shell
@@ -170,7 +168,7 @@ Turso supports three types of transactions: **deferred**, **immediate**, and **c
 
 * **Deferred (default)**: The transaction begins in a suspended state and does not acquire locks immediately. It starts a read transaction when the first read SQL statement (e.g., `SELECT`) runs, and upgrades to a write transaction only when the first write SQL statement (e.g., `INSERT`, `UPDATE`, `DELETE`) executes. This mode allows concurrency for reads and delays write locks, which can reduce contention.
 * **Immediate**: The transaction starts immediately with a reserved write lock, preventing other write transactions from starting concurrently but allowing reads. It attempts to acquire the write lock right away on the `BEGIN` statement, which can fail if another write transaction exists. The `EXCLUSIVE` mode is always an alias for `IMMEDIATE` in Turso, just like it is in SQLite in WAL mode.
-* **Concurrent (MVCC only)**: The transaction begins immediately and allows multiple concurrent read and write transactions. When a concurrent transaction commits, the database performs row-level conflict detection and returns a `SQLITE_BUSY` (write-write conflict) error if the transaction attempted to modify a row that was concurrently modified by another transaction. This mode provides the highest level of concurrency at the cost of potential transaction conflicts that must be retried by the application. The transaction isolation level provided by concurrent transactions is snapshot isolation.
+* **Concurrent (MVCC only)**: Like a deferred transaction, the transaction starts when its first SQL statement runs, and it allows multiple concurrent read and write transactions. When a concurrent transaction commits, the database performs row-level conflict detection and returns a `SQLITE_BUSY` (write-write conflict) error if the transaction attempted to modify a row that was concurrently modified by another transaction. This mode provides the highest level of concurrency at the cost of potential transaction conflicts that must be retried by the application. The transaction isolation level provided by concurrent transactions is snapshot isolation.
 
 ### Deferred transaction lifecycle
 
@@ -182,21 +180,21 @@ If a deferred transaction remains unused (no reads or writes), it is automatical
 
 Concurrent transactions are only available when MVCC (Multi-Version Concurrency Control) is enabled in the database. They use optimistic concurrency control to allow multiple transactions to modify the database simultaneously.
 
-When the `BEGIN CONCURRENT TRANSACTION` statement executes, the database:
+Like `BEGIN DEFERRED`, the `BEGIN CONCURRENT TRANSACTION` statement itself starts nothing. When the transaction's first SQL statement executes, the database:
 
 1. Assigns a unique transaction ID to the transaction
 2. Records a begin timestamp from the logical clock
 3. Creates an empty read set and write set to track accessed rows
-4. Does **not** acquire any locks
+4. Does **not** acquire any locks at start
 
-Unlike deferred transactions which delay locking, concurrent transactions never acquire locks. Instead, they rely on MVCC's snapshot isolation and conflict detection at commit time.
+Unlike deferred transactions which delay locking, concurrent transactions start without locks. They rely on MVCC's snapshot isolation and conflict detection at commit time. Schema changes and header writes upgrade the same transaction to exclusive in place.
 
 #### Read snapshot isolation
 
-Each concurrent transaction reads from a consistent snapshot of the database as of its begin timestamp. This means:
+Each concurrent transaction reads from a consistent snapshot of the database as of its begin timestamp, which is taken at the transaction's first statement, not at `BEGIN`. This means:
 
 - Reads see all data committed before the transaction's begin timestamp
-- Reads do **not** see writes from other transactions that commit after this transaction starts
+- Reads do **not** see writes from other transactions that commit after the snapshot is taken
 - Reads from the same transaction are consistent (repeatable reads within the transaction)
 - Multiple concurrent transactions can read and write simultaneously without blocking each other
 
@@ -206,7 +204,7 @@ All rows read by the transaction are tracked in the transaction's read set, and 
 
 When a concurrent transaction commits, the database performs these steps:
 
-1. **Exclusive transaction check**: If there is an active exclusive transaction (started with `BEGIN IMMEDIATE` or a `BEGIN DEFERRED` that upgraded to a write transaction), the concurrent transaction **cannot commit** and receives a `SQLITE_BUSY` error. Concurrent transactions can read and write concurrently with exclusive transactions, but cannot commit until the exclusive transaction completes.
+1. **Exclusive transaction check**: If there is an active exclusive transaction (started with `BEGIN IMMEDIATE`, a `BEGIN DEFERRED` that upgraded to a write transaction, or a `BEGIN CONCURRENT` that upgraded for schema or header writes), the concurrent transaction **cannot commit** and receives a `SQLITE_BUSY` error. Concurrent transactions can read and write concurrently with exclusive transactions, but cannot commit until the exclusive transaction completes.
 
 2. **Write-write conflict detection**: For each row in the transaction's write set, the database checks if the row was modified by another transaction. A write-write conflict occurs when:
    - The row is currently being modified by another active transaction, or
@@ -222,7 +220,7 @@ Concurrent transactions can coexist with exclusive transactions (deferred and im
 - **Concurrent transactions cannot commit** while an exclusive transaction holds the exclusive lock
 - **Exclusive transactions block concurrent transaction commits**, not their reads or writes
 
-This design allows concurrent transactions to make progress during an exclusive transaction, but ensures that exclusive transactions truly have exclusive write access when needed (for example, schema changes).
+This design allows concurrent transactions to make progress during an exclusive transaction, but ensures that exclusive transactions truly have exclusive write access. Schema changes and header writes upgrade a concurrent transaction to exclusive instead of failing.
 
 **Best practice**: For maximum concurrency in MVCC mode, use `BEGIN CONCURRENT` for all write transactions. Only use `BEGIN IMMEDIATE` or `BEGIN DEFERRED` when you need exclusive write access that prevents any concurrent commits.
 
@@ -883,6 +881,36 @@ Turso provides full-text search (FTS) capabilities powered by the [Tantivy](http
 
 > **Note:** Full-text search is an experimental feature and requires the `fts` feature to be enabled at compile time.
 
+### Where FTS is available
+
+FTS requires the `fts` Cargo feature on `turso_core` and a non-WebAssembly target.
+It is not part of `turso_core`'s default features. The module in
+`core/index_method/mod.rs` is guarded by
+`#[cfg(all(feature = "fts", not(target_family = "wasm")))]`, so enabling the feature
+does not make FTS available on WebAssembly.
+
+At this repository revision, the source build configuration is:
+
+| Build | FTS configuration |
+| --- | --- |
+| `tursodb` CLI | Enables `turso_core/fts` |
+| `turso_core` on a native target | Enable it in the dependency's `features = ["fts"]` |
+| `turso` Rust binding on a native target | Includes `fts` in its default features |
+| `@tursodatabase/database` native addon built from this source | Enables `turso_core/fts` |
+| `@tursodatabase/database-wasm` | Excluded on WebAssembly |
+
+The native addon's build script in `bindings/javascript/packages/native/package.json`
+uses `bindings/javascript/Cargo.toml`, which enables `turso_core/fts`. This describes
+the repository's build configuration; it does not establish whether a particular published npm version
+contains FTS. Check the release version you use.
+
+FTS indexes are also an experimental index method, so the connection must enable index
+methods (`--experimental-index-method` in the `tursodb` CLI). Without it, `CREATE INDEX
+... USING fts` fails with `index method is an experimental feature`. With index methods
+enabled but the module absent, it fails at module lookup with an unknown-module-name
+error. A WebAssembly build has the same limitation even when the `fts` Cargo feature is
+requested.
+
 ### Creating an FTS Index
 
 Create an FTS index on text columns using the `USING fts` syntax:
@@ -1241,7 +1269,9 @@ Each Index Method consists of three traits that work together (for details, see 
 * **`IndexMethodAttachment`** — represents an Index Method instance bound to a specific table. It can create cursors for query execution and defines the metadata needed for integration with the query planner.
 * **`IndexMethodCursor`** — provides methods for accessing and updating data, as well as for managing the underlying storage during `CREATE INDEX` and `DROP INDEX` operations.
 
-While Index Methods can implement arbitrary logic internally, it's generally recommended to use a B-tree as the underlying storage mechanism. To support this, `tursodb` provides a special `backing_btree` Index Method that other Index Methods can use to create auxiliary tables for storing supporting data.
+An Index Method can store its data in any way. We recommend a B-tree, because the engine already versions B-tree rows under MVCC. For this, the `IndexMethodContext` gives the method backing stores that core owns. A `BackingSchema` lists the tables and the indexes that the method owns. A `BackingTable` is a table that core creates. A `BackingIndex` is a `backing_btree` index on a backing table or on any existing table, with the key layout that the method writes through it. `create_backing_schema` and `drop_backing_schema` return an operation. The cursor steps this operation from `create` and `destroy`. `backing_store` takes one `BackingIndex` and returns a `BackingStore` handle. `open_cursor` on the handle gives a cursor over the rows of the store.
+
+Under MVCC, the handle is bound to the current transaction and snapshot. Rows written through the handle are versioned like the rows of any other table, and the method needs no MVCC-specific code. The method never finds the index or its root page itself.
 
 For more details, see [`toy_vector_sparse_ivf`](../core/index_method/toy_vector_sparse_ivf.rs) implementation.
 

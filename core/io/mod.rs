@@ -291,26 +291,14 @@ pub trait File: Send + Sync {
 
 pub struct TempFile {
     pub(crate) file: Arc<dyn File>,
-    /// When temp_dir is dropped the folder is deleted
-    /// set to None if tempfile allocated in memory (for example, in case of WASM target)
-    /// Declared after `file` so the file closes before Windows removes its directory.
-    #[allow(dead_code, reason = "held for its Drop side effect")]
-    temp_dir: Option<tempfile::TempDir>,
 }
 
 impl TempFile {
     pub fn new(io: &Arc<dyn IO>) -> Result<Self> {
         #[cfg(not(target_family = "wasm"))]
         {
-            let temp_dir = tempfile::tempdir().map_err(|e| crate::error::io_error(e, "tempdir"))?;
-            let chunk_file_path = temp_dir.as_ref().join("tursodb_temp_file");
-            let chunk_file_path_str = chunk_file_path.to_str().ok_or_else(|| {
-                crate::LimboError::InternalError("temp file path is not valid UTF-8".to_string())
-            })?;
-            let chunk_file = io.open_file(chunk_file_path_str, OpenFlags::Create, false)?;
             Ok(TempFile {
-                temp_dir: Some(temp_dir),
-                file: chunk_file.clone(),
+                file: Arc::new(DiskTempFile::new(io.clone())),
             })
         }
         // on WASM in browser we do not support temp files (as we pre-register db files in advance and can't easily create a new one)
@@ -321,10 +309,7 @@ impl TempFile {
 
             let memory_io = Arc::new(MemoryIO::new());
             let memory_file = memory_io.open_file("tursodb_temp_file", OpenFlags::Create, false)?;
-            Ok(TempFile {
-                temp_dir: None,
-                file: memory_file,
-            })
+            Ok(TempFile { file: memory_file })
         }
     }
 
@@ -341,10 +326,7 @@ impl TempFile {
                 let memory_io = Arc::new(MemoryIO::new());
                 let memory_file =
                     memory_io.open_file("tursodb_temp_file", OpenFlags::Create, false)?;
-                Ok(TempFile {
-                    temp_dir: None,
-                    file: memory_file,
-                })
+                Ok(TempFile { file: memory_file })
             }
             #[cfg(feature = "fs")]
             {
@@ -352,10 +334,7 @@ impl TempFile {
                     let memory_io = Arc::new(MemoryIO::new());
                     let memory_file =
                         memory_io.open_file("tursodb_temp_file", OpenFlags::Create, false)?;
-                    return Ok(TempFile {
-                        temp_dir: None,
-                        file: memory_file,
-                    });
+                    return Ok(TempFile { file: memory_file });
                 }
                 // Fall through to file-based for Default and File modes
                 Self::new(io)
@@ -370,32 +349,192 @@ impl TempFile {
     }
 }
 
-#[cfg(all(test, target_os = "windows", feature = "fs"))]
-mod temp_file_tests {
-    use super::*;
-
-    #[test]
-    fn closes_file_before_removing_temp_directory() {
-        let io: Arc<dyn IO> = Arc::new(PlatformIO::new().expect("platform IO must initialize"));
-        let temp_file = TempFile::new(&io).expect("temporary file must open");
-        let temp_dir = temp_file
-            .temp_dir
-            .as_ref()
-            .expect("filesystem temporary file must retain its directory")
-            .path()
-            .to_owned();
-
-        assert!(temp_dir.exists());
-        drop(temp_file);
-        assert!(!temp_dir.exists());
-    }
-}
-
 impl core::ops::Deref for TempFile {
     type Target = Arc<dyn File>;
 
     fn deref(&self) -> &Self::Target {
         &self.file
+    }
+}
+
+/// A temp file on disk that is created on its first write, as SQLite opens
+/// a temp database's file only when the pager first writes a page
+/// (`pager_write_pagelist`). Most ephemeral tables, sorters and hash tables
+/// fit in memory and never write, so they never touch the file system.
+#[cfg(not(target_family = "wasm"))]
+struct DiskTempFile {
+    io: Arc<dyn IO>,
+    created: crate::sync::OnceLock<CreatedTempFile>,
+}
+
+#[cfg(not(target_family = "wasm"))]
+struct CreatedTempFile {
+    file: Arc<dyn File>,
+    /// Removes the directory when dropped. Declared after `file` so the file
+    /// closes before Windows removes its directory.
+    #[cfg_attr(not(test), allow(dead_code, reason = "held for its Drop side effect"))]
+    dir: tempfile::TempDir,
+}
+
+#[cfg(not(target_family = "wasm"))]
+impl DiskTempFile {
+    fn new(io: Arc<dyn IO>) -> Self {
+        Self {
+            io,
+            created: crate::sync::OnceLock::new(),
+        }
+    }
+
+    fn file(&self) -> Result<&Arc<dyn File>> {
+        if let Some(created) = self.created.get() {
+            return Ok(&created.file);
+        }
+        let dir = tempfile::tempdir().map_err(|e| crate::error::io_error(e, "tempdir"))?;
+        let path = dir.path().join("tursodb_temp_file");
+        let path = path.to_str().ok_or_else(|| {
+            crate::LimboError::InternalError("temp file path is not valid UTF-8".to_string())
+        })?;
+        let file = self.io.open_file(path, OpenFlags::Create, false)?;
+        Ok(&self
+            .created
+            .get_or_init(|| CreatedTempFile { file, dir })
+            .file)
+    }
+}
+
+#[cfg(not(target_family = "wasm"))]
+impl File for DiskTempFile {
+    fn lock_file(&self, exclusive: bool) -> Result<()> {
+        self.file()?.lock_file(exclusive)
+    }
+
+    fn unlock_file(&self) -> Result<()> {
+        self.file()?.unlock_file()
+    }
+
+    fn pread(&self, pos: u64, c: Completion) -> Result<Completion> {
+        self.file()?.pread(pos, c)
+    }
+
+    fn pwrite(&self, pos: u64, buffer: Arc<Buffer>, c: Completion) -> Result<Completion> {
+        self.file()?.pwrite(pos, buffer, c)
+    }
+
+    fn pwritev(&self, pos: u64, buffers: Vec<Arc<Buffer>>, c: Completion) -> Result<Completion> {
+        self.file()?.pwritev(pos, buffers, c)
+    }
+
+    fn sync(&self, c: Completion, sync_type: FileSyncType) -> Result<Completion> {
+        match self.created.get() {
+            Some(created) => created.file.sync(c, sync_type),
+            None => {
+                c.complete(0);
+                Ok(c)
+            }
+        }
+    }
+
+    fn size(&self) -> Result<u64> {
+        match self.created.get() {
+            Some(created) => created.file.size(),
+            None => Ok(0),
+        }
+    }
+
+    fn truncate(&self, len: u64, c: Completion) -> Result<Completion> {
+        self.file()?.truncate(len, c)
+    }
+}
+
+#[cfg(all(test, feature = "fs", not(target_family = "wasm")))]
+mod temp_file_tests {
+    use super::*;
+
+    #[test]
+    fn creates_the_file_on_first_write_and_removes_it_on_drop() {
+        let io: Arc<dyn IO> = Arc::new(PlatformIO::new().expect("platform IO must initialize"));
+        let temp_file = DiskTempFile::new(io.clone());
+        assert!(temp_file.created.get().is_none());
+        assert_eq!(temp_file.size().unwrap(), 0);
+        let c = temp_file.sync(Completion::new_sync(|_| {}), FileSyncType::Fsync);
+        io.wait_for_completion(c.unwrap()).unwrap();
+        assert!(temp_file.created.get().is_none());
+
+        let buffer = Arc::new(Buffer::new(vec![7; 512]));
+        let c = temp_file.pwrite(0, buffer, Completion::new_write(|_| {}));
+        io.wait_for_completion(c.unwrap()).unwrap();
+        assert_eq!(temp_file.size().unwrap(), 512);
+        let temp_dir = temp_file.created.get().unwrap().dir.path().to_owned();
+        assert!(temp_dir.exists());
+
+        drop(temp_file);
+        assert!(!temp_dir.exists());
+    }
+
+    #[test]
+    fn ephemeral_table_opens_a_temp_file_only_when_it_spills() {
+        let io = Arc::new(TempFileCountingIO::default());
+        let db = crate::Database::open_file(
+            io.clone(),
+            "ephemeral-temp-file.db",
+            Arc::new(crate::SqliteDialect),
+        )
+        .unwrap();
+        let conn = db.connect(crate::ConnectOpts::new()).unwrap();
+        let count_union = |rows: i64| -> i64 {
+            let sql = format!(
+                "SELECT count(*) FROM (\
+                 SELECT printf('%02500d', value) FROM generate_series(1, {rows}) \
+                 UNION SELECT printf('%02500d', value) FROM generate_series(1, {rows}))"
+            );
+            let mut stmt = conn.prepare(sql).unwrap();
+            let mut count = None;
+            stmt.run_with_row_callback(|row| {
+                count = Some(row.get::<i64>(0).unwrap());
+                Ok(())
+            })
+            .unwrap();
+            count.unwrap()
+        };
+
+        assert_eq!(count_union(10), 10);
+        assert_eq!(io.temp_files_opened.load(Ordering::Acquire), 0);
+
+        assert_eq!(count_union(4_000), 4_000);
+        assert!(io.temp_files_opened.load(Ordering::Acquire) > 0);
+    }
+
+    #[derive(Default)]
+    struct TempFileCountingIO {
+        inner: MemoryIO,
+        temp_files_opened: crate::sync::atomic::AtomicUsize,
+    }
+
+    use crate::sync::atomic::Ordering;
+    use crate::{MonotonicInstant, WallClockInstant};
+
+    impl Clock for TempFileCountingIO {
+        fn current_time_monotonic(&self) -> MonotonicInstant {
+            self.inner.current_time_monotonic()
+        }
+        fn current_time_wall_clock(&self) -> WallClockInstant {
+            self.inner.current_time_wall_clock()
+        }
+    }
+
+    impl IO for TempFileCountingIO {
+        fn open_file(&self, path: &str, flags: OpenFlags, direct: bool) -> Result<Arc<dyn File>> {
+            if path.ends_with("tursodb_temp_file") {
+                self.temp_files_opened.fetch_add(1, Ordering::AcqRel);
+            }
+            self.inner.open_file(path, flags, direct)
+        }
+        fn remove_file(&self, path: &str) -> Result<()> {
+            self.inner.remove_file(path)
+        }
+        fn file_id(&self, path: &str) -> Result<FileId> {
+            self.inner.file_id(path)
+        }
     }
 }
 
@@ -554,9 +693,10 @@ impl<'a> WriteBatch<'a> {
             .sum()
     }
 
-    /// Submit all writes. Returns completions caller must wait on.
+    /// Submit all writes. Returns completions caller must wait on. Each
+    /// write is added to `group`, when given, before it is submitted.
     #[inline]
-    pub fn submit(self) -> Result<Vec<Completion>> {
+    pub fn submit(self, mut group: Option<&mut CompletionGroup>) -> Result<Vec<Completion>> {
         let mut completions = Vec::with_capacity(self.ops.len());
         for WriteOp { pos, bufs } in self.ops {
             let total_len = bufs.iter().map(|b| b.len()).sum::<usize>() as i32;
@@ -569,6 +709,9 @@ impl<'a> WriteBatch<'a> {
                     "pwritev wrote {bytes_written} bytes, expected {total_len}"
                 );
             });
+            if let Some(group) = group.as_deref_mut() {
+                group.add(&c);
+            }
             completions.push(self.file.pwritev(pos, bufs.to_vec(), c)?);
         }
         Ok(completions)
@@ -935,7 +1078,7 @@ const BUILTIN_VFS_NAMES: &[&str] = &["memory", "syscall", "io_uring", "experimen
 
 /// Register a named Rust IO backend.
 ///
-/// Once registered, it can be used via [`Database::io_for_vfs`] or through
+/// Once registered, it can be used via [`crate::Database::io_for_vfs`] or through
 /// any language binding's `vfs=` parameter (Go DSN, Python kwarg, etc.).
 ///
 /// Re-registering the same name replaces the previous backend. Registered
@@ -945,7 +1088,7 @@ const BUILTIN_VFS_NAMES: &[&str] = &["memory", "syscall", "io_uring", "experimen
 ///
 /// # Errors
 ///
-/// Returns [`LimboError::InvalidArgument`] if `name` is empty.
+/// Returns [`crate::LimboError::InvalidArgument`] if `name` is empty.
 pub fn register_io(name: &str, io: Arc<dyn IO>) -> crate::Result<()> {
     if name.is_empty() {
         return Err(crate::LimboError::InvalidArgument(

@@ -1,6 +1,7 @@
 //! AUTOINCREMENT for HIR INSERT: like SQLite, the largest rowid a
 //! table has ever used is kept in its `sqlite_sequence` row, and a new rowid
-//! is always larger than it.
+//! is always larger than it. The row is written when the statement ends,
+//! so a statement that stops with FAIL leaves it alone.
 //!
 //! Under MVCC, the table's hidden sequence hands out new rowids
 //! instead and keeps `sqlite_sequence` itself; a rowid from the statement, or
@@ -49,22 +50,15 @@ impl Sequence {
             table: sqlite_sequence,
             database,
             name: table.name.clone(),
+            triggers_insert_into_table: autoincrement.triggers_insert_into_table,
         }))
     }
 
-    /// Before an INSERT of several rows: add the target's row to
-    /// `sqlite_sequence` with 0 when it has none.
-    pub(super) fn ensure_row(&self, program: &mut ProgramBuilder) {
-        if let Self::Table(sequence) = self {
-            sequence.ensure_row(program);
-        }
-    }
-
-    /// At the start of a row.
-    pub(super) fn open(&self, program: &mut ProgramBuilder) -> SequenceCursor<'_> {
+    /// At the start of an INSERT: the sequence as the statement sees it.
+    pub(super) fn begin(&self, program: &mut ProgramBuilder) -> StatementSequence<'_> {
         match self {
-            Self::Table(sequence) => SequenceCursor::Table(sequence.open(program)),
-            Self::Mvcc(operation) => SequenceCursor::Mvcc(operation),
+            Self::Table(sequence) => StatementSequence::Table(sequence.begin(program)),
+            Self::Mvcc(operation) => StatementSequence::Mvcc(operation),
         }
     }
 
@@ -80,13 +74,17 @@ impl Sequence {
     }
 }
 
-/// The sequence of a row being inserted.
-pub(super) enum SequenceCursor<'a> {
-    Table(TableSequenceCursor<'a>),
+/// The sequence of an INSERT statement. Like SQLite, `sqlite_sequence` is
+/// read at the start and whenever a rowid is generated, as a trigger may
+/// have written it, and the largest rowid the statement used is written
+/// back once, when the statement ends: a statement that fails with FAIL
+/// keeps its rows but leaves `sqlite_sequence` alone.
+pub(super) enum StatementSequence<'a> {
+    Table(TableSequenceState<'a>),
     Mvcc(&'a hir::SequenceOperation),
 }
 
-impl SequenceCursor<'_> {
+impl StatementSequence<'_> {
     /// Generate the rowid of a new row into `rowid`.
     pub(super) fn emit_new_rowid(
         &self,
@@ -95,8 +93,8 @@ impl SequenceCursor<'_> {
         rowid: usize,
     ) -> Result<()> {
         match self {
-            Self::Table(cursor) => {
-                cursor.emit_new_rowid(program, table_cursor, rowid);
+            Self::Table(state) => {
+                state.emit_new_rowid(program, table_cursor, rowid);
                 Ok(())
             }
             Self::Mvcc(operation) => {
@@ -109,7 +107,6 @@ impl SequenceCursor<'_> {
                     &operation.normalized_name,
                     operation.sequence.value(),
                     rowid,
-                    None,
                 )
             }
         }
@@ -124,18 +121,38 @@ impl SequenceCursor<'_> {
         rowid: usize,
     ) -> Result<()> {
         match self {
-            Self::Table(cursor) => {
-                cursor.emit_given_rowid(program, rowid);
+            Self::Table(state) => {
+                state.emit_given_rowid(program, rowid);
                 Ok(())
             }
             Self::Mvcc(operation) => emit_advance_past(program, operation, rowid),
         }
     }
 
-    /// After the row and its triggers.
-    pub(super) fn emit_close(&self, program: &mut ProgramBuilder, rowid: usize) {
-        if let Self::Table(cursor) = self {
-            cursor.emit_close(program, rowid);
+    /// Once the row's rowid is known: an INSERT a trigger runs reads
+    /// `sqlite_sequence` from disk, so when a trigger inserts into the
+    /// table, the rowids this statement used are written first.
+    pub(super) fn emit_visible_to_triggers(&self, program: &mut ProgramBuilder) {
+        if let Self::Table(state) = self {
+            if state.sequence.triggers_insert_into_table {
+                state.emit_write_if_advanced(program);
+            }
+        }
+    }
+
+    /// After a row was moved to the rowid in `rowid` by an UPSERT: under
+    /// MVCC, advance the hidden sequence past it.
+    pub(super) fn emit_moved_row(&self, program: &mut ProgramBuilder, rowid: usize) -> Result<()> {
+        match self {
+            Self::Table(_) => Ok(()),
+            Self::Mvcc(operation) => emit_advance_past(program, operation, rowid),
+        }
+    }
+
+    /// When the statement ends: store the largest rowid it used.
+    pub(super) fn emit_end(&self, program: &mut ProgramBuilder) {
+        if let Self::Table(state) = self {
+            state.emit_end(program);
         }
     }
 }
@@ -207,75 +224,31 @@ pub(super) struct TableSequence {
     pub(super) table: Arc<BTreeTable>,
     pub(super) database: usize,
     pub(super) name: String,
+    /// Whether a trigger in the schema inserts into the target.
+    pub(super) triggers_insert_into_table: bool,
 }
 
 impl TableSequence {
-    /// Before an INSERT of several rows: add the target's row with 0 when
-    /// it has none.
-    pub(super) fn ensure_row(&self, program: &mut ProgramBuilder) {
+    /// At the start of an INSERT: open `sqlite_sequence`, read the
+    /// target's row, and start the largest rowid from its value.
+    pub(super) fn begin(&self, program: &mut ProgramBuilder) -> TableSequenceState<'_> {
         let cursor = self.open_write(program);
         let name = program.emit_string8_new_reg(self.name.clone());
-        let exists = program.allocate_label();
-        let missing = program.allocate_label();
-        let next = program.allocate_label();
-        program.emit_insn(Insn::Rewind {
-            cursor_id: cursor,
-            pc_if_empty: missing,
-        });
-        program.preassign_label_to_next_insn(next);
-        let row_name = program.alloc_register();
-        program.emit_column_or_rowid(cursor, 0, row_name);
-        program.emit_insn(Insn::Eq {
-            lhs: name,
-            rhs: row_name,
-            target_pc: exists,
-            flags: Default::default(),
-            collation: None,
-        });
-        program.emit_insn(Insn::Next {
-            cursor_id: cursor,
-            pc_if_next: next,
-            fullscan: false,
-        });
-        program.preassign_label_to_next_insn(missing);
-        let zero = program.alloc_register();
-        program.emit_insn(Insn::Integer {
-            dest: zero,
-            value: 0,
-        });
-        let record = self.emit_record(program, name, zero);
-        let rowid = program.alloc_register();
-        program.emit_insn(Insn::NewRowid {
-            cursor,
-            rowid_reg: rowid,
-            prev_largest_reg: 0,
-        });
-        program.emit_insn(Insn::Insert {
-            cursor,
-            key_reg: rowid,
-            record_reg: record,
-            flag: InsertFlags::new(),
-            table_name: SQLITE_SEQUENCE_TABLE_NAME.to_string(),
-        });
-        program.preassign_label_to_next_insn(exists);
-        program.emit_insn(Insn::Close { cursor_id: cursor });
-    }
-
-    /// At the start of a row: open `sqlite_sequence` and read the target's
-    /// row.
-    pub(super) fn open(&self, program: &mut ProgramBuilder) -> TableSequenceCursor<'_> {
-        let cursor = self.open_write(program);
-        let name = program.emit_string8_new_reg(self.name.clone());
-        let sequence = TableSequenceCursor {
+        let state = TableSequenceState {
             sequence: self,
             cursor,
             name,
             value: program.alloc_register(),
             rowid: program.alloc_register(),
+            max_rowid: program.alloc_register(),
         };
-        sequence.emit_clear(program);
-        sequence.reload(program);
-        sequence
+        state.reload(program);
+        program.emit_insn(Insn::Copy {
+            src_reg: state.value,
+            dst_reg: state.max_rowid,
+            extra_amount: 0,
+        });
+        state
     }
 
     fn open_write(&self, program: &mut ProgramBuilder) -> usize {
@@ -319,20 +292,22 @@ impl TableSequence {
     }
 }
 
-/// `sqlite_sequence` open for one row: the target's sequence value and the
-/// rowid of its row, NULL while there is none.
-pub(super) struct TableSequenceCursor<'a> {
+/// `sqlite_sequence` open for an INSERT: the target's sequence value and
+/// the rowid of its row, NULL while there is none, and the largest rowid
+/// the statement has used.
+pub(super) struct TableSequenceState<'a> {
     sequence: &'a TableSequence,
     cursor: usize,
     name: usize,
     value: usize,
     rowid: usize,
+    max_rowid: usize,
 }
 
-impl TableSequenceCursor<'_> {
+impl TableSequenceState<'_> {
     /// Generate the rowid of a new row into `rowid`: one more than the
-    /// largest of the sequence value and the table's largest rowid, then
-    /// store it in the sequence.
+    /// largest of the sequence value, the rowids the statement used and
+    /// the table's largest rowid.
     pub(super) fn emit_new_rowid(
         &self,
         program: &mut ProgramBuilder,
@@ -351,6 +326,10 @@ impl TableSequenceCursor<'_> {
             src_reg: self.value,
             dst_reg: rowid,
             extra_amount: 0,
+        });
+        program.emit_insn(Insn::MemMax {
+            dest_reg: rowid,
+            src_reg: self.max_rowid,
         });
         program.emit_insn(Insn::MemMax {
             dest_reg: rowid,
@@ -381,62 +360,52 @@ impl TableSequenceCursor<'_> {
             register: rowid,
             value: 1,
         });
-        self.emit_write(program, rowid);
+        program.emit_insn(Insn::Copy {
+            src_reg: rowid,
+            dst_reg: self.max_rowid,
+            extra_amount: 0,
+        });
     }
 
     /// Once the rowid is known, before any constraint is checked: a rowid
-    /// from the statement raises the sequence value. Like SQLite, this
-    /// happens even when the row is then skipped.
+    /// from the statement counts as used. Like SQLite, this happens even
+    /// when the row is then skipped.
     pub(super) fn emit_given_rowid(&self, program: &mut ProgramBuilder, rowid: usize) {
-        self.reload(program);
-        let missing = program.allocate_label();
-        let done = program.allocate_label();
-        program.emit_insn(Insn::IsNull {
-            reg: self.rowid,
-            target_pc: missing,
-        });
-        program.emit_insn(Insn::Le {
-            lhs: rowid,
-            rhs: self.value,
-            target_pc: done,
-            flags: Default::default(),
-            collation: None,
-        });
-        self.emit_write(program, rowid);
-        program.emit_insn(Insn::Goto { target_pc: done });
-        // Without a row yet, store max(0, rowid).
-        program.preassign_label_to_next_insn(missing);
-        let value = program.alloc_register();
-        program.emit_insn(Insn::Copy {
-            src_reg: self.value,
-            dst_reg: value,
-            extra_amount: 0,
-        });
         program.emit_insn(Insn::MemMax {
-            dest_reg: value,
+            dest_reg: self.max_rowid,
             src_reg: rowid,
         });
-        self.emit_write(program, value);
-        program.preassign_label_to_next_insn(done);
     }
 
-    /// After the row and its triggers: raise the sequence value to the
-    /// row's rowid when it is larger, then close `sqlite_sequence`.
-    pub(super) fn emit_close(&self, program: &mut ProgramBuilder, rowid: usize) {
-        self.reload(program);
-        let done = program.allocate_label();
-        program.emit_insn(Insn::Le {
-            lhs: rowid,
-            rhs: self.value,
-            target_pc: done,
-            flags: Default::default(),
-            collation: None,
-        });
-        self.emit_write(program, rowid);
-        program.preassign_label_to_next_insn(done);
+    /// When the statement ends: store the largest rowid it used, then
+    /// close `sqlite_sequence`.
+    pub(super) fn emit_end(&self, program: &mut ProgramBuilder) {
+        self.emit_write_if_advanced(program);
         program.emit_insn(Insn::Close {
             cursor_id: self.cursor,
         });
+    }
+
+    /// Store the largest rowid the statement used when it is larger than
+    /// the stored value, or when the target has no row yet.
+    fn emit_write_if_advanced(&self, program: &mut ProgramBuilder) {
+        self.reload(program);
+        let write = program.allocate_label();
+        let done = program.allocate_label();
+        program.emit_insn(Insn::IsNull {
+            reg: self.rowid,
+            target_pc: write,
+        });
+        program.emit_insn(Insn::Le {
+            lhs: self.max_rowid,
+            rhs: self.value,
+            target_pc: done,
+            flags: Default::default(),
+            collation: None,
+        });
+        program.preassign_label_to_next_insn(write);
+        self.emit_write(program, self.max_rowid);
+        program.preassign_label_to_next_insn(done);
     }
 
     fn emit_clear(&self, program: &mut ProgramBuilder) {
@@ -461,6 +430,9 @@ impl TableSequenceCursor<'_> {
             pc_if_empty: done,
         });
         program.preassign_label_to_next_insn(next);
+        // SQLite writes the row with the table name as declared, so the
+        // name is matched without case, and the stored spelling is kept
+        // for the write, so SQLite finds the row afterwards.
         let name = program.alloc_register();
         program.emit_column_or_rowid(self.cursor, 0, name);
         program.emit_insn(Insn::Ne {
@@ -468,7 +440,12 @@ impl TableSequenceCursor<'_> {
             rhs: name,
             target_pc: other,
             flags: Default::default(),
-            collation: None,
+            collation: Some(crate::translate::collate::CollationSeq::NoCase),
+        });
+        program.emit_insn(Insn::Copy {
+            src_reg: name,
+            dst_reg: self.name,
+            extra_amount: 0,
         });
         program.emit_column_or_rowid(self.cursor, 1, self.value);
         // Like SQLite, the stored value is used as an integer.
@@ -484,6 +461,7 @@ impl TableSequenceCursor<'_> {
         program.preassign_label_to_next_insn(other);
         program.emit_insn(Insn::Next {
             cursor_id: self.cursor,
+            is_index: program.cursor_is_index(self.cursor),
             pc_if_next: next,
             fullscan: false,
         });
@@ -508,7 +486,11 @@ impl TableSequenceCursor<'_> {
             cursor: self.cursor,
             key_reg: self.rowid,
             record_reg: record,
-            flag: InsertFlags::new(),
+            // Bookkeeping: not a change of the statement's, and not the
+            // last inserted rowid.
+            flag: InsertFlags::new()
+                .skip_last_rowid()
+                .skip_all_change_counts(),
             table_name: SQLITE_SEQUENCE_TABLE_NAME.to_string(),
         });
         program.emit_insn(Insn::Goto { target_pc: done });

@@ -56,6 +56,7 @@ expect {
     ok
 }
 
+@skip-if mvcc "REINDEX is not supported in MVCC mode"
 test reindex-table-naming-every-rowid {
     CREATE TABLE r(rowid INT, _rowid_ INT, oid INT, k INT);
     CREATE INDEX r_k ON r(k);

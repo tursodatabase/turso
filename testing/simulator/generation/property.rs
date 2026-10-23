@@ -35,6 +35,7 @@ use crate::{
         interactions::{
             Assertion, Interaction, InteractionBuilder, InteractionType, PropertyMetadata,
         },
+        lateral::LateralSelect,
         metrics::Remaining,
         property::{InteractiveQueryInfo, Property, PropertyDiscriminants},
     },
@@ -277,7 +278,9 @@ impl Property {
             | Property::SelectSelectOptimizer { .. }
             | Property::WhereTrueFalseNull { .. }
             | Property::UnionAllPreservesCardinality { .. }
+            | Property::LateralMatchesJsonEach { .. }
             | Property::ReadYourUpdatesBack { .. }
+            | Property::ReadYourUpdatesBackDeferred { .. }
             | Property::TableHasExpectedContent { .. }
             | Property::AllTableHaveExpectedContent { .. } => {
                 unreachable!("No extensional queries")
@@ -286,7 +289,7 @@ impl Property {
     }
 
     /// interactions construct a list of interactions, which is an executable representation of the property.
-    /// the requirement of property -> vec<interaction> conversion emerges from the need to serialize the property,
+    /// the requirement of property -> `vec<interaction>` conversion emerges from the need to serialize the property,
     /// and `interaction` cannot be serialized directly.
     pub(crate) fn interactions(
         &self,
@@ -295,7 +298,10 @@ impl Property {
     ) -> Vec<Interaction> {
         let interactions: Vec<InteractionBuilder> = match self {
             Property::AllTableHaveExpectedContent { tables } => {
-                assert_all_table_values(tables, connection_index).collect()
+                let mut interactions = vec![assert_schema_names(tables, connection_index)];
+                interactions.extend(assert_all_table_values(tables, connection_index));
+                interactions.push(assert_integrity_check(tables, connection_index));
+                interactions
             }
             Property::TableHasExpectedContent { table } => {
                 let table = table.to_string();
@@ -478,6 +484,138 @@ impl Property {
                                         print_diff(before_rows, after_rows, "before", "after");
                                         return Ok(Err(format!(
                                             "UPDATE failed but rows changed - rollback failed: {} rows before, {} after",
+                                            before_rows.len(),
+                                            after_rows.len()
+                                        )));
+                                    }
+                                    Ok(Ok(()))
+                                }
+                            }
+                            (Err(e), _) | (_, Err(e)) => {
+                                Err(LimboError::InternalError(format!("SELECT failed: {e}")))
+                            }
+                        }
+                    },
+                    vec![table_dependency],
+                ));
+
+                let mut update_builder = InteractionBuilder::with_interaction(update_interaction);
+                update_builder.ignore_error(true);
+
+                vec![
+                    InteractionBuilder::with_interaction(assumption),
+                    InteractionBuilder::with_interaction(before_interaction),
+                    InteractionBuilder::with_interaction(begin_tx),
+                    update_builder,
+                    InteractionBuilder::with_interaction(commit_tx),
+                    InteractionBuilder::with_interaction(after_interaction),
+                    InteractionBuilder::with_interaction(assertion),
+                ]
+            }
+            Property::ReadYourUpdatesBackDeferred {
+                update,
+                select_before,
+                select_after,
+            } => {
+                let table = update.table().to_string();
+                let table_dependency = table.clone();
+                let assumption = InteractionType::Assumption(Assertion::new(
+                    format!("table {table} exists"),
+                    move |_: &Vec<ResultSet>, env: &mut SimulatorEnv| {
+                        let conn_tables = env.get_conn_tables(connection_index);
+                        if conn_tables.iter().any(|t| t.name == table) {
+                            Ok(Ok(()))
+                        } else {
+                            Ok(Err(format!("table {table} does not exist")))
+                        }
+                    },
+                    vec![table_dependency.clone()],
+                ));
+
+                let before_interaction =
+                    InteractionType::Query(Query::Select(select_before.clone()));
+                let begin_tx = InteractionType::Query(Query::Begin(
+                    sql_generation::model::query::transaction::Begin::Deferred,
+                ));
+                let update_interaction = InteractionType::Query(Query::Update(update.clone()));
+                let commit_tx = InteractionType::Query(Query::Commit(
+                    sql_generation::model::query::transaction::Commit,
+                ));
+                let after_interaction = InteractionType::Query(Query::Select(select_after.clone()));
+
+                let update = update.clone();
+                let table = update.table().to_string();
+
+                let assertion = InteractionType::Assertion(Assertion::new(
+                    format!(
+                        "verify UPDATE result for table {table} in deferred tx: success=values updated, failure=snapshot unchanged"
+                    ),
+                    move |stack: &Vec<ResultSet>, _| {
+                        if stack.len() < 5 {
+                            return Err(LimboError::InternalError(
+                                "ReadYourUpdatesBackDeferred: expected 5 results on stack".into(),
+                            ));
+                        }
+                        let before = &stack[stack.len() - 5];
+                        let update_result = &stack[stack.len() - 3];
+                        let after = &stack[stack.len() - 1];
+
+                        let update_succeeded = update_result.is_ok();
+
+                        match (before, after) {
+                            (Ok(before_rows), Ok(after_rows)) => {
+                                if update_succeeded {
+                                    for row in after_rows {
+                                        for (i, (col, set_val)) in
+                                            update.set_values.iter().enumerate()
+                                        {
+                                            match set_val {
+                                                SetValue::Simple(expected) => {
+                                                    if &row[i] != expected {
+                                                        print_diff(
+                                                            &[row.to_vec()],
+                                                            &[vec![expected.clone()]],
+                                                            "database",
+                                                            "expected",
+                                                        );
+                                                        return Ok(Err(format!(
+                                                            "row has incorrect value for column {col}: expected {expected}, got {}",
+                                                            row[i]
+                                                        )));
+                                                    }
+                                                }
+                                                SetValue::CaseWhen { then_value, .. } => {
+                                                    let is_then = &row[i] == then_value;
+                                                    let existed_before = before_rows
+                                                        .iter()
+                                                        .any(|br| br[i] == row[i]);
+                                                    if !is_then && !existed_before {
+                                                        return Ok(Err(format!(
+                                                            "CaseWhen: row col {col} has unexpected value {} (expected {} or a value from before)",
+                                                            row[i], then_value
+                                                        )));
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                    Ok(Ok(()))
+                                } else {
+                                    let rows_equal_as_multiset =
+                                        |a: &[Vec<SimValue>], b: &[Vec<SimValue>]| {
+                                            if a.len() != b.len() {
+                                                return false;
+                                            }
+                                            let count_in =
+                                                |row: &Vec<SimValue>, set: &[Vec<SimValue>]| {
+                                                    set.iter().filter(|r| *r == row).count()
+                                                };
+                                            a.iter().all(|row| count_in(row, a) == count_in(row, b))
+                                        };
+                                    if !rows_equal_as_multiset(before_rows, after_rows) {
+                                        print_diff(before_rows, after_rows, "before", "after");
+                                        return Ok(Err(format!(
+                                            "UPDATE failed in deferred tx but rows changed - snapshot was lost: {} rows before, {} after",
                                             before_rows.len(),
                                             after_rows.len()
                                         )));
@@ -1249,6 +1387,42 @@ impl Property {
                 ),
                 ].into_iter().map(InteractionBuilder::with_interaction).collect()
             }
+            Property::LateralMatchesJsonEach {
+                select,
+                json_each_joins,
+            } => {
+                let tables: Vec<String> = select.dependencies().into_iter().collect();
+                let json_each_select = select.with_json_each_joins(json_each_joins);
+                vec![
+                    assume_tables_exist(tables.clone(), connection_index),
+                    InteractionType::Query(Query::LateralSelect(select.clone())),
+                    InteractionType::Query(Query::LateralSelect(json_each_select)),
+                    InteractionType::Assertion(Assertion::new(
+                        "LATERAL joins and their json_each form should return the same rows"
+                            .to_string(),
+                        move |stack: &Vec<ResultSet>, _: &mut SimulatorEnv| {
+                            let [.., lateral_rows, json_each_rows] = stack.as_slice() else {
+                                return Err(LimboError::InternalError(
+                                    "Not enough result sets on the stack".to_string(),
+                                ));
+                            };
+                            match (lateral_rows, json_each_rows) {
+                                (Ok(lateral_rows), Ok(json_each_rows)) => {
+                                    Ok(compare_rows_in_any_order(lateral_rows, json_each_rows))
+                                }
+                                (Err(e), _) | (_, Err(e)) => {
+                                    tracing::error!("Error in LATERAL or json_each query: {}", e);
+                                    Err(LimboError::InternalError(e.to_string()))
+                                }
+                            }
+                        },
+                        tables,
+                    )),
+                ]
+                .into_iter()
+                .map(InteractionBuilder::with_interaction)
+                .collect()
+            }
             Property::Queries { queries } => queries
                 .clone()
                 .into_iter()
@@ -1405,6 +1579,47 @@ impl Property {
             })
             .collect()
     }
+}
+
+fn assume_tables_exist(tables: Vec<String>, connection_index: usize) -> InteractionType {
+    InteractionType::Assumption(Assertion::new(
+        format!("tables ({}) exist", tables.join(", ")),
+        {
+            let tables = tables.clone();
+            move |_: &Vec<ResultSet>, env: &mut SimulatorEnv| {
+                let conn_tables = env.get_conn_tables(connection_index);
+                let missing_tables: Vec<&String> = tables
+                    .iter()
+                    .filter(|table| !conn_tables.iter().any(|t| t.name == **table))
+                    .collect();
+                if missing_tables.is_empty() {
+                    Ok(Ok(()))
+                } else {
+                    Ok(Err(format!("missing tables: {missing_tables:?}")))
+                }
+            }
+        },
+        tables,
+    ))
+}
+
+fn compare_rows_in_any_order(
+    lateral_rows: &[Vec<SimValue>],
+    json_each_rows: &[Vec<SimValue>],
+) -> Result<(), String> {
+    let mut lateral_rows = lateral_rows.to_vec();
+    let mut json_each_rows = json_each_rows.to_vec();
+    lateral_rows.sort();
+    json_each_rows.sort();
+    if lateral_rows == json_each_rows {
+        return Ok(());
+    }
+    print_diff(&lateral_rows, &json_each_rows, "LATERAL", "json_each");
+    Err(format!(
+        "LATERAL returned {} rows and json_each returned {} rows, and the rows are not the same",
+        lateral_rows.len(),
+        json_each_rows.len()
+    ))
 }
 
 fn random_main_table_write<R: rand::Rng + ?Sized>(
@@ -1596,10 +1811,99 @@ fn random_main_table_delete<R: rand::Rng + ?Sized>(rng: &mut R, table: &Table) -
     })
 }
 
+fn assert_schema_names(tables: &[String], connection_index: usize) -> InteractionBuilder {
+    let expected = tables.to_vec();
+    let dependencies = expected.clone();
+    InteractionBuilder::with_interaction(InteractionType::Assertion(Assertion::new(
+        "database schema should contain exactly the modeled tables".to_string(),
+        move |_stack: &Vec<ResultSet>, env: &mut SimulatorEnv| {
+            let actual = read_user_table_names(env, connection_index)?;
+            Ok(compare_table_names(&expected, &actual))
+        },
+        dependencies,
+    )))
+}
+
+fn compare_table_names(expected: &[String], actual: &[String]) -> Result<(), String> {
+    let mut expected = expected.to_vec();
+    let mut actual = actual.to_vec();
+    expected.sort_unstable();
+    actual.sort_unstable();
+
+    if expected == actual {
+        Ok(())
+    } else {
+        Err(format!(
+            "expected tables {expected:?}, database has {actual:?}"
+        ))
+    }
+}
+
+fn read_user_table_names(
+    env: &mut SimulatorEnv,
+    connection_index: usize,
+) -> turso_core::Result<Vec<String>> {
+    let schemas = std::iter::once("main".to_string())
+        .chain(env.attached_dbs.iter().cloned())
+        .collect::<Vec<_>>();
+    let mut names = Vec::new();
+    for schema in schemas {
+        let query = format!(
+            "SELECT name FROM {schema}.sqlite_schema \
+             WHERE type='table' AND name NOT LIKE 'sqlite_%' \
+             AND name NOT LIKE '__turso_internal_%' ORDER BY name"
+        );
+        match &mut env.connections[connection_index] {
+            crate::runner::env::SimConnection::LimboConnection(conn) => {
+                let mut rows = conn.query(query)?.ok_or_else(|| {
+                    LimboError::InternalError(format!(
+                        "sqlite_schema returned no rows for {schema}"
+                    ))
+                })?;
+                rows.run_with_row_callback(|row| {
+                    let turso_core::Value::Text(name) = row.get_value(0) else {
+                        return Err(LimboError::InternalError(format!(
+                            "sqlite_schema returned a non-text table name for {schema}"
+                        )));
+                    };
+                    names.push(if schema == "main" {
+                        name.as_str().to_string()
+                    } else {
+                        format!("{schema}.{name}")
+                    });
+                    Ok(())
+                })?;
+            }
+            crate::runner::env::SimConnection::SQLiteConnection(conn) => {
+                let mut stmt = conn
+                    .prepare(&query)
+                    .map_err(|err| LimboError::InternalError(err.to_string()))?;
+                let rows = stmt
+                    .query_map([], |row| row.get::<_, String>(0))
+                    .map_err(|err| LimboError::InternalError(err.to_string()))?;
+                for row in rows {
+                    let name = row.map_err(|err| LimboError::InternalError(err.to_string()))?;
+                    names.push(if schema == "main" {
+                        name
+                    } else {
+                        format!("{schema}.{name}")
+                    });
+                }
+            }
+            crate::runner::env::SimConnection::Disconnected => {
+                return Err(LimboError::InternalError(
+                    "connection is disconnected during schema assertion".into(),
+                ));
+            }
+        }
+    }
+    Ok(names)
+}
+
 fn assert_integrity_check(tables: &[String], connection_index: usize) -> InteractionBuilder {
     let tables = tables.to_vec();
     InteractionBuilder::with_interaction(InteractionType::Assertion(Assertion::new(
-        "PRAGMA integrity_check should be ok after savepoint rollback".to_string(),
+        "PRAGMA integrity_check should return ok".to_string(),
         move |_stack: &Vec<ResultSet>, env: &mut SimulatorEnv| {
             let result = run_integrity_check(env, connection_index)?;
             if result == "ok" {
@@ -1616,39 +1920,67 @@ fn run_integrity_check(
     env: &mut SimulatorEnv,
     connection_index: usize,
 ) -> turso_core::Result<String> {
+    let schemas: Vec<_> = std::iter::once("main".to_string())
+        .chain(env.attached_dbs.iter().cloned())
+        .collect();
     match &mut env.connections[connection_index] {
         crate::runner::env::SimConnection::LimboConnection(conn) => {
-            let mut rows = conn.query("PRAGMA integrity_check")?.ok_or_else(|| {
-                LimboError::InternalError("integrity_check returned no rows".into())
-            })?;
-            let mut result = Vec::new();
-            rows.run_with_row_callback(|row| {
-                let value = row
-                    .get_value(0)
-                    .to_text()
-                    .ok_or_else(|| {
-                        LimboError::InternalError(
-                            "integrity_check returned a non-text value".to_string(),
-                        )
-                    })?
-                    .to_string();
-                result.push(value);
-                Ok(())
-            })?;
-            Ok(result.join("\n"))
+            let mut failures = Vec::new();
+            for schema in schemas {
+                let query = format!("PRAGMA {schema}.integrity_check");
+                let mut rows = conn.query(query)?.ok_or_else(|| {
+                    LimboError::InternalError(format!(
+                        "integrity_check returned no rows for {schema}"
+                    ))
+                })?;
+                let mut result = Vec::new();
+                rows.run_with_row_callback(|row| {
+                    let value = row
+                        .get_value(0)
+                        .to_text()
+                        .ok_or_else(|| {
+                            LimboError::InternalError(format!(
+                                "integrity_check returned a non-text value for {schema}"
+                            ))
+                        })?
+                        .to_string();
+                    result.push(value);
+                    Ok(())
+                })?;
+                let result = result.join("\n");
+                if result != "ok" {
+                    failures.push(format!("{schema}: {result}"));
+                }
+            }
+            Ok(if failures.is_empty() {
+                "ok".to_string()
+            } else {
+                failures.join("\n")
+            })
         }
         crate::runner::env::SimConnection::SQLiteConnection(conn) => {
-            let mut stmt = conn
-                .prepare("PRAGMA integrity_check")
-                .map_err(|e| LimboError::InternalError(e.to_string()))?;
-            let rows = stmt
-                .query_map([], |row| row.get::<_, String>(0))
-                .map_err(|e| LimboError::InternalError(e.to_string()))?;
-            let mut result = Vec::new();
-            for row in rows {
-                result.push(row.map_err(|e| LimboError::InternalError(e.to_string()))?);
+            let mut failures = Vec::new();
+            for schema in schemas {
+                let mut stmt = conn
+                    .prepare(&format!("PRAGMA {schema}.integrity_check"))
+                    .map_err(|e| LimboError::InternalError(e.to_string()))?;
+                let rows = stmt
+                    .query_map([], |row| row.get::<_, String>(0))
+                    .map_err(|e| LimboError::InternalError(e.to_string()))?;
+                let mut result = Vec::new();
+                for row in rows {
+                    result.push(row.map_err(|e| LimboError::InternalError(e.to_string()))?);
+                }
+                let result = result.join("\n");
+                if result != "ok" {
+                    failures.push(format!("{schema}: {result}"));
+                }
             }
-            Ok(result.join("\n"))
+            Ok(if failures.is_empty() {
+                "ok".to_string()
+            } else {
+                failures.join("\n")
+            })
         }
         crate::runner::env::SimConnection::Disconnected => Err(LimboError::InternalError(
             "connection is disconnected during integrity_check assertion".into(),
@@ -1676,7 +2008,9 @@ fn assert_all_table_values(
             Predicate::true_(),
         )));
 
-        let assertion = InteractionType::Assertion(Assertion::new(format!("table {table} should contain all of its expected values"), {
+        let assertion = InteractionType::Assertion(Assertion::new(
+            format!("table {table} should contain all of its expected values"),
+            {
                 let table = table.clone();
                 move |stack: &Vec<ResultSet>, env: &mut SimulatorEnv| {
                     let conn_ctx = env.get_conn_tables(connection_index);
@@ -1688,45 +2022,35 @@ fn assert_all_table_values(
                     let last = stack.last().unwrap();
                     match last {
                         Ok(vals) => {
-                            let expected: Vec<Vec<SimValue>> = table.rows.iter().map(|r| strip_virtual_cols(table, r)).collect();
-                            let actual: Vec<Vec<SimValue>> = vals.iter().map(|r| strip_virtual_cols(table, r)).collect();
+                            let mut expected: Vec<Vec<SimValue>> = table
+                                .rows
+                                .iter()
+                                .map(|r| strip_virtual_cols(table, r))
+                                .collect();
+                            let mut actual: Vec<Vec<SimValue>> =
+                                vals.iter().map(|r| strip_virtual_cols(table, r)).collect();
+                            expected.sort_unstable();
+                            actual.sort_unstable();
 
-                            // Check if all values in the table are present in the result set
-                            // Find a value in the table that is not in the result set
-                            let model_contains_db = expected.iter().find(|v| {
-                                !actual.contains(v)
-                            });
-                            let db_contains_model = actual.iter().find(|v| {
-                                !expected.contains(v)
-                            });
-
-                            if let Some(model_contains_db) = model_contains_db {
-                                tracing::debug!(
-                                    "table {} does not contain the expected values, the simulator model has more rows than the database: {:?}",
-                                    table.name,
-                                    print_row(model_contains_db)
-                                );
-                                print_diff(&expected, &actual, "simulator", "database");
-
-                                Ok(Err(format!("table {} does not contain the expected values, the simulator model has more rows than the database: {:?}", table.name, print_row(model_contains_db))))
-                            } else if let Some(db_contains_model) = db_contains_model {
-                                tracing::debug!(
-                                    "table {} does not contain the expected values, the database has more rows than the simulator model: {:?}",
-                                    table.name,
-                                    print_row(db_contains_model)
-                                );
-                                print_diff(&expected, &actual, "simulator", "database");
-
-                                Ok(Err(format!("table {} does not contain the expected values, the database has more rows than the simulator model: {:?}", table.name, print_row(db_contains_model))))
-                            } else {
+                            if expected == actual {
                                 Ok(Ok(()))
+                            } else {
+                                print_diff(&expected, &actual, "simulator", "database");
+                                Ok(Err(format!(
+                                    "table {} does not contain the expected values",
+                                    table.name
+                                )))
                             }
                         }
                         Err(err) => Err(LimboError::InternalError(format!("{err}"))),
                     }
                 }
-            }, vec![table.clone()]));
-        [select, assertion].into_iter().map(InteractionBuilder::with_interaction)
+            },
+            vec![table.clone()],
+        ));
+        [select, assertion]
+            .into_iter()
+            .map(InteractionBuilder::with_interaction)
     })
 }
 
@@ -1885,6 +2209,33 @@ fn property_read_your_updates_back<R: rand::Rng + ?Sized>(
     );
 
     Property::ReadYourUpdatesBack {
+        update,
+        select_before: select.clone(),
+        select_after: select,
+    }
+}
+
+fn property_read_your_updates_back_deferred<R: rand::Rng + ?Sized>(
+    rng: &mut R,
+    _query_distr: &QueryDistribution,
+    ctx: &impl GenerationContext,
+    _mvcc: bool,
+) -> Property {
+    let update = Update::arbitrary(rng, ctx);
+
+    let select = Select::single(
+        update.table().to_string(),
+        update
+            .set_values
+            .iter()
+            .map(|(col, _)| ResultColumn::Column(col.clone()))
+            .collect(),
+        update.predicate.clone(),
+        None,
+        Distinctness::All,
+    );
+
+    Property::ReadYourUpdatesBackDeferred {
         update,
         select_before: select.clone(),
         select_after: select,
@@ -2111,12 +2462,36 @@ fn property_union_all_preserves_cardinality<R: rand::Rng + ?Sized>(
     }
 }
 
+fn property_lateral_matches_json_each<R: rand::Rng + ?Sized>(
+    rng: &mut R,
+    _query_distr: &QueryDistribution,
+    ctx: &impl GenerationContext,
+    _mvcc: bool,
+) -> Property {
+    let select = LateralSelect::arbitrary(rng, ctx);
+    let json_each_joins = arbitrary_json_each_joins(rng, select.joins.len());
+    Property::LateralMatchesJsonEach {
+        select,
+        json_each_joins,
+    }
+}
+
+fn arbitrary_json_each_joins<R: rand::Rng + ?Sized>(rng: &mut R, join_count: usize) -> Vec<usize> {
+    let mut json_each_joins: Vec<usize> =
+        (0..join_count).filter(|_| rng.random_bool(0.5)).collect();
+    if json_each_joins.is_empty() {
+        json_each_joins.push(pick_index(join_count, rng));
+    }
+    json_each_joins
+}
+
 fn property_fsync_no_wait<R: rand::Rng + ?Sized>(
     rng: &mut R,
     query_distr: &QueryDistribution,
     ctx: &impl GenerationContext,
-    _mvcc: bool,
+    mvcc: bool,
 ) -> Property {
+    assert!(!mvcc, "FsyncNoWait must not be generated in MVCC mode");
     Property::FsyncNoWait {
         query: Query::arbitrary_from(rng, ctx, query_distr),
     }
@@ -2202,6 +2577,9 @@ impl PropertyDiscriminants {
         match self {
             PropertyDiscriminants::InsertValuesSelect => property_insert_values_select,
             PropertyDiscriminants::ReadYourUpdatesBack => property_read_your_updates_back,
+            PropertyDiscriminants::ReadYourUpdatesBackDeferred => {
+                property_read_your_updates_back_deferred
+            }
             PropertyDiscriminants::SavepointRollback => property_savepoint_rollback,
             PropertyDiscriminants::TableHasExpectedContent => property_table_has_expected_content,
             PropertyDiscriminants::AllTableHaveExpectedContent => {
@@ -2216,6 +2594,7 @@ impl PropertyDiscriminants {
             PropertyDiscriminants::UnionAllPreservesCardinality => {
                 property_union_all_preserves_cardinality
             }
+            PropertyDiscriminants::LateralMatchesJsonEach => property_lateral_matches_json_each,
             PropertyDiscriminants::FsyncNoWait => property_fsync_no_wait,
             PropertyDiscriminants::FaultyQuery => property_faulty_query,
             PropertyDiscriminants::SequenceMonotonicity => property_sequence_monotonicity,
@@ -2247,6 +2626,13 @@ impl PropertyDiscriminants {
             }
 
             PropertyDiscriminants::ReadYourUpdatesBack => {
+                if remaining.select > 0 && remaining.update > 0 {
+                    u32::min(remaining.select, remaining.update).max(1)
+                } else {
+                    0
+                }
+            }
+            PropertyDiscriminants::ReadYourUpdatesBackDeferred => {
                 if remaining.select > 0 && remaining.update > 0 {
                     u32::min(remaining.select, remaining.update).max(1)
                 } else {
@@ -2321,8 +2707,18 @@ impl PropertyDiscriminants {
                     0
                 }
             }
+            PropertyDiscriminants::LateralMatchesJsonEach => {
+                if !env.opts.disable_lateral_matches_json_each && !ctx.tables().is_empty() {
+                    remaining.select / 3
+                } else {
+                    0
+                }
+            }
             PropertyDiscriminants::FsyncNoWait => {
-                if env.profile.io.enable && !env.opts.disable_fsync_no_wait {
+                if env.profile.io.enable
+                    && !env.opts.disable_fsync_no_wait
+                    && env.can_simulate_power_loss()
+                {
                     50 // Freestyle number
                 } else {
                     0
@@ -2370,6 +2766,9 @@ impl PropertyDiscriminants {
             PropertyDiscriminants::ReadYourUpdatesBack => {
                 QueryCapabilities::SELECT.union(QueryCapabilities::UPDATE)
             }
+            PropertyDiscriminants::ReadYourUpdatesBackDeferred => {
+                QueryCapabilities::SELECT.union(QueryCapabilities::UPDATE)
+            }
             PropertyDiscriminants::SavepointRollback => QueryCapabilities::INSERT,
             PropertyDiscriminants::TableHasExpectedContent => QueryCapabilities::SELECT,
             PropertyDiscriminants::AllTableHaveExpectedContent => QueryCapabilities::SELECT,
@@ -2384,6 +2783,7 @@ impl PropertyDiscriminants {
             PropertyDiscriminants::SelectSelectOptimizer => QueryCapabilities::SELECT,
             PropertyDiscriminants::WhereTrueFalseNull => QueryCapabilities::SELECT,
             PropertyDiscriminants::UnionAllPreservesCardinality => QueryCapabilities::SELECT,
+            PropertyDiscriminants::LateralMatchesJsonEach => QueryCapabilities::SELECT,
             PropertyDiscriminants::FsyncNoWait => QueryCapabilities::all(),
             PropertyDiscriminants::FaultyQuery => QueryCapabilities::all(),
             PropertyDiscriminants::SequenceMonotonicity => QueryCapabilities::SEQUENCE,
@@ -2472,4 +2872,386 @@ fn print_row(row: &[SimValue]) -> String {
         })
         .collect::<Vec<String>>()
         .join(", ")
+}
+
+#[cfg(test)]
+mod tests {
+    use std::num::NonZeroUsize;
+
+    use clap::Parser as _;
+    use rand::SeedableRng;
+    use rand_chacha::ChaCha8Rng;
+    use sql_generation::generation::Arbitrary;
+    use sql_generation::model::query::{Create, CreateIndex, Insert};
+    use sql_generation::model::table::Index;
+    use turso_core::Value;
+
+    use super::*;
+    use crate::model::lateral::{
+        ColumnRef, Comparison, LateralColumn, LateralForm, LateralJoin, LateralJoinType,
+        SubqueryJoin,
+    };
+    use crate::profiles::Profile;
+    use crate::runner::cli::SimulatorCLI;
+    use crate::runner::env::{Paths, SimulationType};
+    use crate::runner::execution::execute_interaction;
+
+    #[test]
+    fn lateral_and_json_each_queries_return_the_same_rows_on_random_tables() {
+        let output_dir = tempfile::tempdir().unwrap();
+        let mut env = memory_env(output_dir.path());
+        let mut rng = ChaCha8Rng::seed_from_u64(0x1A7E);
+        let mut stack = Vec::new();
+
+        for _ in 0..3 {
+            let create = Query::Create(Create::arbitrary(&mut rng, &env.connection_context(0)));
+            execute_query(&mut env, create, &mut stack);
+        }
+        for _ in 0..30 {
+            let insert = Query::Insert(Insert::arbitrary(&mut rng, &env.connection_context(0)));
+            execute_query(&mut env, insert, &mut stack);
+        }
+
+        let mut lateral_rows = 0;
+        for id in 1..=200 {
+            let select = LateralSelect::arbitrary(&mut rng, &env.connection_context(0));
+            let json_each_joins = arbitrary_json_each_joins(&mut rng, select.joins.len());
+            let property = Property::LateralMatchesJsonEach {
+                select,
+                json_each_joins,
+            };
+            lateral_rows += check_property(&mut env, &property, id, &mut stack).len();
+        }
+        assert!(lateral_rows > 0, "the LATERAL queries returned no rows");
+    }
+
+    #[test]
+    fn lateral_join_with_distinct_order_by_and_limit_returns_the_top_rows_in_both_forms() {
+        let output_dir = tempfile::tempdir().unwrap();
+        let mut env = memory_env(output_dir.path());
+        let mut stack = Vec::new();
+        create_table(
+            &mut env,
+            &mut stack,
+            "t",
+            &[("a", ColumnType::Integer)],
+            vec![vec![integer(1)], vec![integer(2)], vec![integer(3)]],
+        );
+        create_table(
+            &mut env,
+            &mut stack,
+            "u",
+            &[("x", ColumnType::Integer), ("y", ColumnType::Text)],
+            [
+                (1, "a"),
+                (1, "b"),
+                (2, "c"),
+                (2, "c"),
+                (3, "d"),
+                (3, "e"),
+                (3, "f"),
+            ]
+            .into_iter()
+            .map(|(x, y)| vec![integer(x), text(y)])
+            .collect(),
+        );
+        let mut join = lateral_join(
+            "u",
+            vec![table_column("i0", "y")],
+            Comparison {
+                left: table_column("i0", "x"),
+                operator: ast::Operator::LessEquals,
+                right: table_column("o", "a"),
+            },
+        );
+        join.join_type = LateralJoinType::Left {
+            on: Predicate::true_(),
+        };
+        join.distinct = true;
+        join.order_by = vec![(0, ast::SortOrder::Desc)];
+        join.limit = Some(2);
+        let property = json_each_property("t", "a", join);
+
+        let mut lateral_rows = check_property(&mut env, &property, 1, &mut stack);
+
+        lateral_rows.sort();
+        let expected: Vec<Vec<SimValue>> =
+            [(1, "a"), (1, "b"), (2, "b"), (2, "c"), (3, "e"), (3, "f")]
+                .into_iter()
+                .map(|(a, y)| vec![integer(a), text(y)])
+                .collect();
+        assert_eq!(lateral_rows, expected);
+    }
+
+    #[test]
+    fn joined_table_that_compares_the_outer_row_first_returns_every_match_in_both_forms() {
+        let output_dir = tempfile::tempdir().unwrap();
+        let mut env = memory_env(output_dir.path());
+        let mut stack = Vec::new();
+        create_table(
+            &mut env,
+            &mut stack,
+            "t",
+            &[("a", ColumnType::Integer)],
+            vec![vec![integer(1)], vec![integer(2)], vec![integer(3)]],
+        );
+        create_table(
+            &mut env,
+            &mut stack,
+            "u",
+            &[("k", ColumnType::Integer)],
+            vec![vec![integer(1)], vec![integer(2)], vec![integer(3)]],
+        );
+        create_table(
+            &mut env,
+            &mut stack,
+            "v",
+            &[("x", ColumnType::Integer), ("y", ColumnType::Text)],
+            [(1, "v1"), (2, "v2"), (3, "v3"), (2, "v22")]
+                .into_iter()
+                .map(|(x, y)| vec![integer(x), text(y)])
+                .collect(),
+        );
+        let mut join = lateral_join(
+            "u",
+            vec![table_column("i0_1", "y")],
+            Comparison {
+                left: table_column("i0", "k"),
+                operator: ast::Operator::Equals,
+                right: table_column("o", "a"),
+            },
+        );
+        join.joined_tables = vec![SubqueryJoin {
+            table: "v".to_string(),
+            alias: "i0_1".to_string(),
+            on: vec![Comparison {
+                left: table_column("o", "a"),
+                operator: ast::Operator::Equals,
+                right: table_column("i0_1", "x"),
+            }],
+        }];
+        let property = json_each_property("t", "a", join);
+
+        let mut lateral_rows = check_property(&mut env, &property, 1, &mut stack);
+
+        lateral_rows.sort();
+        let expected: Vec<Vec<SimValue>> = [(1, "v1"), (2, "v2"), (2, "v22"), (3, "v3")]
+            .into_iter()
+            .map(|(a, y)| vec![integer(a), text(y)])
+            .collect();
+        assert_eq!(lateral_rows, expected);
+    }
+
+    fn memory_env(output_dir: &std::path::Path) -> SimulatorEnv {
+        let mut env = SimulatorEnv::new(
+            0x1A7E,
+            &SimulatorCLI::parse_from(["limbo_sim", "--io-backend=memory"]),
+            Paths::new(output_dir),
+            SimulationType::Default,
+            &Profile::default(),
+        );
+        env.connect(0);
+        env
+    }
+
+    fn check_property(
+        env: &mut SimulatorEnv,
+        property: &Property,
+        id: usize,
+        stack: &mut Vec<ResultSet>,
+    ) -> Vec<Vec<SimValue>> {
+        let mut lateral_rows = Vec::new();
+        for interaction in property.interactions(0, NonZeroUsize::new(id).unwrap()) {
+            if let InteractionType::Assertion(_) = interaction.interaction {
+                let [.., Ok(rows), _] = stack.as_slice() else {
+                    panic!("the LATERAL query must return rows: {stack:?}");
+                };
+                lateral_rows = rows.clone();
+            }
+            execute_interaction(env, &interaction, stack).unwrap_or_else(|err| {
+                panic!("{err}\nproperty: {property:?}");
+            });
+        }
+        lateral_rows
+    }
+
+    #[test]
+    fn joined_table_with_an_indexed_outer_comparison_returns_every_match_in_both_forms() {
+        let output_dir = tempfile::tempdir().unwrap();
+        let mut env = memory_env(output_dir.path());
+        let mut stack = Vec::new();
+        create_table(
+            &mut env,
+            &mut stack,
+            "t",
+            &[("a", ColumnType::Integer)],
+            vec![vec![integer(1)], vec![integer(2)], vec![integer(3)]],
+        );
+        create_table(
+            &mut env,
+            &mut stack,
+            "p",
+            &[("y", ColumnType::Integer), ("v", ColumnType::Text)],
+            [(1, "p1"), (2, "p2"), (3, "p3")]
+                .into_iter()
+                .map(|(y, v)| vec![integer(y), text(v)])
+                .collect(),
+        );
+        create_table(
+            &mut env,
+            &mut stack,
+            "q",
+            &[("x", ColumnType::Integer), ("z", ColumnType::Integer)],
+            [(1, 1), (2, 2), (3, 3), (2, 3)]
+                .into_iter()
+                .map(|(x, z)| vec![integer(x), integer(z)])
+                .collect(),
+        );
+        let index = Index {
+            table_name: "q".to_string(),
+            index_name: "q_x".to_string(),
+            columns: vec![("x".to_string(), ast::SortOrder::Asc)],
+        };
+        execute_query(
+            &mut env,
+            Query::CreateIndex(CreateIndex { index }),
+            &mut stack,
+        );
+        let mut join = lateral_join(
+            "p",
+            vec![table_column("i0", "v")],
+            Comparison {
+                left: table_column("i0_1", "x"),
+                operator: ast::Operator::Equals,
+                right: table_column("o", "a"),
+            },
+        );
+        join.joined_tables = vec![SubqueryJoin {
+            table: "q".to_string(),
+            alias: "i0_1".to_string(),
+            on: vec![Comparison {
+                left: table_column("i0", "y"),
+                operator: ast::Operator::Equals,
+                right: table_column("i0_1", "z"),
+            }],
+        }];
+        let property = json_each_property("t", "a", join);
+
+        let mut lateral_rows = check_property(&mut env, &property, 1, &mut stack);
+
+        lateral_rows.sort();
+        let expected: Vec<Vec<SimValue>> = [(1, "p1"), (2, "p2"), (2, "p3"), (3, "p3")]
+            .into_iter()
+            .map(|(a, v)| vec![integer(a), text(v)])
+            .collect();
+        assert_eq!(lateral_rows, expected);
+    }
+
+    fn create_table(
+        env: &mut SimulatorEnv,
+        stack: &mut Vec<ResultSet>,
+        name: &str,
+        columns: &[(&str, ColumnType)],
+        rows: Vec<Vec<SimValue>>,
+    ) {
+        let table = Table {
+            name: name.to_string(),
+            columns: columns
+                .iter()
+                .map(|(column, column_type)| Column {
+                    name: column.to_string(),
+                    column_type: *column_type,
+                    constraints: Vec::new(),
+                })
+                .collect(),
+            rows: Vec::new(),
+            indexes: Vec::new(),
+        };
+        execute_query(env, Query::Create(Create { table }), stack);
+        let insert = Insert::Values {
+            table: name.to_string(),
+            values: rows,
+            on_conflict: None,
+        };
+        execute_query(env, Query::Insert(insert), stack);
+    }
+
+    fn lateral_join(table: &str, columns: Vec<ColumnRef>, correlation: Comparison) -> LateralJoin {
+        LateralJoin {
+            join_type: LateralJoinType::Comma,
+            form: LateralForm::Lateral,
+            alias: "s0".to_string(),
+            table: table.to_string(),
+            table_alias: "i0".to_string(),
+            joined_tables: Vec::new(),
+            distinct: false,
+            columns: columns
+                .into_iter()
+                .map(|source| LateralColumn {
+                    source,
+                    quoted: false,
+                })
+                .collect(),
+            correlation,
+            filter_operator: ast::Operator::And,
+            filter: Predicate::true_(),
+            order_by: Vec::new(),
+            limit: None,
+        }
+    }
+
+    fn json_each_property(table: &str, column: &str, join: LateralJoin) -> Property {
+        Property::LateralMatchesJsonEach {
+            select: LateralSelect {
+                table: table.to_string(),
+                table_alias: "o".to_string(),
+                columns: vec![column.to_string()],
+                joins: vec![join],
+                where_clause: Predicate::true_(),
+            },
+            json_each_joins: vec![0],
+        }
+    }
+
+    fn table_column(alias: &str, column: &str) -> ColumnRef {
+        ColumnRef::Table {
+            alias: alias.to_string(),
+            column: column.to_string(),
+        }
+    }
+
+    fn integer(value: i64) -> SimValue {
+        SimValue(Value::from_i64(value))
+    }
+
+    fn text(value: &str) -> SimValue {
+        SimValue(Value::build_text(value.to_string()))
+    }
+
+    fn execute_query(env: &mut SimulatorEnv, query: Query, stack: &mut Vec<ResultSet>) {
+        let interaction = InteractionBuilder::with_interaction(InteractionType::Query(query))
+            .connection_index(0)
+            .id(NonZeroUsize::new(1).unwrap())
+            .build()
+            .unwrap();
+        execute_interaction(env, &interaction, stack).unwrap();
+        stack.clear();
+    }
+
+    #[test]
+    fn rows_are_the_same_in_any_order_but_not_with_a_missing_copy() {
+        let row = |values: &[i64]| -> Vec<SimValue> {
+            values
+                .iter()
+                .map(|v| SimValue(Value::from_i64(*v)))
+                .collect()
+        };
+
+        assert!(
+            compare_rows_in_any_order(&[row(&[1, 2]), row(&[3, 4])], &[row(&[3, 4]), row(&[1, 2])])
+                .is_ok()
+        );
+        assert!(compare_rows_in_any_order(&[row(&[1, 2]), row(&[1, 2])], &[row(&[1, 2])]).is_err());
+        assert!(compare_rows_in_any_order(&[row(&[1, 2])], &[row(&[1, 3])]).is_err());
+    }
 }

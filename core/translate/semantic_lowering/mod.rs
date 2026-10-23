@@ -18,13 +18,14 @@ mod window;
 use turso_parser::ast;
 
 use crate::{
+    function::{Func, ScalarFunc},
     schema::{Schema, Type},
     sync::Arc,
     translate::{
         optimizer::cost_model_params,
         plan::QueryDestination,
         semantic::{
-            analyze_root,
+            analyze_root, compound_column_affinity,
             context::SemanticContext,
             hir::{self, HirDocument, HirRoot, OutputNameKind},
             SemanticRootInput,
@@ -34,6 +35,7 @@ use crate::{
     vdbe::{
         affinity::Affinity,
         builder::{ProgramBuilder, SourceBinding},
+        CursorID,
     },
     Connection, LimboError, Result,
 };
@@ -67,7 +69,7 @@ pub(crate) struct PlannedSelect {
     plan: Arc<HirPlan>,
     query: hir::QueryId,
     /// Outputs computed with custom-typed columns read as stored.
-    stored_outputs: Vec<usize>,
+    stored_outputs: crate::alloc::Vec<usize>,
 }
 
 /// One value a schema statement reads from each row of a table.
@@ -99,7 +101,7 @@ impl PlannedSelect {
         Ok(Self {
             plan,
             query,
-            stored_outputs: Vec::new(),
+            stored_outputs: crate::alloc::vec![],
         })
     }
 
@@ -125,7 +127,7 @@ impl PlannedSelect {
         context: &SemanticContext<'_>,
         connection: &Arc<Connection>,
     ) -> Result<Self> {
-        let mut stored_outputs = Vec::new();
+        let mut stored_outputs = crate::alloc::vec![];
         let mut rowid_outputs = Vec::new();
         let columns = values
             .into_iter()
@@ -147,7 +149,7 @@ impl PlannedSelect {
         let from = ast::FromClause {
             select: Box::new(ast::SelectTable::Table(
                 ast::QualifiedName {
-                    db_name: Some(ast::Name::exact(database)),
+                    namespace: Some(ast::Name::exact(database)),
                     name: ast::Name::exact(table),
                     alias: None,
                 },
@@ -278,7 +280,8 @@ impl PlannedSelect {
             .output
             .iter()
             .zip(names)
-            .map(|(output, column)| {
+            .enumerate()
+            .map(|(position, (output, column))| {
                 let output = document.output(*output).ok_or_else(|| {
                     LimboError::InternalError("HIR CTAS output is missing".into())
                 })?;
@@ -291,7 +294,15 @@ impl PlannedSelect {
                     ResolvedResultValue::RowId { name, .. } if !column.name_is_alias => name,
                     _ => column.name,
                 };
-                Ok((name, output.schema_affinity.short_type_name()))
+                // Like SQLite, a compound SELECT's column takes the affinity
+                // its arms agree on; arms of different classes leave it
+                // without a declared type.
+                let affinity = if query.blocks.len() > 1 {
+                    compound_column_affinity(query, position, &|source| document.source(source)).0
+                } else {
+                    output.schema_affinity
+                };
+                Ok((name, affinity.short_type_name()))
             })
             .collect()
     }
@@ -324,6 +335,79 @@ impl PlannedSelect {
         })?;
         Ok(values)
     }
+
+    /// Compute the SELECT's values for the row `cursor` is on, into the
+    /// registers `start + column`, one per value. The SELECT reads one
+    /// table, which `cursor` is open on, and has no WHERE clause.
+    pub(crate) fn emit_values_from_cursor(
+        &self,
+        program: &mut ProgramBuilder,
+        cursor: CursorID,
+        start: usize,
+    ) -> Result<()> {
+        let source = self.table_source()?;
+        let document = &self.plan.document;
+        let query = document
+            .query(self.query)
+            .ok_or_else(|| LimboError::InternalError("HIR scan query is missing".into()))?;
+        program.bind_source(
+            source,
+            SourceBinding::BTree {
+                scan_cursor: cursor,
+                table_cursor: None,
+            },
+        );
+        program.set_hir_plan(self.plan.clone());
+        for (position, output) in query.output.iter().enumerate() {
+            let output = document
+                .output(*output)
+                .ok_or_else(|| LimboError::InternalError("HIR scan output is missing".into()))?;
+            let target = start + position;
+            if self.stored_outputs.contains(&position) {
+                dml::with_stored_values(program, |program| {
+                    expr::translate_expr_no_constant_opt(program, document, &output.expr, target)
+                })?;
+            } else {
+                expr::translate_expr_no_constant_opt(program, document, &output.expr, target)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// STRICT: check the values at `start + column` of the columns `only`
+    /// of the table the SELECT reads against the types they accept, encode
+    /// them with their custom types, then check the encoded values against
+    /// the columns' base types, as INSERT does with new values.
+    pub(crate) fn emit_custom_type_writes(
+        &self,
+        program: &mut ProgramBuilder,
+        table: &Arc<crate::schema::BTreeTable>,
+        start: usize,
+        only: &[usize],
+    ) -> Result<()> {
+        let document = &self.plan.document;
+        let source = document
+            .source(self.table_source()?)
+            .ok_or_else(|| LimboError::InternalError("HIR scan source is missing".into()))?;
+        dml::emit_custom_type_writes(program, document, source, table, start, Some(only))
+    }
+
+    /// The one table the SELECT reads.
+    fn table_source(&self) -> Result<hir::SourceId> {
+        let document = &self.plan.document;
+        let query = document
+            .query(self.query)
+            .ok_or_else(|| LimboError::InternalError("HIR scan query is missing".into()))?;
+        let block = document
+            .query_block(query.first)
+            .ok_or_else(|| LimboError::InternalError("HIR scan block is missing".into()))?;
+        match &block.from {
+            Some(from) if from.joins.is_empty() && query.blocks.len() == 1 => Ok(from.first),
+            _ => Err(LimboError::InternalError(
+                "HIR scan does not read exactly one table".into(),
+            )),
+        }
+    }
 }
 
 /// The DELETE that DROP TABLE runs first when foreign keys are on and other
@@ -341,7 +425,7 @@ pub(crate) fn translate_drop_table_delete(
     let statement = ast::Stmt::Delete {
         with: None,
         tbl_name: ast::QualifiedName {
-            db_name: Some(ast::Name::exact(database.to_string())),
+            namespace: Some(ast::Name::exact(database.to_string())),
             name: ast::Name::exact(table.to_string()),
             alias: None,
         },
@@ -510,6 +594,9 @@ pub(crate) fn translate_insert(
         &subprograms,
         uses_mvcc(connection, &plan.document, insert.target),
         !connection.check_constraints_ignored(),
+        connection
+            .dialect()
+            .upsert_rejects_row_written_by_same_statement(),
     )?;
     if let Some(returning) = &insert.returning {
         program.resolved_result_columns =
@@ -545,12 +632,19 @@ fn check_target(
     {
         crate::bail_parse_error!("table {table_name} may not be modified");
     }
-    if schema.is_materialized_view(&table_name) {
+    // Materialized views live in the main database: a table of the same
+    // name in an attached database is an ordinary table.
+    let in_main = name
+        .namespace
+        .as_ref()
+        .is_none_or(|db| crate::util::normalize_ident(db.as_str()) == "main");
+    if in_main && schema.is_materialized_view(&table_name) {
         crate::bail_parse_error!("cannot modify materialized view {table_name}");
     }
-    if schema
-        .get_btree_table(&table_name)
-        .is_some_and(|table| !table.has_rowid)
+    if in_main
+        && schema
+            .get_btree_table(&table_name)
+            .is_some_and(|table| !table.has_rowid)
         && !schema
             .get_dependent_materialized_views(&table_name)
             .is_empty()
@@ -563,7 +657,7 @@ fn check_target(
         if views.is_empty() {
             return Ok(());
         }
-        use crate::incremental::compiler::DBSP_CIRCUIT_VERSION;
+        use crate::incremental::view::DBSP_CIRCUIT_VERSION;
         crate::bail_parse_error!(
             "Cannot {statement} '{table_name}' because it has incompatible dependent materialized view(s): {}. \n\
              These views were created with a different DBSP version than the current version ({DBSP_CIRCUIT_VERSION}). \n\
@@ -605,10 +699,11 @@ impl<'a> HirSession<'a> {
     ) -> Result<Arc<HirPlan>> {
         let mut document = self.analyze(input)?;
         rewrite(&mut document)?;
-        Ok(Arc::new(HirPlan::build(
+        Ok(Arc::new(HirPlan::build_with_unnesting_mode(
             Arc::new(document),
             self.context.main_schema(),
             cost_model_params(),
+            self.connection.subquery_unnesting_mode(),
         )?))
     }
 
@@ -618,43 +713,10 @@ impl<'a> HirSession<'a> {
     }
 }
 
-/// Compile `expression` over `inputs.len()` values, which the program
-/// holds in registers `0..inputs.len()` when it runs, leaving the result
-/// in `target`. The expression reads input `n` as `Register(n)`.
-pub(crate) fn translate_register_expression(
-    program: &mut ProgramBuilder,
-    expression: &ast::Expr,
-    inputs: &[String],
-    schema: &Arc<Schema>,
-    symbols: &crate::SymbolTable,
-    connection: &Arc<Connection>,
-    target: usize,
-) -> Result<()> {
-    // The expression is SQLite text over the main schema, whatever the
-    // database's dialect or the prepare call's search path.
-    let dialect: Arc<dyn crate::dialect::Dialect> = Arc::new(crate::dialect::SqliteDialect);
-    let catalog = crate::translate::capture_catalog(schema, connection, dialect.as_ref(), None)?;
-    let context = crate::translate::semantic_context(&catalog, symbols, connection, dialect)?;
-    let document =
-        HirSession::new(&context, connection).analyze(SemanticRootInput::RegisterExpressions {
-            inputs,
-            expressions: std::slice::from_ref(expression),
-        })?;
-    let HirRoot::SchemaExpressions(root) = &document.root else {
-        return Err(LimboError::InternalError(
-            "register expression analysis did not produce an expression root".into(),
-        ));
-    };
-    program.bind_source(
-        root.source,
-        SourceBinding::Registers {
-            start: 0,
-            rowid: None,
-        },
-    );
-    expr::translate_expr_no_constant_opt(program, &document, &root.expressions[0], target)?;
-    Ok(())
-}
+/// The expression lowering, for materialized view maintenance programs,
+/// whose operators lower the analyzed expressions of a view's query over
+/// register-bound stream values.
+pub(crate) use expr::{translate_condition_expr, translate_expr_no_constant_opt};
 
 /// Make each output in `positions` of a scan's one query block read the
 /// scanned table's rowid.
@@ -753,7 +815,7 @@ fn resolved_result_columns(
     let block = query.blocks.first().ok_or_else(|| {
         LimboError::InternalError(format!("HIR query {} has no blocks", query.id))
     })?;
-    resolved_output_columns(document, &block.outputs)
+    resolved_output_columns_from(document, &block.outputs, block.from.as_ref())
 }
 
 /// Result-column metadata for a list of outputs, such as a SELECT block's
@@ -762,21 +824,78 @@ fn resolved_output_columns(
     document: &HirDocument,
     outputs: &[hir::Output],
 ) -> Result<Vec<ResolvedResultColumn>> {
+    resolved_output_columns_from(document, outputs, None)
+}
+
+fn resolved_output_columns_from(
+    document: &HirDocument,
+    outputs: &[hir::Output],
+    from: Option<&hir::From>,
+) -> Result<Vec<ResolvedResultColumn>> {
     outputs
         .iter()
         .map(|output| {
+            let value = match group_column_of(document, from, &output.expr) {
+                Some(column) => resolved_result_value(document, &column)?,
+                None => resolved_result_value(document, &output.expr)?,
+            };
             Ok(ResolvedResultColumn {
                 name: output.name.clone(),
                 name_is_alias: matches!(
                     output.name_kind,
                     OutputNameKind::ExplicitAlias | OutputNameKind::StarExpansion
                 ),
-                value: resolved_result_value(document, &output.expr)?,
+                value,
                 affinity: output.affinity,
                 primitive: expression_primitive(document, &output.expr),
             })
         })
         .collect()
+}
+
+/// SQLite reads a parenthesized join as a subquery, and names a column
+/// read through it after that subquery: `(join-1).id:1`, or the group's
+/// alias. The one source of a FROM clause that is a group is read without
+/// the subquery. Returns the group column the expression reads, through
+/// every group it is inside.
+fn group_column_of(
+    document: &HirDocument,
+    from: Option<&hir::From>,
+    expression: &hir::Expr,
+) -> Option<hir::Expr> {
+    let bare = |group: &hir::Source| {
+        from.is_some_and(|from| from.first == group.id && from.joins.is_empty())
+    };
+    let mut found = None;
+    let mut expression = match expression {
+        hir::Expr::Column(_) | hir::Expr::MergedColumn(_) => expression.clone(),
+        _ => return None,
+    };
+    loop {
+        let outer = document.sources.iter().find_map(|source| {
+            let hir::SourceKind::FromGroup(group) = &source.kind else {
+                return None;
+            };
+            if bare(source) {
+                return None;
+            }
+            let column = group
+                .columns
+                .iter()
+                .position(|value| value.equivalent(&expression))?;
+            Some(hir::Expr::Column(hir::ColumnRef {
+                source: source.id,
+                column,
+            }))
+        });
+        match outer {
+            Some(outer) => {
+                expression = outer.clone();
+                found = Some(outer);
+            }
+            None => return found,
+        }
+    }
 }
 
 /// The type name of a computed value: a literal has its
@@ -785,11 +904,6 @@ fn resolved_output_columns(
 /// INTEGER; `||` gives TEXT; anything else reports its affinity.
 fn expression_primitive(document: &HirDocument, expression: &hir::Expr) -> Option<&'static str> {
     use ast::{Operator, UnaryOperator};
-    let arithmetic = |lhs: Option<&'static str>, rhs: Option<&'static str>| match (lhs, rhs) {
-        (Some("INTEGER"), Some("INTEGER")) => "INTEGER",
-        (Some("INTEGER" | "REAL"), Some("INTEGER" | "REAL")) => "REAL",
-        _ => "NUMERIC",
-    };
     match expression {
         hir::Expr::Literal(literal) => {
             match crate::translate::alter::literal_default_value(literal)
@@ -805,7 +919,7 @@ fn expression_primitive(document: &HirDocument, expression: &hir::Expr) -> Optio
         hir::Expr::Collate { expr, .. } => expression_primitive(document, expr),
         hir::Expr::Unary { operator, expr } => match operator {
             UnaryOperator::Not | UnaryOperator::BitwiseNot => Some("INTEGER"),
-            UnaryOperator::Negative => Some(arithmetic(
+            UnaryOperator::Negative => Some(arithmetic_primitive(
                 Some("INTEGER"),
                 expression_primitive(document, expr),
             )),
@@ -818,7 +932,7 @@ fn expression_primitive(document: &HirDocument, expression: &hir::Expr) -> Optio
             | Operator::Subtract
             | Operator::Multiply
             | Operator::Divide
-            | Operator::Modulus => Some(arithmetic(
+            | Operator::Modulus => Some(arithmetic_primitive(
                 expression_primitive(document, lhs),
                 expression_primitive(document, rhs),
             )),
@@ -843,6 +957,33 @@ fn expression_primitive(document: &HirDocument, expression: &hir::Expr) -> Optio
             Operator::ArrowRight | Operator::ArrowRightShift => None,
         },
         hir::Expr::RowId(_) => Some("INTEGER"),
+        hir::Expr::Case {
+            when_then,
+            else_expr,
+            ..
+        } => common_primitive(
+            document,
+            when_then
+                .iter()
+                .map(|(_, then)| then)
+                .chain(else_expr.as_deref()),
+        ),
+        hir::Expr::Function(call) => {
+            let hir::FunctionArguments::Expressions { values, .. } = &call.arguments else {
+                return None;
+            };
+            match call.function.value() {
+                Func::Scalar(
+                    ScalarFunc::Coalesce | ScalarFunc::IfNull | ScalarFunc::Max | ScalarFunc::Min,
+                ) => common_primitive(document, values.iter()),
+                Func::Scalar(ScalarFunc::Nullif) => expression_primitive(document, values.first()?),
+                Func::Scalar(ScalarFunc::Abs) => Some(arithmetic_primitive(
+                    Some("INTEGER"),
+                    expression_primitive(document, values.first()?),
+                )),
+                _ => None,
+            }
+        }
         _ => match expression_affinity(document, expression) {
             Affinity::Integer => Some("INTEGER"),
             Affinity::Real => Some("REAL"),
@@ -850,6 +991,41 @@ fn expression_primitive(document: &HirDocument, expression: &hir::Expr) -> Optio
             Affinity::Numeric => Some("NUMERIC"),
             Affinity::Blob | Affinity::None => None,
         },
+    }
+}
+
+/// The type every non-NULL expression converts to, as PostgreSQL types
+/// CASE branches and COALESCE arguments: mixed numeric types widen the way
+/// arithmetic does, and any other mix has no common type.
+fn common_primitive<'a>(
+    document: &HirDocument,
+    expressions: impl Iterator<Item = &'a hir::Expr>,
+) -> Option<&'static str> {
+    let is_numeric = |primitive| matches!(primitive, "INTEGER" | "REAL" | "NUMERIC");
+    let mut common = None;
+    for expression in expressions
+        .filter(|expression| !matches!(expression, hir::Expr::Literal(ast::Literal::Null)))
+    {
+        let primitive = expression_primitive(document, expression)?;
+        common = match common {
+            None => Some(primitive),
+            Some(common) if common == primitive => Some(common),
+            Some(common) if is_numeric(common) && is_numeric(primitive) => {
+                Some(arithmetic_primitive(Some(common), Some(primitive)))
+            }
+            Some(_) => return None,
+        };
+    }
+    common
+}
+
+/// The type of arithmetic over two operands: INTEGER over two INTEGERs,
+/// REAL over INTEGERs and REALs, and NUMERIC otherwise.
+fn arithmetic_primitive(lhs: Option<&'static str>, rhs: Option<&'static str>) -> &'static str {
+    match (lhs, rhs) {
+        (Some("INTEGER"), Some("INTEGER")) => "INTEGER",
+        (Some("INTEGER" | "REAL"), Some("INTEGER" | "REAL")) => "REAL",
+        _ => "NUMERIC",
     }
 }
 
@@ -881,6 +1057,8 @@ fn resolved_result_value(
         })
     };
     match expression {
+        // SQLite names a USING column after the left table's column.
+        hir::Expr::MergedColumn(merged) => resolved_result_value(document, &merged.left),
         hir::Expr::Column(reference) => {
             let source = source_of(reference.source)?;
             if let Some(table) = catalog_table(source) {
@@ -932,7 +1110,9 @@ fn resolved_result_value(
                 // A FROM subquery is reported by its alias and a CTE by its
                 // name.
                 table_name: match (&source.kind, &source.alias) {
-                    (hir::SourceKind::Derived(_), Some(alias)) => alias.clone(),
+                    (hir::SourceKind::Derived(_) | hir::SourceKind::FromGroup(_), Some(alias)) => {
+                        alias.clone()
+                    }
                     _ => source.name.clone(),
                 },
                 column_name: column.name.clone(),

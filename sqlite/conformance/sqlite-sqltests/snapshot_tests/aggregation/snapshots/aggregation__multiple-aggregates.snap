@@ -27,76 +27,76 @@ QUERY PLAN
 `--USE SORTER FOR ORDER BY
 
 BYTECODE
-addr  opcode                p1  p2  p3  p4                  p5  comment
-   0        Init             0  70   0                       0  Start at 70
-   1        SorterOpen       0   1   0  k(1,-B)              0  cursor=0
-   2        Null             0   8   0                       0  r[8]=NULL
-   3        Null             0   9   0                       0  r[9]=NULL
-   4        Null             0  10   0                       0  r[10]=NULL
-   5        Null             0  11   0                       0  r[11]=NULL
-   6        Null             0  12   0                       0  r[12]=NULL
-   7        Integer          0  29   0                       0  r[29]=0
-   8        Null             0  30   0                       0  r[30]=NULL
-   9        Gosub           28  54   0                       0
-  10        OpenRead         1   4   0  k(2,B)               0  index=idx_sales_category, root=4, iDb=0
-  11        OpenRead         2   2   0  k(7,B,B,B,B,B,B,B)   0  table=sales, root=2, iDb=0
-  12        Rewind           1  36   0                       0  Rewind index idx_sales_category
-  13          DeferredSeek   1   2   0                       0
-  14          Column         1   0  31                       0  r[31]=idx_sales_category.category
-  15          ColumnRange    2   4  17  2                    0  r[17..18]=sales.amount..quantity
-  16          Compare       30  31   1  k(1, Binary)         0  r[30..30]==r[31..31]
-  17          Jump          18  21  18                       0
-  18          Gosub         27  38   0                       0
-  19          Move          31  30   1                       0  r[30..30]=r[31..31]
-  20          Gosub         28  54   0                       0
-  21          Integer        1  32   0                       0  r[32]=1
-  22          AggStep        0  32   8  count                0  accum=r[8] step(r[32])
-  23          Copy          17  33   0                       0  r[33]=r[17]
-  24          AggStep        0  33   9  sum                  0  accum=r[9] step(r[33])
-  25          Copy          17  34   0                       0  r[34]=r[17]
-  26          AggStep        0  34  10  avg                  0  accum=r[10] step(r[34])
-  27          Copy          18  35   0                       0  r[35]=r[18]
-  28          AggStep        0  35  11  sum                  0  accum=r[11] step(r[35])
-  29          Copy          18  36   0                       0  r[36]=r[18]
-  30          AggStep        0  36  12  avg                  0  accum=r[12] step(r[36])
-  31          If            29  34   0                       0  if r[29] goto 34
-  32          Copy          17  24   0                       0  r[24]=r[17]
-  33          Copy          18  25   0                       0  r[25]=r[18]
-  34          Integer        1  29   0                       0  r[29]=1
-  35        Next             1  13   0                       1
-  36        Gosub           27  38   0                       0
-  37        Goto             0  61   0                       0
-  38        IfPos           29  40   0                       0  r[29]>0 -> r[29]-=0, goto 40
-  39      Return            27   0   0                       0
-  40      AggFinal           0   8   0  count                0  accum=r[8]
-  41      AggFinal           0   9   0  sum                  0  accum=r[9]
-  42      AggFinal           0  10   0  avg                  0  accum=r[10]
-  43      AggFinal           0  11   0  sum                  0  accum=r[11]
-  44      AggFinal           0  12   0  avg                  0  accum=r[12]
-  45      Copy              30   3   0                       0  r[3]=r[30]
-  46      Copy               8   4   0                       0  r[4]=r[8]
-  47      Copy               9   2   0                       0  r[2]=r[9]
-  48      Copy              10   5   0                       0  r[5]=r[10]
-  49      Copy              11   6   0                       0  r[6]=r[11]
-  50      Copy              12   7   0                       0  r[7]=r[12]
-  51      MakeRecord         2   6   1                       0  r[1]=mkrec(r[2..7])
-  52      SorterInsert       0   1   0  0                    0  key=r[1]
-  53    Return              27   0   0                       0
-  54    Null                 0   8   0                       0  r[8]=NULL
-  55    Null                 0   9   0                       0  r[9]=NULL
-  56    Null                 0  10   0                       0  r[10]=NULL
-  57    Null                 0  11   0                       0  r[11]=NULL
-  58    Null                 0  12   0                       0  r[12]=NULL
-  59    Integer              0  29   0                       0  r[29]=0
-  60  Return                28   0   0                       0
-  61  OpenPseudo             3   1   6                       0  6 columns in r[1]
-  62  SorterSort             0  69   0                       0
-  63    SorterData           0   1   3                       0  r[1]=data
-  64    ColumnRange          3   1  43  2                    0  r[43..44]=pseudo.column 1..column 2
-  65    Column               3   0  45                       0  r[45]=pseudo.column 0
-  66    ColumnRange          3   3  46  3                    0  r[46..48]=pseudo.column 3..column 5
-  67    ResultRow           43   6   0                       0  output=r[43..48]
-  68  SorterNext             0  63   0                       0
-  69  Halt                   0   0   0                       0
-  70  Transaction            0   1   8                       0  iDb=0 tx_mode=Read
-  71  Goto                   0   1   0                       0
+addr  opcode          p1  p2  p3  p4                  p5  comment
+   0  Init             0  70   0                       0  Start at 70
+   1  SorterOpen       0   1   0  k(1,-B)              0  cursor=0
+   2  Null             0   8   0                       0  r[8]=NULL
+   3  Null             0   9   0                       0  r[9]=NULL
+   4  Null             0  10   0                       0  r[10]=NULL
+   5  Null             0  11   0                       0  r[11]=NULL
+   6  Null             0  12   0                       0  r[12]=NULL
+   7  Integer          0  29   0                       0  r[29]=0
+   8  Null             0  30   0                       0  r[30]=NULL
+   9  Gosub           28  54   0                       0
+  10  OpenRead         1   4   0  k(2,B)               0  index=idx_sales_category, root=4, iDb=0
+  11  OpenRead         2   2   0  k(7,B,B,B,B,B,B,B)   0  table=sales, root=2, iDb=0
+  12  Rewind           1  36   0                       0  Rewind index idx_sales_category
+  13    DeferredSeek   1   2   0                       0
+  14    Column         1   0  31                       0  r[31]=idx_sales_category.category
+  15    ColumnRange    2   4  17  2                    0  r[17..18]=sales.amount..quantity
+  16    Compare       30  31   1  k(1, Binary)         0  r[30..30]==r[31..31]
+  17    Jump          18  21  18                       0
+  18    Gosub         27  38   0                       0
+  19    Move          31  30   1                       0  r[30..30]=r[31..31]
+  20    Gosub         28  54   0                       0
+  21    Integer        1  32   0                       0  r[32]=1
+  22    AggStep        0  32   8  count                0  accum=r[8] step(r[32])
+  23    Copy          17  33   0                       0  r[33]=r[17]
+  24    AggStep        0  33   9  sum                  0  accum=r[9] step(r[33])
+  25    Copy          17  34   0                       0  r[34]=r[17]
+  26    AggStep        0  34  10  avg                  0  accum=r[10] step(r[34])
+  27    Copy          18  35   0                       0  r[35]=r[18]
+  28    AggStep        0  35  11  sum                  0  accum=r[11] step(r[35])
+  29    Copy          18  36   0                       0  r[36]=r[18]
+  30    AggStep        0  36  12  avg                  0  accum=r[12] step(r[36])
+  31    If            29  34   0                       0  if r[29] goto 34
+  32    Copy          17  24   0                       0  r[24]=r[17]
+  33    Copy          18  25   0                       0  r[25]=r[18]
+  34    Integer        1  29   0                       0  r[29]=1
+  35  Next             1  13   0                       1
+  36  Gosub           27  38   0                       0
+  37  Goto             0  61   0                       0
+  38  IfPos           29  40   0                       0  r[29]>0 -> r[29]-=0, goto 40
+  39  Return          27   0   0                       0
+  40  AggFinal         0   8   0  count                0  accum=r[8]
+  41  AggFinal         0   9   0  sum                  0  accum=r[9]
+  42  AggFinal         0  10   0  avg                  0  accum=r[10]
+  43  AggFinal         0  11   0  sum                  0  accum=r[11]
+  44  AggFinal         0  12   0  avg                  0  accum=r[12]
+  45  Copy            30   3   0                       0  r[3]=r[30]
+  46  Copy             8   4   0                       0  r[4]=r[8]
+  47  Copy             9   2   0                       0  r[2]=r[9]
+  48  Copy            10   5   0                       0  r[5]=r[10]
+  49  Copy            11   6   0                       0  r[6]=r[11]
+  50  Copy            12   7   0                       0  r[7]=r[12]
+  51  MakeRecord       2   6   1                       0  r[1]=mkrec(r[2..7])
+  52  SorterInsert     0   1   0  0                    0  key=r[1]
+  53  Return          27   0   0                       0
+  54  Null             0   8   0                       0  r[8]=NULL
+  55  Null             0   9   0                       0  r[9]=NULL
+  56  Null             0  10   0                       0  r[10]=NULL
+  57  Null             0  11   0                       0  r[11]=NULL
+  58  Null             0  12   0                       0  r[12]=NULL
+  59  Integer          0  29   0                       0  r[29]=0
+  60  Return          28   0   0                       0
+  61  OpenPseudo       3   1   6                       0  6 columns in r[1]
+  62  SorterSort       0  69   0                       0
+  63    SorterData     0   1   3                       0  r[1]=data
+  64    ColumnRange    3   1  43  2                    0  r[43..44]=pseudo.column 1..column 2
+  65    Column         3   0  45                       0  r[45]=pseudo.column 0
+  66    ColumnRange    3   3  46  3                    0  r[46..48]=pseudo.column 3..column 5
+  67    ResultRow     43   6   0                       0  output=r[43..48]
+  68  SorterNext       0  63   0                       0
+  69  Halt             0   0   0                       0
+  70  Transaction      0   1   8                       0  iDb=0 tx_mode=Read
+  71  Goto             0   1   0                       0

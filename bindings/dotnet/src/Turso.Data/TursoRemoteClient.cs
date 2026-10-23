@@ -40,6 +40,11 @@ internal sealed class TursoRemoteClient : IDisposable
 
     public bool HasOpenSession => _baton is not null;
 
+    public void ResetSession()
+    {
+        _baton = null;
+    }
+
     public async Task<RemoteStatementResult> ExecuteAsync(
         string sql,
         TursoParameterCollection parameters,
@@ -342,11 +347,20 @@ internal sealed class TursoRemoteClient : IDisposable
     private static TursoException CreateRemoteError(RemoteError? error)
     {
         if (error is null)
-            return new TursoRemoteSqlException("Remote SQL execution failed.");
+            return new TursoRemoteSqlException(
+                "Remote SQL execution failed.",
+                remoteErrorCode: null,
+                remoteErrorMessage: null);
 
         return string.IsNullOrWhiteSpace(error.Code)
-            ? new TursoRemoteSqlException($"Remote SQL execution failed: {error.Message}")
-            : new TursoRemoteSqlException($"Remote SQL execution failed: {error.Message} ({error.Code})");
+            ? new TursoRemoteSqlException(
+                $"Remote SQL execution failed: {error.Message}",
+                remoteErrorCode: null,
+                error.Message)
+            : new TursoRemoteSqlException(
+                $"Remote SQL execution failed: {error.Message} ({error.Code})",
+                error.Code,
+                error.Message);
     }
 
     private void UpdateSession(RemotePipelineResponse response, bool closeAfter)
@@ -570,7 +584,30 @@ internal sealed class RemoteError
     public string? Code { get; init; }
 }
 
-internal sealed class TursoRemoteSqlException(string message) : TursoException(message);
+public sealed class TursoRemoteSqlException(
+    string message,
+    string? remoteErrorCode,
+    string? remoteErrorMessage) : TursoException(message)
+{
+    public string? RemoteErrorCode { get; } = remoteErrorCode;
+
+    public string? RemoteErrorMessage { get; } = remoteErrorMessage;
+
+    public bool IsStreamExpired
+        => !string.IsNullOrWhiteSpace(RemoteErrorCode)
+            ? RemoteErrorCode.Equals("STREAM_EXPIRED", StringComparison.OrdinalIgnoreCase)
+              || RemoteErrorCode.Equals("STREAM_NOT_FOUND", StringComparison.OrdinalIgnoreCase)
+              || RemoteErrorCode.Equals("BATON_EXPIRED", StringComparison.OrdinalIgnoreCase)
+              || RemoteErrorCode.Equals("HRANA_STREAM_EXPIRED", StringComparison.OrdinalIgnoreCase)
+              || RemoteErrorCode.Equals("HRANA_STREAM_NOT_FOUND", StringComparison.OrdinalIgnoreCase)
+              || RemoteErrorCode.Equals("BA_STREAM_EXPIRED", StringComparison.OrdinalIgnoreCase)
+              || RemoteErrorCode.Equals("BA_STREAM_NOT_FOUND", StringComparison.OrdinalIgnoreCase)
+            : RemoteErrorMessage is not null
+              && (RemoteErrorMessage.Contains("stream expired", StringComparison.OrdinalIgnoreCase)
+                  || RemoteErrorMessage.Contains("stream has expired", StringComparison.OrdinalIgnoreCase)
+                  || RemoteErrorMessage.Contains("stream not found", StringComparison.OrdinalIgnoreCase)
+                  || RemoteErrorMessage.Contains("baton expired", StringComparison.OrdinalIgnoreCase));
+}
 
 internal sealed class RemoteBatchResult
 {

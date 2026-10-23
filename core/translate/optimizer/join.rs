@@ -24,7 +24,8 @@ use crate::{
             access_method::{estimate_hash_join_cost, AccessMethodParams},
             cost::{
                 estimate_cost_for_scan_or_seek, estimate_rows_per_seek, hir_where_expr_steps,
-                rows_per_leaf_page_for_index, AnalyzeCtx, Cost, IndexInfo, RowCountEstimate,
+                index_access_is_unique_point_lookup, rows_per_leaf_page_for_index, AnalyzeCtx,
+                Cost, IndexInfo, RowCountEstimate,
             },
         },
         plan::{
@@ -44,13 +45,39 @@ const MAX_MATERIALIZED_BUILD_ROWS: f64 = 200_000.0;
 /// Estimate how much the remaining `WHERE` terms cut the row count.
 ///
 /// Some callers skip a term because they need the count before that term runs.
-fn constraint_output_multipliers<E>(
-    rhs_constraints: &TableConstraints<E>,
+#[allow(clippy::too_many_arguments)]
+fn constraint_output_multipliers(
+    rhs_constraints: &HirTableConstraints,
     lhs_mask: &TableMask,
     rhs_self_mask: TableMask,
     consumed_where_terms: &BitSet<usize>,
     skipped_where_terms: &BitSet<usize>,
+    where_clause: &[HirWhereTerm],
     params: &CostModelParams,
+) -> f64 {
+    constraint_output_multipliers_for(
+        rhs_constraints,
+        lhs_mask,
+        rhs_self_mask,
+        consumed_where_terms,
+        skipped_where_terms,
+        where_clause,
+        params,
+        |_| true,
+    )
+}
+
+/// [constraint_output_multipliers] over the constraints `include` keeps.
+#[allow(clippy::too_many_arguments)]
+fn constraint_output_multipliers_for(
+    rhs_constraints: &HirTableConstraints,
+    lhs_mask: &TableMask,
+    rhs_self_mask: TableMask,
+    consumed_where_terms: &BitSet<usize>,
+    skipped_where_terms: &BitSet<usize>,
+    where_clause: &[HirWhereTerm],
+    params: &CostModelParams,
+    include: impl Fn(&super::constraints::HirConstraint) -> bool,
 ) -> f64 {
     let mut multiplier = 1.0;
     let mut bounds: SmallVec<[(Option<usize>, bool, bool); 4]> = SmallVec::new();
@@ -76,6 +103,8 @@ fn constraint_output_multipliers<E>(
             || constraint.lhs_mask.is_empty())
             && !consumed_where_terms.get(constraint.where_clause_pos.0)
             && !skipped_where_terms.get(constraint.where_clause_pos.0)
+            && !where_clause[constraint.where_clause_pos.0].consumed
+            && include(constraint)
     }) {
         multiplier *= constraint.selectivity;
 
@@ -101,60 +130,143 @@ fn constraint_output_multipliers<E>(
 }
 
 /// Return the row count after one table and its ready filters.
-fn rows_after_join<E>(
+#[allow(clippy::too_many_arguments)]
+fn rows_after_join(
     input_cardinality: f64,
     method: &AccessMethod,
-    rhs_constraints: &TableConstraints<E>,
+    rhs_constraints: &HirTableConstraints,
     lhs_mask: &TableMask,
     rhs_mask: TableMask,
-    is_semi_or_anti: bool,
+    sources: &[HirPlanSource],
+    rhs_position: usize,
+    where_clause: &[HirWhereTerm],
     params: &CostModelParams,
 ) -> f64 {
-    if is_semi_or_anti {
+    use crate::translate::semantic::hir::JoinKind;
+    let rhs = &sources[rhs_position];
+    let join_kind = rhs.join_info().map(|join| join.kind);
+    if matches!(join_kind, Some(JoinKind::Semi | JoinKind::Anti)) {
         return input_cardinality;
     }
-    let remaining_filter_selectivity = constraint_output_multipliers(
+    if !matches!(
+        join_kind,
+        Some(JoinKind::Left | JoinKind::Right | JoinKind::Full)
+    ) {
+        let remaining_filter_selectivity = constraint_output_multipliers(
+            rhs_constraints,
+            lhs_mask,
+            rhs_mask,
+            &method.consumed_where_terms,
+            &Default::default(),
+            where_clause,
+            params,
+        );
+        return input_cardinality
+            * method.estimated_rows_per_outer_row
+            * remaining_filter_selectivity;
+    }
+
+    let is_on_term = |constraint: &super::constraints::HirConstraint| {
+        where_clause[constraint.where_clause_pos.0].from_outer_join == Some(rhs.source())
+    };
+    let on_selectivity = constraint_output_multipliers_for(
+        rhs_constraints,
+        lhs_mask,
+        rhs_mask.clone(),
+        &method.consumed_where_terms,
+        &Default::default(),
+        where_clause,
+        params,
+        is_on_term,
+    );
+    let matching_rows_per_input = method.estimated_rows_per_outer_row * on_selectivity;
+    // Statistics give an average match count, but not its distribution.
+    // A Poisson model estimates the chance that an input row has no match.
+    let unmatched_probability = (-matching_rows_per_input).exp();
+    let outer_join_rows_per_input = matching_rows_per_input + unmatched_probability;
+
+    // `column IS NULL` in WHERE on a column of the null-extended side that
+    // is never NULL in a stored row keeps only the rows the join added.
+    let selects_unmatched_rows = |constraint: &super::constraints::HirConstraint| {
+        if is_on_term(constraint)
+            || !matches!(constraint.operator.as_ast_operator(), Some(Operator::Is))
+        {
+            return false;
+        }
+        let (_, constraining_expr, _) = constraint.get_hir_constraining_expr(where_clause);
+        matches!(
+            constraining_expr,
+            hir::Expr::Literal(turso_parser::ast::Literal::Null)
+        ) && constraint.table_col_pos.is_some_and(|column_pos| {
+            rhs.btree().is_some_and(|source| {
+                source
+                    .table
+                    .columns()
+                    .get(column_pos)
+                    .is_some_and(|column| column.is_rowid_alias() || column.notnull())
+            })
+        })
+    };
+    let selects_only_unmatched_rows = rhs_constraints.constraints.iter().any(|constraint| {
+        !method
+            .consumed_where_terms
+            .get(constraint.where_clause_pos.0)
+            && selects_unmatched_rows(constraint)
+    });
+    let where_selectivity = constraint_output_multipliers_for(
         rhs_constraints,
         lhs_mask,
         rhs_mask,
         &method.consumed_where_terms,
         &Default::default(),
+        where_clause,
         params,
+        |constraint| !is_on_term(constraint) && !selects_unmatched_rows(constraint),
     );
-    input_cardinality * method.estimated_rows_per_outer_row * remaining_filter_selectivity
+    let rows_per_input = if selects_only_unmatched_rows {
+        unmatched_probability
+    } else {
+        outer_join_rows_per_input
+    };
+    input_cardinality * rows_per_input * where_selectivity
 }
 
 /// How many times each correlated subquery of a HIR block runs under a
 /// join plan, counted from the rows that reach the join
 /// step where the last block source it reads is joined. Each subquery comes
-/// with the block sources it reads, as positions, and the position of the
-/// first predicate it appears in: that predicate and the ones after it run
-/// after the subquery, so they cannot reduce its calls.
+/// with the block sources it reads, as positions, the position of the
+/// first predicate it appears in (that predicate and the ones after it run
+/// after the subquery, so they cannot reduce its calls), and whether its
+/// WHERE term may wait for a later loop. Such a term runs after the later
+/// loop that fewest rows reach, which the result names by its source
+/// position; a semi-join or anti-join loop passes rows on one at a time,
+/// so it is not chosen.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn hir_subquery_calls_for_plan(
     plan: &JoinN,
     access_methods: &[AccessMethod],
     constraints: &[HirTableConstraints],
     sources: &[HirPlanSource],
-    subqueries: &[(hir::QueryId, TableMask, Option<usize>)],
-    predicate_count: usize,
+    subqueries: &[(hir::QueryId, TableMask, Option<usize>, bool)],
+    where_clause: &[HirWhereTerm],
     initial_input_cardinality: f64,
     params: &CostModelParams,
-) -> Result<Vec<(hir::QueryId, f64)>> {
+) -> Result<Vec<(hir::QueryId, f64, Option<usize>)>> {
+    let predicate_count = where_clause.len();
     let mut calls = Vec::new();
     if subqueries.is_empty() {
         return Ok(calls);
     }
     let mut prior_sources = TableMask::default();
     let mut input_cardinality = initial_input_cardinality;
-    for (source_position, access_method_index) in &plan.data {
+    for (step, (source_position, access_method_index)) in plan.data.iter().enumerate() {
         let method = &access_methods[*access_method_index];
         let mut source_mask = TableMask::default();
         source_mask.set(*source_position)?;
         let mut current_sources = prior_sources.clone();
         current_sources.set(*source_position)?;
         let rows_before_filters = input_cardinality * method.estimated_rows_per_outer_row;
-        for (query, required, first_predicate) in subqueries {
+        for (query, required, first_predicate, deferrable) in subqueries {
             if required.is_empty()
                 || !current_sources.contains_all_set_bits_of(required)
                 || prior_sources.contains_all_set_bits_of(required)
@@ -171,9 +283,23 @@ pub(crate) fn hir_subquery_calls_for_plan(
                 source_mask.clone(),
                 &method.consumed_where_terms,
                 &skipped,
+                where_clause,
                 params,
             );
-            calls.push((*query, (rows_before_filters * multiplier).max(1.0)));
+            let mut subquery_calls = (rows_before_filters * multiplier).max(1.0);
+            let mut runs_after = None;
+            if *deferrable {
+                for (later_step, rows) in
+                    plan.prefix_cardinalities.iter().enumerate().skip(step + 1)
+                {
+                    let later_position = plan.data[later_step].0;
+                    if rows < &subquery_calls && !hir_is_semi_or_anti(sources, later_position) {
+                        subquery_calls = rows.max(1.0);
+                        runs_after = Some(later_position);
+                    }
+                }
+            }
+            calls.push((*query, subquery_calls, runs_after));
         }
         input_cardinality = rows_after_join(
             input_cardinality,
@@ -181,7 +307,9 @@ pub(crate) fn hir_subquery_calls_for_plan(
             &constraints[*source_position],
             &prior_sources,
             source_mask,
-            hir_is_semi_or_anti(sources, *source_position),
+            sources,
+            *source_position,
+            where_clause,
             params,
         );
         prior_sources.set(*source_position)?;
@@ -208,6 +336,8 @@ pub struct JoinN {
     pub data: Vec<(usize, usize)>,
     /// The estimated number of rows returned by joining these n tables together.
     pub output_cardinality: f64,
+    /// The estimated number of rows after each table of `data`, in order.
+    pub prefix_cardinalities: Vec<f64>,
     /// Estimated execution cost of this N-ary join.
     pub cost: Cost,
 }
@@ -318,19 +448,6 @@ fn build_self_constraint_selectivity<E>(
     selectivity.clamp(0.0, 1.0)
 }
 
-/// Returns true if any prior constraints can be turned into an index lookup.
-fn build_has_indexable_prior_constraints<E>(
-    build_constraints: &TableConstraints<E>,
-    prior_mask: &TableMask,
-) -> bool {
-    build_constraints.candidates.iter().any(|candidate| {
-        candidate.refs.iter().any(|constraint_ref| {
-            let constraint = &build_constraints.constraints[constraint_ref.constraint_vec_pos];
-            constraint.usable && constraint.lhs_mask.intersects(prior_mask)
-        })
-    })
-}
-
 /// The result of a join order search.
 #[derive(Debug)]
 pub struct BestJoinOrderResult {
@@ -343,6 +460,7 @@ pub struct BestJoinOrderResult {
 #[derive(Clone, Copy)]
 struct JoinOrderingFacts {
     constrained: bool,
+    /// The join keeps its right side's unmatched rows: RIGHT or FULL.
     full_outer: bool,
 }
 
@@ -403,10 +521,11 @@ fn join_ordering_restrictions<T>(
         }
     }
 
-    // FULL OUTER is a barrier in both directions. Later sources cannot move
-    // before it: `(t1 INNER t3) FULL OUTER t2` is not equivalent to the
-    // requested `(t1 FULL OUTER t2) INNER t3`, because NULL-extended probe rows
-    // can survive differently.
+    // RIGHT and FULL OUTER are barriers in both directions. Later sources
+    // cannot move before them: `(t1 INNER t3) FULL OUTER t2` is not
+    // equivalent to the requested `(t1 FULL OUTER t2) INNER t3`, because
+    // NULL-extended probe rows can survive differently, and the pass that
+    // finds the unmatched right rows runs only the loops after the join.
     for (full, source) in sources.iter().enumerate() {
         if !facts(source).full_outer {
             continue;
@@ -428,18 +547,27 @@ pub(crate) fn hir_join_ordering_restrictions(
     join_ordering_restrictions(sources, |source| {
         let kind = source.join_info().map(|join| join.kind);
         JoinOrderingFacts {
-            constrained: matches!(
+            // A LATERAL subquery reads the sources on its left, so it
+            // stays after them like the right side of a LEFT JOIN.
+            constrained: source.is_lateral()
+                || matches!(
+                    kind,
+                    Some(
+                        crate::translate::semantic::hir::JoinKind::Cross
+                            | crate::translate::semantic::hir::JoinKind::Left
+                            | crate::translate::semantic::hir::JoinKind::Right
+                            | crate::translate::semantic::hir::JoinKind::Full
+                            | crate::translate::semantic::hir::JoinKind::Semi
+                            | crate::translate::semantic::hir::JoinKind::Anti
+                    )
+                ),
+            full_outer: matches!(
                 kind,
                 Some(
-                    crate::translate::semantic::hir::JoinKind::Cross
-                        | crate::translate::semantic::hir::JoinKind::Left
-                        | crate::translate::semantic::hir::JoinKind::Right
+                    crate::translate::semantic::hir::JoinKind::Right
                         | crate::translate::semantic::hir::JoinKind::Full
-                        | crate::translate::semantic::hir::JoinKind::Semi
-                        | crate::translate::semantic::hir::JoinKind::Anti
                 )
             ),
-            full_outer: kind == Some(crate::translate::semantic::hir::JoinKind::Full),
         }
     })
 }
@@ -535,6 +663,8 @@ const HIR_EXHAUSTIVE_JOIN_LIMIT: usize = 8;
 struct HirPartialJoin {
     steps: Vec<(usize, AccessMethod)>,
     output_cardinality: f64,
+    /// The estimated number of rows after each step, in order.
+    prefix_cardinalities: Vec<f64>,
     cost: Cost,
 }
 
@@ -640,7 +770,9 @@ pub(crate) fn compute_hir_join_order(
             source_constraints,
             &empty,
             mask.try_clone()?,
-            false,
+            sources,
+            position,
+            where_clause,
             params,
         );
         let cost = first.access_method.cost;
@@ -649,6 +781,7 @@ pub(crate) fn compute_hir_join_order(
             HirPartialJoin {
                 steps: vec![(position, first.access_method)],
                 output_cardinality,
+                prefix_cardinalities: vec![output_cardinality],
                 cost,
             },
         );
@@ -685,7 +818,9 @@ pub(crate) fn compute_hir_join_order(
             &constraints[rhs],
             lhs_mask,
             rhs_mask,
-            hir_is_semi_or_anti(sources, rhs),
+            sources,
+            rhs,
+            where_clause,
             params,
         );
         let mut steps = lhs
@@ -694,9 +829,12 @@ pub(crate) fn compute_hir_join_order(
             .map(|(position, method)| (*position, method.clone()))
             .collect::<Vec<_>>();
         steps.push((rhs, method.clone()));
+        let mut prefix_cardinalities = lhs.prefix_cardinalities.clone();
+        prefix_cardinalities.push(output_cardinality);
         Ok(Some(HirPartialJoin {
             steps,
             output_cardinality,
+            prefix_cardinalities,
             cost: lhs.cost + method.cost,
         }))
     };
@@ -713,6 +851,7 @@ pub(crate) fn compute_hir_join_order(
         .map(|first| HirPartialJoin {
             steps: first.steps.clone(),
             output_cardinality: first.output_cardinality,
+            prefix_cardinalities: first.prefix_cardinalities.clone(),
             cost: first.cost,
         });
     let mut from_order_mask = TableMask::default();
@@ -782,6 +921,7 @@ pub(crate) fn compute_hir_join_order(
             })
             .collect(),
         output_cardinality: plan.output_cardinality,
+        prefix_cardinalities: plan.prefix_cardinalities,
         cost: plan.cost,
     };
     let Some(best_position) = (0..complete.len()).reduce(|best, position| {
@@ -791,9 +931,7 @@ pub(crate) fn compute_hir_join_order(
             best
         }
     }) else {
-        return Err(LimboError::PlanningError(
-            "No valid HIR join order found".to_string(),
-        ));
+        return Err(LimboError::PlanningError("no query solution".to_string()));
     };
     // The cheapest plan whose loops already follow the order target, which
     // the caller may prefer to skip a sort.
@@ -812,6 +950,7 @@ pub(crate) fn compute_hir_join_order(
                         .map(|(source, method)| (*source, method.clone()))
                         .collect(),
                     output_cardinality: plan.output_cardinality,
+                    prefix_cardinalities: plan.prefix_cardinalities.clone(),
                     cost: plan.cost,
                 },
                 &mut scratch,
@@ -941,12 +1080,15 @@ pub(crate) fn compute_hir_greedy_join_order(
         &constraints[first_position],
         &joined_mask,
         first_mask,
-        false,
+        sources,
+        first_position,
+        where_clause,
         params,
     );
     let mut cost = first.access_method.cost;
     access_methods_arena.push(first.access_method);
     let mut data = vec![(first_position, access_methods_arena.len() - 1)];
+    let mut prefix_cardinalities = vec![output_cardinality];
     joined_mask.set(first_position)?;
     remaining.clear(first_position);
 
@@ -1036,7 +1178,9 @@ pub(crate) fn compute_hir_greedy_join_order(
                 &constraints[position],
                 &joined_mask,
                 rhs_mask,
-                hir_is_semi_or_anti(sources, position),
+                sources,
+                position,
+                where_clause,
                 params,
             );
             if best
@@ -1055,6 +1199,7 @@ pub(crate) fn compute_hir_greedy_join_order(
         joined_mask.set(position)?;
         remaining.clear(position);
         output_cardinality = cardinality;
+        prefix_cardinalities.push(output_cardinality);
         cost = next_cost;
     }
 
@@ -1062,6 +1207,7 @@ pub(crate) fn compute_hir_greedy_join_order(
         best_plan: JoinN {
             data,
             output_cardinality,
+            prefix_cardinalities,
             cost,
         },
         best_ordered_plan: None,
@@ -1212,12 +1358,15 @@ fn hir_join_step(
             query,
             join_info,
             output_order,
+            lateral,
         } => super::access_method::find_best_hir_access_method_for_subquery(
             document,
             *source,
             *query,
             false,
-            !hir_right_or_full_join(join_info.as_ref()),
+            // A LATERAL subquery runs again for each outer row, so its
+            // rows are never stored for a seek.
+            !hir_right_or_full_join(join_info.as_ref()) && !*lateral,
             order_target,
             output_order,
             &constraints[source_position],
@@ -1418,9 +1567,12 @@ fn hir_try_hash_join_access_method(
     where_clause: &[HirWhereTerm],
     build: usize,
     probe: usize,
+    lhs_mask: &TableMask,
+    max_distinct_build_keys: f64,
     build_cardinality: f64,
     probe_cardinality: f64,
     probe_multiplier: f64,
+    hash_can_replace_build_index: bool,
     hash: &HirHashJoins<'_>,
     schema: &Schema,
     params: &CostModelParams,
@@ -1438,10 +1590,13 @@ fn hir_try_hash_join_access_method(
     }
     let probe_kind = probe_source.join_info.as_ref().map(|join| join.kind);
     let build_kind = build_source.join_info.as_ref().map(|join| join.kind);
-    // A RIGHT join has no hash form, and semi/anti-joins prefer a nested
-    // loop with an index seek.
+    // A RIGHT join has no hash form, and a semi-join prefers a nested loop
+    // with an index seek, which stops at its first match. An anti-join
+    // hashes: the build rows the probe matches are remembered, and the
+    // others come out after the probe loop.
     let hash_join_type = match probe_kind {
-        Some(JoinKind::Right | JoinKind::Semi | JoinKind::Anti) => return None,
+        Some(JoinKind::Right | JoinKind::Semi) => return None,
+        Some(JoinKind::Anti) => HashJoinType::LeftAnti,
         Some(JoinKind::Full) => HashJoinType::FullOuter,
         Some(JoinKind::Left) => HashJoinType::LeftOuter,
         _ => HashJoinType::Inner,
@@ -1497,7 +1652,8 @@ fn hir_try_hash_join_access_method(
         if term.from_outer_join.is_some() && !own_on_term {
             continue;
         }
-        if hash_join_type != HashJoinType::Inner && !own_on_term {
+        // An anti-join's terms are plain terms that read its inner table.
+        if !matches!(hash_join_type, HashJoinType::Inner | HashJoinType::LeftAnti) && !own_on_term {
             continue;
         }
         let hir::Expr::Binary {
@@ -1575,45 +1731,70 @@ fn hir_try_hash_join_access_method(
         }
     }
 
-    // Prefer a nested loop with an index lookup when an index exists on a
-    // join column of either table.
-    let indexed_join_column =
-        |position: usize, expr: &hir::Expr, source: &crate::translate::plan::HirPlannedSource| {
-            if hir_one_source(expr) != Some(source.internal_id)
-                || !matches!(expr, hir::Expr::Column(_) | hir::Expr::RowId(_))
-            {
-                return false;
-            }
-            let table_constraints = &constraints[position];
-            join_keys.iter().any(|key| {
-                let Some(constraint) = table_constraints
-                    .constraints
-                    .iter()
-                    .find(|constraint| constraint.where_clause_pos.0 == key.where_clause_idx)
-                else {
-                    return false;
-                };
-                let Some(column) = constraint.table_col_pos else {
-                    return false;
-                };
-                source
-                    .table
-                    .columns()
-                    .get(column)
-                    .is_some_and(|column| column.is_rowid_alias())
-                    || table_constraints.candidates.iter().any(|candidate| {
-                        candidate.index.as_ref().is_some_and(|index| {
-                            index.column_table_pos_to_index_pos(column).is_some()
-                        })
-                    })
-            })
+    // Prefer a nested loop when an index can seek the probe's join column
+    // with the loops before it joined, or when the build has an index on
+    // its join column that the probe's own filters make worth keeping.
+    let key_constraint = |position: usize, key: &HashJoinKey| {
+        constraints[position]
+            .constraints
+            .iter()
+            .position(|constraint| constraint.where_clause_pos.0 == key.where_clause_idx)
+    };
+    let simple_column = |expr: &hir::Expr, source: &crate::translate::plan::HirPlannedSource| {
+        hir_one_source(expr) == Some(source.internal_id)
+            && matches!(expr, hir::Expr::Column(_) | hir::Expr::RowId(_))
+    };
+    let probe_index_can_seek_join_key = |key: &HashJoinKey| {
+        let Some(constraint_position) = key_constraint(probe, key) else {
+            return false;
         };
+        let probe_constraints = &constraints[probe];
+        probe_constraints.candidates.iter().any(|candidate| {
+            usable_constraints_for_lhs_mask(
+                &probe_constraints.constraints,
+                &candidate.refs,
+                lhs_mask,
+                probe,
+            )
+            .iter()
+            .any(|constraint_ref| {
+                constraint_ref
+                    .eq
+                    .as_ref()
+                    .is_some_and(|equality| equality.constraint_pos == constraint_position)
+            })
+        })
+    };
+    let build_index_on_join_column = |key: &HashJoinKey| {
+        let Some(constraint_position) = key_constraint(build, key) else {
+            return false;
+        };
+        let build_constraints = &constraints[build];
+        let Some(column) = build_constraints.constraints[constraint_position].table_col_pos else {
+            return false;
+        };
+        build_source
+            .table
+            .columns()
+            .get(column)
+            .is_some_and(|column| column.is_rowid_alias())
+            || build_constraints.candidates.iter().any(|candidate| {
+                candidate
+                    .index
+                    .as_ref()
+                    .is_some_and(|index| index.column_table_pos_to_index_pos(column).is_some())
+            })
+    };
     // FULL OUTER must hash.
     if hash_join_type != HashJoinType::FullOuter {
         for key in &join_keys {
             let (build_expr, probe_expr, ..) = sides(key);
-            if indexed_join_column(probe, probe_expr, probe_source)
-                || indexed_join_column(build, build_expr, build_source)
+            if simple_column(probe_expr, probe_source) && probe_index_can_seek_join_key(key) {
+                return None;
+            }
+            if simple_column(build_expr, build_source)
+                && !hash_can_replace_build_index
+                && build_index_on_join_column(key)
             {
                 return None;
             }
@@ -1630,21 +1811,79 @@ fn hir_try_hash_join_access_method(
                 .map_or(params.sel_eq_unindexed, |constraint| constraint.selectivity)
         })
         .product::<f64>();
-    let cost = estimate_hash_join_cost(
-        build_cardinality,
-        probe_cardinality,
-        crate::vdbe::hash_table::DEFAULT_MEM_BUDGET,
-        probe_multiplier,
-        params,
-    );
-    let rows_per_build_row = probe_cardinality * join_selectivity;
+    // Keys that cover the build's rowid or a whole UNIQUE index match each
+    // probe row to one build row.
+    let keys_cover_unique_build_key = join_keys.iter().any(|key| {
+        let (build_expr, ..) = sides(key);
+        match build_expr {
+            hir::Expr::RowId(source) => *source == build_source.internal_id,
+            hir::Expr::Column(column) => {
+                column.source == build_source.internal_id
+                    && build_source
+                        .table
+                        .columns()
+                        .get(column.column)
+                        .is_some_and(|column| column.is_rowid_alias())
+            }
+            _ => false,
+        }
+    }) || {
+        let build_constraints = &constraints[build];
+        let key_terms: SmallVec<[usize; 4]> = join_keys
+            .iter()
+            .filter(|key| {
+                let (build_expr, ..) = sides(key);
+                matches!(build_expr, hir::Expr::Column(column) if column.source == build_source.internal_id)
+            })
+            .map(|key| key.where_clause_idx)
+            .collect();
+        build_constraints.candidates.iter().any(|candidate| {
+            candidate.index.as_ref().is_some_and(|index| {
+                index.unique
+                    && index.where_clause.is_none()
+                    && !index.columns.is_empty()
+                    && index
+                        .columns
+                        .iter()
+                        .enumerate()
+                        .all(|(index_column, column)| {
+                            column.expr.is_none()
+                                && candidate.refs.iter().any(|constraint_ref| {
+                                    constraint_ref.index_col_pos == index_column
+                                        && key_terms.contains(
+                                            &build_constraints.constraints
+                                                [constraint_ref.constraint_vec_pos]
+                                                .where_clause_pos
+                                                .0,
+                                        )
+                                })
+                        })
+            })
+        })
+    };
+    let rows_per_build_row = if keys_cover_unique_build_key {
+        probe_cardinality / max_distinct_build_keys.max(1.0)
+    } else {
+        probe_cardinality * join_selectivity
+    };
     let estimated_rows_per_outer_row = match hash_join_type {
         HashJoinType::Inner => rows_per_build_row,
         HashJoinType::LeftOuter => rows_per_build_row.max(1.0),
         HashJoinType::FullOuter => rows_per_build_row
             .max(1.0)
             .max(probe_cardinality / build_cardinality.max(1.0)),
+        // Each build row comes out at most once, without a probe row.
+        HashJoinType::LeftAnti => 1.0,
     };
+    let cost = estimate_hash_join_cost(
+        build_cardinality,
+        probe_cardinality,
+        build_cardinality * estimated_rows_per_outer_row * probe_multiplier,
+        hash_join_type,
+        crate::vdbe::hash_table::DEFAULT_MEM_BUDGET,
+        probe_multiplier,
+        params,
+    );
     Some(AccessMethod {
         cost,
         estimated_rows_per_outer_row,
@@ -1779,6 +2018,30 @@ fn hir_hash_join_candidate(
         AccessMethodParams::BTreeTable { build_index, constraint_refs, .. }
             if !build_index && constraint_refs.is_empty()
     );
+    let build_read_is_in_seek = matches!(&build_method.params, AccessMethodParams::InSeek { .. });
+    let build_read_is_unique_seek = matches!(
+        &build_method.params,
+        AccessMethodParams::BTreeTable {
+            index,
+            build_index: false,
+            constraint_refs,
+            ..
+        } if index_access_is_unique_point_lookup(index.as_deref(), constraint_refs)
+    );
+    // Rows from earlier loops can repeat a key, so the build has at most as
+    // many distinct keys as either input.
+    let max_distinct_build_keys = if lhs_steps.len() > 1 && build_read_is_unique_seek {
+        input_cardinality.min(*build_base_rows)
+    } else {
+        *build_base_rows
+    };
+    // An index on the build's join column is kept only when the probe has
+    // a constant filter of its own, or the build is read by an IN seek.
+    let hash_can_replace_build_index = build_read_is_in_seek
+        || !constraints[rhs]
+            .constraints
+            .iter()
+            .any(|constraint| constraint.lhs_mask.is_empty());
     let allow_hash_join = !rhs_has_selective_seek
         && !probe_is_prior_build
         && (!build_has_prior_constraints || build_has_rowid)
@@ -1793,9 +2056,12 @@ fn hir_hash_join_candidate(
         where_clause,
         build,
         rhs,
+        lhs_mask,
+        max_distinct_build_keys,
         build_cardinality,
         probe_cardinality,
         probe_multiplier,
+        hash_can_replace_build_index,
         hash,
         schema,
         params,
@@ -1823,41 +2089,52 @@ fn hir_hash_join_candidate(
     if other_outer {
         return Ok(None);
     }
+    // A build read that keeps only some rows (a constraint, a prior join
+    // term the keys do not cover, an earlier probe of this table, an IN
+    // seek) must build from the rows the loops before the probe keep:
+    // the hash table is filled from that join prefix, stored once.
     let needs_materialization = build_has_uncovered_prior_constraints(
         build_constraints,
         join_keys,
         &prior_mask,
         &prior_hash_build_mask,
-    ) || build_table_is_prior_probe;
-    let selectivity_threshold = if probe_multiplier > 1.0 {
-        params.hash_nested_probe_selectivity_threshold
-    } else {
-        params.hash_materialize_selectivity_threshold
-    };
-    let estimated_filtered_rows =
-        *build_base_rows * build_self_selectivity * prior_constraint_selectivity;
-    let wants_materialization = needs_materialization
-        || (build_access_method_uses_constraints
-            && prior_constraint_selectivity < selectivity_threshold);
-    let optional_materialization_too_large = !needs_materialization
-        && wants_materialization
-        && estimated_filtered_rows > MAX_MATERIALIZED_BUILD_ROWS;
-    let should_materialize = needs_materialization
-        || (wants_materialization
-            && build_has_rowid
-            && build_has_indexable_prior_constraints(build_constraints, &prior_mask)
-            && !optional_materialization_too_large);
-    let build_is_eligible = build_am_is_plain_table_scan
-        || needs_materialization
+    ) || build_table_is_prior_probe
+        || build_read_is_in_seek
         || build_access_method_uses_constraints;
+    let estimated_materialized_rows = input_cardinality;
     let materialization_too_large =
-        needs_materialization && estimated_filtered_rows > MAX_MATERIALIZED_BUILD_ROWS;
+        needs_materialization && estimated_materialized_rows > MAX_MATERIALIZED_BUILD_ROWS;
+    let build_is_eligible = build_am_is_plain_table_scan || needs_materialization;
+    let is_full_outer = matches!(
+        &method.params,
+        AccessMethodParams::HashJoin {
+            join_type: HashJoinType::FullOuter,
+            ..
+        }
+    );
+    // A build input holds the values its terms computed once; a term that
+    // reads the outer query's row would be stale for the next outer row.
+    let materialization_reads_an_outer_query = needs_materialization
+        && where_clause.iter().any(|term| {
+            let mut inside = true;
+            let mut reads_outer = false;
+            document.visit_expr_sources(&term.expr, &mut |source| match sources
+                .iter()
+                .position(|planned| planned.source() == source)
+            {
+                Some(position) => inside &= lhs_mask.get(position),
+                None => reads_outer = true,
+            });
+            inside && reads_outer
+        });
     if !build_is_eligible
         || (needs_materialization && !build_has_rowid)
-        || materialization_too_large
+        || (materialization_too_large && !is_full_outer)
+        || materialization_reads_an_outer_query
     {
         return Ok(None);
     }
+    let should_materialize = needs_materialization && build_has_rowid;
     // Under earlier loops, an outer hash join runs its unmatched build rows
     // after each pass of the probe loop, with the earlier loops' rows. That
     // is right for LEFT, whose build rows pair with those rows, but not for
@@ -1881,13 +2158,19 @@ fn hir_hash_join_candidate(
         // probe scan runs once. Between such plans, the tie-breaker prefers
         // the one whose build includes earlier tables.
         let tie_breaker = prior_mask.iter().min().unwrap_or(0) as f64 * 1.0e-6;
+        let join_type = match &method.params {
+            AccessMethodParams::HashJoin { join_type, .. } => *join_type,
+            _ => unreachable!("a hash join access method"),
+        };
         method.cost = estimate_hash_join_cost(
-            estimated_filtered_rows,
+            estimated_materialized_rows,
             probe_cardinality,
+            estimated_materialized_rows * method.estimated_rows_per_outer_row,
+            join_type,
             crate::vdbe::hash_table::DEFAULT_MEM_BUDGET,
             1.0,
             params,
-        ) + Cost(estimated_filtered_rows * 0.003)
+        ) + Cost(estimated_materialized_rows * 0.003)
             + Cost(tie_breaker);
         let AccessMethodParams::HashJoin {
             materialize_build_input,
@@ -1900,13 +2183,6 @@ fn hir_hash_join_candidate(
     }
     add_where_cost(&mut method, ready_where, input_cardinality, params);
     // FULL OUTER requires a hash join for the unmatched-build scan.
-    let is_full_outer = matches!(
-        &method.params,
-        AccessMethodParams::HashJoin {
-            join_type: HashJoinType::FullOuter,
-            ..
-        }
-    );
     Ok((is_full_outer || method.cost < nested_loop.cost).then_some(method))
 }
 
@@ -2287,6 +2563,26 @@ mod tests {
             semantic::hir::{self, IndexHint, JoinKind, SourceId},
         },
     };
+
+    #[test]
+    fn hash_join_cost_includes_probe_scan() {
+        let params = &DEFAULT_PARAMS;
+        let cost = estimate_hash_join_cost(
+            100.0,
+            1_000.0,
+            250.0,
+            HashJoinType::Inner,
+            usize::MAX,
+            1.0,
+            params,
+        );
+        let expected = 100.0 * (params.hash_cpu_cost + params.hash_insert_cost)
+            + 1_000.0 / params.rows_per_table_page
+            + 1_000.0 * params.cpu_cost_per_row
+            + 1_000.0 * (params.hash_cpu_cost + params.hash_lookup_cost)
+            + 250.0 * params.cpu_cost_per_row;
+        assert!((cost.0 - expected).abs() < f64::EPSILON);
+    }
 
     #[test]
     fn hir_group_predicate_owner_is_ready_only_when_current_leaf_completes_group() -> Result<()> {
@@ -2691,8 +2987,11 @@ mod tests {
             c.ty,
             None,
             ColDef {
-                primary_key: false,
-                rowid_alias: c.is_rowid_alias,
+                flags: if c.is_rowid_alias {
+                    crate::schema::ColDefFlags::RowIdAlias
+                } else {
+                    crate::schema::ColDefFlags::empty()
+                },
                 ..Default::default()
             },
         )
@@ -2797,10 +3096,16 @@ mod tests {
         }
     }
 
+    /// No constraints: the table can only be scanned through its rowid
+    /// order, the candidate every table without INDEXED BY has.
     fn _hir_empty_constraints() -> HirTableConstraints {
         HirTableConstraints {
             constraints: Vec::new(),
-            candidates: Vec::new(),
+            candidates: vec![ConstraintUseCandidate {
+                index: None,
+                refs: Vec::new(),
+                partial_index: None,
+            }],
             temporary_index_terms: SmallVec::new(),
         }
     }
@@ -2824,6 +3129,7 @@ mod tests {
                 comparison_affinity: Some(crate::vdbe::affinity::Affinity::Integer),
                 comparison_collation: None,
                 null_matching: false,
+                outer_join_compatible: true,
             }],
             candidates: vec![ConstraintUseCandidate {
                 index: None,
