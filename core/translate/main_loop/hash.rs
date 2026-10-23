@@ -522,7 +522,7 @@ pub(super) fn build_prefilter_where_terms(
     let build_only_mask: TableMask = [hash_join_op.build_table_idx].into_iter().try_collect()?;
     let mut term_indices = Vec::new();
     for (cond_idx, cond) in predicates.iter().enumerate() {
-        if cond.origin.is_outer_join() {
+        if cond.consumed || cond.origin.is_outer_join() {
             continue;
         }
         let mask = table_mask_from_expr(&cond.expr, table_references, subqueries)?;
