@@ -132,7 +132,7 @@ fn schema_call(program: SchemaProgramId) -> BoundSchemaCall {
 fn expression_with_schema_call(program: SchemaProgramId) -> Expr {
     Expr::Cast {
         expr: Box::new(Expr::Literal(Literal::Null)),
-        target: TypeName {
+        target: Box::new(TypeName {
             name: "domain_value".to_string(),
             parameters: Vec::new(),
             array_dimensions: 0,
@@ -143,7 +143,7 @@ fn expression_with_schema_call(program: SchemaProgramId) -> Expr {
                 domain: None,
                 apply_builtin_affinity: false,
             },
-        },
+        }),
     }
 }
 

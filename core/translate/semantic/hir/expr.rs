@@ -344,12 +344,11 @@ pub enum SubqueryExpr {
 
 /// An expression whose names and type-dependent operations are fully resolved.
 #[derive(Clone, Debug)]
-#[allow(clippy::large_enum_variant)]
 pub enum Expr {
     Literal(Literal),
     Parameter(Parameter),
     Column(ColumnRef),
-    MergedColumn(MergedColumn),
+    MergedColumn(Box<MergedColumn>),
     RowId(SourceId),
     Output(OutputId),
     Unary {
@@ -364,7 +363,7 @@ pub enum Expr {
         /// decision depends on bound type facts and must not be rediscovered
         /// during physical emission.
         array_concat: bool,
-        custom: Option<CustomBinaryOperator>,
+        custom: Option<Box<CustomBinaryOperator>>,
         comparison: Option<ComparisonSemantics>,
     },
     Between {
@@ -384,13 +383,15 @@ pub enum Expr {
     },
     Cast {
         expr: Box<Expr>,
-        target: TypeName,
+        target: Box<TypeName>,
     },
     Collate {
         expr: Box<Expr>,
         collation: ResolvedCollation,
     },
-    Function(FunctionCall),
+    /// Boxed: a call is the largest node by far, and every expression is
+    /// moved by value while it is built and planned.
+    Function(Box<FunctionCall>),
     IsNull(Box<Expr>),
     NotNull(Box<Expr>),
     TruthTest {
@@ -420,7 +421,7 @@ pub enum Expr {
         base: Box<Expr>,
         index: Box<Expr>,
     },
-    FieldAccess(FieldAccess),
+    FieldAccess(Box<FieldAccess>),
     Raise {
         action: ResolveType,
         message: Option<Box<Expr>>,
@@ -1094,8 +1095,8 @@ fn push_optional_pair<'expr>(
 }
 
 fn custom_binary_operators_match(
-    left: &Option<CustomBinaryOperator>,
-    right: &Option<CustomBinaryOperator>,
+    left: &Option<Box<CustomBinaryOperator>>,
+    right: &Option<Box<CustomBinaryOperator>>,
 ) -> bool {
     match (left, right) {
         (None, None) => true,

@@ -1249,7 +1249,7 @@ impl Scope {
                 )));
             };
 
-            let merged = hir::Expr::MergedColumn(hir::MergedColumn {
+            let merged = hir::Expr::MergedColumn(Box::new(hir::MergedColumn {
                 left: using.left.clone(),
                 right: Box::new(hir::Expr::Column(using.right)),
                 value: using.value,
@@ -1257,7 +1257,7 @@ impl Scope {
                 affinity: using.affinity,
                 has_affinity: using.has_affinity,
                 collation: using.collation.clone(),
-            });
+            }));
 
             let left = &mut self.visible_columns[left_position];
             left.resolved = ResolvedScopeExpr {
@@ -1861,7 +1861,7 @@ pub(crate) mod tests {
             column: 0,
         };
         let first = using_column(Expr::Column(left_ref), middle_ref, MergedColumnValue::Left);
-        let first_expr = Expr::MergedColumn(hir::MergedColumn {
+        let first_expr = Expr::MergedColumn(Box::new(hir::MergedColumn {
             left: first.left.clone(),
             right: Box::new(Expr::Column(first.right)),
             value: first.value,
@@ -1869,7 +1869,7 @@ pub(crate) mod tests {
             affinity: first.affinity,
             has_affinity: first.has_affinity,
             collation: first.collation.clone(),
-        });
+        }));
         let second = using_column(first_expr, right_ref, MergedColumnValue::Coalesce);
         let mut scope = Scope::default();
         scope.add_source(&left, true);

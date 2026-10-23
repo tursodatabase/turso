@@ -478,7 +478,6 @@ fn replace_scalar_subquery(
 }
 
 /// Where an aggregate subquery's value is after a rewrite.
-#[expect(clippy::large_enum_variant)]
 enum AggregateRewrite {
     /// A column of a grouped table, which a copy of the same subquery can
     /// read too.

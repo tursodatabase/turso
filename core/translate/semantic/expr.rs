@@ -309,7 +309,9 @@ enum FrameValue {
     Scalar(ResolvedScopeExpr),
     RowSubquery {
         query: hir::QueryId,
-        components: ExprChildren,
+        /// Boxed: a row subquery is rare, and every frame holds a few of
+        /// these values inline.
+        components: Box<ExprChildren>,
     },
 }
 
@@ -341,7 +343,7 @@ impl FrameValue {
             },
             Self::RowSubquery { query, components } => ExprOperand {
                 expr: hir::Expr::Subquery(hir::SubqueryExpr::Row { query }),
-                components,
+                components: *components,
             },
         }
     }
@@ -1959,7 +1961,10 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
         let components = (0..width)
             .map(|output| self.query_output_fact(query, output))
             .collect::<Result<ExprChildren>>()?;
-        Ok(FrameValue::RowSubquery { query, components })
+        Ok(FrameValue::RowSubquery {
+            query,
+            components: Box::new(components),
+        })
     }
 
     fn query_output_fact(&self, query: hir::QueryId, output: usize) -> Result<ResolvedScopeExpr> {
@@ -2348,7 +2353,7 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
                 operator,
                 rhs: Box::new(rhs.expr),
                 array_concat,
-                custom,
+                custom: custom.map(Box::new),
                 comparison,
             },
             type_fact,
@@ -2810,7 +2815,7 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
                 Ok(ResolvedScopeExpr {
                     expr: hir::Expr::Cast {
                         expr: Box::new(input.expr),
-                        target,
+                        target: Box::new(target),
                     },
                     type_fact,
                     affinity,
@@ -3280,13 +3285,13 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
         let collation = explicit_collation(input.facts());
         let arguments = input.into_hir();
         Ok(computed_expr(
-            hir::Expr::Function(hir::FunctionCall {
+            hir::Expr::Function(Box::new(hir::FunctionCall {
                 function,
                 evaluation,
                 arguments,
                 result_type: result_type.clone(),
                 operation,
-            }),
+            })),
             result_type,
             collation,
         ))
@@ -4024,7 +4029,7 @@ fn read_as_array(value: ResolvedScopeExpr, declared: &hir::DeclaredType) -> Reso
     computed_expr(
         hir::Expr::Cast {
             expr: Box::new(value.expr),
-            target,
+            target: Box::new(target),
         },
         type_fact,
         value.collation,
@@ -4379,13 +4384,13 @@ fn field_access_expr(
 ) -> ResolvedScopeExpr {
     let result_type = member.result_type;
     computed_expr(
-        hir::Expr::FieldAccess(hir::FieldAccess {
+        hir::Expr::FieldAccess(Box::new(hir::FieldAccess {
             base: Box::new(base.expr),
             field_name: normalize_ident(field_name),
             kind: member.kind,
             container_type: member.container_type,
             result_type: result_type.clone(),
-        }),
+        })),
         result_type,
         ExprCollation::Absent,
     )
@@ -5038,6 +5043,18 @@ mod tests {
         SymbolTable, MAIN_DB_ID,
     };
     use turso_parser::parser::Parser;
+
+    #[test]
+    fn expression_values_stay_small() {
+        // Every expression is moved by value while it is built, planned and
+        // lowered, and a frame of the expression builder holds a few of
+        // them inline. A call, a field access, a merged column, a cast's
+        // type name and a custom operator are boxed to keep them small.
+        assert!(std::mem::size_of::<hir::Expr>() <= 96);
+        assert!(std::mem::size_of::<ResolvedScopeExpr>() <= 216);
+        assert!(std::mem::size_of::<FrameValue>() <= 216);
+        assert!(std::mem::size_of::<ExprFrame<'static>>() <= 696);
+    }
 
     thread_local! {
         /// How many operand widths were computed on this thread.

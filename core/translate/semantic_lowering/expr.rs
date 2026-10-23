@@ -653,7 +653,7 @@ impl<'expr> hir::ExprVisitor<'expr> for ExprLowerer<'_, 'expr, '_> {
             hir::Expr::Binary {
                 lhs, rhs, custom, ..
             } => self
-                .binary_child(lhs, rhs, custom.as_ref(), index)
+                .binary_child(lhs, rhs, custom.as_deref(), index)
                 .map(|child| child.expression()),
             // A probe evaluates the left side inside the subquery.
             hir::Expr::Subquery(hir::SubqueryExpr::In { query, .. })
@@ -688,11 +688,12 @@ impl<'expr> hir::ExprVisitor<'expr> for ExprLowerer<'_, 'expr, '_> {
         // function. Reading its result must not evaluate those inputs again.
         if matches!(
             parent,
-            hir::Expr::Function(hir::FunctionCall {
-                evaluation: hir::FunctionEvaluation::Aggregate { .. }
-                    | hir::FunctionEvaluation::Window { .. },
-                ..
-            })
+            hir::Expr::Function(call)
+                if matches!(
+                    call.evaluation,
+                    hir::FunctionEvaluation::Aggregate { .. }
+                        | hir::FunctionEvaluation::Window { .. }
+                )
         ) {
             return Ok(ControlFlow::Break(()));
         }
@@ -2029,31 +2030,30 @@ impl<'expr> ExprLowerer<'_, 'expr, '_> {
                 };
                 self.emit_in_subquery(registers, cursor, *negated, comparison, target)
             }
-            hir::Expr::Function(hir::FunctionCall {
-                evaluation: hir::FunctionEvaluation::Aggregate { id, .. },
-                ..
-            }) => {
-                let register = self.program.aggregate_result_register(*id).ok_or_else(|| {
-                    LimboError::InternalError(format!(
-                        "HIR aggregate {id:?} has no runtime result register"
-                    ))
-                })?;
-                self.program.emit_insn(Insn::Copy {
-                    src_reg: register,
-                    dst_reg: target,
-                    extra_amount: 0,
-                });
-                Ok(target)
-            }
-            hir::Expr::Function(hir::FunctionCall {
-                evaluation: hir::FunctionEvaluation::Window { id, .. },
-                ..
-            }) => {
-                let register = self.program.window_result_register(*id).ok_or_else(|| {
-                    LimboError::InternalError(format!(
-                        "HIR window function {id:?} has no runtime result register"
-                    ))
-                })?;
+            hir::Expr::Function(call)
+                if matches!(
+                    call.evaluation,
+                    hir::FunctionEvaluation::Aggregate { .. }
+                        | hir::FunctionEvaluation::Window { .. }
+                ) =>
+            {
+                let register = match &call.evaluation {
+                    hir::FunctionEvaluation::Aggregate { id, .. } => {
+                        self.program.aggregate_result_register(*id).ok_or_else(|| {
+                            LimboError::InternalError(format!(
+                                "HIR aggregate {id:?} has no runtime result register"
+                            ))
+                        })?
+                    }
+                    hir::FunctionEvaluation::Window { id, .. } => {
+                        self.program.window_result_register(*id).ok_or_else(|| {
+                            LimboError::InternalError(format!(
+                                "HIR window function {id:?} has no runtime result register"
+                            ))
+                        })?
+                    }
+                    _ => unreachable!("the arm's guard accepts only aggregates and windows"),
+                };
                 self.program.emit_insn(Insn::Copy {
                     src_reg: register,
                     dst_reg: target,
@@ -5573,11 +5573,10 @@ mod tests {
     fn aggregate_results_use_the_register_bound_by_aggregate_identity() {
         let document = analyze_sql(crate::schema::Schema::new(), "SELECT sum(random())");
         let expression = root_output(&document);
-        let hir::Expr::Function(hir::FunctionCall {
-            evaluation: hir::FunctionEvaluation::Aggregate { id, .. },
-            ..
-        }) = expression
-        else {
+        let hir::Expr::Function(call) = expression else {
+            panic!("sum becomes a function call");
+        };
+        let hir::FunctionEvaluation::Aggregate { id, .. } = &call.evaluation else {
             panic!("sum becomes an aggregate function");
         };
 
@@ -5603,11 +5602,10 @@ mod tests {
     fn window_results_use_the_register_bound_by_window_identity() {
         let document = analyze_sql(crate::schema::Schema::new(), "SELECT sum(random()) OVER ()");
         let expression = root_output(&document);
-        let hir::Expr::Function(hir::FunctionCall {
-            evaluation: hir::FunctionEvaluation::Window { id, .. },
-            ..
-        }) = expression
-        else {
+        let hir::Expr::Function(call) = expression else {
+            panic!("sum OVER becomes a function call");
+        };
+        let hir::FunctionEvaluation::Window { id, .. } = &call.evaluation else {
             panic!("sum OVER becomes a window function");
         };
 
@@ -6512,7 +6510,7 @@ mod tests {
     }
 
     fn ordinary_scalar_call(function: Func, values: Vec<hir::Expr>) -> hir::Expr {
-        hir::Expr::Function(hir::FunctionCall {
+        hir::Expr::Function(Box::new(hir::FunctionCall {
             function: resolved_function(function),
             evaluation: hir::FunctionEvaluation::Scalar,
             arguments: hir::FunctionArguments::Expressions {
@@ -6529,7 +6527,7 @@ mod tests {
             },
             result_type: TypeFact::dynamic(),
             operation: hir::FunctionOperation::Ordinary,
-        })
+        }))
     }
 
     fn custom_type_call(
@@ -6537,7 +6535,7 @@ mod tests {
         values: Vec<hir::Expr>,
         operation: hir::CustomTypeOperation,
     ) -> hir::Expr {
-        hir::Expr::Function(hir::FunctionCall {
+        hir::Expr::Function(Box::new(hir::FunctionCall {
             function: resolved_function(Func::Scalar(function)),
             evaluation: hir::FunctionEvaluation::Scalar,
             arguments: hir::FunctionArguments::Expressions {
@@ -6554,7 +6552,7 @@ mod tests {
             },
             result_type: TypeFact::dynamic(),
             operation: hir::FunctionOperation::CustomType(operation),
-        })
+        }))
     }
 
     fn sequence_call(kind: hir::SequenceOperationKind, values: Vec<hir::Expr>) -> hir::Expr {
@@ -6575,7 +6573,7 @@ mod tests {
             hir::SequenceOperationKind::NextValue => ScalarFunc::NextVal,
             hir::SequenceOperationKind::SetValue => ScalarFunc::SetVal,
         };
-        hir::Expr::Function(hir::FunctionCall {
+        hir::Expr::Function(Box::new(hir::FunctionCall {
             function: resolved_function(Func::Scalar(function)),
             evaluation: hir::FunctionEvaluation::Scalar,
             arguments: hir::FunctionArguments::Expressions {
@@ -6610,7 +6608,7 @@ mod tests {
                 ),
                 sqlite_sequence: None,
             }),
-        })
+        }))
     }
 
     fn resolved_type(kind: crate::schema::TypeDefKind) -> hir::ResolvedType {
@@ -7042,7 +7040,7 @@ mod tests {
                     custom: None,
                     comparison: None,
                 }),
-                target: hir::TypeName {
+                target: Box::new(hir::TypeName {
                     name: "resolved".to_string(),
                     parameters: vec![hir::Expr::Literal(Literal::Numeric("99".to_string()))],
                     array_dimensions: 0,
@@ -7053,7 +7051,7 @@ mod tests {
                         domain: None,
                         apply_builtin_affinity: true,
                     },
-                },
+                }),
             };
             let mut program = program();
 
@@ -7822,13 +7820,13 @@ mod tests {
         ];
 
         for (kind, container_type) in cases {
-            let expression = hir::Expr::FieldAccess(hir::FieldAccess {
+            let expression = hir::Expr::FieldAccess(Box::new(hir::FieldAccess {
                 base: Box::new(hir::Expr::Literal(Literal::Numeric("1".to_string()))),
                 field_name: "already_resolved".to_string(),
                 kind,
                 container_type,
                 result_type: TypeFact::dynamic(),
-            });
+            }));
             let mut program = program();
 
             translate_expr(&mut program, &expression, 8).unwrap();
@@ -7867,19 +7865,19 @@ mod tests {
                 variants: crate::alloc::vec![],
                 tag_names: crate::sync::Arc::from(Vec::<String>::new()),
             }));
-        let expression = hir::Expr::FieldAccess(hir::FieldAccess {
-            base: Box::new(hir::Expr::FieldAccess(hir::FieldAccess {
+        let expression = hir::Expr::FieldAccess(Box::new(hir::FieldAccess {
+            base: Box::new(hir::Expr::FieldAccess(Box::new(hir::FieldAccess {
                 base: Box::new(hir::Expr::Literal(Literal::Numeric("1".to_string()))),
                 field_name: "variant".to_string(),
                 kind: hir::FieldAccessKind::Union { tag_index: 2 },
                 container_type: union_type,
                 result_type: TypeFact::dynamic(),
-            })),
+            }))),
             field_name: "field".to_string(),
             kind: hir::FieldAccessKind::Struct { field_index: 4 },
             container_type: struct_type,
             result_type: TypeFact::dynamic(),
-        });
+        }));
         let mut program = program();
 
         translate_expr(&mut program, &expression, 8).unwrap();
@@ -7916,13 +7914,13 @@ mod tests {
         ));
         let mut expression = hir::Expr::Literal(Literal::Numeric("1".to_string()));
         for _ in 0..10_000 {
-            expression = hir::Expr::FieldAccess(hir::FieldAccess {
+            expression = hir::Expr::FieldAccess(Box::new(hir::FieldAccess {
                 base: Box::new(expression),
                 field_name: "field".to_string(),
                 kind: hir::FieldAccessKind::Struct { field_index: 0 },
                 container_type: container_type.clone(),
                 result_type: TypeFact::dynamic(),
-            });
+            }));
         }
 
         let mut program = program();

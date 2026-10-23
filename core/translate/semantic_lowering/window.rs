@@ -246,13 +246,13 @@ impl<'expr> ExprVisitor<'expr> for LateArgumentCollector<'_, 'expr> {
     type Error = LimboError;
 
     fn child(&mut self, expression: &'expr hir::Expr, index: usize) -> Option<&'expr hir::Expr> {
-        if matches!(
-            expression,
-            hir::Expr::Function(hir::FunctionCall {
-                evaluation: hir::FunctionEvaluation::Aggregate { .. },
-                ..
-            }) | hir::Expr::Subquery(_)
-        ) {
+        if matches!(expression, hir::Expr::Subquery(_))
+            || matches!(
+                expression,
+                hir::Expr::Function(call)
+                    if matches!(call.evaluation, hir::FunctionEvaluation::Aggregate { .. })
+            )
+        {
             return None;
         }
         expression.child(index)
@@ -279,12 +279,14 @@ impl<'expr> ExprVisitor<'expr> for LateArgumentCollector<'_, 'expr> {
                 expression,
                 reference: *reference,
             },
-            hir::Expr::RowId(_)
-            | hir::Expr::Subquery(_)
-            | hir::Expr::Function(hir::FunctionCall {
-                evaluation: hir::FunctionEvaluation::Aggregate { .. },
-                ..
-            }) => HirWindowBufferColumn::Evaluate(expression),
+            hir::Expr::RowId(_) | hir::Expr::Subquery(_) => {
+                HirWindowBufferColumn::Evaluate(expression)
+            }
+            hir::Expr::Function(call)
+                if matches!(call.evaluation, hir::FunctionEvaluation::Aggregate { .. }) =>
+            {
+                HirWindowBufferColumn::Evaluate(expression)
+            }
             _ => return Ok(()),
         };
         let column = push_reused_column(self.columns, column);
