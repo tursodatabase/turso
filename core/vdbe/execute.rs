@@ -20216,7 +20216,7 @@ fn op_vacuum_into_inner(program: &Program, state: &mut ProgramState, insn: &Insn
                         ))
                         .into());
                     }
-                    if std::path::Path::new(&target.path).exists() {
+                    if std::fs::metadata(&target.path).is_ok_and(|m| m.len() > 0) {
                         return Err(LimboError::ParseError(format!(
                             "output file already exists: {}",
                             target.path

@@ -662,8 +662,8 @@ fn test_vacuum_into_basic(tmp_db: TempDatabase) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Test VACUUM INTO error cases: plain VACUUM, existing file, within
-/// transaction, and query_only mode.
+/// Test VACUUM INTO error cases: plain VACUUM, existing non-empty and empty
+/// files, within transaction, and query_only mode.
 #[turso_macros::test(mvcc)]
 fn test_vacuum_into_error_cases(tmp_db: TempDatabase) -> anyhow::Result<()> {
     let _ = env_logger::try_init();
@@ -688,6 +688,14 @@ fn test_vacuum_into_error_cases(tmp_db: TempDatabase) -> anyhow::Result<()> {
         err_msg.contains("already exists") || err_msg.contains("output file"),
         "Error should mention file exists, got: {err_msg}"
     );
+
+    // 2b. VACUUM INTO an existing empty file should succeed
+    let empty_path = dest_dir.path().join("empty.db");
+    std::fs::write(&empty_path, b"")?;
+    conn.execute(format!("VACUUM INTO '{}'", empty_path.to_str().unwrap()))?;
+    let (_dest_db, dest_conn) = connect_existing_with_opts(&empty_path, tmp_db.db_opts);
+    let rows: Vec<(i64,)> = dest_conn.exec_rows("SELECT a FROM t");
+    assert_eq!(rows, vec![(1,)]);
 
     // 3. VACUUM INTO within transaction should fail
     conn.execute("BEGIN")?;
