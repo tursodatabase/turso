@@ -603,7 +603,9 @@ The catalog currently returns no rows. Select `tableoid` explicitly; it is
 not included in `SELECT *`.
 
 `pg_catalog.pg_trigger` exposes `tgparentid` for parent-trigger lookup during
-`pg_dump` discovery. This catalog currently returns no rows.
+`pg_dump` discovery. It also exposes the hidden system column `tableoid`, which
+must be selected explicitly and is not included in `SELECT *`. This catalog
+currently returns no rows.
 
 ## See Also
 

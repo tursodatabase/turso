@@ -945,3 +945,16 @@ test pg-trigger-parent-discovery-is-empty {
     ORDER BY t.tgrelid, t.tgname;
 }
 expect {}
+
+test pg-trigger-tableoid-discovery-is-empty {
+    SET search_path TO '';
+    SELECT t.tableoid, t.oid, t.tgrelid, t.tgname, t.tgenabled,
+           t.tgparentid <> 0 AS tgispartition
+    FROM unnest('{}'::pg_catalog.oid[]) AS src(tbloid)
+    JOIN pg_catalog.pg_trigger t ON src.tbloid = t.tgrelid
+    LEFT JOIN pg_catalog.pg_trigger u ON u.oid = t.tgparentid
+    WHERE (NOT t.tgisinternal AND t.tgparentid = 0)
+       OR t.tgenabled != u.tgenabled
+    ORDER BY t.tgrelid, t.tgname;
+}
+expect {}
