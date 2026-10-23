@@ -81,7 +81,7 @@ scalar_functions! {
     PgBackendPid(FunctionArity::Exact(0), true),
     PgIsInRecovery(FunctionArity::Exact(0), false),
     PgLockAccessShare(FunctionArity::Exact(0), false),
-    PgLimitValue(FunctionArity::Exact(3), true),
+    PgLimitValue(FunctionArity::Exact(2), true),
     Now | ClockTimestamp | TransactionTimestamp | StatementTimestamp(FunctionArity::Variadic, false),
 }
 
@@ -424,18 +424,13 @@ fn exec_current_setting(conn: &Connection, args: &[Register]) -> Result<Value> {
 }
 
 /// Converts a LIMIT or OFFSET value to bigint the way PostgreSQL does, rounding
-/// fractions half away from zero for numeric and half to even for float8, and
-/// rejects negative values.
+/// fractions half away from zero, and rejects negative values.
 fn exec_pg_limit_value(args: &[Register]) -> Result<Value> {
     let value = match args[0].get_value() {
         Value::Null => return Ok(Value::Null),
         Value::Numeric(Numeric::Integer(value)) => *value,
         Value::Numeric(Numeric::Float(value)) => {
-            let value = f64::from(*value);
-            let rounded = match text_arg(args, 2).as_str() {
-                "float8" => value.round_ties_even(),
-                _ => value.round(),
-            };
+            let rounded = f64::from(*value).round();
             if !(i64::MIN as f64..i64::MAX as f64).contains(&rounded) {
                 return Err(LimboError::InvalidArgument(
                     "bigint out of range".to_string(),

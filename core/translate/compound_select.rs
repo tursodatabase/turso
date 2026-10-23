@@ -9,11 +9,8 @@ use crate::translate::emitter::{
 use crate::translate::eqp::{EqpCompoundOp, EqpDetail, EqpSortMethod};
 use crate::translate::expr::translate_expr;
 use crate::translate::order_by::{custom_type_comparator, sorter_insert};
-use crate::translate::plan::{
-    CompoundOrderByKey, EvalAt, Plan, QueryDestination, SelectPlan, SubqueryOrigin,
-};
+use crate::translate::plan::{CompoundOrderByKey, Plan, QueryDestination, SelectPlan};
 use crate::translate::result_row::emit_columns_to_destination;
-use crate::translate::subquery::emit_non_from_clause_subqueries_for_eval_at;
 use crate::vdbe::builder::{CursorType, ProgramBuilder};
 use crate::vdbe::insn::{Insn, SorterOpenData};
 use crate::{emit_explain, LimboError};
@@ -51,16 +48,6 @@ pub fn emit_program_for_compound_select(
         right_most.table_references.joined_tables().len(),
         false,
     ));
-
-    emit_non_from_clause_subqueries_for_eval_at(
-        program,
-        resolver,
-        &mut right_most.non_from_clause_subqueries,
-        &right_most.join_order,
-        Some(&right_most.table_references),
-        EvalAt::BeforeLoop,
-        |subquery| subquery.origin == SubqueryOrigin::SelectLimitOffset,
-    )?;
 
     // Each subselect shares the same limit_ctx and offset, because the LIMIT, OFFSET applies to
     // the entire compound select, not just a single subselect.
