@@ -45,7 +45,7 @@ pub fn open_database(
     vfs: Option<&str>,
     flags: turso_core::OpenFlags,
     opts: turso_core::DatabaseOpts,
-) -> Result<(Arc<dyn turso_core::IO>, Arc<turso_core::Database>)> {
+) -> crate::Result<(Arc<dyn turso_core::IO>, Arc<turso_core::Database>)> {
     let io = match vfs {
         Some(vfs) => turso_core::Database::io_for_vfs(vfs)?,
         None => turso_core::Database::io_for_path(path)?,
@@ -61,7 +61,7 @@ pub fn open_database_with_io(
     path: &str,
     flags: turso_core::OpenFlags,
     opts: turso_core::DatabaseOpts,
-) -> Result<Arc<turso_core::Database>> {
+) -> crate::Result<Arc<turso_core::Database>> {
     let file = io.open_file(path, flags, true)?;
     let db_file = Arc::new(turso_core::storage::database::DatabaseFile::new(file));
     turso_core::Database::open(
@@ -72,10 +72,11 @@ pub fn open_database_with_io(
             .flags(flags)
             .db_opts(opts.with_mvcc(true)),
     )
+    .map_err(Into::into)
 }
 
 impl PgConnection {
-    pub fn connect(db: &Arc<turso_core::Database>) -> Result<Self> {
+    pub fn connect(db: &Arc<turso_core::Database>) -> crate::Result<Self> {
         let context = Arc::new(PgSessionState::default());
         let conn = db.connect_with_context(context)?;
         conn.add_namespace("public", turso_core::MAIN_DB_ID);
@@ -89,11 +90,13 @@ impl PgConnection {
         &self.inner.conn
     }
 
-    pub fn prepare(&self, sql: impl AsRef<str>) -> Result<Statement> {
+    pub fn prepare(&self, sql: impl AsRef<str>) -> crate::Result<crate::Statement> {
         prepare_statement(&self.inner, sql.as_ref())
+            .map(crate::Statement::new)
+            .map_err(Into::into)
     }
 
-    pub fn query(&self, sql: impl AsRef<str>) -> Result<Option<Statement>> {
+    pub fn query(&self, sql: impl AsRef<str>) -> crate::Result<Option<crate::Statement>> {
         let sql = sql.as_ref().trim();
         if sql.is_empty() {
             return Ok(None);
@@ -101,7 +104,7 @@ impl PgConnection {
         self.prepare(sql).map(Some)
     }
 
-    pub fn execute(&self, sql: impl AsRef<str>) -> Result<()> {
+    pub fn execute(&self, sql: impl AsRef<str>) -> crate::Result<()> {
         for stmt in self.query_runner(sql.as_ref().as_bytes()) {
             if let Some(mut stmt) = stmt? {
                 stmt.run_ignore_rows()?;
@@ -110,8 +113,8 @@ impl PgConnection {
         Ok(())
     }
 
-    pub fn close(&self) -> Result<()> {
-        self.inner.conn.close()
+    pub fn close(&self) -> crate::Result<()> {
+        self.inner.conn.close().map_err(Into::into)
     }
 
     pub fn pragma_update(&self, name: &str, value: impl std::fmt::Display) -> Result<()> {
@@ -146,7 +149,7 @@ impl<'a> PgQueryRunner<'a> {
 }
 
 impl Iterator for PgQueryRunner<'_> {
-    type Item = Result<Option<Statement>>;
+    type Item = crate::Result<Option<crate::Statement>>;
 
     fn next(&mut self) -> Option<Self::Item> {
         if self.index >= self.stmts.len() {
@@ -155,11 +158,16 @@ impl Iterator for PgQueryRunner<'_> {
 
         let sql = &self.stmts[self.index];
         self.index += 1;
-        Some(prepare_statement(self.conn, sql).map(Some))
+        Some(
+            prepare_statement(self.conn, sql)
+                .map(crate::Statement::new)
+                .map(Some)
+                .map_err(Into::into),
+        )
     }
 }
 
-pub fn split_statements(sql: &str) -> Result<Vec<String>> {
+pub fn split_statements(sql: &str) -> crate::Result<Vec<String>> {
     match turso_pg_parser::split_statements(sql) {
         Ok(stmts) if stmts.is_empty() && !sql.trim().is_empty() => Ok(vec![sql.trim().to_string()]),
         Ok(stmts) => Ok(stmts),

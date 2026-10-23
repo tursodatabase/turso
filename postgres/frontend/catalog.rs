@@ -33,6 +33,10 @@ impl Dialect for PostgresDialect {
         "postgres"
     }
 
+    fn format_error(&self, error: LimboError) -> LimboError {
+        error
+    }
+
     fn parse(&self, sql: &str) -> Result<(Option<turso_parser::ast::Cmd>, usize)> {
         // Engine-generated helper statements and pragmas are canonical SQLite
         // text that pg_query rejects, so anything the PostgreSQL parser cannot
@@ -175,6 +179,10 @@ impl Dialect for PostgresDialect {
     }
 
     fn upsert_rejects_row_written_by_same_statement(&self) -> bool {
+        true
+    }
+
+    fn errors_on_zero_divisor(&self) -> bool {
         true
     }
 }
@@ -1902,8 +1910,7 @@ impl SnapshotRows for PgConstraintTable {
 // pg_attrdef
 // ──────────────────────────────────────────────────────────────────────
 
-const PG_ATTRDEF_SQL: &str =
-    "CREATE TABLE pg_attrdef (oid INTEGER, adrelid INTEGER, adnum INTEGER, adbin TEXT, tableoid INTEGER HIDDEN)";
+const PG_ATTRDEF_SQL: &str = "CREATE TABLE pg_attrdef (oid INTEGER, adrelid INTEGER, adnum INTEGER, adbin TEXT, tableoid INTEGER HIDDEN)";
 
 #[derive(Debug)]
 struct PgAttrdefTable;

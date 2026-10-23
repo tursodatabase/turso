@@ -4335,6 +4335,7 @@ fn ephemeral_index_build(
             .is_some_and(|btree| btree.has_rowid),
         index_method: None,
         on_conflict: None,
+        constraint_name: None,
     };
 
     Ok(ephemeral_index)

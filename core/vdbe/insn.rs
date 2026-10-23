@@ -454,6 +454,101 @@ pub enum ClearBtreeCount {
     ChangesAndRowsWritten,
 }
 
+#[derive(Debug, Clone)]
+pub struct ConstraintInfo {
+    pub kind: crate::ConstraintKind,
+    pub constraint_name: Option<String>,
+    pub index_name: Option<String>,
+    pub table_name: String,
+    pub column_names: Vec<String>,
+    pub violation_regs: Vec<usize>,
+    pub row_col_names: Vec<String>,
+    pub parent_table: Option<String>,
+}
+
+impl ConstraintInfo {
+    pub fn primary_key(
+        table: &str,
+        name: Option<String>,
+        cols: Vec<String>,
+        regs: Vec<usize>,
+    ) -> Self {
+        Self {
+            kind: crate::ConstraintKind::PrimaryKey,
+            constraint_name: name,
+            index_name: None,
+            table_name: table.to_string(),
+            column_names: cols,
+            violation_regs: regs,
+            row_col_names: vec![],
+            parent_table: None,
+        }
+    }
+
+    pub fn unique_index(table: &str, index: &Index, regs: Vec<usize>) -> Self {
+        Self {
+            kind: crate::ConstraintKind::Unique,
+            constraint_name: index.constraint_name.clone(),
+            index_name: Some(index.name.clone()),
+            table_name: table.to_string(),
+            column_names: index.columns.iter().map(|col| col.name.clone()).collect(),
+            violation_regs: regs,
+            row_col_names: vec![],
+            parent_table: None,
+        }
+    }
+
+    pub fn not_null(table: &str, col: String) -> Self {
+        Self {
+            kind: crate::ConstraintKind::NotNull,
+            constraint_name: None,
+            index_name: None,
+            table_name: table.to_string(),
+            column_names: vec![col],
+            violation_regs: vec![],
+            row_col_names: vec![],
+            parent_table: None,
+        }
+    }
+
+    pub fn check(
+        table: &str,
+        name: Option<String>,
+        regs: Vec<usize>,
+        row_names: Vec<String>,
+    ) -> Self {
+        Self {
+            kind: crate::ConstraintKind::Check,
+            constraint_name: name,
+            index_name: None,
+            table_name: table.to_string(),
+            column_names: vec![],
+            violation_regs: regs,
+            row_col_names: row_names,
+            parent_table: None,
+        }
+    }
+
+    pub fn fk(
+        child_table: &str,
+        name: Option<String>,
+        cols: Vec<String>,
+        regs: Vec<usize>,
+        parent_table: String,
+    ) -> Self {
+        Self {
+            kind: crate::ConstraintKind::ForeignKey,
+            constraint_name: name,
+            index_name: None,
+            table_name: child_table.to_string(),
+            column_names: cols,
+            violation_regs: regs,
+            row_col_names: vec![],
+            parent_table: Some(parent_table),
+        }
+    }
+}
+
 // The opcodes the dispatch loop matches directly come first.
 #[repr(u8)]
 #[derive(Description, Debug, Clone, EnumDiscriminants)]
@@ -1063,6 +1158,7 @@ pub enum Insn {
 
     /// Halt the program.
     Halt {
+        constraint_info: Option<Box<ConstraintInfo>>,
         err_code: usize,
         description: String,
         /// Override the program's resolve_type for error handling.
@@ -1074,6 +1170,7 @@ pub enum Insn {
 
     /// Halt the program if P3 is null.
     HaltIfNull {
+        constraint_info: Option<Box<ConstraintInfo>>,
         target_reg: usize,   // P3
         description: String, // p4
         err_code: usize,     // p1
@@ -2076,6 +2173,7 @@ pub enum Insn {
     // If P1 is non-zero, the database constraint counter is incremented (deferred foreign key constraints).
     // Otherwise, if P1 is zero, the statement counter is incremented (immediate foreign key constraints).
     FkCounter {
+        constraint_info: Option<Box<ConstraintInfo>>,
         increment_value: isize,
         deferred: bool,
     },

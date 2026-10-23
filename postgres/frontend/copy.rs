@@ -9,7 +9,7 @@
 //! - Empty field = empty string (not NULL)
 //! - Lines starting with `\.` = end of data
 
-use crate::{LimboError, Result};
+use turso_core::{LimboError, Result};
 
 /// A parsed row from COPY text format: each element is None for NULL, Some for a value.
 type CopyRow = Vec<Option<String>>;

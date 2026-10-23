@@ -308,6 +308,29 @@ impl PostgreSQLTranslator {
         // Collect implicit sequence names for serial columns
         let mut serial_sequences: Vec<String> = Vec::new();
 
+        // Extract table name for serial sequence naming
+        let tbl_name_str = tbl_name.name.as_str().to_string();
+        let mut check_names = std::collections::HashSet::new();
+        for elt in &create.table_elts {
+            match &elt.node {
+                Some(Node::Constraint(c)) => {
+                    if !c.conname.is_empty() {
+                        check_names.insert(c.conname.clone());
+                    }
+                }
+                Some(Node::ColumnDef(col)) => {
+                    for constraint in &col.constraints {
+                        if let Some(Node::Constraint(c)) = &constraint.node {
+                            if !c.conname.is_empty() {
+                                check_names.insert(c.conname.clone());
+                            }
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+
         // Check for table-level PK (to suppress column-level PK emission)
         let mut has_table_pk = false;
         for elt in &create.table_elts {
@@ -332,6 +355,7 @@ impl PostgreSQLTranslator {
                         &tbl_name,
                         &relation.schemaname,
                         &mut serial_sequences,
+                        &mut check_names,
                     )?;
                     columns.push(col);
                 }
@@ -343,7 +367,11 @@ impl PostgreSQLTranslator {
                         ConstrType::ConstrPrimary => {
                             let pk_cols = extract_key_columns(&constraint.keys)?;
                             table_constraints.push(ast::NamedTableConstraint {
-                                name: None,
+                                name: if constraint.conname.is_empty() {
+                                    Some(ast::Name::from_string(format!("{tbl_name_str}_pkey")))
+                                } else {
+                                    Some(ast::Name::from_string(constraint.conname.clone()))
+                                },
                                 constraint: ast::TableConstraint::PrimaryKey {
                                     columns: pk_cols
                                         .into_iter()
@@ -363,7 +391,11 @@ impl PostgreSQLTranslator {
                         ConstrType::ConstrUnique => {
                             let unique_cols = extract_key_columns(&constraint.keys)?;
                             table_constraints.push(ast::NamedTableConstraint {
-                                name: None,
+                                name: if constraint.conname.is_empty() {
+                                    None
+                                } else {
+                                    Some(ast::Name::from_string(constraint.conname.clone()))
+                                },
                                 constraint: ast::TableConstraint::Unique {
                                     columns: unique_cols
                                         .into_iter()
@@ -385,17 +417,20 @@ impl PostgreSQLTranslator {
                                 .push(self.pg_fk_to_table_constraint(&fk, &constraint.fk_attrs)?);
                         }
                         ConstrType::ConstrCheck => {
-                            let raw_expr = constraint.raw_expr.as_ref().ok_or_else(|| {
-                                ParseError::ParseError("CHECK constraint missing expression".into())
-                            })?;
-                            let expr = self.translate_expr(raw_expr)?;
-                            table_constraints.push(ast::NamedTableConstraint {
-                                name: None,
-                                constraint: ast::TableConstraint::Check {
-                                    expr: Box::new(expr),
-                                    source: None,
-                                },
-                            });
+                            if let Some(ref raw_expr) = constraint.raw_expr {
+                                let expr = self.translate_expr(raw_expr)?;
+                                table_constraints.push(ast::NamedTableConstraint {
+                                    name: Some(pg_check_constraint_name(
+                                        &tbl_name_str,
+                                        constraint,
+                                        &mut check_names,
+                                    )),
+                                    constraint: ast::TableConstraint::Check {
+                                        expr: Box::new(expr),
+                                        source: None,
+                                    },
+                                });
+                            }
                         }
                         other => {
                             return Err(not_supported(format!(
@@ -478,6 +513,7 @@ impl PostgreSQLTranslator {
         tbl_name: &ast::QualifiedName,
         table_schema: &str,
         serial_sequences: &mut Vec<String>,
+        check_names: &mut std::collections::HashSet<String>,
     ) -> Result<ast::ColumnDefinition, ParseError> {
         use pg_query::protobuf::node::Node;
         use pg_query::protobuf::ConstrType;
@@ -493,8 +529,10 @@ impl PostgreSQLTranslator {
 
         // Serial does NOT imply PRIMARY KEY in PostgreSQL
         let mut is_primary_key = false;
+        let mut pk_conname: Option<ast::Name> = None;
         let mut is_not_null = col_def.is_not_null || is_serial;
         let mut is_unique = false;
+        let mut unique_conname: Option<ast::Name> = None;
         let mut default_expr: Option<ast::Expr> = None;
         let mut foreign_key: Option<PgForeignKey> = None;
         let mut check_constraints = Vec::new();
@@ -508,9 +546,19 @@ impl PostgreSQLTranslator {
             reject_constraint_attributes(constraint, table_schema)?;
             let contype = ConstrType::try_from(constraint.contype).unwrap_or(ConstrType::Undefined);
             match contype {
-                ConstrType::ConstrPrimary => is_primary_key = true,
+                ConstrType::ConstrPrimary => {
+                    is_primary_key = true;
+                    if !constraint.conname.is_empty() {
+                        pk_conname = Some(ast::Name::from_string(constraint.conname.clone()));
+                    }
+                }
                 ConstrType::ConstrNotnull => is_not_null = true,
-                ConstrType::ConstrUnique => is_unique = true,
+                ConstrType::ConstrUnique => {
+                    is_unique = true;
+                    if !constraint.conname.is_empty() {
+                        unique_conname = Some(ast::Name::from_string(constraint.conname.clone()));
+                    }
+                }
                 ConstrType::ConstrDefault => {
                     let raw_expr = constraint.raw_expr.as_ref().ok_or_else(|| {
                         ParseError::ParseError("DEFAULT missing expression".into())
@@ -518,20 +566,19 @@ impl PostgreSQLTranslator {
                     default_expr = Some(self.translate_expr(raw_expr)?);
                 }
                 ConstrType::ConstrCheck => {
-                    let raw_expr = constraint.raw_expr.as_ref().ok_or_else(|| {
-                        ParseError::ParseError("CHECK constraint missing expression".into())
-                    })?;
-                    check_constraints.push(ast::NamedColumnConstraint {
-                        name: if constraint.conname.is_empty() {
-                            None
-                        } else {
-                            Some(ast::Name::from_string(constraint.conname.clone()))
-                        },
-                        constraint: ast::ColumnConstraint::Check {
-                            expr: Box::new(self.translate_expr(raw_expr)?),
-                            source: None,
-                        },
-                    });
+                    if let Some(ref raw_expr) = constraint.raw_expr {
+                        check_constraints.push(ast::NamedColumnConstraint {
+                            name: Some(pg_check_constraint_name(
+                                tbl_name.name.as_str(),
+                                constraint,
+                                check_names,
+                            )),
+                            constraint: ast::ColumnConstraint::Check {
+                                expr: Box::new(self.translate_expr(raw_expr)?),
+                                source: None,
+                            },
+                        });
+                    }
                 }
                 ConstrType::ConstrForeign => {
                     if foreign_key.is_some() {
@@ -602,7 +649,9 @@ impl PostgreSQLTranslator {
         // PRIMARY KEY (only on column level if there's no table-level PK)
         if is_primary_key && !has_table_pk {
             constraints.push(ast::NamedColumnConstraint {
-                name: None,
+                name: Some(pk_conname.unwrap_or_else(|| {
+                    ast::Name::from_string(format!("{}_pkey", tbl_name.name.as_str()))
+                })),
                 constraint: ast::ColumnConstraint::PrimaryKey {
                     order: None,
                     conflict_clause: None,
@@ -625,7 +674,7 @@ impl PostgreSQLTranslator {
         // UNIQUE
         if is_unique {
             constraints.push(ast::NamedColumnConstraint {
-                name: None,
+                name: unique_conname,
                 constraint: ast::ColumnConstraint::Unique(None),
             });
         }
@@ -642,7 +691,7 @@ impl PostgreSQLTranslator {
         if let Some(ref fk) = foreign_key {
             let clause = self.pg_fk_to_fk_clause(fk);
             constraints.push(ast::NamedColumnConstraint {
-                name: None,
+                name: fk.name.clone().map(ast::Name::from_string),
                 constraint: ast::ColumnConstraint::ForeignKey {
                     clause,
                     defer_clause: None,
@@ -703,7 +752,7 @@ impl PostgreSQLTranslator {
             .collect();
 
         Ok(ast::NamedTableConstraint {
-            name: None,
+            name: fk.name.clone().map(ast::Name::from_string),
             constraint: ast::TableConstraint::ForeignKey {
                 columns,
                 clause: self.pg_fk_to_fk_clause(fk),
@@ -5130,6 +5179,44 @@ fn result_column_names(select: &ast::Select) -> Option<Vec<Option<String>>> {
     }
 }
 
+fn pg_check_constraint_name(
+    table_name: &str,
+    constraint: &pg_query::protobuf::Constraint,
+    used_names: &mut std::collections::HashSet<String>,
+) -> ast::Name {
+    if !constraint.conname.is_empty() {
+        return ast::Name::from_string(constraint.conname.clone());
+    }
+    let mut columns = Vec::new();
+    if let Some(node) = constraint
+        .raw_expr
+        .as_ref()
+        .and_then(|expr| expr.node.as_ref())
+    {
+        for (node, _, _, _) in node.nodes() {
+            if let NodeRef::ColumnRef(column) = node {
+                if let Some(name) = last_string(&column.fields) {
+                    if !columns.contains(&name) {
+                        columns.push(name);
+                    }
+                }
+            }
+        }
+    }
+    let base = if let [column] = columns.as_slice() {
+        format!("{table_name}_{column}_check")
+    } else {
+        format!("{table_name}_check")
+    };
+    let mut name = base.clone();
+    let mut suffix = 1;
+    while !used_names.insert(name.clone()) {
+        name = format!("{base}{suffix}");
+        suffix += 1;
+    }
+    ast::Name::from_string(name)
+}
+
 fn join_keeps_unmatched_right_rows(join: &ast::JoinedSelectTable) -> bool {
     matches!(
         join.operator,
@@ -5496,6 +5583,7 @@ pub fn map_pg_type(pg_type: &str, params: &[i64]) -> Option<PgTypeMapping> {
 
 /// Internal DDL plan for FK constraints — used during CREATE TABLE translation.
 struct PgForeignKey {
+    name: Option<String>,
     ref_table: String,
     ref_columns: Vec<String>,
     on_delete: Option<String>,
@@ -5755,6 +5843,7 @@ fn extract_foreign_key(
     let on_update = pg_fk_action_to_string(&constraint.fk_upd_action)?;
 
     Ok(PgForeignKey {
+        name: (!constraint.conname.is_empty()).then(|| constraint.conname.clone()),
         ref_table,
         ref_columns,
         on_delete,
