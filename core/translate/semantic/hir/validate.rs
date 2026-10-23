@@ -2340,7 +2340,8 @@ impl<'document> HirValidator<'document> {
     }
 
     /// The change capture table of a DML target: a table of the main
-    /// database other than the target itself.
+    /// database, other than the target itself when the target's rows are
+    /// captured.
     fn validate_capture_changes(
         &self,
         target_table: &ResolvedTable,
@@ -2356,7 +2357,7 @@ impl<'document> HirValidator<'document> {
             "change capture table is not a table of the main database",
         )?;
         self.require(
-            capture_changes.table != *target_table,
+            !capture_changes.target_rows || capture_changes.table != *target_table,
             "a DML target captures its own changes",
         )?;
         if let Some(sequence) = &capture_changes.change_ids {

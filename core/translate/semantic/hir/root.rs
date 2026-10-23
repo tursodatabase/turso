@@ -124,6 +124,11 @@ pub struct CaptureChanges {
     /// The capture table's hidden AUTOINCREMENT sequence, which hands out
     /// change ids under MVCC.
     pub change_ids: Option<super::SequenceOperation>,
+    /// Whether the target's own row changes are written. A TEMP table's
+    /// never are, nor the capture table's own; a trigger or foreign-key
+    /// action the statement fires may still write rows of another table,
+    /// and the statement then writes only the COMMIT row for them.
+    pub target_rows: bool,
 }
 
 /// Trigger identities selected for an INSERT and its possible UPSERT update.

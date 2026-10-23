@@ -1782,6 +1782,25 @@ impl<'expr> hir::ExprVisitor<'expr> for ExprLowerer<'_, 'expr, '_> {
     }
 }
 
+/// Whether a constant expression can fail: it calls a function, as
+/// `abs(-9223372036854775808)` fails, or CASTs to a custom type, which runs
+/// the type's encoder and domain checks.
+fn constant_may_fail(expression: &hir::Expr) -> bool {
+    let mut may_fail = false;
+    expression.for_each(&mut |expression| {
+        may_fail |= match expression {
+            hir::Expr::Function(_) => true,
+            hir::Expr::Cast { target, .. } => {
+                !target.programs.encode.is_empty()
+                    || target.programs.domain.is_some()
+                    || target.array_dimensions > 0
+            }
+            _ => false,
+        };
+    });
+    may_fail
+}
+
 impl<'expr> ExprLowerer<'_, 'expr, '_> {
     /// An operand with the same value on every row, such as
     /// the `1` of `a + 1` or the `upper('x')` of `upper('x') || b`, is not
@@ -1790,34 +1809,31 @@ impl<'expr> ExprLowerer<'_, 'expr, '_> {
     /// might fail, as `abs(-9223372036854775808)` does, so an operand that
     /// calls one still runs only where it is first reached, as SQLite's does.
     fn begin_hoisted_constant(&mut self, operand: &hir::Expr) -> Option<Hoisted> {
-        if self.program.constant_span_is_open()
-            || matches!(operand, hir::Expr::Parameter(_))
-            || !hir_expr_is_constant(self.program, operand)
-        {
+        if !self.is_hoisted_constant(operand) {
             return None;
         }
-        // A CAST to a custom type runs its encoder and domain checks, which
-        // may fail like a function.
-        let mut may_fail = false;
-        operand.for_each(&mut |expression| {
-            may_fail |= match expression {
-                hir::Expr::Function(_) => true,
-                hir::Expr::Cast { target, .. } => {
-                    !target.programs.encode.is_empty()
-                        || target.programs.domain.is_some()
-                        || target.array_dimensions > 0
-                }
-                _ => false,
-            };
-        });
-        if !may_fail {
+        if !constant_may_fail(operand) {
             return Some(Hoisted::Span(self.program.constant_span_start()));
         }
+        Some(Hoisted::Once(self.begin_once()))
+    }
+
+    /// Whether `expression` has the same value on every row and is not
+    /// already computed once by an enclosing constant.
+    fn is_hoisted_constant(&self, expression: &hir::Expr) -> bool {
+        !self.program.constant_span_is_open()
+            && !matches!(expression, hir::Expr::Parameter(_))
+            && hir_expr_is_constant(self.program, expression)
+    }
+
+    /// Start a block that runs the first time it is reached and is skipped
+    /// after that. Returns the label the block ends at.
+    fn begin_once(&mut self) -> BranchOffset {
         let done = self.program.allocate_label();
         self.program.emit_insn(Insn::Once {
             target_pc_when_reentered: done,
         });
-        Some(Hoisted::Once(done))
+        done
     }
 
     fn post_order_value(
@@ -4654,14 +4670,35 @@ pub(crate) fn translate_expr_with_inputs<'expr>(
     target: usize,
     inputs: &[ExprRegisterInput<'expr>],
 ) -> Result<usize> {
-    expression.walk(
-        LoweringContext::new(target),
-        &mut ExprLowerer {
-            program,
-            document,
-            inputs,
-        },
-    )
+    let mut lowerer = ExprLowerer {
+        program,
+        document,
+        inputs,
+    };
+    // Like SQLite, a whole expression that calls a function with the same
+    // value on every row, such as `unixepoch()` or `abs(-5)` as a result
+    // column, is computed the first time it is reached and copied from its
+    // own register after that. The register is its own because the target
+    // may be written by others, as a subquery resets its result to NULL on
+    // each run. A literal alone is loaded on every row, as SQLite loads it.
+    if !inputs.is_empty()
+        || !lowerer.is_hoisted_constant(expression)
+        || !constant_may_fail(expression)
+    {
+        return expression.walk(LoweringContext::new(target), &mut lowerer);
+    }
+    let done = lowerer.begin_once();
+    let own = lowerer.program.alloc_register();
+    let mut context = LoweringContext::new(own);
+    context.in_hoisted = true;
+    expression.walk(context, &mut lowerer)?;
+    lowerer.program.preassign_label_to_next_insn(done);
+    lowerer.program.emit_insn(Insn::Copy {
+        src_reg: own,
+        dst_reg: target,
+        extra_amount: 0,
+    });
+    Ok(target)
 }
 
 #[derive(Clone, Copy)]
@@ -4862,8 +4899,19 @@ fn hir_expr_is_constant(program: &ProgramBuilder, expression: &hir::Expr) -> boo
             | hir::Expr::Row(_) => true,
             hir::Expr::Binary { custom, .. } => custom.is_none(),
             hir::Expr::Function(call) => {
+                // Like SQLite's SQLITE_FUNC_SLOCHNG functions, the date and
+                // time functions return the same value for the whole
+                // statement, so a call with constant arguments is computed
+                // once instead of on every row.
+                let function = call.function.value();
+                let same_for_whole_statement =
+                    crate::function::Deterministic::is_deterministic(function)
+                        || matches!(
+                            function,
+                            crate::function::Func::Scalar(scalar) if scalar.is_date_time_function()
+                        );
                 matches!(call.evaluation, hir::FunctionEvaluation::Scalar)
-                    && crate::function::Deterministic::is_deterministic(call.function.value())
+                    && same_for_whole_statement
             }
             _ => false,
         };
@@ -5395,7 +5443,23 @@ mod tests {
         expression: &hir::Expr,
         target: usize,
     ) -> Result<usize> {
-        super::translate_expr(program, &document(Vec::new()), expression, target)
+        translate_expr_in(program, &document(Vec::new()), expression, target)
+    }
+
+    /// Lower `expression` as a caller that computes the whole expression
+    /// once does, such as a condition's operand: the tests check the shape
+    /// of the expression's own instructions, and most expressions here are
+    /// constant.
+    fn translate_expr_in(
+        program: &mut ProgramBuilder,
+        document: &hir::HirDocument,
+        expression: &hir::Expr,
+        target: usize,
+    ) -> Result<usize> {
+        let span = program.constant_span_start();
+        let result = super::translate_expr(program, document, expression, target);
+        program.constant_span_end(span);
+        result
     }
 
     fn resolved_function(function: Func) -> hir::ResolvedFunction {
@@ -7017,7 +7081,7 @@ mod tests {
         let expression = root_output(&document);
         let mut program = program();
 
-        super::translate_expr(&mut program, &document, expression, 8)
+        translate_expr_in(&mut program, &document, expression, 8)
             .expect("parameterized custom CAST lowers");
 
         let parameter = program
@@ -7060,7 +7124,7 @@ mod tests {
         let expression = root_output(&document);
         let mut program = program();
 
-        super::translate_expr(&mut program, &document, expression, 8)
+        translate_expr_in(&mut program, &document, expression, 8)
             .expect("custom domain CAST lowers");
 
         let instruction = |predicate: fn(&Insn) -> bool| {

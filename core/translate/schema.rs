@@ -1622,7 +1622,7 @@ pub fn emit_schema_entry(
             None,
             SQLITE_TABLEID,
         )?;
-        emit_cdc_autocommit_commit(program, catalog, Some(cdc_table_cursor_id))?;
+        emit_cdc_autocommit_commit(program, catalog, cdc_table_cursor_id)?;
     }
     Ok(())
 }
@@ -2041,7 +2041,7 @@ pub fn translate_drop_table(
     program.preassign_label_to_next_insn(end_metadata_label);
     // end of loop on schema table
     if let Some((cdc_cursor_id, _)) = cdc_table {
-        emit_cdc_autocommit_commit(program, catalog, Some(cdc_cursor_id))?;
+        emit_cdc_autocommit_commit(program, catalog, cdc_cursor_id)?;
     }
 
     // SQLite removes temp triggers targeting the dropped table.

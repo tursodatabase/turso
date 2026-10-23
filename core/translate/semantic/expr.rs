@@ -3458,6 +3458,26 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
         let lhs_column = self.custom_operator_column(lhs)?;
         let rhs_column = self.custom_operator_column(rhs)?;
 
+        // With one custom column, the other operand is encoded when it is a
+        // literal the type accepts as input. Otherwise an arithmetic operator
+        // of a type whose stored values read back unchanged still gets the
+        // operand as it is, so `date + 1`, `date + int_col` and `date + ?`
+        // add days; the operator function checks the operand's type. A
+        // comparison such as `int_col = '10'` keeps the standard operator.
+        let one_custom_column = |column: &CustomOperatorColumn,
+                                 other: &ResolvedScopeExpr,
+                                 operand: hir::BinaryOperand| {
+            let encode_other = literal_matches_custom_type(other, column.definition.value());
+            let pass_other_as_is = !operator.is_comparison()
+                && column.definition.value().decode_returns_value_unchanged();
+            if !encode_other && !pass_other_as_is {
+                return None;
+            }
+            Some(encode_other.then(|| hir::CustomBinaryLiteralEncoding {
+                operand,
+                encoder: column.encoder.clone(),
+            }))
+        };
         let (column, literal_encoding) = match (&lhs_column, &rhs_column) {
             (Some(lhs), Some(rhs)) => {
                 if !lhs.declared_name.eq_ignore_ascii_case(&rhs.declared_name) {
@@ -3466,28 +3486,16 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
                 (lhs, None)
             }
             (Some(lhs), None) => {
-                if !literal_matches_custom_type(rhs, lhs.definition.value()) {
+                let Some(encoding) = one_custom_column(lhs, rhs, hir::BinaryOperand::Right) else {
                     return Ok(None);
-                }
-                (
-                    lhs,
-                    Some(hir::CustomBinaryLiteralEncoding {
-                        operand: hir::BinaryOperand::Right,
-                        encoder: lhs.encoder.clone(),
-                    }),
-                )
+                };
+                (lhs, encoding)
             }
             (None, Some(rhs)) => {
-                if !literal_matches_custom_type(lhs, rhs.definition.value()) {
+                let Some(encoding) = one_custom_column(rhs, lhs, hir::BinaryOperand::Left) else {
                     return Ok(None);
-                }
-                (
-                    rhs,
-                    Some(hir::CustomBinaryLiteralEncoding {
-                        operand: hir::BinaryOperand::Left,
-                        encoder: rhs.encoder.clone(),
-                    }),
-                )
+                };
+                (rhs, encoding)
             }
             (None, None) => return Ok(None),
         };
@@ -4455,7 +4463,10 @@ fn bind_function(
         Func::Agg(_) => bind_aggregate(function, context),
         Func::External(external) if external.func.is_aggregate() => {
             if has_over {
-                crate::bail_parse_error!("{} cannot be used as a window function", name.as_str())
+                crate::bail_parse_error!(
+                    "{}() is an extension aggregate and cannot be used as a window function",
+                    name.as_str()
+                )
             }
             bind_aggregate(function, context)
         }

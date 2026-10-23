@@ -1847,10 +1847,11 @@ fn hir_change_capture_records_each_change_once() {
         null.clone(),
         null.clone(),
     ];
+    // The INSERT's own row comes before the row of the AFTER trigger it
+    // fired: a consumer replays the rows in change id order.
     assert_eq!(
         rows,
         vec![
-            vec![int(1), text("l"), int(1), null.clone(), text(r#"{"m":1}"#)],
             vec![
                 int(1),
                 text("p"),
@@ -1858,6 +1859,7 @@ fn hir_change_capture_records_each_change_once() {
                 null.clone(),
                 text(r#"{"id":1,"v":10}"#)
             ],
+            vec![int(1), text("l"), int(1), null.clone(), text(r#"{"m":1}"#)],
             commit.clone(),
             vec![
                 int(-1),

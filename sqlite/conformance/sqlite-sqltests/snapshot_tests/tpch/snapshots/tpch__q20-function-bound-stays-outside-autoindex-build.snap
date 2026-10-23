@@ -32,14 +32,14 @@ QUERY PLAN
 
 BYTECODE
 addr  opcode           p1  p2  p3  p4                                     p5  comment
-   0  Init              0  75   0                                          0  Start at 75
+   0  Init              0  77   0                                          0  Start at 77
    1  Null              0   1   0                                          0  r[1]=NULL
    2  Integer           0  50   0                                          0  r[50]=0
    3  Null              0  51   0                                          0  r[51]=NULL
-   4  Gosub            49  71   0                                          0
+   4  Gosub            49  73   0                                          0
    5  OpenRead          0   6   0  k(6,B,B,B,B,B)                          0  table=partsupp, root=6, iDb=0
    6  OpenRead          2  10   0  k(17,B,B,B,B,B,B,B,B,B,B,B,B,B,B,B,B)   0  table=lineitem, root=10, iDb=0
-   7  Rewind            0  59   0                                          0  Rewind table partsupp
+   7  Rewind            0  61   0                                          0  Rewind table partsupp
    8    Integer         0  53   0                                          0  r[53]=0
    9    Once           19   0   0                                          0  goto 19
   10    OpenAutoindex   1   0   0                                          0  cursor=1
@@ -52,61 +52,63 @@ addr  opcode           p1  p2  p3  p4                                     p5  co
   17      IdxInsert     1  59  54                                          0  key=r[59]
   18    Next            2  12   0                                          0
   19    ColumnRange     0   0  60  2                                       0  r[60..61]=partsupp.PS_PARTKEY..PS_SUPPKEY
-  20    String8         0  63   0  "1994-01-01"                            0  r[63]='"1994-01-01"'
-  21    String8         0  64   0  $                                       0  r[64]='$'
-  22    Function        0  63  62  json_extract                            0  r[62]=func(r[63..64])
-  23    IsNull         62  55   0                                          0  if (r[62]==NULL) goto 55
-  24    Affinity       60   3   0                                          0  r[60..63] = C, C, C
-  25    SeekGE          1  55  60                                          0  key=[60..62]
-  26    String8         0  62   0  1995-01-01                              0  r[62]='1995-01-01'
-  27    Affinity       60   3   0                                          0  r[60..63] = C, C, C
-  28      IdxGE         1  55  60                                          0  key=[60..62]
-  29      Integer       1  53   0                                          0  r[53]=1
-  30      RowId         0  52   0                                          0  r[52]=partsupp.rowid
-  31      ColumnRange   0   1   3  2                                       0  r[3..4]=partsupp.PS_SUPPKEY..PS_AVAILQTY
-  32      RowId         0  12   0                                          0  r[12]=partsupp.rowid
-  33      Column        1   3  18                                          0  r[18]=ephemeral(ephemeral_lineitem_s1).L_QUANTITY
-  34      IdxRowId      1  46   0                                          0  r[46]=cursor 1.rowid
-  35      Compare      51  52   1  k(1, Binary)                            0  r[51..51]==r[52..52]
-  36      Jump         37  40  37                                          0
-  37      Gosub        48  61   0                                          0
-  38      Move         52  51   1                                          0  r[51..51]=r[52..52]
-  39      Gosub        49  71   0                                          0
-  40      Copy         46  66   0                                          0  r[66]=r[46]
-  41      Integer       1  65   0                                          0  r[65]=1
-  42      NotNull      66  44   0                                          0  r[66]!=NULL -> goto 44
-  43      Integer       0  65   0                                          0  r[65]=0
-  44      IfNot        65  47   1                                          0  if !r[65] goto 47
-  45      Copy         18  67   0                                          0  r[67]=r[18]
-  46      AggStep       0  67   1  sum                                     0  accum=r[1] step(r[67])
-  47      If           50  53   0                                          0  if r[50] goto 53
-  48      Copy          3   8   0                                          0  r[8]=r[3]
-  49      Copy          4   9   0                                          0  r[9]=r[4]
-  50      Copy         12  13   0                                          0  r[13]=r[12]
-  51      Copy         18  34   0                                          0  r[34]=r[18]
-  52      Copy         46  47   0                                          0  r[47]=r[46]
-  53      Integer       1  50   0                                          0  r[50]=1
-  54    Next            1  28   0                                          0
-  55    IfPos          53  58   0                                          0  r[53]>0 -> r[53]-=0, goto 58
-  56    NullRow         1   0   0                                          0  Set cursor 1 to a (pseudo) NULL row
-  57    Goto            0  29   0                                          0
-  58  Next              0   8   0                                          1
-  59  Gosub            48  61   0                                          0
-  60  Goto              0  74   0                                          0
-  61  IfPos            50  63   0                                          0  r[50]>0 -> r[50]-=0, goto 63
-  62  Return           48   0   0                                          0
-  63  AggFinal          0   1   0  sum                                     0  accum=r[1]
-  64  Copy              9  68   0                                          0  r[68]=r[9]
-  65  Copy              1  71   0                                          0  r[71]=r[1]
-  66  Multiply         70  71  69                                          0  r[69]=r[70]*r[71]
-  67  Le               68  69  62  Binary                                  0  if r[68]<=r[69] goto 62
-  68  Copy              8  72   0                                          0  r[72]=r[8]
-  69  ResultRow        72   1   0                                          0  output=r[72]
-  70  Return           48   0   0                                          0
-  71  Null              0   1   0                                          0  r[1]=NULL
-  72  Integer           0  50   0                                          0  r[50]=0
-  73  Return           49   0   0                                          0
-  74  Halt              0   0   0                                          0
-  75  Transaction       0   1   8                                          0  iDb=0 tx_mode=Read
-  76  Real              0  70   0  0.5                                     0  r[70]=0.5
-  77  Goto              0   1   0                                          0
+  20    Once           24   0   0                                          0  goto 24
+  21    String8         0  64   0  "1994-01-01"                            0  r[64]='"1994-01-01"'
+  22    String8         0  65   0  $                                       0  r[65]='$'
+  23    Function        0  64  63  json_extract                            0  r[63]=func(r[64..65])
+  24    Copy           63  62   0                                          0  r[62]=r[63]
+  25    IsNull         62  57   0                                          0  if (r[62]==NULL) goto 57
+  26    Affinity       60   3   0                                          0  r[60..63] = C, C, C
+  27    SeekGE          1  57  60                                          0  key=[60..62]
+  28    String8         0  62   0  1995-01-01                              0  r[62]='1995-01-01'
+  29    Affinity       60   3   0                                          0  r[60..63] = C, C, C
+  30      IdxGE         1  57  60                                          0  key=[60..62]
+  31      Integer       1  53   0                                          0  r[53]=1
+  32      RowId         0  52   0                                          0  r[52]=partsupp.rowid
+  33      ColumnRange   0   1   3  2                                       0  r[3..4]=partsupp.PS_SUPPKEY..PS_AVAILQTY
+  34      RowId         0  12   0                                          0  r[12]=partsupp.rowid
+  35      Column        1   3  18                                          0  r[18]=ephemeral(ephemeral_lineitem_s1).L_QUANTITY
+  36      IdxRowId      1  46   0                                          0  r[46]=cursor 1.rowid
+  37      Compare      51  52   1  k(1, Binary)                            0  r[51..51]==r[52..52]
+  38      Jump         39  42  39                                          0
+  39      Gosub        48  63   0                                          0
+  40      Move         52  51   1                                          0  r[51..51]=r[52..52]
+  41      Gosub        49  73   0                                          0
+  42      Copy         46  67   0                                          0  r[67]=r[46]
+  43      Integer       1  66   0                                          0  r[66]=1
+  44      NotNull      67  46   0                                          0  r[67]!=NULL -> goto 46
+  45      Integer       0  66   0                                          0  r[66]=0
+  46      IfNot        66  49   1                                          0  if !r[66] goto 49
+  47      Copy         18  68   0                                          0  r[68]=r[18]
+  48      AggStep       0  68   1  sum                                     0  accum=r[1] step(r[68])
+  49      If           50  55   0                                          0  if r[50] goto 55
+  50      Copy          3   8   0                                          0  r[8]=r[3]
+  51      Copy          4   9   0                                          0  r[9]=r[4]
+  52      Copy         12  13   0                                          0  r[13]=r[12]
+  53      Copy         18  34   0                                          0  r[34]=r[18]
+  54      Copy         46  47   0                                          0  r[47]=r[46]
+  55      Integer       1  50   0                                          0  r[50]=1
+  56    Next            1  30   0                                          0
+  57    IfPos          53  60   0                                          0  r[53]>0 -> r[53]-=0, goto 60
+  58    NullRow         1   0   0                                          0  Set cursor 1 to a (pseudo) NULL row
+  59    Goto            0  31   0                                          0
+  60  Next              0   8   0                                          1
+  61  Gosub            48  63   0                                          0
+  62  Goto              0  76   0                                          0
+  63  IfPos            50  65   0                                          0  r[50]>0 -> r[50]-=0, goto 65
+  64  Return           48   0   0                                          0
+  65  AggFinal          0   1   0  sum                                     0  accum=r[1]
+  66  Copy              9  69   0                                          0  r[69]=r[9]
+  67  Copy              1  72   0                                          0  r[72]=r[1]
+  68  Multiply         71  72  70                                          0  r[70]=r[71]*r[72]
+  69  Le               69  70  64  Binary                                  0  if r[69]<=r[70] goto 64
+  70  Copy              8  73   0                                          0  r[73]=r[8]
+  71  ResultRow        73   1   0                                          0  output=r[73]
+  72  Return           48   0   0                                          0
+  73  Null              0   1   0                                          0  r[1]=NULL
+  74  Integer           0  50   0                                          0  r[50]=0
+  75  Return           49   0   0                                          0
+  76  Halt              0   0   0                                          0
+  77  Transaction       0   1   8                                          0  iDb=0 tx_mode=Read
+  78  Real              0  71   0  0.5                                     0  r[71]=0.5
+  79  Goto              0   1   0                                          0

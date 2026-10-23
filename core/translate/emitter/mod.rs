@@ -624,15 +624,13 @@ fn emit_cdc_commit_row(
     Ok(())
 }
 
-/// Emit the CDC COMMIT record at the end of a statement, once, when in autocommit mode (v2 only).
-/// Only the root statement writes it; a trigger or FK action subprogram never does.
-/// `cdc_cursor_id` is None when the statement's own table is not captured (a
-/// TEMP table): the record is then written only when a trigger or FK action
-/// that ran during the statement captured a row.
+/// Emit the CDC COMMIT record at the end of a schema statement, once, when in autocommit
+/// mode (v2 only). Only the root statement writes it; a trigger or FK action subprogram
+/// never does.
 pub fn emit_cdc_autocommit_commit(
     program: &mut ProgramBuilder,
     catalog: &SemanticContext<'_>,
-    cdc_cursor_id: Option<usize>,
+    cdc_cursor_id: usize,
 ) -> Result<()> {
     if program.flags.is_subprogram() {
         return Ok(());
@@ -641,21 +639,27 @@ pub fn emit_cdc_autocommit_commit(
     if !cdc_info.is_some_and(|info| info.cdc_version().has_commit_record()) {
         return Ok(());
     }
-    if cdc_cursor_id.is_none() && !program.has_emitted_program_call() {
-        return Ok(());
-    }
     with_cdc_change_ids(program, catalog, |program, change_ids| {
-        emit_cdc_statement_commit(program, Some(catalog), change_ids, cdc_cursor_id)
+        emit_cdc_statement_commit(program, change_ids, CdcCommitCursor::Open(cdc_cursor_id))
     })
 }
 
+/// The CDC table cursor a statement's COMMIT record is written through.
+pub(crate) enum CdcCommitCursor {
+    /// The cursor the statement captured its own rows through.
+    Open(usize),
+    /// The statement's own table is not captured (a TEMP table). The CDC
+    /// table is opened, and the record written, only when a trigger or FK
+    /// action that ran during the statement captured a row.
+    OpenWhenCaptured(Arc<BTreeTable>),
+}
+
 /// At the end of a statement in autocommit mode, write a CDC COMMIT record
-/// (v2 only). See [emit_cdc_autocommit_commit] for `cdc_cursor_id`.
+/// (v2 only).
 pub(crate) fn emit_cdc_statement_commit(
     program: &mut ProgramBuilder,
-    catalog: Option<&SemanticContext<'_>>,
     change_ids: &CdcChangeIds<'_>,
-    cdc_cursor_id: Option<usize>,
+    cursor: CdcCommitCursor,
 ) -> Result<()> {
     // Check if we're in autocommit mode; if so, emit a COMMIT record.
     let is_autocommit_fn_ctx = crate::function::FuncCtx {
@@ -678,11 +682,9 @@ pub(crate) fn emit_cdc_statement_commit(
         jump_if_null: true,
     });
 
-    let cdc_cursor_id = match cdc_cursor_id {
-        Some(cdc_cursor_id) => cdc_cursor_id,
-        None => {
-            // A trigger or FK action fired during this statement may have captured a row
-            // elsewhere. Only write the COMMIT record when something was actually captured:
+    let cdc_cursor_id = match cursor {
+        CdcCommitCursor::Open(cdc_cursor_id) => cdc_cursor_id,
+        CdcCommitCursor::OpenWhenCaptured(cdc_table) => {
             // `conn_txn_id(-1)` is -1 until a row is captured.
             let minus_one_reg = program.alloc_register();
             program.emit_int(-1, minus_one_reg);
@@ -703,16 +705,12 @@ pub(crate) fn emit_cdc_statement_commit(
                 flags: crate::vdbe::insn::CmpInsFlags::default(),
                 collation: None,
             });
-            let Some(catalog) = catalog else {
-                return Err(crate::LimboError::InternalError(
-                    "CDC commit without a cursor needs the catalog".to_string(),
-                ));
-            };
-            let (cursor_id, _) = catalog
-                .with_schema(crate::MAIN_DB_ID, |schema| {
-                    prepare_cdc_if_necessary(program, schema, crate::MAIN_DB_ID, None)
-                })?
-                .expect("CDC is active, so prepare_cdc_if_necessary must return a cursor");
+            let cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(cdc_table.clone()));
+            program.emit_insn(Insn::OpenWrite {
+                cursor_id,
+                root_page: cdc_table.root_page.into(),
+                db: crate::MAIN_DB_ID,
+            });
             cursor_id
         }
     };

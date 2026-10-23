@@ -63,7 +63,6 @@ pub(super) fn check(plan: &HirPlan, insert: &hir::Insert, program: &ProgramBuild
     if !table.has_rowid {
         without_rowid_errors(program, insert, source)?;
     }
-    super::dml::check_strict_types(&table, source)?;
     Ok(())
 }
 
@@ -1117,6 +1116,20 @@ impl InsertRow<'_> {
             flag,
             table_name: table.name.clone(),
         });
+        // The change is captured as soon as the row is written, before an
+        // AFTER trigger it fires captures rows of its own: a consumer
+        // replays the rows in change id order.
+        if let Some(capture) = self.target.capture_rows() {
+            let after = capture.after_record(program, table, self.columns, self.rowid);
+            capture.emit_row(
+                program,
+                OperationMode::INSERT,
+                self.rowid,
+                None,
+                after,
+                None,
+            )?;
+        }
         // RAISE(IGNORE) in an AFTER trigger only ends that trigger's body.
         let after_triggers = program.allocate_label();
         for trigger in self
@@ -1141,18 +1154,6 @@ impl InsertRow<'_> {
             self.target.database,
             self.may_replace(),
         )?;
-        // The change is captured after the AFTER triggers ran.
-        if let Some(capture) = &self.target.capture {
-            let after = capture.after_record(program, table, self.columns, self.rowid);
-            capture.emit_row(
-                program,
-                OperationMode::INSERT,
-                self.rowid,
-                None,
-                after,
-                None,
-            )?;
-        }
         if let Some(returning) = returning {
             let start = returning.emit_values(program, document, self.target.resolved_table()?)?;
             returning.emit_buffer(program, start);
@@ -1524,10 +1525,10 @@ impl InsertRow<'_> {
             .collect::<Result<Vec<_>>>()?;
         // The row before the change, for change data capture, read before
         // anything is written.
-        let capture_before =
-            self.target.capture.as_ref().and_then(|capture| {
-                capture.before_record(program, table, self.table_cursor, conflict)
-            });
+        let capture_before = self
+            .target
+            .capture_rows()
+            .and_then(|capture| capture.before_record(program, table, self.table_cursor, conflict));
 
         // Every UNIQUE constraint is checked against the new row before
         // any index changes.
@@ -1711,7 +1712,7 @@ impl InsertRow<'_> {
                 start_reg: start,
                 num_regs: count,
                 cursor_id: rebuild.cursor,
-                raise_error_if_no_matching_entry: false,
+                raise_error_if_no_matching_entry: true,
             });
             if let Some(skip) = skip_delete {
                 program.preassign_label_to_next_insn(skip);
@@ -1760,28 +1761,10 @@ impl InsertRow<'_> {
             flag,
             table_name: table.name.clone(),
         });
-        super::fkey::emit_update_repairs(program, &pending_repairs, database)?;
-        if let (Some(sequence), Some(_)) = (self.sequence, new_rowid) {
-            sequence.emit_moved_row(program, written)?;
-        }
-        // Like UPDATE, the actions run once the row is written, for a parent
-        // key that changed.
-        for (action, old_key) in actions.iter().zip(action_keys) {
-            let new_key =
-                super::fkey::emit_parent_key(program, document, action.foreign_key, new_source.id)?;
-            let unchanged = program.allocate_label();
-            super::fkey::emit_skip_if_same_key(
-                program,
-                old_key,
-                new_key,
-                action.foreign_key.parent_positions.len(),
-                unchanged,
-            );
-            action.emit_fire(program, old_key, Some(new_key))?;
-            program.preassign_label_to_next_insn(unchanged);
-        }
-        // A moved row is captured as deleted and inserted.
-        if let Some(capture) = &self.target.capture {
+        // Like UPDATE, the change is captured as soon as the row is written,
+        // before a foreign-key action or an AFTER trigger it fires captures
+        // rows of its own. A moved row is captured as deleted and inserted.
+        if let Some(capture) = self.target.capture_rows() {
             let after = capture.after_record(program, table, new_row, written);
             match new_rowid {
                 Some(_) => {
@@ -1804,6 +1787,26 @@ impl InsertRow<'_> {
                     None,
                 )?,
             }
+        }
+        super::fkey::emit_update_repairs(program, &pending_repairs, database)?;
+        if let (Some(sequence), Some(_)) = (self.sequence, new_rowid) {
+            sequence.emit_moved_row(program, written)?;
+        }
+        // Like UPDATE, the actions run once the row is written, for a parent
+        // key that changed.
+        for (action, old_key) in actions.iter().zip(action_keys) {
+            let new_key =
+                super::fkey::emit_parent_key(program, document, action.foreign_key, new_source.id)?;
+            let unchanged = program.allocate_label();
+            super::fkey::emit_skip_if_same_key(
+                program,
+                old_key,
+                new_key,
+                action.foreign_key.parent_positions.len(),
+                unchanged,
+            );
+            action.emit_fire(program, old_key, Some(new_key))?;
+            program.preassign_label_to_next_insn(unchanged);
         }
         // RETURNING reads the row as written.
         program.bind_source(

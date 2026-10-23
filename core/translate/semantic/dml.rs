@@ -75,8 +75,8 @@ impl<'ast> Analyzer<'_, '_, 'ast> {
     }
 
     /// The table change data capture writes the target's row changes to.
-    /// Changes to the capture table itself and to its version table are not
-    /// captured.
+    /// Changes to TEMP tables, to the capture table itself and to its
+    /// version table are not captured.
     pub(super) fn analyze_capture_changes(
         &mut self,
         target: &hir::ResolvedTable,
@@ -85,9 +85,9 @@ impl<'ast> Analyzer<'_, '_, 'ast> {
             return Ok(None);
         };
         let target_name = target.value().get_name();
-        if target_name == name || target_name == crate::cdc::TURSO_CDC_VERSION_TABLE_NAME {
-            return Ok(None);
-        }
+        let target_rows = target.database() != Some(hir::DatabaseId::new(crate::TEMP_DB_ID))
+            && target_name != name
+            && target_name != crate::cdc::TURSO_CDC_VERSION_TABLE_NAME;
         let database = hir::DatabaseId::new(crate::MAIN_DB_ID);
         let table = self
             .context()
@@ -102,7 +102,11 @@ impl<'ast> Analyzer<'_, '_, 'ast> {
         let change_ids = self
             .analyze_autoincrement(&table)?
             .and_then(|autoincrement| autoincrement.mvcc_sequence);
-        Ok(Some(hir::CaptureChanges { table, change_ids }))
+        Ok(Some(hir::CaptureChanges {
+            table,
+            change_ids,
+            target_rows,
+        }))
     }
 
     /// The foreign keys a write to `target` checks. For an UPDATE,

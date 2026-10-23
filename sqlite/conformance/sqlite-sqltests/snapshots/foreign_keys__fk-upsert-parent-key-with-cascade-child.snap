@@ -57,7 +57,7 @@ addr  opcode           p1  p2  p3  p4         p5  comment
   39    Halt         1555   0   0  parent.k    0
   40    Column          0   1  18              0  r[18]=parent.k
   41    RowId           0  19   0              0  r[19]=parent.rowid
-  42    IdxDelete       1  18   2              0
+  42    IdxDelete       1  18   2              1
   43    IdxInsert       1  16  14              2  key=r[16]
   44    MakeRecord     10   3  20              0  r[20]=mkrec(r[10..12])
   45    Insert          0  20   5  parent      8  intkey=r[5] data=r[20]

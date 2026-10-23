@@ -68,12 +68,11 @@ pub(super) fn check(plan: &HirPlan, update: &hir::Update, access: &HirAccessPlan
             "HIR UPDATE target is not a table".into(),
         ));
     };
-    let Some(table) = table.value().btree() else {
+    if table.value().btree().is_none() {
         return Err(LimboError::InternalError(
             "HIR UPDATE target has no B-tree".into(),
         ));
-    };
-    super::dml::check_strict_types(&table, source)?;
+    }
     if update.from.is_some() {
         // UPDATE ... FROM fills a scratch table during the join, so no loop
         // reads a table it changes. RETURNING reads only the updated row.
@@ -246,7 +245,11 @@ pub(super) fn emit_update(
     }
 
     // Whether the statement needs a statement journal. A table with any
-    // foreign key counts, even one this UPDATE leaves alone.
+    // foreign key counts, even one this UPDATE leaves alone. The UPDATE of
+    // the schema table that ALTER TABLE generates is one part of a DDL
+    // program that goes on after it, writes the header and stops early
+    // when another transaction holds the schema; that program keeps its
+    // journal, so an abandoned one rolls back only itself.
     let has_foreign_keys = foreign_keys.table_has_foreign_keys;
     let replaces = any_effective_replace(
         has_statement_conflict,
@@ -256,7 +259,8 @@ pub(super) fn emit_update(
             .iter()
             .map(|(old, _)| old.index.value().on_conflict),
     );
-    if triggers.is_empty()
+    if schema_change.is_none()
+        && triggers.is_empty()
         && !has_foreign_keys
         && !replaces
         && single_loop.is_some_and(|(_, operation)| operation.is_some_and(touches_at_most_one_row))
@@ -281,7 +285,8 @@ pub(super) fn emit_update(
             .iter()
             .any(|(old, _)| old.index.value().unique);
     program.set_may_abort(
-        !triggers.is_empty()
+        schema_change.is_some()
+            || !triggers.is_empty()
             || has_foreign_keys
             || constraint_may_abort(
                 has_statement_conflict,
@@ -1427,9 +1432,8 @@ impl UpdateRow<'_, '_> {
         // a flag per column, then the new value of each changed one.
         let updates = self
             .target
-            .capture
-            .as_ref()
-            .filter(|_| super::cdc::Capture::records_updates(program))
+            .capture_rows()
+            .filter(|_| super::cdc::Rows::records_updates(program))
             .map(|_| program.alloc_registers(2 * columns));
         // A BEFORE trigger runs before NOT NULL is checked.
         self.emit_new_values(program, layout, !has_before, updates)?;
@@ -1603,7 +1607,7 @@ impl UpdateRow<'_, '_> {
             })
             .collect::<Result<Vec<_>>>()?;
         // The row before the change, for change data capture.
-        let capture_before = self.target.capture.as_ref().and_then(|capture| {
+        let capture_before = self.target.capture_rows().and_then(|capture| {
             capture.before_record(program, table, self.table_cursor, self.rowid)
         });
         for ((old, _), (cursor, key)) in layout
@@ -1679,42 +1683,11 @@ impl UpdateRow<'_, '_> {
             flag,
             table_name: table.name.clone(),
         });
-        super::fkey::emit_update_repairs(program, &pending_repairs, self.target.database)?;
-        if let (Some(sequence), Some(_)) = (layout.sequence, self.new_rowid) {
-            sequence.emit_moved_row(program, self.written_rowid())?;
-        }
-        // Like SQLite, the actions run once the row is written,
-        // for a parent key that changed, before RETURNING reads the row.
-        for (action, old_key) in layout.actions.iter().zip(action_keys) {
-            let new_key = super::fkey::emit_parent_key(
-                program,
-                document,
-                action.foreign_key,
-                layout.new_source,
-            )?;
-            let unchanged = program.allocate_label();
-            super::fkey::emit_skip_if_same_key(
-                program,
-                old_key,
-                new_key,
-                action.foreign_key.parent_positions.len(),
-                unchanged,
-            );
-            action.emit_fire(program, old_key, Some(new_key))?;
-            program.preassign_label_to_next_insn(unchanged);
-        }
-        if !layout.actions.is_empty() {
-            // An action may have written this table and moved the cursor.
-            let back = program.allocate_label();
-            program.emit_insn(Insn::SeekRowid {
-                cursor_id: self.table_cursor,
-                src_reg: self.written_rowid(),
-                target_pc: back,
-            });
-            program.preassign_label_to_next_insn(back);
-        }
-        // A moved row is captured as deleted and inserted.
-        if let Some(capture) = &self.target.capture {
+        // The change is captured as soon as the row is written, before a
+        // foreign-key action or an AFTER trigger it fires captures rows of
+        // its own: a consumer replays the rows in change id order. A moved
+        // row is captured as deleted and inserted.
+        if let Some(capture) = self.target.capture_rows() {
             let after = capture.after_record(program, table, self.start(), self.written_rowid());
             if self.new_rowid.is_some() {
                 capture.emit_row(
@@ -1754,6 +1727,40 @@ impl UpdateRow<'_, '_> {
                     updates,
                 )?;
             }
+        }
+        super::fkey::emit_update_repairs(program, &pending_repairs, self.target.database)?;
+        if let (Some(sequence), Some(_)) = (layout.sequence, self.new_rowid) {
+            sequence.emit_moved_row(program, self.written_rowid())?;
+        }
+        // Like SQLite, the actions run once the row is written,
+        // for a parent key that changed, before RETURNING reads the row.
+        for (action, old_key) in layout.actions.iter().zip(action_keys) {
+            let new_key = super::fkey::emit_parent_key(
+                program,
+                document,
+                action.foreign_key,
+                layout.new_source,
+            )?;
+            let unchanged = program.allocate_label();
+            super::fkey::emit_skip_if_same_key(
+                program,
+                old_key,
+                new_key,
+                action.foreign_key.parent_positions.len(),
+                unchanged,
+            );
+            action.emit_fire(program, old_key, Some(new_key))?;
+            program.preassign_label_to_next_insn(unchanged);
+        }
+        if !layout.actions.is_empty() {
+            // An action may have written this table and moved the cursor.
+            let back = program.allocate_label();
+            program.emit_insn(Insn::SeekRowid {
+                cursor_id: self.table_cursor,
+                src_reg: self.written_rowid(),
+                target_pc: back,
+            });
+            program.preassign_label_to_next_insn(back);
         }
         if let Some(returning) = layout.returning {
             let start = returning.emit_values(program, document, self.target.resolved_table()?)?;

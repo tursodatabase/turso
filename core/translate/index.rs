@@ -1251,7 +1251,7 @@ pub fn translate_drop_index(
 
     program.preassign_label_to_next_insn(loop_end_label);
     if let Some((cdc_cursor_id, _)) = cdc_table {
-        emit_cdc_autocommit_commit(program, catalog, Some(cdc_cursor_id))?;
+        emit_cdc_autocommit_commit(program, catalog, cdc_cursor_id)?;
     }
 
     let current_schema_version = catalog.with_schema(database_id, |s| s.schema_version);

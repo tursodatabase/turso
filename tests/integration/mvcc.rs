@@ -2048,3 +2048,54 @@ fn test_savepoint_rollback_after_ddl_upgrade_keeps_exclusivity(
     );
     Ok(())
 }
+
+/// Run `sql` the way the bindings do: step until it is done, and drop the
+/// statement where it is when the database is busy.
+fn step_until_done_or_busy(
+    conn: &Arc<turso_core::Connection>,
+    sql: &str,
+) -> turso_core::Result<bool> {
+    let mut stmt = conn.prepare(sql)?;
+    loop {
+        match stmt.step()? {
+            turso_core::StepResult::Done => return Ok(true),
+            turso_core::StepResult::Busy => return Ok(false),
+            turso_core::StepResult::Row => {}
+            turso_core::StepResult::Interrupt => panic!("{sql} was interrupted"),
+            turso_core::StepResult::IO
+            | turso_core::StepResult::Yield
+            | turso_core::StepResult::Sleep { .. } => stmt._io().step()?,
+        }
+    }
+}
+
+/// An ALTER TABLE in a BEGIN CONCURRENT transaction is busy while another
+/// transaction holds the schema. The statement the caller then drops keeps
+/// a statement journal, like main's, so only the ALTER is rolled back and
+/// the transaction still commits.
+#[test]
+fn test_mvcc_busy_alter_table_dropped_does_not_poison_the_transaction() {
+    let db = TempDatabase::builder().with_mvcc(true).build();
+    let holder = db.connect_limbo();
+    let conn = db.connect_limbo();
+    holder
+        .execute("CREATE TABLE t(id INTEGER PRIMARY KEY, a TEXT)")
+        .unwrap();
+    conn.execute("BEGIN CONCURRENT").unwrap();
+    conn.execute("INSERT INTO t VALUES (1, 'x')").unwrap();
+    holder.execute("BEGIN CONCURRENT").unwrap();
+    holder.execute("ALTER TABLE t ADD COLUMN b TEXT").unwrap();
+
+    let done = step_until_done_or_busy(&conn, "ALTER TABLE t ADD COLUMN c TEXT").unwrap();
+    assert!(
+        !done,
+        "the ALTER must be busy while another transaction holds the schema"
+    );
+
+    holder.execute("ROLLBACK").unwrap();
+    conn.execute("COMMIT").unwrap();
+    let rows: Vec<(i64, String)> = conn.exec_rows("SELECT id, a FROM t");
+    assert_eq!(rows, vec![(1, "x".to_string())]);
+    let columns: Vec<(String,)> = conn.exec_rows("SELECT name FROM pragma_table_info('t')");
+    assert_eq!(columns, vec![("id".to_string(),), ("a".to_string(),)]);
+}

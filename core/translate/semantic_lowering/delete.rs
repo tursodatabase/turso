@@ -135,7 +135,7 @@ pub(super) fn emit_delete(
         && delete.returning.is_none()
         && triggers.is_empty()
         && actions.is_empty()
-        && capture_changes.is_none()
+        && target.capture_rows().is_none()
         && foreign_keys.incoming.is_empty()
         && foreign_keys.outgoing.is_empty()
         && target
@@ -510,7 +510,7 @@ fn emit_delete_row(
         .map(|(cursor, expressions)| -> Result<_> {
             let (start, count) =
                 emit_index_key(program, document, source, table, table_cursor, expressions)?;
-            Ok((cursor, start, count, expressions))
+            Ok((cursor, start, count))
         })
         .transpose()?;
     // RETURNING reads the row before it is deleted. A subquery in
@@ -570,14 +570,14 @@ fn emit_delete_row(
             start_reg: start,
             num_regs: count,
             cursor_id: *cursor,
-            raise_error_if_no_matching_entry: expressions.index.value().where_clause.is_none(),
+            raise_error_if_no_matching_entry: true,
         });
         if let Some(skip) = skip {
             program.preassign_label_to_next_insn(skip);
         }
     }
     // The captured change reads the row before it is deleted.
-    if let Some(capture) = &target.capture {
+    if let Some(capture) = target.capture_rows() {
         let before = capture.before_record(program, table, table_cursor, row.rowid);
         capture.emit_row(
             program,
@@ -596,12 +596,12 @@ fn emit_delete_row(
     if let (Some(returning), Some(start)) = (returning, returning_row) {
         returning.emit_buffer(program, start);
     }
-    if let Some((cursor, start, count, expressions)) = iteration_key {
+    if let Some((cursor, start, count)) = iteration_key {
         program.emit_insn(Insn::IdxDelete {
             start_reg: start,
             num_regs: count,
             cursor_id: cursor,
-            raise_error_if_no_matching_entry: expressions.index.value().where_clause.is_none(),
+            raise_error_if_no_matching_entry: true,
         });
     }
     if let (Some(returning), Some(start)) = (returning, copy) {

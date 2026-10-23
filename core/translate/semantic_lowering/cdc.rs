@@ -6,13 +6,18 @@
 //! in `full` mode, which columns changed. A statement in autocommit mode
 //! then writes a COMMIT row. Semantic analysis resolves the capture table
 //! and its change-id sequence (`hir::CaptureChanges`).
+//!
+//! A TEMP table's changes are never captured. A statement on one still
+//! writes the COMMIT row when a trigger or foreign-key action it fires
+//! captures rows of another table.
 
 use crate::{
     schema::BTreeTable,
+    sync::Arc,
     translate::{
         emitter::{
             emit_cdc_full_record, emit_cdc_row, emit_cdc_statement_commit, CdcChangeIds,
-            OperationMode,
+            CdcCommitCursor, OperationMode,
         },
         semantic::hir,
     },
@@ -24,17 +29,24 @@ use crate::{
     CaptureDataChangesExt, LimboError, Result,
 };
 
-/// The capture table, open for one statement.
+/// Change data capture for one statement.
 pub(super) struct Capture<'a> {
-    cursor: CursorID,
+    table: Arc<BTreeTable>,
     change_ids: CdcChangeIds<'a>,
+    /// The capture table's cursor, open when the target's own row changes
+    /// are captured.
+    rows: Option<CapturedRows>,
+}
+
+struct CapturedRows {
+    cursor: CursorID,
     /// The name of the table whose changes are captured.
     table_name: String,
 }
 
 impl<'a> Capture<'a> {
-    /// Open the capture table when the statement captures the changes of
-    /// `target`.
+    /// Resolve the capture table when the statement captures changes, and
+    /// open it when the changes of `target` are captured.
     pub(super) fn open(
         program: &mut ProgramBuilder,
         capture: Option<&'a hir::CaptureChanges>,
@@ -49,13 +61,6 @@ impl<'a> Capture<'a> {
             ));
         }
         let table = capture.table.value().require_btree()?;
-        program.begin_write_operation()?;
-        let cursor = program.alloc_cursor_id(CursorType::BTreeTable(table.clone()));
-        program.emit_insn(Insn::OpenWrite {
-            cursor_id: cursor,
-            root_page: RegisterOrLiteral::Literal(table.root_page),
-            db: crate::MAIN_DB_ID,
-        });
         // Under MVCC, change ids come from the capture table's sequence.
         let change_ids = if program.is_mvcc_enabled() {
             let operation = capture.change_ids.as_ref().ok_or_else(|| {
@@ -78,13 +83,71 @@ impl<'a> Capture<'a> {
         } else {
             CdcChangeIds::NewRowid
         };
+        let rows = capture.target_rows.then(|| {
+            program.begin_write_operation()?;
+            let cursor = program.alloc_cursor_id(CursorType::BTreeTable(table.clone()));
+            program.emit_insn(Insn::OpenWrite {
+                cursor_id: cursor,
+                root_page: RegisterOrLiteral::Literal(table.root_page),
+                db: crate::MAIN_DB_ID,
+            });
+            Ok::<_, LimboError>(CapturedRows {
+                cursor,
+                table_name: target.name.clone(),
+            })
+        });
         Ok(Some(Self {
-            cursor,
+            table,
             change_ids,
-            table_name: target.name.clone(),
+            rows: rows.transpose()?,
         }))
     }
 
+    /// The capture table, open for the target's row changes, when they are
+    /// captured.
+    pub(super) fn rows(&self) -> Option<Rows<'_, 'a>> {
+        self.rows.as_ref().map(|rows| Rows {
+            change_ids: &self.change_ids,
+            cursor: rows.cursor,
+            table_name: &rows.table_name,
+        })
+    }
+
+    /// At the end of the statement: in autocommit mode, write the COMMIT
+    /// row. A trigger or foreign-key action leaves that to the statement
+    /// that fired it. A statement whose own rows are not captured writes
+    /// it only when a trigger or foreign-key action it fired captured a
+    /// row.
+    pub(super) fn emit_commit(&self, program: &mut ProgramBuilder) -> Result<()> {
+        if program.flags.is_subprogram() {
+            return Ok(());
+        }
+        let has_commit_record = program
+            .capture_data_changes_info()
+            .as_ref()
+            .is_some_and(|info| info.cdc_version().has_commit_record());
+        if !has_commit_record {
+            return Ok(());
+        }
+        let cursor = match &self.rows {
+            Some(rows) => CdcCommitCursor::Open(rows.cursor),
+            None if program.has_emitted_program_call() => {
+                CdcCommitCursor::OpenWhenCaptured(self.table.clone())
+            }
+            None => return Ok(()),
+        };
+        emit_cdc_statement_commit(program, &self.change_ids, cursor)
+    }
+}
+
+/// The capture table, open for the target's row changes.
+pub(super) struct Rows<'c, 'a> {
+    change_ids: &'c CdcChangeIds<'a>,
+    cursor: CursorID,
+    table_name: &'c str,
+}
+
+impl Rows<'_, '_> {
     /// The before image of the row `table_cursor` is on, when the mode
     /// keeps it.
     pub(super) fn before_record(
@@ -155,31 +218,14 @@ impl<'a> Capture<'a> {
     ) -> Result<()> {
         emit_cdc_row(
             program,
-            &self.change_ids,
+            self.change_ids,
             operation,
             self.cursor,
             rowid,
             before,
             after,
             updates,
-            &self.table_name,
+            self.table_name,
         )
-    }
-
-    /// At the end of the statement: in autocommit mode, write the COMMIT
-    /// row. A trigger or foreign-key action leaves that to the statement
-    /// that fired it.
-    pub(super) fn emit_commit(&self, program: &mut ProgramBuilder) -> Result<()> {
-        if program.flags.is_subprogram() {
-            return Ok(());
-        }
-        let has_commit_record = program
-            .capture_data_changes_info()
-            .as_ref()
-            .is_some_and(|info| info.cdc_version().has_commit_record());
-        if !has_commit_record {
-            return Ok(());
-        }
-        emit_cdc_statement_commit(program, None, &self.change_ids, Some(self.cursor))
     }
 }

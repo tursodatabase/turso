@@ -189,6 +189,12 @@ impl<'a> DmlTarget<'a> {
         Ok(self)
     }
 
+    /// The capture table, open for the target's row changes, when they are
+    /// captured.
+    pub(super) fn capture_rows(&self) -> Option<super::cdc::Rows<'_, 'a>> {
+        self.capture.as_ref().and_then(super::cdc::Capture::rows)
+    }
+
     /// At the end of the statement: the COMMIT row of change data capture.
     pub(super) fn emit_capture_commit(&self, program: &mut ProgramBuilder) -> Result<()> {
         match &self.capture {
@@ -457,13 +463,13 @@ pub(super) fn emit_replace_delete(
             start_reg: start,
             num_regs: count,
             cursor_id: *cursor,
-            raise_error_if_no_matching_entry: expressions.index.value().where_clause.is_none(),
+            raise_error_if_no_matching_entry: true,
         });
         if let Some(skip) = skip {
             program.preassign_label_to_next_insn(skip);
         }
     }
-    if let Some(capture) = &target.capture {
+    if let Some(capture) = target.capture_rows() {
         let before = capture.before_record(program, table, table_cursor, conflict);
         capture.emit_row(
             program,
@@ -863,40 +869,21 @@ pub(super) fn subquery_query(subquery: &hir::SubqueryExpr) -> hir::QueryId {
     }
 }
 
-/// A STRICT table's column types are built in or custom; CREATE TABLE
-/// rejects any other, so one here is a schema this build does not know.
-pub(super) fn check_strict_types(table: &BTreeTable, source: &hir::Source) -> Result<()> {
-    let builtin = |name: &str| {
-        ["ANY", "INTEGER", "INT", "REAL", "BLOB", "TEXT"]
-            .iter()
-            .any(|builtin| name.eq_ignore_ascii_case(builtin))
-    };
-    if !table.is_strict {
-        return Ok(());
-    }
-    for (position, column) in table.columns().iter().enumerate() {
-        if !column.is_array()
-            && custom_chain(source, position).is_none()
-            && !builtin(&column.ty_str)
-        {
-            crate::bail_parse_error!(
-                "unknown datatype for {}.{}: \"{}\"",
-                table.name,
-                column.name.as_deref().unwrap_or(""),
-                column.ty_str
-            );
-        }
-    }
-    Ok(())
-}
-
-/// `table` for a type check of a row held in registers `start + column`
-/// for every column, virtual ones included: the check reads each column
-/// at its logical position, not at its position in the stored record.
-fn type_check_table(table: &BTreeTable) -> BTreeTable {
+/// `table` with its columns changed by `edit`, for a type check of a row
+/// held in registers `start + column` for every column, virtual ones
+/// included: the check reads each column at its logical position, not at
+/// its position in the stored record. The position map is set last because
+/// editing the columns rebuilds it from the stored record's layout.
+fn type_check_table(
+    table: &BTreeTable,
+    mut edit: impl FnMut(usize, &mut crate::schema::Column),
+) -> Arc<BTreeTable> {
     let mut checked = table.clone();
+    for (position, column) in checked.columns_mut().iter_mut().enumerate() {
+        edit(position, column);
+    }
     checked.logical_to_physical_map = (0..table.columns().len()).collect();
-    checked
+    Arc::new(checked)
 }
 
 /// STRICT: check each stored value of the row in `start..` against its
@@ -909,17 +896,16 @@ pub(super) fn emit_strict_type_check(
     table: &Arc<BTreeTable>,
     start: usize,
 ) {
-    let mut checked = type_check_table(table);
-    for column in checked.columns_mut().iter_mut() {
+    let checked = type_check_table(table, |_, column| {
         if column.is_virtual_generated() {
             column.ty_str = "ANY".to_string();
         }
-    }
+    });
     program.emit_insn(Insn::TypeCheck {
         start_reg: start,
         count: table.columns().len(),
         check_generated: true,
-        table_reference: Arc::new(checked),
+        table_reference: checked,
     });
 }
 
@@ -934,17 +920,16 @@ pub(super) fn emit_strict_generated_check(
     if !table.is_strict || !table.has_virtual_columns() {
         return;
     }
-    let mut checked = type_check_table(table);
-    for column in checked.columns_mut().iter_mut() {
+    let checked = type_check_table(table, |_, column| {
         if !column.is_virtual_generated() {
             column.ty_str = "ANY".to_string();
         }
-    }
+    });
     program.emit_insn(Insn::TypeCheck {
         start_reg: start,
         count: table.columns().len(),
         check_generated: true,
-        table_reference: Arc::new(checked),
+        table_reference: checked,
     });
 }
 
@@ -998,24 +983,23 @@ pub(super) fn emit_custom_type_writes(
 ) -> Result<()> {
     let written = |column: usize| only.is_none_or(|only| only.contains(&column));
     let check_table = |input: bool| {
-        let mut checked = type_check_table(table);
-        for (position, column) in checked.columns_mut().iter_mut().enumerate() {
+        type_check_table(table, |position, column| {
             if column.is_virtual_generated() || (input && !written(position)) {
                 column.ty_str = "ANY".to_string();
                 if input {
                     column.override_affinity(crate::vdbe::affinity::Affinity::Blob);
                 }
-                continue;
+                return;
             }
             // An array is given as text or a blob, and is stored as a
             // record blob.
             if column.is_array() {
                 column.ty_str = if input { "ANY" } else { "BLOB" }.to_string();
                 column.override_affinity(crate::vdbe::affinity::Affinity::Blob);
-                continue;
+                return;
             }
             let Some(chain) = custom_chain(source, position) else {
-                continue;
+                return;
             };
             if input {
                 column.ty_str = chain[0].value().value_input_type().to_uppercase();
@@ -1024,8 +1008,7 @@ pub(super) fn emit_custom_type_writes(
                 column.ty_str = base.value().base().to_uppercase();
                 column.override_affinity(crate::vdbe::affinity::Affinity::None);
             }
-        }
-        Arc::new(checked)
+        })
     };
     program.emit_insn(Insn::TypeCheck {
         start_reg: start,
