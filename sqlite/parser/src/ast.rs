@@ -924,15 +924,13 @@ pub enum Operator {
 
 impl Operator {
     /// returns whether order of operations can be ignored
+    ///
+    /// `=` and `!=` are not included: the collation of the left operand wins,
+    /// so `a = b` and `b = a` can compare differently.
     pub const fn is_commutative(&self) -> bool {
         matches!(
             self,
-            Operator::Add
-                | Operator::Multiply
-                | Operator::BitwiseAnd
-                | Operator::BitwiseOr
-                | Operator::Equals
-                | Operator::NotEquals
+            Operator::Add | Operator::Multiply | Operator::BitwiseAnd | Operator::BitwiseOr
         )
     }
 
