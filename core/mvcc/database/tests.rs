@@ -10414,6 +10414,7 @@ fn test_checkpoint_index_writer_overwrites_existing_interior_key() {
         where_clause: None,
         index_method: None,
         on_conflict: None,
+        constraint_name: None,
     };
 
     pager.begin_read_tx().unwrap();

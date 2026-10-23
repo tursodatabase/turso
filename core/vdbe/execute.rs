@@ -47,7 +47,7 @@ use crate::vdbe::affinity::{
 use crate::vdbe::hash_table::{
     HashEntry, HashInsertResult, HashTable, HashTableConfig, PendingHashInsert, DEFAULT_MEM_BUDGET,
 };
-use crate::vdbe::insn::{AlterColumnData, InsertFlags};
+use crate::vdbe::insn::{AlterColumnData, ConstraintInfo, InsertFlags};
 use crate::vdbe::metrics::HashJoinMetrics;
 use crate::vdbe::vacuum::VacuumInPlaceOpContext;
 use crate::vdbe::value::ComparisonOp;
@@ -569,7 +569,7 @@ fn integer_operands(state: &ProgramState, lhs: usize, rhs: usize) -> Option<(i64
 }
 
 pub fn op_divide(
-    _program: &Program,
+    program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
     _pager: &Arc<Pager>,
@@ -582,6 +582,7 @@ pub fn op_divide(
         state.pc += 1;
         return Ok(InsnFunctionStepResult::Step);
     }
+    check_divisor(program, state, *lhs, *rhs)?;
     op_arithmetic_slow(state, *lhs, *rhs, *dest, Value::exec_divide)
 }
 
@@ -608,7 +609,7 @@ pub fn op_drop_index(
 }
 
 pub fn op_remainder(
-    _program: &Program,
+    program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
     _pager: &Arc<Pager>,
@@ -621,7 +622,33 @@ pub fn op_remainder(
         state.pc += 1;
         return Ok(InsnFunctionStepResult::Step);
     }
+    check_divisor(program, state, *lhs, *rhs)?;
     op_arithmetic_slow(state, *lhs, *rhs, *dest, Value::exec_remainder)
+}
+
+fn check_divisor(
+    program: &Program,
+    state: &ProgramState,
+    lhs: usize,
+    rhs: usize,
+) -> Result<(), Box<LimboError>> {
+    if !program.connection.dialect().errors_on_zero_divisor() {
+        return Ok(());
+    }
+    if matches!(state.registers[lhs].get_value(), Value::Null) {
+        return Ok(());
+    }
+    let rhs_val = state.registers[rhs].get_value();
+    if let Value::Text(t) = rhs_val {
+        match Numeric::from_value_strict(rhs_val) {
+            None => return Err(LimboError::InvalidTextRepresentation(t.as_str().to_owned()).into()),
+            Some(n) if !n.to_bool() => return Err(LimboError::DivisionByZero.into()),
+            _ => {}
+        }
+    } else if Numeric::from_value(rhs_val).is_some_and(|n| !n.to_bool()) {
+        return Err(LimboError::DivisionByZero.into());
+    }
+    Ok(())
 }
 
 pub fn op_bit_and(
@@ -3579,7 +3606,7 @@ pub fn op_blob_read(
         Ok(IOResult::Done(())) => {}
         Ok(IOResult::IO(io)) => return Ok(state.suspend_on_io(io)),
         Err(err) if matches!(*err, LimboError::BlobHandleExpired) => {
-            return Ok(blob_expired_ack(state, *dest))
+            return Ok(blob_expired_ack(state, *dest));
         }
         Err(err) => return Err(err),
     }
@@ -3648,7 +3675,7 @@ pub fn op_blob_write(
         Ok(IOResult::Done(())) => {}
         Ok(IOResult::IO(io)) => return Ok(state.suspend_on_io(io)),
         Err(err) if matches!(*err, LimboError::BlobHandleExpired) => {
-            return Ok(blob_expired_ack(state, *dest))
+            return Ok(blob_expired_ack(state, *dest));
         }
         Err(err) => return Err(err),
     }
@@ -3793,6 +3820,7 @@ pub fn halt(
     err_code: usize,
     description: &str,
     on_error: Option<ResolveType>,
+    constraint_info: Option<&ConstraintInfo>,
 ) -> InsnResult {
     state.halt_in_progress = true;
     let mv_store = state.mv_store(&program.connection).cloned();
@@ -3833,25 +3861,19 @@ pub fn halt(
         return Err(LimboError::RaiseIgnore.into());
     }
 
-    // Determine the constraint error (if any) based on error code
     let constraint_error = match err_code {
         0 => None,
-        SQLITE_CONSTRAINT_PRIMARYKEY => Some(LimboError::Constraint(format!(
-            "UNIQUE constraint failed: {description}"
-        ))),
-        SQLITE_CONSTRAINT_CHECK => Some(LimboError::Constraint(format!(
-            "CHECK constraint failed: {description}"
-        ))),
-        SQLITE_CONSTRAINT_NOTNULL => Some(LimboError::Constraint(format!(
-            "NOT NULL constraint failed: {description}"
-        ))),
-        SQLITE_CONSTRAINT_UNIQUE => Some(LimboError::Constraint(format!(
-            "UNIQUE constraint failed: {description}"
-        ))),
-        SQLITE_CONSTRAINT_FOREIGNKEY => {
-            Some(LimboError::ForeignKeyConstraint(description.to_string()))
-        }
-        SQLITE_CONSTRAINT_TRIGGER => Some(LimboError::Constraint(description.to_string())),
+        SQLITE_CONSTRAINT_PRIMARYKEY
+        | SQLITE_CONSTRAINT_UNIQUE
+        | SQLITE_CONSTRAINT_CHECK
+        | SQLITE_CONSTRAINT_NOTNULL
+        | SQLITE_CONSTRAINT_FOREIGNKEY
+        | SQLITE_CONSTRAINT_TRIGGER => Some(build_constraint_violation_error(
+            state,
+            constraint_info,
+            err_code,
+            description,
+        )),
         SQLITE_FULL => Some(LimboError::DatabaseFull),
         // SQLITE_ERROR is a generic error (e.g. ALTER TABLE validation), not a constraint.
         // SqlError displays bare like sqlite3_errmsg and abort() doesn't apply
@@ -3878,10 +3900,7 @@ pub fn halt(
             if program.connection.foreign_keys_enabled()
                 && state.get_fk_immediate_violations_during_stmt() > 0
             {
-                return Err(LimboError::ForeignKeyConstraint(
-                    "FOREIGN KEY constraint failed".to_string(),
-                )
-                .into());
+                return Err(state.immediate_foreign_key_error().into());
             }
 
             // Maintain materialized views with the kept rows and stage every
@@ -3928,9 +3947,7 @@ pub fn halt(
     if program.connection.foreign_keys_enabled()
         && state.get_fk_immediate_violations_during_stmt() > 0
     {
-        return Err(
-            LimboError::ForeignKeyConstraint("FOREIGN KEY constraint failed".to_string()).into(),
-        );
+        return Err(state.immediate_foreign_key_error().into());
     }
 
     if program.is_trigger_subprogram() {
@@ -4067,6 +4084,51 @@ pub fn halt(
         }
         Ok(InsnFunctionStepResult::Done)
     }
+}
+
+fn build_constraint_violation_error(
+    state: &ProgramState,
+    info: Option<&ConstraintInfo>,
+    err_code: usize,
+    description: &str,
+) -> LimboError {
+    use crate::{ConstraintKind, ConstraintViolation};
+    let (kind, message) = match err_code {
+        SQLITE_CONSTRAINT_PRIMARYKEY => (
+            ConstraintKind::PrimaryKey,
+            format!("UNIQUE constraint failed: {description}"),
+        ),
+        SQLITE_CONSTRAINT_UNIQUE => (
+            ConstraintKind::Unique,
+            format!("UNIQUE constraint failed: {description}"),
+        ),
+        SQLITE_CONSTRAINT_CHECK => (
+            ConstraintKind::Check,
+            format!("CHECK constraint failed: {description}"),
+        ),
+        SQLITE_CONSTRAINT_NOTNULL => (
+            ConstraintKind::NotNull,
+            format!("NOT NULL constraint failed: {description}"),
+        ),
+        SQLITE_CONSTRAINT_FOREIGNKEY => (ConstraintKind::ForeignKey, description.to_string()),
+        _ => (ConstraintKind::Other, description.to_string()),
+    };
+    let mut violation = ConstraintViolation::new(kind, message);
+    if let Some(info) = info {
+        violation.kind = info.kind;
+        violation.table_name = Some(info.table_name.clone());
+        violation.constraint_name.clone_from(&info.constraint_name);
+        violation.index_name.clone_from(&info.index_name);
+        violation.column_names.clone_from(&info.column_names);
+        violation.values = info
+            .violation_regs
+            .iter()
+            .map(|&reg| state.registers[reg].get_value().clone())
+            .collect();
+        violation.row_values = !info.row_col_names.is_empty();
+        violation.parent_table.clone_from(&info.parent_table);
+    }
+    LimboError::ConstraintViolation(Box::new(violation))
 }
 
 /// Call xCommit on all virtual tables that participated in the current transaction.
@@ -4327,6 +4389,7 @@ pub fn op_halt(
 ) -> InsnResult {
     load_insn!(
         Halt {
+            constraint_info,
             err_code,
             description,
             on_error,
@@ -4341,7 +4404,15 @@ pub fn op_halt(
     } else {
         description.to_string()
     };
-    halt(program, state, pager, *err_code, &desc, *on_error)
+    halt(
+        program,
+        state,
+        pager,
+        *err_code,
+        &desc,
+        *on_error,
+        constraint_info.as_deref(),
+    )
 }
 
 pub fn op_halt_if_null(
@@ -4352,6 +4423,7 @@ pub fn op_halt_if_null(
 ) -> InsnResult {
     load_insn!(
         HaltIfNull {
+            constraint_info,
             target_reg,
             err_code,
             description,
@@ -4360,7 +4432,15 @@ pub fn op_halt_if_null(
         insn
     );
     if matches!(state.registers[*target_reg].get_value(), Value::Null) {
-        halt(program, state, pager, *err_code, description, *on_error)
+        halt(
+            program,
+            state,
+            pager,
+            *err_code,
+            description,
+            *on_error,
+            constraint_info.as_deref(),
+        )
     } else {
         state.pc += 1;
         Ok(InsnFunctionStepResult::Step)
@@ -5211,6 +5291,7 @@ pub fn op_transaction_inner(
                             state
                                 .fk_immediate_violations_during_stmt
                                 .store(0, Ordering::Release);
+                            state.fk_immediate_violation = None;
                         }
                         if let Some(mv_store) = mv_store.as_ref() {
                             // Attached MVCC DB: open an MvStore savepoint.
@@ -6127,7 +6208,10 @@ pub fn op_program(
                                 return Err(LimboError::Busy.into());
                             }
                         },
-                        Err(LimboError::Constraint(constraint_err)) => {
+                        Err(
+                            error
+                            @ (LimboError::Constraint(_) | LimboError::ConstraintViolation(_)),
+                        ) if !error.is_foreign_key_constraint() => {
                             if program.resolve_type != ResolveType::Ignore {
                                 subprogram_aborted = true;
                                 finish_subprogram(
@@ -6138,7 +6222,7 @@ pub fn op_program(
                                     saved_last_insert_rowid,
                                     saved_last_changes_value,
                                 );
-                                return Err(LimboError::Constraint(constraint_err).into());
+                                return Err(error.into());
                             }
                             subprogram_aborted = true;
                             break;
@@ -11799,7 +11883,11 @@ pub fn op_function(
             MathFuncArity::Binary => {
                 let lhs = &state.registers[*start_reg];
                 let rhs = &state.registers[*start_reg + 1];
-                let result = lhs.get_value().exec_math_binary(rhs.get_value(), math_func);
+                let result = lhs.get_value().exec_math_binary(
+                    rhs.get_value(),
+                    math_func,
+                    program.connection.dialect().errors_on_zero_divisor(),
+                )?;
                 state.registers[*dest].set_value(result);
             }
 
@@ -13041,8 +13129,8 @@ pub fn op_insert(
                                     state.active_op_state.insert().route.as_ref().ok_or_else(
                                         || {
                                             LimboError::InternalError(format!(
-                                        "changed btree for {table_name} missing from schema"
-                                    ))
+                                                "changed btree for {table_name} missing from schema"
+                                            ))
                                         },
                                     )?;
                                 let values = if route.is_materialized_view {
@@ -18392,6 +18480,7 @@ pub fn op_fk_counter(
 ) -> InsnResult {
     load_insn!(
         FkCounter {
+            constraint_info,
             increment_value,
             deferred,
         },
@@ -18399,6 +18488,18 @@ pub fn op_fk_counter(
     );
     if !*deferred {
         state.increment_fk_immediate_violations_during_stmt(*increment_value);
+        if state.get_fk_immediate_violations_during_stmt() == 0 {
+            state.fk_immediate_violation = None;
+        } else if *increment_value > 0 {
+            if let Some(info) = constraint_info.as_deref() {
+                state.fk_immediate_violation = Some(build_constraint_violation_error(
+                    state,
+                    Some(info),
+                    SQLITE_CONSTRAINT_FOREIGNKEY,
+                    "FOREIGN KEY constraint failed",
+                ));
+            }
+        }
     } else {
         // Transaction-level counter: add/subtract for deferred FKs.
         program
@@ -18464,6 +18565,9 @@ pub fn op_fk_check(
         state.get_fk_immediate_violations_during_stmt()
     };
     if v > 0 {
+        if !*deferred {
+            return Err(state.immediate_foreign_key_error().into());
+        }
         return Err(
             LimboError::ForeignKeyConstraint("FOREIGN KEY constraint failed".to_string()).into(),
         );
@@ -20221,7 +20325,7 @@ fn op_vacuum_into_inner(program: &Program, state: &mut ProgramState, insn: &Insn
                         ))
                         .into());
                     }
-                    if std::path::Path::new(&target.path).exists() {
+                    if std::fs::metadata(&target.path).is_ok_and(|m| m.len() > 0) {
                         return Err(LimboError::ParseError(format!(
                             "output file already exists: {}",
                             target.path
@@ -20557,6 +20661,38 @@ mod tests {
         }
         // The steps cancel except for 12345 and -2 * 7.
         assert_eq!((wrapped, wrap_count), (12345 - 14, 0));
+    }
+
+    #[test]
+    fn set_subtype_non_integer_returns_error() {
+        assert_set_subtype_error(Value::build_text("74"), "stored subtype must be an integer");
+    }
+
+    #[test]
+    fn set_subtype_unknown_integer_returns_error() {
+        assert_set_subtype_error(Value::from_i64(75), "unknown stored subtype: 75");
+    }
+
+    fn assert_set_subtype_error(subtype: Value, expected_message: &str) {
+        let stmt = prepare_test_statement();
+        let mut state = ProgramState::new(2, 0);
+        let original = Value::build_text("unchanged");
+        state.set_register(0, Register::Value(subtype));
+        state.set_register(1, Register::Value(original.clone()));
+        let insn = Insn::SetSubtype {
+            subtype_reg: 0,
+            dest_reg: 1,
+        };
+        let err = match op_set_subtype(stmt.get_program(), &mut state, &insn, stmt.get_pager()) {
+            Ok(_) => panic!("invalid subtype must fail"),
+            Err(err) => err,
+        };
+        assert!(
+            matches!(*err, LimboError::InternalError(ref message) if message == expected_message),
+            "unexpected error: {err:?}"
+        );
+        assert_eq!(state.pc, 0);
+        assert_eq!(state.get_register(1).get_value(), &original);
     }
 
     fn prepare_test_statement() -> Statement {

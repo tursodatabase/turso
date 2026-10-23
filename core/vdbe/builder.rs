@@ -1217,6 +1217,7 @@ impl ProgramBuilder {
 
     fn emit_halt(&mut self, rollback: bool) {
         self.emit_insn(Insn::Halt {
+            constraint_info: None,
             err_code: 0,
             description: if rollback {
                 "rollback".to_string()
@@ -1234,6 +1235,7 @@ impl ProgramBuilder {
     #[allow(dead_code)]
     pub fn emit_halt_err(&mut self, err_code: usize, description: String) {
         self.emit_insn(Insn::Halt {
+            constraint_info: None,
             err_code,
             description,
             on_error: None,
@@ -1855,6 +1857,7 @@ impl ProgramBuilder {
                 "fk action"
             };
             self.emit_insn(Insn::Halt {
+                constraint_info: None,
                 err_code: 0,
                 description: description.to_string(),
                 on_error: None,

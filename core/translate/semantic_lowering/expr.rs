@@ -2376,6 +2376,7 @@ impl<'expr> ExprLowerer<'_, 'expr, '_> {
                         }
                         debug_assert!(children.is_empty());
                         self.program.emit_insn(Insn::Halt {
+                            constraint_info: None,
                             err_code: 0,
                             description: String::new(),
                             on_error: Some(ResolveType::Ignore),
@@ -2404,6 +2405,7 @@ impl<'expr> ExprLowerer<'_, 'expr, '_> {
                             }
                         };
                         self.program.emit_insn(Insn::Halt {
+                            constraint_info: None,
                             err_code: if in_trigger {
                                 SQLITE_CONSTRAINT_TRIGGER
                             } else {
@@ -3027,6 +3029,7 @@ impl ExprLowerer<'_, '_, '_> {
         })?;
         if let Some(description) = &domain.not_null_description {
             self.program.emit_insn(Insn::HaltIfNull {
+                constraint_info: None,
                 target_reg: value,
                 err_code: SQLITE_CONSTRAINT_NOTNULL,
                 on_error: None,
@@ -3067,6 +3070,7 @@ impl ExprLowerer<'_, '_, '_> {
             jump_if_null: false,
         });
         self.program.emit_insn(Insn::Halt {
+            constraint_info: None,
             err_code: SQLITE_CONSTRAINT_CHECK,
             description: check.failure_description.clone(),
             on_error: None,
@@ -5123,6 +5127,7 @@ pub(crate) fn translate_schema_calls_on_elements(
         collation: None,
     });
     program.emit_insn(Insn::Halt {
+        constraint_info: None,
         err_code: crate::error::SQLITE_CONSTRAINT,
         description: format!(
             "array exceeds maximum element count for custom type transform ({MAX_ELEMENTS})"
@@ -6449,6 +6454,7 @@ mod tests {
         ));
 
         let index = Arc::new(Index {
+            constraint_name: None,
             name: "items_value".to_string(),
             table_name: "items".to_string(),
             root_page: 3,
@@ -7956,6 +7962,7 @@ mod tests {
                     description,
                     on_error: Some(ResolveType::Abort),
                     description_reg: None,
+                    constraint_info: None,
                 },
                 _,
             )] if description == "stop' now"

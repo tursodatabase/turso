@@ -350,6 +350,7 @@ impl TableSequenceState<'_> {
             collation: None,
         });
         program.emit_insn(Insn::Halt {
+            constraint_info: None,
             err_code: SQLITE_FULL,
             description: "database or disk is full".to_string(),
             on_error: None,

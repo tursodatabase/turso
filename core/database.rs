@@ -1904,22 +1904,22 @@ impl Database {
                                         let decoded_page_size = header.page_size.get() as usize;
                                         if decoded_page_size != bootstrap_page_size {
                                             return Err(LimboError::InvalidArgument(format!(
-                                            "page codec bootstrap page size {bootstrap_page_size} does not match decoded page-1 size {decoded_page_size}"
-                                        )));
+                                                "page codec bootstrap page size {bootstrap_page_size} does not match decoded page-1 size {decoded_page_size}"
+                                            )));
                                         }
                                         if header.reserved_space != bootstrap_reserved_space {
                                             return Err(LimboError::InvalidArgument(format!(
-                                            "page codec bootstrap reserved space {bootstrap_reserved_space} does not match decoded page-1 reserved space {}",
-                                            header.reserved_space
-                                        )));
+                                                "page codec bootstrap reserved space {bootstrap_reserved_space} does not match decoded page-1 reserved space {}",
+                                                header.reserved_space
+                                            )));
                                         }
                                         let required_reserved_space =
                                             codec.required_reserved_bytes();
                                         if header.reserved_space != required_reserved_space {
                                             return Err(LimboError::InvalidArgument(format!(
-                                            "page codec requires exactly {required_reserved_space} reserved bytes, but decoded page 1 provides {}",
-                                            header.reserved_space
-                                        )));
+                                                "page codec requires exactly {required_reserved_space} reserved bytes, but decoded page 1 provides {}",
+                                                header.reserved_space
+                                            )));
                                         }
                                     }
                                 }

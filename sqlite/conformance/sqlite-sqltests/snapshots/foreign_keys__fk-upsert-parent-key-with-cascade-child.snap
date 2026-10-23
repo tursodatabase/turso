@@ -54,7 +54,7 @@ addr  opcode           p1  p2  p3  p4         p5  comment
   36    NoConflict      1  40  14  1           0  key=r[14..14]
   37    IdxRowId        1  17   0              0  r[17]=cursor 1.rowid
   38    Eq              5  17  40              0  if r[5]==r[17] goto 40
-  39    Halt         1555   0   0  parent.k    0
+  39    Halt         2067   0   0  parent.k    0
   40    Column          0   1  18              0  r[18]=parent.k
   41    RowId           0  19   0              0  r[19]=parent.rowid
   42    IdxDelete       1  18   2              1

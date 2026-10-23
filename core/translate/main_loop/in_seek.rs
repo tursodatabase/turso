@@ -30,6 +30,7 @@ pub(crate) fn open_in_seek_values_cursor<E>(
         .and_then(|index| index.columns.first())
         .and_then(|column| column.collation);
     let ephemeral_index = Arc::new(Index {
+        constraint_name: None,
         name: String::new(),
         table_name: String::new(),
         root_page: 0,

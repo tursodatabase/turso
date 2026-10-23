@@ -2817,6 +2817,7 @@ mod tests {
             None,
         )]);
         let index = Arc::new(Index {
+            constraint_name: None,
             name: "items_a".into(),
             table_name: "items".into(),
             root_page: 2,
@@ -2886,6 +2887,7 @@ mod tests {
             Column::new_default_integer(Some("b".into()), "INTEGER".into(), None),
         ]);
         let index = Arc::new(Index {
+            constraint_name: None,
             name: "items_sum".into(),
             table_name: "items".into(),
             root_page: 2,
@@ -3045,6 +3047,7 @@ mod tests {
             Column::new_default_integer(Some("b".into()), "INTEGER".into(), None),
         ]);
         let index = Arc::new(Index {
+            constraint_name: None,
             name: "items_a_partial".into(),
             table_name: "items".into(),
             root_page: 2,

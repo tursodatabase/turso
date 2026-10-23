@@ -901,6 +901,7 @@ mod tests {
             CatalogSnapshot::from_id(1),
             Some(DatabaseId::new(0)),
             Arc::new(Index {
+                constraint_name: None,
                 name: "items_plus_one".to_string(),
                 table_name: "items".to_string(),
                 root_page: 3,

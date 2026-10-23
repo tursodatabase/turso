@@ -46,6 +46,7 @@ pub(crate) fn emit_percentile_fraction_range_check(program: &mut ProgramBuilder,
     });
     program.preassign_label_to_next_insn(bad);
     program.emit_insn(Insn::Halt {
+        constraint_info: None,
         err_code: crate::error::SQLITE_ERROR,
         description: "percentile value is not between 0 and 1".to_string(),
         on_error: None,
@@ -261,13 +262,15 @@ pub(crate) fn translate_hir_aggregation_step(
     distinct: Option<&HirAggregateDistinct>,
     fraction_reg: Option<usize>,
 ) -> Result<usize> {
-    // Only ordered-set aggregates may carry an ORDER BY on their arguments.
+    let func = hir_aggregate_function(call)?;
     if !call.arguments.order_terms().is_empty()
         && !matches!(call.arguments, hir::FunctionArguments::OrderedSet { .. })
+        && !matches!(func, AggFunc::Min | AggFunc::Max)
     {
-        crate::bail_parse_error!("ORDER BY clause is not supported yet in aggregate functions");
+        return Err(LimboError::InternalError(format!(
+            "{func}() with an argument ORDER BY reached the unordered aggregate step"
+        )));
     }
-    let func = hir_aggregate_function(call)?;
     emit_aggregation_step(
         program,
         AggregationArguments::Hir {

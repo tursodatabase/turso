@@ -272,6 +272,7 @@ pub struct CheckConstraint {
     /// What a failure reports: the constraint's name, or its expression's
     /// text as the user wrote it.
     pub description: String,
+    pub name: Option<String>,
 }
 
 /// Semantic state of a stored expression associated with one source column.

@@ -15,7 +15,7 @@ use crate::{
     translate::collate::CollationSeq,
     vdbe::{
         builder::{CursorType, ProgramBuilder},
-        insn::{CmpInsFlags, Insn},
+        insn::{CmpInsFlags, ConstraintInfo, Insn},
         BranchOffset,
     },
     Result,
@@ -274,8 +274,10 @@ where
 pub(super) fn emit_fk_violation(
     program: &mut ProgramBuilder,
     foreign_key: &ForeignKey,
+    constraint_info: Option<Box<ConstraintInfo>>,
 ) -> Result<()> {
     program.emit_insn(Insn::FkCounter {
+        constraint_info,
         increment_value: 1,
         deferred: foreign_key.deferred,
     });
@@ -284,8 +286,12 @@ pub(super) fn emit_fk_violation(
 
 /// Stop the statement with a foreign-key error at once: for RESTRICT, and
 /// for a missing parent of a single-row INSERT.
-pub(super) fn emit_fk_restrict_halt(program: &mut ProgramBuilder) -> Result<()> {
+pub(super) fn emit_fk_restrict_halt(
+    program: &mut ProgramBuilder,
+    constraint_info: Option<Box<ConstraintInfo>>,
+) -> Result<()> {
     program.emit_insn(Insn::Halt {
+        constraint_info,
         err_code: SQLITE_CONSTRAINT_FOREIGNKEY,
         description: "FOREIGN KEY constraint failed".to_string(),
         on_error: None,
@@ -306,6 +312,7 @@ pub(super) fn emit_guarded_fk_decrement(
         target_pc: label,
     });
     program.emit_insn(Insn::FkCounter {
+        constraint_info: None,
         increment_value: -1,
         deferred,
     });

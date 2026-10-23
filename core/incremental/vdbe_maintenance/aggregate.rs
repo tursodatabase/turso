@@ -1005,6 +1005,7 @@ fn emit_group_aggregate_rows(
     });
     program.preassign_label_to_next_insn(corrupt_label);
     program.emit_insn(Insn::Halt {
+        constraint_info: None,
         err_code: crate::error::SQLITE_ERROR,
         description: format!("materialized view {view_name} state is corrupted"),
         on_error: None,

@@ -254,6 +254,7 @@ pub(super) fn emit_terminal_delta(
     });
     program.preassign_label_to_next_insn(other_values_label);
     program.emit_insn(Insn::Halt {
+        constraint_info: None,
         err_code: crate::error::SQLITE_ERROR,
         description: format!(
             "materialized view {view_name} received a row whose rowid already holds other values"
@@ -263,6 +264,7 @@ pub(super) fn emit_terminal_delta(
     });
     program.preassign_label_to_next_insn(negative_weight_label);
     program.emit_insn(Insn::Halt {
+        constraint_info: None,
         err_code: crate::error::SQLITE_ERROR,
         description: format!(
             "materialized view {view_name} received a retraction for a row it does not hold"

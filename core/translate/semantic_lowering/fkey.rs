@@ -26,7 +26,7 @@ use crate::{
     },
     vdbe::{
         builder::ProgramBuilder,
-        insn::{CmpInsFlags, Insn},
+        insn::{CmpInsFlags, ConstraintInfo, Insn},
         BranchOffset,
     },
     LimboError, Result,
@@ -122,9 +122,9 @@ fn emit_children_still_point_here(
     let declaration = foreign_key.declaration.clone();
     let violation = move |program: &mut ProgramBuilder| -> Result<()> {
         if restrict {
-            emit_fk_restrict_halt(program)
+            emit_fk_restrict_halt(program, None)
         } else {
-            emit_fk_violation(program, &declaration)
+            emit_fk_violation(program, &declaration, None)
         }
     };
     // A self-reference scans the table so that the row being deleted does
@@ -240,11 +240,12 @@ pub(super) fn emit_insert_child_checks(
         let halts = !foreign_key.declaration.deferred
             && !program.flags.is_multi_write()
             && !program.flags.is_subprogram();
+        let constraint_info = halts.then(|| foreign_key_violation(foreign_key, key));
         let violation = move |program: &mut ProgramBuilder| -> Result<()> {
             if halts {
-                emit_fk_restrict_halt(program)
+                emit_fk_restrict_halt(program, constraint_info.clone())
             } else {
-                emit_fk_violation(program, &declaration)
+                emit_fk_violation(program, &declaration, None)
             }
         };
         if foreign_key.parent_uses_rowid {
@@ -447,9 +448,9 @@ pub(super) fn emit_update_checks<'a>(
             database,
             move |program: &mut ProgramBuilder| {
                 if restrict {
-                    emit_fk_restrict_halt(program)
+                    emit_fk_restrict_halt(program, None)
                 } else {
-                    emit_fk_violation(program, &declaration)
+                    emit_fk_violation(program, &declaration, None)
                 }
             },
         )?;
@@ -521,8 +522,11 @@ pub(super) fn emit_update_checks<'a>(
         emit_skip_if_any_null(program, new_key, width, ok);
         let self_reference = is_self_reference(foreign_key);
         let declaration = foreign_key.declaration.clone();
-        let violation =
-            move |program: &mut ProgramBuilder| emit_fk_violation(program, &declaration);
+        let constraint_info =
+            (!declaration.deferred).then(|| foreign_key_violation(foreign_key, new_key));
+        let violation = move |program: &mut ProgramBuilder| {
+            emit_fk_violation(program, &declaration, constraint_info.clone())
+        };
         if foreign_key.parent_uses_rowid {
             let cursor = open_read_table(program, &parent_table, database);
             let parent_rowid = program.alloc_register();
@@ -826,4 +830,15 @@ fn parent_index(foreign_key: &hir::ResolvedForeignKey) -> Result<&hir::ResolvedI
             foreign_key.parent_table.value().get_name()
         ))
     })
+}
+
+fn foreign_key_violation(foreign_key: &hir::ResolvedForeignKey, key: usize) -> Box<ConstraintInfo> {
+    let declaration = &foreign_key.declaration;
+    Box::new(ConstraintInfo::fk(
+        foreign_key.child_table.value().get_name(),
+        declaration.constraint_name.clone(),
+        declaration.child_columns.to_vec(),
+        (key..key + declaration.child_columns.len()).collect(),
+        declaration.parent_table.clone(),
+    ))
 }

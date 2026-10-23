@@ -737,6 +737,7 @@ impl From<LimboError> for TursoError {
             LimboError::ForeignKeyConstraint(e) | LimboError::Constraint(e) => {
                 TursoError::Constraint(e)
             }
+            LimboError::ConstraintViolation(violation) => TursoError::Constraint(violation.message),
             LimboError::Corrupt(e) => TursoError::Corrupt(e),
             LimboError::NotADB => TursoError::NotAdb("file is not a database".to_string()),
             e @ (LimboError::DatabaseFull | LimboError::SequenceExhausted { .. }) => {
@@ -1850,6 +1851,31 @@ mod tests {
     use turso_core::{
         LimboError, PageCodec, PageCodecContext, PageCodecHeaderInfo, PageCodecId, Value,
     };
+
+    #[test]
+    fn structured_constraint_errors_keep_sqlite_codes() {
+        for kind in [
+            turso_core::ConstraintKind::PrimaryKey,
+            turso_core::ConstraintKind::Unique,
+            turso_core::ConstraintKind::ForeignKey,
+            turso_core::ConstraintKind::NotNull,
+            turso_core::ConstraintKind::Check,
+            turso_core::ConstraintKind::Other,
+        ] {
+            let error = LimboError::ConstraintViolation(Box::new(
+                turso_core::ConstraintViolation::new(kind, "constraint message".to_string()),
+            ));
+            let error = TursoError::from(error);
+            assert!(
+                matches!(&error, TursoError::Constraint(message) if message == "constraint message"),
+                "{kind:?}: {error:?}"
+            );
+            assert!(matches!(
+                error.to_capi_code(),
+                c::turso_status_code_t::TURSO_CONSTRAINT
+            ));
+        }
+    }
 
     #[test]
     fn commit_dependency_abort_requires_transaction_retry() {

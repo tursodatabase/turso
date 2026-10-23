@@ -91,6 +91,7 @@ impl<E> WindowFunctionRuntime<E> {
         };
         let minmax = minmax_function.map(|aggregate| {
             let index = Arc::new(Index {
+                constraint_name: None,
                 name: format!(
                     "window_minmax_{}_{}",
                     program.offset().as_offset_int(),
@@ -1225,6 +1226,7 @@ fn emit_window_check_offset(
         (_, WindowFrameBoundSide::End) => "frame ending offset must be a non-negative integer",
     };
     program.emit_insn(Insn::Halt {
+        constraint_info: None,
         err_code: crate::error::SQLITE_ERROR,
         description: msg.to_string(),
         on_error: None,
@@ -2722,6 +2724,7 @@ pub(crate) fn emit_first_value_nth_value_lookup_runtime<E>(
             });
             program.preassign_label_to_next_insn(lbl_n_err);
             program.emit_insn(Insn::Halt {
+                constraint_info: None,
                 err_code: crate::error::SQLITE_ERROR,
                 description: "second argument to nth_value must be a positive integer".to_string(),
                 on_error: None,
@@ -2796,6 +2799,7 @@ pub(crate) fn emit_first_value_nth_value_lookup_runtime<E>(
         });
         program.preassign_label_to_next_insn(lbl_missing_row);
         program.emit_insn(Insn::Halt {
+            constraint_info: None,
             err_code: crate::error::SQLITE_ERROR,
             description: "first_value/nth_value could not find a saved row within its frame"
                 .to_string(),
