@@ -2704,12 +2704,21 @@ pub fn determine_where_to_eval_term(
             let reads_left_table = referenced_tables
                 .iter()
                 .any(|table_index| table_index < right_table_index);
-            if reads_left_table {
-                let loop_index = join_order
-                    .iter()
-                    .position(|table| table.table_id == right_table.internal_id)
-                    .expect("right join table must be in the join order");
-                eval_at = eval_at.max(EvalAt::Loop(loop_index));
+            if !reads_left_table {
+                continue;
+            }
+            match join_order
+                .iter()
+                .position(|table| table.table_id == right_table.internal_id)
+            {
+                Some(loop_index) => eval_at = eval_at.max(EvalAt::Loop(loop_index)),
+                None => turso_assert!(
+                    join_order.iter().any(|member| matches!(
+                        &table_references.joined_tables()[member.original_idx].op,
+                        Operation::HashJoin(hash_join) if hash_join.materialize_build_input
+                    )),
+                    "a RIGHT JOIN table can leave the join order only inside a materialized hash build input"
+                ),
             }
         }
     }
