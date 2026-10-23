@@ -54,6 +54,7 @@ expect {
     1
 }
 
+@skip-if mvcc "REINDEX is not supported in MVCC mode"
 test custom-type-reindex-keeps-entries {
     CREATE TYPE doubled BASE integer ENCODE (value * 2) DECODE (value / 2) OPERATOR '<';
     CREATE TABLE t(id INTEGER PRIMARY KEY, v doubled) STRICT;
