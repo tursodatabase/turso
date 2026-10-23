@@ -2659,7 +2659,7 @@ mod tests {
     }
 
     #[test]
-    fn select_star_with_where_copies_each_column_binding_once() {
+    fn select_star_with_where_copies_no_column_binding() {
         let mut schema = Schema::new();
         let columns: Vec<String> = (0..64).map(|column| format!("c{column} INTEGER")).collect();
         let table = BTreeTable::from_sql(
@@ -2680,8 +2680,7 @@ mod tests {
         let copied = crate::translate::semantic::scope::tests::COLUMN_BINDINGS_COPIED
             .with(|copied| copied.get());
 
-        // Adding the table makes its columns visible by copying each one.
-        assert_eq!(copied, 65);
+        assert_eq!(copied, 0);
     }
 
     #[test]

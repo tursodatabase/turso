@@ -195,6 +195,12 @@ pub(crate) fn resolve_source_column(source: &hir::Source, name: &str) -> Result<
 }
 
 #[derive(Clone, Debug)]
+enum VisibleColumn {
+    AllOfSource(usize),
+    Binding(ColumnBinding),
+}
+
+#[derive(Clone, Debug)]
 struct ScopeSource {
     id: SourceId,
     qualifier: String,
@@ -319,7 +325,7 @@ struct ScopeOutput {
 #[derive(Clone, Debug, Default)]
 pub(crate) struct Scope {
     sources: Arc<Vec<ScopeSource>>,
-    visible_columns: Arc<Vec<ColumnBinding>>,
+    visible: Arc<Vec<VisibleColumn>>,
     outputs: Vec<ScopeOutput>,
     outer: Option<Arc<Scope>>,
     outer_resolution_blocked: bool,
@@ -373,7 +379,7 @@ impl Scope {
             .map(|(index, column)| ColumnBinding::from_source(source, index, column))
             .collect();
         if unqualified {
-            Arc::make_mut(&mut self.visible_columns).extend(columns.iter().cloned());
+            Arc::make_mut(&mut self.visible).push(VisibleColumn::AllOfSource(self.sources.len()));
         }
         Arc::make_mut(&mut self.sources).push(ScopeSource {
             id: source.id,
@@ -423,7 +429,7 @@ impl Scope {
                     visible.hidden = true;
                 }
             }
-            Arc::make_mut(&mut self.visible_columns).push(visible);
+            Arc::make_mut(&mut self.visible).push(VisibleColumn::Binding(visible));
         }
         added.saved = Some(saved);
     }
@@ -605,9 +611,18 @@ impl Scope {
             !self.outer_resolution_blocked && !other.outer_resolution_blocked,
             "root-level source scopes must allow ordinary resolution"
         );
+        let first_appended_source = self.sources.len();
         Arc::make_mut(&mut self.sources).extend(Arc::unwrap_or_clone(other.sources));
-        Arc::make_mut(&mut self.visible_columns)
-            .extend(Arc::unwrap_or_clone(other.visible_columns));
+        Arc::make_mut(&mut self.visible).extend(
+            Arc::unwrap_or_clone(other.visible)
+                .into_iter()
+                .map(|visible| match visible {
+                    VisibleColumn::AllOfSource(source) => {
+                        VisibleColumn::AllOfSource(first_appended_source + source)
+                    }
+                    VisibleColumn::Binding(binding) => VisibleColumn::Binding(binding),
+                }),
+        );
     }
 
     pub(crate) fn without_outer(mut self) -> Self {
@@ -959,7 +974,7 @@ impl Scope {
         // an unmerged visible column makes an unqualified star ambiguous.
         let mut visible_sources = HashSet::default();
         let mut visible_identities = HashMap::default();
-        for column in self.visible_columns.iter().filter(|column| !column.hidden) {
+        for column in self.visible_columns().filter(|column| !column.hidden) {
             visible_sources.insert(column.source);
         }
         for source in self
@@ -970,8 +985,7 @@ impl Scope {
             let identity = (source.database, source.qualifier.as_str());
             if visible_identities.insert(identity, source.id).is_some() {
                 let column = self
-                    .visible_columns
-                    .iter()
+                    .visible_columns()
                     .find(|column| !column.hidden && column.source == source.id)
                     .expect("visible source must own a visible column");
                 crate::bail_parse_error!(
@@ -989,8 +1003,7 @@ impl Scope {
         // `database.table.column`, which a source of the same name inside a
         // join group can make ambiguous.
         let several = self.sources.len() > 1;
-        self.visible_columns
-            .iter()
+        self.visible_columns()
             .filter(|column| !column.hidden)
             .map(|column| {
                 if bare_group {
@@ -1193,8 +1206,7 @@ impl Scope {
         display_name: &str,
     ) -> Result<ResolvedScopeExpr> {
         let mut matches = self
-            .visible_columns
-            .iter()
+            .visible_columns()
             .filter(|visible| visible.lookup_name.matches(lookup_name));
         let Some(first) = matches.next() else {
             crate::bail_parse_error!("no such column: {display_name}");
@@ -1228,7 +1240,7 @@ impl Scope {
         // One copy per source: a join group is one source with one column
         // of each name.
         let mut matches = self.sources.iter().filter_map(|source| {
-            self.visible_columns.iter().find(|column| {
+            self.visible_columns().find(|column| {
                 column.source == source.id
                     && (!natural || !column.hidden)
                     && column.using_name.matches(&normalized)
@@ -1257,8 +1269,7 @@ impl Scope {
             .filter(|column| !column.hidden)
             .filter_map(|right_column| {
                 let lookup = crate::util::normalize_ident(&right_column.name);
-                self.visible_columns
-                    .iter()
+                self.visible_columns()
                     .find(|left_column| {
                         !left_column.hidden && left_column.using_name.matches(&lookup)
                     })
@@ -1269,7 +1280,7 @@ impl Scope {
 
     pub(crate) fn apply_using(&mut self, columns: &[hir::UsingColumn]) -> Result<()> {
         for using in columns {
-            let right_position = self.visible_columns.iter().position(|column| {
+            let right_position = self.visible_columns().position(|column| {
                 matches!(
                     &column.resolved.expr,
                     hir::Expr::Column(reference) if *reference == using.right
@@ -1291,8 +1302,7 @@ impl Scope {
                     .push((lookup_name.clone(), using.value));
             }
             let left_position = self
-                .visible_columns
-                .iter()
+                .visible_columns()
                 .enumerate()
                 .find(|(position, column)| {
                     *position != right_position
@@ -1317,7 +1327,10 @@ impl Scope {
                 collation: using.collation.clone(),
             }));
 
-            let left = &mut Arc::make_mut(&mut self.visible_columns)[left_position];
+            let visible = self.owned_visible_columns();
+            let VisibleColumn::Binding(left) = &mut visible[left_position] else {
+                unreachable!("owned visible columns are bindings");
+            };
             left.resolved = ResolvedScopeExpr {
                 expr: merged,
                 type_fact: using.type_fact.clone(),
@@ -1327,14 +1340,17 @@ impl Scope {
             };
             let left_source = left.source;
             let merged_expr = left.resolved.expr.clone();
-            Arc::make_mut(&mut self.visible_columns).remove(right_position);
+            visible.remove(right_position);
             // Every column of the right source with the merged name gives
             // way to the merged value: a join group can hold several
             // columns the name finds. Under a RIGHT JOIN the merged value
             // also replaces every other copy on the left, as SQLite's
             // `lookupName` lets the right-most table win.
             let right_join = using.value == hir::MergedColumnValue::Right;
-            Arc::make_mut(&mut self.visible_columns).retain(|column| {
+            visible.retain(|column| {
+                let VisibleColumn::Binding(column) = column else {
+                    unreachable!("owned visible columns are bindings");
+                };
                 if !column.lookup_name.matches(&lookup_name) {
                     return true;
                 }
@@ -1353,8 +1369,7 @@ impl Scope {
     fn resolve_source_column(&self, name: &str) -> Result<Option<ResolvedScopeExpr>> {
         let mut found = None;
         for column in self
-            .visible_columns
-            .iter()
+            .visible_columns()
             .filter(|column| !column.rowid_names && column.lookup_name.matches(name))
         {
             if found.is_some() {
@@ -1371,11 +1386,7 @@ impl Scope {
         if !is_rowid_name(name) {
             return Ok(None);
         }
-        for column in self
-            .visible_columns
-            .iter()
-            .filter(|column| column.rowid_names)
-        {
+        for column in self.visible_columns().filter(|column| column.rowid_names) {
             if found.is_some() {
                 crate::bail_parse_error!("ambiguous column name: {}", name);
             }
@@ -1419,6 +1430,29 @@ impl Scope {
                 .outer
                 .as_deref()
                 .is_some_and(|outer| outer.has_qualifier(qualifier))
+    }
+
+    fn visible_columns(&self) -> impl Iterator<Item = &ColumnBinding> + '_ {
+        self.visible.iter().flat_map(|visible| match visible {
+            VisibleColumn::AllOfSource(source) => self.sources[*source].columns.iter(),
+            VisibleColumn::Binding(binding) => std::slice::from_ref(binding).iter(),
+        })
+    }
+
+    fn owned_visible_columns(&mut self) -> &mut Vec<VisibleColumn> {
+        if self
+            .visible
+            .iter()
+            .any(|visible| matches!(visible, VisibleColumn::AllOfSource(_)))
+        {
+            let owned = self
+                .visible_columns()
+                .cloned()
+                .map(VisibleColumn::Binding)
+                .collect();
+            self.visible = Arc::new(owned);
+        }
+        Arc::make_mut(&mut self.visible)
     }
 }
 
@@ -1507,7 +1541,12 @@ pub(crate) mod tests {
             &source.columns[0].name
         ));
         assert!(Arc::ptr_eq(
-            &scope.visible_columns[0].using_name.0,
+            &scope
+                .visible_columns()
+                .next()
+                .expect("the source's columns are visible")
+                .using_name
+                .0,
             &source.columns[0].name
         ));
         assert!(bindings[0].lookup_name.matches("value"));
