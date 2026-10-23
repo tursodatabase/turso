@@ -438,6 +438,59 @@ unsafe extern "C" {
     pub fn turso_connection_last_insert_rowid(self_: *const turso_connection_t) -> i64;
 }
 unsafe extern "C" {
+    #[doc = " Stop this connection from checkpointing or restarting the WAL on its own,\n so the caller decides when frames leave the WAL. The setting lives on the\n connection and must be applied again after reconnecting."]
+    pub fn turso_connection_wal_disable_auto_actions(
+        self_: *const turso_connection_t,
+        error_opt_out: *mut *const ::std::os::raw::c_char,
+    ) -> turso_status_code_t;
+}
+unsafe extern "C" {
+    #[doc = " Get the number of the last frame in the WAL and the checkpoint sequence\n number. Frame numbers start at 1 again after a checkpoint restarts the WAL,\n which also changes the sequence number."]
+    pub fn turso_connection_wal_state(
+        self_: *const turso_connection_t,
+        max_frame_out: *mut u64,
+        checkpoint_seq_out: *mut u32,
+        error_opt_out: *mut *const ::std::os::raw::c_char,
+    ) -> turso_status_code_t;
+}
+unsafe extern "C" {
+    #[doc = " Copy WAL frame `frame_no` (1-based), header included, into `frame`.\n `frame_len` must be the frame header size plus the page size."]
+    pub fn turso_connection_wal_get_frame(
+        self_: *const turso_connection_t,
+        frame_no: u64,
+        frame: *mut u8,
+        frame_len: usize,
+        page_no_out: *mut u32,
+        db_size_out: *mut u32,
+        error_opt_out: *mut *const ::std::os::raw::c_char,
+    ) -> turso_status_code_t;
+}
+unsafe extern "C" {
+    #[doc = " Start a session that appends raw frames to the WAL. It holds a write\n transaction until turso_connection_wal_insert_end."]
+    pub fn turso_connection_wal_insert_begin(
+        self_: *const turso_connection_t,
+        error_opt_out: *mut *const ::std::os::raw::c_char,
+    ) -> turso_status_code_t;
+}
+unsafe extern "C" {
+    #[doc = " Write `frame` (header included) at position `frame_no` in the WAL. Writing a\n frame that already exists with the same content succeeds; different content\n or a gap in frame numbers fails."]
+    pub fn turso_connection_wal_insert_frame(
+        self_: *const turso_connection_t,
+        frame_no: u64,
+        frame: *const u8,
+        frame_len: usize,
+        error_opt_out: *mut *const ::std::os::raw::c_char,
+    ) -> turso_status_code_t;
+}
+unsafe extern "C" {
+    #[doc = " End the session started by turso_connection_wal_insert_begin. Changes not\n closed by a commit frame are rolled back, unless `force_commit` is set, in\n which case pending changes are committed first."]
+    pub fn turso_connection_wal_insert_end(
+        self_: *const turso_connection_t,
+        force_commit: bool,
+        error_opt_out: *mut *const ::std::os::raw::c_char,
+    ) -> turso_status_code_t;
+}
+unsafe extern "C" {
     #[doc = " Register or replace a per-connection managed scalar function."]
     pub fn turso_connection_register_scalar_function(
         self_: *const turso_connection_t,
