@@ -1051,17 +1051,26 @@ pub(crate) fn compute_hir_greedy_join_order(
     };
     let layout = HirFromLayout::new(sources, groups);
     let predicate_work = build_hir_predicate_work(document, &layout, where_clause)?;
-    let starting_sources = hir_starting_sources_by_score(
-        document,
-        sources,
-        constraints,
-        base_table_rows,
-        source_costs,
-        &ordering_restrictions,
-        &boundaries,
-        analyze_stats,
-        params,
-    )?;
+    // A single source starts the join; scoring it would only rank it
+    // against itself.
+    let single_source = sources.len() == 1
+        && boundaries.allows_candidate(0, &TableMask::default())
+        && ordering_restrictions.required_lhs(0).is_none();
+    let starting_sources = if single_source {
+        vec![0]
+    } else {
+        hir_starting_sources_by_score(
+            document,
+            sources,
+            constraints,
+            base_table_rows,
+            source_costs,
+            &ordering_restrictions,
+            &boundaries,
+            analyze_stats,
+            params,
+        )?
+    };
 
     let mut remaining: TableMask = (0..sources.len()).try_collect()?;
     let mut joined_mask = TableMask::default();
@@ -2233,6 +2242,8 @@ fn hir_starting_sources_by_score(
     analyze_stats: &AnalyzeStats,
     params: &CostModelParams,
 ) -> Result<Vec<usize>> {
+    #[cfg(test)]
+    tests::STARTING_SOURCE_SCORINGS.with(|scorings| scorings.set(scorings.get() + 1));
     let multipliers = compute_indexed_seek_benefits_optional(
         sources.len(),
         constraints,
@@ -2910,6 +2921,58 @@ mod tests {
     thread_local! {
         /// How many join steps the planner tried on this thread.
         pub(super) static JOIN_STEPS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+        /// How many times the planner scored the starting sources on this
+        /// thread.
+        pub(super) static STARTING_SOURCE_SCORINGS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    }
+
+    #[test]
+    fn single_source_join_order_does_not_score_starting_sources() -> Result<()> {
+        let only = SourceId::new(0);
+        let mut source = _create_hir_source(
+            _create_btree_table("only", _create_column_list(&["value"], Type::Integer)),
+            None,
+            only,
+        );
+        source.col_used_mask.set(0)?;
+        let sources = vec![HirPlanSource::BTree(source)];
+        let document = HirDocument {
+            snapshot: hir::CatalogSnapshot::from_id(0),
+            databases: Vec::new(),
+            root: hir::HirRoot::SchemaExpressions(hir::SchemaExpressionRoot {
+                source: only,
+                expressions: Vec::new(),
+            }),
+            queries: Vec::new(),
+            sources: vec![_create_hir_definition("only", only)],
+            ctes: Vec::new(),
+            schema_programs: Vec::new(),
+            cdc: None,
+        };
+        let mut access_methods = Vec::new();
+        STARTING_SOURCE_SCORINGS.with(|scorings| scorings.set(0));
+        let result = compute_hir_join_order(
+            &document,
+            &sources,
+            &[],
+            &[_hir_empty_constraints()],
+            &[],
+            &[RowCountEstimate::AnalyzeStats(1_000.0)],
+            &[Cost(0.0)],
+            None,
+            1.0,
+            &mut access_methods,
+            &Schema::new(),
+            &AnalyzeStats::default(),
+            &DEFAULT_PARAMS,
+            false,
+            &HirHashJoins::NONE,
+        )?
+        .expect("one HIR source produces a join plan");
+
+        assert_eq!(result.best_plan.table_numbers().collect::<Vec<_>>(), [0]);
+        assert_eq!(STARTING_SOURCE_SCORINGS.with(|scorings| scorings.get()), 0);
+        Ok(())
     }
 
     #[test]
