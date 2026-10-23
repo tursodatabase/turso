@@ -10,10 +10,11 @@ use crate::functions::ConfigParameter;
 use turso_core::{Connection, LimboError, Result, Statement, Value};
 use turso_parser::ast::{self};
 use turso_pg_parser::translator::{
-    check_set_transaction, is_comment_on, is_refresh_matview, try_extract_copy_from,
-    try_extract_create_schema, try_extract_drop_schema, try_extract_set, try_extract_show,
-    unnamed_index_name, unqualified_create_table_name_location, PgCopyFromStmt, PgCreateSchemaStmt,
-    PgDropSchemaStmt, PgSetStmt, PgSetValue, PgShowStmt, PostgreSQLTranslator,
+    is_begin_read_only, is_comment_on, is_lock, is_refresh_matview, try_extract_copy_from,
+    try_extract_create_schema, try_extract_drop_schema, try_extract_set,
+    try_extract_set_transaction, try_extract_show, unnamed_index_name,
+    unqualified_create_table_name_location, PgCopyFromStmt, PgCreateSchemaStmt, PgDropSchemaStmt,
+    PgSetStmt, PgSetValue, PgShowStmt, PostgreSQLTranslator,
 };
 
 use crate::copy::parse_copy_text_format;
@@ -32,6 +33,15 @@ struct PgConnectionInner {
 #[derive(Default)]
 struct SessionState {
     search_path_setting: Option<String>,
+    transaction: TransactionState,
+}
+
+#[derive(Default, PartialEq)]
+struct TransactionState {
+    read_only: bool,
+    queried: bool,
+    savepoint: bool,
+    query_only_before: bool,
 }
 
 type PgSessionState = Mutex<SessionState>;
@@ -176,6 +186,7 @@ fn prepare_statement(pg_conn: &Arc<PgConnectionInner>, sql: &str) -> Result<Stat
     }
 
     reject_sqlite_catalog_access(sql)?;
+    reset_transaction_state_outside_transaction(&pg_conn.conn);
 
     if let Some(stmt) = try_prepare_special(pg_conn, sql)? {
         return Ok(stmt);
@@ -208,6 +219,8 @@ fn prepare_statement(pg_conn: &Arc<PgConnectionInner>, sql: &str) -> Result<Stat
         .translate_with_prereqs(&parse_result)
         .map_err(|e| LimboError::ParseError(e.to_string()))?;
     reject_catalog_dml(translated.cmd.stmt())?;
+    let read_only =
+        record_transaction_statement(&pg_conn.conn, &parse_result, translated.cmd.stmt());
 
     for prereq in translated.prereqs {
         let input = prereq.to_string();
@@ -215,7 +228,121 @@ fn prepare_statement(pg_conn: &Arc<PgConnectionInner>, sql: &str) -> Result<Stat
         stmt.run_ignore_rows()?;
     }
 
-    pg_conn.conn.prepare_translated_cmd(translated.cmd, &sql)
+    let is_transaction_control = is_transaction_control(translated.cmd.stmt());
+    let stmt = pg_conn.conn.prepare_translated_cmd(translated.cmd, &sql)?;
+    if read_only
+        && !is_transaction_control
+        && (&stmt.get_program().prepared().write_databases)
+            .into_iter()
+            .next()
+            .is_some()
+    {
+        return Err(read_only_transaction_error("this statement"));
+    }
+    Ok(stmt)
+}
+
+fn session_state(conn: &Connection) -> &PgSessionState {
+    conn.context::<PgSessionState>()
+        .expect("PostgreSQL connections have session state")
+}
+
+fn reset_transaction_state_outside_transaction(conn: &Connection) {
+    if !conn.get_auto_commit() {
+        return;
+    }
+    let mut state = session_state(conn).lock().unwrap();
+    if state.transaction.read_only {
+        conn.set_query_only(state.transaction.query_only_before);
+    }
+    state.transaction = TransactionState::default();
+}
+
+fn set_read_only(conn: &Connection, transaction: &mut TransactionState, read_only: bool) {
+    if transaction.read_only != read_only {
+        if read_only {
+            transaction.query_only_before = conn.get_query_only();
+        }
+        transaction.read_only = read_only;
+        conn.set_query_only(read_only || transaction.query_only_before);
+    }
+}
+
+fn record_transaction_statement(
+    conn: &Connection,
+    parse_result: &turso_pg_parser::ParseResult,
+    stmt: &ast::Stmt,
+) -> bool {
+    let mut state = session_state(conn).lock().unwrap();
+    let transaction = &mut state.transaction;
+    match stmt {
+        ast::Stmt::Begin { .. } => {
+            if conn.get_auto_commit() && is_begin_read_only(parse_result) {
+                set_read_only(conn, transaction, true);
+            }
+        }
+        ast::Stmt::Savepoint { .. } => transaction.savepoint = true,
+        stmt if is_transaction_control(stmt) => {}
+        _ if is_lock(parse_result) => {}
+        _ => {
+            if !conn.get_auto_commit() {
+                transaction.queried = true;
+            }
+        }
+    }
+    transaction.read_only
+}
+
+fn is_transaction_control(stmt: &ast::Stmt) -> bool {
+    matches!(
+        stmt,
+        ast::Stmt::Begin { .. }
+            | ast::Stmt::Commit { .. }
+            | ast::Stmt::Rollback { .. }
+            | ast::Stmt::Savepoint { .. }
+            | ast::Stmt::Release { .. }
+    )
+}
+
+pub(crate) fn set_transaction_read_only(conn: &Connection, read_only: bool) -> Result<Value> {
+    if conn.get_auto_commit() {
+        return Ok(Value::from_i64(0));
+    }
+    let mut state = session_state(conn).lock().unwrap();
+    let transaction = &mut state.transaction;
+    if transaction.read_only == read_only {
+        return Ok(Value::from_i64(0));
+    }
+    if read_only && transaction.savepoint {
+        return Err(LimboError::ParseError(
+            "SET TRANSACTION READ ONLY after SAVEPOINT is not supported".to_string(),
+        ));
+    }
+    if !read_only && transaction.savepoint {
+        return Err(LimboError::ParseError(
+            "cannot set transaction read-write mode inside a read-only transaction".to_string(),
+        ));
+    }
+    if !read_only && transaction.queried {
+        return Err(LimboError::ParseError(
+            "transaction read-write mode must be set before any query".to_string(),
+        ));
+    }
+    set_read_only(conn, transaction, read_only);
+    Ok(Value::from_i64(0))
+}
+
+fn reject_in_read_only_transaction(conn: &Connection, command: &str) -> Result<()> {
+    if session_state(conn).lock().unwrap().transaction.read_only {
+        return Err(read_only_transaction_error(command));
+    }
+    Ok(())
+}
+
+fn read_only_transaction_error(command: &str) -> LimboError {
+    LimboError::ParseError(format!(
+        "cannot execute {command} in a read-only transaction"
+    ))
 }
 
 /// The schema that a CREATE TABLE statement naming its table without a
@@ -361,8 +488,15 @@ fn try_prepare_special(pg_conn: &Arc<PgConnectionInner>, sql: &str) -> Result<Op
         return Ok(Some(stmt));
     }
 
-    if check_set_transaction(&parse_result).map_err(|e| LimboError::ParseError(e.to_string()))? {
-        return Ok(Some(noop_statement(&pg_conn.conn)?));
+    if let Some(stmt) = try_extract_set_transaction(&parse_result)
+        .map_err(|e| LimboError::ParseError(e.to_string()))?
+    {
+        return Ok(Some(match stmt.read_only {
+            Some(read_only) => pg_conn.conn.prepare(format!(
+                "SELECT 0 WHERE pg_set_transaction_read_only({read_only}) IS NULL"
+            ))?,
+            None => noop_statement(&pg_conn.conn)?,
+        }));
     }
 
     if let Some(show_stmt) = try_extract_show(&parse_result) {
@@ -372,26 +506,31 @@ fn try_prepare_special(pg_conn: &Arc<PgConnectionInner>, sql: &str) -> Result<Op
     if let Some(stmt) = try_extract_create_schema(&parse_result)
         .map_err(|e| LimboError::ParseError(e.to_string()))?
     {
+        reject_in_read_only_transaction(&pg_conn.conn, "CREATE SCHEMA")?;
         handle_pg_create_schema(pg_conn, &stmt)?;
         return Ok(Some(noop_statement(&pg_conn.conn)?));
     }
 
     if let Some(stmt) = try_extract_drop_schema(&parse_result) {
+        reject_in_read_only_transaction(&pg_conn.conn, "DROP SCHEMA")?;
         handle_pg_drop_schema(&pg_conn.conn, &stmt)?;
         return Ok(Some(noop_statement(&pg_conn.conn)?));
     }
 
     if is_refresh_matview(&parse_result).map_err(|e| LimboError::ParseError(e.to_string()))? {
+        reject_in_read_only_transaction(&pg_conn.conn, "REFRESH MATERIALIZED VIEW")?;
         return Ok(Some(noop_statement(&pg_conn.conn)?));
     }
 
     if is_comment_on(&parse_result) {
+        reject_in_read_only_transaction(&pg_conn.conn, "COMMENT")?;
         return Ok(Some(noop_statement(&pg_conn.conn)?));
     }
 
     if let Some(stmt) =
         try_extract_copy_from(&parse_result).map_err(|e| LimboError::ParseError(e.to_string()))?
     {
+        reject_in_read_only_transaction(&pg_conn.conn, "COPY FROM")?;
         let rows_inserted = handle_pg_copy_from(&pg_conn.conn, &stmt)?;
         let stmt = noop_statement(&pg_conn.conn)?;
         stmt.set_n_change(rows_inserted as i64);

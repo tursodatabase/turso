@@ -81,6 +81,7 @@ scalar_functions! {
     PgBackendPid(FunctionArity::Exact(0), true),
     PgIsInRecovery(FunctionArity::Exact(0), false),
     PgLockAccessShare(FunctionArity::Exact(0), false),
+    PgSetTransactionReadOnly(FunctionArity::Exact(1), false),
     Now | ClockTimestamp | TransactionTimestamp | StatementTimestamp(FunctionArity::Variadic, false),
 }
 
@@ -146,6 +147,17 @@ impl ScalarCall for PgScalarFunction {
                 }
                 Value::from_i64(0)
             }
+            Self::PgSetTransactionReadOnly => match args[0].get_value().as_int() {
+                Some(read_only @ (0 | 1)) => {
+                    crate::session::set_transaction_read_only(connection, read_only == 1)?
+                }
+                _ => {
+                    return Err(LimboError::InvalidArgument(
+                        "pg_set_transaction_read_only requires a boolean".to_string(),
+                    )
+                    .into())
+                }
+            },
             Self::Now
             | Self::ClockTimestamp
             | Self::TransactionTimestamp

@@ -721,7 +721,7 @@ impl PostgreSQLTranslator {
         if txn.chain {
             return Err(not_supported("COMMIT/ROLLBACK AND CHAIN"));
         }
-        check_transaction_options(&txn.options, false)?;
+        transaction_read_only(&txn.options)?;
 
         match TransactionStmtKind::try_from(txn.kind) {
             Ok(TransactionStmtKind::TransStmtBegin | TransactionStmtKind::TransStmtStart) => {
@@ -5827,26 +5827,63 @@ pub fn try_extract_set(parse_result: &ParseResult) -> Option<PgSetStmt> {
     })
 }
 
-fn check_transaction_options(
-    options: &[pg_query::protobuf::Node],
-    read_only_allowed: bool,
-) -> Result<(), ParseError> {
+pub struct PgSetTransactionStmt {
+    pub read_only: Option<bool>,
+}
+
+pub fn try_extract_set_transaction(
+    parse_result: &ParseResult,
+) -> Result<Option<PgSetTransactionStmt>, ParseError> {
+    use pg_query::{protobuf::VariableSetKind, NodeRef};
+
+    match parse_result.protobuf.nodes().first().map(|node| &node.0) {
+        Some(NodeRef::VariableSetStmt(stmt))
+            if stmt.kind == VariableSetKind::VarSetMulti as i32
+                && stmt.name.eq_ignore_ascii_case("transaction") =>
+        {
+            Ok(Some(PgSetTransactionStmt {
+                read_only: transaction_read_only(&stmt.args)?,
+            }))
+        }
+        _ => Ok(None),
+    }
+}
+
+pub fn is_lock(parse_result: &ParseResult) -> bool {
+    matches!(
+        parse_result.protobuf.nodes().first().map(|node| &node.0),
+        Some(pg_query::NodeRef::LockStmt(_))
+    )
+}
+
+pub fn is_begin_read_only(parse_result: &ParseResult) -> bool {
+    use pg_query::{protobuf::TransactionStmtKind, NodeRef};
+
+    match parse_result.protobuf.nodes().first().map(|node| &node.0) {
+        Some(NodeRef::TransactionStmt(txn))
+            if txn.kind == TransactionStmtKind::TransStmtBegin as i32
+                || txn.kind == TransactionStmtKind::TransStmtStart as i32 =>
+        {
+            matches!(transaction_read_only(&txn.options), Ok(Some(true)))
+        }
+        _ => false,
+    }
+}
+
+fn transaction_read_only(options: &[pg_query::protobuf::Node]) -> Result<Option<bool>, ParseError> {
+    use pg_query::protobuf::{a_const::Val, node::Node, AConst};
+
+    let mut read_only = None;
     for opt in options {
-        let Some(pg_query::protobuf::node::Node::DefElem(def)) = &opt.node else {
+        let Some(Node::DefElem(def)) = &opt.node else {
             return Err(not_supported("transaction option"));
         };
-        let arg_is_zero = matches!(
-            def.arg.as_ref().and_then(|n| n.node.as_ref()),
-            Some(pg_query::protobuf::node::Node::AConst(pg_query::protobuf::AConst {
-                val: Some(pg_query::protobuf::a_const::Val::Ival(i)),
-                ..
-            })) if i.ival == 0
-        );
+        let arg = def.arg.as_ref().and_then(|n| n.node.as_ref());
         match def.defname.as_str() {
             "transaction_isolation" => {
-                let level = match def.arg.as_ref().and_then(|n| n.node.as_ref()) {
-                    Some(pg_query::protobuf::node::Node::AConst(pg_query::protobuf::AConst {
-                        val: Some(pg_query::protobuf::a_const::Val::Sval(s)),
+                let level = match arg {
+                    Some(Node::AConst(AConst {
+                        val: Some(Val::Sval(s)),
                         ..
                     })) => s.sval.to_lowercase(),
                     _ => return Err(not_supported("this transaction isolation level")),
@@ -5859,32 +5896,24 @@ fn check_transaction_options(
                     )));
                 }
             }
-            "transaction_deferrable" if !arg_is_zero => {
-                return Err(not_supported("a DEFERRABLE transaction"));
-            }
-            "transaction_read_only" if !arg_is_zero && !read_only_allowed => {
-                return Err(not_supported("a READ ONLY transaction"));
-            }
-            "transaction_deferrable" | "transaction_read_only" => {}
+            "transaction_deferrable" => match arg {
+                Some(Node::AConst(AConst {
+                    val: Some(Val::Ival(i)),
+                    ..
+                })) if i.ival == 0 => {}
+                _ => return Err(not_supported("a DEFERRABLE transaction")),
+            },
+            "transaction_read_only" => match arg {
+                Some(Node::AConst(AConst {
+                    val: Some(Val::Ival(i)),
+                    ..
+                })) => read_only = Some(i.ival != 0),
+                _ => return Err(not_supported("this transaction access mode")),
+            },
             other => return Err(not_supported(format!("transaction option {other}"))),
         }
     }
-    Ok(())
-}
-
-pub fn check_set_transaction(parse_result: &ParseResult) -> Result<bool, ParseError> {
-    use pg_query::{protobuf::VariableSetKind, NodeRef};
-
-    match parse_result.protobuf.nodes().first().map(|node| &node.0) {
-        Some(NodeRef::VariableSetStmt(stmt))
-            if stmt.kind == VariableSetKind::VarSetMulti as i32
-                && stmt.name.eq_ignore_ascii_case("transaction") =>
-        {
-            check_transaction_options(&stmt.args, true)?;
-            Ok(true)
-        }
-        _ => Ok(false),
-    }
+    Ok(read_only)
 }
 
 /// The byte offset of the table name in a CREATE TABLE statement that names
@@ -9929,12 +9958,43 @@ mod tests {
     }
 
     #[test]
-    fn fail_closed_transaction_options() {
-        assert_not_supported("BEGIN READ ONLY", "READ ONLY");
-        assert_not_supported(
-            "START TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY",
-            "READ ONLY",
+    fn transaction_access_modes() {
+        let begin_read_only = |sql| {
+            assert_translates(sql);
+            is_begin_read_only(&crate::parse(sql).unwrap())
+        };
+        assert!(begin_read_only("BEGIN READ ONLY"));
+        assert!(begin_read_only(
+            "START TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY"
+        ));
+        assert!(begin_read_only("BEGIN READ WRITE, READ ONLY"));
+        assert!(!begin_read_only("BEGIN READ ONLY, READ WRITE"));
+        assert!(!begin_read_only("BEGIN"));
+
+        let set_transaction = |sql| {
+            try_extract_set_transaction(&crate::parse(sql).unwrap())
+                .unwrap()
+                .unwrap()
+                .read_only
+        };
+        assert_eq!(
+            set_transaction("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY"),
+            Some(true)
         );
+        assert_eq!(set_transaction("SET TRANSACTION READ WRITE"), Some(false));
+        assert_eq!(
+            set_transaction("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ"),
+            None
+        );
+        assert!(
+            try_extract_set_transaction(&crate::parse("SET search_path = a").unwrap())
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn fail_closed_transaction_options() {
         assert_not_supported("COMMIT AND CHAIN", "AND CHAIN");
         assert_not_supported("ROLLBACK AND CHAIN", "AND CHAIN");
         assert_translates("COMMIT AND NO CHAIN");
@@ -10613,6 +10673,23 @@ mod tests {
         ] {
             assert_not_supported(sql, needle);
         }
+        for (sql, needle) in [
+            (
+                "SET TRANSACTION ISOLATION LEVEL SERIALIZABLE",
+                "ISOLATION LEVEL SERIALIZABLE",
+            ),
+            (
+                "SET TRANSACTION ISOLATION LEVEL READ COMMITTED, READ ONLY",
+                "ISOLATION LEVEL READ COMMITTED",
+            ),
+            ("SET TRANSACTION READ ONLY, DEFERRABLE", "DEFERRABLE"),
+            ("SET TRANSACTION NOT DEFERRABLE, DEFERRABLE", "DEFERRABLE"),
+        ] {
+            let err = try_extract_set_transaction(&crate::parse(sql).unwrap())
+                .err()
+                .unwrap_or_else(|| panic!("{sql} should be rejected"));
+            assert!(err.to_string().contains(needle), "{sql}: {err}");
+        }
         assert_translates("BEGIN ISOLATION LEVEL REPEATABLE READ, READ WRITE, NOT DEFERRABLE");
         assert_translates("BEGIN");
     }
@@ -10630,9 +10707,10 @@ mod tests {
             ),
             ("SET TRANSACTION DEFERRABLE", "DEFERRABLE"),
         ] {
-            let err = check_set_transaction(&crate::parse(sql).unwrap())
-                .expect_err(sql)
-                .to_string();
+            let err = match try_extract_set_transaction(&crate::parse(sql).unwrap()) {
+                Err(err) => err.to_string(),
+                Ok(_) => panic!("{sql} was accepted"),
+            };
             assert!(
                 err.contains("not supported") && err.contains(needle),
                 "{sql}: {err}"
@@ -10643,12 +10721,16 @@ mod tests {
             "SET TRANSACTION READ WRITE, NOT DEFERRABLE",
         ] {
             assert!(
-                check_set_transaction(&crate::parse(sql).unwrap()).unwrap(),
+                try_extract_set_transaction(&crate::parse(sql).unwrap())
+                    .unwrap()
+                    .is_some(),
                 "{sql}"
             );
         }
         assert!(
-            !check_set_transaction(&crate::parse("SET search_path TO public").unwrap()).unwrap()
+            try_extract_set_transaction(&crate::parse("SET search_path TO public").unwrap())
+                .unwrap()
+                .is_none()
         );
     }
 }

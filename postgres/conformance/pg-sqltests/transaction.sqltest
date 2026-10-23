@@ -64,6 +64,107 @@ expect error {
 }
 
 @setup counter
+test txn-set-transaction-read-only-rejects-writes {
+    BEGIN;
+    SET TRANSACTION READ ONLY;
+    UPDATE counter SET n = 1;
+}
+expect error {}
+
+@setup counter
+test txn-begin-read-only-rejects-writes {
+    BEGIN READ ONLY;
+    SELECT n FROM counter;
+    INSERT INTO counter VALUES (1);
+}
+expect error {}
+
+@setup counter
+test txn-start-transaction-read-only-rejects-ddl {
+    START TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY;
+    CREATE TABLE t2 (a int);
+}
+expect error {}
+
+test txn-read-only-rejects-nextval {
+    CREATE SEQUENCE s;
+    BEGIN READ ONLY;
+    SELECT nextval('s');
+}
+expect error {}
+
+@setup counter
+test txn-read-only-allows-window-function {
+    BEGIN READ ONLY;
+    SELECT row_number() OVER () FROM counter;
+    SELECT sum(n) OVER (ORDER BY n) FROM counter;
+    COMMIT;
+}
+expect {
+    1
+    0
+}
+
+@setup counter
+test txn-read-only-allows-materialized-cte {
+    BEGIN READ ONLY;
+    WITH c AS MATERIALIZED (SELECT n FROM counter) SELECT count(*) FROM c;
+    COMMIT;
+}
+expect {
+    1
+}
+
+@setup counter
+test txn-read-write-after-query-rejected {
+    BEGIN READ ONLY;
+    SELECT n FROM counter;
+    SET TRANSACTION READ WRITE;
+}
+expect error {}
+
+@setup counter
+test txn-begin-read-only-then-read-write {
+    BEGIN READ ONLY;
+    SET TRANSACTION READ WRITE;
+    UPDATE counter SET n = 7;
+    COMMIT;
+    SELECT n FROM counter;
+}
+expect {
+    7
+}
+
+@setup counter
+test txn-read-only-ends-with-transaction {
+    BEGIN READ ONLY;
+    SELECT n FROM counter;
+    COMMIT;
+    BEGIN;
+    SET TRANSACTION READ ONLY;
+    ROLLBACK;
+    BEGIN;
+    UPDATE counter SET n = n + 1;
+    COMMIT;
+    SELECT n FROM counter;
+}
+expect {
+    0
+    1
+}
+
+@setup counter
+@skip-if postgres "the runner sends a test as one query string, which PostgreSQL runs as a single implicit transaction"
+test txn-set-transaction-read-only-outside-block-has-no-effect {
+    SET TRANSACTION READ ONLY;
+    UPDATE counter SET n = 3;
+    SELECT n FROM counter;
+}
+expect {
+    3
+}
+
+@setup counter
 test txn-set-transaction-read-write-keeps-earlier-changes {
     BEGIN;
     UPDATE counter SET n = 29;
@@ -151,4 +252,18 @@ test txn-drop-table-rollback-restores {
 }
 expect {
     0
+}
+
+@setup counter
+test txn-lock-table-before-read-write {
+    BEGIN;
+    SET TRANSACTION READ ONLY;
+    LOCK TABLE counter IN ACCESS SHARE MODE;
+    SET TRANSACTION READ WRITE;
+    UPDATE counter SET n = 9;
+    COMMIT;
+    SELECT n FROM counter;
+}
+expect {
+    9
 }

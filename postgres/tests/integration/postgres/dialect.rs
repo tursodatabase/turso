@@ -118,6 +118,93 @@ fn test_postgres_access_share_lock_requires_transaction_at_execution(db: TempDat
 }
 
 #[turso_macros::test(mvcc)]
+fn test_postgres_read_only_transaction_rejects_statements_prepared_before_it(db: TempDatabase) {
+    let conn = db.connect_postgres();
+    conn.execute("CREATE TABLE ro_items (v INTEGER)").unwrap();
+    let mut insert = conn.prepare("INSERT INTO ro_items VALUES (1)").unwrap();
+    conn.execute("BEGIN READ ONLY").unwrap();
+    let error = insert.run_ignore_rows().unwrap_err();
+    assert!(error.to_string().contains("query_only"), "{error}");
+    conn.execute("ROLLBACK").unwrap();
+
+    conn.execute("BEGIN").unwrap();
+    let mut set_read_only = conn.prepare("SET TRANSACTION READ ONLY").unwrap();
+    conn.execute("INSERT INTO ro_items VALUES (2)").unwrap();
+    set_read_only.run_ignore_rows().unwrap();
+    assert!(conn.execute("INSERT INTO ro_items VALUES (3)").is_err());
+    conn.execute("COMMIT").unwrap();
+
+    conn.execute("INSERT INTO ro_items VALUES (4)").unwrap();
+    assert_eq!(
+        conn.prepare("SELECT v FROM ro_items ORDER BY v")
+            .unwrap()
+            .run_collect_rows()
+            .unwrap(),
+        vec![vec![Value::from_i64(2)], vec![Value::from_i64(4)]]
+    );
+}
+
+#[turso_macros::test(mvcc)]
+fn test_postgres_prepared_begin_read_only(db: TempDatabase) {
+    let conn = db.connect_postgres();
+    conn.execute("CREATE TABLE ro_items (v INTEGER)").unwrap();
+    let mut begin = conn.prepare("BEGIN READ ONLY").unwrap();
+    for _ in 0..2 {
+        begin.run_ignore_rows().unwrap();
+        let error = conn.execute("INSERT INTO ro_items VALUES (1)").unwrap_err();
+        assert!(error.to_string().contains("query_only"), "{error}");
+        conn.execute("COMMIT").unwrap();
+        begin.reset().unwrap();
+    }
+
+    let mut insert = conn.prepare("INSERT INTO ro_items VALUES (2)").unwrap();
+    let _unexecuted = conn.prepare("BEGIN READ ONLY").unwrap();
+    assert!(insert.run_ignore_rows().is_err());
+    conn.execute("INSERT INTO ro_items VALUES (3)").unwrap();
+    assert_eq!(
+        conn.prepare("SELECT v FROM ro_items")
+            .unwrap()
+            .run_collect_rows()
+            .unwrap(),
+        vec![vec![Value::from_i64(3)]]
+    );
+}
+
+#[turso_macros::test(mvcc)]
+fn test_postgres_read_only_transaction_keeps_query_only_set_before_it(db: TempDatabase) {
+    let conn = db.connect_postgres();
+    conn.execute("CREATE TABLE ro_items (v INTEGER)").unwrap();
+    conn.pragma_update("query_only", 1).unwrap();
+    conn.execute("BEGIN READ ONLY").unwrap();
+    conn.execute("COMMIT").unwrap();
+    conn.execute("SELECT 1").unwrap();
+    assert!(conn.inner().get_query_only());
+    conn.execute("BEGIN").unwrap();
+    conn.execute("SET TRANSACTION READ ONLY").unwrap();
+    conn.execute("SET TRANSACTION READ WRITE").unwrap();
+    assert!(conn.inner().get_query_only());
+    conn.execute("COMMIT").unwrap();
+    assert!(conn.execute("INSERT INTO ro_items VALUES (1)").is_err());
+}
+
+#[turso_macros::test(mvcc)]
+fn test_postgres_set_transaction_read_only_takes_effect_when_run(db: TempDatabase) {
+    let conn = db.connect_postgres();
+    conn.execute("CREATE TABLE ro_items (v INTEGER)").unwrap();
+    conn.execute("BEGIN").unwrap();
+    let _unexecuted = conn.prepare("SET TRANSACTION READ ONLY").unwrap();
+    conn.execute("INSERT INTO ro_items VALUES (1)").unwrap();
+    conn.execute("COMMIT").unwrap();
+    assert_eq!(
+        conn.prepare("SELECT count(*) FROM ro_items")
+            .unwrap()
+            .run_collect_rows()
+            .unwrap(),
+        vec![vec![Value::from_i64(1)]]
+    );
+}
+
+#[turso_macros::test(mvcc)]
 fn test_postgres_rejects_unsupported_transaction_commands(db: TempDatabase) {
     let conn = db.connect_postgres();
     assert!(conn
