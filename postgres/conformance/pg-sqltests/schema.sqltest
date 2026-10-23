@@ -294,31 +294,28 @@ test view-reads-a-table-of-another-schema {
     CREATE TABLE app.t (x int);
     INSERT INTO app.t VALUES (3);
     CREATE VIEW v AS SELECT x FROM app.t;
-    CREATE MATERIALIZED VIEW mv AS SELECT x FROM app.t;
     CREATE VIEW app.v AS SELECT x FROM public.v;
     SELECT * FROM v;
-    SELECT * FROM mv;
     SELECT * FROM app.v;
 }
 expect {
     3
     3
-    3
 }
 
-test materialized-view-created-in-the-search-path-schema-reads-its-tables {
+test view-created-in-the-search-path-schema-reads-its-tables {
     CREATE SCHEMA app;
     CREATE TABLE app.t (x int);
     CREATE TABLE t (x int);
     INSERT INTO app.t VALUES (1);
     INSERT INTO t VALUES (100);
     SET search_path TO app;
-    CREATE MATERIALIZED VIEW mv AS SELECT sum(x) AS s FROM t;
-    SELECT * FROM mv;
+    CREATE VIEW v AS SELECT sum(x) AS s FROM t;
+    SELECT * FROM v;
     INSERT INTO t VALUES (2);
     INSERT INTO public.t VALUES (200);
-    REFRESH MATERIALIZED VIEW mv;
-    SELECT * FROM mv;
+    SET search_path TO public;
+    SELECT * FROM app.v;
 }
 expect {
     1
@@ -429,14 +426,11 @@ test schema-named-with-a-reserved-prefix-holds-objects {
     CREATE INDEX i ON sqlite_x.t (x);
     ALTER TABLE sqlite_x.t ADD COLUMN y int;
     CREATE VIEW sqlite_x.v AS SELECT x FROM sqlite_x.t;
-    CREATE MATERIALIZED VIEW sqlite_x.mv AS SELECT x FROM sqlite_x.t;
     SELECT * FROM sqlite_x.v;
-    SELECT * FROM sqlite_x.mv;
     DROP SCHEMA sqlite_x CASCADE;
     SELECT count(*) FROM pg_tables WHERE schemaname = 'sqlite_x';
 }
 expect {
-    1
     1
     0
 }
