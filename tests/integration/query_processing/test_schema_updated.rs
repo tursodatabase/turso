@@ -125,6 +125,36 @@ fn test_temp_schema_change_invalidates_unrelated_prepared_statement(
     Ok(())
 }
 
+/// A statement prepared inside a transaction may read an index that the
+/// transaction created. ROLLBACK removes the index, and a later CREATE TABLE
+/// brings the schema version back to the number the statement was prepared
+/// with, reusing the index's page. The statement must still be reprepared
+/// instead of reading that page as the index.
+#[turso_macros::test(mvcc)]
+fn test_rolled_back_schema_change_reprepares_statement(tmp_db: TempDatabase) -> Result<()> {
+    let conn = tmp_db.connect_limbo();
+    conn.execute("CREATE TABLE t(k INTEGER, v INTEGER)")?;
+    conn.execute("INSERT INTO t VALUES (1, 10), (2, 20)")?;
+
+    conn.execute("BEGIN")?;
+    conn.execute("CREATE INDEX t_k ON t(k)")?;
+    let mut stmt = conn.prepare("SELECT v FROM t INDEXED BY t_k WHERE k = 2")?;
+    conn.execute("ROLLBACK")?;
+    conn.execute("CREATE TABLE zz(a INTEGER, b INTEGER)")?;
+    conn.execute("INSERT INTO zz VALUES (2, 99)")?;
+
+    let mut rows = Vec::new();
+    let result = stmt.run_with_row_callback(|row| {
+        rows.push(row.get::<i64>(0)?);
+        Ok(())
+    });
+    let error = result.expect_err("the index the statement names was rolled back");
+    assert_that!(error.to_string()).contains("no such index: t_k");
+    assert_that!(rows).is_empty();
+
+    Ok(())
+}
+
 #[test]
 fn test_prepared_schema_pragmas_reprepare_after_ddl() -> Result<()> {
     let cases: [(&[&str], &str, &[&str]); 7] = [

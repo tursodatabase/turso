@@ -1009,7 +1009,8 @@ fn emit_unmatched_rows_subquery(
             &subquery.query_type,
             subquery.correlated,
         )
-    })
+    })?;
+    Ok(())
 }
 
 pub(super) struct AutoIndexResult {
@@ -1117,7 +1118,7 @@ pub(super) fn emit_autoindex(
                 }
             }
         }
-        program.emit_column_or_rowid(table_cursor_id, col.pos_in_table, reg);
+        emit_stored_column(program, table_cursor_id, col.pos_in_table, reg, resolver)?;
     }
     if table_has_rowid {
         program.emit_insn(Insn::RowId {

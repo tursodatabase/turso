@@ -147,6 +147,443 @@ expect {
     public
 }
 
+test current-setting-default-search-path {
+    SELECT current_setting('search_path');
+    SELECT pg_catalog.current_setting('SEARCH_PATH');
+    SELECT current_setting('Search_Path', false);
+    SELECT current_setting('search_path', true);
+}
+expect {
+    "$user", public
+    "$user", public
+    "$user", public
+    "$user", public
+}
+
+test current-setting-reads-set-config {
+    SELECT quote_literal(set_config('search_path', ' "My,Schema", PUBLIC ', false));
+    SELECT quote_literal(current_setting('search_path'));
+    SELECT quote_literal(set_config('search_path', '', false));
+    SELECT quote_literal(current_setting('search_path'));
+    SELECT set_config('search_path', NULL, false);
+    SELECT current_setting('search_path');
+}
+expect {
+    ' "My,Schema", PUBLIC '
+    ' "My,Schema", PUBLIC '
+    ''
+    ''
+    "$user", public
+    "$user", public
+}
+
+test current-setting-reads-set {
+    SET search_path TO "My,Schema", PUBLIC;
+    SELECT current_setting('search_path');
+    SET search_path TO '';
+    SELECT current_setting('search_path');
+}
+expect {
+    "My,Schema", public
+    ""
+}
+
+test current-setting-sees-set-config-of-the-same-row {
+    CREATE TABLE setting_rows (x int);
+    INSERT INTO setting_rows VALUES (1), (2), (3);
+    SELECT set_config('search_path', 'v' || x, false), current_setting('search_path')
+    FROM setting_rows;
+    SELECT current_setting('search_path'), set_config('search_path', 'last', false);
+    SELECT current_setting('search_path');
+}
+expect {
+    v1|v1
+    v2|v2
+    v3|v3
+    v3|last
+    last
+}
+
+test current-setting-matches-pg-settings {
+    SET search_path TO public;
+    SELECT s.name, current_setting(s.name), s.setting
+    FROM pg_catalog.pg_settings s WHERE s.name = 'search_path';
+}
+expect {
+    search_path|public|public
+}
+
+test current-setting-takes-arguments-from-rows {
+    CREATE TABLE setting_names (id int, name text, missing_ok boolean);
+    INSERT INTO setting_names VALUES
+        (1, 'search_path', false), (2, 'no_such_setting', true),
+        (3, NULL, false), (4, 'search_path', NULL);
+    SELECT id, coalesce(current_setting(name, missing_ok), '<null>')
+    FROM setting_names ORDER BY id;
+}
+expect {
+    1|"$user", public
+    2|<null>
+    3|<null>
+    4|<null>
+}
+
+test current-setting-null-arguments-return-null {
+    SELECT coalesce(current_setting(NULL), '<null>');
+    SELECT coalesce(current_setting(NULL, true), '<null>');
+    SELECT coalesce(current_setting('search_path', NULL), '<null>');
+    SELECT coalesce(current_setting('no_such_setting', NULL), '<null>');
+}
+expect {
+    <null>
+    <null>
+    <null>
+    <null>
+}
+
+test current-setting-missing-ok-returns-null-for-unknown-parameters {
+    SELECT coalesce(current_setting('no_such_setting', true), '<null>');
+    SELECT coalesce(current_setting('nosuch.setting', true), '<null>');
+    SELECT coalesce(current_setting('', true), '<null>');
+}
+expect {
+    <null>
+    <null>
+    <null>
+}
+
+test current-setting-unknown-parameter-errors {
+    SELECT current_setting('no_such_setting');
+}
+expect error {
+    unrecognized configuration parameter "no_such_setting"
+}
+
+test current-setting-unknown-parameter-without-missing-ok-errors {
+    SELECT current_setting('no_such_setting', false);
+}
+expect error {
+    unrecognized configuration parameter "no_such_setting"
+}
+
+test current-setting-does-not-trim-the-parameter-name {
+    SELECT current_setting('search_path ');
+}
+expect error {
+    unrecognized configuration parameter "search_path "
+}
+
+test current-setting-integer-parameter-name-errors {
+    SELECT current_setting(5);
+}
+expect error {}
+
+test current-setting-text-missing-ok-errors {
+    SELECT current_setting('search_path', 'x');
+}
+expect error {}
+
+test current-setting-without-arguments-errors {
+    SELECT current_setting();
+}
+expect error {}
+
+test current-setting-with-three-arguments-errors {
+    SELECT current_setting('search_path', true, true);
+}
+expect error {}
+
+test set-config-custom-parameter {
+    SELECT set_config('app.user_id', '42', false);
+    SELECT current_setting('app.user_id');
+    SELECT current_setting('APP.User_Id');
+    SELECT current_setting('app.user_id', true);
+}
+expect {
+    42
+    42
+    42
+    42
+}
+
+test set-config-custom-parameter-names {
+    SELECT set_config('a.b.c', 'three parts', false);
+    SELECT set_config('_a._b', 'underscores', false);
+    SELECT set_config('app.x1$', 'digit and dollar', false);
+    SELECT set_config('é.ü', 'not ASCII', false);
+    SELECT current_setting('A.B.C'), current_setting('_A._B'), current_setting('APP.X1$'), current_setting('é.ü');
+}
+expect {
+    three parts
+    underscores
+    digit and dollar
+    not ASCII
+    three parts|underscores|digit and dollar|not ASCII
+}
+
+test set-config-custom-parameter-name-is-not-case-sensitive-when-set {
+    SELECT set_config('APP.Mixed_Case', 'v', false);
+    SELECT current_setting('app.mixed_case');
+}
+expect {
+    v
+    v
+}
+
+test custom-parameter-name-ignores-only-the-case-of-ascii-letters {
+    SELECT set_config('app.é', 'lower', false);
+    SELECT current_setting('APP.é');
+    SELECT coalesce(current_setting('app.É', true), '<null>');
+}
+expect {
+    lower
+    lower
+    <null>
+}
+
+test current-setting-undefined-custom-parameter-errors {
+    SELECT current_setting('app.never_set');
+}
+expect error {
+    unrecognized configuration parameter "app\.never_set"
+}
+
+test set-config-custom-parameter-null-value-resets-it {
+    SELECT set_config('app.reset_me', 'v', false);
+    SELECT quote_literal(set_config('app.reset_me', NULL, false));
+    SELECT quote_literal(current_setting('app.reset_me'));
+    SELECT quote_literal(current_setting('app.reset_me', true));
+}
+expect {
+    v
+    ''
+    ''
+    ''
+}
+
+test set-config-custom-parameter-name-with-an-empty-part-errors {
+    SELECT set_config('app..user_id', 'v', false);
+}
+expect error {
+    invalid configuration parameter name "app\.\.user_id"
+}
+
+test set-config-custom-parameter-name-with-a-trailing-dot-errors {
+    SELECT set_config('app.', 'v', false);
+}
+expect error {
+    invalid configuration parameter name "app\."
+}
+
+test set-config-custom-parameter-name-with-a-leading-digit-errors {
+    SELECT set_config('app.1user', 'v', false);
+}
+expect error {
+    invalid configuration parameter name "app\.1user"
+}
+
+test set-config-custom-parameter-name-with-a-space-errors {
+    SELECT set_config('app.user id', 'v', false);
+}
+expect error {
+    invalid configuration parameter name "app\.user id"
+}
+
+test set-config-unknown-parameter-without-a-dot-errors {
+    SELECT set_config('no_such_setting', 'v', false);
+}
+expect error {
+    unrecognized configuration parameter "no_such_setting"
+}
+
+test set-config-local-custom-parameter-in-one-statement {
+    SELECT set_config('app.tx_value', 'local', true), current_setting('app.tx_value');
+}
+expect {
+    local|local
+}
+
+test set-config-local-custom-parameter-ends-with-its-statement-outside-a-transaction {
+    SELECT set_config('app.autocommit_local', 'local', true);
+    SELECT quote_literal(current_setting('app.autocommit_local'));
+}
+expect {
+    local
+    ''
+}
+
+test set-config-local-custom-parameter-ends-at-commit {
+    BEGIN;
+    SELECT set_config('app.tx_value', 'local', true);
+    SELECT current_setting('app.tx_value');
+    COMMIT;
+    SELECT quote_literal(current_setting('app.tx_value'));
+    SELECT quote_literal(current_setting('app.tx_value', true));
+}
+expect {
+    local
+    local
+    ''
+    ''
+}
+
+test set-config-local-custom-parameter-ends-at-rollback {
+    BEGIN;
+    SELECT set_config('app.tx_value', 'local', true);
+    ROLLBACK;
+    SELECT quote_literal(current_setting('app.tx_value'));
+}
+expect {
+    local
+    ''
+}
+
+test set-config-local-custom-parameter-hides-the-session-value {
+    BEGIN;
+    SELECT set_config('app.mode', 'session', false);
+    COMMIT;
+    BEGIN;
+    SELECT set_config('app.mode', 'local', true);
+    SELECT current_setting('app.mode');
+    COMMIT;
+    SELECT current_setting('app.mode');
+    BEGIN;
+    SELECT set_config('app.mode', 'local', true);
+    ROLLBACK;
+    SELECT current_setting('app.mode');
+}
+expect {
+    session
+    local
+    local
+    session
+    local
+    session
+}
+
+test set-config-session-value-stays-after-a-later-local-value-ends {
+    BEGIN;
+    SELECT set_config('app.mode', 'session', false);
+    SELECT set_config('app.mode', 'local', true);
+    SELECT current_setting('app.mode');
+    COMMIT;
+    SELECT current_setting('app.mode');
+}
+expect {
+    session
+    local
+    local
+    session
+}
+
+test set-config-session-value-replaces-a-local-value {
+    BEGIN;
+    SELECT set_config('app.mode', 'local', true);
+    SELECT set_config('app.mode', 'session', false);
+    COMMIT;
+    SELECT current_setting('app.mode');
+}
+expect {
+    local
+    session
+    session
+}
+
+test set-config-rollback-undoes-a-session-value {
+    BEGIN;
+    SELECT set_config('app.rb_value', 'before', false);
+    COMMIT;
+    BEGIN;
+    SELECT set_config('app.rb_value', 'in transaction', false);
+    ROLLBACK;
+    SELECT current_setting('app.rb_value');
+}
+expect {
+    before
+    in transaction
+    before
+}
+
+test set-config-custom-parameter-stays-defined-after-rollback {
+    BEGIN;
+    SELECT set_config('app.rb_new', 'x', false);
+    ROLLBACK;
+    SELECT quote_literal(current_setting('app.rb_new'));
+}
+expect {
+    x
+    ''
+}
+
+test set-config-rollback-to-savepoint-undoes-later-values {
+    BEGIN;
+    SELECT set_config('app.sp_value', 'before savepoint', false);
+    SAVEPOINT s;
+    SELECT set_config('app.sp_value', 'after savepoint', false);
+    SELECT set_config('app.sp_local', 'local', true);
+    ROLLBACK TO SAVEPOINT s;
+    SELECT current_setting('app.sp_value'), quote_literal(current_setting('app.sp_local'));
+    COMMIT;
+    SELECT current_setting('app.sp_value');
+}
+expect {
+    before savepoint
+    after savepoint
+    local
+    before savepoint|''
+    before savepoint
+}
+
+test set-config-release-savepoint-keeps-values {
+    BEGIN;
+    SAVEPOINT s;
+    SELECT set_config('app.rel_session', 'session', false);
+    SELECT set_config('app.rel_local', 'local', true);
+    RELEASE SAVEPOINT s;
+    SELECT current_setting('app.rel_session'), current_setting('app.rel_local');
+    COMMIT;
+    SELECT current_setting('app.rel_session'), quote_literal(current_setting('app.rel_local'));
+}
+expect {
+    session
+    local
+    session|local
+    session|''
+}
+
+test set-config-rollback-undoes-values-of-a-released-savepoint {
+    BEGIN;
+    SAVEPOINT s;
+    SELECT set_config('app.rel_rb', 'released', false);
+    RELEASE SAVEPOINT s;
+    ROLLBACK;
+    SELECT quote_literal(current_setting('app.rel_rb'));
+}
+expect {
+    released
+    ''
+}
+
+test set-config-rollback-to-an-outer-savepoint {
+    BEGIN;
+    SELECT set_config('app.nested', 'outer', false);
+    SAVEPOINT a;
+    SELECT set_config('app.nested', 'a', false);
+    SAVEPOINT b;
+    SELECT set_config('app.nested', 'b', true);
+    ROLLBACK TO SAVEPOINT a;
+    SELECT current_setting('app.nested');
+    COMMIT;
+    SELECT current_setting('app.nested');
+}
+expect {
+    outer
+    a
+    b
+    outer
+    outer
+}
+
 test obj-description-unknown-oid-is-null {
     SELECT obj_description(0, 'pg_class');
 }
@@ -228,6 +665,19 @@ test mode-within-group {
 }
 expect {
     1
+}
+
+test within-group-skips-nulls-with-any-null-order {
+    CREATE TABLE demo (value int);
+    INSERT INTO demo VALUES (1), (NULL), (2), (2);
+    SELECT percentile_cont(0.25) WITHIN GROUP (ORDER BY value) FROM demo;
+    SELECT percentile_disc(0) WITHIN GROUP (ORDER BY value NULLS FIRST) FROM demo;
+    SELECT mode() WITHIN GROUP (ORDER BY value NULLS LAST) FROM demo;
+}
+expect {
+    1.5
+    1
+    2
 }
 
 @skip-if postgres "Turso has the ACLs of PostgreSQL 16, without the MAINTAIN privilege (m) of PostgreSQL 17"
@@ -504,4 +954,149 @@ expect {
     1|2
     1|3
     2|-1
+}
+
+test json-to-recordset-column-list {
+    SELECT (id + 10) || ':' || v FROM json_to_recordset('[{"id":1,"v":"a"},{"id":2,"v":"b"}]') AS _("id" integer, "v" text) ORDER BY id;
+    SELECT (id + 10) || ':' || v FROM jsonb_to_recordset('[{"id":3,"v":"c"},{"id":4,"v":"d"}]'::jsonb) AS _("id" integer, "v" text) ORDER BY id;
+    SELECT count(*) FROM json_to_recordset('[]') AS _(id integer);
+    SELECT count(*) FROM json_to_recordset(NULL) AS _(id integer);
+}
+expect {
+    11:a
+    12:b
+    13:c
+    14:d
+    0
+    0
+}
+
+test json-to-record-column-list {
+    SELECT (id + 10) || ':' || v FROM json_to_record('{"id":1,"v":"a"}') AS _("id" integer, "v" text);
+    SELECT (id + 10) || ':' || v FROM jsonb_to_record('{"id":5,"v":"e"}'::jsonb) AS _("id" integer, "v" text);
+    SELECT coalesce(m, 'none') FROM json_to_record('{"id":1}') AS _(id integer, m text);
+    SELECT coalesce(id, -1) FROM json_to_record(NULL) AS _(id integer);
+}
+expect {
+    11:a
+    15:e
+    none
+    -1
+}
+
+test json-to-record-value-conversion {
+    SELECT id + 1, n, j, s FROM json_to_record('{"id":"5","n":{"z":[1]},"j":"q","s":"x"}') AS _(id integer, n text, j json, s text);
+    SELECT * FROM json_to_record('{"a b":1,"c.d":2,"$x":3,"q\"r":4}') AS _("a b" integer, "c.d" integer, "$x" integer, "q""r" integer);
+}
+expect {
+    6|{"z":[1]}|"q"|x
+    1|2|3|4
+}
+
+test json-to-recordset-correlated {
+    CREATE TABLE json_bodies (id int, body text);
+    INSERT INTO json_bodies VALUES (1, '[{"v":"a"},{"v":"b"}]'), (2, '[{"v":"c"}]');
+    SELECT b.id, r.v FROM json_bodies AS b, json_to_recordset(b.body::json) AS r(v text) ORDER BY b.id, r.v;
+}
+expect {
+    1|a
+    1|b
+    2|c
+}
+
+test json-to-record-requires-column-list {
+    SELECT * FROM json_to_record('{"id":1}') AS _;
+}
+expect error {
+    a column definition list is required for functions returning "record"
+}
+
+test json-to-record-argument-named-like-json-each-column {
+    CREATE TABLE json_each_names (value text, key text, type text);
+    INSERT INTO json_each_names VALUES ('[{"v":"a"},{"v":"b"}]', '{"v":"k"}', '[{"v":"t"}]');
+    SELECT r.v, s.v FROM json_each_names, json_to_recordset(value::json) AS r(v text), json_to_record(key::json) AS s(v text) ORDER BY r.v;
+    SELECT r.v FROM json_each_names, jsonb_to_recordset(type::jsonb) AS r(v text);
+}
+expect {
+    a|k
+    b|k
+    t
+}
+
+test json-to-record-without-alias-uses-function-name {
+    SELECT json_to_recordset.id FROM json_to_recordset('[{"id":1},{"id":2}]') AS (id int) ORDER BY json_to_recordset.id;
+    SELECT jsonb_to_record.id FROM jsonb_to_record('{"id":3}'::jsonb) AS (id int);
+}
+expect {
+    1
+    2
+    3
+}
+
+test json-to-recordset-object-errors {
+    SELECT * FROM json_to_recordset('{"a":1}') AS _(a int);
+}
+expect error {
+    cannot call json_to_recordset on an object
+}
+
+test json-to-recordset-scalar-errors {
+    SELECT * FROM jsonb_to_recordset('5'::jsonb) AS _(a int);
+}
+expect error {
+    cannot call jsonb_to_recordset on a non-array
+}
+
+test json-to-recordset-json-scalar-errors {
+    SELECT * FROM json_to_recordset('5') AS _(a int);
+}
+expect error {
+    cannot call json_to_recordset on a scalar
+}
+
+test json-to-recordset-non-object-element-errors {
+    SELECT * FROM json_to_recordset('[{"a":1},5]') AS _(a int);
+}
+expect error {
+    argument of json_to_recordset must be an array of objects
+}
+
+test json-to-recordset-null-element-errors {
+    SELECT * FROM jsonb_to_recordset('[null]'::jsonb) AS _(a int);
+}
+expect error {
+    argument of jsonb_to_recordset must be an array of objects
+}
+
+test json-to-record-array-errors {
+    SELECT * FROM json_to_record('[{"a":1}]') AS _(a int);
+}
+expect error {
+    cannot call populate_composite on an array
+}
+
+test json-to-record-scalar-errors {
+    SELECT * FROM jsonb_to_record('null'::jsonb) AS _(a int);
+}
+expect error {
+    cannot call populate_composite on a scalar
+}
+
+test json-to-record-text-column-keeps-json-text {
+    SELECT a, b, c, d, e, f, g FROM json_to_record('{"a":true,"b":1e2,"c":12345678901234567890,"d":-0,"e":false,"f":1.50,"g":"s"}') AS _(a text, b text, c text, d varchar, e text, f text, g text);
+    SELECT a, b FROM jsonb_to_recordset('[{"a":12345678901234567890,"b":true}]'::jsonb) AS _(a text, b varchar);
+}
+expect {
+    true|1e2|12345678901234567890|-0|false|1.50|s
+    12345678901234567890|true
+}
+
+test json-to-record-json-null-is-sql-null {
+    SELECT coalesce(a::text, '<null>'), coalesce(b::text, '<null>'), coalesce(c, '<null>'), coalesce(d, -1) FROM jsonb_to_record('{"a":null,"b":null,"c":null,"d":null}'::jsonb) AS _(a jsonb, b json, c text, d int);
+    SELECT coalesce(a::text, '<null>'), b FROM json_to_recordset('[{"a":null,"b":"x"},{"a":{"y":2},"b":"z"}]') AS _(a json, b json);
+}
+expect {
+    <null>|<null>|<null>|-1
+    <null>|"x"
+    {"y":2}|"z"
 }

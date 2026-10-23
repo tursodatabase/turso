@@ -3097,3 +3097,37 @@ fn checkpoints_and_reads_stay_correct_while_a_reader_holds_a_late_wal_frame() {
         "ok"
     );
 }
+
+#[test]
+fn subprocess_idle_begin_sees_table_created_by_other_process() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("coordination-idle-begin-schema.db");
+    let db_path_str = db_path.to_str().unwrap();
+    let io: Arc<dyn IO> = multiprocess_test_io();
+    let db = open_multiprocess_db(io, db_path_str).unwrap();
+    let conn = db.connect(ConnectOpts::new()).unwrap();
+    conn.execute("create table test(id integer primary key, value text)")
+        .unwrap();
+    conn.execute("begin").unwrap();
+
+    let current_exe = std::env::current_exe().unwrap();
+    let schema_output = Command::new(&current_exe)
+        .arg(MULTIPROCESS_SHM_SCHEMA_CHILD_TEST)
+        .arg("--exact")
+        .arg("--nocapture")
+        .env("TURSO_MULTIPROCESS_DB_PATH", db_path_str)
+        .output()
+        .unwrap();
+    assert!(
+        schema_output.status.success(),
+        "child schema process failed: stderr={}",
+        String::from_utf8_lossy(&schema_output.stderr)
+    );
+
+    let result = conn
+        .prepare("select value from child_table")
+        .and_then(|mut stmt| stmt.run_collect_rows());
+    let rows = result.unwrap();
+    assert_eq!(rows.len(), 1);
+    conn.execute("commit").unwrap();
+}

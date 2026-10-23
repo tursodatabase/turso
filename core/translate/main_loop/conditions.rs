@@ -65,13 +65,14 @@ fn emit_correlated_subqueries(
     for subquery_index in subqueries_to_emit {
         let subquery = &mut subqueries[subquery_index];
         let subquery_plan = subquery.consume_plan(EvalAt::Loop(join_index));
-        emit_non_from_clause_subquery(
+        let subroutine = emit_non_from_clause_subquery(
             program,
             resolver,
             *subquery_plan,
             &subquery.query_type,
             true,
         )?;
+        subquery.set_subroutine(subroutine);
     }
     Ok(())
 }

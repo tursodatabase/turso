@@ -21,7 +21,7 @@ use crate::{
     util::exprs_are_equivalent,
     vdbe::{
         affinity::{self, Affinity},
-        builder::{CursorKey, CursorType, ProgramBuilder},
+        builder::{CursorKey, CursorType, ProgramBuilder, Subroutine},
         insn::{HashDistinctData, Insn},
         BranchOffset, CursorID,
     },
@@ -923,10 +923,6 @@ pub enum DmlSafetyReason {
     /// The index method cursor does not materialize results up front,
     /// so writes could invalidate the live iterator.
     IndexMethodNotMaterialized,
-    /// The UPDATE changes a column referenced by an FK with a cascading
-    /// action (CASCADE / SET NULL / SET DEFAULT). The cascade can fire
-    /// triggers on referencing tables that write back to the target,
-    /// which would invalidate the live scan iterator.
     FkCascade,
 }
 
@@ -974,6 +970,10 @@ pub struct DeletePlan {
 #[derive(Debug, Clone)]
 pub struct UpdateSetClause {
     pub column_index: usize,
+    /// Names the SET list used for this column, as written. UPDATE OF triggers
+    /// match against these, so `SET rowid` and `SET id` differ even when `id` is
+    /// the INTEGER PRIMARY KEY.
+    pub column_names: Vec<ast::Name>,
     /// Original user-visible SET expression.
     pub expr: Box<ast::Expr>,
     /// In UPDATE FROM, SET clause expressions are rewritten to read from the
@@ -988,9 +988,10 @@ pub struct UpdateSetClause {
 }
 
 impl UpdateSetClause {
-    pub fn new(column_index: usize, expr: Box<ast::Expr>) -> Self {
+    pub fn new(column_index: usize, column_name: ast::Name, expr: Box<ast::Expr>) -> Self {
         Self {
             column_index,
+            column_names: vec![column_name],
             expr,
             update_from_result: None,
         }
@@ -1146,7 +1147,7 @@ pub(super) fn expand_star(
             {
                 if matches!(&table.table, Table::BTree(_) | Table::Virtual(_)) {
                     let database_name = resolver
-                        .get_database_name_by_index(table.database_id)
+                        .namespace_name(table.database_id)
                         .expect("the table database must exist while compiling a query");
                     crate::bail_parse_error!(
                         "ambiguous column name: {}.{}.{}",
@@ -3869,6 +3870,7 @@ pub struct IndexMethodQuery {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Aggregate {
+    pub order_cursor: Option<usize>,
     pub func: AggFunc,
     pub args: Vec<ast::Expr>,
     pub original_expr: ast::Expr,
@@ -3889,6 +3891,7 @@ impl Aggregate {
         filter_expr: Option<ast::Expr>,
     ) -> Self {
         Aggregate {
+            order_cursor: None,
             func,
             args: args.iter().map(|arg| *arg.clone()).collect(),
             original_expr: expr.clone(),
@@ -3896,6 +3899,30 @@ impl Aggregate {
             filter_expr,
             fraction_reg: None,
         }
+    }
+
+    pub fn order_by(&self) -> &[ast::SortedColumn] {
+        if matches!(self.func, AggFunc::Min | AggFunc::Max) {
+            return &[];
+        }
+        match &self.original_expr {
+            ast::Expr::FunctionCall { order_by, .. } => order_by,
+            _ => &[],
+        }
+    }
+
+    pub fn distinct_uses_order_key(&self) -> bool {
+        self.is_distinct()
+            && self.args.len() == 1
+            && self.order_by().len() == 1
+            && exprs_are_equivalent(&self.args[0], &self.order_by()[0].expr)
+    }
+
+    pub fn input_exprs(&self) -> impl Iterator<Item = &ast::Expr> {
+        self.args
+            .iter()
+            .chain(self.filter_expr.iter())
+            .chain(self.order_by().iter().map(|term| term.expr.as_ref()))
     }
 
     pub fn is_distinct(&self) -> bool {
@@ -4209,6 +4236,10 @@ pub enum SubqueryState {
         /// We keep these so later analysis can still understand dependencies
         /// even after the plan is consumed.
         outer_ref_ids: Vec<TableInternalId>,
+        /// Set when the subquery was emitted as a subroutine that a `Gosub`
+        /// can run again, for example against the NULL row of an aggregate
+        /// query that read no rows.
+        subroutine: Option<Subroutine>,
     },
 }
 
@@ -4324,6 +4355,7 @@ impl NonFromClauseSubquery {
                 self.state = SubqueryState::Evaluated {
                     evaluated_at,
                     outer_ref_ids,
+                    subroutine: None,
                 };
                 plan
             }
@@ -4331,6 +4363,13 @@ impl NonFromClauseSubquery {
                 panic!("subquery has already been evaluated");
             }
         }
+    }
+
+    pub fn set_subroutine(&mut self, new_subroutine: Option<Subroutine>) {
+        let SubqueryState::Evaluated { subroutine, .. } = &mut self.state else {
+            panic!("subquery must be emitted before its subroutine is recorded");
+        };
+        *subroutine = new_subroutine;
     }
 }
 

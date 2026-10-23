@@ -203,6 +203,9 @@ fn emit_loop_source<'a>(
                         for expr in agg.args.iter() {
                             let agg_reg = cur_reg;
                             cur_reg += 1;
+                            if !agg.order_by().is_empty() {
+                                continue;
+                            }
                             translate_expr(
                                 program,
                                 Some(&plan.table_references),
@@ -312,13 +315,13 @@ fn emit_loop_source<'a>(
                     None
                 };
 
-                translate_aggregation_step(
+                emit_aggregate_step(
                     program,
                     &plan.table_references,
+                    agg,
                     AggArgumentSource::new_from_expression(&agg.func, &agg.args, &agg.distinctness),
                     reg,
                     &t_ctx.resolver,
-                    agg.fraction_reg,
                 )?;
                 if let Distinctness::Distinct { ctx } = &agg.distinctness {
                     let ctx = ctx

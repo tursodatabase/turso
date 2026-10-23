@@ -1,4 +1,3 @@
-#[cfg(feature = "json")]
 use crate::types::TextSubtype;
 use crate::{
     function::MathFunc,
@@ -647,9 +646,8 @@ impl Value {
 
     pub fn exec_subtype(&self) -> Value {
         match self {
-            #[cfg(feature = "json")]
-            Value::Text(t) if t.subtype == TextSubtype::Json => Value::from_i64(74),
-            _ => Value::from_i64(0),
+            Value::Text(t) => Value::from_i64(i64::from(t.subtype)),
+            _ => Value::from_i64(i64::from(TextSubtype::Text)),
         }
     }
 
@@ -689,10 +687,9 @@ impl Value {
                     }
                     None => Value::Null,
                 },
-                Some(ignore) => match ignore {
-                    Value::Text(_) => {
+                Some(ignore) => match ignore.cast_text_ref() {
+                    Some(ignore) => {
                         let input = self.to_string();
-                        let ignore = ignore.to_string();
                         let mut chars = input.chars().peekable();
                         let mut out =
                             <crate::ValueBlob as crate::alloc::TursoVecExt<u8>>::with_capacity(
@@ -727,7 +724,7 @@ impl Value {
                             out.push(((hi << 4) | lo) as u8);
                         }
                     }
-                    _ => Value::Null,
+                    None => Value::Null,
                 },
             },
         }
@@ -1068,24 +1065,29 @@ impl Value {
         // string Y in string X. The BINARY collating sequence is used for comparisons. If Y is an empty string
         // then return X unchanged. If Z is not initially a string, it is cast to a UTF-8 string prior to processing.
 
-        // If any of the arguments is NULL, the result is NULL.
-        if matches!(source, Value::Null)
-            || matches!(pattern, Value::Null)
-            || matches!(replacement, Value::Null)
-        {
+        // A NULL X or Y gives NULL. Like SQLite, Z is only checked after an empty Y has
+        // returned X, so replace(X, '', NULL) is X.
+        if matches!(source, Value::Null) || matches!(pattern, Value::Null) {
             return Ok(Value::Null);
         }
 
         let source = source.exec_cast("TEXT")?;
         let pattern = pattern.exec_cast("TEXT")?;
-        let replacement = replacement.exec_cast("TEXT")?;
 
         // If any of the casts failed, panic as text casting is not expected to fail.
-        match (&source, &pattern, &replacement) {
-            (Value::Text(source), Value::Text(pattern), Value::Text(replacement)) => {
+        match (&source, &pattern) {
+            (Value::Text(source), Value::Text(pattern)) => {
                 if pattern.as_str().is_empty() || pattern.as_str().starts_with('\0') {
                     return Ok(Value::Text(source.clone()));
                 }
+
+                if matches!(replacement, Value::Null) {
+                    return Ok(Value::Null);
+                }
+                let replacement = replacement.exec_cast("TEXT")?;
+                let Value::Text(replacement) = replacement else {
+                    unreachable!("text cast should never fail");
+                };
 
                 let result = source
                     .as_str()
@@ -1149,13 +1151,35 @@ impl Value {
         }
     }
 
-    pub fn exec_math_binary(&self, rhs: &Value, function: &MathFunc) -> Value {
+    pub fn exec_math_binary(
+        &self,
+        rhs: &Value,
+        function: &MathFunc,
+        errors_on_zero_divisor: bool,
+    ) -> Result<Value, LimboError> {
         let Some(lhs) = Numeric::from_value_strict(self).map(|v| v.to_f64()) else {
-            return Value::Null;
+            return Ok(Value::Null);
         };
 
+        if matches!(function, MathFunc::Mod) && errors_on_zero_divisor {
+            match rhs {
+                Value::Text(t) => match Numeric::from_value_strict(rhs) {
+                    None => {
+                        return Err(LimboError::InvalidTextRepresentation(t.as_str().to_owned()))
+                    }
+                    Some(n) if n.to_f64() == 0.0 => return Err(LimboError::DivisionByZero),
+                    _ => {}
+                },
+                _ => {
+                    if Numeric::from_value_strict(rhs).is_some_and(|n| n.to_f64() == 0.0) {
+                        return Err(LimboError::DivisionByZero);
+                    }
+                }
+            }
+        }
+
         let Some(rhs) = Numeric::from_value_strict(rhs).map(|v| v.to_f64()) else {
-            return Value::Null;
+            return Ok(Value::Null);
         };
 
         #[allow(unused_unsafe)]
@@ -1166,11 +1190,11 @@ impl Value {
             _ => unreachable!("Unexpected mathematical binary function {:?}", function),
         };
 
-        if result.is_nan() {
+        Ok(if result.is_nan() {
             Value::Null
         } else {
             Value::from_f64(result)
-        }
+        })
     }
 
     /// Mirrors SQLite's logFunc: log(X) calls log10 directly, and log(B,X)

@@ -1302,6 +1302,11 @@ impl MappedSharedWalCoordination {
     /// "reader slot released by non-owner" when they try to end their read
     /// transactions, corrupting the shared WAL state.
     ///
+    /// Slots held by other connections in this process are skipped before
+    /// probing. On Linux the byte lock belongs to the open file description
+    /// that all connections in this process share, so probing it from here
+    /// would succeed and clear a slot that a live reader still uses.
+    ///
     /// Probe the slot byte lock directly on every platform. That lock is the
     /// authoritative liveness signal for this database file; relying on PID
     /// probes here is weaker and can misclassify recycled PIDs as live.
@@ -1316,11 +1321,13 @@ impl MappedSharedWalCoordination {
         // clearing: another live process may hold a slot. Blindly clearing
         // would cause that process to panic with "reader slot released by
         // non-owner" and corrupt the shared WAL state.
+        let local = self.local_lock_state.lock();
+        let process_local = self.process_local_ownership.lock();
         for slot_index in 0..header.reader_slot_count {
-            if !self.uses_linux_ofd_locking()
-                && self
-                    .with_process_local_ownership(|entry| entry.reader_owner(slot_index).is_some())
-            {
+            if local.reader_locks[slot_index as usize] > 0 {
+                continue;
+            }
+            if !self.uses_linux_ofd_locking() && process_local.reader_owner(slot_index).is_some() {
                 continue;
             }
             let offset = Self::process_lock_offset_for_reader(slot_index);
@@ -1928,14 +1935,12 @@ impl MappedSharedWalCoordination {
     /// actually blocks checkpoints; shared owner metadata can be stale.
     fn try_reclaim_stale_reader_slot(&self, slot_index: u32) -> bool {
         if self.uses_linux_ofd_locking() {
-            let should_probe = self.with_local_lock_state(|entry| {
-                turso_assert!(
-                    (slot_index as usize) < entry.reader_locks.len(),
-                    "reader slot registry index out of range"
-                );
-                entry.reader_locks[slot_index as usize] == 0
-            });
-            if !should_probe {
+            let local = self.local_lock_state.lock();
+            turso_assert!(
+                (slot_index as usize) < local.reader_locks.len(),
+                "reader slot registry index out of range"
+            );
+            if local.reader_locks[slot_index as usize] > 0 {
                 return false;
             }
             let offset = Self::process_lock_offset_for_reader(slot_index);
@@ -2269,13 +2274,12 @@ impl MappedSharedWalCoordination {
                     let _ = self.try_reclaim_dead_reader_owner(slot_index as u32, owner);
                     return None;
                 }
+                let local = self.local_lock_state.lock();
                 let frame = frame.load(Ordering::Acquire);
                 if frame == UNUSED_READER_FRAME {
                     return None;
                 }
-                let local_lock_held =
-                    self.with_local_lock_state(|entry| entry.reader_locks[slot_index] > 0);
-                if local_lock_held {
+                if local.reader_locks[slot_index] > 0 {
                     return Some(frame);
                 }
                 let offset = Self::process_lock_offset_for_reader(slot_index as u32);
@@ -3358,6 +3362,48 @@ mod tests {
     }
 
     #[test]
+    fn mapped_shared_wal_coordination_repair_preserves_reader_slots_held_by_sibling_connections() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("coordination.tshm");
+        let mapped = create_mapping(&path);
+
+        let reader = mapped.register_reader(mapped.owner_record(), 4).unwrap();
+
+        mapped.repair_transient_state_for_exclusive_open();
+
+        assert_eq!(mapped.reader_owner(reader.slot_index), Some(reader.owner));
+        assert_eq!(mapped.min_active_reader_frame(), Some(4));
+
+        mapped.unregister_reader(reader);
+        assert_eq!(mapped.reader_owner(reader.slot_index), None);
+        assert_eq!(mapped.min_active_reader_frame(), None);
+    }
+
+    #[cfg(all(target_os = "linux", not(shuttle)))]
+    #[test]
+    fn reader_registered_during_repair_keeps_its_slot() {
+        reader_registered_during_probe_keeps_its_slot(|mapped| {
+            mapped.repair_transient_state_for_exclusive_open();
+        });
+    }
+
+    #[cfg(all(target_os = "linux", not(shuttle)))]
+    #[test]
+    fn reader_registered_during_stale_slot_reclamation_keeps_its_slot() {
+        reader_registered_during_probe_keeps_its_slot(|mapped| {
+            mapped.try_reclaim_stale_reader_slot(0);
+        });
+    }
+
+    #[cfg(all(target_os = "linux", not(shuttle)))]
+    #[test]
+    fn reader_registered_during_frame_scan_keeps_its_slot() {
+        reader_registered_during_probe_keeps_its_slot(|mapped| {
+            mapped.min_active_reader_frame();
+        });
+    }
+
+    #[test]
     fn mapped_shared_wal_coordination_rebuilds_undersized_file_on_exclusive_open() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("coordination.tshm");
@@ -4359,5 +4405,114 @@ mod tests {
             mapped.find_frame(7, 0, boundary + 3, None),
             Some(boundary + 3)
         );
+    }
+
+    #[cfg(all(target_os = "linux", not(shuttle)))]
+    fn reader_registered_during_probe_keeps_its_slot(
+        probe: impl FnOnce(&MappedSharedWalCoordination),
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("coordination.tshm");
+        let mut mapped = create_mapping(&path);
+        assert!(mapped.uses_linux_ofd_locking());
+        mapped.reader_bitmap_words()[0].fetch_and(!1u64, Ordering::Release);
+        mapped.reader_frames()[0].store(17, Ordering::Release);
+        mapped.reader_owners()[0].store(mapped.owner_record().raw(), Ordering::Release);
+
+        let mapping = Arc::new(std::sync::OnceLock::<
+            std::sync::Weak<MappedSharedWalCoordination>,
+        >::new());
+        let registered = Arc::new(Mutex::new(None));
+        let file = mapped.file.clone();
+        mapped.file = Arc::new(ReaderRegistrationDuringProbeFile {
+            file,
+            before_probe: Mutex::new(Some(Box::new({
+                let mapping = mapping.clone();
+                let registered = registered.clone();
+                move || {
+                    let mapped = mapping.get().unwrap().upgrade().unwrap();
+                    let Some(local) = mapped.local_lock_state.try_lock() else {
+                        return;
+                    };
+                    drop(local);
+                    assert!(mapped.try_reclaim_stale_reader_slot(0));
+                    *registered.lock() =
+                        Some(mapped.register_reader(mapped.owner_record(), 23).unwrap());
+                }
+            }))),
+        });
+        let mapped = Arc::new(mapped);
+        mapping.set(Arc::downgrade(&mapped)).unwrap();
+
+        probe(&mapped);
+
+        let reader = registered
+            .lock()
+            .take()
+            .unwrap_or_else(|| mapped.register_reader(mapped.owner_record(), 23).unwrap());
+        assert_eq!(reader.slot_index, 0);
+        assert_eq!(mapped.reader_owner(reader.slot_index), Some(reader.owner));
+        assert_eq!(mapped.min_active_reader_frame(), Some(23));
+        mapped.unregister_reader(reader);
+        assert_eq!(mapped.min_active_reader_frame(), None);
+    }
+
+    #[cfg(all(target_os = "linux", not(shuttle)))]
+    struct ReaderRegistrationDuringProbeFile {
+        file: Arc<dyn File>,
+        before_probe: Mutex<Option<Box<dyn FnOnce() + Send>>>,
+    }
+
+    #[cfg(all(target_os = "linux", not(shuttle)))]
+    impl File for ReaderRegistrationDuringProbeFile {
+        fn lock_file(&self, exclusive: bool) -> Result<()> {
+            self.file.lock_file(exclusive)
+        }
+
+        fn unlock_file(&self) -> Result<()> {
+            self.file.unlock_file()
+        }
+
+        fn pread(&self, pos: u64, c: Completion) -> Result<Completion> {
+            self.file.pread(pos, c)
+        }
+
+        fn pwrite(
+            &self,
+            pos: u64,
+            buffer: Arc<crate::Buffer>,
+            c: Completion,
+        ) -> Result<Completion> {
+            self.file.pwrite(pos, buffer, c)
+        }
+
+        fn sync(&self, c: Completion, sync_type: FileSyncType) -> Result<Completion> {
+            self.file.sync(c, sync_type)
+        }
+
+        fn size(&self) -> Result<u64> {
+            self.file.size()
+        }
+
+        fn truncate(&self, len: u64, c: Completion) -> Result<Completion> {
+            self.file.truncate(len, c)
+        }
+
+        fn shared_wal_try_lock_byte(
+            &self,
+            offset: u64,
+            exclusive: bool,
+            kind: SharedWalLockKind,
+        ) -> Result<bool> {
+            let before_probe = self.before_probe.lock().take();
+            if let Some(before_probe) = before_probe {
+                before_probe();
+            }
+            self.file.shared_wal_try_lock_byte(offset, exclusive, kind)
+        }
+
+        fn shared_wal_unlock_byte(&self, offset: u64, kind: SharedWalLockKind) -> Result<()> {
+            self.file.shared_wal_unlock_byte(offset, kind)
+        }
     }
 }

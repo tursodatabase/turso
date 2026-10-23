@@ -41,7 +41,7 @@ use crate::{
     types::Value,
     util::parse_signed_number,
     vdbe::{
-        builder::{CteFillSubroutine, CursorKey, CursorType, MaterializedCteInfo, ProgramBuilder},
+        builder::{CursorKey, CursorType, MaterializedCteInfo, ProgramBuilder, Subroutine},
         insn::Insn,
         CursorID,
     },
@@ -1058,6 +1058,7 @@ fn get_subquery_parser<'a>(
                     where_clause: None,
                     index_method: None,
                     on_conflict: None,
+                    constraint_name: None,
                 });
 
                 let cursor_id =
@@ -1983,7 +1984,7 @@ fn emit_materialized_subquery_table(
     let fill_subroutine = if plan_is_correlated(plan) {
         None
     } else {
-        let fill_subroutine = CteFillSubroutine {
+        let fill_subroutine = Subroutine {
             label: program.allocate_label(),
             return_reg: program.alloc_register(),
         };
@@ -2101,13 +2102,16 @@ fn emit_materialized_subquery_table(
 /// - a single register for EXISTS subqueries,
 /// - a range of registers for RowValue subqueries,
 /// - an ephemeral index for IN subqueries.
+///
+/// A correlated subquery is emitted as a subroutine, which is returned so
+/// that a `Gosub` can run the subquery again.
 pub fn emit_non_from_clause_subquery(
     program: &mut ProgramBuilder,
     resolver: &Resolver,
     plan: Plan,
     query_type: &SubqueryType,
     is_correlated: bool,
-) -> Result<()> {
+) -> Result<Option<Subroutine>> {
     program.nested(|program| {
         let subquery_id = program.next_subquery_eqp_id();
         match query_type {
@@ -2166,21 +2170,25 @@ pub fn emit_non_from_clause_subquery(
             }
         };
 
+        let subroutine = if is_correlated || !matches!(query_type, SubqueryType::In { .. }) {
+            let subroutine = Subroutine {
+                label: program.allocate_label(),
+                return_reg: program.alloc_register(),
+            };
+            program.emit_insn(Insn::BeginSubrtn {
+                dest: subroutine.return_reg,
+                dest_end: None,
+            });
+            program.preassign_label_to_next_insn(subroutine.label);
+            Some(subroutine)
+        } else {
+            None
+        };
         match query_type {
             SubqueryType::Exists { result_reg, .. } => {
-                let subroutine_reg = program.alloc_register();
-                program.emit_insn(Insn::BeginSubrtn {
-                    dest: subroutine_reg,
-                    dest_end: None,
-                });
                 program.emit_insn(Insn::Integer {
                     value: 0,
                     dest: *result_reg,
-                });
-                emit_plan(program)?;
-                program.emit_insn(Insn::Return {
-                    return_reg: subroutine_reg,
-                    can_fallthrough: true,
                 });
             }
             SubqueryType::In { cursor_id, .. } => {
@@ -2188,29 +2196,25 @@ pub fn emit_non_from_clause_subquery(
                     cursor_id: *cursor_id,
                     is_table: false,
                 });
-                emit_plan(program)?;
             }
             SubqueryType::RowValue {
                 result_reg_start,
                 num_regs,
             } => {
-                let subroutine_reg = program.alloc_register();
-                program.emit_insn(Insn::BeginSubrtn {
-                    dest: subroutine_reg,
-                    dest_end: None,
-                });
                 for result_reg in *result_reg_start..*result_reg_start + *num_regs {
                     program.emit_insn(Insn::Null {
                         dest: result_reg,
                         dest_end: None,
                     });
                 }
-                emit_plan(program)?;
-                program.emit_insn(Insn::Return {
-                    return_reg: subroutine_reg,
-                    can_fallthrough: true,
-                });
             }
+        }
+        emit_plan(program)?;
+        if let Some(subroutine) = subroutine {
+            program.emit_insn(Insn::Return {
+                return_reg: subroutine.return_reg,
+                can_fallthrough: true,
+            });
         }
         // Pop the parent explain for LIST/SCALAR SUBQUERY annotations.
         if !matches!(query_type, SubqueryType::Exists { .. }) {
@@ -2219,7 +2223,7 @@ pub fn emit_non_from_clause_subquery(
         if let Some(label) = label_skip_after_first_run {
             program.preassign_label_to_next_insn(label);
         }
-        Ok(())
+        Ok(subroutine)
     })
 }
 
@@ -2262,13 +2266,14 @@ pub fn emit_non_from_clause_subqueries_for_phase(
         };
 
         let subquery_plan = subquery.consume_plan(evaluated_at);
-        emit_non_from_clause_subquery(
+        let subroutine = emit_non_from_clause_subquery(
             program,
             resolver,
             *subquery_plan,
             &subquery.query_type,
             subquery.correlated,
         )?;
+        subquery.set_subroutine(subroutine);
     }
 
     Ok(())
@@ -2313,7 +2318,7 @@ fn assign_select_subquery_eval_phases(plan: &mut SelectPlan) {
     // first use, so they must keep their phase floor (issue #6807).
     let mut aggregate_subquery_ids: Vec<ast::TableInternalId> = Vec::new();
     for agg in &plan.aggregates {
-        for expr in agg.args.iter().chain(agg.filter_expr.iter()) {
+        for expr in agg.input_exprs() {
             walk_expr(expr, &mut |e: &ast::Expr| -> Result<WalkControl> {
                 if let ast::Expr::SubqueryResult { subquery_id, .. } = e {
                     aggregate_subquery_ids.push(*subquery_id);

@@ -12,8 +12,8 @@ use crate::translate::{
         OperationMode, Resolver,
     },
     expr::{
-        bind_and_rewrite_expr, translate_condition_expr, translate_expr, unwrap_parens, walk_expr,
-        BindingBehavior, ConditionMetadata, WalkControl,
+        bind_and_rewrite_expr, emit_stored_column, translate_condition_expr, translate_expr,
+        unwrap_parens, walk_expr, BindingBehavior, ConditionMetadata, WalkControl,
     },
     insert::format_unique_violation_desc,
     plan::{ColumnUsedMask, IterationDirection, JoinedTable, Operation, Scan, TableReferences},
@@ -155,7 +155,7 @@ pub fn translate_create_index(
         // The index's target table always lives in the index's own database,
         // so SQLite qualifies the missing table with that database name.
         let db_name = resolver
-            .get_database_name_by_index(database_id)
+            .namespace_name(database_id)
             .unwrap_or_else(|| "main".to_string());
         crate::bail_parse_error!("no such table: {}.{}", db_name, original_tbl_name.as_str());
     };
@@ -233,6 +233,7 @@ pub fn translate_create_index(
         where_clause: where_clause.clone(),
         index_method: index_method.clone(),
         on_conflict: None,
+        constraint_name: None,
     });
 
     if !idx.validate_where_expr(&table, resolver) {
@@ -599,6 +600,7 @@ pub(crate) fn emit_refill_index(
                 pc_when_nonequal: goto_label,
             });
             program.emit_insn(Insn::Halt {
+                constraint_info: None,
                 err_code: SQLITE_CONSTRAINT_UNIQUE,
                 description: format_unique_violation_desc(tbl_name.as_str(), idx),
                 on_error: None,
@@ -1181,7 +1183,13 @@ fn emit_index_column_value_from_cursor(
             }
         }
     } else {
-        program.emit_column_or_rowid(table_cursor_id, idx_col.pos_in_table, dest_reg);
+        emit_stored_column(
+            program,
+            table_cursor_id,
+            idx_col.pos_in_table,
+            dest_reg,
+            resolver,
+        )?;
     }
     Ok(())
 }
@@ -1217,11 +1225,19 @@ pub fn translate_drop_index(
     if_exists: bool,
     program: &mut ProgramBuilder,
 ) -> crate::Result<()> {
-    let database_id = resolver.resolve_existing_index_database_id(qualified_name)?;
     let idx_name = normalize_ident(qualified_name.name.as_str());
     let opts = ProgramBuilderOpts::new(5, 40, 5);
     program.extend(&opts);
 
+    let Some(database_id) = resolver.find_existing_index_database_id(qualified_name)? else {
+        if if_exists {
+            return Ok(());
+        }
+        return Err(crate::error::LimboError::InvalidArgument(format!(
+            "No such index: {}",
+            &idx_name
+        )));
+    };
     let schema_cookie = resolver.with_schema(database_id, |s| s.schema_version);
     program.begin_write_on_database(database_id, schema_cookie)?;
 
@@ -1347,10 +1363,11 @@ pub fn translate_drop_index(
         let before_record_reg = if program.capture_data_changes_info().has_before() {
             Some(emit_cdc_full_record(
                 program,
+                resolver,
                 sqlite_table.columns(),
                 sqlite_schema_cursor_id,
                 row_id_reg,
-            ))
+            )?)
         } else {
             None
         };

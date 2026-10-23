@@ -14,7 +14,7 @@ use crate::schema::GeneratedType;
 use crate::translate::plan::{BitSet, ColumnMask, MultiIndexBranchAccess};
 use crate::translate::planner::{table_mask_from_expr, TableMask};
 use crate::{
-    function::{AggFunc, Deterministic},
+    function::{AggFunc, Deterministic, Func},
     index_method::{IndexMethodAttachment, IndexMethodCostContext, IndexMethodCostEstimate},
     numeric::Numeric,
     schema::{
@@ -371,8 +371,8 @@ fn try_match_index_method_pattern(
     let pattern_has_order_by = !pattern.order_by.is_empty();
     let pattern_has_limit = pattern.limit.is_some();
 
-    // If pattern has ORDER BY, it must match exactly
-    if pattern_has_order_by && order_by.len() != pattern.order_by.len() {
+    // If pattern has ORDER BY or LIMIT, ORDER BY must match exactly
+    if (pattern_has_order_by || pattern_has_limit) && order_by.len() != pattern.order_by.len() {
         return None;
     }
 
@@ -871,6 +871,7 @@ fn detect_simple_aggregate(plan: &SelectPlan) -> Option<SimpleAggregate> {
         || plan.group_by.is_some()
         || plan.contains_constant_false_condition
         || plan.aggregates.first().unwrap().filter_expr.is_some()
+        || !plan.aggregates.first().unwrap().order_by().is_empty()
     {
         return None;
     }
@@ -1426,12 +1427,17 @@ fn update_write_set_reason(
             .iter()
             .map(|set_clause| set_clause.column_index)
             .try_collect()?;
+        let updated_col_names: Vec<_> = plan
+            .set_clauses
+            .iter()
+            .flat_map(|set_clause| set_clause.column_names.iter().cloned())
+            .try_collect()?;
         let database_id = table_ref.database_id;
         if has_triggers_including_temp(
             resolver,
             database_id,
             TriggerEvent::Update,
-            Some(&updated_cols),
+            Some(&updated_col_names),
             btree_table,
         ) {
             break 'requires Some(DmlSafetyReason::Trigger);
@@ -4106,7 +4112,12 @@ impl Optimizable for ast::Expr {
                 else {
                     return false;
                 };
-                func.is_deterministic() && args.iter().all(|arg| arg.is_constant(resolver))
+                // Like SQLite's SQLITE_FUNC_SLOCHNG functions, the date and time
+                // functions return the same value for the whole statement, so they
+                // can be computed once instead of on every row.
+                let same_for_whole_statement = func.is_deterministic()
+                    || matches!(func, Func::Scalar(f) if f.is_date_time_function());
+                same_for_whole_statement && args.iter().all(|arg| arg.is_constant(resolver))
             }
             Expr::FunctionCallStar { .. } => false,
             // A merged USING column reads table columns, so its value changes from row to row.
@@ -4325,6 +4336,7 @@ fn ephemeral_index_build(
             .is_some_and(|btree| btree.has_rowid),
         index_method: None,
         on_conflict: None,
+        constraint_name: None,
     };
 
     Ok(ephemeral_index)
@@ -4852,7 +4864,6 @@ fn build_seek_def(
 #[cfg(test)]
 mod tests {
     use super::{where_term_rejects_null_row, Optimizable};
-    use crate::dialect::sqlite::attach::AttachedNamespaces;
     use crate::translate::emitter::{DoubleQuotedDml, Resolver};
     use crate::{schema::Schema, DatabaseCatalog, RwLock, SymbolTable};
     use rustc_hash::FxHashMap as HashMap;
@@ -4863,7 +4874,7 @@ mod tests {
         database_schemas: &'a RwLock<HashMap<usize, crate::sync::Arc<Schema>>>,
         temp_database: &'a RwLock<Option<crate::connection::TempDatabase>>,
         attached_databases: &'a RwLock<DatabaseCatalog>,
-        namespaces: &'a AttachedNamespaces,
+        namespaces: &'a crate::Namespaces,
         syms: &'a SymbolTable,
     ) -> Resolver<'a> {
         Resolver::new(
@@ -4876,7 +4887,7 @@ mod tests {
             true,
             DoubleQuotedDml::Enabled,
             crate::sync::Arc::new(crate::dialect::SqliteDialect),
-            &None,
+            None,
         )
     }
 
@@ -4904,7 +4915,7 @@ mod tests {
         let syms = SymbolTable::new();
         let database_schemas = RwLock::new(HashMap::default());
         let attached_databases = RwLock::new(DatabaseCatalog::new());
-        let namespaces = AttachedNamespaces::default();
+        let namespaces = crate::Namespaces::default();
         let temp_database = RwLock::new(None);
         let resolver = empty_resolver(
             &schema,
@@ -4942,7 +4953,7 @@ mod tests {
         let syms = SymbolTable::new();
         let database_schemas = RwLock::new(HashMap::default());
         let attached_databases = RwLock::new(DatabaseCatalog::new());
-        let namespaces = AttachedNamespaces::default();
+        let namespaces = crate::Namespaces::default();
         let temp_database = RwLock::new(None);
         let resolver = empty_resolver(
             &schema,

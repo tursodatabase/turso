@@ -8,8 +8,9 @@ use super::{
         update::emit_program_for_update,
     },
     expr::{
-        bind_and_rewrite_expr, emit_table_column, translate_expr_no_constant_opt, walk_expr,
-        BindingBehavior, NoConstantOptReason, WalkControl,
+        bind_and_rewrite_expr, emit_stored_column, emit_table_column,
+        translate_expr_no_constant_opt, walk_expr, BindingBehavior, NoConstantOptReason,
+        WalkControl,
     },
     group_by::GroupByMetadata,
     main_loop::{LeftJoinMetadata, LoopLabels, RightJoinMetadata, SemiAntiJoinMetadata},
@@ -33,10 +34,9 @@ use crate::translate::plan::{Aggregate, ColumnMask};
 use crate::vdbe::{
     affinity::Affinity,
     builder::{CursorKey, CursorType, DmlColumnContext, ProgramBuilder, SelfTableContext},
-    insn::{to_u32, InsertFlags, Insn},
+    insn::{to_u32, ConstraintInfo, InsertFlags, Insn},
     BranchOffset, CursorID,
 };
-use crate::NamespaceCatalog;
 use crate::{
     error::SQLITE_CONSTRAINT_CHECK,
     function::Func,
@@ -138,7 +138,7 @@ pub struct Resolver<'a> {
     database_schemas: &'a RwLock<HashMap<usize, Arc<Schema>>>,
     temp_database: &'a RwLock<Option<crate::connection::TempDatabase>>,
     attached_databases: &'a RwLock<DatabaseCatalog>,
-    namespaces: &'a dyn NamespaceCatalog,
+    namespaces: &'a crate::Namespaces,
     non_main_schema_cache: RefCell<HashMap<usize, Arc<Schema>>>,
     pub symbol_table: &'a SymbolTable,
     pub expr_to_reg_cache_enabled: bool,
@@ -210,7 +210,11 @@ pub struct Resolver<'a> {
     /// shared state, a self-referential `ON DELETE CASCADE` could fail to see
     /// that its own action program is already being built.
     pub(super) fk_action_compile_stack: FkActionCompileStack,
-    unqualified_database_search_path: Option<Vec<String>>,
+    /// The databases that a name without a namespace is looked up in, in
+    /// order, from the connection's search path. Temp comes before them.
+    /// The first one is where CREATE puts an object whose name has no
+    /// namespace.
+    search_order: Vec<usize>,
 }
 
 #[derive(Clone)]
@@ -290,12 +294,12 @@ impl<'a> Resolver<'a> {
         database_schemas: &'a RwLock<HashMap<usize, Arc<Schema>>>,
         temp_database: &'a RwLock<Option<crate::connection::TempDatabase>>,
         attached_databases: &'a RwLock<DatabaseCatalog>,
-        namespaces: &'a dyn NamespaceCatalog,
+        namespaces: &'a crate::Namespaces,
         symbol_table: &'a SymbolTable,
         enable_custom_types: bool,
         dqs_dml: DoubleQuotedDml,
         dialect: Arc<dyn crate::dialect::Dialect>,
-        unqualified_database_search_path: &Option<Vec<String>>,
+        search_path: Option<&[String]>,
     ) -> Self {
         let has_temp_schema = temp_database.read().is_some();
         Self {
@@ -321,7 +325,7 @@ impl<'a> Resolver<'a> {
             database_scope: RefCell::new(None),
             has_temp_schema,
             fk_action_compile_stack: FkActionCompileStack::default(),
-            unqualified_database_search_path: unqualified_database_search_path.clone(),
+            search_order: namespaces.search_order(search_path),
         }
     }
 
@@ -367,7 +371,7 @@ impl<'a> Resolver<'a> {
             database_scope: RefCell::new(self.database_scope.borrow().clone()),
             has_temp_schema: self.has_temp_schema,
             fk_action_compile_stack: self.fk_action_compile_stack.clone(),
-            unqualified_database_search_path: self.unqualified_database_search_path.clone(),
+            search_order: self.search_order.clone(),
         }
     }
 
@@ -395,7 +399,7 @@ impl<'a> Resolver<'a> {
             database_scope: RefCell::new(self.database_scope.borrow().clone()),
             has_temp_schema: self.has_temp_schema,
             fk_action_compile_stack: self.fk_action_compile_stack.clone(),
-            unqualified_database_search_path: self.unqualified_database_search_path.clone(),
+            search_order: self.search_order.clone(),
         }
     }
 
@@ -762,11 +766,28 @@ impl<'a> Resolver<'a> {
             .try_collect()?)
     }
 
-    fn resolve_unqualified_existing_database_id<F>(
+    pub(crate) fn resolve_unqualified_existing_database_id<F>(
         &self,
         object_name: &str,
         schema_contains_object: F,
     ) -> Result<usize>
+    where
+        F: Fn(&Schema, &str) -> bool,
+    {
+        self.find_unqualified_existing_database_id(object_name, schema_contains_object)
+            .ok_or_else(|| LimboError::ParseError(format!("no such object: {object_name}")))
+    }
+
+    /// The database of an object named without a namespace: temp when it
+    /// has the object, else the first database of the search order that
+    /// has it. When none has it, the first database of the search order,
+    /// where the caller reports the object missing or does nothing for IF
+    /// EXISTS. None only when the search order is empty.
+    fn find_unqualified_existing_database_id<F>(
+        &self,
+        object_name: &str,
+        schema_contains_object: F,
+    ) -> Option<usize>
     where
         F: Fn(&Schema, &str) -> bool,
     {
@@ -778,44 +799,18 @@ impl<'a> Resolver<'a> {
                 schema_contains_object(schema, object_name)
             })
         {
-            return Ok(crate::TEMP_DB_ID);
+            return Some(crate::TEMP_DB_ID);
         }
 
-        if let Some(search_path) = &self.unqualified_database_search_path {
-            for schema_name in search_path {
-                let Some(database_id) = self.resolve_search_path_database_id(schema_name) else {
-                    continue;
-                };
-                if self.with_schema(database_id, |schema| {
-                    schema_contains_object(schema, object_name)
-                }) {
-                    return Ok(database_id);
-                }
-            }
-            return Err(LimboError::ParseError(format!(
-                "no such object: {object_name}"
-            )));
-        }
-
-        Ok(self
-            .namespaces
-            .find_in_search_order(&mut |database_id| {
+        self.search_order
+            .iter()
+            .copied()
+            .find(|&database_id| {
                 self.with_schema(database_id, |schema| {
                     schema_contains_object(schema, object_name)
                 })
             })
-            .unwrap_or(crate::MAIN_DB_ID))
-    }
-
-    fn resolve_search_path_database_id(&self, schema_name: &str) -> Option<usize> {
-        if schema_name.eq_ignore_ascii_case("public") {
-            return Some(crate::MAIN_DB_ID);
-        }
-        self.namespaces
-            .database_id(schema_name)
-            .filter(|&database_id| {
-                database_id != crate::MAIN_DB_ID && database_id != crate::TEMP_DB_ID
-            })
+            .or_else(|| self.search_order.first().copied())
     }
 
     fn schema_has_table_like_object(schema: &Schema, table_name: &str) -> bool {
@@ -856,13 +851,28 @@ impl<'a> Resolver<'a> {
         &self,
         qualified_name: &ast::QualifiedName,
     ) -> Result<usize> {
-        if qualified_name.namespace.is_some() {
-            return self.resolve_database_id(qualified_name);
-        }
-        self.resolve_existing_table_database_id(qualified_name.name.as_str())
+        self.find_existing_table_database_id_qualified(qualified_name)?
+            .ok_or_else(|| {
+                LimboError::ParseError(format!("no such object: {}", qualified_name.name.as_str()))
+            })
     }
 
     pub(crate) fn resolve_existing_table_database_id(&self, table_name: &str) -> Result<usize> {
+        self.find_existing_table_database_id(table_name)
+            .ok_or_else(|| LimboError::ParseError(format!("no such object: {table_name}")))
+    }
+
+    pub(crate) fn find_existing_table_database_id_qualified(
+        &self,
+        qualified_name: &ast::QualifiedName,
+    ) -> Result<Option<usize>> {
+        if qualified_name.namespace.is_some() {
+            return self.resolve_database_id(qualified_name).map(Some);
+        }
+        Ok(self.find_existing_table_database_id(qualified_name.name.as_str()))
+    }
+
+    fn find_existing_table_database_id(&self, table_name: &str) -> Option<usize> {
         // A TEMP view or trigger carries a scope (so explicit `aux.table`
         // references still see its own database below), but the scope does
         // not restrict unqualified names: SQLite's schema fixer skips TEMP
@@ -871,30 +881,40 @@ impl<'a> Resolver<'a> {
         // same way a top-level query does, sqlite_schema included.
         if let Some(ctx) = self.database_scope.borrow().as_ref() {
             if ctx.restricts_db_references() {
-                return Ok(ctx.database_id);
+                return Some(ctx.database_id);
             }
         }
 
         if let Some(database_id) = Self::resolve_schema_table_database_id(table_name) {
-            return Ok(database_id);
+            return Some(database_id);
         }
 
-        self.resolve_unqualified_existing_database_id(
-            table_name,
-            Self::schema_has_table_like_object,
-        )
+        self.find_unqualified_existing_database_id(table_name, Self::schema_has_table_like_object)
     }
 
     pub(crate) fn resolve_existing_index_database_id(
         &self,
         qualified_name: &ast::QualifiedName,
     ) -> Result<usize> {
+        self.find_existing_index_database_id(qualified_name)?
+            .ok_or_else(|| {
+                LimboError::ParseError(format!(
+                    "no such object: {}",
+                    normalize_ident(qualified_name.name.as_str())
+                ))
+            })
+    }
+
+    pub(crate) fn find_existing_index_database_id(
+        &self,
+        qualified_name: &ast::QualifiedName,
+    ) -> Result<Option<usize>> {
         if qualified_name.namespace.is_some() {
-            return self.resolve_database_id(qualified_name);
+            return self.resolve_database_id(qualified_name).map(Some);
         }
 
         let index_name = normalize_ident(qualified_name.name.as_str());
-        self.resolve_unqualified_existing_database_id(&index_name, Self::schema_has_index)
+        Ok(self.find_unqualified_existing_database_id(&index_name, Self::schema_has_index))
     }
 
     pub(crate) fn resolve_existing_trigger_database_id(
@@ -907,6 +927,30 @@ impl<'a> Resolver<'a> {
 
         let trigger_name = qualified_name.name.as_str();
         self.resolve_unqualified_existing_database_id(trigger_name, Self::schema_has_trigger)
+    }
+
+    /// The database of a sequence named without a namespace: the first
+    /// database of the search order that has it, or the first database of
+    /// the search order when none has it.
+    pub(crate) fn resolve_existing_sequence_database_id(&self, seq_name: &str) -> Result<usize> {
+        self.find_existing_sequence_database_id(seq_name)
+            .ok_or_else(|| LimboError::ParseError(format!("no such object: {seq_name}")))
+    }
+
+    pub(crate) fn find_existing_sequence_database_id(&self, seq_name: &str) -> Option<usize> {
+        self.find_unqualified_existing_database_id(seq_name, |schema, seq_name| {
+            schema.get_sequence(seq_name).is_some()
+        })
+    }
+
+    /// `seq_name` qualified with the database it resolved to, for the
+    /// opcodes that look a sequence up again by its name when the statement
+    /// runs.
+    pub(crate) fn runtime_sequence_name(&self, database_id: usize, seq_name: &str) -> String {
+        let database_name = self
+            .namespace_name(database_id)
+            .expect("the database of a sequence has a name");
+        format!("{database_name}.{seq_name}")
     }
 
     /// Resolve database ID from a qualified name
@@ -966,7 +1010,9 @@ impl<'a> Resolver<'a> {
         if qualified_name.namespace.is_some() {
             return self.resolve_database_id(qualified_name);
         }
-        self.namespaces.database_for_create()
+        self.search_order.first().copied().ok_or_else(|| {
+            LimboError::ParseError("no schema has been selected to create in".to_string())
+        })
     }
 
     /// The database that namespace `name` refers to. `name` is normalized.
@@ -976,7 +1022,7 @@ impl<'a> Resolver<'a> {
 
     /// Get the database name for a given database index.
     /// Returns "main" for index 0, "temp" for index 1, and the alias for attached databases.
-    pub(crate) fn get_database_name_by_index(&self, index: usize) -> Option<String> {
+    pub(crate) fn namespace_name(&self, index: usize) -> Option<String> {
         self.namespaces.name(index)
     }
 }
@@ -1408,10 +1454,11 @@ pub(super) fn emit_make_record<'a>(
 
 pub fn emit_cdc_full_record(
     program: &mut ProgramBuilder,
+    resolver: &Resolver,
     columns: &[Column],
     table_cursor_id: usize,
     rowid_reg: usize,
-) -> usize {
+) -> Result<usize> {
     let storable_count = columns.iter().filter(|c| !c.is_virtual_generated()).count();
     let columns_reg = program.alloc_registers(storable_count + 1);
     let mut slot = 0;
@@ -1426,7 +1473,13 @@ pub fn emit_cdc_full_record(
                 extra_amount: 0,
             });
         } else {
-            program.emit_column_or_rowid(table_cursor_id, i, columns_reg + 1 + slot);
+            emit_stored_column(
+                program,
+                table_cursor_id,
+                i,
+                columns_reg + 1 + slot,
+                resolver,
+            )?;
         }
         slot += 1;
     }
@@ -1443,7 +1496,7 @@ pub fn emit_cdc_full_record(
         index_name: None,
         affinity_str: Some(affinity_str),
     });
-    columns_reg
+    Ok(columns_reg)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1497,7 +1550,6 @@ fn emit_cdc_change_id(
         &seq_name,
         &seq,
         dest_reg,
-        None,
     )
 }
 
@@ -2008,6 +2060,7 @@ pub(crate) fn init_limit(
     t_ctx: &mut TranslateCtx,
     limit: &Option<Box<Expr>>,
     offset: &Option<Box<Expr>>,
+    end_label: BranchOffset,
 ) -> Result<()> {
     if t_ctx.limit_ctx.is_none() && limit.is_some() {
         t_ctx.limit_ctx = Some(LimitCtx::new(program));
@@ -2113,12 +2166,9 @@ pub(crate) fn init_limit(
     }
 
     // exit early if LIMIT 0
-    let main_loop_end = t_ctx
-        .label_main_loop_end
-        .expect("label_main_loop_end must be set before init_limit");
     program.emit_insn(Insn::IfNot {
         reg: limit_ctx.reg_limit,
-        target_pc: main_loop_end,
+        target_pc: end_label,
         jump_if_null: false,
     });
 
@@ -2177,26 +2227,27 @@ pub(crate) fn emit_columns_and_dependencies(
     };
 
     let mut extra_idx = 0;
-    let pairs = table.columns().iter().enumerate().map(|(idx, col)| {
+    let mut pairs = Vec::with_capacity(table.columns().len());
+    for (idx, col) in table.columns().iter().enumerate() {
         let reg = if let Some(pos) = non_rowid_target_positions[idx] {
             let reg = target_base + pos;
             if !col.is_virtual_generated() {
-                program.emit_column_or_rowid(cursor_id, idx, reg);
+                emit_stored_column(program, cursor_id, idx, reg, resolver)?;
             }
             reg
         } else if col.is_rowid_alias() {
             rowid_reg
         } else if dependencies.get(idx) {
             let reg = extra_base + extra_idx;
-            program.emit_column_or_rowid(cursor_id, idx, reg);
+            emit_stored_column(program, cursor_id, idx, reg, resolver)?;
             extra_idx += 1;
             reg
         } else {
             0
         };
-        (col, reg)
-    });
-    let dml_ctx = DmlColumnContext::from_column_reg_mapping(pairs);
+        pairs.push((col, reg));
+    }
+    let dml_ctx = DmlColumnContext::from_column_reg_mapping(pairs.into_iter());
     if targets
         .iter()
         .all(|&idx| !table.columns()[idx].is_rowid_alias())
@@ -2276,7 +2327,13 @@ pub(crate) fn emit_index_column_value_old_image(
             resolver,
         )?;
     } else {
-        program.emit_column_or_rowid(table_cursor_id, idx_col.pos_in_table, dest_reg);
+        emit_stored_column(
+            program,
+            table_cursor_id,
+            idx_col.pos_in_table,
+            dest_reg,
+            resolver,
+        )?;
     }
     Ok(())
 }
@@ -2405,6 +2462,7 @@ fn emit_index_column_value_new_image(
 
 /// Emit bytecode for evaluating CHECK constraints.
 /// Assumes the resolver cache is already populated with column-to-register mappings.
+#[allow(clippy::too_many_arguments)]
 fn emit_check_constraint_bytecode(
     program: &mut ProgramBuilder,
     check_constraints: &[CheckConstraint],
@@ -2413,6 +2471,7 @@ fn emit_check_constraint_bytecode(
     skip_row_label: BranchOffset,
     referenced_tables: Option<&TableReferences>,
     table_name: &str,
+    column_mappings: &[(&str, usize)],
 ) -> Result<()> {
     for check_constraint in check_constraints {
         let expr_result_reg = program.alloc_register();
@@ -2478,7 +2537,16 @@ fn emit_check_constraint_bytecode(
             | ResolveType::Fail
             | ResolveType::Rollback
             | ResolveType::Replace => {
+                let col_regs: Vec<usize> = column_mappings.iter().map(|(_, r)| *r).collect();
+                let col_names: Vec<String> =
+                    column_mappings.iter().map(|(n, _)| n.to_string()).collect();
                 program.emit_insn(Insn::Halt {
+                    constraint_info: Some(Box::new(ConstraintInfo::check(
+                        table_name,
+                        check_constraint.name.clone(),
+                        col_regs,
+                        col_names,
+                    ))),
                     err_code: SQLITE_CONSTRAINT_CHECK,
                     description: constraint_name.to_string(),
                     on_error: program.constraint_halt_on_error(or_conflict),
@@ -2600,6 +2668,7 @@ pub(crate) fn emit_check_constraints<'a>(
         skip_row_label,
         referenced_tables,
         table_name,
+        &column_mappings,
     );
 
     // Always restore resolver state, even on error.

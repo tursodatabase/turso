@@ -52,3 +52,12 @@ test generate-series-explicit-negative-stop {
 expect {
     0
 }
+
+test generate-series-hidden-columns-have-no-hidden-type {
+    SELECT name, instr(upper(type), 'HIDDEN') FROM pragma_table_xinfo('generate_series') WHERE hidden = 1;
+}
+expect {
+    start|0
+    stop|0
+    step|0
+}

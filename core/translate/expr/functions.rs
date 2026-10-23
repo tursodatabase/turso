@@ -202,8 +202,11 @@ pub(super) fn translate_sequence_function(
             })?;
         (db_id, normalize_ident(name))
     } else {
-        (crate::MAIN_DB_ID, normalize_ident(&seq_name_raw))
+        let name = normalize_ident(&seq_name_raw);
+        (resolver.resolve_existing_sequence_database_id(&name)?, name)
     };
+    let runtime_args = qualify_sequence_argument(args, resolver);
+    let args = runtime_args.as_deref().unwrap_or(args);
 
     let backing_table_name =
         crate::translate::sequence::sequence_backing_table_name(&normalized_name);
@@ -231,11 +234,6 @@ pub(super) fn translate_sequence_function(
     program.begin_write_on_database(database_id, schema_cookie)?;
 
     if is_nextval {
-        // Reuse `start_reg` (the user's raw arg, possibly schema-qualified
-        // such as `'aux.my_seq'`) as the currval register so per-session
-        // `currval` stays keyed by the user's original spelling. The
-        // sequence opcodes get the bare `normalized_name` and the database
-        // id resolved here, so they never parse the user's string.
         crate::translate::sequence::emit_disk_read_nextval(
             program,
             resolver,
@@ -243,7 +241,6 @@ pub(super) fn translate_sequence_function(
             &normalized_name,
             &seq_arc,
             target_register,
-            Some(start_reg),
         )?;
     } else {
         // setval keeps its own cursor lifecycle: open the backing table,
@@ -329,7 +326,8 @@ pub(super) fn translate_sequence_function(
             table_name: normalized_name.clone(),
         });
         program.emit_insn(Insn::SetSequenceCurrval {
-            seq_name_reg: start_reg,
+            db: database_id,
+            seq_name: normalized_name.clone(),
             value_reg: start_reg + 1,
         });
         program.emit_insn(Insn::Close { cursor_id });
@@ -348,4 +346,29 @@ pub(super) fn translate_sequence_function(
     }
 
     Ok(target_register)
+}
+
+/// `args` of nextval, currval or setval with the sequence name in the first
+/// argument qualified with the database it resolves to. The handlers look
+/// the sequence up again by that string when the statement runs, and the
+/// currval session value is keyed by it. None when the name keeps its
+/// spelling: it has a schema, it is not a string literal, or the search
+/// order is empty.
+pub(crate) fn qualify_sequence_argument(
+    args: &[Box<ast::Expr>],
+    resolver: &Resolver,
+) -> Option<Box<[Box<ast::Expr>]>> {
+    let seq_name_raw = extract_string_literal(args.first()?).ok()?;
+    if seq_name_raw.contains('.') {
+        return None;
+    }
+    let name = normalize_ident(&seq_name_raw);
+    let database_id = resolver.find_existing_sequence_database_id(&name)?;
+    let runtime_name = resolver.runtime_sequence_name(database_id, &name);
+    let mut args = args.to_vec();
+    args[0] = Box::new(ast::Expr::Literal(ast::Literal::String(format!(
+        "'{}'",
+        runtime_name.replace('\'', "''")
+    ))));
+    Some(args.into_boxed_slice())
 }

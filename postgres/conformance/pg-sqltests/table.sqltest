@@ -198,6 +198,29 @@ expect {
     2024-01-15|10:30:00
 }
 
+test table-check-on-smallint-column {
+    CREATE TABLE t (n smallint DEFAULT 0 CHECK (n >= 0 AND n <= 2));
+    INSERT INTO t VALUES (1) RETURNING n;
+}
+expect {
+    1
+}
+
+test table-check-on-smallint-column-rejects-value-out-of-range {
+    CREATE TABLE t (n smallint DEFAULT 0 CHECK (n >= 0 AND n <= 2));
+    INSERT INTO t VALUES (3);
+}
+expect error {}
+
+test table-check-compares-integer-types-of-different-sizes {
+    CREATE TABLE t (a smallint, b integer, c bigint, CHECK (a < b AND b < c AND c > 0));
+    INSERT INTO t VALUES (1, 2, 3);
+    SELECT a, b, c FROM t;
+}
+expect {
+    1|2|3
+}
+
 test table-delete-row-with-numeric-expression-index {
     CREATE TABLE prices (id int PRIMARY KEY, val numeric(10,2));
     CREATE INDEX prices_doubled ON prices ((val * 2));
@@ -207,4 +230,154 @@ test table-delete-row-with-numeric-expression-index {
 }
 expect {
     0
+}
+
+test table-uuid-column-omitted-from-insert-is-null {
+    CREATE TABLE t (id int PRIMARY KEY, u uuid);
+    INSERT INTO t (id) VALUES (1);
+    SELECT count(*) FROM t WHERE u IS NULL;
+}
+expect {
+    1
+}
+
+test table-uuid-column-with-explicit-default-generates-uuid {
+    CREATE TABLE t (id int PRIMARY KEY, u uuid DEFAULT gen_random_uuid());
+    INSERT INTO t (id) VALUES (1);
+    SELECT count(*) FROM t WHERE u IS NOT NULL;
+}
+expect {
+    1
+}
+
+@setup users
+test table-insert-returning-table-star {
+    INSERT INTO users VALUES (4, 'dave', 40, false) RETURNING users.*;
+}
+expect {
+    4|dave|40|f
+}
+
+@setup users
+test table-update-returning-table-star {
+    UPDATE users SET age = age + 1 WHERE name = 'bob' RETURNING users.*;
+}
+expect {
+    2|bob|26|f
+}
+
+@setup users
+test table-delete-returning-table-star {
+    DELETE FROM users WHERE name = 'carol' RETURNING users.*;
+}
+expect {
+    3|carol|35|t
+}
+
+@setup users
+test table-returning-alias-star {
+    INSERT INTO users AS u VALUES (5, 'eve', 20, true) RETURNING u.*;
+    UPDATE users AS u SET age = 50 WHERE id = 1 RETURNING u.*;
+    DELETE FROM users u WHERE id = 5 RETURNING id, u.*;
+}
+expect {
+    5|eve|20|t
+    1|alice|50|t
+    5|5|eve|20|t
+}
+
+@setup users
+test table-returning-schema-qualified-star {
+    INSERT INTO public.users VALUES (4, 'dave', 40, false) RETURNING public.users.*;
+    UPDATE public.users SET age = 50 WHERE id = 1 RETURNING public.users.*, users.*;
+    DELETE FROM public.users WHERE id = 4 RETURNING public.users.*;
+}
+expect {
+    4|dave|40|f
+    1|alice|50|t|1|alice|50|t
+    4|dave|40|f
+}
+
+@setup users
+test table-returning-star-with-unknown-middle-name-rejected {
+    INSERT INTO users VALUES (4, 'dave', 40, false) RETURNING users.zz.*;
+}
+expect error {}
+
+@setup users
+test table-returning-star-with-other-schema-rejected {
+    INSERT INTO public.users VALUES (4, 'dave', 40, false) RETURNING pg_catalog.users.*;
+}
+expect error {}
+
+@setup users
+test table-returning-table-name-star-after-alias-rejected {
+    INSERT INTO users AS u VALUES (4, 'dave', 40, false) RETURNING users.*;
+}
+expect error {}
+
+setup upsert {
+    CREATE TABLE upsert_t (a int PRIMARY KEY, k int UNIQUE, b int);
+    INSERT INTO upsert_t VALUES (1, 1, 0);
+}
+
+@setup upsert
+test table-upsert-existing-row-updated-twice-rejected {
+    INSERT INTO upsert_t VALUES (1, 10, 1), (1, 11, 5) ON CONFLICT (a) DO UPDATE SET b = excluded.b;
+}
+expect error {ON CONFLICT DO UPDATE command cannot affect row a second time}
+
+@setup upsert
+test table-upsert-inserted-row-updated-rejected {
+    INSERT INTO upsert_t VALUES (2, 2, 1), (2, 3, 5) ON CONFLICT (a) DO UPDATE SET b = excluded.b;
+}
+expect error {ON CONFLICT DO UPDATE command cannot affect row a second time}
+
+@setup upsert
+test table-upsert-row-updated-twice-through-unique-column-rejected {
+    INSERT INTO upsert_t VALUES (2, 1, 1), (3, 1, 5) ON CONFLICT (k) DO UPDATE SET b = excluded.b;
+}
+expect error {ON CONFLICT DO UPDATE command cannot affect row a second time}
+
+@setup upsert
+test table-upsert-row-with-changed-key-updated-again-rejected {
+    INSERT INTO upsert_t VALUES (1, 10, 7), (10, 11, 5) ON CONFLICT (a) DO UPDATE SET a = 10;
+}
+expect error {ON CONFLICT DO UPDATE command cannot affect row a second time}
+
+@setup upsert
+test table-upsert-inserted-row-with-false-where-rejected {
+    INSERT INTO upsert_t VALUES (2, 2, 1), (2, 3, 5) ON CONFLICT (a) DO UPDATE SET b = excluded.b WHERE false;
+}
+expect error {ON CONFLICT DO UPDATE command cannot affect row a second time}
+
+@setup upsert
+test table-upsert-existing-row-with-false-where-twice {
+    INSERT INTO upsert_t VALUES (1, 10, 1), (1, 11, 5) ON CONFLICT (a) DO UPDATE SET b = excluded.b WHERE false;
+    SELECT a, k, b FROM upsert_t ORDER BY a;
+}
+expect {
+    1|1|0
+}
+
+@setup upsert
+test table-upsert-different-rows-each-updated-once {
+    INSERT INTO upsert_t VALUES (2, 2, 0);
+    INSERT INTO upsert_t VALUES (1, 10, 1), (2, 20, 5), (3, 3, 9) ON CONFLICT (a) DO UPDATE SET b = excluded.b;
+    SELECT a, k, b FROM upsert_t ORDER BY a;
+}
+expect {
+    1|1|1
+    2|2|5
+    3|3|9
+}
+
+@setup upsert
+test table-upsert-do-nothing-skips-repeated-key {
+    INSERT INTO upsert_t VALUES (2, 2, 1), (2, 3, 5) ON CONFLICT (a) DO NOTHING;
+    SELECT a, k, b FROM upsert_t ORDER BY a;
+}
+expect {
+    1|1|0
+    2|2|1
 }

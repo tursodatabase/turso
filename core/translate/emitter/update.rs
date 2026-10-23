@@ -52,7 +52,10 @@ use crate::{
     vdbe::{
         affinity::Affinity,
         builder::{CursorKey, CursorType, DmlColumnContext},
-        insn::{to_u32, CmpInsFlags, IdxInsertFlags, InsertFlags, Insn, RegisterOrLiteral},
+        insn::{
+            to_u32, CmpInsFlags, ConstraintInfo, IdxInsertFlags, InsertFlags, Insn,
+            RegisterOrLiteral,
+        },
         BranchOffset,
     },
     CaptureDataChangesExt, Connection, HashSet, Result, MAIN_DB_ID,
@@ -590,25 +593,22 @@ fn emit_notnull_constraint_check(
                 )?;
                 program.preassign_label_to_next_insn(continue_label);
             }
-            // The value must still satisfy NOT NULL, whether it is the original
-            // (non-null) value or the substituted default: a column may declare
-            // DEFAULT (NULL), so substituting the default does not resolve the
-            // violation and SQLite aborts.
-            program.emit_insn(Insn::HaltIfNull {
-                target_reg,
-                err_code: SQLITE_CONSTRAINT_NOTNULL,
-                description: description(),
-                on_error: program.constraint_halt_on_error(or_conflict),
-            });
         }
-        _ => {
-            program.emit_insn(Insn::HaltIfNull {
-                target_reg,
-                err_code: SQLITE_CONSTRAINT_NOTNULL,
-                description: description(),
-                on_error: program.constraint_halt_on_error(or_conflict),
-            });
-        }
+        _ => {}
+    }
+    if !matches!(or_conflict, ResolveType::Ignore) {
+        // The value must still satisfy NOT NULL, whether it is the original
+        // (non-null) value or the substituted default: a column may declare
+        // DEFAULT (NULL), so substituting the default does not resolve the
+        // violation and SQLite aborts.
+        let col_name = table_column.name.as_deref().unwrap_or("").to_string();
+        program.emit_insn(Insn::HaltIfNull {
+            constraint_info: Some(Box::new(ConstraintInfo::not_null(table_name, col_name))),
+            target_reg,
+            err_code: SQLITE_CONSTRAINT_NOTNULL,
+            description: description(),
+            on_error: program.constraint_halt_on_error(or_conflict),
+        });
     }
     Ok(())
 }
@@ -1215,12 +1215,16 @@ fn emit_update_insns<'a>(
         .iter()
         .map(|set_clause| set_clause.column_index)
         .try_collect()?;
+    let updated_column_names: Vec<_> = set_clauses
+        .iter()
+        .flat_map(|set_clause| set_clause.column_names.iter().cloned())
+        .try_collect()?;
     let has_any_update_triggers = if let Some(btree_table) = target_table.table.btree() {
         has_triggers_including_temp(
             &t_ctx.resolver,
             update_database_id,
             TriggerEvent::Update,
-            Some(&updated_column_indices),
+            Some(&updated_column_names),
             &btree_table,
         )
     } else {
@@ -1347,7 +1351,7 @@ fn emit_update_insns<'a>(
             update_database_id,
             TriggerEvent::Update,
             TriggerTime::Before,
-            Some(updated_column_indices.clone()),
+            Some(&updated_column_names),
             &btree_table,
         ),
         None => Vec::new(),
@@ -1397,7 +1401,7 @@ fn emit_update_insns<'a>(
                 &t_ctx.resolver,
                 update_database_id,
                 TriggerEvent::Update,
-                Some(&updated_column_indices),
+                Some(&updated_column_names),
                 &btree_table,
             );
 
@@ -1706,6 +1710,20 @@ fn emit_update_insns<'a>(
                     String::from(table_name) + ".rowid"
                 };
                 program.emit_insn(Insn::Halt {
+                    constraint_info: Some(Box::new(ConstraintInfo::primary_key(
+                        table_name,
+                        target_table
+                            .table
+                            .btree()
+                            .unwrap()
+                            .primary_key_constraint_name
+                            .clone(),
+                        vec![rowid_alias_index.map_or_else(
+                            || "rowid".to_string(),
+                            |idx| target_table.table.columns()[idx].name.clone().unwrap(),
+                        )],
+                        vec![target_reg],
+                    ))),
                     err_code: SQLITE_CONSTRAINT_PRIMARYKEY,
                     description: raw_desc,
                     on_error: program.constraint_halt_on_error(effective_rowid_alias_conflict),
@@ -2069,6 +2087,11 @@ fn emit_update_insns<'a>(
                         },
                     );
                     program.emit_insn(Insn::Halt {
+                        constraint_info: Some(Box::new(ConstraintInfo::unique_index(
+                            table_name,
+                            index,
+                            (idx_start_reg..idx_start_reg + num_cols).collect(),
+                        ))),
                         err_code: SQLITE_CONSTRAINT_UNIQUE,
                         description: column_names,
                         on_error: program.constraint_halt_on_error(idx_conflict),
@@ -2213,6 +2236,7 @@ fn emit_update_insns<'a>(
                     start,
                     effective_rowid_reg,
                     &affected_columns,
+                    !affected_parent_fks.is_empty(),
                     update_database_id,
                     &t_ctx.resolver,
                     &layout,
@@ -2333,10 +2357,11 @@ fn emit_update_insns<'a>(
             {
                 Some(emit_cdc_full_record(
                     program,
+                    &t_ctx.resolver,
                     target_table.table.columns(),
                     target_table_cursor_id,
                     cdc_rowid_before_reg.expect("cdc_rowid_before_reg must be set"),
-                ))
+                )?)
             } else {
                 None
             };
@@ -2601,7 +2626,7 @@ fn emit_update_insns<'a>(
                     update_database_id,
                     TriggerEvent::Update,
                     TriggerTime::After,
-                    Some(updated_column_indices.clone()),
+                    Some(&updated_column_names),
                     &btree_table,
                 );
                 if !relevant_triggers.is_empty() {

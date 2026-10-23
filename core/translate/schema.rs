@@ -21,6 +21,7 @@ use crate::translate::fkeys::emit_fk_drop_table_check;
 use crate::translate::plan::{compound_column_affinity, Plan, QueryDestination};
 use crate::translate::planner::ROWID_STRS;
 use crate::translate::select::{emit_select_plan, prepare_select_plan};
+use crate::translate::sequence::bind_sequence_names;
 use crate::translate::{ProgramBuilder, ProgramBuilderOpts};
 use crate::util::{
     column_declared_type, dequote, escape_sql_string_literal, is_builtin_strict_type,
@@ -80,8 +81,16 @@ pub(crate) fn validate_check_expr(
                 name,
                 args,
                 filter_over,
+                order_by,
                 ..
             } => {
+                super::expr::validate_function_tail(
+                    name.as_str(),
+                    args.len(),
+                    filter_over,
+                    !order_by.is_empty(),
+                    resolver,
+                )?;
                 if filter_over.over_clause.is_some() {
                     bail_parse_error!("misuse of window function {}()", name.as_str());
                 }
@@ -617,7 +626,7 @@ fn resolve_type_name(type_name: &str, resolver: &Resolver) -> Result<CheckExprTy
     if let Ok(Some(resolved)) = resolver.schema().resolve_type_unchecked(type_name) {
         // Domains are transparent wrappers — resolve to the base primitive type
         // so CHECK constraint type checking compares primitives, not domain names.
-        if resolved.is_domain() {
+        if resolved.is_domain() || resolved.reads_stored_values_unchanged() {
             return resolve_type_name(&resolved.primitive, resolver);
         }
         return Ok(CheckExprType::CustomType(type_name.to_lowercase()));
@@ -1144,7 +1153,7 @@ pub fn translate_create_table(
 ) -> Result<()> {
     // For CTAS, extract the SELECT, determine column info, and convert to a
     // regular ColumnsAndConstraints body + separate SELECT for data insertion.
-    let (body, ctas_info) = match body {
+    let (mut body, ctas_info) = match body {
         ast::CreateTableBody::AsSelect(select) => {
             let (info, col_defs) = derive_ctas_schema(
                 select,
@@ -1172,6 +1181,8 @@ pub fn translate_create_table(
     program.begin_write_on_database(database_id, schema_cookie)?;
     let normalized_tbl_name = normalize_ident(tbl_name.name.as_str());
     validate(&body, &normalized_tbl_name, resolver, connection)?;
+    let bound_sequence_names = resolver.dialect.binds_names_at_create()
+        && bind_default_sequence_names(&mut body, resolver)?;
 
     // Gate array column types behind the experimental custom types flag.
     if !connection.experimental_custom_types_enabled() {
@@ -1352,6 +1363,19 @@ pub fn translate_create_table(
     // input text).
     let sql = if let Some(ref info) = ctas_info {
         info.schema_sql.clone()
+    } else if bound_sequence_names {
+        connection
+            .dialect()
+            .format_rewritten_table_sql(&ast::Stmt::CreateTable {
+                temporary,
+                if_not_exists,
+                tbl_name: ast::QualifiedName {
+                    namespace: None,
+                    name: tbl_name.name,
+                    alias: None,
+                },
+                body: body.clone(),
+            })?
     } else {
         connection
             .dialect()
@@ -1538,6 +1562,26 @@ pub fn translate_create_table(
     }
 
     Ok(())
+}
+
+/// Binds the sequences named in the column defaults of `body` to the
+/// schemas they resolve to now. See [`bind_sequence_names`].
+fn bind_default_sequence_names(
+    body: &mut ast::CreateTableBody,
+    resolver: &Resolver,
+) -> Result<bool> {
+    let ast::CreateTableBody::ColumnsAndConstraints { columns, .. } = body else {
+        return Ok(false);
+    };
+    let mut bound = false;
+    for column in columns {
+        for constraint in &mut column.constraints {
+            if let ast::ColumnConstraint::Default(expr) = &mut constraint.constraint {
+                bound |= bind_sequence_names(expr, resolver)?;
+            }
+        }
+    }
+    Ok(bound)
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1888,10 +1932,19 @@ pub fn translate_drop_table(
     program: &mut ProgramBuilder,
     connection: &Arc<Connection>,
 ) -> Result<()> {
-    let database_id = resolver.resolve_existing_table_database_id_qualified(&tbl_name)?;
     let name = tbl_name.name.as_str();
     let opts = ProgramBuilderOpts::new(4, 40, 4);
     program.extend(&opts);
+
+    let Some(database_id) = resolver.find_existing_table_database_id_qualified(&tbl_name)? else {
+        if if_exists {
+            return Ok(());
+        }
+        bail_parse_error!(
+            "no such table: {}",
+            crate::util::table_name_for_error(&tbl_name)
+        );
+    };
 
     let schema_cookie = resolver.with_schema(database_id, |s| s.schema_version);
     program.begin_write_on_database(database_id, schema_cookie)?;
@@ -1986,10 +2039,11 @@ pub fn translate_drop_table(
         let before_record_reg = if program.capture_data_changes_info().has_before() {
             Some(emit_cdc_full_record(
                 program,
+                resolver,
                 schema_table.columns(),
                 sqlite_schema_cursor_id_0,
                 row_id_reg,
-            ))
+            )?)
         } else {
             None
         };

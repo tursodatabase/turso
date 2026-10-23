@@ -1,6 +1,6 @@
 use crate::alloc::Arc;
 use crate::schema::Column;
-use crate::translate::expr::emit_table_column;
+use crate::translate::expr::{emit_stored_column, emit_table_column};
 use crate::vdbe::affinity::Affinity;
 use crate::vdbe::builder::SelfTableContext;
 use crate::{
@@ -124,6 +124,7 @@ fn emit_integrity_result_row(program: &mut ProgramBuilder, registers: &Registers
         decrement_by: 1,
     });
     program.emit_insn(Insn::Halt {
+        constraint_info: None,
         err_code: 0,
         on_error: None,
         description_reg: None,
@@ -227,7 +228,7 @@ fn translate_integrity_check_for_schema(
     });
 
     let database_name = resolver
-        .get_database_name_by_index(database_id)
+        .namespace_name(database_id)
         .expect("resolved integrity-check database must still exist");
     program.emit_string8(
         format!("*** in database {database_name} ***\n"),
@@ -797,7 +798,7 @@ fn emit_column(
     let col_value_reg = program.alloc_register();
     match col_ref {
         BoundIndexColumn::Column(idx) => {
-            program.emit_column_or_rowid(table_cursor_id, *idx, col_value_reg);
+            emit_stored_column(program, table_cursor_id, *idx, col_value_reg, resolver)?;
         }
         BoundIndexColumn::Expr(expr, affinity) => {
             let self_table_context =

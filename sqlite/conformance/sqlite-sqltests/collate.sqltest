@@ -1770,6 +1770,18 @@ expect {
     0|0|1|1
 }
 
+test collation-ordered-aggregate-results-are-opaque {
+    CREATE TABLE t1(a TEXT COLLATE NOCASE, b INTEGER);
+    INSERT INTO t1 VALUES ('B', 2), ('A', 1);
+    SELECT group_concat(a ORDER BY b) = 'a,b',
+           group_concat(a COLLATE NOCASE ORDER BY b) = 'a,b',
+           group_concat(a ORDER BY b COLLATE NOCASE) = 'a,b'
+    FROM t1 GROUP BY a IS NOT NULL;
+}
+expect {
+    0|1|0
+}
+
 test collation-aggregate-having-keeps-explicit-collation {
     CREATE TABLE t1(a TEXT COLLATE NOCASE);
     INSERT INTO t1 VALUES ('A'), ('C');
@@ -1948,4 +1960,19 @@ expect {
     4
     3
     1
+}
+
+test compound-chain-leftmost-collation {
+    CREATE TABLE compound_collate_left(n TEXT COLLATE NOCASE, p TEXT);
+    CREATE TABLE compound_collate_right(n TEXT);
+    INSERT INTO compound_collate_left VALUES ('a', 'z'), ('A', 'A');
+    INSERT INTO compound_collate_right VALUES ('a');
+    SELECT count(*) FROM (
+        SELECT n FROM compound_collate_left
+        EXCEPT SELECT p FROM compound_collate_left
+        INTERSECT SELECT n FROM compound_collate_right
+    );
+}
+expect {
+    0
 }

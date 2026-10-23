@@ -125,7 +125,7 @@ pub fn translate_create_trigger(
             .namespace
             .as_ref()
             .map(|db_name| db_name.as_str().to_string())
-            .or_else(|| resolver.get_database_name_by_index(target_table_database_id))
+            .or_else(|| resolver.namespace_name(target_table_database_id))
             .unwrap_or_else(|| "main".to_string());
         bail_parse_error!(
             "trigger {} cannot reference objects in database {}",
@@ -206,7 +206,7 @@ pub fn translate_create_trigger(
             );
         }
         let db_name = resolver
-            .get_database_name_by_index(target_table_database_id)
+            .namespace_name(target_table_database_id)
             .unwrap_or_else(|| "main".to_string());
         bail_parse_error!("no such table: {}.{}", db_name, tbl_name.name.as_str());
     };

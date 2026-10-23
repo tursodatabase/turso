@@ -101,6 +101,18 @@ module docs in `postgres/regress/main.rs` for known gaps), extend the runner —
 never adapt the corpus. If every test suddenly fails with uniform, systematic
 diffs, suspect the runner's psql emulation before suspecting the server.
 
+## Embedded errors
+
+The `turso_pg` connection and statement APIs return `turso_pg::Error`.
+Its `Display` implementation uses the PostgreSQL message, and its
+`sqlstate`, `detail`, `table_name`, `column_name`, and `constraint_name`
+fields are available without a separate conversion. `core_error()` and
+`std::error::Error::source()` expose the original engine error.
+
+The CLI prints these fields and the wire server serializes them. Error
+classification and PostgreSQL wording belong in the frontend. Explicit
+access through `Connection::inner()` uses the core API and its error type.
+
 ## Rust tests
 
 Focused tests that don't fit the transcript format live in Rust:

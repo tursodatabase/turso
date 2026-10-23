@@ -171,6 +171,38 @@ expect error {
     materialized views with non-deterministic expressions are not yet supported
 }
 
+# CURRENT_DATE, CURRENT_TIME and CURRENT_TIMESTAMP are fixed within one
+# statement but change between statements, so a view row computed from them
+# would go stale without any write to the base table.
+test matview-vdbe-current-timestamp-filter-rejected {
+    CREATE TABLE current_time_base(x INTEGER, t TEXT);
+    CREATE MATERIALIZED VIEW current_time_filter AS
+      SELECT x FROM current_time_base WHERE t < CURRENT_TIMESTAMP;
+}
+expect error {
+    materialized views with non-deterministic expressions are not yet supported
+}
+
+test matview-vdbe-current-date-projection-rejected {
+    CREATE TABLE current_date_base(x INTEGER);
+    CREATE MATERIALIZED VIEW current_date_projection AS
+      SELECT x, CURRENT_DATE AS d FROM current_date_base;
+}
+expect error {
+    materialized views with non-deterministic expressions are not yet supported
+}
+
+test matview-vdbe-current-time-join-rejected {
+    CREATE TABLE current_time_a(x INTEGER, t TEXT);
+    CREATE TABLE current_time_b(x INTEGER);
+    CREATE MATERIALIZED VIEW current_time_join AS
+      SELECT current_time_a.x FROM current_time_a
+      JOIN current_time_b ON current_time_a.x = current_time_b.x AND current_time_a.t < CURRENT_TIME;
+}
+expect error {
+    materialized views with non-deterministic expressions are not yet supported
+}
+
 test matview-vdbe-virtual-generated-column-source-rejected {
     CREATE TABLE generated_source_base(
       x INTEGER,

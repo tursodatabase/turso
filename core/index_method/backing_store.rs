@@ -63,7 +63,7 @@ impl IndexMethodContext {
 
 fn database_prefix(connection: &Connection, database_id: usize) -> String {
     connection
-        .get_database_name_by_index(database_id)
+        .namespace_name(database_id)
         .filter(|name| name != "main")
         .map(|name| format!("{}.", quote_identifier(&name)))
         .unwrap_or_default()

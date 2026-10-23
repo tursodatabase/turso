@@ -1420,6 +1420,7 @@ mod tests {
                 has_rowid: true,
                 index_method: None,
                 on_conflict: None,
+                constraint_name: None,
             })]),
         );
 
@@ -1564,6 +1565,7 @@ mod tests {
                 has_rowid: true,
                 index_method: None,
                 on_conflict: None,
+                constraint_name: None,
             })]),
         );
 
@@ -1673,6 +1675,7 @@ mod tests {
                 has_rowid: true,
                 index_method: None,
                 on_conflict: None,
+                constraint_name: None,
             })]),
         );
 
@@ -1855,6 +1858,7 @@ mod tests {
                 has_rowid: true,
                 index_method: None,
                 on_conflict: None,
+                constraint_name: None,
             })]),
         );
 

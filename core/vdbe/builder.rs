@@ -517,11 +517,11 @@ pub struct MaterializedCteInfo {
     /// calls it before `OpenDup`, because the first reference can be on a path
     /// that never runs. A CTE that reads an outer row is never shared, so each of
     /// its references fills its own table.
-    pub fill_subroutine: CteFillSubroutine,
+    pub fill_subroutine: Subroutine,
 }
 
 #[derive(Debug, Clone, Copy)]
-pub struct CteFillSubroutine {
+pub struct Subroutine {
     pub label: BranchOffset,
     pub return_reg: usize,
 }
@@ -1446,6 +1446,7 @@ impl ProgramBuilder {
 
     fn emit_halt(&mut self, rollback: bool) {
         self.emit_insn(Insn::Halt {
+            constraint_info: None,
             err_code: 0,
             description: if rollback {
                 "rollback".to_string()
@@ -1463,6 +1464,7 @@ impl ProgramBuilder {
     #[allow(dead_code)]
     pub fn emit_halt_err(&mut self, err_code: usize, description: String) {
         self.emit_insn(Insn::Halt {
+            constraint_info: None,
             err_code,
             description,
             on_error: None,
@@ -2173,6 +2175,7 @@ impl ProgramBuilder {
                 "fk action"
             };
             self.emit_insn(Insn::Halt {
+                constraint_info: None,
                 err_code: 0,
                 description: description.to_string(),
                 on_error: None,
@@ -2315,7 +2318,9 @@ impl ProgramBuilder {
 
     /// Emit a ColumnHasField instruction that jumps to `target_pc` if the
     /// cursor's record has a field at the given logical column index.
-    /// Falls through if the record is short (ALTER TABLE ADD COLUMN).
+    /// Also jumps on a NULL row (the unmatched side of a LEFT JOIN), so the
+    /// column stays NULL. Falls through if the record is short (ALTER TABLE
+    /// ADD COLUMN).
     pub fn emit_column_has_field(
         &mut self,
         cursor_id: CursorID,

@@ -364,9 +364,9 @@ pub fn emit_fk_child_decrement_on_delete(
     database_id: usize,
     resolver: &Resolver,
 ) -> crate::Result<()> {
-    for fk_ref in
-        resolver.with_schema(database_id, |s| s.resolved_fks_for_child(child_table_name))?
-    {
+    for fk_ref in resolver.with_schema(database_id, |s| {
+        s.resolved_fks_for_child(child_table_name, None)
+    })? {
         if !fk_ref.fk.deferred {
             continue;
         }
@@ -818,10 +818,11 @@ fn emit_delete_row_common(
                 let table_reference = unsafe { &*table_reference };
                 Some(emit_cdc_full_record(
                     program,
+                    &t_ctx.resolver,
                     table_reference.table.columns(),
                     main_table_cursor_id,
                     rowid_reg,
-                ))
+                )?)
             } else {
                 None
             };

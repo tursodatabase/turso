@@ -280,6 +280,7 @@ impl Property {
             | Property::UnionAllPreservesCardinality { .. }
             | Property::LateralMatchesJsonEach { .. }
             | Property::ReadYourUpdatesBack { .. }
+            | Property::ReadYourUpdatesBackDeferred { .. }
             | Property::TableHasExpectedContent { .. }
             | Property::AllTableHaveExpectedContent { .. } => {
                 unreachable!("No extensional queries")
@@ -483,6 +484,138 @@ impl Property {
                                         print_diff(before_rows, after_rows, "before", "after");
                                         return Ok(Err(format!(
                                             "UPDATE failed but rows changed - rollback failed: {} rows before, {} after",
+                                            before_rows.len(),
+                                            after_rows.len()
+                                        )));
+                                    }
+                                    Ok(Ok(()))
+                                }
+                            }
+                            (Err(e), _) | (_, Err(e)) => {
+                                Err(LimboError::InternalError(format!("SELECT failed: {e}")))
+                            }
+                        }
+                    },
+                    vec![table_dependency],
+                ));
+
+                let mut update_builder = InteractionBuilder::with_interaction(update_interaction);
+                update_builder.ignore_error(true);
+
+                vec![
+                    InteractionBuilder::with_interaction(assumption),
+                    InteractionBuilder::with_interaction(before_interaction),
+                    InteractionBuilder::with_interaction(begin_tx),
+                    update_builder,
+                    InteractionBuilder::with_interaction(commit_tx),
+                    InteractionBuilder::with_interaction(after_interaction),
+                    InteractionBuilder::with_interaction(assertion),
+                ]
+            }
+            Property::ReadYourUpdatesBackDeferred {
+                update,
+                select_before,
+                select_after,
+            } => {
+                let table = update.table().to_string();
+                let table_dependency = table.clone();
+                let assumption = InteractionType::Assumption(Assertion::new(
+                    format!("table {table} exists"),
+                    move |_: &Vec<ResultSet>, env: &mut SimulatorEnv| {
+                        let conn_tables = env.get_conn_tables(connection_index);
+                        if conn_tables.iter().any(|t| t.name == table) {
+                            Ok(Ok(()))
+                        } else {
+                            Ok(Err(format!("table {table} does not exist")))
+                        }
+                    },
+                    vec![table_dependency.clone()],
+                ));
+
+                let before_interaction =
+                    InteractionType::Query(Query::Select(select_before.clone()));
+                let begin_tx = InteractionType::Query(Query::Begin(
+                    sql_generation::model::query::transaction::Begin::Deferred,
+                ));
+                let update_interaction = InteractionType::Query(Query::Update(update.clone()));
+                let commit_tx = InteractionType::Query(Query::Commit(
+                    sql_generation::model::query::transaction::Commit,
+                ));
+                let after_interaction = InteractionType::Query(Query::Select(select_after.clone()));
+
+                let update = update.clone();
+                let table = update.table().to_string();
+
+                let assertion = InteractionType::Assertion(Assertion::new(
+                    format!(
+                        "verify UPDATE result for table {table} in deferred tx: success=values updated, failure=snapshot unchanged"
+                    ),
+                    move |stack: &Vec<ResultSet>, _| {
+                        if stack.len() < 5 {
+                            return Err(LimboError::InternalError(
+                                "ReadYourUpdatesBackDeferred: expected 5 results on stack".into(),
+                            ));
+                        }
+                        let before = &stack[stack.len() - 5];
+                        let update_result = &stack[stack.len() - 3];
+                        let after = &stack[stack.len() - 1];
+
+                        let update_succeeded = update_result.is_ok();
+
+                        match (before, after) {
+                            (Ok(before_rows), Ok(after_rows)) => {
+                                if update_succeeded {
+                                    for row in after_rows {
+                                        for (i, (col, set_val)) in
+                                            update.set_values.iter().enumerate()
+                                        {
+                                            match set_val {
+                                                SetValue::Simple(expected) => {
+                                                    if &row[i] != expected {
+                                                        print_diff(
+                                                            &[row.to_vec()],
+                                                            &[vec![expected.clone()]],
+                                                            "database",
+                                                            "expected",
+                                                        );
+                                                        return Ok(Err(format!(
+                                                            "row has incorrect value for column {col}: expected {expected}, got {}",
+                                                            row[i]
+                                                        )));
+                                                    }
+                                                }
+                                                SetValue::CaseWhen { then_value, .. } => {
+                                                    let is_then = &row[i] == then_value;
+                                                    let existed_before = before_rows
+                                                        .iter()
+                                                        .any(|br| br[i] == row[i]);
+                                                    if !is_then && !existed_before {
+                                                        return Ok(Err(format!(
+                                                            "CaseWhen: row col {col} has unexpected value {} (expected {} or a value from before)",
+                                                            row[i], then_value
+                                                        )));
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                    Ok(Ok(()))
+                                } else {
+                                    let rows_equal_as_multiset =
+                                        |a: &[Vec<SimValue>], b: &[Vec<SimValue>]| {
+                                            if a.len() != b.len() {
+                                                return false;
+                                            }
+                                            let count_in =
+                                                |row: &Vec<SimValue>, set: &[Vec<SimValue>]| {
+                                                    set.iter().filter(|r| *r == row).count()
+                                                };
+                                            a.iter().all(|row| count_in(row, a) == count_in(row, b))
+                                        };
+                                    if !rows_equal_as_multiset(before_rows, after_rows) {
+                                        print_diff(before_rows, after_rows, "before", "after");
+                                        return Ok(Err(format!(
+                                            "UPDATE failed in deferred tx but rows changed - snapshot was lost: {} rows before, {} after",
                                             before_rows.len(),
                                             after_rows.len()
                                         )));
@@ -2082,6 +2215,33 @@ fn property_read_your_updates_back<R: rand::Rng + ?Sized>(
     }
 }
 
+fn property_read_your_updates_back_deferred<R: rand::Rng + ?Sized>(
+    rng: &mut R,
+    _query_distr: &QueryDistribution,
+    ctx: &impl GenerationContext,
+    _mvcc: bool,
+) -> Property {
+    let update = Update::arbitrary(rng, ctx);
+
+    let select = Select::single(
+        update.table().to_string(),
+        update
+            .set_values
+            .iter()
+            .map(|(col, _)| ResultColumn::Column(col.clone()))
+            .collect(),
+        update.predicate.clone(),
+        None,
+        Distinctness::All,
+    );
+
+    Property::ReadYourUpdatesBackDeferred {
+        update,
+        select_before: select.clone(),
+        select_after: select,
+    }
+}
+
 fn property_savepoint_rollback<R: rand::Rng + ?Sized>(
     rng: &mut R,
     query_distr: &QueryDistribution,
@@ -2417,6 +2577,9 @@ impl PropertyDiscriminants {
         match self {
             PropertyDiscriminants::InsertValuesSelect => property_insert_values_select,
             PropertyDiscriminants::ReadYourUpdatesBack => property_read_your_updates_back,
+            PropertyDiscriminants::ReadYourUpdatesBackDeferred => {
+                property_read_your_updates_back_deferred
+            }
             PropertyDiscriminants::SavepointRollback => property_savepoint_rollback,
             PropertyDiscriminants::TableHasExpectedContent => property_table_has_expected_content,
             PropertyDiscriminants::AllTableHaveExpectedContent => {
@@ -2463,6 +2626,13 @@ impl PropertyDiscriminants {
             }
 
             PropertyDiscriminants::ReadYourUpdatesBack => {
+                if remaining.select > 0 && remaining.update > 0 {
+                    u32::min(remaining.select, remaining.update).max(1)
+                } else {
+                    0
+                }
+            }
+            PropertyDiscriminants::ReadYourUpdatesBackDeferred => {
                 if remaining.select > 0 && remaining.update > 0 {
                     u32::min(remaining.select, remaining.update).max(1)
                 } else {
@@ -2594,6 +2764,9 @@ impl PropertyDiscriminants {
                 QueryCapabilities::SELECT.union(QueryCapabilities::INSERT)
             }
             PropertyDiscriminants::ReadYourUpdatesBack => {
+                QueryCapabilities::SELECT.union(QueryCapabilities::UPDATE)
+            }
+            PropertyDiscriminants::ReadYourUpdatesBackDeferred => {
                 QueryCapabilities::SELECT.union(QueryCapabilities::UPDATE)
             }
             PropertyDiscriminants::SavepointRollback => QueryCapabilities::INSERT,

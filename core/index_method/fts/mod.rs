@@ -584,6 +584,7 @@ pub struct FtsIndexAttachment {
 /// Supported tokenizer names for FTS indexes
 pub const SUPPORTED_TOKENIZERS: &[&str] = &[
     "default",    // Tantivy default: lowercase + punctuation split + 40 char limit
+    "en_stem",    // Like default, plus English stemming ("running" matches "runs")
     "raw",        // No tokenization - exact match only
     "simple",     // Basic whitespace/punctuation split
     "whitespace", // Split on whitespace only

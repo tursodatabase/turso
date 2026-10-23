@@ -1101,6 +1101,9 @@ pub struct ProgramState {
     /// `SQLITE_BUSY` halt through `op_halt`, which would mis-wrap it as
     /// a constraint error.
     pub sequence_inner_retry_count: u32,
+    /// The time "now" means for the date and time functions during the
+    /// current step. See `StatementClock`.
+    pub(crate) current_time: Option<crate::WallClockInstant>,
     #[cfg(feature = "json")]
     json_cache: JsonCacheCell,
     active_op_state: ActiveOpStateSlot,
@@ -1165,6 +1168,7 @@ pub struct ProgramState {
     /// Number of immediate foreign key violations that occurred during the active statement. If nonzero,
     /// the statement subtransactionwill roll back.
     fk_immediate_violations_during_stmt: AtomicIsize,
+    fk_immediate_violation: Option<LimboError>,
     uses_subjournal: bool,
     /// Whether this statement is an active write inside an explicit transaction.
     pub(crate) is_active_write: bool,
@@ -1175,6 +1179,12 @@ pub struct ProgramState {
     /// The connection's MvStore handle, revalidated with one pointer compare
     /// per use instead of a full ArcSwap load (see `ProgramState::mv_store`).
     mv_store_cache: Option<arc_swap::Cache<MvStoreHandle, Option<Arc<MvStore>>>>,
+    /// Set when `begin_fresh_mvcc_tx` succeeds for the first statement of a
+    /// deferred explicit transaction (`Pending { .. }`). Holds (db_index,
+    /// concurrent_flag). When the statement fails before returning any rows,
+    /// the error path rolls back the MVCC tx and restores `Pending` so the
+    /// snapshot is taken at the first SUCCESSFUL statement instead.
+    pub(crate) pending_fresh_tx: Option<(usize, bool)>,
 }
 
 /// Lets an `arc_swap::Cache` follow the MvStore slot of a database.
@@ -1242,6 +1252,7 @@ impl ProgramState {
             sequence_inner_commit: None,
             sequence_inner_tx_pending: None,
             sequence_inner_retry_count: 0,
+            current_time: None,
             #[cfg(feature = "json")]
             json_cache: JsonCacheCell::new(),
             active_op_state: ActiveOpStateSlot::default(),
@@ -1254,6 +1265,7 @@ impl ProgramState {
             auto_txn_cleanup: TxnCleanup::None,
             fk_deferred_violations_when_stmt_started: AtomicIsize::new(0),
             fk_immediate_violations_during_stmt: AtomicIsize::new(0),
+            fk_immediate_violation: None,
             rowsets: HashMap::default(),
             spare_agg_payloads: Vec::new(),
             bloom_filters: HashMap::default(),
@@ -1272,6 +1284,7 @@ impl ProgramState {
             pending_cdc_info: None,
             subprogram_stmt_cache: HashMap::default(),
             mv_store_cache: None,
+            pending_fresh_tx: None,
         }
     }
 
@@ -1393,6 +1406,7 @@ impl ProgramState {
         self.execution_state = ProgramExecutionState::Init;
         self.query_deadline = None;
         self.explicit_checkpoint_guard = None;
+        self.current_time = None;
         #[cfg(feature = "json")]
         self.json_cache.clear();
 
@@ -1415,6 +1429,7 @@ impl ProgramState {
         self.populate_matviews_state = None;
         self.auto_txn_cleanup = TxnCleanup::None;
         *self.fk_immediate_violations_during_stmt.get_mut() = 0;
+        self.fk_immediate_violation = None;
         *self.fk_deferred_violations_when_stmt_started.get_mut() = 0;
         if !self.rowsets.is_empty() {
             self.rowsets.clear();
@@ -1442,6 +1457,7 @@ impl ProgramState {
         self.halt_in_progress = false;
         self.pending_cdc_info = None;
         self.subprogram_stmt_cache.clear();
+        self.pending_fresh_tx = None;
     }
 
     pub(crate) fn record_statement_change(&self) {
@@ -1731,6 +1747,7 @@ impl ProgramState {
         // Reset the immediate foreign key violations counter to 0. If this is nonzero when the statement completes, the statement subtransaction will roll back.
         self.fk_immediate_violations_during_stmt
             .store(0, Ordering::Release);
+        self.fk_immediate_violation = None;
         Ok(IOResult::Done(()))
     }
 
@@ -1929,6 +1946,12 @@ impl ProgramState {
     pub fn get_fk_immediate_violations_during_stmt(&self) -> isize {
         self.fk_immediate_violations_during_stmt
             .load(Ordering::Acquire)
+    }
+
+    pub(crate) fn immediate_foreign_key_error(&self) -> LimboError {
+        self.fk_immediate_violation.clone().unwrap_or_else(|| {
+            LimboError::ForeignKeyConstraint("FOREIGN KEY constraint failed".to_string())
+        })
     }
 
     pub fn increment_fk_immediate_violations_during_stmt(&self, v: isize) {
@@ -2501,6 +2524,9 @@ impl Program {
             }
             _ => {}
         }
+        if !matches!(result, ProgramStep::IO | ProgramStep::Yield) {
+            state.current_time = None;
+        }
         return result;
 
         #[inline(never)]
@@ -2879,18 +2905,19 @@ impl Program {
         pager: &Arc<Pager>,
         err: LimboError,
     ) -> Option<ProgramStep> {
-        match err {
+        match err.into_structured_constraint() {
             LimboError::Busy => Some(ProgramStep::Busy),
             LimboError::BusySnapshot
-                if self.connection.transaction_state.get() == TransactionState::None =>
+                if matches!(
+                    self.connection.transaction_state.get(),
+                    TransactionState::None | TransactionState::Pending { .. }
+                ) =>
             {
-                // For interactive transactions that are already in a read transaction, retrying BusySnapshot is pointless
-                // because the snapshot will continue to be stale no matter how many times we retry.
-                // However, for auto-commits or BEGIN IMMEDIATE, failing to promote to write transaction means it was rolled
-                // back, so auto-retrying can be useful.
                 Some(ProgramStep::Busy)
             }
-            err if (matches!(err, LimboError::Constraint(_))
+            err if ((matches!(err, LimboError::Constraint(_))
+                || matches!(err, LimboError::ConstraintViolation(_)))
+                && !err.is_foreign_key_constraint()
                 && self.resolve_type == ResolveType::Fail)
                 || matches!(err, LimboError::Raise(ResolveType::Fail, _)) =>
             {
@@ -3100,7 +3127,8 @@ impl Program {
                     self.end_attached_read_txns(&connection);
                     Ok(IOResult::Done(()))
                 }
-                TransactionState::None => {
+                TransactionState::None | TransactionState::Pending { .. } => {
+                    connection.set_tx_state(TransactionState::None);
                     match self.end_attached_write_txns(&connection, rollback)? {
                         IOResult::Done(_) => {}
                         IOResult::IO(io) => {
@@ -3150,10 +3178,9 @@ impl Program {
             if let Some(tx_id) = conn.get_mv_tx_id() {
                 let state_machine = mv_store.commit_tx(tx_id, &conn, crate::MAIN_DB_ID)?;
                 program_state.commit_state = CommitState::CommittingMvcc { state_machine };
+            } else {
+                conn.set_tx_state(TransactionState::None);
             }
-            // If no main MVCC tx, commit_state stays Ready and we fall
-            // through directly to phase 2 (the CommittingMvcc and
-            // CommittingAttachedMvcc checks will both miss).
         }
 
         if matches!(
@@ -3518,7 +3545,9 @@ impl Program {
         let keeps_prior_changes = match err {
             Some(LimboError::RaiseIgnore) => true,
             Some(LimboError::Raise(ResolveType::Fail, _)) => true,
-            Some(LimboError::Constraint(_)) => self.resolve_type == ResolveType::Fail,
+            Some(error @ (LimboError::Constraint(_) | LimboError::ConstraintViolation(_))) => {
+                !error.is_foreign_key_constraint() && self.resolve_type == ResolveType::Fail
+            }
             _ => false,
         };
         if (err.is_some() || state.execution_state.is_running()) && !keeps_prior_changes {
@@ -3567,6 +3596,7 @@ impl Program {
         }
         // Errors from nested statements are handled by the parent statement.
         if !self.connection.is_nested_stmt() && !self.is_trigger_subprogram() {
+            state.pending_fresh_tx = None;
             let unfinished_statement_reset_or_drop =
                 err.is_none() && state.execution_state.is_running();
             let inside_explicit_transaction = !self.connection.get_auto_commit();
@@ -3613,7 +3643,9 @@ impl Program {
                 // For ON CONFLICT FAIL, do NOT rollback the statement savepoint —
                 // changes made before the error should persist.
                 // For all other resolve types (ABORT, ROLLBACK, etc.), rollback the statement.
-                let is_fail_constraint = (matches!(err, Some(LimboError::Constraint(_)))
+                let is_fail_constraint = ((matches!(err, Some(LimboError::Constraint(_)))
+                    || matches!(err, Some(LimboError::ConstraintViolation(_))))
+                    && !err.is_some_and(LimboError::is_foreign_key_constraint)
                     && self.resolve_type == ResolveType::Fail)
                     || matches!(err, Some(LimboError::Raise(ResolveType::Fail, _)));
                 if !is_fail_constraint {
@@ -3668,7 +3700,7 @@ impl Program {
                 // Foreign key constraint errors: ON CONFLICT does NOT apply to FK violations.
                 // FK errors always behave like ABORT: rollback statement,
                 // rollback transaction in autocommit mode.
-                Some(LimboError::ForeignKeyConstraint(_)) => {
+                Some(error) if error.is_foreign_key_constraint() => {
                     if must_rollback_tx_if_needed {
                         self.rollback_current_txn(pager);
                     }
@@ -3680,7 +3712,9 @@ impl Program {
                 // - ROLLBACK: rollback the entire transaction regardless of autocommit mode
                 // - FAIL: don't rollback anything - changes persist, transaction stays active
                 // - ABORT (default): rollback statement, rollback txn if autocommit
-                Some(LimboError::Constraint(_)) | Some(LimboError::Raise(_, _)) => {
+                Some(LimboError::Constraint(_))
+                | Some(LimboError::ConstraintViolation(_))
+                | Some(LimboError::Raise(_, _)) => {
                     let effective_resolve = match err {
                         Some(LimboError::Raise(rt, _)) => *rt,
                         _ => self.resolve_type,
@@ -3705,6 +3739,11 @@ impl Program {
                                     "Failed to release statement savepoint during abort",
                                 );
                             }
+                            // The fresh MVCC tx opened for the first statement of a Pending
+                            // explicit tx is now adopted — FAIL keeps changes in the tx.
+                            // Clear it so rollback_pending_fresh_tx_if_needed does not
+                            // undo it after abort() returns.
+                            state.pending_fresh_tx = None;
                             if can_autocommit_now {
                                 // Autocommit FAIL: commit partial changes.
                                 // This matches halt()'s FAIL+autocommit path.
@@ -3758,8 +3797,11 @@ impl Program {
                                 // delivered it before returning the error;
                                 // only the trigger RAISE(FAIL) shape reaches
                                 // the commit through this arm.
-                                let halt_already_delivered =
-                                    matches!(err, Some(LimboError::Constraint(_)));
+                                let halt_already_delivered = matches!(
+                                    err,
+                                    Some(LimboError::Constraint(_))
+                                        | Some(LimboError::ConstraintViolation(_))
+                                );
                                 if committed && !halt_already_delivered {
                                     execute::index_method_on_transaction_committed_all(
                                         state,

@@ -110,6 +110,8 @@ BEGIN
 END;
 ```
 
+The trigger fires when one of its columns is named in the SET list of the UPDATE or of an `ON CONFLICT DO UPDATE`. Names are compared as written, so `SET rowid = 5` fires `UPDATE OF rowid` but not `UPDATE OF oid`, and not `UPDATE OF id` where `id` is the `INTEGER PRIMARY KEY` column.
+
 ## RAISE Function
 
 The `RAISE` function is used inside trigger bodies (and other contexts) to interrupt execution and signal an error. It takes one of four forms:

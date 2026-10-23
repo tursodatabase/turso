@@ -585,9 +585,10 @@ pub fn resolve_window_and_aggregate_functions(
                     );
                 }
 
-                if !order_by.is_empty() {
+                if !order_by.is_empty() && filter_over.over_clause.is_some() {
                     crate::bail_parse_error!(
-                        "ORDER BY clause is not supported yet in aggregate functions"
+                        "ORDER BY may not be used with non-aggregate {}()",
+                        name.as_str()
                     );
                 }
                 let args_count = args.len();
@@ -670,6 +671,12 @@ pub fn resolve_window_and_aggregate_functions(
                         }
                     }
                     _ => {}
+                }
+                if !order_by.is_empty() {
+                    crate::bail_parse_error!(
+                        "ORDER BY may not be used with non-aggregate {}()",
+                        name.as_str()
+                    );
                 }
             }
             Expr::FunctionCallStar { name, filter_over } => {
@@ -2159,25 +2166,9 @@ fn parse_table(
         resolver.with_schema(database_id, |schema| schema.get_view(table_name.as_str()));
     if let Some(view) = regular_view {
         // Views are essentially query aliases, so just Expand the view as a subquery.
-        let mut view_select = view.select_stmt.clone();
-        if let ast::OneSelect::Select {
-            ref mut columns, ..
-        } = view_select.body.select
-        {
-            for (col, result_col) in view.columns.iter().zip(columns.iter_mut()) {
-                if let (Some(name_str), ast::ResultColumn::Expr(_, ref mut alias)) =
-                    (&col.name, result_col)
-                {
-                    *alias = Some(ast::As::As(ast::Name::exact(name_str.clone())));
-                }
-            }
-        }
-        let subselect = Box::new(view_select);
-
-        // Use the view name as alias if no explicit alias was provided
         let view_alias = maybe_alias
-            .cloned()
-            .or_else(|| Some(ast::As::As(table_name.clone())));
+            .map(|a| normalize_ident(a.name().as_str()))
+            .unwrap_or_else(|| normalize_ident(table_name.as_str()));
 
         // A persistent view's unqualified table names resolve within the
         // view's own database (`database_id`, where `get_view` found it
@@ -2186,23 +2177,28 @@ fn parse_table(
         // sqlite3FixSelect/sqlite3FixSrcList): a view's unqualified names are
         // fixed to the database it was created in, not resolved TEMP-first
         // like an ordinary top-level query.
-        return resolver.with_view_scope(database_id, view.name.clone(), || {
+        let view_plan = resolver.with_view_scope(database_id, view.name.clone(), || {
             program.with_view_expansion(database_id, &view.name, |program| {
-                parse_from_clause_table(
-                    ast::SelectTable::Select {
-                        select: *subselect,
-                        alias: view_alias,
-                        lateral: false,
-                    },
+                prepare_select_plan(
+                    view.select_stmt.clone(),
                     resolver,
                     program,
-                    table_references,
-                    vtab_predicates,
-                    &[],
+                    table_references.outer_query_refs(),
+                    QueryDestination::placeholder_for_subquery(),
                     connection,
                 )
             })
-        });
+        })?;
+        table_references.add_joined_table(JoinedTable::new_subquery_from_plan(
+            view_alias,
+            view_plan,
+            None,
+            program.table_reference_counter.next(),
+            (!view.explicit_columns.is_empty()).then_some(view.explicit_columns.as_slice()),
+            None,
+            false,
+        )?);
+        return Ok(());
     }
 
     let view = resolver.with_schema(database_id, |schema| {

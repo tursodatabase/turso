@@ -2139,6 +2139,7 @@ fn materialized_subquery_ephemeral_index(
         has_rowid: true,
         index_method: None,
         on_conflict: None,
+        constraint_name: None,
     }))
 }
 

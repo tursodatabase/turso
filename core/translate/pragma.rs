@@ -14,7 +14,7 @@ use super::integrity_check::{
 };
 use crate::function::Func;
 use crate::pragma::pragma_for;
-use crate::schema::{Schema, Table};
+use crate::schema::{BTreeTable, Index, Schema, Table};
 use crate::storage::encryption::{CipherMode, EncryptionKey};
 use crate::storage::pager::AutoVacuumMode;
 use crate::storage::pager::Pager;
@@ -22,7 +22,10 @@ use crate::storage::sqlite3_ondisk::CacheSize;
 use crate::storage::wal::CheckpointMode;
 use crate::translate::emitter::{Resolver, TransactionMode};
 use crate::translate::plan::BitSet;
-use crate::util::{normalize_ident, parse_signed_number, parse_string, IOExt as _};
+use crate::util::{
+    normalize_ident, parse_signed_number, parse_string, IOExt as _,
+    PRIMARY_KEY_AUTOMATIC_INDEX_NAME_PREFIX,
+};
 use crate::vdbe::builder::{ProgramBuilder, ProgramBuilderOpts};
 use crate::vdbe::insn::{Cookie, Insn};
 use crate::{
@@ -118,12 +121,17 @@ fn resolve_index_pragma_database_id(
         return Ok(default_database_id);
     }
 
-    let qualified_name = ast::QualifiedName {
-        namespace: None,
-        name: ast::Name::exact(index_name.to_string()),
-        alias: None,
-    };
-    resolver.resolve_existing_index_database_id(&qualified_name)
+    let has_index =
+        |schema: &Schema, name: &str| !matches!(find_index_by_name(schema, name), Ok(None));
+    let database_id = resolver.resolve_unqualified_existing_database_id(index_name, has_index)?;
+    if resolver.with_schema(database_id, |schema| has_index(schema, index_name)) {
+        return Ok(database_id);
+    }
+    resolver.resolve_unqualified_existing_database_id(index_name, |schema, name| {
+        schema
+            .get_btree_table(name)
+            .is_some_and(|table| !table.has_rowid)
+    })
 }
 
 fn foreign_key_action_name(action: ast::RefAct) -> &'static str {
@@ -608,6 +616,7 @@ fn update_pragma(
                 jump_if_null: false,
             });
             program.emit_insn(Insn::Halt {
+                constraint_info: None,
                 err_code: 0,
                 description: "Early halt because auto vacuum mode is not enabled".to_string(),
                 on_error: None,
@@ -1094,14 +1103,10 @@ fn query_pragma(
                     schema_was_explicit,
                     &index_name,
                 )?;
-                resolver.with_schema(index_database_id, |schema| {
-                    let index = schema
-                        .indexes
-                        .values()
-                        .flatten()
-                        .find(|idx| idx.name.eq_ignore_ascii_case(&index_name));
-
-                    if let Some(index) = index {
+                resolver.with_schema(index_database_id, |schema| -> Result<()> {
+                    if let Some(index) =
+                        find_index_or_without_rowid_primary_key(schema, &index_name)?
+                    {
                         for (seqno, col) in index.columns.iter().enumerate() {
                             program.emit_int(seqno as i64, base_reg);
                             program.emit_int(col.pos_in_table as i64, base_reg + 1);
@@ -1109,7 +1114,8 @@ fn query_pragma(
                             program.emit_result_row(base_reg, 3);
                         }
                     }
-                });
+                    Ok(())
+                })?;
             }
 
             let pragma_meta = pragma_for(&pragma);
@@ -1135,14 +1141,10 @@ fn query_pragma(
                     schema_was_explicit,
                     &index_name,
                 )?;
-                resolver.with_schema(index_database_id, |schema| {
-                    let index = schema
-                        .indexes
-                        .values()
-                        .flatten()
-                        .find(|idx| idx.name.eq_ignore_ascii_case(&index_name));
-
-                    if let Some(index) = index {
+                resolver.with_schema(index_database_id, |schema| -> Result<()> {
+                    if let Some(index) =
+                        find_index_or_without_rowid_primary_key(schema, &index_name)?
+                    {
                         for (seqno, col) in index.columns.iter().enumerate() {
                             let desc = matches!(col.order, ast::SortOrder::Desc);
                             let coll = col
@@ -1170,8 +1172,30 @@ fn query_pragma(
                             program.emit_int(0, base_reg + 5); // not a key column
                             program.emit_result_row(base_reg, 6);
                         }
+
+                        let table = schema.get_btree_table(&index.table_name);
+                        if let Some(table) = table.filter(|t| t.root_page == index.root_page) {
+                            let other_columns =
+                                table.columns().iter().enumerate().filter(|(pos, col)| {
+                                    !col.is_virtual_generated()
+                                        && !index.columns.iter().any(|c| c.pos_in_table == *pos)
+                                });
+                            for (seqno, (pos, col)) in (index.columns.len()..).zip(other_columns) {
+                                program.emit_int(seqno as i64, base_reg);
+                                program.emit_int(pos as i64, base_reg + 1);
+                                program.emit_string8(
+                                    col.name.clone().unwrap_or_default(),
+                                    base_reg + 2,
+                                );
+                                program.emit_int(0, base_reg + 3);
+                                program.emit_string8("BINARY".to_string(), base_reg + 4);
+                                program.emit_int(0, base_reg + 5);
+                                program.emit_result_row(base_reg, 6);
+                            }
+                        }
                     }
-                });
+                    Ok(())
+                })?;
             }
 
             let pragma_meta = pragma_for(&pragma);
@@ -1197,10 +1221,11 @@ fn query_pragma(
                     schema_was_explicit,
                     &table_name,
                 )?;
-                resolver.with_schema(table_database_id, |schema| {
+                resolver.with_schema(table_database_id, |schema| -> Result<()> {
                     if let Some(table) = schema.get_table(&table_name) {
-                        let pk_cols: Vec<String> = table
-                            .btree()
+                        let btree = table.btree();
+                        let pk_cols: Vec<String> = btree
+                            .as_ref()
                             .map(|bt| {
                                 bt.primary_key_columns
                                     .iter()
@@ -1208,8 +1233,16 @@ fn query_pragma(
                                     .collect()
                             })
                             .unwrap_or_default();
+                        let without_rowid_pk_index = match &btree {
+                            Some(bt) => without_rowid_primary_key_index(bt)?,
+                            None => None,
+                        };
 
-                        for (seq, index) in schema.get_indices(&table_name).enumerate() {
+                        let indices = schema
+                            .get_indices(&table_name)
+                            .map(|index| index.as_ref())
+                            .chain(without_rowid_pk_index.as_ref());
+                        for (seq, index) in indices.enumerate() {
                             let origin = if index.name.starts_with("sqlite_autoindex_") {
                                 let idx_cols: Vec<&str> =
                                     index.columns.iter().map(|c| c.name.as_str()).collect();
@@ -1235,7 +1268,8 @@ fn query_pragma(
                             program.emit_result_row(base_reg, 5);
                         }
                     }
-                });
+                    Ok(())
+                })?;
             }
 
             let pragma_meta = pragma_for(&pragma);
@@ -1326,7 +1360,7 @@ fn query_pragma(
             };
             for current_database_id in &database_ids {
                 let database_name = connection
-                    .get_database_name_by_index(current_database_id)
+                    .namespace_name(current_database_id)
                     .unwrap_or_else(|| "main".to_string());
                 resolver.with_schema(current_database_id, |schema| {
                     emit_table_list_rows_for_schema(
@@ -1827,6 +1861,57 @@ fn query_pragma(
             Ok(TransactionMode::None)
         }
     }
+}
+
+fn find_index_or_without_rowid_primary_key(
+    schema: &Schema,
+    name: &str,
+) -> Result<Option<Arc<Index>>> {
+    if let Some(index) = find_index_by_name(schema, name)? {
+        return Ok(Some(index));
+    }
+    let Some(table) = schema.get_btree_table(name) else {
+        return Ok(None);
+    };
+    Ok(without_rowid_primary_key_index(&table)?.map(Arc::new))
+}
+
+fn find_index_by_name(schema: &Schema, index_name: &str) -> Result<Option<Arc<Index>>> {
+    if let Some(index) = schema
+        .indexes
+        .values()
+        .flatten()
+        .find(|idx| idx.name.eq_ignore_ascii_case(index_name))
+    {
+        return Ok(Some(index.clone()));
+    }
+    let Some(table) = index_name
+        .strip_prefix(PRIMARY_KEY_AUTOMATIC_INDEX_NAME_PREFIX)
+        .and_then(|rest| rest.strip_suffix("_1"))
+        .and_then(|table_name| schema.get_btree_table(table_name))
+    else {
+        return Ok(None);
+    };
+    Ok(without_rowid_primary_key_index(&table)?.map(Arc::new))
+}
+
+fn without_rowid_primary_key_index(table: &BTreeTable) -> Result<Option<Index>> {
+    if table.has_rowid {
+        return Ok(None);
+    }
+    let primary_key = table.unique_sets.iter().find(|us| us.is_primary_key);
+    let index = Index::automatic_from_primary_key(
+        table,
+        (
+            format!("{PRIMARY_KEY_AUTOMATIC_INDEX_NAME_PREFIX}{}_1", table.name),
+            table.root_page,
+        ),
+        table.primary_key_columns.len(),
+        primary_key.and_then(|us| us.conflict_clause),
+        primary_key.map_or(&[], |us| us.columns.as_slice()),
+        primary_key.and_then(|us| us.constraint_name.clone()),
+    )?;
+    Ok(Some(index))
 }
 
 /// 0-based index of `column` within `primary_key_columns`, if present.

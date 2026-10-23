@@ -2076,6 +2076,7 @@ impl Jsonb {
             } else if !quoted
                 && (c == b':'
                     || c.is_ascii_whitespace()
+                    || json5_whitespace_len(&input[pos - 1..]) != 0
                     || (c == b'/' && matches!(input.get(pos), Some(b'/' | b'*'))))
             {
                 // End of unquoted identifier. A comment right after the
@@ -4302,14 +4303,17 @@ fn skip_whitespace_and_comments(input: &[u8], mut pos: usize, info: &mut ParseIn
             // Handle JSON5 comments
             match input[pos + 1] {
                 b'/' => {
-                    // Line comment - skip until newline
+                    // Line comment - skip until LF, CR, U+2028 or U+2029.
+                    // The terminator is whitespace, so the outer loop skips it.
                     info.has_json5 = true;
                     pos += 2;
-                    while pos < len && input[pos] != b'\n' {
+                    while pos < len
+                        && !matches!(
+                            &input[pos..],
+                            [b'\n' | b'\r', ..] | [0xe2, 0x80, 0xa8 | 0xa9, ..]
+                        )
+                    {
                         pos += 1;
-                    }
-                    if pos < len {
-                        pos += 1; // Skip the newline
                     }
                 }
                 b'*' => {

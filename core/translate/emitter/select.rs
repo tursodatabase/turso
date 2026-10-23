@@ -17,7 +17,8 @@ use crate::{
         plan::{
             BitSet, Distinctness, EphemeralRowidMode, EvalAt, IndexMethodQuery, JoinOrderMember,
             NonFromClauseSubquery, Operation, QueryDestination, Scan, Search, SeekKeyComponent,
-            SelectPlan, SimpleAggregate, SubqueryEvalPhase, SubqueryState, TableReferences,
+            SelectPlan, SimpleAggregate, SubqueryEvalPhase, SubqueryOrigin, SubqueryState,
+            TableReferences,
         },
         planner::table_mask_from_expr,
         select::emit_simple_count,
@@ -101,7 +102,13 @@ pub fn emit_query<'a>(
 
     // Handle VALUES clause - emit values after subqueries are prepared
     if !plan.values.is_empty() {
-        init_limit(program, t_ctx, &plan.limit, &plan.offset)?;
+        init_limit(
+            program,
+            t_ctx,
+            &plan.limit,
+            &plan.offset,
+            after_main_loop_label,
+        )?;
         let reg_result_cols_start = emit_values(program, plan, t_ctx)?;
         program.preassign_label_to_next_insn(after_main_loop_label);
         return Ok(reg_result_cols_start);
@@ -113,9 +120,16 @@ pub fn emit_query<'a>(
     // For non-grouped aggregation queries that also have non-aggregate columns,
     // we need to ensure non-aggregate columns are only emitted once.
     // This flag helps track whether we've already emitted these columns.
+    // It also tells whether any row reached the aggregate, which a correlated
+    // subquery in the result columns needs even when every column contains an
+    // aggregate: if no row did, the subquery runs again against the NULL row.
     let has_ungrouped_nonagg_cols = !plan.aggregates.is_empty()
         && plan.group_by.is_none()
-        && plan.result_columns.iter().any(|c| !c.contains_aggregates);
+        && (plan.result_columns.iter().any(|c| !c.contains_aggregates)
+            || plan
+                .non_from_clause_subqueries
+                .iter()
+                .any(|s| s.correlated && s.origin == SubqueryOrigin::SelectList));
 
     if has_ungrouped_nonagg_cols {
         let flag = program.alloc_register();
@@ -203,7 +217,21 @@ pub fn emit_query<'a>(
         emit_explain!(program, false, crate::translate::eqp::EqpDetail::Distinct);
     }
 
-    init_limit(program, t_ctx, &plan.limit, &plan.offset)?;
+    let end_label = program.allocate_label();
+    init_limit(program, t_ctx, &plan.limit, &plan.offset, end_label)?;
+
+    for aggregate in &mut plan.aggregates {
+        if aggregate.order_by().is_empty() {
+            continue;
+        }
+        aggregate.order_cursor = Some(program.alloc_cursor_id(CursorType::Sorter));
+        crate::translate::aggregation::open_aggregate_sorter(
+            program,
+            &plan.table_references,
+            &t_ctx.resolver,
+            aggregate,
+        )?;
+    }
 
     // No rows will be read from source table loops if there is a constant false condition eg. WHERE 0
     // however an aggregation might still happen,
@@ -233,11 +261,8 @@ pub fn emit_query<'a>(
             let distinct_ctx = ctx.as_ref().expect("distinct context must exist");
             program.preassign_label_to_next_insn(distinct_ctx.label_on_conflict);
         }
-        // Keep LIMIT's early-exit jump target valid even on the simple_count fast path.
-        // init_limit may emit an IfNot to after_main_loop_label (e.g. scalar subquery injects LIMIT 1).
-        // Without resolving this label before the early return, bytecode assembly fails
-        // with an unresolved IfNot target.
         program.preassign_label_to_next_insn(after_main_loop_label);
+        program.preassign_label_to_next_insn(end_label);
         return Ok(t_ctx.reg_result_cols_start.unwrap());
     }
 
@@ -307,6 +332,7 @@ pub fn emit_query<'a>(
         EmitOrderBy::emit(program, t_ctx, plan)?;
     }
 
+    program.preassign_label_to_next_insn(end_label);
     Ok(t_ctx.reg_result_cols_start.unwrap())
 }
 
