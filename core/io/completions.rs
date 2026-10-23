@@ -217,6 +217,28 @@ impl CompletionGroup {
     }
 }
 
+/// Adds `c` to `group`, if there is one, then starts the IO with `start`.
+///
+/// `c` joins the group first because the IO can finish inside `start`. If
+/// `start` returns an error, the IO did not start and nothing else will
+/// finish `c`, so it is aborted here. Otherwise anything waiting for `c` or
+/// its group would wait forever. Aborting only marks `c` finished with an
+/// error; it does not stop an IO that did start.
+pub fn start_in_group(
+    group: Option<&mut CompletionGroup>,
+    c: Completion,
+    start: impl FnOnce(Completion) -> crate::Result<Completion>,
+) -> crate::Result<Completion> {
+    if let Some(group) = group {
+        group.add(&c);
+    }
+    start(c.clone()).inspect_err(|_| {
+        if !c.finished() {
+            c.abort();
+        }
+    })
+}
+
 pub struct GroupCompletion {
     inner: Arc<GroupCompletionInner>,
 }
