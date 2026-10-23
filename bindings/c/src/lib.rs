@@ -3742,7 +3742,7 @@ pub unsafe extern "C" fn sqlite3_table_column_metadata(
     };
 
     // For now, we only support the main database
-    if db_name != "main" {
+    if !db_name.eq_ignore_ascii_case("main") {
         rc = SQLITE_ERROR;
     } else {
         // Handle column name (can be NULL to just check table existence)
@@ -3764,7 +3764,7 @@ pub unsafe extern "C" fn sqlite3_table_column_metadata(
                             turso_core::Value::Text(text) => text.as_str(),
                             _ => return SQLITE_ERROR,
                         }; // name column
-                        if col_name == column_name {
+                        if col_name.eq_ignore_ascii_case(column_name) {
                             // Found the column, extract metadata
                             let col_type: String = match &row[2] {
                                 turso_core::Value::Text(text) => text.as_str().to_string(),
@@ -3792,9 +3792,9 @@ pub unsafe extern "C" fn sqlite3_table_column_metadata(
 
                     if !found_column {
                         // Check if it's a rowid reference
-                        if column_name == "rowid"
-                            || column_name == "oid"
-                            || column_name == "_rowid_"
+                        if column_name.eq_ignore_ascii_case("rowid")
+                            || column_name.eq_ignore_ascii_case("oid")
+                            || column_name.eq_ignore_ascii_case("_rowid_")
                         {
                             // For rowid columns, return INTEGER type
                             z_data_type = CString::new("INTEGER")

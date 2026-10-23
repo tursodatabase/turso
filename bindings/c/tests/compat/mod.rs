@@ -2631,6 +2631,72 @@ mod tests {
     }
 
     #[test]
+    fn test_sqlite3_table_column_metadata_case_insensitive() {
+        unsafe {
+            let mut db = ptr::null_mut();
+            assert_eq!(sqlite3_open(c":memory:".as_ptr(), &mut db), SQLITE_OK);
+
+            let mut stmt = ptr::null_mut();
+            assert_eq!(
+                sqlite3_prepare_v2(
+                    db,
+                    c"CREATE TABLE test_metadata (id INTEGER PRIMARY KEY, name TEXT NOT NULL)"
+                        .as_ptr(),
+                    -1,
+                    &mut stmt,
+                    ptr::null_mut(),
+                ),
+                SQLITE_OK
+            );
+            assert_eq!(sqlite3_step(stmt), SQLITE_DONE);
+            assert_eq!(sqlite3_finalize(stmt), SQLITE_OK);
+
+            // Resolve schema ("MAIN") and column ("NAME") case-insensitively
+            let mut data_type: *const libc::c_char = ptr::null();
+            let mut coll_seq: *const libc::c_char = ptr::null();
+            let mut not_null: libc::c_int = 0;
+            let mut primary_key: libc::c_int = 0;
+            let mut autoinc: libc::c_int = 0;
+
+            assert_eq!(
+                sqlite3_table_column_metadata(
+                    db,
+                    c"MAIN".as_ptr(),
+                    c"test_metadata".as_ptr(),
+                    c"NAME".as_ptr(),
+                    &mut data_type,
+                    &mut coll_seq,
+                    &mut not_null,
+                    &mut primary_key,
+                    &mut autoinc,
+                ),
+                SQLITE_OK
+            );
+            assert_eq!(not_null, 1);
+            assert_eq!(primary_key, 0);
+
+            // Resolve rowid alias ("ROWID") case-insensitively
+            assert_eq!(
+                sqlite3_table_column_metadata(
+                    db,
+                    c"Main".as_ptr(),
+                    c"test_metadata".as_ptr(),
+                    c"ROWID".as_ptr(),
+                    ptr::null_mut(),
+                    ptr::null_mut(),
+                    ptr::null_mut(),
+                    &mut primary_key,
+                    ptr::null_mut(),
+                ),
+                SQLITE_OK
+            );
+            assert_eq!(primary_key, 1);
+
+            assert_eq!(sqlite3_close(db), SQLITE_OK);
+        }
+    }
+
+    #[test]
     fn test_sqlite3_busy_timeout() {
         unsafe {
             let mut db: *mut sqlite3 = ptr::null_mut();
