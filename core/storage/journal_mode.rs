@@ -92,7 +92,7 @@ pub fn open_mv_store(
                 .as_os_str()
                 .to_str()
                 .expect("path should be valid string");
-            let file = io.open_file(string_path, flags, false)?;
+            let file = io.open_file(string_path, log_open_flags(flags), false)?;
             Arc::new(mvcc::persistent_storage::Storage::new(
                 file,
                 io,
@@ -106,4 +106,12 @@ pub fn open_mv_store(
         allocator,
         experimental_mvcc_passive_checkpoint,
     )?))
+}
+
+fn log_open_flags(flags: OpenFlags) -> OpenFlags {
+    if flags.contains(OpenFlags::ReadOnly) {
+        flags
+    } else {
+        flags | OpenFlags::Create
+    }
 }
