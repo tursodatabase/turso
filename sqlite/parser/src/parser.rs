@@ -1001,11 +1001,17 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_vtab_arg(&mut self) -> Result<String> {
-        let start_idx = self.offset();
+        let mut start_idx: Option<usize> = None;
+        let mut end_idx = 0;
 
         loop {
-            match self.peek_no_eof()?.token_type {
+            let tok = self.peek_no_eof()?;
+            match tok.token_type {
+                TK_COMMA | TK_RP => break,
                 TK_LP => {
+                    if start_idx.is_none() {
+                        start_idx = Some(self.offset());
+                    }
                     let mut lp_count: usize = 0;
                     loop {
                         let tok = self.eat_no_eof()?;
@@ -1016,6 +1022,7 @@ impl<'a> Parser<'a> {
                             TK_RP => {
                                 lp_count -= 1; // FIXME: no need to check underflow
                                 if lp_count == 0 {
+                                    end_idx = self.offset();
                                     break;
                                 }
                             }
@@ -1023,20 +1030,25 @@ impl<'a> Parser<'a> {
                         }
                     }
                 }
-                TK_COMMA | TK_RP => break,
                 _ => {
+                    if start_idx.is_none() {
+                        start_idx = Some(self.offset());
+                    }
                     self.eat_no_eof()?;
+                    end_idx = self.offset();
                 }
             }
         }
 
-        // minus 1 because lexer already consumed TK_COMMA or TK_RP
-        let end_idx = self.offset();
-        if start_idx == end_idx {
+        let Some(start) = start_idx else {
+            return Err(Error::Custom("unexpected COMMA in vtab args".to_owned()));
+        };
+
+        if start == end_idx {
             return Err(Error::Custom("unexpected COMMA in vtab args".to_owned()));
         }
 
-        Ok(from_bytes(&self.lexer.input[start_idx..end_idx]))
+        Ok(from_bytes(&self.lexer.input[start..end_idx]))
     }
 
     fn parse_create_virtual(&mut self) -> Result<Stmt> {
@@ -12766,6 +12778,38 @@ mod tests {
                     args: vec![
                         "x".to_owned(),
                         "tokenize = '''porter'' ''ascii'''".to_owned(),
+                    ],
+                }))],
+            ),
+            (
+                b"CREATE VIRTUAL TABLE temp.t1 USING csv(filename='t.csv'/*x*/, header=yes)".as_slice(),
+                vec![Cmd::Stmt(Stmt::CreateVirtualTable(CreateVirtualTable {
+                    if_not_exists: false,
+                    tbl_name: QualifiedName {
+                        namespace: Some(Name::exact("temp".to_owned())),
+                        name: Name::exact("t1".to_owned()),
+                        alias: None,
+                    },
+                    module_name: Name::exact("csv".to_owned()),
+                    args: vec![
+                        "filename='t.csv'".to_owned(),
+                        "header=yes".to_owned(),
+                    ],
+                }))],
+            ),
+            (
+                b"CREATE VIRTUAL TABLE t USING mod(/*leading*/ a = 1 /*mid*/, b = 2/*trailing*/)".as_slice(),
+                vec![Cmd::Stmt(Stmt::CreateVirtualTable(CreateVirtualTable {
+                    if_not_exists: false,
+                    tbl_name: QualifiedName {
+                        namespace: None,
+                        name: Name::exact("t".to_owned()),
+                        alias: None,
+                    },
+                    module_name: Name::exact("mod".to_owned()),
+                    args: vec![
+                        "a = 1".to_owned(),
+                        "b = 2".to_owned(),
                     ],
                 }))],
             ),
