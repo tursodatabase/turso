@@ -5502,7 +5502,7 @@ mod tests {
         rowid_alias: bool,
     ) -> hir::SourceColumn {
         hir::SourceColumn {
-            name: name.to_string(),
+            name: name.into(),
             type_fact: TypeFact::known(storage),
             affinity,
             has_affinity: true,

@@ -1115,7 +1115,7 @@ fn resolved_result_value(
                     }
                     _ => source.name.clone(),
                 },
-                column_name: column.name.clone(),
+                column_name: column.name.to_string(),
                 declared_type,
                 ty,
                 array_dimensions: declared.map_or(0, |declared| declared.array_dimensions),

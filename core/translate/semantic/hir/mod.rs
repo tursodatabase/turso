@@ -338,6 +338,10 @@ impl TypeFact {
     }
 
     pub fn declared(declared: DeclaredType) -> Self {
+        Self::shared_declared(Arc::new(declared))
+    }
+
+    pub fn shared_declared(declared: Arc<DeclaredType>) -> Self {
         Self {
             storage: Some(if declared.array_dimensions > 0 {
                 Type::Blob
@@ -346,7 +350,7 @@ impl TypeFact {
             }),
             array_dimensions: declared.array_dimensions,
             array_rank_unbounded: false,
-            declared: Some(Arc::new(declared)),
+            declared: Some(declared),
         }
     }
 

@@ -176,6 +176,7 @@ pub(super) struct Analyzer<'context, 'catalog, 'ast> {
     /// standard operators even on custom-typed columns, so the values an
     /// index on the column stores are the ones a read computes.
     pub(super) standard_operators_only: bool,
+    pub(super) built_in_declared_types: Vec<Arc<super::hir::DeclaredType>>,
     /// Stored view SELECTs live in the catalog and are analyzed like the
     /// statement's own AST, so the catalog must outlive the AST borrow.
     _catalog_outlives_ast: std::marker::PhantomData<&'ast &'catalog ()>,
@@ -247,6 +248,7 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
             cte_scopes: Vec::new(),
             views_in_progress: Vec::new(),
             standard_operators_only: false,
+            built_in_declared_types: Vec::new(),
             aggregate_counts: HashMap::default(),
             aggregate_hosts: Vec::new(),
             register_source: None,
@@ -278,7 +280,7 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
         let columns = inputs
             .iter()
             .map(|name| SourceColumn {
-                name: name.clone(),
+                name: name.as_str().into(),
                 type_fact: TypeFact::dynamic(),
                 affinity: Affinity::Blob,
                 has_affinity: false,
@@ -2683,6 +2685,34 @@ mod tests {
     }
 
     #[test]
+    fn columns_with_the_same_declared_type_share_one_declaration() {
+        let mut schema = Schema::new();
+        let table = BTreeTable::from_sql("CREATE TABLE t(a INTEGER, b INTEGER, c TEXT)", 2)
+            .expect("table schema parses");
+        schema
+            .add_btree_table(Arc::new(table))
+            .expect("table name is unique");
+        let document =
+            analyze_sql_with_schema(&schema, "SELECT a FROM t").expect("SELECT analyzes");
+        let HirRoot::Query(root) = &document.root else {
+            panic!("SELECT produces query root");
+        };
+        let query = document.query(root.query).expect("query exists");
+        let first = query.blocks[0].from.as_ref().expect("query has FROM").first;
+        let source = document.source(first).expect("source exists");
+        let declared = |column: usize| {
+            source.columns[column]
+                .type_fact
+                .declared
+                .clone()
+                .expect("column has a declared type")
+        };
+
+        assert!(Arc::ptr_eq(&declared(0), &declared(1)));
+        assert!(!Arc::ptr_eq(&declared(0), &declared(2)));
+    }
+
+    #[test]
     fn select_star_does_not_copy_declared_types() {
         let mut schema = Schema::new();
         let columns: Vec<String> = (0..64).map(|column| format!("c{column} INTEGER")).collect();
@@ -3659,7 +3689,7 @@ mod tests {
         assert_eq!(source.alias.as_deref(), Some("derived"));
         assert!(!source.rowid_available);
         assert_eq!(source.columns.len(), 2);
-        assert_eq!(source.columns[0].name, "item_text");
+        assert_eq!(&*source.columns[0].name, "item_text");
         assert_eq!(source.columns[0].type_fact.storage, Some(Type::Text));
         assert_eq!(
             source.columns[0]
@@ -3669,7 +3699,7 @@ mod tests {
                 .value(),
             &crate::translate::collate::CollationSeq::NoCase
         );
-        assert_eq!(source.columns[1].name, "item_key");
+        assert_eq!(&*source.columns[1].name, "item_key");
         assert!(matches!(
             outer_block.outputs[0].expr,
             Expr::Column(reference) if reference.source == source.id && reference.column == 0
@@ -5096,7 +5126,7 @@ mod tests {
         assert_eq!(source.owner, SourceOwner::QueryBlock(root_block.id));
         assert_eq!(source.alias.as_deref(), Some("p"));
         assert!(!source.rowid_available);
-        assert_eq!(source.columns[1].name, "item_text");
+        assert_eq!(&*source.columns[1].name, "item_text");
         assert!(matches!(
             root_block.outputs[0].expr,
             Expr::Column(reference) if reference.source == source.id && reference.column == 1
@@ -5730,7 +5760,7 @@ mod tests {
             group_source
                 .columns
                 .iter()
-                .map(|column| column.name.as_str())
+                .map(|column| column.name.as_ref())
                 .collect::<Vec<_>>(),
             [
                 "id",
@@ -9859,8 +9889,8 @@ mod tests {
         assert!(matches!(input.kind, SourceKind::SchemaExpression));
         assert_eq!(input.owner, SourceOwner::Root);
         assert_eq!(input.columns.len(), 2);
-        assert_eq!(input.columns[0].name, "value");
-        assert_eq!(input.columns[1].name, "minimum");
+        assert_eq!(&*input.columns[0].name, "value");
+        assert_eq!(&*input.columns[1].name, "minimum");
         assert_eq!(input.columns[0].type_fact.storage, Some(Type::Integer));
 
         let Expr::Case { when_then, .. } = &program.body else {
@@ -11346,7 +11376,7 @@ mod tests {
             .source(program.input_source)
             .expect("domain CHECK input exists");
         assert_eq!(input.columns.len(), 1);
-        assert_eq!(input.columns[0].name, "value");
+        assert_eq!(&*input.columns[0].name, "value");
         assert_eq!(input.columns[0].type_fact.storage, target.type_fact.storage);
         assert!(input.columns[0].type_fact.declared.is_none());
         let Expr::Binary { lhs, .. } = &program.body else {

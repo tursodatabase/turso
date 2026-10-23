@@ -1544,7 +1544,7 @@ fn hir_materialized_subquery_ephemeral_index(
     let index_column = |position: usize| {
         let column = &source.columns[position];
         IndexColumn {
-            name: column.name.clone(),
+            name: column.name.to_string(),
             order: SortOrder::Asc,
             nulls_order: None,
             pos_in_table: position,

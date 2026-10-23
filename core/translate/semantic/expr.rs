@@ -5122,7 +5122,7 @@ mod tests {
             alias: None,
             kind: SourceKind::SchemaExpression,
             columns: vec![SourceColumn {
-                name: "value".to_string(),
+                name: "value".into(),
                 type_fact: TypeFact::known(Type::Text),
                 affinity: Affinity::Text,
                 has_affinity: true,

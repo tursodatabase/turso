@@ -16,7 +16,7 @@ fn generated_position(tc: &hegel::TestCase, width: usize) -> usize {
 
 fn source_column(position: usize) -> SourceColumn {
     SourceColumn {
-        name: format!("c{position}"),
+        name: format!("c{position}").into(),
         type_fact: TypeFact::known(Type::Integer),
         affinity: Affinity::Integer,
         has_affinity: true,

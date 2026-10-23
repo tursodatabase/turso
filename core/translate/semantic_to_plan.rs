@@ -4436,7 +4436,7 @@ pub(crate) mod tests {
             kind: SourceKind::Table(resolved_table("items")),
             columns: vec![
                 SourceColumn {
-                    name: "first".to_string(),
+                    name: "first".into(),
                     type_fact: TypeFact::known(Type::Integer),
                     affinity: Affinity::Integer,
                     has_affinity: true,
@@ -4445,7 +4445,7 @@ pub(crate) mod tests {
                     rowid_alias: false,
                 },
                 SourceColumn {
-                    name: "second".to_string(),
+                    name: "second".into(),
                     type_fact: TypeFact::known(Type::Text),
                     affinity: Affinity::Text,
                     has_affinity: true,
@@ -5688,7 +5688,7 @@ pub(crate) mod tests {
             id: cte_id,
             name: "numbers".to_string(),
             columns: vec![CteColumn {
-                name: source_column.name.clone(),
+                name: source_column.name.to_string(),
                 type_fact: source_column.type_fact.clone(),
                 affinity: source_column.affinity,
                 has_affinity: source_column.has_affinity,

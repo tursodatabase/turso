@@ -362,7 +362,7 @@ pub enum PseudoSource {
 
 #[derive(Clone, Debug)]
 pub struct SourceColumn {
-    pub name: String,
+    pub name: crate::sync::Arc<str>,
     pub type_fact: TypeFact,
     pub affinity: Affinity,
     pub has_affinity: bool,

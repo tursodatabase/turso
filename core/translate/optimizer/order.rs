@@ -922,7 +922,7 @@ mod tests {
             alias: None,
             kind: SourceKind::Table(resolved_table),
             columns: vec![SourceColumn {
-                name: "value".to_string(),
+                name: "value".into(),
                 type_fact: TypeFact::known(Type::Integer),
                 affinity: Affinity::Integer,
                 has_affinity: true,
