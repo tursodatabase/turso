@@ -547,7 +547,7 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
     fn finish_column_reads(&mut self, root: &HirRoot) -> Result<()> {
         let mut pending = Vec::new();
         for query in self.queries.iter().flatten() {
-            pending.extend(query.direct_column_reads(|source| self.source(source)));
+            query.direct_column_reads(|source| self.source(source), &mut pending);
         }
         // An index expression can read a generated column, which then needs
         // its generation expression when the index is used.
@@ -10058,7 +10058,7 @@ mod tests {
         for (sql, expected) in [
             (
                 "SELECT length(value ORDER BY score) FROM items",
-                "Parse error: ORDER BY clause is not supported yet in aggregate functions",
+                "Parse error: ORDER BY may not be used with non-aggregate length()",
             ),
             (
                 "SELECT length(*) FROM items",
@@ -10726,7 +10726,7 @@ mod tests {
             ),
             (
                 "SELECT sum(score ORDER BY id) OVER () FROM items",
-                "Parse error: ORDER BY clause is not supported yet in aggregate functions",
+                "Parse error: ORDER BY may not be used with non-aggregate sum()",
             ),
             (
                 "SELECT sum(score) OVER (RANGE BETWEEN 1 PRECEDING AND CURRENT ROW) FROM items",

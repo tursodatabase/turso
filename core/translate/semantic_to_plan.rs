@@ -645,6 +645,7 @@ fn plan_hir_unmatched_btree_read(
                 base_row_count,
                 schema,
                 params,
+                query_rows,
             )?
         }
         _ => None,
@@ -3360,6 +3361,7 @@ impl<'a> HirPlanContext<'a> {
             params,
             or_union,
             hash,
+            &query_rows,
         )?;
 
         let Some(mut result) = result else {
@@ -3662,6 +3664,7 @@ impl<'a> HirPlanContext<'a> {
                                     base_rows[source_position],
                                     schema,
                                     params,
+                                    &query_rows,
                                 )?
                             }
                             _ => None,
@@ -4683,6 +4686,7 @@ mod tests {
         assert!(matches!(joined.indexed, hir::IndexHint::NotIndexed));
 
         let index = Index {
+            constraint_name: None,
             name: "items_second".to_string(),
             table_name: "items".to_string(),
             root_page: 3,
@@ -4721,6 +4725,7 @@ mod tests {
             CatalogSnapshot::from_id(1),
             Some(DatabaseId::new(0)),
             Arc::new(Index {
+                constraint_name: None,
                 name: "items_sum".to_string(),
                 table_name: "items".to_string(),
                 root_page: 3,

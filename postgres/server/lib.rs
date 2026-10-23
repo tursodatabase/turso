@@ -1,3 +1,4 @@
+use std::fmt::Debug;
 use std::num::NonZero;
 use std::sync::{
     atomic::{AtomicUsize, Ordering},
@@ -5,7 +6,7 @@ use std::sync::{
 };
 
 use async_trait::async_trait;
-use futures::stream;
+use futures::{stream, Sink, SinkExt};
 use tokio::net::TcpListener;
 use tracing::{error, info};
 use turso_core::Value;
@@ -19,9 +20,16 @@ use pgwire::api::results::{
     QueryResponse, Response, Tag,
 };
 use pgwire::api::stmt::{NoopQueryParser, StoredStatement};
-use pgwire::api::{ClientInfo, NoopHandler, PgWireServerHandlers, Type};
+use pgwire::api::store::PortalStore;
+use pgwire::api::{
+    ClientInfo, ClientPortalStore, NoopHandler, PgWireConnectionState, PgWireServerHandlers, Type,
+};
 use pgwire::error::{ErrorInfo, PgWireError, PgWireResult};
 use pgwire::messages::data::DataRow;
+use pgwire::messages::extendedquery::{Describe, Execute};
+use pgwire::messages::response::{ErrorResponse, ReadyForQuery};
+use pgwire::messages::simplequery::Query;
+use pgwire::messages::PgWireBackendMessage;
 use pgwire::tokio::process_socket;
 use pgwire::types::format::FormatOptions;
 
@@ -174,6 +182,16 @@ impl PgWireServerHandlers for TursoPgFactory {
 
 #[async_trait]
 impl SimpleQueryHandler for TursoPgHandler {
+    async fn on_query<C>(&self, client: &mut C, query: Query) -> PgWireResult<()>
+    where
+        C: ClientInfo + ClientPortalStore + Sink<PgWireBackendMessage> + Unpin + Send + Sync,
+        C::Error: Debug,
+        PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
+    {
+        let result = self._on_query(client, query).await;
+        finish_query(client, result, false).await
+    }
+
     async fn do_query<C>(&self, _client: &mut C, query: &str) -> PgWireResult<Vec<Response>>
     where
         C: ClientInfo + Unpin + Send + Sync,
@@ -182,14 +200,11 @@ impl SimpleQueryHandler for TursoPgHandler {
 
         // Per the PostgreSQL simple query protocol, a query string may contain
         // multiple semicolon-separated statements. Split and execute each one.
-        let statements = split_statements(query)
-            .map_err(|e| PgWireError::UserError(Box::new(error_info(&e.to_string()))))?;
+        let statements = split_statements(query).map_err(pg_error)?;
 
         let mut responses = Vec::new();
         for sql in &statements {
-            let mut stmt = conn
-                .prepare(sql)
-                .map_err(|e| PgWireError::UserError(Box::new(error_info(&e.to_string()))))?;
+            let mut stmt = conn.prepare(sql).map_err(pg_error)?;
 
             self.cleanup_dropped_schema_file(sql);
 
@@ -210,6 +225,28 @@ impl ExtendedQueryHandler for TursoPgHandler {
     type Statement = String;
     type QueryParser = NoopQueryParser;
 
+    async fn on_execute<C>(&self, client: &mut C, message: Execute) -> PgWireResult<()>
+    where
+        C: ClientInfo + ClientPortalStore + Sink<PgWireBackendMessage> + Unpin + Send + Sync,
+        C::PortalStore: PortalStore<Statement = Self::Statement>,
+        C::Error: Debug,
+        PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
+    {
+        let result = self._on_execute(client, message).await;
+        finish_query(client, result, true).await
+    }
+
+    async fn on_describe<C>(&self, client: &mut C, message: Describe) -> PgWireResult<()>
+    where
+        C: ClientInfo + ClientPortalStore + Sink<PgWireBackendMessage> + Unpin + Send + Sync,
+        C::PortalStore: PortalStore<Statement = Self::Statement>,
+        C::Error: Debug,
+        PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
+    {
+        let result = self._on_describe(client, message).await;
+        finish_query(client, result, true).await
+    }
+
     fn query_parser(&self) -> Arc<Self::QueryParser> {
         self.query_parser.clone()
     }
@@ -226,9 +263,7 @@ impl ExtendedQueryHandler for TursoPgHandler {
         let conn = self.conn.lock().unwrap().clone();
         let query = &portal.statement.statement;
 
-        let mut stmt = conn
-            .prepare(query)
-            .map_err(|e| PgWireError::UserError(Box::new(error_info(&e.to_string()))))?;
+        let mut stmt = conn.prepare(query).map_err(pg_error)?;
 
         // Clean up schema file after successful DROP SCHEMA
         self.cleanup_dropped_schema_file(query);
@@ -253,9 +288,7 @@ impl ExtendedQueryHandler for TursoPgHandler {
         C: ClientInfo + Unpin + Send + Sync,
     {
         let conn = self.conn.lock().unwrap().clone();
-        let stmt = conn
-            .prepare(&target.statement)
-            .map_err(|e| PgWireError::UserError(Box::new(error_info(&e.to_string()))))?;
+        let stmt = conn.prepare(&target.statement).map_err(pg_error)?;
 
         let param_types: Vec<Type> = target
             .parameter_types
@@ -278,7 +311,7 @@ impl ExtendedQueryHandler for TursoPgHandler {
         let conn = self.conn.lock().unwrap().clone();
         let stmt = conn
             .prepare(&portal.statement.statement)
-            .map_err(|e| PgWireError::UserError(Box::new(error_info(&e.to_string()))))?;
+            .map_err(pg_error)?;
 
         let fields = build_field_info(&stmt, &portal.result_column_format);
         Ok(DescribePortalResponse::new(fields))
@@ -286,7 +319,7 @@ impl ExtendedQueryHandler for TursoPgHandler {
 }
 
 /// Build FieldInfo metadata from a prepared statement's column information.
-fn build_field_info(stmt: &turso_core::Statement, format: &Format) -> Vec<FieldInfo> {
+fn build_field_info(stmt: &turso_pg::Statement, format: &Format) -> Vec<FieldInfo> {
     if is_pg_non_query(stmt.get_sql()) {
         return vec![];
     }
@@ -308,7 +341,7 @@ fn build_field_info(stmt: &turso_core::Statement, format: &Format) -> Vec<FieldI
 /// or `Err` (custom types not enabled — won't happen in PG mode, but the wire
 /// layer shouldn't panic if it does), the safe default is TEXT;
 /// `encode_value` already handles per-value type mismatches.
-fn resolve_pg_type_for_column(stmt: &turso_core::Statement, idx: usize) -> Type {
+fn resolve_pg_type_for_column(stmt: &turso_pg::Statement, idx: usize) -> Type {
     use turso_core::ColumnTypeKind;
 
     let Some(info) = stmt.get_column_type_info(idx).ok().flatten() else {
@@ -387,7 +420,7 @@ fn scalar_pg_type_to_array_type(scalar: &Type) -> Type {
 
 /// Execute a query that returns rows and build a Query response.
 fn execute_query(
-    stmt: &mut turso_core::Statement,
+    stmt: &mut turso_pg::Statement,
     header: Arc<Vec<FieldInfo>>,
 ) -> PgWireResult<Response> {
     let mut rows: Vec<PgWireResult<DataRow>> = Vec::new();
@@ -405,16 +438,15 @@ fn execute_query(
         rows.push(encoder.finish());
         Ok(())
     })
-    .map_err(|e| PgWireError::UserError(Box::new(error_info(&e.to_string()))))?;
+    .map_err(pg_error)?;
 
     let data_stream = stream::iter(rows);
     Ok(Response::Query(QueryResponse::new(header, data_stream)))
 }
 
 /// Execute a non-SELECT statement and build an Execution response.
-fn execute_non_query(stmt: &mut turso_core::Statement, query: &str) -> PgWireResult<Response> {
-    stmt.run_ignore_rows()
-        .map_err(|e| PgWireError::UserError(Box::new(error_info(&e.to_string()))))?;
+fn execute_non_query(stmt: &mut turso_pg::Statement, query: &str) -> PgWireResult<Response> {
+    stmt.run_ignore_rows().map_err(pg_error)?;
 
     let affected = stmt.n_change();
     let tag = command_tag(query, affected as usize);
@@ -428,7 +460,7 @@ fn execute_non_query(stmt: &mut turso_core::Statement, query: &str) -> PgWireRes
 /// order than the $N numbering (e.g. if $2 appears before $1 in the SQL), so we
 /// look up each parameter's internal index by name.
 fn bind_portal_parameters(
-    stmt: &mut turso_core::Statement,
+    stmt: &mut turso_pg::Statement,
     portal: &Portal<String>,
 ) -> PgWireResult<()> {
     for i in 0..portal.parameter_len() {
@@ -765,6 +797,63 @@ fn is_create_table_as(upper: &str) -> bool {
 
 fn error_info(message: &str) -> ErrorInfo {
     ErrorInfo::new("ERROR".to_owned(), "XX000".to_owned(), message.to_owned())
+}
+
+fn pg_error(error: turso_pg::Error) -> PgWireError {
+    PgWireError::ApiError(Box::new(error))
+}
+
+async fn finish_query<C>(
+    client: &mut C,
+    result: PgWireResult<()>,
+    wait_for_sync: bool,
+) -> PgWireResult<()>
+where
+    C: ClientInfo + Sink<PgWireBackendMessage> + Unpin + Send + Sync,
+    C::Error: Debug,
+    PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
+{
+    let Err(PgWireError::ApiError(error)) = result else {
+        return result;
+    };
+    let error = match error.downcast::<turso_pg::Error>() {
+        Ok(error) => error,
+        Err(error) => return Err(PgWireError::ApiError(error)),
+    };
+    let mut fields = vec![
+        (b'S', "ERROR".to_string()),
+        (b'C', error.sqlstate.to_string()),
+        (b'M', error.message.clone()),
+    ];
+    for (tag, value) in [
+        (b'D', &error.detail),
+        (b't', &error.table_name),
+        (b'c', &error.column_name),
+        (b'n', &error.constraint_name),
+    ] {
+        if let Some(value) = value {
+            fields.push((tag, value.clone()));
+        }
+    }
+    client
+        .send(PgWireBackendMessage::ErrorResponse(ErrorResponse::new(
+            fields,
+        )))
+        .await?;
+    let status = client.transaction_status().to_error_state();
+    client.set_transaction_status(status);
+    if wait_for_sync {
+        client.set_state(PgWireConnectionState::AwaitingSync);
+    } else {
+        client.set_state(PgWireConnectionState::ReadyForQuery);
+        client
+            .feed(PgWireBackendMessage::ReadyForQuery(ReadyForQuery::new(
+                status,
+            )))
+            .await?;
+    }
+    client.flush().await?;
+    Ok(())
 }
 
 #[cfg(test)]

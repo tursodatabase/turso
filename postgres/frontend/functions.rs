@@ -1,9 +1,10 @@
+use crate::settings::SettingScope;
 use chrono::Utc;
 use std::{fmt, sync::Arc};
 use turso_core::native_ext::{FunctionArity, ScalarCall, ScalarFunction};
 use turso_core::types::IOResultOr;
 use turso_core::{
-    Connection, ExternalFunc, IOResult, LimboError, OpenOptions, Register, Result, Value,
+    Connection, ExternalFunc, IOResult, LimboError, Numeric, OpenOptions, Register, Result, Value,
 };
 
 pub(crate) fn register_functions(mut options: OpenOptions) -> OpenOptions {
@@ -81,6 +82,7 @@ scalar_functions! {
     PgBackendPid(FunctionArity::Exact(0), true),
     PgIsInRecovery(FunctionArity::Exact(0), false),
     PgLockAccessShare(FunctionArity::Exact(0), false),
+    PgLimitValue(FunctionArity::Exact(2), true),
     Now | ClockTimestamp | TransactionTimestamp | StatementTimestamp(FunctionArity::Variadic, false),
 }
 
@@ -146,6 +148,7 @@ impl ScalarCall for PgScalarFunction {
                 }
                 Value::from_i64(0)
             }
+            Self::PgLimitValue => exec_pg_limit_value(args)?,
             Self::Now
             | Self::ClockTimestamp
             | Self::TransactionTimestamp
@@ -336,6 +339,11 @@ pub(crate) enum ConfigParameter {
     SearchPath,
 }
 
+enum Parameter<'a> {
+    BuiltIn(ConfigParameter),
+    Custom(&'a str),
+}
+
 fn exec_set_config(conn: &Connection, args: &[Register]) -> Result<Value> {
     let name = match args[0].get_value() {
         Value::Text(name) => name.as_str(),
@@ -350,7 +358,7 @@ fn exec_set_config(conn: &Connection, args: &[Register]) -> Result<Value> {
             ));
         }
     };
-    let parameter = name.parse::<ConfigParameter>().map_err(|_| {
+    let parameter = find_parameter(name).ok_or_else(|| {
         LimboError::InvalidArgument(format!("unrecognized configuration parameter \"{name}\""))
     })?;
     let value = match args[1].get_value() {
@@ -362,11 +370,11 @@ fn exec_set_config(conn: &Connection, args: &[Register]) -> Result<Value> {
             ));
         }
     };
-    let is_local = match args[2].get_value() {
-        Value::Null => false,
+    let scope = match args[2].get_value() {
+        Value::Null => SettingScope::Session,
         value => match value.as_int() {
-            Some(0) => false,
-            Some(1) => true,
+            Some(0) => SettingScope::Session,
+            Some(1) => SettingScope::Transaction,
             _ => {
                 return Err(LimboError::InvalidArgument(
                     "set_config requires a boolean".to_string(),
@@ -374,13 +382,11 @@ fn exec_set_config(conn: &Connection, args: &[Register]) -> Result<Value> {
             }
         },
     };
-    if is_local {
-        return Err(LimboError::InvalidArgument(
-            "transaction-local settings are not supported".to_string(),
-        ));
-    }
     match parameter {
-        ConfigParameter::SearchPath => crate::session::set_search_path(conn, value),
+        Parameter::BuiltIn(ConfigParameter::SearchPath) => {
+            crate::session::set_search_path(conn, value, scope)
+        }
+        Parameter::Custom(name) => crate::session::set_custom_parameter(conn, name, value, scope),
     }
 }
 
@@ -409,16 +415,61 @@ fn exec_current_setting(conn: &Connection, args: &[Register]) -> Result<Value> {
             }
         },
     };
-    match name.parse::<ConfigParameter>() {
-        Ok(ConfigParameter::SearchPath) => Ok(Value::build_text(
+    let setting = match find_parameter(name) {
+        Some(Parameter::BuiltIn(ConfigParameter::SearchPath)) => Some(
             crate::session::search_path_setting(conn)
                 .unwrap_or_else(|| crate::session::DEFAULT_SEARCH_PATH.to_owned()),
-        )),
-        Err(_) if missing_ok => Ok(Value::Null),
-        Err(_) => Err(LimboError::InvalidArgument(format!(
+        ),
+        Some(Parameter::Custom(name)) => crate::session::custom_parameter(conn, name),
+        None => None,
+    };
+    match setting {
+        Some(setting) => Ok(Value::build_text(setting)),
+        None if missing_ok => Ok(Value::Null),
+        None => Err(LimboError::InvalidArgument(format!(
             "unrecognized configuration parameter \"{name}\""
         ))),
     }
+}
+
+fn find_parameter(name: &str) -> Option<Parameter<'_>> {
+    match name.parse::<ConfigParameter>() {
+        Ok(parameter) => Some(Parameter::BuiltIn(parameter)),
+        Err(_) if name.contains('.') => Some(Parameter::Custom(name)),
+        Err(_) => None,
+    }
+}
+
+/// Converts a LIMIT or OFFSET value to bigint the way PostgreSQL does, rounding
+/// fractions half away from zero, and rejects negative values.
+fn exec_pg_limit_value(args: &[Register]) -> Result<Value> {
+    let value = match args[0].get_value() {
+        Value::Null => return Ok(Value::Null),
+        Value::Numeric(Numeric::Integer(value)) => *value,
+        Value::Numeric(Numeric::Float(value)) => {
+            let rounded = f64::from(*value).round();
+            if !(i64::MIN as f64..i64::MAX as f64).contains(&rounded) {
+                return Err(LimboError::InvalidArgument(
+                    "bigint out of range".to_string(),
+                ));
+            }
+            rounded as i64
+        }
+        Value::Text(text) => text.as_str().trim().parse().map_err(|_| {
+            LimboError::InvalidArgument(format!(
+                "invalid input syntax for type bigint: \"{}\"",
+                text.as_str()
+            ))
+        })?,
+        Value::Blob(_) => return Err(LimboError::InvalidArgument("datatype mismatch".to_string())),
+    };
+    if value < 0 {
+        return Err(LimboError::InvalidArgument(format!(
+            "{} must not be negative",
+            text_arg(args, 1)
+        )));
+    }
+    Ok(Value::from_i64(value))
 }
 
 fn exec_pg_get_user_by_id(_oid: i64) -> Value {

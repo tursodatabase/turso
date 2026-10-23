@@ -49,7 +49,7 @@ fn pg_query_text(conn: &PgConnection, sql: &str) -> String {
 /// non-Done terminal states. Used after reading a single expected row to
 /// make sure the program reaches `Halt` and any sequence side-effects
 /// commit.
-fn drain_to_done(rows: &mut turso_core::Statement, sql: &str) {
+fn drain_to_done(rows: &mut turso_pg::Statement, sql: &str) {
     loop {
         match rows.step().unwrap() {
             StepResult::Done => return,

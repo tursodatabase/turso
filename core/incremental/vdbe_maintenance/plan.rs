@@ -378,6 +378,9 @@ fn block_aggregates(document: &HirDocument, block: &hir::QueryBlock) -> Result<V
             };
             let (args, distinct) = match &call.arguments {
                 hir::FunctionArguments::Star => (Vec::new(), false),
+                hir::FunctionArguments::Expressions { order_by, .. } if !order_by.is_empty() => {
+                    return unsupported("ORDER BY in aggregates")
+                }
                 hir::FunctionArguments::Expressions {
                     values,
                     distinctness,

@@ -16,11 +16,23 @@ struct ColumnUsageCollector {
     counts: HashMap<ColumnRef, usize>,
 }
 
-impl ColumnUsageCollector {
+trait RecordColumnRead {
+    fn record(&mut self, reference: ColumnRef);
+}
+
+impl RecordColumnRead for ColumnUsageCollector {
     fn record(&mut self, reference: ColumnRef) {
         *self.counts.entry(reference).or_default() += 1;
     }
+}
 
+impl RecordColumnRead for Vec<ColumnRef> {
+    fn record(&mut self, reference: ColumnRef) {
+        self.push(reference);
+    }
+}
+
+impl ColumnUsageCollector {
     fn into_usage(self) -> Vec<ColumnUsage> {
         let mut usage = self
             .counts
@@ -608,51 +620,58 @@ impl Query {
         source_by_id: impl Fn(SourceId) -> Option<&'source Source> + Copy,
     ) -> Vec<ColumnUsage> {
         let mut reads = ColumnUsageCollector::default();
+        self.record_direct_column_reads(source_by_id, &mut reads);
+        reads.into_usage()
+    }
+
+    /// Append every table column read directly by this query, once per
+    /// read. Nested queries own their reads and are visited separately by
+    /// the analyzer.
+    pub(crate) fn direct_column_reads<'source>(
+        &self,
+        source_by_id: impl Fn(SourceId) -> Option<&'source Source> + Copy,
+        reads: &mut Vec<ColumnRef>,
+    ) {
+        self.record_direct_column_reads(source_by_id, reads);
+    }
+
+    fn record_direct_column_reads<'source>(
+        &self,
+        source_by_id: impl Fn(SourceId) -> Option<&'source Source> + Copy,
+        reads: &mut impl RecordColumnRead,
+    ) {
         for block in &self.blocks {
             if let Some(from) = &block.from {
-                collect_from_column_reads(from, &mut reads, source_by_id);
+                collect_from_column_reads(from, reads, source_by_id);
             }
             for output in &block.outputs {
-                collect_expr_column_reads(&output.expr, &mut reads);
+                collect_expr_column_reads(&output.expr, reads);
             }
             match &block.body {
                 QueryBlockBody::Select {
                     filter, grouping, ..
                 } => {
-                    collect_optional_expr_column_reads(filter.as_ref(), &mut reads);
+                    collect_optional_expr_column_reads(filter.as_ref(), reads);
                     if let Some(grouping) = grouping {
-                        collect_exprs_column_reads(&grouping.keys, &mut reads);
-                        collect_optional_expr_column_reads(grouping.having.as_ref(), &mut reads);
+                        collect_exprs_column_reads(&grouping.keys, reads);
+                        collect_optional_expr_column_reads(grouping.having.as_ref(), reads);
                     }
                 }
                 QueryBlockBody::Values { rows } => {
                     for row in rows {
-                        collect_exprs_column_reads(row, &mut reads);
+                        collect_exprs_column_reads(row, reads);
                     }
                 }
             }
             for window in &block.windows {
-                collect_window_column_reads(window, &mut reads);
+                collect_window_column_reads(window, reads);
             }
         }
-        collect_order_column_reads(&self.order_by, &mut reads);
+        collect_order_column_reads(&self.order_by, reads);
         if let Some(limit) = &self.limit {
-            collect_expr_column_reads(&limit.limit, &mut reads);
-            collect_optional_expr_column_reads(limit.offset.as_ref(), &mut reads);
+            collect_expr_column_reads(&limit.limit, reads);
+            collect_optional_expr_column_reads(limit.offset.as_ref(), reads);
         }
-
-        reads.into_usage()
-    }
-
-    /// Return every table column read directly by this query. Nested queries
-    /// own their reads and are visited separately by the analyzer.
-    pub(crate) fn direct_column_reads<'source>(
-        &self,
-        source_by_id: impl Fn(SourceId) -> Option<&'source Source> + Copy,
-    ) -> impl Iterator<Item = ColumnRef> {
-        self.direct_column_usage(source_by_id)
-            .into_iter()
-            .map(|usage| usage.reference)
     }
 }
 
@@ -733,7 +752,7 @@ impl Delete {
 
 fn collect_from_column_reads<'source>(
     from: &From,
-    reads: &mut ColumnUsageCollector,
+    reads: &mut impl RecordColumnRead,
     source_by_id: impl Fn(SourceId) -> Option<&'source Source> + Copy,
 ) {
     collect_source_argument_column_reads(from.first, reads, source_by_id);
@@ -754,7 +773,7 @@ fn collect_from_column_reads<'source>(
 
 fn collect_source_argument_column_reads<'source>(
     id: SourceId,
-    reads: &mut ColumnUsageCollector,
+    reads: &mut impl RecordColumnRead,
     source_by_id: impl Fn(SourceId) -> Option<&'source Source> + Copy,
 ) {
     let Some(source) = source_by_id(id) else {
@@ -775,7 +794,7 @@ fn collect_source_argument_column_reads<'source>(
     }
 }
 
-fn collect_expr_column_reads(expression: &Expr, reads: &mut ColumnUsageCollector) {
+fn collect_expr_column_reads(expression: &Expr, reads: &mut impl RecordColumnRead) {
     expression.for_each(&mut |expression| {
         if let Expr::Column(reference) = expression {
             reads.record(*reference);
@@ -783,25 +802,28 @@ fn collect_expr_column_reads(expression: &Expr, reads: &mut ColumnUsageCollector
     });
 }
 
-fn collect_exprs_column_reads(expressions: &[Expr], reads: &mut ColumnUsageCollector) {
+fn collect_exprs_column_reads(expressions: &[Expr], reads: &mut impl RecordColumnRead) {
     for expression in expressions {
         collect_expr_column_reads(expression, reads);
     }
 }
 
-fn collect_optional_expr_column_reads(expression: Option<&Expr>, reads: &mut ColumnUsageCollector) {
+fn collect_optional_expr_column_reads(
+    expression: Option<&Expr>,
+    reads: &mut impl RecordColumnRead,
+) {
     if let Some(expression) = expression {
         collect_expr_column_reads(expression, reads);
     }
 }
 
-fn collect_order_column_reads(terms: &[OrderTerm], reads: &mut ColumnUsageCollector) {
+fn collect_order_column_reads(terms: &[OrderTerm], reads: &mut impl RecordColumnRead) {
     for term in terms {
         collect_expr_column_reads(&term.expr, reads);
     }
 }
 
-fn collect_window_column_reads(window: &ResolvedWindow, reads: &mut ColumnUsageCollector) {
+fn collect_window_column_reads(window: &ResolvedWindow, reads: &mut impl RecordColumnRead) {
     for term in &window.partition_by {
         collect_expr_column_reads(&term.expr, reads);
     }
@@ -813,7 +835,7 @@ fn collect_window_column_reads(window: &ResolvedWindow, reads: &mut ColumnUsageC
     }
 }
 
-fn collect_window_bound_column_reads(bound: &WindowFrameBound, reads: &mut ColumnUsageCollector) {
+fn collect_window_bound_column_reads(bound: &WindowFrameBound, reads: &mut impl RecordColumnRead) {
     if let WindowFrameBound::Following(expression) | WindowFrameBound::Preceding(expression) = bound
     {
         collect_expr_column_reads(expression, reads);
@@ -1061,10 +1083,9 @@ mod tests {
                 count: 3,
             }]
         );
-        assert_eq!(
-            query.direct_column_reads(no_source).collect::<Vec<_>>(),
-            vec![ColumnRef { source, column: 0 }]
-        );
+        let mut reads = Vec::new();
+        query.direct_column_reads(no_source, &mut reads);
+        assert_eq!(reads, vec![ColumnRef { source, column: 0 }; 3]);
     }
 
     #[test]

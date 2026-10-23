@@ -29,6 +29,7 @@ scripts/diff.sh "SQL" [label]  # compare sqlite3 vs tursodb output
 - `make test-single TEST=foo.test` - single legacy TCL test
 - `make -C sqlite/conformance run-rust ARGS='--snapshot-filter __never__'` - preferred `.sqltest` runner for new coverage
 - `CI=1 make -C sqlite/conformance run-rust` - only when snapshot tests are required
+- `make -C postgres/conformance run` - run the PostgreSQL `.sqltest` corpus against tursopg
 - `make -C postgres/conformance run-postgres` - run the PostgreSQL `.sqltest` corpus against a real PostgreSQL server (needs Docker, or a server at `PG_DSN`)
 
 ### Test Organization
@@ -38,7 +39,7 @@ Default: add coverage to the narrowest existing test harness that can express th
 - `sqlite/conformance/sqlite-sqltests/` - preferred for SQL conformance coverage. These tests run the same scenario against both Turso and SQLite, so use them first for parser, planner, executor, and SQL semantics work that fits the `.sqltest` DSL.
 - `tests/integration/` - primary fallback when the behavior cannot be expressed cleanly in `.sqltest`. Put API-level regressions, multi-connection orchestration, storage assertions, injected failures, timeout behavior, and other Rust-driven scenarios here.
 - `sqlite/conformance/upstream/` - imported upstream SQLite golden tests. Do not modify these for Turso behavior changes; use them as fixed compatibility coverage, and only touch them for intentional upstream sync or harness maintenance.
-- `postgres/conformance/pg-sqltests/` - `.sqltest` coverage for the PostgreSQL frontend.
+- `postgres/conformance/pg-sqltests/` - `.sqltest` coverage for the PostgreSQL frontend. Every test must pass on both tursopg (`run`) and real PostgreSQL (`run-postgres`).
 - `testing/cli_tests/` - CLI-focused Python coverage for shell behavior and end-to-end command workflows.
 - `tests/fuzz/` - minimized fuzz regressions and targeted edge cases that are easier to keep as Rust tests.
 - `testing/simulator/` and `testing/concurrent-simulator/` - deterministic concurrency, scheduling, and failure-injection coverage for state-machine and I/O correctness.
@@ -137,6 +138,8 @@ Before opening a PR, read the "PR Workflow" document linked above.
 8. **Driver API parity** Embedded (`bindings/rust`) and serverless (`serverless/rust`) drivers expose the same public API; add features to both in the same change. Spec: `serverless/conformance/differential/README.md`.
 9. **Backward compatibility** No breaking changes. New versions of Turso must work with databases and sidecar files that were created from previous versions.  
 10. **Keep user docs current.** If a change adds, removes, or changes user-visible SQL behavior (syntax, functions, pragmas, data types, CLI commands, errors), update the matching page in `docs/sql-reference/` in the same change. For example, a new `JOIN` type goes in `docs/sql-reference/statements/select.mdx`.
+11. **Dialect-specific behavior belongs on the `Dialect` trait.** If a behavior differs between the SQLite and PostgreSQL frontends (error handling, type semantics, name resolution, etc.), add a method to `core/dialect/mod.rs` with a default that matches SQLite and override it in `PostgresDialect`. Do not put it in `DatabaseOpts` (that is client-public API and clients should not set dialect behavior) and do not put it in CLI flags or wire-protocol fields (those do not apply to embedded databases).
+12. **No PostgreSQL-specific code in `core/`.** PostgreSQL behavior and state go in `postgres/`. Unsure what to do? Ask.
 
 ## Always use plain language instead of complex jargon
 

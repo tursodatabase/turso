@@ -759,7 +759,8 @@ fn normalize_scalar_input(
         } => {
             if !order_by.is_empty() {
                 crate::bail_parse_error!(
-                    "ORDER BY clause is not supported yet in aggregate functions"
+                    "ORDER BY may not be used with non-aggregate {}()",
+                    name.as_str()
                 );
             }
             Ok(FunctionInput::Expressions {
@@ -3162,11 +3163,14 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
             (false, None) => None,
             _ => unreachable!("window binding and OVER clause must agree"),
         };
+        if window_evaluation && !input.order_terms().is_empty() {
+            crate::bail_parse_error!(
+                "ORDER BY may not be used with non-aggregate {}()",
+                name.as_str()
+            );
+        }
         if window_evaluation && input.distinctness().is_some() {
             crate::bail_parse_error!("DISTINCT is not supported for window functions");
-        }
-        if window_evaluation && !input.order_terms().is_empty() {
-            crate::bail_parse_error!("ORDER BY clause is not supported yet in aggregate functions");
         }
         if window_evaluation && filter.is_some() && matches!(&function, Func::Window(_)) {
             crate::bail_parse_error!(

@@ -70,6 +70,7 @@ rusqlite = { workspace = true }
 # PostgreSQL wire-protocol client (for the tursopg and postgres backends,
 # which drive a tursopg server or a real PostgreSQL server over TCP)
 turso_pg_client = { workspace = true }
+pg_query = { workspace = true }
 
 [dev-dependencies]
 pretty_assertions = "1"

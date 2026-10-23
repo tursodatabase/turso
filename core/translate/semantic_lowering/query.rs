@@ -355,6 +355,7 @@ struct HirOrderedArguments {
     terms: usize,
     values: usize,
     sequence: usize,
+    distinct_on_order_key: bool,
 }
 
 struct HirAggregateState<'a> {
@@ -855,6 +856,7 @@ pub(crate) fn prepare_subquery(
                 .map(|component| component.affinity.aff_mask())
                 .collect::<String>();
             let index = Arc::new(Index {
+                constraint_name: None,
                 columns,
                 name: format!("ephemeral_index_hir_sub_{}", query_id.index()),
                 table_name: String::new(),
@@ -1059,6 +1061,7 @@ fn emit_cached_subquery(
         })
         .collect_vec();
     let index = Arc::new(Index {
+        constraint_name: None,
         columns,
         name: format!("ephemeral_subquery_cache_{}", prepared.query.index()),
         table_name: String::new(),
@@ -2965,22 +2968,22 @@ fn open_hir_compound_index(
         )));
     }
     let mut columns = crate::alloc::vec![];
-    for (position, (left, right)) in left.outputs.iter().zip(&right.outputs).enumerate() {
+    for (position, left) in left.outputs.iter().enumerate() {
         columns.push(IndexColumn {
             name: left.name.clone(),
             order: SortOrder::Asc,
             nulls_order: None,
             pos_in_table: position,
-            collation: left
-                .collation
-                .as_ref()
-                .or(right.collation.as_ref())
+            collation: query.blocks[..=right_block]
+                .iter()
+                .find_map(|block| block.outputs[position].collation.as_ref())
                 .map(|collation| *collation.value()),
             default: None,
             expr: None,
         });
     }
     let index = Arc::new(Index {
+        constraint_name: None,
         name: name.to_string(),
         table_name: String::new(),
         root_page: 0,
@@ -4028,13 +4031,15 @@ fn initialize_hir_aggregates<'a>(
             None
         };
         let ordered = match &call.arguments {
+            _ if matches!(func, AggFunc::Min | AggFunc::Max) => None,
             hir::FunctionArguments::Expressions {
                 values, order_by, ..
             } if !order_by.is_empty() => Some(open_hir_ordered_arguments(
                 program,
                 index,
-                values.len(),
+                values,
                 order_by,
+                distinct.is_some(),
             )?),
             _ => None,
         };
@@ -4197,9 +4202,13 @@ fn emit_hir_bare_row_test(
 fn open_hir_ordered_arguments(
     program: &mut ProgramBuilder,
     aggregate: usize,
-    values: usize,
+    values: &[hir::Expr],
     order_by: &[hir::OrderTerm],
+    distinct: bool,
 ) -> Result<HirOrderedArguments> {
+    let distinct_on_order_key =
+        distinct && matches!((values, order_by), ([value], [term]) if value.equivalent(&term.expr));
+    let values = values.len();
     // An index orders by collation only, not by a custom type's order.
     if order_by.iter().any(|term| {
         crate::translate::order_by::custom_type_comparator_from_type_fact(&term.type_fact).is_some()
@@ -4227,10 +4236,17 @@ fn open_hir_ordered_arguments(
             )
         })
         .collect_vec();
-    for position in order_by.len()..order_by.len() + 1 + values {
+    let sequence_order = if distinct_on_order_key {
+        SortOrder::Desc
+    } else {
+        SortOrder::Asc
+    };
+    columns.push(column(order_by.len(), sequence_order, None, None));
+    for position in order_by.len() + 1..order_by.len() + 1 + 2 * values {
         columns.push(column(position, SortOrder::Asc, None, None));
     }
     let index = Arc::new(Index {
+        constraint_name: None,
         columns,
         name: format!("ephemeral_aggregate_order_{aggregate}"),
         table_name: String::new(),
@@ -4257,6 +4273,7 @@ fn open_hir_ordered_arguments(
         terms: order_by.len(),
         values,
         sequence,
+        distinct_on_order_key,
     })
 }
 
@@ -4264,18 +4281,18 @@ fn open_hir_ordered_arguments(
 fn emit_hir_ordered_argument_row(
     program: &mut ProgramBuilder,
     document: &HirDocument,
-    call: &hir::FunctionCall,
+    aggregate: &HirAggregateRuntime<'_>,
     ordered: &HirOrderedArguments,
 ) -> Result<()> {
     let hir::FunctionArguments::Expressions {
         values, order_by, ..
-    } = &call.arguments
+    } = &aggregate.call.arguments
     else {
         return Err(LimboError::InternalError(
             "HIR ordered aggregate has no argument expressions".into(),
         ));
     };
-    let width = ordered.terms + 1 + ordered.values;
+    let width = ordered.terms + 1 + 2 * ordered.values;
     let start = program.alloc_registers(width);
     for (position, term) in order_by.iter().enumerate() {
         super::expr::translate_expr(program, document, &term.expr, start + position)?;
@@ -4289,14 +4306,40 @@ fn emit_hir_ordered_argument_row(
         dst_reg: start + ordered.terms,
         extra_amount: 0,
     });
+    let arguments = start + ordered.terms + 1;
     for (position, value) in values.iter().enumerate() {
-        super::expr::translate_expr(
-            program,
-            document,
-            value,
-            start + ordered.terms + 1 + position,
-        )?;
+        if ordered.distinct_on_order_key {
+            program.emit_insn(Insn::Copy {
+                src_reg: start,
+                dst_reg: arguments + position,
+                extra_amount: 0,
+            });
+        } else {
+            super::expr::translate_expr(program, document, value, arguments + position)?;
+        }
     }
+    for position in 0..ordered.values {
+        program.emit_insn(Insn::GetSubtype {
+            src_reg: arguments + position,
+            dest_reg: arguments + ordered.values + position,
+        });
+    }
+    let duplicate = match &aggregate.distinct {
+        Some(distinct) if !ordered.distinct_on_order_key => {
+            let duplicate = program.allocate_label();
+            program.emit_insn(Insn::HashDistinct {
+                data: Box::new(HashDistinctData {
+                    hash_table_id: distinct.hash_table,
+                    key_start_reg: arguments,
+                    num_keys: 1,
+                    collations: vec![distinct.collation],
+                    target_pc: duplicate,
+                }),
+            });
+            Some(duplicate)
+        }
+        _ => None,
+    };
     let record = program.alloc_register();
     program.emit_insn(Insn::MakeRecord {
         start_reg: to_u32(start),
@@ -4312,11 +4355,14 @@ fn emit_hir_ordered_argument_row(
         unpacked_count: Some(to_u32(width)),
         flags: crate::vdbe::insn::IdxInsertFlags::new(),
     });
+    if let Some(duplicate) = duplicate {
+        program.preassign_label_to_next_insn(duplicate);
+    }
     Ok(())
 }
 
 /// Step an aggregate with an argument ORDER BY through its kept rows, in
-/// order. DISTINCT keeps the first of equal arguments in that order.
+/// order.
 fn emit_hir_ordered_aggregate_steps(
     program: &mut ProgramBuilder,
     document: &HirDocument,
@@ -4337,6 +4383,7 @@ fn emit_hir_ordered_aggregate_steps(
     program.preassign_label_to_next_insn(row);
     let bound = program.expression_register_count();
     let start = program.alloc_registers(ordered.values.max(1));
+    let subtype = program.alloc_register();
     for (position, value) in values.iter().enumerate() {
         program.emit_insn(Insn::Column {
             cursor_id: ordered.cursor,
@@ -4344,11 +4391,22 @@ fn emit_hir_ordered_aggregate_steps(
             dest: start + position,
             default: None,
         });
+        program.emit_insn(Insn::Column {
+            cursor_id: ordered.cursor,
+            column: ordered.terms + 1 + ordered.values + position,
+            dest: subtype,
+            default: None,
+        });
+        program.emit_insn(Insn::SetSubtype {
+            subtype_reg: subtype,
+            dest_reg: start + position,
+        });
         program.bind_expression_register(value, start + position);
     }
     let distinct = aggregate
         .distinct
         .as_ref()
+        .filter(|_| ordered.distinct_on_order_key)
         .map(|distinct| HirAggregateDistinct {
             hash_table: distinct.hash_table,
             collation: distinct.collation,
@@ -4418,7 +4476,7 @@ fn emit_hir_aggregate_steps(
                     jump_if_null: true,
                 });
             }
-            emit_hir_ordered_argument_row(program, document, aggregate.call, ordered)?;
+            emit_hir_ordered_argument_row(program, document, aggregate, ordered)?;
             if let Some(skip) = skip {
                 program.preassign_label_to_next_insn(skip);
             }
@@ -5777,6 +5835,7 @@ fn open_hir_primary_key_matched_set(
         });
     }
     let index = Arc::new(Index {
+        constraint_name: None,
         name: format!("{}_matched_rows", table.name),
         table_name: table.name.clone(),
         root_page: 0,
@@ -10841,6 +10900,7 @@ pub(super) mod tests {
             .expect("fixed table name is unique");
         schema
             .add_index(Arc::new(Index {
+                constraint_name: None,
                 name: "items_value".to_string(),
                 table_name: "items".to_string(),
                 root_page: 3,
@@ -10908,6 +10968,7 @@ pub(super) mod tests {
             .expect("right table name is unique");
         schema
             .add_index(Arc::new(Index {
+                constraint_name: None,
                 name: "right_items_value".to_string(),
                 table_name: "right_items".to_string(),
                 root_page: 4,

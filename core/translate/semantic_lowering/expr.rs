@@ -1074,6 +1074,7 @@ impl<'expr> hir::ExprVisitor<'expr> for ExprLowerer<'_, 'expr, '_> {
                     }
                     1 => registers.start,
                     2 => {
+                        let value = self.copy_between_value(&registers);
                         self.emit_comparison(
                             if *negated {
                                 Operator::Less
@@ -1081,7 +1082,7 @@ impl<'expr> hir::ExprVisitor<'expr> for ExprLowerer<'_, 'expr, '_> {
                                 Operator::GreaterEquals
                             },
                             start_comparison,
-                            registers.value,
+                            value,
                             registers.start,
                             registers.lower,
                         )?;
@@ -2159,6 +2160,7 @@ impl<'expr> ExprLowerer<'_, 'expr, '_> {
                     unreachable!("BETWEEN registers were allocated")
                 };
                 debug_assert_eq!(registers.width, end_comparison.components.len());
+                let value = self.copy_between_value(&registers);
                 self.emit_comparison(
                     if *negated {
                         Operator::Greater
@@ -2166,7 +2168,7 @@ impl<'expr> ExprLowerer<'_, 'expr, '_> {
                         Operator::LessEquals
                     },
                     end_comparison,
-                    registers.value,
+                    value,
                     registers.end,
                     registers.upper,
                 )?;
@@ -2376,6 +2378,7 @@ impl<'expr> ExprLowerer<'_, 'expr, '_> {
                         }
                         debug_assert!(children.is_empty());
                         self.program.emit_insn(Insn::Halt {
+                            constraint_info: None,
                             err_code: 0,
                             description: String::new(),
                             on_error: Some(ResolveType::Ignore),
@@ -2404,6 +2407,7 @@ impl<'expr> ExprLowerer<'_, 'expr, '_> {
                             }
                         };
                         self.program.emit_insn(Insn::Halt {
+                            constraint_info: None,
                             err_code: if in_trigger {
                                 SQLITE_CONSTRAINT_TRIGGER
                             } else {
@@ -3027,6 +3031,7 @@ impl ExprLowerer<'_, '_, '_> {
         })?;
         if let Some(description) = &domain.not_null_description {
             self.program.emit_insn(Insn::HaltIfNull {
+                constraint_info: None,
                 target_reg: value,
                 err_code: SQLITE_CONSTRAINT_NOTNULL,
                 on_error: None,
@@ -3067,6 +3072,7 @@ impl ExprLowerer<'_, '_, '_> {
             jump_if_null: false,
         });
         self.program.emit_insn(Insn::Halt {
+            constraint_info: None,
             err_code: SQLITE_CONSTRAINT_CHECK,
             description: check.failure_description.clone(),
             on_error: None,
@@ -4090,6 +4096,16 @@ impl ExprLowerer<'_, '_, '_> {
             }
         };
         self.emit_comparison(operator, comparison, lhs, rhs, target)
+    }
+
+    fn copy_between_value(&mut self, registers: &BetweenRegisters) -> usize {
+        let copy = self.program.alloc_registers(registers.width);
+        self.program.emit_insn(Insn::Copy {
+            src_reg: registers.value,
+            dst_reg: copy,
+            extra_amount: registers.width - 1,
+        });
+        copy
     }
 
     fn emit_comparison(
@@ -5123,6 +5139,7 @@ pub(crate) fn translate_schema_calls_on_elements(
         collation: None,
     });
     program.emit_insn(Insn::Halt {
+        constraint_info: None,
         err_code: crate::error::SQLITE_CONSTRAINT,
         description: format!(
             "array exceeds maximum element count for custom type transform ({MAX_ELEMENTS})"
@@ -6449,6 +6466,7 @@ mod tests {
         ));
 
         let index = Arc::new(Index {
+            constraint_name: None,
             name: "items_value".to_string(),
             table_name: "items".to_string(),
             root_page: 3,
@@ -7956,6 +7974,7 @@ mod tests {
                     description,
                     on_error: Some(ResolveType::Abort),
                     description_reg: None,
+                    constraint_info: None,
                 },
                 _,
             )] if description == "stop' now"
@@ -8330,46 +8349,62 @@ mod tests {
 
             assert_eq!(translate_expr(&mut program, &expression, 8).unwrap(), 8);
             assert!(matches!(
-                &program.insns[..3],
+                &program.insns[..4],
                 [
                     (Insn::Integer { value: 2, dest: 1 }, _),
                     (Insn::Integer { value: 1, dest: 3 }, _),
+                    (
+                        Insn::Copy {
+                            src_reg: 1,
+                            dst_reg: 6,
+                            extra_amount: 0,
+                        },
+                        _
+                    ),
                     (Insn::Integer { value: 1, dest: 2 }, _),
                 ]
             ));
             if negated {
                 assert!(matches!(
-                    program.insns[3].0,
-                    Insn::Lt { lhs: 1, rhs: 3, .. }
+                    program.insns[4].0,
+                    Insn::Lt { lhs: 6, rhs: 3, .. }
                 ));
             } else {
                 assert!(matches!(
-                    program.insns[3].0,
-                    Insn::Ge { lhs: 1, rhs: 3, .. }
+                    program.insns[4].0,
+                    Insn::Ge { lhs: 6, rhs: 3, .. }
                 ));
             }
             assert!(matches!(
-                program.insns[4].0,
+                program.insns[5].0,
                 Insn::ZeroOrNull {
-                    rg1: 1,
+                    rg1: 6,
                     rg2: 3,
                     dest: 2,
                 }
             ));
             assert!(matches!(
-                &program.insns[5..7],
+                &program.insns[6..9],
                 [
                     (Insn::Integer { value: 3, dest: 5 }, _),
+                    (
+                        Insn::Copy {
+                            src_reg: 1,
+                            dst_reg: 7,
+                            extra_amount: 0,
+                        },
+                        _
+                    ),
                     (Insn::Integer { value: 1, dest: 4 }, _),
                 ]
             ));
             if negated {
                 assert!(matches!(
-                    program.insns[7].0,
-                    Insn::Gt { lhs: 1, rhs: 5, .. }
+                    program.insns[9].0,
+                    Insn::Gt { lhs: 7, rhs: 5, .. }
                 ));
                 assert!(matches!(
-                    program.insns[9].0,
+                    program.insns[11].0,
                     Insn::Or {
                         lhs: 2,
                         rhs: 4,
@@ -8378,11 +8413,11 @@ mod tests {
                 ));
             } else {
                 assert!(matches!(
-                    program.insns[7].0,
-                    Insn::Le { lhs: 1, rhs: 5, .. }
+                    program.insns[9].0,
+                    Insn::Le { lhs: 7, rhs: 5, .. }
                 ));
                 assert!(matches!(
-                    program.insns[9].0,
+                    program.insns[11].0,
                     Insn::And {
                         lhs: 2,
                         rhs: 4,
@@ -8418,12 +8453,12 @@ mod tests {
             1
         );
         assert!(matches!(
-            program.insns[2].0,
-            Insn::Ge { lhs: 1, rhs: 1, .. }
+            program.insns[3].0,
+            Insn::Ge { lhs: 4, rhs: 1, .. }
         ));
         assert!(matches!(
-            program.insns[5].0,
-            Insn::Le { lhs: 1, rhs: 1, .. }
+            program.insns[7].0,
+            Insn::Le { lhs: 5, rhs: 1, .. }
         ));
     }
 
@@ -8516,23 +8551,48 @@ mod tests {
                 _ => None,
             })
             .collect::<Vec<_>>();
+        let copies = program
+            .insns
+            .iter()
+            .filter_map(|(instruction, _)| match instruction {
+                Insn::Copy {
+                    src_reg: 1,
+                    dst_reg,
+                    extra_amount: 1,
+                } => Some(*dst_reg),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        let [lower_value, upper_value] = copies.as_slice() else {
+            panic!("each bound compares its own copy of the value, got {copies:?}");
+        };
         assert_eq!(
             comparisons,
             vec![
                 (
-                    1,
+                    *lower_value,
                     4,
                     crate::vdbe::affinity::Affinity::Text,
                     Some(crate::translate::collate::CollationSeq::NoCase)
                 ),
-                (2, 5, crate::vdbe::affinity::Affinity::Numeric, None),
                 (
-                    1,
+                    lower_value + 1,
+                    5,
+                    crate::vdbe::affinity::Affinity::Numeric,
+                    None
+                ),
+                (
+                    *upper_value,
                     7,
                     crate::vdbe::affinity::Affinity::Text,
                     Some(crate::translate::collate::CollationSeq::NoCase)
                 ),
-                (2, 8, crate::vdbe::affinity::Affinity::Numeric, None),
+                (
+                    upper_value + 1,
+                    8,
+                    crate::vdbe::affinity::Affinity::Numeric,
+                    None
+                ),
             ]
         );
         assert!(matches!(
@@ -8630,7 +8690,9 @@ mod tests {
             })
             .collect::<Vec<_>>();
         assert_eq!(comparisons.len(), 4);
-        assert!(comparisons.into_iter().all(|(lhs, rhs)| lhs == rhs));
+        assert!(comparisons
+            .into_iter()
+            .all(|(lhs, rhs)| matches!(rhs, 1 | 2) && lhs > &2));
     }
 
     #[test]

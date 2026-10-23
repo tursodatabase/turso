@@ -3,10 +3,11 @@ use std::borrow::Cow;
 use std::collections::HashMap;
 use std::num::NonZero;
 use std::str;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use crate::catalog::{self, PostgresDialect};
 use crate::functions::ConfigParameter;
+use crate::settings::{PgSessionState, SettingScope};
 use turso_core::{Connection, LimboError, Result, Statement, Value};
 use turso_parser::ast::{self};
 use turso_pg_parser::translator::{
@@ -27,14 +28,7 @@ struct PgConnectionInner {
     conn: Arc<Connection>,
 }
 
-/// The text that `search_path` was set to, for SHOW. The search path itself
-/// is on the connection.
-#[derive(Default)]
-struct SessionState {
-    search_path_setting: Option<String>,
-}
-
-type PgSessionState = Mutex<SessionState>;
+const SEARCH_PATH_SETTING: &str = "search_path";
 
 pub(crate) const DEFAULT_SEARCH_PATH: &str = "\"$user\", public";
 
@@ -45,7 +39,7 @@ pub fn open_database(
     vfs: Option<&str>,
     flags: turso_core::OpenFlags,
     opts: turso_core::DatabaseOpts,
-) -> Result<(Arc<dyn turso_core::IO>, Arc<turso_core::Database>)> {
+) -> crate::Result<(Arc<dyn turso_core::IO>, Arc<turso_core::Database>)> {
     let io = match vfs {
         Some(vfs) => turso_core::Database::io_for_vfs(vfs)?,
         None => turso_core::Database::io_for_path(path)?,
@@ -61,7 +55,7 @@ pub fn open_database_with_io(
     path: &str,
     flags: turso_core::OpenFlags,
     opts: turso_core::DatabaseOpts,
-) -> Result<Arc<turso_core::Database>> {
+) -> crate::Result<Arc<turso_core::Database>> {
     let file = io.open_file(path, flags, true)?;
     let db_file = Arc::new(turso_core::storage::database::DatabaseFile::new(file));
     turso_core::Database::open(
@@ -72,14 +66,14 @@ pub fn open_database_with_io(
             .flags(flags)
             .db_opts(opts.with_mvcc(true)),
     )
+    .map_err(Into::into)
 }
 
 impl PgConnection {
-    pub fn connect(db: &Arc<turso_core::Database>) -> Result<Self> {
-        let context = Arc::new(PgSessionState::default());
-        let conn = db.connect_with_context(context)?;
+    pub fn connect(db: &Arc<turso_core::Database>) -> crate::Result<Self> {
+        let conn = db.connect_with_hooks(Arc::new(PgSessionState::default()))?;
         conn.add_namespace("public", turso_core::MAIN_DB_ID);
-        set_search_path(&conn, None)?;
+        set_search_path(&conn, None, SettingScope::Session)?;
         Ok(Self {
             inner: Arc::new(PgConnectionInner { conn }),
         })
@@ -89,11 +83,13 @@ impl PgConnection {
         &self.inner.conn
     }
 
-    pub fn prepare(&self, sql: impl AsRef<str>) -> Result<Statement> {
+    pub fn prepare(&self, sql: impl AsRef<str>) -> crate::Result<crate::Statement> {
         prepare_statement(&self.inner, sql.as_ref())
+            .map(crate::Statement::new)
+            .map_err(Into::into)
     }
 
-    pub fn query(&self, sql: impl AsRef<str>) -> Result<Option<Statement>> {
+    pub fn query(&self, sql: impl AsRef<str>) -> crate::Result<Option<crate::Statement>> {
         let sql = sql.as_ref().trim();
         if sql.is_empty() {
             return Ok(None);
@@ -101,7 +97,7 @@ impl PgConnection {
         self.prepare(sql).map(Some)
     }
 
-    pub fn execute(&self, sql: impl AsRef<str>) -> Result<()> {
+    pub fn execute(&self, sql: impl AsRef<str>) -> crate::Result<()> {
         for stmt in self.query_runner(sql.as_ref().as_bytes()) {
             if let Some(mut stmt) = stmt? {
                 stmt.run_ignore_rows()?;
@@ -110,8 +106,8 @@ impl PgConnection {
         Ok(())
     }
 
-    pub fn close(&self) -> Result<()> {
-        self.inner.conn.close()
+    pub fn close(&self) -> crate::Result<()> {
+        self.inner.conn.close().map_err(Into::into)
     }
 
     pub fn pragma_update(&self, name: &str, value: impl std::fmt::Display) -> Result<()> {
@@ -146,7 +142,7 @@ impl<'a> PgQueryRunner<'a> {
 }
 
 impl Iterator for PgQueryRunner<'_> {
-    type Item = Result<Option<Statement>>;
+    type Item = crate::Result<Option<crate::Statement>>;
 
     fn next(&mut self) -> Option<Self::Item> {
         if self.index >= self.stmts.len() {
@@ -155,11 +151,16 @@ impl Iterator for PgQueryRunner<'_> {
 
         let sql = &self.stmts[self.index];
         self.index += 1;
-        Some(prepare_statement(self.conn, sql).map(Some))
+        Some(
+            prepare_statement(self.conn, sql)
+                .map(crate::Statement::new)
+                .map(Some)
+                .map_err(Into::into),
+        )
     }
 }
 
-pub fn split_statements(sql: &str) -> Result<Vec<String>> {
+pub fn split_statements(sql: &str) -> crate::Result<Vec<String>> {
     match turso_pg_parser::split_statements(sql) {
         Ok(stmts) if stmts.is_empty() && !sql.trim().is_empty() => Ok(vec![sql.trim().to_string()]),
         Ok(stmts) => Ok(stmts),
@@ -504,13 +505,17 @@ fn handle_pg_show(pg_conn: &Arc<PgConnectionInner>, show_stmt: &PgShowStmt) -> R
 
 /// `$user` stands for a schema named after the session user, which does
 /// not exist, so it is not a name that core looks up.
-pub(crate) fn set_search_path(conn: &Connection, value: Option<&str>) -> Result<Value> {
+pub(crate) fn set_search_path(
+    conn: &Connection,
+    value: Option<&str>,
+    scope: SettingScope,
+) -> Result<Value> {
     let mut path = parse_search_path(value.unwrap_or(DEFAULT_SEARCH_PATH))?;
     path.retain(|name| name != "$user" && !is_core_database_name(name));
-    let state = conn.context::<PgSessionState>().ok_or_else(|| {
-        LimboError::InvalidArgument("PostgreSQL session state is not initialized".to_string())
-    })?;
-    state.lock().unwrap().search_path_setting = value.map(str::to_owned);
+    session_state(conn)?.mutate(conn, |settings| {
+        settings.set_search_path(Some(path.clone()), scope);
+        settings.set(SEARCH_PATH_SETTING, value.map(str::to_owned), scope);
+    });
     conn.set_search_path(Some(path));
     Ok(Value::build_text(
         value.unwrap_or(DEFAULT_SEARCH_PATH).to_owned(),
@@ -524,8 +529,51 @@ fn is_core_database_name(name: &str) -> bool {
 }
 
 pub(crate) fn search_path_setting(conn: &Connection) -> Option<String> {
-    conn.context::<PgSessionState>()
-        .and_then(|state| state.lock().unwrap().search_path_setting.clone())
+    conn.context::<PgSessionState>()?
+        .setting(SEARCH_PATH_SETTING)
+}
+
+pub(crate) fn set_custom_parameter(
+    conn: &Connection,
+    name: &str,
+    value: Option<&str>,
+    scope: SettingScope,
+) -> Result<Value> {
+    if !is_valid_custom_parameter_name(name) {
+        return Err(LimboError::InvalidArgument(format!(
+            "invalid configuration parameter name \"{name}\""
+        )));
+    }
+    session_state(conn)?.mutate(conn, |settings| {
+        settings.set(&name.to_ascii_lowercase(), value.map(str::to_owned), scope)
+    });
+    Ok(Value::build_text(value.unwrap_or_default().to_owned()))
+}
+
+pub(crate) fn custom_parameter(conn: &Connection, name: &str) -> Option<String> {
+    let state = conn.context::<PgSessionState>()?;
+    let name = name.to_ascii_lowercase();
+    state
+        .has_setting(&name)
+        .then(|| state.setting(&name).unwrap_or_default())
+}
+
+fn session_state(conn: &Connection) -> Result<&PgSessionState> {
+    conn.context::<PgSessionState>().ok_or_else(|| {
+        LimboError::InvalidArgument("PostgreSQL session state is not initialized".to_string())
+    })
+}
+
+fn is_valid_custom_parameter_name(name: &str) -> bool {
+    name.contains('.') && name.split('.').all(is_simple_identifier)
+}
+
+fn is_simple_identifier(name: &str) -> bool {
+    let mut chars = name.chars();
+    chars
+        .next()
+        .is_some_and(|first| first.is_ascii_alphabetic() || first == '_' || !first.is_ascii())
+        && chars.all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '$' || !c.is_ascii())
 }
 
 fn parse_search_path(value: &str) -> Result<Vec<String>> {
@@ -615,12 +663,12 @@ fn handle_pg_create_schema(
     if !rest.is_empty() {
         search_path = format!("{search_path}, {rest}");
     }
-    set_search_path(conn, Some(&search_path))?;
+    set_search_path(conn, Some(&search_path), SettingScope::Session)?;
     let result = stmt
         .elements
         .iter()
         .try_for_each(|sql| prepare_statement(pg_conn, sql)?.run_ignore_rows());
-    set_search_path(conn, setting.as_deref())?;
+    set_search_path(conn, setting.as_deref(), SettingScope::Session)?;
     if let Err(err) = result {
         handle_pg_drop_schema(
             conn,
@@ -860,16 +908,8 @@ fn schema_exists(conn: &Arc<Connection>, schema_name: &str) -> Result<bool> {
 
 #[cfg(test)]
 mod tests {
-    use super::{search_path_parser, PgSessionState, SessionState};
+    use super::search_path_parser;
     use chumsky::Parser;
-    use std::any::Any;
-    use std::sync::{Arc, Mutex};
-
-    #[test]
-    fn session_state_alias_matches_injected_type() {
-        let state: Arc<dyn Any + Send + Sync> = Arc::new(Mutex::new(SessionState::default()));
-        assert!(state.downcast_ref::<PgSessionState>().is_some());
-    }
 
     #[test]
     fn search_path_parser_accepts_identifier_lists() {

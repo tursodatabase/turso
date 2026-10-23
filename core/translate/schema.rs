@@ -78,12 +78,26 @@ pub(crate) fn validate_check_expr(
                 name,
                 args,
                 filter_over,
+                order_by,
                 ..
             } => {
+                let func = catalog.resolve_function(name.as_str(), args.len())?;
+                if !order_by.is_empty()
+                    && func.as_ref().is_some_and(|func| match func {
+                        Func::Agg(_) | Func::Window(_) => false,
+                        Func::External(external) => !external.func.is_aggregate(),
+                        _ => true,
+                    })
+                {
+                    bail_parse_error!(
+                        "ORDER BY may not be used with non-aggregate {}()",
+                        name.as_str()
+                    );
+                }
                 if filter_over.over_clause.is_some() {
                     bail_parse_error!("misuse of window function {}()", name.as_str());
                 }
-                if let Some(func) = catalog.resolve_function(name.as_str(), args.len())? {
+                if let Some(func) = func {
                     if matches!(func, Func::Agg(..)) {
                         bail_parse_error!("misuse of aggregate function {}()", name.as_str());
                     }
@@ -1922,6 +1936,7 @@ pub fn translate_drop_table(
             target_pc: no_violations,
         });
         program.emit_insn(Insn::Halt {
+            constraint_info: None,
             err_code: crate::error::SQLITE_CONSTRAINT_FOREIGNKEY,
             description: "FOREIGN KEY constraint failed".to_string(),
             on_error: None,

@@ -115,6 +115,7 @@ pub(crate) fn emit_recursive_runtime(
         where_clause: None,
         index_method: None,
         on_conflict: None,
+        constraint_name: None,
     });
     let queue_cursor = program.alloc_cursor_id(CursorType::BTreeIndex(queue_index.clone()));
     program.emit_insn(Insn::OpenEphemeral {
@@ -147,6 +148,7 @@ pub(crate) fn emit_recursive_runtime(
             where_clause: None,
             index_method: None,
             on_conflict: None,
+            constraint_name: None,
         });
         let cursor = program.alloc_cursor_id(CursorType::BTreeIndex(index.clone()));
         program.emit_insn(Insn::OpenEphemeral {

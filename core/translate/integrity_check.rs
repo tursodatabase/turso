@@ -107,6 +107,7 @@ fn emit_integrity_result_row(
         decrement_by: 1,
     });
     program.emit_insn(Insn::Halt {
+        constraint_info: None,
         err_code: 0,
         on_error: None,
         description_reg: None,

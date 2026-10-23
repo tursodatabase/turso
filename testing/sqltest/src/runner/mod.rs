@@ -3,7 +3,7 @@ use crate::comparison::{ComparisonResult, compare};
 use crate::matrix_oracle::{OracleOutcome, run_oracle};
 use crate::parser::ast::{
     Backend, Capability, CaseModifiers, DatabaseConfig, DatabaseLocation, Expectation, Requirement,
-    SetupRef, Skip, SkipCondition, SnapshotCase, TestCase, TestFile,
+    Setup, SetupRef, Skip, SkipCondition, SnapshotCase, TestCase, TestFile,
 };
 use crate::snapshot::{SnapshotInfo, SnapshotManager, SnapshotResult, SnapshotUpdateMode};
 use async_trait::async_trait;
@@ -27,8 +27,8 @@ pub struct RunOptions {
     pub file_path: PathBuf,
     /// Database configuration
     pub db_config: DatabaseConfig,
-    /// Available setup blocks (name -> SQL)
-    pub setups: HashMap<String, String>,
+    /// Available setup blocks
+    pub setups: HashMap<String, Setup>,
     /// Whether MVCC mode is enabled
     pub mvcc: bool,
     /// Global skip directives
@@ -330,7 +330,9 @@ impl Runnable for MatrixRunCase {
             .modifiers
             .setups
             .iter()
-            .map(|s| options.setups[&s.name].clone())
+            .map(|s| &options.setups[&s.name])
+            .filter(|setup| setup.runs_on(options.backend_type))
+            .map(|setup| setup.sql.clone())
             .collect();
         let oracle = match run_oracle(&setups, &self.sql) {
             Ok(outcome) => outcome,
@@ -421,7 +423,9 @@ fn format_sqlite_snapshot_reference(
         .modifiers
         .setups
         .iter()
-        .map(|setup| options.setups[&setup.name].clone())
+        .map(|setup| &options.setups[&setup.name])
+        .filter(|setup| setup.runs_on(options.backend_type))
+        .map(|setup| setup.sql.clone())
         .collect();
     let sqlite_rows = |sql: String| match run_oracle(&setups, &sql)? {
         OracleOutcome::Rows(rows) => Ok(rows),
@@ -533,8 +537,11 @@ async fn run_single<B: SqlBackend, R: Runnable>(
 
         // Run setups
         for setup_ref in test.setups() {
-            if let Some(setup_sql) = options.setups.get(&setup_ref.name) {
-                if let Err(e) = db.execute_setup(setup_sql).await {
+            if let Some(setup) = options.setups.get(&setup_ref.name) {
+                if !setup.runs_on(options.backend_type) {
+                    continue;
+                }
+                if let Err(e) = db.execute_setup(&setup.sql).await {
                     let _ = db.close().await;
                     return TestResult {
                         name: test.name().to_string(),
@@ -1565,6 +1572,64 @@ expect {
         }
     }
 
+    #[tokio::test]
+    async fn setup_for_one_backend_runs_only_on_that_backend() {
+        let file = crate::parser::parse(
+            r#"
+@database :memory:
+
+@backend postgres
+setup postgres_functions {
+    CREATE FUNCTION one() RETURNS int LANGUAGE sql AS $$ SELECT 1 $$;
+}
+
+@setup postgres_functions
+test select-1 {
+    SELECT 1;
+}
+expect {
+    1
+}
+"#,
+        )
+        .unwrap();
+
+        for backend_type in Backend::ALL.iter().copied() {
+            let options = RunOptions {
+                file_path: PathBuf::from("setup.sqltest"),
+                db_config: file.databases[0].clone(),
+                setups: file.setups.clone(),
+                mvcc: false,
+                global_skip: file.global_skip.clone(),
+                global_requires: file.global_requires.clone(),
+                backend_capabilities: HashSet::new(),
+                backend_type,
+                backend_is_sqlite: false,
+                snapshot_update_mode: SnapshotUpdateMode::No,
+                cross_check_binary: None,
+                normalize_plans: false,
+                verify_materialized_views: false,
+            };
+            let backend = Arc::new(SetupFailsBackend { backend_type });
+            let result = run_single(backend, file.tests[0].clone(), options).await;
+            match backend_type {
+                Backend::Postgres => assert!(
+                    matches!(
+                        &result.outcome,
+                        TestOutcome::Error { message } if message.starts_with("setup 'postgres_functions' failed")
+                    ),
+                    "{:?}",
+                    result.outcome
+                ),
+                _ => assert!(
+                    matches!(result.outcome, TestOutcome::Passed),
+                    "{backend_type}: {:?}",
+                    result.outcome
+                ),
+            }
+        }
+    }
+
     /// A backend whose every query returns the single row `1`.
     struct OneRowBackend {
         backend_type: Backend,
@@ -1596,6 +1661,51 @@ expect {
 
     #[async_trait]
     impl crate::backends::DatabaseInstance for OneRowDatabase {
+        async fn execute(&mut self, _sql: &str) -> Result<QueryResult, BackendError> {
+            Ok(QueryResult::success(vec![vec!["1".to_string()]]))
+        }
+
+        async fn close(
+            self: Box<Self>,
+        ) -> Result<crate::backends::DatabaseFileHandle, BackendError> {
+            Ok(crate::backends::DatabaseFileHandle::none())
+        }
+    }
+
+    struct SetupFailsBackend {
+        backend_type: Backend,
+    }
+
+    #[async_trait]
+    impl SqlBackend for SetupFailsBackend {
+        fn name(&self) -> &str {
+            "setup-fails"
+        }
+
+        fn backend_type(&self) -> Backend {
+            self.backend_type
+        }
+
+        fn capabilities(&self) -> HashSet<Capability> {
+            HashSet::new()
+        }
+
+        async fn create_database(
+            &self,
+            _config: &DatabaseConfig,
+        ) -> Result<Box<dyn crate::backends::DatabaseInstance>, BackendError> {
+            Ok(Box::new(SetupFailsDatabase))
+        }
+    }
+
+    struct SetupFailsDatabase;
+
+    #[async_trait]
+    impl crate::backends::DatabaseInstance for SetupFailsDatabase {
+        async fn execute_setup(&mut self, sql: &str) -> Result<(), BackendError> {
+            Err(BackendError::Execute(format!("the setup ran: {sql}")))
+        }
+
         async fn execute(&mut self, _sql: &str) -> Result<QueryResult, BackendError> {
             Ok(QueryResult::success(vec![vec!["1".to_string()]]))
         }

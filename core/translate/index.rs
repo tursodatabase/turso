@@ -226,6 +226,7 @@ pub fn translate_create_index(
         where_clause: where_clause.clone(),
         index_method: index_method.clone(),
         on_conflict: None,
+        constraint_name: None,
     });
 
     if !idx.validate_where_expr(&table) {
@@ -324,6 +325,87 @@ pub fn translate_create_index(
 
 /// Plan the rows that fill `idx`: each index column as DML writes it, then
 /// the rowid.
+enum RefillRows {
+    Planned(PlannedSelect),
+    StoredColumns(Vec<usize>),
+}
+
+impl RefillRows {
+    fn emit_each_row(
+        &self,
+        program: &mut ProgramBuilder,
+        database_id: usize,
+        tbl: &Arc<BTreeTable>,
+        body: impl FnOnce(&mut ProgramBuilder, usize) -> crate::Result<()>,
+    ) -> crate::Result<()> {
+        let positions = match self {
+            Self::Planned(rows) => return rows.emit_each_row(program, body),
+            Self::StoredColumns(positions) => positions,
+        };
+        let cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(tbl.clone()));
+        program.emit_insn(Insn::OpenRead {
+            cursor_id,
+            root_page: tbl.root_page,
+            db: database_id,
+        });
+        let done = program.allocate_label();
+        let row = program.allocate_label();
+        program.emit_insn(Insn::Rewind {
+            cursor_id,
+            pc_if_empty: done,
+        });
+        program.preassign_label_to_next_insn(row);
+        let start = program.alloc_registers(positions.len() + 1);
+        for (offset, position) in positions.iter().enumerate() {
+            program.emit_column_or_rowid(cursor_id, *position, start + offset);
+        }
+        program.emit_insn(Insn::RowId {
+            cursor_id,
+            dest: start + positions.len(),
+        });
+        body(program, start)?;
+        program.emit_insn(Insn::Next {
+            cursor_id,
+            is_index: false,
+            pc_if_next: row,
+            fullscan: false,
+        });
+        program.preassign_label_to_next_insn(done);
+        program.emit_insn(Insn::Close { cursor_id });
+        Ok(())
+    }
+}
+
+fn refill_rows(
+    connection: &Arc<crate::Connection>,
+    catalog: &SemanticContext<'_>,
+    database_id: usize,
+    tbl: &BTreeTable,
+    idx: &Index,
+) -> crate::Result<RefillRows> {
+    let stored_columns = idx.where_clause.is_none()
+        && !tbl.is_strict
+        && idx.columns.iter().all(|column| {
+            column.pos_in_table != EXPR_INDEX_SENTINEL
+                && !tbl.columns()[column.pos_in_table].is_virtual_generated()
+        });
+    if stored_columns {
+        return Ok(RefillRows::StoredColumns(
+            idx.columns
+                .iter()
+                .map(|column| column.pos_in_table)
+                .collect(),
+        ));
+    }
+    Ok(RefillRows::Planned(hir_refill_select(
+        connection,
+        catalog,
+        database_id,
+        tbl,
+        idx,
+    )?))
+}
+
 fn hir_refill_select(
     connection: &Arc<crate::Connection>,
     catalog: &SemanticContext<'_>,
@@ -393,7 +475,7 @@ pub(crate) fn emit_refill_index(
     index_root_page: RegisterOrLiteral<i64>,
     clear_existing_root: Option<i64>,
 ) -> crate::Result<()> {
-    let rows = hir_refill_select(connection, catalog, database_id, tbl, idx)?;
+    let rows = refill_rows(connection, catalog, database_id, tbl, idx)?;
     let columns = &idx.columns;
     let tbl_name = normalize_ident(tbl.name.as_str());
     let mut cursors = vec![index_cursor_id];
@@ -407,7 +489,7 @@ pub(crate) fn emit_refill_index(
             root_page: index_root_page,
             db: database_id,
         });
-        rows.emit_each_row(program, |program, start_reg| {
+        rows.emit_each_row(program, database_id, tbl, |program, start_reg| {
             let record_reg = program.alloc_register();
             program.emit_insn(Insn::MakeRecord {
                 start_reg: to_u32(start_reg),
@@ -453,7 +535,7 @@ pub(crate) fn emit_refill_index(
             num_fields: columns.len() + 1,
         });
 
-        rows.emit_each_row(program, |program, start_reg| {
+        rows.emit_each_row(program, database_id, tbl, |program, start_reg| {
             let record_reg = program.alloc_register();
             program.emit_insn(Insn::MakeRecord {
                 start_reg: to_u32(start_reg),
@@ -505,6 +587,7 @@ pub(crate) fn emit_refill_index(
                 pc_when_nonequal: goto_label,
             });
             program.emit_insn(Insn::Halt {
+                constraint_info: None,
                 err_code: SQLITE_CONSTRAINT_UNIQUE,
                 description: format_unique_violation_desc(tbl_name.as_str(), idx),
                 on_error: None,

@@ -690,6 +690,7 @@ pub(crate) fn compute_hir_join_order(
     params: &CostModelParams,
     or_union: bool,
     hash: &HirHashJoins<'_>,
+    query_rows: &dyn Fn(crate::translate::semantic::hir::QueryId) -> Option<f64>,
 ) -> Result<Option<BestJoinOrderResult>> {
     if sources.len() <= 1 || sources.len() > HIR_EXHAUSTIVE_JOIN_LIMIT {
         return compute_hir_greedy_join_order(
@@ -708,6 +709,7 @@ pub(crate) fn compute_hir_join_order(
             params,
             or_union,
             hash,
+            query_rows,
         );
     }
     let ordering_restrictions = hir_join_ordering_restrictions(sources)?;
@@ -744,6 +746,7 @@ pub(crate) fn compute_hir_join_order(
             params,
             or_union,
             hash,
+            query_rows,
         )
     };
     let allowed = |position: usize, lhs_mask: &TableMask| {
@@ -1039,6 +1042,7 @@ pub(crate) fn compute_hir_greedy_join_order(
     params: &CostModelParams,
     or_union: bool,
     hash: &HirHashJoins<'_>,
+    query_rows: &dyn Fn(crate::translate::semantic::hir::QueryId) -> Option<f64>,
 ) -> Result<Option<BestJoinOrderResult>> {
     if sources.is_empty() {
         return Ok(None);
@@ -1097,6 +1101,7 @@ pub(crate) fn compute_hir_greedy_join_order(
             params,
             or_union,
             hash,
+            query_rows,
         )?;
         if first.is_some() {
             break;
@@ -1192,6 +1197,7 @@ pub(crate) fn compute_hir_greedy_join_order(
                 params,
                 or_union,
                 hash,
+                query_rows,
             )?
             else {
                 continue;
@@ -1280,6 +1286,7 @@ fn hir_join_step(
     params: &CostModelParams,
     or_union: bool,
     hash: &HirHashJoins<'_>,
+    query_rows: &dyn Fn(crate::translate::semantic::hir::QueryId) -> Option<f64>,
 ) -> Result<Option<HirJoinStep>> {
     #[cfg(test)]
     tests::JOIN_STEPS.with(|steps| steps.set(steps.get() + 1));
@@ -1342,6 +1349,7 @@ fn hir_join_step(
                         base_row_count,
                         schema,
                         params,
+                        query_rows,
                     )? {
                         let union_method = AccessMethod {
                             cost: Cost(union_cost.0 * input_cardinality),
@@ -2781,6 +2789,7 @@ mod tests {
             &DEFAULT_PARAMS,
             false,
             &HirHashJoins::NONE,
+            &|_| None,
         )?
         .expect("a B-tree source always has a join step");
 
@@ -2884,6 +2893,7 @@ mod tests {
             &DEFAULT_PARAMS,
             false,
             &HirHashJoins::NONE,
+            &|_| None,
         )?
         .expect("three HIR sources produce a join plan");
 
@@ -2967,6 +2977,7 @@ mod tests {
             &DEFAULT_PARAMS,
             false,
             &HirHashJoins::NONE,
+            &|_| None,
         )?
         .expect("one HIR source produces a join plan");
 
@@ -3051,6 +3062,7 @@ mod tests {
             &DEFAULT_PARAMS,
             false,
             &HirHashJoins::NONE,
+            &|_| None,
         )?
         .expect("eight HIR sources produce a join plan");
         let steps = JOIN_STEPS.with(|steps| steps.get());
@@ -3246,6 +3258,7 @@ mod tests {
             has_rowid: true,
             index_method: None,
             on_conflict: None,
+            constraint_name: None,
         })
     }
 

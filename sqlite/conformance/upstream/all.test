@@ -32,7 +32,7 @@ set test_files {
   affinity3            pass
   aggerror             fail
   aggnested            fail
-  aggorderby           fail
+  aggorderby           pass
   alias                fail
   alter                fail
   alter2               fail

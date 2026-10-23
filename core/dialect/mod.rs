@@ -33,6 +33,10 @@ pub trait Dialect: Send + Sync + 'static {
     /// reject an open whose dialect differs from the already-open instance.
     fn name(&self) -> &'static str;
 
+    fn format_error(&self, error: crate::LimboError) -> crate::LimboError {
+        error.into_sqlite_error()
+    }
+
     /// Parse the first statement in `sql` into the engine AST.
     ///
     /// Returns the parsed command, if any, and the number of input bytes
@@ -192,6 +196,13 @@ pub trait Dialect: Send + Sync + 'static {
     /// PostgreSQL raises an error so that the result does not depend on the
     /// order of the proposed rows. SQLite updates the row again.
     fn upsert_rejects_row_written_by_same_statement(&self) -> bool {
+        false
+    }
+
+    /// Whether integer division by zero raises an error.
+    ///
+    /// PostgreSQL raises SQLSTATE 22012. SQLite returns NULL.
+    fn errors_on_zero_divisor(&self) -> bool {
         false
     }
 }

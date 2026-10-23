@@ -1,0 +1,52 @@
+---
+source: indexes.sqltest
+expression: CREATE INDEX orders_user_status_placed ON orders(user_id, status, placed_at, id);
+info:
+  statement_type: CREATE INDEX
+  tables:
+  - orders
+  setup_blocks:
+  - orders_for_new_index
+  database: ':memory:'
+---
+QUERY PLAN
+
+
+BYTECODE
+addr  opcode          p1  p2  p3  p4                                                                                 p5  comment
+   0  Init             0  34   0                                                                                      0  Start at 34
+   1  CreateBtree      0   1   2                                                                                      0  r[1]=root iDb=0 flags=2
+   2  OpenWrite        0   1   0                                                                                      0  root=1; iDb=0
+   3  NewRowid         0   2   0                                                                                      0  r[2]=rowid
+   4  String8          0   3   0  index                                                                               0  r[3]='index'
+   5  String8          0   4   0  orders_user_status_placed                                                           0  r[4]='orders_user_status_placed'
+   6  String8          0   5   0  orders                                                                              0  r[5]='orders'
+   7  Copy             1   6   0                                                                                      0  r[6]=r[1]
+   8  String8          0   7   0  CREATE INDEX orders_user_status_placed ON orders (user_id, status, placed_at, id)   0  r[7]='CREATE INDEX orders_user_status_placed ON orders (user_id, status, placed_at, id)'
+   9  MakeRecord       3   5   8                                                                                      0  r[8]=mkrec(r[3..7])
+  10  Insert           0   8   2  orders                                                                              0  intkey=r[2] data=r[8]
+  11  SorterOpen       2   4   0  k(4,B,B,B,B)                                                                        0  cursor=2
+  12  OpenPseudo       3   9   5                                                                                      0  5 columns in r[9]
+  13  OpenRead         4   2   0  k(4,B,B,B,B)                                                                        0  table=orders, root=2, iDb=0
+  14  Rewind           4  21   0                                                                                      0  Rewind table orders
+  15    ColumnRange    4   1  10  3                                                                                   0  r[10..12]=orders.user_id..placed_at
+  16    RowId          4  13   0                                                                                      0  r[13]=orders.rowid
+  17    RowId          4  14   0                                                                                      0  r[14]=orders.rowid
+  18    MakeRecord    10   5  15                                                                                      0  r[15]=mkrec(r[10..14]); for orders_user_status_placed
+  19    SorterInsert   2  15   0  0                                                                                   0  key=r[15]
+  20  Next             4  15   0                                                                                      0
+  21  Close            4   0   0                                                                                      0
+  22  OpenWrite        1   1   0                                                                                      0  root=1; iDb=0
+  23  SorterSort       2  28   0                                                                                      0
+  24    SorterData     2   9   3                                                                                      0  r[9]=data
+  25    SeekEnd        1   0   0                                                                                      0
+  26    IdxInsert      1   9   0                                                                                      0  key=r[9]
+  27  SorterNext       2  24   0                                                                                      0
+  28  Close            1   0   0                                                                                      0
+  29  Close            2   0   0                                                                                      0
+  30  SetCookie        0   1   2                                                                                      0
+  31  ParseSchema      0   0   0  name = 'orders_user_status_placed' AND type = 'index'                               0  name = 'orders_user_status_placed' AND type = 'index'
+  32  Close            0   0   0                                                                                      0
+  33  Halt             0   0   0                                                                                      0
+  34  Transaction      0   2   1                                                                                      0  iDb=0 tx_mode=Write
+  35  Goto             0   1   0                                                                                      0

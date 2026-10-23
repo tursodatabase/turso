@@ -5,7 +5,7 @@ use turso_parser::ast;
 
 use crate::{
     error::SQLITE_CONSTRAINT_CHECK,
-    schema::{BTreeTable, Table, EXPR_INDEX_SENTINEL},
+    schema::{BTreeTable, Column, Index, Table, EXPR_INDEX_SENTINEL},
     sync::Arc,
     translate::{
         optimizer::HirBtreeOperation,
@@ -14,7 +14,7 @@ use crate::{
     },
     vdbe::{
         builder::{CursorType, ProgramBuilder, SourceBinding},
-        insn::{to_u32, InsertFlags, Insn, RegisterOrLiteral},
+        insn::{to_u32, ConstraintInfo, InsertFlags, Insn, RegisterOrLiteral},
         BranchOffset, CursorID,
     },
     Connection, LimboError, Result,
@@ -815,11 +815,12 @@ pub(super) fn emit_check_constraints<'c>(
     program: &mut ProgramBuilder,
     document: &HirDocument,
     constraints: impl IntoIterator<Item = &'c hir::CheckConstraint>,
+    row: ConstraintRow<'_>,
     or_conflict: ast::ResolveType,
     skip_row: BranchOffset,
 ) -> Result<()> {
     with_stored_values(program, |program| {
-        emit_check_constraint_list(program, document, constraints, or_conflict, skip_row)
+        emit_check_constraint_list(program, document, constraints, row, or_conflict, skip_row)
     })
 }
 
@@ -827,6 +828,7 @@ fn emit_check_constraint_list<'c>(
     program: &mut ProgramBuilder,
     document: &HirDocument,
     constraints: impl IntoIterator<Item = &'c hir::CheckConstraint>,
+    row: ConstraintRow<'_>,
     or_conflict: ast::ResolveType,
     skip_row: BranchOffset,
 ) -> Result<()> {
@@ -853,7 +855,14 @@ fn emit_check_constraint_list<'c>(
                 target_pc: skip_row,
             });
         } else {
+            let (registers, names) = row.named_columns(true);
             program.emit_insn(Insn::Halt {
+                constraint_info: Some(Box::new(ConstraintInfo::check(
+                    &row.table.name,
+                    constraint.name.clone(),
+                    registers,
+                    names,
+                ))),
                 err_code: SQLITE_CONSTRAINT_CHECK,
                 description: constraint.description.clone(),
                 on_error: program.constraint_halt_on_error(or_conflict),
@@ -1261,4 +1270,87 @@ pub(super) fn has_subquery(expression: &hir::Expr) -> bool {
         found |= matches!(expression, hir::Expr::Subquery(_));
     });
     found
+}
+
+#[derive(Clone, Copy)]
+pub(super) struct ConstraintRow<'a> {
+    pub(super) table: &'a BTreeTable,
+    pub(super) start: usize,
+    pub(super) rowid: usize,
+}
+
+impl ConstraintRow<'_> {
+    pub(super) fn named_columns(&self, with_virtual: bool) -> (Vec<usize>, Vec<String>) {
+        self.table
+            .columns()
+            .iter()
+            .enumerate()
+            .filter(|(_, column)| with_virtual || !column.is_virtual_generated())
+            .filter_map(|(position, column)| {
+                let register = if column.is_rowid_alias() {
+                    self.rowid
+                } else {
+                    self.start + position
+                };
+                column.name.clone().map(|name| (register, name))
+            })
+            .unzip()
+    }
+
+    pub(super) fn not_null(&self, column: &Column) -> Option<Box<ConstraintInfo>> {
+        let (registers, names) = self.named_columns(false);
+        Some(Box::new(ConstraintInfo {
+            kind: crate::ConstraintKind::NotNull,
+            constraint_name: None,
+            index_name: None,
+            table_name: self.table.name.clone(),
+            column_names: vec![column.name.clone().unwrap_or_default()],
+            violation_regs: registers,
+            row_col_names: names,
+            parent_table: None,
+        }))
+    }
+}
+
+pub(super) fn not_null_violation(
+    table: &BTreeTable,
+    column: &Column,
+) -> Option<Box<ConstraintInfo>> {
+    Some(Box::new(ConstraintInfo::not_null(
+        &table.name,
+        column.name.clone().unwrap_or_default(),
+    )))
+}
+
+pub(super) fn rowid_violation(table: &BTreeTable, rowid: usize) -> Option<Box<ConstraintInfo>> {
+    let column = table
+        .get_rowid_alias_column()
+        .and_then(|(_, column)| column.name.clone())
+        .unwrap_or_else(|| "rowid".to_string());
+    primary_key_violation(table, vec![column], vec![rowid])
+}
+
+pub(super) fn primary_key_violation(
+    table: &BTreeTable,
+    columns: Vec<String>,
+    registers: Vec<usize>,
+) -> Option<Box<ConstraintInfo>> {
+    Some(Box::new(ConstraintInfo::primary_key(
+        &table.name,
+        table.primary_key_constraint_name.clone(),
+        columns,
+        registers,
+    )))
+}
+
+pub(super) fn unique_violation(
+    table: &BTreeTable,
+    index: &Index,
+    start: usize,
+) -> Option<Box<ConstraintInfo>> {
+    Some(Box::new(ConstraintInfo::unique_index(
+        &table.name,
+        index,
+        (start..start + index.columns.len()).collect(),
+    )))
 }

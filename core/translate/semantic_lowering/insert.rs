@@ -1005,6 +1005,7 @@ impl InsertRow<'_> {
                 program,
                 document,
                 self.check_constraints(self.target.source.id)?,
+                self.row(),
                 self.or_conflict,
                 row_done,
             )?;
@@ -1266,6 +1267,7 @@ impl InsertRow<'_> {
                 target_pc: not_written,
             });
             program.emit_insn(Insn::Halt {
+                constraint_info: None,
                 err_code: SQLITE_ERROR,
                 description: "ON CONFLICT DO UPDATE command cannot affect row a second time"
                     .to_string(),
@@ -1327,6 +1329,7 @@ impl InsertRow<'_> {
                     )?;
                     if column.notnull() && !column.is_rowid_alias() {
                         program.emit_insn(Insn::HaltIfNull {
+                            constraint_info: None,
                             target_reg: register,
                             err_code: SQLITE_CONSTRAINT_NOTNULL,
                             on_error: None,
@@ -1395,6 +1398,11 @@ impl InsertRow<'_> {
                 program,
                 document,
                 self.check_constraints(new_source.id)?,
+                super::dml::ConstraintRow {
+                    table,
+                    start: new_row,
+                    rowid: written,
+                },
                 ResolveType::Abort,
                 row_done,
             )?;
@@ -1509,6 +1517,7 @@ impl InsertRow<'_> {
                 .and_then(|column| column.name.as_deref())
                 .unwrap_or("rowid");
             program.emit_insn(Insn::Halt {
+                constraint_info: super::dml::rowid_violation(table, new_rowid),
                 err_code: SQLITE_CONSTRAINT_PRIMARYKEY,
                 description: format!("{}.{column}", table.name),
                 on_error: None,
@@ -1531,6 +1540,7 @@ impl InsertRow<'_> {
             let column = &table.columns()[position];
             if column.is_virtual_generated() && column.notnull() {
                 program.emit_insn(Insn::HaltIfNull {
+                    constraint_info: None,
                     target_reg: new_row + position,
                     err_code: SQLITE_CONSTRAINT_NOTNULL,
                     on_error: None,
@@ -1719,10 +1729,37 @@ impl InsertRow<'_> {
                     flags: CmpInsFlags::default(),
                     collation: program.curr_collation(),
                 });
-                // A conflict in another row is reported as a PRIMARY KEY
-                // failure.
+                let primary_key = !table.primary_key_columns.is_empty()
+                    && index
+                        .columns
+                        .iter()
+                        .map(|column| column.name.as_str())
+                        .eq(table
+                            .primary_key_columns
+                            .iter()
+                            .map(|(name, _)| name.as_str()));
+                let (constraint_info, err_code) = if primary_key {
+                    (
+                        super::dml::primary_key_violation(
+                            table,
+                            index
+                                .columns
+                                .iter()
+                                .map(|column| column.name.clone())
+                                .collect(),
+                            (start..start + width).collect(),
+                        ),
+                        SQLITE_CONSTRAINT_PRIMARYKEY,
+                    )
+                } else {
+                    (
+                        super::dml::unique_violation(table, index, start),
+                        SQLITE_CONSTRAINT_UNIQUE,
+                    )
+                };
                 program.emit_insn(Insn::Halt {
-                    err_code: SQLITE_CONSTRAINT_PRIMARYKEY,
+                    constraint_info,
+                    err_code,
                     description: format_unique_violation_desc(&table.name, index),
                     on_error: None,
                     description_reg: None,
@@ -1957,6 +1994,14 @@ impl InsertRow<'_> {
                 .any(|index| index.index.value().on_conflict == Some(ResolveType::Replace))
     }
 
+    fn row(&self) -> super::dml::ConstraintRow<'_> {
+        super::dml::ConstraintRow {
+            table: self.target.table,
+            start: self.columns,
+            rowid: self.rowid,
+        }
+    }
+
     /// The CHECK constraints analysis froze for `source`.
     fn check_constraints(&self, source: hir::SourceId) -> Result<&[hir::CheckConstraint]> {
         self.target
@@ -2050,6 +2095,7 @@ impl InsertRow<'_> {
                 target_pc: row_done,
             }),
             _ => program.emit_insn(Insn::HaltIfNull {
+                constraint_info: self.row().not_null(column),
                 target_reg: register,
                 err_code: SQLITE_CONSTRAINT_NOTNULL,
                 on_error: program.constraint_halt_on_error(conflict),
@@ -2156,6 +2202,7 @@ impl InsertRow<'_> {
                     .and_then(|(_, column)| column.name.clone())
                     .unwrap_or_else(|| "rowid".to_string());
                 program.emit_insn(Insn::Halt {
+                    constraint_info: super::dml::rowid_violation(table, self.rowid),
                     err_code: SQLITE_CONSTRAINT_PRIMARYKEY,
                     description: format!("{}.{column}", table.name),
                     on_error: program.constraint_halt_on_error(conflict),
@@ -2227,6 +2274,15 @@ impl InsertRow<'_> {
                     .collect::<Vec<_>>()
                     .join(", ");
                 program.emit_insn(Insn::Halt {
+                    constraint_info: super::dml::primary_key_violation(
+                        table,
+                        table
+                            .primary_key_columns
+                            .iter()
+                            .map(|(name, _)| name.clone())
+                            .collect(),
+                        (key..key + positions.len()).collect(),
+                    ),
                     err_code: SQLITE_CONSTRAINT_PRIMARYKEY,
                     description: columns,
                     on_error: program.constraint_halt_on_error(conflict),
@@ -2362,6 +2418,7 @@ impl InsertRow<'_> {
                 }
                 conflict => {
                     program.emit_insn(Insn::Halt {
+                        constraint_info: super::dml::unique_violation(table, index, start),
                         err_code: SQLITE_CONSTRAINT_UNIQUE,
                         description: format_unique_violation_desc(&table.name, index),
                         on_error: program.constraint_halt_on_error(conflict),

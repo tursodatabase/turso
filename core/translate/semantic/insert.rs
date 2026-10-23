@@ -417,6 +417,7 @@ impl<'ast> Analyzer<'_, '_, 'ast> {
                 catalog_position,
                 expression: self.analyze_expr(&constraint.expr, &scope, policy)?,
                 description: constraint.error_description(),
+                name: constraint.name.clone(),
             });
         }
 

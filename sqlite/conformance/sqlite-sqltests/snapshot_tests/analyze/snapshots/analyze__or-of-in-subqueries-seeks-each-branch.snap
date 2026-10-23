@@ -1,0 +1,22 @@
+---
+source: analyze.sqltest
+expression: |-
+  SELECT n.id FROM node n
+      WHERE n.type = 'lecture'
+        AND (n.id IN (SELECT e.fromId FROM edge e WHERE e.label = 'requires' AND e.toId = 'n5')
+          OR n.id IN (SELECT e.toId FROM edge e WHERE e.label = 'requires' AND e.fromId = 'n5'));
+info:
+  statement_type: SELECT
+  tables:
+  - edge
+  - node
+  setup_blocks:
+  - analyzed_graph
+  database: ':memory:'
+---
+QUERY PLAN
+|--MULTI-INDEX OR n (sqlite_autoindex_node_1, sqlite_autoindex_node_1)
+|--LIST SUBQUERY 1
+|  `--SEARCH e USING INDEX idx_edge_toid (toId=?)
+`--LIST SUBQUERY 2
+   `--SEARCH e USING INDEX idx_edge_fromid (fromId=?)

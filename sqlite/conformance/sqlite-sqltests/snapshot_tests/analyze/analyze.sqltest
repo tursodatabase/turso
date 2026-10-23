@@ -440,3 +440,25 @@ snapshot join-aggregate-after-analyze {
     JOIN purchases p ON c.id = p.customer_id
     GROUP BY c.id;
 }
+
+setup analyzed_graph {
+    CREATE TABLE node (id TEXT PRIMARY KEY, type TEXT NOT NULL, createdAt TEXT);
+    CREATE TABLE edge (id INTEGER PRIMARY KEY, fromId TEXT NOT NULL, toId TEXT NOT NULL, label TEXT NOT NULL);
+    CREATE INDEX idx_edge_toId ON edge (toId);
+    CREATE INDEX idx_edge_fromId ON edge (fromId);
+    WITH RECURSIVE n(i) AS (VALUES(1) UNION ALL SELECT i + 1 FROM n WHERE i < 2000)
+    INSERT INTO node SELECT 'n' || i, CASE i % 3 WHEN 0 THEN 'lecture' ELSE 'course' END, 'd' || i FROM n;
+    WITH RECURSIVE n(i) AS (VALUES(1) UNION ALL SELECT i + 1 FROM n WHERE i < 2500)
+    INSERT INTO edge (fromId, toId, label) SELECT 'n' || (i % 2000 + 1), 'n' || ((i * 7) % 2000 + 1), 'requires' FROM n;
+    ANALYZE;
+}
+
+# Each IN subquery returns a few rows, so each OR branch seeks the node
+# primary key with them instead of scanning every node.
+@setup analyzed_graph
+snapshot-eqp or-of-in-subqueries-seeks-each-branch {
+    SELECT n.id FROM node n
+    WHERE n.type = 'lecture'
+      AND (n.id IN (SELECT e.fromId FROM edge e WHERE e.label = 'requires' AND e.toId = 'n5')
+        OR n.id IN (SELECT e.toId FROM edge e WHERE e.label = 'requires' AND e.fromId = 'n5'));
+}

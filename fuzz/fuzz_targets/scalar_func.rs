@@ -450,7 +450,7 @@ fn execute_scalar_func(call: ScalarFuncCall) {
             let v1: CoreValue = v1.into();
             let v2: CoreValue = v2.into();
             let math_func: MathFunc = func.into();
-            let _ = v1.exec_math_binary(&v2, &math_func);
+            let _ = v1.exec_math_binary(&v2, &math_func, false);
         }
         ScalarFuncCall::MathLog(val, base) => {
             let v: CoreValue = val.into();

@@ -1005,6 +1005,7 @@ pub fn insn_to_row(
                 description,
                 on_error,
                 description_reg,
+                ..
             } => {
                 let p3 = description_reg.unwrap_or(0) as i64;
                 (
@@ -1022,6 +1023,7 @@ pub fn insn_to_row(
                 target_reg,
                 description,
                 on_error,
+                ..
             } => (
                 "HaltIfNull",
                 *err_code as i64,
@@ -2586,7 +2588,7 @@ pub fn insn_to_row(
             0,
             String::new(),
         ),
-        Insn::FkCounter{increment_value, deferred } => (
+        Insn::FkCounter{increment_value, deferred, .. } => (
         "FkCounter",
             *increment_value as i64,
             *deferred as i64,

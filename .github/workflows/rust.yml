@@ -465,7 +465,7 @@ jobs:
       matrix:
         # Each profile focuses a different workload so CI covers more than the
         # default statement distribution.
-        profile: [balanced, ddl, triggers, writes, correlated-subqueries, joins]
+        profile: [balanced, ddl, triggers, writes, correlated-subqueries, joins, ordered-aggregates]
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable

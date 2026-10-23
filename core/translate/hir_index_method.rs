@@ -170,10 +170,10 @@ fn match_pattern(
         captures: HashMap::default(),
         fields: None,
     };
+    if (applies_order_by || applies_limit) && pattern.order_by.len() != query.order_by.len() {
+        return None;
+    }
     if applies_order_by {
-        if pattern.order_by.len() != query.order_by.len() {
-            return None;
-        }
         for (pattern_term, query_term) in pattern.order_by.iter().zip(query.order_by) {
             if query_term.order != pattern_term.order.unwrap_or(SortOrder::Asc)
                 || query_term.nulls.is_some()

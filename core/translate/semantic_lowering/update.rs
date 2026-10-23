@@ -1576,6 +1576,11 @@ impl UpdateRow<'_, '_> {
             program,
             document,
             layout.checks.iter().copied(),
+            super::dml::ConstraintRow {
+                table,
+                start: self.start(),
+                rowid: self.written_rowid(),
+            },
             self.or_conflict,
             self.skip_row,
         )?;
@@ -1986,6 +1991,7 @@ impl UpdateRow<'_, '_> {
                 target_pc: self.skip_row,
             }),
             _ => program.emit_insn(Insn::HaltIfNull {
+                constraint_info: super::dml::not_null_violation(self.target.table, column),
                 target_reg: register,
                 err_code: SQLITE_CONSTRAINT_NOTNULL,
                 on_error: program.constraint_halt_on_error(conflict),
@@ -2163,6 +2169,7 @@ impl UpdateRow<'_, '_> {
                     .and_then(|column| column.name.as_deref())
                     .unwrap_or("rowid");
                 program.emit_insn(Insn::Halt {
+                    constraint_info: super::dml::rowid_violation(table, new_rowid),
                     err_code: SQLITE_CONSTRAINT_PRIMARYKEY,
                     description: format!("{}.{column}", table.name),
                     on_error: program.constraint_halt_on_error(conflict),
@@ -2299,6 +2306,7 @@ impl UpdateRow<'_, '_> {
                     .collect::<Vec<_>>()
                     .join(", ");
                 program.emit_insn(Insn::Halt {
+                    constraint_info: super::dml::unique_violation(self.target.table, index, start),
                     err_code: SQLITE_CONSTRAINT_UNIQUE,
                     description: columns,
                     on_error: program.constraint_halt_on_error(conflict),
@@ -2364,6 +2372,7 @@ mod tests {
             .unwrap();
         schema
             .add_index(Arc::new(Index {
+                constraint_name: None,
                 name: "items_value".to_string(),
                 table_name: "items".to_string(),
                 root_page: 3,
