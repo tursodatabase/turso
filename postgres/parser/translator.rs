@@ -4397,12 +4397,12 @@ impl PostgreSQLTranslator {
         limit_offset: &Option<Box<pg_query::protobuf::Node>>,
     ) -> Result<Option<ast::Limit>, ParseError> {
         let count = match limit_count {
-            Some(node) => Some(Box::new(self.translate_expr(node)?)),
+            Some(node) => self.translate_limit_value(node, "LIMIT", "-1")?,
             None => None,
         };
 
         let offset = match limit_offset {
-            Some(node) => Some(Box::new(self.translate_expr(node)?)),
+            Some(node) => self.translate_limit_value(node, "OFFSET", "0")?,
             None => None,
         };
 
@@ -4419,6 +4419,38 @@ impl PostgreSQLTranslator {
             }
             (None, None) => Ok(None),
         }
+    }
+
+    /// Non-negative integer literals are kept as written because the planner
+    /// optimizes literal limits.
+    fn translate_limit_value(
+        &self,
+        node: &pg_query::protobuf::Node,
+        clause: &str,
+        when_null: &str,
+    ) -> Result<Option<Box<ast::Expr>>, ParseError> {
+        let value = self.translate_expr(node)?;
+        match &value {
+            ast::Expr::Literal(ast::Literal::Null) => return Ok(None),
+            ast::Expr::Literal(ast::Literal::Numeric(n))
+                if n.parse::<i64>().is_ok_and(|n| n >= 0) =>
+            {
+                return Ok(Some(Box::new(value)));
+            }
+            _ => {}
+        }
+        let checked_value = function_call(
+            "pg_limit_value",
+            vec![
+                value,
+                ast::Expr::Literal(ast::Literal::String(format!("'{clause}'"))),
+            ],
+        );
+        let no_limit = ast::Expr::Literal(ast::Literal::Numeric(when_null.into()));
+        Ok(Some(Box::new(function_call(
+            "coalesce",
+            vec![checked_value, no_limit],
+        ))))
     }
 
     fn translate_returning(

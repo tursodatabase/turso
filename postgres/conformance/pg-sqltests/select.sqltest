@@ -1056,3 +1056,139 @@ expect {
     2
     3
 }
+
+test limit-negative-is-an-error {
+    SELECT * FROM generate_series(1, 3) LIMIT -1;
+}
+expect error {
+    LIMIT must not be negative
+}
+
+test offset-negative-is-an-error {
+    SELECT * FROM generate_series(1, 3) OFFSET -1;
+}
+expect error {
+    OFFSET must not be negative
+}
+
+test limit-negative-from-subquery-is-an-error {
+    SELECT * FROM generate_series(1, 3) LIMIT (SELECT -1);
+}
+expect error {
+    LIMIT must not be negative
+}
+
+test offset-negative-from-subquery-is-an-error {
+    SELECT * FROM generate_series(1, 3) OFFSET (SELECT -1);
+}
+expect error {
+    OFFSET must not be negative
+}
+
+test limit-all-and-null-return-every-row {
+    SELECT * FROM generate_series(1, 3) LIMIT ALL;
+    SELECT * FROM generate_series(1, 3) LIMIT NULL;
+    SELECT * FROM generate_series(1, 3) LIMIT (SELECT NULL::int);
+}
+expect {
+    1
+    2
+    3
+    1
+    2
+    3
+    1
+    2
+    3
+}
+
+test offset-null-skips-no-rows {
+    SELECT * FROM generate_series(1, 3) OFFSET NULL;
+    SELECT * FROM generate_series(1, 3) LIMIT ALL OFFSET 1;
+}
+expect {
+    1
+    2
+    3
+    2
+    3
+}
+
+test limit-and-offset-fractions-round-half-away-from-zero {
+    SELECT * FROM generate_series(1, 3) LIMIT 1.5;
+    SELECT * FROM generate_series(1, 3) LIMIT 2.5;
+    SELECT * FROM generate_series(1, 3) OFFSET 1.5;
+    SELECT count(*) FROM (SELECT * FROM generate_series(1, 3) LIMIT -0.4) AS s;
+}
+expect {
+    1
+    2
+    1
+    2
+    3
+    3
+    0
+}
+
+test limit-expression-is-evaluated-once {
+    CREATE SEQUENCE limit_calls;
+    SELECT * FROM generate_series(1, 5) LIMIT nextval('limit_calls') + 0.5;
+    SELECT currval('limit_calls');
+    DROP SEQUENCE limit_calls;
+}
+expect {
+    1
+    2
+    1
+}
+
+test compound-select-limit-and-offset-expressions {
+    SELECT 1 UNION ALL SELECT 2 UNION ALL SELECT 3 LIMIT 1 + 1;
+    SELECT 1 UNION ALL SELECT 2 UNION ALL SELECT 3 ORDER BY 1 LIMIT 1 + 1;
+    SELECT 1 UNION ALL SELECT 2 UNION ALL SELECT 3 LIMIT 2 OFFSET 0 + 1;
+}
+expect {
+    1
+    2
+    1
+    2
+    2
+    3
+}
+
+test compound-select-limit-all-null-and-fractions {
+    SELECT 1 UNION ALL SELECT 2 UNION ALL SELECT 3 LIMIT ALL;
+    SELECT 1 UNION ALL SELECT 2 UNION ALL SELECT 3 OFFSET NULL;
+    SELECT 1 UNION ALL SELECT 2 UNION ALL SELECT 3 LIMIT 1.5;
+}
+expect {
+    1
+    2
+    3
+    1
+    2
+    3
+    1
+    2
+}
+
+test compound-select-limit-negative-is-an-error {
+    SELECT 1 UNION ALL SELECT 2 UNION ALL SELECT 3 LIMIT -1;
+}
+expect error {
+    LIMIT must not be negative
+}
+
+test compound-select-offset-negative-is-an-error {
+    SELECT 1 UNION SELECT 2 UNION SELECT 3 ORDER BY 1 OFFSET -1;
+}
+expect error {
+    OFFSET must not be negative
+}
+
+test limit-out-of-bigint-range-is-an-error {
+    SELECT * FROM generate_series(1, 3) LIMIT 9223372036854775808;
+}
+expect error {
+    bigint out of range
+}
