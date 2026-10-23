@@ -80,7 +80,7 @@ impl StatementOrigin {
 ///
 /// Returned by [`Statement::get_column_type_info`]. Surfaces the array depth
 /// and custom-type resolution that the SQLite-compat `get_column_decltype`
-/// API does not expose, and also carries the inferred-affinity result for
+/// API does not expose, and also carries an inferred result primitive for
 /// computed expressions (`SELECT 1+1`, function calls in subqueries, etc.)
 /// — the consumer asks one question, the API decides which path applies.
 ///
@@ -93,7 +93,10 @@ impl StatementOrigin {
 /// is the primitive that matches the literal's parsed value type
 /// (`"INTEGER"`, `"TEXT"`, `"REAL"`). For a typed expression — CAST, rowid,
 /// or anything else SQLite's affinity rules can pin down — it's the
-/// inferred primitive. In both cases `array_dimensions` is `0`, `base_type`
+/// inferred primitive. Arithmetic and common-value expressions preserve the
+/// `BIGINT` width of a referenced `BIGINT` or `INT8` column rather than
+/// collapsing it to SQLite's integer affinity. In both cases
+/// `array_dimensions` is `0`, `base_type`
 /// is `None`, and `kind` is [`ColumnTypeKind::Builtin`]. When neither path
 /// produces a usable primitive (binary arithmetic that SQLite refuses to
 /// propagate through, BLOB literals, NULL literals, function calls without
@@ -167,17 +170,17 @@ pub enum ColumnTypeKind {
     Union,
 }
 
-/// Recursively infer the result primitive of a non-table-column expression
-/// and return its uppercase name (`"INTEGER"`, `"REAL"`, `"TEXT"`,
-/// `"NUMERIC"`, `"BLOB"`) or `None` when no determination can be made.
+/// Recursively infer the result primitive of an expression and return its
+/// uppercase name (`"INTEGER"`, `"BIGINT"`, `"REAL"`, `"TEXT"`, `"NUMERIC"`,
+/// `"BLOB"`) or `None` when no determination can be made.
 ///
 /// Used by [`Statement::get_column_type_info`] to give wire-protocol layers
 /// a usable type for `SELECT 1+1`-style result columns. Goes beyond SQLite's
 /// `get_expr_affinity` (which deliberately stops at binary operators because
 /// SQLite's affinity model is about *column* coercion, not expression
 /// inference) by walking through arithmetic, bitwise, comparison, logical,
-/// and concat operators — letting `SELECT 42 + 1` report INT4 to a
-/// PostgreSQL client the way PG itself does.
+/// and concat operators — letting `SELECT 42 + 1` report INT4 while retaining
+/// INT8 for integer-width expressions over BIGINT columns.
 fn infer_expression_primitive(
     expr: &turso_parser::ast::Expr,
     referenced_tables: Option<&translate::plan::TableReferences>,
@@ -209,8 +212,8 @@ fn infer_expression_primitive(
             UnaryOperator::Positive => infer_expression_primitive(inner, referenced_tables),
         },
         Expr::Binary(left, op, right) => match op {
-            // Arithmetic: widen INTEGER × INTEGER to INTEGER, anything mixed
-            // with REAL becomes REAL, fall through to NUMERIC otherwise.
+            // Arithmetic preserves BIGINT width, keeps INTEGER arithmetic as
+            // INTEGER, widens mixtures with REAL, and otherwise uses NUMERIC.
             Operator::Add
             | Operator::Subtract
             | Operator::Multiply
@@ -250,6 +253,25 @@ fn infer_expression_primitive(
                 translate::expr::get_expr_affinity(expr, referenced_tables, None),
             ),
         },
+        Expr::Column { table, column, .. } => {
+            let is_bigint = referenced_tables
+                .and_then(|tables| tables.find_table_by_internal_id(*table))
+                .and_then(|(_, table)| table.get_column_at(*column))
+                .is_some_and(|column| {
+                    column.array_dimensions() == 0
+                        && (column.ty_str.eq_ignore_ascii_case("BIGINT")
+                            || column.ty_str.eq_ignore_ascii_case("INT8"))
+                });
+            if is_bigint {
+                Some("BIGINT")
+            } else {
+                affinity_to_primitive(translate::expr::get_expr_affinity(
+                    expr,
+                    referenced_tables,
+                    None,
+                ))
+            }
+        }
         Expr::RowId { .. } => Some("INTEGER"),
         Expr::Case {
             when_then_pairs,
@@ -298,7 +320,7 @@ fn common_primitive<'a>(
 ) -> Option<&'static str> {
     use turso_parser::ast::{Expr, Literal};
 
-    let is_numeric = |primitive| matches!(primitive, "INTEGER" | "REAL" | "NUMERIC");
+    let is_numeric = |primitive| matches!(primitive, "INTEGER" | "BIGINT" | "REAL" | "NUMERIC");
     let mut common = None;
     for expr in exprs.filter(|expr| !matches!(expr, Expr::Literal(Literal::Null))) {
         let primitive = infer_expression_primitive(expr, referenced_tables)?;
@@ -328,17 +350,22 @@ fn affinity_to_primitive(affinity: crate::vdbe::affinity::Affinity) -> Option<&'
 }
 
 /// Pick the widening primitive for an arithmetic binary op given each
-/// operand's inferred primitive. `INTEGER + INTEGER -> INTEGER`,
-/// `INTEGER + REAL -> REAL`, everything else collapses to `NUMERIC` (the
-/// safe wire default for a mixed-affinity numeric result).
+/// operand's inferred primitive. `INTEGER + INTEGER -> INTEGER`, an integer
+/// operation with a `BIGINT` operand -> `BIGINT`, mixtures with `REAL` ->
+/// `REAL`, and other combinations -> `NUMERIC`.
 fn combine_arithmetic_primitive(
     left: Option<&'static str>,
     right: Option<&'static str>,
 ) -> &'static str {
     match (left, right) {
         (Some("INTEGER"), Some("INTEGER")) => "INTEGER",
+        (Some("INTEGER"), Some("BIGINT"))
+        | (Some("BIGINT"), Some("INTEGER"))
+        | (Some("BIGINT"), Some("BIGINT")) => "BIGINT",
         (Some("INTEGER"), Some("REAL"))
         | (Some("REAL"), Some("INTEGER"))
+        | (Some("BIGINT"), Some("REAL"))
+        | (Some("REAL"), Some("BIGINT"))
         | (Some("REAL"), Some("REAL")) => "REAL",
         _ => "NUMERIC",
     }

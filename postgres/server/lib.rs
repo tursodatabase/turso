@@ -831,6 +831,32 @@ mod tests {
     }
 
     #[test]
+    fn test_bigint_column_expressions_are_int8_on_wire() {
+        let (_io, db) = turso_pg::open_database(
+            ":memory:",
+            None,
+            turso_pg::OpenFlags::default(),
+            turso_pg::DatabaseOpts::new(),
+        )
+        .unwrap();
+        let conn = Connection::connect(&db).unwrap();
+        conn.execute("CREATE TABLE t(id int PRIMARY KEY, b bigint)")
+            .unwrap();
+        conn.execute("INSERT INTO t VALUES (1, 5000000000)")
+            .unwrap();
+
+        for sql in [
+            "SELECT b FROM t",
+            "SELECT b * 2 FROM t",
+            "SELECT coalesce(b, 1) FROM t",
+        ] {
+            let stmt = conn.prepare(sql).unwrap();
+            let fields = build_field_info(&stmt, &Format::UnifiedText);
+            assert_eq!(*fields[0].datatype(), Type::INT8, "{sql}");
+        }
+    }
+
+    #[test]
     fn test_set_transaction_is_non_query() {
         assert!(is_pg_non_query(
             "SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY"
