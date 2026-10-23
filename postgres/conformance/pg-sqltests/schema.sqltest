@@ -557,3 +557,17 @@ test index-definition-names-the-schema-of-its-table {
 expect {
     CREATE INDEX i ON app.t USING btree (x)
 }
+
+test column-named-with-its-schema-reads-the-outer-table-in-a-subquery {
+    CREATE SCHEMA app;
+    CREATE TABLE app.t (x int);
+    CREATE TABLE t (x int);
+    INSERT INTO app.t VALUES (1);
+    INSERT INTO t VALUES (2);
+    SELECT (SELECT app.t.x FROM public.t) FROM app.t;
+    SELECT (SELECT public.t.x FROM app.t) FROM public.t;
+}
+expect {
+    1
+    2
+}

@@ -1794,6 +1794,8 @@ pub struct OuterQueryReference {
     pub internal_id: TableInternalId,
     /// Table object, which contains metadata about the table, e.g. columns.
     pub table: Table,
+    /// The database the table is in.
+    pub database_id: usize,
     /// The join that added this table in the outer scope's FROM list, so an
     /// unqualified name follows the same USING rules there as it does in the
     /// outer query itself (see [unqualified_column_sources]). None for the

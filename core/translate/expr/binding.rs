@@ -1,7 +1,7 @@
 use super::*;
 use crate::translate::plan::{
     merge_columns, resolve_unqualified_column, unqualified_column_sources, ColumnLookup,
-    JoinedTable, OuterQueryReference, ResolvedColumn,
+    OuterQueryReference, ResolvedColumn,
 };
 use crate::Namespace;
 
@@ -737,7 +737,14 @@ fn resolve_qualified_name(
             &joined_table.table,
             joined_table.internal_id,
             &joined_table.identifier,
-            namespace.filter(|namespace| !table_is_in_namespace(resolver, joined_table, namespace)),
+            namespace.filter(|namespace| {
+                !table_is_in_namespace(
+                    resolver,
+                    &joined_table.table,
+                    joined_table.database_id,
+                    namespace,
+                )
+            }),
             table_name,
             column_name,
         )?;
@@ -782,7 +789,9 @@ fn resolve_qualified_name(
             &outer_ref.table,
             outer_ref.internal_id,
             &outer_ref.identifier,
-            namespace,
+            namespace.filter(|namespace| {
+                !table_is_in_namespace(resolver, &outer_ref.table, outer_ref.database_id, namespace)
+            }),
             table_name,
             column_name,
         )?;
@@ -828,13 +837,14 @@ fn resolve_qualified_name(
 
 fn table_is_in_namespace(
     resolver: &Resolver<'_>,
-    joined_table: &JoinedTable,
+    table: &Table,
+    database_id: usize,
     namespace: &Namespace,
 ) -> bool {
-    matches!(joined_table.table, Table::BTree(_) | Table::Virtual(_))
-        && joined_table.database_id == namespace.database_id
+    matches!(table, Table::BTree(_) | Table::Virtual(_))
+        && database_id == namespace.database_id
         && resolver
-            .namespace_of_stored_name(joined_table.database_id, joined_table.table.get_name())
+            .namespace_of_stored_name(database_id, table.get_name())
             .holds_the_same_objects_as(namespace)
 }
 

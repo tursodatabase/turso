@@ -5439,6 +5439,8 @@ mod tests {
             ("SELECT main.t.x FROM app.t JOIN main.t", 2),
             ("SELECT app.t.x FROM (app.t JOIN main.t)", 1),
             ("SELECT main.t.x FROM (app.t JOIN main.t)", 2),
+            ("SELECT (SELECT app.t.x FROM main.t) FROM app.t", 1),
+            ("SELECT (SELECT main.t.x FROM app.t) FROM main.t", 2),
         ] {
             assert_eq!(query_single_i64(&conn, sql), expected, "{sql}");
         }
