@@ -2655,6 +2655,32 @@ mod tests {
         assert_eq!(scope_count("CREATE INDEX i ON t(a) WHERE b > 0"), 2);
     }
 
+    #[test]
+    fn select_star_with_where_copies_each_column_binding_once() {
+        let mut schema = Schema::new();
+        let columns: Vec<String> = (0..64).map(|column| format!("c{column} INTEGER")).collect();
+        let table = BTreeTable::from_sql(
+            &format!(
+                "CREATE TABLE wide(id INTEGER PRIMARY KEY, {})",
+                columns.join(", ")
+            ),
+            2,
+        )
+        .expect("table schema parses");
+        schema
+            .add_btree_table(Arc::new(table))
+            .expect("table name is unique");
+        crate::translate::semantic::scope::tests::COLUMN_BINDINGS_COPIED
+            .with(|copied| copied.set(0));
+        analyze_sql_with_schema(&schema, "SELECT * FROM wide WHERE id = 1")
+            .expect("SELECT analyzes");
+        let copied = crate::translate::semantic::scope::tests::COLUMN_BINDINGS_COPIED
+            .with(|copied| copied.get());
+
+        // Adding the table makes its columns visible by copying each one.
+        assert_eq!(copied, 65);
+    }
+
     fn schema_with_custom_columns() -> Schema {
         let mut schema = Schema::new();
         for sql in [

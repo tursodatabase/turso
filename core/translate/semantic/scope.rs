@@ -99,7 +99,7 @@ pub(crate) struct ExpandedColumn {
     pub(crate) resolved: ResolvedScopeExpr,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 struct ColumnBinding {
     source: SourceId,
     display_name: String,
@@ -113,6 +113,22 @@ struct ColumnBinding {
     /// or for a column of a join group the unique name the group gave it,
     /// since SQLite looks the group's subquery up by column name.
     using_name: String,
+}
+
+impl Clone for ColumnBinding {
+    fn clone(&self) -> Self {
+        #[cfg(test)]
+        tests::COLUMN_BINDINGS_COPIED.with(|copied| copied.set(copied.get() + 1));
+        Self {
+            source: self.source,
+            display_name: self.display_name.clone(),
+            lookup_name: self.lookup_name.clone(),
+            resolved: self.resolved.clone(),
+            hidden: self.hidden,
+            rowid_names: self.rowid_names,
+            using_name: self.using_name.clone(),
+        }
+    }
 }
 
 impl ColumnBinding {
@@ -285,8 +301,8 @@ struct ScopeOutput {
 /// Source namespace visible from one query block.
 #[derive(Clone, Debug, Default)]
 pub(crate) struct Scope {
-    sources: Vec<ScopeSource>,
-    visible_columns: Vec<ColumnBinding>,
+    sources: Arc<Vec<ScopeSource>>,
+    visible_columns: Arc<Vec<ColumnBinding>>,
     outputs: Vec<ScopeOutput>,
     outer: Option<Arc<Scope>>,
     outer_resolution_blocked: bool,
@@ -340,9 +356,9 @@ impl Scope {
             .map(|(index, column)| ColumnBinding::from_source(source, index, column))
             .collect();
         if unqualified {
-            self.visible_columns.extend(columns.iter().cloned());
+            Arc::make_mut(&mut self.visible_columns).extend(columns.iter().cloned());
         }
-        self.sources.push(ScopeSource {
+        Arc::make_mut(&mut self.sources).push(ScopeSource {
             id: source.id,
             qualifier: crate::util::normalize_ident(
                 source.alias.as_deref().unwrap_or(&source.name),
@@ -370,7 +386,9 @@ impl Scope {
             "every column of a join group has a saved origin"
         );
         self.add_source(source, false);
-        let added = self.sources.last_mut().expect("source was just added");
+        let added = Arc::make_mut(&mut self.sources)
+            .last_mut()
+            .expect("source was just added");
         added.unqualified = true;
         for (column, saved) in added.columns.iter().zip(&saved) {
             if saved.visibility == GroupColumnVisibility::QualifiedOnly {
@@ -388,7 +406,7 @@ impl Scope {
                     visible.hidden = true;
                 }
             }
-            self.visible_columns.push(visible);
+            Arc::make_mut(&mut self.visible_columns).push(visible);
         }
         added.saved = Some(saved);
     }
@@ -532,7 +550,10 @@ impl Scope {
     /// values. `names` are the USING column names of the joins after the
     /// source; they apply only when a RIGHT or FULL JOIN also follows it.
     pub(crate) fn mark_star_merged_columns(&mut self, source: SourceId, names: &[String]) {
-        let Some(scope_source) = self.sources.iter_mut().find(|entry| entry.id == source) else {
+        let Some(scope_source) = Arc::make_mut(&mut self.sources)
+            .iter_mut()
+            .find(|entry| entry.id == source)
+        else {
             return;
         };
         scope_source.star_merged = names
@@ -546,7 +567,9 @@ impl Scope {
     /// default, and CHECK expressions name their table this way.
     pub(crate) fn add_schema_source(&mut self, source: &hir::Source) {
         self.add_source(source, true);
-        let added = self.sources.last_mut().expect("source was just added");
+        let added = Arc::make_mut(&mut self.sources)
+            .last_mut()
+            .expect("source was just added");
         added.qualifier = added.table_name.clone();
         added.database_qualified = true;
     }
@@ -561,8 +584,9 @@ impl Scope {
             !self.outer_resolution_blocked && !other.outer_resolution_blocked,
             "root-level source scopes must allow ordinary resolution"
         );
-        self.sources.extend(other.sources);
-        self.visible_columns.extend(other.visible_columns);
+        Arc::make_mut(&mut self.sources).extend(Arc::unwrap_or_clone(other.sources));
+        Arc::make_mut(&mut self.visible_columns)
+            .extend(Arc::unwrap_or_clone(other.visible_columns));
     }
 
     pub(crate) fn without_outer(mut self) -> Self {
@@ -757,7 +781,7 @@ impl Scope {
                 .find(|(merged, _)| merged == name)
                 .map(|(_, value)| *value)
         };
-        for source in &self.sources {
+        for source in self.sources.iter() {
             if let Some(saved) = &source.saved {
                 let inner: Vec<usize> = saved
                     .iter()
@@ -1223,8 +1247,7 @@ impl Scope {
                 )));
             };
             let lookup_name = crate::util::normalize_ident(&using.name);
-            if let Some(right_source) = self
-                .sources
+            if let Some(right_source) = Arc::make_mut(&mut self.sources)
                 .iter_mut()
                 .find(|source| source.id == using.right.source)
             {
@@ -1259,7 +1282,7 @@ impl Scope {
                 collation: using.collation.clone(),
             }));
 
-            let left = &mut self.visible_columns[left_position];
+            let left = &mut Arc::make_mut(&mut self.visible_columns)[left_position];
             left.resolved = ResolvedScopeExpr {
                 expr: merged,
                 type_fact: using.type_fact.clone(),
@@ -1269,14 +1292,14 @@ impl Scope {
             };
             let left_source = left.source;
             let merged_expr = left.resolved.expr.clone();
-            self.visible_columns.remove(right_position);
+            Arc::make_mut(&mut self.visible_columns).remove(right_position);
             // Every column of the right source with the merged name gives
             // way to the merged value: a join group can hold several
             // columns the name finds. Under a RIGHT JOIN the merged value
             // also replaces every other copy on the left, as SQLite's
             // `lookupName` lets the right-most table win.
             let right_join = using.value == hir::MergedColumnValue::Right;
-            self.visible_columns.retain(|column| {
+            Arc::make_mut(&mut self.visible_columns).retain(|column| {
                 if column.lookup_name != lookup_name {
                     return true;
                 }
@@ -1411,6 +1434,8 @@ pub(crate) mod tests {
     thread_local! {
         /// How many sources were added to scopes on this thread.
         pub(crate) static SOURCES_ADDED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+        /// How many column bindings were copied on this thread.
+        pub(crate) static COLUMN_BINDINGS_COPIED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     }
 
     use super::*;
