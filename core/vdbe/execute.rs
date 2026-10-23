@@ -15572,6 +15572,7 @@ pub fn op_sequence_begin_inner_tx(
             db,
             path_kind_reg,
             saved_outer_reg,
+            exclusive,
         },
         insn
     );
@@ -15596,14 +15597,24 @@ pub fn op_sequence_begin_inner_tx(
         }
     }
 
-    let inner_tx_id = mv_store.begin_tx(pager.clone())?;
-    conn.set_mv_tx_for_db(
-        *db,
-        Some((
-            inner_tx_id,
-            crate::translate::emitter::TransactionMode::Concurrent,
-        )),
-    );
+    // An exclusive outer writer can still own the AUTOINCREMENT watermark.
+    // Wait for its writer lock before reading that row, rather than treating
+    // the allocator's conflict as a conflict in the user's outer transaction.
+    let mode = if *exclusive {
+        TransactionMode::Write
+    } else {
+        TransactionMode::Concurrent
+    };
+    let inner_tx_id = begin_mvcc_tx(
+        &mv_store,
+        pager,
+        &mode,
+        None,
+        &conn,
+        None,
+        CheckpointReadLockState::NotHeld,
+    )?;
+    conn.set_mv_tx_for_db(*db, Some((inner_tx_id, mode)));
 
     let saved = encode_saved_outer_mv_tx(outer_tx);
     state.registers[*path_kind_reg].set_value(Value::from_i64(SEQ_PATH_WRAPPED));

@@ -2029,13 +2029,14 @@ pub fn insn_to_row(
                 db,
                 path_kind_reg,
                 saved_outer_reg,
+                exclusive,
             } => (
                 "SequenceBeginInnerTx",
                 *db as i64,
                 *path_kind_reg as i64,
                 *saved_outer_reg as i64,
                 Value::Null,
-                0,
+                i64::from(*exclusive),
                 format!(
                     "r[{path_kind_reg}] = path; r[{saved_outer_reg}] = saved outer mv_tx"
                 ),

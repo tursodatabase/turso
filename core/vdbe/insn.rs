@@ -1802,10 +1802,10 @@ pub enum Insn {
     ///   in-tx rollback unburning the value is acceptable per Turso's
     ///   relaxed-burnt-value contract.
     /// * Wrapped — outer is Concurrent or autocommit Read or none.
-    ///   Begins a fresh Concurrent inner tx via `mv_store.begin_tx`,
-    ///   saves the outer's `(tx_id, mode)`, and swaps the connection's
-    ///   mv_tx for `db` to the inner. The cursor RMW runs against the
-    ///   inner. `SequenceCommitInnerTx` then commits the inner
+    ///   Begins a fresh inner tx, exclusive for an AUTOINCREMENT sequence
+    ///   and Concurrent otherwise. Saves the outer's `(tx_id, mode)` and
+    ///   swaps the connection's mv_tx for `db` to the inner. The cursor RMW
+    ///   runs against the inner. `SequenceCommitInnerTx` then commits the inner
     ///   independently of the outer's eventual fate.
     ///
     /// Outputs:
@@ -1817,6 +1817,8 @@ pub enum Insn {
         db: usize,
         path_kind_reg: usize,
         saved_outer_reg: usize,
+        /// Acquire the writer lock before reading an AUTOINCREMENT watermark.
+        exclusive: bool,
     },
     /// Commit the autonomous inner transaction started by a matching
     /// `SequenceBeginInnerTx`. Multi-step: drives the inner's

@@ -216,6 +216,7 @@ pub fn emit_disk_read_nextval(
         db: database_id,
         path_kind_reg,
         saved_outer_reg,
+        exclusive: seq.name.starts_with(AUTOINCREMENT_SEQ_PREFIX),
     });
 
     program.emit_insn(Insn::OpenWrite {
@@ -456,6 +457,7 @@ pub fn emit_disk_advance_past(
         db: database_id,
         path_kind_reg,
         saved_outer_reg,
+        exclusive: seq.name.starts_with(AUTOINCREMENT_SEQ_PREFIX),
     });
 
     program.emit_insn(Insn::OpenWrite {
