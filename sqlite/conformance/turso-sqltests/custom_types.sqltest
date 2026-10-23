@@ -748,6 +748,20 @@ expect error {
 }
 
 @requires strict "uses STRICT tables"
+test numeric-scale-rounds-half-away-from-zero {
+    CREATE TABLE t1(x numeric(10,2)) STRICT;
+    INSERT INTO t1 VALUES ('1.005'), ('2.999'), ('0.995'), ('-1.005'), ('1.004');
+    SELECT x FROM t1;
+}
+expect {
+    1.01
+    3.00
+    1.00
+    -1.01
+    1.00
+}
+
+@requires strict "uses STRICT tables"
 test order-by-numeric-type-with-lt {
     CREATE TABLE t1(val numeric(10,2)) STRICT;
     INSERT INTO t1 VALUES (9);
