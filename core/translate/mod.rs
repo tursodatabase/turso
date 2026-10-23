@@ -67,7 +67,7 @@ pub(crate) fn capture_catalog(
     semantic::catalog::SemanticCatalog::capture(
         schema.clone(),
         connection.database_schemas(),
-        &connection.temp.database,
+        &connection.temp,
         connection.attached_databases(),
         connection.namespaces(),
         connection.experimental_custom_types_enabled(),

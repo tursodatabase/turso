@@ -400,6 +400,10 @@ where
 #[derive(Clone, Debug)]
 pub(crate) struct HirOrUnion {
     pub(crate) branches: Vec<HirBtreeOperation>,
+    /// For each branch, its conditions that read only the sources before
+    /// this one. Each is checked before the branch's seek, so an outer row
+    /// the branch rejects seeks nothing.
+    pub(crate) branch_filters: Vec<Vec<hir::Expr>>,
     /// Position of the OR term in the block's predicates.
     pub(crate) term: usize,
     /// Every condition of every branch is applied by that branch's seek, so
@@ -517,6 +521,7 @@ pub(crate) fn hir_or_union_with_cost(
         let mut disjuncts = Vec::new();
         split(&term.expr, ast::Operator::Or, &mut disjuncts);
         let mut branches = Vec::with_capacity(disjuncts.len());
+        let mut branch_filters = Vec::with_capacity(disjuncts.len());
         let mut covers_term = true;
         let mut branch_cost = Cost(0.0);
         let mut branch_rows = Vec::with_capacity(disjuncts.len());
@@ -620,19 +625,34 @@ pub(crate) fn hir_or_union_with_cost(
             )?);
             // A branch whose leftover condition runs a subquery keeps the
             // table scanned.
-            let leftover_runs_subquery = terms.iter().any(|term| {
+            let runs_subquery = |term: &HirWhereTerm| {
                 let mut runs = false;
-                if !term.consumed {
-                    term.expr.for_each(&mut |expression| {
-                        runs |= matches!(expression, hir::Expr::Subquery(_));
-                    });
-                }
+                term.expr.for_each(&mut |expression| {
+                    runs |= matches!(expression, hir::Expr::Subquery(_));
+                });
                 runs
-            });
-            if leftover_runs_subquery {
+            };
+            if terms
+                .iter()
+                .any(|term| !term.consumed && runs_subquery(term))
+            {
                 branches.clear();
                 break;
             }
+            // A leftover condition over the sources before this one is
+            // checked before the branch's seek, as the legacy planner does.
+            let mut filters = Vec::new();
+            for term in &mut terms {
+                if term.consumed {
+                    continue;
+                }
+                let mask = layout.table_mask(document, &term.expr)?;
+                if prior_sources.contains_all_set_bits_of(&mask) {
+                    filters.push(term.expr.clone());
+                    term.consume();
+                }
+            }
+            branch_filters.push(filters);
             covers_term &= terms.iter().all(|term| term.consumed);
         }
         if branches.is_empty() {
@@ -656,6 +676,7 @@ pub(crate) fn hir_or_union_with_cost(
         if union_cost.0 < scan_cost.0 {
             let union = HirOrUnion {
                 branches,
+                branch_filters,
                 term: term_position,
                 covers_term,
             };

@@ -2244,7 +2244,7 @@ mod tests {
         assert!(direct_mask.get(0));
         assert!(direct_mask.get(1));
 
-        let merged = hir::Expr::MergedColumn(hir::MergedColumn {
+        let merged = hir::Expr::MergedColumn(Box::new(hir::MergedColumn {
             left: Box::new(hir::Expr::column(first, 0)),
             right: Box::new(hir::Expr::Column(hir::ColumnRef {
                 source: joined,
@@ -2255,7 +2255,7 @@ mod tests {
             affinity: Affinity::Blob,
             has_affinity: false,
             collation: None,
-        });
+        }));
         let merged_mask =
             crate::translate::planner::table_mask_from_hir_expr(&document, Some(&from), &merged)?;
         assert!(merged_mask.get(0));

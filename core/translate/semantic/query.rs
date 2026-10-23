@@ -1697,16 +1697,25 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
             && matches!(owner, SourceOwner::QueryBlock(_))
             && table.value().btree().is_some_and(|btree| btree.has_rowid)
         {
-            let scope = {
+            // Only an index expression or a partial index predicate reads
+            // the table's columns; a plain index needs no scope of them.
+            let indexes_read_columns = self
+                .context()
+                .table_indexes(database, table.value().get_name())?
+                .iter()
+                .any(|index| {
+                    index.where_clause.is_some()
+                        || index.columns.iter().any(|column| column.expr.is_some())
+                });
+            let mut scope = Scope::default();
+            if indexes_read_columns {
                 let definition = self.source(source).ok_or_else(|| {
                     LimboError::InternalError(format!(
                         "missing SELECT table source {source} for index metadata"
                     ))
                 })?;
-                let mut scope = Scope::default();
                 scope.add_schema_source(definition);
-                scope
-            };
+            }
             self.analyze_btree_index_metadata(
                 source,
                 &table,

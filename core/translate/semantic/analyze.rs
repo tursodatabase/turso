@@ -874,7 +874,8 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
 
         let query_id = self.reserve_query();
         let mut blocks = Vec::with_capacity(compounds.len() + 1);
-        let ordinary_order_by = compounds.is_empty().then_some(order_by_syntax);
+        let ordinary_order_by =
+            (compounds.is_empty() && !order_by_syntax.is_empty()).then_some(order_by_syntax);
         let (first_block, mut order_by, first_scope) = self.analyze_select_block(
             first_select,
             query_id,
@@ -2624,6 +2625,107 @@ mod tests {
                 .expect("fixed index name is unique");
         }
         schema
+    }
+
+    #[test]
+    fn plain_table_reference_adds_its_columns_to_one_scope() {
+        let symbols = SymbolTable::new();
+        let scope_count = |index_sql: &str| {
+            let mut schema = Schema::new();
+            let table = Arc::new(
+                BTreeTable::from_sql("CREATE TABLE t(a INTEGER, b INTEGER)", 2)
+                    .expect("table schema parses"),
+            );
+            schema
+                .add_btree_table(table.clone())
+                .expect("table name is unique");
+            let index = Index::from_sql(&symbols, index_sql, 3, &table).expect("index parses");
+            schema
+                .add_index(Arc::new(index))
+                .expect("index name is unique");
+            crate::translate::semantic::scope::tests::SOURCES_ADDED.with(|added| added.set(0));
+            analyze_sql_with_schema(&schema, "SELECT a FROM t WHERE b = 1")
+                .expect("SELECT analyzes");
+            crate::translate::semantic::scope::tests::SOURCES_ADDED.with(|added| added.get())
+        };
+
+        // The FROM clause adds the table once; a plain index reads no column.
+        assert_eq!(scope_count("CREATE INDEX i ON t(a)"), 1);
+        // An index expression is analyzed in a scope of the table's columns.
+        assert_eq!(scope_count("CREATE INDEX i ON t(a + b)"), 2);
+        assert_eq!(scope_count("CREATE INDEX i ON t(a) WHERE b > 0"), 2);
+    }
+
+    #[test]
+    fn select_star_with_where_copies_each_column_binding_once() {
+        let mut schema = Schema::new();
+        let columns: Vec<String> = (0..64).map(|column| format!("c{column} INTEGER")).collect();
+        let table = BTreeTable::from_sql(
+            &format!(
+                "CREATE TABLE wide(id INTEGER PRIMARY KEY, {})",
+                columns.join(", ")
+            ),
+            2,
+        )
+        .expect("table schema parses");
+        schema
+            .add_btree_table(Arc::new(table))
+            .expect("table name is unique");
+        crate::translate::semantic::scope::tests::COLUMN_BINDINGS_COPIED
+            .with(|copied| copied.set(0));
+        analyze_sql_with_schema(&schema, "SELECT * FROM wide WHERE id = 1")
+            .expect("SELECT analyzes");
+        let copied = crate::translate::semantic::scope::tests::COLUMN_BINDINGS_COPIED
+            .with(|copied| copied.get());
+
+        // Adding the table makes its columns visible by copying each one.
+        assert_eq!(copied, 65);
+    }
+
+    #[test]
+    fn select_star_does_not_copy_declared_types() {
+        let mut schema = Schema::new();
+        let columns: Vec<String> = (0..64).map(|column| format!("c{column} INTEGER")).collect();
+        let table = BTreeTable::from_sql(
+            &format!(
+                "CREATE TABLE wide(id INTEGER PRIMARY KEY, {})",
+                columns.join(", ")
+            ),
+            2,
+        )
+        .expect("table schema parses");
+        schema
+            .add_btree_table(Arc::new(table))
+            .expect("table name is unique");
+        crate::translate::semantic::hir::tests::DECLARED_TYPES_COPIED.with(|copied| copied.set(0));
+        analyze_sql_with_schema(&schema, "SELECT * FROM wide WHERE id = 1")
+            .expect("SELECT analyzes");
+        let copied = crate::translate::semantic::hir::tests::DECLARED_TYPES_COPIED
+            .with(|copied| copied.get());
+
+        assert_eq!(copied, 0);
+    }
+
+    #[test]
+    fn select_without_order_by_gives_its_outputs_to_one_clause_scope() {
+        let mut schema = Schema::new();
+        let table = BTreeTable::from_sql("CREATE TABLE t(id INTEGER PRIMARY KEY, a INTEGER)", 2)
+            .expect("table schema parses");
+        schema
+            .add_btree_table(Arc::new(table))
+            .expect("table name is unique");
+        let output_lists_set = |sql: &str| {
+            crate::translate::semantic::scope::tests::OUTPUT_LISTS_SET.with(|set| set.set(0));
+            analyze_sql_with_schema(&schema, sql).expect("SELECT analyzes");
+            crate::translate::semantic::scope::tests::OUTPUT_LISTS_SET.with(|set| set.get())
+        };
+
+        // The WHERE clause can name an output alias.
+        assert_eq!(output_lists_set("SELECT * FROM t WHERE id = 1"), 1);
+        assert_eq!(
+            output_lists_set("SELECT * FROM t WHERE id = 1 ORDER BY a"),
+            2
+        );
     }
 
     fn schema_with_custom_columns() -> Schema {

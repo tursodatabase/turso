@@ -184,14 +184,15 @@ impl HirWindowOutputCollector<'_, '_> {
     fn is_terminal(expression: &hir::Expr) -> bool {
         matches!(
             expression,
-            hir::Expr::Column(_)
-                | hir::Expr::RowId(_)
-                | hir::Expr::Subquery(_)
-                | hir::Expr::Function(hir::FunctionCall {
-                    evaluation: hir::FunctionEvaluation::Aggregate { .. }
-                        | hir::FunctionEvaluation::Window { .. },
-                    ..
-                })
+            hir::Expr::Column(_) | hir::Expr::RowId(_) | hir::Expr::Subquery(_)
+        ) || matches!(
+            expression,
+            hir::Expr::Function(call)
+                if matches!(
+                    call.evaluation,
+                    hir::FunctionEvaluation::Aggregate { .. }
+                        | hir::FunctionEvaluation::Window { .. }
+                )
         )
     }
 }
@@ -228,13 +229,11 @@ impl<'expr> hir::ExprVisitor<'expr> for HirWindowOutputCollector<'_, 'expr> {
         if !Self::is_terminal(expression) {
             return Ok(());
         }
-        if let hir::Expr::Function(hir::FunctionCall {
-            evaluation: hir::FunctionEvaluation::Window { window, .. },
-            ..
-        }) = expression
-        {
-            if *window == self.buffer.window.id {
-                return Ok(());
+        if let hir::Expr::Function(call) = expression {
+            if let hir::FunctionEvaluation::Window { window, .. } = &call.evaluation {
+                if *window == self.buffer.window.id {
+                    return Ok(());
+                }
             }
         }
         let column =
@@ -2133,10 +2132,11 @@ fn hir_group_row_columns(
             }
             match expression {
                 hir::Expr::Column(reference) => self.add(*reference),
-                hir::Expr::Function(hir::FunctionCall {
-                    evaluation: hir::FunctionEvaluation::Aggregate { .. },
-                    ..
-                }) => self.add_row_columns(expression),
+                hir::Expr::Function(call)
+                    if matches!(call.evaluation, hir::FunctionEvaluation::Aggregate { .. }) =>
+                {
+                    self.add_row_columns(expression)
+                }
                 hir::Expr::Output(output) => {
                     if let Some(output) = self.document.output(*output) {
                         self.visit(&output.expr);
@@ -3339,6 +3339,8 @@ pub(super) struct PreparedHirVirtualLoop<'a> {
 pub(super) struct PreparedHirOrUnionLoop<'a> {
     table_cursor: CursorID,
     branches: Vec<PreparedHirBtreeLoop<'a>>,
+    /// For each branch, the conditions checked before its seek.
+    branch_filters: &'a [Vec<hir::Expr>],
 }
 
 /// A scan through a query pattern of an index method, such as FTS: the
@@ -3755,10 +3757,8 @@ impl<'expr> hir::ExprVisitor<'expr> for HirBareAggregateColumnCollector<'expr> {
     ) -> Result<ControlFlow<(), ()>> {
         if matches!(
             child,
-            hir::Expr::Function(hir::FunctionCall {
-                evaluation: hir::FunctionEvaluation::Aggregate { .. },
-                ..
-            })
+            hir::Expr::Function(call)
+                if matches!(call.evaluation, hir::FunctionEvaluation::Aggregate { .. })
         ) {
             return Ok(ControlFlow::Break(()));
         }
@@ -3788,10 +3788,8 @@ impl<'expr> HirBareAggregateColumnCollector<'expr> {
     fn collect(&mut self, expression: &'expr hir::Expr) -> Result<()> {
         if matches!(
             expression,
-            hir::Expr::Function(hir::FunctionCall {
-                evaluation: hir::FunctionEvaluation::Aggregate { .. },
-                ..
-            })
+            hir::Expr::Function(call)
+                if matches!(call.evaluation, hir::FunctionEvaluation::Aggregate { .. })
         ) {
             return Ok(());
         }
@@ -7687,6 +7685,7 @@ fn prepare_hir_or_union_loop<'a>(
     Ok(PreparedHirOrUnionLoop {
         table_cursor,
         branches,
+        branch_filters: &union.branch_filters,
     })
 }
 
@@ -7701,7 +7700,23 @@ fn start_hir_or_union_loop(
     let rows = program.alloc_register();
     program.emit_null(rows, None);
     let rowid = program.alloc_register();
-    for branch in &prepared.branches {
+    for (branch, filters) in prepared.branches.iter().zip(prepared.branch_filters) {
+        // An outer row the branch's own conditions reject seeks nothing.
+        let branch_done = program.allocate_label();
+        for filter in filters {
+            let passed = program.allocate_label();
+            super::expr::translate_condition_expr(
+                program,
+                document,
+                filter,
+                ConditionMetadata {
+                    jump_if_condition_is_true: false,
+                    jump_target_when_true: passed,
+                    jump_target_when_false: branch_done,
+                },
+            )?;
+            program.preassign_label_to_next_insn(passed);
+        }
         let branch_loop = start_hir_btree_loop(program, document, branch, None)?;
         match branch.index {
             Some(_) => program.emit_insn(Insn::IdxRowId {
@@ -7718,6 +7733,7 @@ fn start_hir_or_union_loop(
             value_reg: rowid,
         });
         close_hir_btree_loop(program, &branch_loop, &[]);
+        program.preassign_label_to_next_insn(branch_done);
     }
     let loop_start = program.allocate_label();
     let next = program.allocate_label();

@@ -344,12 +344,11 @@ pub enum SubqueryExpr {
 
 /// An expression whose names and type-dependent operations are fully resolved.
 #[derive(Clone, Debug)]
-#[allow(clippy::large_enum_variant)]
 pub enum Expr {
     Literal(Literal),
     Parameter(Parameter),
     Column(ColumnRef),
-    MergedColumn(MergedColumn),
+    MergedColumn(Box<MergedColumn>),
     RowId(SourceId),
     Output(OutputId),
     Unary {
@@ -364,7 +363,7 @@ pub enum Expr {
         /// decision depends on bound type facts and must not be rediscovered
         /// during physical emission.
         array_concat: bool,
-        custom: Option<CustomBinaryOperator>,
+        custom: Option<Box<CustomBinaryOperator>>,
         comparison: Option<ComparisonSemantics>,
     },
     Between {
@@ -384,13 +383,15 @@ pub enum Expr {
     },
     Cast {
         expr: Box<Expr>,
-        target: TypeName,
+        target: Box<TypeName>,
     },
     Collate {
         expr: Box<Expr>,
         collation: ResolvedCollation,
     },
-    Function(FunctionCall),
+    /// Boxed: a call is the largest node by far, and every expression is
+    /// moved by value while it is built and planned.
+    Function(Box<FunctionCall>),
     IsNull(Box<Expr>),
     NotNull(Box<Expr>),
     TruthTest {
@@ -420,7 +421,7 @@ pub enum Expr {
         base: Box<Expr>,
         index: Box<Expr>,
     },
-    FieldAccess(FieldAccess),
+    FieldAccess(Box<FieldAccess>),
     Raise {
         action: ResolveType,
         message: Option<Box<Expr>>,
@@ -1043,6 +1044,11 @@ impl Expr {
         root_context: V::Context,
         visitor: &mut V,
     ) -> Result<V::Output, V::Error> {
+        if visitor.child(self, 0).is_none() {
+            return visitor.post_order(self, root_context, &[]);
+        }
+        #[cfg(test)]
+        tests::FRAME_STACKS_CREATED.with(|created| created.set(created.get() + 1));
         let mut frames = vec![ExprFrame::new(self, root_context)];
         loop {
             let frame = frames.last_mut().expect("root expression frame exists");
@@ -1094,8 +1100,8 @@ fn push_optional_pair<'expr>(
 }
 
 fn custom_binary_operators_match(
-    left: &Option<CustomBinaryOperator>,
-    right: &Option<CustomBinaryOperator>,
+    left: &Option<Box<CustomBinaryOperator>>,
+    right: &Option<Box<CustomBinaryOperator>>,
 ) -> bool {
     match (left, right) {
         (None, None) => true,
@@ -1313,7 +1319,35 @@ fn child_from_schema_calls<'expr>(
 
 #[cfg(test)]
 mod tests {
+    thread_local! {
+        /// How many expression walks on this thread allocated a stack of frames.
+        pub(super) static FRAME_STACKS_CREATED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    }
+
     use super::*;
+
+    #[test]
+    fn walking_an_expression_without_children_creates_no_frame_stack() {
+        let leaf = Expr::column(SourceId::new(0), 3);
+        let binary = Expr::Binary {
+            lhs: Box::new(Expr::column(SourceId::new(0), 1)),
+            operator: Operator::Add,
+            rhs: Box::new(Expr::column(SourceId::new(0), 2)),
+            array_concat: false,
+            custom: None,
+            comparison: None,
+        };
+        FRAME_STACKS_CREATED.with(|created| created.set(0));
+
+        let mut visited = 0;
+        leaf.for_each(&mut |_| visited += 1);
+        assert_eq!(visited, 1);
+        assert_eq!(FRAME_STACKS_CREATED.with(|created| created.get()), 0);
+
+        binary.for_each(&mut |_| visited += 1);
+        assert_eq!(visited, 4);
+        assert_eq!(FRAME_STACKS_CREATED.with(|created| created.get()), 1);
+    }
 
     #[test]
     fn expression_frames_preserve_child_order_for_walk_and_fold() {

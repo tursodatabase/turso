@@ -237,7 +237,7 @@ pub type ResolvedTrigger = CatalogObject<Trigger>;
 pub type ResolvedSequence = CatalogObject<Sequence>;
 
 /// A declared SQL type whose meaning was resolved during analysis.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Debug, PartialEq)]
 pub struct DeclaredType {
     pub name: String,
     pub storage: Type,
@@ -245,6 +245,19 @@ pub struct DeclaredType {
     /// ancestors. Empty means a built-in declared type.
     pub custom_chain: Vec<ResolvedType>,
     pub array_dimensions: u32,
+}
+
+impl Clone for DeclaredType {
+    fn clone(&self) -> Self {
+        #[cfg(test)]
+        tests::DECLARED_TYPES_COPIED.with(|copied| copied.set(copied.get() + 1));
+        Self {
+            name: self.name.clone(),
+            storage: self.storage,
+            custom_chain: self.custom_chain.clone(),
+            array_dimensions: self.array_dimensions,
+        }
+    }
 }
 
 impl DeclaredType {
@@ -266,7 +279,7 @@ impl DeclaredType {
 #[derive(Clone, Debug, PartialEq)]
 pub struct TypeFact {
     pub storage: Option<Type>,
-    pub declared: Option<DeclaredType>,
+    pub declared: Option<Arc<DeclaredType>>,
     pub array_dimensions: u32,
     pub array_rank_unbounded: bool,
 }
@@ -333,7 +346,7 @@ impl TypeFact {
             }),
             array_dimensions: declared.array_dimensions,
             array_rank_unbounded: false,
-            declared: Some(declared),
+            declared: Some(Arc::new(declared)),
         }
     }
 
@@ -350,7 +363,7 @@ impl TypeFact {
         let dimensions = self.array_dimensions - 1;
         let mut declared = self.declared.clone();
         if let Some(declared) = &mut declared {
-            declared.array_dimensions = dimensions;
+            Arc::make_mut(declared).array_dimensions = dimensions;
             if dimensions == 0 && declared.name.eq_ignore_ascii_case("ANY") {
                 return Some(Self::dynamic());
             }
@@ -549,7 +562,7 @@ impl TypeFact {
         lhs: &Self,
         rhs: &Self,
         array_dimensions: u32,
-    ) -> Option<DeclaredType> {
+    ) -> Option<Arc<DeclaredType>> {
         match (
             lhs.declared.as_ref().filter(|_| lhs.is_array()),
             rhs.declared.as_ref().filter(|_| rhs.is_array()),
@@ -558,19 +571,19 @@ impl TypeFact {
                 if lhs.name.eq_ignore_ascii_case(&rhs.name)
                     && lhs.custom_chain == rhs.custom_chain =>
             {
-                let mut declared = lhs.clone();
+                let mut declared = DeclaredType::clone(lhs);
                 declared.array_dimensions = array_dimensions;
-                Some(declared)
+                Some(Arc::new(declared))
             }
             (Some(declared), None) if !rhs.is_array() => {
-                let mut declared = declared.clone();
+                let mut declared = DeclaredType::clone(declared);
                 declared.array_dimensions = array_dimensions;
-                Some(declared)
+                Some(Arc::new(declared))
             }
             (None, Some(declared)) if !lhs.is_array() => {
-                let mut declared = declared.clone();
+                let mut declared = DeclaredType::clone(declared);
                 declared.array_dimensions = array_dimensions;
-                Some(declared)
+                Some(Arc::new(declared))
             }
             _ => None,
         }
@@ -707,5 +720,13 @@ impl HirDocument {
 
     pub fn schema_program(&self, id: SchemaProgramId) -> Option<&BoundSchemaProgram> {
         self.schema_programs.get(id.index())
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod tests {
+    thread_local! {
+        /// How many declared types were copied on this thread.
+        pub(crate) static DECLARED_TYPES_COPIED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     }
 }
