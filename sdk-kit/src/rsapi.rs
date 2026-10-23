@@ -1529,7 +1529,19 @@ fn step_inner(
             StepResult::Row => Ok(TursoStatusCode::Row),
             StepResult::Busy => Err(TursoError::Busy("database is locked".to_string())),
             StepResult::Interrupt => Err(TursoError::Interrupt("interrupted".to_string())),
-            StepResult::IO | StepResult::Yield | StepResult::Sleep { .. } => {
+            StepResult::Sleep { duration } => {
+                if async_io {
+                    Ok(TursoStatusCode::Io)
+                } else {
+                    // A busy-handler backoff: nothing is in flight, so stepping the event
+                    // loop at once only spins until the lock is released. Wait the time
+                    // the core asked for.
+                    std::thread::sleep(duration);
+                    stmt._io().step()?;
+                    continue;
+                }
+            }
+            StepResult::IO | StepResult::Yield => {
                 if async_io {
                     Ok(TursoStatusCode::Io)
                 } else {
