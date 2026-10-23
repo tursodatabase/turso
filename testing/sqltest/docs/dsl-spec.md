@@ -157,6 +157,18 @@ setup products {
 }
 ```
 
+### Setups for One Backend
+
+Put `@backend <name>` before a setup block to run the setup only on that backend.
+
+```sql
+@backend postgres
+setup auth_functions {
+    CREATE SCHEMA auth;
+    CREATE FUNCTION auth.uid() RETURNS uuid LANGUAGE sql STABLE AS $$ SELECT NULL::uuid $$;
+}
+```
+
 ## File-Level Directives
 
 These directives apply to all tests and snapshots in the file.
