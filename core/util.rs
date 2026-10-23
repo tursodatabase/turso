@@ -437,62 +437,62 @@ pub fn module_args_from_sql(sql: &str) -> Result<Vec<Value>> {
     let mut args = Vec::new();
     let mut current_arg = String::new();
     let mut chars = sql[start..end].chars().peekable();
-    let mut in_quotes = false;
+    let mut active_quote: Option<char> = None;
 
     while let Some(c) = chars.next() {
-        match c {
-            '\'' => {
-                if in_quotes {
-                    if chars.peek() == Some(&'\'') {
-                        // Escaped quote
-                        current_arg.push('\'');
-                        chars.next();
-                    } else {
-                        in_quotes = false;
-                        args.push(Value::from_text(current_arg.trim().to_string()));
-                        current_arg.clear();
-                        // Skip until comma or end
-                        while let Some(&nc) = chars.peek() {
-                            if nc == ',' {
-                                chars.next(); // Consume comma
-                                break;
-                            } else if nc.is_whitespace() {
-                                chars.next();
-                            } else {
-                                return Err(LimboError::InvalidArgument(
-                                    "Unexpected characters after quoted argument".to_string(),
-                                ));
-                            }
+        if let Some(q) = active_quote {
+            if c == q {
+                if chars.peek() == Some(&q) {
+                    // Escaped quote
+                    current_arg.push(q);
+                    chars.next();
+                } else {
+                    active_quote = None;
+                    // Skip following whitespace until comma `,` or end of string.
+                    while let Some(&nc) = chars.peek() {
+                        if nc == ',' {
+                            chars.next(); // Consume comma
+                            args.push(Value::from_text(current_arg.trim().to_string()));
+                            current_arg.clear();
+                            break;
+                        } else if nc.is_whitespace() {
+                            chars.next();
+                        } else {
+                            return Err(LimboError::InvalidArgument(
+                                "Unexpected characters after quoted argument".to_string(),
+                            ));
                         }
                     }
-                } else {
-                    in_quotes = true;
                 }
+            } else {
+                current_arg.push(c);
             }
-            ',' => {
-                if !in_quotes {
+        } else {
+            match c {
+                '\'' | '"' => {
+                    active_quote = Some(c);
+                }
+                ',' => {
                     if !current_arg.trim().is_empty() {
                         args.push(Value::from_text(current_arg.trim().to_string()));
                         current_arg.clear();
                     }
-                } else {
+                }
+                _ => {
                     current_arg.push(c);
                 }
-            }
-            _ => {
-                current_arg.push(c);
             }
         }
     }
 
-    if !current_arg.trim().is_empty() && !in_quotes {
-        args.push(Value::from_text(current_arg.trim().to_string()));
-    }
-
-    if in_quotes {
+    if active_quote.is_some() {
         return Err(LimboError::InvalidArgument(
             "Unterminated string literal in module arguments".to_string(),
         ));
+    }
+
+    if !current_arg.trim().is_empty() {
+        args.push(Value::from_text(current_arg.trim().to_string()));
     }
 
     Ok(args)
@@ -5645,6 +5645,74 @@ pub mod tests {
         let args = module_args_from_sql(sql).unwrap();
         assert_eq!(args.len(), 1);
         assert_eq!("arg1", args[0].to_text().unwrap());
+    }
+
+    #[test]
+    fn test_module_args_double_quotes() {
+        let sql = r#"CREATE VIRTUAL TABLE x USING modname("arg1", "arg2");"#;
+        let args = module_args_from_sql(sql).unwrap();
+        assert_eq!(args.len(), 2);
+        assert_eq!("arg1", args[0].to_text().unwrap());
+        assert_eq!("arg2", args[1].to_text().unwrap());
+    }
+
+    #[test]
+    fn test_module_args_double_quotes_with_comma() {
+        let sql = r#"CREATE VIRTUAL TABLE x USING modname("a,b");"#;
+        let args = module_args_from_sql(sql).unwrap();
+        assert_eq!(args.len(), 1);
+        assert_eq!("a,b", args[0].to_text().unwrap());
+    }
+
+    #[test]
+    fn test_module_args_escaped_double_quotes() {
+        let sql = r#"CREATE VIRTUAL TABLE x USING modname("a""b");"#;
+        let args = module_args_from_sql(sql).unwrap();
+        assert_eq!(args.len(), 1);
+        assert_eq!(r#"a"b"#, args[0].to_text().unwrap());
+    }
+
+    #[test]
+    fn test_module_args_mixed_quotes() {
+        let sql = r#"CREATE VIRTUAL TABLE x USING modname("a'b", 'c"d');"#;
+        let args = module_args_from_sql(sql).unwrap();
+        assert_eq!(args.len(), 2);
+        assert_eq!("a'b", args[0].to_text().unwrap());
+        assert_eq!(r#"c"d"#, args[1].to_text().unwrap());
+    }
+
+    #[test]
+    fn test_module_args_option_prefix_double_quotes() {
+        let sql =
+            r#"CREATE VIRTUAL TABLE f USING modname(text, tokenize="unicode61 tokenchars '_'");"#;
+        let args = module_args_from_sql(sql).unwrap();
+        assert_eq!(args.len(), 2);
+        assert_eq!("text", args[0].to_text().unwrap());
+        assert_eq!(
+            "tokenize=unicode61 tokenchars '_'",
+            args[1].to_text().unwrap()
+        );
+    }
+
+    #[test]
+    fn test_module_args_whitespace_after_closing_quote() {
+        let sql = r#"CREATE VIRTUAL TABLE x USING modname("arg1" , "arg2" );"#;
+        let args = module_args_from_sql(sql).unwrap();
+        assert_eq!(args.len(), 2);
+        assert_eq!("arg1", args[0].to_text().unwrap());
+        assert_eq!("arg2", args[1].to_text().unwrap());
+    }
+
+    #[test]
+    fn test_module_args_unterminated_double_quote() {
+        let sql = r#"CREATE VIRTUAL TABLE x USING modname("arg1);"#;
+        assert!(module_args_from_sql(sql).is_err());
+    }
+
+    #[test]
+    fn test_module_args_extra_garbage_after_double_quote() {
+        let sql = r#"CREATE VIRTUAL TABLE x USING modname("arg1"x);"#;
+        assert!(module_args_from_sql(sql).is_err());
     }
 
     #[test]

@@ -7964,6 +7964,33 @@ mod tests {
     }
 
     #[test]
+    fn test_schema_row_vtab_with_double_quoted_tokenizer_arg() {
+        let mut schema = Schema::new();
+
+        let result = schema.handle_schema_row(
+            "table",
+            "f",
+            "f",
+            0,
+            Some(r#"CREATE VIRTUAL TABLE f USING fts5(text, tokenize="unicode61 tokenchars '_'")"#),
+            &SymbolTable::default(),
+            &mut vec![],
+            &mut HashMap::default(),
+            &mut HashMap::default(),
+            &mut HashMap::default(),
+            &mut HashMap::default(),
+            &|_| None,
+            &crate::dialect::SqliteDialect,
+        );
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("Virtual table module not found: fts5"));
+        assert!(schema.get_table("f").is_none());
+    }
+
+    #[test]
     fn test_schema_row_with_zero_root_page_rejects_malformed_sql() {
         let mut schema = Schema::new();
 
