@@ -463,9 +463,13 @@ fn hir_binary_constraints_for_term(
                 !from.full_join_may_null_extend(source)
             };
 
+        let rowid_alias_column = constraint_source.rowid_alias_column();
         let (table_col_pos, is_rowid) = match part.target {
-            HirConstraintTarget::Column(column) => (Some(column.column), false),
-            HirConstraintTarget::RowId(_) => (None, true),
+            HirConstraintTarget::Column(column) => (
+                Some(column.column),
+                rowid_alias_column == Some(column.column),
+            ),
+            HirConstraintTarget::RowId(_) => (rowid_alias_column, true),
             HirConstraintTarget::Expression(_) => (None, false),
         };
         let selectivity = match constraint_source {
@@ -1179,6 +1183,23 @@ pub(crate) fn hir_constraints_for_source(
         }
     }
     let Some(table) = constraint_source.btree() else {
+        // An automatic index on a derived table orders a column by the
+        // collation its query gives it, so a comparison with another
+        // collation cannot seek it.
+        for constraint in &mut constraints {
+            let Some(position) = constraint.table_col_pos else {
+                continue;
+            };
+            let column_collation = source_definition
+                .columns
+                .get(position)
+                .and_then(|column| column.collation.as_ref())
+                .map(|collation| *collation.value())
+                .unwrap_or_default();
+            if constraint.comparison_collation.unwrap_or_default() != column_collation {
+                constraint.usable = false;
+            }
+        }
         return Ok(HirTableConstraints {
             constraints,
             candidates: Vec::new(),
