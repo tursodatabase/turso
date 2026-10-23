@@ -408,3 +408,16 @@ test create-schema-rejects-the-names-of-the-databases {
 expect error {
     unacceptable schema name "temp"
 }
+
+test column-named-with-its-schema-binds-in-returning-and-upsert {
+    CREATE SCHEMA app;
+    CREATE TABLE app.t (id int PRIMARY KEY, x int);
+    INSERT INTO app.t VALUES (1, 5);
+    UPDATE app.t SET x = 6 RETURNING app.t.x;
+    INSERT INTO app.t VALUES (1, 0) ON CONFLICT (id) DO UPDATE SET x = app.t.x + 1 WHERE app.t.x > 0;
+    SELECT x FROM app.t;
+}
+expect {
+    6
+    7
+}

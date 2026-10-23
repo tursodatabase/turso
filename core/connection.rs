@@ -5549,6 +5549,30 @@ mod tests {
     }
 
     #[test]
+    fn test_a_column_named_with_its_namespace_binds_in_returning_and_upsert() {
+        let temp_dir = TempDir::new().unwrap();
+        let conn = open_connection_with_opts(&temp_dir.path().join("main.db"), DatabaseOpts::new());
+        conn.execute("CREATE TABLE \"app.t\"(id INTEGER PRIMARY KEY, x INTEGER)")
+            .unwrap();
+        conn.execute("INSERT INTO \"app.t\" VALUES(1, 5)").unwrap();
+        conn.add_namespace(crate::Namespace {
+            name: "app".to_string(),
+            database_id: MAIN_DB_ID,
+            prefix: "app.".to_string(),
+        });
+
+        assert_eq!(
+            run_single_i64(&conn, "UPDATE app.t SET x = 6 RETURNING app.t.x"),
+            6
+        );
+        conn.execute(
+            "INSERT INTO app.t VALUES(1, 0) ON CONFLICT(id) DO UPDATE SET x = app.t.x + 1 WHERE app.t.x > 0",
+        )
+        .unwrap();
+        assert_eq!(query_single_i64(&conn, "SELECT x FROM app.t"), 7);
+    }
+
+    #[test]
     fn test_named_memory_parent_can_attach_real_file_database() {
         let temp_dir = TempDir::new().unwrap();
         let aux_path = temp_dir.path().join("aux.db");

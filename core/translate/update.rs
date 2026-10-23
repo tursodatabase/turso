@@ -398,7 +398,7 @@ fn prepare_update_plan(
         // base table name, not the UPDATE alias. Keep the target table in scope, but
         // under its schema name so `RETURNING t.col` works while `RETURNING alias.col`
         // still fails.
-        returning_target.identifier = table_name.to_string();
+        returning_target.identifier = normalize_ident(body.tbl_name.name.as_str());
         let mut returning_table_references = TableReferences::new(
             vec![returning_target],
             read_scope_tables.outer_query_refs().to_vec(),
