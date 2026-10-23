@@ -1674,6 +1674,9 @@ pub fn emit_from_clause_subqueries(
             .join_info
             .as_ref()
             .is_some_and(JoinInfo::keeps_right_rows)
+            && join_order
+                .iter()
+                .any(|member| member.table_id == table.internal_id)
         {
             let (right_join, scan) = eqp_details_for_right_join(table);
             emit_explain!(program, true, right_join);
