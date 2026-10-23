@@ -2076,6 +2076,7 @@ impl Jsonb {
             } else if !quoted
                 && (c == b':'
                     || c.is_ascii_whitespace()
+                    || json5_whitespace_len(&input[pos - 1..]) != 0
                     || (c == b'/' && matches!(input.get(pos), Some(b'/' | b'*'))))
             {
                 // End of unquoted identifier. A comment right after the
