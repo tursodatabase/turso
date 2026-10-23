@@ -974,3 +974,23 @@ expect {
     mvcc
     2|x
 }
+
+# The same with the conflicting row checkpointed into the B-tree: the
+# NotExists probe for the new id must not leave the table cursor looking like
+# it is still on the old row when the update seeks back to it.
+@skip-if sqlite "MVCC is not supported in SQLite"
+test mvcc-upsert-set-pk-on-conflict-target-resolves-after-checkpoint {
+    PRAGMA journal_mode='MVCC';
+    CREATE TABLE t (id INTEGER PRIMARY KEY, a UNIQUE);
+    INSERT INTO t VALUES (1, 'x');
+    PRAGMA wal_checkpoint(TRUNCATE);
+    INSERT INTO t VALUES (9, 'x') ON CONFLICT(a) DO UPDATE SET id = excluded.id;
+    SELECT * FROM t;
+    SELECT a FROM t WHERE a = 'x';
+}
+expect {
+    mvcc
+    0|0|0
+    9|x
+    x
+}
