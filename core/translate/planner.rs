@@ -2181,18 +2181,19 @@ fn parse_table(
         // sqlite3FixSelect/sqlite3FixSrcList): a view's unqualified names are
         // fixed to the database it was created in, not resolved TEMP-first
         // like an ordinary top-level query.
-        let view_plan = resolver.with_view_scope(database_id, view.name.clone(), || {
-            program.with_view_expansion(database_id, &view.name, |program| {
-                prepare_select_plan(
-                    view.select_stmt.clone(),
-                    resolver,
-                    program,
-                    table_references.outer_query_refs(),
-                    QueryDestination::placeholder_for_subquery(),
-                    connection,
-                )
-            })
-        })?;
+        let view_plan =
+            resolver.with_view_scope(resolved.namespace.clone(), view.name.clone(), || {
+                program.with_view_expansion(database_id, &view.name, |program| {
+                    prepare_select_plan(
+                        view.select_stmt.clone(),
+                        resolver,
+                        program,
+                        table_references.outer_query_refs(),
+                        QueryDestination::placeholder_for_subquery(),
+                        connection,
+                    )
+                })
+            })?;
         table_references.add_joined_table(JoinedTable::new_subquery_from_plan(
             view_alias,
             view_plan,

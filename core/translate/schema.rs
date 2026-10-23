@@ -6,8 +6,8 @@ use crate::ext::VTabImpl;
 use crate::function::{Deterministic, Func, MathFunc, ScalarFunc};
 use crate::schema::{
     create_table, translate_ident_to_string_literal, type_registry_key, BTreeCharacteristics,
-    BTreeTable, ColDef, Column, SchemaObjectType, Table, Type, RESERVED_TABLE_PREFIXES,
-    SQLITE_SEQUENCE_TABLE_NAME, TURSO_TYPES_TABLE_NAME,
+    BTreeTable, ColDef, Column, SchemaObjectType, Table, Type, SQLITE_SEQUENCE_TABLE_NAME,
+    TURSO_TYPES_TABLE_NAME,
 };
 use crate::stats::STATS_TABLE;
 use crate::storage::pager::CreateBTreeFlags;
@@ -914,14 +914,13 @@ fn validate(
 /// Schema information derived from a CTAS SELECT.
 struct CtasInfo {
     plan: Plan,
-    schema_sql: String,
+    columns_sql: String,
 }
 
 /// Pre-plan the SELECT to derive the schema for a CTAS table.
 /// Returns the plan (for reuse in emission) along with the complete schema SQL and column definitions.
 fn derive_ctas_schema(
     select: ast::Select,
-    table_name: &str,
     resolver: &Resolver,
     program: &mut ProgramBuilder,
     connection: &Arc<Connection>,
@@ -1008,7 +1007,7 @@ fn derive_ctas_schema(
 
     let info = CtasInfo {
         plan,
-        schema_sql: format!("CREATE TABLE {table_name}({})", sql_parts.join(",")),
+        columns_sql: sql_parts.join(","),
     };
     Ok((info, col_defs))
 }
@@ -1155,13 +1154,7 @@ pub fn translate_create_table(
     // regular ColumnsAndConstraints body + separate SELECT for data insertion.
     let (mut body, ctas_info) = match body {
         ast::CreateTableBody::AsSelect(select) => {
-            let (info, col_defs) = derive_ctas_schema(
-                select,
-                &tbl_name.name.as_ident(),
-                resolver,
-                program,
-                connection,
-            )?;
+            let (info, col_defs) = derive_ctas_schema(select, resolver, program, connection)?;
             let body = ast::CreateTableBody::ColumnsAndConstraints {
                 columns: col_defs,
                 constraints: vec![],
@@ -1176,6 +1169,8 @@ pub fn translate_create_table(
     let database_id = resolved.database_id();
     let schema_cookie = resolver.with_schema(database_id, |s| s.schema_version);
     program.begin_write_on_database(database_id, schema_cookie)?;
+    let tbl_name_in_sql =
+        ast::QualifiedName::single(resolved.namespace.name_in_sql(&tbl_name.name));
     let normalized_tbl_name = resolved.stored_name;
     validate(&body, &normalized_tbl_name, resolver, connection)?;
     let bound_sequence_names = resolver.dialect.binds_names_at_create()
@@ -1208,10 +1203,9 @@ pub fn translate_create_table(
     program.extend(&opts);
 
     if !connection.is_mvcc_bootstrap_connection()
-        && RESERVED_TABLE_PREFIXES
-            .iter()
-            .any(|prefix| normalized_tbl_name.starts_with(prefix))
+        && crate::namespace::is_reserved_object_name(&resolved.name)
         && !connection.is_nested_stmt()
+        && !connection.runs_engine_ddl()
     {
         bail_parse_error!(
             "Object name reserved for internal use: {}",
@@ -1359,24 +1353,24 @@ pub fn translate_create_table(
     // canonical text from the AST, a frontend dialect preserves its own
     // input text).
     let sql = if let Some(ref info) = ctas_info {
-        info.schema_sql.clone()
+        format!(
+            "CREATE TABLE {}({})",
+            tbl_name_in_sql.name.as_ident(),
+            info.columns_sql
+        )
     } else if bound_sequence_names {
         connection
             .dialect()
             .format_rewritten_table_sql(&ast::Stmt::CreateTable {
                 temporary,
                 if_not_exists,
-                tbl_name: ast::QualifiedName {
-                    namespace: None,
-                    name: tbl_name.name,
-                    alias: None,
-                },
+                tbl_name: tbl_name_in_sql,
                 body: body.clone(),
             })?
     } else {
         connection
             .dialect()
-            .format_table_sql(input, &tbl_name, &body)?
+            .format_table_sql(input, &tbl_name_in_sql, &body)?
     };
 
     let parse_schema_label = program.allocate_label();
@@ -1898,6 +1892,7 @@ fn validate_drop_table(
     connection: &Arc<Connection>,
 ) -> Result<()> {
     if !connection.is_nested_stmt()
+        && !connection.runs_engine_ddl()
         && crate::schema::is_system_table(tbl_name)
         // special case, allow dropping `sqlite_stat1`
         && !tbl_name.eq_ignore_ascii_case(STATS_TABLE)

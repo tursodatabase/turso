@@ -885,6 +885,12 @@ pub fn translate_create_sequence(
             normalized_name
         );
     }
+    if crate::namespace::is_reserved_object_name(&resolved.name) {
+        bail_parse_error!(
+            "Object name reserved for internal use: {}",
+            seq_name.name.as_str()
+        );
+    }
 
     // Check if sequence already exists
     let exists = resolver.with_schema(database_id, |s| s.get_sequence(&normalized_name).is_some());

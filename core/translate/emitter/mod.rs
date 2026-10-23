@@ -298,8 +298,8 @@ impl SelfTableScope {
 /// object itself lives in, not through the normal temp-first search.
 #[derive(Debug, Clone)]
 pub(crate) struct DatabaseScopeContext {
-    /// The database ID the object belongs to.
-    database_id: usize,
+    /// The namespace the object belongs to.
+    namespace: Namespace,
     /// "trigger" or "view" (for error messages).
     kind: &'static str,
     /// The object's own name (for error messages).
@@ -308,7 +308,7 @@ pub(crate) struct DatabaseScopeContext {
 
 impl DatabaseScopeContext {
     fn restricts_db_references(&self) -> bool {
-        self.database_id != crate::TEMP_DB_ID
+        self.namespace.database_id != crate::TEMP_DB_ID
     }
 }
 
@@ -576,7 +576,7 @@ impl<'a> Resolver<'a> {
     /// `self` across that loop would conflict with those reborrows.
     pub(crate) fn with_database_scope<T>(
         &self,
-        database_id: usize,
+        namespace: Namespace,
         kind: &'static str,
         object_name: String,
         f: impl FnOnce() -> Result<T>,
@@ -585,7 +585,7 @@ impl<'a> Resolver<'a> {
             .database_scope
             .borrow_mut()
             .replace(DatabaseScopeContext {
-                database_id,
+                namespace,
                 kind,
                 object_name,
             });
@@ -602,7 +602,7 @@ impl<'a> Resolver<'a> {
     /// would fight the mutable borrow this method itself takes.
     pub(crate) fn with_database_scope_mut<T>(
         &mut self,
-        database_id: usize,
+        namespace: Namespace,
         kind: &'static str,
         object_name: String,
         f: impl FnOnce(&mut Self) -> Result<T>,
@@ -611,7 +611,7 @@ impl<'a> Resolver<'a> {
             .database_scope
             .borrow_mut()
             .replace(DatabaseScopeContext {
-                database_id,
+                namespace,
                 kind,
                 object_name,
             });
@@ -623,11 +623,11 @@ impl<'a> Resolver<'a> {
     /// Restrict table resolution to the trigger's own database while `f` runs.
     pub(crate) fn with_trigger_scope<T>(
         &mut self,
-        database_id: usize,
+        namespace: Namespace,
         trigger_name: String,
         f: impl FnOnce(&mut Self) -> Result<T>,
     ) -> Result<T> {
-        self.with_database_scope_mut(database_id, "trigger", trigger_name, f)
+        self.with_database_scope_mut(namespace, "trigger", trigger_name, f)
     }
 
     /// Restrict table resolution to the view's own database while `f` runs,
@@ -637,11 +637,11 @@ impl<'a> Resolver<'a> {
     /// table's name, matching SQLite's view schema fixer.
     pub(crate) fn with_view_scope<T>(
         &self,
-        database_id: usize,
+        namespace: Namespace,
         view_name: String,
         f: impl FnOnce() -> Result<T>,
     ) -> Result<T> {
-        self.with_database_scope(database_id, "view", view_name, f)
+        self.with_database_scope(namespace, "view", view_name, f)
     }
 
     pub fn resolve_function(
@@ -910,7 +910,10 @@ impl<'a> Resolver<'a> {
         // same way a top-level query does, sqlite_schema included.
         if let Some(ctx) = self.database_scope.borrow().as_ref() {
             if ctx.restricts_db_references() {
-                return Some(self.resolved_in_database(ctx.database_id, &table_name));
+                return Some(ResolvedName::in_namespace(
+                    ctx.namespace.clone(),
+                    &table_name,
+                ));
             }
         }
 
@@ -1013,7 +1016,7 @@ impl<'a> Resolver<'a> {
             // SQLite behavior). Otherwise default to main.
             if let Some(ctx) = self.database_scope.borrow().as_ref() {
                 if ctx.restricts_db_references() {
-                    Ok(self.namespace_of_database(ctx.database_id))
+                    Ok(ctx.namespace.clone())
                 } else {
                     Ok(self.namespace_of_database(crate::MAIN_DB_ID))
                 }
@@ -1030,7 +1033,7 @@ impl<'a> Resolver<'a> {
             if !ctx.restricts_db_references() {
                 return Ok(namespace);
             }
-            if namespace.database_id != ctx.database_id {
+            if namespace.database_id != ctx.namespace.database_id {
                 let db_name = qualified_name
                     .namespace
                     .as_ref()
@@ -1085,9 +1088,21 @@ impl<'a> Resolver<'a> {
         ResolvedName::in_namespace(self.namespace_of_database(database_id), name)
     }
 
-    fn namespace_of_database(&self, database_id: usize) -> Namespace {
+    pub(crate) fn namespace_of_database(&self, database_id: usize) -> Namespace {
         self.namespaces
             .of_database(database_id)
+            .expect("a database has a namespace")
+    }
+
+    /// The namespace of database `database_id` that holds the object
+    /// stored as `stored_name`.
+    pub(crate) fn namespace_of_stored_name(
+        &self,
+        database_id: usize,
+        stored_name: &str,
+    ) -> Namespace {
+        self.namespaces
+            .of_stored_name(database_id, stored_name)
             .expect("a database has a namespace")
     }
 

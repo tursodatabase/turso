@@ -2669,6 +2669,7 @@ impl Database {
             temp: crate::connection::TempDbContext::new(),
             attached_databases: RwLock::new(DatabaseCatalog::new()),
             namespaces: crate::Namespaces::default(),
+            runs_engine_ddl: AtomicBool::new(false),
             search_path: RwLock::new(None),
             has_non_main_pagers: AtomicBool::new(false),
             query_only: AtomicBool::new(false),

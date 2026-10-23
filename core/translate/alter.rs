@@ -17,7 +17,6 @@ use crate::{
     schema::{
         collect_column_dependencies_of_expr, BTreeTable, CheckConstraint, Column, ColumnLayout,
         ForeignKey, FromDefinitionFlags, Index, Schema, Table, EXPR_INDEX_SENTINEL,
-        RESERVED_TABLE_PREFIXES,
     },
     translate::{
         emitter::{emit_check_constraints, gencol::compute_virtual_columns, Resolver},
@@ -51,10 +50,7 @@ fn validate(alter_table: &ast::AlterTableBody, table_name: &str) -> Result<()> {
     }
     if let ast::AlterTableBody::RenameTo(new_table_name) = alter_table {
         let normalized_new_name = normalize_ident(new_table_name.as_str());
-        if RESERVED_TABLE_PREFIXES
-            .iter()
-            .any(|prefix| normalized_new_name.starts_with(prefix))
-        {
+        if crate::namespace::is_reserved_object_name(&normalized_new_name) {
             crate::bail_parse_error!("Object name reserved for internal use: {}", new_table_name);
         }
     }
@@ -1439,7 +1435,8 @@ pub fn translate_alter_table(
             )?
         }
         ast::AlterTableBody::RenameTo(new_name) => {
-            let new_name = new_name.as_str();
+            let new_name_in_sql = resolved.namespace.name_in_sql(&new_name);
+            let new_name = new_name_in_sql.as_str();
             let normalized_old_name = normalize_ident(table_name);
             let normalized_new_name = normalize_ident(new_name);
             let mut temp_triggers_to_rewrite: Vec<(String, String, bool)> = Vec::new();

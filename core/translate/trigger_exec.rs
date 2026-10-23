@@ -585,16 +585,16 @@ fn execute_trigger_commands(
     }
     // Restrict table resolution to the trigger's database during subprogram compilation.
     // Temp triggers live in TEMP_DB_ID, regardless of which database the target table is in.
-    let trigger_database_id = if trigger.temporary {
-        crate::TEMP_DB_ID
+    let trigger_namespace = if trigger.temporary {
+        resolver.namespace_of_database(crate::TEMP_DB_ID)
     } else {
-        database_id
+        resolver.namespace_of_stored_name(database_id, &trigger.name)
     };
     // `resolver` is reborrowed as `&mut Resolver` on every trigger command
     // below (`translate_inner` needs it), so the scope closure takes
     // `resolver` as a parameter rather than capturing the outer binding -
     // see `Resolver::with_database_scope_mut`.
-    resolver.with_trigger_scope(trigger_database_id, trigger.name.clone(), |resolver| {
+    resolver.with_trigger_scope(trigger_namespace, trigger.name.clone(), |resolver| {
         for command in trigger.commands.iter() {
             let stmt = trigger_cmd_to_stmt_for_subprogram(command, &subprogram_ctx)?;
             subprogram_builder.prologue();

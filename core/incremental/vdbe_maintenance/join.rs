@@ -528,12 +528,13 @@ pub(super) fn emit_inner_join(
     let eph_record_reg = program.alloc_register();
 
     let syms = connection.syms.read();
+    let namespaces = connection.namespaces_in(schema);
     let mut resolver = Resolver::new(
         schema,
         connection.database_schemas(),
         &connection.temp.database,
         connection.attached_databases(),
-        connection.namespaces(),
+        &namespaces,
         &syms,
         connection.experimental_custom_types_enabled(),
         connection.get_dqs_dml().into(),
@@ -776,12 +777,13 @@ pub(super) fn emit_semi_or_anti_join(
     })?;
 
     let syms = connection.syms.read();
+    let namespaces = connection.namespaces_in(schema);
     let mut resolver = Resolver::new(
         schema,
         connection.database_schemas(),
         &connection.temp.database,
         connection.attached_databases(),
-        connection.namespaces(),
+        &namespaces,
         &syms,
         connection.experimental_custom_types_enabled(),
         connection.get_dqs_dml().into(),

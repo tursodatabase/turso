@@ -240,12 +240,13 @@ fn build_plan_for_connection(
     connection: &Arc<Connection>,
 ) -> Result<MaintenancePlan> {
     let syms = connection.syms.read();
+    let namespaces = connection.namespaces_in(schema);
     let resolver = Resolver::new(
         schema,
         connection.database_schemas(),
         &connection.temp.database,
         connection.attached_databases(),
-        connection.namespaces(),
+        &namespaces,
         &syms,
         connection.experimental_custom_types_enabled(),
         connection.get_dqs_dml().into(),
@@ -256,9 +257,11 @@ fn build_plan_for_connection(
     // names the same way CREATE did: within the view's own database, never
     // through a TEMP table that happens to share a source table's name
     // (#9456). Materialized views always live in main.
-    resolver.with_view_scope(crate::MAIN_DB_ID, view_name.to_string(), || {
-        plan_view(view_name, select, &resolver, connection)
-    })
+    resolver.with_view_scope(
+        resolver.namespace_of_database(crate::MAIN_DB_ID),
+        view_name.to_string(),
+        || plan_view(view_name, select, &resolver, connection),
+    )
 }
 
 /// Emit every node once in DAG topological order.
