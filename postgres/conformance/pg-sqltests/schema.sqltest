@@ -511,3 +511,14 @@ expect {
     1
     t_pkey
 }
+
+test schema-keeps-its-oid-when-another-schema-is-created {
+    CREATE SCHEMA b;
+    CREATE TABLE o (id bigint);
+    INSERT INTO o SELECT oid FROM pg_namespace WHERE nspname = 'b';
+    CREATE SCHEMA a;
+    SELECT n.nspname FROM pg_namespace n JOIN o ON n.oid = o.id;
+}
+expect {
+    b
+}

@@ -2891,20 +2891,33 @@ pub(crate) struct UserSchema {
 
 const PUBLIC_NAMESPACE_OID: i64 = 2200;
 
-const FIRST_USER_SCHEMA_OID: i64 = 16384;
+/// The OIDs of the schemas start here, above the range the tables and
+/// indexes are numbered in.
+const USER_SCHEMA_OID_BASE: i64 = 1 << 20;
 
+/// The schemas of the main database. A schema keeps its OID while it
+/// exists: the OID comes from the root page of its marker table, not from
+/// its place in the list of schemas, which a new schema would shift.
 fn user_schemas(conn: &Connection) -> Vec<UserSchema> {
+    let schema = conn.current_schema();
     conn.namespaces()
         .others()
         .into_iter()
         .filter(|namespace| {
             namespace.database_id == turso_core::MAIN_DB_ID && !namespace.prefix.is_empty()
         })
-        .enumerate()
-        .map(|(index, namespace)| UserSchema {
-            oid: FIRST_USER_SCHEMA_OID + index as i64,
-            name: namespace.name,
-            prefix: namespace.prefix,
+        .map(|namespace| {
+            let marker = format!("{}{}", crate::session::SCHEMA_MARKER_PREFIX, namespace.name);
+            let root_page = schema
+                .tables
+                .get(&marker)
+                .and_then(|table| table.btree())
+                .map_or(0, |table| table.root_page);
+            UserSchema {
+                oid: USER_SCHEMA_OID_BASE + root_page,
+                name: namespace.name,
+                prefix: namespace.prefix,
+            }
         })
         .collect()
 }
