@@ -3548,6 +3548,7 @@ pub(crate) fn pg_get_constraintdef(conn: &Connection, target_oid: i64) -> Option
 /// Uses the same OID assignment as [PgIndexTable] / [PgClassTable].
 pub(crate) fn pg_get_indexdef(conn: &Connection, target_oid: i64) -> Option<String> {
     let schema = conn.current_schema();
+    let schemas = user_schemas(conn);
     let tables = user_tables_sorted(&schema);
     let num_tables = tables.len() as i64;
 
@@ -3558,7 +3559,9 @@ pub(crate) fn pg_get_indexdef(conn: &Connection, target_oid: i64) -> Option<Stri
                 continue;
             }
             if index_oid == target_oid {
-                return Some(index_definition("public", table_name, &idx.name, idx));
+                let table = Placement::of(table_name, &schemas);
+                let index_name = Placement::of(&idx.name, &schemas).name;
+                return Some(index_definition(table.schema, table.name, index_name, idx));
             }
             index_oid += 1;
         }

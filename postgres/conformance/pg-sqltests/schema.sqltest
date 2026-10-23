@@ -547,3 +547,13 @@ test schema-keeps-its-oid-across-a-checkpoint {
 expect {
     1
 }
+
+test index-definition-names-the-schema-of-its-table {
+    CREATE SCHEMA app;
+    CREATE TABLE app.t (x int);
+    CREATE INDEX i ON app.t (x);
+    SELECT pg_get_indexdef(oid) FROM pg_class WHERE relname = 'i';
+}
+expect {
+    CREATE INDEX i ON app.t USING btree (x)
+}
