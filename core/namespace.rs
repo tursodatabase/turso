@@ -46,10 +46,11 @@ impl Namespace {
         &self,
         written: &turso_parser::ast::QualifiedName,
     ) -> turso_parser::ast::QualifiedName {
-        if self.prefix.is_empty() {
-            return written.clone();
+        turso_parser::ast::QualifiedName {
+            namespace: written.namespace.clone().filter(|_| self.prefix.is_empty()),
+            name: self.name_in_sql(&written.name),
+            alias: written.alias.clone(),
         }
-        turso_parser::ast::QualifiedName::single(self.name_in_sql(&written.name))
     }
 
     pub fn holds_the_same_objects_as(&self, other: &Namespace) -> bool {
