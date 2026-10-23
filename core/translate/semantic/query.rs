@@ -1744,12 +1744,10 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
         let database = table.database().ok_or_else(|| {
             LimboError::InternalError("table source has no owning database".to_string())
         })?;
+        let schema = self.context().schema(database)?;
         let mut columns = Vec::with_capacity(table.value().columns().len());
         for (index, column) in table.value().columns().iter().enumerate() {
-            let resolved_type = self
-                .context()
-                .schema(database)?
-                .resolve_type(&column.ty_str, is_strict)?;
+            let resolved_type = schema.resolve_type(&column.ty_str, is_strict)?;
             let (type_fact, programs) = match resolved_type {
                 Some(resolved) if !type_programs => {
                     let (type_fact, _) =

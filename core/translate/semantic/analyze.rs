@@ -325,7 +325,7 @@ impl<'context, 'catalog, 'ast> Analyzer<'context, 'catalog, 'ast> {
         }))
     }
 
-    pub(super) const fn context(&self) -> &SemanticContext<'catalog> {
+    pub(super) const fn context(&self) -> &'context SemanticContext<'catalog> {
         self.context
     }
 

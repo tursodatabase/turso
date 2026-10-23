@@ -103,7 +103,7 @@ pub(crate) struct ExpandedColumn {
 struct ColumnBinding {
     source: SourceId,
     display_name: Arc<str>,
-    lookup_name: Arc<str>,
+    lookup_name: ColumnName,
     resolved: ResolvedScopeExpr,
     hidden: bool,
     /// The implicit rowid a parenthesized join group saved for one of its
@@ -112,7 +112,24 @@ struct ColumnBinding {
     /// The name a USING or NATURAL join compares: the column's own name,
     /// or for a column of a join group the unique name the group gave it,
     /// since SQLite looks the group's subquery up by column name.
-    using_name: Arc<str>,
+    using_name: ColumnName,
+}
+
+#[derive(Clone, Debug)]
+struct ColumnName(Arc<str>);
+
+impl ColumnName {
+    fn matches(&self, name: &str) -> bool {
+        self.0.eq_ignore_ascii_case(name)
+    }
+
+    fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    fn normalized(&self) -> String {
+        crate::util::normalize_ident(&self.0)
+    }
 }
 
 impl Clone for ColumnBinding {
@@ -140,16 +157,10 @@ impl ColumnBinding {
                 column: index,
             }),
         };
-        let display_name = column.name.clone();
-        let lookup_name = if display_name.bytes().any(|byte| byte.is_ascii_uppercase()) {
-            lowercase_name(&display_name)
-        } else {
-            display_name.clone()
-        };
         Self {
             source: source.id,
-            display_name,
-            lookup_name: lookup_name.clone(),
+            display_name: column.name.clone(),
+            lookup_name: ColumnName(column.name.clone()),
             resolved: ResolvedScopeExpr {
                 expr,
                 type_fact: column.type_fact.clone(),
@@ -159,7 +170,7 @@ impl ColumnBinding {
             },
             hidden: column.hidden,
             rowid_names: false,
-            using_name: lookup_name,
+            using_name: ColumnName(column.name.clone()),
         }
     }
 
@@ -168,21 +179,13 @@ impl ColumnBinding {
     }
 }
 
-fn lowercase_name(name: &str) -> Arc<str> {
-    let mut lowercase: Arc<str> = name.into();
-    Arc::get_mut(&mut lowercase)
-        .expect("a new name has one owner")
-        .make_ascii_lowercase();
-    lowercase
-}
-
 pub(crate) fn resolve_source_column(source: &hir::Source, name: &str) -> Result<ResolvedScopeExpr> {
     let normalized = crate::util::normalize_ident(name);
     source
         .columns
         .iter()
         .enumerate()
-        .find(|(_, column)| crate::util::normalize_ident(&column.name) == normalized)
+        .find(|(_, column)| column.name.eq_ignore_ascii_case(&normalized))
         .map(|(index, column)| ColumnBinding::from_source(source, index, column).resolved())
         .ok_or_else(|| {
             crate::LimboError::ParseError(format!(
@@ -412,7 +415,7 @@ impl Scope {
             visible.hidden = saved.visibility == GroupColumnVisibility::HiddenFromStar;
             match &saved.kind {
                 SavedGroupColumnKind::Using { name } | SavedGroupColumnKind::Table { name, .. } => {
-                    visible.lookup_name = name.as_str().into();
+                    visible.lookup_name = ColumnName(name.as_str().into());
                 }
                 // `*` never lists a saved rowid.
                 SavedGroupColumnKind::RowId { .. } => {
@@ -484,13 +487,17 @@ impl Scope {
                         kind: SavedGroupColumnKind::Table {
                             table: source.qualifier.clone(),
                             database: source.database,
-                            name: column.lookup_name.to_string(),
+                            name: column.lookup_name.normalized(),
                         },
                         visibility: GroupColumnVisibility::Visible,
                     },
                 };
-                if own_using.iter().any(|name| **name == *column.lookup_name)
-                    || next_using.iter().any(|name| **name == *column.lookup_name)
+                if own_using
+                    .iter()
+                    .any(|name| column.lookup_name.matches(name))
+                    || next_using
+                        .iter()
+                        .any(|name| column.lookup_name.matches(name))
                 {
                     saved.visibility = GroupColumnVisibility::QualifiedOnly;
                 }
@@ -506,7 +513,7 @@ impl Scope {
                     !source
                         .columns
                         .iter()
-                        .any(|column| column.lookup_name.eq_ignore_ascii_case(name))
+                        .any(|column| column.lookup_name.matches(name))
                 }) {
                     defs.push(GroupColumnDef {
                         name: name.to_string(),
@@ -794,7 +801,7 @@ impl Scope {
             source
                 .using_merged
                 .iter()
-                .find(|(merged, _)| merged == name)
+                .find(|(merged, _)| merged.eq_ignore_ascii_case(name))
                 .map(|(_, value)| *value)
         };
         for source in self.sources.iter() {
@@ -830,7 +837,7 @@ impl Scope {
                         if let Some(candidate) = source
                             .columns
                             .iter()
-                            .find(|candidate| *candidate.lookup_name == *column)
+                            .find(|candidate| candidate.lookup_name.matches(column))
                         {
                             add(candidate.resolved(), None)?;
                         }
@@ -844,7 +851,7 @@ impl Scope {
                         };
                         add(
                             source.columns[index].resolved(),
-                            merged_value(source, &source.columns[index].using_name)
+                            merged_value(source, source.columns[index].using_name.as_str())
                                 .or_else(|| merged_value(source, name)),
                         )?;
                     }
@@ -864,7 +871,7 @@ impl Scope {
             let declared = source
                 .columns
                 .iter()
-                .find(|candidate| *candidate.lookup_name == *column);
+                .find(|candidate| candidate.lookup_name.matches(column));
             match declared {
                 Some(candidate) => add(candidate.resolved(), merged_value(source, column))?,
                 None if source.rowid_available && is_rowid_name(column) => {
@@ -987,7 +994,7 @@ impl Scope {
             .filter(|column| !column.hidden)
             .map(|column| {
                 if bare_group {
-                    self.resolve_source_column(&column.lookup_name)?;
+                    self.resolve_source_column(&column.lookup_name.normalized())?;
                 }
                 let source = self
                     .sources
@@ -999,11 +1006,11 @@ impl Scope {
                         .into_iter()
                         .any(|(group, index)| {
                             let saved = group.saved.as_ref().expect("group");
-                            matches!(&saved[index].kind, SavedGroupColumnKind::Table { name, .. } if **name == *column.lookup_name)
+                            matches!(&saved[index].kind, SavedGroupColumnKind::Table { name, .. } if column.lookup_name.matches(name))
                                 && !group
                                     .using_merged
                                     .iter()
-                                    .any(|(merged, _)| **merged == *column.lookup_name)
+                                    .any(|(merged, _)| column.lookup_name.matches(merged))
                         });
                     if collides {
                         let written = match self.database_name(source.database) {
@@ -1075,7 +1082,7 @@ impl Scope {
                     let resolved = if source
                         .star_merged
                         .iter()
-                        .any(|name| **name == *column.lookup_name)
+                        .any(|name| column.lookup_name.matches(name))
                     {
                         self.merged_star_column(column)?
                     } else {
@@ -1104,7 +1111,9 @@ impl Scope {
                 // The one source of a FROM clause expands them as bare
                 // names, by the unique names the group gave them.
                 let resolved = if bare {
-                    let Some(resolved) = self.resolve_source_column(&column.using_name)? else {
+                    let Some(resolved) =
+                        self.resolve_source_column(&column.using_name.normalized())?
+                    else {
                         crate::bail_parse_error!("no such column: {}", column.display_name);
                     };
                     resolved
@@ -1137,7 +1146,7 @@ impl Scope {
                 let resolved = if source
                     .star_merged
                     .iter()
-                    .any(|name| **name == *column.lookup_name)
+                    .any(|name| column.lookup_name.matches(name))
                 {
                     self.merged_star_column(column)?
                 } else {
@@ -1169,13 +1178,13 @@ impl Scope {
                     SavedGroupColumnKind::RowId { .. } => None,
                 }
             })
-            .unwrap_or_else(|| column.lookup_name.to_string())
+            .unwrap_or_else(|| column.lookup_name.normalized())
     }
 
     /// The value `table.*` reads for a column a later USING merged: the one
     /// visible column of that name, as an unqualified reference would find.
     fn merged_star_column(&self, column: &ColumnBinding) -> Result<ResolvedScopeExpr> {
-        self.merged_star_column_named(&column.lookup_name, &column.display_name)
+        self.merged_star_column_named(column.lookup_name.as_str(), &column.display_name)
     }
 
     fn merged_star_column_named(
@@ -1186,7 +1195,7 @@ impl Scope {
         let mut matches = self
             .visible_columns
             .iter()
-            .filter(|visible| *visible.lookup_name == *lookup_name);
+            .filter(|visible| visible.lookup_name.matches(lookup_name));
         let Some(first) = matches.next() else {
             crate::bail_parse_error!("no such column: {display_name}");
         };
@@ -1222,7 +1231,7 @@ impl Scope {
             self.visible_columns.iter().find(|column| {
                 column.source == source.id
                     && (!natural || !column.hidden)
-                    && *column.using_name == *normalized
+                    && column.using_name.matches(&normalized)
             })
         });
         let Some(column) = matches.next() else {
@@ -1250,7 +1259,9 @@ impl Scope {
                 let lookup = crate::util::normalize_ident(&right_column.name);
                 self.visible_columns
                     .iter()
-                    .find(|left_column| !left_column.hidden && *left_column.using_name == *lookup)
+                    .find(|left_column| {
+                        !left_column.hidden && left_column.using_name.matches(&lookup)
+                    })
                     .map(|_| right_column.name.to_string())
             })
             .collect()
@@ -1285,7 +1296,7 @@ impl Scope {
                 .enumerate()
                 .find(|(position, column)| {
                     *position != right_position
-                        && *column.using_name == *lookup_name
+                        && column.using_name.matches(&lookup_name)
                         && same_join_column(&column.resolved.expr, &using.left)
                 })
                 .map(|(position, _)| position);
@@ -1324,7 +1335,7 @@ impl Scope {
             // `lookupName` lets the right-most table win.
             let right_join = using.value == hir::MergedColumnValue::Right;
             Arc::make_mut(&mut self.visible_columns).retain(|column| {
-                if *column.lookup_name != *lookup_name {
+                if !column.lookup_name.matches(&lookup_name) {
                     return true;
                 }
                 if same_join_column(&column.resolved.expr, &merged_expr) {
@@ -1344,7 +1355,7 @@ impl Scope {
         for column in self
             .visible_columns
             .iter()
-            .filter(|column| !column.rowid_names && *column.lookup_name == *name)
+            .filter(|column| !column.rowid_names && column.lookup_name.matches(name))
         {
             if found.is_some() {
                 crate::bail_parse_error!("ambiguous column name: {}", name);
@@ -1491,13 +1502,17 @@ pub(crate) mod tests {
             &bindings[0].display_name,
             &source.columns[0].name
         ));
-        assert_eq!(&*bindings[0].lookup_name, "value");
         assert!(Arc::ptr_eq(
-            &scope.visible_columns[0].lookup_name,
-            &bindings[0].lookup_name
+            &bindings[0].lookup_name.0,
+            &source.columns[0].name
         ));
         assert!(Arc::ptr_eq(
-            &bindings[1].lookup_name,
+            &scope.visible_columns[0].using_name.0,
+            &source.columns[0].name
+        ));
+        assert!(bindings[0].lookup_name.matches("value"));
+        assert!(Arc::ptr_eq(
+            &bindings[1].lookup_name.0,
             &source.columns[1].name
         ));
     }
