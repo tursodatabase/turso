@@ -3272,12 +3272,13 @@ impl Jsonb {
                 bail_parse_error!("Invalid key type");
             }
             let key_text =
-                decoded_key_text(&patch.data, patch_cursor, key_header, key_header_size)?;
+                read_text_payload(&patch.data, patch_cursor + key_header_size, key_header.1)?;
+            let key_is_escaped = matches!(key_header.0, ElementType::TEXTJ | ElementType::TEXT5);
             let value_idx = patch_cursor + key_header_size + key_header.1;
             let value_end = patch.skip_element(value_idx)?;
             let value_type = patch.read_header(value_idx)?.0 .0;
 
-            match self.find_object_member(members_start, members_end, &key_text)? {
+            match self.find_object_member(members_start, members_end, (key_text, key_is_escaped))? {
                 Some((member_start, member_value, member_end)) => {
                     if value_type == ElementType::NULL {
                         self.data.drain(member_start..member_end);
@@ -3324,7 +3325,7 @@ impl Jsonb {
         &self,
         members_start: usize,
         members_end: usize,
-        key_text: &str,
+        patch_key: (&str, bool),
     ) -> Result<Option<(usize, usize, usize)>> {
         let mut cursor = members_start;
         while cursor < members_end {
@@ -3334,7 +3335,8 @@ impl Jsonb {
             }
             let value_idx = cursor + key_header_size + key_header.1;
             let member_end = self.skip_element(value_idx)?;
-            if decoded_key_text(&self.data, cursor, key_header, key_header_size)? == key_text {
+            let key_text = read_text_payload(&self.data, cursor + key_header_size, key_header.1)?;
+            if compare((key_text, key_header.0), patch_key) {
                 return Ok(Some((cursor, value_idx, member_end)));
             }
             cursor = member_end;
@@ -3538,19 +3540,6 @@ fn read_text_payload(data: &[u8], start: usize, len: usize) -> Result<&str> {
         bail_parse_error!("malformed JSON: text payload extends beyond data");
     };
     from_utf8(bytes).map_err(|_| LimboError::ParseError("malformed JSON".to_string()))
-}
-
-fn decoded_key_text(
-    data: &[u8],
-    key_idx: usize,
-    key_header: JsonbHeader,
-    key_header_size: usize,
-) -> Result<Cow<'_, str>> {
-    let key_text = read_text_payload(data, key_idx + key_header_size, key_header.1)?;
-    Ok(match key_header.0 {
-        ElementType::TEXT5 | ElementType::TEXTJ => Cow::Owned(unescape_string(key_text)),
-        _ => Cow::Borrowed(key_text),
-    })
 }
 
 /// Picks the element type for an object key created from a path label.
