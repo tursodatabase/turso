@@ -1692,6 +1692,57 @@ expect {
     8C1761133117621332
 }
 
+test json-patch-keeps-escapes-in-added-keys {
+    select json_patch('{}', '{"\u00e9":1}');
+    select json_patch('{"a":1}', '{"b\u00e9":2}');
+    select json_patch('{"a":1}', '{"a":"\u00e9"}');
+    select json_patch('{"a":{"x":1}}', '{"a":{"b\u00e9":{"c":null,"d\n":[1]}},"f\u0041":{"g":{}}}');
+}
+expect {
+    {"\u00e9":1}
+    {"a":1,"b\u00e9":2}
+    {"a":"\u00e9"}
+    {"a":{"x":1,"b\u00e9":{"d\n":[1]}},"f\u0041":{"g":{}}}
+}
+
+test json-patch-matches-escaped-keys-by-value {
+    select json_patch('{"\u00e9":1}', '{"é":2}');
+    select json_patch('{"é":1}', '{"\u00e9":2}');
+}
+expect {
+    {"\u00e9":2}
+    {"é":2}
+}
+
+test jsonb-patch-copies-added-key-bytes {
+    select hex(jsonb_patch('{}', '{"x\ny":1}'));
+    select json_valid(jsonb_patch('{}', '{"x\ny":1}'), 8);
+    select hex(jsonb_patch('{"a":{"b":1}}', jsonb('{a:{c:2},"x\x41":3}')));
+}
+expect {
+    7C48785C6E791331
+    1
+    CC1317618C176213311763133259785C7834311333
+}
+
+test json-patch-object-over-non-object-starts-empty {
+    select json_patch('{"a":1}', '{"a":{"b":1,"b":null}}');
+    select json_patch('{"a":1}', '{"a":{"b":{"x":1},"b":{"y":2}}}');
+    select json_patch('{"a":[1],"c":2}', '{"a":{"b":{"c":null,"d":{"e":null}}},"c":{"x":null}}');
+}
+expect {
+    {"a":{}}
+    {"a":{"b":{"x":1,"y":2}}}
+    {"a":{"b":{"d":{}}},"c":{}}
+}
+
+test json-patch-does-not-decode-textraw-keys {
+    select json_patch('{"a\nb":0}', x'7C4A615C6E621331');
+}
+expect {
+    {"a\nb":0,"a\\\\nb":1}
+}
+
 test json-remove-1 {
     select json_remove('{"a": 5, "a": [5,4,3,2,1]}','$.a', '$.a[4]', '$.a[5]', '$.a');
 }

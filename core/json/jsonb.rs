@@ -3267,6 +3267,19 @@ impl Jsonb {
                 continue;
             }
 
+            let target_is_object = result
+                .navigate_path(&path, PathOperationMode::ReplaceExisting)
+                .is_ok_and(|stack| {
+                    stack.last().is_some_and(|target| {
+                        result
+                            .element_type_at(target.field_value_index)
+                            .is_ok_and(|element_type| element_type == ElementType::OBJECT)
+                    })
+                });
+            if !target_is_object {
+                continue;
+            }
+
             let patch_end = patch_cursor + patch_obj_header_size + patch_obj_header.1;
             let mut patch_key_cursor = patch_cursor + patch_obj_header_size;
 
@@ -3284,31 +3297,58 @@ impl Jsonb {
                 // Read the value
                 let value_cursor = key_start + key_header.1;
                 let (value_header, value_header_size) = patch.read_header(value_cursor)?;
-                let key_text = if matches!(
-                    key_header.0,
-                    ElementType::TEXT5 | ElementType::TEXTJ | ElementType::TEXTRAW
-                ) {
+                let key_text = if matches!(key_header.0, ElementType::TEXT5 | ElementType::TEXTJ) {
                     Cow::Owned(unescape_string(key_text))
                 } else {
                     Cow::Borrowed(key_text)
                 };
 
                 key_values.push((
+                    patch_key_cursor..value_cursor,
                     key_text,
                     value_header.0,
-                    value_cursor,
-                    value_header_size,
-                    value_header.1,
+                    value_cursor..value_cursor + value_header_size + value_header.1,
                 ));
 
                 patch_key_cursor = value_cursor + value_header_size + value_header.1;
             }
 
-            for (key_text, value_type, value_cursor, value_header_size, value_size) in key_values {
-                // Create a path to this key
+            for (key_range, key_text, value_type, value_range) in key_values {
                 let mut key_path = path.clone();
-
                 key_path.elements.push(PathElement::Key(key_text, false));
+
+                let Ok(target_stack) =
+                    result.navigate_path(&key_path, PathOperationMode::ReplaceExisting)
+                else {
+                    let empty_obj = JsonbHeader::make_obj().into_bytes();
+                    let value_data = match value_type {
+                        ElementType::NULL => continue,
+                        ElementType::OBJECT => empty_obj.as_bytes(),
+                        _ => &patch.data[value_range.clone()],
+                    };
+                    let key_data = &patch.data[key_range];
+                    let object_stack =
+                        result.navigate_path(&path, PathOperationMode::ReplaceExisting)?;
+                    let object_idx = object_stack
+                        .last()
+                        .ok_or_else(|| {
+                            LimboError::InternalError("object path should not be empty".to_string())
+                        })?
+                        .field_value_index;
+                    let object_end = result.skip_element(object_idx)?;
+                    result.data.splice(
+                        object_end..object_end,
+                        key_data.iter().chain(value_data).copied(),
+                    );
+                    result.update_parent_references(
+                        object_stack,
+                        (key_data.len() + value_data.len()) as isize,
+                    )?;
+                    if value_type == ElementType::OBJECT {
+                        work_stack.push_back((key_path, value_range.start));
+                    }
+                    continue;
+                };
 
                 match value_type {
                     ElementType::NULL => {
@@ -3317,47 +3357,27 @@ impl Jsonb {
                         let _ = result.operate_on_path(&key_path, &mut op);
                     }
                     ElementType::OBJECT => {
-                        let value_data = &patch.data
-                            [value_cursor..value_cursor + value_header_size + value_size];
+                        let target_value_idx = target_stack
+                            .last()
+                            .ok_or_else(|| {
+                                LimboError::InternalError(
+                                    "target stack should not be empty".to_string(),
+                                )
+                            })?
+                            .field_value_index;
+                        let (target_header, _) = result.read_header(target_value_idx)?;
 
-                        let target_path_result =
-                            result.navigate_path(&key_path, PathOperationMode::ReplaceExisting);
-
-                        if let Ok(target_stack) = target_path_result {
-                            let target_value_idx = target_stack
-                                .last()
-                                .ok_or_else(|| {
-                                    LimboError::InternalError(
-                                        "target stack should not be empty".to_string(),
-                                    )
-                                })?
-                                .field_value_index;
-                            let (target_header, _) = result.read_header(target_value_idx)?;
-
-                            if target_header.0 == ElementType::OBJECT {
-                                work_stack.push_back((key_path, value_cursor));
-                            } else {
-                                let patch_obj = Jsonb::from_raw_data(value_data)?;
-                                let mut op = ReplaceOperation::new(patch_obj);
-                                result.operate_on_path(&key_path, &mut op)?;
-                                let _ = result.operate_on_path(&key_path, &mut op);
-
-                                work_stack.push_back((key_path, value_cursor));
-                            }
-                        } else {
+                        if target_header.0 != ElementType::OBJECT {
                             let empty_obj = Jsonb::from_raw_data(
                                 JsonbHeader::make_obj().into_bytes().as_bytes(),
                             )?;
-                            let mut op = SetOperation::new(empty_obj);
-                            let _ = result.operate_on_path(&key_path, &mut op);
-
-                            work_stack.push_back((key_path, value_cursor));
+                            let mut op = ReplaceOperation::new(empty_obj);
+                            result.operate_on_path(&key_path, &mut op)?;
                         }
+                        work_stack.push_back((key_path, value_range.start));
                     }
                     _ => {
-                        let value_data = &patch.data
-                            [value_cursor..value_cursor + value_header_size + value_size];
-                        let patch_value = Jsonb::from_raw_data(value_data)?;
+                        let patch_value = Jsonb::from_raw_data(&patch.data[value_range])?;
 
                         let mut op = SetOperation::new(patch_value);
 
