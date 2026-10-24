@@ -23314,6 +23314,180 @@ fn test_passive_checkpoint_preserves_late_dropped_root_tracking() {
     );
 }
 
+/// Repro for https://github.com/tursodatabase/turso/issues/8004.
+///
+/// When a passive checkpoint collects a newly-created negative-root table before
+/// `DROP TABLE` starts, and `DROP TABLE` pauses at `LogRecordPrepared` until
+/// after the checkpoint publishes the positive root page, committing the DROP
+/// must preserve the dropped root in `dropped_root_pages` (and keep other
+/// published positive roots on surviving tables) until a later checkpoint frees it.
+#[test]
+fn test_passive_checkpoint_preserves_drop_committed_after_root_publication() {
+    use crate::StepResult;
+
+    let _ = tracing_subscriber::fmt::try_init();
+    let db = MvccTestDbNoConn::new_with_random_db_passive();
+    let setup = db.connect();
+    setup
+        .execute("PRAGMA mvcc_checkpoint_threshold = -1")
+        .unwrap();
+    setup
+        .execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)")
+        .unwrap();
+    setup
+        .execute("CREATE TABLE driver(id INTEGER PRIMARY KEY)")
+        .unwrap();
+    setup.execute("INSERT INTO t VALUES (1, 'live')").unwrap();
+    let root_page = get_rows(
+        &setup,
+        "SELECT rootpage FROM sqlite_schema WHERE type = 'table' AND name = 't'",
+    )[0][0]
+        .as_int()
+        .unwrap();
+    assert!(root_page < 0);
+
+    let checkpointer = db.connect();
+    checkpointer
+        .execute("PRAGMA mvcc_checkpoint_threshold = 0")
+        .unwrap();
+    let checkpoint_injector =
+        FixedYieldInjector::new([CheckpointYieldPoint::AfterCollectTableRows.point()]);
+    checkpointer.set_yield_injector(Some(checkpoint_injector.clone()));
+    let mut checkpoint = checkpointer
+        .prepare("INSERT INTO driver VALUES (1)")
+        .unwrap();
+    let io = checkpointer.pager.load().io.clone();
+    let mut checkpoint_yielded = false;
+    for _ in 0..200_000 {
+        match checkpoint.step().unwrap() {
+            StepResult::Yield if checkpoint_injector.is_empty() => {
+                checkpoint_yielded = true;
+                break;
+            }
+            StepResult::IO => io.step().unwrap(),
+            StepResult::Yield => {}
+            StepResult::Done => {
+                panic!("checkpoint completed before AfterCollectTableRows yielded")
+            }
+            other => panic!("unexpected checkpoint result before yield: {other:?}"),
+        }
+    }
+    assert!(checkpoint_yielded);
+
+    let dropper = db.connect();
+    let drop_injector = FixedYieldInjector::new([CommitYieldPoint::LogRecordPrepared.point()]);
+    dropper.set_yield_injector(Some(drop_injector.clone()));
+    let mut drop_table = dropper.prepare("DROP TABLE t").unwrap();
+    assert!(matches!(drop_table.step().unwrap(), StepResult::Yield));
+    assert!(drop_injector.is_empty());
+
+    checkpointer.set_yield_injector(None);
+    checkpoint.run_ignore_rows().unwrap();
+    drop(checkpoint);
+
+    dropper.set_yield_injector(None);
+    drop_table.run_ignore_rows().unwrap();
+    drop(drop_table);
+
+    assert_integrity_ok(&dropper);
+
+    let observer = db.connect();
+    let table_rows = get_rows(
+        &observer,
+        "SELECT name FROM sqlite_schema WHERE type = 'table' AND name = 't'",
+    );
+    assert!(table_rows.is_empty());
+    assert_integrity_ok(&observer);
+
+    observer.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+    assert!(observer.db.schema.lock().dropped_root_pages.is_empty());
+    assert_integrity_ok(&observer);
+}
+
+#[test]
+fn test_passive_checkpoint_preserves_drop_index_committed_after_root_publication() {
+    use crate::StepResult;
+
+    let _ = tracing_subscriber::fmt::try_init();
+    let db = MvccTestDbNoConn::new_with_random_db_passive();
+    let setup = db.connect();
+    setup
+        .execute("PRAGMA mvcc_checkpoint_threshold = -1")
+        .unwrap();
+    setup
+        .execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)")
+        .unwrap();
+    setup.execute("CREATE INDEX idx ON t(v)").unwrap();
+    setup
+        .execute("CREATE TABLE driver(id INTEGER PRIMARY KEY)")
+        .unwrap();
+    setup.execute("INSERT INTO t VALUES (1, 'live')").unwrap();
+    let index_root_page = get_rows(
+        &setup,
+        "SELECT rootpage FROM sqlite_schema WHERE type = 'index' AND name = 'idx'",
+    )[0][0]
+        .as_int()
+        .unwrap();
+    assert!(index_root_page < 0);
+
+    let checkpointer = db.connect();
+    checkpointer
+        .execute("PRAGMA mvcc_checkpoint_threshold = 0")
+        .unwrap();
+    let checkpoint_injector =
+        FixedYieldInjector::new([CheckpointYieldPoint::AfterCollectTableRows.point()]);
+    checkpointer.set_yield_injector(Some(checkpoint_injector.clone()));
+    let mut checkpoint = checkpointer
+        .prepare("INSERT INTO driver VALUES (1)")
+        .unwrap();
+    let io = checkpointer.pager.load().io.clone();
+    let mut checkpoint_yielded = false;
+    for _ in 0..200_000 {
+        match checkpoint.step().unwrap() {
+            StepResult::Yield if checkpoint_injector.is_empty() => {
+                checkpoint_yielded = true;
+                break;
+            }
+            StepResult::IO => io.step().unwrap(),
+            StepResult::Yield => {}
+            StepResult::Done => {
+                panic!("checkpoint completed before AfterCollectTableRows yielded")
+            }
+            other => panic!("unexpected checkpoint result before yield: {other:?}"),
+        }
+    }
+    assert!(checkpoint_yielded);
+
+    let dropper = db.connect();
+    let drop_injector = FixedYieldInjector::new([CommitYieldPoint::LogRecordPrepared.point()]);
+    dropper.set_yield_injector(Some(drop_injector.clone()));
+    let mut drop_index = dropper.prepare("DROP INDEX idx").unwrap();
+    assert!(matches!(drop_index.step().unwrap(), StepResult::Yield));
+    assert!(drop_injector.is_empty());
+
+    checkpointer.set_yield_injector(None);
+    checkpoint.run_ignore_rows().unwrap();
+    drop(checkpoint);
+
+    dropper.set_yield_injector(None);
+    drop_index.run_ignore_rows().unwrap();
+    drop(drop_index);
+
+    assert_integrity_ok(&dropper);
+
+    let observer = db.connect();
+    let index_rows = get_rows(
+        &observer,
+        "SELECT name FROM sqlite_schema WHERE type = 'index' AND name = 'idx'",
+    );
+    assert!(index_rows.is_empty());
+    assert_integrity_ok(&observer);
+
+    observer.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+    assert!(observer.db.schema.lock().dropped_root_pages.is_empty());
+    assert_integrity_ok(&observer);
+}
+
 /// Unlocking before `on_checkpoint_end` races writers and the next checkpoint.
 #[test]
 fn on_checkpoint_end_runs_before_blocking_checkpoint_unlock() {

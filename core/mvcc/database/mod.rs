@@ -9340,24 +9340,39 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
             }
             self.table_id_to_rootpage
                 .get(&MVTableId::from(root_page))
-                .filter(|e| e.value().is_live())
+                .filter(|e| e.value().is_live() && e.value().materialized_at != WalPos::STAGED)
                 .and_then(|e| e.value().root_page)
                 .map(|r| r as i64)
         };
-        for (_, table) in schema.tables_mut(NamespaceId::ROOT) {
+        #[cfg(feature = "conn_raw_api")]
+        let mut raw_root_updates: Vec<(i64, i64, String)> = Vec::new();
+        for (name, table) in schema.tables_mut(NamespaceId::ROOT) {
+            #[cfg(not(feature = "conn_raw_api"))]
+            let _ = name;
             let needs = table
                 .btree()
                 .is_some_and(|b| resolve(b.root_page).is_some());
             if !needs {
                 continue;
             }
+            #[cfg(feature = "conn_raw_api")]
+            let table_name = name.to_string();
             let table = Arc::make_mut(table);
             if let Some(btree_table) = table.btree_mut() {
                 let btree_table = Arc::make_mut(btree_table);
                 if let Some(rp) = resolve(btree_table.root_page) {
+                    #[cfg(feature = "conn_raw_api")]
+                    let old_root_page = btree_table.root_page;
                     btree_table.root_page = rp;
+                    #[cfg(feature = "conn_raw_api")]
+                    raw_root_updates.push((old_root_page, rp, table_name));
                 }
             }
+        }
+        #[cfg(feature = "conn_raw_api")]
+        for (old_root_page, rp, table_name) in raw_root_updates {
+            schema.table_names_by_root_page.remove(&old_root_page);
+            schema.table_names_by_root_page.insert(rp, table_name);
         }
         for index in schema.indexes_mut(NamespaceId::ROOT) {
             if let Some(rp) = resolve(index.root_page) {
@@ -9374,7 +9389,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         }
         self.table_id_to_rootpage
             .get(&MVTableId::from(root_page))
-            .filter(|e| e.value().is_live())
+            .filter(|e| e.value().is_live() && e.value().materialized_at != WalPos::STAGED)
             .and_then(|e| e.value().root_page)
             .map(|r| r as i64)
             .unwrap_or(root_page)
