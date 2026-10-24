@@ -3816,7 +3816,7 @@ mod rename_column_view {
 
 pub use rename_column_view::{rewrite_view_sql_for_column_rename, RewrittenView};
 
-/// Rewrite table-qualified column references in a CHECK constraint expression,
+/// Rewrite table-qualified column references in a stored schema expression,
 /// replacing the table name from `from` to `to`. For example, `t1.a > 0` becomes
 /// `t2.a > 0` when renaming t1 to t2. This matches SQLite 3.49.1+ behavior which
 /// rewrites qualified refs during ALTER TABLE RENAME instead of rejecting them.
@@ -3829,6 +3829,11 @@ pub fn rewrite_check_expr_table_refs(expr: &mut ast::Expr, from: &str, to: &str)
                     if tbl.as_str().eq_ignore_ascii_case(from) {
                         let col = col.clone();
                         *e = ast::Expr::Qualified(ast::Name::exact(to.to_owned()), col);
+                    }
+                }
+                ast::Expr::DoublyQualified(_, tbl, _) => {
+                    if tbl.as_str().eq_ignore_ascii_case(from) {
+                        *tbl = ast::Name::exact(to.to_owned());
                     }
                 }
                 ast::Expr::Exists(select) | ast::Expr::Subquery(select) => {

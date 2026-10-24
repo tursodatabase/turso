@@ -1,0 +1,54 @@
+@database :memory:
+
+# The stored schema text that ALTER TABLE ... RENAME TO writes for an index.
+# SQLite rewrites the same references but quotes the names differently
+# (ON "uu" ... WHERE "uu".a, and temp."uu".a), so these text expectations are
+# Turso's and live here rather than in sqlite-sqltests.
+
+test rename-table-partial-index-where-sql {
+    CREATE TABLE u (a, b, c);
+    CREATE INDEX pa ON u (a) WHERE u.a > 0;
+    ALTER TABLE u RENAME TO uu;
+    SELECT sql FROM sqlite_schema WHERE name = 'pa';
+}
+expect {
+    CREATE INDEX pa ON uu (a) WHERE uu.a > 0
+}
+
+test rename-table-partial-index-where-sql-attached-db {
+    ATTACH ':memory:' AS aux;
+    CREATE TABLE aux.u (a, b, c);
+    CREATE INDEX aux.pa ON u (a) WHERE aux.u.a > 0;
+    ALTER TABLE aux.u RENAME TO uu;
+    SELECT sql FROM aux.sqlite_schema WHERE name = 'pa';
+}
+expect {
+    CREATE INDEX pa ON uu (a) WHERE aux.uu.a > 0
+}
+
+# Re-emitting the statement quotes the database name because temp is a keyword.
+test rename-table-partial-index-where-sql-temp {
+    CREATE TEMP TABLE u (a, b, c);
+    CREATE INDEX temp.pa ON u (a) WHERE temp.u.a > 0;
+    ALTER TABLE temp.u RENAME TO uu;
+    SELECT sql FROM temp.sqlite_schema WHERE name = 'pa';
+}
+expect {
+    CREATE INDEX pa ON uu (a) WHERE "temp".uu.a > 0
+}
+
+# SQLite rejects the "." operator in an index expression, so only Turso can
+# reach this case. The rename must still rewrite the key expression.
+test rename-table-expression-index-key {
+    CREATE TABLE u (a, b, c);
+    INSERT INTO u VALUES (7, 8, 9);
+    CREATE INDEX ea ON u (u.a + 1);
+    ALTER TABLE u RENAME TO uu;
+    SELECT sql FROM sqlite_schema WHERE name = 'ea';
+    ALTER TABLE uu DROP COLUMN b;
+    SELECT * FROM uu;
+}
+expect {
+    CREATE INDEX ea ON uu (uu.a + 1)
+    7|9
+}
