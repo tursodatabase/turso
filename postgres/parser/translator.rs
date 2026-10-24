@@ -2371,7 +2371,7 @@ impl PostgreSQLTranslator {
         }
 
         let name = ast::Name::from_string(func_name);
-        let qualified_name = if is_catalog_table_name(func_name) {
+        let qualified_name = if function_uses_main_schema(func_name) {
             ast::QualifiedName::fullname(ast::Name::from_string("main"), name)
         } else {
             ast::QualifiedName::single(name)
@@ -2440,6 +2440,11 @@ impl PostgreSQLTranslator {
             )));
         }
         reject_column_aliases(&range_func.alias, "a function")?;
+
+        fn function_uses_main_schema(name: &str) -> bool {
+            is_catalog_table_name(name) || name == "generate_series"
+        }
+
         Ok(ast::SelectTable::TableCall(qualified_name, args, alias))
     }
 
@@ -7111,7 +7116,7 @@ mod tests {
             ),
             (
                 "SELECT g.n FROM generate_series(1, 3) AS g(n)",
-                "SELECT g.n FROM LATERAL (SELECT value n FROM generate_series (1, 3)) g",
+                "SELECT g.n FROM LATERAL (SELECT value n FROM main.generate_series (1, 3)) g",
             ),
         ] {
             assert_eq!(translate(sql).unwrap(), expected, "{sql}");

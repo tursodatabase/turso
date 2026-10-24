@@ -63,7 +63,7 @@ Basics not enumerated by the official feature matrix.
 | Parameters (`$1`, `$2`, ...) | 🟡 Partial | Work through the extended wire protocol; text-format values only |
 | Operators: `\|\|`, `%`, bitwise, LIKE/ILIKE [ESCAPE], SIMILAR TO, `~`/`~*`/`!~`/`!~*`, IS [NOT] DISTINCT FROM, BETWEEN | ✅ Supported | BETWEEN SYMMETRIC, SIMILAR TO ... ESCAPE and non-literal SIMILAR TO patterns are rejected. Regex operators lower to REGEXP; `~*`/`!~*` add the `(?i)` flag. LIKE is case-sensitive with `\` as the default escape; ILIKE applies LOWER() to both sides, then matches like LIKE. In CREATE INDEX, LIKE and ILIKE need a string-literal pattern without ESCAPE |
 | Dollar-quoted strings, escape strings (`E'...'`), bit/hex string literals | ✅ Supported | |
-| generate_series | ✅ Supported | In FROM and with joins; column aliases on the function (`AS g(x)`) do not resolve |
+| generate_series | ✅ Supported | In FROM and with joins; column alias lists (`AS g(x)`) work; qualified and unqualified calls resolve even with an empty search_path |
 | pg_catalog emulation | 🟡 Partial | See Backend section |
 | SET / SHOW | 🟡 Partial | Only search_path (`SET`, `SHOW`, `set_config`, `current_setting`). SET of a few parameters to the value Turso already behaves as (e.g. `statement_timeout = 0`, `DateStyle = ISO`, `extra_float_digits = 3`, as sent by pg_dump) is accepted as a no-op; anything else is rejected |
 
