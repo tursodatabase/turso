@@ -6448,10 +6448,7 @@ fn op_row_id_read(state: &mut ProgramState, cursor_id: usize, dest: usize) -> In
     fn row_id_of_other_cursor(cursor: &mut Option<Cursor>) -> IOResultOr<Option<i64>> {
         match cursor {
             Some(Cursor::NullRow) => Ok(IOResult::Done(None)),
-            Some(Cursor::Virtual(virtual_cursor)) => {
-                let rowid = virtual_cursor.rowid();
-                Ok(IOResult::Done((rowid != 0).then_some(rowid)))
-            }
+            Some(Cursor::Virtual(virtual_cursor)) => Ok(IOResult::Done(virtual_cursor.rowid())),
             Some(Cursor::Delta(delta_cursor)) => Ok(IOResult::Done(Some(delta_cursor.rowid()))),
             Some(Cursor::IndexMethod(cursor)) => cursor.query_rowid(),
             Some(Cursor::Pseudo(_)) => Ok(IOResult::Done(None)),
