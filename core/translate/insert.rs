@@ -736,8 +736,11 @@ pub fn translate_insert(
     //
     // SQLite checks NOT NULL before the STRICT types, unless the table has generated columns or
     // BEFORE triggers: then the row is type checked first, before computing the generated
-    // columns or firing the triggers. Columns with a custom type are always checked for NOT NULL
-    // after encoding, because their NOT NULL check looks at the decoded value.
+    // columns or firing the triggers. Otherwise SQLite checks the types right before the first
+    // CHECK constraint, or, if there is none, after a non-REPLACE rowid conflict check and
+    // before the first index, so no REPLACE deletes a row before the types are checked. Columns with a custom type are always checked for NOT NULL after encoding,
+    // because their NOT NULL check looks at the decoded value, and tables with custom types
+    // are always type checked here, before the CHECK constraints and the rowid conflict check.
     //TODO building the type-check table is expensive, we should cache it somehow.
     let maybe_type_check_table = ctx
         .table
@@ -751,37 +754,35 @@ pub fn translate_insert(
                 .is_some()
     };
     let types_checked_first = has_before_triggers || insertion.has_virtual_columns();
+    let types_checked_after_rowid_conflict = !types_checked_first
+        && ctx.table.check_constraints.is_empty()
+        && !ctx.table.has_custom_type_columns(resolver.schema());
     if !types_checked_first {
         emit_notnulls(program, &ctx, &insertion, resolver, |column| {
             !column.is_virtual_generated() && !has_custom_type(column)
         })?;
     }
+    let mut deferred_type_check_table = None;
     if let Some(type_check_table) = &maybe_type_check_table {
-        // Pre-encoding TypeCheck: validate input types match the custom type's declared value type
-        // to catch things like a TEXT value inserted into an INTEGER-based custom type.
-        program.emit_insn(Insn::TypeCheck {
-            start_reg: insertion.first_col_register(),
-            count: insertion.num_non_virtual_cols,
-            check_generated: false,
-            table_reference: BTreeTable::input_type_check_table_ref(
-                ctx.table,
-                resolver.schema(),
-                None,
-            )?,
-        });
+        if types_checked_after_rowid_conflict {
+            deferred_type_check_table = Some(Arc::clone(type_check_table));
+        } else {
+            // Pre-encoding TypeCheck: validate input types match the custom type's declared value
+            // type to catch things like a TEXT value inserted into an INTEGER-based custom type.
+            emit_type_check(
+                program,
+                &insertion,
+                BTreeTable::input_type_check_table_ref(ctx.table, resolver.schema(), None)?,
+            );
 
-        // Encode values for columns with custom types.
-        emit_custom_type_encode(program, resolver, &insertion, &ctx.table.name)?;
+            // Encode values for columns with custom types.
+            emit_custom_type_encode(program, resolver, &insertion, &ctx.table.name)?;
 
-        // Post-encode TypeCheck: validate that encode produced the correct storage type (BASE).
-        // We don't check generated columns in this initial pass because their dependencies could
-        // still be REPLACEd.
-        program.emit_insn(Insn::TypeCheck {
-            start_reg: insertion.first_col_register(),
-            count: insertion.num_non_virtual_cols,
-            check_generated: false,
-            table_reference: Arc::clone(type_check_table),
-        });
+            // Post-encode TypeCheck: validate that encode produced the correct storage type
+            // (BASE). We don't check generated columns in this initial pass because their
+            // dependencies could still be REPLACEd.
+            emit_type_check(program, &insertion, Arc::clone(type_check_table));
+        }
     }
     emit_notnulls(program, &ctx, &insertion, resolver, |column| {
         !column.is_virtual_generated() && (types_checked_first || has_custom_type(column))
@@ -886,6 +887,7 @@ pub fn translate_insert(
         effective_on_conflict: ctx.on_conflict,
         connection,
         table_references: &mut table_references,
+        deferred_type_check_table,
     };
 
     // Populate register-to-affinity map so partial index WHERE clauses get
@@ -918,6 +920,9 @@ pub fn translate_insert(
         &constraints,
         &mut preflight_ctx,
     )?;
+    if let Some(type_check_table) = preflight_ctx.deferred_type_check_table.take() {
+        emit_type_check(program, &insertion, type_check_table);
+    }
 
     // Create and insert the record
     emit_make_record(
@@ -2171,11 +2176,20 @@ fn bind_insert(
     }
     if let ResolveType::Ignore = on_conflict {
         program.set_resolve_type(ResolveType::Ignore);
-        upsert.replace(Box::new(ast::Upsert {
-            do_clause: UpsertDo::Nothing,
-            index: None,
-            next: None,
-        }));
+        let mut chain_end = &mut upsert;
+        while chain_end
+            .as_ref()
+            .is_some_and(|clause| clause.index.is_some())
+        {
+            chain_end = &mut chain_end.as_mut().expect("checked above").next;
+        }
+        if chain_end.is_none() {
+            chain_end.replace(Box::new(ast::Upsert {
+                do_clause: UpsertDo::Nothing,
+                index: None,
+                next: None,
+            }));
+        }
     } else {
         program.set_resolve_type(on_conflict);
     }
@@ -3391,6 +3405,13 @@ fn emit_preflight_constraint_checks(
         preflight.on_replace = effective_on_replace;
         preflight.effective_on_conflict = effective;
 
+        if effective == ResolveType::Replace || matches!(constraint, ResolvedUpsertTarget::Index(_))
+        {
+            if let Some(type_check_table) = preflight.deferred_type_check_table.take() {
+                emit_type_check(program, insertion, type_check_table);
+            }
+        }
+
         match constraint {
             ResolvedUpsertTarget::PrimaryKey => {
                 emit_pk_uniqueness_check(
@@ -3607,6 +3628,9 @@ struct PreflightCtx<'a, 'b> {
     connection: &'a Arc<Connection>,
     /// Table references for expression evaluation
     table_references: &'b mut TableReferences,
+    /// STRICT type check that still has to run, before the first index check, the first
+    /// REPLACE constraint (which deletes rows) or the record.
+    deferred_type_check_table: Option<Arc<BTreeTable>>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -4383,6 +4407,19 @@ pub fn emit_parent_side_fk_decrement_on_insert(
 /// Emit encode expressions for columns with custom types.
 /// For each column that has a custom type with an encode expression,
 /// evaluates the expression with `value` bound to the column register.
+fn emit_type_check(
+    program: &mut ProgramBuilder,
+    insertion: &Insertion,
+    table_reference: Arc<BTreeTable>,
+) {
+    program.emit_insn(Insn::TypeCheck {
+        start_reg: insertion.first_col_register(),
+        count: insertion.num_non_virtual_cols,
+        check_generated: false,
+        table_reference,
+    });
+}
+
 fn emit_custom_type_encode(
     program: &mut ProgramBuilder,
     resolver: &Resolver,

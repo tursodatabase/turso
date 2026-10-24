@@ -3898,11 +3898,7 @@ impl BTreeTable {
         schema: &Schema,
         only_columns: Option<&ColumnMask>,
     ) -> Result<Arc<BTreeTable>> {
-        let has_custom = table
-            .columns
-            .iter()
-            .any(|c| c.is_array() || schema.get_type_def(&c.ty_str, table.is_strict).is_some());
-        if !has_custom {
+        if !table.has_custom_type_columns(schema) {
             return Ok(Arc::clone(table));
         }
         let mut modified = (**table).clone();
@@ -3924,6 +3920,12 @@ impl BTreeTable {
             }
         }
         Ok(Arc::new(modified))
+    }
+
+    pub fn has_custom_type_columns(&self, schema: &Schema) -> bool {
+        self.columns
+            .iter()
+            .any(|c| c.is_array() || schema.get_type_def(&c.ty_str, self.is_strict).is_some())
     }
 
     /// Override column type metadata for custom type columns so that

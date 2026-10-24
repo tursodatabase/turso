@@ -1254,6 +1254,85 @@ fn test_ipk_replace_with_index_rollback(tmp_db: TempDatabase) -> anyhow::Result<
     Ok(())
 }
 
+/// A REPLACE must not delete the conflicting row of a STRICT table before the new row fails
+/// its type check: inside a transaction, no statement journal brings that row back.
+#[turso_macros::test]
+fn test_strict_replace_type_error_keeps_conflicting_row(
+    tmp_db: TempDatabase,
+) -> anyhow::Result<()> {
+    drop(tmp_db);
+
+    let cases = [
+        (
+            "strict_or_replace_ipk",
+            "CREATE TABLE t(id INTEGER PRIMARY KEY, a INT) STRICT",
+            "INSERT INTO t VALUES(1, 1)",
+            "INSERT OR REPLACE INTO t VALUES(1, 'x')",
+        ),
+        (
+            "strict_ipk_on_conflict_replace",
+            "CREATE TABLE t(id INTEGER PRIMARY KEY ON CONFLICT REPLACE, a INT) STRICT",
+            "INSERT INTO t VALUES(1, 1)",
+            "INSERT INTO t VALUES(1, 'x')",
+        ),
+        (
+            "strict_or_replace_unique_index",
+            "CREATE TABLE t(id INTEGER PRIMARY KEY, a INT, b INT UNIQUE) STRICT",
+            "INSERT INTO t VALUES(1, 1, 1)",
+            "INSERT OR REPLACE INTO t VALUES(2, 'x', 1)",
+        ),
+        (
+            "strict_unique_on_conflict_replace",
+            "CREATE TABLE t(id INTEGER PRIMARY KEY, a INT, b INT UNIQUE ON CONFLICT REPLACE) STRICT",
+            "INSERT INTO t VALUES(1, 1, 1)",
+            "INSERT INTO t VALUES(2, 'x', 1)",
+        ),
+    ];
+
+    for (label, ddl, seed, failing_insert) in cases {
+        let limbo_db = TempDatabase::builder()
+            .with_db_name(format!("{label}.db"))
+            .build();
+        let limbo_conn = limbo_db.connect_limbo();
+        let sqlite_conn = rusqlite::Connection::open_in_memory().unwrap();
+        for sql in [ddl, seed, "BEGIN"] {
+            limbo_conn.execute(sql).unwrap();
+            sqlite_conn.execute_batch(sql).unwrap();
+        }
+
+        let limbo_err = limbo_try_exec(&limbo_conn, failing_insert).unwrap_err();
+        let sqlite_err = sqlite_try_exec(&sqlite_conn, failing_insert).unwrap_err();
+        assert!(
+            limbo_err.contains("cannot store TEXT value in INT column t.a"),
+            "[{label}] turso error: {limbo_err}"
+        );
+        assert!(
+            sqlite_err.contains("cannot store TEXT value in INT column t.a"),
+            "[{label}] sqlite error: {sqlite_err}"
+        );
+
+        limbo_conn.execute("COMMIT").unwrap();
+        sqlite_conn.execute_batch("COMMIT").unwrap();
+
+        if let Some(e) = compare_tables(
+            label,
+            &sqlite_conn,
+            &limbo_conn,
+            "SELECT * FROM t ORDER BY id",
+        ) {
+            panic!("{e}");
+        }
+
+        let db_path = limbo_db.path.clone();
+        drop(limbo_conn);
+        drop(limbo_db);
+        let ic = sqlite_integrity_check(&db_path);
+        assert_eq!(ic, "ok", "[{label}] integrity_check: {ic}");
+    }
+
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // INSERT: Index REPLACE + Index non-REPLACE (FAIL, IGNORE, ROLLBACK)
 // (ABORT already covered by test_index_replace_with_index_abort)

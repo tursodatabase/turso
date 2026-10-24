@@ -1599,8 +1599,47 @@ fn emit_update_insns<'a>(
 
     let update_affects_virtual_columns = affected_columns.count() > updated_column_indices.count();
     let has_returning = returning.as_ref().is_some_and(|r| !r.is_empty());
+    let relevant_checks: Vec<CheckConstraint> = match target_table.table.btree() {
+        Some(btree_table) if !btree_table.check_constraints.is_empty() => {
+            // SQLite only evaluates CHECK constraints that reference at least one
+            // column in the SET clause. Build a set of updated column names to filter.
+            let mut updated_col_names: HashSet<String> = btree_table
+                .columns()
+                .iter()
+                .enumerate()
+                .filter(|(idx, _)| affected_columns.get(*idx))
+                .filter_map(|(_, col)| col.name.as_deref())
+                .map(normalize_ident)
+                .collect();
+
+            // If the rowid is being updated (either directly via ROWID_SENTINEL or
+            // through a rowid alias column), also include the rowid pseudo-column
+            // names so that CHECK(rowid > 0) etc. are properly triggered.
+            if updates_rowid {
+                for name in ROWID_STRS {
+                    updated_col_names.insert(name.to_string());
+                }
+            }
+
+            btree_table
+                .check_constraints
+                .iter()
+                .filter(|cc| check_expr_references_columns(&cc.expr, &updated_col_names))
+                .cloned()
+                .collect()
+        }
+        _ => Vec::new(),
+    };
+
     if let Table::BTree(ref btree) = target_table.table {
-        if btree.is_strict {
+        // SQLite checks the STRICT types after the rowid conflict check, unless BEFORE triggers,
+        // generated columns or CHECK constraints need the types checked earlier. Columns with
+        // a custom type are always checked before encoding.
+        let types_checked_before_rowid_conflict = has_before_triggers
+            || btree.columns().iter().any(Column::is_generated)
+            || !relevant_checks.is_empty()
+            || btree.has_custom_type_columns(t_ctx.resolver.schema());
+        if btree.is_strict && types_checked_before_rowid_conflict {
             // pre-encode typecheck for updated columns
             program.emit_insn(Insn::TypeCheck {
                 start_reg: start,
@@ -1775,34 +1814,7 @@ fn emit_update_insns<'a>(
             });
         }
 
-        if !btree_table.check_constraints.is_empty() {
-            // SQLite only evaluates CHECK constraints that reference at least one
-            // column in the SET clause. Build a set of updated column names to filter.
-            let mut updated_col_names: HashSet<String> = btree_table
-                .columns()
-                .iter()
-                .enumerate()
-                .filter(|(idx, _)| affected_columns.get(*idx))
-                .filter_map(|(_, col)| col.name.as_deref())
-                .map(normalize_ident)
-                .collect();
-
-            // If the rowid is being updated (either directly via ROWID_SENTINEL or
-            // through a rowid alias column), also include the rowid pseudo-column
-            // names so that CHECK(rowid > 0) etc. are properly triggered.
-            if updates_rowid {
-                for name in ROWID_STRS {
-                    updated_col_names.insert(name.to_string());
-                }
-            }
-
-            let relevant_checks: Vec<CheckConstraint> = btree_table
-                .check_constraints
-                .iter()
-                .filter(|cc| check_expr_references_columns(&cc.expr, &updated_col_names))
-                .cloned()
-                .collect();
-
+        if !relevant_checks.is_empty() {
             let check_constraint_tables =
                 TableReferences::new(vec![target_table.as_ref().clone()], vec![]);
             emit_check_constraints(

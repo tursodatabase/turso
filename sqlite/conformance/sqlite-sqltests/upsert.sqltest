@@ -1027,3 +1027,40 @@ expect {
     11
     ok
 }
+
+test upsert-insert-or-ignore-do-update-not-null-error {
+    CREATE TABLE n1 (a INT, b REAL NOT NULL);
+    INSERT INTO n1 VALUES (1, 1);
+    CREATE UNIQUE INDEX n1_a ON n1 (a);
+    INSERT OR IGNORE INTO n1 VALUES (1, 2) ON CONFLICT (a) DO UPDATE SET b = NULL;
+}
+expect error {
+    NOT NULL constraint failed: n1.b
+}
+
+@cross-check-integrity
+test upsert-insert-or-ignore-runs-do-update {
+    CREATE TABLE n2 (a INT, b INT);
+    CREATE UNIQUE INDEX n2_a ON n2 (a);
+    CREATE UNIQUE INDEX n2_b ON n2 (b);
+    INSERT INTO n2 VALUES (1, 1), (2, 2);
+    INSERT OR IGNORE INTO n2 VALUES (1, 5) ON CONFLICT (a) DO UPDATE SET b = 10;
+    INSERT OR IGNORE INTO n2 VALUES (3, 2) ON CONFLICT (a) DO UPDATE SET b = 20;
+    INSERT OR IGNORE INTO n2 VALUES (4, 2) ON CONFLICT DO UPDATE SET b = 30;
+    SELECT * FROM n2 ORDER BY a;
+}
+expect {
+    1|10
+    2|30
+}
+
+test upsert-insert-or-ignore-do-update-unique-error {
+    CREATE TABLE n3 (a INT, b INT);
+    CREATE UNIQUE INDEX n3_a ON n3 (a);
+    CREATE UNIQUE INDEX n3_b ON n3 (b);
+    INSERT INTO n3 VALUES (1, 1), (2, 2);
+    INSERT OR IGNORE INTO n3 VALUES (1, 5) ON CONFLICT (a) DO UPDATE SET b = 2;
+}
+expect error {
+    UNIQUE constraint failed: n3.b
+}

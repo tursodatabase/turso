@@ -134,3 +134,58 @@ test strict-insert-before-trigger-type-error-before-not-null {
 expect error {
     cannot store TEXT value in INT column t10.a
 }
+
+@cross-check-integrity
+test strict-insert-or-ignore-rowid-conflict-checked-before-type {
+    CREATE TABLE t11 (id INTEGER PRIMARY KEY, a INT) STRICT;
+    CREATE UNIQUE INDEX t11_a ON t11 (a);
+    INSERT INTO t11 VALUES (1, 1), (2, 2);
+    INSERT OR IGNORE INTO t11 VALUES (1, 'x');
+    SELECT * FROM t11;
+}
+expect {
+    1|1
+    2|2
+}
+
+@cross-check-integrity
+test strict-update-or-ignore-rowid-conflict-checked-before-type {
+    CREATE TABLE t12 (id INTEGER PRIMARY KEY, a INT) STRICT;
+    INSERT INTO t12 VALUES (1, 1), (2, 2);
+    UPDATE OR IGNORE t12 SET id = 1, a = 'x' WHERE id = 2;
+    SELECT * FROM t12;
+}
+expect {
+    1|1
+    2|2
+}
+
+test strict-insert-check-constraint-type-error-before-rowid-conflict {
+    CREATE TABLE t13 (id INTEGER PRIMARY KEY, a INT CHECK (a <> 0)) STRICT;
+    INSERT INTO t13 VALUES (1, 1);
+    INSERT OR IGNORE INTO t13 VALUES (1, 'x');
+}
+expect error {
+    cannot store TEXT value in INT column t13.a
+}
+
+test strict-update-check-constraint-type-error-before-rowid-conflict {
+    CREATE TABLE t14 (id INTEGER PRIMARY KEY, a INT CHECK (a <> 0)) STRICT;
+    INSERT INTO t14 VALUES (1, 1), (2, 2);
+    UPDATE OR IGNORE t14 SET id = 1, a = 'x' WHERE id = 2;
+}
+expect error {
+    cannot store TEXT value in INT column t14.a
+}
+
+@cross-check-integrity
+test strict-update-unrelated-check-constraint-rowid-conflict-checked-before-type {
+    CREATE TABLE t15 (id INTEGER PRIMARY KEY, a INT, b INT CHECK (b <> 0)) STRICT;
+    INSERT INTO t15 VALUES (1, 1, 1), (2, 2, 2);
+    UPDATE OR IGNORE t15 SET id = 1, a = 'x' WHERE id = 2;
+    SELECT * FROM t15;
+}
+expect {
+    1|1|1
+    2|2|2
+}
