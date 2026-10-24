@@ -78,6 +78,10 @@ pub struct CheckpointResult {
     pub wal_truncate_sent: bool,
     /// Whether WAL sync I/O has been submitted after truncation
     pub wal_sync_sent: bool,
+    /// Whether the restarted generation's WAL header has been written after truncation
+    pub wal_header_sent: bool,
+    /// Whether that header's sync has been submitted
+    pub wal_header_sync_sent: bool,
 }
 
 impl Drop for CheckpointResult {
@@ -101,6 +105,8 @@ impl CheckpointResult {
             db_truncate_sent: false,
             wal_truncate_sent: false,
             wal_sync_sent: false,
+            wal_header_sent: false,
+            wal_header_sync_sent: false,
         }
     }
 
@@ -5394,6 +5400,24 @@ impl WalFile {
             )?;
             result.wal_sync_sent = true;
             io_yield_one!(c);
+        } else if !result.wal_header_sent {
+            // A zero-byte WAL remembers no generation. The restarted checkpoint_seq lives only in this
+            // process until the next append writes the header; a process that exits first leaves the next
+            // opener to start again at 0, behind every generation a replication consumer of
+            // `wal_state()` already moved to. Write the restarted header now, so the generation survives
+            // on disk.
+            result.wal_header_sent = true;
+            if let Some(page_size) = PageSize::new(self.coordination.wal_header().page_size) {
+                if let Some(c) = self.prepare_wal_start(page_size)? {
+                    io_yield_one!(c);
+                }
+            }
+        } else if !result.wal_header_sync_sent {
+            result.wal_header_sync_sent = true;
+            if !self.coordination.wal_is_initialized() {
+                let c = self.prepare_wal_finish(sync_type)?;
+                io_yield_one!(c);
+            }
         }
         Ok(IOResult::Done(()))
     }
