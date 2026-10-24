@@ -291,7 +291,9 @@ fn infer_expression_primitive(
 
 /// The type that every non-NULL expression can be converted to, following
 /// PostgreSQL's rule for CASE branches and COALESCE arguments: mixed numeric
-/// types widen the way arithmetic does, any other mix has no common type.
+/// types widen the way arithmetic does, unknown string literals adopt the
+/// other branch's type (or TEXT when all branches are unknown), and other
+/// incompatible mixes have no common type.
 fn common_primitive<'a>(
     exprs: impl Iterator<Item = &'a turso_parser::ast::Expr>,
     referenced_tables: Option<&translate::plan::TableReferences>,
@@ -300,7 +302,12 @@ fn common_primitive<'a>(
 
     let is_numeric = |primitive| matches!(primitive, "INTEGER" | "REAL" | "NUMERIC");
     let mut common = None;
+    let mut has_unknown_string = false;
     for expr in exprs.filter(|expr| !matches!(expr, Expr::Literal(Literal::Null))) {
+        if matches!(expr, Expr::Literal(Literal::String(_))) {
+            has_unknown_string = true;
+            continue;
+        }
         let primitive = infer_expression_primitive(expr, referenced_tables)?;
         common = match common {
             None => Some(primitive),
@@ -311,7 +318,7 @@ fn common_primitive<'a>(
             Some(_) => return None,
         };
     }
-    common
+    common.or_else(|| has_unknown_string.then_some("TEXT"))
 }
 
 /// Map [`crate::vdbe::affinity::Affinity`] to the uppercase primitive name
