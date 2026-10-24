@@ -230,6 +230,63 @@ expect {
     0|0|0|0|1|3|4|4|4
 }
 
+# An exponent with no digits is reported at the 'e', or at the sign
+# after it. '0x' with no hex digit after it is just the number 0, so
+# the 'x' is reported as the next token.
+test json_error_position_reports_exponent_and_hex_prefix_without_digits {
+    SELECT json_error_position('1e'), json_error_position('[1e]'),
+           json_error_position('{"a":1e}'), json_error_position('[1e+]'),
+           json_error_position('1ex'), json_error_position('1e-'),
+           json_error_position('[1.e]'), json_error_position('[0x]'),
+           json_error_position('[0xg]'), json_error_position('[-0x]'),
+           json_error_position('[0X1]');
+}
+expect {
+    2|3|7|4|2|3|4|3|3|4|0
+}
+
+# A bad escape is reported at the character after the backslash.
+test json_error_position_reports_bad_escape_after_backslash {
+    SELECT json_error_position('"\q"'), json_error_position('"ab\q"'),
+           json_error_position('["a\q",1]'), json_error_position('"\x"'),
+           json_error_position('"\uZZZZ"'), json_error_position('"\u12"'),
+           json_error_position('"\x4g"'), json_error_position('{"\q":1}'),
+           json_error_position('"é\q"');
+}
+expect {
+    3|5|5|3|3|3|3|4|4
+}
+
+# In an unquoted key, a backslash that does not start a complete
+# \uXXXX escape is reported at the backslash.
+test json_error_position_reports_bad_escape_in_unquoted_key_at_backslash {
+    SELECT json_error_position('{a\q:1}'), json_error_position('{ab\q:1}'),
+           json_error_position('{a\u0041\q:1}'), json_error_position('{a\u00:1}'),
+           json_error_position('{\u00:1}'), json_error_position('{a\:1}'),
+           json_error_position(char(123) || 'a\'), json_error_position(char(123) || '\u'),
+           json_error_position('{a\"b":1}'), json_error_position('{\u0041:1}');
+}
+expect {
+    3|4|9|3|2|3|3|2|3|0
+}
+
+# JSON5 does not allow a digit right after \0.
+test json_error_position_rejects_nul_escape_followed_by_digit {
+    SELECT json_error_position('"\01"'), json_error_position('["\01"]'),
+           json_error_position('"\09"'), json_error_position('"\0a"'),
+           json_error_position('"\0"'), json_valid('"\01"', 6);
+}
+expect {
+    3|4|3|0|0|0
+}
+
+test nul_escape_followed_by_digit_errors {
+    SELECT json('["\01"]');
+}
+expect error {
+    ^(Runtime error: )?(Parse error: )?malformed JSON$
+}
+
 test digitless_number_document_errors {
     SELECT json('.');
 }
