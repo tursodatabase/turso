@@ -216,6 +216,17 @@ pub trait Dialect: Send + Sync + 'static {
     fn converts_strings_compared_with_custom_types(&self) -> bool {
         false
     }
+
+    /// Whether `CAST(x AS t)` to a custom type gives the value the way a
+    /// column of type `t` shows it (ENCODE then DECODE) instead of the
+    /// stored value (ENCODE only).
+    ///
+    /// PostgreSQL has no stored form: `CAST('A0EEBC99-...' AS uuid)` is the
+    /// uuid text in lowercase. With SQLite, `CAST(42 AS cents)` is the
+    /// stored value 4200.
+    fn cast_to_custom_type_decodes(&self) -> bool {
+        false
+    }
 }
 
 #[cfg(test)]

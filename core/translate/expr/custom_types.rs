@@ -438,10 +438,15 @@ fn comparison_type_of(
             if !resolved.is_domain() {
                 column.ty_params = ty_params;
             }
+            let form = if resolver.dialect.cast_to_custom_type_decodes() {
+                ValueForm::Decoded
+            } else {
+                ValueForm::Stored
+            };
             Ok(Some(ComparisonType {
                 column,
                 chain: resolved.chain,
-                form: ValueForm::Stored,
+                form,
             }))
         }
         _ => Ok(None),

@@ -1165,7 +1165,10 @@ impl Value {
             match rhs {
                 Value::Text(t) => match Numeric::from_value_strict(rhs) {
                     None => {
-                        return Err(LimboError::InvalidTextRepresentation(t.as_str().to_owned()))
+                        return Err(LimboError::InvalidTextRepresentation {
+                            type_name: "numeric",
+                            input: t.as_str().to_owned(),
+                        })
                     }
                     Some(n) if n.to_f64() == 0.0 => return Err(LimboError::DivisionByZero),
                     _ => {}

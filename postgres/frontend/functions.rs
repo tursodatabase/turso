@@ -73,6 +73,8 @@ scalar_functions! {
     DatetimePl(FunctionArity::OneOf(&[2, 4]), true),
     DatetimeMi(FunctionArity::OneOf(&[2, 4]), true),
     DateIn(FunctionArity::Exact(1), true),
+    BoolIn(FunctionArity::Exact(1), true),
+    VarcharIn(FunctionArity::Exact(2), true),
     TimeIn(FunctionArity::Exact(1), true),
     DatePl(FunctionArity::Exact(2), true),
     DateMi(FunctionArity::Exact(2), true),
@@ -143,6 +145,8 @@ impl ScalarCall for PgScalarFunction {
                 &text_arg(args, 3),
             )?,
             Self::DateIn => crate::datetime::exec_date_in(args[0].get_value())?,
+            Self::BoolIn => exec_bool_in(args[0].get_value())?,
+            Self::VarcharIn => exec_varchar_in(args[0].get_value(), int_arg(args, 1, 0))?,
             Self::TimeIn => crate::datetime::exec_time_in(args[0].get_value())?,
             Self::DatePl => {
                 crate::datetime::exec_date_pl(args[0].get_value(), args[1].get_value())?
@@ -186,6 +190,69 @@ impl ScalarCall for PgScalarFunction {
             | Self::StatementTimestamp => Value::build_text(crate::datetime::now_text()),
         };
         Ok(IOResult::Done(value))
+    }
+}
+
+/// Converts a value to the stored form of `boolean`: 1 or 0. An integer is
+/// true when it is not 0, as in a PostgreSQL cast from integer.
+fn exec_bool_in(value: &Value) -> Result<Value> {
+    let input = match value {
+        Value::Null => return Ok(Value::Null),
+        Value::Numeric(Numeric::Integer(i)) => return Ok(Value::from_i64((*i != 0) as i64)),
+        Value::Text(text) => text.as_str().to_string(),
+        other => other.to_string(),
+    };
+    match parse_bool(&input) {
+        Some(b) => Ok(Value::from_i64(b as i64)),
+        None => Err(LimboError::InvalidTextRepresentation {
+            type_name: "boolean",
+            input,
+        }),
+    }
+}
+
+/// Reads a boolean the way PostgreSQL does: surrounding whitespace is
+/// ignored, and any prefix of true, false, yes or no is accepted in any case.
+/// on and off need at least two letters, and 1 and 0 must be the whole input.
+pub(crate) fn parse_bool(input: &str) -> Option<bool> {
+    let word = input
+        .trim_matches(|c| matches!(c, ' ' | '\t' | '\n' | '\r' | '\x0b' | '\x0c'))
+        .to_ascii_lowercase();
+    let is_prefix_of =
+        |full: &str, min_len: usize| word.len() >= min_len && full.starts_with(word.as_str());
+    if is_prefix_of("true", 1) || is_prefix_of("yes", 1) || is_prefix_of("on", 2) || word == "1" {
+        Some(true)
+    } else if is_prefix_of("false", 1)
+        || is_prefix_of("no", 1)
+        || is_prefix_of("off", 2)
+        || word == "0"
+    {
+        Some(false)
+    } else {
+        None
+    }
+}
+
+/// Converts a value to the stored form of `varchar(max_len)`. As in
+/// PostgreSQL, longer text is cut to `max_len` characters when only spaces
+/// are cut off, and is an error otherwise.
+fn exec_varchar_in(value: &Value, max_len: i64) -> Result<Value> {
+    let text = match value {
+        Value::Null => return Ok(Value::Null),
+        Value::Text(text) => text.as_str().to_string(),
+        other => other.to_string(),
+    };
+    let max_len = usize::try_from(max_len)
+        .map_err(|_| LimboError::InternalError(format!("invalid varchar length {max_len}")))?;
+    let Some((cut_at, _)) = text.char_indices().nth(max_len) else {
+        return Ok(Value::build_text(text));
+    };
+    if text[cut_at..].chars().all(|c| c == ' ') {
+        Ok(Value::build_text(text[..cut_at].to_string()))
+    } else {
+        Err(LimboError::ValueTooLong(format!(
+            "character varying({max_len})"
+        )))
     }
 }
 
@@ -789,12 +856,7 @@ pub(crate) fn validate_pg_input(input: &str, type_name: &str) -> Option<(String,
 
     match base_type.as_str() {
         "bool" | "boolean" => {
-            let lower = trimmed.to_lowercase();
-            let valid = matches!(
-                lower.as_str(),
-                "t" | "true" | "y" | "yes" | "on" | "1" | "f" | "false" | "n" | "no" | "off" | "0"
-            );
-            if valid {
+            if parse_bool(input).is_some() {
                 None
             } else {
                 Some((

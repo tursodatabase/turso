@@ -1,0 +1,106 @@
+# Converting text to boolean, uuid and varchar, in casts and on insert.
+
+@database :memory:
+
+test cast-text-to-boolean {
+    SELECT CAST('t' AS boolean), 't'::boolean, CAST('yes' AS boolean), CAST('true' AS boolean),
+        CAST('f' AS boolean), 'no'::bool, CAST('off' AS boolean), CAST('0' AS boolean);
+}
+expect {
+    t|t|t|t|f|f|f|f
+}
+
+test cast-text-to-boolean-prefixes-and-spaces {
+    SELECT 'tr'::boolean, 'ye'::boolean, 'Of'::boolean, ' on '::boolean, 'FALS'::boolean, 'N'::boolean;
+}
+expect {
+    t|t|f|t|f|f
+}
+
+test cast-text-to-boolean-invalid {
+    SELECT 'maybe'::boolean;
+}
+expect error {invalid input syntax for type boolean: "maybe"}
+
+test cast-text-to-boolean-single-o-is-invalid {
+    SELECT 'o'::boolean;
+}
+expect error {invalid input syntax for type boolean: "o"}
+
+test cast-boolean-in-where {
+    CREATE TABLE t (id int, b boolean);
+    INSERT INTO t VALUES (1, true), (2, false);
+    SELECT id FROM t WHERE b = CAST('yes' AS boolean);
+}
+expect {
+    1
+}
+
+test insert-boolean-spellings {
+    CREATE TABLE t (id int, b boolean);
+    INSERT INTO t VALUES (1, 'y'), (2, 'Y'), (3, 'n'), (4, 'N'), (5, 'ye'), (6, ' t '), (7, 'of');
+    SELECT id, b FROM t ORDER BY id;
+}
+expect {
+    1|t
+    2|t
+    3|f
+    4|f
+    5|t
+    6|t
+    7|f
+}
+
+test insert-boolean-invalid {
+    CREATE TABLE t (b boolean);
+    INSERT INTO t VALUES ('maybe');
+}
+expect error {invalid input syntax for type boolean: "maybe"}
+
+test cast-text-to-uuid-lowercases {
+    SELECT CAST('9E6CFBA0-0F51-2201-1410-6069E05B8756' AS uuid);
+}
+expect {
+    9e6cfba0-0f51-2201-1410-6069e05b8756
+}
+
+test cast-uppercase-text-to-uuid-equals-column {
+    CREATE TABLE t (u uuid);
+    INSERT INTO t VALUES ('9e6cfba0-0f51-2201-1410-6069e05b8756');
+    SELECT count(*) FROM t WHERE CAST('9E6CFBA0-0F51-2201-1410-6069E05B8756' AS uuid) = u;
+}
+expect {
+    1
+}
+
+test cast-uppercase-text-to-uuid-equals-indexed-column {
+    CREATE TABLE t (u uuid);
+    CREATE INDEX t_u ON t (u);
+    INSERT INTO t VALUES ('9e6cfba0-0f51-2201-1410-6069e05b8756');
+    SELECT count(*) FROM t WHERE CAST('9E6CFBA0-0F51-2201-1410-6069E05B8756' AS uuid) = u;
+}
+expect {
+    1
+}
+
+test cast-text-to-varchar-with-length {
+    SELECT CAST('ab' AS varchar(5)), 'abcdefg'::varchar(3), CAST('abc' AS character varying(3));
+}
+expect {
+    ab|abc|abc
+}
+
+test insert-too-long-varchar {
+    CREATE TABLE t (v varchar(5));
+    INSERT INTO t VALUES ('abcdef');
+}
+expect error {value too long for type character varying\(5\)}
+
+test insert-varchar-with-trailing-spaces-past-limit {
+    CREATE TABLE t (v varchar(3));
+    INSERT INTO t VALUES ('abc   ');
+    SELECT v || '|', length(v) FROM t;
+}
+expect {
+    abc||3
+}

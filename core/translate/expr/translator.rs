@@ -813,6 +813,13 @@ fn translate_cast_expr(
 
                 // Validate domain constraints on the encoded value
                 emit_domain_cast_constraints(program, &resolved.chain, target_register, resolver)?;
+                emit_cast_decodes(
+                    program,
+                    &resolved.chain,
+                    target_register,
+                    &cast_col,
+                    resolver,
+                )?;
                 return Ok(target_register);
             }
 
@@ -847,6 +854,13 @@ fn translate_cast_expr(
                         resolver,
                     )?;
                 }
+                emit_cast_decodes(
+                    program,
+                    &resolved.chain[..1],
+                    target_register,
+                    &cast_col,
+                    resolver,
+                )?;
                 return Ok(target_register);
             }
         }
@@ -861,6 +875,27 @@ fn translate_cast_expr(
         affinity: type_affinity,
     });
     Ok(target_register)
+}
+
+/// Turns the stored value a cast produced back into the value a column of
+/// the cast type shows, when the dialect wants that (see
+/// [crate::Dialect::cast_to_custom_type_decodes]).
+fn emit_cast_decodes(
+    program: &mut ProgramBuilder,
+    chain: &[Arc<TypeDef>],
+    reg: usize,
+    cast_col: &Column,
+    resolver: &Resolver,
+) -> Result<()> {
+    if !resolver.dialect.cast_to_custom_type_decodes() {
+        return Ok(());
+    }
+    for td in chain.iter().rev() {
+        if let Some(decode_expr) = td.decode() {
+            emit_type_expr(program, decode_expr, reg, reg, cast_col, td, resolver)?;
+        }
+    }
+    Ok(())
 }
 
 #[inline(never)]

@@ -2958,7 +2958,7 @@ impl PostgreSQLTranslator {
                     .as_ref()
                     .ok_or_else(|| ParseError::ParseError("TypeCast missing type name".into()))?;
                 if !pg_type_name.typmods.is_empty() {
-                    return Err(not_supported("a type modifier in a cast"));
+                    return cast_with_type_modifier(expr, pg_type_name);
                 }
                 let type_name = pg_type_name_to_ast_type(pg_type_name)?;
                 Ok(ast::Expr::Cast {
@@ -5828,6 +5828,41 @@ fn json_type_or_raise(
 /// Convert a pg_query TypeName to a Turso AST Type for use in CAST expressions.
 /// Maps PG types to their base SQLite storage types. Other names are kept as
 /// written so that enums and domains resolve to their custom type.
+/// `CAST(x AS varchar(n))`. Unlike an INSERT, an explicit cast cuts longer
+/// text to `n` characters instead of failing, so it becomes
+/// `substr(CAST(x AS TEXT), 1, n)`.
+fn cast_with_type_modifier(
+    expr: Box<ast::Expr>,
+    pg_type_name: &pg_query::protobuf::TypeName,
+) -> Result<ast::Expr, ParseError> {
+    let pg_type = object_name(&pg_type_name.names, is_default_schema, "type")?;
+    let typmods = integer_typmods(pg_type_name)?;
+    let max_len = match (pg_type.to_uppercase().as_str(), typmods.as_slice()) {
+        ("VARCHAR", [max_len]) if *max_len >= 1 && pg_type_name.array_bounds.is_empty() => *max_len,
+        _ => return Err(not_supported("a type modifier in a cast")),
+    };
+    let text = ast::Expr::Cast {
+        expr,
+        type_name: Some(ast::Type {
+            name: "TEXT".to_string(),
+            size: None,
+            array_dimensions: 0,
+        }),
+    };
+    let number = |n: i64| Box::new(ast::Expr::Literal(ast::Literal::Numeric(n.to_string())));
+    Ok(ast::Expr::FunctionCall {
+        name: ast::Name::from_string("substr"),
+        distinctness: None,
+        args: vec![Box::new(text), number(1), number(max_len)],
+        order_by: vec![],
+        within_group: vec![],
+        filter_over: ast::FunctionTail {
+            filter_clause: None,
+            over_clause: None,
+        },
+    })
+}
+
 fn pg_type_name_to_ast_type(
     type_name: &pg_query::protobuf::TypeName,
 ) -> Result<ast::Type, ParseError> {
@@ -5839,14 +5874,13 @@ fn pg_type_name_to_ast_type(
         "REAL" | "FLOAT4" | "DOUBLE PRECISION" | "FLOAT8" | "NUMERIC" | "DECIMAL" | "MONEY" => {
             "REAL"
         }
-        // For CAST expressions, map all text-like PG types to TEXT and
-        // boolean to INTEGER for SQLite VDBE compatibility
-        "BOOLEAN" | "BOOL" => "INTEGER",
+        "BOOLEAN" | "BOOL" => "boolean",
+        "UUID" => "uuid",
         "DATE" => "date",
         "TIME" | "TIMETZ" => "time",
         "TIMESTAMP" => "timestamp",
         "TIMESTAMPTZ" => "timestamptz",
-        "TEXT" | "VARCHAR" | "CHAR" | "BPCHAR" | "NAME" | "UUID" | "INTERVAL" | "INET" | "JSON"
+        "TEXT" | "VARCHAR" | "CHAR" | "BPCHAR" | "NAME" | "INTERVAL" | "INET" | "JSON"
         | "JSONB" | "XML" | "CIDR" | "MACADDR" | "BIT" | "VARBIT" | "TSVECTOR" | "TSQUERY" => {
             "TEXT"
         }
@@ -5905,12 +5939,16 @@ fn extract_type_name(col_def: &pg_query::protobuf::ColumnDef) -> Result<String, 
 fn extract_integer_typmods(
     col_def: &pg_query::protobuf::ColumnDef,
 ) -> Result<Vec<i64>, ParseError> {
+    match &col_def.type_name {
+        Some(type_name) => integer_typmods(type_name),
+        None => Ok(vec![]),
+    }
+}
+
+fn integer_typmods(type_name: &pg_query::protobuf::TypeName) -> Result<Vec<i64>, ParseError> {
     use pg_query::protobuf::a_const::Val;
     use pg_query::protobuf::node::Node;
 
-    let Some(type_name) = &col_def.type_name else {
-        return Ok(vec![]);
-    };
     type_name
         .typmods
         .iter()
@@ -10728,12 +10766,10 @@ mod tests {
     #[test]
     fn fail_closed_cast_type_modifiers() {
         assert_not_supported("SELECT '1.239'::numeric(5, 2)", "a type modifier in a cast");
-        assert_not_supported(
-            "SELECT CAST('abcdef' AS varchar(3))",
-            "a type modifier in a cast",
-        );
+        assert_not_supported("SELECT 'a'::varchar(3)[]", "a type modifier in a cast");
         assert_not_supported("SELECT now()::timestamp(0)", "a type modifier in a cast");
         assert_translates("SELECT '1.5'::numeric, 'a'::varchar, 1::int[]");
+        assert_translates("SELECT CAST('abcdef' AS varchar(3))");
     }
 
     #[test]
