@@ -431,7 +431,6 @@ expect error {
 }
 
 @requires strict "uses STRICT tables"
-@requires strict "uses STRICT tables"
 test boolean-compare-with-text-literal-compares-text {
     CREATE TABLE t1(b boolean) STRICT;
     INSERT INTO t1 VALUES (1), (0);
@@ -443,7 +442,6 @@ expect {
     0|1
 }
 
-@requires strict "uses STRICT tables"
 @requires strict "uses STRICT tables"
 test date-compare-with-invalid-literal-compares-text {
     CREATE TABLE t1(d date) STRICT;
@@ -465,7 +463,6 @@ expect {
     1
 }
 
-@requires strict "uses STRICT tables"
 @requires strict "uses STRICT tables"
 test date-and-timestamp-column-subtraction-uses-standard-operator {
     CREATE TABLE t1(d date, ts timestamp) STRICT;
@@ -517,4 +514,21 @@ test date-and-timestamptz-compare-with-text-prefix {
 }
 expect {
     1|1|1|1|0|0
+}
+
+@requires strict "uses STRICT tables"
+test timestamp-in-list-compares-text-with-and-without-index {
+    CREATE TABLE t1(ts timestamp) STRICT;
+    CREATE TABLE t2(ts timestamp) STRICT;
+    CREATE INDEX t2_ts ON t2(ts);
+    INSERT INTO t1 VALUES ('2026-10-09 12:00:00.5');
+    INSERT INTO t2 VALUES ('2026-10-09 12:00:00.5');
+    SELECT
+        (SELECT count(*) FROM t1 WHERE ts IN ('2026-10-09T12:00:00.500')),
+        (SELECT count(*) FROM t2 WHERE ts IN ('2026-10-09T12:00:00.500')),
+        (SELECT count(*) FROM t1 WHERE ts IN (SELECT '2026-10-09T12:00:00.500')),
+        (SELECT count(*) FROM t2 WHERE ts IN (SELECT '2026-10-09T12:00:00.500'));
+}
+expect {
+    0|0|0|0
 }

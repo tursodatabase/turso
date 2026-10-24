@@ -146,7 +146,11 @@ pub(super) fn open_in_seek_source_cursor(
                     resolver,
                     NoConstantOptReason::InListEphemeral,
                 )?;
-                if let Some(index) = index {
+                if let Some(index) = index.filter(|_| {
+                    resolver
+                        .dialect
+                        .converts_strings_compared_with_custom_types()
+                }) {
                     encode_seek_keys_for_custom_types(
                         program,
                         table_references,
@@ -181,9 +185,10 @@ pub(super) fn open_in_seek_source_cursor(
     }
 }
 
-/// Converts a value read from an `IN (subquery)` to the form the index stores.
-/// Literal lists are converted when the list is built, so that duplicates are
-/// removed after the conversion.
+/// Converts a value read from an `IN (subquery)` to the form the index stores,
+/// in dialects that convert values compared with custom types. Literal lists
+/// are converted when the list is built, so that duplicates are removed after
+/// the conversion.
 pub(super) fn encode_subquery_in_seek_key(
     program: &mut ProgramBuilder,
     table_references: &TableReferences,
@@ -192,6 +197,12 @@ pub(super) fn encode_subquery_in_seek_key(
     source: &InSeekSource,
     seek_reg: usize,
 ) -> Result<()> {
+    if !resolver
+        .dialect
+        .converts_strings_compared_with_custom_types()
+    {
+        return Ok(());
+    }
     match source {
         InSeekSource::LiteralList { .. } => Ok(()),
         InSeekSource::Subquery { .. } => encode_seek_keys_for_custom_types(

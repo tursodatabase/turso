@@ -278,3 +278,45 @@ test timestamp-and-date-column-subtraction {
 expect {
     1 day 12:00:00|-1 days -12:00:00
 }
+
+test check-compares-timestamptz-with-string-literals {
+    CREATE TABLE c1 (ts timestamptz CHECK (ts > '2026-01-01 00:00:00+00' AND ts BETWEEN '2026-01-01' AND '2027-01-01' AND ts IN ('2026-10-08 14:00+02', '2026-10-09 12:00')));
+    INSERT INTO c1 VALUES ('2026-10-08 12:00:00');
+    UPDATE c1 SET ts = '2026-10-09 14:00+02';
+    SELECT ts FROM c1;
+}
+expect {
+    2026-10-09 12:00:00+00
+}
+
+test check-with-timestamptz-literal-rejects-earlier-row {
+    CREATE TABLE c1 (ts timestamptz CHECK (ts > '2026-01-01 00:00:00+00'));
+    INSERT INTO c1 VALUES ('2025-10-08 12:00:00');
+}
+expect error {violates check constraint}
+
+test timestamptz-from-view-subquery-and-aggregate-compared-with-literal {
+    CREATE TABLE t (id int, ts timestamptz);
+    INSERT INTO t VALUES (1, '2026-10-08 12:00:00');
+    CREATE VIEW v AS SELECT id, ts FROM t;
+    SELECT
+        (SELECT count(*) FROM v WHERE ts = '2026-10-08 12:00:00'),
+        (SELECT count(*) FROM (SELECT ts FROM t) s WHERE ts = '2026-10-08 14:00:00+02'),
+        (WITH c AS (SELECT ts FROM t) SELECT count(*) FROM c WHERE ts = '2026-10-08 14:00+02'),
+        (SELECT count(*) FROM t HAVING min(ts) = '2026-10-08 12:00:00'),
+        (SELECT count(*) FROM t WHERE coalesce(ts, '2020-01-01') = '2026-10-08 12:00');
+}
+expect {
+    1|1|1|1|1
+}
+
+test timestamptz-union-with-literal-removes-duplicate {
+    CREATE TABLE t (ts timestamptz);
+    INSERT INTO t VALUES ('2026-10-08 12:00:00');
+    SELECT ts FROM t UNION SELECT '2026-10-08 12:00:00';
+    SELECT '2026-10-08 14:00+02' UNION SELECT ts FROM t;
+}
+expect {
+    2026-10-08 12:00:00+00
+    2026-10-08 12:00:00+00
+}

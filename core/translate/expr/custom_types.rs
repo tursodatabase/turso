@@ -302,9 +302,9 @@ pub(super) struct ResolvedOperator {
 /// 2. One operand is a custom type column and the other is a literal whose type
 ///    is compatible with the custom type's `value` input type, OR
 /// 3. The operator is arithmetic, the type reads stored values back unchanged
-///    (or the dialect applies custom type arithmetic to any operand), one
-///    operand is a column of that type and the other is anything except a
-///    column of a different custom type. This lets `date + 1`, `date + int_col`
+///    (or the dialect applies custom type arithmetic to any operand that is not
+///    a floating-point column or cast), one operand is a column of that type
+///    and the other is anything except a column of a different custom type. This lets `date + 1`, `date + int_col`
 ///    and `date + ?` add days, while a comparison such as `int_col = '10'` still
 ///    uses the standard operator.
 /// 4. The operator is arithmetic and the operands are columns of two different
@@ -401,9 +401,11 @@ pub(super) fn find_custom_type_operator(
             });
             let pass_other_unencoded = !op.is_comparison()
                 && (info.type_def.decode_returns_value_unchanged()
-                    || resolver
+                    || (resolver
                         .dialect
-                        .applies_custom_type_arithmetic_to_any_operand());
+                        .applies_custom_type_arithmetic_to_any_operand()
+                        && get_expr_affinity(other, referenced_tables, Some(resolver))
+                            != Affinity::Real));
             if !encode_other && !pass_other_unencoded {
                 return None;
             }
@@ -511,6 +513,63 @@ pub(crate) fn cast_in_subquery_values_to_lhs_type(
     Ok(())
 }
 
+/// In a compound SELECT, wraps each quoted string in a result column in a CAST
+/// to the custom type of the same column in another arm, in dialects that
+/// convert values compared with custom types. PostgreSQL gives
+/// `SELECT ts FROM t UNION SELECT '2026-10-08 12:00'` the type of `ts`, so
+/// UNION compares the two rows as values of that type.
+pub(crate) fn cast_compound_string_literals_to_column_types(
+    arms: &mut [&mut crate::translate::plan::SelectPlan],
+    resolver: &Resolver,
+) -> Result<()> {
+    if !resolver
+        .dialect
+        .converts_strings_compared_with_custom_types()
+    {
+        return Ok(());
+    }
+    let num_columns = arms.first().map_or(0, |arm| arm.result_columns.len());
+    for column in 0..num_columns {
+        let Some(cast_type) = compound_column_cast_type(arms, column, resolver)? else {
+            continue;
+        };
+        for arm in arms.iter_mut() {
+            let values = arm.values.iter_mut().filter_map(|row| row.get_mut(column));
+            let result_column = arm
+                .result_columns
+                .get_mut(column)
+                .map(|result_column| &mut result_column.expr);
+            for expr in values.chain(result_column) {
+                if matches!(expr, ast::Expr::Literal(ast::Literal::String(_))) {
+                    wrap_in_cast(expr, &cast_type);
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn compound_column_cast_type(
+    arms: &[&mut crate::translate::plan::SelectPlan],
+    column: usize,
+    resolver: &Resolver,
+) -> Result<Option<ast::Type>> {
+    for arm in arms {
+        let Some(result_column) = arm.result_columns.get(column) else {
+            continue;
+        };
+        if let Some(typed) =
+            comparison_type_of(&result_column.expr, Some(&arm.table_references), resolver)?
+        {
+            if !converts_compared_values(&typed.chain, resolver) {
+                return Ok(None);
+            }
+            return Ok(cast_type_for(&typed));
+        }
+    }
+    Ok(None)
+}
+
 fn cast_type_for(typed: &ComparisonType) -> Option<ast::Type> {
     let base_type = typed.chain.iter().find(|td| !td.is_domain)?;
     let params: &[Box<ast::Expr>] = if typed.chain.first()?.is_domain {
@@ -560,7 +619,13 @@ fn comparison_type_of(
     resolver: &Resolver,
 ) -> Result<Option<ComparisonType>> {
     match expr {
-        ast::Expr::Column { .. } => {
+        ast::Expr::Column { table, column, .. } => {
+            if let Some(Table::FromClauseSubquery(subquery)) = referenced_tables
+                .and_then(|tables| tables.find_table_by_internal_id(*table))
+                .map(|(_, table)| table)
+            {
+                return subquery_column_comparison_type(&subquery.plan, *column, resolver);
+            }
             let Some(info) = expr_custom_type_info(expr, referenced_tables, resolver) else {
                 return Ok(None);
             };
@@ -620,8 +685,57 @@ fn comparison_type_of(
                 form,
             }))
         }
+        ast::Expr::FunctionCall { name, args, .. }
+            if args.len() == 1
+                && (name.as_str().eq_ignore_ascii_case("min")
+                    || name.as_str().eq_ignore_ascii_case("max")) =>
+        {
+            comparison_type_of(&args[0], referenced_tables, resolver)
+        }
+        ast::Expr::FunctionCall { name, args, .. }
+            if !args.is_empty()
+                && (name.as_str().eq_ignore_ascii_case("coalesce")
+                    || name.as_str().eq_ignore_ascii_case("nullif")) =>
+        {
+            comparison_type_of(&args[0], referenced_tables, resolver)
+        }
         _ => Ok(None),
     }
+}
+
+/// The type of column `column` of a FROM-clause subquery, view or CTE: the
+/// type of that result column in the first SELECT of the subquery that has
+/// one.
+fn subquery_column_comparison_type(
+    plan: &crate::translate::plan::Plan,
+    column: usize,
+    resolver: &Resolver,
+) -> Result<Option<ComparisonType>> {
+    use crate::translate::plan::{Plan, SelectPlan};
+    let selects: Vec<&SelectPlan> = match plan {
+        Plan::Select(select) => vec![select],
+        Plan::CompoundSelect {
+            left, right_most, ..
+        } => left
+            .iter()
+            .map(|(select, _)| select)
+            .chain(std::iter::once(right_most.as_ref()))
+            .collect(),
+        _ => return Ok(None),
+    };
+    for select in selects {
+        let Some(result_column) = select.result_columns.get(column) else {
+            continue;
+        };
+        if let Some(typed) = comparison_type_of(
+            &result_column.expr,
+            Some(&select.table_references),
+            resolver,
+        )? {
+            return Ok(Some(typed));
+        }
+    }
+    Ok(None)
 }
 
 /// Converts `value_expr`, whose value is in `value_reg`, to the custom type

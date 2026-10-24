@@ -195,6 +195,10 @@ impl Dialect for PostgresDialect {
         true
     }
 
+    fn check_constraints_see_decoded_values(&self) -> bool {
+        true
+    }
+
     fn applies_custom_type_arithmetic_to_any_operand(&self) -> bool {
         true
     }
@@ -3511,33 +3515,11 @@ const PG_TYPE_SQLS: &[&str] = &[
 const PG_TYPE_ALIASES: &[(&str, &str)] = &[("bool", "boolean")];
 
 fn register_pg_types(schema: &mut Schema) -> Result<()> {
-    for sql in PG_TYPE_SQLS {
-        let mut parser = turso_parser::parser::Parser::new(sql.as_bytes());
-        let Ok(Some(turso_parser::ast::Cmd::Stmt(turso_parser::ast::Stmt::CreateType {
-            type_name,
-            body,
-            ..
-        }))) = parser.next_cmd()
-        else {
-            return Err(LimboError::InternalError(format!(
-                "failed to parse built-in type SQL: {sql}"
-            )));
-        };
-        let type_def = turso_core::schema::TypeDef::from_create_type(
-            &type_name,
-            &body,
-            true,
-            sql.to_string(),
-        )?;
-        schema
-            .type_registry
-            .insert(type_name.to_lowercase(), Arc::new(type_def));
-    }
-    for (alias, target) in PG_TYPE_ALIASES {
-        let type_def = schema.type_registry[*target].clone();
-        schema.type_registry.insert(alias.to_string(), type_def);
-    }
-    Ok(())
+    turso_core::schema::register_builtin_types(
+        &mut schema.type_registry,
+        PG_TYPE_SQLS,
+        PG_TYPE_ALIASES,
+    )
 }
 
 // TODO: Fix tests to use correct API

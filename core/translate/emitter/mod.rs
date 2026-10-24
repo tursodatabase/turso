@@ -2589,9 +2589,14 @@ pub(crate) fn emit_check_constraints<'a>(
         return Ok(());
     }
 
-    let column_mappings: Vec<(&str, usize)> = column_mappings.collect();
-    let initial_cache_size = resolver.expr_to_reg_cache.len();
     let joined_table = referenced_tables.and_then(|tables| tables.joined_tables().first());
+    let column_mappings: Vec<(&str, usize)> = match joined_table {
+        Some(joined_table) if resolver.dialect.check_constraints_see_decoded_values() => {
+            decode_check_column_registers(program, resolver, joined_table, column_mappings)?
+        }
+        _ => column_mappings.collect(),
+    };
+    let initial_cache_size = resolver.expr_to_reg_cache.len();
 
     // Map rowid aliases to the actual rowid register.
     // We cache both unqualified (Expr::Id) and qualified (Expr::Qualified) forms
@@ -2676,4 +2681,44 @@ pub(crate) fn emit_check_constraints<'a>(
     resolver.expr_to_reg_cache_enabled = false;
 
     result
+}
+
+/// Copies each custom-type column value whose DECODE changes it to a new
+/// register holding the decoded value, and returns the column mappings with
+/// those registers.
+fn decode_check_column_registers<'a>(
+    program: &mut ProgramBuilder,
+    resolver: &Resolver,
+    joined_table: &JoinedTable,
+    column_mappings: impl Iterator<Item = (&'a str, usize)>,
+) -> Result<Vec<(&'a str, usize)>> {
+    let is_strict = joined_table.btree().is_some_and(|table| table.is_strict);
+    column_mappings
+        .map(|(col_name, register)| {
+            let Some(column) = joined_table.columns().iter().find(|column| {
+                column
+                    .name
+                    .as_ref()
+                    .is_some_and(|name| name.eq_ignore_ascii_case(col_name))
+            }) else {
+                return Ok((col_name, register));
+            };
+            let Some(resolved) = resolver.schema().resolve_type(&column.ty_str, is_strict)? else {
+                return Ok((col_name, register));
+            };
+            if resolved.reads_stored_values_unchanged() {
+                return Ok((col_name, register));
+            }
+            let decoded_reg = program.alloc_register();
+            crate::translate::expr::emit_user_facing_column_value(
+                program,
+                register,
+                decoded_reg,
+                column,
+                is_strict,
+                resolver,
+            )?;
+            Ok((col_name, decoded_reg))
+        })
+        .collect()
 }

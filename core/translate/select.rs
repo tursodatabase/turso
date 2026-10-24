@@ -258,6 +258,12 @@ pub(crate) fn prepare_select_plan_from_arms(
             );
         }
     }
+    let mut arms: Vec<&mut SelectPlan> = left
+        .iter_mut()
+        .map(|(plan, _)| plan)
+        .chain(std::iter::once(&mut last))
+        .collect();
+    crate::translate::expr::cast_compound_string_literals_to_column_types(&mut arms, resolver)?;
     let (limit, offset) = limit.map_or(Ok((None, None)), |limit| parse_limit(limit, resolver))?;
 
     // ORDER BY names can come from any arm of a compound SELECT.

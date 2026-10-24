@@ -811,8 +811,6 @@ expect {
 
 @requires strict "uses STRICT tables"
 @requires custom_types "uses custom types"
-@requires strict "uses STRICT tables"
-@requires custom_types "uses custom types"
 test op-index-seek-encodes-key-of-type-with-parameters {
     CREATE TYPE scaled(value integer, mult integer) BASE integer
         ENCODE value * mult

@@ -228,6 +228,16 @@ pub trait Dialect: Send + Sync + 'static {
         false
     }
 
+    /// Whether a CHECK constraint sees the values of custom-type columns the
+    /// way a SELECT shows them (decoded) instead of the stored values.
+    ///
+    /// PostgreSQL has no stored form, so in `CHECK (ts = '2026-10-08 12:00')`
+    /// on a timestamptz column both sides are timestamptz values. With
+    /// SQLite, a CHECK on a uuid column sees the stored blob.
+    fn check_constraints_see_decoded_values(&self) -> bool {
+        false
+    }
+
     /// Whether `+` or `-` between a column of a custom type and any other
     /// value calls the type's operator function, even when the type's DECODE
     /// changes the stored value.
