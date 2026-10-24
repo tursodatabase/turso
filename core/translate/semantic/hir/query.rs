@@ -288,8 +288,11 @@ pub enum ColumnReadExpression {
     Planned(Box<Expr>),
 }
 
-const _: () = assert!(std::mem::size_of::<ColumnReadExpression>() == 16);
-const _: () = assert!(std::mem::size_of::<Option<Box<BoundColumnTypePrograms>>>() == 8);
+const _: () =
+    assert!(std::mem::size_of::<ColumnReadExpression>() == 2 * std::mem::size_of::<usize>());
+const _: () = assert!(
+    std::mem::size_of::<Option<Box<BoundColumnTypePrograms>>>() == std::mem::size_of::<usize>()
+);
 
 #[derive(Clone, Debug)]
 pub struct Source {
