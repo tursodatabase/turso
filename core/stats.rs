@@ -1,3 +1,4 @@
+use crate::namespace::NamespaceId;
 use crate::sync::Arc;
 use crate::types::IOResultOr;
 use rustc_hash::FxHashMap as HashMap;
@@ -154,7 +155,10 @@ pub fn refresh_analyze_stats_nonblock(
                     return Ok(IOResult::Done(()));
                 }
                 let schema_snapshot = { conn.schema.read().clone() };
-                if schema_snapshot.get_btree_table(STATS_TABLE).is_none() {
+                if schema_snapshot
+                    .get_btree_table(NamespaceId::ROOT, STATS_TABLE)
+                    .is_none()
+                {
                     return Ok(IOResult::Done(()));
                 }
                 let mv_tx = conn.get_mv_tx();
@@ -251,7 +255,10 @@ fn load_sqlite_stat1_row(
     };
 
     // Skip if table is not a regular B-tree.
-    if schema.get_btree_table(table_name).is_none() {
+    if schema
+        .get_btree_table(NamespaceId::ROOT, table_name)
+        .is_none()
+    {
         return Ok(());
     }
     let Some(numbers) = parse_stat_numbers(stat) else {
@@ -269,7 +276,10 @@ fn load_sqlite_stat1_row(
 
     // Index-level entry: only keep if the index exists on this table.
     let idx_name = normalize_ident(idx_name.unwrap());
-    if schema.get_index(table_name, &idx_name).is_none() {
+    if schema
+        .get_index(NamespaceId::ROOT, table_name, &idx_name)
+        .is_none()
+    {
         return Ok(());
     }
 

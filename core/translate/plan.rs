@@ -1,3 +1,4 @@
+use crate::namespace::NamespaceId;
 use crate::{
     alloc::{self, TursoIteratorExt, TursoVecExt},
     function::{AccumulatorFunc, AggFunc},
@@ -3423,9 +3424,9 @@ impl JoinedTable {
                     // schema of the table's own database: a table in an
                     // attached database can share a name with a materialized
                     // view in a different database.
-                    let cursor_type = match resolver
-                        .with_schema(self.database_id, |s| s.get_materialized_view(&btree.name))
-                    {
+                    let cursor_type = match resolver.with_schema(self.database_id, |s| {
+                        s.get_materialized_view(NamespaceId::ROOT, &btree.name)
+                    }) {
                         Some(view_mutex) => CursorType::MaterializedView(btree.clone(), view_mutex),
                         None => CursorType::BTreeTable(btree.clone()),
                     };

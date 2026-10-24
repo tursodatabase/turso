@@ -4,6 +4,7 @@
 //! attached databases.
 
 use crate::connection_hooks::{ConnectionContext, ConnectionHooks};
+use crate::namespace::NamespaceId;
 use crate::types::IOResultOr;
 use crate::util::IOExt;
 #[cfg(feature = "io_memory_yield")]
@@ -3474,7 +3475,7 @@ impl Database {
 
     pub fn register_virtual_table(&self, table: Arc<VirtualTable>) -> Result<String> {
         let name = table.name.clone();
-        self.with_schema_mut(|schema| schema.add_virtual_table(table))?;
+        self.with_schema_mut(|schema| schema.add_virtual_table(NamespaceId::ROOT, table))?;
         Ok(name)
     }
 
