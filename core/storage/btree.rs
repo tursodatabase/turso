@@ -6551,8 +6551,9 @@ impl BTreeCursor {
                 IterationDirection::Forwards => self.get_next_record(),
                 IterationDirection::Backwards => self.get_prev_record(),
             });
-            self.context = None;
+            let ctx = self.context.take().unwrap();
             self.valid_state = CursorValidState::Valid;
+            self.stay_before_entry_if_saved_in_gap(ctx.seek_op);
             return Ok(IOResult::Done(()));
         }
         let ctx = self.context.take().unwrap();
@@ -6566,6 +6567,7 @@ impl BTreeCursor {
                 match res {
                     SeekResult::Found => {
                         self.valid_state = CursorValidState::Valid;
+                        self.stay_before_entry_if_saved_in_gap(ctx.seek_op);
                         Ok(IOResult::Done(()))
                     }
                     SeekResult::TryAdvance => {
@@ -6592,6 +6594,17 @@ impl BTreeCursor {
                 self.context = Some(ctx);
                 Ok(IOResult::IO(io))
             }
+        }
+    }
+
+    /// A range seek op comes from a cursor that sat between two entries with
+    /// no record (see try_save_position_for_external_balance). The seek put
+    /// the cursor on the entry after that gap, so put it back in the gap: no
+    /// record, and the next next() returns this entry.
+    fn stay_before_entry_if_saved_in_gap(&mut self, seek_op: SeekOp) {
+        if !seek_op.eq_only() {
+            self.set_has_record(false);
+            self.skip_advance = true;
         }
     }
 
@@ -7747,7 +7760,8 @@ impl CursorTrait for BTreeCursor {
         // Idempotent, so safe across IO re-entry into this function.
         self.move_to_right_state.1 = None;
         self.invalidate_count_cache();
-        if self.valid_state != CursorValidState::Valid || !self.has_record() {
+        if self.valid_state != CursorValidState::Valid || !(self.has_record() || self.skip_advance)
+        {
             // Nothing to save: cursor has no live position. No invalidation
             // needed either — the stack is already in a state where the next
             // entry point will re-navigate from the root.
@@ -7769,48 +7783,66 @@ impl CursorTrait for BTreeCursor {
         if cell_idx < 0 {
             return Ok(IOResult::Done(SavePositionResult::MustInvalidate));
         }
-        let (is_table, cell_count) = {
+        let (is_table, is_leaf, cell_count) = {
             let page = self.stack.top_ref();
             let contents = page.get_contents();
-            (contents.page_type()?.is_table(), contents.cell_count())
+            (
+                contents.page_type()?.is_table(),
+                contents.is_leaf(),
+                contents.cell_count(),
+            )
         };
-        if (cell_idx as usize) >= cell_count {
+        // A cursor with skip_advance and no record sits in the gap before the
+        // cell at cell_idx, or after the last cell of a leaf: a restore that
+        // did not find its row leaves it there. Save the entry after the gap
+        // with GE, or the last cell of the leaf with GT. A range seek op in
+        // the saved context tells restore_context to put the cursor back in
+        // the gap.
+        let (key_cell, seek_op) = if self.has_record() {
+            if (cell_idx as usize) >= cell_count {
+                return Ok(IOResult::Done(SavePositionResult::MustInvalidate));
+            }
+            (cell_idx as usize, SeekOp::GE { eq_only: true })
+        } else if (cell_idx as usize) < cell_count {
+            (cell_idx as usize, SeekOp::GE { eq_only: false })
+        } else if is_leaf && cell_count > 0 && cell_idx as usize == cell_count {
+            (cell_count - 1, SeekOp::GT)
+        } else {
             return Ok(IOResult::Done(SavePositionResult::MustInvalidate));
-        }
+        };
         if is_table {
             let page = self.stack.top_ref();
             let contents = page.get_contents();
             debug_assert!(
                 matches!(contents.page_type(), Ok(PageType::TableLeaf)),
-                "save_position: table cursor with has_record=true must be on a leaf"
+                "save_position: table cursor with a saved position must be on a leaf"
             );
-            let rowid = contents.cell_table_leaf_read_rowid(cell_idx as usize)?;
+            let rowid = contents.cell_table_leaf_read_rowid(key_cell)?;
             self.save_context(CursorContext {
                 key: CursorContextKey::TableRowId(rowid),
-                seek_op: SeekOp::GE { eq_only: true },
+                seek_op,
             });
             return Ok(IOResult::Done(SavePositionResult::Saved));
         }
-        // Index btree: yield IO for overflow chains. Allocate to the actual
-        // payload size so wide-key indexes don't keep a page-sized buffer
-        // per saved cursor.
-        let cloned = {
-            let record = return_if_io!(self.record());
-            let record = record.expect("has_record=true but record() returned None");
-            let payload = record.get_payload();
-            let mut owned = crate::with_btree_allocation_site!(
-                SavedCursorRecord,
-                ImmutableRecord::new(payload.len())
-            )?;
-            crate::with_btree_allocation_site!(
-                SavedCursorRecord,
-                owned.start_serialization(payload)
-            )?;
-            owned
-        };
+        // record() reads the current cell and only when the cursor has a
+        // record, so a cursor in a gap steps onto the key cell while reading
+        // it and steps back before returning, also when it yields IO.
+        let in_gap = !self.has_record();
+        if in_gap {
+            self.stack.set_cell_index(key_cell as i32);
+            self.set_has_record(true);
+            self.invalidate_record();
+        }
+        let cloned = self.copy_current_index_record();
+        if in_gap {
+            self.stack.set_cell_index(cell_idx);
+            self.set_has_record(false);
+            self.invalidate_record();
+        }
+        let cloned = return_if_io!(cloned);
         self.save_context(CursorContext {
             key: CursorContextKey::IndexKeyRowId(ImmutableRecordRef::from_owned_record(cloned)),
-            seek_op: SeekOp::GE { eq_only: true },
+            seek_op,
         });
         Ok(IOResult::Done(SavePositionResult::Saved))
     }
@@ -7902,6 +7934,21 @@ impl CursorTrait for BTreeCursor {
 }
 
 impl BTreeCursor {
+    /// Index btree: yields IO for overflow chains. Allocates to the actual
+    /// payload size so wide-key indexes don't keep a page-sized buffer per
+    /// saved cursor.
+    fn copy_current_index_record(&mut self) -> IOResultOr<ImmutableRecord> {
+        let record = return_if_io!(self.record());
+        let record = record.expect("has_record=true but record() returned None");
+        let payload = record.get_payload();
+        let mut owned = crate::with_btree_allocation_site!(
+            SavedCursorRecord,
+            ImmutableRecord::new(payload.len())
+        )?;
+        crate::with_btree_allocation_site!(SavedCursorRecord, owned.start_serialization(payload))?;
+        Ok(IOResult::Done(owned))
+    }
+
     /// The bytes of the current record that are stored on the b-tree page,
     /// and the size of the whole record. The two differ when the record
     /// spills into overflow pages; `read_payload` reads any part of it.
@@ -15199,6 +15246,293 @@ mod tests {
                 Some(6),
                 "next() after peer deletion of our row must land on the next-greater rowid"
             );
+        }
+
+        /// Deletes the last row of the first leaf while `peer` sits on it, so
+        /// the peer's restore leaves it after the last cell of that leaf with
+        /// no record. Returns the rowid of the row before the deleted one.
+        fn delete_last_row_of_first_leaf_under_peer(
+            pager: &Arc<Pager>,
+            writer: &mut BTreeCursor,
+            peer: &mut BTreeCursor,
+        ) -> i64 {
+            for rowid in (10..=200).step_by(10) {
+                insert_record(
+                    writer,
+                    pager,
+                    rowid,
+                    Value::Blob(crate::alloc::vec![0u8; 600]),
+                )
+                .unwrap();
+            }
+            run_until_done(|| peer.rewind(), pager.deref()).unwrap();
+            let mut previous_rowid = None;
+            loop {
+                let cell_count = peer.stack.top_ref().get_contents().cell_count();
+                if peer.stack.current_cell_index() as usize + 1 == cell_count {
+                    break;
+                }
+                previous_rowid = run_until_done(|| peer.rowid(), pager.deref()).unwrap();
+                run_until_done(|| peer.next(), pager.deref()).unwrap();
+            }
+            let deleted_rowid = run_until_done(|| peer.rowid(), pager.deref())
+                .unwrap()
+                .unwrap();
+
+            run_until_done(
+                || {
+                    writer.seek(
+                        SeekKey::TableRowId(deleted_rowid),
+                        SeekOp::GE { eq_only: true },
+                    )
+                },
+                pager.deref(),
+            )
+            .unwrap();
+            run_until_done(|| writer.delete(), pager.deref()).unwrap();
+            assert_eq!(
+                run_until_done(|| peer.rowid(), pager.deref()).unwrap(),
+                None
+            );
+            assert!(peer.skip_advance && !peer.has_record());
+            previous_rowid.unwrap()
+        }
+
+        /// Inserts rows at the start of the first leaf and right before
+        /// `deleted_rowid`, so the first leaf splits and its cells move.
+        fn split_first_leaf(pager: &Arc<Pager>, writer: &mut BTreeCursor, deleted_rowid: i64) {
+            for rowid in (1..=5).chain(deleted_rowid - 2..deleted_rowid) {
+                insert_record(
+                    writer,
+                    pager,
+                    rowid,
+                    Value::Blob(crate::alloc::vec![0u8; 600]),
+                )
+                .unwrap();
+            }
+        }
+
+        #[test]
+        fn peer_after_last_cell_of_leaf_continues_forward_after_split() {
+            let (pager, root_page, _db, _conn) = empty_btree();
+            let mut writer = make_registered_cursor(&pager, root_page, 1);
+            let mut peer = make_registered_cursor(&pager, root_page, 1);
+            let previous_rowid =
+                delete_last_row_of_first_leaf_under_peer(&pager, &mut writer, &mut peer);
+            let deleted_rowid = previous_rowid + 10;
+            split_first_leaf(&pager, &mut writer, deleted_rowid);
+
+            let mut rowids = Vec::new();
+            loop {
+                run_until_done(|| peer.next(), pager.deref()).unwrap();
+                match run_until_done(|| peer.rowid(), pager.deref()).unwrap() {
+                    Some(rowid) => rowids.push(rowid),
+                    None => break,
+                }
+            }
+            let expected: Vec<i64> = (deleted_rowid - 2..deleted_rowid)
+                .chain((deleted_rowid + 10..=200).step_by(10))
+                .collect();
+            assert_eq!(rowids, expected);
+        }
+
+        #[test]
+        fn peer_after_last_cell_of_leaf_continues_forward_after_two_splits() {
+            let (pager, root_page, _db, _conn) = empty_btree();
+            let mut writer = make_registered_cursor(&pager, root_page, 1);
+            let mut peer = make_registered_cursor(&pager, root_page, 1);
+            let previous_rowid =
+                delete_last_row_of_first_leaf_under_peer(&pager, &mut writer, &mut peer);
+            let deleted_rowid = previous_rowid + 10;
+            split_first_leaf(&pager, &mut writer, deleted_rowid);
+            assert_eq!(
+                run_until_done(|| peer.rowid(), pager.deref()).unwrap(),
+                None
+            );
+            for rowid in (6..=9).chain(deleted_rowid + 1..deleted_rowid + 5) {
+                insert_record(
+                    &mut writer,
+                    &pager,
+                    rowid,
+                    Value::Blob(crate::alloc::vec![0u8; 600]),
+                )
+                .unwrap();
+            }
+
+            let mut rowids = Vec::new();
+            loop {
+                run_until_done(|| peer.next(), pager.deref()).unwrap();
+                match run_until_done(|| peer.rowid(), pager.deref()).unwrap() {
+                    Some(rowid) => rowids.push(rowid),
+                    None => break,
+                }
+            }
+            let expected: Vec<i64> = (deleted_rowid - 2..deleted_rowid)
+                .chain(deleted_rowid + 1..deleted_rowid + 5)
+                .chain((deleted_rowid + 10..=200).step_by(10))
+                .collect();
+            assert_eq!(rowids, expected);
+        }
+
+        #[test]
+        fn peer_after_last_cell_of_leaf_steps_back_to_that_cell_after_split() {
+            let (pager, root_page, _db, _conn) = empty_btree();
+            let mut writer = make_registered_cursor(&pager, root_page, 1);
+            let mut peer = make_registered_cursor(&pager, root_page, 1);
+            let previous_rowid =
+                delete_last_row_of_first_leaf_under_peer(&pager, &mut writer, &mut peer);
+            split_first_leaf(&pager, &mut writer, previous_rowid + 10);
+
+            run_until_done(|| peer.prev(), pager.deref()).unwrap();
+            assert_eq!(
+                run_until_done(|| peer.rowid(), pager.deref()).unwrap(),
+                Some(previous_rowid)
+            );
+        }
+
+        #[test]
+        fn peer_left_on_emptied_tree_stays_at_end_after_split() {
+            let (pager, root_page, _db, _conn) = empty_btree();
+            let mut writer = make_registered_cursor(&pager, root_page, 1);
+            let mut peer = make_registered_cursor(&pager, root_page, 1);
+            insert_record(&mut writer, &pager, 10, Value::from_i64(10)).unwrap();
+            run_until_done(|| peer.rewind(), pager.deref()).unwrap();
+            run_until_done(
+                || writer.seek(SeekKey::TableRowId(10), SeekOp::GE { eq_only: true }),
+                pager.deref(),
+            )
+            .unwrap();
+            run_until_done(|| writer.delete(), pager.deref()).unwrap();
+            assert_eq!(
+                run_until_done(|| peer.rowid(), pager.deref()).unwrap(),
+                None
+            );
+            assert!(peer.skip_advance && !peer.has_record());
+
+            for rowid in (20..=100).step_by(10) {
+                insert_record(
+                    &mut writer,
+                    &pager,
+                    rowid,
+                    Value::Blob(crate::alloc::vec![0u8; 600]),
+                )
+                .unwrap();
+            }
+
+            run_until_done(|| peer.next(), pager.deref()).unwrap();
+            assert!(!peer.has_record());
+        }
+
+        #[test]
+        fn index_peer_after_last_cell_of_leaf_continues_forward_after_two_inserts() {
+            let (pager, _, _db, _conn) = empty_btree();
+            let root_page = run_until_done(
+                || pager.btree_create(&crate::storage::pager::CreateBTreeFlags::new_index()),
+                pager.deref(),
+            )
+            .unwrap() as i64;
+            let index = Index {
+                name: "peer_index".to_string(),
+                where_clause: None,
+                columns: IndexColumn::new_many(["k".to_string(), "v".to_string()]),
+                table_name: "peer_table".to_string(),
+                root_page,
+                unique: false,
+                ephemeral: false,
+                has_rowid: false,
+                index_method: None,
+                on_conflict: None,
+                constraint_name: None,
+            };
+            let new_cursor = || {
+                let cursor =
+                    Box::new(BTreeCursor::new_index(pager.clone(), root_page, &index, 2).unwrap());
+                (*cursor).register_with_pager();
+                cursor
+            };
+            let mut writer = new_cursor();
+            let mut peer = new_cursor();
+            // Keys larger than a page's max local payload, so reading the
+            // saved key walks an overflow chain.
+            let key = |k: i64| {
+                let registers = [
+                    Register::Value(Value::from_i64(k)),
+                    Register::Value(Value::Blob(crate::alloc::vec![0u8; 1500])),
+                ];
+                ImmutableRecord::from_registers(&registers, registers.len()).unwrap()
+            };
+            let seek_writer = |writer: &mut BTreeCursor, k: i64| {
+                let record = key(k);
+                run_until_done(
+                    || {
+                        writer.seek(
+                            SeekKey::IndexKey(record.as_record_ref()),
+                            SeekOp::GE { eq_only: true },
+                        )
+                    },
+                    pager.deref(),
+                )
+                .unwrap()
+            };
+            let insert = |writer: &mut BTreeCursor, k: i64| {
+                seek_writer(writer, k);
+                let record = key(k);
+                run_until_done(
+                    || writer.insert(&BTreeKey::new_index_key(record.as_record_ref())),
+                    pager.deref(),
+                )
+                .unwrap();
+            };
+            let peer_key = |peer: &mut BTreeCursor| {
+                run_until_done(
+                    || {
+                        Ok(peer.record()?.map(|record| {
+                            record.map(|record| match record.first_value().unwrap() {
+                                ValueRef::Numeric(Numeric::Integer(k)) => k,
+                                value => panic!("unexpected key {value:?}"),
+                            })
+                        }))
+                    },
+                    pager.deref(),
+                )
+                .unwrap()
+            };
+            for k in (10..=300).step_by(10) {
+                insert(&mut writer, k);
+            }
+
+            run_until_done(|| peer.rewind(), pager.deref()).unwrap();
+            while peer.stack.current_cell_index() as usize + 1
+                != peer.stack.top_ref().get_contents().cell_count()
+            {
+                run_until_done(|| peer.next(), pager.deref()).unwrap();
+            }
+            let deleted_key = peer_key(&mut peer).unwrap();
+            assert_eq!(seek_writer(&mut writer, deleted_key), SeekResult::Found);
+            run_until_done(|| writer.delete(), pager.deref()).unwrap();
+            assert_eq!(peer_key(&mut peer), None);
+            assert!(peer.skip_advance && !peer.has_record());
+
+            // The first insert leaves the first leaf alone, so the peer comes
+            // back on the divider cell after the deleted key, in an interior
+            // page. The second one splits the first leaf.
+            insert(&mut writer, 1000);
+            assert_eq!(peer_key(&mut peer), None);
+            assert!(!peer.stack.top_ref().get_contents().is_leaf());
+            for k in 1..=9 {
+                insert(&mut writer, k);
+            }
+
+            let mut keys = Vec::new();
+            loop {
+                run_until_done(|| peer.next(), pager.deref()).unwrap();
+                match peer_key(&mut peer) {
+                    Some(k) => keys.push(k),
+                    None => break,
+                }
+            }
+            let expected: Vec<i64> = (deleted_key + 10..=300).step_by(10).chain([1000]).collect();
+            assert_eq!(keys, expected);
         }
 
         #[test]
