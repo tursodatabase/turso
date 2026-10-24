@@ -245,7 +245,7 @@ impl<'a> Iterator for Lexer<'a> {
                 b'&' => Some(Ok(self.eat_overlap_or_bitand())),
                 b'~' => Some(Ok(self.eat_one_token(TokenType::TK_BITNOT))),
                 b'\'' | b'"' | b'`' => Some(self.mark(|l| l.eat_lit_or_id())),
-                b'.' => Some(self.mark(|l| l.eat_dot_or_frac(false))),
+                b'.' => Some(self.mark(|l| l.eat_dot_or_frac(None))),
                 b'0'..=b'9' => Some(self.mark(|l| l.eat_number())),
                 b'[' => Some(Ok(self.eat_one_token(TokenType::TK_LBRACKET))),
                 b']' => Some(Ok(self.eat_one_token(TokenType::TK_RBRACKET))),
@@ -399,38 +399,81 @@ impl<'a> Lexer<'a> {
         }
     }
 
-    fn eat_while_number_digit(&mut self) -> Result<()> {
+    /// Builds the error SQLite reports for a malformed numeric literal that
+    /// starts at `start`: `unrecognized token: "<literal>"`.
+    ///
+    /// The reported text covers what SQLite's tokenizer consumes before it
+    /// gives up on the number: the digits with any `_`, an optional `.` and
+    /// fractional digits, the exponent only when it is well formed, and then
+    /// every identifier byte glued to it. So `1._5`, `1e_2` and `1.x` are
+    /// reported whole, while `1e+` is reported as `1e`.
+    fn unrecognized_number(&self, start: usize) -> Error {
+        let at = |i: usize| self.input.get(i).copied();
+        let digits = |mut i: usize, is_digit: fn(u8) -> bool| {
+            while at(i).is_some_and(|b| is_digit(b) || b == b'_') {
+                i += 1;
+            }
+            i
+        };
+        let is_hex = at(start) == Some(b'0')
+            && matches!(at(start + 1), Some(b'x') | Some(b'X'))
+            && at(start + 2).is_some_and(|b| b.is_ascii_hexdigit());
+        let mut end = if is_hex {
+            digits(start + 2, |b| b.is_ascii_hexdigit())
+        } else {
+            let mut end = digits(start, |b| b.is_ascii_digit());
+            if at(end) == Some(b'.') {
+                end = digits(end + 1, |b| b.is_ascii_digit());
+            }
+            let has_exponent = matches!(at(end), Some(b'e') | Some(b'E'))
+                && (at(end + 1).is_some_and(|b| b.is_ascii_digit())
+                    || (matches!(at(end + 1), Some(b'+') | Some(b'-'))
+                        && at(end + 2).is_some_and(|b| b.is_ascii_digit())));
+            if has_exponent {
+                end = digits(end + 2, |b| b.is_ascii_digit());
+            }
+            end
+        };
+        while at(end).is_some_and(is_identifier_continue) {
+            end += 1;
+        }
+        Error::UnrecognizedToken {
+            span: (start, end - start).into(),
+            token_text: String::from_utf8_lossy(&self.input[start..end]).to_string(),
+            offset: start,
+        }
+    }
+
+    /// Eats a run of decimal digits that may contain `_` separators.
+    ///
+    /// Like SQLite, an underscore is only valid *between two digits*. The
+    /// caller passes `has_preceding_digit` to say whether a digit was already
+    /// consumed immediately before this run (the first digit of an integer is
+    /// eaten by `eat_number`), so a leading underscore such as the one in
+    /// `1e_2` is rejected while a separator such as the one in `1_000` is kept.
+    /// `number_start` is where the whole literal begins, for the error text.
+    fn eat_while_number_digit(
+        &mut self,
+        number_start: usize,
+        mut has_preceding_digit: bool,
+    ) -> Result<()> {
         loop {
             let start = self.offset;
             self.eat_while(|b| b.is_ascii_digit());
+            if self.offset != start {
+                has_preceding_digit = true;
+            }
             match self.peek() {
                 Some(b'_') => {
-                    self.eat_and_assert(|b| b == b'_');
-
-                    if start == self.offset {
+                    if !has_preceding_digit {
                         // before the underscore, there was no digit
-                        let token_text =
-                            String::from_utf8_lossy(&self.input[start..self.offset]).to_string();
-                        return Err(Error::BadNumber {
-                            span: (start, self.offset - start).into(),
-                            token_text,
-                            offset: start,
-                        });
+                        return Err(self.unrecognized_number(number_start));
                     }
-
+                    self.eat_and_assert(|b| b == b'_');
                     match self.peek() {
-                        Some(b) if b.is_ascii_digit() => continue, // Continue if next is a digit
-                        _ => {
-                            // after the underscore, there is no digit
-                            let token_text =
-                                String::from_utf8_lossy(&self.input[start..self.offset])
-                                    .to_string();
-                            return Err(Error::BadNumber {
-                                span: (start, self.offset - start).into(),
-                                token_text,
-                                offset: start,
-                            });
-                        }
+                        Some(b) if b.is_ascii_digit() => continue,
+                        // after the underscore, there is no digit
+                        _ => return Err(self.unrecognized_number(number_start)),
                     }
                 }
                 _ => return Ok(()),
@@ -438,7 +481,7 @@ impl<'a> Lexer<'a> {
         }
     }
 
-    fn eat_while_number_hexdigit(&mut self) -> Result<()> {
+    fn eat_while_number_hexdigit(&mut self, number_start: usize) -> Result<()> {
         loop {
             let start = self.offset;
             self.eat_while(|b| b.is_ascii_hexdigit());
@@ -446,29 +489,13 @@ impl<'a> Lexer<'a> {
                 Some(b'_') => {
                     if start == self.offset {
                         // before the underscore, there was no digit
-                        let token_text =
-                            String::from_utf8_lossy(&self.input[start..self.offset]).to_string();
-                        return Err(Error::BadNumber {
-                            span: (start, self.offset - start).into(),
-                            token_text,
-                            offset: start,
-                        });
+                        return Err(self.unrecognized_number(number_start));
                     }
-
                     self.eat_and_assert(|b| b == b'_');
                     match self.peek() {
-                        Some(b) if b.is_ascii_hexdigit() => continue, // Continue if next is a digit
-                        _ => {
-                            // after the underscore, there is no digit
-                            let token_text =
-                                String::from_utf8_lossy(&self.input[start..self.offset])
-                                    .to_string();
-                            return Err(Error::BadNumber {
-                                span: (start, self.offset - start).into(),
-                                token_text,
-                                offset: start,
-                            });
-                        }
+                        Some(b) if b.is_ascii_hexdigit() => continue,
+                        // after the underscore, there is no digit
+                        _ => return Err(self.unrecognized_number(number_start)),
                     }
                 }
                 _ => return Ok(()),
@@ -692,37 +719,43 @@ impl<'a> Lexer<'a> {
         Ok(Token::new(&self.input[start..self.offset], tt))
     }
 
-    fn eat_dot_or_frac(&mut self, has_digit_prefix: bool) -> Result<Token<'a>> {
+    /// Lexes a `.`: either the DOT operator or the fractional part of a
+    /// number. `number_start` is `Some(start of the number)` when digits were
+    /// already consumed before the dot, `None` for a leading dot.
+    fn eat_dot_or_frac(&mut self, number_start: Option<usize>) -> Result<Token<'a>> {
         let start = self.offset;
+        let has_digit_prefix = number_start.is_some();
+        let number_start = number_start.unwrap_or(start);
         self.eat_and_assert(|b| b == b'.');
 
         match self.peek() {
             Some(b)
                 if b.is_ascii_digit() || (has_digit_prefix && b.eq_ignore_ascii_case(&b'e')) =>
             {
-                self.eat_while_number_digit()?;
+                self.eat_while_number_digit(number_start, false)?;
                 match self.peek() {
                     Some(b'e') | Some(b'E') => {
-                        _ = self.eat_expo()?;
+                        _ = self.eat_expo(number_start)?;
                         Ok(Token::new(
                             &self.input[start..self.offset],
                             TokenType::TK_FLOAT,
                         ))
                     }
                     Some(b) if is_identifier_start(b) => {
-                        let token_text =
-                            String::from_utf8_lossy(&self.input[start..self.offset]).to_string();
-                        Err(Error::BadFractionalPart {
-                            span: (start, self.offset - start).into(),
-                            token_text,
-                            offset: start,
-                        })
+                        Err(self.unrecognized_number(number_start))
                     }
                     _ => Ok(Token::new(
                         &self.input[start..self.offset],
                         TokenType::TK_FLOAT,
                     )),
                 }
+            }
+            // A digit-prefixed number whose `.` is followed directly by an
+            // identifier byte (e.g. `1._5`, `1.x`) is an invalid numeric token
+            // in SQLite, not `float . identifier`. A bare `.` with no digit
+            // prefix (e.g. `._5`) stays a DOT so the parser reports it.
+            Some(b) if has_digit_prefix && is_identifier_start(b) => {
+                Err(self.unrecognized_number(number_start))
             }
             _ => Ok(Token::new(
                 &self.input[start..self.offset],
@@ -731,7 +764,7 @@ impl<'a> Lexer<'a> {
         }
     }
 
-    fn eat_expo(&mut self) -> Result<Token<'a>> {
+    fn eat_expo(&mut self, number_start: usize) -> Result<Token<'a>> {
         let start = self.offset;
         self.eat_and_assert(|b| b == b'e' || b == b'E');
         match self.peek() {
@@ -742,23 +775,10 @@ impl<'a> Lexer<'a> {
         }
 
         let start_num = self.offset;
-        self.eat_while_number_digit()?;
-        if start_num == self.offset {
-            let token_text = String::from_utf8_lossy(&self.input[start..self.offset]).to_string();
-            return Err(Error::BadExponentPart {
-                span: (start, self.offset - start).into(),
-                token_text,
-                offset: start,
-            });
-        }
-
-        if self.peek().is_some() && is_identifier_start(self.peek().unwrap()) {
-            let token_text = String::from_utf8_lossy(&self.input[start..self.offset]).to_string();
-            return Err(Error::BadExponentPart {
-                span: (start, self.offset - start).into(),
-                token_text,
-                offset: start,
-            });
+        self.eat_while_number_digit(number_start, false)?;
+        if start_num == self.offset || self.peek().is_some_and(is_identifier_start) {
+            // no exponent digits, or an identifier byte glued to them
+            return Err(self.unrecognized_number(number_start));
         }
 
         // This is a number
@@ -779,26 +799,11 @@ impl<'a> Lexer<'a> {
                 Some(b'x') | Some(b'X') => {
                     self.eat_and_assert(|b| b == b'x' || b == b'X');
                     let start_hex = self.offset;
-                    self.eat_while_number_hexdigit()?;
+                    self.eat_while_number_hexdigit(start)?;
 
-                    if start_hex == self.offset {
-                        let token_text =
-                            String::from_utf8_lossy(&self.input[start..self.offset]).to_string();
-                        return Err(Error::MalformedHexInteger {
-                            span: (start, self.offset - start).into(),
-                            token_text,
-                            offset: start,
-                        });
-                    }
-
-                    if self.peek().is_some() && is_identifier_start(self.peek().unwrap()) {
-                        let token_text =
-                            String::from_utf8_lossy(&self.input[start..self.offset]).to_string();
-                        return Err(Error::BadNumber {
-                            span: (start, self.offset - start).into(),
-                            token_text,
-                            offset: start,
-                        });
+                    if start_hex == self.offset || self.peek().is_some_and(is_identifier_start) {
+                        // `0x` with no digits, or a non-hex byte glued to it
+                        return Err(self.unrecognized_number(start));
                     }
 
                     return Ok(Token::new(
@@ -810,31 +815,23 @@ impl<'a> Lexer<'a> {
             }
         }
 
-        self.eat_while_number_digit()?;
+        self.eat_while_number_digit(start, true)?;
         match self.peek() {
             Some(b'.') => {
-                self.eat_dot_or_frac(true)?;
+                self.eat_dot_or_frac(Some(start))?;
                 Ok(Token::new(
                     &self.input[start..self.offset],
                     TokenType::TK_FLOAT,
                 ))
             }
             Some(b'e') | Some(b'E') => {
-                self.eat_expo()?;
+                self.eat_expo(start)?;
                 Ok(Token::new(
                     &self.input[start..self.offset],
                     TokenType::TK_FLOAT,
                 ))
             }
-            Some(b) if is_identifier_start(b) => {
-                let token_text =
-                    String::from_utf8_lossy(&self.input[start..self.offset]).to_string();
-                Err(Error::BadNumber {
-                    span: (start, self.offset - start).into(),
-                    token_text,
-                    offset: start,
-                })
-            }
+            Some(b) if is_identifier_start(b) => Err(self.unrecognized_number(start)),
             _ => Ok(Token::new(
                 &self.input[start..self.offset],
                 TokenType::TK_INTEGER,
@@ -1193,6 +1190,20 @@ mod tests {
             ),
             // issue 2933
             (b"1.e5".as_slice(), Token::new(b"1.e5", TokenType::TK_FLOAT)),
+            // issue 9064: `_` is a valid separator between two digits, including
+            // inside the fractional and exponent parts.
+            (
+                b"1.5_5".as_slice(),
+                Token::new(b"1.5_5", TokenType::TK_FLOAT),
+            ),
+            (
+                b"1e1_0".as_slice(),
+                Token::new(b"1e1_0", TokenType::TK_FLOAT),
+            ),
+            (
+                b"1_0e1_0".as_slice(),
+                Token::new(b"1_0e1_0", TokenType::TK_FLOAT),
+            ),
             // issue 3425
             (b"/*".as_slice(), Token::new(b"/*", TokenType::TK_NONE)),
             (b"/**".as_slice(), Token::new(b"/**", TokenType::TK_NONE)),
@@ -1234,6 +1245,56 @@ mod tests {
                 "expected UnrecognizedToken for {:?}, got {result:?}",
                 String::from_utf8_lossy(input)
             );
+        }
+    }
+
+    // issue 9064: an underscore is only valid between two digits, and a `.` in
+    // a number cannot be followed directly by an identifier byte. turso used to
+    // accept these (misreading `1._5` as `1.0 AS _5` and `1e_2` as `100.0`).
+    // Like SQLite, a malformed number is reported as an unrecognized token whose
+    // text is the whole literal, including any identifier bytes glued to it; an
+    // exponent is part of it only when it is well formed (`1e+` -> `1e`).
+    #[test]
+    fn test_lexer_bad_numbers() {
+        let cases: Vec<(&[u8], &str)> = vec![
+            (b"1._5", "1._5"), // `_` after the `.`, no digit before it
+            (b"1.x", "1.x"),   // `.` followed by an identifier
+            (b"1e_2", "1e_2"), // `_` after `e`, no digit before it
+            (b"1_", "1_"),     // trailing `_`, no digit after it
+            (b"1_.5", "1_.5"), // `_` followed by `.`, not a digit
+            (b"1.5_", "1.5_"), // trailing `_` in the fractional part
+            (b"1e1_", "1e1_"), // trailing `_` in the exponent part
+            (b"1e_", "1e_"),   // `_` right after `e`
+            (b"1_x", "1_x"),
+            (b"12ab", "12ab"),
+            (b"1e", "1e"),
+            (b"1e+", "1e"), // the sign is not part of the token
+            (b"1.e", "1.e"),
+            (b".5_", ".5_"),
+            (b"0x", "0x"),
+            (b"0x_1", "0x_1"),
+            (b"0x1_", "0x1_"),
+            (b"0x1g", "0x1g"),
+        ];
+        for (input, expected) in cases {
+            let mut lexer = Lexer::new(input);
+            match lexer.next().unwrap() {
+                Err(Error::UnrecognizedToken {
+                    token_text, offset, ..
+                }) => {
+                    assert_eq!(
+                        token_text,
+                        expected,
+                        "token text for {:?}",
+                        String::from_utf8_lossy(input)
+                    );
+                    assert_eq!(offset, 0);
+                }
+                other => panic!(
+                    "expected UnrecognizedToken for {:?}, got {other:?}",
+                    String::from_utf8_lossy(input)
+                ),
+            }
         }
     }
 
