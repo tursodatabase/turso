@@ -1245,6 +1245,7 @@ fn plan_cte(
                 identifier: referenced_cte_table.identifier.clone(),
                 internal_id: referenced_cte_table.internal_id,
                 table: referenced_cte_table.table.clone(),
+                database_id: referenced_cte_table.database_id,
                 join_info: None,
                 col_used_mask: ColumnUsedMask::default(),
                 cte_select: None,
@@ -1447,6 +1448,7 @@ fn prepare_recursive_cte_plan(
         identifier: cte_definition.name.clone(),
         internal_id: input_table.internal_id,
         table: input_table.table,
+        database_id: input_table.database_id,
         join_info: None,
         col_used_mask: ColumnUsedMask::default(),
         cte_select: None,
@@ -1642,6 +1644,7 @@ fn parse_from_clause_table(
                 outer_query_refs_for_subquery.push(OuterQueryReference {
                     identifier: cte_definition.name.clone(),
                     internal_id: cte_table.internal_id,
+                    database_id: cte_table.database_id,
                     table: cte_table.table,
                     join_info: None,
                     col_used_mask: ColumnUsedMask::default(),
@@ -2508,6 +2511,7 @@ fn add_ctes_read_by_subqueries_as_outer_refs(
         table_references.add_outer_query_reference(OuterQueryReference {
             identifier: cte_definition.name.clone(),
             internal_id: joined_table.internal_id,
+            database_id: joined_table.database_id,
             table: joined_table.table,
             join_info: None,
             col_used_mask: ColumnUsedMask::default(),
