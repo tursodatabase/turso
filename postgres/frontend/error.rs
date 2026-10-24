@@ -15,6 +15,10 @@ impl Error {
     pub fn core_error(&self) -> &LimboError {
         &self.0.source
     }
+
+    pub(crate) fn into_core_error(self) -> LimboError {
+        self.0.source
+    }
 }
 
 impl std::ops::Deref for Error {
