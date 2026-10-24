@@ -1016,3 +1016,11 @@ test pg-publication-dump-discovery-is-empty {
     FROM pg_publication p;
 }
 expect {}
+
+test pg-publication-rel-tableoid-is-selectable {
+    SET search_path TO '';
+    SELECT tableoid, oid, prpubid, prrelid,
+           pg_catalog.pg_get_expr(prqual, prrelid) AS prrelqual, prattrs
+    FROM pg_catalog.pg_publication_rel;
+}
+expect {}
